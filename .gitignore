@@ -1,0 +1,63 @@
+# Environment & secrets
+.env
+.env.*
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# State (user-specific, never commit)
+state/
+*.pt
+*.onnx
+
+# Claude Code user-specific
+.claude/logs/
+.claude/context/pre-compact-snapshot.md
+.claude/cron-jobs.json
+.claude/worktrees/
+CLAUDE.local.md
+
+# IDE
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Test artifacts
+.pytest_cache/
+htmlcov/
+.coverage
+*.log
+
+# Container volumes (local)
+weaviate_data/
+ollama_data/
+
+# Playwright
+.playwright-mcp/
+
+# MCP server caches
+claude_mcp_servers/models_cache/
+claude_mcp_servers/runs/
+
+# VS Code per-user project settings (claude-code.env lives here, don't commit)
+.vscode/settings.json
+!.vscode/settings.json.example

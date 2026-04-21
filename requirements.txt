@@ -1,0 +1,57 @@
+# VibeCoded Tools — Orchestrator Dependencies
+# All licenses verified: MIT, Apache 2.0, or BSD-3-Clause
+
+# ─── MCP SDK ───
+# MCP Python SDK (MIT) — required for weaviate-kg and ollama MCP servers
+mcp>=1.0
+
+# FastMCP (MIT) — higher-level MCP framework, used by search MCP
+fastmcp>=0.1
+
+# ─── Weaviate ───
+# Weaviate Python client (BSD-3-Clause)
+weaviate-client>=4.9
+
+# ─── HTTP / async ───
+aiohttp>=3.9
+httpx>=0.27
+requests>=2.31
+
+# ─── Data validation ───
+# Pydantic (MIT)
+pydantic>=2.0
+
+# ─── YAML parsing ───
+# PyYAML (MIT)
+pyyaml>=6.0
+
+# ─── File watching ───
+# Watchdog (Apache 2.0)
+watchdog>=4.0
+
+# ─── Database ───
+# asyncpg (Apache 2.0) — optional, for persistent state
+asyncpg>=0.29
+
+# ─── Ollama client ───
+# Ollama Python client (MIT) — for local LLM inference MCP
+ollama>=0.3
+
+# ─── Code embedding service (runs in container, but needed for CPU fallback) ───
+# sentence-transformers (Apache 2.0)
+sentence-transformers>=3.0
+# transformers pinned for CodeSage Conv1D compatibility
+transformers>=4.40.0,<5.0.0
+# PyTorch (BSD-3-Clause) — for RL pipeline (Pro) and code embeddings (CPU fallback)
+torch>=2.0
+
+# ─── FastAPI (code embedding service HTTP server) ───
+# FastAPI (MIT) + uvicorn (BSD-3-Clause)
+fastapi>=0.111
+uvicorn>=0.30
+
+# ─── Telemetry (optional runtime) ───
+# psutil (BSD-3-Clause) — used by commercial_workflow.telemetry.hardware for
+# opt-in hardware profiling. Already a transitive dep of several packages;
+# pinned here so the telemetry module can import it directly.
+psutil>=5.9

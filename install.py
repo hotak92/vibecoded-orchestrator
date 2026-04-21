@@ -1,0 +1,832 @@
+#!/usr/bin/env python3
+"""
+VibeCoded Tools — Orchestrator Installer (Cross-Platform)
+
+Usage:
+    python install.py [options]
+
+Options:
+    --no-containers     Skip Docker/Podman service setup
+    --gpu               Enable GPU support for Ollama + code embeddings
+    --cpu-only          Force CPU-only (skip GPU detection)
+    --openai-key KEY    Use OpenAI embeddings instead of local models
+    --container CMD     Force container runtime: docker | podman
+    --dev               Install development dependencies
+    --skip-models       Skip pulling Ollama models (manual later)
+    --quiet             Minimal output
+
+Requirements:
+    - Python 3.11+
+    - Docker or Podman (for Weaviate + Ollama containers)
+    - Claude Code CLI (npm install -g @anthropic-ai/claude-code)
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import platform
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import NamedTuple
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+MIN_PYTHON = (3, 11)
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+# Default ports (configurable via .env)
+DEFAULT_WEAVIATE_PORT = 8081
+DEFAULT_WEAVIATE_GRPC_PORT = 50052
+DEFAULT_OLLAMA_PORT = 11435
+DEFAULT_CODE_EMBED_PORT = 11440
+
+# Embedding model configurations
+EMBEDDING_CONFIGS = {
+    "gpu": {
+        "text_model": "qwen3-embedding:0.6b",
+        "text_dims": 1024,
+        "code_backend": "gpu",
+        "code_model": "codesage-large-v2",
+        "code_dims": 2048,
+        "chunking_text_tokens": 512,
+        "chunking_code_tokens": 2048,
+        "ollama_models": ["qwen3-embedding:0.6b", "qwen3:0.6b"],
+        "description": "GPU-accelerated (best quality)",
+    },
+    "cpu": {
+        "text_model": "qwen3-embedding:0.6b",
+        "text_dims": 1024,
+        "code_backend": "ollama",
+        "code_model": "qwen3-embedding:0.6b",
+        "code_dims": 1024,
+        "chunking_text_tokens": 512,
+        "chunking_code_tokens": 512,
+        "ollama_models": ["qwen3-embedding:0.6b", "qwen3:0.6b"],
+        "description": "CPU-only (slower, good quality)",
+    },
+    "openai": {
+        "text_model": "text-embedding-3-small",
+        "text_dims": 1536,
+        "code_backend": "openai",
+        "code_model": "text-embedding-3-small",
+        "code_dims": 1536,
+        "chunking_text_tokens": 8191,
+        "chunking_code_tokens": 8191,
+        "ollama_models": ["qwen3:0.6b"],  # still need inference model
+        "description": "OpenAI API (fastest, requires API key)",
+    },
+}
+
+HEALTH_TIMEOUT = 120  # seconds
+
+
+class SystemInfo(NamedTuple):
+    os_name: str        # "Linux", "Windows", "Darwin"
+    has_gpu: bool       # NVIDIA GPU detected
+    has_metal: bool     # Apple Silicon (Metal)
+    container_cmd: str  # "docker" or "podman" or ""
+    gpu_name: str       # GPU model name or ""
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="VibeCoded Tools — Orchestrator Installer",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--no-containers", action="store_true",
+                        help="Skip Docker/Podman service setup")
+    parser.add_argument("--gpu", action="store_true",
+                        help="Enable GPU support for Ollama + code embeddings")
+    parser.add_argument("--cpu-only", action="store_true",
+                        help="Force CPU-only mode (skip GPU detection)")
+    parser.add_argument("--openai-key", type=str, default="",
+                        help="Use OpenAI embeddings (provide API key)")
+    parser.add_argument("--container", type=str, choices=["docker", "podman"],
+                        help="Force a specific container runtime")
+    parser.add_argument("--dev", action="store_true",
+                        help="Install development dependencies")
+    parser.add_argument("--skip-models", action="store_true",
+                        help="Skip pulling Ollama models")
+    parser.add_argument("--update", action="store_true",
+                        help="Update mode: skip clone, re-install deps + restart services")
+    parser.add_argument("--quiet", action="store_true",
+                        help="Minimal output")
+    parser.add_argument("--with-agents", action="store_true", default=True,
+                        help="Install free-tier Claude agents (default: on)")
+    parser.add_argument("--no-agents", dest="with_agents", action="store_false",
+                        help="Skip installing Claude agents")
+    parser.add_argument("--with-mao-agents", action="store_true",
+                        help="Install MAO-tier specialist agents (requires MAO license)")
+    parser.add_argument("--with-skills", action="store_true", default=True,
+                        help="Install Claude skills (default: on)")
+    parser.add_argument("--no-skills", dest="with_skills", action="store_false",
+                        help="Skip installing Claude skills")
+    args = parser.parse_args()
+
+    mode = "update" if args.update else "install"
+
+    print()
+    print("=" * 62)
+    if mode == "update":
+        print("  VibeCoded Tools — Orchestrator Updater")
+    else:
+        print("  VibeCoded Tools — Orchestrator Installer")
+    print("=" * 62)
+    print()
+
+    # Step 1: Check Python
+    _check_python_version()
+
+    # Step 2: Detect system
+    sysinfo = _detect_system(args)
+    _print_system_info(sysinfo)
+
+    # Step 3: Determine embedding configuration
+    embed_config = _choose_embedding_config(sysinfo, args)
+    print(f"\n  Embedding mode: {embed_config['description']}")
+
+    # Step 4: Create virtual environment
+    venv_python = _create_venv(PROJECT_ROOT)
+
+    # Step 5: Install/update Python dependencies
+    _install_requirements(venv_python, dev=args.dev)
+
+    # Step 6: Container services (restart on update to pick up config changes)
+    if not args.no_containers:
+        if not sysinfo.container_cmd:
+            print("\n[!] No container runtime found. Install Docker or Podman.")
+            print("    Docker: https://docs.docker.com/get-docker/")
+            print("    Podman: https://podman.io/getting-started/installation")
+            print("    Or re-run with --no-containers to skip.")
+            return 1
+        _start_services(sysinfo, args, embed_config)
+        if not args.skip_models:
+            _wait_for_ollama()
+            _pull_ollama_models(embed_config["ollama_models"])
+    else:
+        print("\n[skip] Container services (--no-containers)")
+
+    # Step 7: Create state directory
+    _create_state_directory()
+
+    # Step 8: Write .env configuration (skip on update — don't overwrite user changes)
+    if mode == "install":
+        _write_env_config(embed_config, args)
+    else:
+        print("[skip] .env configuration (preserved during update)")
+
+    # Step 9: Configure Claude Code settings (skip on update)
+    if mode == "install":
+        _configure_claude_settings(embed_config)
+    else:
+        print("[skip] Claude settings (preserved during update)")
+
+    # Step 9b: Install agents and skills from templates/
+    _install_agents_and_skills(args)
+
+    # Step 10: Check Claude CLI
+    _check_claude_cli()
+
+    # Step 11: Initial code graph analysis (if repo has code)
+    # Skipped on first install — user runs manually after setup
+
+    # Done
+    print()
+    print("=" * 62)
+    print("  Installation complete!")
+    print("=" * 62)
+    print()
+    _print_next_steps(sysinfo, args)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Step 1: Python version
+# ---------------------------------------------------------------------------
+
+def _check_python_version() -> None:
+    print("[1/10] Checking Python version ... ", end="", flush=True)
+    v = sys.version_info
+    if (v.major, v.minor) < MIN_PYTHON:
+        print("FAIL")
+        print(f"  Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]}+ required, "
+              f"found {v.major}.{v.minor}.{v.micro}")
+        _print_python_install_hint()
+        sys.exit(1)
+    print(f"OK ({v.major}.{v.minor}.{v.micro})")
+
+
+def _print_python_install_hint() -> None:
+    os_name = platform.system()
+    if os_name == "Linux":
+        print("  Install: sudo apt install python3.12  (Ubuntu/Debian)")
+        print("           sudo dnf install python3.12  (Fedora)")
+    elif os_name == "Darwin":
+        print("  Install: brew install python@3.12")
+    elif os_name == "Windows":
+        print("  Install: winget install Python.Python.3.12")
+        print("       Or: https://python.org/downloads/")
+    print("  Download: https://python.org")
+
+
+# ---------------------------------------------------------------------------
+# Step 2: System detection
+# ---------------------------------------------------------------------------
+
+def _detect_system(args: argparse.Namespace) -> SystemInfo:
+    print("[2/10] Detecting system ... ", flush=True)
+    os_name = platform.system()
+    has_gpu = False
+    has_metal = False
+    gpu_name = ""
+    container_cmd = ""
+
+    # GPU detection
+    if args.cpu_only:
+        print("  GPU: skipped (--cpu-only)")
+    elif args.openai_key:
+        print("  GPU: not needed (using OpenAI embeddings)")
+    else:
+        has_gpu, gpu_name = _detect_nvidia_gpu()
+        if has_gpu:
+            print(f"  GPU: {gpu_name}")
+        elif os_name == "Darwin" and _detect_apple_silicon():
+            has_metal = True
+            print("  GPU: Apple Silicon (Metal — Ollama uses natively)")
+        else:
+            print("  GPU: none detected (will use CPU)")
+
+    # Container runtime
+    if args.container:
+        container_cmd = args.container
+        print(f"  Container: {container_cmd} (forced)")
+    else:
+        container_cmd = _detect_container_runtime()
+        if container_cmd:
+            print(f"  Container: {container_cmd}")
+        elif not args.no_containers:
+            print("  Container: none found")
+
+    print(f"  OS: {os_name} ({platform.machine()})")
+
+    return SystemInfo(
+        os_name=os_name,
+        has_gpu=has_gpu or args.gpu,
+        has_metal=has_metal,
+        container_cmd=container_cmd,
+        gpu_name=gpu_name,
+    )
+
+
+def _detect_nvidia_gpu() -> tuple[bool, str]:
+    """Check for NVIDIA GPU via nvidia-smi."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return True, result.stdout.strip().splitlines()[0]
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return False, ""
+
+
+def _detect_apple_silicon() -> bool:
+    """Check if running on Apple Silicon."""
+    return platform.system() == "Darwin" and platform.machine() == "arm64"
+
+
+def _detect_container_runtime() -> str:
+    """Detect Docker or Podman. Prefer Podman on Linux, Docker elsewhere."""
+    os_name = platform.system()
+    # Order: Linux prefers Podman (no commercial license needed)
+    candidates = ["podman", "docker"] if os_name == "Linux" else ["docker", "podman"]
+
+    for cmd in candidates:
+        if shutil.which(cmd):
+            try:
+                result = subprocess.run(
+                    [cmd, "version"], capture_output=True, text=True, timeout=15,
+                )
+                if result.returncode == 0:
+                    return cmd
+            except (subprocess.TimeoutExpired, OSError):
+                continue
+    return ""
+
+
+def _print_system_info(sysinfo: SystemInfo) -> None:
+    pass  # Already printed in _detect_system
+
+
+# ---------------------------------------------------------------------------
+# Step 3: Embedding configuration
+# ---------------------------------------------------------------------------
+
+def _choose_embedding_config(sysinfo: SystemInfo, args: argparse.Namespace) -> dict:
+    if args.openai_key:
+        config = dict(EMBEDDING_CONFIGS["openai"])
+        config["openai_key"] = args.openai_key
+        return config
+    elif sysinfo.has_gpu:
+        return dict(EMBEDDING_CONFIGS["gpu"])
+    else:
+        return dict(EMBEDDING_CONFIGS["cpu"])
+
+
+# ---------------------------------------------------------------------------
+# Step 4: Virtual environment
+# ---------------------------------------------------------------------------
+
+def _create_venv(project_root: Path) -> Path:
+    print("\n[3/10] Creating virtual environment ... ", end="", flush=True)
+    venv_dir = project_root / ".venv"
+
+    if platform.system() == "Windows":
+        venv_python = venv_dir / "Scripts" / "python.exe"
+    else:
+        venv_python = venv_dir / "bin" / "python"
+
+    if venv_python.exists():
+        print("already exists")
+        return venv_python
+
+    subprocess.run(
+        [sys.executable, "-m", "venv", str(venv_dir)],
+        check=True, capture_output=True,
+    )
+    print("OK")
+    return venv_python
+
+
+# ---------------------------------------------------------------------------
+# Step 5: Install dependencies
+# ---------------------------------------------------------------------------
+
+def _install_requirements(venv_python: Path, *, dev: bool) -> None:
+    label = "with dev extras" if dev else "production"
+    print(f"[4/10] Installing dependencies ({label}) ... ", flush=True)
+
+    # Upgrade pip
+    subprocess.run(
+        [str(venv_python), "-m", "pip", "install", "--upgrade", "pip"],
+        check=True, capture_output=True,
+    )
+
+    # Install requirements
+    req_file = PROJECT_ROOT / "requirements.txt"
+    if not req_file.exists():
+        print("  WARNING: requirements.txt not found, skipping pip install")
+        return
+
+    cmd = [str(venv_python), "-m", "pip", "install", "-r", str(req_file)]
+    if dev:
+        req_dev = PROJECT_ROOT / "requirements-dev.txt"
+        if req_dev.exists():
+            cmd = [str(venv_python), "-m", "pip", "install",
+                   "-r", str(req_file), "-r", str(req_dev)]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print("  FAIL")
+        # Show last 30 lines of error
+        lines = result.stderr.strip().splitlines()[-30:]
+        for line in lines:
+            print(f"  {line}")
+        sys.exit(1)
+    print("  OK")
+
+
+# ---------------------------------------------------------------------------
+# Step 6: Container services
+# ---------------------------------------------------------------------------
+
+def _start_services(sysinfo: SystemInfo, args: argparse.Namespace,
+                    embed_config: dict) -> None:
+    print(f"\n[5/10] Starting services via {sysinfo.container_cmd} ... ", flush=True)
+
+    infra_dir = PROJECT_ROOT / "infrastructure"
+    compose_file = infra_dir / "docker-compose.yml"
+
+    if not compose_file.exists():
+        print(f"  WARNING: {compose_file} not found, skipping.")
+        print("  Start Weaviate and Ollama manually.")
+        return
+
+    compose_cmd = _get_compose_command(sysinfo.container_cmd)
+
+    cmd = [*compose_cmd, "-f", str(compose_file)]
+
+    # GPU overlay + code_embed profile
+    if sysinfo.has_gpu:
+        gpu_file = infra_dir / "docker-compose.gpu.yml"
+        if gpu_file.exists():
+            cmd.extend(["-f", str(gpu_file), "--profile", "gpu"])
+            print("  GPU overlay: enabled (includes code_embed container)")
+        else:
+            print("  WARNING: GPU overlay file not found, running CPU-only")
+
+    cmd.extend(["up", "-d"])
+
+    result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(infra_dir))
+    if result.returncode != 0:
+        print(f"  FAIL")
+        for line in result.stderr.strip().splitlines()[-10:]:
+            print(f"  {line}")
+        print(f"\n  Try starting manually:")
+        print(f"    cd {infra_dir}")
+        print(f"    {' '.join(compose_cmd)} up -d")
+        sys.exit(1)
+    print("  OK")
+
+
+def _get_compose_command(container_cmd: str) -> list[str]:
+    """Return the compose command as a list of args."""
+    if container_cmd == "podman":
+        # Prefer standalone podman-compose if present
+        if shutil.which("podman-compose"):
+            return ["podman-compose"]
+        # Try `podman compose` plugin
+        try:
+            result = subprocess.run(
+                ["podman", "compose", "version"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                return ["podman", "compose"]
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        # Last-resort fallback (user will see error if neither works)
+        return ["podman", "compose"]
+
+    # Docker: try v2 plugin first, then standalone
+    try:
+        result = subprocess.run(
+            ["docker", "compose", "version"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            return ["docker", "compose"]
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+    if shutil.which("docker-compose"):
+        return ["docker-compose"]
+    return ["docker", "compose"]
+
+
+def _wait_for_ollama() -> None:
+    """Wait for Ollama to be ready."""
+    print("[6/10] Waiting for Ollama ... ", end="", flush=True)
+    port = os.environ.get("OLLAMA_PORT", str(DEFAULT_OLLAMA_PORT))
+    url = f"http://localhost:{port}/api/tags"
+    deadline = time.monotonic() + HEALTH_TIMEOUT
+
+    while time.monotonic() < deadline:
+        try:
+            resp = urllib.request.urlopen(url, timeout=3)
+            if resp.status == 200:
+                print("OK")
+                return
+        except (urllib.error.URLError, OSError):
+            pass
+        time.sleep(2)
+
+    print("TIMEOUT")
+    print(f"  Ollama not ready after {HEALTH_TIMEOUT}s at {url}")
+    print("  Check container logs.")
+
+
+def _pull_ollama_models(models: list[str]) -> None:
+    """Pull required Ollama models."""
+    print("[7/10] Pulling Ollama models ... ", flush=True)
+    port = os.environ.get("OLLAMA_PORT", str(DEFAULT_OLLAMA_PORT))
+
+    for model in models:
+        print(f"  Pulling {model} ... ", end="", flush=True)
+        try:
+            data = json.dumps({"name": model}).encode()
+            req = urllib.request.Request(
+                f"http://localhost:{port}/api/pull",
+                data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            resp = urllib.request.urlopen(req, timeout=600)
+            # Read streaming response to completion
+            while True:
+                chunk = resp.read(4096)
+                if not chunk:
+                    break
+            print("OK")
+        except (urllib.error.URLError, OSError) as e:
+            print(f"WARN ({e})")
+            print(f"    Pull manually: curl -X POST "
+                  f"http://localhost:{port}/api/pull "
+                  f"-d '{{\"name\": \"{model}\"}}'")
+
+
+# ---------------------------------------------------------------------------
+# Step 7: State directory
+# ---------------------------------------------------------------------------
+
+def _create_state_directory() -> None:
+    print("[8/10] Creating state directory ... ", end="", flush=True)
+    state_dir = PROJECT_ROOT / "state"
+    state_dir.mkdir(exist_ok=True)
+    (state_dir / "logs").mkdir(exist_ok=True)
+    print("OK")
+
+
+# ---------------------------------------------------------------------------
+# Step 8: Write .env
+# ---------------------------------------------------------------------------
+
+def _write_env_config(embed_config: dict, args: argparse.Namespace) -> None:
+    print("[9/10] Writing configuration ... ", end="", flush=True)
+    env_file = PROJECT_ROOT / ".env"
+
+    weaviate_port = os.environ.get("WEAVIATE_PORT", str(DEFAULT_WEAVIATE_PORT))
+    weaviate_grpc = os.environ.get("WEAVIATE_GRPC_PORT", str(DEFAULT_WEAVIATE_GRPC_PORT))
+    ollama_port = os.environ.get("OLLAMA_PORT", str(DEFAULT_OLLAMA_PORT))
+    code_embed_port = os.environ.get("CODE_EMBED_PORT", str(DEFAULT_CODE_EMBED_PORT))
+
+    lines = [
+        "# VibeCoded Tools — Orchestrator Configuration",
+        "# Generated by install.py — edit as needed",
+        "",
+        "# Weaviate",
+        f"WEAVIATE_URL=http://localhost:{weaviate_port}",
+        f"WEAVIATE_PORT={weaviate_port}",
+        f"WEAVIATE_GRPC_PORT={weaviate_grpc}",
+        "",
+        "# Ollama",
+        f"OLLAMA_URL=http://localhost:{ollama_port}",
+        f"OLLAMA_PORT={ollama_port}",
+        "",
+        "# Embedding models",
+        f"EMBEDDING_MODEL={embed_config['text_model']}",
+        f"EMBEDDING_DIMS={embed_config['text_dims']}",
+        f"CODE_EMBED_BACKEND={embed_config['code_backend']}",
+        f"CODE_EMBED_MODEL={embed_config['code_model']}",
+        f"CODE_EMBED_DIMS={embed_config['code_dims']}",
+        f"CODE_EMBED_SERVICE_URL=http://localhost:{code_embed_port}",
+        f"ACTIVE_EMBEDDING=qwen3",
+        "",
+        "# Chunking",
+        f"CHUNKING_TEXT_TOKENS={embed_config['chunking_text_tokens']}",
+        f"CHUNKING_CODE_TOKENS={embed_config['chunking_code_tokens']}",
+        "",
+        "# Knowledge Graph",
+        "KG_COLLECTION=KnowledgeGraph",
+        "DEVELOPMENT_COLLECTION=Development",
+        "",
+    ]
+
+    if embed_config.get("openai_key"):
+        lines.extend([
+            "# OpenAI (for embeddings)",
+            f"OPENAI_API_KEY={embed_config['openai_key']}",
+            "EMBEDDING_PROVIDER=openai",
+            "",
+        ])
+    else:
+        lines.extend([
+            "# Embedding provider",
+            "EMBEDDING_PROVIDER=ollama",
+            "",
+        ])
+
+    # Write (don't overwrite if exists)
+    if env_file.exists():
+        print("already exists (not overwritten)")
+    else:
+        env_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        print("OK")
+
+
+# ---------------------------------------------------------------------------
+# Step 9: Configure Claude Code
+# ---------------------------------------------------------------------------
+
+def _configure_claude_settings(embed_config: dict) -> None:
+    """Create .claude/settings.json with MCP server configuration."""
+    settings_dir = PROJECT_ROOT / ".claude"
+    settings_dir.mkdir(exist_ok=True)
+
+    settings_file = settings_dir / "settings.json"
+    if settings_file.exists():
+        print("  Claude settings: already configured")
+        return
+
+    # Build the env block for weaviate-kg MCP
+    weaviate_port = os.environ.get("WEAVIATE_PORT", str(DEFAULT_WEAVIATE_PORT))
+    weaviate_grpc = os.environ.get("WEAVIATE_GRPC_PORT", str(DEFAULT_WEAVIATE_GRPC_PORT))
+    ollama_port = os.environ.get("OLLAMA_PORT", str(DEFAULT_OLLAMA_PORT))
+
+    settings = {
+        "permissions": {
+            "allow": [
+                "Bash(git *)",
+                "Bash(python *)",
+                "Bash(.claude/scripts/*)",
+            ],
+        },
+        "env": {
+            "WEAVIATE_URL": f"http://localhost:{weaviate_port}",
+            "OLLAMA_URL": f"http://localhost:{ollama_port}",
+            "GRPC_PORT": str(weaviate_grpc),
+            "EMBEDDING_MODEL": embed_config["text_model"],
+            "ACTIVE_EMBEDDING": "qwen3",
+            "KG_COLLECTION": "KnowledgeGraph",
+            "DEVELOPMENT_COLLECTION": "Development",
+            "CODE_EMBED_BACKEND": embed_config["code_backend"],
+            "CODE_EMBED_SERVICE_URL": f"http://localhost:{DEFAULT_CODE_EMBED_PORT}",
+        },
+    }
+
+    settings_file.write_text(
+        json.dumps(settings, indent=2) + "\n", encoding="utf-8",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Step 9b: Install agents + skills from templates/
+# ---------------------------------------------------------------------------
+
+def _install_agents_and_skills(args: argparse.Namespace) -> None:
+    """Copy agents and skills from templates/ into .claude/, substituting paths.
+
+    Free-tier agents live at templates/agents/free/; MAO-tier at templates/agents/mao/
+    (gated on --with-mao-agents). Skills live at templates/skills/.
+
+    Placeholder substitutions applied to copied files:
+        {{ORCHESTRATOR_ROOT}} → this install directory
+        {{PROJECTS_ROOT}}     → parent directory
+        {{HOME}}              → user home directory
+    """
+    print("[9b/10] Installing agents and skills ... ", flush=True)
+
+    templates_dir = PROJECT_ROOT / "templates"
+    claude_dir = PROJECT_ROOT / ".claude"
+    agents_dst = claude_dir / "agents"
+    skills_dst = claude_dir / "skills"
+
+    subs = {
+        "{{ORCHESTRATOR_ROOT}}": str(PROJECT_ROOT),
+        "{{PROJECTS_ROOT}}": str(PROJECT_ROOT.parent),
+        "{{HOME}}": str(Path.home()),
+    }
+
+    def _copy_with_subs(src: Path, dst: Path) -> None:
+        content = src.read_text(encoding="utf-8")
+        for key, val in subs.items():
+            content = content.replace(key, val)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text(content, encoding="utf-8")
+
+    installed_agents = 0
+    skipped_agents = 0
+    if args.with_agents:
+        agents_dst.mkdir(parents=True, exist_ok=True)
+        free_src = templates_dir / "agents" / "free"
+        if free_src.exists():
+            for agent_file in sorted(free_src.glob("*.md")):
+                target = agents_dst / agent_file.name
+                if target.exists():
+                    skipped_agents += 1
+                    continue
+                _copy_with_subs(agent_file, target)
+                installed_agents += 1
+
+    installed_mao = 0
+    if args.with_mao_agents:
+        agents_dst.mkdir(parents=True, exist_ok=True)
+        mao_src = templates_dir / "agents" / "mao"
+        if mao_src.exists():
+            for agent_file in sorted(mao_src.glob("*.md")):
+                target = agents_dst / agent_file.name
+                if target.exists():
+                    continue
+                _copy_with_subs(agent_file, target)
+                installed_mao += 1
+
+    installed_skills = 0
+    skipped_skills = 0
+    if args.with_skills:
+        skills_src = templates_dir / "skills"
+        if skills_src.exists():
+            skills_dst.mkdir(parents=True, exist_ok=True)
+            for skill_dir in sorted(p for p in skills_src.iterdir() if p.is_dir()):
+                target = skills_dst / skill_dir.name
+                if target.exists():
+                    skipped_skills += 1
+                    continue
+                target.mkdir(parents=True, exist_ok=True)
+                for f in skill_dir.rglob("*"):
+                    rel = f.relative_to(skill_dir)
+                    out = target / rel
+                    if f.is_dir():
+                        out.mkdir(parents=True, exist_ok=True)
+                    elif f.suffix == ".md":
+                        _copy_with_subs(f, out)
+                    else:
+                        out.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(f, out)
+                installed_skills += 1
+
+    parts = []
+    if args.with_agents:
+        parts.append(f"{installed_agents} free agents"
+                     + (f" ({skipped_agents} already present)" if skipped_agents else ""))
+    if args.with_mao_agents:
+        parts.append(f"{installed_mao} MAO agents")
+    if args.with_skills:
+        parts.append(f"{installed_skills} skills"
+                     + (f" ({skipped_skills} already present)" if skipped_skills else ""))
+    if not parts:
+        print("  skipped (--no-agents --no-skills)")
+    else:
+        print("  " + ", ".join(parts))
+
+
+# ---------------------------------------------------------------------------
+# Step 10: Claude CLI
+# ---------------------------------------------------------------------------
+
+def _check_claude_cli() -> None:
+    print("[10/10] Checking Claude CLI ... ", end="", flush=True)
+    if shutil.which("claude"):
+        try:
+            result = subprocess.run(
+                ["claude", "--version"],
+                capture_output=True, text=True, timeout=10,
+            )
+            version = result.stdout.strip() or "found"
+            print(f"OK ({version})")
+        except (subprocess.TimeoutExpired, OSError):
+            print("found (version check timed out)")
+    else:
+        print("NOT FOUND")
+        print("  Claude Code CLI is required to use the orchestrator.")
+        print("  Install: npm install -g @anthropic-ai/claude-code")
+        print("  Requires: Node.js 18+ (https://nodejs.org)")
+
+
+# ---------------------------------------------------------------------------
+# Next steps
+# ---------------------------------------------------------------------------
+
+def _print_next_steps(sysinfo: SystemInfo, args: argparse.Namespace) -> None:
+    if sysinfo.os_name == "Windows":
+        activate = r".venv\Scripts\activate"
+    else:
+        activate = "source .venv/bin/activate"
+
+    print("Next steps:")
+    print()
+    print(f"  1. Open this project in VS Code:")
+    print(f"     code {PROJECT_ROOT}")
+    print()
+    print(f"  2. Start a Claude Code session (the orchestrator activates automatically):")
+    print(f"     claude")
+    print()
+    print(f"  3. Or activate the venv for manual scripts:")
+    print(f"     {activate}")
+    print()
+
+    if not shutil.which("claude"):
+        print("  IMPORTANT: Install Claude Code CLI first:")
+        print("     npm install -g @anthropic-ai/claude-code")
+        print()
+
+    if args.no_containers:
+        print("  NOTE: You skipped container setup. Start Weaviate and Ollama")
+        print("  manually before using the orchestrator.")
+        print()
+
+    print("  Documentation: docs/guides/GETTING_STARTED.md")
+    print("  Report issues: https://github.com/VibeCoded-Tools/orchestrator/issues")
+    print()
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    sys.exit(main())

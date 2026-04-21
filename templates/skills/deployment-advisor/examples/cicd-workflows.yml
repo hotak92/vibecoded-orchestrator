@@ -1,0 +1,206 @@
+# CI/CD Workflow Examples
+
+## GitHub Actions - Vercel Deployment
+
+```yaml
+name: Deploy to Vercel
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+      - run: npm ci
+      - run: npm test
+      - run: npm run lint
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+      - run: npm ci
+      - run: npm run build
+      - uses: vercel/action@v1
+        with:
+          token: ${{ secrets.VERCEL_TOKEN }}
+          vercel-args: '--prod'
+```
+
+## GitHub Actions - AWS S3 + CloudFront
+
+```yaml
+name: Deploy to AWS
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+
+      - name: Install and build
+        run: |
+          npm ci
+          npm run build
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Deploy to S3
+        run: |
+          aws s3 sync ./dist s3://${{ secrets.S3_BUCKET }} --delete
+
+      - name: Invalidate CloudFront
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.CLOUDFRONT_ID }} \
+            --paths "/*"
+```
+
+## GitLab CI - Docker + Self-Hosted
+
+```yaml
+stages:
+  - test
+  - build
+  - deploy
+
+test:
+  stage: test
+  image: node:18
+  script:
+    - npm ci
+    - npm test
+    - npm run lint
+
+build:
+  stage: build
+  image: docker:latest
+  services:
+    - docker:dind
+  script:
+    - docker build -t $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA .
+    - docker push $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+  only:
+    - main
+
+deploy:
+  stage: deploy
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache openssh
+  script:
+    - ssh user@server "docker pull $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA"
+    - ssh user@server "docker stop app || true"
+    - ssh user@server "docker rm app || true"
+    - ssh user@server "docker run -d --name app -p 80:3000 $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA"
+  only:
+    - main
+```
+
+## CircleCI - Netlify Deployment
+
+```yaml
+version: 2.1
+
+orbs:
+  node: circleci/node@5.0
+
+workflows:
+  test-and-deploy:
+    jobs:
+      - test
+      - deploy:
+          requires:
+            - test
+          filters:
+            branches:
+              only: main
+
+jobs:
+  test:
+    executor:
+      name: node/default
+      tag: '18'
+    steps:
+      - checkout
+      - node/install-packages
+      - run: npm test
+      - run: npm run lint
+
+  deploy:
+    executor:
+      name: node/default
+      tag: '18'
+    steps:
+      - checkout
+      - node/install-packages
+      - run: npm run build
+      - run: |
+          npm install -g netlify-cli
+          netlify deploy --prod --dir=dist
+```
+
+## Environment-Specific Deployments
+
+```yaml
+# Deploy different branches to different environments
+name: Multi-Environment Deploy
+
+on:
+  push:
+    branches: [dev, staging, main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+
+      - name: Set environment
+        id: env
+        run: |
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "ENV=production" >> $GITHUB_OUTPUT
+            echo "URL=https://app.example.com" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == "refs/heads/staging" ]]; then
+            echo "ENV=staging" >> $GITHUB_OUTPUT
+            echo "URL=https://staging.example.com" >> $GITHUB_OUTPUT
+          else
+            echo "ENV=development" >> $GITHUB_OUTPUT
+            echo "URL=https://dev.example.com" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build and deploy
+        run: |
+          npm ci
+          npm run build
+          # Deploy using environment-specific config
+        env:
+          ENV: ${{ steps.env.outputs.ENV }}
+```

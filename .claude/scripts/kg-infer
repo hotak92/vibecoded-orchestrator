@@ -1,0 +1,21 @@
+#!/bin/bash
+# Knowledge Graph Inference Wrapper
+#
+# Applies semantic inference rules to derive new facts from typed relationships.
+#
+# Usage:
+#   .claude/scripts/kg-infer "Node Title"    # Infer for single node
+#   .claude/scripts/kg-infer --all           # Infer for all nodes
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+# Activate venv if available
+if [ -f "$PROJECT_ROOT/claude_mcp_servers/.venv/bin/activate" ]; then
+    source "$PROJECT_ROOT/claude_mcp_servers/.venv/bin/activate"
+fi
+
+# Run inference script
+exec python "$SCRIPT_DIR/infer_knowledge.py" "$@"

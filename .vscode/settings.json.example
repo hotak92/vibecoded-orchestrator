@@ -1,0 +1,30 @@
+{
+  "_comment": "VS Code project settings template for the VibeCoded Orchestrator. Copy this to .vscode/settings.json and fill in the values. The claude-code.env block is read by the Claude Code VS Code extension and passed to MCP server subprocesses — this is how this project wires up Weaviate + Ollama without global config leaking into other projects.",
+
+  "claude-code.env": {
+    "_comment": "Local infrastructure URLs. Defaults match the podman-compose.yml; change only if you run the services on different ports.",
+    "WEAVIATE_URL": "http://localhost:8081",
+    "OLLAMA_URL": "http://localhost:11435",
+    "GRPC_PORT": "50052",
+
+    "_comment_kg": "Knowledge graph collection (per-project) and shared collection for cross-project patterns.",
+    "KG_COLLECTION": "VibeCodedKG",
+    "SHARED_KG_COLLECTION": "",
+    "KG_BASE_DIR": "${workspaceFolder}",
+    "PROJECT_NAME": "VibeCodedOrchestrator",
+
+    "_comment_codegraph": "Code graph collection name (per-project) + code embedding service URL.",
+    "CODE_GRAPH_PROJECT": "VibeCodedOrchestrator",
+    "CODE_EMBED_SERVICE_URL": "http://localhost:11438",
+
+    "_comment_embeddings": "Text embedding backend — 'qwen3' (default) or 'snowflake' (legacy).",
+    "ACTIVE_EMBEDDING": "qwen3",
+    "EMBEDDING_MODEL": "qwen3-embedding:0.6b",
+
+    "_comment_mcp_servers": "Paths to MCP server entrypoints in this project. install.py sets these for you.",
+    "MCP_PYTHON": "${workspaceFolder}/.venv/bin/python",
+    "MCP_WEAVIATE_SERVER": "${workspaceFolder}/claude_mcp_servers/weaviate_mcp/server.py",
+    "MCP_OLLAMA_SERVER": "${workspaceFolder}/claude_mcp_servers/ollama_mcp/server.py",
+    "MCP_PYTHONPATH": "${workspaceFolder}/claude_mcp_servers"
+  }
+}

@@ -1,0 +1,23 @@
+#!/bin/bash
+# Knowledge Graph Vocabulary Migration
+#
+# Migrate knowledge nodes to vocabulary standard (VOCABULARY.md, TAG_HIERARCHY.md)
+#
+# Usage:
+#   .claude/scripts/kg-migrate --check              # Check all nodes, report issues
+#   .claude/scripts/kg-migrate --fix                # Apply automatic fixes
+#   .claude/scripts/kg-migrate --interactive        # Interactive mode with prompts
+#   .claude/scripts/kg-migrate --file <path>        # Check/fix single file
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+# Activate venv if available
+if [ -f "$PROJECT_ROOT/claude_mcp_servers/.venv/bin/activate" ]; then
+    source "$PROJECT_ROOT/claude_mcp_servers/.venv/bin/activate"
+fi
+
+# Run migration script
+exec python "$SCRIPT_DIR/migrate_to_vocabulary.py" "$@"

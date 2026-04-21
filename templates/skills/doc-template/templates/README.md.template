@@ -1,0 +1,56 @@
+# Project Name
+
+Brief description (1-2 sentences explaining what this project does)
+
+## Features
+
+- Feature 1
+- Feature 2
+- Feature 3
+
+## Installation
+
+```bash
+npm install
+cp .env.example .env
+# Configure .env with your settings
+npm run dev
+```
+
+## Usage
+
+```javascript
+// Example code showing how to use the project
+```
+
+## API Documentation
+
+See [API.md](API.md) for detailed endpoint documentation
+
+## Configuration
+
+Environment variables:
+- `DATABASE_URL`: Database connection string
+- `API_KEY`: External API key
+- `PORT`: Server port (default: 3000)
+
+## Development
+
+```bash
+npm run dev      # Start development server
+npm test         # Run tests
+npm run lint     # Run linter
+npm run build    # Build for production
+```
+
+## Contributing
+
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
+
+## License
+
+MIT License - see [LICENSE](LICENSE) file for details

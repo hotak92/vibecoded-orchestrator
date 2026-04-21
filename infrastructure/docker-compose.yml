@@ -1,0 +1,68 @@
+services:
+  weaviate:
+    image: cr.weaviate.io/semitechnologies/weaviate:1.28.4
+    ports:
+      - "${WEAVIATE_PORT:-8081}:8080"
+      - "${WEAVIATE_GRPC_PORT:-50052}:50051"
+    volumes:
+      - weaviate_data:/var/lib/weaviate
+    environment:
+      QUERY_DEFAULTS_LIMIT: 25
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
+      PERSISTENCE_DATA_PATH: /var/lib/weaviate
+      DEFAULT_VECTORIZER_MODULE: none
+      CLUSTER_HOSTNAME: node1
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/v1/.well-known/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  ollama:
+    image: docker.io/ollama/ollama:latest
+    ports:
+      - "${OLLAMA_PORT:-11435}:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      OLLAMA_ORIGINS: "*"
+      OLLAMA_FLASH_ATTENTION: "1"
+      OLLAMA_KV_CACHE_TYPE: q8_0
+    restart: unless-stopped
+
+  # Code embedding service (GPU — only started with --gpu flag or GPU compose overlay)
+  # CPU users: set CODE_EMBED_BACKEND=ollama in .env to use Ollama fallback instead
+  code_embed:
+    build:
+      context: ../claude_mcp_servers/code_embedding_service
+      dockerfile: Dockerfile
+    container_name: vct_code_embed
+    restart: unless-stopped
+    ports:
+      - "${CODE_EMBED_PORT:-11440}:11440"
+    environment:
+      CODE_EMBED_BACKEND: "${CODE_EMBED_BACKEND:-gpu}"
+      CODE_EMBED_MODEL: "codesage/codesage-large-v2"
+      CODE_EMBED_DEVICE: "auto"
+      CODE_EMBED_DTYPE: "bfloat16"
+      CODE_EMBED_PORT: "11440"
+      CODE_EMBED_MAX_CONCURRENT: "4"
+      HF_HOME: "/cache"
+      HF_HUB_CACHE: "/cache"
+      TRANSFORMERS_CACHE: "/cache"
+    volumes:
+      - code_embed_cache:/cache
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:11440/health')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    profiles:
+      - gpu  # Only started when `--profile gpu` is passed
+
+volumes:
+  weaviate_data:
+  ollama_data:
+  code_embed_cache:

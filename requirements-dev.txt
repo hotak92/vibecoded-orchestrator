@@ -1,0 +1,14 @@
+# Development dependencies (not needed for production use)
+
+# Testing (MIT)
+pytest>=8.0
+pytest-asyncio>=0.23
+
+# Linting (MIT)
+ruff>=0.4
+
+# Browser testing (Apache 2.0) — optional
+playwright>=1.40
+
+# Type checking
+pyright>=1.1

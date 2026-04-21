@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "_comment": "Project-scoped Claude Code settings. Environment variables for MCP servers live in .vscode/settings.json (claude-code.env) — see .vscode/settings.json.example. Users should not need to edit ~/.claude/settings.json for this project.",
+  "permissions": {
+    "allow": [
+      "Bash(pytest *)",
+      "Bash(python *)",
+      "Bash(pip install *)",
+      "mcp__weaviate-kg__*",
+      "mcp__ollama__*"
+    ]
+  },
+  "hooks": {
+    "comment": "Hook registration is done here if you want the orchestrator's automated KG/codegraph sync to fire on file edits. See .claude/hooks/ for the scripts. Install with: cp .claude/settings.json.with-hooks .claude/settings.json (or let install.py set this up for you)."
+  }
+}

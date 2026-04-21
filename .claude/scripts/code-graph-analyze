@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Code Graph Analyzer wrapper - AST-based code entity extraction
+# Usage: code-graph-analyze /path/to/repo [OPTIONS]
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV_PATH="$SCRIPT_DIR/../../claude_mcp_servers/.venv"
+
+# Activate venv if it exists
+if [ -d "$VENV_PATH" ]; then
+    source "$VENV_PATH/bin/activate"
+fi
+
+# Run the Python script
+python3 "$SCRIPT_DIR/analyze_code_graph.py" "$@"

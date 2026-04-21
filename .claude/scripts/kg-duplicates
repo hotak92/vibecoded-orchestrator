@@ -1,0 +1,22 @@
+#!/bin/bash
+# Knowledge Graph Duplicate Detection
+#
+# Finds potential duplicate nodes using semantic similarity and title matching.
+#
+# Usage:
+#   .claude/scripts/kg-duplicates                      # Full scan (threshold 0.95)
+#   .claude/scripts/kg-duplicates --threshold 0.90     # Custom threshold
+#   .claude/scripts/kg-duplicates --output report.md   # Custom output location
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+# Activate venv if available
+if [ -f "$PROJECT_ROOT/claude_mcp_servers/.venv/bin/activate" ]; then
+    source "$PROJECT_ROOT/claude_mcp_servers/.venv/bin/activate"
+fi
+
+# Run duplicate detection
+exec python "$SCRIPT_DIR/detect_duplicates.py" "$@"

@@ -1,0 +1,10 @@
+#!/bin/bash
+# Wrapper script for sync_knowledge_graph.py with automatic venv activation
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+VENV_PATH="$PROJECT_ROOT/claude_mcp_servers/.venv"
+
+# Activate venv and run script
+source "$VENV_PATH/bin/activate"
+python "$SCRIPT_DIR/sync_knowledge_graph.py" "$@"

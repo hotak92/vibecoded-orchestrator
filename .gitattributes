@@ -1,0 +1,39 @@
+# Enforce line endings for cross-platform compatibility.
+# Shell scripts require LF to execute on Linux/macOS — Windows git on checkout
+# will otherwise convert them to CRLF and bash will fail with "bad interpreter".
+
+# Default: auto-detect text, normalize to LF on commit
+* text=auto eol=lf
+
+# Shell scripts must be LF (bash cannot parse CRLF line endings)
+*.sh        text eol=lf
+*.bash      text eol=lf
+
+# PowerShell: LF works fine but CRLF is also accepted; prefer LF for consistency
+*.ps1       text eol=lf
+*.psm1      text eol=lf
+*.cmd       text eol=crlf
+*.bat       text eol=crlf
+
+# Python / config files
+*.py        text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.json      text eol=lf
+*.toml      text eol=lf
+*.md        text eol=lf
+
+# Binary files — never touch
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.ico       binary
+*.pdf       binary
+*.zip       binary
+*.tar       binary
+*.gz        binary
+*.7z        binary
+*.pt        binary
+*.onnx      binary
+*.bin       binary
