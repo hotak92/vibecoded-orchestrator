@@ -33,7 +33,7 @@ from .queue import TelemetryQueue, get_queue
 
 log = logging.getLogger(__name__)
 
-DEFAULT_URL = "https://api.vibecodedtools.it/telemetry"
+DEFAULT_URL = "https://ltnlwhaxnpbiifordlbk.supabase.co/functions/v1/telemetry"
 BATCH_SIZE = 100
 RETRY_DELAYS = (1.0, 4.0, 16.0)  # len = number of retries after the first try
 REQUEST_TIMEOUT = 10.0
