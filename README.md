@@ -10,35 +10,36 @@ Open source. Runs locally. Learns from you.
 
 The orchestrator is an invisible infrastructure layer for [Claude Code](https://claude.ai/code) that solves three problems no other tool addresses together:
 
-| Problem | How We Solve It |
+| Problem | How we solve it |
 |---------|----------------|
 | **Context amnesia** | Knowledge Graph with semantic search — Claude remembers across sessions |
-| **Wasted tokens** | Automated context injection — relevant info is surfaced proactively |
-| **No code understanding** | Code Graph with 5 entity types — Claude understands your codebase structurally |
+| **Code blindness** | Code Graph indexes modules, classes, functions, APIs, and cross-service calls for your whole repo |
+| **Workflow repetition** | 26 specialist agents + 29 skills auto-install; 16 hooks automate repetitive ops (sync, security scan, context injection) |
 
-You use Claude Code normally. The orchestrator works in the background via hooks.
+You use Claude Code normally. The orchestrator works in the background via hooks and MCP servers.
 
 ## Features
 
-- **Knowledge Graph** — Markdown nodes with typed WikiLinks, stored in Weaviate with semantic embeddings
-- **Code Graph** — AST analysis across 10+ languages: modules, classes, functions, APIs, cross-service calls
-- **17+ Hook Scripts** — Automated context injection, security scanning, KG/code graph sync
-- **MCP Servers** — Semantic search, local LLM inference, code embedding
-- **Workflow Automation** — Session state tracking, plans, memory management, compaction preservation
+- **Knowledge Graph** — Markdown nodes with typed WikiLinks, stored in Weaviate with semantic embeddings (qwen3 1024-dim by default; optional OpenAI)
+- **Code Graph** — AST analysis via Tree-sitter across 10+ languages: `CodeModule`, `CodeClass`, `CodeFunction`, `CodeAPI`, `CodeInteraction`
+- **16 Automation Hooks** — SessionStart through Stop: context injection, auto-sync on file edits, credential scanning, KG/code graph maintenance
+- **4 MCP Servers** — Weaviate (semantic search), Ollama (local LLM + embeddings), search (web + code + arXiv), code-embedding (CodeSage-Large-v2 via FastAPI)
+- **26 Agents + 29 Skills** — shipped via `install.py` templates; opt-in MAO-tier specialists add 10 more agents
+- **Workflow Automation** — session state tracking, plans, memory management, compaction-preserving context replay
 
 ## Quick Install
 
 ### Linux / macOS
 ```bash
-git clone https://github.com/VibeCoded-Tools/orchestrator.git
-cd orchestrator
+git clone https://github.com/hotak92/vibecoded-orchestrator.git
+cd vibecoded-orchestrator
 ./install.sh
 ```
 
 ### Windows (PowerShell)
 ```powershell
-git clone https://github.com/VibeCoded-Tools/orchestrator.git
-cd orchestrator
+git clone https://github.com/hotak92/vibecoded-orchestrator.git
+cd vibecoded-orchestrator
 .\install.ps1
 ```
 
@@ -50,11 +51,14 @@ cd orchestrator
 
 ### Options
 ```
-python install.py --gpu              # Enable NVIDIA GPU acceleration
-python install.py --cpu-only         # Force CPU mode
-python install.py --openai-key KEY   # Use OpenAI embeddings instead of local
-python install.py --no-containers    # Skip Docker/Podman (manual setup)
-python install.py --container docker # Force Docker (default: auto-detect)
+python install.py --gpu               # Enable NVIDIA GPU acceleration
+python install.py --cpu-only          # Force CPU mode
+python install.py --openai-key KEY    # Use OpenAI embeddings instead of local
+python install.py --no-containers     # Skip Docker/Podman (manual setup)
+python install.py --container docker  # Force Docker (default: auto-detect)
+python install.py --no-agents         # Skip installing agent templates
+python install.py --no-skills         # Skip installing skill templates
+python install.py --with-mao-agents   # Install the 10 MAO-tier specialist agents (requires MAO license)
 ```
 
 ### Requirements
@@ -97,23 +101,28 @@ Claude generates response
 ## Project Structure
 
 ```
-orchestrator/
+vibecoded-orchestrator/
   .claude/
-    hooks/          # 16 automation hooks (SessionStart → Stop)
-    scripts/        # CLI tools for KG and code graph
-    settings.json   # Claude Code configuration
+    hooks/               # 16 automation hooks (SessionStart → Stop)
+    scripts/             # CLI tools for KG and code graph
+    settings.json        # Claude Code configuration
   claude_mcp_servers/
-    weaviate_mcp/   # Semantic search MCP server
-    ollama_mcp/     # Local LLM inference MCP server
-    search_mcp/     # Web + code + paper search MCP server
-    code_embedding_service/  # GPU code embedding service
+    weaviate_mcp/        # Semantic search MCP server
+    ollama_mcp/          # Local LLM inference MCP server
+    search_mcp/          # Web + code + paper search MCP server
+    code_embedding_service/   # GPU code embedding service (CodeSage-Large-v2)
+  templates/
+    agents/free/         # 16 free-tier agents copied to .claude/agents/ at install time
+    agents/mao/          # 10 MAO-tier specialist agents (opt-in)
+    skills/              # 29 skills copied to .claude/skills/ at install time
   infrastructure/
     docker-compose.yml       # Weaviate + Ollama containers
     docker-compose.gpu.yml   # NVIDIA GPU overlay
-  knowledge/        # Knowledge graph nodes (your persistent memory)
-  config/           # Configuration templates
-  docs/             # Documentation
-  CLAUDE.md         # Instructions for Claude Code
+  VCThelpers/           # License validator + telemetry (opt-in)
+  knowledge/            # Knowledge graph nodes — your persistent memory
+  config/               # Configuration templates
+  docs/                 # Documentation
+  CLAUDE.md             # Instructions for Claude Code when opening this repo
 ```
 
 ## Comparison
@@ -129,14 +138,16 @@ orchestrator/
 
 ## Tiers
 
-| Tier | Price | What You Get |
-|------|-------|-------------|
-| **Free** | €0 | Everything above. Full orchestrator, KG, code graph, hooks, MCP servers. Watermark on generated files (trivially removable). |
-| **Pro** | €19/mo, €149/yr, €199 lifetime (cap 100) | RL-scored retrieval that learns from your usage, curated agent packs, auto-updates, watermark off |
-| **MAO** | €99/mo, €799/yr, €999 lifetime (cap 30) | Everything in Pro + multi-agent orchestrator with 32+ specialized agents, Tauri desktop UI |
-| **Enterprise** | From €500/mo | MAO + SOC 2 compliance, priority support, commercial AGPL exemption, custom SLAs |
+> Pricing is finalized at launch. Numbers below are the current working target, subject to change.
 
-Pro and MAO tiers activate additional features via a license key issued at purchase. Free tier works fully without a key — RL retrieval simply falls back to cosine ordering.
+| Tier | Target price | What you get |
+|------|-------|-------------|
+| **Free** | €0 | Full orchestrator: KG, code graph, hooks, MCP servers, 16 agents, 29 skills. AGPL-3.0 licensed. |
+| **Pro** | €19/mo, €149/yr, €199 lifetime (cap 100) | Free + RL-scored retrieval reranking, curated agent packs, auto-updates |
+| **MAO** | €99/mo, €799/yr, €999 lifetime (cap 30) | Pro + 10 specialist agents + Tauri desktop UI + multi-agent maestro runtime |
+| **Enterprise** | From €500/mo | MAO + SOC 2 compliance track, priority support, commercial AGPL exemption, custom SLAs |
+
+Pro and MAO tiers activate additional features via a license key issued at purchase and validated against our Supabase endpoint. Free tier works fully without a key — RL retrieval simply falls back to cosine ordering. No phone-home, no feature telemetry, no telemetry at all unless you opt in.
 
 ## Licensing
 
@@ -158,10 +169,18 @@ This is the same model used by MongoDB, Grafana, and Sentry.
 
 Contributions welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines and [CLA.md](CLA.md) for the Contributor License Agreement (accepted via `git commit -s`).
 
+## Documentation
+
+- [Configuration philosophy](docs/CONFIGURATION.md) — minimal global, max per-project; where each config lives
+- [Troubleshooting](docs/TROUBLESHOOTING.md) — bypass-permissions, container/MCP issues, first-run problems
+- [User journey](docs/USER_JOURNEY.md) — what using the orchestrator looks like across a first install and multi-project use
+- [Positioning](docs/POSITIONING.md) — target market + competitive framing (launch asset, not user docs)
+- [Dependency licenses](docs/DEPENDENCY_LICENSES.md) — transitive licensing audit for the AGPL-3.0 release
+- [Templates README](templates/README.md) — what agents and skills install.py will drop into `.claude/`
+
 ## Links
 
-- [Documentation](docs/)
-- [Report Issues](https://github.com/VibeCoded-Tools/orchestrator/issues)
+- [Report Issues](https://github.com/hotak92/vibecoded-orchestrator/issues)
 - [VibeCoded Tools](https://vibecodedtools.it)
 
 ---
