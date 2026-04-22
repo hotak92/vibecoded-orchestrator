@@ -49,3 +49,21 @@ If you see any of these in your global `~/.claude/settings.json`, move them to t
 ## Agents and skills
 
 See [templates/README.md](../templates/README.md) for the tier split (free vs MAO) and install-flag reference.
+
+## Parallel agents (3-5x speedup)
+
+Claude Code can run multiple agents concurrently on independent sub-tasks. Enable globally:
+
+```json
+// ~/.claude/settings.json
+{
+  "env": {
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
+  }
+}
+```
+
+With this on, when you ask the orchestrator to refactor 30 files or analyze 5 directories, it spawns up to 3 parallel agents instead of doing the work sequentially. Typical speedup on multi-file tasks: 3-5x.
+
+This is the only global env var we recommend setting — everything else is per-project.
+
