@@ -50,6 +50,7 @@ PRICING = {
     "claude-sonnet-4-6": (3.00, 15.00),
     "claude-opus-4-5": (15.00, 75.00),
     "claude-opus-4-6": (15.00, 75.00),
+    "claude-opus-4-7": (5.00, 25.00),
 }
 
 # Find matching price (prefix match)

@@ -23,16 +23,10 @@ LOG_DIR="$HOME/.claude/metrics"
 mkdir -p "$LOG_DIR"
 echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"project\":\"$PROJECT_NAME\",\"trigger\":\"$TRIGGER\"}" >> "$LOG_DIR/compactions.jsonl"
 
-# Desktop notification (Linux notify-send or macOS osascript)
-TITLE="Context compacted — $PROJECT_NAME"
-BODY="Trigger: $TRIGGER. Context re-injected."
-if command -v notify-send >/dev/null 2>&1; then
-    notify-send \
-        --icon=dialog-information \
-        --expire-time=5000 \
-        --urgency=low \
-        "$TITLE" \
-        "$BODY" 2>/dev/null || true
-elif command -v osascript >/dev/null 2>&1; then
-    osascript -e "display notification \"$BODY\" with title \"$TITLE\"" 2>/dev/null || true
-fi
+# Desktop notification
+notify-send \
+    --icon=dialog-information \
+    --expire-time=5000 \
+    --urgency=low \
+    "Context compacted — $PROJECT_NAME" \
+    "Trigger: $TRIGGER. Context re-injected." 2>/dev/null || true

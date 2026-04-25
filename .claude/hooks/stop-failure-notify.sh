@@ -23,18 +23,10 @@ LOG_DIR="$HOME/.claude/metrics"
 mkdir -p "$LOG_DIR"
 echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"project\":\"$PROJECT_NAME\",\"session_id\":\"$SESSION_ID\",\"error_type\":\"$ERROR_TYPE\",\"error_message\":\"$ERROR_MSG\"}" >> "$LOG_DIR/failures.jsonl"
 
-# Urgent desktop notification (Linux notify-send or macOS osascript)
-TITLE="Claude API Error — $PROJECT_NAME"
-BODY="$ERROR_TYPE: $ERROR_MSG"
-if command -v notify-send >/dev/null 2>&1; then
-    notify-send \
-        --icon=dialog-error \
-        --expire-time=15000 \
-        --urgency=critical \
-        "$TITLE" \
-        "$BODY" 2>/dev/null || true
-elif command -v osascript >/dev/null 2>&1; then
-    # macOS: escape quotes for osascript
-    ESCAPED_BODY=$(printf '%s' "$BODY" | sed 's/"/\\"/g')
-    osascript -e "display notification \"$ESCAPED_BODY\" with title \"$TITLE\"" 2>/dev/null || true
-fi
+# Urgent desktop notification
+notify-send \
+    --icon=dialog-error \
+    --expire-time=15000 \
+    --urgency=critical \
+    "Claude API Error — $PROJECT_NAME" \
+    "$ERROR_TYPE: $ERROR_MSG" 2>/dev/null || true
