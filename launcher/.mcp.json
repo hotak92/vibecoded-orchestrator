@@ -1,0 +1,34 @@
+{
+  "mcpServers": {
+    "weaviate-kg": {
+      "type": "stdio",
+      "command": "cmd",
+      "args": [
+        "/c",
+        "cd /d \"C:\\Users\\fabio\\.claude\\mcp_servers\\weaviate_mcp\" && \"C:\\Users\\fabio\\.claude\\.venv\\Scripts\\python.exe\" server.py"
+      ],
+      "env": {
+        "WEAVIATE_URL": "http://localhost:8080",
+        "EMBEDDING_SOURCE": "weaviate",
+        "GRPC_PORT": "50051",
+        "KG_COLLECTION": "FabioKnowledge",
+        "SHARED_KG_COLLECTION": "",
+        "CG_COLLECTION": "FabioCodeGraph"
+      }
+    },
+    "web-research": {
+      "type": "stdio",
+      "command": "cmd",
+      "args": [
+        "/c",
+        "cd /d \"C:\\Users\\fabio\\.claude\\mcp_servers\\web_research\" && \"C:\\Users\\fabio\\.claude\\.venv\\Scripts\\python.exe\" server.py"
+      ],
+      "env": {
+        "WEAVIATE_URL": "http://localhost:8080",
+        "EMBEDDING_SOURCE": "weaviate",
+        "GRPC_PORT": "50051",
+        "KG_COLLECTION": "FabioKnowledge"
+      }
+    }
+  }
+}

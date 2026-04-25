@@ -1,0 +1,114 @@
+{
+  "$schema": "https://vibecodedtools.it/schemas/vct-module-v1.json",
+  "manifest_version": 1,
+
+  "id": "vct-ollama",
+  "name": "Ollama Local LLM",
+  "version": "0.3.1",
+  "description": "Free local inference + embeddings via Ollama (qwen3). Zero-cost alternative to API calls for simple analysis, rewrites, and text embeddings used by KG and semantic search.",
+  "publisher": "VibeCoded Tools",
+  "repository": "https://github.com/VibeCoded-Tools/orchestrator",
+
+  "category": "core",
+  "tags": ["mcp", "ollama", "local-llm", "embeddings"],
+
+  "compatibility": {
+    "hosts": ["base", "mao"],
+    "min_launcher_version": "1.0.0"
+  },
+
+  "license": {
+    "required": false,
+    "type": "AGPL-3.0-or-later"
+  },
+
+  "requirements": {
+    "os": ["linux", "macos", "windows"],
+    "python": ">=3.11",
+    "memory_mb": 512,
+    "disk_mb": 3000,
+    "network": ["https://ollama.com"],
+    "depends_on": []
+  },
+
+  "install": {
+    "method": "git_clone",
+    "source": "https://github.com/VibeCoded-Tools/orchestrator.git",
+    "ref": "main",
+    "install_dir": "{VCT_MODULES}/vct-ollama",
+    "post_install": [
+      {
+        "cmd": "python -m venv .venv",
+        "cwd": "{install_dir}",
+        "timeout_s": 60
+      },
+      {
+        "cmd": "{install_dir}/.venv/bin/pip install -r claude_mcp_servers/ollama_mcp/requirements.txt",
+        "cwd": "{install_dir}",
+        "timeout_s": 180,
+        "platform_cmd": {
+          "windows": "{install_dir}\\.venv\\Scripts\\pip.exe install -r claude_mcp_servers\\ollama_mcp\\requirements.txt"
+        }
+      }
+    ]
+  },
+
+  "secrets": [],
+
+  "settings": [
+    {
+      "key": "OLLAMA_URL",
+      "prompt": "Ollama HTTP URL",
+      "description": "Launcher auto-starts an Ollama container and fills this in.",
+      "type": "string",
+      "default": "http://localhost:11435",
+      "required": true
+    }
+  ],
+
+  "runtime": {
+    "type": "mcp_stdio",
+    "command": "{install_dir}/.venv/bin/python",
+    "args": ["{install_dir}/claude_mcp_servers/ollama_mcp/server.py"],
+    "platform_command": {
+      "windows": "{install_dir}\\.venv\\Scripts\\python.exe"
+    },
+    "cwd": "{install_dir}",
+    "env_from_settings": ["OLLAMA_URL"],
+    "env_fixed": {
+      "PYTHONPATH": "{install_dir}"
+    },
+    "health_check": {
+      "type": "stdio_ping",
+      "timeout_s": 5,
+      "interval_s": 60
+    },
+    "auto_restart": true,
+    "log_file": "{VCT_LOGS}/vct-ollama.log"
+  },
+
+  "mcp_registration": {
+    "enabled_by_default": true,
+    "mcp_name": "ollama",
+    "target_projects": "all",
+    "scope": "user"
+  },
+
+  "upgrade": {
+    "strategy": "git_pull"
+  },
+
+  "uninstall": {
+    "remove_install_dir": true,
+    "preserve_paths": [],
+    "deregister_mcp": true
+  },
+
+  "provides": [
+    {
+      "kind": "mcp_tools",
+      "tool_prefix": "ollama",
+      "description": "chat (local inference), read_document (summarize/extract), read_image (base64 + optional description)"
+    }
+  ]
+}
