@@ -4,6 +4,7 @@
   import { invoke } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
   import Toast from '$lib/components/Toast.svelte';
+  import Term from '$lib/components/Term.svelte';
   import CollectionList from '$lib/kg/CollectionList.svelte';
   import CollectionViewer from '$lib/kg/CollectionViewer.svelte';
   import AccessModal from '$lib/access/AccessModal.svelte';
@@ -87,7 +88,7 @@
 <div class="kg-page">
   <header class="kg-pageheader">
     <button class="kg-back" onclick={() => goto('/')}>← Back</button>
-    <h1>Knowledge Graph</h1>
+    <h1><Term key="kg">Knowledge Graph</Term></h1>
     {#if project}
       <span class="kg-project">acting as <code>{project.name}</code></span>
     {:else}
@@ -97,7 +98,7 @@
 
   <main class="kg-main">
     {#if !project}
-      <p class="kg-empty">Select a project from the menu bar to use the KG dashboard.</p>
+      <p class="kg-empty">Select a project from the project picker (top of the menu bar) to browse this project's <Term key="kg">Knowledge Graph</Term>.</p>
     {:else if view === 'list'}
       <CollectionList
         projectId={project.id}

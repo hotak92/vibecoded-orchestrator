@@ -1,3 +1,4 @@
+pub mod audit;
 pub mod codegraph;
 pub mod coordination;
 pub mod dashboard;

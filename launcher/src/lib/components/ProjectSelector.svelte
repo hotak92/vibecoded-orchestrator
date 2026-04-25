@@ -10,6 +10,9 @@
 
   import { onMount } from 'svelte';
   import { projects, selectedProject } from '$lib/stores/projects';
+  import { pickDirectory, suggestProjectFolder } from '$lib/dialog';
+  import { isTauriRuntime } from '$lib/tauri';
+  import { projectColor } from '$lib/project-color';
   import type { ProjectHost, ProjectView } from '$lib/types/launcher';
 
   let open = $state(false);
@@ -22,6 +25,26 @@
   let createHost = $state<ProjectHost>('base');
   let creating = $state(false);
   let createError = $state<string | null>(null);
+  let showHostHelp = $state(false);
+  const inTauri = isTauriRuntime();
+
+  async function openCreate() {
+    showCreate = true;
+    open = false;
+    if (!createPath) {
+      // Suggest a sane default the first time the modal opens.
+      const suggested = await suggestProjectFolder();
+      if (suggested) createPath = suggested;
+    }
+  }
+
+  async function browseFolder() {
+    const picked = await pickDirectory({
+      defaultPath: createPath || undefined,
+      title: 'Select project folder',
+    });
+    if (picked) createPath = picked;
+  }
 
   // Rename inline state — keyed by project id
   let renamingId = $state<string | null>(null);
@@ -122,9 +145,12 @@
     }}
     title="Switch project"
   >
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-      <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
-    </svg>
+    <span
+      class="project-dot"
+      style:background={current ? projectColor(current.id) : 'transparent'}
+      style:border-color={current ? 'transparent' : 'rgba(255,255,255,0.2)'}
+      aria-hidden="true"
+    ></span>
     <span class="project-name">
       {current ? current.name : 'No project'}
     </span>
@@ -137,13 +163,7 @@
     <div class="project-panel">
       <div class="panel-header">
         <span class="panel-title">Projects</span>
-        <button
-          class="panel-add"
-          onclick={() => {
-            open = false;
-            showCreate = true;
-          }}
-        >
+        <button class="panel-add" onclick={openCreate}>
           + New
         </button>
       </div>
@@ -154,13 +174,7 @@
         <div class="panel-empty">
           <p class="empty-title">No projects yet</p>
           <p class="empty-text">Create your first project to start installing modules.</p>
-          <button
-            class="btn-3d btn-3d-primary btn-3d-sm"
-            onclick={() => {
-              open = false;
-              showCreate = true;
-            }}
-          >
+          <button class="btn-3d btn-3d-primary btn-3d-sm" onclick={openCreate}>
             Create your first project
           </button>
         </div>
@@ -183,7 +197,10 @@
                 />
               {:else}
                 <button class="row-main" onclick={() => handleSelect(p.id)}>
-                  <span class="row-name">{p.name}</span>
+                  <span class="row-top">
+                    <span class="row-dot" style:background={projectColor(p.id)} aria-hidden="true"></span>
+                    <span class="row-name">{p.name}</span>
+                  </span>
                   <span class="row-meta">
                     <span class="row-host">{p.host}</span>
                     <span class="row-count">{p.module_count} module{p.module_count !== 1 ? 's' : ''}</span>
@@ -242,21 +259,58 @@
         </div>
         <div class="form-group">
           <label for="project-path">Folder Path</label>
-          <input
-            id="project-path"
-            type="text"
-            class="form-input mono"
-            bind:value={createPath}
-            placeholder="/home/user/Desktop/PROJECTS/my-project"
-          />
-          <p class="form-hint">Absolute path. Folder must already exist.</p>
+          <div class="path-row">
+            <input
+              id="project-path"
+              type="text"
+              class="form-input mono path-input"
+              bind:value={createPath}
+              placeholder="/home/you/code/my-project"
+            />
+            <button
+              type="button"
+              class="btn-3d btn-3d-ghost btn-3d-sm browse-btn"
+              onclick={browseFolder}
+              disabled={!inTauri}
+              title={inTauri ? 'Browse for folder' : 'Browse requires the desktop app'}
+            >
+              Browse…
+            </button>
+          </div>
+          <p class="form-hint">
+            Absolute path. Folder must already exist.
+            {#if !inTauri} (Browse requires the desktop app — type the path manually here.){/if}
+          </p>
         </div>
         <div class="form-group">
-          <label for="project-host">Host</label>
+          <div class="label-row">
+            <label for="project-host">Host</label>
+            <button
+              type="button"
+              class="help-btn"
+              onclick={() => (showHostHelp = !showHostHelp)}
+              aria-label="What does host mean?"
+              title="What does host mean?"
+            >?</button>
+          </div>
           <select id="project-host" class="form-input" bind:value={createHost}>
-            <option value="base">base — Claude Code only</option>
-            <option value="mao">mao — MultiagentOrchestrator</option>
+            <option value="base">Standard — Claude Code only</option>
+            <option value="mao">MAO — Multi-Agent Orchestrator (beta)</option>
           </select>
+          {#if showHostHelp}
+            <div class="host-help">
+              <p>
+                <strong>Standard (base):</strong> the standard Orchestrator install
+                — Knowledge Graph, Code Graph, and 16 hooks. Pick this if you're
+                unsure.
+              </p>
+              <p>
+                <strong>MAO:</strong> Multi-Agent Orchestrator — adds 10 specialist
+                agents and a Maestro coordinator on top of Standard. Beta. Pick
+                this if you want the extras and don't mind some rough edges.
+              </p>
+            </div>
+          {/if}
         </div>
         {#if createError}
           <div class="msg msg-error">{createError}</div>
@@ -353,6 +407,25 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     max-width: 180px;
+  }
+  .project-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    border: 1px solid;
+    flex-shrink: 0;
+  }
+  .row-top {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .row-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
   }
 
   .chevron {
@@ -641,6 +714,69 @@
     font-size: 11px;
     color: var(--color-muted);
     margin-top: 4px;
+  }
+
+  .path-row {
+    display: flex;
+    gap: 6px;
+    align-items: stretch;
+  }
+  .path-input {
+    flex: 1;
+  }
+  .browse-btn {
+    flex-shrink: 0;
+    white-space: nowrap;
+  }
+
+  .label-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 6px;
+  }
+  .label-row label {
+    margin-bottom: 0;
+  }
+  .help-btn {
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    background: rgba(255, 255, 255, 0.04);
+    color: var(--color-mid);
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 1;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+  }
+  .help-btn:hover {
+    border-color: rgba(0, 191, 166, 0.5);
+    color: var(--color-teal);
+  }
+
+  .host-help {
+    margin-top: 8px;
+    padding: 10px 12px;
+    background: rgba(0, 191, 166, 0.06);
+    border: 1px solid rgba(0, 191, 166, 0.18);
+    border-radius: 8px;
+    font-size: 12px;
+    color: var(--color-mid);
+    line-height: 1.5;
+  }
+  .host-help p {
+    margin: 0;
+  }
+  .host-help p + p {
+    margin-top: 6px;
+  }
+  .host-help strong {
+    color: var(--color-text);
   }
 
   .form-actions {
