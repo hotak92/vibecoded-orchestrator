@@ -5,6 +5,7 @@
   import { toast } from '$lib/stores/toast';
   import Toast from '$lib/components/Toast.svelte';
   import Term from '$lib/components/Term.svelte';
+  import NoProjectBanner from '$lib/components/NoProjectBanner.svelte';
   import CollectionList from '$lib/kg/CollectionList.svelte';
   import CollectionViewer from '$lib/kg/CollectionViewer.svelte';
   import AccessModal from '$lib/access/AccessModal.svelte';
@@ -98,7 +99,7 @@
 
   <main class="kg-main">
     {#if !project}
-      <p class="kg-empty">Select a project from the project picker (top of the menu bar) to browse this project's <Term key="kg">Knowledge Graph</Term>.</p>
+      <NoProjectBanner section="this project's Knowledge Graph" />
     {:else if view === 'list'}
       <CollectionList
         projectId={project.id}
