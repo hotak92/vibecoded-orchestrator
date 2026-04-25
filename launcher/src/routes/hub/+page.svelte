@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
-  import { invoke } from '$lib/tauri';
+  import { safeInvoke, invoke, isTauriRuntime } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
   import Toast from '$lib/components/Toast.svelte';
 
@@ -11,19 +11,22 @@
   let recipient = $state('');
   let messages = $state<any[]>([]);
 
+  const inTauri = isTauriRuntime();
+
   async function load() {
+    if (!inTauri) return; // Browser mode: render placeholder, no toast spam.
     try {
-      info = await invoke<{ port: number; reachable: boolean }>('hub_info');
+      info = await safeInvoke<{ port: number; reachable: boolean }>('hub_info');
     } catch (e) {
       toast.error(e);
     }
     try {
-      const result = await invoke<any>('hub_list_apps');
-      apps = Array.isArray(result) ? result : (result.apps ?? []);
+      const result = await safeInvoke<any>('hub_list_apps');
+      apps = Array.isArray(result) ? result : (result?.apps ?? []);
     } catch (e) { console.warn(e); }
     try {
-      const result = await invoke<any>('hub_data_catalog');
-      catalog = Array.isArray(result) ? result : (result.entries ?? []);
+      const result = await safeInvoke<any>('hub_data_catalog');
+      catalog = Array.isArray(result) ? result : (result?.entries ?? []);
     } catch (e) { console.warn(e); }
   }
 
@@ -32,6 +35,7 @@
       toast.error('Pick a recipient first');
       return;
     }
+    // Strict invoke here — user-initiated action, surface real errors.
     try {
       const result = await invoke<any>('hub_poll_messages', { recipient: recipient.trim() });
       messages = Array.isArray(result) ? result : (result.messages ?? []);
@@ -54,6 +58,14 @@
     {/if}
     <button class="hub-refresh" onclick={load}>Refresh</button>
   </header>
+
+  {#if !inTauri}
+    <p class="hub-placeholder">
+      The Orchestrator Hub requires the desktop app. Run
+      <code>npm run tauri:dev</code> from <code>launcher/</code> to interact
+      with apps, messages, and the data catalog.
+    </p>
+  {/if}
 
   <main class="hub-main">
     <section class="hub-section">
@@ -148,6 +160,17 @@
     padding: 3px 8px; border-radius: 4px; font-size: 11px;
   }
   .hub-empty { color: #888; padding: 16px; text-align: center; font-size: 12px; }
+  .hub-placeholder {
+    margin: 14px 24px; padding: 12px 14px;
+    background: rgba(255,159,64,0.08);
+    border: 1px solid rgba(255,159,64,0.2);
+    border-radius: 8px;
+    color: #ffb066; font-size: 12px;
+  }
+  .hub-placeholder code {
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    color: #c4b3ff; font-size: 11px;
+  }
   .hub-table { width: 100%; border-collapse: collapse; font-size: 12px; }
   .hub-table th { text-align: left; padding: 4px 8px; color: #888; font-weight: 500; border-bottom: 1px solid rgba(255,255,255,0.08); }
   .hub-table td { padding: 4px 8px; border-bottom: 1px solid rgba(255,255,255,0.04); }

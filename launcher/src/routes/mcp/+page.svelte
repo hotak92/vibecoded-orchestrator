@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
-  import { invoke } from '$lib/tauri';
+  import { invoke, safeInvoke, isTauriRuntime } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
   import Toast from '$lib/components/Toast.svelte';
 
@@ -30,10 +30,14 @@
   let nArgs = $state('');
   let nEnv = $state('');
 
+  const inTauri = isTauriRuntime();
+
   async function load() {
     loading = true;
     try {
-      servers = await invoke<McpServer[]>('get_mcp_servers');
+      // Soft read — null means browser preview, render placeholder.
+      const result = await safeInvoke<McpServer[]>('get_mcp_servers');
+      servers = result ?? [];
     } catch (e) {
       toast.error(e);
     } finally {
@@ -131,6 +135,14 @@
     </div>
   {/if}
 
+  {#if !inTauri}
+    <p class="mcp-placeholder">
+      Custom MCP servers require the desktop app. Run
+      <code>npm run tauri:dev</code> from <code>launcher/</code> to add,
+      remove, or toggle servers.
+    </p>
+  {/if}
+
   {#if loading}
     <p class="mcp-empty">Loading…</p>
   {:else if servers.length === 0}
@@ -186,6 +198,17 @@
   }
   .mcp-form-grid textarea { font-family: ui-monospace, monospace; resize: vertical; }
   .mcp-empty { padding: 40px; text-align: center; color: #888; }
+  .mcp-placeholder {
+    margin: 14px 24px; padding: 12px 14px;
+    background: rgba(255,159,64,0.08);
+    border: 1px solid rgba(255,159,64,0.2);
+    border-radius: 8px;
+    color: #ffb066; font-size: 12px;
+  }
+  .mcp-placeholder code {
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    color: #c4b3ff; font-size: 11px;
+  }
   .mcp-main { padding: 14px 24px; display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 10px; }
   .mcp-card { background: rgba(255,255,255,0.04); padding: 12px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.08); }
   .mcp-card-h { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }

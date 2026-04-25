@@ -26,6 +26,15 @@
   let filterProject = $state<'all' | string>('all');
   let filterText = $state('');
 
+  // Time-range filter. 'custom' uses customFrom/customTo (epoch ms or
+  // null = open). Server-side filtering would require extending the
+  // Tauri command + Db query; we filter purely client-side on the
+  // already-fetched 500-event window for now and document.
+  type RangeKey = '24h' | '7d' | '30d' | 'all' | 'custom';
+  let filterRange = $state<RangeKey>('all');
+  let customFrom = $state(''); // yyyy-mm-dd or empty
+  let customTo = $state('');
+
   const inTauri = isTauriRuntime();
   const allProjects = $derived($projects.projects);
 
@@ -79,19 +88,69 @@
     }
   }
 
-  const filtered = $derived(
-    !filterText
-      ? events
-      : events.filter((e) => {
-          const q = filterText.toLowerCase();
-          return (
-            e.operation.toLowerCase().includes(q) ||
-            (e.project_id ?? '').toLowerCase().includes(q) ||
-            (e.module_id ?? '').toLowerCase().includes(q) ||
-            e.detail.toLowerCase().includes(q)
-          );
-        }),
-  );
+  /** Returns [from, to] epoch ms (inclusive) or [null, null] for 'all'. */
+  function rangeBounds(r: RangeKey): [number | null, number | null] {
+    const now = Date.now();
+    if (r === '24h') return [now - 24 * 3600 * 1000, null];
+    if (r === '7d') return [now - 7 * 24 * 3600 * 1000, null];
+    if (r === '30d') return [now - 30 * 24 * 3600 * 1000, null];
+    if (r === 'custom') {
+      // Parse yyyy-mm-dd as local-midnight; "to" is end-of-day.
+      const from = customFrom ? new Date(customFrom + 'T00:00:00').getTime() : null;
+      const to = customTo ? new Date(customTo + 'T23:59:59.999').getTime() : null;
+      return [from, to];
+    }
+    return [null, null];
+  }
+
+  const filtered = $derived.by(() => {
+    const [from, to] = rangeBounds(filterRange);
+    const q = filterText.toLowerCase();
+    return events.filter((e) => {
+      if (from !== null && e.created_at < from) return false;
+      if (to !== null && e.created_at > to) return false;
+      if (!q) return true;
+      return (
+        e.operation.toLowerCase().includes(q) ||
+        (e.project_id ?? '').toLowerCase().includes(q) ||
+        (e.module_id ?? '').toLowerCase().includes(q) ||
+        e.detail.toLowerCase().includes(q)
+      );
+    });
+  });
+
+  /** RFC 4180-ish CSV cell escape: wrap in quotes, double inner quotes. */
+  function csvCell(s: string | number | null | undefined): string {
+    const raw = s == null ? '' : String(s);
+    if (/[",\n\r]/.test(raw)) return `"${raw.replace(/"/g, '""')}"`;
+    return raw;
+  }
+
+  function exportCsv() {
+    const header = ['timestamp_iso', 'timestamp_ms', 'operation', 'project_id', 'project_name', 'module_id', 'detail'];
+    const lines = [header.join(',')];
+    for (const e of filtered) {
+      lines.push([
+        csvCell(new Date(e.created_at).toISOString()),
+        csvCell(e.created_at),
+        csvCell(e.operation),
+        csvCell(e.project_id),
+        csvCell(projectName(e.project_id)),
+        csvCell(e.module_id),
+        csvCell(e.detail),
+      ].join(','));
+    }
+    const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    a.download = `audit-log-${ts}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
 </script>
 
 <div class="page">
@@ -114,6 +173,27 @@
         {/each}
       </select>
     </label>
+    <div class="range-pills" role="group" aria-label="Time range">
+      <span class="range-label">When:</span>
+      {#each [['24h', '24h'], ['7d', '7d'], ['30d', '30d'], ['all', 'All'], ['custom', 'Custom']] as [val, label]}
+        <button
+          type="button"
+          class="range-pill"
+          class:range-pill-active={filterRange === val}
+          onclick={() => (filterRange = val as RangeKey)}
+        >{label}</button>
+      {/each}
+    </div>
+    {#if filterRange === 'custom'}
+      <label class="custom-range">
+        <span>From:</span>
+        <input type="date" bind:value={customFrom} />
+      </label>
+      <label class="custom-range">
+        <span>To:</span>
+        <input type="date" bind:value={customTo} />
+      </label>
+    {/if}
     <label class="search">
       <span>Search:</span>
       <input
@@ -124,6 +204,14 @@
     </label>
     <button class="btn-3d btn-3d-ghost btn-3d-sm" onclick={load} disabled={loading}>
       {loading ? 'Loading…' : 'Refresh'}
+    </button>
+    <button
+      class="btn-3d btn-3d-ghost btn-3d-sm"
+      onclick={exportCsv}
+      disabled={filtered.length === 0}
+      title="Export the currently filtered table as CSV"
+    >
+      Export CSV ({filtered.length})
     </button>
   </div>
 
@@ -224,6 +312,43 @@
   }
   .controls .search input {
     flex: 1;
+  }
+  .range-pills {
+    display: flex; align-items: center; gap: 4px; flex-wrap: wrap;
+  }
+  .range-label {
+    font-size: 12px; color: var(--color-mid); margin-right: 4px;
+  }
+  .range-pill {
+    padding: 4px 10px;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 999px;
+    color: var(--color-mid);
+    font-size: 11px; font-weight: 600;
+    cursor: pointer;
+    transition: all 0.12s ease;
+  }
+  .range-pill:hover {
+    background: rgba(255,255,255,0.08);
+    color: var(--color-text);
+  }
+  .range-pill-active {
+    background: rgba(0, 191, 166, 0.16);
+    border-color: rgba(0, 191, 166, 0.5);
+    color: var(--color-teal);
+  }
+  .custom-range {
+    display: flex; align-items: center; gap: 4px;
+  }
+  .custom-range input[type="date"] {
+    padding: 4px 6px;
+    background: rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 6px;
+    color: var(--color-text);
+    font-size: 11px;
+    color-scheme: dark;
   }
 
   .note {
