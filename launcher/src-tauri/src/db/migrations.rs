@@ -23,6 +23,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "initial schema: projects, module_installs, module_settings, access grants, tier_cache, audit_log",
         sql: include_str!("migrations/001_initial.sql"),
     },
+    Migration {
+        version: 2,
+        description: "per-project orchestrator state: agents, skills, hooks, permissions, secret refs, KG/codegraph bindings",
+        sql: include_str!("migrations/002_project_state.sql"),
+    },
 ];
 
 /// Apply every migration whose version is greater than the current max applied.

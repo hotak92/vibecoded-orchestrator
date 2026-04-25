@@ -76,7 +76,7 @@ def _sanitize_collection_prefix(name: str) -> str:
 
 
 def _collection_name(base: str, project_name: str) -> str:
-    """Return per-project collection name, e.g. 'ARTup_CodeModule'.
+    """Return per-project collection name, e.g. 'MyProject_CodeModule'.
 
     Falls back to bare base name if project_name is empty.
     """

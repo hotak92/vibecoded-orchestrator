@@ -23,6 +23,7 @@ pub mod modules;
 pub mod settings;
 pub mod access;
 pub mod tier;
+pub mod project_state;
 
 /// Resolve the launcher DB path: `~/.vct/launcher.db`.
 pub fn db_path() -> PathBuf {

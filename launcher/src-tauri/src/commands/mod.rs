@@ -9,5 +9,6 @@ pub mod mcp_reg;
 pub mod modules;
 pub mod projects;
 pub mod projects_v2;
+pub mod project_state_cmd;
 pub mod secrets_cmd;
 pub mod telemetry_cmd;
