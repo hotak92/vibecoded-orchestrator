@@ -51,7 +51,7 @@ fastapi>=0.111
 uvicorn>=0.30
 
 # ─── Telemetry (optional runtime) ───
-# psutil (BSD-3-Clause) — used by commercial_workflow.telemetry.hardware for
-# opt-in hardware profiling. Already a transitive dep of several packages;
-# pinned here so the telemetry module can import it directly.
+# psutil (BSD-3-Clause) — used by VCThelpers.telemetry for opt-in hardware
+# profiling. Already a transitive dep of several packages; pinned here so
+# the telemetry module can import it directly.
 psutil>=5.9
