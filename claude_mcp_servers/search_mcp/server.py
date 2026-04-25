@@ -109,8 +109,8 @@ _DEFAULT_TIMEOUT = aiohttp.ClientTimeout(total=15)
 _FETCH_TIMEOUT   = aiohttp.ClientTimeout(total=25)
 
 _AGENT_UA = (
-    "MultiagentOrchestrator/1.0 "
-    "(research agent; https://github.com/martino/MultiagentOrchestrator)"
+    "vibecoded-orchestrator/1.0 "
+    "(research agent; https://github.com/hotak92/vibecoded-orchestrator)"
 )
 
 
