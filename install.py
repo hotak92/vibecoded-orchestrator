@@ -684,14 +684,35 @@ def _start_services(sysinfo: SystemInfo, args: argparse.Namespace,
 
     cmd.extend(["up", "-d"])
 
-    result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(infra_dir))
-    if result.returncode != 0:
-        print(f"  FAIL")
-        for line in result.stderr.strip().splitlines()[-10:]:
-            print(f"  {line}")
-        print(f"\n  Try starting manually:")
+    # 15 min cap: first-run pulls of weaviate + ollama images can take a while
+    # on slow links, but a hung daemon should not block us forever.
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, cwd=str(infra_dir), timeout=900,
+        )
+    except subprocess.TimeoutExpired:
+        print("  FAIL (timed out after 15 min)")
+        print(f"  Container daemon may be hung. Try manually:")
         print(f"    cd {infra_dir}")
         print(f"    {' '.join(compose_cmd)} up -d")
+        sys.exit(1)
+    if result.returncode != 0:
+        print("  FAIL")
+        for line in (result.stderr or "").strip().splitlines()[-10:]:
+            print(f"  {line}")
+        print("\n  Try starting manually:")
+        print(f"    cd {infra_dir}")
+        print(f"    {' '.join(compose_cmd)} up -d")
+        # Common cause: daemon not running. Surface it.
+        stderr_lower = (result.stderr or "").lower()
+        if "cannot connect" in stderr_lower or "daemon" in stderr_lower:
+            print("\n  Hint: container daemon not running.")
+            if sysinfo.container_cmd == "docker":
+                print("    Linux:  sudo systemctl start docker")
+                print("    macOS:  open Docker Desktop")
+                print("    Windows: start Docker Desktop")
+            else:
+                print("    Linux:  systemctl --user start podman.socket")
         sys.exit(1)
     print("  OK")
 
