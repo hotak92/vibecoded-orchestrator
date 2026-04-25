@@ -255,14 +255,28 @@ def _remote_validate(key: str, machine_hash: str) -> Optional[LicenseResult]:
         return None
 
 
+def _read_key_file() -> str:
+    """Read the license key from the fallback file, if present.
+
+    Returns empty string on any error (missing, unreadable, empty). Never raises.
+    """
+    try:
+        if KEY_FILE.exists():
+            return KEY_FILE.read_text().strip()
+    except (OSError, UnicodeDecodeError) as e:
+        log.debug("Could not read %s: %s", KEY_FILE, e)
+    return ""
+
+
 def validate_license(key: Optional[str] = None) -> LicenseResult:
     """Validate license key and return the current licensing result.
 
     Priority:
         1. `VIBECODED_TIER=free` env forces free tier (dev override).
-        2. If no key → free tier.
-        3. Remote validation → success → cache + return.
-        4. Remote failure → check cache age:
+        2. Key resolution: explicit arg → env var → ``~/.vct-secrets/license_key``.
+        3. No key → free tier.
+        4. Remote validation → success → cache + return.
+        5. Remote failure → check cache age:
              - within 3-day grace period → return cached tier.
              - beyond grace period → degrade to free tier with clear message.
     """
@@ -270,7 +284,10 @@ def validate_license(key: Optional[str] = None) -> LicenseResult:
     if tier_override == "free":
         return LicenseResult(tier="free", valid=True, message="Free tier (env override).")
 
-    key = key or os.environ.get("VIBECODED_LICENSE_KEY", "").strip()
+    if not key:
+        key = os.environ.get("VIBECODED_LICENSE_KEY", "").strip()
+    if not key:
+        key = _read_key_file()
     if not key:
         return LicenseResult(tier="free", valid=True, message="No license key — free tier.")
 
@@ -324,6 +341,60 @@ def feature_enabled(feature: str) -> bool:
     if min_tier is None:
         return True
     return require_tier(min_tier)
+
+
+def license_status() -> dict:
+    """Return a structured snapshot of the current licensing state.
+
+    Intended for CLI / launcher introspection. Never raises. Does NOT trigger
+    a remote call — only inspects environment + cache + status file. Call
+    ``validate_license(force_refresh=True)`` first if you need a fresh check.
+
+    Returns a dict with at minimum:
+        tier             — current effective tier (free | pro | mao | enterprise)
+        has_key          — bool, whether any key source resolved a value
+        key_source       — "env" | "file" | "argument" | "none"
+        cached           — bool, whether a cached LicenseResult exists
+        cache_age_days   — int or None, age of cached.last_validated_at
+        in_grace_period  — bool, cached + within GRACE_PERIOD_SECONDS
+        status_message   — last human-readable status line, if any
+    """
+    env_key = os.environ.get("VIBECODED_LICENSE_KEY", "").strip()
+    file_key = _read_key_file()
+    if env_key:
+        key_source = "env"
+        has_key = True
+    elif file_key:
+        key_source = "file"
+        has_key = True
+    else:
+        key_source = "none"
+        has_key = False
+
+    cached = _load_cached()
+    cache_age_days: Optional[int] = None
+    in_grace = False
+    if cached and cached.last_validated_at:
+        delta = time.time() - cached.last_validated_at
+        cache_age_days = int(delta // 86400)
+        in_grace = delta < GRACE_PERIOD_SECONDS
+
+    status_message = ""
+    try:
+        if STATUS_FILE.exists():
+            status_message = STATUS_FILE.read_text().strip()
+    except OSError:
+        pass
+
+    return {
+        "tier": get_tier(),
+        "has_key": has_key,
+        "key_source": key_source,
+        "cached": cached is not None,
+        "cache_age_days": cache_age_days,
+        "in_grace_period": in_grace,
+        "status_message": status_message,
+    }
 
 
 if __name__ == "__main__":
