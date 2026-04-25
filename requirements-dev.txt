@@ -11,4 +11,4 @@ ruff>=0.4
 playwright>=1.40
 
 # Type checking
-pyright>=1.1
+pyright>=1.1.409
