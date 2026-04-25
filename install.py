@@ -177,6 +177,7 @@ def main() -> int:
 
     # Step 1: Check Python
     _check_python_version()
+    _check_prerequisites()
 
     # Step 2: Detect system
     sysinfo = _detect_system(args)
@@ -271,6 +272,55 @@ def _print_python_install_hint() -> None:
         print("  Install: winget install Python.Python.3.12")
         print("       Or: https://python.org/downloads/")
     print("  Download: https://python.org")
+
+
+def _check_prerequisites() -> None:
+    """Warn (don't block) about optional prerequisites.
+
+    Hard requirements (Python, container runtime) are checked elsewhere.
+    This function surfaces *soft* prereqs that the rest of the install
+    expects to be available later, so the user can install them now rather
+    than discover them mid-run.
+    """
+    os_name = platform.system()
+    missing: list[tuple[str, str]] = []  # (tool, install hint)
+
+    # The python venv module is built-in on most distros, but Debian/Ubuntu
+    # ships it as a separate package. Detect early.
+    if os_name == "Linux":
+        try:
+            r = subprocess.run(
+                [sys.executable, "-c", "import venv"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if r.returncode != 0:
+                missing.append(("python3-venv", "sudo apt install python3-venv  # Debian/Ubuntu"))
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+    # ensurepip / pip availability inside the soon-to-be-created venv.
+    try:
+        r = subprocess.run(
+            [sys.executable, "-c", "import ensurepip"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode != 0:
+            if os_name == "Linux":
+                missing.append(("python3-pip / ensurepip",
+                                "sudo apt install python3-pip  # Debian/Ubuntu"))
+            else:
+                missing.append(("ensurepip",
+                                "Reinstall Python from python.org or your package manager"))
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+    if missing:
+        print()
+        print("  WARNING: missing optional prerequisites:")
+        for tool, hint in missing:
+            print(f"    - {tool}: {hint}")
+        print("  Continuing — these are needed only for specific install paths.")
+        print()
 
 
 # ---------------------------------------------------------------------------
@@ -431,37 +481,59 @@ def _install_joern() -> bool:
 
     Returns True on success, False on failure (non-fatal — the orchestrator
     works fine without Joern).
+
+    Security note: this downloads and executes a remote shell script from
+    joernio/joern's GitHub releases. The transport is HTTPS (cert-validated)
+    and the source is the official upstream. We add basic sanity checks
+    (HTTPS-only URL, non-trivial response size, .sh shebang) but do NOT
+    enforce a checksum because Joern's release pipeline does not publish a
+    pinned hash for `latest`. Users who want stronger guarantees should
+    install Joern themselves first (then we just detect it).
     """
     print("            Installing Joern (this can take a few minutes)...")
 
-    # Joern's official installer downloads its own JDK if needed
     install_url = "https://github.com/joernio/joern/releases/latest/download/joern-install.sh"
-    try:
-        # Download installer
-        with tempfile.NamedTemporaryFile(suffix=".sh", delete=False) as tmp:
-            urllib.request.urlretrieve(install_url, tmp.name)
-            installer_path = tmp.name
+    if not install_url.startswith("https://"):
+        # Defense-in-depth — never fetch over plain HTTP.
+        print("            Refusing to fetch Joern installer over non-HTTPS URL.")
+        return False
 
+    installer_path: str | None = None
+    try:
+        # Download with explicit timeout (urlretrieve has no default timeout).
+        with tempfile.NamedTemporaryFile(suffix=".sh", delete=False) as tmp:
+            installer_path = tmp.name
+        with urllib.request.urlopen(install_url, timeout=60) as resp:
+            data = resp.read()
+        # Sanity-check the payload looks like a shell script.
+        if len(data) < 256:
+            print(f"            Joern installer suspiciously small ({len(data)} bytes); aborting.")
+            return False
+        if not data.lstrip().startswith(b"#!"):
+            print("            Joern installer does not start with a shebang; aborting.")
+            return False
+        Path(installer_path).write_bytes(data)
         os.chmod(installer_path, 0o755)
-        # Install to ~/.local (user-local, no sudo needed). User can move/symlink later.
+
+        # Install to ~/.local (user-local, no sudo needed).
         install_dir = Path.home() / ".local" / "joern"
         result = subprocess.run(
             [installer_path, "--dir", str(install_dir), "--no-interactive"],
             capture_output=True, text=True, timeout=600,
         )
-        Path(installer_path).unlink(missing_ok=True)
 
         if result.returncode != 0:
-            print(f"            Joern install failed: {result.stderr[:300]}")
+            tail = (result.stderr or "").strip()[-300:]
+            print(f"            Joern install failed: {tail}")
             print("            You can install manually: https://docs.joern.io/installation/")
             return False
 
-        # Add to PATH for current install session (user must add permanently themselves)
         joern_bin = install_dir / "joern-cli"
         if joern_bin.exists():
             os.environ["PATH"] = f"{joern_bin}:{os.environ.get('PATH', '')}"
             print(f"            Joern installed at {joern_bin}")
-            print(f"            ADD TO YOUR SHELL RC:  export PATH=\"{joern_bin}:$PATH\"")
+            print(f"            To use joern outside this installer, add to your shell rc:")
+            print(f"              export PATH=\"{joern_bin}:$PATH\"")
             return shutil.which("joern") is not None
 
         print(f"            Joern installer ran but joern-cli not at {joern_bin}")
@@ -471,6 +543,9 @@ def _install_joern() -> bool:
         print(f"            Joern install failed: {e}")
         print("            You can install manually: https://docs.joern.io/installation/")
         return False
+    finally:
+        if installer_path:
+            Path(installer_path).unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -510,10 +585,24 @@ def _create_venv(project_root: Path) -> Path:
         print("already exists")
         return venv_python
 
-    subprocess.run(
+    # Don't use check=True with capture_output — we want to surface stderr on failure.
+    result = subprocess.run(
         [sys.executable, "-m", "venv", str(venv_dir)],
-        check=True, capture_output=True,
+        capture_output=True, text=True,
     )
+    if result.returncode != 0:
+        print("FAIL")
+        print("  Failed to create venv. stderr:")
+        for line in (result.stderr or "").strip().splitlines()[-20:]:
+            print(f"    {line}")
+        print()
+        print("  Common causes:")
+        if platform.system() == "Linux":
+            print("    - Missing python3-venv: sudo apt install python3-venv  (Debian/Ubuntu)")
+            print("                            sudo dnf install python3-venv  (Fedora)")
+        print("    - Disk full or no write permission to:")
+        print(f"      {venv_dir}")
+        sys.exit(1)
     print("OK")
     return venv_python
 
@@ -526,11 +615,19 @@ def _install_requirements(venv_python: Path, *, dev: bool) -> None:
     label = "with dev extras" if dev else "production"
     print(f"[4/10] Installing dependencies ({label}) ... ", flush=True)
 
-    # Upgrade pip
-    subprocess.run(
+    # Upgrade pip — surface errors instead of swallowing them via check=True
+    pip_up = subprocess.run(
         [str(venv_python), "-m", "pip", "install", "--upgrade", "pip"],
-        check=True, capture_output=True,
+        capture_output=True, text=True,
     )
+    if pip_up.returncode != 0:
+        print("  FAIL (pip upgrade)")
+        for line in (pip_up.stderr or "").strip().splitlines()[-15:]:
+            print(f"    {line}")
+        print()
+        print("  Hint: check your network connection and PyPI availability.")
+        print("        If behind a corporate proxy, set http_proxy/https_proxy.")
+        sys.exit(1)
 
     # Install requirements
     req_file = PROJECT_ROOT / "requirements.txt"
@@ -963,8 +1060,9 @@ def _print_next_steps(sysinfo: SystemInfo, args: argparse.Namespace) -> None:
         print("  manually before using the orchestrator.")
         print()
 
-    print("  Documentation: docs/guides/GETTING_STARTED.md")
-    print("  Report issues: https://github.com/VibeCoded-Tools/orchestrator/issues")
+    print("  Documentation: docs/")
+    print("  Troubleshooting: docs/TROUBLESHOOTING.md")
+    print("  Report issues: https://github.com/hotak92/vibecoded-orchestrator/issues")
     print()
 
 
