@@ -203,7 +203,10 @@ async fn delete_project(
 struct AuditQuery {
     project_id: Option<String>,
     project_slug: Option<String>,
+    actor: Option<String>,
     since_ms: Option<i64>,
+    until_ms: Option<i64>,
+    search: Option<String>,
     limit: Option<u32>,
 }
 
@@ -226,9 +229,15 @@ async fn list_audit(
     } else {
         q.project_id.clone()
     };
-    let limit = q.limit.unwrap_or(200).min(1000);
-    let _ = q.since_ms; // not currently supported by audit_list; CLI filters client-side
-    match h.0.audit_list(pid.as_deref(), limit) {
+    let limit = q.limit.unwrap_or(500).min(10000);
+    match h.0.audit_list(
+        pid.as_deref(),
+        q.actor.as_deref(),
+        q.since_ms,
+        q.until_ms,
+        q.search.as_deref(),
+        limit,
+    ) {
         Ok(rows) => {
             let count = rows.len();
             Json(serde_json::json!({ "events": rows, "count": count })).into_response()
