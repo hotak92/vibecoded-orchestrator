@@ -28,7 +28,12 @@
     detecting = true;
     error = null;
     try {
-      system = await orchestrator.detectSystem();
+      const detected = await orchestrator.detectSystem();
+      if (!detected) {
+        error = 'Tauri runtime not available (browser mode); cannot detect system.';
+        return;
+      }
+      system = detected;
       installPath = orchState.installPath;
 
       // Auto-configure based on detection
