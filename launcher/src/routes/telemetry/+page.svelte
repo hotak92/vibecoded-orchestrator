@@ -2,9 +2,13 @@
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
   import { invoke, safeInvoke, isTauriRuntime } from '$lib/tauri';
+  import { selectedProject } from '$lib/stores/projects';
   import { toast } from '$lib/stores/toast';
   import Toast from '$lib/components/Toast.svelte';
+  import NoProjectBanner from '$lib/components/NoProjectBanner.svelte';
   import type { TelemetryStatus, TelemetryEventView, ConsentFlags } from '$lib/types/project-state';
+
+  const project = $derived($selectedProject);
 
   let status = $state<TelemetryStatus | null>(null);
   let events = $state<TelemetryEventView[]>([]);
@@ -72,6 +76,8 @@
       <code>npm run tauri:dev</code> from <code>launcher/</code> to view
       consent flags and queued events.
     </p>
+  {:else if !project}
+    <NoProjectBanner section="Telemetry consent" />
   {:else if loading || !status}
     <p class="t-empty">Loading…</p>
   {:else}

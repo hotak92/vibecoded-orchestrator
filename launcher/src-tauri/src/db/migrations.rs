@@ -33,6 +33,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "projects.slug for URL-addressable /p/<slug>/... routes",
         sql: include_str!("migrations/003_project_slug.sql"),
     },
+    Migration {
+        version: 4,
+        description: "audit_log: add actor column (OS user) for multi-user audit trails",
+        sql: include_str!("migrations/004_audit_actor.sql"),
+    },
 ];
 
 /// Apply every migration whose version is greater than the current max applied.

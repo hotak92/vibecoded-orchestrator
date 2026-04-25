@@ -190,17 +190,33 @@ impl Db {
         module_id: Option<&str>,
         detail: &serde_json::Value,
     ) -> Result<(), String> {
+        self.audit_as(super::current_actor(), operation, project_id, module_id, detail)
+    }
+
+    /// Variant that lets the caller override the actor — useful for
+    /// commands that act on behalf of a specific user (e.g. when the
+    /// launcher gains real auth). Today everything goes through `audit`
+    /// which uses `current_actor()`.
+    pub fn audit_as(
+        &self,
+        actor: &str,
+        operation: &str,
+        project_id: Option<&str>,
+        module_id: Option<&str>,
+        detail: &serde_json::Value,
+    ) -> Result<(), String> {
         {
             let guard = self.lock();
             guard
                 .execute(
-                    "INSERT INTO audit_log (operation, project_id, module_id, detail, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    "INSERT INTO audit_log (operation, project_id, module_id, detail, actor, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![
                         operation,
                         project_id,
                         module_id,
                         detail.to_string(),
+                        actor,
                         Utc::now().timestamp_millis(),
                     ],
                 )
@@ -208,10 +224,7 @@ impl Db {
         }
 
         // Mirror every audited mutation into the change_log so frontend
-        // polling can detect cross-window edits. The `audit_log` table is
-        // ALWAYS appended to (so it itself is also "stale"); we additionally
-        // tag the high-level table affected based on the operation prefix
-        // so consumers can subscribe selectively.
+        // polling can detect cross-window edits (multi-tenant infra P7).
         let _ = self.log_change("audit_log", "insert", None, project_id);
         let inferred = infer_table_for_op(operation);
         if let Some(t) = inferred {
@@ -232,7 +245,7 @@ impl Db {
 
         let (sql, has_filter) = if project_id.is_some() {
             (
-                "SELECT id, operation, project_id, module_id, detail, created_at
+                "SELECT id, operation, project_id, module_id, detail, actor, created_at
                  FROM audit_log
                  WHERE project_id = ?1
                  ORDER BY created_at DESC
@@ -241,7 +254,7 @@ impl Db {
             )
         } else {
             (
-                "SELECT id, operation, project_id, module_id, detail, created_at
+                "SELECT id, operation, project_id, module_id, detail, actor, created_at
                  FROM audit_log
                  ORDER BY created_at DESC
                  LIMIT ?1",
@@ -258,7 +271,8 @@ impl Db {
                 project_id: row.get(2)?,
                 module_id: row.get(3)?,
                 detail: row.get(4)?,
-                created_at: row.get(5)?,
+                actor: row.get(5)?,
+                created_at: row.get(6)?,
             })
         };
 
