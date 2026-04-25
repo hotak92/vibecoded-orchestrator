@@ -5,6 +5,7 @@
   import { selectedProject, projects } from '$lib/stores/projects';
   import { toast } from '$lib/stores/toast';
   import Toast from '$lib/components/Toast.svelte';
+  import Term from '$lib/components/Term.svelte';
   import SigmaGraph from '$lib/kg/SigmaGraph.svelte';
   import type { VizNode, VizEdge } from '$lib/kg/graph-types';
   import type { ProjectView } from '$lib/types/launcher';
@@ -154,7 +155,12 @@
 
   <footer class="cg-legend">
     {#each Object.entries(ENTITY_COLORS) as [type, color]}
-      <span><i style="background:{color}"></i>{type}</span>
+      {@const glossKey = type === 'CodeModule' ? 'code-module'
+        : type === 'CodeClass' ? 'code-class'
+        : type === 'CodeFunction' ? 'code-function'
+        : type === 'CodeAPI' ? 'code-api'
+        : 'code-interaction'}
+      <span><i style="background:{color}"></i><Term key={glossKey}>{type}</Term></span>
     {/each}
   </footer>
 </div>
