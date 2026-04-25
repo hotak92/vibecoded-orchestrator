@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # vct — VCT Secrets Primitive CLI (Phase 1, Bash)
 # Per-project secret store with project-first resolution + audit log.
-# Design: ~/Desktop/PROGETTI/Claude/docs/VCT_SECRETS_PRIMITIVE.md
+# Design: docs/VCT_SECRETS_PRIMITIVE.md (in the vibecoded-orchestrator repo)
 #
 # Root: $VCT_SECRETS_DIR (default: ~/.vct-secrets)
 #   projects/<NAME>/<KEY>  — per-project secret files (chmod 600)
@@ -171,7 +171,7 @@ SUBCOMMANDS:
 ENVIRONMENT:
   VCT_SECRETS_DIR    Override secret store root (default: ~/.vct-secrets)
 
-See: ~/Desktop/PROGETTI/Claude/docs/VCT_SECRETS_PRIMITIVE.md
+See: docs/VCT_SECRETS_PRIMITIVE.md (in the vibecoded-orchestrator repo)
 EOF
 }
 
