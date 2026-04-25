@@ -190,6 +190,8 @@
 <div class="project-wrapper" bind:this={wrapperEl}>
   <button
     class="project-trigger"
+    class:project-trigger-active={!!current}
+    style:--project-accent={current ? projectColor(current.id) : 'transparent'}
     onclick={(e) => {
       e.stopPropagation();
       open = !open;
@@ -449,9 +451,24 @@
     max-width: 260px;
   }
 
+  /* Second accent surface (paired with the MenuBar header strip) — tints
+     the project-name pill background and its border with the project's
+     hue. Solves the "color-only single-channel cue" finding from the
+     joint power-user verification. color-mix has 95%+ browser support
+     in WebKit / Chrome / Firefox 117+; Tauri ships modern WebKit so this
+     is safe in the desktop runtime. */
+  .project-trigger-active {
+    background: color-mix(in srgb, var(--project-accent) 14%, rgba(255,255,255,0.04));
+    border-color: color-mix(in srgb, var(--project-accent) 45%, rgba(255,255,255,0.08));
+  }
+
   .project-trigger:hover {
     border-color: rgba(0, 191, 166, 0.3);
     background: rgba(255, 255, 255, 0.06);
+  }
+  .project-trigger-active:hover {
+    background: color-mix(in srgb, var(--project-accent) 22%, rgba(255,255,255,0.06));
+    border-color: color-mix(in srgb, var(--project-accent) 60%, rgba(255,255,255,0.1));
   }
 
   .project-name {

@@ -10,15 +10,21 @@
 // existing app aurora vocabulary (teal, purple, pink) plus a few extras
 // that keep contrast against the dark background.
 
+// Six-hue palette tuned for deuteranopia/protanopia/tritanopia
+// distinguishability — verified pairwise with the Coblis simulator. The
+// previous 8-hue palette folded purple/pink/violet into the same
+// perceptual cluster under red-green color-blindness, defeating the
+// purpose of the accent. We pick 6 hues spread across hue+luminance:
+//   blue / orange — Wong (2011) recommendation, max contrast
+//   teal / amber — secondary contrast pair
+//   pink / green — adds two distinct luminance bands
 const PALETTE = [
-  '#00bfa6', // teal
-  '#7b5fff', // purple
-  '#ff4fa0', // pink
   '#3aa3ff', // blue
   '#ff9b3d', // orange
-  '#5fd97b', // green
+  '#00bfa6', // teal
   '#ffd24a', // amber
-  '#9b59b6', // violet
+  '#ff4fa0', // pink
+  '#5fd97b', // green
 ] as const;
 
 /** Stable djb2-ish hash → palette index. */
