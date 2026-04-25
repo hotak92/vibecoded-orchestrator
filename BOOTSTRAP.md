@@ -75,7 +75,7 @@ python3 install.py          # or `python install.py` on Windows
 1. Check Python version
 2. Detect your system (OS, GPU, container runtime, optional companions like lean-ctx)
 3. Pick an embedding mode automatically (GPU if NVIDIA detected, CPU otherwise — override with `--gpu` / `--cpu-only` / `--openai-key KEY` / `--low-resource`)
-4. Create a Python venv at `claude_mcp_servers/.venv`
+4. Create a Python venv at `.venv` (project root)
 5. Install Python deps
 6. Bring up Docker/Podman containers (Weaviate + Ollama)
 7. Pull Ollama models (qwen3-embedding, qwen3:0.6b, etc.)
@@ -134,7 +134,7 @@ Then ask the user what they want to work on.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `hybrid_search` returns nothing | Weaviate not running or KG not synced | `podman-compose -f claude_mcp_servers/compose.yaml up -d` then `.claude/scripts/kg-sync --all` |
+| `hybrid_search` returns nothing | Weaviate not running or KG not synced | `cd infrastructure && podman-compose -f docker-compose.yml up -d` (or `docker compose up -d`) then `.claude/scripts/kg-sync --all` |
 | Hooks don't fire | `VCT_DISABLE_HOOKS=1` set in shell | `unset VCT_DISABLE_HOOKS` |
 | Search MCP errors on GitHub queries | `~/.vct-secrets/shared/github_pat` missing or wrong perms | `vct doctor` |
 | `code-graph-query search` returns nothing | Code graph not analyzed yet | `.claude/scripts/code-graph-analyze . --project "MyProject"` |

@@ -41,8 +41,8 @@ For shell scripts, use `# SPDX-License-Identifier: ...`. For JS/TS, use `// SPDX
 ## Development Setup
 
 ```bash
-git clone https://github.com/VibeCoded-Tools/orchestrator.git
-cd orchestrator
+git clone https://github.com/hotak92/vibecoded-orchestrator.git
+cd vibecoded-orchestrator
 python -m venv .venv
 source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -r requirements.txt -r requirements-dev.txt
@@ -76,7 +76,7 @@ pyright
 
 ## Coding Standards
 
-- **Python**: 3.12+. Use type hints. Run `ruff check --fix` before committing. Prefer `pathlib` over `os.path`.
+- **Python**: 3.11+ (3.12 recommended). Use type hints. Run `ruff check --fix` before committing. Prefer `pathlib` over `os.path`.
 - **Shell**: `bash` only (no POSIX `sh` if avoidable). Use `set -euo pipefail` at the top of scripts.
 - **Comments**: only explain WHY, not WHAT. Don't reference issue numbers in code comments — those belong in commit messages.
 - **Commit messages**: imperative mood ("Add feature", not "Added feature"). First line ≤72 chars. Blank line then body if needed.
