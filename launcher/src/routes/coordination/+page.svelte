@@ -5,6 +5,7 @@
   import { selectedProject } from '$lib/stores/projects';
   import { toast } from '$lib/stores/toast';
   import Toast from '$lib/components/Toast.svelte';
+  import NoProjectBanner from '$lib/components/NoProjectBanner.svelte';
   import type {
     CoordinationConfig,
     ConnectionTestResult,
@@ -122,7 +123,7 @@
       from <code>launcher/</code> to configure Supabase and Telegram.
     </p>
   {:else if !project}
-    <p class="co-empty">Select a project to configure coordination.</p>
+    <NoProjectBanner section="Coordination" />
   {:else if loading}
     <p class="co-empty">Loading…</p>
   {:else}
