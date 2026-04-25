@@ -1,0 +1,290 @@
+<script lang="ts">
+  import { auth, currentUser } from '$lib/stores/auth';
+  import { goto } from '$app/navigation';
+
+  type Tab = 'library' | 'store';
+
+  let {
+    activeTab = $bindable('library'),
+    onOpenSettings,
+    onOpenActivation,
+  }: {
+    activeTab: Tab;
+    onOpenSettings: () => void;
+    onOpenActivation: () => void;
+  } = $props();
+
+  const tabs: { id: Tab; label: string }[] = [
+    { id: 'library', label: 'Library' },
+    { id: 'store', label: 'Store' },
+  ];
+
+  let showUserMenu = $state(false);
+  let menuWrapperEl: HTMLDivElement;
+
+  function handleLogout() {
+    showUserMenu = false;
+    auth.logout();
+    goto('/auth');
+  }
+
+  function handleClickOutside(e: MouseEvent) {
+    if (showUserMenu && menuWrapperEl && !menuWrapperEl.contains(e.target as Node)) {
+      showUserMenu = false;
+    }
+  }
+</script>
+
+<svelte:window onclick={handleClickOutside} />
+
+<header class="menu-bar">
+  <!-- Left: Logo + Nav -->
+  <div class="menu-left">
+    <div class="menu-logo">
+      <img src="/logo.png" alt="VCT" class="menu-logo-img" />
+      <span class="menu-logo-text">VCT Launcher</span>
+    </div>
+
+    <nav class="menu-nav">
+      {#each tabs as tab}
+        <button
+          class="menu-nav-item"
+          class:active={activeTab === tab.id}
+          onclick={() => (activeTab = tab.id)}
+        >
+          {tab.label}
+          {#if activeTab === tab.id}
+            <div class="nav-indicator"></div>
+          {/if}
+        </button>
+      {/each}
+    </nav>
+  </div>
+
+  <!-- Right: Avatar only -->
+  <div class="menu-right">
+    <div class="menu-user-wrapper" bind:this={menuWrapperEl}>
+      <button class="menu-avatar" onclick={(e) => { e.stopPropagation(); showUserMenu = !showUserMenu; }}>
+        <span>{$currentUser?.name?.charAt(0).toUpperCase() ?? '?'}</span>
+      </button>
+
+      {#if showUserMenu}
+        <div class="user-menu">
+          <div class="user-menu-header">
+            <p class="user-menu-name">{$currentUser?.name}</p>
+            <p class="user-menu-email">{$currentUser?.email}</p>
+          </div>
+          <div class="user-menu-divider"></div>
+          <button class="user-menu-item" onclick={() => { showUserMenu = false; onOpenSettings(); }}>
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+            </svg>
+            Settings
+          </button>
+          <button class="user-menu-item" onclick={() => { showUserMenu = false; onOpenActivation(); }}>
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+            </svg>
+            Activation Codes
+          </button>
+          <div class="user-menu-divider"></div>
+          <button class="user-menu-item user-menu-logout" onclick={handleLogout}>
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/>
+            </svg>
+            Sign Out
+          </button>
+        </div>
+      {/if}
+    </div>
+  </div>
+</header>
+
+<style>
+  .menu-bar {
+    position: relative;
+    z-index: 100;
+    height: 52px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 20px;
+    background: rgba(8, 15, 40, 0.85);
+    backdrop-filter: blur(20px);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    flex-shrink: 0;
+    -webkit-app-region: drag;
+  }
+
+  .menu-bar * {
+    -webkit-app-region: no-drag;
+  }
+
+  .menu-left {
+    display: flex;
+    align-items: center;
+    gap: 32px;
+  }
+
+  .menu-logo {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    -webkit-app-region: drag;
+  }
+
+  .menu-logo-img {
+    width: 28px;
+    height: 28px;
+    border-radius: 6px;
+    object-fit: contain;
+  }
+
+  .menu-logo-text {
+    font-weight: 800;
+    font-size: 14px;
+    letter-spacing: -0.3px;
+    color: var(--color-text);
+  }
+
+  .menu-nav {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+
+  .menu-nav-item {
+    position: relative;
+    padding: 6px 16px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--color-mid);
+    background: none;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: all 0.2s ease;
+  }
+
+  .menu-nav-item:hover {
+    color: var(--color-text);
+    background: rgba(255, 255, 255, 0.04);
+  }
+
+  .menu-nav-item.active {
+    color: var(--color-text);
+  }
+
+  .nav-indicator {
+    position: absolute;
+    bottom: -1px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 20px;
+    height: 2px;
+    background: var(--color-teal);
+    border-radius: 2px;
+    box-shadow: 0 0 8px rgba(0, 191, 166, 0.5);
+  }
+
+  .menu-right {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .menu-user-wrapper {
+    position: relative;
+  }
+
+  .menu-avatar {
+    width: 32px;
+    height: 32px;
+    border-radius: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: linear-gradient(135deg, var(--color-purple), var(--color-pink));
+    color: white;
+    font-weight: 700;
+    font-size: 13px;
+    border: 2px solid transparent;
+    cursor: pointer;
+    transition: all 0.25s ease;
+  }
+
+  .menu-avatar:hover {
+    border-color: rgba(255, 255, 255, 0.2);
+    transform: translateY(-1px) scale(1.05);
+    box-shadow: 0 4px 16px rgba(123, 95, 255, 0.3);
+  }
+
+  .user-menu {
+    position: fixed;
+    top: 52px;
+    right: 16px;
+    width: 220px;
+    background: rgba(13, 23, 53, 0.95);
+    backdrop-filter: blur(24px);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 14px;
+    padding: 6px;
+    z-index: 200;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+    animation: menu-appear 0.15s ease-out;
+  }
+
+  @keyframes menu-appear {
+    from { opacity: 0; transform: translateY(-8px) scale(0.96); }
+    to { opacity: 1; transform: translateY(0) scale(1); }
+  }
+
+  .user-menu-header {
+    padding: 10px 12px;
+  }
+
+  .user-menu-name {
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--color-text);
+  }
+
+  .user-menu-email {
+    font-size: 11px;
+    color: var(--color-mid);
+    margin-top: 2px;
+  }
+
+  .user-menu-divider {
+    height: 1px;
+    background: rgba(255, 255, 255, 0.06);
+    margin: 4px 8px;
+  }
+
+  .user-menu-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    padding: 8px 12px;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--color-mid);
+    background: none;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    text-align: left;
+    transition: all 0.15s ease;
+  }
+
+  .user-menu-item:hover {
+    color: var(--color-text);
+    background: rgba(255, 255, 255, 0.06);
+  }
+
+  .user-menu-logout:hover {
+    color: var(--color-pink);
+    background: rgba(255, 79, 160, 0.08);
+  }
+</style>

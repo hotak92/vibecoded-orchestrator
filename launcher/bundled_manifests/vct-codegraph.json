@@ -1,0 +1,91 @@
+{
+  "$schema": "https://vibecodedtools.it/schemas/vct-module-v1.json",
+  "manifest_version": 1,
+
+  "id": "vct-codegraph",
+  "name": "Code Graph",
+  "version": "0.3.1",
+  "description": "AST-based code entity search. Extracts modules, classes, functions, APIs, and cross-service interactions across 10+ languages; exposes search_code_graph and query_code_structure tools.",
+  "publisher": "VibeCoded Tools",
+  "repository": "https://github.com/VibeCoded-Tools/orchestrator",
+
+  "category": "core",
+  "tags": ["mcp", "code-analysis", "ast", "weaviate"],
+
+  "compatibility": {
+    "hosts": ["base", "mao"],
+    "min_launcher_version": "1.0.0"
+  },
+
+  "license": {
+    "required": false,
+    "type": "AGPL-3.0-or-later"
+  },
+
+  "requirements": {
+    "os": ["linux", "macos", "windows"],
+    "python": ">=3.11",
+    "memory_mb": 512,
+    "disk_mb": 100,
+    "depends_on": ["vct-kg", "vct-code-embedding"]
+  },
+
+  "install": {
+    "method": "local",
+    "install_dir": "{VCT_MODULES}/vct-kg",
+    "_note": "Code graph lives inside the same orchestrator repo as vct-kg. Installing vct-kg already brings the code graph scripts; this module just registers them as a separate named MCP capability for the Store/Dashboard UI."
+  },
+
+  "secrets": [],
+
+  "settings": [
+    {
+      "key": "CODE_EMBED_BACKEND",
+      "prompt": "Code embedding backend",
+      "description": "gpu = use the local CodeSage GPU service; ollama = fall back to Ollama jina-v2-base-code (CPU-friendly but lower quality)",
+      "type": "string",
+      "default": "gpu",
+      "options": ["gpu", "ollama"],
+      "required": true
+    }
+  ],
+
+  "runtime": {
+    "type": "cli",
+    "command": "{install_dir}/.venv/bin/python",
+    "args": ["{install_dir}/.claude/scripts/analyze_code_graph.py", "--help"],
+    "platform_command": {
+      "windows": "{install_dir}\\.venv\\Scripts\\python.exe"
+    },
+    "cwd": "{install_dir}",
+    "env_from_settings": ["CODE_EMBED_BACKEND"],
+    "_note": "Code graph is invoked on demand (analyze_code_graph.py / query_code_graph.py) rather than as a long-running process. The MCP entry points live in vct-kg's weaviate_mcp/server.py."
+  },
+
+  "mcp_registration": {
+    "enabled_by_default": false,
+    "mcp_name": "codegraph",
+    "target_projects": "all",
+    "scope": "user",
+    "_note": "Disabled by default; tools are already exposed via weaviate-kg MCP. Turn on only for a separate CLI workflow."
+  },
+
+  "upgrade": {
+    "strategy": "git_pull"
+  },
+
+  "uninstall": {
+    "remove_install_dir": false,
+    "preserve_paths": [],
+    "deregister_mcp": true,
+    "_note": "Shared install_dir with vct-kg — do not remove the dir on uninstall."
+  },
+
+  "provides": [
+    {
+      "kind": "mcp_tools",
+      "tool_prefix": "codegraph",
+      "description": "search_code_graph, query_code_structure (dependencies/callers/methods/interactions)"
+    }
+  ]
+}

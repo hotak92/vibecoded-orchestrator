@@ -1,0 +1,122 @@
+{
+  "$schema": "https://vibecodedtools.it/schemas/vct-module-v1.json",
+  "manifest_version": 1,
+
+  "id": "vct-code-embedding",
+  "name": "Code Embedding Service",
+  "version": "0.3.1",
+  "description": "GPU/CPU code embedding service (HTTP on port 11438). Wraps CodeSage-Large-v2 (2048-dim, Apache-2.0) via sentence-transformers. Falls back to Ollama jina-v2-base-code on CPU-only setups.",
+  "publisher": "VibeCoded Tools",
+  "repository": "https://github.com/VibeCoded-Tools/orchestrator",
+
+  "category": "core",
+  "tags": ["embeddings", "http-service", "codesage", "gpu"],
+
+  "compatibility": {
+    "hosts": ["base", "mao"],
+    "min_launcher_version": "1.0.0"
+  },
+
+  "license": {
+    "required": false,
+    "type": "AGPL-3.0-or-later"
+  },
+
+  "requirements": {
+    "os": ["linux", "macos", "windows"],
+    "python": ">=3.11",
+    "memory_mb": 4096,
+    "disk_mb": 3500,
+    "gpu": false
+  },
+
+  "install": {
+    "method": "git_clone",
+    "source": "https://github.com/VibeCoded-Tools/orchestrator.git",
+    "ref": "main",
+    "install_dir": "{VCT_MODULES}/vct-code-embedding",
+    "post_install": [
+      {
+        "cmd": "python -m venv .venv",
+        "cwd": "{install_dir}",
+        "timeout_s": 60
+      },
+      {
+        "cmd": "{install_dir}/.venv/bin/pip install -r requirements.txt",
+        "cwd": "{install_dir}",
+        "timeout_s": 600,
+        "platform_cmd": {
+          "windows": "{install_dir}\\.venv\\Scripts\\pip.exe install -r requirements.txt"
+        }
+      }
+    ]
+  },
+
+  "secrets": [],
+
+  "settings": [
+    {
+      "key": "CODE_EMBED_BACKEND",
+      "prompt": "Embedding backend",
+      "description": "gpu = sentence-transformers on local GPU (needs 3GB VRAM); ollama = jina-v2-base-code via Ollama (CPU-friendly, lower quality)",
+      "type": "string",
+      "default": "gpu",
+      "options": ["gpu", "ollama"],
+      "required": true
+    },
+    {
+      "key": "CODE_EMBED_DEVICE",
+      "prompt": "Device",
+      "description": "cuda / mps / cpu. Leave empty for auto-detect.",
+      "type": "string",
+      "default": "",
+      "required": false
+    },
+    {
+      "key": "CODE_EMBED_PORT",
+      "prompt": "HTTP port",
+      "type": "integer",
+      "default": 11438,
+      "min": 1024,
+      "max": 65535,
+      "required": true
+    }
+  ],
+
+  "runtime": {
+    "type": "service",
+    "command": "{install_dir}/.venv/bin/python",
+    "args": ["-m", "claude_mcp_servers.code_embedding_service.server"],
+    "platform_command": {
+      "windows": "{install_dir}\\.venv\\Scripts\\python.exe"
+    },
+    "cwd": "{install_dir}",
+    "env_from_settings": ["CODE_EMBED_BACKEND", "CODE_EMBED_DEVICE", "CODE_EMBED_PORT"],
+    "env_fixed": {
+      "PYTHONPATH": "{install_dir}",
+      "CODE_EMBED_MODEL": "codesage/codesage-large-v2"
+    },
+    "health_check": {
+      "type": "http_get",
+      "url": "http://localhost:11438/health",
+      "timeout_s": 10,
+      "interval_s": 60
+    },
+    "auto_restart": true,
+    "log_file": "{VCT_LOGS}/vct-code-embedding.log"
+  },
+
+  "mcp_registration": {
+    "enabled_by_default": false,
+    "_note": "Not an MCP — it's an HTTP service the weaviate-kg MCP calls internally."
+  },
+
+  "upgrade": {
+    "strategy": "git_pull"
+  },
+
+  "uninstall": {
+    "remove_install_dir": true,
+    "preserve_paths": ["{VCT_DATA}/vct-code-embedding/model-cache/"]
+  }
+}

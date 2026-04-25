@@ -1,0 +1,28 @@
+# Claude Code
+.claude/
+
+# Dependencies
+node_modules/
+
+# Build output
+src-tauri/target/
+.svelte-kit/
+build/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Supabase CLI temp
+supabase/.temp/

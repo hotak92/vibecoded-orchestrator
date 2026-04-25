@@ -1,0 +1,130 @@
+{
+  "$schema": "https://vibecodedtools.it/schemas/vct-module-v1.json",
+  "manifest_version": 1,
+
+  "id": "vct-kg",
+  "name": "Knowledge Graph",
+  "version": "0.3.1",
+  "description": "Semantic knowledge graph MCP. Stores markdown nodes with typed WikiLinks in Weaviate; exposes hybrid_search, semantic_graph_search, store_knowledge_node to Claude Code. Per-project collection routing.",
+  "publisher": "VibeCoded Tools",
+  "repository": "https://github.com/VibeCoded-Tools/orchestrator",
+
+  "category": "core",
+  "tags": ["mcp", "knowledge-graph", "weaviate", "semantic-search"],
+
+  "compatibility": {
+    "hosts": ["base", "mao"],
+    "min_launcher_version": "1.0.0"
+  },
+
+  "license": {
+    "required": false,
+    "type": "AGPL-3.0-or-later"
+  },
+
+  "requirements": {
+    "os": ["linux", "macos", "windows"],
+    "python": ">=3.11",
+    "memory_mb": 256,
+    "disk_mb": 50,
+    "depends_on": ["vct-ollama"]
+  },
+
+  "install": {
+    "method": "git_clone",
+    "source": "https://github.com/VibeCoded-Tools/orchestrator.git",
+    "ref": "main",
+    "install_dir": "{VCT_MODULES}/vct-kg",
+    "post_install": [
+      {
+        "cmd": "python -m venv .venv",
+        "cwd": "{install_dir}",
+        "timeout_s": 60
+      },
+      {
+        "cmd": "{install_dir}/.venv/bin/pip install -r claude_mcp_servers/weaviate_mcp/requirements.txt",
+        "cwd": "{install_dir}",
+        "timeout_s": 300,
+        "platform_cmd": {
+          "windows": "{install_dir}\\.venv\\Scripts\\pip.exe install -r claude_mcp_servers\\weaviate_mcp\\requirements.txt"
+        }
+      }
+    ]
+  },
+
+  "secrets": [],
+
+  "settings": [
+    {
+      "key": "KG_COLLECTION",
+      "prompt": "Weaviate collection name for this project",
+      "description": "Each project uses its own Weaviate collection so KG content stays scoped.",
+      "type": "string",
+      "default": "",
+      "required": true
+    },
+    {
+      "key": "SHARED_KG_COLLECTION",
+      "prompt": "Shared cross-project collection (optional)",
+      "description": "Name of the cross-project KG collection. Leave empty to disable cross-project KG access.",
+      "type": "string",
+      "default": "",
+      "required": false
+    },
+    {
+      "key": "WEAVIATE_URL",
+      "prompt": "Weaviate HTTP URL",
+      "description": "Auto-configured by the launcher when Weaviate container starts.",
+      "type": "string",
+      "default": "http://localhost:8081",
+      "required": true
+    }
+  ],
+
+  "runtime": {
+    "type": "mcp_stdio",
+    "command": "{install_dir}/.venv/bin/python",
+    "args": ["{install_dir}/claude_mcp_servers/weaviate_mcp/server.py"],
+    "platform_command": {
+      "windows": "{install_dir}\\.venv\\Scripts\\python.exe"
+    },
+    "cwd": "{install_dir}",
+    "env_from_settings": ["KG_COLLECTION", "SHARED_KG_COLLECTION", "WEAVIATE_URL"],
+    "env_fixed": {
+      "PYTHONPATH": "{install_dir}",
+      "OLLAMA_URL": "http://localhost:11435"
+    },
+    "health_check": {
+      "type": "stdio_ping",
+      "timeout_s": 5,
+      "interval_s": 30
+    },
+    "auto_restart": true,
+    "log_file": "{VCT_LOGS}/vct-kg.log"
+  },
+
+  "mcp_registration": {
+    "enabled_by_default": true,
+    "mcp_name": "weaviate-kg",
+    "target_projects": "all",
+    "scope": "user"
+  },
+
+  "upgrade": {
+    "strategy": "git_pull"
+  },
+
+  "uninstall": {
+    "remove_install_dir": true,
+    "preserve_paths": ["{VCT_DATA}/vct-kg/"],
+    "deregister_mcp": true
+  },
+
+  "provides": [
+    {
+      "kind": "mcp_tools",
+      "tool_prefix": "weaviate-kg",
+      "description": "hybrid_search, semantic_graph_search, store_knowledge_node, search_code_graph, query_code_structure"
+    }
+  ]
+}
