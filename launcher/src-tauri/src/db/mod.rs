@@ -24,6 +24,8 @@ pub mod settings;
 pub mod access;
 pub mod tier;
 pub mod project_state;
+pub mod slug;
+pub mod change_log;
 
 /// Resolve the launcher DB path: `~/.vct/launcher.db`.
 pub fn db_path() -> PathBuf {
@@ -62,7 +64,12 @@ impl Db {
 
         migrations::apply(&conn)?;
 
-        Ok(Db(Mutex::new(conn)))
+        let db = Db(Mutex::new(conn));
+        db.ensure_change_log()?;
+        // Best-effort prune of old change_log rows. Silent failure is fine.
+        let cutoff = chrono::Utc::now().timestamp_millis() - 24 * 60 * 60 * 1000;
+        let _ = db.prune_change_log(cutoff);
+        Ok(db)
     }
 
     /// Borrow the connection guard for a short transaction.

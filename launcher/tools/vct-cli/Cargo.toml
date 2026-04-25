@@ -1,0 +1,22 @@
+[package]
+name = "vct-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Command-line interface for the VCT Launcher (escape hatch for power users / CI)."
+
+[[bin]]
+name = "vct"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+directories = "5"
+anyhow = "1"
+
+[profile.release]
+strip = true
+lto = "thin"
+opt-level = "z"
