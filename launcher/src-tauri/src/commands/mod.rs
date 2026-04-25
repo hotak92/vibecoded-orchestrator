@@ -1,6 +1,7 @@
 pub mod codegraph;
 pub mod coordination;
 pub mod dashboard;
+pub mod hub_proxy;
 pub mod installer;
 pub mod kg;
 pub mod lifecycle;
