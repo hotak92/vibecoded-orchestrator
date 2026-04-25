@@ -143,5 +143,4 @@
   .kg-project code { color: #c4b3ff; font-family: ui-monospace, monospace; }
   .kg-warn { color: #fa8; font-size: 12px; }
   .kg-main { flex: 1; min-height: 0; }
-  .kg-empty { padding: 40px; text-align: center; color: #888; }
 </style>

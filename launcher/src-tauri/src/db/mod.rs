@@ -12,7 +12,7 @@
 //! (installs, downloads) never holds the DB lock.
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use rusqlite::Connection;
 
@@ -73,4 +73,24 @@ impl Db {
     pub fn lock(&self) -> std::sync::MutexGuard<Connection> {
         self.0.lock().expect("db mutex poisoned")
     }
+}
+
+// ─── Audit actor (OS user) ───────────────────────────────────────────────
+//
+// The audit_log.actor column needs the username of whoever is running
+// the launcher. Resolved once at process startup by reading $USER /
+// $USERNAME, with a literal "unknown" fallback. Stored in a OnceLock so
+// every call to `Db::audit(...)` can stamp it without re-reading env or
+// taking on a `whoami` crate dependency.
+
+static AUDIT_ACTOR: OnceLock<String> = OnceLock::new();
+
+/// Resolve and cache the current OS user. Called once at process start;
+/// subsequent calls return the cached value.
+pub fn current_actor() -> &'static str {
+    AUDIT_ACTOR.get_or_init(|| {
+        std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
+            .unwrap_or_else(|_| "unknown".to_string())
+    })
 }
