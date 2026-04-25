@@ -1,10 +1,11 @@
 <script lang="ts">
   import { auth, currentUser } from '$lib/stores/auth';
   import { settings } from '$lib/stores/settings';
+  import SecretsPanel from './SecretsPanel.svelte';
 
   let { open = $bindable(false) }: { open: boolean } = $props();
 
-  let activeSection = $state<'profile' | 'downloads' | 'about'>('profile');
+  let activeSection = $state<'profile' | 'downloads' | 'secrets' | 'about'>('profile');
 
   // Profile edit state
   let editName = $state($currentUser?.name ?? '');
@@ -39,6 +40,7 @@
   const sections = [
     { id: 'profile' as const, label: 'Profile' },
     { id: 'downloads' as const, label: 'Downloads' },
+    { id: 'secrets' as const, label: 'Secrets' },
     { id: 'about' as const, label: 'About' },
   ];
 </script>
@@ -137,6 +139,9 @@
             </label>
           </div>
 
+        {:else if activeSection === 'secrets'}
+          <SecretsPanel />
+
         {:else if activeSection === 'about'}
           <h3 class="section-title">About</h3>
           <div class="about-info">
@@ -189,10 +194,10 @@
   }
 
   .settings-panel {
-    width: 640px;
-    max-width: 90vw;
-    height: 480px;
-    max-height: 80vh;
+    width: 760px;
+    max-width: 92vw;
+    height: 560px;
+    max-height: 86vh;
     display: flex;
     background: rgba(13, 23, 53, 0.97);
     backdrop-filter: blur(24px);
