@@ -1,0 +1,131 @@
+<script lang="ts">
+  import { page } from '$app/stores';
+  import { goto } from '$app/navigation';
+  import { onMount } from 'svelte';
+  import { invoke } from '$lib/tauri';
+  import { toast } from '$lib/stores/toast';
+  import Toast from '$lib/components/Toast.svelte';
+  import AgentsTab from '$lib/project-state/AgentsTab.svelte';
+  import SkillsTab from '$lib/project-state/SkillsTab.svelte';
+  import HooksTab from '$lib/project-state/HooksTab.svelte';
+  import PermissionsTab from '$lib/project-state/PermissionsTab.svelte';
+  import SecretsTab from '$lib/project-state/SecretsTab.svelte';
+  import KgCodegraphTab from '$lib/project-state/KgCodegraphTab.svelte';
+  import type { ProjectView } from '$lib/types/launcher';
+
+  let projectId = $derived($page.params.id);
+  let project = $state<ProjectView | null>(null);
+  let activeTab = $state<'agents' | 'skills' | 'hooks' | 'permissions' | 'secrets' | 'kg' | 'settings'>('agents');
+
+  async function loadProject() {
+    try {
+      project = await invoke<ProjectView | null>('get_project_v2', { id: projectId });
+      if (!project) {
+        toast.error(`Project ${projectId} not found`);
+      }
+    } catch (e) {
+      toast.error(e);
+    }
+  }
+
+  onMount(loadProject);
+  $effect(() => {
+    if (projectId) void loadProject();
+  });
+
+  const tabs = [
+    { id: 'agents', label: 'Agents' },
+    { id: 'skills', label: 'Skills' },
+    { id: 'hooks', label: 'Hooks' },
+    { id: 'permissions', label: 'Permissions' },
+    { id: 'secrets', label: 'Secret refs' },
+    { id: 'kg', label: 'KG / Codegraph' },
+    { id: 'settings', label: 'Settings' },
+  ] as const;
+</script>
+
+<div class="project-page">
+  <header class="project-header">
+    <button class="back-btn" onclick={() => goto('/')} aria-label="Back">
+      ← Back
+    </button>
+    <div class="project-title">
+      <h1>{project?.name ?? 'Project'}</h1>
+      {#if project}
+        <p class="project-meta">
+          <code>{project.folder_path}</code>
+          <span class="host-badge host-{project.host}">{project.host}</span>
+        </p>
+      {/if}
+    </div>
+  </header>
+
+  <nav class="tab-nav">
+    {#each tabs as tab}
+      <button
+        class="tab-btn"
+        class:active={activeTab === tab.id}
+        onclick={() => (activeTab = tab.id)}
+      >{tab.label}</button>
+    {/each}
+  </nav>
+
+  <main class="tab-content">
+    {#if !project}
+      <p class="loading">Loading…</p>
+    {:else if activeTab === 'agents'}
+      <AgentsTab projectId={project.id} />
+    {:else if activeTab === 'skills'}
+      <SkillsTab projectId={project.id} />
+    {:else if activeTab === 'hooks'}
+      <HooksTab projectId={project.id} />
+    {:else if activeTab === 'permissions'}
+      <PermissionsTab projectId={project.id} />
+    {:else if activeTab === 'secrets'}
+      <SecretsTab projectId={project.id} />
+    {:else if activeTab === 'kg'}
+      <KgCodegraphTab projectId={project.id} />
+    {:else if activeTab === 'settings'}
+      <a href="/project/{project.id}/settings" class="settings-link">Open project settings →</a>
+    {/if}
+  </main>
+</div>
+
+<Toast />
+
+<style>
+  .project-page { min-height: 100vh; background: var(--color-bg, #0e0e16); color: var(--color-light, #e8e8ee); }
+  .project-header {
+    display: flex; align-items: center; gap: 16px;
+    padding: 14px 24px; border-bottom: 1px solid rgba(255,255,255,0.06);
+  }
+  .back-btn {
+    background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1);
+    color: inherit; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 13px;
+  }
+  .back-btn:hover { background: rgba(255,255,255,0.1); }
+  .project-title h1 { margin: 0; font-size: 18px; }
+  .project-meta { margin: 2px 0 0; font-size: 12px; color: #888; }
+  .project-meta code { font-family: ui-monospace, monospace; }
+  .host-badge {
+    display: inline-block; padding: 1px 8px; border-radius: 10px;
+    font-size: 10px; text-transform: uppercase; font-weight: 600;
+    margin-left: 8px;
+  }
+  .host-base { background: rgba(0,191,166,0.15); color: #0fc; }
+  .host-mao { background: rgba(123,95,255,0.15); color: #c4b3ff; }
+  .tab-nav { display: flex; padding: 0 24px; border-bottom: 1px solid rgba(255,255,255,0.06); }
+  .tab-btn {
+    background: none; border: none; color: #888; padding: 12px 16px;
+    cursor: pointer; font-size: 13px;
+    border-bottom: 2px solid transparent;
+  }
+  .tab-btn:hover { color: #ccc; }
+  .tab-btn.active {
+    color: #fff;
+    border-bottom-color: rgb(0,191,166);
+  }
+  .tab-content { max-width: 1200px; margin: 0 auto; }
+  .loading { padding: 40px; text-align: center; color: #888; }
+  .settings-link { color: #0fc; padding: 24px; display: block; text-decoration: none; }
+</style>
