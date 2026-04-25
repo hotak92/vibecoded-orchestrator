@@ -1,0 +1,83 @@
+{
+  "$schema": "https://vibecodedtools.it/schemas/vct-module-v1.json",
+  "manifest_version": 1,
+
+  "id": "vct-hub-api",
+  "name": "Hub API Server",
+  "version": "1.0.0",
+  "description": "Inter-app message hub. Apps register with the hub on startup, exchange async messages, and declare data they expose. Runs as part of the launcher binary on localhost:7700; this manifest enables the UI to show its status in the module dashboard.",
+  "publisher": "VibeCoded Tools",
+  "repository": "https://github.com/pb992/VCT-Launcher",
+
+  "category": "core",
+  "tags": ["hub", "inter-app", "http"],
+
+  "compatibility": {
+    "hosts": ["base", "mao"],
+    "min_launcher_version": "1.0.0"
+  },
+
+  "license": {
+    "required": false,
+    "type": "AGPL-3.0-or-later"
+  },
+
+  "requirements": {
+    "os": ["linux", "macos", "windows"],
+    "memory_mb": 32,
+    "disk_mb": 5
+  },
+
+  "install": {
+    "method": "local",
+    "install_dir": "{VCT_MODULES}/vct-hub-api",
+    "_note": "The Hub server ships with the launcher binary (src-tauri/src/hub/). This module entry exists so the launcher UI can surface its health in the dashboard and so future Hub upgrades can be delivered through the manifest."
+  },
+
+  "secrets": [],
+  "settings": [
+    {
+      "key": "HUB_PORT",
+      "prompt": "Hub HTTP port",
+      "description": "Default 7700. Change if you have a port conflict.",
+      "type": "integer",
+      "default": 7700,
+      "min": 1024,
+      "max": 65535,
+      "required": true
+    }
+  ],
+
+  "runtime": {
+    "type": "service",
+    "command": "builtin:hub",
+    "args": [],
+    "env_from_settings": ["HUB_PORT"],
+    "health_check": {
+      "type": "http_get",
+      "url": "http://localhost:7700/api/v1/health",
+      "timeout_s": 3,
+      "interval_s": 30
+    },
+    "auto_restart": false,
+    "_note": "command=builtin:hub is a sentinel — the launcher never spawns an external process; it already owns the hub."
+  },
+
+  "mcp_registration": {
+    "enabled_by_default": false,
+    "_note": "Hub is HTTP, not MCP."
+  },
+
+  "uninstall": {
+    "remove_install_dir": false,
+    "_note": "Cannot be uninstalled independently of the launcher."
+  },
+
+  "provides": [
+    {
+      "kind": "http_api",
+      "base_url": "http://localhost:7700/api/v1",
+      "description": "POST /apps/register, GET /apps, POST /messages, GET /messages/{app_id}, POST /data/register, GET /data/catalog, GET /health"
+    }
+  ]
+}

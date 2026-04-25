@@ -1,0 +1,131 @@
+{
+  "$schema": "https://vibecodedtools.it/schemas/vct-module-v1.json",
+  "manifest_version": 1,
+
+  "id": "vct-search",
+  "name": "Web + Code + Paper Search",
+  "version": "0.3.1",
+  "description": "Search MCP: web (via SearXNG), GitHub code, arXiv + OpenAlex papers, full-page fetch. Wraps fetched HTML in an `<fetched-untrusted-content>` tag to guard against prompt injection.",
+  "publisher": "VibeCoded Tools",
+  "repository": "https://github.com/VibeCoded-Tools/orchestrator",
+
+  "category": "core",
+  "tags": ["mcp", "search", "web", "github", "arxiv"],
+
+  "compatibility": {
+    "hosts": ["base", "mao"],
+    "min_launcher_version": "1.0.0"
+  },
+
+  "license": {
+    "required": false,
+    "type": "AGPL-3.0-or-later"
+  },
+
+  "requirements": {
+    "os": ["linux", "macos", "windows"],
+    "python": ">=3.11",
+    "memory_mb": 128,
+    "disk_mb": 30,
+    "network": ["https://*"]
+  },
+
+  "install": {
+    "method": "git_clone",
+    "source": "https://github.com/VibeCoded-Tools/orchestrator.git",
+    "ref": "main",
+    "install_dir": "{VCT_MODULES}/vct-search",
+    "post_install": [
+      {
+        "cmd": "python -m venv .venv",
+        "cwd": "{install_dir}",
+        "timeout_s": 60
+      },
+      {
+        "cmd": "{install_dir}/.venv/bin/pip install -r claude_mcp_servers/search_mcp/requirements.txt",
+        "cwd": "{install_dir}",
+        "timeout_s": 180,
+        "platform_cmd": {
+          "windows": "{install_dir}\\.venv\\Scripts\\pip.exe install -r claude_mcp_servers\\search_mcp\\requirements.txt"
+        }
+      }
+    ]
+  },
+
+  "secrets": [
+    {
+      "key": "GITHUB_TOKEN",
+      "prompt": "GitHub personal access token (optional)",
+      "description": "Raises GitHub rate limit from 60 to 5000 requests/hour. Create at https://github.com/settings/tokens with 'public_repo' scope.",
+      "required": false,
+      "scope": "global",
+      "sensitive": true
+    },
+    {
+      "key": "OPENALEX_EMAIL",
+      "prompt": "OpenAlex email (optional)",
+      "description": "Identifies you to OpenAlex's polite pool — higher rate limits, no token needed.",
+      "required": false,
+      "scope": "global",
+      "sensitive": false
+    }
+  ],
+
+  "settings": [
+    {
+      "key": "SEARXNG_URL",
+      "prompt": "SearXNG HTTP URL",
+      "description": "Launcher auto-starts a SearXNG container and fills this in.",
+      "type": "string",
+      "default": "http://localhost:8888",
+      "required": true
+    }
+  ],
+
+  "runtime": {
+    "type": "mcp_stdio",
+    "command": "{install_dir}/.venv/bin/python",
+    "args": ["{install_dir}/claude_mcp_servers/search_mcp/server.py"],
+    "platform_command": {
+      "windows": "{install_dir}\\.venv\\Scripts\\python.exe"
+    },
+    "cwd": "{install_dir}",
+    "env_from_secrets": ["GITHUB_TOKEN", "OPENALEX_EMAIL"],
+    "env_from_settings": ["SEARXNG_URL"],
+    "env_fixed": {
+      "PYTHONPATH": "{install_dir}"
+    },
+    "health_check": {
+      "type": "stdio_ping",
+      "timeout_s": 5,
+      "interval_s": 60
+    },
+    "auto_restart": true,
+    "log_file": "{VCT_LOGS}/vct-search.log"
+  },
+
+  "mcp_registration": {
+    "enabled_by_default": true,
+    "mcp_name": "search",
+    "target_projects": "all",
+    "scope": "user"
+  },
+
+  "upgrade": {
+    "strategy": "git_pull"
+  },
+
+  "uninstall": {
+    "remove_install_dir": true,
+    "preserve_paths": [],
+    "deregister_mcp": true
+  },
+
+  "provides": [
+    {
+      "kind": "mcp_tools",
+      "tool_prefix": "search",
+      "description": "web_search, search_code (GitHub), search_papers (OpenAlex + arXiv), fetch_page (with injection-guard wrapper)"
+    }
+  ]
+}

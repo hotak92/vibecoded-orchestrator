@@ -1,0 +1,13 @@
+pub mod codegraph;
+pub mod coordination;
+pub mod dashboard;
+pub mod installer;
+pub mod kg;
+pub mod lifecycle;
+pub mod licensing;
+pub mod mcp_reg;
+pub mod modules;
+pub mod projects;
+pub mod projects_v2;
+pub mod secrets_cmd;
+pub mod telemetry_cmd;

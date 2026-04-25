@@ -1,0 +1,72 @@
+//! Forward-only schema migrations for launcher.db.
+//!
+//! Each migration is an idempotent SQL string plus a unique sequence number.
+//! We track applied migrations in a `_schema_migrations` table and only run
+//! the ones newer than the current version.
+//!
+//! Migrations MUST be append-only: never edit a shipped migration. If a
+//! schema change needs revision, add a new migration that alters the table.
+
+use rusqlite::Connection;
+
+struct Migration {
+    version: u32,
+    description: &'static str,
+    sql: &'static str,
+}
+
+/// Ordered list of all migrations the launcher knows about. The `version`
+/// field MUST be monotonically increasing and unique.
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        description: "initial schema: projects, module_installs, module_settings, access grants, tier_cache, audit_log",
+        sql: include_str!("migrations/001_initial.sql"),
+    },
+];
+
+/// Apply every migration whose version is greater than the current max applied.
+pub fn apply(conn: &Connection) -> Result<(), String> {
+    // Bootstrap the tracking table. This statement is itself "migration 0"
+    // and stays outside the MIGRATIONS list so it's always safe to re-run.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS _schema_migrations (
+            version     INTEGER PRIMARY KEY,
+            description TEXT NOT NULL,
+            applied_at  INTEGER NOT NULL
+         );",
+    )
+    .map_err(|e| format!("create _schema_migrations: {}", e))?;
+
+    let current_version: u32 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM _schema_migrations",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("read current version: {}", e))?;
+
+    for m in MIGRATIONS {
+        if m.version <= current_version {
+            continue;
+        }
+        tracing_apply(m);
+        conn.execute_batch(m.sql)
+            .map_err(|e| format!("apply migration {} ({}): {}", m.version, m.description, e))?;
+        conn.execute(
+            "INSERT INTO _schema_migrations (version, description, applied_at) VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                m.version,
+                m.description,
+                chrono::Utc::now().timestamp_millis(),
+            ],
+        )
+        .map_err(|e| format!("record migration {}: {}", m.version, e))?;
+    }
+
+    Ok(())
+}
+
+fn tracing_apply(m: &Migration) {
+    eprintln!("[launcher-db] applying migration {}: {}", m.version, m.description);
+}

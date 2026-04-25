@@ -1,0 +1,57 @@
+[package]
+name = "vct-launcher-temp"
+version = "0.1.0"
+description = "A Tauri App"
+authors = ["you"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "vct_launcher_temp_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+uuid = { version = "1", features = ["v4"] }
+directories = "5"
+chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"
+
+# Hub API server
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
+
+# SQLite for async comms + config
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# OS keychain for secrets (macOS Keychain / Windows Credential Manager / Linux libsecret)
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+
+# Safer subprocess spawning (tokenize strings to Vec<String>)
+shlex = "1"
+
+# Hashing for machine ID (sha256 of MAC matches Python validator.py)
+sha2 = "0.10"
+
+# Regex for manifest validation patterns + PII scrub
+regex = "1"
+
+# Platform hostname
+gethostname = "0.5"
+
+# MAC address for machine binding (matches commercial_workflow/license/validator.py)
+mac_address = "1"
+hex = "0.4"
+
