@@ -1,0 +1,19 @@
+# Funding configuration — uncomment and fill in if you want to enable
+# the GitHub "Sponsor" button on the repo.
+#
+# See https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/displaying-a-sponsor-button-in-your-repository
+#
+# github: [hotak92]              # GitHub Sponsors
+# patreon:                       # Patreon username
+# open_collective:               # Open Collective name
+# ko_fi:                         # Ko-fi username
+# tidelift:                      # Tidelift package, format: "platform-name/package-name"
+# community_bridge:              # CommunityBridge project name
+# liberapay:                     # Liberapay username
+# issuehunt:                     # IssueHunt username
+# otechie:                       # Otechie username
+# lfx_crowdfunding:              # LFX Crowdfunding project name
+# polar:                         # Polar username
+# buy_me_a_coffee:               # Buy Me a Coffee username
+# thanks_dev:                    # thanks.dev username
+# custom: ['https://example.com/sponsor']
