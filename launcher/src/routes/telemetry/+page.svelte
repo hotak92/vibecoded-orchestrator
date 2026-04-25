@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
-  import { invoke } from '$lib/tauri';
+  import { invoke, safeInvoke, isTauriRuntime } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
   import Toast from '$lib/components/Toast.svelte';
   import type { TelemetryStatus, TelemetryEventView, ConsentFlags } from '$lib/types/project-state';
@@ -10,10 +10,12 @@
   let events = $state<TelemetryEventView[]>([]);
   let loading = $state(true);
 
+  const inTauri = isTauriRuntime();
+
   async function loadStatus() {
     loading = true;
     try {
-      status = await invoke<TelemetryStatus>('telemetry_status');
+      status = await safeInvoke<TelemetryStatus>('telemetry_status');
     } catch (e) {
       toast.error(e);
     } finally {
@@ -23,7 +25,8 @@
 
   async function loadEvents() {
     try {
-      events = await invoke<TelemetryEventView[]>('telemetry_recent_events', { limit: 50 });
+      const result = await safeInvoke<TelemetryEventView[]>('telemetry_recent_events', { limit: 50 });
+      events = result ?? [];
     } catch (e) {
       toast.error(e);
     }
@@ -63,7 +66,13 @@
     <h1>Telemetry & Privacy</h1>
   </header>
 
-  {#if loading || !status}
+  {#if !inTauri}
+    <p class="t-empty t-placeholder">
+      Telemetry settings require the desktop app. Run
+      <code>npm run tauri:dev</code> from <code>launcher/</code> to view
+      consent flags and queued events.
+    </p>
+  {:else if loading || !status}
     <p class="t-empty">Loading…</p>
   {:else}
     <main class="t-main">
@@ -175,6 +184,17 @@
   .t-header h1 { font-size: 16px; margin: 0; }
   .t-back { background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); color: inherit; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 12px; }
   .t-empty { padding: 40px; text-align: center; color: #888; }
+  .t-placeholder {
+    max-width: 720px; margin: 14px auto;
+    padding: 12px 14px;
+    background: rgba(255,159,64,0.08);
+    border: 1px solid rgba(255,159,64,0.2);
+    border-radius: 8px;
+    color: #ffb066; font-size: 12px; text-align: left;
+  }
+  .t-placeholder code {
+    font-family: ui-monospace, monospace; color: #c4b3ff; font-size: 11px;
+  }
   .t-main { max-width: 720px; margin: 0 auto; padding: 16px; }
   .t-warn {
     background: rgba(255,170,68,0.1); border: 1px solid rgba(255,170,68,0.3);
