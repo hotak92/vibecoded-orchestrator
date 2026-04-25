@@ -30,9 +30,10 @@
   let filterActor = $state('');
 
   // Time-range filter. 'custom' uses customFrom/customTo (epoch ms or
-  // null = open). Server-side filtering would require extending the
-  // Tauri command + Db query; we filter purely client-side on the
-  // already-fetched 500-event window for now and document.
+  // null = open). Bounds and the search/actor filters are pushed into
+  // the SQL layer of `list_audit_events` so the wire payload only
+  // carries matching rows. Earlier revisions filtered client-side over
+  // a 500-event window and fell over for high-volume audit logs.
   type RangeKey = '24h' | '7d' | '30d' | 'all' | 'custom';
   let filterRange = $state<RangeKey>('all');
   // Hour-precision custom range — datetime-local format (yyyy-MM-ddTHH:mm).
@@ -49,9 +50,16 @@
     error = null;
     try {
       const project_id = filterProject === 'all' ? undefined : filterProject;
+      const [from, to] = rangeBounds(filterRange);
+      const actor = filterActor.trim() || undefined;
+      const search = filterText.trim() || undefined;
       const result = await safeInvoke<AuditEvent[]>('list_audit_events', {
         projectId: project_id,
-        limit: 500,
+        actor,
+        sinceMs: from ?? undefined,
+        untilMs: to ?? undefined,
+        search,
+        limit: 5000,
       });
       events = result ?? [];
     } catch (e) {
@@ -59,6 +67,24 @@
     } finally {
       loading = false;
     }
+  }
+
+  // Re-fetch when any server-side filter changes. Debounced for the
+  // free-text inputs so we don't spam SQL on every keystroke.
+  let textDebounce: ReturnType<typeof setTimeout> | null = null;
+  function scheduleReload(immediate: boolean = false) {
+    if (textDebounce) {
+      clearTimeout(textDebounce);
+      textDebounce = null;
+    }
+    if (immediate) {
+      load();
+      return;
+    }
+    textDebounce = setTimeout(() => {
+      textDebounce = null;
+      load();
+    }, 250);
   }
 
   onMount(() => {
@@ -111,24 +137,14 @@
     return [null, null];
   }
 
-  const filtered = $derived.by(() => {
-    const [from, to] = rangeBounds(filterRange);
-    const q = filterText.toLowerCase();
-    const actorQ = filterActor.toLowerCase().trim();
-    return events.filter((e) => {
-      if (from !== null && e.created_at < from) return false;
-      if (to !== null && e.created_at > to) return false;
-      if (actorQ && !(e.actor ?? '').toLowerCase().includes(actorQ)) return false;
-      if (!q) return true;
-      return (
-        e.operation.toLowerCase().includes(q) ||
-        (e.project_id ?? '').toLowerCase().includes(q) ||
-        (e.module_id ?? '').toLowerCase().includes(q) ||
-        (e.actor ?? '').toLowerCase().includes(q) ||
-        e.detail.toLowerCase().includes(q)
-      );
-    });
-  });
+  // The server-side filters (project, actor, time range, search) already
+  // narrowed the rowset; we just expose `events` as `filtered` so the
+  // table + CSV exporter keep their current callsite. Note the SQL
+  // search matches operation OR detail; the previous JS pass also
+  // matched against project_id / module_id / actor for the same query,
+  // but those are now first-class filter inputs, so the loss is
+  // intentional.
+  const filtered = $derived(events);
 
   /** RFC 4180-ish CSV cell escape: wrap in quotes, double inner quotes. */
   function csvCell(s: string | number | null | undefined): string {
@@ -178,7 +194,7 @@
   <div class="controls">
     <label>
       <span>Project:</span>
-      <select bind:value={filterProject} onchange={load}>
+      <select bind:value={filterProject} onchange={() => scheduleReload(true)}>
         <option value="all">All projects</option>
         {#each allProjects as p}
           <option value={p.id}>{p.name}</option>
@@ -192,18 +208,18 @@
           type="button"
           class="range-pill"
           class:range-pill-active={filterRange === val}
-          onclick={() => (filterRange = val as RangeKey)}
+          onclick={() => { filterRange = val as RangeKey; scheduleReload(true); }}
         >{label}</button>
       {/each}
     </div>
     {#if filterRange === 'custom'}
       <label class="custom-range">
         <span>From:</span>
-        <input type="datetime-local" bind:value={customFrom} />
+        <input type="datetime-local" bind:value={customFrom} onchange={() => scheduleReload(true)} />
       </label>
       <label class="custom-range">
         <span>To:</span>
-        <input type="datetime-local" bind:value={customTo} />
+        <input type="datetime-local" bind:value={customTo} onchange={() => scheduleReload(true)} />
       </label>
     {/if}
     <label class="actor">
@@ -212,6 +228,7 @@
         type="text"
         bind:value={filterActor}
         placeholder="username"
+        oninput={() => scheduleReload()}
       />
     </label>
     <label class="search">
@@ -219,7 +236,8 @@
       <input
         type="text"
         bind:value={filterText}
-        placeholder="operation, project, actor, detail…"
+        placeholder="operation, detail…"
+        oninput={() => scheduleReload()}
       />
     </label>
     <button class="btn-3d btn-3d-ghost btn-3d-sm" onclick={load} disabled={loading}>
