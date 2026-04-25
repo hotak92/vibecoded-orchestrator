@@ -56,4 +56,4 @@ The orchestrator category is young. The closest comparables:
 | **Pro** | Developers with 3+ projects | Free + RL retrieval reranking (learns your preferences over time) + auto-updates |
 | **MAO** | Teams + advanced users | Pro + full multi-agent orchestrator with 10 specialist agents + Tauri desktop UI + team coordination |
 
-Free is AGPL-licensed open source. Pro and MAO are commercial add-ons with an FSL-1.1 → Apache-2.0 delayed-release license (we're time-limiting our own commercial exclusivity).
+Free tier is AGPL. Pro and MAO are commercial subscriptions distributed as signed pre-compiled artifacts; subscribers get the binaries, not source.

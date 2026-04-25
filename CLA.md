@@ -4,7 +4,7 @@
 
 Thank you for your interest in contributing to the VibeCoded Tools Orchestrator project (the "Project"), maintained by Martino Cesaratto (operating as "VibeCoded Tools", "we", or "us").
 
-This Individual Contributor License Agreement ("Agreement") documents the rights granted by contributors to us. This helps us maintain a dual-licensed project where core code is distributed under the GNU Affero General Public License version 3 (AGPL-3.0) and certain modules are distributed under the Functional Source License (FSL-1.1-Apache-2.0) or a commercial license.
+This Individual Contributor License Agreement ("Agreement") documents the rights granted by contributors to us. The Project source code is distributed under the GNU Affero General Public License version 3 (AGPL-3.0). We additionally distribute paid modules as pre-compiled, signed binaries under proprietary commercial terms; this Agreement gives us the rights needed to operate that distribution channel.
 
 By submitting a pull request, issue with patch, or any other contribution to this Project, you agree to the terms below.
 
@@ -20,7 +20,7 @@ By submitting a pull request, issue with patch, or any other contribution to thi
 
 You hereby grant to us, and to recipients of software distributed by us, a perpetual, worldwide, non-exclusive, no-charge, royalty-free, irrevocable copyright license to reproduce, prepare derivative works of, publicly display, publicly perform, sublicense, and distribute Your Contributions and such derivative works.
 
-This license explicitly includes the right for us to **sublicense Your Contributions under any license**, including but not limited to AGPL-3.0, FSL-1.1-Apache-2.0, Apache-2.0, and proprietary commercial licenses. This right is required to operate our dual-licensing business model.
+We may sublicense Your Contributions under AGPL-3.0 and/or under proprietary commercial licenses for our paid distribution channel.
 
 ## 3. Grant of Patent License
 
@@ -34,7 +34,7 @@ You represent that:
 
 1. You are legally entitled to grant the above license. If Your employer(s) has rights to intellectual property that You create, You represent that You have received permission to make Contributions on behalf of that employer, that Your employer has waived such rights for Your Contributions to us, or that Your employer has executed a separate Corporate CLA with us.
 
-2. Each of Your Contributions is Your original creation. You represent that Your Contributions do not include third-party intellectual property (including open source code) unless You have identified it clearly in the Contribution (e.g., commit message, pull request description) and the applicable license of that third-party work is compatible with AGPL-3.0 and FSL-1.1-Apache-2.0.
+2. Each of Your Contributions is Your original creation. You represent that Your Contributions do not include third-party intellectual property (including open source code) unless You have identified it clearly in the Contribution (e.g., commit message, pull request description) and the applicable license of that third-party work is compatible with AGPL-3.0.
 
 3. You are not expected to provide support for Your Contributions, except to the extent You desire to provide support. You may provide support for free, for a fee, or not at all. Unless required by applicable law or agreed to in writing, You provide Your Contributions on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied, including, without limitation, any warranties or conditions of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A PARTICULAR PURPOSE.
 

@@ -124,4 +124,4 @@ It prints the active workspace path, KG collection name, and recent state.
 
 - GitHub Issues: <https://github.com/hotak92/vibecoded-orchestrator/issues>
 - Community channel: (TBD — linked from vibecodedtools.it at launch)
-- Commercial support: Pro and MAO tiers include email support — see [LICENSE-FSL](../LICENSE-FSL).
+- Commercial support: Pro and MAO tiers include email support.
