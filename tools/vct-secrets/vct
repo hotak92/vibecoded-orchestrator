@@ -1,0 +1,617 @@
+#!/usr/bin/env bash
+# vct — VCT Secrets Primitive CLI (Phase 1, Bash)
+# Per-project secret store with project-first resolution + audit log.
+# Design: ~/Desktop/PROGETTI/Claude/docs/VCT_SECRETS_PRIMITIVE.md
+#
+# Root: $VCT_SECRETS_DIR (default: ~/.vct-secrets)
+#   projects/<NAME>/<KEY>  — per-project secret files (chmod 600)
+#   shared/<KEY>           — cross-project fallback
+#   audit.log              — append-only JSON-lines log
+#
+# Safety: umask 077, no secrets on argv, no secrets in logs, no network.
+
+set -u
+umask 077
+
+# ---------- Configuration ----------
+VCT_SECRETS_DIR="${VCT_SECRETS_DIR:-$HOME/.vct-secrets}"
+AUDIT_LOG="$VCT_SECRETS_DIR/audit.log"
+VERSION="0.1.0-phase1"
+
+# Env vars to preserve into child when not --preserve-env.
+# Covers locale, terminal, PATH, home — drops everything else.
+PRESERVE_ENV_VARS=(PATH HOME USER LOGNAME TERM LANG SHELL PWD TMPDIR)
+
+# ---------- Utility ----------
+die() { printf 'vct: error: %s\n' "$*" >&2; exit 1; }
+die_code() { local c=$1; shift; printf 'vct: error: %s\n' "$*" >&2; exit "$c"; }
+warn() { printf 'vct: warning: %s\n' "$*" >&2; }
+
+# Reject keys/projects with path-traversal or control chars.
+# Allow: [A-Za-z0-9_.-], length 1..128.
+validate_name() {
+    local kind=$1 val=$2
+    if [ -z "$val" ]; then
+        die "$kind cannot be empty"
+    fi
+    if [ "${#val}" -gt 128 ]; then
+        die "$kind too long (>128 chars)"
+    fi
+    case "$val" in
+        *..*|*/*|*$'\n'*|*$'\t'*|.*|-*)
+            die "$kind contains invalid characters: $val"
+            ;;
+    esac
+    # Reject anything outside [A-Za-z0-9_.-]
+    if printf '%s' "$val" | LC_ALL=C grep -q '[^A-Za-z0-9_.-]'; then
+        die "$kind contains invalid characters: $val"
+    fi
+}
+
+ensure_root() {
+    if [ ! -d "$VCT_SECRETS_DIR" ]; then
+        mkdir -p "$VCT_SECRETS_DIR"
+        chmod 700 "$VCT_SECRETS_DIR"
+    fi
+    mkdir -p "$VCT_SECRETS_DIR/projects" "$VCT_SECRETS_DIR/shared"
+    chmod 700 "$VCT_SECRETS_DIR/projects" "$VCT_SECRETS_DIR/shared" 2>/dev/null || true
+    if [ ! -f "$AUDIT_LOG" ]; then
+        touch "$AUDIT_LOG"
+        chmod 600 "$AUDIT_LOG"
+    fi
+}
+
+# JSON-escape a string (minimal: quotes, backslashes, control chars).
+json_escape() {
+    local s=$1
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    s=${s//$'\n'/\\n}
+    s=${s//$'\r'/\\r}
+    s=${s//$'\t'/\\t}
+    printf '%s' "$s"
+}
+
+# audit op project keys_array caller_cmd
+audit() {
+    local op=$1 project=$2 keys=$3 caller_cmd=${4:-}
+    local ts
+    ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    local line
+    line=$(printf '{"ts":"%s","op":"%s","project":"%s","secrets":%s,"caller_pid":%d,"caller_cmd":"%s"}' \
+        "$ts" \
+        "$(json_escape "$op")" \
+        "$(json_escape "$project")" \
+        "$keys" \
+        "$$" \
+        "$(json_escape "$caller_cmd")")
+    printf '%s\n' "$line" >> "$AUDIT_LOG"
+}
+
+# Build JSON array from space-separated list.
+json_array_from_list() {
+    local first=1 out='['
+    local k
+    for k in "$@"; do
+        if [ $first -eq 1 ]; then first=0; else out+=','; fi
+        out+='"'$(json_escape "$k")'"'
+    done
+    out+=']'
+    printf '%s' "$out"
+}
+
+# Resolve path for a secret. Prints the path on stdout; exit 0 if found, 2 if not.
+resolve_secret() {
+    local project=$1 key=$2
+    local p_path="$VCT_SECRETS_DIR/projects/$project/$key"
+    local s_path="$VCT_SECRETS_DIR/shared/$key"
+    if [ -f "$p_path" ]; then
+        printf '%s' "$p_path"
+        return 0
+    fi
+    if [ -f "$s_path" ]; then
+        printf '%s' "$s_path"
+        return 0
+    fi
+    return 2
+}
+
+# ---------- Subcommands ----------
+
+cmd_help() {
+    cat <<'EOF'
+vct — VCT Secrets Primitive (Phase 1, Bash)
+
+USAGE:
+  vct <subcommand> [args...]
+  vct secret <subcommand> [args...]    # 'secret' is optional for compatibility
+
+SUBCOMMANDS:
+  list [--project NAME]
+        List secret keys (names only) for a project, or shared if no --project.
+
+  set --project NAME --key KEY [--confirm-tty]
+        Store a secret. Value read from stdin ONLY (never from argv).
+        Refuses interactive TTY stdin unless --confirm-tty given.
+
+  get --project NAME --key KEY [--trusted]
+        Print a secret value to stdout. Requires --trusted when stdout is a TTY
+        (tripwire against shell-history capture). Prefer 'exec' instead.
+
+  exec --project NAME [--secret KEY[=VAR_NAME]]... [--preserve-env] -- CMD [ARGS...]
+        Inject named secrets into child env, then exec CMD. Secrets never
+        touch the parent shell. Missing secret → exit 2, CMD not run.
+        Without --preserve-env, only a safe minimal env is carried through.
+
+  revoke --project NAME --key KEY [--yes]
+        Delete a project's secret file. Prompts unless --yes.
+
+  copy --from-project SRC --to-project DST --key KEY [--yes]
+        Explicit cross-project copy. Prompts unless --yes.
+
+  migrate-from-env FILE --project NAME [--dry-run]
+        Parse a dotenv file (KEY=VALUE lines, # comments, quoted values)
+        and store each key into the project. Renames source → FILE.migrated
+        on success (not in --dry-run).
+
+  doctor
+        Audit dir/file permissions. Fixes chmod to 700/600 where needed.
+        Never reads secret contents.
+
+  detect-project
+        Walks up from PWD to find a .vct-project file; echoes its content.
+        Exits 1 if not found.
+
+  help | --help | -h
+        Show this message.
+
+  version | --version
+        Show version.
+
+ENVIRONMENT:
+  VCT_SECRETS_DIR    Override secret store root (default: ~/.vct-secrets)
+
+See: ~/Desktop/PROGETTI/Claude/docs/VCT_SECRETS_PRIMITIVE.md
+EOF
+}
+
+cmd_version() {
+    printf 'vct %s\n' "$VERSION"
+}
+
+cmd_list() {
+    local project=""
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --project) project=$2; shift 2 ;;
+            -h|--help) cmd_help; return 0 ;;
+            *) die "list: unknown arg: $1" ;;
+        esac
+    done
+    ensure_root
+    local dir
+    if [ -n "$project" ]; then
+        validate_name "project" "$project"
+        dir="$VCT_SECRETS_DIR/projects/$project"
+    else
+        dir="$VCT_SECRETS_DIR/shared"
+    fi
+    if [ ! -d "$dir" ]; then
+        return 0
+    fi
+    # Print basenames of regular files, sorted. No values.
+    local f
+    for f in "$dir"/*; do
+        [ -f "$f" ] || continue
+        basename "$f"
+    done | sort
+}
+
+cmd_set() {
+    local project="" key="" confirm_tty=0
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --project) project=$2; shift 2 ;;
+            --key) key=$2; shift 2 ;;
+            --confirm-tty) confirm_tty=1; shift ;;
+            --value|--value=*)
+                die "set: --value is forbidden (secrets must come from stdin)"
+                ;;
+            -h|--help) cmd_help; return 0 ;;
+            *) die "set: unknown arg: $1" ;;
+        esac
+    done
+    [ -n "$project" ] || die "set: --project required"
+    [ -n "$key" ]     || die "set: --key required"
+    validate_name "project" "$project"
+    validate_name "key" "$key"
+    ensure_root
+
+    if [ -t 0 ] && [ $confirm_tty -eq 0 ]; then
+        die "set: stdin is a TTY — pipe the value in, e.g. 'printf %s \"\$TOKEN\" | vct set ...' (or pass --confirm-tty to type it interactively)"
+    fi
+
+    local proj_dir="$VCT_SECRETS_DIR/projects/$project"
+    mkdir -p "$proj_dir"
+    chmod 700 "$proj_dir"
+    local target="$proj_dir/$key"
+
+    # Read stdin into temp file (never echo), rename atomically.
+    local tmp
+    tmp=$(mktemp "$proj_dir/.$key.tmp.XXXXXX") || die "set: mktemp failed"
+    chmod 600 "$tmp"
+    # shellcheck disable=SC2094
+    cat > "$tmp" || { rm -f "$tmp"; die "set: stdin read failed"; }
+    mv "$tmp" "$target"
+    chmod 600 "$target"
+    audit "set" "$project" "$(json_array_from_list "$key")" ""
+    printf 'vct: stored %s/%s\n' "$project" "$key" >&2
+}
+
+cmd_get() {
+    local project="" key="" trusted=0
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --project) project=$2; shift 2 ;;
+            --key) key=$2; shift 2 ;;
+            --trusted) trusted=1; shift ;;
+            -h|--help) cmd_help; return 0 ;;
+            *) die "get: unknown arg: $1" ;;
+        esac
+    done
+    [ -n "$project" ] || die "get: --project required"
+    [ -n "$key" ]     || die "get: --key required"
+    validate_name "project" "$project"
+    validate_name "key" "$key"
+    ensure_root
+
+    if [ -t 1 ] && [ $trusted -eq 0 ]; then
+        die "get: stdout is a TTY — refusing to print secret. Pass --trusted if you really mean it."
+    fi
+
+    local path
+    if ! path=$(resolve_secret "$project" "$key"); then
+        die_code 2 "get: secret not found — project=$project key=$key. Fix: vct set --project $project --key $key"
+    fi
+    audit "get" "$project" "$(json_array_from_list "$key")" ""
+    cat "$path"
+}
+
+cmd_revoke() {
+    local project="" key="" yes=0
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --project) project=$2; shift 2 ;;
+            --key) key=$2; shift 2 ;;
+            --yes|-y) yes=1; shift ;;
+            -h|--help) cmd_help; return 0 ;;
+            *) die "revoke: unknown arg: $1" ;;
+        esac
+    done
+    [ -n "$project" ] || die "revoke: --project required"
+    [ -n "$key" ]     || die "revoke: --key required"
+    validate_name "project" "$project"
+    validate_name "key" "$key"
+    ensure_root
+
+    local target="$VCT_SECRETS_DIR/projects/$project/$key"
+    if [ ! -f "$target" ]; then
+        die_code 2 "revoke: not found — $project/$key"
+    fi
+    if [ $yes -eq 0 ]; then
+        printf 'Revoke %s/%s? [y/N] ' "$project" "$key" >&2
+        local ans=""
+        read -r ans </dev/tty || die "revoke: cannot read confirmation"
+        case "$ans" in
+            y|Y|yes|YES) ;;
+            *) printf 'vct: revoke cancelled\n' >&2; return 1 ;;
+        esac
+    fi
+    rm -f -- "$target"
+    audit "revoke" "$project" "$(json_array_from_list "$key")" ""
+    printf 'vct: revoked %s/%s\n' "$project" "$key" >&2
+}
+
+cmd_copy() {
+    local src="" dst="" key="" yes=0
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --from-project) src=$2; shift 2 ;;
+            --to-project)   dst=$2; shift 2 ;;
+            --key) key=$2; shift 2 ;;
+            --yes|-y) yes=1; shift ;;
+            -h|--help) cmd_help; return 0 ;;
+            *) die "copy: unknown arg: $1" ;;
+        esac
+    done
+    [ -n "$src" ] || die "copy: --from-project required"
+    [ -n "$dst" ] || die "copy: --to-project required"
+    [ -n "$key" ] || die "copy: --key required"
+    validate_name "project" "$src"
+    validate_name "project" "$dst"
+    validate_name "key" "$key"
+    ensure_root
+
+    local src_path="$VCT_SECRETS_DIR/projects/$src/$key"
+    [ -f "$src_path" ] || die_code 2 "copy: source not found — $src/$key"
+
+    local dst_dir="$VCT_SECRETS_DIR/projects/$dst"
+    local dst_path="$dst_dir/$key"
+
+    if [ $yes -eq 0 ]; then
+        printf 'Copy secret %s from project=%s to project=%s? [y/N] ' "$key" "$src" "$dst" >&2
+        local ans=""
+        read -r ans </dev/tty || die "copy: cannot read confirmation"
+        case "$ans" in
+            y|Y|yes|YES) ;;
+            *) printf 'vct: copy cancelled\n' >&2; return 1 ;;
+        esac
+    fi
+
+    mkdir -p "$dst_dir"
+    chmod 700 "$dst_dir"
+    cp -- "$src_path" "$dst_path"
+    chmod 600 "$dst_path"
+    audit "copy" "$dst" "$(json_array_from_list "$key")" "from=$src"
+    printf 'vct: copied %s/%s → %s/%s\n' "$src" "$key" "$dst" "$key" >&2
+}
+
+cmd_exec() {
+    local project="" preserve_env=0
+    # Parallel arrays: source keys, and env var names they map to (same index).
+    local -a src_keys=() var_names=()
+    local saw_dashdash=0
+
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --project) project=$2; shift 2 ;;
+            --secret)
+                local spec=$2; shift 2
+                local sk vn
+                if [[ "$spec" == *=* ]]; then
+                    sk=${spec%%=*}
+                    vn=${spec#*=}
+                else
+                    sk=$spec
+                    vn=$spec
+                fi
+                validate_name "key" "$sk"
+                # var_name: must be a valid env identifier
+                case "$vn" in
+                    ''|*[^A-Za-z0-9_]*) die "exec: invalid env var name: $vn" ;;
+                esac
+                case "$vn" in
+                    [0-9]*) die "exec: env var name cannot start with digit: $vn" ;;
+                esac
+                src_keys+=("$sk")
+                var_names+=("$vn")
+                ;;
+            --preserve-env) preserve_env=1; shift ;;
+            --) saw_dashdash=1; shift; break ;;
+            -h|--help) cmd_help; return 0 ;;
+            -*) die "exec: unknown flag: $1" ;;
+            *) die "exec: unexpected arg before --: $1" ;;
+        esac
+    done
+    [ -n "$project" ] || die "exec: --project required"
+    validate_name "project" "$project"
+    [ $saw_dashdash -eq 1 ] || die "exec: missing -- before command"
+    [ $# -gt 0 ] || die "exec: no command given after --"
+    ensure_root
+
+    # Resolve each secret up-front. Fail fast before executing CMD.
+    local -a resolved_paths=()
+    local i
+    for ((i = 0; i < ${#src_keys[@]}; i++)); do
+        local sk=${src_keys[$i]}
+        local path
+        if ! path=$(resolve_secret "$project" "$sk"); then
+            die_code 2 "exec: secret not found — project=$project key=$sk. Fix: vct set --project $project --key $sk"
+        fi
+        resolved_paths+=("$path")
+    done
+
+    # Audit BEFORE exec (exec replaces process; no return).
+    local keys_json
+    keys_json=$(json_array_from_list "${var_names[@]:-}")
+    audit "exec" "$project" "$keys_json" "$*"
+
+    # Build env command. Read each secret into a variable, pass with env -S style.
+    # We use `env -i` plus preserved-env assignments and the secret assignments.
+    local -a env_args=()
+    if [ $preserve_env -eq 0 ]; then
+        env_args+=(-i)
+        local ev
+        for ev in "${PRESERVE_ENV_VARS[@]}"; do
+            if [ -n "${!ev-}" ]; then
+                env_args+=("$ev=${!ev}")
+            fi
+        done
+    fi
+    # Append secret assignments
+    for ((i = 0; i < ${#src_keys[@]}; i++)); do
+        local vn=${var_names[$i]}
+        local pth=${resolved_paths[$i]}
+        local val
+        # read binary-safe: cat, strip trailing newline only if present
+        val=$(cat -- "$pth"; printf x)
+        val=${val%x}
+        # Strip exactly one trailing newline if present (common for files created by echo)
+        val=${val%$'\n'}
+        env_args+=("$vn=$val")
+    done
+
+    exec env "${env_args[@]}" "$@"
+}
+
+cmd_migrate_from_env() {
+    local file="" project="" dry_run=0
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --project) project=$2; shift 2 ;;
+            --dry-run) dry_run=1; shift ;;
+            -h|--help) cmd_help; return 0 ;;
+            -*) die "migrate-from-env: unknown flag: $1" ;;
+            *)
+                if [ -z "$file" ]; then file=$1; shift
+                else die "migrate-from-env: unexpected arg: $1"
+                fi
+                ;;
+        esac
+    done
+    [ -n "$file" ]    || die "migrate-from-env: FILE required"
+    [ -n "$project" ] || die "migrate-from-env: --project required"
+    validate_name "project" "$project"
+    [ -f "$file" ]    || die "migrate-from-env: no such file: $file"
+    ensure_root
+
+    local proj_dir="$VCT_SECRETS_DIR/projects/$project"
+    mkdir -p "$proj_dir"
+    chmod 700 "$proj_dir"
+
+    local imported=0 skipped=0
+    local line key value trimmed
+    while IFS= read -r line || [ -n "$line" ]; do
+        # Strip leading whitespace
+        trimmed=${line#"${line%%[![:space:]]*}"}
+        # Skip blanks and comments
+        [ -z "$trimmed" ] && continue
+        case "$trimmed" in \#*) continue ;; esac
+        # Strip optional 'export '
+        case "$trimmed" in
+            export\ *) trimmed=${trimmed#export } ;;
+        esac
+        # Must contain '='
+        case "$trimmed" in
+            *=*) ;;
+            *) skipped=$((skipped+1)); continue ;;
+        esac
+        key=${trimmed%%=*}
+        value=${trimmed#*=}
+        # Strip surrounding quotes on value (single or double)
+        case "$value" in
+            \"*\") value=${value#\"}; value=${value%\"} ;;
+            \'*\') value=${value#\'}; value=${value%\'} ;;
+        esac
+        # Strip trailing whitespace on key
+        key=${key%"${key##*[![:space:]]}"}
+        # Validate key
+        if [ -z "$key" ] || printf '%s' "$key" | LC_ALL=C grep -q '[^A-Za-z0-9_.-]'; then
+            warn "skipping invalid key: $key"
+            skipped=$((skipped+1))
+            continue
+        fi
+        if [ $dry_run -eq 1 ]; then
+            printf 'would import: %s/%s (%d bytes)\n' "$project" "$key" "${#value}"
+        else
+            local target="$proj_dir/$key"
+            local tmp
+            tmp=$(mktemp "$proj_dir/.$key.tmp.XXXXXX") || die "migrate: mktemp failed"
+            chmod 600 "$tmp"
+            printf '%s' "$value" > "$tmp"
+            mv "$tmp" "$target"
+            chmod 600 "$target"
+            audit "set" "$project" "$(json_array_from_list "$key")" "source=migrate-from-env"
+            printf 'imported: %s/%s\n' "$project" "$key"
+        fi
+        imported=$((imported+1))
+    done < "$file"
+
+    if [ $dry_run -eq 1 ]; then
+        printf 'vct: DRY-RUN — %d keys would be imported, %d skipped. Source file unchanged.\n' "$imported" "$skipped" >&2
+    else
+        local migrated="${file}.migrated"
+        mv -- "$file" "$migrated"
+        printf 'vct: imported %d keys, skipped %d. Source renamed → %s\n' "$imported" "$skipped" "$migrated" >&2
+    fi
+}
+
+cmd_doctor() {
+    ensure_root
+    local issues=0 fixed=0
+    # Check root dir
+    local mode
+    mode=$(stat -c '%a' "$VCT_SECRETS_DIR" 2>/dev/null || echo "")
+    if [ "$mode" != "700" ]; then
+        warn "root $VCT_SECRETS_DIR has mode $mode; fixing → 700"
+        chmod 700 "$VCT_SECRETS_DIR"
+        fixed=$((fixed+1))
+    fi
+    # Check subdirs
+    local d
+    while IFS= read -r d; do
+        [ -z "$d" ] && continue
+        mode=$(stat -c '%a' "$d" 2>/dev/null || echo "")
+        if [ "$mode" != "700" ]; then
+            warn "dir $d has mode $mode; fixing → 700"
+            chmod 700 "$d"
+            fixed=$((fixed+1))
+        fi
+    done < <(find "$VCT_SECRETS_DIR" -type d)
+    # Check files (never read contents)
+    local f
+    while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        # Skip CLI itself (needs +x) and tests dir scripts
+        case "$f" in
+            */vct|*/tests/*|*/migrate-shared.sh|*/search-mcp-wrapper.sh|*/git-credential-vct)
+                continue ;;
+        esac
+        mode=$(stat -c '%a' "$f" 2>/dev/null || echo "")
+        if [ "$mode" != "600" ]; then
+            warn "file $f has mode $mode; fixing → 600"
+            chmod 600 "$f"
+            fixed=$((fixed+1))
+        fi
+    done < <(find "$VCT_SECRETS_DIR" -type f)
+
+    printf 'vct doctor: %d issues fixed, %d remaining.\n' "$fixed" "$issues" >&2
+    return 0
+}
+
+cmd_detect_project() {
+    local cur
+    cur=$(pwd -P)
+    while [ "$cur" != "/" ] && [ -n "$cur" ]; do
+        if [ -f "$cur/.vct-project" ]; then
+            local name
+            name=$(head -n1 "$cur/.vct-project" | tr -d '[:space:]')
+            if [ -n "$name" ]; then
+                printf '%s\n' "$name"
+                return 0
+            fi
+        fi
+        cur=$(dirname "$cur")
+    done
+    die_code 1 "detect-project: no .vct-project file found walking up from $(pwd -P)"
+}
+
+# ---------- Dispatcher ----------
+main() {
+    if [ $# -eq 0 ]; then
+        cmd_help
+        exit 0
+    fi
+    # Accept both `vct <cmd>` and `vct secret <cmd>`
+    if [ "$1" = "secret" ]; then
+        shift
+        if [ $# -eq 0 ]; then cmd_help; exit 0; fi
+    fi
+    local sub=$1; shift
+    case "$sub" in
+        list)              cmd_list "$@" ;;
+        set)               cmd_set "$@" ;;
+        get)               cmd_get "$@" ;;
+        exec)              cmd_exec "$@" ;;
+        revoke)            cmd_revoke "$@" ;;
+        copy)              cmd_copy "$@" ;;
+        migrate-from-env)  cmd_migrate_from_env "$@" ;;
+        doctor)            cmd_doctor "$@" ;;
+        detect-project)    cmd_detect_project "$@" ;;
+        help|--help|-h)    cmd_help ;;
+        version|--version) cmd_version ;;
+        *) die "unknown subcommand: $sub (try 'vct help')" ;;
+    esac
+}
+
+main "$@"
