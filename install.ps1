@@ -23,17 +23,35 @@
     Skip pulling Ollama models (manual later)
 .PARAMETER Quiet
     Minimal output
+.PARAMETER LowResource
+    Lightest mode: Jina V2 (768d) via Ollama. For low-RAM/low-VRAM machines.
+.PARAMETER WithJoern
+    Force-enable Joern integration for richer code-graph metrics (CFG/PDG).
+.PARAMETER NoJoern
+    Skip Joern detection entirely.
+.PARAMETER NoAgents
+    Skip installing Claude agents.
+.PARAMETER WithMaoAgents
+    Install MAO-tier specialist agents.
+.PARAMETER NoSkills
+    Skip installing Claude skills.
 #>
 param(
     [switch]$NoContainers,
     [switch]$Gpu,
     [switch]$CpuOnly,
+    [switch]$LowResource,
     [string]$OpenaiKey = "",
     [string]$Container = "",
     [switch]$Dev,
     [switch]$Update,
     [switch]$SkipModels,
-    [switch]$Quiet
+    [switch]$Quiet,
+    [switch]$WithJoern,
+    [switch]$NoJoern,
+    [switch]$NoAgents,
+    [switch]$WithMaoAgents,
+    [switch]$NoSkills
 )
 
 $ErrorActionPreference = "Stop"
@@ -95,15 +113,21 @@ Set-Location (Split-Path -Parent $MyInvocation.MyCommand.Path)
 
 # Build arguments for install.py
 $installArgs = @()
-if ($NoContainers) { $installArgs += "--no-containers" }
-if ($Gpu)          { $installArgs += "--gpu" }
-if ($CpuOnly)      { $installArgs += "--cpu-only" }
-if ($OpenaiKey)    { $installArgs += "--openai-key"; $installArgs += $OpenaiKey }
-if ($Container)    { $installArgs += "--container"; $installArgs += $Container }
-if ($Dev)          { $installArgs += "--dev" }
-if ($Update)       { $installArgs += "--update" }
-if ($SkipModels)   { $installArgs += "--skip-models" }
-if ($Quiet)        { $installArgs += "--quiet" }
+if ($NoContainers)  { $installArgs += "--no-containers" }
+if ($Gpu)           { $installArgs += "--gpu" }
+if ($CpuOnly)       { $installArgs += "--cpu-only" }
+if ($LowResource)   { $installArgs += "--low-resource" }
+if ($OpenaiKey)     { $installArgs += "--openai-key"; $installArgs += $OpenaiKey }
+if ($Container)     { $installArgs += "--container"; $installArgs += $Container }
+if ($Dev)           { $installArgs += "--dev" }
+if ($Update)        { $installArgs += "--update" }
+if ($SkipModels)    { $installArgs += "--skip-models" }
+if ($Quiet)         { $installArgs += "--quiet" }
+if ($WithJoern)     { $installArgs += "--with-joern" }
+if ($NoJoern)       { $installArgs += "--no-joern" }
+if ($NoAgents)      { $installArgs += "--no-agents" }
+if ($WithMaoAgents) { $installArgs += "--with-mao-agents" }
+if ($NoSkills)      { $installArgs += "--no-skills" }
 
 if ($pythonArgs.Count -gt 0) {
     & $pythonCmd @pythonArgs install.py @installArgs

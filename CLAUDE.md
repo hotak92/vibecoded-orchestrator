@@ -257,7 +257,7 @@ status: active   # active, archived, deprecated, idea
 - Cost: free, runs locally
 
 ### Code Embedding Service (optional, GPU)
-- Default URL: `http://localhost:11438`
+- Default URL: `http://localhost:11440`
 - Model: CodeSage-Large-v2 (1.3B params, 2048-dim, Apache 2.0)
 - Env: `CODE_EMBED_BACKEND` (`gpu` | `ollama`), `CODE_EMBED_MODEL`, `CODE_EMBED_DEVICE`, `CODE_EMBED_PORT`
 - Set `CODE_EMBED_BACKEND=ollama` to use Ollama embeddings instead
