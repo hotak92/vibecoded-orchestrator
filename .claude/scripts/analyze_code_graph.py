@@ -3372,10 +3372,20 @@ def main():
     parser.add_argument('--force-recreate', action='store_true',
                        help='Delete and recreate collections (WARNING: deletes all data)')
     parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
-    parser.add_argument('--cfg', action='store_true',
-                       help='Extract CFG summaries via Joern (requires joern in PATH)')
-    parser.add_argument('--pdg', action='store_true',
-                       help='Extract PDG data-flow variables via Joern (requires joern in PATH)')
+    # Joern CFG/PDG: auto-on when joern is installed (or VCT_JOERN_AVAILABLE=1).
+    # Opt out per-run with --no-cfg/--no-pdg, or set VCT_JOERN_AVAILABLE=0.
+    _joern_default = (
+        os.environ.get("VCT_JOERN_AVAILABLE", "").strip() == "1"
+        or shutil.which("joern") is not None
+    )
+    parser.add_argument('--cfg', dest='cfg', action='store_true', default=_joern_default,
+                       help='Extract CFG summaries via Joern (default: on if joern is in PATH)')
+    parser.add_argument('--no-cfg', dest='cfg', action='store_false',
+                       help='Skip CFG extraction (faster; useful in CI)')
+    parser.add_argument('--pdg', dest='pdg', action='store_true', default=_joern_default,
+                       help='Extract PDG data-flow variables via Joern (default: on if joern is in PATH)')
+    parser.add_argument('--no-pdg', dest='pdg', action='store_false',
+                       help='Skip PDG extraction')
     parser.add_argument('--named-vectors', action='store_true',
                        default=True,
                        help='Create collections with named vector support (default: True)')
