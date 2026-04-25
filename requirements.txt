@@ -35,7 +35,7 @@ asyncpg>=0.29
 
 # ─── Ollama client ───
 # Ollama Python client (MIT) — for local LLM inference MCP
-ollama>=0.3
+ollama>=0.6.1
 
 # ─── Code embedding service (runs in container, but needed for CPU fallback) ───
 # sentence-transformers (Apache 2.0)
