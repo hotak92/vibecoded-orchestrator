@@ -182,4 +182,61 @@ impl Db {
             .map_err(|e| format!("audit: {}", e))?;
         Ok(())
     }
+
+    /// Read audit entries, newest first. Optionally filter by project_id.
+    /// `limit` is bounded to 1000 to keep payloads small.
+    pub fn audit_list(
+        &self,
+        project_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<crate::commands::audit::AuditEvent>, String> {
+        let guard = self.lock();
+        let limit = std::cmp::min(limit, 1000);
+
+        let (sql, has_filter) = if project_id.is_some() {
+            (
+                "SELECT id, operation, project_id, module_id, detail, created_at
+                 FROM audit_log
+                 WHERE project_id = ?1
+                 ORDER BY created_at DESC
+                 LIMIT ?2",
+                true,
+            )
+        } else {
+            (
+                "SELECT id, operation, project_id, module_id, detail, created_at
+                 FROM audit_log
+                 ORDER BY created_at DESC
+                 LIMIT ?1",
+                false,
+            )
+        };
+
+        let mut stmt = guard.prepare(sql).map_err(|e| format!("audit_list prepare: {}", e))?;
+
+        let map_row = |row: &rusqlite::Row| -> rusqlite::Result<crate::commands::audit::AuditEvent> {
+            Ok(crate::commands::audit::AuditEvent {
+                id: row.get(0)?,
+                operation: row.get(1)?,
+                project_id: row.get(2)?,
+                module_id: row.get(3)?,
+                detail: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        };
+
+        let rows: Vec<_> = if has_filter {
+            stmt.query_map(params![project_id.unwrap(), limit], map_row)
+                .map_err(|e| format!("audit_list query: {}", e))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("audit_list collect: {}", e))?
+        } else {
+            stmt.query_map(params![limit], map_row)
+                .map_err(|e| format!("audit_list query: {}", e))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("audit_list collect: {}", e))?
+        };
+
+        Ok(rows)
+    }
 }
