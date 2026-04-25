@@ -1,7 +1,7 @@
 # Dependency Licensing Audit
 
 **Generated**: 2026-04-23
-**Target license for this project**: AGPL-3.0 (core), FSL-1.1-Apache-2.0 (paid modules)
+**Target license for this project**: AGPL-3.0
 **Auditor**: `pip-licenses` on full transitive closure of `requirements.txt`
 
 ## Summary
