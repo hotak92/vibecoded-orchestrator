@@ -28,11 +28,12 @@
     loading = true;
     try {
       snapshot = await invoke<ProjectStateSnapshot>('get_project_state_snapshot', { projectId });
-      if (snapshot.kg_binding) {
-        kgRole = (snapshot.kg_binding.role as any) ?? 'primary';
-        kgCollection = snapshot.kg_binding.collection_name;
-        kgEmbedding = snapshot.kg_binding.embedding_model ?? '';
-        kgWeaviateUrl = snapshot.kg_binding.weaviate_url ?? '';
+      const primary = snapshot.kg_bindings.find((b) => b.role === kgRole) ?? snapshot.kg_bindings[0];
+      if (primary) {
+        kgRole = (primary.role as any) ?? 'primary';
+        kgCollection = primary.collection_name;
+        kgEmbedding = primary.embedding_model ?? '';
+        kgWeaviateUrl = primary.weaviate_url ?? '';
       }
       if (snapshot.codegraph_binding) {
         cgPrefix = snapshot.codegraph_binding.collection_prefix;
