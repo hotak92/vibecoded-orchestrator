@@ -14,7 +14,7 @@ Environment variables:
                           ollama default: "unclemusclez/jina-embeddings-v2-base-code:latest"
   CODE_EMBED_DEVICE       "cuda" | "cpu" | "auto"  (default: "auto", gpu backend only)
   CODE_EMBED_DTYPE        "float32" | "bfloat16" | "float16"  (default: "bfloat16", gpu backend only)
-  CODE_EMBED_PORT         Server port (default: 11438)
+  CODE_EMBED_PORT         Server port (default: 11440)
   CODE_EMBED_BATCH_SIZE   Max batch size (default: 32)
   CODE_EMBED_MAX_CONCURRENT  Max queued requests before 503 (default: 4)
   OLLAMA_URL              Ollama API URL (default: http://localhost:11435)

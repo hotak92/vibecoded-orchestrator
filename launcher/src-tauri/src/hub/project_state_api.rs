@@ -1,0 +1,465 @@
+//! HTTP routes for per-project orchestrator state.
+//!
+//! Mirrors the Tauri commands in `crate::commands::project_state_cmd` so
+//! headless callers (install.py, project bootstrap scripts, the
+//! `vibecoded` CLI) can register state without going through the
+//! desktop UI.
+//!
+//! Bound to 127.0.0.1 only (see `hub::server::start_hub_server`). Auth
+//! is deferred — same security posture as `modules_api.rs`.
+
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{delete, get, patch, post},
+    Json, Router,
+};
+use serde::Deserialize;
+use serde_json::Value as JsonValue;
+
+use super::modules_api::LauncherDbHandle;
+
+pub fn router() -> Router<LauncherDbHandle> {
+    Router::new()
+        .route("/projects/{project_id}/state", get(snapshot))
+        .route("/projects/{project_id}/agents", get(list_agents).post(register_agent))
+        .route(
+            "/projects/{project_id}/agents/{agent_name}",
+            patch(patch_agent).delete(delete_agent),
+        )
+        .route("/projects/{project_id}/skills", get(list_skills).post(register_skill))
+        .route(
+            "/projects/{project_id}/skills/{skill_name}",
+            patch(patch_skill).delete(delete_skill),
+        )
+        .route("/projects/{project_id}/hooks", get(list_hooks).post(register_hook))
+        .route("/projects/{project_id}/hooks/{hook_id}", patch(patch_hook).delete(delete_hook))
+        .route(
+            "/projects/{project_id}/permissions",
+            get(list_permissions).post(add_permission),
+        )
+        .route("/projects/{project_id}/permissions/{perm_id}", delete(delete_permission))
+        .route("/projects/{project_id}/secrets", get(list_secrets).post(set_secret))
+        .route("/projects/{project_id}/secrets/{secret_key}", delete(delete_secret))
+        .route("/projects/{project_id}/kg-binding", post(set_kg_binding))
+        .route("/projects/{project_id}/codegraph-binding", post(set_codegraph_binding))
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────
+
+fn err500(e: String) -> axum::response::Response {
+    (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))).into_response()
+}
+fn err400(e: String) -> axum::response::Response {
+    (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e }))).into_response()
+}
+
+// ─── Snapshot ────────────────────────────────────────────────────────────
+
+async fn snapshot(
+    State(h): State<LauncherDbHandle>,
+    Path(project_id): Path<String>,
+) -> impl IntoResponse {
+    match h.0.get_project_state_snapshot(&project_id) {
+        Ok(s) => Json(s).into_response(),
+        Err(e) => err500(e),
+    }
+}
+
+// ─── Agents ──────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct RegisterAgentBody {
+    agent_name: String,
+    source: String,
+    source_module: Option<String>,
+    model: Option<String>,
+    file_path: Option<String>,
+    #[serde(default)]
+    config: JsonValue,
+}
+
+async fn list_agents(
+    State(h): State<LauncherDbHandle>,
+    Path(project_id): Path<String>,
+) -> impl IntoResponse {
+    match h.0.list_project_agents(&project_id) {
+        Ok(rows) => Json(rows).into_response(),
+        Err(e) => err500(e),
+    }
+}
+
+async fn register_agent(
+    State(h): State<LauncherDbHandle>,
+    Path(project_id): Path<String>,
+    Json(body): Json<RegisterAgentBody>,
+) -> impl IntoResponse {
+    match h.0.register_project_agent(
+        &project_id,
+        &body.agent_name,
+        &body.source,
+        body.source_module.as_deref(),
+        body.model.as_deref(),
+        body.file_path.as_deref(),
+        &body.config,
+    ) {
+        Ok(row) => Json(row).into_response(),
+        Err(e) => err400(e),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PatchAgentBody {
+    enabled: Option<bool>,
+}
+
+async fn patch_agent(
+    State(h): State<LauncherDbHandle>,
+    Path((project_id, agent_name)): Path<(String, String)>,
+    Json(body): Json<PatchAgentBody>,
+) -> impl IntoResponse {
+    if let Some(en) = body.enabled {
+        if let Err(e) = h.0.set_project_agent_enabled(&project_id, &agent_name, en) {
+            return err400(e);
+        }
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn delete_agent(
+    State(h): State<LauncherDbHandle>,
+    Path((project_id, agent_name)): Path<(String, String)>,
+) -> impl IntoResponse {
+    match h.0.unregister_project_agent(&project_id, &agent_name) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => err500(e),
+    }
+}
+
+// ─── Skills ──────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct RegisterSkillBody {
+    skill_name: String,
+    source: String,
+    source_module: Option<String>,
+    model: Option<String>,
+    file_path: Option<String>,
+    #[serde(default)]
+    config: JsonValue,
+}
+
+async fn list_skills(
+    State(h): State<LauncherDbHandle>,
+    Path(project_id): Path<String>,
+) -> impl IntoResponse {
+    match h.0.list_project_skills(&project_id) {
+        Ok(rows) => Json(rows).into_response(),
+        Err(e) => err500(e),
+    }
+}
+
+async fn register_skill(
+    State(h): State<LauncherDbHandle>,
+    Path(project_id): Path<String>,
+    Json(body): Json<RegisterSkillBody>,
+) -> impl IntoResponse {
+    match h.0.register_project_skill(
+        &project_id,
+        &body.skill_name,
+        &body.source,
+        body.source_module.as_deref(),
+        body.model.as_deref(),
+        body.file_path.as_deref(),
+        &body.config,
+    ) {
+        Ok(row) => Json(row).into_response(),
+        Err(e) => err400(e),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PatchSkillBody {
+    enabled: Option<bool>,
+}
+
+async fn patch_skill(
+    State(h): State<LauncherDbHandle>,
+    Path((project_id, skill_name)): Path<(String, String)>,
+    Json(body): Json<PatchSkillBody>,
+) -> impl IntoResponse {
+    if let Some(en) = body.enabled {
+        if let Err(e) = h.0.set_project_skill_enabled(&project_id, &skill_name, en) {
+            return err400(e);
+        }
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn delete_skill(
+    State(h): State<LauncherDbHandle>,
+    Path((project_id, skill_name)): Path<(String, String)>,
+) -> impl IntoResponse {
+    match h.0.unregister_project_skill(&project_id, &skill_name) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => err500(e),
+    }
+}
+
+// ─── Hooks ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct RegisterHookBody {
+    event: String,
+    #[serde(default)]
+    matcher: String,
+    command: String,
+    #[serde(default = "default_source_project")]
+    source: String,
+    source_module: Option<String>,
+    timeout_ms: Option<i64>,
+    #[serde(default)]
+    config: JsonValue,
+}
+fn default_source_project() -> String {
+    "project".into()
+}
+
+async fn list_hooks(
+    State(h): State<LauncherDbHandle>,
+    Path(project_id): Path<String>,
+) -> impl IntoResponse {
+    match h.0.list_project_hooks(&project_id) {
+        Ok(rows) => Json(rows).into_response(),
+        Err(e) => err500(e),
+    }
+}
+
+async fn register_hook(
+    State(h): State<LauncherDbHandle>,
+    Path(project_id): Path<String>,
+    Json(body): Json<RegisterHookBody>,
+) -> impl IntoResponse {
+    match h.0.register_project_hook(
+        &project_id,
+        &body.event,
+        &body.matcher,
+        &body.command,
+        &body.source,
+        body.source_module.as_deref(),
+        body.timeout_ms,
+        &body.config,
+    ) {
+        Ok(row) => Json(row).into_response(),
+        Err(e) => err400(e),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PatchHookBody {
+    enabled: Option<bool>,
+}
+
+async fn patch_hook(
+    State(h): State<LauncherDbHandle>,
+    Path((_project_id, hook_id)): Path<(String, i64)>,
+    Json(body): Json<PatchHookBody>,
+) -> impl IntoResponse {
+    if let Some(en) = body.enabled {
+        if let Err(e) = h.0.set_project_hook_enabled(hook_id, en) {
+            return err400(e);
+        }
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn delete_hook(
+    State(h): State<LauncherDbHandle>,
+    Path((_project_id, hook_id)): Path<(String, i64)>,
+) -> impl IntoResponse {
+    match h.0.unregister_project_hook(hook_id) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => err500(e),
+    }
+}
+
+// ─── Permissions ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct AddPermissionBody {
+    subject: String,
+    kind: String,
+    value: String,
+    #[serde(default)]
+    config: JsonValue,
+}
+
+async fn list_permissions(
+    State(h): State<LauncherDbHandle>,
+    Path(project_id): Path<String>,
+) -> impl IntoResponse {
+    match h.0.list_project_permissions(&project_id) {
+        Ok(rows) => Json(rows).into_response(),
+        Err(e) => err500(e),
+    }
+}
+
+async fn add_permission(
+    State(h): State<LauncherDbHandle>,
+    Path(project_id): Path<String>,
+    Json(body): Json<AddPermissionBody>,
+) -> impl IntoResponse {
+    match h.0.add_project_permission(
+        &project_id,
+        &body.subject,
+        &body.kind,
+        &body.value,
+        &body.config,
+    ) {
+        Ok(row) => Json(row).into_response(),
+        Err(e) => err400(e),
+    }
+}
+
+async fn delete_permission(
+    State(h): State<LauncherDbHandle>,
+    Path((_project_id, perm_id)): Path<(String, i64)>,
+) -> impl IntoResponse {
+    match h.0.delete_project_permission(perm_id) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => err500(e),
+    }
+}
+
+// ─── Secret references ───────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct SetSecretBody {
+    secret_key: String,
+    resolution: String,
+    file_path: Option<String>,
+    env_name: Option<String>,
+    source_module: Option<String>,
+    #[serde(default)]
+    required_for: Vec<String>,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    is_set: bool,
+}
+
+async fn list_secrets(
+    State(h): State<LauncherDbHandle>,
+    Path(project_id): Path<String>,
+) -> impl IntoResponse {
+    match h.0.list_project_secret_refs(&project_id) {
+        Ok(rows) => Json(rows).into_response(),
+        Err(e) => err500(e),
+    }
+}
+
+async fn set_secret(
+    State(h): State<LauncherDbHandle>,
+    Path(project_id): Path<String>,
+    Json(body): Json<SetSecretBody>,
+) -> impl IntoResponse {
+    match h.0.set_project_secret_ref(
+        &project_id,
+        &body.secret_key,
+        &body.resolution,
+        body.file_path.as_deref(),
+        body.env_name.as_deref(),
+        body.source_module.as_deref(),
+        &body.required_for,
+        &body.description,
+        body.is_set,
+    ) {
+        Ok(row) => Json(row).into_response(),
+        Err(e) => err400(e),
+    }
+}
+
+async fn delete_secret(
+    State(h): State<LauncherDbHandle>,
+    Path((project_id, secret_key)): Path<(String, String)>,
+) -> impl IntoResponse {
+    match h.0.delete_project_secret_ref(&project_id, &secret_key) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => err500(e),
+    }
+}
+
+// ─── KG / Codegraph bindings ─────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct SetKgBindingBody {
+    #[serde(default = "default_kg_role")]
+    role: String,
+    collection_name: String,
+    embedding_model: Option<String>,
+    embedding_dim: Option<i64>,
+    kg_dir_path: Option<String>,
+    weaviate_url: Option<String>,
+    #[serde(default)]
+    config: JsonValue,
+}
+fn default_kg_role() -> String {
+    "primary".into()
+}
+
+async fn set_kg_binding(
+    State(h): State<LauncherDbHandle>,
+    Path(project_id): Path<String>,
+    Json(body): Json<SetKgBindingBody>,
+) -> impl IntoResponse {
+    match h.0.set_project_kg_binding(
+        &project_id,
+        &body.role,
+        &body.collection_name,
+        body.embedding_model.as_deref(),
+        body.embedding_dim,
+        body.kg_dir_path.as_deref(),
+        body.weaviate_url.as_deref(),
+        &body.config,
+    ) {
+        Ok(row) => Json(row).into_response(),
+        Err(e) => err400(e),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SetCodegraphBindingBody {
+    collection_prefix: String,
+    embedding_model: Option<String>,
+    embedding_dim: Option<i64>,
+    last_analyzed_commit: Option<String>,
+    last_analyzed_at: Option<i64>,
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default)]
+    config: JsonValue,
+}
+fn default_true() -> bool {
+    true
+}
+
+async fn set_codegraph_binding(
+    State(h): State<LauncherDbHandle>,
+    Path(project_id): Path<String>,
+    Json(body): Json<SetCodegraphBindingBody>,
+) -> impl IntoResponse {
+    match h.0.set_project_codegraph_binding(
+        &project_id,
+        &body.collection_prefix,
+        body.embedding_model.as_deref(),
+        body.embedding_dim,
+        body.last_analyzed_commit.as_deref(),
+        body.last_analyzed_at,
+        body.enabled,
+        &body.config,
+    ) {
+        Ok(row) => Json(row).into_response(),
+        Err(e) => err400(e),
+    }
+}

@@ -49,7 +49,13 @@ DEFAULT_WEAVIATE_GRPC_PORT = 50052
 DEFAULT_OLLAMA_PORT = 11435
 DEFAULT_CODE_EMBED_PORT = 11440
 
-# Embedding model configurations
+# Embedding model configurations.
+#
+# Per-model token/chunking limits live in
+#   claude_mcp_servers/weaviate_mcp/chunking.py:MODEL_TOKEN_LIMITS
+# and code-side in
+#   claude_mcp_servers/weaviate_mcp/code_truncation.py:CODE_MODEL_TOKEN_LIMITS
+# That is the single source of truth — do not re-declare chunk sizes here.
 EMBEDDING_CONFIGS = {
     "gpu": {
         "text_model": "qwen3-embedding:0.6b",
@@ -57,21 +63,21 @@ EMBEDDING_CONFIGS = {
         "code_backend": "gpu",
         "code_model": "codesage-large-v2",
         "code_dims": 2048,
-        "chunking_text_tokens": 512,
-        "chunking_code_tokens": 2048,
         "ollama_models": ["qwen3-embedding:0.6b", "qwen3:0.6b"],
-        "description": "GPU-accelerated (best quality)",
+        "description": "GPU-accelerated (qwen3 text + CodeSage code, best quality)",
     },
     "cpu": {
         "text_model": "qwen3-embedding:0.6b",
         "text_dims": 1024,
         "code_backend": "ollama",
-        "code_model": "qwen3-embedding:0.6b",
-        "code_dims": 1024,
-        "chunking_text_tokens": 512,
-        "chunking_code_tokens": 512,
-        "ollama_models": ["qwen3-embedding:0.6b", "qwen3:0.6b"],
-        "description": "CPU-only (slower, good quality)",
+        "code_model": "unclemusclez/jina-embeddings-v2-base-code:latest",
+        "code_dims": 768,
+        "ollama_models": [
+            "qwen3-embedding:0.6b",
+            "unclemusclez/jina-embeddings-v2-base-code:latest",
+            "qwen3:0.6b",
+        ],
+        "description": "CPU-only (qwen3 text + Jina V2 code, both via Ollama)",
     },
     "openai": {
         "text_model": "text-embedding-3-small",
@@ -79,10 +85,26 @@ EMBEDDING_CONFIGS = {
         "code_backend": "openai",
         "code_model": "text-embedding-3-small",
         "code_dims": 1536,
-        "chunking_text_tokens": 8191,
-        "chunking_code_tokens": 8191,
         "ollama_models": ["qwen3:0.6b"],  # still need inference model
         "description": "OpenAI API (fastest, requires API key)",
+    },
+    # Lightest mode for low-RAM / low-VRAM machines.
+    # Text uses Snowflake Arctic Embed v2 (smaller than qwen3, still 1024d, Apache 2.0).
+    # Code uses Jina V2 base-code (768d, specialized for code).
+    # Both run via Ollama (no GPU code-embed service).
+    # Picks: opt-in via --low-resource (not auto-selected — explicit choice).
+    "low_resource": {
+        "text_model": "snowflake-arctic-embed2:latest",
+        "text_dims": 1024,
+        "code_backend": "ollama",
+        "code_model": "unclemusclez/jina-embeddings-v2-base-code:latest",
+        "code_dims": 768,
+        "ollama_models": [
+            "snowflake-arctic-embed2:latest",
+            "unclemusclez/jina-embeddings-v2-base-code:latest",
+            "qwen3:0.6b",
+        ],
+        "description": "Low-resource (Arctic text + Jina V2 code, both via Ollama)",
     },
 }
 
@@ -112,6 +134,8 @@ def main() -> int:
                         help="Enable GPU support for Ollama + code embeddings")
     parser.add_argument("--cpu-only", action="store_true",
                         help="Force CPU-only mode (skip GPU detection)")
+    parser.add_argument("--low-resource", action="store_true",
+                        help="Lightest mode: Jina V2 (768d) via Ollama. For low-RAM/low-VRAM machines.")
     parser.add_argument("--openai-key", type=str, default="",
                         help="Use OpenAI embeddings (provide API key)")
     parser.add_argument("--container", type=str, choices=["docker", "podman"],
@@ -153,6 +177,9 @@ def main() -> int:
     # Step 2: Detect system
     sysinfo = _detect_system(args)
     _print_system_info(sysinfo)
+
+    # Step 2b: Optional companion tools (lean-ctx for context compression)
+    _detect_optional_companions()
 
     # Step 3: Determine embedding configuration
     embed_config = _choose_embedding_config(sysinfo, args)
@@ -333,19 +360,42 @@ def _print_system_info(sysinfo: SystemInfo) -> None:
     pass  # Already printed in _detect_system
 
 
+def _detect_optional_companions() -> None:
+    """Check for optional companion tools that the orchestrator can leverage when present.
+
+    Currently only lean-ctx (Rust binary, global per-user install at ~/.cargo/bin/).
+    Because it's a global tool, integration is OPT-IN: the user must install it
+    themselves; we only print a hint here. Future hooks/MCP wrappers should check
+    for lean-ctx on PATH at runtime and silently no-op if missing.
+    """
+    print("\n[2b/10] Optional companions ...")
+
+    if shutil.which("lean-ctx"):
+        print("  lean-ctx: detected (per-user global; integrations may use it)")
+    else:
+        print("  lean-ctx: not installed (optional, recommended for token savings)")
+        print("            install:  cargo install lean-ctx")
+        print("            then re-run this installer")
+
+
 # ---------------------------------------------------------------------------
 # Step 3: Embedding configuration
 # ---------------------------------------------------------------------------
 
 def _choose_embedding_config(sysinfo: SystemInfo, args: argparse.Namespace) -> dict:
+    # Explicit opt-ins win over auto-detection.
     if args.openai_key:
         config = dict(EMBEDDING_CONFIGS["openai"])
         config["openai_key"] = args.openai_key
         return config
-    elif sysinfo.has_gpu:
-        return dict(EMBEDDING_CONFIGS["gpu"])
-    else:
+    if args.low_resource:
+        return dict(EMBEDDING_CONFIGS["low_resource"])
+    if args.cpu_only:
         return dict(EMBEDDING_CONFIGS["cpu"])
+    # Auto-detection: GPU → gpu config, otherwise cpu (qwen3 for both).
+    if sysinfo.has_gpu:
+        return dict(EMBEDDING_CONFIGS["gpu"])
+    return dict(EMBEDDING_CONFIGS["cpu"])
 
 
 # ---------------------------------------------------------------------------
@@ -586,10 +636,6 @@ def _write_env_config(embed_config: dict, args: argparse.Namespace) -> None:
         f"CODE_EMBED_DIMS={embed_config['code_dims']}",
         f"CODE_EMBED_SERVICE_URL=http://localhost:{code_embed_port}",
         f"ACTIVE_EMBEDDING=qwen3",
-        "",
-        "# Chunking",
-        f"CHUNKING_TEXT_TOKENS={embed_config['chunking_text_tokens']}",
-        f"CHUNKING_CODE_TOKENS={embed_config['chunking_code_tokens']}",
         "",
         "# Knowledge Graph",
         "KG_COLLECTION=KnowledgeGraph",
