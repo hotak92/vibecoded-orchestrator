@@ -563,3 +563,178 @@ pub async fn kg_promote_to_shared(req: PromoteReq, db: State<'_, Db>) -> Result<
     )?;
     Ok(())
 }
+
+// ─── High-level access mode (collection) ────────────────────────────────
+//
+// The UI presents three modes: shared / projects / private. The DB stores
+// per-(project, collection) access levels (read|write|none). This wrapper
+// maps the UI mode onto rows for a given owner project + selected projects:
+//
+//   shared:   write row for owner; read row for every other project that exists
+//   projects: write row for owner; read row for each id in `project_ids`;
+//             none for the rest
+//   private:  write row for owner only; none for everyone else
+
+#[derive(Debug, Deserialize)]
+pub struct CollectionAccessModeReq {
+    pub owner_project_id: String,
+    pub collection: String,
+    pub mode: String, // shared | projects | private
+    #[serde(default)]
+    pub project_ids: Vec<String>,
+}
+
+#[command]
+pub async fn kg_set_collection_access_mode(
+    req: CollectionAccessModeReq,
+    db: State<'_, Db>,
+) -> Result<(), String> {
+    if !matches!(req.mode.as_str(), "shared" | "projects" | "private") {
+        return Err(format!("invalid mode: {}", req.mode));
+    }
+    // Owner always has write
+    db.kg_set_access(&req.owner_project_id, &req.collection, "write")?;
+
+    let all_projects = db.list_projects()?;
+    for p in all_projects.iter() {
+        if p.id == req.owner_project_id {
+            continue;
+        }
+        let level = match req.mode.as_str() {
+            "shared" => "read",
+            "projects" => {
+                if req.project_ids.iter().any(|x| x == &p.id) {
+                    "read"
+                } else {
+                    "none"
+                }
+            }
+            _ => "none", // private
+        };
+        db.kg_set_access(&p.id, &req.collection, level)?;
+    }
+    db.audit(
+        "kg_collection_access_mode_set",
+        Some(&req.owner_project_id),
+        None,
+        &serde_json::json!({
+            "collection": req.collection, "mode": req.mode,
+            "project_count": req.project_ids.len(),
+        }),
+    )?;
+    Ok(())
+}
+
+// ─── Per-node access (cross-project scoping) ────────────────────────────
+//
+// Stores allowed project IDs in the Weaviate object's `cross_project_access`
+// property. If the property doesn't exist on the schema yet, Weaviate's
+// REST PATCH will fail; we catch and report so callers can run a schema
+// migration. This is best-effort — the launcher's collection-level access
+// gate is still authoritative for reads.
+
+#[derive(Debug, Deserialize)]
+pub struct NodeAccessReq {
+    pub project_id: String,
+    pub collection: String,
+    pub node_id: String,
+    pub mode: String, // shared | projects | private
+    #[serde(default)]
+    pub project_ids: Vec<String>,
+}
+
+#[command]
+pub async fn kg_set_node_access(req: NodeAccessReq, db: State<'_, Db>) -> Result<(), String> {
+    require_kg_read(&db, &req.project_id, &req.collection)?;
+    if !matches!(req.mode.as_str(), "shared" | "projects" | "private") {
+        return Err(format!("invalid mode: {}", req.mode));
+    }
+    let allowed: Vec<String> = match req.mode.as_str() {
+        "shared" => vec!["*".to_string()],
+        "projects" => req.project_ids.clone(),
+        _ => vec![],
+    };
+
+    let client = weaviate_client()?;
+    let payload = serde_json::json!({
+        "class": req.collection,
+        "properties": { "cross_project_access": allowed },
+    });
+    let resp = client
+        .patch(format!(
+            "{}/v1/objects/{}/{}",
+            weaviate_url(),
+            req.collection,
+            req.node_id
+        ))
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| format!("weaviate PATCH: {}", e))?;
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "weaviate returned {}: {}. Schema may be missing 'cross_project_access' property — run kg_ensure_node_access_schema.",
+            status,
+            body.chars().take(200).collect::<String>()
+        ));
+    }
+    db.audit(
+        "kg_node_access_set",
+        Some(&req.project_id),
+        None,
+        &serde_json::json!({
+            "collection": req.collection, "node_id": req.node_id,
+            "mode": req.mode, "project_count": req.project_ids.len(),
+        }),
+    )?;
+    Ok(())
+}
+
+/// Add `cross_project_access: text[]` to a Weaviate collection's schema if
+/// it's missing. Idempotent. Returns true if added, false if already present.
+#[command]
+pub async fn kg_ensure_node_access_schema(collection: String) -> Result<bool, String> {
+    let client = weaviate_client()?;
+    let url = format!("{}/v1/schema/{}", weaviate_url(), collection);
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("weaviate GET schema: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!("schema fetch returned {}", resp.status().as_u16()));
+    }
+    let schema: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {}", e))?;
+    let already = schema
+        .get("properties")
+        .and_then(|p| p.as_array())
+        .map(|arr| {
+            arr.iter()
+                .any(|p| p.get("name").and_then(|n| n.as_str()) == Some("cross_project_access"))
+        })
+        .unwrap_or(false);
+    if already {
+        return Ok(false);
+    }
+    let body = serde_json::json!({
+        "name": "cross_project_access",
+        "dataType": ["text[]"],
+        "description": "Project IDs with cross-project read access ('*' = shared with all)",
+    });
+    let resp = client
+        .post(format!("{}/properties", url))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("add property: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "add property returned {}: {}",
+            resp.status().as_u16(),
+            resp.text().await.unwrap_or_default()
+        ));
+    }
+    Ok(true)
+}

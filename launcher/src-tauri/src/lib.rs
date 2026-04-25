@@ -145,6 +145,12 @@ pub fn run() {
             commands::installer::check_for_updates,
             commands::installer::install_orchestrator,
             commands::installer::update_orchestrator,
+            // KG dashboard — extended (v1.1)
+            commands::kg::kg_set_collection_access_mode,
+            commands::kg::kg_set_node_access,
+            commands::kg::kg_ensure_node_access_schema,
+            // Codegraph — graph viz (v1.1)
+            commands::codegraph::codegraph_load_graph,
             // Dashboard: tier, features, MCP management
             commands::dashboard::get_feature_flags,
             commands::dashboard::get_orchestrator_config,
