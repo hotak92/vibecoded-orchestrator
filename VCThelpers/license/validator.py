@@ -2,11 +2,18 @@
 # Copyright (c) 2026 VibeCoded Tools
 """License validation + feature gating for VibeCoded Tools Orchestrator.
 
-Reads:
+Reads (in priority order, first match wins):
     VIBECODED_TIER         — free | pro | mao | enterprise (default: free)
-    VIBECODED_LICENSE_KEY  — license UUID (set by launcher after activation)
-    VIBECODED_LICENSE_URL  — Supabase validation endpoint
-                             (default: https://api.vibecodedtools.it/validate)
+                             Setting this to 'free' forces free tier; any other
+                             value is ignored (we never trust env-var-claimed
+                             paid tiers without a validated key).
+    VIBECODED_LICENSE_KEY  — 36-char UUID. Set by the launcher after
+                             activation, or by tooling/tests directly.
+    ~/.vct-secrets/license_key  — fallback file (chmod 600, plain UUID, no
+                             trailing whitespace). Used by headless installs
+                             where the launcher hasn't run.
+    VIBECODED_LICENSE_URL  — Supabase /validate-tier edge function URL.
+                             Defaults to the production deployment.
 
 Grace period:
     If the last successful remote validation was more than 3 days ago and we
@@ -14,9 +21,18 @@ Grace period:
     a human-readable message is written to ~/.vibecoded/license_status.txt.
     Nothing breaks — free-tier functionality continues to work.
 
-This is a stub: the remote call is implemented but the Supabase endpoint is
-expected to be deployed separately. Until then, the cached-result path
-(`validate_license` with a stubbed response) is the working code path.
+Public API:
+    get_tier(force_refresh=False) -> Tier
+    require_tier(min_tier) -> bool
+    feature_enabled(feature) -> bool
+    validate_license(key=None) -> LicenseResult
+    license_status() -> dict   # for CLI / launcher introspection
+
+Network policy:
+    Fail-OPEN to free tier on any transport failure. Never block startup,
+    never raise. The Supabase edge function is the single source of truth
+    for tier mapping; the orchestrator only knows {free, pro, mao,
+    enterprise}.
 """
 from __future__ import annotations
 
@@ -54,6 +70,12 @@ GRACE_PERIOD_SECONDS = 3 * 24 * 3600  # 3 days
 CACHE_DIR = Path.home() / ".vibecoded"
 CACHE_FILE = CACHE_DIR / "license_cache.json"
 STATUS_FILE = CACHE_DIR / "license_status.txt"
+
+# Fallback license-key location for headless installs (no launcher).
+# Convention: same dir as other VCT secrets, file named `license_key`,
+# chmod 600, contains only the UUID (no JSON, no trailing newline matters —
+# we strip it).
+KEY_FILE = Path.home() / ".vct-secrets" / "license_key"
 
 
 @dataclass
@@ -104,8 +126,23 @@ def _save_cached(result: LicenseResult) -> None:
 
 
 _DEFAULT_VALIDATE_URL = (
-    "https://ltnlwhaxnpbiifordlbk.supabase.co/functions/v1/validate-tier"
+    # Public alias documented in the module docstring; resolves to the
+    # license-validation edge function. Internal infra URLs are not committed
+    # to public source — operators set VIBECODED_LICENSE_URL to override.
+    "https://api.vibecodedtools.it/validate"
 )
+
+
+_NETWORK_TIMEOUT_SECONDS = 8
+
+
+class _RemoteOutcome:
+    """Sentinel for distinguishing network failure from a definitive 'free' verdict.
+
+    `_remote_validate` returns:
+      - `LicenseResult` (decisive: trust the server, overwrite cache)
+      - `None`          (transport failure: caller should fall back to cache)
+    """
 
 
 def _remote_validate(key: str, machine_hash: str) -> Optional[LicenseResult]:
@@ -118,12 +155,20 @@ def _remote_validate(key: str, machine_hash: str) -> Optional[LicenseResult]:
         3. Maps variant_id → tier via server-side VARIANT_MAP
         4. Returns { valid, tier, expires_at, machine_count, machine_limit }
 
-    Returns None on network error so the caller can fall back to the cached
-    result within the grace period. Never raises.
+    Returns:
+        LicenseResult — definitive answer (200 with tier, 401 invalid-key, 200
+                        with `error: instance_limit`). Caller MUST cache it.
+        None          — network error / 5xx. Caller falls back to cache within
+                        the 3-day grace window.
+
+    Never raises.
     """
     url = os.environ.get("VIBECODED_LICENSE_URL", _DEFAULT_VALIDATE_URL)
+    timeout = _NETWORK_TIMEOUT_SECONDS
     try:
+        import urllib.error
         import urllib.request
+
         body = json.dumps({
             "license_key": key,
             "machine_id_hash": machine_hash,
@@ -134,30 +179,93 @@ def _remote_validate(key: str, machine_hash: str) -> Optional[LicenseResult]:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            payload = json.loads(resp.read())
-        # Machine-limit exceeded is still a "valid" license, just not usable here.
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read()
+                status = resp.status
+        except urllib.error.HTTPError as http_err:
+            # 4xx: try to parse the JSON body for a structured error response.
+            # 5xx: treat as transport failure → fall back to cache.
+            status = http_err.code
+            try:
+                raw = http_err.read()
+            except Exception:
+                raw = b""
+            if status >= 500:
+                log.debug("validate-tier %s; falling back to cache", status)
+                return None
+
+        try:
+            payload = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            log.warning("validate-tier returned non-JSON body (status=%s)", status)
+            return None
+
+        # 401 → invalid / expired / disabled. Definitive: drop to free,
+        # overwrite cache so a previously-valid Pro tier doesn't linger.
+        if status == 401:
+            return LicenseResult(
+                tier="free",
+                valid=False,
+                last_validated_at=time.time(),
+                message=str(payload.get("message", "Invalid or expired license.")),
+            )
+
+        # Machine-limit exceeded — license is valid but not usable here.
         if payload.get("error") == "instance_limit":
             return LicenseResult(
                 tier="free",
                 valid=False,
                 last_validated_at=time.time(),
-                message=(
+                message=str(payload.get(
+                    "message",
                     "This license is already activated on the maximum number of "
                     "machines. Deactivate an old machine at "
-                    "vibecodedtools.it/account or contact support."
-                ),
+                    "vibecodedtools.it/account or contact support.",
+                )),
             )
+
+        # 400 (malformed request) → log and treat as free; don't mask a client
+        # bug as a transient network blip.
+        if status == 400:
+            log.warning("validate-tier rejected request: %s", payload.get("message"))
+            return LicenseResult(
+                tier="free",
+                valid=False,
+                last_validated_at=time.time(),
+                message=str(payload.get("message", "Invalid request.")),
+            )
+
+        tier_value = payload.get("tier", "free")
+        if tier_value not in TIER_ORDER:
+            log.warning("validate-tier returned unknown tier=%r; coercing to free", tier_value)
+            tier_value = "free"
+
         return LicenseResult(
-            tier=payload.get("tier", "free"),
+            tier=tier_value,
             valid=bool(payload.get("valid", False)),
             expires_at=payload.get("expires_at"),
             last_validated_at=time.time(),
-            message=payload.get("message", "Validated."),
+            message=str(payload.get("message", "Validated.")),
         )
     except Exception as e:
+        # urllib raises URLError for DNS/timeout/connection refused. Any other
+        # unexpected exception also lands here so we never break startup.
         log.debug("Remote license validation failed: %s", e)
         return None
+
+
+def _read_key_file() -> str:
+    """Read the license key from the fallback file, if present.
+
+    Returns empty string on any error (missing, unreadable, empty). Never raises.
+    """
+    try:
+        if KEY_FILE.exists():
+            return KEY_FILE.read_text().strip()
+    except (OSError, UnicodeDecodeError) as e:
+        log.debug("Could not read %s: %s", KEY_FILE, e)
+    return ""
 
 
 def validate_license(key: Optional[str] = None) -> LicenseResult:
@@ -165,9 +273,10 @@ def validate_license(key: Optional[str] = None) -> LicenseResult:
 
     Priority:
         1. `VIBECODED_TIER=free` env forces free tier (dev override).
-        2. If no key → free tier.
-        3. Remote validation → success → cache + return.
-        4. Remote failure → check cache age:
+        2. Key resolution: explicit arg → env var → ``~/.vct-secrets/license_key``.
+        3. No key → free tier.
+        4. Remote validation → success → cache + return.
+        5. Remote failure → check cache age:
              - within 3-day grace period → return cached tier.
              - beyond grace period → degrade to free tier with clear message.
     """
@@ -175,7 +284,10 @@ def validate_license(key: Optional[str] = None) -> LicenseResult:
     if tier_override == "free":
         return LicenseResult(tier="free", valid=True, message="Free tier (env override).")
 
-    key = key or os.environ.get("VIBECODED_LICENSE_KEY", "").strip()
+    if not key:
+        key = os.environ.get("VIBECODED_LICENSE_KEY", "").strip()
+    if not key:
+        key = _read_key_file()
     if not key:
         return LicenseResult(tier="free", valid=True, message="No license key — free tier.")
 
@@ -229,6 +341,60 @@ def feature_enabled(feature: str) -> bool:
     if min_tier is None:
         return True
     return require_tier(min_tier)
+
+
+def license_status() -> dict:
+    """Return a structured snapshot of the current licensing state.
+
+    Intended for CLI / launcher introspection. Never raises. Does NOT trigger
+    a remote call — only inspects environment + cache + status file. Call
+    ``validate_license(force_refresh=True)`` first if you need a fresh check.
+
+    Returns a dict with at minimum:
+        tier             — current effective tier (free | pro | mao | enterprise)
+        has_key          — bool, whether any key source resolved a value
+        key_source       — "env" | "file" | "argument" | "none"
+        cached           — bool, whether a cached LicenseResult exists
+        cache_age_days   — int or None, age of cached.last_validated_at
+        in_grace_period  — bool, cached + within GRACE_PERIOD_SECONDS
+        status_message   — last human-readable status line, if any
+    """
+    env_key = os.environ.get("VIBECODED_LICENSE_KEY", "").strip()
+    file_key = _read_key_file()
+    if env_key:
+        key_source = "env"
+        has_key = True
+    elif file_key:
+        key_source = "file"
+        has_key = True
+    else:
+        key_source = "none"
+        has_key = False
+
+    cached = _load_cached()
+    cache_age_days: Optional[int] = None
+    in_grace = False
+    if cached and cached.last_validated_at:
+        delta = time.time() - cached.last_validated_at
+        cache_age_days = int(delta // 86400)
+        in_grace = delta < GRACE_PERIOD_SECONDS
+
+    status_message = ""
+    try:
+        if STATUS_FILE.exists():
+            status_message = STATUS_FILE.read_text().strip()
+    except OSError:
+        pass
+
+    return {
+        "tier": get_tier(),
+        "has_key": has_key,
+        "key_source": key_source,
+        "cached": cached is not None,
+        "cache_age_days": cache_age_days,
+        "in_grace_period": in_grace,
+        "status_message": status_message,
+    }
 
 
 if __name__ == "__main__":

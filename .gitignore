@@ -73,3 +73,6 @@ claude_mcp_servers/runs/
 # VS Code per-user project settings (claude-code.env lives here, don't commit)
 .vscode/settings.json
 !.vscode/settings.json.example
+
+# Internal Lemon Squeezy inventory snapshots (contain customer/store IDs)
+docs/license/LS_INVENTORY_*.md
