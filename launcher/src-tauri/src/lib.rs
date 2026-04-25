@@ -172,6 +172,8 @@ pub fn run() {
             commands::dashboard::update_mcp_setting,
             commands::dashboard::add_custom_mcp_server,
             commands::dashboard::remove_mcp_server,
+            // Audit log read API
+            commands::audit::list_audit_events,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
