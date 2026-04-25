@@ -26,16 +26,51 @@
   let creating = $state(false);
   let createError = $state<string | null>(null);
   let showHostHelp = $state(false);
+  // Once the user manually edits the path field we stop overwriting it.
+  let pathTouched = $state(false);
+  // Resolved root for the path autosuggest (e.g. /home/martino/code or
+  // ~/code as a literal fallback in browser mode).
+  let suggestedRoot = $state('~/code');
   const inTauri = isTauriRuntime();
+
+  /** kebab-case slug for the folder name, fallback 'my-project'. */
+  function slugify(s: string): string {
+    return s
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9._-]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 64);
+  }
 
   async function openCreate() {
     showCreate = true;
     open = false;
-    if (!createPath) {
-      // Suggest a sane default the first time the modal opens.
-      const suggested = await suggestProjectFolder();
-      if (suggested) createPath = suggested;
+    pathTouched = createPath !== '' && createPath !== undefined;
+    // Resolve ~/code once per modal open. Browser mode keeps the literal
+    // tilde so the user sees a recognizable shape.
+    const suggested = await suggestProjectFolder();
+    suggestedRoot = suggested || '~/code';
+    if (!pathTouched) {
+      createPath = `${suggestedRoot}/${slugify(createName) || 'my-project'}`;
     }
+  }
+
+  // Reactively keep the path in sync with the name until the user edits it.
+  $effect(() => {
+    if (!showCreate || pathTouched) return;
+    const root = suggestedRoot || '~/code';
+    createPath = `${root}/${slugify(createName) || 'my-project'}`;
+  });
+
+  function onPathInput() {
+    pathTouched = true;
+  }
+
+  function closeCreate() {
+    showCreate = false;
+    pathTouched = false;
+    createError = null;
   }
 
   async function browseFolder() {
@@ -43,7 +78,10 @@
       defaultPath: createPath || undefined,
       title: 'Select project folder',
     });
-    if (picked) createPath = picked;
+    if (picked) {
+      createPath = picked;
+      pathTouched = true;
+    }
   }
 
   // Rename inline state — keyed by project id
@@ -79,13 +117,26 @@
       createError = 'Name and folder path are required';
       return;
     }
+    // Expand a leading ~ to the resolved home dir (best-effort). Tauri's
+    // own commands won't expand ~, so do it here before submitting.
+    let submitPath = createPath.trim();
+    if (submitPath.startsWith('~')) {
+      const root = suggestedRoot || '';
+      // suggestedRoot looks like "/home/you/code" or "~/code"; recover the
+      // home portion by stripping the trailing "/code" if present.
+      const home = root.replace(/[\\/]code$/, '');
+      if (home && !home.startsWith('~')) {
+        submitPath = home + submitPath.slice(1);
+      }
+    }
     creating = true;
     try {
-      await projects.create(createName.trim(), createPath.trim(), createHost);
+      await projects.create(createName.trim(), submitPath, createHost);
       showCreate = false;
       createName = '';
       createPath = '';
       createHost = 'base';
+      pathTouched = false;
       open = false;
     } catch (e) {
       createError = e instanceof Error ? e.message : String(e);
@@ -235,12 +286,12 @@
 <!-- Create project modal -->
 {#if showCreate}
   <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div class="modal-backdrop" onclick={() => (showCreate = false)} onkeydown={() => {}}>
+  <div class="modal-backdrop" onclick={closeCreate} onkeydown={() => {}}>
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <div class="modal-content" onclick={(e) => e.stopPropagation()} onkeydown={() => {}}>
       <div class="modal-header">
         <h2>New Project</h2>
-        <button class="modal-close" onclick={() => (showCreate = false)} aria-label="Close">
+        <button class="modal-close" onclick={closeCreate} aria-label="Close">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M18 6L6 18"/><path d="M6 6l12 12"/>
           </svg>
@@ -265,7 +316,8 @@
               type="text"
               class="form-input mono path-input"
               bind:value={createPath}
-              placeholder="/home/you/code/my-project"
+              oninput={onPathInput}
+              placeholder="~/code/my-project"
             />
             <button
               type="button"
@@ -316,7 +368,7 @@
           <div class="msg msg-error">{createError}</div>
         {/if}
         <div class="form-actions">
-          <button class="btn-3d btn-3d-ghost btn-3d-sm" onclick={() => (showCreate = false)} disabled={creating}>
+          <button class="btn-3d btn-3d-ghost btn-3d-sm" onclick={closeCreate} disabled={creating}>
             Cancel
           </button>
           <button class="btn-3d btn-3d-primary btn-3d-sm" onclick={handleCreate} disabled={creating}>
