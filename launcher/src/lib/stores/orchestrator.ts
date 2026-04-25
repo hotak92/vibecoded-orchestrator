@@ -1,18 +1,8 @@
 import { writable, derived } from 'svelte/store';
-
-// Guard Tauri API imports — they fail in browser-only context (vite dev without native window)
-const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
-
-async function tauriInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
-  if (!isTauri) throw new Error(`Tauri not available (browser mode). Cannot invoke '${cmd}'`);
-  const { invoke } = await import('@tauri-apps/api/core');
-  return invoke<T>(cmd, args);
-}
+import { invoke as tauriInvoke, safeInvoke, listen as tauriListenWrapper } from '$lib/tauri';
 
 async function tauriListen<T>(event: string, handler: (e: { payload: T }) => void) {
-  if (!isTauri) return;
-  const { listen } = await import('@tauri-apps/api/event');
-  listen<T>(event, handler);
+  await tauriListenWrapper<T>(event, handler);
 }
 
 // ---------------------------------------------------------------------------
@@ -93,18 +83,23 @@ function createOrchestratorStore() {
   return {
     subscribe,
 
-    /** Detect system capabilities */
-    async detectSystem(): Promise<SystemDetection> {
-      const system = await tauriInvoke<SystemDetection>('detect_system');
-      const defaultPath = await tauriInvoke<string>('get_default_install_path');
+    /** Detect system capabilities — soft-no-op in browser mode */
+    async detectSystem(): Promise<SystemDetection | null> {
+      const system = await safeInvoke<SystemDetection>('detect_system');
+      const defaultPath = await safeInvoke<string>('get_default_install_path');
 
-      update((s) => ({ ...s, system, installPath: s.installPath || defaultPath }));
+      if (!system) return null;
+
+      update((s) => ({ ...s, system, installPath: s.installPath || defaultPath || '' }));
       return system;
     },
 
-    /** Check if orchestrator is installed and get version */
+    /** Check if orchestrator is installed and get version — soft-no-op in browser mode */
     async checkStatus(): Promise<void> {
-      const defaultPath = await tauriInvoke<string>('get_default_install_path');
+      const defaultPath = await safeInvoke<string>('get_default_install_path');
+
+      // Browser mode: nothing to check, leave status as-is.
+      if (defaultPath === null) return;
 
       update((s) => {
         if (!s.installPath) return { ...s, installPath: defaultPath };
@@ -117,22 +112,19 @@ function createOrchestratorStore() {
 
       if (!currentPath) currentPath = defaultPath;
 
-      const installed = await tauriInvoke<boolean>('check_install_status', { path: currentPath });
+      const installed = await safeInvoke<boolean>('check_install_status', { path: currentPath });
+      if (installed === null) return;
 
       if (installed) {
-        try {
-          const version = await tauriInvoke<string>('get_installed_version', { path: currentPath });
-          const updateAvailable = await tauriInvoke<boolean>('check_for_updates', { path: currentPath });
-          update((s) => ({
-            ...s,
-            status: 'installed',
-            version,
-            updateAvailable,
-            installPath: currentPath,
-          }));
-        } catch {
-          update((s) => ({ ...s, status: 'installed', installPath: currentPath }));
-        }
+        const version = await safeInvoke<string>('get_installed_version', { path: currentPath });
+        const updateAvailable = await safeInvoke<boolean>('check_for_updates', { path: currentPath });
+        update((s) => ({
+          ...s,
+          status: 'installed',
+          version: version ?? s.version,
+          updateAvailable: updateAvailable ?? false,
+          installPath: currentPath,
+        }));
       } else {
         update((s) => ({ ...s, status: 'not_installed', installPath: currentPath }));
       }

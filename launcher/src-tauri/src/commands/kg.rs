@@ -649,37 +649,9 @@ pub async fn kg_set_node_access(req: NodeAccessReq, db: State<'_, Db>) -> Result
     if !matches!(req.mode.as_str(), "shared" | "projects" | "private") {
         return Err(format!("invalid mode: {}", req.mode));
     }
-    let allowed: Vec<String> = match req.mode.as_str() {
-        "shared" => vec!["*".to_string()],
-        "projects" => req.project_ids.clone(),
-        _ => vec![],
-    };
-
+    let allowed = compute_allowed_ids(&req.mode, &req.project_ids);
     let client = weaviate_client()?;
-    let payload = serde_json::json!({
-        "class": req.collection,
-        "properties": { "cross_project_access": allowed },
-    });
-    let resp = client
-        .patch(format!(
-            "{}/v1/objects/{}/{}",
-            weaviate_url(),
-            req.collection,
-            req.node_id
-        ))
-        .json(&payload)
-        .send()
-        .await
-        .map_err(|e| format!("weaviate PATCH: {}", e))?;
-    if !resp.status().is_success() {
-        let status = resp.status().as_u16();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!(
-            "weaviate returned {}: {}. Schema may be missing 'cross_project_access' property — run kg_ensure_node_access_schema.",
-            status,
-            body.chars().take(200).collect::<String>()
-        ));
-    }
+    patch_node_access(&client, &req.collection, &req.node_id, &allowed).await?;
     db.audit(
         "kg_node_access_set",
         Some(&req.project_id),
@@ -690,6 +662,126 @@ pub async fn kg_set_node_access(req: NodeAccessReq, db: State<'_, Db>) -> Result
         }),
     )?;
     Ok(())
+}
+
+fn compute_allowed_ids(mode: &str, project_ids: &[String]) -> Vec<String> {
+    match mode {
+        "shared" => vec!["*".to_string()],
+        "projects" => project_ids.to_vec(),
+        _ => vec![],
+    }
+}
+
+async fn patch_node_access(
+    client: &reqwest::Client,
+    collection: &str,
+    node_id: &str,
+    allowed: &[String],
+) -> Result<(), String> {
+    let payload = serde_json::json!({
+        "class": collection,
+        "properties": { "cross_project_access": allowed },
+    });
+    let resp = client
+        .patch(format!(
+            "{}/v1/objects/{}/{}",
+            weaviate_url(),
+            collection,
+            node_id
+        ))
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| format!("weaviate PATCH {}: {}", node_id, e))?;
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "weaviate returned {} for node {}: {}. Schema may be missing 'cross_project_access' property — run kg_ensure_node_access_schema.",
+            status,
+            node_id,
+            body.chars().take(200).collect::<String>()
+        ));
+    }
+    Ok(())
+}
+
+// ─── Bulk per-node access ────────────────────────────────────────────────
+//
+// Apply the same access mode to many nodes in a single collection.
+// Uses iteration (not a Weaviate batch endpoint — Weaviate's batch API
+// is for object create / delete, not partial-property updates).
+// Continues on per-node failure and returns a summary so the UI can
+// render "47 / 50 succeeded" instead of stopping at the first error.
+
+#[derive(Debug, Deserialize)]
+pub struct NodeAccessBulkReq {
+    pub project_id: String,
+    pub collection: String,
+    pub node_ids: Vec<String>,
+    pub mode: String, // shared | projects | private
+    #[serde(default)]
+    pub project_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BulkAccessResult {
+    pub succeeded: usize,
+    pub failed: usize,
+    pub failures: Vec<BulkFailure>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BulkFailure {
+    pub id: String,
+    pub error: String,
+}
+
+#[command]
+pub async fn kg_set_node_access_bulk(
+    req: NodeAccessBulkReq,
+    db: State<'_, Db>,
+) -> Result<BulkAccessResult, String> {
+    require_kg_read(&db, &req.project_id, &req.collection)?;
+    if !matches!(req.mode.as_str(), "shared" | "projects" | "private") {
+        return Err(format!("invalid mode: {}", req.mode));
+    }
+    if req.node_ids.is_empty() {
+        return Ok(BulkAccessResult { succeeded: 0, failed: 0, failures: vec![] });
+    }
+
+    let allowed = compute_allowed_ids(&req.mode, &req.project_ids);
+    let client = weaviate_client()?;
+
+    let mut succeeded = 0usize;
+    let mut failures: Vec<BulkFailure> = Vec::new();
+    for node_id in &req.node_ids {
+        match patch_node_access(&client, &req.collection, node_id, &allowed).await {
+            Ok(()) => succeeded += 1,
+            Err(e) => failures.push(BulkFailure { id: node_id.clone(), error: e }),
+        }
+    }
+
+    // Single audit event for the bulk op, not one per node.
+    db.audit(
+        "kg_node_access_set_bulk",
+        Some(&req.project_id),
+        None,
+        &serde_json::json!({
+            "collection": req.collection,
+            "mode": req.mode,
+            "project_count": req.project_ids.len(),
+            "node_count": req.node_ids.len(),
+            "succeeded": succeeded,
+            "failed": failures.len(),
+        }),
+    )?;
+
+    Ok(BulkAccessResult {
+        succeeded,
+        failed: failures.len(),
+        failures,
+    })
 }
 
 /// Add `cross_project_access: text[]` to a Weaviate collection's schema if

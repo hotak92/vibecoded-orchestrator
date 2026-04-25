@@ -95,6 +95,11 @@
 
   const pState = $derived($projects);
   const current = $derived($selectedProject);
+  // When no projects exist at all, the trigger button is a one-click
+  // "create your first project" instead of opening an empty dropdown.
+  // Joint Round 3 verdict flagged the previous behavior (open empty
+  // panel that contains a CTA inside) as confusing.
+  const hasNoProjects = $derived(!pState.loading && pState.projects.length === 0);
 
   onMount(() => {
     projects.load();
@@ -109,6 +114,16 @@
   function handleSelect(id: string) {
     projects.select(id);
     open = false;
+  }
+
+  function handleTriggerClick(e: MouseEvent) {
+    e.stopPropagation();
+    if (hasNoProjects) {
+      // Skip the empty dropdown — open the create modal directly.
+      openCreate();
+      return;
+    }
+    open = !open;
   }
 
   async function handleCreate() {
@@ -191,12 +206,10 @@
   <button
     class="project-trigger"
     class:project-trigger-active={!!current}
+    class:project-trigger-empty={hasNoProjects}
     style:--project-accent={current ? projectColor(current.id) : 'transparent'}
-    onclick={(e) => {
-      e.stopPropagation();
-      open = !open;
-    }}
-    title="Switch project"
+    onclick={handleTriggerClick}
+    title={hasNoProjects ? 'Create your first project' : 'Switch project'}
   >
     <span
       class="project-dot"
@@ -205,11 +218,19 @@
       aria-hidden="true"
     ></span>
     <span class="project-name">
-      {current ? current.name : 'No project'}
+      {#if current}
+        {current.name}
+      {:else if hasNoProjects}
+        + New project
+      {:else}
+        No project
+      {/if}
     </span>
-    <svg class="chevron" class:open width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-      <polyline points="6 9 12 15 18 9"/>
-    </svg>
+    {#if !hasNoProjects}
+      <svg class="chevron" class:open width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="6 9 12 15 18 9"/>
+      </svg>
+    {/if}
   </button>
 
   {#if open}
@@ -465,6 +486,17 @@
   .project-trigger:hover {
     border-color: rgba(0, 191, 166, 0.3);
     background: rgba(255, 255, 255, 0.06);
+  }
+  /* Empty-state pill: dashed border + teal text to telegraph "create",
+     not "switch". Click goes straight to the create modal. */
+  .project-trigger-empty {
+    border-style: dashed;
+    border-color: rgba(0, 191, 166, 0.4);
+    color: var(--color-teal, #0fc);
+  }
+  .project-trigger-empty:hover {
+    background: rgba(0, 191, 166, 0.08);
+    border-color: rgba(0, 191, 166, 0.6);
   }
   .project-trigger-active:hover {
     background: color-mix(in srgb, var(--project-accent) 22%, rgba(255,255,255,0.06));

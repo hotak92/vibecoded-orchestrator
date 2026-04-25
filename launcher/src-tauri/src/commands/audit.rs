@@ -26,6 +26,9 @@ pub struct AuditEvent {
     pub module_id: Option<String>,
     /// JSON string. Frontend may parse it for display.
     pub detail: String,
+    /// OS user who performed the operation. "system" for pre-migration
+    /// rows, "unknown" if the launcher could not resolve $USER.
+    pub actor: String,
     /// Unix epoch milliseconds.
     pub created_at: i64,
 }

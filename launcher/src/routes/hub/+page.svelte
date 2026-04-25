@@ -2,9 +2,12 @@
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
   import { safeInvoke, invoke, isTauriRuntime } from '$lib/tauri';
+  import { selectedProject } from '$lib/stores/projects';
   import { toast } from '$lib/stores/toast';
   import Toast from '$lib/components/Toast.svelte';
+  import NoProjectBanner from '$lib/components/NoProjectBanner.svelte';
 
+  const project = $derived($selectedProject);
   let info = $state<{ port: number; reachable: boolean } | null>(null);
   let apps = $state<any[]>([]);
   let catalog = $state<any[]>([]);
@@ -65,6 +68,8 @@
       <code>npm run tauri:dev</code> from <code>launcher/</code> to interact
       with apps, messages, and the data catalog.
     </p>
+  {:else if !project}
+    <NoProjectBanner section="the Orchestrator Hub" />
   {/if}
 
   <main class="hub-main">

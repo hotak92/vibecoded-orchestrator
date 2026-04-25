@@ -11,12 +11,33 @@
     collection,
     onBack,
     onShareNode,
+    onBulkShareNodes,
   }: {
     projectId: string;
     collection: string;
     onBack: () => void;
     onShareNode: (node: KgNode) => void;
+    /** Open the bulk-access modal for a set of selected node IDs. */
+    onBulkShareNodes?: (nodeIds: string[]) => void;
   } = $props();
+
+  // Multi-select state — used by both search results and graph view.
+  let selectedNodeIds = $state<Set<string>>(new Set());
+  function toggleSelect(id: string) {
+    if (selectedNodeIds.has(id)) selectedNodeIds.delete(id);
+    else selectedNodeIds.add(id);
+    selectedNodeIds = new Set(selectedNodeIds);
+  }
+  function selectAllVisible(ids: string[]) {
+    selectedNodeIds = new Set(ids);
+  }
+  function clearSelection() {
+    selectedNodeIds = new Set();
+  }
+  function openBulkModal() {
+    if (!onBulkShareNodes || selectedNodeIds.size === 0) return;
+    onBulkShareNodes([...selectedNodeIds]);
+  }
 
   let viewMode = $state<'search' | 'graph'>('search');
 
@@ -209,13 +230,47 @@
         </button>
       </form>
       {#if results.length > 0}
+        {#if selectedNodeIds.size > 0}
+          <div class="cv-bulk-bar" role="toolbar" aria-label="Bulk actions">
+            <span class="cv-bulk-count">{selectedNodeIds.size} selected</span>
+            {#if onBulkShareNodes}
+              <button class="cv-bulk-btn cv-bulk-btn-primary" onclick={openBulkModal}>
+                Set access for {selectedNodeIds.size} node{selectedNodeIds.size === 1 ? '' : 's'}…
+              </button>
+            {/if}
+            <button class="cv-bulk-btn" onclick={clearSelection}>Clear</button>
+          </div>
+        {/if}
         <table class="cv-table">
           <thead>
-            <tr><th>Title</th><th>Type</th><th>Tags</th><th></th></tr>
+            <tr>
+              <th class="cv-col-check">
+                <input
+                  type="checkbox"
+                  checked={results.length > 0 && results.every((r) => selectedNodeIds.has(r.id))}
+                  onchange={(e) => {
+                    if ((e.target as HTMLInputElement).checked) {
+                      selectAllVisible(results.map((r) => r.id));
+                    } else {
+                      clearSelection();
+                    }
+                  }}
+                  title="Select all visible"
+                />
+              </th>
+              <th>Title</th><th>Type</th><th>Tags</th><th></th>
+            </tr>
           </thead>
           <tbody>
             {#each results as r}
-              <tr>
+              <tr class:cv-row-selected={selectedNodeIds.has(r.id)}>
+                <td class="cv-col-check">
+                  <input
+                    type="checkbox"
+                    checked={selectedNodeIds.has(r.id)}
+                    onchange={() => toggleSelect(r.id)}
+                  />
+                </td>
                 <td>
                   <button class="cv-link" onclick={() => openDetail(r)}>{r.title}</button>
                 </td>
@@ -237,11 +292,24 @@
       {#if graphLoading}
         <p class="cv-empty">Loading graph…</p>
       {:else}
+        {#if selectedNodeIds.size > 0}
+          <div class="cv-bulk-bar cv-bulk-bar-graph" role="toolbar" aria-label="Bulk actions">
+            <span class="cv-bulk-count">{selectedNodeIds.size} selected</span>
+            {#if onBulkShareNodes}
+              <button class="cv-bulk-btn cv-bulk-btn-primary" onclick={openBulkModal}>
+                Set access for {selectedNodeIds.size} node{selectedNodeIds.size === 1 ? '' : 's'}…
+              </button>
+            {/if}
+            <button class="cv-bulk-btn" onclick={clearSelection}>Clear</button>
+          </div>
+        {/if}
         <SigmaGraph
           nodes={vizNodes}
           edges={vizEdges}
           onNodeClick={(n) => (pinnedNode = n)}
           onNodeContextMenu={onCtx}
+          onSelectionToggle={toggleSelect}
+          selectedIds={selectedNodeIds}
         />
         <GraphFilterPanel
           tags={availableTags}
@@ -348,6 +416,38 @@
   .cv-table { width: 100%; border-collapse: collapse; font-size: 12px; }
   .cv-table th { text-align: left; padding: 6px 8px; color: #888; border-bottom: 1px solid rgba(255,255,255,0.08); }
   .cv-table td { padding: 6px 8px; border-bottom: 1px solid rgba(255,255,255,0.04); }
+  .cv-col-check { width: 24px; padding: 6px 4px 6px 8px; }
+  .cv-col-check input { cursor: pointer; }
+  .cv-row-selected { background: rgba(0, 191, 166, 0.06); }
+  .cv-bulk-bar {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 12px; margin-bottom: 8px;
+    background: rgba(0,191,166,0.08);
+    border: 1px solid rgba(0,191,166,0.3);
+    border-radius: 8px;
+    font-size: 12px;
+  }
+  .cv-bulk-bar-graph {
+    position: absolute; top: 8px; right: 8px;
+    z-index: 10; margin: 0;
+    background: rgba(13,23,53,0.95);
+    backdrop-filter: blur(10px);
+  }
+  .cv-bulk-count {
+    color: #0fc; font-weight: 700;
+    padding: 2px 8px;
+    background: rgba(0,191,166,0.12);
+    border-radius: 999px;
+  }
+  .cv-bulk-btn {
+    background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.12);
+    color: inherit; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 11px;
+  }
+  .cv-bulk-btn:hover { background: rgba(255,255,255,0.1); }
+  .cv-bulk-btn-primary {
+    background: rgb(0,191,166); border-color: rgb(0,191,166); color: #000; font-weight: 600;
+  }
+  .cv-bulk-btn-primary:hover { background: rgb(0,210,180); }
   .cv-link { background: none; border: none; color: #0fc; cursor: pointer; padding: 0; text-align: left; }
   .cv-row-share {
     background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1);
