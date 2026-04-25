@@ -2,6 +2,17 @@
 .env
 .env.*
 *.env
+# Per-project / per-user secret files (vct-secrets primitive lives in $HOME, not the repo)
+vct-secrets/
+*.pat
+*.token
+*.pem
+*.key
+!**/public.key
+!**/*.pub.key
+
+# Audit doc (only present on the OSS-readiness branch, not for main)
+OSS_LAUNCH_READINESS.md
 
 # Python
 __pycache__/
