@@ -71,10 +71,14 @@ pub fn run() {
             // Projects — v2 DB-backed
             commands::projects_v2::list_projects_v2,
             commands::projects_v2::get_project_v2,
+            commands::projects_v2::get_project_by_slug,
             commands::projects_v2::create_project_v2,
             commands::projects_v2::rename_project_v2,
             commands::projects_v2::switch_project_host_v2,
             commands::projects_v2::delete_project_v2,
+            // Concurrency invalidation (P7) — change_log polling
+            commands::changes_cmd::poll_changes,
+            commands::changes_cmd::current_change_seq,
             // Modules — catalog + install + lifecycle
             commands::modules::list_module_catalog,
             commands::modules::install_module_for_project,

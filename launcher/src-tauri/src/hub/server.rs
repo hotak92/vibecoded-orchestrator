@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 
-use super::{api, db, modules_api, project_state_api};
+use super::{api, cli_api, db, modules_api, project_state_api};
 
 const DEFAULT_PORT: u16 = 7700;
 
@@ -38,8 +38,9 @@ pub async fn start_hub_server() -> Result<u16, String> {
         .nest("/api/v1", modules_api::router().with_state(launcher_state.clone()))
         .nest(
             "/api/v1",
-            project_state_api::router().with_state(launcher_state),
+            project_state_api::router().with_state(launcher_state.clone()),
         )
+        .nest("/api/v1", cli_api::router().with_state(launcher_state))
         .layer(cors);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));

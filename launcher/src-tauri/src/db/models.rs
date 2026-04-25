@@ -34,6 +34,7 @@ pub struct ProjectRow {
     pub name: String,
     pub folder_path: String,
     pub host: ProjectHost,
+    pub slug: String,
     pub created_at: i64,
     pub updated_at: i64,
 }

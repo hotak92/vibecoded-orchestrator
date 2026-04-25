@@ -18,6 +18,8 @@
   import OnboardingWizard from '$lib/components/OnboardingWizard.svelte';
   import ChangelogModal from '$lib/components/ChangelogModal.svelte';
   import Toast from '$lib/components/Toast.svelte';
+  import { selectedProject, projects } from '$lib/stores/projects';
+  import { startChangePoller, onChange } from '$lib/stores/changes';
 
   let { children } = $props();
 
@@ -67,11 +69,38 @@
         showChangelog = true;
       }
     } catch {}
+
+    // Start the change-log poller (P7). Re-fetches the project list
+    // whenever any window mutates `projects`. Other stores subscribe to
+    // their own tables via `onChange(...)` in their own modules.
+    void startChangePoller();
+    const unsub = onChange('projects', () => {
+      void projects.load();
+    });
+    return () => unsub();
   });
 
   // Routes that render outside the chrome shell (no MenuBar / Sidebar /
   // StatusBar). Auth pages are the only such case today.
   const fullBleed = $derived($page.url.pathname.startsWith('/auth'));
+
+  // Remember the last "section" (top-level path segment) the user visited
+  // while a project was selected. /p/<slug>/+page.svelte reads this on
+  // arrival to redirect deep-link visitors to the most recent view of
+  // that project. Documented in docs/MULTI_TENANT_URLS.md.
+  const REMEMBER = new Set(['kg', 'codegraph', 'coordination', 'audit', 'project', 'hub', 'mcp', 'telemetry']);
+  $effect(() => {
+    if (typeof localStorage === 'undefined') return;
+    const sel = $selectedProject;
+    if (!sel) return;
+    const segs = $page.url.pathname.split('/').filter(Boolean);
+    const top = segs[0];
+    if (top && REMEMBER.has(top)) {
+      try {
+        localStorage.setItem('vct.last_section.' + sel.id, '/' + top);
+      } catch {}
+    }
+  });
 </script>
 
 {#if $authLoading}
