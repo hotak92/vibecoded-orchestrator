@@ -1,59 +1,60 @@
 #!/usr/bin/env bash
-# Ensure infrastructure containers are running (background, non-blocking).
-# Called by SessionStart hook — auto-detects Docker or Podman and starts the
-# compose stack if containers are stopped or missing.
-#
-# This hook is Unix-only (bash). Windows users running without WSL should
-# start containers manually via `docker compose up -d` in the infrastructure/
-# directory before launching Claude Code.
-
 # Scrub sensitive env vars before any subprocess spawning
-unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY \
-      AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD \
-      VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
+unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
+# Ensure all required containers are running (background, non-blocking)
+# Called by SessionStart hook — checks and starts any stopped containers
 
-COMPOSE_DIR="$(cd "$(dirname "$0")/../.." && pwd)/infrastructure"
+# Resolve COMPOSE_DIR relative to this hook (script lives at <repo>/.claude/hooks/),
+# or honor an override for non-standard layouts.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+COMPOSE_DIR="${VCT_COMPOSE_DIR:-$REPO_ROOT/claude_mcp_servers}"
 
-# Auto-detect container runtime: prefer Podman on Linux, Docker elsewhere
-if command -v podman >/dev/null 2>&1; then
-    RUNTIME="podman"
-elif command -v docker >/dev/null 2>&1; then
-    RUNTIME="docker"
-else
-    # No container runtime available — silently exit (user may have --no-containers)
-    exit 0
+# Container names — tunable per-project via VCT_REQUIRED_CONTAINERS (space-separated).
+# Defaults to the free-tier set (no neo4j_claude — that's RL/instinct-tier only).
+read -ra REQUIRED_CONTAINERS <<<"${VCT_REQUIRED_CONTAINERS:-weaviate_claude ollama_claude code_embed_claude}"
+
+# Container runtime: prefer docker if podman isn't around (some users only have one).
+RUNTIME="${VCT_CONTAINER_RUNTIME:-}"
+if [ -z "$RUNTIME" ]; then
+    if command -v podman >/dev/null 2>&1; then RUNTIME=podman
+    elif command -v docker >/dev/null 2>&1; then RUNTIME=docker
+    else echo "ensure-containers: neither podman nor docker found, skipping" >&2; exit 0
+    fi
 fi
 
-# Compose command: try `<runtime> compose` (v2 plugin) first, then standalone
-if "$RUNTIME" compose version >/dev/null 2>&1; then
-    COMPOSE=("$RUNTIME" "compose")
-elif command -v "${RUNTIME}-compose" >/dev/null 2>&1; then
-    COMPOSE=("${RUNTIME}-compose")
-else
-    # No compose tool found — skip silently
-    exit 0
+# Compose binary: podman-compose or docker compose (v2). User can override.
+COMPOSE_CMD="${VCT_COMPOSE_CMD:-}"
+if [ -z "$COMPOSE_CMD" ]; then
+    if [ "$RUNTIME" = "podman" ] && command -v podman-compose >/dev/null 2>&1; then COMPOSE_CMD="podman-compose"
+    elif [ "$RUNTIME" = "docker" ]; then COMPOSE_CMD="docker compose"
+    else COMPOSE_CMD=""
+    fi
 fi
 
-# Services defined in infrastructure/docker-compose.yml
-REQUIRED_SERVICES=(weaviate ollama)
-
-# Check service status via compose (portable across Docker and Podman)
-cd "$COMPOSE_DIR" || exit 0
-
-# Get list of running services (one per line)
-running=$("${COMPOSE[@]}" ps --services --filter "status=running" 2>/dev/null || true)
-
-missing_any=0
-for service in "${REQUIRED_SERVICES[@]}"; do
-    if ! echo "$running" | grep -qx "$service"; then
-        missing_any=1
-        break
+started=0
+needs_compose=false
+for container in "${REQUIRED_CONTAINERS[@]}"; do
+    status=$($RUNTIME inspect "$container" --format '{{.State.Status}}' 2>/dev/null || echo "missing")
+    if [ "$status" = "running" ]; then
+        continue
+    elif [ "$status" = "missing" ]; then
+        # Container doesn't exist — needs compose to create it
+        needs_compose=true
+    else
+        # Container exists but stopped — try starting it
+        $RUNTIME start "$container" 2>/dev/null && started=$((started + 1))
     fi
 done
 
-if [ "$missing_any" -eq 1 ]; then
-    # Bring up the stack in background; user sees output only on failure
-    "${COMPOSE[@]}" up -d >/dev/null 2>&1 && echo "Started container stack via $RUNTIME" || true
+# If any container was missing entirely, bring up the full compose stack
+if [ "$needs_compose" = true ] && [ -n "$COMPOSE_CMD" ] && [ -d "$COMPOSE_DIR" ]; then
+    (cd "$COMPOSE_DIR" && $COMPOSE_CMD up -d) 2>/dev/null
+    echo "Ran '$COMPOSE_CMD up -d' in $COMPOSE_DIR (missing containers detected)"
+fi
+
+if [ "$started" -gt 0 ]; then
+    echo "Started $started container(s) via $RUNTIME"
 fi
 
 exit 0

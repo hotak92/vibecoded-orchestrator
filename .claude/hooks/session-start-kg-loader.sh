@@ -12,10 +12,14 @@ set -e
 PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
 PROJECT_NAME=$(basename "$PROJECT_DIR")
 
-# Auto-launch rl_server for this project (port 11439, state/ in this repo)
-export RL_SERVER_PORT=11439
-export RL_PROJECT_ROOT="${RL_PROJECT_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}"
-# RL server (Pro tier only - not included in base orchestrator)
+# Optional RL retrieval server (Pro tier). Auto-launches if installed,
+# otherwise silently no-ops — free tier ships with KG + code graph only.
+RL_LAUNCHER="${RL_SERVER_LAUNCHER:-$HOME/.claude/scripts/start-rl-server.sh}"
+if [ -x "$RL_LAUNCHER" ]; then
+    export RL_SERVER_PORT="${RL_SERVER_PORT:-11439}"
+    export RL_PROJECT_ROOT="${RL_PROJECT_ROOT:-$PROJECT_DIR}"
+    bash "$RL_LAUNCHER" 2>/dev/null || true
+fi
 
 # Display available resources (paths only, no content loading)
 cat << EOF

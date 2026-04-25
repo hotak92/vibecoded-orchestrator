@@ -25,6 +25,9 @@ state/
 
 # Claude Code user-specific
 .claude/logs/
+.claude/logs/*.log
+.claude/logs/*.jsonl
+.claude/logs/.last_reviewed_commit
 .claude/context/pre-compact-snapshot.md
 .claude/cron-jobs.json
 .claude/worktrees/
@@ -51,8 +54,17 @@ htmlcov/
 weaviate_data/
 ollama_data/
 
-# Playwright
-.playwright-mcp/
+# Playwright per-session artifacts (config OK, outputs not)
+.playwright-mcp/*.png
+.playwright-mcp/*.log
+.playwright-mcp/*.yml
+.playwright-mcp/*.json
+.playwright-mcp/*.html
+
+# Debug screenshots dropped at repo root
+*.png
+!docs/**/*.png
+!knowledge/**/*.png
 
 # MCP server caches
 claude_mcp_servers/models_cache/

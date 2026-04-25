@@ -35,12 +35,7 @@ check_pattern "Generic secret"           '(SECRET|API_KEY|ACCESS_TOKEN|PRIVATE_K
 if [ ${#ALERTS[@]} -gt 0 ]; then
     MSG="Possible credential in $(basename "$EDITED_FILE"): ${ALERTS[*]}"
     echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"file\":\"$EDITED_FILE\",\"patterns\":\"${ALERTS[*]}\"}" >> "$ALERT_LOG" 2>/dev/null || true
-    if command -v notify-send >/dev/null 2>&1; then
-        notify-send "Claude Code Security Alert" "$MSG" 2>/dev/null || true
-    elif command -v osascript >/dev/null 2>&1; then
-        ESCAPED_MSG=$(printf '%s' "$MSG" | sed 's/"/\\"/g')
-        osascript -e "display notification \"$ESCAPED_MSG\" with title \"Claude Code Security Alert\"" 2>/dev/null || true
-    fi
+    notify-send "Claude Code Security Alert" "$MSG" 2>/dev/null || true
     echo "⚠️  $MSG"
     echo "   Review: $EDITED_FILE"
 fi
