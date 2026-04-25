@@ -37,6 +37,7 @@ pub fn router() -> Router<LauncherDbHandle> {
         .route("/projects", get(list_projects))
         .route("/projects/{project_id}", get(get_project))
         .route("/projects/{project_id}/env", get(project_env))
+        .route("/projects/by-slug/{slug}", get(get_project_by_slug_route))
 }
 
 // ─── Types ───────────────────────────────────────────────────────────────
@@ -57,6 +58,7 @@ struct ProjectSummary {
     name: String,
     folder_path: String,
     host: String,
+    slug: String,
     module_count: u32,
 }
 
@@ -67,6 +69,7 @@ impl ProjectSummary {
             name: row.name.clone(),
             folder_path: row.folder_path.clone(),
             host: row.host.as_str().to_string(),
+            slug: row.slug.clone(),
             module_count,
         }
     }
@@ -214,6 +217,28 @@ async fn get_project(
     Path(project_id): Path<String>,
 ) -> impl IntoResponse {
     match h.0.get_project(&project_id) {
+        Ok(Some(row)) => {
+            let count = h
+                .0
+                .list_module_installs_for_project(&row.id)
+                .map(|v| v.len() as u32)
+                .unwrap_or(0);
+            Json(ProjectSummary::from_row(&row, count)).into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "project not found" })),
+        )
+            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+async fn get_project_by_slug_route(
+    State(h): State<LauncherDbHandle>,
+    Path(slug): Path<String>,
+) -> impl IntoResponse {
+    match h.0.get_project_by_slug(&slug) {
         Ok(Some(row)) => {
             let count = h
                 .0
