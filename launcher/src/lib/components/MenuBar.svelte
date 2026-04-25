@@ -1,8 +1,12 @@
 <script lang="ts">
   import { auth, currentUser } from '$lib/stores/auth';
+  import { license } from '$lib/stores/license';
   import { goto } from '$app/navigation';
+  import { onMount } from 'svelte';
+  import ProjectSelector from './ProjectSelector.svelte';
+  import UpdateBadge from './UpdateBadge.svelte';
 
-  type Tab = 'library' | 'store';
+  type Tab = 'library' | 'store' | 'modules';
 
   let {
     activeTab = $bindable('library'),
@@ -17,10 +21,18 @@
   const tabs: { id: Tab; label: string }[] = [
     { id: 'library', label: 'Library' },
     { id: 'store', label: 'Store' },
+    { id: 'modules', label: 'Modules' },
   ];
 
   let showUserMenu = $state(false);
   let menuWrapperEl: HTMLDivElement;
+
+  const licenseState = $derived($license);
+  const tier = $derived(licenseState.cache?.orchestrator_tier ?? 'free');
+
+  onMount(() => {
+    license.load();
+  });
 
   function handleLogout() {
     showUserMenu = false;
@@ -32,6 +44,10 @@
     if (showUserMenu && menuWrapperEl && !menuWrapperEl.contains(e.target as Node)) {
       showUserMenu = false;
     }
+  }
+
+  function tierLabel(t: string): string {
+    return t.charAt(0).toUpperCase() + t.slice(1);
   }
 </script>
 
@@ -59,10 +75,28 @@
         </button>
       {/each}
     </nav>
+
+    <ProjectSelector />
   </div>
 
-  <!-- Right: Avatar only -->
+  <!-- Right: Tier badge + Update badge + Avatar -->
   <div class="menu-right">
+    <UpdateBadge />
+
+    <button
+      class="tier-pill"
+      class:tier-free={tier === 'free'}
+      class:tier-paid={tier !== 'free'}
+      onclick={onOpenActivation}
+      title={tier === 'free' ? 'Activate Pro' : `Tier: ${tierLabel(tier)}`}
+    >
+      {#if tier === 'free'}
+        Free tier — Activate Pro
+      {:else}
+        {tierLabel(tier)}
+      {/if}
+    </button>
+
     <div class="menu-user-wrapper" bind:this={menuWrapperEl}>
       <button class="menu-avatar" onclick={(e) => { e.stopPropagation(); showUserMenu = !showUserMenu; }}>
         <span>{$currentUser?.name?.charAt(0).toUpperCase() ?? '?'}</span>
@@ -116,14 +150,14 @@
     -webkit-app-region: drag;
   }
 
-  .menu-bar * {
+  .menu-bar :global(*) {
     -webkit-app-region: no-drag;
   }
 
   .menu-left {
     display: flex;
     align-items: center;
-    gap: 32px;
+    gap: 20px;
   }
 
   .menu-logo {
@@ -155,7 +189,7 @@
 
   .menu-nav-item {
     position: relative;
-    padding: 6px 16px;
+    padding: 6px 14px;
     font-size: 13px;
     font-weight: 600;
     color: var(--color-mid);
@@ -190,7 +224,35 @@
   .menu-right {
     display: flex;
     align-items: center;
-    gap: 12px;
+    gap: 10px;
+  }
+
+  .tier-pill {
+    padding: 4px 12px;
+    font-size: 11px;
+    font-weight: 700;
+    border-radius: 999px;
+    border: 1px solid;
+    background: none;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    text-transform: capitalize;
+  }
+  .tier-free {
+    border-color: rgba(255, 255, 255, 0.12);
+    color: var(--color-mid);
+  }
+  .tier-free:hover {
+    border-color: rgba(0, 191, 166, 0.5);
+    color: var(--color-teal);
+  }
+  .tier-paid {
+    border-color: rgba(0, 191, 166, 0.4);
+    color: var(--color-teal);
+    background: rgba(0, 191, 166, 0.08);
+  }
+  .tier-paid:hover {
+    background: rgba(0, 191, 166, 0.14);
   }
 
   .menu-user-wrapper {
