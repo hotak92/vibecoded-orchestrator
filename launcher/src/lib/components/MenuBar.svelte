@@ -2,6 +2,8 @@
   import { auth, currentUser } from '$lib/stores/auth';
   import { license } from '$lib/stores/license';
   import { ui } from '$lib/stores/ui';
+  import { selectedProject } from '$lib/stores/projects';
+  import { projectColor } from '$lib/project-color';
   import { goto } from '$app/navigation';
   import { onMount } from 'svelte';
   import ProjectSelector from './ProjectSelector.svelte';
@@ -17,6 +19,7 @@
 
   const licenseState = $derived($license);
   const tier = $derived(licenseState.cache?.orchestrator_tier ?? 'free');
+  const accent = $derived(projectColor($selectedProject?.id));
 
   onMount(() => {
     license.load();
@@ -41,7 +44,8 @@
 
 <svelte:window onclick={handleClickOutside} />
 
-<header class="menu-bar">
+<header class="menu-bar" style:--project-accent={accent}>
+  <div class="accent-strip" aria-hidden="true"></div>
   <!-- Left: Logo + project selector -->
   <div class="menu-left">
     <div class="menu-logo">
@@ -125,6 +129,16 @@
 
   .menu-bar :global(*) {
     -webkit-app-region: no-drag;
+  }
+  .accent-strip {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 3px;
+    background: var(--project-accent, transparent);
+    transition: background 0.3s ease;
+    pointer-events: none;
   }
 
   .menu-left {

@@ -12,6 +12,7 @@
   import { projects, selectedProject } from '$lib/stores/projects';
   import { pickDirectory, suggestProjectFolder } from '$lib/dialog';
   import { isTauriRuntime } from '$lib/tauri';
+  import { projectColor } from '$lib/project-color';
   import type { ProjectHost, ProjectView } from '$lib/types/launcher';
 
   let open = $state(false);
@@ -144,9 +145,12 @@
     }}
     title="Switch project"
   >
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-      <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
-    </svg>
+    <span
+      class="project-dot"
+      style:background={current ? projectColor(current.id) : 'transparent'}
+      style:border-color={current ? 'transparent' : 'rgba(255,255,255,0.2)'}
+      aria-hidden="true"
+    ></span>
     <span class="project-name">
       {current ? current.name : 'No project'}
     </span>
@@ -193,7 +197,10 @@
                 />
               {:else}
                 <button class="row-main" onclick={() => handleSelect(p.id)}>
-                  <span class="row-name">{p.name}</span>
+                  <span class="row-top">
+                    <span class="row-dot" style:background={projectColor(p.id)} aria-hidden="true"></span>
+                    <span class="row-name">{p.name}</span>
+                  </span>
                   <span class="row-meta">
                     <span class="row-host">{p.host}</span>
                     <span class="row-count">{p.module_count} module{p.module_count !== 1 ? 's' : ''}</span>
@@ -400,6 +407,25 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     max-width: 180px;
+  }
+  .project-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    border: 1px solid;
+    flex-shrink: 0;
+  }
+  .row-top {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .row-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
   }
 
   .chevron {
