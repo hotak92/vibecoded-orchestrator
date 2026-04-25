@@ -1,0 +1,88 @@
+{
+  "$schema": "https://vibecodedtools.it/schemas/vct-module-v1.json",
+  "manifest_version": 1,
+
+  "id": "vct-session-state",
+  "name": "Session State",
+  "version": "0.3.1",
+  "description": "Hooks + scripts that maintain CONTEXT_STATE.md, MEMORY.md, and compact-resume state in each project's .claude/ directory. No process — a collection of shell scripts registered with Claude Code's hook system.",
+  "publisher": "VibeCoded Tools",
+  "repository": "https://github.com/VibeCoded-Tools/orchestrator",
+
+  "category": "core",
+  "tags": ["hooks", "state", "memory", "context"],
+
+  "compatibility": {
+    "hosts": ["base", "mao"],
+    "min_launcher_version": "1.0.0"
+  },
+
+  "license": {
+    "required": false,
+    "type": "AGPL-3.0-or-later"
+  },
+
+  "requirements": {
+    "os": ["linux", "macos", "windows"],
+    "memory_mb": 16,
+    "disk_mb": 10,
+    "_windows_note": "Hooks are bash; Windows users need WSL2. PowerShell port is pending."
+  },
+
+  "install": {
+    "method": "git_clone",
+    "source": "https://github.com/VibeCoded-Tools/orchestrator.git",
+    "ref": "main",
+    "install_dir": "{VCT_MODULES}/vct-session-state",
+    "post_install": [],
+    "_note": "No venv or pip — session-state is just hook scripts. The launcher copies .claude/hooks/*.sh and .claude/scripts/*.py into each project folder when the module is enabled for that project."
+  },
+
+  "secrets": [],
+
+  "settings": [
+    {
+      "key": "CONTEXT_STATE_MAX_LINES",
+      "prompt": "Warn if CONTEXT_STATE.md exceeds N lines",
+      "description": "A session-start hook surfaces a warning if the file gets too long.",
+      "type": "integer",
+      "default": 200,
+      "min": 50,
+      "max": 2000,
+      "required": false
+    },
+    {
+      "key": "MEMORY_MAX_LINES",
+      "prompt": "Warn if MEMORY.md exceeds N lines",
+      "type": "integer",
+      "default": 200,
+      "min": 50,
+      "max": 2000,
+      "required": false
+    }
+  ],
+
+  "runtime": {
+    "type": "cli",
+    "command": "bash",
+    "args": ["{install_dir}/.claude/scripts/health-check.sh"],
+    "platform_command": {
+      "windows": "wsl"
+    },
+    "_note": "Not a long-running process. The launcher installs the hooks by copying them into the user's project .claude/hooks/ directory and registering them in .claude/settings.json. This command is invoked only when the user clicks 'Run health check' in the module dashboard."
+  },
+
+  "mcp_registration": {
+    "enabled_by_default": false,
+    "_note": "Not an MCP — hook scripts run under Claude Code's hook system, not the MCP protocol."
+  },
+
+  "upgrade": {
+    "strategy": "git_pull"
+  },
+
+  "uninstall": {
+    "remove_install_dir": true,
+    "preserve_paths": ["{VCT_DATA}/vct-session-state/"]
+  }
+}
