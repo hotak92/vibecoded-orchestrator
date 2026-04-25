@@ -1,43 +1,34 @@
-# Known Issues
+## Known Issues
 
 Tracking polish-grade items that ship with the launcher but are worth
 flagging for early adopters and the next iteration.
 
 ## Visual / UX
 
-- [ ] **Tauri-runtime visual verification of per-project color accent** —
-      the palette has 6 colorblind-safe hues per Wong 2011, and the
-      browser preview confirms the CSS plumbing (5px header strip + tinted
-      project-name pill + sidebar dots), but a real-render visual
-      distinction across 3+ projects under Tauri's bundled WebKit has
-      not been verified end-to-end. Worth re-checking under a
-      colorblind simulator before claiming the multi-tenant
-      "which project am I in?" recognition path is fully closed.
+- [ ] **Tauri visual QA of per-project accent** — verify by running
+      `npm run tauri:dev`, creating 3 projects, switching between them
+      in the MenuBar selector, and confirming the 5px strip color +
+      tinted project-name pill change distinctly per project (Wong 2011
+      colorblind-safe palette). Browser preview confirms the CSS
+      plumbing; only the bundled WebKit render path remains untested
+      end-to-end. Delete this entry after manual verification.
 
-- [ ] **Per-project URL-addressable routes** (`/p/<slug>/kg`,
-      `/p/<slug>/coordination`, etc.) are not wired yet. Project
-      identity lives in localStorage; switching projects in the
-      MenuBar selector retitles the page in place. Bookmarking a
-      specific project's KG view or sharing a deep link with a
-      teammate is therefore not supported. Tracked separately on a
-      sister branch.
+## Recently fixed
 
-- [ ] **CLI escape hatch for headless / scripted use** — the launcher
-      has no `vct-cli` companion yet, so headless installs / project
-      bootstrapping must go through the Tauri UI. Tracked separately.
+- **Audit log filters pushed into SQL.** `Db::audit_list` now accepts
+  `project_id`, `actor`, `since_ms`, `until_ms`, `search` (substring
+  match against `operation` OR `detail`) and a per-call `limit` capped
+  at 10000. The `/audit` route, the `list_audit_events` Tauri command
+  and the hub `/cli/audit` endpoint all forward these directly to the
+  query; the frontend no longer post-filters a 500-row window in JS.
+  Free-text inputs are debounced (250ms) to avoid spamming SQL on each
+  keystroke.
 
-- [ ] **Concurrency invalidation for multi-tab use** — opening the
-      same project in two windows can race on stale data; there is
-      no cross-window invalidation bus yet. Single-window use is
-      unaffected. Tracked separately.
+- **Per-project URL-addressable routes** at `/p/<slug>/...` shipped in
+  P5 (migration 003 + slug resolution).
 
-## Server-side audit filtering
+- **CLI escape hatch** shipped in P6 as `launcher/tools/vct-cli/` plus
+  the hub `/cli/*` HTTP API.
 
-- [ ] **Audit log filters are client-side over a 500-event window.**
-      Project filter is pushed to SQLite, but time-range and search
-      are computed in the browser after the fetch. For NDA-bound
-      consultant work spanning hundreds of thousands of events,
-      consider extending `list_audit_events` with `since_ms` /
-      `until_ms` / `actor` parameters and pushing the filter into
-      `db.audit_list`. Sufficient for the current scale (low
-      thousands of rows).
+- **Concurrency invalidation for multi-tab use** shipped in P7 via the
+  `change_log` table + `poll_changes` Tauri command (5s polling).
