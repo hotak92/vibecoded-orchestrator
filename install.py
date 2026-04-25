@@ -148,6 +148,10 @@ def main() -> int:
                         help="Update mode: skip clone, re-install deps + restart services")
     parser.add_argument("--quiet", action="store_true",
                         help="Minimal output")
+    parser.add_argument("--with-joern", action="store_true", default=False,
+                        help="Force-enable Joern integration for richer code-graph metrics (CFG/PDG). Skips the install prompt.")
+    parser.add_argument("--no-joern", action="store_true", default=False,
+                        help="Skip Joern detection and don't prompt to install it (~600MB JVM-based).")
     parser.add_argument("--with-agents", action="store_true", default=True,
                         help="Install free-tier Claude agents (default: on)")
     parser.add_argument("--no-agents", dest="with_agents", action="store_false",
@@ -179,7 +183,7 @@ def main() -> int:
     _print_system_info(sysinfo)
 
     # Step 2b: Optional companion tools (lean-ctx for context compression)
-    _detect_optional_companions()
+    joern_available = _detect_optional_companions(args)
 
     # Step 3: Determine embedding configuration
     embed_config = _choose_embedding_config(sysinfo, args)
@@ -211,7 +215,7 @@ def main() -> int:
 
     # Step 8: Write .env configuration (skip on update — don't overwrite user changes)
     if mode == "install":
-        _write_env_config(embed_config, args)
+        _write_env_config(embed_config, args, joern_available=joern_available)
     else:
         print("[skip] .env configuration (preserved during update)")
 
@@ -360,22 +364,113 @@ def _print_system_info(sysinfo: SystemInfo) -> None:
     pass  # Already printed in _detect_system
 
 
-def _detect_optional_companions() -> None:
+def _detect_optional_companions(args: argparse.Namespace) -> bool:
     """Check for optional companion tools that the orchestrator can leverage when present.
 
-    Currently only lean-ctx (Rust binary, global per-user install at ~/.cargo/bin/).
-    Because it's a global tool, integration is OPT-IN: the user must install it
-    themselves; we only print a hint here. Future hooks/MCP wrappers should check
-    for lean-ctx on PATH at runtime and silently no-op if missing.
+    Two checks:
+    1. lean-ctx (Rust binary at ~/.cargo/bin/) — token-compression helper, hint only.
+    2. joern (JVM-based code-property-graph tool) — when present, the code graph
+       analyzer adds CFG complexity metrics + data-flow variable lists per function
+       (`cfg_summary`, `data_flow_vars` fields on CodeFunction). When absent, we
+       skip those fields cleanly. If absent + interactive + not --no-joern, we
+       prompt the user once.
+
+    Returns True if Joern is available (whether pre-existing or freshly installed),
+    so callers can flip --cfg/--pdg defaults.
     """
     print("\n[2b/10] Optional companions ...")
 
+    # lean-ctx (hint only — global tool, opt-in install)
     if shutil.which("lean-ctx"):
         print("  lean-ctx: detected (per-user global; integrations may use it)")
     else:
         print("  lean-ctx: not installed (optional, recommended for token savings)")
         print("            install:  cargo install lean-ctx")
         print("            then re-run this installer")
+
+    # Joern (CFG/PDG metrics for code graph)
+    joern_path = shutil.which("joern")
+    if joern_path:
+        print(f"  joern:    detected at {joern_path} (code graph will include CFG/PDG metrics)")
+        return True
+
+    if args.no_joern:
+        print("  joern:    skipped (--no-joern)")
+        return False
+
+    if args.with_joern:
+        # User explicitly requested install — proceed without confirmation
+        return _install_joern()
+
+    if args.quiet or not sys.stdin.isatty():
+        # Non-interactive: hint only, don't prompt
+        print("  joern:    not installed (optional, ~600MB JVM-based)")
+        print("            adds CFG complexity + data-flow variable metrics to the code graph")
+        print("            to install:   re-run installer with --with-joern")
+        print("            to skip prompt next time:   re-run with --no-joern")
+        return False
+
+    # Interactive: ask once
+    print("  joern:    not installed (optional, ~600MB JVM-based)")
+    print("            adds CFG complexity + data-flow variable metrics to the code graph")
+    try:
+        answer = input("            Install Joern now? [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+
+    if answer not in {"y", "yes"}:
+        print("            Skipping. Re-run with --with-joern to install later.")
+        return False
+
+    return _install_joern()
+
+
+def _install_joern() -> bool:
+    """Install Joern via the official installer script.
+
+    Returns True on success, False on failure (non-fatal — the orchestrator
+    works fine without Joern).
+    """
+    print("            Installing Joern (this can take a few minutes)...")
+
+    # Joern's official installer downloads its own JDK if needed
+    install_url = "https://github.com/joernio/joern/releases/latest/download/joern-install.sh"
+    try:
+        # Download installer
+        with tempfile.NamedTemporaryFile(suffix=".sh", delete=False) as tmp:
+            urllib.request.urlretrieve(install_url, tmp.name)
+            installer_path = tmp.name
+
+        os.chmod(installer_path, 0o755)
+        # Install to ~/.local (user-local, no sudo needed). User can move/symlink later.
+        install_dir = Path.home() / ".local" / "joern"
+        result = subprocess.run(
+            [installer_path, "--dir", str(install_dir), "--no-interactive"],
+            capture_output=True, text=True, timeout=600,
+        )
+        Path(installer_path).unlink(missing_ok=True)
+
+        if result.returncode != 0:
+            print(f"            Joern install failed: {result.stderr[:300]}")
+            print("            You can install manually: https://docs.joern.io/installation/")
+            return False
+
+        # Add to PATH for current install session (user must add permanently themselves)
+        joern_bin = install_dir / "joern-cli"
+        if joern_bin.exists():
+            os.environ["PATH"] = f"{joern_bin}:{os.environ.get('PATH', '')}"
+            print(f"            Joern installed at {joern_bin}")
+            print(f"            ADD TO YOUR SHELL RC:  export PATH=\"{joern_bin}:$PATH\"")
+            return shutil.which("joern") is not None
+
+        print(f"            Joern installer ran but joern-cli not at {joern_bin}")
+        return False
+
+    except (urllib.error.URLError, subprocess.TimeoutExpired, OSError) as e:
+        print(f"            Joern install failed: {e}")
+        print("            You can install manually: https://docs.joern.io/installation/")
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -606,7 +701,7 @@ def _create_state_directory() -> None:
 # Step 8: Write .env
 # ---------------------------------------------------------------------------
 
-def _write_env_config(embed_config: dict, args: argparse.Namespace) -> None:
+def _write_env_config(embed_config: dict, args: argparse.Namespace, joern_available: bool = False) -> None:
     print("[9/10] Writing configuration ... ", end="", flush=True)
     env_file = PROJECT_ROOT / ".env"
 
@@ -636,6 +731,9 @@ def _write_env_config(embed_config: dict, args: argparse.Namespace) -> None:
         f"CODE_EMBED_DIMS={embed_config['code_dims']}",
         f"CODE_EMBED_SERVICE_URL=http://localhost:{code_embed_port}",
         f"ACTIVE_EMBEDDING=qwen3",
+        "",
+        "# Optional companion tools (auto-detected at install)",
+        f"VCT_JOERN_AVAILABLE={'1' if joern_available else '0'}",
         "",
         "# Knowledge Graph",
         "KG_COLLECTION=KnowledgeGraph",
