@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { invoke } from '@tauri-apps/api/core';
+  import { invoke } from '$lib/tauri';
   import { currentUser } from '$lib/stores/auth';
 
   let { onClose }: { onClose: () => void } = $props();
