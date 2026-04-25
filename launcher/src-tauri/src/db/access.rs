@@ -233,36 +233,92 @@ impl Db {
         Ok(())
     }
 
-    /// Read audit entries, newest first. Optionally filter by project_id.
-    /// `limit` is bounded to 1000 to keep payloads small.
+    /// Read audit entries, newest first.
+    ///
+    /// All filters are pushed into SQLite via parameterized WHERE clauses so
+    /// we don't ship large windows to the frontend just for it to throw rows
+    /// away. Earlier revisions returned up to 500 rows and let the browser
+    /// filter on time-range/actor/search; that fell over for high-volume
+    /// audit logs.
+    ///
+    /// Filter semantics:
+    ///   * `project_id` — exact match on `project_id` column.
+    ///   * `actor` — exact match on `actor` column (case-sensitive).
+    ///   * `since_ms` / `until_ms` — inclusive bounds on `created_at`
+    ///     (epoch ms). Either or both may be `None`.
+    ///   * `search` — substring match (`LIKE '%' || ? || '%'`) against
+    ///     `operation` OR `detail`. SQLite's default LIKE is
+    ///     case-insensitive for ASCII, which matches the previous
+    ///     browser-side `.toLowerCase().includes(...)` behaviour for the
+    ///     ASCII range we care about.
+    ///
+    /// `limit` is bounded to 10000 server-side. The full table scan over a
+    /// limit of that size is bounded and acceptable; we'd add a covering
+    /// index if a profile ever showed it mattered.
     pub fn audit_list(
         &self,
         project_id: Option<&str>,
+        actor: Option<&str>,
+        since_ms: Option<i64>,
+        until_ms: Option<i64>,
+        search: Option<&str>,
         limit: u32,
     ) -> Result<Vec<crate::commands::audit::AuditEvent>, String> {
         let guard = self.lock();
-        let limit = std::cmp::min(limit, 1000);
+        let limit = std::cmp::min(limit, 10000);
 
-        let (sql, has_filter) = if project_id.is_some() {
-            (
-                "SELECT id, operation, project_id, module_id, detail, actor, created_at
-                 FROM audit_log
-                 WHERE project_id = ?1
-                 ORDER BY created_at DESC
-                 LIMIT ?2",
-                true,
-            )
+        // Build the WHERE clause + bound params dynamically. Using
+        // `Vec<Box<dyn ToSql>>` keeps the param order tied to placeholder
+        // order regardless of which filters are active.
+        let mut where_parts: Vec<&'static str> = Vec::new();
+        let mut bound: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+        if let Some(pid) = project_id {
+            where_parts.push("project_id = ?");
+            bound.push(Box::new(pid.to_string()));
+        }
+        if let Some(a) = actor {
+            if !a.is_empty() {
+                where_parts.push("actor = ?");
+                bound.push(Box::new(a.to_string()));
+            }
+        }
+        if let Some(s) = since_ms {
+            where_parts.push("created_at >= ?");
+            bound.push(Box::new(s));
+        }
+        if let Some(u) = until_ms {
+            where_parts.push("created_at <= ?");
+            bound.push(Box::new(u));
+        }
+        if let Some(q) = search {
+            let q = q.trim();
+            if !q.is_empty() {
+                // Match operation OR detail. We bind the same value twice
+                // (once per `?`) — clearer than reusing one `?N` and works
+                // identically in SQLite.
+                where_parts.push("(operation LIKE '%' || ? || '%' OR detail LIKE '%' || ? || '%')");
+                bound.push(Box::new(q.to_string()));
+                bound.push(Box::new(q.to_string()));
+            }
+        }
+
+        let where_clause = if where_parts.is_empty() {
+            String::new()
         } else {
-            (
-                "SELECT id, operation, project_id, module_id, detail, actor, created_at
-                 FROM audit_log
-                 ORDER BY created_at DESC
-                 LIMIT ?1",
-                false,
-            )
+            format!(" WHERE {}", where_parts.join(" AND "))
         };
 
-        let mut stmt = guard.prepare(sql).map_err(|e| format!("audit_list prepare: {}", e))?;
+        let sql = format!(
+            "SELECT id, operation, project_id, module_id, detail, actor, created_at
+             FROM audit_log{}
+             ORDER BY created_at DESC
+             LIMIT ?",
+            where_clause
+        );
+        bound.push(Box::new(limit));
+
+        let mut stmt = guard.prepare(&sql).map_err(|e| format!("audit_list prepare: {}", e))?;
 
         let map_row = |row: &rusqlite::Row| -> rusqlite::Result<crate::commands::audit::AuditEvent> {
             Ok(crate::commands::audit::AuditEvent {
@@ -276,17 +332,13 @@ impl Db {
             })
         };
 
-        let rows: Vec<_> = if has_filter {
-            stmt.query_map(params![project_id.unwrap(), limit], map_row)
-                .map_err(|e| format!("audit_list query: {}", e))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("audit_list collect: {}", e))?
-        } else {
-            stmt.query_map(params![limit], map_row)
-                .map_err(|e| format!("audit_list query: {}", e))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("audit_list collect: {}", e))?
-        };
+        let param_refs: Vec<&dyn rusqlite::ToSql> = bound.iter().map(|b| &**b as &dyn rusqlite::ToSql).collect();
+
+        let rows: Vec<_> = stmt
+            .query_map(rusqlite::params_from_iter(param_refs.iter()), map_row)
+            .map_err(|e| format!("audit_list query: {}", e))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("audit_list collect: {}", e))?;
 
         Ok(rows)
     }
