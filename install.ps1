@@ -23,17 +23,35 @@
     Skip pulling Ollama models (manual later)
 .PARAMETER Quiet
     Minimal output
+.PARAMETER LowResource
+    Lightest mode: Jina V2 (768d) via Ollama. For low-RAM/low-VRAM machines.
+.PARAMETER WithJoern
+    Force-enable Joern integration for richer code-graph metrics (CFG/PDG).
+.PARAMETER NoJoern
+    Skip Joern detection entirely.
+.PARAMETER NoAgents
+    Skip installing Claude agents.
+.PARAMETER WithMaoAgents
+    Install MAO-tier specialist agents.
+.PARAMETER NoSkills
+    Skip installing Claude skills.
 #>
 param(
     [switch]$NoContainers,
     [switch]$Gpu,
     [switch]$CpuOnly,
+    [switch]$LowResource,
     [string]$OpenaiKey = "",
     [string]$Container = "",
     [switch]$Dev,
     [switch]$Update,
     [switch]$SkipModels,
-    [switch]$Quiet
+    [switch]$Quiet,
+    [switch]$WithJoern,
+    [switch]$NoJoern,
+    [switch]$NoAgents,
+    [switch]$WithMaoAgents,
+    [switch]$NoSkills
 )
 
 $ErrorActionPreference = "Stop"
@@ -48,12 +66,14 @@ $pythonArgs = @()
 foreach ($cmd in @("python3.12", "python3.11", "python3", "python", "py")) {
     $found = Get-Command $cmd -ErrorAction SilentlyContinue
     if ($found) {
-        $version = & $cmd -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>$null
+        # Use %-formatting (no f-strings) so a stray Python 2 doesn't abort the probe
+        $version = & $cmd -c "import sys; sys.stdout.write('%d.%d' % (sys.version_info[0], sys.version_info[1]))" 2>$null
         if ($version) {
             $parts = $version.Split(".")
             $major = [int]$parts[0]
             $minor = [int]$parts[1]
-            if ($major -ge 3 -and $minor -ge 11) {
+            # Accept major > 3, or major == 3 AND minor >= 11. Reject Python 2.x.
+            if ($major -gt 3 -or ($major -eq 3 -and $minor -ge 11)) {
                 $pythonCmd = $cmd
                 break
             }
@@ -65,8 +85,8 @@ foreach ($cmd in @("python3.12", "python3.11", "python3", "python", "py")) {
 if (-not $pythonCmd) {
     $pyLauncher = Get-Command "py" -ErrorAction SilentlyContinue
     if ($pyLauncher) {
-        foreach ($ver in @("3.12", "3.11")) {
-            $version = & py "-$ver" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>$null
+        foreach ($ver in @("3.13", "3.12", "3.11")) {
+            $version = & py "-$ver" -c "import sys; sys.stdout.write('%d.%d' % (sys.version_info[0], sys.version_info[1]))" 2>$null
             if ($LASTEXITCODE -eq 0 -and $version) {
                 $pythonCmd = "py"
                 $pythonArgs = @("-$ver")
@@ -95,15 +115,21 @@ Set-Location (Split-Path -Parent $MyInvocation.MyCommand.Path)
 
 # Build arguments for install.py
 $installArgs = @()
-if ($NoContainers) { $installArgs += "--no-containers" }
-if ($Gpu)          { $installArgs += "--gpu" }
-if ($CpuOnly)      { $installArgs += "--cpu-only" }
-if ($OpenaiKey)    { $installArgs += "--openai-key"; $installArgs += $OpenaiKey }
-if ($Container)    { $installArgs += "--container"; $installArgs += $Container }
-if ($Dev)          { $installArgs += "--dev" }
-if ($Update)       { $installArgs += "--update" }
-if ($SkipModels)   { $installArgs += "--skip-models" }
-if ($Quiet)        { $installArgs += "--quiet" }
+if ($NoContainers)  { $installArgs += "--no-containers" }
+if ($Gpu)           { $installArgs += "--gpu" }
+if ($CpuOnly)       { $installArgs += "--cpu-only" }
+if ($LowResource)   { $installArgs += "--low-resource" }
+if ($OpenaiKey)     { $installArgs += "--openai-key"; $installArgs += $OpenaiKey }
+if ($Container)     { $installArgs += "--container"; $installArgs += $Container }
+if ($Dev)           { $installArgs += "--dev" }
+if ($Update)        { $installArgs += "--update" }
+if ($SkipModels)    { $installArgs += "--skip-models" }
+if ($Quiet)         { $installArgs += "--quiet" }
+if ($WithJoern)     { $installArgs += "--with-joern" }
+if ($NoJoern)       { $installArgs += "--no-joern" }
+if ($NoAgents)      { $installArgs += "--no-agents" }
+if ($WithMaoAgents) { $installArgs += "--with-mao-agents" }
+if ($NoSkills)      { $installArgs += "--no-skills" }
 
 if ($pythonArgs.Count -gt 0) {
     & $pythonCmd @pythonArgs install.py @installArgs

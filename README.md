@@ -53,12 +53,22 @@ cd vibecoded-orchestrator
 ```
 python install.py --gpu               # Enable NVIDIA GPU acceleration
 python install.py --cpu-only          # Force CPU mode
+python install.py --low-resource      # Lightest models (low-RAM/low-VRAM machines)
 python install.py --openai-key KEY    # Use OpenAI embeddings instead of local
 python install.py --no-containers     # Skip Docker/Podman (manual setup)
 python install.py --container docker  # Force Docker (default: auto-detect)
 python install.py --no-agents         # Skip installing agent templates
 python install.py --no-skills         # Skip installing skill templates
 python install.py --with-mao-agents   # Install the 10 MAO-tier specialist agents (requires MAO license)
+python install.py --with-joern        # Install Joern for richer code-graph metrics (~600MB JVM)
+python install.py --no-joern          # Skip Joern detection (don't prompt)
+python install.py --skip-models       # Don't pre-pull Ollama models (do it manually later)
+python install.py --update            # Re-run on an existing install (preserves .env / settings)
+```
+
+For non-interactive / CI installs:
+```
+python install.py --quiet --no-joern --no-containers
 ```
 
 ### Requirements
@@ -68,6 +78,23 @@ python install.py --with-mao-agents   # Install the 10 MAO-tier specialist agent
 - **Claude Code** CLI (`npm install -g @anthropic-ai/claude-code`)
 - **Claude Max** subscription (for Claude Code access)
 - **Node.js 18+** (for Claude CLI)
+
+### Install Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `ERROR: Python 3.11+ required` | System Python is older or missing `venv` | `sudo apt install python3.12 python3-venv` (Debian/Ubuntu); `brew install python@3.12` (macOS) |
+| `Failed to create venv` | `python3-venv` package not installed (Debian-family) | `sudo apt install python3-venv` and re-run |
+| `pip upgrade` fails | Network / corporate proxy / outdated CA bundle | Set `https_proxy=...` env, or upgrade your distro CA bundle |
+| `No container runtime found` | Neither podman nor docker on `PATH` | Install Podman (`sudo apt install podman` / `brew install podman`) or Docker; or pass `--no-containers` and start them manually |
+| Compose fails on Linux with podman | `podman-compose` and the `podman compose` plugin both missing | `pip install --user podman-compose` (or upgrade Podman to 4.x+ for the plugin) |
+| Ollama timeout waiting for `/api/tags` | Container started but slow to come up on first run | Wait and re-run with `--update`; check `podman logs ollama` |
+| Ollama model pull fails | No network in container, or huge model on slow link | Re-run later with `--update`; or pull manually: `curl -X POST http://localhost:11435/api/pull -d '{"name":"qwen3-embedding:0.6b"}'` |
+| `code_embed` container fails on CPU-only host | GPU profile enabled despite no NVIDIA GPU | Run with `--cpu-only` (or `--low-resource`) — these set `CODE_EMBED_BACKEND=ollama` instead |
+| Joern download/install fails | Network blocked or JDK install rejected | Skip with `--no-joern`; install separately later from https://docs.joern.io/installation/ |
+| Hooks don't fire on Windows | Bash hooks need WSL | Install WSL (`wsl --install`) or run only the MCP/CLI parts |
+
+For deeper issues see [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
 
 ### Hardware
 
