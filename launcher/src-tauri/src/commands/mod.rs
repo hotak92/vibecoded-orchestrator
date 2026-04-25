@@ -1,4 +1,5 @@
 pub mod audit;
+pub mod changes_cmd;
 pub mod codegraph;
 pub mod coordination;
 pub mod dashboard;

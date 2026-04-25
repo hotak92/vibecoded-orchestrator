@@ -156,6 +156,30 @@ impl Db {
     }
 }
 
+/// Map an audit operation name to the table the frontend should
+/// re-fetch. Returns None for ops that already imply audit_log alone
+/// (which is always logged separately). Best-effort — unknown op names
+/// fall through to a generic "audit_log" event so consumers always get
+/// SOME signal.
+fn infer_table_for_op(op: &str) -> Option<&'static str> {
+    match op {
+        "project_create" | "project_delete" | "project_host_switch" | "project_rename" => {
+            Some("projects")
+        }
+        s if s.starts_with("module_") => Some("module_installs"),
+        s if s.starts_with("secret_") => Some("project_secret_refs"),
+        s if s.starts_with("setting_") => Some("module_settings"),
+        s if s.starts_with("kg_") => Some("kg_collection_access"),
+        s if s.starts_with("codegraph_") => Some("codegraph_access"),
+        s if s.starts_with("hook_") => Some("project_hooks"),
+        s if s.starts_with("agent_") => Some("project_agents"),
+        s if s.starts_with("skill_") => Some("project_skills"),
+        s if s.starts_with("permission_") => Some("project_permissions"),
+        s if s.starts_with("license_") => Some("tier_cache"),
+        _ => None,
+    }
+}
+
 // ─── Audit log ───────────────────────────────────────────────────────────
 
 impl Db {
@@ -166,20 +190,33 @@ impl Db {
         module_id: Option<&str>,
         detail: &serde_json::Value,
     ) -> Result<(), String> {
-        let guard = self.lock();
-        guard
-            .execute(
-                "INSERT INTO audit_log (operation, project_id, module_id, detail, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    operation,
-                    project_id,
-                    module_id,
-                    detail.to_string(),
-                    Utc::now().timestamp_millis(),
-                ],
-            )
-            .map_err(|e| format!("audit: {}", e))?;
+        {
+            let guard = self.lock();
+            guard
+                .execute(
+                    "INSERT INTO audit_log (operation, project_id, module_id, detail, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        operation,
+                        project_id,
+                        module_id,
+                        detail.to_string(),
+                        Utc::now().timestamp_millis(),
+                    ],
+                )
+                .map_err(|e| format!("audit: {}", e))?;
+        }
+
+        // Mirror every audited mutation into the change_log so frontend
+        // polling can detect cross-window edits. The `audit_log` table is
+        // ALWAYS appended to (so it itself is also "stale"); we additionally
+        // tag the high-level table affected based on the operation prefix
+        // so consumers can subscribe selectively.
+        let _ = self.log_change("audit_log", "insert", None, project_id);
+        let inferred = infer_table_for_op(operation);
+        if let Some(t) = inferred {
+            let _ = self.log_change(t, "update", module_id, project_id);
+        }
         Ok(())
     }
 

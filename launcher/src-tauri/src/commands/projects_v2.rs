@@ -18,6 +18,7 @@ pub struct ProjectView {
     pub name: String,
     pub folder_path: String,
     pub host: ProjectHost,
+    pub slug: String,
     pub created_at: i64,
     pub updated_at: i64,
     pub module_count: u32,
@@ -30,6 +31,7 @@ impl ProjectView {
             name: row.name,
             folder_path: row.folder_path,
             host: row.host,
+            slug: row.slug,
             created_at: row.created_at,
             updated_at: row.updated_at,
             module_count,
@@ -68,6 +70,21 @@ pub async fn get_project_v2(
     Ok(Some(ProjectView::from_row(row, count)))
 }
 
+/// Look up a project by its URL slug (e.g. `acme-corp`). Backs the
+/// `/p/<slug>/...` routes.
+#[command]
+pub async fn get_project_by_slug(
+    slug: String,
+    db: State<'_, Db>,
+) -> Result<Option<ProjectView>, String> {
+    let row = match db.get_project_by_slug(&slug)? {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+    let count = db.list_module_installs_for_project(&row.id)?.len() as u32;
+    Ok(Some(ProjectView::from_row(row, count)))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CreateProjectV2Request {
     pub name: String,
@@ -89,13 +106,15 @@ pub async fn create_project_v2(
     }
 
     let id = Uuid::new_v4().to_string();
-    let row = db.insert_project(&id, &req.name, &req.folder_path, req.host.clone())?;
+    let slug = db.generate_unique_slug(&req.name)?;
+    let row = db.insert_project(&id, &req.name, &req.folder_path, req.host.clone(), &slug)?;
     db.audit(
         "project_create",
         Some(&row.id),
         None,
-        &serde_json::json!({ "host": req.host.as_str(), "name": req.name }),
+        &serde_json::json!({ "host": req.host.as_str(), "name": req.name, "slug": slug }),
     )?;
+    let _ = db.log_change("projects", "insert", Some(&row.id), Some(&row.id));
     Ok(ProjectView::from_row(row, 0))
 }
 
@@ -105,11 +124,17 @@ pub async fn rename_project_v2(
     new_name: String,
     db: State<'_, Db>,
 ) -> Result<ProjectView, String> {
-    db.rename_project(&id, &new_name)?;
+    // Generate a fresh slug derived from the new name so URLs track
+    // renames. The old slug becomes invalid; existing bookmarks 404
+    // gracefully via the /p/[slug] resolver. Documented in
+    // docs/MULTI_TENANT_URLS.md.
+    let new_slug = db.generate_unique_slug(&new_name)?;
+    db.rename_project(&id, &new_name, Some(&new_slug))?;
     let row = db
         .get_project(&id)?
         .ok_or_else(|| format!("project {} not found after rename", id))?;
     let count = db.list_module_installs_for_project(&id)?.len() as u32;
+    let _ = db.log_change("projects", "update", Some(&id), Some(&id));
     Ok(ProjectView::from_row(row, count))
 }
 
@@ -169,6 +194,7 @@ pub async fn switch_project_host_v2(
             "removed_modules": removed.iter().map(|m| &m.module_id).collect::<Vec<_>>(),
         }),
     )?;
+    let _ = db.log_change("projects", "update", Some(&id), Some(&id));
 
     let project = db
         .get_project(&id)?
@@ -192,5 +218,7 @@ pub async fn delete_project_v2(
     // under ~/.vct/modules/ are removed via CASCADE through
     // module_installs. The user's project folder on disk stays.
     db.audit("project_delete", Some(&id), None, &serde_json::json!({}))?;
-    db.delete_project(&id)
+    db.delete_project(&id)?;
+    let _ = db.log_change("projects", "delete", Some(&id), Some(&id));
+    Ok(())
 }

@@ -20,6 +20,10 @@ export interface ProjectView {
   name: string;
   folder_path: string;
   host: ProjectHost;
+  /** URL-friendly slug (lowercase, dashes). Stable across renames only as
+   *  long as the name does not change — renaming regenerates the slug.
+   *  Use for /p/<slug>/... routes. */
+  slug: string;
   created_at: number;
   updated_at: number;
   module_count: number;
