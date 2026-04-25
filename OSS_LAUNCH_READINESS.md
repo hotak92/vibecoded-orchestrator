@@ -96,6 +96,15 @@ The repo had no `SECURITY.md`, `CODE_OF_CONDUCT.md`, issue/PR templates, dependa
 
 Not in this branch's scope (per user instructions, sister branches own most user-visible doc edits). Audit was applied if any sister branch claims the fix; otherwise, picks up later.
 
+### ~~M5. LICENSE-FSL removed (2026-04-26): repo is AGPL-3.0 uniformly; paid modules ship as compiled artifacts via signed-URL CDN, not under any source license.~~
+The dual AGPL/FSL story was wrong. VCThelpers stays in the OSS repo because the trust root for license validation is server-side (Supabase + Lemon Squeezy + Ed25519 signed paid-module artifacts); the on-disk validator is informational, not protective, and ships under AGPL like everything else.
+
+**Fix applied** (branch `oss/license-unify-agpl`):
+- Deleted `LICENSE-FSL`
+- Swapped 12 SPDX headers (`FSL-1.1-Apache-2.0` → `AGPL-3.0-or-later`) in `VCThelpers/` and `tests/`
+- Updated `VCThelpers/__init__.py` docstring
+- Collapsed dual-license language in `README.md`, `CLA.md`, `CONTRIBUTING.md`, `docs/POSITIONING.md`, `docs/TROUBLESHOOTING.md`, `docs/DEPENDENCY_LICENSES.md`, `.github/PULL_REQUEST_TEMPLATE.md`
+
 ---
 
 ## MINOR
@@ -106,8 +115,8 @@ Scanned for `martino|pb992|fabio|vartan|cesaratto|vibecodedtools.it|ovpdtijp|ltn
 ### ~~m2. `.gitignore` doesn't explicitly cover secret/token files~~ — FIXED (commit 197fad0)
 Added: `vct-secrets/`, `*.pat`, `*.token`, `*.pem`, `*.key` (with public-key allowlist), `OSS_LAUNCH_READINESS.md`.
 
-### m3. demo_script.md still says "AGPL-3.0" without the FSL split
-Out of scope for this branch. Left as-is. (Minor framing issue; not blocking.)
+### ~~m3. demo_script.md still says "AGPL-3.0" without the FSL split~~ — RESOLVED by M5
+Now correct: there is no FSL split. Repo is AGPL-3.0 uniformly.
 
 ### m4. `tools/vct-secrets/README.md` references missing doc — covered by B3
 Already fixed via B3 (the public `docs/VCT_SECRETS_PRIMITIVE.md` now exists).
@@ -174,7 +183,7 @@ Status as of this branch:
 - [x] No internal infrastructure URLs in source files in this branch's scope
 - [x] No personal home paths in this branch's scope (`tools/vct-secrets/git-credential-vct` was the last)
 - [x] No internal team handles in shipped User-Agents (`claude_mcp_servers/search_mcp/server.py`)
-- [x] LICENSE + LICENSE-FSL present and consistent (verified — AGPL-3.0 + FSL-1.1-Apache-2.0)
+- [x] LICENSE present and consistent — AGPL-3.0-or-later (uniform across the repo; LICENSE-FSL removed per M5)
 - [x] CLA in repo (`CLA.md`) + sign-off flow documented (`git commit -s`)
 - [x] CODE_OF_CONDUCT.md present (Contributor Covenant 2.1 verbatim)
 - [x] SECURITY.md with vuln-report contact (GitHub Security Advisories + email)
