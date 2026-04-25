@@ -899,6 +899,7 @@ def _configure_claude_settings(embed_config: dict) -> None:
     weaviate_port = os.environ.get("WEAVIATE_PORT", str(DEFAULT_WEAVIATE_PORT))
     weaviate_grpc = os.environ.get("WEAVIATE_GRPC_PORT", str(DEFAULT_WEAVIATE_GRPC_PORT))
     ollama_port = os.environ.get("OLLAMA_PORT", str(DEFAULT_OLLAMA_PORT))
+    code_embed_port = os.environ.get("CODE_EMBED_PORT", str(DEFAULT_CODE_EMBED_PORT))
 
     settings = {
         "permissions": {
@@ -917,7 +918,7 @@ def _configure_claude_settings(embed_config: dict) -> None:
             "KG_COLLECTION": "KnowledgeGraph",
             "DEVELOPMENT_COLLECTION": "Development",
             "CODE_EMBED_BACKEND": embed_config["code_backend"],
-            "CODE_EMBED_SERVICE_URL": f"http://localhost:{DEFAULT_CODE_EMBED_PORT}",
+            "CODE_EMBED_SERVICE_URL": f"http://localhost:{code_embed_port}",
         },
     }
 
