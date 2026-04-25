@@ -135,10 +135,16 @@
     top: 0;
     left: 0;
     right: 0;
-    height: 3px;
+    /* Bumped from 3px → 5px after the multi-tenant power-user flagged
+       the original strip as too thin for safety-critical "which project
+       am I in?" recognition. Paired with the tinted project-name pill
+       below, this gives two reinforcing accent surfaces. */
+    height: 5px;
     background: var(--project-accent, transparent);
-    transition: background 0.3s ease;
+    box-shadow: 0 1px 8px var(--project-accent, transparent);
+    transition: background 0.3s ease, box-shadow 0.3s ease;
     pointer-events: none;
+    opacity: 0.95;
   }
 
   .menu-left {

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
-  import { invoke } from '$lib/tauri';
+  import { invoke, safeInvoke, isTauriRuntime } from '$lib/tauri';
   import { selectedProject } from '$lib/stores/projects';
   import { toast } from '$lib/stores/toast';
   import Toast from '$lib/components/Toast.svelte';
@@ -27,16 +27,21 @@
   let telegramGroup = $state('');
 
   const project = $derived($selectedProject);
+  const inTauri = isTauriRuntime();
 
   async function load() {
     if (!project) return;
     loading = true;
     try {
-      config = await invoke<CoordinationConfig>('coordination_get_config', { projectId: project.id });
-      supabaseUrl = config.supabase_url ?? '';
-      username = config.username ?? '';
-      aliasesRaw = (config.user_aliases ?? []).join(', ');
-      telegramGroup = config.telegram_group_id ?? '';
+      // Soft read so browser preview doesn't toast-spam.
+      const result = await safeInvoke<CoordinationConfig>('coordination_get_config', { projectId: project.id });
+      config = result;
+      if (result) {
+        supabaseUrl = result.supabase_url ?? '';
+        username = result.username ?? '';
+        aliasesRaw = (result.user_aliases ?? []).join(', ');
+        telegramGroup = result.telegram_group_id ?? '';
+      }
     } catch (e) {
       toast.error(e);
     } finally {
@@ -111,7 +116,12 @@
     <h1>Coordination</h1>
   </header>
 
-  {#if !project}
+  {#if !inTauri}
+    <p class="co-empty co-placeholder">
+      Coordination requires the desktop app. Run <code>npm run tauri:dev</code>
+      from <code>launcher/</code> to configure Supabase and Telegram.
+    </p>
+  {:else if !project}
     <p class="co-empty">Select a project to configure coordination.</p>
   {:else if loading}
     <p class="co-empty">Loading…</p>
@@ -224,6 +234,17 @@
   .co-header h1 { font-size: 16px; margin: 0; }
   .co-back { background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); color: inherit; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 12px; }
   .co-empty { padding: 40px; text-align: center; color: #888; }
+  .co-placeholder {
+    max-width: 720px; margin: 14px auto;
+    padding: 12px 14px;
+    background: rgba(255,159,64,0.08);
+    border: 1px solid rgba(255,159,64,0.2);
+    border-radius: 8px;
+    color: #ffb066; font-size: 12px; text-align: left;
+  }
+  .co-placeholder code {
+    font-family: ui-monospace, monospace; color: #c4b3ff; font-size: 11px;
+  }
   .co-main { max-width: 720px; margin: 0 auto; padding: 16px; }
   .co-section { background: rgba(255,255,255,0.03); border-radius: 6px; padding: 14px; margin-bottom: 14px; }
   .co-section h2 { font-size: 13px; margin: 0 0 10px; color: #c4b3ff; }
