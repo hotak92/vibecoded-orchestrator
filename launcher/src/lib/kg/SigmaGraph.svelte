@@ -10,12 +10,18 @@
     edges,
     onNodeClick,
     onNodeContextMenu,
+    onSelectionToggle,
+    selectedIds = new Set<string>(),
     typeColors = {},
   }: {
     nodes: VizNode[];
     edges: VizEdge[];
     onNodeClick?: (node: VizNode) => void;
     onNodeContextMenu?: (node: VizNode, x: number, y: number) => void;
+    /** Called when shift-click toggles a node's selection state. */
+    onSelectionToggle?: (id: string) => void;
+    /** Reactive set of node IDs currently selected. Renders thicker stroke. */
+    selectedIds?: Set<string>;
     typeColors?: Record<string, string>;
   } = $props();
 
@@ -122,7 +128,14 @@
         });
       });
 
-      renderer.on('clickNode', ({ node }: { node: string }) => {
+      renderer.on('clickNode', (ev: any) => {
+        const node: string = ev.node;
+        const orig: MouseEvent | undefined = ev.event?.original;
+        // Shift+click toggles selection rather than firing a regular click.
+        if (orig?.shiftKey && onSelectionToggle) {
+          onSelectionToggle(node);
+          return;
+        }
         const attrs = graph.getNodeAttributes(node);
         const v: VizNode = {
           id: node,
@@ -225,6 +238,19 @@
       renderer = null;
     }
     void initGraph();
+  });
+
+  // Reactive: when the selectedIds set changes, redraw selected nodes with
+  // a larger size + teal halo. Pure visual side-effect — does not trigger
+  // a layout re-run.
+  $effect(() => {
+    if (!graph || !renderer) return;
+    graph.forEachNode((id: string) => {
+      const sel = selectedIds.has(id);
+      graph.setNodeAttribute(id, 'size', sel ? 10 : 6);
+      graph.setNodeAttribute(id, 'borderColor', sel ? '#0fc' : undefined);
+    });
+    renderer.refresh();
   });
 </script>
 
