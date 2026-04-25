@@ -16,6 +16,8 @@
     module_id: string | null;
     /** JSON-encoded string. */
     detail: string;
+    /** OS user who performed the operation. */
+    actor: string;
     /** epoch ms */
     created_at: number;
   }
@@ -25,6 +27,7 @@
   let error = $state<string | null>(null);
   let filterProject = $state<'all' | string>('all');
   let filterText = $state('');
+  let filterActor = $state('');
 
   // Time-range filter. 'custom' uses customFrom/customTo (epoch ms or
   // null = open). Server-side filtering would require extending the
@@ -32,7 +35,10 @@
   // already-fetched 500-event window for now and document.
   type RangeKey = '24h' | '7d' | '30d' | 'all' | 'custom';
   let filterRange = $state<RangeKey>('all');
-  let customFrom = $state(''); // yyyy-mm-dd or empty
+  // Hour-precision custom range — datetime-local format (yyyy-MM-ddTHH:mm).
+  // Power-user verdict flagged calendar-day-only granularity as too coarse
+  // for narrowing down a specific incident window.
+  let customFrom = $state('');
   let customTo = $state('');
 
   const inTauri = isTauriRuntime();
@@ -95,9 +101,11 @@
     if (r === '7d') return [now - 7 * 24 * 3600 * 1000, null];
     if (r === '30d') return [now - 30 * 24 * 3600 * 1000, null];
     if (r === 'custom') {
-      // Parse yyyy-mm-dd as local-midnight; "to" is end-of-day.
-      const from = customFrom ? new Date(customFrom + 'T00:00:00').getTime() : null;
-      const to = customTo ? new Date(customTo + 'T23:59:59.999').getTime() : null;
+      // datetime-local format: yyyy-MM-ddTHH:mm — interpreted as local time.
+      // new Date(s) on a missing-seconds string in local TZ is well-defined
+      // in modern browsers (and the Tauri WebView).
+      const from = customFrom ? new Date(customFrom).getTime() : null;
+      const to = customTo ? new Date(customTo).getTime() : null;
       return [from, to];
     }
     return [null, null];
@@ -106,14 +114,17 @@
   const filtered = $derived.by(() => {
     const [from, to] = rangeBounds(filterRange);
     const q = filterText.toLowerCase();
+    const actorQ = filterActor.toLowerCase().trim();
     return events.filter((e) => {
       if (from !== null && e.created_at < from) return false;
       if (to !== null && e.created_at > to) return false;
+      if (actorQ && !(e.actor ?? '').toLowerCase().includes(actorQ)) return false;
       if (!q) return true;
       return (
         e.operation.toLowerCase().includes(q) ||
         (e.project_id ?? '').toLowerCase().includes(q) ||
         (e.module_id ?? '').toLowerCase().includes(q) ||
+        (e.actor ?? '').toLowerCase().includes(q) ||
         e.detail.toLowerCase().includes(q)
       );
     });
@@ -127,13 +138,14 @@
   }
 
   function exportCsv() {
-    const header = ['timestamp_iso', 'timestamp_ms', 'operation', 'project_id', 'project_name', 'module_id', 'detail'];
+    const header = ['timestamp_iso', 'timestamp_ms', 'operation', 'actor', 'project_id', 'project_name', 'module_id', 'detail'];
     const lines = [header.join(',')];
     for (const e of filtered) {
       lines.push([
         csvCell(new Date(e.created_at).toISOString()),
         csvCell(e.created_at),
         csvCell(e.operation),
+        csvCell(e.actor),
         csvCell(e.project_id),
         csvCell(projectName(e.project_id)),
         csvCell(e.module_id),
@@ -187,19 +199,27 @@
     {#if filterRange === 'custom'}
       <label class="custom-range">
         <span>From:</span>
-        <input type="date" bind:value={customFrom} />
+        <input type="datetime-local" bind:value={customFrom} />
       </label>
       <label class="custom-range">
         <span>To:</span>
-        <input type="date" bind:value={customTo} />
+        <input type="datetime-local" bind:value={customTo} />
       </label>
     {/if}
+    <label class="actor">
+      <span>Actor:</span>
+      <input
+        type="text"
+        bind:value={filterActor}
+        placeholder="username"
+      />
+    </label>
     <label class="search">
       <span>Search:</span>
       <input
         type="text"
         bind:value={filterText}
-        placeholder="operation, project, detail…"
+        placeholder="operation, project, actor, detail…"
       />
     </label>
     <button class="btn-3d btn-3d-ghost btn-3d-sm" onclick={load} disabled={loading}>
@@ -232,6 +252,7 @@
         <tr>
           <th class="col-time">Time</th>
           <th class="col-op">Operation</th>
+          <th class="col-actor">Actor</th>
           <th class="col-project">Project</th>
           <th class="col-module">Module</th>
           <th>Detail</th>
@@ -242,6 +263,7 @@
           <tr>
             <td class="col-time">{fmtTime(e.created_at)}</td>
             <td class="col-op"><code>{e.operation}</code></td>
+            <td class="col-actor"><code>{e.actor ?? 'unknown'}</code></td>
             <td class="col-project">{projectName(e.project_id)}</td>
             <td class="col-module">{e.module_id ?? '—'}</td>
             <td class="col-detail" title={e.detail}>{detailSummary(e.detail)}</td>
@@ -249,7 +271,7 @@
         {/each}
         {#if !loading && filtered.length === 0}
           <tr>
-            <td colspan="5" class="empty">No audit events match the current filter.</td>
+            <td colspan="6" class="empty">No audit events match the current filter.</td>
           </tr>
         {/if}
       </tbody>
@@ -341,7 +363,7 @@
   .custom-range {
     display: flex; align-items: center; gap: 4px;
   }
-  .custom-range input[type="date"] {
+  .custom-range input[type="datetime-local"] {
     padding: 4px 6px;
     background: rgba(255,255,255,0.05);
     border: 1px solid rgba(255,255,255,0.1);
@@ -349,6 +371,9 @@
     color: var(--color-text);
     font-size: 11px;
     color-scheme: dark;
+  }
+  .actor input {
+    width: 130px;
   }
 
   .note {
@@ -410,6 +435,13 @@
   }
   .col-op {
     width: 200px;
+  }
+  .col-actor {
+    width: 120px;
+    white-space: nowrap;
+  }
+  .col-actor code {
+    color: var(--color-purple, #c4b3ff);
   }
   .col-project, .col-module {
     width: 140px;

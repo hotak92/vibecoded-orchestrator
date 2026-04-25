@@ -28,6 +28,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "per-project orchestrator state: agents, skills, hooks, permissions, secret refs, KG/codegraph bindings",
         sql: include_str!("migrations/002_project_state.sql"),
     },
+    Migration {
+        version: 3,
+        description: "audit_log: add actor column (OS user) for multi-user audit trails",
+        sql: include_str!("migrations/003_audit_actor.sql"),
+    },
 ];
 
 /// Apply every migration whose version is greater than the current max applied.
