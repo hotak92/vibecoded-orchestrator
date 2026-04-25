@@ -154,9 +154,11 @@ pub fn run() {
             // KG dashboard — extended (v1.1)
             commands::kg::kg_set_collection_access_mode,
             commands::kg::kg_set_node_access,
+            commands::kg::kg_set_node_access_bulk,
             commands::kg::kg_ensure_node_access_schema,
             // Codegraph — graph viz (v1.1)
             commands::codegraph::codegraph_load_graph,
+            commands::codegraph::codegraph_set_entity_access_bulk,
             // Hub proxy (v1.1)
             commands::hub_proxy::hub_info,
             commands::hub_proxy::hub_list_apps,

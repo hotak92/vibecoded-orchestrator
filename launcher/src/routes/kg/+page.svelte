@@ -19,9 +19,10 @@
   let modalOpen = $state(false);
   let modalLabel = $state('');
   let modalInitial = $state<AccessMode | null>(null);
-  let modalKind = $state<'collection' | 'node'>('collection');
+  let modalKind = $state<'collection' | 'node' | 'node-bulk'>('collection');
   let modalCollection = $state('');
   let modalNodeId = $state<string | null>(null);
+  let modalNodeIds = $state<string[]>([]);
 
   const project = $derived($selectedProject);
 
@@ -45,7 +46,19 @@
     modalKind = 'node';
     modalCollection = node.collection;
     modalNodeId = node.id;
+    modalNodeIds = [];
     modalLabel = `Node: ${node.title}`;
+    modalInitial = { mode: 'private', project_ids: [], owner_project_id: project.id };
+    modalOpen = true;
+  }
+
+  function onBulkShareNodes(nodeIds: string[]) {
+    if (!project || !activeCollection || nodeIds.length === 0) return;
+    modalKind = 'node-bulk';
+    modalCollection = activeCollection;
+    modalNodeId = null;
+    modalNodeIds = nodeIds;
+    modalLabel = `${nodeIds.length} nodes in ${activeCollection}`;
     modalInitial = { mode: 'private', project_ids: [], owner_project_id: project.id };
     modalOpen = true;
   }
@@ -61,6 +74,30 @@
           project_ids: mode.project_ids,
         },
       });
+    } else if (modalKind === 'node-bulk' && modalNodeIds.length > 0) {
+      // Ensure schema first (best effort).
+      try {
+        await invoke('kg_ensure_node_access_schema', { collection: modalCollection });
+      } catch (e) {
+        console.warn('[kg_ensure_node_access_schema]', e);
+      }
+      const result = await invoke<{ succeeded: number; failed: number; failures: { id: string; error: string }[] }>(
+        'kg_set_node_access_bulk',
+        {
+          req: {
+            project_id: project.id,
+            collection: modalCollection,
+            node_ids: modalNodeIds,
+            mode: mode.mode,
+            project_ids: mode.project_ids,
+          },
+        },
+      );
+      if (result.failed > 0) {
+        toast.error(`${result.succeeded} updated, ${result.failed} failed (first: ${result.failures[0]?.error ?? 'unknown'})`);
+      } else {
+        toast.success(`${result.succeeded} node${result.succeeded === 1 ? '' : 's'} updated`);
+      }
     } else if (modalNodeId) {
       // Ensure schema first (best effort, ignore "already exists")
       try {
@@ -112,6 +149,7 @@
         collection={activeCollection}
         onBack={backToList}
         onShareNode={onShareNode}
+        onBulkShareNodes={onBulkShareNodes}
       />
     {/if}
   </main>

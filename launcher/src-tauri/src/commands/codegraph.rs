@@ -376,3 +376,127 @@ pub async fn codegraph_load_graph(
         truncated,
     })
 }
+
+// ─── Bulk per-entity access ──────────────────────────────────────────────
+//
+// Mirrors the KG `kg_set_node_access_bulk` pattern but for codegraph
+// entities (CodeModule / CodeClass / CodeFunction / CodeAPI /
+// CodeInteraction). Stores `cross_project_access` text[] on each
+// Weaviate object — list of project IDs allowed to read this entity,
+// or ["*"] for shared. Continues on per-entity failure and returns
+// a summary.
+//
+// The acting project must own the codegraph (or be the target itself)
+// for this to make sense. We don't currently verify this against the
+// codegraph_access matrix because the matrix is project-level and an
+// owner is implicitly allowed to set per-entity scopes.
+
+#[derive(Debug, Deserialize)]
+pub struct EntityAccessBulkReq {
+    pub project_id: String,
+    /// One of: CodeModule, CodeClass, CodeFunction, CodeAPI, CodeInteraction.
+    pub entity_class: String,
+    pub entity_ids: Vec<String>,
+    pub mode: String, // shared | projects | private
+    #[serde(default)]
+    pub project_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EntityBulkAccessResult {
+    pub succeeded: usize,
+    pub failed: usize,
+    pub failures: Vec<EntityBulkFailure>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EntityBulkFailure {
+    pub id: String,
+    pub error: String,
+}
+
+#[command]
+pub async fn codegraph_set_entity_access_bulk(
+    req: EntityAccessBulkReq,
+    db: State<'_, Db>,
+) -> Result<EntityBulkAccessResult, String> {
+    if !matches!(req.mode.as_str(), "shared" | "projects" | "private") {
+        return Err(format!("invalid mode: {}", req.mode));
+    }
+    if !matches!(
+        req.entity_class.as_str(),
+        "CodeModule" | "CodeClass" | "CodeFunction" | "CodeAPI" | "CodeInteraction"
+    ) {
+        return Err(format!("invalid entity class: {}", req.entity_class));
+    }
+    if req.entity_ids.is_empty() {
+        return Ok(EntityBulkAccessResult { succeeded: 0, failed: 0, failures: vec![] });
+    }
+    db.get_project(&req.project_id)?
+        .ok_or_else(|| format!("project {} not found", req.project_id))?;
+
+    let allowed: Vec<String> = match req.mode.as_str() {
+        "shared" => vec!["*".to_string()],
+        "projects" => req.project_ids.clone(),
+        _ => vec![],
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("http client: {}", e))?;
+    let base = std::env::var("WEAVIATE_URL").unwrap_or_else(|_| "http://localhost:8081".to_string());
+
+    let mut succeeded = 0usize;
+    let mut failures: Vec<EntityBulkFailure> = Vec::new();
+    for id in &req.entity_ids {
+        let payload = serde_json::json!({
+            "class": req.entity_class,
+            "properties": { "cross_project_access": allowed },
+        });
+        let resp = client
+            .patch(format!("{}/v1/objects/{}/{}", base, req.entity_class, id))
+            .json(&payload)
+            .send()
+            .await;
+        match resp {
+            Ok(r) if r.status().is_success() => succeeded += 1,
+            Ok(r) => {
+                let status = r.status().as_u16();
+                let body = r.text().await.unwrap_or_default();
+                failures.push(EntityBulkFailure {
+                    id: id.clone(),
+                    error: format!(
+                        "weaviate returned {}: {}",
+                        status,
+                        body.chars().take(200).collect::<String>()
+                    ),
+                });
+            }
+            Err(e) => failures.push(EntityBulkFailure {
+                id: id.clone(),
+                error: format!("weaviate PATCH: {}", e),
+            }),
+        }
+    }
+
+    db.audit(
+        "codegraph_entity_access_set_bulk",
+        Some(&req.project_id),
+        None,
+        &serde_json::json!({
+            "entity_class": req.entity_class,
+            "mode": req.mode,
+            "project_count": req.project_ids.len(),
+            "entity_count": req.entity_ids.len(),
+            "succeeded": succeeded,
+            "failed": failures.len(),
+        }),
+    )?;
+
+    Ok(EntityBulkAccessResult {
+        succeeded,
+        failed: failures.len(),
+        failures,
+    })
+}
