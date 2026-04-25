@@ -20,14 +20,7 @@ By doing so you confirm you have read the CLA and agree to its terms.
 
 ### 2. Licensing
 
-This project uses a split licensing model:
-
-| Directory | License | SPDX Identifier |
-|---|---|---|
-| `claude_mcp_servers/`, `.claude/`, `knowledge/`, `config/`, `docs/` | AGPL-3.0 | `AGPL-3.0-or-later` |
-| `VCThelpers/license/`, RL retrieval modules (when published) | FSL-1.1-Apache-2.0 | `FSL-1.1-Apache-2.0` |
-
-New source files must include the appropriate SPDX header at the top:
+The entire repository is licensed under **AGPL-3.0-or-later**. New source files must include the SPDX header at the top:
 
 ```python
 # SPDX-License-Identifier: AGPL-3.0-or-later
@@ -35,6 +28,8 @@ New source files must include the appropriate SPDX header at the top:
 ```
 
 For shell scripts, use `# SPDX-License-Identifier: ...`. For JS/TS, use `// SPDX-License-Identifier: ...`.
+
+Paid modules (Pro, MAO, etc.) are distributed as pre-compiled, signed binaries via signed-URL CDN, not under any source license — there is no separate source-license tier in this repo.
 
 ---
 

@@ -31,4 +31,4 @@ If yes, describe migration path for existing users.
 - [ ] My code follows the style of the surrounding code.
 - [ ] I updated documentation where needed.
 - [ ] I did not commit secrets, hardcoded paths, or PII.
-- [ ] I did not change `LICENSE`, `LICENSE-FSL`, or `CLA.md` without prior discussion.
+- [ ] I did not change `LICENSE` or `CLA.md` without prior discussion.
