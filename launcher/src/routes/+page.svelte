@@ -8,6 +8,8 @@
   import InstallWizard from '$lib/components/InstallWizard.svelte';
   import McpDashboard from '$lib/components/McpDashboard.svelte';
   import ModuleCatalog from '$lib/components/ModuleCatalog.svelte';
+  import OnboardingWizard from '$lib/components/OnboardingWizard.svelte';
+  import ChangelogModal from '$lib/components/ChangelogModal.svelte';
   import { currentUser, auth } from '$lib/stores/auth';
   import { orchestrator } from '$lib/stores/orchestrator';
 
@@ -18,9 +20,33 @@
   let showInstallWizard = $state(false);
   let showMcpDashboard = $state(false);
 
+  // v1.1 additions
+  let showOnboarding = $state(false);
+  let showChangelog = $state(false);
+
+  function checkOnboarding() {
+    try {
+      if (localStorage.getItem('vct.onboarding_complete') !== 'true') {
+        showOnboarding = true;
+      }
+    } catch {}
+  }
+
+  function checkChangelog() {
+    // After a successful update, the updater store sets a flag we read here.
+    try {
+      if (localStorage.getItem('vct.show_changelog_after_update') === '1') {
+        localStorage.removeItem('vct.show_changelog_after_update');
+        showChangelog = true;
+      }
+    } catch {}
+  }
+
   // Check orchestrator install status on mount
   onMount(() => {
     orchestrator.checkStatus();
+    checkOnboarding();
+    checkChangelog();
   });
 
   const orchState = $derived($orchestrator);
@@ -277,6 +303,9 @@
 {#if showMcpDashboard}
   <McpDashboard onClose={() => { showMcpDashboard = false; }} />
 {/if}
+
+<OnboardingWizard bind:open={showOnboarding} />
+<ChangelogModal bind:open={showChangelog} />
 
 <style>
   .app-shell {

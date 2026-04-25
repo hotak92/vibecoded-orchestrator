@@ -7,6 +7,7 @@ mod mcp_registration;
 mod registry;
 mod secrets;
 mod state;
+mod tray;
 mod types;
 
 use state::{AppManager, ProjectState, ProjectStore};
@@ -38,7 +39,7 @@ pub fn run() {
         .manage(app_manager)
         .manage(project_store)
         .manage(db_handle)
-        .setup(|_app| {
+        .setup(|app| {
             // Start the Hub API server in the background
             tauri::async_runtime::spawn(async {
                 match hub::server::start_hub_server().await {
@@ -46,6 +47,10 @@ pub fn run() {
                     Err(e) => eprintln!("[vct] Hub server failed to start: {}", e),
                 }
             });
+            // System tray (v1.1)
+            if let Err(e) = tray::setup(&app.handle()) {
+                eprintln!("[vct] tray setup failed: {}", e);
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -151,6 +156,11 @@ pub fn run() {
             commands::kg::kg_ensure_node_access_schema,
             // Codegraph — graph viz (v1.1)
             commands::codegraph::codegraph_load_graph,
+            // Hub proxy (v1.1)
+            commands::hub_proxy::hub_info,
+            commands::hub_proxy::hub_list_apps,
+            commands::hub_proxy::hub_poll_messages,
+            commands::hub_proxy::hub_data_catalog,
             // Dashboard: tier, features, MCP management
             commands::dashboard::get_feature_flags,
             commands::dashboard::get_orchestrator_config,

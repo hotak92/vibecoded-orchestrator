@@ -222,26 +222,32 @@ export interface CoordinationConfigUpdate {
 }
 
 export interface ConnectionTestResult {
-  ok: boolean;
-  latency_ms: number;
+  reachable: boolean;
+  latency_ms: number | null;
+  auth_ok: boolean;
+  schema_applied: boolean;
   error: string | null;
 }
 
 export interface TeamMember {
   username: string;
-  online: boolean;
-  last_seen_at: number | null;
+  display_name: string;
+  role: string;
 }
 
 export interface PresenceEntry {
   username: string;
+  source: string;
   status: string;
-  updated_at: number;
+  last_seen: string;
 }
 
 export interface TeamStatus {
   members: TeamMember[];
   presence: PresenceEntry[];
+  recent_messages_count: number;
+  online_now: number;
+  connection_ok: boolean;
 }
 
 // ─── Telemetry ───────────────────────────────────────────────────────────
