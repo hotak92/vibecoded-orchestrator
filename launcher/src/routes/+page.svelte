@@ -7,10 +7,11 @@
   import ActivationModal from '$lib/components/ActivationModal.svelte';
   import InstallWizard from '$lib/components/InstallWizard.svelte';
   import McpDashboard from '$lib/components/McpDashboard.svelte';
+  import ModuleCatalog from '$lib/components/ModuleCatalog.svelte';
   import { currentUser, auth } from '$lib/stores/auth';
   import { orchestrator } from '$lib/stores/orchestrator';
 
-  type Tab = 'library' | 'store';
+  type Tab = 'library' | 'store' | 'modules';
   let activeTab = $state<Tab>('library');
   let showSettings = $state(false);
   let showActivation = $state(false);
@@ -189,6 +190,12 @@
               {/each}
             </div>
           {/if}
+
+        {:else if activeTab === 'modules'}
+          <ModuleCatalog
+            onOpenActivation={() => (showActivation = true)}
+            onOpenSettings={() => (showSettings = true)}
+          />
 
         {:else if activeTab === 'store'}
           <div class="content-header">
