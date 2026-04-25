@@ -1,4 +1,4 @@
-sentence-transformers>=5.0.0
+sentence-transformers>=5.4.1
 transformers>=4.40.0,<5.0.0
 fastapi>=0.115.0
 uvicorn>=0.30.0
