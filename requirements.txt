@@ -43,7 +43,7 @@ sentence-transformers>=3.0
 # transformers pinned for CodeSage Conv1D compatibility
 transformers>=4.40.0,<5.0.0
 # PyTorch (BSD-3-Clause) — for RL pipeline (Pro) and code embeddings (CPU fallback)
-torch>=2.0
+torch>=2.11.0
 
 # ─── FastAPI (code embedding service HTTP server) ───
 # FastAPI (MIT) + uvicorn (BSD-3-Clause)
