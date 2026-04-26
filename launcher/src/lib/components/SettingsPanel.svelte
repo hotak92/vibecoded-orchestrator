@@ -5,7 +5,7 @@
 
   let { open = $bindable(false) }: { open: boolean } = $props();
 
-  let activeSection = $state<'profile' | 'downloads' | 'secrets' | 'about'>('profile');
+  let activeSection = $state<'profile' | 'downloads' | 'secrets' | 'preferences' | 'about'>('profile');
 
   // Profile edit state
   let editName = $state($currentUser?.name ?? '');
@@ -41,8 +41,24 @@
     { id: 'profile' as const, label: 'Profile' },
     { id: 'downloads' as const, label: 'Downloads' },
     { id: 'secrets' as const, label: 'Secrets' },
+    { id: 'preferences' as const, label: 'Preferences' },
     { id: 'about' as const, label: 'About' },
   ];
+
+  // Bug 14: onboarding can only ever fire once because it gates on
+  // `vct.onboarding_complete` in localStorage. Users with a populated
+  // ~/.vct/launcher.db never see it again. Set a force flag here that the
+  // root layout reads on next reload to re-mount the wizard.
+  function rerunOnboarding() {
+    try {
+      localStorage.setItem('vct.onboarding_force', '1');
+      localStorage.removeItem('vct.onboarding_complete');
+    } catch {}
+    open = false;
+    // Trigger a reload so layout's onMount re-evaluates the gate. Avoids
+    // having to plumb the force flag through Svelte stores.
+    window.location.reload();
+  }
 </script>
 
 <svelte:window onkeydown={open ? handleKeydown : undefined} />
@@ -142,6 +158,20 @@
         {:else if activeSection === 'secrets'}
           <SecretsPanel />
 
+        {:else if activeSection === 'preferences'}
+          <h3 class="section-title">Preferences</h3>
+          <div class="form-group">
+            <p class="form-hint" style="margin-bottom: 10px;">
+              Re-runs the four-step setup wizard you saw on first launch
+              (system detection, container install, first project). Useful
+              if your local DB is stale or you want to revisit the install
+              path.
+            </p>
+            <button class="btn-3d btn-3d-primary" onclick={rerunOnboarding}>
+              Run setup wizard
+            </button>
+          </div>
+
         {:else if activeSection === 'about'}
           <h3 class="section-title">About</h3>
           <div class="about-info">
@@ -186,6 +216,8 @@
     justify-content: center;
     z-index: 300;
     animation: fade-in 0.15s ease-out;
+    padding: 16px;
+    overflow-y: auto;
   }
 
   @keyframes fade-in {
