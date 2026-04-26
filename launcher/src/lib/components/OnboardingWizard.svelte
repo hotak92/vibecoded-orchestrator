@@ -237,11 +237,11 @@
             <span>Install path</span>
             <input bind:value={installPath} />
           </label>
-          {#if sourcePath}
-            <p class="ow-secondary">
-              Copying from <code class="ow-mono">{sourcePath}</code> (local — no network needed)
-            </p>
-          {:else if sourceError}
+          <!-- Bug 27: removed the "Copying from <repo path>" line — that
+               leaked an internal implementation detail (the bundled repo
+               source path) the user doesn't need to see. We still keep
+               the sourceError surfaced so install failures get a reason. -->
+          {#if sourceError}
             <p class="ow-error">Source not found: {sourceError}</p>
           {/if}
           {#if installed}
