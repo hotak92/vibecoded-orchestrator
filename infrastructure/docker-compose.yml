@@ -20,7 +20,11 @@ services:
       retries: 5
 
   ollama:
-    image: docker.io/ollama/ollama:latest
+    # Pinned for supply-chain trust + reproducibility. Bump deliberately when
+    # validating a new ollama release; do NOT use `:latest` in production —
+    # users should know what daemon they're running, and CI should be able
+    # to reproduce builds. Ollama Linux releases: https://github.com/ollama/ollama/releases
+    image: docker.io/ollama/ollama:0.20.2
     ports:
       - "${OLLAMA_PORT:-11435}:11434"
     volumes:

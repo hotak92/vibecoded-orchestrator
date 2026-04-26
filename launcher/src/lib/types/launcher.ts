@@ -78,15 +78,22 @@ export interface ModuleCatalogEntry {
    */
   visibility?: 'public' | 'private-test';
   /**
-   * Bug 16: render hint:
+   * Bug 16 + Fix 8: render hint.
    *   - 'bundled'      → always-installed, no Install button (e.g. the launcher itself)
    *   - 'available'    → catalog-listed, has Install action
    *   - 'installed'    → installed, can be configured / uninstalled
    *   - 'subcomponent' → ships with parent module, navigate to dashboard CTA
+   *   - 'coming_soon'  → announced, not yet shipped. Renders with a Coming Soon
+   *                      badge + Learn-more CTA, no Install. Reserved for items
+   *                      with a public roadmap commitment; do NOT use for vapor.
    */
-  kind: 'bundled' | 'available' | 'installed' | 'subcomponent';
+  kind: 'bundled' | 'available' | 'installed' | 'subcomponent' | 'coming_soon';
   parent_id: string;
   cta_route: string;
+  /** For `kind === 'coming_soon'`: which tier this will ship under (e.g. 'pro'). */
+  coming_soon_tier?: string;
+  /** For `kind === 'coming_soon'`: optional public target window (e.g. 'Q3 2026'). */
+  coming_soon_target?: string;
 }
 
 export interface ModuleStatusView {

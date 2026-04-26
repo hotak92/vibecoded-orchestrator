@@ -57,8 +57,19 @@ def _resolve_endpoint(explicit: Optional[str]) -> str:
 
 
 def _disabled() -> bool:
+    """Return True iff telemetry is disabled.
+
+    Default-OFF: an unset/empty VIBECODED_TELEMETRY env var disables uploads.
+    Mirror of `collector.telemetry_enabled` so the collector and uploader
+    agree on the default — defense-in-depth: even if events were somehow
+    enqueued, the uploader still won't ship them without an explicit opt-in.
+
+    Only explicit truthy values ("true", "1", "yes", "on") enable uploads.
+    """
     env = os.environ.get("VIBECODED_TELEMETRY", "").strip().lower()
-    return env in ("false", "0", "no", "off")
+    if env in ("true", "1", "yes", "on"):
+        return False
+    return True
 
 
 def _post_json(
