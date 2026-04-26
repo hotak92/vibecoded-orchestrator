@@ -171,3 +171,96 @@ fn atomic_write_json(path: &Path, value: &serde_json::Value) -> Result<(), Strin
     fs::rename(&tmp, path).map_err(|e| format!("rename {} -> {}: {}", tmp.display(), path.display(), e))?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn tmp_target() -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "vct-mcp-reg-test-{}.json",
+            uuid::Uuid::new_v4().simple()
+        ));
+        // Don't create the file — register_mcp is supposed to handle absence.
+        p
+    }
+
+    #[test]
+    fn register_creates_file_and_writes_mcpservers_block() {
+        let target = tmp_target();
+        assert!(!target.exists());
+
+        let entry = serde_json::json!({
+            "type": "stdio",
+            "command": "/usr/bin/python",
+            "args": ["server.py"],
+            "env": {"FOO": "bar"},
+        });
+
+        register_mcp(&target, "my-mcp", &entry).expect("register_mcp");
+
+        let raw = fs::read_to_string(&target).expect("read back");
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+        // Bug 6 contract: server lives under mcpServers.<id> with the
+        // exact entry block we passed in. Earlier `add_custom_mcp_server`
+        // only wrote `env` keys to settings.json, which Claude Code does
+        // not read.
+        let server = &json["mcpServers"]["my-mcp"];
+        assert_eq!(server["type"], "stdio");
+        assert_eq!(server["command"], "/usr/bin/python");
+        assert_eq!(server["args"][0], "server.py");
+        assert_eq!(server["env"]["FOO"], "bar");
+
+        fs::remove_file(&target).ok();
+    }
+
+    #[test]
+    fn register_then_deregister_removes_only_named_entry() {
+        let target = tmp_target();
+        let a = serde_json::json!({"type": "stdio", "command": "a"});
+        let b = serde_json::json!({"type": "stdio", "command": "b"});
+        register_mcp(&target, "alpha", &a).unwrap();
+        register_mcp(&target, "beta", &b).unwrap();
+
+        deregister_mcp(&target, "alpha").unwrap();
+
+        let raw = fs::read_to_string(&target).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(json["mcpServers"].get("alpha").is_none());
+        assert_eq!(json["mcpServers"]["beta"]["command"], "b");
+
+        fs::remove_file(&target).ok();
+    }
+
+    #[test]
+    fn register_preserves_existing_top_level_keys() {
+        let target = tmp_target();
+        // Pre-seed the file with unrelated user config — register_mcp
+        // must NOT clobber it.
+        fs::write(
+            &target,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "permissions": {"allow": ["Read", "Edit"]},
+                "feedbackSurveyState": {"lastShownTime": 1234567890},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let entry = serde_json::json!({"type": "stdio", "command": "x"});
+        register_mcp(&target, "x", &entry).unwrap();
+
+        let raw = fs::read_to_string(&target).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+        // Existing keys preserved
+        assert_eq!(json["permissions"]["allow"][0], "Read");
+        assert_eq!(json["feedbackSurveyState"]["lastShownTime"], 1234567890);
+        // New key added
+        assert_eq!(json["mcpServers"]["x"]["command"], "x");
+
+        fs::remove_file(&target).ok();
+    }
+}

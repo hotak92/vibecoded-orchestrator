@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tauri::{command, Emitter, Window};
 
 const ORCHESTRATOR_REPO: &str = "https://github.com/VibeCoded-Tools/orchestrator.git";
@@ -23,6 +23,16 @@ pub struct SystemDetection {
     pub has_claude_cli: bool,
     pub has_git: bool,
     pub has_node: bool,
+    /// First container runtime found (e.g., "podman 4.7.0"), or null if none.
+    /// Frontend reads this for the onboarding "Container runtime" row.
+    pub container_runtime: Option<String>,
+    /// Total system RAM in GB (rounded). 0 if detection failed.
+    pub ram_gb: u64,
+    /// Total VRAM in GB across discovered GPUs (NVIDIA preferred, then ROCm).
+    /// 0 if no GPU detected.
+    pub vram_gb: u64,
+    /// "NVIDIA" | "AMD" | null. Used to label VRAM in the UI.
+    pub gpu_vendor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +61,58 @@ pub struct InstallResult {
     pub system: SystemDetection,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InstallMode {
+    /// Empty or non-existent target. Fresh git clone.
+    Fresh,
+    /// Target has files (git or non-git) but NO `.claude/`. We refuse the
+    /// fresh path and tell the caller to use Adopt.
+    FreshIntoExisting,
+    /// Target has `.claude/` (or other orchestrator-managed paths) — we
+    /// can adopt by overwriting only orchestrator-managed paths and
+    /// leaving everything else alone.
+    Adopt,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallDiff {
+    pub mode: InstallMode,
+    /// Orchestrator-managed paths that already exist at the target and
+    /// would be overwritten on adopt.
+    pub will_overwrite: Vec<String>,
+    /// Orchestrator-managed paths the install would create.
+    pub will_add: Vec<String>,
+    /// Anything outside the orchestrator-managed allowlist is reported
+    /// here so the UI can reassure the user "your code is safe".
+    pub user_paths_preserved: bool,
+}
+
+/// Hard whitelist of paths the orchestrator install is allowed to touch
+/// at the project root. Everything else is treated as user code.
+///
+/// Keep this list in sync with the bundled install manifest (BOOTSTRAP.md
+/// and install.py). The frontend mirrors a humanized version in the
+/// confirm modal.
+pub const ORCHESTRATOR_MANAGED_PATHS: &[&str] = &[
+    ".claude",
+    "CLAUDE.md",
+    "knowledge",
+    "claude_mcp_servers",
+    "state",
+    "config",
+    "docs",
+    "templates",
+    "tools",
+    "infrastructure",
+    "requirements.txt",
+    "requirements-dev.txt",
+    "install.sh",
+    "install.ps1",
+    "install.py",
+    "BOOTSTRAP.md",
+];
+
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
@@ -62,19 +124,47 @@ pub async fn detect_system() -> Result<SystemDetection, String> {
     let arch = std::env::consts::ARCH.to_string();
 
     // Run detections in parallel via tokio
-    let (gpu_result, docker, podman, python_result, claude, git, node) = tokio::join!(
+    let (
+        nvidia_result,
+        amd_result,
+        podman_ver,
+        docker_ver,
+        python_result,
+        claude,
+        git,
+        node,
+    ) = tokio::join!(
         detect_nvidia_gpu(),
-        check_command_exists("docker"),
-        check_command_exists("podman"),
+        detect_amd_gpu(),
+        detect_runtime_version("podman"),
+        detect_runtime_version("docker"),
         detect_python(),
         check_command_exists("claude"),
         check_command_exists("git"),
         check_command_exists("node"),
     );
 
-    let (has_nvidia, gpu_name) = gpu_result;
+    let (has_nvidia, gpu_name, nvidia_vram_gb) = nvidia_result;
+    let (has_amd, amd_vram_gb) = amd_result;
     let (has_python, python_version, python_cmd) = python_result;
     let has_apple_silicon = os == "macos" && arch == "aarch64";
+
+    let has_podman = podman_ver.is_some();
+    let has_docker = docker_ver.is_some();
+
+    // Prefer podman over docker (matches user's stated setup; both work
+    // identically downstream).
+    let container_runtime = podman_ver.clone().or_else(|| docker_ver.clone());
+
+    let (vram_gb, gpu_vendor) = if has_nvidia {
+        (nvidia_vram_gb, Some("NVIDIA".to_string()))
+    } else if has_amd {
+        (amd_vram_gb, Some("AMD".to_string()))
+    } else {
+        (0, None)
+    };
+
+    let ram_gb = detect_ram_gb();
 
     Ok(SystemDetection {
         os,
@@ -82,14 +172,18 @@ pub async fn detect_system() -> Result<SystemDetection, String> {
         has_nvidia_gpu: has_nvidia,
         gpu_name,
         has_apple_silicon,
-        has_docker: docker,
-        has_podman: podman,
+        has_docker,
+        has_podman,
         has_python,
         python_version,
         python_cmd,
         has_claude_cli: claude,
         has_git: git,
         has_node: node,
+        container_runtime,
+        ram_gb,
+        vram_gb,
+        gpu_vendor,
     })
 }
 
@@ -193,11 +287,82 @@ pub async fn check_for_updates(path: String) -> Result<bool, String> {
     Ok(false)
 }
 
+/// Classify what an install target looks like:
+/// - `Fresh` if the path doesn't exist or is empty.
+/// - `Adopt` if it has `.claude/` (or any other orchestrator-managed path).
+/// - `FreshIntoExisting` if it has user files but no orchestrator artifacts.
+pub fn classify_install_target(install_path: &Path) -> InstallMode {
+    if !install_path.exists() {
+        return InstallMode::Fresh;
+    }
+    if !install_path.is_dir() {
+        return InstallMode::FreshIntoExisting;
+    }
+
+    // Empty directory? -> Fresh
+    let entries: Vec<_> = match std::fs::read_dir(install_path) {
+        Ok(rd) => rd.flatten().collect(),
+        Err(_) => return InstallMode::Fresh,
+    };
+    if entries.is_empty() {
+        return InstallMode::Fresh;
+    }
+
+    // Look for any orchestrator-managed artifact
+    for managed in ORCHESTRATOR_MANAGED_PATHS {
+        if install_path.join(managed).exists() {
+            return InstallMode::Adopt;
+        }
+    }
+
+    InstallMode::FreshIntoExisting
+}
+
+/// Diff the bundled manifest against `install_path`. The "manifest" here
+/// is just the orchestrator-managed allowlist plus anything else our
+/// future bundle might ship — we look for what already exists at the
+/// target and report it as overwrite-candidates.
+pub fn diff_install(install_path: &Path) -> InstallDiff {
+    let mode = classify_install_target(install_path);
+
+    let mut will_overwrite: Vec<String> = Vec::new();
+    let mut will_add: Vec<String> = Vec::new();
+
+    for managed in ORCHESTRATOR_MANAGED_PATHS {
+        let p = install_path.join(managed);
+        if p.exists() {
+            will_overwrite.push(managed.to_string());
+        } else {
+            will_add.push(managed.to_string());
+        }
+    }
+
+    InstallDiff {
+        mode,
+        will_overwrite,
+        will_add,
+        user_paths_preserved: true,
+    }
+}
+
+/// Preview what install_orchestrator would do at `config.install_path`.
+/// Frontend calls this before showing the adopt-confirm modal.
+#[command]
+pub async fn preview_install(config: InstallConfig) -> Result<InstallDiff, String> {
+    let install_path = PathBuf::from(&config.install_path);
+    Ok(diff_install(&install_path))
+}
+
 /// Install the orchestrator: clone repo + run install.py.
 /// Emits "install_progress" events to the window.
+///
+/// `confirm_overwrite` must be `true` when classify_install_target reports
+/// `Adopt` — otherwise we refuse and force the caller through `preview_install`
+/// + a confirm modal first.
 #[command]
 pub async fn install_orchestrator(
     config: InstallConfig,
+    confirm_overwrite: Option<bool>,
     window: Window,
 ) -> Result<InstallResult, String> {
     let install_path = PathBuf::from(&config.install_path);
@@ -213,8 +378,30 @@ pub async fn install_orchestrator(
         ));
     }
 
-    // Stage 1: Clone
+    // Bug 8: refuse to silently overwrite existing orchestrator-managed
+    // files. Frontend must call preview_install + show a confirm modal,
+    // then re-invoke with confirm_overwrite=true.
+    let mode = classify_install_target(&install_path);
+    let confirmed = confirm_overwrite.unwrap_or(false);
+    if mode == InstallMode::Adopt && !confirmed {
+        return Err(
+            "install_path already contains orchestrator files (.claude/, knowledge/, etc.). \
+             Call preview_install first and re-invoke with confirm_overwrite=true to adopt."
+                .to_string(),
+        );
+    }
+
+    // Stage 1: Clone (or pull, or adopt-then-pull)
     emit_progress(&window, "clone", "Cloning orchestrator repository...", 5.0);
+
+    // Auto-create the install directory tree if it doesn't exist. Earlier
+    // releases required the user to `mkdir` first; the Tauri runtime test
+    // surfaced that requirement as "install fails for a freshly typed
+    // path". `create_dir_all` is idempotent so this is safe even when the
+    // path already exists.
+    tokio::fs::create_dir_all(&install_path)
+        .await
+        .map_err(|e| format!("Cannot create install directory {}: {}", install_path.display(), e))?;
 
     if install_path.join(".git").exists() {
         emit_progress(&window, "clone", "Repository already exists, pulling latest...", 10.0);
@@ -229,14 +416,26 @@ pub async fn install_orchestrator(
             let stderr = String::from_utf8_lossy(&pull.stderr);
             return Err(format!("git pull failed: {}", stderr));
         }
+    } else if mode == InstallMode::Adopt {
+        // Adopt: user has .claude/ etc. but no .git checkout of the
+        // orchestrator. Clone the orchestrator into a sibling scratch
+        // dir and copy ONLY orchestrator-managed paths over. Anything
+        // outside the allowlist (= user code) is left untouched.
+        emit_progress(&window, "clone", "Adopting existing orchestrator files...", 10.0);
+        adopt_into(&install_path).await?;
+    } else if dir_has_entries(&install_path).await {
+        // FreshIntoExisting: target has user files but no .claude/, no
+        // .git. We could co-mingle but the joint-round audit flagged
+        // this as risky. Refuse and let the user pick an empty folder
+        // or adopt-prep manually.
+        return Err(format!(
+            "{} already contains files but is not a git checkout and has no \
+             orchestrator artifacts. Pick an empty folder, or run \
+             `git init` and add a placeholder .claude/ first if you want \
+             to adopt.",
+            install_path.display()
+        ));
     } else {
-        // Create parent directory
-        if let Some(parent) = install_path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| format!("Cannot create directory: {}", e))?;
-        }
-
         let clone = tokio::process::Command::new("git")
             .args(["clone", ORCHESTRATOR_REPO, &install_path.to_string_lossy()])
             .output()
@@ -398,25 +597,208 @@ fn emit_progress(window: &Window, stage: &str, message: &str, percentage: f32) {
     );
 }
 
-async fn detect_nvidia_gpu() -> (bool, String) {
+/// Detects NVIDIA GPU + total VRAM (across all GPUs) in GB.
+/// Returns (has_gpu, first_gpu_name, total_vram_gb).
+async fn detect_nvidia_gpu() -> (bool, String, u64) {
     let result = tokio::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=name", "--format=csv,noheader,nounits"])
+        .args([
+            "--query-gpu=name,memory.total",
+            "--format=csv,noheader,nounits",
+        ])
         .output()
         .await;
 
     match result {
         Ok(output) if output.status.success() => {
-            let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if name.is_empty() {
-                (false, String::new())
+            let raw = String::from_utf8_lossy(&output.stdout);
+            let mut first_name = String::new();
+            let mut total_mib: u64 = 0;
+            for (i, line) in raw.lines().enumerate() {
+                let mut parts = line.splitn(2, ',').map(|s| s.trim());
+                let name = parts.next().unwrap_or("").to_string();
+                let mem = parts.next().unwrap_or("0");
+                if i == 0 {
+                    first_name = name.clone();
+                }
+                if let Ok(m) = mem.parse::<u64>() {
+                    total_mib = total_mib.saturating_add(m);
+                }
+            }
+            if first_name.is_empty() {
+                (false, String::new(), 0)
             } else {
-                // Take first GPU name if multiple
-                let first = name.lines().next().unwrap_or("").to_string();
-                (true, first)
+                // MiB -> GB (round to nearest)
+                let vram_gb = (total_mib as f64 / 1024.0).round() as u64;
+                (true, first_name, vram_gb)
             }
         }
-        _ => (false, String::new()),
+        _ => (false, String::new(), 0),
     }
+}
+
+/// Detect AMD/ROCm GPU + VRAM. Returns (has_gpu, total_vram_gb).
+/// rocm-smi output varies by version; we try the simplest CSV form first.
+async fn detect_amd_gpu() -> (bool, u64) {
+    let result = tokio::process::Command::new("rocm-smi")
+        .args(["--showmeminfo", "vram", "--csv"])
+        .output()
+        .await;
+    if let Ok(output) = result {
+        if output.status.success() {
+            let raw = String::from_utf8_lossy(&output.stdout);
+            // CSV columns vary; pick the largest integer that looks like
+            // bytes-of-VRAM. Conservative — better to under-report than to
+            // claim phantom VRAM.
+            let mut total_bytes: u64 = 0;
+            for line in raw.lines().skip(1) {
+                for cell in line.split(',') {
+                    if let Ok(n) = cell.trim().parse::<u64>() {
+                        if n > total_bytes && n > 1024 * 1024 * 100 {
+                            total_bytes = n;
+                        }
+                    }
+                }
+            }
+            if total_bytes > 0 {
+                return (true, (total_bytes as f64 / 1024.0 / 1024.0 / 1024.0).round() as u64);
+            }
+        }
+    }
+    (false, 0)
+}
+
+/// `which <cmd>` then `<cmd> --version` → "<cmd> <version>" or None if not
+/// installed. We swallow parse errors and fall back to just the command
+/// name so the UI never shows "podman " with a trailing space.
+async fn detect_runtime_version(cmd: &str) -> Option<String> {
+    if !check_command_exists(cmd).await {
+        return None;
+    }
+    let out = tokio::process::Command::new(cmd)
+        .arg("--version")
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return Some(cmd.to_string());
+    }
+    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    // Typical: "podman version 4.7.0" / "Docker version 27.0.3, build abc"
+    let version = raw
+        .split_whitespace()
+        .find(|tok| tok.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false))
+        .map(|s| s.trim_end_matches(',').to_string());
+    Some(match version {
+        Some(v) => format!("{} {}", cmd, v),
+        None => cmd.to_string(),
+    })
+}
+
+/// Adopt mode: clone the orchestrator into a scratch sibling directory
+/// then copy ONLY the paths in `ORCHESTRATOR_MANAGED_PATHS` over the
+/// target. Anything outside the allowlist (= user code) is left
+/// untouched.
+async fn adopt_into(target: &Path) -> Result<(), String> {
+    let scratch_root = target
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::env::temp_dir());
+    let scratch = scratch_root.join(format!(
+        ".vct-adopt-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+
+    // Cleanup if we left one behind from a previous failed run.
+    if scratch.exists() {
+        let _ = tokio::fs::remove_dir_all(&scratch).await;
+    }
+
+    let clone = tokio::process::Command::new("git")
+        .args([
+            "clone",
+            "--depth",
+            "1",
+            ORCHESTRATOR_REPO,
+            &scratch.to_string_lossy(),
+        ])
+        .output()
+        .await
+        .map_err(|e| format!("git clone (adopt scratch) failed: {}", e))?;
+
+    if !clone.status.success() {
+        let stderr = String::from_utf8_lossy(&clone.stderr);
+        return Err(format!("git clone (adopt scratch) failed: {}", stderr));
+    }
+
+    // Copy each managed path from scratch -> target. Skip any path that
+    // doesn't exist in the freshly-cloned source (some allowlist entries
+    // are optional / future-bundle).
+    for managed in ORCHESTRATOR_MANAGED_PATHS {
+        let src = scratch.join(managed);
+        let dst = target.join(managed);
+        if !src.exists() {
+            continue;
+        }
+        copy_recursive(&src, &dst).await.map_err(|e| {
+            format!("copy {} -> {}: {}", src.display(), dst.display(), e)
+        })?;
+    }
+
+    // Remove scratch.
+    let _ = tokio::fs::remove_dir_all(&scratch).await;
+    Ok(())
+}
+
+/// Recursively copy `src` to `dst`, overwriting existing files. Files
+/// only — symlinks copy by their target. Stops at first error.
+fn copy_recursive<'a>(
+    src: &'a Path,
+    dst: &'a Path,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a>> {
+    Box::pin(async move {
+        let meta = tokio::fs::metadata(src).await?;
+        if meta.is_dir() {
+            tokio::fs::create_dir_all(dst).await?;
+            let mut rd = tokio::fs::read_dir(src).await?;
+            while let Some(entry) = rd.next_entry().await? {
+                let name = entry.file_name();
+                let s = entry.path();
+                let d = dst.join(&name);
+                copy_recursive(&s, &d).await?;
+            }
+        } else {
+            if let Some(parent) = dst.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            tokio::fs::copy(src, dst).await?;
+        }
+        Ok(())
+    })
+}
+
+/// True if `path` exists, is a directory, and contains at least one entry.
+/// Returns false if path doesn't exist, isn't a directory, or read fails.
+async fn dir_has_entries(path: &Path) -> bool {
+    match tokio::fs::read_dir(path).await {
+        Ok(mut rd) => match rd.next_entry().await {
+            Ok(Some(_)) => true,
+            _ => false,
+        },
+        Err(_) => false,
+    }
+}
+
+/// Total system RAM in GB (rounded).
+fn detect_ram_gb() -> u64 {
+    use sysinfo::System;
+    let mut sys = System::new();
+    sys.refresh_memory();
+    // sysinfo 0.32 returns bytes from total_memory().
+    let bytes = sys.total_memory();
+    if bytes == 0 {
+        return 0;
+    }
+    (bytes as f64 / 1024.0 / 1024.0 / 1024.0).round() as u64
 }
 
 async fn check_command_exists(cmd: &str) -> bool {
@@ -465,4 +847,76 @@ async fn detect_python() -> (bool, String, String) {
     }
 
     (false, String::new(), String::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn tmp() -> PathBuf {
+        let p = std::env::temp_dir()
+            .join(format!("vct-installer-test-{}", uuid::Uuid::new_v4().simple()));
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn test_classify_install_target_fresh_nonexistent() {
+        let p = std::env::temp_dir()
+            .join(format!("vct-installer-no-such-{}", uuid::Uuid::new_v4().simple()));
+        assert_eq!(classify_install_target(&p), InstallMode::Fresh);
+    }
+
+    #[test]
+    fn test_classify_install_target_fresh_empty_dir() {
+        let p = tmp();
+        assert_eq!(classify_install_target(&p), InstallMode::Fresh);
+        fs::remove_dir_all(&p).ok();
+    }
+
+    #[test]
+    fn test_classify_install_target_adopt() {
+        let p = tmp();
+        fs::create_dir_all(p.join(".claude")).unwrap();
+        assert_eq!(classify_install_target(&p), InstallMode::Adopt);
+        fs::remove_dir_all(&p).ok();
+    }
+
+    #[test]
+    fn test_classify_install_target_user_code_only() {
+        let p = tmp();
+        fs::create_dir_all(p.join("src")).unwrap();
+        fs::write(p.join("src/main.py"), "print('hi')").unwrap();
+        assert_eq!(classify_install_target(&p), InstallMode::FreshIntoExisting);
+        fs::remove_dir_all(&p).ok();
+    }
+
+    #[test]
+    fn test_diff_install_overwrite_subset() {
+        let p = tmp();
+        // Two managed paths already there
+        fs::create_dir_all(p.join(".claude")).unwrap();
+        fs::create_dir_all(p.join("knowledge")).unwrap();
+
+        let diff = diff_install(&p);
+        assert_eq!(diff.mode, InstallMode::Adopt);
+        assert!(diff.will_overwrite.contains(&".claude".to_string()));
+        assert!(diff.will_overwrite.contains(&"knowledge".to_string()));
+        // CLAUDE.md doesn't exist → in will_add
+        assert!(diff.will_add.contains(&"CLAUDE.md".to_string()));
+        assert!(diff.user_paths_preserved);
+        fs::remove_dir_all(&p).ok();
+    }
+
+    #[test]
+    fn test_diff_install_fresh_target_all_added() {
+        let p = tmp();
+        let diff = diff_install(&p);
+        assert_eq!(diff.mode, InstallMode::Fresh);
+        assert!(diff.will_overwrite.is_empty());
+        assert_eq!(diff.will_add.len(), ORCHESTRATOR_MANAGED_PATHS.len());
+        fs::remove_dir_all(&p).ok();
+    }
 }

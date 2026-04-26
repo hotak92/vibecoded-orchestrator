@@ -98,8 +98,16 @@ pub async fn create_project_v2(
     db: State<'_, Db>,
 ) -> Result<ProjectView, String> {
     let folder = Path::new(&req.folder_path);
+
+    // Bug 3e: auto-create the folder if it doesn't exist. Earlier the
+    // create flow rejected non-existent paths and forced the user to
+    // `mkdir -p` manually, which broke when users typed a fresh path
+    // in the New Project modal. `create_dir_all` is a no-op if the
+    // path already exists.
     if !folder.exists() {
-        return Err(format!("folder does not exist: {}", req.folder_path));
+        std::fs::create_dir_all(folder).map_err(|e| {
+            format!("cannot create folder {}: {}", req.folder_path, e)
+        })?;
     }
     if !folder.is_dir() {
         return Err(format!("not a directory: {}", req.folder_path));

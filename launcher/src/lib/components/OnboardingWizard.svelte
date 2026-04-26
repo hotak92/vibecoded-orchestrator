@@ -22,6 +22,19 @@
   let installed = $state(false);
   let installError = $state<string | null>(null);
 
+  // Bug 8: adopt-confirm modal. Populated by `previewInstall` before
+  // any actual write happens. If `mode === 'adopt'` we show the diff and
+  // require explicit confirmation; otherwise we proceed straight to
+  // install.
+  type InstallMode = 'fresh' | 'fresh_into_existing' | 'adopt';
+  interface InstallDiff {
+    mode: InstallMode;
+    will_overwrite: string[];
+    will_add: string[];
+    user_paths_preserved: boolean;
+  }
+  let pendingDiff = $state<InstallDiff | null>(null);
+
   async function loadStep2() {
     try {
       detection = await invoke<any>('detect_system');
@@ -32,21 +45,60 @@
     }
   }
 
-  async function runInstall() {
+  function buildInstallConfig() {
+    return {
+      install_path: installPath,
+      use_gpu: false,
+      cpu_only: false,
+      openai_key: null,
+      container_runtime: null,
+      skip_containers: false,
+    };
+  }
+
+  async function runInstall(confirmOverwrite = false) {
     installing = true;
     installError = null;
     try {
+      // Bug 8: preview before write. If the target is an Adopt-style
+      // folder (has .claude/, knowledge/, etc.) and the user hasn't
+      // confirmed yet, show the diff modal and stop here.
+      if (!confirmOverwrite) {
+        const diff = await invoke<InstallDiff>('preview_install', {
+          config: buildInstallConfig(),
+        });
+        if (diff.mode === 'adopt' && diff.will_overwrite.length > 0) {
+          pendingDiff = diff;
+          installing = false;
+          return;
+        }
+      }
+
+      // Tauri serializes the command arg name (`config`) as the JSON key,
+      // so the payload must wrap install_path inside `config`. Earlier
+      // versions sent `{ path, config: {} }` which Tauri rejected as
+      // "missing field 'install_path'".
       await invoke('install_orchestrator', {
-        path: installPath,
-        config: {},
+        config: buildInstallConfig(),
+        confirmOverwrite,
       });
       installed = true;
+      pendingDiff = null;
       toast.success('Orchestrator installed');
     } catch (e) {
       installError = String(e);
     } finally {
       installing = false;
     }
+  }
+
+  async function confirmAdopt() {
+    pendingDiff = null;
+    await runInstall(true);
+  }
+  function cancelAdopt() {
+    pendingDiff = null;
+    installing = false;
   }
 
   function finish() {
@@ -109,11 +161,33 @@
           {:else}
             <table class="ow-table">
               <tbody>
-                <tr><th>OS</th><td>{detection.os ?? '—'}</td></tr>
-                <tr><th>Arch</th><td>{detection.arch ?? '—'}</td></tr>
-                <tr><th>Python</th><td>{detection.python_version ?? 'not found'}</td></tr>
-                <tr><th>Container runtime</th><td>{detection.container_runtime ?? 'not found'}</td></tr>
-                <tr><th>RAM</th><td>{detection.ram_gb ?? '—'} GB</td></tr>
+                <tr><th>OS</th><td>{detection.os ?? '—'} {detection.arch ?? ''}</td></tr>
+                <tr>
+                  <th>Python</th>
+                  <td>{detection.has_python ? `Python ${detection.python_version}` : 'not found'}</td>
+                </tr>
+                <tr>
+                  <th>Container runtime</th>
+                  <td>{detection.container_runtime ?? 'not found (install podman or docker)'}</td>
+                </tr>
+                <tr>
+                  <th>RAM</th>
+                  <td>{detection.ram_gb ? `${detection.ram_gb} GB` : '—'}</td>
+                </tr>
+                <tr>
+                  <th>GPU</th>
+                  <td>
+                    {#if detection.has_nvidia_gpu}
+                      {detection.gpu_name} — {detection.vram_gb ? `${detection.vram_gb} GB VRAM (${detection.gpu_vendor ?? 'NVIDIA'})` : 'NVIDIA'}
+                    {:else if detection.gpu_vendor === 'AMD'}
+                      {detection.vram_gb ? `${detection.vram_gb} GB VRAM (AMD)` : 'AMD'}
+                    {:else if detection.has_apple_silicon}
+                      Apple Silicon (unified memory)
+                    {:else}
+                      none detected (CPU only)
+                    {/if}
+                  </td>
+                </tr>
               </tbody>
             </table>
             <p class="ow-secondary">If something is missing, install it before continuing.</p>
@@ -126,11 +200,41 @@
           {#if installed}
             <p class="ow-ok">Orchestrator already installed at this path.</p>
           {:else}
-            <button class="ow-btn-primary" onclick={runInstall} disabled={installing}>
+            <button class="ow-btn-primary" onclick={() => runInstall(false)} disabled={installing}>
               {installing ? 'Installing…' : 'Install orchestrator'}
             </button>
           {/if}
           {#if installError}<p class="ow-error">{installError}</p>{/if}
+
+          {#if pendingDiff}
+            <div class="ow-diff">
+              <h3>Existing orchestrator files detected</h3>
+              <p class="ow-secondary ow-banner">
+                Your code outside <code>.claude/</code>, <code>knowledge/</code>,
+                <code>state/</code>, etc. will <strong>not</strong> be touched.
+              </p>
+              {#if pendingDiff.will_overwrite.length}
+                <details open>
+                  <summary>Will overwrite ({pendingDiff.will_overwrite.length})</summary>
+                  <ul class="ow-paths">
+                    {#each pendingDiff.will_overwrite as p}<li><code>{p}</code></li>{/each}
+                  </ul>
+                </details>
+              {/if}
+              {#if pendingDiff.will_add.length}
+                <details>
+                  <summary>Will add ({pendingDiff.will_add.length})</summary>
+                  <ul class="ow-paths">
+                    {#each pendingDiff.will_add as p}<li><code>{p}</code></li>{/each}
+                  </ul>
+                </details>
+              {/if}
+              <div class="ow-diff-actions">
+                <button class="ow-btn" onclick={cancelAdopt}>Cancel</button>
+                <button class="ow-btn-primary" onclick={confirmAdopt}>Confirm adopt</button>
+              </div>
+            </div>
+          {/if}
         {:else if step === 4}
           <p>Time to create your first project.</p>
           <p class="ow-secondary">
@@ -186,4 +290,14 @@
   .ow-btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
   .ow-btn-link { background: none; border: none; color: #888; }
   .ow-btn-link:hover { color: #ccc; }
+
+  .ow-diff { margin-top: 12px; padding: 10px 12px; border: 1px solid rgba(0,191,166,0.25); background: rgba(0,191,166,0.05); border-radius: 6px; }
+  .ow-diff h3 { font-size: 13px; margin: 0 0 6px; color: #ccc; }
+  .ow-banner { margin: 0 0 8px; }
+  .ow-banner code { background: rgba(255,255,255,0.06); padding: 1px 4px; border-radius: 3px; font-family: ui-monospace, monospace; font-size: 11px; }
+  .ow-paths { list-style: none; padding: 4px 0 0 12px; margin: 0; max-height: 120px; overflow-y: auto; font-size: 11px; }
+  .ow-paths li { padding: 2px 0; color: #ccc; }
+  .ow-paths code { font-family: ui-monospace, monospace; font-size: 11px; color: #c4b3ff; }
+  .ow-diff details summary { cursor: pointer; font-size: 12px; color: #0fc; padding: 4px 0; }
+  .ow-diff-actions { display: flex; justify-content: flex-end; gap: 6px; margin-top: 10px; }
 </style>

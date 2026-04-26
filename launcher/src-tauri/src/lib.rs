@@ -154,6 +154,7 @@ pub fn run() {
             commands::installer::get_installed_version,
             commands::installer::check_for_updates,
             commands::installer::install_orchestrator,
+            commands::installer::preview_install,
             commands::installer::update_orchestrator,
             // KG dashboard — extended (v1.1)
             commands::kg::kg_set_collection_access_mode,
