@@ -536,7 +536,7 @@ mod tests {
     }
 
     #[test]
-    fn write_project_env_files_creates_both_paths() {
+    fn write_project_env_files_creates_all_three_paths() {
         let tmp = std::env::temp_dir().join(format!(
             "vct-env-test-{}",
             uuid::Uuid::new_v4().simple()
@@ -545,7 +545,7 @@ mod tests {
 
         write_project_env_files(&tmp, "My Test").unwrap();
 
-        // VS Code path
+        // 1. VS Code path
         let vscode_settings = tmp.join(".vscode/settings.json");
         assert!(vscode_settings.exists());
         let raw = std::fs::read_to_string(&vscode_settings).unwrap();
@@ -556,13 +556,84 @@ mod tests {
         assert_eq!(env["DEVELOPMENT_COLLECTION"], "MyTest_development");
         assert_eq!(env["CONVERSATION_COLLECTION"], "MyTest_conversations");
 
-        // CLI path
+        // 2. CLI shell file path
         let claude_env = tmp.join(".claude/env");
         assert!(claude_env.exists());
         let env_raw = std::fs::read_to_string(&claude_env).unwrap();
         assert!(env_raw.contains(r#"export KG_COLLECTION="MyTest""#));
         assert!(env_raw.contains(r#"export PROJECT_NAME="MyTest""#));
         assert!(env_raw.contains(r#"export DEVELOPMENT_COLLECTION="MyTest_development""#));
+
+        // 3. Bug 30: canonical .claude/settings.json env block
+        let claude_settings = tmp.join(".claude/settings.json");
+        assert!(claude_settings.exists());
+        let raw = std::fs::read_to_string(&claude_settings).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let env = &parsed["env"];
+        assert_eq!(env["KG_COLLECTION"], "MyTest");
+        assert_eq!(env["PROJECT_NAME"], "MyTest");
+        assert_eq!(env["DEVELOPMENT_COLLECTION"], "MyTest_development");
+        assert_eq!(env["CONVERSATION_COLLECTION"], "MyTest_conversations");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Bug 30: existing `.claude/settings.json` content (hooks, permissions,
+    /// agents config, etc.) MUST be preserved when we inject the env block.
+    /// Read-merge-write semantics; only the top-level `env` key is touched.
+    #[test]
+    fn write_preserves_existing_claude_settings_json() {
+        let tmp = std::env::temp_dir().join(format!(
+            "vct-merge-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&tmp.join(".claude")).unwrap();
+        let path = tmp.join(".claude/settings.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "hooks": {"PreToolUse": [{"matcher": "*", "hooks": []}]},
+                "permissions": {"allow": ["Read"]},
+                "env": {"OLD_KEY": "old_value"}
+            }"#,
+        )
+        .unwrap();
+
+        write_project_env_files(&tmp, "MyProject").unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+        // env block was replaced with our values
+        assert_eq!(v["env"]["KG_COLLECTION"], "MyProject");
+        assert_eq!(v["env"]["PROJECT_NAME"], "MyProject");
+        // Old env keys are gone — top-level env is replaced wholesale.
+        assert!(v["env"].get("OLD_KEY").is_none());
+        // existing hooks + permissions preserved untouched
+        assert!(v["hooks"]["PreToolUse"].is_array());
+        assert!(v["permissions"]["allow"].is_array());
+        assert_eq!(v["permissions"]["allow"][0], "Read");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Bug 30: corrupted `.claude/settings.json` must not crash project
+    /// creation. We log a warning and overwrite with a minimal env block.
+    #[test]
+    fn write_handles_corrupted_claude_settings_json() {
+        let tmp = std::env::temp_dir().join(format!(
+            "vct-corrupt-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&tmp.join(".claude")).unwrap();
+        let path = tmp.join(".claude/settings.json");
+        std::fs::write(&path, "{ this is not valid json").unwrap();
+
+        write_project_env_files(&tmp, "MyProject").expect("must not crash");
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["env"]["KG_COLLECTION"], "MyProject");
 
         std::fs::remove_dir_all(&tmp).ok();
     }
