@@ -36,9 +36,19 @@
     installing = true;
     installError = null;
     try {
+      // Tauri serializes the command arg name (`config`) as the JSON key,
+      // so the payload must wrap install_path inside `config`. Earlier
+      // versions sent `{ path, config: {} }` which Tauri rejected as
+      // "missing field 'install_path'".
       await invoke('install_orchestrator', {
-        path: installPath,
-        config: {},
+        config: {
+          install_path: installPath,
+          use_gpu: false,
+          cpu_only: false,
+          openai_key: null,
+          container_runtime: null,
+          skip_containers: false,
+        },
       });
       installed = true;
       toast.success('Orchestrator installed');
@@ -109,11 +119,33 @@
           {:else}
             <table class="ow-table">
               <tbody>
-                <tr><th>OS</th><td>{detection.os ?? '—'}</td></tr>
-                <tr><th>Arch</th><td>{detection.arch ?? '—'}</td></tr>
-                <tr><th>Python</th><td>{detection.python_version ?? 'not found'}</td></tr>
-                <tr><th>Container runtime</th><td>{detection.container_runtime ?? 'not found'}</td></tr>
-                <tr><th>RAM</th><td>{detection.ram_gb ?? '—'} GB</td></tr>
+                <tr><th>OS</th><td>{detection.os ?? '—'} {detection.arch ?? ''}</td></tr>
+                <tr>
+                  <th>Python</th>
+                  <td>{detection.has_python ? `Python ${detection.python_version}` : 'not found'}</td>
+                </tr>
+                <tr>
+                  <th>Container runtime</th>
+                  <td>{detection.container_runtime ?? 'not found (install podman or docker)'}</td>
+                </tr>
+                <tr>
+                  <th>RAM</th>
+                  <td>{detection.ram_gb ? `${detection.ram_gb} GB` : '—'}</td>
+                </tr>
+                <tr>
+                  <th>GPU</th>
+                  <td>
+                    {#if detection.has_nvidia_gpu}
+                      {detection.gpu_name} — {detection.vram_gb ? `${detection.vram_gb} GB VRAM (${detection.gpu_vendor ?? 'NVIDIA'})` : 'NVIDIA'}
+                    {:else if detection.gpu_vendor === 'AMD'}
+                      {detection.vram_gb ? `${detection.vram_gb} GB VRAM (AMD)` : 'AMD'}
+                    {:else if detection.has_apple_silicon}
+                      Apple Silicon (unified memory)
+                    {:else}
+                      none detected (CPU only)
+                    {/if}
+                  </td>
+                </tr>
               </tbody>
             </table>
             <p class="ow-secondary">If something is missing, install it before continuing.</p>

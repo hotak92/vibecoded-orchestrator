@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tauri::{command, Emitter, Window};
 
 const ORCHESTRATOR_REPO: &str = "https://github.com/VibeCoded-Tools/orchestrator.git";
@@ -23,6 +23,16 @@ pub struct SystemDetection {
     pub has_claude_cli: bool,
     pub has_git: bool,
     pub has_node: bool,
+    /// First container runtime found (e.g., "podman 4.7.0"), or null if none.
+    /// Frontend reads this for the onboarding "Container runtime" row.
+    pub container_runtime: Option<String>,
+    /// Total system RAM in GB (rounded). 0 if detection failed.
+    pub ram_gb: u64,
+    /// Total VRAM in GB across discovered GPUs (NVIDIA preferred, then ROCm).
+    /// 0 if no GPU detected.
+    pub vram_gb: u64,
+    /// "NVIDIA" | "AMD" | null. Used to label VRAM in the UI.
+    pub gpu_vendor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,19 +72,47 @@ pub async fn detect_system() -> Result<SystemDetection, String> {
     let arch = std::env::consts::ARCH.to_string();
 
     // Run detections in parallel via tokio
-    let (gpu_result, docker, podman, python_result, claude, git, node) = tokio::join!(
+    let (
+        nvidia_result,
+        amd_result,
+        podman_ver,
+        docker_ver,
+        python_result,
+        claude,
+        git,
+        node,
+    ) = tokio::join!(
         detect_nvidia_gpu(),
-        check_command_exists("docker"),
-        check_command_exists("podman"),
+        detect_amd_gpu(),
+        detect_runtime_version("podman"),
+        detect_runtime_version("docker"),
         detect_python(),
         check_command_exists("claude"),
         check_command_exists("git"),
         check_command_exists("node"),
     );
 
-    let (has_nvidia, gpu_name) = gpu_result;
+    let (has_nvidia, gpu_name, nvidia_vram_gb) = nvidia_result;
+    let (has_amd, amd_vram_gb) = amd_result;
     let (has_python, python_version, python_cmd) = python_result;
     let has_apple_silicon = os == "macos" && arch == "aarch64";
+
+    let has_podman = podman_ver.is_some();
+    let has_docker = docker_ver.is_some();
+
+    // Prefer podman over docker (matches user's stated setup; both work
+    // identically downstream).
+    let container_runtime = podman_ver.clone().or_else(|| docker_ver.clone());
+
+    let (vram_gb, gpu_vendor) = if has_nvidia {
+        (nvidia_vram_gb, Some("NVIDIA".to_string()))
+    } else if has_amd {
+        (amd_vram_gb, Some("AMD".to_string()))
+    } else {
+        (0, None)
+    };
+
+    let ram_gb = detect_ram_gb();
 
     Ok(SystemDetection {
         os,
@@ -82,14 +120,18 @@ pub async fn detect_system() -> Result<SystemDetection, String> {
         has_nvidia_gpu: has_nvidia,
         gpu_name,
         has_apple_silicon,
-        has_docker: docker,
-        has_podman: podman,
+        has_docker,
+        has_podman,
         has_python,
         python_version,
         python_cmd,
         has_claude_cli: claude,
         has_git: git,
         has_node: node,
+        container_runtime,
+        ram_gb,
+        vram_gb,
+        gpu_vendor,
     })
 }
 
@@ -213,8 +255,17 @@ pub async fn install_orchestrator(
         ));
     }
 
-    // Stage 1: Clone
+    // Stage 1: Clone (or pull, or adopt-then-pull)
     emit_progress(&window, "clone", "Cloning orchestrator repository...", 5.0);
+
+    // Auto-create the install directory tree if it doesn't exist. Earlier
+    // releases required the user to `mkdir` first; the Tauri runtime test
+    // surfaced that requirement as "install fails for a freshly typed
+    // path". `create_dir_all` is idempotent so this is safe even when the
+    // path already exists.
+    tokio::fs::create_dir_all(&install_path)
+        .await
+        .map_err(|e| format!("Cannot create install directory {}: {}", install_path.display(), e))?;
 
     if install_path.join(".git").exists() {
         emit_progress(&window, "clone", "Repository already exists, pulling latest...", 10.0);
@@ -229,14 +280,18 @@ pub async fn install_orchestrator(
             let stderr = String::from_utf8_lossy(&pull.stderr);
             return Err(format!("git pull failed: {}", stderr));
         }
+    } else if dir_has_entries(&install_path).await {
+        // Path is non-empty but isn't a git checkout. With bug 8 (adopt
+        // existing project) we expect callers to either route to the
+        // adopt path or pass `confirm_overwrite=true`. For now, refuse
+        // with a clear message rather than blowing away the user's code.
+        return Err(format!(
+            "{} already contains files but is not a git checkout. \
+             Use the 'Adopt existing project' flow if this is an existing \
+             orchestrator install, or pick an empty folder.",
+            install_path.display()
+        ));
     } else {
-        // Create parent directory
-        if let Some(parent) = install_path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| format!("Cannot create directory: {}", e))?;
-        }
-
         let clone = tokio::process::Command::new("git")
             .args(["clone", ORCHESTRATOR_REPO, &install_path.to_string_lossy()])
             .output()
@@ -398,25 +453,126 @@ fn emit_progress(window: &Window, stage: &str, message: &str, percentage: f32) {
     );
 }
 
-async fn detect_nvidia_gpu() -> (bool, String) {
+/// Detects NVIDIA GPU + total VRAM (across all GPUs) in GB.
+/// Returns (has_gpu, first_gpu_name, total_vram_gb).
+async fn detect_nvidia_gpu() -> (bool, String, u64) {
     let result = tokio::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=name", "--format=csv,noheader,nounits"])
+        .args([
+            "--query-gpu=name,memory.total",
+            "--format=csv,noheader,nounits",
+        ])
         .output()
         .await;
 
     match result {
         Ok(output) if output.status.success() => {
-            let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if name.is_empty() {
-                (false, String::new())
+            let raw = String::from_utf8_lossy(&output.stdout);
+            let mut first_name = String::new();
+            let mut total_mib: u64 = 0;
+            for (i, line) in raw.lines().enumerate() {
+                let mut parts = line.splitn(2, ',').map(|s| s.trim());
+                let name = parts.next().unwrap_or("").to_string();
+                let mem = parts.next().unwrap_or("0");
+                if i == 0 {
+                    first_name = name.clone();
+                }
+                if let Ok(m) = mem.parse::<u64>() {
+                    total_mib = total_mib.saturating_add(m);
+                }
+            }
+            if first_name.is_empty() {
+                (false, String::new(), 0)
             } else {
-                // Take first GPU name if multiple
-                let first = name.lines().next().unwrap_or("").to_string();
-                (true, first)
+                // MiB -> GB (round to nearest)
+                let vram_gb = (total_mib as f64 / 1024.0).round() as u64;
+                (true, first_name, vram_gb)
             }
         }
-        _ => (false, String::new()),
+        _ => (false, String::new(), 0),
     }
+}
+
+/// Detect AMD/ROCm GPU + VRAM. Returns (has_gpu, total_vram_gb).
+/// rocm-smi output varies by version; we try the simplest CSV form first.
+async fn detect_amd_gpu() -> (bool, u64) {
+    let result = tokio::process::Command::new("rocm-smi")
+        .args(["--showmeminfo", "vram", "--csv"])
+        .output()
+        .await;
+    if let Ok(output) = result {
+        if output.status.success() {
+            let raw = String::from_utf8_lossy(&output.stdout);
+            // CSV columns vary; pick the largest integer that looks like
+            // bytes-of-VRAM. Conservative — better to under-report than to
+            // claim phantom VRAM.
+            let mut total_bytes: u64 = 0;
+            for line in raw.lines().skip(1) {
+                for cell in line.split(',') {
+                    if let Ok(n) = cell.trim().parse::<u64>() {
+                        if n > total_bytes && n > 1024 * 1024 * 100 {
+                            total_bytes = n;
+                        }
+                    }
+                }
+            }
+            if total_bytes > 0 {
+                return (true, (total_bytes as f64 / 1024.0 / 1024.0 / 1024.0).round() as u64);
+            }
+        }
+    }
+    (false, 0)
+}
+
+/// `which <cmd>` then `<cmd> --version` → "<cmd> <version>" or None if not
+/// installed. We swallow parse errors and fall back to just the command
+/// name so the UI never shows "podman " with a trailing space.
+async fn detect_runtime_version(cmd: &str) -> Option<String> {
+    if !check_command_exists(cmd).await {
+        return None;
+    }
+    let out = tokio::process::Command::new(cmd)
+        .arg("--version")
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return Some(cmd.to_string());
+    }
+    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    // Typical: "podman version 4.7.0" / "Docker version 27.0.3, build abc"
+    let version = raw
+        .split_whitespace()
+        .find(|tok| tok.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false))
+        .map(|s| s.trim_end_matches(',').to_string());
+    Some(match version {
+        Some(v) => format!("{} {}", cmd, v),
+        None => cmd.to_string(),
+    })
+}
+
+/// True if `path` exists, is a directory, and contains at least one entry.
+/// Returns false if path doesn't exist, isn't a directory, or read fails.
+async fn dir_has_entries(path: &Path) -> bool {
+    match tokio::fs::read_dir(path).await {
+        Ok(mut rd) => match rd.next_entry().await {
+            Ok(Some(_)) => true,
+            _ => false,
+        },
+        Err(_) => false,
+    }
+}
+
+/// Total system RAM in GB (rounded).
+fn detect_ram_gb() -> u64 {
+    use sysinfo::System;
+    let mut sys = System::new();
+    sys.refresh_memory();
+    // sysinfo 0.32 returns bytes from total_memory().
+    let bytes = sys.total_memory();
+    if bytes == 0 {
+        return 0;
+    }
+    (bytes as f64 / 1024.0 / 1024.0 / 1024.0).round() as u64
 }
 
 async fn check_command_exists(cmd: &str) -> bool {
