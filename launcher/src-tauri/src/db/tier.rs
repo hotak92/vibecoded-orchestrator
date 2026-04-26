@@ -37,7 +37,12 @@ impl Db {
         module_licenses: &Value,
         error: Option<&str>,
     ) -> Result<(), String> {
-        if !matches!(orchestrator_tier, "free" | "pro" | "mao" | "enterprise") {
+        // Bug 33: "admin" is server-classified via LS_ADMIN_VARIANT_IDS.
+        // Treated as a strict superset of "enterprise" by feature gates.
+        if !matches!(
+            orchestrator_tier,
+            "free" | "pro" | "mao" | "enterprise" | "admin"
+        ) {
             return Err(format!("invalid tier: {}", orchestrator_tier));
         }
         let guard = self.lock();

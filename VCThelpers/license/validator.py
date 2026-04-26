@@ -48,8 +48,23 @@ from typing import Literal, Optional
 
 log = logging.getLogger(__name__)
 
-Tier = Literal["free", "pro", "mao", "enterprise"]
-TIER_ORDER: dict[Tier, int] = {"free": 0, "pro": 1, "mao": 2, "enterprise": 3}
+Tier = Literal["free", "pro", "mao", "enterprise", "admin"]
+# Bug 33: `admin` is a server-classified tier (not present in any
+# public variant map). Treated as a strict superset of `enterprise`
+# for feature-gate purposes. Validation goes through the same
+# Supabase /validate-tier edge function as every other tier — there
+# is no env-var bypass and no local signature-verification shortcut.
+# A patched client can self-claim `tier=admin` locally, but every
+# server-gated capability (paid module artifact downloads, signed-URL
+# gateway) re-validates against the JWT issued by validate-tier, so
+# self-claimed admin yields nothing the AGPL source doesn't already.
+TIER_ORDER: dict[Tier, int] = {
+    "free": 0,
+    "pro": 1,
+    "mao": 2,
+    "enterprise": 3,
+    "admin": 4,
+}
 
 # Features gated per tier. Order: most-restrictive tier that unlocks it.
 TIER_FEATURES: dict[str, Tier] = {
@@ -330,6 +345,25 @@ def get_tier(force_refresh: bool = False) -> Tier:
 def require_tier(min_tier: Tier) -> bool:
     """Return True if the current tier is at least `min_tier`."""
     return TIER_ORDER[get_tier()] >= TIER_ORDER[min_tier]
+
+
+def is_admin() -> bool:
+    """Bug 33: True iff the server classified this license as admin.
+
+    Admin is a server-only tier. Validation goes through the same
+    Supabase /validate-tier edge function as every other tier — the
+    server consults the `LS_ADMIN_VARIANT_IDS` runtime env var to
+    decide whether a license belongs to the admin variant. There is
+    NO env-var bypass and NO local signature shortcut. Patching this
+    function to always return True will unlock client-side dev
+    affordances (admin sidebar, ADMIN badge, pre-release modules in
+    the catalog) but will NOT unlock server-gated capabilities like
+    paid module artifact downloads — the signed-URL gateway
+    re-validates the JWT issued by validate-tier on every request.
+
+    Cached for the process lifetime via `get_tier()`'s cache.
+    """
+    return get_tier() == "admin"
 
 
 def feature_enabled(feature: str) -> bool:

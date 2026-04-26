@@ -9,6 +9,7 @@
 
   import { page } from '$app/stores';
   import { selectedProject } from '$lib/stores/projects';
+  import { license } from '$lib/stores/license';
 
   type NavItem = {
     href: string;
@@ -24,6 +25,11 @@
   };
 
   const projectId = $derived($selectedProject?.id ?? null);
+  // Bug 33: server-classified admin tier unlocks the Admin sidebar
+  // group with dev-only routes. The check is on the cached tier
+  // string — patching this client-side reveals the routes but not
+  // the server-gated capabilities they exercise.
+  const isAdmin = $derived(($license.cache?.orchestrator_tier ?? 'free') === 'admin');
 
   const groups = $derived<NavGroup[]>([
     {
@@ -133,6 +139,37 @@
         },
       ],
     },
+    // Bug 33: Admin group — visible only when the cached tier is "admin".
+    // Dev-only affordances. Routes also re-check tier server-side via
+    // the standard validate-tier flow before exposing data, so a forged
+    // client tier yields nothing it shouldn't.
+    ...(isAdmin
+      ? [
+          {
+            label: 'Admin',
+            items: [
+              {
+                href: '/admin/feature-flags',
+                label: 'Feature flags',
+                sub: 'Toggle pre-release modules and dev features',
+                match: (p) => p.startsWith('/admin/feature-flags'),
+              },
+              {
+                href: '/admin/diagnostic',
+                label: 'Diagnostics',
+                sub: 'License + container + KG state inspector',
+                match: (p) => p.startsWith('/admin/diagnostic'),
+              },
+              {
+                href: '/admin/license-issuance-test',
+                label: 'License test',
+                sub: 'Issue and verify test licenses',
+                match: (p) => p.startsWith('/admin/license-issuance-test'),
+              },
+            ],
+          } satisfies NavGroup,
+        ]
+      : []),
   ]);
 
   const currentPath = $derived($page.url.pathname);

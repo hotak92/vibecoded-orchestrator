@@ -35,10 +35,105 @@
     }
   }
 
+  // Bug 31: volume location row. Reflects the current launcher.toml +
+  // detected mountpoints. Migrate dialog (Change…) builds a dry-run
+  // plan, shows it, and only fires the actual migration on Confirm.
+  interface VolumeWithSize {
+    name: string;
+    mountpoint: string;
+    size_bytes: number | null;
+    size_human: string | null;
+    role: string;
+  }
+  interface VolumesConfig {
+    volumes_path: string;
+    mode: string;
+    legacy_mapping: { volume_name: string; mountpoint: string; role: string }[];
+    total_size_human: string | null;
+    volumes: VolumeWithSize[];
+  }
+  interface MigrationPlan {
+    from_mode: string;
+    to_path: string;
+    volumes_to_copy: VolumeWithSize[];
+    total_bytes: number;
+    total_human: string;
+    estimated_seconds: number;
+    free_bytes_at_target: number | null;
+    insufficient_free_space: boolean;
+    warnings: string[];
+  }
+  let volumesConfig = $state<VolumesConfig | null>(null);
+  let volumesLoading = $state(false);
+  let volumesError = $state<string | null>(null);
+  let migratingVolumes = $state(false);
+  let migratePath = $state('');
+  let migrationPlan = $state<MigrationPlan | null>(null);
+  let migrationError = $state<string | null>(null);
+
+  async function refreshVolumes() {
+    volumesLoading = true;
+    volumesError = null;
+    try {
+      volumesConfig = await invoke<VolumesConfig>('get_volumes_config');
+    } catch (e) {
+      volumesError = String(e);
+    } finally {
+      volumesLoading = false;
+    }
+  }
+
+  async function startMigrationDryRun() {
+    if (!migratePath.trim()) {
+      migrationError = 'Pick a target path first.';
+      return;
+    }
+    migrationError = null;
+    try {
+      migrationPlan = await invoke<MigrationPlan>('set_volumes_config_dry_run', {
+        path: migratePath.trim(),
+      });
+    } catch (e) {
+      migrationError = String(e);
+    }
+  }
+
+  async function confirmMigration() {
+    if (!migrationPlan) return;
+    if (migrationPlan.insufficient_free_space) {
+      migrationError = 'Insufficient free space at target — pick a larger volume.';
+      return;
+    }
+    migratingVolumes = true;
+    migrationError = null;
+    try {
+      await invoke('migrate_volumes', {
+        path: migrationPlan.to_path,
+        confirmed: true,
+      });
+      migrationPlan = null;
+      migratePath = '';
+      await refreshVolumes();
+    } catch (e) {
+      migrationError = String(e);
+    } finally {
+      migratingVolumes = false;
+    }
+  }
+
+  function cancelMigration() {
+    migrationPlan = null;
+    migratePath = '';
+    migrationError = null;
+  }
+
   // Re-probe whenever the user navigates into Preferences. Cheap (≤2s).
   $effect(() => {
     if (activeSection === 'preferences' && services === null && !servicesLoading) {
       void refreshServices();
+    }
+    if (activeSection === 'preferences' && volumesConfig === null && !volumesLoading) {
+      void refreshVolumes();
     }
   });
 
@@ -245,6 +340,83 @@
                 </li>
               </ul>
               <button class="btn-3d" onclick={refreshServices}>Refresh</button>
+            {/if}
+          </div>
+
+          <!-- Bug 31: container volumes location. Shows the current
+               volumes_path mode (default / detected / custom) plus a
+               Change… button that opens a dry-run plan dialog. -->
+          <div class="form-group" style="margin-top: 18px;">
+            <h4 class="subsection-title">Volume location</h4>
+            <p class="form-hint" style="margin: 0 0 8px;">
+              Where Weaviate's vector index, Ollama's models, and the
+              code-embed cache live. Changing this safely copies all
+              data, verifies new bind-mounts come up healthy, then
+              removes the old volumes. On any failure the migration
+              rolls back without touching your data.
+            </p>
+            {#if volumesLoading}
+              <p class="form-hint">Probing…</p>
+            {:else if volumesError}
+              <p class="form-hint" style="color:#f99;">Couldn't probe: {volumesError}</p>
+            {:else if volumesConfig}
+              <ul class="volumes-list">
+                {#each volumesConfig.volumes as v}
+                  <li>
+                    <span class="vol-role">{v.role}</span>
+                    <code class="mono">{v.mountpoint}</code>
+                    {#if v.size_human}
+                      <span class="vol-size">{v.size_human}</span>
+                    {/if}
+                  </li>
+                {/each}
+              </ul>
+              <p class="form-hint" style="margin: 6px 0;">
+                Mode: <strong>{volumesConfig.mode}</strong>
+                {#if volumesConfig.total_size_human}
+                  · {volumesConfig.total_size_human} total
+                {/if}
+              </p>
+
+              {#if migrationPlan}
+                <!-- Confirm dialog (inline) -->
+                <div class="migrate-confirm">
+                  <p>
+                    Move <strong>{migrationPlan.total_human}</strong>
+                    from {migrationPlan.from_mode} to
+                    <code class="mono">{migrationPlan.to_path}</code>
+                    (~{Math.ceil(migrationPlan.estimated_seconds / 60)} min on local SSD)?
+                  </p>
+                  {#each migrationPlan.warnings as w}
+                    <p class="form-hint" style="color: #ffb84a;">{w}</p>
+                  {/each}
+                  <div class="migrate-actions">
+                    <button class="btn-3d" onclick={cancelMigration} disabled={migratingVolumes}>
+                      Cancel
+                    </button>
+                    <button
+                      class="btn-3d btn-3d-primary"
+                      onclick={confirmMigration}
+                      disabled={migratingVolumes || migrationPlan.insufficient_free_space}
+                    >
+                      {migratingVolumes ? 'Migrating…' : 'Confirm migration'}
+                    </button>
+                  </div>
+                  {#if migrationError}<p class="form-hint" style="color:#f99;">{migrationError}</p>{/if}
+                </div>
+              {:else}
+                <div class="migrate-row">
+                  <input
+                    type="text"
+                    class="migrate-input"
+                    bind:value={migratePath}
+                    placeholder="/mnt/big-disk/vct-volumes"
+                  />
+                  <button class="btn-3d" onclick={startMigrationDryRun}>Change…</button>
+                  <button class="btn-3d" onclick={refreshVolumes}>Refresh</button>
+                </div>
+                {#if migrationError}<p class="form-hint" style="color:#f99;">{migrationError}</p>{/if}
+              {/if}
             {/if}
           </div>
 
@@ -598,4 +770,15 @@
     border-radius: 3px;
     word-break: break-all;
   }
+
+  /* Bug 31: volume location row + migrate dialog. */
+  .volumes-list { list-style: none; padding: 0; margin: 0 0 6px; }
+  .volumes-list li { padding: 3px 0; color: #ccc; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; font-size: 12px; }
+  .vol-role { display: inline-block; min-width: 80px; color: #c4b3ff; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
+  .vol-size { color: #888; font-size: 11px; }
+  .migrate-row { display: flex; gap: 6px; align-items: center; margin-top: 6px; }
+  .migrate-input { flex: 1; padding: 4px 8px; font-family: ui-monospace, monospace; font-size: 12px; background: rgba(0,0,0,0.3); color: #eee; border: 1px solid rgba(255,255,255,0.08); border-radius: 4px; }
+  .migrate-confirm { margin-top: 8px; padding: 10px 12px; border: 1px solid rgba(255,184,74,0.3); border-radius: 6px; background: rgba(255,184,74,0.04); }
+  .migrate-confirm p { margin: 4px 0; font-size: 12px; color: #ddd; }
+  .migrate-actions { display: flex; gap: 8px; margin-top: 8px; }
 </style>
