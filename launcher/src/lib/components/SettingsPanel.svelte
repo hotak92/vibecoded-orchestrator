@@ -1,11 +1,46 @@
 <script lang="ts">
   import { auth, currentUser } from '$lib/stores/auth';
   import { settings } from '$lib/stores/settings';
+  import { invoke } from '$lib/tauri';
   import SecretsPanel from './SecretsPanel.svelte';
 
   let { open = $bindable(false) }: { open: boolean } = $props();
 
   let activeSection = $state<'profile' | 'downloads' | 'secrets' | 'preferences' | 'about'>('profile');
+
+  // Bug 29: shared services status. These are the per-machine Weaviate /
+  // Ollama / code_embed instances that all orchestrator installs reuse via
+  // KG_COLLECTION namespacing inside the shared Weaviate. Probed on demand
+  // when the user opens the Preferences panel.
+  interface ServicesStatus {
+    weaviate_url: string | null;
+    ollama_url: string | null;
+    code_embed_url: string | null;
+    all_detected: boolean;
+    none_detected: boolean;
+  }
+  let services = $state<ServicesStatus | null>(null);
+  let servicesLoading = $state(false);
+  let servicesError = $state<string | null>(null);
+
+  async function refreshServices() {
+    servicesLoading = true;
+    servicesError = null;
+    try {
+      services = await invoke<ServicesStatus>('detect_existing_services');
+    } catch (e) {
+      servicesError = String(e);
+    } finally {
+      servicesLoading = false;
+    }
+  }
+
+  // Re-probe whenever the user navigates into Preferences. Cheap (≤2s).
+  $effect(() => {
+    if (activeSection === 'preferences' && services === null && !servicesLoading) {
+      void refreshServices();
+    }
+  });
 
   // Profile edit state
   let editName = $state($currentUser?.name ?? '');
@@ -170,6 +205,47 @@
             <button class="btn-3d btn-3d-primary" onclick={rerunOnboarding}>
               Run setup wizard
             </button>
+          </div>
+
+          <!-- Bug 29: shared services status. These run once per machine
+               and every orchestrator install talks to the same instances. -->
+          <div class="form-group" style="margin-top: 18px;">
+            <h4 class="subsection-title">Shared services</h4>
+            <p class="form-hint" style="margin: 0 0 8px;">
+              Used by every orchestrator install on this machine. Per-install
+              isolation comes from separate Knowledge Graph collections
+              inside the shared Weaviate, not from separate containers.
+            </p>
+            {#if servicesLoading}
+              <p class="form-hint">Probing…</p>
+            {:else if servicesError}
+              <p class="form-hint" style="color:#f99;">Couldn't probe: {servicesError}</p>
+            {:else if services}
+              <ul class="services-list">
+                <li class:on={services.weaviate_url}>
+                  <span class="dot"></span>
+                  <span class="lbl">Weaviate</span>
+                  <code class="mono">
+                    {services.weaviate_url ?? 'http://localhost:8081 (not running)'}
+                  </code>
+                </li>
+                <li class:on={services.ollama_url}>
+                  <span class="dot"></span>
+                  <span class="lbl">Ollama</span>
+                  <code class="mono">
+                    {services.ollama_url ?? 'http://localhost:11435 (not running)'}
+                  </code>
+                </li>
+                <li class:on={services.code_embed_url}>
+                  <span class="dot"></span>
+                  <span class="lbl">code_embed</span>
+                  <code class="mono">
+                    {services.code_embed_url ?? 'http://localhost:11440 (not running)'}
+                  </code>
+                </li>
+              </ul>
+              <button class="btn-3d" onclick={refreshServices}>Refresh</button>
+            {/if}
           </div>
 
         {:else if activeSection === 'about'}
@@ -474,5 +550,52 @@
 
   .about-link {
     color: var(--color-teal);
+  }
+
+  /* Bug 29: shared services panel in Preferences. */
+  .subsection-title {
+    font-size: 13px;
+    margin: 0 0 6px;
+    color: #ccc;
+  }
+  .services-list {
+    list-style: none;
+    padding: 0;
+    margin: 0 0 10px;
+    font-size: 12px;
+  }
+  .services-list li {
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+    padding: 4px 0;
+    color: #999;
+  }
+  .services-list li.on {
+    color: #ccc;
+  }
+  .services-list .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #555;
+    display: inline-block;
+    flex-shrink: 0;
+    align-self: center;
+  }
+  .services-list li.on .dot {
+    background: rgb(0, 191, 166);
+  }
+  .services-list .lbl {
+    min-width: 80px;
+  }
+  .services-list .mono {
+    font-family: ui-monospace, monospace;
+    font-size: 11px;
+    color: #c4b3ff;
+    background: rgba(255, 255, 255, 0.04);
+    padding: 1px 5px;
+    border-radius: 3px;
+    word-break: break-all;
   }
 </style>
