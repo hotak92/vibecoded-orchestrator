@@ -499,6 +499,81 @@ class UploaderTests(unittest.TestCase):
         self.assertIsNone(result.error)
 
 
+class PreLaunchStubDiversionTests(unittest.TestCase):
+    """Reviewer A round-2: telemetry endpoint is unreleased; opted-in users
+    must not silently 404 forever. Verify that when the resolved URL is
+    DEFAULT_URL (the pre-launch stub), events are diverted to
+    ~/.vibecoded/telemetry_pending.jsonl and removed from the live queue."""
+
+    def setUp(self) -> None:
+        self._home_ctx = _fresh_home()
+        self._home = self._home_ctx.__enter__()
+        self._env_patch = mock.patch.dict(os.environ, {
+            "HOME": self._home,
+            "VIBECODED_TELEMETRY": "true",
+            # Critically: do NOT set VIBECODED_TELEMETRY_URL — we want the
+            # default stub URL to be in effect for this test.
+            "VIBECODED_TELEMETRY_URL": "",
+        }, clear=False)
+        self._env_patch.start()
+        _, self.queue_mod, self.collector_mod, self.uploader_mod, _ = _reload_telemetry_modules()
+        self.queue = self.queue_mod.get_queue()
+        self.collector_mod.collect_session_start(license_valid=True, license_tier="free")
+
+    def tearDown(self) -> None:
+        self._env_patch.stop()
+        self._home_ctx.__exit__(None, None, None)
+
+    def test_default_url_diverts_to_pending_jsonl(self) -> None:
+        # Sanity: the resolved URL is the default.
+        self.assertEqual(
+            self.uploader_mod._resolve_endpoint(None),
+            self.uploader_mod.DEFAULT_URL,
+        )
+        self.assertTrue(self.uploader_mod._is_pre_launch_stub_endpoint(
+            self.uploader_mod.DEFAULT_URL))
+        self.assertEqual(self.queue.count_pending(), 1)
+
+        # Mock _post_json so any leak to the network would be visible —
+        # the diversion path must NOT call it.
+        with mock.patch.object(
+            self.uploader_mod, "_post_json",
+            side_effect=AssertionError("must not POST when endpoint is default stub"),
+        ):
+            result = self.uploader_mod.upload_pending()
+
+        self.assertEqual(result.uploaded_count, 1)
+        self.assertEqual(result.error, "endpoint_pending_deployment")
+        # Event removed from live queue (so we don't infinite-retry).
+        self.assertEqual(self.queue.count_pending(), 0)
+        # Pending file contains exactly 1 JSON line.
+        pending = Path(self._home) / ".vibecoded" / "telemetry_pending.jsonl"
+        self.assertTrue(pending.exists(), "pending jsonl must be written")
+        lines = pending.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 1)
+        # And it's parseable JSON.
+        ev = json.loads(lines[0])
+        self.assertIn("event_type", ev)
+
+    def test_explicit_url_does_not_divert(self) -> None:
+        """Setting VIBECODED_TELEMETRY_URL to a real value bypasses the
+        pre-launch diversion — operator has explicitly accepted live POSTs."""
+        with mock.patch.dict(
+            os.environ,
+            {"VIBECODED_TELEMETRY_URL": "https://real.example/telemetry"},
+        ):
+            with mock.patch.object(
+                self.uploader_mod, "_post_json",
+                return_value=(200, b'{"ok":true}', {}),
+            ) as posted:
+                self.uploader_mod.upload_pending()
+            self.assertTrue(posted.called, "explicit URL must POST normally")
+        # Pending file NOT created.
+        pending = Path(self._home) / ".vibecoded" / "telemetry_pending.jsonl"
+        self.assertFalse(pending.exists(),
+                         "pending file must not be created on explicit URL")
+
+
 class HardwareDetectionTests(unittest.TestCase):
     def setUp(self) -> None:
         self._home_ctx = _fresh_home()
