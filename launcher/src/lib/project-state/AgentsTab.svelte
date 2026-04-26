@@ -3,6 +3,14 @@
   import { invoke } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
   import type { ProjectAgent } from '$lib/types/project-state';
+  import Dropdown from '$lib/components/Dropdown.svelte';
+
+  const SOURCE_OPTIONS = [
+    { value: 'user', label: 'user' },
+    { value: 'bundled', label: 'bundled' },
+    { value: 'paid-module', label: 'paid-module' },
+    { value: 'project', label: 'project' },
+  ];
 
   let { projectId }: { projectId: string } = $props();
 
@@ -90,12 +98,7 @@
       <div class="ps-form-grid">
         <label><span>Name</span><input bind:value={newName} placeholder="my-agent" /></label>
         <label><span>Source</span>
-          <select bind:value={newSource}>
-            <option value="user">user</option>
-            <option value="bundled">bundled</option>
-            <option value="paid-module">paid-module</option>
-            <option value="project">project</option>
-          </select>
+          <Dropdown options={SOURCE_OPTIONS} bind:value={newSource} />
         </label>
         <label><span>Source module</span><input bind:value={newSourceModule} placeholder="optional" /></label>
         <label><span>Model</span><input bind:value={newModel} placeholder="claude/sonnet" /></label>

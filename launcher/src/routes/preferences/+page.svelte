@@ -5,6 +5,7 @@
   import { selectedProject } from '$lib/stores/projects';
   import { toast } from '$lib/stores/toast';
   import Toast from '$lib/components/Toast.svelte';
+  import Dropdown from '$lib/components/Dropdown.svelte';
 
   // Setting key → default value
   const KEYS = [
@@ -91,11 +92,13 @@
                 onchange={(e) => save(k.key, (e.target as HTMLInputElement).checked)}
               />
             {:else if k.kind === 'enum' && k.options}
-              <select onchange={(e) => save(k.key, (e.target as HTMLSelectElement).value)}>
-                {#each k.options as opt}
-                  <option value={opt} selected={values[k.key] === opt}>{opt}</option>
-                {/each}
-              </select>
+              <div class="pr-dd">
+                <Dropdown
+                  options={k.options.map((opt: string) => ({ value: opt, label: opt }))}
+                  value={values[k.key]}
+                  onChange={(v: string) => save(k.key, v)}
+                />
+              </div>
             {/if}
           </li>
         {/each}
@@ -123,8 +126,6 @@
   }
   .pr-row:last-child { border-bottom: none; }
   .pr-row strong { color: #ccc; font-weight: 500; }
-  .pr-row select {
-    background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.12); color: inherit;
-    padding: 3px 8px; border-radius: 4px; font-size: 12px;
-  }
+  /* Bug 12 systemic: native <select> replaced with <Dropdown>. */
+  .pr-dd { width: 180px; }
 </style>
