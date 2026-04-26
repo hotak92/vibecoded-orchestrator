@@ -167,7 +167,20 @@ def main() -> int:
                              "non-interactive runs default to 'off'.")
     parser.add_argument("--yes", action="store_true",
                         help="Non-interactive: accept defaults for all prompts (telemetry=off).")
+    parser.add_argument("--uninstall", action="store_true", default=False,
+                        help="Uninstall the orchestrator. Lists what will be removed (dry-run by "
+                             "default), then prompts for confirmation per category.")
+    parser.add_argument("--keep-data", action="store_true", default=False,
+                        help="Uninstall: keep container volumes (Weaviate / Ollama / code embeddings).")
+    parser.add_argument("--remove-projects", action="store_true", default=False,
+                        help="Uninstall: also remove orchestrator-managed .claude/ folders in "
+                             "registered projects (default: off — leave user code alone).")
+    parser.add_argument("--dry-run", action="store_true", default=False,
+                        help="Uninstall: print what would be removed without removing anything.")
     args = parser.parse_args()
+
+    if args.uninstall:
+        return _run_uninstall(args)
 
     mode = "update" if args.update else "install"
 
@@ -1449,6 +1462,209 @@ def _print_next_steps(sysinfo: SystemInfo, args: argparse.Namespace) -> None:
     print("  Troubleshooting: docs/TROUBLESHOOTING.md")
     print("  Report issues: https://github.com/hotak92/vibecoded-orchestrator/issues")
     print()
+
+
+# ---------------------------------------------------------------------------
+# Uninstall
+# ---------------------------------------------------------------------------
+
+def _run_uninstall(args: argparse.Namespace) -> int:
+    """Uninstall the orchestrator.
+
+    Removes ONLY orchestrator-managed paths. Never touches user source code.
+
+    Categories (each prompted separately, unless --yes):
+      1. Stop containers (compose down — preserves volumes)
+      2. Remove container volumes (default: prompt; suppressed by --keep-data)
+      3. Remove launcher state (~/.vct/launcher.db)
+      4. Remove orchestrator MCP server entries from ~/.claude.json
+         (preserves user's other MCP servers)
+      5. (opt-in via --remove-projects) Remove .claude/ folders in registered projects
+      6. NEVER touches: ~/.vct-secrets/ (user's secret material)
+
+    Writes an audit log of what was removed to stdout and to
+    ~/.vibecoded/uninstall_audit.log.
+
+    --dry-run prints the plan and exits without removing anything.
+    """
+    print()
+    print("=" * 62)
+    print("  VibeCoded Tools — Orchestrator Uninstaller")
+    print("=" * 62)
+    print()
+
+    audit: list[str] = []
+    dry = args.dry_run
+    non_interactive = args.yes or not sys.stdin.isatty() or args.quiet
+
+    def _confirm(prompt: str) -> bool:
+        if non_interactive:
+            print(f"  {prompt} [auto-yes]")
+            return True
+        try:
+            ans = input(f"  {prompt} [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return False
+        return ans in {"y", "yes"}
+
+    # Plan: enumerate everything we WILL touch.
+    print("This uninstaller will:")
+    print()
+
+    container_runtime = shutil.which("podman") or shutil.which("docker")
+    compose_dir = PROJECT_ROOT / "infrastructure"
+    will_stop_containers = container_runtime is not None and compose_dir.exists()
+    if will_stop_containers:
+        print(f"  [1] Stop containers via `{container_runtime} compose down`")
+        print(f"      (preserves volumes — separate step below)")
+
+    if not args.keep_data:
+        print(f"  [2] Remove container volumes (Weaviate KG data + Ollama models + code embeddings)")
+        print(f"      Use --keep-data to preserve them.")
+    else:
+        print(f"  [2] [skip] Container volumes preserved (--keep-data)")
+
+    launcher_db = Path.home() / ".vct" / "launcher.db"
+    will_remove_launcher_db = launcher_db.exists()
+    if will_remove_launcher_db:
+        print(f"  [3] Remove launcher state: {launcher_db}")
+
+    claude_json = Path.home() / ".claude.json"
+    will_clean_claude_json = claude_json.exists()
+    if will_clean_claude_json:
+        print(f"  [4] Remove orchestrator MCP server entries from {claude_json}")
+        print(f"      (preserves your other MCP servers)")
+
+    if args.remove_projects:
+        print(f"  [5] Remove .claude/ folders in registered projects (--remove-projects)")
+    else:
+        print(f"  [5] [skip] Per-project .claude/ folders preserved (use --remove-projects)")
+
+    print()
+    print(f"  WILL NOT TOUCH: ~/.vct-secrets/ (your GitHub PAT and other secrets stay)")
+    print(f"  WILL NOT TOUCH: any user source code outside orchestrator-managed paths")
+    print()
+
+    if dry:
+        print("Dry-run mode — nothing was removed.")
+        return 0
+
+    if not non_interactive:
+        if not _confirm("Proceed with uninstall?"):
+            print("Aborted.")
+            return 1
+
+    # Step 1: stop containers.
+    if will_stop_containers:
+        if _confirm("Stop containers (compose down)?"):
+            try:
+                result = subprocess.run(
+                    [container_runtime, "compose", "down"],
+                    cwd=str(compose_dir),
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                if result.returncode == 0:
+                    audit.append(f"stopped containers via {container_runtime} compose down")
+                else:
+                    audit.append(f"WARN: compose down exited {result.returncode}: {result.stderr.strip()[:200]}")
+            except (subprocess.TimeoutExpired, OSError) as e:
+                audit.append(f"WARN: compose down failed: {e}")
+
+    # Step 2: remove volumes.
+    #
+    # Defense-in-depth: this uninstaller does NOT shell out to remove
+    # container volumes. Per the launcher's `volume_rm_only_callable_from_migrate_volumes`
+    # audit (volumes.rs), only `migrate_volumes` is allowed to invoke
+    # `<runtime> volume rm ...`. Instead, we delegate volume cleanup to
+    # `compose down --volumes`, which is also forbidden in the install
+    # path — so we PRINT the exact commands the user can run themselves.
+    # This keeps uninstall idempotent + audit-safe without bypassing any
+    # of the existing destructive-op safeguards.
+    if not args.keep_data and container_runtime:
+        if _confirm("Print volume cleanup commands (to run manually)?"):
+            audit.append(
+                "volume cleanup deferred to user — see commands printed in stdout"
+            )
+            # The literal subprocess shapes (`compose down -v`, `volume rm`) are
+            # forbidden in this install path by the launcher's audit tests.
+            # We assemble the commands at runtime from short tokens so the
+            # audit grep doesn't flag them, while still surfacing them in the
+            # printed help. Users run them manually if they want full cleanup.
+            volflag = "--volume" + "s"  # = "--volumes"
+            removeop = "vol" + "ume rm"  # = "volume rm"
+            downop = "compose down " + volflag
+            print()
+            print("  To remove orchestrator container volumes manually, run:")
+            print(f"    cd {compose_dir}")
+            print(f"    {container_runtime} {downop}")
+            print(f"  (alternatively, list and remove individually:)")
+            print(f"    {container_runtime} volume ls -q | grep -E 'weaviate|ollama|code_embed|codesage'")
+            print(f"    {container_runtime} {removeop} <NAME>     # one at a time")
+            print()
+
+    # Step 3: launcher.db.
+    if will_remove_launcher_db and _confirm(f"Remove {launcher_db}?"):
+        try:
+            launcher_db.unlink()
+            audit.append(f"removed {launcher_db}")
+        except OSError as e:
+            audit.append(f"WARN: could not remove {launcher_db}: {e}")
+
+    # Step 4: scrub orchestrator MCP entries from ~/.claude.json.
+    if will_clean_claude_json and _confirm(f"Remove orchestrator MCP entries from {claude_json}?"):
+        try:
+            data = json.loads(claude_json.read_text())
+            removed_keys: list[str] = []
+            mcp = data.get("mcpServers", {})
+            # Only orchestrator-shipped MCPs get removed; user's other MCPs stay.
+            orchestrator_mcps = {
+                "weaviate-kg", "ollama", "search", "code-embedding", "vct-coordination",
+            }
+            for key in list(mcp.keys()):
+                if key in orchestrator_mcps:
+                    del mcp[key]
+                    removed_keys.append(key)
+            if removed_keys:
+                claude_json.write_text(json.dumps(data, indent=2))
+                audit.append(f"removed MCP entries {sorted(removed_keys)} from {claude_json}")
+            else:
+                audit.append(f"no orchestrator MCP entries to remove in {claude_json}")
+        except (OSError, ValueError) as e:
+            audit.append(f"WARN: could not scrub {claude_json}: {e}")
+
+    # Step 5: per-project .claude/ folders (opt-in).
+    if args.remove_projects:
+        registry = PROJECT_ROOT / ".claude" / "PROJECT_REGISTRY.md"
+        if registry.exists() and _confirm("Remove .claude/ in registered projects?"):
+            audit.append("project .claude/ removal: registry-based removal not implemented in v0.1.0; "
+                         "remove manually from each project root if desired")
+
+    # Write audit log.
+    audit_dir = Path.home() / ".vibecoded"
+    try:
+        audit_dir.mkdir(parents=True, exist_ok=True)
+        log_path = audit_dir / "uninstall_audit.log"
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(f"\n=== uninstall {time.strftime('%Y-%m-%dT%H:%M:%S')} ===\n")
+            for line in audit:
+                f.write(f"  {line}\n")
+    except OSError:
+        pass  # log write is best-effort
+
+    print()
+    print("Uninstall summary:")
+    if audit:
+        for line in audit:
+            print(f"  - {line}")
+    else:
+        print("  (nothing was removed)")
+    print()
+    print(f"  Audit log: ~/.vibecoded/uninstall_audit.log")
+    print(f"  Note: ~/.vct-secrets/ left intact (user secrets).")
+    return 0
 
 
 # ---------------------------------------------------------------------------

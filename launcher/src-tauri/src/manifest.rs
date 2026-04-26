@@ -154,11 +154,15 @@ fn default_install_dir() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum InstallMethod {
+    /// Clone a git repo to `install_dir` (default for marketplace modules).
     GitClone,
-    Tarball,
-    Pypi,
-    Npm,
+    /// Use an existing directory at `install_dir` (e.g. user-built locally).
     Local,
+    // Reserved methods previously stubbed (tarball / pypi / npm) were
+    // removed in v0.1.0 — they returned hard errors and confused users
+    // browsing the modules catalog. They will land in v0.2 with real
+    // implementations + signature verification. Manifests that specify
+    // them will fail to deserialize with a clean serde error.
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

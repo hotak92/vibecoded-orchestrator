@@ -2245,4 +2245,92 @@ MemAvailable:   23456789 kB
 
         std::fs::remove_dir_all(&target).ok();
     }
+
+    /// Reviewer B blocker: orchestrator data sprawl across ~/podman_volumes,
+    /// ~/.claude, ~/.vct, ~/.vct-secrets, OS keychain, per-project .claude/.
+    /// The uninstaller must:
+    ///   1. Be idempotent (running twice does not fail).
+    ///   2. NEVER touch ~/.vct-secrets/ (user secrets).
+    ///   3. NEVER touch user code outside orchestrator-managed paths.
+    /// We assert by source-grep: install.py's `_run_uninstall` body must
+    /// not contain references to scrubbing ~/.vct-secrets/ or arbitrary
+    /// user paths. Functional execution would touch the real machine and
+    /// is out of scope for unit tests.
+    #[test]
+    fn test_uninstall_never_touches_secrets_or_user_code() {
+        let repo_root = find_local_repo_root().expect("repo root resolves in tests");
+        let install_py = repo_root.join("install.py");
+        let content = std::fs::read_to_string(&install_py).expect("read install.py");
+
+        let start = content
+            .find("def _run_uninstall(")
+            .expect("_run_uninstall defined");
+        let after_start = &content[start..];
+        // End at the next top-level `# ---` divider line (matches the
+        // existing convention used elsewhere in install.py).
+        let body_end = after_start[1..]
+            .find("\n# ----")
+            .map(|idx| idx + 1)
+            .unwrap_or(after_start.len());
+        let body = &after_start[..body_end];
+
+        // 1. Must explicitly mention NOT touching ~/.vct-secrets/ — proves intent.
+        assert!(
+            body.contains(".vct-secrets"),
+            "_run_uninstall must explicitly reference ~/.vct-secrets/ (and skip it)"
+        );
+        // 2. Must NOT call rm/unlink on .vct-secrets.
+        assert!(
+            !body.contains("vct-secrets/.unlink") && !body.contains("rm -rf"),
+            "_run_uninstall must never call rm -rf or scrub .vct-secrets"
+        );
+        // 3. Must NOT remove arbitrary user paths — only Path.home() / .vct or .vibecoded entries.
+        // Heuristic: forbid `shutil.rmtree(` and `os.remove(` on bare user paths.
+        // (We allow `.unlink()` on specific files like launcher.db, audit logs.)
+        for forbidden in &["shutil.rmtree(", "Path('/').", "rmdir('/')"] {
+            assert!(
+                !body.contains(forbidden),
+                "_run_uninstall must not call {} (would risk user code)",
+                forbidden
+            );
+        }
+        // 4. MCP scrub must preserve user's other servers.
+        assert!(
+            body.contains("orchestrator_mcps"),
+            "_run_uninstall must allow-list orchestrator MCPs only (preserving user MCPs)"
+        );
+    }
+
+    /// Idempotence: a second `_run_uninstall` on an already-uninstalled
+    /// machine must not error or print fake "removed X" lines. Source
+    /// audit: every removal step must be guarded by an existence check.
+    #[test]
+    fn test_uninstall_is_idempotent_via_existence_guards() {
+        let repo_root = find_local_repo_root().expect("repo root resolves in tests");
+        let install_py = repo_root.join("install.py");
+        let content = std::fs::read_to_string(&install_py).expect("read install.py");
+
+        let start = content
+            .find("def _run_uninstall(")
+            .expect("_run_uninstall defined");
+        let after_start = &content[start..];
+        let body_end = after_start.find("\n# ----").unwrap_or(after_start.len());
+        let body = &after_start[..body_end];
+
+        // launcher.db removal is gated by .exists() check.
+        assert!(
+            body.contains("launcher_db.exists()"),
+            "launcher.db removal must be guarded by .exists()"
+        );
+        // claude.json scrub is gated by .exists() check.
+        assert!(
+            body.contains("claude_json.exists()"),
+            "~/.claude.json scrub must be guarded by .exists()"
+        );
+        // Container ops are gated by container_runtime is not None.
+        assert!(
+            body.contains("container_runtime is not None"),
+            "container ops must be guarded by runtime detection"
+        );
+    }
 }
