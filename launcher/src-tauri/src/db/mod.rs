@@ -80,6 +80,21 @@ impl Db {
     pub fn lock(&self) -> std::sync::MutexGuard<Connection> {
         self.0.lock().expect("db mutex poisoned")
     }
+
+    /// Open an in-memory DB for tests. Runs all migrations + ensures the
+    /// change_log table is present, mirroring the production `open()`
+    /// path. Each call returns a fresh isolated DB.
+    #[cfg(test)]
+    pub fn open_in_memory() -> Result<Self, String> {
+        let conn = Connection::open_in_memory()
+            .map_err(|e| format!("open in-memory: {}", e))?;
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .map_err(|e| format!("enable FK: {}", e))?;
+        migrations::apply(&conn)?;
+        let db = Db(Mutex::new(conn));
+        db.ensure_change_log()?;
+        Ok(db)
+    }
 }
 
 // ─── Audit actor (OS user) ───────────────────────────────────────────────
