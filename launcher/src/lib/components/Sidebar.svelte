@@ -42,6 +42,15 @@
           match: (p) => p.startsWith('/modules'),
         },
         {
+          // Bug 5: Store needs to be a discoverable route. Sits between
+          // Modules and Project so users browsing for tools find it
+          // before they look at per-project state.
+          href: '/store',
+          label: 'Store',
+          sub: 'Pro plan, Multi-Agent Orchestrator, and other tools',
+          match: (p) => p.startsWith('/store'),
+        },
+        {
           href: projectId ? `/project/${projectId}` : '/project',
           label: 'Project',
           sub: 'Agents, skills, hooks, permissions, secrets',

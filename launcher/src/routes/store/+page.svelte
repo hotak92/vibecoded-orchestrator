@@ -24,9 +24,14 @@
     checkoutUrl?: string;
   }
 
+  // The Pro card description embeds the price grid because RightSidebar
+  // shows the long-form pitch and the card itself needs only a one-liner.
+  // MAO is rendered as Coming Soon; clicking the card surfaces an early-access
+  // hint rather than a checkout link.
   const allApps: AppItem[] = [
     { id: 'orchestrator', name: 'Orchestrator', desc: 'Knowledge graph, code graph, and workflow automation for Claude Code. Free tier — persistent memory for your AI.', color: 'teal', icon: 'O', version: '0.1.0', checkoutUrl: '' },
-    { id: 'orchestrator-pro', name: 'Orchestrator Pro', desc: 'RL-scored retrieval that learns from your usage, curated agent packs, and auto-updates.', color: 'purple', icon: 'O+', version: '0.1.0', checkoutUrl: '' },
+    { id: 'orchestrator-pro', name: 'Orchestrator Pro', desc: 'RL-scored retrieval that learns from your usage, curated agent packs, auto-updates. €19/mo · €149/yr · €199 lifetime.', color: 'purple', icon: 'O+', version: '0.1.0', checkoutUrl: '' },
+    { id: 'mao', name: 'Multi-Agent Orchestrator (MAO)', desc: 'Coming soon — 10 specialist agents + Maestro coordinator + Planner pipeline + Tauri UI on top of Standard.', color: 'pink', icon: 'M', version: 'preview', checkoutUrl: '' },
     { id: 'transcrypt', name: 'Transcrypt', desc: 'Audio transcription with AI-powered correction and vocabulary support', color: 'teal', icon: 'T', version: '2.1.0', checkoutUrl: '' },
     { id: 'arzillibus', name: 'Arzillibus', desc: 'Smart ticketing system for events and venue management', color: 'purple', icon: 'A', version: '1.4.0', checkoutUrl: '' },
     { id: 'convertifacile', name: 'ConvertiFacile', desc: 'Universal file conversion — documents, images, audio', color: 'pink', icon: 'C', version: '1.0.0', checkoutUrl: '' },
@@ -34,6 +39,10 @@
     { id: 'formcraft', name: 'FormCraft', desc: 'Drag & drop form builder with smart validations', color: 'purple', icon: 'F', version: '1.2.0', checkoutUrl: '' },
     { id: 'pixelsnap', name: 'PixelSnap', desc: 'Screenshot tool with annotations and quick sharing', color: 'pink', icon: 'P', version: '1.1.0', checkoutUrl: '' },
   ];
+
+  // Apps that are not yet purchasable. "Get" / "Activate" buttons are
+  // replaced by a "Coming soon" badge for these IDs.
+  const COMING_SOON = new Set(['mao']);
 
   let selectedApp = $state<AppItem | null>(null);
 
@@ -115,6 +124,8 @@
                     Install Free
                   </button>
                 {/if}
+              {:else if COMING_SOON.has(app.id)}
+                <span class="app-card-status app-card-soon">Coming soon</span>
               {:else if owned}
                 <span class="app-card-status app-card-installed">Owned</span>
               {:else}
@@ -243,5 +254,9 @@
   .app-card-installed {
     color: var(--color-teal);
     background: rgba(0, 191, 166, 0.1);
+  }
+  .app-card-soon {
+    color: var(--color-pink, #ff4fa0);
+    background: rgba(255, 79, 160, 0.1);
   }
 </style>
