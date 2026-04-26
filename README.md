@@ -216,7 +216,7 @@ The entire repository is licensed under **[AGPL-3.0-or-later](LICENSE)**. There 
 
 **Plain-language summary**:
 - Individuals and non-commercial users: use freely under AGPL.
-- Companies running this in a service or product: either open-source your modifications under AGPL, or buy a commercial license / subscription. Email sales@vibecodedtools.it.
+- Companies running this in a service or product: either open-source your modifications under AGPL, or buy a commercial license / subscription. Email team@vibecodedtools.com.
 
 **How the commercial model works**: free source under AGPL + paid binaries delivered via signed-URL CDN. Pro and MAO are commercial subscriptions distributed as **pre-compiled, Ed25519-signed artifacts** gated by Lemon Squeezy — subscribers receive the binaries, not source. No source license applies to those artifacts because no source is published for them. The license validator and telemetry components shipped in this repo (under `VCThelpers/`) are AGPL like everything else; the actual trust root for paid-module access is server-side (Supabase + Lemon Squeezy + signature verification on download).
 
