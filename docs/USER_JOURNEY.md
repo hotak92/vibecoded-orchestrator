@@ -21,7 +21,7 @@ First-run time: ~5 minutes for CPU, ~3 minutes for GPU (most of it is model down
 ## 2. First orchestrator session
 
 ```
-User opens the orchestrator project in VS Code with Claude Code extension.
+User opens the orchestrator project in any Claude Code surface — VS Code extension, the Claude Code CLI (`cd <project> && claude`), or the Claude Desktop app.
 
 User: "What can you help me with?"
 
@@ -66,8 +66,9 @@ Claude:  *analyzes codebase via code graph + file scan*
 User: yes
 
 Claude:  *writes files, triggers initial code graph analysis in background*
-         Done. Open ~/dev/my-api in a new VS Code window and Claude there
-         will know your project.
+         Done. Open ~/dev/my-api in your editor (new VS Code window, a
+         fresh `claude` session in that directory, or the Claude Desktop
+         app) and Claude there will know your project.
 ```
 
 ## 4. Cross-project memory in action

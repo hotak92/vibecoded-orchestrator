@@ -3,6 +3,7 @@
   import { settings } from '$lib/stores/settings';
   import { invoke } from '$lib/tauri';
   import SecretsPanel from './SecretsPanel.svelte';
+  import DialogRoot from '$lib/components/DialogRoot.svelte';
 
   let { open = $bindable(false) }: { open: boolean } = $props();
 
@@ -191,13 +192,13 @@
   }
 </script>
 
-<svelte:window onkeydown={open ? handleKeydown : undefined} />
-
-{#if open}
-  <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div class="modal-backdrop" onclick={() => (open = false)} onkeydown={() => {}}>
-    <!-- svelte-ignore a11y_no_static_element_interactions -->
-    <div class="settings-panel" onclick={(e) => e.stopPropagation()} onkeydown={() => {}}>
+<!-- Bug 26: native <dialog> top-layer rendering via DialogRoot.
+     The two-column nav/content layout fills the dialog content shell
+     directly; body padding is cancelled with a negative-margin wrapper
+     so the inner panel can paint edge-to-edge. -->
+<DialogRoot bind:open width="760px" onClose={() => { open = false; }}>
+  {#snippet body()}
+    <div class="settings-shell">
       <!-- Left nav -->
       <div class="settings-nav">
         <h2 class="settings-title">Settings</h2>
@@ -214,7 +215,7 @@
 
       <!-- Right content -->
       <div class="settings-content">
-        <button class="settings-close" onclick={() => (open = false)}>
+        <button class="settings-close" onclick={() => (open = false)} aria-label="Close">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M18 6L6 18"/><path d="M6 6l12 12"/>
           </svg>
@@ -450,47 +451,25 @@
         {/if}
       </div>
     </div>
-  </div>
-{/if}
+  {/snippet}
+</DialogRoot>
 
 <style>
-  .modal-backdrop {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.6);
-    backdrop-filter: blur(8px);
+  /* Bug 26: backdrop / sizing / outer shell now handled by DialogRoot.
+     The negative-margin wrapper cancels the default .dialog-body padding
+     so the two-column settings panel can paint edge-to-edge inside the
+     dialog content shell. */
+  .settings-shell {
+    margin: -16px -20px;
+    height: 560px;
+    max-height: calc(100vh - 4rem);
     display: flex;
-    align-items: center;
-    justify-content: center;
-    z-index: 9999;
-    animation: fade-in 0.15s ease-out;
-    padding: 2rem;
     overflow: hidden;
   }
 
   @keyframes fade-in {
     from { opacity: 0; }
     to { opacity: 1; }
-  }
-
-  .settings-panel {
-    width: 760px;
-    max-width: min(92vw, 800px);
-    height: 560px;
-    max-height: calc(100vh - 4rem);
-    display: flex;
-    background: rgba(13, 23, 53, 0.97);
-    backdrop-filter: blur(24px);
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    border-radius: 20px;
-    box-shadow: 0 30px 80px rgba(0, 0, 0, 0.6);
-    overflow: hidden;
-    animation: modal-enter 0.2s cubic-bezier(0.34, 1.56, 0.64, 1);
-  }
-
-  @keyframes modal-enter {
-    from { opacity: 0; transform: scale(0.95); }
-    to { opacity: 1; transform: scale(1); }
   }
 
   .settings-nav {

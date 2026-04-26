@@ -5,8 +5,8 @@ This project follows a **minimal global, maximum per-project** config principle.
 ## What this means
 
 - **Global `~/.claude/settings.json`**: user preferences only (effort level, output tokens, universal permission denies). No project paths, no MCP server URLs, no environment variables that any given project actually uses.
-- **Per-project `.vscode/settings.json`**: where `claude-code.env` lives. MCP env vars (Weaviate URL, collection names, embedding backend, etc.) are set here so opening this project in VS Code automatically wires up its Claude Code MCP servers correctly, without affecting any other project you have open.
-- **Per-project `.claude/settings.json`**: per-project permissions and hook registrations.
+- **Per-project `.vscode/settings.json`**: where `claude-code.env` lives for the **VS Code extension** specifically. MCP env vars (Weaviate URL, collection names, embedding backend, etc.) are set here so opening this project in VS Code automatically wires up its Claude Code MCP servers correctly, without affecting any other project you have open.
+- **Per-project `.claude/settings.json`**: per-project permissions and hook registrations, plus an `env` block read by the **Claude Code CLI and Desktop app**. The launcher writes both files in lockstep so all three surfaces (VS Code extension / CLI / Desktop) see the same MCP environment.
 - **Per-project secrets**: stored in OS keychain via the VCT Launcher GUI (not env files, not JSON configs). The launcher knows about per-project scoping so e.g. an OpenAI key for one project doesn't leak into another.
 
 ## Why
@@ -25,7 +25,8 @@ Prevents cross-contamination. Global settings default to every project you open 
 | Config | Lives in | Scope | Managed by |
 |---|---|---|---|
 | Effort level, max tokens, OS-level denies | `~/.claude/settings.json` | global | you, manually |
-| MCP env (URLs, collection names, paths) | `.vscode/settings.json` → `claude-code.env` | per-project | VS Code + launcher |
+| MCP env (URLs, collection names, paths) — VS Code extension | `.vscode/settings.json` → `claude-code.env` | per-project | VS Code + launcher |
+| MCP env (URLs, collection names, paths) — CLI / Desktop app | `.claude/settings.json` → `env` | per-project | launcher (kept in sync with the VS Code copy) |
 | Shell/script env | `.env` | per-project | you, `.env.example` template |
 | Project permissions + hooks | `.claude/settings.json` | per-project | install.py + launcher |
 | Secrets (license keys, API tokens) | OS keychain | per-project | launcher GUI only |
