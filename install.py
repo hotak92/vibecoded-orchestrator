@@ -208,6 +208,10 @@ def main() -> int:
         if not args.skip_models:
             _wait_for_ollama()
             _pull_ollama_models(embed_config["ollama_models"])
+        # Bug 29: with shared-container reuse, multiple installs hit the same
+        # Weaviate. Bootstrap any of THIS project's KG/Development collections
+        # that aren't there yet — leave existing ones alone.
+        _ensure_collections(embed_config)
     else:
         print("\n[skip] Container services (--no-containers)")
 
@@ -657,6 +661,41 @@ def _install_requirements(venv_python: Path, *, dev: bool) -> None:
 # Step 6: Container services
 # ---------------------------------------------------------------------------
 
+def _probe_http(url: str, timeout: float = 2.0) -> str | None:
+    """Probe a URL with HEAD/GET. Returns the URL if reachable + status<400, else None.
+
+    Used to detect already-running shared services (Weaviate / Ollama / code_embed)
+    so we don't try to start a duplicate container that would bind-conflict on the
+    same host port.
+    """
+    try:
+        resp = urllib.request.urlopen(url, timeout=timeout)
+        if resp.status < 400:
+            return url
+    except Exception:
+        pass
+    return None
+
+
+def _detect_existing_services(weaviate_port: int = DEFAULT_WEAVIATE_PORT,
+                              ollama_port: int = DEFAULT_OLLAMA_PORT,
+                              code_embed_port: int = DEFAULT_CODE_EMBED_PORT) -> dict:
+    """Probe the three default service endpoints. Returns a dict with the URL
+    on success (str) or None when not reachable, for each of weaviate / ollama /
+    code_embed."""
+    return {
+        "weaviate_url": _probe_http(
+            f"http://localhost:{weaviate_port}/v1/.well-known/ready"
+        ),
+        "ollama_url": _probe_http(
+            f"http://localhost:{ollama_port}/api/tags"
+        ),
+        "code_embed_url": _probe_http(
+            f"http://localhost:{code_embed_port}/health"
+        ),
+    }
+
+
 def _start_services(sysinfo: SystemInfo, args: argparse.Namespace,
                     embed_config: dict) -> None:
     print(f"\n[5/10] Starting services via {sysinfo.container_cmd} ... ", flush=True)
@@ -667,6 +706,58 @@ def _start_services(sysinfo: SystemInfo, args: argparse.Namespace,
     if not compose_file.exists():
         print(f"  WARNING: {compose_file} not found, skipping.")
         print("  Start Weaviate and Ollama manually.")
+        return
+
+    # Bug 29: shared containers across installs.
+    # Before running `compose up -d` (which would bind to host ports), probe
+    # the default ports. If a service is already up, reuse it — installs share
+    # one Weaviate / Ollama / code_embed per machine. Per-install isolation
+    # comes from KG_COLLECTION namespacing inside the shared Weaviate.
+    #
+    # Escape hatch: VCT_FORCE_SEPARATE_CONTAINERS=1 forces a full `up -d`
+    # regardless of what's already running (advanced — caller is responsible
+    # for resolving port conflicts via WEAVIATE_PORT/OLLAMA_PORT overrides).
+    weaviate_port = int(os.environ.get("WEAVIATE_PORT", DEFAULT_WEAVIATE_PORT))
+    ollama_port = int(os.environ.get("OLLAMA_PORT", DEFAULT_OLLAMA_PORT))
+    code_embed_port = int(os.environ.get("CODE_EMBED_PORT", DEFAULT_CODE_EMBED_PORT))
+
+    force_separate = os.environ.get("VCT_FORCE_SEPARATE_CONTAINERS") == "1"
+    detected = _detect_existing_services(weaviate_port, ollama_port, code_embed_port)
+
+    if not force_separate:
+        any_detected = any(v is not None for v in detected.values())
+        if any_detected:
+            print("  Detected already-running services:")
+            for label, url in (
+                ("Weaviate", detected["weaviate_url"]),
+                ("Ollama", detected["ollama_url"]),
+                ("code_embed", detected["code_embed_url"]),
+            ):
+                if url:
+                    print(f"    [reuse] {label}: {url}")
+                else:
+                    print(f"    [start] {label}: not detected")
+
+    # Determine which compose services need to start.
+    # If --gpu, we additionally bring up code_embed (gated on the gpu profile +
+    # overlay file). On CPU-only setups the service uses Ollama as code embed
+    # backend and code_embed is intentionally skipped.
+    services_to_start: list[str] = []
+    if force_separate:
+        # No detection — bring everything compose declares up.
+        services_to_start = []  # empty list => `up -d` with no service args
+    else:
+        if not detected["weaviate_url"]:
+            services_to_start.append("weaviate")
+        if not detected["ollama_url"]:
+            services_to_start.append("ollama")
+        if sysinfo.has_gpu and not detected["code_embed_url"]:
+            services_to_start.append("code_embed")
+
+    # All required services already up — nothing to do.
+    if not force_separate and not services_to_start:
+        print("  All required services already running — reusing them.")
+        print("  (Set VCT_FORCE_SEPARATE_CONTAINERS=1 for separate per-install containers.)")
         return
 
     compose_cmd = _get_compose_command(sysinfo.container_cmd)
@@ -683,6 +774,11 @@ def _start_services(sysinfo: SystemInfo, args: argparse.Namespace,
             print("  WARNING: GPU overlay file not found, running CPU-only")
 
     cmd.extend(["up", "-d"])
+    # When subset detection said only some services are missing, pass them
+    # explicitly so compose doesn't try to recreate already-running ones.
+    if services_to_start:
+        cmd.extend(services_to_start)
+        print(f"  Starting only: {', '.join(services_to_start)}")
 
     # 15 min cap: first-run pulls of weaviate + ollama images can take a while
     # on slow links, but a hung daemon should not block us forever.
@@ -713,6 +809,14 @@ def _start_services(sysinfo: SystemInfo, args: argparse.Namespace,
                 print("    Windows: start Docker Desktop")
             else:
                 print("    Linux:  systemctl --user start podman.socket")
+        # Common cause: bind: address already in use → user already has a
+        # service on this port that we somehow didn't probe (different
+        # protocol, late startup, …). Tell them about the escape hatch.
+        if "address already in use" in stderr_lower or "bind" in stderr_lower:
+            print("\n  Hint: a host port is already in use.")
+            print("    Either stop the conflicting process, or set")
+            print("    VCT_FORCE_SEPARATE_CONTAINERS=1 + override WEAVIATE_PORT /")
+            print("    OLLAMA_PORT / CODE_EMBED_PORT to use distinct ports.")
         sys.exit(1)
     print("  OK")
 
@@ -804,6 +908,120 @@ def _pull_ollama_models(models: list[str]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Step 6c: Weaviate collection bootstrap (shared-container aware)
+# ---------------------------------------------------------------------------
+
+# Minimal Weaviate class definitions for the collections this install needs.
+# Vectorizer is "none" — we feed pre-computed vectors from Ollama / CodeSage.
+# These are intentionally property-light: the MCP server (server.py) uses the
+# v4 client `client.collections.get(name)` which doesn't require a strict
+# property list to insert; richer schemas can be added later without
+# re-creating the class.
+def _kg_class_definition(name: str) -> dict:
+    return {
+        "class": name,
+        "description": "VibeCoded Tools knowledge graph collection",
+        "vectorizer": "none",
+        "properties": [
+            {"name": "title", "dataType": ["text"]},
+            {"name": "content", "dataType": ["text"]},
+            {"name": "file_path", "dataType": ["text"]},
+            {"name": "node_type", "dataType": ["text"]},
+            {"name": "tags", "dataType": ["text[]"]},
+            {"name": "links", "dataType": ["text[]"]},
+            {"name": "typed_links", "dataType": ["text[]"]},
+            {"name": "status", "dataType": ["text"]},
+        ],
+    }
+
+
+def _development_class_definition(name: str) -> dict:
+    return {
+        "class": name,
+        "description": "VibeCoded Tools project documentation collection",
+        "vectorizer": "none",
+        "properties": [
+            {"name": "title", "dataType": ["text"]},
+            {"name": "content", "dataType": ["text"]},
+            {"name": "file_path", "dataType": ["text"]},
+        ],
+    }
+
+
+def _ensure_collections(embed_config: dict) -> None:
+    """Detect existing Weaviate collections and create only the ones missing.
+
+    Code-graph collections (CodeModule / CodeClass / CodeFunction / CodeAPI /
+    CodeInteraction) are SHARED across all projects on this machine — they
+    carry a `project_name` field that separates rows. Don't recreate them
+    per-install: the MCP server creates them lazily on first write.
+    """
+    weaviate_port = os.environ.get("WEAVIATE_PORT", str(DEFAULT_WEAVIATE_PORT))
+    weaviate_url = f"http://localhost:{weaviate_port}"
+    kg_name = os.environ.get("KG_COLLECTION", "KnowledgeGraph")
+    dev_name = os.environ.get("DEVELOPMENT_COLLECTION", "Development")
+
+    print(f"[7b/10] Checking Weaviate collections at {weaviate_url} ... ", flush=True)
+
+    # 1. Read existing schema.
+    try:
+        resp = urllib.request.urlopen(f"{weaviate_url}/v1/schema", timeout=10)
+        schema = json.loads(resp.read())
+    except Exception as e:
+        print(f"  WARN: couldn't read schema ({e}). Skipping bootstrap.")
+        print("  MCP server will create collections lazily on first write.")
+        return
+
+    existing = {
+        c.get("class") for c in schema.get("classes", [])
+        if isinstance(c, dict) and c.get("class")
+    }
+
+    # 2. Required for THIS project install. Code-graph collections excluded
+    #    on purpose — they're shared and created on demand.
+    required = [
+        (kg_name, _kg_class_definition),
+        (dev_name, _development_class_definition),
+    ]
+
+    missing = [(n, b) for (n, b) in required if n not in existing]
+    if not missing:
+        print(f"  All collections present (reusing {len(required)} shared classes).")
+        return
+
+    # 3. POST each missing class definition.
+    created: list[str] = []
+    failed: list[tuple[str, str]] = []
+    for name, builder in missing:
+        body = json.dumps(builder(name)).encode()
+        req = urllib.request.Request(
+            f"{weaviate_url}/v1/schema",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            urllib.request.urlopen(req, timeout=15)
+            created.append(name)
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8", errors="replace")[:200]
+            # 422 with "already exists" is benign on race with another install.
+            if e.code == 422 and "already exists" in err_body.lower():
+                created.append(f"{name} (already)")
+            else:
+                failed.append((name, f"HTTP {e.code}: {err_body}"))
+        except Exception as e:
+            failed.append((name, str(e)))
+
+    for c in created:
+        print(f"  + created collection {c}")
+    for n, err in failed:
+        print(f"  ! failed to create {n}: {err}")
+    if not failed:
+        print("  OK")
+
+
+# ---------------------------------------------------------------------------
 # Step 7: State directory
 # ---------------------------------------------------------------------------
 
@@ -823,6 +1041,12 @@ def _write_env_config(embed_config: dict, args: argparse.Namespace, joern_availa
     print("[9/10] Writing configuration ... ", end="", flush=True)
     env_file = PROJECT_ROOT / ".env"
 
+    # Bug 29: these URLs always point at localhost. With shared containers
+    # there is exactly one Weaviate / Ollama / code_embed per machine; every
+    # install — wherever it lives on disk — reaches them via 127.0.0.1 on the
+    # default ports. Per-install isolation comes from KG_COLLECTION (set by
+    # the launcher's projects_v2::write_project_env_files), NOT from
+    # different host endpoints.
     weaviate_port = os.environ.get("WEAVIATE_PORT", str(DEFAULT_WEAVIATE_PORT))
     weaviate_grpc = os.environ.get("WEAVIATE_GRPC_PORT", str(DEFAULT_WEAVIATE_GRPC_PORT))
     ollama_port = os.environ.get("OLLAMA_PORT", str(DEFAULT_OLLAMA_PORT))
