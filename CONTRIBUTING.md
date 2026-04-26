@@ -67,6 +67,8 @@ Pull requests run a deliberately minimal CI matrix on every push (`.github/workf
 
 CI is intentionally minimal at this stage of the project. When the launcher gets release tags, a separate workflow will add the full per-OS bundle build, signing, and artifact uploads.
 
+For maintainers cutting a release, see [`docs/RELEASING.md`](docs/RELEASING.md). [`CHANGELOG.md`](CHANGELOG.md) follows the Keep a Changelog format.
+
 ---
 
 ## Contribution Flow
