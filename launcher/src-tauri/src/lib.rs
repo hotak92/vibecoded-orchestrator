@@ -157,6 +157,7 @@ pub fn run() {
             commands::installer::install_orchestrator,
             commands::installer::preview_install,
             commands::installer::update_orchestrator,
+            commands::installer::get_local_repo_source,
             // KG dashboard — extended (v1.1)
             commands::kg::kg_set_collection_access_mode,
             commands::kg::kg_set_node_access,
