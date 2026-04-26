@@ -27,6 +27,31 @@
   let sourcePath = $state<string | null>(null);
   let sourceError = $state<string | null>(null);
 
+  // Bug 22: optional GitHub PAT for future auto-update flow.
+  let githubPat = $state('');
+  let savingPat = $state(false);
+  let patError = $state<string | null>(null);
+  let patSaved = $state(false);
+
+  async function savePat() {
+    patError = null;
+    if (!githubPat.trim()) {
+      patError = 'Token is empty.';
+      return;
+    }
+    savingPat = true;
+    try {
+      await invoke('register_github_pat', { token: githubPat.trim() });
+      patSaved = true;
+      githubPat = '';
+      toast.success('GitHub token saved');
+    } catch (e) {
+      patError = String(e);
+    } finally {
+      savingPat = false;
+    }
+  }
+
   // Bug 8: adopt-confirm modal. Populated by `previewInstall` before
   // any actual write happens. If `mode === 'adopt'` we show the diff and
   // require explicit confirmation; otherwise we proceed straight to
@@ -264,6 +289,37 @@
             project selector in the menu bar opens a "create project" form. Pick a folder
             you want to use as the project root.
           </p>
+
+          <!-- Bug 22: optional GitHub access for future auto-update flow. -->
+          <div class="ow-pat">
+            <h3>Updates (optional)</h3>
+            <p class="ow-secondary">
+              Local install + per-project updates work without a GitHub
+              token. Adding a read-only token now will let the launcher
+              fetch newer orchestrator versions from upstream once
+              auto-update lands. No token = 60 GitHub API requests per
+              hour (anonymous). With token = 5000/hour.
+            </p>
+            {#if patSaved}
+              <p class="ow-ok">Token saved to <code class="ow-mono">~/.vct-secrets/github_pat</code>.</p>
+            {:else}
+              <label class="ow-label">
+                <span>GitHub token (optional)</span>
+                <input type="password" bind:value={githubPat} placeholder="ghp_…" />
+              </label>
+              <p class="ow-secondary">
+                How to get one: github.com → Settings → Developer settings →
+                Personal access tokens → Generate new (classic). Scope
+                <code class="ow-mono">public_repo</code> is enough.
+              </p>
+              <div class="ow-pat-actions">
+                <button class="ow-btn-primary" onclick={savePat} disabled={savingPat || !githubPat.trim()}>
+                  {savingPat ? 'Saving…' : 'Save token'}
+                </button>
+              </div>
+              {#if patError}<p class="ow-error">{patError}</p>{/if}
+            {/if}
+          </div>
         {/if}
       </div>
 
@@ -336,4 +392,10 @@
   .ow-paths code { font-family: ui-monospace, monospace; font-size: 11px; color: #c4b3ff; }
   .ow-diff details summary { cursor: pointer; font-size: 12px; color: #0fc; padding: 4px 0; }
   .ow-diff-actions { display: flex; justify-content: flex-end; gap: 6px; margin-top: 10px; }
+
+  /* Bug 22: optional GitHub PAT section */
+  .ow-pat { margin-top: 14px; padding: 10px 12px; border: 1px solid rgba(255,255,255,0.08); border-radius: 6px; background: rgba(255,255,255,0.02); }
+  .ow-pat h3 { font-size: 13px; margin: 0 0 6px; color: #ccc; }
+  .ow-pat input { width: 100%; }
+  .ow-pat-actions { display: flex; justify-content: flex-end; margin-top: 8px; }
 </style>

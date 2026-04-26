@@ -823,6 +823,78 @@ pub fn inspect_orchestrator_at(path: String) -> OrchestratorState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Bug 22: optional GitHub PAT for future auto-update flows that pull
+// upstream commits into the bundled source. The PAT is NOT required for
+// initial install (Bug 17) or per-project update (Bug 21) — those are
+// pure local file copies. We persist to `~/.vct-secrets/github_pat`
+// (chmod 600) to match the convention used in CLAUDE.md, the search
+// MCP wrapper, and the git credential helper.
+// ---------------------------------------------------------------------------
+
+fn vct_secrets_dir() -> Option<PathBuf> {
+    directories::UserDirs::new().map(|u| u.home_dir().join(".vct-secrets"))
+}
+
+fn github_pat_path() -> Option<PathBuf> {
+    vct_secrets_dir().map(|d| d.join("github_pat"))
+}
+
+#[command]
+pub fn has_github_pat() -> bool {
+    github_pat_path()
+        .map(|p| p.exists() && std::fs::read_to_string(&p).map(|s| !s.trim().is_empty()).unwrap_or(false))
+        .unwrap_or(false)
+}
+
+#[command]
+pub fn get_github_pat_preview() -> Option<String> {
+    let p = github_pat_path()?;
+    let raw = std::fs::read_to_string(&p).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.len() <= 4 {
+        return Some("•".repeat(trimmed.len()));
+    }
+    let last4 = &trimmed[trimmed.len() - 4..];
+    Some(format!("••••{}", last4))
+}
+
+#[command]
+pub fn register_github_pat(token: String) -> Result<(), String> {
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+        return Err("token cannot be empty".into());
+    }
+    let dir = vct_secrets_dir().ok_or("could not resolve home directory")?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {}", dir.display(), e))?;
+    let path = dir.join("github_pat");
+    std::fs::write(&path, trimmed).map_err(|e| format!("write {}: {}", path.display(), e))?;
+    // chmod 600 on Unix; Windows ignores this.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&path)
+            .map_err(|e| format!("stat: {}", e))?
+            .permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&path, perms)
+            .map_err(|e| format!("chmod {}: {}", path.display(), e))?;
+    }
+    Ok(())
+}
+
+#[command]
+pub fn clear_github_pat() -> Result<(), String> {
+    let p = github_pat_path().ok_or("could not resolve home directory")?;
+    if p.exists() {
+        std::fs::remove_file(&p).map_err(|e| format!("remove {}: {}", p.display(), e))?;
+    }
+    Ok(())
+}
+
 /// Bug 21: update an orchestrator at `path` by re-running the local-copy
 /// install. Skips the classify-target check (we know the path already
 /// has `.claude/`). Emits "install_progress" events.
