@@ -12,6 +12,7 @@
   //   currently render a busy spinner while waiting.
 
   import { onMount } from 'svelte';
+  import { goto } from '$app/navigation';
   import { modules, installedIds } from '$lib/stores/modules';
   import { selectedProject, projects } from '$lib/stores/projects';
   import { license } from '$lib/stores/license';
@@ -50,7 +51,9 @@
   });
 
   function matchesFilter(m: ModuleCatalogEntry): boolean {
-    const isInstalled = installed.has(m.id);
+    const isInstalled =
+      installed.has(m.id) || m.kind === 'bundled' || m.kind === 'installed' ||
+      m.kind === 'subcomponent';
     if (filter === 'installed') return isInstalled;
     if (filter === 'free') return !m.license_required;
     if (filter === 'pro') return m.license_required;
@@ -232,7 +235,23 @@
             </div>
           {/if}
           <div class="card-footer">
-            {#if isInstalled}
+            {#if m.kind === 'bundled'}
+              <!-- Bug 16: launcher itself — no Install/Uninstall -->
+              <span class="status-badge status-badge-bundled">Bundled</span>
+            {:else if m.kind === 'subcomponent'}
+              <!-- Bug 16: KG / Code Graph — shipped with orchestrator -->
+              <span class="status-badge status-badge-included"
+                >Included with {m.parent_id}</span
+              >
+              {#if m.cta_route}
+                <button
+                  class="btn-3d btn-3d-ghost btn-3d-sm"
+                  onclick={() => goto(m.cta_route)}
+                >
+                  → Open dashboard
+                </button>
+              {/if}
+            {:else if m.kind === 'installed' || isInstalled}
               <label class="enabled-toggle">
                 <input
                   type="checkbox"
@@ -241,9 +260,13 @@
                 />
                 <span>Enabled</span>
               </label>
-              <button class="btn-3d btn-3d-ghost btn-3d-sm" onclick={() => handleUninstall(m)}>
-                Uninstall
-              </button>
+              {#if installRow}
+                <button class="btn-3d btn-3d-ghost btn-3d-sm" onclick={() => handleUninstall(m)}>
+                  Uninstall
+                </button>
+              {:else}
+                <span class="status-badge status-badge-bundled">Installed</span>
+              {/if}
             {:else if m.license_required && !m.is_licensed}
               <button class="btn-3d btn-3d-secondary btn-3d-sm" onclick={onOpenActivation}>
                 Upgrade to Pro
@@ -471,6 +494,26 @@
   .tier-badge.tier-free {
     background: rgba(0, 191, 166, 0.12);
     color: var(--color-teal);
+  }
+
+  /* Bug 16: kind-aware status badges. */
+  .status-badge {
+    font-size: 10px;
+    font-weight: 700;
+    padding: 4px 10px;
+    border-radius: 999px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .status-badge-bundled {
+    background: rgba(123, 95, 255, 0.12);
+    color: var(--color-purple, #b29bff);
+    border: 1px solid rgba(123, 95, 255, 0.3);
+  }
+  .status-badge-included {
+    background: rgba(0, 191, 166, 0.08);
+    color: var(--color-teal);
+    border: 1px solid rgba(0, 191, 166, 0.25);
   }
 
   .card-meta {
