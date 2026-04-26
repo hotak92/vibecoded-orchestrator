@@ -118,5 +118,5 @@ Be respectful, technical, and concise. Criticism of code is welcome; criticism o
 ## Questions
 
 - Technical: open a GitHub Discussion or Issue
-- Licensing / CLA: contributions@vibecodedtools.it
+- Licensing / CLA: team@vibecodedtools.com
 - Security issues: security@vibecodedtools.it (please do not disclose publicly before we've had a chance to respond)

@@ -58,7 +58,7 @@ Signed-off-by: Your Full Name <your.email@example.com>
 
 This `Signed-off-by` trailer (compatible with `git commit -s`) serves as your acceptance of this CLA.
 
-For significant contributions or employer-covered work, please contact contributions@vibecodedtools.it before submitting a PR to discuss a written CLA or Corporate CLA as appropriate.
+For significant contributions or employer-covered work, please contact team@vibecodedtools.com before submitting a PR to discuss a written CLA or Corporate CLA as appropriate.
 
 ---
 
