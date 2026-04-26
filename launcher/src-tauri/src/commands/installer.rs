@@ -64,6 +64,25 @@ pub struct InstallResult {
     pub system: SystemDetection,
 }
 
+/// Bug 29: shared-container detection. Reports which of the three default
+/// service endpoints are already serving on this machine (8081 / 11435 /
+/// 11440), so the OnboardingWizard step 3 can tell the user "your install
+/// will reuse these" before running the installer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServicesStatus {
+    /// Reachable URL or null when the probe failed.
+    pub weaviate_url: Option<String>,
+    pub ollama_url: Option<String>,
+    pub code_embed_url: Option<String>,
+    /// True iff all three probes succeeded — UI uses this to show the green
+    /// "all detected, install will reuse them" panel vs the neutral
+    /// "services not detected, install will start them" panel.
+    pub all_detected: bool,
+    /// True iff zero services responded — implies a fresh machine, install
+    /// will need to start the compose stack.
+    pub none_detected: bool,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum InstallMode {
@@ -188,6 +207,69 @@ pub async fn detect_system() -> Result<SystemDetection, String> {
         ram_gb,
         vram_gb,
         gpu_vendor,
+    })
+}
+
+/// Default ports for the shared services. Match install.py constants —
+/// changing them here without changing install.py would mean the wizard
+/// reports "no services running" while install.py happily reuses them.
+const DEFAULT_WEAVIATE_PORT: u16 = 8081;
+const DEFAULT_OLLAMA_PORT: u16 = 11435;
+const DEFAULT_CODE_EMBED_PORT: u16 = 11440;
+
+/// HTTP probe with short timeout. Returns the URL on 2xx/3xx, None otherwise.
+/// Takes an owned String so callers can compose URLs via format! without
+/// having to keep the formatted string alive themselves.
+async fn probe_http(url: String) -> Option<String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .ok()?;
+    match client.get(&url).send().await {
+        Ok(resp) if resp.status().as_u16() < 400 => Some(url),
+        _ => None,
+    }
+}
+
+/// Bug 29: detect already-running shared services so the OnboardingWizard
+/// can tell the user "this install will reuse them" instead of starting
+/// duplicate containers that bind-conflict.
+///
+/// Probes the three default endpoints in parallel:
+///   - http://localhost:8081/v1/.well-known/ready  (Weaviate)
+///   - http://localhost:11435/api/tags             (Ollama)
+///   - http://localhost:11440/health               (code_embed)
+#[command]
+pub async fn detect_existing_services() -> Result<ServicesStatus, String> {
+    let weaviate = probe_http(format!(
+        "http://localhost:{}/v1/.well-known/ready",
+        DEFAULT_WEAVIATE_PORT
+    ));
+    let ollama = probe_http(format!(
+        "http://localhost:{}/api/tags",
+        DEFAULT_OLLAMA_PORT
+    ));
+    let code_embed = probe_http(format!(
+        "http://localhost:{}/health",
+        DEFAULT_CODE_EMBED_PORT
+    ));
+
+    // Run probes concurrently — total wall time is capped at the 2s timeout
+    // of the slowest probe, not 6s sequentially.
+    let (weaviate_url, ollama_url, code_embed_url) =
+        tokio::join!(weaviate, ollama, code_embed);
+
+    let count = [&weaviate_url, &ollama_url, &code_embed_url]
+        .iter()
+        .filter(|o| o.is_some())
+        .count();
+
+    Ok(ServicesStatus {
+        all_detected: count == 3,
+        none_detected: count == 0,
+        weaviate_url,
+        ollama_url,
+        code_embed_url,
     })
 }
 
@@ -1517,5 +1599,33 @@ MemAvailable:   23456789 kB
         assert_eq!(meminfo_kb_to_gb((1024 * 1024) * 16 / 10), 2);
         // 0 → 0
         assert_eq!(meminfo_kb_to_gb(0), 0);
+    }
+
+    // ─── Bug 29: shared-container detection ────────────────────────
+
+    #[tokio::test]
+    async fn test_probe_http_returns_none_on_unreachable() {
+        // Pick a port that almost certainly isn't listening. 1 is a
+        // privileged TCP port that no userland service will bind in
+        // CI sandboxes.
+        let url = "http://127.0.0.1:1/".to_string();
+        let r = probe_http(url).await;
+        assert!(r.is_none(), "expected None for unreachable URL, got {:?}", r);
+    }
+
+    #[tokio::test]
+    async fn test_detect_existing_services_returns_struct() {
+        // We can't guarantee anything about whether the test machine has
+        // local services up — this test only verifies the command returns
+        // a well-formed ServicesStatus and doesn't panic. Detail-level
+        // probe testing is covered by test_probe_http_returns_none_on_unreachable.
+        let s = detect_existing_services().await.expect("command must not error");
+        // The Option fields are mutually consistent with the booleans.
+        let count = [&s.weaviate_url, &s.ollama_url, &s.code_embed_url]
+            .iter()
+            .filter(|o| o.is_some())
+            .count();
+        assert_eq!(s.all_detected, count == 3);
+        assert_eq!(s.none_detected, count == 0);
     }
 }

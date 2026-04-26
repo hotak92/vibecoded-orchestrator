@@ -1041,6 +1041,12 @@ def _write_env_config(embed_config: dict, args: argparse.Namespace, joern_availa
     print("[9/10] Writing configuration ... ", end="", flush=True)
     env_file = PROJECT_ROOT / ".env"
 
+    # Bug 29: these URLs always point at localhost. With shared containers
+    # there is exactly one Weaviate / Ollama / code_embed per machine; every
+    # install — wherever it lives on disk — reaches them via 127.0.0.1 on the
+    # default ports. Per-install isolation comes from KG_COLLECTION (set by
+    # the launcher's projects_v2::write_project_env_files), NOT from
+    # different host endpoints.
     weaviate_port = os.environ.get("WEAVIATE_PORT", str(DEFAULT_WEAVIATE_PORT))
     weaviate_grpc = os.environ.get("WEAVIATE_GRPC_PORT", str(DEFAULT_WEAVIATE_GRPC_PORT))
     ollama_port = os.environ.get("OLLAMA_PORT", str(DEFAULT_OLLAMA_PORT))
