@@ -150,6 +150,7 @@ pub fn run() {
             commands::telemetry_cmd::telemetry_clear_queue,
             // Orchestrator installer (existing, unchanged)
             commands::installer::detect_system,
+            commands::installer::detect_existing_services,
             commands::installer::get_default_install_path,
             commands::installer::check_install_status,
             commands::installer::get_installed_version,
