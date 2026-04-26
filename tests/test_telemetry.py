@@ -287,6 +287,37 @@ class DefaultOffTests(unittest.TestCase):
                 self.assertFalse(self.collector_mod.telemetry_enabled())
                 self.assertTrue(self.uploader_mod._disabled())
 
+    def test_runtime_toggle_on_to_off_stops_events(self) -> None:
+        """User-facing guarantee: flipping the master switch ON→OFF means
+        no further events are collected. Mirrors `vct-cli telemetry off`
+        flipping the env var and the launcher's Settings → Privacy
+        master toggle.
+        """
+        # Start opted-in (env=true). Always-on events flow.
+        with mock.patch.dict(os.environ, {"VIBECODED_TELEMETRY": "true"}):
+            self.assertTrue(self.collector_mod.telemetry_enabled())
+            ok = self.collector_mod.collect_session_start(
+                license_valid=True, license_tier="free"
+            )
+            self.assertTrue(ok)
+            count_after_on = self.queue_mod.get_queue().count_pending()
+            self.assertGreaterEqual(count_after_on, 1)
+
+        # Flip the master switch off (= what vct-cli telemetry off does).
+        with mock.patch.dict(os.environ, {"VIBECODED_TELEMETRY": "false"}):
+            self.assertFalse(self.collector_mod.telemetry_enabled())
+            ok2 = self.collector_mod.collect_session_start(
+                license_valid=True, license_tier="free"
+            )
+            self.assertFalse(ok2)
+            # Queue size unchanged — no new event added after the toggle.
+            count_after_off = self.queue_mod.get_queue().count_pending()
+            self.assertEqual(count_after_off, count_after_on)
+            # And the uploader will refuse to ship anything that's already
+            # queued, so the user's choice to opt out is respected
+            # immediately.
+            self.assertTrue(self.uploader_mod._disabled())
+
 
 class EnvOptOutTests(unittest.TestCase):
     def setUp(self) -> None:
