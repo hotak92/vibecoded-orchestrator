@@ -381,15 +381,18 @@
   .cg-bulk-btn-primary:hover { background: rgb(0,210,180); }
   .cg-bulk-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
-  /* Bulk modal */
+  /* Bulk modal — Bug 19 systemic */
   .cg-modal-back {
-    position: fixed; inset: 0; z-index: 1100; background: rgba(0,0,0,0.6);
+    position: fixed; inset: 0; z-index: 9999; background: rgba(0,0,0,0.6);
     display: flex; align-items: center; justify-content: center;
+    padding: 2rem; overflow: hidden;
   }
   .cg-modal {
     background: #1a1a22; border: 1px solid rgba(255,255,255,0.1);
-    border-radius: 10px; width: 480px; max-width: 92vw; max-height: 80vh;
-    overflow-y: auto; box-shadow: 0 20px 60px rgba(0,0,0,0.7);
+    border-radius: 10px; width: 480px; max-width: min(92vw, 600px);
+    max-height: calc(100vh - 4rem);
+    display: flex; flex-direction: column; overflow: hidden;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.7);
   }
   .cg-modal-header {
     padding: 12px 16px; border-bottom: 1px solid rgba(255,255,255,0.06);
