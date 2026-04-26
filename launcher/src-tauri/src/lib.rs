@@ -119,6 +119,7 @@ pub fn run() {
             commands::secrets_cmd::list_module_settings_v2,
             // Licensing
             commands::licensing::license_get_tier,
+            commands::licensing::license_is_admin,
             commands::licensing::license_refresh,
             commands::licensing::license_activate,
             commands::licensing::license_deactivate,
