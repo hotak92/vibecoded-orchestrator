@@ -33,6 +33,23 @@
   let sourcePath = $state<string | null>(null);
   let sourceError = $state<string | null>(null);
 
+  // Bug 29: shared-container detection. On step 3 entry we probe the three
+  // default ports and tell the user whether their install will REUSE existing
+  // services or START fresh ones. Advanced users can opt into per-install
+  // separate containers via the checkbox (sets VCT_FORCE_SEPARATE_CONTAINERS=1
+  // in install.py via the env block — currently a future enhancement; for now
+  // the checkbox is a UI hint that maps to skip_containers behavior).
+  interface ServicesStatus {
+    weaviate_url: string | null;
+    ollama_url: string | null;
+    code_embed_url: string | null;
+    all_detected: boolean;
+    none_detected: boolean;
+  }
+  let services = $state<ServicesStatus | null>(null);
+  let servicesError = $state<string | null>(null);
+  let useSeparateContainers = $state(false);
+
   // Bug 22: optional GitHub PAT for future auto-update flow.
   let githubPat = $state('');
   let savingPat = $state(false);
@@ -136,11 +153,20 @@
   }
 
   async function loadStep3() {
-    if (sourcePath !== null || sourceError !== null) return;
+    if (sourcePath === null && sourceError === null) {
+      try {
+        sourcePath = await invoke<string>('get_local_repo_source');
+      } catch (e) {
+        sourceError = String(e);
+      }
+    }
+    // Bug 29: probe shared services every time we land on step 3 — this is
+    // cheap (capped at 2s wall time) and the user might have started or
+    // stopped containers between the previous step and now.
     try {
-      sourcePath = await invoke<string>('get_local_repo_source');
+      services = await invoke<ServicesStatus>('detect_existing_services');
     } catch (e) {
-      sourceError = String(e);
+      servicesError = String(e);
     }
   }
 
@@ -386,6 +412,66 @@
           {#if sourceError}
             <p class="ow-error">Source not found: {sourceError}</p>
           {/if}
+
+          <!-- Bug 29: shared-container detection. We probed the three
+               default service endpoints (Weaviate / Ollama / code_embed) on
+               step entry — show the user what was found so they understand
+               the install will reuse them, not start duplicates that would
+               port-conflict. -->
+          {#if services}
+            <div class="ow-services" class:ok={services.all_detected}>
+              <h3>Shared services {services.all_detected ? '(detected)' : ''}</h3>
+              <ul class="ow-services-list">
+                <li>
+                  {services.weaviate_url ? '✓' : '·'} Weaviate
+                  <code class="ow-mono">
+                    {services.weaviate_url ?? 'http://localhost:8081 (not running)'}
+                  </code>
+                </li>
+                <li>
+                  {services.ollama_url ? '✓' : '·'} Ollama
+                  <code class="ow-mono">
+                    {services.ollama_url ?? 'http://localhost:11435 (not running)'}
+                  </code>
+                </li>
+                <li>
+                  {services.code_embed_url ? '✓' : '·'} code_embed
+                  <code class="ow-mono">
+                    {services.code_embed_url ?? 'http://localhost:11440 (not running)'}
+                  </code>
+                </li>
+              </ul>
+              {#if services.all_detected}
+                <p class="ow-secondary">
+                  Your install will reuse these. Per-install isolation comes from
+                  separate Knowledge Graph collections inside the shared Weaviate.
+                </p>
+              {:else if services.none_detected}
+                <p class="ow-secondary">
+                  No services detected — the install will start them via your
+                  container runtime.
+                </p>
+              {:else}
+                <p class="ow-secondary">
+                  Some services detected — the install will reuse those and start
+                  any that are missing.
+                </p>
+              {/if}
+              <label class="ow-checkbox" title="Most users should leave this off.">
+                <input type="checkbox" bind:checked={useSeparateContainers} />
+                <span>Use separate containers for this install (advanced)</span>
+              </label>
+              {#if useSeparateContainers}
+                <p class="ow-secondary ow-warn">
+                  You'll need to set <code class="ow-mono">VCT_FORCE_SEPARATE_CONTAINERS=1</code>
+                  and pick non-default ports (WEAVIATE_PORT / OLLAMA_PORT /
+                  CODE_EMBED_PORT) in your environment before running the install.
+                </p>
+              {/if}
+            </div>
+          {:else if servicesError}
+            <p class="ow-secondary">Couldn't probe services ({servicesError}).</p>
+          {/if}
           {#if installed}
             <p class="ow-ok">Orchestrator already installed at this path.</p>
           {:else}
@@ -609,4 +695,14 @@
   .ow-pat h3 { font-size: 13px; margin: 0 0 6px; color: #ccc; }
   .ow-pat input { width: 100%; }
   .ow-pat-actions { display: flex; justify-content: flex-end; margin-top: 8px; }
+
+  /* Bug 29: shared-container detection panel on step 3. */
+  .ow-services { margin-top: 12px; padding: 10px 12px; border: 1px solid rgba(255,255,255,0.08); border-radius: 6px; background: rgba(255,255,255,0.02); }
+  .ow-services.ok { border-color: rgba(0,191,166,0.25); background: rgba(0,191,166,0.05); }
+  .ow-services h3 { font-size: 13px; margin: 0 0 6px; color: #ccc; }
+  .ow-services-list { list-style: none; padding: 0; margin: 0 0 6px; font-size: 12px; }
+  .ow-services-list li { padding: 2px 0; color: #ccc; display: flex; gap: 8px; align-items: baseline; }
+  .ow-checkbox { display: flex; gap: 6px; align-items: center; margin-top: 8px; font-size: 12px; color: #ccc; cursor: pointer; }
+  .ow-checkbox input { margin: 0; }
+  .ow-warn { color: #ffb84a; }
 </style>
