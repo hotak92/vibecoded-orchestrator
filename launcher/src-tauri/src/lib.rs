@@ -160,6 +160,10 @@ pub fn run() {
             commands::installer::get_local_repo_source,
             commands::installer::inspect_orchestrator_at,
             commands::installer::update_orchestrator_at,
+            commands::installer::has_github_pat,
+            commands::installer::get_github_pat_preview,
+            commands::installer::register_github_pat,
+            commands::installer::clear_github_pat,
             // KG dashboard — extended (v1.1)
             commands::kg::kg_set_collection_access_mode,
             commands::kg::kg_set_node_access,
