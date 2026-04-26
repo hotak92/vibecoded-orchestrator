@@ -22,6 +22,8 @@
   let showCreate = $state(false);
   let createName = $state('');
   let createPath = $state('');
+  // Bug 3d: default host is always 'base' (Standard). MAO is currently
+  // hidden from the dropdown until it ships as a real managed module.
   let createHost = $state<ProjectHost>('base');
   let creating = $state(false);
   let createError = $state<string | null>(null);
@@ -353,7 +355,7 @@
             </button>
           </div>
           <p class="form-hint">
-            Absolute path. Folder must already exist.
+            Absolute path. The folder will be created if it doesn't exist yet.
             {#if !inTauri} (Browse requires the desktop app — type the path manually here.){/if}
           </p>
         </div>
@@ -368,21 +370,25 @@
               title="What does host mean?"
             >?</button>
           </div>
-          <select id="project-host" class="form-input" bind:value={createHost}>
+          <select id="project-host" class="form-input host-select" bind:value={createHost}>
             <option value="base">Standard — Claude Code only</option>
-            <option value="mao">MAO — Multi-Agent Orchestrator (beta)</option>
+            <!--
+              Bug 3d: MAO option is intentionally hidden from the create
+              modal. MAO is not yet shipped as a managed module; until
+              it is, exposing it here just confuses users. Re-enable
+              with a feature flag when MAO is generally available.
+            -->
           </select>
+          <p class="form-hint">
+            MAO (Multi-Agent Orchestrator) is coming soon — opt-in via the
+            Modules tab once available.
+          </p>
           {#if showHostHelp}
             <div class="host-help">
               <p>
                 <strong>Standard (base):</strong> the standard Orchestrator install
                 — Knowledge Graph, Code Graph, and 16 hooks. Pick this if you're
                 unsure.
-              </p>
-              <p>
-                <strong>MAO:</strong> Multi-Agent Orchestrator — adds 10 specialist
-                agents and a Maestro coordinator on top of Standard. Beta. Pick
-                this if you want the extras and don't mind some rough edges.
               </p>
             </div>
           {/if}
@@ -806,6 +812,20 @@
   .form-input.mono {
     font-family: 'JetBrains Mono', 'Fira Code', monospace;
     font-size: 12px;
+  }
+  /* Bug 3c: native <select> + <option> on Linux/Tauri (WebKitGTK) renders
+     the dropdown panel using the platform theme. Some themes ship a white
+     panel background AND inherited white text from .form-input → invisible
+     options. Force opaque dark background for both the select control and
+     its options. */
+  .host-select {
+    background-color: #1a2342;
+    color: var(--color-text);
+    appearance: auto;
+  }
+  .host-select option {
+    background-color: #1a2342;
+    color: #e8e8ee;
   }
   .form-input:focus {
     border-color: rgba(0, 191, 166, 0.5);
