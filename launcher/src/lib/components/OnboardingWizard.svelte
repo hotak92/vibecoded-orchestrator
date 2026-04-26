@@ -21,6 +21,11 @@
   let installing = $state(false);
   let installed = $state(false);
   let installError = $state<string | null>(null);
+  // Bug 17: install is now a local file copy from the launcher's
+  // bundled repo source. We display the source path so the user
+  // can confirm what's being copied. Loaded once on step 3 entry.
+  let sourcePath = $state<string | null>(null);
+  let sourceError = $state<string | null>(null);
 
   // Bug 8: adopt-confirm modal. Populated by `previewInstall` before
   // any actual write happens. If `mode === 'adopt'` we show the diff and
@@ -42,6 +47,15 @@
       installed = await invoke<boolean>('check_install_status', { path: installPath });
     } catch (e) {
       detectError = String(e);
+    }
+  }
+
+  async function loadStep3() {
+    if (sourcePath !== null || sourceError !== null) return;
+    try {
+      sourcePath = await invoke<string>('get_local_repo_source');
+    } catch (e) {
+      sourceError = String(e);
     }
   }
 
@@ -116,6 +130,7 @@
 
   $effect(() => {
     if (step === 2 && !detection) void loadStep2();
+    if (step === 3) void loadStep3();
   });
 
   onMount(() => {
@@ -197,11 +212,18 @@
             <span>Install path</span>
             <input bind:value={installPath} />
           </label>
+          {#if sourcePath}
+            <p class="ow-secondary">
+              Copying from <code class="ow-mono">{sourcePath}</code> (local — no network needed)
+            </p>
+          {:else if sourceError}
+            <p class="ow-error">Source not found: {sourceError}</p>
+          {/if}
           {#if installed}
             <p class="ow-ok">Orchestrator already installed at this path.</p>
           {:else}
-            <button class="ow-btn-primary" onclick={() => runInstall(false)} disabled={installing}>
-              {installing ? 'Installing…' : 'Install orchestrator'}
+            <button class="ow-btn-primary" onclick={() => runInstall(false)} disabled={installing || !!sourceError}>
+              {installing ? 'Installing…' : 'Install'}
             </button>
           {/if}
           {#if installError}<p class="ow-error">{installError}</p>{/if}
@@ -281,6 +303,7 @@
   .ow-steps li.current { color: #0fc; font-weight: 600; }
   .ow-body { padding: 16px 20px; min-height: 160px; font-size: 13px; line-height: 1.55; color: #ccc; overflow-y: auto; flex: 1 1 auto; }
   .ow-secondary { color: #888; font-size: 12px; }
+  .ow-mono { font-family: ui-monospace, monospace; font-size: 11px; color: #c4b3ff; background: rgba(255,255,255,0.04); padding: 1px 5px; border-radius: 3px; word-break: break-all; }
   .ow-error { color: #f99; font-size: 12px; }
   .ow-ok { color: #0fc; font-size: 12px; }
   .ow-table { font-size: 12px; border-collapse: collapse; }
