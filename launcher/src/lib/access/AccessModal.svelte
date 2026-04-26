@@ -4,6 +4,7 @@
   import { toast } from '$lib/stores/toast';
   import type { AccessMode } from '$lib/types/project-state';
   import type { ProjectView } from '$lib/types/launcher';
+  import DialogRoot from '$lib/components/DialogRoot.svelte';
 
   let {
     targetLabel,
@@ -56,16 +57,18 @@
   }
 </script>
 
-<!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="access-backdrop" onclick={onClose} onkeydown={() => {}}>
-  <!-- svelte-ignore a11y_click_events_have_key_events -->
-  <div class="access-modal" onclick={(e) => e.stopPropagation()}>
-    <header class="access-header">
-      <h3>Access scope</h3>
-      <p class="access-target">{targetLabel}</p>
-      <button class="access-close" onclick={onClose}>×</button>
-    </header>
-
+<!-- Bug 26: native <dialog> top-layer rendering via DialogRoot. -->
+<DialogRoot open={true} width="480px" onClose={onClose}>
+  {#snippet header()}
+    <div class="access-header-row">
+      <div class="access-header-text">
+        <h3>Access scope</h3>
+        <p class="access-target">{targetLabel}</p>
+      </div>
+      <button class="access-close" onclick={onClose} aria-label="Close">×</button>
+    </div>
+  {/snippet}
+  {#snippet body()}
     <div class="access-options">
       <label class="access-opt" class:active={mode === 'shared'}>
         <input type="radio" name="mode" value="shared" bind:group={mode} />
@@ -113,42 +116,30 @@
         {/if}
       </div>
     {/if}
-
-    <footer class="access-footer">
+  {/snippet}
+  {#snippet footer()}
+    <div class="access-footer-row">
       <button class="access-btn" onclick={onClose}>Cancel</button>
       <button class="access-btn access-btn-primary" disabled={saving} onclick={save}>
         {saving ? 'Saving…' : 'Save'}
       </button>
-    </footer>
-  </div>
-</div>
+    </div>
+  {/snippet}
+</DialogRoot>
 
 <style>
-  /* Bug 19 systemic */
-  .access-backdrop {
-    position: fixed; inset: 0; background: rgba(0,0,0,0.6);
-    display: flex; align-items: center; justify-content: center;
-    z-index: 9999;
-    padding: 2rem; overflow: hidden;
+  /* Bug 26: backdrop / sizing / shell now handled by DialogRoot. */
+  .access-header-row {
+    display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
   }
-  .access-modal {
-    background: #1a1a22; border-radius: 10px; width: 480px;
-    max-width: min(92vw, 600px);
-    max-height: calc(100vh - 4rem);
-    display: flex; flex-direction: column; overflow: hidden;
-    padding: 0;
-    box-shadow: 0 20px 60px rgba(0,0,0,0.7); border: 1px solid rgba(255,255,255,0.08);
-  }
-  .access-header { padding: 14px 16px; border-bottom: 1px solid rgba(255,255,255,0.06); position: relative; flex: 0 0 auto; }
-  .access-header h3 { margin: 0; font-size: 14px; }
+  .access-header-text h3 { margin: 0; font-size: 14px; }
   .access-target { margin: 4px 0 0; font-size: 12px; color: #888; font-family: ui-monospace, monospace; }
   .access-close {
-    position: absolute; top: 10px; right: 10px;
     background: none; border: none; color: #888; cursor: pointer; font-size: 20px;
     line-height: 1; padding: 4px 8px;
   }
   .access-close:hover { color: #fff; }
-  .access-options { padding: 14px 16px; display: flex; flex-direction: column; gap: 8px; flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+  .access-options { display: flex; flex-direction: column; gap: 8px; }
   .access-opt {
     display: flex; gap: 10px; padding: 10px 12px;
     background: rgba(255,255,255,0.03); border-radius: 6px; cursor: pointer;
@@ -159,7 +150,7 @@
   .access-opt input { margin-top: 3px; }
   .access-opt strong { font-size: 13px; }
   .access-opt p { font-size: 11px; color: #888; margin: 2px 0 0; }
-  .access-projects { padding: 0 16px 12px; border-top: 1px solid rgba(255,255,255,0.06); padding-top: 10px; }
+  .access-projects { margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.06); }
   .access-projects h4 { font-size: 12px; margin: 0 0 8px; color: #888; text-transform: uppercase; }
   .access-projects ul { list-style: none; padding: 0; margin: 0; max-height: 200px; overflow-y: auto; }
   .access-projects li label {
@@ -170,10 +161,8 @@
   .access-projects li small { color: #666; margin-left: auto; }
   .access-empty { color: #888; font-size: 12px; }
   .access-count { font-size: 11px; color: #888; margin: 8px 0 0; }
-  .access-footer {
-    padding: 12px 16px; display: flex; justify-content: flex-end; gap: 8px;
-    border-top: 1px solid rgba(255,255,255,0.06);
-    flex: 0 0 auto;
+  .access-footer-row {
+    display: flex; justify-content: flex-end; gap: 8px;
   }
   .access-btn {
     background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.12);
