@@ -3,12 +3,12 @@
 The orchestrator was originally tested against the VS Code extension,
 but every functional piece (hooks, agents, skills, MCP servers, slash
 commands, CLAUDE.md) is read by the `claude` CLI binary too. The only
-real gap was per-project env injection — VS Code uses
-`.vscode/settings.json`'s `claude-code.env` block, which the CLI can't
-see.
+real gap was per-project env injection — and as of Bug 30 the launcher
+now writes the canonical `.claude/settings.json` `env` block which is
+read by all three surfaces (CLI, Desktop app, VS Code extension).
 
-This doc lists what works on each surface and how to set up
-per-project env for the CLI / Desktop surfaces.
+This doc lists what works on each surface and how the per-project env
+files relate to each other.
 
 ## Surface matrix
 
@@ -22,20 +22,34 @@ per-project env for the CLI / Desktop surfaces.
 | Skills (`~/.claude/skills/`) | ✓ | ✓ | ✓ |
 | CLAUDE.md auto-load | ✓ | ✓ | ✓ |
 | Slash commands | ✓ | ✓ | ✓ |
-| Per-project env injection | `.vscode/settings.json` | `.claude/env` (manual) | `.claude/env` (manual) |
+| Per-project env injection | `.claude/settings.json` env (Bug 30) + `.vscode/settings.json` claude-code.env | `.claude/settings.json` env (Bug 30) + `.claude/env` shell file | `.claude/settings.json` env (Bug 30) |
 | Stop hooks (`notify-stop.sh` etc.) | ✗ | ✓ | ✓ |
 
-## Per-project env for CLI / Desktop
+## Per-project env files
 
-When the launcher creates a project it writes **both**:
+When the launcher creates a project it writes **three** files, all
+carrying the same env values (`KG_COLLECTION`, `PROJECT_NAME`,
+`DEVELOPMENT_COLLECTION`, `CONVERSATION_COLLECTION`):
 
-1. `.vscode/settings.json` with a `claude-code.env` block — read by the
-   VS Code extension automatically.
-2. `.claude/env` — a plain POSIX env file containing the same values
-   (`KG_COLLECTION`, `PROJECT_NAME`, `DEVELOPMENT_COLLECTION`,
-   `CONVERSATION_COLLECTION`).
+1. **`.claude/settings.json`** with an `env` block — Anthropic's
+   canonical per-project env mechanism. Read by Claude Code CLI, the
+   Desktop app, AND the VS Code extension. This is the **primary**
+   path; without it, Desktop app users get no per-project KG routing.
+   The launcher does a read-merge-write so existing hooks /
+   permissions / agents config in the same file are preserved
+   untouched — only the top-level `env` key is overwritten.
+2. **`.vscode/settings.json`** with a `claude-code.env` block — the
+   VS Code-extension-specific path. Kept for compatibility / user
+   preference; same values as (1) so there is no precedence conflict
+   when both are present.
+3. **`.claude/env`** — a plain POSIX env file containing the same
+   values. Useful for users who launch `claude` from a shell wrapper
+   (see Option A below) or who want to source it manually.
 
-The CLI doesn't auto-source `.claude/env`. Three ways to wire it up:
+The CLI doesn't auto-source `.claude/env`. With (1) in place this is
+no longer required for KG routing, but the wrapper is still useful if
+you want extra env vars beyond the four the launcher manages. Three
+ways to wire it up:
 
 ### Option A: bundled wrapper script (recommended)
 
@@ -84,15 +98,28 @@ ceremony, easiest to forget.
 - **Effort levels**: `/effort high|max` works on all surfaces but is
   CLI-default; the VS Code extension uses the CLI's setting.
 
-## Why two env files?
+## Why three env files?
 
-VS Code's `claude-code.env` block is read by the extension at session
-start and injected into the agent runtime. The CLI doesn't have a
-moral equivalent — it inherits the parent shell's env unchanged. So
-the launcher writes a plain POSIX `.claude/env` file that any sh-family
-shell can source, plus a wrapper that does the sourcing for users who
-don't want to fiddle with shell rc.
+Historical: before Bug 30 we only wrote `.vscode/settings.json` (for
+the extension) and `.claude/env` (for shell-wrapper CLI users).
+Desktop app users had no path to per-project env at all. Bug 30 added
+the canonical `.claude/settings.json` `env` block which Anthropic
+documents as the cross-surface mechanism (CLI + Desktop + extension).
 
-If/when the Claude Code CLI gains a built-in per-project env mechanism
-(e.g. reading `.claude/env` natively), the wrapper becomes a no-op and
-we can deprecate it.
+We keep the other two files for compatibility:
+- `.vscode/settings.json` `claude-code.env` is the path users with
+  pre-Bug-30 muscle memory will look for first.
+- `.claude/env` is useful as a sh-sourceable file for shell wrappers
+  and direnv setups, especially when users want to extend it with
+  extra env vars beyond the four the launcher manages.
+
+Same values in all three files means there is no precedence conflict
+to reason about. If/when the Claude Code surfaces unify on
+`.claude/settings.json`, the other two files become redundant.
+
+## Linux Desktop app gap
+
+Anthropic's Desktop app is macOS / Windows only as of v2.1.x. Linux
+users without VS Code must use the CLI surface (with the `tools/claude`
+wrapper or one of the alternatives below). This is an upstream
+limitation we cannot work around from the launcher.
