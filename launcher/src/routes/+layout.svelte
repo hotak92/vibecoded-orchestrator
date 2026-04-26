@@ -10,6 +10,7 @@
   import MenuBar from '$lib/components/MenuBar.svelte';
   import Sidebar from '$lib/components/Sidebar.svelte';
   import StatusBar from '$lib/components/StatusBar.svelte';
+  import AdminBadge from '$lib/components/AdminBadge.svelte';
   import BrowserModeBanner from '$lib/components/BrowserModeBanner.svelte';
   import SettingsPanel from '$lib/components/SettingsPanel.svelte';
   import ActivationModal from '$lib/components/ActivationModal.svelte';
@@ -157,6 +158,7 @@
   <OnboardingWizard bind:open={showOnboarding} />
   <ChangelogModal bind:open={showChangelog} />
   <Toast />
+  <AdminBadge />
 {/if}
 
 <style>
