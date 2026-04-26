@@ -142,9 +142,13 @@ def _save_cached(result: LicenseResult) -> None:
 
 _DEFAULT_VALIDATE_URL = (
     # Public alias documented in the module docstring; resolves to the
-    # license-validation edge function. Internal infra URLs are not committed
-    # to public source — operators set VIBECODED_LICENSE_URL to override.
-    "https://api.vibecodedtools.it/validate"
+    # /validate-tier Supabase edge function (matches the canonical path
+    # used by the Rust launcher's commands/licensing.rs and by the actual
+    # Supabase function source at launcher/supabase/functions/validate-tier/).
+    # Internal infra URLs are not committed to public source — operators
+    # set VIBECODED_LICENSE_URL to override (or VCT_VALIDATE_TIER_URL to
+    # match the Rust launcher's env var; both are honored).
+    "https://api.vibecodedtools.it/validate-tier"
 )
 
 
@@ -178,7 +182,15 @@ def _remote_validate(key: str, machine_hash: str) -> Optional[LicenseResult]:
 
     Never raises.
     """
-    url = os.environ.get("VIBECODED_LICENSE_URL", _DEFAULT_VALIDATE_URL)
+    # Honor either env var: VIBECODED_LICENSE_URL is the historical Python
+    # name; VCT_VALIDATE_TIER_URL is the Rust launcher's name (commands/
+    # licensing.rs). Either one wins over the default; if both are set,
+    # VIBECODED_LICENSE_URL takes precedence (Python path's own var).
+    url = (
+        os.environ.get("VIBECODED_LICENSE_URL")
+        or os.environ.get("VCT_VALIDATE_TIER_URL")
+        or _DEFAULT_VALIDATE_URL
+    )
     timeout = _NETWORK_TIMEOUT_SECONDS
     try:
         import urllib.error
