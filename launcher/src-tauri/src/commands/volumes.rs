@@ -34,9 +34,54 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use tauri::command;
+use tauri::{command, AppHandle, Emitter};
 
 use super::installer::ExistingVolume;
+
+// ---------------------------------------------------------------------------
+// Migration progress event
+// ---------------------------------------------------------------------------
+
+/// Phase-level progress events for `migrate_volumes`. The frontend
+/// subscribes via `listen('volumes://migrate-progress', ...)` and renders
+/// a real progress bar instead of the static "Migrating..." text.
+///
+/// Reviewer A + B round-2: "Migrating..." with no feedback is a UX cliff
+/// for users with multi-GB Weaviate volumes that can take 5+ minutes to
+/// `cp -a`. Emitting at phase boundaries (no rsync-style byte tracking,
+/// since `cp -a` doesn't expose progress) is the smallest fix that
+/// removes the dead-loading-spinner failure mode.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MigratePhase {
+    StoppingContainers,
+    /// `volume_role` is "weaviate" / "ollama" / "code_embed" — frontend
+    /// can show "Copying weaviate..." dynamically.
+    CopyingVolume { volume_role: String, index: u32, total: u32 },
+    WritingOverride,
+    StartingContainers,
+    WaitingForHealth,
+    RemovingLegacyVolumes,
+    Done,
+    /// Emitted before the function returns Err — frontend shows the
+    /// rollback message instead of the success state.
+    RollingBack { reason: String },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MigrateProgress {
+    pub phase: MigratePhase,
+    pub message: String,
+}
+
+const MIGRATE_EVENT: &str = "volumes://migrate-progress";
+
+fn emit_phase(app: &AppHandle, phase: MigratePhase, message: &str) {
+    let _ = app.emit(
+        MIGRATE_EVENT,
+        MigrateProgress { phase, message: message.into() },
+    );
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -720,7 +765,11 @@ pub async fn set_volumes_config_dry_run(path: String) -> Result<MigrationPlan, S
 /// the work — the user explicitly requested migration; failure here
 /// must be reported synchronously so the rollback path is taken.
 #[command]
-pub async fn migrate_volumes(path: String, confirmed: bool) -> Result<(), String> {
+pub async fn migrate_volumes(
+    app: AppHandle,
+    path: String,
+    confirmed: bool,
+) -> Result<(), String> {
     if !confirmed {
         return Err("migration requires confirmed=true".into());
     }
@@ -740,6 +789,7 @@ pub async fn migrate_volumes(path: String, confirmed: bool) -> Result<(), String
 
     // 1. Stop services. NOTE: NO `--volumes` flag — this only stops
     //    containers, leaves volumes intact.
+    emit_phase(&app, MigratePhase::StoppingContainers, "Stopping containers");
     let compose_dir = orchestrator_root()?.join("infrastructure");
     let compose_status = tokio::process::Command::new(&runtime)
         .args(["compose", "stop"])
@@ -748,14 +798,34 @@ pub async fn migrate_volumes(path: String, confirmed: bool) -> Result<(), String
         .await
         .map_err(|e| format!("compose stop spawn: {}", e))?;
     if !compose_status.success() {
+        emit_phase(
+            &app,
+            MigratePhase::RollingBack { reason: "compose stop failed".into() },
+            "Rolling back",
+        );
         return Err(format!("compose stop failed (status {})", compose_status));
     }
 
     // 2. cp -a each volume's mountpoint to <target>/<role>.
-    for ev in &existing {
+    let total = existing.len() as u32;
+    for (i, ev) in existing.iter().enumerate() {
         let role = volume_role(&ev.name);
+        emit_phase(
+            &app,
+            MigratePhase::CopyingVolume {
+                volume_role: role.into(),
+                index: (i as u32) + 1,
+                total,
+            },
+            &format!("Copying {} ({}/{})", role, i + 1, total),
+        );
         let dest = target.join(role);
         if let Err(e) = std::fs::create_dir_all(&dest) {
+            emit_phase(
+                &app,
+                MigratePhase::RollingBack { reason: format!("create dest: {}", e) },
+                "Rolling back",
+            );
             // Failure BEFORE we changed anything substantive — try to
             // bring services back up with the old volumes and bail.
             let _ = restart_services_for_rollback(&runtime, &compose_dir).await;
@@ -772,6 +842,11 @@ pub async fn migrate_volumes(path: String, confirmed: bool) -> Result<(), String
         match cp_status {
             Ok(s) if s.success() => {}
             other => {
+                emit_phase(
+                    &app,
+                    MigratePhase::RollingBack { reason: format!("cp -a failed: {:?}", other) },
+                    "Rolling back",
+                );
                 // Rollback: remove the override (if we wrote one yet —
                 // we haven't at this point), and bring services up with
                 // old volumes.
@@ -788,12 +863,15 @@ pub async fn migrate_volumes(path: String, confirmed: bool) -> Result<(), String
     }
 
     // 3. Write the bind-mount override + .env entry.
+    emit_phase(&app, MigratePhase::WritingOverride, "Writing compose override");
     let body = generate_override_yaml(&OverrideShape::CustomBindMounts(target.clone()));
     if let Err(e) = write_compose_override(&body) {
+        emit_phase(&app, MigratePhase::RollingBack { reason: e.clone() }, "Rolling back");
         let _ = restart_services_for_rollback(&runtime, &compose_dir).await;
         return Err(format!("{} (rolled back; old volumes intact)", e));
     }
     if let Err(e) = write_volumes_env_var(&target) {
+        emit_phase(&app, MigratePhase::RollingBack { reason: e.clone() }, "Rolling back");
         let _ = remove_compose_override();
         let _ = restart_services_for_rollback(&runtime, &compose_dir).await;
         return Err(format!("{} (rolled back; old volumes intact)", e));
@@ -801,6 +879,7 @@ pub async fn migrate_volumes(path: String, confirmed: bool) -> Result<(), String
 
     // 4. compose up -d. If it fails, ditch the override + .env entry
     //    and restart with old volumes.
+    emit_phase(&app, MigratePhase::StartingContainers, "Starting containers");
     let up_status = tokio::process::Command::new(&runtime)
         .args(["compose", "up", "-d"])
         .current_dir(&compose_dir)
@@ -808,6 +887,11 @@ pub async fn migrate_volumes(path: String, confirmed: bool) -> Result<(), String
         .await;
     let up_ok = matches!(&up_status, Ok(s) if s.success());
     if !up_ok {
+        emit_phase(
+            &app,
+            MigratePhase::RollingBack { reason: format!("compose up failed: {:?}", up_status) },
+            "Rolling back",
+        );
         let _ = remove_compose_override();
         let _ = restart_services_for_rollback(&runtime, &compose_dir).await;
         return Err(format!(
@@ -818,8 +902,14 @@ pub async fn migrate_volumes(path: String, confirmed: bool) -> Result<(), String
 
     // 5. Verify health by probing the standard endpoints. Give services
     //    up to 60 seconds to come back online.
+    emit_phase(&app, MigratePhase::WaitingForHealth, "Waiting for services to come up");
     let healthy = wait_until_healthy(60).await;
     if !healthy {
+        emit_phase(
+            &app,
+            MigratePhase::RollingBack { reason: "services unhealthy after 60s".into() },
+            "Rolling back",
+        );
         let _ = remove_compose_override();
         let _ = restart_services_for_rollback(&runtime, &compose_dir).await;
         return Err("services did not come up healthy within 60s on new bind-mounts (rolled back; old volumes intact)".into());
@@ -827,6 +917,7 @@ pub async fn migrate_volumes(path: String, confirmed: bool) -> Result<(), String
 
     // 6. New bind-mounts verified healthy. NOW we may safely remove the
     //    legacy volumes — they're no longer referenced.
+    emit_phase(&app, MigratePhase::RemovingLegacyVolumes, "Cleaning up legacy volumes");
     for ev in &existing {
         // Skip canonical names: those are the same names we just bound,
         // not "legacy" — removing them would point compose's volume
@@ -847,6 +938,7 @@ pub async fn migrate_volumes(path: String, confirmed: bool) -> Result<(), String
         legacy_mapping: Vec::new(),
     };
     write_launcher_config(&cfg)?;
+    emit_phase(&app, MigratePhase::Done, "Migration complete");
     Ok(())
 }
 

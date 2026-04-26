@@ -72,6 +72,24 @@
   let migrationPlan = $state<MigrationPlan | null>(null);
   let migrationError = $state<string | null>(null);
 
+  // Reviewer A + B round-2: surface real phase progress instead of a
+  // dead "Migrating…" spinner. Backend emits 'volumes://migrate-progress'
+  // events from migrate_volumes (commands/volumes.rs::MigratePhase).
+  interface MigratePhaseEvent {
+    phase:
+      | 'stopping_containers'
+      | { copying_volume: { volume_role: string; index: number; total: number } }
+      | 'writing_override'
+      | 'starting_containers'
+      | 'waiting_for_health'
+      | 'removing_legacy_volumes'
+      | 'done'
+      | { rolling_back: { reason: string } };
+    message: string;
+  }
+  let migrationPhaseLabel = $state<string | null>(null);
+  let migrationCopyProgress = $state<{ index: number; total: number } | null>(null);
+
   async function refreshVolumes() {
     volumesLoading = true;
     volumesError = null;
@@ -107,6 +125,29 @@
     }
     migratingVolumes = true;
     migrationError = null;
+    migrationPhaseLabel = 'Starting…';
+    migrationCopyProgress = null;
+
+    // Subscribe to phase events for the duration of this call.
+    // listen() is dynamically imported so the import doesn't pollute the
+    // top-level namespace if Tauri's event API is unavailable in tests.
+    const { listen } = await import('@tauri-apps/api/event');
+    const unlisten = await listen<MigratePhaseEvent>(
+      'volumes://migrate-progress',
+      (ev) => {
+        const { phase, message } = ev.payload;
+        migrationPhaseLabel = message;
+        if (typeof phase === 'object' && 'copying_volume' in phase) {
+          migrationCopyProgress = {
+            index: phase.copying_volume.index,
+            total: phase.copying_volume.total,
+          };
+        } else {
+          migrationCopyProgress = null;
+        }
+      }
+    );
+
     try {
       await invoke('migrate_volumes', {
         path: migrationPlan.to_path,
@@ -118,7 +159,10 @@
     } catch (e) {
       migrationError = String(e);
     } finally {
+      unlisten();
       migratingVolumes = false;
+      migrationPhaseLabel = null;
+      migrationCopyProgress = null;
     }
   }
 
@@ -403,6 +447,11 @@
                       {migratingVolumes ? 'Migrating…' : 'Confirm migration'}
                     </button>
                   </div>
+                  {#if migratingVolumes && migrationPhaseLabel}
+                    <p class="form-hint" style="color:#9cf;">
+                      {migrationPhaseLabel}{#if migrationCopyProgress} ({migrationCopyProgress.index}/{migrationCopyProgress.total}){/if}
+                    </p>
+                  {/if}
                   {#if migrationError}<p class="form-hint" style="color:#f99;">{migrationError}</p>{/if}
                 </div>
               {:else}
