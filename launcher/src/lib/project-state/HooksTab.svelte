@@ -3,6 +3,7 @@
   import { invoke } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
   import type { ProjectHook } from '$lib/types/project-state';
+  import Dropdown from '$lib/components/Dropdown.svelte';
 
   let { projectId }: { projectId: string } = $props();
 
@@ -20,6 +21,7 @@
     'PreToolUse', 'PostToolUse', 'Stop', 'StopFailure',
     'PreCompact', 'PostCompact', 'TeammateIdle', 'TaskCompleted',
   ];
+  const EVENT_OPTIONS = COMMON_EVENTS.map((e) => ({ value: e, label: e }));
 
   async function load() {
     loading = true;
@@ -84,9 +86,7 @@
     <div class="ps-form">
       <div class="ps-form-grid">
         <label><span>Event</span>
-          <select bind:value={nEvent}>
-            {#each COMMON_EVENTS as e}<option value={e}>{e}</option>{/each}
-          </select>
+          <Dropdown options={EVENT_OPTIONS} bind:value={nEvent} />
         </label>
         <label><span>Matcher</span><input bind:value={nMatcher} placeholder="Edit(*) or *" /></label>
         <label class="ps-span2"><span>Command</span>

@@ -6,6 +6,7 @@
   import { toast } from '$lib/stores/toast';
   import Toast from '$lib/components/Toast.svelte';
   import NoProjectBanner from '$lib/components/NoProjectBanner.svelte';
+  import Dropdown from '$lib/components/Dropdown.svelte';
 
   const project = $derived($selectedProject);
   let info = $state<{ port: number; reachable: boolean } | null>(null);
@@ -98,12 +99,16 @@
       <header class="hub-section-h">
         <h2>Messages</h2>
         <div class="hub-poll">
-          <select bind:value={recipient}>
-            <option value="">— pick recipient —</option>
-            {#each apps as a}
-              <option value={a.app_id ?? a.name}>{a.app_id ?? a.name}</option>
-            {/each}
-          </select>
+          <Dropdown
+            options={[
+              { value: '', label: '— pick recipient —' },
+              ...apps.map((a) => ({
+                value: String(a.app_id ?? a.name),
+                label: String(a.app_id ?? a.name),
+              })),
+            ]}
+            bind:value={recipient}
+          />
           <button class="hub-btn" onclick={pollMessages}>Poll</button>
         </div>
       </header>

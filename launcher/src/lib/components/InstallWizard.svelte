@@ -1,6 +1,12 @@
 <script lang="ts">
   import { orchestrator, isOrchestratorBusy, type SystemDetection, type InstallConfig } from '$lib/stores/orchestrator';
   import { currentUser } from '$lib/stores/auth';
+  import Dropdown from '$lib/components/Dropdown.svelte';
+
+  const RUNTIME_OPTIONS = [
+    { value: 'docker', label: 'Docker' },
+    { value: 'podman', label: 'Podman' },
+  ];
 
   let { onClose }: { onClose: () => void } = $props();
 
@@ -186,10 +192,11 @@
               <label>Container runtime</label>
               <div class="select-row">
                 {#if system.has_docker && system.has_podman}
-                  <select bind:value={containerRuntime}>
-                    <option value="docker">Docker</option>
-                    <option value="podman">Podman</option>
-                  </select>
+                  <Dropdown
+                    options={RUNTIME_OPTIONS}
+                    value={containerRuntime ?? 'podman'}
+                    onChange={(v: string) => (containerRuntime = v)}
+                  />
                 {:else}
                   <span class="auto-value">{system.has_docker ? 'Docker' : 'Podman'} (only one available)</span>
                 {/if}
