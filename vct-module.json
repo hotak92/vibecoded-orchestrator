@@ -1,9 +1,10 @@
 {
+  "_canonical_counts_2026_04_26": "Ground truth verified by `find templates/agents/free -name '*.md' | wc -l` etc. on 2026-04-26 against branch oss/round2-reconciliation. Free agents: 19 (templates/agents/free/*.md). MAO agents: 10 (templates/agents/mao/*.md). Skills: 28 (templates/skills/*/, each with SKILL.md). Hooks: 20 (.claude/hooks/*.sh). MCP servers: 4 (claude_mcp_servers/{weaviate_mcp,ollama_mcp,search_mcp,code_embedding_service}). README + CHANGELOG + this file MUST stay in sync with these.",
   "schema_version": "1",
   "id": "orchestrator",
   "name": "VibeCoded Orchestrator",
   "version": "0.1.0",
-  "description": "The core: 16 hooks, 26 agents, 29 skills, KG + Code Graph, 4 MCP servers. Runs locally in Podman/Docker.",
+  "description": "The core: 20 hooks, 19 free agents (+10 MAO opt-in), 28 skills, KG + Code Graph, 4 MCP servers. Runs locally in Podman/Docker.",
   "license": {
     "spdx": "AGPL-3.0-or-later",
     "tier": "free",

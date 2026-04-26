@@ -366,3 +366,54 @@ class TestEndpointSafety:
         with mock.patch.object(urllib.request, "urlopen", side_effect=fake_urlopen):
             fresh_validator.validate_license()
         assert seen["url"] == "https://example.test/v"
+
+    def test_vct_validate_tier_url_env_override_wins(self, fresh_validator, monkeypatch):
+        """The Rust launcher's env var (VCT_VALIDATE_TIER_URL) is honored as
+        a fallback when VIBECODED_LICENSE_URL is unset. Reviewer A round-2
+        flagged a Python-vs-Rust env-var divergence; this test pins the
+        Python side to honor either name so a single env can drive both."""
+        # Make sure the Python-only var is NOT set.
+        monkeypatch.delenv("VIBECODED_LICENSE_URL", raising=False)
+        monkeypatch.setenv("VIBECODED_LICENSE_KEY", "GOOD-UUID")
+        monkeypatch.setenv("VCT_VALIDATE_TIER_URL", "https://staging.test/validate-tier")
+
+        seen: dict = {}
+
+        def fake_urlopen(req, timeout=None):
+            seen["url"] = req.full_url
+            return _fake_http_response(200, {"valid": True, "tier": "pro"})
+
+        with mock.patch.object(urllib.request, "urlopen", side_effect=fake_urlopen):
+            fresh_validator.validate_license()
+        assert seen["url"] == "https://staging.test/validate-tier"
+
+    def test_vibecoded_license_url_takes_precedence_over_vct_var(
+        self, fresh_validator, monkeypatch
+    ):
+        """When BOTH env vars are set, VIBECODED_LICENSE_URL wins (the
+        Python path's own historical name). This avoids surprise after
+        users adopted VIBECODED_LICENSE_URL pre-launcher."""
+        monkeypatch.setenv("VIBECODED_LICENSE_KEY", "GOOD-UUID")
+        monkeypatch.setenv("VIBECODED_LICENSE_URL", "https://python.win/v")
+        monkeypatch.setenv("VCT_VALIDATE_TIER_URL", "https://rust.lose/v")
+
+        seen: dict = {}
+
+        def fake_urlopen(req, timeout=None):
+            seen["url"] = req.full_url
+            return _fake_http_response(200, {"valid": True, "tier": "pro"})
+
+        with mock.patch.object(urllib.request, "urlopen", side_effect=fake_urlopen):
+            fresh_validator.validate_license()
+        assert seen["url"] == "https://python.win/v"
+
+    def test_default_url_uses_validate_tier_path(self, fresh_validator):
+        """The default URL must point at /validate-tier (matches Rust launcher
+        and Supabase function path). Reviewer A: prior default was /validate
+        which 404s against the actual deployed edge function."""
+        url = fresh_validator._DEFAULT_VALIDATE_URL
+        assert url.endswith("/validate-tier"), (
+            f"default URL must end with /validate-tier (matches Supabase "
+            f"function source at launcher/supabase/functions/validate-tier/), "
+            f"got {url!r}"
+        )

@@ -35,10 +35,20 @@ log = logging.getLogger(__name__)
 
 # Public alias for the telemetry edge function. Internal infra URLs are not
 # committed to public source — operators set VIBECODED_TELEMETRY_URL to override.
+#
+# v0.1.0 status: the upload endpoint is NOT yet deployed (Fabio's pending
+# infra task — see docs/TELEMETRY.md). Until it's live, opted-in
+# telemetry events are written to ~/.vibecoded/telemetry_pending.jsonl
+# instead of posted, so users can see what would have been sent. Set
+# VIBECODED_TELEMETRY_URL to a real endpoint when one is deployed.
 DEFAULT_URL = "https://api.vibecodedtools.it/telemetry"
 BATCH_SIZE = 100
 RETRY_DELAYS = (1.0, 4.0, 16.0)  # len = number of retries after the first try
 REQUEST_TIMEOUT = 10.0
+
+# The pending file the uploader writes to when DEFAULT_URL is in effect
+# (i.e. operator hasn't pointed at a real endpoint yet).
+_PENDING_FILE = "telemetry_pending.jsonl"
 
 
 @dataclass
@@ -53,7 +63,10 @@ class UploadResult:
 def _resolve_endpoint(explicit: Optional[str]) -> str:
     if explicit:
         return explicit
-    return os.environ.get("VIBECODED_TELEMETRY_URL", DEFAULT_URL)
+    # Treat empty env var as "unset" so callers can clear it explicitly
+    # (e.g. tests, or operators wanting the default behavior).
+    env_url = os.environ.get("VIBECODED_TELEMETRY_URL", "").strip()
+    return env_url or DEFAULT_URL
 
 
 def _disabled() -> bool:
@@ -119,6 +132,37 @@ def _parse_retry_after(headers: Optional[dict]) -> Optional[float]:
         return None
 
 
+def _write_pending_jsonl(events: List[dict]) -> int:
+    """Append events to ~/.vibecoded/telemetry_pending.jsonl (one JSON
+    object per line). Returns count written.
+
+    Used when the default upload URL is still pointing at the pre-launch
+    stub endpoint — instead of HTTP-posting (and silently failing or
+    spamming an unhealthy endpoint), we persist events to disk so users
+    who opted in can inspect exactly what telemetry the orchestrator
+    WOULD have shipped. Surfaced via `vct-cli telemetry pending` (TODO).
+    """
+    from pathlib import Path
+    pending_dir = Path.home() / ".vibecoded"
+    pending_dir.mkdir(parents=True, exist_ok=True)
+    pending_path = pending_dir / _PENDING_FILE
+    written = 0
+    with pending_path.open("a", encoding="utf-8") as f:
+        for ev in events:
+            f.write(json.dumps(ev, default=str, separators=(",", ":")) + "\n")
+            written += 1
+    return written
+
+
+def _is_pre_launch_stub_endpoint(url: str) -> bool:
+    """True iff the URL is the not-yet-deployed default endpoint.
+
+    Real custom endpoints set via VIBECODED_TELEMETRY_URL bypass this — the
+    operator has explicitly accepted that they're posting somewhere live.
+    """
+    return url == DEFAULT_URL
+
+
 def upload_pending(
     endpoint: Optional[str] = None,
     *,
@@ -128,6 +172,11 @@ def upload_pending(
     """Upload one batch of pending events.
 
     Returns UploadResult regardless of outcome. Never raises.
+
+    v0.1.0: when the resolved endpoint is the pre-launch stub
+    (DEFAULT_URL), events are written to ~/.vibecoded/telemetry_pending.jsonl
+    and marked uploaded in the queue. Real upload resumes once
+    VIBECODED_TELEMETRY_URL points at a deployed endpoint.
     """
     if _disabled():
         return UploadResult(uploaded_count=0, error="telemetry_disabled", retryable=False)
@@ -150,6 +199,32 @@ def upload_pending(
             for e in pending
         ],
     }
+
+    # v0.1.0 pre-launch path: divert to pending file, mark queued events
+    # as uploaded so they aren't infinitely re-tried, and return a
+    # success-shaped result with a marker error code so callers can
+    # distinguish from real uploads if they care.
+    if _is_pre_launch_stub_endpoint(url):
+        try:
+            written = _write_pending_jsonl(body_obj["events"])
+            marked = q.mark_uploaded(ids)
+            return UploadResult(
+                uploaded_count=marked,
+                error="endpoint_pending_deployment",
+                retryable=False,
+                attempts=0,
+                status_code=None,
+            )
+        except OSError as e:
+            log.debug("Telemetry pending-file write failed: %s", e)
+            return UploadResult(
+                uploaded_count=0,
+                error=f"pending_write_failed: {e}",
+                retryable=True,
+                attempts=0,
+                status_code=None,
+            )
+
     try:
         body = json.dumps(body_obj, separators=(",", ":"), default=str).encode("utf-8")
     except (TypeError, ValueError) as e:
