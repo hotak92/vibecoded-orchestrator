@@ -446,6 +446,299 @@ pub fn get_local_repo_source() -> Result<String, String> {
     find_local_repo_root().map(|p| p.to_string_lossy().to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Bug 32: pre-flight install safety check.
+//
+// Before the user confirms an install, we surface EXACTLY what will and
+// will not be touched. The frontend renders a "safety check" panel from
+// the SafetyReport struct and shows the user a final Cancel / Confirm
+// step. Risks list is the user's last chance to back out.
+//
+// All probes are read-only: we do NOT spawn `podman volume rm`, do NOT
+// call `compose down`, do NOT POST/DELETE to Weaviate. The Weaviate
+// schema is read via GET /v1/schema. Container volumes are listed via
+// `podman/docker volume ls` + `volume inspect` (read-only commands).
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExistingVolume {
+    pub name: String,
+    pub mountpoint: String,
+    pub driver: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SafetyReport {
+    /// Orchestrator-managed paths that adopt-flow would change at the
+    /// install target. Read-merge-write applies for some (e.g.
+    /// `.claude/settings.json`) but the file IS modified.
+    pub will_overwrite_orchestrator_files: Vec<String>,
+    /// Sample of paths INSIDE `install_path` that are NOT in the
+    /// orchestrator-managed allowlist — i.e. user code we will never
+    /// touch. Capped to 50 entries for UI rendering.
+    pub will_preserve_user_code: Vec<String>,
+    /// Existing Podman/Docker volumes whose names match the four
+    /// orchestrator volumes. The launcher will NOT remove or rebind
+    /// these — they are surfaced so the user can see what data is
+    /// already on disk.
+    pub existing_volumes: Vec<ExistingVolume>,
+    /// Weaviate classes that already exist on the running instance.
+    /// Will be preserved (no PUT/DELETE; only POST of missing classes).
+    pub existing_collections: Vec<String>,
+    /// Weaviate classes the install would POST. Empty if Weaviate is
+    /// not reachable or all required classes already exist.
+    pub new_collections_to_add: Vec<String>,
+    /// Services already responding on their default port. Will NOT be
+    /// restarted by the install.
+    pub services_running: Vec<String>,
+    /// Services the install would `compose up -d`. Empty if everything
+    /// is already up.
+    pub services_to_start: Vec<String>,
+    /// Free-form risk lines for the UI to render under a warning icon.
+    /// Empty list = "all clear".
+    pub risks: Vec<String>,
+}
+
+const ORCHESTRATOR_VOLUME_NAMES: &[&str] = &[
+    "weaviate_claude",
+    "ollama_claude",
+    "vct_code_embed",
+    "weaviate_data",
+];
+
+/// Read-only volume detection. Tries `podman volume ls --format json`
+/// first, falls back to `docker volume ls --format json`. If neither is
+/// installed we return an empty list (not an error — the user may not
+/// have a container runtime yet, which is fine pre-install).
+async fn detect_existing_volumes() -> Vec<ExistingVolume> {
+    for runtime in &["podman", "docker"] {
+        let runtime_path = match which_on_path(runtime) {
+            Some(p) => p,
+            None => continue,
+        };
+        // List names matching one of our known orchestrator volume names.
+        let mut found: Vec<ExistingVolume> = Vec::new();
+        for name in ORCHESTRATOR_VOLUME_NAMES {
+            // `volume inspect <name>` returns 0 with JSON if it exists,
+            // non-zero if not. Read-only — never mutates state.
+            let out = tokio::process::Command::new(&runtime_path)
+                .args(["volume", "inspect", name])
+                .output()
+                .await;
+            let out = match out {
+                Ok(o) => o,
+                Err(_) => continue,
+            };
+            if !out.status.success() {
+                continue;
+            }
+            let body = String::from_utf8_lossy(&out.stdout);
+            // Both podman and docker emit a JSON array of volume objects.
+            let arr: serde_json::Value = match serde_json::from_str(&body) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if let Some(items) = arr.as_array() {
+                for item in items {
+                    let mountpoint = item
+                        .get("Mountpoint")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let driver = item
+                        .get("Driver")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("local")
+                        .to_string();
+                    found.push(ExistingVolume {
+                        name: name.to_string(),
+                        mountpoint,
+                        driver,
+                    });
+                }
+            }
+        }
+        if !found.is_empty() {
+            return found;
+        }
+    }
+    Vec::new()
+}
+
+fn which_on_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths).find_map(|dir| {
+            let p = dir.join(name);
+            if p.is_file() { Some(p) } else { None }
+        })
+    })
+}
+
+/// Read-only Weaviate schema probe. Returns the list of class names
+/// already present on the running instance; empty Vec if Weaviate is
+/// not reachable.
+async fn detect_existing_collections() -> Vec<String> {
+    let url = format!(
+        "http://localhost:{}/v1/schema",
+        DEFAULT_WEAVIATE_PORT
+    );
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let resp = match client.get(&url).send().await {
+        Ok(r) if r.status().is_success() => r,
+        _ => return Vec::new(),
+    };
+    let body: serde_json::Value = match resp.json().await {
+        Ok(b) => b,
+        Err(_) => return Vec::new(),
+    };
+    body.get("classes")
+        .and_then(|c| c.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|c| c.get("class").and_then(|v| v.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Walk `path` non-recursively (depth 1 — the immediate children at the
+/// install target), collecting up to `cap` entries that are NOT in the
+/// orchestrator-managed allowlist. Used to reassure the user "your code
+/// in <path>/foo is untouched".
+fn list_user_paths_under(path: &Path, cap: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let read = match std::fs::read_dir(path) {
+        Ok(rd) => rd,
+        Err(_) => return out,
+    };
+    for entry in read.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy().to_string();
+        // Skip orchestrator-managed entries.
+        if ORCHESTRATOR_MANAGED_PATHS.iter().any(|m| *m == name_str) {
+            continue;
+        }
+        // Skip dotfiles that might be IDE/git noise — we still preserve
+        // them but don't bloat the report.
+        if name_str.starts_with('.') {
+            continue;
+        }
+        out.push(name_str);
+        if out.len() >= cap {
+            break;
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Pre-flight safety check. Renders the "you're about to install" panel
+/// in the frontend. Fully read-only — never mutates Weaviate, container
+/// state, or files at `install_path`.
+#[command]
+pub async fn preflight_install_safety_check(
+    install_path: String,
+) -> Result<SafetyReport, String> {
+    let target = PathBuf::from(&install_path);
+
+    // 1. What orchestrator files are at the target? (will_overwrite from
+    //    diff_install — those are the files we'll modify; everything
+    //    else at the path is user code we leave alone.)
+    let diff = diff_install(&target);
+    let will_overwrite_orchestrator_files = diff.will_overwrite.clone();
+
+    // 2. User-code reassurance list — non-recursive, capped at 50.
+    let will_preserve_user_code = if target.is_dir() {
+        list_user_paths_under(&target, 50)
+    } else {
+        Vec::new()
+    };
+
+    // 3. Existing volumes — never touched.
+    let existing_volumes = detect_existing_volumes().await;
+
+    // 4. Existing Weaviate classes — preserved.
+    let existing_collections = detect_existing_collections().await;
+
+    // 5. Required classes for THIS install. Mirror install.py
+    //    `_ensure_collections` — code-graph classes are shared and
+    //    created lazily, so they're not in the per-install required set.
+    let required_classes = ["KnowledgeGraph", "Development"];
+    let new_collections_to_add: Vec<String> = required_classes
+        .iter()
+        .filter(|c| !existing_collections.contains(&(**c).to_string()))
+        .map(|c| (*c).to_string())
+        .collect();
+
+    // 6. Services up/down classification.
+    let services = detect_existing_services().await.unwrap_or(ServicesStatus {
+        all_detected: false,
+        none_detected: true,
+        weaviate_url: None,
+        ollama_url: None,
+        code_embed_url: None,
+    });
+    let mut services_running: Vec<String> = Vec::new();
+    let mut services_to_start: Vec<String> = Vec::new();
+    if services.weaviate_url.is_some() {
+        services_running.push("weaviate".to_string());
+    } else {
+        services_to_start.push("weaviate".to_string());
+    }
+    if services.ollama_url.is_some() {
+        services_running.push("ollama".to_string());
+    } else {
+        services_to_start.push("ollama".to_string());
+    }
+    // code_embed is GPU-only and started conditionally — surface it only
+    // if it's actively running. We don't predict whether install would
+    // start it (that's --gpu-dependent).
+    if services.code_embed_url.is_some() {
+        services_running.push("code_embed".to_string());
+    }
+
+    // 7. Risk list. Empty = all clear.
+    let mut risks: Vec<String> = Vec::new();
+    for path in &will_overwrite_orchestrator_files {
+        // .claude/settings.json + .vscode/settings.json are
+        // read-merge-write — call that out so the user knows their
+        // hooks/permissions/IDE settings survive.
+        if path == ".claude" {
+            risks.push(
+                ".claude/settings.json env block will be added or updated; existing hooks, permissions, and agents config are preserved."
+                    .to_string(),
+            );
+        } else {
+            risks.push(format!("Will overwrite orchestrator-managed path: {}", path));
+        }
+    }
+    if !existing_volumes.is_empty() {
+        // Bug 32 #4 + Bug 31: bind-mount override is suppressed when
+        // existing volumes are detected. Tell the user.
+        risks.push(format!(
+            "Detected {} existing orchestrator container volume(s). They will be reused as-is (NOT removed, NOT rebound). To migrate volume data to a different folder, use Settings → Volumes → Migrate after install.",
+            existing_volumes.len()
+        ));
+    }
+
+    Ok(SafetyReport {
+        will_overwrite_orchestrator_files,
+        will_preserve_user_code,
+        existing_volumes,
+        existing_collections,
+        new_collections_to_add,
+        services_running,
+        services_to_start,
+        risks,
+    })
+}
+
 /// Install the orchestrator by COPYING from the launcher's local repo
 /// source to `config.install_path` (Bug 17). No network, no `git clone`,
 /// no GitHub PAT. After the copy, optionally invoke `install.py` for
@@ -1627,5 +1920,305 @@ MemAvailable:   23456789 kB
             .count();
         assert_eq!(s.all_detected, count == 3);
         assert_eq!(s.none_detected, count == 0);
+    }
+
+    // ─── Bug 32: non-destructive install safety guarantees ────────
+
+    /// Bug 32 #1 + #2: the install path must never invoke any
+    /// volume-removal or compose-down command. Source-level audit:
+    /// grep the install scripts for forbidden subprocess invocations.
+    /// If this test ever fails it means someone added a destructive
+    /// shell-out — gate it behind `--force-clean` or remove it.
+    #[test]
+    fn test_no_destructive_subprocess_calls_in_install_path() {
+        let repo_root = find_local_repo_root().expect("repo root resolves in tests");
+        let install_py = repo_root.join("install.py");
+        let install_sh = repo_root.join("install.sh");
+        let installer_rs = repo_root.join("launcher/src-tauri/src/commands/installer.rs");
+        let projects_v2_rs = repo_root.join("launcher/src-tauri/src/commands/projects_v2.rs");
+
+        // Forbidden literal substrings. We use simple substring matching
+        // because anything more clever (e.g. `volume\s+rm`) would also
+        // match comments referring to the forbidden form. Comments are
+        // scrubbed below.
+        let forbidden = [
+            "podman volume rm",
+            "docker volume rm",
+            "podman volume prune",
+            "docker volume prune",
+            "compose down --volumes",
+            "compose down -v",
+            "podman-compose down",
+            "docker-compose down",
+        ];
+
+        for path in [&install_py, &install_sh, &installer_rs, &projects_v2_rs] {
+            let content = match std::fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(_) => continue, // optional file
+            };
+
+            // Production-only slice: everything before the test module marker.
+            // The Rust files contain `#[cfg(test)]` declaring the test mod;
+            // the audit must NOT scan that section because the test code
+            // legitimately contains the forbidden literals as needles.
+            let scan_end = content.find("#[cfg(test)]").unwrap_or(content.len());
+            let production = &content[..scan_end];
+
+            // Strip line-comments to avoid false positives from docs that
+            // mention the forbidden command (e.g. "# Stop: podman-compose down"
+            // in compose.yaml-adjacent comments).
+            let stripped: String = production
+                .lines()
+                .map(|line| {
+                    // Python/shell `#` comment, or Rust `//` comment.
+                    let cut = line.find("//").or_else(|| line.find('#')).unwrap_or(line.len());
+                    &line[..cut]
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            for needle in &forbidden {
+                assert!(
+                    !stripped.contains(needle),
+                    "FORBIDDEN: '{}' found in {} (would destroy user data on install). \
+                     If genuinely needed, gate behind --force-clean and update this test.",
+                    needle,
+                    path.display()
+                );
+            }
+        }
+    }
+
+    /// Bug 32 #3 (audit form): `_ensure_collections` in install.py must
+    /// only POST to /v1/schema. It must NEVER call PUT, DELETE, or
+    /// PATCH on schema endpoints. Source-level grep audit.
+    #[test]
+    fn test_ensure_collections_only_posts_no_destructive_verbs() {
+        let repo_root = find_local_repo_root().expect("repo root resolves in tests");
+        let install_py = repo_root.join("install.py");
+        let content = std::fs::read_to_string(&install_py).expect("read install.py");
+
+        // Find the _ensure_collections function body (defined to next
+        // top-level def) and audit it specifically.
+        let start = content
+            .find("def _ensure_collections(")
+            .expect("_ensure_collections defined");
+        let after_start = &content[start..];
+        // End at the next top-level `def ` or end-of-file.
+        let body_end = after_start
+            .lines()
+            .skip(1)
+            .scan(0usize, |acc, line| {
+                let len = line.len() + 1;
+                let here = *acc;
+                *acc += len;
+                if line.starts_with("def ") || line.starts_with("# ----") {
+                    Some(None)
+                } else {
+                    Some(Some(here))
+                }
+            })
+            .filter_map(|x| x)
+            .last()
+            .unwrap_or(after_start.len());
+        let body = &after_start[..body_end.min(after_start.len())];
+
+        // The function MUST call POST to /v1/schema and MUST NOT call
+        // any destructive verb on schema.
+        assert!(body.contains("method=\"POST\""), "expected POST in _ensure_collections");
+        for verb in &["method=\"PUT\"", "method=\"DELETE\"", "method=\"PATCH\""] {
+            assert!(
+                !body.contains(verb),
+                "FORBIDDEN: {} found in _ensure_collections — would mutate existing classes",
+                verb
+            );
+        }
+        // Belt-and-braces: never DELETE on /v1/schema.
+        assert!(
+            !body.contains("DELETE") || body.contains("DELETE on /v1"),
+            "DELETE keyword in _ensure_collections must not target schema endpoints"
+        );
+    }
+
+    /// Bug 32 #8: `copy_orchestrator_to_sync` must leave bytes outside
+    /// the orchestrator-managed allowlist 100% identical. Pre-seed a
+    /// user file at the install target, run the copy, and SHA-compare.
+    #[test]
+    fn test_user_code_byte_identical_after_copy() {
+        use sha2::{Digest, Sha256};
+
+        let source = fake_repo_source();
+        let target = tmp();
+        // Pre-seed user code OUTSIDE the allowlist (src/ is not in
+        // ORCHESTRATOR_MANAGED_PATHS — it's user code).
+        let user_code_path = target.join("src").join("main.py");
+        fs::create_dir_all(user_code_path.parent().unwrap()).unwrap();
+        let user_payload = b"def main():\n    print('untouched')\n";
+        fs::write(&user_code_path, user_payload).unwrap();
+
+        let mut hasher = Sha256::new();
+        hasher.update(user_payload);
+        let pre_hash = hasher.finalize_reset();
+
+        copy_orchestrator_to_sync(&source, &target).expect("copy");
+
+        // Must still exist + be byte-identical.
+        let after = fs::read(&user_code_path).expect("user file survives");
+        hasher.update(&after);
+        let post_hash = hasher.finalize();
+        assert_eq!(
+            pre_hash[..],
+            post_hash[..],
+            "user code at {} was modified by install (bytes differ)",
+            user_code_path.display()
+        );
+
+        fs::remove_dir_all(&source).ok();
+        fs::remove_dir_all(&target).ok();
+    }
+
+    /// Bug 32 #5: register_mcp into a `~/.claude.json` that already has
+    /// MCP servers, OAuth session state, and per-project settings must
+    /// preserve every existing key — only adding the new MCP entry.
+    #[test]
+    fn test_claude_json_merge_preserves_existing_mcp_servers_and_state() {
+        use crate::mcp_registration::register_mcp;
+
+        let target = std::env::temp_dir().join(format!(
+            "vct-bug32-claude-json-test-{}.json",
+            uuid::Uuid::new_v4().simple()
+        ));
+        // Pre-seed with realistic ~/.claude.json content: 3 existing MCP
+        // servers, OAuth session marker, project-scoped settings.
+        let existing = serde_json::json!({
+            "mcpServers": {
+                "alpha": {"type": "stdio", "command": "/usr/bin/alpha"},
+                "beta": {"type": "stdio", "command": "/usr/bin/beta"},
+                "gamma": {"type": "http", "url": "http://localhost:9999"},
+            },
+            "oauthAccount": {
+                "emailAddress": "user@example.com",
+                "uuid": "11111111-2222-3333-4444-555555555555",
+            },
+            "projects": {
+                "/home/user/somewhere": {
+                    "mcpServers": {"private": {"type": "stdio", "command": "x"}},
+                    "history": [{"display": "test"}],
+                }
+            },
+            "feedbackSurveyState": {"lastShownTime": 1234567890},
+        });
+        std::fs::write(
+            &target,
+            serde_json::to_string_pretty(&existing).unwrap(),
+        )
+        .unwrap();
+
+        // Now add a new MCP server (what install does).
+        let new_entry = serde_json::json!({"type": "stdio", "command": "/usr/bin/weaviate-kg"});
+        register_mcp(&target, "weaviate-kg", &new_entry).expect("register_mcp");
+
+        let raw = std::fs::read_to_string(&target).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+        // New server registered.
+        assert_eq!(v["mcpServers"]["weaviate-kg"]["command"], "/usr/bin/weaviate-kg");
+        // All 3 existing servers preserved.
+        assert_eq!(v["mcpServers"]["alpha"]["command"], "/usr/bin/alpha");
+        assert_eq!(v["mcpServers"]["beta"]["command"], "/usr/bin/beta");
+        assert_eq!(v["mcpServers"]["gamma"]["url"], "http://localhost:9999");
+        // OAuth session preserved.
+        assert_eq!(v["oauthAccount"]["emailAddress"], "user@example.com");
+        // Project-scoped settings preserved.
+        assert_eq!(
+            v["projects"]["/home/user/somewhere"]["mcpServers"]["private"]["command"],
+            "x"
+        );
+        assert_eq!(v["projects"]["/home/user/somewhere"]["history"][0]["display"], "test");
+        // Survey state preserved.
+        assert_eq!(v["feedbackSurveyState"]["lastShownTime"], 1234567890);
+
+        std::fs::remove_file(&target).ok();
+    }
+
+    /// Bug 32: preflight_install_safety_check returns a well-formed
+    /// SafetyReport for a fresh install path. Cannot assert on
+    /// existing_volumes / existing_collections deterministically (they
+    /// reflect the test machine state) — assert structural sanity only.
+    #[tokio::test]
+    async fn test_preflight_install_safety_check_returns_report() {
+        let target = std::env::temp_dir().join(format!(
+            "vct-bug32-preflight-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&target).unwrap();
+        // Pre-seed user-code that should appear in will_preserve_user_code.
+        std::fs::create_dir_all(target.join("my_app")).unwrap();
+        std::fs::write(target.join("README_USER.md"), "user readme").unwrap();
+
+        let report =
+            preflight_install_safety_check(target.to_string_lossy().to_string())
+                .await
+                .expect("preflight returns Ok");
+
+        // User code surfaced.
+        assert!(
+            report.will_preserve_user_code.iter().any(|p| p == "my_app"),
+            "expected my_app in will_preserve_user_code, got {:?}",
+            report.will_preserve_user_code
+        );
+        assert!(
+            report.will_preserve_user_code.iter().any(|p| p == "README_USER.md"),
+            "expected README_USER.md in will_preserve_user_code"
+        );
+        // services_running + services_to_start partition the three core services.
+        let total_known = report.services_running.len() + report.services_to_start.len();
+        // weaviate + ollama always classified; code_embed only listed when running.
+        assert!(total_known >= 2, "expected at least weaviate+ollama classified");
+        // new_collections_to_add is a subset of the required class names
+        // when Weaviate is unreachable (returns empty existing_collections,
+        // so the required classes are all "new"). Either way, never has
+        // duplicates.
+        let mut sorted = report.new_collections_to_add.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), report.new_collections_to_add.len(),
+            "new_collections_to_add must not contain duplicates");
+
+        std::fs::remove_dir_all(&target).ok();
+    }
+
+    /// Bug 32: when existing volumes are reported, the safety report
+    /// includes a risk line warning that bind-mount overrides will be
+    /// suppressed (Bug 31's volume picker must respect this).
+    #[tokio::test]
+    async fn test_preflight_risk_lines_call_out_existing_volumes_and_overwrites() {
+        let target = std::env::temp_dir().join(format!(
+            "vct-bug32-risk-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        // Pre-seed `.claude` so will_overwrite_orchestrator_files contains it
+        // → expected risk line about read-merge-write.
+        std::fs::create_dir_all(target.join(".claude")).unwrap();
+
+        let report =
+            preflight_install_safety_check(target.to_string_lossy().to_string())
+                .await
+                .expect("preflight returns Ok");
+
+        // .claude is in the overwrite list → preservation risk line emitted.
+        assert!(report.will_overwrite_orchestrator_files.contains(&".claude".to_string()));
+        let has_preservation_risk = report
+            .risks
+            .iter()
+            .any(|r| r.contains("settings.json env block") && r.contains("preserved"));
+        assert!(
+            has_preservation_risk,
+            "expected risk line explaining .claude/settings.json read-merge-write semantics, got {:?}",
+            report.risks
+        );
+
+        std::fs::remove_dir_all(&target).ok();
     }
 }

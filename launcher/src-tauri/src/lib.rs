@@ -157,6 +157,7 @@ pub fn run() {
             commands::installer::check_for_updates,
             commands::installer::install_orchestrator,
             commands::installer::preview_install,
+            commands::installer::preflight_install_safety_check,
             commands::installer::update_orchestrator,
             commands::installer::get_local_repo_source,
             commands::installer::inspect_orchestrator_at,
