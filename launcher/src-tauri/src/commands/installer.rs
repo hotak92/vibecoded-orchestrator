@@ -499,17 +499,41 @@ pub struct SafetyReport {
     pub risks: Vec<String>,
 }
 
-const ORCHESTRATOR_VOLUME_NAMES: &[&str] = &[
-    "weaviate_claude",
-    "ollama_claude",
-    "vct_code_embed",
+/// All volume names the orchestrator might own at this point on a
+/// machine. Includes:
+///   - canonical names from `infrastructure/docker-compose.yml`
+///     (`weaviate_data`, `ollama_data`, `code_embed_cache`)
+///   - historical / project-suffixed names users may have created
+///     before the canonical compose file existed (Bug 31 migration)
+///
+/// Used by both Bug 32 (preflight surfacing) and Bug 31 (volume picker
+/// existing-volume detection).
+pub const ORCHESTRATOR_VOLUME_NAMES: &[&str] = &[
+    // Canonical (current compose)
     "weaviate_data",
+    "ollama_data",
+    "code_embed_cache",
+    // Historical project-suffixed names (Bug 31 — generate `external: true`
+    // mapping to keep the user's existing data without recreating volumes)
+    "weaviate_claude",
+    "weaviate_ARTup",
+    "ollama_claude",
+    "ollama_ARTup",
+    "vct_code_embed",
 ];
 
 /// Read-only volume detection. Tries `podman volume ls --format json`
 /// first, falls back to `docker volume ls --format json`. If neither is
 /// installed we return an empty list (not an error — the user may not
 /// have a container runtime yet, which is fine pre-install).
+///
+/// Bug 31: also exposed as `detect_existing_volumes_for_volumes_module`
+/// so the volumes command module can reuse the same detector instead
+/// of duplicating it.
+pub async fn detect_existing_volumes_for_volumes_module() -> Vec<ExistingVolume> {
+    detect_existing_volumes().await
+}
+
 async fn detect_existing_volumes() -> Vec<ExistingVolume> {
     for runtime in &["podman", "docker"] {
         let runtime_path = match which_on_path(runtime) {

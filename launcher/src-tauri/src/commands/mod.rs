@@ -15,3 +15,4 @@ pub mod projects_v2;
 pub mod project_state_cmd;
 pub mod secrets_cmd;
 pub mod telemetry_cmd;
+pub mod volumes;
