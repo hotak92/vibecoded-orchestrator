@@ -1374,8 +1374,10 @@ def _print_next_steps(sysinfo: SystemInfo, args: argparse.Namespace) -> None:
 
     print("Next steps:")
     print()
-    print(f"  1. Open this project in VS Code:")
-    print(f"     code {PROJECT_ROOT}")
+    print(f"  1. Open this project in your editor (any of these works):")
+    print(f"       VS Code:           code {PROJECT_ROOT}")
+    print(f"       Claude Code CLI:   cd {PROJECT_ROOT} && claude")
+    print(f"       Claude Desktop:    open the folder via the desktop app")
     print()
     print(f"  2. Start a Claude Code session (the orchestrator activates automatically):")
     print(f"     claude")
