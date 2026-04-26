@@ -50,6 +50,31 @@
   let servicesError = $state<string | null>(null);
   let useSeparateContainers = $state(false);
 
+  // Bug 31: volume location picker state. Loaded once on step 3 entry.
+  // - When existing volumes are detected, the picker is REPLACED by a
+  //   read-only info panel and the user can NOT pick a custom path
+  //   (Bug 32 contract: no override generated when volumes already exist).
+  // - When no volumes exist, the user picks default vs custom.
+  interface VolumeWithSize {
+    name: string;
+    mountpoint: string;
+    size_bytes: number | null;
+    size_human: string | null;
+    role: string;
+  }
+  interface VolumesConfig {
+    volumes_path: string;
+    mode: string; // "default" | "detected" | "custom"
+    legacy_mapping: { volume_name: string; mountpoint: string; role: string }[];
+    total_size_human: string | null;
+    volumes: VolumeWithSize[];
+  }
+  let volumesConfig = $state<VolumesConfig | null>(null);
+  let volumesError = $state<string | null>(null);
+  let volumeChoice = $state<'default' | 'custom'>('default');
+  let customVolumesPath = $state('');
+  let volumesPickError = $state<string | null>(null);
+
   // Bug 22: optional GitHub PAT for future auto-update flow.
   let githubPat = $state('');
   let savingPat = $state(false);
@@ -168,6 +193,24 @@
     } catch (e) {
       servicesError = String(e);
     }
+    // Bug 31: probe existing volumes so the picker can render either the
+    // chooser (no volumes) or the read-only info panel (volumes exist).
+    try {
+      volumesConfig = await invoke<VolumesConfig>('get_volumes_config');
+    } catch (e) {
+      volumesError = String(e);
+    }
+  }
+
+  // Bug 31: ask the user to pick a folder for custom volumes.
+  async function pickCustomVolumesFolder() {
+    volumesPickError = null;
+    const picked = await pickDirectory({
+      title: 'Pick a folder for container volumes',
+    });
+    if (picked) {
+      customVolumesPath = picked;
+    }
   }
 
   function buildInstallConfig() {
@@ -197,6 +240,29 @@
           installing = false;
           return;
         }
+      }
+
+      // Bug 31: persist the volume location BEFORE install_orchestrator
+      // touches anything. The backend ignores the path argument when
+      // existing volumes are detected (Bug 32 contract — no override
+      // generated) and falls back to the "detected" branch.
+      // Treat picker errors as install errors so the user sees them.
+      try {
+        const chosenPath =
+          volumesConfig?.mode === 'detected' || volumeChoice === 'default'
+            ? 'default'
+            : customVolumesPath.trim();
+        if (volumeChoice === 'custom' && !customVolumesPath.trim()) {
+          throw new Error('Pick a custom volumes folder or switch back to Default.');
+        }
+        volumesConfig = await invoke<VolumesConfig>('set_volumes_config_for_install', {
+          path: chosenPath,
+        });
+      } catch (e) {
+        volumesPickError = String(e);
+        installError = String(e);
+        installing = false;
+        return;
       }
 
       // Tauri serializes the command arg name (`config`) as the JSON key,
@@ -472,6 +538,80 @@
           {:else if servicesError}
             <p class="ow-secondary">Couldn't probe services ({servicesError}).</p>
           {/if}
+
+          <!-- Bug 31: container volumes location. Two render paths:
+                  - existing volumes detected: read-only info panel,
+                    no picker. Migration is via Settings → Preferences.
+                  - no volumes: pick default vs custom. -->
+          {#if volumesConfig}
+            <div class="ow-volumes">
+              <h3>Container volumes location</h3>
+              {#if volumesConfig.mode === 'detected' && volumesConfig.volumes.length > 0}
+                <p class="ow-secondary">
+                  Existing volumes detected — keeping them in place. To move
+                  them later, use Settings → Preferences → Shared services →
+                  Volume location.
+                </p>
+                <ul class="ow-volumes-list">
+                  {#each volumesConfig.volumes as v}
+                    <li>
+                      <span class="ow-vol-role">{v.role}</span>
+                      <code class="ow-mono">{v.mountpoint}</code>
+                      {#if v.size_human}
+                        <span class="ow-vol-size">{v.size_human}</span>
+                      {/if}
+                    </li>
+                  {/each}
+                </ul>
+              {:else}
+                <p class="ow-secondary">
+                  Where Weaviate's vector index, Ollama's models, and the
+                  code-embed cache live. Defaults to your container engine's
+                  standard location. Move it if you have limited disk on
+                  <code class="ow-mono">$HOME</code>.
+                </p>
+                <label class="ow-radio">
+                  <input
+                    type="radio"
+                    name="volumes-choice"
+                    value="default"
+                    bind:group={volumeChoice}
+                  />
+                  <span>
+                    Default (managed by your container engine):
+                    <code class="ow-mono">~/.local/share/containers/storage/volumes/</code>
+                  </span>
+                </label>
+                <label class="ow-radio">
+                  <input
+                    type="radio"
+                    name="volumes-choice"
+                    value="custom"
+                    bind:group={volumeChoice}
+                  />
+                  <span>Custom path:</span>
+                </label>
+                {#if volumeChoice === 'custom'}
+                  <div class="ow-volumes-custom">
+                    <input
+                      type="text"
+                      bind:value={customVolumesPath}
+                      placeholder="/mnt/big-disk/vct-volumes"
+                    />
+                    <button class="ow-btn" onclick={pickCustomVolumesFolder} type="button">
+                      Browse…
+                    </button>
+                  </div>
+                  {#if volumesPickError}
+                    <p class="ow-error">{volumesPickError}</p>
+                  {/if}
+                {/if}
+              {/if}
+            </div>
+          {:else if volumesError}
+            <p class="ow-secondary">Couldn't probe volumes ({volumesError}).</p>
+          {/if}
+
           {#if installed}
             <p class="ow-ok">Orchestrator already installed at this path.</p>
           {:else}
@@ -705,4 +845,16 @@
   .ow-checkbox { display: flex; gap: 6px; align-items: center; margin-top: 8px; font-size: 12px; color: #ccc; cursor: pointer; }
   .ow-checkbox input { margin: 0; }
   .ow-warn { color: #ffb84a; }
+
+  /* Bug 31: container volumes location picker. */
+  .ow-volumes { margin-top: 12px; padding: 10px 12px; border: 1px solid rgba(255,255,255,0.08); border-radius: 6px; background: rgba(255,255,255,0.02); }
+  .ow-volumes h3 { font-size: 13px; margin: 0 0 6px; color: #ccc; }
+  .ow-volumes-list { list-style: none; padding: 0; margin: 0 0 6px; font-size: 12px; }
+  .ow-volumes-list li { padding: 2px 0; color: #ccc; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+  .ow-vol-role { display: inline-block; min-width: 80px; color: #c4b3ff; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
+  .ow-vol-size { color: #888; font-size: 11px; }
+  .ow-radio { display: flex; gap: 8px; align-items: flex-start; margin-top: 6px; font-size: 12px; color: #ccc; cursor: pointer; }
+  .ow-radio input { margin: 3px 0 0; flex-shrink: 0; }
+  .ow-volumes-custom { display: flex; gap: 6px; margin: 6px 0 0 22px; }
+  .ow-volumes-custom input[type="text"] { flex: 1; padding: 4px 8px; font-family: ui-monospace, monospace; font-size: 12px; background: rgba(0,0,0,0.3); color: #eee; border: 1px solid rgba(255,255,255,0.08); border-radius: 4px; }
 </style>
