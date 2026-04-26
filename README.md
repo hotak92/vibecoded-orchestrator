@@ -14,7 +14,7 @@ The orchestrator is an invisible infrastructure layer for [Claude Code](https://
 |---------|----------------|
 | **Context amnesia** | Knowledge Graph with semantic search — Claude remembers across sessions |
 | **Code blindness** | Code Graph indexes modules, classes, functions, APIs, and cross-service calls for your whole repo |
-| **Workflow repetition** | 26 specialist agents + 29 skills auto-install; 16 hooks automate repetitive ops (sync, security scan, context injection) |
+| **Workflow repetition** | 19 free agents + 28 skills auto-install; 20 hooks automate repetitive ops (sync, security scan, context injection). Optional MAO add-on adds 10 specialist agents. |
 
 You use Claude Code normally. The orchestrator works in the background via hooks and MCP servers.
 
@@ -22,9 +22,9 @@ You use Claude Code normally. The orchestrator works in the background via hooks
 
 - **Knowledge Graph** — Markdown nodes with typed WikiLinks, stored in Weaviate with semantic embeddings (qwen3 1024-dim by default; optional OpenAI)
 - **Code Graph** — AST analysis via Tree-sitter across 10+ languages: `CodeModule`, `CodeClass`, `CodeFunction`, `CodeAPI`, `CodeInteraction`
-- **16 Automation Hooks** — SessionStart through Stop: context injection, auto-sync on file edits, credential scanning, KG/code graph maintenance
+- **20 Automation Hooks** — SessionStart through Stop: context injection, auto-sync on file edits, credential scanning, KG/code graph maintenance
 - **4 MCP Servers** — Weaviate (semantic search), Ollama (local LLM + embeddings), search (web + code + arXiv), code-embedding (CodeSage-Large-v2 via FastAPI)
-- **26 Agents + 29 Skills** — shipped via `install.py` templates; opt-in MAO-tier specialists add 10 more agents
+- **19 Free Agents + 28 Skills** — shipped via `install.py` templates; opt-in MAO-tier add-on installs 10 specialist agents
 - **Workflow Automation** — session state tracking, plans, memory management, compaction-preserving context replay
 
 ## Quick Install
@@ -159,7 +159,7 @@ Claude generates response
 ```
 vibecoded-orchestrator/
   .claude/
-    hooks/               # 16 automation hooks (SessionStart → Stop)
+    hooks/               # 20 automation hooks (SessionStart → Stop)
     scripts/             # CLI tools for KG and code graph
     settings.json        # Claude Code configuration
   claude_mcp_servers/
@@ -168,9 +168,9 @@ vibecoded-orchestrator/
     search_mcp/          # Web + code + paper search MCP server
     code_embedding_service/   # GPU code embedding service (CodeSage-Large-v2)
   templates/
-    agents/free/         # 16 free-tier agents copied to .claude/agents/ at install time
+    agents/free/         # 19 free-tier agents copied to .claude/agents/ at install time
     agents/mao/          # 10 MAO-tier specialist agents (opt-in)
-    skills/              # 29 skills copied to .claude/skills/ at install time
+    skills/              # 28 skills copied to .claude/skills/ at install time
   infrastructure/
     docker-compose.yml       # Weaviate + Ollama containers
     docker-compose.gpu.yml   # NVIDIA GPU overlay
@@ -198,7 +198,7 @@ vibecoded-orchestrator/
 
 | Tier | Target price | What you get |
 |------|-------|-------------|
-| **Free** | €0 | Full orchestrator: KG, code graph, hooks, MCP servers, 16 agents, 29 skills. AGPL-3.0 licensed. |
+| **Free** | €0 | Full orchestrator: KG, code graph, hooks, MCP servers, 19 agents, 28 skills. AGPL-3.0 licensed. |
 | **Pro** | €19/mo, €149/yr, €199 lifetime (cap 100) | Free + RL-scored retrieval reranking, curated agent packs, auto-updates |
 | **MAO** | €99/mo, €799/yr, €999 lifetime (cap 30) | Pro + 10 specialist agents + Tauri desktop UI + multi-agent maestro runtime |
 | **Enterprise** | From €500/mo | MAO + SOC 2 compliance track, priority support, commercial AGPL exemption, custom SLAs |
