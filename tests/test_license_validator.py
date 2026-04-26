@@ -345,6 +345,69 @@ class TestPublicAPI:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+class TestAdminTier:
+    """Bug 33: admin tier end-to-end on the client side.
+
+    The server-side decision (variant_id → admin) lives in the Deno tests
+    at launcher/supabase/functions/_shared/variant_map_test.ts. Here we
+    exercise the Python validator's behavior assuming the server returned
+    tier=admin (i.e. it consulted LS_ADMIN_VARIANT_IDS and matched).
+    """
+
+    def test_admin_response_returns_admin_tier(self, fresh_validator, monkeypatch):
+        monkeypatch.setenv("VIBECODED_LICENSE_KEY", "ADMIN-UUID")
+        resp = _fake_http_response(200, {
+            "valid": True,
+            "tier": "admin",
+            "expires_at": None,
+            "message": "Validated.",
+            "is_admin": True,
+            "unlock_all_modules": True,
+            "dev_features_enabled": True,
+        })
+        with mock.patch.object(urllib.request, "urlopen", return_value=resp):
+            result = fresh_validator.validate_license()
+        assert result.tier == "admin"
+        assert result.valid is True
+
+    def test_is_admin_true_when_server_classifies_admin(
+        self, fresh_validator, monkeypatch
+    ):
+        monkeypatch.setenv("VIBECODED_LICENSE_KEY", "ADMIN-UUID")
+        resp = _fake_http_response(200, {
+            "valid": True,
+            "tier": "admin",
+            "is_admin": True,
+            "message": "Validated.",
+        })
+        with mock.patch.object(urllib.request, "urlopen", return_value=resp):
+            assert fresh_validator.get_tier(force_refresh=True) == "admin"
+        assert fresh_validator.is_admin() is True
+
+    def test_is_admin_false_for_pro(self, fresh_validator, monkeypatch):
+        monkeypatch.setenv("VIBECODED_LICENSE_KEY", "PRO-UUID")
+        resp = _fake_http_response(200, {"valid": True, "tier": "pro"})
+        with mock.patch.object(urllib.request, "urlopen", return_value=resp):
+            fresh_validator.get_tier(force_refresh=True)
+        assert fresh_validator.is_admin() is False
+
+    def test_is_admin_false_when_no_key(self, fresh_validator):
+        # No license at all → free → not admin.
+        assert fresh_validator.is_admin() is False
+
+    def test_admin_satisfies_require_tier_enterprise(
+        self, fresh_validator, monkeypatch
+    ):
+        """Admin is treated as a strict superset of enterprise."""
+        monkeypatch.setenv("VIBECODED_LICENSE_KEY", "ADMIN-UUID")
+        resp = _fake_http_response(200, {"valid": True, "tier": "admin"})
+        with mock.patch.object(urllib.request, "urlopen", return_value=resp):
+            fresh_validator.get_tier(force_refresh=True)
+        assert fresh_validator.require_tier("enterprise") is True
+        assert fresh_validator.require_tier("mao") is True
+        assert fresh_validator.require_tier("pro") is True
+
+
 class TestEndpointSafety:
     def test_default_url_is_public_alias_only(self, fresh_validator):
         url = fresh_validator._DEFAULT_VALIDATE_URL
