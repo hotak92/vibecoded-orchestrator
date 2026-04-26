@@ -56,3 +56,6 @@ gethostname = "0.5"
 mac_address = "1"
 hex = "0.4"
 
+# System info (RAM, CPU). MIT-licensed, lightweight. Used by detect_system.
+sysinfo = { version = "0.32", default-features = false, features = ["system"] }
+

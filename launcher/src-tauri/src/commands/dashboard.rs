@@ -193,6 +193,16 @@ pub async fn update_mcp_setting(
 }
 
 /// Register a new custom MCP server (e.g., user adds Transcrypt live MCP).
+///
+/// Side effects:
+/// 1. Persists the server entry into `~/.vct/orchestrator.json` (so the
+///    launcher remembers it across restarts).
+/// 2. Patches `~/.claude.json` `mcpServers.<id>` with a full
+///    `{type, command, args, env}` block. This is the file Claude Code
+///    reads at startup; without this step the server only existed in
+///    the launcher's mental model.
+/// 3. Re-applies the legacy env injection into the orchestrator's
+///    `.claude/settings.json` for backward compat with the dashboard.
 #[command]
 pub async fn add_custom_mcp_server(server: McpServerConfig) -> Result<Vec<McpServerConfig>, String> {
     let mut config = load_config();
@@ -202,11 +212,40 @@ pub async fn add_custom_mcp_server(server: McpServerConfig) -> Result<Vec<McpSer
         return Err(format!("MCP server '{}' already exists", server.id));
     }
 
+    let id = server.id.clone();
+    let entry = mcp_server_to_claude_entry(&server);
+
     config.mcp_servers.push(server);
     save_config(&config).await?;
+
+    // Patch the user-scope Claude config so the new MCP is actually
+    // visible to Claude Code. Failures here are surfaced — a silent
+    // no-op was the original "add doesn't work" bug.
+    let target = crate::mcp_registration::user_claude_json();
+    crate::mcp_registration::register_mcp(&target, &id, &entry)?;
+
     apply_mcp_to_claude_settings(&config).await?;
 
     Ok(config.mcp_servers)
+}
+
+/// Convert a launcher McpServerConfig into the JSON shape Claude Code
+/// expects under `mcpServers.<name>`. Filters out empty env entries so
+/// the resulting JSON is clean.
+fn mcp_server_to_claude_entry(server: &crate::types::McpServerConfig) -> serde_json::Value {
+    let env: serde_json::Map<String, serde_json::Value> = server
+        .env
+        .iter()
+        .filter(|(_, v)| !v.is_empty())
+        .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+        .collect();
+
+    serde_json::json!({
+        "type": "stdio",
+        "command": server.command,
+        "args": server.args,
+        "env": env,
+    })
 }
 
 /// Remove a custom MCP server.
@@ -222,6 +261,12 @@ pub async fn remove_mcp_server(mcp_id: String) -> Result<Vec<McpServerConfig>, S
 
     config.mcp_servers.retain(|s| s.id != mcp_id);
     save_config(&config).await?;
+
+    // Mirror the removal into ~/.claude.json so Claude Code stops
+    // launching the server on next start.
+    let target = crate::mcp_registration::user_claude_json();
+    let _ = crate::mcp_registration::deregister_mcp(&target, &mcp_id);
+
     apply_mcp_to_claude_settings(&config).await?;
 
     Ok(config.mcp_servers)

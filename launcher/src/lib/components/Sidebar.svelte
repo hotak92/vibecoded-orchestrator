@@ -42,6 +42,15 @@
           match: (p) => p.startsWith('/modules'),
         },
         {
+          // Bug 5: Store needs to be a discoverable route. Sits between
+          // Modules and Project so users browsing for tools find it
+          // before they look at per-project state.
+          href: '/store',
+          label: 'Store',
+          sub: 'Pro plan, Multi-Agent Orchestrator, and other tools',
+          match: (p) => p.startsWith('/store'),
+        },
+        {
           href: projectId ? `/project/${projectId}` : '/project',
           label: 'Project',
           sub: 'Agents, skills, hooks, permissions, secrets',
@@ -64,12 +73,8 @@
           sub: 'Browse what your code knows about itself',
           match: (p) => p.startsWith('/codegraph'),
         },
-        {
-          href: '/glossary',
-          label: 'Glossary',
-          sub: 'Plain-English explanations of terms',
-          match: (p) => p.startsWith('/glossary'),
-        },
+        // Bug 7: Glossary moved to the bottom of the System group so
+        // Knowledge stays focused on actual knowledge surfaces.
       ],
     },
     {
@@ -99,12 +104,6 @@
           match: (p) => p.startsWith('/mcp'),
         },
         {
-          href: '/audit',
-          label: 'Audit log',
-          sub: 'Who changed what, when',
-          match: (p) => p.startsWith('/audit'),
-        },
-        {
           href: '/telemetry',
           label: 'Telemetry',
           sub: 'Anonymous usage stats and consent',
@@ -115,6 +114,22 @@
           label: 'Preferences',
           sub: 'Tray, updates, behavior',
           match: (p) => p.startsWith('/preferences'),
+        },
+        // Bug 9: Audit demoted to second-to-last position. Most users
+        // never need it; keeping it visible but unobtrusive.
+        {
+          href: '/audit',
+          label: 'Audit log',
+          sub: 'History of every change to your projects — useful for compliance and rollback.',
+          match: (p) => p.startsWith('/audit'),
+        },
+        // Bug 7: Glossary at the very bottom of the sidebar — reference
+        // material, not a primary nav target.
+        {
+          href: '/glossary',
+          label: 'Glossary',
+          sub: 'Plain-English explanations of terms',
+          match: (p) => p.startsWith('/glossary'),
         },
       ],
     },

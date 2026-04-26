@@ -343,3 +343,60 @@ impl Db {
         Ok(rows)
     }
 }
+
+#[cfg(test)]
+mod audit_tests {
+    use crate::db::Db;
+    use serde_json::json;
+
+    #[test]
+    fn audit_writes_row_with_actor_and_operation() {
+        let db = Db::open_in_memory().expect("open in-memory");
+
+        db.audit_as(
+            "alice",
+            "project_create",
+            Some("proj-1"),
+            None,
+            &json!({"host": "base", "name": "demo"}),
+        )
+        .expect("audit insert");
+
+        let rows = db
+            .audit_list(None, None, None, None, None, 100)
+            .expect("audit_list");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].operation, "project_create");
+        assert_eq!(rows[0].actor, "alice");
+        assert_eq!(rows[0].project_id.as_deref(), Some("proj-1"));
+        assert!(rows[0].detail.contains("\"host\":\"base\""));
+        assert!(rows[0].detail.contains("\"name\":\"demo\""));
+    }
+
+    #[test]
+    fn audit_filter_by_project_and_actor() {
+        let db = Db::open_in_memory().expect("open in-memory");
+
+        db.audit_as("alice", "secret_set", Some("p1"), None, &json!({"k": "OPENAI"}))
+            .unwrap();
+        db.audit_as("bob", "license_activate", None, None, &json!({})).unwrap();
+        db.audit_as("alice", "module_install", Some("p2"), Some("rag"), &json!({}))
+            .unwrap();
+
+        let by_alice = db
+            .audit_list(None, Some("alice"), None, None, None, 100)
+            .unwrap();
+        assert_eq!(by_alice.len(), 2);
+
+        let on_p1 = db.audit_list(Some("p1"), None, None, None, None, 100).unwrap();
+        assert_eq!(on_p1.len(), 1);
+        assert_eq!(on_p1[0].operation, "secret_set");
+
+        let by_search = db
+            .audit_list(None, None, None, None, Some("license"), 100)
+            .unwrap();
+        assert_eq!(by_search.len(), 1);
+        assert_eq!(by_search[0].operation, "license_activate");
+    }
+}

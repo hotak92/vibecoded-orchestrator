@@ -29,6 +29,21 @@
   let filterText = $state('');
   let filterActor = $state('');
 
+  // Bug 9: dismissible plain-English explainer. Most users never need
+  // this tab; the explainer tells them what it's for and how to use
+  // it. Persists `vct.audit_intro_dismissed=true` in localStorage so
+  // power-users can collapse it after first read.
+  const INTRO_KEY = 'vct.audit_intro_dismissed';
+  let introDismissed = $state(false);
+  if (typeof localStorage !== 'undefined') {
+    try { introDismissed = localStorage.getItem(INTRO_KEY) === 'true'; }
+    catch {}
+  }
+  function dismissIntro() {
+    introDismissed = true;
+    try { localStorage.setItem(INTRO_KEY, 'true'); } catch {}
+  }
+
   // Time-range filter. 'custom' uses customFrom/customTo (epoch ms or
   // null = open). Bounds and the search/actor filters are pushed into
   // the SQL layer of `list_audit_events` so the wire payload only
@@ -185,11 +200,39 @@
   <header class="page-header">
     <h1>Audit log</h1>
     <p class="lede">
-      Mutating operations recorded by the launcher: project create / rename /
-      delete, module install / uninstall, secret set / clear, license
-      activate / deactivate, access grants, and more.
+      Every state-changing action across your projects (project create / rename
+      / delete, secret rotations, license events, module installs, KG /
+      codegraph access changes, hook + agent toggles). Useful for compliance,
+      NDA-bound consultant work, and SOC2 deliverables.
+      Stored locally in <code>~/.vct/launcher.db</code> — see
+      <a href="https://github.com/VibeCoded-Tools/orchestrator/blob/main/launcher/docs/AUDIT.md" target="_blank" rel="noopener">docs/AUDIT.md</a>
+      for the full schema and operation list.
     </p>
   </header>
+
+  {#if !introDismissed}
+    <div class="audit-intro">
+      <button class="audit-intro-dismiss" onclick={dismissIntro} aria-label="Hide introduction">× hide</button>
+      <h3>What's this page for?</h3>
+      <p>
+        Every time you create a project, set a secret, install a module,
+        activate a license, change KG access — that action gets logged here
+        automatically. This page is a read-only history; you can't change
+        settings from here (use Settings → Secrets, /project/&lt;id&gt;,
+        etc. for that).
+      </p>
+      <p>Most users won't need this tab. It's useful when:</p>
+      <ul>
+        <li>You're a freelance consultant proving to a client what changed in their project (export to CSV)</li>
+        <li>Something broke after a configuration change and you want to see when/by whom</li>
+        <li>You need a SOC2-style audit deliverable</li>
+      </ul>
+      <p class="muted">
+        Tip: filter by project, by actor, by date range, or search inside
+        the operation/detail. Hit Export CSV to send to a client.
+      </p>
+    </div>
+  {/if}
 
   <div class="controls">
     <label>
@@ -317,6 +360,60 @@
     font-size: 13px;
     color: var(--color-mid);
     max-width: 720px;
+  }
+
+  .audit-intro {
+    position: relative;
+    margin: 0 0 18px;
+    padding: 14px 18px;
+    background: rgba(0, 191, 166, 0.06);
+    border: 1px solid rgba(0, 191, 166, 0.18);
+    border-radius: 12px;
+    color: var(--color-text);
+    max-width: 760px;
+  }
+  .audit-intro h3 {
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--color-teal, #0fc);
+    margin: 0 0 8px;
+  }
+  .audit-intro p {
+    font-size: 13px;
+    color: var(--color-mid);
+    line-height: 1.55;
+    margin: 0 0 8px;
+  }
+  .audit-intro ul {
+    margin: 0 0 8px 0;
+    padding-left: 20px;
+    font-size: 12px;
+    color: var(--color-mid);
+    line-height: 1.55;
+  }
+  .audit-intro li {
+    margin-bottom: 3px;
+  }
+  .audit-intro p.muted {
+    color: var(--color-muted);
+    font-size: 12px;
+    font-style: italic;
+  }
+  .audit-intro-dismiss {
+    position: absolute;
+    top: 8px;
+    right: 10px;
+    background: none;
+    border: none;
+    color: var(--color-muted);
+    font-size: 11px;
+    cursor: pointer;
+    padding: 4px 6px;
+    border-radius: 4px;
+  }
+  .audit-intro-dismiss:hover {
+    color: var(--color-text);
+    background: rgba(255, 255, 255, 0.06);
   }
 
   .controls {
