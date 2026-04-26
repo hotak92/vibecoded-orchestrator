@@ -121,6 +121,28 @@ podman ps   # or `docker ps`
 
 **Advanced**: set `VCT_FORCE_SEPARATE_CONTAINERS=1` and override `WEAVIATE_PORT` / `OLLAMA_PORT` / `CODE_EMBED_PORT` to give an install its own containers — useful for hard isolation between, e.g., work and personal setups, but costs extra disk and RAM per install.
 
+### Container volumes location (Bug 31)
+
+The three orchestrator volumes — `weaviate_data`, `ollama_data`, `code_embed_cache` — default to the container engine's standard location (`~/.local/share/containers/storage/volumes/` for rootless Podman). Move them if `$HOME` has limited disk.
+
+**Fresh install** (no existing volumes): the launcher's onboarding step 3 shows a picker. Pick Default or Custom; if Custom, the launcher writes `infrastructure/docker-compose.override.yml` (gitignored) with bind-mount overrides pointing the three volumes at `<chosen>/weaviate`, `<chosen>/ollama`, `<chosen>/code_embed`. The actual root path is indirected through `${VCT_VOLUMES_PATH}` in `infrastructure/.env` so the override yaml is portable across machines.
+
+**Subsequent install** (existing volumes detected): the launcher and `install.py` BOTH detect existing orchestrator volumes (canonical names + historical names like `weaviate_claude`) via `podman volume inspect` (read-only). When found, the launcher skips the picker and shows a read-only info panel; `install.py` prints the existing mountpoints. **No override is generated** — bind-mount overrides on top of already-existing named volumes either fail or mask the original. Historical names get an `external: true` alias in the override so compose reuses the data without rebinding.
+
+**Move volumes later** (Settings → Preferences → Volume location):
+1. Pick a target path → Change…
+2. Read-only dry-run: total size, ETA, free-space check, warnings
+3. Confirm migration:
+   - `compose stop` (preserves volumes — no `--volumes` flag)
+   - `cp -a` each mountpoint to `<target>/<role>`
+   - Write the bind-mount override + `${VCT_VOLUMES_PATH}` in `.env`
+   - `compose up -d` and HTTP-probe Weaviate + Ollama for up to 60 s
+   - **Only if all probes pass**: `podman volume rm` the legacy volumes
+
+**Safe-rollback guarantee**: every error branch past the override-write removes the override and brings the OLD volumes back up. The legacy volumes are removed only after the new bind-mounts are verified healthy. If the migration fails halfway, your data stays where it was.
+
+`migrate_volumes` is the ONLY function in the launcher allowed to invoke `podman volume rm`. The non-destructive audit guard `test_no_destructive_subprocess_calls_in_install_path` enforces this at the source level — no install-path file may shell out to `volume rm`.
+
 ### When you decide you want the launcher
 
 Install [VCT Launcher](https://github.com/pb992/VCT-Launcher), point it at this folder, and run "Adopt project". The launcher imports the existing setup (KG bindings, hooks, secret references) into its DB without disrupting anything. From that point on, the launcher manages this project the way Path A describes.
