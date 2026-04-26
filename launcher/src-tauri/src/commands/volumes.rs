@@ -928,6 +928,46 @@ fn _force_existing_volume_used(_: ExistingVolume) {}
 mod tests {
     use super::*;
 
+    /// Replace every Python triple-quoted docstring (both """ and ''')
+    /// with whitespace of the same length. Used by the source-level
+    /// `volume rm` audit so docstrings explaining the command's
+    /// semantics don't false-positive as actual invocations.
+    fn strip_python_docstrings(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        let bytes = src.as_bytes();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let three_double = i + 3 <= bytes.len() && &bytes[i..i + 3] == b"\"\"\"";
+            let three_single = i + 3 <= bytes.len() && &bytes[i..i + 3] == b"'''";
+            if three_double || three_single {
+                let marker: &[u8] = if three_double { b"\"\"\"" } else { b"'''" };
+                // Find closing marker.
+                let start = i + 3;
+                let mut j = start;
+                while j + 3 <= bytes.len() {
+                    if &bytes[j..j + 3] == marker {
+                        break;
+                    }
+                    j += 1;
+                }
+                // Replace from i..end with spaces (preserve newlines).
+                let end = (j + 3).min(bytes.len());
+                for k in i..end {
+                    if bytes[k] == b'\n' {
+                        out.push('\n');
+                    } else {
+                        out.push(' ');
+                    }
+                }
+                i = end;
+            } else {
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+        }
+        out
+    }
+
     #[test]
     fn launcher_config_roundtrip_with_detected_paths() {
         let dir = tempfile::tempdir().unwrap();
@@ -1104,17 +1144,32 @@ mod tests {
         let install_sh = repo_root.join("install.sh");
         let installer_rs = repo_root.join("launcher/src-tauri/src/commands/installer.rs");
 
-        // 1. install-path files MUST NOT mention `volume rm`.
+        // 1. install-path files MUST NOT invoke `volume rm`. We scan
+        //    for actual subprocess-call shapes, not raw substrings: a
+        //    docstring/comment that uses the words "volume rm" for
+        //    documentation purposes is fine — what matters is whether
+        //    the runtime actually executes it. Forbidden shapes:
+        //      "volume", "rm"   — Rust Command::args slice (e.g.
+        //                          ["podman", "volume", "rm", ...])
+        //      "volume rm"      — a single Bash/sh-quoted command line
+        //                          (e.g. `podman volume rm ...` after
+        //                          a shebang or eval)
+        //      However, plain prose in docstrings is OK. We approximate
+        //      "subprocess call" by looking for the literal `volume rm`
+        //      OUTSIDE Python triple-quoted strings and Rust /// doc
+        //      comments — both are non-executing forms.
         for path in [&install_py, &install_sh, &installer_rs] {
             let content = match std::fs::read_to_string(path) {
                 Ok(c) => c,
                 Err(_) => continue,
             };
-            // Strip both #[cfg(test)] and after-test sections.
             let scan_end = content.find("#[cfg(test)]").unwrap_or(content.len());
             let production = &content[..scan_end];
-            // Strip line-comments.
-            let stripped: String = production
+            // Strip Python triple-quoted docstrings (both """ and ''') —
+            // they're prose, not executable code.
+            let no_pydocs = strip_python_docstrings(production);
+            // Strip line-comments (Rust // and Python/shell #).
+            let stripped: String = no_pydocs
                 .lines()
                 .map(|line| {
                     let cut = line.find("//").or_else(|| line.find('#')).unwrap_or(line.len());
@@ -1123,8 +1178,9 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n");
             assert!(
-                !stripped.contains("volume rm") && !stripped.contains("volume_rm"),
-                "FORBIDDEN: 'volume rm' in {} — only migrate_volumes may invoke it",
+                !stripped.contains("volume rm") && !stripped.contains("\"volume\", \"rm\""),
+                "FORBIDDEN: 'volume rm' invocation found in {} — \
+                 only migrate_volumes may invoke it",
                 path.display()
             );
         }
