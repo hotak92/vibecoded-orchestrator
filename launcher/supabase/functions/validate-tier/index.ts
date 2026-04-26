@@ -9,7 +9,14 @@
 //
 // Response shapes — see end of file.
 
-import { lookupVariant, type OrchestratorTier } from "../_shared/variant_map.ts";
+import {
+  appendAdminAuthLog,
+  bindVaultAdminMachine,
+  fetchVaultAdminTokensJson,
+  lookupVariant,
+  lookupVaultAdminToken,
+  type OrchestratorTier,
+} from "../_shared/variant_map.ts";
 
 const LS_BASE = "https://api.lemonsqueezy.com/v1";
 const LS_TIMEOUT_MS = 8000;
@@ -38,6 +45,19 @@ function isValidLicenseKey(s: unknown): s is string {
   return typeof s === "string"
     && s.length === 36
     && /^[0-9a-fA-F-]{36}$/.test(s);
+}
+
+/**
+ * Vault-admin token shape check: `vct_admin_` prefix + URL-safe base64
+ * body. Range chosen to accommodate the 64-char default
+ * (token_urlsafe(48) → 64 chars) plus reasonable headroom for variants.
+ */
+function isValidVaultAdminToken(s: unknown): s is string {
+  return typeof s === "string"
+    && s.startsWith("vct_admin_")
+    && s.length >= 30
+    && s.length <= 256
+    && /^vct_admin_[A-Za-z0-9_-]+$/.test(s);
 }
 
 /** sha256 hex output: 64 lowercase hex chars. */
@@ -180,13 +200,10 @@ Deno.serve(async (req: Request) => {
     return jsonResponse({ error: "Method not allowed" }, 405);
   }
 
-  // Hard-fail if the LS API key is missing — never silently degrade to
-  // "everyone is on free tier" because that masks a deployment bug.
-  const apiKey = Deno.env.get("LEMON_SQUEEZY_API_KEY");
-  if (!apiKey) {
-    console.error("FATAL: LEMON_SQUEEZY_API_KEY not configured");
-    return jsonResponse({ error: "Service misconfigured" }, 500);
-  }
+  // LS API key check moved into Path B (LS-license validation) — Path A
+  // (Vault-token admin) doesn't call LS, so missing LS key shouldn't block
+  // admins. We still hard-fail at the LS-call site so misconfiguration is
+  // visible if LS keys are submitted.
 
   // Parse + validate input
   let body: any;
@@ -199,17 +216,118 @@ Deno.serve(async (req: Request) => {
   const licenseKey = body?.license_key;
   const machineHash = body?.machine_id_hash;
 
+  // machine_id_hash is required for both paths — validate it first
+  if (!isValidMachineHash(machineHash)) {
+    return jsonResponse(
+      { valid: false, tier: "free", message: "Invalid machine_id_hash format." },
+      400,
+    );
+  }
+
+  // ── Path A: Vault-token admin (precedes LS-variant path) ───────────────
+  // High-entropy random tokens stored in the `vct_admin_tokens` Vault
+  // secret (JSON map). Used for solo + small-team admin without
+  // creating an LS product. Per-token leak containment: optional
+  // expiration + TOFU machine binding. See variant_map.ts for the
+  // full design.
+  if (isValidVaultAdminToken(licenseKey)) {
+    const supabaseUrl = Deno.env.get("SUPABASE_URL");
+    const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+    if (!supabaseUrl || !serviceRoleKey) {
+      console.error("FATAL: SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY missing");
+      return jsonResponse({ error: "Service misconfigured" }, 500);
+    }
+
+    const vaultJson = await fetchVaultAdminTokensJson(supabaseUrl, serviceRoleKey);
+    const result = lookupVaultAdminToken(licenseKey, machineHash, vaultJson);
+
+    if (result === null) {
+      // Token shape was right, but didn't match any user. Fall through to
+      // the LS path is wrong here (LS keys are UUIDs; vct_admin_ keys
+      // are not). Reject explicitly.
+      return jsonResponse(
+        { valid: false, tier: "free", message: "Invalid or expired admin token." },
+        401,
+      );
+    }
+
+    // Audit every outcome (including failures) for forensic trace.
+    appendAdminAuthLog(supabaseUrl, serviceRoleKey, {
+      admin_user: result.user,
+      machine_id_hash: machineHash,
+      outcome: result.outcome,
+    }).catch(() => {/* non-blocking */});
+
+    if (result.outcome === "expired") {
+      console.log(`[validate-tier] admin token expired user=${result.user}`);
+      return jsonResponse(
+        { valid: false, tier: "free", message: "Admin token expired." },
+        401,
+      );
+    }
+    if (result.outcome === "machine_mismatch") {
+      console.warn(
+        `[validate-tier] admin token machine mismatch user=${result.user}`,
+      );
+      return jsonResponse(
+        {
+          valid: false,
+          tier: "free",
+          error: "machine_mismatch",
+          message:
+            "Admin token is bound to a different machine. Contact the project owner to rebind.",
+        },
+        401,
+      );
+    }
+
+    // Success. TOFU bind if needed.
+    if (result.bind_machine_hash) {
+      const bound = await bindVaultAdminMachine(
+        supabaseUrl,
+        serviceRoleKey,
+        result.user,
+        result.bind_machine_hash,
+      );
+      if (!bound) {
+        console.warn(
+          `[validate-tier] TOFU bind failed user=${result.user} ` +
+            `(possible race; token still authenticates this request)`,
+        );
+      }
+    }
+
+    console.log(
+      `[validate-tier] OK Vault-admin user=${result.user} ` +
+        `(${result.bind_machine_hash ? "first-bind" : "matched"})`,
+    );
+    return jsonResponse({
+      valid: true,
+      tier: "admin",
+      expires_at: null, // expiration is enforced server-side; client doesn't need it
+      message: "Validated.",
+      is_admin: true,
+      unlock_all_modules: true,
+      dev_features_enabled: true,
+      admin_user: result.user,
+    });
+  }
+
+  // ── Path B: LS license key (existing UUID path) ────────────────────────
   if (!isValidLicenseKey(licenseKey)) {
     return jsonResponse(
       { valid: false, tier: "free", message: "Invalid license_key format." },
       400,
     );
   }
-  if (!isValidMachineHash(machineHash)) {
-    return jsonResponse(
-      { valid: false, tier: "free", message: "Invalid machine_id_hash format." },
-      400,
-    );
+
+  // LS API key required for the LS path. Hard-fail if missing — never
+  // silently degrade to "everyone is on free tier" because that masks a
+  // deployment bug.
+  const apiKey = Deno.env.get("LEMON_SQUEEZY_API_KEY");
+  if (!apiKey) {
+    console.error("FATAL: LEMON_SQUEEZY_API_KEY not configured");
+    return jsonResponse({ error: "Service misconfigured" }, 500);
   }
 
   const keyTag = maskKey(licenseKey);
@@ -375,6 +493,19 @@ Deno.serve(async (req: Request) => {
 //     is_admin: true,
 //     unlock_all_modules: true,
 //     dev_features_enabled: true }
+//
+// 200 — Vault-token admin (vct_admin_<token> matched in vct_admin_tokens):
+//   { valid: true, tier: "admin",
+//     expires_at: null,
+//     message: "Validated.",
+//     is_admin: true,
+//     unlock_all_modules: true,
+//     dev_features_enabled: true,
+//     admin_user: "martino" | "fabio" | "vartan" | ... }
+//
+// 401 — Vault-token admin token expired / machine-bound to a different machine:
+//   { valid: false, tier: "free", message: "Admin token expired." }
+//   { valid: false, tier: "free", error: "machine_mismatch", message: "..." }
 //
 // 200 — valid license but not an orchestrator product:
 //   { valid: true, tier: "free", message: "...does not grant..." }
