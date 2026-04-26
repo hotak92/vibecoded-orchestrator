@@ -56,6 +56,18 @@ gethostname = "0.5"
 mac_address = "1"
 hex = "0.4"
 
+# Bug 31: launcher.toml config (volume location, etc.)
+toml = "0.8"
+
+# Bug 31 tests: tempdir for filesystem fixtures (also used by Bug 31
+# volumes module for non-test tempdir uses).
+tempfile = "3"
+
 # System info (RAM, CPU). MIT-licensed, lightweight. Used by detect_system.
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
+
+# Bug 31: libc statvfs for free-space probe (Unix only — Windows path
+# returns None, see free_bytes_at in commands/volumes.rs).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
