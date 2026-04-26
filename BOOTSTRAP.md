@@ -106,6 +106,21 @@ echo "ghp_yourtokenhere" | ~/.vct-secrets/vct set --project SHARED --key github_
 
 Open the project folder in **VS Code**. Start a Claude Code session. The hooks fire automatically. Try editing a file and watch the post-edit hook auto-sync to the code graph.
 
+### Shared services across multiple installs
+
+The orchestrator uses three local services — **Weaviate**, **Ollama**, and an optional **code_embed** — that are **shared across every orchestrator install on this machine**. Per-project isolation is by collection namespacing inside the shared Weaviate (each project gets its own `KG_COLLECTION` and `DEVELOPMENT_COLLECTION`), not by separate containers.
+
+- **First install**: services start automatically via `podman-compose up -d` (or the docker equivalent).
+- **Subsequent installs**: `install.py` probes ports 8081 / 11435 / 11440 first; if the services are already up, it reuses them and bootstraps only the Weaviate collections this project needs.
+
+Verify what's running:
+```bash
+podman ps   # or `docker ps`
+# Should show one weaviate, one ollama, optionally one vct_code_embed.
+```
+
+**Advanced**: set `VCT_FORCE_SEPARATE_CONTAINERS=1` and override `WEAVIATE_PORT` / `OLLAMA_PORT` / `CODE_EMBED_PORT` to give an install its own containers — useful for hard isolation between, e.g., work and personal setups, but costs extra disk and RAM per install.
+
 ### When you decide you want the launcher
 
 Install [VCT Launcher](https://github.com/pb992/VCT-Launcher), point it at this folder, and run "Adopt project". The launcher imports the existing setup (KG bindings, hooks, secret references) into its DB without disrupting anything. From that point on, the launcher manages this project the way Path A describes.
@@ -140,5 +155,6 @@ Then ask the user what they want to work on.
 | `code-graph-query search` returns nothing | Code graph not analyzed yet | `.claude/scripts/code-graph-analyze . --project "MyProject"` |
 | Ollama models slow/missing | Models not pulled | `ollama list` to check; `ollama pull qwen3-embedding:0.6b` if missing |
 | Container runtime not detected | Neither podman nor docker on PATH | Install one, or set `VCT_CONTAINER_RUNTIME=podman` (or `docker`) |
+| `bind: address already in use` on 8081/11435/11440 | Another install already runs the shared services | Expected — `install.py` should detect this and reuse them. If it didn't, check that the services respond to `curl localhost:8081/v1/.well-known/ready` etc. To force separate containers per install, set `VCT_FORCE_SEPARATE_CONTAINERS=1` plus distinct ports |
 
 For deeper issues, see `docs/TROUBLESHOOTING.md` and `docs/CONFIGURATION.md`.
