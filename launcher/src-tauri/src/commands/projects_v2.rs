@@ -158,22 +158,54 @@ pub fn write_project_env_files(folder: &Path, project_name: &str) -> Result<(), 
     let dev_collection = format!("{}_development", kg_collection);
     let conv_collection = format!("{}_conversations", kg_collection);
 
-    // VS Code path (existing behavior — extension reads claude-code.env).
+    // VS Code path (extension reads claude-code.env).
+    //
+    // Bug 32 (safety): READ-MERGE-WRITE so user settings like
+    // `editor.formatOnSave`, `python.defaultInterpreterPath`, workspace
+    // recommendations etc. survive. Only the `claude-code.env` key is
+    // overwritten.
     let vscode_dir = folder.join(".vscode");
     std::fs::create_dir_all(&vscode_dir)
         .map_err(|e| format!("mkdir {}: {}", vscode_dir.display(), e))?;
     let vscode_settings_path = vscode_dir.join("settings.json");
-    let vscode_settings = serde_json::json!({
-        "claude-code.env": {
-            "KG_COLLECTION": kg_collection,
-            "PROJECT_NAME": kg_collection,
-            "DEVELOPMENT_COLLECTION": dev_collection,
-            "CONVERSATION_COLLECTION": conv_collection,
+
+    let mut vscode_root: serde_json::Value = if vscode_settings_path.exists() {
+        match std::fs::read_to_string(&vscode_settings_path) {
+            Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|e| {
+                eprintln!(
+                    "[vct] warning: {} is not valid JSON ({}); replacing with minimal claude-code.env block",
+                    vscode_settings_path.display(),
+                    e
+                );
+                serde_json::json!({})
+            }),
+            Err(e) => {
+                eprintln!(
+                    "[vct] warning: could not read {} ({}); creating fresh",
+                    vscode_settings_path.display(),
+                    e
+                );
+                serde_json::json!({})
+            }
         }
+    } else {
+        serde_json::json!({})
+    };
+    if !vscode_root.is_object() {
+        vscode_root = serde_json::json!({});
+    }
+    let vscode_env_block = serde_json::json!({
+        "KG_COLLECTION": kg_collection,
+        "PROJECT_NAME": kg_collection,
+        "DEVELOPMENT_COLLECTION": dev_collection,
+        "CONVERSATION_COLLECTION": conv_collection,
     });
+    if let Some(obj) = vscode_root.as_object_mut() {
+        obj.insert("claude-code.env".to_string(), vscode_env_block);
+    }
     std::fs::write(
         &vscode_settings_path,
-        serde_json::to_string_pretty(&vscode_settings)
+        serde_json::to_string_pretty(&vscode_root)
             .map_err(|e| format!("serialize settings.json: {}", e))?,
     )
     .map_err(|e| format!("write {}: {}", vscode_settings_path.display(), e))?;
@@ -613,6 +645,41 @@ mod tests {
         assert!(v["hooks"]["PreToolUse"].is_array());
         assert!(v["permissions"]["allow"].is_array());
         assert_eq!(v["permissions"]["allow"][0], "Read");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Bug 32: existing `.vscode/settings.json` user keys (formatOnSave,
+    /// defaultInterpreter, etc.) MUST be preserved. Only `claude-code.env`
+    /// is mutated. Without this, opening the launcher would clobber any
+    /// user IDE customisations.
+    #[test]
+    fn write_preserves_existing_vscode_settings_json() {
+        let tmp = std::env::temp_dir().join(format!(
+            "vct-vscode-merge-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(tmp.join(".vscode")).unwrap();
+        let path = tmp.join(".vscode/settings.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "editor.formatOnSave": true,
+                "python.defaultInterpreterPath": "/usr/bin/python3",
+                "claude-code.env": {"OLD_KEY": "old"}
+            }"#,
+        )
+        .unwrap();
+
+        write_project_env_files(&tmp, "MyProject").unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["editor.formatOnSave"], true);
+        assert_eq!(v["python.defaultInterpreterPath"], "/usr/bin/python3");
+        assert_eq!(v["claude-code.env"]["KG_COLLECTION"], "MyProject");
+        // Old env key is gone — claude-code.env is replaced wholesale.
+        assert!(v["claude-code.env"].get("OLD_KEY").is_none());
 
         std::fs::remove_dir_all(&tmp).ok();
     }
