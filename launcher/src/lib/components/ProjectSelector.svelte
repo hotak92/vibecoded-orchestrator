@@ -15,6 +15,7 @@
   import { projectColor } from '$lib/project-color';
   import type { ProjectHost, ProjectView } from '$lib/types/launcher';
   import Dropdown from '$lib/components/Dropdown.svelte';
+  import DialogRoot from '$lib/components/DialogRoot.svelte';
 
   // Bug 20: when the user picks a folder, run inspect_orchestrator_at to
   // detect whether an orchestrator is already there and what shape it's
@@ -422,20 +423,18 @@
 </div>
 
 <!-- Create project modal -->
-{#if showCreate}
-  <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div class="modal-backdrop" onclick={closeCreate} onkeydown={() => {}}>
-    <!-- svelte-ignore a11y_no_static_element_interactions -->
-    <div class="modal-content" onclick={(e) => e.stopPropagation()} onkeydown={() => {}}>
-      <div class="modal-header">
-        <h2>New Project</h2>
-        <button class="modal-close" onclick={closeCreate} aria-label="Close">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M18 6L6 18"/><path d="M6 6l12 12"/>
-          </svg>
-        </button>
-      </div>
-      <div class="modal-body">
+<DialogRoot bind:open={showCreate} onClose={closeCreate}>
+  {#snippet header()}
+    <div class="modal-header-row">
+      <h2>New Project</h2>
+      <button class="modal-close" onclick={closeCreate} aria-label="Close">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M18 6L6 18"/><path d="M6 6l12 12"/>
+        </svg>
+      </button>
+    </div>
+  {/snippet}
+  {#snippet body()}
         <div class="form-group">
           <label for="project-name">Name</label>
           <input
@@ -593,33 +592,34 @@
             {/if}
           </button>
         </div>
-      </div>
-    </div>
-  </div>
-{/if}
+  {/snippet}
+</DialogRoot>
 
 <!-- Delete confirm modal -->
 {#if deletingProject}
-  <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div class="modal-backdrop" onclick={() => (deletingProject = null)} onkeydown={() => {}}>
-    <!-- svelte-ignore a11y_no_static_element_interactions -->
-    <div class="modal-content" onclick={(e) => e.stopPropagation()} onkeydown={() => {}}>
-      <div class="modal-header">
-        <h2>Delete Project</h2>
-      </div>
-      <div class="modal-body">
+{@const proj = deletingProject}
+<DialogRoot
+  open={true}
+  onClose={() => (deletingProject = null)}
+>
+  {#snippet header()}
+    <div class="modal-header-row">
+      <h2>Delete Project</h2>
+    </div>
+  {/snippet}
+  {#snippet body()}
         <p class="modal-desc">
           This removes the project from the launcher and uninstalls its modules.
           Your project folder on disk is <strong>not</strong> deleted.
         </p>
         <p class="modal-desc">
-          Type <strong class="mono">{deletingProject.name}</strong> to confirm.
+          Type <strong class="mono">{proj.name}</strong> to confirm.
         </p>
         <input
           type="text"
           class="form-input mono"
           bind:value={deleteConfirmText}
-          placeholder={deletingProject.name}
+          placeholder={proj.name}
         />
         <div class="form-actions">
           <button class="btn-3d btn-3d-ghost btn-3d-sm" onclick={() => (deletingProject = null)} disabled={deleting}>
@@ -628,7 +628,7 @@
           <button
             class="btn-3d btn-3d-accent btn-3d-sm"
             onclick={confirmDelete}
-            disabled={deleting || deleteConfirmText !== deletingProject.name}
+            disabled={deleting || deleteConfirmText !== proj.name}
           >
             {#if deleting}
               <span class="spinner-sm"></span>
@@ -637,9 +637,8 @@
             {/if}
           </button>
         </div>
-      </div>
-    </div>
-  </div>
+  {/snippet}
+</DialogRoot>
 {/if}
 
 <style>
@@ -901,55 +900,15 @@
   }
 
   /* ── Modals ─────────────────────────────────────────────── */
-  /* Bug 19: backdrop uses padding (2rem) instead of overflow-y, modal is
-     capped at calc(100vh - 4rem) so it can NEVER extend above the
-     viewport top no matter how tall the content grows. z-index bumped
-     to 9999 so the modal is unconditionally above the in-app MenuBar
-     (z-index 100), dropdown (200), Term (250), tray-related popups,
-     etc. NO position-fixed or transform on .modal-content — flexbox
-     centering only. */
-  .modal-backdrop {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.6);
-    backdrop-filter: blur(8px);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    z-index: 9999;
-    animation: fade-in 0.15s ease-out;
-    padding: 2rem;
-    overflow: hidden;
-  }
-  @keyframes fade-in {
-    from { opacity: 0; }
-    to { opacity: 1; }
-  }
-
-  .modal-content {
-    width: 460px;
-    max-width: min(90vw, 600px);
-    max-height: calc(100vh - 4rem);
-    display: flex;
-    flex-direction: column;
-    background: rgba(13, 23, 53, 0.97);
-    backdrop-filter: blur(24px);
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    border-radius: 18px;
-    box-shadow: 0 30px 80px rgba(0, 0, 0, 0.6);
-    overflow: hidden;
-  }
-
-  .modal-header {
+  /* Bug 26: modals now use the native <dialog> top layer via DialogRoot.
+     This component only owns the header row layout + close button styling.
+     Backdrop / centering / max-height are handled by DialogRoot.svelte. */
+  .modal-header-row {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 18px 20px;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-    flex-shrink: 0;
   }
-
-  .modal-header h2 {
+  .modal-header-row h2 {
     font-size: 15px;
     font-weight: 700;
     color: var(--color-text);
@@ -970,13 +929,6 @@
   .modal-close:hover {
     color: var(--color-text);
     background: rgba(255, 255, 255, 0.06);
-  }
-
-  .modal-body {
-    padding: 18px 20px;
-    overflow-y: auto;
-    flex: 1 1 auto;
-    min-height: 0;
   }
 
   .modal-desc {

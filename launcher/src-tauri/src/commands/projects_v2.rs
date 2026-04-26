@@ -529,4 +529,69 @@ mod tests {
         let err = res.expect_err("expected NotFound when PATH is empty");
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
+
+    // ─── Bug 28: onboarding finish must produce a project record ──
+    //
+    // We can't drive the Tauri `#[command]` directly without the
+    // State<Db> harness, but the command body is a thin wrapper around
+    // `db.insert_project` + folder-create + env-file write. This test
+    // exercises that core sequence end-to-end against an in-memory db.
+    // After the simulated onboarding flow finishes, `list_projects`
+    // must return at least one row.
+
+    #[test]
+    fn onboarding_finish_inserts_project_row() {
+        use crate::db::Db;
+
+        let db = Db::open_in_memory().expect("in-memory db");
+
+        // Simulate the flow that OnboardingWizard.finish() drives:
+        //   1. Create a fresh folder for the project (matches the
+        //      `create_dir_all` step inside create_project_v2).
+        //   2. Generate a unique slug for the chosen name.
+        //   3. Insert the project row.
+        //   4. Write the per-project env files (mirrors create_project_v2).
+        let folder = std::env::temp_dir().join(format!(
+            "vct-bug28-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&folder).unwrap();
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let name = "Bug28 Onboarding Project";
+        let slug = db.generate_unique_slug(name).expect("slug");
+        let row = db
+            .insert_project(
+                &id,
+                name,
+                folder.to_string_lossy().as_ref(),
+                ProjectHost::Base,
+                &slug,
+            )
+            .expect("insert_project");
+        assert_eq!(row.name, name);
+
+        // Mirror the env-file write the real command does.
+        write_project_env_files(&folder, name).expect("env files");
+
+        // The contract: after onboarding, at least one project row
+        // exists. The user reported ending up with zero — that's the
+        // regression this guards against.
+        let all = db.list_projects().expect("list_projects");
+        assert!(
+            !all.is_empty(),
+            "expected at least one project row after onboarding finish"
+        );
+        assert!(
+            all.iter().any(|p| p.name == name),
+            "expected project named {name:?} in list, got {:?}",
+            all.iter().map(|p| &p.name).collect::<Vec<_>>()
+        );
+
+        // env files must have landed at the project folder.
+        assert!(folder.join(".vscode/settings.json").exists());
+        assert!(folder.join(".claude/env").exists());
+
+        std::fs::remove_dir_all(&folder).ok();
+    }
 }
