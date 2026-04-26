@@ -2,6 +2,7 @@
   import { orchestrator, isOrchestratorBusy, type SystemDetection, type InstallConfig } from '$lib/stores/orchestrator';
   import { currentUser } from '$lib/stores/auth';
   import Dropdown from '$lib/components/Dropdown.svelte';
+  import DialogRoot from '$lib/components/DialogRoot.svelte';
 
   const RUNTIME_OPTIONS = [
     { value: 'docker', label: 'Docker' },
@@ -99,10 +100,10 @@
   });
 </script>
 
-<div class="wizard-overlay" onclick={onClose}>
-  <div class="wizard-modal" onclick={(e) => e.stopPropagation()}>
-    <!-- Header -->
-    <div class="wizard-header">
+<!-- Bug 26: native <dialog> top-layer rendering via DialogRoot. -->
+<DialogRoot open={true} width="600px" onClose={onClose}>
+  {#snippet header()}
+    <div class="wizard-header-row">
       <h2>
         {#if step === 'detect'}Detecting System...
         {:else if step === 'configure'}Configure Installation
@@ -110,21 +111,20 @@
         {:else}Installation Complete!
         {/if}
       </h2>
-      <button class="close-btn" onclick={onClose}>&times;</button>
+      <button class="close-btn" onclick={onClose} aria-label="Close">&times;</button>
     </div>
-
+  {/snippet}
+  {#snippet body()}
     <!-- Step: Detect -->
     {#if step === 'detect'}
-      <div class="wizard-body">
-        <div class="detect-spinner">
-          <div class="spinner"></div>
-          <p>Scanning your system for GPU, Python, Docker/Podman...</p>
-        </div>
+      <div class="detect-spinner">
+        <div class="spinner"></div>
+        <p>Scanning your system for GPU, Python, Docker/Podman...</p>
       </div>
 
     <!-- Step: Configure -->
     {:else if step === 'configure' && system}
-      <div class="wizard-body">
+      <div class="wizard-step-configure">
         <!-- System summary -->
         <div class="system-summary">
           <h3>System Detected</h3>
@@ -247,76 +247,56 @@
         {/if}
       </div>
 
-      <div class="wizard-footer">
+    <!-- Step: Installing -->
+    {:else if step === 'install'}
+      <div class="install-progress">
+        {#if progress}
+          <div class="progress-bar-container">
+            <div class="progress-bar" style="width: {progress.percentage}%"></div>
+          </div>
+          <p class="progress-stage">{progress.stage}</p>
+          <p class="progress-message">{progress.message}</p>
+        {:else}
+          <div class="spinner"></div>
+          <p>Starting installation...</p>
+        {/if}
+      </div>
+
+    <!-- Step: Done -->
+    {:else if step === 'done'}
+      <div class="done-section">
+        <div class="done-icon">&#10003;</div>
+        <h3>Orchestrator Installed!</h3>
+        <p>Open your project in your editor (VS Code, Claude Code CLI, or Claude Desktop) and run <code>claude</code> to start using it.</p>
+        <p class="done-path">Installed at: <code>{installPath}</code></p>
+      </div>
+    {/if}
+  {/snippet}
+  {#snippet footer()}
+    {#if step === 'configure' && system}
+      <div class="wizard-footer-row">
         <button class="btn-secondary" onclick={onClose}>Cancel</button>
         <button class="btn-primary" onclick={startInstall}
           disabled={!system.has_python || !system.has_git}>
           Install Orchestrator
         </button>
       </div>
-
-    <!-- Step: Installing -->
-    {:else if step === 'install'}
-      <div class="wizard-body">
-        <div class="install-progress">
-          {#if progress}
-            <div class="progress-bar-container">
-              <div class="progress-bar" style="width: {progress.percentage}%"></div>
-            </div>
-            <p class="progress-stage">{progress.stage}</p>
-            <p class="progress-message">{progress.message}</p>
-          {:else}
-            <div class="spinner"></div>
-            <p>Starting installation...</p>
-          {/if}
-        </div>
-      </div>
-
-    <!-- Step: Done -->
     {:else if step === 'done'}
-      <div class="wizard-body">
-        <div class="done-section">
-          <div class="done-icon">&#10003;</div>
-          <h3>Orchestrator Installed!</h3>
-          <p>Open your project in VS Code and run <code>claude</code> to start using it.</p>
-          <p class="done-path">Installed at: <code>{installPath}</code></p>
-        </div>
-      </div>
-      <div class="wizard-footer">
+      <div class="wizard-footer-row">
         <button class="btn-primary" onclick={onClose}>Done</button>
       </div>
     {/if}
-  </div>
-</div>
+  {/snippet}
+</DialogRoot>
 
 <style>
-  .wizard-overlay {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.7);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    z-index: 1000;
-    backdrop-filter: blur(4px);
-  }
-  .wizard-modal {
-    background: var(--color-bg2);
-    border: 1px solid var(--color-border);
-    border-radius: var(--radius-card);
-    width: 600px;
-    max-height: 80vh;
-    overflow-y: auto;
-    box-shadow: 0 24px 64px rgba(0, 0, 0, 0.5);
-  }
-  .wizard-header {
+  /* Bug 26: backdrop / sizing / shell now handled by DialogRoot. */
+  .wizard-header-row {
     display: flex;
     justify-content: space-between;
     align-items: center;
-    padding: 20px 24px;
-    border-bottom: 1px solid var(--color-border);
   }
-  .wizard-header h2 { font-size: 18px; font-weight: 600; }
+  .wizard-header-row h2 { font-size: 18px; font-weight: 600; margin: 0; }
   .close-btn {
     background: none;
     border: none;
@@ -326,13 +306,10 @@
     padding: 0 4px;
   }
   .close-btn:hover { color: var(--color-text); }
-  .wizard-body { padding: 24px; }
-  .wizard-footer {
+  .wizard-footer-row {
     display: flex;
     justify-content: flex-end;
     gap: 12px;
-    padding: 16px 24px;
-    border-top: 1px solid var(--color-border);
   }
 
   /* System summary */
