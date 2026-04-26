@@ -21,6 +21,36 @@
   let installing = $state(false);
   let installed = $state(false);
   let installError = $state<string | null>(null);
+  // Bug 17: install is now a local file copy from the launcher's
+  // bundled repo source. We display the source path so the user
+  // can confirm what's being copied. Loaded once on step 3 entry.
+  let sourcePath = $state<string | null>(null);
+  let sourceError = $state<string | null>(null);
+
+  // Bug 22: optional GitHub PAT for future auto-update flow.
+  let githubPat = $state('');
+  let savingPat = $state(false);
+  let patError = $state<string | null>(null);
+  let patSaved = $state(false);
+
+  async function savePat() {
+    patError = null;
+    if (!githubPat.trim()) {
+      patError = 'Token is empty.';
+      return;
+    }
+    savingPat = true;
+    try {
+      await invoke('register_github_pat', { token: githubPat.trim() });
+      patSaved = true;
+      githubPat = '';
+      toast.success('GitHub token saved');
+    } catch (e) {
+      patError = String(e);
+    } finally {
+      savingPat = false;
+    }
+  }
 
   // Bug 8: adopt-confirm modal. Populated by `previewInstall` before
   // any actual write happens. If `mode === 'adopt'` we show the diff and
@@ -42,6 +72,15 @@
       installed = await invoke<boolean>('check_install_status', { path: installPath });
     } catch (e) {
       detectError = String(e);
+    }
+  }
+
+  async function loadStep3() {
+    if (sourcePath !== null || sourceError !== null) return;
+    try {
+      sourcePath = await invoke<string>('get_local_repo_source');
+    } catch (e) {
+      sourceError = String(e);
     }
   }
 
@@ -116,6 +155,7 @@
 
   $effect(() => {
     if (step === 2 && !detection) void loadStep2();
+    if (step === 3) void loadStep3();
   });
 
   onMount(() => {
@@ -197,11 +237,18 @@
             <span>Install path</span>
             <input bind:value={installPath} />
           </label>
+          {#if sourcePath}
+            <p class="ow-secondary">
+              Copying from <code class="ow-mono">{sourcePath}</code> (local — no network needed)
+            </p>
+          {:else if sourceError}
+            <p class="ow-error">Source not found: {sourceError}</p>
+          {/if}
           {#if installed}
             <p class="ow-ok">Orchestrator already installed at this path.</p>
           {:else}
-            <button class="ow-btn-primary" onclick={() => runInstall(false)} disabled={installing}>
-              {installing ? 'Installing…' : 'Install orchestrator'}
+            <button class="ow-btn-primary" onclick={() => runInstall(false)} disabled={installing || !!sourceError}>
+              {installing ? 'Installing…' : 'Install'}
             </button>
           {/if}
           {#if installError}<p class="ow-error">{installError}</p>{/if}
@@ -242,6 +289,37 @@
             project selector in the menu bar opens a "create project" form. Pick a folder
             you want to use as the project root.
           </p>
+
+          <!-- Bug 22: optional GitHub access for future auto-update flow. -->
+          <div class="ow-pat">
+            <h3>Updates (optional)</h3>
+            <p class="ow-secondary">
+              Local install + per-project updates work without a GitHub
+              token. Adding a read-only token now will let the launcher
+              fetch newer orchestrator versions from upstream once
+              auto-update lands. No token = 60 GitHub API requests per
+              hour (anonymous). With token = 5000/hour.
+            </p>
+            {#if patSaved}
+              <p class="ow-ok">Token saved to <code class="ow-mono">~/.vct-secrets/github_pat</code>.</p>
+            {:else}
+              <label class="ow-label">
+                <span>GitHub token (optional)</span>
+                <input type="password" bind:value={githubPat} placeholder="ghp_…" />
+              </label>
+              <p class="ow-secondary">
+                How to get one: github.com → Settings → Developer settings →
+                Personal access tokens → Generate new (classic). Scope
+                <code class="ow-mono">public_repo</code> is enough.
+              </p>
+              <div class="ow-pat-actions">
+                <button class="ow-btn-primary" onclick={savePat} disabled={savingPat || !githubPat.trim()}>
+                  {savingPat ? 'Saving…' : 'Save token'}
+                </button>
+              </div>
+              {#if patError}<p class="ow-error">{patError}</p>{/if}
+            {/if}
+          </div>
         {/if}
       </div>
 
@@ -261,26 +339,29 @@
 {/if}
 
 <style>
-  /* Bug 11 systemic: bound the wizard to the viewport. The body scrolls
-     when content overflows so step 3 (install + adopt diff) doesn't push
-     the header out of view on short windows. */
+  /* Bug 19: backdrop padding + modal max-height: calc(100vh - 4rem) so
+     the modal can never extend above the viewport top. z-index 9999 to
+     win against any in-app chrome. overflow: hidden on backdrop (NOT
+     auto) — body scrolls inside the modal, the backdrop never moves. */
   .ow-back {
     position: fixed; inset: 0; background: rgba(0,0,0,0.7);
-    z-index: 1200; display: flex; align-items: center; justify-content: center;
-    padding: 16px; overflow-y: auto;
+    z-index: 9999; display: flex; align-items: center; justify-content: center;
+    padding: 2rem; overflow: hidden;
   }
   .ow-modal {
     background: #1a1a22; border: 1px solid rgba(255,255,255,0.08);
-    border-radius: 10px; padding: 0; width: 560px; max-width: 92vw;
-    max-height: 90vh; display: flex; flex-direction: column; overflow: hidden;
+    border-radius: 10px; padding: 0; width: 560px;
+    max-width: min(92vw, 600px); max-height: calc(100vh - 4rem);
+    display: flex; flex-direction: column; overflow: hidden;
   }
   .ow-header { padding: 16px 20px 8px; border-bottom: 1px solid rgba(255,255,255,0.06); flex-shrink: 0; }
   .ow-header h2 { margin: 0 0 12px; font-size: 16px; }
   .ow-steps { list-style: none; padding: 0; margin: 0; display: flex; gap: 8px; font-size: 11px; color: #666; }
   .ow-steps li.active { color: #c4b3ff; }
   .ow-steps li.current { color: #0fc; font-weight: 600; }
-  .ow-body { padding: 16px 20px; min-height: 160px; font-size: 13px; line-height: 1.55; color: #ccc; overflow-y: auto; flex: 1 1 auto; }
+  .ow-body { padding: 16px 20px; min-height: 0; font-size: 13px; line-height: 1.55; color: #ccc; overflow-y: auto; flex: 1 1 auto; }
   .ow-secondary { color: #888; font-size: 12px; }
+  .ow-mono { font-family: ui-monospace, monospace; font-size: 11px; color: #c4b3ff; background: rgba(255,255,255,0.04); padding: 1px 5px; border-radius: 3px; word-break: break-all; }
   .ow-error { color: #f99; font-size: 12px; }
   .ow-ok { color: #0fc; font-size: 12px; }
   .ow-table { font-size: 12px; border-collapse: collapse; }
@@ -311,4 +392,10 @@
   .ow-paths code { font-family: ui-monospace, monospace; font-size: 11px; color: #c4b3ff; }
   .ow-diff details summary { cursor: pointer; font-size: 12px; color: #0fc; padding: 4px 0; }
   .ow-diff-actions { display: flex; justify-content: flex-end; gap: 6px; margin-top: 10px; }
+
+  /* Bug 22: optional GitHub PAT section */
+  .ow-pat { margin-top: 14px; padding: 10px 12px; border: 1px solid rgba(255,255,255,0.08); border-radius: 6px; background: rgba(255,255,255,0.02); }
+  .ow-pat h3 { font-size: 13px; margin: 0 0 6px; color: #ccc; }
+  .ow-pat input { width: 100%; }
+  .ow-pat-actions { display: flex; justify-content: flex-end; margin-top: 8px; }
 </style>

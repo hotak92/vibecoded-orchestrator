@@ -45,12 +45,14 @@
 
   const launchLabel = $derived.by(() => {
     if (launchState === 'starting') return 'Starting…';
-    if (launchState === 'running') return 'Open in VS Code';
+    if (launchState === 'running') return 'Open project';
     if (launchState === 'error') return 'Retry';
-    return 'Launch';
+    return 'Open project';
   });
 
-  async function doLaunch(projectId: string) {
+  // Bug 24: support both surfaces. `surface` arg drives the backend
+  // dispatch — 'auto' picks vscode if available, falls back to cli.
+  async function doLaunch(projectId: string, surface: 'auto' | 'vscode' | 'cli' = 'auto') {
     if (launchState === 'starting') return; // debounce
     const proj = projectList.find((p) => p.id === projectId);
     if (!proj) {
@@ -59,13 +61,12 @@
     }
     launchState = 'starting';
     try {
-      await invoke<void>('launch_project_in_editor', { projectId });
+      await invoke<void>('launch_project_in_editor', { projectId, surface });
       try {
         localStorage.setItem('vct.last_launched_project_id', projectId);
       } catch {}
       launchState = 'running';
-      toast.success(`Opened ${proj.name} in VS Code`);
-      // Hold "Open in VS Code" label until user clicks again. No timeout.
+      toast.success(`Opened ${proj.name}`);
     } catch (e) {
       launchState = 'error';
       toast.error(e);
@@ -142,7 +143,7 @@
           onclick={onLaunchClick}
           disabled={!hasProjects || launchState === 'starting'}
           title={hasProjects
-            ? 'Open the selected project in VS Code'
+            ? 'Open the selected project (VS Code if installed, else terminal CLI)'
             : 'Create a project first to launch the orchestrator'}
         >
           {launchLabel}
@@ -210,7 +211,7 @@
           onclick={onLaunchClick}
           disabled={!hasProjects || launchState === 'starting'}
           title={hasProjects
-            ? 'Open the selected project in VS Code'
+            ? 'Open the selected project (VS Code if installed, else terminal CLI)'
             : 'Create a project first to launch the orchestrator'}
         >
           {launchLabel}

@@ -84,17 +84,21 @@
 {/if}
 
 <style>
-  /* Bug 11 systemic */
+  /* Bug 19 systemic */
   .cm-back {
-    position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 1100;
+    position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 9999;
     display: flex; align-items: center; justify-content: center;
-    padding: 16px; overflow-y: auto;
+    padding: 2rem; overflow: hidden;
   }
   .cm-modal {
     background: #1a1a22; border: 1px solid rgba(255,255,255,0.08);
-    border-radius: 10px; padding: 16px; width: 640px; max-width: 92vw;
-    max-height: 90vh; overflow-y: auto;
+    border-radius: 10px; padding: 16px; width: 640px;
+    max-width: min(92vw, 800px);
+    max-height: calc(100vh - 4rem);
+    display: flex; flex-direction: column; overflow: hidden;
   }
+  .cm-modal > .cm-header { flex: 0 0 auto; }
+  .cm-modal > .cm-body, .cm-modal > div:not(.cm-header) { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
   .cm-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
   .cm-header h2 { font-size: 14px; margin: 0; }
   .cm-x { background: none; border: none; color: #888; font-size: 20px; line-height: 1; cursor: pointer; padding: 0 4px; }

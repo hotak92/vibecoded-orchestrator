@@ -17,14 +17,52 @@
   let project = $state<ProjectView | null>(null);
   let activeTab = $state<'agents' | 'skills' | 'hooks' | 'permissions' | 'secrets' | 'kg' | 'settings'>('agents');
 
+  // Bug 21: orchestrator update banner. Loads inspect_orchestrator_at on
+  // mount; if version_status === 'outdated' a "Update this project"
+  // button appears.
+  type ConfigHealth = { file: string; ok: boolean; error: string | null };
+  type OrchestratorState = {
+    installed: boolean;
+    version: string | null;
+    version_status: 'current' | 'outdated' | 'unknown';
+    bundled_version: string | null;
+    config_health: ConfigHealth[];
+  };
+  let orchState = $state<OrchestratorState | null>(null);
+  let updating = $state(false);
+
   async function loadProject() {
     try {
       project = await invoke<ProjectView | null>('get_project_v2', { id: projectId });
       if (!project) {
         toast.error(`Project ${projectId} not found`);
+        return;
+      }
+      try {
+        orchState = await invoke<OrchestratorState>('inspect_orchestrator_at', {
+          path: project.folder_path,
+        });
+      } catch (e) {
+        console.error('inspect_orchestrator_at failed', e);
       }
     } catch (e) {
       toast.error(e);
+    }
+  }
+
+  async function runUpdate() {
+    if (!project) return;
+    updating = true;
+    try {
+      await invoke('update_orchestrator_at', { path: project.folder_path });
+      orchState = await invoke<OrchestratorState>('inspect_orchestrator_at', {
+        path: project.folder_path,
+      });
+      toast.success('Orchestrator updated');
+    } catch (e) {
+      toast.error(e);
+    } finally {
+      updating = false;
     }
   }
 
@@ -59,6 +97,19 @@
       {/if}
     </div>
   </header>
+
+  {#if orchState && orchState.installed && orchState.version_status === 'outdated' && orchState.bundled_version}
+    <div class="orch-banner">
+      <span class="orch-banner-text">
+        Orchestrator
+        {#if orchState.version}v{orchState.version}{/if}
+        — update to v{orchState.bundled_version} available
+      </span>
+      <button class="orch-banner-btn" onclick={runUpdate} disabled={updating}>
+        {updating ? 'Updating…' : 'Update this project'}
+      </button>
+    </div>
+  {/if}
 
   <nav class="tab-nav">
     {#each tabs as tab}
@@ -114,6 +165,25 @@
   }
   .host-base { background: rgba(0,191,166,0.15); color: #0fc; }
   .host-mao { background: rgba(123,95,255,0.15); color: #c4b3ff; }
+
+  /* Bug 21: outdated-orchestrator banner */
+  .orch-banner {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px;
+    padding: 10px 24px;
+    background: rgba(245,179,66,0.1);
+    border-bottom: 1px solid rgba(245,179,66,0.25);
+    color: #f5b342;
+    font-size: 13px;
+  }
+  .orch-banner-text { line-height: 1.4; }
+  .orch-banner-btn {
+    background: rgba(0,191,166,0.9); border: 1px solid rgba(0,191,166,1);
+    color: #000; font-weight: 600;
+    padding: 6px 14px; border-radius: 6px; cursor: pointer;
+    font-size: 12px;
+  }
+  .orch-banner-btn:disabled { opacity: 0.6; cursor: not-allowed; }
   .tab-nav { display: flex; padding: 0 24px; border-bottom: 1px solid rgba(255,255,255,0.06); }
   .tab-btn {
     background: none; border: none; color: #888; padding: 12px 16px;
