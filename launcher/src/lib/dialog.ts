@@ -9,6 +9,9 @@
 // `@tauri-apps/api`. The Rust side is registered in `src-tauri/src/lib.rs`
 // and the capability `dialog:default` is granted in
 // `src-tauri/capabilities/default.json`.
+//
+// Named import per Tauri 2 plugin-dialog docs:
+// https://v2.tauri.app/plugin/dialog/
 
 import { isTauriRuntime } from './tauri';
 
@@ -20,33 +23,82 @@ export interface OpenDirectoryOptions {
 /**
  * Open a native folder picker. Returns the selected path, or `null` if the
  * user canceled or Tauri is not available.
+ *
+ * Bug 13: previous version used `mod.open` after dynamic import without
+ * verifying the export shape; on some runs the call silently failed because
+ * the function was looked up via the wrong specifier. The dynamic import is
+ * still kept (so the package is optional in browser-mode dev builds) but
+ * we now destructure `{ open }` explicitly and log every step so failures
+ * surface in the devtools console instead of disappearing.
  */
 export async function pickDirectory(
   opts: OpenDirectoryOptions = {},
 ): Promise<string | null> {
-  if (!isTauriRuntime()) return null;
+  if (!isTauriRuntime()) {
+    console.warn('[dialog] pickDirectory: not in Tauri runtime, returning null');
+    return null;
+  }
+  console.log('[dialog] pickDirectory called', opts);
   try {
-    // Resolved at runtime by the Tauri host; the plugin is registered in
-    // src-tauri/src/lib.rs and the package is listed in package.json. The
-    // dynamic specifier (and @ts-ignore) avoid a hard build dependency on
-    // the plugin's TS types in dev environments where node_modules isn't
-    // populated.
     const specifier = '@tauri-apps/plugin-dialog';
-    // @ts-ignore — plugin types are optional in this dev workflow.
     const mod = (await import(/* @vite-ignore */ specifier)) as {
       open?: (o: unknown) => Promise<string | string[] | null>;
     };
-    if (typeof mod.open !== 'function') return null;
+    if (typeof mod.open !== 'function') {
+      console.error('[dialog] pickDirectory: open() not found on plugin module', mod);
+      return null;
+    }
     const picked = await mod.open({
       directory: true,
       multiple: false,
       defaultPath: opts.defaultPath,
       title: opts.title ?? 'Select project folder',
     });
+    console.log('[dialog] pickDirectory result:', picked);
     if (Array.isArray(picked)) return picked[0] ?? null;
     return picked ?? null;
   } catch (err) {
-    console.warn('[dialog] pickDirectory failed:', err);
+    console.error('[dialog] pickDirectory failed:', err);
+    return null;
+  }
+}
+
+/**
+ * Open a native file picker. Returns the selected path, or `null` if the
+ * user canceled or Tauri is not available. Mirror of pickDirectory but
+ * returns a single file path. Filters are forwarded to the native picker.
+ */
+export async function pickFile(
+  opts: OpenDirectoryOptions & {
+    filters?: { name: string; extensions: string[] }[];
+  } = {},
+): Promise<string | null> {
+  if (!isTauriRuntime()) {
+    console.warn('[dialog] pickFile: not in Tauri runtime, returning null');
+    return null;
+  }
+  console.log('[dialog] pickFile called', opts);
+  try {
+    const specifier = '@tauri-apps/plugin-dialog';
+    const mod = (await import(/* @vite-ignore */ specifier)) as {
+      open?: (o: unknown) => Promise<string | string[] | null>;
+    };
+    if (typeof mod.open !== 'function') {
+      console.error('[dialog] pickFile: open() not found on plugin module', mod);
+      return null;
+    }
+    const picked = await mod.open({
+      directory: false,
+      multiple: false,
+      defaultPath: opts.defaultPath,
+      title: opts.title ?? 'Select file',
+      filters: opts.filters,
+    });
+    console.log('[dialog] pickFile result:', picked);
+    if (Array.isArray(picked)) return picked[0] ?? null;
+    return picked ?? null;
+  } catch (err) {
+    console.error('[dialog] pickFile failed:', err);
     return null;
   }
 }
