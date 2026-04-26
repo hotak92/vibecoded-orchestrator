@@ -71,15 +71,6 @@ pub async fn run_install(
             )
             .await?;
         }
-        InstallMethod::Tarball => {
-            return Err("install.method=tarball not yet implemented".into());
-        }
-        InstallMethod::Pypi => {
-            return Err("install.method=pypi not yet implemented".into());
-        }
-        InstallMethod::Npm => {
-            return Err("install.method=npm not yet implemented".into());
-        }
         InstallMethod::Local => {
             // Local: install_dir must already exist; skip fetch.
             if !install_dir.exists() {
