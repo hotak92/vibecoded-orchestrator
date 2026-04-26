@@ -208,6 +208,10 @@ def main() -> int:
         if not args.skip_models:
             _wait_for_ollama()
             _pull_ollama_models(embed_config["ollama_models"])
+        # Bug 29: with shared-container reuse, multiple installs hit the same
+        # Weaviate. Bootstrap any of THIS project's KG/Development collections
+        # that aren't there yet — leave existing ones alone.
+        _ensure_collections(embed_config)
     else:
         print("\n[skip] Container services (--no-containers)")
 
@@ -901,6 +905,120 @@ def _pull_ollama_models(models: list[str]) -> None:
             print(f"    Pull manually: curl -X POST "
                   f"http://localhost:{port}/api/pull "
                   f"-d '{{\"name\": \"{model}\"}}'")
+
+
+# ---------------------------------------------------------------------------
+# Step 6c: Weaviate collection bootstrap (shared-container aware)
+# ---------------------------------------------------------------------------
+
+# Minimal Weaviate class definitions for the collections this install needs.
+# Vectorizer is "none" — we feed pre-computed vectors from Ollama / CodeSage.
+# These are intentionally property-light: the MCP server (server.py) uses the
+# v4 client `client.collections.get(name)` which doesn't require a strict
+# property list to insert; richer schemas can be added later without
+# re-creating the class.
+def _kg_class_definition(name: str) -> dict:
+    return {
+        "class": name,
+        "description": "VibeCoded Tools knowledge graph collection",
+        "vectorizer": "none",
+        "properties": [
+            {"name": "title", "dataType": ["text"]},
+            {"name": "content", "dataType": ["text"]},
+            {"name": "file_path", "dataType": ["text"]},
+            {"name": "node_type", "dataType": ["text"]},
+            {"name": "tags", "dataType": ["text[]"]},
+            {"name": "links", "dataType": ["text[]"]},
+            {"name": "typed_links", "dataType": ["text[]"]},
+            {"name": "status", "dataType": ["text"]},
+        ],
+    }
+
+
+def _development_class_definition(name: str) -> dict:
+    return {
+        "class": name,
+        "description": "VibeCoded Tools project documentation collection",
+        "vectorizer": "none",
+        "properties": [
+            {"name": "title", "dataType": ["text"]},
+            {"name": "content", "dataType": ["text"]},
+            {"name": "file_path", "dataType": ["text"]},
+        ],
+    }
+
+
+def _ensure_collections(embed_config: dict) -> None:
+    """Detect existing Weaviate collections and create only the ones missing.
+
+    Code-graph collections (CodeModule / CodeClass / CodeFunction / CodeAPI /
+    CodeInteraction) are SHARED across all projects on this machine — they
+    carry a `project_name` field that separates rows. Don't recreate them
+    per-install: the MCP server creates them lazily on first write.
+    """
+    weaviate_port = os.environ.get("WEAVIATE_PORT", str(DEFAULT_WEAVIATE_PORT))
+    weaviate_url = f"http://localhost:{weaviate_port}"
+    kg_name = os.environ.get("KG_COLLECTION", "KnowledgeGraph")
+    dev_name = os.environ.get("DEVELOPMENT_COLLECTION", "Development")
+
+    print(f"[7b/10] Checking Weaviate collections at {weaviate_url} ... ", flush=True)
+
+    # 1. Read existing schema.
+    try:
+        resp = urllib.request.urlopen(f"{weaviate_url}/v1/schema", timeout=10)
+        schema = json.loads(resp.read())
+    except Exception as e:
+        print(f"  WARN: couldn't read schema ({e}). Skipping bootstrap.")
+        print("  MCP server will create collections lazily on first write.")
+        return
+
+    existing = {
+        c.get("class") for c in schema.get("classes", [])
+        if isinstance(c, dict) and c.get("class")
+    }
+
+    # 2. Required for THIS project install. Code-graph collections excluded
+    #    on purpose — they're shared and created on demand.
+    required = [
+        (kg_name, _kg_class_definition),
+        (dev_name, _development_class_definition),
+    ]
+
+    missing = [(n, b) for (n, b) in required if n not in existing]
+    if not missing:
+        print(f"  All collections present (reusing {len(required)} shared classes).")
+        return
+
+    # 3. POST each missing class definition.
+    created: list[str] = []
+    failed: list[tuple[str, str]] = []
+    for name, builder in missing:
+        body = json.dumps(builder(name)).encode()
+        req = urllib.request.Request(
+            f"{weaviate_url}/v1/schema",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            urllib.request.urlopen(req, timeout=15)
+            created.append(name)
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8", errors="replace")[:200]
+            # 422 with "already exists" is benign on race with another install.
+            if e.code == 422 and "already exists" in err_body.lower():
+                created.append(f"{name} (already)")
+            else:
+                failed.append((name, f"HTTP {e.code}: {err_body}"))
+        except Exception as e:
+            failed.append((name, str(e)))
+
+    for c in created:
+        print(f"  + created collection {c}")
+    for n, err in failed:
+        print(f"  ! failed to create {n}: {err}")
+    if not failed:
+        print("  OK")
 
 
 # ---------------------------------------------------------------------------
