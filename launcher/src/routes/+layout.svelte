@@ -61,7 +61,17 @@
   onMount(() => {
     // Check onboarding / changelog gates once per app load.
     try {
-      if (localStorage.getItem('vct.onboarding_complete') !== 'true') {
+      // Bug 14: `vct.onboarding_force` is set by Settings → Preferences →
+      // Run setup wizard. Honor it ahead of the normal "completed" check so
+      // users with a populated ~/.vct/launcher.db can still re-trigger the
+      // wizard on demand. We clear the force flag immediately so it only
+      // fires once.
+      const forced = localStorage.getItem('vct.onboarding_force') === '1';
+      if (forced) {
+        localStorage.removeItem('vct.onboarding_force');
+        localStorage.removeItem('vct.onboarding_complete');
+      }
+      if (forced || localStorage.getItem('vct.onboarding_complete') !== 'true') {
         showOnboarding = true;
       }
       if (localStorage.getItem('vct.show_changelog_after_update') === '1') {

@@ -29,6 +29,20 @@ pub struct ModuleCatalogEntry {
     pub compatibility_hosts: Vec<String>,
     pub is_licensed: bool,
     pub manifest_source: String, // path or URL the manifest was loaded from
+    /// Bug 16: how the launcher should render this entry.
+    ///   - "bundled"      = bundled with the launcher itself, always installed,
+    ///                      cannot be uninstalled (e.g. the launcher).
+    ///   - "available"    = catalog-listed, not installed yet, has Install action.
+    ///   - "installed"    = installed, can be reconfigured / uninstalled.
+    ///   - "subcomponent" = ships with a parent module, no separate install,
+    ///                      offers a Dashboard CTA.
+    pub kind: String,
+    /// For subcomponents: which parent module they ship with. Empty otherwise.
+    #[serde(default)]
+    pub parent_id: String,
+    /// Optional dashboard route for subcomponents (e.g. "/kg", "/codegraph").
+    #[serde(default)]
+    pub cta_route: String,
 }
 
 impl ModuleCatalogEntry {
@@ -46,8 +60,188 @@ impl ModuleCatalogEntry {
             compatibility_hosts: m.compatibility.hosts.clone(),
             is_licensed,
             manifest_source: source,
+            kind: "available".into(),
+            parent_id: String::new(),
+            cta_route: String::new(),
         }
     }
+}
+
+/// Bug 16: minimal manifest the launcher reads from `vct-module.json` at the
+/// repo root. The full ModuleManifest schema is for installable modules; the
+/// orchestrator core is not installable as a module — it IS the orchestrator —
+/// so it ships its own slim shape.
+#[derive(Debug, Deserialize)]
+struct OrchestratorManifest {
+    #[serde(default = "default_orch_id")]
+    id: String,
+    #[serde(default = "default_orch_name")]
+    name: String,
+    version: String,
+    description: String,
+    #[serde(default)]
+    components: Vec<OrchestratorComponent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OrchestratorComponent {
+    id: String,
+    name: String,
+    description: String,
+}
+
+fn default_orch_id() -> String {
+    "orchestrator".into()
+}
+fn default_orch_name() -> String {
+    "VibeCoded Orchestrator".into()
+}
+
+/// Find `vct-module.json` at the repo root. We walk up from
+/// CARGO_MANIFEST_DIR (the launcher/src-tauri/) to the repo root. Only used
+/// at runtime in dev/source builds; release builds will have to ship the
+/// JSON inside the bundled resources, but for now the dev build path is what
+/// matters since users run `npm run tauri:dev` against the repo checkout.
+fn find_orchestrator_manifest() -> Option<PathBuf> {
+    let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut p = here.as_path();
+    loop {
+        let candidate = p.join("vct-module.json");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        match p.parent() {
+            Some(parent) => p = parent,
+            None => return None,
+        }
+    }
+}
+
+fn read_orchestrator_manifest() -> Option<OrchestratorManifest> {
+    let path = find_orchestrator_manifest()?;
+    let raw = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Bug 16: launcher's own version, sourced from CARGO_PKG_VERSION at compile
+/// time. Always reflects the running binary, not whatever package.json
+/// happens to say.
+fn launcher_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+/// Bug 16: detect whether the orchestrator core is "installed" by checking
+/// whether any project in the launcher DB has host=base. This is the same
+/// signal used elsewhere — projects with the base host imply a working
+/// orchestrator install.
+fn orchestrator_installed(db: &Db) -> bool {
+    db.list_projects()
+        .map(|rows| rows.iter().any(|p| matches!(p.host, ProjectHost::Base)))
+        .unwrap_or(false)
+}
+
+/// Bug 16: built-in catalog entries that always render in /modules even
+/// when no installable modules are present. Reflects real repo state:
+/// launcher version comes from CARGO_PKG_VERSION, orchestrator + components
+/// from `vct-module.json` at repo root, install state from the launcher DB.
+fn builtin_catalog_entries(db: &Db) -> Vec<ModuleCatalogEntry> {
+    let mut out = Vec::new();
+
+    // 1. The launcher itself — always "bundled" (the running process).
+    out.push(ModuleCatalogEntry {
+        id: "vct-launcher".into(),
+        name: "VCT Launcher".into(),
+        version: launcher_version().into(),
+        description:
+            "Desktop launcher: manages orchestrator runtime, projects, secrets, licensing. \
+             Bundled with the orchestrator install."
+                .into(),
+        category: "launcher".into(),
+        tags: vec!["bundled".into(), "free".into()],
+        license_required: false,
+        license_variant_ids: vec![],
+        min_orchestrator_tier: "free".into(),
+        compatibility_hosts: vec!["base".into(), "mao".into()],
+        is_licensed: true,
+        manifest_source: "builtin".into(),
+        kind: "bundled".into(),
+        parent_id: String::new(),
+        cta_route: String::new(),
+    });
+
+    // 2. Orchestrator core + 3-4. its sub-components, sourced from
+    //    `vct-module.json`. If the manifest is missing, we still emit the
+    //    core entry with version "dev" so the catalog isn't empty.
+    let manifest = read_orchestrator_manifest();
+    let (orch_version, orch_desc, components): (String, String, Vec<OrchestratorComponent>) =
+        if let Some(m) = manifest {
+            (m.version, m.description, m.components)
+        } else {
+            (
+                "dev".into(),
+                "The core: hooks, agents, skills, KG + Code Graph, 4 MCP servers. \
+                 Runs locally in Podman/Docker."
+                    .into(),
+                vec![
+                    OrchestratorComponent {
+                        id: "knowledge-graph".into(),
+                        name: "Knowledge Graph".into(),
+                        description: "Markdown-based KG, Weaviate-backed embeddings.".into(),
+                    },
+                    OrchestratorComponent {
+                        id: "code-graph".into(),
+                        name: "Code Graph".into(),
+                        description: "AST analysis with Tree-sitter, optional Joern.".into(),
+                    },
+                ],
+            )
+        };
+
+    let installed = orchestrator_installed(db);
+    out.push(ModuleCatalogEntry {
+        id: "orchestrator".into(),
+        name: "VibeCoded Orchestrator".into(),
+        version: orch_version.clone(),
+        description: orch_desc,
+        category: "core".into(),
+        tags: vec!["free".into(), "agpl-3.0".into()],
+        license_required: false,
+        license_variant_ids: vec![],
+        min_orchestrator_tier: "free".into(),
+        compatibility_hosts: vec!["base".into()],
+        is_licensed: true,
+        manifest_source: "builtin".into(),
+        kind: if installed { "installed".into() } else { "available".into() },
+        parent_id: String::new(),
+        cta_route: String::new(),
+    });
+
+    for comp in components {
+        let route = match comp.id.as_str() {
+            "knowledge-graph" => "/kg",
+            "code-graph" => "/codegraph",
+            _ => "",
+        };
+        out.push(ModuleCatalogEntry {
+            id: comp.id,
+            name: comp.name,
+            version: orch_version.clone(),
+            description: comp.description,
+            category: "subcomponent".into(),
+            tags: vec!["free".into(), "bundled-with-orchestrator".into()],
+            license_required: false,
+            license_variant_ids: vec![],
+            min_orchestrator_tier: "free".into(),
+            compatibility_hosts: vec!["base".into()],
+            is_licensed: true,
+            manifest_source: "builtin".into(),
+            kind: "subcomponent".into(),
+            parent_id: "orchestrator".into(),
+            cta_route: route.into(),
+        });
+    }
+
+    out
 }
 
 // ─── Catalog discovery ──────────────────────────────────────────────────
@@ -121,7 +315,9 @@ fn is_module_licensed(manifest: &ModuleManifest, db: &Db) -> bool {
 
 #[command]
 pub async fn list_module_catalog(db: State<'_, Db>) -> Result<Vec<ModuleCatalogEntry>, String> {
-    let mut out = Vec::new();
+    // Bug 16: built-in entries (launcher + orchestrator + KG + code graph)
+    // come first — they're always present and reflect real repo state.
+    let mut out = builtin_catalog_entries(&db);
     for path in catalog_scan_paths() {
         let raw = match std::fs::read_to_string(&path) {
             Ok(s) => s,
@@ -134,6 +330,12 @@ pub async fn list_module_catalog(db: State<'_, Db>) -> Result<Vec<ModuleCatalogE
                 continue;
             }
         };
+        // Skip if a built-in already covers this id (defensive against a
+        // user dropping a `vct-module.json` named "orchestrator" in
+        // ~/.vct/bundled_manifests/).
+        if out.iter().any(|e| e.id == manifest.id) {
+            continue;
+        }
         let licensed = is_module_licensed(&manifest, &db);
         out.push(ModuleCatalogEntry::from_manifest(
             &manifest,

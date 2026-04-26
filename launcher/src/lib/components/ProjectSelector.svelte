@@ -14,6 +14,13 @@
   import { isTauriRuntime } from '$lib/tauri';
   import { projectColor } from '$lib/project-color';
   import type { ProjectHost, ProjectView } from '$lib/types/launcher';
+  import Dropdown from '$lib/components/Dropdown.svelte';
+
+  // Host options used by the create modal. Bug 3d: MAO is hidden until it
+  // ships as a managed module.
+  const HOST_OPTIONS: { value: ProjectHost; label: string }[] = [
+    { value: 'base', label: 'Standard — Claude Code only' },
+  ];
 
   let open = $state(false);
   let wrapperEl: HTMLDivElement;
@@ -370,15 +377,15 @@
               title="What does host mean?"
             >?</button>
           </div>
-          <select id="project-host" class="form-input host-select" bind:value={createHost}>
-            <option value="base">Standard — Claude Code only</option>
-            <!--
-              Bug 3d: MAO option is intentionally hidden from the create
-              modal. MAO is not yet shipped as a managed module; until
-              it is, exposing it here just confuses users. Re-enable
-              with a feature flag when MAO is generally available.
-            -->
-          </select>
+          <!-- Bug 12: native <select> on Linux/Tauri WebKitGTK ignores CSS
+               on the OS-level dropdown popup and renders white-on-white.
+               Replaced with custom Dropdown component. Bug 3d: MAO option
+               still hidden — re-add a row to HOST_OPTIONS when ready. -->
+          <Dropdown
+            id="project-host"
+            options={HOST_OPTIONS}
+            bind:value={createHost}
+          />
           <p class="form-hint">
             MAO (Multi-Agent Orchestrator) is coming soon — opt-in via the
             Modules tab once available.
@@ -716,6 +723,12 @@
   }
 
   /* ── Modals ─────────────────────────────────────────────── */
+  /* Bug 11: backdrop is `position: fixed; inset: 0` so it always covers
+     the viewport, and uses flex centering so the modal stays vertically
+     centered no matter the screen height. The modal itself is capped at
+     `max-height: 90vh` and its body scrolls — guarantees the top of the
+     modal is never above the viewport (was being clipped on ~600px-tall
+     windows when the form grew with errors). */
   .modal-backdrop {
     position: fixed;
     inset: 0;
@@ -726,6 +739,8 @@
     justify-content: center;
     z-index: 400;
     animation: fade-in 0.15s ease-out;
+    padding: 16px;
+    overflow-y: auto;
   }
   @keyframes fade-in {
     from { opacity: 0; }
@@ -735,11 +750,15 @@
   .modal-content {
     width: 460px;
     max-width: 90vw;
+    max-height: 90vh;
+    display: flex;
+    flex-direction: column;
     background: rgba(13, 23, 53, 0.97);
     backdrop-filter: blur(24px);
     border: 1px solid rgba(255, 255, 255, 0.1);
     border-radius: 18px;
     box-shadow: 0 30px 80px rgba(0, 0, 0, 0.6);
+    overflow: hidden;
   }
 
   .modal-header {
@@ -748,6 +767,7 @@
     justify-content: space-between;
     padding: 18px 20px;
     border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    flex-shrink: 0;
   }
 
   .modal-header h2 {
@@ -775,6 +795,9 @@
 
   .modal-body {
     padding: 18px 20px;
+    overflow-y: auto;
+    flex: 1 1 auto;
+    min-height: 0;
   }
 
   .modal-desc {
@@ -813,20 +836,9 @@
     font-family: 'JetBrains Mono', 'Fira Code', monospace;
     font-size: 12px;
   }
-  /* Bug 3c: native <select> + <option> on Linux/Tauri (WebKitGTK) renders
-     the dropdown panel using the platform theme. Some themes ship a white
-     panel background AND inherited white text from .form-input → invisible
-     options. Force opaque dark background for both the select control and
-     its options. */
-  .host-select {
-    background-color: #1a2342;
-    color: var(--color-text);
-    appearance: auto;
-  }
-  .host-select option {
-    background-color: #1a2342;
-    color: #e8e8ee;
-  }
+  /* Bug 12: native <select> styling is upstream-broken on Tauri/WebKitGTK
+     (see https://github.com/tauri-apps/tauri/issues/11755). The HOST field
+     now uses the custom Dropdown component instead. */
   .form-input:focus {
     border-color: rgba(0, 191, 166, 0.5);
     box-shadow: 0 0 0 3px rgba(0, 191, 166, 0.1);

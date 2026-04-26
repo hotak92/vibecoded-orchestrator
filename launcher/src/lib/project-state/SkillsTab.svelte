@@ -3,6 +3,15 @@
   import { invoke } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
   import type { ProjectSkill } from '$lib/types/project-state';
+  import Dropdown from '$lib/components/Dropdown.svelte';
+
+  // Bug 12 systemic: native <select> is unstyled-on-Linux/Tauri.
+  const SOURCE_OPTIONS = [
+    { value: 'user', label: 'user' },
+    { value: 'bundled', label: 'bundled' },
+    { value: 'paid-module', label: 'paid-module' },
+    { value: 'project', label: 'project' },
+  ];
 
   let { projectId }: { projectId: string } = $props();
 
@@ -72,12 +81,7 @@
       <div class="ps-form-grid">
         <label><span>Name</span><input bind:value={newName} placeholder="my-skill" /></label>
         <label><span>Source</span>
-          <select bind:value={newSource}>
-            <option value="user">user</option>
-            <option value="bundled">bundled</option>
-            <option value="paid-module">paid-module</option>
-            <option value="project">project</option>
-          </select>
+          <Dropdown options={SOURCE_OPTIONS} bind:value={newSource} />
         </label>
         <label><span>Model</span><input bind:value={newModel} placeholder="optional" /></label>
       </div>

@@ -7,6 +7,13 @@
     ProjectKgBinding,
     ProjectCodegraphBinding,
   } from '$lib/types/project-state';
+  import Dropdown from '$lib/components/Dropdown.svelte';
+
+  const ROLE_OPTIONS = [
+    { value: 'primary', label: 'primary' },
+    { value: 'shared', label: 'shared' },
+    { value: 'archive', label: 'archive' },
+  ];
 
   let { projectId }: { projectId: string } = $props();
 
@@ -111,11 +118,7 @@
       <div class="ps-form-grid">
         <label>
           <span>Role</span>
-          <select bind:value={kgRole}>
-            <option value="primary">primary</option>
-            <option value="shared">shared</option>
-            <option value="archive">archive</option>
-          </select>
+          <Dropdown options={ROLE_OPTIONS} bind:value={kgRole} />
         </label>
         <label>
           <span>Collection</span>

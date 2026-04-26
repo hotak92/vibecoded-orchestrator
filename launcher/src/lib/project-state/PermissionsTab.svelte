@@ -3,6 +3,7 @@
   import { invoke } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
   import type { ProjectPermission } from '$lib/types/project-state';
+  import Dropdown from '$lib/components/Dropdown.svelte';
 
   let { projectId }: { projectId: string } = $props();
 
@@ -14,6 +15,7 @@
     permission_mode: 'default | acceptEdits | dontAsk | bypassPermissions | plan',
   };
   const KINDS = Object.keys(KIND_HELP);
+  const KIND_OPTIONS = KINDS.map((k) => ({ value: k, label: k }));
 
   let perms = $state<ProjectPermission[]>([]);
   let loading = $state(true);
@@ -81,9 +83,7 @@
       <div class="ps-form-grid">
         <label><span>Subject</span><input bind:value={nSubject} placeholder="agent:planner or @global" /></label>
         <label><span>Kind</span>
-          <select bind:value={nKind}>
-            {#each KINDS as k}<option value={k}>{k}</option>{/each}
-          </select>
+          <Dropdown options={KIND_OPTIONS} bind:value={nKind} />
         </label>
         <label class="ps-span2"><span>Value</span>
           <input bind:value={nValue} placeholder="e.g. Read, src/**, weaviate-kg" />

@@ -261,14 +261,25 @@
 {/if}
 
 <style>
-  .ow-back { position: fixed; inset: 0; background: rgba(0,0,0,0.7); z-index: 1200; display: flex; align-items: center; justify-content: center; }
-  .ow-modal { background: #1a1a22; border: 1px solid rgba(255,255,255,0.08); border-radius: 10px; padding: 0; width: 560px; max-width: 92vw; }
-  .ow-header { padding: 16px 20px 8px; border-bottom: 1px solid rgba(255,255,255,0.06); }
+  /* Bug 11 systemic: bound the wizard to the viewport. The body scrolls
+     when content overflows so step 3 (install + adopt diff) doesn't push
+     the header out of view on short windows. */
+  .ow-back {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.7);
+    z-index: 1200; display: flex; align-items: center; justify-content: center;
+    padding: 16px; overflow-y: auto;
+  }
+  .ow-modal {
+    background: #1a1a22; border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 10px; padding: 0; width: 560px; max-width: 92vw;
+    max-height: 90vh; display: flex; flex-direction: column; overflow: hidden;
+  }
+  .ow-header { padding: 16px 20px 8px; border-bottom: 1px solid rgba(255,255,255,0.06); flex-shrink: 0; }
   .ow-header h2 { margin: 0 0 12px; font-size: 16px; }
   .ow-steps { list-style: none; padding: 0; margin: 0; display: flex; gap: 8px; font-size: 11px; color: #666; }
   .ow-steps li.active { color: #c4b3ff; }
   .ow-steps li.current { color: #0fc; font-weight: 600; }
-  .ow-body { padding: 16px 20px; min-height: 160px; font-size: 13px; line-height: 1.55; color: #ccc; }
+  .ow-body { padding: 16px 20px; min-height: 160px; font-size: 13px; line-height: 1.55; color: #ccc; overflow-y: auto; flex: 1 1 auto; }
   .ow-secondary { color: #888; font-size: 12px; }
   .ow-error { color: #f99; font-size: 12px; }
   .ow-ok { color: #0fc; font-size: 12px; }
@@ -280,7 +291,7 @@
     background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.12); color: inherit;
     padding: 5px 10px; border-radius: 4px; font-size: 13px; font-family: ui-monospace, monospace;
   }
-  .ow-footer { display: flex; justify-content: space-between; align-items: center; padding: 12px 20px; border-top: 1px solid rgba(255,255,255,0.06); }
+  .ow-footer { display: flex; justify-content: space-between; align-items: center; padding: 12px 20px; border-top: 1px solid rgba(255,255,255,0.06); flex-shrink: 0; }
   .ow-nav { display: flex; gap: 6px; }
   .ow-btn, .ow-btn-primary, .ow-btn-link {
     padding: 5px 14px; border-radius: 4px; cursor: pointer; font-size: 12px; font-weight: 500;
