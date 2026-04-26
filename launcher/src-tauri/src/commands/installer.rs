@@ -1070,7 +1070,7 @@ fn detect_ram_gb() -> u64 {
 #[cfg(target_os = "linux")]
 fn detect_ram_gb_native() -> Option<u64> {
     parse_meminfo_total_kb(&std::fs::read_to_string("/proc/meminfo").ok()?)
-        .map(meminfo_kb_to_gb)
+        .map(snap_to_common_ram_gb)
 }
 
 #[cfg(target_os = "macos")]
@@ -1084,7 +1084,9 @@ fn detect_ram_gb_native() -> Option<u64> {
     }
     let raw = String::from_utf8_lossy(&out.stdout);
     let bytes: u64 = raw.trim().parse().ok()?;
-    Some(((bytes as f64) / (1024.0 * 1024.0 * 1024.0)).round() as u64)
+    // sysctl reports the actual installed bytes; convert bytes → kB
+    // and snap to the marketed-stick value the same as Linux does.
+    Some(snap_to_common_ram_gb(bytes / 1024))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -1123,10 +1125,39 @@ pub fn parse_meminfo_total_kb(meminfo: &str) -> Option<u64> {
 /// Convert MemTotal kB → GB with half-step rounding so 65857132 kB
 /// (≈62.8 GiB / 67.4 GB worth of binary kB) rounds to 64 GB cleanly.
 /// Without the +0.5 nudge sysinfo's plain divide reports 62.
+///
+/// Kept around for tests / callers that want raw GiB. Production
+/// display uses `snap_to_common_ram_gb` instead so the user sees the
+/// marketed stick capacity (e.g. "64 GB") rather than the post-kernel-
+/// reserve value (e.g. "62 GB").
 pub fn meminfo_kb_to_gb(kb: u64) -> u64 {
     // 1 GB (binary) = 1024 * 1024 kB. Add half a GB for round-to-nearest.
     let denom: u64 = 1024 * 1024;
     (kb + denom / 2) / denom
+}
+
+/// Snap MemTotal (kB) to the closest common DDR stick capacity in
+/// decimal GB. Linux's `MemTotal` reports physical RAM minus kernel
+/// reserves, which on a "64 GB" machine yields ~62.4 GiB. We snap UP
+/// to the bucket the user actually paid for.
+///
+/// Match window: `bucket * 0.93 ≤ approx_gib ≤ bucket + 0.5`. The 0.93
+/// floor accommodates kernel reserves up to ~7%; the +0.5 ceiling lets
+/// a slightly-over MemTotal still hit the bucket cleanly.
+pub fn snap_to_common_ram_gb(meminfo_kb: u64) -> u64 {
+    let approx_gib = meminfo_kb as f64 / (1024.0 * 1024.0);
+    // Common DDR4/DDR5 capacities (and a couple of legacy values).
+    let buckets: &[u64] = &[
+        1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024,
+    ];
+    for &b in buckets {
+        let bf = b as f64;
+        if approx_gib >= bf * 0.93 && approx_gib <= bf + 0.5 {
+            return b;
+        }
+    }
+    // Fallback: round to nearest GiB.
+    approx_gib.round() as u64
 }
 
 async fn check_command_exists(cmd: &str) -> bool {
@@ -1359,6 +1390,39 @@ MemAvailable:   23456789 kB
     fn test_parse_meminfo_returns_none_when_missing() {
         let bad = "Nothing useful here\n";
         assert!(parse_meminfo_total_kb(bad).is_none());
+    }
+
+    // ─── Bug 25: snap to marketed RAM stick capacity ───────────────
+
+    #[test]
+    fn test_snap_64gb_machine() {
+        // Real-world MemTotal on a 64 GB box (the user's machine).
+        // 65498468 kB ≈ 62.46 GiB → must snap to 64.
+        assert_eq!(snap_to_common_ram_gb(65498468), 64);
+        // The slightly-different sample we used in test_parse_meminfo_64gb.
+        assert_eq!(snap_to_common_ram_gb(65857132), 64);
+    }
+
+    #[test]
+    fn test_snap_common_capacities() {
+        // 8 GB stick: ~7.7 GiB MemTotal (kernel reserves ~0.3 GiB).
+        // 7.7 GiB = 7.7 * 1024 * 1024 = 8074035 kB.
+        assert_eq!(snap_to_common_ram_gb(8_074_035), 8);
+        // 16 GB stick: ~15.5 GiB.
+        assert_eq!(snap_to_common_ram_gb(16_252_928), 16);
+        // 32 GB stick: ~31.2 GiB.
+        assert_eq!(snap_to_common_ram_gb(32_715_571), 32);
+        // 128 GB stick: ~125 GiB.
+        assert_eq!(snap_to_common_ram_gb(131_072_000), 128);
+    }
+
+    #[test]
+    fn test_snap_falls_back_for_oddball() {
+        // 3 GiB doesn't match any common bucket → fallback rounds to nearest GiB.
+        let kb = 3 * 1024 * 1024; // exactly 3 GiB
+        let gb = snap_to_common_ram_gb(kb);
+        // 3 isn't in buckets, so it falls back. round(3.0) = 3.
+        assert_eq!(gb, 3);
     }
 
     // ─── Bug 20: inspect orchestrator state ────────────────────────
