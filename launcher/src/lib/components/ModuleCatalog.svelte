@@ -554,7 +554,8 @@
     to { transform: rotate(360deg); }
   }
 
-  /* Modal */
+  /* Modal — Bug 11 systemic: bound to viewport so it never crops on
+     short windows. */
   .modal-backdrop {
     position: fixed;
     inset: 0;
@@ -564,15 +565,21 @@
     align-items: center;
     justify-content: center;
     z-index: 400;
+    padding: 16px;
+    overflow-y: auto;
   }
 
   .modal-content {
     width: 440px;
     max-width: 90vw;
+    max-height: 90vh;
+    display: flex;
+    flex-direction: column;
     background: rgba(13, 23, 53, 0.97);
     border: 1px solid rgba(255, 255, 255, 0.1);
     border-radius: 18px;
     box-shadow: 0 30px 80px rgba(0, 0, 0, 0.6);
+    overflow: hidden;
   }
 
   .modal-header {
@@ -588,6 +595,9 @@
 
   .modal-body {
     padding: 18px 20px;
+    overflow-y: auto;
+    flex: 1 1 auto;
+    min-height: 0;
   }
 
   .modal-desc {

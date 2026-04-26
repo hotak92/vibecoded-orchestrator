@@ -316,6 +316,7 @@
 </div>
 
 <style>
+  /* Bug 11 systemic */
   .dashboard-overlay {
     position: fixed;
     inset: 0;
@@ -325,13 +326,16 @@
     justify-content: center;
     z-index: 1000;
     backdrop-filter: blur(4px);
+    padding: 16px;
+    overflow-y: auto;
   }
   .dashboard-modal {
     background: var(--color-bg2);
     border: 1px solid var(--color-border);
     border-radius: var(--radius-card);
     width: 680px;
-    max-height: 85vh;
+    max-width: 92vw;
+    max-height: 90vh;
     overflow-y: auto;
     box-shadow: 0 24px 64px rgba(0, 0, 0, 0.5);
   }
