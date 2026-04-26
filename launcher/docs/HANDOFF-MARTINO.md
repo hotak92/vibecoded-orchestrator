@@ -87,8 +87,11 @@ npx supabase functions deploy lemon-squeezy-webhook --no-verify-jwt
 
 ### 4. Configurare il webhook su LS
 1. **app.lemonsqueezy.com** → **Settings** → **Webhooks** → **Add Webhook**
-2. **URL**: `https://ltnlwhaxnpbiifordlbk.supabase.co/functions/v1/lemon-squeezy-webhook`
-3. **Signing Secret**: `wh_vct_ls_2026_s3cur3k3y`
+2. **URL**: `https://api.vibecodedtools.it/lemon-squeezy-webhook`
+3. **Signing Secret**: `<YOUR_LS_WEBHOOK_SIGNING_SECRET>` — generalo con
+   `openssl rand -hex 32` (NON riusare il valore di esempio storico:
+   quello e' compromesso, vedi SETUP.md). Copia lo stesso valore in
+   `supabase secrets set LEMON_SQUEEZY_WEBHOOK_SECRET=...`.
 4. **Events**: seleziona solo **order_created**
 
 ---
@@ -111,11 +114,11 @@ Inserire in: Menu avatar → Activation Codes
 
 | Servizio | Dettaglio |
 |----------|-----------|
-| Supabase Project | ltnlwhaxnpbiifordlbk |
-| Supabase URL | https://ltnlwhaxnpbiifordlbk.supabase.co |
+| Supabase Project | `<YOUR_SUPABASE_PROJECT_REF>` (vedi `~/.vct-secrets/shared/supabase_project_ref`) |
+| Supabase URL pubblico | `https://api.vibecodedtools.it` |
 | Edge Function | lemon-squeezy-webhook (deployed) |
-| Webhook Secret | wh_vct_ls_2026_s3cur3k3y |
-| LS API Key | in .env (VITE_LEMONSQUEEZY_API_KEY) |
+| Webhook Secret | `<YOUR_LS_WEBHOOK_SIGNING_SECRET>` — generalo con `openssl rand -hex 32`, NON riusare valori da git history |
+| LS API Key | in `.env` (`VITE_LEMONSQUEEZY_API_KEY`); per server-side, in Supabase secrets come `LEMON_SQUEEZY_API_KEY` |
 
 ---
 
