@@ -281,8 +281,8 @@
   }
   .co-member.co-online { border-color: rgba(0,191,166,0.5); }
   .co-member small { display: block; color: #888; font-size: 10px; }
-  .co-modal-back { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 1100; }
-  .co-modal { background: #1a1a22; border-radius: 10px; padding: 16px; width: 420px; max-width: 90vw; border: 1px solid rgba(255,255,255,0.08); }
+  .co-modal-back { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; align-items: center; justify-content: center; z-index: 9999; padding: 2rem; overflow: hidden; }
+  .co-modal { background: #1a1a22; border-radius: 10px; padding: 16px; width: 420px; max-width: min(90vw, 600px); max-height: calc(100vh - 4rem); display: flex; flex-direction: column; overflow-y: auto; border: 1px solid rgba(255,255,255,0.08); }
   .co-modal h3 { font-size: 14px; margin: 0 0 8px; }
   .co-modal p { font-size: 12px; color: #ccc; line-height: 1.5; }
   .co-modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }

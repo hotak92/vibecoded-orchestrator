@@ -214,10 +214,10 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    z-index: 300;
+    z-index: 9999;
     animation: fade-in 0.15s ease-out;
-    padding: 16px;
-    overflow-y: auto;
+    padding: 2rem;
+    overflow: hidden;
   }
 
   @keyframes fade-in {
@@ -227,9 +227,9 @@
 
   .settings-panel {
     width: 760px;
-    max-width: 92vw;
+    max-width: min(92vw, 800px);
     height: 560px;
-    max-height: 86vh;
+    max-height: calc(100vh - 4rem);
     display: flex;
     background: rgba(13, 23, 53, 0.97);
     backdrop-filter: blur(24px);
@@ -241,8 +241,8 @@
   }
 
   @keyframes modal-enter {
-    from { opacity: 0; transform: scale(0.95) translateY(10px); }
-    to { opacity: 1; transform: scale(1) translateY(0); }
+    from { opacity: 0; transform: scale(0.95); }
+    to { opacity: 1; transform: scale(1); }
   }
 
   .settings-nav {

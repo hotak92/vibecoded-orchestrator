@@ -283,25 +283,27 @@
 {/if}
 
 <style>
-  /* Bug 11 systemic: bound the wizard to the viewport. The body scrolls
-     when content overflows so step 3 (install + adopt diff) doesn't push
-     the header out of view on short windows. */
+  /* Bug 19: backdrop padding + modal max-height: calc(100vh - 4rem) so
+     the modal can never extend above the viewport top. z-index 9999 to
+     win against any in-app chrome. overflow: hidden on backdrop (NOT
+     auto) — body scrolls inside the modal, the backdrop never moves. */
   .ow-back {
     position: fixed; inset: 0; background: rgba(0,0,0,0.7);
-    z-index: 1200; display: flex; align-items: center; justify-content: center;
-    padding: 16px; overflow-y: auto;
+    z-index: 9999; display: flex; align-items: center; justify-content: center;
+    padding: 2rem; overflow: hidden;
   }
   .ow-modal {
     background: #1a1a22; border: 1px solid rgba(255,255,255,0.08);
-    border-radius: 10px; padding: 0; width: 560px; max-width: 92vw;
-    max-height: 90vh; display: flex; flex-direction: column; overflow: hidden;
+    border-radius: 10px; padding: 0; width: 560px;
+    max-width: min(92vw, 600px); max-height: calc(100vh - 4rem);
+    display: flex; flex-direction: column; overflow: hidden;
   }
   .ow-header { padding: 16px 20px 8px; border-bottom: 1px solid rgba(255,255,255,0.06); flex-shrink: 0; }
   .ow-header h2 { margin: 0 0 12px; font-size: 16px; }
   .ow-steps { list-style: none; padding: 0; margin: 0; display: flex; gap: 8px; font-size: 11px; color: #666; }
   .ow-steps li.active { color: #c4b3ff; }
   .ow-steps li.current { color: #0fc; font-weight: 600; }
-  .ow-body { padding: 16px 20px; min-height: 160px; font-size: 13px; line-height: 1.55; color: #ccc; overflow-y: auto; flex: 1 1 auto; }
+  .ow-body { padding: 16px 20px; min-height: 0; font-size: 13px; line-height: 1.55; color: #ccc; overflow-y: auto; flex: 1 1 auto; }
   .ow-secondary { color: #888; font-size: 12px; }
   .ow-mono { font-family: ui-monospace, monospace; font-size: 11px; color: #c4b3ff; background: rgba(255,255,255,0.04); padding: 1px 5px; border-radius: 3px; word-break: break-all; }
   .ow-error { color: #f99; font-size: 12px; }

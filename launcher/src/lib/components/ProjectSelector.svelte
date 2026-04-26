@@ -723,12 +723,13 @@
   }
 
   /* ── Modals ─────────────────────────────────────────────── */
-  /* Bug 11: backdrop is `position: fixed; inset: 0` so it always covers
-     the viewport, and uses flex centering so the modal stays vertically
-     centered no matter the screen height. The modal itself is capped at
-     `max-height: 90vh` and its body scrolls — guarantees the top of the
-     modal is never above the viewport (was being clipped on ~600px-tall
-     windows when the form grew with errors). */
+  /* Bug 19: backdrop uses padding (2rem) instead of overflow-y, modal is
+     capped at calc(100vh - 4rem) so it can NEVER extend above the
+     viewport top no matter how tall the content grows. z-index bumped
+     to 9999 so the modal is unconditionally above the in-app MenuBar
+     (z-index 100), dropdown (200), Term (250), tray-related popups,
+     etc. NO position-fixed or transform on .modal-content — flexbox
+     centering only. */
   .modal-backdrop {
     position: fixed;
     inset: 0;
@@ -737,10 +738,10 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    z-index: 400;
+    z-index: 9999;
     animation: fade-in 0.15s ease-out;
-    padding: 16px;
-    overflow-y: auto;
+    padding: 2rem;
+    overflow: hidden;
   }
   @keyframes fade-in {
     from { opacity: 0; }
@@ -749,8 +750,8 @@
 
   .modal-content {
     width: 460px;
-    max-width: 90vw;
-    max-height: 90vh;
+    max-width: min(90vw, 600px);
+    max-height: calc(100vh - 4rem);
     display: flex;
     flex-direction: column;
     background: rgba(13, 23, 53, 0.97);
