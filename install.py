@@ -162,6 +162,11 @@ def main() -> int:
                         help="Install Claude skills (default: on)")
     parser.add_argument("--no-skills", dest="with_skills", action="store_false",
                         help="Skip installing Claude skills")
+    parser.add_argument("--telemetry", choices=["on", "off"], default=None,
+                        help="Anonymous telemetry consent. Default: prompt; "
+                             "non-interactive runs default to 'off'.")
+    parser.add_argument("--yes", action="store_true",
+                        help="Non-interactive: accept defaults for all prompts (telemetry=off).")
     args = parser.parse_args()
 
     mode = "update" if args.update else "install"
@@ -1125,9 +1130,39 @@ def _create_state_directory() -> None:
 # Step 8: Write .env
 # ---------------------------------------------------------------------------
 
+def _telemetry_consent(args: argparse.Namespace) -> bool:
+    """Resolve the user's telemetry choice for the generated .env.
+
+    Default-OFF policy. Order:
+      1. --telemetry on|off flag wins.
+      2. --yes / non-interactive (no TTY) → off.
+      3. Interactive prompt; default = No.
+
+    Returns True iff the user explicitly opted IN to anonymous telemetry.
+    """
+    if args.telemetry is not None:
+        return args.telemetry == "on"
+    if args.yes or not sys.stdin.isatty():
+        return False
+
+    print()
+    print("  Anonymous telemetry")
+    print("  -------------------")
+    print("  Help us improve the orchestrator by sharing anonymous usage data?")
+    print("  All paths/emails/tokens are scrubbed before upload (see")
+    print("  VCThelpers/telemetry/collector.py::_scrub_pii). Default: No.")
+    print()
+    try:
+        ans = input("  Enable anonymous telemetry? [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        ans = ""
+    return ans in ("y", "yes")
+
+
 def _write_env_config(embed_config: dict, args: argparse.Namespace, joern_available: bool = False) -> None:
     print("[9/10] Writing configuration ... ", end="", flush=True)
     env_file = PROJECT_ROOT / ".env"
+    telemetry_enabled = _telemetry_consent(args)
 
     # Bug 29: these URLs always point at localhost. With shared containers
     # there is exactly one Weaviate / Ollama / code_embed per machine; every
@@ -1185,12 +1220,26 @@ def _write_env_config(embed_config: dict, args: argparse.Namespace, joern_availa
             "",
         ])
 
+    # Anonymous telemetry consent (default OFF; matches collector/uploader
+    # default-OFF semantics — README promises "no telemetry unless you opt in").
+    # Belt-and-suspenders: the flag is also written explicitly so user / sysadmin
+    # can audit consent state by reading .env, not just by trusting the lib default.
+    lines.extend([
+        "# Anonymous telemetry (default: off — README promise)",
+        "# Set to 'true' to enable; collector + uploader both honour this.",
+        f"VIBECODED_TELEMETRY={'true' if telemetry_enabled else 'false'}",
+        "",
+    ])
+
     # Write (don't overwrite if exists)
     if env_file.exists():
         print("already exists (not overwritten)")
     else:
         env_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        print("OK")
+        if telemetry_enabled:
+            print("OK (telemetry: on, opt-in)")
+        else:
+            print("OK (telemetry: off)")
 
 
 # ---------------------------------------------------------------------------
