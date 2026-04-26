@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- Sanitized leaked Lemon Squeezy webhook signing secret from
+  `launcher/docs/SETUP.md` and `launcher/docs/HANDOFF-MARTINO.md`. The
+  example value (`wh_vct_ls_2026_s3cur3k3y`) had been present since the
+  launcher subtree was imported on 2026-03-07 and must be considered
+  compromised. Replaced with `<YOUR_LS_WEBHOOK_SIGNING_SECRET>` plus
+  `openssl rand -hex 32` instructions. **The webhook secret must be
+  rotated in the LS dashboard.**
+- Sanitized internal Supabase project ref `ltnlwhaxnpbiifordlbk` from
+  `launcher/docs/SETUP.md`. Replaced with `<YOUR_SUPABASE_PROJECT_REF>`
+  placeholder. The 0.1.0 changelog claim that "internal Supabase URLs
+  are not committed to public source" is now actually true.
+- Added `scripts/check-no-secrets.sh` pre-commit grep guard listing
+  known-leaked tokens so they cannot sneak back in.
+
 ## [0.1.0] — 2026-04-26 — Initial private release
 
 ### Added
