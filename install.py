@@ -657,6 +657,41 @@ def _install_requirements(venv_python: Path, *, dev: bool) -> None:
 # Step 6: Container services
 # ---------------------------------------------------------------------------
 
+def _probe_http(url: str, timeout: float = 2.0) -> str | None:
+    """Probe a URL with HEAD/GET. Returns the URL if reachable + status<400, else None.
+
+    Used to detect already-running shared services (Weaviate / Ollama / code_embed)
+    so we don't try to start a duplicate container that would bind-conflict on the
+    same host port.
+    """
+    try:
+        resp = urllib.request.urlopen(url, timeout=timeout)
+        if resp.status < 400:
+            return url
+    except Exception:
+        pass
+    return None
+
+
+def _detect_existing_services(weaviate_port: int = DEFAULT_WEAVIATE_PORT,
+                              ollama_port: int = DEFAULT_OLLAMA_PORT,
+                              code_embed_port: int = DEFAULT_CODE_EMBED_PORT) -> dict:
+    """Probe the three default service endpoints. Returns a dict with the URL
+    on success (str) or None when not reachable, for each of weaviate / ollama /
+    code_embed."""
+    return {
+        "weaviate_url": _probe_http(
+            f"http://localhost:{weaviate_port}/v1/.well-known/ready"
+        ),
+        "ollama_url": _probe_http(
+            f"http://localhost:{ollama_port}/api/tags"
+        ),
+        "code_embed_url": _probe_http(
+            f"http://localhost:{code_embed_port}/health"
+        ),
+    }
+
+
 def _start_services(sysinfo: SystemInfo, args: argparse.Namespace,
                     embed_config: dict) -> None:
     print(f"\n[5/10] Starting services via {sysinfo.container_cmd} ... ", flush=True)
@@ -667,6 +702,58 @@ def _start_services(sysinfo: SystemInfo, args: argparse.Namespace,
     if not compose_file.exists():
         print(f"  WARNING: {compose_file} not found, skipping.")
         print("  Start Weaviate and Ollama manually.")
+        return
+
+    # Bug 29: shared containers across installs.
+    # Before running `compose up -d` (which would bind to host ports), probe
+    # the default ports. If a service is already up, reuse it — installs share
+    # one Weaviate / Ollama / code_embed per machine. Per-install isolation
+    # comes from KG_COLLECTION namespacing inside the shared Weaviate.
+    #
+    # Escape hatch: VCT_FORCE_SEPARATE_CONTAINERS=1 forces a full `up -d`
+    # regardless of what's already running (advanced — caller is responsible
+    # for resolving port conflicts via WEAVIATE_PORT/OLLAMA_PORT overrides).
+    weaviate_port = int(os.environ.get("WEAVIATE_PORT", DEFAULT_WEAVIATE_PORT))
+    ollama_port = int(os.environ.get("OLLAMA_PORT", DEFAULT_OLLAMA_PORT))
+    code_embed_port = int(os.environ.get("CODE_EMBED_PORT", DEFAULT_CODE_EMBED_PORT))
+
+    force_separate = os.environ.get("VCT_FORCE_SEPARATE_CONTAINERS") == "1"
+    detected = _detect_existing_services(weaviate_port, ollama_port, code_embed_port)
+
+    if not force_separate:
+        any_detected = any(v is not None for v in detected.values())
+        if any_detected:
+            print("  Detected already-running services:")
+            for label, url in (
+                ("Weaviate", detected["weaviate_url"]),
+                ("Ollama", detected["ollama_url"]),
+                ("code_embed", detected["code_embed_url"]),
+            ):
+                if url:
+                    print(f"    [reuse] {label}: {url}")
+                else:
+                    print(f"    [start] {label}: not detected")
+
+    # Determine which compose services need to start.
+    # If --gpu, we additionally bring up code_embed (gated on the gpu profile +
+    # overlay file). On CPU-only setups the service uses Ollama as code embed
+    # backend and code_embed is intentionally skipped.
+    services_to_start: list[str] = []
+    if force_separate:
+        # No detection — bring everything compose declares up.
+        services_to_start = []  # empty list => `up -d` with no service args
+    else:
+        if not detected["weaviate_url"]:
+            services_to_start.append("weaviate")
+        if not detected["ollama_url"]:
+            services_to_start.append("ollama")
+        if sysinfo.has_gpu and not detected["code_embed_url"]:
+            services_to_start.append("code_embed")
+
+    # All required services already up — nothing to do.
+    if not force_separate and not services_to_start:
+        print("  All required services already running — reusing them.")
+        print("  (Set VCT_FORCE_SEPARATE_CONTAINERS=1 for separate per-install containers.)")
         return
 
     compose_cmd = _get_compose_command(sysinfo.container_cmd)
@@ -683,6 +770,11 @@ def _start_services(sysinfo: SystemInfo, args: argparse.Namespace,
             print("  WARNING: GPU overlay file not found, running CPU-only")
 
     cmd.extend(["up", "-d"])
+    # When subset detection said only some services are missing, pass them
+    # explicitly so compose doesn't try to recreate already-running ones.
+    if services_to_start:
+        cmd.extend(services_to_start)
+        print(f"  Starting only: {', '.join(services_to_start)}")
 
     # 15 min cap: first-run pulls of weaviate + ollama images can take a while
     # on slow links, but a hung daemon should not block us forever.
@@ -713,6 +805,14 @@ def _start_services(sysinfo: SystemInfo, args: argparse.Namespace,
                 print("    Windows: start Docker Desktop")
             else:
                 print("    Linux:  systemctl --user start podman.socket")
+        # Common cause: bind: address already in use → user already has a
+        # service on this port that we somehow didn't probe (different
+        # protocol, late startup, …). Tell them about the escape hatch.
+        if "address already in use" in stderr_lower or "bind" in stderr_lower:
+            print("\n  Hint: a host port is already in use.")
+            print("    Either stop the conflicting process, or set")
+            print("    VCT_FORCE_SEPARATE_CONTAINERS=1 + override WEAVIATE_PORT /")
+            print("    OLLAMA_PORT / CODE_EMBED_PORT to use distinct ports.")
         sys.exit(1)
     print("  OK")
 
