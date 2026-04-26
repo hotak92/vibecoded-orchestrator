@@ -117,12 +117,13 @@ pub async fn create_project_v2(
     let slug = db.generate_unique_slug(&req.name)?;
     let row = db.insert_project(&id, &req.name, &req.folder_path, req.host.clone(), &slug)?;
 
-    // Bug 23: write per-project env files for BOTH surfaces — VS Code
-    // extension (via `.vscode/settings.json` claude-code.env) and
-    // Claude Code CLI (via `.claude/env`, sourced by tools/claude
-    // wrapper or user shell rc). We swallow individual errors here:
-    // create_project must not fail just because the user's folder is
-    // read-only or mid-edit. We do log them.
+    // Bug 23 + 30: write per-project env files for ALL Claude Code
+    // surfaces — VS Code extension (via `.vscode/settings.json`
+    // claude-code.env), Claude Code CLI (via `.claude/env`, sourced by
+    // tools/claude wrapper or user shell rc), AND the canonical
+    // `.claude/settings.json` env block (CLI + Desktop app + VS Code).
+    // We swallow individual errors here: create_project must not fail
+    // just because the user's folder is read-only or mid-edit.
     if let Err(e) = write_project_env_files(folder, &req.name) {
         eprintln!("[vct] warning: write_project_env_files failed: {}", e);
     }
@@ -137,10 +138,21 @@ pub async fn create_project_v2(
     Ok(ProjectView::from_row(row, 0))
 }
 
-/// Bug 23: write per-project env files for VS Code AND Claude Code CLI.
-/// Returns Ok(()) only when BOTH succeed; partial-success is logged but
-/// surfaced as Ok in the caller (we don't want to fail project creation
-/// over an env file).
+/// Bug 23 + 30: write per-project env files for every Claude Code surface.
+///
+/// Writes three files, all carrying the same env values:
+///   1. `.vscode/settings.json` `claude-code.env` — VS Code extension
+///   2. `.claude/env` — POSIX shell file sourced by the `tools/claude`
+///      wrapper (CLI users without VS Code)
+///   3. `.claude/settings.json` `env` — canonical Anthropic per-project
+///      env (read by CLI, Desktop app, and the VS Code extension)
+///
+/// (3) is the only surface that reaches Claude Code Desktop app users.
+/// (1) and (2) are kept for compatibility / preference. Same values in
+/// all three means there's no precedence conflict to reason about.
+///
+/// Returns Ok(()) only when ALL succeed; the caller currently logs and
+/// swallows the error so project creation never fails over an env file.
 pub fn write_project_env_files(folder: &Path, project_name: &str) -> Result<(), String> {
     let kg_collection = sanitize_kg_collection(project_name);
     let dev_collection = format!("{}_development", kg_collection);
@@ -185,6 +197,58 @@ pub fn write_project_env_files(folder: &Path, project_name: &str) -> Result<(), 
     );
     std::fs::write(&env_path, env_content)
         .map_err(|e| format!("write {}: {}", env_path.display(), e))?;
+
+    // Bug 30: `.claude/settings.json` is the canonical Anthropic
+    // per-project env mechanism — read by Claude Code CLI, the Desktop
+    // app, AND the VS Code extension. Without it, Desktop app users
+    // never get per-project KG routing. We READ-MERGE-WRITE: this file
+    // commonly contains the user's hooks, permissions, agents config,
+    // etc. that we must not clobber. Only the top-level `env` key is
+    // overwritten.
+    let claude_settings_path = claude_dir.join("settings.json");
+    let mut settings: serde_json::Value = if claude_settings_path.exists() {
+        match std::fs::read_to_string(&claude_settings_path) {
+            Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|e| {
+                eprintln!(
+                    "[vct] warning: {} is not valid JSON ({}); replacing with minimal env block",
+                    claude_settings_path.display(),
+                    e
+                );
+                serde_json::json!({})
+            }),
+            Err(e) => {
+                eprintln!(
+                    "[vct] warning: could not read {} ({}); creating fresh",
+                    claude_settings_path.display(),
+                    e
+                );
+                serde_json::json!({})
+            }
+        }
+    } else {
+        serde_json::json!({})
+    };
+
+    // If the existing root is not a JSON object (array, string, etc.),
+    // replace it with an empty object — we cannot inject into a non-object.
+    if !settings.is_object() {
+        settings = serde_json::json!({});
+    }
+
+    let env_block = serde_json::json!({
+        "KG_COLLECTION": kg_collection,
+        "PROJECT_NAME": kg_collection,
+        "DEVELOPMENT_COLLECTION": dev_collection,
+        "CONVERSATION_COLLECTION": conv_collection,
+    });
+    if let Some(obj) = settings.as_object_mut() {
+        obj.insert("env".to_string(), env_block);
+    }
+
+    let pretty = serde_json::to_string_pretty(&settings)
+        .map_err(|e| format!("serialize .claude/settings.json: {}", e))?;
+    std::fs::write(&claude_settings_path, pretty)
+        .map_err(|e| format!("write {}: {}", claude_settings_path.display(), e))?;
 
     Ok(())
 }
