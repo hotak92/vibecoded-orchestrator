@@ -124,14 +124,16 @@
 </div>
 
 <style>
+  /* Bug 11 systemic */
   .access-backdrop {
     position: fixed; inset: 0; background: rgba(0,0,0,0.6);
     display: flex; align-items: center; justify-content: center;
     z-index: 1000;
+    padding: 16px; overflow-y: auto;
   }
   .access-modal {
     background: #1a1a22; border-radius: 10px; width: 480px; max-width: 92vw;
-    max-height: 80vh; overflow-y: auto; padding: 0;
+    max-height: 90vh; overflow-y: auto; padding: 0;
     box-shadow: 0 20px 60px rgba(0,0,0,0.7); border: 1px solid rgba(255,255,255,0.08);
   }
   .access-header { padding: 14px 16px; border-bottom: 1px solid rgba(255,255,255,0.06); position: relative; }

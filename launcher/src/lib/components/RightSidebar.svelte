@@ -1,5 +1,20 @@
 <script lang="ts">
+  // Right sidebar — project info + Launch button.
+  //
+  // Bug 15: Launch button used to be a fake-state-machine no-op
+  // (setTimeout cycle). Now it actually spawns VS Code with the selected
+  // project's folder via the `launch_project_in_editor` Tauri command.
+  //
+  // - No projects → button disabled, tooltip explains why.
+  // - One project → click launches it directly.
+  // - Multiple projects → click opens a Dropdown picker; on selection we
+  //   launch and remember the last-launched id in localStorage.
+
   import { currentUser } from '$lib/stores/auth';
+  import { projects, selectedProject } from '$lib/stores/projects';
+  import { invoke } from '$lib/tauri';
+  import { toast } from '$lib/stores/toast';
+  import Dropdown from '$lib/components/Dropdown.svelte';
 
   interface App {
     id: string;
@@ -16,26 +31,84 @@
     onOpenActivation: () => void;
   } = $props();
 
-  let launchStatus = $state<string | null>(null);
+  type LaunchState = 'idle' | 'starting' | 'running' | 'error';
+  let launchState = $state<LaunchState>('idle');
+  let showPicker = $state(false);
+  let pickerValue = $state<string>('');
+
   let updateStatus = $state<string | null>(null);
 
-  function handleLaunch() {
-    if (!selectedApp) return;
-    launchStatus = 'Starting...';
-    // Tauri: use shell.open or Command to launch the app
-    // For now, show feedback
-    setTimeout(() => {
-      launchStatus = 'Running';
-      setTimeout(() => { launchStatus = null; }, 2000);
-    }, 800);
+  const pState = $derived($projects);
+  const current = $derived($selectedProject);
+  const projectList = $derived(pState.projects);
+  const hasProjects = $derived(projectList.length > 0);
+
+  const launchLabel = $derived.by(() => {
+    if (launchState === 'starting') return 'Starting…';
+    if (launchState === 'running') return 'Open in VS Code';
+    if (launchState === 'error') return 'Retry';
+    return 'Launch';
+  });
+
+  async function doLaunch(projectId: string) {
+    if (launchState === 'starting') return; // debounce
+    const proj = projectList.find((p) => p.id === projectId);
+    if (!proj) {
+      toast.error('Project not found');
+      return;
+    }
+    launchState = 'starting';
+    try {
+      await invoke<void>('launch_project_in_editor', { projectId });
+      try {
+        localStorage.setItem('vct.last_launched_project_id', projectId);
+      } catch {}
+      launchState = 'running';
+      toast.success(`Opened ${proj.name} in VS Code`);
+      // Hold "Open in VS Code" label until user clicks again. No timeout.
+    } catch (e) {
+      launchState = 'error';
+      toast.error(e);
+    }
+  }
+
+  function onLaunchClick() {
+    if (!hasProjects) return; // button is disabled, but be defensive
+    if (projectList.length === 1) {
+      void doLaunch(projectList[0]!.id);
+      return;
+    }
+    // Multiple projects: open picker. Default selection = current project,
+    // else last-launched, else first project.
+    const last = (() => {
+      try {
+        return localStorage.getItem('vct.last_launched_project_id') ?? '';
+      } catch {
+        return '';
+      }
+    })();
+    pickerValue =
+      current?.id ??
+      projectList.find((p) => p.id === last)?.id ??
+      projectList[0]?.id ??
+      '';
+    showPicker = true;
+  }
+
+  function onPickerChange(v: string) {
+    pickerValue = v;
+    showPicker = false;
+    if (v) void doLaunch(v);
   }
 
   function handleCheckUpdate() {
     if (!selectedApp) return;
-    updateStatus = 'Checking...';
+    updateStatus = 'Checking…';
     setTimeout(() => {
       updateStatus = 'Up to date';
-      setTimeout(() => { updateStatus = null; }, 2000);
+      setTimeout(() => {
+        updateStatus = null;
+      }, 2000);
     }, 1000);
   }
 
@@ -49,7 +122,8 @@
 <aside class="right-sidebar">
   {#if selectedApp}
     <div class="sidebar-section">
-      <div class="sidebar-app-icon"
+      <div
+        class="sidebar-app-icon"
         style:background="rgba({getColorRgb(selectedApp.color)}, 0.15)"
         style:border-color="rgba({getColorRgb(selectedApp.color)}, 0.3)"
       >
@@ -63,10 +137,30 @@
     <div class="sidebar-section">
       <h4 class="sidebar-label">Quick Actions</h4>
       <div class="sidebar-actions">
-        <button class="btn-3d btn-3d-primary btn-3d-sm sidebar-action-btn" onclick={handleLaunch}>
-          {launchStatus ?? 'Launch'}
+        <button
+          class="btn-3d btn-3d-primary btn-3d-sm sidebar-action-btn"
+          onclick={onLaunchClick}
+          disabled={!hasProjects || launchState === 'starting'}
+          title={hasProjects
+            ? 'Open the selected project in VS Code'
+            : 'Create a project first to launch the orchestrator'}
+        >
+          {launchLabel}
         </button>
-        <button class="btn-3d btn-3d-ghost btn-3d-sm sidebar-action-btn" onclick={handleCheckUpdate}>
+        {#if showPicker && projectList.length > 1}
+          <div class="launch-picker">
+            <Dropdown
+              options={projectList.map((p) => ({ value: p.id, label: p.name }))}
+              value={pickerValue}
+              onChange={onPickerChange}
+              placeholder="Pick a project to open…"
+            />
+          </div>
+        {/if}
+        <button
+          class="btn-3d btn-3d-ghost btn-3d-sm sidebar-action-btn"
+          onclick={handleCheckUpdate}
+        >
           {updateStatus ?? 'Check Update'}
         </button>
       </div>
@@ -109,7 +203,29 @@
     <div class="sidebar-section">
       <h4 class="sidebar-label">Quick Access</h4>
       <div class="sidebar-actions">
-        <button class="btn-3d btn-3d-primary btn-3d-sm sidebar-action-btn" onclick={onOpenActivation}>
+        <!-- Bug 15: even without an app selected, expose Launch so the
+             user can open a project in VS Code from the homepage. -->
+        <button
+          class="btn-3d btn-3d-primary btn-3d-sm sidebar-action-btn"
+          onclick={onLaunchClick}
+          disabled={!hasProjects || launchState === 'starting'}
+          title={hasProjects
+            ? 'Open the selected project in VS Code'
+            : 'Create a project first to launch the orchestrator'}
+        >
+          {launchLabel}
+        </button>
+        {#if showPicker && projectList.length > 1}
+          <div class="launch-picker">
+            <Dropdown
+              options={projectList.map((p) => ({ value: p.id, label: p.name }))}
+              value={pickerValue}
+              onChange={onPickerChange}
+              placeholder="Pick a project to open…"
+            />
+          </div>
+        {/if}
+        <button class="btn-3d btn-3d-ghost btn-3d-sm sidebar-action-btn" onclick={onOpenActivation}>
           Activate Code
         </button>
       </div>
@@ -181,6 +297,14 @@
     width: 100%;
     font-size: 12px;
     padding: 8px 14px;
+  }
+  .sidebar-action-btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+
+  .launch-picker {
+    margin-top: 4px;
   }
 
   .sidebar-info {

@@ -6,6 +6,7 @@
   import { toast } from '$lib/stores/toast';
   import Toast from '$lib/components/Toast.svelte';
   import Term from '$lib/components/Term.svelte';
+  import Dropdown from '$lib/components/Dropdown.svelte';
   import SigmaGraph from '$lib/kg/SigmaGraph.svelte';
   import type { VizNode, VizEdge } from '$lib/kg/graph-types';
   import type { ProjectView } from '$lib/types/launcher';
@@ -178,9 +179,12 @@
     {:else}
       <label class="cg-target">
         <span>Target:</span>
-        <select bind:value={targetId}>
-          {#each availableTargets as p}<option value={p.id}>{p.name}</option>{/each}
-        </select>
+        <div class="cg-target-dd">
+          <Dropdown
+            options={availableTargets.map((p) => ({ value: p.id, label: p.name }))}
+            bind:value={targetId}
+          />
+        </div>
       </label>
       <button class="cg-load" onclick={loadGraph} disabled={loading}>
         {loading ? 'Loading…' : 'Load graph'}
@@ -319,10 +323,7 @@
   .cg-load { background: rgb(0,191,166); border-color: rgb(0,191,166); color: #000; font-weight: 600; }
   .cg-load:disabled { opacity: 0.5; cursor: not-allowed; }
   .cg-target { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #888; }
-  .cg-target select {
-    background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.12); color: inherit;
-    padding: 3px 8px; border-radius: 4px; font-size: 12px;
-  }
+  .cg-target-dd { width: 200px; }
   .cg-warn { color: #fa8; }
   .cg-summary { display: flex; gap: 8px; flex-wrap: wrap; padding: 8px 24px; }
   .cg-stat {

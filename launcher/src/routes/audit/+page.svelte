@@ -8,6 +8,7 @@
   import { onMount } from 'svelte';
   import { safeInvoke, isTauriRuntime } from '$lib/tauri';
   import { selectedProject, projects } from '$lib/stores/projects';
+  import Dropdown from '$lib/components/Dropdown.svelte';
 
   interface AuditEvent {
     id: number;
@@ -237,12 +238,16 @@
   <div class="controls">
     <label>
       <span>Project:</span>
-      <select bind:value={filterProject} onchange={() => scheduleReload(true)}>
-        <option value="all">All projects</option>
-        {#each allProjects as p}
-          <option value={p.id}>{p.name}</option>
-        {/each}
-      </select>
+      <div class="dd-shell">
+        <Dropdown
+          options={[
+            { value: 'all', label: 'All projects' },
+            ...allProjects.map((p) => ({ value: p.id, label: p.name })),
+          ]}
+          value={filterProject}
+          onChange={(v: string) => { filterProject = v; scheduleReload(true); }}
+        />
+      </div>
     </label>
     <div class="range-pills" role="group" aria-label="Time range">
       <span class="range-label">When:</span>
@@ -434,7 +439,6 @@
     font-size: 12px;
     color: var(--color-mid);
   }
-  .controls select,
   .controls input {
     padding: 5px 8px;
     background: rgba(255, 255, 255, 0.05);
@@ -443,6 +447,7 @@
     color: var(--color-text);
     font-size: 12px;
   }
+  .dd-shell { min-width: 180px; }
   .controls .search {
     flex: 1;
     min-width: 220px;

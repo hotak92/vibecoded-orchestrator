@@ -1,0 +1,28 @@
+{
+  "schema_version": "1",
+  "id": "orchestrator",
+  "name": "VibeCoded Orchestrator",
+  "version": "0.1.0",
+  "description": "The core: 16 hooks, 26 agents, 29 skills, KG + Code Graph, 4 MCP servers. Runs locally in Podman/Docker.",
+  "license": {
+    "spdx": "AGPL-3.0-or-later",
+    "tier": "free",
+    "required": false,
+    "variant_ids": [],
+    "min_orchestrator_tier": "free"
+  },
+  "components": [
+    {
+      "id": "knowledge-graph",
+      "name": "Knowledge Graph",
+      "path": "claude_mcp_servers/weaviate_mcp",
+      "description": "Markdown-based KG with typed WikiLinks, Weaviate-backed embeddings, hook-driven auto-sync."
+    },
+    {
+      "id": "code-graph",
+      "name": "Code Graph",
+      "path": "claude_mcp_servers/code_embedding_service",
+      "description": "AST analysis via Tree-sitter for 10+ languages. Optional Joern integration for CFG/PDG."
+    }
+  ]
+}

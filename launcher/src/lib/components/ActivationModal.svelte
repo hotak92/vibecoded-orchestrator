@@ -179,6 +179,8 @@
     justify-content: center;
     z-index: 300;
     animation: fade-in 0.15s ease-out;
+    padding: 16px;
+    overflow-y: auto;
   }
 
   @keyframes fade-in {

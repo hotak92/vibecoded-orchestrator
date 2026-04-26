@@ -76,6 +76,7 @@ pub fn run() {
             commands::projects_v2::rename_project_v2,
             commands::projects_v2::switch_project_host_v2,
             commands::projects_v2::delete_project_v2,
+            commands::projects_v2::launch_project_in_editor,
             // Concurrency invalidation (P7) — change_log polling
             commands::changes_cmd::poll_changes,
             commands::changes_cmd::current_change_seq,

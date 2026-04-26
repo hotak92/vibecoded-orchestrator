@@ -69,6 +69,16 @@ export interface ModuleCatalogEntry {
   compatibility_hosts: string[];
   is_licensed: boolean;
   manifest_source: string;
+  /**
+   * Bug 16: render hint:
+   *   - 'bundled'      → always-installed, no Install button (e.g. the launcher itself)
+   *   - 'available'    → catalog-listed, has Install action
+   *   - 'installed'    → installed, can be configured / uninstalled
+   *   - 'subcomponent' → ships with parent module, navigate to dashboard CTA
+   */
+  kind: 'bundled' | 'available' | 'installed' | 'subcomponent';
+  parent_id: string;
+  cta_route: string;
 }
 
 export interface ModuleStatusView {
