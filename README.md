@@ -22,12 +22,17 @@ You use Claude Code normally. The orchestrator works in the background via hooks
 
 - **Knowledge Graph** — Markdown nodes with typed WikiLinks, stored in Weaviate with semantic embeddings (qwen3 1024-dim by default; optional OpenAI)
 - **Code Graph** — AST analysis via Tree-sitter across 10+ languages: `CodeModule`, `CodeClass`, `CodeFunction`, `CodeAPI`, `CodeInteraction`
-- **20 Automation Hooks** — SessionStart through Stop: context injection, auto-sync on file edits, credential scanning, KG/code graph maintenance
+- **20 Automation Hooks** — SessionStart through Stop: context injection, auto-sync on file edits, credential scanning, KG/code graph maintenance. Hooks ship pre-installed in this repo's `.claude/hooks/` and fire when you work inside the orchestrator project; per-target-project hook distribution is on the roadmap (today, agents/skills are copied to `.claude/`, hooks are not).
 - **4 MCP Servers** — Weaviate (semantic search), Ollama (local LLM + embeddings), search (web + code + arXiv), code-embedding (CodeSage-Large-v2 via FastAPI)
 - **19 Free Agents + 28 Skills** — shipped via `install.py` templates; opt-in MAO-tier add-on installs 10 specialist agents
 - **Workflow Automation** — session state tracking, plans, memory management, compaction-preserving context replay
 
 ## Quick Install
+
+**Time budget**: ~5 min interactive setup + 10–30 min initial container/model
+downloads on first run (~5 GB total — Weaviate image + Ollama qwen3 weights;
+GPU mode also pulls CodeSage-Large-v2 ~2.5 GB). Subsequent installs reuse the
+cached images and finish in seconds.
 
 ### Linux / macOS
 ```bash

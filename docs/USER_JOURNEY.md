@@ -14,9 +14,9 @@ Reads README → installs:
     python install.py
 ```
 
-`install.py` auto-detects the user's hardware (GPU/CPU/Apple Silicon), starts Weaviate + Ollama in containers, pulls embedding models, installs 16 free-tier agents and 29 skills, writes `.env` and `.claude/settings.json`.
+`install.py` auto-detects the user's hardware (GPU/CPU/Apple Silicon), starts Weaviate + Ollama in containers, pulls embedding models, installs 19 free-tier agents and 28 skills (10 MAO-tier specialist agents are opt-in via `--with-mao-agents`), writes `.env` and `.claude/settings.json`.
 
-First-run time: ~5 minutes for CPU, ~3 minutes for GPU (most of it is model downloads).
+First-run time: ~5 min interactive setup + 10–30 min for container image + model downloads (~5 GB Weaviate + Ollama qwen3 weights; GPU mode adds CodeSage-Large-v2 ~2.5 GB). On a fast link this lands closer to 10 min; on a slow connection budget for 30+. Subsequent re-installs reuse cached images and finish in seconds.
 
 ## 2. First orchestrator session
 
