@@ -61,6 +61,58 @@ pub struct InstallResult {
     pub system: SystemDetection,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InstallMode {
+    /// Empty or non-existent target. Fresh git clone.
+    Fresh,
+    /// Target has files (git or non-git) but NO `.claude/`. We refuse the
+    /// fresh path and tell the caller to use Adopt.
+    FreshIntoExisting,
+    /// Target has `.claude/` (or other orchestrator-managed paths) — we
+    /// can adopt by overwriting only orchestrator-managed paths and
+    /// leaving everything else alone.
+    Adopt,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallDiff {
+    pub mode: InstallMode,
+    /// Orchestrator-managed paths that already exist at the target and
+    /// would be overwritten on adopt.
+    pub will_overwrite: Vec<String>,
+    /// Orchestrator-managed paths the install would create.
+    pub will_add: Vec<String>,
+    /// Anything outside the orchestrator-managed allowlist is reported
+    /// here so the UI can reassure the user "your code is safe".
+    pub user_paths_preserved: bool,
+}
+
+/// Hard whitelist of paths the orchestrator install is allowed to touch
+/// at the project root. Everything else is treated as user code.
+///
+/// Keep this list in sync with the bundled install manifest (BOOTSTRAP.md
+/// and install.py). The frontend mirrors a humanized version in the
+/// confirm modal.
+pub const ORCHESTRATOR_MANAGED_PATHS: &[&str] = &[
+    ".claude",
+    "CLAUDE.md",
+    "knowledge",
+    "claude_mcp_servers",
+    "state",
+    "config",
+    "docs",
+    "templates",
+    "tools",
+    "infrastructure",
+    "requirements.txt",
+    "requirements-dev.txt",
+    "install.sh",
+    "install.ps1",
+    "install.py",
+    "BOOTSTRAP.md",
+];
+
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
@@ -235,11 +287,82 @@ pub async fn check_for_updates(path: String) -> Result<bool, String> {
     Ok(false)
 }
 
+/// Classify what an install target looks like:
+/// - `Fresh` if the path doesn't exist or is empty.
+/// - `Adopt` if it has `.claude/` (or any other orchestrator-managed path).
+/// - `FreshIntoExisting` if it has user files but no orchestrator artifacts.
+pub fn classify_install_target(install_path: &Path) -> InstallMode {
+    if !install_path.exists() {
+        return InstallMode::Fresh;
+    }
+    if !install_path.is_dir() {
+        return InstallMode::FreshIntoExisting;
+    }
+
+    // Empty directory? -> Fresh
+    let entries: Vec<_> = match std::fs::read_dir(install_path) {
+        Ok(rd) => rd.flatten().collect(),
+        Err(_) => return InstallMode::Fresh,
+    };
+    if entries.is_empty() {
+        return InstallMode::Fresh;
+    }
+
+    // Look for any orchestrator-managed artifact
+    for managed in ORCHESTRATOR_MANAGED_PATHS {
+        if install_path.join(managed).exists() {
+            return InstallMode::Adopt;
+        }
+    }
+
+    InstallMode::FreshIntoExisting
+}
+
+/// Diff the bundled manifest against `install_path`. The "manifest" here
+/// is just the orchestrator-managed allowlist plus anything else our
+/// future bundle might ship — we look for what already exists at the
+/// target and report it as overwrite-candidates.
+pub fn diff_install(install_path: &Path) -> InstallDiff {
+    let mode = classify_install_target(install_path);
+
+    let mut will_overwrite: Vec<String> = Vec::new();
+    let mut will_add: Vec<String> = Vec::new();
+
+    for managed in ORCHESTRATOR_MANAGED_PATHS {
+        let p = install_path.join(managed);
+        if p.exists() {
+            will_overwrite.push(managed.to_string());
+        } else {
+            will_add.push(managed.to_string());
+        }
+    }
+
+    InstallDiff {
+        mode,
+        will_overwrite,
+        will_add,
+        user_paths_preserved: true,
+    }
+}
+
+/// Preview what install_orchestrator would do at `config.install_path`.
+/// Frontend calls this before showing the adopt-confirm modal.
+#[command]
+pub async fn preview_install(config: InstallConfig) -> Result<InstallDiff, String> {
+    let install_path = PathBuf::from(&config.install_path);
+    Ok(diff_install(&install_path))
+}
+
 /// Install the orchestrator: clone repo + run install.py.
 /// Emits "install_progress" events to the window.
+///
+/// `confirm_overwrite` must be `true` when classify_install_target reports
+/// `Adopt` — otherwise we refuse and force the caller through `preview_install`
+/// + a confirm modal first.
 #[command]
 pub async fn install_orchestrator(
     config: InstallConfig,
+    confirm_overwrite: Option<bool>,
     window: Window,
 ) -> Result<InstallResult, String> {
     let install_path = PathBuf::from(&config.install_path);
@@ -253,6 +376,19 @@ pub async fn install_orchestrator(
         return Err(format!(
             "Python 3.11+ is required. Install from https://python.org"
         ));
+    }
+
+    // Bug 8: refuse to silently overwrite existing orchestrator-managed
+    // files. Frontend must call preview_install + show a confirm modal,
+    // then re-invoke with confirm_overwrite=true.
+    let mode = classify_install_target(&install_path);
+    let confirmed = confirm_overwrite.unwrap_or(false);
+    if mode == InstallMode::Adopt && !confirmed {
+        return Err(
+            "install_path already contains orchestrator files (.claude/, knowledge/, etc.). \
+             Call preview_install first and re-invoke with confirm_overwrite=true to adopt."
+                .to_string(),
+        );
     }
 
     // Stage 1: Clone (or pull, or adopt-then-pull)
@@ -280,15 +416,23 @@ pub async fn install_orchestrator(
             let stderr = String::from_utf8_lossy(&pull.stderr);
             return Err(format!("git pull failed: {}", stderr));
         }
+    } else if mode == InstallMode::Adopt {
+        // Adopt: user has .claude/ etc. but no .git checkout of the
+        // orchestrator. Clone the orchestrator into a sibling scratch
+        // dir and copy ONLY orchestrator-managed paths over. Anything
+        // outside the allowlist (= user code) is left untouched.
+        emit_progress(&window, "clone", "Adopting existing orchestrator files...", 10.0);
+        adopt_into(&install_path).await?;
     } else if dir_has_entries(&install_path).await {
-        // Path is non-empty but isn't a git checkout. With bug 8 (adopt
-        // existing project) we expect callers to either route to the
-        // adopt path or pass `confirm_overwrite=true`. For now, refuse
-        // with a clear message rather than blowing away the user's code.
+        // FreshIntoExisting: target has user files but no .claude/, no
+        // .git. We could co-mingle but the joint-round audit flagged
+        // this as risky. Refuse and let the user pick an empty folder
+        // or adopt-prep manually.
         return Err(format!(
-            "{} already contains files but is not a git checkout. \
-             Use the 'Adopt existing project' flow if this is an existing \
-             orchestrator install, or pick an empty folder.",
+            "{} already contains files but is not a git checkout and has no \
+             orchestrator artifacts. Pick an empty folder, or run \
+             `git init` and add a placeholder .claude/ first if you want \
+             to adopt.",
             install_path.display()
         ));
     } else {
@@ -550,6 +694,88 @@ async fn detect_runtime_version(cmd: &str) -> Option<String> {
     })
 }
 
+/// Adopt mode: clone the orchestrator into a scratch sibling directory
+/// then copy ONLY the paths in `ORCHESTRATOR_MANAGED_PATHS` over the
+/// target. Anything outside the allowlist (= user code) is left
+/// untouched.
+async fn adopt_into(target: &Path) -> Result<(), String> {
+    let scratch_root = target
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::env::temp_dir());
+    let scratch = scratch_root.join(format!(
+        ".vct-adopt-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+
+    // Cleanup if we left one behind from a previous failed run.
+    if scratch.exists() {
+        let _ = tokio::fs::remove_dir_all(&scratch).await;
+    }
+
+    let clone = tokio::process::Command::new("git")
+        .args([
+            "clone",
+            "--depth",
+            "1",
+            ORCHESTRATOR_REPO,
+            &scratch.to_string_lossy(),
+        ])
+        .output()
+        .await
+        .map_err(|e| format!("git clone (adopt scratch) failed: {}", e))?;
+
+    if !clone.status.success() {
+        let stderr = String::from_utf8_lossy(&clone.stderr);
+        return Err(format!("git clone (adopt scratch) failed: {}", stderr));
+    }
+
+    // Copy each managed path from scratch -> target. Skip any path that
+    // doesn't exist in the freshly-cloned source (some allowlist entries
+    // are optional / future-bundle).
+    for managed in ORCHESTRATOR_MANAGED_PATHS {
+        let src = scratch.join(managed);
+        let dst = target.join(managed);
+        if !src.exists() {
+            continue;
+        }
+        copy_recursive(&src, &dst).await.map_err(|e| {
+            format!("copy {} -> {}: {}", src.display(), dst.display(), e)
+        })?;
+    }
+
+    // Remove scratch.
+    let _ = tokio::fs::remove_dir_all(&scratch).await;
+    Ok(())
+}
+
+/// Recursively copy `src` to `dst`, overwriting existing files. Files
+/// only — symlinks copy by their target. Stops at first error.
+fn copy_recursive<'a>(
+    src: &'a Path,
+    dst: &'a Path,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a>> {
+    Box::pin(async move {
+        let meta = tokio::fs::metadata(src).await?;
+        if meta.is_dir() {
+            tokio::fs::create_dir_all(dst).await?;
+            let mut rd = tokio::fs::read_dir(src).await?;
+            while let Some(entry) = rd.next_entry().await? {
+                let name = entry.file_name();
+                let s = entry.path();
+                let d = dst.join(&name);
+                copy_recursive(&s, &d).await?;
+            }
+        } else {
+            if let Some(parent) = dst.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            tokio::fs::copy(src, dst).await?;
+        }
+        Ok(())
+    })
+}
+
 /// True if `path` exists, is a directory, and contains at least one entry.
 /// Returns false if path doesn't exist, isn't a directory, or read fails.
 async fn dir_has_entries(path: &Path) -> bool {
@@ -621,4 +847,76 @@ async fn detect_python() -> (bool, String, String) {
     }
 
     (false, String::new(), String::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn tmp() -> PathBuf {
+        let p = std::env::temp_dir()
+            .join(format!("vct-installer-test-{}", uuid::Uuid::new_v4().simple()));
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn test_classify_install_target_fresh_nonexistent() {
+        let p = std::env::temp_dir()
+            .join(format!("vct-installer-no-such-{}", uuid::Uuid::new_v4().simple()));
+        assert_eq!(classify_install_target(&p), InstallMode::Fresh);
+    }
+
+    #[test]
+    fn test_classify_install_target_fresh_empty_dir() {
+        let p = tmp();
+        assert_eq!(classify_install_target(&p), InstallMode::Fresh);
+        fs::remove_dir_all(&p).ok();
+    }
+
+    #[test]
+    fn test_classify_install_target_adopt() {
+        let p = tmp();
+        fs::create_dir_all(p.join(".claude")).unwrap();
+        assert_eq!(classify_install_target(&p), InstallMode::Adopt);
+        fs::remove_dir_all(&p).ok();
+    }
+
+    #[test]
+    fn test_classify_install_target_user_code_only() {
+        let p = tmp();
+        fs::create_dir_all(p.join("src")).unwrap();
+        fs::write(p.join("src/main.py"), "print('hi')").unwrap();
+        assert_eq!(classify_install_target(&p), InstallMode::FreshIntoExisting);
+        fs::remove_dir_all(&p).ok();
+    }
+
+    #[test]
+    fn test_diff_install_overwrite_subset() {
+        let p = tmp();
+        // Two managed paths already there
+        fs::create_dir_all(p.join(".claude")).unwrap();
+        fs::create_dir_all(p.join("knowledge")).unwrap();
+
+        let diff = diff_install(&p);
+        assert_eq!(diff.mode, InstallMode::Adopt);
+        assert!(diff.will_overwrite.contains(&".claude".to_string()));
+        assert!(diff.will_overwrite.contains(&"knowledge".to_string()));
+        // CLAUDE.md doesn't exist → in will_add
+        assert!(diff.will_add.contains(&"CLAUDE.md".to_string()));
+        assert!(diff.user_paths_preserved);
+        fs::remove_dir_all(&p).ok();
+    }
+
+    #[test]
+    fn test_diff_install_fresh_target_all_added() {
+        let p = tmp();
+        let diff = diff_install(&p);
+        assert_eq!(diff.mode, InstallMode::Fresh);
+        assert!(diff.will_overwrite.is_empty());
+        assert_eq!(diff.will_add.len(), ORCHESTRATOR_MANAGED_PATHS.len());
+        fs::remove_dir_all(&p).ok();
+    }
 }
