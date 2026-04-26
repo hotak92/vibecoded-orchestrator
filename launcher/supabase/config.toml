@@ -1,0 +1,23 @@
+# Supabase project config for the launcher's edge functions.
+#
+# This file is consumed by `supabase functions deploy ...`. Per-function
+# settings here override the CLI default (which is verify_jwt = true).
+#
+# Why several functions are verify_jwt = false:
+#   - validate-tier: authenticates via the request body's `license_key`
+#     (a license key OR a Vault admin token). The auth boundary is at
+#     the body level, not the JWT level. Adding a JWT requirement on
+#     top would force the launcher to obtain a Supabase anon key just
+#     to call validate-tier — which it already needs to do anyway, but
+#     the wider compatibility (sb_publishable_* keys are NOT accepted
+#     by verify_jwt edge functions) makes this cleaner.
+#   - lemon-squeezy-webhook: authenticates via HMAC-SHA256 signature in
+#     the X-Signature header. JWT verification on top is redundant.
+
+project_id = "ovpdtijpdchzlxbojhsg"
+
+[functions.validate-tier]
+verify_jwt = false
+
+[functions.lemon-squeezy-webhook]
+verify_jwt = false
