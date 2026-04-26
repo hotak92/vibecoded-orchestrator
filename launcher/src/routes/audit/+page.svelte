@@ -185,9 +185,13 @@
   <header class="page-header">
     <h1>Audit log</h1>
     <p class="lede">
-      Mutating operations recorded by the launcher: project create / rename /
-      delete, module install / uninstall, secret set / clear, license
-      activate / deactivate, access grants, and more.
+      Every state-changing action across your projects (project create / rename
+      / delete, secret rotations, license events, module installs, KG /
+      codegraph access changes, hook + agent toggles). Useful for compliance,
+      NDA-bound consultant work, and SOC2 deliverables.
+      Stored locally in <code>~/.vct/launcher.db</code> — see
+      <a href="https://github.com/VibeCoded-Tools/orchestrator/blob/main/launcher/docs/AUDIT.md" target="_blank" rel="noopener">docs/AUDIT.md</a>
+      for the full schema and operation list.
     </p>
   </header>
 
