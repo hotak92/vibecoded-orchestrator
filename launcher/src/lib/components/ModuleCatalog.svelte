@@ -50,6 +50,18 @@
     }
   });
 
+  // Bug 33: hide private-test modules from non-admin users. Admin
+  // (server-classified via LS_ADMIN_VARIANT_IDS) sees ALL modules
+  // including ones still in pre-release. Missing visibility field
+  // defaults to public.
+  const isAdminUser = $derived(tier === 'admin');
+
+  function matchesVisibility(m: ModuleCatalogEntry): boolean {
+    const v = m.visibility ?? 'public';
+    if (v === 'public') return true;
+    return isAdminUser;
+  }
+
   function matchesFilter(m: ModuleCatalogEntry): boolean {
     const isInstalled =
       installed.has(m.id) || m.kind === 'bundled' || m.kind === 'installed' ||
@@ -70,7 +82,9 @@
     );
   }
 
-  const visible = $derived(mState.catalog.filter((m) => matchesFilter(m) && matchesSearch(m)));
+  const visible = $derived(
+    mState.catalog.filter((m) => matchesVisibility(m) && matchesFilter(m) && matchesSearch(m))
+  );
 
   function initials(name: string): string {
     return name

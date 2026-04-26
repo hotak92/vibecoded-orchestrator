@@ -13,7 +13,7 @@ export type ModuleStatus = 'installing' | 'installed' | 'running' | 'stopped' | 
 
 export type SecretScope = 'per_project' | 'shared' | 'global';
 
-export type LicenseTier = 'free' | 'pro' | 'mao' | 'enterprise';
+export type LicenseTier = 'free' | 'pro' | 'mao' | 'enterprise' | 'admin';
 
 export interface ProjectView {
   id: string;
@@ -69,6 +69,14 @@ export interface ModuleCatalogEntry {
   compatibility_hosts: string[];
   is_licensed: boolean;
   manifest_source: string;
+  /**
+   * Bug 33: optional visibility hint. Public modules are visible to
+   * everyone; `private-test` modules are visible only to users with
+   * the server-classified `admin` tier. Missing field is treated as
+   * `public` for backward compatibility with manifests written before
+   * Bug 33.
+   */
+  visibility?: 'public' | 'private-test';
   /**
    * Bug 16: render hint:
    *   - 'bundled'      → always-installed, no Install button (e.g. the launcher itself)
