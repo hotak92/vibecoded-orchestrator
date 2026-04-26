@@ -1,6 +1,7 @@
 <script lang="ts">
   import { invoke } from '$lib/tauri';
   import { currentUser } from '$lib/stores/auth';
+  import DialogRoot from '$lib/components/DialogRoot.svelte';
 
   let { onClose }: { onClose: () => void } = $props();
 
@@ -126,20 +127,19 @@
   $effect(() => { loadConfig(); });
 </script>
 
-<div class="dashboard-overlay" onclick={onClose}>
-  <div class="dashboard-modal" onclick={(e) => e.stopPropagation()}>
-    <!-- Header -->
-    <div class="dashboard-header">
+<!-- Bug 26: native <dialog> top-layer rendering via DialogRoot. -->
+<DialogRoot open={true} width="680px" onClose={onClose}>
+  {#snippet header()}
+    <div class="dashboard-header-row">
       <h2>Orchestrator Dashboard</h2>
       {#if features}
         <span class="tier-badge" style="--tier-color: {tierColor(features.tier)}">
           {tierLabel(features.tier)}
         </span>
       {/if}
-      <button class="close-btn" onclick={onClose}>&times;</button>
+      <button class="close-btn" onclick={onClose} aria-label="Close">&times;</button>
     </div>
-
-    <!-- Tabs -->
+    <!-- Tabs (rendered in header so they stay pinned above the scrolling body) -->
     <div class="tab-bar">
       <button class="tab" class:active={activeTab === 'services'} onclick={() => activeTab = 'services'}>
         Services
@@ -151,11 +151,12 @@
         Privacy
       </button>
     </div>
-
+  {/snippet}
+  {#snippet body()}
     {#if loading}
-      <div class="dashboard-body"><div class="spinner"></div></div>
+      <div class="spinner"></div>
     {:else if config && features}
-      <div class="dashboard-body">
+      <div class="dashboard-body-inner">
 
         {#if error}
           <div class="error-box">{error}</div>
@@ -312,41 +313,17 @@
         {/if}
       </div>
     {/if}
-  </div>
-</div>
+  {/snippet}
+</DialogRoot>
 
 <style>
-  /* Bug 11 systemic */
-  .dashboard-overlay {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.7);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    z-index: 1000;
-    backdrop-filter: blur(4px);
-    padding: 16px;
-    overflow-y: auto;
-  }
-  .dashboard-modal {
-    background: var(--color-bg2);
-    border: 1px solid var(--color-border);
-    border-radius: var(--radius-card);
-    width: 680px;
-    max-width: 92vw;
-    max-height: 90vh;
-    overflow-y: auto;
-    box-shadow: 0 24px 64px rgba(0, 0, 0, 0.5);
-  }
-  .dashboard-header {
+  /* Bug 26: backdrop / sizing / shell now handled by DialogRoot. */
+  .dashboard-header-row {
     display: flex;
     align-items: center;
     gap: 12px;
-    padding: 20px 24px;
-    border-bottom: 1px solid var(--color-border);
   }
-  .dashboard-header h2 { font-size: 18px; font-weight: 600; flex: 1; }
+  .dashboard-header-row h2 { font-size: 18px; font-weight: 600; flex: 1; margin: 0; }
   .close-btn {
     background: none; border: none; color: var(--color-mid);
     font-size: 24px; cursor: pointer; padding: 0 4px;
@@ -363,13 +340,14 @@
     border: 1px solid var(--tier-color);
     opacity: 0.9;
   }
-  .dashboard-body { padding: 20px 24px; }
+  .dashboard-body-inner { padding-top: 4px; }
 
-  /* Tabs */
+  /* Tabs (sit at the bottom of the dialog header). */
   .tab-bar {
     display: flex;
     border-bottom: 1px solid var(--color-border);
-    padding: 0 24px;
+    margin: 12px -20px -16px;  /* counter dialog-header padding so tabs span full width */
+    padding: 0 20px;
   }
   .tab {
     padding: 12px 20px;
