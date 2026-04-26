@@ -17,6 +17,7 @@
   import { selectedProject, projects } from '$lib/stores/projects';
   import { license } from '$lib/stores/license';
   import type { ModuleCatalogEntry } from '$lib/types/launcher';
+  import DialogRoot from '$lib/components/DialogRoot.svelte';
 
   type Filter = 'all' | 'free' | 'pro' | 'installed';
 
@@ -310,37 +311,38 @@
   {/if}
 </div>
 
-<!-- Missing-secret prompt -->
+<!-- Missing-secret prompt — Bug 26: native <dialog> top-layer via DialogRoot. -->
 {#if openSecretsPrompt}
-  <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div class="modal-backdrop" onclick={() => (openSecretsPrompt = null)} onkeydown={() => {}}>
-    <!-- svelte-ignore a11y_no_static_element_interactions -->
-    <div class="modal-content" onclick={(e) => e.stopPropagation()} onkeydown={() => {}}>
-      <div class="modal-header">
-        <h2>Set required secret</h2>
+  {@const promptModule = openSecretsPrompt}
+  <DialogRoot
+    open={true}
+    width="440px"
+    onClose={() => (openSecretsPrompt = null)}
+  >
+    {#snippet header()}
+      <h2 class="secret-prompt-title">Set required secret</h2>
+    {/snippet}
+    {#snippet body()}
+      <p class="modal-desc">
+        <strong>{promptModule.name}</strong> needs a secret to be set
+        before it can run. Open Settings → Secrets to add the required key.
+      </p>
+      <div class="modal-actions">
+        <button class="btn-3d btn-3d-ghost btn-3d-sm" onclick={() => (openSecretsPrompt = null)}>
+          Cancel
+        </button>
+        <button
+          class="btn-3d btn-3d-primary btn-3d-sm"
+          onclick={() => {
+            openSecretsPrompt = null;
+            onOpenSettings();
+          }}
+        >
+          Open Secrets
+        </button>
       </div>
-      <div class="modal-body">
-        <p class="modal-desc">
-          <strong>{openSecretsPrompt.name}</strong> needs a secret to be set
-          before it can run. Open Settings → Secrets to add the required key.
-        </p>
-        <div class="modal-actions">
-          <button class="btn-3d btn-3d-ghost btn-3d-sm" onclick={() => (openSecretsPrompt = null)}>
-            Cancel
-          </button>
-          <button
-            class="btn-3d btn-3d-primary btn-3d-sm"
-            onclick={() => {
-              openSecretsPrompt = null;
-              onOpenSettings();
-            }}
-          >
-            Open Secrets
-          </button>
-        </div>
-      </div>
-    </div>
-  </div>
+    {/snippet}
+  </DialogRoot>
 {/if}
 
 <style>
@@ -611,54 +613,13 @@
     to { transform: rotate(360deg); }
   }
 
-  /* Modal — Bug 19 systemic: backdrop padding + modal max-height
-     calc(100vh - 4rem) so the modal can never extend above the
-     viewport top. */
-  .modal-backdrop {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.6);
-    backdrop-filter: blur(8px);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    z-index: 9999;
-    padding: 2rem;
-    overflow: hidden;
-  }
-
-  .modal-content {
-    width: 440px;
-    max-width: min(90vw, 600px);
-    max-height: calc(100vh - 4rem);
-    display: flex;
-    flex-direction: column;
-    background: rgba(13, 23, 53, 0.97);
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    border-radius: 18px;
-    box-shadow: 0 30px 80px rgba(0, 0, 0, 0.6);
-    overflow: hidden;
-  }
-
-  .modal-header {
-    padding: 16px 20px;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-    flex: 0 0 auto;
-  }
-
-  .modal-header h2 {
+  /* Bug 26: backdrop / sizing / header / body now handled by DialogRoot. */
+  .secret-prompt-title {
     font-size: 15px;
     font-weight: 700;
     color: var(--color-text);
+    margin: 0;
   }
-
-  .modal-body {
-    padding: 18px 20px;
-    overflow-y: auto;
-    flex: 1 1 auto;
-    min-height: 0;
-  }
-
   .modal-desc {
     font-size: 13px;
     color: var(--color-mid);

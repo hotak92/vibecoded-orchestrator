@@ -104,7 +104,7 @@ echo "ghp_yourtokenhere" | ~/.vct-secrets/vct set --project SHARED --key github_
 .claude/scripts/kg-sync --all            # syncs the bundled knowledge/ to Weaviate
 ```
 
-Open the project folder in **VS Code**. Start a Claude Code session. The hooks fire automatically. Try editing a file and watch the post-edit hook auto-sync to the code graph.
+Open the project folder in any Claude Code surface — **VS Code extension**, the **Claude Code CLI** (`cd <project> && claude`), or the **Claude Desktop app**. Start a Claude Code session. The hooks fire automatically. Try editing a file and watch the post-edit hook auto-sync to the code graph.
 
 ### Shared services across multiple installs
 
