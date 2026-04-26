@@ -177,10 +177,10 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    z-index: 300;
+    z-index: 9999;
     animation: fade-in 0.15s ease-out;
-    padding: 16px;
-    overflow-y: auto;
+    padding: 2rem;
+    overflow: hidden;
   }
 
   @keyframes fade-in {
@@ -190,9 +190,11 @@
 
   .modal-content {
     width: 480px;
-    max-width: 90vw;
-    max-height: 80vh;
-    overflow-y: auto;
+    max-width: min(90vw, 600px);
+    max-height: calc(100vh - 4rem);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
     background: rgba(13, 23, 53, 0.97);
     backdrop-filter: blur(24px);
     border: 1px solid rgba(255, 255, 255, 0.1);
@@ -202,8 +204,8 @@
   }
 
   @keyframes modal-enter {
-    from { opacity: 0; transform: scale(0.95) translateY(10px); }
-    to { opacity: 1; transform: scale(1) translateY(0); }
+    from { opacity: 0; transform: scale(0.95); }
+    to { opacity: 1; transform: scale(1); }
   }
 
   .modal-header {
@@ -212,6 +214,7 @@
     justify-content: space-between;
     padding: 20px 24px;
     border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    flex: 0 0 auto;
   }
 
   .modal-header h2 {
@@ -242,6 +245,9 @@
 
   .modal-body {
     padding: 22px 24px;
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
   }
 
   .modal-desc {

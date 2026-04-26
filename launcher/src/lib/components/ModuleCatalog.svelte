@@ -597,8 +597,9 @@
     to { transform: rotate(360deg); }
   }
 
-  /* Modal — Bug 11 systemic: bound to viewport so it never crops on
-     short windows. */
+  /* Modal — Bug 19 systemic: backdrop padding + modal max-height
+     calc(100vh - 4rem) so the modal can never extend above the
+     viewport top. */
   .modal-backdrop {
     position: fixed;
     inset: 0;
@@ -607,15 +608,15 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    z-index: 400;
-    padding: 16px;
-    overflow-y: auto;
+    z-index: 9999;
+    padding: 2rem;
+    overflow: hidden;
   }
 
   .modal-content {
     width: 440px;
-    max-width: 90vw;
-    max-height: 90vh;
+    max-width: min(90vw, 600px);
+    max-height: calc(100vh - 4rem);
     display: flex;
     flex-direction: column;
     background: rgba(13, 23, 53, 0.97);
@@ -628,6 +629,7 @@
   .modal-header {
     padding: 16px 20px;
     border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    flex: 0 0 auto;
   }
 
   .modal-header h2 {

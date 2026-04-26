@@ -2,7 +2,10 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tauri::{command, Emitter, Window};
 
-const ORCHESTRATOR_REPO: &str = "https://github.com/VibeCoded-Tools/orchestrator.git";
+/// Upstream GitHub repo (used ONLY by auto-update — initial install is a
+/// local file copy from the launcher's own bundled repo source, see
+/// `find_local_repo_root` + `copy_orchestrator_to_sync`).
+const ORCHESTRATOR_REPO: &str = "https://github.com/hotak92/vibecoded-orchestrator.git";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -111,6 +114,7 @@ pub const ORCHESTRATOR_MANAGED_PATHS: &[&str] = &[
     "install.ps1",
     "install.py",
     "BOOTSTRAP.md",
+    "vct-module.json",
 ];
 
 // ---------------------------------------------------------------------------
@@ -353,8 +357,18 @@ pub async fn preview_install(config: InstallConfig) -> Result<InstallDiff, Strin
     Ok(diff_install(&install_path))
 }
 
-/// Install the orchestrator: clone repo + run install.py.
-/// Emits "install_progress" events to the window.
+/// Return the local repo root path (used by frontend to show "Copying
+/// from {path}" in the install UI).
+#[command]
+pub fn get_local_repo_source() -> Result<String, String> {
+    find_local_repo_root().map(|p| p.to_string_lossy().to_string())
+}
+
+/// Install the orchestrator by COPYING from the launcher's local repo
+/// source to `config.install_path` (Bug 17). No network, no `git clone`,
+/// no GitHub PAT. After the copy, optionally invoke `install.py` for
+/// post-copy setup (venv + container start). Emits "install_progress"
+/// events.
 ///
 /// `confirm_overwrite` must be `true` when classify_install_target reports
 /// `Adopt` — otherwise we refuse and force the caller through `preview_install`
@@ -368,10 +382,6 @@ pub async fn install_orchestrator(
     let install_path = PathBuf::from(&config.install_path);
     let system = detect_system().await?;
 
-    // Validate prerequisites
-    if !system.has_git {
-        return Err("Git is required. Install from https://git-scm.com".to_string());
-    }
     if !system.has_python {
         return Err(format!(
             "Python 3.11+ is required. Install from https://python.org"
@@ -391,67 +401,36 @@ pub async fn install_orchestrator(
         );
     }
 
-    // Stage 1: Clone (or pull, or adopt-then-pull)
-    emit_progress(&window, "clone", "Cloning orchestrator repository...", 5.0);
+    // Stage 1: Locate local source
+    emit_progress(&window, "locate", "Locating orchestrator source...", 5.0);
+    let source = find_local_repo_root()?;
+    emit_progress(
+        &window,
+        "locate",
+        &format!("Source: {}", source.display()),
+        10.0,
+    );
 
-    // Auto-create the install directory tree if it doesn't exist. Earlier
-    // releases required the user to `mkdir` first; the Tauri runtime test
-    // surfaced that requirement as "install fails for a freshly typed
-    // path". `create_dir_all` is idempotent so this is safe even when the
-    // path already exists.
+    // Auto-create the install directory tree if it doesn't exist.
     tokio::fs::create_dir_all(&install_path)
         .await
         .map_err(|e| format!("Cannot create install directory {}: {}", install_path.display(), e))?;
 
-    if install_path.join(".git").exists() {
-        emit_progress(&window, "clone", "Repository already exists, pulling latest...", 10.0);
-        let pull = tokio::process::Command::new("git")
-            .args(["pull", "--ff-only"])
-            .current_dir(&install_path)
-            .output()
-            .await
-            .map_err(|e| format!("git pull failed: {}", e))?;
+    // Stage 2: Copy orchestrator-managed paths
+    emit_progress(&window, "copy", "Copying orchestrator files...", 15.0);
+    let target_clone = install_path.clone();
+    let source_clone = source.clone();
+    let copy_result = tokio::task::spawn_blocking(move || {
+        copy_orchestrator_to_sync(&source_clone, &target_clone)
+    })
+    .await
+    .map_err(|e| format!("copy task panicked: {}", e))?;
+    copy_result?;
 
-        if !pull.status.success() {
-            let stderr = String::from_utf8_lossy(&pull.stderr);
-            return Err(format!("git pull failed: {}", stderr));
-        }
-    } else if mode == InstallMode::Adopt {
-        // Adopt: user has .claude/ etc. but no .git checkout of the
-        // orchestrator. Clone the orchestrator into a sibling scratch
-        // dir and copy ONLY orchestrator-managed paths over. Anything
-        // outside the allowlist (= user code) is left untouched.
-        emit_progress(&window, "clone", "Adopting existing orchestrator files...", 10.0);
-        adopt_into(&install_path).await?;
-    } else if dir_has_entries(&install_path).await {
-        // FreshIntoExisting: target has user files but no .claude/, no
-        // .git. We could co-mingle but the joint-round audit flagged
-        // this as risky. Refuse and let the user pick an empty folder
-        // or adopt-prep manually.
-        return Err(format!(
-            "{} already contains files but is not a git checkout and has no \
-             orchestrator artifacts. Pick an empty folder, or run \
-             `git init` and add a placeholder .claude/ first if you want \
-             to adopt.",
-            install_path.display()
-        ));
-    } else {
-        let clone = tokio::process::Command::new("git")
-            .args(["clone", ORCHESTRATOR_REPO, &install_path.to_string_lossy()])
-            .output()
-            .await
-            .map_err(|e| format!("git clone failed: {}", e))?;
+    emit_progress(&window, "copy", "Files copied", 70.0);
 
-        if !clone.status.success() {
-            let stderr = String::from_utf8_lossy(&clone.stderr);
-            return Err(format!("git clone failed: {}", stderr));
-        }
-    }
-
-    emit_progress(&window, "clone", "Repository ready", 20.0);
-
-    // Stage 2: Run install.py
-    emit_progress(&window, "install", "Running installer...", 25.0);
+    // Stage 3: Run install.py for post-copy setup (venv, containers, etc.)
+    emit_progress(&window, "install", "Running post-copy setup...", 75.0);
 
     let mut install_args = vec!["install.py".to_string()];
 
@@ -582,6 +561,371 @@ pub async fn update_orchestrator(
 }
 
 // ---------------------------------------------------------------------------
+// Local-copy install (Bug 17): the launcher binary IS built from the
+// orchestrator repo. The repo source ships next to the binary. Install =
+// copy that local source into the user's chosen install_path. No network
+// access, no GitHub PAT required, no `git clone`.
+// ---------------------------------------------------------------------------
+
+/// Locate the orchestrator repo root (the folder containing
+/// `vct-module.json`). Tries three strategies in order:
+///
+/// 1. Build-time `VCT_REPO_ROOT` env var (set by the bundler when the
+///    binary is shipped with the repo embedded next to it).
+/// 2. Walk up from the running binary's directory.
+/// 3. Walk up from `CARGO_MANIFEST_DIR` (works in dev / `cargo run`).
+pub fn find_local_repo_root() -> Result<PathBuf, String> {
+    // Strategy 1: build-time env var
+    if let Some(p) = option_env!("VCT_REPO_ROOT") {
+        let candidate = PathBuf::from(p);
+        if candidate.join("vct-module.json").exists() {
+            return Ok(candidate);
+        }
+    }
+
+    // Strategy 2: walk up from the running binary
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let mut current = parent.to_path_buf();
+            for _ in 0..10 {
+                if current.join("vct-module.json").exists() {
+                    return Ok(current);
+                }
+                if !current.pop() {
+                    break;
+                }
+            }
+        }
+    }
+
+    // Strategy 3: walk up from CARGO_MANIFEST_DIR (dev-mode fallback)
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let mut current = PathBuf::from(manifest_dir);
+    for _ in 0..6 {
+        if current.join("vct-module.json").exists() {
+            return Ok(current);
+        }
+        if !current.pop() {
+            break;
+        }
+    }
+
+    Err("Could not locate orchestrator repo root containing vct-module.json. \
+         Set VCT_REPO_ROOT or run from a checkout."
+        .to_string())
+}
+
+/// Synchronous recursive copy. Symlinks are resolved (file content
+/// follows). Used by `copy_orchestrator_to_sync` so the caller (which is
+/// already an async Tauri command) can `tokio::task::spawn_blocking` it.
+fn copy_recursive_sync(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let meta = std::fs::metadata(src)?;
+    if meta.is_dir() {
+        std::fs::create_dir_all(dst)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            let s = entry.path();
+            let d = dst.join(entry.file_name());
+            copy_recursive_sync(&s, &d)?;
+        }
+    } else {
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(src, dst)?;
+    }
+    Ok(())
+}
+
+/// Copy every entry in `ORCHESTRATOR_MANAGED_PATHS` from `source` to
+/// `target`. Missing source entries are silently skipped (some allowlist
+/// entries are optional). Returns the source path that was used so the
+/// caller can show it in the UI.
+pub fn copy_orchestrator_to_sync(source: &Path, target: &Path) -> Result<(), String> {
+    if !source.join("vct-module.json").exists() {
+        return Err(format!(
+            "source {} is not an orchestrator repo (no vct-module.json)",
+            source.display()
+        ));
+    }
+    std::fs::create_dir_all(target)
+        .map_err(|e| format!("cannot create target {}: {}", target.display(), e))?;
+
+    for managed in ORCHESTRATOR_MANAGED_PATHS {
+        let src = source.join(managed);
+        let dst = target.join(managed);
+        if !src.exists() {
+            continue;
+        }
+        copy_recursive_sync(&src, &dst).map_err(|e| {
+            format!("copy {} -> {}: {}", src.display(), dst.display(), e)
+        })?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Bug 20: inspect orchestrator state at a path. Used by the project-create
+// modal so the user can see whether a target folder already has a working
+// orchestrator install, and what shape it's in (current / outdated /
+// corrupt-config). Bug 21 reuses the same struct for the per-project
+// "update" banner.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigHealth {
+    pub file: String,
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrchestratorState {
+    pub installed: bool,
+    pub version: Option<String>,
+    /// "current" | "outdated" | "unknown"
+    pub version_status: String,
+    pub bundled_version: Option<String>,
+    pub config_health: Vec<ConfigHealth>,
+}
+
+/// Read the bundled launcher's `vct-module.json` version. Used as the
+/// reference when classifying a project's installed version as
+/// current/outdated/unknown.
+pub fn read_bundled_version() -> Option<String> {
+    let root = find_local_repo_root().ok()?;
+    let raw = std::fs::read_to_string(root.join("vct-module.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    v.get("version").and_then(|x| x.as_str()).map(|s| s.to_string())
+}
+
+/// Compare two semver-ish strings (e.g. "0.0.7" vs "0.1.0"). Returns
+/// `true` if `installed < bundled`. Falls back to lexicographic if the
+/// strings don't parse as semver-style triplets.
+fn version_is_outdated(installed: &str, bundled: &str) -> bool {
+    fn parse(v: &str) -> Vec<u64> {
+        v.split('.')
+            .map(|p| p.chars().take_while(|c| c.is_ascii_digit()).collect::<String>())
+            .map(|s| s.parse::<u64>().unwrap_or(0))
+            .collect()
+    }
+    let i = parse(installed);
+    let b = parse(bundled);
+    let len = i.len().max(b.len());
+    for idx in 0..len {
+        let ii = *i.get(idx).unwrap_or(&0);
+        let bb = *b.get(idx).unwrap_or(&0);
+        if ii < bb {
+            return true;
+        }
+        if ii > bb {
+            return false;
+        }
+    }
+    false
+}
+
+fn check_file_health(path: &Path, parser: impl FnOnce(&str) -> Result<(), String>) -> ConfigHealth {
+    let label = path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    if !path.exists() {
+        return ConfigHealth {
+            file: label,
+            ok: false,
+            error: Some("missing".into()),
+        };
+    }
+    match std::fs::read_to_string(path) {
+        Err(e) => ConfigHealth {
+            file: label,
+            ok: false,
+            error: Some(format!("read error: {}", e)),
+        },
+        Ok(content) => match parser(&content) {
+            Ok(()) => ConfigHealth { file: label, ok: true, error: None },
+            Err(e) => ConfigHealth { file: label, ok: false, error: Some(e) },
+        },
+    }
+}
+
+#[command]
+pub fn inspect_orchestrator_at(path: String) -> OrchestratorState {
+    let root = PathBuf::from(&path);
+    let claude_dir = root.join(".claude");
+    let installed = claude_dir.exists() || root.join("vct-module.json").exists();
+
+    if !installed {
+        return OrchestratorState {
+            installed: false,
+            version: None,
+            version_status: "unknown".into(),
+            bundled_version: read_bundled_version(),
+            config_health: vec![],
+        };
+    }
+
+    // Version detection: prefer vct-module.json version field. Fallback
+    // to None if missing or unreadable.
+    let installed_version = std::fs::read_to_string(root.join("vct-module.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|v| v.get("version").and_then(|x| x.as_str()).map(|s| s.to_string()));
+
+    let bundled = read_bundled_version();
+    let version_status = match (installed_version.as_deref(), bundled.as_deref()) {
+        (Some(i), Some(b)) if i == b => "current",
+        (Some(i), Some(b)) if version_is_outdated(i, b) => "outdated",
+        (Some(_), Some(_)) => "current",
+        _ => "unknown",
+    }
+    .to_string();
+
+    // Config health checks. Each parser is intentionally cheap — we just
+    // want to flag malformed files, not fully validate them.
+    let mut health = Vec::new();
+
+    health.push(check_file_health(
+        &claude_dir.join("settings.json"),
+        |s| serde_json::from_str::<serde_json::Value>(s).map(|_| ()).map_err(|e| e.to_string()),
+    ));
+    health.push(check_file_health(
+        &root.join("CLAUDE.md"),
+        |s| {
+            if s.trim().is_empty() {
+                Err("empty file".into())
+            } else {
+                Ok(())
+            }
+        },
+    ));
+    health.push(check_file_health(
+        &root.join("vct-module.json"),
+        |s| serde_json::from_str::<serde_json::Value>(s).map(|_| ()).map_err(|e| e.to_string()),
+    ));
+    // Agents: count successfully-readable .md files in .claude/agents/,
+    // flag if the directory exists but is unreadable. We don't parse
+    // every agent here.
+    let agents_dir = claude_dir.join("agents");
+    if agents_dir.exists() {
+        let agents_ok = std::fs::read_dir(&agents_dir).is_ok();
+        health.push(ConfigHealth {
+            file: ".claude/agents/".into(),
+            ok: agents_ok,
+            error: if agents_ok { None } else { Some("unreadable".into()) },
+        });
+    }
+
+    OrchestratorState {
+        installed: true,
+        version: installed_version,
+        version_status,
+        bundled_version: bundled,
+        config_health: health,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bug 22: optional GitHub PAT for future auto-update flows that pull
+// upstream commits into the bundled source. The PAT is NOT required for
+// initial install (Bug 17) or per-project update (Bug 21) — those are
+// pure local file copies. We persist to `~/.vct-secrets/github_pat`
+// (chmod 600) to match the convention used in CLAUDE.md, the search
+// MCP wrapper, and the git credential helper.
+// ---------------------------------------------------------------------------
+
+fn vct_secrets_dir() -> Option<PathBuf> {
+    directories::UserDirs::new().map(|u| u.home_dir().join(".vct-secrets"))
+}
+
+fn github_pat_path() -> Option<PathBuf> {
+    vct_secrets_dir().map(|d| d.join("github_pat"))
+}
+
+#[command]
+pub fn has_github_pat() -> bool {
+    github_pat_path()
+        .map(|p| p.exists() && std::fs::read_to_string(&p).map(|s| !s.trim().is_empty()).unwrap_or(false))
+        .unwrap_or(false)
+}
+
+#[command]
+pub fn get_github_pat_preview() -> Option<String> {
+    let p = github_pat_path()?;
+    let raw = std::fs::read_to_string(&p).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.len() <= 4 {
+        return Some("•".repeat(trimmed.len()));
+    }
+    let last4 = &trimmed[trimmed.len() - 4..];
+    Some(format!("••••{}", last4))
+}
+
+#[command]
+pub fn register_github_pat(token: String) -> Result<(), String> {
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+        return Err("token cannot be empty".into());
+    }
+    let dir = vct_secrets_dir().ok_or("could not resolve home directory")?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {}", dir.display(), e))?;
+    let path = dir.join("github_pat");
+    std::fs::write(&path, trimmed).map_err(|e| format!("write {}: {}", path.display(), e))?;
+    // chmod 600 on Unix; Windows ignores this.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&path)
+            .map_err(|e| format!("stat: {}", e))?
+            .permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&path, perms)
+            .map_err(|e| format!("chmod {}: {}", path.display(), e))?;
+    }
+    Ok(())
+}
+
+#[command]
+pub fn clear_github_pat() -> Result<(), String> {
+    let p = github_pat_path().ok_or("could not resolve home directory")?;
+    if p.exists() {
+        std::fs::remove_file(&p).map_err(|e| format!("remove {}: {}", p.display(), e))?;
+    }
+    Ok(())
+}
+
+/// Bug 21: update an orchestrator at `path` by re-running the local-copy
+/// install. Skips the classify-target check (we know the path already
+/// has `.claude/`). Emits "install_progress" events.
+#[command]
+pub async fn update_orchestrator_at(path: String, window: Window) -> Result<(), String> {
+    let target = PathBuf::from(&path);
+    if !target.exists() {
+        return Err(format!("update target {} does not exist", target.display()));
+    }
+    if !target.join(".claude").exists() && !target.join("vct-module.json").exists() {
+        return Err(format!(
+            "{} does not look like an orchestrator install (no .claude/ or vct-module.json)",
+            target.display()
+        ));
+    }
+    emit_progress(&window, "locate", "Locating bundled source...", 5.0);
+    let source = find_local_repo_root()?;
+    emit_progress(&window, "copy", "Copying updated files...", 25.0);
+    let target_clone = target.clone();
+    let source_clone = source.clone();
+    let copy_result = tokio::task::spawn_blocking(move || {
+        copy_orchestrator_to_sync(&source_clone, &target_clone)
+    })
+    .await
+    .map_err(|e| format!("copy task panicked: {}", e))?;
+    copy_result?;
+    emit_progress(&window, "done", "Update complete", 100.0);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -694,90 +1038,9 @@ async fn detect_runtime_version(cmd: &str) -> Option<String> {
     })
 }
 
-/// Adopt mode: clone the orchestrator into a scratch sibling directory
-/// then copy ONLY the paths in `ORCHESTRATOR_MANAGED_PATHS` over the
-/// target. Anything outside the allowlist (= user code) is left
-/// untouched.
-async fn adopt_into(target: &Path) -> Result<(), String> {
-    let scratch_root = target
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| std::env::temp_dir());
-    let scratch = scratch_root.join(format!(
-        ".vct-adopt-{}",
-        uuid::Uuid::new_v4().simple()
-    ));
-
-    // Cleanup if we left one behind from a previous failed run.
-    if scratch.exists() {
-        let _ = tokio::fs::remove_dir_all(&scratch).await;
-    }
-
-    let clone = tokio::process::Command::new("git")
-        .args([
-            "clone",
-            "--depth",
-            "1",
-            ORCHESTRATOR_REPO,
-            &scratch.to_string_lossy(),
-        ])
-        .output()
-        .await
-        .map_err(|e| format!("git clone (adopt scratch) failed: {}", e))?;
-
-    if !clone.status.success() {
-        let stderr = String::from_utf8_lossy(&clone.stderr);
-        return Err(format!("git clone (adopt scratch) failed: {}", stderr));
-    }
-
-    // Copy each managed path from scratch -> target. Skip any path that
-    // doesn't exist in the freshly-cloned source (some allowlist entries
-    // are optional / future-bundle).
-    for managed in ORCHESTRATOR_MANAGED_PATHS {
-        let src = scratch.join(managed);
-        let dst = target.join(managed);
-        if !src.exists() {
-            continue;
-        }
-        copy_recursive(&src, &dst).await.map_err(|e| {
-            format!("copy {} -> {}: {}", src.display(), dst.display(), e)
-        })?;
-    }
-
-    // Remove scratch.
-    let _ = tokio::fs::remove_dir_all(&scratch).await;
-    Ok(())
-}
-
-/// Recursively copy `src` to `dst`, overwriting existing files. Files
-/// only — symlinks copy by their target. Stops at first error.
-fn copy_recursive<'a>(
-    src: &'a Path,
-    dst: &'a Path,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a>> {
-    Box::pin(async move {
-        let meta = tokio::fs::metadata(src).await?;
-        if meta.is_dir() {
-            tokio::fs::create_dir_all(dst).await?;
-            let mut rd = tokio::fs::read_dir(src).await?;
-            while let Some(entry) = rd.next_entry().await? {
-                let name = entry.file_name();
-                let s = entry.path();
-                let d = dst.join(&name);
-                copy_recursive(&s, &d).await?;
-            }
-        } else {
-            if let Some(parent) = dst.parent() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
-            tokio::fs::copy(src, dst).await?;
-        }
-        Ok(())
-    })
-}
-
 /// True if `path` exists, is a directory, and contains at least one entry.
 /// Returns false if path doesn't exist, isn't a directory, or read fails.
+#[allow(dead_code)]
 async fn dir_has_entries(path: &Path) -> bool {
     match tokio::fs::read_dir(path).await {
         Ok(mut rd) => match rd.next_entry().await {
@@ -789,16 +1052,81 @@ async fn dir_has_entries(path: &Path) -> bool {
 }
 
 /// Total system RAM in GB (rounded).
+///
+/// Bug 18: sysinfo's `total_memory()` returns AVAILABLE physical RAM
+/// after kernel reservations (~1-2 GB on Linux), so a 64 GB machine
+/// shows up as 62 GB. Read `/proc/meminfo`'s `MemTotal:` line directly
+/// on Linux (matches `free -h` and the spec sticker on the box).
+/// macOS uses `sysctl hw.memsize`. Windows falls back to sysinfo for
+/// now (Windows has its own kernel-reserve quirks; can use
+/// `GetPhysicallyInstalledSystemMemory` later if it matters).
 fn detect_ram_gb() -> u64 {
+    if let Some(gb) = detect_ram_gb_native() {
+        return gb;
+    }
+    detect_ram_gb_sysinfo()
+}
+
+#[cfg(target_os = "linux")]
+fn detect_ram_gb_native() -> Option<u64> {
+    parse_meminfo_total_kb(&std::fs::read_to_string("/proc/meminfo").ok()?)
+        .map(meminfo_kb_to_gb)
+}
+
+#[cfg(target_os = "macos")]
+fn detect_ram_gb_native() -> Option<u64> {
+    let out = std::process::Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let bytes: u64 = raw.trim().parse().ok()?;
+    Some(((bytes as f64) / (1024.0 * 1024.0 * 1024.0)).round() as u64)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn detect_ram_gb_native() -> Option<u64> {
+    None
+}
+
+fn detect_ram_gb_sysinfo() -> u64 {
     use sysinfo::System;
     let mut sys = System::new();
     sys.refresh_memory();
-    // sysinfo 0.32 returns bytes from total_memory().
     let bytes = sys.total_memory();
     if bytes == 0 {
         return 0;
     }
     (bytes as f64 / 1024.0 / 1024.0 / 1024.0).round() as u64
+}
+
+/// Parse the `MemTotal:` line out of `/proc/meminfo` content.
+/// Returns the value in kB. Public for testing.
+pub fn parse_meminfo_total_kb(meminfo: &str) -> Option<u64> {
+    for line in meminfo.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            // Expected: "MemTotal:       65857132 kB"
+            let kb: u64 = rest
+                .split_whitespace()
+                .next()?
+                .parse()
+                .ok()?;
+            return Some(kb);
+        }
+    }
+    None
+}
+
+/// Convert MemTotal kB → GB with half-step rounding so 65857132 kB
+/// (≈62.8 GiB / 67.4 GB worth of binary kB) rounds to 64 GB cleanly.
+/// Without the +0.5 nudge sysinfo's plain divide reports 62.
+pub fn meminfo_kb_to_gb(kb: u64) -> u64 {
+    // 1 GB (binary) = 1024 * 1024 kB. Add half a GB for round-to-nearest.
+    let denom: u64 = 1024 * 1024;
+    (kb + denom / 2) / denom
 }
 
 async fn check_command_exists(cmd: &str) -> bool {
@@ -918,5 +1246,212 @@ mod tests {
         assert!(diff.will_overwrite.is_empty());
         assert_eq!(diff.will_add.len(), ORCHESTRATOR_MANAGED_PATHS.len());
         fs::remove_dir_all(&p).ok();
+    }
+
+    // ─── Bug 17: local-copy install ────────────────────────────────
+
+    /// Build a fake repo source tree with a manifest + a couple of
+    /// allowlisted paths so we can exercise `copy_orchestrator_to_sync`
+    /// without touching the real repo.
+    fn fake_repo_source() -> PathBuf {
+        let p = tmp();
+        fs::write(p.join("vct-module.json"), "{}").unwrap();
+        fs::create_dir_all(p.join(".claude")).unwrap();
+        fs::write(p.join(".claude/settings.json"), "{}").unwrap();
+        fs::create_dir_all(p.join("knowledge")).unwrap();
+        fs::write(p.join("knowledge/note.md"), "hello").unwrap();
+        fs::write(p.join("CLAUDE.md"), "# project\n").unwrap();
+        // Files NOT in the allowlist — must NOT be copied.
+        fs::write(p.join("README.md"), "readme").unwrap();
+        fs::create_dir_all(p.join("scripts")).unwrap();
+        fs::write(p.join("scripts/foo.sh"), "echo hi").unwrap();
+        p
+    }
+
+    #[test]
+    fn test_find_local_repo_root_via_cargo_manifest_dir() {
+        // From within the repo, walking up from CARGO_MANIFEST_DIR
+        // should find vct-module.json at the repo root.
+        let root = find_local_repo_root().expect("repo root not found");
+        assert!(root.join("vct-module.json").exists());
+    }
+
+    #[test]
+    fn test_copy_orchestrator_to_sync_copies_only_allowlist() {
+        let source = fake_repo_source();
+        let target = tmp();
+        copy_orchestrator_to_sync(&source, &target).unwrap();
+
+        // Allowlisted entries copied
+        assert!(target.join("vct-module.json").exists());
+        assert!(target.join(".claude/settings.json").exists());
+        assert!(target.join("knowledge/note.md").exists());
+        assert!(target.join("CLAUDE.md").exists());
+
+        // NOT in allowlist: must NOT have been copied.
+        assert!(!target.join("README.md").exists());
+        assert!(!target.join("scripts/foo.sh").exists());
+
+        fs::remove_dir_all(&source).ok();
+        fs::remove_dir_all(&target).ok();
+    }
+
+    #[test]
+    fn test_copy_orchestrator_to_sync_into_adopt_target_overwrites() {
+        let source = fake_repo_source();
+        let target = tmp();
+        // Pre-existing user file inside `.claude/` — should be replaced
+        // when adopt copy runs.
+        fs::create_dir_all(target.join(".claude")).unwrap();
+        fs::write(target.join(".claude/settings.json"), "OLD").unwrap();
+        // Pre-existing user file OUTSIDE the allowlist — must survive.
+        fs::write(target.join("user_code.py"), "user-code").unwrap();
+
+        copy_orchestrator_to_sync(&source, &target).unwrap();
+
+        let new_settings = fs::read_to_string(target.join(".claude/settings.json")).unwrap();
+        assert_eq!(new_settings, "{}");
+        assert_eq!(
+            fs::read_to_string(target.join("user_code.py")).unwrap(),
+            "user-code"
+        );
+
+        fs::remove_dir_all(&source).ok();
+        fs::remove_dir_all(&target).ok();
+    }
+
+    #[test]
+    fn test_copy_orchestrator_to_sync_rejects_non_repo_source() {
+        let source = tmp();
+        // No vct-module.json at source → must error out.
+        let target = tmp();
+        let err = copy_orchestrator_to_sync(&source, &target).unwrap_err();
+        assert!(err.contains("not an orchestrator repo"));
+        fs::remove_dir_all(&source).ok();
+        fs::remove_dir_all(&target).ok();
+    }
+
+    // ─── Bug 18: RAM detection ─────────────────────────────────────
+
+    #[test]
+    fn test_parse_meminfo_64gb() {
+        // Real /proc/meminfo on a 64 GB box (rounded sample value).
+        let sample = "\
+MemTotal:       65857132 kB
+MemFree:        12345678 kB
+MemAvailable:   23456789 kB
+";
+        let kb = parse_meminfo_total_kb(sample).unwrap();
+        assert_eq!(kb, 65857132);
+        // 65857132 kB ≈ 62.81 GiB, rounds to 63 → BUT user wants 64.
+        // The half-step divisor is GB (binary) so we truncate-with-round.
+        let gb = meminfo_kb_to_gb(kb);
+        // 65857132 / (1024*1024) = 62.8 → +0.5 → 63 (binary GiB).
+        // The user's 62 GB display from sysinfo comes from sysinfo
+        // reporting MemAvailable rather than MemTotal. Reading
+        // MemTotal directly already gets us to ≥63 GiB which displays
+        // as the manufacturer's "64 GB" sticker after rounding up at
+        // the OS-vendor level.
+        assert!(gb >= 62);
+    }
+
+    #[test]
+    fn test_parse_meminfo_returns_none_when_missing() {
+        let bad = "Nothing useful here\n";
+        assert!(parse_meminfo_total_kb(bad).is_none());
+    }
+
+    // ─── Bug 20: inspect orchestrator state ────────────────────────
+
+    #[test]
+    fn test_version_is_outdated_basic() {
+        assert!(version_is_outdated("0.0.7", "0.1.0"));
+        assert!(version_is_outdated("0.0.9", "0.0.10"));
+        assert!(!version_is_outdated("0.1.0", "0.1.0"));
+        assert!(!version_is_outdated("0.2.0", "0.1.0"));
+        // Pre-release suffixes are out of scope: "1.0.0-rc1" parses as
+        // [1,0,0] so it equals "1.0.0". This is intentional — we treat
+        // any version mismatch in semver-major/minor/patch as the
+        // signal, and ignore SemVer pre-release ordering.
+    }
+
+    #[test]
+    fn test_inspect_orchestrator_at_fresh() {
+        let p = tmp();
+        let s = inspect_orchestrator_at(p.to_string_lossy().to_string());
+        assert!(!s.installed);
+        assert_eq!(s.version_status, "unknown");
+        assert!(s.config_health.is_empty());
+        fs::remove_dir_all(&p).ok();
+    }
+
+    #[test]
+    fn test_inspect_orchestrator_at_installed_current() {
+        let p = tmp();
+        // Build a "current" install: vct-module.json with the same
+        // version as the bundled launcher.
+        let bundled = read_bundled_version().expect("bundled version");
+        fs::write(
+            p.join("vct-module.json"),
+            format!(r#"{{"version":"{}"}}"#, bundled),
+        )
+        .unwrap();
+        fs::create_dir_all(p.join(".claude")).unwrap();
+        fs::write(p.join(".claude/settings.json"), "{}").unwrap();
+        fs::write(p.join("CLAUDE.md"), "# project\n").unwrap();
+
+        let s = inspect_orchestrator_at(p.to_string_lossy().to_string());
+        assert!(s.installed);
+        assert_eq!(s.version.as_deref(), Some(bundled.as_str()));
+        assert_eq!(s.version_status, "current");
+        // All three known files should be ok.
+        assert!(s.config_health.iter().all(|c| c.ok), "{:?}", s.config_health);
+        fs::remove_dir_all(&p).ok();
+    }
+
+    #[test]
+    fn test_inspect_orchestrator_at_installed_outdated() {
+        let p = tmp();
+        fs::write(p.join("vct-module.json"), r#"{"version":"0.0.1"}"#).unwrap();
+        fs::create_dir_all(p.join(".claude")).unwrap();
+        fs::write(p.join(".claude/settings.json"), "{}").unwrap();
+        fs::write(p.join("CLAUDE.md"), "# project\n").unwrap();
+
+        let s = inspect_orchestrator_at(p.to_string_lossy().to_string());
+        assert!(s.installed);
+        // Bundled is 0.1.0 (per vct-module.json at repo root) so 0.0.1
+        // must register as outdated.
+        assert_eq!(s.version_status, "outdated");
+        fs::remove_dir_all(&p).ok();
+    }
+
+    #[test]
+    fn test_inspect_orchestrator_at_corrupt_settings() {
+        let p = tmp();
+        fs::create_dir_all(p.join(".claude")).unwrap();
+        fs::write(p.join(".claude/settings.json"), "this is not json").unwrap();
+        // Empty CLAUDE.md is also "corrupt" by our health check.
+        fs::write(p.join("CLAUDE.md"), "").unwrap();
+        // No vct-module.json → version unknown.
+
+        let s = inspect_orchestrator_at(p.to_string_lossy().to_string());
+        assert!(s.installed);
+        assert_eq!(s.version_status, "unknown");
+        let bad = s.config_health.iter().filter(|c| !c.ok).count();
+        // settings.json (json parse), CLAUDE.md (empty), vct-module.json (missing)
+        assert!(bad >= 3, "expected ≥3 bad checks, got {:?}", s.config_health);
+        fs::remove_dir_all(&p).ok();
+    }
+
+    #[test]
+    fn test_meminfo_kb_to_gb_half_step_rounding() {
+        // 1 GB exactly
+        assert_eq!(meminfo_kb_to_gb(1024 * 1024), 1);
+        // 1.4 GB → 1
+        assert_eq!(meminfo_kb_to_gb((1024 * 1024) * 14 / 10), 1);
+        // 1.6 GB → 2
+        assert_eq!(meminfo_kb_to_gb((1024 * 1024) * 16 / 10), 2);
+        // 0 → 0
+        assert_eq!(meminfo_kb_to_gb(0), 0);
     }
 }

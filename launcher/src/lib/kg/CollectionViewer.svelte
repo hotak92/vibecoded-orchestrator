@@ -498,12 +498,15 @@
   }
   .cv-ctx li button:hover { background: rgba(255,255,255,0.08); }
   .cv-modal-back {
-    position: fixed; inset: 0; z-index: 1100; background: rgba(0,0,0,0.6);
+    position: fixed; inset: 0; z-index: 9999; background: rgba(0,0,0,0.6);
     display: flex; align-items: center; justify-content: center;
+    padding: 2rem; overflow: hidden;
   }
   .cv-modal {
-    background: #1a1a22; border-radius: 10px; width: 720px; max-width: 90vw;
-    max-height: 80vh; padding: 16px; overflow-y: auto;
+    background: #1a1a22; border-radius: 10px; width: 720px;
+    max-width: min(90vw, 900px);
+    max-height: calc(100vh - 4rem);
+    padding: 16px; overflow-y: auto;
     border: 1px solid rgba(255,255,255,0.08);
   }
   .cv-modal header { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; margin-bottom: 6px; }

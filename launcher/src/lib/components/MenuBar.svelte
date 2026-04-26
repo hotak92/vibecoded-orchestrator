@@ -6,6 +6,8 @@
   import { projectColor } from '$lib/project-color';
   import { goto } from '$app/navigation';
   import { onMount } from 'svelte';
+  import { invoke } from '$lib/tauri';
+  import { toast } from '$lib/stores/toast';
   import ProjectSelector from './ProjectSelector.svelte';
   import UpdateBadge from './UpdateBadge.svelte';
 
@@ -40,6 +42,77 @@
   function tierLabel(t: string): string {
     return t.charAt(0).toUpperCase() + t.slice(1);
   }
+
+  // Bug 21: scan all known projects for outdated orchestrator installs.
+  // Computed lazily when the user menu opens (cheap — one Tauri call per
+  // project, all FS-local).
+  type OrchestratorState = {
+    installed: boolean;
+    version: string | null;
+    version_status: 'current' | 'outdated' | 'unknown';
+    bundled_version: string | null;
+    config_health: { file: string; ok: boolean; error: string | null }[];
+  };
+  let updatableProjectIds = $state<string[]>([]);
+  let scanningUpdates = $state(false);
+  let updatingAll = $state(false);
+
+  async function scanForUpdates() {
+    if (scanningUpdates) return;
+    scanningUpdates = true;
+    try {
+      const list = await invoke<{ id: string; folder_path: string }[]>('list_projects_v2');
+      const outdated: string[] = [];
+      for (const p of list) {
+        try {
+          const s = await invoke<OrchestratorState>('inspect_orchestrator_at', {
+            path: p.folder_path,
+          });
+          if (s.installed && s.version_status === 'outdated') {
+            outdated.push(p.id);
+          }
+        } catch {
+          // Skip — folder unreadable / missing.
+        }
+      }
+      updatableProjectIds = outdated;
+    } finally {
+      scanningUpdates = false;
+    }
+  }
+
+  async function updateAllProjects() {
+    if (updatingAll) return;
+    updatingAll = true;
+    try {
+      const list = await invoke<{ id: string; folder_path: string }[]>('list_projects_v2');
+      const targets = list.filter((p) => updatableProjectIds.includes(p.id));
+      let ok = 0;
+      let fail = 0;
+      for (const p of targets) {
+        try {
+          await invoke('update_orchestrator_at', { path: p.folder_path });
+          ok += 1;
+        } catch (e) {
+          console.error('update failed', p.id, e);
+          fail += 1;
+        }
+      }
+      if (fail === 0) {
+        toast.success(`Updated ${ok} project${ok === 1 ? '' : 's'}`);
+      } else {
+        toast.error(`${ok} updated, ${fail} failed`);
+      }
+      await scanForUpdates();
+    } finally {
+      updatingAll = false;
+      showUserMenu = false;
+    }
+  }
+
+  $effect(() => {
+    if (showUserMenu) void scanForUpdates();
+  });
 </script>
 
 <svelte:window onclick={handleClickOutside} />
@@ -92,6 +165,15 @@
             </svg>
             Settings
           </button>
+          {#if updatableProjectIds.length > 0}
+            <button class="user-menu-item user-menu-update" onclick={updateAllProjects} disabled={updatingAll}>
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/>
+                <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+              </svg>
+              {updatingAll ? 'Updating…' : `Update ${updatableProjectIds.length} project${updatableProjectIds.length === 1 ? '' : 's'}`}
+            </button>
+          {/if}
           <button class="user-menu-item" onclick={() => { showUserMenu = false; ui.openActivation(); }}>
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>
@@ -301,5 +383,15 @@
   .user-menu-logout:hover {
     color: var(--color-pink);
     background: rgba(255, 79, 160, 0.08);
+  }
+  .user-menu-update {
+    color: var(--color-teal, #0fc);
+  }
+  .user-menu-update:hover {
+    background: rgba(0, 191, 166, 0.1);
+  }
+  .user-menu-update:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
   }
 </style>
