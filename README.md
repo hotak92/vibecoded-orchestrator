@@ -205,7 +205,7 @@ vibecoded-orchestrator/
 |------|-------|-------------|
 | **Free** | €0 | Full orchestrator: KG, code graph, hooks, MCP servers, 19 agents, 28 skills. AGPL-3.0 licensed. |
 | **Pro** | €19/mo, €149/yr, €199 lifetime (cap 100) | Free + RL-scored retrieval reranking, curated agent packs, auto-updates |
-| **MAO** | €99/mo, €799/yr, €999 lifetime (cap 30) | Pro + 10 specialist agents + Tauri desktop UI + multi-agent maestro runtime |
+| **MAO** | TBD — sign up for the waitlist | Pro + 10 specialist agents + Tauri desktop UI + multi-agent maestro runtime |
 | **Enterprise** | From €500/mo | MAO + SOC 2 compliance track, priority support, commercial AGPL exemption, custom SLAs |
 
 Pro and MAO tiers activate additional features via a license key issued at purchase and validated against our Supabase endpoint. Free tier works fully without a key — RL retrieval simply falls back to cosine ordering. No phone-home, no feature telemetry, no telemetry at all unless you opt in.
