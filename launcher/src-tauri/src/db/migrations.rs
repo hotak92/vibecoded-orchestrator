@@ -38,6 +38,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "audit_log: add actor column (OS user) for multi-user audit trails",
         sql: include_str!("migrations/004_audit_actor.sql"),
     },
+    Migration {
+        version: 5,
+        description: "tier_cache: extend orchestrator_tier CHECK to allow 'admin' (Bug 33)",
+        sql: include_str!("migrations/005_tier_cache_admin.sql"),
+    },
 ];
 
 /// Apply every migration whose version is greater than the current max applied.

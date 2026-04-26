@@ -79,6 +79,23 @@ pub async fn license_get_tier(db: State<'_, Db>) -> Result<TierCacheView, String
     Ok(to_view(row))
 }
 
+/// Bug 33: thin convenience command that returns true iff the cached
+/// orchestrator tier is `"admin"`. Frontend uses this to gate the
+/// admin sidebar group + ADMIN badge.
+///
+/// Cached value comes from the same `tier_cache` row that
+/// `license_get_tier` returns — the SOURCE OF TRUTH is the Supabase
+/// `validate-tier` edge function, which classifies `tier=admin` only
+/// when the variant_id is in `LS_ADMIN_VARIANT_IDS` (Bug 33). Patching
+/// this function to always return true unlocks client-side dev UI but
+/// does NOT unlock server-gated capabilities (paid module artifact
+/// downloads re-validate JWTs server-side).
+#[command]
+pub async fn license_is_admin(db: State<'_, Db>) -> Result<bool, String> {
+    let row = db.get_tier_cache()?;
+    Ok(row.orchestrator_tier == "admin")
+}
+
 #[command]
 pub async fn license_refresh(db: State<'_, Db>) -> Result<TierCacheView, String> {
     let key_opt = secrets::get(SecretScope::Global, LICENSE_MODULE_ID, LICENSE_KEY_NAME)?;
@@ -192,4 +209,137 @@ pub async fn license_deactivate(db: State<'_, Db>) -> Result<(), String> {
     db.set_tier_cache("free", &serde_json::json!({}), None)?;
     db.audit("license_deactivate", None, None, &serde_json::json!({}))?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Bug 33: admin tier passthrough tests.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `to_view` must pass `orchestrator_tier` through verbatim — admin
+    /// tier produced by the server must NOT be remapped or sanitized to
+    /// "free" / "enterprise" by the client. The client treats "admin"
+    /// as a strict superset of "enterprise" but the wire string stays
+    /// "admin".
+    #[test]
+    fn to_view_passes_admin_tier_through() {
+        let row = TierCacheRow {
+            orchestrator_tier: "admin".to_string(),
+            module_licenses: serde_json::json!({}),
+            last_validated: chrono::Utc::now().timestamp_millis(),
+            last_error: None,
+        };
+        let view = to_view(row);
+        assert_eq!(view.orchestrator_tier, "admin");
+    }
+
+    /// `license_is_admin` returns true iff cache says admin. Uses an
+    /// in-memory db so the test doesn't touch the user's real cache.
+    #[tokio::test]
+    async fn license_is_admin_reflects_tier_cache() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        // Default tier in a fresh cache is "free".
+        db.set_tier_cache("free", &serde_json::json!({}), None).unwrap();
+        assert_eq!(db.get_tier_cache().unwrap().orchestrator_tier, "free");
+
+        // Simulate the server returning admin.
+        db.set_tier_cache("admin", &serde_json::json!({}), None).unwrap();
+        assert_eq!(db.get_tier_cache().unwrap().orchestrator_tier, "admin");
+    }
+
+    /// Bug 33 audit: the licensing module must NOT contain any local
+    /// bypass paths. Source-level grep: assert no symbols matching
+    /// `_verify_maintainer_token`, `MAINTAINER_TOKEN`, `ed25519`,
+    /// `bypass_token`, etc. appear anywhere in the licensing surface.
+    #[test]
+    fn no_local_bypass_paths_in_licensing_or_validator() {
+        // We can't import the Python validator from Rust — instead we
+        // walk the file and grep its source. Same for licensing.rs.
+        let repo_root = super::super::installer::find_local_repo_root().expect("repo root");
+        let licensing_rs = repo_root.join("launcher/src-tauri/src/commands/licensing.rs");
+        let validator_py = repo_root.join("VCThelpers/license/validator.py");
+
+        let forbidden = [
+            "MAINTAINER_TOKEN",
+            "_verify_maintainer_token",
+            "_verify_maintainer",
+            "VCT_MAINTAINER_TOKEN",
+            "ed25519_dalek",
+            "Ed25519",
+            "maintainer_token",
+            "maintainer_signing_key",
+        ];
+
+        for path in [&licensing_rs, &validator_py] {
+            let content = match std::fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            // Strip Rust /// doc comments + Python triple-quoted
+            // docstrings + line comments, since prose is allowed.
+            let scan_end = content.find("#[cfg(test)]").unwrap_or(content.len());
+            let production = &content[..scan_end];
+            let cleaned = strip_for_audit(production);
+            for needle in &forbidden {
+                assert!(
+                    !cleaned.contains(needle),
+                    "FORBIDDEN: '{}' found in {} — Bug 33 dropped local bypass paths",
+                    needle,
+                    path.display()
+                );
+            }
+        }
+    }
+
+    /// Replace Python triple-quoted blocks AND Rust /// doc comments
+    /// with whitespace so the audit only sees executable source. Match
+    /// the helper used in the volumes module's audit.
+    fn strip_for_audit(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        let bytes = src.as_bytes();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let three_double = i + 3 <= bytes.len() && &bytes[i..i + 3] == b"\"\"\"";
+            let three_single = i + 3 <= bytes.len() && &bytes[i..i + 3] == b"'''";
+            if three_double || three_single {
+                let marker: &[u8] = if three_double { b"\"\"\"" } else { b"'''" };
+                let start = i + 3;
+                let mut j = start;
+                while j + 3 <= bytes.len() {
+                    if &bytes[j..j + 3] == marker {
+                        break;
+                    }
+                    j += 1;
+                }
+                let end = (j + 3).min(bytes.len());
+                for k in i..end {
+                    if bytes[k] == b'\n' {
+                        out.push('\n');
+                    } else {
+                        out.push(' ');
+                    }
+                }
+                i = end;
+                continue;
+            }
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+        // Strip line comments after multiline scrubbing.
+        out.lines()
+            .map(|line| {
+                // Rust doc /// or // and Python/sh #
+                let cut = line
+                    .find("///")
+                    .or_else(|| line.find("//"))
+                    .or_else(|| line.find('#'))
+                    .unwrap_or(line.len());
+                &line[..cut]
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }

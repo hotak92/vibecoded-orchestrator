@@ -696,6 +696,80 @@ def _detect_existing_services(weaviate_port: int = DEFAULT_WEAVIATE_PORT,
     }
 
 
+_ORCHESTRATOR_VOLUME_NAMES = (
+    # Canonical (current compose)
+    "weaviate_data",
+    "ollama_data",
+    "code_embed_cache",
+    # Historical project-suffixed names
+    "weaviate_claude",
+    "weaviate_ARTup",
+    "ollama_claude",
+    "ollama_ARTup",
+    "vct_code_embed",
+)
+
+
+def _detect_existing_volume_paths() -> dict:
+    """Bug 31: read-only probe for existing orchestrator volumes.
+
+    Mirrors the Rust `detect_existing_volumes` in
+    launcher/src-tauri/src/commands/installer.rs — both the launcher and
+    the headless install.py honor the same Bug 32 contract: when
+    existing volumes are detected, do NOT generate a bind-mount override.
+
+    Returns a dict mapping volume_name -> {"mountpoint": str,
+    "size_gb": float | None}. Empty dict when no runtime is installed
+    or no orchestrator volumes are found.
+
+    Calls only `<runtime> volume inspect <name>` which is read-only.
+    Never invokes `volume rm` / `volume prune` / `compose down`.
+    """
+    volumes: dict[str, dict] = {}
+    runtime = None
+    for cmd in ("podman", "docker"):
+        if shutil.which(cmd):
+            runtime = cmd
+            break
+    if runtime is None:
+        return volumes
+    for name in _ORCHESTRATOR_VOLUME_NAMES:
+        try:
+            r = subprocess.run(
+                [runtime, "volume", "inspect", name],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+        if r.returncode != 0:
+            continue
+        try:
+            data = json.loads(r.stdout or "[]")
+        except json.JSONDecodeError:
+            continue
+        if not data or "Mountpoint" not in data[0]:
+            continue
+        mountpoint = data[0]["Mountpoint"]
+        # Best-effort size probe via `du -sk` (kibibytes). Failure is fine.
+        size_gb: float | None = None
+        try:
+            du = subprocess.run(
+                ["du", "-sk", mountpoint],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            if du.returncode == 0:
+                kb_str = du.stdout.split()[0]
+                size_gb = int(kb_str) / (1024 * 1024)
+        except (FileNotFoundError, subprocess.TimeoutExpired, ValueError, IndexError):
+            pass
+        volumes[name] = {"mountpoint": mountpoint, "size_gb": size_gb}
+    return volumes
+
+
 def _start_services(sysinfo: SystemInfo, args: argparse.Namespace,
                     embed_config: dict) -> None:
     print(f"\n[5/10] Starting services via {sysinfo.container_cmd} ... ", flush=True)
@@ -707,6 +781,20 @@ def _start_services(sysinfo: SystemInfo, args: argparse.Namespace,
         print(f"  WARNING: {compose_file} not found, skipping.")
         print("  Start Weaviate and Ollama manually.")
         return
+
+    # Bug 31 contract: when existing orchestrator volumes are detected,
+    # we surface them so the user knows their data will be reused, and
+    # we do NOT (re)generate any bind-mount override. The launcher GUI
+    # is the only path that may generate a docker-compose.override.yml;
+    # headless install.py keeps things conservative.
+    existing_volumes = _detect_existing_volume_paths()
+    if existing_volumes:
+        print(f"  Existing orchestrator volumes detected — keeping in place:")
+        for name, info in existing_volumes.items():
+            size = (
+                f" ({info['size_gb']:.1f} GB)" if info.get("size_gb") is not None else ""
+            )
+            print(f"    [reuse] {name} -> {info['mountpoint']}{size}")
 
     # Bug 29: shared containers across installs.
     # Before running `compose up -d` (which would bind to host ports), probe

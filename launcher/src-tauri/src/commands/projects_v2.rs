@@ -117,12 +117,13 @@ pub async fn create_project_v2(
     let slug = db.generate_unique_slug(&req.name)?;
     let row = db.insert_project(&id, &req.name, &req.folder_path, req.host.clone(), &slug)?;
 
-    // Bug 23: write per-project env files for BOTH surfaces — VS Code
-    // extension (via `.vscode/settings.json` claude-code.env) and
-    // Claude Code CLI (via `.claude/env`, sourced by tools/claude
-    // wrapper or user shell rc). We swallow individual errors here:
-    // create_project must not fail just because the user's folder is
-    // read-only or mid-edit. We do log them.
+    // Bug 23 + 30: write per-project env files for ALL Claude Code
+    // surfaces — VS Code extension (via `.vscode/settings.json`
+    // claude-code.env), Claude Code CLI (via `.claude/env`, sourced by
+    // tools/claude wrapper or user shell rc), AND the canonical
+    // `.claude/settings.json` env block (CLI + Desktop app + VS Code).
+    // We swallow individual errors here: create_project must not fail
+    // just because the user's folder is read-only or mid-edit.
     if let Err(e) = write_project_env_files(folder, &req.name) {
         eprintln!("[vct] warning: write_project_env_files failed: {}", e);
     }
@@ -137,31 +138,74 @@ pub async fn create_project_v2(
     Ok(ProjectView::from_row(row, 0))
 }
 
-/// Bug 23: write per-project env files for VS Code AND Claude Code CLI.
-/// Returns Ok(()) only when BOTH succeed; partial-success is logged but
-/// surfaced as Ok in the caller (we don't want to fail project creation
-/// over an env file).
+/// Bug 23 + 30: write per-project env files for every Claude Code surface.
+///
+/// Writes three files, all carrying the same env values:
+///   1. `.vscode/settings.json` `claude-code.env` — VS Code extension
+///   2. `.claude/env` — POSIX shell file sourced by the `tools/claude`
+///      wrapper (CLI users without VS Code)
+///   3. `.claude/settings.json` `env` — canonical Anthropic per-project
+///      env (read by CLI, Desktop app, and the VS Code extension)
+///
+/// (3) is the only surface that reaches Claude Code Desktop app users.
+/// (1) and (2) are kept for compatibility / preference. Same values in
+/// all three means there's no precedence conflict to reason about.
+///
+/// Returns Ok(()) only when ALL succeed; the caller currently logs and
+/// swallows the error so project creation never fails over an env file.
 pub fn write_project_env_files(folder: &Path, project_name: &str) -> Result<(), String> {
     let kg_collection = sanitize_kg_collection(project_name);
     let dev_collection = format!("{}_development", kg_collection);
     let conv_collection = format!("{}_conversations", kg_collection);
 
-    // VS Code path (existing behavior — extension reads claude-code.env).
+    // VS Code path (extension reads claude-code.env).
+    //
+    // Bug 32 (safety): READ-MERGE-WRITE so user settings like
+    // `editor.formatOnSave`, `python.defaultInterpreterPath`, workspace
+    // recommendations etc. survive. Only the `claude-code.env` key is
+    // overwritten.
     let vscode_dir = folder.join(".vscode");
     std::fs::create_dir_all(&vscode_dir)
         .map_err(|e| format!("mkdir {}: {}", vscode_dir.display(), e))?;
     let vscode_settings_path = vscode_dir.join("settings.json");
-    let vscode_settings = serde_json::json!({
-        "claude-code.env": {
-            "KG_COLLECTION": kg_collection,
-            "PROJECT_NAME": kg_collection,
-            "DEVELOPMENT_COLLECTION": dev_collection,
-            "CONVERSATION_COLLECTION": conv_collection,
+
+    let mut vscode_root: serde_json::Value = if vscode_settings_path.exists() {
+        match std::fs::read_to_string(&vscode_settings_path) {
+            Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|e| {
+                eprintln!(
+                    "[vct] warning: {} is not valid JSON ({}); replacing with minimal claude-code.env block",
+                    vscode_settings_path.display(),
+                    e
+                );
+                serde_json::json!({})
+            }),
+            Err(e) => {
+                eprintln!(
+                    "[vct] warning: could not read {} ({}); creating fresh",
+                    vscode_settings_path.display(),
+                    e
+                );
+                serde_json::json!({})
+            }
         }
+    } else {
+        serde_json::json!({})
+    };
+    if !vscode_root.is_object() {
+        vscode_root = serde_json::json!({});
+    }
+    let vscode_env_block = serde_json::json!({
+        "KG_COLLECTION": kg_collection,
+        "PROJECT_NAME": kg_collection,
+        "DEVELOPMENT_COLLECTION": dev_collection,
+        "CONVERSATION_COLLECTION": conv_collection,
     });
+    if let Some(obj) = vscode_root.as_object_mut() {
+        obj.insert("claude-code.env".to_string(), vscode_env_block);
+    }
     std::fs::write(
         &vscode_settings_path,
-        serde_json::to_string_pretty(&vscode_settings)
+        serde_json::to_string_pretty(&vscode_root)
             .map_err(|e| format!("serialize settings.json: {}", e))?,
     )
     .map_err(|e| format!("write {}: {}", vscode_settings_path.display(), e))?;
@@ -185,6 +229,58 @@ pub fn write_project_env_files(folder: &Path, project_name: &str) -> Result<(), 
     );
     std::fs::write(&env_path, env_content)
         .map_err(|e| format!("write {}: {}", env_path.display(), e))?;
+
+    // Bug 30: `.claude/settings.json` is the canonical Anthropic
+    // per-project env mechanism — read by Claude Code CLI, the Desktop
+    // app, AND the VS Code extension. Without it, Desktop app users
+    // never get per-project KG routing. We READ-MERGE-WRITE: this file
+    // commonly contains the user's hooks, permissions, agents config,
+    // etc. that we must not clobber. Only the top-level `env` key is
+    // overwritten.
+    let claude_settings_path = claude_dir.join("settings.json");
+    let mut settings: serde_json::Value = if claude_settings_path.exists() {
+        match std::fs::read_to_string(&claude_settings_path) {
+            Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|e| {
+                eprintln!(
+                    "[vct] warning: {} is not valid JSON ({}); replacing with minimal env block",
+                    claude_settings_path.display(),
+                    e
+                );
+                serde_json::json!({})
+            }),
+            Err(e) => {
+                eprintln!(
+                    "[vct] warning: could not read {} ({}); creating fresh",
+                    claude_settings_path.display(),
+                    e
+                );
+                serde_json::json!({})
+            }
+        }
+    } else {
+        serde_json::json!({})
+    };
+
+    // If the existing root is not a JSON object (array, string, etc.),
+    // replace it with an empty object — we cannot inject into a non-object.
+    if !settings.is_object() {
+        settings = serde_json::json!({});
+    }
+
+    let env_block = serde_json::json!({
+        "KG_COLLECTION": kg_collection,
+        "PROJECT_NAME": kg_collection,
+        "DEVELOPMENT_COLLECTION": dev_collection,
+        "CONVERSATION_COLLECTION": conv_collection,
+    });
+    if let Some(obj) = settings.as_object_mut() {
+        obj.insert("env".to_string(), env_block);
+    }
+
+    let pretty = serde_json::to_string_pretty(&settings)
+        .map_err(|e| format!("serialize .claude/settings.json: {}", e))?;
+    std::fs::write(&claude_settings_path, pretty)
+        .map_err(|e| format!("write {}: {}", claude_settings_path.display(), e))?;
 
     Ok(())
 }
@@ -472,7 +568,7 @@ mod tests {
     }
 
     #[test]
-    fn write_project_env_files_creates_both_paths() {
+    fn write_project_env_files_creates_all_three_paths() {
         let tmp = std::env::temp_dir().join(format!(
             "vct-env-test-{}",
             uuid::Uuid::new_v4().simple()
@@ -481,7 +577,7 @@ mod tests {
 
         write_project_env_files(&tmp, "My Test").unwrap();
 
-        // VS Code path
+        // 1. VS Code path
         let vscode_settings = tmp.join(".vscode/settings.json");
         assert!(vscode_settings.exists());
         let raw = std::fs::read_to_string(&vscode_settings).unwrap();
@@ -492,13 +588,119 @@ mod tests {
         assert_eq!(env["DEVELOPMENT_COLLECTION"], "MyTest_development");
         assert_eq!(env["CONVERSATION_COLLECTION"], "MyTest_conversations");
 
-        // CLI path
+        // 2. CLI shell file path
         let claude_env = tmp.join(".claude/env");
         assert!(claude_env.exists());
         let env_raw = std::fs::read_to_string(&claude_env).unwrap();
         assert!(env_raw.contains(r#"export KG_COLLECTION="MyTest""#));
         assert!(env_raw.contains(r#"export PROJECT_NAME="MyTest""#));
         assert!(env_raw.contains(r#"export DEVELOPMENT_COLLECTION="MyTest_development""#));
+
+        // 3. Bug 30: canonical .claude/settings.json env block
+        let claude_settings = tmp.join(".claude/settings.json");
+        assert!(claude_settings.exists());
+        let raw = std::fs::read_to_string(&claude_settings).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let env = &parsed["env"];
+        assert_eq!(env["KG_COLLECTION"], "MyTest");
+        assert_eq!(env["PROJECT_NAME"], "MyTest");
+        assert_eq!(env["DEVELOPMENT_COLLECTION"], "MyTest_development");
+        assert_eq!(env["CONVERSATION_COLLECTION"], "MyTest_conversations");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Bug 30: existing `.claude/settings.json` content (hooks, permissions,
+    /// agents config, etc.) MUST be preserved when we inject the env block.
+    /// Read-merge-write semantics; only the top-level `env` key is touched.
+    #[test]
+    fn write_preserves_existing_claude_settings_json() {
+        let tmp = std::env::temp_dir().join(format!(
+            "vct-merge-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&tmp.join(".claude")).unwrap();
+        let path = tmp.join(".claude/settings.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "hooks": {"PreToolUse": [{"matcher": "*", "hooks": []}]},
+                "permissions": {"allow": ["Read"]},
+                "env": {"OLD_KEY": "old_value"}
+            }"#,
+        )
+        .unwrap();
+
+        write_project_env_files(&tmp, "MyProject").unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+        // env block was replaced with our values
+        assert_eq!(v["env"]["KG_COLLECTION"], "MyProject");
+        assert_eq!(v["env"]["PROJECT_NAME"], "MyProject");
+        // Old env keys are gone — top-level env is replaced wholesale.
+        assert!(v["env"].get("OLD_KEY").is_none());
+        // existing hooks + permissions preserved untouched
+        assert!(v["hooks"]["PreToolUse"].is_array());
+        assert!(v["permissions"]["allow"].is_array());
+        assert_eq!(v["permissions"]["allow"][0], "Read");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Bug 32: existing `.vscode/settings.json` user keys (formatOnSave,
+    /// defaultInterpreter, etc.) MUST be preserved. Only `claude-code.env`
+    /// is mutated. Without this, opening the launcher would clobber any
+    /// user IDE customisations.
+    #[test]
+    fn write_preserves_existing_vscode_settings_json() {
+        let tmp = std::env::temp_dir().join(format!(
+            "vct-vscode-merge-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(tmp.join(".vscode")).unwrap();
+        let path = tmp.join(".vscode/settings.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "editor.formatOnSave": true,
+                "python.defaultInterpreterPath": "/usr/bin/python3",
+                "claude-code.env": {"OLD_KEY": "old"}
+            }"#,
+        )
+        .unwrap();
+
+        write_project_env_files(&tmp, "MyProject").unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["editor.formatOnSave"], true);
+        assert_eq!(v["python.defaultInterpreterPath"], "/usr/bin/python3");
+        assert_eq!(v["claude-code.env"]["KG_COLLECTION"], "MyProject");
+        // Old env key is gone — claude-code.env is replaced wholesale.
+        assert!(v["claude-code.env"].get("OLD_KEY").is_none());
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Bug 30: corrupted `.claude/settings.json` must not crash project
+    /// creation. We log a warning and overwrite with a minimal env block.
+    #[test]
+    fn write_handles_corrupted_claude_settings_json() {
+        let tmp = std::env::temp_dir().join(format!(
+            "vct-corrupt-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&tmp.join(".claude")).unwrap();
+        let path = tmp.join(".claude/settings.json");
+        std::fs::write(&path, "{ this is not valid json").unwrap();
+
+        write_project_env_files(&tmp, "MyProject").expect("must not crash");
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["env"]["KG_COLLECTION"], "MyProject");
 
         std::fs::remove_dir_all(&tmp).ok();
     }
