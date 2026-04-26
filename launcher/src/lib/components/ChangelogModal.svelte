@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { marked } from 'marked';
+  import DialogRoot from '$lib/components/DialogRoot.svelte';
 
   let {
     open = $bindable<boolean>(false),
@@ -56,15 +57,15 @@
   });
 </script>
 
-{#if open}
-  <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <!-- svelte-ignore a11y_click_events_have_key_events -->
-  <div class="cm-back" onclick={close}>
-    <div class="cm-modal" onclick={(e) => e.stopPropagation()}>
-      <header class="cm-header">
-        <h2>What's new</h2>
-        <button class="cm-x" onclick={close} aria-label="Close">×</button>
-      </header>
+<!-- Bug 26: native <dialog> top-layer rendering via DialogRoot. -->
+<DialogRoot bind:open width="640px" onClose={close}>
+  {#snippet header()}
+    <div class="cm-header">
+      <h2>What's new</h2>
+      <button class="cm-x" onclick={close} aria-label="Close">×</button>
+    </div>
+  {/snippet}
+  {#snippet body()}
       {#if loading}
         <p class="cm-empty">Loading…</p>
       {:else if error}
@@ -79,27 +80,12 @@
           <a class="cm-link" href={url} target="_blank" rel="noreferrer">View on GitHub →</a>
         {/if}
       {/if}
-    </div>
-  </div>
-{/if}
+  {/snippet}
+</DialogRoot>
 
 <style>
-  /* Bug 19 systemic */
-  .cm-back {
-    position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 9999;
-    display: flex; align-items: center; justify-content: center;
-    padding: 2rem; overflow: hidden;
-  }
-  .cm-modal {
-    background: #1a1a22; border: 1px solid rgba(255,255,255,0.08);
-    border-radius: 10px; padding: 16px; width: 640px;
-    max-width: min(92vw, 800px);
-    max-height: calc(100vh - 4rem);
-    display: flex; flex-direction: column; overflow: hidden;
-  }
-  .cm-modal > .cm-header { flex: 0 0 auto; }
-  .cm-modal > .cm-body, .cm-modal > div:not(.cm-header) { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
-  .cm-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+  /* Bug 26: backdrop / sizing now handled by DialogRoot. */
+  .cm-header { display: flex; justify-content: space-between; align-items: center; }
   .cm-header h2 { font-size: 14px; margin: 0; }
   .cm-x { background: none; border: none; color: #888; font-size: 20px; line-height: 1; cursor: pointer; padding: 0 4px; }
   .cm-x:hover { color: #fff; }
