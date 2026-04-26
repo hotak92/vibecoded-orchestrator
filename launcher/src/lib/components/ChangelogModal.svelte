@@ -84,11 +84,16 @@
 {/if}
 
 <style>
-  .cm-back { position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 1100; display: flex; align-items: center; justify-content: center; }
+  /* Bug 11 systemic */
+  .cm-back {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 1100;
+    display: flex; align-items: center; justify-content: center;
+    padding: 16px; overflow-y: auto;
+  }
   .cm-modal {
     background: #1a1a22; border: 1px solid rgba(255,255,255,0.08);
     border-radius: 10px; padding: 16px; width: 640px; max-width: 92vw;
-    max-height: 80vh; overflow-y: auto;
+    max-height: 90vh; overflow-y: auto;
   }
   .cm-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
   .cm-header h2 { font-size: 14px; margin: 0; }
