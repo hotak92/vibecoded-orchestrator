@@ -338,11 +338,24 @@ Deno.serve(async (req: Request) => {
     `[validate-tier] OK key=${keyTag} variant=${variantId} tier=${tier} usage=${lsKey.activation_usage}/${lsKey.activation_limit}`,
   );
 
+  // Bug 33: admin tier carries extra capability flags so the client
+  // doesn't have to special-case the tier name. These are in addition
+  // to the standard tier-feature gates (admin is treated as a superset
+  // of enterprise by the client validator).
+  const adminExtras = tier === "admin"
+    ? {
+      is_admin: true,
+      unlock_all_modules: true,
+      dev_features_enabled: true,
+    }
+    : {};
+
   return jsonResponse({
     valid: true,
     tier,
     expires_at: lsKey.expires_at, // null for lifetime
     message: "Validated.",
+    ...adminExtras,
   });
 });
 
@@ -354,6 +367,14 @@ Deno.serve(async (req: Request) => {
 //   { valid: true, tier: "pro"|"mao"|"enterprise",
 //     expires_at: "2027-04-18T00:00:00.000Z" | null,
 //     message: "Validated." }
+//
+// 200 — Bug 33: valid admin license (variant in LS_ADMIN_VARIANT_IDS):
+//   { valid: true, tier: "admin",
+//     expires_at: "...",
+//     message: "Validated.",
+//     is_admin: true,
+//     unlock_all_modules: true,
+//     dev_features_enabled: true }
 //
 // 200 — valid license but not an orchestrator product:
 //   { valid: true, tier: "free", message: "...does not grant..." }
