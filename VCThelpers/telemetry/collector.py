@@ -76,16 +76,24 @@ class TelemetryEvent:
 def telemetry_enabled(category: Optional[str] = None) -> bool:
     """Return True if telemetry is enabled globally (and for this category).
 
-    Hierarchy of controls:
-        1. VIBECODED_TELEMETRY=false disables everything, including always-on.
-           (The validator/uploader still runs because license validation is
-           separate, but no events are enqueued.)
-        2. No category → always-on events pass.
-        3. Category given → must be True in ~/.vibecoded/config.json.
+    Default-OFF policy (Bug: README promises "no telemetry unless you opt in"):
+
+        1. VIBECODED_TELEMETRY=false (or 0/no/off) → everything OFF.
+        2. VIBECODED_TELEMETRY=true (or 1/yes/on) → opt-in. No category given:
+           always-on events pass. Category given: still gated by per-category
+           consent in ~/.vibecoded/config.json.
+        3. VIBECODED_TELEMETRY unset/empty → treated as OFF (default-OFF).
+           Match `_disabled()` in uploader.py for consistent defense-in-depth.
+
+    The VCT Launcher install flow surfaces an explicit consent prompt
+    ("Enable anonymous telemetry to help us improve?"). The default answer is
+    No; the .env file is written with VIBECODED_TELEMETRY=false unless the
+    user explicitly opts in.
     """
     env = os.environ.get("VIBECODED_TELEMETRY", "").strip().lower()
-    if env in ("false", "0", "no", "off"):
+    if env in ("false", "0", "no", "off", ""):
         return False
+    # env in {"true", "1", "yes", "on"} or any other truthy → opt-in active.
     if category is None:
         return True
     consent = load_consent()
