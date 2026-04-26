@@ -665,6 +665,195 @@ pub fn copy_orchestrator_to_sync(source: &Path, target: &Path) -> Result<(), Str
 }
 
 // ---------------------------------------------------------------------------
+// Bug 20: inspect orchestrator state at a path. Used by the project-create
+// modal so the user can see whether a target folder already has a working
+// orchestrator install, and what shape it's in (current / outdated /
+// corrupt-config). Bug 21 reuses the same struct for the per-project
+// "update" banner.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigHealth {
+    pub file: String,
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrchestratorState {
+    pub installed: bool,
+    pub version: Option<String>,
+    /// "current" | "outdated" | "unknown"
+    pub version_status: String,
+    pub bundled_version: Option<String>,
+    pub config_health: Vec<ConfigHealth>,
+}
+
+/// Read the bundled launcher's `vct-module.json` version. Used as the
+/// reference when classifying a project's installed version as
+/// current/outdated/unknown.
+pub fn read_bundled_version() -> Option<String> {
+    let root = find_local_repo_root().ok()?;
+    let raw = std::fs::read_to_string(root.join("vct-module.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    v.get("version").and_then(|x| x.as_str()).map(|s| s.to_string())
+}
+
+/// Compare two semver-ish strings (e.g. "0.0.7" vs "0.1.0"). Returns
+/// `true` if `installed < bundled`. Falls back to lexicographic if the
+/// strings don't parse as semver-style triplets.
+fn version_is_outdated(installed: &str, bundled: &str) -> bool {
+    fn parse(v: &str) -> Vec<u64> {
+        v.split('.')
+            .map(|p| p.chars().take_while(|c| c.is_ascii_digit()).collect::<String>())
+            .map(|s| s.parse::<u64>().unwrap_or(0))
+            .collect()
+    }
+    let i = parse(installed);
+    let b = parse(bundled);
+    let len = i.len().max(b.len());
+    for idx in 0..len {
+        let ii = *i.get(idx).unwrap_or(&0);
+        let bb = *b.get(idx).unwrap_or(&0);
+        if ii < bb {
+            return true;
+        }
+        if ii > bb {
+            return false;
+        }
+    }
+    false
+}
+
+fn check_file_health(path: &Path, parser: impl FnOnce(&str) -> Result<(), String>) -> ConfigHealth {
+    let label = path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    if !path.exists() {
+        return ConfigHealth {
+            file: label,
+            ok: false,
+            error: Some("missing".into()),
+        };
+    }
+    match std::fs::read_to_string(path) {
+        Err(e) => ConfigHealth {
+            file: label,
+            ok: false,
+            error: Some(format!("read error: {}", e)),
+        },
+        Ok(content) => match parser(&content) {
+            Ok(()) => ConfigHealth { file: label, ok: true, error: None },
+            Err(e) => ConfigHealth { file: label, ok: false, error: Some(e) },
+        },
+    }
+}
+
+#[command]
+pub fn inspect_orchestrator_at(path: String) -> OrchestratorState {
+    let root = PathBuf::from(&path);
+    let claude_dir = root.join(".claude");
+    let installed = claude_dir.exists() || root.join("vct-module.json").exists();
+
+    if !installed {
+        return OrchestratorState {
+            installed: false,
+            version: None,
+            version_status: "unknown".into(),
+            bundled_version: read_bundled_version(),
+            config_health: vec![],
+        };
+    }
+
+    // Version detection: prefer vct-module.json version field. Fallback
+    // to None if missing or unreadable.
+    let installed_version = std::fs::read_to_string(root.join("vct-module.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|v| v.get("version").and_then(|x| x.as_str()).map(|s| s.to_string()));
+
+    let bundled = read_bundled_version();
+    let version_status = match (installed_version.as_deref(), bundled.as_deref()) {
+        (Some(i), Some(b)) if i == b => "current",
+        (Some(i), Some(b)) if version_is_outdated(i, b) => "outdated",
+        (Some(_), Some(_)) => "current",
+        _ => "unknown",
+    }
+    .to_string();
+
+    // Config health checks. Each parser is intentionally cheap — we just
+    // want to flag malformed files, not fully validate them.
+    let mut health = Vec::new();
+
+    health.push(check_file_health(
+        &claude_dir.join("settings.json"),
+        |s| serde_json::from_str::<serde_json::Value>(s).map(|_| ()).map_err(|e| e.to_string()),
+    ));
+    health.push(check_file_health(
+        &root.join("CLAUDE.md"),
+        |s| {
+            if s.trim().is_empty() {
+                Err("empty file".into())
+            } else {
+                Ok(())
+            }
+        },
+    ));
+    health.push(check_file_health(
+        &root.join("vct-module.json"),
+        |s| serde_json::from_str::<serde_json::Value>(s).map(|_| ()).map_err(|e| e.to_string()),
+    ));
+    // Agents: count successfully-readable .md files in .claude/agents/,
+    // flag if the directory exists but is unreadable. We don't parse
+    // every agent here.
+    let agents_dir = claude_dir.join("agents");
+    if agents_dir.exists() {
+        let agents_ok = std::fs::read_dir(&agents_dir).is_ok();
+        health.push(ConfigHealth {
+            file: ".claude/agents/".into(),
+            ok: agents_ok,
+            error: if agents_ok { None } else { Some("unreadable".into()) },
+        });
+    }
+
+    OrchestratorState {
+        installed: true,
+        version: installed_version,
+        version_status,
+        bundled_version: bundled,
+        config_health: health,
+    }
+}
+
+/// Bug 21: update an orchestrator at `path` by re-running the local-copy
+/// install. Skips the classify-target check (we know the path already
+/// has `.claude/`). Emits "install_progress" events.
+#[command]
+pub async fn update_orchestrator_at(path: String, window: Window) -> Result<(), String> {
+    let target = PathBuf::from(&path);
+    if !target.exists() {
+        return Err(format!("update target {} does not exist", target.display()));
+    }
+    if !target.join(".claude").exists() && !target.join("vct-module.json").exists() {
+        return Err(format!(
+            "{} does not look like an orchestrator install (no .claude/ or vct-module.json)",
+            target.display()
+        ));
+    }
+    emit_progress(&window, "locate", "Locating bundled source...", 5.0);
+    let source = find_local_repo_root()?;
+    emit_progress(&window, "copy", "Copying updated files...", 25.0);
+    let target_clone = target.clone();
+    let source_clone = source.clone();
+    let copy_result = tokio::task::spawn_blocking(move || {
+        copy_orchestrator_to_sync(&source_clone, &target_clone)
+    })
+    .await
+    .map_err(|e| format!("copy task panicked: {}", e))?;
+    copy_result?;
+    emit_progress(&window, "done", "Update complete", 100.0);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -1098,6 +1287,88 @@ MemAvailable:   23456789 kB
     fn test_parse_meminfo_returns_none_when_missing() {
         let bad = "Nothing useful here\n";
         assert!(parse_meminfo_total_kb(bad).is_none());
+    }
+
+    // ─── Bug 20: inspect orchestrator state ────────────────────────
+
+    #[test]
+    fn test_version_is_outdated_basic() {
+        assert!(version_is_outdated("0.0.7", "0.1.0"));
+        assert!(version_is_outdated("0.0.9", "0.0.10"));
+        assert!(!version_is_outdated("0.1.0", "0.1.0"));
+        assert!(!version_is_outdated("0.2.0", "0.1.0"));
+        // Pre-release suffixes are out of scope: "1.0.0-rc1" parses as
+        // [1,0,0] so it equals "1.0.0". This is intentional — we treat
+        // any version mismatch in semver-major/minor/patch as the
+        // signal, and ignore SemVer pre-release ordering.
+    }
+
+    #[test]
+    fn test_inspect_orchestrator_at_fresh() {
+        let p = tmp();
+        let s = inspect_orchestrator_at(p.to_string_lossy().to_string());
+        assert!(!s.installed);
+        assert_eq!(s.version_status, "unknown");
+        assert!(s.config_health.is_empty());
+        fs::remove_dir_all(&p).ok();
+    }
+
+    #[test]
+    fn test_inspect_orchestrator_at_installed_current() {
+        let p = tmp();
+        // Build a "current" install: vct-module.json with the same
+        // version as the bundled launcher.
+        let bundled = read_bundled_version().expect("bundled version");
+        fs::write(
+            p.join("vct-module.json"),
+            format!(r#"{{"version":"{}"}}"#, bundled),
+        )
+        .unwrap();
+        fs::create_dir_all(p.join(".claude")).unwrap();
+        fs::write(p.join(".claude/settings.json"), "{}").unwrap();
+        fs::write(p.join("CLAUDE.md"), "# project\n").unwrap();
+
+        let s = inspect_orchestrator_at(p.to_string_lossy().to_string());
+        assert!(s.installed);
+        assert_eq!(s.version.as_deref(), Some(bundled.as_str()));
+        assert_eq!(s.version_status, "current");
+        // All three known files should be ok.
+        assert!(s.config_health.iter().all(|c| c.ok), "{:?}", s.config_health);
+        fs::remove_dir_all(&p).ok();
+    }
+
+    #[test]
+    fn test_inspect_orchestrator_at_installed_outdated() {
+        let p = tmp();
+        fs::write(p.join("vct-module.json"), r#"{"version":"0.0.1"}"#).unwrap();
+        fs::create_dir_all(p.join(".claude")).unwrap();
+        fs::write(p.join(".claude/settings.json"), "{}").unwrap();
+        fs::write(p.join("CLAUDE.md"), "# project\n").unwrap();
+
+        let s = inspect_orchestrator_at(p.to_string_lossy().to_string());
+        assert!(s.installed);
+        // Bundled is 0.1.0 (per vct-module.json at repo root) so 0.0.1
+        // must register as outdated.
+        assert_eq!(s.version_status, "outdated");
+        fs::remove_dir_all(&p).ok();
+    }
+
+    #[test]
+    fn test_inspect_orchestrator_at_corrupt_settings() {
+        let p = tmp();
+        fs::create_dir_all(p.join(".claude")).unwrap();
+        fs::write(p.join(".claude/settings.json"), "this is not json").unwrap();
+        // Empty CLAUDE.md is also "corrupt" by our health check.
+        fs::write(p.join("CLAUDE.md"), "").unwrap();
+        // No vct-module.json → version unknown.
+
+        let s = inspect_orchestrator_at(p.to_string_lossy().to_string());
+        assert!(s.installed);
+        assert_eq!(s.version_status, "unknown");
+        let bad = s.config_health.iter().filter(|c| !c.ok).count();
+        // settings.json (json parse), CLAUDE.md (empty), vct-module.json (missing)
+        assert!(bad >= 3, "expected ≥3 bad checks, got {:?}", s.config_health);
+        fs::remove_dir_all(&p).ok();
     }
 
     #[test]

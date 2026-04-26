@@ -11,10 +11,31 @@
   import { onMount } from 'svelte';
   import { projects, selectedProject } from '$lib/stores/projects';
   import { pickDirectory, suggestProjectFolder } from '$lib/dialog';
-  import { isTauriRuntime } from '$lib/tauri';
+  import { isTauriRuntime, invoke } from '$lib/tauri';
   import { projectColor } from '$lib/project-color';
   import type { ProjectHost, ProjectView } from '$lib/types/launcher';
   import Dropdown from '$lib/components/Dropdown.svelte';
+
+  // Bug 20: when the user picks a folder, run inspect_orchestrator_at to
+  // detect whether an orchestrator is already there and what shape it's
+  // in. The status panel below the path input shows the result and
+  // gives the user three explicit choices (use as-is / update / install
+  // fresh).
+  type ConfigHealth = { file: string; ok: boolean; error: string | null };
+  type OrchestratorState = {
+    installed: boolean;
+    version: string | null;
+    version_status: 'current' | 'outdated' | 'unknown';
+    bundled_version: string | null;
+    config_health: ConfigHealth[];
+  };
+  let orchestratorState = $state<OrchestratorState | null>(null);
+  let inspecting = $state(false);
+  let installAfterCreate = $state(true);
+  // 'use_as_is' | 'update' | 'install_fresh' — only meaningful when a
+  // pre-existing install was detected.
+  let adoptChoice = $state<'use_as_is' | 'update' | 'install_fresh'>('use_as_is');
+  let inspectDebounce: ReturnType<typeof setTimeout> | null = null;
 
   // Host options used by the create modal. Bug 3d: MAO is hidden until it
   // ships as a managed module.
@@ -74,12 +95,62 @@
 
   function onPathInput() {
     pathTouched = true;
+    scheduleInspect();
   }
+
+  /**
+   * Bug 20: debounce calls to inspect_orchestrator_at so we don't hammer
+   * the FS while the user is typing. 300 ms is short enough to feel
+   * instant after they pause.
+   */
+  function scheduleInspect() {
+    if (inspectDebounce) clearTimeout(inspectDebounce);
+    if (!inTauri) return;
+    inspectDebounce = setTimeout(() => {
+      void runInspect();
+    }, 300);
+  }
+
+  async function runInspect() {
+    const path = (createPath || '').trim();
+    if (!path) {
+      orchestratorState = null;
+      return;
+    }
+    inspecting = true;
+    try {
+      orchestratorState = await invoke<OrchestratorState>('inspect_orchestrator_at', { path });
+      // If a fresh path was chosen, default the toggle ON so the
+      // checkbox reflects the most-likely intent.
+      if (!orchestratorState.installed) {
+        installAfterCreate = true;
+      } else {
+        // For pre-existing installs, default action depends on health.
+        adoptChoice = orchestratorState.version_status === 'outdated' ? 'update' : 'use_as_is';
+      }
+    } catch (e) {
+      orchestratorState = null;
+      console.error('inspect_orchestrator_at failed', e);
+    } finally {
+      inspecting = false;
+    }
+  }
+
+  // Re-run inspection when the path changes via the auto-suggest effect
+  // above (otherwise we'd only inspect on manual edits / browse).
+  $effect(() => {
+    if (showCreate && createPath) scheduleInspect();
+  });
 
   function closeCreate() {
     showCreate = false;
     pathTouched = false;
     createError = null;
+    orchestratorState = null;
+    if (inspectDebounce) {
+      clearTimeout(inspectDebounce);
+      inspectDebounce = null;
+    }
   }
 
   async function browseFolder() {
@@ -90,6 +161,7 @@
     if (picked) {
       createPath = picked;
       pathTouched = true;
+      scheduleInspect();
     }
   }
 
@@ -155,12 +227,46 @@
     }
     creating = true;
     try {
+      // Bug 20: handle pre-existing orchestrator state before creating
+      // the project record so the user's choice is honored.
+      if (orchestratorState?.installed) {
+        if (adoptChoice === 'update') {
+          await invoke('update_orchestrator_at', { path: submitPath });
+        } else if (adoptChoice === 'install_fresh') {
+          await invoke('install_orchestrator', {
+            config: {
+              install_path: submitPath,
+              use_gpu: false,
+              cpu_only: false,
+              openai_key: null,
+              container_runtime: null,
+              skip_containers: true,
+            },
+            confirmOverwrite: true,
+          });
+        }
+        // 'use_as_is' → no action, just register.
+      } else if (installAfterCreate) {
+        await invoke('install_orchestrator', {
+          config: {
+            install_path: submitPath,
+            use_gpu: false,
+            cpu_only: false,
+            openai_key: null,
+            container_runtime: null,
+            skip_containers: true,
+          },
+          confirmOverwrite: false,
+        });
+      }
+
       await projects.create(createName.trim(), submitPath, createHost);
       showCreate = false;
       createName = '';
       createPath = '';
       createHost = 'base';
       pathTouched = false;
+      orchestratorState = null;
       open = false;
     } catch (e) {
       createError = e instanceof Error ? e.message : String(e);
@@ -366,6 +472,78 @@
             {#if !inTauri} (Browse requires the desktop app — type the path manually here.){/if}
           </p>
         </div>
+
+        {#if inTauri && createPath.trim() && orchestratorState}
+          {#if !orchestratorState.installed}
+            <div class="orch-status orch-fresh">
+              <p class="orch-row">
+                <span class="orch-icon">+</span>
+                <span>No orchestrator at this path.</span>
+              </p>
+              <label class="orch-toggle">
+                <input type="checkbox" bind:checked={installAfterCreate} />
+                <span>Install orchestrator into this folder
+                  {#if orchestratorState.bundled_version}
+                    <span class="orch-mid">(v{orchestratorState.bundled_version})</span>
+                  {/if}
+                </span>
+              </label>
+            </div>
+          {:else}
+            <div class="orch-status orch-existing">
+              <p class="orch-row">
+                <span class="orch-icon orch-ok">✓</span>
+                <span>
+                  Existing orchestrator detected
+                  {#if orchestratorState.version}
+                    — installed: <strong>v{orchestratorState.version}</strong>
+                  {/if}
+                  {#if orchestratorState.version_status === 'outdated' && orchestratorState.bundled_version}
+                    <span class="orch-mid">(bundled v{orchestratorState.bundled_version} available)</span>
+                  {:else if orchestratorState.version_status === 'unknown'}
+                    <span class="orch-mid">(version unknown)</span>
+                  {/if}
+                </span>
+              </p>
+              {#if orchestratorState.config_health.length > 0}
+                {@const bad = orchestratorState.config_health.filter((c) => !c.ok)}
+                {#if bad.length === 0}
+                  <p class="orch-row orch-mid">
+                    Config: all {orchestratorState.config_health.length} files parse OK
+                  </p>
+                {:else}
+                  <p class="orch-row orch-warn">
+                    Config: {orchestratorState.config_health.length - bad.length} of
+                    {orchestratorState.config_health.length} files parse OK; flagged:
+                    {bad.map((c) => c.file).join(', ')}
+                  </p>
+                {/if}
+              {/if}
+              <div class="orch-choices" role="radiogroup">
+                <label class="orch-radio" class:active={adoptChoice === 'use_as_is'}>
+                  <input type="radio" name="adopt-choice" value="use_as_is" bind:group={adoptChoice} />
+                  <span>Use as-is</span>
+                </label>
+                <label class="orch-radio" class:active={adoptChoice === 'update'}>
+                  <input type="radio" name="adopt-choice" value="update" bind:group={adoptChoice} />
+                  <span>
+                    Update
+                    {#if orchestratorState.bundled_version}
+                      to v{orchestratorState.bundled_version}
+                    {/if}
+                  </span>
+                </label>
+                <label class="orch-radio" class:active={adoptChoice === 'install_fresh'}>
+                  <input type="radio" name="adopt-choice" value="install_fresh" bind:group={adoptChoice} />
+                  <span>Install fresh (overwrite)</span>
+                </label>
+              </div>
+            </div>
+          {/if}
+        {:else if inTauri && createPath.trim() && inspecting}
+          <p class="form-hint orch-inspecting">Inspecting folder…</p>
+        {/if}
+
         <div class="form-group">
           <div class="label-row">
             <label for="project-host">Host</label>
@@ -849,6 +1027,51 @@
     color: var(--color-muted);
     margin-top: 4px;
   }
+
+  /* Bug 20: orchestrator state panel inside project-create modal */
+  .orch-status {
+    margin: 14px 0;
+    padding: 10px 12px;
+    border: 1px solid rgba(0,191,166,0.25);
+    background: rgba(0,191,166,0.05);
+    border-radius: 8px;
+    font-size: 12px;
+  }
+  .orch-status.orch-fresh {
+    border-color: rgba(255,255,255,0.12);
+    background: rgba(255,255,255,0.02);
+  }
+  .orch-row {
+    display: flex; align-items: flex-start; gap: 8px;
+    margin: 0 0 6px;
+    color: var(--color-text);
+    line-height: 1.5;
+  }
+  .orch-icon { font-weight: 700; color: rgb(0,191,166); }
+  .orch-icon.orch-ok { color: rgb(0,191,166); }
+  .orch-mid { color: var(--color-mid); }
+  .orch-warn { color: #f5b342; }
+  .orch-inspecting { color: var(--color-mid); margin-top: 8px; }
+  .orch-toggle {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 12px; color: var(--color-text);
+    margin-top: 6px;
+  }
+  .orch-choices {
+    display: flex; flex-direction: column; gap: 4px;
+    margin-top: 8px;
+  }
+  .orch-radio {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 8px;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 12px;
+    color: var(--color-text);
+  }
+  .orch-radio:hover { background: rgba(255,255,255,0.04); }
+  .orch-radio.active { border-color: rgba(0,191,166,0.4); background: rgba(0,191,166,0.08); }
 
   .path-row {
     display: flex;
