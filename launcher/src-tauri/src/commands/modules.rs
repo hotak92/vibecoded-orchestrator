@@ -36,6 +36,10 @@ pub struct ModuleCatalogEntry {
     ///   - "installed"    = installed, can be reconfigured / uninstalled.
     ///   - "subcomponent" = ships with a parent module, no separate install,
     ///                      offers a Dashboard CTA.
+    ///   - "coming_soon"  = announced, not yet shipped. Rendered with a
+    ///                      "Coming Soon" badge + Learn-more CTA, no Install.
+    ///                      Reserved for items with a public roadmap commitment;
+    ///                      do NOT use for vapor.
     pub kind: String,
     /// For subcomponents: which parent module they ship with. Empty otherwise.
     #[serde(default)]
@@ -43,6 +47,14 @@ pub struct ModuleCatalogEntry {
     /// Optional dashboard route for subcomponents (e.g. "/kg", "/codegraph").
     #[serde(default)]
     pub cta_route: String,
+    /// For `kind == "coming_soon"`: the tier this will ship under
+    /// (e.g. "pro", "mao"). Empty for everything else.
+    #[serde(default)]
+    pub coming_soon_tier: String,
+    /// For `kind == "coming_soon"`: optional target shipping window
+    /// (e.g. "Q3 2026"). Empty when no public commitment exists.
+    #[serde(default)]
+    pub coming_soon_target: String,
 }
 
 impl ModuleCatalogEntry {
@@ -63,6 +75,8 @@ impl ModuleCatalogEntry {
             kind: "available".into(),
             parent_id: String::new(),
             cta_route: String::new(),
+            coming_soon_tier: String::new(),
+            coming_soon_target: String::new(),
         }
     }
 }
@@ -167,6 +181,8 @@ fn builtin_catalog_entries(db: &Db) -> Vec<ModuleCatalogEntry> {
         kind: "bundled".into(),
         parent_id: String::new(),
         cta_route: String::new(),
+        coming_soon_tier: String::new(),
+        coming_soon_target: String::new(),
     });
 
     // 2. Orchestrator core + 3-4. its sub-components, sourced from
@@ -214,6 +230,8 @@ fn builtin_catalog_entries(db: &Db) -> Vec<ModuleCatalogEntry> {
         kind: if installed { "installed".into() } else { "available".into() },
         parent_id: String::new(),
         cta_route: String::new(),
+        coming_soon_tier: String::new(),
+        coming_soon_target: String::new(),
     });
 
     for comp in components {
@@ -238,8 +256,36 @@ fn builtin_catalog_entries(db: &Db) -> Vec<ModuleCatalogEntry> {
             kind: "subcomponent".into(),
             parent_id: "orchestrator".into(),
             cta_route: route.into(),
+            coming_soon_tier: String::new(),
+            coming_soon_target: String::new(),
         });
     }
+
+    // 5. RL Reranker — Pro-tier add-on, not yet shipped. Listed as the ONE
+    //    explicit "Coming Soon" entry on the home page (single vapor item is
+    //    acceptable when clearly marked; multiple is the bad pattern).
+    out.push(ModuleCatalogEntry {
+        id: "rl-reranker".into(),
+        name: "RL Reranker".into(),
+        version: "preview".into(),
+        description:
+            "Reinforcement-learning-trained reranker that improves retrieval \
+             quality across KG and Code Graph queries. Coming with Pro tier."
+                .into(),
+        category: "addon".into(),
+        tags: vec!["pro".into(), "coming-soon".into()],
+        license_required: true,
+        license_variant_ids: vec![],
+        min_orchestrator_tier: "pro".into(),
+        compatibility_hosts: vec!["base".into()],
+        is_licensed: false,
+        manifest_source: "builtin".into(),
+        kind: "coming_soon".into(),
+        parent_id: String::new(),
+        cta_route: String::new(),
+        coming_soon_tier: "pro".into(),
+        coming_soon_target: String::new(),
+    });
 
     out
 }
@@ -559,4 +605,89 @@ fn _unused_host_import(_h: ProjectHost) {}
 pub struct StartStopReq {
     pub project_id: String,
     pub module_id: String,
+}
+
+#[cfg(test)]
+mod tests {
+    //! Reviewer-B fix-8 audit: the home page used to advertise 6 vapor
+    //! "sister apps" (Transcrypt / Arzillibus / ConvertiFacile / DataWeave /
+    //! FormCraft / PixelSnap). After Bug 16 the source of truth is
+    //! `list_module_catalog`, so the home page renders only what this list
+    //! returns. These tests pin the contract:
+    //!   - exactly one entry of each real built-in (launcher, orchestrator,
+    //!     KG, Code Graph)
+    //!   - exactly ONE coming-soon entry: RL Reranker
+    //!   - no entry whose id matches any of the historical vapor names
+    use super::*;
+    use crate::db::Db;
+
+    fn open_db() -> Db {
+        Db::open_in_memory().expect("in-memory db")
+    }
+
+    #[test]
+    fn builtin_catalog_contains_all_four_real_entries() {
+        let db = open_db();
+        let entries = builtin_catalog_entries(&db);
+        let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+
+        assert!(ids.contains(&"vct-launcher"), "missing vct-launcher: {:?}", ids);
+        assert!(ids.contains(&"orchestrator"), "missing orchestrator: {:?}", ids);
+        // KG + Code Graph are sub-components of orchestrator.
+        assert!(
+            ids.contains(&"knowledge-graph"),
+            "missing knowledge-graph: {:?}",
+            ids
+        );
+        assert!(ids.contains(&"code-graph"), "missing code-graph: {:?}", ids);
+    }
+
+    #[test]
+    fn builtin_catalog_lists_exactly_one_coming_soon_entry() {
+        let db = open_db();
+        let entries = builtin_catalog_entries(&db);
+        let coming: Vec<&ModuleCatalogEntry> =
+            entries.iter().filter(|e| e.kind == "coming_soon").collect();
+        assert_eq!(
+            coming.len(),
+            1,
+            "expected exactly 1 coming-soon entry; got {}: {:?}",
+            coming.len(),
+            coming.iter().map(|e| &e.id).collect::<Vec<_>>()
+        );
+        let rl = coming[0];
+        assert_eq!(rl.id, "rl-reranker");
+        assert_eq!(rl.coming_soon_tier, "pro");
+        assert!(
+            rl.coming_soon_target.is_empty(),
+            "no public target date committed yet"
+        );
+    }
+
+    #[test]
+    fn builtin_catalog_contains_no_vapor_module_ids() {
+        // Names reviewer B specifically called out as vapor on the home page.
+        // Belt-and-suspenders: even if a future commit ever re-adds them,
+        // this guard fails the build.
+        let db = open_db();
+        let entries = builtin_catalog_entries(&db);
+        let forbidden = [
+            "transcrypt",
+            "arzillibus",
+            "convertifacile",
+            "dataweave",
+            "formcraft",
+            "pixelsnap",
+            "telegram",
+            "mao",
+            "orchestrator-pro", // marketing card disguised as a module
+        ];
+        for e in &entries {
+            assert!(
+                !forbidden.contains(&e.id.as_str()),
+                "FORBIDDEN: vapor module id '{}' resurfaced in builtin_catalog_entries",
+                e.id
+            );
+        }
+    }
 }

@@ -13,7 +13,7 @@
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build"
   },
-  "license": "MIT",
+  "license": "AGPL-3.0-or-later",
   "dependencies": {
     "@supabase/supabase-js": "^2.98.0",
     "@tauri-apps/api": "^2",

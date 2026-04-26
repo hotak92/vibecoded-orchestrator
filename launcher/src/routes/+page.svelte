@@ -1,5 +1,12 @@
 <script lang="ts">
-  // Home / Library — list of tools the current user has activated.
+  // Home / Library — renders the current orchestrator install's module catalog.
+  //
+  // Source of truth: `list_module_catalog` (commands::modules in Rust). Bug 16
+  // wired the launcher + orchestrator + KG + Code Graph as built-in entries.
+  // Fix 8 (reviewer-B credibility) added one explicit Coming-Soon entry
+  // (RL Reranker, Pro tier) and removed the hardcoded vapor list (Transcrypt,
+  // Arzillibus, ConvertiFacile, DataWeave, FormCraft, PixelSnap, plus an
+  // "Orchestrator Pro" marketing card disguised as a module).
   //
   // Layout chrome (MenuBar, Sidebar, StatusBar, modals) lives in
   // +layout.svelte so it persists across every route. This page is just
@@ -7,68 +14,108 @@
 
   import { onMount } from 'svelte';
   import RightSidebar from '$lib/components/RightSidebar.svelte';
-  import { currentUser, auth } from '$lib/stores/auth';
+  import { auth } from '$lib/stores/auth';
   import { orchestrator } from '$lib/stores/orchestrator';
+  import { modules } from '$lib/stores/modules';
   import { ui } from '$lib/stores/ui';
+  import type { ModuleCatalogEntry } from '$lib/types/launcher';
 
   onMount(() => {
     orchestrator.checkStatus();
+    modules.loadCatalog();
     const handleFocus = () => auth.refreshProfile();
     window.addEventListener('focus', handleFocus);
     return () => window.removeEventListener('focus', handleFocus);
   });
 
   const orchState = $derived($orchestrator);
+  const modulesState = $derived($modules);
 
-  interface AppItem {
-    id: string;
-    name: string;
-    desc: string;
-    color: string;
+  // Card view-model derived from the catalog. Pure presentation — colour,
+  // icon glyph, click target. No business logic, no hardcoded ids beyond
+  // mapping known categories to a colour scheme.
+  interface AppCard {
+    entry: ModuleCatalogEntry;
+    color: 'teal' | 'purple' | 'pink';
     icon: string;
-    version: string;
-    checkoutUrl?: string;
+    badge: string;
+    badgeKind: 'bundled' | 'installed' | 'available' | 'subcomponent' | 'coming_soon';
   }
 
-  const allApps: AppItem[] = [
-    { id: 'orchestrator', name: 'Orchestrator', desc: 'Knowledge graph, code graph, and workflow automation for Claude Code. Free tier — persistent memory for your AI.', color: 'teal', icon: 'O', version: '0.1.0', checkoutUrl: '' },
-    { id: 'orchestrator-pro', name: 'Orchestrator Pro', desc: 'RL-scored retrieval that learns from your usage, curated agent packs, and auto-updates.', color: 'purple', icon: 'O+', version: '0.1.0', checkoutUrl: '' },
-    { id: 'transcrypt', name: 'Transcrypt', desc: 'Audio transcription with AI-powered correction and vocabulary support', color: 'teal', icon: 'T', version: '2.1.0', checkoutUrl: '' },
-    { id: 'arzillibus', name: 'Arzillibus', desc: 'Smart ticketing system for events and venue management', color: 'purple', icon: 'A', version: '1.4.0', checkoutUrl: '' },
-    { id: 'convertifacile', name: 'ConvertiFacile', desc: 'Universal file conversion — documents, images, audio', color: 'pink', icon: 'C', version: '1.0.0', checkoutUrl: '' },
-    { id: 'dataweave', name: 'DataWeave', desc: 'Visual data pipeline builder for ETL workflows', color: 'teal', icon: 'D', version: '0.9.0', checkoutUrl: '' },
-    { id: 'formcraft', name: 'FormCraft', desc: 'Drag & drop form builder with smart validations', color: 'purple', icon: 'F', version: '1.2.0', checkoutUrl: '' },
-    { id: 'pixelsnap', name: 'PixelSnap', desc: 'Screenshot tool with annotations and quick sharing', color: 'pink', icon: 'P', version: '1.1.0', checkoutUrl: '' },
-  ];
+  function colorFor(e: ModuleCatalogEntry): 'teal' | 'purple' | 'pink' {
+    if (e.id === 'vct-launcher') return 'pink';
+    if (e.id === 'orchestrator') return 'teal';
+    if (e.kind === 'subcomponent') return 'purple';
+    if (e.kind === 'coming_soon') return 'pink';
+    return 'teal';
+  }
 
-  let selectedApp = $state<AppItem | null>(null);
+  function iconFor(e: ModuleCatalogEntry): string {
+    // First letter of the name; specific overrides for clarity.
+    if (e.id === 'vct-launcher') return 'L';
+    if (e.id === 'orchestrator') return 'O';
+    if (e.id === 'knowledge-graph') return 'K';
+    if (e.id === 'code-graph') return 'C';
+    if (e.id === 'rl-reranker') return 'R';
+    return e.name.charAt(0).toUpperCase();
+  }
 
-  let userApps = $derived(
-    allApps.filter((app) => $currentUser?.apps?.includes(app.id))
+  function badgeFor(e: ModuleCatalogEntry): string {
+    if (e.kind === 'bundled') return 'Bundled';
+    if (e.kind === 'installed') return 'Installed';
+    if (e.kind === 'subcomponent') return 'Included';
+    if (e.kind === 'coming_soon') {
+      const tier = (e.coming_soon_tier ?? '').toUpperCase();
+      const tierLabel = tier ? `${tier} · ` : '';
+      const target = e.coming_soon_target ? ` (${e.coming_soon_target})` : '';
+      return `${tierLabel}Coming Soon${target}`;
+    }
+    return 'Available';
+  }
+
+  let cards = $derived<AppCard[]>(
+    modulesState.catalog.map((entry) => ({
+      entry,
+      color: colorFor(entry),
+      icon: iconFor(entry),
+      badge: badgeFor(entry),
+      badgeKind: entry.kind,
+    }))
   );
 
-  function getColorRgb(color: string): string {
+  let selectedCard = $state<AppCard | null>(null);
+
+  function getColorRgb(color: 'teal' | 'purple' | 'pink'): string {
     if (color === 'teal') return '0,191,166';
     if (color === 'purple') return '123,95,255';
     return '255,79,160';
   }
 
-  function getColorVar(color: string): string {
+  function getColorVar(color: 'teal' | 'purple' | 'pink'): string {
     if (color === 'teal') return 'var(--color-teal)';
     if (color === 'purple') return 'var(--color-purple)';
     return 'var(--color-pink)';
   }
 
-  function selectApp(app: AppItem) {
-    selectedApp = selectedApp?.id === app.id ? null : app;
+  function selectCard(c: AppCard) {
+    selectedCard = selectedCard?.entry.id === c.entry.id ? null : c;
   }
 
-  function handleAppCardAction(app: AppItem) {
-    if (app.id === 'orchestrator' && orchState.status === 'installed') {
+  function handleCardAction(c: AppCard) {
+    // 1. Orchestrator MCP dashboard if running.
+    if (c.entry.id === 'orchestrator' && orchState.status === 'installed') {
       ui.openMcpDashboard();
       return;
     }
-    selectApp(app);
+    // 2. Subcomponent CTA (e.g. KG → /kg).
+    if (c.entry.kind === 'subcomponent' && c.entry.cta_route) {
+      window.location.assign(c.entry.cta_route);
+      return;
+    }
+    // 3. Coming-soon: open the right sidebar with the description; the
+    //    Learn-more CTA over there can later link to a roadmap page or
+    //    waitlist form. We do NOT advance to install.
+    selectCard(c);
   }
 </script>
 
@@ -83,11 +130,17 @@
       <div class="content-header">
         <div>
           <h1 class="content-title">Your Library</h1>
-          <p class="content-subtitle">{userApps.length} tool{userApps.length !== 1 ? 's' : ''} activated</p>
+          <p class="content-subtitle">
+            {cards.length} component{cards.length !== 1 ? 's' : ''}
+          </p>
         </div>
       </div>
 
-      {#if userApps.length === 0}
+      {#if modulesState.loading && cards.length === 0}
+        <div class="empty-state">
+          <p class="empty-text">Loading catalog…</p>
+        </div>
+      {:else if cards.length === 0}
         <div class="empty-state">
           <div class="empty-icon">
             <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -95,42 +148,52 @@
               <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
             </svg>
           </div>
-          <h2 class="empty-title">Library is empty</h2>
-          <p class="empty-text">Activate a code or browse the Store to add tools.</p>
-          <a class="btn-3d btn-3d-primary" href="/store">
-            Browse Store
-          </a>
+          <h2 class="empty-title">Catalog unavailable</h2>
+          <p class="empty-text">
+            Couldn't load the module catalog. Make sure the launcher is running
+            and the orchestrator is reachable.
+          </p>
         </div>
       {:else}
         <div class="app-grid">
-          {#each userApps as app}
+          {#each cards as c (c.entry.id)}
             <!-- svelte-ignore a11y_no_static_element_interactions -->
             <div
               class="app-card glass-card"
-              class:app-card-selected={selectedApp?.id === app.id}
-              onclick={() => handleAppCardAction(app)}
-              onkeydown={(e) => { if (e.key === 'Enter') handleAppCardAction(app); }}
+              class:app-card-selected={selectedCard?.entry.id === c.entry.id}
+              class:app-card-coming-soon={c.badgeKind === 'coming_soon'}
+              onclick={() => handleCardAction(c)}
+              onkeydown={(e) => { if (e.key === 'Enter') handleCardAction(c); }}
               role="button"
               tabindex="0"
             >
-              <div class="app-card-glow" style:--glow-color="rgba({getColorRgb(app.color)}, 0.5)"></div>
-              <div class="app-card-top-line" style:background="linear-gradient(90deg, transparent, {getColorVar(app.color)}, transparent)"></div>
-              <div class="app-card-icon" style:background="rgba({getColorRgb(app.color)}, 0.12)" style:border-color="rgba({getColorRgb(app.color)}, 0.25)">
-                <span style:color={getColorVar(app.color)}>{app.icon}</span>
+              <div class="app-card-glow" style:--glow-color="rgba({getColorRgb(c.color)}, 0.5)"></div>
+              <div class="app-card-top-line" style:background="linear-gradient(90deg, transparent, {getColorVar(c.color)}, transparent)"></div>
+              <div class="app-card-icon" style:background="rgba({getColorRgb(c.color)}, 0.12)" style:border-color="rgba({getColorRgb(c.color)}, 0.25)">
+                <span style:color={getColorVar(c.color)}>{c.icon}</span>
               </div>
-              <h3 class="app-card-name">{app.name}</h3>
-              <p class="app-card-desc">{app.desc}</p>
+              <h3 class="app-card-name">{c.entry.name}</h3>
+              <p class="app-card-desc">{c.entry.description}</p>
               <div class="app-card-footer">
-                <span class="app-card-version">v{app.version}</span>
-                {#if app.id === 'orchestrator' && orchState.status === 'installed'}
+                <span class="app-card-version">v{c.entry.version}</span>
+                {#if c.badgeKind === 'coming_soon'}
+                  <span class="app-card-status app-card-coming-soon-badge">{c.badge}</span>
+                {:else if c.entry.id === 'orchestrator' && orchState.status === 'installed'}
                   <button
                     class="btn-3d btn-3d-ghost btn-3d-sm"
                     onclick={(e) => { e.stopPropagation(); ui.openMcpDashboard(); }}
                   >
                     Dashboard
                   </button>
+                {:else if c.badgeKind === 'subcomponent' && c.entry.cta_route}
+                  <button
+                    class="btn-3d btn-3d-ghost btn-3d-sm"
+                    onclick={(e) => { e.stopPropagation(); window.location.assign(c.entry.cta_route); }}
+                  >
+                    Open dashboard
+                  </button>
                 {:else}
-                  <span class="app-card-status app-card-installed">Installed</span>
+                  <span class="app-card-status app-card-installed">{c.badge}</span>
                 {/if}
               </div>
             </div>
@@ -140,7 +203,10 @@
     </div>
   </div>
 
-  <RightSidebar {selectedApp} onOpenActivation={() => ui.openActivation()} />
+  <RightSidebar
+    selectedApp={selectedCard ? { id: selectedCard.entry.id, name: selectedCard.entry.name, color: selectedCard.color, version: selectedCard.entry.version } : null}
+    onOpenActivation={() => ui.openActivation()}
+  />
 </div>
 
 <style>
@@ -374,5 +440,21 @@
   .app-card-installed {
     color: var(--color-teal);
     background: rgba(0, 191, 166, 0.1);
+  }
+
+  /* Coming-soon visual state: dimmer card, pink badge — same pattern as
+     other "not yet available" affordances elsewhere in the launcher. */
+  .app-card-coming-soon {
+    opacity: 0.78;
+  }
+
+  .app-card-coming-soon:hover {
+    opacity: 1;
+  }
+
+  .app-card-coming-soon-badge {
+    color: var(--color-pink);
+    background: rgba(255, 79, 160, 0.12);
+    border: 1px solid rgba(255, 79, 160, 0.25);
   }
 </style>

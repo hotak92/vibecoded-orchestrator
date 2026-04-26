@@ -144,9 +144,13 @@ class ConsentGatingTests(unittest.TestCase):
     def setUp(self) -> None:
         self._home_ctx = _fresh_home()
         self._home = self._home_ctx.__enter__()
+        # Explicit opt-in here: this class tests per-category consent gating
+        # (rl_data, routing_data, instinct_data) on top of an active telemetry
+        # opt-in. The default-OFF behaviour for an unset env var is asserted
+        # separately in DefaultOffTests below.
         self._env_patch = mock.patch.dict(os.environ, {
             "HOME": self._home,
-            "VIBECODED_TELEMETRY": "",
+            "VIBECODED_TELEMETRY": "true",
         }, clear=False)
         self._env_patch.start()
         (self.consent_mod, self.queue_mod, self.collector_mod,
@@ -171,7 +175,9 @@ class ConsentGatingTests(unittest.TestCase):
         with self.consent_mod.CONFIG_FILE.open("w") as fh:
             json.dump(consent, fh)
 
-    def test_always_on_session_start_without_consent(self) -> None:
+    def test_always_on_session_start_with_explicit_optin(self) -> None:
+        """With VIBECODED_TELEMETRY=true, always-on category bypasses per-flag
+        consent (no consent file required) and the event is enqueued."""
         ok = self.collector_mod.collect_session_start(license_valid=True, license_tier="free")
         self.assertTrue(ok)
         q = self.queue_mod.get_queue()
@@ -228,6 +234,58 @@ class ConsentGatingTests(unittest.TestCase):
         # session_id is hashed, not raw.
         self.assertNotEqual(payload["session_id_hash"], "abc-123")
         self.assertEqual(len(payload["session_id_hash"]), 64)
+
+
+class DefaultOffTests(unittest.TestCase):
+    """Default-OFF policy: with no explicit VIBECODED_TELEMETRY env, telemetry
+    is disabled. Mirrors the README promise and the .env default written by
+    install.py. Belt-and-suspenders: collector AND uploader both default OFF.
+    """
+
+    def setUp(self) -> None:
+        self._home_ctx = _fresh_home()
+        self._home = self._home_ctx.__enter__()
+        # Empty env (= default state) — no opt-in.
+        self._env_patch = mock.patch.dict(os.environ, {
+            "HOME": self._home,
+            "VIBECODED_TELEMETRY": "",
+        }, clear=False)
+        self._env_patch.start()
+        (_, self.queue_mod, self.collector_mod,
+         self.uploader_mod, _) = _reload_telemetry_modules()
+
+    def tearDown(self) -> None:
+        self._env_patch.stop()
+        self._home_ctx.__exit__(None, None, None)
+
+    def test_collector_is_disabled_when_env_unset(self) -> None:
+        """Even always-on events do NOT enqueue without opt-in."""
+        self.assertFalse(self.collector_mod.telemetry_enabled())
+        ok = self.collector_mod.collect_session_start(license_valid=True, license_tier="free")
+        self.assertFalse(ok)
+        self.assertEqual(self.queue_mod.get_queue().count_pending(), 0)
+
+    def test_uploader_is_disabled_when_env_unset(self) -> None:
+        """Defense in depth: even if rows somehow exist in the queue, the
+        uploader refuses to ship them without an explicit opt-in."""
+        self.assertTrue(self.uploader_mod._disabled())
+        # Inject a row directly bypassing the collector gate.
+        self.queue_mod.get_queue().enqueue("forced", {"x": 1})
+        result = self.uploader_mod.upload_pending()
+        self.assertEqual(result.uploaded_count, 0)
+        self.assertEqual(result.error, "telemetry_disabled")
+
+    def test_optin_truthy_values_enable(self) -> None:
+        for v in ("true", "1", "yes", "on", "TRUE", "On"):
+            with mock.patch.dict(os.environ, {"VIBECODED_TELEMETRY": v}):
+                self.assertTrue(self.collector_mod.telemetry_enabled())
+                self.assertFalse(self.uploader_mod._disabled())
+
+    def test_optout_falsy_values_disable(self) -> None:
+        for v in ("false", "0", "no", "off", "FALSE", "Off", ""):
+            with mock.patch.dict(os.environ, {"VIBECODED_TELEMETRY": v}):
+                self.assertFalse(self.collector_mod.telemetry_enabled())
+                self.assertTrue(self.uploader_mod._disabled())
 
 
 class EnvOptOutTests(unittest.TestCase):
@@ -330,9 +388,12 @@ class UploaderTests(unittest.TestCase):
     def setUp(self) -> None:
         self._home_ctx = _fresh_home()
         self._home = self._home_ctx.__enter__()
+        # Explicit opt-in: this class tests the upload mechanics (retries,
+        # backoff, success/failure marking) — not the default-OFF gate
+        # (covered separately in DefaultOffTests).
         self._env_patch = mock.patch.dict(os.environ, {
             "HOME": self._home,
-            "VIBECODED_TELEMETRY": "",
+            "VIBECODED_TELEMETRY": "true",
             "VIBECODED_TELEMETRY_URL": "https://stub.example/telemetry",
         }, clear=False)
         self._env_patch.start()

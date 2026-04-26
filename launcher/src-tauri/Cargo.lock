@@ -4836,6 +4836,7 @@ dependencies = [
  "gethostname",
  "hex",
  "keyring",
+ "libc",
  "mac_address",
  "regex",
  "reqwest 0.12.28",
@@ -4849,7 +4850,9 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-dialog",
  "tauri-plugin-opener",
+ "tempfile",
  "tokio",
+ "toml 0.8.2",
  "tower-http",
  "uuid",
 ]
