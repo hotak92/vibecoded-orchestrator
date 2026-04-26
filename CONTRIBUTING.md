@@ -57,6 +57,18 @@ pyright
 
 ---
 
+## Continuous Integration
+
+Pull requests run a deliberately minimal CI matrix on every push (`.github/workflows/ci.yml`):
+
+- **Rust** — `cargo test --lib --manifest-path launcher/src-tauri/Cargo.toml`. Library tests only; full Tauri bundle builds are gated behind a release workflow because they need a per-OS matrix and a lot of platform deps.
+- **Python** — `pytest tests/` against Python 3.12 with `requirements.txt` + `requirements-dev.txt`. Covers the trust-critical helpers (license validator, telemetry PII scrubbing + consent gating, install-flow detection).
+- **Frontend** — `npm run check` in `launcher/` (svelte-check + TypeScript). No frontend runtime tests yet — that's a known gap; PRs that add a Playwright smoke test or component tests are welcome.
+
+CI is intentionally minimal at this stage of the project. When the launcher gets release tags, a separate workflow will add the full per-OS bundle build, signing, and artifact uploads.
+
+---
+
 ## Contribution Flow
 
 1. **Open an issue first** for anything beyond a small fix — so we can agree on scope before you invest time.
