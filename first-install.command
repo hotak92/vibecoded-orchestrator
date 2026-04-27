@@ -19,6 +19,9 @@
 
 set -euo pipefail
 
+# Insulate from user-defined shell rc files (see first-install.sh).
+unset BASH_ENV
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
