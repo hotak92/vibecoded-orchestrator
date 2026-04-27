@@ -87,7 +87,7 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
                     let _ = w.set_focus();
                 }
             }
-            "quit" => app.exit(0),
+            "quit" => crate::quit_dialog::confirm_and_quit(app),
             "check_updates" => {
                 if let Some(w) = app.get_webview_window("main") {
                     let _ = w.show();
