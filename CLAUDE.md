@@ -220,6 +220,15 @@ status: active   # active, archived, deprecated, idea
 - Concise (<300 lines)
 - Search: `kg-search` CLI or `hybrid_search` MCP
 
+**1b. Shared Knowledge Graph** (`SHARED_KG_COLLECTION`, default `VibeCodedTools_KnowledgeGraph`)
+- Cross-project shared collection bundled with the orchestrator install
+- Seeded at install time from `vibecoded-orchestrator/knowledge/`
+- Every project queries it alongside its own KG by default
+- Per-project opt-out: set `SHARED_KG_OPT_OUT=true` (any of the three env surfaces)
+- Writes: `store_knowledge_node(scope="shared")` — power-user only; default scope is "project"
+- Sidecar: `<orchestrator>/knowledge/.node_formats.json` (separate from per-project sidecar)
+- See `knowledge/concepts/shared-knowledge-graph.md` for the design.
+
 **2. Code Graph** (Weaviate code collections)
 - `CodeModule` — files with imports and metrics
 - `CodeClass` — classes with inheritance, methods, composition

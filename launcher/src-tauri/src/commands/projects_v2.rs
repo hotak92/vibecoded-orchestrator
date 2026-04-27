@@ -192,6 +192,15 @@ pub fn write_project_env_files(folder: &Path, project_name: &str) -> Result<(), 
     let kg_collection = sanitize_kg_collection(project_name);
     let dev_collection = format!("{}_development", kg_collection);
     let conv_collection = format!("{}_conversations", kg_collection);
+    // Shared cross-project KG. Same name across all projects on this machine
+    // — bundled with the orchestrator install (seeded from
+    // vibecoded-orchestrator/knowledge/). Per-project SHARED_KG_OPT_OUT
+    // disables it for THIS project without affecting others.
+    let shared_kg_collection = "VibeCodedTools_KnowledgeGraph";
+    // Default: opt-IN. Users who want a sandboxed project flip this via the
+    // launcher Preferences toggle (which re-runs write_project_env_files
+    // with opt_out=true).
+    let shared_kg_opt_out = "false";
 
     // VS Code path (extension reads claude-code.env).
     //
@@ -234,6 +243,8 @@ pub fn write_project_env_files(folder: &Path, project_name: &str) -> Result<(), 
         "PROJECT_NAME": kg_collection,
         "DEVELOPMENT_COLLECTION": dev_collection,
         "CONVERSATION_COLLECTION": conv_collection,
+        "SHARED_KG_COLLECTION": shared_kg_collection,
+        "SHARED_KG_OPT_OUT": shared_kg_opt_out,
     });
     if let Some(obj) = vscode_root.as_object_mut() {
         obj.insert("claude-code.env".to_string(), vscode_env_block);
@@ -259,8 +270,15 @@ pub fn write_project_env_files(folder: &Path, project_name: &str) -> Result<(), 
          export KG_COLLECTION=\"{}\"\n\
          export PROJECT_NAME=\"{}\"\n\
          export DEVELOPMENT_COLLECTION=\"{}\"\n\
-         export CONVERSATION_COLLECTION=\"{}\"\n",
-        kg_collection, kg_collection, dev_collection, conv_collection,
+         export CONVERSATION_COLLECTION=\"{}\"\n\
+         export SHARED_KG_COLLECTION=\"{}\"\n\
+         export SHARED_KG_OPT_OUT=\"{}\"\n",
+        kg_collection,
+        kg_collection,
+        dev_collection,
+        conv_collection,
+        shared_kg_collection,
+        shared_kg_opt_out,
     );
     std::fs::write(&env_path, env_content)
         .map_err(|e| format!("write {}: {}", env_path.display(), e))?;
@@ -307,6 +325,8 @@ pub fn write_project_env_files(folder: &Path, project_name: &str) -> Result<(), 
         "PROJECT_NAME": kg_collection,
         "DEVELOPMENT_COLLECTION": dev_collection,
         "CONVERSATION_COLLECTION": conv_collection,
+        "SHARED_KG_COLLECTION": shared_kg_collection,
+        "SHARED_KG_OPT_OUT": shared_kg_opt_out,
     });
     if let Some(obj) = settings.as_object_mut() {
         obj.insert("env".to_string(), env_block);
@@ -622,6 +642,9 @@ mod tests {
         assert_eq!(env["PROJECT_NAME"], "MyTest");
         assert_eq!(env["DEVELOPMENT_COLLECTION"], "MyTest_development");
         assert_eq!(env["CONVERSATION_COLLECTION"], "MyTest_conversations");
+        // Shared-KG fields propagate to all three surfaces.
+        assert_eq!(env["SHARED_KG_COLLECTION"], "VibeCodedTools_KnowledgeGraph");
+        assert_eq!(env["SHARED_KG_OPT_OUT"], "false");
 
         // 2. CLI shell file path
         let claude_env = tmp.join(".claude/env");
@@ -630,6 +653,8 @@ mod tests {
         assert!(env_raw.contains(r#"export KG_COLLECTION="MyTest""#));
         assert!(env_raw.contains(r#"export PROJECT_NAME="MyTest""#));
         assert!(env_raw.contains(r#"export DEVELOPMENT_COLLECTION="MyTest_development""#));
+        assert!(env_raw.contains(r#"export SHARED_KG_COLLECTION="VibeCodedTools_KnowledgeGraph""#));
+        assert!(env_raw.contains(r#"export SHARED_KG_OPT_OUT="false""#));
 
         // 3. Bug 30: canonical .claude/settings.json env block
         let claude_settings = tmp.join(".claude/settings.json");
@@ -641,6 +666,8 @@ mod tests {
         assert_eq!(env["PROJECT_NAME"], "MyTest");
         assert_eq!(env["DEVELOPMENT_COLLECTION"], "MyTest_development");
         assert_eq!(env["CONVERSATION_COLLECTION"], "MyTest_conversations");
+        assert_eq!(env["SHARED_KG_COLLECTION"], "VibeCodedTools_KnowledgeGraph");
+        assert_eq!(env["SHARED_KG_OPT_OUT"], "false");
 
         std::fs::remove_dir_all(&tmp).ok();
     }

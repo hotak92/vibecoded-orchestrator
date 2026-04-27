@@ -159,10 +159,14 @@ class EnsureCollectionsTests(unittest.TestCase):
     def test_creates_missing_collections(self):
         server, port, _ = _start_server()
         try:
+            # Pre-create the shared collection so this test stays focused on
+            # KG + Dev (covered separately in test_creates_shared_kg_collection).
+            _Handler.schema = {"classes": [{"class": "TestShared"}]}
             with mock.patch.dict(
                 "os.environ",
                 {"WEAVIATE_PORT": str(port), "KG_COLLECTION": "TestKG",
-                 "DEVELOPMENT_COLLECTION": "TestDev"},
+                 "DEVELOPMENT_COLLECTION": "TestDev",
+                 "SHARED_KG_COLLECTION": "TestShared"},
             ):
                 install._ensure_collections({})
             posted_classes = [p.get("class") for p in _Handler.posted]
@@ -174,14 +178,24 @@ class EnsureCollectionsTests(unittest.TestCase):
     def test_skips_existing_collections(self):
         server, port, _ = _start_server()
         try:
-            _Handler.schema = {"classes": [{"class": "TestKG"}, {"class": "TestDev"}]}
+            # Pre-seed all three collections (project + dev + shared) so
+            # _ensure_collections has nothing to POST. The shared collection
+            # name comes from SHARED_KG_COLLECTION (default
+            # VibeCodedTools_KnowledgeGraph) — pin it explicitly here to
+            # decouple the test from the default value.
+            _Handler.schema = {"classes": [
+                {"class": "TestKG"},
+                {"class": "TestDev"},
+                {"class": "TestShared"},
+            ]}
             with mock.patch.dict(
                 "os.environ",
                 {"WEAVIATE_PORT": str(port), "KG_COLLECTION": "TestKG",
-                 "DEVELOPMENT_COLLECTION": "TestDev"},
+                 "DEVELOPMENT_COLLECTION": "TestDev",
+                 "SHARED_KG_COLLECTION": "TestShared"},
             ):
                 install._ensure_collections({})
-            # Both collections already in schema → no POSTs.
+            # All three collections already in schema → no POSTs.
             self.assertEqual(_Handler.posted, [])
         finally:
             server.shutdown()
@@ -189,16 +203,49 @@ class EnsureCollectionsTests(unittest.TestCase):
     def test_creates_only_missing_subset(self):
         server, port, _ = _start_server()
         try:
-            _Handler.schema = {"classes": [{"class": "TestKG"}]}
+            # Pre-seed project KG and shared KG; only the dev collection
+            # should be POSTed.
+            _Handler.schema = {"classes": [
+                {"class": "TestKG"},
+                {"class": "TestShared"},
+            ]}
             with mock.patch.dict(
                 "os.environ",
                 {"WEAVIATE_PORT": str(port), "KG_COLLECTION": "TestKG",
-                 "DEVELOPMENT_COLLECTION": "TestDev"},
+                 "DEVELOPMENT_COLLECTION": "TestDev",
+                 "SHARED_KG_COLLECTION": "TestShared"},
             ):
                 install._ensure_collections({})
-            # Only TestDev should be POSTed; TestKG is already there.
+            # Only TestDev should be POSTed; TestKG + TestShared already there.
             posted_classes = [p.get("class") for p in _Handler.posted]
             self.assertEqual(posted_classes, ["TestDev"])
+        finally:
+            server.shutdown()
+
+    def test_creates_shared_kg_collection(self):
+        """Step 7b also bootstraps the cross-project shared KG collection so
+        every install on this machine sees the same VibeCodedTools_KnowledgeGraph."""
+        server, port, _ = _start_server()
+        try:
+            _Handler.schema = {"classes": []}
+            with mock.patch.dict(
+                "os.environ",
+                {"WEAVIATE_PORT": str(port), "KG_COLLECTION": "TestKG",
+                 "DEVELOPMENT_COLLECTION": "TestDev",
+                 "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph"},
+            ):
+                install._ensure_collections({})
+            posted_classes = [p.get("class") for p in _Handler.posted]
+            self.assertIn("TestKG", posted_classes)
+            self.assertIn("TestDev", posted_classes)
+            self.assertIn("VibeCodedTools_KnowledgeGraph", posted_classes)
+            # Shared collection schema mirrors the project KG (same builder).
+            shared = next(p for p in _Handler.posted
+                          if p.get("class") == "VibeCodedTools_KnowledgeGraph")
+            prop_names = {p["name"] for p in shared["properties"]}
+            self.assertIn("title", prop_names)
+            self.assertIn("content", prop_names)
+            self.assertIn("typed_links", prop_names)
         finally:
             server.shutdown()
 
