@@ -90,9 +90,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             // Container-services lifecycle (Podman/Docker compose).
             // App-launch suite (launch_app/kill_app/get_app_status/etc.) was
-            // removed 2026-04-27: zero FE consumers (Svelte) and zero Hub
-            // consumers. Re-add from git history if a packaged-app
-            // launcher is reintroduced.
+            // archived 2026-04-28: zero FE consumers (Svelte) and zero Hub
+            // consumers. The extracted source lives in the orchestrator's
+            // private launch-assets archive (launcher-archived-rust/
+            // lifecycle_app_process.rs) for future re-introduction.
             commands::lifecycle::services_status,
             commands::lifecycle::services_start_all,
             commands::lifecycle::services_stop_all,
@@ -104,10 +105,11 @@ pub fn run() {
             commands::lifecycle::services_get_adoption,
             commands::lifecycle::services_reset_adoption,
             commands::lifecycle::services_find_free_port,
-            // Projects v1 (legacy JSON-backed) was removed 2026-04-27 — frontend
-            // is 100% Svelte and uses projects_v2 exclusively. Underlying fns in
-            // commands/projects.rs are retained for now under #[allow(dead_code)]
-            // until the next sweep.
+            // Projects v1 (legacy JSON-backed) was deleted 2026-04-28 — frontend
+            // is 100% Svelte and uses projects_v2 exclusively. The file
+            // commands/projects.rs and types CreateProjectRequest/
+            // UpdateProjectRequest are gone from this tree; recover from git
+            // history if v1 ever resurfaces.
             // Projects — v2 DB-backed
             commands::projects_v2::list_projects_v2,
             commands::projects_v2::get_project_v2,
@@ -185,12 +187,12 @@ pub fn run() {
             commands::coordination::coordination_apply_schema,
             commands::coordination::coordination_team_status,
             // MCP registration: register_module_mcp / deregister_module_mcp
-            // were removed from invoke_handler 2026-04-27. The actual write
-            // path goes through `mcp_registration::register_mcp` /
-            // `deregister_mcp` invoked server-side by dashboard.rs and
-            // installer.rs — the Tauri command wrappers had zero FE/Hub
-            // consumers. The functions in commands/mcp_reg.rs are retained
-            // under #[allow(dead_code)] for now.
+            // were archived 2026-04-28. The actual write path goes through
+            // `mcp_registration::register_mcp` / `deregister_mcp` invoked
+            // server-side by dashboard.rs and installer.rs — the Tauri
+            // command wrappers had zero FE/Hub consumers. The extracted
+            // source lives in the orchestrator's private launch-assets
+            // archive (launcher-archived-rust/mcp_reg.rs).
             // Telemetry consent + dashboard
             commands::telemetry_cmd::telemetry_status,
             commands::telemetry_cmd::telemetry_set_consent,

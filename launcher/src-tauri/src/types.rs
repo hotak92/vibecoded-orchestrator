@@ -28,20 +28,6 @@ pub struct ServiceEntry {
     pub started_at: Option<String>,
 }
 
-// --- App launch config ---
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LaunchConfig {
-    pub app_id: String,
-    pub executable: String,
-    pub args: Vec<String>,
-    pub env: HashMap<String, String>,
-    pub health_url: Option<String>,
-    pub port: Option<u16>,
-    pub project_id: Option<String>,
-    pub workspace_path: Option<String>,
-}
-
 // --- Download progress ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,18 +37,6 @@ pub struct DownloadProgress {
     pub total_bytes: u64,
     pub percentage: f32,
     pub stage: String,
-}
-
-// --- Health check result ---
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HealthStatus {
-    pub app_id: String,
-    pub healthy: bool,
-    pub status_text: Option<String>,
-    pub version: Option<String>,
-    pub uptime_ms: Option<u64>,
-    pub latency_ms: Option<u64>,
 }
 
 // --- Orchestrator tier ---
@@ -298,17 +272,3 @@ pub struct Project {
     pub synced_to_cloud: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreateProjectRequest {
-    pub name: String,
-    pub local_path: String,
-    pub app_ids: Vec<String>,
-    pub config: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UpdateProjectRequest {
-    pub name: Option<String>,
-    pub app_ids: Option<Vec<String>>,
-    pub config: Option<serde_json::Value>,
-}
