@@ -612,8 +612,8 @@ If you're seeing this orchestrator for the first time, here's the 60-second ment
 If install hasn't run yet (or you're not sure):
 
 ```bash
-./install.sh           # Linux / macOS
-.\install.ps1          # Windows
+bash first-install.sh       # Linux / macOS — or double-click first-install.command (macOS) / first-install.desktop (Linux)
+# Windows: double-click first-install.bat
 ```
 
 Full install walk-through and options: [`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md).

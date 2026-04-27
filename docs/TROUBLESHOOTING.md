@@ -2,6 +2,83 @@
 
 Common issues during install and first-run. If none of these help, open an issue on [GitHub](https://github.com/hotak92/vibecoded-orchestrator/issues) with the output of `python install.py --help` and your OS/Python version.
 
+## First-install issues
+
+Issues specific to `first-install.sh` / `first-install.command` / `first-install.bat` / `first-install.desktop`.
+
+### Joern installer hang
+
+Versions before commit `64d5804` could hang indefinitely while downloading the Joern JVM tool. Fixed in `64d5804`. If you are on an older clone:
+
+```bash
+git pull
+bash first-install.sh
+```
+
+To skip Joern entirely on any version:
+
+```bash
+bash first-install.sh --yes
+# then re-run install.py directly with:
+python3 install.py --no-joern
+```
+
+### macOS: "VCT Launcher is damaged and can't be opened" (Gatekeeper)
+
+Gatekeeper blocks unsigned binaries downloaded from the internet. `first-install.command` strips the quarantine xattr automatically on binaries it downloads. If the warning appears anyway (e.g. you downloaded the `.dmg` manually):
+
+```bash
+xattr -cr /Applications/VCT\ Launcher.app
+```
+
+Then open the app from `/Applications`. This is the standard macOS procedure for unsigned third-party software; it does not bypass Gatekeeper, it tells Gatekeeper you trust this specific app.
+
+Code signing and Apple Developer notarization are on the post-v1.0 backlog.
+
+### Windows: "Windows protected your PC" (SmartScreen)
+
+The first run of an unsigned Windows executable shows SmartScreen's blue dialog. This is expected for v0.1.0 — the build is not yet code-signed.
+
+1. Click **More info**.
+2. Click **Run anyway**.
+
+SmartScreen remembers the choice per binary hash; subsequent runs on the same machine open without the dialog. Code signing is on the v0.1.1 backlog.
+
+### Linux: `.desktop` file doesn't open on double-click
+
+Some file managers require enabling executable-text activation before `.desktop` files open as programs rather than text.
+
+**GNOME Files (Nautilus)**: Preferences → Behavior → Executable Text Files → "Run executable text files when they are opened".
+
+**Thunar (XFCE)**: Edit → Preferences → Misc → "Run executable scripts by default".
+
+**Dolphin (KDE)**: right-click → Properties → Permissions → Is executable, then double-click again.
+
+Alternatively, run from a terminal:
+
+```bash
+bash first-install.sh
+```
+
+### No container runtime found
+
+`first-install.*` prints a URL and exits if it cannot install a container runtime automatically (macOS and Windows require manual install; Linux uses pkexec to attempt it interactively).
+
+- **Linux**: `sudo apt install podman` (Debian/Ubuntu) or `sudo dnf install podman` (Fedora/RHEL) or `sudo pacman -S podman` (Arch), then re-run `bash first-install.sh`.
+- **macOS**: install [Podman Desktop](https://podman-desktop.io/) or [Docker Desktop](https://www.docker.com/products/docker-desktop), then re-run `bash first-install.sh`.
+- **Windows**: install [Docker Desktop](https://www.docker.com/products/docker-desktop) or [Podman Desktop](https://podman-desktop.io/), then double-click `first-install.bat` again.
+
+### GPU hardware detected but no driver installed
+
+`first-install.*` detects NVIDIA and AMD GPU hardware but does not attempt driver installation — driver installs require a reboot and carry risk. If it prints a GPU URL:
+
+- **NVIDIA**: install the driver from <https://www.nvidia.com/drivers>, then install the NVIDIA Container Toolkit from <https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html>. Re-run `bash first-install.sh` after.
+- **AMD (ROCm)**: install ROCm from <https://rocm.docs.amd.com/en/latest/deploy/linux/quick_start.html>. Re-run after.
+
+Without a driver, `first-install.*` continues with CPU-only mode automatically.
+
+---
+
 ## Bypass permissions mode
 
 By default, Claude Code prompts for approval on every tool call. With 30+ approvals per setup session, this gets painful fast. The orchestrator ships with `"defaultMode": "bypassPermissions"` in `.claude/settings.json`. How you opt in depends on which surface you use:

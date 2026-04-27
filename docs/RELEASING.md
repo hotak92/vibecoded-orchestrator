@@ -49,6 +49,16 @@ Steps:
 
 4. **GitHub release** — create a release from the tag. Copy the `## [x.y.z]` body from CHANGELOG.md into the release notes. Do not check "pre-release" unless the version is a pre-release identifier (e.g. `0.2.0-rc1`).
 
+5. **Attach per-OS launcher artifacts** to the GitHub release. The `first-install.*` entry points probe GitHub Releases for the launcher binary when it is absent locally. If the artifacts are missing from the release, the download path in `first-install.*` will fail and users will be redirected to the "build from source" fallback. Required artifact names (must match exactly):
+
+   | OS | Artifact name |
+   |---|---|
+   | Windows (x64) | `vct-launcher-windows-x64.exe` |
+   | Linux (x64) | `VCT_Launcher_*.AppImage` and/or `vct-launcher_*.deb` |
+   | macOS (Apple Silicon) | `vct-launcher-macos-arm64.dmg` |
+
+   These are the canonical names `first-install.*` looks for when it calls the GitHub Releases API. Renaming them breaks the download path.
+
 ## Why no automated tagging?
 
 Tagging will be the trigger for the future GitHub release pipeline (per-OS Tauri bundle build, signing, artifact upload). Until that pipeline exists and has been smoke-tested, tagging is reserved for the maintainer to do explicitly when a release is ready — not as the side effect of a CI run. A tag means "this is the commit external users should pin to". Nothing should silently create one.
