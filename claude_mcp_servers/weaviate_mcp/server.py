@@ -212,14 +212,250 @@ def _get_node_format(file_path: str, level: str) -> str | None:
 
     Args:
         file_path: Relative path (e.g., 'knowledge/tools/leanctx.md')
-        level: 'description' or 'summary'
+        level: 'description', 'summary', or 'chunk_summaries'
 
     Returns:
-        The formatted text, or None if not available.
+        The formatted text (or dict for 'chunk_summaries'), or None if not available.
     """
     db = _load_node_formats()
     entry = db.get(file_path, {})
     return entry.get(level)
+
+
+# ---------------------------------------------------------------------------
+# Score-driven retrieval verbosity tiers
+# ---------------------------------------------------------------------------
+# Thresholds calibrated 2026-04-10 on 18 relevant + 20 irrelevant queries
+# (canonical source: previously inline in claude_mcp_servers/scripts/rl_kg_search.py).
+#
+# Tier semantics (RL-reranked or 1-distance score, range 0..1, higher=better):
+#   < 0.42   → discard (noise from unrelated topics)
+#   0.42..0.55 → "summary"      (LLM description from sidecar, or 200-char content)
+#   0.55..0.65 → "single_chunk" (matched chunk, up to ~2000 chars)
+#   0.65..0.75 → "three_chunks" (matched + neighbours, 3 chunks centred on hit)
+#   >= 0.75  → "full"           (whole node, capped at 7 nearest chunks)
+#
+# Tunable at runtime via env-var overrides (kept as module constants so tests and
+# rl_kg_search can override without monkey-patching imports).
+_TIER_THRESHOLDS: dict[str, float] = {
+    "min":          float(os.getenv("KG_TIER_MIN",          "0.42")),
+    "single_chunk": float(os.getenv("KG_TIER_SINGLE_CHUNK", "0.55")),
+    "three_chunks": float(os.getenv("KG_TIER_THREE_CHUNKS", "0.65")),
+    "full":         float(os.getenv("KG_TIER_FULL",         "0.75")),
+}
+
+# Per-tier chunk window (how many chunks to assemble from a chunked node)
+_TIER_CHUNK_WINDOW: dict[str, int] = {
+    "single_chunk": 1,
+    "three_chunks": 3,
+    "full":         7,
+}
+
+
+def _get_result_verbosity_by_score(score: float) -> str:
+    """Return one of: 'discard' | 'summary' | 'single_chunk' | 'three_chunks' | 'full'.
+
+    Score is normalised 0..1, higher=better. See _TIER_THRESHOLDS for the cutoffs.
+    """
+    try:
+        s = float(score)
+    except (TypeError, ValueError):
+        s = 0.0
+    if s < _TIER_THRESHOLDS["min"]:
+        return "discard"
+    if s < _TIER_THRESHOLDS["single_chunk"]:
+        return "summary"
+    if s < _TIER_THRESHOLDS["three_chunks"]:
+        return "single_chunk"
+    if s < _TIER_THRESHOLDS["full"]:
+        return "three_chunks"
+    return "full"
+
+
+def _chunk_summaries_header(file_path: str, shown_chunk_nums: list[int] | None = None) -> str:
+    """Build a small header listing per-chunk summaries from the sidecar.
+
+    Used when assembling partial multi-chunk content (single_chunk / three_chunks
+    tiers) so the agent gets a one-line orientation of every chunk in the source
+    node, even those not included in the assembled body.
+
+    Args:
+        file_path: Relative path (e.g. 'knowledge/concepts/foo.md')
+        shown_chunk_nums: Chunk numbers actually being assembled below the header.
+            When provided, the header marks shown chunks with ▶ and unshown with ·
+            so the agent can request additional chunks deliberately.
+
+    Returns:
+        Header string ending in two newlines, or "" if no chunk_summaries exist.
+    """
+    if not file_path:
+        return ""
+    chunk_summaries = _get_node_format(file_path, "chunk_summaries")
+    if not isinstance(chunk_summaries, dict) or not chunk_summaries:
+        return ""
+
+    shown = set(shown_chunk_nums or [])
+    lines = ["[Chunk map:"]
+    # Keys are stringified ints "1", "2", … — sort numerically when possible.
+    def _key(k: str) -> int:
+        try:
+            return int(k)
+        except (TypeError, ValueError):
+            return 0
+    for k in sorted(chunk_summaries.keys(), key=_key):
+        try:
+            n = int(k)
+        except (TypeError, ValueError):
+            n = 0
+        marker = "▶" if n in shown else "·"
+        snippet = (chunk_summaries[k] or "").strip().splitlines()
+        first_line = snippet[0] if snippet else ""
+        if len(first_line) > 140:
+            first_line = first_line[:137] + "…"
+        lines.append(f"  {marker} {k}: {first_line}")
+    lines.append("]")
+    return "\n".join(lines) + "\n\n"
+
+
+def _fetch_node_chunks(coll, title: str, hit_chunk: int, total: int, max_chunks: int):
+    """Fetch up to ``max_chunks`` content chunks centred on ``hit_chunk``.
+
+    Returns a list of (chunk_num, content) tuples sorted by chunk_num. Empty list
+    on failure (collection unavailable, no chunks, etc.).
+
+    Mirrors the inline ``_fetch_chunks`` previously embedded in rl_kg_search.py.
+    """
+    try:
+        objs = coll.query.fetch_objects(
+            filters=Filter.by_property("title").equal(title),
+            limit=(total or max_chunks) + 1,
+        )
+        chunk_list: list[tuple[int, str]] = []
+        for obj in objs.objects:
+            cn = obj.properties.get("chunk_num", 0) or 0
+            chunk_list.append((cn, obj.properties.get("content", "") or ""))
+        chunk_list.sort(key=lambda x: x[0])
+        if max_chunks >= len(chunk_list):
+            return chunk_list
+        # Centre window on hit_chunk
+        hit_idx = next((i for i, (cn, _) in enumerate(chunk_list) if cn == hit_chunk), 0)
+        half = max_chunks // 2
+        start = max(0, min(hit_idx - half, len(chunk_list) - max_chunks))
+        return chunk_list[start:start + max_chunks]
+    except Exception as exc:
+        logger.debug("Chunk fetch failed for '%s': %s", title, exc)
+        return []
+
+
+def _format_result_by_tier(
+    result: dict,
+    tier: str,
+    sidecar_db: dict | None = None,
+    coll=None,
+) -> dict | None:
+    """Format a single search result at the requested verbosity tier.
+
+    Args:
+        result: Result dict from _format_obj or merged hybrid_search (must include
+            at minimum: title, node_type, file_path, content; optional: tags,
+            score, chunk_number, total_chunks).
+        tier: One of 'discard' | 'titles' | 'summary' | 'single_chunk' |
+            'three_chunks' | 'full' | 'descriptions' (legacy alias for 'summary').
+        sidecar_db: Optional pre-loaded sidecar dict. When omitted, the cached
+            sidecar is used via _get_node_format. Pass an explicit dict in tests.
+        coll: Optional Weaviate collection handle. Required for multi-chunk
+            assembly (single_chunk / three_chunks / full tiers). When omitted,
+            those tiers fall back to the 300-char content snippet.
+
+    Returns:
+        Formatted result dict, or None when tier == 'discard'.
+    """
+    if tier == "discard":
+        return None
+
+    fp = result.get("file_path", "") or ""
+    title = result.get("title", "")
+    node_type = result.get("node_type", "")
+    tags = result.get("tags", []) or []
+    score = result.get("score")
+    content = result.get("content", "") or ""
+    total_chunks = result.get("total_chunks") or 1
+    hit_chunk = result.get("chunk_number") or 1
+
+    # Helper to read sidecar respecting an injected db override (used by tests).
+    def _sc(level: str):
+        if sidecar_db is not None:
+            entry = sidecar_db.get(fp, {}) if isinstance(sidecar_db, dict) else {}
+            return entry.get(level) if isinstance(entry, dict) else None
+        return _get_node_format(fp, level)
+
+    base = {
+        "title": title,
+        "node_type": node_type,
+        "file_path": fp,
+        "tags": tags,
+    }
+    if score is not None:
+        base["score"] = score
+    # tier echoed back so callers (and tests) can see what was chosen.
+    base["tier"] = tier
+
+    if tier == "titles":
+        return base
+
+    if tier in ("summary", "descriptions"):
+        # Decision: prefer description (longer, ~6 lines), fall back to summary
+        # (1-2 lines), then to truncated content. This fixes BUG-SIDECAR-DESC-FALLBACK
+        # — the old hybrid_search loop skipped 'summary' entirely.
+        desc = _sc("description")
+        summary = _sc("summary")
+        if desc:
+            base["description"] = desc
+        elif summary:
+            base["summary"] = summary
+        else:
+            base["content"] = content[:200] if len(content) > 200 else content
+        return base
+
+    # single_chunk / three_chunks / full — multi-chunk assembly when possible
+    window = _TIER_CHUNK_WINDOW.get(tier, 1)
+    chunks = _fetch_node_chunks(coll, title, hit_chunk, total_chunks, window) if coll is not None else []
+    if chunks and total_chunks and total_chunks > 1:
+        shown_nums = [cn for cn, _ in chunks]
+        # Whole-node summary header when partial view (all-tiers below 'full' for multi-chunk).
+        node_summary = _sc("summary")
+        header_parts: list[str] = []
+        is_partial = len(chunks) < (total_chunks or len(chunks))
+        if is_partial and node_summary:
+            header_parts.append(f"[Node summary: {node_summary}]")
+        # Chunk map header for single_chunk/three_chunks (orient agent across full node).
+        if tier in ("single_chunk", "three_chunks"):
+            chunk_map = _chunk_summaries_header(fp, shown_chunk_nums=shown_nums)
+            if chunk_map:
+                # _chunk_summaries_header already trails with \n\n; strip for join below.
+                header_parts.append(chunk_map.rstrip())
+        body = "\n".join(c for _, c in chunks)
+        prefix = ("\n\n".join(header_parts) + "\n\n") if header_parts else ""
+        base["content"] = f"{prefix}{body}"
+        base["chunks_shown"] = len(chunks)
+        base["chunks_total"] = total_chunks
+        return base
+
+    # Single-chunk node (or coll unavailable) — return content as-is.
+    if tier == "single_chunk":
+        # For multi-chunk nodes where we couldn't fetch, prepend node summary if available.
+        node_summary = _sc("summary") if (total_chunks and total_chunks > 1) else None
+        if node_summary:
+            base["content"] = f"[Node summary: {node_summary}]\n\n{content}"
+        else:
+            base["content"] = content
+        return base
+
+    # three_chunks / full fallback when chunk fetch failed: return full snippet.
+    base["content"] = content
+    return base
+
+
 KG_COLLECTION = os.getenv("KG_COLLECTION", "ClaudeKnowledgeGraph")
 SHARED_KG_COLLECTION = os.getenv("SHARED_KG_COLLECTION", "")
 # Project-specific documentation collection (e.g. ProjectName_development).
@@ -1138,7 +1374,8 @@ async def search_single_collection(collection_name: str, query: str, limit: int,
 async def semantic_graph_search(
     query: str,
     limit: int = 5,
-    depth: int = 2
+    depth: int = 2,
+    detail: str = "auto",
 ) -> str:
     """
     Semantic search with WikiLink graph traversal (GraphRAG). Finds concepts
@@ -1158,10 +1395,15 @@ async def semantic_graph_search(
         limit: Max primary results (default: 5). Connected nodes are additional.
         depth: Graph traversal depth (default: 2, max: 3). Higher depth finds
                more distant connections but returns more results.
+        detail: Verbosity tier per result (default "auto"). See hybrid_search
+            for the full tier semantics. Auto-mode applies per-result score
+            tiering to primary results. Connected nodes always use the
+            "summary" tier — see Decision note below.
 
     Returns:
         JSON with primary_results (direct matches) + connected_nodes (graph
-        neighbors discovered via WikiLink traversal), each with relationship type.
+        neighbors discovered via WikiLink traversal). Each result carries title,
+        file_path, node_type, score, tier, and content at the chosen detail.
     """
     client = get_weaviate_client()
     coll = client.collections.get(KG_COLLECTION)
@@ -1191,9 +1433,33 @@ async def semantic_graph_search(
     ]
     all_formatted = _enrich_with_adjacent_chunks(coll, all_formatted, KG_COLLECTION)
 
+    # Preserve a normalised score (1 - distance) so per-result tiering works.
+    for r in all_formatted:
+        if "score" not in r:
+            d = r.get("distance")
+            r["score"] = (1.0 - d) if isinstance(d, (int, float)) else 0.0
+
     # RL: rerank + cache using all over-fetched nodes; return top-k primary results.
     task_id = str(uuid.uuid4())
-    primary_formatted = await _rl_cache_and_rerank(task_id, query, all_formatted, limit)
+    primary_results = await _rl_cache_and_rerank(task_id, query, all_formatted, limit)
+    for r in primary_results:
+        if "score" not in r:
+            d = r.get("distance")
+            r["score"] = (1.0 - d) if isinstance(d, (int, float)) else 0.0
+
+    # Apply tiering to primary results (mirrors hybrid_search behaviour).
+    legacy_aliases = {"descriptions": "summary"}
+    primary_formatted: list[dict] = []
+    for r in primary_results:
+        if detail == "auto":
+            tier = _get_result_verbosity_by_score(r.get("score", 0.0) or 0.0)
+        else:
+            tier = legacy_aliases.get(detail, detail)
+        if tier == "discard":
+            continue
+        entry = _format_result_by_tier(r, tier, sidecar_db=None, coll=coll)
+        if entry is not None:
+            primary_formatted.append(entry)
 
     # Extract WikiLinks only from the top-k returned to Claude
     connected_titles = set()
@@ -1202,8 +1468,9 @@ async def semantic_graph_search(
         wikilinks = re.findall(r'\[\[(?:[^:]+::)?([^\]]+)\]\]', content)
         connected_titles.update(wikilinks)
 
-    # Query connected nodes
-    connected_nodes = []
+    # Query connected nodes (exact title match — these are graph neighbours,
+    # not search hits, so they have no native distance/score).
+    connected_raw = []
     if connected_titles and depth > 1:
         for title in list(connected_titles)[:10]:
             try:
@@ -1214,12 +1481,35 @@ async def semantic_graph_search(
                 if results.objects:
                     obj = results.objects[0]
                     formatted = _format_obj(obj, KG_COLLECTION, distance=None)
-                    connected_nodes.append(formatted)
+                    connected_raw.append(formatted)
             except Exception as e:
                 logger.warning(f"Failed to fetch connected node '{title}': {e}")
 
-    if connected_nodes:
-        connected_nodes = _enrich_with_adjacent_chunks(coll, connected_nodes, KG_COLLECTION)
+    if connected_raw:
+        connected_raw = _enrich_with_adjacent_chunks(coll, connected_raw, KG_COLLECTION)
+
+    # Decision: connected nodes always render at "summary" tier.
+    #
+    # Auditing the cost of re-fetching each connected node via near_text/near_vector
+    # to obtain a real score: that's an extra Weaviate roundtrip per neighbour
+    # (≤10 in practice). On a warm GRPC connection that's ~30-80ms each →
+    # +300-800ms latency for graph traversal that is meant to be cheap.
+    # The neighbours are *already* selected by graph topology (they were
+    # WikiLinked from a relevant primary), so a low semantic score does not
+    # mean low relevance — it just means the title isn't lexically close to
+    # the query. A flat "summary" tier is both faster and semantically more
+    # honest.
+    connected_nodes: list[dict] = []
+    for r in connected_raw:
+        # Connected nodes have no score; treat tier as "summary" unless the
+        # caller explicitly requested "titles" or "full" globally (then mirror it).
+        if detail in ("titles", "full"):
+            tier = detail
+        else:
+            tier = "summary"
+        entry = _format_result_by_tier(r, tier, sidecar_db=None, coll=coll)
+        if entry is not None:
+            connected_nodes.append(entry)
 
     logger.info(f"semantic_graph_search: {len(primary_formatted)} primary + {len(connected_nodes)} connected")
     return _large_result({
@@ -1227,7 +1517,8 @@ async def semantic_graph_search(
         "primary_results": primary_formatted,
         "connected_nodes": connected_nodes,
         "query": query,
-        "depth": depth
+        "depth": depth,
+        "detail": detail,
     })
 
 
@@ -1328,7 +1619,7 @@ async def hybrid_search(
     node_type: str = None,
     tags: list[str] = None,
     days: int = None,
-    detail: str = "descriptions",
+    detail: str = "auto",
 ) -> str:
     """
     Combined semantic + keyword search across KG and project docs.
@@ -1354,15 +1645,28 @@ async def hybrid_search(
         node_type: Filter by type (project, concept, tool, model, hardware, research)
         tags: Filter by tags (e.g., ["AI", "python"])
         days: If set, only return nodes updated in the last N days
-        detail: Level of detail in results:
-            - "titles": title + file_path + node_type only (minimal tokens)
-            - "descriptions": title + 6-line description (default, good balance)
-            - "full": title + 300-char content snippet (most detail)
+        detail: Verbosity tier per result. Default "auto" — selected per result by
+            relevance score (calibrated thresholds, see _TIER_THRESHOLDS):
+              - score < 0.42  → discarded (noise)
+              - 0.42..0.55    → "summary" (LLM description, ~6 lines)
+              - 0.55..0.65    → "single_chunk" (matched chunk, ~2000 chars)
+              - 0.65..0.75    → "three_chunks" (matched + neighbours)
+              - >= 0.75       → "full" (whole node, up to 7 nearest chunks)
+            Explicit overrides apply uniformly to all results:
+              - "titles"        → title + file_path + node_type only
+              - "summary"       → LLM description / summary / 200-char content
+              - "single_chunk"  → matched chunk only
+              - "three_chunks"  → 3 chunks centred on hit
+              - "full"          → whole node (or 300-char snippet for unchunked)
+            Legacy aliases (kept for backward compat):
+              - "descriptions"  → "summary"
+              - (old) "full"    → unchanged behaviour, now also assembles chunks
+                                  for chunked nodes when available
 
     Returns:
         JSON with deduplicated results ranked by combined semantic + keyword score.
-        Each result includes title, file_path, node_type, and content at the
-        requested detail level.
+        Each result includes title, file_path, node_type, score (0..1), tier (the
+        verbosity actually applied), and content at the requested detail level.
     """
     # Build type/tag filter
     filters = []
@@ -1409,40 +1713,55 @@ async def hybrid_search(
     # Sort all over-fetched candidates by combined score
     all_results = sorted(merged.values(), key=lambda x: x["combined_score"], reverse=True)
 
+    # Preserve combined_score → score (BUG-SCORE-DROP fix). RL server may
+    # overwrite this with its own normalised score; if not, the merged
+    # combined_score (already 0..1, higher=better) is used as the surface score.
+    for r in all_results:
+        if "score" not in r and "combined_score" in r:
+            r["score"] = r["combined_score"]
+
     # RL: rerank + cache using all candidates; return top-k.
     task_id = str(uuid.uuid4())
     results = await _rl_cache_and_rerank(task_id, query, all_results, limit)
 
-    # Apply detail level to results
-    if detail == "titles":
-        results = [
-            {
-                "title": r.get("title", ""),
-                "node_type": r.get("node_type", ""),
-                "file_path": r.get("file_path", ""),
-                "tags": r.get("tags", []),
-            }
-            for r in results
-        ]
-    elif detail == "descriptions":
-        formatted = []
-        for r in results:
-            fp = r.get("file_path", "")
-            desc = _get_node_format(fp, "description")
-            entry = {
-                "title": r.get("title", ""),
-                "node_type": r.get("node_type", ""),
-                "file_path": fp,
-                "tags": r.get("tags", []),
-            }
-            if desc:
-                entry["description"] = desc
-            else:
-                # Fallback: use truncated content if no pre-generated description
-                entry["content"] = r.get("content", "")
+    # Ensure score survives the RL hop too (RL server returns its own dicts; if
+    # it dropped the score field, fall back to combined_score from the input).
+    for r in results:
+        if "score" not in r:
+            r["score"] = r.get("combined_score", 0.0)
+
+    # Get a collection handle for multi-chunk assembly (used by single_chunk /
+    # three_chunks / full tiers). Use KG_COLLECTION as the canonical home;
+    # results from SHARED_KG / DEVELOPMENT collections will fall back to the
+    # 300-char snippet if their title isn't found in KG_COLLECTION.
+    coll_for_chunks = None
+    try:
+        client = get_weaviate_client()
+        coll_for_chunks = client.collections.get(KG_COLLECTION)
+    except Exception as exc:
+        logger.debug("hybrid_search: chunk-fetch collection unavailable (%s)", exc)
+
+    # Apply detail level. "auto" → per-result tier from score; explicit value →
+    # uniform across all results.
+    formatted: list[dict] = []
+    legacy_aliases = {"descriptions": "summary"}
+    for r in results:
+        if detail == "auto":
+            score = r.get("score", 0.0) or 0.0
+            tier = _get_result_verbosity_by_score(score)
+        else:
+            tier = legacy_aliases.get(detail, detail)
+        # Decision: skip discarded results outright; the agent never sees noise.
+        if tier == "discard":
+            continue
+        # Decision: when explicit detail == "full" was requested historically, the
+        # behaviour was "300-char snippet". The new "full" tier additionally
+        # assembles chunks for chunked nodes — strictly more useful, no regression
+        # for unchunked nodes (still returns the snippet via the fallback path).
+        entry = _format_result_by_tier(r, tier, sidecar_db=None, coll=coll_for_chunks)
+        if entry is not None:
             formatted.append(entry)
-        results = formatted
-    # detail == "full" → keep results as-is (300-char content snippet)
+    results = formatted
 
     # Log detail level for RL training signal
     _log_detail_choice(query, detail, len(results))
@@ -1745,6 +2064,7 @@ async def search_code_graph(
     expand_hops: int = 0,
     layer: str = None,
     project: str = None,
+    detail: str = "auto",
 ) -> str:
     """
     Find code entities (functions, classes, modules, APIs) by describing what
@@ -1763,15 +2083,24 @@ async def search_code_graph(
         query: Natural language description of the code you're looking for
         scope: "all" (default) — all entity types; "code" — functions/classes/modules
                only; "interaction" — service boundaries (APIs, cross-service calls) only
-        limit: Max results (default: 8). Top 4 get full details; rest are refs.
+        limit: Max results (default: 8).
         expand_hops: 0 (default) — no expansion; 1 or 2 — follow call/interaction
                      edges from seed nodes to discover related code
         layer: Filter by architectural layer (API, Service, Data, UI, Utility)
         project: Project name override. Omit to use workspace default.
+        detail: Verbosity per result (default "auto"):
+            - "auto"   → top 4 (highest score) get full details, the rest are
+                         metadata-only refs. Backward-compatible with the
+                         pre-tiering behaviour.
+            - "titles" → metadata-only refs for every result (cheapest)
+            - "full"   → full details for every result (most expensive)
+            Code graph has no .node_formats sidecar so the auto-mode tiering is
+            position-based (top-k) rather than score-threshold-based; the score
+            is still surfaced in every result for clients to filter on.
 
     Returns:
-        JSON with code entities, each including file_path, full_name, and
-        description. Full details (body, signature) for top results.
+        JSON with code entities, each including file_path, score, and (for
+        full-tier results) full_name/signature/doc. Metadata refs for the rest.
     """
     _SCOPES: dict[str, list[str]] = {
         "all":         ["CodeFunction", "CodeClass", "CodeModule", "CodeAPI", "CodeInteraction"],
@@ -1863,6 +2192,24 @@ async def search_code_graph(
                 return "/".join(parts[:-1]) if len(parts) > 1 else p["full_name"]
             return ""
 
+        # Determine per-result verbosity. Backward-compatible default ("auto")
+        # mirrors the legacy "top 4 full / rest refs" heuristic. Explicit
+        # detail values apply uniformly. Decision: code graph has no sidecar,
+        # so we cannot do score-threshold tiering — we use position-based
+        # tiering (rank order) for "auto" instead. The score is still in every
+        # result for client-side filtering.
+        if detail not in ("auto", "titles", "full"):
+            # Map legacy/unknown values onto sane defaults rather than 500ing.
+            detail = "auto"
+
+        def _is_full_tier(idx: int) -> bool:
+            if detail == "full":
+                return True
+            if detail == "titles":
+                return False
+            # auto: top 4 get full, rest get refs
+            return idx < 4
+
         results = []
         for i, r in enumerate(candidates):
             coll_name, p, score, dist = r["_c"], r["_p"], r["_s"], r["_d"]
@@ -1873,7 +2220,7 @@ async def search_code_graph(
                 "file_path": _file_path(coll_name, p),
             }
 
-            if i < 4:
+            if _is_full_tier(i):
                 # Full details
                 if coll_name == "CodeFunction":
                     doc = p.get("doc", "")
@@ -2093,6 +2440,7 @@ async def search_code_graph(
             "query": query,
             "scope": scope,
             "expand_hops": effective_hops,
+            "detail": detail,
             "count": len(results),
             "results": results,
         })
