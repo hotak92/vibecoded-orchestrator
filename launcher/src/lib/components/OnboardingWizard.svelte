@@ -90,10 +90,16 @@
   let projectName = $state('');
   let projectPath = $state('');
   let projectPathTouched = $state(false);
-  let suggestedRoot = $state('~/code');
   let creatingProject = $state(false);
   let projectError = $state<string | null>(null);
 
+  // 2026-04-28 fix: do NOT auto-fill projectPath with a templated value.
+  // Earlier code wrote `${suggestedRoot}/${slug}` into the field as a real
+  // value, which (a) looked like a concrete location the user had to delete
+  // before typing their own (`/home/martino/code/agape`), and (b) implied
+  // the orchestrator expected projects under `~/code/` even when the user
+  // had no such directory. Now: leave the field blank, show only a generic
+  // `path/to/project` placeholder, and let the user type or click Browse.
   function slugify(s: string): string {
     return s
       .trim()
@@ -104,25 +110,11 @@
   }
 
   async function loadStep4() {
-    // Resolve a sane default root for the path field. In Tauri this
-    // returns an absolute path like "/home/you/code"; in browser mode
-    // it stays as the literal "~/code" so the user knows it'll be
-    // expanded. Only run once per modal session.
-    if (suggestedRoot !== '~/code') return;
-    try {
-      const root = await suggestProjectFolder();
-      suggestedRoot = root || '~/code';
-    } catch {
-      suggestedRoot = '~/code';
-    }
+    // No-op for step 4 right now; kept for the lifecycle hook contract.
+    // Previously resolved a default project-root via suggestProjectFolder,
+    // but per the no-templated-default decision above we don't pre-fill
+    // anything — the user picks via Browse or types an absolute path.
   }
-
-  // Auto-suggest path from name until the user edits the path field.
-  $effect(() => {
-    if (step !== 4 || projectPathTouched) return;
-    const root = suggestedRoot || '~/code';
-    projectPath = `${root}/${slugify(projectName) || 'my-project'}`;
-  });
 
   async function browseProjectFolder() {
     const picked = await pickDirectory({
@@ -341,13 +333,14 @@
 
   function expandTilde(p: string): string {
     if (!p.startsWith('~')) return p;
-    // Best-effort: suggestedRoot looks like "/home/you/code" or "~/code".
-    // Strip the trailing "/code" portion to recover the home dir.
-    const root = suggestedRoot || '';
-    const home = root.replace(/[\\/]code$/, '');
-    if (home && !home.startsWith('~')) {
-      return home + p.slice(1);
-    }
+    // Tilde expansion at the JS layer is best-effort — the user may have
+    // typed `~/something` manually. The Rust side handles real path
+    // resolution canonically, but we'd rather not pass `~/...` raw.
+    // We don't have the home dir cached anymore (suggestedRoot was
+    // removed when auto-fill went away). Pass through unchanged and let
+    // the backend resolve, OR (future) call homeDirectory() from
+    // dialog.ts before submission. For v1 the typed path is most often
+    // an absolute /home/... or /Users/... path anyway.
     return p;
   }
 
@@ -499,6 +492,21 @@
             <p class="ow-secondary">If something is missing, install it before continuing.</p>
           {/if}
         {:else if step === 3}
+          {#if alreadyInstalledRoot}
+            <!-- 2026-04-28: when the user navigated Back to step 3 from
+                 the auto-skipped step 4, the install path field defaulting
+                 to ~/vibecoded-orchestrator is misleading — they're already
+                 installed at $alreadyInstalledRoot. Pre-fill with the
+                 detected root and label it accordingly. The user can still
+                 change it to relocate, but they'll know the default is
+                 their CURRENT install. -->
+            <p class="ow-secondary">
+              <strong>Already installed at</strong>
+              <code class="ow-mono">{alreadyInstalledRoot}</code>.
+              You usually don't need to change this — only edit the path
+              below if you want to relocate the orchestrator.
+            </p>
+          {/if}
           <label class="ow-label">
             <span>Install path</span>
             <input bind:value={installPath} />
@@ -742,7 +750,7 @@
                 class="ow-path-input"
                 bind:value={projectPath}
                 oninput={() => (projectPathTouched = true)}
-                placeholder="~/code/my-project"
+                placeholder="/path/to/your/project"
               />
               <button
                 type="button"
