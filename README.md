@@ -16,6 +16,29 @@ Open source. Runs locally. Learns from how you work.
 
 ---
 
+## Quick Start (zero-dependency click-to-install)
+
+Brand-new machine, no Python, no Node, no container runtime? Use the
+double-clickable entry points at the **repo root**:
+
+1. **Get the repo** — clone (`git clone https://github.com/hotak92/vibecoded-orchestrator.git`) or download a release tarball from [Releases](https://github.com/hotak92/vibecoded-orchestrator/releases).
+2. **Double-click the file for your OS:**
+
+   | OS | Install file | Launcher file |
+   |---|---|---|
+   | **Linux** | `first-install.desktop` (or `first-install.sh` from a terminal) | `start-launcher.desktop` (or `start-launcher.sh`) |
+   | **macOS** | `first-install.command` | `start-launcher.command` |
+   | **Windows** | `first-install.bat` | `start-launcher.bat` |
+
+3. The installer auto-handles Python, the container runtime (Podman/Docker), GPU detection, and the launcher binary — interactive prompts only when needed. Allow ~5–10 minutes plus first-run image downloads (~5 GB).
+4. After install: double-click `start-launcher.<ext>` for your OS to start the launcher GUI.
+
+> **Linux note**: Some file managers require enabling "Run executable text files on activation" before `.sh`/`.desktop` files become double-clickable (GNOME Files → Preferences → Behavior). The `.desktop` variants are the most reliable double-click target across DEs (GNOME, KDE, XFCE, Cinnamon).
+
+> **Prefer the CLI?** See [Quick Install](#quick-install) below.
+
+---
+
 ## What it does
 
 An infrastructure layer for Claude Code that addresses three things no single tool covers today:
@@ -77,18 +100,33 @@ downloads on first run (~5 GB total — Weaviate image + Ollama qwen3 weights;
 GPU mode also pulls CodeSage-Large-v2 ~2.5 GB). Subsequent installs reuse the
 cached images and finish in seconds.
 
-### Linux / macOS
+### One-click entry points (clone, then double-click)
+
+After cloning the repo, the easiest way to install is to double-click the
+file matching your OS:
+
+| OS | First-time install | Start launcher (after install) |
+|---|---|---|
+| Linux | `first-install.sh` | `start-launcher.sh` |
+| macOS | `first-install.command` | `start-launcher.command` |
+| Windows | `first-install.bat` | `start-launcher.bat` |
+
+`first-install.*` carries no pre-install dependencies — it auto-installs
+Python, prompts to install Podman/Docker if neither is found, and runs the
+full setup. `start-launcher.*` runs after install completes.
+
+### Linux / macOS (terminal)
 ```bash
 git clone https://github.com/hotak92/vibecoded-orchestrator.git
 cd vibecoded-orchestrator
-./install.sh
+./install.sh                      # or ./first-install.sh
 ```
 
 ### Windows (PowerShell)
 ```powershell
 git clone https://github.com/hotak92/vibecoded-orchestrator.git
 cd vibecoded-orchestrator
-.\install.ps1
+.\install.ps1                     # or double-click first-install.bat
 ```
 
 **Windows notes**:

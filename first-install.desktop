@@ -1,0 +1,17 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Install VibeCoded Tools
+GenericName=VibeCoded Tools Installer
+Comment=One-click installer for the VibeCoded Tools orchestrator
+# %k expands to the directory containing this .desktop file, so the
+# launcher works whether it's run in-place from a cloned repo, copied
+# to ~/Desktop/, or installed to ~/.local/share/applications/.
+# We `cd` into that dir, run first-install.sh, then keep the terminal
+# open so the user can read the final status.
+Exec=bash -c "cd %k && ./first-install.sh; echo; read -p 'Press Enter to close.' _"
+Icon=utilities-terminal
+Terminal=true
+Categories=Development;
+Keywords=install;setup;orchestrator;ai;claude;
+StartupNotify=true

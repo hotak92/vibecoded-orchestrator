@@ -1,0 +1,18 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=VCT Launcher
+GenericName=VibeCoded Tools Launcher
+Comment=Start the VibeCoded Tools launcher GUI
+# The launcher detaches itself (nohup + & inside start-launcher.sh), so
+# Terminal=false is fine — we don't need a visible terminal once it's up.
+# We still wrap in `bash -c` to handle the missing-binary error path,
+# which prints to stderr; if that path triggers, the user gets a desktop
+# notification rather than a terminal. Set Terminal=true if you'd prefer
+# a console window to see the error message directly.
+Exec=bash -c "cd %k && ./start-launcher.sh"
+Icon=applications-development
+Terminal=false
+Categories=Development;
+Keywords=launcher;orchestrator;ai;claude;vct;
+StartupNotify=true
