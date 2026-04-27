@@ -6,6 +6,7 @@
 
 # Scrub sensitive env vars (this hook doesn't need credentials)
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN 2>/dev/null
+[ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
 
 CONTEXT_FILE=".claude/CONTEXT_STATE.md"
 SNAPSHOT_DIR="${TMPDIR:-/tmp}/claude_ctx_snapshots"

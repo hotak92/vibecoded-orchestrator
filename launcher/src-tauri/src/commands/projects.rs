@@ -1,3 +1,11 @@
+#![allow(dead_code)]
+// Legacy v1 project commands. Removed from invoke_handler 2026-04-27 — the
+// frontend is 100% Svelte and uses projects_v2 exclusively. The functions
+// remain in source under #[allow(dead_code)] so that history and intent are
+// preserved; the next sweep can delete the file (and the orphaned types in
+// types.rs: CreateProjectRequest, UpdateProjectRequest) if no v1 code path
+// resurfaces.
+
 use tauri::{command, Emitter, State};
 use uuid::Uuid;
 

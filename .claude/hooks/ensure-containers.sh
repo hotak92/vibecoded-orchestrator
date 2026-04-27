@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Scrub sensitive env vars before any subprocess spawning
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
+[ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
 # Ensure all required containers are running (background, non-blocking)
 # Called by SessionStart hook — checks and starts any stopped containers
 

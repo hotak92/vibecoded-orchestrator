@@ -88,14 +88,11 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            // Lifecycle (existing, unchanged)
-            commands::lifecycle::launch_app,
-            commands::lifecycle::kill_app,
-            commands::lifecycle::get_app_status,
-            commands::lifecycle::get_all_app_statuses,
-            commands::lifecycle::check_app_health,
-            commands::lifecycle::check_all_health,
             // Container-services lifecycle (Podman/Docker compose).
+            // App-launch suite (launch_app/kill_app/get_app_status/etc.) was
+            // removed 2026-04-27: zero FE consumers (Svelte) and zero Hub
+            // consumers. Re-add from git history if a packaged-app
+            // launcher is reintroduced.
             commands::lifecycle::services_status,
             commands::lifecycle::services_start_all,
             commands::lifecycle::services_stop_all,
@@ -107,12 +104,10 @@ pub fn run() {
             commands::lifecycle::services_get_adoption,
             commands::lifecycle::services_reset_adoption,
             commands::lifecycle::services_find_free_port,
-            // Projects — legacy JSON-backed (kept for React components not yet migrated)
-            commands::projects::create_project,
-            commands::projects::get_projects,
-            commands::projects::update_project,
-            commands::projects::open_project,
-            commands::projects::close_project,
+            // Projects v1 (legacy JSON-backed) was removed 2026-04-27 — frontend
+            // is 100% Svelte and uses projects_v2 exclusively. Underlying fns in
+            // commands/projects.rs are retained for now under #[allow(dead_code)]
+            // until the next sweep.
             // Projects — v2 DB-backed
             commands::projects_v2::list_projects_v2,
             commands::projects_v2::get_project_v2,
@@ -175,7 +170,10 @@ pub fn run() {
             commands::kg::kg_search,
             commands::kg::kg_get_node,
             commands::kg::kg_promote_to_shared,
-            // Codegraph access matrix
+            // Codegraph access matrix — per-project access control. UI for
+            // matrix list/summary/bulk-set ships in v1.x; grant/check are
+            // helper APIs used by the bulk path and reserved for future
+            // single-row UX. KEEP: deliberately post-v1 surface.
             commands::codegraph::codegraph_list_access,
             commands::codegraph::codegraph_grant_access,
             commands::codegraph::codegraph_check_access,
@@ -186,9 +184,13 @@ pub fn run() {
             commands::coordination::coordination_test_connection,
             commands::coordination::coordination_apply_schema,
             commands::coordination::coordination_team_status,
-            // MCP registration (.claude.json / .mcp.json editor)
-            commands::mcp_reg::register_module_mcp,
-            commands::mcp_reg::deregister_module_mcp,
+            // MCP registration: register_module_mcp / deregister_module_mcp
+            // were removed from invoke_handler 2026-04-27. The actual write
+            // path goes through `mcp_registration::register_mcp` /
+            // `deregister_mcp` invoked server-side by dashboard.rs and
+            // installer.rs — the Tauri command wrappers had zero FE/Hub
+            // consumers. The functions in commands/mcp_reg.rs are retained
+            // under #[allow(dead_code)] for now.
             // Telemetry consent + dashboard
             commands::telemetry_cmd::telemetry_status,
             commands::telemetry_cmd::telemetry_set_consent,
@@ -203,6 +205,11 @@ pub fn run() {
             commands::installer::check_for_updates,
             commands::installer::install_orchestrator,
             commands::installer::preview_install,
+            // TODO(safety): wire preflight_install_safety_check to the
+            //   OnboardingWizard's confirm-step. Currently `preview_install`
+            //   covers the diff-mode path; preflight returns the richer
+            //   SafetyReport (volumes, collections, services classification)
+            //   and should run before clicking Install on a fresh path.
             commands::installer::preflight_install_safety_check,
             commands::volumes::get_volumes_config,
             commands::volumes::set_volumes_config_for_install,
@@ -212,6 +219,13 @@ pub fn run() {
             commands::installer::get_local_repo_source,
             commands::installer::inspect_orchestrator_at,
             commands::installer::update_orchestrator_at,
+            // GitHub PAT lifecycle. `register_github_pat` is wired in the
+            // OnboardingWizard (Bug 22). The read/clear surface (has/preview/
+            // clear) is registered for the v1.x "Manage Token" UI which
+            // hasn't been built yet — keep registered so the next FE sweep
+            // can wire it without backend churn.
+            // TODO(v1.x): wire has_github_pat / get_github_pat_preview /
+            //   clear_github_pat to a Manage Token settings page.
             commands::installer::has_github_pat,
             commands::installer::get_github_pat_preview,
             commands::installer::register_github_pat,
@@ -235,6 +249,9 @@ pub fn run() {
             // Dashboard: tier, features, MCP management
             commands::dashboard::get_feature_flags,
             commands::dashboard::get_orchestrator_config,
+            // TODO(v1.x): wire save_orchestrator_config to a Settings UI
+            //   "Save" button. update_orchestrator_setting handles the
+            //   per-key path; this command is the bulk-write counterpart.
             commands::dashboard::save_orchestrator_config,
             commands::dashboard::update_orchestrator_setting,
             commands::dashboard::get_mcp_servers,

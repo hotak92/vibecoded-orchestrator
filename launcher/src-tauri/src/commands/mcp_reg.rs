@@ -1,6 +1,13 @@
 //! Tauri commands for registering/deregistering module MCPs in the user's
 //! Claude Code configuration files. Safe concurrent editor lives in
 //! `crate::mcp_registration`.
+//!
+//! Removed from invoke_handler 2026-04-27 — the actual write path goes
+//! through `crate::mcp_registration::register_mcp` / `deregister_mcp`
+//! invoked server-side by `commands::dashboard` and `commands::installer`.
+//! These Tauri command wrappers had zero FE/Hub consumers. Kept in source
+//! under #[allow(dead_code)] in case a future direct-from-FE path is needed.
+#![allow(dead_code)]
 
 use std::path::PathBuf;
 
