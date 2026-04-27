@@ -109,6 +109,7 @@ _json_escape() {
 
 YES=0
 AUTO_LAUNCH=1
+NO_DESKTOP_ICON=0
 # Env knob: VCT_NO_AUTO_LAUNCH=1 has the same effect as --no-auto-launch.
 # Useful for unattended / agent / CI runs that need to control launcher
 # spawning out-of-band (e.g. spawning under Xvfb, or skipping spawn
@@ -123,6 +124,7 @@ for arg in "$@"; do
     case "$arg" in
         --yes|--non-interactive|--quiet) YES=1 ;;
         --no-auto-launch) AUTO_LAUNCH=0 ;;
+        --no-desktop-icon) NO_DESKTOP_ICON=1 ;;
     esac
 done
 
@@ -1087,6 +1089,126 @@ if [ "$AUTO_LAUNCH" -eq 0 ]; then
     echo "[launcher] --no-auto-launch set. Run start-launcher.sh to open the GUI."
     exit 0
 fi
+
+# ----- Desktop shortcut (opt-out) ---------------------------------------------
+# Create a launcher shortcut so the user can double-click to open the GUI.
+# Per-user only (no sudo, no /usr/share/applications). Idempotent: re-running
+# the install simply overwrites the entry with the current binary path.
+#
+#   Linux : ~/.local/share/applications/vct-launcher.desktop
+#           + ~/Desktop/vct-launcher.desktop (when ~/Desktop exists)
+#   macOS : symlink ~/Applications/VCT Launcher → the .app bundle
+#           (only when LAUNCHER_BIN is inside a .app structure)
+#   The Windows path lives in first-install.bat — Windows needs a .lnk
+#   shortcut written via PowerShell, which is awkward to call from bash.
+#
+# Opt-out: --no-desktop-icon CLI flag, VCT_NO_DESKTOP_ICON=1 env var, or
+# answering n to the interactive prompt. Default Y because most users
+# want the icon.
+_create_desktop_shortcut() {
+    if [ "${VCT_NO_DESKTOP_ICON:-0}" = "1" ] || [ "${NO_DESKTOP_ICON:-0}" = "1" ]; then
+        echo "[launcher] Skipping desktop shortcut (opt-out)."
+        return 0
+    fi
+
+    # Interactive prompt unless --yes or non-TTY.
+    if [ "$YES" -eq 0 ] && [ -t 0 ]; then
+        local ans
+        read -r -p "Create a desktop shortcut for the launcher? [Y/n] " ans || ans="Y"
+        case "${ans:-Y}" in
+            n|N|no|NO) echo "[launcher] Skipping desktop shortcut."; return 0 ;;
+        esac
+    fi
+
+    case "$OS" in
+        linux) _create_linux_desktop_entry ;;
+        macos) _create_macos_app_link ;;
+        *)     return 0 ;;
+    esac
+}
+
+_create_linux_desktop_entry() {
+    # Pick the highest-resolution icon shipped with the launcher source
+    # tree. Falls back to the first available size.
+    local icon_path=""
+    local icon_candidates=(
+        "$REPO_ROOT/launcher/src-tauri/icons/icon.png"
+        "$REPO_ROOT/launcher/src-tauri/icons/128x128@2x.png"
+        "$REPO_ROOT/launcher/src-tauri/icons/128x128.png"
+    )
+    for c in "${icon_candidates[@]}"; do
+        if [ -f "$c" ]; then
+            icon_path="$c"
+            break
+        fi
+    done
+
+    local apps_dir="$HOME/.local/share/applications"
+    mkdir -p "$apps_dir"
+    local desktop_file="$apps_dir/vct-launcher.desktop"
+    cat > "$desktop_file" <<DESKTOP_EOF
+[Desktop Entry]
+Type=Application
+Name=VCT Launcher
+GenericName=VibeCoded Tools Launcher
+Comment=Project manager + KG/codegraph dashboards for vibecoded-orchestrator
+Exec="$LAUNCHER_BIN"
+Icon=$icon_path
+Terminal=false
+Categories=Development;IDE;
+StartupWMClass=vct-launcher
+StartupNotify=true
+DESKTOP_EOF
+    chmod 644 "$desktop_file"
+    echo "[launcher] Desktop entry: $desktop_file"
+
+    # Optional: copy a clickable shortcut to ~/Desktop/ if the user has a
+    # standard desktop directory. Many distros + DEs honor this; some
+    # require "Allow Launching" via right-click first (GNOME 42+). The
+    # Applications entry above already gets the launcher into the system
+    # menu / activities overview regardless.
+    if [ -d "$HOME/Desktop" ]; then
+        cp "$desktop_file" "$HOME/Desktop/vct-launcher.desktop" 2>/dev/null && \
+            chmod +x "$HOME/Desktop/vct-launcher.desktop" 2>/dev/null && \
+            echo "[launcher] Desktop icon: $HOME/Desktop/vct-launcher.desktop" && \
+            echo "           (GNOME 42+: right-click → 'Allow Launching' on first use)"
+    fi
+
+    # Refresh the desktop entry cache so the launcher appears in the system
+    # menu without requiring a logout. Failure is non-fatal.
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database "$apps_dir" 2>/dev/null || true
+    fi
+
+    _log_event "desktop-icon" "ok" "Linux desktop entry created" \
+        "{\"path\":\"$(_json_escape "$desktop_file")\"}"
+}
+
+_create_macos_app_link() {
+    # Only meaningful when LAUNCHER_BIN points inside a .app bundle.
+    case "$LAUNCHER_BIN" in
+        */Contents/MacOS/*) ;;
+        *)
+            echo "[launcher] macOS shortcut skipped: launcher is not a .app bundle"
+            return 0
+            ;;
+    esac
+    local app_root="${LAUNCHER_BIN%/Contents/MacOS/*}"
+    if [ ! -d "$app_root" ]; then
+        return 0
+    fi
+    mkdir -p "$HOME/Applications"
+    local link_target="$HOME/Applications/$(basename "$app_root")"
+    if [ -L "$link_target" ] || [ -e "$link_target" ]; then
+        rm -f "$link_target" 2>/dev/null || true
+    fi
+    ln -s "$app_root" "$link_target" 2>/dev/null && \
+        echo "[launcher] Application link: $link_target" && \
+        _log_event "desktop-icon" "ok" "macOS Applications link" \
+            "{\"path\":\"$(_json_escape "$link_target")\"}"
+}
+
+_create_desktop_shortcut
 
 echo ""
 echo "Installation complete. Opening launcher..."
