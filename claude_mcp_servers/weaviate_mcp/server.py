@@ -152,10 +152,21 @@ GRPC_PORT = int(os.getenv("GRPC_PORT", "50052"))
 # Loaded lazily on first use. Maps file_path → {title, description, summary, generated_at}.
 KG_BASE_DIR = os.getenv("KG_BASE_DIR", "")
 _node_formats_cache: dict | None = None
+# Per-collection sidecar cache. Keys are collection names; values are the
+# parsed sidecar dicts (or {} if no sidecar was found at the resolved path).
+# This lets shared-KG results pull descriptions/summaries from the bundled
+# vibecoded-orchestrator/knowledge/.node_formats.json while project results
+# still use their own per-project sidecar.
+_node_formats_by_collection: dict[str, dict] = {}
 
 
 def _load_node_formats() -> dict:
-    """Load the .node_formats.json sidecar file. Cached after first load."""
+    """Load the project-KG .node_formats.json sidecar. Cached after first load.
+
+    Looks under KG_BASE_DIR/knowledge/ first, then the cwd-relative path. This
+    is the legacy entry point used everywhere that doesn't carry a collection
+    hint. For collection-aware lookups, prefer ``_load_node_formats_for_collection``.
+    """
     global _node_formats_cache
     if _node_formats_cache is not None:
         return _node_formats_cache
@@ -169,7 +180,8 @@ def _load_node_formats() -> dict:
     for path in candidates:
         if os.path.exists(path):
             try:
-                _node_formats_cache = json.loads(open(path, encoding="utf-8").read())
+                with open(path, encoding="utf-8") as fh:
+                    _node_formats_cache = json.loads(fh.read())
                 logger.info(f"Loaded node formats from {path} ({len(_node_formats_cache)} entries)")
                 return _node_formats_cache
             except Exception as e:
@@ -177,6 +189,57 @@ def _load_node_formats() -> dict:
 
     _node_formats_cache = {}
     return _node_formats_cache
+
+
+def _load_node_formats_for_collection(collection_name: str) -> dict:
+    """Load the .node_formats.json sidecar appropriate for a given collection.
+
+    Resolution rules:
+      - Project KG (KG_COLLECTION) → uses the project sidecar (same as
+        ``_load_node_formats``: KG_BASE_DIR/knowledge/.node_formats.json or
+        cwd/knowledge/.node_formats.json).
+      - Shared KG (SHARED_KG_COLLECTION) → uses the SHARED sidecar bundled
+        with the orchestrator install. Resolution order:
+          1. $SHARED_KG_NODE_FORMATS env override (absolute path, for tests).
+          2. _SERVER_INFERRED_BASE/knowledge/.node_formats.json — the
+             orchestrator's own knowledge/ directory shipped with this server.
+      - Anything else (DEVELOPMENT_COLLECTION, code-graph collections, etc.)
+        → empty dict; sidecar tiers don't apply.
+
+    Caches per-collection to avoid re-reading on every result. Returns {} on
+    miss / parse error so callers can safely treat the result as a dict.
+    """
+    if collection_name in _node_formats_by_collection:
+        return _node_formats_by_collection[collection_name]
+
+    candidates: list[str] = []
+    if collection_name == KG_COLLECTION:
+        # Same resolution as _load_node_formats — keep them in lockstep.
+        if KG_BASE_DIR:
+            candidates.append(os.path.join(KG_BASE_DIR, "knowledge", ".node_formats.json"))
+        candidates.append(os.path.join(os.getcwd(), "knowledge", ".node_formats.json"))
+    elif SHARED_KG_COLLECTION and collection_name == SHARED_KG_COLLECTION:
+        env_override = os.getenv("SHARED_KG_NODE_FORMATS", "")
+        if env_override:
+            candidates.append(env_override)
+        candidates.append(str(_SERVER_INFERRED_BASE / "knowledge" / ".node_formats.json"))
+    # else: no sidecar resolution for unknown collections — fall through.
+
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    data = json.loads(fh.read())
+                _node_formats_by_collection[collection_name] = data
+                logger.info(
+                    f"Loaded node formats for {collection_name} from {path} ({len(data)} entries)"
+                )
+                return data
+            except Exception as e:
+                logger.warning(f"Failed to load node formats from {path}: {e}")
+
+    _node_formats_by_collection[collection_name] = {}
+    return {}
 
 
 def _log_detail_choice(query: str, detail: str, result_count: int) -> None:
@@ -207,19 +270,33 @@ def _log_detail_choice(query: str, detail: str, result_count: int) -> None:
         pass  # Best-effort logging, never block search
 
 
-def _get_node_format(file_path: str, level: str) -> str | None:
+def _get_node_format(file_path: str, level: str, collection_name: str | None = None) -> str | None:
     """Get a pre-generated format for a node.
 
     Args:
         file_path: Relative path (e.g., 'knowledge/tools/leanctx.md')
         level: 'description', 'summary', or 'chunk_summaries'
+        collection_name: Optional collection the result came from. When given,
+            the matching per-collection sidecar is consulted (project vs shared).
+            When omitted, falls back to the legacy single-sidecar lookup so
+            existing callers keep working.
 
     Returns:
         The formatted text (or dict for 'chunk_summaries'), or None if not available.
     """
+    if collection_name:
+        db = _load_node_formats_for_collection(collection_name)
+        entry = db.get(file_path, {})
+        val = entry.get(level) if isinstance(entry, dict) else None
+        if val is not None:
+            return val
+        # If the collection-aware lookup misses but the legacy sidecar has it,
+        # fall through. This covers the case where a result came from a
+        # collection without sidecar support but file_path happens to map into
+        # the project sidecar (rare but cheap to handle).
     db = _load_node_formats()
     entry = db.get(file_path, {})
-    return entry.get(level)
+    return entry.get(level) if isinstance(entry, dict) else None
 
 
 # ---------------------------------------------------------------------------
@@ -272,7 +349,11 @@ def _get_result_verbosity_by_score(score: float) -> str:
     return "full"
 
 
-def _chunk_summaries_header(file_path: str, shown_chunk_nums: list[int] | None = None) -> str:
+def _chunk_summaries_header(
+    file_path: str,
+    shown_chunk_nums: list[int] | None = None,
+    collection_name: str | None = None,
+) -> str:
     """Build a small header listing per-chunk summaries from the sidecar.
 
     Used when assembling partial multi-chunk content (single_chunk / three_chunks
@@ -290,7 +371,7 @@ def _chunk_summaries_header(file_path: str, shown_chunk_nums: list[int] | None =
     """
     if not file_path:
         return ""
-    chunk_summaries = _get_node_format(file_path, "chunk_summaries")
+    chunk_summaries = _get_node_format(file_path, "chunk_summaries", collection_name)
     if not isinstance(chunk_summaries, dict) or not chunk_summaries:
         return ""
 
@@ -381,13 +462,16 @@ def _format_result_by_tier(
     content = result.get("content", "") or ""
     total_chunks = result.get("total_chunks") or 1
     hit_chunk = result.get("chunk_number") or 1
+    # Source collection — set by _format_obj when known. Used to pick the
+    # right sidecar (project vs shared) for descriptions/summaries/chunk maps.
+    source_collection = result.get("source_collection") or result.get("collection")
 
     # Helper to read sidecar respecting an injected db override (used by tests).
     def _sc(level: str):
         if sidecar_db is not None:
             entry = sidecar_db.get(fp, {}) if isinstance(sidecar_db, dict) else {}
             return entry.get(level) if isinstance(entry, dict) else None
-        return _get_node_format(fp, level)
+        return _get_node_format(fp, level, source_collection)
 
     base = {
         "title": title,
@@ -430,7 +514,9 @@ def _format_result_by_tier(
             header_parts.append(f"[Node summary: {node_summary}]")
         # Chunk map header for single_chunk/three_chunks (orient agent across full node).
         if tier in ("single_chunk", "three_chunks"):
-            chunk_map = _chunk_summaries_header(fp, shown_chunk_nums=shown_nums)
+            chunk_map = _chunk_summaries_header(
+                fp, shown_chunk_nums=shown_nums, collection_name=source_collection
+            )
             if chunk_map:
                 # _chunk_summaries_header already trails with \n\n; strip for join below.
                 header_parts.append(chunk_map.rstrip())
@@ -457,7 +543,17 @@ def _format_result_by_tier(
 
 
 KG_COLLECTION = os.getenv("KG_COLLECTION", "ClaudeKnowledgeGraph")
-SHARED_KG_COLLECTION = os.getenv("SHARED_KG_COLLECTION", "")
+# Cross-project shared collection. Defaults to "VibeCodedTools_KnowledgeGraph"
+# (the bundled cross-project KG seeded at install time from
+# vibecoded-orchestrator/knowledge/). Per-project opt-out via
+# SHARED_KG_OPT_OUT=true (see below).
+_SHARED_KG_DEFAULT = "VibeCodedTools_KnowledgeGraph"
+_SHARED_KG_RAW = os.getenv("SHARED_KG_COLLECTION", _SHARED_KG_DEFAULT)
+# Per-project opt-out: when true, the shared collection is treated as if
+# unset for THIS process (no shared-collection queries, no shared writes via
+# scope='shared' fallback). Default false (opt-in by default).
+SHARED_KG_OPT_OUT = os.getenv("SHARED_KG_OPT_OUT", "").lower() in ("1", "true", "yes")
+SHARED_KG_COLLECTION = "" if SHARED_KG_OPT_OUT else _SHARED_KG_RAW
 # Project-specific documentation collection (e.g. ProjectName_development).
 # When set, hybrid_search also searches this collection automatically.
 DEVELOPMENT_COLLECTION = os.getenv("DEVELOPMENT_COLLECTION", "")
@@ -1410,34 +1506,77 @@ async def semantic_graph_search(
 
     fetch_limit = limit * _RL_OVERFETCH
 
-    # Get primary results (over-fetched for RL)
-    if EMBEDDING_SOURCE == "weaviate":
-        primary = coll.query.near_text(
-            query=query,
-            limit=fetch_limit,
-            return_metadata=["distance"]
-        )
-    else:
-        vector, target_name = await _get_search_vector(query)
-        nv_kwargs = dict(
-            near_vector=vector, limit=fetch_limit, return_metadata=["distance"]
-        )
-        if target_name:
-            nv_kwargs["target_vector"] = target_name
-        primary = coll.query.near_vector(**nv_kwargs)
+    # Determine all collections to search. Mirrors hybrid_search: project KG +
+    # shared KG (when configured and not opted out). We do NOT include
+    # DEVELOPMENT_COLLECTION here — graph traversal relies on WikiLinks which
+    # are a knowledge-graph convention, not present in dev docs.
+    collections_to_search: list[str] = [KG_COLLECTION]
+    if SHARED_KG_COLLECTION and SHARED_KG_COLLECTION != KG_COLLECTION:
+        collections_to_search.append(SHARED_KG_COLLECTION)
 
-    # Format all over-fetched results
-    all_formatted = [
-        _format_obj(obj, KG_COLLECTION, obj.metadata.distance)
-        for obj in primary.objects
-    ]
-    all_formatted = _enrich_with_adjacent_chunks(coll, all_formatted, KG_COLLECTION)
+    # Per-collection handle cache (shared with the connected-node lookup below).
+    coll_handles: dict[str, object] = {KG_COLLECTION: coll}
+
+    def _coll_for(name: str):
+        if not name:
+            return None
+        if name in coll_handles:
+            return coll_handles[name]
+        try:
+            handle = client.collections.get(name)
+            coll_handles[name] = handle
+            return handle
+        except Exception as exc:
+            logger.debug("semantic_graph_search: collection '%s' unavailable (%s)", name, exc)
+            coll_handles[name] = None
+            return None
+
+    # Run the semantic search across each collection and collect raw
+    # ``(obj, collection_name)`` pairs so we can later rebuild WikiLinks from
+    # the actual hit objects (regardless of source collection).
+    all_formatted: list[dict] = []
+    raw_primary: list[tuple[object, str]] = []
+    for coll_name in collections_to_search:
+        handle = _coll_for(coll_name)
+        if handle is None:
+            continue
+        try:
+            if EMBEDDING_SOURCE == "weaviate":
+                primary = handle.query.near_text(
+                    query=query,
+                    limit=fetch_limit,
+                    return_metadata=["distance"]
+                )
+            else:
+                vector, target_name = await _get_search_vector(query)
+                nv_kwargs = dict(
+                    near_vector=vector, limit=fetch_limit, return_metadata=["distance"]
+                )
+                if target_name:
+                    nv_kwargs["target_vector"] = target_name
+                primary = handle.query.near_vector(**nv_kwargs)
+        except Exception as exc:
+            logger.warning(f"semantic_graph_search: error searching {coll_name}: {exc}")
+            continue
+
+        # Format all over-fetched results from this collection
+        coll_formatted = [
+            _format_obj(obj, coll_name, obj.metadata.distance)
+            for obj in primary.objects
+        ]
+        coll_formatted = _enrich_with_adjacent_chunks(handle, coll_formatted, coll_name)
+        all_formatted.extend(coll_formatted)
+        for obj in primary.objects:
+            raw_primary.append((obj, coll_name))
 
     # Preserve a normalised score (1 - distance) so per-result tiering works.
     for r in all_formatted:
         if "score" not in r:
             d = r.get("distance")
             r["score"] = (1.0 - d) if isinstance(d, (int, float)) else 0.0
+
+    # Sort merged candidates by score so RL sees a clean list (top-k semantics).
+    all_formatted.sort(key=lambda x: x.get("score", 0.0), reverse=True)
 
     # RL: rerank + cache using all over-fetched nodes; return top-k primary results.
     task_id = str(uuid.uuid4())
@@ -1448,6 +1587,8 @@ async def semantic_graph_search(
             r["score"] = (1.0 - d) if isinstance(d, (int, float)) else 0.0
 
     # Apply tiering to primary results (mirrors hybrid_search behaviour).
+    # Use per-result collection so chunk fetch and sidecar lookup go to the
+    # right place when results come from the shared KG.
     legacy_aliases = {"descriptions": "summary"}
     primary_formatted: list[dict] = []
     for r in primary_results:
@@ -1457,36 +1598,54 @@ async def semantic_graph_search(
             tier = legacy_aliases.get(detail, detail)
         if tier == "discard":
             continue
-        entry = _format_result_by_tier(r, tier, sidecar_db=None, coll=coll)
+        result_coll_name = r.get("collection") or KG_COLLECTION
+        entry = _format_result_by_tier(
+            r, tier, sidecar_db=None, coll=_coll_for(result_coll_name)
+        )
         if entry is not None:
             primary_formatted.append(entry)
 
-    # Extract WikiLinks only from the top-k returned to Claude
+    # Extract WikiLinks only from the top-k returned to Claude. We sort the
+    # raw_primary list by distance so the "top-k" heuristic is honoured even
+    # though we merged across collections.
+    raw_primary.sort(key=lambda pair: pair[0].metadata.distance if pair[0].metadata else 1.0)
     connected_titles = set()
-    for obj in primary.objects[:limit]:
+    for obj, _src in raw_primary[:limit]:
         content = obj.properties.get("content", "")
         wikilinks = re.findall(r'\[\[(?:[^:]+::)?([^\]]+)\]\]', content)
         connected_titles.update(wikilinks)
 
     # Query connected nodes (exact title match — these are graph neighbours,
-    # not search hits, so they have no native distance/score).
-    connected_raw = []
+    # not search hits, so they have no native distance/score). Search BOTH
+    # collections for each title; first hit wins (project KG takes priority
+    # because it appears first in collections_to_search).
+    connected_raw: list[dict] = []
+    connected_seen_titles: set[str] = set()
     if connected_titles and depth > 1:
         for title in list(connected_titles)[:10]:
-            try:
-                results = coll.query.fetch_objects(
-                    filters=Filter.by_property("title").equal(title),
-                    limit=1
-                )
-                if results.objects:
-                    obj = results.objects[0]
-                    formatted = _format_obj(obj, KG_COLLECTION, distance=None)
-                    connected_raw.append(formatted)
-            except Exception as e:
-                logger.warning(f"Failed to fetch connected node '{title}': {e}")
-
-    if connected_raw:
-        connected_raw = _enrich_with_adjacent_chunks(coll, connected_raw, KG_COLLECTION)
+            for coll_name in collections_to_search:
+                if title in connected_seen_titles:
+                    break
+                handle = _coll_for(coll_name)
+                if handle is None:
+                    continue
+                try:
+                    results = handle.query.fetch_objects(
+                        filters=Filter.by_property("title").equal(title),
+                        limit=1
+                    )
+                    if results.objects:
+                        obj = results.objects[0]
+                        formatted = _format_obj(obj, coll_name, distance=None)
+                        # Per-collection chunk enrichment so adjacent chunks
+                        # come from the right collection.
+                        formatted = _enrich_with_adjacent_chunks(
+                            handle, [formatted], coll_name
+                        )[0]
+                        connected_raw.append(formatted)
+                        connected_seen_titles.add(title)
+                except Exception as e:
+                    logger.warning(f"Failed to fetch connected node '{title}' from {coll_name}: {e}")
 
     # Decision: connected nodes always render at "summary" tier.
     #
@@ -1507,11 +1666,17 @@ async def semantic_graph_search(
             tier = detail
         else:
             tier = "summary"
-        entry = _format_result_by_tier(r, tier, sidecar_db=None, coll=coll)
+        result_coll_name = r.get("collection") or KG_COLLECTION
+        entry = _format_result_by_tier(
+            r, tier, sidecar_db=None, coll=_coll_for(result_coll_name)
+        )
         if entry is not None:
             connected_nodes.append(entry)
 
-    logger.info(f"semantic_graph_search: {len(primary_formatted)} primary + {len(connected_nodes)} connected")
+    logger.info(
+        f"semantic_graph_search: {len(primary_formatted)} primary + "
+        f"{len(connected_nodes)} connected across {collections_to_search}"
+    )
     return _large_result({
         "success": True,
         "primary_results": primary_formatted,
@@ -1519,6 +1684,7 @@ async def semantic_graph_search(
         "query": query,
         "depth": depth,
         "detail": detail,
+        "collections_searched": collections_to_search,
     })
 
 
@@ -1730,16 +1896,31 @@ async def hybrid_search(
         if "score" not in r:
             r["score"] = r.get("combined_score", 0.0)
 
-    # Get a collection handle for multi-chunk assembly (used by single_chunk /
-    # three_chunks / full tiers). Use KG_COLLECTION as the canonical home;
-    # results from SHARED_KG / DEVELOPMENT collections will fall back to the
-    # 300-char snippet if their title isn't found in KG_COLLECTION.
-    coll_for_chunks = None
+    # Get collection handles for multi-chunk assembly. We need ONE handle per
+    # source collection because results may come from KG_COLLECTION OR
+    # SHARED_KG_COLLECTION; fetching chunks from the wrong collection returns
+    # nothing and forces a snippet fallback. Cache handles to avoid repeat
+    # client lookups inside the loop.
+    coll_handles: dict[str, object] = {}
     try:
         client = get_weaviate_client()
-        coll_for_chunks = client.collections.get(KG_COLLECTION)
     except Exception as exc:
-        logger.debug("hybrid_search: chunk-fetch collection unavailable (%s)", exc)
+        logger.debug("hybrid_search: weaviate client unavailable (%s)", exc)
+        client = None
+
+    def _coll_for(name: str):
+        if not name or client is None:
+            return None
+        if name in coll_handles:
+            return coll_handles[name]
+        try:
+            handle = client.collections.get(name)
+            coll_handles[name] = handle
+            return handle
+        except Exception as exc:
+            logger.debug("hybrid_search: collection '%s' unavailable (%s)", name, exc)
+            coll_handles[name] = None
+            return None
 
     # Apply detail level. "auto" → per-result tier from score; explicit value →
     # uniform across all results.
@@ -1758,7 +1939,11 @@ async def hybrid_search(
         # behaviour was "300-char snippet". The new "full" tier additionally
         # assembles chunks for chunked nodes — strictly more useful, no regression
         # for unchunked nodes (still returns the snippet via the fallback path).
-        entry = _format_result_by_tier(r, tier, sidecar_db=None, coll=coll_for_chunks)
+        # Pick the chunk-fetch collection from the result's source — without
+        # this, shared-KG hits would fall back to snippet because their chunks
+        # don't live in KG_COLLECTION.
+        result_coll = r.get("collection") or KG_COLLECTION
+        entry = _format_result_by_tier(r, tier, sidecar_db=None, coll=_coll_for(result_coll))
         if entry is not None:
             formatted.append(entry)
     results = formatted
@@ -3180,7 +3365,10 @@ async def backfill_embeddings(
 if __name__ == "__main__":
     logger.info(f"Starting Claude Orchestrator Weaviate MCP Server")
     logger.info(f"Primary Collection: {KG_COLLECTION}")
-    logger.info(f"Shared Collection: {SHARED_KG_COLLECTION if SHARED_KG_COLLECTION else 'None'}")
+    if SHARED_KG_OPT_OUT:
+        logger.info(f"Shared Collection: opted out via SHARED_KG_OPT_OUT (would have been '{_SHARED_KG_RAW}')")
+    else:
+        logger.info(f"Shared Collection: {SHARED_KG_COLLECTION if SHARED_KG_COLLECTION else 'None'}")
     logger.info(f"Dual Embedding: {DUAL_EMBEDDING_ENABLED} (active: {ACTIVE_EMBEDDING})")
     logger.info(f"Weaviate: {WEAVIATE_URL}")
     logger.info(f"Code Graph Project: {CODE_GRAPH_PROJECT if CODE_GRAPH_PROJECT else '(all projects)'}")

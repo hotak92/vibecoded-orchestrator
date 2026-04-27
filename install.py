@@ -422,10 +422,9 @@ def _detect_apple_silicon() -> bool:
 
 
 def _detect_container_runtime() -> str:
-    """Detect Docker or Podman. Prefer Podman on Linux, Docker elsewhere."""
-    os_name = platform.system()
-    # Order: Linux prefers Podman (no commercial license needed)
-    candidates = ["podman", "docker"] if os_name == "Linux" else ["docker", "podman"]
+    """Detect Docker or Podman. Prefer Podman everywhere — no commercial
+    license required, increasingly native on macOS/Windows."""
+    candidates = ["podman", "docker"]
 
     for cmd in candidates:
         if shutil.which(cmd):
@@ -463,7 +462,7 @@ def _detect_optional_companions(args: argparse.Namespace) -> bool:
     # lean-ctx (optional — wires BASH_ENV so non-interactive Bash subprocesses
     # get ~90-97% command-output compression, same as the interactive shell hook)
     shim_path = PROJECT_ROOT / ".claude" / "scripts" / "leanctx-bash-env.sh"
-    if shutil.which("lean-ctx") or Path(Path.home() / ".cargo/bin/lean-ctx").exists():
+    if shutil.which("lean-ctx"):
         print("  lean-ctx: detected — wiring BASH_ENV for non-interactive compression")
         # Write BASH_ENV into .claude/settings.json at install time.
         # _configure_claude_settings runs later (Step 9), so we patch the env block
@@ -571,10 +570,10 @@ def _install_joern() -> bool:
 
         joern_bin = install_dir / "joern-cli"
         if joern_bin.exists():
-            os.environ["PATH"] = f"{joern_bin}:{os.environ.get('PATH', '')}"
+            os.environ["PATH"] = f"{joern_bin}{os.pathsep}{os.environ.get('PATH', '')}"
             print(f"            Joern installed at {joern_bin}")
             print(f"            To use joern outside this installer, add to your shell rc:")
-            print(f"              export PATH=\"{joern_bin}:$PATH\"")
+            print(f"              export PATH=\"{joern_bin}{os.pathsep}$PATH\"")
             return shutil.which("joern") is not None
 
         print(f"            Joern installer ran but joern-cli not at {joern_bin}")
@@ -1085,6 +1084,13 @@ def _ensure_collections(embed_config: dict) -> None:
     weaviate_url = f"http://localhost:{weaviate_port}"
     kg_name = os.environ.get("KG_COLLECTION", "KnowledgeGraph")
     dev_name = os.environ.get("DEVELOPMENT_COLLECTION", "Development")
+    # Cross-project shared KG. All vibecoded installs read from the same shared
+    # collection name (default "VibeCodedTools_KnowledgeGraph"); the projects
+    # only differ in their per-project KG. Bootstrapped once per Weaviate
+    # instance — re-runs are no-ops thanks to the existing-class detection.
+    shared_name = os.environ.get(
+        "SHARED_KG_COLLECTION", "VibeCodedTools_KnowledgeGraph"
+    ) or ""
 
     print(f"[7b/10] Checking Weaviate collections at {weaviate_url} ... ", flush=True)
 
@@ -1108,6 +1114,12 @@ def _ensure_collections(embed_config: dict) -> None:
         (kg_name, _kg_class_definition),
         (dev_name, _development_class_definition),
     ]
+    # Shared cross-project KG. Same schema as the per-project KG (the MCP
+    # server reads them with the same shape). Created once per Weaviate
+    # instance — the existing-class check above means concurrent installs
+    # don't double-create.
+    if shared_name and shared_name != kg_name:
+        required.append((shared_name, _kg_class_definition))
 
     missing = [(n, b) for (n, b) in required if n not in existing]
     if not missing:
@@ -1224,6 +1236,56 @@ def _seed_weaviate(args: argparse.Namespace) -> None:
     else:
         print(f"  ! upload_docs.py not found at {upload_docs}")
 
+    # 3. Cross-project shared KG seed (Step 7d).
+    #
+    # Re-runs sync_knowledge_graph.py against the SHARED collection so
+    # vibecoded-orchestrator/knowledge/ is also persisted into
+    # VibeCodedTools_KnowledgeGraph. All projects on this machine then read
+    # from this shared collection in addition to their per-project KG (see
+    # weaviate_mcp/server.py: SHARED_KG_COLLECTION).
+    #
+    # Idempotency: sync_knowledge_graph.py upserts per file (delete+insert
+    # by file_path), so re-running on unchanged content yields the same
+    # collection state. The cost on a 50-node tree is ~30s on warm Ollama.
+    #
+    # Honor SHARED_KG_OPT_OUT=true at install time too (skip seeding) so
+    # power-users who explicitly disabled the shared KG don't get it
+    # re-populated by a subsequent install / update.
+    shared_opt_out = os.environ.get("SHARED_KG_OPT_OUT", "").lower() in ("1", "true", "yes")
+    shared_collection = os.environ.get(
+        "SHARED_KG_COLLECTION", "VibeCodedTools_KnowledgeGraph"
+    )
+    if shared_opt_out:
+        print("  → shared KG seed: skipped (SHARED_KG_OPT_OUT=true)")
+    elif not shared_collection:
+        print("  → shared KG seed: skipped (SHARED_KG_COLLECTION empty)")
+    elif sync_kg.exists():
+        print(f"  → knowledge/ → {shared_collection} (shared) ...", flush=True)
+        # Pass the override via subprocess env so the script writes into the
+        # shared collection without us having to special-case its argparse.
+        # The script reads KG_COLLECTION via os.getenv at module top-level,
+        # so a fresh subprocess picks up the override cleanly.
+        seed_env = os.environ.copy()
+        seed_env["KG_COLLECTION"] = shared_collection
+        # Keep KG_BASE_DIR pointed at the orchestrator root so file_path
+        # resolution still finds the bundled knowledge/ tree.
+        seed_env["KG_BASE_DIR"] = str(PROJECT_ROOT)
+        try:
+            subprocess.run(
+                [str(venv_py), str(sync_kg), "--all"],
+                check=True,
+                cwd=str(PROJECT_ROOT),
+                timeout=600,
+                env=seed_env,
+            )
+        except subprocess.CalledProcessError as e:
+            print(f"    ! shared KG seed exited {e.returncode} — re-run later with "
+                  f"`KG_COLLECTION={shared_collection} kg-sync --all`")
+        except subprocess.TimeoutExpired:
+            print("    ! shared KG seed timed out (>10 min)")
+        except FileNotFoundError as e:
+            print(f"    ! shared KG seed failed: {e}")
+
     print("  OK (seed step complete; per-script errors are non-fatal — see hints above)")
 
 
@@ -1317,6 +1379,13 @@ def _write_env_config(embed_config: dict, args: argparse.Namespace, joern_availa
         "KG_COLLECTION=KnowledgeGraph",
         "DEVELOPMENT_COLLECTION=Development",
         "",
+        "# Cross-project shared KG (all projects on this machine read from it",
+        "# alongside their own KG). Seeded at install time from",
+        "# vibecoded-orchestrator/knowledge/. Set SHARED_KG_OPT_OUT=true to",
+        "# disable the shared collection per-project.",
+        "SHARED_KG_COLLECTION=VibeCodedTools_KnowledgeGraph",
+        "SHARED_KG_OPT_OUT=false",
+        "",
     ]
 
     if embed_config.get("openai_key"):
@@ -1383,6 +1452,8 @@ def _configure_claude_settings(embed_config: dict) -> None:
         "ACTIVE_EMBEDDING": "qwen3",
         "KG_COLLECTION": "KnowledgeGraph",
         "DEVELOPMENT_COLLECTION": "Development",
+        "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
+        "SHARED_KG_OPT_OUT": "false",
         "CODE_EMBED_BACKEND": embed_config["code_backend"],
         "CODE_EMBED_SERVICE_URL": f"http://localhost:{code_embed_port}",
     }

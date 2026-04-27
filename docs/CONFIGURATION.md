@@ -47,6 +47,24 @@ It prevents cross-contamination. Global settings apply to every project you open
 
 If you see any of these in your global `~/.claude/settings.json`, move them to the per-project config. They're leaking.
 
+## Knowledge graph env vars
+
+The MCP server (`claude_mcp_servers/weaviate_mcp/server.py`) reads these on startup. They're written to all three per-project surfaces (VS Code `claude-code.env`, `.claude/env`, `.claude/settings.json::env`) by the launcher's `write_project_env_files`.
+
+| Var | Default | What it does |
+|---|---|---|
+| `KG_COLLECTION` | `<ProjectName>` | Per-project Weaviate collection. Knowledge nodes from `knowledge/` land here. |
+| `DEVELOPMENT_COLLECTION` | `<ProjectName>_development` | Per-project Weaviate collection for `docs/`. |
+| `CONVERSATION_COLLECTION` | `<ProjectName>_conversations` | Reserved for future chat history; not auto-populated in v1.0. |
+| `SHARED_KG_COLLECTION` | `VibeCodedTools_KnowledgeGraph` | Cross-project shared KG. All projects on this machine query it alongside their own KG. Seeded by `install.py` Step 7d from `vibecoded-orchestrator/knowledge/`. |
+| `SHARED_KG_OPT_OUT` | `false` | Per-project opt-out. Set to `true` (or `1`/`yes`) to disable shared-KG queries for this project. The shared collection itself is unaffected — other projects keep using it. |
+| `SHARED_KG_NODE_FORMATS` | (unset) | Override path for the shared KG's `.node_formats.json` sidecar. Used by tests; in production the sidecar is read from `<orchestrator>/knowledge/.node_formats.json` via `_SERVER_INFERRED_BASE`. |
+| `KG_TIER_MIN` / `KG_TIER_SINGLE_CHUNK` / `KG_TIER_THREE_CHUNKS` / `KG_TIER_FULL` | `0.42` / `0.55` / `0.65` / `0.75` | Score thresholds for the auto-tier retrieval system. See `knowledge/concepts/score-driven-retrieval-tiers.md`. |
+
+**Opt-out semantics**: `SHARED_KG_OPT_OUT=true` zeros `SHARED_KG_COLLECTION` for this MCP process. `hybrid_search` / `semantic_graph_search` then skip the dual-collection merge entirely. Writes via `store_knowledge_node(scope="shared")` fall back to writing to the project KG (no silent black-hole writes).
+
+**Power-user override**: point `SHARED_KG_COLLECTION` at a private team-shared collection (e.g. `AcmeTeam_SharedKG`) to share knowledge across an internal team without exposing it via the public bundled name.
+
 ## Agents and skills
 
 See [templates/README.md](../templates/README.md) for the tier split (free vs MAO) and install-flag reference.

@@ -94,7 +94,13 @@ pub async fn kg_list_collections(
             .cloned()
             .unwrap_or_else(|| "none".to_string());
         let node_count = fetch_class_count(&client, &name).await.unwrap_or(0);
-        let is_shared = name == "sharedVCT" || name.to_lowercase().contains("shared");
+        // Recognize the canonical cross-project KG name shipped by the
+        // orchestrator (VibeCodedTools_KnowledgeGraph). Falls back to the
+        // historical "shared" substring heuristic + legacy "sharedVCT" name
+        // for back-compat with older installs / custom setups.
+        let is_shared = name == "VibeCodedTools_KnowledgeGraph"
+            || name == "sharedVCT"
+            || name.to_lowercase().contains("shared");
         out.push(KgCollectionAccess {
             name,
             node_count,
