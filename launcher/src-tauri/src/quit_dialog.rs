@@ -131,3 +131,94 @@ async fn stop_services<R: Runtime>(_app: &AppHandle<R>) -> Result<(), String> {
     eprintln!("[vct] stop_services: STUB (container-lifecycle agent will wire this)");
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    //! Tests for the force-quit short-circuit flag.
+    //!
+    //! These tests serialize on the global `FORCE_QUIT` flag (it's a
+    //! process-wide AtomicBool) so they MUST mutate-and-restore inside a
+    //! mutex to stay deterministic when the test binary runs them in
+    //! parallel. We use `Mutex` from std rather than a fancy fixture
+    //! crate to keep the dependency surface unchanged.
+
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes access to the global FORCE_QUIT flag so parallel tests
+    /// don't observe each other's mutations.
+    static SERIALIZE: Mutex<()> = Mutex::new(());
+
+    fn reset_flag() {
+        FORCE_QUIT.store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn force_quit_sets_skip_dialog_flag() {
+        let _g = SERIALIZE.lock().unwrap();
+        reset_flag();
+
+        assert!(
+            !should_skip_dialog(),
+            "flag must start cleared before force_quit() is called"
+        );
+        force_quit();
+        assert!(
+            should_skip_dialog(),
+            "should_skip_dialog() must return true once force_quit() ran"
+        );
+
+        reset_flag();
+    }
+
+    #[test]
+    fn should_skip_dialog_defaults_to_false() {
+        let _g = SERIALIZE.lock().unwrap();
+        reset_flag();
+        assert!(
+            !should_skip_dialog(),
+            "freshly reset flag must report false"
+        );
+    }
+
+    #[test]
+    fn force_quit_is_idempotent() {
+        let _g = SERIALIZE.lock().unwrap();
+        reset_flag();
+        force_quit();
+        force_quit();
+        force_quit();
+        assert!(
+            should_skip_dialog(),
+            "calling force_quit multiple times must not toggle the flag back"
+        );
+        reset_flag();
+    }
+
+    #[test]
+    fn button_labels_are_unique_and_nonempty() {
+        // Regression: if two button labels collide, the dispatch arms in
+        // `confirm_and_quit` would route ambiguously. Also catches an
+        // accidental empty string (which the dialog plugin rejects on
+        // some platforms).
+        let labels = [BTN_QUIT, BTN_TRAY, BTN_CANCEL];
+        for l in labels.iter() {
+            assert!(!l.is_empty(), "button label must not be empty");
+        }
+        assert_ne!(BTN_QUIT, BTN_TRAY);
+        assert_ne!(BTN_QUIT, BTN_CANCEL);
+        assert_ne!(BTN_TRAY, BTN_CANCEL);
+    }
+
+    #[test]
+    fn dialog_title_and_body_are_nonempty() {
+        // Sanity check on the user-visible strings — empty title/body
+        // breaks the dialog on Windows.
+        assert!(!TITLE.trim().is_empty());
+        assert!(!BODY.trim().is_empty());
+    }
+}
