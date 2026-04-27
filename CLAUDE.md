@@ -533,3 +533,14 @@ Claude Code can authenticate either via API key (`ANTHROPIC_API_KEY`) or via cla
 - Plan mode: `claude --plan` or `/plan` — read-only exploration before implementation
 - Compact with focus: `/compact focus on <topic>`
 - Fix from PR: `claude --from-pr <PR-URL>` — auto-loads PR diff as context
+
+## Lean-ctx Shell Compression
+
+`lean-ctx` (MIT, zero telemetry) compresses CLI output by 90-97% by wrapping common commands (`git`, `npm`, `pip`, `grep`, `ls`, etc.) and stripping boilerplate, progress bars, and redundant lines. In interactive shells this is handled by `~/.bashrc`. For Claude Code's non-interactive Bash subprocesses (which never source `~/.bashrc`), the shim `.claude/scripts/leanctx-bash-env.sh` is sourced automatically via the `BASH_ENV` env var set in `.claude/settings.json`. The compression is transparent — commands behave identically, output is just much shorter.
+
+**Bypass options** (use either when you need raw output):
+- `LEAN_CTX_OFF=1 some-command` — one-shot disable for that invocation
+- `lean-ctx bypass "some-command"` — explicit bypass via lean-ctx itself
+
+**Shim location**: `.claude/scripts/leanctx-bash-env.sh` (idempotent, safe no-op if lean-ctx not installed)
+**install.py**: automatically wires BASH_ENV into `.claude/settings.json` when lean-ctx is detected at install time

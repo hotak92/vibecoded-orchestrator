@@ -460,13 +460,24 @@ def _detect_optional_companions(args: argparse.Namespace) -> bool:
     """
     print("\n[2b/10] Optional companions ...")
 
-    # lean-ctx (hint only — global tool, opt-in install)
-    if shutil.which("lean-ctx"):
-        print("  lean-ctx: detected (per-user global; integrations may use it)")
+    # lean-ctx (optional — wires BASH_ENV so non-interactive Bash subprocesses
+    # get ~90-97% command-output compression, same as the interactive shell hook)
+    shim_path = PROJECT_ROOT / ".claude" / "scripts" / "leanctx-bash-env.sh"
+    if shutil.which("lean-ctx") or Path(Path.home() / ".cargo/bin/lean-ctx").exists():
+        print("  lean-ctx: detected — wiring BASH_ENV for non-interactive compression")
+        # Write BASH_ENV into .claude/settings.json at install time.
+        # _configure_claude_settings runs later (Step 9), so we patch the env block
+        # directly here so Step 9 picks it up when it serialises the settings dict.
+        # Store the resolved path as a module-level side-effect the step-9 function
+        # can read.  We use a simple module attribute (cleaner than a global dict).
+        import install as _self  # noqa: PLC0415 — self-reference, safe in __main__
+        _self._LEAN_CTX_BASH_ENV = str(shim_path)
+        print(f"  lean-ctx: BASH_ENV will point to {shim_path}")
     else:
-        print("  lean-ctx: not installed (optional, recommended for token savings)")
+        print("  lean-ctx: not installed (optional, recommended for ~95% token savings on CLI output)")
         print("            install:  cargo install lean-ctx")
-        print("            then re-run this installer")
+        print("              or:     curl -fsSL https://leanctx.com/install.sh | sh")
+        print("            then re-run this installer to wire BASH_ENV")
 
     # Joern (CFG/PDG metrics for code graph)
     joern_path = shutil.which("joern")
@@ -1364,6 +1375,27 @@ def _configure_claude_settings(embed_config: dict) -> None:
     ollama_port = os.environ.get("OLLAMA_PORT", str(DEFAULT_OLLAMA_PORT))
     code_embed_port = os.environ.get("CODE_EMBED_PORT", str(DEFAULT_CODE_EMBED_PORT))
 
+    env_block: dict[str, str] = {
+        "WEAVIATE_URL": f"http://localhost:{weaviate_port}",
+        "OLLAMA_URL": f"http://localhost:{ollama_port}",
+        "GRPC_PORT": str(weaviate_grpc),
+        "EMBEDDING_MODEL": embed_config["text_model"],
+        "ACTIVE_EMBEDDING": "qwen3",
+        "KG_COLLECTION": "KnowledgeGraph",
+        "DEVELOPMENT_COLLECTION": "Development",
+        "CODE_EMBED_BACKEND": embed_config["code_backend"],
+        "CODE_EMBED_SERVICE_URL": f"http://localhost:{code_embed_port}",
+    }
+
+    # Wire lean-ctx BASH_ENV if the binary was detected in step 2b.
+    # This makes non-interactive Bash subprocesses (Claude Code Bash tool) source
+    # the alias shim, giving the same ~90-97% output compression as interactive shells.
+    import install as _self  # noqa: PLC0415
+    bash_env_path = getattr(_self, "_LEAN_CTX_BASH_ENV", None)
+    if bash_env_path:
+        env_block["BASH_ENV"] = bash_env_path
+        print(f"  Claude settings: BASH_ENV set to {bash_env_path}")
+
     settings = {
         "permissions": {
             "allow": [
@@ -1372,17 +1404,7 @@ def _configure_claude_settings(embed_config: dict) -> None:
                 "Bash(.claude/scripts/*)",
             ],
         },
-        "env": {
-            "WEAVIATE_URL": f"http://localhost:{weaviate_port}",
-            "OLLAMA_URL": f"http://localhost:{ollama_port}",
-            "GRPC_PORT": str(weaviate_grpc),
-            "EMBEDDING_MODEL": embed_config["text_model"],
-            "ACTIVE_EMBEDDING": "qwen3",
-            "KG_COLLECTION": "KnowledgeGraph",
-            "DEVELOPMENT_COLLECTION": "Development",
-            "CODE_EMBED_BACKEND": embed_config["code_backend"],
-            "CODE_EMBED_SERVICE_URL": f"http://localhost:{code_embed_port}",
-        },
+        "env": env_block,
     }
 
     settings_file.write_text(

@@ -252,6 +252,10 @@ The entire repository is licensed under **[AGPL-3.0-or-later](LICENSE)**. There 
 
 **How the commercial model works**: free source under AGPL, plus paid binaries delivered via signed-URL CDN. Pro and MAO are subscriptions distributed as pre-compiled, Ed25519-signed artifacts gated by Lemon Squeezy — subscribers receive binaries, not source. No source license applies to those artifacts because no source is published for them. The license validator and telemetry components in this repo (`VCThelpers/`) are AGPL like the rest; the trust root for paid-module access is server-side (Supabase + Lemon Squeezy + signature verification on download).
 
+## Recommended Companions
+
+**[lean-ctx](https://github.com/yvgude/lean-ctx)** — MIT license, zero telemetry. Wraps common CLI commands (`git`, `npm`, `pip`, `grep`, `ls`, etc.) and compresses their output by 90-97% by stripping boilerplate, progress bars, and redundant lines. This translates directly to shorter Claude context windows, lower token costs, and faster responses. The installer detects lean-ctx automatically and wires it into Claude Code's non-interactive Bash subprocesses via `BASH_ENV`; if you install it later, re-run `install.py` to activate. Install: `cargo install lean-ctx` or `curl -fsSL https://leanctx.com/install.sh | sh`.
+
 ## Contributing
 
 Contributions welcome — small fixes and bug reports especially. See [CONTRIBUTING.md](CONTRIBUTING.md) for the workflow and [CLA.md](CLA.md) for the Contributor License Agreement (accepted via `git commit -s`).
