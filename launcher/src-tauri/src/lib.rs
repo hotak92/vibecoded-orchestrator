@@ -4,6 +4,7 @@ mod hub;
 mod installer_engine;
 mod manifest;
 mod mcp_registration;
+mod quit_dialog;
 mod registry;
 mod secrets;
 mod state;
@@ -53,6 +54,20 @@ pub fn run() {
                 eprintln!("[vct] tray setup failed: {}", e);
             }
             Ok(())
+        })
+        // Intercept window-close (X / Cmd+Q) on the main window. We
+        // prevent the default close, then defer to the same confirmation
+        // dialog used by the tray Quit item. Programmatic quits set the
+        // FORCE_QUIT flag (see quit_dialog::force_quit) and bypass.
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                use tauri::Manager;
+                if window.label() == "main" && !quit_dialog::should_skip_dialog() {
+                    api.prevent_close();
+                    let app = window.app_handle().clone();
+                    quit_dialog::confirm_and_quit(&app);
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             // Lifecycle (existing, unchanged)
