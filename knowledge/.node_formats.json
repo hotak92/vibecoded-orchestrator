@@ -73,30 +73,6 @@
     "content_hash": "3f11ad4db1ef73fa",
     "backend": "cli"
   },
-  "knowledge/patterns/ml-confidence-propagation.md": {
-    "title": "ML Confidence Propagation Pattern",
-    "description": "**ML Confidence Propagation Pattern** ensures derived measurements maintain connection to source uncertainty by propagating ML model confidence scores through calculations. The core principle is that derived confidence cannot exceed its least confident component; the recommended formula balances optimistic (simple average) and conservative (product) estimates as `(simple_avg + product) / 2`, preventing one low-confidence keypoint from being masked by high-confidence neighbors. Implementation involves collecting all relevant ML confidences, then applying the formula before returning final predictions. Critical for applications like pose detection where claiming high confidence from uncertain keypoints leads to false positives.",
-    "summary": "Propagates ML keypoint confidences through derived measurements using a balanced formula [(simple_avg + product) / 2] to prevent false high-confidence detections from uncertain source keypoints; the core principle is that derived confidence cannot exceed the confidence of its least certain component.",
-    "generated_at": "2026-04-27T03:03:49.119615+00:00",
-    "content_hash": "bcb9a586d779ed62",
-    "backend": "cli"
-  },
-  "knowledge/models/smolvlm-2b.md": {
-    "title": "SmolVLM-2B",
-    "description": "SmolVLM-2B is a lightweight 2-billion-parameter vision-language model for fast image captioning and filtering. It runs on ~2.5GB VRAM in 4-bit GGUF format via llama.cpp, processing images in under 1 second with good quality for simple caption generation. The model integrates as an always-loaded service through llama.cpp Python bindings to avoid warm-up latency. Use it for real-time image batch processing, web scanning, and preliminary filtering tasks before more resource-intensive analysis.",
-    "summary": "SmolVLM-2B is a 2-billion-parameter vision-language model that performs image captioning in <1 second using 4-bit GGUF quantization with ~2.5GB VRAM, optimized for fast batch image processing and filtering via llama.cpp. Best suited for rapid image scanning and simple captions; slower alternative (MiniCPM-V-2.6) offers better quality at the cost of latency.",
-    "generated_at": "2026-04-27T03:04:01.992000+00:00",
-    "content_hash": "c83a5f02b1e5b790",
-    "backend": "cli"
-  },
-  "knowledge/models/florence-2.md": {
-    "title": "Florence-2",
-    "description": "Florence-2 is a lightweight vision foundation model by Microsoft that unifies dozens of computer vision tasks through a single prompt-based architecture, eliminating the need for specialized task-specific models. Built on a DaViT image encoder and Transformer text decoder, it processes image + text prompts (e.g., `<CAPTION>`, `<OD>`, `<OCR>`) and outputs structured text including bounding boxes via special tokens. The base model (232M params) and large variant (771M) fit comfortably on consumer GPUs (2–4GB VRAM), trained on FLD-5B with 5.4 billion annotations across 126 million images. It achieves state-of-the-art zero-shot performance on captioning, detection, and grounding while maintaining a fraction of the footprint of specialist models, making it practical for resource-constrained multi-task vision workloads.",
-    "summary": "Florence-2 is a unified vision foundation model (Microsoft, 2024) that handles 10+ computer vision tasks—captioning, detection, OCR, grounding—through a single text-prompt interface, proving that a single small model (232M–771M params) can match or exceed specialized task-specific models. Trained on FLD-5B (5.4B annotations) with DaViT encoder + Transformer decoder, it achieves SOTA zero-shot performance on captioning and grounding while fitting in 2–4GB VRAM and remaining highly fine-tunable for custom domains.",
-    "generated_at": "2026-04-27T03:04:20.108887+00:00",
-    "content_hash": "d277a4d60ebde6b2",
-    "backend": "cli"
-  },
   "knowledge/tools/claude-code-mcp-configuration.md": {
     "title": "Claude Code MCP Configuration Pattern",
     "description": "**Claude Code MCP Configuration Pattern**\n\nA workaround for Linux Claude Code's inability to load MCP servers from project-level `.mcp.json` files by centralizing configuration in `~/.claude/settings.json` instead. MCP servers are defined with environment variable placeholders (`${VAR:-default}`), enabling project-specific overrides through `.vscode/settings.json` without duplicating configuration across projects. This pattern works consistently between the CLI and Claude Code extension because both read the user-level settings file, whereas `.mcp.json` only works with CLI. Critical for teams running Claude Code on Linux with multiple projects using different MCP server configurations or Python environments.",
@@ -363,30 +339,6 @@
       "3": "Chunk 3 defines escalation procedures, provides 2026 productivity statistics (55% faster completion with well-engineered prompts, 60% error reduction with Chain-of-Thought), catalogs 33 prompt-engineering vocabulary terms, and lists recommended academic papers and official documentation for further study."
     },
     "total_chunks": 3
-  },
-  "knowledge/models/qwen3-coder-30b-a3b.md": {
-    "title": "Qwen3-Coder-30B-A3B",
-    "description": "Qwen3-Coder-30B-A3B is a Mixture-of-Experts coding model with 30.5B total parameters and 3.3B active parameters per token, designed as the primary local Ollama integration for agentic coding tasks. The model features 48 layers with 128 experts (8 routed), a 262k token native context window, and recommended CPU-only deployment using Q4_K_M quantization (~19GB) with approximately 25GB total RAM for 100k context operation. Community best practice suggests 32k–65k context for stable tool calling, though 100k+ context is possible with some quality degradation on complex tasks. Use this when you need free local code generation, agentic coding workflows, or CPU-only inference without cloud dependencies.",
-    "summary": "Qwen3's 30.5B-param MoE coding model with 3.3B active params per token, designed for agentic coding tasks and Ollama integration with 262k native context. Requires ~25 GB RAM for CPU-only 100k-context inference (Q4_K_M quantization); community best practice is 32k–65k context for reliable tool calling.",
-    "generated_at": "2026-04-27T03:21:17.709464+00:00",
-    "content_hash": "676bf2acb50d7804",
-    "backend": "cli"
-  },
-  "knowledge/models/qwen3-coder-next.md": {
-    "title": "Qwen3-Coder-Next",
-    "description": "Qwen3-Coder-Next is a 80B-parameter mixture-of-experts (MoE) coding model with only 3B parameters active per token, available locally via Ollama. It uses 48 hybrid layers combining GatedDeltaNet attention with 512 total experts (10+1 active per token), trained with RL on 800K verifiable executable tasks, and supports 256K context length. The model achieves 70.6% on SWE-Bench Verified and 44.3% on SWE-Bench Pro—outperforming models 10–20× larger on coding benchmarks. Runs locally on ~46GB VRAM (q4_K_M quantization), making it practical for offline code generation tasks where state-of-the-art quality matters without the cost of larger closed models.",
-    "summary": "Sparse MoE coding model with 80B parameters and 3B active per token, achieving 70.6% on SWE-Bench Verified—outperforming models 10-20x larger—trained with RL on 800K executable tasks. Offers 256K context length and runs locally on ~46GB VRAM with q4_K_M quantization.",
-    "generated_at": "2026-04-27T03:21:54.714418+00:00",
-    "content_hash": "05ddb2ed35cdf72a",
-    "backend": "cli"
-  },
-  "knowledge/models/internvl.md": {
-    "title": "InternVL",
-    "description": "InternVL is a family of open-source multimodal large language models from OpenGVLab achieving state-of-the-art performance among open-source VLMs, with InternVL3-78B scoring 72.2 on MMMU. The architecture combines a vision encoder (InternViT: 300M–6B parameters) with a language model backbone (InternLM or Qwen), connected via dynamic resolution tiling that handles images up to 4K by splitting them into 448×448 patches. Models range from 1B to 78B parameters, with InternVL3-8B (~18 GB FP16, ~7 GB INT4) offering strong quality/size balance and excelling at OCR, document understanding, and chart comprehension. Use InternVL when you need open-source multimodal reasoning for high-resolution documents or visual understanding tasks with moderate VRAM constraints.",
-    "summary": "InternVL3-78B achieves 72.2 on MMMU (SOTA among open-source VLMs) via a mini-GPT-4 architecture combining a 6B InternViT vision encoder with dynamic-resolution image tiling (12–24 patches max) for handling 4K images. InternVL2-8B (17GB VRAM) scores 794 on OCRBench and 91.6 on DocVQA, making it one of the best open-source models for document understanding and text-in-image OCR tasks.",
-    "generated_at": "2026-04-27T03:22:16.369426+00:00",
-    "content_hash": "805edf96bd878525",
-    "backend": "cli"
   },
   "knowledge/tools/fastmcp.md": {
     "title": "FastMCP",

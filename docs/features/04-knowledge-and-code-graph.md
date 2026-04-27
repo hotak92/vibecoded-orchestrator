@@ -55,14 +55,14 @@ A new install ships with 50 pre-authored `.md` nodes under `knowledge/`. Adopter
 - **Reasoning & multimodal** — tree-of-thought, agentic LLM workflows, vision-language models, neurosymbolic AI, Bayesian inference.
 - **Coordination & infrastructure** — agent orchestration, MCP architecture, blackboard coordination, RAFT consensus, AI infrastructure budget configurations.
 
-### 5 model nodes
-`knowledge/models/` ships nodes for `florence-2` (vision-language), `internvl` (multimodal), `qwen3-coder-30b-a3b` (current code model), `qwen3-coder-next` (roadmap), `smolvlm-2b` (small VLM).
+### 6 model nodes
+`knowledge/models/` covers the models the orchestrator actually uses: `qwen3.5` (default text + vision), `gemma4-e4b` (low-VRAM fallback), `qwen3-embedding` (text embeddings, primary), `snowflake-arctic-embed2` (legacy text embeddings), `codesage-large-v2` (code embeddings, GPU), `jina-embeddings-v2-base-code` (code embeddings, CPU fallback).
 
 ### 9 tool nodes
 `knowledge/tools/` covers: `weaviate` (vector DB), `weaviate-usage-patterns` (collection design), `ollama` (local LLM server), `ollama-mcp-server` (MCP wrapper), `fastapi` (Python web framework), `fastmcp` (MCP boilerplate), `llama-cpp` (GGUF inference), `claude-code-cli-headless` (programmatic CLI), `claude-code-mcp-configuration` (MCP config patterns).
 
-### 2 pattern nodes
-`knowledge/patterns/` ships `ml-confidence-propagation` (decision uncertainty plumbing) and `prompt-engineering-2026` (Claude 4.x-era prompt patterns).
+### 1 pattern node
+`knowledge/patterns/` ships `prompt-engineering-2026` (Claude 4.x-era prompt patterns).
 
 ### TAG_HIERARCHY.md
 Formal 5-level tag taxonomy at `knowledge/TAG_HIERARCHY.md`: domain tags (`#AI`, `#database`, `#workflow`, …), abstraction level tags (`#high-level-plan`, `#mid-level-architecture`, `#low-level-implementation`, `#function-description`), technology tags, status tags (`#idea → #in-progress → #implemented → #tested → #deployed → #archived → #deprecated`), and pattern tags (`#RAG`, `#MCP`, etc.).
