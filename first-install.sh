@@ -65,15 +65,47 @@ if [ -n "${DISPLAY:-}" ] && command -v zenity >/dev/null 2>&1; then
         2>/dev/null &
 fi
 
+# Sniff for our own flags before forwarding to install.sh. We accept
+# --no-auto-launch (skip GUI auto-spawn at end) and pass-through everything
+# else. --yes / --non-interactive / --quiet are forwarded but also picked
+# up by post-install-launcher.sh as "no prompts" signals.
+NO_AUTO_LAUNCH=0
+HELPER_FLAGS=()
+for arg in "$@"; do
+    case "$arg" in
+        --no-auto-launch) NO_AUTO_LAUNCH=1 ;;
+        --yes|--non-interactive|--quiet) HELPER_FLAGS+=("--yes") ;;
+    esac
+done
+if [ $NO_AUTO_LAUNCH -eq 1 ]; then
+    HELPER_FLAGS+=("--no-auto-launch")
+fi
+
 # Forward all arguments to install.sh — same flag surface (`--no-containers`,
-# `--gpu`, `--low-resource`, `--non-interactive`, etc.).
-"$SCRIPT_DIR/install.sh" "$@"
+# `--gpu`, `--low-resource`, `--non-interactive`, etc.). Strip our own
+# --no-auto-launch out (install.sh doesn't know it).
+INSTALL_ARGS=()
+for arg in "$@"; do
+    case "$arg" in
+        --no-auto-launch) ;;  # consumed by us, not install.sh
+        *) INSTALL_ARGS+=("$arg") ;;
+    esac
+done
+"$SCRIPT_DIR/install.sh" "${INSTALL_ARGS[@]}"
 status=$?
 
 echo ""
 if [ $status -eq 0 ]; then
-    echo "Install complete. To start the launcher: ./start-launcher.sh"
-    echo "(Or double-click start-launcher.desktop in your file manager.)"
+    # Hand off to the launcher-bootstrap helper. It probes for an existing
+    # binary, offers download/build/skip, and (unless --no-auto-launch)
+    # spawns the GUI detached so the user sees the launcher window at the
+    # end of install. ALWAYS exits 0; never blocks our exit status.
+    if [ -x "$SCRIPT_DIR/scripts/post-install-launcher.sh" ]; then
+        "$SCRIPT_DIR/scripts/post-install-launcher.sh" "$SCRIPT_DIR" "${HELPER_FLAGS[@]}" || true
+    else
+        echo "Install complete. To start the launcher: ./start-launcher.sh"
+        echo "(Or double-click start-launcher.desktop in your file manager.)"
+    fi
 else
     echo "Install failed (exit $status). See messages above."
 fi
@@ -85,10 +117,3 @@ if [ -t 0 ]; then
     echo ""
 fi
 exit $status
-
-# TODO(post-v1.0): after install.sh succeeds, also:
-#   - Build the Tauri launcher (cd launcher && pnpm install && pnpm tauri build)
-#     OR download a pre-built binary from a GitHub release.
-#   - install.py copies first-install.desktop / start-launcher.desktop into
-#     ~/.local/share/applications/ so they appear in the apps menu.
-#   - Optionally also drop them on ~/Desktop/ for max discoverability.
