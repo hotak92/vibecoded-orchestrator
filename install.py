@@ -410,6 +410,8 @@ def main() -> int:
                         help="Force-enable Joern integration for richer code-graph metrics (CFG/PDG). Skips the install prompt.")
     parser.add_argument("--no-joern", action="store_true", default=False,
                         help="Skip Joern detection and don't prompt to install it (~600MB JVM-based).")
+    parser.add_argument("--no-lean-ctx", action="store_true", default=False,
+                        help="Skip lean-ctx detection / install / hints (optional CLI-output compression tool).")
     parser.add_argument("--with-agents", action="store_true", default=True,
                         help="Install free-tier Claude agents (default: on)")
     parser.add_argument("--no-agents", dest="with_agents", action="store_false",
@@ -1110,6 +1112,132 @@ def _print_system_info(sysinfo: SystemInfo) -> None:
     pass  # Already printed in _detect_system
 
 
+def _find_lean_ctx_binary() -> str | None:
+    """Locate lean-ctx beyond PATH.
+
+    `shutil.which` only checks PATH, so users who installed lean-ctx via
+    `cargo install lean-ctx` (lands at ~/.cargo/bin) but whose shell PATH
+    doesn't include ~/.cargo/bin (cargo's installer adds it to ~/.profile
+    but `bash first-install.sh` from a fresh terminal may not have sourced
+    it yet) saw 'not installed' even though the binary is right there.
+    Mirrors the known-binary-path probe pattern in
+    post-install-launcher.sh's _ensure_path_for_tool helper.
+    """
+    on_path = shutil.which("lean-ctx")
+    if on_path:
+        return on_path
+    candidates = [
+        Path.home() / ".cargo" / "bin" / "lean-ctx",
+        Path.home() / ".local" / "bin" / "lean-ctx",
+        Path("/usr/local/bin/lean-ctx"),
+        Path("/usr/bin/lean-ctx"),
+        # Homebrew on Apple Silicon vs Intel macOS:
+        Path("/opt/homebrew/bin/lean-ctx"),
+        Path("/home/linuxbrew/.linuxbrew/bin/lean-ctx"),
+    ]
+    for cand in candidates:
+        if cand.is_file() and os.access(cand, os.X_OK):
+            return str(cand)
+    return None
+
+
+def _maybe_install_lean_ctx(args: argparse.Namespace) -> str | None:
+    """Auto-install lean-ctx if a supported package manager is present.
+
+    Tries Homebrew → Cargo → AUR. Returns the resolved binary path on
+    success, None otherwise. Auto-install only runs in --yes / non-TTY
+    contexts (real users get a prompt). The lean-ctx project ships via:
+    https://github.com/yvgude/lean-ctx — see Installation section.
+    """
+    # T1 silent (with --yes / non-TTY). T3 prompt for interactive.
+    silent = bool(args.yes or not sys.stdin.isatty())
+
+    has_brew = shutil.which("brew") is not None
+    has_cargo = shutil.which("cargo") is not None
+    has_yay = shutil.which("yay") is not None
+    has_paru = shutil.which("paru") is not None
+
+    if not (has_brew or has_cargo or has_yay or has_paru):
+        # No supported channel — fall through; caller prints the manual
+        # install hints (rustup-then-cargo).
+        return None
+
+    method = None
+    if has_brew:
+        method = "brew"
+    elif has_cargo:
+        method = "cargo"
+    elif has_yay:
+        method = "yay"
+    elif has_paru:
+        method = "paru"
+
+    if not silent:
+        # Interactive: ask before installing. Default Y because the
+        # benefit is large (~95% token savings) and the cost is small
+        # (~one-time cargo build / brew tap).
+        try:
+            method_text = {
+                "brew": "Homebrew (`brew tap yvgude/lean-ctx && brew install lean-ctx`)",
+                "cargo": "Cargo (`cargo install lean-ctx`, ~2-5 min build)",
+                "yay": "AUR (`yay -S lean-ctx-bin`)",
+                "paru": "AUR (`paru -S lean-ctx-bin`)",
+            }[method]
+            ans = input(
+                f"  lean-ctx: not installed. Install via {method_text}? [Y/n]: "
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if ans and ans not in {"y", "yes"}:
+            return None
+
+    print(f"  lean-ctx: installing via {method}...")
+    try:
+        if method == "brew":
+            # `brew tap` is idempotent. Do tap + install in two steps so
+            # an already-tapped tap doesn't error.
+            subprocess.run(
+                ["brew", "tap", "yvgude/lean-ctx"],
+                check=False, timeout=120,
+            )
+            r = subprocess.run(
+                ["brew", "install", "lean-ctx"],
+                check=False, timeout=600,
+            )
+            if r.returncode != 0:
+                print(f"  lean-ctx: brew install failed (exit {r.returncode}).")
+                return None
+        elif method == "cargo":
+            r = subprocess.run(
+                ["cargo", "install", "lean-ctx"],
+                check=False, timeout=900,  # cargo build can be slow on small machines
+            )
+            if r.returncode != 0:
+                print(f"  lean-ctx: cargo install failed (exit {r.returncode}).")
+                return None
+        elif method in {"yay", "paru"}:
+            r = subprocess.run(
+                [method, "-S", "--noconfirm", "lean-ctx-bin"],
+                check=False, timeout=300,
+            )
+            if r.returncode != 0:
+                # Fallback: try the source-built package name.
+                r = subprocess.run(
+                    [method, "-S", "--noconfirm", "lean-ctx"],
+                    check=False, timeout=900,
+                )
+                if r.returncode != 0:
+                    print(f"  lean-ctx: {method} install failed.")
+                    return None
+    except (subprocess.TimeoutExpired, OSError) as e:
+        print(f"  lean-ctx: install raised {type(e).__name__}: {e}")
+        return None
+
+    # Re-detect — the just-installed binary should be findable now.
+    return _find_lean_ctx_binary()
+
+
 def _detect_optional_companions(args: argparse.Namespace) -> bool:
     """Check for optional companion tools that the orchestrator can leverage when present.
 
@@ -1128,26 +1256,21 @@ def _detect_optional_companions(args: argparse.Namespace) -> bool:
     _log_install_event("2b/10", "start", "probing optional companion tools")
 
     # lean-ctx (optional — wires BASH_ENV so non-interactive Bash subprocesses
-    # get ~90-97% command-output compression, same as the interactive shell hook)
+    # get ~90-97% command-output compression, same as the interactive shell hook).
+    # https://github.com/yvgude/lean-ctx
     #
     # Detection: shutil.which checks PATH only. Many users have lean-ctx
     # installed via `cargo install lean-ctx` (canonical landing dir
     # ~/.cargo/bin/) but their non-interactive shell PATH doesn't include
     # ~/.cargo/bin (cargo's installer adds the line to ~/.profile but
     # `bash first-install.sh` from a fresh terminal may not have sourced
-    # it yet). Probe known-binary locations as a fallback.
+    # it yet). Probe known-binary locations as a fallback. Also auto-install
+    # via cargo / brew when those are available.
     shim_path = PROJECT_ROOT / ".claude" / "scripts" / "leanctx-bash-env.sh"
-    lean_ctx_path = shutil.which("lean-ctx")
-    if not lean_ctx_path:
-        for cand in (
-            Path.home() / ".cargo" / "bin" / "lean-ctx",
-            Path.home() / ".local" / "bin" / "lean-ctx",
-            Path("/usr/local/bin/lean-ctx"),
-            Path("/usr/bin/lean-ctx"),
-        ):
-            if cand.is_file() and os.access(cand, os.X_OK):
-                lean_ctx_path = str(cand)
-                break
+    lean_ctx_path = _find_lean_ctx_binary()
+    if not lean_ctx_path and not args.quiet and not args.no_lean_ctx:
+        # Try auto-install via the most appropriate package manager.
+        lean_ctx_path = _maybe_install_lean_ctx(args)
     if lean_ctx_path:
         print(f"  lean-ctx: detected at {lean_ctx_path} — wiring BASH_ENV for non-interactive compression")
         # Write BASH_ENV into .claude/settings.json at install time.
@@ -1160,9 +1283,23 @@ def _detect_optional_companions(args: argparse.Namespace) -> bool:
         print(f"  lean-ctx: BASH_ENV will point to {shim_path}")
     else:
         print("  lean-ctx: not installed (optional, recommended for ~95% token savings on CLI output)")
-        print("            install:  cargo install lean-ctx")
-        print("              or:     curl -fsSL https://leanctx.com/install.sh | sh")
-        print("            then re-run this installer to wire BASH_ENV")
+        # OS-aware install hints. Use the canonical channels documented at
+        # https://github.com/yvgude/lean-ctx — verified 2026-04-28.
+        print("            Install via your preferred channel, then re-run this installer to wire BASH_ENV:")
+        if shutil.which("brew"):
+            print("              Homebrew:   brew tap yvgude/lean-ctx && brew install lean-ctx")
+        if shutil.which("cargo"):
+            print("              Cargo:      cargo install lean-ctx")
+        if shutil.which("yay") or shutil.which("paru"):
+            print("              AUR:        yay -S lean-ctx-bin   (or: yay -S lean-ctx)")
+        if not (shutil.which("brew") or shutil.which("cargo") or shutil.which("yay") or shutil.which("paru")):
+            # No supported package manager detected. Give the user a clear
+            # path: install Cargo (Rust toolchain) and then lean-ctx.
+            print("              No supported package manager detected.")
+            print("              Easiest path: install Rust + Cargo, then `cargo install lean-ctx`:")
+            print("                curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh")
+            print("                source $HOME/.cargo/env && cargo install lean-ctx")
+        print("            (Pass --no-lean-ctx to silence this hint.)")
 
     # Joern (CFG/PDG metrics for code graph)
     joern_path = shutil.which("joern")
