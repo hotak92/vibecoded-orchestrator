@@ -74,10 +74,15 @@ _install_log_path() {
 }
 
 _log_event() {
-    # _log_event <step> <phase> <detail>
+    # _log_event <step> <phase> <detail> [<data_json>]
+    # data_json (optional) is a pre-formed JSON object literal — caller
+    # is responsible for valid JSON. Used for compact structured fields
+    # like {"path":"/x"} or {"size_mb":42}. Detail string is escaped;
+    # data is inserted verbatim so callers must escape upstream.
     local step="${1:-?}"
     local phase="${2:-?}"
     local detail="${3:-}"
+    local data="${4:-}"
     local path
     path="$(_install_log_path)"
     [ -z "$path" ] && return 0
@@ -87,8 +92,19 @@ _log_event() {
     # Detail strings are bounded (we always pass short literals).
     local esc_detail
     esc_detail="$(printf '%s' "$detail" | sed 's/\\/\\\\/g; s/"/\\"/g')"
-    printf '{"ts":"%s","actor":"post-install-launcher.sh","step":"%s","phase":"%s","detail":"%s"}\n' \
-        "$ts" "$step" "$phase" "$esc_detail" >> "$path" 2>/dev/null || true
+    if [ -n "$data" ]; then
+        printf '{"ts":"%s","actor":"post-install-launcher.sh","step":"%s","phase":"%s","detail":"%s","data":%s}\n' \
+            "$ts" "$step" "$phase" "$esc_detail" "$data" >> "$path" 2>/dev/null || true
+    else
+        printf '{"ts":"%s","actor":"post-install-launcher.sh","step":"%s","phase":"%s","detail":"%s"}\n' \
+            "$ts" "$step" "$phase" "$esc_detail" >> "$path" 2>/dev/null || true
+    fi
+}
+
+# Helper to JSON-escape a string for use inside _log_event's data field.
+# Handles backslash + double-quote — same rules as detail.
+_json_escape() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
 YES=0
@@ -126,6 +142,14 @@ case "${OSTYPE:-}" in
     linux*)  OS="linux" ;;
     *)       OS="unknown" ;;
 esac
+
+# Mark the start of the post-install phase in the durable log. The log
+# directory was created by install.py Step 8, so this lands in a real
+# file (unless install.py never reached Step 8 — in which case the log
+# helper silently no-ops, matching the "never-throw" contract).
+_log_event "script-start" "start" \
+    "post-install-launcher.sh starting on $OS" \
+    "{\"os\":\"$(_json_escape "$OS")\",\"yes\":$YES,\"auto_launch\":$AUTO_LAUNCH}"
 
 # ----- _check_prerequisites — upfront capability audit -----------------------
 # Reports which tools are present and which paths will be taken. This makes
@@ -287,6 +311,12 @@ _check_prerequisites() {
     if [ $HAS_CURL -eq 0 ] && [ $HAS_WGET -eq 0 ]; then
         echo "[launcher] WARNING: neither curl nor wget present. Download path will be unavailable."
     fi
+
+    # Emit a structured audit event so the launcher / Claude Code can
+    # tell at a glance which paths were viable on this machine. Bool
+    # encoded as 1/0 to keep JSON compact.
+    _log_event "audit" "ok" "prerequisites audited" \
+        "{\"curl\":$HAS_CURL,\"wget\":$HAS_WGET,\"python3\":$HAS_PYTHON3,\"node\":$HAS_NODE,\"npm\":$HAS_NPM,\"pnpm\":$HAS_PNPM,\"sudo\":$HAS_SUDO,\"pkgmgr\":\"$(_json_escape "$PKGMGR")\"}"
 }
 
 # Wrapper for sudo: only escalate if sudo is actually available; otherwise
@@ -363,7 +393,10 @@ LAUNCHER_BIN="$(find_binary || true)"
 
 if [ -n "$LAUNCHER_BIN" ]; then
     echo "[launcher] Found existing binary: $LAUNCHER_BIN"
+    _log_event "binary-probe" "ok" "existing launcher binary found" \
+        "{\"path\":\"$(_json_escape "$LAUNCHER_BIN")\"}"
 else
+    _log_event "binary-probe" "skip" "no existing launcher binary on disk"
     # ----- Step 3: prompt for path --------------------------------------------
     echo "==============================================="
     echo "  Launcher binary not found. Choose how to get it:"
@@ -465,9 +498,13 @@ PY
 
         if [ -z "$asset_url" ]; then
             echo "[launcher] No prebuilt available yet for $OS. Falling back to build."
+            _log_event "download" "skip" "no prebuilt asset for $OS" \
+                "{\"os\":\"$(_json_escape "$OS")\"}"
             MODE="build"
         else
             echo "[launcher] Downloading: $asset_name"
+            _log_event "download" "start" "downloading $asset_name" \
+                "{\"asset\":\"$(_json_escape "$asset_name")\"}"
             if [ "$OS" = "linux" ]; then
                 target_dir="$HOME/.local/share/vct-launcher"
                 mkdir -p "$target_dir"
@@ -478,18 +515,24 @@ PY
                     if [ "${sz:-0}" -gt 10485760 ]; then
                         LAUNCHER_BIN="$target_path"
                         echo "[launcher] Downloaded to $target_path ($((sz / 1048576)) MB)"
+                        _log_event "download" "ok" "linux appimage downloaded" \
+                            "{\"path\":\"$(_json_escape "$target_path")\",\"size_mb\":$((sz / 1048576))}"
                     else
                         echo "[launcher] Downloaded file looks too small ($sz bytes). Falling back to build."
                         rm -f "$target_path"
+                        _log_event "download" "error" "downloaded file too small" \
+                            "{\"size_bytes\":${sz:-0}}"
                         MODE="build"
                     fi
                 else
                     echo "[launcher] Download failed. Falling back to build."
+                    _log_event "download" "error" "linux download failed (curl/wget exit non-zero)"
                     MODE="build"
                 fi
             elif [ "$OS" = "macos" ]; then
                 if [ $HAS_HDIUTIL -eq 0 ]; then
                     echo "[launcher] hdiutil missing (unexpected on macOS). Falling back to build."
+                    _log_event "download" "error" "macos hdiutil missing"
                     MODE="build"
                 else
                     tmp_dmg="/tmp/vct-launcher-$$.dmg"
@@ -519,10 +562,15 @@ PY
                         rm -f "$tmp_dmg"
                         if [ -z "$LAUNCHER_BIN" ]; then
                             echo "[launcher] DMG mount/copy failed. Falling back to build."
+                            _log_event "download" "error" "macos dmg mount/copy failed"
                             MODE="build"
+                        else
+                            _log_event "download" "ok" "macos dmg installed" \
+                                "{\"path\":\"$(_json_escape "$LAUNCHER_BIN")\"}"
                         fi
                     else
                         echo "[launcher] Download failed. Falling back to build."
+                        _log_event "download" "error" "macos download failed"
                         MODE="build"
                     fi
                 fi
@@ -788,6 +836,20 @@ PY
                     done
                     if [ "${#missing_deps[@]}" -gt 0 ]; then
                         echo "[launcher] Missing Tauri Linux deps: ${missing_deps[*]}"
+                        # Build a minimal JSON array of missing dep names
+                        # for the structured `data` field. Newlines/quotes
+                        # in package names are impossible (apt forbids
+                        # them) so a simple comma-join is safe.
+                        _missing_json="["
+                        _first=1
+                        for _p in "${missing_deps[@]}"; do
+                            if [ $_first -eq 1 ]; then _first=0; else _missing_json+=","; fi
+                            _missing_json+="\"$(_json_escape "$_p")\""
+                        done
+                        _missing_json+="]"
+                        _log_event "apt-deps" "start" \
+                            "${#missing_deps[@]} apt deps to install" \
+                            "{\"missing\":$_missing_json}"
                         installed_deps=0
                         if [ "$YES" -eq 1 ]; then
                             echo "[launcher] T1 silent: installing missing Tauri deps (apt --yes)"
@@ -806,13 +868,23 @@ PY
                         if [ $installed_deps -eq 0 ]; then
                             echo "[launcher] T4: deps not installed. Build will likely fail."
                             echo "           Manual: sudo apt install ${missing_deps[*]}"
+                            _log_event "apt-deps" "error" \
+                                "deps not installed (T4 manual hint)" \
+                                "{\"missing\":$_missing_json}"
+                        else
+                            _log_event "apt-deps" "ok" "apt deps installed"
                         fi
+                    else
+                        _log_event "apt-deps" "skip" "all Tauri Linux deps already present"
                     fi
                     ;;
                 *)
                     echo "[launcher] Non-apt distro ($PKGMGR): skipping auto-install of Tauri deps."
                     echo "           If build fails, install webkit2gtk + gtk3 + libsoup3 + appindicator manually."
                     echo "           See https://tauri.app/start/prerequisites/"
+                    _log_event "apt-deps" "skip" \
+                        "non-apt distro ($PKGMGR); manual deps required" \
+                        "{\"pkgmgr\":\"$(_json_escape "$PKGMGR")\"}"
                     ;;
             esac
         fi
@@ -969,11 +1041,21 @@ fi
 # Spawn detached. nohup + & + setsid (where available) decouples from this
 # shell so first-install can exit without killing the GUI. Redirect stdio
 # to /dev/null. Suppress any spawn failure: never block exit-0.
+_spawn_pid=""
 if command -v setsid >/dev/null 2>&1; then
     (setsid nohup "$LAUNCHER_BIN" >/dev/null 2>&1 < /dev/null &) || true
+    _spawn_pid=$!
 else
     (nohup "$LAUNCHER_BIN" >/dev/null 2>&1 < /dev/null &) || true
+    _spawn_pid=$!
 fi
 disown 2>/dev/null || true
+
+# Note: the subshell pid above is the subshell, not the launcher itself,
+# but it's the closest correlation we have without running `pgrep` from
+# this script. The launcher's own pid file (~/.vct/launcher.pid) is a
+# better source for runtime tooling — this event mostly says "we tried".
+_log_event "spawn" "ok" "launcher detached" \
+    "{\"binary\":\"$(_json_escape "$LAUNCHER_BIN")\",\"subshell_pid\":${_spawn_pid:-0}}"
 
 exit 0

@@ -86,6 +86,16 @@ With this on, asking the orchestrator to refactor 30 files or analyze 5 director
 
 This is the only global env var worth setting; everything else is per-project.
 
+## Install-time env knobs
+
+Set these before running `bash first-install.sh` (or export them for the duration of a CI run):
+
+| Var | Effect |
+|---|---|
+| `VCT_NO_AUTO_LAUNCH=1` | Skip auto-spawning the launcher GUI at end of `first-install.sh` / `first-install.command`. Equivalent to passing `--no-auto-launch`. Useful for CI, agent-driven installs, or when the GUI will be controlled out-of-band (Xvfb, Playwright). |
+| `VCT_NON_INTERACTIVE=1` | Treat the run as non-interactive. The Python auto-installer wrappers (`install.sh` / `install.ps1`) will fail loudly on missing Python rather than prompting — fix it in your CI image. Implied by `--quiet`. |
+| `VCT_DISABLE_HOOKS=1` | See section below. |
+
 ## Disabling hooks for debugging or CI
 
 Set `VCT_DISABLE_HOOKS=1` and every `.claude/hooks/*.sh` exits 0 cleanly without doing its work. Useful when:
