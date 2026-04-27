@@ -11,6 +11,8 @@ You're looking at **VibeCoded Orchestrator**, an AI-coding orchestrator that sit
 
 The next steps depend on how you got here.
 
+> **Easier alternative**: If you just want to install and go, see the **Quick Start** section near the top of [README.md](README.md) — double-click `first-install.<ext>` for your OS and skip the manual steps below.
+
 ---
 
 ## Path A: You opened this through the VCT Launcher
