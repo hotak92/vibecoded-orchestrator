@@ -128,6 +128,8 @@ python install.py --quiet --no-joern --no-containers
 - **Claude Max** subscription (for Claude Code access)
 - **Node.js 18+** (for Claude CLI)
 
+> Already running Weaviate or Ollama? See [docs/GETTING_STARTED.md → Coexisting with other Weaviate or Ollama installs](docs/GETTING_STARTED.md#coexisting-with-other-weaviate-or-ollama-installs) — install detects existing services by content and adopts cleanly without polluting host collections.
+
 #### Installing Python 3.12
 
 The `install.sh` / `install.ps1` wrappers detect a missing or too-old Python and offer to install one for you (interactive — you'll be prompted before any sudo/admin/winget call). To install manually:

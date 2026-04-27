@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import http.server
 import json
+import os
 import socketserver
 import sys
 import threading
@@ -264,6 +265,214 @@ class EnsureCollectionsTests(unittest.TestCase):
                 install._ensure_collections({})
         finally:
             server.shutdown()
+
+
+def _ns(**overrides):
+    """Minimal argparse-like namespace for _ensure_collections."""
+    ns = type("Ns", (), {})()
+    ns.yes = overrides.get("yes", True)
+    ns.quiet = overrides.get("quiet", False)
+    ns.skip_seed = overrides.get("skip_seed", False)
+    ns.skip_collections = overrides.get("skip_collections", False)
+    return ns
+
+
+class EnsureCollectionsAdoptModeTests(unittest.TestCase):
+    """Adopt-mode safety: per-install naming, skip-if-exists, --skip-seed."""
+
+    def setUp(self):
+        _Handler.schema = {"classes": []}
+        _Handler.posted = []
+        _Handler.fail_post = False
+
+    def test_adopt_does_not_create_bare_kg_when_host_namespaced(self):
+        """Installing into a Weaviate that uses per-project namespacing
+        (e.g. ARTup_KnowledgeGraph, ClaudeKnowledgeGraph) must NOT create
+        the bare top-level `KnowledgeGraph` / `Development` classes."""
+        server, port, _ = _start_server()
+        try:
+            # Simulate the user's existing Weaviate from the bug report.
+            _Handler.schema = {"classes": [
+                {"class": "ARTup_KnowledgeGraph",
+                 "properties": [{"name": "typed_links"}]},
+                {"class": "ARTup_CodeFunction"},
+                {"class": "ClaudeKnowledgeGraph",
+                 "properties": [{"name": "typed_links"}]},
+                {"class": "SD15_KnowledgeGraph",
+                 "properties": [{"name": "typed_links"}]},
+                {"class": "ClaudeOrchestrator_development"},
+            ]}
+            decisions = {"weaviate": {"action": install.ACTION_ADOPT}}
+            # Clear any inherited env so the basename derivation runs.
+            with mock.patch.dict(
+                "os.environ",
+                {"WEAVIATE_PORT": str(port)},
+                clear=False,
+            ):
+                for k in ("KG_COLLECTION", "DEVELOPMENT_COLLECTION",
+                          "SHARED_KG_COLLECTION"):
+                    os.environ.pop(k, None) if k in os.environ else None  # type: ignore
+                install._ensure_collections(
+                    {}, decisions=decisions, args=_ns(yes=True),
+                )
+            posted_classes = [p.get("class") for p in _Handler.posted]
+            # The exact failure mode from the bug brief:
+            self.assertNotIn("KnowledgeGraph", posted_classes,
+                             "must not create bare KnowledgeGraph in adopt mode")
+            self.assertNotIn("Development", posted_classes,
+                             "must not create bare Development in adopt mode")
+            # Per-install name is derived from PROJECT_ROOT basename. Basename
+            # is whatever directory install.py lives in — just assert it's a
+            # sane *_KnowledgeGraph or vct_KnowledgeGraph.
+            kg_posted = [c for c in posted_classes
+                         if c.endswith("_KnowledgeGraph")
+                         and c not in ("VibeCodedTools_KnowledgeGraph",
+                                       "ClaudeKnowledgeGraph",
+                                       "ARTup_KnowledgeGraph",
+                                       "SD15_KnowledgeGraph")]
+            self.assertTrue(
+                kg_posted,
+                f"expected a project-scoped *_KnowledgeGraph; got {posted_classes}",
+            )
+        finally:
+            # Clean up env mutations done by _ensure_collections.
+            for k in ("KG_COLLECTION", "DEVELOPMENT_COLLECTION",
+                      "SHARED_KG_COLLECTION"):
+                os.environ.pop(k, None)
+            server.shutdown()
+
+    def test_adopt_skips_dev_when_host_has_per_project_dev(self):
+        server, port, _ = _start_server()
+        try:
+            _Handler.schema = {"classes": [
+                {"class": "ClaudeOrchestrator_development"},
+            ]}
+            decisions = {"weaviate": {"action": install.ACTION_ADOPT}}
+            with mock.patch.dict(
+                "os.environ",
+                {"WEAVIATE_PORT": str(port)},
+                clear=False,
+            ):
+                for k in ("KG_COLLECTION", "DEVELOPMENT_COLLECTION",
+                          "SHARED_KG_COLLECTION"):
+                    os.environ.pop(k, None)
+                install._ensure_collections(
+                    {}, decisions=decisions, args=_ns(yes=True),
+                )
+            posted_classes = [p.get("class") for p in _Handler.posted]
+            # Must not POST a bare or basename-Development when a
+            # `*_development` already exists.
+            for c in posted_classes:
+                self.assertFalse(
+                    c.lower().endswith("_development") or c == "Development",
+                    f"unexpectedly posted Development-like class: {c}",
+                )
+        finally:
+            for k in ("KG_COLLECTION", "DEVELOPMENT_COLLECTION",
+                      "SHARED_KG_COLLECTION"):
+                os.environ.pop(k, None)
+            server.shutdown()
+
+    def test_skip_seed_skips_collection_creation(self):
+        """--skip-seed must short-circuit the whole step (no schema POSTs)."""
+        server, port, _ = _start_server()
+        try:
+            _Handler.schema = {"classes": []}
+            with mock.patch.dict(
+                "os.environ",
+                {"WEAVIATE_PORT": str(port), "KG_COLLECTION": "TestKG",
+                 "DEVELOPMENT_COLLECTION": "TestDev",
+                 "SHARED_KG_COLLECTION": "TestShared"},
+            ):
+                install._ensure_collections(
+                    {}, decisions={}, args=_ns(yes=True, skip_seed=True),
+                )
+            self.assertEqual(_Handler.posted, [],
+                             "--skip-seed must not POST any schema")
+        finally:
+            server.shutdown()
+
+    def test_skip_collections_flag(self):
+        server, port, _ = _start_server()
+        try:
+            _Handler.schema = {"classes": []}
+            with mock.patch.dict(
+                "os.environ",
+                {"WEAVIATE_PORT": str(port), "KG_COLLECTION": "TestKG",
+                 "DEVELOPMENT_COLLECTION": "TestDev",
+                 "SHARED_KG_COLLECTION": "TestShared"},
+            ):
+                install._ensure_collections(
+                    {}, decisions={}, args=_ns(yes=True, skip_collections=True),
+                )
+            self.assertEqual(_Handler.posted, [])
+        finally:
+            server.shutdown()
+
+    def test_self_managed_keeps_bare_defaults(self):
+        """When we own the Weaviate (not adopt), bare defaults are fine
+        and we must not derive basename-prefixed names."""
+        server, port, _ = _start_server()
+        try:
+            _Handler.schema = {"classes": []}
+            decisions = {"weaviate": {"action": install.ACTION_START}}
+            with mock.patch.dict(
+                "os.environ",
+                {"WEAVIATE_PORT": str(port)},
+                clear=False,
+            ):
+                for k in ("KG_COLLECTION", "DEVELOPMENT_COLLECTION",
+                          "SHARED_KG_COLLECTION"):
+                    os.environ.pop(k, None)
+                install._ensure_collections(
+                    {}, decisions=decisions, args=_ns(yes=True),
+                )
+            posted_classes = [p.get("class") for p in _Handler.posted]
+            self.assertIn("KnowledgeGraph", posted_classes)
+            self.assertIn("Development", posted_classes)
+        finally:
+            for k in ("KG_COLLECTION", "DEVELOPMENT_COLLECTION",
+                      "SHARED_KG_COLLECTION"):
+                os.environ.pop(k, None)
+            server.shutdown()
+
+
+class DeriveProjectKgNameTests(unittest.TestCase):
+    """install._derive_project_kg_name basename → class-name conversion."""
+
+    def test_simple_basename(self):
+        self.assertEqual(
+            install._derive_project_kg_name(Path("/x/y/myapp")),
+            "Myapp_KnowledgeGraph",
+        )
+
+    def test_basename_with_hyphens(self):
+        self.assertEqual(
+            install._derive_project_kg_name(Path("/x/y/vibecoded-orchestrator")),
+            "VibecodedOrchestrator_KnowledgeGraph",
+        )
+
+    def test_basename_with_underscores(self):
+        self.assertEqual(
+            install._derive_project_kg_name(Path("/x/y/test_install")),
+            "TestInstall_KnowledgeGraph",
+        )
+
+    def test_basename_with_special_chars_only(self):
+        # Edge case: path basename is all punctuation. Falls back to the
+        # `vct_` prefix to keep the install valid.
+        self.assertEqual(
+            install._derive_project_kg_name(Path("/x/y/...")),
+            "vct_KnowledgeGraph",
+        )
+
+    def test_basename_starting_with_digit(self):
+        # Leading digit on its own would yield "1Foo" — invalid Weaviate
+        # class name (must start with letter). Fallback prefix.
+        self.assertEqual(
+            install._derive_project_kg_name(Path("/x/y/1foo")),
+            "vct_KnowledgeGraph",
+        )
 
 
 class ProbeServiceIdentityTests(unittest.TestCase):
