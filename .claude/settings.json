@@ -1,6 +1,6 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
-  "_comment": "Project-scoped Claude Code settings for VibeCoded Orchestrator. Per-project env vars (KG_COLLECTION etc.) live in .vscode/settings.json (claude-code.env). Hooks fire by default — set VCT_DISABLE_HOOKS=1 in your shell to opt out per-shell, or remove blocks here for project-wide opt-out.",
+  "_comment": "Project-scoped Claude Code settings for VibeCoded Orchestrator. Per-project env vars (KG_COLLECTION etc.) live in .vscode/settings.json (claude-code.env). Hooks fire by default \u2014 set VCT_DISABLE_HOOKS=1 in your shell to opt out per-shell, or remove blocks here for project-wide opt-out.",
   "permissions": {
     "allow": [
       "Bash(pytest *)",
@@ -260,5 +260,8 @@
       }
     ]
   },
-  "_env_comment": "Set VCT_DISABLE_HOOKS=1 in your shell to opt out of all hooks for that shell (e.g. when debugging). Set it in .vscode/settings.json claude-code.env to disable per-project."
+  "_env_comment": "Set VCT_DISABLE_HOOKS=1 in your shell to opt out of all hooks for that shell (e.g. when debugging). Set it in .vscode/settings.json claude-code.env to disable per-project.",
+  "env": {
+    "BASH_ENV": "/home/martino/Desktop/PROGETTI/vibecoded-orchestrator/.claude/scripts/leanctx-bash-env.sh"
+  }
 }
