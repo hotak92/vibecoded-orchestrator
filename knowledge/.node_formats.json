@@ -1,0 +1,448 @@
+{
+  "knowledge/concepts/ai-infrastructure-budget-configurations.md": {
+    "title": "AI Infrastructure Budget Configurations",
+    "description": "A decision framework for AI infrastructure planning that balances on-premise investment with cloud services across three budget tiers (€15K–€50K), based on 2026 market analysis. Entry-level configurations (€15K–€20K) use 2× RTX 3090 or RTX 4090 with cloud burst (€11K budget); mid-tier (€30K–€35K) uses 2× RTX 4090 + multi-cloud; enterprise (€45K–€50K) uses distributed clusters or new GPUs + cloud. Each tier specifies VRAM capacity, supported model sizes (LLaMA 7B to 70B+), and cost allocation between on-premise and cloud services. Use this framework to right-size infrastructure investment, estimate training capacity, and plan ROI timelines (12–24 months depending on tier).",
+    "summary": "Decision framework for AI infrastructure budgets (€15K-50K) providing specific hardware configurations per tier—entry-level with used RTX 3090/4070 + cloud burst (18-24mo ROI), mid-range with dual RTX 4090 + multi-cloud (12-18mo ROI)—including detailed cost breakdowns and TCO analysis for each setup.",
+    "generated_at": "2026-04-27T03:00:29.713838+00:00",
+    "content_hash": "7de669973ee269e2",
+    "backend": "cli",
+    "chunk_summaries": {
+      "1": "This chunk introduces a decision framework for AI infrastructure planning across budget levels, emphasizing the core tradeoff between on-premise investment and cloud services while considering performance, scalability, and total cost of ownership.",
+      "2": "Presents a budget tier decision matrix and three €15K-20K entry-level configurations combining on-premise GPU hardware with cloud services, differentiated by strategy: used hardware, single high-end card, or distributed mid-range systems.",
+      "3": "This chunk establishes the data provenance (65+ verified sources, 12 tested configurations, Italian providers) and applicability window (last verified Feb 2026, applicable to 2026 market conditions only, next review May 2026)."
+    },
+    "total_chunks": 3
+  },
+  "knowledge/concepts/knowledge-graph.md": {
+    "title": "Knowledge Graph",
+    "description": "A knowledge graph is a structured representation of entities (nodes) and typed relationships (edges) that encodes semantic meaning in its structure, enabling multi-hop reasoning and inference over interconnected facts. Representations include property graphs (nodes/edges with key-value properties), RDF triples (subject-predicate-object), and WikiLink markdown files indexed into vector databases—each suited to different schema requirements and querying patterns. Construction methods range from manual expert curation to LLM-powered extraction from text to hybrid approaches, with this project implementing Weaviate as a hybrid system combining vector embeddings and property graph cross-references. Knowledge graphs outperform relational databases for relationship queries, vector databases for explicit semantic connections, and document stores for connected reasoning—making them foundational for RAG systems, enterprise AI, and multi-agent coordination.",
+    "summary": "A knowledge graph is a directed graph of typed entities and relationships that encodes semantic meaning structurally, enabling multi-hop reasoning and traversal superior to flat document stores. This project implements its KG as Markdown files with WikiLink relationships indexed in Weaviate, providing structured context for RAG and semantic search via `hybrid_search` and `semantic_graph_search` MCP tools.",
+    "generated_at": "2026-04-27T03:01:14.506199+00:00",
+    "content_hash": "04cf34a7f978ef70",
+    "backend": "cli",
+    "chunk_summaries": {
+      "1": "Evaluates the 'Understand Anything' architecture tool and recommends adopting its layer-classification and learning-tour features for the orchestrator's code graph."
+    },
+    "total_chunks": 3
+  },
+  "knowledge/concepts/ppo-improvements-st-ppo-modern-variants.md": {
+    "title": "PPO Improvements - ST-PPO and Modern Variants",
+    "description": "ST-PPO (Stabilized Turn-level PPO) addresses instability in PPO training for multi-turn LLM agents by operating at turn granularity rather than token level, combined with explicit correction for clipping-induced bias. Turn-level importance sampling aggregates per-token probability ratios geometrically (w_turn = exp(1/|turn| × Σ log π_new/π_old)) so all tokens in a turn share a single advantage estimate, reducing variance compared to independent token-level weights. Clipping-bias correction decomposes PPO's gradient and directly downweights the clipping-bias term—which grows exponentially during training—by reweighting highly off-policy samples. Critical for training complex multi-turn reasoning agents where vanilla PPO fails due to token-level noise amplification, off-policy critic errors, and sparse delayed rewards that destabilize standard importance weighting.",
+    "summary": "ST-PPO (Stabilized Turn-level PPO) fixes PPO collapse on multi-turn reasoning tasks by aggregating importance weights at turn level (using geometric mean per token) rather than token level, and adding clipping-bias correction to downweight extreme off-policy samples. On multi-turn search benchmarks, ST-PPO achieves 85% success vs 20% for vanilla token-level PPO.",
+    "generated_at": "2026-04-27T03:01:52.871780+00:00",
+    "content_hash": "9110f48a9d95b80d",
+    "backend": "cli"
+  },
+  "knowledge/concepts/neurosymbolic-ai.md": {
+    "title": "Neurosymbolic AI",
+    "description": "Neurosymbolic AI combines neural networks' pattern recognition capabilities with symbolic reasoning's interpretability and systematic logic to overcome the limitations of either approach alone. Key implementations include Logical Tensor Networks (grounding first-order logic into differentiable tensor operations), DeepProbLog (integrating neural predicates into probabilistic logic programming), and Neural Logic Programming (learning differentiable logical rules over embeddings), unified by a measure-theoretic formalism where neural belief functions integrate over logical satisfaction scores. These systems enable gradient-based learning while enforcing domain constraints and compositional structure. Critical for applications requiring interpretability, systematic generalization, and mixed perceptual/logical reasoning—such as knowledge-constrained learning, structured prediction, and knowledge graph completion.",
+    "summary": "Neurosymbolic AI integrates neural networks (pattern recognition from noisy data) with symbolic reasoning (interpretable, compositional logic) through a unified measure-theoretic formalism F(φ; θ) = ∫_Ω l(φ, ω) · b_θ(ω) dμ(ω) that makes both components jointly differentiable for end-to-end optimization. Key implementations include Logical Tensor Networks (grounding first-order logic as differentiable t-norms), DeepProbLog (neural predicates in probabilistic programs), and Neural Logic Programming (learning rules as embeddings), enabling knowledge-constrained learning and systematic generalization.",
+    "generated_at": "2026-04-27T03:02:13.263650+00:00",
+    "content_hash": "c6cb0c31ec2d2986",
+    "backend": "cli"
+  },
+  "knowledge/concepts/model-context-protocol.md": {
+    "title": "Model Context Protocol",
+    "description": "The Model Context Protocol is an open standard from Anthropic that standardizes how AI applications connect to external data sources, tools, and services through a universal client-server architecture. MCP exposes three core primitives—tools (callable functions with JSON Schema), resources (URI-addressed data), and prompts (workflow templates)—supporting local (stdio) and remote (HTTP+SSE) communication with built-in security controls that isolate servers and require explicit tool invocation. This matters because it eliminates bespoke integrations, allowing tools like Claude Code to connect to diverse services (knowledge graphs, databases, APIs) through a single stable protocol instead of custom implementations for each service.",
+    "summary": "MCP is an open standard (November 2024) that provides a universal client-server protocol for AI applications to connect to external tools, resources, and prompts, standardizing integrations that previously required bespoke implementations. The architecture uses JSON-RPC 2.0 with three core primitives—**tools** (executable functions), **resources** (URI-addressed data), and **prompts** (command templates)—where the LLM controls tool invocation based on declared capabilities.",
+    "generated_at": "2026-04-27T03:02:32.699076+00:00",
+    "content_hash": "43ae7baacfce8919",
+    "backend": "cli"
+  },
+  "knowledge/concepts/raft-consensus-algorithm.md": {
+    "title": "Raft Consensus Algorithm",
+    "description": "Raft is a consensus algorithm that distributes a replicated state machine across a cluster, ensuring all nodes agree on the same sequence of state transitions—designed to be more understandable than Paxos by decomposing consensus into leader election, log replication, and safety. Leader election uses randomized timeouts and term-based voting, where a follower becomes a candidate if it receives no heartbeat within its timeout and wins with majority quorum. Log replication requires the leader to append commands, replicate them to followers via AppendEntries RPC, and commit entries once a majority acknowledges them before applying to the state machine. Raft's formally proven safety properties (election safety, log matching, leader completeness, state machine safety) and emphasis on understandability make it the de facto standard for building fault-tolerant distributed systems.",
+    "summary": "Raft is a consensus algorithm that achieves understandability by decomposing distributed consensus into three subproblems—leader election, log replication, and safety—using a strong single-leader model with randomized election timeouts and formally-proven safety guarantees. It provides crash fault tolerance in a 2f+1 cluster tolerating f failures, with widespread production use in etcd, CockroachDB, and TiKV.",
+    "generated_at": "2026-04-27T03:02:51.202991+00:00",
+    "content_hash": "49d07aaa7dbee63e",
+    "backend": "cli"
+  },
+  "knowledge/concepts/sparse-activation.md": {
+    "title": "Sparse Activation",
+    "description": "Sparse activation is a conditional computation mechanism where a gating network dynamically selects only a subset of parameters to activate per input, enabling Mixture-of-Experts (MoE) models to decouple parameter count from compute cost. The router uses input-dependent selection to activate only top-K experts (typically K=1–2), allowing models like DeepSeek-V2 to achieve 236B total parameters with only 21B active per token (~9% activation), matching dense model quality at much lower inference speed. Training requires auxiliary balance losses to prevent expert starvation and address fine-tuning brittleness, with sparse MoE models showing overfitting on small tasks but excelling on diverse, knowledge-heavy workloads. Sparse activation is essential for scaling to very large parameter counts (100B+) while maintaining practical inference costs.",
+    "summary": "Sparse activation is a gating-based conditional computation mechanism where only a subset of neural network parameters activate per input, decoupling total parameters from actual compute. DeepSeek-V2 exemplifies this scaling: 236B total parameters with only 21B activated per token (9% ratio) matches ~70B dense model quality while reducing training costs by 42.5%, but all expert parameters must still reside in VRAM despite sparse activation.",
+    "generated_at": "2026-04-27T03:03:08.881493+00:00",
+    "content_hash": "f21cb769f0396b40",
+    "backend": "cli"
+  },
+  "knowledge/concepts/transformer-architecture.md": {
+    "title": "Transformer Architecture",
+    "description": "The Transformer is a neural network architecture that uses self-attention mechanisms to process sequences in parallel, replacing sequential RNNs and enabling capture of long-range dependencies (introduced in \"Attention Is All You Need\", 2017). The core mechanism transforms embeddings into Query, Key, and Value matrices computed via softmax-weighted attention with O(n²) complexity, while multi-head attention operates on different representation subspaces and positional encoding (typically rotary embeddings in modern models) injects sequence position information. Modern LLMs predominantly use decoder-only transformers with causal masking (GPT, Llama, Claude), with attention variants like Grouped-Query Attention (GQA) and Multi-Head Latent Attention (MLA) reducing KV cache memory overhead during autoregressive generation. Transformers are fundamental to modern language models because they enable efficient parallel processing, long-range dependency modeling, and when combined with attention optimizations, practical inference at scale.",
+    "summary": "Transformers use multi-head self-attention (O(n²) complexity: `softmax((Q×K^T)/√d_k)×V`) to enable parallel sequence processing, with modern LLMs implemented as decoder-only variants using causal masking and rotary positional embeddings (RoPE). KV cache memory during generation scales linearly with sequence length and is the primary inference bottleneck, motivating efficient variants (GQA, MLA) that compress KV or group attention heads.",
+    "generated_at": "2026-04-27T03:03:32.979964+00:00",
+    "content_hash": "3f11ad4db1ef73fa",
+    "backend": "cli"
+  },
+  "knowledge/patterns/ml-confidence-propagation.md": {
+    "title": "ML Confidence Propagation Pattern",
+    "description": "**ML Confidence Propagation Pattern** ensures derived measurements maintain connection to source uncertainty by propagating ML model confidence scores through calculations. The core principle is that derived confidence cannot exceed its least confident component; the recommended formula balances optimistic (simple average) and conservative (product) estimates as `(simple_avg + product) / 2`, preventing one low-confidence keypoint from being masked by high-confidence neighbors. Implementation involves collecting all relevant ML confidences, then applying the formula before returning final predictions. Critical for applications like pose detection where claiming high confidence from uncertain keypoints leads to false positives.",
+    "summary": "Propagates ML keypoint confidences through derived measurements using a balanced formula [(simple_avg + product) / 2] to prevent false high-confidence detections from uncertain source keypoints; the core principle is that derived confidence cannot exceed the confidence of its least certain component.",
+    "generated_at": "2026-04-27T03:03:49.119615+00:00",
+    "content_hash": "bcb9a586d779ed62",
+    "backend": "cli"
+  },
+  "knowledge/models/smolvlm-2b.md": {
+    "title": "SmolVLM-2B",
+    "description": "SmolVLM-2B is a lightweight 2-billion-parameter vision-language model for fast image captioning and filtering. It runs on ~2.5GB VRAM in 4-bit GGUF format via llama.cpp, processing images in under 1 second with good quality for simple caption generation. The model integrates as an always-loaded service through llama.cpp Python bindings to avoid warm-up latency. Use it for real-time image batch processing, web scanning, and preliminary filtering tasks before more resource-intensive analysis.",
+    "summary": "SmolVLM-2B is a 2-billion-parameter vision-language model that performs image captioning in <1 second using 4-bit GGUF quantization with ~2.5GB VRAM, optimized for fast batch image processing and filtering via llama.cpp. Best suited for rapid image scanning and simple captions; slower alternative (MiniCPM-V-2.6) offers better quality at the cost of latency.",
+    "generated_at": "2026-04-27T03:04:01.992000+00:00",
+    "content_hash": "c83a5f02b1e5b790",
+    "backend": "cli"
+  },
+  "knowledge/models/florence-2.md": {
+    "title": "Florence-2",
+    "description": "Florence-2 is a lightweight vision foundation model by Microsoft that unifies dozens of computer vision tasks through a single prompt-based architecture, eliminating the need for specialized task-specific models. Built on a DaViT image encoder and Transformer text decoder, it processes image + text prompts (e.g., `<CAPTION>`, `<OD>`, `<OCR>`) and outputs structured text including bounding boxes via special tokens. The base model (232M params) and large variant (771M) fit comfortably on consumer GPUs (2–4GB VRAM), trained on FLD-5B with 5.4 billion annotations across 126 million images. It achieves state-of-the-art zero-shot performance on captioning, detection, and grounding while maintaining a fraction of the footprint of specialist models, making it practical for resource-constrained multi-task vision workloads.",
+    "summary": "Florence-2 is a unified vision foundation model (Microsoft, 2024) that handles 10+ computer vision tasks—captioning, detection, OCR, grounding—through a single text-prompt interface, proving that a single small model (232M–771M params) can match or exceed specialized task-specific models. Trained on FLD-5B (5.4B annotations) with DaViT encoder + Transformer decoder, it achieves SOTA zero-shot performance on captioning and grounding while fitting in 2–4GB VRAM and remaining highly fine-tunable for custom domains.",
+    "generated_at": "2026-04-27T03:04:20.108887+00:00",
+    "content_hash": "d277a4d60ebde6b2",
+    "backend": "cli"
+  },
+  "knowledge/tools/claude-code-mcp-configuration.md": {
+    "title": "Claude Code MCP Configuration Pattern",
+    "description": "**Claude Code MCP Configuration Pattern**\n\nA workaround for Linux Claude Code's inability to load MCP servers from project-level `.mcp.json` files by centralizing configuration in `~/.claude/settings.json` instead. MCP servers are defined with environment variable placeholders (`${VAR:-default}`), enabling project-specific overrides through `.vscode/settings.json` without duplicating configuration across projects. This pattern works consistently between the CLI and Claude Code extension because both read the user-level settings file, whereas `.mcp.json` only works with CLI. Critical for teams running Claude Code on Linux with multiple projects using different MCP server configurations or Python environments.",
+    "summary": "Claude Code on Linux fails to load MCP servers from project-level `.mcp.json`, but `~/.claude/settings.json` with environment variable syntax (e.g., `${MCP_PYTHON:-/default}`) works across CLI and extension, enabling per-project overrides via `.vscode/settings.json` without workspace variable support. Use absolute paths only, and test with `claude mcp list` before expecting VS Code integration.",
+    "generated_at": "2026-04-27T03:04:36.806705+00:00",
+    "content_hash": "3e97e4c86affbfbd",
+    "backend": "cli"
+  },
+  "knowledge/tools/llama-cpp.md": {
+    "title": "llama.cpp",
+    "description": "llama.cpp is an open-source C/C++ library for efficient LLM inference on diverse hardware, from laptops to workstations, with minimal dependencies. It uses the GGUF binary format storing model weights, tokenizer, and metadata, with quantization schemes ranging from Q2_K (~2.6 bits) to F16 (16 bits), where K-quants provide per-layer adaptive quantization for superior quality. Hardware support spans CPU with SIMD optimizations, NVIDIA CUDA, Apple Metal, AMD Vulkan/ROCm, and OpenCL, with hybrid CPU+GPU offloading for models exceeding GPU VRAM. It enables practical local LLM inference with state-of-the-art performance and serves as the inference backend for Ollama, making it essential for on-device deployment scenarios.",
+    "summary": "llama.cpp is a C/C++ library for efficient LLM inference using GGUF format (single-file binary with quantized weights and metadata) and K-quants—adaptive per-layer quantization where Q4_K_M (~4.5 bits) is the recommended quality/VRAM tradeoff. It supports CPU SIMD, CUDA, Metal, Vulkan, and hybrid GPU/CPU offloading, and serves as Ollama's inference backend.",
+    "generated_at": "2026-04-27T03:05:01.789183+00:00",
+    "content_hash": "4944cd9e9b38f430",
+    "backend": "cli"
+  },
+  "knowledge/tools/weaviate-usage-patterns.md": {
+    "title": "Weaviate Usage Patterns",
+    "description": "Weaviate Usage Patterns documents practical implementation patterns for using Weaviate with Ollama embeddings in storage and retrieval operations. The critical constraint is that the snowflake-arctic-embed2 embedding model has a working limit of 2500 tokens (despite documentation claiming 8192), requiring all content and queries to be truncated or chunked before embedding. Small documents (<2500 tokens) are stored directly; larger content is split into numbered chunks with shared metadata (title, tags, links) linked via a source_node_id UUID. This pattern prevents embedding API errors and enables reliable semantic search across variable-length documents like knowledge graphs and documentation.",
+    "summary": "Weaviate with `snowflake-arctic-embed2:latest` embeddings enforces a 2500-token practical limit (despite 8192 documented) for both storage and queries; exceeding it causes embedding failures and requires chunking strategies with source_node_id linking and deduplication patterns for reassembly.",
+    "generated_at": "2026-04-27T03:05:19.310060+00:00",
+    "content_hash": "7990f7bddc65ef46",
+    "backend": "cli"
+  },
+  "knowledge/concepts/qlora.md": {
+    "title": "QLoRA",
+    "description": "QLoRA is a parameter-efficient fine-tuning method combining 4-bit quantization of the base model with Low-Rank Adaptation (LoRA) adapters to enable fine-tuning of LLMs up to 65B parameters on consumer hardware (single 48GB GPU). It uses NormalFloat 4-bit (NF4) quantization for frozen base weights with on-the-fly dequantization, while trainable LoRA adapters (0.1–1% of model parameters) remain in BFloat16 precision; double quantization further reduces memory by quantizing the quantization constants themselves, and paged optimizers prevent OOM by offloading optimizer states to CPU RAM. A 65B model requires ~48GB with QLoRA versus 260GB with standard LoRA or 1040GB with full fine-tuning. Use QLoRA when you need to adapt large models on resource-constrained hardware without sacrificing practical performance.",
+    "summary": "QLoRA combines 4-bit NormalFloat quantization (NF4) of frozen base model weights with trainable LoRA adapters in BFloat16, enabling fine-tuning of 65B+ parameter LLMs on a single 48GB consumer GPU (48GB vs. 1TB+ for full fine-tuning). The method achieves near-full fine-tuning quality through on-the-fly weight dequantization, double quantization of quantization constants, and paged optimizers to prevent OOM during training.",
+    "generated_at": "2026-04-27T03:09:49.072467+00:00",
+    "content_hash": "4ba70b211acc4d56",
+    "backend": "cli"
+  },
+  "knowledge/concepts/llm-alignment.md": {
+    "title": "LLM Alignment",
+    "description": "LLM alignment ensures model outputs reflect human values (helpfulness, honesty, harmlessness) through post-training fine-tuning and mechanistic interpretability techniques. DPO (direct preference optimization) has become the dominant method for 7B-70B models, reducing RLHF complexity from 4 simultaneous models to 2 while achieving comparable results at lower cost; alternative approaches include Constitutional AI and GRPO, though inner-alignment methods during pretraining remain theoretically more robust but immature. Empirical research shows safety constraints incur a measurable \"alignment tax\" of 7–31% reasoning accuracy loss, though this tradeoff remains contested, and multi-agent systems exhibit unique alignment failures requiring coordination-aware frameworks beyond standard single-agent methods. Understanding alignment is critical for production AI systems where safety cannot be compromised, particularly in high-stakes domains like healthcare where online exploration is necessary, and for multi-agent systems that require inter-agent coordination without emergent misalignment.",
+    "summary": "Safety alignment mechanisms (DPO, RLHF, constitutional AI) incur a measured 7-31% accuracy tax in large reasoning models, with DPO becoming the dominant method for 7B-70B scales. Standard alignment fails in multi-agent coordination systems (10-15% drop), but the FAAF framework achieves 52.6% accuracy by treating inter-agent friction as productive—directly relevant to multi-agent orchestration.",
+    "generated_at": "2026-04-27T03:10:12.850457+00:00",
+    "content_hash": "8e19cda111635ba4",
+    "backend": "cli"
+  },
+  "knowledge/concepts/agent-orchestration.md": {
+    "title": "Agent Orchestration",
+    "description": "Agent Orchestration manages multiple AI agents to solve complex tasks by decomposing high-level goals into subtasks, assigning them to appropriate agents, and assembling results. The orchestrator handles dynamic task decomposition, agent selection by capability/model tier, parallel execution with resource management, and error handling with retry logic; it can use static DAG workflows, dynamic LLM-driven decomposition, or reactive event-driven patterns. Communication occurs via tool-based delegation (preferred), message passing, or shared blackboard state. Essential for complex multi-step tasks where parallel execution and dynamic adaptation provide efficiency gains over sequential chaining, with frameworks like LangGraph, AutoGen, and Claude-native task coordination supporting implementation.",
+    "summary": "Agent orchestration distinguishes itself from simple chaining through dynamic goal decomposition and agent selection: it assigns parallelizable subtasks to capability-matched agents, manages parallel execution, and handles retry logic. Communication uses tool-based delegation, message passing, or shared blackboard patterns, with execution models ranging from static pre-defined DAGs to LLM-driven dynamic decomposition at runtime.",
+    "generated_at": "2026-04-27T03:10:52.666490+00:00",
+    "content_hash": "64490725a22d1289",
+    "backend": "cli",
+    "chunk_summaries": {
+      "1": "This chunk defines user roles (admin/manager/developer/viewer), task-scoped dynamic authorization through three-layer validation (user role → task scope → agent guard), and role-floor autonomy resolution that enforces minimum autonomy levels based on user role and policy rules."
+    },
+    "total_chunks": 2
+  },
+  "knowledge/concepts/agentic-llm-workflows.md": {
+    "title": "Agentic LLM Workflows",
+    "description": "Agentic LLM Workflows is a pattern using multiple specialized agents with role-specific responsibilities and cost-optimized model routing (Haiku, Sonnet, Opus, or free Ollama) to accomplish complex tasks efficiently. Agents organize into three categories—planning (orchestrator, planner, architect), implementation (coder, helper-scripter, tester), and maintenance (memory-manager, doc-maintainer, code-reviewer)—coordinated through an orchestrator that executes simple, complex, or parallel workflows with 300-500 token handoffs. Task routing matches model capability to complexity: Haiku handles ~70% of simple validations, Sonnet covers ~25% of design and implementation, and Opus reserves ~5% for critical decisions. This achieves ~70% cost savings versus always using premium models while improving quality through specialization and enabling scalable parallel execution across task complexity.",
+    "summary": "Route tasks to cost-optimized model tiers—Haiku for validation (70%), Sonnet for complex reasoning (25%), Opus for critical decisions (5%)—with specialized agents for planning/implementation/maintenance, achieving 70% cost reduction versus always using premium models. Orchestrator coordinates execution patterns (linear, branching, parallel) with structured 300-500 token handoffs and context tracking via CONTEXT_STATE.md.",
+    "generated_at": "2026-04-27T03:11:32.808512+00:00",
+    "content_hash": "91aac5d5105aeab8",
+    "backend": "cli"
+  },
+  "knowledge/concepts/flashattention.md": {
+    "title": "FlashAttention",
+    "description": "FlashAttention is an IO-aware algorithm that reduces memory footprint and improves attention computation speed by processing attention in SRAM-resident tiles instead of materializing the full N×N attention matrix in GPU high-bandwidth memory. It achieves this through block tiling of Q, K, V and online softmax computation that tracks running statistics without seeing all scores simultaneously, reducing memory from O(N²) to O(N) and HBM IO from O(N²) to O(N² d / M). The backward pass uses recomputation to trade compute for memory rather than storing intermediate attention matrices. This enables 2–4x training speedup, 5–10x memory reduction, and makes longer sequences computationally feasible by addressing the memory-bandwidth bottleneck of standard attention.",
+    "summary": "FlashAttention reduces memory complexity from O(N²) to O(N) and achieves 2-4× training speedup by computing attention in SRAM-resident tiles with online softmax instead of materializing the full attention matrix, enabling 10× longer sequences at fixed memory. The key insight: GPU compute is faster than HBM memory bandwidth (~10× on A100); standard attention is memory-bound, while FlashAttention's block-wise execution with recomputed backward pass becomes compute-bound.",
+    "generated_at": "2026-04-27T03:11:56.852426+00:00",
+    "content_hash": "847e48710035e343",
+    "backend": "cli"
+  },
+  "knowledge/concepts/speculative-decoding.md": {
+    "title": "Speculative Decoding",
+    "description": "Speculative decoding is a lossless inference acceleration technique where a small draft model proposes k tokens in parallel, then a larger target model validates them in a single forward pass using speculative sampling, ensuring output distribution matches standard autoregressive decoding exactly. The draft-verify loop accepts tokens with probability min(1, p_target/p_draft), rejecting and resampling from the residual distribution when necessary. It achieves 2–4× wall-clock speedup on memory-bandwidth-bound hardware by leveraging token predictability in structured contexts, with state-of-the-art variants (EAGLE-3) reaching 3–6.5× speedup through dedicated draft heads and dynamic token trees. Critical for latency-sensitive, single-batch inference where the target model is bottlenecked on weight loading, making it essential for interactive LLM applications.",
+    "summary": "Speculative decoding proposes multiple tokens from a small draft model and validates them in parallel via the target model using probability-ratio acceptance sampling, guaranteeing identical output distributions to standard decoding. EAGLE-3 (2025) achieves 3.0–6.5× wall-clock speedup by training the draft model with simulated inference conditions and multi-layer information fusion.",
+    "generated_at": "2026-04-27T03:12:17.424411+00:00",
+    "content_hash": "b077f84bf3fea75b",
+    "backend": "cli",
+    "chunk_summaries": {
+      "1": "Speculative decoding, introduced by concurrent 2022-2023 papers, accelerates LLM inference 2-3x by having a small draft model propose k tokens and the target model validate them in one forward pass via lossless speculative sampling."
+    },
+    "total_chunks": 2
+  },
+  "knowledge/concepts/constitutional-ai.md": {
+    "title": "Constitutional AI",
+    "description": "Constitutional AI (CAI) is Anthropic's alignment method that trains harmless AI assistants using a written constitution of principles and self-supervised AI feedback instead of human-labeled preferences. Phase 1 (SL-CAI) fine-tunes the model on self-revised responses—generating harmful outputs, critiquing them against constitutional principles, and iteratively revising them via chain-of-thought reasoning. Phase 2 (RLAIF) trains a preference reward model on AI-labeled preference pairs using a feedback model, then applies RL fine-tuning with PPO to produce the final model. CAI reduces cost and inconsistency of human feedback annotation, eliminates exposure of human raters to harmful content, and is foundational to Claude's training.",
+    "summary": "Constitutional AI (CAI) is Anthropic's training method that replaces human feedback annotation in RLHF with an AI feedback loop guided by explicit written principles, using two phases: supervised learning from model self-critique (SL-CAI), then reinforcement learning from AI preference labeling (RLAIF). The key innovation enables scalable harmlessness training by making alignment auditable through human-authored constitutional principles rather than inconsistent human labeling of harmful content.",
+    "generated_at": "2026-04-27T03:12:53.188402+00:00",
+    "content_hash": "11ab0f8225c81bc1",
+    "backend": "cli"
+  },
+  "knowledge/concepts/vision-language-models.md": {
+    "title": "Vision-Language Models",
+    "description": "Vision-Language Models are neural architectures that learn shared multimodal representations from image-text pairs, enabling simultaneous understanding of visual and linguistic content. Core components include a vision encoder (CLIP ViT, DaViT, or SigLIP), a language model backbone (typically decoder-only LLMs like Llama or Qwen), and projection layers bridging vision and language feature spaces. Modern VLMs prepend image tokens to text and generate responses autoregressively, enabling visual question answering, image captioning, OCR, document understanding, and visual grounding. Essential for applications requiring multimodal reasoning—document processing, accessibility, and any task demanding joint understanding of visual and textual information.",
+    "summary": "Vision-Language Models learn shared multimodal representations by combining a vision encoder (typically ViT), projection layer, and decoder-only LLM backbone, enabling autoregressive generation for VQA, captioning, OCR, and document understanding. Modern architectures (Qwen2.5-VL, InternVL3, Florence-2) scale from 0.2B to 78B parameters and require 4–24+ GB VRAM depending on model size, with INT4/INT8 quantization reducing requirements by 50–75%.",
+    "generated_at": "2026-04-27T03:13:10.466117+00:00",
+    "content_hash": "e9ba882f0bc53242",
+    "backend": "cli"
+  },
+  "knowledge/concepts/rag-pattern.md": {
+    "title": "RAG Pattern",
+    "description": "RAG is a software architecture pattern that grounds LLM responses in retrieved documents rather than the model's parametric knowledge, decoupling the knowledge base from the model for cheap knowledge updates without retraining. The pattern embeds documents into a vector store (like Weaviate), retrieves top-k relevant documents for a query, and feeds these with the original query to the LLM via a prompt builder. Variants include standard RAG for single retrieval, iterative RAG for multi-hop reasoning (ReAct), fusion RAG for query expansion, and corrective RAG with retrieval quality evaluation and web-search fallback. Use RAG when knowledge changes frequently, answers must be traceable to sources, domain is specialized, or factual precision matters—it reduces hallucination and eliminates expensive fine-tuning cycles.",
+    "summary": "RAG (Retrieval-Augmented Generation) decouples knowledge from LLM weights by grounding responses in semantically-retrieved domain documents from a vector store, enabling cheap knowledge updates without model retraining. The pattern combines document embedding, dense retrieval, prompt construction, and generation to reduce hallucination and provide source attribution, with variants including iterative multi-hop reasoning (ReAct), query fusion, and corrective retrieval with web-search fallback.",
+    "generated_at": "2026-04-27T03:13:28.091588+00:00",
+    "content_hash": "1a4768a8e3436c6b",
+    "backend": "cli"
+  },
+  "knowledge/concepts/graphrag-pattern.md": {
+    "title": "GraphRAG Pattern",
+    "description": "GraphRAG augments standard RAG with LLM-generated knowledge graphs to answer complex questions spanning entire document corpora, solving the limitation of semantic chunk retrieval in handling global, synthetic queries. It extracts entities and relationships, clusters them into hierarchical communities using the Leiden algorithm, and generates multi-resolution community summaries. Query resolution uses local search for specific entity questions and global map-reduce over all communities for corpus-wide synthesis. Use GraphRAG for questions requiring cross-document themes or synthesis; standard RAG remains better for targeted, entity-specific lookups with lower build cost and latency.",
+    "summary": "GraphRAG augments standard RAG with LLM-extracted entity graphs and Leiden-detected communities, enabling synthesis across entire document corpora through hierarchical community summarization and map-reduce global search—solving the fundamental limitation of vector-only retrieval for corpus-wide questions. The critical innovation is parallel summarization of graph communities (rather than individual chunks) followed by answer reduction, achieving multi-hop reasoning and holistic corpus understanding at the cost of higher indexing and query latency.",
+    "generated_at": "2026-04-27T03:13:44.592412+00:00",
+    "content_hash": "becf81f2dbc178ba",
+    "backend": "cli"
+  },
+  "knowledge/concepts/reinforcement-learning.md": {
+    "title": "Reinforcement Learning",
+    "description": "Reinforcement Learning is a machine learning paradigm where an agent learns to make sequential decisions by interacting with an environment, receiving scalar reward signals, and optimizing for cumulative discounted reward—fundamentally different from supervised or unsupervised learning. Core algorithms fall into three categories: value-based methods (Q-Learning, DQN) that learn state-action values and derive policy from them, policy gradient methods (REINFORCE, PPO) that directly optimize the policy, and actor-critic approaches that combine value estimation with policy optimization. The agent balances exploration (discovering new high-reward actions) and exploitation (using known good actions), typically via ε-greedy or UCB strategies. RL is critical for applications requiring learned sequential decision-making: game AI (Atari), robotics control, and modern LLM alignment via RLHF (as used in ChatGPT and Claude).",
+    "summary": "RL maximizes discounted cumulative reward (G_t = r_t + γ·r_{t+1} + ...) using three algorithm families: value-based (Q-learning/DQN), policy-gradient (PPO/REINFORCE), and actor-critic. RLHF fine-tunes LLM policies against learned reward models, enabling alignment of modern systems like ChatGPT and Claude.",
+    "generated_at": "2026-04-27T03:14:06.425419+00:00",
+    "content_hash": "4d4dc7671bf83dd3",
+    "backend": "cli",
+    "chunk_summaries": {
+      "1": "DreamerV3 learns a latent world model from visual observations and trains an actor-critic policy by imagining future trajectories entirely in latent space, enabling general-purpose reinforcement learning across diverse visual control tasks."
+    },
+    "total_chunks": 3
+  },
+  "knowledge/concepts/fine-tuning-techniques-llm.md": {
+    "title": "Fine-Tuning Techniques for Open-Source LLMs",
+    "description": "Fine-tuning adapts pre-trained LLMs to domain-specific tasks without full retraining, using parameter-efficient methods to make customization viable on consumer hardware. LoRA (Low-Rank Adaptation) learns small delta matrices (~0.7% of model parameters), reducing a 7B model's training memory from 40GB to 20GB; QLoRA further combines this with 4-bit quantization, enabling a 70B model to fine-tune on a single RTX 4090 (48GB VRAM). QLoRA quantizes the base model to 4-bit while computing gradients in higher precision (bfloat16), trading minor quality loss for dramatic hardware cost reduction. Fine-tuning technique selection depends on available resources—QLoRA for single GPU constraints, full fine-tuning only for teams with no budget limits—making task-specific model adaptation economically feasible across organizations of any scale.",
+    "summary": "QLoRA (Quantized Low-Rank Adaptation) combines 4-bit quantization with low-rank parameter updates to enable fine-tuning of 70B+ models on consumer hardware (RTX 4090, ~48GB VRAM) with 0.7% of original parameters trainable, reducing memory requirements from 400GB to 48GB while maintaining near-full-model quality. Parameter-efficient methods like LoRA and QLoRA are now standard for domain-specific adaptation, with hyperparameter guidelines (rank 8-64, learning rate 5e-4) optimized for 3-5 epoch training on modest hardware.",
+    "generated_at": "2026-04-27T03:14:50.560529+00:00",
+    "content_hash": "fe13ade883009076",
+    "backend": "cli"
+  },
+  "knowledge/concepts/hybrid-search-keyword-semantic.md": {
+    "title": "Hybrid Search - Combining Keyword and Semantic Retrieval",
+    "description": "Hybrid search combines keyword-based retrieval (BM25 for exact term matching) with semantic search (vector embeddings for meaning-based similarity), merging both result sets into a unified ranked output. The process runs keyword and semantic searches in parallel, normalizes their different scoring scales (BM25's 0-100 range vs. cosine similarity's 0-1 range), and uses Reciprocal Rank Fusion (RRF) to combine results by rewarding documents that rank highly in either method. This captures both precision from exact terminology and understanding from conceptual relationships. Keyword-only search misses synonyms and paraphrases while semantic-only search returns irrelevant results lacking required terminology, making hybrid essential for comprehensive retrieval.",
+    "summary": "Hybrid search merges BM25 keyword retrieval with semantic vector search through Reciprocal Rank Fusion (RRF), normalizing incompatible score ranges (BM25's 0-100, cosine similarity's 0-1) to capture both exact terminology and conceptual meaning in a unified ranked result set. This solves the core limitation that keyword-only search misses paraphrases while semantic-only search returns irrelevant results lacking required terminology.",
+    "generated_at": "2026-04-27T03:15:08.534811+00:00",
+    "content_hash": "23ebed610279bdb7",
+    "backend": "cli"
+  },
+  "knowledge/concepts/llm-inference-optimization.md": {
+    "title": "LLM Inference Optimization",
+    "description": "LLM inference optimization reduces latency, memory, and serving costs through attention kernels (FlashAttention-3), KV cache quantization, speculative decoding, and distributed serving. Production deployments combine PagedAttention with FP8 quantization, FlashAttention-3 kernels achieving 75% theoretical FLOPs on H100, and speculative decoding (EAGLE-3: 3.0–6.5× speedup) with continuous batching. Key advances include FlashInfer's block-sparse KV formats (28–69% latency reduction), Lookahead reasoning for chain-of-thought parallelism (1.4× → 2.1× speedup), and disaggregated prefill/decode (compute-bound vs memory-bound separation). Essential for any production LLM serving system where latency and throughput directly impact user experience and infrastructure cost.",
+    "summary": "The recommended 2025-2026 production LLM inference stack combines FlashAttention-3 kernels (75% H100 FLOPs), PagedAttention, FP8 KV cache quantization, continuous batching, and EAGLE-3 speculative decoding (3.0-6.5× speedup)—techniques that compose synergistically to achieve 2-4× throughput and 3-6× latency improvements simultaneously. Disaggregated prefill/decode and W4A4KV4 quantization (INT4 weights/activations/KV cache) further optimize hardware utilization and memory efficiency under mixed production workloads.",
+    "generated_at": "2026-04-27T03:15:43.977443+00:00",
+    "content_hash": "09132683d47f18c6",
+    "backend": "cli"
+  },
+  "knowledge/concepts/process-reward-models.md": {
+    "title": "Process Reward Models",
+    "description": "Process Reward Models evaluate intermediate reasoning steps rather than only final answers, providing dense, step-level supervision signals for error detection and correction during multi-step problem-solving. PRMs significantly outperform Outcome Reward Models on mathematical reasoning tasks (78.2% vs 56% on MATH benchmark) by avoiding the \"correct answer, wrong reasoning\" problem through step-level penalties and providing cleaner RL training signals with explicit error localization. Training methods include human annotation (gold standard but expensive at $1–5 per solution) and Monte Carlo estimation (common but produces inferior models; Qwen research shows LLM-as-judge or consensus filtering yields better data quality). PRMs are essential for complex reasoning tasks where dense per-step feedback outweighs the sparse, noisy end-of-rollout signals provided by outcome supervision.",
+    "summary": "Process Reward Models assign correctness scores to individual reasoning steps rather than only final answers, achieving 78.2% accuracy on MATH versus 56% with outcome supervision. The key methodological problem: standard Monte Carlo label-synthesis conflates logical step validity with answer reachability; consensus filtering (combining MC + LLM-as-judge) provides better training signals.",
+    "generated_at": "2026-04-27T03:16:06.495510+00:00",
+    "content_hash": "1a9fbb2f712d1bca",
+    "backend": "cli"
+  },
+  "knowledge/concepts/actor-critic.md": {
+    "title": "Actor-Critic",
+    "description": "Actor-Critic methods combine a policy network (actor) and value function (critic) to enable low-variance policy gradient updates that scale to continuous action spaces. The critic uses temporal difference learning to evaluate actions (δ = r + γV(s') - V(s)), providing an advantage baseline that reduces variance without introducing bias. Key variants include PPO (on-policy, clipped surrogate objective—the standard for RLHF), SAC (off-policy with entropy regularization), and TD3 (twin critics with delayed updates for stability). Actor-Critic is foundational because on-policy methods prioritize stability and ease of tuning, while off-policy variants achieve 25–40% better sample efficiency in continuous control, making the approach suitable across different application constraints.",
+    "summary": "Actor-Critic methods combine policy gradients (actor) with temporal difference learning (critic) for low-variance feedback enabling continuous control; PPO (clipped surrogate objective) dominates on-policy RL and RLHF, while off-policy variants (SAC, TD3 with twin critics) achieve 25–40% higher sample efficiency through entropy regularization and pessimistic value estimates.",
+    "generated_at": "2026-04-27T03:16:28.576529+00:00",
+    "content_hash": "df095b2a294caa4e",
+    "backend": "cli",
+    "chunk_summaries": {
+      "1": "Presents Actor-Critic architecture (actor policy paired with value-critic for TD-based learning) and surveys six major algorithm variants (A3C, A2C, PPO, SAC, TD3, DDPG) with their distinguishing mechanisms."
+    },
+    "total_chunks": 2
+  },
+  "knowledge/concepts/tree-of-thought.md": {
+    "title": "Tree-of-Thought",
+    "description": "Tree-of-Thought (ToT) is a prompting framework that extends chain-of-thought reasoning by allowing language models to explore multiple reasoning paths simultaneously as a tree search, where each node represents an intermediate reasoning step (\"thought\"). The approach uses thought generators to create candidate next steps and state evaluators to score them, then applies search algorithms (BFS, DFS, or beam search) to traverse the tree and find optimal solutions. Key implementation details include flexible thought decomposition (granularity depends on task type), independent sampling or sequential proposals for generating candidates, and scoring via LLM evaluation or voting mechanisms. ToT significantly outperforms standard CoT on complex reasoning tasks requiring backtracking—GPT-4 improved from 4% to 74% success on Game of 24, and solved 4× more crossword puzzles—making it essential for multi-step problems where early choices affect later feasibility.",
+    "summary": "Tree-of-Thought (ToT) extends chain-of-thought prompting by enabling language models to explore multiple reasoning paths simultaneously through tree search, where each node represents an intermediate reasoning step evaluated and scored by the model. The approach demonstrated dramatic improvements on complex reasoning tasks—Game of 24 accuracy jumped from 4% with standard CoT to 74% with GPT-4 using ToT—making it particularly effective for mathematical, planning, and backtracking-heavy problems.",
+    "generated_at": "2026-04-27T03:17:04.379674+00:00",
+    "content_hash": "06255f6cbb087684",
+    "backend": "cli"
+  },
+  "knowledge/concepts/online-speed-envelope-learning.md": {
+    "title": "Online Speed Envelope Learning",
+    "description": "Online Speed Envelope Learning is an adaptive system that learns per-waypoint speed limits for racing AI using real-time slip angle telemetry, eliminating the need for physics DataLibrary access. It maintains a speed table initialized conservatively (μ=0.8) and adapts each lap based on observed slip angles—reducing speed by 5% when slip exceeds 5-8° and increasing by 2% when below 2°, converging to near-optimal in 3-5 laps. Per-waypoint indexing accounts for track-specific grip variations (kerbs, elevation, surface type) rather than assuming a global friction coefficient. This approach automatically adapts to tire wear, fuel load, and damage, making it practical for racing AI deployment across diverse conditions.",
+    "summary": "Online speed envelope learning adapts per-waypoint speed limits using slip angle telemetry feedback, reducing speeds when slip exceeds 5–8° and increasing when below 2°, converging to track-specific grip limits within 3–5 laps without requiring physics DataLibrary access. The algorithm maintains a per-section speed table initialized conservatively (μ=0.8) and adjusts via threshold-based multiplicative factors (±2–5% per lap) to handle tire wear, fuel load, and surface variations.",
+    "generated_at": "2026-04-27T03:17:22.113412+00:00",
+    "content_hash": "b834f497bf8c47ec",
+    "backend": "cli"
+  },
+  "knowledge/concepts/semantic-search.md": {
+    "title": "Semantic Search",
+    "description": "Semantic search retrieves documents by meaning rather than exact keyword matches, encoding queries and documents as dense vectors in an embedding space and ranking results by vector distance. Both query and documents use the same embedding model (e.g., text-embedding-3-large, snowflake-arctic-embed2) to produce vectors (768–3072 dimensions), which are then searched using approximate nearest neighbor algorithms like HNSW. Hybrid search combines dense semantic retrieval with sparse BM25 keyword matching via Reciprocal Rank Fusion for higher accuracy. Use semantic search when you need conceptually related results beyond literal keywords, and hybrid search when exact matches matter alongside meaning-based retrieval.",
+    "summary": "Semantic search retrieves documents by vector similarity rather than keyword matching, encoding documents and queries as dense vectors in a shared embedding space. This project implements hybrid search combining semantic similarity with BM25 keyword matching, powered by snowflake-arctic-embed2 embeddings (1024-dim) in Weaviate.",
+    "generated_at": "2026-04-27T03:17:39.347514+00:00",
+    "content_hash": "f2d63840c663c503",
+    "backend": "cli"
+  },
+  "knowledge/concepts/rotary-positional-embeddings-rope.md": {
+    "title": "Rotary Positional Embeddings (RoPE)",
+    "description": "RoPE encodes each token's absolute position as a rotation in 2D embedding subspaces such that query-key dot products depend only on relative distance, unifying absolute and relative positional encoding with zero learnable parameters. Applied via rotation matrices R(m, d) using angle m * theta_d (where theta_d = 1 / base^(2d / |D|)) on embedding dimension pairs before attention, it requires only ~1-3% computational overhead per forward pass. The design produces natural recency bias through frequency-dependent decay and integrates seamlessly with efficient attention variants like FlashAttention and linear attention, unlike T5-style relative bias methods. RoPE is the de facto positional encoding for virtually all major open-weight LLMs (Llama, Mistral, Qwen) and has spawned context-extension methods enabling up to 2M+ token windows, making it essential for modern transformer architectures.",
+    "summary": "RoPE encodes token positions as rotations in 2D subspaces, making attention dot products depend only on relative distance with zero learnable parameters. It is the de facto standard for virtually all major open-weight LLMs and supports context extension to 2M+ tokens via methods like YaRN and LongRoPE.",
+    "generated_at": "2026-04-27T03:17:57.071476+00:00",
+    "content_hash": "33b43698230c1162",
+    "backend": "cli"
+  },
+  "knowledge/concepts/dpo-direct-preference-optimization.md": {
+    "title": "DPO - Direct Preference Optimization",
+    "description": "DPO is a preference-based alignment method that replaces RLHF's separate reward model and reinforcement learning loop with direct supervised learning, reducing cost by ~60% and compute time by ~40%. It reparameterizes the RLHF objective to derive a closed-form loss where the log-probability ratio log(π/π_ref) implicitly encodes preference signals, requiring only a policy and reference model instead of four separate models. Training simplifies from three stages (SFT→RM→PPO) to two (SFT→DPO) while improving stability by eliminating reward model drift and RL instability. DPO is now standard in major models (Llama 3, Claude, GPT-4) and is preferred for efficient alignment when you have fixed preference datasets and prioritize computational efficiency over the ability to discover novel failure modes during training.",
+    "summary": "DPO eliminates RLHF's separate reward model and PPO training via a closed-form supervised loss derived from the Bradley-Terry model, where the log-probability ratio log(π/π_ref) implicitly encodes preference, reducing alignment cost by ~60% and training time by ~40%. The offline nature—learning only from fixed preference datasets without exploratory sampling—trades this efficiency for inability to discover or correct failure modes unseen during training.",
+    "generated_at": "2026-04-27T03:18:17.098462+00:00",
+    "content_hash": "764e41a6b1f6eb27",
+    "backend": "cli"
+  },
+  "knowledge/concepts/structured-output.md": {
+    "title": "Structured Output",
+    "description": "Structured Output constrains LLM generation to produce outputs conforming to specific schemas (JSON, XML, typed objects) rather than free-form text, enabling programmatic downstream use in tool calling and data extraction. Modern implementations range from API-level JSON Mode guarantees through schema-constrained generation with Pydantic models (OpenAI/Anthropic Beta APIs) and guided decoding frameworks (Outlines, vLLM, LMQL) to simpler prompt-based extraction with retry-on-parse-failure. For unsupported APIs, prompt engineering with explicit schema examples and validation loops achieves similar reliability, though with higher failure rates. Structured outputs are essential for production systems that need deterministic parsing, enabling robust integration of LLM outputs into downstream pipelines.",
+    "summary": "Structured Output constrains LLM generation to conform to explicit schemas (JSON, XML, typed objects) for programmatic use, with reliability ranging from native API-level schema enforcement (guaranteed conformance) through guided decoding and tool calling to prompt-based approaches (requiring validation and retry). The critical distinction: native schema-constrained APIs guarantee output conformance, while prompt-based methods do not.",
+    "generated_at": "2026-04-27T03:18:38.524404+00:00",
+    "content_hash": "d62731c3d1068684",
+    "backend": "cli"
+  },
+  "knowledge/concepts/reward-shaping-intrinsic-reward-design.md": {
+    "title": "Reward Shaping & Intrinsic Reward Design in RL",
+    "description": "Reward shaping modifies reward signals in RL to accelerate learning without changing the optimal policy, addressing sparse rewards and misalignment between designer intent and agent behavior. Potential-based reward shaping uses the formula R'(s,a,s') = R(s,a,s') + γ*Φ(s') - Φ(s), where the potential function Φ(s) shifts value functions by a constant while preserving optimal policy. Intrinsic reward shaping combines extrinsic and intrinsic rewards, enabling dynamic adjustment via methods like PGRD and LIRPG that optimize reward parameters online as the agent learns. Essential for robotics, game AI, and navigation tasks where delayed or sparse feedback would otherwise require impractically long training times.",
+    "summary": "Potential-based reward shaping modifies reward signals as R'(s,a,s') = R(s,a,s') + γ*Φ(s') - Φ(s) to accelerate learning while provably preserving the optimal policy by shifting value functions by a constant. Intrinsic reward methods like LIRPG combine extrinsic task rewards with intrinsic rewards (curiosity, progress-based, diversity-based) to reduce sample complexity on sparse-reward tasks.",
+    "generated_at": "2026-04-27T03:19:01.887577+00:00",
+    "content_hash": "fa095846993c36b8",
+    "backend": "cli"
+  },
+  "knowledge/concepts/model-quantization.md": {
+    "title": "Model Quantization",
+    "description": "Model quantization reduces the numerical precision of neural network weights and activations from high-precision formats (FP32/BF16) to lower-precision representations (INT8, INT4, INT2), decreasing memory footprint and accelerating inference. Two primary approaches exist: post-training quantization (PTQ) methods like GPTQ, AWQ, and GGUF (5–30 minutes, 90–95% quality retention), and quantization-aware training (QAT) integrated during training for up to 96% accuracy recovery. A 7B model at FP16 occupies ~14 GB; quantized to INT4 it reduces to ~3.5 GB, with granular optimization strategies (per-tensor, per-channel, per-group) targeting weights, activations, or KV cache depending on use case. Quantization is critical for deploying large models on resource-constrained hardware and enabling long-context inference where KV cache memory dominates total consumption.",
+    "summary": "Quantization converts FP32/BF16 weights to INT4/INT8 using the formula GB = (params in billions) × (bits/8); post-training methods (GPTQ, AWQ) achieve 90–95% quality retention in 5–30 minutes while QAT training recovers to 96% accuracy over 2–4 hours for 7B models.",
+    "generated_at": "2026-04-27T03:19:26.877436+00:00",
+    "content_hash": "3b901b29b08fea13",
+    "backend": "cli"
+  },
+  "knowledge/concepts/chunking-strategies-llm-rag.md": {
+    "title": "Chunking Strategies for LLM and RAG Systems",
+    "description": "Chunking is splitting documents into smaller pieces before embedding and indexing for LLM/RAG systems; strategy choice directly impacts recall—up to 9% gap between best and worst approaches. Recursive Character Splitting (the default) splits at natural language boundaries (paragraphs → sentences → words), preserves document structure, and achieves 88-89% recall with text-embedding-3-large. Semantic Chunking uses embedding similarity between consecutive sentences to identify topic shifts and split where meaning changes, yielding 2-3% better recall than recursive splitting. Choose recursive splitting for technical documentation and general content; semantic splitting when fine-grained semantic coherence matters more than structural preservation.",
+    "summary": "Chunking strategy directly impacts RAG retrieval recall by up to 9%; semantic chunking achieves 2-3% better performance than recursive character splitting (88-89% baseline) but requires expensive embedding API calls, making recursive character splitting the recommended default for most document types. Key tradeoff: recursive splitting offers strong recall (88-89%) with low cost, while semantic chunking justifies its higher cost ($0.01-0.04 per 10K words) only for dense, high-stakes retrieval scenarios.",
+    "generated_at": "2026-04-27T03:19:47.178464+00:00",
+    "content_hash": "1e661b61d9f43f07",
+    "backend": "cli",
+    "chunk_summaries": {
+      "1": "Chunk 1 introduces chunking fundamentals and the critical size-tradeoff problem for RAG systems, then details recursive character splitting strategy with implementation code and 88-89% recall benchmarks.",
+      "2": "Late chunking, decision trees for selecting chunking strategies based on document type and constraints, 10-20% overlap best practices, and chunk quality evaluation metrics."
+    },
+    "total_chunks": 2
+  },
+  "knowledge/concepts/bayesian-inference.md": {
+    "title": "Bayesian Inference",
+    "description": "Bayesian inference is a statistical method that updates probability estimates for hypotheses using Bayes' theorem to compute posterior distributions from prior beliefs and observed evidence, forming the mathematical foundation for the Free Energy Principle and Active Inference. The core challenge is that computing the exact posterior p(H|D) requires marginalizing over all hypotheses, which is intractable for most real-world models. Approximate inference methods address this: Variational Inference minimizes KL divergence to find a tractable distribution q(H), MCMC samples from the posterior via ergodic chains, and Laplace Approximation fits a Gaussian around the posterior mode—notably, minimizing variational free energy F = -ELBO is mathematically equivalent to Bayesian inference. Bayesian inference enables belief-driven AI systems, from multi-agent coordination (BEACOF, Bayesian delegation) to LLM reasoning and uncertainty quantification, making it essential for principled probabilistic reasoning under uncertainty.",
+    "summary": "Bayesian inference uses Bayes' theorem to compute posteriors p(H|D) from likelihoods, priors, and evidence, with variational free energy minimization mathematically equivalent to approximate Bayesian inference—the formal foundation of the Free Energy Principle and Active Inference. Core approximation methods include variational inference (ELBO maximization), MCMC, and Laplace approximation, enabling applications in multi-agent coordination, LLMs, knowledge graphs, and reinforcement learning.",
+    "generated_at": "2026-04-27T03:20:28.052438+00:00",
+    "content_hash": "3ac8349626a29f02",
+    "backend": "cli"
+  },
+  "knowledge/patterns/prompt-engineering-2026.md": {
+    "title": "Prompt Engineering Patterns - 2026 Research",
+    "description": "This is a research-backed synthesis of prompt engineering techniques for Claude 4.x models, covering 1,500+ academic papers and Anthropic's 2026 best practices to reduce AI error rates by up to 60%. Effective prompts follow three pillars: context provision (background and constraints), instruction clarity (explicit, unambiguous directions), and constraint definition (output format and boundaries)—with key techniques including Chain-of-Thought, Few-Shot Learning, and Role-Based prompting. Claude 4.x models require more explicit instruction than 3.x versions, prioritizing clarity over implicit assumptions and demanding that reasoning be stated rather than implied. Apply these patterns when building production AI systems to systematically improve prompt quality through iteration and constraint definition rather than guesswork.",
+    "summary": "Research-backed prompt engineering patterns reduce error rates by 60% via three pillars—context provision, instruction clarity, and constraint definition—with Chain-of-Thought, few-shot learning, and role-based prompting showing maximum impact. Claude 4.x models require explicit instructions (unlike 3.x) and rely more heavily on clear motivation and above-and-beyond behavior specified directly in the prompt.",
+    "generated_at": "2026-04-27T03:20:44.725479+00:00",
+    "content_hash": "d106cf51e0973d8e",
+    "backend": "cli",
+    "chunk_summaries": {
+      "1": "This chunk establishes the three foundational pillars of prompt engineering (Context Provision, Instruction Clarity, Constraint Definition) and positions Chain-of-Thought, Few-Shot, and Role-Based prompting as the most impactful techniques, backed by 1,500+ academic papers.",
+      "2": "This chunk covers three MCP-integrated prompting patterns: tool-use prompts for semantic search and code analysis, MCP server templates for systematic codebase analysis workflows, and resource prompts for knowledge/code graph data retrieval.",
+      "3": "Chunk 3 defines escalation procedures, provides 2026 productivity statistics (55% faster completion with well-engineered prompts, 60% error reduction with Chain-of-Thought), catalogs 33 prompt-engineering vocabulary terms, and lists recommended academic papers and official documentation for further study."
+    },
+    "total_chunks": 3
+  },
+  "knowledge/models/qwen3-coder-30b-a3b.md": {
+    "title": "Qwen3-Coder-30B-A3B",
+    "description": "Qwen3-Coder-30B-A3B is a Mixture-of-Experts coding model with 30.5B total parameters and 3.3B active parameters per token, designed as the primary local Ollama integration for agentic coding tasks. The model features 48 layers with 128 experts (8 routed), a 262k token native context window, and recommended CPU-only deployment using Q4_K_M quantization (~19GB) with approximately 25GB total RAM for 100k context operation. Community best practice suggests 32k–65k context for stable tool calling, though 100k+ context is possible with some quality degradation on complex tasks. Use this when you need free local code generation, agentic coding workflows, or CPU-only inference without cloud dependencies.",
+    "summary": "Qwen3's 30.5B-param MoE coding model with 3.3B active params per token, designed for agentic coding tasks and Ollama integration with 262k native context. Requires ~25 GB RAM for CPU-only 100k-context inference (Q4_K_M quantization); community best practice is 32k–65k context for reliable tool calling.",
+    "generated_at": "2026-04-27T03:21:17.709464+00:00",
+    "content_hash": "676bf2acb50d7804",
+    "backend": "cli"
+  },
+  "knowledge/models/qwen3-coder-next.md": {
+    "title": "Qwen3-Coder-Next",
+    "description": "Qwen3-Coder-Next is a 80B-parameter mixture-of-experts (MoE) coding model with only 3B parameters active per token, available locally via Ollama. It uses 48 hybrid layers combining GatedDeltaNet attention with 512 total experts (10+1 active per token), trained with RL on 800K verifiable executable tasks, and supports 256K context length. The model achieves 70.6% on SWE-Bench Verified and 44.3% on SWE-Bench Pro—outperforming models 10–20× larger on coding benchmarks. Runs locally on ~46GB VRAM (q4_K_M quantization), making it practical for offline code generation tasks where state-of-the-art quality matters without the cost of larger closed models.",
+    "summary": "Sparse MoE coding model with 80B parameters and 3B active per token, achieving 70.6% on SWE-Bench Verified—outperforming models 10-20x larger—trained with RL on 800K executable tasks. Offers 256K context length and runs locally on ~46GB VRAM with q4_K_M quantization.",
+    "generated_at": "2026-04-27T03:21:54.714418+00:00",
+    "content_hash": "05ddb2ed35cdf72a",
+    "backend": "cli"
+  },
+  "knowledge/models/internvl.md": {
+    "title": "InternVL",
+    "description": "InternVL is a family of open-source multimodal large language models from OpenGVLab achieving state-of-the-art performance among open-source VLMs, with InternVL3-78B scoring 72.2 on MMMU. The architecture combines a vision encoder (InternViT: 300M–6B parameters) with a language model backbone (InternLM or Qwen), connected via dynamic resolution tiling that handles images up to 4K by splitting them into 448×448 patches. Models range from 1B to 78B parameters, with InternVL3-8B (~18 GB FP16, ~7 GB INT4) offering strong quality/size balance and excelling at OCR, document understanding, and chart comprehension. Use InternVL when you need open-source multimodal reasoning for high-resolution documents or visual understanding tasks with moderate VRAM constraints.",
+    "summary": "InternVL3-78B achieves 72.2 on MMMU (SOTA among open-source VLMs) via a mini-GPT-4 architecture combining a 6B InternViT vision encoder with dynamic-resolution image tiling (12–24 patches max) for handling 4K images. InternVL2-8B (17GB VRAM) scores 794 on OCRBench and 91.6 on DocVQA, making it one of the best open-source models for document understanding and text-in-image OCR tasks.",
+    "generated_at": "2026-04-27T03:22:16.369426+00:00",
+    "content_hash": "805edf96bd878525",
+    "backend": "cli"
+  },
+  "knowledge/tools/fastmcp.md": {
+    "title": "FastMCP",
+    "description": "FastMCP is the standard Python framework for building Model Context Protocol servers and clients, maintained by Prefect and used by ~70% of MCP servers worldwide. It auto-generates JSON schemas, validation, and MCP boilerplate from Python type hints and decorators (`@mcp.tool`, `@mcp.resource`, `@mcp.prompt`), eliminating manual schema writing and Pydantic validation overhead. The framework supports multiple transports (stdio, HTTP/SSE, WebSocket), authentication (OAuth 2.0, API keys), response caching, and async patterns, making it production-ready out of the box. Use FastMCP when building MCP servers—it reduces boilerplate 10–20x versus the raw MCP SDK while providing enterprise features like proper lifespans and request authorization.",
+    "summary": "FastMCP is the standard Python framework for MCP servers/clients (2.x/3.x, Prefect-maintained) that auto-generates JSON schema, validation, and protocol boilerplate from Python type hints and docstrings. It powers ~70% of MCP servers globally and is downloaded ~1 million times per day.",
+    "generated_at": "2026-04-27T03:22:38.130458+00:00",
+    "content_hash": "ef4267d443995e13",
+    "backend": "cli",
+    "chunk_summaries": {
+      "1": "FastMCP is a Python framework for building MCP servers (1M daily downloads, Prefect-maintained) featuring decorator-based tools with auto-generated schemas, and supporting resources, prompts, multiple transports (stdio/HTTP/WebSocket), and authentication middleware."
+    },
+    "total_chunks": 2
+  },
+  "knowledge/tools/ollama-mcp-server.md": {
+    "title": "Ollama MCP Server",
+    "description": "The Ollama MCP Server is a FastMCP-based local LLM inference tool providing FREE document processing without consuming Claude API tokens. It provides `chat` for inference (qwen3:0.6b by default, qwen3:latest for reasoning) and `read_document` for summarization/extraction, with automatic chunking for large files (>100K chars). The server runs as a stdio subprocess and returns JSON responses including processing results, tokens/second, and execution time. Use it to save API tokens on quick analysis, rewrites, and extraction tasks while keeping documents local; trade reasoning capability for speed and cost.",
+    "summary": "FastMCP-based server providing FREE local LLM inference through Ollama (qwen3:0.6b/8B models) with two tools: `chat()` for quick analysis/rewrites and `read_document()` for file summarization that auto-switches to chunked scanning for files >100K characters, eliminating Claude API token consumption for document processing.",
+    "generated_at": "2026-04-27T03:23:22.953745+00:00",
+    "content_hash": "262ef6588c5989fc",
+    "backend": "cli"
+  },
+  "knowledge/tools/fastapi.md": {
+    "title": "FastAPI",
+    "description": "FastAPI is a modern Python web framework for building REST APIs with automatic OpenAPI documentation, type-hint-based validation, and native async support, built on Starlette (ASGI) and Pydantic v2. Key strengths include async-first performance comparable to Node.js/Go for I/O workloads, end-to-end type safety with automatic request/response validation, and automatic Swagger UI/ReDoc documentation generated from type hints. FastAPI includes built-in dependency injection for clean resource management, and native support for common ML/AI patterns like streaming responses (for LLM token generation) and file uploads (for vision models). It is the dominant choice for AI/ML API backends due to strong developer experience, performance, and seamless Python type system integration.",
+    "summary": "FastAPI (built on Starlette + Pydantic) is an async-first REST framework that auto-generates OpenAPI specs from type hints and matches Node.js/Go I/O performance, making it the dominant choice for AI/ML APIs. Native streaming responses, automatic Pydantic v2 validation, and type-safe dependency injection eliminate boilerplate while enforcing end-to-end type safety.",
+    "generated_at": "2026-04-27T03:23:42.097195+00:00",
+    "content_hash": "8be38785ee74638c",
+    "backend": "cli"
+  },
+  "knowledge/tools/weaviate.md": {
+    "title": "Weaviate",
+    "description": "Weaviate is an open-source vector database that stores and searches high-dimensional embeddings with metadata filtering, enabling semantic search and knowledge graph capabilities. It uses HNSW for sub-100ms similarity queries, supports property filtering via GraphQL/gRPC APIs, and models relationships through cross-referenced objects and graph traversal. Schema design separates document chunks (content + source metadata) from knowledge nodes (title, type, tags, WikiLinks). Use it when you need semantic search across structured data, knowledge graph relationships, or multi-tenant isolation with filtered vector queries—critical for this project's KG infrastructure.",
+    "summary": "Weaviate is an open-source vector database using HNSW for sub-100ms semantic search with property filtering and graph traversal; critical constraint: actual embedding token limit is 2500 tokens (not the documented 8192), requiring strict chunking for content ingestion and query deduplication by source_node_id.",
+    "generated_at": "2026-04-27T03:23:59.153381+00:00",
+    "content_hash": "a51d61712a912939",
+    "backend": "cli",
+    "chunk_summaries": {
+      "1": "This chunk describes an automated feature that seeds Weaviate with bundled project documentation during installation via `upload_docs.py`, solving the empty-database problem and ensuring immediate semantic search availability through idempotent chunk insertion and tested integration with install.py.",
+      "2": "This chunk explains how conversation messages are validated, tokenized, and chunked for storage, including the 1500-token threshold rationale and the design decision to start chunks with user messages for better semantic search."
+    },
+    "total_chunks": 4
+  },
+  "knowledge/tools/ollama.md": {
+    "title": "Ollama",
+    "description": "Ollama is a local LLM inference server wrapping llama.cpp with a Go-based REST API, providing Docker-like model management for running open-weight language models on consumer hardware. It exposes REST endpoints for text completions, chat, embeddings, and model management via Modelfile format, supporting CUDA/Metal/ROCm GPU acceleration and GGUF quantized models. Tool calling is supported (llama3.2+, qwen2.5+), with 14B-32B models recommended for production agents. It's ideal for zero-cost local inference with no API keys or data privacy concerns, though sequential request processing makes it single-user optimized; for high-concurrency production, vLLM achieves 16.6x higher throughput.",
+    "summary": "Ollama wraps llama.cpp in a Go REST API to provide zero-cost local inference of GGUF-quantized models on consumer GPUs, supporting streaming chat, embeddings, and tool calling via `localhost:11434`; its critical limitation is sequential request processing without batching, making it unsuitable for concurrent multi-user production deployments.",
+    "generated_at": "2026-04-27T03:25:04.808420+00:00",
+    "content_hash": "1d6d2ba6fe9c7c44",
+    "backend": "cli"
+  },
+  "knowledge/tools/claude-code-cli-headless.md": {
+    "title": "Claude Code CLI - Headless & Scripted Usage",
+    "description": "Claude Code CLI (`claude -p`) enables headless, non-interactive use with real-time JSON streaming, running on Claude Max subscription instead of per-token API billing. Session management includes `--continue`, `--resume`, `--fork-session`; context injection uses `--append-system-prompt` (preserves defaults) or `--system-prompt` (replaces); tool control via `--allowedTools`, `--disallowedTools`, `--permission-mode`. It supports multi-agent workflows with inline agent definitions and provides agentic loop safety limits (`--max-turns`). Use for subscription-based headless automation and external system integration—the recommended approach over Agent SDK for subscription users seeking cost-free orchestration.",
+    "summary": "**Claude Code CLI (`claude -p`) uses Claude Max subscription for headless orchestration without per-token API billing—unlike the Agent SDK which charges per token.** Supports session resumption, context injection via `--append-system-prompt`, granular tool/permission control, multi-agent definitions, and `stream-json` output for real-time programmatic automation.",
+    "generated_at": "2026-04-27T03:25:25.522449+00:00",
+    "content_hash": "ac7a1b0d86a55bbb",
+    "backend": "cli"
+  }
+}
