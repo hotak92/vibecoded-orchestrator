@@ -86,6 +86,74 @@ With this on, asking the orchestrator to refactor 30 files or analyze 5 director
 
 This is the only global env var worth setting; everything else is per-project.
 
+## Disabling hooks for debugging or CI
+
+Set `VCT_DISABLE_HOOKS=1` and every `.claude/hooks/*.sh` exits 0 cleanly without doing its work. Useful when:
+
+- A hook misbehaves and you want a one-knob disable instead of editing each hook or the hook matchers.
+- Running install or tests in CI where backing services (Weaviate, Ollama) are not running and hook probes would spam errors.
+- You're debugging a session and need raw tool output without hook side effects.
+
+```bash
+# Ad-hoc, single session
+VCT_DISABLE_HOOKS=1 claude
+
+# Persistent, current shell only
+export VCT_DISABLE_HOOKS=1
+
+# CI runners
+env VCT_DISABLE_HOOKS=1 python install.py --quiet
+```
+
+The guard sits **after** the credential-scrub block in every hook, so secrets are still stripped from the env even when the hook itself no-ops. Coverage is asserted by `tests/test_hooks_disable_guard.py` — a regression that adds a new hook without the guard fails CI.
+
+## Vision (read_image) memory budget
+
+The Ollama MCP's `read_image` tool returns an image as a base64 data URL (which Claude can read directly) and optionally a local text description from a vision model. The local description tier is memory-aware:
+
+- Probes free VRAM and system RAM at module load.
+- Picks GPU if VRAM is at or above the per-model threshold; otherwise tries CPU; otherwise auto-falls-back to a smaller installed model.
+- If no model fits, returns the image-as-base64 with `description_skipped_reason` set. Claude still sees the image directly.
+
+Per-model thresholds (q4_K_M; floors include KV cache and image-feature activations):
+
+| Model | VRAM | RAM |
+|---|---|---|
+| qwen3.5:9b (default) | 7.5 GB | 12 GB |
+| qwen3.5:7b | 6.0 GB | 10 GB |
+| qwen3.5:4b | 4.0 GB | 7 GB |
+| llama3.2-vision:11b | 9.0 GB | 16 GB |
+| gemma3:4b / gemma4:e4b | 5.0 GB | 8 GB |
+
+Resize budget is also tiered: `max_total_pixels` (default 1024² = 1,048,576) is clamped DOWN to 720² / 512² / 256² when free VRAM drops below 8 / 6 / 4 GB. The actual budget used is surfaced as `image_budget_clamped_from` in the response.
+
+Override via `OLLAMA_VISION_MODEL=<model_id>` to force a specific model regardless of memory.
+
+## Sharing knowledge across projects
+
+By default, every project queries both its per-project KG and a shared cross-project collection (`VibeCodedTools_KnowledgeGraph`). Knowledge nodes captured in one project are visible to all others without re-explaining context.
+
+Three control points:
+
+- **`SHARED_KG_COLLECTION`** — name of the shared collection. Default `VibeCodedTools_KnowledgeGraph`. Override to point at a private team-shared collection (`AcmeTeam_SharedKG`) without exposing it via the public bundled name.
+- **`SHARED_KG_OPT_OUT=true`** — per-project opt-out. Zeros `SHARED_KG_COLLECTION` for this project's MCP server; `hybrid_search` and `semantic_graph_search` then query only the per-project KG. The shared collection itself is unaffected — other projects keep using it.
+- **`store_knowledge_node(scope="shared")`** — explicit write to the shared collection. The default scope is `"project"` so arbitrary projects don't pollute the shared collection by accident.
+
+Install does NOT auto-adopt a foreign shared KG it finds on the host (e.g. an existing `ClaudeKnowledgeGraph` from an earlier install). Reason: the orphan-prune pass in `sync_knowledge_graph.py` deletes entries whose `file_path` no longer exists in the active project; two installs sharing one collection would silently delete each other's nodes. vco always creates `VibeCodedTools_KnowledgeGraph` fresh (or skips creation if the exact name already exists).
+
+## KG-summary backend selection
+
+Auto-generated 2-3 sentence summaries for every KG node, written to `knowledge/.node_formats.json` and consumed by the auto-tier retrieval system. Backends are tried in order; first one available wins:
+
+1. `claude` CLI on PATH — best quality, requires CLI install.
+2. Ollama at `http://localhost:11435` — works for any vco user since Ollama is already required for embeddings. Default model `qwen3.5:9b` (16+ GB VRAM) or `gemma4:e4b` for low-VRAM hosts.
+3. `ANTHROPIC_API_KEY` direct — opt-in fallback; costs $$ per generation.
+4. Silent skip — friendly log line, exits 0.
+
+Force a specific backend with `KG_SUMMARY_BACKEND=cli|ollama|api|skip`. Override Ollama generation params with `KG_SUMMARY_OLLAMA_OPTIONS='{"temperature": 0.5, "num_ctx": 32768}'` (JSON object passed through to the Ollama API).
+
+A separate `PreToolUse` hook validates frontmatter on every write to `knowledge/**/*.md` and blocks writes missing required fields (`title`, `type`, `tags`, `created`, `updated`, `status`). The summary generator depends on these.
+
 ## Manual operator scripts
 
 Two helper scripts under `claude_mcp_servers/scripts/` are not wired into the

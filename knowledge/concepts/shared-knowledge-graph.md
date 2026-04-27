@@ -3,7 +3,7 @@ title: Shared Knowledge Graph (Cross-Project)
 type: concept
 tags: [knowledge-graph, weaviate, vibecoded-tools, mid-level-architecture, retrieval]
 created: 2026-04-27T00:00:00Z
-updated: 2026-04-27T00:00:00Z
+updated: 2026-04-27T20:00:00Z
 status: active
 ---
 
@@ -126,6 +126,24 @@ See `[[relatedTo::score-driven-retrieval-tiers]]` for the tier semantics.
   the `summary` tier falls back to a 200-char content snippet. No crash.
 - **Opt-out flag flipped post-create** — restart the MCP server (it reads env
   at startup). VS Code reload re-spawns the server.
+
+## Why install never auto-adopts a foreign shared KG
+
+The installer's content-based service detection can find an existing Weaviate
+collection that looks like a shared KG (e.g. `ClaudeKnowledgeGraph` from a prior
+Claude orchestrator install on the same machine). The installer **does not
+auto-adopt** it. Reason: the orchestrator's `sync_knowledge_graph.py` runs an
+**orphan-prune** pass that deletes Weaviate entries whose `file_path` no longer
+exists under the active project's `knowledge/` dir. Two installs sharing one
+collection would silently delete each other's nodes on the next sync.
+
+vco always creates its own `VibeCodedTools_KnowledgeGraph` (or skips creation if
+that exact name already exists). Power-users who really want to share across
+machines can override `SHARED_KG_COLLECTION` per-project to point at their own
+team-shared name; they accept responsibility for managing the orphan-prune
+collision themselves (typically by disabling orphan-prune for that collection
+or by ensuring all participating projects sync from a common source-of-truth
+folder).
 
 ## Why one shared collection (not many)
 
