@@ -58,6 +58,7 @@ import argparse
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -211,8 +212,14 @@ def main() -> int:
                         help="Uninstall: print what would be removed without removing anything.")
     parser.add_argument("--skip-seed", action="store_true", default=False,
                         help="Skip the Weaviate seed step (bundled knowledge/ + docs/). "
-                             "Useful in CI / test runs that don't need search content. "
-                             "Re-run later with `kg-sync --all` and `upload_docs.py --all`.")
+                             "Also skips collection creation — when there's no content "
+                             "to seed, the MCP server creates collections lazily on first "
+                             "write. Useful in CI / test runs. Re-run later with "
+                             "`kg-sync --all` and `upload_docs.py --all`.")
+    parser.add_argument("--skip-collections", action="store_true", default=False,
+                        help="Skip Weaviate collection bootstrap (Step 7b) but still seed. "
+                             "Implied by --skip-seed. Useful when the user wants the MCP "
+                             "server to create collections lazily.")
     # Safe-by-default service handling. When a foreign Weaviate / Ollama is
     # detected on the canonical port, the installer prompts the user. These
     # flags resolve the prompt non-interactively for CI / scripting.
@@ -302,7 +309,7 @@ def main() -> int:
         #     ⇒ writes to user-owned Weaviate WITH EXPLICIT CONSENT
         # No path writes without consent. The default for foreign is
         # alt-port, so the no-consent case never hits ACTION_ADOPT.
-        _ensure_collections(embed_config)
+        _ensure_collections(embed_config, decisions=decisions, args=args)
         # Seed Weaviate with bundled knowledge/ + docs/. Idempotent;
         # safe to re-run on update.
         _seed_weaviate(args)
@@ -1672,18 +1679,111 @@ def _development_class_definition(name: str) -> dict:
     }
 
 
-def _ensure_collections(embed_config: dict) -> None:
+_SAFE_CLASS_RE = re.compile(r"[^A-Za-z0-9]+")
+
+
+def _derive_project_kg_name(project_root: Path) -> str:
+    """Derive a per-project KG class name from the project root basename.
+
+    Weaviate class names must start with a capital letter and only contain
+    `[A-Za-z0-9_]`. We PascalCase the basename, drop everything else, and
+    suffix with `_KnowledgeGraph`. Fallback when nothing usable survives:
+    `vct_KnowledgeGraph` (lowercase prefix is intentional — Weaviate
+    capitalises the first letter on POST regardless, and the `vct_` token
+    flags it as installer-managed).
+    """
+    base = project_root.name or ""
+    parts = [p for p in _SAFE_CLASS_RE.split(base) if p]
+    if not parts:
+        return "vct_KnowledgeGraph"
+    pascal = "".join(p[:1].upper() + p[1:] for p in parts)
+    if not pascal or not pascal[0].isalpha():
+        return "vct_KnowledgeGraph"
+    return f"{pascal}_KnowledgeGraph"
+
+
+def _derive_project_dev_name(project_root: Path) -> str:
+    """Project-scoped Development collection name. Mirrors the per-project
+    KG naming so adopt mode does not pollute with a bare `Development`.
+    """
+    base = project_root.name or ""
+    parts = [p for p in _SAFE_CLASS_RE.split(base) if p]
+    if not parts:
+        return "vct_Development"
+    pascal = "".join(p[:1].upper() + p[1:] for p in parts)
+    if not pascal or not pascal[0].isalpha():
+        return "vct_Development"
+    return f"{pascal}_Development"
+
+
+def _ensure_collections(embed_config: dict,
+                        decisions: dict | None = None,
+                        args: argparse.Namespace | None = None) -> None:
     """Detect existing Weaviate collections and create only the ones missing.
 
     Code-graph collections (CodeModule / CodeClass / CodeFunction / CodeAPI /
     CodeInteraction) are SHARED across all projects on this machine — they
     carry a `project_name` field that separates rows. Don't recreate them
     per-install: the MCP server creates them lazily on first write.
+
+    Adopt-mode safety (the user's Weaviate already exists):
+      - Per-project KG / Development names are derived from the project
+        basename so we never write bare top-level `KnowledgeGraph` /
+        `Development` into a host that uses per-project namespacing.
+      - vco always creates its OWN collections; we deliberately do NOT
+        adopt cross-project KGs from other installs. Reason: the
+        orchestrator's orphan-prune sync would delete entries whose
+        `file_path` no longer exists in this install.
+      - In adopt mode, every proposed creation is announced; with `--yes`
+        the install proceeds non-interactively, otherwise the user is
+        prompted to confirm.
+      - `--skip-seed` and `--skip-collections` short-circuit the whole
+        step (collections get created lazily by the MCP server).
+
+    The resolved per-project / shared names are propagated back to
+    `os.environ` so `_write_env_config` writes them into `.env`.
     """
+    # Honor --skip-seed / --skip-collections: if the user opted out of
+    # seeding, they almost certainly don't want us mutating schema either.
+    if args is not None and (
+        getattr(args, "skip_collections", False)
+        or getattr(args, "skip_seed", False)
+    ):
+        print("[7b/10] Skipping Weaviate collection bootstrap "
+              "(--skip-seed / --skip-collections).")
+        print("  Run `kg-sync --all` later to seed; the MCP server creates "
+              "missing collections lazily on first write.")
+        return
+
     weaviate_port = os.environ.get("WEAVIATE_PORT", str(DEFAULT_WEAVIATE_PORT))
     weaviate_url = f"http://localhost:{weaviate_port}"
-    kg_name = os.environ.get("KG_COLLECTION", "KnowledgeGraph")
-    dev_name = os.environ.get("DEVELOPMENT_COLLECTION", "Development")
+
+    # Detect adopt mode: install is reusing a Weaviate it didn't bring up.
+    weaviate_decision = (decisions or {}).get("weaviate", {})
+    adopt_mode = weaviate_decision.get("action") == ACTION_ADOPT
+
+    # Per-project KG name. Resolution order:
+    #   1. KG_COLLECTION env var (Claude Code workspace override)
+    #   2. Adopt mode: derive from project basename (don't pollute with
+    #      bare `KnowledgeGraph`)
+    #   3. Otherwise: bare default (we own the Weaviate)
+    env_kg = os.environ.get("KG_COLLECTION")
+    if env_kg:
+        kg_name = env_kg
+    elif adopt_mode:
+        kg_name = _derive_project_kg_name(PROJECT_ROOT)
+    else:
+        kg_name = "KnowledgeGraph"
+
+    # Per-project Development collection: same logic.
+    env_dev = os.environ.get("DEVELOPMENT_COLLECTION")
+    if env_dev:
+        dev_name = env_dev
+    elif adopt_mode:
+        dev_name = _derive_project_dev_name(PROJECT_ROOT)
+    else:
+        dev_name = "Development"
+
     # Cross-project shared KG. All vibecoded installs read from the same shared
     # collection name (default "VibeCodedTools_KnowledgeGraph"); the projects
     # only differ in their per-project KG. Bootstrapped once per Weaviate
@@ -1692,7 +1792,9 @@ def _ensure_collections(embed_config: dict) -> None:
         "SHARED_KG_COLLECTION", "VibeCodedTools_KnowledgeGraph"
     ) or ""
 
-    print(f"[7b/10] Checking Weaviate collections at {weaviate_url} ... ", flush=True)
+    print(f"[7b/10] Checking Weaviate collections at {weaviate_url} "
+          f"({'adopt' if adopt_mode else 'self-managed'} mode) ... ",
+          flush=True)
 
     # 1. Read existing schema.
     try:
@@ -1708,23 +1810,83 @@ def _ensure_collections(embed_config: dict) -> None:
         if isinstance(c, dict) and c.get("class")
     }
 
+    # Note: we deliberately do NOT auto-adopt existing cross-project KGs
+    # (e.g. `ClaudeKnowledgeGraph` from another install). The orchestrator
+    # runs an orphan-prune sync cycle that would delete entries whose
+    # `file_path` no longer exists in this install — silently destroying
+    # the other install's KG. vco always gets its own collections;
+    # existing collections from other projects are left untouched.
+
+    # Propagate resolved names back to env so .env / settings.json pick
+    # them up. This is the tri-write source of truth for downstream steps.
+    os.environ["KG_COLLECTION"] = kg_name
+    os.environ["DEVELOPMENT_COLLECTION"] = dev_name
+    if shared_name:
+        os.environ["SHARED_KG_COLLECTION"] = shared_name
+
     # 2. Required for THIS project install. Code-graph collections excluded
     #    on purpose — they're shared and created on demand.
-    required = [
+    required: list[tuple[str, "callable"]] = [
         (kg_name, _kg_class_definition),
         (dev_name, _development_class_definition),
     ]
     # Shared cross-project KG. Same schema as the per-project KG (the MCP
     # server reads them with the same shape). Created once per Weaviate
     # instance — the existing-class check above means concurrent installs
-    # don't double-create.
+    # don't double-create. Skip if shared_name resolved to an existing class
+    # (we already adopted it above).
     if shared_name and shared_name != kg_name:
         required.append((shared_name, _kg_class_definition))
 
+    # In adopt mode, skip any `Development`-shaped class if the host already
+    # has a per-project one (e.g. `ClaudeOrchestrator_development`). The
+    # user's existing namespacing scheme wins.
+    if adopt_mode and dev_name not in existing:
+        existing_dev_like = [
+            c for c in existing
+            if c and (c.lower().endswith("_development") or c == "Development")
+            and c != dev_name
+        ]
+        if existing_dev_like:
+            print(f"  → host has existing Development-style collection(s): "
+                  f"{', '.join(sorted(existing_dev_like))}; skipping our "
+                  f"`{dev_name}` to respect host namespacing.")
+            required = [(n, b) for (n, b) in required if n != dev_name]
+
     missing = [(n, b) for (n, b) in required if n not in existing]
+    skipped_existing = [n for (n, _) in required if n in existing]
     if not missing:
         print(f"  All collections present (reusing {len(required)} shared classes).")
         return
+
+    # In adopt mode, announce what we're about to do and confirm. With
+    # --yes / non-TTY we proceed non-interactively (the user already
+    # consented to adoption upstream).
+    if adopt_mode:
+        print(f"  Existing classes ({len(existing)}): "
+              f"{', '.join(sorted(list(existing))[:6])}"
+              + (" ..." if len(existing) > 6 else ""))
+        if skipped_existing:
+            print(f"  Will SKIP (already present): "
+                  f"{', '.join(skipped_existing)}")
+        print(f"  Will CREATE in adopted Weaviate: "
+              f"{', '.join(n for (n, _) in missing)}")
+        interactive = (
+            args is not None
+            and not getattr(args, "yes", False)
+            and not getattr(args, "quiet", False)
+            and sys.stdin.isatty()
+        )
+        if interactive:
+            try:
+                ans = input("  Proceed with creating these classes? "
+                            "[Y/n]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                ans = ""
+            if ans in ("n", "no"):
+                print("  → user declined; skipping collection creation.")
+                print("    (MCP server will create lazily on first write.)")
+                return
 
     # 3. POST each missing class definition.
     created: list[str] = []
@@ -1976,14 +2138,17 @@ def _write_env_config(embed_config: dict, args: argparse.Namespace, joern_availa
         f"VCT_JOERN_AVAILABLE={'1' if joern_available else '0'}",
         "",
         "# Knowledge Graph",
-        "KG_COLLECTION=KnowledgeGraph",
-        "DEVELOPMENT_COLLECTION=Development",
+        # Resolved by _ensure_collections (per-install naming on adopt mode,
+        # bare defaults when we own the Weaviate). Defaults pinned here in
+        # case _ensure_collections didn't run (e.g. --no-containers).
+        f"KG_COLLECTION={os.environ.get('KG_COLLECTION', 'KnowledgeGraph')}",
+        f"DEVELOPMENT_COLLECTION={os.environ.get('DEVELOPMENT_COLLECTION', 'Development')}",
         "",
-        "# Cross-project shared KG (all projects on this machine read from it",
-        "# alongside their own KG). Seeded at install time from",
+        "# Cross-project shared KG (all vco installs on this machine read",
+        "# from it alongside their own KG). Seeded at install time from",
         "# vibecoded-orchestrator/knowledge/. Set SHARED_KG_OPT_OUT=true to",
         "# disable the shared collection per-project.",
-        "SHARED_KG_COLLECTION=VibeCodedTools_KnowledgeGraph",
+        f"SHARED_KG_COLLECTION={os.environ.get('SHARED_KG_COLLECTION', 'VibeCodedTools_KnowledgeGraph')}",
         "SHARED_KG_OPT_OUT=false",
         "",
     ]

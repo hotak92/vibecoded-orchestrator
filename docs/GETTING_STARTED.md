@@ -66,7 +66,7 @@ If anything goes wrong during install, see the troubleshooting table in [README.
 
 The installer is safe by default if you already have a Weaviate, Ollama, or other vco-managed service running on the canonical ports (`8081`, `11435`, `11440`) — regardless of who started it.
 
-Before bringing up its own containers, `install.py` probes each port and content-fingerprints the response:
+Before bringing up its own containers, `install.py` probes each port and content-fingerprints the response (it does not rely on container names; the probe inspects the `/v1/schema` and `/api/tags` payloads):
 
 - **Nothing on the port** → start our service on the default port.
 - **A prior vco install on the port** → adopt it. No new container, no re-prompt; reuses the running service via the `~/.vct/services.toml` lock file.
@@ -82,6 +82,57 @@ python install.py --on-conflict abort      # bail if any conflict is detected
 ```
 
 The chosen action per service is recorded in `~/.vct/services.toml` and re-read by both install.py and the launcher, so subsequent runs do not re-prompt.
+
+#### Collection naming in adopt mode
+
+When install adopts an existing Weaviate, it must not pollute the host with bare top-level `KnowledgeGraph` / `Development` collections — many users run Weaviate with per-project namespacing (`ARTup_KnowledgeGraph`, `ClaudeKnowledgeGraph`, etc.). Adopt mode therefore:
+
+1. **Derives the per-install KG name from the project basename** — installing in `~/projects/myapp/` writes to `Myapp_KnowledgeGraph` and `Myapp_Development`. Hyphens / underscores in the basename are PascalCased; pure-punctuation basenames fall back to `vct_KnowledgeGraph`.
+2. **Honors `KG_COLLECTION` / `DEVELOPMENT_COLLECTION` env vars** if set (typically via `.vscode/settings.json` `claude-code.env`) — explicit override wins over the basename derivation.
+3. **Skips creation of any collection that already exists** under the resolved name.
+4. **Skips a `Development` collection entirely** if the host already has any `<X>_development` (the host's namespacing wins).
+5. **Announces every proposed creation and waits for confirmation** in interactive mode. Pass `--yes` for non-interactive runs.
+6. **Does not auto-adopt cross-project shared KGs** like an existing `ClaudeKnowledgeGraph`. The orchestrator runs an orphan-prune sync that deletes entries whose `file_path` no longer exists in the active project, so two installs sharing one collection would silently delete each other's entries. vco always creates its own `VibeCodedTools_KnowledgeGraph` (or skips creation if it already exists).
+
+When install starts its own Weaviate (no adoption), bare `KnowledgeGraph` / `Development` defaults are kept — there's nothing else in the instance to namespace against.
+
+#### Skipping collection creation
+
+`--skip-seed` skips both the seed step and the schema bootstrap (no content to seed into anyway). The MCP server creates collections lazily on first write, so subsequent operations still work:
+
+```
+python install.py --skip-seed             # skip seed + collection bootstrap
+python install.py --skip-collections      # bootstrap-only opt-out (still seeds)
+```
+
+#### Opting out of the shared cross-project KG
+
+Set `SHARED_KG_OPT_OUT=true` in `.env` (or in the install environment) to disable the `VibeCodedTools_KnowledgeGraph` shared collection per-project. Useful for users who want hard isolation between projects.
+
+#### Lock file: `~/.vct/services.toml`
+
+Persists each service's resolved action so installer and launcher agree:
+
+```toml
+[[services]]
+name = "weaviate"
+mode = "adopt"          # or: "parallel", "unresolved", "refuse"
+external_url = "http://localhost:8081"
+parallel_port = 8082    # only when mode = "parallel"
+```
+
+Mode mapping mirrors the launcher's `AdoptionMode` enum (`adoption.rs`): `unresolved | adopt | parallel | refuse`. Delete the file to force a fresh probe on the next run.
+
+#### Manual cleanup of stray collections
+
+If an older install left orphaned collections behind (e.g. a bare `KnowledgeGraph` from before this fix), inspect them via the Weaviate REST API and delete with `curl`:
+
+```
+curl -s http://localhost:8081/v1/schema | python -m json.tool
+curl -X DELETE http://localhost:8081/v1/schema/KnowledgeGraph
+```
+
+The MCP server recreates any collection it actively uses on next write, so deleting an unused one is safe.
 
 ## Open the orchestrator in Claude Code
 
