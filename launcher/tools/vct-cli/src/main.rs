@@ -25,13 +25,16 @@ const DEFAULT_PORT: u16 = 7700;
 
 #[derive(Parser)]
 #[command(
-    name = "vct",
+    name = "vco",
     version,
-    about = "VCT Launcher CLI — power-user / CI escape hatch.",
+    about = "vibecoded-orchestrator CLI — power-user / CI escape hatch.",
     long_about = "\
 Talks to the running VCT Launcher's local hub server (default 127.0.0.1:7700).
 The launcher must be running for these commands to succeed; if it is not,
-start it via the system tray or the desktop app first."
+start it via the system tray or the desktop app first.
+
+Note: this CLI was renamed from `vct` to `vco` in v0.1.0 to avoid a name
+collision with the bash secrets tool at tools/vct-secrets/vct."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -78,6 +81,16 @@ enum TopCommand {
     Hub {
         #[command(subcommand)]
         cmd: HubCmd,
+    },
+    /// Knowledge graph search and collection inspection.
+    Kg {
+        #[command(subcommand)]
+        cmd: KgCmd,
+    },
+    /// Code graph search and collection inspection.
+    Codegraph {
+        #[command(subcommand)]
+        cmd: CodegraphCmd,
     },
 }
 
@@ -177,6 +190,59 @@ enum HubCmd {
     Health,
     /// Print the hub URL the CLI is talking to.
     Url,
+}
+
+#[derive(Subcommand)]
+enum KgCmd {
+    /// List orchestrator-shaped KG collections detected on the local
+    /// Weaviate instance.
+    Collections,
+    /// Search across one or more KG collections.
+    ///
+    /// If `--collections` is omitted the hub auto-detects every
+    /// orchestrator-shaped class on Weaviate (those with
+    /// `title`/`node_type`/`tags`/`typed_links`).
+    Search {
+        /// Search query (free text).
+        query: String,
+        /// Comma-separated collections (default: auto-detect).
+        #[arg(long, value_delimiter = ',')]
+        collections: Option<Vec<String>>,
+        /// Project context (id or slug). Required — used to enforce
+        /// per-collection ACLs and attribute the audit log entry.
+        #[arg(long)]
+        project: String,
+        /// Max hits per collection (clamped to 100 by hub).
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
+}
+
+#[derive(Subcommand)]
+enum CodegraphCmd {
+    /// List code-graph collections detected on the local Weaviate
+    /// instance (canonical 5 + per-project namespaced variants).
+    Collections,
+    /// Search across one or more code-graph collections.
+    Search {
+        /// Search query (free text).
+        query: String,
+        /// Comma-separated collections (default: auto-detect).
+        #[arg(long, value_delimiter = ',')]
+        collections: Option<Vec<String>>,
+        /// Project context (id or slug). Required for audit
+        /// attribution.
+        #[arg(long)]
+        project: String,
+        /// Restrict to a subset:
+        ///   * `all` (default) — every code-graph class
+        ///   * `code` — CodeModule / CodeClass / CodeFunction only
+        ///   * `interaction` — CodeAPI / CodeInteraction only
+        #[arg(long, default_value = "all")]
+        scope: String,
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
 }
 
 // ─── Hub client ─────────────────────────────────────────────────────────
@@ -303,6 +369,8 @@ fn run() -> Result<()> {
         TopCommand::Hooks { cmd } => hooks(&hub, cmd),
         TopCommand::Telemetry { cmd } => telemetry(&hub, cmd),
         TopCommand::Hub { cmd } => hub_cmd(&hub, cmd),
+        TopCommand::Kg { cmd } => kg(&hub, cmd),
+        TopCommand::Codegraph { cmd } => codegraph(&hub, cmd),
     }
 }
 
@@ -453,6 +521,62 @@ fn hub_cmd(hub: &Hub, cmd: HubCmd) -> Result<()> {
         HubCmd::Url => {
             println!("{}", hub.url());
             Ok(())
+        }
+    }
+}
+
+fn kg(hub: &Hub, cmd: KgCmd) -> Result<()> {
+    match cmd {
+        KgCmd::Collections => {
+            let v: serde_json::Value = hub.get_json("/cli/kg/collections")?;
+            print_json(&v)
+        }
+        KgCmd::Search {
+            query,
+            collections,
+            project,
+            limit,
+        } => {
+            let pid = resolve_project_id(hub, &project)?;
+            let mut body = serde_json::json!({
+                "project_id": pid,
+                "query": query,
+                "limit": limit,
+            });
+            if let Some(cs) = collections {
+                body["collections"] = serde_json::json!(cs);
+            }
+            let v: serde_json::Value = hub.post_json("/cli/kg/search", &body)?;
+            print_json(&v)
+        }
+    }
+}
+
+fn codegraph(hub: &Hub, cmd: CodegraphCmd) -> Result<()> {
+    match cmd {
+        CodegraphCmd::Collections => {
+            let v: serde_json::Value = hub.get_json("/cli/codegraph/collections")?;
+            print_json(&v)
+        }
+        CodegraphCmd::Search {
+            query,
+            collections,
+            project,
+            scope,
+            limit,
+        } => {
+            let pid = resolve_project_id(hub, &project)?;
+            let mut body = serde_json::json!({
+                "project_id": pid,
+                "query": query,
+                "scope": scope,
+                "limit": limit,
+            });
+            if let Some(cs) = collections {
+                body["collections"] = serde_json::json!(cs);
+            }
+            let v: serde_json::Value = hub.post_json("/cli/codegraph/search", &body)?;
+            print_json(&v)
         }
     }
 }

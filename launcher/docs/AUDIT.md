@@ -24,12 +24,18 @@ exhaustive as of this writing — derived by greping for `db.audit(` across
 | `commands/mcp_reg.rs` | `mcp_register_module`, `mcp_deregister_module` |
 | `commands/telemetry_cmd.rs` | `telemetry_set_consent`, `telemetry_clear_queue` |
 | `commands/project_state_cmd.rs` | agent/skill/hook register, enable, disable, unregister; permission add/delete; secret-ref set/delete; KG/codegraph binding set |
-| `hub/cli_api.rs` | mirror of the above when invoked via the hub CLI (`cli_*` variants tagged with `via: cli`) |
+| `hub/cli_api.rs` | mirror of the above when invoked via the hub CLI (`cli_*` variants tagged with `via: cli`); plus `cli.kg.search`, `cli.codegraph.search` for read-only search calls (query truncated to 200 chars in `detail`) |
 
 Operations not yet audited (intentionally — they're either read-only or
-non-persistent): `list_audit_events`, `kg_search`, `kg_load_graph`,
-`get_feature_flags`, `coordination_team_status`, all `get_*` /
-`list_*` queries.
+non-persistent): `list_audit_events`, `kg_search` (Tauri),
+`kg_load_graph`, `get_feature_flags`, `coordination_team_status`, all
+`get_*` / `list_*` queries.
+
+Note: the CLI-facing `cli.kg.search` and `cli.codegraph.search` operations
+*are* logged (one row per call) so power-user / CI activity is visible in
+the audit trail. The Tauri-side `kg_search` command remains read-only +
+non-audited because it's invoked many times per second by the GUI's
+auto-search box.
 
 ## Schema
 

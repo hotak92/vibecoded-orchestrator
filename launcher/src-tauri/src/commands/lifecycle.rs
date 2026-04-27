@@ -114,6 +114,22 @@ async fn probe_url(url: &str) -> bool {
     matches!(client.get(url).send().await, Ok(r) if r.status().as_u16() < 400)
 }
 
+/// Probe whether vco's services are already responding on the local host.
+/// Used as a false-negative guard for runtime detection: if Weaviate is
+/// reachable, the orchestrator's services are up regardless of whether
+/// our launcher process can find a container runtime on its (possibly
+/// stripped) PATH. In that case we should NOT show the user a "no
+/// container runtime" modal — they have one, our detection is wrong.
+///
+/// Only Weaviate is probed (not Ollama or code_embed). Weaviate is the
+/// hard prerequisite for the launcher's KG/codegraph features; Ollama and
+/// code_embed can be slower to come up and aren't blockers for the modal
+/// suppression.
+async fn services_already_running() -> bool {
+    let url = format!("http://localhost:{}/v1/.well-known/ready", DEFAULT_WEAVIATE_PORT);
+    probe_url(&url).await
+}
+
 /// Resolve the compose directory — `<repo_root>/infrastructure`. Errors
 /// when we can't locate the orchestrator repo (e.g. the binary isn't
 /// shipped with the source tree).
@@ -482,6 +498,37 @@ pub async fn auto_start_on_boot(app: AppHandle) {
     let info = match detect_runtime().await {
         Some(i) => i,
         None => {
+            // FALSE-NEGATIVE GUARD: a launcher process spawned by
+            // post-install-launcher.sh inherits a stripped PATH from
+            // `setsid nohup`. The runtime-detection probes can fail (no
+            // `podman-compose` on PATH, 2s cold-cache timeouts) even
+            // though the orchestrator's services are already running.
+            // Before showing the user a "no runtime found" modal — which
+            // pops a Gatekeeper-style dialog and can auto-open browser
+            // URLs to install instructions — verify whether Weaviate is
+            // ALREADY responding on the configured port. If it is, the
+            // services are up and the modal would be a false alarm.
+            //
+            // The launcher's full feature set (KG dashboards, search,
+            // module install) only needs Weaviate reachable, not a
+            // container runtime detected. The runtime is only needed to
+            // bring services UP from a stopped state.
+            if services_already_running().await {
+                eprintln!(
+                    "[lifecycle] runtime detection returned None but Weaviate \
+                     is reachable — services already running, suppressing \
+                     vct-no-container-runtime modal"
+                );
+                let _ = app.emit(
+                    EVT_LIFECYCLE_PROGRESS,
+                    LifecycleProgress {
+                        phase: "started".into(),
+                        message: "Services already running (adopted existing instance).".into(),
+                    },
+                );
+                return;
+            }
+
             // Surface BOTH events: the existing lifecycle event keeps
             // the tray/services panel informed (legacy consumer); the
             // new dedicated event drives the blocking modal that asks
@@ -666,6 +713,16 @@ mod services_lifecycle_tests {
             parallel_port: Some(8091), // ignored under Adopt mode
         });
         assert_eq!(effective_port("weaviate", 8081, &state), 8081);
+    }
+
+    #[tokio::test]
+    async fn services_already_running_probe_does_not_panic() {
+        // The probe MUST be panic-free regardless of whether Weaviate is
+        // up. This is a smoke test for the false-negative guard added
+        // 2026-04-27 to suppress the no-runtime modal when services are
+        // already running. Whether it returns true or false depends on
+        // the test host's state; we just assert it returned a bool.
+        let _ = services_already_running().await;
     }
 
     #[tokio::test]

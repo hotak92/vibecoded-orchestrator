@@ -5,7 +5,11 @@ edition = "2021"
 description = "Command-line interface for the VCT Launcher (escape hatch for power users / CI)."
 
 [[bin]]
-name = "vct"
+# Renamed from `vct` to `vco` to avoid colliding with the bash secrets tool
+# at tools/vct-secrets/vct (which predates this CLI and is already widely
+# integrated with git credentials, MCP launchers, etc.). `vco` matches the
+# `vibecoded-orchestrator` repo name. See docs/CLI.md.
+name = "vco"
 path = "src/main.rs"
 
 [dependencies]

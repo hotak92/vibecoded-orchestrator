@@ -352,11 +352,34 @@ pub async fn kg_search(
 
     let mut out = Vec::new();
     for collection in collections {
+        // GraphQL safety: validate the class name against a strict
+        // whitelist (Weaviate only ever creates classes matching
+        // `[A-Za-z][A-Za-z0-9_]*`), and escape backslashes BEFORE
+        // quotes in the query string. The original code did only
+        // `query.replace('"', "\\\"")` — which means a query like `\"`
+        // becomes `\\\"` and Weaviate parses it as literal-backslash +
+        // escaped-quote, letting the user's input slip through. Fixed
+        // 2026-04-27 alongside the parallel fix in hub/cli_api.rs.
+        if !collection
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_alphabetic())
+            .unwrap_or(false)
+            || !collection
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return Err(format!(
+                "invalid collection name: {} (must match [A-Za-z][A-Za-z0-9_]*)",
+                collection
+            ));
+        }
+        let escaped_query = query.replace('\\', "\\\\").replace('"', "\\\"");
         let q = format!(
             "{{ Get {{ {cls}(nearText: {{concepts: [\"{query}\"]}}, limit: {lim}) \
                 {{ title node_type tags content file_path _additional {{ id }} }} }} }}",
             cls = collection,
-            query = query.replace('"', "\\\""),
+            query = escaped_query,
             lim = limit,
         );
         let resp = client

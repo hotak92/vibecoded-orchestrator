@@ -148,43 +148,88 @@ fn which_on_path(name: &str) -> Option<PathBuf> {
 // Detection
 // ---------------------------------------------------------------------------
 
-/// Probe a binary's `--version` flag with a 2s timeout. Returns true if
-/// the binary executes successfully. We don't parse the version string —
-/// the binary either runs or it doesn't; "podman from 2018 that lacks
-/// compose" surfaces later when the compose-form probe fails.
+/// Probe a binary's `--version` flag. Returns true if the binary executes
+/// successfully. We don't parse the version string — the binary either
+/// runs or it doesn't; "podman from 2018 that lacks compose" surfaces
+/// later when the compose-form probe fails.
+///
+/// Timeout 5s (was 2s pre-2026-04-27): `podman --version` itself is fast,
+/// but a freshly-spawned launcher process competing with `first-install`'s
+/// final container-restart phase has been observed to time out at 2s
+/// under disk I/O pressure on slower machines. A 5s ceiling is still well
+/// under any user-perceivable lag if the runtime is genuinely missing.
 async fn version_probe(binary: &PathBuf) -> bool {
     let result = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
+        std::time::Duration::from_secs(5),
         TokioCommand::new(binary).arg("--version").output(),
     )
     .await;
-    matches!(result, Ok(Ok(out)) if out.status.success())
+    let ok = matches!(&result, Ok(Ok(out)) if out.status.success());
+    if !ok {
+        // Diagnostic log — runtime detection silently returning None has
+        // surfaced as a launcher UX bug (firing the no-container modal
+        // even when the user has Podman installed). When this fires the
+        // user sees a misleading dialog; we want stderr breadcrumbs in
+        // the launcher log to prove cause without strace.
+        eprintln!(
+            "[runtime] version_probe failed for {}: {:?}",
+            binary.display(),
+            match &result {
+                Err(_) => "timeout".to_string(),
+                Ok(Err(e)) => format!("spawn error: {}", e),
+                Ok(Ok(out)) => format!("non-zero exit {:?}", out.status.code()),
+            }
+        );
+    }
+    ok
 }
 
 /// Probe `<runtime> compose version`. Returns true when the subcommand
 /// is present (modern Podman/Docker). Falls back to checking for the
 /// standalone `<runtime>-compose` binary if the subcommand is absent.
+///
+/// Timeout 5s per probe (was 2s). `podman compose version` can be slow
+/// because Podman v4 delegates to an "external compose provider" (often
+/// docker-compose at /usr/local/bin/docker-compose), printing a banner
+/// to stderr before the version output. When the provider lookup hits
+/// a cold disk cache, 2s was sometimes not enough.
 async fn detect_compose_form(binary: &PathBuf, runtime: ContainerRuntime) -> Option<ComposeForm> {
     // Subcommand probe — `podman compose version` or `docker compose version`.
     let sub = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
+        std::time::Duration::from_secs(5),
         TokioCommand::new(binary)
             .args(["compose", "version"])
             .output(),
     )
     .await;
-    if let Ok(Ok(out)) = sub {
+    if let Ok(Ok(out)) = &sub {
         if out.status.success() {
             return Some(ComposeForm::Subcommand);
         }
     }
 
     // Standalone fallback — `podman-compose --version`.
-    let standalone = format!("{}-compose", runtime.binary());
-    if let Some(path) = which_on_path(&standalone) {
+    // NOTE: which_on_path uses the launcher process's PATH. When the
+    // launcher is spawned by `setsid nohup` from post-install-launcher.sh,
+    // PATH is the shell-default (typically /usr/bin:/bin) and does NOT
+    // include `~/.local/bin/`, where pip-installed `podman-compose` lives.
+    // We also probe ~/.local/bin/ explicitly so the standalone fallback
+    // doesn't silently miss user-local installs.
+    let standalone_name = format!("{}-compose", runtime.binary());
+    let mut standalone_paths: Vec<PathBuf> = Vec::new();
+    if let Some(p) = which_on_path(&standalone_name) {
+        standalone_paths.push(p);
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let user_local = PathBuf::from(home).join(".local/bin").join(&standalone_name);
+        if user_local.is_file() && !standalone_paths.contains(&user_local) {
+            standalone_paths.push(user_local);
+        }
+    }
+    for path in &standalone_paths {
         let sa = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            TokioCommand::new(&path).arg("--version").output(),
+            std::time::Duration::from_secs(5),
+            TokioCommand::new(path).arg("--version").output(),
         )
         .await;
         if let Ok(Ok(out)) = sa {
@@ -194,6 +239,18 @@ async fn detect_compose_form(binary: &PathBuf, runtime: ContainerRuntime) -> Opt
         }
     }
 
+    eprintln!(
+        "[runtime] detect_compose_form: no compose support for {} (subcommand_status={:?}, \
+         standalone_candidates={:?})",
+        binary.display(),
+        match &sub {
+            Err(_) => "timeout".to_string(),
+            Ok(Err(e)) => format!("spawn error: {}", e),
+            Ok(Ok(out)) => format!("exit {:?}, stderr={}", out.status.code(),
+                String::from_utf8_lossy(&out.stderr).chars().take(200).collect::<String>()),
+        },
+        standalone_paths
+    );
     None
 }
 

@@ -56,6 +56,16 @@ shift || true
 
 YES=0
 AUTO_LAUNCH=1
+# Env knob: VCT_NO_AUTO_LAUNCH=1 has the same effect as --no-auto-launch.
+# Useful for unattended / agent / CI runs that need to control launcher
+# spawning out-of-band (e.g. spawning under Xvfb, or skipping spawn
+# entirely for a Playwright-driven E2E that controls the GUI itself).
+# An autonomous agent inadvertently triggered the launcher's runtime-
+# missing modal during a 2026-04-27 install test, which is what motivated
+# this env-level escape hatch (the CLI flag was already there).
+if [ "${VCT_NO_AUTO_LAUNCH:-0}" = "1" ]; then
+    AUTO_LAUNCH=0
+fi
 for arg in "$@"; do
     case "$arg" in
         --yes|--non-interactive|--quiet) YES=1 ;;
