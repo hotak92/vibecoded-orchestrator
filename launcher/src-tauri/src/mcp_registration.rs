@@ -191,9 +191,17 @@ mod tests {
         let target = tmp_target();
         assert!(!target.exists());
 
+        // Use a cross-OS path stub for the test — the real registrar will resolve
+        // a real venv path; here we just verify the registrar writes whatever
+        // command we pass through unchanged.
+        let test_command = if cfg!(target_os = "windows") {
+            "C:\\Python\\python.exe"
+        } else {
+            "/usr/bin/python3"
+        };
         let entry = serde_json::json!({
             "type": "stdio",
-            "command": "/usr/bin/python",
+            "command": test_command,
             "args": ["server.py"],
             "env": {"FOO": "bar"},
         });
