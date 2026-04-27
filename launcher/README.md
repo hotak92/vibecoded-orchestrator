@@ -51,7 +51,7 @@ Tauri 2 desktop shell + Svelte 5 (runes) frontend talking to a Rust backend over
 
 - [Top-level README](../README.md) — what the orchestrator is, why it exists, install path
 - [BOOTSTRAP.md](../BOOTSTRAP.md) — Path A (with launcher) vs Path B (clone-only) trade-offs
-- [`docs/USER_JOURNEY.md`](../docs/USER_JOURNEY.md) — first-session walkthrough
+- [`docs/GETTING_STARTED.md`](../docs/GETTING_STARTED.md) — install and first-session walkthrough
 - [`docs/CONFIGURATION.md`](../docs/CONFIGURATION.md) — env vars, ports, KG collection layout
 
 ## License

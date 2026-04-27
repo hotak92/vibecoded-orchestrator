@@ -260,7 +260,7 @@ Contributions welcome — small fixes and bug reports especially. See [CONTRIBUT
 
 - [Configuration philosophy](docs/CONFIGURATION.md) — minimal global, max per-project; where each config lives
 - [Troubleshooting](docs/TROUBLESHOOTING.md) — bypass-permissions, container/MCP issues, first-run problems
-- [User journey](docs/USER_JOURNEY.md) — what using the orchestrator looks like across a first install and multi-project use
+- [Getting started](docs/GETTING_STARTED.md) — install, first-session walkthrough, and cross-project setup
 - [Positioning](docs/POSITIONING.md) — target market + competitive framing (launch asset, not user docs)
 - [Dependency licenses](docs/DEPENDENCY_LICENSES.md) — transitive licensing audit for the AGPL-3.0 release
 - [Templates README](templates/README.md) — what agents and skills install.py will drop into `.claude/`
