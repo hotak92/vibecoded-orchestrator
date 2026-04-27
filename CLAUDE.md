@@ -98,14 +98,17 @@ For known exact terms, tags, or node titles:
 
 ### 2. Weaviate MCP (semantic / graph, ~1–2 s)
 - `hybrid_search(query, limit, node_type, tags, days, detail)` — keyword + semantic across KG + project docs. **Default search tool.**
-  - `detail`: `"titles"` (minimal) | `"descriptions"` (default) | `"full"` (300-char content). Use titles to browse, descriptions to decide what to read, full when implementing.
-- `semantic_graph_search(query, depth)` — GraphRAG with WikiLink traversal
+  - `detail` defaults to `"auto"` — score-driven per-result verbosity. Each hit is rendered at one of 5 tiers based on its relevance score (`discard` <0.42 / `summary` 0.42–0.55 / `single_chunk` 0.55–0.65 / `three_chunks` 0.65–0.75 / `full` ≥0.75). The top hit gets full content; marginal hits get a 6-line summary; noise is filtered. See [`knowledge/concepts/score-driven-retrieval-tiers.md`](knowledge/concepts/score-driven-retrieval-tiers.md).
+  - Explicit overrides apply uniformly: `"titles"` | `"summary"` | `"single_chunk"` | `"three_chunks"` | `"full"`. Legacy alias: `"descriptions"` → `"summary"` (back-compat).
+  - Tier thresholds env-tunable: `KG_TIER_MIN`, `KG_TIER_SINGLE_CHUNK`, `KG_TIER_THREE_CHUNKS`, `KG_TIER_FULL`.
+- `semantic_graph_search(query, depth, detail)` — GraphRAG with WikiLink traversal. Same `detail` tiers as above; connected nodes always render at `summary` (graph topology, not score, drove their selection — re-fetching for scores would add 300–800 ms).
 - `store_knowledge_node(..., scope)` — write a node; `scope="project"` (default) or `"shared"`
 
 ### 3. Code Graph (Weaviate MCP)
-- `search_code_graph(query, scope, limit, expand_hops)` — find code by purpose/concept (~200–500 ms)
+- `search_code_graph(query, scope, limit, expand_hops, detail)` — find code by purpose/concept (~200–500 ms)
   - `scope`: `"all"` (default) | `"code"` (functions/classes/modules) | `"interaction"` (APIs / cross-service calls)
   - `expand_hops`: 0 | 1 | 2 — follow call/interaction edges after seed retrieval
+  - `detail`: `"auto"` (default — top-4 full, rest as refs) | `"titles"` (cheapest) | `"full"` (every result full). Code graph has no sidecar so tiering is position-based (rank), not score-thresholded. Score is surfaced in every result regardless.
 - `query_code_structure(query_type, target, project)` — structural queries (~50–100 ms)
   - types: `dependencies` | `imports` | `callers` | `methods` | `extends` | `interactions` | `path` | `composes` | `composed_by` | `type_users`
   - `path` target format: `"source.func->dest.func"` (BFS up to depth 6)
