@@ -44,8 +44,21 @@
     if (!showActivation && uiState.showActivation) ui.closeActivation();
   });
 
-  let showOnboarding = $state(false);
   let showChangelog = $state(false);
+
+  // showOnboarding is driven by the ui store so any route (e.g. /preferences)
+  // can open the wizard without a page reload. The onMount below seeds it from
+  // localStorage on first load; after that ui.openOnboarding() is the entry point.
+  // We mirror it into a local $state so OnboardingWizard can use bind:open (which
+  // needs a writable binding). When the wizard sets open=false we sync back to
+  // the store; when the store sets showOnboarding=true we forward to local state.
+  let showOnboarding = $state(false);
+  $effect(() => {
+    if ($ui.showOnboarding && !showOnboarding) showOnboarding = true;
+  });
+  $effect(() => {
+    if (!showOnboarding && $ui.showOnboarding) ui.closeOnboarding();
+  });
 
   $effect(() => {
     if ($authLoading) return; // Wait for session check
@@ -73,7 +86,7 @@
         localStorage.removeItem('vct.onboarding_complete');
       }
       if (forced || localStorage.getItem('vct.onboarding_complete') !== 'true') {
-        showOnboarding = true;
+        ui.openOnboarding();
       }
       if (localStorage.getItem('vct.show_changelog_after_update') === '1') {
         localStorage.removeItem('vct.show_changelog_after_update');
