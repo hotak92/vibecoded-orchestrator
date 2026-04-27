@@ -409,7 +409,60 @@ find_binary() {
     return 1
 }
 
+# Staleness check for bundled binaries. Reads <binary>.metadata.json (the
+# manifest scripts/build-bundled-launcher.sh writes alongside the binary)
+# and compares its source_hash against the current launcher subtree's
+# git ls-tree hash. If they don't match, the bundled binary was built
+# from an older snapshot of launcher/src-tauri or launcher/src — likely
+# missing recent commands or behavior. Returns 0 (fresh) or 1 (stale).
+#
+# Only checks bundled binaries (paths under launcher/dist/). Locally
+# built binaries (target/release/) and system installs are assumed
+# fresh — the user opted in to those.
+_bundled_binary_is_fresh() {
+    local bin="$1"
+    case "$bin" in
+        "$REPO_ROOT"/launcher/dist/*) ;;
+        *) return 0 ;;  # not a bundled binary; staleness check skipped
+    esac
+    local meta="${bin}.metadata.json"
+    if [ ! -f "$meta" ]; then
+        # No metadata → can't verify freshness. Treat as stale to err
+        # toward correctness; users can override by deleting the
+        # metadata file or moving the binary outside dist/.
+        echo "[launcher] ${bin##*/} has no metadata.json — treating as stale"
+        return 1
+    fi
+    if ! command -v git >/dev/null 2>&1; then
+        # Without git we can't compute the live hash. Trust the bundle.
+        return 0
+    fi
+    local meta_hash live_hash
+    meta_hash="$(grep -oE '"source_hash"[^"]*"[^"]*"' "$meta" 2>/dev/null | sed -E 's/.*"source_hash"[^"]*"([^"]*)".*/\1/')"
+    if [ -z "$meta_hash" ] || [ "$meta_hash" = "null" ]; then
+        return 0  # metadata didn't capture a hash — be lenient
+    fi
+    live_hash="$(cd "$REPO_ROOT" && git ls-tree HEAD launcher/src-tauri/src/ launcher/src/ launcher/src-tauri/Cargo.toml launcher/src-tauri/Cargo.lock launcher/package.json 2>/dev/null | git hash-object --stdin 2>/dev/null || echo '')"
+    if [ -z "$live_hash" ]; then
+        return 0  # not in a git checkout (tarball install) — trust the bundle
+    fi
+    if [ "$meta_hash" = "$live_hash" ]; then
+        return 0
+    fi
+    echo "[launcher] ${bin##*/} is stale (built from a different launcher source)"
+    echo "           bundled source_hash=$meta_hash"
+    echo "           live    source_hash=$live_hash"
+    return 1
+}
+
 LAUNCHER_BIN="$(find_binary || true)"
+
+# If find_binary picked a bundled binary, verify it's fresh. Stale =
+# fall through to download / build paths.
+if [ -n "$LAUNCHER_BIN" ] && ! _bundled_binary_is_fresh "$LAUNCHER_BIN"; then
+    echo "[launcher] Skipping stale bundled binary; will try download/build."
+    LAUNCHER_BIN=""
+fi
 
 if [ -n "$LAUNCHER_BIN" ]; then
     echo "[launcher] Found existing binary: $LAUNCHER_BIN"
