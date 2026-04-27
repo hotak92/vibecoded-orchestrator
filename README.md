@@ -18,20 +18,31 @@ Open source. Runs locally. Learns from how you work.
 
 ## Quick Start (zero-dependency click-to-install)
 
-Brand-new machine, no Python, no Node, no container runtime? Use the
-double-clickable entry points at the **repo root**:
+Brand-new machine, no Python, no Node, no container runtime? Two ways to start:
 
-1. **Get the repo** — clone (`git clone https://github.com/hotak92/vibecoded-orchestrator.git`) or download a release tarball from [Releases](https://github.com/hotak92/vibecoded-orchestrator/releases).
-2. **Double-click the file for your OS:**
+### A. One-liner from a terminal (Linux / macOS)
 
-   | OS | Install file | Launcher file |
-   |---|---|---|
-   | **Linux** | `first-install.desktop` (or `first-install.sh` from a terminal) | `start-launcher.desktop` (or `start-launcher.sh`) |
-   | **macOS** | `first-install.command` | `start-launcher.command` |
-   | **Windows** | `first-install.bat` | `start-launcher.bat` |
+From the directory you want to install into:
 
-3. The installer auto-handles Python, the container runtime (Podman/Docker), GPU detection, and the launcher binary — interactive prompts only when needed. Allow ~5–10 minutes plus first-run image downloads (~5 GB).
-4. After install: double-click `start-launcher.<ext>` for your OS to start the launcher GUI.
+```bash
+git clone https://github.com/hotak92/vibecoded-orchestrator.git && cd vibecoded-orchestrator && bash first-install.sh
+```
+
+(macOS: same command works in Terminal. Or after cloning, double-click `first-install.command` from Finder — see B.)
+
+### B. Double-click
+
+After cloning or downloading a [Release](https://github.com/hotak92/vibecoded-orchestrator/releases), open the repo folder and double-click the file for your OS:
+
+| OS | Install file | Launcher file |
+|---|---|---|
+| **Linux** | `first-install.desktop` (or `first-install.sh` from a terminal) | `start-launcher.desktop` (or `start-launcher.sh`) |
+| **macOS** | `first-install.command` | `start-launcher.command` |
+| **Windows** | `first-install.bat` | `start-launcher.bat` |
+
+The installer auto-handles Python, the container runtime (Podman/Docker), GPU detection, and the launcher binary — interactive prompts only when needed. Allow ~5–10 minutes plus first-run image downloads (~5 GB).
+
+After install: double-click `start-launcher.<ext>` for your OS to start the launcher GUI.
 
 > **Linux note**: Some file managers require enabling "Run executable text files on activation" before `.sh`/`.desktop` files become double-clickable (GNOME Files → Preferences → Behavior). The `.desktop` variants are the most reliable double-click target across DEs (GNOME, KDE, XFCE, Cinnamon).
 
