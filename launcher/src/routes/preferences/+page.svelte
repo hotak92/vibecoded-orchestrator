@@ -129,6 +129,22 @@
           </button>
         </div>
       </section>
+
+      <section class="pr-section">
+        <h2 class="pr-section-title">Updates</h2>
+        <div class="pr-onboarding-row">
+          <div class="pr-onboarding-text">
+            <strong>Launcher self-update</strong>
+            <span class="pr-onboarding-hint">
+              Pulls launcher updates from the upstream repo. Daily check, manual apply.
+              User-owned files (CONTEXT_STATE.md, logs, runtime state) are never overwritten.
+            </span>
+          </div>
+          <button class="pr-btn" onclick={() => goto('/preferences/updates')}>
+            Open
+          </button>
+        </div>
+      </section>
     </main>
   {/if}
 </div>

@@ -20,9 +20,10 @@ use std::time::Duration;
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem, Submenu},
     tray::{TrayIconBuilder, TrayIconEvent},
-    AppHandle, Manager, Runtime,
+    AppHandle, Listener, Manager, Runtime,
 };
 
+use crate::commands::self_update::{self, UpdateStatus};
 use crate::db::Db;
 
 /// Default ports for the shared services. Mirror
@@ -57,7 +58,19 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     // Recent projects sub-menu (populated on each open via menu rebuild).
     let recent = recent_projects_submenu(app)?;
 
-    let updates = MenuItem::with_id(app, "check_updates", "Check for updates", true, None::<&str>)?;
+    // Initial label uses cached state from ~/.vct/launcher-update-state.json
+    // so a known-pending update from a previous session shows up immediately
+    // (before the first daily-check tick runs). The label flips to
+    // "⚠ Update available (N commits behind)" via a Listener on the
+    // `vct-launcher-update-available` event below.
+    let cached = self_update::get_cached_update_status();
+    let updates = MenuItem::with_id(
+        app,
+        "check_updates",
+        &format_update_label(&cached),
+        true,
+        None::<&str>,
+    )?;
     let about = MenuItem::with_id(app, "about", "About VibeCoded Tools", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
@@ -92,9 +105,21 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
                 if let Some(w) = app.get_webview_window("main") {
                     let _ = w.show();
                     let _ = w.set_focus();
-                    let _ = w.eval(
-                        "window.dispatchEvent(new CustomEvent('vct-check-updates'));",
-                    );
+                    // If we already know an update is pending (cached
+                    // state), open the updates preferences page directly.
+                    // Otherwise, fire the legacy event so any in-page
+                    // listener can prompt a manual check.
+                    let cached = self_update::get_cached_update_status();
+                    if cached.available {
+                        let _ = w.eval(
+                            "window.location.hash = '/preferences/updates'; \
+                             window.dispatchEvent(new CustomEvent('vct-check-updates'));",
+                        );
+                    } else {
+                        let _ = w.eval(
+                            "window.dispatchEvent(new CustomEvent('vct-check-updates'));",
+                        );
+                    }
                 }
             }
             "about" => {
@@ -129,6 +154,19 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
             }
         })
         .build(app)?;
+
+    // Listen for self-update events emitted by the daily background check
+    // and by user-triggered checks. We update the "Check for updates"
+    // menu item label in place — same pattern as the services pill below,
+    // so we don't have to coordinate a full menu rebuild with the
+    // services-status background task. Both writers target distinct
+    // MenuItems, so there's no contention.
+    let updates_for_listener = updates.clone();
+    app.listen("vct-launcher-update-available", move |evt| {
+        if let Ok(status) = serde_json::from_str::<UpdateStatus>(evt.payload()) {
+            let _ = updates_for_listener.set_text(format_update_label(&status));
+        }
+    });
 
     // Background poller. `MenuItem<R>` is internally `Arc`-wrapped and
     // cheap to clone, so the spawned task gets its own handle without
@@ -269,6 +307,23 @@ fn format_label(snap: &ServiceSnapshot, externally_managed: bool) -> String {
     format!("Services: {}/{} ({})", running, total, names)
 }
 
+/// Render the "Check for updates" menu item. Rules:
+///   - error / !available          → "Check for updates"
+///   - available, count == 1       → "⚠ Update available (1 commit behind)"
+///   - available, count >  1       → "⚠ Update available (N commits behind)"
+fn format_update_label(status: &UpdateStatus) -> String {
+    if !status.available || status.commit_count == 0 {
+        return "Check for updates".to_string();
+    }
+    if status.commit_count == 1 {
+        return "⚠ Update available (1 commit behind)".to_string();
+    }
+    format!(
+        "⚠ Update available ({} commits behind)",
+        status.commit_count
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -316,5 +371,39 @@ mod tests {
     fn label_single_running() {
         let s = snap(&[("Weaviate", false), ("Ollama", true), ("code-embed", false)]);
         assert_eq!(format_label(&s, false), "Services: 1/3 (Ollama)");
+    }
+
+    fn upd(available: bool, count: u32) -> UpdateStatus {
+        UpdateStatus {
+            available,
+            current_sha: None,
+            remote_sha: None,
+            commit_count: count,
+            branch: String::new(),
+            last_checked: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn update_label_no_update() {
+        assert_eq!(format_update_label(&upd(false, 0)), "Check for updates");
+        assert_eq!(format_update_label(&upd(true, 0)), "Check for updates");
+    }
+
+    #[test]
+    fn update_label_singular() {
+        assert_eq!(
+            format_update_label(&upd(true, 1)),
+            "⚠ Update available (1 commit behind)"
+        );
+    }
+
+    #[test]
+    fn update_label_plural() {
+        assert_eq!(
+            format_update_label(&upd(true, 7)),
+            "⚠ Update available (7 commits behind)"
+        );
     }
 }
