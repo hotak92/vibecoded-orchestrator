@@ -63,8 +63,8 @@ if [[ "$EDITED_FILE" == "$DOCS_DIR"* ]] && [[ "$EDITED_FILE" == *.md ]]; then
     # Activate venv and run upload script in background
     cd "$PROJECT_ROOT"
     (source claude_mcp_servers/.venv/bin/activate && \
-     python .claude/scripts/upload_docs_to_weaviate.py "$EDITED_FILE" 2>&1 | \
-     grep -E "(✓|✗|Processing)" || true) &
+     python .claude/scripts/upload_docs.py "$EDITED_FILE" 2>&1 | \
+     grep -E "(✓|✗|Uploading|chunks)" || true) &
 
     echo "✅ Background sync started for development docs"
 fi

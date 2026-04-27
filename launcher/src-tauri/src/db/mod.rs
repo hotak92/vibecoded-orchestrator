@@ -26,6 +26,7 @@ pub mod tier;
 pub mod project_state;
 pub mod slug;
 pub mod change_log;
+pub mod code_graph_builds;
 
 /// Resolve the launcher DB path: `~/.vct/launcher.db`.
 pub fn db_path() -> PathBuf {

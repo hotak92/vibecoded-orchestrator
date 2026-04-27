@@ -43,6 +43,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "tier_cache: extend orchestrator_tier CHECK to allow 'admin' (Bug 33)",
         sql: include_str!("migrations/005_tier_cache_admin.sql"),
     },
+    Migration {
+        version: 6,
+        description: "code_graph_builds: per-project initial-build status (Gap 2)",
+        sql: include_str!("migrations/006_code_graph_build_status.sql"),
+    },
 ];
 
 /// Apply every migration whose version is greater than the current max applied.

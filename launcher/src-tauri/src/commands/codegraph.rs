@@ -14,8 +14,9 @@
 //!     itself because agents don't have a UI-level confirmation gesture.
 
 use serde::{Deserialize, Serialize};
-use tauri::{command, State};
+use tauri::{command, AppHandle, Emitter, Manager, State};
 
+use crate::db::code_graph_builds::{status as build_status, CodeGraphBuildRow};
 use crate::db::Db;
 
 #[derive(Debug, Serialize)]
@@ -500,3 +501,813 @@ pub async fn codegraph_set_entity_access_bulk(
         failures,
     })
 }
+
+// ─── Gap 2: initial code-graph build on project create ────────────────────
+//
+// When a user creates a project we kick off `code-graph-analyze` in the
+// background so `search_code_graph` returns useful results out of the
+// box (rather than the user having to drop into a terminal). The build
+// status is persisted in `code_graph_builds` and live progress is
+// emitted on the `code-graph-build-progress` Tauri event.
+//
+// Behaviour:
+//   1. `create_project_v2` calls `spawn_initial_build` AFTER the project
+//      row is inserted. The spawn is fire-and-forget — project create
+//      returns immediately to the user.
+//   2. Pre-check: if the project folder has no supported source files
+//      within depth 3, we record status='skipped' and stop. This avoids
+//      a needless multi-second analyzer startup for empty / asset-only
+//      folders.
+//   3. Otherwise: shell out to `<orchestrator>/.claude/scripts/code-graph-analyze`
+//      capturing stdout+stderr. Tail last 4 KiB into log_tail. Parse
+//      "Files analyzed: N" from stdout.
+//   4. Joern (`--cfg --pdg`) is gated on `VCT_JOERN_AVAILABLE=1` — this
+//      env is set by install.py when the Joern binary is on PATH and
+//      otherwise stays unset. We never assume it's installed.
+//
+// Failure isolation: ANY failure of this background task (analyzer not
+// found, Weaviate down, subprocess crash) is recorded in the row's
+// `error_message` and emitted as a terminal `failed` event. It is NEVER
+// propagated to the create_project_v2 caller — the user has already
+// gotten their `ProjectView` back by the time this runs.
+
+const BUILD_EVENT: &str = "code-graph-build-progress";
+
+/// Tauri-event payload + DTO for `get_code_graph_build_status`.
+///
+/// Mirrors `CodeGraphBuildRow` but in a public-API shape: timestamps in
+/// ISO 8601 (so the GUI doesn't have to convert epoch-ms), explicit
+/// optionals, and a `current_phase` string for live progress events.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeGraphBuildView {
+    pub project_id: String,
+    pub status: String,
+    pub started_at_iso: Option<String>,
+    pub finished_at_iso: Option<String>,
+    pub duration_ms: Option<i64>,
+    pub files_analyzed: u32,
+    pub languages: Vec<String>,
+    pub joern_used: bool,
+    pub error_message: Option<String>,
+    pub log_tail: Option<String>,
+    /// Live phase indicator. Only populated on `running` events emitted
+    /// during the build (e.g. "python", "typescript", "joern-cfg",
+    /// "weaviate-upload"). Always None for stored rows fetched via
+    /// `get_code_graph_build_status`.
+    pub current_phase: Option<String>,
+}
+
+impl CodeGraphBuildView {
+    fn from_row(row: CodeGraphBuildRow) -> Self {
+        Self {
+            project_id: row.project_id,
+            status: row.status,
+            started_at_iso: row.started_at.and_then(epoch_ms_to_iso),
+            finished_at_iso: row.finished_at.and_then(epoch_ms_to_iso),
+            duration_ms: row.duration_ms,
+            files_analyzed: row.files_analyzed,
+            languages: row.languages.unwrap_or_default(),
+            joern_used: row.joern_used,
+            error_message: row.error_message,
+            log_tail: row.log_tail,
+            current_phase: None,
+        }
+    }
+}
+
+fn epoch_ms_to_iso(ms: i64) -> Option<String> {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms).map(|dt| dt.to_rfc3339())
+}
+
+#[command]
+pub async fn get_code_graph_build_status(
+    project_id: String,
+    db: State<'_, Db>,
+) -> Result<Option<CodeGraphBuildView>, String> {
+    Ok(db
+        .get_code_graph_build(&project_id)?
+        .map(CodeGraphBuildView::from_row))
+}
+
+/// Re-trigger a code-graph build for an existing project. Marks the row
+/// as `pending` and re-spawns the background task. Safe to call while
+/// a previous build is still running — the new spawn will overwrite the
+/// row when it transitions, and the old subprocess (if any) keeps going
+/// until it finishes; whichever finishes last wins. Re-builds are rare
+/// enough in practice that we don't bother with cancellation.
+#[command]
+pub async fn rebuild_code_graph(
+    project_id: String,
+    db: State<'_, Db>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let project = db
+        .get_project(&project_id)?
+        .ok_or_else(|| format!("project {} not found", project_id))?;
+
+    db.upsert_code_graph_build(
+        &project.id,
+        build_status::PENDING,
+        Some(chrono::Utc::now().timestamp_millis()),
+        None,
+        None,
+        0,
+        None,
+        false,
+        None,
+        None,
+    )?;
+    db.audit(
+        "code_graph_rebuild",
+        Some(&project.id),
+        None,
+        &serde_json::json!({ "name": project.name }),
+    )?;
+
+    spawn_initial_build(app, project.id, project.name, project.folder_path);
+    Ok(())
+}
+
+/// Public entry point used by `create_project_v2` (and the rebuild
+/// command). Spawns a background task; never blocks. The caller has
+/// already inserted a `pending` row into `code_graph_builds`.
+pub fn spawn_initial_build(
+    app: AppHandle,
+    project_id: String,
+    project_name: String,
+    folder_path: String,
+) {
+    tokio::spawn(async move {
+        run_build_task(app, project_id, project_name, folder_path).await;
+    });
+}
+
+/// Body of the spawned task. Errors here are recorded in the build row,
+/// never propagated. Each transition emits a `code-graph-build-progress`
+/// event so the GUI updates live.
+async fn run_build_task(
+    app: AppHandle,
+    project_id: String,
+    project_name: String,
+    folder_path: String,
+) {
+    let started_at = chrono::Utc::now().timestamp_millis();
+
+    // 1. Mark RUNNING + emit. We deliberately recompute the languages
+    //    pre-check here so the user sees a "scanning…" pill the moment
+    //    project create returns.
+    upsert_quiet(
+        &app,
+        &project_id,
+        build_status::RUNNING,
+        Some(started_at),
+        None,
+        None,
+        0,
+        None,
+        false,
+        None,
+        None,
+    );
+    emit_build(&app, &project_id, build_status::RUNNING, 0, Some("scan"), None);
+
+    // 2. Pre-check: any supported source files at all?
+    let detected = match detect_supported_languages(std::path::Path::new(&folder_path), 3) {
+        Ok(set) => set,
+        Err(e) => {
+            finalize_failed(
+                &app,
+                &project_id,
+                started_at,
+                format!("scan folder failed: {}", e),
+                None,
+            );
+            return;
+        }
+    };
+
+    if detected.is_empty() {
+        let finished_at = chrono::Utc::now().timestamp_millis();
+        upsert_quiet(
+            &app,
+            &project_id,
+            build_status::SKIPPED,
+            Some(started_at),
+            Some(finished_at),
+            Some(finished_at - started_at),
+            0,
+            None,
+            false,
+            Some("no supported source files found within depth 3"),
+            None,
+        );
+        emit_build(
+            &app,
+            &project_id,
+            build_status::SKIPPED,
+            0,
+            None,
+            Some("no supported source files found within depth 3"),
+        );
+        return;
+    }
+
+    let langs_vec: Vec<String> = detected.iter().cloned().collect();
+    emit_build(
+        &app,
+        &project_id,
+        build_status::RUNNING,
+        0,
+        Some("analyze"),
+        None,
+    );
+
+    // 3. Resolve the analyzer wrapper. Convention: the script lives at
+    //    `<orchestrator-root>/.claude/scripts/code-graph-analyze`. We
+    //    try the project's own folder first, then the launcher's repo
+    //    root (one of the worktrees may be running us during dev), then
+    //    fall back to the system PATH.
+    let script = match resolve_analyzer_script(std::path::Path::new(&folder_path)) {
+        Some(p) => p,
+        None => {
+            finalize_failed(
+                &app,
+                &project_id,
+                started_at,
+                "code-graph-analyze script not found (looked in project, launcher install, $PATH)"
+                    .to_string(),
+                None,
+            );
+            return;
+        }
+    };
+
+    let joern_available = std::env::var("VCT_JOERN_AVAILABLE")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+
+    // 4. Build args. First run uses no `--incremental` flag so the
+    //    analyzer does a full pass. Re-builds also pass through here
+    //    (rebuild_code_graph upserts pending → spawn_initial_build),
+    //    and we keep them as full passes too for now: incremental
+    //    semantics depend on git state we don't necessarily have.
+    let mut args: Vec<String> = vec![
+        folder_path.clone(),
+        "--project".to_string(),
+        project_name.clone(),
+    ];
+    if joern_available {
+        args.push("--cfg".to_string());
+        args.push("--pdg".to_string());
+    }
+
+    // 5. Run it. We capture stdout+stderr; they're combined into one
+    //    log buffer (interleaving is fine for human debugging).
+    let output = tokio::process::Command::new(&script)
+        .args(&args)
+        // Don't inherit the launcher's working dir; the analyzer is
+        // path-aware and we don't want it picking up an unrelated cwd.
+        .current_dir(std::env::temp_dir())
+        // Don't leak Tauri's pipe to a long-running subprocess that
+        // might hang on stdin: explicitly close it.
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await;
+
+    let finished_at = chrono::Utc::now().timestamp_millis();
+
+    let (status_str, files_analyzed, error_msg, log_tail, joern_used) = match output {
+        Ok(out) => {
+            let stdout_str = String::from_utf8_lossy(&out.stdout).to_string();
+            let stderr_str = String::from_utf8_lossy(&out.stderr).to_string();
+            let combined = format!("{}{}", stdout_str, stderr_str);
+            let tail = tail_log(&combined);
+
+            if out.status.success() {
+                let count = parse_files_analyzed(&stdout_str).unwrap_or(0);
+                (
+                    build_status::SUCCESS.to_string(),
+                    count,
+                    None,
+                    Some(tail),
+                    joern_available,
+                )
+            } else {
+                let head = stderr_str
+                    .lines()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("");
+                let snippet: String = head.chars().take(200).collect();
+                let exit_code = out.status.code().unwrap_or(-1);
+                (
+                    build_status::FAILED.to_string(),
+                    0,
+                    Some(format!(
+                        "code-graph-analyze exited {}: {}",
+                        exit_code,
+                        if snippet.is_empty() { "no stderr" } else { &snippet }
+                    )),
+                    Some(tail),
+                    joern_available,
+                )
+            }
+        }
+        Err(e) => (
+            build_status::FAILED.to_string(),
+            0,
+            Some(format!("could not spawn code-graph-analyze: {}", e)),
+            None,
+            false,
+        ),
+    };
+
+    // 6. Persist + emit terminal event.
+    upsert_quiet(
+        &app,
+        &project_id,
+        &status_str,
+        Some(started_at),
+        Some(finished_at),
+        Some(finished_at - started_at),
+        files_analyzed,
+        Some(&langs_vec),
+        joern_used,
+        error_msg.as_deref(),
+        log_tail.as_deref(),
+    );
+    emit_build(
+        &app,
+        &project_id,
+        &status_str,
+        files_analyzed,
+        None,
+        error_msg.as_deref(),
+    );
+}
+
+/// Helper: resolve the launcher Db from the AppHandle and write a row.
+/// We swallow errors here because the alternative (panicking the
+/// background task) would lose the whole build status. Errors are
+/// logged to stderr.
+#[allow(clippy::too_many_arguments)]
+fn upsert_quiet(
+    app: &AppHandle,
+    project_id: &str,
+    status: &str,
+    started_at: Option<i64>,
+    finished_at: Option<i64>,
+    duration_ms: Option<i64>,
+    files_analyzed: u32,
+    languages: Option<&[String]>,
+    joern_used: bool,
+    error_message: Option<&str>,
+    log_tail: Option<&str>,
+) {
+    let db = app.state::<Db>();
+    if let Err(e) = db.upsert_code_graph_build(
+        project_id,
+        status,
+        started_at,
+        finished_at,
+        duration_ms,
+        files_analyzed,
+        languages,
+        joern_used,
+        error_message,
+        log_tail,
+    ) {
+        eprintln!(
+            "[vct] warning: code_graph_builds upsert failed for {}: {}",
+            project_id, e
+        );
+    }
+}
+
+/// Failed-state convenience helper. Keeps `run_build_task` readable.
+fn finalize_failed(
+    app: &AppHandle,
+    project_id: &str,
+    started_at: i64,
+    error: String,
+    log_tail: Option<String>,
+) {
+    let finished_at = chrono::Utc::now().timestamp_millis();
+    upsert_quiet(
+        app,
+        project_id,
+        build_status::FAILED,
+        Some(started_at),
+        Some(finished_at),
+        Some(finished_at - started_at),
+        0,
+        None,
+        false,
+        Some(&error),
+        log_tail.as_deref(),
+    );
+    emit_build(
+        app,
+        project_id,
+        build_status::FAILED,
+        0,
+        None,
+        Some(&error),
+    );
+}
+
+fn emit_build(
+    app: &AppHandle,
+    project_id: &str,
+    status: &str,
+    files_analyzed: u32,
+    current_phase: Option<&str>,
+    error: Option<&str>,
+) {
+    let payload = CodeGraphBuildView {
+        project_id: project_id.to_string(),
+        status: status.to_string(),
+        started_at_iso: None,
+        finished_at_iso: None,
+        duration_ms: None,
+        files_analyzed,
+        languages: vec![],
+        joern_used: false,
+        error_message: error.map(|s| s.to_string()),
+        log_tail: None,
+        current_phase: current_phase.map(|s| s.to_string()),
+    };
+    let _ = app.emit(BUILD_EVENT, payload);
+}
+
+/// File-extension set we know `analyze_code_graph.py` can handle. Kept
+/// in sync with the language dispatch table at the top of that file
+/// (Python / TS / JS / Go / Rust / Java / Lua / C++ / Ruby / Shell /
+/// C# / Proto). Empty extension list => skip pre-check, just run.
+fn supported_extensions() -> &'static [&'static str] {
+    &[
+        // Python
+        "py",
+        // TypeScript / JavaScript
+        "ts", "tsx", "js", "jsx", "mjs",
+        // Compiled
+        "go", "rs", "java", "cs",
+        // Native / scripting
+        "cpp", "cc", "cxx", "c", "h", "hpp",
+        "lua", "rb", "sh", "bash", "zsh",
+        // RPC / schemas
+        "proto",
+    ]
+}
+
+/// Directory names we always skip when scanning. Matches the analyzer's
+/// own ignore lists (vendor / build / venv / vcs).
+fn ignored_dirs() -> &'static [&'static str] {
+    &[
+        ".git", ".svn", ".hg",
+        "node_modules", "__pycache__", ".pytest_cache",
+        ".venv", "venv", "env", ".tox", "site-packages", "virtualenv",
+        "build", "dist", "target", "out", ".next", ".nuxt",
+        "coverage", ".gradle", ".idea", ".vscode",
+        ".claude",  // launcher-managed config, not user code
+    ]
+}
+
+/// Walk `root` up to `max_depth` levels deep. Return the set of file
+/// extensions found that match `supported_extensions()`. Returns an
+/// empty set if no supported files are present (caller treats this as
+/// "skip the build").
+///
+/// We DON'T do a full rglob here because the user's project might be a
+/// big monorepo and we just need a fast yes/no. Three levels is plenty
+/// to find at least one source file in any sane layout.
+pub(crate) fn detect_supported_languages(
+    root: &std::path::Path,
+    max_depth: usize,
+) -> Result<std::collections::HashSet<String>, std::io::Error> {
+    let mut found: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let exts = supported_extensions();
+    let ignored = ignored_dirs();
+    walk(root, 0, max_depth, exts, ignored, &mut found)?;
+    Ok(found)
+}
+
+fn walk(
+    dir: &std::path::Path,
+    depth: usize,
+    max_depth: usize,
+    exts: &[&str],
+    ignored: &[&str],
+    found: &mut std::collections::HashSet<String>,
+) -> Result<(), std::io::Error> {
+    if depth > max_depth {
+        return Ok(());
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        // Hidden + ignored dirs (don't descend, don't sample).
+        if path.is_dir() {
+            if name_str.starts_with('.') && name_str.as_ref() != "." && name_str.as_ref() != ".." {
+                // .git/.venv/.claude already in ignored; this blanket-skips
+                // any other hidden dir (e.g. .cache, .terraform) — those
+                // are never user source.
+                continue;
+            }
+            if ignored.iter().any(|i| *i == name_str.as_ref()) {
+                continue;
+            }
+            walk(&path, depth + 1, max_depth, exts, ignored, found)?;
+        } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            let lower = ext.to_ascii_lowercase();
+            if exts.iter().any(|e| *e == lower) {
+                found.insert(lower);
+                // Early-exit: if every supported ext is already in the
+                // set we can stop walking. Tiny optimisation; matters
+                // only on huge monorepos.
+                if found.len() == exts.len() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Tail the last N bytes of analyzer output. We slice on a char
+/// boundary so non-ASCII output (rare in this analyzer's logs but
+/// possible on Windows file paths) doesn't panic the format step.
+fn tail_log(s: &str) -> String {
+    use crate::db::code_graph_builds::LOG_TAIL_MAX_BYTES;
+    if s.len() <= LOG_TAIL_MAX_BYTES {
+        return s.to_string();
+    }
+    let cut_at = s.len() - LOG_TAIL_MAX_BYTES;
+    let mut idx = cut_at;
+    while idx < s.len() && !s.is_char_boundary(idx) {
+        idx += 1;
+    }
+    format!("…\n{}", &s[idx..])
+}
+
+/// Parse "Files analyzed: N" from analyzer stdout. Falls back to 0 if
+/// the line isn't present (older script versions).
+pub(crate) fn parse_files_analyzed(stdout: &str) -> Option<u32> {
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        // Match "Files analyzed: 42" with or without leading emoji.
+        if let Some(idx) = trimmed.find("Files analyzed:") {
+            let tail = &trimmed[idx + "Files analyzed:".len()..];
+            if let Some(num) = tail.split_whitespace().next() {
+                if let Ok(n) = num.parse::<u32>() {
+                    return Some(n);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Look for `code-graph-analyze` in (in order):
+///   1. `<project>/.claude/scripts/code-graph-analyze` — projects that
+///      shipped with their own copy.
+///   2. `$VCT_LAUNCHER_SCRIPTS_DIR/code-graph-analyze` — env override
+///      used by tests + by install.py to point the launcher at the
+///      orchestrator install dir.
+///   3. `<exe>/../.claude/scripts/code-graph-analyze` — when the launcher
+///      runs from a built bundle alongside the orchestrator install.
+///   4. `code-graph-analyze` on PATH — system-wide install.
+///
+/// Returns `None` if nothing resolves; caller records this as a build
+/// failure with a clear "script not found" message.
+pub(crate) fn resolve_analyzer_script(project_folder: &std::path::Path) -> Option<std::path::PathBuf> {
+    let bin = if cfg!(windows) {
+        "code-graph-analyze.ps1"
+    } else {
+        "code-graph-analyze"
+    };
+
+    // 1. Project-local
+    let p1 = project_folder.join(".claude").join("scripts").join(bin);
+    if p1.is_file() {
+        return Some(p1);
+    }
+
+    // 2. Env override
+    if let Ok(dir) = std::env::var("VCT_LAUNCHER_SCRIPTS_DIR") {
+        let p2 = std::path::PathBuf::from(dir).join(bin);
+        if p2.is_file() {
+            return Some(p2);
+        }
+    }
+
+    // 3. Sibling-of-exe convention
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            for hop in [".", "..", "../.."].iter() {
+                let p3 = parent.join(hop).join(".claude").join("scripts").join(bin);
+                if p3.is_file() {
+                    return Some(p3);
+                }
+            }
+        }
+    }
+
+    // 4. PATH lookup
+    if let Ok(path) = std::env::var("PATH") {
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        for d in path.split(sep) {
+            let p4 = std::path::Path::new(d).join(bin);
+            if p4.is_file() {
+                return Some(p4);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod build_tests {
+    use super::*;
+    use std::fs;
+
+    fn tmpdir(label: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "vct-cgbuild-{}-{}",
+            label,
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn detect_finds_python_at_root() {
+        let d = tmpdir("py");
+        fs::write(d.join("hello.py"), b"print('hi')").unwrap();
+        let langs = detect_supported_languages(&d, 3).unwrap();
+        assert!(langs.contains("py"));
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn detect_skips_node_modules_and_venv() {
+        let d = tmpdir("ignored");
+        fs::create_dir_all(d.join("node_modules/lodash")).unwrap();
+        fs::write(d.join("node_modules/lodash/index.js"), b"// vendor").unwrap();
+        fs::create_dir_all(d.join(".venv/lib")).unwrap();
+        fs::write(d.join(".venv/lib/m.py"), b"# vendor").unwrap();
+        // No user source at the root.
+        let langs = detect_supported_languages(&d, 3).unwrap();
+        assert!(langs.is_empty(), "expected empty; got {:?}", langs);
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn detect_walks_to_max_depth_only() {
+        let d = tmpdir("depth");
+        // depth 4 > max_depth 3 → must NOT be detected
+        fs::create_dir_all(d.join("a/b/c/d")).unwrap();
+        fs::write(d.join("a/b/c/d/deep.rs"), b"fn main() {}").unwrap();
+        let langs = detect_supported_languages(&d, 3).unwrap();
+        assert!(!langs.contains("rs"), "should not descend past depth 3");
+        // depth 3 should be reachable
+        fs::write(d.join("a/b/c/ok.rs"), b"fn main() {}").unwrap();
+        let langs2 = detect_supported_languages(&d, 3).unwrap();
+        assert!(langs2.contains("rs"));
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn detect_handles_empty_dir() {
+        let d = tmpdir("empty");
+        let langs = detect_supported_languages(&d, 3).unwrap();
+        assert!(langs.is_empty());
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn detect_handles_missing_dir() {
+        let bogus = std::env::temp_dir().join(format!("definitely-not-{}", uuid::Uuid::new_v4()));
+        // Should not error out; should return empty set.
+        let langs = detect_supported_languages(&bogus, 3).unwrap();
+        assert!(langs.is_empty());
+    }
+
+    #[test]
+    fn detect_picks_up_typescript() {
+        let d = tmpdir("ts");
+        fs::write(d.join("a.ts"), b"export const x = 1;").unwrap();
+        fs::write(d.join("b.tsx"), b"export const y = 2;").unwrap();
+        let langs = detect_supported_languages(&d, 3).unwrap();
+        assert!(langs.contains("ts"));
+        assert!(langs.contains("tsx"));
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn parse_files_analyzed_extracts_count() {
+        let stdout = "🔍 Analyzing codebase...\n\
+                      📂 Found 5 python files to analyze\n\
+                      \n============================================================\n\
+                      ✅ Code Graph Analysis Complete\n\
+                      ============================================================\n\
+                      📊 Statistics:\n\
+                         Modules: 5\n\
+                         Classes: 3\n\
+                         Functions: 12\n\
+                         APIs: 0\n\
+                         Files analyzed: 5\n\
+                         Files skipped: 0\n";
+        assert_eq!(parse_files_analyzed(stdout), Some(5));
+    }
+
+    #[test]
+    fn parse_files_analyzed_returns_none_when_missing() {
+        assert_eq!(parse_files_analyzed("nothing to see here"), None);
+    }
+
+    #[test]
+    fn tail_log_truncates_long_output() {
+        let big = "a".repeat(10_000);
+        let tail = tail_log(&big);
+        assert!(tail.len() < 5_000);
+        assert!(tail.starts_with('…'));
+    }
+
+    #[test]
+    fn tail_log_passes_through_short_output() {
+        let small = "all good";
+        assert_eq!(tail_log(small), "all good");
+    }
+
+    #[test]
+    fn resolve_analyzer_finds_project_local_copy() {
+        let d = tmpdir("resolve");
+        let scripts = d.join(".claude").join("scripts");
+        fs::create_dir_all(&scripts).unwrap();
+        let bin = if cfg!(windows) {
+            "code-graph-analyze.ps1"
+        } else {
+            "code-graph-analyze"
+        };
+        let p = scripts.join(bin);
+        fs::write(&p, b"#!/usr/bin/env bash\necho ok\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&p).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&p, perms).unwrap();
+        }
+
+        let resolved = resolve_analyzer_script(&d).expect("must resolve");
+        assert_eq!(resolved, p);
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn resolve_analyzer_returns_none_when_nothing_found() {
+        // Empty project + cleared env override + emptied PATH.
+        let d = tmpdir("resolve-none");
+
+        // SAFETY: tests in this crate are single-threaded by default
+        // (consistent with launch_returns_not_found_when_editor_missing
+        // pattern in projects_v2). If parallelism is ever enabled we'd
+        // need a Mutex around env vars.
+        let saved_path = std::env::var_os("PATH");
+        let saved_override = std::env::var_os("VCT_LAUNCHER_SCRIPTS_DIR");
+        unsafe {
+            std::env::set_var("PATH", "");
+            std::env::remove_var("VCT_LAUNCHER_SCRIPTS_DIR");
+        }
+
+        let resolved = resolve_analyzer_script(&d);
+
+        if let Some(p) = saved_path {
+            unsafe { std::env::set_var("PATH", p); }
+        }
+        if let Some(p) = saved_override {
+            unsafe { std::env::set_var("VCT_LAUNCHER_SCRIPTS_DIR", p); }
+        }
+
+        // The current_exe lookup may still find the test binary's parent
+        // having a `.claude/scripts/...` somehow during dev, but in CI
+        // sandboxes it generally doesn't. We accept either outcome but
+        // check that the project-local path was definitely not picked
+        // (it doesn't exist).
+        if let Some(p) = resolved {
+            // If something was found via current_exe traversal, it must
+            // not be inside our temp project dir.
+            assert!(!p.starts_with(&d), "must not find a non-existent project-local copy");
+        }
+        fs::remove_dir_all(&d).ok();
+    }
+}
+

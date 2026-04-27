@@ -10,6 +10,7 @@
   import { goto } from '$app/navigation';
   import { projects, selectedProject } from '$lib/stores/projects';
   import { projectColor } from '$lib/project-color';
+  import CodeGraphBuildPill from '$lib/components/CodeGraphBuildPill.svelte';
 
   const pState = $derived($projects);
 
@@ -57,7 +58,10 @@
           <button class="card" onclick={() => pick(p.id)}>
             <span class="dot" style:background={projectColor(p.id)} aria-hidden="true"></span>
             <span class="card-body">
-              <span class="name">{p.name}</span>
+              <span class="name-row">
+                <span class="name">{p.name}</span>
+                <CodeGraphBuildPill projectId={p.id} compact />
+              </span>
               <span class="meta">
                 <span>{p.host}</span>
                 <span>· {p.module_count} module{p.module_count === 1 ? '' : 's'}</span>
@@ -119,7 +123,11 @@
     width: 10px; height: 10px; border-radius: 50%;
     flex-shrink: 0; margin-top: 5px;
   }
-  .card-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+  .card-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
+  .name-row {
+    display: flex; align-items: center; gap: 8px;
+    justify-content: space-between;
+  }
   .name { font-size: 14px; font-weight: 700; color: var(--color-text); }
   .meta { font-size: 11px; color: var(--color-muted); display: flex; gap: 4px; }
   .path {

@@ -6,9 +6,11 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use tauri::{command, State};
+use tauri::{command, AppHandle, State};
 use uuid::Uuid;
 
+use crate::commands::codegraph;
+use crate::db::code_graph_builds::status as build_status;
 use crate::db::models::{ModuleInstallRow, ProjectHost, ProjectRow};
 use crate::db::Db;
 
@@ -96,6 +98,7 @@ pub struct CreateProjectV2Request {
 pub async fn create_project_v2(
     req: CreateProjectV2Request,
     db: State<'_, Db>,
+    app: AppHandle,
 ) -> Result<ProjectView, String> {
     let folder = Path::new(&req.folder_path);
 
@@ -135,6 +138,38 @@ pub async fn create_project_v2(
         &serde_json::json!({ "host": req.host.as_str(), "name": req.name, "slug": slug }),
     )?;
     let _ = db.log_change("projects", "insert", Some(&row.id), Some(&row.id));
+
+    // Gap 2 (OSS launch 2026-05-12): kick off the initial code-graph
+    // build in the background so `search_code_graph` returns useful
+    // results out of the box. This must NOT block project creation —
+    // the user gets their `ProjectView` back immediately.
+    //
+    // We swallow any DB error from the pending-row insert because a
+    // failure here is purely cosmetic (the user just won't see a build
+    // status pill); the project itself is already committed.
+    let now = chrono::Utc::now().timestamp_millis();
+    if let Err(e) = db.upsert_code_graph_build(
+        &row.id,
+        build_status::PENDING,
+        Some(now),
+        None,
+        None,
+        0,
+        None,
+        false,
+        None,
+        None,
+    ) {
+        eprintln!("[vct] warning: could not queue code-graph build for {}: {}", row.id, e);
+    } else {
+        codegraph::spawn_initial_build(
+            app,
+            row.id.clone(),
+            row.name.clone(),
+            row.folder_path.clone(),
+        );
+    }
+
     Ok(ProjectView::from_row(row, 0))
 }
 

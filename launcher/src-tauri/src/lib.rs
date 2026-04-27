@@ -179,6 +179,9 @@ pub fn run() {
             // Codegraph — graph viz (v1.1)
             commands::codegraph::codegraph_load_graph,
             commands::codegraph::codegraph_set_entity_access_bulk,
+            // Codegraph — Gap 2: initial build status + manual rebuild
+            commands::codegraph::get_code_graph_build_status,
+            commands::codegraph::rebuild_code_graph,
             // Hub proxy (v1.1)
             commands::hub_proxy::hub_info,
             commands::hub_proxy::hub_list_apps,
