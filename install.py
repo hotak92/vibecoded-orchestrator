@@ -20,7 +20,39 @@ Requirements:
     - Docker or Podman (for Weaviate + Ollama containers)
     - Claude Code CLI (npm install -g @anthropic-ai/claude-code)
 """
+
 from __future__ import annotations
+
+# ---------------------------------------------------------------------------
+# Python version sentinel — runs BEFORE any other module imports.
+#
+# We hard-fail here (instead of letting a downstream import like `tomllib`
+# raise a confusing ModuleNotFoundError) so the user gets a single clear
+# message + the canonical install URL. Keep this block dependency-free
+# and 3.7-syntax-compatible so it parses on the user's broken interpreter
+# regardless of which old Python they invoked us with.
+#
+# `from __future__ import annotations` MUST stay above this block (Python
+# requires future imports to be the first statement after the docstring).
+# That's fine — future imports work back to 3.7 and don't execute code.
+# ---------------------------------------------------------------------------
+import sys as _sys
+
+if _sys.version_info < (3, 11):
+    _v = _sys.version_info
+    _sys.stderr.write(
+        "ERROR: Python 3.11 or newer required (got %d.%d.%d).\n"
+        "       Install hints:\n"
+        "         Linux (apt):   sudo apt install python3.12 python3.12-venv\n"
+        "         Linux (dnf):   sudo dnf install python3.12\n"
+        "         macOS:         brew install python@3.12\n"
+        "         Windows:       winget install Python.Python.3.12\n"
+        "       Or use the install.sh / install.ps1 wrapper which can\n"
+        "       auto-install Python on most platforms.\n"
+        "       Docs: https://github.com/hotak92/vibecoded-orchestrator#prerequisites\n"
+        % (_v.major, _v.minor, _v.micro)
+    )
+    _sys.exit(1)
 
 import argparse
 import json
