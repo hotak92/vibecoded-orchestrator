@@ -8,6 +8,7 @@ interface UIState {
   showActivation: boolean;
   showInstallWizard: boolean;
   showMcpDashboard: boolean;
+  showOnboarding: boolean;
 }
 
 function createUIStore() {
@@ -16,6 +17,7 @@ function createUIStore() {
     showActivation: false,
     showInstallWizard: false,
     showMcpDashboard: false,
+    showOnboarding: false,
   });
 
   return {
@@ -31,6 +33,14 @@ function createUIStore() {
     openMcpDashboard: () => update((s) => ({ ...s, showMcpDashboard: true })),
     closeMcpDashboard: () =>
       update((s) => ({ ...s, showMcpDashboard: false })),
+    // Clears the onboarding-complete localStorage flag and opens the wizard.
+    // Existing projects and settings are unaffected — only the completion
+    // marker is removed so the wizard re-runs from step 1.
+    openOnboarding: () => {
+      try { localStorage.removeItem('vct.onboarding_complete'); } catch {}
+      update((s) => ({ ...s, showOnboarding: true }));
+    },
+    closeOnboarding: () => update((s) => ({ ...s, showOnboarding: false })),
   };
 }
 
