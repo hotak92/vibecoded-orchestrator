@@ -341,7 +341,13 @@ class EnsureCollectionsAdoptModeTests(unittest.TestCase):
                 os.environ.pop(k, None)
             server.shutdown()
 
-    def test_adopt_skips_dev_when_host_has_per_project_dev(self):
+    def test_adopt_creates_own_dev_even_when_sibling_dev_exists(self):
+        # Per-project `_development` collections are NOT shared — each
+        # project owns its own namespace. Earlier code skipped ours when
+        # a sibling's existed (e.g. ClaudeOrchestrator_development),
+        # which left our docs unseeded (Step 7c then exited 1). Fixed
+        # in 2026-04-27 — assert the project-scoped collection is
+        # always created in adopt mode.
         server, port, _ = _start_server()
         try:
             _Handler.schema = {"classes": [
@@ -360,13 +366,17 @@ class EnsureCollectionsAdoptModeTests(unittest.TestCase):
                     {}, decisions=decisions, args=_ns(yes=True),
                 )
             posted_classes = [p.get("class") for p in _Handler.posted]
-            # Must not POST a bare or basename-Development when a
-            # `*_development` already exists.
-            for c in posted_classes:
-                self.assertFalse(
-                    c.lower().endswith("_development") or c == "Development",
-                    f"unexpectedly posted Development-like class: {c}",
-                )
+            # Our own per-project `_development` must be created.
+            self.assertIn(
+                "VibecodedOrchestrator_Development", posted_classes,
+                f"expected VibecodedOrchestrator_Development to be created; "
+                f"posted: {posted_classes}",
+            )
+            # We must NOT touch the sibling project's collection.
+            self.assertNotIn(
+                "ClaudeOrchestrator_development", posted_classes,
+                "must not re-post a sibling project's existing collection",
+            )
         finally:
             for k in ("KG_COLLECTION", "DEVELOPMENT_COLLECTION",
                       "SHARED_KG_COLLECTION"):
