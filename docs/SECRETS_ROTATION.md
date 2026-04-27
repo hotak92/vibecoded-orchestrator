@@ -1,23 +1,22 @@
 # Secrets rotation runbook
 
-This document is the canonical rotation procedure for every secret the
-launcher / orchestrator depends on. Run through the relevant section
-end-to-end whenever a key is rotated, exposed, or suspected to have
-leaked.
+The canonical rotation procedure for every secret the launcher and
+orchestrator depend on. Walk through the relevant section end-to-end
+whenever a key is rotated, exposed, or suspected to have leaked.
 
-The companion file `docs/VCT_SECRETS_PRIMITIVE.md` describes the
+The companion doc `docs/VCT_SECRETS_PRIMITIVE.md` describes the
 write-scoped storage layout under `~/.vct-secrets/` (file mode `0600`,
 read scope per-app, write scope shared per-team).
 
 ## Master rule
 
-Every consumer of a rotated secret reads it from the file under
+Every consumer of a rotated secret reads it from a file under
 `~/.vct-secrets/...`. Nothing reads `~/.claude.json` directly anymore
-(`~/.claude.json` was scrubbed 2026-04-21 — see Memory). So a rotation
-is, with one exception, a single-file write + a service restart.
+(it was scrubbed 2026-04-21 — see Memory). With one exception, rotation
+is a single-file write plus a service restart.
 
-The exception is **Vercel + Supabase server-side env**, which need a
-dashboard / CLI update because those processes do not see the local
+The exception is **Vercel and Supabase server-side env**, which need a
+dashboard or CLI update because those processes don't see the local
 filesystem.
 
 ---
@@ -88,8 +87,8 @@ Used by `validate-tier` to call `/licenses/activate`.
    launcher; check the Supabase function log line
    `[validate-tier] OK key=...` for the new key tag.
 
-If the LS API key is exposed publicly, rotate IMMEDIATELY: anyone with
-the key can issue / revoke licenses.
+If the LS API key is exposed publicly, rotate immediately. Anyone with
+the key can issue or revoke licenses.
 
 ---
 

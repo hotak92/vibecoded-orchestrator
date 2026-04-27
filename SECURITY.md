@@ -67,7 +67,7 @@ Out of scope:
 
 ## Hardening notes
 
-The project ships several defence-in-depth layers; if you find a way
+The project ships a few defence-in-depth layers. If you find a way
 around any of them, that's a valid report:
 
 - **Credential scrubbing** — hooks that scan written files for

@@ -1,7 +1,7 @@
 # Asciinema Demo Script — VibeCoded Tools Orchestrator
 
 Target duration: **75 seconds** (range 60-90s).
-Output: terminal recording embedded in README. No voiceover; pacing relies on prompt timing and visible output.
+Output: terminal recording embedded in README. No voiceover — pacing relies on prompt timing and visible output.
 
 Record with:
 
@@ -9,7 +9,7 @@ Record with:
 asciinema rec -i 1.5 --title "VibeCoded Tools Orchestrator — persistent memory for Claude Code" demo.cast
 ```
 
-`-i 1.5` caps idle time at 1.5s so viewers don't wait for real LLM responses.
+`-i 1.5` caps idle time at 1.5s so viewers aren't waiting on real LLM responses.
 
 ---
 

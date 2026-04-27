@@ -1,6 +1,6 @@
 # Releasing
 
-How to cut a release of vibecoded-orchestrator. Tagging is intentionally a manual step — see "Why no automated tagging?" below.
+How to cut a release of vibecoded-orchestrator. Tagging is a manual step on purpose — see "Why no automated tagging?" below.
 
 ## Version layout
 
@@ -12,7 +12,7 @@ The repo currently has three places that carry a version number:
 | `launcher/src-tauri/Cargo.toml` | `[package].version` | The launcher's Rust crate / Tauri bundle version. Should match `package.json`. |
 | `CHANGELOG.md` | `## [x.y.z]` heading | Human-readable release notes following [Keep a Changelog](https://keepachangelog.com/). |
 
-The orchestrator itself (Python side) doesn't carry a separate semver yet — it tracks the launcher version because they ship together. If/when we split, the `vct-module.json` manifests gain their own versions and this section grows.
+The orchestrator itself (Python side) doesn't carry a separate semver yet; it tracks the launcher version because they ship together. If we split them later, the `vct-module.json` manifests gain their own versions and this section grows.
 
 ## Cutting a release
 
@@ -51,9 +51,9 @@ Steps:
 
 ## Why no automated tagging?
 
-Tagging is the trigger for the future GitHub release pipeline (per-OS Tauri bundle build, signing, artifact upload). Until that pipeline exists and has been smoke-tested, tagging is reserved for the maintainer to do explicitly when a release is actually ready — not the side effect of a CI run. The point of a tag is "this is the commit external users should pin to"; nothing should silently create one.
+Tagging will be the trigger for the future GitHub release pipeline (per-OS Tauri bundle build, signing, artifact upload). Until that pipeline exists and has been smoke-tested, tagging is reserved for the maintainer to do explicitly when a release is ready — not as the side effect of a CI run. A tag means "this is the commit external users should pin to". Nothing should silently create one.
 
-When the release pipeline lands, the rule will be: tag manually after pre-flight passes; CI then takes the tag and builds the artifacts.
+When the release pipeline lands, the rule will be: tag manually after pre-flight passes; CI then picks up the tag and builds the artifacts.
 
 ## Hot-fix releases
 

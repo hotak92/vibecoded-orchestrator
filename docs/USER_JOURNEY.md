@@ -1,6 +1,6 @@
 # User Journey
 
-How a new user goes from "never heard of this" to "productive across 3 projects." Use as reference for landing page copy, onboarding emails, and docs/demo flows.
+How a new user gets from "never heard of this" to "productive across 3 projects." Reference for landing page copy, onboarding emails, and docs/demo flows.
 
 ## 1. Discovery and install
 
@@ -14,9 +14,9 @@ Reads README → installs:
     python install.py
 ```
 
-`install.py` auto-detects the user's hardware (GPU/CPU/Apple Silicon), starts Weaviate + Ollama in containers, pulls embedding models, installs 19 free-tier agents and 28 skills (10 MAO-tier specialist agents are opt-in via `--with-mao-agents`), writes `.env` and `.claude/settings.json`.
+`install.py` detects the user's hardware (GPU/CPU/Apple Silicon), starts Weaviate + Ollama in containers, pulls embedding models, installs 19 free-tier agents and 28 skills (10 MAO-tier specialist agents are opt-in via `--with-mao-agents`), and writes `.env` and `.claude/settings.json`.
 
-First-run time: ~5 min interactive setup + 10–30 min for container image + model downloads (~5 GB Weaviate + Ollama qwen3 weights; GPU mode adds CodeSage-Large-v2 ~2.5 GB). On a fast link this lands closer to 10 min; on a slow connection budget for 30+. Subsequent re-installs reuse cached images and finish in seconds.
+First-run time: ~5 min of interactive setup, plus 10–30 min for container image and model downloads (~5 GB for Weaviate + Ollama qwen3 weights; GPU mode adds CodeSage-Large-v2, another ~2.5 GB). On a fast link this lands closer to 10 min; on a slow connection budget for 30+. Re-installs reuse cached images and finish in seconds.
 
 ## 2. First orchestrator session
 
@@ -73,7 +73,7 @@ Claude:  *writes files, triggers initial code graph analysis in background*
 
 ## 4. Cross-project memory in action
 
-A week later, the user is working on a *different* project and asks Claude a question. Because the orchestrator's knowledge graph is shared (`SHARED_KG_COLLECTION`), Claude pulls in relevant patterns from the FastAPI project automatically.
+A week later, the user is working on a *different* project and asks Claude a question. Because the orchestrator's knowledge graph is shared (`SHARED_KG_COLLECTION`), Claude pulls relevant patterns from the FastAPI project on its own.
 
 ```
 User (in different project): "How should I structure auth for this microservice?"
@@ -88,9 +88,9 @@ No re-explanation. No re-reading the old codebase. The knowledge is persistent.
 
 ## 5. Upgrade to Pro or MAO
 
-As the user's project portfolio grows, RL retrieval reranking starts making a bigger difference (it learns which KG nodes the user actually acts on). They upgrade to Pro via the VCT Launcher.
+As the user's project portfolio grows, RL retrieval reranking starts to matter — it learns which KG nodes the user actually acts on. They upgrade to Pro via the VCT Launcher.
 
-Teams that want parallel agents working across a codebase upgrade to MAO and get 10 specialist agents + the Tauri desktop UI for orchestration oversight.
+Teams that want parallel agents working across a codebase upgrade to MAO and get 10 specialist agents plus the Tauri desktop UI for orchestration oversight.
 
 ## 6. Typical long-term usage
 

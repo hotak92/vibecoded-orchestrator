@@ -1,31 +1,31 @@
 # Admin license
 
 Admin licenses unlock dev-only affordances in the launcher: a persistent
-ADMIN badge, an Admin sidebar group with feature-flag / diagnostic /
+ADMIN badge, an Admin sidebar group with feature-flag, diagnostic, and
 license-test routes, and visibility on `private-test` modules in the
 catalog.
 
-There are **two paths** to admin tier, both server-authoritative:
+Two paths to admin tier exist, both server-authoritative:
 
 - **Path A — Vault-token admin** (recommended for maintainer / small-team use).
   High-entropy random tokens stored in the `vct_admin_tokens` Supabase
-  Vault secret. No Lemon Squeezy product required. Per-token leak
-  containment via TOFU machine binding + optional expiration.
-  Adding/revoking team members = a single SQL statement.
+  Vault secret. No Lemon Squeezy product required. Leaked-token containment
+  via TOFU machine binding plus optional expiration. Adding or revoking a
+  team member is a single SQL statement.
 - **Path B — Lemon Squeezy admin variant** (Bug 33; legacy). Real LS
-  license keys backed by a hidden variant. Useful when you want
-  per-license LS-dashboard revocability (e.g. issuing admin to a
-  contractor on a dated subscription). Requires LS product configuration.
+  license keys backed by a hidden variant. Worth using when you want
+  per-license LS-dashboard revocability — e.g. handing admin to a
+  contractor on a dated subscription. Requires LS product configuration.
 
-Both paths share the same `tier="admin"` outcome on the wire and identical
+Both paths produce the same `tier="admin"` on the wire and the same
 client-side capability flags (`is_admin`, `unlock_all_modules`,
-`dev_features_enabled`). The launcher and Python validator don't need to
-care which path was used; only `validate-tier`'s server logic distinguishes.
+`dev_features_enabled`). The launcher and Python validator don't care
+which path was used; only `validate-tier`'s server logic distinguishes them.
 
-This document supersedes any earlier draft mentioning a local
-`MAINTAINER_TOKEN` / Ed25519 bypass — that approach was dropped because it
-was too easy to defeat with a one-line client patch. Both Path A and Path B
-above are server-side classifications; client-side patches accomplish nothing.
+This document supersedes any earlier draft that mentioned a local
+`MAINTAINER_TOKEN` / Ed25519 bypass. That approach was dropped because it
+fell to a one-line client patch. Both Path A and Path B are server-side
+classifications, so client patches buy you nothing.
 
 ---
 
@@ -73,15 +73,15 @@ The `vct_admin_tokens` secret holds a JSON map:
 }
 ```
 
-- **`token`**: the high-entropy admin token (~74 chars total, prefix +
-  64 url-safe base64 chars). Generated client-side; only the server
-  hashed comparison is constant-time.
+- **`token`**: the high-entropy admin token (~74 chars: prefix + 64
+  url-safe base64 chars). Generated client-side; only the server-side
+  comparison is constant-time.
 - **`expires_at`**: optional ISO-8601 UTC. NULL = no expiration. After
   expiry, lookup returns `outcome="expired"` (no admin tier).
 - **`machine_id_hash`**: optional sha256 hex. NULL = not yet bound. The
-  FIRST successful auth from any machine writes the hash back into the
+  first successful auth from any machine writes the hash back into the
   Vault secret (TOFU pattern). Subsequent auths from a different
-  machine_id_hash are rejected.
+  `machine_id_hash` are rejected.
 
 ### Setup (project owner, one-time)
 
@@ -111,7 +111,7 @@ The `vct_admin_tokens` secret holds a JSON map:
 
 ### Adding a team member
 
-Generate the token on YOUR machine (not theirs — you control issuance):
+Generate the token on your machine, not theirs — you control issuance:
 
 ```bash
 TOKEN_FABIO="vct_admin_$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')"
@@ -146,8 +146,8 @@ FROM vault.decrypted_secrets WHERE name = 'vct_admin_tokens';
 ```
 
 Fabio pastes the token into his launcher's License → Activate field. The
-edge function recognizes `admin_user="fabio"`, performs TOFU bind to
-his machine, returns admin tier. Audit log records the bind.
+edge function recognises `admin_user="fabio"`, performs TOFU bind on his
+machine, returns admin tier. The audit log records the bind.
 
 ### Revoking a team member
 
@@ -220,30 +220,30 @@ SELECT * FROM admin_auth_log WHERE outcome != 'success' ORDER BY id DESC LIMIT 2
 | `is_admin()` returns True locally | …local feature flags lit up. Server-gated capabilities re-validate against the Supabase JWT — a self-claimed admin tier yields nothing the AGPL source doesn't already. |
 
 Token-leak threat model:
-- **Token never leaves the user's `~/.vct-secrets/`** during normal operation; the launcher reads it at activation, sends ONCE over HTTPS to validate-tier, and caches the resulting tier (not the token).
-- **TOFU machine binding** ensures a leaked token can't be used from another machine after first activation. (Trade-off: legitimate machine changes require manual rebind by project owner.)
-- **Audit log** records every authentication, including outcome, so unusual patterns are detectable.
-- **Constant-time comparison** in `lookupVaultAdminToken` prevents timing oracle attacks against the Vault map.
-- **High entropy** (48 random bytes = 256 bits) makes brute force infeasible.
+- **Token never leaves the user's `~/.vct-secrets/`** in normal operation. The launcher reads it once at activation, sends it over HTTPS to validate-tier, and caches the resulting tier — not the token.
+- **TOFU machine binding** keeps a leaked token from being reused on another machine after first activation. Trade-off: legitimate machine changes need a manual rebind by the project owner.
+- **Audit log** records every authentication and its outcome, so unusual patterns are detectable.
+- **Constant-time comparison** in `lookupVaultAdminToken` blocks timing-oracle attacks against the Vault map.
+- **High entropy** (48 random bytes = 256 bits) puts brute force out of reach.
 
 ### Why this is open-source-safe
 
-Open-source readers see:
+Open-source readers can see:
 - The lookup function (`lookupVaultAdminToken`) and its branches
 - The Vault secret name (`vct_admin_tokens`)
-- The schema of records (`token`, `expires_at`, `machine_id_hash`)
+- The record schema (`token`, `expires_at`, `machine_id_hash`)
 
-But CANNOT derive any actual token value, because tokens are
-high-entropy random and live only in the Vault (encrypted at rest by
-Supabase KMS) + the holder's local secrets dir. Reading the source
-provides zero attack surface.
+But they CAN'T derive an actual token value. Tokens are high-entropy
+random and live only in the Vault (encrypted at rest by Supabase KMS)
+and on the holder's local secrets dir. Reading the source gives an
+attacker nothing.
 
 ---
 
 ## Path B: Lemon Squeezy admin variant (Bug 33; legacy)
 
-Admin is a real Lemon Squeezy license, not a local bypass. The flow is
-identical to Pro / MAO / Enterprise, with one extra branch on the server:
+Admin is a real Lemon Squeezy license, not a local bypass. The flow
+mirrors Pro / MAO / Enterprise, with one extra branch on the server:
 
 ```
 launcher / orchestrator
@@ -263,10 +263,10 @@ returns { valid: true, tier: "admin", is_admin: true,
 ```
 
 The admin variant ID lives in the Supabase env var `LS_ADMIN_VARIANT_IDS`
-(JSON array of strings), NEVER in the public AGPL source. Open-source
+(JSON array of strings), never in the public AGPL source. Open-source
 readers see the resolution function (`isAdminVariant` in
 `launcher/supabase/functions/_shared/variant_map.ts`) but cannot derive the
-variant ID — `isAdminVariant` consults the runtime env, not source data.
+variant ID; `isAdminVariant` consults the runtime env, not source data.
 
 ### Setup (Path B; maintainer, one-time)
 
@@ -276,7 +276,7 @@ variant ID — `isAdminVariant` consults the runtime env, not source data.
 > when LS products are ready or you need per-license LS-dashboard
 > revocability for contractors.
 
-1. **Lemon Squeezy dashboard**: create a new product OR a new variant
+1. **Lemon Squeezy dashboard**: create a new product, or a new variant
    under an existing product. Name it "Admin / Maintainer". Set price = $0.
    Configure for unlimited issuance via test-mode or complimentary
    license keys.
@@ -300,24 +300,23 @@ variant ID — `isAdminVariant` consults the runtime env, not source data.
 2. Open Settings → License → Activate.
 3. Paste the admin license key.
 4. The launcher calls validate-tier, gets back `tier=admin`, caches it.
-5. The ADMIN badge appears in the bottom-right corner. The Admin
-   sidebar group becomes visible.
+5. The ADMIN badge appears in the bottom-right corner; the Admin sidebar
+   group becomes visible.
 
-The admin tier is treated as a strict superset of `enterprise` for
-feature gates: `require_tier("enterprise")` → True for admins.
+For feature gates, admin is treated as a strict superset of `enterprise`:
+`require_tier("enterprise")` returns True for admins.
 
 ## Revocation
 
 1. Open the LS dashboard → Admin variant → find the license → Disable.
-2. The launcher's validator re-checks at most every 24h (cache TTL +
-   on-demand refresh). On the next refresh, tier drops to `free` (or
-   whatever underlying retail tier the user might have on the same
-   account).
+2. The launcher's validator re-checks at most every 24h (cache TTL plus
+   on-demand refresh). On the next refresh the tier drops to `free` —
+   or whatever retail tier the user actually owns on the same account.
 3. The ADMIN badge disappears, admin routes hide, private-test modules
    leave the catalog.
 
-To force an immediate refresh on the user side, they can run
-`license_refresh` from the Settings panel.
+The user can force an immediate refresh by running `license_refresh`
+from Settings.
 
 ## Security model
 
@@ -329,32 +328,30 @@ To force an immediate refresh on the user side, they can run
 | `is_admin()` returns True locally | …local feature flags lit up. Server-gated capabilities (paid-module artifact downloads, license issuance, telemetry inspector data) all re-validate against the Supabase JWT — a self-claimed admin tier yields nothing the AGPL source doesn't already. |
 
 The only way to actually be admin is to own a real LS admin license key
-+ have the Supabase server classify it via the `LS_ADMIN_VARIANT_IDS`
-env. Patching the open-source client is no shortcut.
+AND have the Supabase server classify it via `LS_ADMIN_VARIANT_IDS`.
+Patching the open-source client is no shortcut.
 
-### What about `LS_ADMIN_VARIANT_IDS` leaking?
+### What if `LS_ADMIN_VARIANT_IDS` leaks?
 
-If the env var leaks (e.g. via a Supabase config dump), an attacker
-still needs to OWN an LS license for that variant. The variant ID is
-the lookup key; the LS license is the auth token. Without both, no
-admin classification.
+The attacker still needs to OWN an LS license for that variant. The
+variant ID is the lookup key; the LS license is the auth token. Without
+both, no admin classification.
 
-Mitigation if the variant ID does leak: rotate by creating a new
-admin variant in LS, updating `LS_ADMIN_VARIANT_IDS`, and re-issuing
-admin licenses for the new variant. Old variant keys remain valid for
-the original variant (which is now empty / disabled).
+Recovery if the variant ID does leak: create a new admin variant in
+LS, update `LS_ADMIN_VARIANT_IDS`, and re-issue admin licenses for the
+new variant. Old variant keys stay valid for the original variant (which
+is now empty / disabled).
 
 ## CI / E2E tests
 
 Tests that need the admin tier use a real LS test-mode admin license
 key, stored in the GitHub Actions secret `LS_ADMIN_TEST_LICENSE`.
-Tests run against the live validate-tier endpoint (which has a
-test-mode that recognizes test keys).
+The tests run against the live validate-tier endpoint, which has a
+test-mode that recognises test keys.
 
-Dev/test infrastructure uses real LS — no parallel auth path. This
-simplifies the security model: there's exactly one path to admin
-(LS license → validate-tier classifies as admin), exercised in
-production AND tests.
+Dev and test infrastructure use real LS — no parallel auth path. That
+simplifies the security model: exactly one path to admin (LS license →
+validate-tier classifies as admin), exercised in both production and tests.
 
 ## Relationship to the Tier type
 
@@ -365,9 +362,9 @@ Tier = Literal["free", "pro", "mao", "enterprise", "admin"]
 TIER_ORDER = {"free": 0, "pro": 1, "mao": 2, "enterprise": 3, "admin": 4}
 ```
 
-`is_admin() -> bool` is the canonical helper (returns
-`get_tier() == "admin"`). It does NOT consult any env var, file, or
-signing key — only the cached server response.
+`is_admin() -> bool` is the canonical helper, returning
+`get_tier() == "admin"`. It consults nothing else — no env var, no
+file, no signing key. Only the cached server response.
 
 `launcher/src-tauri/src/db/migrations/005_tier_cache_admin.sql` extends
 the SQLite CHECK constraint on the `tier_cache` table to allow

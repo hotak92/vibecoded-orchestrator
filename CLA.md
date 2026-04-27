@@ -50,7 +50,7 @@ This Agreement shall be governed by the laws of Italy, without regard to its con
 
 ## How to Accept
 
-By opening a pull request against this repository, you confirm that you have read this CLA and agree to its terms. The commit message of your first commit in the PR should include the line:
+By opening a pull request against this repository, you confirm that you have read this CLA and agree to its terms. Your first commit in the PR must include the line:
 
 ```
 Signed-off-by: Your Full Name <your.email@example.com>
