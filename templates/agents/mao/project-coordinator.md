@@ -32,8 +32,6 @@ Find proven coordination strategies from past projects.
 
 For project-specific coordination approaches:
 - Ask user: "Search [Project]_development for workflow patterns"
-- Ask user: "Search [Project]_conversations for past coordination decisions"
-
 Use these to align with established project practices.
 
 ## Track Coordination
@@ -522,9 +520,6 @@ def verify_task_complete(self, task_id):
 
 **3. Development Collection** (docs/ → [Project]_development):
 - Verbose project-specific docs, auto-syncs
-
-**4. Conversation Collection** ([Project]_conversations):
-- Auto-captured chat history
 
 ## Success Criteria
 

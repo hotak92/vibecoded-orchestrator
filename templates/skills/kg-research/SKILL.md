@@ -129,7 +129,7 @@ Query: "What research have we done on context limits?"
 Best approach:
 1. search_recent_work(days=90, node_type="research") - Recent research
 2. hybrid_search("context limits RLM adaptive") - Conceptual search
-3. search_documentation("context management", collections=["ClaudeOrchestrator_conversations"])
+3. search_documentation("context management", collections=["ClaudeOrchestrator_development"])
 ```
 
 ---
@@ -262,10 +262,6 @@ Skill response:
 **Development Docs**:
 - `ClaudeOrchestrator_development` - Orchestrator docs
 - `[Project]_development` - Project-specific docs
-
-**Conversations**:
-- `ClaudeOrchestrator_conversations` - Chat history (decisions, context)
-- `[Project]_conversations` - Project-specific conversations
 
 **Code Graph**:
 - `CodeModule` - Files with imports and metrics

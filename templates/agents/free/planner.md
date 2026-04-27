@@ -208,16 +208,6 @@ Ask Claude Code: "Search [ProjectName]_development for [topic]"
 
 **Returns**: Documentation from that project's `docs/` directory
 
-### Project Conversations (past decisions, user preferences)
-
-Ask Claude Code: "Search [ProjectName]_conversations for [decision topic]"
-
-**Examples**:
-- "Search ARTup_conversations for authentication decisions"
-- "Search ClaudeOrchestrator_conversations for rate limiting discussions"
-
-**Returns**: Relevant past discussions, decisions, and context
-
 ### When to Search Project Context
 
 - Understanding existing project architecture

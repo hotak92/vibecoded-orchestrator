@@ -21,7 +21,7 @@ When providing RAG guidance, you can reference this workflow's working implement
 
 **Vector Database**: Weaviate
 - Production-ready, scalable
-- Collections: `ClaudeKnowledgeGraph`, `[Project]_development`, `[Project]_conversations`
+- Collections: `ClaudeKnowledgeGraph`, `[Project]_development`
 - Auto-sync via hooks when source files change
 
 **Embeddings**: snowflake-arctic-embed2
@@ -50,8 +50,6 @@ When providing RAG guidance, you can reference this workflow's working implement
 **Collections Strategy**:
 - `ClaudeKnowledgeGraph`: Concise cross-project patterns (<300 lines/node)
 - `[Project]_development`: Verbose project-specific docs (no size limit)
-- `[Project]_conversations`: Chat history with metadata
-
 **Performance**:
 - Keyword search: ~100ms (file-based)
 - Semantic search: ~500ms (Weaviate)

@@ -499,9 +499,6 @@ Date: 2026-01-28
 **3. Development Collection** (docs/ → [Project]_development):
 - Verbose project-specific docs, auto-syncs
 
-**4. Conversation Collection** ([Project]_conversations):
-- Auto-captured chat history
-
 ## Success Criteria
 
 - Clear folder structure
