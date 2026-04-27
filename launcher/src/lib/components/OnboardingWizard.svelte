@@ -496,21 +496,30 @@
             <!-- 2026-04-28: when the user navigated Back to step 3 from
                  the auto-skipped step 4, the install path field defaulting
                  to ~/vibecoded-orchestrator is misleading — they're already
-                 installed at $alreadyInstalledRoot. Pre-fill with the
-                 detected root and label it accordingly. The user can still
-                 change it to relocate, but they'll know the default is
-                 their CURRENT install. -->
+                 installed at $alreadyInstalledRoot. Show the detected
+                 path as read-only context and gate any "relocate" action
+                 to a future Tools → Relocate flow. Letting the user just
+                 type a new path here would either (a) create a SECOND
+                 install at the new path (disk waste, no config rewrite)
+                 or (b) break the existing git checkout if they expected
+                 a clean move. Both are wrong; the proper relocate is a
+                 copy + venv-rebuild + .env / .claude / hook path-rewrite,
+                 which is its own feature. -->
             <p class="ow-secondary">
               <strong>Already installed at</strong>
               <code class="ow-mono">{alreadyInstalledRoot}</code>.
-              You usually don't need to change this — only edit the path
-              below if you want to relocate the orchestrator.
+              To relocate the orchestrator, use the launcher's Settings
+              → Preferences → Relocate workflow (post-v1 feature) — it
+              copies the install + rewrites config paths safely. Don't
+              re-run the install at a new path here; it would create a
+              duplicate without rewriting any existing config.
             </p>
+          {:else}
+            <label class="ow-label">
+              <span>Install path</span>
+              <input bind:value={installPath} />
+            </label>
           {/if}
-          <label class="ow-label">
-            <span>Install path</span>
-            <input bind:value={installPath} />
-          </label>
           <!-- Bug 27: removed the "Copying from <repo path>" line — that
                leaked an internal implementation detail (the bundled repo
                source path) the user doesn't need. We still keep the
