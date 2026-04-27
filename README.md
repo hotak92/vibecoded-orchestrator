@@ -20,10 +20,17 @@ Open source. Runs locally. Learns from how you work.
 
 Brand-new machine, no Python, no Node, no container runtime? Two ways to start:
 
-> **Recent fixes** (2026-04-27): Joern installer hang resolved (commit `64d5804`); macOS
-> Gatekeeper quarantine xattr stripped automatically by `first-install.command`; Windows
-> SmartScreen UI documented. Update via `git pull && bash first-install.sh` if you hit
-> these on an older clone.
+> **Platform support for v1.0**: Linux is the validated path (developed and tested on Linux x64).
+> macOS is **experimental Tier-2** — only minimal smoke testing on Apple Silicon. Windows is
+> Tier-3 (CI-built but not interactively tested). On macOS expect to run `xattr -dr com.apple.quarantine .`
+> after extracting a downloaded zip, and to install Homebrew + Python 3.11+ before the installer
+> proceeds. See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for the full list of platform caveats.
+>
+> **Recent fixes** (2026-04-27): Joern post-install detection (probes 3 known locations);
+> `_development` collection no longer skipped when sibling projects exist on the host; Bash 3.2
+> empty-array crash on macOS (`cb3df13`); Joern installer hang (`64d5804`); macOS Gatekeeper
+> quarantine xattr stripped by `first-install.command`. Update via `git pull && bash first-install.sh`
+> if you hit any of these on an older clone.
 
 ### A. One-liner from a terminal (Linux / macOS)
 

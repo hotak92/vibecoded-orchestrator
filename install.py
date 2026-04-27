@@ -955,15 +955,32 @@ def _install_joern() -> bool:
             print("            You can install manually: https://docs.joern.io/installation/")
             return False
 
-        joern_bin = install_dir / "joern-cli"
-        if joern_bin.exists():
-            os.environ["PATH"] = f"{joern_bin}{os.pathsep}{os.environ.get('PATH', '')}"
-            print(f"            Joern installed at {joern_bin}")
-            print(f"            To use joern outside this installer, add to your shell rc:")
-            print(f"              export PATH=\"{joern_bin}{os.pathsep}$PATH\"")
-            return shutil.which("joern") is not None
+        # Recent Joern installers ignore --dir and land in ~/bin/joern/
+        # regardless of what we pass. Probe several known locations rather
+        # than trusting our flag was honored. Verify the joern executable
+        # itself exists, not just the directory.
+        candidates = [
+            install_dir / "joern-cli",                    # what we asked for
+            Path.home() / "bin" / "joern" / "joern-cli",  # what installer actually does (2026)
+            Path.home() / ".joern" / "joern-cli",         # legacy
+        ]
+        for joern_bin_dir in candidates:
+            joern_exe = joern_bin_dir / "joern"
+            if joern_exe.exists():
+                os.environ["PATH"] = f"{joern_bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"
+                print(f"            Joern installed at {joern_bin_dir}")
+                print(f"            To use joern outside this installer, add to your shell rc:")
+                print(f"              export PATH=\"{joern_bin_dir}{os.pathsep}$PATH\"")
+                return True
 
-        print(f"            Joern installer ran but joern-cli not at {joern_bin}")
+        # Last-ditch PATH probe — installer may have its own location logic.
+        path_joern = shutil.which("joern")
+        if path_joern:
+            print(f"            Joern detected on PATH at {path_joern}")
+            return True
+
+        probed = ", ".join(str(c / "joern") for c in candidates)
+        print(f"            Joern installer ran but binary not found at any of: {probed}")
         return False
 
     except (urllib.error.URLError, subprocess.TimeoutExpired, OSError) as e:
@@ -2179,20 +2196,13 @@ def _ensure_collections(embed_config: dict,
     if shared_name and shared_name != kg_name:
         required.append((shared_name, _kg_class_definition))
 
-    # In adopt mode, skip any `Development`-shaped class if the host already
-    # has a per-project one (e.g. `ClaudeOrchestrator_development`). The
-    # user's existing namespacing scheme wins.
-    if adopt_mode and dev_name not in existing:
-        existing_dev_like = [
-            c for c in existing
-            if c and (c.lower().endswith("_development") or c == "Development")
-            and c != dev_name
-        ]
-        if existing_dev_like:
-            print(f"  → host has existing Development-style collection(s): "
-                  f"{', '.join(sorted(existing_dev_like))}; skipping our "
-                  f"`{dev_name}` to respect host namespacing.")
-            required = [(n, b) for (n, b) in required if n != dev_name]
+    # NOTE: do NOT skip our `_development` collection just because other
+    # projects on the host have their own. Each project's docs live in
+    # its own per-project `<Project>_development` namespace — they are
+    # NOT shared like the cross-project KG. Creating ours is required
+    # for Step 7c to seed `docs/` content. Earlier code skipped it on
+    # the false assumption that one Development class served all
+    # projects, which left vco's docs unseeded (Step 7c then exited 1).
 
     missing = [(n, b) for (n, b) in required if n not in existing]
     skipped_existing = [n for (n, _) in required if n in existing]
