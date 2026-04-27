@@ -129,8 +129,15 @@ class CodeGraphQuery:
             print(f"❌ Failed to connect to Weaviate: {e}", file=sys.stderr)
             return False
 
-    def search_by_concept(self, query: str, collection: str = "CodeFunction", limit: int = 5):
-        """Semantic search for code by concept."""
+    def search_by_concept(self, query: str, collection: str = "CodeFunction", limit: int = 5, detail: str = "auto"):
+        """Semantic search for code by concept.
+
+        detail:
+          "auto" (default) — top-4 results get full per-collection details, rest
+                              get name + score refs (matches MCP search_code_graph behavior).
+          "titles"         — name + score only for every result.
+          "full"           — full details for every result.
+        """
         try:
             # Generate query embedding
             query_embedding = generate_code_embedding(query)
@@ -151,7 +158,7 @@ class CodeGraphQuery:
             response = coll.query.near_vector(**nv_kwargs)
 
             # Format and print results
-            print(f"\n🔍 Semantic search in {collection}: '{query}'")
+            print(f"\n🔍 Semantic search in {collection}: '{query}'  (detail={detail})")
             if self.project:
                 print(f"   Project filter: {self.project}")
             print(f"   Found {len(response.objects)} results:\n")
@@ -161,8 +168,20 @@ class CodeGraphQuery:
                 distance = obj.metadata.distance if obj.metadata.distance is not None else -1.0
                 similarity = 1.0 - distance if distance >= 0 else 0.0
 
+                # Per-result tier — mirrors search_code_graph MCP semantics
+                if detail == "titles":
+                    show_full = False
+                elif detail == "full":
+                    show_full = True
+                else:  # auto: top-4 full, rest as refs
+                    show_full = i <= 4
+
                 print(f"{i}. {props.get('full_name', props.get('name', 'Unknown'))}")
                 print(f"   Distance: {distance:.3f} (similarity: {similarity:.3f})")
+
+                if not show_full:
+                    print()
+                    continue
 
                 if collection == "CodeFunction":
                     print(f"   Signature: {props.get('signature')}")
@@ -410,6 +429,11 @@ def main():
                               help='Maximum results (default: 5)')
     search_parser.add_argument('--project', '-p', type=str,
                               help='Filter by project name')
+    search_parser.add_argument('--detail', type=str, default='auto',
+                              choices=['auto', 'titles', 'full'],
+                              help=("Verbosity per result. 'auto' (default) = top-4 full, "
+                                    "rest as refs (matches search_code_graph MCP). "
+                                    "'titles' = name+score only. 'full' = full details for all."))
 
     # Similar code
     similar_parser = subparsers.add_parser('similar', help='Find similar code')
@@ -447,7 +471,7 @@ def main():
     try:
         # Execute command
         if args.command == 'search':
-            querier.search_by_concept(args.query, args.collection, args.limit)
+            querier.search_by_concept(args.query, args.collection, args.limit, args.detail)
         elif args.command == 'similar':
             querier.find_similar(args.reference, args.collection, args.limit)
         elif args.command == 'structure':

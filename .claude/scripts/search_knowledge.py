@@ -29,6 +29,20 @@ DUAL_EMBEDDING_ENABLED = os.getenv("DUAL_EMBEDDING_ENABLED", "true").lower() == 
 # Query token limit (same as embedding limit)
 MAX_QUERY_TOKENS = 2500
 
+# Import shared tier helpers from the MCP server (single source of truth)
+# Falls back to a no-op formatter if the import fails (e.g. running standalone
+# without the venv) — in that case --detail is silently ignored.
+try:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "claude_mcp_servers"))
+    from weaviate_mcp.server import (
+        _get_result_verbosity_by_score,
+        _format_result_by_tier,
+        _load_node_formats,
+    )
+    HAS_TIER_HELPERS = True
+except Exception:
+    HAS_TIER_HELPERS = False
+
 # Try to import query logger
 try:
     from query_logger import ToolUsageLogger
@@ -117,16 +131,35 @@ def reassemble_chunks(collection, source_node_id: str) -> Dict[str, Any]:
     }
 
 
-def search_knowledge(query: str, limit: int = 5, node_type: str = None, tags: list = None, show_content: bool = False, files_only: bool = False):
+def search_knowledge(
+    query: str,
+    limit: int = 5,
+    node_type: str = None,
+    tags: list = None,
+    show_content: bool = False,
+    files_only: bool = False,
+    detail: str = "auto",
+):
     """
-    Search knowledge graph using semantic search
+    Search knowledge graph using semantic search.
 
-    Automatically handles chunked nodes - returns unique nodes only (not duplicate chunks)
-    Truncates queries exceeding MAX_QUERY_TOKENS
+    Automatically handles chunked nodes - returns unique nodes only (not duplicate chunks).
+    Truncates queries exceeding MAX_QUERY_TOKENS.
 
     Args:
-        files_only: If True, output only file paths (minimal tokens, ~5-10 tokens)
+        detail: Verbosity tier per result. "auto" (default) picks per-result tier
+            from the relevance score using the same 5-tier system as hybrid_search
+            ("discard" / "summary" / "single_chunk" / "three_chunks" / "full").
+            Explicit overrides: "titles", "summary", "descriptions", "full".
+            Uses the shared `_format_result_by_tier` helper from weaviate-mcp/server.py.
+        files_only: Compatibility shim — equivalent to `detail="titles"` (file path only).
+        show_content: Compatibility shim — equivalent to `detail="full"` (300-char preview).
     """
+    # Map legacy flags onto the new detail tiers (CLI back-compat).
+    if files_only:
+        detail = "titles"
+    elif show_content and detail == "auto":
+        detail = "full"
     start_time = time.time()
     result_count = 0
     error_msg = None
@@ -214,13 +247,13 @@ def search_knowledge(query: str, limit: int = 5, node_type: str = None, tags: li
         result_count = len(unique_results)
 
         # Print results
-        if files_only:
-            # Minimal output: just file paths (5-10 tokens)
+        if detail == "titles":
+            # Minimal output: just file paths (5-10 tokens) — preserves --files-only semantics
             for obj in unique_results:
                 props = obj.properties
                 print(props.get('file_path', 'unknown'))
         else:
-            # Normal output with formatting
+            # Tier-aware formatting via the shared helpers when available.
             collections_searched = len(collections_to_query)
             if collections_searched > 1:
                 print(f"\n🔍 Found {len(unique_results)} results for: \"{query}\" (searched {collections_searched} collections)\n")
@@ -228,11 +261,14 @@ def search_knowledge(query: str, limit: int = 5, node_type: str = None, tags: li
                 print(f"\n🔍 Found {len(unique_results)} results for: \"{query}\"\n")
             print("=" * 60)
 
+            sidecar_db = _load_node_formats() if HAS_TIER_HELPERS else {}
+
             for i, obj in enumerate(unique_results, 1):
                 props = obj.properties
                 collection_source = getattr(obj, '_collection_source', KG_COLLECTION)
+                distance = obj.metadata.distance if obj.metadata and obj.metadata.distance is not None else 1.0
+                score = max(0.0, min(1.0, 1.0 - distance))
 
-                # Show collection source if querying multiple
                 source_label = ""
                 if collections_searched > 1:
                     if collection_source == SHARED_KG_COLLECTION:
@@ -240,17 +276,50 @@ def search_knowledge(query: str, limit: int = 5, node_type: str = None, tags: li
                     else:
                         source_label = " [project]"
 
-                print(f"\n{i}. {props['title']}{source_label}")
-                print(f"   Type: {props.get('node_type', 'unknown')}")
-                print(f"   Tags: {', '.join(props.get('tags', []))}")
-                print(f"   File: {props.get('file_path', 'unknown')}")
+                # Build a result dict in the shape _format_result_by_tier expects
+                result_dict = {
+                    "title": props.get("title", ""),
+                    "node_type": props.get("node_type", "unknown"),
+                    "file_path": props.get("file_path", ""),
+                    "tags": list(props.get("tags", []) or []),
+                    "content": props.get("content", "") or "",
+                    "score": score,
+                    "distance": distance,
+                }
 
-                if show_content:
-                    content = props.get('content', '')
-                    preview = content[:300] + "..." if len(content) > 300 else content
-                    print(f"\n   {preview}\n")
+                # Pick the per-result tier
+                if HAS_TIER_HELPERS and detail == "auto":
+                    tier = _get_result_verbosity_by_score(score)
+                    if tier == "discard":
+                        # Skip noise tier results when in auto mode
+                        continue
+                else:
+                    # Explicit detail overrides — descriptions is a back-compat alias for summary
+                    tier = "summary" if detail == "descriptions" else detail
 
-            print("=" * 60)
+                if HAS_TIER_HELPERS:
+                    formatted = _format_result_by_tier(result_dict, tier, sidecar_db, coll=None)
+                else:
+                    formatted = result_dict  # fallback when helpers unavailable
+
+                print(f"\n{i}. {formatted.get('title', '?')}{source_label}  (score={score:.2f}, tier={tier})")
+                print(f"   Type: {formatted.get('node_type', 'unknown')}")
+                if formatted.get("tags"):
+                    print(f"   Tags: {', '.join(formatted.get('tags', []))}")
+                print(f"   File: {formatted.get('file_path', 'unknown')}")
+
+                # Render whichever tier-rendered text field is present (preferred order)
+                for field in ("description", "summary", "content"):
+                    text = formatted.get(field)
+                    if text:
+                        # Indent each line for readability
+                        lines = text.splitlines() or [text]
+                        print()
+                        for ln in lines:
+                            print(f"   {ln}")
+                        break
+
+            print("\n" + "=" * 60)
             print()
 
     except Exception as e:
@@ -404,8 +473,19 @@ if __name__ == "__main__":
     parser.add_argument("--limit", type=int, default=5, help="Max results")
     parser.add_argument("--type", dest="node_type", help="Filter by node type")
     parser.add_argument("--tags", help="Filter by tags (comma-separated)")
-    parser.add_argument("--content", action="store_true", help="Show content preview")
-    parser.add_argument("--files-only", action="store_true", help="Return only file paths (minimal tokens)")
+    parser.add_argument("--content", action="store_true", help="(Legacy) Show 300-char content preview — equivalent to --detail full")
+    parser.add_argument("--files-only", action="store_true", help="(Legacy) Return only file paths — equivalent to --detail titles")
+    parser.add_argument(
+        "--detail",
+        choices=["auto", "titles", "summary", "descriptions", "full"],
+        default="auto",
+        help=(
+            "Verbosity tier per result. Default 'auto' picks per-result tier from the "
+            "relevance score using the same 5-tier system as hybrid_search "
+            "(discard / summary / single_chunk / three_chunks / full). "
+            "'descriptions' is a back-compat alias for 'summary'."
+        ),
+    )
     parser.add_argument("--days", type=int, default=7, help="Days to look back")
 
     args = parser.parse_args()
@@ -418,7 +498,7 @@ if __name__ == "__main__":
                 print("Error: search requires a query")
                 sys.exit(1)
             files_only = getattr(args, 'files_only', False)
-            search_knowledge(args.query, args.limit, args.node_type, tags_list, args.content, files_only)
+            search_knowledge(args.query, args.limit, args.node_type, tags_list, args.content, files_only, args.detail)
         elif args.command == "list":
             list_all_nodes()
         elif args.command == "recent":
