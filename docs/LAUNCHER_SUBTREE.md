@@ -1,6 +1,6 @@
 # Launcher Subtree
 
-The `launcher/` directory is a **git subtree** of the [VCT-Launcher](https://github.com/pb992/VCT-Launcher) repo, branch `feature/orchestrator-hub`. It is bundled into this repo so that users get the launcher source alongside the orchestrator with a single `git clone`.
+The `launcher/` directory is a git subtree of the [VCT-Launcher](https://github.com/pb992/VCT-Launcher) repo, branch `feature/orchestrator-hub`. It's bundled here so a single `git clone` gives users the launcher source alongside the orchestrator.
 
 ## Why subtree (not submodule)?
 
@@ -35,10 +35,10 @@ This pushes only the `launcher/` history to the VCT-Launcher repo's branch. Pref
 
 ## Don't edit `launcher/` casually
 
-The launcher is its own product with its own CI, tests, and release cadence. Edits should usually originate in `pb992/VCT-Launcher` and flow into this repo via `git subtree pull`. Direct edits here create a divergence that has to be reconciled.
+The launcher is its own product with its own CI, tests, and release cadence. Edits should originate in `pb992/VCT-Launcher` and flow here via `git subtree pull`. Direct edits in this repo create a divergence that has to be reconciled.
 
 ## Why this layout
 
-- Users `git clone https://github.com/hotak92/vibecoded-orchestrator.git` and have everything (orchestrator + launcher source)
-- Fixed relative path: `<repo>/launcher/` always exists. `install.py`, packaging scripts, and docs can rely on this.
-- The launcher's `src-tauri/` Rust crate, `src/` Svelte UI, `supabase/` migrations are all here.
+- One `git clone https://github.com/hotak92/vibecoded-orchestrator.git` gets users orchestrator + launcher source together.
+- Fixed relative path: `<repo>/launcher/` always exists, so `install.py`, packaging scripts, and docs can rely on it.
+- The launcher's `src-tauri/` Rust crate, `src/` Svelte UI, and `supabase/` migrations all live there.

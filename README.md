@@ -1,31 +1,64 @@
 # VibeCoded Tools — Orchestrator
 
-**The only AI coding tool with persistent memory, code understanding, and workflow automation.**
+**Persistent memory, code-graph search, and workflow automation for [Claude Code](https://claude.ai/code).**
 
-Open source. Runs locally. Learns from you.
+Open source. Runs locally. Learns from how you work.
 
 ---
 
-## What It Does
+## What it does
 
-The orchestrator is an invisible infrastructure layer for [Claude Code](https://claude.ai/code) that solves three problems no other tool addresses together:
+An infrastructure layer for Claude Code that addresses three things no single tool covers today:
 
-| Problem | How we solve it |
+| Problem | What we add |
 |---------|----------------|
-| **Context amnesia** | Knowledge Graph with semantic search — Claude remembers across sessions |
-| **Code blindness** | Code Graph indexes modules, classes, functions, APIs, and cross-service calls for your whole repo |
-| **Workflow repetition** | 19 free agents + 28 skills auto-install; 20 hooks automate repetitive ops (sync, security scan, context injection). Optional MAO add-on adds 10 specialist agents. |
+| Context amnesia between sessions | Knowledge Graph with semantic search — Claude reads it on session start |
+| Code blindness | Code graph indexes modules, classes, functions, APIs, and cross-service calls |
+| Repetitive setup and ops | 19 free agents + 28 skills installed into `.claude/`; 20 hooks for sync, secret scans, context injection. Optional MAO add-on adds 10 specialist agents. |
 
-You use Claude Code normally. The orchestrator works in the background via hooks and MCP servers.
+You use Claude Code the way you already do. The orchestrator runs in the background via hooks and MCP servers.
 
 ## Features
 
-- **Knowledge Graph** — Markdown nodes with typed WikiLinks, stored in Weaviate with semantic embeddings (qwen3 1024-dim by default; optional OpenAI)
+- **Knowledge Graph** — Markdown nodes with typed WikiLinks, indexed in Weaviate with semantic embeddings (qwen3 1024-dim by default; optional OpenAI)
 - **Code Graph** — AST analysis via Tree-sitter across 10+ languages: `CodeModule`, `CodeClass`, `CodeFunction`, `CodeAPI`, `CodeInteraction`
-- **20 Automation Hooks** — SessionStart through Stop: context injection, auto-sync on file edits, credential scanning, KG/code graph maintenance. Hooks ship pre-installed in this repo's `.claude/hooks/` and fire when you work inside the orchestrator project; per-target-project hook distribution is on the roadmap (today, agents/skills are copied to `.claude/`, hooks are not).
-- **4 MCP Servers** — Weaviate (semantic search), Ollama (local LLM + embeddings), search (web + code + arXiv), code-embedding (CodeSage-Large-v2 via FastAPI)
-- **19 Free Agents + 28 Skills** — shipped via `install.py` templates; opt-in MAO-tier add-on installs 10 specialist agents
-- **Workflow Automation** — session state tracking, plans, memory management, compaction-preserving context replay
+- **20 automation hooks** — SessionStart through Stop: context injection, auto-sync on file edits, credential scans, KG/code-graph maintenance. The hooks live in this repo's `.claude/hooks/` and fire when you work inside the orchestrator project. Per-target-project hook distribution is on the roadmap; today, `install.py` copies agents and skills into `.claude/`, but not hooks.
+- **4 MCP servers** — Weaviate (semantic search), Ollama (local LLM + embeddings), search (web + code + arXiv), code-embedding (CodeSage-Large-v2 via FastAPI)
+- **19 free agents + 28 skills** — shipped via `install.py` templates. The opt-in MAO add-on installs 10 more specialist agents.
+- **Workflow plumbing** — session state tracking, plans, memory management, compaction-preserving context replay
+
+## Downloads (Launcher GUI — v0.1.0+)
+
+The launcher GUI ships as a per-OS standalone artifact on [GitHub
+Releases](https://github.com/hotak92/vibecoded-orchestrator/releases). It's
+the path of least resistance if you'd rather not touch the CLI; the
+backend (Python + containers) is installed by the launcher's on-screen
+wizard on first run.
+
+| OS | Artifact | Notes |
+|---|---|---|
+| **Windows 10/11 (x64)** | `vct-launcher-windows-x64.exe` | Portable, no installer. **First run**: SmartScreen will warn "Windows protected your PC" because the build is unsigned. Click **More info** → **Run anyway**. Code signing is on the v0.1.1 backlog. |
+| **Linux (x64)** | `*.AppImage` (portable) or `*.deb` (Debian/Ubuntu) | AppImage: `chmod +x VCT_Launcher_*.AppImage && ./VCT_Launcher_*.AppImage`. .deb: `sudo dpkg -i vct-launcher_*.deb`. |
+| **macOS (Apple Silicon, experimental)** | `vct-launcher-macos-arm64.dmg` | See "macOS (experimental)" below. We have no Mac to test on, so quality is best-effort. |
+
+**No GUI yet?** The CLI install path (next section) works on all three OSes.
+
+### macOS (experimental)
+
+We can't test on Mac. The .dmg is built unattended in CI. Try at your own risk.
+
+1. Download `vct-launcher-macos-arm64.dmg` from [Releases](https://github.com/hotak92/vibecoded-orchestrator/releases).
+2. Open the .dmg, drag **VCT Launcher** into Applications.
+3. **First run**: Gatekeeper will say "VCT Launcher is damaged and can't be opened". That's the unsigned-binary warning, not actual damage. Strip the quarantine attribute:
+   ```bash
+   xattr -cr /Applications/VCT\ Launcher.app
+   ```
+4. Open the app from /Applications.
+
+If it works, please open an issue saying "v0.1.0 worked on macOS [version] [arch]". That helps us prioritise Apple Developer enrollment.
+If it doesn't, please open an issue with macOS version, architecture (`uname -m`), and the error message.
+
+Apple Developer enrollment + notarization are on the post-launch backlog. Intel Mac users: build from source for v0.1.0; a Universal binary is planned for v0.1.1.
 
 ## Quick Install
 
@@ -112,9 +145,8 @@ For deeper issues see [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
 
 ## Compatibility
 
-The orchestrator works with **all Claude Code surfaces** — hooks fire,
-agents/skills load, MCP servers connect regardless of which surface you
-use:
+Works with all three Claude Code surfaces. Hooks fire, agents and skills
+load, MCP servers connect regardless of which one you launch from:
 
 - **Claude Code CLI** (`claude` binary): Per-project env via the
   canonical `.claude/settings.json` `env` block (auto-generated by
@@ -131,10 +163,10 @@ use:
   Linux Desktop app is not yet shipped by Anthropic; Linux users
   should use the CLI surface.
 
-When the launcher creates a project it writes three files —
+The launcher writes three files when it creates a project:
 `.claude/settings.json` (canonical), `.vscode/settings.json` (extension
-compat), and `.claude/env` (shell wrapper) — all carrying the same
-values, so you can switch surfaces freely without reconfiguring.
+compat), and `.claude/env` (shell wrapper). All three carry the same
+values, so you can switch surfaces without reconfiguring.
 
 See [`docs/CLAUDE_CODE_COMPATIBILITY.md`](docs/CLAUDE_CODE_COMPATIBILITY.md)
 for the full surface matrix, known caveats, and direnv alternative.
@@ -208,7 +240,7 @@ vibecoded-orchestrator/
 | **MAO** | TBD — sign up for the waitlist | Pro + 10 specialist agents + Tauri desktop UI + multi-agent maestro runtime |
 | **Enterprise** | From €500/mo | MAO + SOC 2 compliance track, priority support, commercial AGPL exemption, custom SLAs |
 
-Pro and MAO tiers activate additional features via a license key issued at purchase and validated against our Supabase endpoint. Free tier works fully without a key — RL retrieval simply falls back to cosine ordering. No phone-home, no feature telemetry, no telemetry at all unless you opt in.
+Pro and MAO tiers activate additional features via a license key issued at purchase, validated against our Supabase endpoint. Free tier works fully without a key — RL retrieval falls back to cosine ordering. No phone-home, no feature telemetry, no telemetry at all unless you opt in.
 
 ## Licensing
 
@@ -218,11 +250,11 @@ The entire repository is licensed under **[AGPL-3.0-or-later](LICENSE)**. There 
 - Individuals and non-commercial users: use freely under AGPL.
 - Companies running this in a service or product: either open-source your modifications under AGPL, or buy a commercial license / subscription. Email team@vibecodedtools.com.
 
-**How the commercial model works**: free source under AGPL + paid binaries delivered via signed-URL CDN. Pro and MAO are commercial subscriptions distributed as **pre-compiled, Ed25519-signed artifacts** gated by Lemon Squeezy — subscribers receive the binaries, not source. No source license applies to those artifacts because no source is published for them. The license validator and telemetry components shipped in this repo (under `VCThelpers/`) are AGPL like everything else; the actual trust root for paid-module access is server-side (Supabase + Lemon Squeezy + signature verification on download).
+**How the commercial model works**: free source under AGPL, plus paid binaries delivered via signed-URL CDN. Pro and MAO are subscriptions distributed as pre-compiled, Ed25519-signed artifacts gated by Lemon Squeezy — subscribers receive binaries, not source. No source license applies to those artifacts because no source is published for them. The license validator and telemetry components in this repo (`VCThelpers/`) are AGPL like the rest; the trust root for paid-module access is server-side (Supabase + Lemon Squeezy + signature verification on download).
 
 ## Contributing
 
-Contributions welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines and [CLA.md](CLA.md) for the Contributor License Agreement (accepted via `git commit -s`).
+Contributions welcome — small fixes and bug reports especially. See [CONTRIBUTING.md](CONTRIBUTING.md) for the workflow and [CLA.md](CLA.md) for the Contributor License Agreement (accepted via `git commit -s`).
 
 ## Documentation
 

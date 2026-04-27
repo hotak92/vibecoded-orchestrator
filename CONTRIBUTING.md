@@ -1,6 +1,6 @@
 # Contributing to VibeCoded Tools — Orchestrator
 
-Thanks for considering a contribution. This project is in alpha, small contributions and issue reports are very welcome.
+Thanks for considering a contribution. The project is in alpha; small fixes and issue reports are especially welcome.
 
 ---
 
@@ -8,9 +8,9 @@ Thanks for considering a contribution. This project is in alpha, small contribut
 
 ### 1. Read and Accept the CLA
 
-All contributions to this project require acceptance of our [Contributor License Agreement (CLA.md)](CLA.md). This is standard practice for dual-licensed projects (same model as MongoDB, Grafana, Sentry).
+All contributions require accepting our [Contributor License Agreement (CLA.md)](CLA.md). Standard practice for dual-licensed projects — same model MongoDB, Grafana, and Sentry use.
 
-**How to accept**: your first commit in a PR must include a `Signed-off-by` trailer. Use `git commit -s` to add this automatically:
+**How to accept**: your first commit in a PR must include a `Signed-off-by` trailer. `git commit -s` adds it automatically:
 
 ```bash
 git commit -s -m "Your commit message"
@@ -29,7 +29,7 @@ The entire repository is licensed under **AGPL-3.0-or-later**. New source files 
 
 For shell scripts, use `# SPDX-License-Identifier: ...`. For JS/TS, use `// SPDX-License-Identifier: ...`.
 
-Paid modules (Pro, MAO, etc.) are distributed as pre-compiled, signed binaries via signed-URL CDN, not under any source license — there is no separate source-license tier in this repo.
+Paid modules (Pro, MAO, etc.) are distributed as pre-compiled, signed binaries through a signed-URL CDN. They aren't covered by any source license; there is no separate source-license tier in this repo.
 
 ---
 
@@ -59,13 +59,13 @@ pyright
 
 ## Continuous Integration
 
-Pull requests run a deliberately minimal CI matrix on every push (`.github/workflows/ci.yml`):
+Pull requests run a deliberately small CI matrix on every push (`.github/workflows/ci.yml`):
 
-- **Rust** — `cargo test --lib --manifest-path launcher/src-tauri/Cargo.toml`. Library tests only; full Tauri bundle builds are gated behind a release workflow because they need a per-OS matrix and a lot of platform deps.
-- **Python** — `pytest tests/` against Python 3.12 with `requirements.txt` + `requirements-dev.txt`. Covers the trust-critical helpers (license validator, telemetry PII scrubbing + consent gating, install-flow detection).
-- **Frontend** — `npm run check` in `launcher/` (svelte-check + TypeScript). No frontend runtime tests yet — that's a known gap; PRs that add a Playwright smoke test or component tests are welcome.
+- **Rust** — `cargo test --lib --manifest-path launcher/src-tauri/Cargo.toml`. Library tests only. Full Tauri bundle builds are gated behind a release workflow because they need a per-OS matrix and a lot of platform deps.
+- **Python** — `pytest tests/` on Python 3.12 with `requirements.txt` + `requirements-dev.txt`. Covers the trust-critical helpers: license validator, telemetry PII scrubbing + consent gating, install-flow detection.
+- **Frontend** — `npm run check` in `launcher/` (svelte-check + TypeScript). No frontend runtime tests yet — known gap. PRs that add a Playwright smoke test or component tests are welcome.
 
-CI is intentionally minimal at this stage of the project. When the launcher gets release tags, a separate workflow will add the full per-OS bundle build, signing, and artifact uploads.
+CI stays small at this stage. When the launcher gets release tags, a separate workflow will add the full per-OS bundle build, signing, and artifact upload.
 
 For maintainers cutting a release, see [`docs/RELEASING.md`](docs/RELEASING.md). [`CHANGELOG.md`](CHANGELOG.md) follows the Keep a Changelog format.
 
@@ -73,9 +73,9 @@ For maintainers cutting a release, see [`docs/RELEASING.md`](docs/RELEASING.md).
 
 ## Contribution Flow
 
-1. **Open an issue first** for anything beyond a small fix — so we can agree on scope before you invest time.
+1. **Open an issue first** for anything beyond a small fix, so we can agree on scope before you invest time.
 2. **Fork the repo** and create a feature branch: `git checkout -b feature/your-feature-name`.
-3. **Write tests** for new behavior. Coverage for changed lines is expected.
+3. **Write tests** for new behaviour. Coverage on changed lines is expected.
 4. **Commit with sign-off**: `git commit -s -m "concise message"`. Keep commits focused.
 5. **Run the test suite locally** before pushing.
 6. **Open a PR** against `main`. Fill in the PR template. Link the related issue.
@@ -111,7 +111,7 @@ For maintainers cutting a release, see [`docs/RELEASING.md`](docs/RELEASING.md).
 
 ## Code of Conduct
 
-Be respectful, technical, and concise. Criticism of code is welcome; criticism of people is not. Moderators reserve the right to close issues and PRs that don't meet this standard.
+Be respectful, technical, and concise. Criticism of code is welcome; criticism of people is not. Maintainers may close issues and PRs that don't meet this standard.
 
 ---
 

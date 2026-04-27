@@ -6,9 +6,9 @@
 
 ## Summary
 
-All direct and transitive Python dependencies carry licenses compatible with AGPL-3.0 (the core project's license). No GPL-2-only, AGPL-3-only, or other copyleft-incompatible licenses are pulled in.
+All direct and transitive Python dependencies carry licenses compatible with AGPL-3.0 (the core project's license). Nothing GPL-2-only, AGPL-3-only, or otherwise copyleft-incompatible is pulled in.
 
-The NVIDIA CUDA libraries are a special case: they are proprietary but are transitive dependencies of `torch` that pip only installs on CUDA-capable systems. We do NOT redistribute them in our repo or installers; users who install `torch` with GPU support pull them directly from PyPI under NVIDIA's EULA, which NVIDIA itself enforces. Same situation as CUDA Toolkit itself.
+The NVIDIA CUDA libraries are a special case. They're proprietary, but transitive dependencies of `torch` that pip only installs on CUDA-capable systems. We don't redistribute them in our repo or installers; users who install `torch` with GPU support pull them directly from PyPI under NVIDIA's EULA, which NVIDIA itself enforces. Same situation as the CUDA Toolkit.
 
 **Approval status**: ✅ Cleared for AGPL-3.0 core release.
 

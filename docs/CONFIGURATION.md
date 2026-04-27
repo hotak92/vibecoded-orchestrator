@@ -1,17 +1,17 @@
 # Configuration Philosophy
 
-This project follows a **minimal global, maximum per-project** config principle.
+Config layout follows one rule: **minimal global, maximum per-project**.
 
 ## What this means
 
-- **Global `~/.claude/settings.json`**: user preferences only (effort level, output tokens, universal permission denies). No project paths, no MCP server URLs, no environment variables that any given project actually uses.
-- **Per-project `.vscode/settings.json`**: where `claude-code.env` lives for the **VS Code extension** specifically. MCP env vars (Weaviate URL, collection names, embedding backend, etc.) are set here so opening this project in VS Code automatically wires up its Claude Code MCP servers correctly, without affecting any other project you have open.
+- **Global `~/.claude/settings.json`**: user preferences only — effort level, output tokens, universal permission denies. No project paths, no MCP server URLs, no environment variables that any specific project depends on.
+- **Per-project `.vscode/settings.json`**: where `claude-code.env` lives for the **VS Code extension**. MCP env vars (Weaviate URL, collection names, embedding backend) live here so opening this project in VS Code wires up its MCP servers correctly without affecting any other project you have open.
 - **Per-project `.claude/settings.json`**: per-project permissions and hook registrations, plus an `env` block read by the **Claude Code CLI and Desktop app**. The launcher writes both files in lockstep so all three surfaces (VS Code extension / CLI / Desktop) see the same MCP environment.
-- **Per-project secrets**: stored in OS keychain via the VCT Launcher GUI (not env files, not JSON configs). The launcher knows about per-project scoping so e.g. an OpenAI key for one project doesn't leak into another.
+- **Per-project secrets**: stored in the OS keychain via the VCT Launcher GUI — not in env files, not in JSON configs. The launcher knows about per-project scoping, so an OpenAI key for one project doesn't leak into another.
 
 ## Why
 
-Prevents cross-contamination. Global settings default to every project you open — if you set `KG_COLLECTION=MyMainProjectKG` globally, every other project will silently reuse that collection and mix knowledge graphs.
+It prevents cross-contamination. Global settings apply to every project you open — set `KG_COLLECTION=MyMainProjectKG` globally and every other project will silently reuse that collection and mix knowledge graphs.
 
 ## Setup for new users
 
@@ -53,7 +53,7 @@ See [templates/README.md](../templates/README.md) for the tier split (free vs MA
 
 ## Parallel agents (3-5x speedup)
 
-Claude Code can run multiple agents concurrently on independent sub-tasks. Enable globally:
+Claude Code can run multiple agents concurrently on independent sub-tasks. Turn it on globally:
 
 ```json
 // ~/.claude/settings.json
@@ -64,7 +64,7 @@ Claude Code can run multiple agents concurrently on independent sub-tasks. Enabl
 }
 ```
 
-With this on, when you ask the orchestrator to refactor 30 files or analyze 5 directories, it spawns up to 3 parallel agents instead of doing the work sequentially. Typical speedup on multi-file tasks: 3-5x.
+With this on, asking the orchestrator to refactor 30 files or analyze 5 directories spawns up to 3 parallel agents instead of doing the work sequentially. Typical speedup on multi-file tasks: 3-5x.
 
-This is the only global env var we recommend setting — everything else is per-project.
+This is the only global env var worth setting; everything else is per-project.
 

@@ -1,11 +1,11 @@
 # Claude Code surface compatibility
 
 The orchestrator was originally tested against the VS Code extension,
-but every functional piece (hooks, agents, skills, MCP servers, slash
-commands, CLAUDE.md) is read by the `claude` CLI binary too. The only
-real gap was per-project env injection — and as of Bug 30 the launcher
-now writes the canonical `.claude/settings.json` `env` block which is
-read by all three surfaces (CLI, Desktop app, VS Code extension).
+but every functional piece — hooks, agents, skills, MCP servers, slash
+commands, CLAUDE.md — is read by the `claude` CLI binary too. The only
+real gap was per-project env injection. As of Bug 30 the launcher writes
+the canonical `.claude/settings.json` `env` block, which is read by all
+three surfaces (CLI, Desktop app, VS Code extension).
 
 This doc lists what works on each surface and how the per-project env
 files relate to each other.
@@ -27,17 +27,17 @@ files relate to each other.
 
 ## Per-project env files
 
-When the launcher creates a project it writes **three** files, all
+The launcher writes **three** files when it creates a project, all
 carrying the same env values (`KG_COLLECTION`, `PROJECT_NAME`,
 `DEVELOPMENT_COLLECTION`, `CONVERSATION_COLLECTION`):
 
 1. **`.claude/settings.json`** with an `env` block — Anthropic's
-   canonical per-project env mechanism. Read by Claude Code CLI, the
-   Desktop app, AND the VS Code extension. This is the **primary**
+   canonical per-project env mechanism. Read by the Claude Code CLI,
+   the Desktop app, AND the VS Code extension. This is the primary
    path; without it, Desktop app users get no per-project KG routing.
-   The launcher does a read-merge-write so existing hooks /
-   permissions / agents config in the same file are preserved
-   untouched — only the top-level `env` key is overwritten.
+   The launcher does a read-merge-write so existing hooks, permissions,
+   and agents config in the same file stay untouched — only the
+   top-level `env` key is overwritten.
 2. **`.vscode/settings.json`** with a `claude-code.env` block — the
    VS Code-extension-specific path. Kept for compatibility / user
    preference; same values as (1) so there is no precedence conflict
@@ -49,7 +49,7 @@ carrying the same env values (`KG_COLLECTION`, `PROJECT_NAME`,
 The CLI doesn't auto-source `.claude/env`. With (1) in place this is
 no longer required for KG routing, but the wrapper is still useful if
 you want extra env vars beyond the four the launcher manages. Three
-ways to wire it up:
+ways to wire it in:
 
 ### Option A: bundled wrapper script (recommended)
 
@@ -100,26 +100,26 @@ ceremony, easiest to forget.
 
 ## Why three env files?
 
-Historical: before Bug 30 we only wrote `.vscode/settings.json` (for
-the extension) and `.claude/env` (for shell-wrapper CLI users).
-Desktop app users had no path to per-project env at all. Bug 30 added
-the canonical `.claude/settings.json` `env` block which Anthropic
-documents as the cross-surface mechanism (CLI + Desktop + extension).
+History: before Bug 30 we only wrote `.vscode/settings.json` (for the
+extension) and `.claude/env` (for shell-wrapper CLI users). Desktop app
+users had no path to per-project env at all. Bug 30 added the canonical
+`.claude/settings.json` `env` block, which Anthropic documents as the
+cross-surface mechanism (CLI + Desktop + extension).
 
-We keep the other two files for compatibility:
-- `.vscode/settings.json` `claude-code.env` is the path users with
-  pre-Bug-30 muscle memory will look for first.
+The other two files stick around for compatibility:
+- `.vscode/settings.json` `claude-code.env` is where users with
+  pre-Bug-30 muscle memory will look first.
 - `.claude/env` is useful as a sh-sourceable file for shell wrappers
   and direnv setups, especially when users want to extend it with
   extra env vars beyond the four the launcher manages.
 
-Same values in all three files means there is no precedence conflict
-to reason about. If/when the Claude Code surfaces unify on
-`.claude/settings.json`, the other two files become redundant.
+Because all three files carry the same values, there's no precedence
+conflict to reason about. If the Claude Code surfaces ever unify on
+`.claude/settings.json`, the other two become redundant.
 
 ## Linux Desktop app gap
 
 Anthropic's Desktop app is macOS / Windows only as of v2.1.x. Linux
-users without VS Code must use the CLI surface (with the `tools/claude`
-wrapper or one of the alternatives below). This is an upstream
-limitation we cannot work around from the launcher.
+users without VS Code have to use the CLI surface (with the
+`tools/claude` wrapper or one of the alternatives above). Upstream
+limitation — nothing the launcher can do about it.

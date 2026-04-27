@@ -2,20 +2,20 @@
 
 **Read this first if you (or your AI assistant) just opened this repo.**
 
-You're looking at **VibeCoded Orchestrator** — an AI coding orchestrator built on top of Claude Code. It adds:
-- **Knowledge Graph** with semantic search across your project
-- **Code Graph** that understands your repo structurally (modules, classes, functions, APIs, cross-service calls)
-- **16 automation hooks** (KG sync on file edits, security scans, context injection, post-commit reviews)
+You're looking at **VibeCoded Orchestrator**, an AI-coding orchestrator that sits on top of Claude Code. It adds:
+- A **Knowledge Graph** with semantic search across your project
+- A **Code Graph** that knows your repo structurally — modules, classes, functions, APIs, cross-service calls
+- **16 automation hooks** (KG sync on file edits, secret scans, context injection, post-commit reviews)
 - **MCP servers** for Weaviate (KG + code graph), Ollama (local LLM), web search
-- **Curated agent + skill bundle** for Claude Code (architects, code reviewers, debuggers, etc.)
+- A bundle of agents and skills for Claude Code — architects, code reviewers, debuggers, and friends
 
-How you got here matters — the next steps depend on it.
+The next steps depend on how you got here.
 
 ---
 
 ## Path A: You opened this through the VCT Launcher
 
-If you installed via the **VCT Launcher** desktop app, **almost everything is already done**:
+If you installed via the **VCT Launcher** desktop app, almost everything is already wired up:
 
 - Container services (Weaviate, Ollama) are running
 - Secrets are managed by the launcher's keychain
@@ -27,13 +27,13 @@ If you installed via the **VCT Launcher** desktop app, **almost everything is al
 
 **What the AI assistant reading this should do**: nothing special. The orchestrator is ready. Read [`CLAUDE.md`](CLAUDE.md) for the operating manual.
 
-If something looks broken — hooks not firing, MCPs unreachable, secrets missing — open the VCT Launcher, navigate to this project, and run **Doctor** (or the equivalent diagnostic). Don't try to fix it manually first; the launcher knows what it set up.
+If something looks broken (hooks not firing, MCPs unreachable, secrets missing), open the VCT Launcher, navigate to this project, and run **Doctor** or the equivalent diagnostic. Don't try to fix it manually first; the launcher knows what it set up.
 
 ---
 
 ## Path B: You cloned this from GitHub directly (no launcher)
 
-You can absolutely run the orchestrator without the launcher — but you'll miss some integrations and have to set things up by hand. Trade-offs first, then steps.
+You can run the orchestrator without the launcher; you just miss some integrations and have to set a few things up by hand. Trade-offs first, then steps.
 
 ### What you lose without the launcher
 
@@ -47,10 +47,10 @@ You can absolutely run the orchestrator without the launcher — but you'll miss
 | **MCP discovery** | New MCP servers appear in Claude Code automatically | You edit `~/.claude.json` by hand |
 
 What you keep without the launcher:
-- The orchestrator's **core value** (KG, code graph, hooks, MCPs, agents, skills)
+- The whole orchestrator core: KG, code graph, hooks, MCPs, agents, skills
 - All four free-tier embedding modes (GPU / CPU / OpenAI / low-resource)
 - Cross-platform support (Linux / macOS / Windows + WSL)
-- The right to install paid modules later by just installing the launcher then
+- The option to install the launcher later when you want paid modules
 
 ### Standalone install steps
 
@@ -104,11 +104,11 @@ echo "ghp_yourtokenhere" | ~/.vct-secrets/vct set --project SHARED --key github_
 .claude/scripts/kg-sync --all            # syncs the bundled knowledge/ to Weaviate
 ```
 
-Open the project folder in any Claude Code surface — **VS Code extension**, the **Claude Code CLI** (`cd <project> && claude`), or the **Claude Desktop app**. Start a Claude Code session. The hooks fire automatically. Try editing a file and watch the post-edit hook auto-sync to the code graph.
+Open the project folder in any Claude Code surface: **VS Code extension**, the **Claude Code CLI** (`cd <project> && claude`), or the **Claude Desktop app**. Start a session. Hooks fire on their own. Edit a file and watch the post-edit hook sync the change into the code graph.
 
 ### Shared services across multiple installs
 
-The orchestrator uses three local services — **Weaviate**, **Ollama**, and an optional **code_embed** — that are **shared across every orchestrator install on this machine**. Per-project isolation is by collection namespacing inside the shared Weaviate (each project gets its own `KG_COLLECTION` and `DEVELOPMENT_COLLECTION`), not by separate containers.
+The orchestrator uses three local services — **Weaviate**, **Ollama**, and an optional **code_embed** — and they're shared across every orchestrator install on the machine. Isolation between projects happens at the collection level inside the shared Weaviate (each project gets its own `KG_COLLECTION` and `DEVELOPMENT_COLLECTION`), not at the container level.
 
 - **First install**: services start automatically via `podman-compose up -d` (or the docker equivalent).
 - **Subsequent installs**: `install.py` probes ports 8081 / 11435 / 11440 first; if the services are already up, it reuses them and bootstraps only the Weaviate collections this project needs.
@@ -119,7 +119,7 @@ podman ps   # or `docker ps`
 # Should show one weaviate, one ollama, optionally one vct_code_embed.
 ```
 
-**Advanced**: set `VCT_FORCE_SEPARATE_CONTAINERS=1` and override `WEAVIATE_PORT` / `OLLAMA_PORT` / `CODE_EMBED_PORT` to give an install its own containers — useful for hard isolation between, e.g., work and personal setups, but costs extra disk and RAM per install.
+**Advanced**: set `VCT_FORCE_SEPARATE_CONTAINERS=1` and override `WEAVIATE_PORT` / `OLLAMA_PORT` / `CODE_EMBED_PORT` to give an install its own containers. Useful for hard isolation between (e.g.) work and personal setups, but it costs extra disk and RAM per install.
 
 ### Container volumes location (Bug 31)
 
@@ -145,20 +145,20 @@ The three orchestrator volumes — `weaviate_data`, `ollama_data`, `code_embed_c
 
 ### When you decide you want the launcher
 
-Install [VCT Launcher](https://github.com/pb992/VCT-Launcher), point it at this folder, and run "Adopt project". The launcher imports the existing setup (KG bindings, hooks, secret references) into its DB without disrupting anything. From that point on, the launcher manages this project the way Path A describes.
+Install [VCT Launcher](https://github.com/pb992/VCT-Launcher), point it at this folder, and run "Adopt project". The launcher imports the existing setup — KG bindings, hooks, secret references — into its DB without disturbing anything. After that, the launcher manages this project the way Path A describes.
 
 ---
 
 ## What every assistant reading this should know
 
-Beyond paths A/B, the operating manual is in [`CLAUDE.md`](CLAUDE.md). It covers:
-- KG-first search policy (use `hybrid_search` before grep for conceptual queries)
+Beyond paths A/B, the operating manual is [`CLAUDE.md`](CLAUDE.md). It covers:
+- KG-first search policy (`hybrid_search` before grep for conceptual queries)
 - The two-layer memory pattern (`MEMORY.md` for stable facts, `.claude/CONTEXT_STATE.md` for current task)
-- Hook events + when each one fires
-- Agents/skills + when to spawn them (Opus / Sonnet / Haiku decision tree)
-- Communication style: direct, no fluff, no superlatives, no premature validation
+- Hook events and when each fires
+- Agents and skills, with an Opus / Sonnet / Haiku decision tree for when to spawn them
+- House communication style: direct, no fluff, no superlatives, no premature validation
 
-If you're an AI assistant and the user dropped you in here without context, your **first action** should be:
+If you're an AI assistant and the user dropped you in here without context, your first three actions are:
 1. Read `CLAUDE.md` (operating manual)
 2. Read `.claude/CONTEXT_STATE.md` if it exists (current work state)
 3. Run `hybrid_search("what is this project")` to surface relevant KG nodes

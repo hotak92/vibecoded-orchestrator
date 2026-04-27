@@ -4,7 +4,7 @@ Common issues during install and first-run. If none of these help, open an issue
 
 ## Bypass permissions mode
 
-By default, Claude Code asks for approval on every tool call. With 30+ approvals per setup session, this gets painful. The orchestrator ships with `"defaultMode": "bypassPermissions"` in `.claude/settings.json`. How you opt in depends on which surface you use:
+By default, Claude Code prompts for approval on every tool call. With 30+ approvals per setup session, this gets painful fast. The orchestrator ships with `"defaultMode": "bypassPermissions"` in `.claude/settings.json`. How you opt in depends on which surface you use:
 
 **Claude Code CLI** (or Claude Desktop app): pass the flag directly, no extra config:
 
@@ -55,7 +55,7 @@ open -a Docker                           # macOS (Docker Desktop)
 # Start Docker Desktop from the Start menu
 ```
 
-**Insufficient memory**: Weaviate needs ~512 MB RAM minimum, 1-2 GB comfortable. On Docker Desktop, raise the memory limit under Settings → Resources.
+**Insufficient memory**: Weaviate needs ~512 MB RAM minimum, 1-2 GB to run comfortably. On Docker Desktop, raise the memory limit under Settings → Resources.
 
 ## Ollama container won't start
 
@@ -114,7 +114,7 @@ chmod +x .claude/scripts/*
 
 ## Post-install, Claude doesn't read the knowledge graph
 
-Most common cause: the editor was opened in a different directory than the orchestrator's project root. `KG_BASE_DIR` resolves relative to the working directory of the Claude Code session, so make sure your VS Code workspace root, your CLI's `cwd`, or the folder Claude Desktop has open matches the orchestrator's install dir (or the project dir you configured with the orchestrator).
+The most common cause: the editor was opened in a different directory than the orchestrator's project root. `KG_BASE_DIR` resolves relative to the working directory of the Claude Code session, so the VS Code workspace root, the CLI's `cwd`, or the folder Claude Desktop has open must match the orchestrator install dir (or the project dir you configured with the orchestrator).
 
 Verify what Claude sees:
 
