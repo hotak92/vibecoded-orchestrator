@@ -40,6 +40,12 @@ pub fn load_service_registry() -> HashMap<String, ServiceEntry> {
 }
 
 /// Serialize current ServiceEntry map to ~/.vct/services.json.
+///
+/// Currently unused: the only caller was the archived app-process Tauri
+/// command suite (launch_app/kill_app/etc.). Kept available for if/when
+/// those commands are restored from the orchestrator's private
+/// launch-assets/launcher-archived-rust/lifecycle_app_process.rs.
+#[allow(dead_code)]
 pub async fn persist_service_registry(state: &AppManager) -> Result<(), String> {
     let entries: HashMap<String, ServiceEntry> = {
         let guard = state.0.lock().unwrap();
