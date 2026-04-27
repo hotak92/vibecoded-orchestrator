@@ -28,13 +28,6 @@
 
 set -euo pipefail
 
-# Insulate the install from user-defined shell rc files that wrap tools
-# (lean-ctx, asdf, nvm, conda, etc.) with shell functions. Those
-# wrappers can mask "tool not actually installed" as "tool present"
-# when their `command -v <tool>` succeeds but the wrapped binary is
-# missing. See post-install-launcher.sh for the bug history.
-unset BASH_ENV
-
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
