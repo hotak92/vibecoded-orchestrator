@@ -1648,11 +1648,32 @@ def _pull_ollama_models(models: list[str]) -> None:
 # v4 client `client.collections.get(name)` which doesn't require a strict
 # property list to insert; richer schemas can be added later without
 # re-creating the class.
+def _named_vector_config() -> dict:
+    """Three named-vector slots: qwen3_embed (active default, 1024-dim),
+    ollama_embed (legacy snowflake-arctic-embed2, 1024-dim, kept for back-
+    compat), and openai_embed (1536-dim, for users who set OPENAI_API_KEY).
+
+    Each slot has `vectorizer: none` so we feed pre-computed embeddings
+    from the MCP server. Index type stays HNSW (Weaviate default for ANN).
+
+    The MCP server's `sync_knowledge_graph.py` writes objects with at
+    least one named vector populated; the others are filled lazily as the
+    user pulls more embedding backends. Without this multi-vector config
+    seeding fails with HTTP 422 ("collection configured without multiple
+    named vectors, but received named vectors").
+    """
+    return {
+        "qwen3_embed":  {"vectorizer": {"none": {}}, "vectorIndexType": "hnsw"},
+        "ollama_embed": {"vectorizer": {"none": {}}, "vectorIndexType": "hnsw"},
+        "openai_embed": {"vectorizer": {"none": {}}, "vectorIndexType": "hnsw"},
+    }
+
+
 def _kg_class_definition(name: str) -> dict:
     return {
         "class": name,
         "description": "VibeCoded Tools knowledge graph collection",
-        "vectorizer": "none",
+        "vectorConfig": _named_vector_config(),
         "properties": [
             {"name": "title", "dataType": ["text"]},
             {"name": "content", "dataType": ["text"]},
@@ -1660,7 +1681,16 @@ def _kg_class_definition(name: str) -> dict:
             {"name": "node_type", "dataType": ["text"]},
             {"name": "tags", "dataType": ["text[]"]},
             {"name": "links", "dataType": ["text[]"]},
-            {"name": "typed_links", "dataType": ["text[]"]},
+            # WikiLink edges as nested objects: [[relationType::Target]]
+            # → {relation_type: "uses", target_title: "Target"}.
+            {
+                "name": "typed_links",
+                "dataType": ["object[]"],
+                "nestedProperties": [
+                    {"name": "relation_type", "dataType": ["text"]},
+                    {"name": "target_title", "dataType": ["text"]},
+                ],
+            },
             {"name": "status", "dataType": ["text"]},
         ],
     }
@@ -1670,7 +1700,7 @@ def _development_class_definition(name: str) -> dict:
     return {
         "class": name,
         "description": "VibeCoded Tools project documentation collection",
-        "vectorizer": "none",
+        "vectorConfig": _named_vector_config(),
         "properties": [
             {"name": "title", "dataType": ["text"]},
             {"name": "content", "dataType": ["text"]},
@@ -1947,14 +1977,22 @@ def _seed_weaviate(args: argparse.Namespace) -> None:
         return
 
     # We must use the venv's Python so weaviate-client + weaviate_mcp.chunking
-    # import correctly. The venv was created in Step 4.
-    venv_py = PROJECT_ROOT / "claude_mcp_servers" / ".venv" / "bin" / "python"
+    # import correctly. Step 4 creates the venv at PROJECT_ROOT/.venv (NOT
+    # at claude_mcp_servers/.venv — that's a stale legacy path).
     if os.name == "nt":
-        # Windows: scripts/ instead of bin/, .exe suffix
-        venv_py = PROJECT_ROOT / "claude_mcp_servers" / ".venv" / "Scripts" / "python.exe"
+        venv_py = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
+    else:
+        venv_py = PROJECT_ROOT / ".venv" / "bin" / "python"
     if not venv_py.exists():
-        print(f"  ! venv python not found at {venv_py} — skipping seed (run Step 4 first)")
-        return
+        # Legacy fallback: some older installs put the venv inside claude_mcp_servers/
+        legacy = PROJECT_ROOT / "claude_mcp_servers" / ".venv" / (
+            "Scripts/python.exe" if os.name == "nt" else "bin/python"
+        )
+        if legacy.exists():
+            venv_py = legacy
+        else:
+            print(f"  ! venv python not found at {venv_py} — skipping seed (run Step 4 first)")
+            return
 
     scripts_dir = PROJECT_ROOT / ".claude" / "scripts"
     sync_kg = scripts_dir / "sync_knowledge_graph.py"
