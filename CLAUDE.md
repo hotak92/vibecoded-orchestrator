@@ -110,11 +110,13 @@ This repo is licensed **AGPL-3.0**. Any source file you create or modify under `
 - CLI: `.claude/scripts/code-graph-query search "auth middleware"`.
 - Use when: finding code entities, understanding architecture, cross-service call mapping.
 
-**4. Ollama MCP (Local LLM)** — FREE:
+**4. Ollama MCP (Local LLM + Vision)** — FREE:
 - `chat(prompt, model, system_prompt, temperature, max_tokens)` — Local inference (~1–3 s).
 - `read_document(file_path, model, task, context_lines)` — Summarize or extract info from files; auto-switches to chunked scan for large files.
-- Models: `qwen3:0.6b` (fast inference), `qwen3:latest` (8B), `qwen3-embedding:0.6b` (text embeddings).
-- Use when: simple analysis, rewrites, summarizing files (all FREE).
+- `read_image(file_path, max_total_pixels, describe, vision_model, description_prompt)` — Read an image as a base64 data URL Claude can see directly. Optionally get a local text description from a vision model (default `qwen3.5:9b`, unified text+vision; no separate `-vl` tag needed). Auto-resizes images to fit within `max_total_pixels` (default 1,048,576 ≈ 1024×1024) to bound VRAM during local inference. Supports PNG, JPEG, GIF, WebP, BMP, TIFF, SVG.
+- Models: `qwen3:0.6b` (fast inference), `qwen3:latest` (8B), `qwen3-embedding:0.6b` (text embeddings), `qwen3.5:9b` (text + vision).
+- Use when: simple analysis, rewrites, summarizing files, reading images (all FREE).
+- Roadmap: a heavier `image_interpretation_mcp` (object detection, OCR, table extraction via YOLO / Donut / GOT-OCR2) is in design; ships post-1.0 if user demand materializes. Today's `read_image` covers the common case.
 
 **Decision Tree**:
 - Known exact terms → `kg-search`
@@ -124,6 +126,7 @@ This repo is licensed **AGPL-3.0**. Any source file you create or modify under `
 - Architecture queries → `query_code_structure`
 - Quick analysis → `chat` (Ollama, FREE)
 - Summarize/extract from file → `read_document` (Ollama, FREE)
+- Read an image / vision task → `read_image` (Ollama, FREE)
 - Literal strings → Grep
 - File content → Read
 
