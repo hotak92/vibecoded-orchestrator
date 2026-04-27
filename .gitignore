@@ -35,6 +35,14 @@ build/
 !launcher/dist/
 !launcher/dist/**
 
+# Diagnostic launcher builds (devtools-enabled, debug profile, etc.) —
+# these are NOT shippable artifacts. Keep them out of the repo no matter
+# where they land. The release binary lives ONLY at
+# launcher/dist/<arch>/vct-launcher (un-ignored above).
+launcher/dist/**/*-debug
+launcher/dist/**/*-with-devtools
+launcher/src-tauri/target/
+
 # Virtual environments
 .venv/
 venv/
