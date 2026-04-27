@@ -124,6 +124,29 @@ In Claude Code: run the skill /context
 
 It prints the active workspace path, KG collection name, and recent state.
 
+## A hook isn't firing or is misbehaving
+
+`.claude/hooks/*.sh` shell hooks fire on Claude Code lifecycle events (file edits, session start, prompt submit, etc.). If one is hanging, eating tokens, or silently failing:
+
+**Quickest diagnosis — disable everything**:
+
+```bash
+VCT_DISABLE_HOOKS=1 claude
+```
+
+Every hook respects this and exits 0 cleanly. If the issue goes away, you've narrowed it to a hook. If the issue persists, look elsewhere.
+
+**Per-hook debugging**: the hooks are plain Bash. Run one directly with `bash -x .claude/hooks/<name>.sh` to see line-by-line execution.
+
+**TMPDIR / scratch space failures** (sometimes seen on macOS sandboxed apps): hooks use `${TMPDIR:-${XDG_RUNTIME_DIR:-/tmp}}` for scratch dirs. If your shell or app has a non-writable `TMPDIR`, hooks may fail to write state. Verify with:
+
+```bash
+echo "$TMPDIR"
+test -w "${TMPDIR:-/tmp}" && echo "writable" || echo "NOT writable"
+```
+
+**syntax-check on edit**: if you've edited a hook locally, run `bash -n .claude/hooks/<name>.sh` to syntax-check before saving. CI does this on every PR.
+
 ## Getting more help
 
 - GitHub Issues: <https://github.com/hotak92/vibecoded-orchestrator/issues>

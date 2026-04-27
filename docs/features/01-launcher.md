@@ -261,6 +261,15 @@ Migration emits phase-level `volumes://migrate-progress` Tauri events so the UI 
 ### Zero-Destruction Install Guard
 `installer.rs` includes an audit test (`test_no_destructive_subprocess_calls_in_install_path`) that greps install-path files for banned commands (`rm -rf`, `docker volume rm`, `podman volume rm`). Prevents accidental destructive commands from slipping into the install path.
 
+### Service Lifecycle on Launcher Start/Stop
+`commands/lifecycle.rs` ties the backing services (Weaviate, Ollama, code-embed) to the launcher's own lifecycle:
+
+- **Auto-start on boot**: `services_start_all()` runs `podman compose up -d` (or docker if no podman) at launcher startup. Failure does not block the launcher window — the Services route surfaces the error.
+- **Per-service controls**: `services_start`, `services_stop`, `services_restart` Tauri commands surface to a Services route + tray submenu. Service names are validated against a hardcoded allowlist (`weaviate`, `ollama`, `code_embed`); arbitrary names refuse.
+- **Runtime detection** (`services/runtime.rs`): podman-first universal preference, with macOS Podman Machine handling (`podman machine list` to detect a started VM and fall through to Docker if not).
+- **Adoption modes** (`services/adoption.rs`): when a foreign service is detected on a default port, `ExternalServicesDialog.svelte` prompts the user with `unresolved | adopt | parallel | refuse` modes. The chosen mode is written to `~/.vct/services.toml` — the same lock file install.py uses, so the launcher and installer never disagree.
+- **Frontend events**: `vct-services-lifecycle` (start/stop/restart progress) and `vct-external-services-detected` (adoption prompt trigger). Lets the UI render real-time state without polling.
+
 ---
 
 ## Hub API
@@ -581,6 +590,19 @@ Hub `cli_api.rs` mirrors audit operations with `via: "cli"` tagged in detail JSO
 ### Updater Store
 `stores/updater.ts` manages update state (available version, download progress, install). Backed by Tauri's built-in updater plugin.
 
+### Self-Update via Git Pull
+`commands/self_update.rs` provides an in-app self-update path independent of the Tauri updater plugin. Tray surfaces an "Update available" state when remote `HEAD` has new commits. Manual "Update now" runs `git pull --ff-only` (conflict-aware), rebuilds (Cargo OR npm based on which directories changed), and restarts the launcher.
+
+- **Daily check cadence**: 24-hour timer with state persisted in `~/.vct/launcher-update-state.json` (last_check, last_remote_sha).
+- **User-owned-paths protection**: a hard-coded never-overwrite manifest covers `.claude/CONTEXT_STATE.md`, `.claude/context/**`, `state/**`, etc. The pull validates these paths are untouched in the incoming commit; if they would change, the update fails closed with a clear message.
+- **Rebuild gating**: diff between current and target SHA is inspected. If only `launcher/src-tauri/**` changed → cargo build. If only `launcher/src/**` changed → npm build. Both → both. Saves 2-5 minutes when the change is frontend-only.
+- **Restart sequence**: writes `force_quit=true` to a transient state file, exec's the new binary, parent exits. The Quit confirmation dialog reads `force_quit` and skips the prompt.
+
+UI surface: `/preferences/updates` route with a manual check button + last-check timestamp + pending-pull preview.
+
+### Re-Run Onboarding from Preferences
+`/preferences` includes a "Re-run onboarding" button that clears the `vct.onboarding_complete` localStorage flag and reloads. The 4-step wizard fires again; existing projects, settings, and secrets are unaffected. Useful after a hardware change (GPU added, RAM upgraded) when the user wants to re-run the infrastructure-detection step.
+
 ---
 
 ## URL Routing
@@ -665,6 +687,18 @@ Twenty-one Tauri commands mutate or read the per-project Claude Code registry. E
 
 ### Tray Click to Focus
 Left-clicking the tray icon shows and focuses the main window (`w.show()` + `w.set_focus()`).
+
+### Live Service Status Pill
+The "Running services" line is polled every 5s and updated in-place (`MenuItem::set_text` rather than full menu rebuild — avoids flicker and OS-level menu re-grab). States: `Services: N/M running`, `No services running`, `managed externally`. The probe reads the same port set as install.py (8081 / 11435 / 11440); foreign services on the same ports are counted as "running" for the headline count, with the externally-managed case surfaced when a foreign service is detected with no `~/.vct/services.toml` lock entry.
+
+### 3-Button Quit Confirmation
+Both tray Quit and window-close (`WindowEvent::CloseRequested`) prompt with three options:
+
+- **Quit and stop services** — full shutdown cascade
+- **Reduce to tray** — minimize-to-background convenience (services keep running)
+- **Cancel** — keep window open
+
+Backed by `quit_dialog.rs` and `tauri-plugin-dialog` (native dialog on each OS). The self-update path bypasses the prompt via a `force_quit` flag set before the relaunch sequence — prevents double-prompting during update apply.
 
 ### Bundled Tauri Plugins
 `tauri_plugin_opener` (open URLs and file paths in the OS default app) and `tauri_plugin_dialog` (native open/save dialogs) are bundled. Registered in `lib.rs` `Builder::default().plugin(...)`.
