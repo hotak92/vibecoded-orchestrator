@@ -673,9 +673,14 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
         content = _update_frontmatter_timestamp(file_path, content)
         node_data = parse_markdown_node(content, file_path)
 
-        # Validate against vocabulary (report warnings, don't block sync)
+        # Validate against vocabulary (report warnings, don't block sync).
+        # Silenced by default during install (VCT_VERBOSE_VOCAB_WARNINGS=0
+        # implicit) — these are contributor-facing lint about KG node tag
+        # hygiene, not actionable for end users running first-install.sh.
+        # Set VCT_VERBOSE_VOCAB_WARNINGS=1 (or run sync_knowledge_graph.py
+        # directly with that env var) to see them when curating the KG.
         validation_warnings = validate_node_against_vocabulary(node_data, file_path)
-        if validation_warnings:
+        if validation_warnings and os.environ.get("VCT_VERBOSE_VOCAB_WARNINGS", "0") == "1":
             print(f"⚠️  Vocabulary validation warnings ({len(validation_warnings)}):")
             for warning in validation_warnings[:3]:  # Show first 3
                 print(f"   - {warning}")
