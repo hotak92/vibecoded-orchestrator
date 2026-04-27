@@ -274,7 +274,7 @@ Migration emits phase-level `volumes://migrate-progress` Tauri events so the UI 
 
 ## Hub API
 
-The Hub is the launcher's local HTTP face — used by the headless `vct` CLI, by ecosystem apps (Transcrypt, Arzillibus), and by other VCT processes that need to talk to the launcher without going through Tauri IPC. It runs on `127.0.0.1` only and writes its bound port to `~/.vct/hub.port` so consumers don't have to guess.
+The Hub is the launcher's local HTTP face — used by the headless `vco` CLI, by ecosystem apps (Transcrypt, Arzillibus), and by other VCT processes that need to talk to the launcher without going through Tauri IPC. It runs on `127.0.0.1` only and writes its bound port to `~/.vct/hub.port` so consumers don't have to guess.
 
 ### Local HTTP Server (port 7700)
 `hub/server.rs` starts an Axum HTTP server on `127.0.0.1:7700` (or `VCT_HUB_PORT`) as a background tokio task at launcher startup. Uses WAL mode for the SQLite connection so it coexists with the Tauri-side DB handle.
@@ -290,7 +290,7 @@ Four sub-routers nested under `/api/v1`, each in its own file under `launcher/sr
 - `api.rs` — core operations: health, app catalog (register/deregister/heartbeat), cross-app messaging (send/poll/ack), data catalog (register/query). 10 routes.
 - `modules_api.rs` — module catalog + installed list + install + project list + project env. 8 routes.
 - `project_state_api.rs` — full per-project agent/skill/hook/permission/secret-ref/KG-binding/codegraph-binding registry. ~16 method+path combos.
-- `cli_api.rs` — mirror of Tauri commands for headless `vct` CLI access (project CRUD, audit list, license, hooks toggle, telemetry consent). 10 routes.
+- `cli_api.rs` — mirror of Tauri commands for headless `vco` CLI access (project CRUD, audit list, license, hooks toggle, telemetry consent). 10 routes.
 
 For the full route enumeration → see [Hub HTTP API — Routes](#hub-http-api--routes) below.
 
@@ -534,7 +534,7 @@ The hub HTTP server (`hub/server.rs`, port 7700) nests four sub-routers under `/
 - `POST /api/v1/projects/{project_id}/codegraph-binding` — set the code graph binding.
 
 ### CLI-facing endpoints (`hub/cli_api.rs`)
-Mirror of Tauri commands so the headless `vct` CLI can drive the launcher without IPC into the Tauri app. All actions audit with `via: "cli"` tagged in the detail JSON.
+Mirror of Tauri commands so the headless `vco` CLI can drive the launcher without IPC into the Tauri app. All actions audit with `via: "cli"` tagged in the detail JSON.
 - `POST /api/v1/cli/projects` — create a project.
 - `PATCH, DELETE /api/v1/cli/projects/{id_or_slug}` — rename / delete.
 - `GET /api/v1/cli/audit` — read audit log (mirrors `list_audit_events`).
@@ -705,7 +705,7 @@ Backed by `quit_dialog.rs` and `tauri-plugin-dialog` (native dialog on each OS).
 
 ---
 
-## Headless CLI (`vct`)
+## Headless CLI (`vco`)
 
 ### Build & Install
 `tools/vct-cli/install.sh` runs `cargo build --release` and copies the binary to `~/.local/bin/vct`. Built independently from the Tauri app.
@@ -714,7 +714,7 @@ Backed by `quit_dialog.rs` and `tauri-plugin-dialog` (native dialog on each OS).
 CLI resolves the hub port: `--port <N>` flag → `VCT_HUB_PORT` env → `~/.vct/hub.port` file → 7700 default.
 
 ### JSON Output
-Every `vct` command outputs JSON for machine consumption. Pipe through `jq` for human-readable formatting.
+Every `vco` command outputs JSON for machine consumption. Pipe through `jq` for human-readable formatting.
 
 ### `vct project` Commands
 `list`, `show <id_or_slug>`, `create --name <name> --path <dir> [--host base|mao]`, `rename <id_or_slug> <new_name>`, `delete <id_or_slug>`.

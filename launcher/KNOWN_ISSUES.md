@@ -52,12 +52,6 @@ subprocesses that are tied to the Tauri app handle (event emission,
 progress streaming). Use the launcher GUI for installs; the CLI can
 list the catalog and the installed modules.
 
-### P6 — KG/codegraph search not in CLI
-
-`vct kg search` / `vct codegraph search` were on the v1 wishlist but are
-not implemented yet. They require Weaviate connectivity that the hub
-does not currently proxy. Tracked for a follow-up.
-
 ### P5 — Slug regenerated on rename
 
 Renaming a project regenerates its slug from the new name. Existing

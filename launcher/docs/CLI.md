@@ -1,4 +1,4 @@
-# vct CLI
+# vco CLI
 
 Command-line interface for the VCT Launcher. Mirrors most GUI capabilities
 so power users can script project lifecycle, audit pulls, and license
@@ -9,25 +9,25 @@ operations from a terminal or CI job.
 ```bash
 cd launcher/tools/vct-cli
 ./install.sh
-# → copies ~/.local/bin/vct
+# → copies ~/.local/bin/vco
 ```
 
 `install.sh` runs `cargo build --release` and copies the binary to
 `~/.local/bin/`. Make sure `~/.local/bin` is on your `PATH`. Build
-target output (uninstalled) is at `target/release/vct`.
+target output (uninstalled) is at `target/release/vco`.
 
 ## How it works
 
-`vct` is a small Rust binary that talks to the launcher's local hub
+`vco` is a small Rust binary that talks to the launcher's local hub
 server (default `http://127.0.0.1:7700`). The hub exposes a parallel
 REST surface for every Tauri command the GUI uses; the CLI just calls
 those routes.
 
-The launcher GUI MUST be running for `vct` to work. If it is not, the
+The launcher GUI MUST be running for `vco` to work. If it is not, the
 CLI prints:
 
 ```
-vct: Cannot reach launcher hub: ... Is the launcher running?
+vco: Cannot reach launcher hub: ... Is the launcher running?
 ```
 
 ## Hub port discovery
@@ -38,31 +38,37 @@ In order: `--port <N>` (CLI flag) > `VCT_HUB_PORT` env > `~/.vct/hub.port`
 ## Commands
 
 ```text
-vct project list
-vct project show <id_or_slug>
-vct project create --name <name> --path <dir> [--host base|mao]
-vct project rename <id_or_slug> <new_name>
-vct project delete <id_or_slug>
+vco project list
+vco project show <id_or_slug>
+vco project create --name <name> --path <dir> [--host base|mao]
+vco project rename <id_or_slug> <new_name>
+vco project delete <id_or_slug>
 
-vct module list
-vct module installed <project_id_or_slug>
+vco module list
+vco module installed <project_id_or_slug>
 
-vct audit list [--project <id|slug>] [--since <epoch_ms>] [--limit <N>]
+vco audit list [--project <id|slug>] [--since <epoch_ms>] [--limit <N>]
 
-vct license status
-vct license activate <key>
-vct license deactivate
+vco license status
+vco license activate <key>
+vco license deactivate
 
-vct hooks list <project_id_or_slug>
-vct hooks enable <hook_id> [--project <id|slug>]
-vct hooks disable <hook_id> [--project <id|slug>]
+vco hooks list <project_id_or_slug>
+vco hooks enable <hook_id> [--project <id|slug>]
+vco hooks disable <hook_id> [--project <id|slug>]
 
-vct telemetry status
-vct telemetry on
-vct telemetry off
+vco telemetry status
+vco telemetry on
+vco telemetry off
 
-vct hub health
-vct hub url
+vco hub health
+vco hub url
+
+vco kg collections
+vco kg search <query> --project <id|slug> [--collections <c1,c2>] [--limit <N>]
+
+vco codegraph collections
+vco codegraph search <query> --project <id|slug> [--collections <c1,c2>] [--scope all|code|interaction] [--limit <N>]
 ```
 
 Every command outputs JSON for machine consumption. Pipe through `jq`
@@ -72,19 +78,31 @@ for human-readable formatting.
 
 ```bash
 # Quick health check
-vct hub health
+vco hub health
 
 # List all projects (slug + module count visible)
-vct project list | jq '.projects[] | {name, slug, module_count}'
+vco project list | jq '.projects[] | {name, slug, module_count}'
 
 # Create a project + see its slug
-vct project create --name "Acme Corp" --path ~/code/acme | jq '.slug'
+vco project create --name "Acme Corp" --path ~/code/acme | jq '.slug'
 
 # Pull audit log for a tenant in a CI job
-vct audit list --project acme-corp --limit 500 > acme-audit.json
+vco audit list --project acme-corp --limit 500 > acme-audit.json
 
 # Toggle telemetry for headless CI runs
-vct telemetry off
+vco telemetry off
+
+# Discover orchestrator-shaped KG collections on the local Weaviate
+vco kg collections | jq '.collections[] | {name, node_count}'
+
+# Search the KG with auto-detected collection list
+vco kg search "rerank pipeline" --project acme-corp --limit 10
+
+# Search the code graph (only functions/classes/modules)
+vco codegraph search "auth middleware" --project acme-corp --scope code
+
+# Search interaction-only (APIs + cross-service calls)
+vco codegraph search "/users" --project acme-corp --scope interaction
 ```
 
 ## Limitations
@@ -96,12 +114,18 @@ vct telemetry off
 - Module install/uninstall is GUI-only for now (the install path
   spawns subprocesses tied to Tauri's app handle). Use the launcher
   GUI for installs; the CLI can list catalog and installed modules.
-- KG / codegraph search are not yet exposed via the CLI — both
-  require Weaviate connectivity that the hub does not currently
-  proxy. Tracked for a follow-up.
+- KG search enforces per-collection ACLs from the launcher DB
+  (`kg_collection_access`). If the project doesn't have a `read` or
+  `write` grant on a collection, the hub returns 403. Configure grants
+  via the launcher GUI's KG dashboard or set them programmatically
+  with `Db::kg_set_access`.
+- Auto-detection is strict: a Weaviate class only counts as an
+  "orchestrator KG collection" if its schema has all four markers
+  (`title` text, `node_type` text, `tags` text[], `typed_links`
+  object[]). Use `--collections c1,c2,...` to override.
 
 ## Subcommand reference
 
-Run `vct <subcommand> --help` (or `vct help`) for full flag-level help
+Run `vco <subcommand> --help` (or `vco help`) for full flag-level help
 generated by clap. The on-disk help is the source of truth — the list
 above may lag minor additions.

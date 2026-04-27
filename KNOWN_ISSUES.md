@@ -85,7 +85,10 @@ flagging for early adopters and the next iteration.
   P5 (migration 003 + slug resolution).
 
 - **CLI escape hatch** shipped in P6 as `launcher/tools/vct-cli/` plus
-  the hub `/cli/*` HTTP API.
+  the hub `/cli/*` HTTP API. KG and code-graph search are now wired
+  through the hub (`/cli/kg/{collections,search}`,
+  `/cli/codegraph/{collections,search}`) with strict auto-detection of
+  orchestrator-shaped Weaviate collections.
 
 - **Concurrency invalidation for multi-tab use** shipped in P7 via the
   `change_log` table + `poll_changes` Tauri command (5s polling).
