@@ -18,6 +18,7 @@
   import McpDashboard from '$lib/components/McpDashboard.svelte';
   import OnboardingWizard from '$lib/components/OnboardingWizard.svelte';
   import ChangelogModal from '$lib/components/ChangelogModal.svelte';
+  import ExternalServicesDialog from '$lib/components/ExternalServicesDialog.svelte';
   import Toast from '$lib/components/Toast.svelte';
   import { selectedProject, projects } from '$lib/stores/projects';
   import { startChangePoller, onChange } from '$lib/stores/changes';
@@ -170,6 +171,7 @@
 
   <OnboardingWizard bind:open={showOnboarding} />
   <ChangelogModal bind:open={showChangelog} />
+  <ExternalServicesDialog />
   <Toast />
   <AdminBadge />
 {/if}

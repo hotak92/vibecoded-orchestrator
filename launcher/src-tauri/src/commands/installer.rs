@@ -213,9 +213,9 @@ pub async fn detect_system() -> Result<SystemDetection, String> {
 /// Default ports for the shared services. Match install.py constants —
 /// changing them here without changing install.py would mean the wizard
 /// reports "no services running" while install.py happily reuses them.
-const DEFAULT_WEAVIATE_PORT: u16 = 8081;
-const DEFAULT_OLLAMA_PORT: u16 = 11435;
-const DEFAULT_CODE_EMBED_PORT: u16 = 11440;
+pub(crate) const DEFAULT_WEAVIATE_PORT: u16 = 8081;
+pub(crate) const DEFAULT_OLLAMA_PORT: u16 = 11435;
+pub(crate) const DEFAULT_CODE_EMBED_PORT: u16 = 11440;
 
 /// HTTP probe with short timeout. Returns the URL on 2xx/3xx, None otherwise.
 /// Takes an owned String so callers can compose URLs via format! without

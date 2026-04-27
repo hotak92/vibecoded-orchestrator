@@ -7,6 +7,7 @@ mod mcp_registration;
 mod quit_dialog;
 mod registry;
 mod secrets;
+mod services;
 mod state;
 mod tray;
 mod types;
@@ -53,6 +54,23 @@ pub fn run() {
             if let Err(e) = tray::setup(&app.handle()) {
                 eprintln!("[vct] tray setup failed: {}", e);
             }
+            // Daily launcher self-update check. Honors `auto_check_enabled`
+            // toggle in ~/.vct/launcher-update-state.json (default ON).
+            // Emits `vct-launcher-update-available` event when remote HEAD
+            // has new commits — never auto-applies.
+            commands::self_update::spawn_daily_check(app.handle().clone());
+            // Auto-start the shared compose stack (Weaviate / Ollama /
+            // code_embed). Runs in the background — must NOT block the
+            // tray or main window from rendering. Surfaces progress via
+            // the `vct-services-lifecycle` event; surfaces externally-
+            // managed services for the Adopt/Parallel dialog via
+            // `vct-external-services-detected`. See
+            // `commands::lifecycle::auto_start_on_boot` for the state
+            // machine.
+            let app_handle_for_services = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                commands::lifecycle::auto_start_on_boot(app_handle_for_services).await;
+            });
             Ok(())
         })
         // Intercept window-close (X / Cmd+Q) on the main window. We
@@ -77,6 +95,18 @@ pub fn run() {
             commands::lifecycle::get_all_app_statuses,
             commands::lifecycle::check_app_health,
             commands::lifecycle::check_all_health,
+            // Container-services lifecycle (Podman/Docker compose).
+            commands::lifecycle::services_status,
+            commands::lifecycle::services_start_all,
+            commands::lifecycle::services_stop_all,
+            commands::lifecycle::services_restart_all,
+            commands::lifecycle::service_start,
+            commands::lifecycle::service_stop,
+            commands::lifecycle::service_restart,
+            commands::lifecycle::services_set_adoption,
+            commands::lifecycle::services_get_adoption,
+            commands::lifecycle::services_reset_adoption,
+            commands::lifecycle::services_find_free_port,
             // Projects — legacy JSON-backed (kept for React components not yet migrated)
             commands::projects::create_project,
             commands::projects::get_projects,
@@ -214,6 +244,13 @@ pub fn run() {
             commands::dashboard::remove_mcp_server,
             // Audit log read API
             commands::audit::list_audit_events,
+            // Launcher self-update (git-pull based, daily check)
+            commands::self_update::check_for_launcher_update,
+            commands::self_update::apply_launcher_update,
+            commands::self_update::get_user_owned_paths,
+            commands::self_update::get_cached_update_status,
+            commands::self_update::set_auto_check_enabled,
+            commands::self_update::get_auto_check_enabled,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
