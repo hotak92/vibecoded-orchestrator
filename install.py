@@ -913,7 +913,9 @@ def _install_joern() -> bool:
     pinned hash for `latest`. Users who want stronger guarantees should
     install Joern themselves first (then we just detect it).
     """
-    print("            Installing Joern (this can take a few minutes)...")
+    print("            Installing Joern (this can take 5-10 minutes — downloads ~600 MB JVM-based binaries)...")
+    print("            Note: the Joern installer may open a browser tab if a JDK is missing on your system.")
+    print("            Streaming installer output below; press Ctrl+C to abort.")
 
     install_url = "https://github.com/joernio/joern/releases/latest/download/joern-install.sh"
     if not install_url.startswith("https://"):
@@ -938,16 +940,18 @@ def _install_joern() -> bool:
         Path(installer_path).write_bytes(data)
         os.chmod(installer_path, 0o755)
 
-        # Install to ~/.local (user-local, no sudo needed).
+        # Install to ~/.local (user-local, no sudo needed). Stream output to
+        # the terminal so the user sees progress (no `capture_output=True` —
+        # silent multi-minute downloads with browser-tab side effects are bad
+        # UX). Bumped timeout to 900 s for slow connections.
         install_dir = Path.home() / ".local" / "joern"
         result = subprocess.run(
             [installer_path, "--dir", str(install_dir), "--no-interactive"],
-            capture_output=True, text=True, timeout=600,
+            text=True, timeout=900,
         )
 
         if result.returncode != 0:
-            tail = (result.stderr or "").strip()[-300:]
-            print(f"            Joern install failed: {tail}")
+            print(f"            Joern install failed (exit {result.returncode}).")
             print("            You can install manually: https://docs.joern.io/installation/")
             return False
 
