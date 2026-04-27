@@ -1,0 +1,349 @@
+//! Row-level CRUD for `code_graph_builds` table.
+//!
+//! One row per project tracks the lifecycle of the initial code-graph
+//! analyzer run kicked off when the user creates a project (Gap 2 — OSS
+//! launch 2026-05-12). Higher-level orchestration (the actual subprocess
+//! spawn, event emission, log capture) lives in
+//! `crate::commands::codegraph::build`.
+
+use rusqlite::{params, OptionalExtension};
+use serde::{Deserialize, Serialize};
+
+use super::Db;
+
+/// Lifecycle states for a project's initial code-graph build.
+///
+/// `pending`  → row inserted, subprocess not yet started.
+/// `running`  → subprocess alive, files being analyzed.
+/// `success`  → subprocess exited 0, rows in Weaviate.
+/// `failed`   → subprocess exited non-zero or panicked.
+/// `skipped`  → no supported source files in the folder, nothing to do.
+pub mod status {
+    pub const PENDING: &str = "pending";
+    pub const RUNNING: &str = "running";
+    pub const SUCCESS: &str = "success";
+    pub const FAILED: &str = "failed";
+    pub const SKIPPED: &str = "skipped";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeGraphBuildRow {
+    pub project_id: String,
+    pub status: String,
+    pub started_at: Option<i64>,
+    pub finished_at: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub files_analyzed: u32,
+    /// JSON array, e.g. `["py","ts"]`. None when no build ran or no
+    /// languages were detected.
+    pub languages: Option<Vec<String>>,
+    pub joern_used: bool,
+    pub error_message: Option<String>,
+    pub log_tail: Option<String>,
+}
+
+/// Cap stored log_tail at 4 KiB. The analyzer's stdout/stderr is mostly
+/// human-readable progress lines; we keep just the tail for debugging
+/// without bloating the SQLite row. Source code is never logged by the
+/// analyzer, but if a future change ever leaks lines we still have a
+/// hard size cap.
+pub const LOG_TAIL_MAX_BYTES: usize = 4096;
+
+impl Db {
+    /// UPSERT the build row for a project. Used by every transition
+    /// (pending → running → success/failed/skipped). Caller is
+    /// responsible for picking sensible field values for each status.
+    ///
+    /// Languages are serialized to JSON in the `languages` column. None
+    /// stays SQL NULL. Same for `error_message` and `log_tail`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_code_graph_build(
+        &self,
+        project_id: &str,
+        status: &str,
+        started_at: Option<i64>,
+        finished_at: Option<i64>,
+        duration_ms: Option<i64>,
+        files_analyzed: u32,
+        languages: Option<&[String]>,
+        joern_used: bool,
+        error_message: Option<&str>,
+        log_tail: Option<&str>,
+    ) -> Result<(), String> {
+        // Validate status against the CHECK constraint up-front so we
+        // get a clear error rather than a SQLite "constraint failed".
+        if !matches!(
+            status,
+            status::PENDING
+                | status::RUNNING
+                | status::SUCCESS
+                | status::FAILED
+                | status::SKIPPED
+        ) {
+            return Err(format!("invalid code-graph build status: {}", status));
+        }
+
+        let langs_json: Option<String> = languages.map(|l| {
+            serde_json::to_string(l)
+                .unwrap_or_else(|_| "[]".to_string())
+        });
+        // Defensive: cap log_tail so we never write a huge blob, even if
+        // a buggy caller hands us megabytes.
+        let log_tail_capped: Option<String> = log_tail.map(|s| {
+            if s.len() <= LOG_TAIL_MAX_BYTES {
+                s.to_string()
+            } else {
+                let cut = floor_char_boundary(s, s.len() - LOG_TAIL_MAX_BYTES);
+                format!("…\n{}", &s[cut..])
+            }
+        });
+
+        let guard = self.lock();
+        guard
+            .execute(
+                "INSERT INTO code_graph_builds
+                    (project_id, status, started_at, finished_at, duration_ms,
+                     files_analyzed, languages, joern_used, error_message, log_tail)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(project_id) DO UPDATE SET
+                    status         = excluded.status,
+                    started_at     = excluded.started_at,
+                    finished_at    = excluded.finished_at,
+                    duration_ms    = excluded.duration_ms,
+                    files_analyzed = excluded.files_analyzed,
+                    languages      = excluded.languages,
+                    joern_used     = excluded.joern_used,
+                    error_message  = excluded.error_message,
+                    log_tail       = excluded.log_tail",
+                params![
+                    project_id,
+                    status,
+                    started_at,
+                    finished_at,
+                    duration_ms,
+                    files_analyzed,
+                    langs_json,
+                    if joern_used { 1 } else { 0 },
+                    error_message,
+                    log_tail_capped,
+                ],
+            )
+            .map_err(|e| format!("upsert code_graph_builds: {}", e))?;
+        Ok(())
+    }
+
+    pub fn get_code_graph_build(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<CodeGraphBuildRow>, String> {
+        let guard = self.lock();
+        guard
+            .query_row(
+                "SELECT project_id, status, started_at, finished_at, duration_ms,
+                        files_analyzed, languages, joern_used, error_message, log_tail
+                 FROM code_graph_builds
+                 WHERE project_id = ?1",
+                params![project_id],
+                row_to_build,
+            )
+            .optional()
+            .map_err(|e| format!("get code_graph_build: {}", e))
+    }
+
+    /// Project IDs whose most recent recorded status is 'pending'. Used
+    /// at startup to recover from a launcher crash mid-build (we requeue
+    /// the build) and by anyone wanting to know what's queued.
+    ///
+    /// Note: 'running' is intentionally NOT included here. A 'running'
+    /// row after a launcher crash is a stale ghost (the subprocess is
+    /// dead). Rebuild-on-startup logic should treat such rows as failed.
+    pub fn list_pending_code_graph_builds(&self) -> Result<Vec<String>, String> {
+        let guard = self.lock();
+        let mut stmt = guard
+            .prepare(
+                "SELECT project_id FROM code_graph_builds
+                 WHERE status = 'pending' ORDER BY started_at ASC",
+            )
+            .map_err(|e| format!("prepare list pending: {}", e))?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| format!("query list pending: {}", e))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("collect list pending: {}", e))
+    }
+}
+
+fn row_to_build(row: &rusqlite::Row<'_>) -> rusqlite::Result<CodeGraphBuildRow> {
+    let langs_json: Option<String> = row.get(6)?;
+    let languages: Option<Vec<String>> = langs_json
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok());
+    let joern_int: i64 = row.get(7)?;
+    Ok(CodeGraphBuildRow {
+        project_id: row.get(0)?,
+        status: row.get(1)?,
+        started_at: row.get(2)?,
+        finished_at: row.get(3)?,
+        duration_ms: row.get(4)?,
+        files_analyzed: row.get::<_, i64>(5)? as u32,
+        languages,
+        joern_used: joern_int != 0,
+        error_message: row.get(8)?,
+        log_tail: row.get(9)?,
+    })
+}
+
+/// std::str::floor_char_boundary is unstable; tiny local replacement.
+/// Returns the largest valid char-boundary index `<= idx`.
+fn floor_char_boundary(s: &str, idx: usize) -> usize {
+    if idx >= s.len() {
+        return s.len();
+    }
+    let mut i = idx;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::models::ProjectHost;
+
+    fn fresh_db_with_project() -> (Db, String) {
+        let db = Db::open_in_memory().expect("in-memory db");
+        let id = uuid::Uuid::new_v4().to_string();
+        let slug = db.generate_unique_slug("Test").unwrap();
+        db.insert_project(&id, "Test", "/tmp/whatever", ProjectHost::Base, &slug)
+            .unwrap();
+        (db, id)
+    }
+
+    #[test]
+    fn upsert_then_get_round_trips_all_fields() {
+        let (db, pid) = fresh_db_with_project();
+        let langs = vec!["py".to_string(), "ts".to_string()];
+        db.upsert_code_graph_build(
+            &pid,
+            status::SUCCESS,
+            Some(1000),
+            Some(2500),
+            Some(1500),
+            42,
+            Some(&langs),
+            true,
+            None,
+            Some("ok"),
+        )
+        .unwrap();
+
+        let got = db.get_code_graph_build(&pid).unwrap().expect("row exists");
+        assert_eq!(got.status, "success");
+        assert_eq!(got.started_at, Some(1000));
+        assert_eq!(got.finished_at, Some(2500));
+        assert_eq!(got.duration_ms, Some(1500));
+        assert_eq!(got.files_analyzed, 42);
+        assert_eq!(got.languages.as_deref().unwrap(), ["py", "ts"]);
+        assert!(got.joern_used);
+        assert_eq!(got.error_message, None);
+        assert_eq!(got.log_tail.as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn upsert_overwrites_on_state_transition() {
+        let (db, pid) = fresh_db_with_project();
+        db.upsert_code_graph_build(&pid, status::PENDING, Some(1), None, None, 0, None, false, None, None).unwrap();
+        db.upsert_code_graph_build(&pid, status::RUNNING, Some(1), None, None, 5, None, false, None, None).unwrap();
+        db.upsert_code_graph_build(
+            &pid,
+            status::SUCCESS,
+            Some(1),
+            Some(100),
+            Some(99),
+            10,
+            Some(&["py".to_string()]),
+            false,
+            None,
+            Some("done"),
+        )
+        .unwrap();
+
+        let got = db.get_code_graph_build(&pid).unwrap().unwrap();
+        assert_eq!(got.status, "success");
+        assert_eq!(got.files_analyzed, 10);
+    }
+
+    #[test]
+    fn invalid_status_rejected_with_clear_error() {
+        let (db, pid) = fresh_db_with_project();
+        let err = db
+            .upsert_code_graph_build(&pid, "borked", None, None, None, 0, None, false, None, None)
+            .expect_err("must reject");
+        assert!(err.contains("borked"));
+    }
+
+    #[test]
+    fn log_tail_truncated_to_4kb() {
+        let (db, pid) = fresh_db_with_project();
+        let big = "x".repeat(10_000);
+        db.upsert_code_graph_build(
+            &pid,
+            status::SUCCESS,
+            Some(1),
+            Some(1),
+            Some(0),
+            0,
+            None,
+            false,
+            None,
+            Some(&big),
+        )
+        .unwrap();
+        let got = db.get_code_graph_build(&pid).unwrap().unwrap();
+        let tail = got.log_tail.unwrap();
+        // Truncated tail should be ≤ 4KB + a couple bytes for the leading marker.
+        assert!(
+            tail.len() <= LOG_TAIL_MAX_BYTES + 8,
+            "expected truncation, got {} bytes",
+            tail.len()
+        );
+        assert!(tail.starts_with('…'), "expected leading ellipsis marker");
+    }
+
+    #[test]
+    fn list_pending_returns_only_pending_rows() {
+        let db = Db::open_in_memory().unwrap();
+        for (i, (name, st)) in [
+            ("A", status::PENDING),
+            ("B", status::RUNNING),
+            ("C", status::SUCCESS),
+            ("D", status::PENDING),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let id = uuid::Uuid::new_v4().to_string();
+            let slug = db.generate_unique_slug(name).unwrap();
+            // folder_path has a UNIQUE index in the projects schema —
+            // give each row a distinct path.
+            let folder = format!("/tmp/cgbuild-{}", i);
+            db.insert_project(&id, name, &folder, ProjectHost::Base, &slug)
+                .unwrap();
+            db.upsert_code_graph_build(&id, st, Some(0), None, None, 0, None, false, None, None)
+                .unwrap();
+        }
+        let pending = db.list_pending_code_graph_builds().unwrap();
+        assert_eq!(pending.len(), 2);
+    }
+
+    #[test]
+    fn cascade_delete_removes_build_row() {
+        let (db, pid) = fresh_db_with_project();
+        db.upsert_code_graph_build(&pid, status::PENDING, None, None, None, 0, None, false, None, None)
+            .unwrap();
+        db.delete_project(&pid).unwrap();
+        let got = db.get_code_graph_build(&pid).unwrap();
+        assert!(got.is_none(), "row should cascade-delete with project");
+    }
+}

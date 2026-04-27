@@ -110,3 +110,36 @@ export interface ModuleInstallCompleteEvent {
   success: boolean;
   error?: string;
 }
+
+/**
+ * Gap 2: per-project initial code-graph build status.
+ *
+ * Mirrors `CodeGraphBuildView` in commands::codegraph (Rust). Fired on
+ * the `code-graph-build-progress` Tauri event during a build, and
+ * returned by `get_code_graph_build_status`.
+ */
+export type CodeGraphBuildStatus =
+  | 'pending'
+  | 'running'
+  | 'success'
+  | 'failed'
+  | 'skipped';
+
+export interface CodeGraphBuildView {
+  project_id: string;
+  status: CodeGraphBuildStatus;
+  /** ISO 8601 (RFC 3339); null until the build starts. */
+  started_at_iso: string | null;
+  /** ISO 8601; null until the build reaches a terminal state. */
+  finished_at_iso: string | null;
+  duration_ms: number | null;
+  files_analyzed: number;
+  /** File-extension tags, e.g. `["py","ts"]`. */
+  languages: string[];
+  joern_used: boolean;
+  error_message: string | null;
+  /** Last ~4 KiB of analyzer stdout/stderr — debugging aid. */
+  log_tail: string | null;
+  /** Live phase indicator on `running` events (e.g. "scan", "analyze"). */
+  current_phase: string | null;
+}

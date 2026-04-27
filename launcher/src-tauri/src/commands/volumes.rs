@@ -774,6 +774,21 @@ pub async fn migrate_volumes(
         return Err("migration requires confirmed=true".into());
     }
 
+    // Volume migration is Linux-only for v0.1.0. The pipeline shells out
+    // to POSIX `cp -a` (line ~838) and assumes podman/docker host bind-mount
+    // semantics that differ on Windows (Docker Desktop) and macOS. The
+    // launcher still detects volumes on those OSes (read-only) but the
+    // destructive migration path is gated. Cross-OS migration is on the
+    // post-launch backlog — see Stage 8 audit (2026-04-26).
+    if cfg!(target_os = "windows") || cfg!(target_os = "macos") {
+        return Err(
+            "volume migration is currently Linux-only; on Windows/macOS \
+             move volumes manually via Docker Desktop / Podman Desktop. \
+             Tracked: github.com/hotak92/vibecoded-orchestrator/issues (cross-OS volume migration)"
+                .into(),
+        );
+    }
+
     // Build a fresh plan and re-validate; the dry-run might have been
     // computed minutes ago and the disk situation could have changed.
     let _plan = set_volumes_config_dry_run(path.clone()).await?;

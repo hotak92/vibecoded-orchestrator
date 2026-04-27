@@ -11,6 +11,7 @@
   import PermissionsTab from '$lib/project-state/PermissionsTab.svelte';
   import SecretsTab from '$lib/project-state/SecretsTab.svelte';
   import KgCodegraphTab from '$lib/project-state/KgCodegraphTab.svelte';
+  import CodeGraphBuildPill from '$lib/components/CodeGraphBuildPill.svelte';
   import type { ProjectView } from '$lib/types/launcher';
 
   let projectId = $derived($page.params.id);
@@ -30,6 +31,20 @@
   };
   let orchState = $state<OrchestratorState | null>(null);
   let updating = $state(false);
+  let rebuilding = $state(false);
+
+  async function rebuildCodeGraph() {
+    if (!project) return;
+    rebuilding = true;
+    try {
+      await invoke('rebuild_code_graph', { projectId: project.id });
+      toast.success('Code graph rebuild started');
+    } catch (e) {
+      toast.error(e);
+    } finally {
+      rebuilding = false;
+    }
+  }
 
   async function loadProject() {
     try {
@@ -93,9 +108,20 @@
         <p class="project-meta">
           <code>{project.folder_path}</code>
           <span class="host-badge host-{project.host}">{project.host}</span>
+          <CodeGraphBuildPill projectId={project.id} />
         </p>
       {/if}
     </div>
+    {#if project}
+      <button
+        class="rebuild-btn"
+        onclick={rebuildCodeGraph}
+        disabled={rebuilding}
+        title="Re-run code-graph-analyze on this project's source folder"
+      >
+        {rebuilding ? 'Starting…' : 'Re-build code graph'}
+      </button>
+    {/if}
   </header>
 
   {#if orchState && orchState.installed && orchState.version_status === 'outdated' && orchState.bundled_version}
@@ -150,13 +176,31 @@
     display: flex; align-items: center; gap: 16px;
     padding: 14px 24px; border-bottom: 1px solid rgba(255,255,255,0.06);
   }
+  .project-title { flex: 1; }
+  .rebuild-btn {
+    background: rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.1);
+    color: inherit; padding: 6px 12px; border-radius: 4px;
+    cursor: pointer; font-size: 12px;
+    flex-shrink: 0;
+  }
+  .rebuild-btn:hover:not(:disabled) {
+    background: rgba(0,191,166,0.10);
+    border-color: rgba(0,191,166,0.3);
+    color: rgb(0,191,166);
+  }
+  .rebuild-btn:disabled { opacity: 0.6; cursor: not-allowed; }
   .back-btn {
     background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1);
     color: inherit; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 13px;
   }
   .back-btn:hover { background: rgba(255,255,255,0.1); }
   .project-title h1 { margin: 0; font-size: 18px; }
-  .project-meta { margin: 2px 0 0; font-size: 12px; color: #888; }
+  .project-meta {
+    margin: 4px 0 0; font-size: 12px; color: #888;
+    display: flex; align-items: center; gap: 8px;
+    flex-wrap: wrap;
+  }
   .project-meta code { font-family: ui-monospace, monospace; }
   .host-badge {
     display: inline-block; padding: 1px 8px; border-radius: 10px;

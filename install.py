@@ -177,6 +177,10 @@ def main() -> int:
                              "registered projects (default: off — leave user code alone).")
     parser.add_argument("--dry-run", action="store_true", default=False,
                         help="Uninstall: print what would be removed without removing anything.")
+    parser.add_argument("--skip-seed", action="store_true", default=False,
+                        help="Skip the Weaviate seed step (bundled knowledge/ + docs/). "
+                             "Useful in CI / test runs that don't need search content. "
+                             "Re-run later with `kg-sync --all` and `upload_docs.py --all`.")
     args = parser.parse_args()
 
     if args.uninstall:
@@ -230,8 +234,12 @@ def main() -> int:
         # Weaviate. Bootstrap any of THIS project's KG/Development collections
         # that aren't there yet — leave existing ones alone.
         _ensure_collections(embed_config)
+        # Seed Weaviate with bundled knowledge/ + docs/. Idempotent;
+        # safe to re-run on update.
+        _seed_weaviate(args)
     else:
         print("\n[skip] Container services (--no-containers)")
+        print("[skip] Weaviate seeding (--no-containers)")
 
     # Step 7: Create state directory
     _create_state_directory()
@@ -1125,6 +1133,87 @@ def _ensure_collections(embed_config: dict) -> None:
         print(f"  ! failed to create {n}: {err}")
     if not failed:
         print("  OK")
+
+
+# ---------------------------------------------------------------------------
+# Step 7c: Seed Weaviate with bundled knowledge/ + docs/
+# ---------------------------------------------------------------------------
+#
+# Without this step, a fresh install leaves the Weaviate collections empty
+# and `hybrid_search` returns nothing until the user manually runs
+# `kg-sync --all`. That's exactly the friction-y workaround that
+# undermines the orchestrator's "search just works" promise. Seed at
+# install time so it's invisible to adopters.
+#
+# Soft-fail policy: if Weaviate or Ollama isn't yet reachable (timing
+# race on first-boot pulls), print a clear hint and continue. The
+# install itself succeeds; the user can re-run seeding later via
+#   .claude/scripts/kg-sync --all
+#   .claude/scripts/upload_docs.py --all
+#
+# Both scripts are idempotent so re-runs are safe.
+
+def _seed_weaviate(args: argparse.Namespace) -> None:
+    print("[7c/10] Seeding Weaviate with bundled knowledge/ + docs/ ... ", flush=True)
+
+    # Guard: if user passed --skip-seed, honor it (useful for CI / tests).
+    if getattr(args, "skip_seed", False):
+        print("  Skipped (--skip-seed).")
+        return
+
+    # We must use the venv's Python so weaviate-client + weaviate_mcp.chunking
+    # import correctly. The venv was created in Step 4.
+    venv_py = PROJECT_ROOT / "claude_mcp_servers" / ".venv" / "bin" / "python"
+    if os.name == "nt":
+        # Windows: scripts/ instead of bin/, .exe suffix
+        venv_py = PROJECT_ROOT / "claude_mcp_servers" / ".venv" / "Scripts" / "python.exe"
+    if not venv_py.exists():
+        print(f"  ! venv python not found at {venv_py} — skipping seed (run Step 4 first)")
+        return
+
+    scripts_dir = PROJECT_ROOT / ".claude" / "scripts"
+    sync_kg = scripts_dir / "sync_knowledge_graph.py"
+    upload_docs = scripts_dir / "upload_docs.py"
+
+    # 1. Knowledge graph seed
+    if sync_kg.exists():
+        print("  → knowledge/ → KG collection ...", flush=True)
+        try:
+            subprocess.run(
+                [str(venv_py), str(sync_kg), "--all"],
+                check=True,
+                cwd=str(PROJECT_ROOT),
+                timeout=600,  # 10 min cap; 50 seed nodes = ~30s on warm Ollama
+            )
+        except subprocess.CalledProcessError as e:
+            print(f"    ! kg sync exited {e.returncode} — re-run later with `kg-sync --all`")
+        except subprocess.TimeoutExpired:
+            print("    ! kg sync timed out (>10 min) — re-run later with `kg-sync --all`")
+        except FileNotFoundError as e:
+            print(f"    ! kg sync failed: {e}")
+    else:
+        print(f"  ! sync_knowledge_graph.py not found at {sync_kg}")
+
+    # 2. Project documentation seed
+    if upload_docs.exists():
+        print("  → docs/ → Development collection ...", flush=True)
+        try:
+            subprocess.run(
+                [str(venv_py), str(upload_docs), "--all"],
+                check=True,
+                cwd=str(PROJECT_ROOT),
+                timeout=600,
+            )
+        except subprocess.CalledProcessError as e:
+            print(f"    ! docs upload exited {e.returncode} — re-run later with `upload_docs.py --all`")
+        except subprocess.TimeoutExpired:
+            print("    ! docs upload timed out (>10 min) — re-run later with `upload_docs.py --all`")
+        except FileNotFoundError as e:
+            print(f"    ! docs upload failed: {e}")
+    else:
+        print(f"  ! upload_docs.py not found at {upload_docs}")
+
+    print("  OK (seed step complete; per-script errors are non-fatal — see hints above)")
 
 
 # ---------------------------------------------------------------------------
