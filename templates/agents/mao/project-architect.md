@@ -39,8 +39,6 @@ Adapt proven architectures to current needs.
 
 For project-specific architecture:
 - Ask: "Search [Project]_development for architecture docs"
-- Ask: "Search [Project]_conversations for architecture decisions"
-
 Understand existing patterns before proposing changes.
 
 ## Track Decisions
@@ -676,9 +674,6 @@ After project architecture:
 
 **3. Development Collection** (docs/ → [Project]_development):
 - Verbose project-specific docs, auto-syncs
-
-**4. Conversation Collection** ([Project]_conversations):
-- Auto-captured chat history
 
 ## Success Criteria
 

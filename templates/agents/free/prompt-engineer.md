@@ -304,7 +304,6 @@ You succeed when:
 - **Collections**:
   - `{KG_COLLECTION}`: Cross-project patterns and concepts
   - `[Project]_development`: Project-specific documentation
-  - `[Project]_conversations`: Past decisions and context
   - `CodeFunction`, `CodeClass`, `CodeModule`, `CodeAPI`: Code entities with embeddings
 - **Tools**:
   - `hybrid_search(query, limit)`: Semantic search across KG (~500ms)
@@ -771,7 +770,7 @@ Update `CONTEXT_STATE.md` during work:
 ## Environment
 
 - Python 3.12, venv: project's own `.venv/` for project code; `.claude/scripts/kg-*` for MCP/KG operations
-- Weaviate: Vector database (port 8081). Shared KG: `{KG_COLLECTION}` (cross-project patterns). Project collections: `[Project]_development`, `[Project]_conversations`.
+- Weaviate: Vector database (port 8081). Shared KG: `{KG_COLLECTION}` (cross-project patterns). Project collections: `[Project]_development`.
 - Ollama: Embeddings (snowflake-arctic-embed2, 1024-dim) (port 11435)
 - Testing: pytest
 ```
@@ -783,7 +782,6 @@ Update `CONTEXT_STATE.md` during work:
 Three collections via Weaviate MCP:
 - `{KG_COLLECTION}` - Cross-project patterns (knowledge/)
 - `[Project]_development` - Project docs (docs/)
-- `[Project]_conversations` - Chat history
 
 Search tools:
 - `hybrid_search(query, limit)` - Semantic (~500ms)

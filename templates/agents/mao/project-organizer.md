@@ -109,9 +109,6 @@ Grep "file_reference" --output_mode content
 **3. Development Collection** (docs/ → [Project]_development):
 - Verbose project-specific docs, auto-syncs
 
-**4. Conversation Collection** ([Project]_conversations):
-- Auto-captured chat history
-
 ## Success Criteria
 
 - Health metrics improved

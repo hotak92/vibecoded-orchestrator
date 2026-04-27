@@ -1238,9 +1238,6 @@ Find infrastructure setup patterns, deployment strategies, configuration best pr
 - Verbose project-specific docs
 - Auto-syncs via post-file-edit hook
 
-**4. Conversation Collection** ([Project]_conversations):
-- Auto-captures via user-prompt-submit hook
-
 ## Scripts
 
 **Knowledge Graph** (auto venv):

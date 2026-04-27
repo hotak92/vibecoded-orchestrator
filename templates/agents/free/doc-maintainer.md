@@ -516,12 +516,7 @@ Date: 2026-01-28
 - Auto-syncs via post-file-edit hook
 - Search: Weaviate MCP
 
-**4. Conversation Collection** ([Project]_conversations):
-- Chat history, decisions, discoveries
-- Auto-captures via user-prompt-submit hook
-- Search: Weaviate MCP
-
-**Decision**: Reusable pattern → KG | Code entities → Code Graph | Verbose docs → Development | Conversations → Auto-captured
+**Decision**: Reusable pattern → KG | Code entities → Code Graph | Verbose docs → Development
 
 ## Success Criteria
 
