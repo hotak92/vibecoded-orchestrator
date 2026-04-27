@@ -201,16 +201,78 @@ if %ERRORLEVEL% NEQ 0 (
         REM winget modifies PATH for new shells but not us — refresh.
         call refreshenv >nul 2>&1
     ) else (
-        echo [launcher] winget not available. Install Node manually:
-        echo            https://nodejs.org/   ^(or: https://aka.ms/getwinget for winget^)
-        goto :launch_skip
+        REM No winget — old Win10 build, Server, or removed by IT policy.
+        REM Loud-stop: tell user what to install + give a re-check option.
+        echo.
+        echo ===============================================
+        echo   Cannot auto-install Node: winget is not available
+        echo ===============================================
+        echo.
+        echo   Install Node.js manually:
+        echo     https://nodejs.org/  ^(LTS .msi, 18+ recommended^)
+        echo   Or get winget first:  https://aka.ms/getwinget
+        echo.
+        echo   IMPORTANT: After installing Node, OPEN A NEW TERMINAL so PATH
+        echo   refreshes, then re-run this script. Or choose [r] to retry.
+        echo.
+        if "%YES_FLAG%"=="1" (
+            echo [launcher] Non-interactive run: skipping.
+            goto :launch_skip
+        )
+        :winget_recheck
+        set /p "WG_RETRY=[r] Re-check / [s] Skip the build: "
+        if /I "!WG_RETRY!"=="r" (
+            where /q node
+            if %ERRORLEVEL% EQU 0 (
+                echo [launcher] Node detected — continuing.
+                goto :node_install_done
+            ) else (
+                echo [launcher] Still no Node on PATH. Try a new terminal.
+                goto :winget_recheck
+            )
+        ) else (
+            goto :launch_skip
+        )
+        :node_install_done
     )
 )
 
 where /q node
 if %ERRORLEVEL% NEQ 0 (
-    echo [launcher] Node still not on PATH. Open a NEW terminal and re-run, or build manually.
-    goto :launch_skip
+    REM Loud-stop pattern (parity with Linux/macOS post-install-launcher.sh).
+    REM Don't silently skip and report "Installation complete!" while the
+    REM launcher build was actually skipped — that's the same anti-pattern
+    REM as the Joern silent-hang. Tell the user exactly what to do.
+    echo.
+    echo ===============================================
+    echo   Cannot build the launcher: Node.js is missing
+    echo ===============================================
+    echo.
+    echo   Auto-install attempts failed. Install Node.js manually:
+    echo     https://nodejs.org/  ^(LTS, 18+ recommended^)
+    echo   Or via winget:  winget install OpenJS.NodeJS
+    echo.
+    echo   IMPORTANT: After installing, OPEN A NEW TERMINAL so PATH refreshes,
+    echo   then re-run this script. Or choose [r] to retry from this terminal
+    echo   ^(may not see new PATH^).
+    echo.
+    if "%YES_FLAG%"=="1" (
+        echo [launcher] Non-interactive run: skipping. Re-run with Node available.
+        goto :launch_skip
+    )
+    :node_recheck
+    set /p "NODE_RETRY=[r] Re-check / [s] Skip the build: "
+    if /I "!NODE_RETRY!"=="r" (
+        where /q node
+        if %ERRORLEVEL% EQU 0 (
+            echo [launcher] Node detected — continuing build.
+        ) else (
+            echo [launcher] Still no Node on PATH. Try opening a new terminal.
+            goto :node_recheck
+        )
+    ) else (
+        goto :launch_skip
+    )
 )
 
 REM pnpm preferred, npm fallback.
@@ -242,14 +304,35 @@ if exist "%~dp0launcher\src-tauri\target\release\vct-launcher.exe" (
     set "LAUNCHER_BIN=%~dp0launcher\src-tauri\target\release\vct-launcher-temp.exe"
 )
 if not defined LAUNCHER_BIN (
-    echo [launcher] Build reported done but no .exe found. Run start-launcher.bat manually.
+    REM Loud-stop: build "succeeded" per its exit code but no .exe is present.
+    REM This usually means Tauri produced an error we missed. Tell the user
+    REM what to look for.
+    echo.
+    echo ===============================================
+    echo   Build reported success but no .exe was found
+    echo ===============================================
+    echo.
+    echo   Expected one of:
+    echo     %~dp0launcher\src-tauri\target\release\vct-launcher.exe
+    echo     %~dp0launcher\src-tauri\target\release\vct-launcher-temp.exe
+    echo.
+    echo   This usually means a Tauri build dependency is missing.
+    echo   See: https://tauri.app/start/prerequisites/
+    echo   ^(Windows: Visual Studio Build Tools + WebView2 + Rust toolchain^)
+    echo.
     goto :launch_skip
 )
 goto :auto_launch
 
 :launch_skip
-echo [launcher] Skipped. Run start-launcher.bat after building manually:
-echo            cd launcher ^&^& pnpm install ^&^& pnpm tauri build
+echo.
+echo [launcher] Launcher build was skipped or failed.
+echo [launcher] To build later, open a terminal in the repo root and run:
+echo            cd launcher
+echo            pnpm install ^(or npm install^)
+echo            pnpm tauri build
+echo            ..\start-launcher.bat
+echo.
 goto :end
 
 :auto_launch
