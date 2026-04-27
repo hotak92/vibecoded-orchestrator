@@ -51,17 +51,14 @@ set -uo pipefail
 # NOTE: deliberately NOT `set -e`. We want to swallow failures and exit 0
 # rather than have a single curl/build hiccup abort first-install.
 
-# Insulate from user-defined shell rc files that wrap tools with shell
-# functions (e.g. lean-ctx wrappers around `pnpm`/`npm`/`git`). When a
-# user has BASH_ENV pointing at a script that defines such wrappers,
-# every subshell we spawn inherits them — and the wrappers can refer
-# to binaries that aren't actually installed, masquerading as "tool
-# present". This caused a real install bug on 2026-04-27 where pnpm
-# audit said "yes" but `pnpm install` failed with "command not found".
-# Subsequent build/spawn calls in this script run in plain `/bin/bash`
-# subshells without the wrappers, so the audit and the actual call
-# agree about what's available.
-unset BASH_ENV
+# We do NOT `unset BASH_ENV` — leave user-defined output-compression shims
+# (lean-ctx, etc.) active during long phases like `pnpm install`/`tauri
+# build` where their progress chatter is what users actually want to see
+# compressed. The audit-vs-execution mismatch that bit us on 2026-04-27
+# is handled at detection time by `_resolves_to_binary` below — we only
+# accept tools that resolve to a real PATH binary, never function or
+# builtin shadows. That way false-positive detection (audit says "yes"
+# but the binary doesn't exist) is impossible.
 
 REPO_ROOT="${1:-}"
 shift || true
@@ -479,14 +476,70 @@ PY
                 fi
             fi
 
-            command -v node >/dev/null 2>&1 && HAS_NODE=1
-            command -v npm  >/dev/null 2>&1 && HAS_NPM=1
+            # Same binary-only detection as the initial audit.
+            _resolves_to_binary node && HAS_NODE=1
+            _resolves_to_binary npm  && HAS_NPM=1
         fi
 
         if [ $HAS_NODE -eq 0 ]; then
-            echo "[launcher] Node.js still not available. Build skipped — install manually:"
-            echo "           https://nodejs.org/ then run: cd launcher && pnpm install && pnpm tauri build"
-            MODE="skip"
+            # All auto-install tiers failed and Node is still missing.
+            # Stop here and ask the user to install it manually rather
+            # than silently skipping the launcher build (which leaves
+            # the user with an "Installation complete!" message they
+            # can't actually use). 2026-04-27 review: silent-skip is
+            # the same anti-pattern as the Joern hang — install MUST
+            # surface blockers loudly with actionable guidance.
+            echo ""
+            echo "==============================================="
+            echo "  Cannot build the launcher: Node.js is missing"
+            echo "==============================================="
+            echo ""
+            echo "  Auto-install attempts failed. Please install Node.js manually:"
+            echo "    https://nodejs.org/ (LTS, 18+ recommended)"
+            case "$OS" in
+                linux)
+                    echo "    Or via your package manager:"
+                    echo "      sudo apt install nodejs npm        # Debian/Ubuntu"
+                    echo "      sudo dnf install nodejs npm        # Fedora/RHEL"
+                    echo "      sudo pacman -S nodejs npm          # Arch"
+                    ;;
+                macos)
+                    echo "    Or via Homebrew:  brew install node"
+                    echo "    (Install Homebrew first if needed: https://brew.sh)"
+                    ;;
+            esac
+            echo ""
+            echo "  After installing Node, choose:"
+            echo "    [r] Re-check (I just installed it)"
+            echo "    [s] Skip the launcher build (run later: cd launcher && pnpm install && pnpm tauri build)"
+            echo ""
+            if [ "$YES" -eq 1 ] || [ ! -t 0 ]; then
+                echo "[launcher] Non-interactive run: skipping. Re-run the installer with Node available, or build manually."
+                MODE="skip"
+            else
+                while :; do
+                    read -r -p "Your choice [r/s]: " ans || ans="s"
+                    case "${ans:-s}" in
+                        r|R|recheck|RECHECK)
+                            _resolves_to_binary node && HAS_NODE=1
+                            _resolves_to_binary npm  && HAS_NPM=1
+                            if [ $HAS_NODE -eq 1 ]; then
+                                echo "[launcher] Detected Node.js — continuing build."
+                                break
+                            else
+                                echo "[launcher] Still no Node.js on PATH. Try again or skip."
+                            fi
+                            ;;
+                        s|S|skip|SKIP)
+                            MODE="skip"
+                            break
+                            ;;
+                        *)
+                            echo "Type 'r' to re-check or 's' to skip."
+                            ;;
+                    esac
+                done
+            fi
         fi
     fi
 
@@ -498,17 +551,78 @@ PY
         elif [ $HAS_NPM -eq 1 ]; then
             echo "[launcher] pnpm not found. Installing via npm..."
             npm install -g pnpm 2>/dev/null || _maybe_sudo npm install -g pnpm 2>/dev/null || true
-            if command -v pnpm >/dev/null 2>&1; then
+            # `npm install -g pnpm` may put the binary in
+            # `~/.local/share/npm/bin/`, `~/.npm-global/bin/`, or
+            # `/usr/local/lib/node_modules/.bin/`, depending on the npm
+            # prefix config. Probe the canonical npm-prefix-bin
+            # locations so we find a freshly-installed pnpm even if PATH
+            # hasn't been refreshed yet, then prepend that dir to PATH
+            # so the subsequent `pnpm install` invocation works.
+            if _resolves_to_binary pnpm; then
                 PKG_MGR="pnpm"
             else
-                echo "[launcher] pnpm install failed. Falling back to npm."
-                PKG_MGR="npm"
+                # Probe known npm global-bin locations explicitly.
+                npm_bin="$(npm bin -g 2>/dev/null || true)"
+                if [ -n "$npm_bin" ] && [ -x "$npm_bin/pnpm" ]; then
+                    export PATH="$npm_bin:$PATH"
+                    PKG_MGR="pnpm"
+                else
+                    for cand in \
+                        "$HOME/.local/share/npm/bin" \
+                        "$HOME/.npm-global/bin" \
+                        "/usr/local/lib/node_modules/.bin" \
+                        "$(dirname "$(_resolves_to_binary npm && command -v npm)")"; do
+                        if [ -n "$cand" ] && [ -x "$cand/pnpm" ]; then
+                            export PATH="$cand:$PATH"
+                            PKG_MGR="pnpm"
+                            break
+                        fi
+                    done
+                fi
+                if [ -z "$PKG_MGR" ]; then
+                    echo "[launcher] pnpm install via npm failed. Falling back to npm."
+                    PKG_MGR="npm"
+                fi
             fi
         fi
 
         if [ -z "$PKG_MGR" ]; then
-            echo "[launcher] No package manager (npm/pnpm) available. Build skipped."
-            MODE="skip"
+            # Same loud-stop pattern as the Node-missing branch above.
+            echo ""
+            echo "==============================================="
+            echo "  Cannot build the launcher: no package manager"
+            echo "==============================================="
+            echo ""
+            echo "  Neither pnpm nor npm is available even after install attempts."
+            echo "  Install Node.js (which ships npm) — pnpm is optional, npm is enough:"
+            echo "    https://nodejs.org/ (LTS, 18+ recommended)"
+            echo ""
+            if [ "$YES" -eq 1 ] || [ ! -t 0 ]; then
+                echo "[launcher] Non-interactive run: skipping. Re-run with npm available, or build manually."
+                MODE="skip"
+            else
+                while :; do
+                    read -r -p "[r] Re-check / [s] Skip the build: " ans || ans="s"
+                    case "${ans:-s}" in
+                        r|R)
+                            _resolves_to_binary pnpm && PKG_MGR="pnpm"
+                            [ -z "$PKG_MGR" ] && _resolves_to_binary npm  && PKG_MGR="npm"
+                            if [ -n "$PKG_MGR" ]; then
+                                echo "[launcher] Detected $PKG_MGR — continuing."
+                                break
+                            else
+                                echo "[launcher] Still no pnpm/npm. Try again or skip."
+                            fi
+                            ;;
+                        s|S)
+                            MODE="skip"
+                            break
+                            ;;
+                        *) echo "Type 'r' to re-check or 's' to skip." ;;
+                    esac
+                done
+            fi
+            [ -z "$PKG_MGR" ] && MODE="skip"
         fi
     fi
 

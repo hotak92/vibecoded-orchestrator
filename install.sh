@@ -1,10 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Insulate from user-defined shell rc files (see first-install.sh
-# and post-install-launcher.sh for the bug history).
-unset BASH_ENV
-
 # VibeCoded Tools — Orchestrator Installer (Linux / macOS)
 #
 # This wrapper:
