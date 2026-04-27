@@ -105,20 +105,6 @@ their next `git pull` get the new binaries automatically — no Releases asset
 download needed (though Releases are still published for users who don't want
 to clone the full repo).
 
-## Repository size cost
-
-Each binary is ~30–40 MB. Three platforms ≈ 90–120 MB committed. We don't use
-Git LFS — even for OSS repos GitHub charges storage + bandwidth past 1 GB
-total. Plain-file commits are simpler and still well under any sensible
-repo-size threshold for v1.0.
-
-If repo size becomes a problem in v0.1.x, the alternatives are:
-- Move binaries to GitHub Releases (Releases assets don't count against repo
-  size, but require network at install time).
-- Use git-lfs with a GitHub Pro / Team plan.
-- Strip binaries with `cargo build --release --strip` (already on; ~30 MB is
-  the floor for a Tauri+Svelte app).
-
 ## Why we don't ship `.deb` / `.rpm` / `.dmg` / `.msi` here
 
 This directory ships the **executable binary**, not redistribution-grade
