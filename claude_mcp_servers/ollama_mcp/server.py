@@ -288,9 +288,9 @@ If yes, extract and explain the relevant information. If no, respond with "NOT F
 @mcp.tool()
 def read_image(
     file_path: str,
-    max_dimension: int = 1568,
+    max_total_pixels: int = 1_048_576,
     describe: bool = False,
-    vision_model: str = "llama3.2-vision:latest",
+    vision_model: str = "qwen3.5:9b",
     description_prompt: str = "Describe this image concisely.",
 ) -> str:
     """
@@ -304,9 +304,13 @@ def read_image(
 
     Args:
         file_path: Absolute path to the image file
-        max_dimension: Max width/height in pixels (resized if larger, preserving aspect ratio). Default 1568 (Anthropic's recommended max).
+        max_total_pixels: Max total pixel count (width * height); image is downscaled
+            preserving aspect ratio if larger. Default 1,048,576 (~1024x1024 equivalent)
+            keeps memory usage bounded for local vision inference (Qwen3.5 9B in q4 needs
+            ~5-8 GB VRAM at this size).
         describe: If True, also return a text description from a local vision model
-        vision_model: Ollama model for description (default: llama3.2-vision:latest)
+        vision_model: Ollama model for description. Default `qwen3.5:9b` — unified
+            text+vision model (no separate `-vl` tag); Qwen 3.5 is multimodal-native.
         description_prompt: Prompt for the vision model when describe=True
     """
     import base64
@@ -371,17 +375,22 @@ def read_image(
             "error": f"Image too large: {len(raw)/1_000_000:.1f}MB (max ~3.75MB for API). Resize first.",
         })
 
-    # Optional resize using PIL (if available)
+    # Optional resize using PIL (if available). Bound by total-pixel count
+    # rather than max-dimension so wide/tall images don't blow up VRAM
+    # during local vision inference. 1024x1024 ≈ 1,048,576 px is the
+    # default budget for Qwen3.5 9B in q4 quantization (~5-8 GB VRAM).
+    import math
     resized = False
-    if max_dimension and mime_type not in ("image/svg+xml",):
+    if max_total_pixels and mime_type not in ("image/svg+xml",):
         try:
             from PIL import Image
             import io
             img = Image.open(io.BytesIO(raw))
             w, h = img.size
-            if w > max_dimension or h > max_dimension:
-                ratio = min(max_dimension / w, max_dimension / h)
-                new_size = (int(w * ratio), int(h * ratio))
+            total = w * h
+            if total > max_total_pixels:
+                ratio = math.sqrt(max_total_pixels / total)
+                new_size = (max(1, int(w * ratio)), max(1, int(h * ratio)))
                 img = img.resize(new_size, Image.LANCZOS)
                 buf = io.BytesIO()
                 fmt = "PNG" if mime_type == "image/png" else "JPEG"
@@ -389,7 +398,10 @@ def read_image(
                 raw = buf.getvalue()
                 mime_type = "image/png" if fmt == "PNG" else "image/jpeg"
                 resized = True
-                logger.info(f"read_image: resized {path.name} from {w}x{h} to {new_size[0]}x{new_size[1]}")
+                logger.info(
+                    f"read_image: resized {path.name} from {w}x{h} ({total} px) "
+                    f"to {new_size[0]}x{new_size[1]} ({new_size[0]*new_size[1]} px)"
+                )
         except ImportError:
             pass  # PIL not available — send original size
 
