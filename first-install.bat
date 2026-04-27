@@ -102,7 +102,12 @@ REM     fallback if absent.
 REM ---------------------------------------------------------------------------
 
 set "LAUNCHER_BIN="
-REM First-match-wins probe.
+REM First-match-wins probe. Order:
+REM   1. Locally built (developer running pnpm tauri build directly)
+REM   2. Bundled prebuilt in launcher\dist\windows-x64\ (default for end users
+REM      once a Windows binary lands there — currently a placeholder, see
+REM      launcher\dist\windows-x64\README.md)
+REM   3. System install paths (someone installed via winget / msi)
 if exist "%~dp0launcher\src-tauri\target\release\vct-launcher.exe" (
     set "LAUNCHER_BIN=%~dp0launcher\src-tauri\target\release\vct-launcher.exe"
 ) else if exist "%~dp0launcher\src-tauri\target\release\vct-launcher-temp.exe" (
@@ -111,6 +116,8 @@ if exist "%~dp0launcher\src-tauri\target\release\vct-launcher.exe" (
     set "LAUNCHER_BIN=%~dp0launcher\src-tauri\target\release\launcher.exe"
 ) else if exist "%~dp0launcher\src-tauri\target\debug\vct-launcher-temp.exe" (
     set "LAUNCHER_BIN=%~dp0launcher\src-tauri\target\debug\vct-launcher-temp.exe"
+) else if exist "%~dp0launcher\dist\windows-x64\vct-launcher.exe" (
+    set "LAUNCHER_BIN=%~dp0launcher\dist\windows-x64\vct-launcher.exe"
 ) else if exist "%LOCALAPPDATA%\Programs\VCT Launcher\vct-launcher.exe" (
     set "LAUNCHER_BIN=%LOCALAPPDATA%\Programs\VCT Launcher\vct-launcher.exe"
 ) else if exist "%LOCALAPPDATA%\vct-launcher\vct-launcher.exe" (

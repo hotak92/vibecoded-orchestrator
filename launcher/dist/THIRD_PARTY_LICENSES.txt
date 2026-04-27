@@ -1,0 +1,128 @@
+VibeCoded Tools Launcher — Third-Party License Notice
+======================================================
+
+The launcher binary distributed in this directory (vct-launcher / vct-launcher.exe)
+is licensed under AGPL-3.0-or-later, the same license as vibecoded-orchestrator
+itself. See the repo root LICENSE file for the AGPL-3.0 full text.
+
+This binary statically links and dynamically loads several third-party libraries.
+Their licenses are listed below. None of these libraries' terms restrict our
+ability to ship the binary alongside the AGPL source under the same terms.
+
+For an exhaustive, machine-generated license inventory of every transitive Rust
+crate compiled into the binary, contributors should run `cargo about generate`
+in launcher/src-tauri/ at release time. This file is the human-curated summary
+covering the major components.
+
+----------------------------------------------------------------------
+1. Tauri framework
+----------------------------------------------------------------------
+License: MIT OR Apache-2.0 (dual-licensed; we use under MIT)
+Copyright: 2017-present Tauri Programme within The Commons Conservancy
+URL: https://github.com/tauri-apps/tauri
+
+The MIT License (MIT)
+=====================
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+----------------------------------------------------------------------
+2. webkit2gtk (Linux runtime — DYNAMICALLY LINKED)
+----------------------------------------------------------------------
+License: LGPL-2.1-only (libraries) and BSD-2-Clause (some components)
+Copyright: WebKit contributors
+URL: https://webkit.org/
+
+The launcher uses webkit2gtk DYNAMICALLY (loaded at runtime from the host's
+system libraries — typically /usr/lib/x86_64-linux-gnu/libwebkit2gtk-4.1.so.0).
+Per LGPL-2.1 § 6, this constitutes "use" rather than "derivative work" of the
+LGPL'd library, and our binary distribution does not need to be LGPL-licensed.
+
+Users may replace the webkit2gtk library on their system with a different
+version; the launcher binary will load whatever webkit2gtk-4.1 the OS provides.
+Source code for webkit2gtk is available at https://webkit.org/getting-the-code/.
+
+The full LGPL-2.1 text is available at:
+https://www.gnu.org/licenses/old-licenses/lgpl-2.1.txt
+
+----------------------------------------------------------------------
+3. WebView2 (Windows runtime — DYNAMICALLY LINKED)
+----------------------------------------------------------------------
+License: Microsoft proprietary (distributable per WebView2 Runtime Distribution
+         Agreement)
+Copyright: Microsoft Corporation
+URL: https://docs.microsoft.com/en-us/microsoft-edge/webview2/
+
+The launcher .exe loads WebView2 Runtime, which Microsoft pre-installs on
+Windows 10 1903+ and Windows 11. We do NOT redistribute WebView2 — users
+obtain it from Microsoft. If the runtime is missing, the launcher prints a
+download link to https://developer.microsoft.com/microsoft-edge/webview2/.
+
+Microsoft's distribution terms allow free use of WebView2 Runtime by any
+application without per-distribution licensing.
+
+----------------------------------------------------------------------
+4. WKWebView (macOS runtime — system framework)
+----------------------------------------------------------------------
+License: Part of Apple's macOS — no separate redistribution required.
+Copyright: Apple Inc.
+
+The launcher .app bundle uses WKWebView from the host macOS WebKit framework.
+No additional licensing applies; users have already accepted Apple's macOS EULA.
+
+----------------------------------------------------------------------
+5. Rust standard library + transitive crates
+----------------------------------------------------------------------
+License: MIT OR Apache-2.0 (Rust stdlib); various MIT/Apache-2.0/BSD-2-Clause/
+         BSD-3-Clause for transitive crates.
+
+The launcher's Cargo.toml depends on ~150 crates transitively. Notable direct
+dependencies (see launcher/src-tauri/Cargo.toml for the full list):
+
+  serde, serde_json, tokio, reqwest, axum  - MIT OR Apache-2.0
+  tauri-plugin-opener, tauri-plugin-dialog - MIT OR Apache-2.0
+  rusqlite                                 - MIT
+  directories                              - MIT OR Apache-2.0
+
+For a complete machine-readable list, run from launcher/src-tauri/:
+    cargo install cargo-about
+    cargo about generate -c about.toml -o ../dist/THIRD_PARTY_LICENSES.html
+
+----------------------------------------------------------------------
+6. Frontend (SvelteKit + bundled webview assets)
+----------------------------------------------------------------------
+License: MIT (SvelteKit and most npm dependencies); see launcher/package.json.
+
+The launcher's HTML/CSS/JS bundle is embedded in the Rust binary via Tauri's
+asset packaging. License headers for those bundled assets are in the project's
+package-lock.json + the SvelteKit project source.
+
+----------------------------------------------------------------------
+Generating an exhaustive inventory
+----------------------------------------------------------------------
+Maintainers cutting a release should generate the full transitive license
+list and ship it alongside this summary file. From the repo root:
+
+    cd launcher/src-tauri
+    cargo install cargo-about
+    cargo about generate -c about.toml -o ../dist/THIRD_PARTY_LICENSES.html
+
+(Create about.toml with `cargo about init` if not present; commit both.)
+
+----------------------------------------------------------------------
+Last reviewed: 2026-04-28 (vco v1.0 sprint)

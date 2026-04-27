@@ -360,17 +360,37 @@ _check_prerequisites
 echo ""
 
 # ----- Step 2: probe for an existing launcher binary --------------------------
+# Discovery order (highest-priority first):
+#   1. Locally built binary (developers running `pnpm tauri build` directly).
+#   2. Bundled prebuilt at launcher/dist/<arch>/ (default for end users).
+#   3. System install paths (~/.local/share, /usr/local, etc.) — for users who
+#      installed a launcher via apt/brew/winget at some earlier point.
+# See launcher/dist/README.md for the bundling layout.
 candidates_unix=(
+    # 1. Locally built (contributors)
     "$REPO_ROOT/launcher/src-tauri/target/release/vct-launcher"
     "$REPO_ROOT/launcher/src-tauri/target/release/vct-launcher-temp"
     "$REPO_ROOT/launcher/src-tauri/target/release/launcher"
     "$REPO_ROOT/launcher/src-tauri/target/debug/vct-launcher-temp"
+    # 2. Bundled-in-repo prebuilt (default for end users — sidesteps the
+    #    build-from-source path that was the launch-blocker for users
+    #    without Node + Rust + webkit2gtk-dev). 30 MB committed binaries
+    #    per arch; see launcher/dist/README.md.
+    "$REPO_ROOT/launcher/dist/linux-x64/vct-launcher"
+    # 3. System installs
     "$HOME/.local/share/vct-launcher/vct-launcher"
     "$HOME/.local/bin/vct-launcher"
     "/usr/bin/vct-launcher"
     "/usr/local/bin/vct-launcher"
 )
 candidates_mac=(
+    # Locally built (contributors)
+    "$REPO_ROOT/launcher/src-tauri/target/release/vct-launcher"
+    "$REPO_ROOT/launcher/src-tauri/target/release/vct-launcher-temp"
+    # Bundled experimental prebuilt — empty until macOS is validated end-to-end.
+    "$REPO_ROOT/launcher/dist/experimental_macOS/vct-launcher.app/Contents/MacOS/vct-launcher"
+    "$REPO_ROOT/launcher/dist/experimental_macOS/vct-launcher.app/Contents/MacOS/VCT Launcher"
+    # System installs
     "/Applications/VCT Launcher.app/Contents/MacOS/VCT Launcher"
     "/Applications/VCT Launcher.app/Contents/MacOS/vct-launcher"
     "$HOME/Applications/VCT Launcher.app/Contents/MacOS/VCT Launcher"
