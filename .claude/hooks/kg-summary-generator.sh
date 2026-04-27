@@ -70,7 +70,7 @@ fi
 [ -f "$FILE_PATH" ] || exit 0
 
 # Debounce: skip if we generated for this file in the last 60 seconds
-DEBOUNCE_DIR="/tmp/.kg-summary-debounce"
+DEBOUNCE_DIR="${TMPDIR:-${XDG_RUNTIME_DIR:-/tmp}}/.kg-summary-debounce"
 mkdir -p "$DEBOUNCE_DIR"
 FILE_HASH=$(echo "$FILE_PATH" | md5sum | cut -d' ' -f1)
 STAMP="$DEBOUNCE_DIR/$FILE_HASH"

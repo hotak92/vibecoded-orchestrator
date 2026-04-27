@@ -19,8 +19,8 @@ USER_MESSAGE="$2"
 TOOL_ARGS="$3"
 
 SESSION_ID="${CLAUDE_SESSION_ID:-$(date +%Y%m%d_%H)}"
-SESSION_READS_FILE="/tmp/.claude_reads_${SESSION_ID}"
-BACKUP_DIR="/tmp/.claude_backups"
+SESSION_READS_FILE="${TMPDIR:-${XDG_RUNTIME_DIR:-/tmp}}/.claude_reads_${SESSION_ID}"
+BACKUP_DIR="${TMPDIR:-${XDG_RUNTIME_DIR:-/tmp}}/.claude_backups"
 SECURITY_LOG="$PROJECT_ROOT/.claude/logs/security_events.jsonl"
 
 mkdir -p "$PROJECT_ROOT/.claude/logs"

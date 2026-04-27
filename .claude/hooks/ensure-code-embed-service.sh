@@ -14,7 +14,7 @@ set -euo pipefail
 
 PORT="${CODE_EMBED_PORT:-11440}"
 CONTAINER_NAME="${VCT_CODE_EMBED_CONTAINER:-code_embed}"
-LOCKFILE="/tmp/code_embed_service.lock"
+LOCKFILE="${TMPDIR:-${XDG_RUNTIME_DIR:-/tmp}}/code_embed_service.lock"
 
 # Resolve compose dir relative to the hook's own location
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

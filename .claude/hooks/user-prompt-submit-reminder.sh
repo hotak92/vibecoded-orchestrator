@@ -7,7 +7,7 @@ set -e
 PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
 PROJECT_NAME=$(basename "$PROJECT_DIR")
 CONTEXT_FILE="$PROJECT_DIR/.claude/CONTEXT_STATE.md"
-SESSION_LOG="/tmp/claude-session-$PROJECT_NAME"
+SESSION_LOG="${TMPDIR:-${XDG_RUNTIME_DIR:-/tmp}}/claude-session-$PROJECT_NAME"
 
 # Initialize session tracking
 if [ ! -f "$SESSION_LOG" ]; then
@@ -43,7 +43,7 @@ fi
 
 # Trigger at 200K words (~300K tokens, about 30% of 1M context on Opus)
 if [ "$TOTAL_WORDS" -ge 200000 ]; then
-    MARKER="/tmp/claude-ctx-warn-$PROJECT_NAME"
+    MARKER="${TMPDIR:-${XDG_RUNTIME_DIR:-/tmp}}/claude-ctx-warn-$PROJECT_NAME"
     [ -f "$MARKER" ] && exit 0
 
     echo ""
