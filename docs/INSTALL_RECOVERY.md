@@ -12,14 +12,78 @@ Schema:
 ```json
 {"ts": "2026-04-27T22:00:00Z",
  "actor": "install.py" | "post-install-launcher.sh" | "launcher",
- "step": "1/10" | "build" | "first-spawn" | "wizard-step-N" | ...,
- "phase": "start" | "ok" | "skip" | "error",
- "detail": "human-readable string, never PII"}
+ "step": "1/10" | "build/tauri" | "first-spawn" | "wizard-step-N" | ...,
+ "phase": "start" | "ok" | "skip" | "error" | "warn",
+ "detail": "human-readable string, never PII",
+ "data": { /* optional structured payload, e.g. {"path": "/x", "size_mb": 42} */ }}
 ```
 
-The last "phase":"error" event is usually the cause of the failure. If the
+The last `"phase":"error"` event is usually the cause of the failure. If the
 log shows steps 1-7 ok, build start, build error, no later events — the
 launcher build phase is where to dig.
+
+## Reading the log
+
+**Each line is a complete JSON object.** Parse line-by-line; tolerate
+malformed lines (a writer that crashed mid-write leaves a half-written
+JSON record, which you should skip rather than abort on).
+
+**Common phase patterns:**
+- `start → ok` — step succeeded
+- `start → error` — step failed; this is your failure point
+- `start → skip` — step intentionally skipped (usually optional features
+  like Joern, or `--skip-seed` / `--skip-collections`)
+- `start → warn` — step partially succeeded (e.g. seed step where the KG
+  sync ran but docs upload failed). Non-fatal but worth surfacing.
+- `start` with no terminal phase — the writer crashed mid-step.
+  `read_install_log` reports these in `failed_steps` with detail
+  `"interrupted: ..."` so the wizard offers to re-run them.
+
+**Step IDs you'll see:**
+- `1/10` … `10/10` — main install.py phases (Python → system → venv →
+  deps → services → Ollama → models → collections → seed → state-dir →
+  .env → claude-cli)
+- `2b/10`, `7b/10`, `7c/10` — sub-steps (joern, collection bootstrap,
+  Weaviate seeding)
+- `session` — meta-event: install.py session start/ok markers
+- `script-start`, `audit`, `binary-probe`, `download`, `apt-deps`,
+  `build/deps`, `build/tauri`, `build/locate`, `spawn` — post-install
+  launcher phases
+- `first-spawn`, `wizard-step-N`, `project-register`, ... — launcher
+  runtime events
+
+**Tauri command** (used by the launcher's onboarding wizard + a future
+Settings → Install Diagnostics panel):
+
+```rust
+read_install_log() -> InstallLog {
+    events: Vec<InstallEvent>,
+    state_summary: InstallState {
+        session_started: Option<String>,    // ISO ts of latest session start
+        completed_steps: Vec<String>,       // step IDs that reached "ok"
+        skipped_steps: Vec<String>,         // step IDs that ended at "skip"
+        failed_steps: Vec<(String, String)>, // (step, error_detail)
+        last_event_ts: Option<String>,
+        looks_complete: bool,               // heuristic — needs verification
+    },
+    log_path: String,
+    exists: bool,
+}
+```
+
+`looks_complete` is a hint, not a contract — the wizard MUST still verify
+side effects (venv exists, .env present, Weaviate has the collection
+schema we expect) before declaring a step a no-op. The log is necessary
+but not sufficient.
+
+**Resume behaviour in install.py**:
+On re-run, install.py reads the log and skips steps whose latest phase
+within the most-recent session is `ok` or `skip`. Sessions older than 24
+hours are treated as stale and ignored. The user can disable resume
+entirely with `--no-resume` (forces every step to re-run regardless of
+log state). Even when the log says skip, install.py re-verifies the
+actual side effect (venv-python on disk, schema in Weaviate, etc.)
+before honouring it.
 
 
 

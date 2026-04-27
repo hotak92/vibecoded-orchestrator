@@ -1644,6 +1644,268 @@ async fn detect_python() -> (bool, String, String) {
     (false, String::new(), String::new())
 }
 
+// ---------------------------------------------------------------------------
+// Durable install log reader
+//
+// Both `install.py` and `post-install-launcher.sh` append events to
+// `<repo_root>/state/logs/install.jsonl`. Schema lives in
+// `docs/INSTALL_RECOVERY.md`. The launcher reads this so:
+//  - The first-start wizard can skip steps install.py already covered.
+//  - A future Settings → Install Diagnostics panel can render the timeline
+//    + offer "Re-run from step X" actions.
+//
+// This is intentionally a PULL-only API: the FE invokes `read_install_log`
+// when it wants the current state. Polling/auto-refresh is out of scope
+// for v1.0 — the install log only changes during install + post-install,
+// which is bounded; the wizard reads it once on mount, the diagnostics
+// panel can re-read on user click.
+// ---------------------------------------------------------------------------
+
+/// One event line from `state/logs/install.jsonl`.
+///
+/// `data` is preserved as opaque JSON (not strongly typed) because
+/// different actors emit different shapes and locking the schema in
+/// Rust would force a churn cycle every time install.py adds a field.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct InstallEvent {
+    pub ts: String,
+    pub actor: String,
+    pub step: String,
+    pub phase: String, // "start" | "ok" | "skip" | "error" | "warn"
+    pub detail: String,
+    #[serde(default, skip_serializing_if = "is_null_value")]
+    pub data: serde_json::Value,
+}
+
+fn is_null_value(v: &serde_json::Value) -> bool {
+    v.is_null()
+}
+
+/// Derived state: which steps reached terminal phases, when the last
+/// session started, and a single boolean summarising "looks complete."
+#[derive(Serialize, Debug, Clone)]
+pub struct InstallState {
+    /// ISO-8601 timestamp of the most-recent session-start event, if any.
+    pub session_started: Option<String>,
+    /// step IDs that reached phase=ok in the most-recent session.
+    pub completed_steps: Vec<String>,
+    /// step IDs that ended at phase=skip in the most-recent session.
+    pub skipped_steps: Vec<String>,
+    /// (step, last error detail) pairs for steps whose last phase was "error".
+    pub failed_steps: Vec<(String, String)>,
+    /// ISO-8601 ts of the last event in the file (any actor).
+    pub last_event_ts: Option<String>,
+    /// True iff the install reached a terminal-good state: install.py
+    /// session-ok seen AND post-install build/spawn either ok or skipped
+    /// AND no later "error" events. Heuristic; the wizard uses it to
+    /// decide whether to short-circuit or fall through to per-step
+    /// verification.
+    pub looks_complete: bool,
+}
+
+#[derive(Serialize, Debug, Clone)]
+pub struct InstallLog {
+    pub events: Vec<InstallEvent>,
+    pub state_summary: InstallState,
+    /// Absolute path the log was read from (for display/debug).
+    pub log_path: String,
+    /// True iff the file exists. False → empty events + zeroed state.
+    pub exists: bool,
+}
+
+/// Tauri command: read state/logs/install.jsonl and derive a summary.
+///
+/// On a fresh install (no log yet) returns `exists=false` with empty
+/// events so the FE can render a "no install detected" state. Returns
+/// Err only if we can't even resolve the repo root — the missing log
+/// file itself is a normal case, not an error.
+#[command]
+pub fn read_install_log() -> Result<InstallLog, String> {
+    let root = find_local_repo_root()?;
+    let log_path = root.join("state").join("logs").join("install.jsonl");
+    Ok(read_install_log_from(&log_path))
+}
+
+/// Pure helper: read + parse the log from a specific path. Split out so
+/// tests can drive it with fixture files in a tempdir without needing a
+/// real `vct-module.json` repo root. Returns a structurally-valid
+/// `InstallLog` even on parse errors (corrupt lines are skipped); the
+/// `exists` flag distinguishes "no file" from "file present but empty".
+pub fn read_install_log_from(log_path: &Path) -> InstallLog {
+    let exists = log_path.is_file();
+    let log_path_str = log_path.to_string_lossy().to_string();
+
+    if !exists {
+        return InstallLog {
+            events: Vec::new(),
+            state_summary: empty_install_state(),
+            log_path: log_path_str,
+            exists: false,
+        };
+    }
+
+    let raw = match std::fs::read_to_string(log_path) {
+        Ok(s) => s,
+        Err(_) => {
+            return InstallLog {
+                events: Vec::new(),
+                state_summary: empty_install_state(),
+                log_path: log_path_str,
+                exists: true,
+            };
+        }
+    };
+
+    let mut events: Vec<InstallEvent> = Vec::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(ev) = serde_json::from_str::<InstallEvent>(line) {
+            events.push(ev);
+        }
+        // Silently skip un-parseable lines. The log is append-only and
+        // best-effort; a malformed line means a writer crashed mid-write.
+        // Treating that as an error would cripple recovery on the very
+        // failure modes the log was designed to capture.
+    }
+
+    let state_summary = derive_install_state(&events);
+
+    InstallLog {
+        events,
+        state_summary,
+        log_path: log_path_str,
+        exists: true,
+    }
+}
+
+fn empty_install_state() -> InstallState {
+    InstallState {
+        session_started: None,
+        completed_steps: Vec::new(),
+        skipped_steps: Vec::new(),
+        failed_steps: Vec::new(),
+        last_event_ts: None,
+        looks_complete: false,
+    }
+}
+
+/// Compute the derived state summary from a parsed event vector.
+///
+/// Logic:
+///   1. Find the last "session-start" emitted by install.py (step="1/10",
+///      phase="start", actor="install.py"). Events before that are an
+///      older session and ignored for completed/failed.
+///   2. Walk forward; for each event update a per-step latest-phase map.
+///   3. Bucket into completed/skipped/failed based on the LATEST phase
+///      observed for each step.
+///   4. `looks_complete` = (1) install.py emitted session-ok AND (2) we
+///      saw build/tauri reach ok or skip OR a binary was already located
+///      (binary-probe ok at start) AND (3) no later `error` event in the
+///      session.
+fn derive_install_state(events: &[InstallEvent]) -> InstallState {
+    if events.is_empty() {
+        return empty_install_state();
+    }
+
+    let last_event_ts = events.last().map(|e| e.ts.clone());
+
+    // Find the last install.py session-start (step "1/10" + phase "start"
+    // OR step "session" + phase "start"). We accept either: install.py
+    // emits both as part of its initial flow.
+    let session_start_idx = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| {
+            e.actor == "install.py"
+                && e.phase == "start"
+                && (e.step == "1/10" || e.step == "session")
+        })
+        .map(|(i, _)| i)
+        .next_back();
+
+    let session_start_idx = match session_start_idx {
+        Some(i) => i,
+        // No install.py session anchor — derive what we can from all
+        // events; this happens when the only writer was the bash post-
+        // install script (e.g. user re-ran post-install standalone).
+        None => 0,
+    };
+
+    let session_started = events.get(session_start_idx).map(|e| e.ts.clone());
+
+    // Track latest phase per step within the session.
+    let mut latest_phase: std::collections::BTreeMap<String, (String, String)> =
+        std::collections::BTreeMap::new();
+    let mut session_session_ok = false;
+
+    for ev in &events[session_start_idx..] {
+        // Track the install.py "session ok" terminal marker.
+        if ev.actor == "install.py" && ev.step == "session" && ev.phase == "ok" {
+            session_session_ok = true;
+        }
+        // Skip the session anchor events themselves from the per-step
+        // bucket — they're meta-events, not real install steps.
+        if ev.step == "session" {
+            continue;
+        }
+        latest_phase.insert(ev.step.clone(), (ev.phase.clone(), ev.detail.clone()));
+    }
+
+    let mut completed_steps: Vec<String> = Vec::new();
+    let mut skipped_steps: Vec<String> = Vec::new();
+    let mut failed_steps: Vec<(String, String)> = Vec::new();
+
+    for (step, (phase, detail)) in &latest_phase {
+        match phase.as_str() {
+            "ok" => completed_steps.push(step.clone()),
+            "skip" => skipped_steps.push(step.clone()),
+            "error" => failed_steps.push((step.clone(), detail.clone())),
+            // "start" without a terminal phase = step in progress / crashed
+            // mid-step. We do NOT call this completed; surfacing it as
+            // failed is more accurate for the FE.
+            "start" => failed_steps.push((step.clone(), format!("interrupted: {}", detail))),
+            _ => {} // "warn" + unknown phases: not in any bucket
+        }
+    }
+
+    // Heuristic for `looks_complete`. We want both halves of the install
+    // path: install.py's 10/10 + post-install-launcher's spawn OR a
+    // pre-existing binary. The FE uses this to short-circuit the wizard,
+    // but the per-step verification (file exists, service responds)
+    // still runs — the log signal is necessary, not sufficient.
+    let install_py_done = session_session_ok
+        || latest_phase
+            .get("10/10")
+            .map(|(p, _)| p == "ok" || p == "warn")
+            .unwrap_or(false);
+    let launcher_ready = latest_phase
+        .get("spawn")
+        .map(|(p, _)| p == "ok")
+        .unwrap_or(false)
+        || latest_phase
+            .get("binary-probe")
+            .map(|(p, _)| p == "ok")
+            .unwrap_or(false)
+        || latest_phase
+            .get("build/tauri")
+            .map(|(p, _)| p == "ok")
+            .unwrap_or(false);
+
+    let looks_complete = install_py_done && launcher_ready && failed_steps.is_empty();
+
+    InstallState {
+        session_started,
+        completed_steps,
+        skipped_steps,
+        failed_steps,
+        last_event_ts,
+        looks_complete,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2438,5 +2700,163 @@ MemAvailable:   23456789 kB
             body.contains("container_runtime is not None"),
             "container ops must be guarded by runtime detection"
         );
+    }
+
+    // ─── Install log reader (read_install_log_from + derive_install_state) ─────
+
+    /// Helper: write a JSONL fixture and read it back through the public
+    /// helper. Returns the (parsed-events, derived-summary) pair.
+    fn parse_log_fixture(lines: &[&str]) -> InstallLog {
+        let dir = tmp();
+        let path = dir.join("install.jsonl");
+        let body = lines.join("\n") + "\n";
+        std::fs::write(&path, body).unwrap();
+        let log = read_install_log_from(&path);
+        std::fs::remove_dir_all(&dir).ok();
+        log
+    }
+
+    #[test]
+    fn test_install_log_missing_file() {
+        // No file at the given path: exists=false, summary all-empty,
+        // looks_complete=false. This is the fresh-install case.
+        let dir = tmp();
+        let log = read_install_log_from(&dir.join("nope.jsonl"));
+        assert!(!log.exists);
+        assert!(log.events.is_empty());
+        assert!(log.state_summary.completed_steps.is_empty());
+        assert!(log.state_summary.failed_steps.is_empty());
+        assert!(!log.state_summary.looks_complete);
+        assert!(log.state_summary.session_started.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_install_log_empty_file() {
+        // File exists but no events: same shape as missing, but exists=true.
+        let log = parse_log_fixture(&[]);
+        assert!(log.exists);
+        assert!(log.events.is_empty());
+        assert!(!log.state_summary.looks_complete);
+    }
+
+    #[test]
+    fn test_install_log_full_happy_path() {
+        // Simulate a clean end-to-end install: install.py 1/10..10/10 ok,
+        // session ok, post-install build/tauri ok, spawn ok. Summary
+        // should report all steps completed and looks_complete=true.
+        let log = parse_log_fixture(&[
+            r#"{"ts":"2026-04-27T22:00:00Z","actor":"install.py","step":"1/10","phase":"start","detail":"checking"}"#,
+            r#"{"ts":"2026-04-27T22:00:01Z","actor":"install.py","step":"1/10","phase":"ok","detail":"3.12.4"}"#,
+            r#"{"ts":"2026-04-27T22:00:05Z","actor":"install.py","step":"2/10","phase":"ok","detail":"linux"}"#,
+            r#"{"ts":"2026-04-27T22:00:10Z","actor":"install.py","step":"3/10","phase":"ok","detail":"venv"}"#,
+            r#"{"ts":"2026-04-27T22:00:20Z","actor":"install.py","step":"4/10","phase":"ok","detail":"deps"}"#,
+            r#"{"ts":"2026-04-27T22:00:30Z","actor":"install.py","step":"5/10","phase":"ok","detail":"compose"}"#,
+            r#"{"ts":"2026-04-27T22:00:40Z","actor":"install.py","step":"6/10","phase":"ok","detail":"ollama"}"#,
+            r#"{"ts":"2026-04-27T22:00:50Z","actor":"install.py","step":"7/10","phase":"ok","detail":"models"}"#,
+            r#"{"ts":"2026-04-27T22:00:55Z","actor":"install.py","step":"7b/10","phase":"ok","detail":"collections"}"#,
+            r#"{"ts":"2026-04-27T22:00:58Z","actor":"install.py","step":"7c/10","phase":"ok","detail":"seed"}"#,
+            r#"{"ts":"2026-04-27T22:01:00Z","actor":"install.py","step":"8/10","phase":"ok","detail":"state"}"#,
+            r#"{"ts":"2026-04-27T22:01:01Z","actor":"install.py","step":"9/10","phase":"ok","detail":"env"}"#,
+            r#"{"ts":"2026-04-27T22:01:02Z","actor":"install.py","step":"10/10","phase":"ok","detail":"claude"}"#,
+            r#"{"ts":"2026-04-27T22:01:03Z","actor":"install.py","step":"session","phase":"ok","detail":"finished"}"#,
+            r#"{"ts":"2026-04-27T22:01:10Z","actor":"post-install-launcher.sh","step":"audit","phase":"ok","detail":"audited"}"#,
+            r#"{"ts":"2026-04-27T22:01:30Z","actor":"post-install-launcher.sh","step":"build/tauri","phase":"ok","detail":"built"}"#,
+            r#"{"ts":"2026-04-27T22:01:35Z","actor":"post-install-launcher.sh","step":"spawn","phase":"ok","detail":"launched"}"#,
+        ]);
+
+        assert!(log.exists);
+        assert_eq!(log.events.len(), 17);
+        let s = &log.state_summary;
+        assert!(s.session_started.is_some());
+        assert!(s.last_event_ts.is_some());
+        assert!(s.failed_steps.is_empty());
+        assert!(s.completed_steps.contains(&"10/10".to_string()));
+        assert!(s.completed_steps.contains(&"build/tauri".to_string()));
+        assert!(s.completed_steps.contains(&"spawn".to_string()));
+        assert!(s.looks_complete);
+    }
+
+    #[test]
+    fn test_install_log_failure_at_build() {
+        // install.py completes but post-install build/tauri errors out.
+        // looks_complete must be false, build/tauri must be in failed_steps.
+        let log = parse_log_fixture(&[
+            r#"{"ts":"2026-04-27T22:00:00Z","actor":"install.py","step":"1/10","phase":"start","detail":""}"#,
+            r#"{"ts":"2026-04-27T22:00:01Z","actor":"install.py","step":"1/10","phase":"ok","detail":""}"#,
+            r#"{"ts":"2026-04-27T22:01:03Z","actor":"install.py","step":"session","phase":"ok","detail":"finished"}"#,
+            r#"{"ts":"2026-04-27T22:01:30Z","actor":"post-install-launcher.sh","step":"build/tauri","phase":"start","detail":""}"#,
+            r#"{"ts":"2026-04-27T22:01:31Z","actor":"post-install-launcher.sh","step":"build/tauri","phase":"error","detail":"missing webkit2gtk"}"#,
+        ]);
+        let s = &log.state_summary;
+        assert!(!s.looks_complete);
+        let failed_steps: Vec<&String> = s.failed_steps.iter().map(|(s, _)| s).collect();
+        assert!(failed_steps.contains(&&"build/tauri".to_string()));
+        let build_err = s
+            .failed_steps
+            .iter()
+            .find(|(s, _)| s == "build/tauri")
+            .unwrap()
+            .1
+            .clone();
+        assert!(build_err.contains("webkit2gtk"));
+    }
+
+    #[test]
+    fn test_install_log_skip_classified_correctly() {
+        // skip != ok != error. Make sure skipped_steps catches "skip" only.
+        // Note: 1/10 needs a terminal phase or it would be misclassified as
+        // interrupted. We follow start with ok like a real install.
+        let log = parse_log_fixture(&[
+            r#"{"ts":"2026-04-27T22:00:00Z","actor":"install.py","step":"1/10","phase":"start","detail":""}"#,
+            r#"{"ts":"2026-04-27T22:00:00Z","actor":"install.py","step":"1/10","phase":"ok","detail":""}"#,
+            r#"{"ts":"2026-04-27T22:00:01Z","actor":"install.py","step":"2b/10","phase":"skip","detail":"--no-joern"}"#,
+            r#"{"ts":"2026-04-27T22:00:02Z","actor":"install.py","step":"9/10","phase":"skip","detail":".env preserved"}"#,
+            r#"{"ts":"2026-04-27T22:00:03Z","actor":"install.py","step":"3/10","phase":"ok","detail":"venv"}"#,
+        ]);
+        let s = &log.state_summary;
+        assert!(s.skipped_steps.contains(&"2b/10".to_string()));
+        assert!(s.skipped_steps.contains(&"9/10".to_string()));
+        assert!(s.completed_steps.contains(&"3/10".to_string()));
+        assert!(s.completed_steps.contains(&"1/10".to_string()));
+        assert!(s.failed_steps.is_empty());
+    }
+
+    #[test]
+    fn test_install_log_corrupt_lines_are_skipped() {
+        // Mid-write crashes can leave half a JSON object on a line. The
+        // parser must drop those without bailing on the whole file.
+        let log = parse_log_fixture(&[
+            r#"{"ts":"2026-04-27T22:00:00Z","actor":"install.py","step":"1/10","phase":"start","detail":""}"#,
+            r#"{"ts":"2026-04-27T22:00:01Z","actor":"insta"#, // corrupt
+            r#"{"ts":"2026-04-27T22:00:02Z","actor":"install.py","step":"2/10","phase":"ok","detail":""}"#,
+            r#"not even json"#,
+            r#"{"ts":"2026-04-27T22:00:03Z","actor":"install.py","step":"3/10","phase":"ok","detail":""}"#,
+        ]);
+        // 3 valid records.
+        assert_eq!(log.events.len(), 3);
+        assert!(log.state_summary.completed_steps.contains(&"2/10".to_string()));
+        assert!(log.state_summary.completed_steps.contains(&"3/10".to_string()));
+    }
+
+    #[test]
+    fn test_install_log_interrupted_step() {
+        // A step at "start" with no terminal phase = the writer crashed
+        // mid-step. Must surface as failed (the wizard treats it as a
+        // resume point, not as completed).
+        let log = parse_log_fixture(&[
+            r#"{"ts":"2026-04-27T22:00:00Z","actor":"install.py","step":"1/10","phase":"start","detail":""}"#,
+            r#"{"ts":"2026-04-27T22:00:01Z","actor":"install.py","step":"1/10","phase":"ok","detail":""}"#,
+            r#"{"ts":"2026-04-27T22:00:30Z","actor":"install.py","step":"5/10","phase":"start","detail":"compose up"}"#,
+        ]);
+        let s = &log.state_summary;
+        let failed: Vec<&String> = s.failed_steps.iter().map(|(s, _)| s).collect();
+        assert!(failed.contains(&&"5/10".to_string()));
+        assert!(s
+            .failed_steps
+            .iter()
+            .find(|(s, _)| s == "5/10")
+            .map(|(_, d)| d.starts_with("interrupted:"))
+            .unwrap_or(false));
     }
 }
