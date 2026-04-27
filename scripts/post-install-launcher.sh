@@ -118,7 +118,6 @@ _check_prerequisites() {
     command -v curl    >/dev/null 2>&1 && HAS_CURL=1
     command -v wget    >/dev/null 2>&1 && HAS_WGET=1
     command -v python3 >/dev/null 2>&1 && HAS_PYTHON3=1
-    command -v node    >/dev/null 2>&1 && HAS_NODE=1
     # Use `command -v <tool>` AND require it to resolve to a real PATH
     # binary, not a shell function or alias. Some users have `pnpm` defined
     # as a corepack-style bash function in their interactive rc files; that
@@ -137,8 +136,60 @@ _check_prerequisites() {
             *) return 1 ;;
         esac
     }
-    _resolves_to_binary pnpm    && HAS_PNPM=1
-    _resolves_to_binary npm     && HAS_NPM=1
+    # When `command -v` finds only a function/alias (not a real binary),
+    # probe known-binary locations and prepend the first match to PATH so
+    # the function wrapper is bypassed for our subsequent calls. Covers
+    # users with fnm/nvm/lean-ctx wrappers around node/npm that point at
+    # genuinely-installed binaries the wrapper just can't be invoked from
+    # a non-interactive subshell context.
+    _ensure_path_for_tool() {
+        local tool="$1"; shift
+        if _resolves_to_binary "$tool"; then
+            return 0
+        fi
+        local cand
+        for cand in "$@"; do
+            if [ -x "$cand" ]; then
+                # Symlink resolution (fnm uses ~/.local/bin/node ->
+                # ~/.fnm/...; we want the real dir on PATH so its sibling
+                # binaries are also picked up).
+                local real
+                real="$(readlink -f "$cand" 2>/dev/null || echo "$cand")"
+                local real_dir
+                real_dir="$(dirname "$real")"
+                if [ -d "$real_dir" ]; then
+                    case ":$PATH:" in
+                        *":$real_dir:"*) ;;
+                        *) export PATH="$real_dir:$PATH" ;;
+                    esac
+                    if _resolves_to_binary "$tool"; then
+                        return 0
+                    fi
+                fi
+            fi
+        done
+        return 1
+    }
+    _ensure_path_for_tool node \
+        "$HOME/.local/bin/node" \
+        "$HOME/.fnm/aliases/default/bin/node" \
+        "$HOME/.nvm/versions/node/*/bin/node" \
+        "/usr/local/bin/node" \
+        "/usr/bin/node" \
+        && HAS_NODE=1
+    _ensure_path_for_tool npm \
+        "$HOME/.local/bin/npm" \
+        "$HOME/.fnm/aliases/default/bin/npm" \
+        "$HOME/.nvm/versions/node/*/bin/npm" \
+        "/usr/local/bin/npm" \
+        "/usr/bin/npm" \
+        && HAS_NPM=1
+    _ensure_path_for_tool pnpm \
+        "$HOME/.local/bin/pnpm" \
+        "$HOME/.local/share/pnpm/pnpm" \
+        "/usr/local/bin/pnpm" \
+        "/usr/bin/pnpm" \
+        && HAS_PNPM=1
     command -v brew    >/dev/null 2>&1 && HAS_BREW=1
     command -v sudo    >/dev/null 2>&1 && HAS_SUDO=1
     command -v hdiutil >/dev/null 2>&1 && HAS_HDIUTIL=1
@@ -703,8 +754,50 @@ fi
 
 # ----- Step 5: auto-launch (unless --no-auto-launch) --------------------------
 if [ -z "$LAUNCHER_BIN" ]; then
+    # Final fallback. Every auto-install path either failed or was
+    # declined. Tell the user explicitly, and offer the smartest
+    # recovery option vco itself enables: "open Claude Code in this
+    # repo and ask it to fix the install." That's literally what the
+    # orchestrator is for, and the user already has Claude Code (it's
+    # the install.py:[10/10] check that runs before we get here).
     echo ""
-    echo "[launcher] No binary available. Run start-launcher.sh after building manually."
+    echo "==============================================="
+    echo "  Launcher build did not complete"
+    echo "==============================================="
+    echo ""
+    echo "  Manual build (when you've installed the missing prereqs):"
+    echo "    cd $REPO_ROOT/launcher"
+    echo "    pnpm install     # or: npm install"
+    echo "    pnpm tauri build # or: npx tauri build"
+    echo "    cd $REPO_ROOT && ./start-launcher.sh"
+    echo ""
+    echo "  Detailed recovery doc (humans + Claude both read this):"
+    echo "    $REPO_ROOT/docs/INSTALL_RECOVERY.md"
+    echo ""
+    echo "  Stuck? Let Claude Code diagnose this for you:"
+    echo "    cd $REPO_ROOT"
+    echo "    claude   # opens Claude Code in this repo"
+    echo ""
+    echo "  Then paste this exact prompt to Claude:"
+    echo "    -------- COPY BELOW --------"
+    echo "    Read docs/INSTALL_RECOVERY.md and follow it. The launcher"
+    echo "    build did not complete during first-install. The launcher"
+    echo "    is the GUI for managing projects, services, hooks, RL"
+    echo "    retrieval, the knowledge graph dashboard, and the audit log"
+    echo "    — without it the user loses the project wizard, KG/codegraph"
+    echo "    visualizations, hook toggles, and module install flow."
+    echo "    DO NOT just skip the launcher build or tell me to do it"
+    echo "    manually. Find why the build failed (missing prereqs, system"
+    echo "    deps, perms, fnm/lean-ctx wrappers) and ACTUALLY install/fix"
+    echo "    what's needed, then run pnpm tauri build (or npm + npx tauri)"
+    echo "    until I have a working binary at launcher/src-tauri/target/"
+    echo "    release/. After that, run ./start-launcher.sh and confirm"
+    echo "    the launcher window opens."
+    echo "    -------- COPY ABOVE --------"
+    echo ""
+    echo "  The repo's own knowledge graph + hooks give Claude full"
+    echo "  context to debug your specific machine. That's why vco exists."
+    echo ""
     exit 0
 fi
 

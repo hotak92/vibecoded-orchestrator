@@ -326,12 +326,43 @@ goto :auto_launch
 
 :launch_skip
 echo.
-echo [launcher] Launcher build was skipped or failed.
-echo [launcher] To build later, open a terminal in the repo root and run:
-echo            cd launcher
-echo            pnpm install ^(or npm install^)
-echo            pnpm tauri build
-echo            ..\start-launcher.bat
+echo ===============================================
+echo   Launcher build did not complete
+echo ===============================================
+echo.
+echo   Manual build (when you've installed the missing prereqs):
+echo     cd %~dp0launcher
+echo     pnpm install     ^(or npm install^)
+echo     pnpm tauri build ^(or npx tauri build^)
+echo     cd %~dp0
+echo     start-launcher.bat
+echo.
+echo   Detailed recovery doc (humans + Claude both read this):
+echo     %~dp0docs\INSTALL_RECOVERY.md
+echo.
+echo   Stuck? Let Claude Code diagnose this for you:
+echo     cd %~dp0
+echo     claude    ^(opens Claude Code in this repo^)
+echo.
+echo   Then paste this exact prompt to Claude:
+echo     -------- COPY BELOW --------
+echo     Read docs\INSTALL_RECOVERY.md and follow it. The launcher
+echo     build did not complete during first-install. The launcher
+echo     is the GUI for managing projects, services, hooks, RL
+echo     retrieval, the knowledge graph dashboard, and the audit log
+echo     - without it the user loses the project wizard, KG/codegraph
+echo     visualizations, hook toggles, and module install flow.
+echo     DO NOT just skip the launcher build or tell me to do it
+echo     manually. Find why the build failed (missing prereqs, system
+echo     deps, perms, Visual Studio Build Tools, WebView2, Rust) and
+echo     ACTUALLY install/fix what's needed, then run pnpm tauri build
+echo     (or npm + npx tauri) until I have a working binary at
+echo     launcher\src-tauri\target\release\. After that, run
+echo     start-launcher.bat and confirm the launcher window opens.
+echo     -------- COPY ABOVE --------
+echo.
+echo   The repo's own knowledge graph + hooks give Claude full
+echo   context to debug your specific machine. That's why vco exists.
 echo.
 goto :end
 
