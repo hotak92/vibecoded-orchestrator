@@ -140,13 +140,21 @@ pub async fn runtime_install_podman_linux(app: AppHandle) -> Result<(), String> 
         return Err(msg);
     }
 
-    // Build the pkexec command: `pkexec <pkg_mgr> <args...>`. pkexec
-    // shows the GNOME/KDE auth dialog automatically when run from a GUI
-    // session — we DO NOT spawn an interactive terminal. apt-get also
-    // needs an `update` first on stale Debian/Ubuntu boxes, but a fresh
-    // first install of podman doesn't require it (the package list ships
-    // with the system). Skip the update for simplicity; if it fails we
-    // surface the error and the user can run apt update from terminal.
+    // Build the pkexec command: `pkexec /usr/bin/env DEBIAN_FRONTEND=noninteractive
+    // <pkg_mgr> <args...>`. pkexec shows the GNOME/KDE auth dialog automatically
+    // when run from a GUI session — we DO NOT spawn an interactive terminal.
+    //
+    // Why the /usr/bin/env wrapper: pkexec strips most environment variables
+    // by default for security. Without `DEBIAN_FRONTEND=noninteractive`,
+    // apt-get can hang on interactive prompts that never reach our piped
+    // stdin (e.g. "do you want to continue [Y/n]?"). The /usr/bin/env hop
+    // is the canonical Debian/polkit pattern for forwarding env vars
+    // through pkexec. dnf/pacman don't strictly need a frontend var, but
+    // the wrapper is harmless there and keeps PATH propagation consistent.
+    //
+    // apt-get also needs an `update` first on stale Debian/Ubuntu boxes,
+    // but a fresh first install of podman doesn't require it (the package
+    // list ships with the system). Skip the update for simplicity.
     let _ = app.emit(
         EVT_INSTALL_PROGRESS,
         InstallProgress {
@@ -156,6 +164,9 @@ pub async fn runtime_install_podman_linux(app: AppHandle) -> Result<(), String> 
     );
 
     let mut cmd = TokioCommand::new("pkexec");
+    // Wrap in /usr/bin/env so DEBIAN_FRONTEND survives pkexec's env strip.
+    cmd.arg("/usr/bin/env");
+    cmd.arg("DEBIAN_FRONTEND=noninteractive");
     cmd.arg(pkg_mgr);
     for a in &args {
         cmd.arg(a);

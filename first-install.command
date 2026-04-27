@@ -22,6 +22,17 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# First-run quarantine note: if Gatekeeper just whitelisted us via right-click
+# → Open, the com.apple.quarantine xattr is still present. Future runs will
+# have it cleared, so this is the user's signal that the warning is expected
+# only on the very first run. We can't strip it ourselves (the OS would have
+# already blocked us) — only document it.
+if xattr -p com.apple.quarantine "$0" 2>/dev/null | grep -q .; then
+    echo "Note: macOS Gatekeeper just allowed this script. Future runs will work normally."
+    echo "      (If you saw 'developer cannot be verified' and right-clicked → Open, that's why.)"
+    echo ""
+fi
+
 echo "==============================================="
 echo "  VibeCoded Tools — First-Time Installer (macOS)"
 echo "==============================================="
@@ -43,15 +54,42 @@ if [ ! -f "$SCRIPT_DIR/install.sh" ]; then
     exit 1
 fi
 
-# Forward all arguments — Finder won't pass any (it doesn't have a way
-# to), but Terminal-launched runs ($./first-install.command --no-gpu-check)
-# do.
-"$SCRIPT_DIR/install.sh" "$@"
+# Sniff for our own flags before forwarding (see first-install.sh for the
+# rationale; same logic here).
+NO_AUTO_LAUNCH=0
+HELPER_FLAGS=()
+for arg in "$@"; do
+    case "$arg" in
+        --no-auto-launch) NO_AUTO_LAUNCH=1 ;;
+        --yes|--non-interactive|--quiet) HELPER_FLAGS+=("--yes") ;;
+    esac
+done
+if [ $NO_AUTO_LAUNCH -eq 1 ]; then
+    HELPER_FLAGS+=("--no-auto-launch")
+fi
+
+INSTALL_ARGS=()
+for arg in "$@"; do
+    case "$arg" in
+        --no-auto-launch) ;;
+        *) INSTALL_ARGS+=("$arg") ;;
+    esac
+done
+
+# Forward all install args — Finder won't pass any, but Terminal-launched
+# runs ($./first-install.command --no-gpu-check) do.
+"$SCRIPT_DIR/install.sh" "${INSTALL_ARGS[@]}"
 status=$?
 
 echo ""
 if [ $status -eq 0 ]; then
-    echo "Install complete. To start the launcher: ./start-launcher.command"
+    # Same launcher-bootstrap helper as Linux. It detects macOS via $OSTYPE
+    # and uses .app bundle paths + hdiutil for DMG mounts.
+    if [ -x "$SCRIPT_DIR/scripts/post-install-launcher.sh" ]; then
+        "$SCRIPT_DIR/scripts/post-install-launcher.sh" "$SCRIPT_DIR" "${HELPER_FLAGS[@]}" || true
+    else
+        echo "Install complete. To start the launcher: ./start-launcher.command"
+    fi
 else
     echo "Install failed (exit $status). See messages above."
 fi
@@ -65,8 +103,7 @@ fi
 exit $status
 
 # TODO(post-v1.0): after install.sh succeeds, also:
-#   - Build/install the Tauri launcher .app bundle into /Applications.
-#   - Use osascript for a native progress dialog during long steps:
-#       osascript -e 'display dialog "Installing VibeCoded Tools…" buttons {} giving up after 1'
 #   - Codesign the .app bundle (ad-hoc signing OK for v1.0; notarized
 #     signing for v1.1+).
+#   - Use osascript for a native progress dialog during long steps:
+#       osascript -e 'display dialog "Installing VibeCoded Tools…" buttons {} giving up after 1'
