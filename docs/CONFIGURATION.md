@@ -86,3 +86,22 @@ With this on, asking the orchestrator to refactor 30 files or analyze 5 director
 
 This is the only global env var worth setting; everything else is per-project.
 
+## Manual operator scripts
+
+Two helper scripts under `claude_mcp_servers/scripts/` are not wired into the
+default workflow but are kept available for operators upgrading older
+installations:
+
+- **`migrate_to_new_embeddings.py`** — One-shot migration that adds new named
+  vectors (qwen3_embed for KG, codesage_embed for code) to Weaviate
+  collections alongside any legacy named vectors (ollama_embed,
+  ollama_code_embed). Preserves all existing data; only adds the new vector
+  slots and backfills them. Run manually after upgrading the embedding
+  models referenced in the MCP configuration.
+
+- **`generate_node_formats.py`** — Manual `--all` backfill that regenerates
+  per-node descriptions / summaries in `knowledge/.node_formats.json`.
+  Normally produced incrementally by the kg-summary-generator hook on edit;
+  use this script when you want to rebuild the cache from scratch (for
+  example after a bulk import or a node-format schema change).
+

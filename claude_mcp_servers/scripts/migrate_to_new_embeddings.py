@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Manual migration tool — see docs/CONFIGURATION.md
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
 """

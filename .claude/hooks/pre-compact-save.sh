@@ -1,6 +1,7 @@
 #!/bin/bash
 # Scrub sensitive env vars before any subprocess spawning
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
+[ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
 # pre-compact-save.sh
 # Fires BEFORE auto context compaction (PreCompact event, matcher: "auto").
 # Saves a snapshot of current working state to disk so compact-context-reinject.sh

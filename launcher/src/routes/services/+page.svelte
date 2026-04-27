@@ -26,7 +26,21 @@
     message: string;
   }
 
+  // services.toml-backed adoption config (read-only mirror of `services_get_adoption`).
+  // Useful for "why is this service routed externally?" diagnostics; the per-row
+  // `adoption_mode` on the snapshot is the runtime-classified value used for UI.
+  interface ServiceAdoptionConfig {
+    name: string;
+    mode: string;
+    external_url?: string | null;
+    parallel_port?: number | null;
+  }
+  interface AdoptionState {
+    services: ServiceAdoptionConfig[];
+  }
+
   let snapshot = $state<ServicesRuntimeSnapshot | null>(null);
+  let adoptionConfig = $state<AdoptionState | null>(null);
   let loading = $state(false);
   let error = $state<string | null>(null);
   let progress = $state<LifecycleProgress | null>(null);
@@ -135,6 +149,14 @@
 
   onMount(async () => {
     await refresh();
+    // Mirror the on-disk adoption config for diagnostics. Failures are
+    // non-fatal — the snapshot already drives the UI.
+    try {
+      adoptionConfig = await invoke<AdoptionState>('services_get_adoption');
+    } catch (e) {
+      // Soft-fail: log to console only; this is a diagnostics fetch.
+      console.warn('services_get_adoption failed:', e);
+    }
     pollerHandle = setInterval(refresh, 5000);
     unlistenProgress = await listen<LifecycleProgress>(
       'vct-services-lifecycle',
@@ -237,7 +259,13 @@
               {/if}
             </td>
             <td>{svc.port}</td>
-            <td class="mode-cell">{svc.adoption_mode}</td>
+            <td
+              class="mode-cell"
+              title={
+                adoptionConfig?.services.find((a) => a.name === svc.name)
+                  ?.external_url ?? ''
+              }
+            >{svc.adoption_mode}</td>
             <td class="actions-cell">
               <button
                 onclick={() => startOne(svc.name)}

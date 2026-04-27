@@ -15,6 +15,11 @@ use crate::types::{AppStatus, HealthStatus, LaunchConfig, ServiceEntry};
 
 /// Launch an app subprocess. Returns PID on success.
 /// Emits "app_status_changed" event when status transitions.
+///
+/// Removed from invoke_handler 2026-04-27 — zero FE/Hub consumers. Retained
+/// under #[allow(dead_code)] for the launch_app suite (launch/kill/status/
+/// health) until a packaged-app launcher is reintroduced.
+#[allow(dead_code)]
 #[command]
 pub async fn launch_app(
     config: LaunchConfig,
@@ -102,6 +107,7 @@ pub async fn launch_app(
 }
 
 /// Gracefully kill a running app.
+#[allow(dead_code)]
 #[command]
 pub async fn kill_app(
     app_id: String,
@@ -132,6 +138,7 @@ pub async fn kill_app(
 
 /// Get current status of a single app.
 /// Checks if the process is still alive (crash detection).
+#[allow(dead_code)]
 #[command]
 pub fn get_app_status(app_id: String, state: State<'_, AppManager>) -> ServiceEntry {
     let mut guard = state.0.lock().unwrap();
@@ -171,6 +178,7 @@ pub fn get_app_status(app_id: String, state: State<'_, AppManager>) -> ServiceEn
 }
 
 /// Get status of ALL apps tracked in the registry.
+#[allow(dead_code)]
 #[command]
 pub fn get_all_app_statuses(state: State<'_, AppManager>) -> Vec<ServiceEntry> {
     let mut guard = state.0.lock().unwrap();
@@ -191,6 +199,7 @@ pub fn get_all_app_statuses(state: State<'_, AppManager>) -> Vec<ServiceEntry> {
 }
 
 /// HTTP health check against a running app's /health endpoint (3s timeout).
+#[allow(dead_code)]
 #[command]
 pub async fn check_app_health(app_id: String, health_url: String) -> HealthStatus {
     let start = std::time::Instant::now();
@@ -232,6 +241,7 @@ pub async fn check_app_health(app_id: String, health_url: String) -> HealthStatu
 }
 
 /// Ping health endpoints of ALL running apps in parallel.
+#[allow(dead_code)]
 #[command]
 pub async fn check_all_health(state: State<'_, AppManager>) -> Result<Vec<HealthStatus>, String> {
     let entries: Vec<ServiceEntry> = {

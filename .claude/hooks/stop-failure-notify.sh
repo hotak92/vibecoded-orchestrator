@@ -1,6 +1,7 @@
 #!/bin/bash
 # Scrub sensitive env vars before any subprocess spawning
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
+[ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
 # stop-failure-notify.sh
 # Fires on StopFailure event — when a turn ends due to API error (rate limit, auth failure, etc).
 # Sends urgent desktop notification and logs the failure.
