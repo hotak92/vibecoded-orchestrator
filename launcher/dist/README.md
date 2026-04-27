@@ -68,6 +68,37 @@ xattr -cr launcher/dist/experimental_macOS/vct-launcher.app
 This path is **experimental until vco has tested macOS end-to-end**. Use at
 your own risk; file an issue if it fails to launch.
 
+## Versioning metadata
+
+Every bundled binary ships with a `<binary>.metadata.json` sidecar containing
+the source SHA, build timestamp, and a content hash of the launcher subtree
+(`launcher/src-tauri/src/`, `launcher/src/`, `Cargo.{toml,lock}`,
+`package.json`). Schema:
+
+```json
+{
+  "source_sha":         "501cd831c9d1...",   // git rev-parse HEAD at build time
+  "source_short_sha":   "501cd83",
+  "source_hash":        "b150d4b6...",       // git ls-tree hash of the launcher subtree
+  "built_at":           "2026-04-28T00:53:35Z",
+  "launcher_version":   "0.1.0",
+  "host_target":        "linux-x64",
+  "binary_name":        "vct-launcher",
+  "binary_size_bytes":  31435576
+}
+```
+
+`post-install-launcher.sh` reads the metadata at install time. If
+`source_hash` doesn't match the current clone's launcher subtree hash, the
+bundled binary is treated as stale (= built from older sources) and the
+install falls through to the download/build path. This prevents the regression
+where a bundled binary was missing commands the source already advertises (a
+real bug from 2026-04-28: bundled binary lacked `detect_existing_install_root`
+even though the source had it).
+
+To regenerate metadata after a rebuild, use `scripts/build-bundled-launcher.sh`
+— it writes both the binary and the sidecar atomically.
+
 ## Updating the bundled binaries
 
 Maintainers cutting a vco release should rebuild + restage all platform
