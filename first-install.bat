@@ -288,12 +288,15 @@ if %ERRORLEVEL% EQU 0 (
     echo [launcher] [3/4] pnpm install
     call pnpm install
     echo [launcher] [4/4] tauri build ^(this takes 5-15 min^)
-    call pnpm tauri build
+    REM --no-bundle: skip MSI packaging. End users only need the .exe;
+    REM the bundle step needs WiX which often isn't installed. See
+    REM post-install-launcher.sh for the same rationale.
+    call pnpm tauri build --no-bundle
 ) else (
     echo [launcher] [3/4] npm install
     call npm install
     echo [launcher] [4/4] tauri build ^(this takes 5-15 min^)
-    call npx tauri build
+    call npx tauri build --no-bundle
 )
 cd /d "%~dp0"
 

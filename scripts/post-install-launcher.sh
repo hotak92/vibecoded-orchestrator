@@ -742,29 +742,42 @@ PY
         if [ "$OS" = "linux" ]; then
             case "$PKGMGR" in
                 apt|apt-get)
-                    if ! dpkg -s libwebkit2gtk-4.1-dev >/dev/null 2>&1; then
-                        deps_pkgs=(libwebkit2gtk-4.1-dev libgtk-3-dev \
-                                   libayatana-appindicator3-dev librsvg2-dev \
-                                   libsoup-3.0-dev libjavascriptcoregtk-4.1-dev \
-                                   build-essential curl wget file)
+                    deps_pkgs=(libwebkit2gtk-4.1-dev libgtk-3-dev \
+                               libayatana-appindicator3-dev librsvg2-dev \
+                               libsoup-3.0-dev libjavascriptcoregtk-4.1-dev \
+                               build-essential curl wget file)
+                    # Check EACH dep, not just webkit2gtk. Earlier code
+                    # used webkit2gtk as a sentinel — but a system that
+                    # had webkit2gtk-dev (e.g. from a prior Electron
+                    # build) but lacked appindicator-dev would silently
+                    # skip the install and hit a "Can't detect any
+                    # appindicator library" panic during tauri build's
+                    # bundle step. Now we audit every package and only
+                    # install missing ones.
+                    missing_deps=()
+                    for p in "${deps_pkgs[@]}"; do
+                        dpkg -s "$p" >/dev/null 2>&1 || missing_deps+=("$p")
+                    done
+                    if [ "${#missing_deps[@]}" -gt 0 ]; then
+                        echo "[launcher] Missing Tauri Linux deps: ${missing_deps[*]}"
                         installed_deps=0
                         if [ "$YES" -eq 1 ]; then
-                            echo "[launcher] T1 silent: installing Tauri Linux build deps (apt --yes)"
+                            echo "[launcher] T1 silent: installing missing Tauri deps (apt --yes)"
                             _maybe_sudo apt-get update && \
-                                _maybe_sudo apt-get install -y "${deps_pkgs[@]}" && installed_deps=1
+                                _maybe_sudo apt-get install -y "${missing_deps[@]}" && installed_deps=1
                         elif [ -t 0 ]; then
-                            echo "[launcher] Tauri build needs system packages: webkit2gtk + gtk3 + ..."
-                            read -r -p "Install Tauri build deps via apt? [Y/n] " ans || ans="Y"
+                            echo "[launcher] Tauri build needs system packages."
+                            read -r -p "Install missing deps via apt? [Y/n] " ans || ans="Y"
                             case "${ans:-Y}" in
                                 ""|y|Y|yes|YES)
                                     _maybe_sudo apt-get update && \
-                                        _maybe_sudo apt-get install "${deps_pkgs[@]}" && installed_deps=1
+                                        _maybe_sudo apt-get install "${missing_deps[@]}" && installed_deps=1
                                     ;;
                             esac
                         fi
                         if [ $installed_deps -eq 0 ]; then
                             echo "[launcher] T4: deps not installed. Build will likely fail."
-                            echo "           Manual: sudo apt install ${deps_pkgs[*]}"
+                            echo "           Manual: sudo apt install ${missing_deps[*]}"
                         fi
                     fi
                     ;;
@@ -792,10 +805,20 @@ PY
 
     if [ "$MODE" = "build" ]; then
         echo "[launcher] [4/4] tauri build (this takes 5-15 min)"
+        # `--no-bundle`: skip the DEB/RPM/AppImage/DMG/MSI packaging step.
+        # End users only need the executable binary at
+        # target/release/vct-launcher* — they're not redistributing the
+        # app, so building installer bundles wastes time AND requires
+        # extra system deps like libayatana-appindicator3-dev (DEB),
+        # rpmbuild (RPM), etc. that often aren't installed. The bundling
+        # step has nothing to do with the launcher *running* — it's
+        # solely about producing redistributable artifacts. Maintainers
+        # who do want bundles can run `pnpm tauri build` (no flag) in
+        # launcher/ themselves.
         if [ "$PKG_MGR" = "pnpm" ]; then
-            pnpm tauri build || { echo "[launcher] tauri build failed."; MODE="skip"; }
+            pnpm tauri build --no-bundle || { echo "[launcher] tauri build failed."; MODE="skip"; }
         else
-            npx tauri build || { echo "[launcher] tauri build failed."; MODE="skip"; }
+            npx tauri build --no-bundle || { echo "[launcher] tauri build failed."; MODE="skip"; }
         fi
         cd - >/dev/null || true
 
