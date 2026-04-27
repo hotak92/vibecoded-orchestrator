@@ -214,6 +214,10 @@ pub fn run() {
             commands::installer::install_orchestrator,
             commands::installer::preview_install,
             commands::installer::detect_existing_install_root,
+            // Durable install log reader. Backs the OnboardingWizard's
+            // skip-if-installed path + a future Settings → Install
+            // Diagnostics panel. Pull-only: the FE invokes on demand.
+            commands::installer::read_install_log,
             // TODO(safety): wire preflight_install_safety_check to the
             //   OnboardingWizard's confirm-step. Currently `preview_install`
             //   covers the diff-mode path; preflight returns the richer

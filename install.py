@@ -153,6 +153,229 @@ class SystemInfo(NamedTuple):
 
 
 # ---------------------------------------------------------------------------
+# Durable install log (state/logs/install.jsonl)
+#
+# Append-only JSONL written by both install.py and post-install-launcher.sh.
+# Both the launcher (Tauri command read_install_log) and Claude Code read
+# this file on failure to figure out where the install got to. See
+# docs/INSTALL_RECOVERY.md for the schema.
+#
+# Design constraints:
+#   - Stdlib only (json/datetime/os/pathlib). install.py runs in the system
+#     Python BEFORE the venv exists for the early steps, so we can't depend
+#     on anything from requirements.txt here.
+#   - Never throw. A logging failure (disk full, permission denied, dir
+#     missing) must NEVER break the install — silent skip is the contract.
+#   - Atomic per-line writes. JSON is well under typical OS atomic-write
+#     thresholds (~4096 bytes), so a single open(..., "a") + write+flush is
+#     safe across normal filesystems. Two writers (install.py + the bash
+#     post-install script) never run concurrently in practice — bash spawns
+#     after install.py exits — so we don't need a file lock.
+# ---------------------------------------------------------------------------
+
+# Resume state, populated by _load_resume_state() at start of main().
+# Maps step-id -> last terminal phase ("ok" | "skip" | "error" | "warn") seen
+# in the most-recent install session. Only "ok"/"skip" steps qualify as
+# candidates for skip-on-resume; the per-step verification still runs.
+_RESUME_STATE: dict[str, str] = {}
+_RESUME_ENABLED: bool = True
+
+# In-memory buffer for events emitted BEFORE Step 8 creates state/logs/.
+# Without this, every fresh install loses Steps 1-7 because the log path
+# isn't viable yet. _flush_pending_events() drains this in Step 8 once the
+# directory exists. Bounded only by the install length (~10s of entries),
+# so no eviction needed.
+_PENDING_EVENTS: list[str] = []
+
+
+def _install_log_path() -> Path | None:
+    """Return path to state/logs/install.jsonl iff the dir exists.
+
+    We deliberately do NOT auto-create state/logs/ here — Step 8 (state
+    directory creation) is the single owner of that mkdir. Logging before
+    Step 8 buffers in memory; Step 8 flushes the buffer to disk.
+    """
+    log_dir = PROJECT_ROOT / "state" / "logs"
+    if not log_dir.is_dir():
+        return None
+    return log_dir / "install.jsonl"
+
+
+def _log_install_event(step: str, phase: str, detail: str = "",
+                       data: dict | None = None,
+                       actor: str = "install.py") -> None:
+    """Append one event to state/logs/install.jsonl. Never raises.
+
+    If the log directory doesn't exist yet (pre-Step-8), the event is
+    buffered in `_PENDING_EVENTS` and flushed once Step 8 creates the
+    directory. This means events from Steps 1-7 of a FRESH install land
+    in the file too, instead of being lost.
+    """
+    try:
+        ts = _utc_iso_now()
+        record = {
+            "ts": ts,
+            "actor": actor,
+            "step": step,
+            "phase": phase,
+            "detail": detail or "",
+        }
+        if data:
+            # Best-effort: drop unserializable values rather than fail.
+            try:
+                json.dumps(data)
+                record["data"] = data
+            except (TypeError, ValueError):
+                pass
+        line = json.dumps(record, ensure_ascii=True) + "\n"
+
+        path = _install_log_path()
+        if path is None:
+            # Buffer until Step 8 creates the dir. Bounded buffer size
+            # (a runaway install would fill memory but not crash).
+            if len(_PENDING_EVENTS) < 500:
+                _PENDING_EVENTS.append(line)
+            return
+
+        # Drain pending events first so they appear in chronological order
+        # alongside the current event. This is the normal case once Step 8
+        # has run; the buffer is empty so it's a no-op.
+        if _PENDING_EVENTS:
+            _drain_pending_events(path)
+
+        with path.open("a", encoding="utf-8") as f:
+            f.write(line)
+            f.flush()
+    except Exception:
+        # Per the contract: NEVER let a log failure break the install.
+        pass
+
+
+def _drain_pending_events(path: Path) -> None:
+    """Write any pre-Step-8 buffered events to the log file.
+
+    Called automatically from `_log_install_event` once the log dir is
+    available, AND explicitly from `_create_state_directory` so the
+    buffer drains even if the next event happens to fail to log.
+    """
+    if not _PENDING_EVENTS:
+        return
+    try:
+        with path.open("a", encoding="utf-8") as f:
+            for buffered_line in _PENDING_EVENTS:
+                f.write(buffered_line)
+            f.flush()
+        _PENDING_EVENTS.clear()
+    except Exception:
+        # If draining fails (disk full, perm denied), keep the buffer so
+        # a later event has another shot. Bounded above so memory is safe.
+        pass
+
+
+def _utc_iso_now() -> str:
+    """ISO-8601 UTC timestamp with second precision, Z suffix."""
+    # datetime.now(tz=...) avoids the deprecated utcnow().
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _load_resume_state() -> dict[str, str]:
+    """Parse state/logs/install.jsonl and return {step: last_phase} for the
+    most-recent install session that's no older than 24 hours.
+
+    A "session" begins with `actor=install.py, step=1/10, phase=start`.
+    Only events from the *latest* session are considered. Sessions older
+    than 24h are treated as stale and ignored entirely. Any later "error"
+    on a step within the same session demotes that step out of the
+    skip-eligible set (we set its last_phase = "error" so the caller will
+    re-run it).
+    """
+    path = _install_log_path()
+    if path is None or not path.is_file():
+        return {}
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+
+    events: list[dict] = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(obj, dict):
+            events.append(obj)
+
+    if not events:
+        return {}
+
+    # Find the index of the most-recent session start.
+    last_session_start = -1
+    for i, ev in enumerate(events):
+        if (ev.get("actor") == "install.py"
+                and ev.get("step") == "1/10"
+                and ev.get("phase") == "start"):
+            last_session_start = i
+    if last_session_start < 0:
+        return {}
+
+    session_events = events[last_session_start:]
+
+    # Stale-session check (>24h).
+    start_ts = session_events[0].get("ts", "")
+    if start_ts:
+        from datetime import datetime, timezone, timedelta
+        try:
+            # Strip trailing 'Z' for fromisoformat (3.11 supports Z; we
+            # accept both for portability with older ts strings).
+            ts_clean = start_ts.replace("Z", "+00:00")
+            start_dt = datetime.fromisoformat(ts_clean)
+            now = datetime.now(timezone.utc)
+            if now - start_dt > timedelta(hours=24):
+                return {}
+        except (ValueError, TypeError):
+            # Unparseable timestamp → treat as stale (safer than resuming
+            # on a malformed log).
+            return {}
+
+    # Reduce session events to {step: last_phase}. "ok" / "skip" only count
+    # if no later "error" appears for the same step.
+    state: dict[str, str] = {}
+    for ev in session_events:
+        step = ev.get("step")
+        phase = ev.get("phase")
+        if not isinstance(step, str) or not isinstance(phase, str):
+            continue
+        if ev.get("actor") != "install.py":
+            # Cross-actor events (post-install-launcher.sh, launcher) are
+            # not consulted by install.py's resume — they describe phases
+            # install.py doesn't own.
+            continue
+        # Latest phase wins.
+        state[step] = phase
+    return state
+
+
+def _should_skip_step(step: str) -> bool:
+    """Return True iff resume is enabled AND the log says this step
+    completed (ok/skip) in the current session.
+
+    NOTE: This is a HINT — callers MUST still verify the actual side
+    effect (venv exists, .env exists, collection has the schema we expect)
+    before declaring the step a no-op. The log is necessary but not
+    sufficient — Weaviate may have been wiped between runs, the user may
+    have deleted .venv, etc.
+    """
+    if not _RESUME_ENABLED:
+        return False
+    return _RESUME_STATE.get(step) in ("ok", "skip")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -218,6 +441,11 @@ def main() -> int:
                              "to seed, the MCP server creates collections lazily on first "
                              "write. Useful in CI / test runs. Re-run later with "
                              "`kg-sync --all` and `upload_docs.py --all`.")
+    parser.add_argument("--no-resume", action="store_true", default=False,
+                        help="Disable resume-from-log. Forces every step to run "
+                             "even if state/logs/install.jsonl says a previous "
+                             "session already completed it. Default: resume "
+                             "enabled (verifies side effects regardless).")
     parser.add_argument("--skip-collections", action="store_true", default=False,
                         help="Skip Weaviate collection bootstrap (Step 7b) but still seed. "
                              "Implied by --skip-seed. Useful when the user wants the MCP "
@@ -240,6 +468,14 @@ def main() -> int:
 
     mode = "update" if args.update else "install"
 
+    # Configure resume-from-log behaviour. Loaded BEFORE any step runs so
+    # individual step functions can consult _should_skip_step(). The log
+    # is at state/logs/install.jsonl — only present once Step 8 has run
+    # at least once (i.e. on second+ install attempts on this checkout).
+    global _RESUME_ENABLED, _RESUME_STATE
+    _RESUME_ENABLED = not args.no_resume
+    _RESUME_STATE = _load_resume_state() if _RESUME_ENABLED else {}
+
     print()
     print("=" * 62)
     if mode == "update":
@@ -248,6 +484,18 @@ def main() -> int:
         print("  VibeCoded Tools — Orchestrator Installer")
     print("=" * 62)
     print()
+
+    # Mark the start of this install session in the durable log. Subsequent
+    # events from install.py + post-install-launcher.sh share the same log.
+    # On a first-ever install the log dir doesn't exist yet (Step 8 creates
+    # it) so this is a no-op until later — fine: 1/10 is also re-emitted
+    # as part of _check_python_version().
+    _log_install_event(
+        "session", "start",
+        f"install.py {mode} mode",
+        data={"mode": mode, "resume_enabled": _RESUME_ENABLED,
+              "argv": sys.argv[1:]},
+    )
 
     # Step 1: Check Python
     _check_python_version()
@@ -352,7 +600,16 @@ def main() -> int:
     # Step 11: Initial code graph analysis (if repo has code)
     # Skipped on first install — user runs manually after setup
 
-    # Done
+    # Done — mark the session complete in the durable log so the
+    # launcher/Claude Code can tell at a glance that install.py reached
+    # the end. (post-install-launcher.sh appends its own build/spawn
+    # events after this returns.)
+    # Note: 10/10 is logged inside _check_claude_cli() — the per-step
+    # event captures the actual outcome. This event marks the *session*
+    # closed cleanly, which is a separate signal the launcher uses to
+    # decide whether the install completed start-to-end.
+    _log_install_event("session", "ok", f"{mode} finished cleanly")
+
     print()
     print("=" * 62)
     print("  Installation complete!")
@@ -368,14 +625,27 @@ def main() -> int:
 
 def _check_python_version() -> None:
     print("[1/10] Checking Python version ... ", end="", flush=True)
+    _log_install_event("1/10", "start", "checking Python version")
     v = sys.version_info
     if (v.major, v.minor) < MIN_PYTHON:
         print("FAIL")
         print(f"  Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]}+ required, "
               f"found {v.major}.{v.minor}.{v.micro}")
         _print_python_install_hint()
+        _log_install_event(
+            "1/10", "error",
+            f"Python {v.major}.{v.minor}.{v.micro} below required "
+            f"{MIN_PYTHON[0]}.{MIN_PYTHON[1]}",
+            data={"found": f"{v.major}.{v.minor}.{v.micro}",
+                  "required": f"{MIN_PYTHON[0]}.{MIN_PYTHON[1]}"},
+        )
         sys.exit(1)
     print(f"OK ({v.major}.{v.minor}.{v.micro})")
+    _log_install_event(
+        "1/10", "ok",
+        f"Python {v.major}.{v.minor}.{v.micro}",
+        data={"version": f"{v.major}.{v.minor}.{v.micro}"},
+    )
 
 
 def _print_python_install_hint() -> None:
@@ -446,6 +716,7 @@ def _check_prerequisites() -> None:
 
 def _detect_system(args: argparse.Namespace) -> SystemInfo:
     print("[2/10] Detecting system ... ", flush=True)
+    _log_install_event("2/10", "start", "detecting system")
     os_name = platform.system()
     has_gpu = False
     has_metal = False
@@ -506,13 +777,26 @@ def _detect_system(args: argparse.Namespace) -> SystemInfo:
 
     print(f"  OS: {os_name} ({platform.machine()})")
 
-    return SystemInfo(
+    info = SystemInfo(
         os_name=os_name,
         has_gpu=has_gpu or args.gpu,
         has_metal=has_metal,
         container_cmd=container_cmd,
         gpu_name=gpu_name,
     )
+    _log_install_event(
+        "2/10", "ok",
+        f"system detected: {os_name}",
+        data={
+            "os": os_name,
+            "arch": platform.machine(),
+            "has_gpu": info.has_gpu,
+            "has_metal": info.has_metal,
+            "container_cmd": container_cmd,
+            "gpu_name": gpu_name,
+        },
+    )
+    return info
 
 
 def _detect_nvidia_gpu() -> tuple[bool, str]:
@@ -841,6 +1125,7 @@ def _detect_optional_companions(args: argparse.Namespace) -> bool:
     so callers can flip --cfg/--pdg defaults.
     """
     print("\n[2b/10] Optional companions ...")
+    _log_install_event("2b/10", "start", "probing optional companion tools")
 
     # lean-ctx (optional — wires BASH_ENV so non-interactive Bash subprocesses
     # get ~90-97% command-output compression, same as the interactive shell hook)
@@ -865,15 +1150,27 @@ def _detect_optional_companions(args: argparse.Namespace) -> bool:
     joern_path = shutil.which("joern")
     if joern_path:
         print(f"  joern:    detected at {joern_path} (code graph will include CFG/PDG metrics)")
+        _log_install_event(
+            "2b/10", "ok",
+            "joern already installed",
+            data={"joern_path": joern_path},
+        )
         return True
 
     if args.no_joern:
         print("  joern:    skipped (--no-joern)")
+        _log_install_event("2b/10", "skip", "joern skipped via --no-joern")
         return False
 
     if args.with_joern:
         # User explicitly requested install — proceed without confirmation
-        return _install_joern()
+        installed = _install_joern()
+        _log_install_event(
+            "2b/10", "ok" if installed else "error",
+            "joern install (--with-joern)",
+            data={"installed": installed},
+        )
+        return installed
 
     if args.quiet or not sys.stdin.isatty():
         # Non-interactive: hint only, don't prompt
@@ -881,6 +1178,7 @@ def _detect_optional_companions(args: argparse.Namespace) -> bool:
         print("            adds CFG complexity + data-flow variable metrics to the code graph")
         print("            to install:   re-run installer with --with-joern")
         print("            to skip prompt next time:   re-run with --no-joern")
+        _log_install_event("2b/10", "skip", "joern skipped (non-interactive)")
         return False
 
     # Interactive: ask once
@@ -890,13 +1188,21 @@ def _detect_optional_companions(args: argparse.Namespace) -> bool:
         answer = input("            Install Joern now? [y/N]: ").strip().lower()
     except (EOFError, KeyboardInterrupt):
         print()
+        _log_install_event("2b/10", "skip", "joern prompt cancelled")
         return False
 
     if answer not in {"y", "yes"}:
         print("            Skipping. Re-run with --with-joern to install later.")
+        _log_install_event("2b/10", "skip", "user declined joern install")
         return False
 
-    return _install_joern()
+    installed = _install_joern()
+    _log_install_event(
+        "2b/10", "ok" if installed else "error",
+        "joern install (interactive)",
+        data={"installed": installed},
+    )
+    return installed
 
 
 def _install_joern() -> bool:
@@ -916,11 +1222,13 @@ def _install_joern() -> bool:
     print("            Installing Joern (this can take 5-10 minutes — downloads ~600 MB JVM-based binaries)...")
     print("            Note: the Joern installer may open a browser tab if a JDK is missing on your system.")
     print("            Streaming installer output below; press Ctrl+C to abort.")
+    _log_install_event("2b/10", "start", "downloading joern installer")
 
     install_url = "https://github.com/joernio/joern/releases/latest/download/joern-install.sh"
     if not install_url.startswith("https://"):
         # Defense-in-depth — never fetch over plain HTTP.
         print("            Refusing to fetch Joern installer over non-HTTPS URL.")
+        _log_install_event("2b/10", "error", "non-HTTPS joern installer URL refused")
         return False
 
     installer_path: str | None = None
@@ -1018,6 +1326,7 @@ def _choose_embedding_config(sysinfo: SystemInfo, args: argparse.Namespace) -> d
 
 def _create_venv(project_root: Path) -> Path:
     print("\n[3/10] Creating virtual environment ... ", end="", flush=True)
+    _log_install_event("3/10", "start", "creating venv")
     venv_dir = project_root / ".venv"
 
     if platform.system() == "Windows":
@@ -1026,7 +1335,15 @@ def _create_venv(project_root: Path) -> Path:
         venv_python = venv_dir / "bin" / "python"
 
     if venv_python.exists():
+        # Verification beats log signal: even if resume says ok, the
+        # venv-python file is what matters. If it's gone, fall through to
+        # re-create. Resume log is a hint, not a contract.
         print("already exists")
+        _log_install_event(
+            "3/10", "skip",
+            "venv already present",
+            data={"venv_python": str(venv_python)},
+        )
         return venv_python
 
     # Don't use check=True with capture_output — we want to surface stderr on failure.
@@ -1046,8 +1363,19 @@ def _create_venv(project_root: Path) -> Path:
             print("                            sudo dnf install python3-venv  (Fedora)")
         print("    - Disk full or no write permission to:")
         print(f"      {venv_dir}")
+        _log_install_event(
+            "3/10", "error",
+            f"venv creation failed (exit {result.returncode})",
+            data={"exit_code": result.returncode,
+                  "stderr_tail": (result.stderr or "").strip()[-400:]},
+        )
         sys.exit(1)
     print("OK")
+    _log_install_event(
+        "3/10", "ok",
+        "venv created",
+        data={"venv_python": str(venv_python)},
+    )
     return venv_python
 
 
@@ -1058,6 +1386,11 @@ def _create_venv(project_root: Path) -> Path:
 def _install_requirements(venv_python: Path, *, dev: bool) -> None:
     label = "with dev extras" if dev else "production"
     print(f"[4/10] Installing dependencies ({label}) ... ", flush=True)
+    _log_install_event(
+        "4/10", "start",
+        f"pip install ({label})",
+        data={"dev": dev},
+    )
 
     # Upgrade pip — surface errors instead of swallowing them via check=True
     pip_up = subprocess.run(
@@ -1071,12 +1404,24 @@ def _install_requirements(venv_python: Path, *, dev: bool) -> None:
         print()
         print("  Hint: check your network connection and PyPI availability.")
         print("        If behind a corporate proxy, set http_proxy/https_proxy.")
+        _log_install_event(
+            "4/10", "error",
+            f"pip upgrade failed (exit {pip_up.returncode})",
+            data={"phase": "pip-upgrade",
+                  "exit_code": pip_up.returncode,
+                  "stderr_tail": (pip_up.stderr or "").strip()[-400:]},
+        )
         sys.exit(1)
 
     # Install requirements
     req_file = PROJECT_ROOT / "requirements.txt"
     if not req_file.exists():
         print("  WARNING: requirements.txt not found, skipping pip install")
+        _log_install_event(
+            "4/10", "warn",
+            "requirements.txt missing",
+            data={"requirements": str(req_file)},
+        )
         return
 
     cmd = [str(venv_python), "-m", "pip", "install", "-r", str(req_file)]
@@ -1093,8 +1438,15 @@ def _install_requirements(venv_python: Path, *, dev: bool) -> None:
         lines = result.stderr.strip().splitlines()[-30:]
         for line in lines:
             print(f"  {line}")
+        _log_install_event(
+            "4/10", "error",
+            f"pip install failed (exit {result.returncode})",
+            data={"exit_code": result.returncode,
+                  "stderr_tail": "\n".join(lines)},
+        )
         sys.exit(1)
     print("  OK")
+    _log_install_event("4/10", "ok", "pip install completed")
 
 
 # ---------------------------------------------------------------------------
@@ -1731,6 +2083,11 @@ def _detect_existing_volume_paths() -> dict:
 def _start_services(sysinfo: SystemInfo, args: argparse.Namespace,
                     embed_config: dict, decisions: dict | None = None) -> None:
     print(f"\n[5/10] Starting services via {sysinfo.container_cmd} ... ", flush=True)
+    _log_install_event(
+        "5/10", "start",
+        f"compose up via {sysinfo.container_cmd}",
+        data={"runtime": sysinfo.container_cmd},
+    )
 
     infra_dir = PROJECT_ROOT / "infrastructure"
     compose_file = infra_dir / "docker-compose.yml"
@@ -1738,6 +2095,11 @@ def _start_services(sysinfo: SystemInfo, args: argparse.Namespace,
     if not compose_file.exists():
         print(f"  WARNING: {compose_file} not found, skipping.")
         print("  Start Weaviate and Ollama manually.")
+        _log_install_event(
+            "5/10", "warn",
+            "docker-compose.yml missing",
+            data={"compose_file": str(compose_file)},
+        )
         return
 
     # Bug 31 contract: when existing orchestrator volumes are detected,
@@ -1850,6 +2212,11 @@ def _start_services(sysinfo: SystemInfo, args: argparse.Namespace,
         print(f"  Container daemon may be hung. Try manually:")
         print(f"    cd {infra_dir}")
         print(f"    {' '.join(compose_cmd)} up -d")
+        _log_install_event(
+            "5/10", "error",
+            "compose up timed out after 15 min",
+            data={"runtime": sysinfo.container_cmd},
+        )
         sys.exit(1)
     if result.returncode != 0:
         print("  FAIL")
@@ -1876,8 +2243,16 @@ def _start_services(sysinfo: SystemInfo, args: argparse.Namespace,
             print("    Either stop the conflicting process, or set")
             print("    VCT_FORCE_SEPARATE_CONTAINERS=1 + override WEAVIATE_PORT /")
             print("    OLLAMA_PORT / CODE_EMBED_PORT to use distinct ports.")
+        _log_install_event(
+            "5/10", "error",
+            f"compose up failed (exit {result.returncode})",
+            data={"runtime": sysinfo.container_cmd,
+                  "exit_code": result.returncode,
+                  "stderr_tail": (result.stderr or "").strip()[-400:]},
+        )
         sys.exit(1)
     print("  OK")
+    _log_install_event("5/10", "ok", "compose up completed")
 
 
 def _get_compose_command(container_cmd: str) -> list[str]:
@@ -1918,6 +2293,7 @@ def _get_compose_command(container_cmd: str) -> list[str]:
 def _wait_for_ollama() -> None:
     """Wait for Ollama to be ready."""
     print("[6/10] Waiting for Ollama ... ", end="", flush=True)
+    _log_install_event("6/10", "start", "waiting for Ollama")
     port = os.environ.get("OLLAMA_PORT", str(DEFAULT_OLLAMA_PORT))
     url = f"http://localhost:{port}/api/tags"
     deadline = time.monotonic() + HEALTH_TIMEOUT
@@ -1927,6 +2303,11 @@ def _wait_for_ollama() -> None:
             resp = urllib.request.urlopen(url, timeout=3)
             if resp.status == 200:
                 print("OK")
+                _log_install_event(
+                    "6/10", "ok",
+                    "Ollama is ready",
+                    data={"url": url},
+                )
                 return
         except (urllib.error.URLError, OSError):
             pass
@@ -1935,13 +2316,24 @@ def _wait_for_ollama() -> None:
     print("TIMEOUT")
     print(f"  Ollama not ready after {HEALTH_TIMEOUT}s at {url}")
     print("  Check container logs.")
+    _log_install_event(
+        "6/10", "error",
+        f"Ollama not ready after {HEALTH_TIMEOUT}s",
+        data={"url": url, "timeout_s": HEALTH_TIMEOUT},
+    )
 
 
 def _pull_ollama_models(models: list[str]) -> None:
     """Pull required Ollama models."""
     print("[7/10] Pulling Ollama models ... ", flush=True)
+    _log_install_event(
+        "7/10", "start",
+        f"pulling {len(models)} Ollama model(s)",
+        data={"models": list(models)},
+    )
     port = os.environ.get("OLLAMA_PORT", str(DEFAULT_OLLAMA_PORT))
 
+    failed: list[str] = []
     for model in models:
         print(f"  Pulling {model} ... ", end="", flush=True)
         try:
@@ -1964,6 +2356,16 @@ def _pull_ollama_models(models: list[str]) -> None:
             print(f"    Pull manually: curl -X POST "
                   f"http://localhost:{port}/api/pull "
                   f"-d '{{\"name\": \"{model}\"}}'")
+            failed.append(model)
+
+    if failed:
+        _log_install_event(
+            "7/10", "warn",
+            f"{len(failed)} model pull(s) failed",
+            data={"failed": failed},
+        )
+    else:
+        _log_install_event("7/10", "ok", "all Ollama models pulled")
 
 
 # ---------------------------------------------------------------------------
@@ -2111,6 +2513,12 @@ def _ensure_collections(embed_config: dict,
               "(--skip-seed / --skip-collections).")
         print("  Run `kg-sync --all` later to seed; the MCP server creates "
               "missing collections lazily on first write.")
+        _log_install_event(
+            "7b/10", "skip",
+            "collection bootstrap skipped via flag",
+            data={"skip_collections": getattr(args, "skip_collections", False),
+                  "skip_seed": getattr(args, "skip_seed", False)},
+        )
         return
 
     weaviate_port = os.environ.get("WEAVIATE_PORT", str(DEFAULT_WEAVIATE_PORT))
@@ -2153,6 +2561,11 @@ def _ensure_collections(embed_config: dict,
     print(f"[7b/10] Checking Weaviate collections at {weaviate_url} "
           f"({'adopt' if adopt_mode else 'self-managed'} mode) ... ",
           flush=True)
+    _log_install_event(
+        "7b/10", "start",
+        f"checking Weaviate collections ({'adopt' if adopt_mode else 'self-managed'})",
+        data={"weaviate_url": weaviate_url, "adopt_mode": adopt_mode},
+    )
 
     # 1. Read existing schema.
     try:
@@ -2161,6 +2574,11 @@ def _ensure_collections(embed_config: dict,
     except Exception as e:
         print(f"  WARN: couldn't read schema ({e}). Skipping bootstrap.")
         print("  MCP server will create collections lazily on first write.")
+        _log_install_event(
+            "7b/10", "warn",
+            f"schema read failed: {type(e).__name__}",
+            data={"error": str(e)[:200]},
+        )
         return
 
     existing = {
@@ -2208,6 +2626,12 @@ def _ensure_collections(embed_config: dict,
     skipped_existing = [n for (n, _) in required if n in existing]
     if not missing:
         print(f"  All collections present (reusing {len(required)} shared classes).")
+        _log_install_event(
+            "7b/10", "ok",
+            "all required collections already present",
+            data={"existing": skipped_existing,
+                  "kg": kg_name, "dev": dev_name, "shared": shared_name},
+        )
         return
 
     # In adopt mode, announce what we're about to do and confirm. With
@@ -2237,6 +2661,10 @@ def _ensure_collections(embed_config: dict,
             if ans in ("n", "no"):
                 print("  → user declined; skipping collection creation.")
                 print("    (MCP server will create lazily on first write.)")
+                _log_install_event(
+                    "7b/10", "skip",
+                    "user declined collection creation in adopt mode",
+                )
                 return
 
     # 3. POST each missing class definition.
@@ -2269,6 +2697,18 @@ def _ensure_collections(embed_config: dict,
         print(f"  ! failed to create {n}: {err}")
     if not failed:
         print("  OK")
+        _log_install_event(
+            "7b/10", "ok",
+            f"created {len(created)} collection(s)",
+            data={"created": created, "skipped_existing": skipped_existing},
+        )
+    else:
+        _log_install_event(
+            "7b/10", "error",
+            f"{len(failed)} collection(s) failed to create",
+            data={"created": created,
+                  "failed": [{"name": n, "error": e[:200]} for n, e in failed]},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2291,10 +2731,12 @@ def _ensure_collections(embed_config: dict,
 
 def _seed_weaviate(args: argparse.Namespace) -> None:
     print("[7c/10] Seeding Weaviate with bundled knowledge/ + docs/ ... ", flush=True)
+    _log_install_event("7c/10", "start", "seeding Weaviate")
 
     # Guard: if user passed --skip-seed, honor it (useful for CI / tests).
     if getattr(args, "skip_seed", False):
         print("  Skipped (--skip-seed).")
+        _log_install_event("7c/10", "skip", "seed skipped via --skip-seed")
         return
 
     # We must use the venv's Python so weaviate-client + weaviate_mcp.chunking
@@ -2313,11 +2755,18 @@ def _seed_weaviate(args: argparse.Namespace) -> None:
             venv_py = legacy
         else:
             print(f"  ! venv python not found at {venv_py} — skipping seed (run Step 4 first)")
+            _log_install_event(
+                "7c/10", "error",
+                "venv python missing — Step 4 must run first",
+                data={"venv_py": str(venv_py)},
+            )
             return
 
     scripts_dir = PROJECT_ROOT / ".claude" / "scripts"
     sync_kg = scripts_dir / "sync_knowledge_graph.py"
     upload_docs = scripts_dir / "upload_docs.py"
+
+    seed_errors: list[str] = []
 
     # 1. Knowledge graph seed
     if sync_kg.exists():
@@ -2331,12 +2780,16 @@ def _seed_weaviate(args: argparse.Namespace) -> None:
             )
         except subprocess.CalledProcessError as e:
             print(f"    ! kg sync exited {e.returncode} — re-run later with `kg-sync --all`")
+            seed_errors.append(f"kg-sync exit {e.returncode}")
         except subprocess.TimeoutExpired:
             print("    ! kg sync timed out (>10 min) — re-run later with `kg-sync --all`")
+            seed_errors.append("kg-sync timeout")
         except FileNotFoundError as e:
             print(f"    ! kg sync failed: {e}")
+            seed_errors.append(f"kg-sync FileNotFound: {e}")
     else:
         print(f"  ! sync_knowledge_graph.py not found at {sync_kg}")
+        seed_errors.append("sync_knowledge_graph.py missing")
 
     # 2. Project documentation seed
     if upload_docs.exists():
@@ -2350,12 +2803,16 @@ def _seed_weaviate(args: argparse.Namespace) -> None:
             )
         except subprocess.CalledProcessError as e:
             print(f"    ! docs upload exited {e.returncode} — re-run later with `upload_docs.py --all`")
+            seed_errors.append(f"upload_docs exit {e.returncode}")
         except subprocess.TimeoutExpired:
             print("    ! docs upload timed out (>10 min) — re-run later with `upload_docs.py --all`")
+            seed_errors.append("upload_docs timeout")
         except FileNotFoundError as e:
             print(f"    ! docs upload failed: {e}")
+            seed_errors.append(f"upload_docs FileNotFound: {e}")
     else:
         print(f"  ! upload_docs.py not found at {upload_docs}")
+        seed_errors.append("upload_docs.py missing")
 
     # 3. Cross-project shared KG seed (Step 7d).
     #
@@ -2402,12 +2859,27 @@ def _seed_weaviate(args: argparse.Namespace) -> None:
         except subprocess.CalledProcessError as e:
             print(f"    ! shared KG seed exited {e.returncode} — re-run later with "
                   f"`KG_COLLECTION={shared_collection} kg-sync --all`")
+            seed_errors.append(f"shared-kg exit {e.returncode}")
         except subprocess.TimeoutExpired:
             print("    ! shared KG seed timed out (>10 min)")
+            seed_errors.append("shared-kg timeout")
         except FileNotFoundError as e:
             print(f"    ! shared KG seed failed: {e}")
+            seed_errors.append(f"shared-kg FileNotFound: {e}")
 
     print("  OK (seed step complete; per-script errors are non-fatal — see hints above)")
+    if seed_errors:
+        # Soft-fail: still log as warn, not error. Step is non-fatal by
+        # design — users can re-run kg-sync / upload_docs later. The
+        # downstream resume-decider treats "warn" as still-eligible-to-skip
+        # so a partial seed doesn't block install completion.
+        _log_install_event(
+            "7c/10", "warn",
+            f"{len(seed_errors)} seed sub-step(s) had errors (non-fatal)",
+            data={"errors": seed_errors},
+        )
+    else:
+        _log_install_event("7c/10", "ok", "all seed sub-steps completed")
 
 
 # ---------------------------------------------------------------------------
@@ -2416,10 +2888,21 @@ def _seed_weaviate(args: argparse.Namespace) -> None:
 
 def _create_state_directory() -> None:
     print("[8/10] Creating state directory ... ", end="", flush=True)
+    # Pre-Step-8 events have been buffering in `_PENDING_EVENTS`; drain
+    # them now that state/logs/ exists. Subsequent events (Step 9, 10,
+    # post-install-launcher) land directly in the JSONL.
     state_dir = PROJECT_ROOT / "state"
     state_dir.mkdir(exist_ok=True)
     (state_dir / "logs").mkdir(exist_ok=True)
     print("OK")
+    log_path = _install_log_path()
+    if log_path is not None:
+        _drain_pending_events(log_path)
+    _log_install_event(
+        "8/10", "ok",
+        "state/logs/ directory present",
+        data={"state_dir": str(state_dir)},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2457,6 +2940,7 @@ def _telemetry_consent(args: argparse.Namespace) -> bool:
 
 def _write_env_config(embed_config: dict, args: argparse.Namespace, joern_available: bool = False) -> None:
     print("[9/10] Writing configuration ... ", end="", flush=True)
+    _log_install_event("9/10", "start", "writing .env")
     env_file = PROJECT_ROOT / ".env"
     telemetry_enabled = _telemetry_consent(args)
 
@@ -2540,12 +3024,24 @@ def _write_env_config(embed_config: dict, args: argparse.Namespace, joern_availa
     # Write (don't overwrite if exists)
     if env_file.exists():
         print("already exists (not overwritten)")
+        _log_install_event(
+            "9/10", "skip",
+            ".env already exists — preserved",
+            data={"env_file": str(env_file)},
+        )
     else:
         env_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
         if telemetry_enabled:
             print("OK (telemetry: on, opt-in)")
         else:
             print("OK (telemetry: off)")
+        _log_install_event(
+            "9/10", "ok",
+            ".env written",
+            data={"env_file": str(env_file),
+                  "telemetry_on": telemetry_enabled,
+                  "joern_available": joern_available},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2713,6 +3209,7 @@ def _install_agents_and_skills(args: argparse.Namespace) -> None:
 
 def _check_claude_cli() -> None:
     print("[10/10] Checking Claude CLI ... ", end="", flush=True)
+    _log_install_event("10/10", "start", "checking claude CLI")
     if shutil.which("claude"):
         try:
             result = subprocess.run(
@@ -2721,13 +3218,26 @@ def _check_claude_cli() -> None:
             )
             version = result.stdout.strip() or "found"
             print(f"OK ({version})")
+            _log_install_event(
+                "10/10", "ok",
+                f"claude CLI present ({version})",
+                data={"version": version},
+            )
         except (subprocess.TimeoutExpired, OSError):
             print("found (version check timed out)")
+            _log_install_event(
+                "10/10", "warn",
+                "claude CLI present but --version timed out",
+            )
     else:
         print("NOT FOUND")
         print("  Claude Code CLI is required to use the orchestrator.")
         print("  Install: npm install -g @anthropic-ai/claude-code")
         print("  Requires: Node.js 18+ (https://nodejs.org)")
+        _log_install_event(
+            "10/10", "warn",
+            "claude CLI missing — user must install separately",
+        )
 
 
 # ---------------------------------------------------------------------------
