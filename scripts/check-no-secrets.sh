@@ -73,7 +73,7 @@ if [ "$violations" -gt 0 ]; then
   echo "" >&2
   echo "Refusing to commit. Replace each occurrence with a placeholder" >&2
   echo "(e.g. <YOUR_LS_WEBHOOK_SIGNING_SECRET>) and document how to" >&2
-  echo "generate a real value. See docs/SECRETS_ROTATION.md." >&2
+  echo "generate a real value. See the project secrets rotation runbook." >&2
   exit 1
 fi
 

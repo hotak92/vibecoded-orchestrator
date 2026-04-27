@@ -1,8 +1,7 @@
 # Orchestrator Pro — Variant IDs
 
-> **Status as of 2026-04-26**: Variants not yet created in LS (or LS API
-> key is invalid; see `LS_INVENTORY_2026-04-26.md`). Fill these in once
-> the variants are live.
+> **Status as of 2026-04-26**: Variants not yet created in LS (LS API key
+> setup pending). Fill these in once the variants are live.
 
 | Tier         | Variant Name | LS variant_id | Price | Activation cap |
 | ------------ | ------------ | ------------- | ----- | -------------- |
