@@ -19,15 +19,21 @@ vct-secrets/
 # Audit doc (only present on the OSS-readiness branch, not for main)
 OSS_LAUNCH_READINESS.md
 
-# Python
+# Python build output (sdist/wheel). NOT the launcher's bundled prebuilt
+# binaries at launcher/dist/ — those are checked in (see un-ignore below).
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 *.egg-info/
-dist/
+/dist/
 build/
 .eggs/
+
+# Launcher prebuilt binaries — checked in alongside source.
+# See launcher/dist/README.md for the bundling rationale.
+!launcher/dist/
+!launcher/dist/**
 
 # Virtual environments
 .venv/
