@@ -1,5 +1,28 @@
 # Install Recovery — for Claude Code, after a failed first-install
 
+## Where the install log lives
+
+If `<repo_root>/state/logs/install.jsonl` exists, read it FIRST. It's an
+append-only JSONL written by both `install.py` and `post-install-launcher.sh`,
+with each event capturing what step ran, what phase it reached, and any
+relevant detail. The launcher also appends events when it spawns at end of
+install or when its first-start wizard fires.
+
+Schema:
+```json
+{"ts": "2026-04-27T22:00:00Z",
+ "actor": "install.py" | "post-install-launcher.sh" | "launcher",
+ "step": "1/10" | "build" | "first-spawn" | "wizard-step-N" | ...,
+ "phase": "start" | "ok" | "skip" | "error",
+ "detail": "human-readable string, never PII"}
+```
+
+The last "phase":"error" event is usually the cause of the failure. If the
+log shows steps 1-7 ok, build start, build error, no later events — the
+launcher build phase is where to dig.
+
+
+
 If a user opened Claude Code in this repo and pasted the install-recovery
 prompt, you're reading this because the launcher build did not produce a
 binary. The user has already run `bash first-install.sh` and the

@@ -213,6 +213,7 @@ pub fn run() {
             commands::installer::check_for_updates,
             commands::installer::install_orchestrator,
             commands::installer::preview_install,
+            commands::installer::detect_existing_install_root,
             // TODO(safety): wire preflight_install_safety_check to the
             //   OnboardingWizard's confirm-step. Currently `preview_install`
             //   covers the diff-mode path; preflight returns the richer
