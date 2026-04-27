@@ -321,7 +321,7 @@ Two entries as of v0.1.0: (1) `wh_vct_ls_2026_s3cur3k3y` — LS webhook signing 
 All 20 project hooks scrub `SUPABASE_KEY`, `GITHUB_TOKEN`, `OPENAI_API_KEY`, AWS credentials, `TELEGRAM_BOT_TOKEN`, etc. before spawning subprocesses. See `SECURITY.md`.
 
 ### Supabase key rotation runbook
-`docs/SECRETS_ROTATION.md`: (1) Roll key in Supabase dashboard, (2) write to `~/.vct-secrets/shared/supabase_token`, (3) `supabase secrets set`, (4) update Vercel env, (5) restart local services. Old key valid ~24 h (zero-downtime window).
+Secrets rotation runbook (maintainer docs): (1) Roll key in Supabase dashboard, (2) write to `~/.vct-secrets/shared/supabase_token`, (3) `supabase secrets set`, (4) update Vercel env, (5) restart local services. Old key valid ~24 h (zero-downtime window).
 
 ### GitHub PAT rotation — single file write
 PAT lives at `~/.vct-secrets/github_pat`. Rotation = update file + chmod 600. Credential helper, search MCP wrapper, and `gh` CLI all re-read on each invocation.
@@ -388,8 +388,8 @@ The CLA and any disputes arising under it are governed by Italian law. Specific 
 ### Supabase
 Hosts `profiles` table (entitlements), `validate-tier` and `lemon-squeezy-webhook` edge functions, and email functions.
 
-### Vercel (Fabio's account)
-Only the `vibecodedtools` project. `SUPABASE_SERVICE_ROLE_KEY` and `SUPABASE_ANON_KEY` set as Vercel project env vars.
+### Vercel
+Only the `vibecodedtools` project (hosted on the maintainers' Vercel account). `SUPABASE_SERVICE_ROLE_KEY` and `SUPABASE_ANON_KEY` set as Vercel project env vars.
 
 ### IONOS
 Static-only web hosting. SMTP fallback credentials stored as Supabase edge function secret (`IONOS_SMTP_PASSWORD`).

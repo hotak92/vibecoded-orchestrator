@@ -90,8 +90,7 @@ network calls.
 
 ## Operations docs
 
-- `VARIANT_SETUP.md` — step-by-step LS dashboard setup
-- `LS_INVENTORY_*.md` — point-in-time API snapshots (gitignored)
+- `LS_INVENTORY_*.md` — point-in-time API snapshots (gitignored; see maintainer docs for setup steps)
 - `USER_FLOW.md` — end-user activation / deactivation / transfer
 - `MACHINE_BINDING.md` — how machine_id_hash works, quota policy
 - `INTEGRATION.md` — wiring `get_tier()` into orchestrator entry points

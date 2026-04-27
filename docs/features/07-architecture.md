@@ -100,7 +100,7 @@ A `PreToolUse` hook inspects bash commands for shell-injection patterns and bloc
 Secrets entered through the Launcher GUI are stored in the OS keychain, not in plaintext files.
 
 ### Pre-commit secret blocklist (`scripts/check-no-secrets.sh`)
-Maintained blocklist of every token that has ever leaked from this repo's history. Wire as a git pre-commit hook. Refusals include the exact file and a pointer to `docs/SECRETS_ROTATION.md`.
+Maintained blocklist of every token that has ever leaked from this repo's history. Wire as a git pre-commit hook. Refusals include the exact file and a pointer to the secrets rotation runbook (see maintainer docs).
 
 ### Hard path whitelist (install safety)
 The installer and Launcher enforce a hard whitelist of orchestrator-managed paths. No write operation touches user code outside those paths. A `preflight_install_safety_check` Tauri command runs before any installation step.
@@ -217,7 +217,7 @@ The uninstall path removes only orchestrator-managed files. User project code is
 | `docs/TROUBLESHOOTING.md` | Common failure modes with causes and fixes |
 | `docs/DEPENDENCY_LICENSES.md` | Transitive dependency license audit |
 | `docs/VCT_SECRETS_PRIMITIVE.md` | vct-secrets design |
-| `docs/SECRETS_ROTATION.md` | Key rotation runbooks |
+| Secrets rotation runbook | Key rotation runbooks (maintainer docs) |
 | `docs/TELEMETRY.md` | Opt-in telemetry model |
 | `docs/ADMIN_LICENSE.md` | Admin tier architecture — both Path A (Vault-token) and Path B (LS variant) with operational runbooks |
 | `docs/LAUNCHER_SUBTREE.md` | Git subtree workflow for launcher/ |
