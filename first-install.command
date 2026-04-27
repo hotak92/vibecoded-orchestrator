@@ -78,7 +78,11 @@ done
 
 # Forward all install args — Finder won't pass any, but Terminal-launched
 # runs ($./first-install.command --no-gpu-check) do.
-"$SCRIPT_DIR/install.sh" "${INSTALL_ARGS[@]}"
+if [ ${#INSTALL_ARGS[@]} -gt 0 ]; then
+    "$SCRIPT_DIR/install.sh" "${INSTALL_ARGS[@]}"
+else
+    "$SCRIPT_DIR/install.sh"
+fi
 status=$?
 
 echo ""
@@ -86,7 +90,11 @@ if [ $status -eq 0 ]; then
     # Same launcher-bootstrap helper as Linux. It detects macOS via $OSTYPE
     # and uses .app bundle paths + hdiutil for DMG mounts.
     if [ -x "$SCRIPT_DIR/scripts/post-install-launcher.sh" ]; then
-        "$SCRIPT_DIR/scripts/post-install-launcher.sh" "$SCRIPT_DIR" "${HELPER_FLAGS[@]}" || true
+        if [ ${#HELPER_FLAGS[@]} -gt 0 ]; then
+            "$SCRIPT_DIR/scripts/post-install-launcher.sh" "$SCRIPT_DIR" "${HELPER_FLAGS[@]}" || true
+        else
+            "$SCRIPT_DIR/scripts/post-install-launcher.sh" "$SCRIPT_DIR" || true
+        fi
     else
         echo "Install complete. To start the launcher: ./start-launcher.command"
     fi

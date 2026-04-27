@@ -91,7 +91,11 @@ for arg in "$@"; do
         *) INSTALL_ARGS+=("$arg") ;;
     esac
 done
-"$SCRIPT_DIR/install.sh" "${INSTALL_ARGS[@]}"
+if [ ${#INSTALL_ARGS[@]} -gt 0 ]; then
+    "$SCRIPT_DIR/install.sh" "${INSTALL_ARGS[@]}"
+else
+    "$SCRIPT_DIR/install.sh"
+fi
 status=$?
 
 echo ""
@@ -101,7 +105,11 @@ if [ $status -eq 0 ]; then
     # spawns the GUI detached so the user sees the launcher window at the
     # end of install. ALWAYS exits 0; never blocks our exit status.
     if [ -x "$SCRIPT_DIR/scripts/post-install-launcher.sh" ]; then
-        "$SCRIPT_DIR/scripts/post-install-launcher.sh" "$SCRIPT_DIR" "${HELPER_FLAGS[@]}" || true
+        if [ ${#HELPER_FLAGS[@]} -gt 0 ]; then
+            "$SCRIPT_DIR/scripts/post-install-launcher.sh" "$SCRIPT_DIR" "${HELPER_FLAGS[@]}" || true
+        else
+            "$SCRIPT_DIR/scripts/post-install-launcher.sh" "$SCRIPT_DIR" || true
+        fi
     else
         echo "Install complete. To start the launcher: ./start-launcher.sh"
         echo "(Or double-click start-launcher.desktop in your file manager.)"
