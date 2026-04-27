@@ -33,9 +33,18 @@ git subtree push --prefix=launcher vct-launcher feature/orchestrator-hub
 
 This pushes only the `launcher/` history to the VCT-Launcher repo's branch. Prefer making the change in the VCT-Launcher repo directly when possible — it's cleaner.
 
+## Active source-of-truth note (as of v0.1.0)
+
+During the v1.0 build-out, `vibecoded-orchestrator/launcher/` is ahead of `pb992/VCT-Launcher`
+on several fronts (five-screen critical path, packaging decisions, first-install integration).
+`pb992/VCT-Launcher` is the **upstream-of-record** for the launcher product, but it currently
+lags the subtree here. The plan is to push the v1.0 delta back upstream after launch via
+`git subtree push` and then resume the normal pull-first workflow. Do not treat `pb992/VCT-Launcher`
+as the definitive reference for launcher behavior until that sync is complete.
+
 ## Don't edit `launcher/` casually
 
-The launcher is its own product with its own CI, tests, and release cadence. Edits should originate in `pb992/VCT-Launcher` and flow here via `git subtree pull`. Direct edits in this repo create a divergence that has to be reconciled.
+The launcher is its own product with its own CI, tests, and release cadence. Edits should originate in `pb992/VCT-Launcher` and flow here via `git subtree pull`. During the v1.0 sprint the rule is relaxed — edits in this repo are acceptable when iteration speed matters. Reconcile by pushing back upstream after the release.
 
 ## Why this layout
 

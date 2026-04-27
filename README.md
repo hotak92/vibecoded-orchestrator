@@ -10,15 +10,20 @@ Open source. Runs locally. Learns from how you work.
 > - **Claude Code CLI** + **Claude Max** subscription
 > - **Node.js 18+**
 >
-> The `install.sh` / `install.ps1` wrappers detect a missing Python
-> 3.11+ and offer to install it interactively (apt / dnf / pacman / brew
-> / winget). See [Prerequisites](#requirements) below.
+> The `first-install.*` entry points detect and install missing Python,
+> container runtimes, and GPU drivers automatically (tier: silent with
+> `--yes` → interactive prompt → URL fallback). See [Prerequisites](#requirements) below.
 
 ---
 
 ## Quick Start (zero-dependency click-to-install)
 
 Brand-new machine, no Python, no Node, no container runtime? Two ways to start:
+
+> **Recent fixes** (2026-04-27): Joern installer hang resolved (commit `64d5804`); macOS
+> Gatekeeper quarantine xattr stripped automatically by `first-install.command`; Windows
+> SmartScreen UI documented. Update via `git pull && bash first-install.sh` if you hit
+> these on an older clone.
 
 ### A. One-liner from a terminal (Linux / macOS)
 
@@ -130,14 +135,15 @@ full setup. `start-launcher.*` runs after install completes.
 ```bash
 git clone https://github.com/hotak92/vibecoded-orchestrator.git
 cd vibecoded-orchestrator
-./install.sh                      # or ./first-install.sh
+bash first-install.sh
 ```
 
 ### Windows (PowerShell)
 ```powershell
 git clone https://github.com/hotak92/vibecoded-orchestrator.git
 cd vibecoded-orchestrator
-.\install.ps1                     # or double-click first-install.bat
+# Double-click first-install.bat, or from PowerShell:
+.\first-install.bat
 ```
 
 **Windows notes**:
@@ -181,7 +187,7 @@ python install.py --quiet --no-joern --no-containers
 
 #### Installing Python 3.12
 
-The `install.sh` / `install.ps1` wrappers detect a missing or too-old Python and offer to install one for you (interactive — you'll be prompted before any sudo/admin/winget call). To install manually:
+`first-install.*` detects a missing or too-old Python and installs one automatically (T1 silent with `--yes`, T3 interactive prompt, T4 URL fallback). To install manually:
 
 | OS | Command |
 |---|---|

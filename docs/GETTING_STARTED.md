@@ -16,32 +16,54 @@ This guide walks you through installing the orchestrator, configuring your first
 
 ## Install
 
-### Linux / macOS
+### Recommended: entry-point scripts (Linux / macOS / Windows)
+
+The quickest path from zero to running:
 
 ```bash
-git clone https://github.com/hotak92/vibecoded-orchestrator.git
-cd vibecoded-orchestrator
-./install.sh
+git clone https://github.com/hotak92/vibecoded-orchestrator.git && cd vibecoded-orchestrator && bash first-install.sh
 ```
 
-### Windows (PowerShell)
+Or, after cloning, double-click the file for your OS:
 
-```powershell
-git clone https://github.com/hotak92/vibecoded-orchestrator.git
+| OS | File to double-click |
+|---|---|
+| Linux | `first-install.desktop` |
+| macOS | `first-install.command` |
+| Windows | `first-install.bat` |
+
+`first-install.*` handles everything without pre-installed Python:
+- Detects and installs Python (apt/dnf/pacman/brew/winget; tier: silent `--yes` → interactive → URL fallback)
+- Detects and installs a container runtime (Podman or Docker) via pkexec on Linux; URL-only on macOS/Windows
+- Detects GPU drivers (CUDA/ROCm) — detect-only; prints URL if hardware is present without a driver
+- Runs `install.py` (creates `<project>/.venv`, not `claude_mcp_servers/.venv`)
+- Probes for the launcher binary; if absent, offers to download from GitHub Releases or build from source
+- macOS: strips `com.apple.quarantine` xattr from downloaded binaries to preempt Gatekeeper
+- Auto-launches the launcher GUI as a detached process
+
+Flags: `--yes` (non-interactive), `--no-auto-launch` (skip GUI spawn).
+
+After install, double-click `start-launcher.<ext>` for your OS to start the launcher GUI.
+
+**Time budget**: ~5 min of interactive prompts, then 10–30 min for container images and model downloads (~5 GB; GPU mode pulls an additional ~2.5 GB). Re-runs reuse cached images.
+
+### For advanced users: run install.py directly
+
+If you already have Python 3.11+ and a container runtime, you can call `install.py` directly:
+
+```bash
 cd vibecoded-orchestrator
-.\install.ps1
+python3 install.py
 ```
 
-`install.py` (called by both scripts) does the following:
+`install.py` does the following:
 
-1. Creates a Python venv at `.venv/`
+1. Creates a Python venv at `.venv/` (project root)
 2. Detects your hardware (NVIDIA GPU / CPU / Apple Silicon) and sets the embedding backend
 3. Starts Weaviate and Ollama in containers and waits for them to be ready
 4. Pulls embedding models (`qwen3-embedding:0.6b` by default; CodeSage-Large-v2 on GPU installs)
 5. Writes `.env`, `.claude/settings.json`, and `.vscode/settings.json`
 6. Copies 19 agent templates into `.claude/agents/` and 28 skill templates into `.claude/skills/`
-
-**Time budget**: ~5 min of interactive prompts, then 10–30 min for container images and model downloads (~5 GB; GPU mode pulls an additional ~2.5 GB). Re-runs reuse cached images.
 
 ### Common install flags
 
