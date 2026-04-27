@@ -8,11 +8,19 @@ Open source. Runs locally. Learns from how you work.
 > - **Python 3.11 or newer** (3.12 recommended; 3.13 also supported)
 > - **Docker** or **Podman**
 > - **Claude Code CLI** + **Claude Max** subscription
-> - **Node.js 18+**
+> - **Node.js 18+** with `npm` (only when building the launcher GUI from source — not needed if using the bundled prebuilt binary)
 >
-> The `first-install.*` entry points detect and install missing Python,
-> container runtimes, and GPU drivers automatically (tier: silent with
-> `--yes` → interactive prompt → URL fallback). See [Prerequisites](#requirements) below.
+> The `first-install.*` entry points detect and (when missing) auto-install
+> the dependencies above plus a few build-time/optional tools: `pnpm` (via
+> `npm`), Tauri's Linux build deps (`libwebkit2gtk-4.1-dev`, `libgtk-3-dev`,
+> `libayatana-appindicator3-dev`, `librsvg2-dev`, `libsoup-3.0-dev`,
+> `libjavascriptcoregtk-4.1-dev`, plus `build-essential curl wget file` —
+> apt only; other distros get a manual-install hint), the Claude Code CLI,
+> and optionally [Joern](https://docs.joern.io/installation/) (~600 MB
+> JVM-based, code-graph CFG/PDG metrics) and [lean-ctx](https://github.com/yvgude/lean-ctx)
+> (~95% Claude API token savings). Install ladder: silent with `--yes` →
+> interactive prompt → URL fallback. See [Prerequisites](#requirements)
+> below.
 
 ---
 
@@ -182,11 +190,27 @@ python install.py --quiet --no-joern --no-containers
 <a id="requirements"></a>
 ### Requirements
 
+**Required (the install will halt and ask if missing):**
 - **Python 3.11 or newer** — 3.12 is the version we develop and CI-test on; 3.13 is supported. 3.10 and older are rejected (we depend on stdlib `tomllib`, which lands in 3.11).
 - **Docker** or **Podman** (for Weaviate + Ollama containers)
-- **Claude Code** CLI (`npm install -g @anthropic-ai/claude-code`)
-- **Claude Max** subscription (for Claude Code access)
-- **Node.js 18+** (for Claude CLI)
+- **Claude Code** CLI (`npm install -g @anthropic-ai/claude-code`) — auto-installed via npm if Node is present
+- **Claude Max** subscription (for Claude Code access; not auto-installable)
+- **Node.js 18+** with `npm` — required for Claude Code itself AND for building the launcher GUI from source. NOT needed if you use the bundled prebuilt at `launcher/dist/<arch>/`.
+
+**Auto-installed when needed (install attempts these without further prompts beyond the per-tool [Y/n]):**
+- **`pnpm`** — installed via `npm install -g pnpm` if Node is present and pnpm is missing. Falls back to plain `npm` if the global install fails.
+- **Tauri Linux build deps** (apt only) — `libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, `libayatana-appindicator3-dev`, `librsvg2-dev`, `libsoup-3.0-dev`, `libjavascriptcoregtk-4.1-dev`, `build-essential`, `curl`, `wget`, `file`. Other distros get a manual-install hint with the equivalent package names. Only needed when building the launcher from source (skipped when the bundled prebuilt is present).
+- **GPU drivers** — detected, not auto-installed. The install prints download URLs for NVIDIA / AMD / Apple Silicon paths if no driver is detected.
+
+**Optional companion tools (the install asks; default Y):**
+- **[Joern](https://docs.joern.io/installation/)** — ~600 MB JVM-based code-property-graph tool. Adds CFG (control-flow) and PDG (program-dependence) metrics to the code-graph. Skip with `--no-joern`.
+- **[lean-ctx](https://github.com/yvgude/lean-ctx)** — Rust binary that compresses CLI output by ~95%. Wires `BASH_ENV` so non-interactive subshells get the same compression. Auto-installs via Homebrew / Cargo / AUR (yay/paru) when one of those is present. Skip with `--no-lean-ctx`.
+
+**Pre-installed assumptions (the install will fail clearly if missing — no auto-install path):**
+- **`bash`** (Linux/macOS) or **`cmd.exe`** + **`PowerShell 5.1+`** (Windows) — POSIX/Windows guarantees.
+- **`curl` OR `wget`** — needed for downloading the Joern installer and (when not bundled) the launcher binary from GitHub Releases. macOS always has `curl`; Linux Alpine/NixOS minimal may have neither and need `apt install curl` first.
+- **`hdiutil`** (macOS only, for mounting `.dmg`) — ships with macOS.
+- **`pkexec`** (Linux only, for graphical sudo prompts during Podman/apt installs) — present on most desktop distros.
 
 > Already running Weaviate or Ollama? See [docs/GETTING_STARTED.md → Coexisting with other Weaviate or Ollama installs](docs/GETTING_STARTED.md#coexisting-with-other-weaviate-or-ollama-installs) — install detects existing services by content and adopts cleanly without polluting host collections.
 

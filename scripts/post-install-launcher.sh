@@ -1061,13 +1061,18 @@ fi
 # Spawn detached. nohup + & + setsid (where available) decouples from this
 # shell so first-install can exit without killing the GUI. Redirect stdio
 # to /dev/null. Suppress any spawn failure: never block exit-0.
-_spawn_pid=""
+#
+# `$!` (PID of last bg job) is unset under set -u because the
+# `(... &)` subshell scope closes before we read it. Use the param-default
+# form `${!:-0}` to keep set -u happy. The PID is informational only —
+# we use it for the log event, not for any wait/signal logic.
+_spawn_pid="0"
 if command -v setsid >/dev/null 2>&1; then
     (setsid nohup "$LAUNCHER_BIN" >/dev/null 2>&1 < /dev/null &) || true
-    _spawn_pid=$!
+    _spawn_pid="${!:-0}"
 else
     (nohup "$LAUNCHER_BIN" >/dev/null 2>&1 < /dev/null &) || true
-    _spawn_pid=$!
+    _spawn_pid="${!:-0}"
 fi
 disown 2>/dev/null || true
 
