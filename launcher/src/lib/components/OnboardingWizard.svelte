@@ -394,8 +394,40 @@
     if (step === 4) void loadStep4();
   });
 
+  // Skip the install steps when the launcher is running from inside an
+  // already-installed orchestrator. The user just ran `bash first-install.sh`;
+  // they don't want a "Welcome → System → Containers → Install at /home/.../
+  // vibecoded-orchestrator" flow. They want to register their first project.
+  // Reported 2026-04-27 from real install testing — the default-path field
+  // was being concatenated with user-typed absolute paths and producing
+  // garbage like /home/.../vibecoded-orch/home/.../Agape/Code.
+  let alreadyInstalledRoot = $state<string | null>(null);
+  let preflightChecked = $state(false);
+  async function preflightSkipIfAlreadyInstalled() {
+    if (!inTauri) {
+      preflightChecked = true;
+      return;
+    }
+    try {
+      const root = await invoke<string | null>('detect_existing_install_root');
+      if (root) {
+        alreadyInstalledRoot = root;
+        installPath = root;
+        installed = true;
+        // Jump straight to step 4 — first project. The user is past
+        // installing the orchestrator; they need to register a project.
+        step = 4;
+      }
+    } catch {
+      // Non-fatal — fall through to the normal wizard flow.
+    } finally {
+      preflightChecked = true;
+    }
+  }
+
   onMount(() => {
     // Caller decides whether to open; we only check the flag if asked.
+    void preflightSkipIfAlreadyInstalled();
   });
 
   export function shouldShow(): boolean {
@@ -509,29 +541,54 @@
               </ul>
               {#if services.all_detected}
                 <p class="ow-secondary">
-                  Your install will reuse these. Per-install isolation comes from
-                  separate Knowledge Graph collections inside the shared Weaviate.
+                  Your install will <strong>reuse these running services</strong>.
+                  Project-level isolation comes from per-project Knowledge Graph
+                  and Code Graph collections inside the shared Weaviate — your
+                  data won't mix with other projects', and each project sees
+                  only what it has access to.
+                </p>
+                <p class="ow-secondary">
+                  This is the recommended setup. Memory/CPU footprint stays
+                  flat as you add projects (one Weaviate, one Ollama, one
+                  embedding service for everything).
                 </p>
               {:else if services.none_detected}
                 <p class="ow-secondary">
-                  No services detected — the install will start them via your
-                  container runtime.
+                  No services detected — the install will start fresh ones via
+                  your container runtime. Future projects on this machine will
+                  reuse the same instances unless you opt into the advanced
+                  separate-containers mode below.
                 </p>
               {:else}
                 <p class="ow-secondary">
-                  Some services detected — the install will reuse those and start
-                  any that are missing.
+                  Some services detected — the install will reuse those and
+                  start any that are missing.
                 </p>
               {/if}
-              <label class="ow-checkbox" title="Most users should leave this off.">
+              <label class="ow-checkbox" title="Most users should leave this off — see the warning text when checked.">
                 <input type="checkbox" bind:checked={useSeparateContainers} />
                 <span>Use separate containers for this install (advanced)</span>
               </label>
               {#if useSeparateContainers}
                 <p class="ow-secondary ow-warn">
-                  You'll need to set <code class="ow-mono">VCT_FORCE_SEPARATE_CONTAINERS=1</code>
-                  and pick non-default ports (WEAVIATE_PORT / OLLAMA_PORT /
-                  CODE_EMBED_PORT) in your environment before running the install.
+                  <strong>What this does:</strong> spawns a <em>new</em>
+                  Weaviate, Ollama and code-embed instance dedicated to this
+                  install, instead of adopting the running ones. They will
+                  bind to non-default ports — set <code class="ow-mono">WEAVIATE_PORT</code>,
+                  <code class="ow-mono">OLLAMA_PORT</code>, <code class="ow-mono">CODE_EMBED_PORT</code>,
+                  and <code class="ow-mono">VCT_FORCE_SEPARATE_CONTAINERS=1</code> in your
+                  environment before clicking Install.
+                </p>
+                <p class="ow-secondary ow-warn">
+                  <strong>When to use it:</strong> air-gapped per-project
+                  installs (different KG schema, different model versions,
+                  different storage class). Cost: 2-4 GB extra RAM per
+                  install, fully duplicated model files on disk.
+                </p>
+                <p class="ow-secondary ow-warn">
+                  Project-level isolation does NOT need this — that's already
+                  handled by per-project KG collections in the shared
+                  Weaviate.
                 </p>
               {/if}
             </div>
@@ -569,6 +626,13 @@
                   code-embed cache live. Defaults to your container engine's
                   standard location. Move it if you have limited disk on
                   <code class="ow-mono">$HOME</code>.
+                </p>
+                <p class="ow-secondary">
+                  <strong>Note:</strong> this only matters when this install
+                  spawns its own containers. If shared services were detected
+                  above and you're reusing them, this setting is ignored —
+                  the existing volumes the running services already use stay
+                  in place.
                 </p>
                 <label class="ow-radio">
                   <input

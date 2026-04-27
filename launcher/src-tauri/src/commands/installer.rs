@@ -446,6 +446,34 @@ pub fn get_local_repo_source() -> Result<String, String> {
     find_local_repo_root().map(|p| p.to_string_lossy().to_string())
 }
 
+/// Detect whether the launcher is running from inside an already-installed
+/// orchestrator (i.e. the user did `bash first-install.sh` and we are now
+/// inside that install). The wizard uses this to skip the install step
+/// rather than prompt the user to install AGAIN somewhere else — a real
+/// UX bug surfaced in 2026-04-27 testing where the wizard's default install
+/// path was `~/vibecoded-orchestrator` and a user typing an absolute path
+/// like `~/Desktop/PROGETTI/Agape/Code` would get the two paths concatenated
+/// and write the orchestrator INSIDE the project folder. With self-detection
+/// the wizard can skip directly to project registration.
+///
+/// Returns Some(path) when:
+///  - we can locate the repo root (find_local_repo_root succeeds), AND
+///  - that root contains the canonical install markers: CLAUDE.md +
+///    install.py + .venv/. The .venv check is what distinguishes a
+///    bundled source tree from a complete install.
+#[command]
+pub fn detect_existing_install_root() -> Option<String> {
+    let root = find_local_repo_root().ok()?;
+    let claude_md = root.join("CLAUDE.md");
+    let install_py = root.join("install.py");
+    let venv = root.join(".venv");
+    if claude_md.is_file() && install_py.is_file() && venv.is_dir() {
+        Some(root.to_string_lossy().to_string())
+    } else {
+        None
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Bug 32: pre-flight install safety check.
 //

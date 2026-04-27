@@ -63,6 +63,34 @@ set -uo pipefail
 REPO_ROOT="${1:-}"
 shift || true
 
+# Durable install log written by both install.py and this script. Both
+# the launcher and Claude Code read this on failure to figure out where
+# the install got to. JSONL: one event per line, never PII. See
+# docs/INSTALL_RECOVERY.md for the full schema.
+_install_log_path() {
+    if [ -n "${REPO_ROOT:-}" ] && [ -d "$REPO_ROOT/state/logs" ]; then
+        printf '%s\n' "$REPO_ROOT/state/logs/install.jsonl"
+    fi
+}
+
+_log_event() {
+    # _log_event <step> <phase> <detail>
+    local step="${1:-?}"
+    local phase="${2:-?}"
+    local detail="${3:-}"
+    local path
+    path="$(_install_log_path)"
+    [ -z "$path" ] && return 0
+    local ts
+    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    # Escape minimal: backslash, double-quote, control chars not handled.
+    # Detail strings are bounded (we always pass short literals).
+    local esc_detail
+    esc_detail="$(printf '%s' "$detail" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+    printf '{"ts":"%s","actor":"post-install-launcher.sh","step":"%s","phase":"%s","detail":"%s"}\n' \
+        "$ts" "$step" "$phase" "$esc_detail" >> "$path" 2>/dev/null || true
+}
+
 YES=0
 AUTO_LAUNCH=1
 # Env knob: VCT_NO_AUTO_LAUNCH=1 has the same effect as --no-auto-launch.
@@ -796,15 +824,29 @@ PY
 
     if [ "$MODE" = "build" ]; then
         echo "[launcher] [3/4] $PKG_MGR install"
+        _log_event "build/deps" "start" "$PKG_MGR install"
         if [ "$PKG_MGR" = "pnpm" ]; then
-            pnpm install || { echo "[launcher] pnpm install failed."; MODE="skip"; }
+            if pnpm install; then
+                _log_event "build/deps" "ok" "pnpm install completed"
+            else
+                echo "[launcher] pnpm install failed."
+                _log_event "build/deps" "error" "pnpm install failed"
+                MODE="skip"
+            fi
         else
-            npm install || { echo "[launcher] npm install failed."; MODE="skip"; }
+            if npm install; then
+                _log_event "build/deps" "ok" "npm install completed"
+            else
+                echo "[launcher] npm install failed."
+                _log_event "build/deps" "error" "npm install failed"
+                MODE="skip"
+            fi
         fi
     fi
 
     if [ "$MODE" = "build" ]; then
         echo "[launcher] [4/4] tauri build (this takes 5-15 min)"
+        _log_event "build/tauri" "start" "tauri build --no-bundle (using $PKG_MGR)"
         # `--no-bundle`: skip the DEB/RPM/AppImage/DMG/MSI packaging step.
         # End users only need the executable binary at
         # target/release/vct-launcher* — they're not redistributing the
@@ -816,9 +858,21 @@ PY
         # who do want bundles can run `pnpm tauri build` (no flag) in
         # launcher/ themselves.
         if [ "$PKG_MGR" = "pnpm" ]; then
-            pnpm tauri build --no-bundle || { echo "[launcher] tauri build failed."; MODE="skip"; }
+            if pnpm tauri build --no-bundle; then
+                _log_event "build/tauri" "ok" "release binary built"
+            else
+                echo "[launcher] tauri build failed."
+                _log_event "build/tauri" "error" "pnpm tauri build exit non-zero"
+                MODE="skip"
+            fi
         else
-            npx tauri build --no-bundle || { echo "[launcher] tauri build failed."; MODE="skip"; }
+            if npx tauri build --no-bundle; then
+                _log_event "build/tauri" "ok" "release binary built"
+            else
+                echo "[launcher] tauri build failed."
+                _log_event "build/tauri" "error" "npx tauri build exit non-zero"
+                MODE="skip"
+            fi
         fi
         cd - >/dev/null || true
 
@@ -827,6 +881,9 @@ PY
         if [ -z "$LAUNCHER_BIN" ]; then
             echo "[launcher] Build reported success but no binary found in target/release/."
             echo "           See https://github.com/hotak92/vibecoded-orchestrator/blob/main/launcher/KNOWN_ISSUES.md"
+            _log_event "build/locate" "error" "binary missing after build success"
+        else
+            _log_event "build/locate" "ok" "$LAUNCHER_BIN"
         fi
     fi
 fi
