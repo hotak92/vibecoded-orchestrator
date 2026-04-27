@@ -19,6 +19,7 @@
   import OnboardingWizard from '$lib/components/OnboardingWizard.svelte';
   import ChangelogModal from '$lib/components/ChangelogModal.svelte';
   import ExternalServicesDialog from '$lib/components/ExternalServicesDialog.svelte';
+  import NoContainerRuntimeDialog from '$lib/components/NoContainerRuntimeDialog.svelte';
   import Toast from '$lib/components/Toast.svelte';
   import { selectedProject, projects } from '$lib/stores/projects';
   import { startChangePoller, onChange } from '$lib/stores/changes';
@@ -172,6 +173,7 @@
   <OnboardingWizard bind:open={showOnboarding} />
   <ChangelogModal bind:open={showChangelog} />
   <ExternalServicesDialog />
+  <NoContainerRuntimeDialog />
   <Toast />
   <AdminBadge />
 {/if}
