@@ -19,6 +19,12 @@ pub fn user_claude_json() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".claude.json"))
 }
 
+/// Resolve the project-scoped `.mcp.json` path for a given project folder.
+///
+/// Currently unused: the only caller was the archived `commands::mcp_reg`
+/// Tauri wrapper. Restore from launch-assets/launcher-archived-rust/mcp_reg.rs
+/// if/when a direct-from-FE registration path is wired up.
+#[allow(dead_code)]
 pub fn project_mcp_json(project_folder: &Path) -> PathBuf {
     project_folder.join(".mcp.json")
 }
@@ -217,7 +223,7 @@ mod tests {
         // not read.
         let server = &json["mcpServers"]["my-mcp"];
         assert_eq!(server["type"], "stdio");
-        assert_eq!(server["command"], "/usr/bin/python");
+        assert_eq!(server["command"], test_command);
         assert_eq!(server["args"][0], "server.py");
         assert_eq!(server["env"]["FOO"], "bar");
 
