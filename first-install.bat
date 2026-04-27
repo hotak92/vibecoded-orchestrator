@@ -68,9 +68,11 @@ REM Sniff for our own flags. We accept --no-auto-launch (skip GUI auto-spawn
 REM at the end) and --yes (silent / non-interactive). Pass-through everything
 REM else to install.ps1.
 set "NO_AUTO_LAUNCH=0"
+set "NO_DESKTOP_ICON=0"
 set "YES_FLAG=0"
 for %%A in (%*) do (
     if /I "%%~A"=="--no-auto-launch" set "NO_AUTO_LAUNCH=1"
+    if /I "%%~A"=="--no-desktop-icon" set "NO_DESKTOP_ICON=1"
     if /I "%%~A"=="--yes"             set "YES_FLAG=1"
     if /I "%%~A"=="--non-interactive" set "YES_FLAG=1"
     if /I "%%~A"=="--quiet"           set "YES_FLAG=1"
@@ -382,6 +384,38 @@ if "%NO_AUTO_LAUNCH%"=="1" (
     echo [launcher] --no-auto-launch set. Run start-launcher.bat to open the GUI.
     goto :end
 )
+
+REM ----- Desktop shortcut (opt-out) -----------------------------------------
+REM Create a .lnk on the Desktop + Start Menu so the user can launch the GUI
+REM with double-click. Skip via VCT_NO_DESKTOP_ICON=1, --no-desktop-icon flag,
+REM or by answering N to the prompt.
+if "%VCT_NO_DESKTOP_ICON%"=="1" goto :skip_shortcut
+if "%NO_DESKTOP_ICON%"=="1" goto :skip_shortcut
+if "%YES_FLAG%"=="1" goto :create_shortcut
+set "SHORTCUT_ANS=Y"
+set /p "SHORTCUT_ANS=Create a desktop shortcut for the launcher? [Y/n] "
+if /I "%SHORTCUT_ANS%"=="N" goto :skip_shortcut
+:create_shortcut
+REM Use PowerShell's WScript.Shell to create the .lnk. The IconLocation
+REM points at the launcher's .exe so Windows uses its embedded icon
+REM resource (Tauri bakes the launcher icon into the binary at build time).
+set "DESKTOP_LNK=%USERPROFILE%\Desktop\VCT Launcher.lnk"
+set "STARTMENU_DIR=%APPDATA%\Microsoft\Windows\Start Menu\Programs"
+set "STARTMENU_LNK=%STARTMENU_DIR%\VCT Launcher.lnk"
+if not exist "%STARTMENU_DIR%" mkdir "%STARTMENU_DIR%"
+"%PSCMD%" -NoProfile -ExecutionPolicy Bypass -Command ^
+    "$ws = New-Object -ComObject WScript.Shell;" ^
+    "foreach ($p in @('%DESKTOP_LNK%','%STARTMENU_LNK%')) {" ^
+    "  $s = $ws.CreateShortcut($p);" ^
+    "  $s.TargetPath = '%LAUNCHER_BIN%';" ^
+    "  $s.WorkingDirectory = (Split-Path -Parent '%LAUNCHER_BIN%');" ^
+    "  $s.Description = 'VibeCoded Tools Launcher';" ^
+    "  $s.IconLocation = '%LAUNCHER_BIN%,0';" ^
+    "  $s.Save();" ^
+    "  Write-Host ('[launcher] Shortcut: ' + $p)" ^
+    "}"
+:skip_shortcut
+
 echo.
 echo Installation complete. Opening launcher...
 REM `start "" ...`: empty string is the WINDOW TITLE arg required by `start`
