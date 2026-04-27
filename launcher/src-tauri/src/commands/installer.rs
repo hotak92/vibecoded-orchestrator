@@ -446,6 +446,19 @@ pub fn get_local_repo_source() -> Result<String, String> {
     find_local_repo_root().map(|p| p.to_string_lossy().to_string())
 }
 
+/// Returns true iff `root` is a complete vco install — i.e. it has the
+/// canonical install markers: CLAUDE.md + install.py + .venv/. The
+/// .venv check is the key discriminator between a bundled source tree
+/// (CLAUDE.md + install.py exist but .venv doesn't) and a finished
+/// install (all three exist). Extracted for unit-testability so we can
+/// exercise the predicate without depending on `find_local_repo_root`'s
+/// runtime walk from `current_exe()`.
+fn install_root_complete_at(root: &Path) -> bool {
+    root.join("CLAUDE.md").is_file()
+        && root.join("install.py").is_file()
+        && root.join(".venv").is_dir()
+}
+
 /// Detect whether the launcher is running from inside an already-installed
 /// orchestrator (i.e. the user did `bash first-install.sh` and we are now
 /// inside that install). The wizard uses this to skip the install step
@@ -458,16 +471,12 @@ pub fn get_local_repo_source() -> Result<String, String> {
 ///
 /// Returns Some(path) when:
 ///  - we can locate the repo root (find_local_repo_root succeeds), AND
-///  - that root contains the canonical install markers: CLAUDE.md +
-///    install.py + .venv/. The .venv check is what distinguishes a
-///    bundled source tree from a complete install.
+///  - that root contains the canonical install markers (see
+///    install_root_complete_at).
 #[command]
 pub fn detect_existing_install_root() -> Option<String> {
     let root = find_local_repo_root().ok()?;
-    let claude_md = root.join("CLAUDE.md");
-    let install_py = root.join("install.py");
-    let venv = root.join(".venv");
-    if claude_md.is_file() && install_py.is_file() && venv.is_dir() {
+    if install_root_complete_at(&root) {
         Some(root.to_string_lossy().to_string())
     } else {
         None
@@ -1659,6 +1668,75 @@ mod tests {
     fn test_classify_install_target_fresh_empty_dir() {
         let p = tmp();
         assert_eq!(classify_install_target(&p), InstallMode::Fresh);
+        fs::remove_dir_all(&p).ok();
+    }
+
+    // ---- install_root_complete_at predicate ----------------------------
+    //
+    // Used by the wizard self-detect logic (commit fafdc51) to decide
+    // whether to skip onboarding when the launcher is running from inside
+    // an existing complete install vs a partial copy. Three discriminators:
+    // CLAUDE.md, install.py, .venv/. All three must be present.
+
+    #[test]
+    fn test_install_root_complete_at_complete_dir() {
+        let p = tmp();
+        fs::write(p.join("CLAUDE.md"), "# claude\n").unwrap();
+        fs::write(p.join("install.py"), "# install\n").unwrap();
+        fs::create_dir_all(p.join(".venv")).unwrap();
+        assert!(install_root_complete_at(&p));
+        fs::remove_dir_all(&p).ok();
+    }
+
+    #[test]
+    fn test_install_root_complete_at_missing_venv() {
+        // Bundled source tree (no .venv yet) must NOT be classified as
+        // a complete install — that's the discriminator that fixed the
+        // wizard's "ask user where to install" bug. A bundled-but-not-
+        // installed tree has CLAUDE.md + install.py but no .venv/.
+        let p = tmp();
+        fs::write(p.join("CLAUDE.md"), "# claude\n").unwrap();
+        fs::write(p.join("install.py"), "# install\n").unwrap();
+        // .venv intentionally absent
+        assert!(!install_root_complete_at(&p));
+        fs::remove_dir_all(&p).ok();
+    }
+
+    #[test]
+    fn test_install_root_complete_at_missing_claude_md() {
+        let p = tmp();
+        fs::write(p.join("install.py"), "# install\n").unwrap();
+        fs::create_dir_all(p.join(".venv")).unwrap();
+        assert!(!install_root_complete_at(&p));
+        fs::remove_dir_all(&p).ok();
+    }
+
+    #[test]
+    fn test_install_root_complete_at_missing_install_py() {
+        let p = tmp();
+        fs::write(p.join("CLAUDE.md"), "# claude\n").unwrap();
+        fs::create_dir_all(p.join(".venv")).unwrap();
+        assert!(!install_root_complete_at(&p));
+        fs::remove_dir_all(&p).ok();
+    }
+
+    #[test]
+    fn test_install_root_complete_at_empty_dir() {
+        let p = tmp();
+        assert!(!install_root_complete_at(&p));
+        fs::remove_dir_all(&p).ok();
+    }
+
+    #[test]
+    fn test_install_root_complete_at_venv_is_a_file_not_dir() {
+        // Defensive: if someone (or a misconfigured filesystem) has a
+        // FILE named .venv at the root, we should reject — only a dir
+        // counts. A symlink-to-dir is still ok via .is_dir().
+        let p = tmp();
+        fs::write(p.join("CLAUDE.md"), "# claude\n").unwrap();
+        fs::write(p.join("install.py"), "# install\n").unwrap();
+        fs::write(p.join(".venv"), "not-a-dir\n").unwrap();
+        assert!(!install_root_complete_at(&p));
         fs::remove_dir_all(&p).ok();
     }
 
