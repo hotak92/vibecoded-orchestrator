@@ -23,12 +23,18 @@ if [ -z "$RUNTIME" ]; then
     fi
 fi
 
-# Compose binary: podman-compose or docker compose (v2). User can override.
+# Compose binary: detect both v2 plugin and v1 standalone, for either runtime.
+# User can override via VCT_COMPOSE_CMD.
 COMPOSE_CMD="${VCT_COMPOSE_CMD:-}"
 if [ -z "$COMPOSE_CMD" ]; then
-    if [ "$RUNTIME" = "podman" ] && command -v podman-compose >/dev/null 2>&1; then COMPOSE_CMD="podman-compose"
-    elif [ "$RUNTIME" = "docker" ]; then COMPOSE_CMD="docker compose"
-    else COMPOSE_CMD=""
+    if [ "$RUNTIME" = "podman" ]; then
+        if podman compose version >/dev/null 2>&1; then COMPOSE_CMD="podman compose"
+        elif command -v podman-compose >/dev/null 2>&1; then COMPOSE_CMD="podman-compose"
+        fi
+    elif [ "$RUNTIME" = "docker" ]; then
+        if docker compose version >/dev/null 2>&1; then COMPOSE_CMD="docker compose"
+        elif command -v docker-compose >/dev/null 2>&1; then COMPOSE_CMD="docker-compose"
+        fi
     fi
 fi
 
@@ -47,10 +53,13 @@ for container in "${REQUIRED_CONTAINERS[@]}"; do
     fi
 done
 
-# If any container was missing entirely, bring up the full compose stack
+# If any container was missing entirely, bring up the full compose stack.
+# Don't redirect stderr — surface failures so users can see what went wrong.
 if [ "$needs_compose" = true ] && [ -n "$COMPOSE_CMD" ] && [ -d "$COMPOSE_DIR" ]; then
-    (cd "$COMPOSE_DIR" && $COMPOSE_CMD up -d) 2>/dev/null
+    (cd "$COMPOSE_DIR" && $COMPOSE_CMD up -d)
     echo "Ran '$COMPOSE_CMD up -d' in $COMPOSE_DIR (missing containers detected)"
+elif [ "$needs_compose" = true ] && [ -z "$COMPOSE_CMD" ]; then
+    echo "ensure-containers: $RUNTIME has no compose available (tried '$RUNTIME compose' and standalone) — install $RUNTIME-compose or the compose plugin" >&2
 fi
 
 if [ "$started" -gt 0 ]; then
