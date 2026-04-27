@@ -143,13 +143,20 @@ _check_prerequisites() {
     # genuinely-installed binaries the wrapper just can't be invoked from
     # a non-interactive subshell context.
     _ensure_path_for_tool() {
-        # Locate a real binary for $tool and put its directory on PATH.
-        # Returns 0 if a binary is found (possibly after PATH munging),
-        # 1 if not. Critically: also UNSETS any shell function shadowing
-        # the tool name so subsequent direct invocations actually run
-        # the binary, not the wrapper. Functions take precedence over
-        # PATH in bash, so a wrapped tool stays wrapped even after we
-        # add the bin/ to PATH.
+        # Locate a real binary for $tool and put its directory(ies) on
+        # PATH. Returns 0 if a binary is found (possibly after PATH
+        # munging), 1 if not. Critically: also UNSETS any shell function
+        # shadowing the tool name so subsequent direct invocations
+        # actually run the binary, not the wrapper. Functions take
+        # precedence over PATH in bash, so a wrapped tool stays wrapped
+        # even after we add the bin/ to PATH.
+        #
+        # When the candidate is a symlink (typical for fnm/nvm/voltaa
+        # which symlink ~/.local/bin/<tool> -> <real_install>/bin/<tool>),
+        # we also add the symlink target's parent bin/ to PATH. Reason:
+        # `npx` lives next to `npm` in fnm's real bin/ but is NOT
+        # symlinked into ~/.local/bin/. Without this we'd find `npm` but
+        # later fail at `npx tauri build` because npx isn't reachable.
         local tool="$1"; shift
         if _resolves_to_binary "$tool"; then
             return 0
@@ -157,26 +164,38 @@ _check_prerequisites() {
         local cand
         for cand in "$@"; do
             if [ -x "$cand" ]; then
-                # Use `dirname` of the candidate path itself, NOT
-                # readlink -f. fnm/nvm install npm as a shell shim
-                # at ~/.local/bin/npm pointing at
-                # node_modules/npm/bin/npm-cli.js; readlink -f follows
-                # all hops down to npm-cli.js whose dir doesn't have
-                # the actual npm shim. The candidate dirname IS the
-                # bin/ we want.
                 local cand_dir
                 cand_dir="$(dirname "$cand")"
-                if [ -d "$cand_dir" ]; then
-                    case ":$PATH:" in
-                        *":$cand_dir:"*) ;;
-                        *) export PATH="$cand_dir:$PATH" ;;
+                # Resolve a single symlink hop to find the real install
+                # bin/ — so siblings (npx, corepack, node) are picked up
+                # too. Don't `readlink -f`: that follows ALL hops
+                # including ones into node_modules/npm/bin/npm-cli.js
+                # whose dirname is wrong.
+                local hop_target
+                hop_target="$(readlink "$cand" 2>/dev/null || true)"
+                local hop_dir=""
+                if [ -n "$hop_target" ]; then
+                    case "$hop_target" in
+                        /*) hop_dir="$(dirname "$hop_target")" ;;
+                        *)  hop_dir="$(cd "$cand_dir" && cd "$(dirname "$hop_target")" && pwd 2>/dev/null || true)" ;;
                     esac
-                    # Strip any shell-function shadow now that the
-                    # binary is reachable via PATH.
-                    unset -f "$tool" 2>/dev/null || true
-                    if _resolves_to_binary "$tool"; then
-                        return 0
-                    fi
+                fi
+                local d
+                # Add candidate dir AND symlink target dir (in that order)
+                # so the front of PATH always has the original symlink dir
+                # (so the user's preferred wrapper-free entry wins) but
+                # siblings via the resolved dir are still findable.
+                for d in "$cand_dir" "$hop_dir"; do
+                    [ -z "$d" ] && continue
+                    [ ! -d "$d" ] && continue
+                    case ":$PATH:" in
+                        *":$d:"*) ;;
+                        *) export PATH="$d:$PATH" ;;
+                    esac
+                done
+                unset -f "$tool" 2>/dev/null || true
+                if _resolves_to_binary "$tool"; then
+                    return 0
                 fi
             fi
         done
@@ -618,7 +637,18 @@ PY
             PKG_MGR="pnpm"
         elif [ $HAS_NPM -eq 1 ]; then
             echo "[launcher] pnpm not found. Installing via npm..."
-            npm install -g pnpm 2>/dev/null || _maybe_sudo npm install -g pnpm 2>/dev/null || true
+            # Try without sudo first — fnm/nvm/voltaa users have a
+            # writable npm prefix, so sudo isn't needed and would
+            # actually break (fnm install dir is owned by user).
+            # Fall back to sudo only if the unprivileged attempt fails.
+            # Stream output so we can see WHY it failed (was 2>/dev/null
+            # which masked auth failures).
+            if npm install -g pnpm; then
+                : # success
+            elif [ "$HAS_SUDO" -eq 1 ]; then
+                echo "[launcher] unprivileged npm install -g failed; retrying with sudo..."
+                _maybe_sudo npm install -g pnpm || true
+            fi
             # `npm install -g pnpm` may put the binary in
             # `~/.local/share/npm/bin/`, `~/.npm-global/bin/`, or
             # `/usr/local/lib/node_modules/.bin/`, depending on the npm
@@ -629,24 +659,33 @@ PY
             if _resolves_to_binary pnpm; then
                 PKG_MGR="pnpm"
             else
-                # Probe known npm global-bin locations explicitly.
-                npm_bin="$(npm bin -g 2>/dev/null || true)"
-                if [ -n "$npm_bin" ] && [ -x "$npm_bin/pnpm" ]; then
-                    export PATH="$npm_bin:$PATH"
-                    PKG_MGR="pnpm"
-                else
-                    for cand in \
-                        "$HOME/.local/share/npm/bin" \
-                        "$HOME/.npm-global/bin" \
-                        "/usr/local/lib/node_modules/.bin" \
-                        "$(dirname "$(_resolves_to_binary npm && command -v npm)")"; do
-                        if [ -n "$cand" ] && [ -x "$cand/pnpm" ]; then
-                            export PATH="$cand:$PATH"
-                            PKG_MGR="pnpm"
-                            break
-                        fi
-                    done
+                # Probe npm's GLOBAL prefix to find where it installed
+                # pnpm. Prefer `npm prefix -g` (canonical, works on
+                # npm 7+); fall back to `npm config get prefix` and
+                # well-known prefix locations. `npm bin -g` was
+                # removed in npm 9 — don't rely on it.
+                local npm_prefix=""
+                npm_prefix="$(npm prefix -g 2>/dev/null || npm config get prefix 2>/dev/null || true)"
+                local probe_dirs=()
+                if [ -n "$npm_prefix" ]; then
+                    probe_dirs+=("$npm_prefix/bin")
                 fi
+                probe_dirs+=(
+                    "$HOME/.local/share/npm/bin"
+                    "$HOME/.npm-global/bin"
+                    "/usr/local/lib/node_modules/.bin"
+                )
+                local cand
+                for cand in "${probe_dirs[@]}"; do
+                    if [ -n "$cand" ] && [ -x "$cand/pnpm" ]; then
+                        case ":$PATH:" in
+                            *":$cand:"*) ;;
+                            *) export PATH="$cand:$PATH" ;;
+                        esac
+                        PKG_MGR="pnpm"
+                        break
+                    fi
+                done
                 if [ -z "$PKG_MGR" ]; then
                     echo "[launcher] pnpm install via npm failed. Falling back to npm."
                     PKG_MGR="npm"
