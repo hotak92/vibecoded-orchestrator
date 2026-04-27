@@ -105,6 +105,12 @@ pub fn run() {
             commands::lifecycle::services_get_adoption,
             commands::lifecycle::services_reset_adoption,
             commands::lifecycle::services_find_free_port,
+            // Container-runtime install (no-runtime modal). Linux uses
+            // pkexec to elevate apt/dnf/pacman; macOS/Windows just open
+            // the canonical install page in the user's default browser.
+            commands::runtime_install::runtime_install_podman_linux,
+            commands::runtime_install::runtime_open_install_url,
+            commands::runtime_install::runtime_recheck,
             // Projects v1 (legacy JSON-backed) was deleted 2026-04-28 — frontend
             // is 100% Svelte and uses projects_v2 exclusively. The file
             // commands/projects.rs and types CreateProjectRequest/

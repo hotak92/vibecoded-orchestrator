@@ -442,6 +442,13 @@ pub async fn services_find_free_port(start: u16, end: u16) -> Result<u16, String
 /// page subscribe to the same strings.
 pub const EVT_EXTERNAL_DETECTED: &str = "vct-external-services-detected";
 pub const EVT_LIFECYCLE_PROGRESS: &str = "vct-services-lifecycle";
+/// Emitted when neither Podman nor Docker is detected at launcher boot.
+/// `NoContainerRuntimeDialog.svelte` listens and shows a blocking modal
+/// with OS-specific install options (Linux: button calling
+/// `runtime_install_podman_linux`; macOS/Windows: "Open install page"
+/// + "Re-check" buttons calling `runtime_open_install_url` /
+/// `runtime_recheck`).
+pub const EVT_NO_CONTAINER_RUNTIME: &str = "vct-no-container-runtime";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LifecycleProgress {
@@ -475,12 +482,35 @@ pub async fn auto_start_on_boot(app: AppHandle) {
     let info = match detect_runtime().await {
         Some(i) => i,
         None => {
+            // Surface BOTH events: the existing lifecycle event keeps
+            // the tray/services panel informed (legacy consumer); the
+            // new dedicated event drives the blocking modal that asks
+            // the user to install Podman/Docker. The modal is what the
+            // user actually interacts with — the lifecycle event is
+            // for status text in the tray pill.
             let _ = app.emit(
                 EVT_LIFECYCLE_PROGRESS,
                 LifecycleProgress {
                     phase: "runtime_missing".into(),
                     message: "No container runtime found. Install Podman or Docker to run VCT services.".into(),
                 },
+            );
+            // Payload includes the host OS so the modal can pick the
+            // right copy (auto-install button on Linux, URL-only on
+            // macOS/Windows). Using a plain JSON object keeps the
+            // frontend's TS types simple — no shared schema needed.
+            let os = if cfg!(target_os = "linux") {
+                "linux"
+            } else if cfg!(target_os = "macos") {
+                "macos"
+            } else if cfg!(target_os = "windows") {
+                "windows"
+            } else {
+                "unknown"
+            };
+            let _ = app.emit(
+                EVT_NO_CONTAINER_RUNTIME,
+                serde_json::json!({ "os": os }),
             );
             return;
         }

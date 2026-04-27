@@ -167,6 +167,8 @@ def main() -> int:
                         help="Enable GPU support for Ollama + code embeddings")
     parser.add_argument("--cpu-only", action="store_true",
                         help="Force CPU-only mode (skip GPU detection)")
+    parser.add_argument("--no-gpu-check", action="store_true",
+                        help="Skip GPU driver probing entirely (for environments where nvidia-smi/rocm-smi hangs)")
     parser.add_argument("--low-resource", action="store_true",
                         help="Lightest mode: Jina V2 (768d) via Ollama. For low-RAM/low-VRAM machines.")
     parser.add_argument("--openai-key", type=str, default="",
@@ -271,11 +273,20 @@ def main() -> int:
     # Step 6: Container services (restart on update to pick up config changes)
     if not args.no_containers:
         if not sysinfo.container_cmd:
-            print("\n[!] No container runtime found. Install Docker or Podman.")
-            print("    Docker: https://docs.docker.com/get-docker/")
-            print("    Podman: https://podman.io/getting-started/installation")
-            print("    Or re-run with --no-containers to skip.")
-            return 1
+            # OS-aware prompt: Linux can auto-install via apt/dnf/pacman;
+            # macOS/Windows print URLs only (Homebrew/winget+WSL2 require
+            # user-driven setup we won't shoulder).
+            installed = _prompt_install_container_runtime(args)
+            if installed:
+                # Re-detect after user-confirmed install. PATH may already
+                # contain the new binary in this Python process.
+                sysinfo = sysinfo._replace(container_cmd=_detect_container_runtime())
+            if not sysinfo.container_cmd:
+                # Either the user declined, the package manager failed,
+                # or we're on macOS/Windows (URL-only path). Fall through
+                # to a clear exit with --no-containers escape hatch.
+                print("\n    Or re-run with --no-containers to skip.")
+                return 1
 
         # Step 5b: probe BEFORE compose up. Honors content-based detection
         # and persists the resolution in ~/.vct/services.toml. Foreign
@@ -446,15 +457,41 @@ def _detect_system(args: argparse.Namespace) -> SystemInfo:
         print("  GPU: skipped (--cpu-only)")
     elif args.openai_key:
         print("  GPU: not needed (using OpenAI embeddings)")
+    elif getattr(args, "no_gpu_check", False):
+        print("  GPU: skipped (--no-gpu-check)")
     else:
+        # Layered detection:
+        #   1. nvidia-smi present + working → NVIDIA driver+CUDA OK.
+        #   2. rocm-smi present + working → AMD ROCm driver OK.
+        #   3. Apple Silicon → Metal (built-in).
+        #   4. Else: probe lspci on Linux for "hardware present but
+        #      driver missing"; print URLs.
+        # We do NOT auto-install GPU drivers — they're large (~3 GB),
+        # may need a reboot, and the canonical install path is vendor-
+        # specific. Detection-only here; the launcher GUI offers
+        # opt-in install for users who want it.
         has_gpu, gpu_name = _detect_nvidia_gpu()
         if has_gpu:
-            print(f"  GPU: {gpu_name}")
-        elif os_name == "Darwin" and _detect_apple_silicon():
-            has_metal = True
-            print("  GPU: Apple Silicon (Metal — Ollama uses natively)")
+            extra = _probe_nvidia_versions()
+            if extra:
+                print(f"  GPU: {gpu_name} ({extra})")
+            else:
+                print(f"  GPU: {gpu_name}")
         else:
-            print("  GPU: none detected (will use CPU)")
+            rocm_present, rocm_info = _detect_amd_rocm()
+            if rocm_present:
+                # Treat ROCm as GPU-capable for the embedding-mode
+                # picker. Ollama supports ROCm natively (per Ollama
+                # docs); if their build doesn't, the user gets a clear
+                # runtime error and can fall back to --cpu-only.
+                has_gpu = True
+                gpu_name = rocm_info
+                print(f"  GPU: {rocm_info}")
+            elif os_name == "Darwin" and _detect_apple_silicon():
+                has_metal = True
+                print("  GPU: Apple Silicon (Metal — built-in, no driver install needed)")
+            else:
+                _print_gpu_hint(os_name)
 
     # Container runtime
     if args.container:
@@ -497,6 +534,155 @@ def _detect_apple_silicon() -> bool:
     return platform.system() == "Darwin" and platform.machine() == "arm64"
 
 
+def _probe_nvidia_versions() -> str:
+    """Best-effort fetch of NVIDIA driver + CUDA version strings.
+
+    Returns a `"driver X.Y, CUDA Z.W"` summary on success, or an empty
+    string on any failure. Purely cosmetic — used to enrich the system-
+    info banner. NEVER raises.
+
+    nvidia-smi output format (csv,noheader): `545.23.06, 12.3` per GPU.
+    We just take the first row.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=driver_version,cuda_version",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            line = result.stdout.strip().splitlines()
+            if line:
+                parts = [p.strip() for p in line[0].split(",")]
+                if len(parts) >= 2:
+                    return f"driver {parts[0]}, CUDA {parts[1]}"
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+    return ""
+
+
+def _detect_amd_rocm() -> tuple[bool, str]:
+    """Detect AMD GPU via ROCm tooling.
+
+    Returns (present, summary). `summary` is human-readable, e.g.
+    "AMD Radeon Pro VII (ROCm 6.0)". Empty string when absent.
+
+    rocm-smi is part of ROCm; if it runs and returns 0, the kernel
+    driver is loaded and at least one supported GPU is visible. We
+    also try `rocm-smi --showdriverversion` for the version string;
+    failure on the version sub-probe is non-fatal — we still return
+    True with a generic summary.
+    """
+    if not shutil.which("rocm-smi"):
+        return False, ""
+    try:
+        # `rocm-smi --showproductname --json` would be cleaner but
+        # JSON output isn't universal across rocm-smi versions. The
+        # plain `--showproductname` text output is a stable fallback.
+        result = subprocess.run(
+            ["rocm-smi", "--showproductname"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return False, ""
+        # Parse a "Card Series: Radeon RX 6800" / "Card model: ..." line
+        # if present; otherwise fall back to a generic label.
+        product = ""
+        for line in result.stdout.splitlines():
+            stripped = line.strip()
+            if "Card Series:" in stripped or "Card Model:" in stripped:
+                product = stripped.split(":", 1)[1].strip()
+                break
+        # Driver version (best effort).
+        driver = ""
+        try:
+            v = subprocess.run(
+                ["rocm-smi", "--showdriverversion"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if v.returncode == 0:
+                for line in v.stdout.splitlines():
+                    if "Driver" in line and ":" in line:
+                        driver = line.split(":", 1)[1].strip()
+                        break
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            pass
+        if product and driver:
+            return True, f"{product} (ROCm driver {driver})"
+        if product:
+            return True, f"{product} (ROCm)"
+        return True, "AMD GPU (ROCm detected)"
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False, ""
+
+
+def _lspci_has_vendor(vendor_substr: str) -> bool:
+    """Linux-only: check `lspci` output for a substring (e.g. "NVIDIA",
+    "AMD/ATI"). Returns False on non-Linux or any probe failure.
+
+    Used to detect "hardware present but driver missing" — when there's
+    NVIDIA silicon in the box but no nvidia-smi, the user almost
+    certainly forgot to install the proprietary driver.
+    """
+    if platform.system() != "Linux" or not shutil.which("lspci"):
+        return False
+    try:
+        result = subprocess.run(
+            ["lspci"], capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return False
+        return vendor_substr.lower() in result.stdout.lower()
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def _print_gpu_hint(os_name: str) -> None:
+    """Print a CPU-only fallback notice + GPU-driver install URLs when
+    we couldn't find a working GPU stack. Best-effort: detects
+    "hardware present but no driver" via lspci on Linux, and prints
+    OS-appropriate URLs everywhere else.
+
+    No auto-install: GPU drivers are vendor-specific, multi-step, often
+    require a reboot, and add gigabytes of disk usage. We surface the
+    canonical install URLs and let the user decide. The launcher GUI
+    can offer an opt-in install button later.
+
+    Reference URLs (canonical only):
+      - NVIDIA Linux:    https://docs.nvidia.com/cuda/cuda-installation-guide-linux/
+      - NVIDIA Windows:  https://developer.nvidia.com/cuda-downloads
+      - AMD ROCm Linux:  https://rocm.docs.amd.com/projects/install-on-linux/en/latest/
+    """
+    print("  GPU: none detected (will use CPU)")
+
+    has_nvidia_hw = _lspci_has_vendor("NVIDIA")
+    has_amd_hw = _lspci_has_vendor("AMD/ATI") or _lspci_has_vendor("ATI Technologies")
+
+    if has_nvidia_hw:
+        print("       NVIDIA hardware detected via lspci, but nvidia-smi is missing.")
+        if os_name == "Linux":
+            print("       Install CUDA toolkit + driver:")
+            print("         Ubuntu:   sudo apt install nvidia-driver-545 nvidia-cuda-toolkit")
+            print("         Fedora:   sudo dnf install xorg-x11-drv-nvidia-cuda")
+            print("         Docs:     https://docs.nvidia.com/cuda/cuda-installation-guide-linux/")
+            print("       Re-run install.py after the driver is installed.")
+        else:
+            print("       https://developer.nvidia.com/cuda-downloads")
+
+    if has_amd_hw:
+        print("       AMD hardware detected via lspci. ROCm is optional but")
+        print("       enables GPU embeddings on supported cards. Install:")
+        print("         https://rocm.docs.amd.com/projects/install-on-linux/en/latest/")
+
+    if os_name == "Windows" and not has_nvidia_hw:
+        # On Windows we can't do the lspci probe; print a softer hint.
+        print("       If you have an NVIDIA GPU, install drivers + CUDA:")
+        print("         https://developer.nvidia.com/cuda-downloads")
+
+
 def _detect_container_runtime() -> str:
     """Detect Docker or Podman. Prefer Podman everywhere — no commercial
     license required, increasingly native on macOS/Windows."""
@@ -513,6 +699,127 @@ def _detect_container_runtime() -> str:
             except (subprocess.TimeoutExpired, OSError):
                 continue
     return ""
+
+
+def _prompt_install_container_runtime(args: argparse.Namespace) -> bool:
+    """Prompt the user to install Podman/Docker when neither is detected.
+
+    Returns True iff an auto-install attempt completed successfully. Caller
+    must re-detect afterward (PATH refresh, etc.).
+
+    OS matrix:
+      - Linux:   We CAN auto-install via apt/dnf/pacman. Prompt y/n;
+                 on yes, run the package-manager command (sudo prompt
+                 surfaces in the controlling terminal).
+      - macOS:   URL only. Homebrew may not be present; Docker Desktop
+                 needs kernel-extension consent on Apple Silicon. We
+                 don't shoulder that.
+      - Windows: URL only. winget on Podman requires WSL2 + admin
+                 elevation; Docker Desktop installer is a separate
+                 download. Print canonical URLs and exit.
+
+    Honors `--yes` / non-TTY by skipping the prompt and printing
+    instructions only (treated as a decline). This matches the spec's
+    "fall back to manual install" rule for non-interactive runs.
+
+    Refs:
+      - Podman install:   https://podman.io/getting-started/installation
+      - Docker Desktop:   https://www.docker.com/products/docker-desktop
+      - Homebrew:         https://brew.sh
+    """
+    os_name = platform.system()
+    print("\n[!] No container runtime found. The orchestrator needs Podman or Docker.")
+
+    non_interactive = bool(args.yes) or not sys.stdin.isatty() or bool(args.quiet)
+
+    if os_name == "Linux":
+        # Detect package manager first; we only prompt for managers we
+        # can actually drive.
+        if shutil.which("apt-get"):
+            cmd = ["sudo", "apt-get", "install", "-y", "podman"]
+            update_cmd = ["sudo", "apt-get", "update"]
+            label = "apt (Debian/Ubuntu)"
+        elif shutil.which("dnf"):
+            cmd = ["sudo", "dnf", "install", "-y", "podman"]
+            update_cmd = None
+            label = "dnf (Fedora/RHEL)"
+        elif shutil.which("pacman"):
+            cmd = ["sudo", "pacman", "-S", "--noconfirm", "podman"]
+            update_cmd = None
+            label = "pacman (Arch)"
+        else:
+            print("    No supported package manager found (apt/dnf/pacman).")
+            print("    Install Podman manually: https://podman.io/getting-started/installation")
+            print("    Or Docker:               https://docs.docker.com/get-docker/")
+            return False
+
+        print(f"    Detected {label}. Will run:")
+        if update_cmd:
+            print(f"      {' '.join(update_cmd)}")
+        print(f"      {' '.join(cmd)}")
+        print("    (You'll be prompted for your sudo password.)")
+
+        if non_interactive:
+            print("    Non-interactive mode — skipping auto-install.")
+            print("    Re-run interactively, or install manually then re-run install.py.")
+            return False
+
+        try:
+            reply = input("    Install podman now? [Y/n] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n    Aborted.")
+            return False
+        if reply and reply[0] != "y":
+            print("    Skipped. Install manually then re-run install.py.")
+            return False
+
+        try:
+            if update_cmd:
+                subprocess.run(update_cmd, check=True)
+            subprocess.run(cmd, check=True)
+        except subprocess.CalledProcessError as e:
+            print(f"    Package install failed (exit {e.returncode}).")
+            print("    Install manually: https://podman.io/getting-started/installation")
+            return False
+        except FileNotFoundError:
+            print("    sudo not found. Install Podman manually:")
+            print("      https://podman.io/getting-started/installation")
+            return False
+        return True
+
+    if os_name == "Darwin":
+        # Homebrew install requires Homebrew already present. Even with
+        # brew, the user still needs `podman machine init && podman
+        # machine start` (Podman runs in a VM on macOS). Don't try to
+        # automate that — surface the canonical instructions.
+        print("    Install one of (we recommend Podman):")
+        print("      brew install podman                                     # if Homebrew is installed")
+        print("      Then: podman machine init && podman machine start")
+        print("    Or download:")
+        print("      Podman:        https://podman.io/getting-started/installation")
+        print("      Docker Desktop: https://www.docker.com/products/docker-desktop")
+        print("      Homebrew:      https://brew.sh   (if not already installed)")
+        return False
+
+    if os_name == "Windows":
+        # Podman on Windows requires WSL2 underneath; winget can install
+        # the Podman binary but not the WSL2 prerequisite + admin
+        # elevation. Docker Desktop is a separate installer. Manual.
+        print("    Install one of (we recommend Podman):")
+        print("      winget install RedHat.Podman                            # if winget is available")
+        print("      Then: podman machine init && podman machine start")
+        print("    Or download:")
+        print("      Podman:         https://podman.io/getting-started/installation")
+        print("      Docker Desktop: https://www.docker.com/products/docker-desktop")
+        print("    Note: Podman on Windows requires WSL2.")
+        print("      WSL2 setup:    https://learn.microsoft.com/windows/wsl/install")
+        return False
+
+    # Other / unknown OS — print generic guidance.
+    print(f"    Unrecognized OS '{os_name}'. Install Podman or Docker manually:")
+    print("      Podman:         https://podman.io/getting-started/installation")
+    print("      Docker:         https://docs.docker.com/get-docker/")
+    return False
 
 
 def _print_system_info(sysinfo: SystemInfo) -> None:

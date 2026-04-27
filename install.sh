@@ -72,8 +72,9 @@ print_manual_hint() {
             echo "  Arch:          sudo pacman -S python python-pip" >&2
             ;;
         darwin*)
-            echo "  macOS:         brew install python@3.12" >&2
+            echo "  macOS (brew):  brew install python@3.12" >&2
             echo "                 (Homebrew: https://brew.sh)" >&2
+            echo "  macOS (download): https://www.python.org/downloads/" >&2
             ;;
         *)
             echo "  Download:      https://python.org/downloads/" >&2
@@ -136,14 +137,48 @@ attempt_install_linux() {
 }
 
 attempt_install_macos() {
+    # We never auto-install Homebrew itself: the official installer is
+    # interactive (asks for sudo password, may need to install Xcode CLT)
+    # and bootstrapping a package manager from a wrapper script is the
+    # kind of side-effect we don't want to silently do for the user.
+    #
+    # Homebrew PATH gotcha: a freshly installed brew may not be on PATH
+    # in this shell yet. Canonical detection (per Homebrew's Tips and
+    # Tricks: https://docs.brew.sh/Tips-and-Tricks):
+    #   - Apple Silicon: /opt/homebrew/bin/brew
+    #   - Intel:         /usr/local/bin/brew
+    #   - Linuxbrew:     /home/linuxbrew/.linuxbrew/bin/brew
+    # We probe those locations and if found, source `brew shellenv` so
+    # subsequent `brew install` calls resolve.
+    if ! command -v brew >/dev/null 2>&1; then
+        for candidate in /opt/homebrew/bin/brew /usr/local/bin/brew /home/linuxbrew/.linuxbrew/bin/brew; do
+            if [ -x "$candidate" ]; then
+                eval "$("$candidate" shellenv)"
+                break
+            fi
+        done
+    fi
     if ! command -v brew &>/dev/null; then
         echo "ERROR: Homebrew not found." >&2
-        echo "       Install from https://brew.sh, then re-run ./install.sh." >&2
+        echo "" >&2
+        echo "       Two ways to get Python 3.11+ on macOS:" >&2
+        echo "" >&2
+        echo "       1) Install Homebrew, then re-run this script:" >&2
+        echo "            https://brew.sh" >&2
+        echo "          Once installed: brew install python@3.12" >&2
+        echo "" >&2
+        echo "       2) Or download the official installer:" >&2
+        echo "            https://www.python.org/downloads/" >&2
+        echo "" >&2
+        echo "       Then re-run ./install.sh." >&2
         return 1
     fi
     echo "Detected Homebrew. Will run:"
     echo "  brew install python@3.12"
     if prompt_yes "Proceed?"; then
+        # `brew install` does not require sudo for Homebrew-managed
+        # prefixes (/opt/homebrew on Apple Silicon, /usr/local on Intel).
+        # Run it uninteractively — no extra prompt needed.
         brew install python@3.12
         return 0
     fi

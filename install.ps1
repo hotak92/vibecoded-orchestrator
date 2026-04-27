@@ -70,6 +70,23 @@ $ErrorActionPreference = "Stop"
 Write-Host "=== VibeCoded Tools - Orchestrator Installer ===" -ForegroundColor Cyan
 Write-Host ""
 
+# ---------------------------------------------------------------------------
+# WSL guard: PowerShell can technically run inside WSL via pwsh, but the
+# orchestrator's container layer (compose against host Podman/Docker) is a
+# different story across the WSL boundary. If we detect WSL, redirect the
+# user to install.sh inside their WSL distro — that's the supported path.
+# `$env:WSL_DISTRO_NAME` is set by Microsoft's WSL runtime; absence means
+# native Windows or non-WSL environment.
+# ---------------------------------------------------------------------------
+if ($env:WSL_DISTRO_NAME) {
+    Write-Host "Detected WSL ('$env:WSL_DISTRO_NAME')." -ForegroundColor Yellow
+    Write-Host "Use the Linux installer instead — run inside your WSL distro:"
+    Write-Host "  ./install.sh"
+    Write-Host ""
+    Write-Host "install.ps1 is for native Windows only."
+    exit 1
+}
+
 # Treat -Quiet, $env:CI, and $env:VCT_NON_INTERACTIVE as non-interactive too.
 $nonInteractiveMode = $NonInteractive -or $Quiet -or `
     ($env:CI -ne $null -and $env:CI -ne "") -or `
@@ -113,9 +130,10 @@ function Find-Python {
 function Print-ManualHint {
     Write-Host ""
     Write-Host "Install Python 3.11+ manually, then re-run install.ps1:" -ForegroundColor Yellow
-    Write-Host "  winget:    winget install Python.Python.3.12 --silent --accept-package-agreements --accept-source-agreements"
-    Write-Host "  Download:  https://python.org/downloads/"
-    Write-Host "  Docs:      https://github.com/hotak92/vibecoded-orchestrator#prerequisites"
+    Write-Host "  winget:           winget install Python.Python.3.12 --silent --accept-package-agreements --accept-source-agreements"
+    Write-Host "  Microsoft Store:  https://apps.microsoft.com/detail/9ncvdn91xzqp        # Python 3.12 (Microsoft Store)"
+    Write-Host "  python.org:       https://www.python.org/downloads/"
+    Write-Host "  Docs:             https://github.com/hotak92/vibecoded-orchestrator#prerequisites"
 }
 
 # ---------------------------------------------------------------------------
@@ -132,8 +150,14 @@ function Prompt-Yes {
 function Attempt-Install-Python {
     $winget = Get-Command "winget" -ErrorAction SilentlyContinue
     if (-not $winget) {
-        Write-Host "ERROR: winget not found. winget ships with Windows 10 1809+ / 11." -ForegroundColor Red
-        Write-Host "       Update Windows or install Python manually."
+        # winget ships with Windows 10 1809+ / 11; older installs don't
+        # have it, and we don't try to install winget itself (the
+        # canonical install path is the Microsoft Store, which itself
+        # requires a sign-in flow we won't shoulder).
+        Write-Host "ERROR: winget not found." -ForegroundColor Red
+        Write-Host "       winget ships with Windows 10 1809+ / 11. On older Windows, install Python manually:"
+        Write-Host "         Microsoft Store: https://apps.microsoft.com/detail/9ncvdn91xzqp"
+        Write-Host "         python.org:      https://www.python.org/downloads/"
         return $false
     }
     Write-Host "Detected winget. Will run:"
@@ -144,6 +168,9 @@ function Attempt-Install-Python {
     & winget install Python.Python.3.12 --silent --accept-package-agreements --accept-source-agreements
     if ($LASTEXITCODE -ne 0) {
         Write-Host "ERROR: winget install failed (exit $LASTEXITCODE)." -ForegroundColor Red
+        Write-Host "       Try installing Python manually:"
+        Write-Host "         Microsoft Store: https://apps.microsoft.com/detail/9ncvdn91xzqp"
+        Write-Host "         python.org:      https://www.python.org/downloads/"
         return $false
     }
     return $true
