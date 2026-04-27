@@ -2,6 +2,8 @@
 
 These instructions are loaded by Claude Code whenever you open a project that has the orchestrator installed. They tell Claude how to use the Knowledge Graph, Code Graph, hooks, and MCP servers shipped with this repo.
 
+This repo is licensed **AGPL-3.0**. Any source file you create or modify under `claude_mcp_servers/`, `.claude/scripts/`, `.claude/hooks/`, or top-level packages must keep / inherit the AGPL header. Do not strip license headers when refactoring.
+
 ---
 
 ## SESSION START (always)
@@ -15,176 +17,563 @@ These instructions are loaded by Claude Code whenever you open a project that ha
 
 ---
 
-## CRITICAL: KG-First Search Policy (always)
+## Context Management
+
+**Two-Layer Memory**:
+- `MEMORY.md` (`~/.claude/projects/.../memory/`) — Claude's self-written operational notes. First 200 lines auto-loaded each session (hard cap; silent truncation after). Stable patterns, recurring bug fixes, key paths, user preferences. NOT in git. Keep as concise index; put details in topic files (`debugging.md`, etc.). Edit via `/memory` or ask Claude directly ("remember that...").
+- `.claude/CONTEXT_STATE.md` — Active working memory (250–350 lines, max 500). Current task, recent progress, next steps, active blockers. Update during work, not just at end.
+
+| MEMORY.md | CONTEXT_STATE.md |
+|---|---|
+| "use pnpm not npm", solved recurring bugs, stable architecture facts, service URLs | Current sprint goal, recent progress ✅, next steps, open blockers |
+
+**Other Context**:
+- `.claude/context/archive/` — Completed tasks
+- `.claude/context/plans/` — Active plans (referenced, not auto-loaded)
+
+**Token Efficiency**:
+- Parallel tool calls: Read/Grep multiple files in a single message.
+- Read files directly for files <150 lines; use `offset`/`limit` for larger ones.
+- Cache mentally for 20–30 minutes — don't re-read the same file repeatedly within a session.
+- Limit shell output: `| head -30` or `2>&1 | tail -20`.
+- Skip echoing after writes; trust the tool result.
+- Spawn agents for multi-file ops (cap at 3 parallel).
+
+**Large Documents (>20 pages)**: Skim ToC/structure first, then targeted section reads; note discoveries as you go.
+
+---
+
+## CRITICAL: KG-First Search Policy
 
 **Before searching OR reasoning about project topics, choose the right tool:**
 
-| Need | Tool | Notes |
-|---|---|---|
-| Conceptual question | `hybrid_search` (Weaviate MCP) | Default — searches KG + docs together |
-| Relationships / "what links to what" | `semantic_graph_search` | GraphRAG with WikiLink traversal |
-| Code by purpose / concept | `search_code_graph` | Functions/classes/modules/APIs |
-| Architecture / callers / deps | `query_code_structure` | Structural queries (~50–100 ms) |
-| Known exact term, tag, or title | `kg-search` CLI | ~100 ms keyword/metadata |
-| Quick analysis or rewrite | `chat` (Ollama MCP) | FREE local LLM |
-| Summarize/extract from a file | `read_document` (Ollama MCP) | FREE, auto-chunks large files |
-| Literal string (variable, error) | Grep | Last resort |
-| Specific file you already know | Read | Use `offset`/`limit` for large files |
+1. Conceptual question → `hybrid_search` (Weaviate MCP) — searches KG + docs together
+2. Relational ("what links to what") → `semantic_graph_search` (Weaviate MCP)
+3. Code by purpose → `search_code_graph` (Weaviate MCP)
+4. Architecture / callers / deps → `query_code_structure` (Weaviate MCP)
+5. Known exact term/tag/title → `kg-search` CLI (~100 ms)
+6. Quick analysis or rewrite → `chat` (Ollama MCP, FREE)
+7. Still unsure → `hybrid_search` (most comprehensive)
 
-**This applies to reasoning, not just searching** — do NOT explain what the codebase does, what patterns exist, or what was previously decided from memory alone. Look it up first.
+**This applies to reasoning too** — do NOT explain what the codebase does, what patterns exist, or what was previously decided from memory alone. Look it up first.
 
-**Use the code graph to explore code, not file reads:**
+**Only use Grep/Read when**:
+- User provides exact file path
+- Searching for literal strings (variable names, error messages)
+- File already in context
+- Need line-by-line detail
+
+**Use the code graph to explore the codebase, not file reads:**
 - "How does X work?" → `search_code_graph("X")` BEFORE opening files.
 - "What calls function Z?" → `query_code_structure("callers", "Z")` BEFORE grep.
+- "What does this module import?" → `query_code_structure("dependencies", "file.py")`.
 - Only `Read` once you know which lines you need.
 
-**`detail` parameter** (Weaviate MCP): defaults to `"auto"` — score-driven tiering renders top hits full and marginal hits as a 6-line summary. Override with `"titles"` | `"summary"` | `"single_chunk"` | `"three_chunks"` | `"full"`. Tier thresholds: `KG_TIER_MIN`/`SINGLE_CHUNK`/`THREE_CHUNKS`/`FULL`.
+**Default: check sources first, reason second.**
 
 ---
 
-## Hooks (always)
+## Search Systems
 
-Hooks are bash scripts in `.claude/hooks/`; on Windows they need WSL2 to fire automatically. One-line summary by event:
+**1. kg-search / kg-info (Keyword/Metadata)** — Fast (~100 ms):
+- Known exact terms, tags, node titles
+- `.claude/scripts/kg-search search "term" [--type TYPE] [--tags TAGS]`
+- `.claude/scripts/kg-info info "Node Title"`
+- `.claude/scripts/kg-info connections "Node Title"`
+- Use when: you know the exact term to search for.
 
-| Event | What it does |
-|---|---|
-| `SessionStart` (startup) | Auto-start containers, display KG paths, warn on oversized `CONTEXT_STATE.md` |
-| `SessionStart` (compact/resume) | Re-inject `CONTEXT_STATE.md` + recent commits + active plan + pre-compact snapshot |
-| `UserPromptSubmit` | Workflow reminders + diff-based `CONTEXT_STATE.md` injection (large token savings after first prompt) |
-| `PreToolUse` | Tool-usage logging; KG + code-graph search before `Edit` |
-| `PostToolUse` | Auto-sync `knowledge/` → KG, `docs/` → development collection, code → code-graph queue; `py_compile` / `ruff` / `pyright` on Python; credential scan |
-| `PreCompact` / `PostCompact` | Save git+files snapshot before compaction; log + notify after |
-| `Stop` / `StopFailure` / `SessionEnd` | Cost tracking (`~/.claude/metrics/costs.jsonl`), desktop notifications, final cleanup |
+**2. Weaviate MCP Tools (Semantic/Graph)**:
+- `hybrid_search(query, limit, node_type, tags, days, detail)` — Keyword+semantic across per-project KG + shared KG + project docs, auto-scoped (~1–2 s). **Default search tool.**
+  - `detail` (default `"auto"`) — score-driven verbosity. Five tiers (calibrated 2026-04-10, see `knowledge/concepts/score-driven-retrieval-tiers.md`):
+    - `score < 0.42` → discarded (noise)
+    - `0.42..0.55` → `summary` (LLM description from sidecar, ~6 lines)
+    - `0.55..0.65` → `single_chunk` (matched chunk, ~2000 chars)
+    - `0.65..0.75` → `three_chunks` (matched + neighbours, 3 chunks)
+    - `>= 0.75` → `full` (whole node, up to 7 nearest chunks)
+    Auto-mode varies tier per result based on score → most relevant nodes get richer detail, marginal nodes only get a summary. Token savings ~50% vs uniform `full`.
+    Explicit overrides (`titles`, `summary`, `single_chunk`, `three_chunks`, `full`) apply uniformly to every result. Legacy alias `descriptions` → `summary`. Tier thresholds are tunable via `KG_TIER_MIN` / `KG_TIER_SINGLE_CHUNK` / `KG_TIER_THREE_CHUNKS` / `KG_TIER_FULL` env vars.
+  - Each result carries `score` (0..1) and `tier` (the verbosity actually applied).
+- `semantic_graph_search(query, depth, detail)` — GraphRAG with WikiLink traversal (~1–2 s). Same `detail="auto"` tiering on primary results; connected nodes always render at `summary` tier (graph topology, not score, drove their selection).
+- `store_knowledge_node(..., scope)` — Write node; `scope="project"` (default) or `scope="shared"` (writes into the shared `VibeCodedTools_KnowledgeGraph` collection, visible to every other project).
+- Use when: conceptual queries, discovering patterns, comprehensive research.
 
-Full event list and blocking semantics: `docs/features/03-hooks.md` (or whichever hooks doc your install ships).
+**3. Code Graph (Semantic Code Search)** — Weaviate MCP:
+- `search_code_graph(query, scope, limit, expand_hops, detail)` — Find code by purpose/concept (~200–500 ms).
+  - `scope`: `"all"` (default), `"code"` (functions/classes/modules), `"interaction"` (APIs/cross-service calls).
+  - `expand_hops`: 0 (default) | 1 | 2 — follow call/interaction edges after seed retrieval.
+  - `detail` (default `"auto"`) — code graph has no sidecar so tiering is position-based: `auto` gives top-4 full details + rest as metadata refs (legacy behaviour); `titles` returns metadata refs for all; `full` returns full details for all.
+- `query_code_structure(query_type, target, project)` — Structural queries (~50–100 ms).
+  - Types: `dependencies` | `imports` | `callers` | `methods` | `extends` | `interactions` | `path` | `composes` | `composed_by` | `type_users`.
+  - `path`: target format `"source.func->dest.func"` (BFS up to depth 6).
+  - `composes` / `composed_by`: composition relationships between classes.
+  - `type_users`: functions using a given type in annotations.
+- CLI: `.claude/scripts/code-graph-query search "auth middleware"`.
+- Use when: finding code entities, understanding architecture, cross-service call mapping.
+
+**4. Ollama MCP (Local LLM)** — FREE:
+- `chat(prompt, model, system_prompt, temperature, max_tokens)` — Local inference (~1–3 s).
+- `read_document(file_path, model, task, context_lines)` — Summarize or extract info from files; auto-switches to chunked scan for large files.
+- Models: `qwen3:0.6b` (fast inference), `qwen3:latest` (8B), `qwen3-embedding:0.6b` (text embeddings).
+- Use when: simple analysis, rewrites, summarizing files (all FREE).
+
+**Decision Tree**:
+- Known exact terms → `kg-search`
+- Conceptual search → `hybrid_search` (default — searches KG + docs automatically)
+- Relationships/graph → `semantic_graph_search`
+- Code by purpose → `search_code_graph`
+- Architecture queries → `query_code_structure`
+- Quick analysis → `chat` (Ollama, FREE)
+- Summarize/extract from file → `read_document` (Ollama, FREE)
+- Literal strings → Grep
+- File content → Read
 
 ---
 
-## Scripts (always)
+## Knowledge Graph
+
+**Format** (Obsidian-style `.md` with YAML frontmatter):
+
+```yaml
+---
+title: Node Title
+type: concept  # project, concept, tool, research, model, hardware
+tags: [tag1, tag2]
+created: 2026-01-15T10:30:00Z
+updated: 2026-01-28T14:22:00Z
+valid_from: 2026-01-15T00:00:00Z
+valid_until: null
+status: active  # active, archived, deprecated, idea
+---
+```
+
+**Typed WikiLinks** — `[[relationshipType::Target]]`:
+- `[[uses::Tool]]` — uses a tool/technology
+- `[[implements::Concept]]` — implements a pattern
+- `[[extends::Parent]]` — extends/specializes
+- `[[buildsOn::Work]]` — builds upon
+- `[[relatedTo::Node]]` — general (default)
+
+**Tags**: `#high-level-plan`, `#mid-level-architecture`, `#low-level-implementation`, `#AI`, `#python`, `#idea`, `#implemented`, etc. See `knowledge/TAG_HIERARCHY.md`.
+
+**Node Guidelines**:
+- High-level: broad overviews (<300 lines)
+- Mid-level: specific domains (<200 lines)
+- Low-level: individual tools/models (<150 lines)
+- One node per tool/model/concept
+- Links unidirectional (projects → concepts)
+
+**Per-project isolation**: `KG_COLLECTION` (per-project KG) and `SHARED_KG_COLLECTION` (cross-project shared, default `VibeCodedTools_KnowledgeGraph`) are set per-project via `.vscode/settings.json` `claude-code.env` and `.claude/settings.json` `env`. Per-project opt-out: `SHARED_KG_OPT_OUT=true` skips the shared collection on read. The active workspace determines the active KG, not which project is being discussed.
+
+**Weaviate Collection** (per-project KG, name from `KG_COLLECTION`):
+- Properties: `title`, `content`, `file_path`, `node_type`, `tags`, `links`, `typed_links`, `created_at`, `updated_at`, `valid_from`, `valid_until`, `status`.
+- Search via embeddings, filter by type/tags.
+- Graph queries for reverse links.
+
+**KG Write Rule** — `store_knowledge_node` always writes the `.md` file (upsert: new or changed content). File path resolution priority:
+1. `file_path` is absolute → written directly.
+2. `file_path` is relative + `KG_BASE_DIR` set → `KG_BASE_DIR/file_path` (the VS Code extension sets this to the workspace root).
+3. `file_path` is relative + `KG_BASE_DIR` unset → falls back to the inferred project root.
+
+- `file_path` should include the `knowledge/` prefix (e.g. `knowledge/concepts/foo.md`).
+- Check `file_written: true` and `absolute_path` in the response to confirm where the file landed.
+- Upsert: file is skipped only if content is identical (avoids unnecessary writes).
+- **Preferred workflow**: write the `.md` file directly → `PostToolUse` hook auto-syncs to Weaviate. `store_knowledge_node` is the secondary path (used by agents that can't write files directly).
+- **Warning**: subagents spawned via the Agent tool may inherit a different KG collection from `~/.claude.json` than the one set for the workspace. Pass an absolute `file_path` (or set the agent's `mcpServers` env explicitly) to ensure the file lands in the correct knowledge folder.
+
+---
+
+## Scripts
+
+**Knowledge Graph** (auto venv):
 
 ```bash
-# Knowledge graph
 .claude/scripts/kg-search   search "query" [--type TYPE] [--tags TAGS] [--limit N]
 .claude/scripts/kg-search   list | recent | created [--days N]
 .claude/scripts/kg-info     info "Title"
 .claude/scripts/kg-info     connections "Title"
 .claude/scripts/kg-sync     FILE | --all
 .claude/scripts/kg-duplicates [--threshold 0.95]
+```
 
-# Code graph
+**Code Graph** (auto venv):
+
+```bash
 .claude/scripts/code-graph-analyze  /path/to/repo [--project NAME] [--incremental] [--cfg] [--pdg]
+# --cfg/--pdg require joern in PATH
 .claude/scripts/code-graph-query    search "auth middleware" [--collection TYPE] [--limit N]
 .claude/scripts/code-graph-query    similar "module.function" [--limit N]
 .claude/scripts/code-graph-query    structure dependencies|callers|methods|extends|interactions "target"
 ```
 
-Backend Python helpers (sync, maintain, temporal, vocabulary, code analysis) live next to the wrappers. PowerShell variants (`*.ps1`) ship for Windows users.
+**Backend Python helpers** (next to the wrappers):
+- `search_knowledge.py` — keyword search backend
+- `sync_knowledge_graph.py` — parse/chunk/sync to Weaviate
+- `maintain_knowledge_graph.py` — integrity checks
+- `add_temporal_metadata.py` — add temporal fields from git
+- `query_temporal.py` — point-in-time queries
+- `migrate_to_vocabulary.py` — validate tags/vocabulary
+- `analyze_code_graph.py` — AST-based code entity extraction
+- `query_code_graph.py` — semantic/structural code queries
+
+PowerShell variants (`*.ps1`) ship for Windows users.
+
+**Setup utility**:
+- `.claude/scripts/cleanup-setup-sections.py` — strip the SETUP-ONLY blocks below once first-run is done. Idempotent.
 
 ---
 
-## Knowledge Graph (always)
+## Infrastructure Overview
 
-**Format**: Obsidian-style Markdown with YAML frontmatter under `knowledge/`. Required keys: `title`, `type` (`concept`/`project`/`tool`/`research`/`model`/`hardware`), `tags`, `status`. Typed WikiLinks: `[[uses::Tool]]`, `[[implements::Concept]]`, `[[extends::Parent]]`, `[[buildsOn::Work]]`, `[[relatedTo::Node]]`.
+### Weaviate Vector Database
+- **URL**: `http://localhost:8081` (HTTP), port 50052 (gRPC)
+- **Purpose**: Semantic search across knowledge, code, docs, conversations.
+- **Text embeddings**: `qwen3-embedding:0.6b` via Ollama (1024-dim, Apache 2.0). Requires `num_ctx=8192`.
+- **Code embeddings**: CodeSage-Large-v2 via FastAPI service at port 11440 (2048-dim, Apache 2.0). CPU fallback uses `qwen3-embedding:0.6b` via Ollama.
+- **Named vectors per collection**: KG: `qwen3_embed` (+ `openai_embed` if configured); Code: `codesage_embed` (+ `openai_embed`).
+- **Active search vector**: controlled by `ACTIVE_EMBEDDING` env (`qwen3` default).
+- **Collections** (names depend on `PROJECT_NAME` / `KG_COLLECTION`):
+  - `<KG_COLLECTION>` — per-project KG (`knowledge/`)
+  - `<SHARED_KG_COLLECTION>` — cross-project shared KG (`VibeCodedTools_KnowledgeGraph` by default)
+  - `<DEVELOPMENT_COLLECTION>` — verbose project docs (`docs/`)
+  - `<CONVERSATION_COLLECTION>` — chat history (optional, often disabled)
+  - `CodeModule`, `CodeClass`, `CodeFunction`, `CodeAPI`, `CodeInteraction` — code entities
+- **Access**: Weaviate MCP tools (`hybrid_search`, `semantic_graph_search`, `store_knowledge_node`, `search_code_graph`, `query_code_structure`).
 
-**Size guidelines**: high-level <300 lines, mid-level <200, low-level <150. One node per tool/model/concept. Links unidirectional (projects → concepts).
+### Ollama Local LLM
+- **URL**: `http://localhost:11435`
+- **Purpose**: FREE local inference and embeddings (internal use).
+- **Models**:
+  - `qwen3-embedding:0.6b` — text embeddings (1024 dim, primary; needs `num_ctx=8192`)
+  - `qwen3:0.6b` — fast inference (~50–100 tok/s)
+  - `qwen3:latest` — 8B inference for document processing
+- **Access**: Ollama MCP tools (`chat`, `read_document`).
+- **Cost**: FREE (runs locally).
 
-**Write rule**: write the `.md` file directly → the `PostToolUse` hook auto-syncs to Weaviate. `store_knowledge_node` is the secondary path (used by agents that can't write files); always check `file_written: true` and `absolute_path` in the response. Pass an absolute `file_path` if a subagent might inherit a different KG collection.
+### Code Embedding Service
+- **URL**: `http://localhost:11440` (default; configurable via `CODE_EMBED_PORT`)
+- **Purpose**: GPU-accelerated code embeddings via sentence-transformers.
+- **Model**: CodeSage-Large-v2 (1.3B params, 2048-dim, Apache 2.0).
+- **Start**: `python -m claude_mcp_servers.code_embedding_service.server`
+- **Env**: `CODE_EMBED_BACKEND` (`gpu`/`ollama`), `CODE_EMBED_MODEL`, `CODE_EMBED_DEVICE`, `CODE_EMBED_PORT`.
+- **Fallback**: set `CODE_EMBED_BACKEND=ollama` to skip the GPU path entirely (useful on CPU-only machines).
 
-**Per-project isolation**: `KG_COLLECTION` (per-project KG) and `SHARED_KG_COLLECTION` (cross-project shared, default `VibeCodedTools_KnowledgeGraph`) are set per-project via `.vscode/settings.json` `claude-code.env` and `.claude/settings.json` `env`. Per-project opt-out: `SHARED_KG_OPT_OUT=true`. The active workspace determines the active KG, not which project is being discussed.
+### MCP Servers
+Located in the user's `~/.claude.json`. Each launches via the project venv (`claude_mcp_servers/.venv`):
+- **weaviate-kg** — semantic search and code graph.
+  - Command: `claude_mcp_servers/.venv/bin/python claude_mcp_servers/weaviate_mcp/server.py`
+  - Env: `WEAVIATE_URL`, `OLLAMA_URL`, `EMBEDDING_MODEL`, `KG_COLLECTION`, `SHARED_KG_COLLECTION`, `DEVELOPMENT_COLLECTION`, `GRPC_PORT`, `SHARED_KG_OPT_OUT`.
+- **ollama** — local LLM inference.
+  - Command: `claude_mcp_servers/.venv/bin/python claude_mcp_servers/ollama_mcp/server.py`
+  - Env: `OLLAMA_URL`.
+- **coordination** — local KG-backed coordination notes (decisions, tasks, patterns).
+  - Command: `claude_mcp_servers/.venv/bin/python claude_mcp_servers/coordination_mcp/server.py`
+  - Env: `KG_BASE_DIR` (optional, defaults to project root).
+  - Tools: `post_coordination_note`, `read_coordination_notes`.
 
-Tag hierarchy + vocabulary: `knowledge/TAG_HIERARCHY.md`, `knowledge/VOCABULARY.md` (if shipped).
+**Claude SKU pinning** — this fork pins `claude/opus` → `claude-opus-4-6` (not 4-7) inside the orchestrator's model resolver. Don't rewrite that mapping unless you're consciously upgrading; downstream agents and skills assume 4-6's behaviour.
+
+**Free-tier RL gate** — `_rl_cache_and_rerank` skips RL reranking when `feature_enabled("rl_retrieval") == False`. Pro/MAO licenses unlock RL; free-tier users get plain Weaviate cosine ordering. Nothing breaks when the gate is closed — retrieval just falls back to base scores.
+
+### Hook System
+Located in `.claude/hooks/` — automated workflow actions. On Windows the bash hooks need WSL2 to fire automatically.
+
+**SessionStart (startup)**:
+- `ensure-containers.sh` — auto-start Podman containers (Weaviate, Ollama, code-embed) if not running (background).
+- `session-start-kg-loader.sh` — display KG resource paths.
+- `context-size-check.sh` — warn if `CONTEXT_STATE.md` exceeds 200 lines.
+
+**SessionStart (compact/resume)**:
+- `compact-context-reinject.sh` — re-inject `CONTEXT_STATE.md` + recent commits + active plan + pre-compact snapshot.
+
+**PreCompact (auto)**:
+- `pre-compact-save.sh` — save git status + recent files to `.claude/context/pre-compact-snapshot.md`.
+
+**PostCompact**:
+- `post-compact.sh` — log compaction event + desktop notification (logs to `~/.claude/metrics/compactions.jsonl`).
+
+**UserPromptSubmit**:
+- `user-prompt-submit-reminder.sh` — workflow reminders.
+- `diff-context-inject.sh` — section-level diffs of `CONTEXT_STATE.md` (70–90% token savings after the first prompt).
+
+**PreToolUse**:
+- `pre-tool-use.sh` — log tool usage to `.claude/logs/YYYY-MM-DD_tool_usage.jsonl` (matcher: `*`).
+- `pre-edit-context-inject.sh` — KG + code-graph search before `Edit` (~2.7 s live, ~31 ms cached) (matcher: `Edit(*)`).
+
+**PostToolUse**:
+- `post-file-edit.sh` — auto-sync on file edits: `knowledge/` → KG, `docs/` → development collection, code files → code-graph queue; duplicate detection every 10 edits (matcher: `Edit(*)|Write(*)`).
+- `py_compile` — syntax check on Python writes (matcher: `Write(*.py)`).
+- `ruff` — `ruff check --fix --quiet` auto-fix (background) (matcher: `Edit(*.py)|Write(*.py)`).
+- `pyright` — type checking (background, non-blocking) (matcher: `Edit(*.py)|Write(*.py)`).
+- KG auto-sync — sync knowledge nodes to Weaviate on edit (matcher: `Edit(knowledge/**/*.md)|Write(knowledge/**/*.md)`).
+- document processing — process uploaded documents (matcher: `Write(documents/**/*.md)|Write(documents/**/*.pdf)`).
+- `post-tool-security.sh` — credential scan on written files (matcher: `Edit(*)|Write(*)`).
+
+**ConfigChange**:
+- `config-change-audit.sh` — log `settings.json` changes to JSONL (background).
+
+**Stop**:
+- `cost-tracker.sh` — append `{timestamp, session_id, model, input_tokens, output_tokens, cache_read_tokens, cost_usd}` to `~/.claude/metrics/costs.jsonl`. Summary: `.claude/scripts/cost-summary`.
+- `notify-stop.sh` — desktop notification (`notify-send`).
+
+**StopFailure**:
+- `stop-failure-notify.sh` — urgent notification + failure logging to `~/.claude/metrics/failures.jsonl`.
+
+**TaskCompleted** (Agent Teams only):
+- `task-completed-validate.sh` — quality gates for agent output.
+
+**TeammateIdle** (Agent Teams only):
+- `teammate-idle-redirect.sh` — redirect idle agents to pending plan items.
+
+**SessionEnd**:
+- `session-end.sh` — cleanup, final sync.
+
+**All available hook events** (as of v2.1.81):
+
+| Event | Can Block? | Notes |
+|---|---|---|
+| `SessionStart` | No | Matchers: `startup`, `compact`, `resume` |
+| `UserPromptSubmit` | Yes | |
+| `PreToolUse` | Yes | Matcher = tool name pattern |
+| `PermissionRequest` | Yes | |
+| `PostToolUse` | No | Matcher = tool name pattern |
+| `PostToolUseFailure` | No | |
+| `InstructionsLoaded` | No | Fires when CLAUDE.md/agents/skills loaded (v2.1.69) |
+| `SubagentStart` | No | |
+| `SubagentStop` | Yes | Exit 2 prevents stop |
+| `Notification` | No | |
+| `Stop` | Yes | |
+| `StopFailure` | No | |
+| `PreCompact` | No | |
+| `PostCompact` | No | |
+| `SessionEnd` | No | |
+| `ConfigChange` | Yes | Except policy_settings |
+| `TeammateIdle` | Yes | Exit 2 → feedback to teammate, keeps working. Requires Agent Teams. |
+| `TaskCompleted` | Yes | Exit 2 → task not marked done, stderr fed to model. Requires Agent Teams. |
+| `WorktreeCreate` | Yes | Must print absolute worktree path on stdout |
+| `WorktreeRemove` | No | Cleanup only |
+| `Elicitation` | Yes | MCP server input forms (v2.1.76) |
+| `ElicitationResult` | Yes | Auto-respond to elicitation (v2.1.76) |
 
 ---
 
-## Storage Systems (always)
+## Storage Systems
 
-| Store | Source | Collection | Search via |
-|---|---|---|---|
-| Knowledge Graph | `knowledge/*.md` | `KG_COLLECTION` | `hybrid_search`, `kg-search` |
-| Shared KG | `<orchestrator>/knowledge/` | `SHARED_KG_COLLECTION` | `hybrid_search` (auto-merged) |
-| Code Graph | source files | `CodeModule`/`Class`/`Function`/`API`/`Interaction` | `search_code_graph`, `query_code_structure` |
-| Development docs | `docs/*.md` | `DEVELOPMENT_COLLECTION` | `hybrid_search` (auto-scoped) |
-| Conversation log (optional) | chat history | `CONVERSATION_COLLECTION` | `hybrid_search` (when enabled) |
+**1. Knowledge Graph** (`knowledge/` → `KG_COLLECTION`):
+- Per-project patterns, concepts, learnings.
+- Concise (<300 lines per node).
+- Search: `kg-search` CLI or `hybrid_search` MCP (auto-merges with shared KG + docs).
+- Format: Markdown with YAML frontmatter, typed WikiLinks.
+- Embedding: `qwen3-embedding:0.6b` (1024-dim) via Ollama.
 
-**Decision tree**: reusable pattern → KG. Code entities → code graph. Verbose project docs → development collection. Quick local analysis → Ollama MCP (FREE).
+**2. Shared KG** (`VibeCodedTools_KnowledgeGraph`):
+- Cross-project patterns visible to every workspace by default.
+- Auto-merged into `hybrid_search` results unless `SHARED_KG_OPT_OUT=true`.
+- Write to it explicitly with `store_knowledge_node(scope="shared", ...)`.
+
+**3. Code Graph** (Weaviate collections):
+- **CodeModule** — files with imports and metrics (`path`, `language`, `module_summary`, `loc`, `complexity`).
+- **CodeClass** — classes with inheritance (`name`, `full_name`, `class_body`, `methods`, `extends`, `field_types`, `composes`).
+- **CodeFunction** — functions with call graphs (`name`, `full_name`, `function_body`, `signature`, `calls`, `type_uses`, `cfg_summary`*, `data_flow_vars`*).
+  - *`cfg_summary` / `data_flow_vars` populated only when `--cfg`/`--pdg` flags are used with Joern.*
+- **CodeAPI** — API endpoints with handlers (`endpoint`, `method`, `api_description`, `handler`).
+- **CodeInteraction** — cross-service calls (`interaction_type`, `protocol`, `endpoint`, `confidence`, `direction`). Query: `query_code_structure("interactions", "module.py")`.
+- Search: `search_code_graph`, `query_code_structure` MCPs or `code-graph-query` CLI.
+- Embedding: CodeSage-Large-v2 (2048-dim) via code embedding service (CPU fallback: `qwen3-embedding:0.6b`).
+- Analysis: `.claude/scripts/code-graph-analyze . --project "ProjectName" [--cfg] [--pdg]`.
+
+**4. Development Collection** (`docs/` → `DEVELOPMENT_COLLECTION`):
+- Verbose project-specific docs.
+- Auto-syncs via `post-file-edit` hook.
+- Search: `hybrid_search` (auto-scoped).
+- Embedding: `qwen3-embedding:0.6b` (1024-dim) via Ollama.
+
+**5. Conversation Collection** (`CONVERSATION_COLLECTION`):
+- Chat history, decisions, discoveries.
+- Auto-capture is opt-in (often disabled).
+- Search: `hybrid_search` (auto-scoped when present).
+
+**Decision Tree**:
+- Reusable cross-project pattern → shared KG (`scope="shared"`).
+- Project-specific pattern → per-project KG.
+- Code entities → code graph.
+- Verbose docs → development collection.
+- Quick local analysis → Ollama MCP (FREE).
 
 ---
 
-## Voice + Communication (always)
+## Voice + Communication
 
-**Professional objectivity**
+**Professional Objectivity**:
 - Prioritize technical accuracy over validation.
 - Challenge incorrect assumptions with evidence.
 - Pattern: Challenge → Evidence → Alternative → wait for decision.
 
-**Anti-sycophancy**
-- Check actual evidence before claiming success.
-- Avoid superlatives ("Great!", "Perfect!", "Beautifully!"). State facts: "X launched", not "X working perfectly".
-- When uncertain, say so. Don't validate feelings — explain why.
+**Anti-Sycophancy Rules**:
+- Check actual evidence before claiming success (don't assume).
+- Avoid superlatives: "Great!", "Perfect!", "Beautifully!", "Amazing!"
+- State facts objectively: "X launched", not "X working perfectly".
+- When uncertain, say so: "We'll know when..." not "This will work".
+- Don't validate feelings: "That works because..." not "Great idea!"
+- Challenge politely: "That approach has issues because..." with evidence.
 
-**Specification adherence**
-- Follow specs exactly. No placeholders (`... rest unchanged`, `// existing code`).
-- Implement general solutions, not test-case shortcuts.
-- Real-world functionality per spec > tests passing > speed.
-- Good simplification (remove complexity, keep behavior) — encouraged. Lazy shortcuts (skip features, drop edge cases) — forbidden.
+**Specification Adherence**:
+- Follow specs exactly — don't skip steps or simplify without permission.
+- Never use placeholders: `... rest unchanged`, `// existing code`, `<!-- rest of HTML -->`.
+- Implement general solutions for ALL inputs, not just test cases.
+- Don't hard-code values or make assumptions to finish faster.
+- Priority hierarchy: real-world functionality per spec > tests passing > speed.
+- Good simplification (remove complexity, keep behavior) — encouraged.
+- Lazy shortcuts (skip features, drop edge cases, use workarounds) — forbidden.
+- If task unclear, ask questions — don't guess and implement the wrong thing.
 
-**When to ask vs. decide**
+**When to Ask vs Decide**:
 - Ask: architecture choices, tech selection, breaking changes, multiple plausible approaches.
 - Decide autonomously: bug fixes, optimizations, refactors, docs.
-- If you find yourself reasoning through multiple interpretations in your reply, STOP and ask instead.
+- **Ambiguous requirements**: if you find yourself reasoning through multiple interpretations in your reply, STOP and ask instead. Do not speculate out loud.
 
 ---
 
-## Workflow (always)
+## Workflow
 
-**Knowledge management**
+**Knowledge Management**:
 - Proactively capture: project details, architecture, decisions, preferences, learnings.
 - Create nodes in the appropriate `knowledge/` subfolder; use typed WikiLinks for implementation relationships.
 - Sync via the `PostToolUse` hook or `.claude/scripts/kg-sync`.
 
-**Update `CLAUDE.md` when**: new directories, tech-stack changes, new scripts/tools, new patterns, new KG conventions.
+**Update `CLAUDE.md` when**:
+- New directories, tech-stack changes, new scripts/tools, new patterns, new KG conventions.
 
-**Update `CONTEXT_STATE.md`**: during work, not just at the end. Mark completed subtasks (`✅`). Add discoveries, new nodes, blockers.
+**Update `CONTEXT_STATE.md`**:
+- During work (not just at end).
+- Mark completed subtasks (`✅`).
+- Add discoveries, new nodes, blockers.
 
-**Compaction**: critical context is preserved by `PreCompact`/`PostCompact` hooks. Before compacting manually, update `CONTEXT_STATE.md`. Use `/compact focus on <topic>` to guide the summary.
+**Compaction**: critical context is preserved by `PreCompact` / `PostCompact` hooks. Before compacting manually, update `CONTEXT_STATE.md` with current state, modified files, open blockers. Use `/compact focus on <topic>` to guide the summary.
 
 ---
 
-## Agents & Skills (always)
+## Agents & Skills
 
 The installer drops a default set of agents into `.claude/agents/` and skills into `.claude/skills/`. Customize freely — they are templates, not framework code.
 
 **Invoke skills**: `/skill-name` (e.g. `/architect`, `/tdd`).
-**Spawn agents**: `@agent-name (Model)` via the Agent tool.
+**Spawn agents**: `@agent-name (Model)` via the Agent tool. (`Task` is a legacy alias for `Agent`, renamed in v2.1.63.)
 
-**Model selection**
+**Model Selection**:
 - **Opus**: complex tradeoffs, security review, deep debugging — sparingly.
 - **Sonnet**: implementation, planning, guidance — default.
 - **Haiku**: simple tasks, calculations, tests — freely.
 
-**When to spawn**: parallel to current work, sustained focus (30+ min), isolated context, substantial output (>200 lines). **Don't spawn**: <5 min tasks, needs immediate back-and-forth, exploring/brainstorming.
+**When to Spawn**:
+- Task parallel to current work.
+- Requires sustained focus (30+ min).
+- Isolated context.
+- Substantial output (>200 lines).
 
-**Parallel execution**: cap at 3 parallel agents (avoids context overflow when they all return). Use `run_in_background: true` for independent work. Resume stopped agents with `SendMessage({to: agentId})` (the `resume` param on the Agent tool was removed).
+**Don't Spawn**:
+- <5 min tasks.
+- Needs immediate back-and-forth.
+- Exploring/brainstorming.
 
-**Frontmatter quick reference**
-- Agents: `model`, `tools`/`disallowedTools`, `permissionMode`, `maxTurns`, `effort`, `isolation: worktree`, `background`, `memory`, `skills`, `mcpServers`, `hooks`.
-- Skills: VS Code validates `name`, `description`, `argument-hint`, `disable-model-invocation`, `user-invocable`, `compatibility`, `license`, `metadata`. CLI/runtime also accepts `model`, `effort`, `allowed-tools`, `context: fork`, `agent`, `hooks` (VS Code warns but they work).
+**Handoff Format** (300–500 tokens):
+
+```
+@agent-name (Model)
+Task: One sentence goal
+Context: File paths, patterns, constraints
+Success Criteria: What "done" looks like
+Output: Where to save
+```
+
+**Parallel Execution**:
+- Lengthy task (>2 hours) → break into 3–6 independent subtasks.
+- Spawn multiple agents in a single message via multiple Agent calls.
+- **Cap at 3 parallel agents** to avoid context overflow when they all return.
+- `run_in_background: true` runs the agent in background; you get notified on completion. Use for independent work that doesn't block your next step.
+- Resume stopped agents with `SendMessage({to: agentId})` (the `resume` param on the Agent tool was removed in v2.1.74+).
+
+**Skill Frontmatter** (in `.claude/skills/NAME/SKILL.md`):
+- VS Code validates: `name`, `description`, `argument-hint`, `disable-model-invocation`, `user-invocable`, `compatibility`, `license`, `metadata`.
+- CLI/runtime also accepts (VS Code warns but they work): `model`, `effort`, `allowed-tools`, `context: fork`, `agent`, `hooks`.
+- `model` — `sonnet` | `opus` | `haiku` | full model ID | `inherit`.
+- `disable-model-invocation: true` — only the user can invoke via `/command`.
+- `user-invocable: false` — hide from the `/` menu, only Claude auto-invokes.
+- `context: fork` — run in an isolated subagent context (CLI only).
+
+**Agent Frontmatter** (in `.claude/agents/NAME.md`):
+- `name`, `description` — required.
+- `model` — `sonnet` | `opus` | `haiku` | `inherit` (default) | full model ID.
+- `tools` / `disallowedTools` — allow/deny tool lists.
+- `permissionMode` — `default` | `acceptEdits` | `dontAsk` | `bypassPermissions` | `plan`.
+- `maxTurns` — max agentic turns before stopping.
+- `effort` — `low` | `medium` | `high` | `max` — caps per-agent reasoning cost.
+- `isolation: worktree` — runs in a temporary git worktree (auto-cleaned if no changes).
+- `background: true` — always run as background task.
+- `memory` — `user` | `project` | `local` — enables persistent agent memory directory.
+- `skills` — skills injected into subagent context (not inherited from parent).
+- `mcpServers` — MCP servers scoped to this subagent only.
+- `hooks` — lifecycle hooks scoped to this subagent.
 
 ---
 
-## Context Efficiency (always)
+## Context Efficiency
 
-- Parallel tool calls: Read/Grep multiple files in a single message.
-- File operations: check before reading (Grep first), use `offset`/`limit` for large files, trust writes (no re-reads).
-- Spawn agents for multi-file ops; cap at 3 parallel.
-- Limit shell output: `| head -30` or `2>&1 | tail -20`.
-- `lean-ctx` (if installed) compresses CLI output ~90–97% transparently via `BASH_ENV`. Bypass: `LEAN_CTX_OFF=1 some-command`.
+**File Operations**: check before reading (Grep first), use `offset`/`limit` for large files, trust writes (no re-reads), spawn agents for multi-file ops (cap at 3 parallel).
 
-**Target metrics**: simple <5K tokens, complex <20K, full session <100K.
+**Lean-ctx shim**: `.claude/scripts/leanctx-bash-env.sh` is sourced automatically via the `BASH_ENV` env var set in `.claude/settings.json`. When `lean-ctx` is on PATH, it compresses CLI output ~90–97% by wrapping common commands (`git`, `npm`, `pip`, `grep`, `ls`, `find`, etc.) and stripping boilerplate, progress bars, and redundant lines. Behaviour is identical, output is just much shorter. Bypass:
+- `LEAN_CTX_OFF=1 some-command` — one-shot disable.
+- `lean-ctx bypass "some-command"` — explicit bypass.
+
+The shim is a no-op when `lean-ctx` isn't installed.
+
+**Target Metrics**:
+- Simple: <5K tokens
+- Complex: <20K tokens
+- Session: <100K tokens
 
 ---
 
-## Quick Reference (always)
+## Tool Usage Examples (READ THIS!)
+
+**Example 1: Implementing an authentication feature**
+
+```python
+# WRONG: skip knowledge search, use Grep immediately
+Grep "def.*auth" --type py  # Only finds literal function names
+
+# CORRECT: KG-first search policy
+hybrid_search("authentication patterns for web APIs")          # Find proven patterns
+search_code_graph("authentication middleware", scope="code")   # Find similar code
+query_code_structure("callers", "api.auth.validate_token")     # Understand usage
+search_code_graph("HTTP calls to external API", scope="interaction")  # Cross-service calls
+query_code_structure("interactions", "api/routes.py")          # All outbound calls from a module
+# THEN use Grep for exact strings, Read for detail
+```
+
+**Example 2: User asks about project state or architecture**
+
+```python
+# WRONG: start reasoning immediately from what you remember
+# "Based on what I know, the code graph system uses 5 collections..."
+
+# CORRECT: check CONTEXT_STATE.md + KG first
+Read(".claude/CONTEXT_STATE.md")                   # What's current task / recent work?
+hybrid_search("code graph collections schema")      # What does KG say about this?
+# THEN answer based on what you found, not what you assumed
+```
+
+**Example 3: Quick analysis task**
+
+```python
+# WRONG: use Claude API for simple task (wastes tokens)
+# CORRECT: use Ollama MCP (FREE)
+chat("Rewrite this docstring to be clearer: [docstring]", model="qwen3:0.6b")
+read_document("/path/to/large_file.py", task="find the authentication logic")  # Extract from file, FREE
+```
+
+---
+
+## Quick Reference
 
 - Start: read `.claude/CONTEXT_STATE.md`.
 - Test: `pytest tests/`.
@@ -195,12 +584,14 @@ The installer drops a default set of agents into `.claude/agents/` and skills in
 - Quick analysis (FREE): `chat("prompt", model="qwen3:0.6b")` (Ollama MCP).
 - MCP venv: `source claude_mcp_servers/.venv/bin/activate`.
 - Active plans: `.claude/context/plans/`.
+- Tag hierarchy: `knowledge/TAG_HIERARCHY.md`.
+- Score-tier reference: `knowledge/concepts/score-driven-retrieval-tiers.md`.
 - Plan mode: `claude --plan` or `/plan` (read-only exploration).
 - Compact with focus: `/compact focus on <topic>`.
 - Fix from PR: `claude --from-pr <PR-URL>`.
 
 **Default ports**: Weaviate `8081` (HTTP) / `50052` (gRPC), Ollama `11435`, code-embed service `11440` (optional GPU).
-**Default models**: text embeddings `qwen3-embedding:0.6b` (1024-dim), code embeddings CodeSage-Large-v2 (2048-dim, GPU) / qwen3-embedding (CPU fallback), inference `qwen3:0.6b` / `qwen3:latest`.
+**Default models**: text embeddings `qwen3-embedding:0.6b` (1024-dim), code embeddings CodeSage-Large-v2 (2048-dim, GPU) / `qwen3-embedding:0.6b` (CPU fallback), inference `qwen3:0.6b` / `qwen3:latest`.
 
 ---
 
