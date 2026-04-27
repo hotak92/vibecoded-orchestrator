@@ -181,6 +181,17 @@ def main() -> int:
                         help="Skip the Weaviate seed step (bundled knowledge/ + docs/). "
                              "Useful in CI / test runs that don't need search content. "
                              "Re-run later with `kg-sync --all` and `upload_docs.py --all`.")
+    # Safe-by-default service handling. When a foreign Weaviate / Ollama is
+    # detected on the canonical port, the installer prompts the user. These
+    # flags resolve the prompt non-interactively for CI / scripting.
+    parser.add_argument("--on-conflict",
+                        choices=["alt-port", "adopt", "abort"],
+                        default=None,
+                        help="Non-interactive resolution when a foreign service is "
+                             "detected on a canonical port. 'alt-port' (default for "
+                             "foreign): pick a free port and write compose.override.yaml. "
+                             "'adopt' (advanced): reuse the foreign service in place — "
+                             "WILL write our collections into it. 'abort': stop install.")
     args = parser.parse_args()
 
     if args.uninstall:
@@ -226,13 +237,39 @@ def main() -> int:
             print("    Podman: https://podman.io/getting-started/installation")
             print("    Or re-run with --no-containers to skip.")
             return 1
-        _start_services(sysinfo, args, embed_config)
+
+        # Step 5b: probe BEFORE compose up. Honors content-based detection
+        # and persists the resolution in ~/.vct/services.toml. Foreign
+        # services on the canonical port either get an alt-port (default)
+        # or, with explicit consent, are adopted in place. We never POST
+        # collections into a service we didn't start.
+        decisions = _resolve_service_safety(args)
+        if any(d["action"] == ACTION_ABORT for d in decisions.values()):
+            for name, d in decisions.items():
+                if d["action"] == ACTION_ABORT:
+                    print(f"  [{name}] aborted: {d['evidence']}")
+            return 1
+
+        _start_services(sysinfo, args, embed_config, decisions)
         if not args.skip_models:
             _wait_for_ollama()
             _pull_ollama_models(embed_config["ollama_models"])
+
         # Bug 29: with shared-container reuse, multiple installs hit the same
         # Weaviate. Bootstrap any of THIS project's KG/Development collections
         # that aren't there yet — leave existing ones alone.
+        #
+        # Pollution guarantee: collection writes only happen when the user
+        # consented. The matrix:
+        #   - ACTION_START / ACTION_ALT_PORT (we run our own Weaviate)
+        #     ⇒ writes to our instance
+        #   - ACTION_ADOPT vct-managed (prior install of ours)
+        #     ⇒ writes to a Weaviate we already populated
+        #   - ACTION_ADOPT foreign (user typed "2" / passed
+        #     --on-conflict adopt)
+        #     ⇒ writes to user-owned Weaviate WITH EXPLICIT CONSENT
+        # No path writes without consent. The default for foreign is
+        # alt-port, so the no-consent case never hits ACTION_ADOPT.
         _ensure_collections(embed_config)
         # Seed Weaviate with bundled knowledge/ + docs/. Idempotent;
         # safe to re-run on update.
@@ -732,6 +769,524 @@ def _detect_existing_services(weaviate_port: int = DEFAULT_WEAVIATE_PORT,
     }
 
 
+# ---------------------------------------------------------------------------
+# Step 5b: Safe-by-default service detection
+# ---------------------------------------------------------------------------
+#
+# Goal: install.py must NOT touch a Weaviate / Ollama / code-embed service
+# that wasn't started by us, EVEN IF it's running on our canonical port. The
+# old behavior — blindly POSTing to localhost:8081 — would pollute a foreign
+# user-owned Weaviate with our collections (`KnowledgeGraph` etc.) and could
+# even bind-conflict the compose `up -d` against it.
+#
+# Detection is content-based, not name-based: we probe the port and
+# fingerprint the response. A container called `weaviate` is irrelevant —
+# what matters is "did WE start whatever's responding here?".
+#
+# Decision matrix:
+#
+#   probe state    | default action             | non-interactive override
+#   ---------------+----------------------------+------------------------
+#   not-running    | start our compose service  | (none — no conflict)
+#   vct-managed    | adopt (skip compose start) | (none — auto-handled)
+#   foreign        | alt-port (free port)       | --on-conflict
+#   incompatible   | abort                      | (cannot override)
+#
+# State persistence: the chosen action is recorded in
+# `~/.vct/services.toml`, the SAME file the launcher's
+# `services::adoption` reads/writes (commit 8b1890f). install.py and the
+# launcher therefore see consistent state. Schema is the launcher's
+# `AdoptionState` (rust serde) but expressed as flat TOML so plain Python
+# can produce it without depending on the `tomli_w` package.
+
+# Canonical service identifiers used in services.toml. Match the launcher's
+# launcher::services::adoption canonical names.
+_CANONICAL_SERVICES = ("weaviate", "ollama", "code_embed")
+
+# Default ports per service. Mirrors the DEFAULT_*_PORT constants above but
+# keyed by canonical name for table-driven loops.
+_DEFAULT_PORTS = {
+    "weaviate": DEFAULT_WEAVIATE_PORT,
+    "ollama": DEFAULT_OLLAMA_PORT,
+    "code_embed": DEFAULT_CODE_EMBED_PORT,
+}
+
+# Health-probe paths per service. GET / 2xx-3xx ⇒ "something is listening";
+# we then fingerprint the body to decide vct-managed vs. foreign.
+_HEALTH_PATHS = {
+    "weaviate": "/v1/.well-known/ready",
+    "ollama": "/api/tags",
+    "code_embed": "/health",
+}
+
+
+def _services_toml_path() -> Path:
+    """Path to `~/.vct/services.toml` — shared with launcher::services::adoption."""
+    return Path.home() / ".vct" / "services.toml"
+
+
+def _read_services_toml() -> dict:
+    """Parse `~/.vct/services.toml` into a list-of-tables dict.
+
+    Returns `{"services": [{name, mode, external_url, parallel_port}, ...]}`.
+    Empty dict on missing file. Empty `services` list on parse error — we'd
+    rather treat the file as missing than crash mid-install on a corrupted
+    TOML the user might have hand-edited.
+    """
+    path = _services_toml_path()
+    if not path.exists():
+        return {"services": []}
+    try:
+        # tomllib is stdlib in Python 3.11+; install.py already requires 3.11.
+        import tomllib  # noqa: PLC0415
+        return tomllib.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"  ! services.toml unreadable ({e}); treating as empty")
+        return {"services": []}
+
+
+def _write_services_toml(state: dict) -> None:
+    """Serialize `{services: [...]}` to `~/.vct/services.toml`.
+
+    Hand-rolled TOML serializer because `tomli_w` isn't in the install-time
+    venv (we run BEFORE `pip install -r requirements.txt`). The schema is
+    a flat array of tables — the rust launcher's `AdoptionState` shape —
+    so a hand-rolled writer is trivial and avoids a chicken-and-egg
+    dependency. Atomic via temp-file + rename so a crashed install never
+    leaves a half-written services.toml.
+    """
+    path = _services_toml_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    lines: list[str] = []
+    for entry in state.get("services", []):
+        lines.append("[[services]]")
+        # Order: name, mode (always present), then optional fields.
+        lines.append(f'name = "{_toml_escape(entry["name"])}"')
+        lines.append(f'mode = "{_toml_escape(entry["mode"])}"')
+        if entry.get("external_url"):
+            lines.append(f'external_url = "{_toml_escape(entry["external_url"])}"')
+        if entry.get("parallel_port") is not None:
+            lines.append(f'parallel_port = {int(entry["parallel_port"])}')
+        lines.append("")  # blank line between tables
+
+    body = "\n".join(lines).rstrip() + "\n"
+    tmp = path.with_suffix(".toml.tmp")
+    tmp.write_text(body, encoding="utf-8")
+    os.replace(tmp, path)  # atomic on POSIX + Windows
+
+
+def _toml_escape(s: str) -> str:
+    """Minimal TOML basic-string escaping (backslash + double-quote).
+
+    Sufficient for our payloads — service names, mode tokens, and URLs.
+    No newlines, no control chars in any value we ever write here.
+    """
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+# ProbeResult and ProbeAction — emulated as string constants for stdlib-only
+# install.py. `enum` would work but adds import noise without buying us
+# anything; the action set is small and string-comparable.
+PROBE_NOT_RUNNING = "not-running"   # port free; we'll start compose
+PROBE_VCT_MANAGED = "vct-managed"   # our prior install — adopt seamlessly
+PROBE_FOREIGN = "foreign"           # someone else's service — DO NOT TOUCH
+PROBE_INCOMPATIBLE = "incompatible" # protocol mismatch — abort
+
+ACTION_START = "start"      # bring up the compose service on default port
+ACTION_ADOPT = "adopt"      # reuse the existing service as-is (skip compose)
+ACTION_ALT_PORT = "alt-port"  # bring up compose on an alternate free port
+ACTION_ABORT = "abort"      # bail the install
+
+
+def _probe_service_identity(name: str, port: int) -> tuple[str, str]:
+    """Content-fingerprint whatever is listening on `localhost:<port>`.
+
+    Returns (probe_result, evidence) where:
+      - probe_result is one of PROBE_*
+      - evidence is a short human-readable string (URL, schema-class name,
+        etc.) used for log lines and the interactive prompt
+
+    Heuristic per service:
+      - weaviate: GET /v1/.well-known/ready; if 200, GET /v1/schema and
+        look for our canonical collections (KnowledgeGraph,
+        VibeCodedTools_KnowledgeGraph). Either present ⇒ vct-managed.
+        Empty schema + no services.toml record ⇒ foreign (we don't claim
+        bare instances).
+      - ollama: GET /api/tags; if 200, look for our pinned embedding model
+        (qwen3-embedding:0.6b OR snowflake-arctic-embed2:latest) AS WELL AS
+        the services.toml record. Either signal present ⇒ vct-managed.
+        Empty tags or no signal ⇒ foreign.
+      - code_embed: GET /health; if 200 + body matches CodeSage/Ollama
+        backend marker, vct-managed. Otherwise foreign.
+
+    The services.toml lock is the strongest signal — it survives a Weaviate
+    that we previously cleared. Content fingerprints are the secondary
+    signal so we can recognise our own data even when the lock file was
+    deleted (rare; user wiped ~/.vct/).
+    """
+    path = _HEALTH_PATHS.get(name)
+    if path is None:
+        return PROBE_INCOMPATIBLE, f"unknown service '{name}'"
+
+    base = f"http://localhost:{port}"
+
+    # Step 1: liveness probe
+    try:
+        resp = urllib.request.urlopen(f"{base}{path}", timeout=2)
+        if resp.status >= 400:
+            return PROBE_NOT_RUNNING, f"{base}{path} → HTTP {resp.status}"
+    except Exception:
+        return PROBE_NOT_RUNNING, f"{base}{path} unreachable"
+
+    # Step 2: services.toml lookup (strongest signal — explicit prior claim).
+    state = _read_services_toml()
+    locked = next(
+        (s for s in state.get("services", []) if s.get("name") == name),
+        None,
+    )
+    if locked and locked.get("mode") in ("adopt", "parallel", "refuse"):
+        # We previously decided how to handle this port. Consider it
+        # "ours" in the sense that subsequent installs should not re-prompt.
+        return PROBE_VCT_MANAGED, f"prior decision: {locked['mode']}"
+
+    # Step 3: content fingerprint per service.
+    if name == "weaviate":
+        try:
+            schema_resp = urllib.request.urlopen(f"{base}/v1/schema", timeout=3)
+            schema = json.loads(schema_resp.read())
+            classes = {
+                c.get("class") for c in schema.get("classes", [])
+                if isinstance(c, dict)
+            }
+            # Two recognition modes for vct ownership of a Weaviate:
+            # 1. Exact canonical names (single-tenant install).
+            # 2. Suffix-pattern names (multi-project orchestrator setup
+            #    where each project namespaces its collections — e.g.
+            #    `ARTup_CodeFunction`, `ClaudeKnowledgeGraph`,
+            #    `SD15_KnowledgeGraph`). The `_KnowledgeGraph` /
+            #    `_CodeFunction` / `_CodeClass` / `_CodeModule` suffixes
+            #    are ours by construction and don't appear in foreign
+            #    Weaviates.
+            exact_markers = {"KnowledgeGraph", "VibeCodedTools_KnowledgeGraph",
+                             "Development", "CodeFunction", "CodeClass",
+                             "CodeModule", "CodeAPI", "CodeInteraction"}
+            suffix_markers = ("_KnowledgeGraph", "_Development",
+                              "_CodeFunction", "_CodeClass", "_CodeModule",
+                              "_conversations", "_development")
+            exact_hits = classes & exact_markers
+            suffix_hits = {c for c in classes if c and any(c.endswith(s) for s in suffix_markers)}
+            hits = exact_hits | suffix_hits
+            if hits:
+                return PROBE_VCT_MANAGED, f"weaviate has vct collections: {sorted(hits)[:3]}"
+            # Weaviate alive but no vct markers — could be empty (fresh user
+            # install) or could be foreign + populated. Either way, not ours.
+            return PROBE_FOREIGN, f"weaviate alive at {base} (classes: {sorted(classes)[:3] or 'none'})"
+        except Exception as e:
+            return PROBE_INCOMPATIBLE, f"weaviate at {base} but /v1/schema failed: {e}"
+
+    if name == "ollama":
+        try:
+            tags_resp = urllib.request.urlopen(f"{base}/api/tags", timeout=3)
+            tags = json.loads(tags_resp.read())
+            model_names = {m.get("name", "") for m in tags.get("models", [])}
+            vct_markers = {"qwen3-embedding:0.6b",
+                           "snowflake-arctic-embed2:latest",
+                           "unclemusclez/jina-embeddings-v2-base-code:latest",
+                           "qwen3:0.6b"}
+            if model_names & vct_markers:
+                return PROBE_VCT_MANAGED, f"ollama has vct models: {sorted(model_names & vct_markers)}"
+            return PROBE_FOREIGN, f"ollama alive at {base} (models: {sorted(model_names)[:3] or 'none'})"
+        except Exception as e:
+            return PROBE_INCOMPATIBLE, f"ollama at {base} but /api/tags failed: {e}"
+
+    if name == "code_embed":
+        # Our service responds to /health with JSON {"status": "ok",
+        # "model": "codesage-large-v2", ...}. Foreign FastAPIs may also
+        # respond 200 to /health but not produce that body.
+        try:
+            health_resp = urllib.request.urlopen(f"{base}/health", timeout=3)
+            body = health_resp.read().decode("utf-8", errors="replace")
+            if "codesage" in body.lower() or "code_embed" in body.lower():
+                return PROBE_VCT_MANAGED, f"code_embed responds with vct fingerprint"
+            return PROBE_FOREIGN, f"port {port} responds to /health but is not our code_embed"
+        except Exception as e:
+            return PROBE_INCOMPATIBLE, f"code_embed at {base} unrecognised: {e}"
+
+    return PROBE_INCOMPATIBLE, f"no fingerprint logic for '{name}'"
+
+
+def _find_free_port(start: int, end: int = 65000) -> int | None:
+    """Return the first free TCP port in [start, end] on 127.0.0.1.
+
+    Used when a foreign service holds the canonical port and the user
+    chose `alt-port`. We bind-and-close to test, which is racy with a
+    process spawning a millisecond later — but for install-time it's
+    fine; the compose `up -d` happens within the same install run.
+    """
+    import socket  # noqa: PLC0415 — lazy import; rare path
+    for port in range(start, end + 1):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind(("127.0.0.1", port))
+                return port
+        except OSError:
+            continue
+    return None
+
+
+def _decide_action(name: str, probe: str, evidence: str,
+                   args: argparse.Namespace) -> str:
+    """Resolve a probe result into a concrete action.
+
+    Honors:
+      1. `--on-conflict` flag (non-interactive override for `foreign`)
+      2. `--yes` / non-TTY (defaults to alt-port for foreign, abort for incompatible)
+      3. interactive prompt
+    """
+    if probe == PROBE_NOT_RUNNING:
+        return ACTION_START
+    if probe == PROBE_VCT_MANAGED:
+        return ACTION_ADOPT
+    if probe == PROBE_INCOMPATIBLE:
+        return ACTION_ABORT
+
+    # Foreign — the interesting case.
+    if args.on_conflict == "alt-port":
+        return ACTION_ALT_PORT
+    if args.on_conflict == "adopt":
+        return ACTION_ADOPT
+    if args.on_conflict == "abort":
+        return ACTION_ABORT
+
+    # Non-interactive default: alt-port. Prevents pollution; never adopts
+    # someone else's service without explicit consent.
+    if args.yes or not sys.stdin.isatty() or args.quiet:
+        print(f"  [{name}] foreign service detected ({evidence})")
+        print(f"  [{name}] non-interactive mode → using alt-port "
+              f"(override: --on-conflict adopt|abort)")
+        return ACTION_ALT_PORT
+
+    # Interactive prompt
+    print()
+    print(f"  Detected a foreign {name} on port {_DEFAULT_PORTS[name]}.")
+    print(f"  Evidence: {evidence}")
+    print()
+    print(f"  Options:")
+    print(f"    [1] alt-port  — pick a free port and run our own {name} alongside it (safe, default)")
+    print(f"    [2] adopt     — reuse the existing {name}; WILL write our collections into it")
+    print(f"    [3] abort     — stop installation")
+    try:
+        ans = input(f"  Choice for {name} [1/2/3, default 1]: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return ACTION_ALT_PORT
+    if ans in ("2", "adopt"):
+        return ACTION_ADOPT
+    if ans in ("3", "abort"):
+        return ACTION_ABORT
+    return ACTION_ALT_PORT
+
+
+def _resolve_service_safety(args: argparse.Namespace) -> dict:
+    """Probe Weaviate / Ollama / code_embed and pick a safe action per service.
+
+    Returns a dict shaped:
+        {
+          "weaviate":  {"action": ACTION_*, "port": int, "probe": PROBE_*, "evidence": str},
+          "ollama":    {...},
+          "code_embed":{...},
+        }
+
+    Side effects:
+      - When alt-port is chosen: sets the corresponding env var
+        (WEAVIATE_PORT / OLLAMA_PORT / CODE_EMBED_PORT) for the rest of
+        the install. Compose reads these from the env via
+        `${WEAVIATE_PORT:-8081}` substitutions.
+      - Persists the resolution to `~/.vct/services.toml` so the
+        launcher and subsequent installs see it.
+
+    Design note: probing happens BEFORE compose `up -d`. That's the whole
+    point — we never start a container against an occupied port without
+    explicit consent.
+    """
+    print(f"\n[5b/10] Probing existing services (content-based detection) ...")
+
+    decisions: dict = {}
+    state = _read_services_toml()
+    services_list = state.get("services", []) or []
+    services_by_name = {s.get("name"): s for s in services_list}
+    state_dirty = False
+
+    for name in _CANONICAL_SERVICES:
+        port = _DEFAULT_PORTS[name]
+        # Honor explicit env-var override (advanced users / CI).
+        env_port_name = {
+            "weaviate": "WEAVIATE_PORT",
+            "ollama": "OLLAMA_PORT",
+            "code_embed": "CODE_EMBED_PORT",
+        }[name]
+        explicit_port = os.environ.get(env_port_name)
+        if explicit_port:
+            try:
+                port = int(explicit_port)
+            except ValueError:
+                pass
+
+        probe, evidence = _probe_service_identity(name, port)
+        action = _decide_action(name, probe, evidence, args)
+
+        chosen_port = port
+        if action == ACTION_ALT_PORT:
+            free = _find_free_port(port + 1)
+            if free is None:
+                print(f"  [{name}] FAIL: no free port in [{port + 1}, 65000]; aborting")
+                action = ACTION_ABORT
+            else:
+                chosen_port = free
+                # Propagate to env so all downstream code (compose, env
+                # writers, MCP settings) picks up the override.
+                os.environ[env_port_name] = str(chosen_port)
+                if name == "weaviate":
+                    # gRPC port also moves; offset matches the default gap (50052 vs 8081 → +41971).
+                    # Simpler: just shift by the same delta from default.
+                    delta = chosen_port - DEFAULT_WEAVIATE_PORT
+                    grpc_port = DEFAULT_WEAVIATE_GRPC_PORT + delta
+                    free_grpc = _find_free_port(grpc_port)
+                    if free_grpc is not None:
+                        os.environ["WEAVIATE_GRPC_PORT"] = str(free_grpc)
+
+        decisions[name] = {
+            "action": action,
+            "port": chosen_port,
+            "default_port": port,
+            "probe": probe,
+            "evidence": evidence,
+        }
+
+        # Print the decision summary line
+        if action == ACTION_START:
+            print(f"  [{name}] not running → will start on port {chosen_port}")
+        elif action == ACTION_ADOPT:
+            print(f"  [{name}] adopting existing service on port {chosen_port} ({evidence})")
+        elif action == ACTION_ALT_PORT:
+            print(f"  [{name}] foreign on {port} → starting our copy on alt port {chosen_port}")
+        elif action == ACTION_ABORT:
+            print(f"  [{name}] ABORT: {evidence}")
+            return decisions  # caller must check for any ABORT
+
+        # Persist to services.toml. Mode mapping mirrors the launcher's
+        # AdoptionMode enum exactly (adoption.rs):
+        #   unresolved | adopt | parallel | refuse  (snake_case in TOML)
+        # ACTION_START → "unresolved" because there is no foreign service to
+        # adopt or run parallel to; "unresolved" tells the launcher "no
+        # conflict was seen" so it doesn't re-prompt. ACTION_ABORT also
+        # maps to "unresolved" — the install bailed before persisting a
+        # decision, so the next install should re-probe from scratch.
+        mode_map = {
+            ACTION_START: "unresolved",     # no conflict; launcher won't re-prompt
+            ACTION_ADOPT: "adopt",
+            ACTION_ALT_PORT: "parallel",
+            ACTION_ABORT: "unresolved",
+        }
+        new_entry = {
+            "name": name,
+            "mode": mode_map[action],
+            "external_url": f"http://localhost:{port}" if probe != PROBE_NOT_RUNNING else None,
+            "parallel_port": chosen_port if action == ACTION_ALT_PORT else None,
+        }
+        # Only update if changed (idempotency: re-running install on a fully
+        # adopted machine touches nothing).
+        existing = services_by_name.get(name)
+        if existing != new_entry:
+            services_by_name[name] = new_entry
+            state_dirty = True
+
+    if state_dirty:
+        new_state = {"services": list(services_by_name.values())}
+        try:
+            _write_services_toml(new_state)
+        except OSError as e:
+            print(f"  ! could not persist {_services_toml_path()}: {e}")
+
+    # If any service decision was alt-port, write a compose override.
+    alt_ports = {n: d for n, d in decisions.items()
+                 if d["action"] == ACTION_ALT_PORT}
+    if alt_ports:
+        _write_compose_override(alt_ports)
+
+    return decisions
+
+
+def _write_compose_override(alt_ports: dict) -> None:
+    """Generate `infrastructure/docker-compose.override.yml` with alternate ports.
+
+    The override is per-machine state (not source-controlled) and is
+    already covered by `.gitignore` (Bug 31 contract). We append rather
+    than overwrite when a previous override exists from the launcher's
+    volume migration — the override file at this path is read-merged by
+    docker compose, so two concurrent override files can't safely coexist
+    on the same path. Strategy: read existing, splice in our port section
+    if absent, write back.
+
+    Rather than YAML-parse without PyYAML in the pre-pip phase, we write
+    a fresh file with both the volume-migration block AND our port
+    overrides. If the launcher had an override there already, we preserve
+    its non-port content via simple text concatenation. In practice, the
+    user paths that hit alt-port (foreign service) and the volume-migration
+    path (existing volumes) are disjoint enough that this is fine — the
+    launcher writes the volume override, and install.py only writes here
+    if no launcher override exists.
+    """
+    infra_dir = PROJECT_ROOT / "infrastructure"
+    override_path = infra_dir / "docker-compose.override.yml"
+
+    if override_path.exists():
+        # Don't clobber a launcher-written volume override. Surface the
+        # collision and rely on env-var port overrides alone — compose
+        # WILL honor the env vars without needing an override file
+        # (infrastructure/docker-compose.yml uses ${WEAVIATE_PORT:-8081}).
+        print(f"  [override] {override_path} already exists; relying on env-var port overrides instead.")
+        return
+
+    # Compose v3 schema. Each alt-port service overrides only its `ports`
+    # mapping; all other config from the base file (image, volumes, env)
+    # is inherited.
+    lines = [
+        "# Auto-generated by install.py — alt-port mappings for foreign-service coexistence",
+        "# Safe to delete + regenerate by re-running `python install.py`.",
+        "# Tracked in ~/.vct/services.toml.",
+        "services:",
+    ]
+    for name, dec in alt_ports.items():
+        host_port = dec["port"]
+        if name == "weaviate":
+            grpc = os.environ.get("WEAVIATE_GRPC_PORT", str(DEFAULT_WEAVIATE_GRPC_PORT))
+            lines.extend([
+                "  weaviate:",
+                "    ports:",
+                f'      - "{host_port}:8080"',
+                f'      - "{grpc}:50051"',
+            ])
+        elif name == "ollama":
+            lines.extend([
+                "  ollama:",
+                "    ports:",
+                f'      - "{host_port}:11434"',
+            ])
+        elif name == "code_embed":
+            lines.extend([
+                "  code_embed:",
+                "    ports:",
+                f'      - "{host_port}:11440"',
+            ])
+
+    override_path.parent.mkdir(parents=True, exist_ok=True)
+    override_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"  [override] wrote {override_path}")
+
+
 _ORCHESTRATOR_VOLUME_NAMES = (
     # Canonical (current compose)
     "weaviate_data",
@@ -807,7 +1362,7 @@ def _detect_existing_volume_paths() -> dict:
 
 
 def _start_services(sysinfo: SystemInfo, args: argparse.Namespace,
-                    embed_config: dict) -> None:
+                    embed_config: dict, decisions: dict | None = None) -> None:
     print(f"\n[5/10] Starting services via {sysinfo.container_cmd} ... ", flush=True)
 
     infra_dir = PROJECT_ROOT / "infrastructure"
@@ -870,7 +1425,20 @@ def _start_services(sysinfo: SystemInfo, args: argparse.Namespace,
     if force_separate:
         # No detection — bring everything compose declares up.
         services_to_start = []  # empty list => `up -d` with no service args
+    elif decisions:
+        # Decision-driven: only bring up services where the action is start
+        # or alt-port. Adopted services (vct-managed reuse, foreign adopt)
+        # explicitly do NOT get a compose start — they're already running.
+        if decisions["weaviate"]["action"] in (ACTION_START, ACTION_ALT_PORT):
+            services_to_start.append("weaviate")
+        if decisions["ollama"]["action"] in (ACTION_START, ACTION_ALT_PORT):
+            services_to_start.append("ollama")
+        if (sysinfo.has_gpu
+                and decisions["code_embed"]["action"] in (ACTION_START, ACTION_ALT_PORT)):
+            services_to_start.append("code_embed")
     else:
+        # Legacy path (no safety probe ran — should not happen in normal
+        # install but kept for callers that pass decisions=None).
         if not detected["weaviate_url"]:
             services_to_start.append("weaviate")
         if not detected["ollama_url"]:

@@ -1,6 +1,11 @@
 services:
   weaviate:
     image: cr.weaviate.io/semitechnologies/weaviate:1.28.4
+    # Explicit prefixed name keeps us out of the way of any bare `weaviate`
+    # container the user might already be running. The compose project name
+    # already prefixes generated names, but pinning it makes lifecycle CLI
+    # output self-describing.
+    container_name: vco_weaviate
     ports:
       - "${WEAVIATE_PORT:-8081}:8080"
       - "${WEAVIATE_GRPC_PORT:-50052}:50051"
@@ -25,6 +30,8 @@ services:
     # users should know what daemon they're running, and CI should be able
     # to reproduce builds. Ollama Linux releases: https://github.com/ollama/ollama/releases
     image: docker.io/ollama/ollama:0.20.2
+    # See vco_weaviate note above — same anti-collision rationale.
+    container_name: vco_ollama
     ports:
       - "${OLLAMA_PORT:-11435}:11434"
     volumes:
@@ -41,6 +48,9 @@ services:
     build:
       context: ../claude_mcp_servers/code_embedding_service
       dockerfile: Dockerfile
+    # Kept as `vct_code_embed` (historical) — the launcher's
+    # types.rs::command and volumes.rs::volume_role still reference this
+    # exact name. Don't rename without updating both.
     container_name: vct_code_embed
     restart: unless-stopped
     ports:

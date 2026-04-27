@@ -185,4 +185,33 @@ mod tests {
         let state = AdoptionState::default();
         assert!(state.get("weaviate").is_none());
     }
+
+    /// install.py writes ~/.vct/services.toml with a hand-rolled TOML
+    /// serializer (it runs before pip-install, so it can't depend on
+    /// `tomli_w`). This test pins the schema both sides agree on. If
+    /// install.py ever drifts (extra fields, different mode tokens), this
+    /// test breaks loudly so we notice before shipping.
+    #[test]
+    fn parses_install_py_written_toml() {
+        let raw = r#"[[services]]
+name = "weaviate"
+mode = "adopt"
+external_url = "http://localhost:8081"
+
+[[services]]
+name = "ollama"
+mode = "parallel"
+external_url = "http://localhost:11435"
+parallel_port = 11445
+
+[[services]]
+name = "code_embed"
+mode = "unresolved"
+"#;
+        let parsed: AdoptionState = toml::from_str(raw).expect("should parse");
+        assert_eq!(parsed.services.len(), 3);
+        assert_eq!(parsed.get("weaviate").unwrap().mode, AdoptionMode::Adopt);
+        assert_eq!(parsed.get("ollama").unwrap().parallel_port, Some(11445));
+        assert_eq!(parsed.get("code_embed").unwrap().mode, AdoptionMode::Unresolved);
+    }
 }

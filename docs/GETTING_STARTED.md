@@ -57,6 +57,27 @@ python install.py --quiet --no-joern --no-containers
 
 If anything goes wrong during install, see the troubleshooting table in [README.md](../README.md) and [docs/TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 
+### Coexisting with other Weaviate or Ollama installs
+
+The installer is safe by default if you already have a Weaviate, Ollama, or other vco-managed service running on the canonical ports (`8081`, `11435`, `11440`) — regardless of who started it.
+
+Before bringing up its own containers, `install.py` probes each port and content-fingerprints the response:
+
+- **Nothing on the port** → start our service on the default port.
+- **A prior vco install on the port** → adopt it. No new container, no re-prompt; reuses the running service via the `~/.vct/services.toml` lock file.
+- **A foreign service on the port** (e.g. an unrelated Weaviate, an aihive Ollama, a project's own stack) → default action is **alt-port**: pick the next free port, write `infrastructure/docker-compose.override.yml`, and bring our copy up next to the existing service. Your service is never stopped, modified, or written to.
+
+Override the default with `--on-conflict`:
+
+```
+python install.py --on-conflict alt-port   # default — run our copy on a free port
+python install.py --on-conflict adopt      # advanced — reuse the foreign service IN PLACE
+                                           #   (will write our collections into it)
+python install.py --on-conflict abort      # bail if any conflict is detected
+```
+
+The chosen action per service is recorded in `~/.vct/services.toml` and re-read by both install.py and the launcher, so subsequent runs do not re-prompt.
+
 ## Open the orchestrator in Claude Code
 
 After install, open the `vibecoded-orchestrator` directory in one of the three supported surfaces:
