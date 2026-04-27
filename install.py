@@ -1129,9 +1129,27 @@ def _detect_optional_companions(args: argparse.Namespace) -> bool:
 
     # lean-ctx (optional — wires BASH_ENV so non-interactive Bash subprocesses
     # get ~90-97% command-output compression, same as the interactive shell hook)
+    #
+    # Detection: shutil.which checks PATH only. Many users have lean-ctx
+    # installed via `cargo install lean-ctx` (canonical landing dir
+    # ~/.cargo/bin/) but their non-interactive shell PATH doesn't include
+    # ~/.cargo/bin (cargo's installer adds the line to ~/.profile but
+    # `bash first-install.sh` from a fresh terminal may not have sourced
+    # it yet). Probe known-binary locations as a fallback.
     shim_path = PROJECT_ROOT / ".claude" / "scripts" / "leanctx-bash-env.sh"
-    if shutil.which("lean-ctx"):
-        print("  lean-ctx: detected — wiring BASH_ENV for non-interactive compression")
+    lean_ctx_path = shutil.which("lean-ctx")
+    if not lean_ctx_path:
+        for cand in (
+            Path.home() / ".cargo" / "bin" / "lean-ctx",
+            Path.home() / ".local" / "bin" / "lean-ctx",
+            Path("/usr/local/bin/lean-ctx"),
+            Path("/usr/bin/lean-ctx"),
+        ):
+            if cand.is_file() and os.access(cand, os.X_OK):
+                lean_ctx_path = str(cand)
+                break
+    if lean_ctx_path:
+        print(f"  lean-ctx: detected at {lean_ctx_path} — wiring BASH_ENV for non-interactive compression")
         # Write BASH_ENV into .claude/settings.json at install time.
         # _configure_claude_settings runs later (Step 9), so we patch the env block
         # directly here so Step 9 picks it up when it serialises the settings dict.
