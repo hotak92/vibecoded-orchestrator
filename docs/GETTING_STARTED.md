@@ -4,7 +4,12 @@ This guide walks you through installing the orchestrator, configuring your first
 
 ## Prerequisites
 
-- Python 3.11+
+- **Python 3.11 or newer** (3.12 recommended; 3.13 supported). Older versions fail at the install.py sentinel — we use stdlib `tomllib`, which is 3.11+.
+  - Linux: `sudo apt install python3.12 python3.12-venv` (or `sudo dnf install python3.12`, `sudo pacman -S python`)
+  - macOS: `brew install python@3.12`
+  - Windows: `winget install Python.Python.3.12`
+  - Or: <https://python.org/downloads/>
+  - The `install.sh` / `install.ps1` wrappers can do this for you interactively if Python is missing.
 - Docker or Podman (for Weaviate + Ollama containers)
 - Claude Code CLI (`npm install -g @anthropic-ai/claude-code`) with a Claude Max subscription
 - Node.js 18+

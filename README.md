@@ -4,6 +4,16 @@
 
 Open source. Runs locally. Learns from how you work.
 
+> **Requirements at a glance**
+> - **Python 3.11 or newer** (3.12 recommended; 3.13 also supported)
+> - **Docker** or **Podman**
+> - **Claude Code CLI** + **Claude Max** subscription
+> - **Node.js 18+**
+>
+> The `install.sh` / `install.ps1` wrappers detect a missing Python
+> 3.11+ and offer to install it interactively (apt / dnf / pacman / brew
+> / winget). See [Prerequisites](#requirements) below.
+
 ---
 
 ## What it does
@@ -109,13 +119,29 @@ For non-interactive / CI installs:
 python install.py --quiet --no-joern --no-containers
 ```
 
+<a id="requirements"></a>
 ### Requirements
 
-- **Python 3.11+**
+- **Python 3.11 or newer** — 3.12 is the version we develop and CI-test on; 3.13 is supported. 3.10 and older are rejected (we depend on stdlib `tomllib`, which lands in 3.11).
 - **Docker** or **Podman** (for Weaviate + Ollama containers)
 - **Claude Code** CLI (`npm install -g @anthropic-ai/claude-code`)
 - **Claude Max** subscription (for Claude Code access)
 - **Node.js 18+** (for Claude CLI)
+
+#### Installing Python 3.12
+
+The `install.sh` / `install.ps1` wrappers detect a missing or too-old Python and offer to install one for you (interactive — you'll be prompted before any sudo/admin/winget call). To install manually:
+
+| OS | Command |
+|---|---|
+| **Ubuntu / Debian** | `sudo apt install python3.12 python3.12-venv python3-pip` |
+| **Fedora / RHEL** | `sudo dnf install python3.12` |
+| **Arch** | `sudo pacman -S python python-pip` |
+| **macOS** (Homebrew) | `brew install python@3.12` |
+| **Windows** (winget) | `winget install Python.Python.3.12` |
+| Any | Download from <https://python.org/downloads/> |
+
+If the wrappers can't auto-install (for example, no `winget` on older Windows or no Homebrew on macOS) they fail with a manual hint and the URL above. CI / non-interactive runs (`--quiet` or `VCT_NON_INTERACTIVE=1`) never auto-install — they fail loudly so you can fix it in your CI image.
 
 ### Install Troubleshooting
 

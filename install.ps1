@@ -3,8 +3,16 @@
 .SYNOPSIS
     VibeCoded Tools - Orchestrator Installer for Windows
 .DESCRIPTION
-    Installs the orchestrator with all dependencies.
-    Requires Python 3.11+.
+    Installs the orchestrator with all dependencies. Requires Python 3.11+.
+
+    If Python 3.11+ is not on PATH, this wrapper offers to install it via
+    winget (Python.Python.3.12). Auto-install is INTERACTIVE: pass
+    -NonInteractive (or -Quiet) to disable and just fail with a hint.
+
+    Why a shell wrapper instead of bootstrapping in Python: chicken-and-egg
+    — install.py needs Python to run. A standalone bootstrap binary
+    (Rust/Go) and an `uv` (Astral) bootstrap are tracked for v1.1. For v1.0
+    the lightest touch is a wrapper that leans on winget.
 .PARAMETER NoContainers
     Skip Docker/Podman service setup
 .PARAMETER Gpu
@@ -35,6 +43,8 @@
     Install MAO-tier specialist agents.
 .PARAMETER NoSkills
     Skip installing Claude skills.
+.PARAMETER NonInteractive
+    Refuse to auto-install Python; fail with a hint instead.
 #>
 param(
     [switch]$NoContainers,
@@ -51,7 +61,8 @@ param(
     [switch]$NoJoern,
     [switch]$NoAgents,
     [switch]$WithMaoAgents,
-    [switch]$NoSkills
+    [switch]$NoSkills,
+    [switch]$NonInteractive
 )
 
 $ErrorActionPreference = "Stop"
@@ -59,49 +70,124 @@ $ErrorActionPreference = "Stop"
 Write-Host "=== VibeCoded Tools - Orchestrator Installer ===" -ForegroundColor Cyan
 Write-Host ""
 
-# Find Python 3.11+
-$pythonCmd = $null
-$pythonArgs = @()
+# Treat -Quiet, $env:CI, and $env:VCT_NON_INTERACTIVE as non-interactive too.
+$nonInteractiveMode = $NonInteractive -or $Quiet -or `
+    ($env:CI -ne $null -and $env:CI -ne "") -or `
+    ($env:VCT_NON_INTERACTIVE -ne $null -and $env:VCT_NON_INTERACTIVE -ne "")
 
-foreach ($cmd in @("python3.12", "python3.11", "python3", "python", "py")) {
-    $found = Get-Command $cmd -ErrorAction SilentlyContinue
-    if ($found) {
-        # Use %-formatting (no f-strings) so a stray Python 2 doesn't abort the probe
-        $version = & $cmd -c "import sys; sys.stdout.write('%d.%d' % (sys.version_info[0], sys.version_info[1]))" 2>$null
-        if ($version) {
-            $parts = $version.Split(".")
-            $major = [int]$parts[0]
-            $minor = [int]$parts[1]
-            # Accept major > 3, or major == 3 AND minor >= 11. Reject Python 2.x.
-            if ($major -gt 3 -or ($major -eq 3 -and $minor -ge 11)) {
-                $pythonCmd = $cmd
-                break
+# ---------------------------------------------------------------------------
+# Python detection
+# ---------------------------------------------------------------------------
+function Find-Python {
+    $candidates = @("python3.13", "python3.12", "python3.11", "python3", "python")
+    foreach ($cmd in $candidates) {
+        $found = Get-Command $cmd -ErrorAction SilentlyContinue
+        if ($found) {
+            $version = & $cmd -c "import sys; sys.stdout.write('%d.%d' % (sys.version_info[0], sys.version_info[1]))" 2>$null
+            if ($version) {
+                $parts = $version.Split(".")
+                $major = [int]$parts[0]
+                $minor = [int]$parts[1]
+                if ($major -gt 3 -or ($major -eq 3 -and $minor -ge 11)) {
+                    return @{ Cmd = $cmd; Args = @() }
+                }
             }
         }
     }
-}
-
-# Try Windows py launcher with version flag
-if (-not $pythonCmd) {
+    # Try Windows py launcher with explicit version.
     $pyLauncher = Get-Command "py" -ErrorAction SilentlyContinue
     if ($pyLauncher) {
         foreach ($ver in @("3.13", "3.12", "3.11")) {
             $version = & py "-$ver" -c "import sys; sys.stdout.write('%d.%d' % (sys.version_info[0], sys.version_info[1]))" 2>$null
             if ($LASTEXITCODE -eq 0 -and $version) {
-                $pythonCmd = "py"
-                $pythonArgs = @("-$ver")
-                break
+                return @{ Cmd = "py"; Args = @("-$ver") }
             }
         }
     }
+    return $null
 }
 
-if (-not $pythonCmd) {
-    Write-Host "ERROR: Python 3.11+ required." -ForegroundColor Red
-    Write-Host "Install: winget install Python.Python.3.12"
-    Write-Host "Or download: https://python.org/downloads/"
-    exit 1
+# ---------------------------------------------------------------------------
+# Manual install hint
+# ---------------------------------------------------------------------------
+function Print-ManualHint {
+    Write-Host ""
+    Write-Host "Install Python 3.11+ manually, then re-run install.ps1:" -ForegroundColor Yellow
+    Write-Host "  winget:    winget install Python.Python.3.12 --silent --accept-package-agreements --accept-source-agreements"
+    Write-Host "  Download:  https://python.org/downloads/"
+    Write-Host "  Docs:      https://github.com/hotak92/vibecoded-orchestrator#prerequisites"
 }
+
+# ---------------------------------------------------------------------------
+# Auto-install Python (winget)
+# ---------------------------------------------------------------------------
+function Prompt-Yes {
+    param([string]$Question)
+    if ($nonInteractiveMode) { return $false }
+    $reply = Read-Host "$Question [Y/n]"
+    if ([string]::IsNullOrWhiteSpace($reply)) { return $true }
+    return ($reply -match '^[Yy]')
+}
+
+function Attempt-Install-Python {
+    $winget = Get-Command "winget" -ErrorAction SilentlyContinue
+    if (-not $winget) {
+        Write-Host "ERROR: winget not found. winget ships with Windows 10 1809+ / 11." -ForegroundColor Red
+        Write-Host "       Update Windows or install Python manually."
+        return $false
+    }
+    Write-Host "Detected winget. Will run:"
+    Write-Host "  winget install Python.Python.3.12 --silent --accept-package-agreements --accept-source-agreements"
+    Write-Host "  (May trigger a UAC elevation prompt depending on your machine policy.)"
+    if (-not (Prompt-Yes "Proceed?")) { return $false }
+
+    & winget install Python.Python.3.12 --silent --accept-package-agreements --accept-source-agreements
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "ERROR: winget install failed (exit $LASTEXITCODE)." -ForegroundColor Red
+        return $false
+    }
+    return $true
+}
+
+# ---------------------------------------------------------------------------
+# Main flow
+# ---------------------------------------------------------------------------
+$py = Find-Python
+
+if (-not $py) {
+    Write-Host "Python 3.11+ not found on PATH."
+
+    if ($nonInteractiveMode) {
+        Write-Host "ERROR: non-interactive mode - refusing to auto-install Python." -ForegroundColor Red
+        Print-ManualHint
+        exit 1
+    }
+
+    Write-Host ""
+    Write-Host "vibecoded-orchestrator requires Python 3.11 or newer."
+    Write-Host ""
+
+    if (Attempt-Install-Python) {
+        Write-Host ""
+        Write-Host "Re-checking for Python..."
+        # winget installs may not refresh PATH for the current shell. Reload it.
+        $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + `
+                    [System.Environment]::GetEnvironmentVariable("Path", "User")
+        $py = Find-Python
+        if (-not $py) {
+            Write-Host "ERROR: Python install appeared to succeed but no 3.11+ interpreter is on PATH." -ForegroundColor Red
+            Write-Host "       Open a new PowerShell window and re-run install.ps1."
+            Print-ManualHint
+            exit 1
+        }
+    } else {
+        Print-ManualHint
+        exit 1
+    }
+}
+
+$pythonCmd = $py.Cmd
+$pythonArgs = $py.Args
 
 $pyVersion = if ($pythonArgs.Count -gt 0) {
     & $pythonCmd @pythonArgs --version
