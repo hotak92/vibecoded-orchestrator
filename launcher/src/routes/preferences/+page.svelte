@@ -81,12 +81,17 @@
     <h1>Preferences</h1>
   </header>
 
-  {#if !project}
-    <p class="pr-empty">Select a project from the menu bar.</p>
-  {:else if loading}
-    <p class="pr-empty">Loading…</p>
-  {:else}
-    <main class="pr-main">
+  <main class="pr-main">
+    <!-- Project-scoped settings (KG / module dropdowns) require a selected
+         project. Onboarding and Launcher self-update are app-level — they
+         work for new users who don't have a project yet, so they live
+         OUTSIDE the project guard. -->
+
+    {#if !project}
+      <p class="pr-empty">Select a project from the menu bar to edit project-scoped settings.</p>
+    {:else if loading}
+      <p class="pr-empty">Loading project settings…</p>
+    {:else}
       <p class="pr-hint">
         Settings scoped to <code>{project.name}</code>. They're stored under the <code>launcher</code> module
         namespace in <code>~/.vct/launcher.db</code>.
@@ -113,40 +118,41 @@
           </li>
         {/each}
       </ul>
+    {/if}
 
-      <section class="pr-section">
-        <h2 class="pr-section-title">Onboarding</h2>
-        <div class="pr-onboarding-row">
-          <div class="pr-onboarding-text">
-            <strong>Re-run onboarding wizard</strong>
-            <span class="pr-onboarding-hint">
-              Walks through project setup, KG bindings, and module recommendations again.
-              Existing projects and settings won't be affected.
-            </span>
-          </div>
-          <button class="pr-btn" onclick={() => (showOnboardingConfirm = true)}>
-            Re-run wizard
-          </button>
+    <!-- Onboarding + Updates: app-level, available regardless of project state. -->
+    <section class="pr-section">
+      <h2 class="pr-section-title">Onboarding</h2>
+      <div class="pr-onboarding-row">
+        <div class="pr-onboarding-text">
+          <strong>Re-run onboarding wizard</strong>
+          <span class="pr-onboarding-hint">
+            Walks through project setup, KG bindings, and module recommendations again.
+            Existing projects and settings won't be affected.
+          </span>
         </div>
-      </section>
+        <button class="pr-btn" onclick={() => (showOnboardingConfirm = true)}>
+          Re-run wizard
+        </button>
+      </div>
+    </section>
 
-      <section class="pr-section">
-        <h2 class="pr-section-title">Updates</h2>
-        <div class="pr-onboarding-row">
-          <div class="pr-onboarding-text">
-            <strong>Launcher self-update</strong>
-            <span class="pr-onboarding-hint">
-              Pulls launcher updates from the upstream repo. Daily check, manual apply.
-              User-owned files (CONTEXT_STATE.md, logs, runtime state) are never overwritten.
-            </span>
-          </div>
-          <button class="pr-btn" onclick={() => goto('/preferences/updates')}>
-            Open
-          </button>
+    <section class="pr-section">
+      <h2 class="pr-section-title">Updates</h2>
+      <div class="pr-onboarding-row">
+        <div class="pr-onboarding-text">
+          <strong>Launcher self-update</strong>
+          <span class="pr-onboarding-hint">
+            Pulls launcher updates from the upstream repo. Daily check, manual apply.
+            User-owned files (CONTEXT_STATE.md, logs, runtime state) are never overwritten.
+          </span>
         </div>
-      </section>
-    </main>
-  {/if}
+        <button class="pr-btn" onclick={() => goto('/preferences/updates')}>
+          Open
+        </button>
+      </div>
+    </section>
+  </main>
 </div>
 
 {#if showOnboardingConfirm}
