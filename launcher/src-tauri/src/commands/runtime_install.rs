@@ -281,23 +281,32 @@ pub async fn runtime_install_podman_linux(app: AppHandle) -> Result<(), String> 
 /// users into clicking through to phishing sites. The opener plugin's
 /// scope config in `capabilities/default.json` is permissive (the plugin
 /// defaults allow open_url broadly) — this allowlist is defense-in-depth.
+const ALLOWED_INSTALL_URL_PREFIXES: &[&str] = &[
+    "https://podman.io/",
+    "https://podman-desktop.io/",
+    "https://docs.docker.com/",
+    "https://www.docker.com/products/docker-desktop",
+    "https://brew.sh",
+    "https://www.python.org/downloads/",
+    "https://apps.microsoft.com/detail/",
+    "https://learn.microsoft.com/",
+];
+
+/// Pure allowlist check — extracted so it can be unit-tested without
+/// side-effecting the host's web browser. Earlier the test for the
+/// public command called the FULL function, which on a host with
+/// `DISPLAY=:0` set actually invoked `xdg-open` and popped a browser
+/// tab on every `cargo test` run. Reported by user 2026-04-28.
+fn install_url_is_allowed(url: &str) -> bool {
+    ALLOWED_INSTALL_URL_PREFIXES.iter().any(|p| url.starts_with(p))
+}
+
 #[command]
 pub async fn runtime_open_install_url(url: String) -> Result<(), String> {
     // Strict prefix allowlist: each entry is a URL prefix the modal is
     // allowed to ask us to open. Anything outside this list is a config
     // error or a tampered-with frontend; reject loudly.
-    const ALLOWED_PREFIXES: &[&str] = &[
-        "https://podman.io/",
-        "https://podman-desktop.io/",
-        "https://docs.docker.com/",
-        "https://www.docker.com/products/docker-desktop",
-        "https://brew.sh",
-        "https://www.python.org/downloads/",
-        "https://apps.microsoft.com/detail/",
-        "https://learn.microsoft.com/",
-    ];
-    let allowed = ALLOWED_PREFIXES.iter().any(|p| url.starts_with(p));
-    if !allowed {
+    if !install_url_is_allowed(&url) {
         return Err(format!(
             "URL not in install-instructions allowlist: {}",
             url
@@ -344,28 +353,40 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn open_install_url_rejects_disallowed() {
-        let r = runtime_open_install_url("https://evil.example.com/".into()).await;
-        assert!(r.is_err(), "non-allowlisted URL must be rejected");
+    // Allowlist tests use the pure `install_url_is_allowed` helper
+    // instead of calling `runtime_open_install_url` directly. The latter
+    // calls `tauri_plugin_opener::open_url` which on hosts with DISPLAY
+    // set actually pops a browser tab — which was happening every
+    // `cargo test --lib` run, opening podman.io repeatedly on dev
+    // machines. The allowlist gate is the testable contract; the
+    // open_url call itself is delegated to a mature 3rd-party plugin
+    // we don't need to re-test here.
+
+    #[test]
+    fn install_url_allowlist_rejects_disallowed() {
+        assert!(!install_url_is_allowed("https://evil.example.com/"));
+        assert!(!install_url_is_allowed("http://podman.io/anything")); // http, not https
+        assert!(!install_url_is_allowed("https://podman.io.evil/")); // host suffix attack
     }
 
-    #[tokio::test]
-    async fn open_install_url_accepts_canonical() {
-        // We don't actually want to open a browser in tests — but the
-        // allowlist gate is the part we're testing. tauri-plugin-opener's
-        // open_url returns Err in headless test environments (no display),
-        // so the function returns Err for a different reason. We accept
-        // either Ok or "opener::open_url failed" — what we DON'T want is
-        // the "not in allowlist" error.
-        let r = runtime_open_install_url("https://podman.io/getting-started/installation".into())
-            .await;
-        if let Err(e) = r {
-            assert!(
-                !e.contains("allowlist"),
-                "canonical URL was rejected by allowlist: {}",
-                e
-            );
-        }
+    #[test]
+    fn install_url_allowlist_accepts_canonical() {
+        assert!(install_url_is_allowed(
+            "https://podman.io/getting-started/installation"
+        ));
+        assert!(install_url_is_allowed("https://brew.sh"));
+        assert!(install_url_is_allowed(
+            "https://www.python.org/downloads/macos/"
+        ));
+        assert!(install_url_is_allowed(
+            "https://docs.docker.com/desktop/install/linux-install/"
+        ));
+    }
+
+    #[test]
+    fn install_url_allowlist_accepts_redirected_podman_path() {
+        // Podman renamed /getting-started/ → /docs/. Both the old and new
+        // path live under the same allowlisted https://podman.io/ prefix.
+        assert!(install_url_is_allowed("https://podman.io/docs/installation"));
     }
 }

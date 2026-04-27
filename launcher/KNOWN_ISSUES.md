@@ -39,7 +39,7 @@ stable, so the upgrade is additive.
 
 ### P6 — CLI license activation is partial
 
-`vct license activate <key>` writes the key to `~/.vct/license.key` and
+`vco license activate <key>` writes the key to `~/.vct/license.key` and
 records an audit event, but does NOT call the remote tier-validation
 service. The launcher GUI performs the actual remote validation on its
 next refresh cycle. CLI-only headless validation (for CI environments
@@ -47,7 +47,7 @@ that never open the GUI) is tracked as a follow-up.
 
 ### P6 — CLI module install is GUI-only
 
-`vct module install` is intentionally not implemented. Install spawns
+`vco module install` is intentionally not implemented. Install spawns
 subprocesses that are tied to the Tauri app handle (event emission,
 progress streaming). Use the launcher GUI for installs; the CLI can
 list the catalog and the installed modules.

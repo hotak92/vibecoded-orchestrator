@@ -707,8 +707,10 @@ Backed by `quit_dialog.rs` and `tauri-plugin-dialog` (native dialog on each OS).
 
 ## Headless CLI (`vco`)
 
+The launcher CLI was renamed from `vct` to `vco` in commit `0d9a458` to avoid colliding with the `vct` bash secrets tool. Full reference: [`launcher/docs/CLI.md`](../../launcher/docs/CLI.md).
+
 ### Build & Install
-`tools/vct-cli/install.sh` runs `cargo build --release` and copies the binary to `~/.local/bin/vct`. Built independently from the Tauri app.
+`tools/vct-cli/install.sh` runs `cargo build --release` and copies the binary to `~/.local/bin/vco`. Built independently from the Tauri app.
 
 ### Hub Port Discovery Order
 CLI resolves the hub port: `--port <N>` flag → `VCT_HUB_PORT` env → `~/.vct/hub.port` file → 7700 default.
@@ -716,26 +718,29 @@ CLI resolves the hub port: `--port <N>` flag → `VCT_HUB_PORT` env → `~/.vct/
 ### JSON Output
 Every `vco` command outputs JSON for machine consumption. Pipe through `jq` for human-readable formatting.
 
-### `vct project` Commands
+### `vco project` Commands
 `list`, `show <id_or_slug>`, `create --name <name> --path <dir> [--host base|mao]`, `rename <id_or_slug> <new_name>`, `delete <id_or_slug>`.
 
-### `vct module` Commands
+### `vco module` Commands
 `list` (full catalog), `installed <project_id_or_slug>`.
 
-### `vct audit list`
+### `vco audit list`
 `--project <id|slug>`, `--since <epoch_ms>`, `--limit <N>`. Suitable for CI audit-pull jobs.
 
-### `vct license` Commands
+### `vco license` Commands
 `status` (reads tier cache), `activate <key>` (persists to keychain + audits), `deactivate`.
 
-### `vct hooks` Commands
+### `vco hooks` Commands
 `list <project_id_or_slug>`, `enable <hook_id> [--project]`, `disable <hook_id> [--project]`.
 
-### `vct hub` Commands
+### `vco hub` Commands
 `health` (ping hub), `url` (print hub URL).
 
+### `vco kg` / `vco codegraph` Commands
+`kg collections`, `kg search <query> --project <id|slug> [--collections c1,c2] [--limit N]`. Same shape for `codegraph`, plus `--scope all|code|interaction`. Wired through the hub at `/cli/kg/{collections,search}` and `/cli/codegraph/{collections,search}` with strict auto-detection of orchestrator-shaped Weaviate collections (must have `title` text + `node_type` text + `tags` text[] + `typed_links` object[]).
+
 ### CLI Limitations
-Module install/uninstall requires the GUI (installer engine uses Tauri app handle). KG/codegraph search not yet exposed via CLI (requires Weaviate connectivity). License activation persists the key but remote re-validation happens on next GUI refresh.
+Module install/uninstall requires the GUI (installer engine uses Tauri app handle). License activation persists the key but remote re-validation happens on next GUI refresh.
 
 ---
 

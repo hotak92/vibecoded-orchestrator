@@ -49,7 +49,7 @@ Steps:
 
 4. **GitHub release** — create a release from the tag. Copy the `## [x.y.z]` body from CHANGELOG.md into the release notes. Do not check "pre-release" unless the version is a pre-release identifier (e.g. `0.2.0-rc1`).
 
-5. **Attach per-OS launcher artifacts** to the GitHub release. The `first-install.*` entry points probe GitHub Releases for the launcher binary when it is absent locally. If the artifacts are missing from the release, the download path in `first-install.*` will fail and users will be redirected to the "build from source" fallback. Required artifact names (must match exactly):
+5. **Attach per-OS launcher artifacts** to the GitHub release. **Launch blocker for the 2026-05-12 OSS release**: without published artifacts, every Linux user falls into the build-from-source path (5–15 min, requires Node + Rust toolchain + system dev libs). The `first-install.*` entry points probe GitHub Releases for the launcher binary when it is absent locally. If the artifacts are missing from the release, the download path in `first-install.*` will fail and users will be redirected to the "build from source" fallback. Required artifact names (must match exactly):
 
    | OS | Artifact name |
    |---|---|

@@ -65,5 +65,5 @@ URLs would be added without breaking `/p/<slug>` semantics.
 - Tauri command: `get_project_by_slug(slug: string) -> ProjectView | null`
 - Hub HTTP: `GET /api/v1/projects/by-slug/<slug>` returns the same
   payload as `GET /api/v1/projects/<id>`.
-- CLI: `vct project switch <slug>` (P6) or open the URL in any browser
+- CLI: `vco project show <slug>` (P6) or open the URL in any browser
   pointed at the launcher.

@@ -60,6 +60,29 @@ Alternatively, run from a terminal:
 bash first-install.sh
 ```
 
+### Shell-function wrappers shadow `node` / `npm` / `pnpm`
+
+Tools like `lean-ctx`, `asdf`, `fnm`, `nvm`, and `corepack` install shell functions that wrap `node` / `npm` / `pnpm`. `command -v node` reports them as present, but `node --version` may fail (the wrapper resolves to a non-binary, or the underlying binary doesn't exist).
+
+`first-install.sh` / `first-install.bat` now detect this — `_resolves_to_binary` rejects function/builtin shadows, `_ensure_path_for_tool` probes known-binary locations (`~/.local/bin`, `~/.fnm/aliases/default/bin`, `~/.nvm/versions/node/*/bin`, `/usr/local/bin`, `/usr/bin`) and prepends them to PATH while unsetting the shell function. If the loud-stop prompt still says a tool is missing after recheck, no real binary exists anywhere — install the tool via your OS package manager:
+
+```bash
+# Linux
+sudo apt install -y nodejs npm     # Debian/Ubuntu
+sudo dnf install -y nodejs npm     # Fedora/RHEL
+sudo pacman -S nodejs npm          # Arch
+
+# macOS
+brew install node
+
+# Windows
+winget install OpenJS.NodeJS
+```
+
+Then `npm install -g pnpm` (may require sudo).
+
+If a build still fails because of a wrapper that bypasses our detection, the recovery guide at [docs/INSTALL_RECOVERY.md](INSTALL_RECOVERY.md) walks Claude Code through finishing the install.
+
 ### No container runtime found
 
 `first-install.*` prints a URL and exits if it cannot install a container runtime automatically (macOS and Windows require manual install; Linux uses pkexec to attempt it interactively).
