@@ -143,6 +143,13 @@ _check_prerequisites() {
     # genuinely-installed binaries the wrapper just can't be invoked from
     # a non-interactive subshell context.
     _ensure_path_for_tool() {
+        # Locate a real binary for $tool and put its directory on PATH.
+        # Returns 0 if a binary is found (possibly after PATH munging),
+        # 1 if not. Critically: also UNSETS any shell function shadowing
+        # the tool name so subsequent direct invocations actually run
+        # the binary, not the wrapper. Functions take precedence over
+        # PATH in bash, so a wrapped tool stays wrapped even after we
+        # add the bin/ to PATH.
         local tool="$1"; shift
         if _resolves_to_binary "$tool"; then
             return 0
@@ -150,24 +157,34 @@ _check_prerequisites() {
         local cand
         for cand in "$@"; do
             if [ -x "$cand" ]; then
-                # Symlink resolution (fnm uses ~/.local/bin/node ->
-                # ~/.fnm/...; we want the real dir on PATH so its sibling
-                # binaries are also picked up).
-                local real
-                real="$(readlink -f "$cand" 2>/dev/null || echo "$cand")"
-                local real_dir
-                real_dir="$(dirname "$real")"
-                if [ -d "$real_dir" ]; then
+                # Use `dirname` of the candidate path itself, NOT
+                # readlink -f. fnm/nvm install npm as a shell shim
+                # at ~/.local/bin/npm pointing at
+                # node_modules/npm/bin/npm-cli.js; readlink -f follows
+                # all hops down to npm-cli.js whose dir doesn't have
+                # the actual npm shim. The candidate dirname IS the
+                # bin/ we want.
+                local cand_dir
+                cand_dir="$(dirname "$cand")"
+                if [ -d "$cand_dir" ]; then
                     case ":$PATH:" in
-                        *":$real_dir:"*) ;;
-                        *) export PATH="$real_dir:$PATH" ;;
+                        *":$cand_dir:"*) ;;
+                        *) export PATH="$cand_dir:$PATH" ;;
                     esac
+                    # Strip any shell-function shadow now that the
+                    # binary is reachable via PATH.
+                    unset -f "$tool" 2>/dev/null || true
                     if _resolves_to_binary "$tool"; then
                         return 0
                     fi
                 fi
             fi
         done
+        # Last attempt: even if no candidate path was given, the tool
+        # may already be reachable via PATH but masked by a function.
+        if unset -f "$tool" 2>/dev/null && _resolves_to_binary "$tool"; then
+            return 0
+        fi
         return 1
     }
     _ensure_path_for_tool node \
