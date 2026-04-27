@@ -22,7 +22,11 @@ services:
   # exposing on any non-loopback interface.
   weaviate:
     image: cr.weaviate.io/semitechnologies/weaviate:1.28.4
-    container_name: weaviate
+    # Prefixed name avoids collision with bare `weaviate` containers a user
+    # may already be running. The `name: vibecoded` project label above also
+    # auto-prefixes, but the explicit form makes the lifecycle (start / stop /
+    # log) commands self-describing for ad-hoc CLI use.
+    container_name: vco_weaviate
     restart: unless-stopped
     ports:
       - "8081:8080"    # HTTP API
@@ -56,7 +60,9 @@ services:
     # infrastructure/docker-compose.yml). Bump deliberately on a new
     # ollama release; releases: https://github.com/ollama/ollama/releases
     image: docker.io/ollama/ollama:0.20.2
-    container_name: ollama
+    # Prefixed name avoids collision with bare `ollama` containers — see
+    # weaviate above.
+    container_name: vco_ollama
     restart: unless-stopped
     ports:
       - "11435:11434"
@@ -90,7 +96,7 @@ services:
   #   build:
   #     context: ./code_embedding_service
   #     dockerfile: Dockerfile
-  #   container_name: code_embed
+  #   container_name: vco_code_embed
   #   restart: unless-stopped
   #   ports:
   #     - "11440:11440"

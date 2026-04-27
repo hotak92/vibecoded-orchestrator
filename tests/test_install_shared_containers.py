@@ -266,5 +266,162 @@ class EnsureCollectionsTests(unittest.TestCase):
             server.shutdown()
 
 
+class ProbeServiceIdentityTests(unittest.TestCase):
+    """install._probe_service_identity content-fingerprinting."""
+
+    def setUp(self):
+        _Handler.schema = {"classes": []}
+        _Handler.posted = []
+        _Handler.fail_post = False
+
+    def test_not_running_when_port_unreachable(self):
+        # Port 1 — no listener.
+        result, _evidence = install._probe_service_identity("weaviate", port=1)
+        self.assertEqual(result, install.PROBE_NOT_RUNNING)
+
+    def test_weaviate_with_vct_collections_is_managed(self):
+        # Pre-seed schema with our marker.
+        _Handler.schema = {"classes": [{"class": "KnowledgeGraph"}]}
+        server, port, _ = _start_server()
+        try:
+            with mock.patch.object(install, "_read_services_toml",
+                                   return_value={"services": []}):
+                result, evidence = install._probe_service_identity(
+                    "weaviate", port=port,
+                )
+            self.assertEqual(result, install.PROBE_VCT_MANAGED)
+            self.assertIn("KnowledgeGraph", evidence)
+        finally:
+            server.shutdown()
+
+    def test_weaviate_with_no_vct_collections_is_foreign(self):
+        # Empty schema, no services.toml lock — a fresh foreign Weaviate.
+        _Handler.schema = {"classes": []}
+        server, port, _ = _start_server()
+        try:
+            with mock.patch.object(install, "_read_services_toml",
+                                   return_value={"services": []}):
+                result, _evidence = install._probe_service_identity(
+                    "weaviate", port=port,
+                )
+            self.assertEqual(result, install.PROBE_FOREIGN)
+        finally:
+            server.shutdown()
+
+    def test_services_toml_lock_overrides_content_probe(self):
+        # Schema is empty (would otherwise be foreign) — but services.toml
+        # has a prior `adopt` decision → vct_managed.
+        _Handler.schema = {"classes": []}
+        server, port, _ = _start_server()
+        try:
+            with mock.patch.object(install, "_read_services_toml", return_value={
+                "services": [{"name": "weaviate", "mode": "adopt"}],
+            }):
+                result, evidence = install._probe_service_identity(
+                    "weaviate", port=port,
+                )
+            self.assertEqual(result, install.PROBE_VCT_MANAGED)
+            self.assertIn("prior decision", evidence)
+        finally:
+            server.shutdown()
+
+
+class DecideActionTests(unittest.TestCase):
+    """install._decide_action — non-interactive resolution paths only."""
+
+    def _args(self, **overrides):
+        ns = type("Ns", (), {})()
+        ns.on_conflict = overrides.get("on_conflict", None)
+        ns.yes = overrides.get("yes", True)  # default to non-interactive
+        ns.quiet = overrides.get("quiet", False)
+        return ns
+
+    def test_not_running_starts(self):
+        action = install._decide_action(
+            "weaviate", install.PROBE_NOT_RUNNING, "n/a", self._args(),
+        )
+        self.assertEqual(action, install.ACTION_START)
+
+    def test_managed_adopts(self):
+        action = install._decide_action(
+            "weaviate", install.PROBE_VCT_MANAGED, "n/a", self._args(),
+        )
+        self.assertEqual(action, install.ACTION_ADOPT)
+
+    def test_incompatible_aborts(self):
+        action = install._decide_action(
+            "weaviate", install.PROBE_INCOMPATIBLE, "n/a", self._args(),
+        )
+        self.assertEqual(action, install.ACTION_ABORT)
+
+    def test_foreign_default_is_alt_port(self):
+        # No --on-conflict; --yes (non-interactive) → alt-port (the safe default).
+        action = install._decide_action(
+            "weaviate", install.PROBE_FOREIGN, "n/a", self._args(),
+        )
+        self.assertEqual(action, install.ACTION_ALT_PORT)
+
+    def test_foreign_with_on_conflict_adopt(self):
+        action = install._decide_action(
+            "weaviate", install.PROBE_FOREIGN, "n/a",
+            self._args(on_conflict="adopt"),
+        )
+        self.assertEqual(action, install.ACTION_ADOPT)
+
+    def test_foreign_with_on_conflict_abort(self):
+        action = install._decide_action(
+            "weaviate", install.PROBE_FOREIGN, "n/a",
+            self._args(on_conflict="abort"),
+        )
+        self.assertEqual(action, install.ACTION_ABORT)
+
+
+class FindFreePortTests(unittest.TestCase):
+    def test_returns_free_port_above_default(self):
+        # Bind to a known port; ask for the next free one.
+        import socket
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            taken = s.getsockname()[1]
+            free = install._find_free_port(taken + 1)
+            self.assertIsNotNone(free)
+            self.assertGreater(free, taken)
+
+
+class ServicesTomlRoundtripTests(unittest.TestCase):
+    """install._write_services_toml + _read_services_toml end-to-end.
+
+    Schema must be readable by both Python (tomllib) and the launcher's
+    Rust toml crate (services::adoption::AdoptionState).
+    """
+
+    def test_roundtrip_via_tomllib(self):
+        import tempfile
+        import tomllib
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "services.toml"
+            with mock.patch.object(install, "_services_toml_path",
+                                   return_value=path):
+                state = {"services": [
+                    {"name": "weaviate", "mode": "parallel",
+                     "external_url": "http://localhost:8081",
+                     "parallel_port": 8082},
+                    {"name": "ollama", "mode": "unresolved",
+                     "external_url": None, "parallel_port": None},
+                ]}
+                install._write_services_toml(state)
+                roundtripped = tomllib.loads(path.read_text())
+            services = roundtripped["services"]
+            self.assertEqual(len(services), 2)
+            self.assertEqual(services[0]["name"], "weaviate")
+            self.assertEqual(services[0]["parallel_port"], 8082)
+            self.assertEqual(services[1]["mode"], "unresolved")
+            # Optional fields omitted when None — matches launcher's
+            # serde(skip_serializing_if = "Option::is_none") behavior on
+            # AdoptionState.
+            self.assertNotIn("parallel_port", services[1])
+            self.assertNotIn("external_url", services[1])
+
+
 if __name__ == "__main__":
     unittest.main()
