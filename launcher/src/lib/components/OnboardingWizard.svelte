@@ -494,25 +494,17 @@
         {:else if step === 3}
           {#if alreadyInstalledRoot}
             <!-- 2026-04-28: when the user navigated Back to step 3 from
-                 the auto-skipped step 4, the install path field defaulting
-                 to ~/vibecoded-orchestrator is misleading — they're already
-                 installed at $alreadyInstalledRoot. Show the detected
-                 path as read-only context and gate any "relocate" action
-                 to a future Tools → Relocate flow. Letting the user just
-                 type a new path here would either (a) create a SECOND
-                 install at the new path (disk waste, no config rewrite)
-                 or (b) break the existing git checkout if they expected
-                 a clean move. Both are wrong; the proper relocate is a
-                 copy + venv-rebuild + .env / .claude / hook path-rewrite,
-                 which is its own feature. -->
+                 the auto-skipped step 4, the install path field default
+                 (~/vibecoded-orchestrator) is misleading — vco is
+                 already installed at $alreadyInstalledRoot. Show the
+                 path read-only and don't expose a re-install workflow.
+                 Re-running install at a different path here would
+                 either create a SECOND install or break the existing
+                 git checkout. Proper relocate is a copy + venv-rebuild +
+                 path-rewrite — out of scope for v1. -->
             <p class="ow-secondary">
               <strong>Already installed at</strong>
               <code class="ow-mono">{alreadyInstalledRoot}</code>.
-              To relocate the orchestrator, use the launcher's Settings
-              → Preferences → Relocate workflow (post-v1 feature) — it
-              copies the install + rewrites config paths safely. Don't
-              re-run the install at a new path here; it would create a
-              duplicate without rewriting any existing config.
             </p>
           {:else}
             <label class="ow-label">
