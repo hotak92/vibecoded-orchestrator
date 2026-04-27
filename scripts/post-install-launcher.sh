@@ -51,6 +51,18 @@ set -uo pipefail
 # NOTE: deliberately NOT `set -e`. We want to swallow failures and exit 0
 # rather than have a single curl/build hiccup abort first-install.
 
+# Insulate from user-defined shell rc files that wrap tools with shell
+# functions (e.g. lean-ctx wrappers around `pnpm`/`npm`/`git`). When a
+# user has BASH_ENV pointing at a script that defines such wrappers,
+# every subshell we spawn inherits them — and the wrappers can refer
+# to binaries that aren't actually installed, masquerading as "tool
+# present". This caused a real install bug on 2026-04-27 where pnpm
+# audit said "yes" but `pnpm install` failed with "command not found".
+# Subsequent build/spawn calls in this script run in plain `/bin/bash`
+# subshells without the wrappers, so the audit and the actual call
+# agree about what's available.
+unset BASH_ENV
+
 REPO_ROOT="${1:-}"
 shift || true
 
@@ -110,8 +122,26 @@ _check_prerequisites() {
     command -v wget    >/dev/null 2>&1 && HAS_WGET=1
     command -v python3 >/dev/null 2>&1 && HAS_PYTHON3=1
     command -v node    >/dev/null 2>&1 && HAS_NODE=1
-    command -v pnpm    >/dev/null 2>&1 && HAS_PNPM=1
-    command -v npm     >/dev/null 2>&1 && HAS_NPM=1
+    # Use `command -v <tool>` AND require it to resolve to a real PATH
+    # binary, not a shell function or alias. Some users have `pnpm` defined
+    # as a corepack-style bash function in their interactive rc files; that
+    # shadows the binary and is invisible to non-interactive subshells we
+    # spawn for `pnpm install` later. Without this gate we set HAS_PNPM=1
+    # then fail later with "pnpm install: command not found". Reported on
+    # 2026-04-27 from a real install test.
+    _resolves_to_binary() {
+        local resolved
+        resolved="$(command -v "$1" 2>/dev/null)"
+        # `command -v` prints the function name verbatim for functions/
+        # builtins; for binaries it prints an absolute path. Require the
+        # latter and require the file to exist + be executable.
+        case "$resolved" in
+            /*) [ -x "$resolved" ] ;;
+            *) return 1 ;;
+        esac
+    }
+    _resolves_to_binary pnpm    && HAS_PNPM=1
+    _resolves_to_binary npm     && HAS_NPM=1
     command -v brew    >/dev/null 2>&1 && HAS_BREW=1
     command -v sudo    >/dev/null 2>&1 && HAS_SUDO=1
     command -v hdiutil >/dev/null 2>&1 && HAS_HDIUTIL=1
