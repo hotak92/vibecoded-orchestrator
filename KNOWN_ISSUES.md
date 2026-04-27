@@ -15,6 +15,14 @@ flagging for early adopters and the next iteration.
 
 ## Install / first-run
 
+- [ ] **macOS support is experimental for v1.0** — only minimal smoke-tested on a single Apple
+      Silicon machine (Bash 3.2 empty-array fix landed during that test, see commit `cb3df13`).
+      Known macOS-specific gotchas: Apple ships Bash 3.2 (the rest of the world uses 4.x+), Finder
+      strips the exec bit on zip downloads, `.command` files need `xattr -dr com.apple.quarantine`
+      after zip extraction, and Homebrew is not installed by default. The full Linux path is
+      validated; the macOS path beyond `first-install.command` reaching `install.sh` is
+      not. Linux is the recommended platform for v1.0; macOS Tier-2.
+
 - [ ] **Launcher binary not yet code-signed (Windows + macOS)** — Windows shows SmartScreen "Windows
       protected your PC"; macOS Gatekeeper shows "damaged and can't be opened". Both are expected for
       v0.1.0. Workarounds documented in [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#first-install-issues).
@@ -33,11 +41,32 @@ flagging for early adopters and the next iteration.
       install. No change planned for v1.0 — container runtimes on those platforms require user consent
       GUI steps that can't be scripted portably.
 
+- [ ] **Cosmetic warnings during seed (non-blocking)** — `AuthlibDeprecationWarning` from a
+      transitive dep of `weaviate-client`, and several "No abstraction level tag" /
+      "Tag 'LoRA' uses camelCase" vocabulary warnings from the bundled seed nodes in
+      `knowledge/concepts/`. None affect correctness; the install completes successfully.
+      Vocabulary cleanup of seed nodes is a v0.1.1 chore.
+
 ## Recently fixed
 
+- **Joern installer ignored `--dir` flag, post-install detection failed** — install.py probed only
+  the directory we asked the installer to use. Recent Joern installers ignore `--dir` and land at
+  `~/bin/joern/joern-cli/` regardless. Now probes 3 known locations + falls back to PATH. Reported
+  by user during real-machine test 2026-04-27.
+
+- **`_development` collection skipped when other projects had theirs** — adopt-mode logic
+  incorrectly treated per-project `<Project>_development` collections as a shared namespace. If
+  the host had any `_development` collection from a sibling project, vco's was skipped, leaving
+  `docs/` content unseeded (Step 7c exited 1). Fixed: `_development` is project-scoped, always
+  created. Reported by user during real-machine test 2026-04-27.
+
+- **Bash 3.2 empty-array expansion crash on macOS** — `first-install.{sh,command}` used
+  `"${INSTALL_ARGS[@]}"` and `"${HELPER_FLAGS[@]}"` under `set -euo pipefail`. Bash 3.2 (Apple's
+  shipped default) trips "unbound variable" on empty-array expansion. Now guarded with
+  `[ ${#ARR[@]} -gt 0 ]`. Reported by macOS tester 2026-04-27, fixed in `cb3df13`.
+
 - **Joern installer hang** — `first-install.*` could hang indefinitely while the Joern JVM installer
-  ran without a timeout. Fixed in commit `64d5804`: added a 5-minute timeout + fallback to `--no-joern`
-  with a printed message. Users on older clones: `git pull && bash first-install.sh`.
+  ran without a timeout. Fixed in commit `64d5804`: streams installer output, 900s timeout.
 
 - **macOS Gatekeeper quarantine on downloaded binary** — `first-install.command` now strips
   `com.apple.quarantine` xattr from any launcher binary it downloads from GitHub Releases before
