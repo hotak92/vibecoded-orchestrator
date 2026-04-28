@@ -1,0 +1,10 @@
+{
+  "source_sha": "b0f9d56e71a71ec6ccde43793aafdf54712a2094",
+  "source_short_sha": "b0f9d56",
+  "source_hash": "06e306f72924bb3aef5ea2c790c241a91322e022",
+  "built_at": "2026-04-28T04:21:31Z",
+  "launcher_version": "0.1.0",
+  "host_target": "windows-x64",
+  "binary_name": "vct-launcher.exe",
+  "binary_size_bytes": 24486912
+}
