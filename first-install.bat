@@ -190,6 +190,26 @@ if defined LAUNCHER_BIN (
     )
 )
 
+REM Frontend-embedded check (added 2026-04-28). A release binary built
+REM with an empty launcher\build\ compiles fine but renders "Could not
+REM connect to localhost" at startup because no SvelteKit assets were
+REM embedded. We require >=5 occurrences of "_app/immutable/assets" in
+REM the binary's bytes; otherwise treat as broken and fall through to
+REM download/build. Threshold derived from build artifact analysis at
+REM commit d576ad6 (which fixed the original regression in 5abb8cf).
+REM Mirror of bash _bundled_binary_is_fresh frontend-check.
+if defined LAUNCHER_BIN (
+    for /f "delims=" %%C in ('"%PSCMD%" -NoProfile -ExecutionPolicy Bypass -Command ^
+        "try { $bytes=[System.IO.File]::ReadAllBytes('!LAUNCHER_BIN!'); $s=[System.Text.Encoding]::ASCII.GetString($bytes); ($s.Split([string[]]@('_app/immutable/assets'), [System.StringSplitOptions]::None).Count - 1) } catch { 0 }" 2^>nul') do set "FE_COUNT=%%C"
+    if not defined FE_COUNT set "FE_COUNT=0"
+    REM CMD batch can't do GEQ on arbitrary strings; coerce + compare numerically.
+    set /a "FE_COUNT_INT=!FE_COUNT! + 0" 2>nul
+    if !FE_COUNT_INT! LSS 5 (
+        echo [launcher] Bundled binary has !FE_COUNT_INT! frontend asset refs ^(expected ^>=5^) — frontend not embedded; treating as broken.
+        set "LAUNCHER_BIN="
+    )
+)
+
 if defined LAUNCHER_BIN (
     echo [launcher] Found existing binary: %LAUNCHER_BIN%
     call :_log_event "binary-probe" "ok" "existing launcher binary found"

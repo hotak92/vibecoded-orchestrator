@@ -389,7 +389,15 @@ candidates_mac=(
     # Locally built (contributors)
     "$REPO_ROOT/launcher/src-tauri/target/release/vct-launcher"
     "$REPO_ROOT/launcher/src-tauri/target/release/vct-launcher-temp"
-    # Bundled experimental prebuilt — empty until macOS is validated end-to-end.
+    # Bundled experimental prebuilt — flat file produced by
+    # scripts/build-bundled-launcher.sh on Darwin hosts ($DIST_DIR/$HOST_TARGET/$HOST_BIN
+    # = launcher/dist/experimental_macOS/vct-launcher). Empty in repo until
+    # macOS is validated end-to-end, but populated locally after a
+    # contributor runs the build script on Apple Silicon.
+    "$REPO_ROOT/launcher/dist/experimental_macOS/vct-launcher"
+    # Bundled experimental prebuilt — full .app bundle copied in manually
+    # per launcher/dist/experimental_macOS/README.md (alternative shipping
+    # mode for when we want native Gatekeeper signing on the bundle).
     "$REPO_ROOT/launcher/dist/experimental_macOS/vct-launcher.app/Contents/MacOS/vct-launcher"
     "$REPO_ROOT/launcher/dist/experimental_macOS/vct-launcher.app/Contents/MacOS/VCT Launcher"
     # System installs
