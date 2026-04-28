@@ -376,6 +376,335 @@ def _should_skip_step(step: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Re-install file-conflict resolution
+#
+# Mirror of the Rust implementation in
+#   launcher/src-tauri/src/commands/installer.rs
+# (apply_conflict_strategy + DEFAULT_PRESERVE_LIST + MERGE_BLOCK_*).
+# Keep both sides in lockstep — see docs/INSTALL_RECOVERY.md → "Conflict
+# Resolution" for the user-facing description and the Claude self-merge
+# contract.
+#
+# This Python path is only exercised when install.py is invoked directly
+# with --conflict-strategy (CLI users). The launcher's own install_orchestrator
+# does the conflict-resolution step in Rust BEFORE spawning install.py, so
+# the wizard flow doesn't go through here.
+# ---------------------------------------------------------------------------
+
+# Default preserve list — keep in sync with DEFAULT_PRESERVE_LIST in
+# launcher/src-tauri/src/commands/installer.rs and OnboardingWizard.svelte.
+#
+# MEMORY.md is intentionally NOT here — lives at
+# ~/.claude/projects/<id>/memory/MEMORY.md, not in the install dir. The
+# notification block mentions it so the user can manually run a merge
+# if their MEMORY.md has diverged.
+DEFAULT_PRESERVE_LIST: tuple[str, ...] = (
+    "CLAUDE.md",
+    ".claude/CONTEXT_STATE.md",
+    ".claude/PROJECT_REGISTRY.md",
+    ".env",
+)
+
+# Notification block markers in .claude/CONTEXT_STATE.md. Re-runs of the
+# install REPLACE the block in-place rather than accumulating stale copies.
+MERGE_BLOCK_START = "<!-- vct-merge-pending -->"
+MERGE_BLOCK_END = "<!-- /vct-merge-pending -->"
+
+# Hard whitelist of paths the orchestrator install is allowed to copy
+# from `source` into `install_path`. Mirror of ORCHESTRATOR_MANAGED_PATHS
+# in installer.rs. Anything else at the source is left behind; anything
+# else at the install_path is left untouched.
+ORCHESTRATOR_MANAGED_PATHS: tuple[str, ...] = (
+    ".claude",
+    "CLAUDE.md",
+    "knowledge",
+    "claude_mcp_servers",
+    "state",
+    "config",
+    "docs",
+    "templates",
+    "tools",
+    "infrastructure",
+    "requirements.txt",
+    "requirements-dev.txt",
+    "install.sh",
+    "install.ps1",
+    "install.py",
+    "BOOTSTRAP.md",
+    "vct-module.json",
+)
+
+
+def _normalize_conflict_strategy(s: str) -> str:
+    """CLI uses kebab-case; internal handler uses snake_case (matches Rust)."""
+    return {
+        "delete-claude": "delete_claude_and_reinstall",
+        "overwrite-all": "overwrite_all",
+        "overwrite-preserve": "overwrite_preserve",
+        "adopt-as-is": "adopt_as_is",
+    }[s]
+
+
+def _parse_preserve_paths(raw: str | None) -> list[str]:
+    """Parse `--preserve-paths a,b,c`. Empty/None → default list."""
+    if not raw:
+        return list(DEFAULT_PRESERVE_LIST)
+    return [p.strip() for p in raw.split(",") if p.strip()]
+
+
+def _new_sibling_path(p: Path) -> Path:
+    """Insert `.new` before the file's extension. Mirrors `new_sibling_path`
+    in installer.rs.
+
+    Examples:
+      - CLAUDE.md → CLAUDE.new.md
+      - .env → .env.new (no extension to split on)
+      - archive.tar.gz → archive.tar.new.gz (split on LAST dot)
+    """
+    name = p.name
+    # Filename starting with `.` and no other `.` (e.g. `.env`) → treat
+    # the leading dot as part of the stem so we don't write `.new.env`.
+    if "." not in name or (name.startswith(".") and name.count(".") == 1):
+        return p.with_name(f"{name}.new")
+    stem, _, ext = name.rpartition(".")
+    return p.with_name(f"{stem}.new.{ext}")
+
+
+def _build_merge_notification_block(preserved_files: list[str]) -> str:
+    """Render the notification block. Idempotency note: the prose inside
+    must NOT contain the literal MERGE_BLOCK_START/END strings, otherwise
+    the marker-counting check breaks. Reference them obliquely as "the
+    HTML-comment markers".
+    """
+    if preserved_files:
+        list_lines = "\n".join(
+            f"- `{p}` (upstream-new at `{_new_sibling_path(Path(p))}`)"
+            for p in preserved_files
+        )
+    else:
+        list_lines = "_(none — strategy ran with an empty preserve list)_"
+
+    return (
+        f"{MERGE_BLOCK_START}\n"
+        "## Pending merge — read this on session start\n"
+        "\n"
+        "The orchestrator was just upgraded. Several user-curated files have an\n"
+        "upstream-new version sitting next to them (`*.new.md` / `*.new.<ext>`).\n"
+        "For each pair:\n"
+        "\n"
+        "1. Read both the existing file AND the upstream-new sibling.\n"
+        "2. Reconcile: keep the user's project-specific content, but adopt new\n"
+        "   structure / guidance / sections from the upstream version. Use your\n"
+        "   judgment for ambiguous merges; ask the user if a conflict is\n"
+        "   irreconcilable.\n"
+        "3. After successfully merging a file, **delete its upstream-new\n"
+        "   sibling**.\n"
+        "4. When ALL `.new.*` siblings under the install path are gone, you'll\n"
+        "   know the merge is complete — at that point, **delete this entire\n"
+        "   notification block** (the HTML-comment markers wrapping this section\n"
+        "   plus all text between them) from this CONTEXT_STATE.md. That removes\n"
+        "   the prompt for the next session.\n"
+        "\n"
+        "Files awaiting merge:\n"
+        f"{list_lines}\n"
+        "\n"
+        "Note: `MEMORY.md` lives at `~/.claude/projects/<id>/memory/MEMORY.md`,\n"
+        "not in the install dir, so v1.0 of the conflict resolver does NOT write\n"
+        "an upstream-new sibling for it. If you suspect your MEMORY.md is\n"
+        "divergent from the upstream template, run a manual diff and merge by\n"
+        "hand.\n"
+        "\n"
+        "(Do NOT delete user content. Preserve any session-specific state in\n"
+        "CONTEXT_STATE.md, your existing CLAUDE.md customisations, etc. The\n"
+        "upstream version is a reference for new structure, not a wholesale\n"
+        "replacement.)\n"
+        f"{MERGE_BLOCK_END}\n"
+    )
+
+
+def _replace_or_append_block(existing: str, block: str) -> str:
+    """If `existing` contains a `<!-- vct-merge-pending -->` ...
+    `<!-- /vct-merge-pending -->` block, replace it with `block`. Otherwise
+    append `block` (separated by a single newline) to the end."""
+    start = existing.find(MERGE_BLOCK_START)
+    if start != -1:
+        end_rel = existing[start:].find(MERGE_BLOCK_END)
+        if end_rel != -1:
+            end = start + end_rel + len(MERGE_BLOCK_END)
+            after = existing[end:]
+            # Strip a single leading newline so we don't accumulate blank
+            # lines on every refresh.
+            if after.startswith("\n"):
+                after = after[1:]
+            return existing[:start] + block + after
+    sep = "" if (existing.endswith("\n") or not existing) else "\n"
+    return f"{existing}{sep}\n{block}"
+
+
+def update_merge_notification_block(
+    context_state_path: Path, preserved_files: list[str]
+) -> bool:
+    """Append (or refresh) the merge-notification block in
+    `.claude/CONTEXT_STATE.md`. Returns True iff the file was written.
+    """
+    block = _build_merge_notification_block(preserved_files)
+    if not context_state_path.exists():
+        context_state_path.parent.mkdir(parents=True, exist_ok=True)
+        context_state_path.write_text(block)
+        return True
+    existing = context_state_path.read_text()
+    updated = _replace_or_append_block(existing, block)
+    if updated == existing:
+        return False
+    context_state_path.write_text(updated)
+    return True
+
+
+def _copy_recursive(src: Path, dst: Path) -> int:
+    """Plain recursive copy. Symlinks are resolved (file content follows).
+    Returns the number of files copied."""
+    if src.is_dir():
+        dst.mkdir(parents=True, exist_ok=True)
+        total = 0
+        for entry in src.iterdir():
+            total += _copy_recursive(entry, dst / entry.name)
+        return total
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+    return 1
+
+
+def _copy_recursive_preserve(
+    src: Path,
+    dst: Path,
+    install_root: Path,
+    preserve: list[str],
+    preserved_present: list[str],
+) -> tuple[int, int]:
+    """Preserve-aware recursive copy. For each FILE encountered:
+      - If its install-relative path is in `preserve` AND a file already
+        exists at `dst`, copy to `<dst>.new.<ext>` instead and append the
+        relative path to `preserved_present`.
+      - Otherwise, plain overwrite copy.
+
+    Returns `(files_visited, new_files_written)`.
+    """
+    if src.is_dir():
+        dst.mkdir(parents=True, exist_ok=True)
+        files_visited = 0
+        new_files = 0
+        for entry in src.iterdir():
+            v, n = _copy_recursive_preserve(
+                entry, dst / entry.name, install_root, preserve, preserved_present
+            )
+            files_visited += v
+            new_files += n
+        return files_visited, new_files
+
+    rel = str(dst.relative_to(install_root))
+    if rel in preserve and dst.exists():
+        sibling = _new_sibling_path(dst)
+        sibling.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, sibling)
+        preserved_present.append(rel)
+        return 1, 1
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+    return 1, 0
+
+
+def apply_conflict_strategy(
+    source: Path, install_path: Path, strategy: str, preserve_paths: list[str]
+) -> dict:
+    """Apply a `ConflictStrategy` at `install_path`, copying from `source`.
+
+    `strategy` is the snake_case name (matches the Rust `ConflictStrategy`
+    enum). Returns a report dict with the same shape as the Rust
+    `ConflictApplyReport` so callers can log it as JSON-serializable
+    metadata.
+
+    Defense: for `delete_claude_and_reinstall` we resolve and verify the
+    path we're about to remove is exactly `<install_path>/.claude` before
+    calling shutil.rmtree. Refuses to follow symlinks out of the install
+    path.
+    """
+    report: dict = {
+        "strategy": strategy,
+        "preserved_count": 0,
+        "new_md_count": 0,
+        "notification_written": False,
+        "copied_count": 0,
+    }
+    if not (source / "vct-module.json").exists():
+        raise ValueError(
+            f"source {source} is not an orchestrator repo (no vct-module.json)"
+        )
+    install_path.mkdir(parents=True, exist_ok=True)
+
+    if strategy == "adopt_as_is":
+        return report
+
+    if strategy == "delete_claude_and_reinstall":
+        claude_dir = install_path / ".claude"
+        if claude_dir.exists():
+            canon_install = install_path.resolve()
+            canon_claude = claude_dir.resolve()
+            expected = canon_install / ".claude"
+            if canon_claude != expected:
+                raise ValueError(
+                    f"refusing to delete: {claude_dir} resolves to "
+                    f"{canon_claude} (expected {expected})"
+                )
+            shutil.rmtree(claude_dir)
+        # Fresh copy.
+        for managed in ORCHESTRATOR_MANAGED_PATHS:
+            s = source / managed
+            d = install_path / managed
+            if not s.exists():
+                continue
+            report["copied_count"] += _copy_recursive(s, d)
+        return report
+
+    if strategy == "overwrite_all":
+        for managed in ORCHESTRATOR_MANAGED_PATHS:
+            s = source / managed
+            d = install_path / managed
+            if not s.exists():
+                continue
+            report["copied_count"] += _copy_recursive(s, d)
+        return report
+
+    if strategy == "overwrite_preserve":
+        # Dedup the preserve list (callers may pass repeats).
+        preserve = sorted(set(preserve_paths))
+        preserved_present: list[str] = []
+        new_files_written = 0
+        copied = 0
+        for managed in ORCHESTRATOR_MANAGED_PATHS:
+            s = source / managed
+            d = install_path / managed
+            if not s.exists():
+                continue
+            v, n = _copy_recursive_preserve(
+                s, d, install_path, preserve, preserved_present
+            )
+            copied += v
+            new_files_written += n
+        report["copied_count"] = copied
+        report["preserved_count"] = len(preserved_present)
+        report["new_md_count"] = new_files_written
+
+        ctx = install_path / ".claude" / "CONTEXT_STATE.md"
+        report["notification_written"] = update_merge_notification_block(
+            ctx, preserved_present
+        )
+        return report
+
+    raise ValueError(f"unknown conflict strategy: {strategy}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -463,7 +792,63 @@ def main() -> int:
                              "foreign): pick a free port and write compose.override.yaml. "
                              "'adopt' (advanced): reuse the foreign service in place — "
                              "WILL write our collections into it. 'abort': stop install.")
+    # Re-install file-conflict resolution. Mirrors the 4-option modal in
+    # the launcher's OnboardingWizard. CLI users running install.py
+    # directly against a populated install path get explicit flags
+    # instead of the wizard prompt. Default unset = keep current behaviour
+    # (no copy step in install.py — those flags are a no-op unless
+    # --conflict-source-path is also passed). See
+    # docs/INSTALL_RECOVERY.md → "Conflict Resolution".
+    parser.add_argument("--conflict-strategy",
+                        choices=["delete-claude", "overwrite-all",
+                                 "overwrite-preserve", "adopt-as-is"],
+                        default=None,
+                        help="File-conflict resolution when re-installing over an "
+                             "existing install. Pairs with --conflict-source-path "
+                             "(the bundled repo to copy FROM). Mirrors the "
+                             "OnboardingWizard's 4-option modal.")
+    parser.add_argument("--conflict-source-path",
+                        type=str, default=None,
+                        help="Source path for the conflict-resolution copy step "
+                             "(should be a bundled vct-orchestrator repo with "
+                             "vct-module.json). Required when --conflict-strategy "
+                             "is set.")
+    parser.add_argument("--preserve-paths",
+                        type=str, default=None,
+                        help="Comma-separated list of install-relative paths to "
+                             "preserve under --conflict-strategy=overwrite-preserve. "
+                             "Default: CLAUDE.md,.claude/CONTEXT_STATE.md,"
+                             ".claude/PROJECT_REGISTRY.md,.env")
     args = parser.parse_args()
+
+    # Run conflict-resolution copy step BEFORE the rest of install.py so
+    # subsequent steps see the post-resolution file tree. Best-effort
+    # logging — the install log dir may not exist yet, in which case
+    # _log_install_event() silently skips (matches Rust contract).
+    if args.conflict_strategy:
+        if not args.conflict_source_path:
+            print("ERROR: --conflict-strategy requires --conflict-source-path")
+            return 2
+        try:
+            report = apply_conflict_strategy(
+                source=Path(args.conflict_source_path),
+                install_path=PROJECT_ROOT,
+                strategy=_normalize_conflict_strategy(args.conflict_strategy),
+                preserve_paths=_parse_preserve_paths(args.preserve_paths),
+            )
+        except Exception as e:
+            print(f"ERROR: conflict-resolve failed: {e}")
+            _log_install_event(
+                "conflict-resolve", "error",
+                f"strategy={args.conflict_strategy}: {e}",
+                data={"strategy": args.conflict_strategy},
+            )
+            return 1
+        _log_install_event(
+            "conflict-resolve", "ok",
+            f"strategy={args.conflict_strategy}",
+            data=report,
+        )
 
     if args.uninstall:
         return _run_uninstall(args)

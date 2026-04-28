@@ -299,3 +299,163 @@ and the last 200 lines of build output.
 
 But that should be rare. Most failures are one of the categories
 above.
+
+---
+
+## Conflict Resolution (re-installing over existing files)
+
+When the install path already contains orchestrator files (`.claude/`,
+`knowledge/`, etc.), the launcher's OnboardingWizard surfaces a 4-option
+modal instead of the legacy "call preview_install + confirm_overwrite=true"
+error. CLI users who run `python install.py` directly get the same options
+via `--conflict-strategy=...`.
+
+### The 4 strategies
+
+1. **Overwrite, preserving project-specific files** *(default — strongly
+   recommended)*
+
+   Copy every tracked install file on top of existing ones BUT for a
+   small "preserve list" of user-curated files, leave the existing
+   file untouched and write the upstream version next to it as
+   `<file>.new.<ext>` (e.g. `CLAUDE.new.md` next to `CLAUDE.md`). After
+   all files are copied, append a notification block to
+   `.claude/CONTEXT_STATE.md` instructing Claude to merge the pairs
+   on the next session start.
+
+   Default preserve list (`DEFAULT_PRESERVE_LIST`):
+   - `CLAUDE.md`
+   - `.claude/CONTEXT_STATE.md`
+   - `.claude/PROJECT_REGISTRY.md`
+   - `.env`
+
+   `MEMORY.md` is intentionally NOT in the preserve list — it lives at
+   `~/.claude/projects/<id>/memory/MEMORY.md`, not in the install dir,
+   so v1.0 of the conflict resolver does not write a `.new.md` for it.
+   The notification block mentions this so the user can manually merge
+   if their MEMORY.md has diverged from the upstream template.
+
+2. **Overwrite all** — copy every tracked install file on top with no
+   preservation. Loses user edits to CLAUDE.md, CONTEXT_STATE.md, etc.
+
+3. **Delete and replace `.claude/`** — wipes ONLY the destination's
+   `.claude/` directory (NOT the entire install path; the rest may
+   contain real user code), then performs a fresh install. Use this
+   when `.claude/` is corrupt and you want a clean slate.
+
+4. **Adopt as-is** — equivalent to the legacy `confirm_overwrite=true`
+   path: keep existing files exactly as they are, just register the
+   project in the launcher.
+
+### CLI usage (advanced)
+
+CLI users running `install.py` directly:
+
+```bash
+# Overwrite-preserve with the default preserve list:
+python install.py \
+    --conflict-strategy=overwrite-preserve \
+    --conflict-source-path=/path/to/bundled/orchestrator
+
+# Custom preserve list:
+python install.py \
+    --conflict-strategy=overwrite-preserve \
+    --conflict-source-path=/path/to/bundled/orchestrator \
+    --preserve-paths="CLAUDE.md,.claude/CONTEXT_STATE.md"
+
+# Wipe .claude/ and re-install:
+python install.py \
+    --conflict-strategy=delete-claude \
+    --conflict-source-path=/path/to/bundled/orchestrator
+```
+
+`--conflict-source-path` MUST point to a directory containing
+`vct-module.json` (i.e. a bundled orchestrator repo). The conflict
+resolver will refuse to copy from anywhere else.
+
+### The Claude self-merge contract
+
+After Strategy 1 (`overwrite-preserve`) runs, the appended notification
+block in `.claude/CONTEXT_STATE.md` looks like this:
+
+```markdown
+<!-- vct-merge-pending -->
+## Pending merge — read this on session start
+
+The orchestrator was just upgraded. Several user-curated files have an
+upstream-new version sitting next to them (`*.new.md` / `*.new.<ext>`).
+For each pair:
+
+1. Read both the existing file AND the upstream-new sibling.
+2. Reconcile: keep the user's project-specific content, but adopt new
+   structure / guidance / sections from the upstream version. Use your
+   judgment for ambiguous merges; ask the user if a conflict is
+   irreconcilable.
+3. After successfully merging a file, **delete its upstream-new
+   sibling**.
+4. When ALL `.new.*` siblings under the install path are gone, you'll
+   know the merge is complete — at that point, **delete this entire
+   notification block** (the HTML-comment markers wrapping this section
+   plus all text between them) from this CONTEXT_STATE.md. That removes
+   the prompt for the next session.
+
+Files awaiting merge:
+- `CLAUDE.md` (upstream-new at `CLAUDE.new.md`)
+- `.claude/CONTEXT_STATE.md` (upstream-new at `.claude/CONTEXT_STATE.new.md`)
+…
+
+Note: `MEMORY.md` lives at `~/.claude/projects/<id>/memory/MEMORY.md`,
+not in the install dir, so v1.0 of the conflict resolver does NOT write
+an upstream-new sibling for it. If you suspect your MEMORY.md is
+divergent from the upstream template, run a manual diff and merge by
+hand.
+
+(Do NOT delete user content. Preserve any session-specific state in
+CONTEXT_STATE.md, your existing CLAUDE.md customisations, etc. The
+upstream version is a reference for new structure, not a wholesale
+replacement.)
+<!-- /vct-merge-pending -->
+```
+
+Claude self-monitors via the contract:
+
+- **When you process the merge**, you delete the `.new.<ext>` sibling.
+- **When all `.new.*` siblings are gone**, you delete the notification
+  block.
+
+No external trigger needed. The user simply opens Claude Code in the
+install root and you read CONTEXT_STATE.md as you always do on session
+start.
+
+The notification block is **idempotent** — if the user re-runs the
+install with `overwrite-preserve` while a stale block from a previous
+run is still in CONTEXT_STATE.md, the new block REPLACES the old one
+in-place rather than duplicating. The marker comments
+`<!-- vct-merge-pending -->` ... `<!-- /vct-merge-pending -->` are the
+boundary; do not paste them into other prose, otherwise the
+marker-counting idempotency check breaks.
+
+### Audit trail
+
+Both the launcher (Rust) and `install.py` (Python) emit a
+`conflict-resolve` event into `state/logs/install.jsonl`:
+
+```json
+{
+  "ts": "2026-04-27T12:34:56Z",
+  "actor": "launcher",  // or "install.py"
+  "step": "conflict-resolve",
+  "phase": "ok",
+  "detail": "strategy=OverwritePreserve",
+  "data": {
+    "strategy": "OverwritePreserve",
+    "preserved_count": 4,
+    "new_md_count": 4,
+    "notification_written": true,
+    "copied_count": 137
+  }
+}
+```
+
+`read_install_log` (Tauri command) and the Diagnostics panel surface this
+event so the user can see which strategy ran and what it touched.

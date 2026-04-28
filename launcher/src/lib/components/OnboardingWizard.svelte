@@ -159,6 +159,69 @@
   }
   let pendingDiff = $state<InstallDiff | null>(null);
 
+  // Re-install conflict resolution (4-option modal). When the install
+  // target already contains orchestrator files and the wizard hasn't
+  // picked a strategy yet, the Rust install_orchestrator command returns
+  // a JSON-encoded `InstallConflictError` in its Err variant. We parse
+  // it here, render the 4 options, then re-invoke install_orchestrator
+  // with the chosen `conflict: { strategy, preserve_paths }`.
+  type ConflictStrategy =
+    | 'delete_claude_and_reinstall'
+    | 'overwrite_all'
+    | 'overwrite_preserve'
+    | 'adopt_as_is';
+  interface InstallConflictError {
+    kind: 'install_conflict';
+    message: string;
+    install_path: string;
+    source_path: string;
+    mode: InstallMode;
+    will_overwrite: string[];
+    will_add: string[];
+    preserve_candidates: string[];
+  }
+  // Default preserve list — keep in sync with DEFAULT_PRESERVE_LIST in
+  // launcher/src-tauri/src/commands/installer.rs and install.py.
+  const DEFAULT_PRESERVE_LIST: string[] = [
+    'CLAUDE.md',
+    '.claude/CONTEXT_STATE.md',
+    '.claude/PROJECT_REGISTRY.md',
+    '.env',
+  ];
+  let pendingConflict = $state<InstallConflictError | null>(null);
+  let conflictStrategy = $state<ConflictStrategy>('overwrite_preserve');
+  // Editable preserve list (one path per line). Initialised from the
+  // default list when the modal opens; the user can override.
+  let conflictPreserveText = $state<string>(DEFAULT_PRESERVE_LIST.join('\n'));
+  let conflictShowPreserveEditor = $state(false);
+
+  /**
+   * Try to parse a Tauri Err string as an InstallConflictError. Tauri
+   * surfaces our JSON-encoded error wrapped as a plain string, so we
+   * detect the leading `{"kind":"install_conflict"...}` shape.
+   */
+  function tryParseConflictError(s: string): InstallConflictError | null {
+    if (!s.includes('"kind":"install_conflict"')) return null;
+    try {
+      const parsed = JSON.parse(s);
+      if (parsed && parsed.kind === 'install_conflict') {
+        return parsed as InstallConflictError;
+      }
+    } catch {
+      // Some Tauri runtimes prepend a label like `Error: `. Strip and retry.
+      const stripped = s.replace(/^[^{]+/, '');
+      try {
+        const parsed = JSON.parse(stripped);
+        if (parsed && parsed.kind === 'install_conflict') {
+          return parsed as InstallConflictError;
+        }
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+
   async function loadStep2() {
     try {
       detection = await invoke<any>('detect_system');
@@ -216,24 +279,13 @@
     };
   }
 
-  async function runInstall(confirmOverwrite = false) {
+  async function runInstall(
+    confirmOverwrite = false,
+    conflict: { strategy: ConflictStrategy; preserve_paths?: string[] } | null = null,
+  ) {
     installing = true;
     installError = null;
     try {
-      // Bug 8: preview before write. If the target is an Adopt-style
-      // folder (has .claude/, knowledge/, etc.) and the user hasn't
-      // confirmed yet, show the diff modal and stop here.
-      if (!confirmOverwrite) {
-        const diff = await invoke<InstallDiff>('preview_install', {
-          config: buildInstallConfig(),
-        });
-        if (diff.mode === 'adopt' && diff.will_overwrite.length > 0) {
-          pendingDiff = diff;
-          installing = false;
-          return;
-        }
-      }
-
       // Bug 31: persist the volume location BEFORE install_orchestrator
       // touches anything. The backend ignores the path argument when
       // existing volumes are detected (Bug 32 contract — no override
@@ -261,15 +313,32 @@
       // so the payload must wrap install_path inside `config`. Earlier
       // versions sent `{ path, config: {} }` which Tauri rejected as
       // "missing field 'install_path'".
+      //
+      // Conflict resolution: if `conflict` is null AND the target is an
+      // Adopt-target, the Rust side returns InstallConflictError which we
+      // catch below to render the 4-option modal.
       await invoke('install_orchestrator', {
         config: buildInstallConfig(),
         confirmOverwrite,
+        conflict,
       });
       installed = true;
       pendingDiff = null;
+      pendingConflict = null;
       toast.success('Orchestrator installed');
     } catch (e) {
-      installError = String(e);
+      const raw = String(e);
+      const conflictErr = tryParseConflictError(raw);
+      if (conflictErr) {
+        // Hand off to the conflict modal. installing = false so the
+        // Install button is re-enabled if the user cancels.
+        pendingConflict = conflictErr;
+        conflictStrategy = 'overwrite_preserve';
+        conflictPreserveText = DEFAULT_PRESERVE_LIST.join('\n');
+        conflictShowPreserveEditor = false;
+      } else {
+        installError = raw;
+      }
     } finally {
       installing = false;
     }
@@ -281,6 +350,32 @@
   }
   function cancelAdopt() {
     pendingDiff = null;
+    installing = false;
+  }
+
+  /**
+   * Apply the chosen conflict strategy. Re-invokes runInstall with an
+   * explicit `conflict` object — that bypasses the conflict-detect path
+   * in install_orchestrator and runs the strategy directly.
+   */
+  async function applyConflictResolution() {
+    if (!pendingConflict) return;
+    const preserve_paths =
+      conflictStrategy === 'overwrite_preserve'
+        ? conflictPreserveText
+            .split('\n')
+            .map((s) => s.trim())
+            .filter(Boolean)
+        : undefined;
+    pendingConflict = null;
+    await runInstall(false, {
+      strategy: conflictStrategy,
+      preserve_paths,
+    });
+  }
+
+  function cancelConflictResolution() {
+    pendingConflict = null;
     installing = false;
   }
 
@@ -314,6 +409,7 @@
               skip_containers: true,
             },
             confirmOverwrite: false,
+            conflict: null,
           });
         }
         await projects.create(name, path, 'base');
@@ -693,36 +789,14 @@
             </button>
           {/if}
           {#if installError}<p class="ow-error">{installError}</p>{/if}
-
-          {#if pendingDiff}
-            <div class="ow-diff">
-              <h3>Existing orchestrator files detected</h3>
-              <p class="ow-secondary ow-banner">
-                Your code outside <code>.claude/</code>, <code>knowledge/</code>,
-                <code>state/</code>, etc. will <strong>not</strong> be touched.
-              </p>
-              {#if pendingDiff.will_overwrite.length}
-                <details open>
-                  <summary>Will overwrite ({pendingDiff.will_overwrite.length})</summary>
-                  <ul class="ow-paths">
-                    {#each pendingDiff.will_overwrite as p}<li><code>{p}</code></li>{/each}
-                  </ul>
-                </details>
-              {/if}
-              {#if pendingDiff.will_add.length}
-                <details>
-                  <summary>Will add ({pendingDiff.will_add.length})</summary>
-                  <ul class="ow-paths">
-                    {#each pendingDiff.will_add as p}<li><code>{p}</code></li>{/each}
-                  </ul>
-                </details>
-              {/if}
-              <div class="ow-diff-actions">
-                <button class="ow-btn" onclick={cancelAdopt}>Cancel</button>
-                <button class="ow-btn-primary" onclick={confirmAdopt}>Confirm adopt</button>
-              </div>
-            </div>
-          {/if}
+          <!-- Legacy pendingDiff inline modal removed: conflict resolution
+               now uses the dedicated 4-option modal rendered below the
+               wizard via DialogRoot (see `pendingConflict`). The script
+               still exposes `pendingDiff` / `confirmAdopt` / `cancelAdopt`
+               so unrelated callers keep compiling, but nothing sets
+               `pendingDiff` anymore — `runInstall` skips preview_install
+               entirely and lets the Rust install_orchestrator surface a
+               structured `InstallConflictError` instead. -->
         {:else if step === 4}
           <!-- Bug 28: collect name + path here so the user actually
                ends up with a project record after Finish. Previously
@@ -859,6 +933,131 @@
 </DialogRoot>
 {/if}
 
+<!-- Re-install conflict resolution modal. Triggered when the user
+     clicks Install on a path that already contains orchestrator files.
+     The Rust install_orchestrator command returns an InstallConflictError
+     in that case; we parse it out of the Err string in `runInstall` and
+     populate `pendingConflict` to show this dialog. -->
+{#if pendingConflict}
+<DialogRoot
+  open={true}
+  width="540px"
+  onClose={cancelConflictResolution}
+>
+  {#snippet header()}
+    <h2 style="margin:0;font-size:15px;">
+      Existing install detected at
+      <code class="ow-mono" style="font-size:11px;">{pendingConflict!.install_path}</code>
+    </h2>
+  {/snippet}
+  {#snippet body()}
+    <p style="margin:0 0 12px;color:#ccc;font-size:13px;">
+      The install path contains orchestrator files (<code>.claude/</code>,
+      <code>knowledge/</code>, etc.). Choose how to handle the conflict:
+    </p>
+
+    {#if pendingConflict!.preserve_candidates.length > 0}
+      <p class="ow-secondary" style="margin:0 0 10px;">
+        Preserve-list files at the target ({pendingConflict!.preserve_candidates.length}):
+        {#each pendingConflict!.preserve_candidates as p, i}
+          <code class="ow-mono" style="margin-left:4px;">{p}</code>{i < pendingConflict!.preserve_candidates.length - 1 ? ',' : ''}
+        {/each}
+      </p>
+    {/if}
+
+    <div class="ow-conflict-options">
+      <label class="ow-conflict-option">
+        <input type="radio" bind:group={conflictStrategy} value="overwrite_preserve" />
+        <div class="ow-conflict-text">
+          <span class="ow-conflict-title">
+            Overwrite, preserving project-specific files
+            <span class="ow-conflict-recommend">Recommended</span>
+          </span>
+          <span class="ow-conflict-desc">
+            Copy new files but leave the preserve list alone. The upstream
+            versions are written next to them as <code>&lt;file&gt;.new.&lt;ext&gt;</code>;
+            a notification block is appended to <code>.claude/CONTEXT_STATE.md</code>
+            so Claude can merge them on your next session.
+          </span>
+        </div>
+      </label>
+
+      <label class="ow-conflict-option">
+        <input type="radio" bind:group={conflictStrategy} value="overwrite_all" />
+        <div class="ow-conflict-text">
+          <span class="ow-conflict-title">Overwrite all</span>
+          <span class="ow-conflict-desc">
+            Copy every tracked install file on top — no preservation.
+            Loses your edits to <code>CLAUDE.md</code>, <code>CONTEXT_STATE.md</code>,
+            <code>PROJECT_REGISTRY.md</code>, <code>.env</code>, etc.
+          </span>
+        </div>
+      </label>
+
+      <label class="ow-conflict-option">
+        <input type="radio" bind:group={conflictStrategy} value="delete_claude_and_reinstall" />
+        <div class="ow-conflict-text">
+          <span class="ow-conflict-title">Delete and replace <code>.claude/</code></span>
+          <span class="ow-conflict-desc">
+            Wipes ONLY the destination's <code>.claude/</code> directory
+            (the rest of the install path is left alone), then performs a
+            fresh install. Use this when <code>.claude/</code> is corrupt
+            and you want a clean slate.
+          </span>
+        </div>
+      </label>
+
+      <label class="ow-conflict-option">
+        <input type="radio" bind:group={conflictStrategy} value="adopt_as_is" />
+        <div class="ow-conflict-text">
+          <span class="ow-conflict-title">Adopt as-is</span>
+          <span class="ow-conflict-desc">
+            Keep the existing files exactly as they are; just register the
+            project in the launcher. Use this when the install at this
+            path is already current.
+          </span>
+        </div>
+      </label>
+    </div>
+
+    {#if conflictStrategy === 'overwrite_preserve'}
+      <div class="ow-conflict-preserve">
+        <button
+          type="button"
+          class="ow-btn-link"
+          style="padding:0;font-size:11px;color:#0fc;"
+          onclick={() => (conflictShowPreserveEditor = !conflictShowPreserveEditor)}
+        >
+          {conflictShowPreserveEditor ? '▾' : '▸'} Files that will be preserved
+          ({conflictPreserveText.split('\n').filter((s) => s.trim()).length})
+        </button>
+        {#if conflictShowPreserveEditor}
+          <p class="ow-secondary" style="margin:6px 0 4px;font-size:11px;">
+            One install-relative path per line. Defaults below — edit only if
+            you know what you're doing.
+          </p>
+          <textarea
+            class="ow-conflict-preserve-input"
+            bind:value={conflictPreserveText}
+            rows="5"
+          ></textarea>
+        {/if}
+      </div>
+    {/if}
+  {/snippet}
+  {#snippet footer()}
+    <div class="ow-confirm-actions">
+      <button class="ow-btn" onclick={cancelConflictResolution} disabled={installing}>
+        Cancel
+      </button>
+      <button class="ow-btn-primary" onclick={applyConflictResolution} disabled={installing}>
+        {installing ? 'Applying…' : 'Apply'}
+      </button>
+    </div>
+  {/snippet}
+</DialogRoot>
+{/if}
+
 <style>
   /* Bug 26: backdrop / centering / max-height now handled by DialogRoot.
      This block only owns the wizard-specific header / body / footer
@@ -893,15 +1092,8 @@
   .ow-btn-link { background: none; border: none; color: #888; }
   .ow-btn-link:hover { color: #ccc; }
 
-  .ow-diff { margin-top: 12px; padding: 10px 12px; border: 1px solid rgba(0,191,166,0.25); background: rgba(0,191,166,0.05); border-radius: 6px; }
-  .ow-diff h3 { font-size: 13px; margin: 0 0 6px; color: #ccc; }
-  .ow-banner { margin: 0 0 8px; }
-  .ow-banner code { background: rgba(255,255,255,0.06); padding: 1px 4px; border-radius: 3px; font-family: ui-monospace, monospace; font-size: 11px; }
-  .ow-paths { list-style: none; padding: 4px 0 0 12px; margin: 0; max-height: 120px; overflow-y: auto; font-size: 11px; }
-  .ow-paths li { padding: 2px 0; color: #ccc; }
-  .ow-paths code { font-family: ui-monospace, monospace; font-size: 11px; color: #c4b3ff; }
-  .ow-diff details summary { cursor: pointer; font-size: 12px; color: #0fc; padding: 4px 0; }
-  .ow-diff-actions { display: flex; justify-content: flex-end; gap: 6px; margin-top: 10px; }
+  /* Legacy `.ow-diff*` selectors removed alongside the inline pendingDiff
+     modal — see the comment above `pendingConflict` in the markup. */
 
   /* Bug 22: optional GitHub PAT section */
   .ow-pat { margin-top: 14px; padding: 10px 12px; border: 1px solid rgba(255,255,255,0.08); border-radius: 6px; background: rgba(255,255,255,0.02); }
@@ -930,4 +1122,31 @@
   .ow-radio input { margin: 3px 0 0; flex-shrink: 0; }
   .ow-volumes-custom { display: flex; gap: 6px; margin: 6px 0 0 22px; }
   .ow-volumes-custom input[type="text"] { flex: 1; padding: 4px 8px; font-family: ui-monospace, monospace; font-size: 12px; background: rgba(0,0,0,0.3); color: #eee; border: 1px solid rgba(255,255,255,0.08); border-radius: 4px; }
+
+  /* Re-install conflict resolution modal — 4-option radio list. */
+  .ow-conflict-options { display: flex; flex-direction: column; gap: 8px; margin: 8px 0 12px; }
+  .ow-conflict-option {
+    display: flex; gap: 10px; align-items: flex-start;
+    padding: 10px 12px; border: 1px solid rgba(255,255,255,0.08); border-radius: 6px;
+    background: rgba(255,255,255,0.02); cursor: pointer;
+  }
+  .ow-conflict-option:hover { border-color: rgba(0,191,166,0.3); background: rgba(0,191,166,0.04); }
+  .ow-conflict-option input[type="radio"] { margin: 3px 0 0; flex-shrink: 0; accent-color: rgb(0,191,166); }
+  .ow-conflict-text { display: flex; flex-direction: column; gap: 4px; flex: 1; }
+  .ow-conflict-title { font-size: 13px; color: #eee; font-weight: 500; display: flex; gap: 8px; align-items: baseline; }
+  .ow-conflict-recommend {
+    font-size: 10px; font-weight: 600; padding: 1px 6px; border-radius: 8px;
+    background: rgba(0,191,166,0.18); color: #0fc; text-transform: uppercase; letter-spacing: 0.04em;
+  }
+  .ow-conflict-desc { font-size: 11px; color: #aaa; line-height: 1.4; }
+  .ow-conflict-desc code {
+    background: rgba(255,255,255,0.06); padding: 0 4px; border-radius: 3px;
+    font-family: ui-monospace, monospace; font-size: 10.5px; color: #c4b3ff;
+  }
+  .ow-conflict-preserve { margin-top: 4px; padding: 8px 10px; border: 1px dashed rgba(255,255,255,0.1); border-radius: 5px; }
+  .ow-conflict-preserve-input {
+    width: 100%; padding: 6px 8px; font-family: ui-monospace, monospace; font-size: 11px;
+    background: rgba(0,0,0,0.3); color: #eee; border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 4px; resize: vertical; box-sizing: border-box;
+  }
 </style>
