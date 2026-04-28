@@ -1,0 +1,53 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  schedule:
+    # Weekly Monday 06:00 UTC, matches Dependabot's schedule.
+    - cron: '0 6 * * 1'
+
+permissions:
+  contents: read
+  security-events: write
+  packages: read
+  actions: read
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: python
+            build-mode: none
+          - language: javascript-typescript
+            build-mode: none
+          # Rust intentionally omitted: CodeQL has no native Rust support
+          # in 2026. Cargo deps are covered by Dependabot security updates;
+          # Rust binary surface area is small (Tauri commands).
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          # security-extended catches more security-relevant patterns at
+          # roughly 2x the runtime of the default suite. Negligible cost
+          # at this repo size and worth the broader coverage on a fresh
+          # public release.
+          queries: security-extended
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
