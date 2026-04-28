@@ -204,7 +204,27 @@
 
   <div class="cg-graph-host">
     {#if nodes.length === 0 && !loading}
-      <p class="cg-empty">Pick a project and click <em>Load graph</em>.</p>
+      <div class="cg-empty-state">
+        {#if summary && (summary.module_count + summary.class_count + summary.function_count) > 0}
+          <p class="cg-empty">
+            The codegraph has data but the visualization is empty.
+          </p>
+          <p class="cg-empty-hint">
+            Click <em>Load graph</em> above to fetch the first {150} entities.
+            Codegraph is large — we render a table view rather than a force-directed
+            graph (force layouts don't scale to {summary.function_count}+ nodes).
+          </p>
+        {:else}
+          <p class="cg-empty">No codegraph data for this project yet.</p>
+          <p class="cg-empty-hint">
+            Run <code>code-graph-analyze</code> on the project folder, or wait for
+            the auto-build to finish (status pill shows progress in the project
+            header). Re-open this page when the pill turns green.
+          </p>
+        {/if}
+      </div>
+    {:else if loading}
+      <p class="cg-empty">Loading…</p>
     {:else}
       {#if selectedNodeIds.size > 0}
         <div class="cg-bulk-bar" role="toolbar" aria-label="Bulk actions">
@@ -218,14 +238,44 @@
           <button class="cg-bulk-btn" onclick={clearSelection}>Clear</button>
         </div>
       {/if}
-      <SigmaGraph
-        {nodes}
-        {edges}
-        typeColors={ENTITY_COLORS}
-        onNodeClick={(n) => (pinned = n)}
-        onSelectionToggle={toggleSelect}
-        selectedIds={selectedNodeIds}
-      />
+      <!-- Table view replaces the prior SigmaGraph force-directed layout
+           (2026-04-28): force layouts don't render meaningfully for the
+           hundreds-to-thousands of entities a typical codebase produces,
+           and the user reported the existing visualization "doesn't play
+           nicely". Table is sortable by type → file → label, click to
+           pin like before. -->
+      <table class="cg-table">
+        <thead>
+          <tr>
+            <th style="width:36px"></th>
+            <th>Type</th>
+            <th>Name</th>
+            <th>File</th>
+          </tr>
+        </thead>
+        <tbody>
+          {#each [...nodes].sort((a, b) => a.type.localeCompare(b.type) || (a.meta?.file_path ?? '').localeCompare(b.meta?.file_path ?? '')) as n (n.id)}
+            <tr
+              class:selected={selectedNodeIds.has(n.id)}
+              class:pinned={pinned?.id === n.id}
+              onclick={() => (pinned = n)}
+            >
+              <td>
+                <input
+                  type="checkbox"
+                  checked={selectedNodeIds.has(n.id)}
+                  onclick={(e) => { e.stopPropagation(); toggleSelect(n); }}
+                />
+              </td>
+              <td>
+                <span class="cg-stat cg-stat-mini" style="border-color:{ENTITY_COLORS[n.type] ?? '#888'}">{n.type}</span>
+              </td>
+              <td class="cg-name">{n.label}</td>
+              <td class="cg-file"><code>{n.meta?.file_path ?? ''}</code></td>
+            </tr>
+          {/each}
+        </tbody>
+      </table>
       {#if pinned}
         <aside class="cg-side">
           <header>
