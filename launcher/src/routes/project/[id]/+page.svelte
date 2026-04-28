@@ -99,7 +99,25 @@
 
 <div class="project-page">
   <header class="project-header">
-    <button class="back-btn" onclick={() => goto('/')} aria-label="Back">
+    <button
+      class="back-btn"
+      onclick={() => {
+        // Send the user back to a list/picker. There's no dedicated
+        // /projects route — the home page already renders the project
+        // catalog as the default landing view, so '/' is correct *as
+        // long as* we anchor the projects section on it. If history
+        // has a previous internal route (e.g. the user navigated
+        // here from /codegraph), prefer that. Reported 2026-04-28:
+        // Back used to slam the user to the home dashboard regardless
+        // of where they came from.
+        if (window.history.length > 1 && document.referrer) {
+          history.back();
+        } else {
+          goto('/');
+        }
+      }}
+      aria-label="Back"
+    >
       ← Back
     </button>
     <div class="project-title">

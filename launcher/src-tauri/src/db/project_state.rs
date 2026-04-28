@@ -924,6 +924,27 @@ impl Db {
             .map_err(|e| format!("delete_project_codegraph_binding: {}", e))?;
         Ok(())
     }
+
+    /// Reverse-lookup: given a Weaviate collection prefix (e.g. "Agape"),
+    /// return the project_id that owns that prefix. Used by the codegraph
+    /// dashboard to map Weaviate classes back to projects so it can render
+    /// one card per project (not one per class). Returns None when the
+    /// prefix isn't claimed by any project — the dashboard then renders
+    /// the prefix as the project name and "none" access.
+    pub fn find_project_by_codegraph_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Option<String>, String> {
+        let guard = self.lock();
+        guard
+            .query_row(
+                "SELECT project_id FROM project_codegraph_bindings WHERE collection_prefix = ?1",
+                params![prefix],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| format!("find_project_by_codegraph_prefix: {}", e))
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════

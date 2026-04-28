@@ -809,18 +809,34 @@ async fn run_build_task(
         args.push("--pdg".to_string());
     }
 
+    // Resolve VCT_INSTALL_ROOT: the directory of the orchestrator
+    // install (where install.py created `.venv`). The analyzer wrapper
+    // probes this when the project itself has no venv (e.g. a project
+    // registered against an existing folder via the launcher's Browse
+    // flow). We pass it as an env var rather than hard-coding a path
+    // in the script so the same script works across multiple installs.
+    // Derived from the resolved script's location: scripts dir →
+    // .claude → install root.
+    let install_root = script
+        .parent()                  // .claude/scripts/
+        .and_then(|p| p.parent())  // .claude/
+        .and_then(|p| p.parent())  // <install_root>/
+        .map(|p| p.to_path_buf());
+
     // 5. Run it. We capture stdout+stderr; they're combined into one
     //    log buffer (interleaving is fine for human debugging).
-    let output = tokio::process::Command::new(&script)
-        .args(&args)
+    let mut cmd = tokio::process::Command::new(&script);
+    cmd.args(&args)
         // Don't inherit the launcher's working dir; the analyzer is
         // path-aware and we don't want it picking up an unrelated cwd.
         .current_dir(std::env::temp_dir())
         // Don't leak Tauri's pipe to a long-running subprocess that
         // might hang on stdin: explicitly close it.
-        .stdin(std::process::Stdio::null())
-        .output()
-        .await;
+        .stdin(std::process::Stdio::null());
+    if let Some(ref root) = install_root {
+        cmd.env("VCT_INSTALL_ROOT", root);
+    }
+    let output = cmd.output().await;
 
     let finished_at = chrono::Utc::now().timestamp_millis();
 
