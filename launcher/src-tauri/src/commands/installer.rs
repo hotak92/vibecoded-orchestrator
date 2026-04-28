@@ -1067,6 +1067,19 @@ pub async fn install_orchestrator(
 
     let mut install_args = vec!["install.py".to_string()];
 
+    // The launcher invokes install.py as a non-interactive subprocess.
+    // ALWAYS pass --quiet + --no-joern so install.py never blocks waiting
+    // for stdin input that the launcher can't provide. Reported 2026-04-28
+    // from real wizard test: project creation hung at step 2b/10 (Joern
+    // prompt) because tokio::process::Command inherits stdin and the
+    // launcher's stdin can register as a TTY via webkit2gtk inheritance.
+    //
+    // CLI users who DO want Joern install via the launcher path will need
+    // to either rerun install.py manually with --with-joern or use a
+    // future "install Joern" tray action.
+    install_args.push("--quiet".to_string());
+    install_args.push("--no-joern".to_string());
+
     if config.use_gpu {
         install_args.push("--gpu".to_string());
     }
@@ -1090,6 +1103,12 @@ pub async fn install_orchestrator(
     let python_cmd = &system.python_cmd;
     let install_output = tokio::process::Command::new(python_cmd)
         .args(&install_args)
+        // Defense-in-depth: explicitly close stdin so install.py's input()
+        // calls receive EOF instead of blocking indefinitely. The --quiet
+        // + --no-joern flags above should already prevent any prompt, but
+        // a future code path that adds another input() would re-introduce
+        // the hang. Stdin=null makes the hang impossible.
+        .stdin(std::process::Stdio::null())
         .current_dir(&install_path)
         .output()
         .await
