@@ -24,6 +24,22 @@ Open source. Runs locally. Learns from how you work.
 
 ---
 
+## TL;DR — install + launch
+
+After cloning the repo, run the install entry point for your OS, then double-click the launcher entry point:
+
+| OS | Install (one-time) | Start the launcher |
+|---|---|---|
+| **Linux** | `bash first-install.sh` (or double-click `first-install.desktop`) | `bash start-launcher.sh` (or `start-launcher.desktop`) |
+| **macOS** | Double-click `first-install.command` (or `bash first-install.sh`) | Double-click `start-launcher.command` |
+| **Windows** | Double-click `first-install.bat` | Double-click `start-launcher.bat` |
+
+The launcher binary is checked at startup for an embedded SvelteKit frontend; broken builds are skipped with a clear `rebuild with scripts/build-bundled-launcher.sh` hint instead of opening to a blank "Could not connect to localhost" page (regression guard added 2026-04-28).
+
+If the GUI fails to open or shows an empty window, see [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) and [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
+
+---
+
 ## Quick Start (zero-dependency click-to-install)
 
 Brand-new machine, no Python, no Node, no container runtime? Two ways to start:
