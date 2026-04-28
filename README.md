@@ -371,7 +371,28 @@ vibecoded-orchestrator/
 | **MAO** | TBD — sign up for the waitlist | Pro + 10 specialist agents + Tauri desktop UI + multi-agent maestro runtime |
 | **Enterprise** | From €500/mo | MAO + SOC 2 compliance track, priority support, commercial AGPL exemption, custom SLAs |
 
-Pro and MAO tiers activate additional features via a license key issued at purchase, validated against our Supabase endpoint. Free tier works fully without a key — RL retrieval falls back to cosine ordering. No phone-home, no feature telemetry, no telemetry at all unless you opt in.
+Pro and MAO tiers activate additional features via a license key issued at purchase, validated against our Supabase endpoint. Free tier works fully without a key — RL retrieval falls back to cosine ordering.
+
+### Telemetry
+
+**Telemetry is OPT-IN.** Nothing is sent unless you explicitly enable it during install (or later via the launcher's Settings → Telemetry panel). When opted in, we collect ONE thing only:
+
+- **Multi-sentence-level retrieval embeddings** — the dense vectors produced by the local embedding model when it indexes your KG / code-graph chunks (~2-8 sentences per chunk), paired with which chunks were retrieved and which the user/agent actually used.
+
+These embeddings are used **exclusively** to refine the RL reranker — the neural model that decides which retrieved nodes are most relevant for a given query. Better signal → better re-ordering for everyone. The training pipeline is part of the open-source codebase you can inspect (`claude_mcp_servers/` + `state/rl_*`).
+
+**What we do NOT collect (ever, even with telemetry on):**
+- Raw text content of your KG nodes, code, files, or queries
+- File paths, project names, repo identifiers
+- API keys, secrets, environment variables
+- Personal info, IP, hostname, machine identifiers
+- Any payload that could reconstruct your codebase or workspace
+
+Embeddings are dense numeric vectors — they're aggregated, irreversible representations of the chunks that produced them, not the chunks themselves. We can't reconstruct the source text from the vectors we receive.
+
+**Toggle it off anytime**: Settings → Telemetry → Disable, or set `VCT_TELEMETRY=0` in `.env`. Disabling stops collection immediately; previously-collected data isn't deleted retroactively unless you email `privacy@vibecodedtools.it`.
+
+The telemetry endpoint runs on our Supabase project; payload schema is open in `claude_mcp_servers/`. AGPL applies to the collector code — you can self-host it for your own RL fine-tuning if you fork.
 
 ## Licensing
 
