@@ -53,21 +53,120 @@ logger = logging.getLogger(__name__)
 #     full KV cache; 10–12 GB recommended). Hence 8 GB floor here, with the
 #     understanding that running it at small image-budget (256×256) is borderline.
 VISION_MODEL_REQUIREMENTS = {
-    # Ollama tags Martino uses in this repo:
-    "qwen3.5:9b":             {"vram_gb": 7.5,  "ram_gb": 12.0,  "file_gb": 6.0},
-    "qwen3.5:7b":             {"vram_gb": 6.0,  "ram_gb": 10.0,  "file_gb": 4.7},
-    "qwen3.5:4b":             {"vram_gb": 4.0,  "ram_gb": 7.0,   "file_gb": 2.6},
+    # Ollama tags Martino uses in this repo. RAM thresholds bumped
+    # 2026-04-28: the previous values matched Ollama's reported
+    # working-set, but in practice on a desktop machine OS + browser +
+    # IDE + Weaviate + code-embed already eat ~10-12 GB before any
+    # LLM loads. A user with 16 GB hit OOM trying to load qwen3.5:9b
+    # (the read_image VLM) because 12 GB threshold "fit" the raw spec
+    # but didn't fit the realistic budget. Practical floors: 9b → 24 GB,
+    # 7b → 18 GB, 4b → 12 GB. CPU-only inference also adds compute time
+    # measured in minutes per request, so we'd rather skip vision than
+    # serve unusable latency on tight RAM.
+    "qwen3.5:9b":             {"vram_gb": 7.5,  "ram_gb": 24.0,  "file_gb": 6.0},
+    "qwen3.5:7b":             {"vram_gb": 6.0,  "ram_gb": 18.0,  "file_gb": 4.7},
+    "qwen3.5:4b":             {"vram_gb": 4.0,  "ram_gb": 12.0,  "file_gb": 2.6},
     # Sibling tags users may swap to:
-    "qwen3-vl:8b":            {"vram_gb": 7.5,  "ram_gb": 12.0,  "file_gb": 6.0},
-    "qwen2.5vl:7b":           {"vram_gb": 6.0,  "ram_gb": 10.0,  "file_gb": 4.7},
-    "llama3.2-vision:latest": {"vram_gb": 9.0,  "ram_gb": 16.0,  "file_gb": 7.9},
-    "llama3.2-vision:11b":    {"vram_gb": 9.0,  "ram_gb": 16.0,  "file_gb": 7.9},
+    "qwen3-vl:8b":            {"vram_gb": 7.5,  "ram_gb": 22.0,  "file_gb": 6.0},
+    "qwen2.5vl:7b":           {"vram_gb": 6.0,  "ram_gb": 18.0,  "file_gb": 4.7},
+    "llama3.2-vision:latest": {"vram_gb": 9.0,  "ram_gb": 24.0,  "file_gb": 7.9},
+    "llama3.2-vision:11b":    {"vram_gb": 9.0,  "ram_gb": 24.0,  "file_gb": 7.9},
     "llama3.2-vision:90b":    {"vram_gb": 64.0, "ram_gb": 110.0, "file_gb": 55.0},
-    "gemma3:4b":              {"vram_gb": 5.0,  "ram_gb": 8.0,   "file_gb": 3.3},
-    "gemma4:e4b":             {"vram_gb": 5.0,  "ram_gb": 8.0,   "file_gb": 3.3},
+    "gemma3:4b":              {"vram_gb": 5.0,  "ram_gb": 12.0,  "file_gb": 3.3},
+    "gemma4:e4b":             {"vram_gb": 5.0,  "ram_gb": 12.0,  "file_gb": 3.3},
 }
-# Default threshold for unknown models (conservative — assume 8B-ish multimodal).
-_DEFAULT_VISION_REQUIREMENTS = {"vram_gb": 7.5, "ram_gb": 14.0, "file_gb": 6.0}
+# Default threshold for unknown models (conservative — assume 8B-ish
+# multimodal). Bumped 2026-04-28 to match the 16-GB-isn't-enough rule.
+_DEFAULT_VISION_REQUIREMENTS = {"vram_gb": 7.5, "ram_gb": 22.0, "file_gb": 6.0}
+
+
+# Text-generation model tiers used by `read_document` and any other
+# tool that asks the MCP for a "best available text model" via
+# `model="auto"`. Ordered from heaviest to lightest. The first entry
+# whose RAM/VRAM threshold fits the host's capability wins.
+#
+# Numbers are practical thresholds (OS + Weaviate + IDE overhead
+# already subtracted), NOT raw model working set. Mirrors the
+# vision-table convention introduced 2026-04-28.
+#
+# Selection policy (codified in _select_text_model):
+#   1. If host has >=16 GB VRAM, ALWAYS run on GPU. Pick the heaviest
+#      tier whose VRAM threshold fits — never fall through to CPU on
+#      a workstation-class GPU.
+#   2. Else if has_gpu + VRAM fits → GPU.
+#   3. Else if RAM fits → CPU.
+#   4. Else fall through to next (smaller) tier.
+#   5. Smallest tier wins as last resort: qwen3:0.6b fits down to 4 GB
+#      RAM; gemma4:e4b is the preferred 12 GB-RAM summarizer.
+#
+# Gemma4:e4b is the canonical low-RAM summarization fallback — preferred
+# over Gemma3:4b per user direction 2026-04-28. Use Gemma3:4b only as
+# a backup if e4b isn't installed locally.
+TEXT_MODEL_TIERS = [
+    # 24+ GB total RAM (or 7.5+ GB VRAM) — Qwen3.5 9B is the workstation
+    # default for both summarization + reasoning. Same model as the
+    # vision tier (text + image-aware), so when GPU has it loaded we
+    # share weights between calls.
+    ("qwen3.5:9b",     {"vram_gb": 7.5,  "ram_gb": 24.0}),
+    # 18-24 GB territory — 7B variant (smaller KV cache).
+    ("qwen3.5:7b",     {"vram_gb": 6.0,  "ram_gb": 18.0}),
+    # 12-18 GB RAM (or 5+ GB VRAM) — Gemma4 e4b is the canonical
+    # small-config summarization fallback. Tight, well-tuned for
+    # summaries; preferred over Gemma3:4b per user direction
+    # 2026-04-28.
+    ("gemma4:e4b",     {"vram_gb": 5.0,  "ram_gb": 12.0}),
+    # Backup if e4b isn't installed locally.
+    ("gemma3:4b",      {"vram_gb": 5.0,  "ram_gb": 12.0}),
+    # Also a tight fallback (4B Qwen variant).
+    ("qwen3.5:4b",     {"vram_gb": 4.0,  "ram_gb": 12.0}),
+    # Tiny fallback — always fits down to 4 GB RAM. Weaker reasoning
+    # but better than refusing the call.
+    ("qwen3:0.6b",     {"vram_gb": 1.0,  "ram_gb": 4.0}),
+]
+
+# VRAM threshold (GB) above which we ALWAYS use GPU and never fall
+# back to a smaller tier on CPU. A 16 GB-VRAM card can comfortably hold
+# qwen3:latest with full KV cache, so there's no reason to prefer a
+# smaller model just because RAM is tight. Workstation-class GPUs
+# should always shoulder the load.
+GPU_FORCE_VRAM_THRESHOLD_GB = 16.0
+
+
+def _select_text_model(capability: dict) -> str:
+    """Pick the best text-gen model that fits this host's capability.
+
+    Used when a tool was called with `model="auto"`. Returns the bare
+    model name (e.g. "gemma4:e4b"). Always returns SOMETHING — the
+    smallest tier (qwen3:0.6b) fits everything down to 4 GB RAM.
+
+    Selection rule: 16+ GB VRAM workstation always uses the heaviest
+    GPU-fit tier. Smaller GPUs use the heaviest tier they can fit;
+    CPU-only hosts fall through to RAM-fit tiers; tight machines land
+    on Gemma4:e4b (or qwen3:0.6b if even that doesn't fit).
+    """
+    vram = capability.get("vram_gb") or 0.0
+    ram = capability.get("ram_gb") or 0.0
+    has_gpu = bool(capability.get("has_gpu"))
+
+    # Workstation-class GPU rule: always use GPU, pick the heaviest
+    # model whose VRAM threshold fits. Don't fall through to CPU.
+    if has_gpu and vram >= GPU_FORCE_VRAM_THRESHOLD_GB:
+        for name, req in TEXT_MODEL_TIERS:
+            if vram >= req["vram_gb"]:
+                return name
+        # Even the smallest tier didn't fit (impossible for >=16 GB,
+        # but be safe). Fall through to the general selection below.
+
+    for name, req in TEXT_MODEL_TIERS:
+        if has_gpu and vram >= req["vram_gb"]:
+            return name
+        if ram >= req["ram_gb"]:
+            return name
+    # Couldn't find a fit (capability dict was empty or both 0) —
+    # default to the smallest known model. Caller will get a real
+    # OOM if it doesn't fit, which is more diagnostic than us
+    # silently refusing the call.
+    return TEXT_MODEL_TIERS[-1][0]
 
 
 def _resize_budget_pixels(capability: dict, model: str) -> int:
@@ -424,7 +523,7 @@ def chat(
 @mcp.tool()
 def read_document(
     file_path: str,
-    model: str = "qwen3:latest",
+    model: str = "auto",
     task: str = "summarize",
     context_lines: int = 50,
 ) -> str:
@@ -437,8 +536,15 @@ def read_document(
 
     Args:
         file_path: Absolute path to the document (txt, md, py, json, etc.)
-        model: Ollama model (qwen3:latest [8.2B, default], qwen3-coder:latest [30.5B for code],
-               devstral:24b [23.6B for code], olmo-3:7b [7.3B, faster])
+        model: Ollama model. Default `"auto"` picks the heaviest model that
+               fits this host (qwen3.5:9b on 24+ GB or 7.5+ GB VRAM,
+               gemma4:e4b on 12-24 GB RAM, qwen3:0.6b as the always-fits
+               fallback). 16+ GB VRAM workstations always run on GPU.
+               Override explicitly: qwen3.5:9b, gemma4:e4b, qwen3:latest
+               [8B], qwen3-coder:latest [30.5B code], devstral:24b
+               [23.6B code], olmo-3:7b [7.3B faster]. Memory-aware
+               default added 2026-04-28 after a 16 GB user OOMed
+               loading the 8B model.
         task: What to do — "summarize", "extract_key_points", "analyze_structure",
               or a natural language instruction like "find the database connection string"
               or "extract all error handling logic". For targeted extraction from large
@@ -454,6 +560,20 @@ def read_document(
         read_document("/path/to/code.py", task="explain what this code does")
         read_document("/path/to/large.py", task="find the database connection string")
     """
+    # Resolve "auto" to a tier-appropriate model based on detected
+    # host capability (RAM/VRAM). Picks qwen3.5:9b on workstations,
+    # gemma4:e4b on 12-24 GB RAM, qwen3:0.6b as the always-fits
+    # fallback. Re-resolves per call so swapping hardware (or freeing
+    # RAM) takes effect without restarting the MCP server.
+    if model == "auto":
+        try:
+            cap = _detect_vision_capability()
+            model = _select_text_model(cap)
+        except Exception:
+            # If capability probe fails, fall back to the smallest model
+            # — never refuse the call.
+            model = "qwen3:0.6b"
+
     try:
         path = Path(file_path)
         if not path.exists():
