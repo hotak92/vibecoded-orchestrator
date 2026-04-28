@@ -46,11 +46,65 @@ JSON record, which you should skip rather than abort on).
 - `2b/10`, `7b/10`, `7c/10` — sub-steps (joern, collection bootstrap,
   Weaviate seeding)
 - `session` — meta-event: install.py session start/ok markers
+- `choices` — install-time decisions (joern, embedding mode, container
+  runtime). `detail` is the choice name, `data.value` is the chosen
+  value, `data.reason` is a human-readable rationale. Read by
+  `_load_previous_choices` to replay decisions on a re-install
+  (24-hour stale-session rule applies — older choices are ignored).
+- `state-hashes` — post-install snapshot of MD5 digests for
+  `requirements.txt`, `launcher/src-tauri/Cargo.lock`,
+  `launcher/package.json`, and the `knowledge/` directory listing.
+  Written exactly once per successful install (at the end of `main()`).
+  Read by `_compute_drift` to detect what's changed since the last
+  successful install — drives the lightweight re-install path's
+  upgrade-vs-skip decision. NOT subject to the 24h stale rule:
+  a baseline from 3 months ago is still a perfectly valid drift
+  reference.
+- `lightweight` — emitted only on `install.py --lightweight` runs.
+  Walks through path-rewrite + venv-triage + container-ensure (no
+  model pulls, no Weaviate seed). See "Lightweight re-install" below.
 - `script-start`, `audit`, `binary-probe`, `download`, `apt-deps`,
   `build/deps`, `build/tauri`, `build/locate`, `spawn` — post-install
   launcher phases
 - `first-spawn`, `wizard-step-N`, `project-register`, ... — launcher
   runtime events
+
+## Lightweight re-install (`install.py --lightweight`)
+
+When the launcher's conflict modal Strategy 3 (overwrite-preserve)
+runs against an already-installed project, the full install.py path
+takes 1-2 minutes (re-asks Joern, redetects GPU, re-pulls Ollama
+models). Most of that work is unnecessary on a hot system.
+
+**Lightweight mode skips:**
+- Model pulls (shared volume, already pulled)
+- Weaviate seeding (`sync_knowledge_graph.py` is idempotent)
+- Joern probe + lean-ctx detection
+- GPU detection / embedding-mode prompt
+
+**Lightweight mode runs:**
+1. Path rewrite — when `--lightweight-old-path <PATH>` is passed,
+   replaces every absolute occurrence of `<PATH>` with the current
+   `PROJECT_ROOT` in `.env` and `.claude/settings.json`. Used when
+   the install moved on disk.
+2. Venv triage — chooses one of:
+   - `create` if `.venv/` is missing,
+   - `recreate` if Python version mismatch (drop + recreate),
+   - `upgrade` if `requirements_txt_md5` differs from the last
+     `state-hashes` snapshot (`pip install -r ... --upgrade`),
+   - `skip` if everything matches.
+3. Container ensure — assumes the shared containers are already
+   running. Lightweight does NOT start them; the launcher is
+   responsible for that on its own startup path.
+4. Fresh `state-hashes` snapshot — so the next run has a current
+   baseline.
+
+**Triggering lightweight:** the launcher detects when an
+`apply_conflict_strategy` Strategy-3 run is over a project with a
+healthy `.venv/` AND matching state hashes, and passes `--lightweight`
++ `--lightweight-old-path` to install.py. CLI users can also invoke
+`python install.py --lightweight --lightweight-old-path /old/path`
+directly.
 
 **Tauri command** (used by the launcher's onboarding wizard + a future
 Settings → Install Diagnostics panel):

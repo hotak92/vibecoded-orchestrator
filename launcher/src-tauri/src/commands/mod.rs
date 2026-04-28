@@ -11,6 +11,7 @@ pub mod licensing;
 pub mod modules;
 pub mod projects_v2;
 pub mod project_state_cmd;
+pub mod project_state_populate;
 pub mod runtime_install;
 pub mod secrets_cmd;
 pub mod self_update;

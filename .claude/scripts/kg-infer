@@ -12,10 +12,13 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-# Activate venv if available
-if [ -f "$PROJECT_ROOT/claude_mcp_servers/.venv/bin/activate" ]; then
-    source "$PROJECT_ROOT/claude_mcp_servers/.venv/bin/activate"
-fi
+# Probe canonical .venv locations (OSS install-root first, legacy second).
+for _c in "$PROJECT_ROOT/.venv" "$PROJECT_ROOT/claude_mcp_servers/.venv"; do
+    if [ -f "$_c/bin/activate" ]; then
+        source "$_c/bin/activate"
+        break
+    fi
+done
 
 # Run inference script
 exec python "$SCRIPT_DIR/infer_knowledge.py" "$@"
