@@ -143,7 +143,7 @@ jobs:
       # Always upload as workflow artifacts too — lets workflow_dispatch
       # runs (no tag) still produce downloadable binaries for QA.
       - name: Upload as workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: vct-launcher-${{ matrix.target }}
           path: |
