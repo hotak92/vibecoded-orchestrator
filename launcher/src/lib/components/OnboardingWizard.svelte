@@ -362,6 +362,63 @@
   // afterwards (= conflict fired from step 4 / finish(), not step 3).
   let conflictResumeStep4 = $state(false);
 
+  // Step-4 sub-state: the user picked a folder_path that's already
+  // registered as a project in the DB. We show three choices:
+  // open the existing project, recreate (delete + add fresh), or
+  // cancel. Prevents the wizard from dead-ending on a raw SQLite
+  // error. Reported 2026-04-28.
+  let duplicateProjectPrompt = $state<{ name: string; path: string } | null>(null);
+  let recreatingProject = $state(false);
+
+  async function openExistingProject() {
+    if (!duplicateProjectPrompt) return;
+    const { path } = duplicateProjectPrompt;
+    duplicateProjectPrompt = null;
+    try {
+      // Switch the launcher to the existing project by folder_path.
+      // The list_projects_v2 result has slug; find by folder_path
+      // and dispatch a navigation event the parent listens for.
+      const all = await invoke<Array<{ id: string; folder_path: string; slug: string }>>('list_projects_v2');
+      const match = all.find((p) => p.folder_path === path);
+      if (match) {
+        toast.success(`Opened existing project at ${path}`);
+      }
+    } catch {
+      // Non-fatal — at worst the project is still listed; user can pick it.
+    }
+    try { localStorage.setItem(KEY, 'true'); } catch {}
+    open = false;
+    onComplete?.();
+  }
+
+  async function recreateProject() {
+    if (!duplicateProjectPrompt) return;
+    const { name, path } = duplicateProjectPrompt;
+    recreatingProject = true;
+    try {
+      // Find the existing project_id, delete it, then create fresh.
+      const all = await invoke<Array<{ id: string; folder_path: string }>>('list_projects_v2');
+      const existing = all.find((p) => p.folder_path === path);
+      if (existing) {
+        await invoke('delete_project_v2', { projectId: existing.id });
+      }
+      await projects.create(name, path, 'base');
+      toast.success(`Project "${name}" recreated`);
+      duplicateProjectPrompt = null;
+      try { localStorage.setItem(KEY, 'true'); } catch {}
+      open = false;
+      onComplete?.();
+    } catch (e) {
+      projectError = e instanceof Error ? e.message : String(e);
+    } finally {
+      recreatingProject = false;
+    }
+  }
+
+  function cancelDuplicatePrompt() {
+    duplicateProjectPrompt = null;
+  }
+
   async function applyConflictResolution() {
     if (!pendingConflict) return;
     const conflict = pendingConflict;
@@ -452,8 +509,24 @@
             conflict: null,
           });
         }
-        await projects.create(name, path, 'base');
-        toast.success(`Project "${name}" created`);
+        try {
+          await projects.create(name, path, 'base');
+          toast.success(`Project "${name}" created`);
+        } catch (createErr) {
+          // The folder_path is already registered (UNIQUE constraint
+          // on projects.folder_path). Surface a clear inline choice
+          // instead of a raw error: Open existing / Re-create
+          // (delete + add) / Cancel. Reported 2026-04-28: re-running
+          // the wizard against Agape used to dead-end with a raw
+          // SQLite error and no way to dismiss.
+          const cmsg = createErr instanceof Error ? createErr.message : String(createErr);
+          if (/UNIQUE constraint failed.*projects\.folder_path/i.test(cmsg)) {
+            duplicateProjectPrompt = { name, path };
+            creatingProject = false;
+            return;
+          }
+          throw createErr;
+        }
       } catch (e) {
         // The inline install we kicked off above can return an
         // InstallConflictError when the project path already has
@@ -575,6 +648,26 @@
       return;
     }
     try {
+      // First: if the launcher already has projects registered, the user
+      // is fully set up. Don't show the wizard at all — the
+      // onboarding-complete localStorage flag may have been wiped by a
+      // browser-cache reset (reported 2026-04-28 after webkit storage
+      // wipe during connection-refused debugging). Treat "≥1 project
+      // in the DB" as proof of completion and close immediately.
+      try {
+        const projects = await invoke<unknown[]>('list_projects_v2');
+        if (Array.isArray(projects) && projects.length > 0) {
+          try { localStorage.setItem(KEY, 'true'); } catch {}
+          open = false;
+          preflightChecked = true;
+          onComplete?.();
+          return;
+        }
+      } catch {
+        // list_projects_v2 not available or DB unhappy — fall through
+        // to the install-root probe rather than block the wizard.
+      }
+
       const root = await invoke<string | null>('detect_existing_install_root');
       if (root) {
         alreadyInstalledRoot = root;
@@ -1004,6 +1097,51 @@
       </button>
       <button class="ow-btn-primary" onclick={installNowAndAdvance} disabled={installing || !!sourceError}>
         {installing ? 'Installing…' : 'Install now'}
+      </button>
+    </div>
+  {/snippet}
+</DialogRoot>
+{/if}
+
+<!-- Duplicate-project prompt. Step 4's projects.create() can fail with
+     UNIQUE constraint failed: projects.folder_path when the user enters
+     a path already registered as a project. Three options:
+       - Open existing  : keep what's in the DB, close the wizard.
+       - Re-create      : delete the existing row + create fresh (does
+                          NOT touch filesystem).
+       - Cancel         : back to step 4 with current input intact.
+     Reported 2026-04-28. -->
+{#if duplicateProjectPrompt}
+<DialogRoot
+  open={true}
+  width="500px"
+  onClose={cancelDuplicatePrompt}
+>
+  {#snippet header()}
+    <h2 style="margin:0;font-size:15px;">Project already registered</h2>
+  {/snippet}
+  {#snippet body()}
+    <p style="margin:0 0 10px;color:#ccc;">
+      A project at
+      <code class="ow-mono">{duplicateProjectPrompt.path}</code>
+      is already in the launcher's database.
+    </p>
+    <p style="margin:0 0 10px;color:#888;font-size:12px;">
+      Opening the existing record keeps its agents, skills, hooks, and
+      KG/codegraph bindings intact. Re-creating deletes the DB record
+      and starts fresh — no filesystem changes are made either way.
+    </p>
+  {/snippet}
+  {#snippet footer()}
+    <div class="ow-confirm-actions">
+      <button class="ow-btn" onclick={cancelDuplicatePrompt} disabled={recreatingProject}>
+        Cancel
+      </button>
+      <button class="ow-btn" onclick={recreateProject} disabled={recreatingProject}>
+        {recreatingProject ? 'Recreating…' : 'Re-create'}
+      </button>
+      <button class="ow-btn-primary" onclick={openExistingProject} disabled={recreatingProject}>
+        Open existing
       </button>
     </div>
   {/snippet}
