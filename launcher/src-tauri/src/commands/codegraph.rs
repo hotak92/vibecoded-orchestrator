@@ -285,7 +285,27 @@ pub async fn codegraph_load_graph(
         std::collections::HashMap::new();
     let mut edges: Vec<CgVizEdge> = Vec::new();
 
-    // (class, label_field, extra_fields)
+    // Resolve the project's code-graph collection prefix from the
+    // launcher DB. Code-graph entities are namespaced per project
+    // (e.g. `Agape_CodeFunction`, `VideoFrames_CodeModule`) so we MUST
+    // prefix the class name with the project's binding. Querying the
+    // bare class names returns 0 results — that was the visible bug
+    // reported 2026-04-28: codegraph dashboard rendered empty even
+    // though Weaviate had all the data. The prefix is set by
+    // `populate_project_state_from_filesystem` (commit 03eb485) and is
+    // typically a sanitized form of the project name.
+    let cg_binding = db
+        .get_project_codegraph_binding(&target_project_id)?
+        .ok_or_else(|| {
+            format!(
+                "project {} has no codegraph binding configured (run \
+                 code-graph-analyze first, or recreate the project)",
+                target_project_id
+            )
+        })?;
+    let prefix = cg_binding.collection_prefix.clone();
+
+    // (suffix, label_field, extra_fields). Class name is `<prefix>_<suffix>`.
     let classes: &[(&str, &str, &str)] = &[
         ("CodeModule", "path", "imports"),
         ("CodeClass", "full_name", "extends"),
@@ -294,7 +314,8 @@ pub async fn codegraph_load_graph(
         ("CodeInteraction", "endpoint", ""),
     ];
     let mut truncated = false;
-    for (class, label_field, edge_field) in classes {
+    for (suffix, label_field, edge_field) in classes {
+        let class = format!("{}_{}", prefix, suffix);
         let q = format!(
             "{{ Get {{ {class}(where: {{path:[\"project\"], operator:Equal, valueText:\"{project}\"}}, limit: {lim}) {{ {label_field} {ef} _additional {{ id }} }} }} }}",
             class = class,
@@ -338,7 +359,11 @@ pub async fn codegraph_load_graph(
             nodes.push(CgVizNode {
                 id: id.clone(),
                 label: label.clone(),
-                entity_type: class.to_string(),
+                // entity_type uses the bare suffix (e.g. "CodeFunction"),
+                // NOT the project-prefixed class name. Frontend renders
+                // node icons / colors based on the entity kind, not the
+                // namespaced class.
+                entity_type: suffix.to_string(),
                 project: target.name.clone(),
                 file_path: item
                     .get("path")
