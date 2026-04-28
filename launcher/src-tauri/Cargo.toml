@@ -50,7 +50,7 @@ sha2 = "0.10"
 regex = "1"
 
 # Platform hostname
-gethostname = "0.5"
+gethostname = "1.1"
 
 # MAC address for machine binding (matches commercial_workflow/license/validator.py)
 mac_address = "1"
