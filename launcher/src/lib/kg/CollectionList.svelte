@@ -74,14 +74,29 @@
     background: rgba(255,255,255,0.04); padding: 10px 12px; border-radius: 6px;
     border: 1px solid rgba(255,255,255,0.08);
   }
-  .cl-card-h { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
-  .cl-card-h strong { font-size: 13px; flex: 1; min-width: 100px; }
+  .cl-card-h {
+    display: flex; align-items: center; gap: 6px;
+    /* No flex-wrap: keep title + badges on one line. Long names
+       truncate with ellipsis instead of pushing badges to a new line
+       (which produced overlapping-text glitches in narrow cards
+       reported 2026-04-28). */
+  }
+  .cl-card-h strong {
+    font-size: 13px; flex: 1 1 auto;
+    /* Truncate-on-overflow pattern: min-width: 0 lets the flex item
+       shrink below its content's intrinsic min size; overflow + ellipsis
+       hide the overflow gracefully. */
+    min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
   .cl-badge {
     font-size: 10px; padding: 1px 6px; border-radius: 8px;
     background: rgba(0,191,166,0.15); color: #0fc;
+    flex-shrink: 0;
   }
   .cl-access {
     font-size: 10px; padding: 1px 6px; border-radius: 8px; text-transform: uppercase;
+    flex-shrink: 0;
   }
   .cl-access-read { background: rgba(123,95,255,0.2); color: #c4b3ff; }
   .cl-access-write { background: rgba(0,191,166,0.2); color: #0fc; }
