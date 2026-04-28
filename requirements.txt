@@ -19,7 +19,7 @@ requests>=2.31
 
 # ─── Data validation ───
 # Pydantic (MIT)
-pydantic>=2.0
+pydantic>=2.13.3
 
 # ─── YAML parsing ───
 # PyYAML (MIT)
