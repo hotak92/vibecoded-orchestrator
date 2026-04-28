@@ -101,7 +101,39 @@ REM   - python3: NOT pre-installed; install.ps1 already auto-installs it
 REM     before we get here (so guaranteed at this point).
 REM   - winget: pre-installed Win11 + recent Win10 only. Detect; URL
 REM     fallback if absent.
+REM
+REM Shell-function shadowing on Windows: cmd.exe doesn't have shell
+REM functions the way bash does, so the Linux _resolves_to_binary problem
+REM (lean-ctx/asdf/fnm/nvm wrappers around node/npm) doesn't apply here.
+REM `where /q` only matches PATH executables — function/alias shadows are
+REM impossible. PowerShell users with `function npm { ... }` in their
+REM profile would still be hit, but install.ps1 runs with -NoProfile so
+REM profile-defined functions are not loaded.
 REM ---------------------------------------------------------------------------
+
+REM Install log path — bidirectional with install.py + post-install-launcher.sh.
+REM Cmd doesn't have a JSON library so we hand-roll the JSONL writes via
+REM PowerShell. Each event is one line; never PII; the launcher and Claude
+REM Code both read this on failure (see docs/INSTALL_RECOVERY.md).
+set "INSTALL_LOG=%~dp0state\logs\install.jsonl"
+
+REM _log_event <step> <phase> <detail>
+REM Idempotent: silently no-ops if the log dir doesn't exist (install.py
+REM Step 8 creates it; if we got here without that step we just skip the
+REM event — never crash).
+goto :after_log_helper
+:_log_event
+if not exist "%~dp0state\logs" goto :_log_event_done
+"%PSCMD%" -NoProfile -ExecutionPolicy Bypass -Command ^
+    "$ts = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ');" ^
+    "$step  = '%~1' -replace '\\','\\\\' -replace '\"','\\\"';" ^
+    "$phase = '%~2' -replace '\\','\\\\' -replace '\"','\\\"';" ^
+    "$det   = '%~3' -replace '\\','\\\\' -replace '\"','\\\"';" ^
+    "$line = '{\"ts\":\"' + $ts + '\",\"actor\":\"first-install.bat\",\"step\":\"' + $step + '\",\"phase\":\"' + $phase + '\",\"detail\":\"' + $det + '\"}';" ^
+    "Add-Content -Path '%INSTALL_LOG%' -Value $line" 2>nul
+:_log_event_done
+goto :eof
+:after_log_helper
 
 set "LAUNCHER_BIN="
 REM First-match-wins probe. Order:
@@ -126,9 +158,44 @@ if exist "%~dp0launcher\src-tauri\target\release\vct-launcher.exe" (
     set "LAUNCHER_BIN=%LOCALAPPDATA%\vct-launcher\vct-launcher.exe"
 )
 
+REM Staleness check for bundled binaries. Reads <binary>.metadata.json
+REM (the manifest scripts/build-bundled-launcher.sh writes alongside the
+REM binary) and compares its source_hash against the live launcher
+REM subtree's git hash. If they don't match, the bundled binary was built
+REM from an older snapshot — fall through to the download/build menu.
+REM Mirror of post-install-launcher.sh::_bundled_binary_is_fresh, ported
+REM to PowerShell for Windows. Only runs for paths under launcher\dist\.
+if defined LAUNCHER_BIN (
+    echo !LAUNCHER_BIN! | findstr /I /C:"\launcher\dist\" >nul
+    if !ERRORLEVEL! EQU 0 (
+        set "META_FILE=!LAUNCHER_BIN!.metadata.json"
+        if exist "!META_FILE!" (
+            for /f "delims=" %%H in ('"%PSCMD%" -NoProfile -ExecutionPolicy Bypass -Command ^
+                "$j = Get-Content -Raw '!META_FILE!' | ConvertFrom-Json;" ^
+                "$mh = $j.source_hash;" ^
+                "Push-Location '%~dp0';" ^
+                "$lh = (git ls-tree HEAD launcher/src-tauri/src/ launcher/src/ launcher/src-tauri/Cargo.toml launcher/src-tauri/Cargo.lock launcher/package.json 2^>$null ^| git hash-object --stdin 2^>$null);" ^
+                "Pop-Location;" ^
+                "if (-not $lh -or -not $mh) { 'fresh' } elseif ($mh -eq $lh) { 'fresh' } else { 'stale' }" 2^>nul') do set "FRESHNESS=%%H"
+            if /I "!FRESHNESS!"=="stale" (
+                echo [launcher] Bundled binary is stale ^(built from a different launcher source^); will try download/build.
+                set "LAUNCHER_BIN="
+            )
+        ) else (
+            REM No metadata file alongside the bundled binary — treat as
+            REM stale. Mirror of bash behaviour: err toward correctness.
+            echo [launcher] Bundled binary has no metadata.json — treating as stale.
+            set "LAUNCHER_BIN="
+        )
+    )
+)
+
 if defined LAUNCHER_BIN (
     echo [launcher] Found existing binary: %LAUNCHER_BIN%
+    call :_log_event "binary-probe" "ok" "existing launcher binary found"
     goto :auto_launch
+) else (
+    call :_log_event "binary-probe" "skip" "no existing launcher binary on disk"
 )
 
 REM Binary not found — present the same 3-way menu as the bash helper.
@@ -182,9 +249,11 @@ set "DL_EXIT=%ERRORLEVEL%"
 
 if "%DL_EXIT%"=="0" (
     set "LAUNCHER_BIN=%DEST_EXE%"
+    call :_log_event "download" "ok" "windows exe downloaded"
     goto :auto_launch
 )
 echo [launcher] Download failed ^(exit %DL_EXIT%^). Falling back to build.
+call :_log_event "download" "error" "windows download failed; falling back to build"
 goto :launch_build
 
 :launch_build
@@ -295,17 +364,41 @@ cd /d "%~dp0launcher"
 where /q pnpm
 if %ERRORLEVEL% EQU 0 (
     echo [launcher] [3/4] pnpm install
+    call :_log_event "build/deps" "start" "pnpm install"
     call pnpm install
+    if !ERRORLEVEL! NEQ 0 (
+        call :_log_event "build/deps" "error" "pnpm install failed"
+    ) else (
+        call :_log_event "build/deps" "ok" "pnpm install completed"
+    )
     echo [launcher] [4/4] tauri build ^(this takes 5-15 min^)
     REM --no-bundle: skip MSI packaging. End users only need the .exe;
     REM the bundle step needs WiX which often isn't installed. See
     REM post-install-launcher.sh for the same rationale.
+    call :_log_event "build/tauri" "start" "pnpm tauri build --no-bundle"
     call pnpm tauri build --no-bundle
+    if !ERRORLEVEL! NEQ 0 (
+        call :_log_event "build/tauri" "error" "pnpm tauri build exit non-zero"
+    ) else (
+        call :_log_event "build/tauri" "ok" "release exe built"
+    )
 ) else (
     echo [launcher] [3/4] npm install
+    call :_log_event "build/deps" "start" "npm install"
     call npm install
+    if !ERRORLEVEL! NEQ 0 (
+        call :_log_event "build/deps" "error" "npm install failed"
+    ) else (
+        call :_log_event "build/deps" "ok" "npm install completed"
+    )
     echo [launcher] [4/4] tauri build ^(this takes 5-15 min^)
+    call :_log_event "build/tauri" "start" "npx tauri build --no-bundle"
     call npx tauri build --no-bundle
+    if !ERRORLEVEL! NEQ 0 (
+        call :_log_event "build/tauri" "error" "npx tauri build exit non-zero"
+    ) else (
+        call :_log_event "build/tauri" "ok" "release exe built"
+    )
 )
 cd /d "%~dp0"
 
@@ -418,6 +511,7 @@ if not exist "%STARTMENU_DIR%" mkdir "%STARTMENU_DIR%"
 
 echo.
 echo Installation complete. Opening launcher...
+call :_log_event "spawn" "ok" "launcher detached"
 REM `start "" ...`: empty string is the WINDOW TITLE arg required by `start`
 REM when the path is quoted; without it cmd treats the quoted path as the
 REM title. Detached spawn — this cmd window can close without killing the GUI.
