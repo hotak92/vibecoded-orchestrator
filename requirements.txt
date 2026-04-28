@@ -6,7 +6,7 @@
 mcp>=1.0
 
 # FastMCP (MIT) — higher-level MCP framework, used by search MCP
-fastmcp>=0.1
+fastmcp>=3.2.4
 
 # ─── Weaviate ───
 # Weaviate Python client (BSD-3-Clause)
