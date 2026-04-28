@@ -174,7 +174,7 @@
 
 <div class="cg-page">
   <header class="cg-header">
-    <button class="cg-back" onclick={() => goto('/projects')}>← Back</button>
+    <button class="cg-back" onclick={() => goto('/')}>← Back</button>
     <h1>Code Graph</h1>
     <button class="cg-refresh" onclick={load} disabled={loading}>
       {loading ? 'Loading…' : 'Refresh'}
