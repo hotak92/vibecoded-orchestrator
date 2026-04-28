@@ -16,7 +16,8 @@ If you don't use Claude Code: the KG / code graph / MCPs / launcher GUI still al
 > - **Python 3.11 or newer** (3.12 recommended; 3.13 also supported)
 > - **Docker** or **Podman**
 > - **Node.js 18+** with `npm` (only when building the launcher GUI from source — not needed if using the bundled prebuilt binary)
-> - *(optional)* **Claude Code CLI** + a Claude subscription — adds auto-summarization of new KG nodes via Haiku. Everything else (KG semantic search, code graph, agents, hooks) works without it.
+> - **A Claude subscription** (Pro / Max / Team / Enterprise). Required to actually use Claude as your AI coding client — the orchestrator's whole reason to exist is to feed it context. Free Anthropic accounts work for browsing docs but won't authenticate Claude Code.
+> - *(recommended)* **Claude Code CLI** (`@anthropic-ai/claude-code` from npm) — pairs with the subscription. Other Claude clients work too if you wire them up to the MCP servers manually.
 >
 > The `first-install.*` entry points detect and (when missing) auto-install
 > the dependencies above plus a few build-time/optional tools: `pnpm` (via
@@ -220,9 +221,10 @@ python install.py --quiet --no-joern --no-containers
 - **Python 3.11 or newer** — 3.12 is the version we develop and CI-test on; 3.13 is supported. 3.10 and older are rejected (we depend on stdlib `tomllib`, which lands in 3.11).
 - **Docker** or **Podman** (for Weaviate + Ollama containers)
 - **Node.js 18+** with `npm` — needed only for building the launcher GUI from source AND for installing Claude Code (if you want it). NOT needed if you use the bundled prebuilt at `launcher/dist/<arch>/` and don't intend to install Claude Code.
+- **A Claude subscription** (Pro, Max, Team, or Enterprise) — Claude Code authenticates against your subscription, and the orchestrator exists to feed Claude better context. Free Anthropic web accounts can browse `claude.ai` but cannot authenticate Claude Code. We don't auto-handle billing — pick a tier at https://claude.ai/upgrade before install if you don't already have one.
 
-**Optional (improves the experience but the orchestrator works without it):**
-- **Claude Code** CLI (`npm install -g @anthropic-ai/claude-code`) + a Claude subscription — auto-installed via npm if Node is present. Enables auto-summarization of new KG nodes via Haiku, and is the primary client we wire all the agents/skills/hooks for. Without it, KG nodes get stored without auto-summaries (you can still write summaries by hand) and the agents/skills/hooks remain dormant — the KG, code graph, MCPs, and launcher GUI all keep working.
+**Recommended (improves the experience but the orchestrator works without it):**
+- **Claude Code** CLI (`npm install -g @anthropic-ai/claude-code`) — auto-installed via npm if Node is present. The CLI is the primary Claude client we wire the agents/skills/hooks for; using a different Claude client (Anthropic API, web UI, third-party MCP-aware tools) is possible but you'd have to manually point it at the orchestrator's MCP servers. Without ANY Claude client, KG nodes still get stored (without Haiku-generated summaries — you can write summaries by hand) and the agents/skills/hooks stay dormant; the KG, code graph, MCPs, and launcher GUI all keep working standalone.
 
 **Auto-installed when needed (install attempts these without further prompts beyond the per-tool [Y/n]):**
 - **`pnpm`** — installed via `npm install -g pnpm` if Node is present and pnpm is missing. Falls back to plain `npm` if the global install fails.
