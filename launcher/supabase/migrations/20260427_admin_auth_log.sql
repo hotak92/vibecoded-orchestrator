@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS public.admin_auth_log (
   user_agent      TEXT            -- short prefix only, NULL allowed
 );
 
--- Lookup by user (forensic — "show me Fabio's auth history")
+-- Lookup by user (forensic — per-admin auth history queries)
 CREATE INDEX IF NOT EXISTS idx_admin_auth_log_user_time
   ON public.admin_auth_log (admin_user, authenticated_at DESC);
 

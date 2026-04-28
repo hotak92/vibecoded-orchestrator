@@ -501,7 +501,7 @@ Deno.serve(async (req: Request) => {
 //     is_admin: true,
 //     unlock_all_modules: true,
 //     dev_features_enabled: true,
-//     admin_user: "martino" | "fabio" | "vartan" | ... }
+//     admin_user: "<admin-identifier>" }
 //
 // 401 — Vault-token admin token expired / machine-bound to a different machine:
 //   { valid: false, tier: "free", message: "Admin token expired." }

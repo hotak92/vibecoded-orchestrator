@@ -117,7 +117,7 @@ Returns `{valid: false, tier: "free", error: "instance_limit", message: "...Deac
 Checked at the top of the LS-license branch (after Path A has had a chance to short-circuit on `vct_admin_*` tokens). If missing, the function returns 500 `{"error": "Service misconfigured"}` and logs `FATAL`. Never silently falls through to free tier. Path A also hard-fails on missing `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` (required for the Vault RPC and audit-log insert) with the same 500 response — so misconfiguration is loud whichever path the request lands in.
 
 ### Admin extras in response
-When `tier === "admin"`, the response body includes `{is_admin: true, unlock_all_modules: true, dev_features_enabled: true}`. The Path-A response additionally carries `admin_user: "<username>"` (resolved from the Vault map) so the client can display "Logged in as admin: martino" in the UI; Path B has no per-license username concept and omits this field.
+When `tier === "admin"`, the response body includes `{is_admin: true, unlock_all_modules: true, dev_features_enabled: true}`. The Path-A response additionally carries `admin_user: "<username>"` (resolved from the Vault map) so the client can display "Logged in as admin: <username>" in the UI; Path B has no per-license username concept and omits this field.
 
 ### CORS headers — wildcard origin
 `Access-Control-Allow-Origin: *` with `Access-Control-Max-Age: 86400`. Safe because authentication is via the license key body, not cookies.
@@ -176,7 +176,7 @@ Two server-side functions defined in `20260427_admin_auth_log.sql`, owned by `po
 Both RPCs `REVOKE ALL FROM PUBLIC, anon, authenticated` and `GRANT EXECUTE TO service_role` — open-source readers see the SQL but cannot call them from a client.
 
 ### `admin_auth_log` table
-`launcher/supabase/migrations/20260427_admin_auth_log.sql`. Columns: `id BIGSERIAL`, `admin_user TEXT NOT NULL`, `machine_id_hash TEXT NOT NULL`, `authenticated_at TIMESTAMPTZ DEFAULT now()`, `outcome TEXT CHECK IN ('success','expired','machine_mismatch')`, `ip_hash TEXT NULL`, `user_agent TEXT NULL`. Two forensic indexes: `(admin_user, authenticated_at DESC)` for "show me Fabio's auth history" and `(machine_id_hash, authenticated_at DESC)` for "what tokens authenticated from this machine?". RLS enabled with an explicit `deny_all_to_clients` policy on `anon`/`authenticated` (USING false, WITH CHECK false) — only `service_role` (used by the edge function) bypasses RLS. Append-only; not pruned.
+`launcher/supabase/migrations/20260427_admin_auth_log.sql`. Columns: `id BIGSERIAL`, `admin_user TEXT NOT NULL`, `machine_id_hash TEXT NOT NULL`, `authenticated_at TIMESTAMPTZ DEFAULT now()`, `outcome TEXT CHECK IN ('success','expired','machine_mismatch')`, `ip_hash TEXT NULL`, `user_agent TEXT NULL`. Two forensic indexes: `(admin_user, authenticated_at DESC)` for per-admin auth history queries and `(machine_id_hash, authenticated_at DESC)` for "what tokens authenticated from this machine?". RLS enabled with an explicit `deny_all_to_clients` policy on `anon`/`authenticated` (USING false, WITH CHECK false) — only `service_role` (used by the edge function) bypasses RLS. Append-only; not pruned.
 
 <details>
 <summary>Details</summary>

@@ -124,11 +124,11 @@ export function isAdminVariant(variantId: string): boolean {
 //
 // Vault secret format (`vct_admin_tokens`):
 //   {
-//     "martino": { "token": "vct_admin_<64chars>",
-//                  "expires_at": "2026-10-26T00:00:00Z" | null,
-//                  "machine_id_hash": "abc123..." | null },
-//     "fabio":   { ... },
-//     "vartan":  { ... }
+//     "admin1": { "token": "vct_admin_<64chars>",
+//                 "expires_at": "2026-10-26T00:00:00Z" | null,
+//                 "machine_id_hash": "abc123..." | null },
+//     "admin2": { ... },
+//     "admin3": { ... }
 //   }
 //
 //   - `expires_at`: optional ISO-8601 timestamp. NULL means no expiry.

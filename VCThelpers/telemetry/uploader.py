@@ -15,7 +15,7 @@ Design:
       once per N enqueues, nightly cron, etc).
 
 Endpoint:
-    Default https://api.vibecodedtools.it/telemetry (stub — Fabio deploys).
+    Default https://api.vibecodedtools.it/telemetry (stub — pending deploy).
     Override via VIBECODED_TELEMETRY_URL.
 """
 from __future__ import annotations
@@ -36,7 +36,7 @@ log = logging.getLogger(__name__)
 # Public alias for the telemetry edge function. Internal infra URLs are not
 # committed to public source — operators set VIBECODED_TELEMETRY_URL to override.
 #
-# v0.1.0 status: the upload endpoint is NOT yet deployed (Fabio's pending
+# v0.1.0 status: the upload endpoint is NOT yet deployed (pending
 # infra task — see docs/TELEMETRY.md). Until it's live, opted-in
 # telemetry events are written to ~/.vibecoded/telemetry_pending.jsonl
 # instead of posted, so users can see what would have been sent. Set

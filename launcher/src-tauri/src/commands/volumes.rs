@@ -1086,12 +1086,12 @@ mod tests {
             legacy_mapping: vec![
                 LegacyVolumeMapping {
                     volume_name: "weaviate_claude".to_string(),
-                    mountpoint: "/home/martino/podman_volumes/weaviate_claude".to_string(),
+                    mountpoint: "/home/example/podman_volumes/weaviate_claude".to_string(),
                     role: "weaviate".to_string(),
                 },
                 LegacyVolumeMapping {
                     volume_name: "ollama_claude".to_string(),
-                    mountpoint: "/home/martino/podman_volumes/ollama_claude".to_string(),
+                    mountpoint: "/home/example/podman_volumes/ollama_claude".to_string(),
                     role: "ollama".to_string(),
                 },
             ],
