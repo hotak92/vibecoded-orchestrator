@@ -61,7 +61,15 @@ state/
 .claude/context/pre-compact-snapshot.md
 .claude/cron-jobs.json
 .claude/worktrees/
+# Per-machine orchestrator install artifacts — populated by install.py, NEVER commit
+.claude/agents/
+.claude/skills/
 CLAUDE.local.md
+
+# pnpm artefacts — launcher uses npm; pnpm-lock.yaml accidentally created by
+# contributors with pnpm on PATH must NOT enter the repo (would fight package-lock.json)
+launcher/pnpm-lock.yaml
+pnpm-lock.yaml
 
 # IDE
 .vscode/settings.json
