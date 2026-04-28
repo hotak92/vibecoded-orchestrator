@@ -1,6 +1,13 @@
 # VibeCoded Tools — Orchestrator
 
+[![CI](https://img.shields.io/github/actions/workflow/status/hotak92/vibecoded-orchestrator/ci.yml?branch=main&label=CI)](https://github.com/hotak92/vibecoded-orchestrator/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/hotak92/vibecoded-orchestrator)](https://github.com/hotak92/vibecoded-orchestrator/releases)
+[![License: AGPL-3.0](https://img.shields.io/github/license/hotak92/vibecoded-orchestrator)](LICENSE)
+[![Stability: alpha](https://img.shields.io/badge/stability-alpha-orange)](KNOWN_ISSUES.md)
+
 **Persistent memory, code-graph search, and workflow automation for [Claude Code](https://claude.ai/code).**
+
+> **Stability**: alpha (v0.1.x). Validated end-to-end on Linux + Windows; macOS Tier-2. Expect rough edges; please report them via Issues.
 
 Open source. Runs locally. Learns from how you work.
 
