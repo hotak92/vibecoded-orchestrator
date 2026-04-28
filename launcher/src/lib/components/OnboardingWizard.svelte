@@ -539,7 +539,20 @@
     showSkipInstallConfirm = false;
   }
   function prev() { if (step > 1) step = (step - 1) as any; }
-  function skip() { finish(); }
+  // Skip = user wants to dismiss the wizard entirely. Don't go through
+  // finish() — that runs install + project-create which can hit a
+  // conflict modal and trap the user. Skip just sets the
+  // onboarding-complete flag and closes. The project list will be empty
+  // until the user creates one from the main UI; that's fine — better
+  // than a wizard that won't go away. Reported 2026-04-28.
+  function skip() {
+    try { localStorage.setItem(KEY, 'true'); } catch {}
+    pendingConflict = null;
+    conflictResumeStep4 = false;
+    creatingProject = false;
+    open = false;
+    onComplete?.();
+  }
 
   $effect(() => {
     if (step === 2 && !detection) void loadStep2();
