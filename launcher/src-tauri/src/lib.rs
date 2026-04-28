@@ -43,6 +43,18 @@ pub fn run() {
         .manage(project_store)
         .manage(db_handle)
         .setup(|app| {
+            // Windows-only: clean up the previous launcher's .old.exe
+            // left behind by `apply_launcher_update`'s rename-then-build
+            // workaround for the running-binary lock. Best effort —
+            // silently swallow errors (file missing, still locked, etc).
+            #[cfg(windows)]
+            {
+                if let Ok(exe) = std::env::current_exe() {
+                    let old_path = exe.with_extension("old.exe");
+                    let _ = std::fs::remove_file(&old_path);
+                }
+            }
+
             // Start the Hub API server in the background
             tauri::async_runtime::spawn(async {
                 match hub::server::start_hub_server().await {
