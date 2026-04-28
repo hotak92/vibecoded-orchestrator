@@ -26,6 +26,26 @@
 
   let view = $state<CodeGraphBuildView | null>(null);
   let unlisten: (() => void) | null = null;
+  let showFailureDetail = $state(false);
+  let rerunning = $state(false);
+
+  async function rerun() {
+    if (rerunning) return;
+    rerunning = true;
+    try {
+      // trigger_code_graph_build is the canonical re-run command — it
+      // queues a fresh analysis pass and the live `code-graph-build-progress`
+      // event will update our pill state in place.
+      await safeInvoke<void>('rebuild_code_graph', { projectId });
+      showFailureDetail = false;
+    } catch (e) {
+      // Surface the error inline rather than a toast — the user is
+      // already in a failure-investigation flow.
+      if (view) view = { ...view, error_message: e instanceof Error ? e.message : String(e) };
+    } finally {
+      rerunning = false;
+    }
+  }
 
   async function load() {
     view = await safeInvoke<CodeGraphBuildView | null>(
@@ -122,22 +142,57 @@
 </script>
 
 {#if view}
-  <span
-    class="pill status-{view.status}"
-    class:compact
-    title={tooltip(view)}
-    aria-label={`Code graph: ${statusLabel(view)}`}
-  >
-    <span class="glyph" class:spin={view.status === 'running'} aria-hidden="true">
-      {statusGlyph(view.status)}
-    </span>
-    {#if !compact}
-      <span class="label">{statusLabel(view)}</span>
+  <span class="pill-wrap">
+    <button
+      type="button"
+      class="pill status-{view.status}"
+      class:compact
+      class:clickable={view.status === 'failed'}
+      title={tooltip(view)}
+      aria-label={`Code graph: ${statusLabel(view)}`}
+      onclick={() => {
+        if (view?.status === 'failed') showFailureDetail = !showFailureDetail;
+      }}
+      disabled={view.status !== 'failed'}
+    >
+      <span class="glyph" class:spin={view.status === 'running'} aria-hidden="true">
+        {statusGlyph(view.status)}
+      </span>
+      {#if !compact}
+        <span class="label">{statusLabel(view)}</span>
+      {/if}
+    </button>
+
+    {#if showFailureDetail && view.status === 'failed'}
+      <div class="failure-popover" role="dialog" aria-label="Code graph build failure detail">
+        <div class="failure-row">
+          <strong>Error</strong>
+          <pre class="failure-msg">{view.error_message ?? 'No error message persisted (check launcher logs).'}</pre>
+        </div>
+        {#if view.log_tail}
+          <div class="failure-row">
+            <strong>Log tail</strong>
+            <pre class="failure-log">{view.log_tail}</pre>
+          </div>
+        {/if}
+        <div class="failure-actions">
+          <button type="button" class="btn-secondary" onclick={() => (showFailureDetail = false)}>
+            Close
+          </button>
+          <button type="button" class="btn-primary" onclick={rerun} disabled={rerunning}>
+            {rerunning ? 'Retrying…' : 'Retry build'}
+          </button>
+        </div>
+      </div>
     {/if}
   </span>
 {/if}
 
 <style>
+  .pill-wrap {
+    position: relative;
+    display: inline-block;
+  }
   .pill {
     display: inline-flex;
     align-items: center;
@@ -150,6 +205,95 @@
     white-space: nowrap;
     border: 1px solid transparent;
     user-select: none;
+    background: transparent;
+    color: inherit;
+    font-family: inherit;
+  }
+  button.pill {
+    cursor: default;
+  }
+  button.pill.clickable {
+    cursor: pointer;
+  }
+  button.pill.clickable:hover {
+    filter: brightness(1.15);
+  }
+  button.pill[disabled] {
+    cursor: default;
+  }
+
+  .failure-popover {
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 0;
+    z-index: 1000;
+    min-width: 380px;
+    max-width: 540px;
+    padding: 12px 14px;
+    background: #1a1d24;
+    border: 1px solid rgba(255,79,160,0.35);
+    border-radius: 8px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.45);
+    font-size: 12px;
+    color: #ddd;
+  }
+  .failure-row {
+    margin-bottom: 8px;
+  }
+  .failure-row strong {
+    display: block;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: #999;
+    margin-bottom: 4px;
+  }
+  .failure-msg, .failure-log {
+    margin: 0;
+    padding: 6px 8px;
+    background: rgba(255,255,255,0.04);
+    border-radius: 4px;
+    font-family: ui-monospace, monospace;
+    font-size: 11px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 200px;
+    overflow-y: auto;
+  }
+  .failure-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 10px;
+  }
+  .btn-secondary, .btn-primary {
+    padding: 4px 10px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    border: 1px solid transparent;
+    font-family: inherit;
+  }
+  .btn-secondary {
+    background: rgba(255,255,255,0.06);
+    color: #ccc;
+    border-color: rgba(255,255,255,0.12);
+  }
+  .btn-secondary:hover {
+    background: rgba(255,255,255,0.1);
+  }
+  .btn-primary {
+    background: rgb(0,191,166);
+    color: #001a17;
+  }
+  .btn-primary:hover:not(:disabled) {
+    background: rgb(0,210,180);
+  }
+  .btn-primary:disabled {
+    opacity: 0.5;
+    cursor: default;
   }
   .pill.compact { padding: 1px 6px; gap: 0; }
   .glyph {
