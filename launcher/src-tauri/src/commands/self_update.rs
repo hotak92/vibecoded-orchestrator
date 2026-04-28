@@ -484,6 +484,33 @@ async fn rebuild_cargo(repo: &Path) -> Result<(), String> {
         repo.join("src-tauri")
     };
 
+    // Windows-specific: cargo writes the new .exe over the old one, but
+    // the old one is OUR own running process — Windows refuses with
+    // "Access is denied" (os error 5). Workaround: rename the running
+    // .exe to <name>.old.exe before building. Windows DOES allow
+    // renaming a running file (just not deleting/overwriting), so the
+    // build then writes the new .exe at the canonical path. We delete
+    // the .old.exe on next launcher start (cleanup_stale_old_exe in
+    // lib.rs setup). Reported 2026-04-28 from a Windows rebuild attempt.
+    #[cfg(windows)]
+    {
+        if let Ok(running_exe) = std::env::current_exe() {
+            // Walk up from running_exe to find the matching target/release/
+            // path; only rename if it's the cargo target (not e.g. a copy
+            // staged in launcher/dist/ that the user double-clicked from).
+            let target_release = dir.join("target").join("release");
+            if running_exe.starts_with(&target_release) {
+                let old_path = running_exe.with_extension("old.exe");
+                let _ = std::fs::remove_file(&old_path); // best-effort
+                std::fs::rename(&running_exe, &old_path)
+                    .map_err(|e| format!(
+                        "rename running launcher to .old.exe (Windows lock workaround): {}",
+                        e
+                    ))?;
+            }
+        }
+    }
+
     let fut = TokioCommand::new("cargo")
         .args(["build", "--release"])
         .current_dir(&dir)
