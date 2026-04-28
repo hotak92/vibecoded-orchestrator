@@ -1282,6 +1282,10 @@ def main() -> int:
                         help="Install Claude skills (default: on)")
     parser.add_argument("--no-skills", dest="with_skills", action="store_false",
                         help="Skip installing Claude skills")
+    parser.add_argument("--with-hooks", action="store_true", default=True,
+                        help="Install Claude Code hooks + merge .claude/settings.json (default: on)")
+    parser.add_argument("--no-hooks", dest="with_hooks", action="store_false",
+                        help="Skip installing hooks and the settings.json template")
     parser.add_argument("--telemetry", choices=["on", "off"], default=None,
                         help="Anonymous telemetry consent. Default: prompt; "
                              "non-interactive runs default to 'off'.")
@@ -4679,7 +4683,7 @@ def _install_agents_and_skills(args: argparse.Namespace) -> None:
         {{PROJECTS_ROOT}}     → parent directory
         {{HOME}}              → user home directory
     """
-    print("[9b/10] Installing agents and skills ... ", flush=True)
+    print("[9b/10] Installing agents, skills, and hooks ... ", flush=True)
 
     templates_dir = PROJECT_ROOT / "templates"
     claude_dir = PROJECT_ROOT / ".claude"
@@ -4758,10 +4762,148 @@ def _install_agents_and_skills(args: argparse.Namespace) -> None:
     if args.with_skills:
         parts.append(f"{installed_skills} skills"
                      + (f" ({skipped_skills} already present)" if skipped_skills else ""))
+    # Hooks + settings.json (gated on --with-hooks; default on).
+    hooks_summary = _install_hooks_and_settings(args)
+    if hooks_summary:
+        parts.append(hooks_summary)
+
     if not parts:
-        print("  skipped (--no-agents --no-skills)")
+        print("  skipped (--no-agents --no-skills --no-hooks)")
     else:
         print("  " + ", ".join(parts))
+
+
+def _install_hooks_and_settings(args: argparse.Namespace) -> str:
+    """Copy hooks from templates/hooks/ into .claude/hooks/ and smart-merge
+    templates/settings.json.template into .claude/settings.json.
+
+    Hooks are byte-copied (no placeholder substitution) so every project carries
+    identical scripts. Hooks read VCT_INSTALL_ROOT, KG_COLLECTION, WEAVIATE_URL,
+    etc. at runtime; the launcher exports VCT_INSTALL_ROOT per-project.
+
+    settings.json merge rules (only when target file already exists):
+      * recursive dict merge — template provides defaults, user keys win on conflict
+      * `hooks.{Event}` arrays: append template entries that don't already exist
+        (compared by `command` string equality on the inner-hooks list); never
+        replace user-customized commands.
+
+    Returns a one-line summary string for the caller to print, or "" when the
+    install was skipped (e.g. --no-hooks or templates missing).
+    """
+    if not getattr(args, "with_hooks", True):
+        return ""
+
+    templates_dir = PROJECT_ROOT / "templates"
+    hooks_src = templates_dir / "hooks"
+    settings_template = templates_dir / "settings.json.template"
+    if not hooks_src.exists():
+        return ""
+
+    claude_dir = PROJECT_ROOT / ".claude"
+    hooks_dst = claude_dir / "hooks"
+    hooks_dst.mkdir(parents=True, exist_ok=True)
+
+    installed_hooks = 0
+    skipped_hooks = 0
+    for hook_file in sorted(hooks_src.glob("*.sh")):
+        target = hooks_dst / hook_file.name
+        if target.exists():
+            skipped_hooks += 1
+            continue
+        # copy2 preserves the executable bit and mtime — important for hooks.
+        shutil.copy2(hook_file, target)
+        installed_hooks += 1
+
+    settings_action = _merge_settings_template(
+        settings_template, claude_dir / "settings.json"
+    )
+
+    summary = f"{installed_hooks} hooks"
+    if skipped_hooks:
+        summary += f" ({skipped_hooks} already present)"
+    if settings_action:
+        summary += f", settings.json {settings_action}"
+    return summary
+
+
+def _merge_settings_template(template_path: Path, target_path: Path) -> str:
+    """Smart-merge settings.json.template into target. Returns one of:
+    'created', 'merged', 'unchanged', or '' (template missing).
+    """
+    if not template_path.exists():
+        return ""
+    template_data = json.loads(template_path.read_text(encoding="utf-8"))
+
+    if not target_path.exists():
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_text(
+            json.dumps(template_data, indent=2) + "\n", encoding="utf-8"
+        )
+        return "created"
+
+    try:
+        existing = json.loads(target_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        # Don't overwrite a malformed user file silently — leave it alone.
+        return "unchanged (user file unparseable)"
+
+    merged = _smart_merge_settings(existing, template_data)
+    if merged == existing:
+        return "unchanged"
+    target_path.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
+    return "merged"
+
+
+def _smart_merge_settings(user: dict, template: dict) -> dict:
+    """Recursive dict merge. User wins on scalar/leaf conflicts. For the special
+    `hooks.{Event}` lists, append template entries whose inner `command` strings
+    aren't already present in user's config.
+    """
+    out = dict(user)
+    for key, tval in template.items():
+        if key not in out:
+            out[key] = tval
+            continue
+        uval = out[key]
+        if key == "hooks" and isinstance(uval, dict) and isinstance(tval, dict):
+            out[key] = _merge_hooks_block(uval, tval)
+        elif isinstance(uval, dict) and isinstance(tval, dict):
+            out[key] = _smart_merge_settings(uval, tval)
+        # else: user wins — leave uval untouched.
+    return out
+
+
+def _merge_hooks_block(user_hooks: dict, template_hooks: dict) -> dict:
+    """Merge per-event hook arrays.
+
+    For each Event (SessionStart, PreToolUse, ...): if template provides hook
+    entries whose inner-hook `command` string isn't already present in any of
+    the user's entries for that event, append the entire template entry.
+    """
+    out = dict(user_hooks)
+    for event, t_entries in template_hooks.items():
+        if event not in out:
+            out[event] = list(t_entries)
+            continue
+        u_entries = out[event] if isinstance(out[event], list) else []
+        existing_cmds = set()
+        for entry in u_entries:
+            for h in entry.get("hooks", []) if isinstance(entry, dict) else []:
+                cmd = h.get("command")
+                if cmd:
+                    existing_cmds.add(cmd)
+        merged_entries = list(u_entries)
+        for t_entry in t_entries:
+            t_cmds = [
+                h.get("command")
+                for h in t_entry.get("hooks", [])
+                if isinstance(h, dict) and h.get("command")
+            ]
+            if t_cmds and all(c in existing_cmds for c in t_cmds):
+                continue  # every command already present — don't duplicate.
+            merged_entries.append(t_entry)
+        out[event] = merged_entries
+    return out
 
 
 # ---------------------------------------------------------------------------

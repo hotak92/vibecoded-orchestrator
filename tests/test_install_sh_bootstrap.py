@@ -90,15 +90,29 @@ def _source_and_call_find_python(path: str, extra_env: dict[str, str] | None = N
 def test_find_python_returns_failure_when_no_python_on_path(tmp_path: Path) -> None:
     """PATH with no python detected → exit 1.
 
-    We have to allow /bin so that bash itself can run, but we mask
-    /usr/bin out by giving the helper an explicit, narrow PATH and
-    relying on the empty tmp_path containing no python shims. /bin on
-    most distros has no `python*` symlink (those live in /usr/bin).
-    If the host /bin DOES have python (rare), this skips.
+    We need bash to run the helper, but bash itself can live anywhere.
+    Try `/usr/bin/bash` first (no python there on most Linuxes including
+    Debian/Ubuntu/Fedora — `/usr/bin` has python on those, but bash
+    itself is at `/usr/bin/bash` and we don't add it to PATH; we point
+    the script at it directly). Fall back to `/bin/bash` and skip if
+    that path's directory has python too. Works on every Linux + macOS
+    in our matrix.
+
+    Strategy: pick the bash executable explicitly, then put ONLY a
+    python-free temp dir on PATH (no `/bin`, no `/usr/bin`). That way
+    the test doesn't depend on which `/*` directory the host parks
+    python in.
     """
-    if any(Path("/bin", c).exists() for c in ("python3", "python3.11", "python3.12", "python")):
-        pytest.skip("/bin has a python interpreter on this host; cannot mask it out")
-    # Bypass the helper to control PATH precisely.
+    # Find a bash executable to run the helper.
+    bash_path = None
+    for cand in ("/usr/bin/bash", "/bin/bash"):
+        if Path(cand).exists():
+            bash_path = cand
+            break
+    if bash_path is None:
+        pytest.skip("no bash on /usr/bin or /bin")
+    # Bypass the helper to control PATH precisely. PATH=tmp_path only
+    # — no system bin dirs leak in.
     script = textwrap.dedent(
         """
         find_python() {
@@ -119,8 +133,8 @@ def test_find_python_returns_failure_when_no_python_on_path(tmp_path: Path) -> N
         """
     )
     result = subprocess.run(
-        ["/bin/bash", "-c", script],
-        env={"PATH": f"{tmp_path}:/bin"},
+        [bash_path, "-c", script],
+        env={"PATH": str(tmp_path)},
         capture_output=True,
         text=True,
         timeout=10,
