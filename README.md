@@ -32,7 +32,9 @@ After cloning the repo, run the install entry point for your OS, then double-cli
 |---|---|---|
 | **Linux** | `bash first-install.sh` (or double-click `first-install.desktop`) | `bash start-launcher.sh` (or `start-launcher.desktop`) |
 | **macOS** | Double-click `first-install.command` (or `bash first-install.sh`) | Double-click `start-launcher.command` |
-| **Windows** | Double-click `first-install.bat` | Double-click `start-launcher.bat` |
+| **Windows** | Double-click `first-install.bat`, **or** from a terminal: `.\first-install.bat` | Double-click `start-launcher.bat`, **or** `.\start-launcher.bat` |
+
+> **Windows terminal note**: cmd.exe and PowerShell don't put the current directory on `PATH` by default, so plain `first-install.bat` fails with "not recognized". Use `.\first-install.bat` (with the leading `.\`) when running from a terminal.
 
 The launcher binary is checked at startup for an embedded SvelteKit frontend; broken builds are skipped with a clear `rebuild with scripts/build-bundled-launcher.sh` hint instead of opening to a blank "Could not connect to localhost" page (regression guard added 2026-04-28).
 
