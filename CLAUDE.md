@@ -531,6 +531,15 @@ Output: Where to save
 
 The shim is a no-op when `lean-ctx` isn't installed.
 
+**⚠️ Known footgun — silent stderr swallowing on `git commit`**: `lean-ctx`'s default mode can swallow stderr from `git commit` to the point where a hook-failed commit returns exit code 1 with **zero output**, making the failure invisible. Symptom: `git commit` returns exit 1 but no error message; subsequent `git status` shows the file is staged but uncommitted. **Workaround**: prefix any `git commit` (and any command where you suspect lean-ctx is hiding errors) with `LEAN_CTX_OFF=1`:
+
+```bash
+# If `git -c user.name=... commit -m "..."` exits 1 silently:
+LEAN_CTX_OFF=1 git -c user.name=... commit -m "..."
+```
+
+This affects automated agents and Claude Code sessions on this machine. Apply the same workaround for `git push` if it returns silent non-zero (rare, but possible with pre-push hooks). When in doubt, prefix `LEAN_CTX_OFF=1` for any git command that exits non-zero with no output.
+
 **Target Metrics**:
 - Simple: <5K tokens
 - Complex: <20K tokens
