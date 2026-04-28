@@ -1,6 +1,6 @@
 [package]
 name = "vct-launcher-temp"
-version = "0.1.1"
+version = "0.1.2"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -64,7 +64,7 @@ toml = "0.8"
 tempfile = "3"
 
 # System info (RAM, CPU). MIT-licensed, lightweight. Used by detect_system.
-sysinfo = { version = "0.32", default-features = false, features = ["system"] }
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 
 # Bug 31: libc statvfs for free-space probe (Unix only — Windows path
 # returns None, see free_bytes_at in commands/volumes.rs).

@@ -49,19 +49,17 @@
 
   let showChangelog = $state(false);
 
-  // showOnboarding is driven by the ui store so any route (e.g. /preferences)
-  // can open the wizard without a page reload. The onMount below seeds it from
-  // localStorage on first load; after that ui.openOnboarding() is the entry point.
-  // We mirror it into a local $state so OnboardingWizard can use bind:open (which
-  // needs a writable binding). When the wizard sets open=false we sync back to
-  // the store; when the store sets showOnboarding=true we forward to local state.
-  let showOnboarding = $state(false);
-  $effect(() => {
-    if ($ui.showOnboarding && !showOnboarding) showOnboarding = true;
-  });
-  $effect(() => {
-    if (!showOnboarding && $ui.showOnboarding) ui.closeOnboarding();
-  });
+  // 2026-04-28 fix (Bug A): the OnboardingWizard is driven directly by
+  // the ui store now — no more local mirror + two-effect bridge. The
+  // previous pattern raced on Svelte 5's effect ordering: when the
+  // wizard set open=false, the back-sync effect tried to call
+  // ui.closeOnboarding() AFTER the forward effect had already
+  // re-flipped showOnboarding back to true (because $ui.showOnboarding
+  // was still true at that microtask), so the wizard closed for one
+  // frame and immediately reopened. The wizard now exposes onClose;
+  // we gate its mount with `{#if $ui.showOnboarding}` and the wizard
+  // calls onClose() when the user dismisses it. Same pattern used by
+  // InstallWizard and McpDashboard above. Single source of truth.
 
   $effect(() => {
     if ($authLoading) return; // Wait for session check
@@ -83,13 +81,18 @@
       // users with a populated ~/.vct/launcher.db can still re-trigger the
       // wizard on demand. We clear the force flag immediately so it only
       // fires once.
+      // 2026-04-28: distinguish explicit re-run (forced=true, came in
+      // via a SettingsPanel reload that set vct.onboarding_force) from
+      // first-launch auto-open (no flag, just the absence of
+      // vct.onboarding_complete). The wizard's preflight uses this to
+      // decide whether to auto-close on "projects already exist".
       const forced = localStorage.getItem('vct.onboarding_force') === '1';
       if (forced) {
         localStorage.removeItem('vct.onboarding_force');
         localStorage.removeItem('vct.onboarding_complete');
-      }
-      if (forced || localStorage.getItem('vct.onboarding_complete') !== 'true') {
-        ui.openOnboarding();
+        ui.openOnboarding(); // sets onboardingForced=true in the store
+      } else if (localStorage.getItem('vct.onboarding_complete') !== 'true') {
+        ui.autoOpenOnboarding(); // first-launch auto-open; preflight may auto-close
       }
       if (localStorage.getItem('vct.show_changelog_after_update') === '1') {
         localStorage.removeItem('vct.show_changelog_after_update');
@@ -171,7 +174,12 @@
     <McpDashboard onClose={() => ui.closeMcpDashboard()} />
   {/if}
 
-  <OnboardingWizard bind:open={showOnboarding} />
+  {#if uiState.showOnboarding}
+    <OnboardingWizard
+      force={uiState.onboardingForced}
+      onClose={() => ui.closeOnboarding()}
+    />
+  {/if}
   <ChangelogModal bind:open={showChangelog} />
   <ExternalServicesDialog />
   <NoContainerRuntimeDialog />
