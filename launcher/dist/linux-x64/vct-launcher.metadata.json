@@ -1,10 +1,10 @@
 {
-  "source_sha": "d576ad68a23c6ec8d58ef0de628081a57b38e29d",
-  "source_short_sha": "d576ad6",
-  "source_hash": "6663845070ab4f535c815b12519a5c40792c2529",
-  "built_at": "2026-04-28T01:59:32Z",
+  "source_sha": "0f8713e61ecf9ac80cd12f62e14b66cad7683cff",
+  "source_short_sha": "0f8713e",
+  "source_hash": "9ba3d948266428d2d1e1b0e141d27a7885620e2e",
+  "built_at": "2026-04-28T02:11:50Z",
   "launcher_version": "0.1.0",
   "host_target": "linux-x64",
   "binary_name": "vct-launcher",
-  "binary_size_bytes": 31665544
+  "binary_size_bytes": 31674552
 }

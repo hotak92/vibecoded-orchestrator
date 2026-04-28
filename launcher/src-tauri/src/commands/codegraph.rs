@@ -174,8 +174,29 @@ pub async fn codegraph_summary(
     let base = std::env::var("WEAVIATE_URL").unwrap_or_else(|_| "http://localhost:8081".to_string());
 
     let project_tag = &target.name; // codegraph entities are tagged by project name
+
+    // Codegraph entities are stored under namespaced classes
+    // (`<Prefix>_CodeFunction` etc.). The prefix is configured in
+    // project_codegraph_bindings; we MUST resolve it before querying
+    // Weaviate or the Aggregate query returns 0 every time. Same fix
+    // as commit db42af9 in codegraph_load_graph — the summary endpoint
+    // also needed it but was missed. Reported 2026-04-28: VideoFrames
+    // codegraph dashboard rendered 0/0/0/0/0 even though Weaviate
+    // had 64 classes / 335 functions for that project.
+    let cg_binding = db
+        .get_project_codegraph_binding(&target_project_id)?
+        .ok_or_else(|| {
+            format!(
+                "project {} has no codegraph binding configured (run \
+                 code-graph-analyze first, or recreate the project)",
+                target_project_id
+            )
+        })?;
+    let prefix = cg_binding.collection_prefix.clone();
+
     let mut counts = std::collections::HashMap::new();
-    for class in ["CodeModule", "CodeClass", "CodeFunction", "CodeAPI", "CodeInteraction"] {
+    for suffix in ["CodeModule", "CodeClass", "CodeFunction", "CodeAPI", "CodeInteraction"] {
+        let class = format!("{}_{}", prefix, suffix);
         let q = format!(
             "{{ Aggregate {{ {class}(where: {{path:[\"project\"], operator:Equal, valueText:\"{project}\"}}) {{ meta {{ count }} }} }} }}",
             class = class,
@@ -195,7 +216,9 @@ pub async fn codegraph_summary(
             }
             Err(_) => 0,
         };
-        counts.insert(class.to_string(), count as u32);
+        // Key by the bare suffix so the lookup below isn't sensitive
+        // to the per-project prefix.
+        counts.insert(suffix.to_string(), count as u32);
     }
 
     Ok(CodegraphSummary {

@@ -61,6 +61,22 @@ async fn snapshot(
     State(h): State<LauncherDbHandle>,
     Path(project_id): Path<String>,
 ) -> impl IntoResponse {
+    // Verify the project exists before returning a snapshot. The
+    // per-table helpers below (list_project_agents etc.) all happily
+    // return [] for an unknown project_id — callers couldn't tell
+    // an empty real project apart from a stale/wrong ID. Reported
+    // 2026-04-28 by the gui-tester agent.
+    match h.0.get_project(&project_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": format!("project not found: {}", project_id) })),
+            )
+                .into_response();
+        }
+        Err(e) => return err500(e),
+    }
     match h.0.get_project_state_snapshot(&project_id) {
         Ok(s) => Json(s).into_response(),
         Err(e) => err500(e),
