@@ -81,9 +81,9 @@ class PIIScrubTests(unittest.TestCase):
         self.assertNotIn("bob", out)
 
     def test_scrubs_email(self) -> None:
-        out = self.collector_mod._scrub_pii("Contact: martino.cesaratto@gmail.com please")
+        out = self.collector_mod._scrub_pii("Contact: user@example.com please")
         self.assertIn("<email>", out)
-        self.assertNotIn("gmail.com", out)
+        self.assertNotIn("example.com", out)
 
     def test_scrubs_github_pat(self) -> None:
         out = self.collector_mod._scrub_pii("token=ghp_ABCDEFG1234567890abcdef")
