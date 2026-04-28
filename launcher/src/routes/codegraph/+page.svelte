@@ -71,12 +71,84 @@
     );
   }
 
-  function browseProject(s: CodegraphProjectSummary) {
-    // v0 placeholder — entity-table viewer is the next iteration.
-    // For now the per-project tab "KG / Codegraph" is the canonical
-    // place to see + manage one project's codegraph; this dashboard
-    // is the cross-project overview.
-    toast.info(`Codegraph viewer for ${s.project_name} — coming soon. See the project's KG / Codegraph tab.`);
+  // Assign-access modal state. Mirrors the KG dashboard's flow:
+  // pick which other projects are granted read access to this
+  // project's codegraph. Owner project (write access) is always
+  // allowed. Granting goes through codegraph_grant_access.
+  let assignModalFor = $state<CodegraphProjectSummary | null>(null);
+  let assignAllProjects = $state<Array<{ id: string; name: string }>>([]);
+  let assignChecked = $state<Set<string>>(new Set());
+  let assignSaving = $state(false);
+  let assignError = $state<string | null>(null);
+
+  async function openAssign(s: CodegraphProjectSummary) {
+    if (s.access !== 'write') {
+      toast.error('You can only change access on codegraphs you own.');
+      return;
+    }
+    assignModalFor = s;
+    assignError = null;
+    assignChecked = new Set();
+    try {
+      assignAllProjects = await invoke<Array<{ id: string; name: string }>>('list_projects_v2');
+      // Pre-fill: query existing grants for this owner project. Best
+      // effort — if codegraph_list_access isn't available we silently
+      // start with an empty set.
+      try {
+        const matrix = await invoke<{ allowed?: Array<{ id: string }>; can_read_from?: Array<{ id: string }> }>(
+          'codegraph_list_access',
+          { projectId: assignModalFor!.prefix },
+        ).catch(() => null) as any;
+        if (matrix?.allowed) {
+          assignChecked = new Set(matrix.allowed.map((p: any) => p.id));
+        }
+      } catch { /* swallow */ }
+    } catch (e) {
+      assignError = e instanceof Error ? e.message : String(e);
+    }
+  }
+
+  function toggleAssign(id: string) {
+    if (assignChecked.has(id)) assignChecked.delete(id);
+    else assignChecked.add(id);
+    assignChecked = new Set(assignChecked);
+  }
+
+  async function saveAssign() {
+    if (!assignModalFor || !acting) return;
+    assignSaving = true;
+    assignError = null;
+    try {
+      // Resolve owner project_id from the prefix (the summary doesn't
+      // carry it but we know acting writes it ⇒ owner is acting).
+      const ownerId = acting.id;
+      // For each candidate project: if checked → grant read; if
+      // unchecked but was previously granted → revoke (access_level
+      // = "none"). We send all of them in parallel.
+      const ops = assignAllProjects
+        .filter((p) => p.id !== ownerId)
+        .map((p) =>
+          invoke('codegraph_grant_access', {
+            req: {
+              grantor_project_id: ownerId,
+              grantee_project_id: p.id,
+              access_level: assignChecked.has(p.id) ? 'read' : 'none',
+            },
+          }),
+        );
+      await Promise.all(ops);
+      toast.success(`Codegraph access updated for ${assignModalFor.project_name}`);
+      assignModalFor = null;
+      await load();
+    } catch (e) {
+      assignError = e instanceof Error ? e.message : String(e);
+    } finally {
+      assignSaving = false;
+    }
+  }
+
+  function closeAssign() {
+    assignModalFor = null;
   }
 </script>
 
@@ -123,19 +195,65 @@
           </div>
           <p class="cg-card-total">{totalEntities(s)} entities total</p>
           <div class="cg-card-actions">
-            <button
-              class="cg-btn"
-              onclick={() => browseProject(s)}
-              disabled={s.access === 'none'}
-            >
-              Browse
-            </button>
+            {#if s.access === 'write'}
+              <button class="cg-btn" onclick={() => openAssign(s)}>
+                Assign access…
+              </button>
+            {/if}
           </div>
         </article>
       {/each}
     </div>
   {/if}
 </div>
+
+{#if assignModalFor}
+  <div class="cg-modal-back" onclick={closeAssign}>
+    <div class="cg-modal" role="dialog" onclick={(e) => e.stopPropagation()}>
+      <header class="cg-modal-head">
+        <h3>Codegraph access — {assignModalFor.project_name}</h3>
+        <button class="cg-close" onclick={closeAssign} aria-label="Close">×</button>
+      </header>
+      <p class="cg-modal-help">
+        Pick which other projects can read this codegraph. Owners
+        always have write access; granting "read" lets the grantee
+        see entities + run cross-project searches but not modify.
+      </p>
+      {#if assignError}
+        <p class="cg-modal-error">{assignError}</p>
+      {/if}
+      <ul class="cg-modal-list">
+        {#each assignAllProjects.filter((p) => p.id !== acting?.id) as p (p.id)}
+          <li>
+            <label>
+              <input
+                type="checkbox"
+                checked={assignChecked.has(p.id)}
+                onchange={() => toggleAssign(p.id)}
+              />
+              <span>{p.name}</span>
+            </label>
+          </li>
+        {/each}
+        {#if assignAllProjects.filter((p) => p.id !== acting?.id).length === 0}
+          <li class="cg-modal-empty">
+            No other projects to grant access to.
+          </li>
+        {/if}
+      </ul>
+      <div class="cg-modal-actions">
+        <button class="cg-btn" onclick={closeAssign} disabled={assignSaving}>Cancel</button>
+        <button
+          class="cg-btn cg-btn-primary"
+          onclick={saveAssign}
+          disabled={assignSaving || assignAllProjects.filter((p) => p.id !== acting?.id).length === 0}
+        >
+          {assignSaving ? 'Saving…' : 'Save'}
+        </button>
+      </div>
+    </div>
+  </div>
+{/if}
 
 <style>
   .cg-page { padding: 24px; max-width: 1200px; margin: 0 auto; }
@@ -224,4 +342,67 @@
   }
   .cg-btn:hover:not(:disabled) { background: rgba(255,255,255,0.12); }
   .cg-btn:disabled { opacity: 0.4; cursor: default; }
+  .cg-btn-primary {
+    background: rgb(0,191,166); color: #001a17; border-color: rgb(0,191,166);
+  }
+  .cg-btn-primary:hover:not(:disabled) { background: rgb(0,210,180); }
+
+  /* Assign-access modal */
+  .cg-modal-back {
+    position: fixed; inset: 0; z-index: 9000;
+    background: rgba(0,0,0,0.55);
+    display: flex; align-items: center; justify-content: center;
+  }
+  .cg-modal {
+    background: #1a1d24;
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 8px;
+    box-shadow: 0 12px 36px rgba(0,0,0,0.5);
+    width: 480px; max-width: 90vw;
+    padding: 18px 20px 14px;
+    color: #ddd;
+  }
+  .cg-modal-head {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 8px;
+  }
+  .cg-modal-head h3 { margin: 0; font-size: 14px; }
+  .cg-close {
+    background: none; border: none; color: #888; font-size: 18px;
+    cursor: pointer; padding: 0 4px;
+  }
+  .cg-close:hover { color: #fff; }
+  .cg-modal-help { margin: 0 0 12px; font-size: 12px; color: #aaa; }
+  .cg-modal-error {
+    margin: 0 0 10px; padding: 6px 10px;
+    background: rgba(255,79,160,0.10);
+    border: 1px solid rgba(255,79,160,0.3);
+    border-radius: 4px; color: rgb(255,79,160);
+    font-size: 12px; font-family: ui-monospace, monospace;
+  }
+  .cg-modal-list {
+    list-style: none; padding: 0; margin: 0 0 14px;
+    max-height: 280px; overflow-y: auto;
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 6px;
+  }
+  .cg-modal-list li {
+    padding: 8px 12px;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+  }
+  .cg-modal-list li:last-child { border-bottom: none; }
+  .cg-modal-list li.cg-modal-empty {
+    color: #888; text-align: center; font-size: 12px;
+    padding: 16px; border-bottom: none;
+  }
+  .cg-modal-list label {
+    display: flex; align-items: center; gap: 8px;
+    cursor: pointer; font-size: 13px;
+  }
+  .cg-modal-list input[type="checkbox"] {
+    accent-color: rgb(0,191,166);
+  }
+  .cg-modal-actions {
+    display: flex; justify-content: flex-end; gap: 8px;
+  }
 </style>
