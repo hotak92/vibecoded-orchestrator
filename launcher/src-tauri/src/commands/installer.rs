@@ -137,6 +137,113 @@ pub const ORCHESTRATOR_MANAGED_PATHS: &[&str] = &[
 ];
 
 // ---------------------------------------------------------------------------
+// Re-install conflict resolution (4-option modal)
+//
+// When the install target already contains orchestrator files (`mode ==
+// Adopt`), the wizard prompts the user with four explicit strategies
+// instead of the cryptic "call preview_install + confirm_overwrite=true"
+// error path. See docs/INSTALL_RECOVERY.md → "Conflict Resolution" for
+// the user-facing description and the Claude self-merge contract.
+//
+// Strategy semantics:
+//   - DeleteClaudeAndReinstall: rm -rf <install_path>/.claude THEN copy
+//     fresh. Only `.claude/` is wiped — the rest of the install path may
+//     contain real user code, wiping the whole path would be destructive.
+//   - OverwriteAll: copy on top of existing files; user edits to
+//     CLAUDE.md / CONTEXT_STATE.md / etc. are LOST.
+//   - OverwritePreserve [DEFAULT]: copy on top BUT for each entry in the
+//     preserve list, leave the existing file alone and write the upstream
+//     version as `<file>.new.<ext>` next to it. Then append a notification
+//     block to .claude/CONTEXT_STATE.md instructing Claude to merge.
+//   - AdoptAsIs: equivalent to the legacy `confirm_overwrite=true` path —
+//     do nothing on disk, just register the install.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictStrategy {
+    /// rm -rf <install_path>/.claude, then fresh copy.
+    DeleteClaudeAndReinstall,
+    /// Copy every tracked install file on top — no preservation.
+    OverwriteAll,
+    /// [DEFAULT] Copy + leave preserve-list entries alone + write
+    /// `<file>.new.<ext>` siblings + append merge-notification block.
+    OverwritePreserve,
+    /// No-op on disk — just register.
+    AdoptAsIs,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConflictResolution {
+    pub strategy: ConflictStrategy,
+    /// Optional override for the preserve list. None → use
+    /// `DEFAULT_PRESERVE_LIST`. Paths are interpreted relative to the
+    /// install root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preserve_paths: Option<Vec<String>>,
+}
+
+/// Default preserve list for `OverwritePreserve`. Paths are relative to
+/// the install root. Keep in sync with `install.py::DEFAULT_PRESERVE_LIST`.
+///
+/// Note on MEMORY.md: lives at `~/.claude/projects/<id>/memory/MEMORY.md`,
+/// NOT in the install dir. v1.0 treats it as out-of-scope-for-the-install
+/// (no `.new.md` written). The notification block mentions this so the
+/// user can manually merge if their MEMORY.md has diverged.
+pub const DEFAULT_PRESERVE_LIST: &[&str] = &[
+    "CLAUDE.md",
+    ".claude/CONTEXT_STATE.md",
+    ".claude/PROJECT_REGISTRY.md",
+    ".env",
+];
+
+/// Marker comments delimiting the merge-notification block inside
+/// `.claude/CONTEXT_STATE.md`. Re-runs of the install REPLACE the block
+/// in-place rather than accumulating stale copies.
+pub const MERGE_BLOCK_START: &str = "<!-- vct-merge-pending -->";
+pub const MERGE_BLOCK_END: &str = "<!-- /vct-merge-pending -->";
+
+/// Structured error returned by `install_orchestrator` when the target
+/// already contains orchestrator files and the caller hasn't picked a
+/// strategy. The frontend renders the 4-option conflict-resolution modal
+/// from this payload.
+///
+/// Surfaced over Tauri as a JSON-encoded string in the Err variant: the
+/// FE detects the `vct-conflict-error` discriminator field, parses the
+/// JSON, and renders the modal. Plain (non-conflict) errors stay as
+/// human-readable strings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallConflictError {
+    /// Discriminator — always "install_conflict". The frontend matches
+    /// on this to distinguish a conflict from a generic install error.
+    pub kind: String,
+    /// Human-readable summary (also shown if the FE somehow can't parse
+    /// the JSON).
+    pub message: String,
+    pub install_path: String,
+    pub source_path: String,
+    pub mode: InstallMode,
+    /// Orchestrator paths that exist at the target and would be touched
+    /// by a copy.
+    pub will_overwrite: Vec<String>,
+    /// Orchestrator paths the install would add.
+    pub will_add: Vec<String>,
+    /// Subset of `will_overwrite` that intersects the default preserve
+    /// list (i.e. files the user has likely customised). Rendered first
+    /// in the modal so the user sees the human cost.
+    pub preserve_candidates: Vec<String>,
+}
+
+impl InstallConflictError {
+    /// Serialize as a JSON string suitable for Tauri's Err variant. The
+    /// frontend parses the leading `{"kind":"install_conflict"...}` shape
+    /// and renders the modal.
+    pub fn into_err_string(self) -> String {
+        serde_json::to_string(&self).unwrap_or_else(|_| self.message)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
 
@@ -806,13 +913,21 @@ pub async fn preflight_install_safety_check(
 /// post-copy setup (venv + container start). Emits "install_progress"
 /// events.
 ///
-/// `confirm_overwrite` must be `true` when classify_install_target reports
-/// `Adopt` — otherwise we refuse and force the caller through `preview_install`
-/// + a confirm modal first.
+/// Conflict resolution (re-install over an existing install):
+///   - `conflict: Some(ConflictResolution)` → execute the chosen
+///     strategy (preferred path; the wizard always sends this).
+///   - `conflict: None && confirm_overwrite: true` → legacy adopt path,
+///     equivalent to `ConflictStrategy::AdoptAsIs`. Kept for backward
+///     compatibility with any caller that hasn't been migrated yet.
+///   - `conflict: None && confirm_overwrite: false` on an Adopt target →
+///     refuse with `InstallConflictError` (JSON-encoded in the Err
+///     variant). The frontend parses this and renders the 4-option
+///     conflict-resolution modal.
 #[command]
 pub async fn install_orchestrator(
     config: InstallConfig,
     confirm_overwrite: Option<bool>,
+    conflict: Option<ConflictResolution>,
     window: Window,
 ) -> Result<InstallResult, String> {
     let install_path = PathBuf::from(&config.install_path);
@@ -824,17 +939,49 @@ pub async fn install_orchestrator(
         ));
     }
 
-    // Bug 8: refuse to silently overwrite existing orchestrator-managed
-    // files. Frontend must call preview_install + show a confirm modal,
-    // then re-invoke with confirm_overwrite=true.
+    // Resolve the effective conflict strategy.
     let mode = classify_install_target(&install_path);
     let confirmed = confirm_overwrite.unwrap_or(false);
-    if mode == InstallMode::Adopt && !confirmed {
-        return Err(
-            "install_path already contains orchestrator files (.claude/, knowledge/, etc.). \
-             Call preview_install first and re-invoke with confirm_overwrite=true to adopt."
-                .to_string(),
-        );
+    let effective_conflict: Option<ConflictResolution> = match (&conflict, confirmed) {
+        (Some(c), _) => Some(c.clone()),
+        // Legacy: confirm_overwrite=true with no explicit strategy → AdoptAsIs.
+        (None, true) => Some(ConflictResolution {
+            strategy: ConflictStrategy::AdoptAsIs,
+            preserve_paths: None,
+        }),
+        (None, false) => None,
+    };
+
+    if mode == InstallMode::Adopt && effective_conflict.is_none() {
+        // Build a structured error for the FE to render the conflict
+        // modal. Source path may fail to resolve in test envs — fall
+        // back to a placeholder rather than aborting on the resolve.
+        let source_for_err = find_local_repo_root()
+            .ok()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "<source not found>".to_string());
+        let diff = diff_install(&install_path);
+        let preserve_candidates: Vec<String> = diff
+            .will_overwrite
+            .iter()
+            .filter(|p| DEFAULT_PRESERVE_LIST.iter().any(|x| x == p))
+            .cloned()
+            .collect();
+        let err = InstallConflictError {
+            kind: "install_conflict".to_string(),
+            message: format!(
+                "Install path {} already contains orchestrator files. \
+                 Pick a conflict-resolution strategy.",
+                install_path.display()
+            ),
+            install_path: install_path.to_string_lossy().to_string(),
+            source_path: source_for_err,
+            mode,
+            will_overwrite: diff.will_overwrite,
+            will_add: diff.will_add,
+            preserve_candidates,
+        };
+        return Err(err.into_err_string());
     }
 
     // Stage 1: Locate local source
@@ -852,16 +999,66 @@ pub async fn install_orchestrator(
         .await
         .map_err(|e| format!("Cannot create install directory {}: {}", install_path.display(), e))?;
 
-    // Stage 2: Copy orchestrator-managed paths
+    // Stage 2: Copy orchestrator-managed paths.
+    //
+    // Three branches:
+    //   1. Conflict strategy provided AND target is an Adopt target →
+    //      run the strategy (handles its own copy/preserve/notify).
+    //   2. Conflict strategy provided but target is NOT an Adopt target
+    //      (Fresh / FreshIntoExisting) → strategy is irrelevant; do a
+    //      plain copy. This keeps the wizard's behaviour stable when
+    //      the user picked a strategy on a path that subsequently
+    //      stopped being an adopt-target between preview and install.
+    //   3. No strategy + classify said Fresh/FreshIntoExisting → plain
+    //      copy.
     emit_progress(&window, "copy", "Copying orchestrator files...", 15.0);
     let target_clone = install_path.clone();
     let source_clone = source.clone();
-    let copy_result = tokio::task::spawn_blocking(move || {
-        copy_orchestrator_to_sync(&source_clone, &target_clone)
+    let strategy_for_copy = effective_conflict.clone();
+    let conflict_report = tokio::task::spawn_blocking(move || -> Result<Option<ConflictApplyReport>, String> {
+        if let Some(c) = strategy_for_copy {
+            if classify_install_target(&target_clone) == InstallMode::Adopt {
+                let preserve = c
+                    .preserve_paths
+                    .clone()
+                    .unwrap_or_else(|| {
+                        DEFAULT_PRESERVE_LIST.iter().map(|s| s.to_string()).collect()
+                    });
+                let report = apply_conflict_strategy(
+                    &source_clone,
+                    &target_clone,
+                    c.strategy,
+                    &preserve,
+                )?;
+                return Ok(Some(report));
+            }
+        }
+        // Plain copy path (no conflict OR target became fresh).
+        copy_orchestrator_to_sync(&source_clone, &target_clone)?;
+        Ok(None)
     })
     .await
     .map_err(|e| format!("copy task panicked: {}", e))?;
-    copy_result?;
+    let conflict_report = conflict_report?;
+
+    // Emit a structured event in the install log so the conflict-resolve
+    // step is auditable. Best-effort; never fails the install.
+    if let Some(ref report) = conflict_report {
+        let log_path = install_path.join("state").join("logs").join("install.jsonl");
+        let _ = append_install_log_event(
+            &log_path,
+            "conflict-resolve",
+            "ok",
+            &format!("strategy={}", report.strategy),
+            Some(serde_json::json!({
+                "strategy": report.strategy,
+                "preserved_count": report.preserved_count,
+                "new_md_count": report.new_md_count,
+                "notification_written": report.notification_written,
+                "copied_count": report.copied_count,
+            })),
+        );
+    }
 
     emit_progress(&window, "copy", "Files copied", 70.0);
 
@@ -1098,6 +1295,400 @@ pub fn copy_orchestrator_to_sync(source: &Path, target: &Path) -> Result<(), Str
         })?;
     }
     Ok(())
+}
+
+/// Result of running a `ConflictStrategy` against an install target.
+/// Used by the install-log emitter and the FE success toast.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ConflictApplyReport {
+    pub strategy: String,
+    /// Number of preserve-list paths that already existed at the target
+    /// and were left untouched (only meaningful for OverwritePreserve).
+    pub preserved_count: usize,
+    /// Number of `<file>.new.<ext>` siblings written next to preserved
+    /// files (only meaningful for OverwritePreserve).
+    pub new_md_count: usize,
+    /// Whether the merge-notification block was written / refreshed in
+    /// `.claude/CONTEXT_STATE.md`.
+    pub notification_written: bool,
+    /// Number of files copied from source to target on top of existing
+    /// content. 0 for AdoptAsIs.
+    pub copied_count: usize,
+}
+
+/// Insert `.new` before the file's extension. Examples:
+///   - `CLAUDE.md` -> `CLAUDE.new.md`
+///   - `.env` -> `.env.new` (no extension to split, append at end)
+///   - `archive.tar.gz` -> `archive.tar.new.gz` (split on LAST `.`)
+fn new_sibling_path(path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    let file_name = match path.file_name().and_then(|n| n.to_str()) {
+        Some(n) => n,
+        None => return path.with_extension("new"),
+    };
+    // Filename starting with `.` and no other `.` (e.g. `.env`) → treat
+    // the leading dot as part of the stem so we don't write `.new.env`.
+    let dot_idx = file_name.rfind('.').filter(|&i| i > 0);
+    let new_name = match dot_idx {
+        Some(i) => format!("{}.new{}", &file_name[..i], &file_name[i..]),
+        None => format!("{}.new", file_name),
+    };
+    parent.join(new_name)
+}
+
+/// Append (or refresh) the merge-notification block in
+/// `.claude/CONTEXT_STATE.md`. Idempotent: if a previous block exists, it
+/// is REPLACED in-place rather than duplicated. The block is bounded by
+/// the marker comments `MERGE_BLOCK_START` / `MERGE_BLOCK_END`.
+///
+/// Returns `true` iff the file was written (i.e. block needed adding or
+/// updating). Returns `false` if the block was already present and
+/// identical to what we'd write.
+pub fn update_merge_notification_block(
+    context_state_path: &Path,
+    preserved_files: &[String],
+) -> std::io::Result<bool> {
+    let block = build_merge_notification_block(preserved_files);
+
+    // CONTEXT_STATE.md ought to exist by the time we get here (we only
+    // call this after a copy step that populates `.claude/`), but guard
+    // anyway: if missing, create with just the block.
+    if !context_state_path.exists() {
+        if let Some(parent) = context_state_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(context_state_path, &block)?;
+        return Ok(true);
+    }
+
+    let existing = std::fs::read_to_string(context_state_path)?;
+    let updated = replace_or_append_block(&existing, &block);
+    if updated == existing {
+        return Ok(false);
+    }
+    std::fs::write(context_state_path, updated)?;
+    Ok(true)
+}
+
+fn build_merge_notification_block(preserved_files: &[String]) -> String {
+    let list = if preserved_files.is_empty() {
+        "_(none — strategy ran with an empty preserve list)_".to_string()
+    } else {
+        preserved_files
+            .iter()
+            .map(|p| format!("- `{}` (upstream-new at `{}`)", p, new_sibling_display(p)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    // Important: the prose inside this block must NOT contain the
+    // literal `MERGE_BLOCK_START` / `MERGE_BLOCK_END` strings, otherwise
+    // the idempotency check (which counts marker occurrences) breaks.
+    // We reference them obliquely as "the HTML-comment markers".
+    format!(
+        "{start}\n\
+## Pending merge — read this on session start\n\
+\n\
+The orchestrator was just upgraded. Several user-curated files have an\n\
+upstream-new version sitting next to them (`*.new.md` / `*.new.<ext>`).\n\
+For each pair:\n\
+\n\
+1. Read both the existing file AND the upstream-new sibling.\n\
+2. Reconcile: keep the user's project-specific content, but adopt new\n\
+   structure / guidance / sections from the upstream version. Use your\n\
+   judgment for ambiguous merges; ask the user if a conflict is\n\
+   irreconcilable.\n\
+3. After successfully merging a file, **delete its upstream-new\n\
+   sibling**.\n\
+4. When ALL `.new.*` siblings under the install path are gone, you'll\n\
+   know the merge is complete — at that point, **delete this entire\n\
+   notification block** (the HTML-comment markers wrapping this section\n\
+   plus all text between them) from this CONTEXT_STATE.md. That removes\n\
+   the prompt for the next session.\n\
+\n\
+Files awaiting merge:\n\
+{list}\n\
+\n\
+Note: `MEMORY.md` lives at `~/.claude/projects/<id>/memory/MEMORY.md`,\n\
+not in the install dir, so v1.0 of the conflict resolver does NOT write\n\
+an upstream-new sibling for it. If you suspect your MEMORY.md is\n\
+divergent from the upstream template, run a manual diff and merge by\n\
+hand.\n\
+\n\
+(Do NOT delete user content. Preserve any session-specific state in\n\
+CONTEXT_STATE.md, your existing CLAUDE.md customisations, etc. The\n\
+upstream version is a reference for new structure, not a wholesale\n\
+replacement.)\n\
+{end}\n",
+        start = MERGE_BLOCK_START,
+        end = MERGE_BLOCK_END,
+        list = list,
+    )
+}
+
+/// Return a display-friendly `<file>.new.<ext>` rendering for the given
+/// install-relative path. Used inside the notification block.
+fn new_sibling_display(rel_path: &str) -> String {
+    let p = PathBuf::from(rel_path);
+    new_sibling_path(&p).to_string_lossy().to_string()
+}
+
+/// If `existing` already contains a `<!-- vct-merge-pending -->` ...
+/// `<!-- /vct-merge-pending -->` block, replace it with `block`.
+/// Otherwise, append `block` (separated by a blank line) to the end.
+fn replace_or_append_block(existing: &str, block: &str) -> String {
+    if let (Some(start), Some(end_rel)) = (
+        existing.find(MERGE_BLOCK_START),
+        existing[existing.find(MERGE_BLOCK_START).unwrap_or(0)..].find(MERGE_BLOCK_END),
+    ) {
+        let end = start + end_rel + MERGE_BLOCK_END.len();
+        // Trim a single trailing newline after the existing block so we
+        // don't accumulate blank lines on every refresh.
+        let after = &existing[end..];
+        let after_trimmed = after.strip_prefix('\n').unwrap_or(after);
+        let mut out = String::with_capacity(existing.len() + block.len());
+        out.push_str(&existing[..start]);
+        out.push_str(block);
+        out.push_str(after_trimmed);
+        return out;
+    }
+    let sep = if existing.ends_with('\n') || existing.is_empty() {
+        ""
+    } else {
+        "\n"
+    };
+    format!("{}{}\n{}", existing, sep, block)
+}
+
+/// Apply a `ConflictStrategy` at `target`, copying from `source`.
+///
+/// Defense: for `DeleteClaudeAndReinstall` we hard-assert the path we're
+/// about to remove is exactly `<target>/.claude` (no symlink games, no
+/// path traversal) before calling `remove_dir_all`. The launcher is
+/// running with the user's full UID so any rmtree we issue is real.
+pub fn apply_conflict_strategy(
+    source: &Path,
+    target: &Path,
+    strategy: ConflictStrategy,
+    preserve_paths: &[String],
+) -> Result<ConflictApplyReport, String> {
+    let mut report = ConflictApplyReport::default();
+    report.strategy = format!("{:?}", strategy);
+
+    if !source.join("vct-module.json").exists() {
+        return Err(format!(
+            "source {} is not an orchestrator repo (no vct-module.json)",
+            source.display()
+        ));
+    }
+    std::fs::create_dir_all(target)
+        .map_err(|e| format!("cannot create target {}: {}", target.display(), e))?;
+
+    match strategy {
+        ConflictStrategy::AdoptAsIs => {
+            // No-op on disk.
+        }
+        ConflictStrategy::DeleteClaudeAndReinstall => {
+            let claude_dir = target.join(".claude");
+            // Defense in depth: never rm anything other than the literal
+            // `<target>/.claude` directory. Refuse symlinks and refuse
+            // anything that resolves outside `target`.
+            if claude_dir.exists() {
+                let canon_target = target.canonicalize().map_err(|e| {
+                    format!("canonicalize target {}: {}", target.display(), e)
+                })?;
+                let canon_claude = claude_dir.canonicalize().map_err(|e| {
+                    format!("canonicalize {}: {}", claude_dir.display(), e)
+                })?;
+                let expected = canon_target.join(".claude");
+                if canon_claude != expected {
+                    return Err(format!(
+                        "refusing to delete: {} resolves to {} (expected {})",
+                        claude_dir.display(),
+                        canon_claude.display(),
+                        expected.display(),
+                    ));
+                }
+                std::fs::remove_dir_all(&claude_dir).map_err(|e| {
+                    format!("rm -rf {}: {}", claude_dir.display(), e)
+                })?;
+            }
+            // Now do a fresh copy.
+            let copied = copy_orchestrator_with_count(source, target)?;
+            report.copied_count = copied;
+        }
+        ConflictStrategy::OverwriteAll => {
+            let copied = copy_orchestrator_with_count(source, target)?;
+            report.copied_count = copied;
+        }
+        ConflictStrategy::OverwritePreserve => {
+            // Build a Set-like vector of preserve paths (relative to
+            // install root). Dedup to avoid double-handling.
+            let mut preserve: Vec<String> = preserve_paths.to_vec();
+            preserve.sort();
+            preserve.dedup();
+
+            let mut copied = 0usize;
+            let mut preserved_present: Vec<String> = Vec::new();
+            let mut new_files_written = 0usize;
+
+            // Iterate the orchestrator-managed allowlist. For each entry:
+            //  - if it's a directory, recurse and apply preserve-aware copy.
+            //  - if it's a file, apply preserve-aware copy directly.
+            for managed in ORCHESTRATOR_MANAGED_PATHS {
+                let src = source.join(managed);
+                let dst = target.join(managed);
+                if !src.exists() {
+                    continue;
+                }
+                copied += copy_recursive_preserve_sync(
+                    &src,
+                    &dst,
+                    target,
+                    &preserve,
+                    &mut preserved_present,
+                    &mut new_files_written,
+                )
+                .map_err(|e| {
+                    format!("copy {} -> {}: {}", src.display(), dst.display(), e)
+                })?;
+            }
+
+            report.copied_count = copied;
+            report.preserved_count = preserved_present.len();
+            report.new_md_count = new_files_written;
+
+            // Append/refresh notification block. CONTEXT_STATE.md is in
+            // the preserve list so it is guaranteed to either already
+            // exist OR have just been freshly copied (if the user didn't
+            // have one) — either way it's safe to append.
+            let context_state = target.join(".claude").join("CONTEXT_STATE.md");
+            let notification_written = update_merge_notification_block(
+                &context_state,
+                &preserved_present,
+            )
+            .map_err(|e| {
+                format!(
+                    "writing notification block to {}: {}",
+                    context_state.display(),
+                    e
+                )
+            })?;
+            report.notification_written = notification_written;
+        }
+    }
+
+    Ok(report)
+}
+
+/// Convenience wrapper that returns a copy count alongside the
+/// existing `copy_orchestrator_to_sync` semantics. Used by strategies
+/// that overwrite-all so the report can show how many files moved.
+fn copy_orchestrator_with_count(source: &Path, target: &Path) -> Result<usize, String> {
+    let mut count = 0usize;
+    for managed in ORCHESTRATOR_MANAGED_PATHS {
+        let src = source.join(managed);
+        let dst = target.join(managed);
+        if !src.exists() {
+            continue;
+        }
+        count += count_files_recursive(&src);
+        copy_recursive_sync(&src, &dst).map_err(|e| {
+            format!("copy {} -> {}: {}", src.display(), dst.display(), e)
+        })?;
+    }
+    Ok(count)
+}
+
+fn count_files_recursive(p: &Path) -> usize {
+    if p.is_file() {
+        return 1;
+    }
+    if !p.is_dir() {
+        return 0;
+    }
+    let mut total = 0usize;
+    if let Ok(rd) = std::fs::read_dir(p) {
+        for e in rd.flatten() {
+            total += count_files_recursive(&e.path());
+        }
+    }
+    total
+}
+
+/// Preserve-aware recursive copy used by `OverwritePreserve`.
+///
+/// For each FILE encountered:
+///   - Compute the install-relative path (`dst` minus `install_root`).
+///   - If that path is in `preserve`, AND a file already exists at
+///     `dst`, write to `<dst>.new.<ext>` instead of overwriting and
+///     record the original path in `preserved_present`.
+///   - Otherwise, plain overwrite copy.
+///
+/// Symlinks are resolved (we copy file content) — same behaviour as the
+/// non-preserve path. Returns the number of source files visited
+/// (whether copied as-is or to a `.new.*` sibling).
+fn copy_recursive_preserve_sync(
+    src: &Path,
+    dst: &Path,
+    install_root: &Path,
+    preserve: &[String],
+    preserved_present: &mut Vec<String>,
+    new_files_written: &mut usize,
+) -> std::io::Result<usize> {
+    let meta = std::fs::metadata(src)?;
+    if meta.is_dir() {
+        std::fs::create_dir_all(dst)?;
+        let mut total = 0usize;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            let s = entry.path();
+            let d = dst.join(entry.file_name());
+            total += copy_recursive_preserve_sync(
+                &s,
+                &d,
+                install_root,
+                preserve,
+                preserved_present,
+                new_files_written,
+            )?;
+        }
+        return Ok(total);
+    }
+
+    // It's a file. Compute install-relative path.
+    let rel = match dst.strip_prefix(install_root) {
+        Ok(r) => r.to_string_lossy().to_string(),
+        Err(_) => {
+            // Should never happen — dst is always rooted at install_root
+            // by construction. Fall back to plain copy.
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(src, dst)?;
+            return Ok(1);
+        }
+    };
+
+    let is_preserved = preserve.iter().any(|p| p == &rel);
+    if is_preserved && dst.exists() {
+        // Write to <dst>.new.<ext>; leave existing file untouched.
+        let sibling = new_sibling_path(dst);
+        if let Some(parent) = sibling.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(src, &sibling)?;
+        preserved_present.push(rel);
+        *new_files_written += 1;
+        return Ok(1);
+    }
+
+    // Plain copy.
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::copy(src, dst)?;
+    Ok(1)
 }
 
 // ---------------------------------------------------------------------------
@@ -1375,6 +1966,90 @@ fn emit_progress(window: &Window, stage: &str, message: &str, percentage: f32) {
             error: None,
         },
     );
+}
+
+/// Append one event to `state/logs/install.jsonl` from the launcher
+/// (actor=launcher). Mirrors the Python-side `_log_install_event`
+/// schema. Best-effort: the install log dir might not exist yet, in
+/// which case we silently skip — matches the Python contract.
+///
+/// Returns `Ok(true)` iff a line was actually written.
+fn append_install_log_event(
+    log_path: &Path,
+    step: &str,
+    phase: &str,
+    detail: &str,
+    data: Option<serde_json::Value>,
+) -> std::io::Result<bool> {
+    use std::io::Write;
+    let parent = match log_path.parent() {
+        Some(p) => p,
+        None => return Ok(false),
+    };
+    if !parent.is_dir() {
+        // state/logs/ doesn't exist yet — install.py Step 8 owns its
+        // creation; we never auto-create from the launcher to avoid a
+        // race with the Python side.
+        return Ok(false);
+    }
+    let ts = chrono_iso_z();
+    let mut record = serde_json::json!({
+        "ts": ts,
+        "actor": "launcher",
+        "step": step,
+        "phase": phase,
+        "detail": detail,
+    });
+    if let Some(d) = data {
+        if let Some(obj) = record.as_object_mut() {
+            obj.insert("data".to_string(), d);
+        }
+    }
+    let line = format!("{}\n", serde_json::to_string(&record)?);
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?;
+    f.write_all(line.as_bytes())?;
+    Ok(true)
+}
+
+/// Stdlib-only ISO-8601 UTC "Z" timestamp (matches Python's
+/// `_utc_iso_now`). Avoids pulling chrono just for this. Resolution is
+/// seconds, which is what the rest of the install log uses.
+fn chrono_iso_z() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Convert seconds-since-epoch to UTC YYYY-MM-DDTHH:MM:SSZ. We use a
+    // tiny civil-from-days algorithm rather than chrono.
+    let days = (secs / 86_400) as i64;
+    let secs_of_day = (secs % 86_400) as u32;
+    let hh = secs_of_day / 3600;
+    let mm = (secs_of_day % 3600) / 60;
+    let ss = secs_of_day % 60;
+    let (y, m, d) = civil_from_days(days);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        y, m, d, hh, mm, ss
+    )
+}
+
+/// Howard Hinnant's days-from-civil inverse (returns y/m/d for unix days).
+fn civil_from_days(z: i64) -> (i32, u32, u32) {
+    let z = z + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097) as u32; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe as i32 + (era as i32) * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
 }
 
 /// Detects NVIDIA GPU + total VRAM (across all GPUs) in GB.
@@ -2858,5 +3533,391 @@ MemAvailable:   23456789 kB
             .find(|(s, _)| s == "5/10")
             .map(|(_, d)| d.starts_with("interrupted:"))
             .unwrap_or(false));
+    }
+
+    // ─── Re-install conflict resolution (4-option modal) ───────────────────
+
+    /// Build a fake adopt-target install root with user-edited copies of
+    /// every preserve-list file plus a couple of directory contents, so
+    /// each strategy has something to act on.
+    fn fake_adopt_target() -> PathBuf {
+        let p = tmp();
+        // Pre-existing user content INSIDE .claude
+        fs::create_dir_all(p.join(".claude")).unwrap();
+        fs::write(
+            p.join(".claude/CONTEXT_STATE.md"),
+            "# user CONTEXT_STATE\nsome custom session state\n",
+        )
+        .unwrap();
+        fs::write(
+            p.join(".claude/PROJECT_REGISTRY.md"),
+            "# user registry\nproject-foo\n",
+        )
+        .unwrap();
+        fs::write(p.join(".claude/settings.json"), "{\"old\":true}").unwrap();
+        // Top-level preserve-list files
+        fs::write(p.join("CLAUDE.md"), "# user CLAUDE.md\ncustom rules\n").unwrap();
+        fs::write(p.join(".env"), "USER_KEY=secret\n").unwrap();
+        // Outside the allowlist — must survive every strategy.
+        fs::write(p.join("user_code.py"), "print('survive')\n").unwrap();
+        // Knowledge dir with one user-curated note that's NOT in the
+        // preserve list (so it gets overwritten on every strategy that
+        // copies — that's the contract).
+        fs::create_dir_all(p.join("knowledge")).unwrap();
+        fs::write(p.join("knowledge/note.md"), "OLD\n").unwrap();
+        p
+    }
+
+    #[test]
+    fn test_serde_conflict_strategy_snake_case() {
+        let json = serde_json::to_string(&ConflictStrategy::OverwritePreserve).unwrap();
+        assert_eq!(json, "\"overwrite_preserve\"");
+        let parsed: ConflictStrategy =
+            serde_json::from_str("\"delete_claude_and_reinstall\"").unwrap();
+        assert_eq!(parsed, ConflictStrategy::DeleteClaudeAndReinstall);
+    }
+
+    #[test]
+    fn test_serde_conflict_resolution_round_trip() {
+        let r = ConflictResolution {
+            strategy: ConflictStrategy::OverwritePreserve,
+            preserve_paths: Some(vec!["CLAUDE.md".into(), ".claude/CONTEXT_STATE.md".into()]),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let back: ConflictResolution = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.strategy, ConflictStrategy::OverwritePreserve);
+        assert_eq!(back.preserve_paths.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_install_conflict_error_serializes_with_kind_discriminator() {
+        let err = InstallConflictError {
+            kind: "install_conflict".into(),
+            message: "boom".into(),
+            install_path: "/tmp/x".into(),
+            source_path: "/tmp/src".into(),
+            mode: InstallMode::Adopt,
+            will_overwrite: vec!["CLAUDE.md".into()],
+            will_add: vec!["state".into()],
+            preserve_candidates: vec!["CLAUDE.md".into()],
+        };
+        let s = err.into_err_string();
+        assert!(s.contains("\"kind\":\"install_conflict\""));
+        assert!(s.contains("\"will_overwrite\":[\"CLAUDE.md\"]"));
+    }
+
+    #[test]
+    fn test_new_sibling_path_basic_extension() {
+        let got = new_sibling_path(Path::new("/x/CLAUDE.md"));
+        assert_eq!(got, PathBuf::from("/x/CLAUDE.new.md"));
+    }
+
+    #[test]
+    fn test_new_sibling_path_dotfile_no_extension() {
+        // .env has no "real" extension — append .new at end.
+        let got = new_sibling_path(Path::new("/x/.env"));
+        assert_eq!(got, PathBuf::from("/x/.env.new"));
+    }
+
+    #[test]
+    fn test_new_sibling_path_no_extension() {
+        let got = new_sibling_path(Path::new("/x/Makefile"));
+        assert_eq!(got, PathBuf::from("/x/Makefile.new"));
+    }
+
+    #[test]
+    fn test_new_sibling_path_double_extension_keeps_last() {
+        // archive.tar.gz → split on LAST dot → archive.tar.new.gz
+        let got = new_sibling_path(Path::new("/x/archive.tar.gz"));
+        assert_eq!(got, PathBuf::from("/x/archive.tar.new.gz"));
+    }
+
+    #[test]
+    fn test_strategy_adopt_as_is_is_noop_on_disk() {
+        let source = fake_repo_source();
+        let target = fake_adopt_target();
+        let pre_user = fs::read_to_string(target.join("CLAUDE.md")).unwrap();
+
+        let report =
+            apply_conflict_strategy(&source, &target, ConflictStrategy::AdoptAsIs, &[]).unwrap();
+        assert_eq!(report.copied_count, 0);
+        assert_eq!(report.preserved_count, 0);
+        assert_eq!(report.new_md_count, 0);
+        assert!(!report.notification_written);
+
+        // User file untouched.
+        assert_eq!(fs::read_to_string(target.join("CLAUDE.md")).unwrap(), pre_user);
+        // Bytes outside allowlist also untouched.
+        assert_eq!(
+            fs::read_to_string(target.join("user_code.py")).unwrap(),
+            "print('survive')\n"
+        );
+
+        fs::remove_dir_all(&source).ok();
+        fs::remove_dir_all(&target).ok();
+    }
+
+    #[test]
+    fn test_strategy_overwrite_all_loses_user_edits_in_managed_paths() {
+        let source = fake_repo_source();
+        let target = fake_adopt_target();
+
+        let report =
+            apply_conflict_strategy(&source, &target, ConflictStrategy::OverwriteAll, &[]).unwrap();
+        assert!(report.copied_count > 0);
+        assert_eq!(report.preserved_count, 0);
+        assert_eq!(report.new_md_count, 0);
+
+        // CLAUDE.md from upstream replaces the user-edited one.
+        assert_eq!(
+            fs::read_to_string(target.join("CLAUDE.md")).unwrap(),
+            "# project\n"
+        );
+        // settings.json overwritten with upstream {}
+        assert_eq!(
+            fs::read_to_string(target.join(".claude/settings.json")).unwrap(),
+            "{}"
+        );
+        // No `.new.md` siblings.
+        assert!(!target.join("CLAUDE.new.md").exists());
+        // User code OUTSIDE the allowlist is preserved (allowlist is the
+        // copy boundary, NOT a strategy choice).
+        assert_eq!(
+            fs::read_to_string(target.join("user_code.py")).unwrap(),
+            "print('survive')\n"
+        );
+
+        fs::remove_dir_all(&source).ok();
+        fs::remove_dir_all(&target).ok();
+    }
+
+    #[test]
+    fn test_strategy_overwrite_preserve_writes_new_md_siblings_and_notification() {
+        let source = fake_repo_source();
+        let target = fake_adopt_target();
+
+        let preserve: Vec<String> = DEFAULT_PRESERVE_LIST.iter().map(|s| s.to_string()).collect();
+        let report = apply_conflict_strategy(
+            &source,
+            &target,
+            ConflictStrategy::OverwritePreserve,
+            &preserve,
+        )
+        .unwrap();
+
+        // CLAUDE.md is in fake_repo_source (so it's a candidate); user
+        // version exists at target so we expect a CLAUDE.new.md sibling.
+        assert!(target.join("CLAUDE.new.md").exists());
+        assert_eq!(
+            fs::read_to_string(target.join("CLAUDE.new.md")).unwrap(),
+            "# project\n"
+        );
+        // User file untouched.
+        assert_eq!(
+            fs::read_to_string(target.join("CLAUDE.md")).unwrap(),
+            "# user CLAUDE.md\ncustom rules\n"
+        );
+        // CONTEXT_STATE.md is in the preserve list but fake_repo_source
+        // doesn't ship one, so no .new.md is written for it. The
+        // existing user file must be left intact AND the notification
+        // block appended to it.
+        let ctx = fs::read_to_string(target.join(".claude/CONTEXT_STATE.md")).unwrap();
+        assert!(ctx.contains("# user CONTEXT_STATE"));
+        assert!(ctx.contains(MERGE_BLOCK_START));
+        assert!(ctx.contains(MERGE_BLOCK_END));
+        assert!(ctx.contains("CLAUDE.md"));
+
+        // Knowledge dir is NOT preserved — the user note gets overwritten.
+        assert_eq!(
+            fs::read_to_string(target.join("knowledge/note.md")).unwrap(),
+            "hello"
+        );
+
+        assert!(report.notification_written);
+        assert!(report.new_md_count >= 1);
+        assert_eq!(report.preserved_count, report.new_md_count);
+
+        fs::remove_dir_all(&source).ok();
+        fs::remove_dir_all(&target).ok();
+    }
+
+    #[test]
+    fn test_strategy_overwrite_preserve_notification_block_is_idempotent() {
+        // Run OverwritePreserve twice. The notification block must NOT
+        // duplicate; the second run must REPLACE the first block in-place.
+        let source = fake_repo_source();
+        let target = fake_adopt_target();
+        let preserve: Vec<String> = DEFAULT_PRESERVE_LIST.iter().map(|s| s.to_string()).collect();
+
+        apply_conflict_strategy(
+            &source,
+            &target,
+            ConflictStrategy::OverwritePreserve,
+            &preserve,
+        )
+        .unwrap();
+        apply_conflict_strategy(
+            &source,
+            &target,
+            ConflictStrategy::OverwritePreserve,
+            &preserve,
+        )
+        .unwrap();
+
+        let ctx = fs::read_to_string(target.join(".claude/CONTEXT_STATE.md")).unwrap();
+        let start_count = ctx.matches(MERGE_BLOCK_START).count();
+        let end_count = ctx.matches(MERGE_BLOCK_END).count();
+        assert_eq!(start_count, 1, "duplicate <!-- vct-merge-pending --> block");
+        assert_eq!(end_count, 1, "duplicate <!-- /vct-merge-pending --> block");
+
+        fs::remove_dir_all(&source).ok();
+        fs::remove_dir_all(&target).ok();
+    }
+
+    #[test]
+    fn test_strategy_delete_claude_wipes_only_dot_claude() {
+        let source = fake_repo_source();
+        let target = fake_adopt_target();
+
+        let report = apply_conflict_strategy(
+            &source,
+            &target,
+            ConflictStrategy::DeleteClaudeAndReinstall,
+            &[],
+        )
+        .unwrap();
+        assert!(report.copied_count > 0);
+
+        // .claude was wiped then re-populated with upstream settings.json
+        // (the OLD `{"old":true}` is gone).
+        assert_eq!(
+            fs::read_to_string(target.join(".claude/settings.json")).unwrap(),
+            "{}"
+        );
+        // Top-level files OUTSIDE .claude are NOT wiped — DeleteClaude
+        // only nukes .claude/. CLAUDE.md was overwritten by the fresh
+        // copy step (it's in the allowlist), so we check user_code.py
+        // which is OUTSIDE the allowlist.
+        assert_eq!(
+            fs::read_to_string(target.join("user_code.py")).unwrap(),
+            "print('survive')\n"
+        );
+
+        fs::remove_dir_all(&source).ok();
+        fs::remove_dir_all(&target).ok();
+    }
+
+    #[test]
+    fn test_strategy_delete_claude_handles_missing_dot_claude() {
+        // If .claude doesn't exist (somehow we got dispatched to this
+        // strategy on a non-adopt target), DeleteClaude must not error.
+        let source = fake_repo_source();
+        let target = tmp();
+        fs::write(target.join("user_code.py"), "x").unwrap();
+
+        let report = apply_conflict_strategy(
+            &source,
+            &target,
+            ConflictStrategy::DeleteClaudeAndReinstall,
+            &[],
+        )
+        .expect("must not error on missing .claude/");
+        assert!(report.copied_count > 0);
+
+        fs::remove_dir_all(&source).ok();
+        fs::remove_dir_all(&target).ok();
+    }
+
+    #[test]
+    fn test_strategy_overwrite_preserve_with_custom_preserve_list() {
+        let source = fake_repo_source();
+        let target = fake_adopt_target();
+
+        // Custom preserve list: only CLAUDE.md, exclude .env and others.
+        let preserve = vec!["CLAUDE.md".to_string()];
+        apply_conflict_strategy(
+            &source,
+            &target,
+            ConflictStrategy::OverwritePreserve,
+            &preserve,
+        )
+        .unwrap();
+
+        // CLAUDE.md preserved, sibling written.
+        assert!(target.join("CLAUDE.new.md").exists());
+        assert_eq!(
+            fs::read_to_string(target.join("CLAUDE.md")).unwrap(),
+            "# user CLAUDE.md\ncustom rules\n"
+        );
+
+        fs::remove_dir_all(&source).ok();
+        fs::remove_dir_all(&target).ok();
+    }
+
+    #[test]
+    fn test_strategy_rejects_non_orchestrator_source() {
+        let source = tmp(); // no vct-module.json
+        let target = tmp();
+        let err = apply_conflict_strategy(
+            &source,
+            &target,
+            ConflictStrategy::OverwriteAll,
+            &[],
+        )
+        .unwrap_err();
+        assert!(err.contains("not an orchestrator repo"));
+        fs::remove_dir_all(&source).ok();
+        fs::remove_dir_all(&target).ok();
+    }
+
+    #[test]
+    fn test_replace_or_append_block_appends_when_missing() {
+        let existing = "# header\nbody\n";
+        let block = "<!-- vct-merge-pending -->\nstuff\n<!-- /vct-merge-pending -->\n";
+        let out = replace_or_append_block(existing, block);
+        assert!(out.starts_with("# header\nbody\n"));
+        assert!(out.contains("<!-- vct-merge-pending -->"));
+    }
+
+    #[test]
+    fn test_replace_or_append_block_replaces_in_place() {
+        let existing = "# header\n<!-- vct-merge-pending -->\nOLD STUFF\n<!-- /vct-merge-pending -->\n# tail\n";
+        let new_block =
+            "<!-- vct-merge-pending -->\nNEW STUFF\n<!-- /vct-merge-pending -->";
+        let out = replace_or_append_block(existing, new_block);
+        assert!(out.contains("NEW STUFF"));
+        assert!(!out.contains("OLD STUFF"));
+        assert!(out.contains("# header"));
+        assert!(out.contains("# tail"));
+        // Exactly one block.
+        assert_eq!(out.matches(MERGE_BLOCK_START).count(), 1);
+    }
+
+    #[test]
+    fn test_update_merge_notification_block_creates_file_if_missing() {
+        let dir = tmp();
+        let target_file = dir.join(".claude/CONTEXT_STATE.md");
+        let written = update_merge_notification_block(
+            &target_file,
+            &["CLAUDE.md".to_string()],
+        )
+        .unwrap();
+        assert!(written);
+        assert!(target_file.exists());
+        let content = fs::read_to_string(&target_file).unwrap();
+        assert!(content.contains(MERGE_BLOCK_START));
+        assert!(content.contains("CLAUDE.md"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_civil_from_days_known_dates() {
+        // unix epoch (1970-01-01) is day 0.
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        // 2026-04-27 = days since epoch. Don't compute by hand; just
+        // sanity-check via the iso formatter.
+        let s = chrono_iso_z();
+        assert!(s.ends_with("Z"));
+        assert_eq!(s.len(), 20); // YYYY-MM-DDTHH:MM:SSZ
     }
 }
