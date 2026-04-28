@@ -281,98 +281,113 @@ echo.
 echo [launcher] Building from source...
 
 REM Ensure Node.js. T1 silent (only with --yes), T3 prompt, T4 URL.
+REM
+REM IMPORTANT: cmd.exe does NOT allow labels (`:foo`) inside parenthesised
+REM blocks. The previous version had `:winget_recheck`, `:node_install_done`,
+REM `:node_recheck` inside `if ( ... )` blocks — that produced the cryptic
+REM `") non atteso."` ("`)` not expected") parser error reported 2026-04-28.
+REM Refactored to flat goto-driven control flow with labels at top level.
 where /q node
-if %ERRORLEVEL% NEQ 0 (
-    where /q winget
-    if %ERRORLEVEL% EQU 0 (
-        if "%YES_FLAG%"=="1" (
-            echo [launcher] T1 silent: winget install Node.js
-            winget install --silent --accept-package-agreements --accept-source-agreements OpenJS.NodeJS
-        ) else (
-            set /p "NODE_ANS=Install Node.js via winget? [Y/n] "
-            if /I "!NODE_ANS!"=="N" (
-                echo [launcher] T4: install Node manually from https://nodejs.org/
-                goto :launch_skip
-            )
-            winget install --accept-package-agreements --accept-source-agreements OpenJS.NodeJS
-        )
-        REM winget modifies PATH for new shells but not us — refresh.
-        call refreshenv >nul 2>&1
-    ) else (
-        REM No winget — old Win10 build, Server, or removed by IT policy.
-        REM Loud-stop: tell user what to install + give a re-check option.
-        echo.
-        echo ===============================================
-        echo   Cannot auto-install Node: winget is not available
-        echo ===============================================
-        echo.
-        echo   Install Node.js manually:
-        echo     https://nodejs.org/  ^(LTS .msi, 18+ recommended^)
-        echo   Or get winget first:  https://aka.ms/getwinget
-        echo.
-        echo   IMPORTANT: After installing Node, OPEN A NEW TERMINAL so PATH
-        echo   refreshes, then re-run this script. Or choose [r] to retry.
-        echo.
-        if "%YES_FLAG%"=="1" (
-            echo [launcher] Non-interactive run: skipping.
-            goto :launch_skip
-        )
-        :winget_recheck
-        set /p "WG_RETRY=[r] Re-check / [s] Skip the build: "
-        if /I "!WG_RETRY!"=="r" (
-            where /q node
-            if %ERRORLEVEL% EQU 0 (
-                echo [launcher] Node detected — continuing.
-                goto :node_install_done
-            ) else (
-                echo [launcher] Still no Node on PATH. Try a new terminal.
-                goto :winget_recheck
-            )
-        ) else (
-            goto :launch_skip
-        )
-        :node_install_done
-    )
+if %ERRORLEVEL% EQU 0 goto :node_ready
+
+where /q winget
+if %ERRORLEVEL% NEQ 0 goto :no_winget
+
+REM winget available — try silent (T1) or prompt (T3).
+if "%YES_FLAG%"=="1" (
+    echo [launcher] T1 silent: winget install Node.js
+    winget install --silent --accept-package-agreements --accept-source-agreements OpenJS.NodeJS
+    goto :after_winget_install
 )
 
-where /q node
-if %ERRORLEVEL% NEQ 0 (
-    REM Loud-stop pattern (parity with Linux/macOS post-install-launcher.sh).
-    REM Don't silently skip and report "Installation complete!" while the
-    REM launcher build was actually skipped — that's the same anti-pattern
-    REM as the Joern silent-hang. Tell the user exactly what to do.
-    echo.
-    echo ===============================================
-    echo   Cannot build the launcher: Node.js is missing
-    echo ===============================================
-    echo.
-    echo   Auto-install attempts failed. Install Node.js manually:
-    echo     https://nodejs.org/  ^(LTS, 18+ recommended^)
-    echo   Or via winget:  winget install OpenJS.NodeJS
-    echo.
-    echo   IMPORTANT: After installing, OPEN A NEW TERMINAL so PATH refreshes,
-    echo   then re-run this script. Or choose [r] to retry from this terminal
-    echo   ^(may not see new PATH^).
-    echo.
-    if "%YES_FLAG%"=="1" (
-        echo [launcher] Non-interactive run: skipping. Re-run with Node available.
-        goto :launch_skip
-    )
-    :node_recheck
-    set /p "NODE_RETRY=[r] Re-check / [s] Skip the build: "
-    if /I "!NODE_RETRY!"=="r" (
-        where /q node
-        if %ERRORLEVEL% EQU 0 (
-            echo [launcher] Node detected — continuing build.
-        ) else (
-            echo [launcher] Still no Node on PATH. Try opening a new terminal.
-            goto :node_recheck
-        )
-    ) else (
-        goto :launch_skip
-    )
+set "NODE_ANS="
+set /p "NODE_ANS=Install Node.js via winget? [Y/n] "
+if /I "%NODE_ANS%"=="N" (
+    echo [launcher] T4: install Node manually from https://nodejs.org/
+    goto :launch_skip
+)
+winget install --accept-package-agreements --accept-source-agreements OpenJS.NodeJS
+
+:after_winget_install
+REM winget modifies PATH for new shells but not us — refresh.
+call refreshenv >nul 2>&1
+goto :recheck_node
+
+:no_winget
+REM No winget — old Win10 build, Server, or removed by IT policy.
+REM Loud-stop: tell user what to install + give a re-check option.
+echo.
+echo ===============================================
+echo   Cannot auto-install Node: winget is not available
+echo ===============================================
+echo.
+echo   Install Node.js manually:
+echo     https://nodejs.org/  ^(LTS .msi, 18+ recommended^)
+echo   Or get winget first:  https://aka.ms/getwinget
+echo.
+echo   IMPORTANT: After installing Node, OPEN A NEW TERMINAL so PATH
+echo   refreshes, then re-run this script. Or choose [r] to retry.
+echo.
+if "%YES_FLAG%"=="1" (
+    echo [launcher] Non-interactive run: skipping.
+    goto :launch_skip
 )
 
+:winget_recheck
+set "WG_RETRY="
+set /p "WG_RETRY=[r] Re-check / [s] Skip the build: "
+if /I "%WG_RETRY%"=="r" goto :recheck_node
+goto :launch_skip
+
+:recheck_node
+where /q node
+if %ERRORLEVEL% EQU 0 (
+    echo [launcher] Node detected — continuing.
+    goto :node_ready
+)
+echo [launcher] Still no Node on PATH. Try a new terminal.
+if "%YES_FLAG%"=="1" goto :launch_skip
+goto :winget_recheck
+
+:node_ready
+where /q node
+if %ERRORLEVEL% EQU 0 goto :node_install_done
+
+REM Loud-stop pattern (parity with Linux/macOS post-install-launcher.sh).
+REM Don't silently skip and report "Installation complete!" while the
+REM launcher build was actually skipped — that's the same anti-pattern
+REM as the Joern silent-hang. Tell the user exactly what to do.
+echo.
+echo ===============================================
+echo   Cannot build the launcher: Node.js is missing
+echo ===============================================
+echo.
+echo   Auto-install attempts failed. Install Node.js manually:
+echo     https://nodejs.org/  ^(LTS, 18+ recommended^)
+echo   Or via winget:  winget install OpenJS.NodeJS
+echo.
+echo   IMPORTANT: After installing, OPEN A NEW TERMINAL so PATH refreshes,
+echo   then re-run this script. Or choose [r] to retry from this terminal
+echo   ^(may not see new PATH^).
+echo.
+if "%YES_FLAG%"=="1" (
+    echo [launcher] Non-interactive run: skipping. Re-run with Node available.
+    goto :launch_skip
+)
+
+:node_recheck
+set "NODE_RETRY="
+set /p "NODE_RETRY=[r] Re-check / [s] Skip the build: "
+if /I not "%NODE_RETRY%"=="r" goto :launch_skip
+where /q node
+if %ERRORLEVEL% EQU 0 (
+    echo [launcher] Node detected — continuing build.
+    goto :node_install_done
+)
+echo [launcher] Still no Node on PATH. Try opening a new terminal.
+goto :node_recheck
+
+:node_install_done
 REM pnpm preferred, npm fallback.
 where /q pnpm
 if %ERRORLEVEL% NEQ 0 (
