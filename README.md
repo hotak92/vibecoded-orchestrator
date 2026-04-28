@@ -7,8 +7,8 @@ Open source. Runs locally. Learns from how you work.
 > **Requirements at a glance**
 > - **Python 3.11 or newer** (3.12 recommended; 3.13 also supported)
 > - **Docker** or **Podman**
-> - **Claude Code CLI** + **Claude Max** subscription
 > - **Node.js 18+** with `npm` (only when building the launcher GUI from source — not needed if using the bundled prebuilt binary)
+> - *(optional)* **Claude Code CLI** + a Claude subscription — adds auto-summarization of new KG nodes via Haiku. Everything else (KG semantic search, code graph, agents, hooks) works without it.
 >
 > The `first-install.*` entry points detect and (when missing) auto-install
 > the dependencies above plus a few build-time/optional tools: `pnpm` (via
@@ -211,9 +211,10 @@ python install.py --quiet --no-joern --no-containers
 **Required (the install will halt and ask if missing):**
 - **Python 3.11 or newer** — 3.12 is the version we develop and CI-test on; 3.13 is supported. 3.10 and older are rejected (we depend on stdlib `tomllib`, which lands in 3.11).
 - **Docker** or **Podman** (for Weaviate + Ollama containers)
-- **Claude Code** CLI (`npm install -g @anthropic-ai/claude-code`) — auto-installed via npm if Node is present
-- **Claude Max** subscription (for Claude Code access; not auto-installable)
-- **Node.js 18+** with `npm` — required for Claude Code itself AND for building the launcher GUI from source. NOT needed if you use the bundled prebuilt at `launcher/dist/<arch>/`.
+- **Node.js 18+** with `npm` — needed only for building the launcher GUI from source AND for installing Claude Code (if you want it). NOT needed if you use the bundled prebuilt at `launcher/dist/<arch>/` and don't intend to install Claude Code.
+
+**Optional (improves the experience but the orchestrator works without it):**
+- **Claude Code** CLI (`npm install -g @anthropic-ai/claude-code`) + a Claude subscription — auto-installed via npm if Node is present. Enables auto-summarization of new KG nodes via Haiku, and is the primary client we wire all the agents/skills/hooks for. Without it, KG nodes get stored without auto-summaries (you can still write summaries by hand) and the agents/skills/hooks remain dormant — the KG, code graph, MCPs, and launcher GUI all keep working.
 
 **Auto-installed when needed (install attempts these without further prompts beyond the per-tool [Y/n]):**
 - **`pnpm`** — installed via `npm install -g pnpm` if Node is present and pnpm is missing. Falls back to plain `npm` if the global install fails.
