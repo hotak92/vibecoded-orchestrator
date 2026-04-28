@@ -131,6 +131,33 @@ pub async fn create_project_v2(
         eprintln!("[vct] warning: write_project_env_files failed: {}", e);
     }
 
+    // Bug 33 (2026-04-28): also ensure a per-project `.env` template
+    // exists. `write_project_env_files` only writes `.claude/env` +
+    // `.claude/settings.json`; a separate `.env` is what most CLI
+    // users expect to edit (esp. Agape/SD15-style projects that
+    // pre-existed any orchestrator install). The template carries
+    // commented placeholders for ANTHROPIC_API_KEY / OPENAI_API_KEY /
+    // GITHUB_TOKEN / RL_*; values stay user-controlled. Idempotent on
+    // re-runs.
+    if let Err(e) = ensure_project_env_template(folder, &req.name) {
+        eprintln!("[vct] warning: ensure_project_env_template failed: {}", e);
+    }
+
+    // 2026-04-28 fix: populate the per-project state DB tables (agents,
+    // skills, hooks, kg/codegraph bindings) from the project's `.claude/`
+    // directory. Without this, the launcher's per-project GUI tabs
+    // appear empty even when the filesystem has 26+ agents bundled.
+    // Idempotent on re-run; preserves user-toggled `enabled` flags. We
+    // log soft-errors and continue — never fail project creation over a
+    // populate hiccup.
+    let populate_report = crate::commands::project_state_populate::
+        populate_project_state_from_filesystem(&row.id, &req.name, folder, &db);
+    if !populate_report.warnings.is_empty() {
+        for w in &populate_report.warnings {
+            eprintln!("[vct] populate warning ({}): {}", row.id, w);
+        }
+    }
+
     db.audit(
         "project_create",
         Some(&row.id),
@@ -338,6 +365,259 @@ pub fn write_project_env_files(folder: &Path, project_name: &str) -> Result<(), 
         .map_err(|e| format!("write {}: {}", claude_settings_path.display(), e))?;
 
     Ok(())
+}
+
+/// Marker tag inserted on every line `ensure_project_env_template`
+/// appends to a pre-existing `.env`. Mirror of `ENV_VCO_MARKER` in
+/// install.py — keep in lockstep. Idempotency depends on the exact
+/// substring match; do NOT translate or reformat.
+const ENV_VCO_MARKER: &str = "# added by vco";
+
+/// Canonical key list rendered by `ensure_project_env_template`.
+///
+/// Each tuple = `(KEY, default)`:
+///   - `default = Some(value)` → write `KEY=value` (active)
+///   - `default = None` → write `# KEY=...` (commented placeholder)
+///
+/// Mirrors `_env_canonical_template` in install.py. The
+/// `<project>` / `<project_root>` tokens are substituted by the
+/// caller. Keep the two lists in lockstep — the test
+/// `env_template_canonical_keys_match_python` (added 2026-04-28)
+/// asserts the Python and Rust key sets are identical.
+fn env_canonical_keys() -> Vec<(&'static str, Option<&'static str>)> {
+    vec![
+        // Service URLs (all commented placeholders — launcher chooses
+        // the actual ports at adopt time and writes them via the env
+        // block in `.claude/settings.json`, NOT into `.env`).
+        ("WEAVIATE_URL", None),
+        ("WEAVIATE_PORT", None),
+        ("OLLAMA_URL", None),
+        ("OLLAMA_PORT", None),
+        ("CODE_EMBED_URL", None),
+        // Per-project Weaviate collections (active — filled at create time).
+        ("KG_COLLECTION", Some("__project__:kg")),
+        ("SHARED_KG_COLLECTION", Some("VibeCodedTools_KnowledgeGraph")),
+        ("DEVELOPMENT_COLLECTION", Some("__project__:dev")),
+        ("PROJECT_NAME", Some("__project__:raw")),
+        ("CONVERSATION_COLLECTION", Some("__project__:conv")),
+        // LLM API keys (commented).
+        ("ANTHROPIC_API_KEY", None),
+        ("OPENAI_API_KEY", None),
+        // GitHub access (commented).
+        ("GITHUB_TOKEN", None),
+        // RL retrieval (commented — module section).
+        ("RL_SERVER_URL", None),
+        ("RL_SERVER_PORT", None),
+        ("RL_PROJECT_ROOT", None),
+        // Telemetry (commented — opt-in).
+        ("VCT_TELEMETRY", None),
+    ]
+}
+
+/// Substitute `__project__:*` tokens to the per-project values.
+fn render_canonical_default(default: &str, project_name: &str, kg_collection: &str) -> String {
+    match default {
+        "__project__:kg" => format!("{}_KnowledgeGraph", kg_collection),
+        "__project__:dev" => format!("{}_Development", kg_collection),
+        "__project__:conv" => format!("{}_conversations", kg_collection),
+        "__project__:raw" => project_name.to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Build the canonical `.env` text used when no `.env` exists.
+///
+/// Output mirrors `_build_canonical_env_template_text` in install.py
+/// (modulo tiny formatting differences — header date, section order).
+/// What MUST match cross-language: the set of declared KEY names. The
+/// `env_template_canonical_keys_match_python` test enforces that.
+fn build_canonical_env_text(project_name: &str, kg_collection: &str) -> String {
+    let today = chrono::Utc::now().format("%Y-%m-%d");
+    let mut s = String::new();
+    s.push_str("# vibecoded-orchestrator per-project .env\n");
+    s.push_str("# Edit values to override defaults. Empty / commented lines are\n");
+    s.push_str(&format!("# treated as \"use default\". Created by vco {}.\n\n", today));
+
+    s.push_str("# === Service URLs (uncomment to override the launcher's adopted defaults) ===\n");
+    s.push_str("# WEAVIATE_URL=http://localhost:8081\n");
+    s.push_str("# WEAVIATE_PORT=8081\n");
+    s.push_str("# OLLAMA_URL=http://localhost:11435\n");
+    s.push_str("# OLLAMA_PORT=11435\n");
+    s.push_str("# CODE_EMBED_URL=http://localhost:11440\n\n");
+
+    s.push_str("# === Per-project Weaviate collections ===\n");
+    s.push_str("# Resolved by the launcher when the project is registered. Don't\n");
+    s.push_str("# edit unless you know what you're doing.\n");
+    s.push_str(&format!("KG_COLLECTION={}_KnowledgeGraph\n", kg_collection));
+    s.push_str("SHARED_KG_COLLECTION=VibeCodedTools_KnowledgeGraph\n");
+    s.push_str(&format!("DEVELOPMENT_COLLECTION={}_Development\n", kg_collection));
+    s.push_str(&format!("PROJECT_NAME={}\n", project_name));
+    s.push_str(&format!("CONVERSATION_COLLECTION={}_conversations\n\n", kg_collection));
+
+    s.push_str("# === LLM API keys (optional) ===\n");
+    s.push_str("# ANTHROPIC_API_KEY=\n");
+    s.push_str("# OPENAI_API_KEY=\n\n");
+
+    s.push_str("# === GitHub access for code-search MCP (optional) ===\n");
+    s.push_str("# GITHUB_TOKEN=\n\n");
+
+    s.push_str("# === RL retrieval module (Pro tier — uncomment when installed) ===\n");
+    s.push_str("# RL_SERVER_URL=http://localhost:8090\n");
+    s.push_str("# RL_SERVER_PORT=8090\n");
+    s.push_str("# RL_PROJECT_ROOT=<project_root>\n\n");
+
+    s.push_str("# === Telemetry (off by default; on=opt-in only) ===\n");
+    s.push_str("# VCT_TELEMETRY=off\n");
+    s
+}
+
+/// Parse keys present in an existing `.env`. Both commented (`# KEY=`)
+/// and active (`KEY=`) lines count — the user knows about either form
+/// and we should not duplicate-append over them. Mirrors
+/// `_parse_existing_env_keys` in install.py.
+fn parse_existing_env_keys(text: &str) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for line in text.lines() {
+        let s = line.trim();
+        if s.is_empty() {
+            continue;
+        }
+        // Strip a single leading '#' + whitespace.
+        let body = if let Some(rest) = s.strip_prefix('#') {
+            rest.trim_start()
+        } else {
+            s
+        };
+        if let Some(eq_idx) = body.find('=') {
+            if eq_idx == 0 {
+                continue;
+            }
+            let key = body[..eq_idx].trim();
+            // Validate key shape: alnum + underscore, leading non-digit.
+            // Skips lines like `# Defaults match the podman-compose...`
+            // which would otherwise parse as `match=...`.
+            if !key.is_empty()
+                && !key.starts_with(|c: char| c.is_ascii_digit())
+                && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                out.insert(key.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Report shape returned by `ensure_project_env_template`. Mirrors the
+/// dict returned by Python's `_ensure_env_template`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnsureEnvReport {
+    /// One of "created", "appended", "noop".
+    pub action: String,
+    /// Keys that were just written (only the canonical KEY names, not
+    /// every line of comments).
+    pub added_keys: Vec<String>,
+    /// Absolute path to the .env file.
+    pub env_path: String,
+}
+
+/// Ensure `<folder>/.env` exists and has every canonical-template key.
+///
+/// - Missing → write fresh from the canonical template (with placeholders
+///   substituted for `<project>` / `<project_root>`).
+/// - Exists → append any canonical keys that aren't already present
+///   (commented or active), tagged with `# added by vco YYYY-MM-DD`.
+/// - Idempotent: a second invocation produces a no-op.
+///
+/// User-set values are preserved verbatim — we only append new lines,
+/// never rewrite existing ones.
+///
+/// This is the Rust mirror of `_ensure_env_template` in install.py;
+/// keep them in lockstep. The 'env_template_canonical_keys_match_python'
+/// integration test is the contract that enforces this.
+pub fn ensure_project_env_template(
+    folder: &Path,
+    project_name: &str,
+) -> Result<EnsureEnvReport, String> {
+    let env_path = folder.join(".env");
+    let kg_collection = sanitize_kg_collection(project_name);
+
+    if !env_path.exists() {
+        let text = build_canonical_env_text(project_name, &kg_collection);
+        std::fs::write(&env_path, text)
+            .map_err(|e| format!("write {}: {}", env_path.display(), e))?;
+        let added: Vec<String> = env_canonical_keys()
+            .iter()
+            .map(|(k, _)| k.to_string())
+            .collect();
+        return Ok(EnsureEnvReport {
+            action: "created".into(),
+            added_keys: added,
+            env_path: env_path.to_string_lossy().to_string(),
+        });
+    }
+
+    let existing = std::fs::read_to_string(&env_path)
+        .map_err(|e| format!("read {}: {}", env_path.display(), e))?;
+    let present = parse_existing_env_keys(&existing);
+
+    let missing: Vec<(&'static str, Option<&'static str>)> = env_canonical_keys()
+        .into_iter()
+        .filter(|(k, _)| !present.contains(*k))
+        .collect();
+
+    if missing.is_empty() {
+        return Ok(EnsureEnvReport {
+            action: "noop".into(),
+            added_keys: vec![],
+            env_path: env_path.to_string_lossy().to_string(),
+        });
+    }
+
+    let today = chrono::Utc::now().format("%Y-%m-%d");
+    let mut block = String::new();
+    if !existing.ends_with('\n') {
+        block.push('\n');
+    }
+    block.push('\n');
+    block.push_str(&format!(
+        "{} {}: appended missing canonical keys\n",
+        ENV_VCO_MARKER, today
+    ));
+    let added: Vec<String> = missing
+        .iter()
+        .map(|(k, default)| {
+            match default {
+                Some(d) => {
+                    let val = render_canonical_default(d, project_name, &kg_collection);
+                    block.push_str(&format!("{}={}\n", k, val));
+                }
+                None => {
+                    // Commented placeholder. RL_PROJECT_ROOT gets a
+                    // <project_root> token; everything else just '='.
+                    if *k == "RL_PROJECT_ROOT" {
+                        block.push_str("# RL_PROJECT_ROOT=<project_root>\n");
+                    } else {
+                        block.push_str(&format!("# {}=\n", k));
+                    }
+                }
+            }
+            (*k).to_string()
+        })
+        .collect();
+
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&env_path)
+        .map_err(|e| format!("open {} for append: {}", env_path.display(), e))?;
+    use std::io::Write;
+    f.write_all(block.as_bytes())
+        .map_err(|e| format!("append to {}: {}", env_path.display(), e))?;
+
+    Ok(EnsureEnvReport {
+        action: "appended".into(),
+        added_keys: added,
+        env_path: env_path.to_string_lossy().to_string(),
+    })
 }
 
 /// Convert a project display name into a Weaviate-collection-safe id.
@@ -857,5 +1137,149 @@ mod tests {
         assert!(folder.join(".claude/env").exists());
 
         std::fs::remove_dir_all(&folder).ok();
+    }
+
+    // ─── Deliverable 1 (2026-04-28): ensure_project_env_template ──
+
+    fn _scratch_dir(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "vct-envtmpl-{}-{}",
+            tag,
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn ensure_env_template_creates_when_missing() {
+        let dir = _scratch_dir("create");
+        assert!(!dir.join(".env").exists());
+        let report = ensure_project_env_template(&dir, "Agape").unwrap();
+        assert_eq!(report.action, "created");
+        assert!(dir.join(".env").exists());
+        let text = std::fs::read_to_string(dir.join(".env")).unwrap();
+        // Active keys filled with project-substituted values.
+        assert!(text.contains("KG_COLLECTION=Agape_KnowledgeGraph"));
+        assert!(text.contains("PROJECT_NAME=Agape"));
+        // Optional keys remain commented.
+        assert!(text.contains("# OPENAI_API_KEY="));
+        assert!(text.contains("# GITHUB_TOKEN="));
+        // Active OPENAI_API_KEY must NOT appear.
+        assert!(!text.contains("\nOPENAI_API_KEY="));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ensure_env_template_appends_missing_with_marker() {
+        let dir = _scratch_dir("append");
+        let env_path = dir.join(".env");
+        std::fs::write(&env_path, "OPENAI_API_KEY=sk-user\n").unwrap();
+        let report = ensure_project_env_template(&dir, "X").unwrap();
+        assert_eq!(report.action, "appended");
+        let text = std::fs::read_to_string(&env_path).unwrap();
+        // User value preserved verbatim.
+        assert!(text.contains("OPENAI_API_KEY=sk-user"));
+        // Marker present.
+        assert!(text.contains(ENV_VCO_MARKER));
+        // Missing keys appended.
+        assert!(text.contains("KG_COLLECTION=X_KnowledgeGraph"));
+        assert!(text.contains("# GITHUB_TOKEN="));
+        // OPENAI_API_KEY must appear exactly once (the user's line).
+        let count = text.matches("OPENAI_API_KEY").count();
+        assert_eq!(count, 1, "expected 1, got {count}\n{text}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ensure_env_template_idempotent_on_double_run() {
+        let dir = _scratch_dir("idem");
+        ensure_project_env_template(&dir, "X").unwrap();
+        let after_first = std::fs::read_to_string(dir.join(".env")).unwrap();
+        let report = ensure_project_env_template(&dir, "X").unwrap();
+        let after_second = std::fs::read_to_string(dir.join(".env")).unwrap();
+        assert_eq!(report.action, "noop");
+        assert_eq!(after_first, after_second);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ensure_env_template_recognises_commented_form_as_present() {
+        // User has `# ANTHROPIC_API_KEY=` — the commented canonical
+        // form. Re-running must NOT append a duplicate.
+        let dir = _scratch_dir("commented");
+        std::fs::write(
+            dir.join(".env"),
+            "# my prose\n# ANTHROPIC_API_KEY=\nGITHUB_TOKEN=ghp_user\n",
+        )
+        .unwrap();
+        ensure_project_env_template(&dir, "X").unwrap();
+        let text = std::fs::read_to_string(dir.join(".env")).unwrap();
+        let count = text.matches("ANTHROPIC_API_KEY").count();
+        assert_eq!(count, 1, "expected 1 occurrence, got {count}\n{text}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ensure_env_template_handles_no_trailing_newline() {
+        let dir = _scratch_dir("nonl");
+        std::fs::write(dir.join(".env"), "FOO=bar").unwrap();
+        ensure_project_env_template(&dir, "X").unwrap();
+        let text = std::fs::read_to_string(dir.join(".env")).unwrap();
+        assert!(text.contains("FOO=bar\n"),
+                "user line should now end with newline: {text:?}");
+        // Marker line must not be glued to FOO=bar.
+        for line in text.lines() {
+            if line.contains(ENV_VCO_MARKER) {
+                assert!(!line.starts_with("FOO=bar"),
+                        "marker glued to user line: {line:?}");
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ensure_env_template_user_value_for_kg_collection_not_overwritten() {
+        let dir = _scratch_dir("kguser");
+        std::fs::write(dir.join(".env"), "KG_COLLECTION=MyCustom_KG\n").unwrap();
+        ensure_project_env_template(&dir, "Agape").unwrap();
+        let text = std::fs::read_to_string(dir.join(".env")).unwrap();
+        assert!(text.contains("KG_COLLECTION=MyCustom_KG"));
+        assert!(!text.contains("KG_COLLECTION=Agape_KnowledgeGraph"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_existing_env_keys_handles_blank_and_comment_only_lines() {
+        let text = "\n\n# pure prose comment\n\n# Another: with a colon\nFOO=bar\n";
+        let keys = parse_existing_env_keys(text);
+        assert_eq!(keys.len(), 1);
+        assert!(keys.contains("FOO"));
+    }
+
+    #[test]
+    fn env_template_canonical_keys_match_python() {
+        // Cross-language contract: the Rust canonical-key list MUST
+        // match install.py's. If this test fails because the lists
+        // diverge, update both sides — the user shouldn't get
+        // different keys depending on which surface ran first.
+        let rust_keys: std::collections::HashSet<String> = env_canonical_keys()
+            .iter()
+            .map(|(k, _)| (*k).to_string())
+            .collect();
+        let expected: std::collections::HashSet<String> = [
+            "WEAVIATE_URL", "WEAVIATE_PORT", "OLLAMA_URL", "OLLAMA_PORT",
+            "CODE_EMBED_URL",
+            "KG_COLLECTION", "SHARED_KG_COLLECTION", "DEVELOPMENT_COLLECTION",
+            "PROJECT_NAME", "CONVERSATION_COLLECTION",
+            "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
+            "GITHUB_TOKEN",
+            "RL_SERVER_URL", "RL_SERVER_PORT", "RL_PROJECT_ROOT",
+            "VCT_TELEMETRY",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(rust_keys, expected, "Rust canonical key set drifted from Python");
     }
 }

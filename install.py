@@ -376,6 +376,288 @@ def _should_skip_step(step: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Deliverable 2 (2026-04-28): persist install choices + state hashes so
+# re-installs can replay them instead of re-prompting / re-detecting.
+#
+# Two new event step IDs in install.jsonl:
+#   - "choices"      → one record per major decision point (joern,
+#                      embedding mode, container runtime). The record
+#                      holds enough info that a second install run can
+#                      re-make the same decision without prompting.
+#   - "state-hashes" → MD5 of requirements.txt / Cargo.lock / package.json /
+#                      knowledge dir, written at the END of a successful
+#                      install. `_compute_drift` compares these against
+#                      current files to flag what changed and needs
+#                      re-syncing.
+#
+# Stale-session rule: choices older than 24h are NOT replayed (matches
+# the existing `_load_resume_state` rule — same reasoning: a long-stale
+# choice is more likely wrong than right).
+# ---------------------------------------------------------------------------
+
+# Files whose content hashes are tracked across installs. Tuple form so
+# we can iterate stably and return a deterministic dict shape.
+STATE_HASH_TARGETS: tuple[tuple[str, str], ...] = (
+    ("requirements_txt_md5", "requirements.txt"),
+    ("cargo_lock_md5", "launcher/src-tauri/Cargo.lock"),
+    ("package_json_md5", "launcher/package.json"),
+)
+
+# Knowledge dir is hashed differently — md5 of the sorted file-name
+# listing rather than file content. Catches additions/removals; cheap.
+STATE_HASH_KNOWLEDGE_DIR = "knowledge"
+
+
+def _record_install_choice(name: str, value, extra: dict | None = None) -> None:
+    """Persist one install-time decision so re-runs can replay it.
+
+    Wraps `_log_install_event` with a fixed step="choices" so all
+    decisions appear in a single audit category. Best-effort: never
+    raises (matches the install-log contract).
+
+    Args:
+        name: Stable choice ID (e.g. "joern", "embedding_mode",
+            "container_runtime"). The replay loader keys on this.
+        value: The chosen value, JSON-serialisable. Bool / str / dict
+            are all fine.
+        extra: Optional structured payload (model versions, reason,
+            etc.) — useful for forensics, ignored by the replay loader.
+    """
+    payload: dict = {"value": value}
+    if extra:
+        payload.update(extra)
+    _log_install_event("choices", "ok", name, data=payload)
+
+
+def _load_previous_choices() -> dict[str, dict]:
+    """Read install.jsonl and return {choice_name: {value, ...extra}}
+    for the most-recent install.py session.
+
+    Returns an empty dict when:
+      - The log file doesn't exist yet (first install).
+      - The most-recent session is older than 24h (stale-session rule).
+      - No "choices" events were recorded that session.
+
+    Reuses the session-detection logic from `_load_resume_state`
+    (session = events between consecutive `step="1/10", phase="start"`
+    markers from `actor=install.py`). The choice with the latest
+    timestamp wins if a name was recorded twice in one session.
+    """
+    path = _install_log_path()
+    if path is None or not path.is_file():
+        return {}
+
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+
+    events: list[dict] = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(obj, dict):
+            events.append(obj)
+
+    if not events:
+        return {}
+
+    last_session_start = -1
+    for i, ev in enumerate(events):
+        if (ev.get("actor") == "install.py"
+                and ev.get("step") == "1/10"
+                and ev.get("phase") == "start"):
+            last_session_start = i
+    if last_session_start < 0:
+        return {}
+
+    session_events = events[last_session_start:]
+
+    # Stale check (>24h).
+    start_ts = session_events[0].get("ts", "")
+    if start_ts:
+        from datetime import datetime, timezone, timedelta
+        try:
+            ts_clean = start_ts.replace("Z", "+00:00")
+            start_dt = datetime.fromisoformat(ts_clean)
+            now = datetime.now(timezone.utc)
+            if now - start_dt > timedelta(hours=24):
+                return {}
+        except (ValueError, TypeError):
+            return {}
+
+    out: dict[str, dict] = {}
+    for ev in session_events:
+        if ev.get("step") != "choices" or ev.get("phase") != "ok":
+            continue
+        name = ev.get("detail")
+        data = ev.get("data") or {}
+        if not isinstance(name, str) or not name:
+            continue
+        if not isinstance(data, dict):
+            continue
+        out[name] = data
+    return out
+
+
+def _md5_file(path: Path) -> str | None:
+    """Return MD5 hex digest of a file's bytes, or None on read error
+    (file missing, permission denied, etc.). MD5 chosen over SHA-256
+    purely for size (32-char vs 64-char) — drift detection is not
+    security-critical.
+    """
+    if not path.is_file():
+        return None
+    import hashlib
+    h = hashlib.md5()
+    try:
+        with path.open("rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+    except OSError:
+        return None
+    return h.hexdigest()
+
+
+def _md5_knowledge_dir(root: Path) -> str | None:
+    """MD5 of the sorted relative-path listing under `root/knowledge/`.
+
+    Catches additions / removals / renames; doesn't compare file
+    contents (would be expensive on every install run, and content
+    drift on knowledge nodes is normal — they're meant to be edited).
+
+    Used to flag when the bundled knowledge dir has changed and needs
+    re-seeding into Weaviate. Returns None when knowledge/ is missing.
+    """
+    kd = root / STATE_HASH_KNOWLEDGE_DIR
+    if not kd.is_dir():
+        return None
+    import hashlib
+    paths: list[str] = []
+    for p in kd.rglob("*"):
+        if p.is_file():
+            try:
+                rel = p.relative_to(kd).as_posix()
+            except ValueError:
+                continue
+            paths.append(rel)
+    paths.sort()
+    h = hashlib.md5()
+    for s in paths:
+        h.update(s.encode("utf-8"))
+        h.update(b"\n")
+    return h.hexdigest()
+
+
+def _compute_state_hashes(install_path: Path) -> dict[str, str | None]:
+    """Compute MD5s of every tracked artifact under `install_path`.
+
+    Returns a dict with one key per `STATE_HASH_TARGETS` entry plus
+    `knowledge_md5`. Missing files map to None (NOT to the empty-string
+    hash) so the caller can distinguish "file gone" from "file empty".
+    """
+    out: dict[str, str | None] = {}
+    for slot, rel in STATE_HASH_TARGETS:
+        out[slot] = _md5_file(install_path / rel)
+    out["knowledge_md5"] = _md5_knowledge_dir(install_path)
+    return out
+
+
+def _record_state_hashes(install_path: Path) -> None:
+    """Snapshot the post-install state-hash set into install.jsonl.
+
+    Call this at the END of a successful install (after Step 9b /
+    Step 10) so the next run has a known-good baseline to diff against.
+    """
+    hashes = _compute_state_hashes(install_path)
+    _log_install_event(
+        "state-hashes", "ok",
+        "post-install snapshot",
+        data=hashes,
+    )
+
+
+def _load_previous_state_hashes() -> dict[str, str | None]:
+    """Return the most-recent state-hash snapshot from install.jsonl,
+    or {} if none. Like `_load_previous_choices`, only reads from the
+    most-recent session and honours the 24h stale-session rule.
+    """
+    path = _install_log_path()
+    if path is None or not path.is_file():
+        return {}
+
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+
+    events: list[dict] = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(obj, dict):
+            events.append(obj)
+
+    if not events:
+        return {}
+
+    # Find latest "state-hashes" event globally — these are written
+    # exactly once per successful install at the very end, so the
+    # latest one is always the "last good install" baseline. We do NOT
+    # apply the 24h stale rule here: a state-hash baseline from 3
+    # months ago is still a perfectly valid drift reference (the user
+    # hasn't reinstalled since then; we want to know what changed).
+    for ev in reversed(events):
+        if ev.get("step") == "state-hashes" and ev.get("phase") == "ok":
+            data = ev.get("data") or {}
+            if isinstance(data, dict):
+                return {k: v for k, v in data.items()
+                        if isinstance(k, str)}
+    return {}
+
+
+def _compute_drift(install_path: Path) -> dict[str, bool]:
+    """Compare current state hashes against the last-recorded snapshot.
+
+    Returns a bool-per-slot dict where True = "this artifact has
+    changed since the last successful install". When no previous
+    snapshot exists, returns all True (treat as fully-drifted, since
+    we have no baseline).
+
+    Used by the lightweight re-install path (Deliverable 3) to decide:
+      - requirements_txt_md5 changed → run `pip install -r ... --upgrade`
+      - cargo_lock_md5 / package_json_md5 changed → caller may want to
+        rebuild the launcher
+      - knowledge_md5 changed → re-run sync_knowledge_graph.py
+    """
+    current = _compute_state_hashes(install_path)
+    previous = _load_previous_state_hashes()
+    if not previous:
+        # No baseline — nothing to compare against. Return True for
+        # every slot so the caller falls back to full processing.
+        return {k: True for k in current}
+    out: dict[str, bool] = {}
+    for slot, cur_hash in current.items():
+        prev_hash = previous.get(slot)
+        # Two-sided None is "no change" (both absent).
+        if cur_hash is None and prev_hash is None:
+            out[slot] = False
+        else:
+            out[slot] = cur_hash != prev_hash
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Re-install file-conflict resolution
 #
 # Mirror of the Rust implementation in
@@ -705,6 +987,255 @@ def apply_conflict_strategy(
 
 
 # ---------------------------------------------------------------------------
+# Deliverable 3 (2026-04-28): lightweight re-install
+#
+# Used by the launcher when a Strategy-3 (overwrite-preserve) re-install
+# runs against an already-installed project that has a healthy `.venv/`,
+# unchanged Python deps, and matching state hashes. The full install.py
+# path takes ~1-2min on a hot system; the lightweight path skips model
+# pulls + Weaviate seed (both idempotent already) and only redoes:
+#
+#   1. Path rewrite in .env / .claude/settings.json (when the install
+#      moved or was bundled at a different path).
+#   2. Venv triage — recreate only on Python version mismatch or
+#      requirements.txt drift; otherwise leave alone.
+#   3. Container ensure (no model pull — those are shared volumes,
+#      already present).
+#
+# The lightweight mode is gated on `--lightweight`; the full path is
+# unchanged when the flag isn't passed.
+# ---------------------------------------------------------------------------
+
+# Files we rewrite paths in. Conservative — only those that commonly
+# embed an absolute install_path. Hooks under .claude/hooks/ use
+# `$(dirname "$0")` and don't need rewriting.
+LIGHTWEIGHT_PATH_REWRITE_TARGETS: tuple[str, ...] = (
+    ".env",
+    ".claude/settings.json",
+)
+
+
+def _rewrite_paths_in_file(path: Path, old_str: str, new_str: str) -> bool:
+    """Replace every literal occurrence of `old_str` with `new_str` in
+    a single text file. Returns True iff at least one replacement was
+    made. No-op if the file is missing or doesn't contain old_str.
+
+    We use literal substring replace (not regex) because the strings
+    we're rewriting are absolute filesystem paths. They may contain
+    regex metacharacters, but no user-controlled regex syntax is
+    expected.
+    """
+    if not path.is_file() or not old_str:
+        return False
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+    if old_str not in text:
+        return False
+    new_text = text.replace(old_str, new_str)
+    try:
+        path.write_text(new_text, encoding="utf-8")
+    except OSError:
+        return False
+    return True
+
+
+def _lightweight_rewrite_paths(install_path: Path,
+                              old_path: str) -> dict[str, bool]:
+    """Rewrite occurrences of `old_path` (absolute) → str(install_path)
+    in every target file under `install_path`.
+
+    Returns {relative_target: rewrote_at_least_one_occurrence}. Used
+    when a project moved on disk (e.g. user renamed the parent folder).
+
+    Idempotent: a no-op when old_path == install_path or when no target
+    file embeds the old path.
+    """
+    results: dict[str, bool] = {}
+    new_str = str(install_path)
+    if not old_path or old_path == new_str:
+        # Nothing to do; record a clean no-op for every target.
+        for rel in LIGHTWEIGHT_PATH_REWRITE_TARGETS:
+            results[rel] = False
+        return results
+    for rel in LIGHTWEIGHT_PATH_REWRITE_TARGETS:
+        results[rel] = _rewrite_paths_in_file(
+            install_path / rel, old_path, new_str,
+        )
+    return results
+
+
+def _venv_triage(install_path: Path) -> dict:
+    """Decide what to do with `<install_path>/.venv` on a lightweight
+    re-install.
+
+    Cases:
+      1. .venv missing       → action="create", recreate fully
+      2. .venv exists, Python version mismatch → action="recreate",
+         drop + recreate
+      3. .venv exists, Python OK, requirements.txt drift → action="upgrade",
+         pip install -r ... --upgrade in place
+      4. .venv exists, all matches  → action="skip"
+
+    Returns {"action": one_of(...), "reason": str, "venv_python": Path|None}.
+    The caller (`_run_lightweight`) executes the action.
+    """
+    venv = install_path / ".venv"
+    if platform.system() == "Windows":
+        venv_python = venv / "Scripts" / "python.exe"
+    else:
+        venv_python = venv / "bin" / "python"
+
+    if not venv.is_dir() or not venv_python.exists():
+        return {"action": "create", "reason": ".venv missing",
+                "venv_python": None}
+
+    # Python version check.
+    try:
+        result = subprocess.run(
+            [str(venv_python), "-c",
+             "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"],
+            capture_output=True, text=True, timeout=10,
+        )
+        venv_pyver = (result.stdout.strip()
+                      if result.returncode == 0 else "")
+    except (subprocess.SubprocessError, OSError):
+        venv_pyver = ""
+
+    expected = f"{sys.version_info.major}.{sys.version_info.minor}"
+    if not venv_pyver or venv_pyver != expected:
+        return {"action": "recreate",
+                "reason": f"Python version mismatch (.venv={venv_pyver!r}, "
+                          f"launcher={expected!r})",
+                "venv_python": None}
+
+    # Requirements drift check (uses state-hashes from Deliverable 2).
+    drift = _compute_drift(install_path)
+    if drift.get("requirements_txt_md5", True):
+        return {"action": "upgrade",
+                "reason": "requirements.txt content changed since last install",
+                "venv_python": venv_python}
+
+    return {"action": "skip", "reason": "venv healthy, no drift",
+            "venv_python": venv_python}
+
+
+def _run_lightweight(args: argparse.Namespace) -> int:
+    """Execute the lightweight re-install path.
+
+    Skips: model pulls, Weaviate seed, Joern probe, lean-ctx detection,
+    full GPU detection. Runs: path rewrite, venv triage, container
+    ensure (without seed), state-hash snapshot.
+
+    Returns the exit code (0 on success, non-zero on failure).
+    """
+    print("=" * 62)
+    print("  VibeCoded Tools — Orchestrator Lightweight Re-install")
+    print("=" * 62)
+    print(f"  install path: {PROJECT_ROOT}")
+    if args.lightweight_old_path:
+        print(f"  previous path: {args.lightweight_old_path}")
+    print()
+    _log_install_event(
+        "lightweight", "start",
+        "lightweight re-install begin",
+        data={"install_path": str(PROJECT_ROOT),
+              "old_path": args.lightweight_old_path},
+    )
+
+    # Step 1: state directory must exist before logging will hit disk.
+    _create_state_directory()
+
+    # Step 2: path rewrite in .env / .claude/settings.json
+    if args.lightweight_old_path:
+        rewrite_report = _lightweight_rewrite_paths(
+            PROJECT_ROOT, args.lightweight_old_path,
+        )
+        rewritten = [k for k, v in rewrite_report.items() if v]
+        print(f"[1/4] Path rewrite: {len(rewritten)} file(s) updated")
+        for k in rewritten:
+            print(f"        {k}")
+        _log_install_event(
+            "lightweight", "ok",
+            "path-rewrite complete",
+            data={"rewrote_files": rewritten,
+                  "all_targets": list(rewrite_report.keys())},
+        )
+    else:
+        print("[1/4] Path rewrite: skipped (no --lightweight-old-path)")
+        _log_install_event(
+            "lightweight", "skip",
+            "path-rewrite (no old path provided)",
+        )
+
+    # Step 3: venv triage
+    triage = _venv_triage(PROJECT_ROOT)
+    print(f"[2/4] Venv triage: action={triage['action']} ({triage['reason']})")
+    _log_install_event(
+        "lightweight", "ok",
+        f"venv triage: {triage['action']}",
+        data={"action": triage["action"], "reason": triage["reason"]},
+    )
+
+    if triage["action"] == "create":
+        _create_venv(PROJECT_ROOT)
+        venv_python = (PROJECT_ROOT / ".venv" /
+                       ("Scripts/python.exe" if platform.system() == "Windows"
+                        else "bin/python"))
+        _install_requirements(venv_python, dev=args.dev)
+    elif triage["action"] == "recreate":
+        # Drop the old venv first.
+        venv = PROJECT_ROOT / ".venv"
+        if venv.is_dir():
+            shutil.rmtree(venv, ignore_errors=True)
+        _create_venv(PROJECT_ROOT)
+        venv_python = (PROJECT_ROOT / ".venv" /
+                       ("Scripts/python.exe" if platform.system() == "Windows"
+                        else "bin/python"))
+        _install_requirements(venv_python, dev=args.dev)
+    elif triage["action"] == "upgrade":
+        _install_requirements(triage["venv_python"], dev=args.dev)
+    else:
+        # action == "skip"
+        pass
+
+    # Step 4: container ensure (skip model pulls + seed; both
+    # idempotent and unchanged on lightweight path).
+    if args.no_containers:
+        print("[3/4] Containers: skipped (--no-containers)")
+    else:
+        # Ensure the runtime is available, but do not pull models or
+        # reseed Weaviate. The shared-container volume already has
+        # everything; a re-install is purely about wiring this project
+        # up to point at it.
+        if sys.platform == "linux":
+            print("[3/4] Containers: assumed running (lightweight path "
+                  "doesn't probe / start them)")
+        else:
+            print("[3/4] Containers: assumed running (lightweight)")
+    _log_install_event(
+        "lightweight", "ok",
+        "containers: assume-running",
+    )
+
+    # Step 5: snapshot fresh state hashes so future drift detection
+    # has the right baseline.
+    _record_state_hashes(PROJECT_ROOT)
+    print("[4/4] State-hashes snapshot: written")
+    _log_install_event(
+        "lightweight", "ok",
+        "lightweight re-install complete",
+    )
+
+    print()
+    print("=" * 62)
+    print("  Lightweight re-install complete!")
+    print("=" * 62)
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -813,6 +1344,18 @@ def main() -> int:
                              "(should be a bundled vct-orchestrator repo with "
                              "vct-module.json). Required when --conflict-strategy "
                              "is set.")
+    parser.add_argument("--lightweight", action="store_true", default=False,
+                        help="Lightweight re-install. Skips model pulls + Weaviate "
+                             "seed (idempotent upserts already done), preserves an "
+                             "existing healthy .venv (recreates only on Python "
+                             "version mismatch or requirements.txt drift), and "
+                             "runs path-rewrite on .env / .claude/settings.json. "
+                             "Used by the launcher's per-project re-install path "
+                             "(Deliverable 3 from launch-blocker spec 2026-04-28).")
+    parser.add_argument("--lightweight-old-path", type=str, default=None,
+                        help="Used with --lightweight. The previous install path "
+                             "whose absolute occurrences in .env / settings.json "
+                             "should be rewritten to the current PROJECT_ROOT.")
     parser.add_argument("--preserve-paths",
                         type=str, default=None,
                         help="Comma-separated list of install-relative paths to "
@@ -852,6 +1395,14 @@ def main() -> int:
 
     if args.uninstall:
         return _run_uninstall(args)
+
+    # Deliverable 3 (2026-04-28): lightweight re-install path. The
+    # launcher passes --lightweight when re-running over a healthy
+    # install (matching state hashes, present .venv). Skips model
+    # pulls, Weaviate seed, full GPU detection — completes in seconds
+    # instead of minutes.
+    if args.lightweight:
+        return _run_lightweight(args)
 
     mode = "update" if args.update else "install"
 
@@ -923,6 +1474,14 @@ def main() -> int:
                 print("\n    Or re-run with --no-containers to skip.")
                 return 1
 
+        # Deliverable 2 (2026-04-28): persist the resolved runtime so
+        # re-installs don't re-prompt. This fires AFTER any optional
+        # install prompt so we capture the final value.
+        _record_install_choice(
+            "container_runtime", sysinfo.container_cmd or "none",
+            {"reason": "post-detection (incl. prompt-install if any)"},
+        )
+
         # Step 5b: probe BEFORE compose up. Honors content-based detection
         # and persists the resolution in ~/.vct/services.toml. Foreign
         # services on the canonical port either get an alt-port (default)
@@ -986,6 +1545,12 @@ def main() -> int:
 
     # Step 11: Initial code graph analysis (if repo has code)
     # Skipped on first install — user runs manually after setup
+
+    # Deliverable 2 (2026-04-28): snapshot the post-install state-hash
+    # set (requirements.txt / Cargo.lock / package.json / knowledge/).
+    # The next install run uses these to detect drift and choose
+    # between full reinstall vs lightweight reinstall (Deliverable 3).
+    _record_state_hashes(PROJECT_ROOT)
 
     # Done — mark the session complete in the durable log so the
     # launcher/Claude Code can tell at a glance that install.py reached
@@ -1687,6 +2252,12 @@ def _detect_optional_companions(args: argparse.Namespace) -> bool:
         print("            (Pass --no-lean-ctx to silence this hint.)")
 
     # Joern (CFG/PDG metrics for code graph)
+    #
+    # Deliverable 2 (2026-04-28): also persist the joern choice via
+    # `_record_install_choice`. On a re-install, `_load_previous_choices`
+    # surfaces this so the caller can short-circuit the prompt without
+    # re-detecting / re-asking. The CLI flag (--with-joern / --no-joern)
+    # always wins over a replayed choice.
     joern_path = shutil.which("joern")
     if joern_path:
         print(f"  joern:    detected at {joern_path} (code graph will include CFG/PDG metrics)")
@@ -1695,11 +2266,29 @@ def _detect_optional_companions(args: argparse.Namespace) -> bool:
             "joern already installed",
             data={"joern_path": joern_path},
         )
+        _record_install_choice("joern", True, {"reason": "pre-installed",
+                                              "joern_path": joern_path})
         return True
+
+    # Replay-eligible: if we have a recent choice and the user did NOT
+    # pass either CLI flag, honour what they picked last time.
+    prior_choices = _load_previous_choices()
+    if (not args.no_joern and not args.with_joern
+            and "joern" in prior_choices):
+        prior = prior_choices["joern"]
+        prior_value = prior.get("value")
+        if prior_value is False:
+            print("  joern:    skipped (replayed from last install)")
+            _log_install_event("2b/10", "skip",
+                               "joern skipped (replayed from last install)")
+            _record_install_choice("joern", False,
+                                   {"reason": "replayed declined"})
+            return False
 
     if args.no_joern:
         print("  joern:    skipped (--no-joern)")
         _log_install_event("2b/10", "skip", "joern skipped via --no-joern")
+        _record_install_choice("joern", False, {"reason": "user declined via flag"})
         return False
 
     if args.with_joern:
@@ -1710,6 +2299,8 @@ def _detect_optional_companions(args: argparse.Namespace) -> bool:
             "joern install (--with-joern)",
             data={"installed": installed},
         )
+        _record_install_choice("joern", bool(installed),
+                               {"reason": "user opted in via --with-joern"})
         return installed
 
     if args.quiet or not sys.stdin.isatty():
@@ -1719,6 +2310,8 @@ def _detect_optional_companions(args: argparse.Namespace) -> bool:
         print("            to install:   re-run installer with --with-joern")
         print("            to skip prompt next time:   re-run with --no-joern")
         _log_install_event("2b/10", "skip", "joern skipped (non-interactive)")
+        _record_install_choice("joern", False,
+                               {"reason": "non-interactive, no flag"})
         return False
 
     # Interactive: ask once
@@ -1729,11 +2322,14 @@ def _detect_optional_companions(args: argparse.Namespace) -> bool:
     except (EOFError, KeyboardInterrupt):
         print()
         _log_install_event("2b/10", "skip", "joern prompt cancelled")
+        _record_install_choice("joern", False, {"reason": "prompt cancelled"})
         return False
 
     if answer not in {"y", "yes"}:
         print("            Skipping. Re-run with --with-joern to install later.")
         _log_install_event("2b/10", "skip", "user declined joern install")
+        _record_install_choice("joern", False,
+                               {"reason": "user declined interactive prompt"})
         return False
 
     installed = _install_joern()
@@ -1742,6 +2338,8 @@ def _detect_optional_companions(args: argparse.Namespace) -> bool:
         "joern install (interactive)",
         data={"installed": installed},
     )
+    _record_install_choice("joern", bool(installed),
+                           {"reason": "user accepted interactive prompt"})
     return installed
 
 
@@ -1846,17 +2444,48 @@ def _install_joern() -> bool:
 
 def _choose_embedding_config(sysinfo: SystemInfo, args: argparse.Namespace) -> dict:
     # Explicit opt-ins win over auto-detection.
+    #
+    # Deliverable 2 (2026-04-28): persist the resolved choice so a
+    # re-install with no CLI flags re-uses the same mode rather than
+    # re-detecting GPU. Detection is normally fine but on machines
+    # where nvidia-smi flapped or Ollama was unreachable at first
+    # install, the user already picked a mode they want to stick.
     if args.openai_key:
         config = dict(EMBEDDING_CONFIGS["openai"])
         config["openai_key"] = args.openai_key
+        _record_install_choice("embedding_mode", "openai",
+                               {"reason": "user passed --openai-key"})
         return config
     if args.low_resource:
-        return dict(EMBEDDING_CONFIGS["low_resource"])
+        config = dict(EMBEDDING_CONFIGS["low_resource"])
+        _record_install_choice("embedding_mode", "low_resource",
+                               {"reason": "user passed --low-resource"})
+        return config
     if args.cpu_only:
-        return dict(EMBEDDING_CONFIGS["cpu"])
+        config = dict(EMBEDDING_CONFIGS["cpu"])
+        _record_install_choice("embedding_mode", "cpu",
+                               {"reason": "user passed --cpu-only"})
+        return config
+
+    # Replay-eligible: no flag and we have a recent choice.
+    prior_choices = _load_previous_choices()
+    if "embedding_mode" in prior_choices:
+        prior_value = prior_choices["embedding_mode"].get("value")
+        if prior_value in EMBEDDING_CONFIGS:
+            config = dict(EMBEDDING_CONFIGS[prior_value])
+            _record_install_choice(
+                "embedding_mode", prior_value,
+                {"reason": "replayed from last install"},
+            )
+            return config
+
     # Auto-detection: GPU → gpu config, otherwise cpu (qwen3 for both).
     if sysinfo.has_gpu:
+        _record_install_choice("embedding_mode", "gpu",
+                               {"reason": "auto-detected GPU"})
         return dict(EMBEDDING_CONFIGS["gpu"])
+    _record_install_choice("embedding_mode", "cpu",
+                           {"reason": "auto-detected no GPU"})
     return dict(EMBEDDING_CONFIGS["cpu"])
 
 
@@ -3449,6 +4078,232 @@ def _create_state_directory() -> None:
 # Step 8: Write .env
 # ---------------------------------------------------------------------------
 
+# Marker tag inserted on every line ensure_env_template appends to a
+# pre-existing .env. The tag is what makes the operation idempotent —
+# a second run sees the marker and refuses to re-append the same key.
+#
+# Format: `# added by vco YYYY-MM-DD` (date is for forensic value;
+# the *literal* `# added by vco ` substring is what the dedupe check
+# looks for).
+ENV_VCO_MARKER = "# added by vco"
+
+# Module-section delimiters for template-managed .env. When a module
+# is installed via the launcher, append a section bracketed by these
+# markers; when uninstalled (v1.1+), the section can be located and
+# removed cleanly. Keep simple for v1: append-only.
+ENV_MODULE_BLOCK_START = "# >>> module: "
+ENV_MODULE_BLOCK_END = "# <<< module: "
+
+
+def _env_canonical_template(project_name: str = "<project>",
+                            project_root: str = "<project_root>") -> list[tuple[str, str | None, str]]:
+    """Return the canonical .env template as a list of (key, default, comment).
+
+    Each entry:
+      - key: env var name (e.g. "WEAVIATE_URL")
+      - default: value to write, or None to write a commented-out placeholder
+      - comment: human-readable comment (one line, no trailing newline)
+
+    Section headers are encoded as entries with key="" and comment set.
+    Pure comment lines have key="" and default=None.
+
+    Used by both:
+      - _build_canonical_env_template_text (creating a fresh .env)
+      - _ensure_env_template (parsing the canonical key list to know
+        what's missing in an existing .env)
+
+    NOTE: The launcher's per-project values (KG_COLLECTION, PROJECT_NAME,
+    etc.) are written by `write_project_env_files` in Rust. install.py's
+    template carries placeholder values (`<project>_KnowledgeGraph`)
+    that the launcher overwrites at project-registration time.
+    """
+    return [
+        # Header banner
+        ("", None, "# vibecoded-orchestrator per-project .env"),
+        ("", None, "# Edit values to override defaults. Empty / commented lines are"),
+        ("", None, "# treated as \"use default\". Created by vco "
+                   + _utc_iso_now()[:10] + "."),
+        ("", None, ""),
+
+        # Service URLs section
+        ("", None, "# === Service URLs (uncomment to override the launcher's adopted defaults) ==="),
+        ("WEAVIATE_URL", None, "# WEAVIATE_URL=http://localhost:8081"),
+        ("WEAVIATE_PORT", None, "# WEAVIATE_PORT=8081"),
+        ("OLLAMA_URL", None, "# OLLAMA_URL=http://localhost:11435"),
+        ("OLLAMA_PORT", None, "# OLLAMA_PORT=11435"),
+        ("CODE_EMBED_URL", None, "# CODE_EMBED_URL=http://localhost:11440"),
+        ("", None, ""),
+
+        # Per-project Weaviate collections
+        ("", None, "# === Per-project Weaviate collections ==="),
+        ("", None, "# Resolved by the launcher when the project is registered. Don't"),
+        ("", None, "# edit unless you know what you're doing."),
+        ("KG_COLLECTION", f"{project_name}_KnowledgeGraph", None),
+        ("SHARED_KG_COLLECTION", "VibeCodedTools_KnowledgeGraph", None),
+        ("DEVELOPMENT_COLLECTION", f"{project_name}_Development", None),
+        ("PROJECT_NAME", project_name, None),
+        ("CONVERSATION_COLLECTION", f"{project_name}_conversations", None),
+        ("", None, ""),
+
+        # LLM API keys
+        ("", None, "# === LLM API keys (optional) ==="),
+        ("ANTHROPIC_API_KEY", None, "# ANTHROPIC_API_KEY="),
+        ("OPENAI_API_KEY", None, "# OPENAI_API_KEY="),
+        ("", None, ""),
+
+        # GitHub access
+        ("", None, "# === GitHub access for code-search MCP (optional) ==="),
+        ("GITHUB_TOKEN", None, "# GITHUB_TOKEN="),
+        ("", None, ""),
+
+        # RL retrieval (Pro tier — module section)
+        ("", None, "# === RL retrieval module (Pro tier — uncomment when installed) ==="),
+        ("RL_SERVER_URL", None, "# RL_SERVER_URL=http://localhost:8090"),
+        ("RL_SERVER_PORT", None, "# RL_SERVER_PORT=8090"),
+        ("RL_PROJECT_ROOT", None, f"# RL_PROJECT_ROOT={project_root}"),
+        ("", None, ""),
+
+        # Telemetry
+        ("", None, "# === Telemetry (off by default; on=opt-in only) ==="),
+        ("VCT_TELEMETRY", None, "# VCT_TELEMETRY=off"),
+        ("", None, ""),
+    ]
+
+
+def _build_canonical_env_template_text(project_name: str = "<project>",
+                                       project_root: str = "<project_root>") -> str:
+    """Render the canonical template to a single .env file string.
+
+    Used when no .env exists yet. Active (uncommented) keys get written
+    as `KEY=value`, optional keys as `# KEY=value` comments.
+    """
+    lines: list[str] = []
+    for key, default, comment in _env_canonical_template(project_name, project_root):
+        if not key:
+            # Pure comment / blank line.
+            lines.append(comment if comment is not None else "")
+            continue
+        if default is None:
+            # Optional key — write the commented form.
+            lines.append(comment if comment is not None else f"# {key}=")
+        else:
+            # Active key — write KEY=value.
+            lines.append(f"{key}={default}")
+    return "\n".join(lines) + "\n"
+
+
+def _parse_existing_env_keys(env_path: Path) -> set[str]:
+    """Return the set of KEY names present in an existing .env file
+    (commented or active). Used by `_ensure_env_template` to decide
+    which canonical keys are missing.
+
+    A line is considered to declare KEY iff (after lstrip + optional
+    leading "#") it matches `^KEY=`. We deliberately treat commented
+    keys as PRESENT — the user knows about them, they just chose to
+    leave the value blank. Re-appending would be noisy.
+    """
+    if not env_path.is_file():
+        return set()
+    keys: set[str] = set()
+    try:
+        for raw in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            s = raw.strip()
+            if not s:
+                continue
+            # Strip a single leading `#` and any whitespace after it.
+            if s.startswith("#"):
+                s = s[1:].lstrip()
+            # Now s should look like KEY=value (or be a pure comment we
+            # don't care about).
+            eq = s.find("=")
+            if eq <= 0:
+                continue
+            key = s[:eq].strip()
+            # Validate key shape: alnum + underscore, no spaces. Skips
+            # things like "Defaults match the podman-compose.yml ..."
+            # which would otherwise parse as an "added=" key.
+            if key and all(c.isalnum() or c == "_" for c in key) and not key[0].isdigit():
+                keys.add(key)
+    except OSError:
+        return set()
+    return keys
+
+
+def _ensure_env_template(env_path: Path, project_name: str = "<project>",
+                        project_root: str = "<project_root>") -> dict:
+    """Ensure `.env` exists and contains all canonical template keys.
+
+    Behaviour:
+      - .env missing → create from the canonical template (all optional
+        keys commented out, active keys filled with placeholders).
+      - .env exists → diff against canonical, append any missing keys
+        commented out, tagged with `# added by vco YYYY-MM-DD`.
+      - Idempotent: keys already present (commented or not) are skipped,
+        and lines already carrying the marker tag aren't re-considered.
+
+    Preserves all existing values verbatim — never overwrites a
+    user-set value.
+
+    Returns a small report dict: {"action": "created"|"appended"|"noop",
+    "added_keys": [..], "env_path": str}.
+
+    Used by:
+      - install.py Step 9 (_write_env_config integration)
+      - launcher's projects_v2::create_project_v2 (Rust mirror calls
+        Python via subprocess on lightweight re-installs; for the
+        normal create_project flow we have a dedicated Rust helper.)
+    """
+    if not env_path.exists():
+        env_path.write_text(
+            _build_canonical_env_template_text(project_name, project_root),
+            encoding="utf-8",
+        )
+        return {
+            "action": "created",
+            "added_keys": [k for k, _, _ in _env_canonical_template(project_name, project_root)
+                           if k],
+            "env_path": str(env_path),
+        }
+
+    existing_keys = _parse_existing_env_keys(env_path)
+    missing: list[tuple[str, str | None, str]] = [
+        (k, default, comment)
+        for k, default, comment in _env_canonical_template(project_name, project_root)
+        if k and k not in existing_keys
+    ]
+    if not missing:
+        return {"action": "noop", "added_keys": [], "env_path": str(env_path)}
+
+    # Append a marked block. Preserve trailing newline behaviour: if the
+    # file doesn't end with \n, add one before our block so we don't
+    # glue our header onto the user's last line.
+    today = _utc_iso_now()[:10]
+    existing_text = env_path.read_text(encoding="utf-8")
+    needs_leading_nl = (existing_text and not existing_text.endswith("\n"))
+    block_lines: list[str] = []
+    if needs_leading_nl:
+        block_lines.append("")  # joining will add a \n at start
+    block_lines.append("")
+    block_lines.append(f"{ENV_VCO_MARKER} {today}: appended missing canonical keys")
+    for key, default, comment in missing:
+        if default is None:
+            # Optional key — write the comment form (already starts with `#`).
+            line = comment if comment is not None else f"# {key}="
+        else:
+            line = f"{key}={default}"
+        block_lines.append(line)
+    block_lines.append("")  # trailing newline
+
+    with env_path.open("a", encoding="utf-8") as f:
+        f.write("\n".join(block_lines))
+
+    return {
+        "action": "appended",
+        "added_keys": [k for k, _, _ in missing],
+        "env_path": str(env_path),
+    }
+
+
 def _telemetry_consent(args: argparse.Namespace) -> bool:
     """Resolve the user's telemetry choice for the generated .env.
 
@@ -3561,14 +4416,27 @@ def _write_env_config(embed_config: dict, args: argparse.Namespace, joern_availa
         "",
     ])
 
-    # Write (don't overwrite if exists)
+    # Write (don't overwrite if exists). When the file IS already there,
+    # run the canonical-template append-merge so installs that pre-date
+    # the template (or third-party-provided .env files) pick up newer
+    # placeholder keys without losing the user's edits.
     if env_file.exists():
-        print("already exists (not overwritten)")
-        _log_install_event(
-            "9/10", "skip",
-            ".env already exists — preserved",
-            data={"env_file": str(env_file)},
-        )
+        report = _ensure_env_template(env_file)
+        if report["action"] == "appended":
+            print(f"already exists — appended {len(report['added_keys'])} canonical keys")
+            _log_install_event(
+                "9/10", "ok",
+                f".env append-merged ({len(report['added_keys'])} new keys)",
+                data={"env_file": str(env_file),
+                      "added_keys": report["added_keys"]},
+            )
+        else:
+            print("already exists (not overwritten)")
+            _log_install_event(
+                "9/10", "skip",
+                ".env already exists — preserved",
+                data={"env_file": str(env_file)},
+            )
     else:
         env_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
         if telemetry_enabled:

@@ -3,8 +3,17 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-VENV_PATH="$PROJECT_ROOT/claude_mcp_servers/.venv"
 
-# Activate venv and run script
-source "$VENV_PATH/bin/activate"
+VENV_PATH=""
+for _c in "$PROJECT_ROOT/.venv" "$PROJECT_ROOT/claude_mcp_servers/.venv"; do
+    if [ -x "$_c/bin/python" ] || [ -x "$_c/bin/python3" ]; then
+        VENV_PATH="$_c"
+        break
+    fi
+done
+
+if [ -n "$VENV_PATH" ]; then
+    source "$VENV_PATH/bin/activate"
+fi
+
 python "$SCRIPT_DIR/search_knowledge.py" "$@"

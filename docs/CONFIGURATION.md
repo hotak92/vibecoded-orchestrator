@@ -16,9 +16,42 @@ It prevents cross-contamination. Global settings apply to every project you open
 ## Setup for new users
 
 1. Copy `.vscode/settings.json.example` to `.vscode/settings.json` and adjust if needed (defaults work out of the box for a local Podman+Ollama setup).
-2. Copy `.env.example` to `.env` for shell/script use.
+2. The VCT Launcher creates a per-project `.env` from a canonical template when you register a project (see "`.env` template management" below). For non-launcher CLI users, copy `.env.example` manually.
 3. Let `install.py` wire the rest (venv, containers, KG collection creation).
 4. Launch via the VCT Launcher GUI (manages secrets, tier gating, module installs).
+
+## `.env` template management (Deliverable 1, 2026-04-28)
+
+Both `install.py` Step 9 and the launcher's `create_project_v2` Tauri command call `ensure_project_env_template` (Python: `_ensure_env_template`; Rust: `ensure_project_env_template`) on the project root. The behaviour is:
+
+- **`.env` missing** → write a fresh canonical template with all known keys. Active keys (`KG_COLLECTION`, `PROJECT_NAME`, `DEVELOPMENT_COLLECTION`, `CONVERSATION_COLLECTION`, `SHARED_KG_COLLECTION`) get values substituted from the project name. Optional keys (LLM API keys, `GITHUB_TOKEN`, RL module URLs, `VCT_TELEMETRY`) stay commented out.
+- **`.env` exists** → diff against the canonical key list. Any keys not yet present (commented or active) get appended in a marked block tagged `# added by vco YYYY-MM-DD`. The user's existing values are preserved verbatim — never overwritten.
+- **Idempotent** — a second invocation against an up-to-date file is a no-op.
+
+The Python and Rust canonical key lists are kept in lockstep by the cross-language test `env_template_canonical_keys_match_python` (in `commands/projects_v2.rs`). When you add a new key, update both `_env_canonical_template` (install.py) AND `env_canonical_keys` (projects_v2.rs).
+
+Canonical keys (as of 2026-04-28):
+
+```
+# Service URLs (commented; launcher writes resolved values into .claude/settings.json)
+WEAVIATE_URL, WEAVIATE_PORT, OLLAMA_URL, OLLAMA_PORT, CODE_EMBED_URL
+
+# Per-project Weaviate collections (active; filled at create time)
+KG_COLLECTION, SHARED_KG_COLLECTION, DEVELOPMENT_COLLECTION,
+PROJECT_NAME, CONVERSATION_COLLECTION
+
+# LLM API keys (commented)
+ANTHROPIC_API_KEY, OPENAI_API_KEY
+
+# GitHub access for code-search MCP (commented)
+GITHUB_TOKEN
+
+# RL retrieval module — Pro tier (commented)
+RL_SERVER_URL, RL_SERVER_PORT, RL_PROJECT_ROOT
+
+# Telemetry (commented; opt-in only)
+VCT_TELEMETRY
+```
 
 ## What goes in each file
 

@@ -3,12 +3,32 @@
 # Usage: code-graph-analyze /path/to/repo [OPTIONS]
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VENV_PATH="$SCRIPT_DIR/../../claude_mcp_servers/.venv"
 
-# Activate venv if it exists
-if [ -d "$VENV_PATH" ]; then
+# Probe candidate venvs in canonical-first order. install_root/.venv is
+# where install.py creates it for OSS vco installs (commit fafdc51 era);
+# claude_mcp_servers/.venv is the legacy path from the private Claude
+# orchestrator setup. The launcher invokes this script from a project's
+# folder via `<install_root>/.claude/scripts/code-graph-analyze`, so the
+# install-root .venv is two levels up from this script.
+CANDIDATES=(
+    "$SCRIPT_DIR/../../.venv"                       # vco OSS install root
+    "$SCRIPT_DIR/../../claude_mcp_servers/.venv"    # legacy Claude orch
+)
+
+VENV_PATH=""
+for c in "${CANDIDATES[@]}"; do
+    if [ -x "$c/bin/python" ] || [ -x "$c/bin/python3" ]; then
+        VENV_PATH="$c"
+        break
+    fi
+done
+
+if [ -n "$VENV_PATH" ]; then
     source "$VENV_PATH/bin/activate"
 fi
 
-# Run the Python script
+# Run the Python script. Use the venv's python if we activated one,
+# otherwise fall through to system python3 (which will fail loudly with
+# "weaviate-client not installed" rather than silently using the wrong
+# environment).
 python3 "$SCRIPT_DIR/analyze_code_graph.py" "$@"
