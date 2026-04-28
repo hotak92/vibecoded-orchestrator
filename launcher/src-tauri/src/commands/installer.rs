@@ -1101,15 +1101,32 @@ pub async fn install_orchestrator(
     }
 
     let python_cmd = &system.python_cmd;
-    let install_output = tokio::process::Command::new(python_cmd)
-        .args(&install_args)
+    let mut cmd = tokio::process::Command::new(python_cmd);
+    cmd.args(&install_args)
         // Defense-in-depth: explicitly close stdin so install.py's input()
         // calls receive EOF instead of blocking indefinitely. The --quiet
         // + --no-joern flags above should already prevent any prompt, but
         // a future code path that adds another input() would re-introduce
         // the hang. Stdin=null makes the hang impossible.
         .stdin(std::process::Stdio::null())
-        .current_dir(&install_path)
+        .current_dir(&install_path);
+
+    // Windows: suppress the transient cmd console window that pops up
+    // when Tauri (a windowed app, no console) spawns a subprocess.
+    // Without CREATE_NO_WINDOW, Windows materialises an empty cmd
+    // window for the subprocess's stdin/stdout, which the user sees
+    // as "an empty terminal window named python.exe". Reported
+    // 2026-04-28 from a Windows wizard test.
+    //
+    // CREATE_NO_WINDOW = 0x08000000. Per Microsoft docs:
+    // https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+
+    let install_output = cmd
         .output()
         .await
         .map_err(|e| format!("install.py failed to start: {}", e))?;
@@ -1190,9 +1207,16 @@ pub async fn update_orchestrator(
     emit_progress(&window, "install", "Applying updates...", 40.0);
 
     let python_cmd = &system.python_cmd;
-    let install_output = tokio::process::Command::new(python_cmd)
-        .args(["install.py", "--update"])
-        .current_dir(&install_path)
+    let mut cmd = tokio::process::Command::new(python_cmd);
+    cmd.args(["install.py", "--update"])
+        .stdin(std::process::Stdio::null())
+        .current_dir(&install_path);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    let install_output = cmd
         .output()
         .await
         .map_err(|e| format!("install.py --update failed: {}", e))?;
@@ -2307,17 +2331,31 @@ async fn check_command_exists(cmd: &str) -> bool {
 }
 
 async fn detect_python() -> (bool, String, String) {
+    // On Windows, prefer `py` (the Python launcher — bundled with
+    // python.org installer) over bare `python` because `python` on
+    // Windows can be the Microsoft Store stub at
+    // C:\Users\<u>\AppData\Local\Microsoft\WindowsApps\python.exe
+    // which redirects to the Store on first run instead of executing.
+    // `py` always points to a real interpreter when one's installed
+    // via python.org or PythonManager. Reported 2026-04-28: the wizard
+    // got stuck in "Creating…" with a flashing python.exe console
+    // window because the picked python_cmd was a Store-managed stub.
     let candidates = if cfg!(windows) {
-        vec!["python", "python3", "py"]
+        vec!["py", "python3", "python"]
     } else {
         vec!["python3.12", "python3.11", "python3", "python"]
     };
 
     for cmd in candidates {
-        let result = tokio::process::Command::new(cmd)
-            .args(["-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')"])
-            .output()
-            .await;
+        let mut tcmd = tokio::process::Command::new(cmd);
+        tcmd.args(["-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')"]);
+        // Suppress empty cmd window flash on Windows.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            tcmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+        let result = tcmd.output().await;
 
         if let Ok(output) = result {
             if output.status.success() {
