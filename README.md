@@ -4,6 +4,14 @@
 
 Open source. Runs locally. Learns from how you work.
 
+## Who this is for
+
+If you use **VS Code (or any IDE) with [Claude Code](https://claude.ai/code)** as your AI coding assistant, this is for you. The orchestrator runs **entirely in the background** — it indexes your knowledge, your codebase, your tool calls, and feeds Claude richer context every time you talk to it. **Your workflow doesn't change.** You keep writing prompts in Claude Code exactly the same way; Claude just gets persistent memory and code-aware retrieval automatically.
+
+Concretely: hooks fire when you edit files, search runs in the background, embeddings sync to a local Weaviate, agents and skills become available to Claude — and you never have to think about any of it. Open VS Code, talk to Claude, ship code. The orchestrator does its job out of sight.
+
+If you don't use Claude Code: the KG / code graph / MCPs / launcher GUI still all work standalone, but you'll get the most value when there's an AI client driving them. See the [Optional](#requirements) section.
+
 > **Requirements at a glance**
 > - **Python 3.11 or newer** (3.12 recommended; 3.13 also supported)
 > - **Docker** or **Podman**
