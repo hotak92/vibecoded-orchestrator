@@ -101,23 +101,8 @@
   <header class="project-header">
     <button
       class="back-btn"
-      onclick={() => {
-        // Try browser-history back first; if it doesn't actually move
-        // (no prior entry, or popstate cancelled), the URL stays the
-        // same and we fall through to /. We schedule the fallback on
-        // a microtask so popstate has a chance to fire. If the user
-        // truly has prior history (came from /codegraph or the home
-        // grid), back() returns them there. If not (deep-link, fresh
-        // launch), we land on /.
-        const before = window.location.href;
-        history.back();
-        setTimeout(() => {
-          if (window.location.href === before) {
-            goto('/');
-          }
-        }, 50);
-      }}
-      aria-label="Back"
+      onclick={() => goto('/projects')}
+      aria-label="Back to projects list"
     >
       ← Back
     </button>

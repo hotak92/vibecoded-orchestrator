@@ -19,7 +19,7 @@
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
   import { invoke } from '$lib/tauri';
-  import { selectedProject } from '$lib/stores/projects';
+  import { selectedProject, projects } from '$lib/stores/projects';
   import { toast } from '$lib/stores/toast';
   import Toast from '$lib/components/Toast.svelte';
   import NoProjectBanner from '$lib/components/NoProjectBanner.svelte';
@@ -82,22 +82,34 @@
   let assignError = $state<string | null>(null);
 
   async function openAssign(s: CodegraphProjectSummary) {
-    if (s.access !== 'write') {
-      toast.error('You can only change access on codegraphs you own.');
-      return;
-    }
+    // Open the modal regardless of which project is currently "active"
+    // in the launcher. The cross-project access dropdown was previously
+    // gated on s.access === 'write' (i.e. the active project owns this
+    // codegraph) but that restriction is purely cosmetic — there's no
+    // security boundary between projects on the same local machine,
+    // and forcing the user to switch active context first to grant
+    // read access is friction without payoff. Reported 2026-04-28.
+    //
+    // We DO need to know which project owns this codegraph (it's
+    // the grantor in codegraph_grant_access). Resolve it from the
+    // prefix via the project list.
     assignModalFor = s;
     assignError = null;
     assignChecked = new Set();
     try {
       assignAllProjects = await invoke<Array<{ id: string; name: string }>>('list_projects_v2');
-      // Pre-fill: query existing grants for this owner project. Best
+      const owner = assignAllProjects.find((p) => p.name === s.project_name);
+      if (!owner) {
+        assignError = `No project record found for codegraph prefix "${s.prefix}". The Weaviate collection exists but the launcher DB has no matching project — recreate the project to manage access.`;
+        return;
+      }
+      // Pre-fill: query existing grants for the owner project. Best
       // effort — if codegraph_list_access isn't available we silently
       // start with an empty set.
       try {
         const matrix = await invoke<{ allowed?: Array<{ id: string }>; can_read_from?: Array<{ id: string }> }>(
           'codegraph_list_access',
-          { projectId: assignModalFor!.prefix },
+          { projectId: owner.id },
         ).catch(() => null) as any;
         if (matrix?.allowed) {
           assignChecked = new Set(matrix.allowed.map((p: any) => p.id));
@@ -115,13 +127,19 @@
   }
 
   async function saveAssign() {
-    if (!assignModalFor || !acting) return;
+    if (!assignModalFor) return;
     assignSaving = true;
     assignError = null;
     try {
-      // Resolve owner project_id from the prefix (the summary doesn't
-      // carry it but we know acting writes it ⇒ owner is acting).
-      const ownerId = acting.id;
+      // Resolve owner from the card (NOT from acting) — the user can
+      // manage access on any of their codegraphs from this dashboard
+      // regardless of which project is currently "active".
+      const owner = assignAllProjects.find((p) => p.name === assignModalFor!.project_name);
+      if (!owner) {
+        assignError = `No project record found for "${assignModalFor.project_name}".`;
+        return;
+      }
+      const ownerId = owner.id;
       // For each candidate project: if checked → grant read; if
       // unchecked but was previously granted → revoke (access_level
       // = "none"). We send all of them in parallel.
@@ -156,7 +174,7 @@
 
 <div class="cg-page">
   <header class="cg-header">
-    <button class="cg-back" onclick={() => history.back()}>← Back</button>
+    <button class="cg-back" onclick={() => goto('/projects')}>← Back</button>
     <h1>Code Graph</h1>
     <button class="cg-refresh" onclick={load} disabled={loading}>
       {loading ? 'Loading…' : 'Refresh'}
@@ -195,11 +213,9 @@
           </div>
           <p class="cg-card-total">{totalEntities(s)} entities total</p>
           <div class="cg-card-actions">
-            {#if s.access === 'write'}
-              <button class="cg-btn" onclick={() => openAssign(s)}>
-                Assign access…
-              </button>
-            {/if}
+            <button class="cg-btn" onclick={() => openAssign(s)}>
+              Assign access…
+            </button>
           </div>
         </article>
       {/each}
@@ -223,7 +239,7 @@
         <p class="cg-modal-error">{assignError}</p>
       {/if}
       <ul class="cg-modal-list">
-        {#each assignAllProjects.filter((p) => p.id !== acting?.id) as p (p.id)}
+        {#each assignAllProjects.filter((p) => p.name !== assignModalFor?.project_name) as p (p.id)}
           <li>
             <label>
               <input
@@ -235,7 +251,7 @@
             </label>
           </li>
         {/each}
-        {#if assignAllProjects.filter((p) => p.id !== acting?.id).length === 0}
+        {#if assignAllProjects.filter((p) => p.name !== assignModalFor?.project_name).length === 0}
           <li class="cg-modal-empty">
             No other projects to grant access to.
           </li>
@@ -246,7 +262,7 @@
         <button
           class="cg-btn cg-btn-primary"
           onclick={saveAssign}
-          disabled={assignSaving || assignAllProjects.filter((p) => p.id !== acting?.id).length === 0}
+          disabled={assignSaving || assignAllProjects.filter((p) => p.name !== assignModalFor?.project_name).length === 0}
         >
           {assignSaving ? 'Saving…' : 'Save'}
         </button>
