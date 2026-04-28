@@ -106,3 +106,4 @@ claude_mcp_servers/runs/
 
 # Internal Lemon Squeezy inventory snapshots (contain customer/store IDs)
 docs/license/LS_INVENTORY_*.md
+docs/ADMIN_LICENSE.md

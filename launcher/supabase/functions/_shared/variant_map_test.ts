@@ -98,15 +98,15 @@ Deno.test("lookupVariant: static map fallback when not admin", () => {
 // Vault-token admin path (separate from Bug 33 LS-variant path)
 // ────────────────────────────────────────────────────────────────────────────
 
-const TEST_TOKEN_MARTINO = "vct_admin_" + "x".repeat(64);
-const TEST_TOKEN_FABIO   = "vct_admin_" + "y".repeat(64);
+const TEST_TOKEN_ALICE = "vct_admin_" + "x".repeat(64);
+const TEST_TOKEN_BOB   = "vct_admin_" + "y".repeat(64);
 const TEST_MACHINE_HASH  = "a".repeat(64);
 const OTHER_MACHINE_HASH = "b".repeat(64);
 const NOW_ISO = "2026-04-26T20:00:00Z";
 
 const SAMPLE_VAULT = JSON.stringify({
-  martino: { token: TEST_TOKEN_MARTINO, expires_at: null, machine_id_hash: null },
-  fabio:   { token: TEST_TOKEN_FABIO,   expires_at: "2026-12-31T00:00:00Z", machine_id_hash: TEST_MACHINE_HASH },
+  alice: { token: TEST_TOKEN_ALICE, expires_at: null, machine_id_hash: null },
+  bob:   { token: TEST_TOKEN_BOB,   expires_at: "2026-12-31T00:00:00Z", machine_id_hash: TEST_MACHINE_HASH },
 });
 
 Deno.test("constantTimeEq: equal strings", () => {
@@ -130,14 +130,14 @@ Deno.test("lookupVaultAdminToken: missing prefix returns null (fast path)", () =
 
 Deno.test("lookupVaultAdminToken: null vault JSON returns null", () => {
   assertEquals(
-    lookupVaultAdminToken(TEST_TOKEN_MARTINO, TEST_MACHINE_HASH, null),
+    lookupVaultAdminToken(TEST_TOKEN_ALICE, TEST_MACHINE_HASH, null),
     null,
   );
 });
 
 Deno.test("lookupVaultAdminToken: malformed JSON returns null", () => {
   assertEquals(
-    lookupVaultAdminToken(TEST_TOKEN_MARTINO, TEST_MACHINE_HASH, "not json"),
+    lookupVaultAdminToken(TEST_TOKEN_ALICE, TEST_MACHINE_HASH, "not json"),
     null,
   );
 });
@@ -150,46 +150,46 @@ Deno.test("lookupVaultAdminToken: token not in map returns null", () => {
 });
 
 Deno.test("lookupVaultAdminToken: TOFU bind on unbound user", () => {
-  const r = lookupVaultAdminToken(TEST_TOKEN_MARTINO, TEST_MACHINE_HASH, SAMPLE_VAULT, NOW_ISO);
+  const r = lookupVaultAdminToken(TEST_TOKEN_ALICE, TEST_MACHINE_HASH, SAMPLE_VAULT, NOW_ISO);
   assertEquals(r, {
-    user: "martino",
+    user: "alice",
     outcome: "success",
     bind_machine_hash: TEST_MACHINE_HASH,
   });
 });
 
 Deno.test("lookupVaultAdminToken: bound user matching machine succeeds", () => {
-  const r = lookupVaultAdminToken(TEST_TOKEN_FABIO, TEST_MACHINE_HASH, SAMPLE_VAULT, NOW_ISO);
-  assertEquals(r, { user: "fabio", outcome: "success" });
+  const r = lookupVaultAdminToken(TEST_TOKEN_BOB, TEST_MACHINE_HASH, SAMPLE_VAULT, NOW_ISO);
+  assertEquals(r, { user: "bob", outcome: "success" });
 });
 
 Deno.test("lookupVaultAdminToken: bound user from a different machine rejects", () => {
-  const r = lookupVaultAdminToken(TEST_TOKEN_FABIO, OTHER_MACHINE_HASH, SAMPLE_VAULT, NOW_ISO);
-  assertEquals(r, { user: "fabio", outcome: "machine_mismatch" });
+  const r = lookupVaultAdminToken(TEST_TOKEN_BOB, OTHER_MACHINE_HASH, SAMPLE_VAULT, NOW_ISO);
+  assertEquals(r, { user: "bob", outcome: "machine_mismatch" });
 });
 
 Deno.test("lookupVaultAdminToken: expired token rejects (regardless of machine)", () => {
   const expiredVault = JSON.stringify({
-    stale: { token: TEST_TOKEN_MARTINO, expires_at: "2026-01-01T00:00:00Z", machine_id_hash: TEST_MACHINE_HASH },
+    stale: { token: TEST_TOKEN_ALICE, expires_at: "2026-01-01T00:00:00Z", machine_id_hash: TEST_MACHINE_HASH },
   });
-  const r = lookupVaultAdminToken(TEST_TOKEN_MARTINO, TEST_MACHINE_HASH, expiredVault, NOW_ISO);
+  const r = lookupVaultAdminToken(TEST_TOKEN_ALICE, TEST_MACHINE_HASH, expiredVault, NOW_ISO);
   assertEquals(r, { user: "stale", outcome: "expired" });
 });
 
 Deno.test("lookupVaultAdminToken: future expiration is fine", () => {
   const futureVault = JSON.stringify({
-    user: { token: TEST_TOKEN_MARTINO, expires_at: "2099-01-01T00:00:00Z", machine_id_hash: TEST_MACHINE_HASH },
+    user: { token: TEST_TOKEN_ALICE, expires_at: "2099-01-01T00:00:00Z", machine_id_hash: TEST_MACHINE_HASH },
   });
-  const r = lookupVaultAdminToken(TEST_TOKEN_MARTINO, TEST_MACHINE_HASH, futureVault, NOW_ISO);
+  const r = lookupVaultAdminToken(TEST_TOKEN_ALICE, TEST_MACHINE_HASH, futureVault, NOW_ISO);
   assertEquals(r, { user: "user", outcome: "success" });
 });
 
 Deno.test("lookupVaultAdminToken: malformed entry (missing token field) is skipped", () => {
   const badVault = JSON.stringify({
     user1: { /* no token */ expires_at: null, machine_id_hash: null },
-    user2: { token: TEST_TOKEN_MARTINO, expires_at: null, machine_id_hash: null },
+    user2: { token: TEST_TOKEN_ALICE, expires_at: null, machine_id_hash: null },
   });
-  const r = lookupVaultAdminToken(TEST_TOKEN_MARTINO, TEST_MACHINE_HASH, badVault, NOW_ISO);
+  const r = lookupVaultAdminToken(TEST_TOKEN_ALICE, TEST_MACHINE_HASH, badVault, NOW_ISO);
   // user2 still matches; user1 is skipped
   assertEquals(r?.user, "user2");
 });
@@ -197,7 +197,7 @@ Deno.test("lookupVaultAdminToken: malformed entry (missing token field) is skipp
 Deno.test("lookupVaultAdminToken: array (not object) at top level returns null", () => {
   // Defensive: malformed Vault content shouldn't crash
   assertEquals(
-    lookupVaultAdminToken(TEST_TOKEN_MARTINO, TEST_MACHINE_HASH, JSON.stringify([1, 2, 3])),
+    lookupVaultAdminToken(TEST_TOKEN_ALICE, TEST_MACHINE_HASH, JSON.stringify([1, 2, 3])),
     null,
   );
 });

@@ -27,3 +27,5 @@ Thumbs.db
 
 # Supabase CLI temp
 supabase/.temp/
+
+.mcp.json

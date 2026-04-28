@@ -262,6 +262,6 @@
   },
   "_env_comment": "Set VCT_DISABLE_HOOKS=1 in your shell to opt out of all hooks for that shell (e.g. when debugging). Set it in .vscode/settings.json claude-code.env to disable per-project.",
   "env": {
-    "BASH_ENV": "/home/martino/Desktop/PROGETTI/vibecoded-orchestrator/.claude/scripts/leanctx-bash-env.sh"
+    "BASH_ENV": "${CLAUDE_PROJECT_DIR}/.claude/scripts/leanctx-bash-env.sh"
   }
 }
