@@ -127,14 +127,14 @@ jobs:
           fi
           ls -lh "$dist"
 
-      # Upload the binary + metadata as Release assets. softprops/action-gh-release@v2
+      # Upload the binary + metadata as Release assets. softprops/action-gh-release@v3
       # auto-creates the release on tag push if it doesn't exist yet, and
       # is a no-op for workflow_dispatch runs without a tag (files still
       # show up as workflow artifacts via the separate upload-artifact
       # step below — useful for dry-runs).
       - name: Upload to GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             launcher/dist/${{ matrix.target }}/${{ matrix.binary }}
