@@ -172,20 +172,19 @@
 
 <div class="cg-page">
   <header class="cg-header">
-    <button class="cg-back" onclick={() => goto('/')}>← Back</button>
+    <button class="cg-back" onclick={() => history.back()}>← Back</button>
     <h1>Code Graph</h1>
     {#if !acting}
       <span class="cg-warn">No project selected.</span>
     {:else}
-      <label class="cg-target">
-        <span>Target:</span>
-        <div class="cg-target-dd">
-          <Dropdown
-            options={availableTargets.map((p) => ({ value: p.id, label: p.name }))}
-            bind:value={targetId}
-          />
-        </div>
-      </label>
+      <!-- Target dropdown removed 2026-04-28: route is already
+           project-scoped (active project = the only valid target);
+           cross-project codegraph viewing is gated by the access
+           control we already enforce server-side. If we ever
+           reintroduce cross-project viewing, restore the Dropdown
+           with availableTargets filtered to projects the user has
+           explicit read access to. -->
+      <span class="cg-target-label">{acting.name}</span>
       <button class="cg-load" onclick={loadGraph} disabled={loading}>
         {loading ? 'Loading…' : 'Load graph'}
       </button>
