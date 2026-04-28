@@ -56,7 +56,10 @@ def test_detect_vision_capability_never_raises_on_failure(monkeypatch):
     assert cap["ram_gb"] == 8.0
     assert cap["vram_gb"] is None
     assert cap["has_gpu"] is False
-    # 8 GB RAM < 12 GB threshold for qwen3.5:9b → preferred_backend is "none"
+    # 8 GB RAM < 24 GB threshold for qwen3.5:9b → preferred_backend is "none"
+    # (threshold raised 2026-04-28; 16 GB machines were OOMing on 9b VLM
+    # because the previous 12 GB raw-spec threshold ignored OS+services
+    # overhead in real-world desktop usage.)
     assert cap["preferred_backend"] == "none"
 
 
@@ -66,7 +69,7 @@ def _cap(has_gpu: bool, vram_gb, ram_gb: float, backend: str = None):
     if backend is None:
         if has_gpu and vram_gb is not None and vram_gb >= 7.5:
             backend = "gpu"
-        elif ram_gb >= 12.0:
+        elif ram_gb >= 24.0:
             backend = "cpu"
         else:
             backend = "none"
@@ -76,29 +79,39 @@ def _cap(has_gpu: bool, vram_gb, ram_gb: float, backend: str = None):
         "ram_gb": ram_gb,
         "preferred_backend": backend,
         "smallest_vram_required_gb": 7.5,
-        "smallest_ram_required_gb": 12.0,
+        "smallest_ram_required_gb": 24.0,
     }
 
 
 def test_qwen35_9b_fits_with_8gb_vram():
-    # Practical threshold for qwen3.5:9b is 7.5 GB → 8 GB GPU passes.
+    # Practical threshold for qwen3.5:9b is 7.5 GB VRAM → 8 GB GPU passes.
+    # RAM threshold (24 GB) only used for CPU fallback path.
     assert server._model_fits("qwen3.5:9b", _cap(True, 8.0, 16.0)) is True
 
 
 def test_qwen35_9b_does_not_fit_55gb_vram_low_ram():
     # 5.5 GB VRAM is below 7.5 GB threshold → GPU path fails.
-    # 8 GB RAM is below 12 GB threshold → CPU path also fails.
+    # 8 GB RAM is below 24 GB threshold → CPU path also fails.
     assert server._model_fits("qwen3.5:9b", _cap(True, 5.5, 8.0)) is False
 
 
 def test_qwen35_7b_fits_with_6gb_vram():
-    # qwen3.5:7b threshold is 6.0 GB.
+    # qwen3.5:7b threshold is 6.0 GB VRAM. 12 GB RAM doesn't matter
+    # when GPU passes.
     assert server._model_fits("qwen3.5:7b", _cap(True, 6.0, 12.0)) is True
 
 
 def test_no_gpu_high_ram_falls_back_to_cpu():
-    # 0 GB GPU + 16 GB RAM → CPU OK for qwen3.5:9b (12 GB threshold).
-    assert server._model_fits("qwen3.5:9b", _cap(False, None, 16.0)) is True
+    # 0 GB GPU + 24 GB RAM → CPU OK for qwen3.5:9b (24 GB threshold).
+    assert server._model_fits("qwen3.5:9b", _cap(False, None, 24.0)) is True
+
+
+def test_16gb_ram_skips_9b_vlm():
+    # Regression guard 2026-04-28: 16 GB user OOMed when read_image
+    # tried to load qwen3.5:9b. With the practical RAM threshold raised
+    # to 24 GB, _model_fits now correctly refuses the model on a 16 GB
+    # CPU-only machine.
+    assert server._model_fits("qwen3.5:9b", _cap(False, None, 16.0)) is False
 
 
 def test_no_gpu_low_ram_does_not_fit():
