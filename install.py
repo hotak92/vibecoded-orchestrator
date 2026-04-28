@@ -2142,14 +2142,98 @@ def _find_lean_ctx_binary() -> str | None:
     return None
 
 
+def _resolve_vendored_lean_ctx() -> Path | None:
+    """Look for a repo-vendored lean-ctx binary matching this host's
+    arch. We ship prebuilts under `vendor/lean-ctx/<arch>/lean-ctx[.exe]`
+    so users on Windows (where `cargo install lean-ctx` takes 5-10 min
+    of cold Rust compile) can skip the build entirely. Mirrors the
+    `launcher/dist/<arch>/` convention.
+
+    Returns the absolute path to the vendored binary if it exists,
+    None otherwise. Caller decides whether to copy it into a PATH
+    location or run it in place.
+
+    Vendor convention:
+      vendor/lean-ctx/windows-x64/lean-ctx.exe   (Windows x86_64)
+      vendor/lean-ctx/linux-x64/lean-ctx         (Linux x86_64)
+      vendor/lean-ctx/experimental_macOS/lean-ctx (macOS, both archs)
+    """
+    os_name = platform.system()
+    if os_name == "Windows":
+        arch_dir = "windows-x64"
+        bin_name = "lean-ctx.exe"
+    elif os_name == "Darwin":
+        arch_dir = "experimental_macOS"
+        bin_name = "lean-ctx"
+    elif os_name == "Linux":
+        arch_dir = "linux-x64"
+        bin_name = "lean-ctx"
+    else:
+        return None
+    candidate = PROJECT_ROOT / "vendor" / "lean-ctx" / arch_dir / bin_name
+    if candidate.is_file():
+        return candidate
+    return None
+
+
+def _install_vendored_lean_ctx() -> str | None:
+    """Copy the repo-vendored lean-ctx binary into a PATH-resolvable
+    location so `shutil.which("lean-ctx")` picks it up post-install.
+
+    Linux/macOS: target ~/.local/bin/lean-ctx (already on most users'
+    PATH; rustup adds it if cargo is installed).
+    Windows: target %USERPROFILE%\\.cargo\\bin\\lean-ctx.exe (cargo's
+    canonical bin dir; cargo adds it to PATH; install.py's
+    _resolve_lean_ctx already probes this dir as a fallback).
+
+    Returns the destination path on success, None if no vendored
+    prebuilt was found or the copy failed. Idempotent — re-copies
+    even if a stale older version is already at the destination.
+    """
+    src = _resolve_vendored_lean_ctx()
+    if src is None:
+        return None
+    os_name = platform.system()
+    if os_name == "Windows":
+        dest_dir = Path.home() / ".cargo" / "bin"
+        dest = dest_dir / "lean-ctx.exe"
+    else:
+        dest_dir = Path.home() / ".local" / "bin"
+        dest = dest_dir / "lean-ctx"
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
+        if os_name != "Windows":
+            os.chmod(dest, 0o755)
+        return str(dest)
+    except (OSError, shutil.Error) as e:
+        print(f"  lean-ctx: failed to copy vendored prebuilt: {e}")
+        return None
+
+
 def _maybe_install_lean_ctx(args: argparse.Namespace) -> str | None:
     """Auto-install lean-ctx if a supported package manager is present.
 
-    Tries Homebrew → Cargo → AUR. Returns the resolved binary path on
-    success, None otherwise. Auto-install only runs in --yes / non-TTY
-    contexts (real users get a prompt). The lean-ctx project ships via:
-    https://github.com/yvgude/lean-ctx — see Installation section.
+    Order of attempts:
+      1. Repo-vendored prebuilt (vendor/lean-ctx/<arch>/) — fastest
+         path. Saves the ~5-10 min cargo build on Windows. Skipped if
+         no prebuilt for this host arch.
+      2. Homebrew tap (macOS / Linuxbrew).
+      3. Cargo install (any host with rustup).
+      4. AUR helpers (Arch Linux).
+
+    Returns the resolved binary path on success, None otherwise.
+    Auto-install runs in --yes / non-TTY contexts; real users get a
+    prompt. lean-ctx project: https://github.com/yvgude/lean-ctx
     """
+    # Step 1: try vendored prebuilt first. No prompt needed — the
+    # binary is already in the repo, we just copy it. Silent on
+    # failure (caller falls through to package-manager paths).
+    vendored = _install_vendored_lean_ctx()
+    if vendored:
+        print(f"  lean-ctx: installed from vendored prebuilt → {vendored}")
+        return vendored
+
     # T1 silent (with --yes / non-TTY). T3 prompt for interactive.
     silent = bool(args.yes or not sys.stdin.isatty())
 
