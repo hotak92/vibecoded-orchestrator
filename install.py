@@ -1921,7 +1921,14 @@ def _print_gpu_hint(os_name: str) -> None:
 
 def _detect_container_runtime() -> str:
     """Detect Docker or Podman. Prefer Podman everywhere — no commercial
-    license required, increasingly native on macOS/Windows."""
+    license required, increasingly native on macOS/Windows.
+
+    Returns:
+      - "podman" or "docker" if a runtime is present AND its daemon
+        responds to `version`/`info` (i.e. it can actually run containers).
+      - "" if neither runtime is on PATH OR the daemon isn't responding.
+        Caller distinguishes the two cases via `_detect_installed_runtime()`.
+    """
     candidates = ["podman", "docker"]
 
     for cmd in candidates:
@@ -1934,6 +1941,24 @@ def _detect_container_runtime() -> str:
                     return cmd
             except (subprocess.TimeoutExpired, OSError):
                 continue
+    return ""
+
+
+def _detect_installed_runtime() -> str:
+    """Lightweight presence check — returns the FIRST container-runtime
+    binary on PATH regardless of whether its daemon is running.
+
+    Use case: `_detect_container_runtime()` returned "" (no working
+    runtime) but we want to give a better message than "install Podman/
+    Docker" if one IS installed, just stopped. On Windows specifically,
+    Docker Desktop ships `docker.exe` on PATH but `docker version` fails
+    until the user opens Docker Desktop from the Start Menu.
+
+    Returns "" when neither binary is on PATH.
+    """
+    for cmd in ("podman", "docker"):
+        if shutil.which(cmd):
+            return cmd
     return ""
 
 
@@ -1964,6 +1989,32 @@ def _prompt_install_container_runtime(args: argparse.Namespace) -> bool:
       - Homebrew:         https://brew.sh
     """
     os_name = platform.system()
+
+    # First: distinguish "not installed" from "installed but daemon
+    # not running". On Windows in particular Docker Desktop installs
+    # docker.exe on PATH but the daemon stays stopped until the user
+    # opens Docker Desktop from the Start Menu / system tray; calling
+    # `docker version` fails with the same exit code as truly-absent
+    # docker, which made our earlier message misleading. Reported
+    # 2026-04-28: "PC had docker, but not currently running".
+    installed = _detect_installed_runtime()
+    if installed:
+        print(f"\n[!] {installed} is installed but its daemon isn't responding.")
+        if os_name == "Windows" and installed == "docker":
+            print("    Open Docker Desktop from the Start Menu or system tray,")
+            print("    wait for the whale icon to settle (~30 seconds), then re-run install.")
+        elif os_name == "Darwin" and installed == "docker":
+            print("    Open Docker Desktop from /Applications, wait for the whale")
+            print("    icon to settle (~30 seconds), then re-run install.")
+        elif installed == "podman":
+            print("    Start the Podman machine (Linux: systemctl --user start podman.socket;")
+            print("    macOS / Windows: podman machine start), then re-run install.")
+        else:
+            print("    Start the Docker daemon (`sudo systemctl start docker` on Linux),")
+            print("    then re-run install.")
+        print("    Or re-run with --no-containers to skip container setup.")
+        return False
+
     print("\n[!] No container runtime found. The orchestrator needs Podman or Docker.")
 
     non_interactive = bool(args.yes) or not sys.stdin.isatty() or bool(args.quiet)
