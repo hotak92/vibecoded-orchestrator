@@ -76,12 +76,67 @@ if [ ! -d node_modules ]; then
     fi
 fi
 
-# Build with --no-bundle (we ship the binary, not the installer bundle).
-echo "[build-bundled] $PKG_MGR tauri build --no-bundle"
+# Build the SvelteKit frontend EXPLICITLY first. Don't rely on Tauri's
+# `beforeBuildCommand` — it silently no-ops if package-manager resolution
+# differs between dev/CI runs, leaving `launcher/build/` empty. An empty
+# frontendDist produces a release binary with no embedded assets, which
+# loads as "Could not connect to localhost" at runtime (regression
+# observed at commit 5abb8cf, 2026-04-28).
+echo "[build-bundled] $PKG_MGR run build (SvelteKit frontend)"
 if [ "$PKG_MGR" = "pnpm" ]; then
-    pnpm tauri build --no-bundle
+    pnpm run build
 else
+    npm run build
+fi
+
+# Sanity-check: frontend assets MUST exist before tauri build embeds them.
+if [ ! -f "$LAUNCHER_DIR/build/index.html" ] || \
+   ! ls "$LAUNCHER_DIR/build/_app/immutable/assets/" >/dev/null 2>&1; then
+    echo "[build-bundled] FATAL: launcher/build/ is empty or missing _app/immutable/assets/." >&2
+    echo "                Frontend build produced no output. Aborting before tauri build." >&2
+    exit 1
+fi
+echo "[build-bundled] frontend assets present ($(ls "$LAUNCHER_DIR/build/_app/immutable/assets/" | wc -l) files)"
+
+# Build with --no-bundle (we ship the binary, not the installer bundle).
+# `npx` isn't always present on minimal Node installs (the user's
+# `~/.local/bin/node` install on 2026-04-28 had `npm` but no `npx`).
+# Prefer the locally-installed `node_modules/.bin/tauri` — that's what
+# both pnpm and npx ultimately exec — falling back to package-manager
+# wrappers if the local bin isn't there.
+LOCAL_TAURI_BIN="$LAUNCHER_DIR/node_modules/.bin/tauri"
+echo "[build-bundled] tauri build --no-bundle"
+if [ -x "$LOCAL_TAURI_BIN" ]; then
+    "$LOCAL_TAURI_BIN" build --no-bundle
+elif [ "$PKG_MGR" = "pnpm" ]; then
+    pnpm tauri build --no-bundle
+elif command -v npx >/dev/null 2>&1; then
     npx tauri build --no-bundle
+else
+    # Last resort: `npm exec` (npm 7+) — equivalent to npx for local bins.
+    npm exec --no -- tauri build --no-bundle
+fi
+
+# Sanity-check: the built binary MUST contain references to embedded
+# SvelteKit assets. If `strings` finds zero `_app/immutable/assets/`
+# matches, the frontend was NOT embedded (Tauri's frontendDist was empty
+# or unreadable at build time). Refuse to stage a broken binary.
+RELEASE_DIR="$SRC_TAURI/target/release"
+PROBE_BIN=""
+for cand in vct-launcher vct-launcher-temp launcher; do
+    if [ -x "$RELEASE_DIR/$cand" ]; then
+        PROBE_BIN="$RELEASE_DIR/$cand"
+        break
+    fi
+done
+if [ -n "$PROBE_BIN" ]; then
+    EMBEDDED_COUNT=$(strings "$PROBE_BIN" 2>/dev/null | grep -c '_app/immutable/assets' || true)
+    if [ "${EMBEDDED_COUNT:-0}" -lt 5 ]; then
+        echo "[build-bundled] FATAL: built binary has $EMBEDDED_COUNT '_app/immutable/assets' refs (expected >=5)." >&2
+        echo "                Frontend was NOT embedded. Refusing to stage. Investigate." >&2
+        exit 1
+    fi
+    echo "[build-bundled] embedded asset refs: $EMBEDDED_COUNT (passes sanity check)"
 fi
 
 # Find what was actually built. Tauri may produce vct-launcher-temp during

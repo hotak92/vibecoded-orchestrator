@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# .githooks/pre-commit — Refuse to commit a broken bundled launcher binary.
+#
+# Activated by: git config core.hooksPath .githooks
+# Or run ./scripts/install-githooks.sh once per clone.
+#
+# Why: a bundled binary built without an embedded SvelteKit frontend
+# compiles fine but renders "Could not connect to localhost" at startup
+# (regressed at 5abb8cf, 2026-04-28). Every user who pulled HEAD got a
+# non-functional launcher. This hook prevents the same class of break
+# from being committed again.
+#
+# Only triggers when the commit touches `launcher/dist/`. Other commits
+# pass through unchanged. Bypass with --no-verify if you understand
+# what you're doing (e.g. removing a binary).
+
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+
+# Are any staged files under launcher/dist/?
+if ! git diff --cached --name-only --diff-filter=ACM | grep -qE '^launcher/dist/.+/(vct-launcher|launcher)(\.exe)?$'; then
+    exit 0  # nothing relevant; pass through
+fi
+
+echo "[pre-commit] launcher/dist/ binary touched — running check-bundled-binaries.sh"
+if ! bash "$REPO_ROOT/scripts/check-bundled-binaries.sh"; then
+    echo "" >&2
+    echo "[pre-commit] REFUSED: bundled binary lacks embedded frontend." >&2
+    echo "             Rebuild with: bash scripts/build-bundled-launcher.sh" >&2
+    echo "             Or bypass (NOT RECOMMENDED): git commit --no-verify" >&2
+    exit 1
+fi

@@ -449,6 +449,24 @@ _bundled_binary_is_fresh() {
         return 0  # not in a git checkout (tarball install) — trust the bundle
     fi
     if [ "$meta_hash" = "$live_hash" ]; then
+        # Hash matches but the binary may still be broken — a build that
+        # ran with an empty `launcher/build/` produces a release binary
+        # that compiles fine but has NO embedded frontend, leaving the
+        # webview to fail with "Could not connect to localhost" at
+        # startup. This regressed in 5abb8cf (2026-04-28). Sanity-check
+        # that embedded SvelteKit assets are present before trusting the
+        # binary. `strings` is part of binutils — present on every
+        # supported host with a Rust toolchain. If absent, skip the
+        # check (don't false-fail on minimal containers).
+        if command -v strings >/dev/null 2>&1; then
+            local embedded_count
+            embedded_count="$(strings "$bin" 2>/dev/null | grep -c '_app/immutable/assets' || true)"
+            if [ "${embedded_count:-0}" -lt 5 ]; then
+                echo "[launcher] ${bin##*/} hash matches but frontend is NOT embedded (found $embedded_count asset refs, expected >=5)."
+                echo "           Refusing to trust — bundled binary was built with an empty launcher/build/."
+                return 1
+            fi
+        fi
         return 0
     fi
     echo "[launcher] ${bin##*/} is stale (built from a different launcher source)"
