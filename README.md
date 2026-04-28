@@ -55,11 +55,12 @@ If the GUI fails to open or shows an empty window, see [docs/TROUBLESHOOTING.md]
 
 Brand-new machine, no Python, no Node, no container runtime? Two ways to start:
 
-> **Platform support**: Linux is the validated path. macOS is **experimental Tier-2** —
-> minimal smoke testing on Apple Silicon. Windows is Tier-3 (CI-built but not interactively
-> tested). On macOS expect to run `xattr -dr com.apple.quarantine .` after extracting a
-> downloaded zip, and to install Homebrew + Python 3.11+ before the installer proceeds. See
-> [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for the full list of platform caveats.
+> **Platform support**: Linux + Windows are both **validated** end-to-end on real
+> machines (install + launcher build + first project create + tab navigation). macOS is
+> **experimental Tier-2** — script-ready but no bundled binary yet (build from source on
+> macOS works with the existing scripts). On macOS expect to run `xattr -dr com.apple.quarantine .`
+> after extracting a downloaded zip, and to install Homebrew + Python 3.11+ before the
+> installer proceeds. See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for the full list of platform caveats.
 >
 > If `bash first-install.sh` fails partway through, paste the prompt from
 > [`docs/INSTALL_RECOVERY.md`](docs/INSTALL_RECOVERY.md) into Claude Code — it walks Claude
@@ -111,8 +112,8 @@ You use Claude Code the way you already do. The orchestrator runs in the backgro
 
 - **Knowledge Graph** — Markdown nodes with typed WikiLinks, indexed in Weaviate with semantic embeddings (qwen3 1024-dim by default; optional OpenAI)
 - **Code Graph** — AST analysis via Tree-sitter across 10+ languages: `CodeModule`, `CodeClass`, `CodeFunction`, `CodeAPI`, `CodeInteraction`
-- **20 automation hooks** — SessionStart through Stop: context injection, auto-sync on file edits, credential scans, KG/code-graph maintenance. The hooks live in this repo's `.claude/hooks/` and fire when you work inside the orchestrator project. Per-target-project hook distribution is on the roadmap; today, `install.py` copies agents and skills into `.claude/`, but not hooks.
-- **4 MCP servers** — Weaviate (semantic search), Ollama (local LLM + embeddings), search (web + code + arXiv), code-embedding (CodeSage-Large-v2 via FastAPI)
+- **20 automation hooks** — SessionStart through Stop: context injection, auto-sync on file edits, credential scans, KG/code-graph maintenance. `install.py` copies the hooks into the project's `.claude/hooks/` and merges the hook registrations into `.claude/settings.json`.
+- **4 MCP servers** — Weaviate (semantic search), Ollama (local LLM + embeddings + **vision-aware image reading via qwen3.5:9b** + document summarization via `read_document`), search (web + code + arXiv), code-embedding (CodeSage-Large-v2 via FastAPI). All run locally; no per-tool API keys required for the default tier.
 - **19 free agents + 28 skills** — shipped via `install.py` templates. The opt-in MAO add-on installs 10 more specialist agents.
 - **Workflow plumbing** — session state tracking, plans, memory management, compaction-preserving context replay
 
