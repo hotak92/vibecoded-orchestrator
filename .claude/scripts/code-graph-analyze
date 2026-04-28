@@ -10,9 +10,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # orchestrator setup. The launcher invokes this script from a project's
 # folder via `<install_root>/.claude/scripts/code-graph-analyze`, so the
 # install-root .venv is two levels up from this script.
+#
+# When a project was registered against an existing folder via the
+# launcher's "Browse" flow, the project itself has no venv. The
+# launcher passes its own install root as VCT_INSTALL_ROOT — that's
+# where weaviate-client + the analyzer deps actually live. Fixed
+# 2026-04-28 after Agape codegraph build failed with "weaviate-client
+# not installed" because Agape/Code had neither .venv nor
+# claude_mcp_servers/.venv.
 CANDIDATES=(
-    "$SCRIPT_DIR/../../.venv"                       # vco OSS install root
-    "$SCRIPT_DIR/../../claude_mcp_servers/.venv"    # legacy Claude orch
+    "$SCRIPT_DIR/../../.venv"                          # vco OSS install root
+    "$SCRIPT_DIR/../../claude_mcp_servers/.venv"       # legacy Claude orch
+    "${VCT_INSTALL_ROOT:-}/.venv"                      # launcher-provided install root
+    "${VCT_INSTALL_ROOT:-}/claude_mcp_servers/.venv"   # launcher-provided legacy path
 )
 
 VENV_PATH=""

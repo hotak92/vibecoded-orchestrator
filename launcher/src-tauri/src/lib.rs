@@ -173,6 +173,7 @@ pub fn run() {
             commands::licensing::license_deactivate,
             // KG dashboard
             commands::kg::kg_list_collections,
+            commands::kg::codegraph_list_projects,
             commands::kg::kg_set_collection_access,
             commands::kg::kg_load_graph,
             commands::kg::kg_search,

@@ -37,12 +37,33 @@ pub struct KgCollectionAccess {
     pub is_shared: bool,
 }
 
+/// Heuristic: returns true for the codegraph entity classes
+/// (`<Prefix>_CodeModule|CodeClass|CodeFunction|CodeAPI|CodeInteraction`).
+/// Used by the KG dashboard to filter codegraph classes OUT (they
+/// belong on the dedicated /codegraph route), and by the codegraph
+/// dashboard to filter them IN.
+fn is_codegraph_class(name: &str) -> bool {
+    matches!(
+        name.rsplit_once('_').map(|(_, suffix)| suffix),
+        Some("CodeModule")
+            | Some("CodeClass")
+            | Some("CodeFunction")
+            | Some("CodeAPI")
+            | Some("CodeInteraction")
+    )
+}
+
 /// List all Weaviate collections along with this project's access level.
 ///
 /// A collection appears in the result if Weaviate has it AND the project
 /// has an explicit access row OR the collection is the declared shared
 /// cross-project one (`sharedVCT` by convention, matches the
 /// `SHARED_KG_COLLECTION` setting).
+///
+/// Filters OUT codegraph entity classes (`<Prefix>_CodeFunction` etc.) —
+/// those live in the dedicated /codegraph dashboard. Mixing them into
+/// the KG card grid produced 25+ tiles per project where most were
+/// duplicates of the same codebase. Reported 2026-04-28.
 #[command]
 pub async fn kg_list_collections(
     project_id: String,
@@ -89,6 +110,11 @@ pub async fn kg_list_collections(
         if name.is_empty() {
             continue;
         }
+        // Skip codegraph entity classes — they belong on /codegraph,
+        // not in the KG card grid. See is_codegraph_class doc.
+        if is_codegraph_class(&name) {
+            continue;
+        }
         let access = grants
             .get(&name)
             .cloned()
@@ -110,6 +136,133 @@ pub async fn kg_list_collections(
     }
     // Alphabetical, shared collections first.
     out.sort_by(|a, b| b.is_shared.cmp(&a.is_shared).then(a.name.cmp(&b.name)));
+    Ok(out)
+}
+
+// ─── Codegraph dashboard listing ─────────────────────────────────────────
+
+/// One project's codegraph footprint: the prefix + total entity count
+/// across all five namespaced classes (CodeModule + CodeClass +
+/// CodeFunction + CodeAPI + CodeInteraction). The five classes share
+/// settings (one prefix, one embedding model) so we render one card
+/// per project on the codegraph dashboard, not five.
+#[derive(Debug, Serialize)]
+pub struct CodegraphProjectSummary {
+    /// Project's bare name (e.g. "Agape", "VideoFrames"). Used as the
+    /// dashboard card heading.
+    pub project_name: String,
+    /// Sanitized prefix used for namespacing the five classes
+    /// (e.g. "Agape" → `Agape_CodeFunction`). Empty if the project
+    /// has no codegraph_binding row yet.
+    pub prefix: String,
+    pub module_count: u32,
+    pub class_count: u32,
+    pub function_count: u32,
+    pub api_count: u32,
+    pub interaction_count: u32,
+    /// Acting project's access level: "read" | "write" | "none". For
+    /// the project's OWN codegraph this is always "write".
+    pub access: String,
+}
+
+/// Scan Weaviate for codegraph classes, group them by prefix (= project),
+/// and return one summary row per project. Used by the /codegraph
+/// dashboard's card grid. The acting project sees its own codegraph
+/// (always "write") plus any others it's been granted read access to
+/// via the codegraph access table.
+#[command]
+pub async fn codegraph_list_projects(
+    project_id: String,
+    db: State<'_, Db>,
+) -> Result<Vec<CodegraphProjectSummary>, String> {
+    let client = weaviate_client()?;
+    let schema_resp = client
+        .get(format!("{}/v1/schema", weaviate_url()))
+        .send()
+        .await
+        .map_err(|e| format!("weaviate /v1/schema: {}", e))?;
+    if !schema_resp.status().is_success() {
+        return Err(format!("weaviate returned {}", schema_resp.status().as_u16()));
+    }
+    let schema: serde_json::Value = schema_resp
+        .json()
+        .await
+        .map_err(|e| format!("schema parse: {}", e))?;
+    let classes = schema
+        .get("classes")
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    // Group <Prefix>_<Suffix> classes by Prefix.
+    let mut by_prefix: std::collections::HashMap<String, std::collections::HashMap<String, u32>> =
+        std::collections::HashMap::new();
+    for cls in classes {
+        let name = cls
+            .get("class")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if name.is_empty() || !is_codegraph_class(&name) {
+            continue;
+        }
+        if let Some((prefix, suffix)) = name.rsplit_once('_') {
+            let count = fetch_class_count(&client, &name).await.unwrap_or(0);
+            by_prefix
+                .entry(prefix.to_string())
+                .or_default()
+                .insert(suffix.to_string(), count);
+        }
+    }
+
+    // Resolve access: the acting project's own codegraph is "write";
+    // others depend on db.codegraph_check (returns Some("read") if
+    // granted). Resolve project name from the prefix by looking up
+    // project_codegraph_bindings — if no row, fall back to the prefix.
+    let acting = db.get_project(&project_id)?;
+    let mut out: Vec<CodegraphProjectSummary> = Vec::new();
+    for (prefix, counts) in by_prefix {
+        // Find which project owns this prefix (best effort).
+        let owner_project_id = db
+            .find_project_by_codegraph_prefix(&prefix)
+            .ok()
+            .flatten();
+        let access = if let Some(ref owner_id) = owner_project_id {
+            if owner_id == &project_id {
+                "write".to_string()
+            } else {
+                db.codegraph_check(owner_id, &project_id)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| "none".to_string())
+            }
+        } else {
+            // No owner row found — the prefix exists in Weaviate but the
+            // launcher DB has no record. Show as "none" so the user can
+            // see it but can't browse without explicit access.
+            "none".to_string()
+        };
+        let project_name = owner_project_id
+            .as_ref()
+            .and_then(|id| acting.as_ref().filter(|p| &p.id == id).map(|p| p.name.clone()))
+            .unwrap_or_else(|| prefix.clone());
+        out.push(CodegraphProjectSummary {
+            project_name,
+            prefix: prefix.clone(),
+            module_count: counts.get("CodeModule").copied().unwrap_or(0),
+            class_count: counts.get("CodeClass").copied().unwrap_or(0),
+            function_count: counts.get("CodeFunction").copied().unwrap_or(0),
+            api_count: counts.get("CodeAPI").copied().unwrap_or(0),
+            interaction_count: counts.get("CodeInteraction").copied().unwrap_or(0),
+            access,
+        });
+    }
+    // Acting project's own codegraph first, then alphabetical.
+    out.sort_by(|a, b| {
+        let a_own = a.access == "write";
+        let b_own = b.access == "write";
+        b_own.cmp(&a_own).then(a.project_name.cmp(&b.project_name))
+    });
     Ok(out)
 }
 
