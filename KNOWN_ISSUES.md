@@ -47,7 +47,47 @@ flagging for early adopters and the next iteration.
       `knowledge/concepts/`. None affect correctness; the install completes successfully.
       Vocabulary cleanup of seed nodes is a v0.1.1 chore.
 
+## Pending v0.1.x
+
+- [ ] **Custom MCP tab is not populated by initial project registration** — `project_state_populate`
+      mirrors `.claude/settings.json::mcpServers` into the launcher's per-project DB on `create_project_v2`,
+      but doesn't flag user-added entries (anything beyond bundled `weaviate-kg` / `ollama` / `search` /
+      `code-embedding`) as `is_user_added=true`. Tab reads with that filter so user-added servers show up
+      blank. Workaround: re-add via the launcher's "Add MCP" button (writes the row with the correct flag),
+      or click Refresh on the MCP tab. Fix on v0.1.x backlog.
+
+- [ ] **Apple Developer enrollment / notarization pending** — already in this list under Install/first-run;
+      tracked as v0.1.1 priority. Without notarization the macOS `.dmg` requires manual Gatekeeper override.
+
+- [ ] **Lightweight Rust wiring for `--lightweight` re-install** — the Python path is shipped (`install.py
+      --lightweight` skips model pulls + seeding + agent/skill copy; `--lightweight-old-path` rewrites
+      absolute paths in settings/env files). The launcher's "Reinstall" button currently calls full install;
+      wiring it to the lightweight path is a v0.1.x polish item.
+
 ## Recently fixed
+
+- **Project tabs empty after wizard** — `create_project_v2` registered the project but didn't populate the
+  per-project state DB; Hooks / MCP / Agents / Skills tabs read from that DB and showed empty until the
+  next launcher session triggered a manual refresh. Fixed in `03eb485` by adding `project_state_populate`
+  step at the tail of `create_project_v2`.
+
+- **Browse button silently fails to open folder picker** — earlier wizard builds dynamically imported
+  `@tauri-apps/plugin-dialog`. Vite couldn't bundle a dynamic import, so the dialog plugin code was missing
+  at runtime; clicking Browse fired the import, errored silently, and nothing happened. Fixed in `2c3429d`
+  with static imports.
+
+- **`vct` CLI hung when launcher tab opened a Cargo test page in the browser** — fixed alongside the CLI
+  rename to `vco` (kg/codegraph search hub-routed via `/cli/*` HTTP API; doesn't shell out to launcher).
+
+- **Wizard offered onboarding step on top of an existing install** — the launcher now self-detects an
+  existing `vibecoded-orchestrator` install at the chosen path and skips onboarding. Step 4 inline-install
+  path also handles `InstallConflictError` cleanly via the conflict modal (commits `260d156`, `fafdc51`).
+
+- **Re-install over an existing `.claude/` had no clear path** — earlier "skip if exists" logic left the
+  user wedged. Replaced with the **conflict modal**: 4 strategies (`delete-claude` / `overwrite-all` /
+  `overwrite-preserve` / `adopt-as-is`) with `overwrite-preserve` as the safe default. Preserved files
+  surface a Claude self-merge contract via a marker block in `.claude/CONTEXT_STATE.md`. Shipped in
+  `e801590`.
 
 - **Joern installer ignored `--dir` flag, post-install detection failed** — install.py probed only
   the directory we asked the installer to use. Recent Joern installers ignore `--dir` and land at

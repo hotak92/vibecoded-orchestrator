@@ -60,6 +60,37 @@ Alternatively, run from a terminal:
 bash first-install.sh
 ```
 
+### Browse button doesn't open a folder picker
+
+Resolved in commit `2c3429d`. Earlier wizard builds dynamically imported `@tauri-apps/plugin-dialog`, which Vite couldn't bundle — clicking Browse silently failed. Static imports were the fix.
+
+If you still see this on a build older than `2c3429d`, pull the latest:
+
+```bash
+git pull
+bash first-install.sh --lightweight
+```
+
+(`--lightweight` skips model pulls and KG seeding; only re-resolves the launcher build.)
+
+### Project tabs (Hooks / MCP / Agents / Skills) appear empty after registration
+
+Resolved in commit `03eb485`. Earlier launcher builds registered projects without populating the per-project state DB; the tabs read from that DB and showed "no entries" until the next launcher session triggered a manual refresh.
+
+Click the **Refresh** button on the affected tab if you're on a build before `03eb485` and don't want to re-clone. New registrations on current builds populate immediately.
+
+(Custom MCP servers added via `.claude/settings.json` outside the launcher's "Add MCP" flow are still skipped by the initial populate — known gap on the v0.1.x backlog. Workaround: re-add via the launcher's "Add MCP" button, or click **Refresh** on the MCP tab.)
+
+### Bundled launcher binary is stale (built from a different launcher source)
+
+`first-install.*` ships a prebuilt Linux x64 launcher binary at `launcher/dist/linux-x64/vct-launcher` (~30 MB). The installer compares its `source_hash` (in `vct-launcher.metadata.json` alongside it) against the live `launcher/` subtree — if they differ, the binary is treated as stale and the installer falls through to the download / build menu.
+
+If you see "Bundled binary is stale, will try download/build" the bundled binary is older than the `launcher/` source you cloned. This is the expected behavior — your cloned `launcher/` is ahead of the bundled snapshot. Either:
+
+- **Build from source** (option 2 in the menu): clean, ~5-15 min, requires Node + Tauri toolchain.
+- **Download from Releases** (option 1, default): fast, but won't include uncommitted launcher source changes.
+- **Rebuild the bundle locally** (contributors): `bash scripts/build-bundled-launcher.sh` rebuilds the bundled binary + metadata at the current HEAD.
+
 ### Shell-function wrappers shadow `node` / `npm` / `pnpm`
 
 Tools like `lean-ctx`, `asdf`, `fnm`, `nvm`, and `corepack` install shell functions that wrap `node` / `npm` / `pnpm`. `command -v node` reports them as present, but `node --version` may fail (the wrapper resolves to a non-binary, or the underlying binary doesn't exist).

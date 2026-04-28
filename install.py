@@ -2349,6 +2349,13 @@ def _install_joern() -> bool:
     Returns True on success, False on failure (non-fatal — the orchestrator
     works fine without Joern).
 
+    Platform support: the upstream installer is a `.sh` script (POSIX
+    bash). It works on Linux + macOS. On Windows we surface a manual-
+    install URL — joernio.github.io ships a separate Windows install
+    path (Scoop / direct download) that this installer doesn't drive.
+    The orchestrator works fine without Joern; CFG/PDG metrics just won't
+    populate in the code graph.
+
     Security note: this downloads and executes a remote shell script from
     joernio/joern's GitHub releases. The transport is HTTPS (cert-validated)
     and the source is the official upstream. We add basic sanity checks
@@ -2357,6 +2364,17 @@ def _install_joern() -> bool:
     pinned hash for `latest`. Users who want stronger guarantees should
     install Joern themselves first (then we just detect it).
     """
+    # Windows: no .sh installer support. Skip with a manual-install URL.
+    # Joern works on Windows via Scoop or direct download from the GitHub
+    # release, but driving those paths is post-v1.0; for now we just tell
+    # the user where to go.
+    if platform.system() == "Windows":
+        print("            Joern auto-install is not supported on Windows.")
+        print("            Manual install (any one):")
+        print("              Scoop:    scoop install joern")
+        print("              Direct:   https://github.com/joernio/joern/releases/latest")
+        print("              Then re-run install.py and Joern will be detected on PATH.")
+        return False
     print("            Installing Joern (this can take 5-10 minutes — downloads ~600 MB JVM-based binaries)...")
     print("            Note: the Joern installer may open a browser tab if a JDK is missing on your system.")
     print("            Streaming installer output below; press Ctrl+C to abort.")
