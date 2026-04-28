@@ -20,6 +20,7 @@
   import ChangelogModal from '$lib/components/ChangelogModal.svelte';
   import ExternalServicesDialog from '$lib/components/ExternalServicesDialog.svelte';
   import NoContainerRuntimeDialog from '$lib/components/NoContainerRuntimeDialog.svelte';
+  import InstallHealthGate from '$lib/components/InstallHealthGate.svelte';
   import Toast from '$lib/components/Toast.svelte';
   import { selectedProject, projects } from '$lib/stores/projects';
   import { startChangePoller, onChange } from '$lib/stores/changes';
@@ -174,6 +175,11 @@
   <ChangelogModal bind:open={showChangelog} />
   <ExternalServicesDialog />
   <NoContainerRuntimeDialog />
+  <!-- Highest-priority gate: blocks the UI when the launcher binary is
+       running from inside an install root that never had first-install
+       executed. Self-bypasses in developer mode and once the user has
+       acknowledged it. Mounted last so it stacks above every other modal. -->
+  <InstallHealthGate />
   <Toast />
   <AdminBadge />
 {/if}

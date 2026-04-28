@@ -2638,6 +2638,118 @@ fn derive_install_state(events: &[InstallEvent]) -> InstallState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Install health gate.
+//
+// Concern: when we publish a GitHub Release with the launcher .exe attached,
+// users may download the .exe directly and skip first-install.{bat,sh,command}.
+// The .exe alone won't have a working orchestrator behind it (no Python venv,
+// no Docker/Podman containers, no MCP registration, no .env). This check runs
+// once at app startup and surfaces a blocking modal when the binary is
+// running from inside what should-be an install root but the install never
+// actually ran.
+//
+// Discriminators (see `check_install_health` below):
+//   - .venv/                        → Python deps installed
+//   - state/                        → durable install log dir created
+//   - claude_mcp_servers/.venv/     → MCP server venv installed
+//   - .env with KG_COLLECTION line  → orchestrator config present
+//
+// Developer-mode bypass: if we cannot locate an install root by walking up
+// from current_exe() (i.e. running `cargo run` / `pnpm tauri dev` from the
+// launcher subdir, no install context anywhere up the tree), the FE-facing
+// `all_ok` is set to true so the modal never fires for devs.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallHealth {
+    /// Resolved install-root path the check was run against, if found.
+    /// None means we are in developer mode (no install root up the tree).
+    pub install_root: Option<String>,
+    /// `.venv/` directory exists in install root.
+    pub has_venv: bool,
+    /// `state/` directory exists in install root.
+    pub has_state_dir: bool,
+    /// `.env` exists AND contains a `KG_COLLECTION` line.
+    pub has_env_with_kg: bool,
+    /// `claude_mcp_servers/` exists AND its `.venv/` exists.
+    pub mcp_servers_ok: bool,
+    /// True when every signal passes, OR when we are in developer mode
+    /// (no install root found). False only when we are clearly inside an
+    /// install root but the install never ran.
+    pub all_ok: bool,
+}
+
+/// Walk up from `current_exe()` looking for an orchestrator install root.
+/// Unlike `find_local_repo_root` (which keys on `vct-module.json`, present
+/// in any checkout — bundled or installed), this looks for the marker pair
+/// `install.py` + `CLAUDE.md` which is what gets copied into a user's
+/// install destination by `copy_orchestrator_to_sync`. Returns None when
+/// the binary lives outside any plausible install root (typical dev path:
+/// `target/debug/launcher` from the launcher subdir).
+fn find_install_root_from_exe() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let mut current = exe.parent()?.to_path_buf();
+    for _ in 0..10 {
+        if current.join("install.py").is_file() && current.join("CLAUDE.md").is_file() {
+            return Some(current);
+        }
+        if !current.pop() {
+            break;
+        }
+    }
+    None
+}
+
+/// Inspect a candidate install root and report which install signals are
+/// present. Pure function over `&Path` so the unit test can drive it
+/// against a tmpdir without touching the real filesystem.
+fn inspect_install_health_at(root: &Path) -> InstallHealth {
+    let has_venv = root.join(".venv").is_dir();
+    let has_state_dir = root.join("state").is_dir();
+
+    let env_path = root.join(".env");
+    let has_env_with_kg = match std::fs::read_to_string(&env_path) {
+        Ok(contents) => contents
+            .lines()
+            .any(|line| line.trim_start().starts_with("KG_COLLECTION")),
+        Err(_) => false,
+    };
+
+    let mcp_dir = root.join("claude_mcp_servers");
+    let mcp_servers_ok = mcp_dir.is_dir() && mcp_dir.join(".venv").is_dir();
+
+    let all_ok = has_venv && has_state_dir && has_env_with_kg && mcp_servers_ok;
+
+    InstallHealth {
+        install_root: Some(root.to_string_lossy().to_string()),
+        has_venv,
+        has_state_dir,
+        has_env_with_kg,
+        mcp_servers_ok,
+        all_ok,
+    }
+}
+
+/// Frontend-facing entry point. Resolves the install root from the running
+/// binary's location and inspects it. When no install root is found
+/// (developer mode), returns `all_ok: true` so the modal never fires.
+#[command]
+pub fn check_install_health() -> InstallHealth {
+    match find_install_root_from_exe() {
+        Some(root) => inspect_install_health_at(&root),
+        None => InstallHealth {
+            install_root: None,
+            has_venv: false,
+            has_state_dir: false,
+            has_env_with_kg: false,
+            mcp_servers_ok: false,
+            // Developer mode: no install root → don't gate.
+            all_ok: true,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3976,5 +4088,88 @@ MemAvailable:   23456789 kB
         let s = chrono_iso_z();
         assert!(s.ends_with("Z"));
         assert_eq!(s.len(), 20); // YYYY-MM-DDTHH:MM:SSZ
+    }
+
+    // ---- check_install_health predicate ---------------------------------
+    //
+    // The .exe-only install scenario: a user downloads the launcher binary
+    // from a GitHub Release and skips first-install. The four signals must
+    // all flip to true for `all_ok` to fire; missing any one of them is
+    // sufficient evidence the install never ran.
+
+    #[test]
+    fn test_inspect_install_health_incomplete_dir() {
+        let p = tmp();
+        // Plant ONLY the install-root markers (CLAUDE.md + install.py)
+        // so the path looks like an install root, but none of the four
+        // post-install signals are present.
+        fs::write(p.join("CLAUDE.md"), "# claude\n").unwrap();
+        fs::write(p.join("install.py"), "# install\n").unwrap();
+
+        let health = inspect_install_health_at(&p);
+        assert_eq!(health.install_root, Some(p.to_string_lossy().to_string()));
+        assert!(!health.has_venv);
+        assert!(!health.has_state_dir);
+        assert!(!health.has_env_with_kg);
+        assert!(!health.mcp_servers_ok);
+        assert!(!health.all_ok);
+        fs::remove_dir_all(&p).ok();
+    }
+
+    #[test]
+    fn test_inspect_install_health_complete_dir() {
+        let p = tmp();
+        fs::write(p.join("CLAUDE.md"), "# claude\n").unwrap();
+        fs::write(p.join("install.py"), "# install\n").unwrap();
+        fs::create_dir_all(p.join(".venv")).unwrap();
+        fs::create_dir_all(p.join("state")).unwrap();
+        fs::write(
+            p.join(".env"),
+            "FOO=bar\nKG_COLLECTION=ClaudeKnowledgeGraph\n",
+        )
+        .unwrap();
+        fs::create_dir_all(p.join("claude_mcp_servers").join(".venv")).unwrap();
+
+        let health = inspect_install_health_at(&p);
+        assert!(health.has_venv);
+        assert!(health.has_state_dir);
+        assert!(health.has_env_with_kg);
+        assert!(health.mcp_servers_ok);
+        assert!(health.all_ok);
+        fs::remove_dir_all(&p).ok();
+    }
+
+    #[test]
+    fn test_inspect_install_health_env_without_kg_line() {
+        // .env is present but missing the KG_COLLECTION key — must NOT
+        // count as healthy.
+        let p = tmp();
+        fs::create_dir_all(p.join(".venv")).unwrap();
+        fs::create_dir_all(p.join("state")).unwrap();
+        fs::write(p.join(".env"), "FOO=bar\nBAZ=qux\n").unwrap();
+        fs::create_dir_all(p.join("claude_mcp_servers").join(".venv")).unwrap();
+
+        let health = inspect_install_health_at(&p);
+        assert!(!health.has_env_with_kg);
+        assert!(!health.all_ok);
+        fs::remove_dir_all(&p).ok();
+    }
+
+    #[test]
+    fn test_inspect_install_health_mcp_dir_without_venv() {
+        // claude_mcp_servers/ exists but its .venv/ does not — must NOT
+        // count as healthy. This is the "user copied the source tree but
+        // never ran the MCP server bootstrap" failure mode.
+        let p = tmp();
+        fs::create_dir_all(p.join(".venv")).unwrap();
+        fs::create_dir_all(p.join("state")).unwrap();
+        fs::write(p.join(".env"), "KG_COLLECTION=Foo\n").unwrap();
+        fs::create_dir_all(p.join("claude_mcp_servers")).unwrap();
+        // .venv intentionally absent inside claude_mcp_servers/
+
+        let health = inspect_install_health_at(&p);
+        assert!(!health.mcp_servers_ok);
+        assert!(!health.all_ok);
+        fs::remove_dir_all(&p).ok();
     }
 }

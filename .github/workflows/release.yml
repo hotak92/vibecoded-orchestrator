@@ -1,39 +1,32 @@
-# Release workflow — Stage 8 multi-OS shipping (2026-04-26).
+# Release workflow — Stage 8 multi-OS shipping (rev. 2026-04-28).
 #
-# Triggers on tag push (v*), produces per-OS launcher artifacts, and
-# uploads them to the GitHub release. Does NOT replace ci.yml (that's
-# the per-PR fast lane); this is the slow per-tag pipeline.
+# Triggers:
+#   - Tag push matching v*.*.* (e.g. v0.1.0) → cuts a GitHub Release.
+#   - Manual workflow_dispatch → useful for dry-runs / re-cutting artifacts.
 #
-# What we ship per OS:
-#   - Linux:   .AppImage (portable) + .deb (system install). Both come
-#              out of `tauri build` for free on ubuntu-latest. Primary
-#              is .AppImage; .deb is the convenience for Debian/Ubuntu.
-#   - Windows: portable .exe. We grab the raw binary from
-#              src-tauri/target/release/, NOT the NSIS installer Tauri
-#              also produces. User direction (Stage 8): "a simple
-#              portable .exe to launch the launcher". WebView2 is
-#              downloaded on first run via Tauri's bootstrapper if
-#              missing (almost never on Win10 21H1+/Win11). Unsigned
-#              for v0.1.0 — SmartScreen warning is documented in README.
-#   - macOS:   .dmg. EXPERIMENTAL — we have no Mac to test on (Stage 8
-#              constraint). Built best-effort on macos-latest (which is
-#              currently macos-14 on Apple Silicon, M1). Unsigned and
-#              un-notarized: macOS Gatekeeper will quarantine on first
-#              open. README documents the `xattr -cr` workaround. Apple
-#              Developer enrollment is on the post-launch backlog.
+# What we ship per OS (v0.1.0 launch matrix):
+#   - Linux x64 (ubuntu-latest):    vct-launcher        + .metadata.json
+#   - Windows x64 (windows-latest): vct-launcher.exe    + .metadata.json
 #
-# macOS gotcha research (canonical at time of writing, 2026-04):
-#   - Without notarization, .dmg downloads pick up the
-#     com.apple.quarantine xattr → Gatekeeper says "app is damaged".
-#     Workaround: `xattr -cr /Applications/VCT\ Launcher.app`.
-#   - Universal binary (Intel + Apple Silicon) requires the
-#     `aarch64-apple-darwin` AND `x86_64-apple-darwin` Rust targets
-#     installed AND `--target universal-apple-darwin`. We ship
-#     architecture-specific artifacts (Apple Silicon only via macos-14
-#     runner) for v0.1.0 to keep the matrix simple. Intel users will
-#     have to wait for v0.1.1 OR build from source. Documented in README.
-#   - WebKit on macOS has no known Tauri 2 blockers as of 2026-04.
-#   - LaunchServices registers the .app once it's dragged to /Applications.
+# macOS is INTENTIONALLY out of this CI matrix for v0.1.0 — labeled
+# Tier-2 experimental, built locally on Martino's Mac and uploaded
+# manually to the release. Adding macos-latest here would burn billing
+# minutes on a target we cannot validate from this dev box. Tracked
+# for re-inclusion in v0.1.1 alongside code signing / notarization.
+#
+# Build is driven by `bash scripts/build-bundled-launcher.sh` — the
+# SAME script maintainers run locally. It does:
+#   1. npm/pnpm install + run build (SvelteKit frontend) — explicit, NOT
+#      relying on Tauri's beforeBuildCommand which has silently no-op'd
+#      under mismatched package managers (regression 2026-04-28).
+#   2. tauri build --no-bundle (we ship the raw binary, not installers).
+#   3. POST-BUILD asset-ref check — refuses to stage a binary with <5
+#      `_app/immutable/` refs (catches the "Could not connect to
+#      localhost" empty-frontend regression at commit 5abb8cf).
+#   4. Stage to launcher/dist/<host_target>/<binary> + .metadata.json
+#      (source_sha, source_hash, built_at, launcher_version, etc.).
+# Reusing the script keeps CI and local builds bit-identical and means
+# the embedded-frontend safety check ALSO runs in CI — not just locally.
 #
 # Code signing (Windows AuthentiCode + Apple Developer ID) is OUT OF
 # SCOPE for v0.1.0. Tracked separately for v0.1.1.
@@ -43,39 +36,30 @@ name: Release
 on:
   push:
     tags:
-      - "v*"
+      - "v*.*.*"
+  workflow_dispatch:
 
 permissions:
   contents: write  # needed to attach artifacts to the release
 
 jobs:
   build:
-    name: Build (${{ matrix.os }})
+    name: Build (${{ matrix.target }})
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
-            artifact_glob: |
-              launcher/src-tauri/target/release/bundle/appimage/*.AppImage
-              launcher/src-tauri/target/release/bundle/deb/*.deb
+            target: linux-x64
+            binary: vct-launcher
           - os: windows-latest
-            artifact_glob: |
-              launcher/src-tauri/target/release/vct-launcher-temp.exe
-          - os: macos-latest
-            artifact_glob: |
-              launcher/src-tauri/target/release/bundle/dmg/*.dmg
+            target: windows-x64
+            binary: vct-launcher.exe
 
     runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: launcher/src-tauri
 
       - uses: actions/setup-node@v4
         with:
@@ -83,7 +67,21 @@ jobs:
           cache: npm
           cache-dependency-path: launcher/package-lock.json
 
-      # Tauri 2 Linux build deps. Same set as ci.yml.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: launcher/src-tauri
+
+      # Tauri 2 Linux build deps. Mirror the set in scripts/build-bundled-launcher.sh
+      # docs and ci.yml so a CI failure here matches what a contributor would
+      # hit running the script on a fresh Ubuntu box. `build-essential`,
+      # `curl`, `wget`, `file` are required by Tauri's bundler chain even
+      # under --no-bundle (file is used for ELF detection).
       - name: Install Tauri Linux deps
         if: matrix.os == 'ubuntu-latest'
         run: |
@@ -94,70 +92,61 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev \
             libsoup-3.0-dev \
-            libjavascriptcoregtk-4.1-dev
+            libjavascriptcoregtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file
 
-      - name: npm ci
-        working-directory: launcher
-        run: npm ci
+      # Single source of truth: same script maintainers run locally.
+      # Bash is the shell on both runners — Git Bash on windows-latest is
+      # preinstalled, and the script's host-detection case branch handles
+      # MINGW*/MSYS*/CYGWIN* → windows-x64. Output lands at
+      # launcher/dist/<target>/vct-launcher{,.exe} + .metadata.json.
+      - name: Build launcher (bundled script)
+        shell: bash
+        run: bash scripts/build-bundled-launcher.sh
 
-      # `tauri build` runs the frontend build (vite) via beforeBuildCommand
-      # then bundles the Rust backend per-OS targets.
-      - name: tauri build
-        working-directory: launcher
-        run: npx tauri build
-
-      # Rename Windows .exe to a download-friendly name. Tauri produces
-      # `vct-launcher-temp.exe` (matches Cargo `[package].name`); we
-      # rename in-place before upload so the artifact is `vct-launcher-windows-x64.exe`.
-      - name: Rename Windows portable .exe
-        if: matrix.os == 'windows-latest'
-        shell: pwsh
+      # Sanity-check that the staged artifacts exist before upload, so a
+      # silent build-script change can't produce a release with empty
+      # assets. Listing also surfaces sizes in the run log.
+      - name: Verify staged artifacts
+        shell: bash
         run: |
-          $src = "launcher/src-tauri/target/release/vct-launcher-temp.exe"
-          $dst = "launcher/src-tauri/target/release/vct-launcher-windows-x64.exe"
-          if (Test-Path $src) {
-            Move-Item -Path $src -Destination $dst -Force
-            Write-Host "Renamed -> $dst"
-            $size = (Get-Item $dst).Length / 1MB
-            Write-Host ("Size: {0:N1} MB" -f $size)
-          } else {
-            Write-Error "Expected portable .exe not found at $src"
-            exit 1
-          }
-
-      # Rename .dmg so users can tell architecture. macos-14 runners
-      # are Apple Silicon; macos-13 was Intel. We're on -latest = -14
-      # for v0.1.0; Intel users build from source or wait for v0.1.1.
-      - name: Rename macOS .dmg with arch suffix
-        if: matrix.os == 'macos-latest'
-        run: |
-          dmg=$(ls launcher/src-tauri/target/release/bundle/dmg/*.dmg | head -1)
-          if [ -z "$dmg" ]; then
-            echo "::error::No .dmg found"
+          set -euo pipefail
+          dist="launcher/dist/${{ matrix.target }}"
+          if [ ! -f "$dist/${{ matrix.binary }}" ]; then
+            echo "::error::Expected $dist/${{ matrix.binary }} not found"
+            ls -la "$dist" || true
             exit 1
           fi
-          arch=$(uname -m)
-          new="launcher/src-tauri/target/release/bundle/dmg/vct-launcher-macos-${arch}.dmg"
-          mv "$dmg" "$new"
-          echo "Renamed -> $new"
-          ls -lh "$new"
+          if [ ! -f "$dist/${{ matrix.binary }}.metadata.json" ]; then
+            echo "::error::Expected $dist/${{ matrix.binary }}.metadata.json not found"
+            ls -la "$dist" || true
+            exit 1
+          fi
+          ls -lh "$dist"
 
+      # Upload the binary + metadata as Release assets. softprops/action-gh-release@v2
+      # auto-creates the release on tag push if it doesn't exist yet, and
+      # is a no-op for workflow_dispatch runs without a tag (files still
+      # show up as workflow artifacts via the separate upload-artifact
+      # step below — useful for dry-runs).
       - name: Upload to GitHub Release
-        if: matrix.os == 'windows-latest'
-        uses: softprops/action-gh-release@v2
-        with:
-          files: launcher/src-tauri/target/release/vct-launcher-windows-x64.exe
-
-      - name: Upload to GitHub Release (Linux)
-        if: matrix.os == 'ubuntu-latest'
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            launcher/src-tauri/target/release/bundle/appimage/*.AppImage
-            launcher/src-tauri/target/release/bundle/deb/*.deb
+            launcher/dist/${{ matrix.target }}/${{ matrix.binary }}
+            launcher/dist/${{ matrix.target }}/${{ matrix.binary }}.metadata.json
 
-      - name: Upload to GitHub Release (macOS)
-        if: matrix.os == 'macos-latest'
-        uses: softprops/action-gh-release@v2
+      # Always upload as workflow artifacts too — lets workflow_dispatch
+      # runs (no tag) still produce downloadable binaries for QA.
+      - name: Upload as workflow artifact
+        uses: actions/upload-artifact@v4
         with:
-          files: launcher/src-tauri/target/release/bundle/dmg/*.dmg
+          name: vct-launcher-${{ matrix.target }}
+          path: |
+            launcher/dist/${{ matrix.target }}/${{ matrix.binary }}
+            launcher/dist/${{ matrix.target }}/${{ matrix.binary }}.metadata.json
+          if-no-files-found: error
