@@ -309,10 +309,17 @@
     background: rgba(0,191,166,0.05);
   }
   .cg-card-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
-  .cg-card-head h3 { margin: 0; font-size: 15px; }
+  .cg-card-head h3 {
+    margin: 0; font-size: 15px;
+    /* Truncate long project names so the access badge can't overlap
+       the title text. Same fix as KG CollectionList 2026-04-28. */
+    flex: 1 1 auto; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
   .cg-card-access {
     padding: 2px 8px; border-radius: 10px; font-size: 10px; font-weight: 600;
     letter-spacing: 0.04em;
+    flex-shrink: 0;
   }
   .cg-card-access-write {
     background: rgba(0,191,166,0.15); color: rgb(0,191,166);

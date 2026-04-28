@@ -109,12 +109,17 @@
     background: rgba(0,191,166,0.05);
   }
   .pl-card-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
-  .pl-card-head h3 { margin: 0; font-size: 15px; }
+  .pl-card-head h3 {
+    margin: 0; font-size: 15px;
+    flex: 1 1 auto; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
   .pl-card-badge {
     background: rgba(0,191,166,0.15); color: rgb(0,191,166);
     border: 1px solid rgba(0,191,166,0.3);
     padding: 2px 8px; border-radius: 10px; font-size: 10px;
     font-weight: 600; letter-spacing: 0.04em;
+    flex-shrink: 0;
   }
   .pl-card-path {
     margin: 0; font-size: 11px; color: #888;
