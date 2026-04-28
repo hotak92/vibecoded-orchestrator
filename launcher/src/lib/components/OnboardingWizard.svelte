@@ -358,8 +358,13 @@
    * explicit `conflict` object — that bypasses the conflict-detect path
    * in install_orchestrator and runs the strategy directly.
    */
+  // Set when applyConflictResolution should also run projects.create()
+  // afterwards (= conflict fired from step 4 / finish(), not step 3).
+  let conflictResumeStep4 = $state(false);
+
   async function applyConflictResolution() {
     if (!pendingConflict) return;
+    const conflict = pendingConflict;
     const preserve_paths =
       conflictStrategy === 'overwrite_preserve'
         ? conflictPreserveText
@@ -368,6 +373,39 @@
             .filter(Boolean)
         : undefined;
     pendingConflict = null;
+    if (conflictResumeStep4) {
+      // Came from step 4 — call install_orchestrator directly with the
+      // strategy, then resume the project-creation we were halfway
+      // through. runInstall(false, ...) is the step-3 helper and would
+      // also try to advance the wizard, which we don't want here.
+      conflictResumeStep4 = false;
+      creatingProject = true;
+      try {
+        await invoke('install_orchestrator', {
+          config: {
+            install_path: conflict.install_path,
+            use_gpu: false,
+            cpu_only: false,
+            openai_key: null,
+            container_runtime: null,
+            skip_containers: true,
+          },
+          confirmOverwrite: false,
+          conflict: { strategy: conflictStrategy, preserve_paths },
+        });
+        await projects.create(projectName.trim(), conflict.install_path, 'base');
+        toast.success(`Project "${projectName.trim()}" created`);
+        // Trigger the same close-on-success flow as the regular finish.
+        try { localStorage.setItem(KEY, 'true'); } catch {}
+        open = false;
+        onComplete?.();
+      } catch (e) {
+        projectError = e instanceof Error ? e.message : String(e);
+      } finally {
+        creatingProject = false;
+      }
+      return;
+    }
     await runInstall(false, {
       strategy: conflictStrategy,
       preserve_paths,
@@ -376,7 +414,9 @@
 
   function cancelConflictResolution() {
     pendingConflict = null;
+    conflictResumeStep4 = false;
     installing = false;
+    creatingProject = false;
   }
 
   /**
@@ -415,7 +455,31 @@
         await projects.create(name, path, 'base');
         toast.success(`Project "${name}" created`);
       } catch (e) {
-        projectError = e instanceof Error ? e.message : String(e);
+        // The inline install we kicked off above can return an
+        // InstallConflictError when the project path already has
+        // orchestrator files (e.g. user picked an existing dir). The
+        // step-3 install handler (line ~329) renders the modal in that
+        // case; the step-4 path needs the same treatment, otherwise the
+        // user sees a raw JSON blob in the project-error string.
+        // Reported 2026-04-28 from real wizard test on Agape.
+        const raw = e instanceof Error ? e.message : String(e);
+        const conflictErr = tryParseConflictError(raw);
+        if (conflictErr) {
+          // Pre-fill the modal state and flag conflictResumeStep4 so
+          // applyConflictResolution() resumes the project-creation
+          // we were halfway through (instead of the step-3 install
+          // pipeline, which is the default code path).
+          pendingConflict = conflictErr;
+          conflictStrategy = 'overwrite_preserve';
+          conflictPreserveText = (conflictErr.preserve_candidates && conflictErr.preserve_candidates.length > 0
+            ? conflictErr.preserve_candidates
+            : DEFAULT_PRESERVE_LIST).join('\n');
+          conflictShowPreserveEditor = false;
+          conflictResumeStep4 = true;
+          creatingProject = false;
+          return;
+        }
+        projectError = raw;
         creatingProject = false;
         return;
       } finally {
