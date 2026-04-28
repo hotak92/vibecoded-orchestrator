@@ -2,11 +2,13 @@
 # All licenses verified: MIT, Apache 2.0, or BSD-3-Clause
 
 # ─── MCP SDK ───
-# MCP Python SDK (MIT) — required for weaviate-kg and ollama MCP servers
+# MCP Python SDK (MIT) — required for weaviate-kg, ollama, and search MCP
+# servers. All three import the bundled FastMCP submodule of the official
+# Anthropic SDK via `from mcp.server.fastmcp import FastMCP`.
+# (The standalone PyPI `fastmcp` package is NOT a dependency — its only
+# call site, an unused `ToolResult` import in weaviate_mcp/server.py, was
+# removed on 2026-04-28. See PR #31 for context.)
 mcp>=1.0
-
-# FastMCP (MIT) — higher-level MCP framework, used by search MCP
-fastmcp>=0.1
 
 # ─── Weaviate ───
 # Weaviate Python client (BSD-3-Clause)
@@ -43,7 +45,13 @@ sentence-transformers>=3.0
 # transformers pinned for CodeSage Conv1D compatibility
 transformers>=4.40.0,<5.0.0
 # PyTorch (BSD-3-Clause) — for RL pipeline (Pro) and code embeddings (CPU fallback)
-torch>=2.0
+# NOTE: torch>=2.11 ships CUDA 13.0 wheels by default on PyPI. Users with
+# CUDA 12.x drivers, Volta/Pascal/Maxwell GPUs, or CPU-only systems should
+# pre-install a compatible torch wheel:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   pip install torch --index-url https://download.pytorch.org/whl/cu126
+# before running `pip install -r requirements.txt`. See KNOWN_ISSUES.md.
+torch>=2.11.0
 
 # ─── FastAPI (code embedding service HTTP server) ───
 # FastAPI (MIT) + uvicorn (BSD-3-Clause)

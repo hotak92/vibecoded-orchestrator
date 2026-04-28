@@ -37,7 +37,6 @@ from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
 from mcp.server.fastmcp import FastMCP
-from fastmcp.tools.tool import ToolResult
 import weaviate
 from weaviate.classes.query import Filter, MetadataQuery
 import aiohttp
