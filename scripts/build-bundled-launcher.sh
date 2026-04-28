@@ -136,25 +136,68 @@ else
 fi
 
 # Sanity-check: the built binary MUST contain references to embedded
-# SvelteKit assets. If `strings` finds zero `_app/immutable/assets/`
-# matches, the frontend was NOT embedded (Tauri's frontendDist was empty
-# or unreadable at build time). Refuse to stage a broken binary.
+# SvelteKit assets. If we can find zero `_app/immutable/` matches,
+# the frontend was NOT embedded (Tauri's frontendDist was empty or
+# unreadable at build time). Refuse to stage a broken binary.
+#
+# `strings` is binutils-only and not in Git Bash on Windows. Fall
+# back to PowerShell's byte-stream string scan when strings is
+# absent. We grep for the broader `_app/immutable/` (no trailing
+# `assets`) because newer SvelteKit / Svelte 5 emits chunks under
+# `_app/immutable/{chunks,entry,nodes}/` instead of `assets/`, so
+# requiring `assets/` produced false negatives on Windows builds
+# (reported 2026-04-28 from a Git-Bash build that also lacked
+# `strings` — it false-failed even though the .exe was healthy).
 RELEASE_DIR="$SRC_TAURI/target/release"
 PROBE_BIN=""
-for cand in vct-launcher vct-launcher-temp launcher; do
-    if [ -x "$RELEASE_DIR/$cand" ]; then
+for cand in vct-launcher vct-launcher-temp launcher \
+            vct-launcher.exe vct-launcher-temp.exe launcher.exe; do
+    if [ -f "$RELEASE_DIR/$cand" ]; then
         PROBE_BIN="$RELEASE_DIR/$cand"
         break
     fi
 done
+
+_count_asset_refs() {
+    # Returns the integer count of `_app/immutable/` substrings in the
+    # binary's bytes. Tries strings → PowerShell → grep -ao fallback.
+    local bin="$1"
+    if command -v strings >/dev/null 2>&1; then
+        strings "$bin" 2>/dev/null | grep -c '_app/immutable/' || true
+        return
+    fi
+    # Windows fallback: PowerShell byte-scan. Works in Git Bash MSYS
+    # because powershell.exe is on PATH on every modern Windows.
+    if command -v powershell.exe >/dev/null 2>&1; then
+        # Convert MSYS path to Windows path for PowerShell.
+        local winpath
+        winpath="$(cygpath -w "$bin" 2>/dev/null || echo "$bin")"
+        powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "
+            \$bytes = [System.IO.File]::ReadAllBytes('$winpath');
+            \$s = [System.Text.Encoding]::ASCII.GetString(\$bytes);
+            (\$s.Split([string[]]@('_app/immutable/'), [System.StringSplitOptions]::None).Count - 1)
+        " 2>/dev/null | tr -d '\r' | tr -d '[:space:]'
+        return
+    fi
+    # Last-resort: `grep -ao` (binary-mode regex count) on platforms
+    # that have neither strings nor powershell.
+    grep -aoc '_app/immutable/' "$bin" 2>/dev/null || echo 0
+}
+
 if [ -n "$PROBE_BIN" ]; then
-    EMBEDDED_COUNT=$(strings "$PROBE_BIN" 2>/dev/null | grep -c '_app/immutable/assets' || true)
-    if [ "${EMBEDDED_COUNT:-0}" -lt 5 ]; then
-        echo "[build-bundled] FATAL: built binary has $EMBEDDED_COUNT '_app/immutable/assets' refs (expected >=5)." >&2
+    EMBEDDED_COUNT="$(_count_asset_refs "$PROBE_BIN")"
+    EMBEDDED_COUNT="${EMBEDDED_COUNT:-0}"
+    if ! [ "$EMBEDDED_COUNT" -eq "$EMBEDDED_COUNT" ] 2>/dev/null; then
+        # Not a number — count helper failed silently.
+        echo "[build-bundled] WARNING: cannot validate asset embedding (no strings/powershell available)." >&2
+        echo "                Skipping post-build asset-ref check; manual verification recommended." >&2
+    elif [ "$EMBEDDED_COUNT" -lt 5 ]; then
+        echo "[build-bundled] FATAL: built binary has $EMBEDDED_COUNT '_app/immutable/' refs (expected >=5)." >&2
         echo "                Frontend was NOT embedded. Refusing to stage. Investigate." >&2
         exit 1
+    else
+        echo "[build-bundled] embedded asset refs: $EMBEDDED_COUNT (passes sanity check)"
     fi
-    echo "[build-bundled] embedded asset refs: $EMBEDDED_COUNT (passes sanity check)"
 fi
 
 # Find what was actually built. Tauri may produce vct-launcher-temp during

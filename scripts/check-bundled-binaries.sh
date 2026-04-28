@@ -37,18 +37,40 @@ if [ ! -d "$DIST_DIR" ]; then
     exit 0
 fi
 
-if ! command -v strings >/dev/null 2>&1; then
-    echo "[check-bundled] FATAL: \`strings\` not found on PATH (binutils required)." >&2
-    exit 2
+# `strings` is binutils-only. Git Bash on Windows lacks it. Fall back
+# to PowerShell byte-scan when missing. Reported 2026-04-28.
+HAVE_STRINGS=0
+if command -v strings >/dev/null 2>&1; then
+    HAVE_STRINGS=1
 fi
 
 # Resolve absolute paths so lean-ctx's `BASH_ENV`-injected aliases for
 # find/grep/strings can't shadow us. The shim breaks pipelines like
 # `strings | grep -c PATTERN` by reformatting the args mid-flight.
-STRINGS_BIN="$(command -v strings)"
+STRINGS_BIN="$(command -v strings 2>/dev/null || echo '')"
 GREP_BIN="$(command -v grep)"
 for p in /usr/bin/strings /bin/strings; do [ -x "$p" ] && STRINGS_BIN="$p" && break; done
 for p in /usr/bin/grep /bin/grep; do [ -x "$p" ] && GREP_BIN="$p" && break; done
+
+# Asset-ref counter that tries strings → PowerShell → grep -aoc.
+_count_asset_refs() {
+    local bin="$1"
+    if [ "$HAVE_STRINGS" = "1" ] && [ -n "$STRINGS_BIN" ]; then
+        "$STRINGS_BIN" "$bin" 2>/dev/null | "$GREP_BIN" -c '_app/immutable/' || true
+        return
+    fi
+    if command -v powershell.exe >/dev/null 2>&1; then
+        local winpath
+        winpath="$(cygpath -w "$bin" 2>/dev/null || echo "$bin")"
+        powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "
+            \$bytes = [System.IO.File]::ReadAllBytes('$winpath');
+            \$s = [System.Text.Encoding]::ASCII.GetString(\$bytes);
+            (\$s.Split([string[]]@('_app/immutable/'), [System.StringSplitOptions]::None).Count - 1)
+        " 2>/dev/null | tr -d '\r' | tr -d '[:space:]'
+        return
+    fi
+    "$GREP_BIN" -aoc '_app/immutable/' "$bin" 2>/dev/null || echo 0
+}
 
 # Find every executable under launcher/dist/. Use the full path to GNU
 # find rather than `find` on PATH — dev environments sometimes alias
@@ -75,8 +97,17 @@ for bin in "${binaries[@]}"; do
         true
     fi
 
-    count="$("$STRINGS_BIN" "$bin" 2>/dev/null | "$GREP_BIN" -c '_app/immutable/assets' || true)"
-    if [ "${count:-0}" -lt 5 ]; then
+    count="$(_count_asset_refs "$bin")"
+    count="${count:-0}"
+    # Validate count is numeric — if the helper failed silently (no
+    # strings + no powershell + grep failure), don't false-fail; warn
+    # and continue. This is rare but worth surfacing.
+    if ! [ "$count" -eq "$count" ] 2>/dev/null; then
+        echo "[check-bundled] WARN: $rel — could not count asset refs (no strings/powershell available)." >&2
+        echo "                Skipping validation for this binary." >&2
+        continue
+    fi
+    if [ "$count" -lt 5 ]; then
         echo "[check-bundled] FAIL: $rel has $count embedded frontend asset refs (expected >=5)." >&2
         echo "                Frontend was NOT embedded. Rebuild with:" >&2
         echo "                  cd $REPO_ROOT && bash scripts/build-bundled-launcher.sh" >&2
