@@ -187,3 +187,480 @@ If a future version adds a dedicated `Rules` tab (e.g. for higher-level policies
 ---
 
 _End of Secrets / Permissions / Rules section. Other tabs (Agents, Skills, Hooks, KgCodegraph) are documented in their own sections of this file._
+
+---
+
+## Agents, Skills, Hooks, KG, and Codegraph tabs
+
+These five tabs share a common contract:
+
+- Rows are **auto-populated** at project onboarding by scanning
+  `<project>/.claude/`. See `populate_project_state_from_filesystem`
+  in `launcher/src-tauri/src/commands/project_state_populate.rs`.
+  Subsequent edits to filesystem files do not retroactively appear;
+  populate must be re-triggered.
+- The `enabled` column is **owned by the user via the GUI**. Re-running
+  populate (or re-onboarding the project) preserves user toggles —
+  the `register_*` upsert helpers in `db/project_state.rs` intentionally
+  omit the `enabled` column from `ON CONFLICT … DO UPDATE SET …`.
+- Deleting a row from a tab removes the **registry row only**. The
+  source file on disk is not touched. To fully remove an agent/skill,
+  delete the file and unregister the row.
+- All mutations are written to the audit log (`db.audit(...)`) without
+  recording values.
+
+Schema source of truth: `launcher/src-tauri/src/db/project_state.rs`
+(tables `project_agents`, `project_skills`, `project_hooks`,
+`project_kg_bindings`, `project_codegraph_bindings`).
+
+Frontend invocations are defined in
+`launcher/src-tauri/src/commands/project_state_cmd.rs`. Each tab calls
+`list_*` on mount and `set_*_enabled` / `register_*` / `unregister_*`
+on user actions.
+
+---
+
+### Agents tab
+
+#### What this tab is for
+
+Lists every Claude Code subagent the launcher knows about for this
+project. The harness loads agents from `.claude/agents/*.md`
+(project-scope) and `~/.claude/agents/*.md` (user-scope) at session
+start; this tab is the launcher's **index** of those files plus a
+per-project `enabled` flag and a `source` label.
+
+#### How rows get there
+
+- Auto-populated by `populate_agents()`: scans
+  `<project>/.claude/agents/`, reads each `*.md`, parses YAML
+  frontmatter for `name`, `description`, `model`, inserts one row per
+  file via `Db::register_project_agent(...)` with `source = "bundled"`.
+- The `agent_name` is taken from frontmatter `name:` if present,
+  otherwise from the file stem (e.g. `coder.md` → `coder`).
+- Manual: the **+ Register** button (top-right of the tab) calls the
+  `register_project_agent` Tauri command. This adds a registry row
+  *without* creating a `.md` file — useful for tracking an agent
+  defined elsewhere (user-scope `~/.claude/agents/`, or a paid module).
+- Adding a new file under `.claude/agents/` after onboarding does
+  **not** make it appear automatically. You must re-run populate
+  (re-onboard the project) or manually register it.
+
+#### Field reference
+
+| Column / field | Meaning |
+|---|---|
+| `agent_name` | Logical name. Unique per `(project_id, agent_name)`. From frontmatter `name:` or file stem. |
+| `source` | One of `bundled`, `user`, `paid-module`, `project`. The validator (`VALID_SOURCE`) rejects anything else. `bundled` = shipped with the orchestrator; `user` = user-scope `~/.claude/agents/`; `paid-module` = installed by a paid module; `project` = manually added in this project only. |
+| `source_module` | Optional module slug if `source = paid-module` (e.g. `vct-coordination`). |
+| `model` | Frontmatter `model:` value: `sonnet`, `opus`, `haiku`, `inherit`, or full model id. Display-only — the harness reads this from the `.md` itself. |
+| `enabled` | User-owned toggle. The harness still loads the `.md` regardless; `enabled=false` is a launcher-managed signal that downstream code can consult. **It does not delete the file or block the harness directly.** |
+| `file_path` | Absolute path to the `.md`. `null` for rows manually registered without a file. |
+| `config` (JSON) | Currently stores `{"description": "..."}` from frontmatter. Reserved for future per-row overrides (`tools`, `effort`, `mcpServers`). |
+| `installed_at` / `updated_at` | Unix-millis timestamps. |
+
+#### Frontmatter fields the launcher tracks
+
+The populate scanner only reads `name`, `description`, `model` (see
+`parse_frontmatter()` — it deliberately filters everything else to
+keep the map small). Other Claude Code agent frontmatter
+(`tools`, `disallowedTools`, `permissionMode`, `maxTurns`, `effort`,
+`isolation`, `background`, `memory`, `skills`, `mcpServers`, `hooks`)
+**is honored by the harness when it loads the `.md`**, but is not
+mirrored in the launcher DB. To change those, edit the `.md` directly.
+
+#### Common operations
+
+- Disable a noisy/expensive agent for one project without removing
+  the file: toggle `enabled = false`. The flag survives re-onboarding.
+- Track a user-scope agent so it shows up in the per-project view:
+  use **+ Register** with `source = user`, `name = <agent>`,
+  `file_path = null`.
+- Remove a row whose `.md` was deleted: click **Unregister**. Re-runs
+  of populate will not re-add it.
+
+#### Gotchas
+
+- The toggle is **advisory** unless something downstream of the
+  launcher reads the `project_agents.enabled` column. As of v1.0 the
+  Claude Code harness itself does not read this DB; it loads `.md`
+  files directly. Treat `enabled` as a launcher-internal preference.
+- Two agent files with the same `name:` in frontmatter collide on the
+  `(project_id, agent_name)` unique key — the second insert upserts
+  over the first.
+- The `enabled` flag is preserved across re-populates. Other fields
+  (`model`, `file_path`, `config`, `source`) are **overwritten** on
+  each re-populate from the `.md`.
+- The launcher's populate scanner does not read `~/.claude/agents/`.
+  User-scope agents have to be registered manually if you want them
+  in this view.
+
+---
+
+### Skills tab
+
+#### What this tab is for
+
+Lists Claude Code skills (slash-invoked helpers). Same registry
+pattern as Agents but skills live in **directories**
+(`<dir>/SKILL.md`) rather than single files, and they have two
+natural scopes: user-wide (`~/.claude/skills/`) and project
+(`.claude/skills/`).
+
+#### How rows get there
+
+- Auto-populated by `populate_skills()`: scans
+  `<project>/.claude/skills/`, looks for subdirectories containing
+  a `SKILL.md`, parses its frontmatter, inserts one row per skill via
+  `Db::register_project_skill(...)` with `source = "bundled"`.
+- A skill directory without `SKILL.md` is silently skipped.
+- Manual: the **+ Register** button registers a row without requiring
+  a directory.
+
+#### Distinguishing scopes
+
+The launcher's populate scanner reads only project-scope
+(`<project>/.claude/skills/`). User-scope skills under
+`~/.claude/skills/` are loaded by the harness at runtime but are
+**not** mirrored into the project's registry automatically. If you
+want user-scope skills in this view, register them manually with
+`source = user`.
+
+#### Field reference
+
+| Column | Meaning |
+|---|---|
+| `skill_name` | From `name:` in `SKILL.md` frontmatter, or directory name as fallback. |
+| `source` | Same vocabulary as agents: `bundled` / `user` / `paid-module` / `project`. |
+| `model` | Frontmatter `model:`. Display-only (harness reads it from the file). |
+| `enabled` | User-owned toggle. Same caveat as agents: advisory unless downstream consumers read it. |
+| `file_path` | Absolute path to `SKILL.md`. |
+| `config.description` | From frontmatter `description:`. |
+
+#### Common operations
+
+- Hide a noisy skill from a project's slash menu (when downstream
+  honors it): toggle `enabled = false`.
+- Surface a user-scope skill in this view: **+ Register** with
+  `source = user`.
+
+#### Gotchas
+
+- Frontmatter fields the launcher does **not** track but the harness
+  may honor: `argument-hint`, `disable-model-invocation`,
+  `user-invocable`, `allowed-tools`, `context`, `agent`, `hooks`.
+  Edit `SKILL.md` directly to change these.
+- VS Code's skill schema warns on `model`, `effort`, `allowed-tools`,
+  `context`, `agent`, `hooks` — they still work at runtime in the
+  CLI. Don't strip them from `SKILL.md` based on the warning alone.
+
+---
+
+### Hooks tab
+
+#### What this tab is for
+
+Mirrors `<project>/.claude/settings.json`'s `hooks` block as
+queryable rows, with a per-row `enabled` toggle. Hooks are lifecycle
+callbacks the harness runs on events (file edits, session start,
+compaction, etc.) and are the **only** mechanism for *automated*
+harness behavior — memory and instructions cannot fulfill "each time
+X" requirements.
+
+#### How rows get there
+
+- Auto-populated by `populate_hooks()`: parses
+  `<project>/.claude/settings.json`, walks the
+  `hooks: { Event: [ { matcher?, hooks: [ { command, type,
+  timeout?, background?, ... } ] } ] }` schema, inserts one row per
+  *innermost* command via `Db::register_project_hook(...)` with
+  `source = "project"`.
+- The `timeout` field in `settings.json` is in **seconds**; the DB
+  column `timeout_ms` is in **milliseconds** — populate multiplies
+  by 1000.
+- Manual: the **+ Register** button calls `register_project_hook`.
+  It does **not** edit `settings.json` — the row exists in the DB
+  only unless something else writes it back.
+- A missing `settings.json` is fine (no warning). A malformed one
+  emits a warning to the populate report and skips hook population
+  (KG/codegraph bindings still write).
+
+#### Schema (`settings.json` side)
+
+```jsonc
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit(*.py)",
+        "hooks": [
+          {"type": "command", "command": "ruff check --fix", "timeout": 5},
+          {"type": "command", "command": "pyright", "background": true}
+        ]
+      }
+    ]
+  }
+}
+```
+Each innermost `{command, type, timeout?, background?}` becomes one
+row.
+
+#### Field reference
+
+| Column | Meaning |
+|---|---|
+| `id` | Auto-increment primary key (hooks have no natural unique name). |
+| `event` | Event name. The launcher's "common events" dropdown lists: `SessionStart`, `SessionEnd`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`, `StopFailure`, `PreCompact`, `PostCompact`, `TeammateIdle`, `TaskCompleted`. The harness supports more (see CLAUDE.md hook table); the dropdown is convenience-only — any string is accepted. |
+| `matcher` | Tool-name pattern. Empty = match all. Examples: `Edit(*.py)`, `Edit(knowledge/**/*.md)`, `Edit(*)\|Write(*)`, `*`. Matcher syntax is harness-defined. |
+| `command` | Shell command run on the event. The harness invokes `bash -c <command>` with env scrubbed for secrets. |
+| `source` | `bundled` / `user` / `paid-module` / `project`. Auto-populated rows are `project`. |
+| `timeout_ms` | Per-hook timeout in milliseconds. `null` = harness default. |
+| `enabled` | Advisory toggle. **Critical caveat: turning a row off here does NOT remove the hook from `settings.json`.** The harness reads `settings.json`, not this table. To actually disable a hook, edit `settings.json`. |
+| `config` (JSON) | The full hook entry from `settings.json` — preserves `type`, `background`, and any other keys for the GUI to render. |
+
+#### Blocking behavior
+
+This is harness-side, not launcher-side, but critical to understand:
+only some events can block. From CLAUDE.md hook table —
+`PreToolUse`, `UserPromptSubmit`, `PermissionRequest`,
+`SubagentStop`, `Stop`, `ConfigChange`, `TeammateIdle`,
+`TaskCompleted`, `WorktreeCreate`, `Elicitation`,
+`ElicitationResult` can block. Returning exit code 2 from these
+blocks the action. Other events (`PostToolUse`, `Notification`,
+`PostCompact`, `SessionEnd`, etc.) cannot block.
+
+#### Common operations
+
+- Inspect what hooks are firing for a project: just look at this tab.
+- Identify a slow hook: check `timeout_ms`. Then investigate the
+  script under `.claude/hooks/<name>.sh` (or wherever the command
+  points).
+
+#### Gotchas
+
+- `enabled = false` does NOT actually disable the hook unless you
+  also edit `settings.json`. Treat the toggle as a launcher-internal
+  flag.
+- Re-running populate **does not delete** rows that are no longer in
+  `settings.json`. Stale rows from removed hooks must be cleaned via
+  the **Delete** button.
+- Hook commands run with secret env vars scrubbed (see CLAUDE.md
+  "Env Scrubbing"). Do not assume `GITHUB_TOKEN`, `OPENAI_API_KEY`,
+  etc. are visible in hook scripts — read from `~/.vct-secrets/<name>`
+  instead.
+- The unique key for hooks is `(project_id, event, matcher, command)`.
+  Two `PostToolUse / Edit(*.py) / ruff check` rows cannot coexist;
+  the second will upsert over the first.
+
+---
+
+### KG bindings tab (top half of "KG / Codegraph bindings")
+
+#### What this tab is for
+
+Records which Weaviate collection(s) this project's knowledge graph
+reads/writes. A project has at most one binding per `role` —
+currently `primary`, `shared`, or `archive`. Other code (the
+`weaviate-kg` MCP server, the orchestrator's `hybrid_search`)
+consults `KG_COLLECTION` env vars set per-workspace, **not** this
+DB; the binding row is the launcher's record of what those should be.
+
+#### How rows get there
+
+- Auto-populated by `populate_kg_bindings()`:
+  - `primary` row → `collection_name = sanitize_kg_collection(project_name) + "_KnowledgeGraph"`. For a project named `Agape` that's `Agape_KnowledgeGraph`. The sanitizer strips non-alphanumerics and TitleCases (`my project name` → `MyProjectName`).
+  - `shared` row → `collection_name = "VibeCodedTools_KnowledgeGraph"` (cross-project shared KG used by all projects).
+  - Both default to `weaviate_url = http://localhost:8081`,
+    `embedding_model = qwen3-embedding:0.6b`, `embedding_dim = 1024`.
+- Idempotence: populate **only inserts a binding if no row exists for that role**. User edits to the row survive re-onboarding (in contrast to agents/skills/hooks where `model/file_path/source` get overwritten).
+
+#### Primary vs shared
+
+- **`primary`** = the project's own KG. Notes you write while working
+  on this project go here.
+- **`shared`** = `VibeCodedTools_KnowledgeGraph`. Cross-project
+  patterns, team-wide concepts, anything you want every project's
+  `hybrid_search` to find.
+- **`archive`** = reserved (no auto-population). Use it manually if
+  you rotate a KG collection out of active use but want to keep it
+  queryable.
+
+#### `KG_COLLECTION` env interaction
+
+The harness's `weaviate-kg` MCP server reads `KG_COLLECTION` and
+`SHARED_KG_COLLECTION` from its env (set in
+`<project>/.vscode/settings.json` under `claude-code.env`). The
+launcher writes the binding row, but **does not** write
+`.vscode/settings.json` — the orchestrator install step does. If
+you edit a binding here, also update `.vscode/settings.json` for
+the change to take effect in Claude Code sessions.
+
+#### Field reference
+
+| Column | Meaning |
+|---|---|
+| `role` | `primary` / `shared` / `archive`. Validated against `VALID_KG_ROLE`. |
+| `collection_name` | Weaviate collection. Must satisfy Weaviate's "starts with [A-Z], alphanumeric only" rule — `sanitize_kg_collection` enforces this. |
+| `embedding_model` | Default `qwen3-embedding:0.6b`. Display/reference; the actual embedding model is determined at runtime by `ACTIVE_EMBEDDING` env. |
+| `embedding_dim` | Default 1024 (qwen3, also matches snowflake-arctic-embed2). |
+| `kg_dir_path` | Optional override of the `knowledge/` directory. Usually `null` (defaults to `<project>/knowledge/`). |
+| `weaviate_url` | Default `http://localhost:8081`. |
+| `config` | Reserved JSON blob. |
+
+#### Common operations
+
+- Point a project at a different Weaviate instance: edit
+  `weaviate_url`. Remember to also update `.vscode/settings.json`'s
+  `claude-code.env.WEAVIATE_URL`.
+- Switch from per-project KG to shared-only: delete the `primary`
+  binding (the harness will fall back to whatever `KG_COLLECTION`
+  is set in the env).
+
+#### Gotchas
+
+- The collection must already exist in Weaviate (or be auto-created
+  by the orchestrator install step). The launcher does not create
+  collections.
+- Sanitization is one-way: renaming a project does not rename its
+  collection. To rename, manually create the new collection, copy
+  data, and update this binding.
+
+---
+
+### Codegraph bindings tab (bottom half of "KG / Codegraph bindings")
+
+#### What this tab is for
+
+Code graph collections (`CodeFunction`, `CodeClass`, `CodeModule`,
+`CodeAPI`, `CodeInteraction`) are **namespaced per project** by a
+prefix. This row records the prefix and the embedding model used.
+Without a binding, `search_code_graph` cannot find the project's
+code entities.
+
+#### Namespaced classes
+
+A project with prefix `Agape` ends up with `Agape_CodeFunction`,
+`Agape_CodeClass`, `Agape_CodeModule`, `Agape_CodeAPI`,
+`Agape_CodeInteraction` in Weaviate.
+
+| Project name | `collection_prefix` | Resulting classes |
+|---|---|---|
+| `Agape` | `Agape` | `Agape_CodeFunction`, … |
+| `my project name` | `MyProjectName` | `MyProjectName_CodeFunction`, … |
+| `SD15` | `SD15` | `SD15_CodeFunction`, … |
+
+The prefix is derived by `sanitize_kg_collection(project_name)` —
+same function as KG bindings.
+
+#### How the row gets there
+
+- Auto-populated by `populate_codegraph_binding()`:
+  - `collection_prefix = sanitize_kg_collection(project_name)`
+  - `embedding_model = codesage-large-v2`
+  - `embedding_dim = 2048`
+  - `enabled = true`
+- Idempotence: populate **only inserts if no codegraph binding
+  exists for the project**. The `enabled` flag and any user edits
+  survive re-onboarding. (The DB-level upsert *would* clobber
+  `enabled`, hence the pre-check in populate.)
+
+#### Field reference
+
+| Column | Meaning |
+|---|---|
+| `collection_prefix` | Prefix prepended to `_CodeFunction` etc. Must be alphanumeric, starting with a letter. |
+| `embedding_model` | `codesage-large-v2` default (2048-dim, served by the code embedding service on port 11438). Legacy alternative: `unclemusclez/jina-embeddings-v2-base-code` (768-dim, CPU-only Ollama fallback). |
+| `embedding_dim` | 2048 (CodeSage) or 768 (Jina). Must match the model. |
+| `last_analyzed_commit` | Git SHA of the last `code-graph-analyze` run. Used to decide whether re-analysis is needed. |
+| `last_analyzed_at` | Unix-millis of the last analysis. |
+| `enabled` | If `false`, the launcher should not auto-trigger code graph re-analysis. (Manual `code-graph-analyze` runs still work.) |
+| `config` | Reserved. |
+
+#### When to rebuild
+
+- After a significant refactor (new modules, removed files, renamed
+  classes). The analyzer is incremental but only catches changes
+  per file — a directory move benefits from a clean re-run.
+- After switching `embedding_model` or `embedding_dim`. Embeddings
+  are not portable between dimensions; you must re-analyze.
+- When `last_analyzed_commit` is many commits behind `HEAD`.
+- Run: `.claude/scripts/code-graph-analyze . --project "<ProjectName>"`
+  from the project root. Add `--cfg --pdg` for control-flow / data-flow
+  graphs (requires `joern` in PATH).
+
+#### Common operations
+
+- Disable code graph for a project (e.g. it's not a code project):
+  toggle `enabled = false` and skip running the analyzer.
+- Switch embedding model: change `embedding_model` and
+  `embedding_dim`, then run `code-graph-analyze` to re-embed.
+
+#### Gotchas
+
+- Renaming a project does not rename its prefix automatically. If
+  you change `collection_prefix`, you must rebuild the code graph
+  from scratch — the old `Agape_CodeFunction` collection won't be
+  queried under the new prefix.
+- `embedding_dim` mismatches with `embedding_model` will produce
+  garbage results silently. The launcher does not validate the
+  pairing.
+- The CodeSage service (port 11438) must be running. If you set
+  `CODE_EMBED_BACKEND=ollama` in the env, the launcher row is
+  display-only — actual embeddings come from Ollama.
+
+---
+
+### For Claude Code agents operating on a user's behalf
+
+These rules apply when an agent (you) is making changes to a project
+the user has registered in the launcher. The launcher's per-project
+tabs are user preferences, not facts to be silently overwritten.
+
+1. **Never enable/disable an agent, skill, or hook without user
+   confirmation.** The `enabled` column in `project_agents`,
+   `project_skills`, and `project_hooks` is owned by the user. If
+   you think a row should be off, raise it as a recommendation; do
+   not invoke `set_project_agent_enabled` (or its skill/hook
+   counterparts) silently.
+2. **Adding a new `.md` under `.claude/agents/` or `.claude/skills/`
+   does not make it appear in the launcher GUI.**
+   `populate_project_state_from_filesystem` runs only at project
+   creation. To surface a new agent: either re-onboard the project,
+   ask the user to re-scan, or call `register_project_agent` via
+   the Tauri command if you're inside the launcher process.
+3. **Editing `.claude/settings.json`'s `hooks` block does not update
+   the Hooks tab** — same reason. Re-populate is required.
+4. **Do not assume `enabled = false` blocks the harness.** The
+   Claude Code harness reads `.md` files and `settings.json`
+   directly. The launcher's `enabled` toggle is currently advisory.
+   To truly disable an agent or hook, edit/remove the underlying
+   file or `settings.json` entry.
+5. **Re-running populate preserves user toggles** but **overwrites**
+   `model`, `file_path`, `description`, `source`, and the `config`
+   blob from frontmatter. Do not store user preferences in any of
+   those — they will be clobbered.
+6. **Do not silently change `collection_name` or
+   `collection_prefix`.** Renaming a binding without rebuilding the
+   underlying Weaviate data orphans the old collection and produces
+   empty search results. If a rename is necessary, do all three:
+   update the binding, update `.vscode/settings.json` env, and
+   re-run the analyzer (for code graph) or `kg-sync --all` (for KG).
+7. **`source = "bundled"` is reserved for orchestrator-shipped
+   rows.** Manually-registered rows should use `source = "project"`
+   (or `user` / `paid-module` if appropriate). Do not insert with
+   `source = "bundled"` from agent code.
+8. **Unregistering a row does not delete the file.** When the user
+   asks "remove this agent", clarify whether they mean (a) the
+   registry row (use `unregister_project_agent`), (b) the file
+   (delete `.claude/agents/<name>.md`), or (c) both. Do not assume.
+9. **Secrets never live in any of these tabs.** Secret references
+   live in the Secrets tab and point to `~/.vct-secrets/` paths or
+   keychain entries — never inline values. If you find a
+   secret-looking string in a `config` column, treat it as a bug
+   and surface it.
+10. **Audit log is automatic.** Every mutation goes through
+    `db.audit(...)`. Do not try to suppress it.
+11. **Project creation must never fail over a populate hiccup.**
+    Per-row errors during populate are logged as warnings; if you
+    are extending populate, follow that contract — never propagate
+    a single bad frontmatter or unreadable file as a hard error.

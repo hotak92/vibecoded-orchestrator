@@ -23,6 +23,12 @@
 
 set -euo pipefail
 
+# Some dev environments wrap common shell tools (find, grep, strings)
+# via lean-ctx for output compression. Those wrappers occasionally
+# misinterpret arg lists or pipelines, causing this script to silently
+# under-report. Use bare tools: disable the shim + prefer absolute paths.
+export LEAN_CTX_OFF=1
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST_DIR="$REPO_ROOT/launcher/dist"
 
@@ -36,8 +42,24 @@ if ! command -v strings >/dev/null 2>&1; then
     exit 2
 fi
 
-# Find every executable under launcher/dist/. Skip metadata/json/txt/html.
-mapfile -t binaries < <(find "$DIST_DIR" -type f \( -name 'vct-launcher' -o -name 'vct-launcher.exe' -o -name 'launcher' \) 2>/dev/null)
+# Resolve absolute paths so lean-ctx's `BASH_ENV`-injected aliases for
+# find/grep/strings can't shadow us. The shim breaks pipelines like
+# `strings | grep -c PATTERN` by reformatting the args mid-flight.
+STRINGS_BIN="$(command -v strings)"
+GREP_BIN="$(command -v grep)"
+for p in /usr/bin/strings /bin/strings; do [ -x "$p" ] && STRINGS_BIN="$p" && break; done
+for p in /usr/bin/grep /bin/grep; do [ -x "$p" ] && GREP_BIN="$p" && break; done
+
+# Find every executable under launcher/dist/. Use the full path to GNU
+# find rather than `find` on PATH — dev environments sometimes alias
+# `find` to `bfs` (lean-ctx) which silently returns no results on the
+# pattern we use here, causing this script to falsely report "nothing
+# to check" and let a broken binary slip through.
+FIND_BIN="/usr/bin/find"
+if [ ! -x "$FIND_BIN" ]; then
+    FIND_BIN="$(command -v find)"
+fi
+mapfile -t binaries < <("$FIND_BIN" "$DIST_DIR" -type f \( -name 'vct-launcher' -o -name 'vct-launcher.exe' -o -name 'launcher' \) 2>/dev/null)
 
 if [ ${#binaries[@]} -eq 0 ]; then
     echo "[check-bundled] No bundled binaries found under $DIST_DIR — nothing to check."
@@ -53,7 +75,7 @@ for bin in "${binaries[@]}"; do
         true
     fi
 
-    count="$(strings "$bin" 2>/dev/null | grep -c '_app/immutable/assets' || true)"
+    count="$("$STRINGS_BIN" "$bin" 2>/dev/null | "$GREP_BIN" -c '_app/immutable/assets' || true)"
     if [ "${count:-0}" -lt 5 ]; then
         echo "[check-bundled] FAIL: $rel has $count embedded frontend asset refs (expected >=5)." >&2
         echo "                Frontend was NOT embedded. Rebuild with:" >&2

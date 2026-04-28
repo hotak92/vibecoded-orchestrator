@@ -16,6 +16,12 @@
 
 set -euo pipefail
 
+# Disable lean-ctx (output-compression shim that aliases find→bfs).
+# bfs accepts different syntax which made check-bundled-binaries.sh
+# silently return zero results on this dev box (2026-04-28), letting
+# the hook pass when it should have failed. Use bare GNU tools.
+export LEAN_CTX_OFF=1
+
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 
 # Are any staged files under launcher/dist/?
