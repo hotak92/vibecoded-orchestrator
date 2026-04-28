@@ -810,18 +810,66 @@ async fn run_build_task(
     }
 
     // Resolve VCT_INSTALL_ROOT: the directory of the orchestrator
-    // install (where install.py created `.venv`). The analyzer wrapper
-    // probes this when the project itself has no venv (e.g. a project
-    // registered against an existing folder via the launcher's Browse
-    // flow). We pass it as an env var rather than hard-coding a path
-    // in the script so the same script works across multiple installs.
-    // Derived from the resolved script's location: scripts dir →
-    // .claude → install root.
-    let install_root = script
+    // install (where install.py created `.venv` with weaviate-client).
+    // The analyzer wrapper probes this when the project itself has
+    // no venv (e.g. a project registered against an existing folder
+    // via the launcher's Browse flow). We pass it as an env var
+    // rather than hard-coding a path in the script so the same
+    // script works across multiple installs.
+    //
+    // Derivation:
+    //   1. If the resolved analyzer script lives under an install
+    //      root that has a .venv, use the script's grandparent
+    //      (script_dir → .claude → install_root). This is the case
+    //      when find_analyzer_script picked the launcher's own
+    //      .claude/scripts/ rather than the project's.
+    //   2. Otherwise (script is in the project's .claude/scripts/
+    //      and the project has no venv), walk up from the launcher
+    //      binary itself: `<install_root>/launcher/dist/<arch>/
+    //      vct-launcher`. We hop 4 levels up to reach <install_root>.
+    //      This is the FIX for the bug reported 2026-04-28: Agape
+    //      had a project-local analyzer script, so step 1 set
+    //      VCT_INSTALL_ROOT=/Agape/Code (no venv) and the wrapper
+    //      fell through to system python with no weaviate-client.
+    let from_script = script
         .parent()                  // .claude/scripts/
         .and_then(|p| p.parent())  // .claude/
         .and_then(|p| p.parent())  // <install_root>/
         .map(|p| p.to_path_buf());
+
+    fn looks_like_install_root(p: &std::path::Path) -> bool {
+        p.join(".venv").join("bin").join("python").is_file()
+            || p.join(".venv").join("bin").join("python3").is_file()
+            || p.join("claude_mcp_servers").join(".venv").join("bin").join("python").is_file()
+    }
+
+    let install_root = match from_script {
+        Some(p) if looks_like_install_root(&p) => Some(p),
+        _ => {
+            // Fall back to the launcher binary's own location.
+            std::env::current_exe().ok().and_then(|exe| {
+                // launcher/dist/<arch>/vct-launcher → walk up 4 hops
+                // to reach the orchestrator install root. Try a few
+                // hop counts since dev-build (`target/release/`) and
+                // bundled (`launcher/dist/<arch>/`) layouts differ.
+                let parent = exe.parent()?.to_path_buf();
+                for hops in [3, 4, 5] {
+                    let mut cur = parent.clone();
+                    let mut ok = true;
+                    for _ in 0..hops {
+                        match cur.parent() {
+                            Some(p) => cur = p.to_path_buf(),
+                            None => { ok = false; break; }
+                        }
+                    }
+                    if ok && looks_like_install_root(&cur) {
+                        return Some(cur);
+                    }
+                }
+                None
+            })
+        }
+    };
 
     // 5. Run it. We capture stdout+stderr; they're combined into one
     //    log buffer (interleaving is fine for human debugging).

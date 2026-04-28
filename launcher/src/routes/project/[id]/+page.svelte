@@ -102,19 +102,20 @@
     <button
       class="back-btn"
       onclick={() => {
-        // Send the user back to a list/picker. There's no dedicated
-        // /projects route — the home page already renders the project
-        // catalog as the default landing view, so '/' is correct *as
-        // long as* we anchor the projects section on it. If history
-        // has a previous internal route (e.g. the user navigated
-        // here from /codegraph), prefer that. Reported 2026-04-28:
-        // Back used to slam the user to the home dashboard regardless
-        // of where they came from.
-        if (window.history.length > 1 && document.referrer) {
-          history.back();
-        } else {
-          goto('/');
-        }
+        // Try browser-history back first; if it doesn't actually move
+        // (no prior entry, or popstate cancelled), the URL stays the
+        // same and we fall through to /. We schedule the fallback on
+        // a microtask so popstate has a chance to fire. If the user
+        // truly has prior history (came from /codegraph or the home
+        // grid), back() returns them there. If not (deep-link, fresh
+        // launch), we land on /.
+        const before = window.location.href;
+        history.back();
+        setTimeout(() => {
+          if (window.location.href === before) {
+            goto('/');
+          }
+        }, 50);
       }}
       aria-label="Back"
     >
