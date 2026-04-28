@@ -2,5 +2,5 @@ sentence-transformers>=5.0.0
 transformers>=4.40.0,<5.0.0
 fastapi>=0.115.0
 uvicorn>=0.46.0
-pydantic>=2.0.0
+pydantic>=2.13.3
 requests>=2.33.1
