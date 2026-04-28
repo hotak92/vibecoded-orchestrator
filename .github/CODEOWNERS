@@ -1,0 +1,6 @@
+# Default reviewer for all PRs. See https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-security/customizing-your-repository/about-code-owners
+*	@hotak92
+
+# Areas Fabio (@pb992) co-maintains — request his review too
+/launcher/	@hotak92 @pb992
+/.github/workflows/release.yml	@hotak92 @pb992
