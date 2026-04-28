@@ -9,6 +9,13 @@ interface UIState {
   showInstallWizard: boolean;
   showMcpDashboard: boolean;
   showOnboarding: boolean;
+  // 2026-04-28: true when the wizard was opened by an explicit user
+  // action (Settings → Re-run, Preferences → Re-run) rather than the
+  // automatic first-launch gate. The wizard's preflight uses this to
+  // decide whether to auto-close on the "projects already exist" branch
+  // — explicit re-runs must NOT auto-close even if projects exist.
+  // Cleared when closeOnboarding() runs.
+  onboardingForced: boolean;
 }
 
 function createUIStore() {
@@ -18,6 +25,7 @@ function createUIStore() {
     showInstallWizard: false,
     showMcpDashboard: false,
     showOnboarding: false,
+    onboardingForced: false,
   });
 
   return {
@@ -33,14 +41,38 @@ function createUIStore() {
     openMcpDashboard: () => update((s) => ({ ...s, showMcpDashboard: true })),
     closeMcpDashboard: () =>
       update((s) => ({ ...s, showMcpDashboard: false })),
-    // Clears the onboarding-complete localStorage flag and opens the wizard.
-    // Existing projects and settings are unaffected — only the completion
-    // marker is removed so the wizard re-runs from step 1.
+    // Explicit re-run by the user (Settings → Re-run, Preferences →
+    // Re-run). Clears the onboarding-complete localStorage flag, opens
+    // the wizard, AND sets onboardingForced=true so the wizard's
+    // preflight knows not to auto-close even if projects already
+    // exist. Existing projects and settings are unaffected — only the
+    // completion marker is removed so the wizard re-runs from step 1.
     openOnboarding: () => {
       try { localStorage.removeItem('vct.onboarding_complete'); } catch {}
-      update((s) => ({ ...s, showOnboarding: true }));
+      update((s) => ({
+        ...s,
+        showOnboarding: true,
+        onboardingForced: true,
+      }));
     },
-    closeOnboarding: () => update((s) => ({ ...s, showOnboarding: false })),
+    // Auto-launch path used by +layout.svelte's onMount when the
+    // onboarding-complete flag is missing. NOT a forced re-run — the
+    // wizard's preflight may still auto-close if it discovers
+    // projects already exist (e.g. localStorage was wiped but the DB
+    // is intact). Internal-only; routes should call openOnboarding().
+    autoOpenOnboarding: () => {
+      update((s) => ({
+        ...s,
+        showOnboarding: true,
+        onboardingForced: false,
+      }));
+    },
+    closeOnboarding: () =>
+      update((s) => ({
+        ...s,
+        showOnboarding: false,
+        onboardingForced: false,
+      })),
   };
 }
 

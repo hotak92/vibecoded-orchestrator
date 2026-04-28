@@ -20,7 +20,7 @@
   //
   // Or drive open/close via the bindable `open` prop.
 
-  import { onMount } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
   import type { Snippet } from 'svelte';
 
   let {
@@ -47,13 +47,34 @@
 
   // Sync external `open` prop → showModal/close. Also emit onClose when
   // the dialog closes via any path (Escape, backdrop click, .close()).
+  //
+  // 2026-04-28 (Bug B): if a caller's reactive state flips this prop
+  // false-then-true within a single microtask (Svelte's effect
+  // batching collapses to the final value `true`), the effect would
+  // see `open=true` AND `dialogEl.open=true` (never actually closed
+  // between flips) and skip the showModal() call — leaving the
+  // <dialog> in whatever top-layer state it had, which under
+  // WebKitGTK can mean an orphaned slot that captures clicks
+  // viewport-wide on subsequent screens. We track the previous value
+  // and force a close()+showModal() cycle when we observe such a
+  // toggle, which guarantees the top layer is released and re-
+  // acquired cleanly.
+  let prevOpen = false;
   $effect(() => {
     if (!dialogEl) return;
-    if (open && !dialogEl.open) {
+    const wantOpen = open;
+    const isOpen = dialogEl.open;
+    if (wantOpen && !isOpen) {
       try { dialogEl.showModal(); } catch { /* already open */ }
-    } else if (!open && dialogEl.open) {
+    } else if (!wantOpen && isOpen) {
       dialogEl.close();
+    } else if (wantOpen && isOpen && prevOpen === false) {
+      // Defensive: same-tick false→true toggle that the effect
+      // missed. Cycle the top layer.
+      try { dialogEl.close(); } catch {}
+      try { dialogEl.showModal(); } catch {}
     }
+    prevOpen = wantOpen;
   });
 
   function handleClose() {
@@ -101,6 +122,30 @@
   onMount(() => {
     // If the consumer mounted with open=true, the $effect above already
     // handled the initial showModal call. Nothing else to do here.
+  });
+
+  // Defense in depth — release the native top-layer slot BEFORE Svelte
+  // detaches the <dialog> node from the DOM.
+  //
+  // Background (2026-04-28 wizard bug): consumer code that wraps
+  //   {#if flag}<DialogRoot open={true} ...>{/if}
+  // unmounts the DialogRoot when `flag` flips to false. WebKitGTK keeps
+  // the <dialog>'s top-layer entry alive UNTIL someone calls .close()
+  // on the element — DOM removal alone is not enough to release the
+  // top layer. The orphaned top-layer entry then captures pointer
+  // events viewport-wide on subsequent screens (Bugs 1, 3, 4, 5 in the
+  // OnboardingWizard). Per MDN: top-layer placement is set by
+  // showModal() and released by close(), independent of DOM tree.
+  //
+  // Calling close() in onDestroy guarantees correct teardown even when
+  // a (badly-written) caller passed `open={true}` as a literal and
+  // then yanks the component via {#if} — the $effect above never sees
+  // the open=true→false transition in that pattern, so it cannot do
+  // this cleanup itself.
+  onDestroy(() => {
+    if (dialogEl?.open) {
+      try { dialogEl.close(); } catch { /* already closed */ }
+    }
   });
 </script>
 

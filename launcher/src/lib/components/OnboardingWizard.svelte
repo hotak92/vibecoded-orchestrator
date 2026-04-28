@@ -8,9 +8,39 @@
   import DialogRoot from '$lib/components/DialogRoot.svelte';
 
   let {
-    open = $bindable<boolean>(false),
+    force = false,
+    onClose,
     onComplete,
-  }: { open: boolean; onComplete?: () => void } = $props();
+  }: {
+    // 2026-04-28 fix (Bug A): the wizard no longer takes a bindable
+    // `open` prop. The parent gates the wizard with
+    // `{#if uiState.showOnboarding}` and listens for `onClose` to flip
+    // its store; if we're mounted at all, we're meant to be visible.
+    // The previous two-effect bridge in +layout.svelte (mirror
+    // store→local + back-sync local→store) raced on Svelte 5's
+    // effect-ordering and reopened the wizard one tick after Skip
+    // closed it. Single source of truth (the ui store) eliminates the
+    // race. See +layout.svelte for the consumer side.
+    //
+    // 2026-04-28 fix (forced re-run): `force` is set true when the
+    // user explicitly invoked Settings → Preferences → "Re-run
+    // onboarding wizard". The preflight then skips the
+    // already-have-projects auto-close branch (which would otherwise
+    // hide the wizard immediately on a machine that already has
+    // projects registered). The install-root path-defaulting branch
+    // still runs so step 3 / step 4 see correct defaults.
+    force?: boolean;
+    onClose?: () => void;
+    onComplete?: () => void;
+  } = $props();
+
+  // Internal: drives the outer <DialogRoot bind:open>. Initialises
+  // true because the parent only mounts us when the wizard should be
+  // visible (gated by `{#if $ui.showOnboarding}`). Internal exit
+  // paths set this to false, but they ALSO call onClose() so the
+  // parent unmounts us — at which point DialogRoot.onDestroy
+  // releases the native top-layer slot regardless.
+  let open = $state(true);
 
   const inTauri = isTauriRuntime();
 
@@ -125,6 +155,20 @@
       projectPath = picked;
       projectPathTouched = true;
     }
+  }
+
+  // 2026-04-28 fix (Bug 2): step 3's install-path field had no Browse
+  // button — users had to manually type/paste an absolute path, which
+  // led to typos and concatenation bugs. Mirror step 4's
+  // browseProjectFolder pattern using the shared pickDirectory wrapper
+  // (Tauri 2 plugin-dialog `open({ directory: true })`).
+  async function browseInstallFolder() {
+    if (!inTauri) return;
+    const picked = await pickDirectory({
+      defaultPath: installPath || undefined,
+      title: 'Select install folder',
+    });
+    if (picked) installPath = picked;
   }
 
   async function savePat() {
@@ -387,7 +431,7 @@
       // Non-fatal — at worst the project is still listed; user can pick it.
     }
     try { localStorage.setItem(KEY, 'true'); } catch {}
-    open = false;
+    onClose?.();
     onComplete?.();
   }
 
@@ -406,7 +450,7 @@
       toast.success(`Project "${name}" recreated`);
       duplicateProjectPrompt = null;
       try { localStorage.setItem(KEY, 'true'); } catch {}
-      open = false;
+      onClose?.();
       onComplete?.();
     } catch (e) {
       projectError = e instanceof Error ? e.message : String(e);
@@ -454,7 +498,7 @@
         toast.success(`Project "${projectName.trim()}" created`);
         // Trigger the same close-on-success flow as the regular finish.
         try { localStorage.setItem(KEY, 'true'); } catch {}
-        open = false;
+        onClose?.();
         onComplete?.();
       } catch (e) {
         projectError = e instanceof Error ? e.message : String(e);
@@ -560,7 +604,7 @@
       }
     }
     try { localStorage.setItem(KEY, 'true'); } catch {}
-    open = false;
+    onClose?.();
     onComplete?.();
   }
 
@@ -584,6 +628,13 @@
    * (stay on step 3). No more silent skips.
    */
   function next() {
+    // 2026-04-28 fix (Bug 4): refuse to advance while any secondary
+    // modal is up. With the WebKitGTK top-layer leak now fixed at
+    // DialogRoot level (onDestroy + bind:open), this is belt-and-
+    // suspenders against re-entrant Next clicks (double-click during
+    // animation, keyboard repeat, etc.) — a stuck modal must NOT be
+    // bypassable by hitting Next a second time.
+    if (showSkipInstallConfirm || pendingConflict || duplicateProjectPrompt) return;
     if (step === 3 && !installed) {
       showSkipInstallConfirm = true;
       return;
@@ -623,7 +674,7 @@
     pendingConflict = null;
     conflictResumeStep4 = false;
     creatingProject = false;
-    open = false;
+    onClose?.();
     onComplete?.();
   }
 
@@ -654,11 +705,18 @@
       // browser-cache reset (reported 2026-04-28 after webkit storage
       // wipe during connection-refused debugging). Treat "≥1 project
       // in the DB" as proof of completion and close immediately.
+      //
+      // Exception: when `force=true` (user explicitly clicked
+      // "Re-run onboarding wizard" in Settings → Preferences), skip
+      // this auto-close — the user wants to see the wizard even if
+      // projects are already registered. The install-root probe
+      // below still runs so path defaults are correct on a machine
+      // that already has an install.
       try {
         const projects = await invoke<unknown[]>('list_projects_v2');
-        if (Array.isArray(projects) && projects.length > 0) {
+        if (!force && Array.isArray(projects) && projects.length > 0) {
           try { localStorage.setItem(KEY, 'true'); } catch {}
-          open = false;
+          onClose?.();
           preflightChecked = true;
           onComplete?.();
           return;
@@ -775,7 +833,26 @@
           {:else}
             <label class="ow-label">
               <span>Install path</span>
-              <input bind:value={installPath} />
+              <!-- 2026-04-28 fix (Bug 2): Browse button mirrors step 4's
+                   project-folder picker so users can avoid typing
+                   absolute paths by hand. -->
+              <div class="ow-path-row">
+                <input
+                  type="text"
+                  class="ow-path-input"
+                  bind:value={installPath}
+                  placeholder="/path/to/install"
+                />
+                <button
+                  type="button"
+                  class="ow-btn"
+                  onclick={browseInstallFolder}
+                  disabled={!inTauri}
+                  title={inTauri ? 'Browse for folder' : 'Browse requires the desktop app'}
+                >
+                  Browse…
+                </button>
+              </div>
             </label>
           {/if}
           <!-- Bug 27: removed the "Copying from <repo path>" line — that
@@ -1052,7 +1129,11 @@
         <div class="ow-nav">
           {#if step > 1}<button class="ow-btn" onclick={prev}>Back</button>{/if}
           {#if step < 4}
-            <button class="ow-btn-primary" onclick={next}>Next →</button>
+            <button
+              class="ow-btn-primary"
+              onclick={next}
+              disabled={!!showSkipInstallConfirm || !!pendingConflict || !!duplicateProjectPrompt}
+            >Next →</button>
           {:else}
             <button class="ow-btn-primary" onclick={finish} disabled={creatingProject}>
               {creatingProject ? 'Creating…' : 'Finish'}
@@ -1066,15 +1147,32 @@
 <!-- Bug 28: explicit skip-install confirmation. Triggered when the user
      hits Next on step 3 without having installed the orchestrator. We
      refuse to silently advance — the user picks Install, Skip, or
-     Cancel. -->
+     Cancel.
+
+     2026-04-28 fix (Bugs 1/3/4/5): use bind:open so DialogRoot's $effect
+     drives showModal()/close() lifecycle. The previous `open={true}`
+     literal + outer `{#if}` pattern leaked the native top-layer slot
+     when WebKitGTK detached the <dialog> while it was still in the
+     top layer. DialogRoot now also has an onDestroy cleanup as
+     defense-in-depth. -->
 {#if showSkipInstallConfirm}
 <DialogRoot
-  open={true}
+  bind:open={showSkipInstallConfirm}
   width="460px"
   onClose={cancelSkipInstall}
 >
   {#snippet header()}
-    <h2 style="margin:0;font-size:15px;">Install the orchestrator?</h2>
+    <div class="ow-modal-header-row">
+      <h2 style="margin:0;font-size:15px;">Install the orchestrator?</h2>
+      <button
+        type="button"
+        class="ow-modal-close"
+        onclick={cancelSkipInstall}
+        disabled={installing}
+        aria-label="Close"
+        title="Close"
+      >×</button>
+    </div>
   {/snippet}
   {#snippet body()}
     <p style="margin:0 0 10px;color:#ccc;">
@@ -1111,6 +1209,11 @@
                           NOT touch filesystem).
        - Cancel         : back to step 4 with current input intact.
      Reported 2026-04-28. -->
+<!-- 2026-04-28 fix (Bugs 1/3/4/5): duplicate-project state is an object
+     (not a plain bool) so we keep `open={true}` here. DialogRoot's new
+     onDestroy hook calls dialog.close() before WebKit detaches the
+     element, releasing the top-layer slot — which was the actual leak
+     causing viewport-wide click capture on subsequent screens. -->
 {#if duplicateProjectPrompt}
 <DialogRoot
   open={true}
@@ -1118,7 +1221,17 @@
   onClose={cancelDuplicatePrompt}
 >
   {#snippet header()}
-    <h2 style="margin:0;font-size:15px;">Project already registered</h2>
+    <div class="ow-modal-header-row">
+      <h2 style="margin:0;font-size:15px;">Project already registered</h2>
+      <button
+        type="button"
+        class="ow-modal-close"
+        onclick={cancelDuplicatePrompt}
+        disabled={recreatingProject}
+        aria-label="Close"
+        title="Close"
+      >×</button>
+    </div>
   {/snippet}
   {#snippet body()}
     <p style="margin:0 0 10px;color:#ccc;">
@@ -1153,6 +1266,9 @@
      The Rust install_orchestrator command returns an InstallConflictError
      in that case; we parse it out of the Err string in `runInstall` and
      populate `pendingConflict` to show this dialog. -->
+<!-- 2026-04-28 fix (Bugs 1/3/4/5): pendingConflict is an object (not a
+     bool); keep open={true}. DialogRoot's onDestroy releases the top
+     layer when WebKit detaches the node. -->
 {#if pendingConflict}
 <DialogRoot
   open={true}
@@ -1160,10 +1276,20 @@
   onClose={cancelConflictResolution}
 >
   {#snippet header()}
-    <h2 style="margin:0;font-size:15px;">
-      Existing install detected at
-      <code class="ow-mono" style="font-size:11px;">{pendingConflict!.install_path}</code>
-    </h2>
+    <div class="ow-modal-header-row">
+      <h2 style="margin:0;font-size:15px;">
+        Existing install detected at
+        <code class="ow-mono" style="font-size:11px;">{pendingConflict!.install_path}</code>
+      </h2>
+      <button
+        type="button"
+        class="ow-modal-close"
+        onclick={cancelConflictResolution}
+        disabled={installing}
+        aria-label="Close"
+        title="Close"
+      >×</button>
+    </div>
   {/snippet}
   {#snippet body()}
     <p style="margin:0 0 12px;color:#ccc;font-size:13px;">
@@ -1297,6 +1423,17 @@
   .ow-path-row { display: flex; gap: 6px; align-items: stretch; }
   .ow-path-input { flex: 1; }
   .ow-confirm-actions { display: flex; gap: 6px; justify-content: flex-end; }
+  /* 2026-04-28: secondary modals get an explicit X close button so the
+     user always has an unambiguous dismiss path even if buttons in the
+     footer are momentarily disabled (Bugs 1/3/4/5 follow-up). */
+  .ow-modal-header-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+  .ow-modal-close {
+    flex-shrink: 0; width: 24px; height: 24px; padding: 0; line-height: 1;
+    font-size: 16px; border-radius: 4px; cursor: pointer;
+    background: transparent; border: 1px solid transparent; color: #888;
+  }
+  .ow-modal-close:hover:not(:disabled) { color: #eee; border-color: rgba(255,255,255,0.15); background: rgba(255,255,255,0.04); }
+  .ow-modal-close:disabled { opacity: 0.4; cursor: not-allowed; }
   .ow-nav { display: flex; gap: 6px; }
   .ow-btn, .ow-btn-primary, .ow-btn-link {
     padding: 5px 14px; border-radius: 4px; cursor: pointer; font-size: 12px; font-weight: 500;
