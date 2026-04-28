@@ -98,6 +98,24 @@ if [ ! -f "$LAUNCHER_DIR/build/index.html" ] || \
 fi
 echo "[build-bundled] frontend assets present ($(ls "$LAUNCHER_DIR/build/_app/immutable/assets/" | wc -l) files)"
 
+# Windows + OneDrive guard: if the repo lives under a OneDrive-synced
+# path, the SvelteKit assets that pnpm just wrote may be in a
+# dehydrated/syncing state when tauri-build's embedder reads them.
+# The embedder gets ENOENT or zero bytes silently, builds a release
+# binary with no embedded frontend, and the launcher renders "Could
+# not connect to localhost" at runtime. Reported 2026-04-28 from a
+# build inside C:\Users\<u>\OneDrive\Desktop\orchestrator\ — produced
+# a 24 MB .exe with 0 asset refs vs the expected 31 MB / 31 refs.
+case "$REPO_ROOT" in
+    *OneDrive*|*onedrive*)
+        echo "[build-bundled] WARNING: repo path contains 'OneDrive' — Tauri's embedder" >&2
+        echo "                may fail to read SvelteKit assets due to OneDrive's virtual FS." >&2
+        echo "                If the post-build asset-ref check below fails with 0 refs," >&2
+        echo "                move the repo OUTSIDE the OneDrive-synced tree (e.g. C:\\dev\\)" >&2
+        echo "                and rebuild." >&2
+        ;;
+esac
+
 # Build with --no-bundle (we ship the binary, not the installer bundle).
 # `npx` isn't always present on minimal Node installs (the user's
 # `~/.local/bin/node` install on 2026-04-28 had `npm` but no `npx`).
