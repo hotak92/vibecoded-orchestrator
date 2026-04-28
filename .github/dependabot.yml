@@ -65,3 +65,20 @@ updates:
     commit-message:
       prefix: "deps(launcher)"
       include: "scope"
+
+  # cargo — launcher Tauri Rust backend
+  - package-ecosystem: "cargo"
+    directory: "/launcher/src-tauri"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "cargo"
+      - "launcher"
+    commit-message:
+      prefix: "deps(launcher)"
+      include: "scope"
