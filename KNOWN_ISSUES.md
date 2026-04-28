@@ -47,6 +47,19 @@ flagging for early adopters and the next iteration.
       `knowledge/concepts/`. None affect correctness; the install completes successfully.
       Vocabulary cleanup of seed nodes is a v0.1.1 chore.
 
+## Dev-only / upstream-blocked security alerts
+
+- [ ] **`cookie@0.6.0` (low) — out-of-bounds chars in name/path/domain
+      ([GHSA-pxg6-pf52-xh8x](https://github.com/advisories/GHSA-pxg6-pf52-xh8x))**.
+      Pulled in transitively via `@sveltejs/kit@2.58.0` (latest), which
+      pins `cookie@^0.6.0`. No in-range fix: `npm audit fix --force`
+      would downgrade `@sveltejs/kit` to `0.0.30` (breaking). Tracked
+      upstream; will pick up the patch when SvelteKit bumps its `cookie`
+      dependency. Surfaces as 3 transitive low alerts (`cookie`,
+      `@sveltejs/kit`, `@sveltejs/adapter-static`). No runtime cookie
+      handling in our launcher (`@sveltejs/adapter-static` builds to a
+      static SPA — no SSR cookie path is exercised at runtime).
+
 ## Pending v0.1.x
 
 - [ ] **Custom MCP tab is not populated by initial project registration** — `project_state_populate`
