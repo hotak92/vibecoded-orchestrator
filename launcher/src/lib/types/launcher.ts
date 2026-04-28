@@ -143,3 +143,18 @@ export interface CodeGraphBuildView {
   /** Live phase indicator on `running` events (e.g. "scan", "analyze"). */
   current_phase: string | null;
 }
+
+/** Mirrors `InstallHealth` in commands/installer.rs. Returned by
+ *  `check_install_health` once at app startup. When `all_ok` is false the
+ *  layout renders `InstallHealthGate.svelte` as a blocking modal. */
+export interface InstallHealth {
+  /** Resolved install-root path (null = developer mode, no install root
+   *  found by walking up from the launcher binary). */
+  install_root: string | null;
+  has_venv: boolean;
+  has_state_dir: boolean;
+  has_env_with_kg: boolean;
+  mcp_servers_ok: boolean;
+  /** True when every signal passes OR when in developer mode. */
+  all_ok: boolean;
+}

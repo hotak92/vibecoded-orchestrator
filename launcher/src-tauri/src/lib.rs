@@ -227,6 +227,12 @@ pub fn run() {
             commands::installer::install_orchestrator,
             commands::installer::preview_install,
             commands::installer::detect_existing_install_root,
+            // Install health gate. Runs once at app startup from
+            // `+layout.svelte` to detect the .exe-only install scenario
+            // (user downloads launcher binary from a Release, skips
+            // first-install.{bat,sh,command}). Returns `all_ok: true` for
+            // dev builds running outside any install root.
+            commands::installer::check_install_health,
             // Durable install log reader. Backs the OnboardingWizard's
             // skip-if-installed path + a future Settings → Install
             // Diagnostics panel. Pull-only: the FE invokes on demand.
