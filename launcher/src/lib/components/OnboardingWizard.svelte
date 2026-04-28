@@ -1123,7 +1123,7 @@
   {#snippet body()}
     <p style="margin:0 0 10px;color:#ccc;">
       A project at
-      <code class="ow-mono">{duplicateProjectPrompt.path}</code>
+      <code class="ow-mono">{duplicateProjectPrompt?.path ?? ''}</code>
       is already in the launcher's database.
     </p>
     <p style="margin:0 0 10px;color:#888;font-size:12px;">
