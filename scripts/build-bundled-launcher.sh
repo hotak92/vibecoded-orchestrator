@@ -41,11 +41,15 @@ for arg in "$@"; do
 done
 
 # Detect host arch.
+# `BUILD_TARGET` env override lets CI explicitly pick the canonical
+# directory name (e.g. `macos-arm64` for the Apple-Silicon job, where
+# uname-detection alone produced the legacy `experimental_macOS` slot
+# used for local maintainer builds).
 case "$(uname -s)-$(uname -m)" in
-    Linux-x86_64)   HOST_TARGET="linux-x64";   HOST_BIN="vct-launcher" ;;
-    Darwin-arm64)   HOST_TARGET="experimental_macOS"; HOST_BIN="vct-launcher" ;;
-    Darwin-x86_64)  HOST_TARGET="experimental_macOS"; HOST_BIN="vct-launcher" ;;
-    MINGW*|MSYS*|CYGWIN*) HOST_TARGET="windows-x64"; HOST_BIN="vct-launcher.exe" ;;
+    Linux-x86_64)   HOST_TARGET="${BUILD_TARGET:-linux-x64}";   HOST_BIN="vct-launcher" ;;
+    Darwin-arm64)   HOST_TARGET="${BUILD_TARGET:-macos-arm64}"; HOST_BIN="vct-launcher" ;;
+    Darwin-x86_64)  HOST_TARGET="${BUILD_TARGET:-macos-x64}";   HOST_BIN="vct-launcher" ;;
+    MINGW*|MSYS*|CYGWIN*) HOST_TARGET="${BUILD_TARGET:-windows-x64}"; HOST_BIN="vct-launcher.exe" ;;
     *)
         echo "[build-bundled] Unrecognised host: $(uname -s)-$(uname -m). Aborting." >&2
         exit 1
@@ -259,6 +263,17 @@ if command -v git >/dev/null 2>&1; then
     SOURCE_HASH="$(cd "$REPO_ROOT" && git ls-tree HEAD launcher/src-tauri/src/ launcher/src/ launcher/src-tauri/Cargo.toml launcher/src-tauri/Cargo.lock launcher/package.json 2>/dev/null | git hash-object --stdin 2>/dev/null || echo '')"
 fi
 
+# Tier marker. macOS targets ship UNSIGNED at this stage (Apple Developer
+# ID + notarytool deferred to v0.2.x), so any consumer reading the
+# metadata can route on `tier == "experimental"` to surface the
+# Gatekeeper warning to end users. linux-x64 + windows-x64 ship as
+# `stable`. Local maintainer macOS builds (legacy `experimental_macOS`
+# slot) stay tier=`experimental` too.
+case "$HOST_TARGET" in
+    macos-arm64|macos-x64|experimental_macOS) TIER="experimental" ;;
+    *) TIER="stable" ;;
+esac
+
 cat > "${DEST}.metadata.json" <<METADATA_EOF
 {
   "source_sha": "$SOURCE_SHA",
@@ -268,7 +283,8 @@ cat > "${DEST}.metadata.json" <<METADATA_EOF
   "launcher_version": "$TAURI_VERSION",
   "host_target": "$HOST_TARGET",
   "binary_name": "$HOST_BIN",
-  "binary_size_bytes": $(stat -c%s "$DEST" 2>/dev/null || stat -f%z "$DEST" 2>/dev/null || echo 0)
+  "binary_size_bytes": $(stat -c%s "$DEST" 2>/dev/null || stat -f%z "$DEST" 2>/dev/null || echo 0),
+  "tier": "$TIER"
 }
 METADATA_EOF
 echo "[build-bundled] Staged: $DEST"
