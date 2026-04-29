@@ -143,7 +143,7 @@
   // 2026-04-28 fix: do NOT auto-fill projectPath with a templated value.
   // Earlier code wrote `${suggestedRoot}/${slug}` into the field as a real
   // value, which (a) looked like a concrete location the user had to delete
-  // before typing their own (`/home/martino/code/agape`), and (b) implied
+  // before typing their own (`~/dev/myproject`), and (b) implied
   // the orchestrator expected projects under `~/code/` even when the user
   // had no such directory. Now: leave the field blank, show only a generic
   // `path/to/project` placeholder, and let the user type or click Browse.

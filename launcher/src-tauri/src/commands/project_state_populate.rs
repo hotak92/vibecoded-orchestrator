@@ -936,7 +936,7 @@ mod tests {
     /// skills, hooks block. Verifies the launcher GUI's per-project tabs
     /// would no longer be empty.
     #[test]
-    fn end_to_end_simulates_agape_onboarding() {
+    fn end_to_end_simulates_full_onboarding() {
         let folder = scratch_dir("e2e");
         let claude = folder.join(".claude");
         let agents_dir = claude.join("agents");
@@ -972,7 +972,7 @@ mod tests {
 
         let db = make_db_with_project("acme-id", "Acme");
         let report = populate_project_state_from_filesystem(
-            "agape-id",
+            "acme-id",
             "Acme",
             &folder,
             &db,
@@ -986,7 +986,7 @@ mod tests {
         assert!(report.warnings.is_empty(), "warnings: {:?}", report.warnings);
 
         // Snapshot is what the GUI consumes — verify it has everything.
-        let snap = db.get_project_state_snapshot("agape-id").unwrap();
+        let snap = db.get_project_state_snapshot("acme-id").unwrap();
         assert_eq!(snap.agents.len(), 26);
         assert_eq!(snap.skills.len(), 4);
         assert_eq!(snap.hooks.len(), 2);

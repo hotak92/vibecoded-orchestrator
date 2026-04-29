@@ -430,7 +430,7 @@ Bash test -f tests/pytest.ini && echo "pytest.ini exists" || echo "Missing pytes
 - Project: ImageDataset Manager
 - Phase: Testing & Integration
 - Current issues: CONTEXT_STATE.md 515 lines, docs/ 113 files
-- Technology: Python 3.12, OneTrainer, Weaviate, Ollama
+- Technology: Python 3.12, TrainingTool, Weaviate, Ollama
 
 **Success Criteria**:
 - CONTEXT_STATE.md <200 lines (current work only)
@@ -452,7 +452,7 @@ Bash test -f tests/pytest.ini && echo "pytest.ini exists" || echo "Missing pytes
 
 **Context**:
 - Project: ImageDataset Manager
-- Search for: VLM patterns, VRAM management, content safety, OneTrainer integration
+- Search for: VLM patterns, VRAM management, content safety, TrainingTool integration
 - Check: What's already documented? What's missing?
 
 **Success Criteria**:
@@ -590,7 +590,7 @@ Write .claude/agents/imagedataset-organizer.md
 # - [ ] Recent test images organized by date
 # - [ ] No failed generation artifacts
 #
-# **OneTrainer Integration**:
+# **TrainingTool Integration**:
 # - [ ] workspace/concepts.json exists
 # - [ ] Model configs current (match docs/MODEL_CONFIGS.md)
 # - [ ] VRAM limits enforced (RTX 3060 12GB)
@@ -602,7 +602,7 @@ Write .claude/agents/imagedataset-organizer.md
 #
 # ## ImageDataset-Specific Actions
 # - Check test outputs size: `du -sh test_outputs/`
-# - Verify OneTrainer workspace: `ls ~/OneTrainer/workspace/concepts.json`
+# - Verify TrainingTool workspace: `ls ~/TrainingTool/workspace/concepts.json`
 # - Validate VRAM patterns: `grep "torch.cuda.empty_cache" src/**/*.py`
 ```
 
@@ -634,7 +634,7 @@ Write .claude/agents/imagedataset-organizer.md
 
 2. **kg-navigator** (Sonnet):
    - Found related patterns: VLM systems (ImagePipeline), VRAM management (ImagePipeline)
-   - Identified gaps: VLM Consensus Pattern, OneTrainer Integration
+   - Identified gaps: VLM Consensus Pattern, TrainingTool Integration
    - Recommendations: Create 2 concept nodes (done)
 
 ### Self-Executed

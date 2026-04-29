@@ -295,9 +295,9 @@ Write to `.claude/logs/graph_health_report.md`:
   2. Change link to `[[uses::Redis]]` (existing node)
 
 ### 2. Missing Embedding
-- **Node**: knowledge/projects/agape.md
+- **Node**: knowledge/projects/acme.md
 - **Issue**: Node has no vector embedding (semantic search won't work)
-- **Fix**: Run: `.claude/scripts/kg-sync knowledge/projects/agape.md`
+- **Fix**: Run: `.claude/scripts/kg-sync knowledge/projects/acme.md`
 
 ### 3. Code Entity File Not Found
 - **Entity**: CodeModule "src/old_api.py"
