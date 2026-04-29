@@ -47,6 +47,14 @@ flagging for early adopters and the next iteration.
       `knowledge/concepts/`. None affect correctness; the install completes successfully.
       Vocabulary cleanup of seed nodes is a v0.1.1 chore.
 
+- [ ] **First-install grew by ~150 MB for Playwright MCP** — the default-enabled
+      `playwright` MCP entry pre-caches Chromium during `install.py` so the first
+      browser-automation call doesn't stall on a 150 MB download. Bandwidth-constrained
+      users can opt out by exporting `VCT_SKIP_PLAYWRIGHT=1` before running
+      `first-install.sh` / `install.py`; the MCP will then lazy-install Chromium on
+      its first browser-launch instead. The pre-cache is non-fatal — if `npx` is
+      missing or the download fails, the install logs a warn event and continues.
+
 ## Dev-only / upstream-blocked security alerts
 
 - [ ] **`cookie@0.6.0` (low) — out-of-bounds chars in name/path/domain

@@ -255,6 +255,19 @@ fn default_mcp_servers() -> Vec<McpServerConfig> {
                 }),
             ]),
         },
+        McpServerConfig {
+            id: "playwright".to_string(),
+            name: "Browser automation".to_string(),
+            description: "Browser automation, screenshots, and GUI testing via @playwright/mcp (Microsoft, Apache-2.0). Auto-installed via npx; Chromium (~150 MB) is cached during first-install. Set VCT_SKIP_PLAYWRIGHT=1 to skip the eager browser download.".to_string(),
+            enabled: true, // Default-enabled — Playwright is generally useful and Chromium is cached during first-install
+            command: "npx".to_string(),
+            args: vec!["-y".to_string(), "@playwright/mcp@latest".to_string()],
+            env: HashMap::new(),
+            min_tier: OrchestratorTier::Free, // Available to all tiers
+            port: None, // stdio-based MCP, no HTTP port
+            configurable: false, // No user-editable settings on day one (can be added later)
+            settings: HashMap::new(),
+        },
     ]
 }
 

@@ -254,7 +254,7 @@ pub async fn remove_mcp_server(mcp_id: String) -> Result<Vec<McpServerConfig>, S
     let mut config = load_config();
 
     // Don't allow removing built-in servers
-    let builtin = ["weaviate-kg", "ollama", "search", "code-embed"];
+    let builtin = ["weaviate-kg", "ollama", "search", "code-embed", "playwright"];
     if builtin.contains(&mcp_id.as_str()) {
         return Err(format!("Cannot remove built-in MCP server '{}'. Disable it instead.", mcp_id));
     }

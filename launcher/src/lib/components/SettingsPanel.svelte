@@ -1,6 +1,7 @@
 <script lang="ts">
   import { auth, currentUser } from '$lib/stores/auth';
   import { settings } from '$lib/stores/settings';
+  import { ui } from '$lib/stores/ui';
   import { invoke } from '$lib/tauri';
   import SecretsPanel from './SecretsPanel.svelte';
   import DialogRoot from '$lib/components/DialogRoot.svelte';
@@ -8,6 +9,18 @@
   let { open = $bindable(false) }: { open: boolean } = $props();
 
   let activeSection = $state<'profile' | 'downloads' | 'secrets' | 'preferences' | 'about'>('profile');
+
+  // When callers open Settings via ui.openSettings('secrets') (e.g.
+  // the per-project SecretsTab "Open secrets panel" button), jump
+  // straight to that section instead of staying on whatever was last
+  // active. The store field is consumed-once and cleared by
+  // closeSettings(), so this only fires when a caller explicitly
+  // requested an initial section.
+  $effect(() => {
+    if (open && $ui.settingsInitialSection) {
+      activeSection = $ui.settingsInitialSection;
+    }
+  });
 
   // Shared services status. These are the per-machine Weaviate /
   // Ollama / code_embed instances that all orchestrator installs reuse via
