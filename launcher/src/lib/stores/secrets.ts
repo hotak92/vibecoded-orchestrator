@@ -58,7 +58,7 @@ function createSecretsStore() {
     async refresh(entry: Pick<SecretEntry, 'project_id' | 'module_id' | 'scope' | 'key' | 'sensitive'>): Promise<void> {
       if (!tauriAvailable()) return;
       const args = {
-        projectId: entry.scope === 'global' ? '_global_' : entry.project_id,
+        projectId: resolveProjectId(entry),
         moduleId: entry.module_id,
         scope: entry.scope,
         key: entry.key,
@@ -109,7 +109,7 @@ function createSecretsStore() {
       update((s) => ({ ...s, busy: true, error: null }));
       try {
         await invoke<void>('set_secret_v2', {
-          projectId: entry.scope === 'global' ? '_global_' : entry.project_id,
+          projectId: resolveProjectId(entry),
           moduleId: entry.module_id,
           scope: entry.scope,
           key: entry.key,
@@ -129,12 +129,14 @@ function createSecretsStore() {
       }
     },
 
-    async clearValue(entry: Pick<SecretEntry, 'project_id' | 'module_id' | 'scope' | 'key' | 'sensitive'>): Promise<void> {
+    /** Unset: clear the keychain VALUE but keep the entry in the registry
+     * map so it still renders as "not set". Use case: rotating tokens. */
+    async unsetValue(entry: Pick<SecretEntry, 'project_id' | 'module_id' | 'scope' | 'key' | 'sensitive'>): Promise<void> {
       if (!tauriAvailable()) throw new Error('Tauri not available');
       update((s) => ({ ...s, busy: true, error: null }));
       try {
         await invoke<void>('clear_secret_v2', {
-          projectId: entry.scope === 'global' ? '_global_' : entry.project_id,
+          projectId: resolveProjectId(entry),
           moduleId: entry.module_id,
           scope: entry.scope,
           key: entry.key,
@@ -151,10 +153,65 @@ function createSecretsStore() {
       }
     },
 
+    /** Remove: clear the keychain value AND drop the entry from the
+     * registry map. The row stops appearing in the panel. Use Unset
+     * instead if you want the entry to remain visible (e.g. token
+     * rotation). */
+    async removeEntry(entry: Pick<SecretEntry, 'project_id' | 'module_id' | 'scope' | 'key' | 'sensitive'>): Promise<void> {
+      if (!tauriAvailable()) throw new Error('Tauri not available');
+      update((s) => ({ ...s, busy: true, error: null }));
+      try {
+        await invoke<void>('remove_secret_v2', {
+          projectId: resolveProjectId(entry),
+          moduleId: entry.module_id,
+          scope: entry.scope,
+          key: entry.key,
+        });
+        update((s) => {
+          const k = entryKey(entry);
+          if (!s.entries.has(k)) return { ...s, busy: false };
+          const map = new Map(s.entries);
+          map.delete(k);
+          return { ...s, entries: map, busy: false };
+        });
+      } catch (e) {
+        update((s) => ({
+          ...s,
+          busy: false,
+          error: e instanceof Error ? e.message : String(e),
+        }));
+        throw e;
+      }
+    },
+
+    /** Drop an entry from the in-memory registry without touching the
+     * keychain. Used when re-seeding or pruning stale UI state. */
+    forgetEntry(entry: Pick<SecretEntry, 'project_id' | 'module_id' | 'scope' | 'key'>): void {
+      update((s) => {
+        const k = entryKey(entry);
+        if (!s.entries.has(k)) return s;
+        const map = new Map(s.entries);
+        map.delete(k);
+        return { ...s, entries: map };
+      });
+    },
+
     clearError() {
       update((s) => ({ ...s, error: null }));
     },
   };
+}
+
+// Resolve the project_id we send to the backend. Globals use a fixed
+// sentinel; shared scope uses a different sentinel (so all "shared"
+// secrets land in one user-wide bucket regardless of which project is
+// currently selected — see backend `enforce_scope_invariants`); per-
+// project uses the entry's project_id (must reference a registered
+// project, enforced by backend).
+function resolveProjectId(entry: Pick<SecretEntry, 'project_id' | 'scope'>): string {
+  if (entry.scope === 'global') return '_global_';
+  if (entry.scope === 'shared') return '_user_shared_';
+  return entry.project_id;
 }
 
 export const secrets = createSecretsStore();
