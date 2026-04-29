@@ -42,7 +42,21 @@
 
   // Apps that are not yet purchasable. "Get" / "Activate" buttons are
   // replaced by a "Coming soon" badge for these IDs.
-  const COMING_SOON = new Set(['mao']);
+  // 2026-04-30: pre-launch hardening — only `orchestrator` is actually
+  // shippable today. Everything else (Pro, MAO, Transcrypt, Arzillibus,
+  // ConvertiFacile, DataWeave, FormCraft, PixelSnap) is on the
+  // pipeline, none are purchasable yet. Show "Coming soon" rather than
+  // a misleading "Get" button that 404s in some flows.
+  const COMING_SOON = new Set([
+    'orchestrator-pro',
+    'mao',
+    'transcrypt',
+    'arzillibus',
+    'convertifacile',
+    'dataweave',
+    'formcraft',
+    'pixelsnap',
+  ]);
 
   let selectedApp = $state<AppItem | null>(null);
 
