@@ -52,6 +52,17 @@
   let detectError = $state<string | null>(null);
 
   // Step 3: install
+  // 2026-04-29 fix (wizard install-path lockdown):
+  // The install path is NOT user-configurable. vco installs in-place
+  // alongside the source repo it's launched from — letting the user
+  // pick an arbitrary folder produced "orphan" installs (orchestrator
+  // files copied into an empty folder, but no launcher / no
+  // first-install.sh / no scripts) that the end user couldn't run.
+  // `installPath` is now derived from the launcher's local repo
+  // source (`get_local_repo_source`) at step 3 entry and the field
+  // is rendered read-only. The `installPath` $state is retained so
+  // downstream code paths (buildInstallConfig, conflict modal,
+  // already-installed display, finish()) keep working unchanged.
   let installPath = $state('');
   let installing = $state(false);
   let installed = $state(false);
@@ -61,6 +72,13 @@
   // can confirm what's being copied. Loaded once on step 3 entry.
   let sourcePath = $state<string | null>(null);
   let sourceError = $state<string | null>(null);
+  // 2026-04-29 fix: confirmation modal before the install runs. The
+  // wizard previously kicked off install_orchestrator on the very
+  // first click of the Install button — fine when the user typed the
+  // path themselves, but with the path now locked to the source repo
+  // we want one explicit confirmation step so the user understands
+  // what's about to happen.
+  let showInstallConfirm = $state(false);
 
   // Bug 29: shared-container detection. On step 3 entry we probe the three
   // default ports and tell the user whether their install will REUSE existing
@@ -156,19 +174,9 @@
     }
   }
 
-  // 2026-04-28 fix (Bug 2): step 3's install-path field had no Browse
-  // button — users had to manually type/paste an absolute path, which
-  // led to typos and concatenation bugs. Mirror step 4's
-  // browseProjectFolder pattern using the shared pickDirectory wrapper
-  // (Tauri 2 plugin-dialog `open({ directory: true })`).
-  async function browseInstallFolder() {
-    if (!inTauri) return;
-    const picked = await pickDirectory({
-      defaultPath: installPath || undefined,
-      title: 'Select install folder',
-    });
-    if (picked) installPath = picked;
-  }
+  // 2026-04-29 fix (wizard install-path lockdown): browseInstallFolder()
+  // was removed — the install path is no longer user-pickable. See the
+  // `installPath` $state declaration above for rationale.
 
   async function savePat() {
     patError = null;
@@ -268,7 +276,21 @@
   async function loadStep2() {
     try {
       detection = await invoke<any>('detect_system');
-      installPath = await invoke<string>('get_default_install_path');
+      // 2026-04-29 fix (wizard install-path lockdown): the install path
+      // is the launcher's bundled repo source — there is no separate
+      // "where do you want vco installed" choice anymore. We resolve
+      // that path here so step 3's read-only display has it ready, and
+      // call check_install_status against it so the "already installed"
+      // branch keeps working unchanged.
+      try {
+        installPath = await invoke<string>('get_local_repo_source');
+      } catch (e) {
+        // Fall back to the legacy default — keeps the wizard usable on
+        // the rare host where find_local_repo_root fails (e.g. running
+        // the launcher binary from a path with no parent vco repo).
+        installPath = await invoke<string>('get_default_install_path');
+        sourceError = String(e);
+      }
       installed = await invoke<boolean>('check_install_status', { path: installPath });
     } catch (e) {
       detectError = String(e);
@@ -534,23 +556,31 @@
     if (name && path) {
       creatingProject = true;
       try {
-        // If no orchestrator was installed at this path yet, install
-        // here inline (skip_containers=true keeps it fast — the user
-        // can opt into containers later from the dashboard).
-        const alreadyInstalled = await invoke<boolean>('check_install_status', { path });
-        if (!alreadyInstalled) {
-          await invoke('install_orchestrator', {
-            config: {
-              install_path: path,
-              use_gpu: false,
-              cpu_only: false,
-              openai_key: null,
-              container_runtime: null,
-              skip_containers: true,
-            },
-            confirmOverwrite: false,
-            conflict: null,
-          });
+        // 2026-04-29 fix (wizard install-path lockdown): the inline
+        // install kicked off here previously targeted the project's
+        // own folder (`install_path: path`), which produced an orphan
+        // install at every project location. With the lockdown the
+        // orchestrator install lives in-place at the source repo
+        // only, so we check / install at `installPath` (the source
+        // repo path, resolved on step 2 entry). The project path is
+        // only used for projects.create() below.
+        const orchestratorPath = installPath;
+        if (orchestratorPath) {
+          const alreadyInstalled = await invoke<boolean>('check_install_status', { path: orchestratorPath });
+          if (!alreadyInstalled) {
+            await invoke('install_orchestrator', {
+              config: {
+                install_path: orchestratorPath,
+                use_gpu: false,
+                cpu_only: false,
+                openai_key: null,
+                container_runtime: null,
+                skip_containers: true,
+              },
+              confirmOverwrite: false,
+              conflict: null,
+            });
+          }
         }
         try {
           await projects.create(name, path, 'base');
@@ -633,7 +663,7 @@
     // suspenders against re-entrant Next clicks (double-click during
     // animation, keyboard repeat, etc.) — a stuck modal must NOT be
     // bypassable by hitting Next a second time.
-    if (showSkipInstallConfirm || pendingConflict || duplicateProjectPrompt) return;
+    if (showSkipInstallConfirm || showInstallConfirm || pendingConflict || duplicateProjectPrompt) return;
     if (step === 3 && !installed) {
       showSkipInstallConfirm = true;
       return;
@@ -661,6 +691,24 @@
   function cancelSkipInstall() {
     showSkipInstallConfirm = false;
   }
+
+  // 2026-04-29 fix (wizard install-path lockdown): Install button now
+  // opens a confirmation modal first instead of kicking install
+  // straight off. requestInstall() pops the modal; confirmInstall()
+  // dispatches the real runInstall() and closes the modal;
+  // cancelInstallConfirm() just closes it.
+  function requestInstall() {
+    if (installing || sourceError) return;
+    showInstallConfirm = true;
+  }
+  async function confirmInstall() {
+    showInstallConfirm = false;
+    await runInstall(false);
+  }
+  function cancelInstallConfirm() {
+    showInstallConfirm = false;
+  }
+
   function prev() { if (step > 1) step = (step - 1) as any; }
   // Skip = user wants to dismiss the wizard entirely. Don't go through
   // finish() — that runs install + project-create which can hit a
@@ -830,29 +878,20 @@
               <code class="ow-mono">{alreadyInstalledRoot}</code>.
             </p>
           {:else}
-            <label class="ow-label">
-              <span>Install path</span>
-              <!-- 2026-04-28 fix (Bug 2): Browse button mirrors step 4's
-                   project-folder picker so users can avoid typing
-                   absolute paths by hand. -->
-              <div class="ow-path-row">
-                <input
-                  type="text"
-                  class="ow-path-input"
-                  bind:value={installPath}
-                  placeholder="/path/to/install"
-                />
-                <button
-                  type="button"
-                  class="ow-btn"
-                  onclick={browseInstallFolder}
-                  disabled={!inTauri}
-                  title={inTauri ? 'Browse for folder' : 'Browse requires the desktop app'}
-                >
-                  Browse…
-                </button>
-              </div>
-            </label>
+            <!-- 2026-04-29 fix (wizard install-path lockdown): the
+                 install path is no longer user-pickable. vco installs
+                 in-place alongside the source repo. The previous
+                 free-text input + Browse button let users target an
+                 empty folder, which produced an "orphan" install
+                 (orchestrator side files copied, but no launcher / no
+                 first-install.sh / no scripts) that the end user
+                 couldn't actually run. We now show the resolved
+                 source-repo path read-only and the install button
+                 always targets that path. -->
+            <p class="ow-secondary">
+              Installing into <code class="ow-mono">{installPath || '…'}</code>
+              (your source repo).
+            </p>
           {/if}
           <!-- Bug 27: removed the "Copying from <repo path>" line — that
                leaked an internal implementation detail (the bundled repo
@@ -1030,7 +1069,7 @@
           {#if installed}
             <p class="ow-ok">Orchestrator already installed at this path.</p>
           {:else}
-            <button class="ow-btn-primary" onclick={() => runInstall(false)} disabled={installing || !!sourceError}>
+            <button class="ow-btn-primary" onclick={requestInstall} disabled={installing || !!sourceError || !installPath}>
               {installing ? 'Installing…' : 'Install'}
             </button>
           {/if}
@@ -1131,7 +1170,7 @@
             <button
               class="ow-btn-primary"
               onclick={next}
-              disabled={!!showSkipInstallConfirm || !!pendingConflict || !!duplicateProjectPrompt}
+              disabled={!!showSkipInstallConfirm || !!showInstallConfirm || !!pendingConflict || !!duplicateProjectPrompt}
             >Next →</button>
           {:else}
             <button class="ow-btn-primary" onclick={finish} disabled={creatingProject}>
@@ -1194,6 +1233,53 @@
       </button>
       <button class="ow-btn-primary" onclick={installNowAndAdvance} disabled={installing || !!sourceError}>
         {installing ? 'Installing…' : 'Install now'}
+      </button>
+    </div>
+  {/snippet}
+</DialogRoot>
+{/if}
+
+<!-- 2026-04-29 fix (wizard install-path lockdown): Install confirmation
+     modal. Triggered by step 3's Install button (was: kicked
+     install_orchestrator off directly). One explicit confirmation step
+     so the user understands what's about to happen — relevant now that
+     the install path is locked to the source repo and not chosen
+     interactively. Same DialogRoot lifecycle as the skip-install and
+     conflict modals (bind:open, X close button, Cancel + primary
+     action). -->
+{#if showInstallConfirm}
+<DialogRoot
+  bind:open={showInstallConfirm}
+  width="500px"
+  onClose={cancelInstallConfirm}
+>
+  {#snippet header()}
+    <div class="ow-modal-header-row">
+      <h2 style="margin:0;font-size:15px;">Install the orchestrator?</h2>
+      <button
+        type="button"
+        class="ow-modal-close"
+        onclick={cancelInstallConfirm}
+        disabled={installing}
+        aria-label="Close"
+        title="Close"
+      >×</button>
+    </div>
+  {/snippet}
+  {#snippet body()}
+    <p style="margin:0 0 10px;color:#ccc;">
+      Install vco's Python venv + container services into
+      <code class="ow-mono">{installPath}</code>. This will set up the
+      orchestrator alongside your existing source files. Continue?
+    </p>
+  {/snippet}
+  {#snippet footer()}
+    <div class="ow-confirm-actions">
+      <button class="ow-btn" onclick={cancelInstallConfirm} disabled={installing}>
+        Cancel
+      </button>
+      <button class="ow-btn-primary" onclick={confirmInstall} disabled={installing || !!sourceError}>
+        {installing ? 'Installing…' : 'Install'}
       </button>
     </div>
   {/snippet}

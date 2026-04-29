@@ -76,6 +76,32 @@ from typing import NamedTuple
 MIN_PYTHON = (3, 11)
 PROJECT_ROOT = Path(__file__).resolve().parent
 
+
+# 2026-04-29 fix (wizard install-path lockdown): defensive sanity check
+# that PROJECT_ROOT is actually a vco source repo. The CLI path
+# (`python install.py`) runs FROM the source repo so this should always
+# pass — the check is here in case someone copies install.py somewhere
+# weird (e.g. a packaging step that strips first-install.sh, a user
+# `cp install.py /tmp/` and runs it). Mirrors the Rust-side
+# `validate_source_repo` in launcher/src-tauri/src/commands/installer.rs.
+def validate_source_repo(install_path: Path) -> None:
+    """Raise SystemExit(2) with a clear message when `install_path` is
+    not a vco source repo. The discriminator is install.py +
+    first-install.sh side by side; both ship in every clone and tarball
+    and neither is in ORCHESTRATOR_MANAGED_PATHS, so a partial
+    "managed paths only" copy can't fake source-repo status.
+    """
+    install_py = install_path / "install.py"
+    first_install_sh = install_path / "first-install.sh"
+    if not install_py.is_file() or not first_install_sh.is_file():
+        raise SystemExit(
+            f"ERROR: install path must be a vco source repo "
+            f"(must contain install.py + first-install.sh). "
+            f"To install at a different location, clone the repo there "
+            f"and re-run from that folder. Got: {install_path}"
+        )
+
+
 # Default ports (configurable via .env)
 DEFAULT_WEAVIATE_PORT = 8081
 DEFAULT_WEAVIATE_GRPC_PORT = 50052
@@ -1240,6 +1266,13 @@ def _run_lightweight(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 def main() -> int:
+    # 2026-04-29 fix (wizard install-path lockdown): defensive
+    # source-repo check — install.py operates on PROJECT_ROOT which is
+    # the directory it was launched from. If someone has copied
+    # install.py somewhere without first-install.sh next to it, fail
+    # loudly with a clear message instead of half-installing.
+    validate_source_repo(PROJECT_ROOT)
+
     parser = argparse.ArgumentParser(
         description="VibeCoded Tools — Orchestrator Installer",
         formatter_class=argparse.RawDescriptionHelpFormatter,
