@@ -5,8 +5,8 @@
   // dashboards like `/kg` and `/codegraph`. The home page (`/`) renders
   // the module catalog, not a project list — they're different concepts
   // (modules = "what tools are installed" vs projects = "which workspaces
-  // do they manage"). Reported 2026-04-28: the per-project Back button
-  // was sending users to the catalog, which felt like a dead-end.
+  // do they manage"). The per-project Back button targets this page so
+  // users land somewhere meaningful instead of the module catalog.
 
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';

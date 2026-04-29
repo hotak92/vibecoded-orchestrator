@@ -26,9 +26,7 @@ These four persistence layers exist for a reason — future-you, future-agents, 
 - **MEMORY.md** (`~/.claude/projects/.../memory/`): user preferences, recurring fixes, stable facts. Save corrections AND validations (don't just record what you got wrong).
 - **Plans** (`.claude/context/plans/`): non-trivial work breakdowns with rationale. Active plans live here; archived plans in `archive/`. Update when scope changes.
 
-**User directive (2026-04-29)**: "I often tell you to 'update context/KG/plans' to make you do so. Sometimes you remember to auto-update context and plans, but very rarely KG. Treat KG updates with stronger discipline."
-
-**Concrete rule**: if you've done >2 hours of substantive work or learned a non-obvious thing, write the KG node BEFORE the user has to ask. The hook backstops you, but the goal is to never need its nudge.
+**Concrete rule**: if you've done >2 hours of substantive work or learned a non-obvious thing, write the KG node BEFORE the user has to ask. KG updates need the same discipline as context and plan updates — context/plans tend to get auto-updated, KG often does not. The hook backstops you, but the goal is to never need its nudge.
 
 **Per-chat counter**: the hook keys state by `session_id` in `~/.claude/metrics/kg_update_tokens.jsonl`. Tokens from one Claude Code session do NOT leak into another — each conversation has its own counter.
 
@@ -101,7 +99,7 @@ These four persistence layers exist for a reason — future-you, future-agents, 
 
 **2. Weaviate MCP Tools (Semantic/Graph)**:
 - `hybrid_search(query, limit, node_type, tags, days, detail)` — Keyword+semantic across per-project KG + shared KG + project docs, auto-scoped (~1–2 s). **Default search tool.**
-  - `detail` (default `"auto"`) — score-driven verbosity. Five tiers (calibrated 2026-04-10, see `knowledge/concepts/score-driven-retrieval-tiers.md`):
+  - `detail` (default `"auto"`) — score-driven verbosity. Five tiers (calibrated against a canonical eval set; see `knowledge/concepts/score-driven-retrieval-tiers.md`):
     - `score < 0.42` → discarded (noise)
     - `0.42..0.55` → `summary` (LLM description from sidecar, ~6 lines)
     - `0.55..0.65` → `single_chunk` (matched chunk, ~2000 chars)

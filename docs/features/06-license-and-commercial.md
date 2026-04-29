@@ -26,7 +26,7 @@ Adds: `soc2_compliance`, `priority_support`. Superset of MAO.
 ### Admin tier
 Server-only tier; strict superset of enterprise. Two server-authoritative classification paths exist (see [§Admin License](#admin-license) below):
 - **Path A — Vault-token admin (recommended)**: token shape `vct_admin_<URL-safe-base64>` resolved against the `vct_admin_tokens` Supabase Vault secret. No LS product required.
-- **Path B — Lemon Squeezy admin variant (legacy/Bug 33)**: a real LS license whose `variant_id` appears in the `LS_ADMIN_VARIANT_IDS` env var.
+- **Path B — Lemon Squeezy admin variant (legacy)**: a real LS license whose `variant_id` appears in the `LS_ADMIN_VARIANT_IDS` env var.
 
 Both paths yield identical client-side flags (`is_admin`, `unlock_all_modules`, `dev_features_enabled`) and unlock the same dev affordances in the launcher (ADMIN badge, Admin sidebar, `private-test` catalog modules). Neither bypasses server-gated capabilities — a self-claimed admin tier on a patched client yields nothing the AGPL source doesn't already.
 
@@ -155,7 +155,7 @@ The TL;DR of the architecture: an earlier draft used a local `MAINTAINER_TOKEN` 
 ### Two paths to admin tier
 **Path A — Vault-token admin (recommended for maintainer / small-team use).** High-entropy `vct_admin_<URL-safe-base64>` token resolved against the `vct_admin_tokens` Supabase Vault secret. No LS product required. Per-token leak containment via TOFU machine binding + optional expiration. Adding/revoking team members = a single SQL statement.
 
-**Path B — Lemon Squeezy admin variant (legacy / Bug 33).** Real LS license keyed to a hidden variant whose `variant_id` lives in the `LS_ADMIN_VARIANT_IDS` env var. Useful for per-license LS-dashboard revocability (e.g. issuing admin to a contractor on a dated subscription). Currently parked pending tax/legal LS product setup.
+**Path B — Lemon Squeezy admin variant (legacy).** Real LS license keyed to a hidden variant whose `variant_id` lives in the `LS_ADMIN_VARIANT_IDS` env var. Useful for per-license LS-dashboard revocability (e.g. issuing admin to a contractor on a dated subscription). Currently parked pending tax/legal LS product setup.
 
 `docs/ADMIN_LICENSE.md` notes that an earlier draft mentioning a local `MAINTAINER_TOKEN` / Ed25519 bypass was dropped — neither Path A nor Path B is bypassable by patching the AGPL client; classification is server-side in `validate-tier`.
 

@@ -1,4 +1,4 @@
-//! Bug 31: configurable container volumes location.
+//! Configurable container volumes location.
 //!
 //! ## Behavior summary
 //!
@@ -9,8 +9,8 @@
 //!   pointing the three named volumes at subfolders of the chosen path.
 //!
 //! - **Subsequent install** (existing volumes detected): no picker is
-//!   shown. Per the Bug 32 contract, we do NOT generate the override file
-//!   when existing volumes are found — bind-mount overrides on top of
+//!   shown. The contract is to NOT generate the override file when
+//!   existing volumes are found — bind-mount overrides on top of
 //!   already-existing named volumes would either fail (volume name
 //!   conflict) or worse, mask the original. The detected paths are
 //!   recorded into `~/.vct/launcher.toml` as `volumes_path = "detected"`

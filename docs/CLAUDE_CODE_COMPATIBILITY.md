@@ -2,10 +2,10 @@
 
 The orchestrator was originally tested against the VS Code extension,
 but every functional piece — hooks, agents, skills, MCP servers, slash
-commands, CLAUDE.md — is read by the `claude` CLI binary too. The only
-real gap was per-project env injection. As of Bug 30 the launcher writes
-the canonical `.claude/settings.json` `env` block, which is read by all
-three surfaces (CLI, Desktop app, VS Code extension).
+commands, CLAUDE.md — is read by the `claude` CLI binary too. The
+launcher writes the canonical `.claude/settings.json` `env` block, which
+is read by all three surfaces (CLI, Desktop app, VS Code extension), so
+per-project env routing works uniformly across them.
 
 This doc lists what works on each surface and how the per-project env
 files relate to each other.
@@ -22,7 +22,7 @@ files relate to each other.
 | Skills (`~/.claude/skills/`) | ✓ | ✓ | ✓ |
 | CLAUDE.md auto-load | ✓ | ✓ | ✓ |
 | Slash commands | ✓ | ✓ | ✓ |
-| Per-project env injection | `.claude/settings.json` env (Bug 30) + `.vscode/settings.json` claude-code.env | `.claude/settings.json` env (Bug 30) + `.claude/env` shell file | `.claude/settings.json` env (Bug 30) |
+| Per-project env injection | `.claude/settings.json` env + `.vscode/settings.json` claude-code.env | `.claude/settings.json` env + `.claude/env` shell file | `.claude/settings.json` env |
 | Stop hooks (`notify-stop.sh` etc.) | ✗ | ✓ | ✓ |
 
 ## Per-project env files
@@ -100,15 +100,13 @@ ceremony, easiest to forget.
 
 ## Why three env files?
 
-History: before Bug 30 we only wrote `.vscode/settings.json` (for the
-extension) and `.claude/env` (for shell-wrapper CLI users). Desktop app
-users had no path to per-project env at all. Bug 30 added the canonical
-`.claude/settings.json` `env` block, which Anthropic documents as the
-cross-surface mechanism (CLI + Desktop + extension).
+`.claude/settings.json` `env` is the canonical cross-surface mechanism
+documented by Anthropic — read by the CLI, the Desktop app, AND the VS
+Code extension. The launcher writes it on every project create. The other
+two files stick around for compatibility:
 
-The other two files stick around for compatibility:
-- `.vscode/settings.json` `claude-code.env` is where users with
-  pre-Bug-30 muscle memory will look first.
+- `.vscode/settings.json` `claude-code.env` is where existing VS Code
+  users will look first.
 - `.claude/env` is useful as a sh-sourceable file for shell wrappers
   and direnv setups, especially when users want to extend it with
   extra env vars beyond the four the launcher manages.

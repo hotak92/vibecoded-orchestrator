@@ -1,12 +1,10 @@
 <script lang="ts">
   // Home / Library — renders the current orchestrator install's module catalog.
   //
-  // Source of truth: `list_module_catalog` (commands::modules in Rust). Bug 16
-  // wired the launcher + orchestrator + KG + Code Graph as built-in entries.
-  // Fix 8 (reviewer-B credibility) added one explicit Coming-Soon entry
-  // (RL Reranker, Pro tier) and removed the hardcoded vapor list (Transcrypt,
-  // Arzillibus, ConvertiFacile, DataWeave, FormCraft, PixelSnap, plus an
-  // "Orchestrator Pro" marketing card disguised as a module).
+  // Source of truth: `list_module_catalog` (commands::modules in Rust). The
+  // built-in entries are launcher + orchestrator + KG + Code Graph, plus
+  // one explicit Coming-Soon entry (RL Reranker, Pro tier). The home page
+  // does not advertise modules that don't exist yet.
   //
   // Layout chrome (MenuBar, Sidebar, StatusBar, modals) lives in
   // +layout.svelte so it persists across every route. This page is just

@@ -1,16 +1,14 @@
 <script lang="ts">
   // Codegraph dashboard — card grid mirroring /kg.
   //
-  // Replaced 2026-04-28: the prior implementation tried to render a
-  // force-directed graph of every codegraph entity, which (a) didn't
-  // scale past a few hundred nodes and (b) was useless for the task
-  // users actually have ("which projects have a code graph and how
-  // big is each one"). New layout: one card per project that has
-  // codegraph data, with the five entity counts (modules/classes/
-  // functions/APIs/interactions) and a Browse button that drills into
-  // an entity table view. Drill-in TBD; for v0 the Browse button is
-  // a placeholder that toasts "viewer coming soon" so we ship the
-  // dashboard now and iterate.
+  // One card per project that has codegraph data, with the five
+  // entity counts (modules / classes / functions / APIs / interactions)
+  // and a Browse button that drills into an entity table view.
+  // Drill-in TBD; for v0 the Browse button toasts "viewer coming
+  // soon". A force-directed graph of every entity was considered and
+  // rejected — it doesn't scale past a few hundred nodes and doesn't
+  // answer the question users actually have ("which projects have a
+  // code graph and how big is each one").
   //
   // Source: codegraph_list_projects (Rust). Returns one row per
   // <prefix>_CodeFunction-style class group, with the five counts

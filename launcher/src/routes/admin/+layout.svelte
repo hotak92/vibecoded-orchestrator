@@ -1,5 +1,5 @@
 <script lang="ts">
-  // Bug 33: gate every /admin/* route on the cached "admin" tier.
+  // Gate every /admin/* route on the cached "admin" tier.
   // The check is client-side for UX (show "Admin only" placeholder
   // instead of a 404), but every admin tab also re-checks tier
   // server-side before exposing data. Patching this layout to bypass

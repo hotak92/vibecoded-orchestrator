@@ -1,7 +1,5 @@
 # VCT Launcher — User Guide
 
-_(Multi-agent contribution: Secrets/Permissions section by general-purpose agent, run 2026-04-28)_
-
 This guide documents the per-project tabs in the VCT Launcher window. Each project has its own state stored in the launcher's SQLite DB (`projects.db`), and most tabs render rows from one of the `project_*` tables.
 
 ---

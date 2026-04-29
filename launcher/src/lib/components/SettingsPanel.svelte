@@ -10,8 +10,8 @@
 
   let activeSection = $state<'profile' | 'downloads' | 'secrets' | 'preferences' | 'about'>('profile');
 
-  // 2026-04-29: when callers open Settings via ui.openSettings('secrets')
-  // (e.g. the per-project SecretsTab "Open secrets panel" button), jump
+  // When callers open Settings via ui.openSettings('secrets') (e.g.
+  // the per-project SecretsTab "Open secrets panel" button), jump
   // straight to that section instead of staying on whatever was last
   // active. The store field is consumed-once and cleared by
   // closeSettings(), so this only fires when a caller explicitly
@@ -22,7 +22,7 @@
     }
   });
 
-  // Bug 29: shared services status. These are the per-machine Weaviate /
+  // Shared services status. These are the per-machine Weaviate /
   // Ollama / code_embed instances that all orchestrator installs reuse via
   // KG_COLLECTION namespacing inside the shared Weaviate. Probed on demand
   // when the user opens the Preferences panel.

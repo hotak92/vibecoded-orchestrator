@@ -9,14 +9,14 @@
 // - appId is added to profiles.apps for any product (existing behavior).
 // - tier is set on profiles.orchestrator_tier ONLY when appId === "orchestrator".
 //
-// Bug 33: the `admin` tier is a server-side classification. Admin
-// variant IDs are NOT listed in this file (which ships in the public
-// AGPL source). They live in the Supabase env var
-// `LS_ADMIN_VARIANT_IDS` (JSON array of strings) and are resolved at
-// request time by `isAdminVariant`. Open-source readers can see the
-// type and the resolution function, but cannot derive the variant ID
-// or fabricate an admin classification by patching this file —
-// `isAdminVariant` consults the runtime env, not source data.
+// The `admin` tier is a server-side classification. Admin variant IDs
+// are NOT listed in this file (which ships in the public AGPL source).
+// They live in the Supabase env var `LS_ADMIN_VARIANT_IDS` (JSON array
+// of strings) and are resolved at request time by `isAdminVariant`.
+// Open-source readers can see the type and the resolution function,
+// but cannot derive the variant ID or fabricate an admin classification
+// by patching this file — `isAdminVariant` consults the runtime env,
+// not source data.
 
 export type OrchestratorTier = "free" | "pro" | "mao" | "enterprise" | "admin";
 
