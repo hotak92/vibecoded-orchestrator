@@ -87,6 +87,14 @@ flagging for early adopters and the next iteration.
 
 ## Recently fixed
 
+- **Wizard step 3 install-path field allowed orphan installs** — the install-path text input + Browse button let
+  users target any empty folder, after which the installer copied a SUBSET of files (per `ORCHESTRATOR_MANAGED_PATHS`)
+  in but left out the launcher/, `first-install.sh`, and `start-launcher.sh`. End users got a half-installed orphan
+  they couldn't run. The wizard now derives the install path from the launcher's source-repo location (vco installs
+  in-place) and the install button opens an explicit confirmation modal. `install_orchestrator` (Rust) and `install.py`
+  (CLI) now both refuse non-source paths via `validate_source_repo()`. Wizard step 3 shows a read-only
+  `Installing into <source-repo>` line; the field and Browse button are gone. Fixed in `fix/wizard-install-path-lockdown`.
+
 - **Project tabs empty after wizard** — `create_project_v2` registered the project but didn't populate the
   per-project state DB; Hooks / MCP / Agents / Skills tabs read from that DB and showed empty until the
   next launcher session triggered a manual refresh. Fixed in `03eb485` by adding `project_state_populate`
