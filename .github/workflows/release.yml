@@ -145,6 +145,33 @@ jobs:
           fi
           ls -lh "$dist"
 
+      # macOS artifacts are flagged with the `-experimental` suffix in their
+      # filename so users browsing the GitHub Release sidebar see the tier
+      # marker before downloading. Apple Developer ID code-signing +
+      # notarization are deferred to v0.2.x; until then macOS users will
+      # hit Gatekeeper. Done BEFORE attestation so SLSA provenance binds
+      # to the user-visible filename (so `gh attestation verify
+      # vct-launcher-macos-arm64-experimental` works).
+      - name: Stage release artifact (rename macOS to -experimental)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          dist="launcher/dist/${{ matrix.target }}"
+          stage="$dist/_release"
+          mkdir -p "$stage"
+          case "${{ matrix.target }}" in
+            macos-arm64|macos-x64)
+              cp "$dist/${{ matrix.binary }}" "$stage/vct-launcher-${{ matrix.target }}-experimental"
+              cp "$dist/${{ matrix.binary }}.metadata.json" "$stage/vct-launcher-${{ matrix.target }}-experimental.metadata.json"
+              ;;
+            *)
+              cp "$dist/${{ matrix.binary }}" "$stage/${{ matrix.binary }}"
+              cp "$dist/${{ matrix.binary }}.metadata.json" "$stage/${{ matrix.binary }}.metadata.json"
+              ;;
+          esac
+          ls -lh "$stage"
+
       # SLSA build provenance attestation. Generates a Sigstore-signed
       # in-toto provenance predicate (SLSA Build Level 2 by default on
       # GitHub-hosted runners) for the launcher binary. End users can
@@ -152,11 +179,13 @@ jobs:
       # with `gh attestation verify <binary> --repo hotak92/vibecoded-orchestrator`.
       # Runs only on tagged releases — workflow_dispatch dry-runs skip
       # attestation since there's nothing to publish provenance for.
+      # Subject path resolution: macOS jobs attest the renamed
+      # `-experimental` binary, others attest the canonical filename.
       - name: Generate build provenance attestation
         if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: launcher/dist/${{ matrix.target }}/${{ matrix.binary }}
+          subject-path: launcher/dist/${{ matrix.target }}/_release/${{ (startsWith(matrix.target, 'macos-')) && format('vct-launcher-{0}-experimental', matrix.target) || matrix.binary }}
 
       # Upload the binary + metadata as Release assets. softprops/action-gh-release@v3
       # auto-creates the release on tag push if it doesn't exist yet, and
@@ -168,8 +197,7 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           files: |
-            launcher/dist/${{ matrix.target }}/${{ matrix.binary }}
-            launcher/dist/${{ matrix.target }}/${{ matrix.binary }}.metadata.json
+            launcher/dist/${{ matrix.target }}/_release/*
 
       # Always upload as workflow artifacts too — lets workflow_dispatch
       # runs (no tag) still produce downloadable binaries for QA.
