@@ -610,7 +610,7 @@ pub fn validate_source_repo(install_path: &Path) -> Result<(), String> {
 /// rather than prompt the user to install AGAIN somewhere else — a real
 /// UX bug surfaced in 2026-04-27 testing where the wizard's default install
 /// path was `~/vibecoded-orchestrator` and a user typing an absolute path
-/// like `~/Desktop/PROGETTI/Agape/Code` would get the two paths concatenated
+/// like `~/dev/my-project/Code` would get the two paths concatenated
 /// and write the orchestrator INSIDE the project folder. With self-detection
 /// the wizard can skip directly to project registration.
 ///
