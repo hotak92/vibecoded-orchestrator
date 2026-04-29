@@ -36,7 +36,7 @@
   //  visual grouping and keys solely by KEY name.
 
   import { onMount } from 'svelte';
-  import { secrets, type SecretEntry, type SecretScope } from '$lib/stores/secrets';
+  import { secrets, lifecycleOf, type SecretEntry, type SecretScope } from '$lib/stores/secrets';
   import { selectedProject, projects } from '$lib/stores/projects';
 
   let scope = $state<SecretScope>('per_project');
@@ -193,6 +193,17 @@
     }
   }
 
+  async function handleReactivate(e: SecretEntry) {
+    busy = true;
+    try {
+      await secrets.reactivateValue(e);
+    } catch (err) {
+      console.error('reactivate secret failed', err);
+    } finally {
+      busy = false;
+    }
+  }
+
   async function handleRemoveConfirmed() {
     if (!removeConfirm) return;
     busy = true;
@@ -307,16 +318,27 @@
     {:else}
       <div class="entries-list">
         {#each visibleEntries as entry (entryDomKey(entry))}
-          <div class="entry-row">
+          {@const lifecycle = lifecycleOf(entry)}
+          <div class="entry-row" class:row-inactive={lifecycle === 'inactive'}>
             <div class="entry-info">
               <span class="entry-key mono">{entry.key}</span>
               <span class="entry-meta">
-                <span class="badge" class:badge-set={entry.is_set} class:badge-unset={!entry.is_set}>
-                  {entry.is_set ? 'set' : 'not set'}
-                </span>
-                {#if entry.is_set && entry.preview}
+                <!-- Lifecycle badge:
+                       active   → "set"     (teal, value readable)
+                       inactive → "unset"   (amber, value preserved but gated)
+                       empty    → "not set" (grey, no saved value)
+                     The value-still-in-keychain part of inactive is NOT
+                     surfaced as a preview — readers are gated on active. -->
+                {#if lifecycle === 'active'}
+                  <span class="badge badge-set">set</span>
+                {:else if lifecycle === 'inactive'}
+                  <span class="badge badge-inactive" title="Value preserved in keychain. Readers gated until you Reactivate.">unset</span>
+                {:else}
+                  <span class="badge badge-unset">not set</span>
+                {/if}
+                {#if lifecycle === 'active' && entry.preview}
                   <span class="entry-preview mono">{entry.preview}</span>
-                {:else if entry.is_set && entry.sensitive}
+                {:else if lifecycle === 'active' && entry.sensitive}
                   <span class="entry-preview mono">••••••••</span>
                 {/if}
                 {#if entry.sensitive}
@@ -355,19 +377,53 @@
                 >
                   Cancel
                 </button>
+              {:else if lifecycle === 'inactive'}
+                <!-- Inactive: one-click Reactivate (no value-input row).
+                     The value is still in the keychain from before Unset
+                     so we just flip the active flag. "Set as new value"
+                     is the escape hatch when the user wants to replace
+                     the saved value while currently paused. -->
+                <button
+                  class="btn-3d btn-3d-primary btn-3d-sm"
+                  onclick={() => handleReactivate(entry)}
+                  title="Re-activate using the saved value. No re-entry required."
+                  disabled={busy}
+                >
+                  Reactivate
+                </button>
+                <button
+                  class="btn-3d btn-3d-ghost btn-3d-sm"
+                  onclick={() => startEdit(entry)}
+                  title="Replace the saved value with a new one (keeps the entry; sets active)."
+                  disabled={busy}
+                >
+                  Set as new value
+                </button>
+                <button
+                  class="btn-3d btn-3d-ghost btn-3d-sm danger"
+                  onclick={() => (removeConfirm = entry)}
+                  title="Drop this entry from the registry entirely (forgets the entry exists, deletes from keychain)."
+                  disabled={busy}
+                >
+                  Remove
+                </button>
               {:else}
+                <!-- Active or Empty: classic flow. The button label
+                     swaps between Update and Set based on whether the
+                     keychain has a value. Unset only appears when there
+                     is something to pause. -->
                 <button
                   class="btn-3d btn-3d-primary btn-3d-sm"
                   onclick={() => startEdit(entry)}
-                  title={entry.is_set ? 'Update the stored value' : 'Set a value'}
+                  title={lifecycle === 'active' ? 'Update the stored value' : 'Set a value'}
                 >
-                  {entry.is_set ? 'Update' : 'Set'}
+                  {lifecycle === 'active' ? 'Update' : 'Set'}
                 </button>
-                {#if entry.is_set}
+                {#if lifecycle === 'active'}
                   <button
                     class="btn-3d btn-3d-ghost btn-3d-sm"
                     onclick={() => handleUnset(entry)}
-                    title="Clear the value from keychain but keep this entry registered. Useful when rotating tokens."
+                    title="Mark inactive. The value stays securely in your OS keychain but readers won't see it. Use to rotate tokens — pause an old one while validating a new one."
                     disabled={busy}
                   >
                     Unset
@@ -376,7 +432,7 @@
                 <button
                   class="btn-3d btn-3d-ghost btn-3d-sm danger"
                   onclick={() => (removeConfirm = entry)}
-                  title="Drop this entry from the registry entirely (forgets the entry exists)."
+                  title="Drop this entry from the registry entirely (forgets the entry exists, deletes from keychain)."
                   disabled={busy}
                 >
                   Remove
@@ -408,9 +464,19 @@
           bind:value={newValue}
           autocomplete="off"
         />
+        <!-- Sensitive checkbox + tooltip (Bug 2 follow-up to PR #60).
+             Default is true — most secrets ARE sensitive. The (?) icon
+             carries the explanation as a native tooltip; same wording as
+             the inline help below for screen-readers / pointer hover. -->
         <label class="sensitive-toggle">
           <input type="checkbox" bind:checked={newSensitive} />
           <span>Sensitive</span>
+          <span
+            class="help-icon"
+            title="Tokens, API keys, passwords. When checked, the launcher refuses to display the value anywhere — even masked. Uncheck only for non-secret config strings (e.g. URLs, usernames) you want to verify in audit logs."
+            aria-label="Help: what does Sensitive do?"
+            role="img"
+          >?</span>
         </label>
         <button
           class="btn-3d btn-3d-primary btn-3d-sm"
@@ -641,9 +707,24 @@
     background: rgba(0, 191, 166, 0.12);
   }
 
+  /* Inactive (Lifecycle B): value is paused in keychain. Amber so it's
+   * visually distinct from "set" (teal) and "not set" (grey) — readers
+   * are gated, but the saved value still exists. */
+  .badge-inactive {
+    color: #ffc800;
+    background: rgba(255, 200, 0, 0.12);
+  }
+
   .badge-unset {
     color: var(--color-muted);
     background: rgba(255, 255, 255, 0.04);
+  }
+
+  /* Subtle de-emphasis on inactive rows so the lifecycle state reads at
+   * a glance. Buttons themselves stay full-opacity — the action is
+   * still available, the row is just paused. */
+  .row-inactive .entry-key {
+    color: var(--color-mid);
   }
 
   .badge-hint {
@@ -728,8 +809,26 @@
     border-color: rgba(0, 191, 166, 0.5);
   }
 
+  /* Project-picker dropdown: the global app.css rule sets `color-scheme:
+   * dark` on :root so WebKitGTK paints the popup in dark mode (Bug 1).
+   * We layer explicit colors here as defence in depth — any browser /
+   * webview that ignores `color-scheme` for whatever reason still gets
+   * a legible control. The `option` rule is critical on Chromium /
+   * WebView2 where the popup honors per-option styling.
+   * MDN: https://developer.mozilla.org/en-US/docs/Web/HTML/Element/select#styling_with_css */
   select.form-input {
     cursor: pointer;
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--color-text);
+    /* color-scheme on the element itself reinforces the :root rule for
+     * environments where the user-agent only consults the nearest
+     * ancestor (rare, but cheap insurance). */
+    color-scheme: dark;
+  }
+
+  select.form-input option {
+    background: var(--color-bg2);
+    color: var(--color-text);
   }
 
   .sensitive-toggle {
@@ -743,6 +842,29 @@
 
   .sensitive-toggle input {
     accent-color: var(--color-teal);
+  }
+
+  /* Tooltip-bearing question mark next to the Sensitive label. We use a
+   * native `title` attribute (rendered as the OS tooltip by every
+   * webview) rather than a custom popover — keeps the bundle small and
+   * matches the rest of the panel's tooltip pattern. */
+  .help-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: rgba(255, 255, 255, 0.08);
+    color: var(--color-mid);
+    font-size: 9px;
+    font-weight: 700;
+    cursor: help;
+    user-select: none;
+  }
+  .help-icon:hover {
+    background: rgba(0, 191, 166, 0.2);
+    color: var(--color-teal);
   }
 
   .msg {

@@ -19,6 +19,46 @@
   --radius-card: 16px;
 }
 
+/* Tell the user-agent to render form controls (and other browser-painted
+ * UI surfaces — scrollbars, the <select> popup list, date pickers) using
+ * the dark palette. Without this, WebKitGTK on Linux paints <select> and
+ * its <option> popup with a light-mode default that ignores parent
+ * `color`/`background` rules — the symptom is "white dropdown with
+ * invisible white text". MDN: https://developer.mozilla.org/en-US/docs/Web/CSS/color-scheme
+ *
+ * This is the SINGLE most important rule for native form controls in a
+ * dark theme. Per-element `background`/`color` overrides (below) are
+ * defence in depth; `color-scheme: dark` is what actually makes the
+ * native popup readable. */
+:root {
+  color-scheme: dark;
+}
+
+/* Native <select> dark styling for both the closed control and the open
+ * <option> popup. WebKitGTK (Tauri's Linux webview) and Chromium-based
+ * WebView2 (Tauri Windows) both honour these — Chromium also exposes a
+ * future-proof `::picker(select)` pseudo-element behind `appearance:
+ * base-select` (Chrome 132+), but we deliberately keep the classic
+ * approach so the same CSS works on every supported Tauri runtime today.
+ * MDN refs:
+ *   https://developer.mozilla.org/en-US/docs/Web/HTML/Element/select#styling_with_css
+ *   https://developer.mozilla.org/en-US/docs/Web/CSS/appearance
+ *
+ * Note: <option> background/color is honoured by Chromium and partially
+ * by WebKitGTK; combined with `color-scheme: dark` above, the popup is
+ * legible on both. We do NOT call `appearance: none` here because the
+ * default arrow + native popup positioning are exactly what we want —
+ * they just need to be painted in the dark scheme. */
+select {
+  background: var(--color-bg2);
+  color: var(--color-text);
+  border: 1px solid var(--color-border);
+}
+select option {
+  background: var(--color-bg2);
+  color: var(--color-text);
+}
+
 /* ─── BASE ─── */
 *,
 *::before,

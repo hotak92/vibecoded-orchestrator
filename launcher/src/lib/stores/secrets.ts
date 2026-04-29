@@ -16,8 +16,32 @@ export interface SecretEntry {
   scope: SecretScope;
   key: string;
   sensitive: boolean;
+  /** Visible to readers: true ⇔ keychain has value AND is_active. */
   is_set: boolean;
+  /** Active flag in launcher.db. False after Unset, true after Set or
+   * Reactivate. Used by the UI to choose between Set vs Reactivate
+   * buttons — the value-input row only opens when the keychain is empty
+   * or the user explicitly chose "Set as new value". */
+  is_active: boolean;
+  /** Whether the keychain still holds a value. Combined with `is_active`,
+   * the UI distinguishes three lifecycle states:
+   *   active=true,  saved=true  → ACTIVE   (badge "set", buttons Update/Unset/Remove)
+   *   active=false, saved=true  → INACTIVE (badge "unset", buttons Reactivate/Set as new/Remove)
+   *   active=true,  saved=false → EMPTY    (badge "not set", buttons Set/Remove)
+   * (The fourth combination — active=false, saved=false — would mean a
+   *  ghost row; we treat it as EMPTY.) */
+  has_saved_value: boolean;
   preview: string | null;
+}
+
+/** Lifecycle states the UI renders. Derived from is_active +
+ * has_saved_value at the call site rather than stored, so the store
+ * stays the single source of truth. */
+export type SecretLifecycle = 'active' | 'inactive' | 'empty';
+export function lifecycleOf(e: Pick<SecretEntry, 'is_active' | 'has_saved_value'>): SecretLifecycle {
+  if (e.is_active && e.has_saved_value) return 'active';
+  if (!e.is_active && e.has_saved_value) return 'inactive';
+  return 'empty';
 }
 
 function entryKey(e: Pick<SecretEntry, 'project_id' | 'module_id' | 'scope' | 'key'>): string {
@@ -42,19 +66,27 @@ function createSecretsStore() {
     subscribe,
 
     /** Register a known secret key for the UI to track + render.
-     * Idempotent. Does not call the backend. Use refresh() to fetch
-     * is_set / preview state. */
-    register(entry: Omit<SecretEntry, 'is_set' | 'preview'>) {
+     * Idempotent. Does not call the backend. Use refresh() to fetch the
+     * current lifecycle state. */
+    register(entry: Omit<SecretEntry, 'is_set' | 'is_active' | 'has_saved_value' | 'preview'>) {
       update((s) => {
         const k = entryKey(entry);
         if (s.entries.has(k)) return s;
         const map = new Map(s.entries);
-        map.set(k, { ...entry, is_set: false, preview: null });
+        map.set(k, {
+          ...entry,
+          is_set: false,
+          is_active: true,
+          has_saved_value: false,
+          preview: null,
+        });
         return { ...s, entries: map };
       });
     },
 
-    /** Pull is_set + (optionally) masked preview for one entry. */
+    /** Pull lifecycle status (is_set, is_active, has_saved_value) +
+     * optional masked preview for one entry. Single round-trip via
+     * `get_secret_status_v2`. */
     async refresh(entry: Pick<SecretEntry, 'project_id' | 'module_id' | 'scope' | 'key' | 'sensitive'>): Promise<void> {
       if (!tauriAvailable()) return;
       const args = {
@@ -64,9 +96,17 @@ function createSecretsStore() {
         key: entry.key,
       };
       try {
-        const isSet = await invoke<boolean>('is_secret_set', args);
+        const status = await invoke<{
+          is_set: boolean;
+          is_active: boolean;
+          has_saved_value: boolean;
+        }>('get_secret_status_v2', args);
         let preview: string | null = null;
-        if (isSet && !entry.sensitive) {
+        // Only fetch the preview if the entry is fully readable (active
+        // + non-sensitive + value present). The backend gates the
+        // preview on active=true anyway, but skipping the call here
+        // saves a round-trip for inactive / sensitive entries.
+        if (status.is_set && !entry.sensitive) {
           try {
             preview = await invoke<string | null>('get_secret_preview', {
               ...args,
@@ -81,7 +121,13 @@ function createSecretsStore() {
           const existing = s.entries.get(k);
           if (!existing) return s;
           const map = new Map(s.entries);
-          map.set(k, { ...existing, is_set: isSet, preview });
+          map.set(k, {
+            ...existing,
+            is_set: status.is_set,
+            is_active: status.is_active,
+            has_saved_value: status.has_saved_value,
+            preview,
+          });
           return { ...s, entries: map };
         });
       } catch (e) {
@@ -129,13 +175,44 @@ function createSecretsStore() {
       }
     },
 
-    /** Unset: clear the keychain VALUE but keep the entry in the registry
-     * map so it still renders as "not set". Use case: rotating tokens. */
+    /** Unset (Lifecycle B): mark the entry INACTIVE while keeping the
+     * VALUE in the OS keychain. The launcher's read API then refuses to
+     * return the value until the user calls `reactivateValue`. Use case:
+     * rotating tokens — pause an old one while validating a new one,
+     * with no re-typing required to resume. */
     async unsetValue(entry: Pick<SecretEntry, 'project_id' | 'module_id' | 'scope' | 'key' | 'sensitive'>): Promise<void> {
       if (!tauriAvailable()) throw new Error('Tauri not available');
       update((s) => ({ ...s, busy: true, error: null }));
       try {
+        // `clear_secret_v2` no longer touches the keychain — it only
+        // flips the active flag in launcher.db. The keychain value is
+        // preserved so `reactivateValue` is a one-click resume.
         await invoke<void>('clear_secret_v2', {
+          projectId: resolveProjectId(entry),
+          moduleId: entry.module_id,
+          scope: entry.scope,
+          key: entry.key,
+        });
+        await this.refresh(entry);
+        update((s) => ({ ...s, busy: false }));
+      } catch (e) {
+        update((s) => ({
+          ...s,
+          busy: false,
+          error: e instanceof Error ? e.message : String(e),
+        }));
+        throw e;
+      }
+    },
+
+    /** Reactivate a previously-Unset entry: flip active back to true.
+     * No re-entry required — the value is still in the keychain from
+     * before Unset. Pairs with `unsetValue`. */
+    async reactivateValue(entry: Pick<SecretEntry, 'project_id' | 'module_id' | 'scope' | 'key' | 'sensitive'>): Promise<void> {
+      if (!tauriAvailable()) throw new Error('Tauri not available');
+      update((s) => ({ ...s, busy: true, error: null }));
+      try {
+        await invoke<void>('reactivate_secret_v2', {
           projectId: resolveProjectId(entry),
           moduleId: entry.module_id,
           scope: entry.scope,
