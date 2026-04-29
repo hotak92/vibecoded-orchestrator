@@ -51,7 +51,7 @@ logger = logging.getLogger(__name__)
 #     full KV cache; 10–12 GB recommended). Hence 8 GB floor here, with the
 #     understanding that running it at small image-budget (256×256) is borderline.
 VISION_MODEL_REQUIREMENTS = {
-    # Ollama tags Martino uses in this repo. RAM thresholds bumped
+    # Ollama tags used in this repo. RAM thresholds bumped
     # 2026-04-28: the previous values matched Ollama's reported
     # working-set, but in practice on a desktop machine OS + browser +
     # IDE + Weaviate + code-embed already eat ~10-12 GB before any

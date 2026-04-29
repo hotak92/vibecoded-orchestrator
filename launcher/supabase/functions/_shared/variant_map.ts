@@ -271,7 +271,7 @@ export async function fetchVaultAdminTokensJson(
     });
     if (!resp.ok) return null;
     // PostgREST returns scalar text functions as a JSON string body, e.g.
-    //   "{\"martino\":{\"token\":\"vct_admin_...\"}}"
+    //   "{\"<admin>\":{\"token\":\"vct_admin_...\"}}"
     // We want the inner string, which is the JSON map serialized.
     const body = await resp.text();
     if (!body || body === "null") return null;
