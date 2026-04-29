@@ -11,8 +11,10 @@
 
   import { currentUser } from '$lib/stores/auth';
   import { projects, selectedProject } from '$lib/stores/projects';
+  import { orchestrator } from '$lib/stores/orchestrator';
   import { invoke } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
+  import { ui } from '$lib/stores/ui';
   import Dropdown from '$lib/components/Dropdown.svelte';
 
   interface App {
@@ -20,6 +22,22 @@
     name: string;
     color: string;
     version?: string;
+    /**
+     * Whether the app is shipped + installed. Defaults to true only for
+     * apps the launcher itself ships (orchestrator + bundled subcomponents).
+     * For Store catalog entries, the caller passes the real install state
+     * derived from the user's owned-apps list / orchestrator status.
+     */
+    installed?: boolean;
+    /**
+     * Lifecycle stage. Drives which Quick Action buttons render.
+     * - `shipped` (default): the app is real and installed; show Launch + Check Update.
+     * - `not_installed`: app is real but not installed locally; show Install (orchestrator) or Get (paid).
+     * - `coming_soon`: pre-release; suppress Launch/Update entirely, show
+     *   only an info note. This is the bug-fix for 2026-04-30: previously
+     *   every selectedApp got Launch + Check Update regardless of stage.
+     */
+    stage?: 'shipped' | 'not_installed' | 'coming_soon';
   }
 
   let {
@@ -29,6 +47,37 @@
     selectedApp: App | null;
     onOpenActivation: () => void;
   } = $props();
+
+  const orchState = $derived($orchestrator);
+  // Effective stage: explicit prop wins; otherwise infer for known IDs.
+  // Coming-soon products get inferred from a static set so the home
+  // catalog (which doesn't pass stage) still suppresses Launch/Update.
+  const COMING_SOON_IDS = new Set([
+    'orchestrator-pro', 'mao', 'transcrypt', 'arzillibus',
+    'convertifacile', 'dataweave', 'formcraft', 'pixelsnap',
+    'rl-reranker',
+  ]);
+  const effectiveStage = $derived.by(() => {
+    if (!selectedApp) return 'shipped' as const;
+    if (selectedApp.stage) return selectedApp.stage;
+    if (selectedApp.id === 'orchestrator') {
+      return orchState.status === 'installed' ? 'shipped' : 'not_installed';
+    }
+    if (COMING_SOON_IDS.has(selectedApp.id)) return 'coming_soon';
+    // Subcomponents (knowledge-graph, code-graph) are always shipped if
+    // VCO itself is installed.
+    if (selectedApp.id === 'knowledge-graph' || selectedApp.id === 'code-graph') {
+      return orchState.status === 'installed' ? 'shipped' : 'not_installed';
+    }
+    return 'shipped' as const;
+  });
+  // Whether to show the install/launch quick actions.
+  const showLaunchActions = $derived(
+    selectedApp !== null && effectiveStage === 'shipped' && selectedApp.id === 'orchestrator'
+  );
+  const showInstallAction = $derived(
+    selectedApp !== null && effectiveStage === 'not_installed' && selectedApp.id === 'orchestrator'
+  );
 
   type LaunchState = 'idle' | 'starting' | 'running' | 'error';
   let launchState = $state<LaunchState>('idle');
@@ -134,54 +183,90 @@
 
     <div class="sidebar-divider"></div>
 
-    <div class="sidebar-section">
-      <h4 class="sidebar-label">Quick Actions</h4>
-      <div class="sidebar-actions">
-        <button
-          class="btn-3d btn-3d-primary btn-3d-sm sidebar-action-btn"
-          onclick={onLaunchClick}
-          disabled={!hasProjects || launchState === 'starting'}
-          title={hasProjects
-            ? 'Open the selected project (VS Code if installed, else terminal CLI)'
-            : 'Create a project first to launch the orchestrator'}
-        >
-          {launchLabel}
-        </button>
-        {#if showPicker && projectList.length > 1}
-          <div class="launch-picker">
-            <Dropdown
-              options={projectList.map((p) => ({ value: p.id, label: p.name }))}
-              value={pickerValue}
-              onChange={onPickerChange}
-              placeholder="Pick a project to open…"
-            />
-          </div>
-        {/if}
-        <button
-          class="btn-3d btn-3d-ghost btn-3d-sm sidebar-action-btn"
-          onclick={handleCheckUpdate}
-        >
-          {updateStatus ?? 'Check Update'}
-        </button>
+    {#if showLaunchActions}
+      <div class="sidebar-section">
+        <h4 class="sidebar-label">Quick Actions</h4>
+        <div class="sidebar-actions">
+          <button
+            class="btn-3d btn-3d-primary btn-3d-sm sidebar-action-btn"
+            onclick={onLaunchClick}
+            disabled={!hasProjects || launchState === 'starting'}
+            title={hasProjects
+              ? 'Open the selected project (VS Code if installed, else terminal CLI)'
+              : 'Create a project first to launch the orchestrator'}
+          >
+            {launchLabel}
+          </button>
+          {#if showPicker && projectList.length > 1}
+            <div class="launch-picker">
+              <Dropdown
+                options={projectList.map((p) => ({ value: p.id, label: p.name }))}
+                value={pickerValue}
+                onChange={onPickerChange}
+                placeholder="Pick a project to open…"
+              />
+            </div>
+          {/if}
+          <button
+            class="btn-3d btn-3d-ghost btn-3d-sm sidebar-action-btn"
+            onclick={handleCheckUpdate}
+          >
+            {updateStatus ?? 'Check Update'}
+          </button>
+        </div>
       </div>
-    </div>
 
-    <div class="sidebar-divider"></div>
+      <div class="sidebar-divider"></div>
+    {:else if showInstallAction}
+      <div class="sidebar-section">
+        <h4 class="sidebar-label">Quick Actions</h4>
+        <div class="sidebar-actions">
+          <button
+            class="btn-3d btn-3d-primary btn-3d-sm sidebar-action-btn"
+            onclick={() => ui.openInstallWizard()}
+          >
+            Install Free
+          </button>
+          <p class="sidebar-info-key" style:font-size="11px" style:line-height="1.5">
+            VCO isn't installed yet on this machine. Install Free runs the
+            wizard with sensible defaults.
+          </p>
+        </div>
+      </div>
+
+      <div class="sidebar-divider"></div>
+    {:else if effectiveStage === 'coming_soon'}
+      <div class="sidebar-section">
+        <h4 class="sidebar-label">Status</h4>
+        <div class="sidebar-coming-soon">
+          <span class="sidebar-coming-soon-badge">Coming soon</span>
+          <p class="sidebar-coming-soon-note">
+            Not yet shippable. No install or launch actions until release.
+          </p>
+        </div>
+      </div>
+
+      <div class="sidebar-divider"></div>
+    {/if}
 
     <div class="sidebar-section">
       <h4 class="sidebar-label">App Info</h4>
       <div class="sidebar-info">
-        <div class="sidebar-info-row">
-          <span class="sidebar-info-key">Version</span>
-          <span class="sidebar-info-value">v{selectedApp.version ?? '1.0.0'}</span>
-        </div>
-        <div class="sidebar-info-row">
-          <span class="sidebar-info-key">Size</span>
-          <span class="sidebar-info-value">45 MB</span>
-        </div>
+        {#if selectedApp.version}
+          <div class="sidebar-info-row">
+            <span class="sidebar-info-key">Version</span>
+            <span class="sidebar-info-value">v{selectedApp.version}</span>
+          </div>
+        {/if}
         <div class="sidebar-info-row">
           <span class="sidebar-info-key">Status</span>
-          <span class="sidebar-info-status">Installed</span>
+          {#if effectiveStage === 'coming_soon'}
+            <span class="sidebar-info-status sidebar-info-status-soon">Coming soon</span>
+          {:else if effectiveStage === 'not_installed'}
+            <span class="sidebar-info-status sidebar-info-status-pending">Not installed</span>
+          {:else}
+            <span class="sidebar-info-status">Installed</span>
+          {/if}
         </div>
       </div>
     </div>
@@ -337,6 +422,35 @@
     background: rgba(0, 191, 166, 0.1);
     padding: 2px 10px;
     border-radius: 20px;
+  }
+  .sidebar-info-status-soon {
+    color: var(--color-pink, #ff4fa0);
+    background: rgba(255, 79, 160, 0.12);
+    border: 1px solid rgba(255, 79, 160, 0.25);
+  }
+  .sidebar-info-status-pending {
+    color: var(--color-muted);
+    background: rgba(255, 255, 255, 0.06);
+  }
+  .sidebar-coming-soon {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .sidebar-coming-soon-badge {
+    align-self: flex-start;
+    font-size: 11px;
+    font-weight: 700;
+    padding: 3px 10px;
+    border-radius: 20px;
+    color: var(--color-pink, #ff4fa0);
+    background: rgba(255, 79, 160, 0.12);
+    border: 1px solid rgba(255, 79, 160, 0.25);
+  }
+  .sidebar-coming-soon-note {
+    font-size: 11px;
+    color: var(--color-muted);
+    line-height: 1.5;
   }
 
   .sidebar-profile {
