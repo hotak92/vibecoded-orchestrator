@@ -172,6 +172,7 @@ pub fn run() {
             // Secrets + settings
             commands::secrets_cmd::set_secret_v2,
             commands::secrets_cmd::clear_secret_v2,
+            commands::secrets_cmd::remove_secret_v2,
             commands::secrets_cmd::is_secret_set,
             commands::secrets_cmd::get_secret_preview,
             commands::secrets_cmd::get_setting_v2,
