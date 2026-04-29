@@ -104,6 +104,12 @@
       label: 'System',
       items: [
         {
+          href: '/services',
+          label: 'Services',
+          sub: 'Start/stop Weaviate, Ollama, SearXNG, code-embed',
+          match: (p) => p.startsWith('/services'),
+        },
+        {
           href: '/mcp',
           label: 'Custom MCP servers',
           sub: 'Add Claude capabilities (web search, etc.)',
