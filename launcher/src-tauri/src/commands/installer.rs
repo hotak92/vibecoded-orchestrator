@@ -577,6 +577,33 @@ fn install_root_complete_at(root: &Path) -> bool {
         && (root.join("state").is_dir() || env_contains_kg(&root.join(".env")))
 }
 
+/// 2026-04-29 fix (wizard install-path lockdown): assert that
+/// `install_path` is a vco source repo before any install-time
+/// mutations run. The wizard previously let the user pick an arbitrary
+/// empty folder; install_orchestrator would then copy
+/// `ORCHESTRATOR_MANAGED_PATHS` into that folder — which is a SUBSET
+/// (no launcher/, no first-install.sh, no scripts/) and produced an
+/// "orphan" install the end user couldn't run. The discriminator is
+/// the presence of `install.py` AND `first-install.sh` next to each
+/// other; both ship in every vco clone and tarball, neither is in
+/// ORCHESTRATOR_MANAGED_PATHS so they can't appear in a half-install.
+///
+/// Returns `Err` with a user-actionable message when validation fails;
+/// returns `Ok(())` when the path looks like a vco source repo.
+pub fn validate_source_repo(install_path: &Path) -> Result<(), String> {
+    let install_py = install_path.join("install.py");
+    let first_install_sh = install_path.join("first-install.sh");
+    if !install_py.is_file() || !first_install_sh.is_file() {
+        return Err(format!(
+            "Install path must be a vco source repo (must contain install.py + first-install.sh). \
+             To install at a different location, clone the repo there and re-run from that folder. \
+             Got: {}",
+            install_path.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Detect whether the launcher is running from inside an already-installed
 /// orchestrator (i.e. the user did `bash first-install.sh` and we are now
 /// inside that install). The wizard uses this to skip the install step
@@ -942,6 +969,17 @@ pub async fn install_orchestrator(
     window: Window,
 ) -> Result<InstallResult, String> {
     let install_path = PathBuf::from(&config.install_path);
+
+    // 2026-04-29 fix (wizard install-path lockdown): refuse to install
+    // into a directory that isn't a vco source repo. The previous code
+    // path let the wizard target an arbitrary empty folder and copy a
+    // SUBSET of files in (per ORCHESTRATOR_MANAGED_PATHS — no launcher,
+    // no first-install.sh, no scripts/), producing a half-installed
+    // orphan that the end user couldn't run. Install is in-place; the
+    // install_path must be the cloned source repo. Defensive check
+    // BEFORE any filesystem mutations.
+    validate_source_repo(&install_path)?;
+
     let system = detect_system().await?;
 
     if !system.has_python {
@@ -4403,6 +4441,58 @@ MemAvailable:   23456789 kB
         let health = inspect_install_health_at(&p);
         assert!(!health.mcp_servers_ok);
         assert!(!health.all_ok);
+        fs::remove_dir_all(&p).ok();
+    }
+
+    // ---- validate_source_repo (2026-04-29 wizard install-path lockdown) ----
+    //
+    // The wizard previously let the user pick any folder as install_path;
+    // install_orchestrator would copy ORCHESTRATOR_MANAGED_PATHS in but the
+    // result was a half-install with no launcher / no first-install.sh.
+    // validate_source_repo() rejects non-source folders BEFORE any
+    // mutations. The discriminator is install.py + first-install.sh side
+    // by side — both ship in every clone, neither is in
+    // ORCHESTRATOR_MANAGED_PATHS, so a half-install can't fake it.
+
+    #[test]
+    fn install_orchestrator_rejects_non_source_repo() {
+        // An empty tmp dir is the canonical "user picked an empty folder"
+        // case the lockdown is meant to refuse. validate_source_repo must
+        // return Err with a message that mentions install.py and
+        // first-install.sh so the user knows what's expected.
+        let p = tmp();
+        let res = validate_source_repo(&p);
+        assert!(res.is_err(), "validate_source_repo accepted an empty dir");
+        let msg = res.unwrap_err();
+        assert!(
+            msg.contains("install.py") && msg.contains("first-install.sh"),
+            "error message must name the two required files; got: {}",
+            msg
+        );
+        fs::remove_dir_all(&p).ok();
+    }
+
+    #[test]
+    fn install_orchestrator_rejects_partial_source_repo() {
+        // install.py present but first-install.sh missing — still a
+        // non-source target, must be refused.
+        let p = tmp();
+        fs::write(p.join("install.py"), "# install\n").unwrap();
+        let res = validate_source_repo(&p);
+        assert!(res.is_err(), "validate_source_repo accepted install.py-only dir");
+        fs::remove_dir_all(&p).ok();
+    }
+
+    #[test]
+    fn install_orchestrator_accepts_source_repo() {
+        // Both markers present — must pass. (Intentionally short-circuits
+        // before any real install side effects; this test only exercises
+        // the validation gate, not the rest of install_orchestrator.)
+        let p = tmp();
+        fs::write(p.join("install.py"), "# install\n").unwrap();
+        fs::write(p.join("first-install.sh"), "#!/usr/bin/env bash\n").unwrap();
+        let res = validate_source_repo(&p);
+        assert!(res.is_ok(), "validate_source_repo rejected a source repo: {:?}", res);
         fs::remove_dir_all(&p).ok();
     }
 }
