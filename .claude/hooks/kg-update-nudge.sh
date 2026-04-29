@@ -197,7 +197,11 @@ Before continuing, review what you've learned in this session and:
   - Use store_knowledge_node OR write directly to knowledge/**/*.md (hook auto-syncs to Weaviate)
 
 If you've genuinely learned nothing worth recording, write a brief comment to that effect and continue. But don't silently skip the prompt."""
-        print(msg, file=sys.stderr)
+        # UserPromptSubmit hooks surface STDOUT as <system-reminder>
+        # context, not stderr. v2/v3 used stderr — the message was
+        # generated correctly but never reached the conversation.
+        # PostToolUse-background never surfaces either channel.
+        print(msg)
         current["last_nudge_at"] = session_total
         current["fired_once"] = True
 else:
