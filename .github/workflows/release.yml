@@ -4,15 +4,17 @@
 #   - Tag push matching v*.*.* (e.g. v0.1.0) → cuts a GitHub Release.
 #   - Manual workflow_dispatch → useful for dry-runs / re-cutting artifacts.
 #
-# What we ship per OS (v0.1.0 launch matrix):
-#   - Linux x64 (ubuntu-latest):    vct-launcher        + .metadata.json
-#   - Windows x64 (windows-latest): vct-launcher.exe    + .metadata.json
+# What we ship per OS (v0.1.5 matrix):
+#   - Linux x64 (ubuntu-latest):    vct-launcher          + .metadata.json
+#   - Windows x64 (windows-latest): vct-launcher.exe      + .metadata.json
+#   - macOS arm64 (macos-latest):   vct-launcher          + .metadata.json
+#   - macOS x64 (macos-13):         vct-launcher          + .metadata.json
 #
-# macOS is INTENTIONALLY out of this CI matrix for v0.1.0 — labeled
-# Tier-2 experimental, built locally on a maintainer Mac and uploaded
-# manually to the release. Adding macos-latest here would burn billing
-# minutes on a target we cannot validate from CI. Tracked for
-# re-inclusion in v0.1.1 alongside code signing / notarization.
+# macOS UNSIGNED — Apple Developer ID + notarization deferred
+# (Tier-2 alpha, see QuickStart). First-launch users will see a
+# Gatekeeper "unidentified developer" dialog; right-click → Open
+# bypasses it. README + QuickStart already disclose this. Code
+# signing tracked separately for v0.2.x.
 #
 # Build is driven by `bash scripts/build-bundled-launcher.sh` — the
 # SAME script maintainers run locally. It does:
@@ -57,6 +59,17 @@ jobs:
           - os: windows-latest
             target: windows-x64
             binary: vct-launcher.exe
+          # macOS Apple Silicon (M1/M2/M3). `macos-latest` defaults to ARM
+          # since the GitHub-hosted runner image transition (Sept 2024+).
+          - os: macos-latest
+            target: macos-arm64
+            binary: vct-launcher
+          # macOS Intel. macos-13 is the last x86_64 runner image — newer
+          # macos-14/-15 are ARM-only. Drop this entry once Intel users
+          # are below a usable cohort threshold.
+          - os: macos-13
+            target: macos-x64
+            binary: vct-launcher
 
     runs-on: ${{ matrix.os }}
 
@@ -101,12 +114,15 @@ jobs:
             file
 
       # Single source of truth: same script maintainers run locally.
-      # Bash is the shell on both runners — Git Bash on windows-latest is
-      # preinstalled, and the script's host-detection case branch handles
-      # MINGW*/MSYS*/CYGWIN* → windows-x64. Output lands at
-      # launcher/dist/<target>/vct-launcher{,.exe} + .metadata.json.
+      # Bash is the shell on all runners — Git Bash on windows-latest is
+      # preinstalled. The script auto-detects host arch but accepts a
+      # `BUILD_TARGET` override so CI can pin the canonical dist subdir
+      # name (matters for macOS where local builds use the legacy
+      # `experimental_macOS` slot but CI ships `macos-arm64`/`macos-x64`).
       - name: Build launcher (bundled script)
         shell: bash
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
         run: bash scripts/build-bundled-launcher.sh
 
       # Sanity-check that the staged artifacts exist before upload, so a
@@ -129,6 +145,33 @@ jobs:
           fi
           ls -lh "$dist"
 
+      # macOS artifacts are flagged with the `-experimental` suffix in their
+      # filename so users browsing the GitHub Release sidebar see the tier
+      # marker before downloading. Apple Developer ID code-signing +
+      # notarization are deferred to v0.2.x; until then macOS users will
+      # hit Gatekeeper. Done BEFORE attestation so SLSA provenance binds
+      # to the user-visible filename (so `gh attestation verify
+      # vct-launcher-macos-arm64-experimental` works).
+      - name: Stage release artifact (rename macOS to -experimental)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          dist="launcher/dist/${{ matrix.target }}"
+          stage="$dist/_release"
+          mkdir -p "$stage"
+          case "${{ matrix.target }}" in
+            macos-arm64|macos-x64)
+              cp "$dist/${{ matrix.binary }}" "$stage/vct-launcher-${{ matrix.target }}-experimental"
+              cp "$dist/${{ matrix.binary }}.metadata.json" "$stage/vct-launcher-${{ matrix.target }}-experimental.metadata.json"
+              ;;
+            *)
+              cp "$dist/${{ matrix.binary }}" "$stage/${{ matrix.binary }}"
+              cp "$dist/${{ matrix.binary }}.metadata.json" "$stage/${{ matrix.binary }}.metadata.json"
+              ;;
+          esac
+          ls -lh "$stage"
+
       # SLSA build provenance attestation. Generates a Sigstore-signed
       # in-toto provenance predicate (SLSA Build Level 2 by default on
       # GitHub-hosted runners) for the launcher binary. End users can
@@ -136,11 +179,13 @@ jobs:
       # with `gh attestation verify <binary> --repo hotak92/vibecoded-orchestrator`.
       # Runs only on tagged releases — workflow_dispatch dry-runs skip
       # attestation since there's nothing to publish provenance for.
+      # Subject path resolution: macOS jobs attest the renamed
+      # `-experimental` binary, others attest the canonical filename.
       - name: Generate build provenance attestation
         if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: launcher/dist/${{ matrix.target }}/${{ matrix.binary }}
+          subject-path: launcher/dist/${{ matrix.target }}/_release/${{ (startsWith(matrix.target, 'macos-')) && format('vct-launcher-{0}-experimental', matrix.target) || matrix.binary }}
 
       # Upload the binary + metadata as Release assets. softprops/action-gh-release@v3
       # auto-creates the release on tag push if it doesn't exist yet, and
@@ -152,8 +197,7 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           files: |
-            launcher/dist/${{ matrix.target }}/${{ matrix.binary }}
-            launcher/dist/${{ matrix.target }}/${{ matrix.binary }}.metadata.json
+            launcher/dist/${{ matrix.target }}/_release/*
 
       # Always upload as workflow artifacts too — lets workflow_dispatch
       # runs (no tag) still produce downloadable binaries for QA.
