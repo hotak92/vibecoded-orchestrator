@@ -198,7 +198,7 @@ git config --global credential.https://github.com.helper '/path/to/git-credentia
 
 It walks up from `$PWD` looking for a `.vct-project` marker, falls back
 to matching against `$VCT_PROJECT_ROOT_PATTERN` (default
-`$HOME/Desktop/PROGETTI`), and reads the per-project or shared
+`$HOME/dev`), and reads the per-project or shared
 `github_pat`. No PAT in `~/.git-credentials`.
 
 ### For CI / deploy scripts

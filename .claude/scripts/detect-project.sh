@@ -3,7 +3,7 @@
 #
 # Given a file path, checks if it's under the current project root.
 # If not, looks for a sibling project folder under the common parent
-# (e.g. ~/Desktop/PROGETTI/) and returns that project's name.
+# (e.g. ~/dev/) and returns that project's name.
 #
 # Usage:
 #   source detect-project.sh
