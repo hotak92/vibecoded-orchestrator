@@ -3,25 +3,42 @@
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
 # KG-update nudge hook — fires a stderr <system-reminder> when the assistant
-# has used >150k tokens since the last knowledge-graph write OR
-# store_knowledge_node call. Defensive ergonomics: the user has noticed
-# Claude often forgets to update the KG even after substantial work.
+# has used substantial tokens since the last knowledge-graph write OR
+# store_knowledge_node call.
 #
-# Reset triggers:
+# v3 (2026-04-30): two-event hook (PostToolUse + UserPromptSubmit).
+#   - PostToolUse path: detects KG-writes (Write/Edit/store_knowledge_node)
+#     and resets the baseline. Background-safe; never prints stderr.
+#   - UserPromptSubmit path: reads state, computes delta against the live
+#     transcript token total, prints stderr if threshold tripped. Stderr
+#     from UserPromptSubmit hooks IS surfaced into the conversation as
+#     a system-reminder (unlike background PostToolUse hooks where stderr
+#     is detached). This is the v2→v3 fix — v2 fired correctly but the
+#     stderr never reached the conversation.
+#
+# v2 (2026-04-30): rewritten because v1 read tokens from the PostToolUse
+#   `usage` field, which Claude Code does not populate on PostToolUse. v2
+#   reads cumulative session tokens from the live transcript JSONL passed
+#   as `transcript_path` in the hook payload.
+#
+# Trigger ladder (per user 2026-04-30):
+#   - First nudge: cumulative session tokens since last KG-write >= 150_000
+#   - Subsequent nudges: every 10_000 additional tokens after first fire
+#
+# Counter reset triggers (PostToolUse):
 #   - tool_name == "mcp__weaviate-kg__store_knowledge_node"
 #   - (Write or Edit) AND file_path matches **/knowledge/**/*.md
 #
-# Bypass: KG_NUDGE_OFF=1 in the environment disables the nudge entirely.
-# Threshold tweak: KG_NUDGE_THRESHOLD=<int> overrides the 150k default.
+# Bypass: KG_NUDGE_OFF=1 disables the nudge entirely.
+# Threshold tweak:
+#   KG_NUDGE_FIRST=<int>     overrides 150_000 first-fire threshold
+#   KG_NUDGE_INTERVAL=<int>  overrides 10_000 subsequent interval
 #
 # State: ~/.claude/metrics/kg_update_tokens.jsonl
-#   One JSON line per session_id: {"session_id": "...", "tokens": 12345, "updated_at": "..."}
+#   {session_id, baseline, last_nudge_at, last_seen_total, fired_once, updated_at}
 #   Atomic rename + fcntl lock to handle concurrent writes from sibling agents.
 #
-# Always exits 0 — never blocks the tool call.
-#
-# Registered in .claude/settings.json under PostToolUse matcher "*"
-# with background: true and timeout: 3.
+# Always exits 0 — never blocks the tool call or prompt.
 
 set -uo pipefail
 
@@ -31,15 +48,13 @@ set -uo pipefail
 INPUT="$(cat 2>/dev/null || true)"
 [ -z "$INPUT" ] && exit 0
 
-THRESHOLD="${KG_NUDGE_THRESHOLD:-150000}"
+FIRST_THRESHOLD="${KG_NUDGE_FIRST:-150000}"
+INTERVAL="${KG_NUDGE_INTERVAL:-10000}"
 METRICS_DIR="$HOME/.claude/metrics"
 METRICS_FILE="$METRICS_DIR/kg_update_tokens.jsonl"
 
 mkdir -p "$METRICS_DIR" 2>/dev/null || exit 0
 
-# Embed Python for JSON parsing + atomic state update. Bash + jq alone is
-# fragile when handling missing keys / nested structures across Claude Code
-# versions. Python is available everywhere this hook runs.
 python3 <<PYTHON_EOF || true
 import json
 import os
@@ -49,7 +64,8 @@ import tempfile
 from datetime import datetime, timezone
 
 INPUT = """$INPUT"""
-THRESHOLD = $THRESHOLD
+FIRST_THRESHOLD = $FIRST_THRESHOLD
+INTERVAL = $INTERVAL
 METRICS_FILE = "$METRICS_FILE"
 
 try:
@@ -60,21 +76,17 @@ except (json.JSONDecodeError, TypeError):
 session_id = payload.get("session_id") or "unknown"
 tool_name = payload.get("tool_name") or ""
 tool_input = payload.get("tool_input") or {}
-tool_response = payload.get("tool_response") or {}
+transcript_path = payload.get("transcript_path") or ""
 
-# Token usage — try several known shapes across Claude Code versions.
-usage = (
-    payload.get("usage")
-    or payload.get("message", {}).get("usage")
-    or tool_response.get("usage")
-    or {}
-)
-in_tok = int(usage.get("input_tokens") or 0)
-out_tok = int(usage.get("output_tokens") or 0)
-new_tokens = in_tok + out_tok
-# Note: cache_read_input_tokens excluded — they're cheap, don't represent new work.
+# Branch by event type:
+#   PostToolUse → has tool_name + tool_input. Mission: detect KG-write,
+#                 reset baseline. NEVER print stderr (background ⇒ detached).
+#   UserPromptSubmit → has prompt + (no tool_name). Mission: compute
+#                      cumulative tokens, fire nudge to stderr if threshold.
+is_post_tool = bool(tool_name)
+is_user_prompt = (not tool_name) and ("prompt" in payload)
 
-# Detect "knowledge update" — counter reset trigger.
+# --- Detect KG-write (counter reset) — only relevant on PostToolUse ---
 def is_knowledge_path(path: str) -> bool:
     if not path:
         return False
@@ -82,16 +94,45 @@ def is_knowledge_path(path: str) -> bool:
     return "/knowledge/" in p and p.endswith(".md")
 
 is_knowledge_update = False
-if tool_name == "mcp__weaviate-kg__store_knowledge_node":
-    is_knowledge_update = True
-elif tool_name in ("Write", "Edit"):
-    for k in ("file_path", "path", "filePath"):
-        v = tool_input.get(k) or ""
-        if is_knowledge_path(v):
-            is_knowledge_update = True
-            break
+if is_post_tool:
+    if tool_name == "mcp__weaviate-kg__store_knowledge_node":
+        is_knowledge_update = True
+    elif tool_name in ("Write", "Edit"):
+        for k in ("file_path", "path", "filePath"):
+            v = tool_input.get(k) or ""
+            if is_knowledge_path(v):
+                is_knowledge_update = True
+                break
 
-# Read existing state.
+# --- Read cumulative session tokens from live transcript ---
+# Skip the costly scan on PostToolUse if it's a KG-write (we just need to
+# reset and don't actually need the current total).
+session_total = 0
+need_total = is_user_prompt or (is_post_tool and not is_knowledge_update)
+if need_total and transcript_path and os.path.exists(transcript_path):
+    try:
+        size = os.path.getsize(transcript_path)
+        if size < 256 * 1024 * 1024:
+            with open(transcript_path, "r", errors="replace") as f:
+                for line in f:
+                    try:
+                        d = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    msg = d.get("message")
+                    if not isinstance(msg, dict):
+                        continue
+                    usage = msg.get("usage")
+                    if not isinstance(usage, dict):
+                        continue
+                    in_tok = int(usage.get("input_tokens") or 0)
+                    out_tok = int(usage.get("output_tokens") or 0)
+                    cc_tok = int(usage.get("cache_creation_input_tokens") or 0)
+                    session_total += in_tok + out_tok + cc_tok
+    except OSError:
+        pass
+
+# --- Read existing state ---
 state = {}
 if os.path.exists(METRICS_FILE):
     try:
@@ -110,36 +151,66 @@ if os.path.exists(METRICS_FILE):
     except OSError:
         pass
 
-current = state.get(session_id, {"session_id": session_id, "tokens": 0})
+current = state.get(session_id, {
+    "session_id": session_id,
+    "baseline": 0,
+    "last_nudge_at": 0,
+    "last_seen_total": 0,
+    "fired_once": False,
+})
 
-if is_knowledge_update:
-    new_total = 0
-    fired = False
-else:
-    new_total = int(current.get("tokens", 0)) + new_tokens
-    # Threshold check — fire stderr nudge, then reset counter so we don't re-fire
-    # immediately on every subsequent tool call.
-    fired = False
-    if new_total >= THRESHOLD:
-        fired = True
-        kilo = round(new_total / 1000)
-        msg = f"""📚 KG-update nudge: you've used ~{kilo}k tokens since the last knowledge-graph update (counter resets on writes to knowledge/**/*.md OR store_knowledge_node calls).
+# --- Branch logic ---
+if is_post_tool and is_knowledge_update:
+    # Reset baseline. Use last_seen_total as the new baseline if we
+    # didn't recompute (we skipped the transcript scan above).
+    base = session_total if session_total else int(current.get("last_seen_total", 0))
+    current["baseline"] = base
+    current["last_nudge_at"] = 0
+    current["fired_once"] = False
+elif is_user_prompt:
+    # Threshold check + stderr fire.
+    delta = session_total - int(current.get("baseline", 0))
+    fired_once = bool(current.get("fired_once", False))
+    last_nudge_at = int(current.get("last_nudge_at", 0))
+
+    should_fire = False
+    if not fired_once and delta >= FIRST_THRESHOLD:
+        should_fire = True
+    elif fired_once and (session_total - last_nudge_at) >= INTERVAL:
+        should_fire = True
+
+    if should_fire:
+        kilo = round(delta / 1000)
+        if not fired_once:
+            preamble = f"📚 KG-update nudge: ~{kilo}k tokens of work since the last knowledge-graph update."
+        else:
+            since_last = round((session_total - last_nudge_at) / 1000)
+            preamble = (
+                f"📚 KG-update nudge ({kilo}k tokens since last KG-write, "
+                f"{since_last}k since last nudge — escalating because no KG node was written between nudges)."
+            )
+        msg = preamble + """ Counter resets only on writes to knowledge/**/*.md OR store_knowledge_node calls.
 
 Before continuing, review what you've learned in this session and:
-  - UPDATE existing nodes if they're now outdated (status, content, valid_until)
+  - UPDATE existing nodes if outdated (status, content, valid_until)
   - CREATE new nodes for non-obvious facts: project state, architecture decisions, gotchas, patterns
   - Use store_knowledge_node OR write directly to knowledge/**/*.md (hook auto-syncs to Weaviate)
 
-This is a soft nudge — if you've genuinely learned nothing worth recording, write a brief comment to that effect and continue. But don't silently skip the prompt."""
+If you've genuinely learned nothing worth recording, write a brief comment to that effect and continue. But don't silently skip the prompt."""
         print(msg, file=sys.stderr)
-        # Reset counter after firing so subsequent nudges only fire on FRESH 150k.
-        new_total = 0
+        current["last_nudge_at"] = session_total
+        current["fired_once"] = True
+else:
+    # PostToolUse non-KG-write: just bookkeeping the session_total.
+    pass
 
-current["tokens"] = new_total
+# Update last_seen_total whenever we computed it.
+if session_total:
+    current["last_seen_total"] = session_total
 current["updated_at"] = datetime.now(timezone.utc).isoformat()
 state[session_id] = current
 
-# Atomic write: write to tmpfile in same dir, fsync, rename.
+# --- Atomic write ---
 try:
     dir_ = os.path.dirname(METRICS_FILE)
     fd, tmppath = tempfile.mkstemp(prefix=".kg_update_tokens.", dir=dir_)

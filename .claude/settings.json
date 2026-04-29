@@ -117,6 +117,11 @@
             "type": "command",
             "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/diff-context-inject.sh",
             "timeout": 3
+          },
+          {
+            "type": "command",
+            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/kg-update-nudge.sh",
+            "timeout": 4
           }
         ]
       }
