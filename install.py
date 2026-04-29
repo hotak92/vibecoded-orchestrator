@@ -1547,6 +1547,12 @@ def main() -> int:
     # Step 10: Check Claude CLI
     _check_claude_cli()
 
+    # Cache Playwright MCP + Chromium so the default-enabled `playwright`
+    # MCP entry doesn't stall on first browser-launch with a 150 MB
+    # download. Non-fatal: failures here only warn, since the MCP can
+    # still lazy-install on first call.
+    _install_playwright_browsers()
+
     # Step 11: Initial code graph analysis (if repo has code)
     # Skipped on first install — user runs manually after setup
 
@@ -4941,6 +4947,103 @@ def _check_claude_cli() -> None:
             "10/10", "warn",
             "claude CLI missing — user must install separately",
         )
+
+
+# ---------------------------------------------------------------------------
+# Playwright MCP + Chromium pre-cache
+# ---------------------------------------------------------------------------
+
+def _install_playwright_browsers() -> None:
+    """Pre-cache `@playwright/mcp` + Chromium so the default-enabled
+    Playwright MCP doesn't stall on first browser launch.
+
+    Behaviour:
+      - Skipped entirely if `VCT_SKIP_PLAYWRIGHT=1` is set in the env.
+      - Skipped if `npx` is not on PATH (the MCP can still lazy-install
+        when Node arrives later; we just warn).
+      - Runs `npx -y @playwright/mcp@latest --version` to populate the
+        npx cache (~few MB).
+      - Runs `npx playwright install chromium` to fetch the Chromium
+        binary (~150 MB).
+
+    Non-fatal: any failure logs a warn event and prints a short notice,
+    but never aborts the install. The MCP can still lazy-install on
+    first invocation; the only cost is a one-time UX delay.
+    """
+    print("[playwright] Pre-caching Playwright MCP + Chromium ... ",
+          end="", flush=True)
+    _log_install_event("playwright", "start",
+                       "caching @playwright/mcp + chromium")
+
+    if os.environ.get("VCT_SKIP_PLAYWRIGHT") == "1":
+        print("SKIPPED (VCT_SKIP_PLAYWRIGHT=1)")
+        _log_install_event("playwright", "skip",
+                           "VCT_SKIP_PLAYWRIGHT=1 in env")
+        return
+
+    if not shutil.which("npx"):
+        print("SKIPPED (npx not found)")
+        print("  Node.js / npx not detected. Playwright MCP will")
+        print("  lazy-install when first invoked. Install Node.js 18+")
+        print("  to pre-cache: https://nodejs.org")
+        _log_install_event("playwright", "skip",
+                           "npx not on PATH — MCP will lazy-install")
+        return
+
+    print("(this may take ~30s, ~150 MB)")
+
+    # 1) Cache the MCP package itself (small).
+    try:
+        result = subprocess.run(
+            ["npx", "-y", "@playwright/mcp@latest", "--version"],
+            capture_output=True, text=True, timeout=180,
+        )
+        if result.returncode != 0:
+            print("  WARN: @playwright/mcp version check failed.")
+            print(f"    stderr: {result.stderr.strip()[:200]}")
+            _log_install_event("playwright", "warn",
+                               "npx -y @playwright/mcp@latest --version "
+                               "exited non-zero",
+                               data={"returncode": result.returncode,
+                                     "stderr": result.stderr.strip()[:500]})
+            return
+    except (subprocess.TimeoutExpired, OSError) as e:
+        print(f"  WARN: @playwright/mcp version check failed: {e}")
+        _log_install_event("playwright", "warn",
+                           f"npx -y @playwright/mcp version check failed: {e}")
+        return
+
+    # 2) Cache the Chromium browser binary (~150 MB). This is the
+    #    expensive step; we only do chromium (not firefox/webkit) to
+    #    keep the install size down. Users who need other browsers can
+    #    `npx playwright install firefox` etc. manually.
+    try:
+        result = subprocess.run(
+            ["npx", "playwright", "install", "chromium"],
+            capture_output=True, text=True, timeout=600,
+        )
+        if result.returncode == 0:
+            print("[playwright] Chromium cached OK.")
+            _log_install_event("playwright", "ok",
+                               "Playwright MCP + Chromium cached")
+        else:
+            print("  WARN: chromium install exited non-zero.")
+            print(f"    stderr: {result.stderr.strip()[:200]}")
+            print("  The MCP will lazy-install Chromium on first browser call.")
+            _log_install_event("playwright", "warn",
+                               "npx playwright install chromium exited "
+                               "non-zero",
+                               data={"returncode": result.returncode,
+                                     "stderr": result.stderr.strip()[:500]})
+    except subprocess.TimeoutExpired:
+        print("  WARN: chromium install timed out after 10 min.")
+        print("  The MCP will lazy-install Chromium on first browser call.")
+        _log_install_event("playwright", "warn",
+                           "npx playwright install chromium timed out (600s)")
+    except OSError as e:
+        print(f"  WARN: chromium install failed: {e}")
+        _log_install_event("playwright", "warn",
+                           f"npx playwright install chromium failed: {e}")
 
 
 # ---------------------------------------------------------------------------
