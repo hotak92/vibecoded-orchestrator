@@ -41,11 +41,15 @@ for arg in "$@"; do
 done
 
 # Detect host arch.
+# `BUILD_TARGET` env override lets CI explicitly pick the canonical
+# directory name (e.g. `macos-arm64` for the Apple-Silicon job, where
+# uname-detection alone produced the legacy `experimental_macOS` slot
+# used for local maintainer builds).
 case "$(uname -s)-$(uname -m)" in
-    Linux-x86_64)   HOST_TARGET="linux-x64";   HOST_BIN="vct-launcher" ;;
-    Darwin-arm64)   HOST_TARGET="experimental_macOS"; HOST_BIN="vct-launcher" ;;
-    Darwin-x86_64)  HOST_TARGET="experimental_macOS"; HOST_BIN="vct-launcher" ;;
-    MINGW*|MSYS*|CYGWIN*) HOST_TARGET="windows-x64"; HOST_BIN="vct-launcher.exe" ;;
+    Linux-x86_64)   HOST_TARGET="${BUILD_TARGET:-linux-x64}";   HOST_BIN="vct-launcher" ;;
+    Darwin-arm64)   HOST_TARGET="${BUILD_TARGET:-macos-arm64}"; HOST_BIN="vct-launcher" ;;
+    Darwin-x86_64)  HOST_TARGET="${BUILD_TARGET:-macos-x64}";   HOST_BIN="vct-launcher" ;;
+    MINGW*|MSYS*|CYGWIN*) HOST_TARGET="${BUILD_TARGET:-windows-x64}"; HOST_BIN="vct-launcher.exe" ;;
     *)
         echo "[build-bundled] Unrecognised host: $(uname -s)-$(uname -m). Aborting." >&2
         exit 1
