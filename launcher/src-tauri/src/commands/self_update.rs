@@ -1,10 +1,10 @@
 //! Launcher self-update via git-pull.
 //!
-//! User decision (verbatim, 2026-04-27):
-//! "this should pull the latest from repo, merge it (but not on files that
-//!  are to be considered 'user owned' like CONTEXT_STATE.md) -> restart
-//!  launcher to pick up changes. check for updates once a day and alert on
-//!  new version available"
+//! Behaviour: pull the latest from the remote, merge it (skipping
+//! files considered user-owned, e.g. `CONTEXT_STATE.md`), then restart
+//! the launcher to pick up changes. Check for updates once a day and
+//! surface a notification when a new version is available — never
+//! auto-apply.
 //!
 //! Approach:
 //!   1. Daily background check: `git ls-remote origin <branch>` + local

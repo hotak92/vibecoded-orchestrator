@@ -12,8 +12,9 @@
 //!
 //!   - **Parallel**: pick a free port and write
 //!     `infrastructure/docker-compose.override.yml` (alongside any
-//!     existing override from Bug 31's volume migration). Our compose
-//!     stack runs on the new port; the external service is left alone.
+//!     existing override from a prior volume-location migration). Our
+//!     compose stack runs on the new port; the external service is
+//!     left alone.
 //!
 //!   - **Refuse**: the launcher does nothing — the user keeps managing
 //!     their external services manually. Lifecycle commands skip the

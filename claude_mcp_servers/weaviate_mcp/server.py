@@ -21,8 +21,6 @@ Connection:
 - HTTP: localhost:8081 (configurable via WEAVIATE_URL)
 - gRPC: localhost:50052 (configurable via GRPC_PORT)
 - Ollama: localhost:11435 (configurable via OLLAMA_URL)
-
-Date: 2026-03-12
 """
 
 import os

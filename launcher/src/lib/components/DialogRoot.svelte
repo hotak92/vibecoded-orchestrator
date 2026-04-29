@@ -1,13 +1,13 @@
 <script lang="ts">
   // DialogRoot — native <dialog>-based modal wrapper.
   //
-  // Bug 26: previous fixed-position+inset:0 modals z-fought with Tauri's
-  // GTK title bar. The native <dialog> element renders in the browser
-  // top layer (above ALL other elements including OS chrome inside the
-  // WebView), with native ::backdrop, native escape-to-close, native
-  // accessibility tree treatment, and native focus trapping when opened
-  // with showModal(). No CSS centering math, no z-index, no
-  // position:fixed.
+  // Avoids the fixed-position+inset:0 modal pattern, which z-fought
+  // with Tauri's GTK title bar in earlier builds. The native <dialog>
+  // element renders in the browser top layer (above ALL other elements
+  // including OS chrome inside the WebView), with native ::backdrop,
+  // native escape-to-close, native accessibility tree treatment, and
+  // native focus trapping when opened with showModal(). No CSS
+  // centering math, no z-index, no position:fixed.
   //
   // Usage:
   //   <DialogRoot bind:this={dlg} onClose={...}>

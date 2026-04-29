@@ -17,7 +17,7 @@
   import Dropdown from '$lib/components/Dropdown.svelte';
   import DialogRoot from '$lib/components/DialogRoot.svelte';
 
-  // Bug 20: when the user picks a folder, run inspect_orchestrator_at to
+  // When the user picks a folder, run inspect_orchestrator_at to
   // detect whether an orchestrator is already there and what shape it's
   // in. The status panel below the path input shows the result and
   // gives the user three explicit choices (use as-is / update / install

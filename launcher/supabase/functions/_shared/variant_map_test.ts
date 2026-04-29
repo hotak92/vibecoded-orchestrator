@@ -1,4 +1,4 @@
-// Bug 33 — admin variant resolution unit tests.
+// Admin variant resolution unit tests.
 //
 // Run with:  deno test --no-check launcher/supabase/functions/_shared/variant_map_test.ts
 //

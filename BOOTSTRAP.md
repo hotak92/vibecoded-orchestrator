@@ -123,7 +123,7 @@ podman ps   # or `docker ps`
 
 **Advanced**: set `VCT_FORCE_SEPARATE_CONTAINERS=1` and override `WEAVIATE_PORT` / `OLLAMA_PORT` / `CODE_EMBED_PORT` to give an install its own containers. Useful for hard isolation between (e.g.) work and personal setups, but it costs extra disk and RAM per install.
 
-### Container volumes location (Bug 31)
+### Container volumes location
 
 The three orchestrator volumes — `weaviate_data`, `ollama_data`, `code_embed_cache` — default to the container engine's standard location (`~/.local/share/containers/storage/volumes/` for rootless Podman). Move them if `$HOME` has limited disk.
 

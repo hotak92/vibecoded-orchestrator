@@ -12,23 +12,22 @@
     onClose,
     onComplete,
   }: {
-    // 2026-04-28 fix (Bug A): the wizard no longer takes a bindable
-    // `open` prop. The parent gates the wizard with
-    // `{#if uiState.showOnboarding}` and listens for `onClose` to flip
-    // its store; if we're mounted at all, we're meant to be visible.
-    // The previous two-effect bridge in +layout.svelte (mirror
-    // store→local + back-sync local→store) raced on Svelte 5's
-    // effect-ordering and reopened the wizard one tick after Skip
-    // closed it. Single source of truth (the ui store) eliminates the
-    // race. See +layout.svelte for the consumer side.
+    // The wizard does not take a bindable `open` prop. The parent
+    // gates it with `{#if uiState.showOnboarding}` and listens for
+    // `onClose` to flip its store; if we're mounted at all, we're
+    // meant to be visible. A two-effect bridge (mirror store→local +
+    // back-sync local→store) would race on Svelte 5's effect-ordering
+    // and could reopen the wizard one tick after Skip closed it.
+    // Single source of truth (the ui store) eliminates the race. See
+    // +layout.svelte for the consumer side.
     //
-    // 2026-04-28 fix (forced re-run): `force` is set true when the
-    // user explicitly invoked Settings → Preferences → "Re-run
-    // onboarding wizard". The preflight then skips the
-    // already-have-projects auto-close branch (which would otherwise
-    // hide the wizard immediately on a machine that already has
-    // projects registered). The install-root path-defaulting branch
-    // still runs so step 3 / step 4 see correct defaults.
+    // `force` is set true when the user explicitly invoked
+    // Settings → Preferences → "Re-run onboarding wizard". The
+    // preflight then skips the already-have-projects auto-close
+    // branch (which would otherwise hide the wizard immediately on a
+    // machine that already has projects registered). The
+    // install-root path-defaulting branch still runs so step 3 /
+    // step 4 see correct defaults.
     force?: boolean;
     onClose?: () => void;
     onComplete?: () => void;

@@ -5,7 +5,7 @@
   import type { ProjectSkill } from '$lib/types/project-state';
   import Dropdown from '$lib/components/Dropdown.svelte';
 
-  // Bug 12 systemic: native <select> is unstyled-on-Linux/Tauri.
+  // Custom Dropdown — native <select> is unstyled on Linux/Tauri.
   const SOURCE_OPTIONS = [
     { value: 'user', label: 'user' },
     { value: 'bundled', label: 'bundled' },

@@ -2,12 +2,12 @@
 //
 // Falls back to `null` in browser mode (vite preview, Playwright). Static
 // imports for the plugin so Vite bundles the code into the chunk; an
-// earlier dynamic-import-with-/* @vite-ignore */ pattern (Bug 13 era)
-// produced runtime "Module name '@tauri-apps/plugin-dialog' does not
-// resolve to a valid URL" errors in webkit2gtk because the bundler was
-// told to keep the bare specifier raw — which works in dev (where Vite
-// has a live module-resolver) but breaks in production-built webview
-// pages where bare specifiers are NOT a valid HTTP URL.
+// earlier dynamic-import-with-/* @vite-ignore */ pattern produced
+// runtime "Module name '@tauri-apps/plugin-dialog' does not resolve to
+// a valid URL" errors in webkit2gtk because the bundler was told to
+// keep the bare specifier raw — which works in dev (where Vite has a
+// live module-resolver) but breaks in production-built webview pages
+// where bare specifiers are NOT a valid HTTP URL.
 //
 // Tauri 2: `tauri-plugin-dialog` is a separate plugin from
 // `@tauri-apps/api`. The Rust side is registered in `src-tauri/src/lib.rs`

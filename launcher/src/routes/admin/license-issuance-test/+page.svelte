@@ -1,5 +1,5 @@
 <script lang="ts">
-  // Bug 33: admin license-issuance test placeholder. Real flow:
+  // Admin license-issuance test placeholder. Real flow:
   //   1. Maintainer issues a test license via the LS dashboard
   //      (Admin variant, test-mode, complimentary)
   //   2. Maintainer pastes the key here, hits Verify

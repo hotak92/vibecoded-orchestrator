@@ -1,9 +1,8 @@
 <script lang="ts">
   // Right sidebar — project info + Launch button.
   //
-  // Bug 15: Launch button used to be a fake-state-machine no-op
-  // (setTimeout cycle). Now it actually spawns VS Code with the selected
-  // project's folder via the `launch_project_in_editor` Tauri command.
+  // The Launch button spawns VS Code with the selected project's
+  // folder via the `launch_project_in_editor` Tauri command.
   //
   // - No projects → button disabled, tooltip explains why.
   // - One project → click launches it directly.

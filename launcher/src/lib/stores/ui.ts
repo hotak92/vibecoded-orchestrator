@@ -16,17 +16,17 @@ export type SettingsSection =
 
 interface UIState {
   showSettings: boolean;
-  // 2026-04-29: when non-null, SettingsPanel jumps to this section on
-  // open instead of defaulting to 'profile'. Consumed once and cleared
-  // by closeSettings(). Replaces the dead 'vct-open-secrets' window
-  // event the SecretsTab used to dispatch.
+  // When non-null, SettingsPanel jumps to this section on open instead
+  // of defaulting to 'profile'. Consumed once and cleared by
+  // closeSettings(). Replaces an earlier 'vct-open-secrets' window
+  // event that SecretsTab used to dispatch.
   settingsInitialSection: SettingsSection | null;
   showActivation: boolean;
   showInstallWizard: boolean;
   showMcpDashboard: boolean;
   showOnboarding: boolean;
-  // 2026-04-28: true when the wizard was opened by an explicit user
-  // action (Settings → Re-run, Preferences → Re-run) rather than the
+  // True when the wizard was opened by an explicit user action
+  // (Settings → Re-run, Preferences → Re-run) rather than the
   // automatic first-launch gate. The wizard's preflight uses this to
   // decide whether to auto-close on the "projects already exist" branch
   // — explicit re-runs must NOT auto-close even if projects exist.
