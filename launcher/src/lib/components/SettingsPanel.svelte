@@ -9,7 +9,7 @@
 
   let activeSection = $state<'profile' | 'downloads' | 'secrets' | 'preferences' | 'about'>('profile');
 
-  // Bug 29: shared services status. These are the per-machine Weaviate /
+  // Shared services status. These are the per-machine Weaviate /
   // Ollama / code_embed instances that all orchestrator installs reuse via
   // KG_COLLECTION namespacing inside the shared Weaviate. Probed on demand
   // when the user opens the Preferences panel.

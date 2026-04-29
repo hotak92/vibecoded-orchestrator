@@ -9,8 +9,8 @@ interface UIState {
   showInstallWizard: boolean;
   showMcpDashboard: boolean;
   showOnboarding: boolean;
-  // 2026-04-28: true when the wizard was opened by an explicit user
-  // action (Settings → Re-run, Preferences → Re-run) rather than the
+  // True when the wizard was opened by an explicit user action
+  // (Settings → Re-run, Preferences → Re-run) rather than the
   // automatic first-launch gate. The wizard's preflight uses this to
   // decide whether to auto-close on the "projects already exist" branch
   // — explicit re-runs must NOT auto-close even if projects exist.

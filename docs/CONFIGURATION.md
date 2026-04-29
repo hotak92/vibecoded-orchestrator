@@ -20,7 +20,7 @@ It prevents cross-contamination. Global settings apply to every project you open
 3. Let `install.py` wire the rest (venv, containers, KG collection creation).
 4. Launch via the VCT Launcher GUI (manages secrets, tier gating, module installs).
 
-## `.env` template management (Deliverable 1, 2026-04-28)
+## `.env` template management
 
 Both `install.py` Step 9 and the launcher's `create_project_v2` Tauri command call `ensure_project_env_template` (Python: `_ensure_env_template`; Rust: `ensure_project_env_template`) on the project root. The behaviour is:
 
@@ -30,7 +30,7 @@ Both `install.py` Step 9 and the launcher's `create_project_v2` Tauri command ca
 
 The Python and Rust canonical key lists are kept in lockstep by the cross-language test `env_template_canonical_keys_match_python` (in `commands/projects_v2.rs`). When you add a new key, update both `_env_canonical_template` (install.py) AND `env_canonical_keys` (projects_v2.rs).
 
-Canonical keys (as of 2026-04-28):
+Canonical keys:
 
 ```
 # Service URLs (commented; launcher writes resolved values into .claude/settings.json)

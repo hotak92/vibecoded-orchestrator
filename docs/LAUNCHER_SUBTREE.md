@@ -44,7 +44,7 @@ as the definitive reference for launcher behavior until that sync is complete.
 
 ## Don't edit `launcher/` casually
 
-The launcher is its own product with its own CI, tests, and release cadence. Edits should originate in `pb992/VCT-Launcher` and flow here via `git subtree pull`. During the v1.0 sprint the rule is relaxed — edits in this repo are acceptable when iteration speed matters. Reconcile by pushing back upstream after the release.
+The launcher is its own product with its own CI, tests, and release cadence. Edits should originate in `pb992/VCT-Launcher` and flow here via `git subtree pull`. During the early launch window the rule is relaxed — edits in this repo are acceptable when iteration speed matters. Reconcile by pushing back upstream after each release.
 
 ## Why this layout
 

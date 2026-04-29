@@ -1,6 +1,6 @@
 <script lang="ts">
-  // Bug 33: admin feature-flags placeholder. Wired to no real backend
-  // yet — admins can still see the UI shape so we know the route works.
+  // Admin feature-flags placeholder. Wired to no real backend yet —
+  // admins can still see the UI shape so we know the route works.
   // Future: toggle pre-release modules + dev features here. The tier
   // gate above this route enforces access; this page just renders.
 </script>

@@ -6,8 +6,6 @@ Ollama MCP Server for Claude Code
 Provides local LLM tools:
 - chat: Run inference with local models (FREE)
 - read_document: Read, summarize, or extract specific information from files using local models
-
-Date: 2026-03-12
 """
 
 import os

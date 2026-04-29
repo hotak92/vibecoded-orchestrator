@@ -1,4 +1,4 @@
-# Release workflow — Stage 8 multi-OS shipping (rev. 2026-04-28).
+# Release workflow — multi-OS shipping.
 #
 # Triggers:
 #   - Tag push matching v*.*.* (e.g. v0.1.0) → cuts a GitHub Release.
@@ -9,20 +9,20 @@
 #   - Windows x64 (windows-latest): vct-launcher.exe    + .metadata.json
 #
 # macOS is INTENTIONALLY out of this CI matrix for v0.1.0 — labeled
-# Tier-2 experimental, built locally on Martino's Mac and uploaded
+# Tier-2 experimental, built locally on a maintainer Mac and uploaded
 # manually to the release. Adding macos-latest here would burn billing
-# minutes on a target we cannot validate from this dev box. Tracked
-# for re-inclusion in v0.1.1 alongside code signing / notarization.
+# minutes on a target we cannot validate from CI. Tracked for
+# re-inclusion in v0.1.1 alongside code signing / notarization.
 #
 # Build is driven by `bash scripts/build-bundled-launcher.sh` — the
 # SAME script maintainers run locally. It does:
 #   1. npm/pnpm install + run build (SvelteKit frontend) — explicit, NOT
 #      relying on Tauri's beforeBuildCommand which has silently no-op'd
-#      under mismatched package managers (regression 2026-04-28).
+#      under mismatched package managers.
 #   2. tauri build --no-bundle (we ship the raw binary, not installers).
 #   3. POST-BUILD asset-ref check — refuses to stage a binary with <5
 #      `_app/immutable/` refs (catches the "Could not connect to
-#      localhost" empty-frontend regression at commit 5abb8cf).
+#      localhost" empty-frontend regression class).
 #   4. Stage to launcher/dist/<host_target>/<binary> + .metadata.json
 #      (source_sha, source_hash, built_at, launcher_version, etc.).
 # Reusing the script keeps CI and local builds bit-identical and means

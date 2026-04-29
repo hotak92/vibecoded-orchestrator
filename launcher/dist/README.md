@@ -91,10 +91,9 @@ the source SHA, build timestamp, and a content hash of the launcher subtree
 `post-install-launcher.sh` reads the metadata at install time. If
 `source_hash` doesn't match the current clone's launcher subtree hash, the
 bundled binary is treated as stale (= built from older sources) and the
-install falls through to the download/build path. This prevents the regression
-where a bundled binary was missing commands the source already advertises (a
-real bug from 2026-04-28: bundled binary lacked `detect_existing_install_root`
-even though the source had it).
+install falls through to the download/build path. This prevents the
+class of regression where a bundled binary lacks commands the source
+already advertises.
 
 To regenerate metadata after a rebuild, use `scripts/build-bundled-launcher.sh`
 — it writes both the binary and the sidecar atomically.

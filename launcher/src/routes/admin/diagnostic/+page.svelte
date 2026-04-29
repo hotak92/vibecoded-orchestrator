@@ -1,7 +1,7 @@
 <script lang="ts">
-  // Bug 33: admin diagnostic page — license + container + KG state
-  // inspector. Read-only. Reuses existing Tauri commands so no
-  // additional backend gates are needed.
+  // Admin diagnostic page — license + container + KG state inspector.
+  // Read-only. Reuses existing Tauri commands so no additional
+  // backend gates are needed.
   import { license } from '$lib/stores/license';
 </script>
 

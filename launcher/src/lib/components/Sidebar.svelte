@@ -25,10 +25,10 @@
   };
 
   const projectId = $derived($selectedProject?.id ?? null);
-  // Bug 33: server-classified admin tier unlocks the Admin sidebar
-  // group with dev-only routes. The check is on the cached tier
-  // string — patching this client-side reveals the routes but not
-  // the server-gated capabilities they exercise.
+  // Server-classified admin tier unlocks the Admin sidebar group with
+  // dev-only routes. The check is on the cached tier string — patching
+  // this client-side reveals the routes but not the server-gated
+  // capabilities they exercise.
   const isAdmin = $derived(($license.cache?.orchestrator_tier ?? 'free') === 'admin');
 
   const groups = $derived<NavGroup[]>([

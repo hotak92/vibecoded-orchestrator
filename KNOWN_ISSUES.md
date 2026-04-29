@@ -104,26 +104,25 @@ flagging for early adopters and the next iteration.
 
 - **Joern installer ignored `--dir` flag, post-install detection failed** — install.py probed only
   the directory we asked the installer to use. Recent Joern installers ignore `--dir` and land at
-  `~/bin/joern/joern-cli/` regardless. Now probes 3 known locations + falls back to PATH. Reported
-  by user during real-machine test 2026-04-27.
+  `~/bin/joern/joern-cli/` regardless. Now probes 3 known locations + falls back to PATH.
 
 - **`_development` collection skipped when other projects had theirs** — adopt-mode logic
   incorrectly treated per-project `<Project>_development` collections as a shared namespace. If
   the host had any `_development` collection from a sibling project, vco's was skipped, leaving
   `docs/` content unseeded (Step 7c exited 1). Fixed: `_development` is project-scoped, always
-  created. Reported by user during real-machine test 2026-04-27.
+  created.
 
 - **Bash 3.2 empty-array expansion crash on macOS** — `first-install.{sh,command}` used
   `"${INSTALL_ARGS[@]}"` and `"${HELPER_FLAGS[@]}"` under `set -euo pipefail`. Bash 3.2 (Apple's
   shipped default) trips "unbound variable" on empty-array expansion. Now guarded with
-  `[ ${#ARR[@]} -gt 0 ]`. Reported by macOS tester 2026-04-27, fixed in `cb3df13`.
+  `[ ${#ARR[@]} -gt 0 ]` (fixed in `cb3df13`).
 
 - **Joern installer hang** — `first-install.*` could hang indefinitely while the Joern JVM installer
   ran without a timeout. Fixed in commit `64d5804`: streams installer output, 900s timeout.
 
 - **macOS Gatekeeper quarantine on downloaded binary** — `first-install.command` now strips
   `com.apple.quarantine` xattr from any launcher binary it downloads from GitHub Releases before
-  attempting to launch it. Fixed alongside the download-path work in this sprint.
+  attempting to launch it.
 
 - **Audit log filters pushed into SQL.** `Db::audit_list` now accepts
   `project_id`, `actor`, `since_ms`, `until_ms`, `search` (substring

@@ -4,8 +4,7 @@
 //! Called from `create_project_v2` after the `projects` row is inserted.
 //! Without this, the launcher's per-project tabs (Agents, Skills, Hooks,
 //! KG Bindings, Codegraph Bindings) appear empty even when the filesystem
-//! has 26+ agents and a full bundled `.claude/` tree (reported in the
-//! 2026-04-28 Agape onboarding test).
+//! has 26+ agents and a full bundled `.claude/` tree.
 //!
 //! Idempotence: every insert routes through the existing `register_*`
 //! upsert helpers in `crate::db::project_state`, which leave the `enabled`
@@ -17,7 +16,7 @@
 //! file logs a warning and we continue. Project creation must NEVER fail
 //! over a populate hiccup.
 //!
-//! Out of scope (flagged in the 2026-04-28 brief, not yet investigated):
+//! Out of scope here (tracked separately, not yet investigated):
 //!   - `mcp_servers` table population (verify the table exists + whether
 //!     other code already auto-populates it before adding code here).
 //!   - The "Open project" button on the launcher's own self-tile.

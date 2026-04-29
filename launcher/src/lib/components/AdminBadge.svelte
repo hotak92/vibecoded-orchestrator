@@ -1,5 +1,5 @@
 <script lang="ts">
-  // Bug 33: persistent corner badge that appears whenever the cached
+  // Persistent corner badge that appears whenever the cached
   // orchestrator tier is "admin". Color is amber/orange so it's
   // visible but not alarming — its purpose is to remind the user
   // they're running with elevated dev affordances on.

@@ -18,7 +18,7 @@
   let project = $state<ProjectView | null>(null);
   let activeTab = $state<'agents' | 'skills' | 'hooks' | 'permissions' | 'secrets' | 'kg' | 'settings'>('agents');
 
-  // Bug 21: orchestrator update banner. Loads inspect_orchestrator_at on
+  // Orchestrator update banner. Loads inspect_orchestrator_at on
   // mount; if version_status === 'outdated' a "Update this project"
   // button appears.
   type ConfigHealth = { file: string; ok: boolean; error: string | null };

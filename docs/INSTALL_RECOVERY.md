@@ -209,9 +209,9 @@ Common patterns and their fixes:
 #### a. Detection mismatch (false-positive `pnpm: yes` then `pnpm install: command not found`)
 
 The user has a shell function (lean-ctx, asdf, nvm, fnm, corepack)
-wrapping `pnpm`/`npm`/`node` that shadows the binary. The 2026-04-27
-fixes added `_resolves_to_binary` to detect this, but if you see this
-pattern still occurring, the underlying binary genuinely doesn't exist.
+wrapping `pnpm`/`npm`/`node` that shadows the binary. `_resolves_to_binary`
+detects this case; if you see it still occurring, the underlying binary
+genuinely doesn't exist.
 
 ```bash
 # Check if real binaries exist behind the wrappers:
@@ -297,8 +297,8 @@ and continue diagnosing.
 ls -la <repo_root>/launcher/src-tauri/target/release/vct-launcher* 2>/dev/null
 ```
 
-Expected: a `vct-launcher` (or `vct-launcher-temp` during pre-rename
-sprint) executable around 30-60 MB.
+Expected: a `vct-launcher` executable around 30-60 MB. (Older builds
+may have produced a `vct-launcher-temp` artifact instead.)
 
 ### 5. Start the launcher
 

@@ -3,8 +3,8 @@
   //
   // The sidebar's "Project" link points here when nothing is selected; if a
   // project IS selected, we hop straight to /project/<id>. Without this
-  // file, /project 404'd in the post-cleanup verification — see joint
-  // playwright report 2026-04-26 (P0 regression).
+  // file, /project would 404 (the route must exist for the redirect to
+  // dispatch).
 
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
