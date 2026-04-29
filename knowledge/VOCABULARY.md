@@ -31,7 +31,7 @@ Standard namespaces used in this knowledge graph:
 - **Definition**: A software project, implementation, or initiative
 - **Parent**: `rdfs:Resource`
 - **Properties**: title, status, tech_stack, repository, created, updated
-- **Examples**: ARTup Project, Claude Orchestrator, Agape Catalog Digitization
+- **Examples**: Acme Project, Claude Orchestrator, Example WebApp
 
 #### **`co:Concept`** (alias: `concept`)
 - **Definition**: Abstract idea, design pattern, or theoretical knowledge
@@ -109,7 +109,7 @@ rdfs:Resource
 - **Definition**: Entity utilizes or depends on the target resource
 - **Inverse**: `usedBy`
 - **Examples**:
-  - ARTup Project [[uses::Weaviate]]
+  - Acme Project [[uses::Weaviate]]
   - VRAM Optimization [[uses::Model Quantization]]
 
 #### **`implements`** (co:implements)
@@ -118,7 +118,7 @@ rdfs:Resource
 - **Definition**: Entity implements or realizes the target concept/pattern
 - **Inverse**: `implementedBy`
 - **Examples**:
-  - ARTup [[implements::RAG Pattern]]
+  - Acme [[implements::RAG Pattern]]
   - MCP Server [[implements::Tool Use Pattern]]
 
 #### **`extends`** (rdfs:subClassOf)
@@ -274,9 +274,7 @@ Tags for common patterns:
 Tags for project-specific knowledge (lowercase with hyphens):
 
 - `#claude-orchestrator` - Meta-project for knowledge orchestration
-- `#artup` - Conversational AI for artistic knowledge
-- `#agape` - Catalog digitization with PDF processing
-- `#sd15-setup` - Stable Diffusion 1.5 installation
+- `#project-x` - One tag per project (replace with your own)
 - [Add more project tags as needed]
 
 **Usage Guidelines**:
@@ -344,20 +342,20 @@ Tags for project-specific knowledge (lowercase with hyphens):
 
 ```markdown
 ---
-title: ARTup Project
+title: Acme Project
 type: project
 tags: [AI, RAG, conversational-AI, implemented, mid-level-architecture]
 created: 2025-12-15T00:00:00Z
 updated: 2026-01-20T14:30:00Z
 status: active
 external_links:
-  github: https://github.com/user/artup
-  official: https://artup.example.com
+  github: https://github.com/user/acme
+  official: https://acme.example.com
 ---
 
 #AI #RAG #conversational-AI
 
-ARTup is a conversational AI assistant for artistic knowledge.
+Acme is a conversational AI assistant for a domain-specific knowledge base.
 
 ## Technology Stack
 

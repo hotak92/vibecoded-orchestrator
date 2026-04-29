@@ -827,9 +827,9 @@ async fn run_build_task(
     //      and the project has no venv), walk up from the launcher
     //      binary itself: `<install_root>/launcher/dist/<arch>/
     //      vct-launcher`. We hop 4 levels up to reach <install_root>.
-    //      This is the FIX for the bug reported 2026-04-28: Agape
+    //      This is the FIX for the bug reported 2026-04-28: a project
     //      had a project-local analyzer script, so step 1 set
-    //      VCT_INSTALL_ROOT=/Agape/Code (no venv) and the wrapper
+    //      VCT_INSTALL_ROOT=/some-project/Code (no venv) and the wrapper
     //      fell through to system python with no weaviate-client.
     let from_script = script
         .parent()                  // .claude/scripts/

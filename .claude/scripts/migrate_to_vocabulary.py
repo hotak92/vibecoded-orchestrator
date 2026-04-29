@@ -121,11 +121,10 @@ def suggest_tags(node_data: Dict, file_path: Path) -> Dict[str, List[str]]:
     rel_path = file_path.relative_to(KNOWLEDGE_ROOT)
     path_str = str(rel_path).lower()
 
+    # Add project-specific tag patterns here as needed.
+    # Example: {"my-project": ["my-project", "alias-keyword"]}
     project_patterns = {
         "claude-orchestrator": ["orchestrator", "meta-project"],
-        "artup": ["artup"],
-        "agape": ["agape"],
-        "sd15-setup": ["sd15", "stable-diffusion"]
     }
 
     for project, patterns in project_patterns.items():

@@ -219,12 +219,12 @@ Ask Claude Code: "Search [ProjectName]_development for [topic]"
 ### Example
 
 ```
-Planning for ARTup project:
+Planning for Acme project:
 1. Search KG: .claude/scripts/kg-search search "REST API patterns"
-2. Search project docs: "Search ARTup_development for existing API patterns"
+2. Search project docs: "Search Acme_development for existing API patterns"
 3. Find: REST API conventions document
 4. Adapt: Use same conventions in your plan
-5. Reference: Note in plan "Following API conventions from ARTup docs"
+5. Reference: Note in plan "Following API conventions from Acme docs"
 ```
 
 ## Update Context State During Planning

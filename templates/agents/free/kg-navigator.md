@@ -165,7 +165,7 @@ User query:
 # Single message, multiple searches
 Bash .claude/scripts/kg-search search "VLM" --type concepts
 Bash .claude/scripts/kg-search search "VRAM" --type concepts
-Bash .claude/scripts/kg-search recent --days 7 --tags SD15
+Bash .claude/scripts/kg-search recent --days 7 --tags ImageDataset
 
 # Then read relevant nodes (parallel)
 Read knowledge/concepts/vlm-consensus-pattern.md
@@ -178,7 +178,7 @@ Read knowledge/concepts/vram-management-strategy.md
 Bash .claude/scripts/kg-info info "VLM Consensus Pattern"
 
 # Get connections (outbound/inbound links)
-Bash .claude/scripts/kg-info connections "SD15 Dataset Manager"
+Bash .claude/scripts/kg-info connections "ImageDataset Manager"
 
 # Only then: Read specific nodes if needed
 Read knowledge/concepts/vlm-consensus-pattern.md
@@ -204,7 +204,7 @@ You:
 User: "What's related to the VLM consensus pattern?"
 You:
 1. Get connections: .claude/scripts/kg-info connections "VLM Consensus Pattern"
-2. Find: Used by SD15 project, ARTup project
+2. Find: Used by ImageDataset project, ImagePipeline project
 3. Depends on: VRAM Management Strategy
 4. Related to: Image Captioning concepts
 5. Report: Show relationship graph and relevant nodes
@@ -236,11 +236,11 @@ You:
 ### Workflow 5: Project-Focused Navigation
 
 ```
-User: "What patterns does SD15 project use?"
+User: "What patterns does ImageDataset project use?"
 You:
-1. Find project: .claude/scripts/kg-search search "SD15" --type projects
-2. Get details: .claude/scripts/kg-info info "SD15 Dataset Manager"
-3. Get connections: .claude/scripts/kg-info connections "SD15 Dataset Manager"
+1. Find project: .claude/scripts/kg-search search "ImageDataset" --type projects
+2. Get details: .claude/scripts/kg-info info "ImageDataset Manager"
+3. Get connections: .claude/scripts/kg-info connections "ImageDataset Manager"
 4. Report: Project uses VLM Consensus, VRAM Management, etc. (with node details)
 ```
 
@@ -261,9 +261,9 @@ You:
 User: "Show me the full context around VLM consensus"
 You:
 1. Start: .claude/scripts/kg-info connections "VLM Consensus Pattern"
-2. Find connections: SD15 Project, ARTup Project, VRAM Management
+2. Find connections: ImageDataset Project, ImagePipeline Project, VRAM Management
 3. Follow path: .claude/scripts/kg-info connections "VRAM Management Strategy"
-4. Build map: VLM Consensus → Used by SD15/ARTup → Depends on VRAM Management
+4. Build map: VLM Consensus → Used by ImageDataset/ImagePipeline → Depends on VRAM Management
 5. Report: Complete relationship graph with all connected nodes
 ```
 

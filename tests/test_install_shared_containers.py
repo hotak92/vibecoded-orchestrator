@@ -287,18 +287,18 @@ class EnsureCollectionsAdoptModeTests(unittest.TestCase):
 
     def test_adopt_does_not_create_bare_kg_when_host_namespaced(self):
         """Installing into a Weaviate that uses per-project namespacing
-        (e.g. ARTup_KnowledgeGraph, ClaudeKnowledgeGraph) must NOT create
+        (e.g. Acme_KnowledgeGraph, ClaudeKnowledgeGraph) must NOT create
         the bare top-level `KnowledgeGraph` / `Development` classes."""
         server, port, _ = _start_server()
         try:
             # Simulate the user's existing Weaviate from the bug report.
             _Handler.schema = {"classes": [
-                {"class": "ARTup_KnowledgeGraph",
+                {"class": "Acme_KnowledgeGraph",
                  "properties": [{"name": "typed_links"}]},
-                {"class": "ARTup_CodeFunction"},
+                {"class": "Acme_CodeFunction"},
                 {"class": "ClaudeKnowledgeGraph",
                  "properties": [{"name": "typed_links"}]},
-                {"class": "SD15_KnowledgeGraph",
+                {"class": "ImageDataset_KnowledgeGraph",
                  "properties": [{"name": "typed_links"}]},
                 {"class": "ClaudeOrchestrator_development"},
             ]}
@@ -328,8 +328,8 @@ class EnsureCollectionsAdoptModeTests(unittest.TestCase):
                          if c.endswith("_KnowledgeGraph")
                          and c not in ("VibeCodedTools_KnowledgeGraph",
                                        "ClaudeKnowledgeGraph",
-                                       "ARTup_KnowledgeGraph",
-                                       "SD15_KnowledgeGraph")]
+                                       "Acme_KnowledgeGraph",
+                                       "ImageDataset_KnowledgeGraph")]
             self.assertTrue(
                 kg_posted,
                 f"expected a project-scoped *_KnowledgeGraph; got {posted_classes}",

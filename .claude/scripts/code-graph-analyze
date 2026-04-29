@@ -15,8 +15,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # launcher's "Browse" flow, the project itself has no venv. The
 # launcher passes its own install root as VCT_INSTALL_ROOT — that's
 # where weaviate-client + the analyzer deps actually live. Fixed
-# 2026-04-28 after Agape codegraph build failed with "weaviate-client
-# not installed" because Agape/Code had neither .venv nor
+# 2026-04-28 after an example project codegraph build failed with "weaviate-client
+# not installed" because example/Code had neither .venv nor
 # claude_mcp_servers/.venv.
 CANDIDATES=(
     "$SCRIPT_DIR/../../.venv"                          # vco OSS install root

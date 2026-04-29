@@ -65,7 +65,7 @@ For Llama 2 7B at 4096 tokens (batch=1, FP16): ~2GB. Memory grows linearly with 
 |---------|-----------|----------|----------|
 | Encoder-only | Bidirectional attention | BERT, RoBERTa | Classification, embeddings |
 | Decoder-only | Causal masking | GPT, Llama, Claude | Language generation |
-| Encoder-decoder | Cross-attention | T5, BART | Translation, seq2seq |
+| Encoder-decoder | Cross-attention | T5, mBART | Translation, seq2seq |
 | Hybrid Transformer+SSM | Attention + state space | Jamba, Zamba | Long-context efficiency |
 
 ## Scaling via Mixture of Experts

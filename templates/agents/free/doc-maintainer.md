@@ -218,7 +218,7 @@ Grep "## Implementation Status" docs/ARCHITECTURE.md
 - Current phase: Testing & Integration (started 2026-01-25)
 - Active tasks: VLM consensus (80% done), VRAM optimization (next)
 - Recent decision: Use 3-VLM consensus (2026-01-24, see DECISIONS_LOG.md)
-- Blocker: OneTrainer workspace path issue (investigating)
+- Blocker: TrainingTool workspace path issue (investigating)
 - Knowledge: Created nodes for VLM-Consensus-Pattern, VRAM-Management
 ```
 

@@ -255,9 +255,7 @@ Skill response:
 
 **Knowledge Graph**:
 - `ClaudeKnowledgeGraph` - Shared cross-project patterns (161 nodes)
-- `ARTup_KnowledgeGraph` - ARTup project-specific
-- `SD15_KnowledgeGraph` - SD15 project-specific
-- `Agape_KnowledgeGraph` - Agape project-specific
+- `[ProjectName]_KnowledgeGraph` - Per-project KG collections (one per project)
 
 **Development Docs**:
 - `ClaudeOrchestrator_development` - Orchestrator docs

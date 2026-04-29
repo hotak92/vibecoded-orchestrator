@@ -85,9 +85,7 @@ Primary domains for knowledge organization:
 
 #projects (Project-specific knowledge)
 ├── #claude-orchestrator (Meta-project for knowledge orchestration)
-├── #artup (Conversational AI for artistic knowledge)
-├── #agape (Catalog digitization with PDF processing)
-├── #sd15-setup (Stable Diffusion 1.5 installation)
+├── #project-x (one tag per project — replace with your own)
 └── [Add project tags as needed for project-specific nodes]
 ```
 
@@ -106,7 +104,7 @@ Indicates knowledge depth and technical level:
 #high-level-plan
   Purpose: Strategic overview, roadmap, architecture decisions
   Use for: Project overviews, long-term plans, architectural choices
-  Example nodes: "ARTup Vision", "Claude Orchestrator Roadmap"
+  Example nodes: "Acme Vision", "Claude Orchestrator Roadmap"
 
 #mid-level-architecture
   Purpose: System design, component interaction, integration patterns
@@ -254,13 +252,13 @@ Common design patterns and architectural patterns:
 - 1 abstraction tag (`#mid-level-architecture` or `#high-level-plan`)
 - 2-3 technology tags (stack used)
 - 1 status tag (`#in-progress`, `#implemented`, etc.)
-- 1 project tag (`#artup`, `#claude-orchestrator`, etc.)
+- 1 project tag (`#project-x`, `#claude-orchestrator`, etc.)
 - Optional: Pattern tags for architectural patterns used
 
-**Example**: ARTup Project
+**Example**: Acme Project
 ```
 Tags: [#AI, #RAG, #conversational-AI, #implemented, #mid-level-architecture,
-       #fastapi, #weaviate, #ollama, #artup]
+       #fastapi, #weaviate, #ollama, #project-x]
 ```
 
 **Concept Nodes** should typically have:
@@ -306,9 +304,9 @@ Tags: [#AI, #VLM, #research, #benchmark, #document-understanding,
 - Status tag if applicable (for guides that may become outdated)
 - No abstraction level tag (project-specific = concrete)
 
-**Example**: ARTup Weaviate Setup Guide
+**Example**: Acme Weaviate Setup Guide
 ```
-Tags: [#database, #vector-db, #weaviate, #artup, #setup, #low-level-implementation]
+Tags: [#database, #vector-db, #weaviate, #project-x, #setup, #low-level-implementation]
 ```
 
 **Example**: Claude Orchestrator RDF Improvements Plan
@@ -438,7 +436,7 @@ When reviewing node tags, ensure:
 ### Well-Tagged Nodes
 
 ```markdown
-# ARTup Project
+# Acme Project
 Tags: [#AI, #RAG, #conversational-AI, #implemented, #mid-level-architecture,
        #fastapi, #weaviate, #ollama, #MCP]
 ✅ Good: Domain (AI), abstraction (mid-level), status (implemented), technologies (fastapi, weaviate, ollama), pattern (RAG, MCP)

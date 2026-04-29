@@ -110,7 +110,7 @@ You will receive:
 
 **Changed files**:
 - knowledge/concepts/redis-caching-pattern.md
-- knowledge/projects/artup.md
+- knowledge/projects/acme.md
 
 **Mode**: incremental
 
@@ -127,7 +127,7 @@ You will receive:
 
 **Typed WikiLinks** (explicit):
 ```markdown
-ARTup project [[uses::Weaviate]] for vector search.
+Acme project [[uses::Weaviate]] for vector search.
 Implements [[implements::RAG Pattern]] for semantic retrieval.
 Builds on [[buildsOn::MCP Architecture]] from previous work.
 ```
@@ -192,17 +192,17 @@ Write to `.claude/logs/maintenance_report.md`:
 
 ## Nodes Processed
 1. knowledge/concepts/redis-caching-pattern.md (4 relationships)
-2. knowledge/projects/artup.md (4 relationships)
+2. knowledge/projects/acme.md (4 relationships)
 
 ## Relationships Created
 - redis-caching-pattern [[uses::Redis]]
 - redis-caching-pattern [[implements::Caching Strategy]]
-- artup [[uses::Weaviate]]
-- artup [[uses::FastAPI]]
-- artup [[implements::RAG Pattern]]
-- artup [[implements::Content Safety]]
-- artup [[buildsOn::MCP Architecture]]
-- artup [[relatedTo::ARTup Patterns]]
+- acme [[uses::Weaviate]]
+- acme [[uses::FastAPI]]
+- acme [[implements::RAG Pattern]]
+- acme [[implements::Content Safety]]
+- acme [[buildsOn::MCP Architecture]]
+- acme [[relatedTo::Acme Patterns]]
 
 ## Weaviate Updates
 ```
@@ -233,7 +233,7 @@ Write to `.claude/logs/maintenance_report.md`:
 None
 
 ## Suggestions (Manual Review)
-1. Consider adding `[[uses::Ollama]]` to artup.md (inferred from text)
+1. Consider adding `[[uses::Ollama]]` to acme.md (inferred from text)
 2. Consider adding `[[extends::Base Patterns]]` to redis-caching-pattern.md (inferred from structure)
 
 ## Errors

@@ -736,15 +736,15 @@ mod tests {
     #[test]
     fn populate_kg_bindings_writes_primary_and_shared() {
         let folder = scratch_dir("kg");
-        let db = make_db_with_project("p1", "Agape");
+        let db = make_db_with_project("p1", "Acme");
         let report =
-            populate_project_state_from_filesystem("p1", "Agape", &folder, &db);
+            populate_project_state_from_filesystem("p1", "Acme", &folder, &db);
         assert_eq!(report.kg_bindings_inserted, 2);
 
         let bindings = db.list_project_kg_bindings("p1").unwrap();
         assert_eq!(bindings.len(), 2);
         let primary = bindings.iter().find(|b| b.role == "primary").unwrap();
-        assert_eq!(primary.collection_name, "Agape_KnowledgeGraph");
+        assert_eq!(primary.collection_name, "Acme_KnowledgeGraph");
         assert_eq!(primary.embedding_model.as_deref(), Some("qwen3-embedding:0.6b"));
         assert_eq!(primary.embedding_dim, Some(1024));
         assert_eq!(
@@ -919,9 +919,9 @@ mod tests {
     #[test]
     fn empty_project_folder_still_writes_kg_and_codegraph() {
         let folder = scratch_dir("empty");
-        let db = make_db_with_project("p1", "Agape");
+        let db = make_db_with_project("p1", "Acme");
         let report =
-            populate_project_state_from_filesystem("p1", "Agape", &folder, &db);
+            populate_project_state_from_filesystem("p1", "Acme", &folder, &db);
         assert_eq!(report.agents_inserted, 0);
         assert_eq!(report.skills_inserted, 0);
         assert_eq!(report.hooks_inserted, 0);
@@ -932,11 +932,11 @@ mod tests {
 
     // ─── End-to-end ─────────────────────────────────────────────────
 
-    /// Simulates the full Agape onboarding case: 26 agents, several
+    /// Simulates the full real-project onboarding case: 26 agents, several
     /// skills, hooks block. Verifies the launcher GUI's per-project tabs
     /// would no longer be empty.
     #[test]
-    fn end_to_end_simulates_agape_onboarding() {
+    fn end_to_end_simulates_full_onboarding() {
         let folder = scratch_dir("e2e");
         let claude = folder.join(".claude");
         let agents_dir = claude.join("agents");
@@ -970,10 +970,10 @@ mod tests {
         )
         .unwrap();
 
-        let db = make_db_with_project("agape-id", "Agape");
+        let db = make_db_with_project("acme-id", "Acme");
         let report = populate_project_state_from_filesystem(
-            "agape-id",
-            "Agape",
+            "acme-id",
+            "Acme",
             &folder,
             &db,
         );
@@ -986,7 +986,7 @@ mod tests {
         assert!(report.warnings.is_empty(), "warnings: {:?}", report.warnings);
 
         // Snapshot is what the GUI consumes — verify it has everything.
-        let snap = db.get_project_state_snapshot("agape-id").unwrap();
+        let snap = db.get_project_state_snapshot("acme-id").unwrap();
         assert_eq!(snap.agents.len(), 26);
         assert_eq!(snap.skills.len(), 4);
         assert_eq!(snap.hooks.len(), 2);
