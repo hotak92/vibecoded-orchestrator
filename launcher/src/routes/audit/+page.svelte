@@ -112,10 +112,28 @@
     return new Date(ms).toLocaleString();
   }
 
+  // Sentinels used by the secrets layer (and any future scope-level
+  // operation) when an audit row isn't tied to a single project. See
+  // `commands/secrets_cmd.rs` SENTINEL_GLOBAL / SENTINEL_SHARED.
+  const SENTINEL_GLOBAL = '_global_';
+  const SENTINEL_SHARED = '_user_shared_';
+
+  /** Plain text for CSV export only. */
   function projectName(id: string | null): string {
     if (!id) return '—';
+    if (id === SENTINEL_GLOBAL) return 'global';
+    if (id === SENTINEL_SHARED) return 'shared';
     const p = allProjects.find((x) => x.id === id);
     return p ? p.name : id.slice(0, 8);
+  }
+
+  /** Cell label + scope-chip class for the rendered table. */
+  function projectCell(id: string | null): { label: string; chip: 'project' | 'global' | 'shared' | 'none' } {
+    if (!id) return { label: '—', chip: 'none' };
+    if (id === SENTINEL_GLOBAL) return { label: 'global', chip: 'global' };
+    if (id === SENTINEL_SHARED) return { label: 'shared', chip: 'shared' };
+    const p = allProjects.find((x) => x.id === id);
+    return { label: p ? p.name : id.slice(0, 8), chip: 'project' };
   }
 
   function detailSummary(s: string): string {
@@ -161,6 +179,26 @@
   // but those are now first-class filter inputs, so the loss is
   // intentional.
   const filtered = $derived(events);
+
+  // Render module column. Secrets carry a real `module_id` (sub-scope
+  // for keychain key derivation), but it's not the user-meaningful
+  // subject of the action — the secret key + scope already identify
+  // what changed and live in the detail blob. The MODULE column is
+  // reserved for module-install / module-license operations where the
+  // module IS the subject. For everything else, render `—`. CSV export
+  // keeps the raw `module_id` regardless.
+  function moduleCell(e: AuditEvent): string {
+    if (e.operation.startsWith('secret_')) return '—';
+    return e.module_id ?? '—';
+  }
+
+  // Hide the column entirely when no row in the current view uses it
+  // (every cell would render as `—`). Avoids the dead-column visual
+  // noise on the common "secrets only" filter while keeping the column
+  // for module-install / license / catalog operations.
+  const showModuleCol = $derived(
+    filtered.some((e) => moduleCell(e) !== '—')
+  );
 
   /** RFC 4180-ish CSV cell escape: wrap in quotes, double inner quotes. */
   function csvCell(s: string | number | null | undefined): string {
@@ -242,6 +280,8 @@
         <Dropdown
           options={[
             { value: 'all', label: 'All projects' },
+            { value: SENTINEL_SHARED, label: 'shared (cross-project)' },
+            { value: SENTINEL_GLOBAL, label: 'global' },
             ...allProjects.map((p) => ({ value: p.id, label: p.name })),
           ]}
           value={filterProject}
@@ -320,24 +360,31 @@
           <th class="col-op">Operation</th>
           <th class="col-actor">Actor</th>
           <th class="col-project">Project</th>
-          <th class="col-module">Module</th>
+          {#if showModuleCol}<th class="col-module">Module</th>{/if}
           <th>Detail</th>
         </tr>
       </thead>
       <tbody>
         {#each filtered as e (e.id)}
+          {@const pc = projectCell(e.project_id)}
           <tr>
             <td class="col-time">{fmtTime(e.created_at)}</td>
             <td class="col-op"><code>{e.operation}</code></td>
             <td class="col-actor"><code>{e.actor ?? 'unknown'}</code></td>
-            <td class="col-project">{projectName(e.project_id)}</td>
-            <td class="col-module">{e.module_id ?? '—'}</td>
+            <td class="col-project">
+              {#if pc.chip === 'global' || pc.chip === 'shared'}
+                <span class="scope-chip scope-{pc.chip}">{pc.label}</span>
+              {:else}
+                {pc.label}
+              {/if}
+            </td>
+            {#if showModuleCol}<td class="col-module">{moduleCell(e)}</td>{/if}
             <td class="col-detail" title={e.detail}>{detailSummary(e.detail)}</td>
           </tr>
         {/each}
         {#if !loading && filtered.length === 0}
           <tr>
-            <td colspan="6" class="empty">No audit events match the current filter.</td>
+            <td colspan={showModuleCol ? 6 : 5} class="empty">No audit events match the current filter.</td>
           </tr>
         {/if}
       </tbody>
@@ -566,6 +613,26 @@
   .col-project, .col-module {
     width: 140px;
     color: var(--color-text);
+  }
+  .scope-chip {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    line-height: 1.4;
+  }
+  .scope-global {
+    background: rgba(196, 179, 255, 0.14);
+    color: #c4b3ff;
+    border: 1px solid rgba(196, 179, 255, 0.35);
+  }
+  .scope-shared {
+    background: rgba(0, 191, 166, 0.14);
+    color: var(--color-teal);
+    border: 1px solid rgba(0, 191, 166, 0.4);
   }
   .col-detail {
     font-family: 'JetBrains Mono', 'Fira Code', monospace;
