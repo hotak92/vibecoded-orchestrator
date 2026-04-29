@@ -257,6 +257,17 @@
             "background": true
           }
         ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/kg-update-nudge.sh",
+            "background": true,
+            "timeout": 3
+          }
+        ]
       }
     ]
   },

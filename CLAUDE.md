@@ -17,6 +17,23 @@ This repo is licensed **AGPL-3.0**. Any source file you create or modify under `
 
 ---
 
+## CRITICAL: KG/Context/Memory/Plans are LOAD-BEARING
+
+These four persistence layers exist for a reason — future-you, future-agents, and the user rely on them. Treat them like commits to a codebase, not optional notes:
+
+- **Knowledge Graph** (`knowledge/**/*.md`): cross-project patterns, concepts, decisions. Write a node BEFORE moving on after learning a non-obvious fact (architecture, gotcha, decision rationale, post-incident insight). The `kg-update-nudge` hook fires every 150k tokens of work without a KG write — treat that nudge as a hard prompt, not optional. Bypass with `KG_NUDGE_OFF=1` only when in a release operation or other inappropriate context.
+- **CONTEXT_STATE.md**: current task, recent progress, blockers. Update DURING work, not at end. Stale state = future-you starts confused.
+- **MEMORY.md** (`~/.claude/projects/.../memory/`): user preferences, recurring fixes, stable facts. Save corrections AND validations (don't just record what you got wrong).
+- **Plans** (`.claude/context/plans/`): non-trivial work breakdowns with rationale. Active plans live here; archived plans in `archive/`. Update when scope changes.
+
+**User directive (2026-04-29)**: "I often tell you to 'update context/KG/plans' to make you do so. Sometimes you remember to auto-update context and plans, but very rarely KG. Treat KG updates with stronger discipline."
+
+**Concrete rule**: if you've done >2 hours of substantive work or learned a non-obvious thing, write the KG node BEFORE the user has to ask. The hook backstops you, but the goal is to never need its nudge.
+
+**Per-chat counter**: the hook keys state by `session_id` in `~/.claude/metrics/kg_update_tokens.jsonl`. Tokens from one Claude Code session do NOT leak into another — each conversation has its own counter.
+
+---
+
 ## Context Management
 
 **Two-Layer Memory**:
