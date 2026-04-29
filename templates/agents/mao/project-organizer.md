@@ -182,7 +182,7 @@ Update `CONTEXT_STATE.md` during reorganization (not just at end):
 ```markdown
 ## Cross-Project Coordination
 
-- Pattern "VRAM Management" used by: SD15, ARTup, Project X
+- Pattern "VRAM Management" used by: ImageDataset, ImagePipeline, Project X
 - Updated all 3 project nodes to link to canonical knowledge/concepts/vram-management.md
 - Notified in PROJECT_REGISTRY.md: Pattern consolidated, update references
 ```
@@ -369,7 +369,7 @@ Bash test -f tests/pytest.ini && echo "pytest.ini exists" || echo "Missing pytes
 ```markdown
 # Project Organization Plan
 
-## Project: SD15 Dataset Manager
+## Project: ImageDataset Manager
 ## Date: 2026-01-28
 
 ### Issues Found (by severity)
@@ -398,7 +398,7 @@ Bash test -f tests/pytest.ini && echo "pytest.ini exists" || echo "Missing pytes
    - Addresses: Issue #5
 
 4. **Capture patterns** (Self, 15min):
-   - Document VLM-Consensus-Pattern (used by ARTup too)
+   - Document VLM-Consensus-Pattern (used by ImagePipeline too)
    - Document VRAM-Management-Strategy
    - Create project node linking patterns
 
@@ -427,7 +427,7 @@ Bash test -f tests/pytest.ini && echo "pytest.ini exists" || echo "Missing pytes
 **Task**: Consolidate 113 scattered docs into canonical structure
 
 **Context**:
-- Project: SD15 Dataset Manager
+- Project: ImageDataset Manager
 - Phase: Testing & Integration
 - Current issues: CONTEXT_STATE.md 515 lines, docs/ 113 files
 - Technology: Python 3.12, OneTrainer, Weaviate, Ollama
@@ -451,7 +451,7 @@ Bash test -f tests/pytest.ini && echo "pytest.ini exists" || echo "Missing pytes
 **Task**: Find related patterns and identify KG gaps
 
 **Context**:
-- Project: SD15 Dataset Manager
+- Project: ImageDataset Manager
 - Search for: VLM patterns, VRAM management, content safety, OneTrainer integration
 - Check: What's already documented? What's missing?
 
@@ -524,13 +524,13 @@ Write knowledge/concepts/vlm-consensus-pattern.md
 # - Fallback to most confident if no consensus
 #
 # ## Benefits
-# - Error rate reduction: 25% → 8% (SD15 case)
+# - Error rate reduction: 25% → 8% (ImageDataset case)
 # - Edge case handling: Better on ambiguous inputs
 # - Robustness: Single model failures don't break system
 #
 # ## Applied In
-# - [[uses::SD15 Dataset Manager]]: Age detection, caption generation
-# - [[uses::ARTup Project]]: Content safety classification
+# - [[uses::ImageDataset Manager]]: Age detection, caption generation
+# - [[uses::ImagePipeline Project]]: Content safety classification
 #
 # ## Implementation Notes
 # - Token budget: ~500 tokens per image (3 models)
@@ -540,7 +540,7 @@ Write knowledge/concepts/vlm-consensus-pattern.md
 
 3. **Update project node** with outcomes:
 ```bash
-Edit knowledge/projects/sd15-dataset-manager.md
+Edit knowledge/projects/imagedataset-manager.md
 
 # Add:
 # ## Phase: Testing & Integration (2026-01-25 to present)
@@ -566,22 +566,22 @@ Bash .claude/scripts/kg-sync --all
 
 **Only if repetitive tasks detected** (don't over-automate).
 
-**Example: SD15-specific organizer**:
+**Example: ImageDataset-specific organizer**:
 
 ```bash
-Write .claude/agents/sd15-organizer.md
+Write .claude/agents/imagedataset-organizer.md
 
 # Content:
 # ---
-# name: sd15-organizer
-# description: SD15-specific project health checks and automation
+# name: imagedataset-organizer
+# description: ImageDataset-specific project health checks and automation
 # tools: Read, Bash, Grep
 # model: sonnet
 # ---
 #
-# # SD15 Project Organizer
+# # ImageDataset Project Organizer
 #
-# Extends global project-organizer with SD15-specific checks.
+# Extends global project-organizer with ImageDataset-specific checks.
 #
 # ## Additional Health Checks
 #
@@ -600,7 +600,7 @@ Write .claude/agents/sd15-organizer.md
 # - [ ] VLM filters active (age detection, explicit content)
 # - [ ] Test coverage for edge cases
 #
-# ## SD15-Specific Actions
+# ## ImageDataset-Specific Actions
 # - Check test outputs size: `du -sh test_outputs/`
 # - Verify OneTrainer workspace: `ls ~/OneTrainer/workspace/concepts.json`
 # - Validate VRAM patterns: `grep "torch.cuda.empty_cache" src/**/*.py`
@@ -613,7 +613,7 @@ Write .claude/agents/sd15-organizer.md
 ```markdown
 # Project Organization Report
 
-## Project: SD15 Dataset Manager
+## Project: ImageDataset Manager
 ## Date: 2026-01-28
 
 ## Issues Addressed
@@ -633,7 +633,7 @@ Write .claude/agents/sd15-organizer.md
    - Archived 28 old docs to archive/2026-01-28_testing_phase/
 
 2. **kg-navigator** (Sonnet):
-   - Found related patterns: VLM systems (ARTup), VRAM management (ARTup)
+   - Found related patterns: VLM systems (ImagePipeline), VRAM management (ImagePipeline)
    - Identified gaps: VLM Consensus Pattern, OneTrainer Integration
    - Recommendations: Create 2 concept nodes (done)
 
@@ -647,8 +647,8 @@ Write .claude/agents/sd15-organizer.md
 4. **Cross-project patterns**:
    - Created knowledge/concepts/vlm-consensus-pattern.md
    - Created knowledge/concepts/vram-management-strategy.md
-   - Updated knowledge/projects/sd15-dataset-manager.md
-   - Linked patterns to ARTup project (both use them)
+   - Updated knowledge/projects/imagedataset-manager.md
+   - Linked patterns to ImagePipeline project (both use them)
    - Synced to Weaviate
 
 ## Health Metrics (Before → After)
@@ -659,9 +659,9 @@ Write .claude/agents/sd15-organizer.md
 - CLAUDE.md: 916 lines → 605 lines (-34%), well-organized
 
 **Knowledge Graph**:
-- Project nodes: 0 → 1 (SD15 Dataset Manager)
+- Project nodes: 0 → 1 (ImageDataset Manager)
 - Concept nodes: 0 → 2 (VLM Consensus, VRAM Management)
-- Cross-project links: 0 → 2 (linked to ARTup patterns)
+- Cross-project links: 0 → 2 (linked to ImagePipeline patterns)
 
 **Tests**:
 - Organization: Flat directory → 4 categories
@@ -677,12 +677,12 @@ Write .claude/agents/sd15-organizer.md
 ## Cross-Project Patterns Captured
 
 1. **VLM Consensus Pattern** (knowledge/concepts/vlm-consensus-pattern.md):
-   - Applied in: SD15, ARTup
+   - Applied in: ImageDataset, ImagePipeline
    - Benefit: 25% → 8% error rate
    - Reusable for: Any multi-model system
 
 2. **VRAM Management Strategy** (knowledge/concepts/vram-management-strategy.md):
-   - Applied in: SD15 (RTX 3060 12GB), ARTup (model loading)
+   - Applied in: ImageDataset (RTX 3060 12GB), ImagePipeline (model loading)
    - Pattern: Sequential load → process → unload → clear cache
    - Reusable for: Any VRAM-constrained project
 
@@ -694,7 +694,7 @@ Write .claude/agents/sd15-organizer.md
 - Sync KG after major phases (capture learnings)
 
 **Improvements for next phase**:
-- Consider project-specific organizer (sd15-organizer.md) if test outputs become unwieldy
+- Consider project-specific organizer (imagedataset-organizer.md) if test outputs become unwieldy
 - Monitor VRAM patterns consistency (could create linter)
 
 ## Next Steps

@@ -98,7 +98,7 @@ You will receive:
 - src/utils/validators.py
 - tests/test_api.py
 
-**Project**: ARTup
+**Project**: Acme
 
 **Mode**: incremental
 
@@ -142,7 +142,7 @@ Write to `.claude/logs/maintenance_report.md`:
 # Code Graph Update Report
 
 **Date**: 2026-01-29 14:30:00
-**Project**: ARTup
+**Project**: Acme
 **Mode**: incremental
 **Trigger**: git commit (3 files changed)
 

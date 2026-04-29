@@ -134,7 +134,7 @@ pub async fn create_project_v2(
     // Bug 33 (2026-04-28): also ensure a per-project `.env` template
     // exists. `write_project_env_files` only writes `.claude/env` +
     // `.claude/settings.json`; a separate `.env` is what most CLI
-    // users expect to edit (esp. Agape/SD15-style projects that
+    // users expect to edit (esp. existing-folder projects that
     // pre-existed any orchestrator install). The template carries
     // commented placeholders for ANTHROPIC_API_KEY / OPENAI_API_KEY /
     // GITHUB_TOKEN / RL_*; values stay user-controlled. Idempotent on
@@ -1155,13 +1155,13 @@ mod tests {
     fn ensure_env_template_creates_when_missing() {
         let dir = _scratch_dir("create");
         assert!(!dir.join(".env").exists());
-        let report = ensure_project_env_template(&dir, "Agape").unwrap();
+        let report = ensure_project_env_template(&dir, "Acme").unwrap();
         assert_eq!(report.action, "created");
         assert!(dir.join(".env").exists());
         let text = std::fs::read_to_string(dir.join(".env")).unwrap();
         // Active keys filled with project-substituted values.
         assert!(text.contains("KG_COLLECTION=Agape_KnowledgeGraph"));
-        assert!(text.contains("PROJECT_NAME=Agape"));
+        assert!(text.contains("PROJECT_NAME=Acme"));
         // Optional keys remain commented.
         assert!(text.contains("# OPENAI_API_KEY="));
         assert!(text.contains("# GITHUB_TOKEN="));
@@ -1242,7 +1242,7 @@ mod tests {
     fn ensure_env_template_user_value_for_kg_collection_not_overwritten() {
         let dir = _scratch_dir("kguser");
         std::fs::write(dir.join(".env"), "KG_COLLECTION=MyCustom_KG\n").unwrap();
-        ensure_project_env_template(&dir, "Agape").unwrap();
+        ensure_project_env_template(&dir, "Acme").unwrap();
         let text = std::fs::read_to_string(dir.join(".env")).unwrap();
         assert!(text.contains("KG_COLLECTION=MyCustom_KG"));
         assert!(!text.contains("KG_COLLECTION=Agape_KnowledgeGraph"));

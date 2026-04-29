@@ -222,7 +222,7 @@ Create project-specific scripts:
 
 **4.2 Create Project Agents (if needed)**
 
-Template from SD15 agents:
+Template from existing project agents:
 - `[project]-planner.md` - Feature planning with project knowledge
 - `[project]-coder.md` - Implementation following project patterns
 - `[project]-organizer.md` - Maintenance and cleanup

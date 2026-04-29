@@ -399,7 +399,7 @@ pub async fn set_project_kg_binding(
 
 /// POSTs a canonical KG-collection schema to Weaviate `/v1/schema` if
 /// the collection does not yet exist. Schema mirrors the layout used
-/// across Claude/SD15/ARTup/Agape orchestrator instances:
+/// across multiple orchestrator instances:
 ///
 ///   - `vectorConfig` with named vectors `qwen3_embed` (primary,
 ///     1024d) + `ollama_embed` (legacy, 1024d) + `openai_embed`

@@ -267,17 +267,17 @@ Read knowledge/concepts/vlm-patterns.md
 Read docs/guides/vlm-usage.md
 
 # vlm-patterns.md is canonical (cross-project pattern)
-# vlm-usage.md has unique SD15-specific examples
+# vlm-usage.md has unique ImageDataset-specific examples
 
 # Extract unique value from vlm-usage.md
 # Merge into vlm-patterns.md with Edit
 Edit knowledge/concepts/vlm-patterns.md
-# Add: ## Applied in SD15 Project
-# Include: SD15-specific examples from vlm-usage.md
+# Add: ## Applied in ImageDataset Project
+# Include: ImageDataset-specific examples from vlm-usage.md
 
 # Update WikiLinks
 Grep "vlm-usage" knowledge/ docs/ --output_mode content
-# Replace: [[vlm-usage]] → [[vlm-patterns#Applied in SD15]]
+# Replace: [[vlm-usage]] → [[vlm-patterns#Applied in ImageDataset]]
 
 # Archive old version
 Bash mv docs/guides/vlm-usage.md .claude/context/archive/2026-01-28_vlm-usage.md
@@ -291,7 +291,7 @@ Bash mv docs/guides/vlm-usage.md .claude/context/archive/2026-01-28_vlm-usage.md
 Bash mv docs/guides/caching-strategy.md knowledge/concepts/
 
 # Project-specific guide → docs/guides/
-Bash mv knowledge/projects/sd15-setup.md docs/guides/
+Bash mv knowledge/projects/imagedataset-setup.md docs/guides/
 
 # Reference material → docs/references/
 Bash mv docs/vlm-model-comparison.md docs/references/
@@ -306,7 +306,7 @@ Bash mv docs/session-notes-2026-01-15.md .claude/context/archive/2026-01-28_sess
 Grep "caching-strategy" knowledge/ docs/ --output_mode content -n
 
 # Update with Edit
-Edit knowledge/projects/artup.md
+Edit knowledge/projects/acme.md
 # Replace: [[docs/guides/caching-strategy]]
 # With: [[concepts/caching-strategy]]
 ```
@@ -399,7 +399,7 @@ Date: 2026-01-28
 ### 1. Duplicates Consolidated
 - **Merged**: vlm-usage.md + vlm-patterns.md → vlm-patterns.md
   - Reason: 85% overlap, vlm-patterns.md is canonical (cross-project)
-  - Action: Extracted SD15-specific examples, updated WikiLinks (3 files)
+  - Action: Extracted ImageDataset-specific examples, updated WikiLinks (3 files)
   - Archived: docs/guides/vlm-usage.md → archive/2026-01-28_vlm-usage.md
 
 - **Merged**: auth-guide.md + auth-patterns.md → auth-patterns.md
@@ -409,7 +409,7 @@ Date: 2026-01-28
 
 ### 2. Files Moved to Correct Folders
 - **knowledge/concepts/** ← docs/guides/caching-strategy.md (cross-project pattern)
-- **docs/guides/** ← knowledge/projects/sd15-setup.md (project-specific)
+- **docs/guides/** ← knowledge/projects/imagedataset-setup.md (project-specific)
 - **docs/references/** ← docs/vlm-model-comparison.md (reference material)
 
 ### 3. Archived Old Documentation

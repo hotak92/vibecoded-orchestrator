@@ -925,7 +925,7 @@ impl Db {
         Ok(())
     }
 
-    /// Reverse-lookup: given a Weaviate collection prefix (e.g. "Agape"),
+    /// Reverse-lookup: given a Weaviate collection prefix (e.g. "MyProject"),
     /// return the project_id that owns that prefix. Used by the codegraph
     /// dashboard to map Weaviate classes back to projects so it can render
     /// one card per project (not one per class). Returns None when the

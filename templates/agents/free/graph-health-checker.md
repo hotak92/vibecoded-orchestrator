@@ -319,7 +319,7 @@ Write to `.claude/logs/graph_health_report.md`:
   2. Archive if no longer relevant
 
 ### 2. Invalid Relationship Type
-- **Node**: knowledge/projects/artup.md
+- **Node**: knowledge/projects/acme.md
 - **Issue**: Uses relationship type "dependsOn" (not in VOCABULARY.md)
 - **Fix**: Change to valid type: `[[uses::X]]` or `[[buildsOn::X]]`
 

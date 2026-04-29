@@ -736,9 +736,9 @@ mod tests {
     #[test]
     fn populate_kg_bindings_writes_primary_and_shared() {
         let folder = scratch_dir("kg");
-        let db = make_db_with_project("p1", "Agape");
+        let db = make_db_with_project("p1", "Acme");
         let report =
-            populate_project_state_from_filesystem("p1", "Agape", &folder, &db);
+            populate_project_state_from_filesystem("p1", "Acme", &folder, &db);
         assert_eq!(report.kg_bindings_inserted, 2);
 
         let bindings = db.list_project_kg_bindings("p1").unwrap();
@@ -919,9 +919,9 @@ mod tests {
     #[test]
     fn empty_project_folder_still_writes_kg_and_codegraph() {
         let folder = scratch_dir("empty");
-        let db = make_db_with_project("p1", "Agape");
+        let db = make_db_with_project("p1", "Acme");
         let report =
-            populate_project_state_from_filesystem("p1", "Agape", &folder, &db);
+            populate_project_state_from_filesystem("p1", "Acme", &folder, &db);
         assert_eq!(report.agents_inserted, 0);
         assert_eq!(report.skills_inserted, 0);
         assert_eq!(report.hooks_inserted, 0);
@@ -932,7 +932,7 @@ mod tests {
 
     // ─── End-to-end ─────────────────────────────────────────────────
 
-    /// Simulates the full Agape onboarding case: 26 agents, several
+    /// Simulates the full real-project onboarding case: 26 agents, several
     /// skills, hooks block. Verifies the launcher GUI's per-project tabs
     /// would no longer be empty.
     #[test]
@@ -970,10 +970,10 @@ mod tests {
         )
         .unwrap();
 
-        let db = make_db_with_project("agape-id", "Agape");
+        let db = make_db_with_project("acme-id", "Acme");
         let report = populate_project_state_from_filesystem(
             "agape-id",
-            "Agape",
+            "Acme",
             &folder,
             &db,
         );
