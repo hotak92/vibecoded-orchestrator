@@ -1160,7 +1160,7 @@ mod tests {
         assert!(dir.join(".env").exists());
         let text = std::fs::read_to_string(dir.join(".env")).unwrap();
         // Active keys filled with project-substituted values.
-        assert!(text.contains("KG_COLLECTION=Agape_KnowledgeGraph"));
+        assert!(text.contains("KG_COLLECTION=Acme_KnowledgeGraph"));
         assert!(text.contains("PROJECT_NAME=Acme"));
         // Optional keys remain commented.
         assert!(text.contains("# OPENAI_API_KEY="));
@@ -1245,7 +1245,7 @@ mod tests {
         ensure_project_env_template(&dir, "Acme").unwrap();
         let text = std::fs::read_to_string(dir.join(".env")).unwrap();
         assert!(text.contains("KG_COLLECTION=MyCustom_KG"));
-        assert!(!text.contains("KG_COLLECTION=Agape_KnowledgeGraph"));
+        assert!(!text.contains("KG_COLLECTION=Acme_KnowledgeGraph"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

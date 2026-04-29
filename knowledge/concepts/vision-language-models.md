@@ -23,7 +23,7 @@ Vision-Language Models (VLMs) are neural architectures that learn a shared multi
 
 2. **Language Model Backbone** — generates or encodes text:
    - Decoder-only LLMs (Llama, Qwen, Mistral) — most modern VLMs
-   - Encoder-decoder (T5, BART) — older architectures (Donut, Pix2Struct)
+   - Encoder-decoder (T5, mBART) — older architectures (Donut, Pix2Struct)
 
 3. **Projection Layer** — bridges vision and language feature spaces:
    - Linear projection (simple, efficient)

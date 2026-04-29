@@ -1396,7 +1396,7 @@ class CodeGraphAnalyzer:
             })
 
         # --- External HTTP calls (fetch) ---
-        # Match: fetch(`${BART_URL}/api/tx/build`, ...) or fetch('http://bart:8000/api/somepath', ...)
+        # Match: fetch(`${EXAMPLE_API_URL}/api/tx/build`, ...) or fetch('http://example:8000/api/somepath', ...)
         external_calls: List[str] = []
         # Template literal with env var prefix: fetch(`${VAR}/path/here`...)
         for m in re.finditer(r'fetch\s*\(\s*`\$\{[\w]+\}(/[^`]*)`', content):

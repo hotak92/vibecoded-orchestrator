@@ -744,7 +744,7 @@ mod tests {
         let bindings = db.list_project_kg_bindings("p1").unwrap();
         assert_eq!(bindings.len(), 2);
         let primary = bindings.iter().find(|b| b.role == "primary").unwrap();
-        assert_eq!(primary.collection_name, "Agape_KnowledgeGraph");
+        assert_eq!(primary.collection_name, "Acme_KnowledgeGraph");
         assert_eq!(primary.embedding_model.as_deref(), Some("qwen3-embedding:0.6b"));
         assert_eq!(primary.embedding_dim, Some(1024));
         assert_eq!(
