@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { invoke } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
+  import { ui } from '$lib/stores/ui';
   import type { ProjectSecretRef } from '$lib/types/project-state';
 
   let { projectId }: { projectId: string } = $props();
@@ -18,9 +19,11 @@
   }
 
   function deepLinkSet(_key: string) {
-    // SecretsPanel is part of v1.0 — open the modal at the right tab.
-    // We dispatch a CustomEvent that +page.svelte (root) listens to.
-    window.dispatchEvent(new CustomEvent('vct-open-secrets', { detail: { projectId } }));
+    // 2026-04-29: previously dispatched a 'vct-open-secrets' window event
+    // that no listener consumed (dead code — confirmed by repo-wide grep).
+    // Open Settings → Secrets directly via the ui store, which
+    // SettingsPanel reads on mount via $ui.settingsInitialSection.
+    ui.openSettings('secrets');
   }
 
   async function del(key: string) {
