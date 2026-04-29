@@ -3,8 +3,24 @@
 
 import { writable } from 'svelte/store';
 
+// Sections rendered by SettingsPanel.svelte's left nav. Exported so
+// callers (e.g. SecretsTab "Open secrets panel") can request a specific
+// initial section when opening Settings without going through a
+// window-event bus.
+export type SettingsSection =
+  | 'profile'
+  | 'downloads'
+  | 'secrets'
+  | 'preferences'
+  | 'about';
+
 interface UIState {
   showSettings: boolean;
+  // 2026-04-29: when non-null, SettingsPanel jumps to this section on
+  // open instead of defaulting to 'profile'. Consumed once and cleared
+  // by closeSettings(). Replaces the dead 'vct-open-secrets' window
+  // event the SecretsTab used to dispatch.
+  settingsInitialSection: SettingsSection | null;
   showActivation: boolean;
   showInstallWizard: boolean;
   showMcpDashboard: boolean;
@@ -21,6 +37,7 @@ interface UIState {
 function createUIStore() {
   const { subscribe, update, set } = writable<UIState>({
     showSettings: false,
+    settingsInitialSection: null,
     showActivation: false,
     showInstallWizard: false,
     showMcpDashboard: false,
@@ -31,8 +48,23 @@ function createUIStore() {
   return {
     subscribe,
     set,
-    openSettings: () => update((s) => ({ ...s, showSettings: true })),
-    closeSettings: () => update((s) => ({ ...s, showSettings: false })),
+    // Open the Settings dialog. Pass `section` to jump straight to a
+    // specific tab (e.g. 'secrets' from the per-project SecretsTab
+    // "Open secrets panel" button). Defaults to null, which lets
+    // SettingsPanel keep its previous activeSection (typically
+    // 'profile' on first open).
+    openSettings: (section: SettingsSection | null = null) =>
+      update((s) => ({
+        ...s,
+        showSettings: true,
+        settingsInitialSection: section,
+      })),
+    closeSettings: () =>
+      update((s) => ({
+        ...s,
+        showSettings: false,
+        settingsInitialSection: null,
+      })),
     openActivation: () => update((s) => ({ ...s, showActivation: true })),
     closeActivation: () => update((s) => ({ ...s, showActivation: false })),
     openInstallWizard: () => update((s) => ({ ...s, showInstallWizard: true })),
