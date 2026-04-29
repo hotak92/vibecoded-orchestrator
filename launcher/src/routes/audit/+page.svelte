@@ -366,11 +366,11 @@
       </thead>
       <tbody>
         {#each filtered as e (e.id)}
+          {@const pc = projectCell(e.project_id)}
           <tr>
             <td class="col-time">{fmtTime(e.created_at)}</td>
             <td class="col-op"><code>{e.operation}</code></td>
             <td class="col-actor"><code>{e.actor ?? 'unknown'}</code></td>
-            {@const pc = projectCell(e.project_id)}
             <td class="col-project">
               {#if pc.chip === 'global' || pc.chip === 'shared'}
                 <span class="scope-chip scope-{pc.chip}">{pc.label}</span>
