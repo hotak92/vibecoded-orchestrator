@@ -48,6 +48,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "code_graph_builds: per-project initial-build status (Gap 2)",
         sql: include_str!("migrations/006_code_graph_build_status.sql"),
     },
+    Migration {
+        version: 7,
+        description: "secret_active_state: per-secret active flag (Lifecycle B + Storage A — Bug 3 follow-up)",
+        sql: include_str!("migrations/007_secret_active_state.sql"),
+    },
 ];
 
 /// Apply every migration whose version is greater than the current max applied.
