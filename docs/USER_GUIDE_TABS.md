@@ -466,7 +466,7 @@ DB; the binding row is the launcher's record of what those should be.
 #### How rows get there
 
 - Auto-populated by `populate_kg_bindings()`:
-  - `primary` row → `collection_name = sanitize_kg_collection(project_name) + "_KnowledgeGraph"`. For a project named `Agape` that's `Agape_KnowledgeGraph`. The sanitizer strips non-alphanumerics and TitleCases (`my project name` → `MyProjectName`).
+  - `primary` row → `collection_name = sanitize_kg_collection(project_name) + "_KnowledgeGraph"`. For a project named `Acme` that's `Agape_KnowledgeGraph`. The sanitizer strips non-alphanumerics and TitleCases (`my project name` → `MyProjectName`).
   - `shared` row → `collection_name = "VibeCodedTools_KnowledgeGraph"` (cross-project shared KG used by all projects).
   - Both default to `weaviate_url = http://localhost:8081`,
     `embedding_model = qwen3-embedding:0.6b`, `embedding_dim = 1024`.
@@ -537,15 +537,15 @@ code entities.
 
 #### Namespaced classes
 
-A project with prefix `Agape` ends up with `Agape_CodeFunction`,
+A project with prefix `Acme` ends up with `Agape_CodeFunction`,
 `Agape_CodeClass`, `Agape_CodeModule`, `Agape_CodeAPI`,
 `Agape_CodeInteraction` in Weaviate.
 
 | Project name | `collection_prefix` | Resulting classes |
 |---|---|---|
-| `Agape` | `Agape` | `Agape_CodeFunction`, … |
+| `Acme` | `Acme` | `Agape_CodeFunction`, … |
 | `my project name` | `MyProjectName` | `MyProjectName_CodeFunction`, … |
-| `SD15` | `SD15` | `SD15_CodeFunction`, … |
+| `ImageDataset` | `ImageDataset` | `SD15_CodeFunction`, … |
 
 The prefix is derived by `sanitize_kg_collection(project_name)` —
 same function as KG bindings.

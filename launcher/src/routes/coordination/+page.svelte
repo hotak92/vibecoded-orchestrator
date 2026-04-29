@@ -149,7 +149,7 @@
             <input bind:value={username} placeholder="hotak92" />
           </label>
           <label><span>User aliases (comma)</span>
-            <input bind:value={aliasesRaw} placeholder="martino, m" />
+            <input bind:value={aliasesRaw} placeholder="alice, a" />
           </label>
         </div>
       </section>

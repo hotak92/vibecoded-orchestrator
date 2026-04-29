@@ -649,7 +649,7 @@ Use shared agents if:
 
 **8.2 Create Agents (if needed)**
 
-Use templates from SD15:
+Use templates from existing projects:
 
 **[project]-planner.md**:
 ```markdown

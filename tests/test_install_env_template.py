@@ -57,14 +57,14 @@ class TestEnvTemplateFreshCreate(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             env = Path(td) / ".env"
             self.assertFalse(env.exists())
-            report = install._ensure_env_template(env, project_name="Agape")
+            report = install._ensure_env_template(env, project_name="Acme")
             self.assertEqual(report["action"], "created")
             self.assertTrue(env.exists())
 
     def test_created_file_has_all_canonical_keys(self):
         with tempfile.TemporaryDirectory() as td:
             env = Path(td) / ".env"
-            install._ensure_env_template(env, project_name="Agape")
+            install._ensure_env_template(env, project_name="Acme")
             present = install._parse_existing_env_keys(env)
             for key in CANONICAL_KEYS:
                 self.assertIn(key, present, f"missing {key} in fresh template")
@@ -72,11 +72,11 @@ class TestEnvTemplateFreshCreate(unittest.TestCase):
     def test_created_file_uses_project_name_in_collection_keys(self):
         with tempfile.TemporaryDirectory() as td:
             env = Path(td) / ".env"
-            install._ensure_env_template(env, project_name="Agape")
+            install._ensure_env_template(env, project_name="Acme")
             text = env.read_text(encoding="utf-8")
-            self.assertIn("KG_COLLECTION=Agape_KnowledgeGraph", text)
-            self.assertIn("DEVELOPMENT_COLLECTION=Agape_Development", text)
-            self.assertIn("PROJECT_NAME=Agape", text)
+            self.assertIn("KG_COLLECTION=Acme_KnowledgeGraph", text)
+            self.assertIn("DEVELOPMENT_COLLECTION=Acme_Development", text)
+            self.assertIn("PROJECT_NAME=Acme", text)
 
     def test_created_file_keeps_optional_keys_commented(self):
         # Sensitive / optional keys must NOT be active by default.
@@ -186,10 +186,10 @@ class TestEnvTemplateAppendMerge(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             env = Path(td) / ".env"
             env.write_text("KG_COLLECTION=MyCustom_KG\n", encoding="utf-8")
-            install._ensure_env_template(env, project_name="Agape")
+            install._ensure_env_template(env, project_name="Acme")
             text = env.read_text(encoding="utf-8")
             self.assertIn("KG_COLLECTION=MyCustom_KG", text)
-            self.assertNotIn("KG_COLLECTION=Agape_KnowledgeGraph", text)
+            self.assertNotIn("KG_COLLECTION=Acme_KnowledgeGraph", text)
 
 
 class TestEnvTemplateNoop(unittest.TestCase):

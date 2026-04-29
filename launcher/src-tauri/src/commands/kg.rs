@@ -148,11 +148,11 @@ pub async fn kg_list_collections(
 /// per project on the codegraph dashboard, not five.
 #[derive(Debug, Serialize)]
 pub struct CodegraphProjectSummary {
-    /// Project's bare name (e.g. "Agape", "VideoFrames"). Used as the
+    /// Project's bare name (e.g. "MyProject", "VideoFrames"). Used as the
     /// dashboard card heading.
     pub project_name: String,
     /// Sanitized prefix used for namespacing the five classes
-    /// (e.g. "Agape" → `Agape_CodeFunction`). Empty if the project
+    /// (e.g. "MyProject" → `MyProject_CodeFunction`). Empty if the project
     /// has no codegraph_binding row yet.
     pub prefix: String,
     pub module_count: u32,

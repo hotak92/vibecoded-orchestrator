@@ -143,7 +143,7 @@
   // 2026-04-28 fix: do NOT auto-fill projectPath with a templated value.
   // Earlier code wrote `${suggestedRoot}/${slug}` into the field as a real
   // value, which (a) looked like a concrete location the user had to delete
-  // before typing their own (`/home/martino/code/agape`), and (b) implied
+  // before typing their own (`~/dev/myproject`), and (b) implied
   // the orchestrator expected projects under `~/code/` even when the user
   // had no such directory. Now: leave the field blank, show only a generic
   // `path/to/project` placeholder, and let the user type or click Browse.
@@ -590,7 +590,7 @@
           // on projects.folder_path). Surface a clear inline choice
           // instead of a raw error: Open existing / Re-create
           // (delete + add) / Cancel. Reported 2026-04-28: re-running
-          // the wizard against Agape used to dead-end with a raw
+          // the wizard against an existing-folder project used to dead-end with a raw
           // SQLite error and no way to dismiss.
           const cmsg = createErr instanceof Error ? createErr.message : String(createErr);
           if (/UNIQUE constraint failed.*projects\.folder_path/i.test(cmsg)) {
@@ -607,7 +607,7 @@
         // step-3 install handler (line ~329) renders the modal in that
         // case; the step-4 path needs the same treatment, otherwise the
         // user sees a raw JSON blob in the project-error string.
-        // Reported 2026-04-28 from real wizard test on Agape.
+        // Reported 2026-04-28 from real wizard test on existing-folder project.
         const raw = e instanceof Error ? e.message : String(e);
         const conflictErr = tryParseConflictError(raw);
         if (conflictErr) {
@@ -737,7 +737,7 @@
   // vibecoded-orchestrator" flow. They want to register their first project.
   // Reported 2026-04-27 from real install testing — the default-path field
   // was being concatenated with user-typed absolute paths and producing
-  // garbage like /home/.../vibecoded-orch/home/.../Agape/Code.
+  // garbage like /home/.../vibecoded-orch/home/.../some-project/Code.
   let alreadyInstalledRoot = $state<string | null>(null);
   let preflightChecked = $state(false);
   async function preflightSkipIfAlreadyInstalled() {
