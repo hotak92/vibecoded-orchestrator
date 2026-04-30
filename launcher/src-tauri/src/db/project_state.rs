@@ -992,14 +992,33 @@ mod tests {
     }
 
     fn seed_project(db: &Db, id: &str, name: &str) {
+        // Placeholder folder_path — never resolved against disk by these
+        // tests. Pick a platform-appropriate prefix so the value isn't
+        // ambiguous on Windows.
+        let folder = if cfg!(windows) {
+            format!(r"C:\tmp\{}", id)
+        } else {
+            format!("/tmp/{}", id)
+        };
         let guard = db.lock();
         guard
             .execute(
                 "INSERT INTO projects (id, name, folder_path, host, created_at, updated_at)
                  VALUES (?1, ?2, ?3, 'base', ?4, ?4)",
-                params![id, name, format!("/tmp/{}", id), 1_700_000_000_000_i64],
+                params![id, name, folder, 1_700_000_000_000_i64],
             )
             .unwrap();
+    }
+
+    /// Platform-aware placeholder path for fixture string fields (agent
+    /// file paths, secret-ref file paths). Tests only round-trip these
+    /// strings through SQLite; nothing on disk is opened.
+    fn fixture_str_path(rel: &str) -> String {
+        if cfg!(windows) {
+            format!(r"C:\Users\u\{}", rel.replace('/', "\\"))
+        } else {
+            format!("/home/u/{}", rel)
+        }
     }
 
     #[test]
@@ -1012,7 +1031,7 @@ mod tests {
             "bundled",
             None,
             Some("sonnet"),
-            Some("/home/u/.claude/agents/coder.md"),
+            Some(&fixture_str_path(".claude/agents/coder.md")),
             &serde_json::json!({"description": "general coder"}),
         )
         .unwrap();
@@ -1072,7 +1091,7 @@ mod tests {
             "p1",
             "GITHUB_TOKEN",
             "file",
-            Some("/home/u/.vct-secrets/github_pat"),
+            Some(&fixture_str_path(".vct-secrets/github_pat")),
             None,
             None,
             &["coder".to_string()],

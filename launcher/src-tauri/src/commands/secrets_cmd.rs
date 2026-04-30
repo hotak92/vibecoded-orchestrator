@@ -414,12 +414,20 @@ mod tests {
     }
 
     fn seed_project(db: &Db, id: &str, name: &str) {
+        // Placeholder folder_path string — never resolved against disk by
+        // these tests. Use a platform-appropriate prefix so the value isn't
+        // ambiguous on Windows.
+        let folder = if cfg!(windows) {
+            format!(r"C:\tmp\{}", id)
+        } else {
+            format!("/tmp/{}", id)
+        };
         let guard = db.lock();
         guard
             .execute(
                 "INSERT INTO projects (id, name, folder_path, host, slug, created_at, updated_at)
                  VALUES (?1, ?2, ?3, 'base', ?4, ?5, ?5)",
-                params![id, name, format!("/tmp/{}", id), id, 1_700_000_000_000_i64],
+                params![id, name, folder, id, 1_700_000_000_000_i64],
             )
             .unwrap();
     }
