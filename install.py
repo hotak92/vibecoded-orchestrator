@@ -5039,12 +5039,14 @@ def _install_agents_and_skills(args: argparse.Namespace) -> None:
 
 
 def _install_hooks_and_settings(args: argparse.Namespace) -> str:
-    """Copy hooks from templates/hooks/ into .claude/hooks/ and smart-merge
+    """Copy hooks from templates/hooks/ into .claude/hooks/, scripts from
+    templates/scripts/ into .claude/scripts/, and smart-merge
     templates/settings.json.template into .claude/settings.json.
 
-    Hooks are byte-copied (no placeholder substitution) so every project carries
-    identical scripts. Hooks read VCT_INSTALL_ROOT, KG_COLLECTION, WEAVIATE_URL,
-    etc. at runtime; the launcher exports VCT_INSTALL_ROOT per-project.
+    Hooks and scripts are byte-copied (no placeholder substitution) so every
+    project carries identical files. They read VCT_INSTALL_ROOT,
+    KG_COLLECTION, WEAVIATE_URL, etc. at runtime; the launcher exports
+    VCT_INSTALL_ROOT per-project.
 
     settings.json merge rules (only when target file already exists):
       * recursive dict merge — template provides defaults, user keys win on conflict
@@ -5060,6 +5062,7 @@ def _install_hooks_and_settings(args: argparse.Namespace) -> str:
 
     templates_dir = PROJECT_ROOT / "templates"
     hooks_src = templates_dir / "hooks"
+    scripts_src = templates_dir / "scripts"
     settings_template = templates_dir / "settings.json.template"
     if not hooks_src.exists():
         return ""
@@ -5079,6 +5082,23 @@ def _install_hooks_and_settings(args: argparse.Namespace) -> str:
         shutil.copy2(hook_file, target)
         installed_hooks += 1
 
+    # Scripts referenced by hooks (e.g. precompact_prune.py). Live alongside
+    # hooks under .claude/scripts/. Some scripts may not exist if the
+    # installation predates them — that's fine, the hooks ?-guard against
+    # missing files.
+    installed_scripts = 0
+    skipped_scripts = 0
+    if scripts_src.exists():
+        scripts_dst = claude_dir / "scripts"
+        scripts_dst.mkdir(parents=True, exist_ok=True)
+        for script_file in sorted(scripts_src.glob("*.py")):
+            target = scripts_dst / script_file.name
+            if target.exists():
+                skipped_scripts += 1
+                continue
+            shutil.copy2(script_file, target)
+            installed_scripts += 1
+
     settings_action = _merge_settings_template(
         settings_template, claude_dir / "settings.json"
     )
@@ -5086,6 +5106,10 @@ def _install_hooks_and_settings(args: argparse.Namespace) -> str:
     summary = f"{installed_hooks} hooks"
     if skipped_hooks:
         summary += f" ({skipped_hooks} already present)"
+    if installed_scripts or skipped_scripts:
+        summary += f", {installed_scripts} scripts"
+        if skipped_scripts:
+            summary += f" ({skipped_scripts} already present)"
     if settings_action:
         summary += f", settings.json {settings_action}"
     return summary
