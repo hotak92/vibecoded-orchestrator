@@ -211,11 +211,25 @@ mod tests {
     use super::*;
     use crate::db::models::ProjectHost;
 
+    /// Platform-aware placeholder folder path for fixtures. Tests only
+    /// store this in the `folder_path` SQL column for uniqueness / round-
+    /// trip checks — they never touch disk — but a string like `/tmp/x`
+    /// looks ambiguous on Windows where `Path::new("/tmp/x")` is parsed
+    /// as relative-ish. Pick a host-appropriate fake.
+    fn fixture_path(suffix: &str) -> String {
+        if cfg!(windows) {
+            format!(r"C:\tmp\{}", suffix)
+        } else {
+            format!("/tmp/{}", suffix)
+        }
+    }
+
     fn fresh_db_with_project() -> (Db, String) {
         let db = Db::open_in_memory().expect("in-memory db");
         let id = uuid::Uuid::new_v4().to_string();
         let slug = db.generate_unique_slug("Test").unwrap();
-        db.insert_project(&id, "Test", "/tmp/whatever", ProjectHost::Base, &slug)
+        let folder = fixture_path("whatever");
+        db.insert_project(&id, "Test", &folder, ProjectHost::Base, &slug)
             .unwrap();
         (db, id)
     }
@@ -327,7 +341,7 @@ mod tests {
             let slug = db.generate_unique_slug(name).unwrap();
             // folder_path has a UNIQUE index in the projects schema —
             // give each row a distinct path.
-            let folder = format!("/tmp/cgbuild-{}", i);
+            let folder = fixture_path(&format!("cgbuild-{}", i));
             db.insert_project(&id, name, &folder, ProjectHost::Base, &slug)
                 .unwrap();
             db.upsert_code_graph_build(&id, st, Some(0), None, None, 0, None, false, None, None)

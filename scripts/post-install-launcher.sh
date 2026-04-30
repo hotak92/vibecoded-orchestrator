@@ -636,7 +636,14 @@ PY
                     _log_event "download" "error" "macos hdiutil missing"
                     MODE="build"
                 else
-                    tmp_dmg="/tmp/vct-launcher-$$.dmg"
+                    # Use mktemp for idiomatic correctness: avoids $$ races
+                    # and respects $TMPDIR (macOS sandbox places it under
+                    # per-user dirs, not always /tmp). BSD mktemp on macOS
+                    # treats `-t` as a prefix, GNU as a template — using a
+                    # directory + manual basename keeps both happy.
+                    tmp_dir="$(mktemp -d -t vct-launcher.XXXXXX 2>/dev/null \
+                                || mktemp -d "${TMPDIR:-/tmp}/vct-launcher.XXXXXX")"
+                    tmp_dmg="$tmp_dir/launcher.dmg"
                     if _download "$asset_url" "$tmp_dmg"; then
                         mount_point="$(hdiutil attach -nobrowse -quiet "$tmp_dmg" 2>/dev/null \
                             | awk '/\/Volumes\// {for (i=3;i<=NF;i++) printf "%s%s", $i, (i<NF?" ":""); print ""}' \
@@ -660,7 +667,7 @@ PY
                             fi
                             hdiutil detach "$mount_point" -quiet 2>/dev/null || true
                         fi
-                        rm -f "$tmp_dmg"
+                        rm -rf "$tmp_dir"
                         if [ -z "$LAUNCHER_BIN" ]; then
                             echo "[launcher] DMG mount/copy failed. Falling back to build."
                             _log_event "download" "error" "macos dmg mount/copy failed"

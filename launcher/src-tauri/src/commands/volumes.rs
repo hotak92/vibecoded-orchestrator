@@ -1081,17 +1081,31 @@ mod tests {
         // Override config path via the env-aware helper would require
         // refactoring; instead we test serialization round-trip directly,
         // which is what `read_launcher_config` does internally.
+        // Sample mountpoints only round-tripped through TOML — not opened —
+        // but pick host-appropriate placeholders so the strings aren't
+        // ambiguous on Windows.
+        let (mp_weav, mp_oll): (String, String) = if cfg!(windows) {
+            (
+                r"C:\Users\example\podman_volumes\weaviate_claude".to_string(),
+                r"C:\Users\example\podman_volumes\ollama_claude".to_string(),
+            )
+        } else {
+            (
+                "/home/example/podman_volumes/weaviate_claude".to_string(),
+                "/home/example/podman_volumes/ollama_claude".to_string(),
+            )
+        };
         let cfg = LauncherConfig {
             volumes_path: "detected".to_string(),
             legacy_mapping: vec![
                 LegacyVolumeMapping {
                     volume_name: "weaviate_claude".to_string(),
-                    mountpoint: "/home/example/podman_volumes/weaviate_claude".to_string(),
+                    mountpoint: mp_weav,
                     role: "weaviate".to_string(),
                 },
                 LegacyVolumeMapping {
                     volume_name: "ollama_claude".to_string(),
-                    mountpoint: "/home/example/podman_volumes/ollama_claude".to_string(),
+                    mountpoint: mp_oll,
                     role: "ollama".to_string(),
                 },
             ],

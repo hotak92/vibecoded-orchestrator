@@ -483,7 +483,10 @@ mod tests {
     fn make_db_with_project(project_id: &str, name: &str) -> Db {
         let db = Db::open_in_memory().expect("in-memory db");
         let slug = db.generate_unique_slug(name).unwrap();
-        db.insert_project(project_id, name, "/tmp/x", ProjectHost::Base, &slug)
+        // Platform-aware placeholder folder path. Stored only as a string
+        // in the projects table; never touches disk.
+        let folder = if cfg!(windows) { r"C:\tmp\x" } else { "/tmp/x" };
+        db.insert_project(project_id, name, folder, ProjectHost::Base, &slug)
             .unwrap();
         db
     }
