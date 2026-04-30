@@ -2,13 +2,9 @@
 
 This directory holds the agents and skills that `install.py` copies into a user's `.claude/agents/` and `.claude/skills/` at install time. Contents here are *templates*, not active agents — they're populated into your project's `.claude/` so Claude Code picks them up.
 
-## Tier split
+## Bundled agents — `agents/free/` (29 agents)
 
-The agents are partitioned into two subdirectories by tier. Skills are tier-flat (all free).
-
-### Free tier — `agents/free/` (16 agents)
-
-Shipped on install by default. Cover the base orchestrator workflow: coding, testing, planning, docs, knowledge graph, code graph, migration, bootstrapping.
+All bundled agents are free and installed by default. They cover the base orchestrator workflow plus specialist + coordinator roles: coding, testing, planning, docs, knowledge graph, code graph, migration, bootstrapping, multi-agent design, and language/framework expertise.
 
 | Agent | Role |
 |---|---|
@@ -28,13 +24,6 @@ Shipped on install by default. Cover the base orchestrator workflow: coding, tes
 | `orchestrator-installer` | Infrastructure bring-up |
 | `project-bootstrapper` | New-project scaffolding |
 | `project-migrator` | Adopt orchestrator into existing project |
-
-### MAO tier — `agents/mao/` (10 agents)
-
-Installed only with `--with-mao-agents`. Gated by MAO license at runtime. These are the specialist + coordinator agents that power the multi-agent orchestrator product.
-
-| Agent | Role |
-|---|---|
 | `ai-agentic-architect` | Designs multi-agent workflows |
 | `project-coordinator` | Coordinates running agents |
 | `project-architect` | End-to-end design |
@@ -45,6 +34,9 @@ Installed only with `--with-mao-agents`. Gated by MAO license at runtime. These 
 | `frontend-specialist` | React/Vue/UI |
 | `gui-expert` | Gradio + GUI/UX |
 | `deep-researcher` | Recursive sub-agent research |
+| `code-explorer` | Read-only code exploration |
+| `gui-tester` | GUI testing |
+| `web-explorer` | Web research |
 
 ### Skills — `skills/` (29 skills)
 
@@ -76,10 +68,9 @@ Keep placeholders in templates — do NOT hard-code paths.
 ## Install flags
 
 ```bash
-python install.py                      # free agents + all skills (default)
+python install.py                      # 29 bundled agents + all skills (default)
 python install.py --no-agents          # skip agent installation
 python install.py --no-skills          # skip skill installation
-python install.py --with-mao-agents    # also install MAO specialist agents
 ```
 
 Reinstalls preserve any agents/skills already present — you won't lose customizations.

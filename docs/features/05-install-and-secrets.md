@@ -53,10 +53,7 @@ Installs `requirements-dev.txt` in addition to `requirements.txt` inside the ven
 Re-installs deps and restarts services, but skips `.env` and `settings.json` creation (preserves user edits).
 
 ### `--with-agents` / `--no-agents`
-Default-on. Copies free-tier agent templates from `templates/agents/free/` into `~/.claude/agents/`. Already-present files are skipped (idempotent).
-
-### `--with-mao-agents`
-Installs MAO-tier specialist agents from `templates/agents/mao/`. Gated at runtime (MAO license required); install step itself is ungated.
+Default-on. Copies bundled agent templates from `templates/agents/free/` into `~/.claude/agents/`. Already-present files are skipped (idempotent).
 
 ### `--with-skills` / `--no-skills`
 Default-on. Copies skill directories from `templates/skills/` into `~/.claude/skills/`. `.md` files get placeholder substitution; other files are copied raw.
