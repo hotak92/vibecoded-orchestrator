@@ -2809,8 +2809,13 @@ def _install_joern() -> bool:
         # Mirror the guard at line 2476: chmod is a Linux/macOS operation;
         # on Windows os.chmod only honors the read-only bit and the early
         # return above means we never reach this branch anyway.
+        # Owner-only rwx (0o700) — the installer is in a private NamedTemporary
+        # file we delete seconds later; no other user needs to read or execute
+        # it. CodeQL py/overly-permissive-file (CWE-732) flagged the previous
+        # 0o755 as world-readable+executable; 0o700 is the minimum bit set
+        # that still lets us exec it ourselves.
         if platform.system() != "Windows":
-            os.chmod(installer_path, 0o755)
+            os.chmod(installer_path, 0o700)
 
         # Install to ~/.local (user-local, no sudo needed). Stream output to
         # the terminal so the user sees progress (no `capture_output=True` —
