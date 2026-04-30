@@ -9,9 +9,11 @@ Reads (in priority order, first match wins):
                              paid tiers without a validated key).
     VIBECODED_LICENSE_KEY  — 36-char UUID. Set by the launcher after
                              activation, or by tooling/tests directly.
-    ~/.vct-secrets/license_key  — fallback file (chmod 600, plain UUID, no
-                             trailing whitespace). Used by headless installs
-                             where the launcher hasn't run.
+    ~/.vct-secrets/shared/license_key  — fallback file (chmod 600, plain UUID,
+                             no trailing whitespace). Used by headless installs
+                             where the launcher hasn't run. Legacy flat layout
+                             ~/.vct-secrets/license_key is still honored as a
+                             fallback for backward compat.
     VIBECODED_LICENSE_URL  — Supabase /validate-tier edge function URL.
                              Defaults to the production deployment.
 
@@ -90,7 +92,13 @@ STATUS_FILE = CACHE_DIR / "license_status.txt"
 # Convention: same dir as other VCT secrets, file named `license_key`,
 # chmod 600, contains only the UUID (no JSON, no trailing newline matters —
 # we strip it).
-KEY_FILE = Path.home() / ".vct-secrets" / "license_key"
+#
+# Phase 1 layout (preferred): ~/.vct-secrets/shared/license_key
+# Legacy flat layout (fallback): ~/.vct-secrets/license_key
+KEY_FILE_SHARED = Path.home() / ".vct-secrets" / "shared" / "license_key"
+KEY_FILE_FLAT = Path.home() / ".vct-secrets" / "license_key"
+# Back-compat export for any external code that imported KEY_FILE directly:
+KEY_FILE = KEY_FILE_FLAT
 
 
 @dataclass
@@ -285,13 +293,16 @@ def _remote_validate(key: str, machine_hash: str) -> Optional[LicenseResult]:
 def _read_key_file() -> str:
     """Read the license key from the fallback file, if present.
 
+    Tries the Phase 1 layout (`~/.vct-secrets/shared/license_key`) first, then
+    falls back to the legacy flat layout (`~/.vct-secrets/license_key`).
     Returns empty string on any error (missing, unreadable, empty). Never raises.
     """
-    try:
-        if KEY_FILE.exists():
-            return KEY_FILE.read_text().strip()
-    except (OSError, UnicodeDecodeError) as e:
-        log.debug("Could not read %s: %s", KEY_FILE, e)
+    for path in (KEY_FILE_SHARED, KEY_FILE_FLAT):
+        try:
+            if path.exists():
+                return path.read_text().strip()
+        except (OSError, UnicodeDecodeError) as e:
+            log.debug("Could not read %s: %s", path, e)
     return ""
 
 
@@ -300,7 +311,7 @@ def validate_license(key: Optional[str] = None) -> LicenseResult:
 
     Priority:
         1. `VIBECODED_TIER=free` env forces free tier (dev override).
-        2. Key resolution: explicit arg → env var → ``~/.vct-secrets/license_key``.
+        2. Key resolution: explicit arg → env var → ``~/.vct-secrets/shared/license_key`` (preferred) or ``~/.vct-secrets/license_key`` (legacy fallback).
         3. No key → free tier.
         4. Remote validation → success → cache + return.
         5. Remote failure → check cache age:

@@ -50,7 +50,7 @@ Low-level gate; returns True iff `TIER_ORDER[current] >= TIER_ORDER[min_tier]`.
 The Python client's job is narrow: find a license key (env var, file, argument), POST it to the Supabase edge function, cache the verdict, and answer `feature_enabled()` queries against it. Anything more interesting — the actual classification, the LS API calls, the Vault lookups — happens server-side.
 
 ### Key resolution priority
-`validate_license()` resolves the license key in order: (1) `VIBECODED_TIER=free` env forces free tier immediately; (2) explicit `key` argument; (3) `VIBECODED_LICENSE_KEY` env var; (4) `~/.vct-secrets/license_key` file. First non-empty value wins. No key → free tier.
+`validate_license()` resolves the license key in order: (1) `VIBECODED_TIER=free` env forces free tier immediately; (2) explicit `key` argument; (3) `VIBECODED_LICENSE_KEY` env var; (4) `~/.vct-secrets/shared/license_key` file (preferred) or legacy `~/.vct-secrets/license_key` (fallback). First non-empty value wins. No key → free tier.
 
 ### Remote validation via Supabase edge function
 `_remote_validate()` POSTs `{license_key, machine_id_hash}` to `https://api.vibecodedtools.it/validate-tier` (or `VIBECODED_LICENSE_URL` / `VCT_VALIDATE_TIER_URL` env overrides). Both env var names are honored for compatibility with the Rust launcher.
@@ -324,7 +324,7 @@ All 20 project hooks scrub `SUPABASE_KEY`, `GITHUB_TOKEN`, `OPENAI_API_KEY`, AWS
 Secrets rotation runbook (maintainer docs): (1) Roll key in Supabase dashboard, (2) write to `~/.vct-secrets/shared/supabase_token`, (3) `supabase secrets set`, (4) update Vercel env, (5) restart local services. Old key valid ~24 h (zero-downtime window).
 
 ### GitHub PAT rotation — single file write
-PAT lives at `~/.vct-secrets/github_pat`. Rotation = update file + chmod 600. Credential helper, search MCP wrapper, and `gh` CLI all re-read on each invocation.
+PAT lives at `~/.vct-secrets/shared/github_pat` (Phase 1 layout, since 2026-04-24). Legacy flat path `~/.vct-secrets/github_pat` is still honored as a fallback. Rotation = update file + chmod 600. Credential helper, search MCP wrapper, and `gh` CLI all re-read on each invocation.
 
 ### Security reporting: `security@vibecodedtools.it`
 Preferred: GitHub Security Advisories at `https://github.com/hotak92/vibecoded-orchestrator/security/advisories/new`. Email as fallback for reporters who cannot use GitHub. SLA: ack 3 days, initial assessment 10 days, fix plan 30 days (high/critical) / 90 days (medium/low).

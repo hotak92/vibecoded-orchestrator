@@ -1140,7 +1140,7 @@
               hour (anonymous). With token = 5000/hour.
             </p>
             {#if patSaved}
-              <p class="ow-ok">Token saved to <code class="ow-mono">~/.vct-secrets/github_pat</code>.</p>
+              <p class="ow-ok">Token saved to <code class="ow-mono">~/.vct-secrets/shared/github_pat</code>.</p>
             {:else}
               <label class="ow-label">
                 <span>GitHub token (optional)</span>
