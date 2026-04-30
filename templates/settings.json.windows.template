@@ -1,0 +1,275 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "_template_origin": "vibecoded-orchestrator v0.1.6+ \u2014 Windows variant (PowerShell), copied by install.py",
+  "_comment": "Project-scoped Claude Code settings for VibeCoded Orchestrator-managed projects. Hooks fire by default \u2014 set VCT_DISABLE_HOOKS=1 in your shell to opt out per-shell, or remove blocks here for project-wide opt-out.",
+  "permissions": {
+    "allow": [
+      "Bash(pytest *)",
+      "Bash(python *)",
+      "Bash(pip install *)",
+      "Bash(cat *)",
+      "Bash(grep *)",
+      "Bash(find *)",
+      "Bash(ls *)",
+      "Bash(mkdir *)",
+      "Bash(mv *)",
+      "Bash(cp *)",
+      "Bash(git *)",
+      "mcp__weaviate-kg__*",
+      "mcp__ollama__*",
+      "mcp__search__*"
+    ],
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./secrets/**)",
+      "Write(./.env)",
+      "Write(./.env.*)",
+      "Bash(rm -rf /)",
+      "Bash(rm -rf /*)",
+      "Bash(rm -rf ~)",
+      "Bash(rm -rf ~/)",
+      "Bash(rm -rf /home)",
+      "Bash(rm -rf /etc)",
+      "Bash(rm -rf /usr)",
+      "Bash(rm -rf /var)",
+      "Bash(dd if=* of=/dev/*)",
+      "Bash(mkfs*)",
+      "Bash(shred *)",
+      "Bash(curl * | bash*)",
+      "Bash(curl * | sh*)",
+      "Bash(wget * | bash*)",
+      "Bash(wget * | sh*)"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\ensure-containers.ps1",
+            "timeout": 15,
+            "background": true
+          },
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\ensure-code-embed-service.ps1",
+            "timeout": 15,
+            "background": true
+          },
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\session-start-kg-loader.ps1",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\context-size-check.ps1",
+            "timeout": 2
+          }
+        ]
+      },
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\compact-context-reinject.ps1",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "auto",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\pre-compact-save.ps1",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\post-compact.ps1",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\user-prompt-submit-reminder.ps1",
+            "timeout": 2
+          },
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\diff-context-inject.ps1",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash(*vercel*--token*)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\pre-vercel-token-guard.ps1 \"$CLAUDE_TOOL_NAME\" \"$CLAUDE_USER_MESSAGE\" \"$CLAUDE_TOOL_ARGS\"",
+            "timeout": 2
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\pre-tool-use.ps1 \"$CLAUDE_TOOL_NAME\" \"$CLAUDE_USER_MESSAGE\" \"$CLAUDE_TOOL_ARGS\"",
+            "timeout": 3
+          }
+        ]
+      },
+      {
+        "matcher": "Edit(*)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\pre-edit-context-inject.ps1 \"$CLAUDE_TOOL_NAME\" \"$CLAUDE_TOOL_ARGS\"",
+            "timeout": 8
+          }
+        ]
+      }
+    ],
+    "ConfigChange": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\config-change-audit.ps1",
+            "timeout": 2,
+            "background": true
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\cost-tracker.ps1",
+            "timeout": 5,
+            "background": true
+          },
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\notify-stop.ps1",
+            "timeout": 5,
+            "background": true
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\stop-failure-notify.ps1",
+            "timeout": 5,
+            "background": true
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit(*)|Write(*)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\post-file-edit.ps1 \"$CLAUDE_TOOL_ARG_FILE_PATH\"",
+            "timeout": 5,
+            "background": true
+          }
+        ]
+      },
+      {
+        "matcher": "Edit(*)|Write(*)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\post-tool-security.ps1 \"$CLAUDE_TOOL_ARG_FILE_PATH\"",
+            "timeout": 5,
+            "background": true
+          }
+        ]
+      },
+      {
+        "matcher": "Write(*.py)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -Command \"try { python -m py_compile $env:CLAUDE_TOOL_ARG_PATH } catch { Write-Output 'Syntax error' }\"",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Edit(knowledge/**/*.md)|Write(knowledge/**/*.md)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -Command \"try { python .claude/scripts/sync_knowledge_graph.py $env:CLAUDE_TOOL_ARG_FILE_PATH } catch { }\"",
+            "timeout": 15,
+            "background": true
+          },
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\kg-summary-generator.ps1",
+            "timeout": 5,
+            "background": true
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__weaviate-kg__store_knowledge_node",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\kg-summary-generator.ps1",
+            "timeout": 5,
+            "background": true
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Bash(git commit *)",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\post-git-commit-kg-sync.ps1",
+            "timeout": 10,
+            "background": true
+          }
+        ]
+      }
+    ]
+  },
+  "_env_comment": "Set VCT_DISABLE_HOOKS=1 in your shell to opt out of all hooks for that shell (e.g. when debugging). Set it in .vscode/settings.json claude-code.env to disable per-project. Note: the orchestrator's own settings.json wires BASH_ENV to .claude/scripts/leanctx-bash-env.sh \u2014 this template intentionally omits that, since lean-ctx is orchestrator-specific."
+}
