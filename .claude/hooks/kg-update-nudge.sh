@@ -131,6 +131,19 @@ if is_post_tool:
 # when the session genuinely had nothing worth recording.
 session_total = 0
 escape_marker_token_total = 0  # session_total at the time the marker was last seen; 0 if never
+# v8 (2026-05-01): counter is `output_tokens` ONLY, not the previous
+# `input + output + cache_creation` sum. Prior versions over-counted
+# by ~50× because `input_tokens` reports the FULL context window for
+# each turn (prompt-cache rereads), so a long session double-counted
+# the same prefix on every turn. Operators saw 50M+ "tokens" within a
+# few turns and the threshold tripped almost immediately. New signal
+# is the genuinely-produced model output (monotonic, per-turn,
+# cache-independent). Old state files written under v1-v7 have wildly
+# inflated baselines — the hook tolerates them (mismatched baseline
+# just means the counter looks small relative to baseline, so the
+# hook waits) but operators may want to manually drop pre-v8 state
+# entries for active sessions to reset cleanly.
+#
 # v7 (2026-04-30): the escape marker now requires a non-empty reason — the
 # bare `[No KG update needed]` string is no longer accepted. Pattern:
 #   `[No KG update needed: <one-or-more non-empty chars>]`
@@ -155,10 +168,19 @@ if need_total:
                         continue
                     usage = msg.get("usage")
                     if isinstance(usage, dict):
-                        in_tok = int(usage.get("input_tokens") or 0)
+                        # Counter: output_tokens ONLY. Earlier versions
+                        # summed input + output + cache_creation across
+                        # turns, which double-counted massively because
+                        # `input_tokens` reports the FULL context window
+                        # for that turn (prompt-cache rereads). For a
+                        # 16k-turn session that produced an over-count of
+                        # ~7B "tokens" — the threshold tripped within a
+                        # handful of turns and the nudge fired constantly.
+                        # `output_tokens` is the cleanest "work produced"
+                        # signal: monotonic, per-turn, no caching effects.
+                        # 175K output_tokens ≈ 200 turns at avg verbosity.
                         out_tok = int(usage.get("output_tokens") or 0)
-                        cc_tok = int(usage.get("cache_creation_input_tokens") or 0)
-                        session_total += in_tok + out_tok + cc_tok
+                        session_total += out_tok
 
                     # Escape-hatch detection: only inspect assistant
                     # messages, only top-level text content (not
