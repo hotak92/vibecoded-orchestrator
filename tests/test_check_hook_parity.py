@@ -266,3 +266,27 @@ def test_orphan_ps1_without_sh_fails(tmp_path: Path):
     assert result.returncode == 1, result.stdout + result.stderr
     assert "orphan.ps1" in result.stdout
     assert "missing .sh sibling" in result.stdout
+
+
+def test_new_ps1_paired_with_existing_sh_passes(tmp_path: Path):
+    """First-wave .ps1 siblings: a PR that adds a .ps1 paired with a
+    pre-existing unchanged .sh should NOT trigger modification parity.
+
+    This is the common case when a project transitions from .sh-only
+    to .sh + .ps1 — the .sh files are untouched, the .ps1 files are
+    fresh additions. Without this carve-out the whole transition PR
+    fails the gate.
+    """
+    repo = init_repo(tmp_path)
+    write_hook(repo, "templates/hooks/foo.sh")
+    write_hook(repo, "templates/hooks/bar.sh")
+    commit_all(repo, "add .sh hooks on main")
+    make_branch_with_changes(repo)
+    # Add NEW .ps1 siblings; .sh files unchanged.
+    write_hook(repo, "templates/hooks/foo.ps1", "# pwsh\nWrite-Host hi\n")
+    write_hook(repo, "templates/hooks/bar.ps1", "# pwsh\nWrite-Host hi\n")
+    commit_all(repo, "add .ps1 siblings")
+    result = run_script(repo)
+    assert result.returncode == 0, result.stdout + result.stderr
+    # Should NOT contain a "modified without its sibling" message.
+    assert "modified without its sibling" not in result.stdout
