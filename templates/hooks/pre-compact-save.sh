@@ -31,8 +31,21 @@ mkdir -p "$PROJECT_DIR/.claude/context"
     echo ""
 } > "$SNAPSHOT_FILE"
 
-# Generate pruned context summary (gentle — only large stale results)
-python3 "$PROJECT_DIR/.claude/scripts/precompact_prune.py" 2>/dev/null <<< "${CLAUDE_HOOK_STDIN:-{}}" || true
+# Generate pruned activity summary scoped to "since last compact".
+# Pipe the original hook stdin through so the script can read transcript_path.
+# Resolve python interpreter portably (Windows ships python.exe / py.exe,
+# not python3 — see audit finding F6, 2026-04-30).
+PY="$(command -v python3 || command -v python || command -v py)"
+if [ -n "$PY" ] && [ -f "$PROJECT_DIR/.claude/scripts/precompact_prune.py" ]; then
+    HOOK_STDIN="${CLAUDE_HOOK_STDIN:-{}}"
+    echo "$HOOK_STDIN" | "$PY" "$PROJECT_DIR/.claude/scripts/precompact_prune.py" 2>/dev/null || true
+fi
+
+# Update the last-compact marker AFTER the prune script ran (so the next
+# invocation correctly scopes to messages emitted between this compact and
+# the next one). Marker is plain epoch seconds.
+MARKER="$PROJECT_DIR/.claude/context/last-compact-marker"
+date +%s > "$MARKER" 2>/dev/null || true
 
 # Set compact flag for diff-context-inject.sh to reset its baseline
 SNAPSHOT_DIR="${TMPDIR:-/tmp}/claude_ctx_snapshots"
