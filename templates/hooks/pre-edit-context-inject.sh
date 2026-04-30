@@ -24,6 +24,11 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
+# Resolve a Python interpreter portably (python3 → python → py).
+# Used for JSON arg parsing and cross-platform mtime; see audit F4 + F6.
+# shellcheck source=_lib/find-python.sh disable=SC1091
+[ -f "$SCRIPT_DIR/_lib/find-python.sh" ] && . "$SCRIPT_DIR/_lib/find-python.sh"
+
 SESSION_ID="${CLAUDE_SESSION_ID:-default}"
 CACHE_BASE="${TMPDIR:-/tmp}/claude_edit_cache_${SESSION_ID}"
 CACHE_TTL=600  # 10 minutes in seconds
@@ -39,7 +44,8 @@ fi
 # === Extract fields from TOOL_ARGS JSON ===
 _extract_field() {
     local field="$1"
-    python3 -c "
+    [ -z "${PY:-}" ] && { echo ""; return; }
+    "$PY" -c "
 import sys, json
 try:
     d = json.loads(sys.stdin.read())
@@ -65,8 +71,16 @@ CACHE_FILE="$CACHE_DIR/$FILE_HASH"
 mkdir -p "$CACHE_DIR" 2>/dev/null || true
 
 # === Check cache (10 min TTL) ===
+# Use Python for mtime — `stat -c %Y` is GNU-only; macOS BSD stat needs
+# `-f %m`. Without this, every macOS install treats the cache as expired.
+# See audit finding F4. Falls back to 0 if Python is missing.
 if [[ -f "$CACHE_FILE" ]]; then
-    FILE_AGE=$(( $(date +%s) - $(stat -c %Y "$CACHE_FILE" 2>/dev/null || echo 0) ))
+    if [ -n "${PY:-}" ]; then
+        CACHE_MTIME=$("$PY" -c "import os,sys; print(int(os.path.getmtime(sys.argv[1])))" "$CACHE_FILE" 2>/dev/null || echo 0)
+    else
+        CACHE_MTIME=0
+    fi
+    FILE_AGE=$(( $(date +%s) - CACHE_MTIME ))
     if [[ "$FILE_AGE" -lt "$CACHE_TTL" ]]; then
         cat "$CACHE_FILE"
         exit 0
@@ -112,7 +126,12 @@ if [[ "$FILE_PATH" =~ \.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|
     CODE_PID=$!
 fi
 
-# Wait for searches (5s budget, leave 0.5s for formatting + output)
+# Wait for searches (5s budget, leave 0.5s for formatting + output).
+# NOTE (audit F7, P3): Git Bash on Windows occasionally hangs on this
+# `wait <pid>` pattern due to signal-handling differences vs upstream bash.
+# If you hit this, set VCT_DISABLE_HOOKS=1 in your shell to opt out — the
+# only feature lost is the pre-edit context cache (a search-speed
+# optimisation, not correctness).
 wait "$KG_PID" 2>/dev/null || true
 if [[ "$IS_CODE" == "1" ]]; then
     wait "$CODE_PID" 2>/dev/null || true
