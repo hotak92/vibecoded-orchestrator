@@ -1,0 +1,29 @@
+name: Hook OS-Parity Gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  hook-parity:
+    name: Check .sh / .ps1 hook parity
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run parity check
+        env:
+          GITHUB_BASE_REF: ${{ github.base_ref }}
+        run: |
+          python3 .github/scripts/check_hook_parity.py
