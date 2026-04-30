@@ -1,12 +1,12 @@
 # Agents, Skills & Hooks
 
-The Claude Code automation surface: 19 free agents, 10 MAO-tier agents (runtime requires MAO license), 28 skills, and 20 hooks. Templates in `templates/agents/` and `templates/skills/`; hooks in `.claude/hooks/`, registered in `.claude/settings.json`.
+The Claude Code automation surface: 29 bundled agents, 28 skills, and 20 hooks. Templates in `templates/agents/` and `templates/skills/`; hooks in `.claude/hooks/`, registered in `.claude/settings.json`.
 
 For the MCP servers that agents use → see [02-mcps-and-agents.md](02-mcps-and-agents.md).
 
 ---
 
-## Bundled Agents — Free Tier (`templates/agents/free/`)
+## Bundled Agents (`templates/agents/free/`)
 
 Free agents install to `~/.claude/agents/` via `install.py --with-agents` (default-on). Each agent is a single `.md` file with YAML frontmatter: `name`, `description`, `model` (required), plus optional `tools`, `effort`, `isolation`, `skills`, `mcpServers`. The 19 agents below are split roughly into builders (write code), researchers (read & report), and lifecycle helpers (install / migrate / bootstrap).
 
@@ -90,10 +90,6 @@ Migrates an existing Claude Code project onto the Orchestrator workflow.
 
 ---
 
-## Bundled Agents — MAO Tier (`templates/agents/mao/`)
-
-MAO-tier agents target teams running the full MultiagentOrchestrator stack. The template files ship in the OSS bundle for inspection, but they reference the `orchestrator-tools` MCP (Pro-only) — runtime needs a MAO license. Install with `python install.py --with-mao-agents`.
-
 ### `expert-coder` (Opus, `isolation: worktree`)
 Complex implementation work that needs cross-layer architectural reasoning, security analysis, or multi-layer debugging. Use sparingly — Sonnet handles most implementations fine and costs less.
 
@@ -137,7 +133,7 @@ Agents with `isolation: worktree` run in a temporary git worktree (isolated bran
 Agent frontmatter `mcpServers: orchestrator-tools` references `{{ORCHESTRATOR_ROOT}}/claude_mcp_servers/orchestrator_tools_mcp/server.py`. This MCP is a **Pro-tier MAO component** — the implementation is not present in the OSS bundle. Free-tier agents use `weaviate-kg`, `ollama`, and `search` MCPs directly.
 
 ### Graceful degradation behaviour
-Three free-tier agents (`coder`, `tester`, `planner`) reference `orchestrator-tools` in their frontmatter. The OSS bundle does not ship this MCP server. Claude Code silently ignores MCP entries it cannot find on disk, so the agents install and start cleanly — calls to `orchestrator-tools` tools simply fail at runtime, not at install time. The 10 MAO-tier agents in `templates/agents/mao/` follow the same pattern. If you install MAO agents without the Pro module, expect runtime tool-call failures for any `mcp__orchestrator-tools__*` invocation.
+Three agents (`coder`, `tester`, `planner`) reference `orchestrator-tools` in their frontmatter. The OSS bundle does not ship this MCP server. Claude Code silently ignores MCP entries it cannot find on disk, so the agents install and start cleanly — calls to `orchestrator-tools` tools simply fail at runtime, not at install time. Same pattern applies to any agent that references `orchestrator-tools` (MCP not in OSS bundle): installs cleanly, fails at tool-call time only.
 
 ---
 

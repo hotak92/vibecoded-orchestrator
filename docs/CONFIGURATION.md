@@ -64,8 +64,7 @@ VCT_TELEMETRY
 | Project permissions + hooks | `.claude/settings.json` | per-project | install.py + launcher |
 | Secrets (license keys, API tokens) | OS keychain | per-project | launcher GUI only |
 | Hooks scripts | `.claude/hooks/` | per-project | install.py |
-| Project agents | `.claude/agents/` | per-project | install.py (from `templates/agents/free/`) |
-| MAO specialist agents | `.claude/agents/` | per-project | install.py `--with-mao-agents` (MAO license) |
+| Bundled agents | `.claude/agents/` | per-project | installed by default (from `templates/agents/free/`) |
 | Project skills | `.claude/skills/` | per-project | install.py (from `templates/skills/`) |
 | Generic agents (e.g. `code-migrator`) | `~/.claude/agents/` | global | you, optional |
 | Generic skills (e.g. `debug-expert`) | `~/.claude/skills/` | global | you, optional |

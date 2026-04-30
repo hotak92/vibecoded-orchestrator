@@ -48,7 +48,6 @@ These exist but are **not** in the OSS bundle:
 |---|---|---|
 | `coordination` MCP | Team coordination platform with Supabase backend | `hotak92/vct-coordination` (separate repo) |
 | `orchestrator_tools_mcp` | Pro-tier agent tooling MCP | Pro module, not bundled |
-| MAO agents (10) | Multi-agent orchestrator specialist agents | Referenced in `templates/agents/mao/` — runtime requires MAO license |
 | RL reranker | Reinforcement-learning result reranking server | Pro module; MCP falls through cleanly when absent |
 
 ---
