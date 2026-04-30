@@ -5,7 +5,8 @@
 //! `projects.id` so deleting a project wipes its state.
 //!
 //! Secret VALUES never live here — only references. The actual values
-//! are resolved at runtime from `~/.vct-secrets/` or the OS keychain
+//! are resolved at runtime from `~/.vct-secrets/shared/` (Phase 1 layout)
+//! with fallback to legacy flat `~/.vct-secrets/` or the OS keychain
 //! (see `crate::secrets`).
 
 use chrono::Utc;
