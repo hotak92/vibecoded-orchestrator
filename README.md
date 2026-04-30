@@ -210,7 +210,6 @@ python install.py --no-containers     # Skip Docker/Podman (manual setup)
 python install.py --container docker  # Force Docker (default: auto-detect)
 python install.py --no-agents         # Skip installing agent templates
 python install.py --no-skills         # Skip installing skill templates
-python install.py --with-mao-agents   # Install the 10 MAO-tier specialist agents (requires MAO license)
 python install.py --with-joern        # Install Joern for richer code-graph metrics (~600MB JVM)
 python install.py --no-joern          # Skip Joern detection (don't prompt)
 python install.py --skip-models       # Don't pre-pull Ollama models (do it manually later)
@@ -355,8 +354,7 @@ vibecoded-orchestrator/
     search_mcp/          # Web + code + paper search MCP server
     code_embedding_service/   # GPU code embedding service (CodeSage-Large-v2)
   templates/
-    agents/free/         # 19 free-tier agents copied to .claude/agents/ at install time
-    agents/mao/          # 10 MAO-tier specialist agents (opt-in)
+    agents/free/         # 29 bundled agents (all free, copied to .claude/agents/ at install time)
     skills/              # 28 skills copied to .claude/skills/ at install time
   infrastructure/
     docker-compose.yml       # Weaviate + Ollama containers

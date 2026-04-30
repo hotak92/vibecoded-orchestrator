@@ -71,7 +71,6 @@ python3 install.py
 python install.py --gpu               # Enable NVIDIA GPU acceleration
 python install.py --cpu-only          # Force CPU-only mode
 python install.py --low-resource      # Lightest models for low-RAM machines
-python install.py --with-mao-agents   # Install 10 MAO-tier specialist agents (MAO license)
 python install.py --no-containers     # Skip container management (bring your own)
 python install.py --update            # Re-run on an existing install (preserves .env)
 ```

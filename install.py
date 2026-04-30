@@ -1306,11 +1306,9 @@ def main() -> int:
     parser.add_argument("--no-lean-ctx", action="store_true", default=False,
                         help="Skip lean-ctx detection / install / hints (optional CLI-output compression tool).")
     parser.add_argument("--with-agents", action="store_true", default=True,
-                        help="Install free-tier Claude agents (default: on)")
+                        help="Install bundled Claude agents (default: on)")
     parser.add_argument("--no-agents", dest="with_agents", action="store_false",
                         help="Skip installing Claude agents")
-    parser.add_argument("--with-mao-agents", action="store_true",
-                        help="Install MAO-tier specialist agents (requires MAO license)")
     parser.add_argument("--with-skills", action="store_true", default=True,
                         help="Install Claude skills (default: on)")
     parser.add_argument("--no-skills", dest="with_skills", action="store_false",
@@ -4714,8 +4712,7 @@ def _configure_claude_settings(embed_config: dict) -> None:
 def _install_agents_and_skills(args: argparse.Namespace) -> None:
     """Copy agents and skills from templates/ into .claude/, substituting paths.
 
-    Free-tier agents live at templates/agents/free/; MAO-tier at templates/agents/mao/
-    (gated on --with-mao-agents). Skills live at templates/skills/.
+    Bundled agents live at templates/agents/free/. Skills live at templates/skills/.
 
     Placeholder substitutions applied to copied files:
         {{ORCHESTRATOR_ROOT}} → this install directory
@@ -4756,18 +4753,6 @@ def _install_agents_and_skills(args: argparse.Namespace) -> None:
                 _copy_with_subs(agent_file, target)
                 installed_agents += 1
 
-    installed_mao = 0
-    if args.with_mao_agents:
-        agents_dst.mkdir(parents=True, exist_ok=True)
-        mao_src = templates_dir / "agents" / "mao"
-        if mao_src.exists():
-            for agent_file in sorted(mao_src.glob("*.md")):
-                target = agents_dst / agent_file.name
-                if target.exists():
-                    continue
-                _copy_with_subs(agent_file, target)
-                installed_mao += 1
-
     installed_skills = 0
     skipped_skills = 0
     if args.with_skills:
@@ -4794,10 +4779,8 @@ def _install_agents_and_skills(args: argparse.Namespace) -> None:
 
     parts = []
     if args.with_agents:
-        parts.append(f"{installed_agents} free agents"
+        parts.append(f"{installed_agents} agents"
                      + (f" ({skipped_agents} already present)" if skipped_agents else ""))
-    if args.with_mao_agents:
-        parts.append(f"{installed_mao} MAO agents")
     if args.with_skills:
         parts.append(f"{installed_skills} skills"
                      + (f" ({skipped_skills} already present)" if skipped_skills else ""))
