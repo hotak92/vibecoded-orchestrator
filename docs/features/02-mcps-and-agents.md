@@ -88,7 +88,7 @@ Use `search_code_graph` first to discover entity names, then `query_code_structu
 ### `natural_language_code_query`
 Translates a natural language question about code structure into a `query_code_structure` call automatically.
 
-Params: `question` (NL question), `model` (`"claude/haiku"` default | `"ollama/qwen3:0.6b"` etc.), `project`. Use `model="ollama/qwen3:0.6b"` to avoid API costs on the interpretation step.
+Params: `question` (NL question), `model` (`"claude/haiku"` default | `"ollama/qwen3.5:0.8b"` etc.), `project`. Use `model="ollama/qwen3.5:0.8b"` to avoid API costs on the interpretation step.
 
 ### RL Reranking (ambient, opt-in)
 When `RL_SERVER_URL` is reachable, KG search results pass through a reinforcement-learning reranker before being returned. When it's not, free-tier installs see plain cosine-ordered results — no error, no warning. The RL server (`rl_server.py` in MultiagentOrchestrator) is a **Pro-tier component** and is not in the OSS bundle.
@@ -113,14 +113,14 @@ When `RL_SERVER_URL` is reachable, KG search results pass through a reinforcemen
 Local inference and embeddings via Ollama. Everything runs on-device, so the bill for trivial generations (docstring rewrites, classification, summary extraction) is zero. Three tools.
 
 ### `chat`
-Run inference against any Ollama model. Default model: `qwen3:0.6b` (fast, ~50-100 tok/s).
+Run inference against any Ollama model. Default model: `qwen3.5:0.8b` (fast, ~50-100 tok/s).
 
 <details>
 <summary>Details</summary>
 
-Params: `prompt`, `model` (default `qwen3:0.6b`), `system_prompt`, `temperature` (default 0.7), `max_tokens` (default 500). Returns response plus metrics (total_duration_ms, output_tokens, tokens_per_sec). Use for: quick analysis, rewrites, docstring improvements, classification — any task where you'd otherwise burn Claude API tokens on a trivial generation. For complex reasoning, use `qwen3:latest` (8B).
+Params: `prompt`, `model` (default `qwen3.5:0.8b`), `system_prompt`, `temperature` (default 0.7), `max_tokens` (default 500). Returns response plus metrics (total_duration_ms, output_tokens, tokens_per_sec). Use for: quick analysis, rewrites, docstring improvements, classification — any task where you'd otherwise burn Claude API tokens on a trivial generation. For complex reasoning, use `qwen3.5:9b` (8B).
 
-Supported models: `qwen3:0.6b` (fast inference), `qwen3:latest` (8B), `qwen3-coder:latest` (30.5B for code), `devstral:24b` (23.6B), `olmo-3:7b` (7.3B). All free, local.
+Supported models: `qwen3.5:0.8b` (fast inference), `qwen3.5:9b` (8B), `qwen3-coder:latest` (30.5B for code), `devstral:24b` (23.6B), `olmo-3:7b` (7.3B). All free, local.
 
 </details>
 
@@ -130,7 +130,7 @@ Summarize or extract information from a file using a local Ollama model. Handles
 <details>
 <summary>Details</summary>
 
-Params: `file_path` (absolute), `model` (default `qwen3:latest`), `task` (`"summarize"`, `"extract_key_points"`, `"analyze_structure"`, or freeform instruction), `context_lines` (chunk size for large files, default 50).
+Params: `file_path` (absolute), `model` (default `qwen3.5:9b`), `task` (`"summarize"`, `"extract_key_points"`, `"analyze_structure"`, or freeform instruction), `context_lines` (chunk size for large files, default 50).
 
 Files ≤ ~100k chars: processed whole. Larger files: chunked scanning mode activates automatically. All models free, local.
 

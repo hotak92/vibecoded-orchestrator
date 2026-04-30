@@ -320,14 +320,14 @@ You succeed when:
 - **When to use**: Simple tasks, analysis, summarization, info extraction (USE THIS MORE!)
 - **Cost**: FREE (runs locally on port 11435)
 - **Tools**:
-  - `chat(prompt, model, system_prompt, temperature, max_tokens)`: Local inference (qwen3:0.6b is fast!)
+  - `chat(prompt, model, system_prompt, temperature, max_tokens)`: Local inference (qwen3.5:0.8b is fast!)
   - `read_document(file_path, model, task, context_lines)`: Summarize/extract from files; auto-chunked for large files
 - **Models**:
   - `snowflake-arctic-embed2:latest`: Embeddings (1024 dimensions, used internally by KG)
-  - `qwen3:0.6b`: Fast inference (~50-100 tokens/sec, FREE alternative to Claude for simple tasks)
-  - `qwen3:latest`: 8B — better quality for complex analysis
+  - `qwen3.5:0.8b`: Fast inference (~50-100 tokens/sec, FREE alternative to Claude for simple tasks)
+  - `qwen3.5:9b`: 8B — better quality for complex analysis
   - `unclemusclez/jina-embeddings-v2-base-code:latest`: Code embeddings (768 dimensions, used internally by Code Graph)
-- **Example**: `chat("Rewrite this prompt to be clearer: [prompt]", model="qwen3:0.6b")` (FREE, ~2-3s)
+- **Example**: `chat("Rewrite this prompt to be clearer: [prompt]", model="qwen3.5:0.8b")` (FREE, ~2-3s)
 - **Example**: `read_document("/path/to/spec.md", task="extract all API endpoints")` (FREE, handles large files)
 
 ## MCP Usage Rules (IMPORTANT)
@@ -362,14 +362,14 @@ You succeed when:
 1. `hybrid_search("concept")` → Find patterns, architecture decisions, past solutions (Weaviate MCP)
 2. `search_code_graph("purpose", collection="CodeFunction")` → Find similar code implementations (Weaviate MCP)
 3. `query_code_structure("dependencies", "target_module")` → Understand architecture (Weaviate MCP)
-4. `chat("Analyze this approach: [description]", model="qwen3:0.6b")` → Quick validation (Ollama MCP, FREE)
+4. `chat("Analyze this approach: [description]", model="qwen3.5:0.8b")` → Quick validation (Ollama MCP, FREE)
 5. Grep → Find exact strings/names in current codebase (built-in)
 6. Read → Understand specific files in detail (built-in)
 
 **During implementation**:
 1. Edit → Targeted changes to existing files (built-in)
 2. Write → New files or major refactorings (built-in)
-3. `chat("Suggest variable names for [context]", model="qwen3:0.6b")` → Quick naming help (Ollama MCP, FREE)
+3. `chat("Suggest variable names for [context]", model="qwen3.5:0.8b")` → Quick naming help (Ollama MCP, FREE)
 4. Bash → Run tests after changes (built-in)
 
 **After implementation**:
@@ -683,9 +683,9 @@ You succeed when your prompts:
 
 **chat** (local LLM inference, ~1-3s) - Ollama MCP:
 **Usage**: Quick analysis, simple rewording, token counting (FREE, local)
-**Inputs**: prompt, model (qwen3:0.6b for speed), system_prompt (optional)
+**Inputs**: prompt, model (qwen3.5:0.8b for speed), system_prompt (optional)
 **Returns**: Model response with metrics (tokens/sec, duration)
-**Example**: `chat("Rewrite this prompt to be clearer: [prompt]", model="qwen3:0.6b")`
+**Example**: `chat("Rewrite this prompt to be clearer: [prompt]", model="qwen3.5:0.8b")`
 **Why use**: FREE local processing for simple tasks (no API costs)
 
 **read_document** (file analysis, free) - Ollama MCP:

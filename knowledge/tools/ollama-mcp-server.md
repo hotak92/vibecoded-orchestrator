@@ -24,7 +24,7 @@ Shared MCP server providing FREE local document processing and information extra
 
 **Architecture**: Runs as stdio subprocess via Python
 **Port**: Stdio (MCP protocol)
-**Models**: qwen3:0.6b (fast, default for chat), qwen3:latest (8B, default for read_document)
+**Models**: qwen3.5:0.8b (fast, default for chat), qwen3.5:9b (8B, default for read_document)
 
 ## Tools
 
@@ -37,14 +37,14 @@ Local LLM inference — FREE, runs on-device.
 
 **Parameters**:
 - `prompt` (required): The prompt to send
-- `model` (optional): default `qwen3:0.6b` (fast); use `qwen3:latest` (8B) for complex reasoning
+- `model` (optional): default `qwen3.5:0.8b` (fast); use `qwen3.5:9b` (8B) for complex reasoning
 - `system_prompt` (optional): System context
 - `temperature` (optional): Sampling temperature
 - `max_tokens` (optional): Max output tokens
 
 **Example**:
 ```python
-chat("Rewrite this docstring to be clearer: [docstring]", model="qwen3:0.6b")
+chat("Rewrite this docstring to be clearer: [docstring]", model="qwen3.5:0.8b")
 ```
 
 ### read_document
@@ -57,7 +57,7 @@ Summarize or extract specific information from files using local LLM — FREE. A
 
 **Parameters**:
 - `file_path` (required): Absolute path to document
-- `model` (optional): default `qwen3:latest` (8B); use `qwen3:0.6b` for speed
+- `model` (optional): default `qwen3.5:9b` (8B); use `qwen3.5:0.8b` for speed
 - `task` (optional): Processing instruction, e.g.:
   - `"summarize"` (default)
   - `"find the authentication logic"`
@@ -75,13 +75,13 @@ read_document("/path/to/doc.md")  # default: summarize
 
 ## Models
 
-### qwen3:latest (8.2B) - Default
+### qwen3.5:9b (8.2B) - Default
 **Size**: 8.2B parameters
 **Use**: General purpose processing
 **Speed**: ~50 tokens/sec
 **Best For**: Summaries, extraction, general Q&A
 
-### qwen3:0.6b - Fast inference
+### qwen3.5:0.8b - Fast inference
 **Use for**: Simple tasks where speed matters (quick chat, short analysis).
 **Avoid for**: Complex reasoning, long documents.
 
@@ -121,5 +121,5 @@ Restart by reloading Claude Code MCP configuration.
 
 - **2026-03-12**: Consolidated to 2 tools: `chat` + `read_document`. Auto-switches to chunked-scan mode for large files.
 - **2026-01-19**: Enhanced with read_document tool
-- **2026-01-19**: Updated to use correct models (qwen3:latest default)
+- **2026-01-19**: Updated to use correct models (qwen3.5:9b default)
 - **2026-01-14**: Initial implementation

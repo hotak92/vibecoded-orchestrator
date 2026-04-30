@@ -83,7 +83,7 @@ class TokenCounter:
     """
     Token counter with Ollama LLM tokenizer (accurate) and character approximation fallback
 
-    Uses Ollama qwen3:0.6b for accurate token counting when available.
+    Uses Ollama qwen3.5:0.8b for accurate token counting when available.
     Falls back to approximation (1 token ≈ 4 characters) if Ollama unavailable.
     """
 
@@ -101,7 +101,7 @@ class TokenCounter:
 
             try:
                 cls._llm = ChatOllama(
-                    model=os.getenv("TOKENIZER_MODEL", "qwen3:0.6b"),
+                    model=os.getenv("TOKENIZER_MODEL", "qwen3.5:0.8b"),
                     base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11435"),
                     temperature=0
                 )

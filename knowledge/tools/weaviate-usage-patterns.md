@@ -301,7 +301,7 @@ tokens = len(text) // 4  # 1 token ≈ 4 characters
 **Accurate method** (slower, use for critical operations):
 ```python
 from langchain_ollama import ChatOllama
-llm = ChatOllama(model="qwen3:0.6b")
+llm = ChatOllama(model="qwen3.5:0.8b")
 tokens = llm.get_num_tokens(text)
 ```
 

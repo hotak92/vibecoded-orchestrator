@@ -94,7 +94,7 @@ _DEFAULT_VISION_REQUIREMENTS = {"vram_gb": 7.5, "ram_gb": 22.0, "file_gb": 6.0}
 #   2. Else if has_gpu + VRAM fits → GPU.
 #   3. Else if RAM fits → CPU.
 #   4. Else fall through to next (smaller) tier.
-#   5. Smallest tier wins as last resort: qwen3:0.6b fits down to 4 GB
+#   5. Smallest tier wins as last resort: qwen3.5:0.8b fits down to 4 GB
 #      RAM; gemma4:e4b is the preferred 12 GB-RAM summarizer.
 #
 # Gemma4:e4b is the canonical low-RAM summarization fallback — preferred
@@ -119,12 +119,12 @@ TEXT_MODEL_TIERS = [
     ("qwen3.5:4b",     {"vram_gb": 4.0,  "ram_gb": 12.0}),
     # Tiny fallback — always fits down to 4 GB RAM. Weaker reasoning
     # but better than refusing the call.
-    ("qwen3:0.6b",     {"vram_gb": 1.0,  "ram_gb": 4.0}),
+    ("qwen3.5:0.8b",     {"vram_gb": 1.0,  "ram_gb": 4.0}),
 ]
 
 # VRAM threshold (GB) above which we ALWAYS use GPU and never fall
 # back to a smaller tier on CPU. A 16 GB-VRAM card can comfortably hold
-# qwen3:latest with full KV cache, so there's no reason to prefer a
+# qwen3.5:9b with full KV cache, so there's no reason to prefer a
 # smaller model just because RAM is tight. Workstation-class GPUs
 # should always shoulder the load.
 GPU_FORCE_VRAM_THRESHOLD_GB = 16.0
@@ -135,12 +135,12 @@ def _select_text_model(capability: dict) -> str:
 
     Used when a tool was called with `model="auto"`. Returns the bare
     model name (e.g. "gemma4:e4b"). Always returns SOMETHING — the
-    smallest tier (qwen3:0.6b) fits everything down to 4 GB RAM.
+    smallest tier (qwen3.5:0.8b) fits everything down to 4 GB RAM.
 
     Selection rule: 16+ GB VRAM workstation always uses the heaviest
     GPU-fit tier. Smaller GPUs use the heaviest tier they can fit;
     CPU-only hosts fall through to RAM-fit tiers; tight machines land
-    on Gemma4:e4b (or qwen3:0.6b if even that doesn't fit).
+    on Gemma4:e4b (or qwen3.5:0.8b if even that doesn't fit).
     """
     vram = capability.get("vram_gb") or 0.0
     ram = capability.get("ram_gb") or 0.0
@@ -434,7 +434,7 @@ mcp = FastMCP(
         "Use read_document() to summarize or extract specific information from files locally. "
         "For large files (>100k chars), read_document automatically switches to chunked scanning mode. "
         "Use read_image() to load image files — returns base64 for Claude's vision + optional local description. "
-        "Default model: qwen3:0.6b (fast). For complex reasoning: qwen3:latest (8B)."
+        "Default model: qwen3.5:0.8b (fast). For complex reasoning: qwen3.5:9b (8B)."
     )
 )
 
@@ -445,7 +445,7 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11435")
 @mcp.tool()
 def chat(
     prompt: str,
-    model: str = "qwen3:0.6b",
+    model: str = "qwen3.5:0.8b",
     system_prompt: Optional[str] = None,
     temperature: float = 0.7,
     max_tokens: int = 500
@@ -455,7 +455,7 @@ def chat(
 
     Args:
         prompt: User prompt
-        model: Model to use (default: qwen3:0.6b for fast inference)
+        model: Model to use (default: qwen3.5:0.8b for fast inference)
         system_prompt: Optional system prompt
         temperature: Sampling temperature 0.0-1.0 (default: 0.7)
         max_tokens: Maximum tokens to generate (default: 500)
@@ -536,9 +536,9 @@ def read_document(
         file_path: Absolute path to the document (txt, md, py, json, etc.)
         model: Ollama model. Default `"auto"` picks the heaviest model that
                fits this host (qwen3.5:9b on 24+ GB or 7.5+ GB VRAM,
-               gemma4:e4b on 12-24 GB RAM, qwen3:0.6b as the always-fits
+               gemma4:e4b on 12-24 GB RAM, qwen3.5:0.8b as the always-fits
                fallback). 16+ GB VRAM workstations always run on GPU.
-               Override explicitly: qwen3.5:9b, gemma4:e4b, qwen3:latest
+               Override explicitly: qwen3.5:9b, gemma4:e4b, qwen3.5:9b
                [8B], qwen3-coder:latest [30.5B code], devstral:24b
                [23.6B code], olmo-3:7b [7.3B faster]. Memory-aware
                default added 2026-04-28 after a 16 GB user OOMed
@@ -560,7 +560,7 @@ def read_document(
     """
     # Resolve "auto" to a tier-appropriate model based on detected
     # host capability (RAM/VRAM). Picks qwen3.5:9b on workstations,
-    # gemma4:e4b on 12-24 GB RAM, qwen3:0.6b as the always-fits
+    # gemma4:e4b on 12-24 GB RAM, qwen3.5:0.8b as the always-fits
     # fallback. Re-resolves per call so swapping hardware (or freeing
     # RAM) takes effect without restarting the MCP server.
     if model == "auto":
@@ -570,7 +570,7 @@ def read_document(
         except Exception:
             # If capability probe fails, fall back to the smallest model
             # — never refuse the call.
-            model = "qwen3:0.6b"
+            model = "qwen3.5:0.8b"
 
     try:
         path = Path(file_path)

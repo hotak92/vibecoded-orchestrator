@@ -233,7 +233,7 @@ Summary:"""
         response = requests.post(
             f"{OLLAMA_URL}/api/generate",
             json={
-                "model": "qwen3:latest",
+                "model": "qwen3.5:9b",
                 "prompt": prompt,
                 "stream": False,
                 "options": {

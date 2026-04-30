@@ -131,7 +131,7 @@ These four persistence layers exist for a reason — future-you, future-agents, 
 - `read_image(file_path, max_total_pixels, describe, vision_model, description_prompt)` — Read an image as a base64 data URL Claude can see directly. Optionally get a local text description from a vision model (default `qwen3.5:9b`, unified text+vision; no separate `-vl` tag needed). Auto-resizes images to fit within `max_total_pixels` (default 1,048,576 ≈ 1024×1024) to bound VRAM during local inference. Supports PNG, JPEG, GIF, WebP, BMP, TIFF, SVG.
   - **Memory-aware gating**: the description tier auto-skips if neither GPU VRAM nor system RAM is sufficient (image base64 is still returned for Claude's own vision). Auto-swaps to a smaller installed VLM when the requested model doesn't fit but a smaller one does. Per-model thresholds: `qwen3.5:9b` ≥7.5 GB VRAM / 12 GB RAM; `qwen3.5:7b` ≥6 / 10; `qwen3.5:4b` ≥4 / 7; `llama3.2-vision:11b` ≥9 / 16; `gemma3:4b` ≥5 / 8. Override default with `OLLAMA_VISION_MODEL` env var.
   - **Tiered resize budget**: `max_total_pixels` is an UPPER bound and is auto-clamped on tight hardware (1024² → 720² → 512² → 256²) based on free VRAM (or RAM in CPU mode). The clamp is reported as `image_budget_clamped_from`.
-- Models: `qwen3:0.6b` (fast inference), `qwen3:latest` (8B), `qwen3-embedding:0.6b` (text embeddings), `qwen3.5:9b` (text + vision).
+- Models: `qwen3.5:0.8b` (fast inference), `qwen3-embedding:0.6b` (text embeddings, 1024-dim), `qwen3.5:9b` (text + vision, used by `read_image` and as the larger reasoning model).
 - Use when: simple analysis, rewrites, summarizing files, reading images (all FREE).
 - Roadmap: a heavier `image_interpretation_mcp` (object detection, OCR, table extraction via YOLO / Donut / GOT-OCR2) is in design; ships post-1.0 if user demand materializes. Today's `read_image` covers the common case.
 
@@ -264,8 +264,8 @@ PowerShell variants (`*.ps1`) ship for Windows users.
 - **Purpose**: FREE local inference and embeddings (internal use).
 - **Models**:
   - `qwen3-embedding:0.6b` — text embeddings (1024 dim, primary; needs `num_ctx=8192`)
-  - `qwen3:0.6b` — fast inference (~50–100 tok/s)
-  - `qwen3:latest` — 8B inference for document processing
+  - `qwen3.5:0.8b` — fast inference (~50–100 tok/s)
+  - `qwen3.5:9b` — larger inference model (9B, used for document processing + read_image vision)
 - **Access**: Ollama MCP tools (`chat`, `read_document`).
 - **Cost**: FREE (runs locally).
 
@@ -596,7 +596,7 @@ hybrid_search("code graph collections schema")      # What does KG say about thi
 ```python
 # WRONG: use Claude API for simple task (wastes tokens)
 # CORRECT: use Ollama MCP (FREE)
-chat("Rewrite this docstring to be clearer: [docstring]", model="qwen3:0.6b")
+chat("Rewrite this docstring to be clearer: [docstring]", model="qwen3.5:0.8b")
 read_document("/path/to/large_file.py", task="find the authentication logic")  # Extract from file, FREE
 ```
 
@@ -610,7 +610,7 @@ read_document("/path/to/large_file.py", task="find the authentication logic")  #
 - Analyze code: `.claude/scripts/code-graph-analyze . --project "MyProject"`.
 - Search code: `.claude/scripts/code-graph-query search "pattern"`.
 - Search knowledge: `hybrid_search("concept")` (Weaviate MCP).
-- Quick analysis (FREE): `chat("prompt", model="qwen3:0.6b")` (Ollama MCP).
+- Quick analysis (FREE): `chat("prompt", model="qwen3.5:0.8b")` (Ollama MCP).
 - MCP venv: `source claude_mcp_servers/.venv/bin/activate`.
 - Active plans: `.claude/context/plans/`.
 - Tag hierarchy: `knowledge/TAG_HIERARCHY.md`.
@@ -620,7 +620,7 @@ read_document("/path/to/large_file.py", task="find the authentication logic")  #
 - Fix from PR: `claude --from-pr <PR-URL>`.
 
 **Default ports**: Weaviate `8081` (HTTP) / `50052` (gRPC), Ollama `11435`, code-embed service `11440` (optional GPU).
-**Default models**: text embeddings `qwen3-embedding:0.6b` (1024-dim), code embeddings CodeSage-Large-v2 (2048-dim, GPU) / `qwen3-embedding:0.6b` (CPU fallback), inference `qwen3:0.6b` / `qwen3:latest`.
+**Default models**: text embeddings `qwen3-embedding:0.6b` (1024-dim), code embeddings CodeSage-Large-v2 (2048-dim, GPU) / `qwen3-embedding:0.6b` (CPU fallback), inference `qwen3.5:0.8b` / `qwen3.5:9b`.
 
 ---
 

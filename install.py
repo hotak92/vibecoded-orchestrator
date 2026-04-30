@@ -122,7 +122,7 @@ EMBEDDING_CONFIGS = {
         "code_backend": "gpu",
         "code_model": "codesage-large-v2",
         "code_dims": 2048,
-        "ollama_models": ["qwen3-embedding:0.6b", "qwen3:0.6b"],
+        "ollama_models": ["qwen3-embedding:0.6b", "qwen3.5:0.8b"],
         "description": "GPU-accelerated (qwen3 text + CodeSage code, best quality)",
     },
     "cpu": {
@@ -134,7 +134,7 @@ EMBEDDING_CONFIGS = {
         "ollama_models": [
             "qwen3-embedding:0.6b",
             "unclemusclez/jina-embeddings-v2-base-code:latest",
-            "qwen3:0.6b",
+            "qwen3.5:0.8b",
         ],
         "description": "CPU-only (qwen3 text + Jina V2 code, both via Ollama)",
     },
@@ -144,7 +144,7 @@ EMBEDDING_CONFIGS = {
         "code_backend": "openai",
         "code_model": "text-embedding-3-small",
         "code_dims": 1536,
-        "ollama_models": ["qwen3:0.6b"],  # still need inference model
+        "ollama_models": ["qwen3.5:0.8b"],  # still need inference model
         "description": "OpenAI API (fastest, requires API key)",
     },
     # Lightest mode for low-RAM / low-VRAM machines.
@@ -161,7 +161,7 @@ EMBEDDING_CONFIGS = {
         "ollama_models": [
             "snowflake-arctic-embed2:latest",
             "unclemusclez/jina-embeddings-v2-base-code:latest",
-            "qwen3:0.6b",
+            "qwen3.5:0.8b",
         ],
         "description": "Low-resource (Arctic text + Jina V2 code, both via Ollama)",
     },
@@ -3075,7 +3075,7 @@ def _probe_service_identity(name: str, port: int) -> tuple[str, str]:
             vct_markers = {"qwen3-embedding:0.6b",
                            "snowflake-arctic-embed2:latest",
                            "unclemusclez/jina-embeddings-v2-base-code:latest",
-                           "qwen3:0.6b"}
+                           "qwen3.5:0.8b"}
             if model_names & vct_markers:
                 return PROBE_VCT_MANAGED, f"ollama has vct models: {sorted(model_names & vct_markers)}"
             return PROBE_FOREIGN, f"ollama alive at {base} (models: {sorted(model_names)[:3] or 'none'})"
