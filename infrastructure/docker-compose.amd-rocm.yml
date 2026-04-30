@@ -1,0 +1,43 @@
+# AMD ROCm overlay — apply with:
+#   docker compose -f docker-compose.yml -f docker-compose.amd-rocm.yml --profile gpu up -d
+#
+# Requires:
+#   - ROCm kernel driver loaded on host (`rocm-smi` returns 0)
+#   - Host user in `video` and `render` groups (Linux): the container
+#     needs read access to /dev/kfd and /dev/dri to talk to the GPU.
+#   - Ollama ROCm image. Pinned to the same upstream version family as
+#     the base compose.yaml's CPU/CUDA image so the daemon protocol
+#     stays in sync. Bump deliberately when the base image is bumped.
+#
+# Authoritative reference: Ollama's official Docker docs
+#   https://github.com/ollama/ollama/blob/main/docs/docker.md  (AMD GPU section)
+#   https://hub.docker.com/r/ollama/ollama  (rocm tag)
+#
+# We deliberately drop the NVIDIA `deploy.resources.reservations.devices`
+# block from the GPU overlay — the two are mutually exclusive. If a host
+# has both NVIDIA and AMD silicon, install.py picks NVIDIA first (since
+# nvidia-smi is probed before rocm-smi).
+
+services:
+  ollama:
+    image: docker.io/ollama/ollama:0.20.2-rocm
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    # Group access for the GPU device files. Names are resolved by the
+    # container runtime against the host's /etc/group at start time.
+    # Numeric GIDs would be more portable but vary by distribution
+    # (Ubuntu video=44, Fedora video=39, etc.) — group names are what
+    # the upstream Ollama docs use.
+    group_add:
+      - video
+      - render
+    # No `deploy.resources.reservations.devices` here — that block is
+    # NVIDIA-only and would conflict with the device passthrough above.
+
+  # code_embed has no ROCm build path today (CodeSage runs on CUDA or
+  # CPU only). AMD users get the Ollama-based code embedding fallback
+  # (jina-v2-base-code) automatically when install.py picks the "cpu"
+  # embedding profile, which is the right behaviour until we either
+  # ship a ROCm-built code_embed image or upstream sentence-transformers
+  # picks up ROCm wheels.
