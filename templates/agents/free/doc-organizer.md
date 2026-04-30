@@ -196,16 +196,21 @@ Bash for f in docs/old-*.md; do mv "$f" ".claude/context/archive/2026-01-28_$(ba
 
 **Scan structure** (parallel operations):
 ```bash
-# Check file counts
+# Check file counts (these run under bash on Linux/macOS and Git Bash on
+# Windows). For a portable equivalent that runs anywhere Python is installed,
+# use the Python one-liners after each Bash example.
 Bash find knowledge/ -type f -name "*.md" | wc -l
 Bash find docs/ -type f -name "*.md" | wc -l
-Bash ls -la *.md 2>/dev/null | wc -l  # Root files
+Bash find . -maxdepth 1 -type f -name "*.md" | wc -l   # root .md files (cross-platform via find)
+
+# Cross-platform alternative for the count above:
+# Bash python3 -c "from pathlib import Path; print(sum(1 for _ in Path('.').glob('*.md')))"
 
 # Find loose files (not in subdirectories)
 Bash find knowledge/ -maxdepth 1 -type f -name "*.md"
 Bash find docs/ -maxdepth 1 -type f -name "*.md"
 
-# Check for old files
+# Check for old files (Linux/macOS find supports -mtime; Git Bash does too)
 Bash find knowledge/ docs/ -name "*.md" -mtime +30 -ls
 ```
 
@@ -346,8 +351,13 @@ Bash mv docs/old-architecture.md .claude/context/archive/2026-01-28_old-architec
 
 **Check root directory**:
 ```bash
-# Should be <10 non-essential files
-Bash ls -la *.md 2>/dev/null | wc -l
+# Should be <10 non-essential files. Use `find` (works under bash on
+# Linux/macOS and Git Bash on Windows); on native Windows shells use the
+# Python fallback below.
+Bash find . -maxdepth 1 -type f -name "*.md" | wc -l
+
+# Cross-platform (no shell required beyond Python):
+# Bash python3 -c "from pathlib import Path; print(sum(1 for _ in Path('.').glob('*.md')))"
 
 # Essential root files OK:
 # - README.md
