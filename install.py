@@ -117,7 +117,7 @@ DEFAULT_CODE_EMBED_PORT = 11440
 # That is the single source of truth — do not re-declare chunk sizes here.
 # Each profile keeps its own static `embedding_models` — these are the
 # Ollama-served embedding models that MUST be pulled regardless of
-# hardware. Inference models (qwen3.5:9b, gemma4:e4b, qwen3:0.6b) are
+# hardware. Inference models (qwen3.5:9b, gemma4:e4b, qwen3.5:0.8b) are
 # layered on at install time by `_inference_models_for_capability` based
 # on detected VRAM/RAM, then merged with `embedding_models` to form the
 # final pull list. See _build_ollama_pull_list().
@@ -174,7 +174,8 @@ EMBEDDING_CONFIGS = {
             "unclemusclez/jina-embeddings-v2-base-code:latest",
         ],
         # Hard-cap inference models for this profile — user opted in.
-        "inference_models_override": ["gemma4:e4b", "qwen3:0.6b"],
+        # qwen3.5:0.8b is the canonical always-fits floor on main.
+        "inference_models_override": ["gemma4:e4b", "qwen3.5:0.8b"],
         "description": "Low-resource (Arctic text + Jina V2 code, both via Ollama)",
     },
 }
@@ -2089,27 +2090,27 @@ def _probe_system_ram_gb() -> float:
 # isn't installed and falling back unexpectedly.
 #
 # Ladder (matches runtime exactly as of 2026-04-29):
-#   GPU + VRAM >= 7.5 GB         → qwen3.5:9b + gemma4:e4b + qwen3:0.6b
-#   GPU + VRAM >= 5.0 GB         → gemma4:e4b + qwen3:0.6b
-#   GPU + VRAM >= 1.0 GB         → qwen3:0.6b
-#   no GPU + RAM >= 24 GB        → qwen3.5:9b + gemma4:e4b + qwen3:0.6b
-#   no GPU + RAM >= 12 GB        → gemma4:e4b + qwen3:0.6b
-#   else (incl. probe failures)  → qwen3:0.6b  (always-fits floor)
+#   GPU + VRAM >= 7.5 GB         → qwen3.5:9b + gemma4:e4b + qwen3.5:0.8b
+#   GPU + VRAM >= 5.0 GB         → gemma4:e4b + qwen3.5:0.8b
+#   GPU + VRAM >= 1.0 GB         → qwen3.5:0.8b
+#   no GPU + RAM >= 24 GB        → qwen3.5:9b + gemma4:e4b + qwen3.5:0.8b
+#   no GPU + RAM >= 12 GB        → gemma4:e4b + qwen3.5:0.8b
+#   else (incl. probe failures)  → qwen3.5:0.8b  (always-fits floor)
 def _inference_models_for_capability(sysinfo: SystemInfo) -> list[str]:
     """Return inference models to pull given detected capability.
 
-    Returns at minimum ["qwen3:0.6b"] — the floor that fits down to 4 GB
+    Returns at minimum ["qwen3.5:0.8b"] — the floor that fits down to 4 GB
     RAM. Larger tiers are added only when the host can actually run them.
     """
-    floor = ["qwen3:0.6b"]
+    floor = ["qwen3.5:0.8b"]
     has_gpu = bool(sysinfo.has_gpu)
     vram = float(sysinfo.vram_gb or 0.0)
     ram = float(sysinfo.ram_gb or 0.0)
 
     if has_gpu and vram >= 7.5:
-        return ["qwen3.5:9b", "gemma4:e4b", "qwen3:0.6b"]
+        return ["qwen3.5:9b", "gemma4:e4b", "qwen3.5:0.8b"]
     if has_gpu and vram >= 5.0:
-        return ["gemma4:e4b", "qwen3:0.6b"]
+        return ["gemma4:e4b", "qwen3.5:0.8b"]
     if has_gpu and vram >= 1.0:
         # Tiny GPU (<5 GB VRAM, e.g. older laptop dGPU) — trust GPU
         # presence but only pull the floor model. Anything larger
@@ -2117,9 +2118,9 @@ def _inference_models_for_capability(sysinfo: SystemInfo) -> list[str]:
         return floor
     # CPU-only paths — RAM-driven.
     if ram >= 24.0:
-        return ["qwen3.5:9b", "gemma4:e4b", "qwen3:0.6b"]
+        return ["qwen3.5:9b", "gemma4:e4b", "qwen3.5:0.8b"]
     if ram >= 12.0:
-        return ["gemma4:e4b", "qwen3:0.6b"]
+        return ["gemma4:e4b", "qwen3.5:0.8b"]
     return floor
 
 
@@ -3302,7 +3303,7 @@ def _probe_service_identity(name: str, port: int) -> tuple[str, str]:
             vct_markers = {"qwen3-embedding:0.6b",
                            "snowflake-arctic-embed2:latest",
                            "unclemusclez/jina-embeddings-v2-base-code:latest",
-                           "qwen3:0.6b"}
+                           "qwen3.5:0.8b"}
             if model_names & vct_markers:
                 return PROBE_VCT_MANAGED, f"ollama has vct models: {sorted(model_names & vct_markers)}"
             return PROBE_FOREIGN, f"ollama alive at {base} (models: {sorted(model_names)[:3] or 'none'})"
