@@ -77,6 +77,11 @@
             "type": "command",
             "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/compact-context-reinject.sh",
             "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/kg-update-nudge.sh",
+            "timeout": 4
           }
         ]
       }
