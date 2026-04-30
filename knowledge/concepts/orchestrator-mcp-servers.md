@@ -101,19 +101,19 @@ Structural queries without reading source files. `path` type uses BFS (max depth
 ```python
 chat(
     prompt: str,
-    model: str = "qwen3:0.6b",
+    model: str = "qwen3.5:9b",
     system_prompt: str = None,
     temperature: float = 0.7,
     max_tokens: int = 2048
 )
 ```
-Direct inference via Ollama API. Common models: `qwen3:0.6b` (fast), `qwen3:latest` (8B, better reasoning), [[Qwen3.5]] family for vision + text.
+Direct inference via Ollama API. Default model: `qwen3.5:9b` (text + vision). For fast summarization on low-power machines: `gemma4:e4b`, [[Qwen3.5]] family for vision + text.
 
 ### read_document
 ```python
 read_document(
     file_path: str,
-    model: str = "qwen3:latest",
+    model: str = "qwen3.5:9b",
     task: str = "summarize",
     context_lines: int = 50
 )

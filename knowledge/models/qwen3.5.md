@@ -31,7 +31,7 @@ VRAM figures are approximate practical floors at default quantization with a sma
 
 - **Default vision model**: `claude_mcp_servers/ollama_mcp/server.py` defaults `OLLAMA_VISION_MODEL` to `qwen3.5:9b` for `read_image` and document-page description. The same checkpoint serves text inference.
 - **Memory-aware gating**: the Ollama MCP carries a `VISION_MODEL_REQUIREMENTS` table for `qwen3.5:0.8b/2b/4b/7b/9b` and refuses to load a variant that does not fit the host's free VRAM/RAM, falling back to a smaller variant or returning a structured error.
-- **Install bootstrap**: `install.py` does not pull Qwen3.5 by default — it ships the embedding models and `qwen3:0.6b` for fast local inference, leaving the user to pull the larger Qwen3.5 variant matching their hardware (`ollama pull qwen3.5:9b`).
+- **Install bootstrap**: `install.py` does not pull Qwen3.5 by default — it ships the embedding model + `qwen3.5:9b` (default inference + vision) + `gemma4:e4b` (fast summarization on low-power machines) (`ollama pull qwen3.5:9b`).
 
 ## Why this model
 

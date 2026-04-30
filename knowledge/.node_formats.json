@@ -354,8 +354,8 @@
   },
   "knowledge/tools/ollama-mcp-server.md": {
     "title": "Ollama MCP Server",
-    "description": "The Ollama MCP Server is a FastMCP-based local LLM inference tool providing FREE document processing without consuming Claude API tokens. It provides `chat` for inference (qwen3:0.6b by default, qwen3:latest for reasoning) and `read_document` for summarization/extraction, with automatic chunking for large files (>100K chars). The server runs as a stdio subprocess and returns JSON responses including processing results, tokens/second, and execution time. Use it to save API tokens on quick analysis, rewrites, and extraction tasks while keeping documents local; trade reasoning capability for speed and cost.",
-    "summary": "FastMCP-based server providing FREE local LLM inference through Ollama (qwen3:0.6b/8B models) with two tools: `chat()` for quick analysis/rewrites and `read_document()` for file summarization that auto-switches to chunked scanning for files >100K characters, eliminating Claude API token consumption for document processing.",
+    "description": "The Ollama MCP Server is a FastMCP-based local LLM inference tool providing FREE document processing without consuming Claude API tokens. It provides `chat` for inference (qwen3.5:0.8b by default, qwen3.5:9b for reasoning) and `read_document` for summarization/extraction, with automatic chunking for large files (>100K chars). The server runs as a stdio subprocess and returns JSON responses including processing results, tokens/second, and execution time. Use it to save API tokens on quick analysis, rewrites, and extraction tasks while keeping documents local; trade reasoning capability for speed and cost.",
+    "summary": "FastMCP-based server providing FREE local LLM inference through Ollama (qwen3.5:0.8b/8B models) with two tools: `chat()` for quick analysis/rewrites and `read_document()` for file summarization that auto-switches to chunked scanning for files >100K characters, eliminating Claude API token consumption for document processing.",
     "generated_at": "2026-04-27T03:23:22.953745+00:00",
     "content_hash": "262ef6588c5989fc",
     "backend": "cli"

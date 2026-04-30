@@ -122,7 +122,17 @@ EMBEDDING_CONFIGS = {
         "code_backend": "gpu",
         "code_model": "codesage-large-v2",
         "code_dims": 2048,
-        "ollama_models": ["qwen3-embedding:0.6b", "qwen3:0.6b"],
+        # Inference + summarization: pull the canonical tier ladder so
+        # _select_text_model() in ollama_mcp/server.py has real models
+        # to choose from at runtime. qwen3.5:9b is the workstation default
+        # (text + vision + summarization); gemma4:e4b is the 12-18 GB RAM
+        # summarizer fallback; qwen3.5:0.8b is the always-fits safety net.
+        "ollama_models": [
+            "qwen3-embedding:0.6b",
+            "qwen3.5:9b",
+            "gemma4:e4b",
+            "qwen3.5:0.8b",
+        ],
         "description": "GPU-accelerated (qwen3 text + CodeSage code, best quality)",
     },
     "cpu": {
@@ -134,7 +144,9 @@ EMBEDDING_CONFIGS = {
         "ollama_models": [
             "qwen3-embedding:0.6b",
             "unclemusclez/jina-embeddings-v2-base-code:latest",
-            "qwen3:0.6b",
+            "qwen3.5:9b",
+            "gemma4:e4b",
+            "qwen3.5:0.8b",
         ],
         "description": "CPU-only (qwen3 text + Jina V2 code, both via Ollama)",
     },
@@ -144,7 +156,13 @@ EMBEDDING_CONFIGS = {
         "code_backend": "openai",
         "code_model": "text-embedding-3-small",
         "code_dims": 1536,
-        "ollama_models": ["qwen3:0.6b"],  # still need inference model
+        # Inference: same canonical tier ladder, even with OpenAI embeddings —
+        # users still want local inference for FREE chat/read_document.
+        "ollama_models": [
+            "qwen3.5:9b",
+            "gemma4:e4b",
+            "qwen3.5:0.8b",
+        ],
         "description": "OpenAI API (fastest, requires API key)",
     },
     # Lightest mode for low-RAM / low-VRAM machines.
@@ -158,10 +176,13 @@ EMBEDDING_CONFIGS = {
         "code_backend": "ollama",
         "code_model": "unclemusclez/jina-embeddings-v2-base-code:latest",
         "code_dims": 768,
+        # No qwen3.5:9b on low-resource (6.6 GB doesn't fit comfortably);
+        # gemma4:e4b is the canonical 12 GB summarizer.
         "ollama_models": [
             "snowflake-arctic-embed2:latest",
             "unclemusclez/jina-embeddings-v2-base-code:latest",
-            "qwen3:0.6b",
+            "gemma4:e4b",
+            "qwen3.5:0.8b",
         ],
         "description": "Low-resource (Arctic text + Jina V2 code, both via Ollama)",
     },
@@ -3075,7 +3096,7 @@ def _probe_service_identity(name: str, port: int) -> tuple[str, str]:
             vct_markers = {"qwen3-embedding:0.6b",
                            "snowflake-arctic-embed2:latest",
                            "unclemusclez/jina-embeddings-v2-base-code:latest",
-                           "qwen3:0.6b"}
+                           "qwen3.5:0.8b"}
             if model_names & vct_markers:
                 return PROBE_VCT_MANAGED, f"ollama has vct models: {sorted(model_names & vct_markers)}"
             return PROBE_FOREIGN, f"ollama alive at {base} (models: {sorted(model_names)[:3] or 'none'})"

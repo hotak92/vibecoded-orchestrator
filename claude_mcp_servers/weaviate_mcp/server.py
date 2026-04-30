@@ -892,14 +892,14 @@ async def _get_search_vector(text: str, scheme: str = "kg") -> tuple[list[float]
 
 async def count_tokens_async(text: str) -> int:
     """
-    Count tokens using Ollama qwen3:0.6b tokenizer.
+    Count tokens using Ollama qwen3.5:0.8b tokenizer.
     Falls back to character approximation (len // 4) if Ollama is unavailable.
     """
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 f"{OLLAMA_URL}/api/tokenize",
-                json={"model": "qwen3:0.6b", "content": text},
+                json={"model": "qwen3.5:0.8b", "content": text},
                 timeout=aiohttp.ClientTimeout(total=10)
             ) as response:
                 if response.status == 200:
@@ -2989,8 +2989,8 @@ async def nl_code_query(
 
     Args:
         question: Natural language question about code structure
-        model: Model to use for NL interpretation. Format: "claude/haiku", "ollama/qwen3:0.6b",
-               "ollama/qwen3:latest". Default: "claude/haiku" (uses ANTHROPIC_API_KEY env var).
+        model: Model to use for NL interpretation. Format: "claude/haiku", "ollama/qwen3.5:0.8b",
+               "ollama/qwen3.5:9b". Default: "claude/haiku" (uses ANTHROPIC_API_KEY env var).
                Ollama models are free and run locally.
         project: Optional project name filter (same as query_code_structure)
     """
