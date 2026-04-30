@@ -108,8 +108,15 @@ if is_post_tool:
 # Skip the costly scan on PostToolUse if it's a KG-write (we just need to
 # reset and don't actually need the current total).
 session_total = 0
-need_total = is_user_prompt or (is_post_tool and not is_knowledge_update)
-if need_total and transcript_path and os.path.exists(transcript_path):
+# v4 (2026-04-30): always scan when a transcript is available. v3 tried
+# to skip the scan on KG-write events (assuming we'd just reset
+# baseline), but that left baseline at 0 because last_seen_total
+# wasn't kept fresh between events. Result: KG-writes appeared not to
+# reset the counter at all in long sessions. Scanning unconditionally
+# (~0.65s on 168 MB transcripts) is cheap; baseline now reflects the
+# real cumulative-tokens-at-write-time.
+need_total = bool(transcript_path) and os.path.exists(transcript_path)
+if need_total:
     try:
         size = os.path.getsize(transcript_path)
         if size < 256 * 1024 * 1024:
