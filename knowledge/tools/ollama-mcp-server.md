@@ -24,7 +24,7 @@ Shared MCP server providing FREE local document processing and information extra
 
 **Architecture**: Runs as stdio subprocess via Python
 **Port**: Stdio (MCP protocol)
-**Models**: qwen3.5:0.8b (fast, default for chat), qwen3.5:9b (8B, default for read_document)
+**Models**: qwen3.5:9b (text + vision, default for chat and read_document); gemma4:e4b (fast summarization for low-power machines)
 
 ## Tools
 
@@ -37,14 +37,14 @@ Local LLM inference — FREE, runs on-device.
 
 **Parameters**:
 - `prompt` (required): The prompt to send
-- `model` (optional): default `qwen3.5:0.8b` (fast); use `qwen3.5:9b` (8B) for complex reasoning
+- `model` (optional): default `qwen3.5:9b` (text + vision); `gemma4:e4b` for fast summarization on low-power
 - `system_prompt` (optional): System context
 - `temperature` (optional): Sampling temperature
 - `max_tokens` (optional): Max output tokens
 
 **Example**:
 ```python
-chat("Rewrite this docstring to be clearer: [docstring]", model="qwen3.5:0.8b")
+chat("Rewrite this docstring to be clearer: [docstring]", model="gemma4:e4b")
 ```
 
 ### read_document
@@ -57,7 +57,7 @@ Summarize or extract specific information from files using local LLM — FREE. A
 
 **Parameters**:
 - `file_path` (required): Absolute path to document
-- `model` (optional): default `qwen3.5:9b` (8B); use `qwen3.5:0.8b` for speed
+- `model` (optional): default `qwen3.5:9b`; `gemma4:e4b` for fast summarization on low-power
 - `task` (optional): Processing instruction, e.g.:
   - `"summarize"` (default)
   - `"find the authentication logic"`
@@ -81,7 +81,7 @@ read_document("/path/to/doc.md")  # default: summarize
 **Speed**: ~50 tokens/sec
 **Best For**: Summaries, extraction, general Q&A
 
-### qwen3.5:0.8b - Fast inference
+### gemma4:e4b - Fast inference + summarization (low-power)
 **Use for**: Simple tasks where speed matters (quick chat, short analysis).
 **Avoid for**: Complex reasoning, long documents.
 

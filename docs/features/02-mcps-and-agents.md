@@ -88,7 +88,7 @@ Use `search_code_graph` first to discover entity names, then `query_code_structu
 ### `natural_language_code_query`
 Translates a natural language question about code structure into a `query_code_structure` call automatically.
 
-Params: `question` (NL question), `model` (`"claude/haiku"` default | `"ollama/qwen3.5:0.8b"` etc.), `project`. Use `model="ollama/qwen3.5:0.8b"` to avoid API costs on the interpretation step.
+Params: `question` (NL question), `model` (`"claude/haiku"` default | `"ollama/qwen3.5:9b"` or `"ollama/gemma4:e4b"`), `project`. Use `model="ollama/gemma4:e4b"` to avoid API costs on the interpretation step.
 
 ### RL Reranking (ambient, opt-in)
 When `RL_SERVER_URL` is reachable, KG search results pass through a reinforcement-learning reranker before being returned. When it's not, free-tier installs see plain cosine-ordered results — no error, no warning. The RL server (`rl_server.py` in MultiagentOrchestrator) is a **Pro-tier component** and is not in the OSS bundle.
@@ -113,14 +113,14 @@ When `RL_SERVER_URL` is reachable, KG search results pass through a reinforcemen
 Local inference and embeddings via Ollama. Everything runs on-device, so the bill for trivial generations (docstring rewrites, classification, summary extraction) is zero. Three tools.
 
 ### `chat`
-Run inference against any Ollama model. Default model: `qwen3.5:0.8b` (fast, ~50-100 tok/s).
+Run inference against any Ollama model. Default model: `qwen3.5:9b` (text + vision); `gemma4:e4b` for fast summarization on low-power machines.
 
 <details>
 <summary>Details</summary>
 
-Params: `prompt`, `model` (default `qwen3.5:0.8b`), `system_prompt`, `temperature` (default 0.7), `max_tokens` (default 500). Returns response plus metrics (total_duration_ms, output_tokens, tokens_per_sec). Use for: quick analysis, rewrites, docstring improvements, classification — any task where you'd otherwise burn Claude API tokens on a trivial generation. For complex reasoning, use `qwen3.5:9b` (8B).
+Params: `prompt`, `model` (default `qwen3.5:9b`), `system_prompt`, `temperature` (default 0.7), `max_tokens` (default 500). Returns response plus metrics (total_duration_ms, output_tokens, tokens_per_sec). Use for: quick analysis, rewrites, docstring improvements, classification — any task where you'd otherwise burn Claude API tokens on a trivial generation. For complex reasoning + vision, qwen3.5:9b is default. For fast summarization on low-power, use gemma4:e4b.
 
-Supported models: `qwen3.5:0.8b` (fast inference), `qwen3.5:9b` (8B), `qwen3-coder:latest` (30.5B for code), `devstral:24b` (23.6B), `olmo-3:7b` (7.3B). All free, local.
+Supported models: `qwen3.5:9b` (text + vision, default), `gemma4:e4b` (fast summarization), `qwen3-coder:latest` (30.5B for code), `devstral:24b` (23.6B), `olmo-3:7b` (7.3B). All free, local.
 
 </details>
 

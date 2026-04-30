@@ -80,7 +80,7 @@ python3 install.py          # or `python install.py` on Windows
 4. Create a Python venv at `.venv` (project root)
 5. Install Python deps
 6. Bring up Docker/Podman containers (Weaviate + Ollama)
-7. Pull Ollama models (qwen3-embedding, qwen3.5:0.8b, etc.)
+7. Pull Ollama models (qwen3-embedding, qwen3.5:9b, gemma4:e4b)
 8. Create `state/` directory
 9. Write `.env`
 10. Copy bundled agents + skills into `.claude/agents/` and `.claude/skills/`
