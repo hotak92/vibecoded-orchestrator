@@ -15,7 +15,9 @@ isolation: worktree
 
 - Python 3.12, venv: project's own `.venv/` (check `$PROJECT_ROOT/.venv`). For MCP scripts, `.claude/scripts/kg-*` wrappers handle the orchestrator's venv internally.
 - Scripts: `.claude/scripts/` (project) or `~/.claude/scripts/` (global)
-- Make executable: `chmod +x script.sh`
+- Make executable:
+  - Linux / macOS: `chmod +x script.sh`
+  - Windows: no chmod — `.py` files run via `py script.py`; `.ps1` files run via PowerShell (set `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once); `.cmd` / `.bat` files are executable by extension.
 - Wrapper pattern: Auto-activate venv in Python scripts
 
 ## Search Before Creating Scripts

@@ -21,11 +21,15 @@ Structured onboarding for unfamiliar codebases. Produces a concise architecture 
 
 ### 1. Project Overview (~2 min)
 
+The commands below assume a Unix shell (Linux/macOS, or Git Bash on Windows).
+On native Windows shells, substitute `dir` for `ls -la` and `type` /
+`Get-Content` for `cat`; `git`, `head`, and the rest behave the same.
+
 ```bash
-ls -la                              # root structure
-cat README.md | head -80            # stated purpose
+ls -la                              # root structure (Windows: `dir` or PowerShell `Get-ChildItem`)
+cat README.md | head -80            # stated purpose (Windows: `Get-Content README.md -TotalCount 80`)
 cat pyproject.toml | head -40       # or package.json / Cargo.toml
-git log --oneline -10               # recent activity
+git log --oneline -10               # recent activity (cross-platform via git)
 git shortlog -sn --no-merges | head -5  # main contributors
 ```
 

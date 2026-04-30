@@ -615,7 +615,8 @@ If specialized needs:
 **7.3 Set Up KG Scripts**
 
 ```bash
-# kg-search wrapper
+# kg-search wrapper (Linux / macOS — bash script; on Windows ship a .cmd or
+# .ps1 wrapper instead, see note below).
 cat > .claude/scripts/kg-search <<'EOF'
 #!/bin/bash
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -629,10 +630,15 @@ fi
 # Use shared script with project tags
 exec ~/.claude/scripts/kg-search "$@" --tags [project]
 EOF
-chmod +x .claude/scripts/kg-search
+chmod +x .claude/scripts/kg-search   # Unix only — no-op on Windows
 
 # Repeat for kg-info, kg-sync
 ```
+
+> Windows note: `chmod` doesn't exist on cmd.exe / PowerShell. Either ship a
+> `kg-search.cmd` wrapper that calls `py %USERPROFILE%\.claude\scripts\kg-search %*`,
+> or run hooks/scripts under Git Bash (where the bash wrapper above works
+> as-is, and `chmod` is available).
 
 ### Phase 8: Agents (if needed)
 
@@ -706,23 +712,48 @@ Implementation agent following [project] patterns.
 
 **9.1 Essential Scripts**
 
-**All projects**:
+The commands below are written for Linux / macOS (bash). On Windows, drop the
+`chmod` lines (no-op), substitute `mklink` (cmd.exe, requires admin) or
+`New-Item -ItemType SymbolicLink` (PowerShell, requires Developer Mode) for
+`ln -s`, or just `Copy-Item` if a hard link/symlink isn't important.
+
+**All projects** (Linux / macOS):
 ```bash
 # Link to shared scripts
 ln -s ~/.claude/scripts/smart-file-ops .claude/scripts/smart-file-ops
 ```
 
-**Add doc-check**:
+**All projects** (Windows PowerShell):
+```powershell
+# Copy is fine if a symlink isn't required:
+Copy-Item "$env:USERPROFILE\.claude\scripts\smart-file-ops" `
+          ".claude\scripts\smart-file-ops"
+```
+
+**Add doc-check** (Linux / macOS):
 ```bash
 cp ~/.claude/workflow/templates/doc-check .claude/scripts/doc-check
 chmod +x .claude/scripts/doc-check
 # Customize thresholds for project
 ```
 
-**If has tests**:
+**Add doc-check** (Windows PowerShell):
+```powershell
+Copy-Item "$env:USERPROFILE\.claude\workflow\templates\doc-check" `
+          ".claude\scripts\doc-check"
+# No chmod needed; invoke via `py .claude\scripts\doc-check ...`
+```
+
+**If has tests** (Linux / macOS):
 ```bash
 cp ~/.claude/workflow/templates/test-organize .claude/scripts/test-organize
 chmod +x .claude/scripts/test-organize
+```
+
+**If has tests** (Windows PowerShell):
+```powershell
+Copy-Item "$env:USERPROFILE\.claude\workflow\templates\test-organize" `
+          ".claude\scripts\test-organize"
 ```
 
 **9.2 Recommended Hooks**

@@ -26,7 +26,7 @@ Enables user to then bootstrap individual projects using the installed infrastru
 
 ## Capabilities
 
-- Detect OS (Windows/Linux) and adjust installation
+- Detect OS (Windows/Linux/macOS) and adjust installation
 - Install/configure Weaviate (Docker or standalone)
 - Install/configure Ollama with required models
 - Set up shared workflow directory structure
@@ -34,6 +34,33 @@ Enables user to then bootstrap individual projects using the installed infrastru
 - Configure MCP servers
 - Create initial knowledge graph structure
 - Generate machine-specific documentation
+
+## Platform context — IMPORTANT
+
+**Before emitting any shell command, determine the host OS** and only emit commands valid for that platform. Never recite Linux-only invocations (`sudo apt-get`, `chmod +x`, `systemctl`) on a Windows or macOS host — the user will copy-paste them and get "command not found".
+
+**Detection order**:
+
+1. Check the `${PLATFORM}` environment variable — `install.py` exports it as `Linux`, `Darwin`, or `Windows`.
+2. If `${PLATFORM}` is unset, run a one-shot probe and cache the result:
+   ```bash
+   python3 -c "import platform; print(platform.system())" 2>/dev/null \
+     || python -c "import platform; print(platform.system())" 2>/dev/null \
+     || py -c "import platform; print(platform.system())"
+   ```
+3. Only then proceed.
+
+**Preferred path: delegate to `install.py`.** The installer is already cross-platform and handles Python detection, venv creation, container orchestration, and permission ops correctly on every OS. Whenever the user's request is "install X", run `install.py` (or one of its phase entry points) instead of hand-rolling shell. The shell snippets in this prompt are for **diagnostics, demonstration, or fallback** when `install.py` cannot be used — not the primary install path.
+
+**When you must show a literal command**, use a three-OS block:
+
+```
+- Linux:   <command>
+- macOS:   <command>     # often the same as Linux but verify
+- Windows: <command>     # PowerShell or cmd.exe — never bash builtins
+```
+
+Keep Linux first (the most common VCO host today), then macOS, then Windows.
 
 ## Task Context
 
@@ -112,17 +139,30 @@ Use AskUserQuestion to clarify setup:
 **2.1 Check Python**
 
 ```bash
-# Python 3.10+ required
-python3 --version
+# Python 3.10+ required. Probe under whichever interpreter name exists.
+python3 --version 2>/dev/null || python --version 2>/dev/null || py --version
 
-# If missing or too old
+# If missing or too old, surface platform-specific instructions:
 if [too_old_or_missing]; then
     echo "Python 3.10+ required. Please install:"
-    if [Linux]; then
-        echo "  sudo apt-get install python3.11 python3.11-venv"
-    elif [Windows]; then
-        echo "  Download from https://www.python.org/downloads/"
-    fi
+    case "${PLATFORM:-$(python3 -c 'import platform; print(platform.system())' 2>/dev/null || echo Unknown)}" in
+        Linux)
+            echo "  Debian/Ubuntu:  sudo apt-get install python3.11 python3.11-venv"
+            echo "  Fedora/RHEL:    sudo dnf install python3.11"
+            echo "  Arch:           sudo pacman -S python"
+            ;;
+        Darwin)
+            echo "  Homebrew:  brew install python@3.11"
+            echo "  Or:        Download from https://www.python.org/downloads/"
+            ;;
+        Windows)
+            echo "  Download from https://www.python.org/downloads/"
+            echo "  Or via winget:  winget install Python.Python.3.11"
+            ;;
+        *)
+            echo "  Download from https://www.python.org/downloads/"
+            ;;
+    esac
     # Offer to pause and wait for user installation
 fi
 ```
@@ -216,13 +256,15 @@ done
 
 **3.2 Standalone Installation (alternative)**
 
+Pick the release archive and startup wrapper for the host OS. The Linux example is shown first; macOS and Windows variants follow.
+
 ```bash
-# Download Weaviate binary (Linux example)
+# Linux (binary tarball)
 wget https://github.com/weaviate/weaviate/releases/download/v1.26.1/weaviate-v1.26.1-linux-amd64.tar.gz
 tar -xzf weaviate-v1.26.1-linux-amd64.tar.gz -C ~/.claude/workflow/
-chmod +x ~/.claude/workflow/weaviate
+chmod +x ~/.claude/workflow/weaviate   # Unix only — no-op / not needed on Windows
 
-# Create startup script
+# Create startup script (Unix shells)
 cat > ~/.claude/workflow/start-weaviate.sh <<'EOF'
 #!/bin/bash
 ~/.claude/workflow/weaviate \
@@ -232,9 +274,31 @@ cat > ~/.claude/workflow/start-weaviate.sh <<'EOF'
     &
 EOF
 chmod +x ~/.claude/workflow/start-weaviate.sh
-
-# Add to system startup (optional - ask user)
 ```
+
+```bash
+# macOS (Darwin tarball; Apple Silicon = darwin-arm64, Intel = darwin-amd64)
+curl -L -o weaviate.tar.gz \
+  https://github.com/weaviate/weaviate/releases/download/v1.26.1/weaviate-v1.26.1-darwin-arm64.tar.gz
+tar -xzf weaviate.tar.gz -C ~/.claude/workflow/
+chmod +x ~/.claude/workflow/weaviate
+# Reuse the start-weaviate.sh wrapper above.
+```
+
+```powershell
+# Windows (PowerShell — no chmod, files are executable by extension)
+$url = "https://github.com/weaviate/weaviate/releases/download/v1.26.1/weaviate-v1.26.1-windows-amd64.zip"
+Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\weaviate.zip"
+Expand-Archive -Path "$env:TEMP\weaviate.zip" -DestinationPath "$env:USERPROFILE\.claude\workflow\"
+
+# Start wrapper (PowerShell):
+@"
+& "`$env:USERPROFILE\.claude\workflow\weaviate.exe" --host 0.0.0.0 --port 8081 --scheme http
+"@ | Set-Content "$env:USERPROFILE\.claude\workflow\start-weaviate.ps1"
+```
+
+# Add to system startup (optional - ask user; method varies per OS: systemd unit on Linux,
+# launchd plist on macOS, Task Scheduler / Startup folder on Windows).
 
 **3.3 Connect to Existing (alternative)**
 
@@ -262,15 +326,29 @@ EOF
 ```bash
 curl -fsSL https://ollama.com/install.sh | sh
 
-# Start Ollama service
-systemctl start ollama  # Or however Ollama starts on this system
+# Start Ollama service.
+# On systemd-based distros the install script registers and starts the unit;
+# verify with `systemctl status ollama` and `systemctl start ollama` if needed.
+# On distros without systemd (e.g. Alpine, some containers), run `ollama serve &`
+# manually or supervise it with whatever init system the host uses.
+```
+
+**macOS**:
+```bash
+# Native app installer (recommended): https://ollama.com/download
+# Or Homebrew:
+brew install ollama
+brew services start ollama   # registers a launchd agent; `brew services stop ollama` to stop
+# Manual start (no launchd registration): `ollama serve &`
 ```
 
 **Windows**:
 ```powershell
-# Download from https://ollama.com/download
-# Run installer
-# (Provide download link and instructions)
+# Download installer from https://ollama.com/download/windows and run it,
+# or via winget:
+winget install Ollama.Ollama
+# The installer registers Ollama as a Windows service and starts it automatically.
+# Verify with: Get-Service Ollama
 ```
 
 **4.2 Pull Required Models**
@@ -452,8 +530,13 @@ EOF
 
 **8.1 Core Scripts**
 
+`chmod +x` is Unix-only and a no-op on Windows (where executability is by file
+extension / shebang via `py.exe`). The blocks below show the Unix flow first;
+on Windows skip the `chmod` lines entirely and rely on `py` / `python` to invoke
+the scripts.
+
 ```bash
-# Smart file operations
+# Linux / macOS
 cp [orchestrator]/.claude/scripts/smart_file_ops.py ~/.claude/scripts/
 chmod +x ~/.claude/scripts/smart_file_ops.py
 
@@ -475,6 +558,17 @@ chmod +x ~/.claude/scripts/generate-workflow
 # MCP testing
 cp [orchestrator]/.claude/scripts/test-mcp ~/.claude/scripts/
 chmod +x ~/.claude/scripts/test-mcp
+```
+
+```powershell
+# Windows (PowerShell) — no chmod needed; invoke through `py` / `python`.
+$src = "[orchestrator]\.claude\scripts"
+$dst = "$env:USERPROFILE\.claude\scripts"
+New-Item -ItemType Directory -Force -Path $dst | Out-Null
+Copy-Item "$src\smart_file_ops.py","$src\kg-search","$src\kg-info","$src\kg-sync",`
+          "$src\search_knowledge.py","$src\get_node_info.py","$src\sync_knowledge_graph.py",`
+          "$src\detect-workflow-needs","$src\generate-workflow","$src\test-mcp" $dst
+# Run via:  py "$dst\smart_file_ops.py" check ...
 ```
 
 **8.2 Verify Scripts Work**
@@ -513,7 +607,11 @@ Templates for project-specific hooks.
 **Usage**:
 1. Copy template to project's `.claude/hooks/`
 2. Customize for project (change collection name, etc.)
-3. Make executable: `chmod +x .claude/hooks/*.sh`
+3. Ensure scripts are executable:
+   - Linux / macOS: `chmod +x .claude/hooks/*.sh`
+   - Windows: no chmod needed; hooks run via `bash` (Git Bash) or are
+     invoked as `python` scripts directly. If you wrap hooks in `.ps1`,
+     ensure execution policy allows them: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
 EOF
 ```
 
@@ -819,17 +917,27 @@ docker-compose up -d
 ~/.claude/workflow/start-weaviate.sh
 ```
 
-**Ollama**:
+**Ollama**: usually runs as a system service; check status with the host's service manager.
 ```bash
-# Usually runs as system service
-# Check: systemctl status ollama
+# Linux (systemd):  systemctl status ollama
+# macOS (Homebrew): brew services list | grep ollama
+# Windows:          Get-Service Ollama   # PowerShell
 ```
 
 ### Update Workflow
 
-Check for updates:
+Check for updates — the version file is plain text; read with whatever tool the host shell provides:
 ```bash
-cat ~/.claude/workflow/VERSION  # Current version
+# Linux / macOS:
+cat ~/.claude/workflow/VERSION
+
+# Windows (PowerShell):
+# Get-Content "$env:USERPROFILE\.claude\workflow\VERSION"
+# Windows (cmd.exe):
+# type "%USERPROFILE%\.claude\workflow\VERSION"
+
+# Cross-platform fallback:
+python3 -c "from pathlib import Path; print(Path.home() / '.claude/workflow/VERSION', '->', (Path.home() / '.claude/workflow/VERSION').read_text().strip())"
 
 # Future: Will have update mechanism
 # For now: Manual update from VibeCoded Orchestrator project
@@ -862,14 +970,19 @@ docker-compose restart
 
 ### Ollama connection fails
 ```bash
-# Check service
-systemctl status ollama
+# Check service (use host's service manager):
+#   Linux (systemd):  systemctl status ollama
+#   macOS (brew):     brew services list | grep ollama
+#   Windows:          Get-Service Ollama          # PowerShell
 
-# Check port
+# Check port (curl is available on all three OSes — pre-installed on Linux/macOS,
+# bundled with Windows 10+ as curl.exe):
 curl http://localhost:11434/api/version
 
-# Restart
-systemctl restart ollama
+# Restart:
+#   Linux (systemd):  sudo systemctl restart ollama
+#   macOS (brew):     brew services restart ollama
+#   Windows:          Restart-Service Ollama       # PowerShell, elevated
 ```
 
 ### KG sync fails
@@ -890,14 +1003,19 @@ python -c "import weaviate; print('OK')"
 
 ### Scripts don't work
 ```bash
-# Check permissions
+# Linux / macOS — check + fix permissions:
 ls -l ~/.claude/scripts/kg-*
-
-# Make executable
 chmod +x ~/.claude/scripts/kg-*
 
-# Check Python venv
-which python3  # Should be in .venv after activation
+# Windows (PowerShell) — no permission bit; verify the file exists and
+# the wrapper invokes python correctly:
+#   Get-ChildItem "$env:USERPROFILE\.claude\scripts\kg-*"
+#   py "$env:USERPROFILE\.claude\scripts\kg-search" --help
+
+# Check Python venv (cross-platform):
+#   Linux / macOS:  which python3
+#   Windows:        Get-Command python ; Get-Command py
+# Activated venv path should appear in the result.
 ```
 
 ## Support
@@ -1133,8 +1251,11 @@ MINOR=$(echo "$PYTHON_VERSION" | cut -d. -f2)
 if [ "$MAJOR" -lt 3 ] || { [ "$MAJOR" -eq 3 ] && [ "$MINOR" -lt 10 ]; }; then
     echo "❌ Python 3.10+ required, found $PYTHON_VERSION"
     echo "Install Python 3.10+:"
-    echo "  Ubuntu: sudo apt-get install python3.11"
-    echo "  macOS: brew install python@3.11"
+    echo "  Linux (Debian/Ubuntu): sudo apt-get install python3.11"
+    echo "  Linux (Fedora/RHEL):   sudo dnf install python3.11"
+    echo "  macOS (Homebrew):      brew install python@3.11"
+    echo "  Windows:               winget install Python.Python.3.11"
+    echo "                         (or download from https://www.python.org/downloads/)"
     exit 1
 fi
 
