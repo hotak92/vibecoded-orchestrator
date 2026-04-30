@@ -131,7 +131,14 @@ if is_post_tool:
 # when the session genuinely had nothing worth recording.
 session_total = 0
 escape_marker_token_total = 0  # session_total at the time the marker was last seen; 0 if never
-NO_KG_UPDATE_MARKER = "[No KG update needed]"
+# v7 (2026-04-30): the escape marker now requires a non-empty reason — the
+# bare `[No KG update needed]` string is no longer accepted. Pattern:
+#   `[No KG update needed: <one-or-more non-empty chars>]`
+# This forces the agent to articulate WHY the work was orthogonal instead
+# of treating the escape hatch as a default. The regex below allows any
+# character except `]` and requires at least one non-whitespace char.
+import re
+NO_KG_UPDATE_MARKER_RE = re.compile(r"\[No KG update needed:\s*\S[^\]]*\]")
 need_total = bool(transcript_path) and os.path.exists(transcript_path)
 if need_total:
     try:
@@ -170,7 +177,7 @@ if need_total:
                                     t = c.get("text") or ""
                                     if t:
                                         text_parts.append(t)
-                        if any(NO_KG_UPDATE_MARKER in t for t in text_parts):
+                        if any(NO_KG_UPDATE_MARKER_RE.search(t) for t in text_parts):
                             escape_marker_token_total = session_total
     except OSError:
         pass
@@ -268,7 +275,7 @@ Workflow (do these in order — don't skip steps):
   2. UPDATE: for each match, Edit the existing node — extend content, set 'valid_until' if the old content was superseded. Re-grouping into existing nodes prevents duplicate-KG drift.
   3. CREATE only if no existing node fits. Two near-duplicate nodes hurt future-grep more than the missing node would.
 
-If after the search you've genuinely learned nothing worth recording, write the literal phrase [No KG update needed] in your reply (top-level text, not inside a tool call) — the next hook run will detect it via transcript scan and reset the counter. Use this when the work was orthogonal (deploys, status checks, scrubs that were already captured) — NOT as a default escape from doing the search. Don't skip silently."""
+If after the search you've genuinely learned nothing worth recording, write [No KG update needed: <one-line reason>] in your reply (top-level text, not in a tool call). Example: [No KG update needed: only deploys + status checks this turn]. The reason must be non-empty — if you can't articulate one, the search step wasn't done."""
         # UserPromptSubmit hooks surface STDOUT as <system-reminder>
         # context, not stderr. v2/v3 used stderr — the message was
         # generated correctly but never reached the conversation.
