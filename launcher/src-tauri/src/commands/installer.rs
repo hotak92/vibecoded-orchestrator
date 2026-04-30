@@ -3596,8 +3596,25 @@ MemAvailable:   23456789 kB
             "vct-bug32-claude-json-test-{}.json",
             uuid::Uuid::new_v4().simple()
         ));
+        // Claude Code stores real per-host folder paths as keys under
+        // `projects` — POSIX-shaped on Linux/macOS, Windows-shaped on
+        // Windows. Use a host-appropriate fake so the assertion isn't
+        // ambiguous on Windows.
+        let project_key: &str = if cfg!(windows) {
+            r"C:\Users\user\somewhere"
+        } else {
+            "/home/user/somewhere"
+        };
         // Pre-seed with realistic ~/.claude.json content: 3 existing MCP
         // servers, OAuth session marker, project-scoped settings.
+        let mut projects_map = serde_json::Map::new();
+        projects_map.insert(
+            project_key.to_string(),
+            serde_json::json!({
+                "mcpServers": {"private": {"type": "stdio", "command": "x"}},
+                "history": [{"display": "test"}],
+            }),
+        );
         let existing = serde_json::json!({
             "mcpServers": {
                 "alpha": {"type": "stdio", "command": "/usr/bin/alpha"},
@@ -3608,12 +3625,7 @@ MemAvailable:   23456789 kB
                 "emailAddress": "user@example.com",
                 "uuid": "11111111-2222-3333-4444-555555555555",
             },
-            "projects": {
-                "/home/user/somewhere": {
-                    "mcpServers": {"private": {"type": "stdio", "command": "x"}},
-                    "history": [{"display": "test"}],
-                }
-            },
+            "projects": serde_json::Value::Object(projects_map),
             "feedbackSurveyState": {"lastShownTime": 1234567890},
         });
         std::fs::write(
@@ -3639,10 +3651,10 @@ MemAvailable:   23456789 kB
         assert_eq!(v["oauthAccount"]["emailAddress"], "user@example.com");
         // Project-scoped settings preserved.
         assert_eq!(
-            v["projects"]["/home/user/somewhere"]["mcpServers"]["private"]["command"],
+            v["projects"][project_key]["mcpServers"]["private"]["command"],
             "x"
         );
-        assert_eq!(v["projects"]["/home/user/somewhere"]["history"][0]["display"], "test");
+        assert_eq!(v["projects"][project_key]["history"][0]["display"], "test");
         // Survey state preserved.
         assert_eq!(v["feedbackSurveyState"]["lastShownTime"], 1234567890);
 
@@ -4031,11 +4043,19 @@ MemAvailable:   23456789 kB
 
     #[test]
     fn test_install_conflict_error_serializes_with_kind_discriminator() {
+        // Path strings here are only round-tripped through serde — no
+        // disk I/O — but pick host-appropriate placeholders so the test
+        // intent is unambiguous on Windows.
+        let (ip, sp): (&str, &str) = if cfg!(windows) {
+            (r"C:\tmp\x", r"C:\tmp\src")
+        } else {
+            ("/tmp/x", "/tmp/src")
+        };
         let err = InstallConflictError {
             kind: "install_conflict".into(),
             message: "boom".into(),
-            install_path: "/tmp/x".into(),
-            source_path: "/tmp/src".into(),
+            install_path: ip.into(),
+            source_path: sp.into(),
             mode: InstallMode::Adopt,
             will_overwrite: vec!["CLAUDE.md".into()],
             will_add: vec!["state".into()],
