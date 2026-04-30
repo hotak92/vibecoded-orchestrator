@@ -29,6 +29,11 @@ services:
     # validating a new ollama release; do NOT use `:latest` in production —
     # users should know what daemon they're running, and CI should be able
     # to reproduce builds. Ollama Linux releases: https://github.com/ollama/ollama/releases
+    #
+    # GPU overlays (mutually exclusive — install.py picks based on detection):
+    #   NVIDIA   → docker-compose.gpu.yml       (driver: nvidia reservation)
+    #   AMD ROCm → docker-compose.amd-rocm.yml  (ollama:rocm image + /dev/kfd)
+    # Without an overlay this image runs CPU-only even on a GPU host.
     image: docker.io/ollama/ollama:0.20.2
     # See vco_weaviate note above — same anti-collision rationale.
     container_name: vco_ollama
