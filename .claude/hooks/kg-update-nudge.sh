@@ -22,7 +22,7 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 #   as `transcript_path` in the hook payload.
 #
 # Trigger ladder (per user 2026-04-30):
-#   - First nudge: cumulative session tokens since last KG-write >= 150_000
+#   - First nudge: cumulative session tokens since last KG-write >= 175_000
 #   - Subsequent nudges: every 10_000 additional tokens after first fire
 #
 # Counter reset triggers (PostToolUse):
@@ -31,7 +31,7 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 #
 # Bypass: KG_NUDGE_OFF=1 disables the nudge entirely.
 # Threshold tweak:
-#   KG_NUDGE_FIRST=<int>     overrides 150_000 first-fire threshold
+#   KG_NUDGE_FIRST=<int>     overrides 175_000 first-fire threshold
 #   KG_NUDGE_INTERVAL=<int>  overrides 10_000 subsequent interval
 #
 # State: ~/.claude/metrics/kg_update_tokens.jsonl
@@ -48,8 +48,8 @@ set -uo pipefail
 INPUT="$(cat 2>/dev/null || true)"
 [ -z "$INPUT" ] && exit 0
 
-FIRST_THRESHOLD="${KG_NUDGE_FIRST:-150000}"
-INTERVAL="${KG_NUDGE_INTERVAL:-25000}"
+FIRST_THRESHOLD="${KG_NUDGE_FIRST:-175000}"
+INTERVAL="${KG_NUDGE_INTERVAL:-50000}"
 METRICS_DIR="$HOME/.claude/metrics"
 METRICS_FILE="$METRICS_DIR/kg_update_tokens.jsonl"
 
@@ -88,7 +88,7 @@ is_user_prompt = (not tool_name) and ("prompt" in payload)
 # v5 (2026-04-30): SessionStart hook with source=compact resets the
 # nudge state for this session. Post-compact context is sparse and
 # hallucination risk is high — forcing the first post-compact nudge
-# to wait a fresh 150k tokens prevents agents from writing speculative
+# to wait a fresh 175k tokens prevents agents from writing speculative
 # KG nodes based on whatever the compactor preserved. source=startup
 # and source=resume don't reset (they reattach to existing state).
 is_session_compact = (
@@ -225,7 +225,7 @@ if is_session_compact:
     # /compact (manual) and auto-compaction both fire SessionStart with
     # source=compact. Reset state to "fresh session" — baseline at
     # post-compact session_total, fired_once cleared, so the next nudge
-    # waits the full FIRST_THRESHOLD (150k) instead of 25k. Rationale:
+    # waits the full FIRST_THRESHOLD (175k) instead of 50k. Rationale:
     # compaction throws away most context, so agents have low-quality
     # signal for what's worth saving. Forcing them to do real work
     # before the next nudge prevents hallucinated/speculative KG nodes.
@@ -270,12 +270,16 @@ elif is_user_prompt:
             )
         msg = preamble + """ Counter resets on Write or Edit to knowledge/**/*.md OR store_knowledge_node calls.
 
-Workflow (do these in order — don't skip steps):
-  1. SEARCH: list what you've learned this session that's worth keeping. For each item, run hybrid_search('<topic phrase>') against the KG to find nodes that should ABSORB the new info.
-  2. UPDATE: for each match, Edit the existing node — extend content, set 'valid_until' if the old content was superseded. Re-grouping into existing nodes prevents duplicate-KG drift.
+DEFAULT IS TO RUN THE SEARCH. Most sessions of this size produce at least one durable lesson — non-obvious gotcha, post-incident finding, design decision rationale, or discovery that rewrites an old assumption. Treat "nothing to record" as the surprising case, not the default.
+
+Workflow (do these in order — don't skip):
+  1. SEARCH: list 2-5 candidate lessons from this session (forensic findings, design decisions, gotchas, anything that future-you would thank you for). For each, run hybrid_search('<topic phrase>') against the KG to find nodes that should ABSORB the new info. If your initial list is empty, look harder — what failed and got fixed? What surprised you?
+  2. UPDATE: for each match, Edit the existing node — extend content, set 'valid_until' if old content was superseded. Re-grouping into existing nodes prevents duplicate-KG drift.
   3. CREATE only if no existing node fits. Two near-duplicate nodes hurt future-grep more than the missing node would.
 
-If after the search you've genuinely learned nothing worth recording, write [No KG update needed: <one-line reason>] in your reply (top-level text, not in a tool call). Example: [No KG update needed: only deploys + status checks this turn]. The reason must be non-empty — if you can't articulate one, the search step wasn't done."""
+If — after running step 1's hybrid_search calls — you've genuinely learned nothing worth recording, write [No KG update needed: <one-line reason naming what you searched for>] in your reply (top-level text, not in a tool call). The reason must name the topic(s) you searched and why it didn't yield candidates — bare reasons like "nothing new" or "orthogonal work" are insufficient signal that the search was actually done. Example of acceptable: [No KG update needed: searched 'PR merge order' and 'CI re-trigger flow' — both already covered in workflow-discipline.md].
+
+The escape hatch is for the truly orthogonal turn (deploys, status reports, scrub-only). Default is to write the node."""
         # UserPromptSubmit hooks surface STDOUT as <system-reminder>
         # context, not stderr. v2/v3 used stderr — the message was
         # generated correctly but never reached the conversation.
