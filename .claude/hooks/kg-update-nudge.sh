@@ -85,6 +85,16 @@ transcript_path = payload.get("transcript_path") or ""
 #                      cumulative tokens, fire nudge to stderr if threshold.
 is_post_tool = bool(tool_name)
 is_user_prompt = (not tool_name) and ("prompt" in payload)
+# v5 (2026-04-30): SessionStart hook with source=compact resets the
+# nudge state for this session. Post-compact context is sparse and
+# hallucination risk is high — forcing the first post-compact nudge
+# to wait a fresh 150k tokens prevents agents from writing speculative
+# KG nodes based on whatever the compactor preserved. source=startup
+# and source=resume don't reset (they reattach to existing state).
+is_session_compact = (
+    payload.get("hook_event_name") == "SessionStart"
+    and payload.get("source") == "compact"
+)
 
 # --- Detect KG-write (counter reset) — only relevant on PostToolUse ---
 def is_knowledge_path(path: str) -> bool:
@@ -167,7 +177,18 @@ current = state.get(session_id, {
 })
 
 # --- Branch logic ---
-if is_post_tool and is_knowledge_update:
+if is_session_compact:
+    # /compact (manual) and auto-compaction both fire SessionStart with
+    # source=compact. Reset state to "fresh session" — baseline at
+    # post-compact session_total, fired_once cleared, so the next nudge
+    # waits the full FIRST_THRESHOLD (150k) instead of 25k. Rationale:
+    # compaction throws away most context, so agents have low-quality
+    # signal for what's worth saving. Forcing them to do real work
+    # before the next nudge prevents hallucinated/speculative KG nodes.
+    current["baseline"] = session_total
+    current["last_nudge_at"] = 0
+    current["fired_once"] = False
+elif is_post_tool and is_knowledge_update:
     # Reset baseline. Use last_seen_total as the new baseline if we
     # didn't recompute (we skipped the transcript scan above).
     base = session_total if session_total else int(current.get("last_seen_total", 0))
