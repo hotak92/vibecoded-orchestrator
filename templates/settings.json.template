@@ -124,6 +124,16 @@
     ],
     "PreToolUse": [
       {
+        "matcher": "Bash(*vercel*--token*)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/pre-vercel-token-guard.sh \"$CLAUDE_TOOL_NAME\" \"$CLAUDE_USER_MESSAGE\" \"$CLAUDE_TOOL_ARGS\"",
+            "timeout": 2
+          }
+        ]
+      },
+      {
         "matcher": "*",
         "hooks": [
           {
