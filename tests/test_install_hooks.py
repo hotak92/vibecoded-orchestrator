@@ -185,6 +185,33 @@ class InstallHooksAndSettingsIntegrationTest(unittest.TestCase):
             self.assertEqual(summary, "")
             self.assertFalse((tmp_root / ".claude" / "hooks").exists())
 
+    def test_scripts_directory_is_copied(self) -> None:
+        """Scripts in templates/scripts/ should land in .claude/scripts/.
+
+        Specifically precompact_prune.py, which is referenced by
+        pre-compact-save.sh — without it the hook fails silently.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            (tmp_root / "templates").symlink_to(REPO_ROOT / "templates")
+            fake_args = argparse.Namespace(with_hooks=True)
+            with patch.object(install, "PROJECT_ROOT", tmp_root):
+                summary = install._install_hooks_and_settings(fake_args)
+
+            scripts_dst = tmp_root / ".claude" / "scripts"
+            self.assertTrue(
+                scripts_dst.exists(),
+                ".claude/scripts/ should be created when templates/scripts/ has files",
+            )
+            installed = list(scripts_dst.glob("*.py"))
+            self.assertGreaterEqual(len(installed), 1, "at least one script expected")
+            # precompact_prune.py specifically — wired by pre-compact-save.sh
+            self.assertTrue(
+                (scripts_dst / "precompact_prune.py").is_file(),
+                "precompact_prune.py must be copied so pre-compact-save.sh works",
+            )
+            self.assertIn("scripts", summary)
+
 
 if __name__ == "__main__":
     unittest.main()
