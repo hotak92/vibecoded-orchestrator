@@ -134,6 +134,11 @@ EMBEDDING_CONFIGS = {
         "code_model": "codesage-large-v2",
         "code_dims": 2048,
         "embedding_models": ["qwen3-embedding:0.6b"],
+        # ACTIVE_EMBEDDING env var — controls which named-vector slot
+        # the MCP server reads/writes. MUST match the slot name labelled
+        # for the model that emitted the vector. See
+        # `weaviate_mcp/server.py::_get_search_vector` mapping.
+        "active_embedding": "qwen3",
         "description": "GPU-accelerated (qwen3 text + CodeSage code, best quality)",
     },
     "cpu": {
@@ -146,6 +151,7 @@ EMBEDDING_CONFIGS = {
             "qwen3-embedding:0.6b",
             "unclemusclez/jina-embeddings-v2-base-code:latest",
         ],
+        "active_embedding": "qwen3",
         "description": "CPU-only (qwen3 text + Jina V2 code, both via Ollama)",
     },
     "openai": {
@@ -156,6 +162,7 @@ EMBEDDING_CONFIGS = {
         "code_dims": 1536,
         # OpenAI handles embeddings; only inference models need pulling.
         "embedding_models": [],
+        "active_embedding": "openai",
         "description": "OpenAI API (fastest, requires API key)",
     },
     # Lightest mode for low-RAM / low-VRAM machines.
@@ -176,6 +183,9 @@ EMBEDDING_CONFIGS = {
         # Hard-cap inference models for this profile — user opted in.
         # qwen3.5:0.8b is the canonical always-fits floor on main.
         "inference_models_override": ["gemma4:e4b", "qwen3.5:0.8b"],
+        # arctic → ollama_embed slot in the named-vector schema.
+        # Maps to ACTIVE_EMBEDDING=arctic in weaviate_mcp/server.py.
+        "active_embedding": "arctic",
         "description": "Low-resource (Arctic text + Jina V2 code, both via Ollama)",
     },
 }
@@ -4791,7 +4801,11 @@ def _write_env_config(embed_config: dict, args: argparse.Namespace, joern_availa
         f"CODE_EMBED_MODEL={embed_config['code_model']}",
         f"CODE_EMBED_DIMS={embed_config['code_dims']}",
         f"CODE_EMBED_SERVICE_URL=http://localhost:{code_embed_port}",
-        f"ACTIVE_EMBEDDING=qwen3",
+        # ACTIVE_EMBEDDING: maps to the named-vector slot the MCP server
+        # reads/writes. Per-profile so low-resource/openai installs don't
+        # cross-write qwen3 vectors into a slot labelled for a different
+        # model (audit fix 2026-04-30, see kg-embedding-vector-audit-2026-04-30.md).
+        f"ACTIVE_EMBEDDING={embed_config.get('active_embedding', 'qwen3')}",
         "",
         "# Optional companion tools (auto-detected at install)",
         f"VCT_JOERN_AVAILABLE={'1' if joern_available else '0'}",
@@ -4898,7 +4912,8 @@ def _configure_claude_settings(embed_config: dict) -> None:
         "OLLAMA_URL": f"http://localhost:{ollama_port}",
         "GRPC_PORT": str(weaviate_grpc),
         "EMBEDDING_MODEL": embed_config["text_model"],
-        "ACTIVE_EMBEDDING": "qwen3",
+        # See note at the .env-write block above. Per-profile slot mapping.
+        "ACTIVE_EMBEDDING": embed_config.get("active_embedding", "qwen3"),
         "KG_COLLECTION": "KnowledgeGraph",
         "DEVELOPMENT_COLLECTION": "Development",
         "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
