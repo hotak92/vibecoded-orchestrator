@@ -139,6 +139,28 @@ def base_has_ps1(repo_root: Path, hooks_dir_rel: str, base_ref: str) -> bool:
     return False
 
 
+def file_exists_on_base(repo_root: Path, path: str, base_ref: str | None) -> bool:
+    """True iff `path` was a tracked file on the base ref.
+
+    Used by modification-parity to distinguish a NEW file (added in this
+    PR) from a MODIFIED existing file. New files are paired with their
+    pre-existing sibling implicitly — they don't require the sibling to
+    also be modified.
+    """
+    if not base_ref:
+        return False
+    try:
+        # `git cat-file -e` returns 0 if the object exists; non-zero
+        # otherwise. Suppress stderr — non-existence is the answer, not
+        # a failure to report.
+        result = run_git(
+            ["cat-file", "-e", f"origin/{base_ref}:{path}"], cwd=repo_root
+        )
+        return True
+    except RuntimeError:
+        return False
+
+
 def get_changed_files(repo_root: Path, base_ref: str | None) -> set[str]:
     """Return the set of repo-relative changed files between base and HEAD.
 
@@ -261,6 +283,18 @@ def main() -> int:
         if not sibling_path_abs.exists():
             # No sibling on disk. Existence-parity rule above already
             # handled this; do not double-fail here.
+            continue
+
+        # If THIS file is brand new on the PR (didn't exist on base) AND
+        # its sibling ALREADY existed on base, this is a "new pairing"
+        # case — the sibling shouldn't also need to be modified just
+        # because we're adding its complement. Common scenario: first
+        # batch of .ps1 siblings paired with existing unchanged .sh
+        # hooks. Modification parity only fires when the file was
+        # already part of a tracked pair on base.
+        was_new = not file_exists_on_base(repo_root, changed_path, base_ref)
+        sibling_was_on_base = file_exists_on_base(repo_root, sibling, base_ref)
+        if was_new and sibling_was_on_base:
             continue
 
         if sibling not in changed:
