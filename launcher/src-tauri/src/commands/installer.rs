@@ -1946,29 +1946,58 @@ pub fn inspect_orchestrator_at(path: String) -> OrchestratorState {
 // Bug 22: optional GitHub PAT for future auto-update flows that pull
 // upstream commits into the bundled source. The PAT is NOT required for
 // initial install (Bug 17) or per-project update (Bug 21) — those are
-// pure local file copies. We persist to `~/.vct-secrets/github_pat`
-// (chmod 600) to match the convention used in CLAUDE.md, the search
-// MCP wrapper, and the git credential helper.
+// pure local file copies.
+//
+// Phase 1 layout (preferred, since 2026-04-24): persist to
+// `~/.vct-secrets/shared/github_pat`. Legacy flat layout
+// `~/.vct-secrets/github_pat` is honored on read for backward compat with
+// existing installs that haven't migrated. Writes always go to the
+// preferred path; on first write we'll create `shared/` if missing.
+// chmod 600 on Unix; Windows ignores this.
 // ---------------------------------------------------------------------------
 
 fn vct_secrets_dir() -> Option<PathBuf> {
     directories::UserDirs::new().map(|u| u.home_dir().join(".vct-secrets"))
 }
 
-fn github_pat_path() -> Option<PathBuf> {
+fn vct_secrets_shared_dir() -> Option<PathBuf> {
+    vct_secrets_dir().map(|d| d.join("shared"))
+}
+
+fn github_pat_path_shared() -> Option<PathBuf> {
+    vct_secrets_shared_dir().map(|d| d.join("github_pat"))
+}
+
+fn github_pat_path_flat() -> Option<PathBuf> {
     vct_secrets_dir().map(|d| d.join("github_pat"))
+}
+
+/// Resolve the existing PAT path, preferring the new shared/ layout and
+/// falling back to the legacy flat layout. Returns `None` if neither exists.
+fn github_pat_resolve_existing() -> Option<PathBuf> {
+    if let Some(p) = github_pat_path_shared() {
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    if let Some(p) = github_pat_path_flat() {
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
 }
 
 #[command]
 pub fn has_github_pat() -> bool {
-    github_pat_path()
-        .map(|p| p.exists() && std::fs::read_to_string(&p).map(|s| !s.trim().is_empty()).unwrap_or(false))
+    github_pat_resolve_existing()
+        .map(|p| std::fs::read_to_string(&p).map(|s| !s.trim().is_empty()).unwrap_or(false))
         .unwrap_or(false)
 }
 
 #[command]
 pub fn get_github_pat_preview() -> Option<String> {
-    let p = github_pat_path()?;
+    let p = github_pat_resolve_existing()?;
     let raw = std::fs::read_to_string(&p).ok()?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -1987,7 +2016,8 @@ pub fn register_github_pat(token: String) -> Result<(), String> {
     if trimmed.is_empty() {
         return Err("token cannot be empty".into());
     }
-    let dir = vct_secrets_dir().ok_or("could not resolve home directory")?;
+    // Write to the new Phase 1 layout (`~/.vct-secrets/shared/github_pat`).
+    let dir = vct_secrets_shared_dir().ok_or("could not resolve home directory")?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {}", dir.display(), e))?;
     let path = dir.join("github_pat");
     std::fs::write(&path, trimmed).map_err(|e| format!("write {}: {}", path.display(), e))?;
@@ -2007,9 +2037,16 @@ pub fn register_github_pat(token: String) -> Result<(), String> {
 
 #[command]
 pub fn clear_github_pat() -> Result<(), String> {
-    let p = github_pat_path().ok_or("could not resolve home directory")?;
-    if p.exists() {
-        std::fs::remove_file(&p).map_err(|e| format!("remove {}: {}", p.display(), e))?;
+    // Clear from both shared/ and legacy flat locations to avoid stale tokens.
+    if let Some(p) = github_pat_path_shared() {
+        if p.exists() {
+            std::fs::remove_file(&p).map_err(|e| format!("remove {}: {}", p.display(), e))?;
+        }
+    }
+    if let Some(p) = github_pat_path_flat() {
+        if p.exists() {
+            std::fs::remove_file(&p).map_err(|e| format!("remove {}: {}", p.display(), e))?;
+        }
     }
     Ok(())
 }
