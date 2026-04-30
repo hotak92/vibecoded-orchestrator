@@ -642,7 +642,9 @@ cp ~/.claude/workflow/hooks/context-reminder.sh .claude/hooks/
 
 ✅ **Detects version and adapts**:
 ```bash
-# Detect workflow version
+# Detect workflow version. The bash form below works on Linux/macOS and under
+# Git Bash on Windows. For a fully cross-platform read (cmd.exe, PowerShell),
+# use the Python one-liner instead.
 if [ -f ~/.claude/workflow/VERSION ]; then
     WORKFLOW_VERSION=$(cat ~/.claude/workflow/VERSION)
     echo "Detected workflow version: $WORKFLOW_VERSION"
@@ -650,6 +652,11 @@ else
     echo "⚠️  No workflow version found"
     read -p "Enter workflow version (e.g., 0.3.0) or 'unknown': " WORKFLOW_VERSION
 fi
+
+# Cross-platform equivalent (works under any shell where python is on PATH):
+# WORKFLOW_VERSION=$(python3 -c "from pathlib import Path; p=Path.home()/'.claude/workflow/VERSION'; print(p.read_text().strip() if p.exists() else '')")
+# Windows cmd.exe:  type "%USERPROFILE%\.claude\workflow\VERSION"
+# Windows PowerShell:  Get-Content "$env:USERPROFILE\.claude\workflow\VERSION"
 
 # Adapt migration based on version
 case "$WORKFLOW_VERSION" in
