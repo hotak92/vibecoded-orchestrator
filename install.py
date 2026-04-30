@@ -5091,6 +5091,16 @@ def _install_hooks_and_settings(args: argparse.Namespace) -> str:
         shutil.copy2(hook_file, target)
         installed_hooks += 1
 
+    # Library files sourced by hooks (e.g. _lib/find-python.sh). Live under
+    # .claude/hooks/_lib/. Always overwrite — they're not user-customisable
+    # and stale copies would defeat their portability purpose. See audit F6.
+    lib_src = hooks_src / "_lib"
+    if lib_src.exists():
+        lib_dst = hooks_dst / "_lib"
+        lib_dst.mkdir(parents=True, exist_ok=True)
+        for lib_file in sorted(lib_src.glob("*.sh")):
+            shutil.copy2(lib_file, lib_dst / lib_file.name)
+
     # Scripts referenced by hooks (e.g. precompact_prune.py). Live alongside
     # hooks under .claude/scripts/. Some scripts may not exist if the
     # installation predates them — that's fine, the hooks ?-guard against

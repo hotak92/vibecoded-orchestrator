@@ -11,6 +11,14 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 #
 # Output format (costs.jsonl):
 #   {"timestamp":"ISO","session_id":"...","model":"...","input_tokens":N,"output_tokens":N,"cache_read_tokens":N,"cost_usd":N}
+#
+# Portability note (audit F19, 2026-04-30): the metrics directory is
+# resolved Python-side via `pathlib.Path.home()` below, which works on
+# every OS regardless of $HOME / %USERPROFILE%. The `~/.claude/...` path
+# in the comment above is bash-shorthand and is also expanded correctly
+# by every shell that can execute this hook (bash on Linux/macOS, Git
+# Bash on Windows). cmd.exe / PowerShell don't expand tildes — but they
+# also can't run a `.sh` hook in the first place; that's audit F1.
 
 set -euo pipefail
 
