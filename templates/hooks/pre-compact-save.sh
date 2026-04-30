@@ -33,10 +33,12 @@ mkdir -p "$PROJECT_DIR/.claude/context"
 
 # Generate pruned activity summary scoped to "since last compact".
 # Pipe the original hook stdin through so the script can read transcript_path.
-# Resolve python interpreter portably (Windows ships python.exe / py.exe,
-# not python3 — see audit finding F6, 2026-04-30).
-PY="$(command -v python3 || command -v python || command -v py)"
-if [ -n "$PY" ] && [ -f "$PROJECT_DIR/.claude/scripts/precompact_prune.py" ]; then
+# Resolve python interpreter portably via the shared helper (Windows ships
+# python.exe / py.exe, not python3 — see audit finding F6, 2026-04-30).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=_lib/find-python.sh disable=SC1091
+[ -f "$SCRIPT_DIR/_lib/find-python.sh" ] && . "$SCRIPT_DIR/_lib/find-python.sh"
+if [ -n "${PY:-}" ] && [ -f "$PROJECT_DIR/.claude/scripts/precompact_prune.py" ]; then
     HOOK_STDIN="${CLAUDE_HOOK_STDIN:-{}}"
     echo "$HOOK_STDIN" | "$PY" "$PROJECT_DIR/.claude/scripts/precompact_prune.py" 2>/dev/null || true
 fi
