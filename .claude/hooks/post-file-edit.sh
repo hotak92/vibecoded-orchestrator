@@ -55,17 +55,18 @@ if [[ "$EDITED_FILE" == "$KNOWLEDGE_ROOT"* ]]; then
     fi
 fi
 
-# 2. Auto-sync development documentation files
+# 2. Auto-sync development documentation files via the same kg-sync entry
+#    point as knowledge/ (path-routed: docs/* → dev collection sync_doc;
+#    knowledge/* → KG sync_node). Audit-driven 2026-04-30 replacement
+#    for upload_docs.py. Same chunker, named-vector slot, archive-skip.
 DOCS_DIR="$PROJECT_ROOT/docs"
 if [[ "$EDITED_FILE" == "$DOCS_DIR"* ]] && [[ "$EDITED_FILE" == *.md ]]; then
     echo "📚 Documentation edited: $EDITED_FILE"
     echo "   Syncing to Weaviate development collection..."
 
-    # Activate venv and run upload script in background
+    REL_PATH="${EDITED_FILE#$PROJECT_ROOT/}"
     cd "$PROJECT_ROOT"
-    (source "${VCT_INSTALL_ROOT:-.}/claude_mcp_servers/.venv/bin/activate" && \
-     python .claude/scripts/upload_docs.py "$EDITED_FILE" 2>&1 | \
-     grep -E "(✓|✗|Uploading|chunks)" || true) &
+    .claude/scripts/kg-sync "$REL_PATH" &
 
     echo "✅ Background sync started for development docs"
 fi

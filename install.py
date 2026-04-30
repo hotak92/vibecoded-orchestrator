@@ -1373,7 +1373,7 @@ def main() -> int:
                              "Also skips collection creation — when there's no content "
                              "to seed, the MCP server creates collections lazily on first "
                              "write. Useful in CI / test runs. Re-run later with "
-                             "`kg-sync --all` and `upload_docs.py --all`.")
+                             "`kg-sync --all` (handles both knowledge/ and docs/ since 2026-04-30).")
     parser.add_argument("--no-resume", action="store_true", default=False,
                         help="Disable resume-from-log. Forces every step to run "
                              "even if state/logs/install.jsonl says a previous "
@@ -4330,10 +4330,9 @@ def _ensure_collections(embed_config: dict,
 # Soft-fail policy: if Weaviate or Ollama isn't yet reachable (timing
 # race on first-boot pulls), print a clear hint and continue. The
 # install itself succeeds; the user can re-run seeding later via
-#   .claude/scripts/kg-sync --all
-#   .claude/scripts/upload_docs.py --all
+#   .claude/scripts/kg-sync --all       (handles knowledge/ + docs/)
 #
-# Both scripts are idempotent so re-runs are safe.
+# The script is idempotent so re-runs are safe.
 
 def _seed_weaviate(args: argparse.Namespace) -> None:
     print("[7c/10] Seeding Weaviate with bundled knowledge/ + docs/ ... ", flush=True)
@@ -4370,55 +4369,34 @@ def _seed_weaviate(args: argparse.Namespace) -> None:
 
     scripts_dir = PROJECT_ROOT / ".claude" / "scripts"
     sync_kg = scripts_dir / "sync_knowledge_graph.py"
-    upload_docs = scripts_dir / "upload_docs.py"
 
     seed_errors: list[str] = []
 
-    # 1. Knowledge graph seed
+    # `sync_knowledge_graph.py` now handles both KG (knowledge/) and dev
+    # docs (docs/) ingest paths — it routes by the file's location.
+    # Old upload_docs.py was retired 2026-04-30 (audit cleanup); the
+    # `--all` flag below seeds knowledge/ AND docs/ in one pass.
     if sync_kg.exists():
-        print("  → knowledge/ → KG collection ...", flush=True)
+        print("  → knowledge/ + docs/ → KG + Development collections ...", flush=True)
         try:
             subprocess.run(
                 [str(venv_py), str(sync_kg), "--all"],
                 check=True,
                 cwd=str(PROJECT_ROOT),
-                timeout=600,  # 10 min cap; 50 seed nodes = ~30s on warm Ollama
+                timeout=900,  # 15 min cap; large repos may hit this
             )
         except subprocess.CalledProcessError as e:
-            print(f"    ! kg sync exited {e.returncode} — re-run later with `kg-sync --all`")
+            print(f"    ! kg/docs sync exited {e.returncode} — re-run later with `kg-sync --all`")
             seed_errors.append(f"kg-sync exit {e.returncode}")
         except subprocess.TimeoutExpired:
-            print("    ! kg sync timed out (>10 min) — re-run later with `kg-sync --all`")
+            print("    ! kg/docs sync timed out (>15 min) — re-run later with `kg-sync --all`")
             seed_errors.append("kg-sync timeout")
         except FileNotFoundError as e:
-            print(f"    ! kg sync failed: {e}")
+            print(f"    ! kg/docs sync failed: {e}")
             seed_errors.append(f"kg-sync FileNotFound: {e}")
     else:
         print(f"  ! sync_knowledge_graph.py not found at {sync_kg}")
         seed_errors.append("sync_knowledge_graph.py missing")
-
-    # 2. Project documentation seed
-    if upload_docs.exists():
-        print("  → docs/ → Development collection ...", flush=True)
-        try:
-            subprocess.run(
-                [str(venv_py), str(upload_docs), "--all"],
-                check=True,
-                cwd=str(PROJECT_ROOT),
-                timeout=600,
-            )
-        except subprocess.CalledProcessError as e:
-            print(f"    ! docs upload exited {e.returncode} — re-run later with `upload_docs.py --all`")
-            seed_errors.append(f"upload_docs exit {e.returncode}")
-        except subprocess.TimeoutExpired:
-            print("    ! docs upload timed out (>10 min) — re-run later with `upload_docs.py --all`")
-            seed_errors.append("upload_docs timeout")
-        except FileNotFoundError as e:
-            print(f"    ! docs upload failed: {e}")
-            seed_errors.append(f"upload_docs FileNotFound: {e}")
-    else:
-        print(f"  ! upload_docs.py not found at {upload_docs}")
-        seed_errors.append("upload_docs.py missing")
 
     # 3. Cross-project shared KG seed (Step 7d).
     #
@@ -4476,7 +4454,7 @@ def _seed_weaviate(args: argparse.Namespace) -> None:
     print("  OK (seed step complete; per-script errors are non-fatal — see hints above)")
     if seed_errors:
         # Soft-fail: still log as warn, not error. Step is non-fatal by
-        # design — users can re-run kg-sync / upload_docs later. The
+        # design — users can re-run `kg-sync --all` later. The
         # downstream resume-decider treats "warn" as still-eligible-to-skip
         # so a partial seed doesn't block install completion.
         _log_install_event(
