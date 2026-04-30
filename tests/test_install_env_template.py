@@ -39,7 +39,9 @@ CANONICAL_KEYS = {
     "SHARED_KG_COLLECTION",
     "DEVELOPMENT_COLLECTION",
     "PROJECT_NAME",
-    "CONVERSATION_COLLECTION",
+    # CONVERSATION_COLLECTION removed 2026-04-30 (audit cleanup); see
+    # commit history. The collection is no longer auto-created on new
+    # installs; existing installs keep the data but stop accumulating.
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
     "GITHUB_TOKEN",

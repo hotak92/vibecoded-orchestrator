@@ -24,7 +24,7 @@ It prevents cross-contamination. Global settings apply to every project you open
 
 Both `install.py` Step 9 and the launcher's `create_project_v2` Tauri command call `ensure_project_env_template` (Python: `_ensure_env_template`; Rust: `ensure_project_env_template`) on the project root. The behaviour is:
 
-- **`.env` missing** → write a fresh canonical template with all known keys. Active keys (`KG_COLLECTION`, `PROJECT_NAME`, `DEVELOPMENT_COLLECTION`, `CONVERSATION_COLLECTION`, `SHARED_KG_COLLECTION`) get values substituted from the project name. Optional keys (LLM API keys, `GITHUB_TOKEN`, RL module URLs, `VCT_TELEMETRY`) stay commented out.
+- **`.env` missing** → write a fresh canonical template with all known keys. Active keys (`KG_COLLECTION`, `PROJECT_NAME`, `DEVELOPMENT_COLLECTION`, `SHARED_KG_COLLECTION`) get values substituted from the project name. Optional keys (LLM API keys, `GITHUB_TOKEN`, RL module URLs, `VCT_TELEMETRY`) stay commented out. (`CONVERSATION_COLLECTION` removed 2026-04-30 — capture flow deprecated.)
 - **`.env` exists** → diff against the canonical key list. Any keys not yet present (commented or active) get appended in a marked block tagged `# added by vco YYYY-MM-DD`. The user's existing values are preserved verbatim — never overwritten.
 - **Idempotent** — a second invocation against an up-to-date file is a no-op.
 
@@ -37,8 +37,7 @@ Canonical keys:
 WEAVIATE_URL, WEAVIATE_PORT, OLLAMA_URL, OLLAMA_PORT, CODE_EMBED_URL
 
 # Per-project Weaviate collections (active; filled at create time)
-KG_COLLECTION, SHARED_KG_COLLECTION, DEVELOPMENT_COLLECTION,
-PROJECT_NAME, CONVERSATION_COLLECTION
+KG_COLLECTION, SHARED_KG_COLLECTION, DEVELOPMENT_COLLECTION, PROJECT_NAME
 
 # LLM API keys (commented)
 ANTHROPIC_API_KEY, OPENAI_API_KEY
@@ -86,8 +85,7 @@ The MCP server (`claude_mcp_servers/weaviate_mcp/server.py`) reads these on star
 | Var | Default | What it does |
 |---|---|---|
 | `KG_COLLECTION` | `<ProjectName>` | Per-project Weaviate collection. Knowledge nodes from `knowledge/` land here. |
-| `DEVELOPMENT_COLLECTION` | `<ProjectName>_development` | Per-project Weaviate collection for `docs/`. |
-| `CONVERSATION_COLLECTION` | `<ProjectName>_conversations` | Reserved for future chat history; not auto-populated in v1.0. |
+| `DEVELOPMENT_COLLECTION` | `<ProjectName>_development` | Per-project Weaviate collection for `docs/`. Auto-paired with KG by the launcher. Same chunker + named-vector slot logic as KG. |
 | `SHARED_KG_COLLECTION` | `VibeCodedTools_KnowledgeGraph` | Cross-project shared KG. All projects on this machine query it alongside their own KG. Seeded by `install.py` Step 7d from `vibecoded-orchestrator/knowledge/`. |
 | `SHARED_KG_OPT_OUT` | `false` | Per-project opt-out. Set to `true` (or `1`/`yes`) to disable shared-KG queries for this project. The shared collection itself is unaffected — other projects keep using it. |
 | `SHARED_KG_NODE_FORMATS` | (unset) | Override path for the shared KG's `.node_formats.json` sidecar. Used by tests; in production the sidecar is read from `<orchestrator>/knowledge/.node_formats.json` via `_SERVER_INFERRED_BASE`. |

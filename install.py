@@ -3281,6 +3281,9 @@ def _probe_service_identity(name: str, port: int) -> tuple[str, str]:
             exact_markers = {"KnowledgeGraph", "VibeCodedTools_KnowledgeGraph",
                              "Development", "CodeFunction", "CodeClass",
                              "CodeModule", "CodeAPI", "CodeInteraction"}
+            # `_conversations` is a legacy marker (collection deprecated
+            # 2026-04-30) — kept here for detection of old installs only.
+            # New installs do NOT create the conversations collection.
             suffix_markers = ("_KnowledgeGraph", "_Development",
                               "_CodeFunction", "_CodeClass", "_CodeModule",
                               "_conversations", "_development")
@@ -4557,7 +4560,10 @@ def _env_canonical_template(project_name: str = "<project>",
         ("SHARED_KG_COLLECTION", "VibeCodedTools_KnowledgeGraph", None),
         ("DEVELOPMENT_COLLECTION", f"{project_name}_Development", None),
         ("PROJECT_NAME", project_name, None),
-        ("CONVERSATION_COLLECTION", f"{project_name}_conversations", None),
+        # CONVERSATION_COLLECTION removed 2026-04-30 — capture flow deprecated
+        # and the collection was dropped from new installs. If you have an
+        # existing install with conversations data, that collection still
+        # exists but is no longer written to.
         ("", None, ""),
 
         # LLM API keys
