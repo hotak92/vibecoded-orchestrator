@@ -2241,6 +2241,72 @@ def _detect_installed_runtime() -> str:
     return ""
 
 
+def _ensure_nvidia_cdi_spec_for_podman() -> None:
+    """Generate the NVIDIA CDI spec for Podman if missing.
+
+    Podman needs a CDI YAML at /etc/cdi/nvidia.yaml to expose
+    `nvidia.com/gpu=all` device entries. The NVIDIA Container Toolkit
+    ships `nvidia-ctk` for this. We invoke it idempotently before
+    compose-up.
+
+    Behavior:
+      - Skip silently on macOS / Windows (CDI is a Linux concept).
+      - Skip if /etc/cdi/nvidia.yaml already exists (idempotent).
+      - Skip if `nvidia-ctk` isn't on PATH — print a one-line hint with
+        the NVIDIA Container Toolkit install URL so the user can fix it.
+        Compose-up will fail loudly afterwards, which is the right
+        signal in this case.
+      - On Linux with nvidia-ctk present: run `sudo nvidia-ctk cdi
+        generate --output=/etc/cdi/nvidia.yaml`. Sudo prompt surfaces
+        in the controlling terminal. If sudo is non-interactive (CI),
+        this fails; user re-runs install with sudo or sets up CDI
+        manually.
+
+    No-op + non-fatal by design — install.py prints what happened and
+    moves on. The compose-up that follows will surface the real error
+    if CDI didn't get set up.
+    """
+    if platform.system() != "Linux":
+        # macOS Podman runs in a VM; CDI generation happens inside
+        # the VM via Podman Machine, not on the host. Skip for now.
+        return
+
+    cdi_path = Path("/etc/cdi/nvidia.yaml")
+    if cdi_path.exists():
+        # Already configured. nvidia-ctk is idempotent so we could
+        # re-run anyway, but the no-op is cheaper.
+        return
+
+    if not shutil.which("nvidia-ctk"):
+        print(
+            "  [!] Podman + NVIDIA: `nvidia-ctk` not on PATH. Install the "
+            "NVIDIA Container Toolkit:\n"
+            "      https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html\n"
+            "      (then re-run install — compose-up will fail until CDI is set up)"
+        )
+        return
+
+    print("  Generating NVIDIA CDI spec for Podman (sudo required) ...")
+    try:
+        result = subprocess.run(
+            ["sudo", "nvidia-ctk", "cdi", "generate",
+             "--output=/etc/cdi/nvidia.yaml"],
+            capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode == 0:
+            print("    ✓ /etc/cdi/nvidia.yaml created")
+        else:
+            print(
+                f"    ! nvidia-ctk exited {result.returncode}; "
+                f"compose-up may fail to find GPU. Stderr: "
+                f"{result.stderr.strip()[:200]}"
+            )
+    except subprocess.TimeoutExpired:
+        print("    ! nvidia-ctk timed out (>60s); skipping")
+    except Exception as e:
+        print(f"    ! nvidia-ctk failed: {e}")
+
+
 def _prompt_install_container_runtime(args: argparse.Namespace) -> bool:
     """Prompt the user to install Podman/Docker when neither is detected.
 
@@ -3795,23 +3861,39 @@ def _start_services(sysinfo: SystemInfo, args: argparse.Namespace,
     # + /dev/dri device passthrough). The two are mutually exclusive —
     # picking the wrong one means Ollama silently runs CPU-only despite
     # has_gpu=True. Distinguished via sysinfo.gpu_vendor.
+    #
+    # Podman vs Docker: each engine needs a different compose overlay
+    # because the device-passthrough syntax differs (Docker reads
+    # `deploy.resources.reservations.devices`; Podman uses CDI form
+    # `devices: [nvidia.com/gpu=all]`). Pick by `sysinfo.container_cmd`.
+    is_podman = "podman" in (sysinfo.container_cmd or "").lower()
     if sysinfo.has_gpu:
         if sysinfo.gpu_vendor == "amd":
-            rocm_file = infra_dir / "docker-compose.amd-rocm.yml"
+            rocm_file_name = "podman-compose.amd-rocm.yml" if is_podman else "docker-compose.amd-rocm.yml"
+            rocm_file = infra_dir / rocm_file_name
             if rocm_file.exists():
                 cmd.extend(["-f", str(rocm_file), "--profile", "gpu"])
-                print("  GPU overlay: AMD ROCm (Ollama ROCm image, /dev/kfd + /dev/dri)")
+                engine = "Podman" if is_podman else "Docker"
+                print(f"  GPU overlay: AMD ROCm ({engine}: Ollama ROCm image, /dev/kfd + /dev/dri)")
             else:
-                print("  WARNING: AMD ROCm overlay file not found, running CPU-only")
+                print(f"  WARNING: AMD ROCm overlay {rocm_file_name} not found, running CPU-only")
         else:
             # Default to NVIDIA overlay for has_gpu=True with vendor
             # unset or "nvidia" (back-compat with --gpu flag).
-            gpu_file = infra_dir / "docker-compose.gpu.yml"
+            gpu_file_name = "podman-compose.gpu.yml" if is_podman else "docker-compose.gpu.yml"
+            gpu_file = infra_dir / gpu_file_name
             if gpu_file.exists():
+                # Podman + NVIDIA prerequisite: nvidia-ctk CDI spec must
+                # exist on the host. install.py runs the generator once
+                # before compose-up so compose can reference
+                # `nvidia.com/gpu=all` without manual setup.
+                if is_podman:
+                    _ensure_nvidia_cdi_spec_for_podman()
                 cmd.extend(["-f", str(gpu_file), "--profile", "gpu"])
-                print("  GPU overlay: NVIDIA (includes code_embed container)")
+                engine = "Podman" if is_podman else "Docker"
+                print(f"  GPU overlay: NVIDIA ({engine}: includes code_embed container)")
             else:
-                print("  WARNING: GPU overlay file not found, running CPU-only")
+                print(f"  WARNING: GPU overlay {gpu_file_name} not found, running CPU-only")
 
     cmd.extend(["up", "-d"])
     # When subset detection said only some services are missing, pass them

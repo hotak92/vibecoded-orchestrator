@@ -1,0 +1,52 @@
+# AMD ROCm overlay — PODMAN-SPECIFIC.
+#
+# Apply with:
+#   podman-compose -f docker-compose.yml -f podman-compose.amd-rocm.yml --profile gpu up -d
+#
+# Why a separate file from docker-compose.amd-rocm.yml:
+#   - Podman rootless commonly uses `--group-add keep-groups` to
+#     preserve the host user's supplementary groups (video, render)
+#     inside the container. That mechanism doesn't exist on Docker;
+#     Docker users add the user to those groups on the host instead.
+#   - The `devices` block has the same shape on both engines, but
+#     splitting the files makes the rootless flow self-contained.
+#
+# Prerequisites (Podman, run ONCE on the host BEFORE compose-up):
+#
+#   1. ROCm kernel driver loaded (`rocm-smi` returns 0).
+#
+#   2. /dev/kfd and /dev/dri readable from the user account that runs
+#      Podman. Two paths:
+#      (a) Add the user to the `video` and `render` host groups:
+#            sudo usermod -aG video,render $USER
+#          Then log out/in. install.py does this when it detects
+#          rootless podman + missing group membership.
+#      (b) OR pass `--group-add keep-groups` to podman-compose so the
+#          container inherits supplementary groups. (Built-in below
+#          as `group_add: [keep-groups]` — Podman-only.)
+#
+#   3. Verify with:  podman run --rm --device /dev/kfd --device /dev/dri \
+#                      --group-add keep-groups docker.io/rocm/dev-ubuntu-22.04 \
+#                      rocm-smi
+#
+# References:
+#   - AMD ROCm container guide: https://rocm.docs.amd.com/projects/install-on-linux/en/latest/how-to/docker.html
+#   - Podman GPU access:        https://podman-desktop.io/docs/podman/gpu
+
+services:
+  ollama:
+    image: docker.io/ollama/ollama:0.20.2-rocm
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    # `keep-groups` is Podman-specific; preserves host supplementary
+    # groups (video, render) inside the rootless container without
+    # needing to know their numeric GIDs. Equivalent to
+    # `--group-add keep-groups` on the CLI.
+    group_add:
+      - keep-groups
+
+  # code_embed has no ROCm build path today (CodeSage runs on CUDA or
+  # CPU only). AMD users get the Ollama-based code embedding fallback
+  # (jina-v2-base-code) automatically when install.py picks the "cpu"
+  # embedding profile.

@@ -1,22 +1,44 @@
 # AMD ROCm overlay — apply with:
-#   docker compose -f docker-compose.yml -f docker-compose.amd-rocm.yml --profile gpu up -d
 #
-# Requires:
+#   Docker:        docker compose -f docker-compose.yml -f docker-compose.amd-rocm.yml --profile gpu up -d
+#   Podman:        podman-compose -f docker-compose.yml -f docker-compose.amd-rocm.yml --profile gpu up -d
+#
+# Requires (any container engine):
 #   - ROCm kernel driver loaded on host (`rocm-smi` returns 0)
-#   - Host user in `video` and `render` groups (Linux): the container
-#     needs read access to /dev/kfd and /dev/dri to talk to the GPU.
+#   - /dev/kfd and /dev/dri exist on the host
 #   - Ollama ROCm image. Pinned to the same upstream version family as
 #     the base compose.yaml's CPU/CUDA image so the daemon protocol
 #     stays in sync. Bump deliberately when the base image is bumped.
 #
-# Authoritative reference: Ollama's official Docker docs
-#   https://github.com/ollama/ollama/blob/main/docs/docker.md  (AMD GPU section)
-#   https://hub.docker.com/r/ollama/ollama  (rocm tag)
+# Linux host group setup (per engine):
 #
-# We deliberately drop the NVIDIA `deploy.resources.reservations.devices`
-# block from the GPU overlay — the two are mutually exclusive. If a host
-# has both NVIDIA and AMD silicon, install.py picks NVIDIA first (since
-# nvidia-smi is probed before rocm-smi).
+#   Docker:
+#     User running `docker compose` is in the `docker` group; the
+#     container picks up `video` + `render` group access via the
+#     `group_add` block below. Names resolved against host /etc/group
+#     at start time.
+#
+#   Podman (rootless, recommended):
+#     Two approaches work — pick one:
+#     (a) Add the user to host `video` and `render` groups, then
+#         `group_add: [video, render]` below works as-is. Tested with
+#         podman-compose ≥ 1.0.6.
+#     (b) Use `--group-add keep-groups` (Podman-specific) to preserve
+#         the host user's supplementary groups inside the container.
+#         podman-compose translates `group_add` to that form on recent
+#         versions; on older releases run `podman-compose run` with
+#         `--group-add keep-groups` manually instead.
+#
+# References:
+#   - Ollama Docker docs: https://hub.docker.com/r/ollama/ollama
+#   - AMD ROCm container guide: https://rocm.docs.amd.com/projects/install-on-linux/en/latest/how-to/docker.html
+#   - Podman GPU access: https://podman-desktop.io/docs/podman/gpu
+#
+# Conflict notes:
+#   We deliberately drop the NVIDIA `deploy.resources.reservations.devices`
+#   block from the GPU overlay — the two are mutually exclusive. If a host
+#   has both NVIDIA and AMD silicon, install.py picks NVIDIA first (since
+#   nvidia-smi is probed before rocm-smi).
 
 services:
   ollama:

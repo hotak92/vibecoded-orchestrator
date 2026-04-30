@@ -1,0 +1,41 @@
+# NVIDIA CUDA overlay — PODMAN-SPECIFIC.
+#
+# Apply with:
+#   podman-compose -f docker-compose.yml -f podman-compose.gpu.yml --profile gpu up -d
+#
+# Why a separate file from docker-compose.gpu.yml:
+#   - Podman ≥ 4.6 reads the standard `deploy.resources.reservations.devices`
+#     block but only when the NVIDIA CDI spec has been generated on the
+#     host (see prerequisites below).
+#   - On older Podman releases or when CDI is unavailable, the canonical
+#     form is `--device nvidia.com/gpu=all` (CDI form). podman-compose
+#     translates this from a `devices: [nvidia.com/gpu=all]` entry, NOT
+#     from a `deploy.resources.reservations.devices` block.
+#   - Docker compose can't parse the `nvidia.com/gpu=all` device spec —
+#     that's why we keep two files.
+#
+# Prerequisites (Podman, run ONCE on the host BEFORE compose-up):
+#
+#   1. Install NVIDIA Container Toolkit:
+#      https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
+#
+#   2. Generate the CDI spec — install.py does this automatically when it
+#      detects podman + nvidia-smi at install time. Manual fallback:
+#        sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+#        sudo nvidia-ctk runtime configure --runtime=podman
+#
+#   3. Verify with:  podman run --rm --device nvidia.com/gpu=all \
+#                      ubuntu nvidia-smi
+#
+# References:
+#   - Podman GPU access:           https://podman-desktop.io/docs/podman/gpu
+#   - NVIDIA Container Toolkit:    https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
+
+services:
+  ollama:
+    devices:
+      - nvidia.com/gpu=all
+
+  code_embed:
+    devices:
+      - nvidia.com/gpu=all
