@@ -49,7 +49,7 @@ INPUT="$(cat 2>/dev/null || true)"
 [ -z "$INPUT" ] && exit 0
 
 FIRST_THRESHOLD="${KG_NUDGE_FIRST:-150000}"
-INTERVAL="${KG_NUDGE_INTERVAL:-10000}"
+INTERVAL="${KG_NUDGE_INTERVAL:-25000}"
 METRICS_DIR="$HOME/.claude/metrics"
 METRICS_FILE="$METRICS_DIR/kg_update_tokens.jsonl"
 
@@ -189,14 +189,14 @@ elif is_user_prompt:
                 f"📚 KG-update nudge ({kilo}k tokens since last KG-write, "
                 f"{since_last}k since last nudge — escalating because no KG node was written between nudges)."
             )
-        msg = preamble + """ Counter resets only on writes to knowledge/**/*.md OR store_knowledge_node calls.
+        msg = preamble + """ Counter resets on Write or Edit to knowledge/**/*.md OR store_knowledge_node calls.
 
-Before continuing, review what you've learned in this session and:
-  - UPDATE existing nodes if outdated (status, content, valid_until)
-  - CREATE new nodes for non-obvious facts: project state, architecture decisions, gotchas, patterns
-  - Use store_knowledge_node OR write directly to knowledge/**/*.md (hook auto-syncs to Weaviate)
+Workflow (do these in order — don't skip steps):
+  1. SEARCH: list what you've learned this session that's worth keeping. For each item, run hybrid_search('<topic phrase>') against the KG to find nodes that should ABSORB the new info.
+  2. UPDATE: for each match, Edit the existing node — extend content, set 'valid_until' if the old content was superseded. Re-grouping into existing nodes prevents duplicate-KG drift.
+  3. CREATE only if no existing node fits. Two near-duplicate nodes hurt future-grep more than the missing node would.
 
-If you've genuinely learned nothing worth recording, write a brief comment to that effect and continue. But don't silently skip the prompt."""
+If after the search you've genuinely learned nothing worth recording, write a one-line comment saying so and continue — don't skip silently."""
         # UserPromptSubmit hooks surface STDOUT as <system-reminder>
         # context, not stderr. v2/v3 used stderr — the message was
         # generated correctly but never reached the conversation.
