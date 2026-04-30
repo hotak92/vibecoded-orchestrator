@@ -115,9 +115,6 @@ if is_post_tool:
                 break
 
 # --- Read cumulative session tokens from live transcript ---
-# Skip the costly scan on PostToolUse if it's a KG-write (we just need to
-# reset and don't actually need the current total).
-session_total = 0
 # v4 (2026-04-30): always scan when a transcript is available. v3 tried
 # to skip the scan on KG-write events (assuming we'd just reset
 # baseline), but that left baseline at 0 because last_seen_total
@@ -125,6 +122,16 @@ session_total = 0
 # reset the counter at all in long sessions. Scanning unconditionally
 # (~0.65s on 168 MB transcripts) is cheap; baseline now reflects the
 # real cumulative-tokens-at-write-time.
+#
+# v6 (2026-04-30): also scan for an opt-out marker. If the assistant
+# wrote literal "[No KG update needed]" in the most recent assistant
+# message, treat that turn as if it were a KG write (reset baseline +
+# fired_once). Cheap, transcript-based escape hatch — agent doesn't
+# have to actually edit a knowledge file just to silence the nudge
+# when the session genuinely had nothing worth recording.
+session_total = 0
+escape_marker_token_total = 0  # session_total at the time the marker was last seen; 0 if never
+NO_KG_UPDATE_MARKER = "[No KG update needed]"
 need_total = bool(transcript_path) and os.path.exists(transcript_path)
 if need_total:
     try:
@@ -140,12 +147,31 @@ if need_total:
                     if not isinstance(msg, dict):
                         continue
                     usage = msg.get("usage")
-                    if not isinstance(usage, dict):
-                        continue
-                    in_tok = int(usage.get("input_tokens") or 0)
-                    out_tok = int(usage.get("output_tokens") or 0)
-                    cc_tok = int(usage.get("cache_creation_input_tokens") or 0)
-                    session_total += in_tok + out_tok + cc_tok
+                    if isinstance(usage, dict):
+                        in_tok = int(usage.get("input_tokens") or 0)
+                        out_tok = int(usage.get("output_tokens") or 0)
+                        cc_tok = int(usage.get("cache_creation_input_tokens") or 0)
+                        session_total += in_tok + out_tok + cc_tok
+
+                    # Escape-hatch detection: only inspect assistant
+                    # messages, only top-level text content (not
+                    # tool_result echoes from earlier turns). Capture
+                    # the cumulative session_total at the time of the
+                    # marker so we can tell whether it appeared after
+                    # the last baseline reset.
+                    if msg.get("role") == "assistant":
+                        content = msg.get("content")
+                        text_parts = []
+                        if isinstance(content, str):
+                            text_parts.append(content)
+                        elif isinstance(content, list):
+                            for c in content:
+                                if isinstance(c, dict) and c.get("type") == "text":
+                                    t = c.get("text") or ""
+                                    if t:
+                                        text_parts.append(t)
+                        if any(NO_KG_UPDATE_MARKER in t for t in text_parts):
+                            escape_marker_token_total = session_total
     except OSError:
         pass
 
@@ -176,6 +202,17 @@ current = state.get(session_id, {
     "fired_once": False,
 })
 
+# --- Escape-hatch: "[No KG update needed]" marker in latest assistant turn ---
+# v6 (2026-04-30): if the assistant explicitly declared no-KG-needed for
+# this batch of work, treat it like a KG write. The marker must appear
+# AFTER the current baseline (otherwise it's stale from a previous
+# escape that already reset). Cheap to honor — saves the agent from
+# having to write a placeholder KG file just to silence the nudge.
+escape_hatch_active = (
+    escape_marker_token_total > 0
+    and escape_marker_token_total > int(current.get("baseline", 0))
+)
+
 # --- Branch logic ---
 if is_session_compact:
     # /compact (manual) and auto-compaction both fire SessionStart with
@@ -193,6 +230,13 @@ elif is_post_tool and is_knowledge_update:
     # didn't recompute (we skipped the transcript scan above).
     base = session_total if session_total else int(current.get("last_seen_total", 0))
     current["baseline"] = base
+    current["last_nudge_at"] = 0
+    current["fired_once"] = False
+elif escape_hatch_active:
+    # Treat the most recent escape-marker assistant turn as a baseline
+    # reset point. The marker's session_total IS the new baseline so
+    # subsequent work counts from there.
+    current["baseline"] = escape_marker_token_total
     current["last_nudge_at"] = 0
     current["fired_once"] = False
 elif is_user_prompt:
@@ -224,7 +268,7 @@ Workflow (do these in order — don't skip steps):
   2. UPDATE: for each match, Edit the existing node — extend content, set 'valid_until' if the old content was superseded. Re-grouping into existing nodes prevents duplicate-KG drift.
   3. CREATE only if no existing node fits. Two near-duplicate nodes hurt future-grep more than the missing node would.
 
-If after the search you've genuinely learned nothing worth recording, write a one-line comment saying so and continue — don't skip silently."""
+If after the search you've genuinely learned nothing worth recording, write the literal phrase [No KG update needed] in your reply (top-level text, not inside a tool call) — the next hook run will detect it via transcript scan and reset the counter. Use this when the work was orthogonal (deploys, status checks, scrubs that were already captured) — NOT as a default escape from doing the search. Don't skip silently."""
         # UserPromptSubmit hooks surface STDOUT as <system-reminder>
         # context, not stderr. v2/v3 used stderr — the message was
         # generated correctly but never reached the conversation.
