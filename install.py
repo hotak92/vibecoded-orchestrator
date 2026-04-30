@@ -1343,6 +1343,21 @@ def main() -> int:
                         help="Skip pulling Ollama models")
     parser.add_argument("--update", action="store_true",
                         help="Update mode: skip clone, re-install deps + restart services")
+    parser.add_argument("--rebuild-collections", action="store_true", default=False,
+                        help="Drop and re-ingest Weaviate collections (KG + dev). "
+                             "Required when the schema invariants change "
+                             "(named-vector slots, index_null_state, etc.) and "
+                             "Weaviate ≤1.30 doesn't allow Reconfigure for those. "
+                             "ONLY touches Weaviate state — your .md sources, "
+                             ".env, .vscode/settings.json, .claude/settings.json "
+                             "are NOT modified. Auto-detected and prompted on "
+                             "--update when the running collection lacks "
+                             "today's invariants.")
+    parser.add_argument("--skip-rebuild-prompt", action="store_true", default=False,
+                        help="During --update, skip the schema-rebuild prompt "
+                             "even if the running collection is on an older "
+                             "schema. Use to defer the rebuild for a later "
+                             "session (search may misbehave until rebuilt).")
     parser.add_argument("--quiet", action="store_true",
                         help="Minimal output")
     parser.add_argument("--with-joern", action="store_true", default=False,
@@ -1595,6 +1610,16 @@ def main() -> int:
         #     ⇒ writes to user-owned Weaviate WITH EXPLICIT CONSENT
         # No path writes without consent. The default for foreign is
         # alt-port, so the no-consent case never hits ACTION_ADOPT.
+        # Schema-rebuild gate (--update only): if the running KG
+        # collection is on an older schema lacking today's invariants
+        # (named-vector slots, index_null_state, etc.), prompt to drop
+        # + recreate. User-driven decision; defaults to deferring on
+        # non-interactive shells without --yes. ONLY touches Weaviate
+        # state — sources, env, settings stay intact. After drop,
+        # _ensure_collections recreates with the fresh schema and
+        # _seed_weaviate re-ingests from sources.
+        if _maybe_prompt_rebuild_collections(args):
+            _rebuild_collections(args)
         _ensure_collections(embed_config, decisions=decisions, args=args)
         # Seed Weaviate with bundled knowledge/ + docs/. Idempotent;
         # safe to re-run on update.
@@ -4428,6 +4453,182 @@ def _ensure_collections(embed_config: dict,
 #   .claude/scripts/kg-sync --all       (handles knowledge/ + docs/)
 #
 # The script is idempotent so re-runs are safe.
+
+def _detect_kg_schema_drift(weaviate_url: str, kg_collection: str) -> tuple[bool, list[str]]:
+    """Probe a running KG collection for today's required schema invariants.
+
+    Returns (drift_detected, missing_features). drift_detected=True
+    means the collection exists but lacks one or more invariants that
+    the current code requires. missing_features lists the human-readable
+    invariant names so the prompt can show the user what changed.
+
+    Invariants checked (today's set; grow this list when new ones land):
+      - 3 named-vector slots (qwen3_embed, ollama_embed, openai_embed)
+      - inverted_index_config.index_null_state == True
+
+    Both invariants CANNOT be retro-added on Weaviate ≤1.30 — the only
+    fix is drop + re-ingest. Return value drives the prompt in
+    `_maybe_prompt_rebuild_collections`.
+
+    Failure-soft: if Weaviate is unreachable or the collection doesn't
+    exist, returns (False, []) — caller treats that as "no drift" and
+    leaves the seed step to handle creation. We only flag drift when we
+    can affirmatively see a non-conformant existing schema.
+    """
+    try:
+        import urllib.request
+        # Weaviate v1 REST: GET /v1/schema/<class> returns the schema.
+        req = urllib.request.Request(
+            f"{weaviate_url.rstrip('/')}/v1/schema/{kg_collection}",
+            headers={"Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            if resp.status != 200:
+                return (False, [])
+            schema = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return (False, [])
+
+    missing: list[str] = []
+
+    # Check named-vector slots
+    vec_config = schema.get("vectorConfig") or {}
+    expected_slots = {"qwen3_embed", "ollama_embed", "openai_embed"}
+    actual_slots = set(vec_config.keys())
+    if not expected_slots.issubset(actual_slots):
+        gap = sorted(expected_slots - actual_slots)
+        missing.append(f"named-vector slots (missing: {', '.join(gap)})")
+
+    # Check index_null_state
+    inv_idx = schema.get("invertedIndexConfig") or {}
+    if not inv_idx.get("indexNullState", False):
+        missing.append("index_null_state=True (required for stale-filter)")
+
+    return (bool(missing), missing)
+
+
+def _maybe_prompt_rebuild_collections(args: argparse.Namespace) -> bool:
+    """During --update, detect schema drift and prompt the user.
+
+    Returns True iff the rebuild should run. Exits silently with False
+    on:
+      - install (not update) mode — schema is fresh by definition
+      - --skip-rebuild-prompt — explicit defer
+      - --rebuild-collections — explicit opt-in (returns True directly)
+      - non-interactive shell with no --yes — fail safe; no destructive
+        action without confirmation
+    """
+    if not args.update:
+        return False
+    if args.rebuild_collections:
+        # Explicit opt-in. No prompt needed.
+        return True
+    if args.skip_rebuild_prompt:
+        return False
+
+    # Detect drift on the running KG collection.
+    weaviate_url = os.environ.get("WEAVIATE_URL", f"http://localhost:{DEFAULT_WEAVIATE_PORT}")
+    kg_collection = os.environ.get("KG_COLLECTION", "")
+    if not kg_collection:
+        # No KG collection configured — first install probably; let
+        # _ensure_collections + _seed_weaviate handle it.
+        return False
+
+    drift, missing = _detect_kg_schema_drift(weaviate_url, kg_collection)
+    if not drift:
+        return False
+
+    print()
+    print("=" * 70)
+    print("⚠️  SCHEMA REBUILD REQUIRED")
+    print("=" * 70)
+    print()
+    print(f"The running KG collection ({kg_collection}) is on an older schema:")
+    for feat in missing:
+        print(f"  - missing: {feat}")
+    print()
+    print("Today's code requires these invariants. Weaviate ≤1.30 doesn't")
+    print("allow adding them via Reconfigure — the collections must be")
+    print("dropped and re-ingested from `knowledge/` and `docs/`.")
+    print()
+    print("What gets touched:")
+    print("  ✓ Weaviate collections (DROPPED + recreated + re-ingested)")
+    print("  ✗ Your .md source files in knowledge/ and docs/  (untouched)")
+    print("  ✗ .env / .vscode/settings.json / .claude/settings.json (untouched)")
+    print("  ✗ The launcher's project bindings (untouched)")
+    print()
+    print("Estimated time: ~3-5 minutes (Ollama re-embeds ~600 nodes).")
+    print()
+
+    # Non-interactive flow: respect --yes; otherwise refuse to nuke data.
+    if not sys.stdin.isatty():
+        if getattr(args, "yes", False):
+            print("(non-interactive --yes: proceeding with rebuild)")
+            return True
+        print("Non-interactive shell + no --yes — DEFERRING rebuild.")
+        print("Re-run with `install.py --update --rebuild-collections` to apply.")
+        print("Note: search may misbehave until rebuild completes.")
+        return False
+
+    answer = input("Proceed with rebuild? [y/N]: ").strip().lower()
+    return answer in ("y", "yes")
+
+
+def _rebuild_collections(args: argparse.Namespace) -> None:
+    """Drop the KG and dev collections (when configured) so the
+    subsequent _ensure_collections + _seed_weaviate steps recreate
+    them with today's schema and re-ingest from sources.
+
+    Idempotent: silently skips collections that don't exist. Logs each
+    drop as a separate install event for forensics.
+    """
+    print("[7b.1/10] Dropping KG + Dev collections for schema rebuild ...")
+    _log_install_event("7b.1/10", "start", "schema-rebuild collection drop")
+
+    try:
+        import weaviate
+        weaviate_url = os.environ.get("WEAVIATE_URL", f"http://localhost:{DEFAULT_WEAVIATE_PORT}")
+        host = weaviate_url.replace("http://", "").replace("https://", "").split(":")[0]
+        port = int(weaviate_url.rsplit(":", 1)[-1]) if ":" in weaviate_url else 8080
+        client = weaviate.connect_to_custom(
+            http_host=host,
+            http_port=port,
+            http_secure=False,
+            grpc_host=host,
+            grpc_port=int(os.environ.get("GRPC_PORT", "50052")),
+            grpc_secure=False,
+            skip_init_checks=True,
+        )
+        try:
+            for env_key, label in [
+                ("KG_COLLECTION", "KG"),
+                ("DEVELOPMENT_COLLECTION", "Dev"),
+            ]:
+                name = os.environ.get(env_key, "")
+                if not name:
+                    continue
+                if client.collections.exists(name):
+                    print(f"  Dropping {label}: {name} ...")
+                    client.collections.delete(name)
+                    _log_install_event(
+                        "7b.1/10", "step",
+                        f"dropped {label}: {name}",
+                        data={"collection": name},
+                    )
+                else:
+                    print(f"  {label} ({name}) does not exist — skipping drop")
+        finally:
+            client.close()
+        _log_install_event("7b.1/10", "ok", "schema-rebuild drop complete")
+    except Exception as e:
+        print(f"  ! rebuild drop failed: {e}")
+        print("    Update will continue but search may misbehave until")
+        print("    you manually drop the collections and re-run --update.")
+        _log_install_event(
+            "7b.1/10", "error",
+            f"rebuild drop failed: {e}",
+        )
+
 
 def _seed_weaviate(args: argparse.Namespace) -> None:
     print("[7c/10] Seeding Weaviate with bundled knowledge/ + docs/ ... ", flush=True)
