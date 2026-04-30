@@ -115,6 +115,17 @@ DEFAULT_CODE_EMBED_PORT = 11440
 # and code-side in
 #   claude_mcp_servers/weaviate_mcp/code_truncation.py:CODE_MODEL_TOKEN_LIMITS
 # That is the single source of truth — do not re-declare chunk sizes here.
+# Each profile keeps its own static `embedding_models` — these are the
+# Ollama-served embedding models that MUST be pulled regardless of
+# hardware. Inference models (qwen3.5:9b, gemma4:e4b, qwen3.5:0.8b) are
+# layered on at install time by `_inference_models_for_capability` based
+# on detected VRAM/RAM, then merged with `embedding_models` to form the
+# final pull list. See _build_ollama_pull_list().
+#
+# The "low_resource" profile is special: it explicitly opts the user in
+# to the smallest models, so we DO NOT layer larger inference tiers on
+# top of it even if the host could run them. Respect the explicit
+# choice.
 EMBEDDING_CONFIGS = {
     "gpu": {
         "text_model": "qwen3-embedding:0.6b",
@@ -122,17 +133,7 @@ EMBEDDING_CONFIGS = {
         "code_backend": "gpu",
         "code_model": "codesage-large-v2",
         "code_dims": 2048,
-        # Inference + summarization: pull the canonical tier ladder so
-        # _select_text_model() in ollama_mcp/server.py has real models
-        # to choose from at runtime. qwen3.5:9b is the workstation default
-        # (text + vision + summarization); gemma4:e4b is the 12-18 GB RAM
-        # summarizer fallback; qwen3.5:0.8b is the always-fits safety net.
-        "ollama_models": [
-            "qwen3-embedding:0.6b",
-            "qwen3.5:9b",
-            "gemma4:e4b",
-            "qwen3.5:0.8b",
-        ],
+        "embedding_models": ["qwen3-embedding:0.6b"],
         "description": "GPU-accelerated (qwen3 text + CodeSage code, best quality)",
     },
     "cpu": {
@@ -141,12 +142,9 @@ EMBEDDING_CONFIGS = {
         "code_backend": "ollama",
         "code_model": "unclemusclez/jina-embeddings-v2-base-code:latest",
         "code_dims": 768,
-        "ollama_models": [
+        "embedding_models": [
             "qwen3-embedding:0.6b",
             "unclemusclez/jina-embeddings-v2-base-code:latest",
-            "qwen3.5:9b",
-            "gemma4:e4b",
-            "qwen3.5:0.8b",
         ],
         "description": "CPU-only (qwen3 text + Jina V2 code, both via Ollama)",
     },
@@ -156,13 +154,8 @@ EMBEDDING_CONFIGS = {
         "code_backend": "openai",
         "code_model": "text-embedding-3-small",
         "code_dims": 1536,
-        # Inference: same canonical tier ladder, even with OpenAI embeddings —
-        # users still want local inference for FREE chat/read_document.
-        "ollama_models": [
-            "qwen3.5:9b",
-            "gemma4:e4b",
-            "qwen3.5:0.8b",
-        ],
+        # OpenAI handles embeddings; only inference models need pulling.
+        "embedding_models": [],
         "description": "OpenAI API (fastest, requires API key)",
     },
     # Lightest mode for low-RAM / low-VRAM machines.
@@ -176,27 +169,49 @@ EMBEDDING_CONFIGS = {
         "code_backend": "ollama",
         "code_model": "unclemusclez/jina-embeddings-v2-base-code:latest",
         "code_dims": 768,
-        # No qwen3.5:9b on low-resource (6.6 GB doesn't fit comfortably);
-        # gemma4:e4b is the canonical 12 GB summarizer.
-        "ollama_models": [
+        "embedding_models": [
             "snowflake-arctic-embed2:latest",
             "unclemusclez/jina-embeddings-v2-base-code:latest",
-            "gemma4:e4b",
-            "qwen3.5:0.8b",
         ],
+        # Hard-cap inference models for this profile — user opted in.
+        # qwen3.5:0.8b is the canonical always-fits floor on main.
+        "inference_models_override": ["gemma4:e4b", "qwen3.5:0.8b"],
         "description": "Low-resource (Arctic text + Jina V2 code, both via Ollama)",
     },
 }
+
+
+def _build_ollama_pull_list(embed_config: dict, sysinfo: SystemInfo) -> list[str]:
+    """Combine the profile's static embedding models with the right
+    inference-model tier for this host. Deduplicates while preserving
+    order (embedding models first, inference second).
+    """
+    embedding_models: list[str] = list(embed_config.get("embedding_models") or [])
+    override = embed_config.get("inference_models_override")
+    if override:
+        inference_models = list(override)
+    else:
+        inference_models = _inference_models_for_capability(sysinfo)
+    seen: set[str] = set()
+    out: list[str] = []
+    for m in embedding_models + inference_models:
+        if m and m not in seen:
+            seen.add(m)
+            out.append(m)
+    return out
 
 HEALTH_TIMEOUT = 120  # seconds
 
 
 class SystemInfo(NamedTuple):
     os_name: str        # "Linux", "Windows", "Darwin"
-    has_gpu: bool       # NVIDIA GPU detected
+    has_gpu: bool       # NVIDIA or AMD ROCm GPU usable by Ollama container
     has_metal: bool     # Apple Silicon (Metal)
     container_cmd: str  # "docker" or "podman" or ""
     gpu_name: str       # GPU model name or ""
+    vram_gb: float = 0.0      # GPU VRAM in GB if has_gpu else 0.0
+    ram_gb: float = 0.0       # System RAM in GB
+    gpu_vendor: str = ""      # "nvidia" | "amd" | "metal" | "" — picks compose overlay
 
 
 # ---------------------------------------------------------------------------
@@ -1553,7 +1568,7 @@ def main() -> int:
         _start_services(sysinfo, args, embed_config, decisions)
         if not args.skip_models:
             _wait_for_ollama()
-            _pull_ollama_models(embed_config["ollama_models"])
+            _pull_ollama_models(_build_ollama_pull_list(embed_config, sysinfo))
 
         # Bug 29: with shared-container reuse, multiple installs hit the same
         # Weaviate. Bootstrap any of THIS project's KG/Development collections
@@ -1735,7 +1750,10 @@ def _detect_system(args: argparse.Namespace) -> SystemInfo:
     has_gpu = False
     has_metal = False
     gpu_name = ""
+    gpu_vendor = ""
+    vram_gb = 0.0
     container_cmd = ""
+    ram_gb = _probe_system_ram_gb()
 
     # GPU detection
     if args.cpu_only:
@@ -1757,11 +1775,14 @@ def _detect_system(args: argparse.Namespace) -> SystemInfo:
         # opt-in install for users who want it.
         has_gpu, gpu_name = _detect_nvidia_gpu()
         if has_gpu:
+            gpu_vendor = "nvidia"
+            vram_gb = _probe_nvidia_vram_gb()
             extra = _probe_nvidia_versions()
+            vram_label = f", {vram_gb:.1f} GB VRAM" if vram_gb > 0 else ""
             if extra:
-                print(f"  GPU: {gpu_name} ({extra})")
+                print(f"  GPU: {gpu_name} ({extra}{vram_label})")
             else:
-                print(f"  GPU: {gpu_name}")
+                print(f"  GPU: {gpu_name}{vram_label.lstrip(',').rstrip()}")
         else:
             rocm_present, rocm_info = _detect_amd_rocm()
             if rocm_present:
@@ -1770,10 +1791,14 @@ def _detect_system(args: argparse.Namespace) -> SystemInfo:
                 # docs); if their build doesn't, the user gets a clear
                 # runtime error and can fall back to --cpu-only.
                 has_gpu = True
+                gpu_vendor = "amd"
                 gpu_name = rocm_info
-                print(f"  GPU: {rocm_info}")
+                vram_gb = _probe_amd_rocm_vram_gb()
+                vram_label = f" ({vram_gb:.1f} GB VRAM)" if vram_gb > 0 else ""
+                print(f"  GPU: {rocm_info}{vram_label}")
             elif os_name == "Darwin" and _detect_apple_silicon():
                 has_metal = True
+                gpu_vendor = "metal"
                 print("  GPU: Apple Silicon (Metal — built-in, no driver install needed)")
             else:
                 _print_gpu_hint(os_name)
@@ -1791,12 +1816,22 @@ def _detect_system(args: argparse.Namespace) -> SystemInfo:
 
     print(f"  OS: {os_name} ({platform.machine()})")
 
+    # If --gpu was forced and no vendor detected, default to "nvidia" so
+    # the existing GPU overlay still applies (back-compat: prior behaviour
+    # was NVIDIA-only).
+    final_has_gpu = has_gpu or args.gpu
+    final_vendor = gpu_vendor or ("nvidia" if args.gpu else "")
+    if ram_gb > 0:
+        print(f"  RAM: {ram_gb:.1f} GB")
     info = SystemInfo(
         os_name=os_name,
-        has_gpu=has_gpu or args.gpu,
+        has_gpu=final_has_gpu,
         has_metal=has_metal,
         container_cmd=container_cmd,
         gpu_name=gpu_name,
+        vram_gb=vram_gb,
+        ram_gb=ram_gb,
+        gpu_vendor=final_vendor,
     )
     _log_install_event(
         "2/10", "ok",
@@ -1808,6 +1843,9 @@ def _detect_system(args: argparse.Namespace) -> SystemInfo:
             "has_metal": info.has_metal,
             "container_cmd": container_cmd,
             "gpu_name": gpu_name,
+            "gpu_vendor": final_vendor,
+            "vram_gb": vram_gb,
+            "ram_gb": ram_gb,
         },
     )
     return info
@@ -1915,6 +1953,175 @@ def _detect_amd_rocm() -> tuple[bool, str]:
         return True, "AMD GPU (ROCm detected)"
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return False, ""
+
+
+def _probe_nvidia_vram_gb() -> float:
+    """Best-effort NVIDIA VRAM probe via nvidia-smi.
+
+    Returns total VRAM (GB) for GPU 0, or 0.0 on any failure. Multi-GPU
+    hosts: we just take the first card — the install-time selector
+    only cares whether SOMETHING in the box can hold a given model.
+    """
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            mb = float(result.stdout.strip().splitlines()[0].strip())
+            return round(mb / 1024.0, 2)
+    except (FileNotFoundError, subprocess.TimeoutExpired, ValueError, OSError):
+        pass
+    return 0.0
+
+
+def _probe_amd_rocm_vram_gb() -> float:
+    """Best-effort AMD ROCm VRAM probe.
+
+    Tries `rocm-smi --showmeminfo vram --csv` first (newer rocm-smi),
+    falls back to plain `--showmeminfo vram` text parse. Returns total
+    VRAM (GB) or 0.0 on any failure.
+
+    rocm-smi text format varies by version; we look for a "Total Memory"
+    or "vram Total Memory" line and parse the bytes value. CSV format is
+    more stable but not universally supported.
+    """
+    if not shutil.which("rocm-smi"):
+        return 0.0
+    # Try CSV first (cleaner parse).
+    try:
+        result = subprocess.run(
+            ["rocm-smi", "--showmeminfo", "vram", "--csv"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            # CSV header includes "VRAM Total Memory (B)" or similar.
+            lines = [ln for ln in result.stdout.splitlines() if ln.strip()]
+            if len(lines) >= 2:
+                header = [h.strip().lower() for h in lines[0].split(",")]
+                values = [v.strip() for v in lines[1].split(",")]
+                for i, h in enumerate(header):
+                    if "vram" in h and "total" in h and i < len(values):
+                        try:
+                            bytes_val = float(values[i])
+                            return round(bytes_val / (1024.0 ** 3), 2)
+                        except ValueError:
+                            continue
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+    # Text fallback.
+    try:
+        result = subprocess.run(
+            ["rocm-smi", "--showmeminfo", "vram"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                ll = line.lower()
+                if "total" in ll and "memory" in ll and ":" in line:
+                    val = line.split(":", 1)[1].strip().split()[0]
+                    try:
+                        bytes_val = float(val)
+                        # Heuristic: if value is huge it's bytes; if small, MB.
+                        if bytes_val > 1024 ** 3:
+                            return round(bytes_val / (1024.0 ** 3), 2)
+                        if bytes_val > 1024:
+                            return round(bytes_val / 1024.0, 2)  # MB→GB
+                        return round(bytes_val, 2)
+                    except ValueError:
+                        continue
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+    return 0.0
+
+
+def _probe_system_ram_gb() -> float:
+    """Best-effort system RAM probe across Linux/macOS/Windows.
+
+    Uses `psutil` if available (fastest and most portable). Falls back
+    to /proc/meminfo on Linux, `sysctl hw.memsize` on macOS, and `wmic`
+    on Windows. Returns 0.0 on any failure — caller handles gracefully.
+    """
+    try:
+        import psutil  # type: ignore
+        return round(psutil.virtual_memory().total / (1024.0 ** 3), 2)
+    except ImportError:
+        pass
+    except Exception:
+        return 0.0
+
+    system = platform.system()
+    try:
+        if system == "Linux":
+            with open("/proc/meminfo", "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        kb = int(line.split()[1])
+                        return round(kb / (1024.0 ** 2), 2)
+        elif system == "Darwin":
+            result = subprocess.run(
+                ["sysctl", "-n", "hw.memsize"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return round(int(result.stdout.strip()) / (1024.0 ** 3), 2)
+        elif system == "Windows":
+            result = subprocess.run(
+                ["wmic", "ComputerSystem", "get", "TotalPhysicalMemory"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                for line in result.stdout.splitlines():
+                    s = line.strip()
+                    if s.isdigit():
+                        return round(int(s) / (1024.0 ** 3), 2)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError, ValueError):
+        pass
+    return 0.0
+
+
+# Inference model tier ladder for install-time pulls.
+#
+# This MIRRORS the runtime selector ladder in
+#   claude_mcp_servers/ollama_mcp/server.py:TEXT_MODEL_TIERS
+# Do not let them drift — the runtime selector picks from what we pull
+# here, so a thresholds mismatch leads to "auto" picking a model that
+# isn't installed and falling back unexpectedly.
+#
+# Ladder (matches runtime exactly as of 2026-04-29):
+#   GPU + VRAM >= 7.5 GB         → qwen3.5:9b + gemma4:e4b + qwen3.5:0.8b
+#   GPU + VRAM >= 5.0 GB         → gemma4:e4b + qwen3.5:0.8b
+#   GPU + VRAM >= 1.0 GB         → qwen3.5:0.8b
+#   no GPU + RAM >= 24 GB        → qwen3.5:9b + gemma4:e4b + qwen3.5:0.8b
+#   no GPU + RAM >= 12 GB        → gemma4:e4b + qwen3.5:0.8b
+#   else (incl. probe failures)  → qwen3.5:0.8b  (always-fits floor)
+def _inference_models_for_capability(sysinfo: SystemInfo) -> list[str]:
+    """Return inference models to pull given detected capability.
+
+    Returns at minimum ["qwen3.5:0.8b"] — the floor that fits down to 4 GB
+    RAM. Larger tiers are added only when the host can actually run them.
+    """
+    floor = ["qwen3.5:0.8b"]
+    has_gpu = bool(sysinfo.has_gpu)
+    vram = float(sysinfo.vram_gb or 0.0)
+    ram = float(sysinfo.ram_gb or 0.0)
+
+    if has_gpu and vram >= 7.5:
+        return ["qwen3.5:9b", "gemma4:e4b", "qwen3.5:0.8b"]
+    if has_gpu and vram >= 5.0:
+        return ["gemma4:e4b", "qwen3.5:0.8b"]
+    if has_gpu and vram >= 1.0:
+        # Tiny GPU (<5 GB VRAM, e.g. older laptop dGPU) — trust GPU
+        # presence but only pull the floor model. Anything larger
+        # would OOM at runtime.
+        return floor
+    # CPU-only paths — RAM-driven.
+    if ram >= 24.0:
+        return ["qwen3.5:9b", "gemma4:e4b", "qwen3.5:0.8b"]
+    if ram >= 12.0:
+        return ["gemma4:e4b", "qwen3.5:0.8b"]
+    return floor
 
 
 def _lspci_has_vendor(vendor_substr: str) -> bool:
@@ -3569,14 +3776,29 @@ def _start_services(sysinfo: SystemInfo, args: argparse.Namespace,
 
     cmd = [*compose_cmd, "-f", str(compose_file)]
 
-    # GPU overlay + code_embed profile
+    # GPU overlay + code_embed profile.
+    # NVIDIA → docker-compose.gpu.yml (deploy.resources NVIDIA driver).
+    # AMD ROCm → docker-compose.amd-rocm.yml (Ollama ROCm image + /dev/kfd
+    # + /dev/dri device passthrough). The two are mutually exclusive —
+    # picking the wrong one means Ollama silently runs CPU-only despite
+    # has_gpu=True. Distinguished via sysinfo.gpu_vendor.
     if sysinfo.has_gpu:
-        gpu_file = infra_dir / "docker-compose.gpu.yml"
-        if gpu_file.exists():
-            cmd.extend(["-f", str(gpu_file), "--profile", "gpu"])
-            print("  GPU overlay: enabled (includes code_embed container)")
+        if sysinfo.gpu_vendor == "amd":
+            rocm_file = infra_dir / "docker-compose.amd-rocm.yml"
+            if rocm_file.exists():
+                cmd.extend(["-f", str(rocm_file), "--profile", "gpu"])
+                print("  GPU overlay: AMD ROCm (Ollama ROCm image, /dev/kfd + /dev/dri)")
+            else:
+                print("  WARNING: AMD ROCm overlay file not found, running CPU-only")
         else:
-            print("  WARNING: GPU overlay file not found, running CPU-only")
+            # Default to NVIDIA overlay for has_gpu=True with vendor
+            # unset or "nvidia" (back-compat with --gpu flag).
+            gpu_file = infra_dir / "docker-compose.gpu.yml"
+            if gpu_file.exists():
+                cmd.extend(["-f", str(gpu_file), "--profile", "gpu"])
+                print("  GPU overlay: NVIDIA (includes code_embed container)")
+            else:
+                print("  WARNING: GPU overlay file not found, running CPU-only")
 
     cmd.extend(["up", "-d"])
     # When subset detection said only some services are missing, pass them
