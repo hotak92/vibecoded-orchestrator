@@ -348,6 +348,15 @@ class EnsureCollectionsAdoptModeTests(unittest.TestCase):
         # which left our docs unseeded (Step 7c then exited 1). Fixed
         # in 2026-04-27 — assert the project-scoped collection is
         # always created in adopt mode.
+        #
+        # The expected dev-collection name depends on `install.PROJECT_ROOT`
+        # (PascalCased basename + `_Development`). When the test is run
+        # from a worktree (e.g. /tmp/vco-kg-port) the name differs from
+        # the production "VibecodedOrchestrator". Derive the expected
+        # name dynamically so the test is worktree-agnostic — both the
+        # main checkout and any /tmp/<x> worktree pass.
+        expected_dev = install._derive_project_dev_name(install.PROJECT_ROOT)
+
         server, port, _ = _start_server()
         try:
             _Handler.schema = {"classes": [
@@ -368,8 +377,8 @@ class EnsureCollectionsAdoptModeTests(unittest.TestCase):
             posted_classes = [p.get("class") for p in _Handler.posted]
             # Our own per-project `_development` must be created.
             self.assertIn(
-                "VibecodedOrchestrator_Development", posted_classes,
-                f"expected VibecodedOrchestrator_Development to be created; "
+                expected_dev, posted_classes,
+                f"expected {expected_dev} to be created; "
                 f"posted: {posted_classes}",
             )
             # We must NOT touch the sibling project's collection.
