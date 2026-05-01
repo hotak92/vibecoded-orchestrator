@@ -48,8 +48,8 @@ set -uo pipefail
 INPUT="$(cat 2>/dev/null || true)"
 [ -z "$INPUT" ] && exit 0
 
-FIRST_THRESHOLD="${KG_NUDGE_FIRST:-175000}"
-INTERVAL="${KG_NUDGE_INTERVAL:-50000}"
+FIRST_THRESHOLD="${KG_NUDGE_FIRST:-500000}"
+INTERVAL="${KG_NUDGE_INTERVAL:-200000}"
 METRICS_DIR="$HOME/.claude/metrics"
 METRICS_FILE="$METRICS_DIR/kg_update_tokens.jsonl"
 
@@ -131,78 +131,59 @@ if is_post_tool:
 # when the session genuinely had nothing worth recording.
 session_total = 0
 escape_marker_token_total = 0  # session_total at the time the marker was last seen; 0 if never
-# v8 (2026-05-01): counter is `output_tokens` ONLY, not the previous
-# `input + output + cache_creation` sum. Prior versions over-counted
-# by ~50× because `input_tokens` reports the FULL context window for
-# each turn (prompt-cache rereads), so a long session double-counted
-# the same prefix on every turn. Operators saw 50M+ "tokens" within a
-# few turns and the threshold tripped almost immediately. New signal
-# is the genuinely-produced model output (monotonic, per-turn,
-# cache-independent). Old state files written under v1-v7 have wildly
-# inflated baselines — the hook tolerates them (mismatched baseline
-# just means the counter looks small relative to baseline, so the
-# hook waits) but operators may want to manually drop pre-v8 state
-# entries for active sessions to reset cleanly.
+seen_request_ids = set()
+# v9 (2026-05-01): counter is cache_creation_input_tokens summed
+# over requestId-deduped entries. Web research + live transcript
+# verification (16,349 raw entries -> 6,950 deduped, 57.5% redundant):
+#   - input_tokens is a streaming placeholder, 75% are 0 or 1 — UNRELIABLE
+#   - output_tokens undercounted ~10-17x vs statusbar — UNRELIABLE
+#   - cache_creation_input_tokens matches statusbar 1x — RELIABLE
+# v8's output-tokens-only counter still over-fired because Claude Code
+# emits ~3 JSONL entries per actual API request during streaming;
+# without requestId dedup, totals are ~3x inflated. v9 dedups by
+# requestId and uses cache_creation as the genuine "new context the
+# model had to digest" signal. New thresholds (500k first, 200k
+# interval) reflect the cache_creation scale: a typical multi-hour
+# substantive session lands ~500k-1M, casual chat sessions stay
+# under 100k.
 #
 # v7 (2026-04-30): the escape marker now requires a non-empty reason — the
-# bare `[No KG update needed]` string is no longer accepted. Pattern:
-#   `[No KG update needed: <one-or-more non-empty chars>]`
+# bare "No KG update needed" string is no longer accepted. Pattern requires
+# the marker bracket plus a colon plus at least one non-whitespace char.
 # This forces the agent to articulate WHY the work was orthogonal instead
 # of treating the escape hatch as a default. The regex below allows any
-# character except `]` and requires at least one non-whitespace char.
+# character except a closing bracket and requires at least one non-whitespace char.
 import re
 NO_KG_UPDATE_MARKER_RE = re.compile(r"\[No KG update needed:\s*\S[^\]]*\]")
-need_total = bool(transcript_path) and os.path.exists(transcript_path)
-if need_total:
-    try:
-        size = os.path.getsize(transcript_path)
-        if size < 256 * 1024 * 1024:
-            with open(transcript_path, "r", errors="replace") as f:
-                for line in f:
-                    try:
-                        d = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    msg = d.get("message")
-                    if not isinstance(msg, dict):
-                        continue
-                    usage = msg.get("usage")
-                    if isinstance(usage, dict):
-                        # Counter: output_tokens ONLY. Earlier versions
-                        # summed input + output + cache_creation across
-                        # turns, which double-counted massively because
-                        # `input_tokens` reports the FULL context window
-                        # for that turn (prompt-cache rereads). For a
-                        # 16k-turn session that produced an over-count of
-                        # ~7B "tokens" — the threshold tripped within a
-                        # handful of turns and the nudge fired constantly.
-                        # `output_tokens` is the cleanest "work produced"
-                        # signal: monotonic, per-turn, no caching effects.
-                        # 175K output_tokens ≈ 200 turns at avg verbosity.
-                        out_tok = int(usage.get("output_tokens") or 0)
-                        session_total += out_tok
 
-                    # Escape-hatch detection: only inspect assistant
-                    # messages, only top-level text content (not
-                    # tool_result echoes from earlier turns). Capture
-                    # the cumulative session_total at the time of the
-                    # marker so we can tell whether it appeared after
-                    # the last baseline reset.
-                    if msg.get("role") == "assistant":
-                        content = msg.get("content")
-                        text_parts = []
-                        if isinstance(content, str):
-                            text_parts.append(content)
-                        elif isinstance(content, list):
-                            for c in content:
-                                if isinstance(c, dict) and c.get("type") == "text":
-                                    t = c.get("text") or ""
-                                    if t:
-                                        text_parts.append(t)
-                        if any(NO_KG_UPDATE_MARKER_RE.search(t) for t in text_parts):
-                            escape_marker_token_total = session_total
-    except OSError:
+# v9: delegate transcript scanning to shared module
+# (.claude/scripts/claude_token_counter.py). The module dedups by
+# requestId and sums cache_creation_input_tokens — see its module
+# docstring for field-reliability rationale. Hooks are invoked with
+# cwd=project root, so the relative .claude/scripts path resolves.
+_have_scanner = False
+_scripts_dir = os.path.join(os.getcwd(), ".claude", "scripts")
+if os.path.isfile(os.path.join(_scripts_dir, "claude_token_counter.py")):
+    sys.path.insert(0, _scripts_dir)
+    try:
+        from claude_token_counter import TranscriptScanner, iter_assistant_text
+        _have_scanner = True
+    except ImportError:
         pass
+
+if _have_scanner and transcript_path and os.path.exists(transcript_path):
+    _escape_holder = [0]
+    def _on_msg(entry, msg, running_cc):
+        # Escape-hatch detection: only top-level assistant text.
+        # Capture session_total at the time of the LATEST marker so the
+        # baseline-reset logic can compare against current baseline.
+        for t in iter_assistant_text(msg):
+            if NO_KG_UPDATE_MARKER_RE.search(t):
+                _escape_holder[0] = running_cc
+                break
+    scan_result = TranscriptScanner().scan(transcript_path, on_assistant_message=_on_msg)
+    session_total = scan_result.cache_creation_total
+    escape_marker_token_total = _escape_holder[0]
 
 # --- Read existing state ---
 state = {}
