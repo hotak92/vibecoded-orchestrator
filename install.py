@@ -76,6 +76,16 @@ from typing import NamedTuple
 MIN_PYTHON = (3, 11)
 PROJECT_ROOT = Path(__file__).resolve().parent
 
+# vco_lib lives at PROJECT_ROOT/vco_lib (sibling of install.py). Make it
+# importable when install.py is invoked directly (no package context).
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+# Single source of truth — see vco_lib/project_init.py docstring.
+# Moved to vco_lib.project_init in PR 2 — kept as shim for existing
+# callers; will be removed in PR 9 (cleanup).
+from vco_lib import project_init as _project_init  # noqa: E402
+
 
 # 2026-04-29 fix (wizard install-path lockdown): defensive sanity check
 # that PROJECT_ROOT is actually a vco source repo. The CLI path
@@ -4209,102 +4219,15 @@ def _pull_ollama_models(models: list[str]) -> None:
 # v4 client `client.collections.get(name)` which doesn't require a strict
 # property list to insert; richer schemas can be added later without
 # re-creating the class.
-def _named_vector_config() -> dict:
-    """Three named-vector slots: qwen3_embed (active default, 1024-dim),
-    ollama_embed (legacy snowflake-arctic-embed2, 1024-dim, kept for back-
-    compat), and openai_embed (1536-dim, for users who set OPENAI_API_KEY).
-
-    Each slot has `vectorizer: none` so we feed pre-computed embeddings
-    from the MCP server. Index type stays HNSW (Weaviate default for ANN).
-
-    The MCP server's `sync_knowledge_graph.py` writes objects with at
-    least one named vector populated; the others are filled lazily as the
-    user pulls more embedding backends. Without this multi-vector config
-    seeding fails with HTTP 422 ("collection configured without multiple
-    named vectors, but received named vectors").
-    """
-    return {
-        "qwen3_embed":  {"vectorizer": {"none": {}}, "vectorIndexType": "hnsw"},
-        "ollama_embed": {"vectorizer": {"none": {}}, "vectorIndexType": "hnsw"},
-        "openai_embed": {"vectorizer": {"none": {}}, "vectorIndexType": "hnsw"},
-    }
-
-
-def _kg_class_definition(name: str) -> dict:
-    return {
-        "class": name,
-        "description": "VibeCoded Tools knowledge graph collection",
-        "vectorConfig": _named_vector_config(),
-        "properties": [
-            {"name": "title", "dataType": ["text"]},
-            {"name": "content", "dataType": ["text"]},
-            {"name": "file_path", "dataType": ["text"]},
-            {"name": "node_type", "dataType": ["text"]},
-            {"name": "tags", "dataType": ["text[]"]},
-            {"name": "links", "dataType": ["text[]"]},
-            # WikiLink edges as nested objects: [[relationType::Target]]
-            # → {relation_type: "uses", target_title: "Target"}.
-            {
-                "name": "typed_links",
-                "dataType": ["object[]"],
-                "nestedProperties": [
-                    {"name": "relation_type", "dataType": ["text"]},
-                    {"name": "target_title", "dataType": ["text"]},
-                ],
-            },
-            {"name": "status", "dataType": ["text"]},
-        ],
-    }
-
-
-def _development_class_definition(name: str) -> dict:
-    return {
-        "class": name,
-        "description": "VibeCoded Tools project documentation collection",
-        "vectorConfig": _named_vector_config(),
-        "properties": [
-            {"name": "title", "dataType": ["text"]},
-            {"name": "content", "dataType": ["text"]},
-            {"name": "file_path", "dataType": ["text"]},
-        ],
-    }
-
-
-_SAFE_CLASS_RE = re.compile(r"[^A-Za-z0-9]+")
-
-
-def _derive_project_kg_name(project_root: Path) -> str:
-    """Derive a per-project KG class name from the project root basename.
-
-    Weaviate class names must start with a capital letter and only contain
-    `[A-Za-z0-9_]`. We PascalCase the basename, drop everything else, and
-    suffix with `_KnowledgeGraph`. Fallback when nothing usable survives:
-    `vct_KnowledgeGraph` (lowercase prefix is intentional — Weaviate
-    capitalises the first letter on POST regardless, and the `vct_` token
-    flags it as installer-managed).
-    """
-    base = project_root.name or ""
-    parts = [p for p in _SAFE_CLASS_RE.split(base) if p]
-    if not parts:
-        return "vct_KnowledgeGraph"
-    pascal = "".join(p[:1].upper() + p[1:] for p in parts)
-    if not pascal or not pascal[0].isalpha():
-        return "vct_KnowledgeGraph"
-    return f"{pascal}_KnowledgeGraph"
-
-
-def _derive_project_dev_name(project_root: Path) -> str:
-    """Project-scoped Development collection name. Mirrors the per-project
-    KG naming so adopt mode does not pollute with a bare `Development`.
-    """
-    base = project_root.name or ""
-    parts = [p for p in _SAFE_CLASS_RE.split(base) if p]
-    if not parts:
-        return "vct_Development"
-    pascal = "".join(p[:1].upper() + p[1:] for p in parts)
-    if not pascal or not pascal[0].isalpha():
-        return "vct_Development"
-    return f"{pascal}_Development"
+# Moved to vco_lib.project_init in PR 2 — kept as shim for existing callers;
+# will be removed in PR 9 (cleanup). The old underscored names are exported
+# below for back-compat with tests and other modules.
+_named_vector_config = _project_init._named_vector_config
+_kg_class_definition = _project_init._kg_class_definition
+_development_class_definition = _project_init._development_class_definition
+_SAFE_CLASS_RE = _project_init._SAFE_CLASS_RE
+_derive_project_kg_name = _project_init._derive_project_kg_name
+_derive_project_dev_name = _project_init._derive_project_dev_name
 
 
 def _ensure_collections(embed_config: dict,
@@ -4559,57 +4482,9 @@ def _ensure_collections(embed_config: dict,
 #
 # The script is idempotent so re-runs are safe.
 
-def _detect_kg_schema_drift(weaviate_url: str, kg_collection: str) -> tuple[bool, list[str]]:
-    """Probe a running KG collection for today's required schema invariants.
-
-    Returns (drift_detected, missing_features). drift_detected=True
-    means the collection exists but lacks one or more invariants that
-    the current code requires. missing_features lists the human-readable
-    invariant names so the prompt can show the user what changed.
-
-    Invariants checked (today's set; grow this list when new ones land):
-      - 3 named-vector slots (qwen3_embed, ollama_embed, openai_embed)
-      - inverted_index_config.index_null_state == True
-
-    Both invariants CANNOT be retro-added on Weaviate ≤1.30 — the only
-    fix is drop + re-ingest. Return value drives the prompt in
-    `_maybe_prompt_rebuild_collections`.
-
-    Failure-soft: if Weaviate is unreachable or the collection doesn't
-    exist, returns (False, []) — caller treats that as "no drift" and
-    leaves the seed step to handle creation. We only flag drift when we
-    can affirmatively see a non-conformant existing schema.
-    """
-    try:
-        import urllib.request
-        # Weaviate v1 REST: GET /v1/schema/<class> returns the schema.
-        req = urllib.request.Request(
-            f"{weaviate_url.rstrip('/')}/v1/schema/{kg_collection}",
-            headers={"Accept": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            if resp.status != 200:
-                return (False, [])
-            schema = json.loads(resp.read().decode("utf-8"))
-    except Exception:
-        return (False, [])
-
-    missing: list[str] = []
-
-    # Check named-vector slots
-    vec_config = schema.get("vectorConfig") or {}
-    expected_slots = {"qwen3_embed", "ollama_embed", "openai_embed"}
-    actual_slots = set(vec_config.keys())
-    if not expected_slots.issubset(actual_slots):
-        gap = sorted(expected_slots - actual_slots)
-        missing.append(f"named-vector slots (missing: {', '.join(gap)})")
-
-    # Check index_null_state
-    inv_idx = schema.get("invertedIndexConfig") or {}
-    if not inv_idx.get("indexNullState", False):
-        missing.append("index_null_state=True (required for stale-filter)")
-
-    return (bool(missing), missing)
+# Moved to vco_lib.project_init in PR 2 — kept as shim for existing callers;
+# will be removed in PR 9 (cleanup).
+_detect_kg_schema_drift = _project_init._detect_kg_schema_drift
 
 
 def _maybe_prompt_rebuild_collections(args: argparse.Namespace) -> bool:
@@ -4679,60 +4554,17 @@ def _maybe_prompt_rebuild_collections(args: argparse.Namespace) -> bool:
     return answer in ("y", "yes")
 
 
+# Moved to vco_lib.project_init in PR 2 — kept as shim for existing callers;
+# will be removed in PR 9 (cleanup). PR 3 will replace the underlying
+# implementation with `migrate_collections` (smart copy/patch/rebuild
+# dispatch) but keep this entry-point name for back-compat.
 def _rebuild_collections(args: argparse.Namespace) -> None:
-    """Drop the KG and dev collections (when configured) so the
-    subsequent _ensure_collections + _seed_weaviate steps recreate
-    them with today's schema and re-ingest from sources.
+    """Shim — delegates to vco_lib.project_init.rebuild_collections.
 
-    Idempotent: silently skips collections that don't exist. Logs each
-    drop as a separate install event for forensics.
+    Passes the install.py-local `_log_install_event` so forensic logs
+    continue to land in the same JSONL stream.
     """
-    print("[7b.1/10] Dropping KG + Dev collections for schema rebuild ...")
-    _log_install_event("7b.1/10", "start", "schema-rebuild collection drop")
-
-    try:
-        import weaviate
-        weaviate_url = os.environ.get("WEAVIATE_URL", f"http://localhost:{DEFAULT_WEAVIATE_PORT}")
-        host = weaviate_url.replace("http://", "").replace("https://", "").split(":")[0]
-        port = int(weaviate_url.rsplit(":", 1)[-1]) if ":" in weaviate_url else 8080
-        client = weaviate.connect_to_custom(
-            http_host=host,
-            http_port=port,
-            http_secure=False,
-            grpc_host=host,
-            grpc_port=int(os.environ.get("GRPC_PORT", "50052")),
-            grpc_secure=False,
-            skip_init_checks=True,
-        )
-        try:
-            for env_key, label in [
-                ("KG_COLLECTION", "KG"),
-                ("DEVELOPMENT_COLLECTION", "Dev"),
-            ]:
-                name = os.environ.get(env_key, "")
-                if not name:
-                    continue
-                if client.collections.exists(name):
-                    print(f"  Dropping {label}: {name} ...")
-                    client.collections.delete(name)
-                    _log_install_event(
-                        "7b.1/10", "step",
-                        f"dropped {label}: {name}",
-                        data={"collection": name},
-                    )
-                else:
-                    print(f"  {label} ({name}) does not exist — skipping drop")
-        finally:
-            client.close()
-        _log_install_event("7b.1/10", "ok", "schema-rebuild drop complete")
-    except Exception as e:
-        print(f"  ! rebuild drop failed: {e}")
-        print("    Update will continue but search may misbehave until")
-        print("    you manually drop the collections and re-run --update.")
-        _log_install_event(
-            "7b.1/10", "error",
-            f"rebuild drop failed: {e}",
-        )
+    _project_init.rebuild_collections(args, log_event=_log_install_event)
 
 
 def _seed_weaviate(args: argparse.Namespace) -> None:
