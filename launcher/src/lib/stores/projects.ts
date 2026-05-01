@@ -11,6 +11,7 @@ import type {
   SwitchHostResult,
   CreateProjectResult,
   RenameProjectResult,
+  UpdateProjectResult,
 } from '$lib/types/launcher';
 import { toast } from '$lib/stores/toast';
 
@@ -97,6 +98,63 @@ function createProjectsStore() {
       }));
       saveSelected(project.id);
       return project;
+    },
+
+    /**
+     * PR 5 (2026-05-01): re-run the bundle install in update mode against
+     * an existing project. Picks up newly-shipped orchestrator files
+     * (hooks, scripts, agents, skills, settings, infrastructure) WITHOUT
+     * overwriting user customizations.
+     *
+     * On success: toasts a one-line summary ("N updated, M preserved") +
+     * info/error toasts for every entry in `result.warnings`. The toast
+     * stream surfaces deferral writes (schema migration required, user-
+     * modified files preserved) so the user knows what to action next.
+     *
+     * On hard env failure (project missing, folder gone): the invoke
+     * itself throws — we re-throw to the caller so it can render a
+     * fatal error UI.
+     */
+    async update(id: string): Promise<UpdateProjectResult> {
+      const result = await invoke<UpdateProjectResult>('update_project_v2', {
+        projectId: id,
+      });
+
+      // One-line summary toast: choose info/success based on whether
+      // anything actually changed (created + overwritten + always_overwritten > 0).
+      const s = result.summary;
+      const shipped = s.created + s.overwritten + s.always_overwritten;
+      if (shipped === 0 && s.preserved === 0 && s.errors_count === 0) {
+        toast.success('Project bundle already up to date.');
+      } else {
+        const parts: string[] = [];
+        if (s.created > 0) parts.push(`${s.created} created`);
+        if (s.overwritten > 0) parts.push(`${s.overwritten} updated`);
+        if (s.always_overwritten > 0) parts.push(`${s.always_overwritten} always-updated`);
+        if (s.preserved > 0) parts.push(`${s.preserved} user-modifications preserved`);
+        if (s.errors_count > 0) parts.push(`${s.errors_count} errors`);
+        const line = parts.length > 0 ? parts.join(', ') : 'no changes';
+        if (s.errors_count > 0) {
+          toast.error(`Bundle update finished: ${line}.`);
+        } else {
+          toast.success(`Bundle update finished: ${line}.`);
+        }
+      }
+
+      // Stream every warning as its own toast so the user sees the
+      // deferral pointers (schema migration required, user-modified
+      // files preserved). They're info-level conditions, not blocking
+      // failures — but the project owner should action them.
+      for (const w of result.warnings) toast.error(w);
+
+      // Refresh the cached project view (e.g. updated_at bumped via
+      // db.log_change).
+      update((s) => ({
+        ...s,
+        projects: s.projects.map((p) => (p.id === id ? result.project : p)),
+      }));
+
+      return result;
     },
 
     async rename(id: string, newName: string): Promise<ProjectView> {

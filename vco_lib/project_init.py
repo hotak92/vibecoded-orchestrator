@@ -2115,6 +2115,103 @@ def _emit_skipped_existing_deferral(
     report.write(folder)
 
 
+def _emit_migrate_required_deferral(
+    folder: Path,
+    *,
+    project_name: str,
+    weaviate_url: str,
+    plan_entries: list[dict],
+) -> None:
+    """Emit `schema_migration_required`: a Weaviate dry-run plan revealed
+    one or more collections need `copy` or `rebuild` to reach the target
+    schema. Both are destructive (drop+recreate the collection),
+    so we DO NOT auto-apply them — we surface a deferral entry that names
+    each collection + its required action and tells the user the explicit
+    command to consent.
+
+    Args:
+        folder: target user-project folder.
+        project_name: raw project name (the user-facing label).
+        weaviate_url: the URL the dry-run probed (echoed in the command_to_apply).
+        plan_entries: list of `{"collection", "action"}` dicts where action is
+            in {"copy", "rebuild"}. Anything filtered before this call.
+
+    Severity is `warning`: the project is functional with the existing schema
+    (read paths still work), but new schema features (e.g. `index_null_state`)
+    are missing until the user explicitly consents to migrate.
+    """
+    if not plan_entries:
+        return
+    from vco_lib.deferral_report import DeferralEntry, DeferralReport
+
+    # Render the per-collection action plan as a bullet list. Sorted for
+    # determinism so deferral .md doesn't churn between runs that produce
+    # the same plan in different order.
+    detected_lines = []
+    has_rebuild = False
+    for entry in sorted(plan_entries, key=lambda e: (e.get("collection") or "", e.get("action") or "")):
+        coll = entry.get("collection") or "?"
+        action = entry.get("action") or "?"
+        if action == "rebuild":
+            has_rebuild = True
+            detected_lines.append(
+                f"  - `{coll}` → **rebuild** (drop + re-embed; legacy single-vector format)"
+            )
+        else:
+            detected_lines.append(
+                f"  - `{coll}` → **copy-with-vectors** (atomic swap; ~30s per collection)"
+            )
+
+    # Build the suggested command. `--force-rebuild` is only mentioned when
+    # the plan actually has a rebuild entry — otherwise the smart copy path
+    # handles it without the escape hatch.
+    if has_rebuild:
+        cmd = (
+            f"# Run the migration explicitly (preserves vectors via copy where possible,\n"
+            f"# falls back to drop+re-embed for legacy single-vector collections):\n"
+            f"python -m vco_lib.project_init migrate-collections "
+            f"--name {project_name!r} --weaviate-url {weaviate_url!r} --json\n"
+            f"# OR force the destructive drop+re-embed for ALL collections (slower,\n"
+            f"# requires Ollama embedding service to be healthy; ~3-5 min):\n"
+            f"python -m vco_lib.project_init migrate-collections "
+            f"--name {project_name!r} --weaviate-url {weaviate_url!r} "
+            f"--force-rebuild --json"
+        )
+    else:
+        cmd = (
+            f"# Run the migration explicitly (atomic copy-with-vectors swap;\n"
+            f"# preserves all UUIDs + vectors + WikiLink cross-references):\n"
+            f"python -m vco_lib.project_init migrate-collections "
+            f"--name {project_name!r} --weaviate-url {weaviate_url!r} --json"
+        )
+
+    entry = DeferralEntry(
+        condition_id="schema_migration_required",
+        title="Schema migration required",
+        detected=(
+            f"A pre-update dry-run of `migrate-collections` against "
+            f"`{weaviate_url}` reported one or more per-project Weaviate "
+            f"collections need a destructive migration to reach the current "
+            f"target schema:\n"
+            + "\n".join(detected_lines)
+        ),
+        why_deferred=(
+            "Schema drift detected. `copy` and `rebuild` actions modify "
+            "Weaviate state in ways that are not silently reversible "
+            "(`copy` drops the collection mid-swap; `rebuild` re-embeds "
+            "every object via Ollama). PR 5's update flow defers this so "
+            "the user explicitly consents — the bundle install (hooks, "
+            "agents, scripts) still proceeds and is unaffected."
+        ),
+        command_to_apply=cmd,
+        severity="warning",
+        kg_node_refs=[],
+    )
+    report = DeferralReport.read(folder)
+    report.add_entry(entry)
+    report.write(folder)
+
+
 def install_project_bundle(
     folder: Path,
     orchestrator_root: Optional[Path] = None,
@@ -2513,7 +2610,7 @@ def _cmd_derive(args: argparse.Namespace) -> int:
 
 def _cmd_migrate_collections(args: argparse.Namespace) -> int:
     """`migrate-collections --name <name> [--dry-run] [--force-rebuild]
-    [--weaviate-url <url>] --json`
+    [--weaviate-url <url>] [--project-folder <path>] --json`
 
     Sets KG_COLLECTION + DEVELOPMENT_COLLECTION env vars from --name
     (using canonical derivation), then runs the dispatcher.
@@ -2521,7 +2618,16 @@ def _cmd_migrate_collections(args: argparse.Namespace) -> int:
     JSON stdout schema:
       {"plan": [{"collection", "action", "objects_copied", "elapsed_ms"}],
        "dry_run": bool,
+       "deferral_emitted": bool,
        "errors": [{"collection", "action", "error"}]}
+
+    PR 5 (2026-05-01): when --dry-run AND --project-folder are both set
+    AND the plan contains any `copy` or `rebuild` action, a
+    `schema_migration_required` deferral entry is written to
+    `<project-folder>/.claude/context/UPDATE_DEFERRED.md`. This is the
+    pre-update path used by Rust `update_project_v2` to surface destructive
+    schema migrations for explicit user consent (rather than auto-applying
+    them mid-bundle-install).
 
     Exit 0 on success; 1 if any errors[] entry exists.
     """
@@ -2540,10 +2646,39 @@ def _cmd_migrate_collections(args: argparse.Namespace) -> int:
         dry_run=bool(args.dry_run),
         weaviate_url=args.weaviate_url,
     )
+    result.setdefault("deferral_emitted", False)
+
+    # PR 5: drift-detection deferral (pre-update path).
+    project_folder = getattr(args, "project_folder", None)
+    if project_folder and bool(args.dry_run) and not result["errors"]:
+        destructive = [
+            e for e in result.get("plan", [])
+            if e.get("action") in ("copy", "rebuild")
+        ]
+        if destructive:
+            try:
+                _emit_migrate_required_deferral(
+                    Path(project_folder).resolve(),
+                    project_name=args.name,
+                    weaviate_url=args.weaviate_url or _weaviate_url_default(),
+                    plan_entries=destructive,
+                )
+                result["deferral_emitted"] = True
+            except Exception as e:
+                # Soft-fail: a deferral write failure must not abort the
+                # whole update flow. Report via errors[] so the Rust caller
+                # surfaces it as a warning toast.
+                result["errors"].append({
+                    "collection": None,
+                    "action": "deferral",
+                    "error": f"migrate-required deferral write failed: "
+                             f"{type(e).__name__}: {e}",
+                })
+
     if args.json:
         print(json.dumps(result))
     else:
-        print(f"dry_run: {result['dry_run']}")
+        print(f"dry_run: {result['dry_run']}  deferral_emitted: {result['deferral_emitted']}")
         for entry in result["plan"]:
             print(
                 f"  {entry['action']:13s} {entry['collection']}  "
@@ -2700,6 +2835,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--weaviate-url", default=None,
         help="Override Weaviate URL (default: WEAVIATE_URL env or "
              "http://localhost:8081).",
+    )
+    p_migrate.add_argument(
+        "--project-folder", default=None,
+        help="Path to the user-project folder. PR 5: when set with "
+             "--dry-run, a `schema_migration_required` deferral entry is "
+             "written to <folder>/.claude/context/UPDATE_DEFERRED.md when "
+             "the plan contains any `copy` or `rebuild` action.",
     )
     p_migrate.add_argument(
         "--json", action="store_true",
