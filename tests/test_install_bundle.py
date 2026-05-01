@@ -513,6 +513,207 @@ class InstallBundleUpdateModeTests(unittest.TestCase):
         # NOT v2 — so the next update knows what we originally shipped).
         self.assertIn(rel, manifest["files"])
 
+    def test_update_picks_up_newly_shipped_file(self):
+        """PR 5 (2026-05-01): a file that the orchestrator only ships
+        in the *new* bundle (i.e. wasn't present at first-install time
+        — analogous to today's `claude_token_counter.py`) MUST be
+        created on update. The manifest from the prior install lists no
+        entry for it; `_file_action` falls into the `create` branch
+        because the target path doesn't exist on disk.
+        """
+        is_windows = platform.system() == "Windows"
+        ext = "ps1" if is_windows else "sh"
+
+        # Simulate "newly shipped" by writing a brand-new template hook
+        # that wasn't part of setUp's first-install. Use the OS-correct
+        # extension so `_hook_glob_for_os()` picks it up.
+        new_hook = self.orch / "templates" / "hooks" / f"new_hook.{ext}"
+        new_hook_body = "#!/bin/sh\necho new\n" if not is_windows else "Write-Host new\n"
+        new_hook.write_text(new_hook_body, encoding="utf-8")
+
+        # Sanity: the target doesn't exist before the update.
+        target = self.proj / ".claude" / "hooks" / f"new_hook.{ext}"
+        self.assertFalse(target.exists())
+
+        result = project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch, update_mode=True,
+        )
+        rel = str(Path(".claude") / "hooks" / f"new_hook.{ext}")
+        self.assertIn(rel, result["actions"]["create"],
+                      f"new_hook.{ext} should be in create[]: {result['actions']}")
+        # File deposited on disk with the shipped content.
+        self.assertTrue(target.exists())
+        self.assertEqual(target.read_text(encoding="utf-8"), new_hook_body)
+        # Manifest now records the new file's hash.
+        manifest = json.loads(
+            (self.proj / ".claude" / ".vco-manifest.json").read_text(encoding="utf-8")
+        )
+        self.assertIn(rel, manifest["files"])
+        self.assertEqual(len(manifest["files"][rel]["sha256"]), 64)
+
+    def test_update_overwrites_unmodified_file(self):
+        """PR 5 (2026-05-01): explicit case for the `overwrite` branch.
+
+        Setup leaves the on-disk hook matching the prior-shipped hash
+        (= user has not touched it). The orchestrator bumps the hook
+        content. The update MUST overwrite — and the manifest's hash
+        entry MUST advance to the new shipped hash so the next update
+        re-computes the same `overwrite` decision against the latest
+        baseline.
+
+        This is distinct from `test_update_overwrites_unmodified_files`
+        above (PR 4) — that one verifies the action; this one ALSO
+        verifies the manifest hash advances.
+        """
+        is_windows = platform.system() == "Windows"
+        ext = "ps1" if is_windows else "sh"
+        rel = str(Path(".claude") / "hooks" / f"foo.{ext}")
+        # Snapshot the manifest's prior-shipped hash for foo.{ext}.
+        manifest_before = json.loads(
+            (self.proj / ".claude" / ".vco-manifest.json").read_text(encoding="utf-8")
+        )
+        prior_hash = manifest_before["files"][rel]["sha256"]
+        self.assertEqual(len(prior_hash), 64)
+
+        # User left the file alone — bump orchestrator template only.
+        new_body = "#!/bin/sh\necho v_overwrite\n"
+        self._bump_orchestrator_foo(new_body)
+        result = project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch, update_mode=True,
+        )
+        self.assertIn(rel, result["actions"]["overwrite"])
+        # File now has the new shipped content.
+        self.assertEqual(self._foo_path().read_text(encoding="utf-8"), new_body)
+
+        # Manifest's hash entry advanced to the new shipped hash.
+        manifest_after = json.loads(
+            (self.proj / ".claude" / ".vco-manifest.json").read_text(encoding="utf-8")
+        )
+        new_hash = manifest_after["files"][rel]["sha256"]
+        self.assertEqual(len(new_hash), 64)
+        self.assertNotEqual(new_hash, prior_hash,
+                            "manifest must advance to the new shipped hash on overwrite")
+
+    def test_update_preserves_user_modified_with_deferral_entry(self):
+        """PR 5 (2026-05-01): explicit, narrow case for the `preserve`
+        branch + matching deferral entry. The PR 4 sibling test
+        `test_update_preserves_user_modified_files` covers the basic
+        case; this one additionally asserts that the deferral entry
+        contains the offending file's rel path AND the suggested
+        `--force` command.
+        """
+        is_windows = platform.system() == "Windows"
+        ext = "ps1" if is_windows else "sh"
+        rel = str(Path(".claude") / "hooks" / f"foo.{ext}")
+
+        # User edits the installed file — diverges from prior-shipped hash.
+        self._foo_path().write_text("MY CUSTOM HOOK\n", encoding="utf-8")
+        # Orchestrator also bumped (so we're not in the noop branch).
+        self._bump_orchestrator_foo("#!/bin/sh\necho v_pr5\n")
+
+        result = project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch, update_mode=True,
+        )
+        self.assertIn(rel, result["actions"]["preserve"],
+                      f"user-modified file should be preserved: {result['actions']}")
+        # On-disk content untouched.
+        self.assertEqual(self._foo_path().read_text(encoding="utf-8"),
+                         "MY CUSTOM HOOK\n")
+
+        # Deferral entry exists, names the file, points to --force.
+        deferral_path = self.proj / ".claude" / "context" / "UPDATE_DEFERRED.md"
+        self.assertTrue(deferral_path.exists(),
+                        f"expected deferral .md at {deferral_path}")
+        body = deferral_path.read_text(encoding="utf-8")
+        self.assertIn("bundle_user_modified_preserved", body)
+        self.assertIn(f"foo.{ext}", body)
+        self.assertIn("--force", body,
+                      "deferral entry must surface the --force escape hatch")
+
+    def test_update_force_overwrites_user_modified(self):
+        """PR 5 (2026-05-01): `force=True` + `update_mode=True` → user-modified
+        file is overwritten with the new shipped version, manifest hash
+        advances, and NO `bundle_user_modified_preserved` entry is
+        emitted (force is the explicit consent path).
+        """
+        is_windows = platform.system() == "Windows"
+        ext = "ps1" if is_windows else "sh"
+        rel = str(Path(".claude") / "hooks" / f"foo.{ext}")
+
+        # User-modified + orchestrator bumped.
+        self._foo_path().write_text("USER VERSION\n", encoding="utf-8")
+        new_body = "#!/bin/sh\necho v_forced\n"
+        self._bump_orchestrator_foo(new_body)
+
+        result = project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch, update_mode=True, force=True,
+        )
+        # With force, the action flips from preserve → overwrite.
+        self.assertIn(rel, result["actions"]["overwrite"])
+        self.assertNotIn(rel, result["actions"].get("preserve", []))
+        # File now has the new shipped content (user edits discarded).
+        self.assertEqual(self._foo_path().read_text(encoding="utf-8"), new_body)
+
+        # Manifest advanced to the new hash.
+        manifest = json.loads(
+            (self.proj / ".claude" / ".vco-manifest.json").read_text(encoding="utf-8")
+        )
+        self.assertIn(rel, manifest["files"])
+
+        # No bundle_user_modified_preserved deferral entry.
+        report = DeferralReport.read(self.proj)
+        self.assertFalse(
+            report.has_condition("bundle_user_modified_preserved"),
+            "force=True is the explicit consent path; preserve deferral must not be emitted",
+        )
+
+    def test_update_dry_run_no_mutations(self):
+        """PR 5 (2026-05-01): `dry_run=True` with full update mode classifies
+        every action without touching the filesystem. The on-disk files
+        keep their pre-run content; the manifest is not rewritten; no
+        deferral entry is added.
+        """
+        is_windows = platform.system() == "Windows"
+        ext = "ps1" if is_windows else "sh"
+
+        # Set up a mixed scenario: one user-modified file, one new shipped file.
+        user_content = "I EDITED THIS\n"
+        self._foo_path().write_text(user_content, encoding="utf-8")
+        self._bump_orchestrator_foo("#!/bin/sh\necho v_new\n")
+
+        new_hook = self.orch / "templates" / "hooks" / f"dryrun_new.{ext}"
+        new_hook_body = "echo dryrun new\n"
+        new_hook.write_text(new_hook_body, encoding="utf-8")
+        new_target = self.proj / ".claude" / "hooks" / f"dryrun_new.{ext}"
+
+        # Snapshot manifest before.
+        manifest_before = (self.proj / ".claude" / ".vco-manifest.json").read_bytes()
+
+        result = project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch,
+            update_mode=True, dry_run=True,
+        )
+        # Classification still happens — dry_run only blocks mutations.
+        rel_foo = str(Path(".claude") / "hooks" / f"foo.{ext}")
+        rel_new = str(Path(".claude") / "hooks" / f"dryrun_new.{ext}")
+        self.assertIn(rel_foo, result["actions"]["preserve"])
+        self.assertIn(rel_new, result["actions"]["create"])
+        # On-disk: foo untouched.
+        self.assertEqual(self._foo_path().read_text(encoding="utf-8"), user_content)
+        # On-disk: new file NOT created.
+        self.assertFalse(new_target.exists(),
+                         f"dry_run must not write {new_target}")
+        # Manifest byte-for-byte identical (no rewrite).
+        manifest_after = (self.proj / ".claude" / ".vco-manifest.json").read_bytes()
+        self.assertEqual(manifest_before, manifest_after,
+                         "dry_run must not rewrite the manifest")
+        # `manifest_written=False` reflects the no-write state.
+        self.assertFalse(result["manifest_written"])
+        # No deferral file written.
+        deferral_path = self.proj / ".claude" / "context" / "UPDATE_DEFERRED.md"
+        self.assertFalse(deferral_path.exists(),
+                         f"dry_run must not emit deferral .md")
+
     def test_user_modified_deferral_grouped_per_project(self):
         """Per coordinator directive 2026-05-01: when multiple files are
         preserved during update, only ONE deferral entry is emitted (per-
@@ -905,6 +1106,138 @@ class BootstrapCliTests(unittest.TestCase):
         # In dry-run we don't restart or defer.
         self.assertFalse(payload["restart_attempted"])
         self.assertFalse(payload["deferred"])
+
+
+class MigrateRequiredDeferralTests(unittest.TestCase):
+    """PR 5 (2026-05-01): `_emit_migrate_required_deferral` writes a
+    `schema_migration_required` deferral entry when a pre-update
+    `migrate-collections --dry-run` reveals copy/rebuild actions. The
+    Rust update_project_v2 wraps this CLI so destructive Weaviate
+    migrations require explicit user consent (preserves data).
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="vct-migrate-required-"))
+        self.proj = self.tmp / "project"
+        self.proj.mkdir()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(str(self.tmp), ignore_errors=True)
+
+    def test_emit_migrate_required_deferral_copy_action(self):
+        # Plan with a single `copy` action (smart migrate path).
+        plan = [{"collection": "VideoFrames_KnowledgeGraph", "action": "copy"}]
+        project_init._emit_migrate_required_deferral(
+            self.proj,
+            project_name="VideoFrames",
+            weaviate_url="http://localhost:8081",
+            plan_entries=plan,
+        )
+        deferral_path = self.proj / ".claude" / "context" / "UPDATE_DEFERRED.md"
+        self.assertTrue(deferral_path.exists())
+        body = deferral_path.read_text(encoding="utf-8")
+        self.assertIn("schema_migration_required", body)
+        self.assertIn("VideoFrames_KnowledgeGraph", body)
+        self.assertIn("copy-with-vectors", body)
+        # Suggested command points at migrate-collections, not at the
+        # destructive --force-rebuild (no rebuild in plan).
+        self.assertIn("migrate-collections", body)
+        self.assertNotIn("--force-rebuild", body)
+
+    def test_emit_migrate_required_deferral_rebuild_action(self):
+        plan = [{"collection": "ArcAgi_KnowledgeGraph", "action": "rebuild"}]
+        project_init._emit_migrate_required_deferral(
+            self.proj,
+            project_name="ArcAgi",
+            weaviate_url="http://localhost:8081",
+            plan_entries=plan,
+        )
+        body = (self.proj / ".claude" / "context" / "UPDATE_DEFERRED.md") \
+            .read_text(encoding="utf-8")
+        self.assertIn("schema_migration_required", body)
+        self.assertIn("ArcAgi_KnowledgeGraph", body)
+        self.assertIn("rebuild", body)
+        # Rebuild plan ALSO surfaces the --force-rebuild escape hatch.
+        self.assertIn("--force-rebuild", body)
+
+    def test_emit_migrate_required_deferral_empty_plan_noop(self):
+        # No destructive actions → no deferral file written.
+        project_init._emit_migrate_required_deferral(
+            self.proj,
+            project_name="Whatever",
+            weaviate_url="http://localhost:8081",
+            plan_entries=[],
+        )
+        deferral_path = self.proj / ".claude" / "context" / "UPDATE_DEFERRED.md"
+        self.assertFalse(deferral_path.exists(),
+                         "empty plan_entries must NOT write a deferral")
+
+    def test_migrate_cli_writes_deferral_on_copy_drift(self):
+        """End-to-end CLI: migrate-collections --dry-run with --project-folder
+        AND a fake-Weaviate response that classifies a collection as
+        needing `copy` MUST emit `schema_migration_required` deferral.
+
+        Stubs the migrate dispatcher (we don't have a live Weaviate);
+        verifies the CLI integration writes the right deferral.
+        """
+        with mock.patch.object(project_init, "migrate_collections") as mc:
+            mc.return_value = {
+                "plan": [
+                    {"collection": "VideoFrames_KnowledgeGraph",
+                     "action": "copy",
+                     "objects_copied": 0,
+                     "elapsed_ms": 0},
+                ],
+                "dry_run": True,
+                "errors": [],
+            }
+            ns = mock.Mock(
+                name="VideoFrames",
+                dry_run=True,
+                force_rebuild=False,
+                weaviate_url="http://localhost:8081",
+                project_folder=str(self.proj),
+                json=False,
+            )
+            # Mock auto-creates `name` as a Mock attr — re-attach the real string.
+            ns.name = "VideoFrames"
+            rc = project_init._cmd_migrate_collections(ns)
+            self.assertEqual(rc, 0)
+        deferral_path = self.proj / ".claude" / "context" / "UPDATE_DEFERRED.md"
+        self.assertTrue(deferral_path.exists())
+        body = deferral_path.read_text(encoding="utf-8")
+        self.assertIn("schema_migration_required", body)
+        self.assertIn("VideoFrames_KnowledgeGraph", body)
+
+    def test_migrate_cli_no_deferral_on_noop_plan(self):
+        """A plan composed of only `noop` / `create` / `patch_props` actions
+        is non-destructive — no deferral entry.
+        """
+        with mock.patch.object(project_init, "migrate_collections") as mc:
+            mc.return_value = {
+                "plan": [
+                    {"collection": "Foo_KnowledgeGraph",
+                     "action": "noop", "objects_copied": 0, "elapsed_ms": 0},
+                    {"collection": "Foo_Development",
+                     "action": "patch_props", "objects_copied": 0, "elapsed_ms": 0},
+                ],
+                "dry_run": True,
+                "errors": [],
+            }
+            ns = mock.Mock(
+                dry_run=True,
+                force_rebuild=False,
+                weaviate_url="http://localhost:8081",
+                project_folder=str(self.proj),
+                json=False,
+            )
+            ns.name = "Foo"
+            rc = project_init._cmd_migrate_collections(ns)
+            self.assertEqual(rc, 0)
+        deferral_path = self.proj / ".claude" / "context" / "UPDATE_DEFERRED.md"
+        self.assertFalse(deferral_path.exists(),
+                         "non-destructive plan must NOT emit a deferral")
 
 
 if __name__ == "__main__":
