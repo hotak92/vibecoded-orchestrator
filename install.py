@@ -1476,6 +1476,12 @@ def main() -> int:
                         help="During --update, attempt to apply each pending entry "
                              "in .claude/context/UPDATE_DEFERRED.md. Resolved entries "
                              "are removed; the file is deleted when zero entries remain.")
+    parser.add_argument("--project-folder", type=str, default=None,
+                        help="Folder where .claude/context/UPDATE_DEFERRED.md should "
+                             "land. Defaults to the orchestrator's PROJECT_ROOT "
+                             "(self-update behavior). End-user managed projects pass "
+                             "their own project root so deferral entries are visible "
+                             "in their workspace, not the orchestrator clone.")
     parser.add_argument("--quiet", action="store_true",
                         help="Minimal output")
     parser.add_argument("--with-joern", action="store_true", default=False,
@@ -1748,20 +1754,82 @@ def main() -> int:
         # state — sources, env, settings stay intact. After drop,
         # _ensure_collections recreates with the fresh schema and
         # _seed_weaviate re-ingests from sources.
+        # Track whether migrate_collections performed a "rebuild" action this
+        # run. If so AND a later step (ensure/seed) crashes, the deferral
+        # entry must signal "rebuild_pending_seed" so the operator knows the
+        # collection was dropped and is awaiting re-seed (HIGH-4).
+        _rebuild_was_performed = False
+
         if _maybe_prompt_rebuild_collections(args, deferral_report=_deferral_report):
             # PR 3: smart per-collection dispatch (copy-with-vectors etc.)
             # replaces the old drop-and-re-embed default. --force-rebuild
             # is the escape hatch back to today's behaviour.
             if getattr(args, "force_rebuild", False):
                 _rebuild_collections(args)
+                _rebuild_was_performed = True
             else:
-                _project_init.migrate_collections(
+                # HIGH-1 fix (2026-05-01): capture migrate_collections result
+                # and emit a per-collection deferral entry for every entry in
+                # result["errors"]. Previously the dict was discarded silently.
+                _migrate_result = _project_init.migrate_collections(
                     args,
                     dry_run=getattr(args, "migrate_dry_run", False),
                     log_event=_log_install_event,
                 )
+                if _migrate_result and not _migrate_result.get("dry_run", False):
+                    if any(
+                        entry.get("action") == "rebuild"
+                        for entry in _migrate_result.get("plan", [])
+                    ):
+                        _rebuild_was_performed = True
+                    for err in _migrate_result.get("errors", []) or []:
+                        _err_collection = err.get("collection") or "unknown"
+                        _err_action = err.get("action") or "unknown"
+                        _err_msg = err.get("error") or "(no error message)"
+                        # condition_id includes the collection name so multiple
+                        # failures across collections do NOT deduplicate.
+                        _deferral_report.add_entry(
+                            DeferralEntry(
+                                condition_id=(
+                                    f"migrate_collections_partial_failure_"
+                                    f"{_err_collection}"
+                                ),
+                                title=(
+                                    f"Schema migration failed for "
+                                    f"`{_err_collection}`"
+                                ),
+                                detected=(
+                                    f"Action `{_err_action}` raised: {_err_msg}"
+                                ),
+                                why_deferred=(
+                                    "Migration partial failure leaves the "
+                                    "collection in an inconsistent state; "
+                                    "manual recovery required."
+                                ),
+                                command_to_apply=(
+                                    "python install.py --update "
+                                    "--rebuild-collections --force-rebuild "
+                                    "(last-resort drop+re-embed) OR see logs at "
+                                    "state/logs/install.jsonl stage 7b.<action>"
+                                ),
+                                severity="critical",
+                                kg_node_refs=[
+                                    ".claude/context/"
+                                    "weaviate-schema-port-research-2026-05-01.md",
+                                ],
+                            )
+                        )
+
+        # MEDIUM-9 + HIGH-4 fix (2026-05-01): the Weaviate-down try/except
+        # now covers BOTH _ensure_collections AND _seed_weaviate. If a
+        # rebuild action dropped a collection earlier this run AND seed/
+        # ensure later crashes, the deferral entry includes
+        # `rebuild_pending_seed` so the operator knows what was lost.
         try:
             _ensure_collections(embed_config, decisions=decisions, args=args)
+            # Seed Weaviate with bundled knowledge/ + docs/. Idempotent;
+            # safe to re-run on update.
+            _seed_weaviate(args)
         except Exception as _weaviate_err:
             # PR 6: Weaviate is unreachable (or refused connection) after the
             # containers were started. Attempt a soft-recovery restart
@@ -1776,6 +1844,7 @@ def main() -> int:
                 import time as _time
                 _time.sleep(3)  # brief settle
                 _ensure_collections(embed_config, decisions=decisions, args=args)
+                _seed_weaviate(args)
                 _restarted = True
             except Exception:
                 pass
@@ -1806,10 +1875,42 @@ def main() -> int:
                         kg_node_refs=[],
                     )
                 )
-        else:
-            # Seed Weaviate with bundled knowledge/ + docs/. Idempotent;
-            # safe to re-run on update.
-            _seed_weaviate(args)
+                # HIGH-4: if a rebuild action dropped collections this run,
+                # warn the operator that the collection is GONE and needs
+                # re-seed once Weaviate is back.
+                if _rebuild_was_performed:
+                    _deferral_report.add_entry(
+                        DeferralEntry(
+                            condition_id="rebuild_pending_seed",
+                            title="Rebuild dropped collections; seed pending",
+                            detected=(
+                                "A `rebuild` action dropped one or more "
+                                "collections during this run, and a "
+                                "subsequent ensure/seed step crashed before "
+                                "the collections could be recreated and "
+                                "re-ingested. See `state/logs/install.jsonl` "
+                                "stage `7b.rebuild snapshot` for the per-"
+                                "collection object count + sample UUIDs that "
+                                "were present immediately before the drop."
+                            ),
+                            why_deferred=(
+                                "Cannot recreate + re-ingest without a live "
+                                "Weaviate. The .md sources in knowledge/ + "
+                                "docs/ are intact and will be re-ingested by "
+                                "the next install.py --update run."
+                            ),
+                            command_to_apply=(
+                                "podman start weaviate_claude && "
+                                "python install.py --update "
+                                "--skip-rebuild-prompt"
+                            ),
+                            severity="critical",
+                            kg_node_refs=[
+                                ".claude/context/"
+                                "weaviate-schema-port-research-2026-05-01.md",
+                            ],
+                        )
+                    )
     else:
         print("\n[skip] Container services (--no-containers)")
         print("[skip] Weaviate seeding (--no-containers)")
@@ -1860,13 +1961,22 @@ def main() -> int:
     # decide whether the install completed start-to-end.
     _log_install_event("session", "ok", f"{mode} finished cleanly")
 
+    # HIGH-2 fix (2026-05-01): deferral file lands in the user-project folder
+    # when --project-folder is passed. Default = PROJECT_ROOT preserves the
+    # orchestrator self-update behaviour.
+    _deferral_folder = (
+        Path(args.project_folder)
+        if getattr(args, "project_folder", None)
+        else PROJECT_ROOT
+    )
+
     # Apply pending deferrals if requested (--update --apply-deferred).
     if args.update and getattr(args, "apply_deferred", False):
-        _apply_deferred_entries(_deferral_report, PROJECT_ROOT)
+        _apply_deferred_entries(_deferral_report, _deferral_folder)
 
     # Write (or delete) the deferral report. On install runs, this is a no-op
     # (nothing accumulates); on update runs, any unresolved conditions land here.
-    _deferral_report.write(PROJECT_ROOT)
+    _deferral_report.write(_deferral_folder)
 
     print()
     print("=" * 62)
@@ -4779,8 +4889,12 @@ def _maybe_prompt_rebuild_collections(
                 ),
                 command_to_apply="python install.py --update --rebuild-collections",
                 severity="warning",
+                # HIGH-3 fix (2026-05-01): kg_node_refs now points at the
+                # actual schema-port research report. Path is relative to the
+                # claude-orchestrator project root (the meta-project that owns
+                # research reports), not VCO. Cross-repo reference is intentional.
                 kg_node_refs=[
-                    "knowledge/concepts/kg-nudge-token-counting.md",
+                    ".claude/context/weaviate-schema-port-research-2026-05-01.md",
                 ],
             )
         )

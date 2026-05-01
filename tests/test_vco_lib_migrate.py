@@ -627,5 +627,92 @@ class LiveMigrateIntegrationTest(unittest.TestCase):
         self.assertEqual(result["errors"], [])
 
 
+class SnapshotForRebuildTests(unittest.TestCase):
+    """HIGH-4 (2026-05-01): _snapshot_collection_for_rebuild captures count +
+    sample UUIDs without raising on Weaviate-unreachable.
+    """
+
+    def test_snapshot_returns_count_and_uuids_on_success(self):
+        with mock.patch.object(project_init, "_http_request") as hmock:
+            # First call (REST objects) → 200 with two objects.
+            # Second call (GraphQL aggregate) → 200 with count=99.
+            hmock.side_effect = [
+                (200, json.dumps({
+                    "objects": [{"id": "uuid-1"}, {"id": "uuid-2"}],
+                }).encode("utf-8")),
+                (200, json.dumps({
+                    "data": {"Aggregate": {"Foo": [{"meta": {"count": 99}}]}},
+                }).encode("utf-8")),
+            ]
+            snap = project_init._snapshot_collection_for_rebuild(
+                "Foo", weaviate_url="http://localhost:9999",
+            )
+        self.assertEqual(snap["object_count"], 99)
+        self.assertEqual(snap["sample_uuids"], ["uuid-1", "uuid-2"])
+
+    def test_snapshot_swallows_errors_returns_defaults(self):
+        with mock.patch.object(project_init, "_http_request",
+                               side_effect=Exception("network down")):
+            snap = project_init._snapshot_collection_for_rebuild(
+                "Foo", weaviate_url="http://localhost:9999",
+            )
+        self.assertIsNone(snap["object_count"])
+        self.assertEqual(snap["sample_uuids"], [])
+
+    def test_rebuild_action_logs_snapshot_event(self):
+        """End-to-end through migrate_collections: rebuild action emits a
+        7b.rebuild snapshot log event with object_count + sample_uuids."""
+        actual_legacy = {"class": "Foo_KnowledgeGraph", "properties": []}
+        target_kg = project_init._kg_class_definition("Foo_KnowledgeGraph")
+        fetcher = lambda n: actual_legacy if n == "Foo_KnowledgeGraph" else target_kg
+
+        env_backup = {
+            k: os.environ.get(k) for k in ("KG_COLLECTION", "DEVELOPMENT_COLLECTION")
+        }
+        os.environ["KG_COLLECTION"] = "Foo_KnowledgeGraph"
+        os.environ["DEVELOPMENT_COLLECTION"] = "Foo_Development"
+        args = argparse.Namespace(force_rebuild=False)
+
+        try:
+            with mock.patch.object(project_init, "_drop_orphan_staging",
+                                   return_value=False), \
+                 mock.patch.object(project_init, "_fetch_schema",
+                                   side_effect=lambda n, weaviate_url=None: fetcher(n)), \
+                 mock.patch.object(project_init, "_snapshot_collection_for_rebuild",
+                                   return_value={"object_count": 7,
+                                                 "sample_uuids": ["x", "y"]}), \
+                 mock.patch.object(project_init, "_delete_class") as dmock:
+                events: list = []
+
+                def _logger(step, phase, detail="", *, data=None):
+                    events.append({"step": step, "phase": phase, "data": data})
+
+                project_init.migrate_collections(
+                    args, dry_run=False, schema_fetcher=fetcher,
+                    log_event=_logger,
+                )
+        finally:
+            for k, v in env_backup.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+        snapshot_events = [
+            e for e in events
+            if e["step"] == "7b.rebuild" and e["phase"] == "snapshot"
+        ]
+        self.assertEqual(len(snapshot_events), 1)
+        snap = snapshot_events[0]["data"]
+        self.assertEqual(snap["collection"], "Foo_KnowledgeGraph")
+        self.assertEqual(snap["object_count"], 7)
+        self.assertEqual(snap["sample_uuids"], ["x", "y"])
+        # And _delete_class was called for the rebuild after snapshot.
+        dmock.assert_called_with(
+            "Foo_KnowledgeGraph",
+            weaviate_url=mock.ANY,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

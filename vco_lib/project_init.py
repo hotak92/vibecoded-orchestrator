@@ -600,6 +600,61 @@ def _drop_orphan_staging(name: str, weaviate_url: Optional[str] = None) -> bool:
     return True
 
 
+def _snapshot_collection_for_rebuild(
+    name: str, weaviate_url: Optional[str] = None, sample_limit: int = 10,
+) -> dict:
+    """HIGH-4 (2026-05-01): snapshot object count + sample UUIDs BEFORE a
+    rebuild action drops the collection. Used by ``migrate_collections``'s
+    rebuild branch so a mid-rebuild Weaviate crash leaves a forensic trail
+    in the install log + the deferral entry.
+
+    Returns ``{"object_count": int|None, "sample_uuids": list[str]}``. Never
+    raises — Weaviate already being unreachable means we have nothing to
+    snapshot, and the caller proceeds with the drop+recreate semantic.
+    """
+    base = (weaviate_url or _weaviate_url_default()).rstrip("/")
+    snapshot: dict = {"object_count": None, "sample_uuids": []}
+
+    # Sample UUIDs via REST (simpler than GraphQL, no class-vs-quoted-name
+    # escaping headaches).
+    try:
+        status, body = _http_request(
+            "GET",
+            f"{base}/v1/objects?class={name}&limit={sample_limit}",
+            timeout=10,
+        )
+        if status == 200:
+            payload = json.loads(body.decode("utf-8"))
+            snapshot["sample_uuids"] = [
+                obj.get("id", "") for obj in payload.get("objects", [])
+                if obj.get("id")
+            ]
+    except Exception:
+        pass
+
+    # Object count via GraphQL Aggregate.
+    try:
+        gql = {"query": "{ Aggregate { %s { meta { count } } } }" % name}
+        status, body = _http_request(
+            "POST", f"{base}/v1/graphql", body=gql, timeout=10,
+        )
+        if status == 200:
+            payload = json.loads(body.decode("utf-8"))
+            agg = (
+                payload.get("data", {})
+                .get("Aggregate", {})
+                .get(name, [])
+            )
+            if agg and isinstance(agg, list):
+                count = agg[0].get("meta", {}).get("count")
+                if isinstance(count, int):
+                    snapshot["object_count"] = count
+    except Exception:
+        pass
+
+    return snapshot
+
+
 def _connect_v4_client(weaviate_url: Optional[str] = None):
     """Late-import weaviate-client v4 so non-migrate code paths don't pull
     the dependency. Returns a connected client."""
@@ -888,6 +943,17 @@ def migrate_collections(
                 # collection here; the caller's _ensure_collections +
                 # _seed_weaviate handle recreate + re-ingest.
                 if _fetch_schema(name, weaviate_url=weaviate_url) is not None:
+                    # HIGH-4 (2026-05-01): snapshot BEFORE the destructive
+                    # _delete_class so a mid-rebuild crash leaves a forensic
+                    # trail (object count + sample UUIDs) in install.jsonl.
+                    _snap = _snapshot_collection_for_rebuild(
+                        name, weaviate_url=weaviate_url,
+                    )
+                    _log("7b.rebuild", "snapshot",
+                         f"{name}: pre-drop snapshot",
+                         data={"collection": name,
+                               "object_count": _snap["object_count"],
+                               "sample_uuids": _snap["sample_uuids"]})
                     _delete_class(name, weaviate_url=weaviate_url)
             else:
                 raise RuntimeError(f"unknown action: {action}")
