@@ -4,7 +4,8 @@
 install.py.
 
 Covers the per-target-project hook distribution feature added 2026-04-28
-to close the README "roadmap" gap (20 hooks were previously orchestrator-only).
+to close the README "roadmap" gap (20 hooks were previously orchestrator-only),
+and the .sh / .ps1 OS-active install behaviour added 2026-04-30 (audit F1).
 """
 from __future__ import annotations
 
@@ -23,34 +24,39 @@ sys.path.insert(0, str(REPO_ROOT))
 import install  # type: ignore  # noqa: E402
 
 
+def _linux_template() -> Path:
+    return REPO_ROOT / "templates" / "settings.json.linux.template"
+
+
+def _windows_template() -> Path:
+    return REPO_ROOT / "templates" / "settings.json.windows.template"
+
+
 class SmartMergeFreshProjectTest(unittest.TestCase):
     """When .claude/settings.json doesn't exist, the template is written
     verbatim (with an extra trailing newline) and every template hook command
     ends up registered."""
 
-    def test_creates_file_from_template_when_absent(self) -> None:
+    def test_creates_file_from_linux_template_when_absent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / ".claude" / "settings.json"
-            template = REPO_ROOT / "templates" / "settings.json.template"
-            self.assertTrue(template.exists(), "template must ship in repo")
+            template = _linux_template()
+            self.assertTrue(template.exists(), "linux template must ship in repo")
 
             action = install._merge_settings_template(template, target)
 
             self.assertEqual(action, "created")
             self.assertTrue(target.exists())
             data = json.loads(target.read_text(encoding="utf-8"))
-            # Every event from the template should be present.
             self.assertIn("hooks", data)
             for event in (
                 "SessionStart", "PreCompact", "PostCompact", "UserPromptSubmit",
                 "PreToolUse", "Stop", "PostToolUse",
             ):
                 self.assertIn(event, data["hooks"], f"missing event: {event}")
-            # Permissions baseline carried over.
             self.assertIn("permissions", data)
             self.assertIn("allow", data["permissions"])
             self.assertIn("deny", data["permissions"])
-            # Origin marker preserved.
             self.assertIn("_template_origin", data)
 
 
@@ -63,8 +69,6 @@ class SmartMergePreservesUserSettingsTest(unittest.TestCase):
             target = Path(tmp) / ".claude" / "settings.json"
             target.parent.mkdir(parents=True)
 
-            # User has a custom permission list and ONE existing hook command
-            # that overlaps with the template (must NOT be duplicated).
             user_existing = {
                 "permissions": {"allow": ["Bash(my-tool *)"]},
                 "hooks": {
@@ -84,20 +88,15 @@ class SmartMergePreservesUserSettingsTest(unittest.TestCase):
             }
             target.write_text(json.dumps(user_existing, indent=2))
 
-            template = REPO_ROOT / "templates" / "settings.json.template"
+            template = _linux_template()
             action = install._merge_settings_template(template, target)
             self.assertEqual(action, "merged")
 
             merged = json.loads(target.read_text(encoding="utf-8"))
 
-            # User scalar key preserved verbatim.
             self.assertEqual(merged.get("myCustomKey"), "do-not-touch")
-            # User permission list is the dict value at allow — should be kept
-            # since the user supplied it (template's allow list shouldn't replace it).
             self.assertIn("Bash(my-tool *)", merged["permissions"]["allow"])
 
-            # Stop event: user's custom hook still there + template hooks appended
-            # (cost-tracker.sh and notify-stop.sh) — user's command not duplicated.
             stop_entries = merged["hooks"]["Stop"]
             all_cmds = [
                 h.get("command", "")
@@ -117,7 +116,6 @@ class SmartMergePreservesUserSettingsTest(unittest.TestCase):
                 "template's notify-stop should be appended",
             )
 
-            # Events the user didn't define should be added wholesale from template.
             self.assertIn("SessionStart", merged["hooks"])
             self.assertIn("PostToolUse", merged["hooks"])
 
@@ -145,17 +143,17 @@ class HooksDirectorySyntaxTest(unittest.TestCase):
 class InstallHooksAndSettingsIntegrationTest(unittest.TestCase):
     """End-to-end: exercise `_install_hooks_and_settings` against a fake
     PROJECT_ROOT and confirm hooks land in .claude/hooks/ and settings.json
-    is written from the template."""
+    is written from the OS-active template."""
 
-    def test_install_into_fresh_target(self) -> None:
+    def test_install_into_fresh_target_linux(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_root = Path(tmp)
-            # Stage a fake "orchestrator install" by symlinking templates/.
             (tmp_root / "templates").symlink_to(REPO_ROOT / "templates")
 
             fake_args = argparse.Namespace(with_hooks=True)
 
-            with patch.object(install, "PROJECT_ROOT", tmp_root):
+            with patch.object(install, "PROJECT_ROOT", tmp_root), \
+                    patch("install.platform.system", return_value="Linux"):
                 summary = install._install_hooks_and_settings(fake_args)
 
             self.assertIn("hooks", summary)
@@ -163,17 +161,31 @@ class InstallHooksAndSettingsIntegrationTest(unittest.TestCase):
 
             hooks_dst = tmp_root / ".claude" / "hooks"
             self.assertTrue(hooks_dst.exists())
-            installed = list(hooks_dst.glob("*.sh"))
-            self.assertGreaterEqual(len(installed), 15)
-            # Executable bit preserved by shutil.copy2.
-            for h in installed:
+            installed_sh = list(hooks_dst.glob("*.sh"))
+            installed_ps1 = list(hooks_dst.glob("*.ps1"))
+            self.assertGreaterEqual(len(installed_sh), 15,
+                                    "linux install should land .sh hooks")
+            self.assertEqual(installed_ps1, [],
+                             "linux install must NOT land .ps1 hooks")
+            for h in installed_sh:
                 self.assertTrue(h.stat().st_mode & 0o111, f"{h.name} not executable")
 
             settings_path = tmp_root / ".claude" / "settings.json"
             self.assertTrue(settings_path.exists())
             data = json.loads(settings_path.read_text(encoding="utf-8"))
-            self.assertIn("hooks", data)
-            self.assertIn("SessionStart", data["hooks"])
+            # Linux template uses bash hook commands.
+            cmds = []
+            for event_entries in data["hooks"].values():
+                for entry in event_entries:
+                    for h in entry.get("hooks", []):
+                        c = h.get("command", "")
+                        if c:
+                            cmds.append(c)
+            bash_hook_cmds = [c for c in cmds if ".claude/hooks/" in c]
+            self.assertTrue(
+                all("bash " in c for c in bash_hook_cmds),
+                "linux template must wire hooks via `bash` prefix",
+            )
 
     def test_no_hooks_flag_skips(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -205,12 +217,124 @@ class InstallHooksAndSettingsIntegrationTest(unittest.TestCase):
             )
             installed = list(scripts_dst.glob("*.py"))
             self.assertGreaterEqual(len(installed), 1, "at least one script expected")
-            # precompact_prune.py specifically — wired by pre-compact-save.sh
             self.assertTrue(
                 (scripts_dst / "precompact_prune.py").is_file(),
                 "precompact_prune.py must be copied so pre-compact-save.sh works",
             )
             self.assertIn("scripts", summary)
+
+
+class WindowsHookInstallTest(unittest.TestCase):
+    """`_install_hooks_and_settings` on Windows hosts copies `.ps1` siblings
+    instead of `.sh`, and writes the Windows settings template."""
+
+    def test_windows_install_picks_ps1_hooks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            (tmp_root / "templates").symlink_to(REPO_ROOT / "templates")
+            fake_args = argparse.Namespace(with_hooks=True)
+            with patch.object(install, "PROJECT_ROOT", tmp_root), \
+                    patch("install.platform.system", return_value="Windows"):
+                install._install_hooks_and_settings(fake_args)
+
+            hooks_dst = tmp_root / ".claude" / "hooks"
+            installed_ps1 = list(hooks_dst.glob("*.ps1"))
+            installed_sh = list(hooks_dst.glob("*.sh"))
+            self.assertGreaterEqual(
+                len(installed_ps1), 15,
+                "windows install should land .ps1 hooks",
+            )
+            self.assertEqual(
+                installed_sh, [],
+                "windows install must NOT land .sh hooks",
+            )
+            # _lib subdir should also pick the Windows variant.
+            lib_dst = hooks_dst / "_lib"
+            if lib_dst.exists():
+                self.assertTrue(
+                    (lib_dst / "find-python.ps1").exists(),
+                    "_lib/find-python.ps1 should land on Windows",
+                )
+                self.assertFalse(
+                    (lib_dst / "find-python.sh").exists(),
+                    "_lib/find-python.sh should NOT land on Windows",
+                )
+
+    def test_windows_install_uses_windows_settings_template(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            (tmp_root / "templates").symlink_to(REPO_ROOT / "templates")
+            fake_args = argparse.Namespace(with_hooks=True)
+            with patch.object(install, "PROJECT_ROOT", tmp_root), \
+                    patch("install.platform.system", return_value="Windows"):
+                install._install_hooks_and_settings(fake_args)
+
+            settings_path = tmp_root / ".claude" / "settings.json"
+            data = json.loads(settings_path.read_text(encoding="utf-8"))
+            cmds = []
+            for event_entries in data["hooks"].values():
+                for entry in event_entries:
+                    for h in entry.get("hooks", []):
+                        c = h.get("command", "")
+                        if c:
+                            cmds.append(c)
+            ps1_cmds = [c for c in cmds if ".claude\\hooks\\" in c or ".ps1" in c]
+            self.assertTrue(ps1_cmds, "windows template should reference .ps1 hooks")
+            for c in ps1_cmds:
+                self.assertIn(
+                    "powershell",
+                    c.lower(),
+                    f"every .ps1 hook command should be invoked via powershell: {c}",
+                )
+                self.assertNotIn(
+                    "bash ", c,
+                    f"windows template must not use bash prefix: {c}",
+                )
+
+
+class WindowsInstallGateTest(unittest.TestCase):
+    """The Windows install gate refuses install when neither PowerShell 5.1+
+    nor Git Bash is available, and warns when only Git Bash is missing."""
+
+    def test_non_windows_is_noop(self) -> None:
+        with patch("install.platform.system", return_value="Linux"):
+            # Should not raise.
+            install._check_windows_shell_prereqs()
+        with patch("install.platform.system", return_value="Darwin"):
+            install._check_windows_shell_prereqs()
+
+    def test_refuses_windows_without_pwsh(self) -> None:
+        with patch("install.platform.system", return_value="Windows"), \
+                patch("install._windows_powershell_version", return_value=None), \
+                patch("install._windows_has_git_bash", return_value=False):
+            with self.assertRaises(SystemExit) as cm:
+                install._check_windows_shell_prereqs()
+            self.assertIn("PowerShell 5.1", str(cm.exception))
+
+    def test_refuses_windows_with_only_git_bash(self) -> None:
+        with patch("install.platform.system", return_value="Windows"), \
+                patch("install._windows_powershell_version", return_value=None), \
+                patch("install._windows_has_git_bash", return_value=True):
+            with self.assertRaises(SystemExit) as cm:
+                install._check_windows_shell_prereqs()
+            # Same actionable message as the no-shell case.
+            self.assertIn("PowerShell 5.1", str(cm.exception))
+
+    def test_passes_windows_with_pwsh_and_git_bash(self) -> None:
+        with patch("install.platform.system", return_value="Windows"), \
+                patch("install._windows_powershell_version", return_value=(5, 1)), \
+                patch("install._windows_has_git_bash", return_value=True):
+            install._check_windows_shell_prereqs()  # should not raise
+
+    def test_warns_on_windows_with_pwsh_but_no_git_bash(self) -> None:
+        import io
+        captured = io.StringIO()
+        with patch("install.platform.system", return_value="Windows"), \
+                patch("install._windows_powershell_version", return_value=(7, 4)), \
+                patch("install._windows_has_git_bash", return_value=False), \
+                patch("sys.stderr", captured):
+            install._check_windows_shell_prereqs()
+        self.assertIn("Git Bash", captured.getvalue())
 
 
 if __name__ == "__main__":

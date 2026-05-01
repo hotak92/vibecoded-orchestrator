@@ -102,6 +102,97 @@ def validate_source_repo(install_path: Path) -> None:
         )
 
 
+def _windows_powershell_version() -> tuple[int, int] | None:
+    """Return the (major, minor) version of the available PowerShell, or
+    None if neither `pwsh` (PowerShell 7+) nor `powershell` (Windows
+    PowerShell 5.1) resolves on PATH.
+
+    Used by the Windows install gate (audit F1, P0). PowerShell 5.1 ships
+    preinstalled on Windows 10/11 — that's the floor. `pwsh` (Core 7+) is
+    preferred when available but not required.
+    """
+    for exe in ("pwsh", "powershell"):
+        if not shutil.which(exe):
+            continue
+        try:
+            r = subprocess.run(
+                [exe, "-NoProfile", "-Command",
+                 "$PSVersionTable.PSVersion.Major; $PSVersionTable.PSVersion.Minor"],
+                capture_output=True, text=True, timeout=8,
+            )
+        except (subprocess.SubprocessError, OSError):
+            continue
+        if r.returncode != 0:
+            continue
+        nums = [int(x) for x in r.stdout.split() if x.strip().isdigit()]
+        if len(nums) >= 2:
+            return (nums[0], nums[1])
+    return None
+
+
+def _windows_has_git_bash() -> bool:
+    """Return True when Git Bash appears to be on PATH.
+
+    We resolve `bash.exe` via `shutil.which` and accept it as Git Bash if
+    its path contains a `Git/` (or `Git\\`) component — that excludes
+    Cygwin / MSYS standalone installs which the audit does not target.
+    """
+    bash = shutil.which("bash") or shutil.which("bash.exe")
+    if not bash:
+        return False
+    norm = bash.replace("\\", "/").lower()
+    return "/git/" in norm or norm.endswith("/git/usr/bin/bash.exe") or "/cmd/" in norm
+
+
+def _check_windows_shell_prereqs() -> None:
+    """Hard-fail (or warn) the install on Windows when the shell tooling
+    needed by hooks isn't available.
+
+    Behaviour:
+      - Linux / macOS: no-op.
+      - Windows + PowerShell 5.1+ + Git Bash: pass silently.
+      - Windows + PowerShell 5.1+ but no Git Bash: warn (legacy `.sh`
+        instinct hooks won't run, but every `.ps1` hook will).
+      - Windows + no PowerShell (Git Bash or not): SystemExit with an
+        actionable install message.
+      - Windows + Git Bash only (no PowerShell): same SystemExit — the
+        `.ps1` hooks need PowerShell.
+
+    See VCO portability audit 2026-04-30, finding F1.
+    """
+    if platform.system() != "Windows":
+        return
+
+    pwsh_ver = _windows_powershell_version()
+    has_git_bash = _windows_has_git_bash()
+
+    pwsh_ok = pwsh_ver is not None and (
+        pwsh_ver[0] > 5 or (pwsh_ver[0] == 5 and pwsh_ver[1] >= 1)
+    )
+
+    if not pwsh_ok:
+        msg = (
+            "Refusing to install on Windows: PowerShell 5.1+ is required "
+            "(Windows 10/11 ships with it; older systems need "
+            "https://aka.ms/PSWindows). Git Bash is also recommended as a "
+            "fallback for legacy hooks; install via "
+            "https://git-scm.com/downloads/win or `winget install Git.Git`.\n\n"
+            "Re-run install once one of these is on PATH."
+        )
+        raise SystemExit(msg)
+
+    if not has_git_bash:
+        # PowerShell-only install: every .ps1 hook works, but the bash-only
+        # `instinct-*.sh` data-collection helpers (Linux-only by design,
+        # marked OS-EXEMPT-PARITY) won't fire. That's expected on Windows.
+        sys.stderr.write(
+            "WARNING: Git Bash not detected on PATH. PowerShell hooks will "
+            "run normally, but legacy `.sh`-only helpers (e.g. the instinct "
+            "pipeline) won't fire. Install Git Bash via "
+            "https://git-scm.com/downloads/win for full coverage.\n"
+        )
+
+
 # Default ports (configurable via .env)
 DEFAULT_WEAVIATE_PORT = 8081
 DEFAULT_WEAVIATE_GRPC_PORT = 50052
@@ -1459,6 +1550,11 @@ def main() -> int:
                              "Default: CLAUDE.md,.claude/CONTEXT_STATE.md,"
                              ".claude/PROJECT_REGISTRY.md,.env")
     args = parser.parse_args()
+
+    # Windows install gate: refuse install when PowerShell 5.1+ isn't on
+    # PATH (the .ps1 hooks would have nothing to run them). Non-Windows
+    # hosts are a silent no-op. See audit F1 (P0).
+    _check_windows_shell_prereqs()
 
     # Run conflict-resolution copy step BEFORE the rest of install.py so
     # subsequent steps see the post-resolution file tree. Best-effort
@@ -5329,15 +5425,43 @@ def _install_agents_and_skills(args: argparse.Namespace) -> None:
         print("  " + ", ".join(parts))
 
 
+def _hook_glob_for_os() -> str:
+    """Pick the OS-active hook file extension glob.
+
+    Linux/macOS run bash hooks; Windows runs the PowerShell siblings shipped
+    by `feat/hook-system-ps1-parity`. The two-template + two-glob approach
+    keeps per-OS installs lean — a Linux user never gets unused .ps1 files in
+    .claude/hooks/, and vice versa. See audit F1 (P0).
+    """
+    return "*.ps1" if platform.system() == "Windows" else "*.sh"
+
+
+def _settings_template_for_os(templates_dir: Path) -> Path:
+    """Return the OS-specific settings.json template path.
+
+    Two templates ship in templates/: settings.json.linux.template (bash
+    hooks) and settings.json.windows.template (PowerShell hooks). They are
+    identical except for the `command` strings inside `hooks.*.hooks`. See
+    audit F1 (P0).
+    """
+    if platform.system() == "Windows":
+        return templates_dir / "settings.json.windows.template"
+    return templates_dir / "settings.json.linux.template"
+
+
 def _install_hooks_and_settings(args: argparse.Namespace) -> str:
     """Copy hooks from templates/hooks/ into .claude/hooks/, scripts from
-    templates/scripts/ into .claude/scripts/, and smart-merge
-    templates/settings.json.template into .claude/settings.json.
+    templates/scripts/ into .claude/scripts/, and smart-merge the OS-specific
+    settings template into .claude/settings.json.
 
     Hooks and scripts are byte-copied (no placeholder substitution) so every
     project carries identical files. They read VCT_INSTALL_ROOT,
     KG_COLLECTION, WEAVIATE_URL, etc. at runtime; the launcher exports
     VCT_INSTALL_ROOT per-project.
+
+    OS-active install: only the shell flavour native to the host is copied
+    (`*.sh` on Linux/macOS, `*.ps1` on Windows). The non-active flavour is
+    skipped — a Linux project never gets stray `.ps1` files. See audit F1.
 
     settings.json merge rules (only when target file already exists):
       * recursive dict merge — template provides defaults, user keys win on conflict
@@ -5354,17 +5478,18 @@ def _install_hooks_and_settings(args: argparse.Namespace) -> str:
     templates_dir = PROJECT_ROOT / "templates"
     hooks_src = templates_dir / "hooks"
     scripts_src = templates_dir / "scripts"
-    settings_template = templates_dir / "settings.json.template"
+    settings_template = _settings_template_for_os(templates_dir)
     if not hooks_src.exists():
         return ""
 
+    hook_glob = _hook_glob_for_os()
     claude_dir = PROJECT_ROOT / ".claude"
     hooks_dst = claude_dir / "hooks"
     hooks_dst.mkdir(parents=True, exist_ok=True)
 
     installed_hooks = 0
     skipped_hooks = 0
-    for hook_file in sorted(hooks_src.glob("*.sh")):
+    for hook_file in sorted(hooks_src.glob(hook_glob)):
         target = hooks_dst / hook_file.name
         if target.exists():
             skipped_hooks += 1
@@ -5373,14 +5498,15 @@ def _install_hooks_and_settings(args: argparse.Namespace) -> str:
         shutil.copy2(hook_file, target)
         installed_hooks += 1
 
-    # Library files sourced by hooks (e.g. _lib/find-python.sh). Live under
-    # .claude/hooks/_lib/. Always overwrite — they're not user-customisable
-    # and stale copies would defeat their portability purpose. See audit F6.
+    # Library files sourced by hooks (e.g. _lib/find-python.sh on POSIX,
+    # _lib/find-python.ps1 on Windows). Live under .claude/hooks/_lib/.
+    # Always overwrite — they're not user-customisable and stale copies
+    # would defeat their portability purpose. See audit F6.
     lib_src = hooks_src / "_lib"
     if lib_src.exists():
         lib_dst = hooks_dst / "_lib"
         lib_dst.mkdir(parents=True, exist_ok=True)
-        for lib_file in sorted(lib_src.glob("*.sh")):
+        for lib_file in sorted(lib_src.glob(hook_glob)):
             shutil.copy2(lib_file, lib_dst / lib_file.name)
 
     # Scripts referenced by hooks (e.g. precompact_prune.py). Live alongside
