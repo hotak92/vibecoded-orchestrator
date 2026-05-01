@@ -68,7 +68,9 @@ export interface CreateProjectResult {
  *
  * HIGH-7 (2026-05-01): rename mirrors create's warning surface so env
  * refresh failures during rename can be toasted instead of eprintln'd.
- * Also reused as the return type of `set_shared_kg_opt_out` (MEDIUM-1).
+ * Also reused as the return type of `set_shared_kg_write_disabled`
+ * (MEDIUM-1, refactored 2026-05-01) and its deprecated alias
+ * `set_shared_kg_opt_out`.
  */
 export interface RenameProjectResult {
   project: ProjectView;

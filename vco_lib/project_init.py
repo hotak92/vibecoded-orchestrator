@@ -129,12 +129,18 @@ def derive_project_collection_names(project_name: str) -> dict:
 
     Returns:
         {
-          "kg_collection":            "<sanitized>_KnowledgeGraph",
-          "development_collection":   "<sanitized>_Development",   # uppercase D
-          "project_name":             <raw, not sanitized>,
-          "shared_kg_collection":     "VibeCodedTools_KnowledgeGraph",
-          "kg_basename":              "<sanitized>",
+          "kg_collection":              "<sanitized>_KnowledgeGraph",
+          "development_collection":     "<sanitized>_Development",   # uppercase D
+          "project_name":               <raw, not sanitized>,
+          "shared_kg_collection":       "VibeCodedTools_KnowledgeGraph",
+          "shared_kg_write_disabled":   "false",
+          "kg_basename":                "<sanitized>",
         }
+
+    `shared_kg_write_disabled` is the per-project WRITE gate (asymmetric
+    model since 2026-05-01: all projects always READ the shared KG; only
+    writes are gated). Default "false" (writes allowed). Stored as a
+    string so all 4 env surfaces can pass it through unchanged.
     """
     basename = sanitize_for_weaviate_class(project_name)
     return {
@@ -142,6 +148,7 @@ def derive_project_collection_names(project_name: str) -> dict:
         "development_collection": f"{basename}_Development",
         "project_name": project_name,
         "shared_kg_collection": "VibeCodedTools_KnowledgeGraph",
+        "shared_kg_write_disabled": "false",
         "kg_basename": basename,
     }
 
@@ -1294,10 +1301,10 @@ _migrate_collections = migrate_collections
 #      Claude Code session.
 #
 # Shared KG (`VibeCodedTools_KnowledgeGraph`): created when missing
-# regardless of any per-project SHARED_KG_OPT_OUT toggle. Per the
-# coordinator's 2026-05-01 directive: every project ALWAYS reads the
-# shared KG; the toggle is purely a runtime write-gate. Creation is not
-# gated on it.
+# regardless of any per-project SHARED_KG_WRITE_DISABLED toggle (or
+# its legacy SHARED_KG_OPT_OUT alias). Per the coordinator's 2026-05-01
+# directive: every project ALWAYS reads the shared KG; the toggle is
+# purely a runtime write-gate. Creation is not gated on it.
 # ---------------------------------------------------------------------------
 
 

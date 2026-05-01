@@ -126,9 +126,9 @@ python install.py --skip-seed             # skip seed + collection bootstrap
 python install.py --skip-collections      # bootstrap-only opt-out (still seeds)
 ```
 
-#### Opting out of the shared cross-project KG
+#### Gating writes to the shared cross-project KG
 
-Set `SHARED_KG_OPT_OUT=true` in `.env` (or in the install environment) to disable the `VibeCodedTools_KnowledgeGraph` shared collection per-project. Useful for users who want hard isolation between projects.
+Set `SHARED_KG_WRITE_DISABLED=true` in `.env` (or in the install environment) to refuse `store_knowledge_node(scope="shared")` calls from this project. Reads of `VibeCodedTools_KnowledgeGraph` remain on (asymmetric model since 2026-05-01: every project always reads the shared KG; the gate is write-only). Legacy alias `SHARED_KG_OPT_OUT` kept for ~3 releases.
 
 #### Lock file: `~/.vct/services.toml`
 

@@ -182,7 +182,9 @@ status: active  # active, archived, deprecated, idea
 - One node per tool/model/concept
 - Links unidirectional (projects → concepts)
 
-**Per-project isolation**: `KG_COLLECTION` (per-project KG) and `SHARED_KG_COLLECTION` (cross-project shared, default `VibeCodedTools_KnowledgeGraph`) are set per-project via `.vscode/settings.json` `claude-code.env` and `.claude/settings.json` `env`. Per-project opt-out: `SHARED_KG_OPT_OUT=true` skips the shared collection on read. The active workspace determines the active KG, not which project is being discussed.
+**Per-project isolation**: `KG_COLLECTION` (per-project KG) and `SHARED_KG_COLLECTION` (cross-project shared, default `VibeCodedTools_KnowledgeGraph`) are set per-project via `.vscode/settings.json` `claude-code.env` and `.claude/settings.json` `env`. The active workspace determines the active KG, not which project is being discussed.
+
+**Asymmetric shared-KG access (since 2026-05-01)**: every project ALWAYS reads the shared KG when `SHARED_KG_COLLECTION` is set — there is no per-project read opt-out (knowledge accumulates across all projects, by design). The per-project gate `SHARED_KG_WRITE_DISABLED=true` restricts only WRITES from this project to the shared collection (`store_knowledge_node(scope='shared')` returns an error rather than silently rerouting). The legacy `SHARED_KG_OPT_OUT` env var is honoured as a write-gate fallback for ~3 releases (target removal: 2026-08).
 
 **Weaviate Collection** (per-project KG, name from `KG_COLLECTION`):
 - Properties: `title`, `content`, `file_path`, `node_type`, `tags`, `links`, `typed_links`, `created_at`, `updated_at`, `valid_from`, `valid_until`, `status`.
@@ -280,7 +282,7 @@ PowerShell variants (`*.ps1`) ship for Windows users.
 Located in the user's `~/.claude.json`. Each launches via the project venv (`claude_mcp_servers/.venv`):
 - **weaviate-kg** — semantic search and code graph.
   - Command: `claude_mcp_servers/.venv/bin/python claude_mcp_servers/weaviate_mcp/server.py`
-  - Env: `WEAVIATE_URL`, `OLLAMA_URL`, `EMBEDDING_MODEL`, `KG_COLLECTION`, `SHARED_KG_COLLECTION`, `DEVELOPMENT_COLLECTION`, `GRPC_PORT`, `SHARED_KG_OPT_OUT`.
+  - Env: `WEAVIATE_URL`, `OLLAMA_URL`, `EMBEDDING_MODEL`, `KG_COLLECTION`, `SHARED_KG_COLLECTION`, `DEVELOPMENT_COLLECTION`, `GRPC_PORT`, `SHARED_KG_WRITE_DISABLED` (write gate; legacy alias `SHARED_KG_OPT_OUT` kept for ~3 releases).
 - **ollama** — local LLM inference.
   - Command: `claude_mcp_servers/.venv/bin/python claude_mcp_servers/ollama_mcp/server.py`
   - Env: `OLLAMA_URL`.
@@ -385,9 +387,9 @@ Located in `.claude/hooks/` — automated workflow actions. On Windows the bash 
 - Embedding: `qwen3-embedding:0.6b` (1024-dim) via Ollama.
 
 **2. Shared KG** (`VibeCodedTools_KnowledgeGraph`):
-- Cross-project patterns visible to every workspace by default.
-- Auto-merged into `hybrid_search` results unless `SHARED_KG_OPT_OUT=true`.
-- Write to it explicitly with `store_knowledge_node(scope="shared", ...)`.
+- Cross-project patterns visible to every workspace.
+- Auto-merged into `hybrid_search` results — read access is unconditional (asymmetric model since 2026-05-01).
+- Write to it explicitly with `store_knowledge_node(scope="shared", ...)`. Per-project gate `SHARED_KG_WRITE_DISABLED=true` refuses such writes with a clear error (no silent reroute to project KG); legacy alias `SHARED_KG_OPT_OUT` kept for ~3 releases.
 
 **3. Code Graph** (Weaviate collections):
 - **CodeModule** — files with imports and metrics (`path`, `language`, `module_summary`, `loc`, `complexity`).

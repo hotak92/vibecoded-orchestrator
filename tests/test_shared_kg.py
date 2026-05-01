@@ -3,7 +3,10 @@
 """Tests for the shared cross-project KG collection.
 
 Covers the Python side of the shared-KG feature:
-    - SHARED_KG_OPT_OUT env var disables the shared collection.
+    - SHARED_KG_COLLECTION read paths are ALWAYS active when configured
+      (no per-project read opt-out — asymmetric model since 2026-05-01).
+    - SHARED_KG_WRITE_DISABLED gates writes only.
+    - SHARED_KG_OPT_OUT (legacy) is honoured as a write-only fallback.
     - The default SHARED_KG_COLLECTION resolves to "VibeCodedTools_KnowledgeGraph".
     - _load_node_formats_for_collection picks the right sidecar per collection.
     - _format_result_by_tier uses the result's source_collection / collection
@@ -34,9 +37,10 @@ sys.path.insert(0, str(MCP_DIR))
 def _fresh_server(env_overrides: dict[str, str]):
     """Reload weaviate_mcp.server with a fresh env. Returns the module.
 
-    The server reads KG_COLLECTION / SHARED_KG_COLLECTION / SHARED_KG_OPT_OUT
-    at import time, so we have to reimport (not just patch) to test the
-    different env permutations.
+    The server reads KG_COLLECTION / SHARED_KG_COLLECTION /
+    SHARED_KG_WRITE_DISABLED / SHARED_KG_OPT_OUT at import time, so we
+    have to reimport (not just patch) to test the different env
+    permutations.
 
     Note: env_overrides are applied to ``os.environ`` directly (NOT via a
     context manager) because some sidecar lookups read env at runtime, not
@@ -52,51 +56,111 @@ def _fresh_server(env_overrides: dict[str, str]):
     return importlib.import_module("weaviate_mcp.server")
 
 
+def _clear_shared_env() -> None:
+    """Clean both new and legacy shared-KG env vars between tests so leftover
+    values from a prior test don't bleed across cases."""
+    for k in (
+        "SHARED_KG_COLLECTION",
+        "SHARED_KG_WRITE_DISABLED",
+        "SHARED_KG_OPT_OUT",
+    ):
+        os.environ.pop(k, None)
+
+
 class SharedKgEnvTests(unittest.TestCase):
-    """SHARED_KG_COLLECTION / SHARED_KG_OPT_OUT env handling."""
+    """SHARED_KG_COLLECTION / SHARED_KG_WRITE_DISABLED / legacy alias env handling.
+
+    Asymmetric model since 2026-05-01: SHARED_KG_COLLECTION is ALWAYS exposed
+    to read paths when set; only writes are gated.
+    """
+
+    def setUp(self) -> None:
+        _clear_shared_env()
 
     def test_default_shared_kg_is_vibecoded(self):
         """Without explicit env, the shared collection defaults to the
-        canonical VibeCodedTools_KnowledgeGraph."""
-        # Pop the keys entirely so the default branch fires.
-        for k in ("SHARED_KG_COLLECTION", "SHARED_KG_OPT_OUT"):
-            os.environ.pop(k, None)
+        canonical VibeCodedTools_KnowledgeGraph and writes are allowed."""
         srv = _fresh_server(env_overrides={})
         self.assertEqual(srv.SHARED_KG_COLLECTION, "VibeCodedTools_KnowledgeGraph")
+        self.assertFalse(srv.SHARED_KG_WRITE_DISABLED)
+        # Back-compat alias — points at the resolved write-disabled value.
         self.assertFalse(srv.SHARED_KG_OPT_OUT)
 
-    def test_opt_out_disables_shared_collection(self):
-        """SHARED_KG_OPT_OUT=true zeroes SHARED_KG_COLLECTION even if the
-        env var is set, so all dual-collection code paths skip the shared
-        query."""
+    def test_read_path_is_unconditional(self):
+        """Even with SHARED_KG_WRITE_DISABLED=true, SHARED_KG_COLLECTION
+        stays populated for read paths. This is the headline asymmetry of
+        the 2026-05-01 refactor."""
+        srv = _fresh_server({
+            "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
+            "SHARED_KG_WRITE_DISABLED": "true",
+        })
+        # Read surface untouched.
+        self.assertEqual(srv.SHARED_KG_COLLECTION, "VibeCodedTools_KnowledgeGraph")
+        # Write gate is on.
+        self.assertTrue(srv.SHARED_KG_WRITE_DISABLED)
+
+    def test_read_path_is_unconditional_under_legacy_alias(self):
+        """SHARED_KG_OPT_OUT=true must NOT zero the read collection any
+        more. It only forwards to the write gate. This breaks the previous
+        contract on purpose: keeping legacy alias semantically symmetric
+        with the new key prevents two different "true" meanings."""
         srv = _fresh_server({
             "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
             "SHARED_KG_OPT_OUT": "true",
         })
+        self.assertEqual(srv.SHARED_KG_COLLECTION, "VibeCodedTools_KnowledgeGraph")
+        self.assertTrue(srv.SHARED_KG_WRITE_DISABLED)
         self.assertTrue(srv.SHARED_KG_OPT_OUT)
-        self.assertEqual(srv.SHARED_KG_COLLECTION, "")
-        # The "would have been" reference is preserved for diagnostic logs.
-        self.assertEqual(srv._SHARED_KG_RAW, "VibeCodedTools_KnowledgeGraph")
 
-    def test_opt_out_accepts_multiple_truthy_values(self):
-        """SHARED_KG_OPT_OUT honours common truthy spellings."""
+    def test_canonical_key_wins_over_legacy_alias(self):
+        """When both are set, SHARED_KG_WRITE_DISABLED wins. This lets
+        users explicitly RE-ENABLE writes on a project whose .env still
+        carries the legacy SHARED_KG_OPT_OUT=true."""
+        srv = _fresh_server({
+            "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
+            "SHARED_KG_WRITE_DISABLED": "false",
+            "SHARED_KG_OPT_OUT": "true",
+        })
+        self.assertFalse(srv.SHARED_KG_WRITE_DISABLED,
+                         "canonical key 'false' must win over legacy 'true'")
+        self.assertEqual(srv.SHARED_KG_COLLECTION, "VibeCodedTools_KnowledgeGraph")
+
+    def test_write_disabled_accepts_truthy_spellings(self):
+        """SHARED_KG_WRITE_DISABLED honours common truthy spellings."""
         for val in ("true", "True", "TRUE", "1", "yes", "YES"):
+            _clear_shared_env()
             srv = _fresh_server({
                 "SHARED_KG_COLLECTION": "Some_KG",
-                "SHARED_KG_OPT_OUT": val,
+                "SHARED_KG_WRITE_DISABLED": val,
             })
-            self.assertTrue(srv.SHARED_KG_OPT_OUT, f"opt-out should be true for {val!r}")
-            self.assertEqual(srv.SHARED_KG_COLLECTION, "")
+            self.assertTrue(srv.SHARED_KG_WRITE_DISABLED,
+                            f"write-disabled should be true for {val!r}")
+            # Read path stays open.
+            self.assertEqual(srv.SHARED_KG_COLLECTION, "Some_KG")
 
-    def test_opt_out_falsy_values_keep_shared_active(self):
-        """SHARED_KG_OPT_OUT=false / empty / 0 leaves the shared collection
-        active (default behaviour)."""
+    def test_write_disabled_falsy_keeps_writes_enabled(self):
+        """SHARED_KG_WRITE_DISABLED=false / empty / 0 leaves writes enabled."""
         for val in ("false", "FALSE", "0", "no", ""):
+            _clear_shared_env()
+            srv = _fresh_server({
+                "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
+                "SHARED_KG_WRITE_DISABLED": val,
+            })
+            self.assertFalse(srv.SHARED_KG_WRITE_DISABLED,
+                             f"write-disabled should be false for {val!r}")
+            self.assertEqual(srv.SHARED_KG_COLLECTION, "VibeCodedTools_KnowledgeGraph")
+
+    def test_legacy_alias_truthy_disables_writes(self):
+        """When only SHARED_KG_OPT_OUT is set, it gates writes."""
+        for val in ("true", "True", "1", "yes"):
+            _clear_shared_env()
             srv = _fresh_server({
                 "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
                 "SHARED_KG_OPT_OUT": val,
             })
-            self.assertFalse(srv.SHARED_KG_OPT_OUT, f"opt-out should be false for {val!r}")
+            self.assertTrue(srv.SHARED_KG_WRITE_DISABLED,
+                            f"legacy alias should disable writes for {val!r}")
+            # Read still open.
             self.assertEqual(srv.SHARED_KG_COLLECTION, "VibeCodedTools_KnowledgeGraph")
 
     def test_explicit_shared_kg_override(self):
@@ -104,7 +168,7 @@ class SharedKgEnvTests(unittest.TestCase):
         a private team-shared collection)."""
         srv = _fresh_server({
             "SHARED_KG_COLLECTION": "AcmeTeam_SharedKG",
-            "SHARED_KG_OPT_OUT": "false",
+            "SHARED_KG_WRITE_DISABLED": "false",
         })
         self.assertEqual(srv.SHARED_KG_COLLECTION, "AcmeTeam_SharedKG")
 
@@ -113,6 +177,7 @@ class SidecarPerCollectionTests(unittest.TestCase):
     """Per-collection sidecar resolution for tier formatting."""
 
     def setUp(self):
+        _clear_shared_env()
         # Build a fresh server module each test; helpers cache module-level
         # state (_node_formats_by_collection) and we want isolation.
         self.tmpdir = Path(__file__).resolve().parent / "_tmp_shared_kg"
@@ -146,7 +211,6 @@ class SidecarPerCollectionTests(unittest.TestCase):
         srv = _fresh_server({
             "KG_COLLECTION": "ProjectKG",
             "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
-            "SHARED_KG_OPT_OUT": "false",
             "KG_BASE_DIR": str(self.tmpdir / "project"),
             "SHARED_KG_NODE_FORMATS": str(self.shared_sidecar),
         })
@@ -183,7 +247,6 @@ class SidecarPerCollectionTests(unittest.TestCase):
         srv = _fresh_server({
             "KG_COLLECTION": "ProjectKG",
             "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
-            "SHARED_KG_OPT_OUT": "false",
             "KG_BASE_DIR": str(self.tmpdir / "project"),
             "SHARED_KG_NODE_FORMATS": str(self.shared_sidecar),
         })
@@ -220,13 +283,17 @@ class SidecarPerCollectionTests(unittest.TestCase):
 class StoreKnowledgeNodeScopeTests(unittest.TestCase):
     """The scope='shared' parameter on store_knowledge_node routes writes to
     the shared collection. Doesn't roundtrip Weaviate (no live instance in
-    unit tests); just verifies the collection-selection branch."""
+    unit tests); just verifies the collection-selection branch and the
+    write-disabled gate."""
+
+    def setUp(self) -> None:
+        _clear_shared_env()
 
     def test_scope_shared_targets_shared_collection_when_set(self):
         srv = _fresh_server({
             "KG_COLLECTION": "ProjectKG",
             "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
-            "SHARED_KG_OPT_OUT": "false",
+            "SHARED_KG_WRITE_DISABLED": "false",
         })
 
         # Replicate the core selection logic: scope='shared' AND
@@ -239,27 +306,49 @@ class StoreKnowledgeNodeScopeTests(unittest.TestCase):
 
         self.assertEqual(target, "VibeCodedTools_KnowledgeGraph")
 
-    def test_scope_shared_falls_back_when_opted_out(self):
-        """Opt-out makes SHARED_KG_COLLECTION='' — scope='shared' then
-        falls back to the project KG (no silent black-hole writes)."""
+    def test_write_gate_blocks_shared_writes_with_canonical_key(self):
+        """SHARED_KG_WRITE_DISABLED=true must make _resolve_shared_kg_write_disabled
+        return True — the store_knowledge_node implementation refuses the
+        write at that point with a clear error, NOT a silent project-KG
+        reroute."""
+        srv = _fresh_server({
+            "KG_COLLECTION": "ProjectKG",
+            "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
+            "SHARED_KG_WRITE_DISABLED": "true",
+        })
+        # The collection still resolves (read path) — but the write gate is on.
+        self.assertEqual(srv.SHARED_KG_COLLECTION, "VibeCodedTools_KnowledgeGraph")
+        self.assertTrue(srv._resolve_shared_kg_write_disabled())
+
+    def test_write_gate_uses_legacy_alias_as_fallback(self):
+        """When SHARED_KG_WRITE_DISABLED is unset, the legacy
+        SHARED_KG_OPT_OUT acts as a fallback — keeps existing per-project
+        env files honouring the write gate after the rename."""
         srv = _fresh_server({
             "KG_COLLECTION": "ProjectKG",
             "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
             "SHARED_KG_OPT_OUT": "true",
         })
+        self.assertEqual(srv.SHARED_KG_COLLECTION, "VibeCodedTools_KnowledgeGraph")
+        self.assertTrue(srv._resolve_shared_kg_write_disabled())
 
-        scope = "shared"
-        target = srv.KG_COLLECTION
-        if scope == "shared" and srv.SHARED_KG_COLLECTION and srv.SHARED_KG_COLLECTION != srv.KG_COLLECTION:
-            target = srv.SHARED_KG_COLLECTION
-
-        self.assertEqual(target, "ProjectKG")  # fallback
+    def test_write_gate_canonical_overrides_legacy(self):
+        """SHARED_KG_WRITE_DISABLED=false explicitly RE-ENABLES writes
+        even when SHARED_KG_OPT_OUT=true is still set in the env (e.g.
+        from a stale .env that survived the rename)."""
+        srv = _fresh_server({
+            "KG_COLLECTION": "ProjectKG",
+            "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
+            "SHARED_KG_WRITE_DISABLED": "false",
+            "SHARED_KG_OPT_OUT": "true",
+        })
+        self.assertFalse(srv._resolve_shared_kg_write_disabled())
 
     def test_scope_project_always_targets_kg_collection(self):
         srv = _fresh_server({
             "KG_COLLECTION": "ProjectKG",
             "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
-            "SHARED_KG_OPT_OUT": "false",
+            "SHARED_KG_WRITE_DISABLED": "false",
         })
 
         scope = "project"
@@ -268,6 +357,56 @@ class StoreKnowledgeNodeScopeTests(unittest.TestCase):
             target = srv.SHARED_KG_COLLECTION
 
         self.assertEqual(target, "ProjectKG")
+
+
+class ReadPathAlwaysIncludesSharedTests(unittest.TestCase):
+    """Verify the collections-to-search list assembled by hybrid_search /
+    semantic_graph_search includes the shared KG regardless of whether
+    SHARED_KG_WRITE_DISABLED or the legacy SHARED_KG_OPT_OUT is on. We
+    mirror the helper logic both readers use rather than spinning up a
+    Weaviate instance."""
+
+    def setUp(self) -> None:
+        _clear_shared_env()
+
+    def _collections_to_search(self, srv) -> list[str]:
+        """Replicate the assembly used by both hybrid_search and
+        semantic_graph_search to determine which collections to query."""
+        out: list[str] = [srv.KG_COLLECTION]
+        if srv.SHARED_KG_COLLECTION and srv.SHARED_KG_COLLECTION != srv.KG_COLLECTION:
+            out.append(srv.SHARED_KG_COLLECTION)
+        return out
+
+    def test_shared_in_search_with_default_env(self):
+        srv = _fresh_server({
+            "KG_COLLECTION": "ProjectKG",
+            "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
+        })
+        self.assertIn("VibeCodedTools_KnowledgeGraph",
+                      self._collections_to_search(srv))
+
+    def test_shared_in_search_when_writes_disabled(self):
+        """The headline regression test: a write-disabled project must
+        STILL read the shared KG."""
+        srv = _fresh_server({
+            "KG_COLLECTION": "ProjectKG",
+            "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
+            "SHARED_KG_WRITE_DISABLED": "true",
+        })
+        self.assertIn("VibeCodedTools_KnowledgeGraph",
+                      self._collections_to_search(srv))
+
+    def test_shared_in_search_when_legacy_optout_set(self):
+        """Legacy SHARED_KG_OPT_OUT=true used to ZERO the read collection;
+        after the refactor it only gates writes, so reads must still see
+        the shared collection."""
+        srv = _fresh_server({
+            "KG_COLLECTION": "ProjectKG",
+            "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
+            "SHARED_KG_OPT_OUT": "true",
+        })
+        self.assertIn("VibeCodedTools_KnowledgeGraph",
+                      self._collections_to_search(srv))
 
 
 if __name__ == "__main__":

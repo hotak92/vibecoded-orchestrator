@@ -135,6 +135,9 @@ pub fn run() {
             commands::projects_v2::create_project_v2,
             commands::projects_v2::update_project_v2,
             commands::projects_v2::rename_project_v2,
+            commands::projects_v2::set_shared_kg_write_disabled,
+            // Deprecated alias — delegates to set_shared_kg_write_disabled,
+            // logs a deprecation warning. Slated for removal ~2026-08.
             commands::projects_v2::set_shared_kg_opt_out,
             commands::projects_v2::switch_project_host_v2,
             commands::projects_v2::delete_project_v2,
