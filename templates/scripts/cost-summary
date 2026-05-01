@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# cost-summary — Show Claude API cost summary from ~/.claude/metrics/costs.jsonl
+# Usage: cost-summary [--days N] [--session SESSION_ID]
+
+COSTS_FILE="$HOME/.claude/metrics/costs.jsonl"
+
+if [[ ! -f "$COSTS_FILE" ]]; then
+    echo "No cost data yet. Costs are tracked per response in ~/.claude/metrics/costs.jsonl"
+    exit 0
+fi
+
+DAYS="${1:-}"
+SESSION="${2:-}"
+
+python3 - <<PYEOF
+import json, sys, os
+from pathlib import Path
+from datetime import datetime, timezone, timedelta
+from collections import defaultdict
+
+costs_file = Path.home() / ".claude" / "metrics" / "costs.jsonl"
+records = []
+with open(costs_file) as f:
+    for line in f:
+        line = line.strip()
+        if line:
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+
+if not records:
+    print("No cost records found.")
+    sys.exit(0)
+
+# Filter by days if specified
+days_arg = os.environ.get("DAYS", "")
+if days_arg:
+    cutoff = datetime.now(timezone.utc) - timedelta(days=int(days_arg))
+    records = [r for r in records if datetime.fromisoformat(r["timestamp"]) > cutoff]
+
+# Split by auth mode: subscription rows have cost_usd=null (claude.ai
+# subscription tokens are included in the plan, not metered per token).
+api_records = [r for r in records if r.get("auth_mode") == "api" or r.get("cost_usd") not in (None, 0)]
+sub_records = [r for r in records if r.get("auth_mode") == "subscription"]
+# Legacy rows (pre-2026-05-01 cost-tracker) had no auth_mode field.
+# Treat them as API for backward compat IFF cost_usd is non-null.
+legacy_records = [r for r in records if r.get("auth_mode") is None]
+
+def _safe_cost(r):
+    c = r.get("cost_usd")
+    return c if isinstance(c, (int, float)) else 0.0
+
+total_cost = sum(_safe_cost(r) for r in api_records + legacy_records)
+total_input = sum(r["input_tokens"] for r in records)
+total_output = sum(r["output_tokens"] for r in records)
+total_cache = sum(r.get("cache_read_tokens", 0) for r in records)
+
+# Per-model breakdown
+by_model = defaultdict(lambda: {"cost": 0.0, "input": 0, "output": 0, "count": 0})
+for r in records:
+    m = r["model"]
+    by_model[m]["cost"] += _safe_cost(r)
+    by_model[m]["input"] += r["input_tokens"]
+    by_model[m]["output"] += r["output_tokens"]
+    by_model[m]["count"] += 1
+
+print(f"=== Claude Token / Cost Summary ===")
+print(f"Records: {len(records)}  ({len(api_records)} api / {len(sub_records)} subscription / {len(legacy_records)} legacy)")
+print(f"Total billable cost: \${total_cost:.4f}  (subscription tokens are free)")
+print(f"Total tokens: {total_input:,} in + {total_output:,} out + {total_cache:,} cache_read")
+print()
+print("By model:")
+for model, stats in sorted(by_model.items(), key=lambda x: -x[1]["cost"]):
+    print(f"  {model}: \${stats['cost']:.4f} ({stats['count']} responses, {stats['input']:,}in/{stats['output']:,}out)")
+PYEOF
