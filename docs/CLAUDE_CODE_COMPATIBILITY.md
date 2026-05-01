@@ -29,7 +29,7 @@ files relate to each other.
 
 The launcher writes **three** files when it creates a project, all
 carrying the same env values (`KG_COLLECTION`, `PROJECT_NAME`,
-`DEVELOPMENT_COLLECTION`, `CONVERSATION_COLLECTION`):
+`DEVELOPMENT_COLLECTION`):
 
 1. **`.claude/settings.json`** with an `env` block — Anthropic's
    canonical per-project env mechanism. Read by the Claude Code CLI,

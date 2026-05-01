@@ -85,6 +85,16 @@ Second KG collection searched transparently alongside `KG_COLLECTION`. Set via e
 ### `DEVELOPMENT_COLLECTION` (project docs)
 Per-project verbose documentation collection (e.g. `ClaudeOrchestrator_development`). Set via env var. `hybrid_search` fans out to it automatically alongside the KG collections — agents don't need to specify which collection to search.
 
+**Schema-paired with KG**: same chunker, same three named-vector slots (`qwen3_embed` / `ollama_embed` / `openai_embed`), same `inverted_index_config(index_null_state=True)`. Schema is a strict subset — drops the KG-specific fields (`tags`, `links`, `typed_links`, `external_links`, `node_type`, `status`) since docs typically have no frontmatter. The launcher auto-pairs KG and dev collections per project: assigning KG access on a project automatically assigns dev access.
+
+**`semantic_graph_search` excludes the dev collection** since docs have no WikiLinks — graph traversal can't find useful neighbours there. `hybrid_search` does include it.
+
+**Sync behaviour** (`.claude/scripts/sync_knowledge_graph.py`):
+- `docs/*.md` edits route to `sync_doc()` (dev collection)
+- `knowledge/*.md` edits route to `sync_node()` (KG collection)
+- Files under any `archive/` directory or with frontmatter `status: archived`/`deprecated` are skipped on sync AND removed from Weaviate if they were previously indexed.
+- The `--all-docs` CLI flag bootstraps the dev collection in one pass (used at install time).
+
 ### `DocumentChunks` collection
 Stores chunks from files dropped in `documents/`. Created on demand by `process_documents.py`. Properties: `content`, `chunk_number`, `total_chunks`, `token_count`, `source_id`, `metadata_json`, `created_at`.
 
@@ -226,3 +236,29 @@ When set, all path resolution (node writes, `kg-sync`, hook auto-sync) uses this
 
 ### `query_logger.py`
 Optional query usage logger imported by `search_knowledge.py` and `sync_knowledge_graph.py`. Logs tool invocations to JSONL. Silently skipped if import fails.
+
+### Schema-Creation Gotchas (Weaviate ≤ 1.30)
+
+These collection settings MUST be set at create time — `Reconfigure` cannot toggle them later:
+
+- **`inverted_index_config=Configure.inverted_index(index_null_state=True)`** — required for `Filter.by_property("foo").is_none(True)` queries. Without it, Weaviate rejects with `"Nullstate must be indexed to be filterable!"`. The MCP `_stale_filter` (which excludes nodes whose `valid_until` is past) relies on this.
+- **Named-vector slots: declare upfront**. Weaviate ≥ 1.31 supports `Reconfigure.NamedVectors.add()`; ≤ 1.30 (including the 1.28.4 we run by default) does NOT. Strategy: every collection declares **all three slots** (`qwen3_embed`, `ollama_embed`, `openai_embed` for KG; `codesage_embed`, `ollama_code_embed`, `openai_embed` for code-graph). Only the slot matching the active embedding profile is populated; the other two stay empty until the user switches profiles or runs a re-embed pass.
+- **Date-property filters**: pass `datetime` objects (not ISO strings) to `Filter.by_property("foo").greater_than()`. The Python client serializes `datetime` to `valueDate`; ISO strings get serialized as `valueText` and Weaviate rejects.
+
+### Embedding-Slot Discipline
+
+Vectors emitted by model X must be stored under the slot whose name maps to X. Never cross-write — the slot name is its semantic contract. A vector produced by qwen3-embedding stored under `ollama_embed` (which is labelled for arctic) leads to silent retrieval-quality regressions when the user switches `ACTIVE_EMBEDDING`.
+
+Enforcement: `_active_named_vector_for_kg()` in `sync_knowledge_graph.py` asserts `ACTIVE_EMBEDDING in ("qwen3", "codesage")` and refuses to run otherwise. For multi-slot writes (e.g. populating arctic + qwen3 + openai simultaneously), use the `store_knowledge_node` MCP tool — it dispatches to the right model per slot via `_get_all_kg_embeddings`.
+
+### Cross-OS install support
+
+`install.py` selects an embedding profile based on detected hardware:
+- **GPU profile** (≥ 7.5 GB VRAM, AMD ROCm or NVIDIA CUDA detected): `qwen3-embedding:0.6b` (text) + CodeSage-Large-v2 (code, GPU service)
+- **CPU profile** (no GPU): `qwen3-embedding:0.6b` (text) + jina-embeddings-v2-base-code (code, CPU via Ollama)
+- **OpenAI profile** (`--openai-key`): `text-embedding-3-small` for both text and code
+- **Low-resource profile** (`--low-resource` opt-in): snowflake-arctic-embed2 (text) + jina-v2-base-code (code)
+
+Each profile sets `ACTIVE_EMBEDDING` to the matching slot name (`qwen3` / `qwen3` / `openai` / `arctic`). The MCP server reads `ACTIVE_EMBEDDING` to pick the named-vector slot for queries — automatic per-machine selection.
+
+To switch profile post-install: drop the affected collections and re-ingest with the new profile, OR upgrade Weaviate to ≥ 1.31 and use `Reconfigure.NamedVectors.add()`.

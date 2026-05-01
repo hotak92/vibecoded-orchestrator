@@ -4,11 +4,18 @@
 #   - Tag push matching v*.*.* (e.g. v0.1.0) → cuts a GitHub Release.
 #   - Manual workflow_dispatch → useful for dry-runs / re-cutting artifacts.
 #
-# What we ship per OS (v0.1.5 matrix):
+# What we ship per OS:
 #   - Linux x64 (ubuntu-latest):    vct-launcher          + .metadata.json
 #   - Windows x64 (windows-latest): vct-launcher.exe      + .metadata.json
 #   - macOS arm64 (macos-latest):   vct-launcher          + .metadata.json
-#   - macOS x64 (macos-13):         vct-launcher          + .metadata.json
+#
+# Intel Macs (x86_64) intentionally NOT shipped: the `macos-13` GitHub
+# runner image was fully deprecated 2025-12-04 (actions/runner-images
+# #13046) and v0.1.5's matrix entry caused a 23h47m queue hang because
+# no runner picks up that label anymore. Apple stopped selling Intel
+# Macs in late 2023, so the cohort is negligible for a tier-2 alpha.
+# Revisit if user demand surfaces — cross-compile path:
+# `--target x86_64-apple-darwin` from the arm64 runner.
 #
 # macOS UNSIGNED — Apple Developer ID + notarization deferred
 # (Tier-2 alpha, see QuickStart). First-launch users will see a
@@ -61,14 +68,13 @@ jobs:
             binary: vct-launcher.exe
           # macOS Apple Silicon (M1/M2/M3). `macos-latest` defaults to ARM
           # since the GitHub-hosted runner image transition (Sept 2024+).
+          # macOS Intel (x86_64) entry was removed 2026-05-01 — the
+          # macos-13 runner image was fully deprecated 2025-12-04 and
+          # caused v0.1.5's release run to hang in queue for 23+ hours.
+          # See .claude/context/macos-x64-build-investigation-2026-05-01.md
+          # in the orchestrator host repo.
           - os: macos-latest
             target: macos-arm64
-            binary: vct-launcher
-          # macOS Intel. macos-13 is the last x86_64 runner image — newer
-          # macos-14/-15 are ARM-only. Drop this entry once Intel users
-          # are below a usable cohort threshold.
-          - os: macos-13
-            target: macos-x64
             binary: vct-launcher
 
     runs-on: ${{ matrix.os }}

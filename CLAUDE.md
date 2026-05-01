@@ -254,8 +254,7 @@ PowerShell variants (`*.ps1`) ship for Windows users.
 - **Collections** (names depend on `PROJECT_NAME` / `KG_COLLECTION`):
   - `<KG_COLLECTION>` — per-project KG (`knowledge/`)
   - `<SHARED_KG_COLLECTION>` — cross-project shared KG (`VibeCodedTools_KnowledgeGraph` by default)
-  - `<DEVELOPMENT_COLLECTION>` — verbose project docs (`docs/`)
-  - `<CONVERSATION_COLLECTION>` — chat history (optional, often disabled)
+  - `<DEVELOPMENT_COLLECTION>` — verbose project docs (`docs/`); auto-paired with KG by the launcher
   - `CodeModule`, `CodeClass`, `CodeFunction`, `CodeAPI`, `CodeInteraction` — code entities
 - **Access**: Weaviate MCP tools (`hybrid_search`, `semantic_graph_search`, `store_knowledge_node`, `search_code_graph`, `query_code_structure`).
 
@@ -406,11 +405,6 @@ Located in `.claude/hooks/` — automated workflow actions. On Windows the bash 
 - Auto-syncs via `post-file-edit` hook.
 - Search: `hybrid_search` (auto-scoped).
 - Embedding: `qwen3-embedding:0.6b` (1024-dim) via Ollama.
-
-**5. Conversation Collection** (`CONVERSATION_COLLECTION`):
-- Chat history, decisions, discoveries.
-- Auto-capture is opt-in (often disabled).
-- Search: `hybrid_search` (auto-scoped when present).
 
 **Decision Tree**:
 - Reusable cross-project pattern → shared KG (`scope="shared"`).

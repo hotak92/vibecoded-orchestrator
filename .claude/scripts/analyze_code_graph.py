@@ -509,13 +509,31 @@ class CodeGraphAnalyzer:
             return False
 
     def _vectorizer_config(self):
-        """Return appropriate vectorizer config based on named_vectors flag."""
-        if self.named_vectors:
-            return [
-                Configure.NamedVectors.none(name=_ACTIVE_CODE_VECTOR),
-                Configure.NamedVectors.none(name="ollama_code_embed"),  # legacy
-            ]
-        return Configure.Vectorizer.none()
+        """Return appropriate vectorizer config based on named_vectors flag.
+
+        Three slots, matching `VECTOR_SCHEMES["code"]` in
+        weaviate_mcp/server.py. Pre-2026-04-30 only declared two
+        (active + legacy), which broke `_get_all_code_embeddings` writes
+        and `backfill_embeddings(provider="openai")` on freshly-analyzed
+        collections (audit finding Code-M1, 2026-04-30). De-dup against
+        `_ACTIVE_CODE_VECTOR` for the case where the active slot is
+        `ollama_code_embed` (legacy backend).
+        """
+        if not self.named_vectors:
+            return Configure.Vectorizer.none()
+        slot_names = {_ACTIVE_CODE_VECTOR, "ollama_code_embed", "openai_embed"}
+        return [Configure.NamedVectors.none(name=n) for n in sorted(slot_names)]
+
+    def _inverted_index_config(self):
+        """Always return an inverted index config with `index_null_state=True`.
+
+        Required for `is_none(True)` filters (e.g. future stale-filter on
+        valid_until). Cannot be retro-added on existing collections —
+        Weaviate ≤1.30 ignores `Reconfigure.inverted_index(...)` for
+        index_null_state, so this MUST be set at create time. Audit
+        finding Code-M2 (2026-04-30).
+        """
+        return Configure.inverted_index(index_null_state=True)
 
     def create_collections(self, force: bool = False):
         """Create Weaviate collections for code graph (per-project names)."""
@@ -536,6 +554,7 @@ class CodeGraphAnalyzer:
                     name=self.coll_module,
                     description="Code modules/files with imports and metrics",
                     vectorizer_config=self._vectorizer_config(),
+                    inverted_index_config=self._inverted_index_config(),
                     properties=[
                         Property(name="path", data_type=DataType.TEXT, description="File path relative to repo root", skip_vectorization=True),
                         Property(name="language", data_type=DataType.TEXT, description="Programming language", skip_vectorization=True),
@@ -567,6 +586,7 @@ class CodeGraphAnalyzer:
                     name=self.coll_class,
                     description="Classes with inheritance and methods",
                     vectorizer_config=self._vectorizer_config(),
+                    inverted_index_config=self._inverted_index_config(),
                     properties=[
                         Property(name="name", data_type=DataType.TEXT, description="Class name", skip_vectorization=True),
                         Property(name="full_name", data_type=DataType.TEXT, description="Fully qualified name", skip_vectorization=True),
@@ -603,6 +623,7 @@ class CodeGraphAnalyzer:
                     name=self.coll_function,
                     description="Functions with call graphs",
                     vectorizer_config=self._vectorizer_config(),
+                    inverted_index_config=self._inverted_index_config(),
                     properties=[
                         Property(name="name", data_type=DataType.TEXT, description="Function name", skip_vectorization=True),
                         Property(name="full_name", data_type=DataType.TEXT, description="Fully qualified name", skip_vectorization=True),
@@ -640,6 +661,7 @@ class CodeGraphAnalyzer:
                     name=self.coll_api,
                     description="API endpoints with handlers",
                     vectorizer_config=self._vectorizer_config(),
+                    inverted_index_config=self._inverted_index_config(),
                     properties=[
                         Property(name="endpoint", data_type=DataType.TEXT, description="API endpoint path", skip_vectorization=True),
                         Property(name="method", data_type=DataType.TEXT, description="HTTP method", skip_vectorization=True),
@@ -669,6 +691,7 @@ class CodeGraphAnalyzer:
                     name=self.coll_interaction,
                     description="Cross-language and cross-service communication calls",
                     vectorizer_config=self._vectorizer_config(),
+                    inverted_index_config=self._inverted_index_config(),
                     properties=[
                         Property(name="source_project", data_type=DataType.TEXT, description="Project that initiates the call", skip_vectorization=True),
                         Property(name="interaction_type", data_type=DataType.TEXT, description="http | grpc | mq | websocket", skip_vectorization=True),

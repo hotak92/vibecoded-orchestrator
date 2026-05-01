@@ -218,6 +218,13 @@ pub async fn create_project_v2(
 pub fn write_project_env_files(folder: &Path, project_name: &str) -> Result<(), String> {
     let kg_collection = sanitize_kg_collection(project_name);
     let dev_collection = format!("{}_development", kg_collection);
+    // FIXME(2026-04-30): CONVERSATION_COLLECTION was deprecated along
+    // with the capture flow. The MCP server no longer reads it. We still
+    // write the env var here for backward-compat with older installs
+    // that may have a populated conversations collection. New installs
+    // will see this env var pointing to a never-populated collection.
+    // TODO: remove all conversation_collection references from this
+    // file in a follow-up PR (see install.py 2026-04-30 removal).
     let conv_collection = format!("{}_conversations", kg_collection);
     // Shared cross-project KG. Same name across all projects on this machine
     // — bundled with the orchestrator install (seeded from
