@@ -61,7 +61,7 @@ Bash hooks (`.claude/hooks/*.sh`) require WSL2 on Windows to fire automatically.
 No MCP server URLs, collection names, or project-specific paths go in the global `~/.claude/settings.json`. The only recommended global env var is `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`. Everything else is scoped per-project. This prevents cross-project KG contamination. See `docs/CONFIGURATION.md`.
 
 ### Per-project KG isolation via env vars
-Six env vars control KG routing per project: `KG_COLLECTION`, `SHARED_KG_COLLECTION`, `DEVELOPMENT_COLLECTION`, `CONVERSATION_COLLECTION`, `PROJECT_NAME`, `KG_BASE_DIR`. The active VS Code workspace determines which collection is active.
+Five env vars control KG routing per project: `KG_COLLECTION`, `SHARED_KG_COLLECTION`, `DEVELOPMENT_COLLECTION`, `PROJECT_NAME`, `KG_BASE_DIR`. The active VS Code workspace determines which collection is active. (`CONVERSATION_COLLECTION` was deprecated 2026-04-30 along with the capture flow.)
 
 ### `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` global flag
 The one recommended global env var. When set to `"1"`, Claude Code spawns up to 3 parallel agents for multi-file tasks, giving 3–5x speedup on large operations.

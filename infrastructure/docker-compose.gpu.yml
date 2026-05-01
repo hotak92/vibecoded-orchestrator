@@ -1,5 +1,24 @@
-# GPU overlay — apply with: docker compose -f docker-compose.yml -f docker-compose.gpu.yml --profile gpu up -d
-# Requires NVIDIA Container Toolkit: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
+# NVIDIA CUDA overlay — apply with:
+#
+#   Docker:        docker compose -f docker-compose.yml -f docker-compose.gpu.yml --profile gpu up -d
+#   Podman:        podman-compose -f docker-compose.yml -f docker-compose.gpu.yml --profile gpu up -d
+#
+# Requires (any container engine):
+#   - NVIDIA Container Toolkit on host
+#     (https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)
+#   - For Podman: also run `sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml`
+#     once after installing the toolkit. This generates the CDI spec
+#     Podman uses to expose GPUs. Docker doesn't need this step.
+#
+# The `driver: nvidia` form below works for BOTH Docker and Podman with
+# Container Toolkit ≥ 1.14 (CDI-aware). Older Podman releases needed
+# `driver: nvidia.com/gpu` (CDI-namespaced) — bump the toolkit if you
+# hit "device not found" errors on Podman.
+#
+# References:
+#   - Docker compose GPU support: https://docs.docker.com/compose/how-tos/gpu-support/
+#   - Podman GPU access:           https://podman-desktop.io/docs/podman/gpu
+#   - NVIDIA Container Toolkit:    https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
 
 services:
   ollama:

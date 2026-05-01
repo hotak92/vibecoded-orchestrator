@@ -134,6 +134,11 @@ EMBEDDING_CONFIGS = {
         "code_model": "codesage-large-v2",
         "code_dims": 2048,
         "embedding_models": ["qwen3-embedding:0.6b"],
+        # ACTIVE_EMBEDDING env var — controls which named-vector slot
+        # the MCP server reads/writes. MUST match the slot name labelled
+        # for the model that emitted the vector. See
+        # `weaviate_mcp/server.py::_get_search_vector` mapping.
+        "active_embedding": "qwen3",
         "description": "GPU-accelerated (qwen3 text + CodeSage code, best quality)",
     },
     "cpu": {
@@ -146,6 +151,7 @@ EMBEDDING_CONFIGS = {
             "qwen3-embedding:0.6b",
             "unclemusclez/jina-embeddings-v2-base-code:latest",
         ],
+        "active_embedding": "qwen3",
         "description": "CPU-only (qwen3 text + Jina V2 code, both via Ollama)",
     },
     "openai": {
@@ -156,6 +162,7 @@ EMBEDDING_CONFIGS = {
         "code_dims": 1536,
         # OpenAI handles embeddings; only inference models need pulling.
         "embedding_models": [],
+        "active_embedding": "openai",
         "description": "OpenAI API (fastest, requires API key)",
     },
     # Lightest mode for low-RAM / low-VRAM machines.
@@ -176,6 +183,9 @@ EMBEDDING_CONFIGS = {
         # Hard-cap inference models for this profile — user opted in.
         # qwen3.5:0.8b is the canonical always-fits floor on main.
         "inference_models_override": ["gemma4:e4b", "qwen3.5:0.8b"],
+        # arctic → ollama_embed slot in the named-vector schema.
+        # Maps to ACTIVE_EMBEDDING=arctic in weaviate_mcp/server.py.
+        "active_embedding": "arctic",
         "description": "Low-resource (Arctic text + Jina V2 code, both via Ollama)",
     },
 }
@@ -1333,6 +1343,21 @@ def main() -> int:
                         help="Skip pulling Ollama models")
     parser.add_argument("--update", action="store_true",
                         help="Update mode: skip clone, re-install deps + restart services")
+    parser.add_argument("--rebuild-collections", action="store_true", default=False,
+                        help="Drop and re-ingest Weaviate collections (KG + dev). "
+                             "Required when the schema invariants change "
+                             "(named-vector slots, index_null_state, etc.) and "
+                             "Weaviate ≤1.30 doesn't allow Reconfigure for those. "
+                             "ONLY touches Weaviate state — your .md sources, "
+                             ".env, .vscode/settings.json, .claude/settings.json "
+                             "are NOT modified. Auto-detected and prompted on "
+                             "--update when the running collection lacks "
+                             "today's invariants.")
+    parser.add_argument("--skip-rebuild-prompt", action="store_true", default=False,
+                        help="During --update, skip the schema-rebuild prompt "
+                             "even if the running collection is on an older "
+                             "schema. Use to defer the rebuild for a later "
+                             "session (search may misbehave until rebuilt).")
     parser.add_argument("--quiet", action="store_true",
                         help="Minimal output")
     parser.add_argument("--with-joern", action="store_true", default=False,
@@ -1373,7 +1398,7 @@ def main() -> int:
                              "Also skips collection creation — when there's no content "
                              "to seed, the MCP server creates collections lazily on first "
                              "write. Useful in CI / test runs. Re-run later with "
-                             "`kg-sync --all` and `upload_docs.py --all`.")
+                             "`kg-sync --all` (handles both knowledge/ and docs/ since 2026-04-30).")
     parser.add_argument("--no-resume", action="store_true", default=False,
                         help="Disable resume-from-log. Forces every step to run "
                              "even if state/logs/install.jsonl says a previous "
@@ -1585,6 +1610,16 @@ def main() -> int:
         #     ⇒ writes to user-owned Weaviate WITH EXPLICIT CONSENT
         # No path writes without consent. The default for foreign is
         # alt-port, so the no-consent case never hits ACTION_ADOPT.
+        # Schema-rebuild gate (--update only): if the running KG
+        # collection is on an older schema lacking today's invariants
+        # (named-vector slots, index_null_state, etc.), prompt to drop
+        # + recreate. User-driven decision; defaults to deferring on
+        # non-interactive shells without --yes. ONLY touches Weaviate
+        # state — sources, env, settings stay intact. After drop,
+        # _ensure_collections recreates with the fresh schema and
+        # _seed_weaviate re-ingests from sources.
+        if _maybe_prompt_rebuild_collections(args):
+            _rebuild_collections(args)
         _ensure_collections(embed_config, decisions=decisions, args=args)
         # Seed Weaviate with bundled knowledge/ + docs/. Idempotent;
         # safe to re-run on update.
@@ -2229,6 +2264,72 @@ def _detect_installed_runtime() -> str:
         if shutil.which(cmd):
             return cmd
     return ""
+
+
+def _ensure_nvidia_cdi_spec_for_podman() -> None:
+    """Generate the NVIDIA CDI spec for Podman if missing.
+
+    Podman needs a CDI YAML at /etc/cdi/nvidia.yaml to expose
+    `nvidia.com/gpu=all` device entries. The NVIDIA Container Toolkit
+    ships `nvidia-ctk` for this. We invoke it idempotently before
+    compose-up.
+
+    Behavior:
+      - Skip silently on macOS / Windows (CDI is a Linux concept).
+      - Skip if /etc/cdi/nvidia.yaml already exists (idempotent).
+      - Skip if `nvidia-ctk` isn't on PATH — print a one-line hint with
+        the NVIDIA Container Toolkit install URL so the user can fix it.
+        Compose-up will fail loudly afterwards, which is the right
+        signal in this case.
+      - On Linux with nvidia-ctk present: run `sudo nvidia-ctk cdi
+        generate --output=/etc/cdi/nvidia.yaml`. Sudo prompt surfaces
+        in the controlling terminal. If sudo is non-interactive (CI),
+        this fails; user re-runs install with sudo or sets up CDI
+        manually.
+
+    No-op + non-fatal by design — install.py prints what happened and
+    moves on. The compose-up that follows will surface the real error
+    if CDI didn't get set up.
+    """
+    if platform.system() != "Linux":
+        # macOS Podman runs in a VM; CDI generation happens inside
+        # the VM via Podman Machine, not on the host. Skip for now.
+        return
+
+    cdi_path = Path("/etc/cdi/nvidia.yaml")
+    if cdi_path.exists():
+        # Already configured. nvidia-ctk is idempotent so we could
+        # re-run anyway, but the no-op is cheaper.
+        return
+
+    if not shutil.which("nvidia-ctk"):
+        print(
+            "  [!] Podman + NVIDIA: `nvidia-ctk` not on PATH. Install the "
+            "NVIDIA Container Toolkit:\n"
+            "      https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html\n"
+            "      (then re-run install — compose-up will fail until CDI is set up)"
+        )
+        return
+
+    print("  Generating NVIDIA CDI spec for Podman (sudo required) ...")
+    try:
+        result = subprocess.run(
+            ["sudo", "nvidia-ctk", "cdi", "generate",
+             "--output=/etc/cdi/nvidia.yaml"],
+            capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode == 0:
+            print("    ✓ /etc/cdi/nvidia.yaml created")
+        else:
+            print(
+                f"    ! nvidia-ctk exited {result.returncode}; "
+                f"compose-up may fail to find GPU. Stderr: "
+                f"{result.stderr.strip()[:200]}"
+            )
+    except subprocess.TimeoutExpired:
+        print("    ! nvidia-ctk timed out (>60s); skipping")
+    except Exception as e:
+        print(f"    ! nvidia-ctk failed: {e}")
 
 
 def _prompt_install_container_runtime(args: argparse.Namespace) -> bool:
@@ -3290,6 +3391,9 @@ def _probe_service_identity(name: str, port: int) -> tuple[str, str]:
             exact_markers = {"KnowledgeGraph", "VibeCodedTools_KnowledgeGraph",
                              "Development", "CodeFunction", "CodeClass",
                              "CodeModule", "CodeAPI", "CodeInteraction"}
+            # `_conversations` is a legacy marker (collection deprecated
+            # 2026-04-30) — kept here for detection of old installs only.
+            # New installs do NOT create the conversations collection.
             suffix_markers = ("_KnowledgeGraph", "_Development",
                               "_CodeFunction", "_CodeClass", "_CodeModule",
                               "_conversations", "_development")
@@ -3791,23 +3895,39 @@ def _start_services(sysinfo: SystemInfo, args: argparse.Namespace,
     # + /dev/dri device passthrough). The two are mutually exclusive —
     # picking the wrong one means Ollama silently runs CPU-only despite
     # has_gpu=True. Distinguished via sysinfo.gpu_vendor.
+    #
+    # Podman vs Docker: each engine needs a different compose overlay
+    # because the device-passthrough syntax differs (Docker reads
+    # `deploy.resources.reservations.devices`; Podman uses CDI form
+    # `devices: [nvidia.com/gpu=all]`). Pick by `sysinfo.container_cmd`.
+    is_podman = "podman" in (sysinfo.container_cmd or "").lower()
     if sysinfo.has_gpu:
         if sysinfo.gpu_vendor == "amd":
-            rocm_file = infra_dir / "docker-compose.amd-rocm.yml"
+            rocm_file_name = "podman-compose.amd-rocm.yml" if is_podman else "docker-compose.amd-rocm.yml"
+            rocm_file = infra_dir / rocm_file_name
             if rocm_file.exists():
                 cmd.extend(["-f", str(rocm_file), "--profile", "gpu"])
-                print("  GPU overlay: AMD ROCm (Ollama ROCm image, /dev/kfd + /dev/dri)")
+                engine = "Podman" if is_podman else "Docker"
+                print(f"  GPU overlay: AMD ROCm ({engine}: Ollama ROCm image, /dev/kfd + /dev/dri)")
             else:
-                print("  WARNING: AMD ROCm overlay file not found, running CPU-only")
+                print(f"  WARNING: AMD ROCm overlay {rocm_file_name} not found, running CPU-only")
         else:
             # Default to NVIDIA overlay for has_gpu=True with vendor
             # unset or "nvidia" (back-compat with --gpu flag).
-            gpu_file = infra_dir / "docker-compose.gpu.yml"
+            gpu_file_name = "podman-compose.gpu.yml" if is_podman else "docker-compose.gpu.yml"
+            gpu_file = infra_dir / gpu_file_name
             if gpu_file.exists():
+                # Podman + NVIDIA prerequisite: nvidia-ctk CDI spec must
+                # exist on the host. install.py runs the generator once
+                # before compose-up so compose can reference
+                # `nvidia.com/gpu=all` without manual setup.
+                if is_podman:
+                    _ensure_nvidia_cdi_spec_for_podman()
                 cmd.extend(["-f", str(gpu_file), "--profile", "gpu"])
-                print("  GPU overlay: NVIDIA (includes code_embed container)")
+                engine = "Podman" if is_podman else "Docker"
+                print(f"  GPU overlay: NVIDIA ({engine}: includes code_embed container)")
             else:
-                print("  WARNING: GPU overlay file not found, running CPU-only")
+                print(f"  WARNING: GPU overlay {gpu_file_name} not found, running CPU-only")
 
     cmd.extend(["up", "-d"])
     # When subset detection said only some services are missing, pass them
@@ -4339,10 +4459,185 @@ def _ensure_collections(embed_config: dict,
 # Soft-fail policy: if Weaviate or Ollama isn't yet reachable (timing
 # race on first-boot pulls), print a clear hint and continue. The
 # install itself succeeds; the user can re-run seeding later via
-#   .claude/scripts/kg-sync --all
-#   .claude/scripts/upload_docs.py --all
+#   .claude/scripts/kg-sync --all       (handles knowledge/ + docs/)
 #
-# Both scripts are idempotent so re-runs are safe.
+# The script is idempotent so re-runs are safe.
+
+def _detect_kg_schema_drift(weaviate_url: str, kg_collection: str) -> tuple[bool, list[str]]:
+    """Probe a running KG collection for today's required schema invariants.
+
+    Returns (drift_detected, missing_features). drift_detected=True
+    means the collection exists but lacks one or more invariants that
+    the current code requires. missing_features lists the human-readable
+    invariant names so the prompt can show the user what changed.
+
+    Invariants checked (today's set; grow this list when new ones land):
+      - 3 named-vector slots (qwen3_embed, ollama_embed, openai_embed)
+      - inverted_index_config.index_null_state == True
+
+    Both invariants CANNOT be retro-added on Weaviate ≤1.30 — the only
+    fix is drop + re-ingest. Return value drives the prompt in
+    `_maybe_prompt_rebuild_collections`.
+
+    Failure-soft: if Weaviate is unreachable or the collection doesn't
+    exist, returns (False, []) — caller treats that as "no drift" and
+    leaves the seed step to handle creation. We only flag drift when we
+    can affirmatively see a non-conformant existing schema.
+    """
+    try:
+        import urllib.request
+        # Weaviate v1 REST: GET /v1/schema/<class> returns the schema.
+        req = urllib.request.Request(
+            f"{weaviate_url.rstrip('/')}/v1/schema/{kg_collection}",
+            headers={"Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            if resp.status != 200:
+                return (False, [])
+            schema = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return (False, [])
+
+    missing: list[str] = []
+
+    # Check named-vector slots
+    vec_config = schema.get("vectorConfig") or {}
+    expected_slots = {"qwen3_embed", "ollama_embed", "openai_embed"}
+    actual_slots = set(vec_config.keys())
+    if not expected_slots.issubset(actual_slots):
+        gap = sorted(expected_slots - actual_slots)
+        missing.append(f"named-vector slots (missing: {', '.join(gap)})")
+
+    # Check index_null_state
+    inv_idx = schema.get("invertedIndexConfig") or {}
+    if not inv_idx.get("indexNullState", False):
+        missing.append("index_null_state=True (required for stale-filter)")
+
+    return (bool(missing), missing)
+
+
+def _maybe_prompt_rebuild_collections(args: argparse.Namespace) -> bool:
+    """During --update, detect schema drift and prompt the user.
+
+    Returns True iff the rebuild should run. Exits silently with False
+    on:
+      - install (not update) mode — schema is fresh by definition
+      - --skip-rebuild-prompt — explicit defer
+      - --rebuild-collections — explicit opt-in (returns True directly)
+      - non-interactive shell with no --yes — fail safe; no destructive
+        action without confirmation
+    """
+    if not args.update:
+        return False
+    if args.rebuild_collections:
+        # Explicit opt-in. No prompt needed.
+        return True
+    if args.skip_rebuild_prompt:
+        return False
+
+    # Detect drift on the running KG collection.
+    weaviate_url = os.environ.get("WEAVIATE_URL", f"http://localhost:{DEFAULT_WEAVIATE_PORT}")
+    kg_collection = os.environ.get("KG_COLLECTION", "")
+    if not kg_collection:
+        # No KG collection configured — first install probably; let
+        # _ensure_collections + _seed_weaviate handle it.
+        return False
+
+    drift, missing = _detect_kg_schema_drift(weaviate_url, kg_collection)
+    if not drift:
+        return False
+
+    print()
+    print("=" * 70)
+    print("⚠️  SCHEMA REBUILD REQUIRED")
+    print("=" * 70)
+    print()
+    print(f"The running KG collection ({kg_collection}) is on an older schema:")
+    for feat in missing:
+        print(f"  - missing: {feat}")
+    print()
+    print("Today's code requires these invariants. Weaviate ≤1.30 doesn't")
+    print("allow adding them via Reconfigure — the collections must be")
+    print("dropped and re-ingested from `knowledge/` and `docs/`.")
+    print()
+    print("What gets touched:")
+    print("  ✓ Weaviate collections (DROPPED + recreated + re-ingested)")
+    print("  ✗ Your .md source files in knowledge/ and docs/  (untouched)")
+    print("  ✗ .env / .vscode/settings.json / .claude/settings.json (untouched)")
+    print("  ✗ The launcher's project bindings (untouched)")
+    print()
+    print("Estimated time: ~3-5 minutes (Ollama re-embeds ~600 nodes).")
+    print()
+
+    # Non-interactive flow: respect --yes; otherwise refuse to nuke data.
+    if not sys.stdin.isatty():
+        if getattr(args, "yes", False):
+            print("(non-interactive --yes: proceeding with rebuild)")
+            return True
+        print("Non-interactive shell + no --yes — DEFERRING rebuild.")
+        print("Re-run with `install.py --update --rebuild-collections` to apply.")
+        print("Note: search may misbehave until rebuild completes.")
+        return False
+
+    answer = input("Proceed with rebuild? [y/N]: ").strip().lower()
+    return answer in ("y", "yes")
+
+
+def _rebuild_collections(args: argparse.Namespace) -> None:
+    """Drop the KG and dev collections (when configured) so the
+    subsequent _ensure_collections + _seed_weaviate steps recreate
+    them with today's schema and re-ingest from sources.
+
+    Idempotent: silently skips collections that don't exist. Logs each
+    drop as a separate install event for forensics.
+    """
+    print("[7b.1/10] Dropping KG + Dev collections for schema rebuild ...")
+    _log_install_event("7b.1/10", "start", "schema-rebuild collection drop")
+
+    try:
+        import weaviate
+        weaviate_url = os.environ.get("WEAVIATE_URL", f"http://localhost:{DEFAULT_WEAVIATE_PORT}")
+        host = weaviate_url.replace("http://", "").replace("https://", "").split(":")[0]
+        port = int(weaviate_url.rsplit(":", 1)[-1]) if ":" in weaviate_url else 8080
+        client = weaviate.connect_to_custom(
+            http_host=host,
+            http_port=port,
+            http_secure=False,
+            grpc_host=host,
+            grpc_port=int(os.environ.get("GRPC_PORT", "50052")),
+            grpc_secure=False,
+            skip_init_checks=True,
+        )
+        try:
+            for env_key, label in [
+                ("KG_COLLECTION", "KG"),
+                ("DEVELOPMENT_COLLECTION", "Dev"),
+            ]:
+                name = os.environ.get(env_key, "")
+                if not name:
+                    continue
+                if client.collections.exists(name):
+                    print(f"  Dropping {label}: {name} ...")
+                    client.collections.delete(name)
+                    _log_install_event(
+                        "7b.1/10", "step",
+                        f"dropped {label}: {name}",
+                        data={"collection": name},
+                    )
+                else:
+                    print(f"  {label} ({name}) does not exist — skipping drop")
+        finally:
+            client.close()
+        _log_install_event("7b.1/10", "ok", "schema-rebuild drop complete")
+    except Exception as e:
+        print(f"  ! rebuild drop failed: {e}")
+        print("    Update will continue but search may misbehave until")
+        print("    you manually drop the collections and re-run --update.")
+        _log_install_event(
+            "7b.1/10", "error",
+            f"rebuild drop failed: {e}",
+        )
+
 
 def _seed_weaviate(args: argparse.Namespace) -> None:
     print("[7c/10] Seeding Weaviate with bundled knowledge/ + docs/ ... ", flush=True)
@@ -4379,55 +4674,34 @@ def _seed_weaviate(args: argparse.Namespace) -> None:
 
     scripts_dir = PROJECT_ROOT / ".claude" / "scripts"
     sync_kg = scripts_dir / "sync_knowledge_graph.py"
-    upload_docs = scripts_dir / "upload_docs.py"
 
     seed_errors: list[str] = []
 
-    # 1. Knowledge graph seed
+    # `sync_knowledge_graph.py` now handles both KG (knowledge/) and dev
+    # docs (docs/) ingest paths — it routes by the file's location.
+    # Old upload_docs.py was retired 2026-04-30 (audit cleanup); the
+    # `--all` flag below seeds knowledge/ AND docs/ in one pass.
     if sync_kg.exists():
-        print("  → knowledge/ → KG collection ...", flush=True)
+        print("  → knowledge/ + docs/ → KG + Development collections ...", flush=True)
         try:
             subprocess.run(
                 [str(venv_py), str(sync_kg), "--all"],
                 check=True,
                 cwd=str(PROJECT_ROOT),
-                timeout=600,  # 10 min cap; 50 seed nodes = ~30s on warm Ollama
+                timeout=900,  # 15 min cap; large repos may hit this
             )
         except subprocess.CalledProcessError as e:
-            print(f"    ! kg sync exited {e.returncode} — re-run later with `kg-sync --all`")
+            print(f"    ! kg/docs sync exited {e.returncode} — re-run later with `kg-sync --all`")
             seed_errors.append(f"kg-sync exit {e.returncode}")
         except subprocess.TimeoutExpired:
-            print("    ! kg sync timed out (>10 min) — re-run later with `kg-sync --all`")
+            print("    ! kg/docs sync timed out (>15 min) — re-run later with `kg-sync --all`")
             seed_errors.append("kg-sync timeout")
         except FileNotFoundError as e:
-            print(f"    ! kg sync failed: {e}")
+            print(f"    ! kg/docs sync failed: {e}")
             seed_errors.append(f"kg-sync FileNotFound: {e}")
     else:
         print(f"  ! sync_knowledge_graph.py not found at {sync_kg}")
         seed_errors.append("sync_knowledge_graph.py missing")
-
-    # 2. Project documentation seed
-    if upload_docs.exists():
-        print("  → docs/ → Development collection ...", flush=True)
-        try:
-            subprocess.run(
-                [str(venv_py), str(upload_docs), "--all"],
-                check=True,
-                cwd=str(PROJECT_ROOT),
-                timeout=600,
-            )
-        except subprocess.CalledProcessError as e:
-            print(f"    ! docs upload exited {e.returncode} — re-run later with `upload_docs.py --all`")
-            seed_errors.append(f"upload_docs exit {e.returncode}")
-        except subprocess.TimeoutExpired:
-            print("    ! docs upload timed out (>10 min) — re-run later with `upload_docs.py --all`")
-            seed_errors.append("upload_docs timeout")
-        except FileNotFoundError as e:
-            print(f"    ! docs upload failed: {e}")
-            seed_errors.append(f"upload_docs FileNotFound: {e}")
-    else:
-        print(f"  ! upload_docs.py not found at {upload_docs}")
-        seed_errors.append("upload_docs.py missing")
 
     # 3. Cross-project shared KG seed (Step 7d).
     #
@@ -4485,7 +4759,7 @@ def _seed_weaviate(args: argparse.Namespace) -> None:
     print("  OK (seed step complete; per-script errors are non-fatal — see hints above)")
     if seed_errors:
         # Soft-fail: still log as warn, not error. Step is non-fatal by
-        # design — users can re-run kg-sync / upload_docs later. The
+        # design — users can re-run `kg-sync --all` later. The
         # downstream resume-decider treats "warn" as still-eligible-to-skip
         # so a partial seed doesn't block install completion.
         _log_install_event(
@@ -4588,7 +4862,10 @@ def _env_canonical_template(project_name: str = "<project>",
         ("SHARED_KG_COLLECTION", "VibeCodedTools_KnowledgeGraph", None),
         ("DEVELOPMENT_COLLECTION", f"{project_name}_Development", None),
         ("PROJECT_NAME", project_name, None),
-        ("CONVERSATION_COLLECTION", f"{project_name}_conversations", None),
+        # CONVERSATION_COLLECTION removed 2026-04-30 — capture flow deprecated
+        # and the collection was dropped from new installs. If you have an
+        # existing install with conversations data, that collection still
+        # exists but is no longer written to.
         ("", None, ""),
 
         # LLM API keys
@@ -4816,7 +5093,11 @@ def _write_env_config(embed_config: dict, args: argparse.Namespace, joern_availa
         f"CODE_EMBED_MODEL={embed_config['code_model']}",
         f"CODE_EMBED_DIMS={embed_config['code_dims']}",
         f"CODE_EMBED_SERVICE_URL=http://localhost:{code_embed_port}",
-        f"ACTIVE_EMBEDDING=qwen3",
+        # ACTIVE_EMBEDDING: maps to the named-vector slot the MCP server
+        # reads/writes. Per-profile so low-resource/openai installs don't
+        # cross-write qwen3 vectors into a slot labelled for a different
+        # model (audit fix 2026-04-30, see kg-embedding-vector-audit-2026-04-30.md).
+        f"ACTIVE_EMBEDDING={embed_config.get('active_embedding', 'qwen3')}",
         "",
         "# Optional companion tools (auto-detected at install)",
         f"VCT_JOERN_AVAILABLE={'1' if joern_available else '0'}",
@@ -4923,7 +5204,8 @@ def _configure_claude_settings(embed_config: dict) -> None:
         "OLLAMA_URL": f"http://localhost:{ollama_port}",
         "GRPC_PORT": str(weaviate_grpc),
         "EMBEDDING_MODEL": embed_config["text_model"],
-        "ACTIVE_EMBEDDING": "qwen3",
+        # See note at the .env-write block above. Per-profile slot mapping.
+        "ACTIVE_EMBEDDING": embed_config.get("active_embedding", "qwen3"),
         "KG_COLLECTION": "KnowledgeGraph",
         "DEVELOPMENT_COLLECTION": "Development",
         "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",

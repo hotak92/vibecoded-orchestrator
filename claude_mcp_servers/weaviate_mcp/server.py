@@ -553,6 +553,12 @@ SHARED_KG_OPT_OUT = os.getenv("SHARED_KG_OPT_OUT", "").lower() in ("1", "true", 
 SHARED_KG_COLLECTION = "" if SHARED_KG_OPT_OUT else _SHARED_KG_RAW
 # Project-specific documentation collection (e.g. ProjectName_development).
 # When set, hybrid_search also searches this collection automatically.
+# Auto-pairing convention: the launcher should set `KG_COLLECTION=Foo` AND
+# `DEVELOPMENT_COLLECTION=Foo_development` together. We do NOT auto-derive
+# here — `write_project_env_files` (Rust) and `_ensure_collections` (install.py)
+# are the canonical writers; the server just reads. semantic_graph_search
+# uses KG_COLLECTION only — docs have no WikiLinks so graph traversal can't
+# find useful neighbors there.
 DEVELOPMENT_COLLECTION = os.getenv("DEVELOPMENT_COLLECTION", "")
 # Base directory for KG markdown files. When set, store_knowledge_node will
 # write the .md file if it doesn't already exist (file_path is relative to this dir).
@@ -853,8 +859,10 @@ def _primary_named_vector(scheme: str) -> str:
 async def _get_search_vector(text: str, scheme: str = "kg") -> tuple[list[float] | None, str]:
     """Get embedding for search, returns (vector, target_vector_name).
 
-    target_vector_name is empty string when DUAL_EMBEDDING_ENABLED is False
-    (legacy single-vector mode).
+    Every collection on disk is named-vector — the DUAL-off branch was
+    dead code (audit fix 2026-04-30). target_vector_name is always the
+    slot name matching the model that produced the vector; never the
+    empty string.
 
     ACTIVE_EMBEDDING controls which model is used for search:
       KG scheme:   "qwen3" (default) | "ollama" (legacy arctic) | "openai"
@@ -867,26 +875,41 @@ async def _get_search_vector(text: str, scheme: str = "kg") -> tuple[list[float]
     if ACTIVE_EMBEDDING == "openai" and OPENAI_API_KEY:
         vec = await get_openai_embedding(text)
         if vec:
-            return vec, "openai_embed" if DUAL_EMBEDDING_ENABLED else ""
+            return vec, "openai_embed"
+        # Audit fix (2026-04-30): on openai failure, do NOT silently fall
+        # through to qwen3/arctic below — that mixes embedding spaces and
+        # surfaces poor results without any signal to the caller. Log the
+        # failure and return None; the caller will see a clear error.
+        logger.warning(
+            "_get_search_vector: ACTIVE_EMBEDDING=openai but OpenAI call "
+            "failed; refusing to fall back to legacy embedder (would "
+            "produce results from a different vector space). Caller will "
+            "receive None."
+        )
+        return None, ""
 
     if scheme == "code":
         if ACTIVE_EMBEDDING in ("codesage", "qwen3"):
             # Use new CodeSage model (default for code)
             vec = await get_code_embedding(text)
-            target = "codesage_embed" if DUAL_EMBEDDING_ENABLED else ""
+            target = "codesage_embed"
         else:
             # Legacy: Jina via Ollama
             vec = await get_legacy_code_embedding(text)
-            target = "ollama_code_embed" if DUAL_EMBEDDING_ENABLED else ""
+            target = "ollama_code_embed"
     else:
         if ACTIVE_EMBEDDING in ("qwen3", "codesage"):
             # Use new Qwen3-Embedding (default for KG)
             vec = await get_ollama_embedding(text)
-            target = "qwen3_embed" if DUAL_EMBEDDING_ENABLED else ""
+            target = "qwen3_embed"
         else:
             # Legacy: Arctic via Ollama
             vec = await get_legacy_text_embedding(text)
-            target = "ollama_embed" if DUAL_EMBEDDING_ENABLED else ""
+            target = "ollama_embed"
+    # NOTE: previously this returned (vec, "" if not DUAL_EMBEDDING_ENABLED).
+    # The DUAL-off branch was dead code — every collection on disk is
+    # named-vector — and `target_vector=""` would query an unnamed slot
+    # that doesn't exist on dual-vector collections (audit fix, 2026-04-30).
     return vec, target
 
 
@@ -1463,12 +1486,50 @@ async def search_single_collection(collection_name: str, query: str, limit: int,
         return []
 
 
+def _stale_filter(include_stale: bool = False):
+    """Filter that excludes nodes whose `valid_until` is in the past.
+
+    Returns a Weaviate `Filter` matching only nodes that are either:
+      - missing `valid_until` (active by default), OR
+      - have `valid_until` greater than now.
+
+    Returns None when `include_stale=True` (no filter). The filter is
+    applied AT QUERY TIME — before reranking, before result counting —
+    so stale nodes never leave Weaviate. Tests, audit jobs, or research
+    that genuinely needs archived nodes should pass `include_stale=True`.
+
+    Why query-time and not post-fetch:
+      - RL reranker would otherwise score stale candidates
+      - `limit=N` would return fewer than N valid results after a Python pass
+      - tier counts (auto-mode) would be wrong
+
+    Schema requirement: the collection MUST be created with
+    `inverted_index_config=Configure.inverted_index(index_null_state=True)`.
+    Without that, the IsNull leg errors with "Nullstate must be indexed to
+    be filterable!" — and Weaviate doesn't allow toggling that flag after
+    creation, so collections created without it must be deleted and
+    rebuilt. See `sync_knowledge_graph.py::ensure_collection_exists` and
+    `analyze_code_graph.py::_inverted_index_config`.
+
+    Pass a datetime object (not ISO string) — the Python client serializes
+    to valueDate, which the date-typed property requires.
+    """
+    if include_stale:
+        return None
+    now = datetime.now(timezone.utc)
+    return (
+        Filter.by_property("valid_until").is_none(True)
+        | Filter.by_property("valid_until").greater_than(now)
+    )
+
+
 @mcp.tool()
 async def semantic_graph_search(
     query: str,
     limit: int = 5,
     depth: int = 2,
     detail: str = "auto",
+    include_stale: bool = False,
 ) -> str:
     """
     Semantic search with WikiLink graph traversal (GraphRAG). Finds concepts
@@ -1502,6 +1563,9 @@ async def semantic_graph_search(
     coll = client.collections.get(KG_COLLECTION)
 
     fetch_limit = limit * _RL_OVERFETCH
+
+    # Stale-filter applied at query time, before RL rerank + result counting.
+    stale = _stale_filter(include_stale=include_stale)
 
     # Determine all collections to search. Mirrors hybrid_search: project KG +
     # shared KG (when configured and not opted out). We do NOT include
@@ -1539,11 +1603,10 @@ async def semantic_graph_search(
             continue
         try:
             if EMBEDDING_SOURCE == "weaviate":
-                primary = handle.query.near_text(
-                    query=query,
-                    limit=fetch_limit,
-                    return_metadata=["distance"]
-                )
+                nt_kwargs = dict(query=query, limit=fetch_limit, return_metadata=["distance"])
+                if stale is not None:
+                    nt_kwargs["filters"] = stale
+                primary = handle.query.near_text(**nt_kwargs)
             else:
                 vector, target_name = await _get_search_vector(query)
                 nv_kwargs = dict(
@@ -1551,6 +1614,8 @@ async def semantic_graph_search(
                 )
                 if target_name:
                     nv_kwargs["target_vector"] = target_name
+                if stale is not None:
+                    nv_kwargs["filters"] = stale
                 primary = handle.query.near_vector(**nv_kwargs)
         except Exception as exc:
             logger.warning(f"semantic_graph_search: error searching {coll_name}: {exc}")
@@ -1783,6 +1848,7 @@ async def hybrid_search(
     tags: list[str] = None,
     days: int = None,
     detail: str = "auto",
+    include_stale: bool = False,
 ) -> str:
     """
     Combined semantic + keyword search across KG and project docs.
@@ -1838,6 +1904,12 @@ async def hybrid_search(
     if tags:
         for tag in tags:
             filters.append(Filter.by_property("tags").contains_any([tag]))
+
+    # Stale-filter — exclude archived/expired nodes BEFORE rerank+counting.
+    # Caller passes `include_stale=True` to disable (audits, history queries).
+    stale = _stale_filter(include_stale=include_stale)
+    if stale is not None:
+        filters.append(stale)
 
     weaviate_filter = None
     if filters:
@@ -3197,12 +3269,16 @@ async def migrate_embeddings(
         for vec_name in scheme_vectors
     ]
 
-    # Delete and recreate with named vectors
+    # Delete and recreate with named vectors. Preserve the
+    # index_null_state=True invariant (the stale-filter relies on
+    # `valid_until is_none(True)` being filterable; see _stale_filter
+    # docstring). This setting CANNOT be added later via Reconfigure.
     client.collections.delete(collection_name)
     client.collections.create(
         name=collection_name,
         properties=existing_props,
         vectorizer_config=vectorizer_config,
+        inverted_index_config=Configure.inverted_index(index_null_state=True),
     )
 
     new_coll = client.collections.get(collection_name)

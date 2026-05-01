@@ -9,8 +9,14 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 # Payload format (from Claude Code Stop event):
 #   {"session_id":"...","message":{"usage":{"input_tokens":N,"output_tokens":N,"cache_read_input_tokens":N},"model":"..."},...}
 #
+# Auth mode detection (2026-05-01): claude.ai OAuth subscription has no
+# per-token cost — this script was originally written for MAO API-key
+# usage. We now record auth_mode in each entry; cost_usd is only
+# populated when auth_mode == "api". Subscription rows still log token
+# counts (useful for usage analysis) but cost_usd is null.
+#
 # Output format (costs.jsonl):
-#   {"timestamp":"ISO","session_id":"...","model":"...","input_tokens":N,"output_tokens":N,"cache_read_tokens":N,"cost_usd":N}
+#   {"timestamp":"ISO","session_id":"...","model":"...","input_tokens":N,"output_tokens":N,"cache_read_tokens":N,"auth_mode":"api|subscription","cost_usd":N|null}
 
 set -euo pipefail
 
@@ -43,7 +49,18 @@ cache_read_tokens = usage.get("cache_read_input_tokens", 0)
 if input_tokens == 0 and output_tokens == 0:
     sys.exit(0)
 
-# Pricing table (per 1M tokens) — update as models change
+# Auth-mode detection. claude.ai OAuth credentials live at
+# ~/.claude/credentials*. Presence -> subscription (no per-token cost).
+# Absence -> assume API-key billing (cost calc applies). We deliberately
+# don't parse the JSON because the credential schema isn't documented
+# stable; mere file presence is the signal Claude Code itself uses.
+home = pathlib.Path.home()
+oauth_paths = list(home.glob(".claude/credentials*"))
+auth_mode = "subscription" if oauth_paths else "api"
+
+# Pricing table (per 1M tokens) — update as models change. Only used
+# when auth_mode == "api"; subscription tokens are free (included in
+# claude.ai subscription).
 PRICING = {
     "claude-haiku-4-5": (0.80, 4.00),
     "claude-haiku-4-5-20251001": (0.80, 4.00),
@@ -54,14 +71,14 @@ PRICING = {
     "claude-opus-4-7": (5.00, 25.00),
 }
 
-# Find matching price (prefix match)
-input_price, output_price = 3.00, 15.00  # default: sonnet
-for model_key, (ip, op) in PRICING.items():
-    if model_key in model:
-        input_price, output_price = ip, op
-        break
-
-cost_usd = (input_tokens * input_price + output_tokens * output_price) / 1_000_000
+cost_usd = None
+if auth_mode == "api":
+    input_price, output_price = 3.00, 15.00  # default: sonnet
+    for model_key, (ip, op) in PRICING.items():
+        if model_key in model:
+            input_price, output_price = ip, op
+            break
+    cost_usd = round((input_tokens * input_price + output_tokens * output_price) / 1_000_000, 6)
 
 record = {
     "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -70,7 +87,8 @@ record = {
     "input_tokens": input_tokens,
     "output_tokens": output_tokens,
     "cache_read_tokens": cache_read_tokens,
-    "cost_usd": round(cost_usd, 6),
+    "auth_mode": auth_mode,
+    "cost_usd": cost_usd,
 }
 
 metrics_dir = pathlib.Path.home() / ".claude" / "metrics"

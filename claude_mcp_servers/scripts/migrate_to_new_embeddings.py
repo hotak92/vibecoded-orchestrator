@@ -195,13 +195,18 @@ def add_named_vector_to_collection(
         for vn in sorted(all_vec_names)
     ]
 
-    # Delete and recreate
+    # Delete and recreate. Preserve `index_null_state=True` so the
+    # MCP `_stale_filter()` (`valid_until is_none(True) | > now`) keeps
+    # working on KG collections post-migration. CANNOT be retro-added
+    # via Reconfigure on Weaviate ≤1.30, so we must include it here.
+    # Audit finding 2026-04-30 (Code-M2 / KG schema gotchas).
     logger.info("Recreating '%s' with named vectors: %s", coll_name, sorted(all_vec_names))
     client.collections.delete(coll_name)
     client.collections.create(
         name=coll_name,
         properties=existing_props,
         vectorizer_config=vectorizer_config,
+        inverted_index_config=Configure.inverted_index(index_null_state=True),
     )
 
     # Re-insert objects with existing vectors

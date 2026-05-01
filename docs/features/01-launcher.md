@@ -33,7 +33,7 @@ The `projects` store auto-selects a project when exactly one exists, so a freshl
 On `projects.load()`, if the previously selected project id no longer exists, the selection is cleared gracefully rather than leaving the UI broken.
 
 ### Per-project Env File Tri-write
-On project create (and update), `write_project_env_files` writes `KG_COLLECTION`, `PROJECT_NAME`, `DEVELOPMENT_COLLECTION`, `CONVERSATION_COLLECTION` to three surfaces simultaneously.
+On project create (and update), `write_project_env_files` writes `KG_COLLECTION`, `PROJECT_NAME`, `DEVELOPMENT_COLLECTION` to three surfaces simultaneously. (`CONVERSATION_COLLECTION` removed 2026-04-30 — capture flow deprecated.)
 
 <details>
 <summary>Details</summary>
