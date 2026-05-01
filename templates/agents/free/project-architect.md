@@ -3,6 +3,7 @@ name: project-architect
 description: End-to-end project design with requirements, architecture, and implementation plan
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
+effort: xhigh
 mcpServers:
   orchestrator-tools:
     command: {{ORCHESTRATOR_ROOT}}/claude_mcp_servers/.venv/bin/python

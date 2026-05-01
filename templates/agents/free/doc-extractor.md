@@ -3,7 +3,7 @@ name: doc-extractor
 description: Extract knowledge from scattered documentation - read-only, no modifications
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
-effort: low
+effort: high
 hooks:
   PreToolUse:
     matcher: "Write|Edit"

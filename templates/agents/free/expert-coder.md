@@ -3,6 +3,7 @@ name: expert-coder
 description: Opus-powered expert implementing complex features with deep architectural reasoning, security analysis, and multi-layer debugging capabilities
 tools: Read, Write, Edit, Grep, Glob, Bash
 model: opus
+effort: xhigh
 isolation: worktree
 mcpServers:
   orchestrator-tools:

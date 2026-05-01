@@ -3,7 +3,7 @@ name: kg-navigator
 description: Navigate knowledge graph - search, explore connections, identify gaps (read-only)
 tools: Read, Grep, Bash
 model: sonnet
-effort: low
+effort: high
 ---
 
 # Knowledge Graph Navigator Agent

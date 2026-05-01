@@ -3,7 +3,7 @@ name: prompt-engineer
 description: Reviews and optimizes prompts for code agents using 2026 research. Creates agent prompts with critical thinking, tool usage, and Claude 4.x patterns.
 tools: Read, Write, Edit, Grep, Glob
 model: sonnet
-effort: low
+effort: xhigh
 ---
 
 # Prompt Engineering Specialist Agent

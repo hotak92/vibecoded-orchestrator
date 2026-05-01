@@ -3,7 +3,7 @@ name: ai-llm-expert
 description: LLM integration specialist - prompts, context, caching, routing, cost optimization
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
-effort: low
+effort: xhigh
 skills:
   - ai-prompting
   - ai-model-selector
