@@ -196,7 +196,14 @@ cd vibecoded-orchestrator
 
 **Windows notes**:
 - The installer and MCP servers run natively on Windows.
-- Automation hooks (`.claude/hooks/*.sh`) are bash scripts and require **WSL2** (Windows Subsystem for Linux) to fire automatically. Without WSL, the core orchestrator still works but session-start container checks, auto-sync on file edits, and context-injection hooks do not run. Install WSL: `wsl --install`.
+- **Automation hooks ship as native PowerShell** (`.ps1`) on Windows. The installer
+  copies the OS-active flavour only — Linux/macOS get `*.sh`, Windows gets `*.ps1`.
+- **Required**: PowerShell 5.1+ (preinstalled on Windows 10/11). The installer
+  hard-fails if neither `pwsh` (PowerShell 7+) nor `powershell` (Windows
+  PowerShell 5.1) is on PATH. Older Windows: install via https://aka.ms/PSWindows.
+- **Recommended**: Git Bash (`winget install Git.Git`) as a fallback for legacy
+  helpers. The instinct-pipeline data-collection hooks are Linux-only by design
+  (marked `OS-EXEMPT-PARITY`); without Git Bash they simply don't fire on Windows.
 - PowerShell wrappers (`.ps1`) are provided for the main CLI tools: `kg-search.ps1`, `kg-sync.ps1`, `kg-info.ps1`, `code-graph-query.ps1`, `code-graph-analyze.ps1`.
 - Docker Desktop is the recommended container runtime on Windows. Podman Desktop also works.
 
@@ -278,7 +285,7 @@ If the wrappers can't auto-install (for example, no `winget` on older Windows or
 | Ollama model pull fails | No network in container, or huge model on slow link | Re-run later with `--update`; or pull manually: `curl -X POST http://localhost:11435/api/pull -d '{"name":"qwen3-embedding:0.6b"}'` |
 | `code_embed` container fails on CPU-only host | GPU profile enabled despite no NVIDIA GPU | Run with `--cpu-only` (or `--low-resource`) — these set `CODE_EMBED_BACKEND=ollama` instead |
 | Joern download/install fails | Network blocked or JDK install rejected | Skip with `--no-joern`; install separately later from https://docs.joern.io/installation/ |
-| Hooks don't fire on Windows | Bash hooks need WSL | Install WSL (`wsl --install`) or run only the MCP/CLI parts |
+| Hooks don't fire on Windows | Hooks ship as `.ps1` on Windows; PowerShell 5.1+ required | Install/upgrade PowerShell — Windows 10/11 ships with 5.1 by default. Legacy `.sh`-only helpers (instinct pipeline) need Git Bash for full coverage. |
 | Existing Weaviate / Ollama on default ports | The installer detects foreign services on `8081` / `11435` / `11440` and runs ours on a free alt-port by default — no collision, no pollution. Override with `--on-conflict adopt\|abort`. See [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md#coexisting-with-other-weaviate-or-ollama-installs). | — |
 
 For deeper issues see [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
