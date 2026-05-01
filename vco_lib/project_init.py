@@ -1982,21 +1982,44 @@ def _write_file_atomic(target: Path, data: bytes, *, mode: Optional[int] = None)
         raise
 
 
+def _format_file_list_md(paths: list[str], cap: int = 20) -> str:
+    """Render a bullet-list of file paths for inclusion in a deferral entry.
+
+    Caps at `cap` entries with a "... and N more" trailer when oversize so
+    the deferral .md doesn't grow unbounded for large preserve / skip lists
+    (a fresh-folder install over a previously-installed orchestrator could
+    plausibly produce dozens of skipped paths).
+    """
+    if len(paths) <= cap:
+        return "\n".join(f"  - `{p}`" for p in paths)
+    head = "\n".join(f"  - `{p}`" for p in paths[:cap])
+    return f"{head}\n  - ... and {len(paths) - cap} more"
+
+
 def _emit_user_modified_deferral(
     folder: Path, modified_files: list[str], orchestrator_root: Path,
 ) -> None:
-    """When `install_project_bundle --update` finds user-modified files
-    that diverge from the prior-shipped hash, emit a single deferral
-    entry naming all such files. The user can then either accept the
-    new shipped versions (rerun with `--force`) or merge manually.
+    """Emit `bundle_user_modified_preserved`: one deferral entry per project
+    listing every file that diverged from the prior-shipped hash during an
+    `--update` run.
+
+    The user has three options:
+    1. Accept shipped versions wholesale: `--update --force`.
+    2. Keep customizations and dismiss the deferral via `dismiss-deferral`
+       (PR 5+ command — placeholder in the message for now).
+    3. Manually merge per-file.
+
+    Per-project grouping (single entry, file list inside) is intentional —
+    one entry per file would generate dozens of deferrals that all
+    duplicate the same actionable command.
     """
     if not modified_files:
         return
     from vco_lib.deferral_report import DeferralEntry, DeferralReport
 
-    files_md = "\n".join(f"  - `{f}`" for f in modified_files)
+    files_md = _format_file_list_md(sorted(modified_files))
     cmd = (
-        f"# Inspect the differences:\n"
+        f"# Inspect the differences (per file):\n"
         f"#   diff -u <orchestrator>/<source-rel> {folder}/<dest-rel>\n"
         f"# Then either accept shipped versions (forces overwrite):\n"
         f"python -m vco_lib.project_init install-bundle "
@@ -2005,11 +2028,11 @@ def _emit_user_modified_deferral(
         f"# OR keep your customizations and dismiss this deferral:\n"
         f"python -m vco_lib.project_init dismiss-deferral "
         f"--folder {str(folder)!r} "
-        f"--condition-id user_modified_bundle_files"
+        f"--condition-id bundle_user_modified_preserved"
     )
     entry = DeferralEntry(
-        condition_id="user_modified_bundle_files",
-        title="User-modified bundle files diverged from shipped templates",
+        condition_id="bundle_user_modified_preserved",
+        title="User-modified bundle files preserved during update",
         detected=(
             f"During an `install-bundle --update` run, "
             f"{len(modified_files)} file(s) under the project's `.claude/` "
@@ -2019,10 +2042,69 @@ def _emit_user_modified_deferral(
         ),
         why_deferred=(
             "Default-to-safety: when an installed file's hash differs "
-            "from both the prior-shipped hash and the new shipped hash, "
+            "from the prior-shipped hash recorded in .vco-manifest.json, "
             "we preserve the on-disk version. If your edits are "
             "intentional, dismiss the deferral; if you'd rather take the "
             "shipped version, re-run with `--force`."
+        ),
+        command_to_apply=cmd,
+        severity="info",
+        kg_node_refs=[],
+    )
+    report = DeferralReport.read(folder)
+    report.add_entry(entry)
+    report.write(folder)
+
+
+def _emit_skipped_existing_deferral(
+    folder: Path, skipped_files: list[str], orchestrator_root: Path,
+) -> None:
+    """Emit `bundle_skipped_existing_files`: one deferral entry per project
+    listing pre-existing files that the first-install path SKIPPED because
+    their content differs from the orchestrator's shipped version.
+
+    Why: a Claude Code session opening this folder needs to know the bundle
+    install was incomplete — the user may have a stale custom hook that
+    will silently miss new orchestrator-side improvements until they
+    explicitly run `--update --force`.
+
+    Severity is `info` (not `warning`) — the project is functional, just
+    not 100% in lockstep with the orchestrator's defaults.
+
+    Per-project grouping (single entry, file list inside): one entry per
+    file would be noisy and harder to action. The single entry's command
+    fixes ALL of them in one go.
+    """
+    if not skipped_files:
+        return
+    from vco_lib.deferral_report import DeferralEntry, DeferralReport
+
+    files_md = _format_file_list_md(sorted(skipped_files))
+    cmd = (
+        f"# Accept the orchestrator's shipped versions for ALL skipped files:\n"
+        f"python -m vco_lib.project_init install-bundle "
+        f"--folder {str(folder)!r} --orchestrator-root "
+        f"{str(orchestrator_root)!r} --update --force --json"
+    )
+    entry = DeferralEntry(
+        condition_id="bundle_skipped_existing_files",
+        title="Pre-existing files preserved during first-install",
+        detected=(
+            f"During the first-install of this project's bundle, "
+            f"{len(skipped_files)} file(s) under `.claude/` and "
+            f"`infrastructure/` already existed AND differed from the "
+            f"orchestrator's shipped versions. They were preserved to "
+            f"avoid overwriting user customizations:\n"
+            f"{files_md}"
+        ),
+        why_deferred=(
+            "These files already existed when the bundle was first "
+            "installed and differ from the orchestrator's shipped "
+            "versions. We preserved them to avoid overwriting user "
+            "customizations. If you intended to use the orchestrator's "
+            "defaults, run "
+            "`python -m vco_lib.project_init install-bundle --folder "
+            "<path> --update --force` to overwrite."
         ),
         command_to_apply=cmd,
         severity="info",
@@ -2140,6 +2222,7 @@ def install_project_bundle(
     manifest = _read_manifest(folder)
     new_files: dict[str, dict] = {}
     user_modified_paths: list[str] = []
+    skipped_existing_paths: list[str] = []
 
     ops = _enumerate_bundle_files(orchestrator_root)
     _log("4.bundle", "start",
@@ -2184,7 +2267,10 @@ def install_project_bundle(
         elif action == "skip-existing":
             # First-install with pre-existing file: do not overwrite, but
             # also don't claim ownership in the manifest (it's not ours).
-            pass
+            # Track for the per-project deferral so Claude Code knows the
+            # bundle install was incomplete (user has stale customizations
+            # that won't track future orchestrator improvements).
+            skipped_existing_paths.append(op.dest_rel)
 
         elif action == "noop":
             # File matches what we'd write. Manifest entry should reflect
@@ -2259,20 +2345,47 @@ def install_project_bundle(
                  data={"error": err})
             result["errors"].append({"path": str(_MANIFEST_REL), "error": err})
 
-    # User-modified deferral entry (update mode + non-empty preserve list).
-    if update_mode and not dry_run and user_modified_paths and not force:
-        try:
-            _emit_user_modified_deferral(
-                folder, user_modified_paths, orchestrator_root,
-            )
-        except Exception as e:
-            err = f"{type(e).__name__}: {e}"
-            _log("4.bundle.deferral", "error",
-                 f"user-modified deferral write failed: {err}",
-                 data={"error": err})
-            result["warnings"].append(
-                f"user-modified deferral write failed: {err}"
-            )
+    # Per-project deferral entries — single entry per case, listing all
+    # affected files. Two distinct cases are tracked:
+    #
+    # 1. update-mode `preserve`: files the user modified, diverging from
+    #    the prior-shipped manifest hash. Emitted unless --force was used.
+    # 2. first-install `skip-existing`: files that pre-existed AND differ
+    #    from what we would have shipped. Emitted regardless of mode (the
+    #    user has stale customizations that won't auto-update).
+    #
+    # Both deferrals share the same UPDATE_DEFERRED.md file via PR 6's
+    # `DeferralReport.add_entry` (last-write-wins per condition_id, so a
+    # subsequent install run that resolves the condition will overwrite
+    # the entry with the new state, or remove it when the list is empty).
+    if not dry_run:
+        if update_mode and user_modified_paths and not force:
+            try:
+                _emit_user_modified_deferral(
+                    folder, user_modified_paths, orchestrator_root,
+                )
+            except Exception as e:
+                err = f"{type(e).__name__}: {e}"
+                _log("4.bundle.deferral", "error",
+                     f"user-modified deferral write failed: {err}",
+                     data={"error": err})
+                result["warnings"].append(
+                    f"user-modified deferral write failed: {err}"
+                )
+
+        if skipped_existing_paths:
+            try:
+                _emit_skipped_existing_deferral(
+                    folder, skipped_existing_paths, orchestrator_root,
+                )
+            except Exception as e:
+                err = f"{type(e).__name__}: {e}"
+                _log("4.bundle.deferral", "error",
+                     f"skipped-existing deferral write failed: {err}",
+                     data={"error": err})
+                result["warnings"].append(
+                    f"skipped-existing deferral write failed: {err}"
+                )
 
     return result
 

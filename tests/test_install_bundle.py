@@ -272,6 +272,93 @@ class InstallBundleFreshTests(unittest.TestCase):
         # User content preserved.
         self.assertEqual(target.read_text(encoding="utf-8"), "USER CUSTOM\n")
 
+    def test_skip_existing_emits_deferral_entry(self):
+        """Per coordinator directive 2026-05-01: when first-install hits a
+        target that exists with different content, leave a single
+        per-project deferral entry (`bundle_skipped_existing_files`)
+        listing all such files so Claude Code on next session knows the
+        bundle install was incomplete.
+
+        Critical assertions:
+        - File untouched (user content preserved).
+        - UPDATE_DEFERRED.md exists.
+        - Deferral has condition_id `bundle_skipped_existing_files`.
+        - The skipped file's relative path appears in the entry body.
+        """
+        is_windows = platform.system() == "Windows"
+        ext = "ps1" if is_windows else "sh"
+        target = self.proj / ".claude" / "hooks" / f"foo.{ext}"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("USER CUSTOM\n", encoding="utf-8")
+
+        project_init.install_project_bundle(
+            self.proj,
+            orchestrator_root=self.orch,
+            update_mode=False,
+        )
+        # File untouched.
+        self.assertEqual(target.read_text(encoding="utf-8"), "USER CUSTOM\n")
+        # Deferral entry written to the project's UPDATE_DEFERRED.md.
+        deferred = self.proj / ".claude" / "context" / "UPDATE_DEFERRED.md"
+        self.assertTrue(deferred.exists(),
+                        "UPDATE_DEFERRED.md must exist after skip-existing")
+        report = DeferralReport.read(self.proj)
+        self.assertTrue(
+            report.has_condition("bundle_skipped_existing_files"),
+            "deferral with condition_id `bundle_skipped_existing_files` "
+            "must be present when first-install skipped pre-existing files",
+        )
+        # Body lists the skipped file's relative path.
+        body = deferred.read_text(encoding="utf-8")
+        rel = str(Path(".claude") / "hooks" / f"foo.{ext}")
+        self.assertIn(rel, body,
+                      f"deferral body must list the skipped file ({rel}):\n{body}")
+
+    def test_skip_existing_grouped_per_project_one_entry(self):
+        """Even when multiple files are skipped, only ONE deferral entry
+        is emitted (per coordinator: per-project grouping, not per-file).
+
+        We read the raw markdown to assert all files are listed — the
+        deferral_report parser captures only the first line of multi-line
+        fields like `Detected:` so reparsing the bullet-list back out is
+        not currently round-trip-able. The on-disk file IS the canonical
+        source for Claude Code on next session.
+        """
+        is_windows = platform.system() == "Windows"
+        ext = "ps1" if is_windows else "sh"
+        # Pre-create TWO files with custom content.
+        for name in (f"foo.{ext}", "kg-search"):
+            t = self.proj / ".claude" / ("hooks" if name.endswith(("." + ext)) else "scripts") / name
+            t.parent.mkdir(parents=True, exist_ok=True)
+            t.write_text(f"USER {name}\n", encoding="utf-8")
+
+        project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch, update_mode=False,
+        )
+        # Exactly one entry with the right condition_id.
+        report = DeferralReport.read(self.proj)
+        skip_entries = [e for e in report.entries
+                        if e.condition_id == "bundle_skipped_existing_files"]
+        self.assertEqual(len(skip_entries), 1,
+                         f"expected exactly 1 grouped entry, got {len(skip_entries)}")
+        # Both files listed in the markdown body.
+        body = (self.proj / ".claude" / "context" / "UPDATE_DEFERRED.md") \
+            .read_text(encoding="utf-8")
+        # Section header.
+        self.assertIn("## bundle_skipped_existing_files (info)", body)
+        # Both file paths in the bullet-list.
+        self.assertIn(f"foo.{ext}", body)
+        self.assertIn("kg-search", body)
+
+    def test_skip_existing_no_deferral_when_nothing_skipped(self):
+        """Clean first-install (empty folder) should NOT emit the
+        skipped-existing deferral entry."""
+        project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch, update_mode=False,
+        )
+        report = DeferralReport.read(self.proj)
+        self.assertFalse(report.has_condition("bundle_skipped_existing_files"))
+
     def test_dry_run_makes_no_mutations(self):
         result = project_init.install_project_bundle(
             self.proj,
@@ -369,7 +456,7 @@ class InstallBundleUpdateModeTests(unittest.TestCase):
 
         # Deferral entry emitted.
         report = DeferralReport.read(self.proj)
-        self.assertTrue(report.has_condition("user_modified_bundle_files"))
+        self.assertTrue(report.has_condition("bundle_user_modified_preserved"))
 
     def test_force_overwrites_user_modifications(self):
         self._foo_path().write_text("USER EDIT\n", encoding="utf-8")
@@ -388,7 +475,7 @@ class InstallBundleUpdateModeTests(unittest.TestCase):
         self.assertEqual(self._foo_path().read_text(encoding="utf-8"), "#!/bin/sh\necho v3\n")
         # No deferral emitted under --force.
         report = DeferralReport.read(self.proj)
-        self.assertFalse(report.has_condition("user_modified_bundle_files"))
+        self.assertFalse(report.has_condition("bundle_user_modified_preserved"))
 
     def test_lib_files_always_overwrite(self):
         # _lib files should be unconditionally overwritten on update.
@@ -425,6 +512,48 @@ class InstallBundleUpdateModeTests(unittest.TestCase):
         # The manifest entry should still be present (carrying the v1 hash —
         # NOT v2 — so the next update knows what we originally shipped).
         self.assertIn(rel, manifest["files"])
+
+    def test_user_modified_deferral_grouped_per_project(self):
+        """Per coordinator directive 2026-05-01: when multiple files are
+        preserved during update, only ONE deferral entry is emitted (per-
+        project grouping, not per-file).
+
+        Critical assertions:
+        - `bundle_user_modified_preserved` deferral exists.
+        - Exactly ONE entry with that condition_id.
+        - Markdown body lists ALL preserved file rel-paths.
+        """
+        is_windows = platform.system() == "Windows"
+        ext = "ps1" if is_windows else "sh"
+        # User edits TWO different files post-install.
+        foo = self.proj / ".claude" / "hooks" / f"foo.{ext}"
+        foo.write_text("USER FOO\n", encoding="utf-8")
+        kg = self.proj / ".claude" / "scripts" / "kg-search"
+        kg.write_text("USER KG\n", encoding="utf-8")
+        # Orchestrator bumped both.
+        self._bump_orchestrator_foo("v2 foo\n")
+        (self.orch / "templates" / "scripts" / "kg-search").write_text(
+            "v2 kg\n", encoding="utf-8",
+        )
+
+        project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch, update_mode=True,
+        )
+        # Files untouched.
+        self.assertEqual(foo.read_text(encoding="utf-8"), "USER FOO\n")
+        self.assertEqual(kg.read_text(encoding="utf-8"), "USER KG\n")
+        # Deferral has exactly ONE entry with the right condition_id.
+        report = DeferralReport.read(self.proj)
+        preserve_entries = [e for e in report.entries
+                            if e.condition_id == "bundle_user_modified_preserved"]
+        self.assertEqual(len(preserve_entries), 1,
+                         f"expected exactly 1 grouped entry, got {len(preserve_entries)}")
+        # Both files listed in the on-disk markdown body.
+        body = (self.proj / ".claude" / "context" / "UPDATE_DEFERRED.md") \
+            .read_text(encoding="utf-8")
+        self.assertIn("## bundle_user_modified_preserved (info)", body)
+        self.assertIn(f"foo.{ext}", body)
+        self.assertIn("kg-search", body)
 
 
 class SmartMergeSettingsTests(unittest.TestCase):
