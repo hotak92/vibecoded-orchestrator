@@ -2286,13 +2286,12 @@ def install_project_bundle(
                     if op.dest_rel.endswith((".sh",)) or "/scripts/" in op.dest_rel.replace("\\", "/"):
                         # Many launcher scripts have no extension (kg-search,
                         # code-graph-query, cost-summary). Mark all of
-                        # .claude/scripts/ + *.sh as executable. 0o750
-                        # (owner rwx, group rx, NO world access) — CodeQL
-                        # flagged 0o755 as overly permissive (py/overly-
-                        # permissive-file). The user owns the project
-                        # folder; world access is unnecessary for hooks
-                        # to run from a Claude Code session.
-                        mode = 0o750
+                        # .claude/scripts/ + *.sh as executable. 0o700
+                        # (owner-only rwx) — CodeQL py/overly-permissive-file
+                        # flagged both 0o755 (world) and 0o750 (group) as
+                        # overly permissive. The project folder belongs to
+                        # the user; group/world access is unnecessary.
+                        mode = 0o700
                     _write_file_atomic(target_path, source_bytes, mode=mode)
                 except Exception as e:
                     err = f"{type(e).__name__}: {e}"
