@@ -520,7 +520,7 @@ Output: Where to save
 - `tools` / `disallowedTools` — allow/deny tool lists.
 - `permissionMode` — `default` | `acceptEdits` | `dontAsk` | `bypassPermissions` | `plan`.
 - `maxTurns` — max agentic turns before stopping.
-- `effort` — `low` | `medium` | `high` | `max` — caps per-agent reasoning cost.
+- `effort` — `low` | `medium` | `high` | `xhigh` | `max` — caps per-agent reasoning cost. Frontmatter wins over session level. Cannot be set as Agent-tool parameter — must be in `.md` frontmatter. The env var `CLAUDE_CODE_EFFORT_LEVEL` overrides frontmatter globally; don't set for per-agent control. **When you spawn ad-hoc agents not in our shipped list** (Agent tool with a description but no pre-existing definition file), tell them in the prompt to operate at `xhigh` (Opus 4.7) or `max` (Opus 4.6) for deep-reasoning work — architecture spec, deep code review, security analysis, gnarly multi-system debugging. Trivial sweeps can stay at default. Thinking toggle: on 4.6 / Sonnet 4.6 and earlier the IDE Thinking toggle and `CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1` control fixed-budget thinking; on Opus 4.7 both are no-ops (4.7 uses adaptive thinking governed by effort).
 - `isolation: worktree` — runs in a temporary git worktree (auto-cleaned if no changes).
 - `background: true` — always run as background task.
 - `memory` — `user` | `project` | `local` — enables persistent agent memory directory.
