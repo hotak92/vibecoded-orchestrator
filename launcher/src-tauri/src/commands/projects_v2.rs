@@ -2395,15 +2395,35 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
+    /// Grab a free localhost port and immediately drop the listener so the
+    /// port is unbound when the caller subprocess tries to connect. The
+    /// kernel won't reuse the port for another process within the test
+    /// duration (TIME_WAIT semantics + parallel tests get distinct ports
+    /// each), so each test instance gets its own guaranteed-refused port.
+    ///
+    /// Why this matters (flake hunt 2026-05-01): hard-coding a port like
+    /// `:1` or `:8081` collides under default `cargo test --lib`
+    /// parallelism — two parallel subprocess invocations probing the same
+    /// port can race on `_attempt_container_restart`'s
+    /// `podman start weaviate_claude` side-effect, causing one of them to
+    /// see the real Weaviate come up between probes.
+    fn unused_local_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind 127.0.0.1:0 for port reservation");
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        port
+    }
+
     /// PR 4: bootstrap-collections soft-fails to a deferral when Weaviate
-    /// is unreachable. Drives `--weaviate-url http://127.0.0.1:1` (always
-    /// dead) and asserts the deferral .md lands at
-    /// `<folder>/.claude/context/UPDATE_DEFERRED.md`.
+    /// is unreachable. Drives `--weaviate-url http://127.0.0.1:<free-port>`
+    /// (a port we just released so it's guaranteed-refused) and asserts the
+    /// deferral .md lands at `<folder>/.claude/context/UPDATE_DEFERRED.md`.
     ///
     /// Note: this test exercises Python end-to-end including the podman
-    /// restart attempt (which fails — there's no `weaviate_claude` running
-    /// at port 1). The test passes regardless of whether the host has
-    /// podman installed (start fails either way).
+    /// restart attempt (which fails because the URL points at a port no
+    /// container is bound to). The test passes regardless of whether the
+    /// host has podman installed.
     #[test]
     fn bootstrap_collections_soft_fails_to_deferral() {
         let py = if std::process::Command::new("python3").arg("--version")
@@ -2424,12 +2444,15 @@ mod tests {
         ));
         std::fs::create_dir_all(&tmp).unwrap();
 
+        // Per-test free port → no collision with parallel tests probing
+        // the same Weaviate URL.
+        let dead_url = format!("http://127.0.0.1:{}", unused_local_port());
         let out = std::process::Command::new(&py)
             .args([
                 "-m", "vco_lib.project_init",
                 "bootstrap-collections",
                 "--name", "VideoFrames",
-                "--weaviate-url", "http://127.0.0.1:1", // unreachable
+                "--weaviate-url", &dead_url,
                 "--project-folder", &tmp.to_string_lossy(),
                 "--json",
             ])
