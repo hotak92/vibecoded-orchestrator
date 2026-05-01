@@ -90,7 +90,9 @@ def telemetry_enabled(category: Optional[str] = None) -> bool:
     No; the .env file is written with VIBECODED_TELEMETRY=false unless the
     user explicitly opts in.
     """
-    env = os.environ.get("VIBECODED_TELEMETRY", "").strip().lower()
+    # B7 (2026-05-01): VCT_TELEMETRY is canonical; VIBECODED_TELEMETRY is a
+    # read-time alias kept for ~3 releases of back-compat. Prefer canonical.
+    env = (os.environ.get("VCT_TELEMETRY") or os.environ.get("VIBECODED_TELEMETRY", "")).strip().lower()
     if env in ("false", "0", "no", "off", ""):
         return False
     # env in {"true", "1", "yes", "on"} or any other truthy → opt-in active.
