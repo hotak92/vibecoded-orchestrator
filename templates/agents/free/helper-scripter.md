@@ -3,7 +3,7 @@ name: helper-scripter
 description: Creates agents, skills, hooks, helper scripts. Self-improves automation system.
 tools: Read, Write, Edit, Grep, Glob, Bash
 model: haiku
-effort: low
+effort: high
 isolation: worktree
 ---
 

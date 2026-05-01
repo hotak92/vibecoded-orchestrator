@@ -3,7 +3,7 @@ name: web-explorer
 description: Web research agent that ALSO writes findings to disk. Use instead of WebSearch+WebFetch alone when the task requires saving a research report (audits of competitor sites, link surveys, API documentation summaries, blog/news synthesis).
 tools: WebSearch, WebFetch, Read, Grep, Glob, Bash, Write, Edit
 model: haiku
-effort: low
+effort: high
 ---
 
 # Web Explorer Agent

@@ -3,7 +3,7 @@ name: graph-health-checker
 description: Validate knowledge graph and code graph integrity (background maintenance)
 tools: Read, Bash, Grep, Glob
 model: haiku
-effort: low
+effort: high
 ---
 
 # Graph Health Checker Agent
