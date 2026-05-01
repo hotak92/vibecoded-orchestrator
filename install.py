@@ -5349,13 +5349,22 @@ def _install_hooks_and_settings(args: argparse.Namespace) -> str:
     if scripts_src.exists():
         scripts_dst = claude_dir / "scripts"
         scripts_dst.mkdir(parents=True, exist_ok=True)
-        for script_file in sorted(scripts_src.glob("*.py")):
-            target = scripts_dst / script_file.name
-            if target.exists():
-                skipped_scripts += 1
-                continue
-            shutil.copy2(script_file, target)
-            installed_scripts += 1
+        # Glob all script types: Python modules, shell wrappers (no ext or .sh),
+        # and PowerShell wrappers (.ps1). Previously only *.py was copied which
+        # left kg-search, kg-sync, code-graph-* etc. missing from user projects.
+        script_patterns = ["*.py", "*.sh", "*.ps1", "kg-*", "code-graph-*", "cost-summary"]
+        seen: set[str] = set()
+        for pattern in script_patterns:
+            for script_file in sorted(scripts_src.glob(pattern)):
+                if script_file.name in seen or script_file.is_dir():
+                    continue
+                seen.add(script_file.name)
+                target = scripts_dst / script_file.name
+                if target.exists():
+                    skipped_scripts += 1
+                    continue
+                shutil.copy2(script_file, target)
+                installed_scripts += 1
 
     settings_action = _merge_settings_template(
         settings_template, claude_dir / "settings.json"
