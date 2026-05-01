@@ -589,15 +589,185 @@ def _delete_class(name: str, weaviate_url: Optional[str] = None) -> None:
         raise RuntimeError(f"DELETE /v1/schema/{name} → HTTP {status}: {body[:300]!r}")
 
 
-def _drop_orphan_staging(name: str, weaviate_url: Optional[str] = None) -> bool:
-    """Crash-recovery: if a previous migrate left `<name>__staging`,
-    drop it. Returns True iff we actually dropped one.
+def _count_objects(name: str, weaviate_url: Optional[str] = None) -> int:
+    """Count objects in a collection via v4 iterator. Lightweight: yields
+    object metadata only (no vectors) so it scales for the recovery
+    classification check. Returns 0 if collection missing or empty.
     """
+    try:
+        client = _connect_v4_client(weaviate_url=weaviate_url)
+    except Exception:
+        # Connection failure → can't classify; treat as 0 (caller will
+        # log + bail rather than risk a destructive decision).
+        return 0
+    try:
+        col = client.collections.get(name)
+        n = 0
+        # include_vector=False keeps payloads small.
+        for _ in col.iterator(include_vector=False):
+            n += 1
+        return n
+    except Exception:
+        # Collection might not exist yet, or v4 client raises on missing
+        # class. Let _fetch_schema be the existence oracle elsewhere;
+        # here, missing → 0.
+        return 0
+    finally:
+        client.close()
+
+
+def _recover_or_drop_orphan_staging(
+    name: str,
+    target_def: Optional[dict] = None,
+    *,
+    weaviate_url: Optional[str] = None,
+    log_event: Optional[Callable[..., None]] = None,
+) -> str:
+    """Crash-recovery for `<name>__staging` left by a prior failed migrate.
+
+    Three branches based on the relative state of `<name>` vs
+    `<name>__staging`:
+
+    * RECOVER — `<name>` is missing or empty AND staging is populated.
+      The staging holds the only surviving copy of user data (prior run
+      died between `_delete_class(name)` at step 3 and the staging→new
+      copy at step 5). We re-create `<name>` with `target_def` (target
+      schema), copy staging→new, then drop staging. Returns "recovered".
+      See `test_crash_recovery_recovers_data_when_name_deleted_mid_copy`.
+
+    * SAFE-DROP — `<name>` exists with object count >= staging's count.
+      Staging is genuinely orphaned (mid-step-2 crash where the source
+      still held the canonical data). Safe to drop staging. Returns
+      "dropped". See `test_crash_recovery_drops_orphan_when_name_already_intact`.
+
+    * AMBIGUOUS — `<name>` exists with FEWER objects than staging. We
+      cannot tell whether the staging is a partial copy mid-flight or
+      contains data that `<name>` lost. Do NOT drop staging. Emit a loud
+      forensic log and return "ambiguous"; the caller surfaces this as
+      a deferral entry per HIGH-1 (see deferral integration sibling fix).
+
+    Returns one of {"none", "recovered", "dropped", "ambiguous"}.
+
+    DATA-LOSS WARNING (history): the prior `_drop_orphan_staging`
+    unconditionally deleted `<name>__staging`, which destroyed the only
+    surviving copy when a prior run died mid-step-5. Never re-introduce
+    the unconditional path — see BLOCKER-1 in
+    `.claude/context/pr3-6-7-integration-review-2026-05-01.md`.
+    """
+    def _log(step: str, phase: str, detail: str = "", *, data=None) -> None:
+        if log_event is None:
+            return
+        try:
+            log_event(step, phase, detail, data=data)
+        except TypeError:
+            log_event(step, phase, detail)
+
     staging = f"{name}{_STAGING_SUFFIX}"
     if _fetch_schema(staging, weaviate_url=weaviate_url) is None:
-        return False
-    _delete_class(staging, weaviate_url=weaviate_url)
-    return True
+        return "none"
+
+    name_present = _fetch_schema(name, weaviate_url=weaviate_url) is not None
+    name_count = _count_objects(name, weaviate_url=weaviate_url) if name_present else 0
+    staging_count = _count_objects(staging, weaviate_url=weaviate_url)
+
+    # RECOVER — staging is the only surviving copy.
+    if (not name_present) or name_count == 0:
+        if staging_count == 0:
+            # Both empty — nothing to recover, just drop the orphan.
+            _delete_class(staging, weaviate_url=weaviate_url)
+            return "dropped"
+        if target_def is None:
+            # Caller didn't give us a target schema; we can't safely
+            # recreate `<name>`. Loudly leave staging alone.
+            _log(
+                "7b.recover",
+                "error",
+                f"RECOVER NEEDED but no target schema supplied for {name}; "
+                f"staging {staging} retains {staging_count} objects — "
+                f"manual recovery: copy_collection_with_vectors("
+                f"{staging!r}, {name!r}); delete_class({staging!r})",
+                data={"collection": name, "staging": staging,
+                      "staging_count": staging_count,
+                      "branch": "ambiguous_no_target"},
+            )
+            return "ambiguous"
+        # Build a copy of target_def with the canonical name in case the
+        # caller passed a staging-flavoured definition.
+        recover_def = dict(target_def)
+        recover_def["class"] = name
+        if name_present:
+            # `<name>` exists but is empty — drop it so _create_class
+            # (idempotent on existing) actually applies the target
+            # schema fresh.
+            _delete_class(name, weaviate_url=weaviate_url)
+        _create_class(recover_def, weaviate_url=weaviate_url)
+        copied = _copy_collection_with_vectors(
+            staging, name, weaviate_url=weaviate_url,
+        )
+        if copied != staging_count:
+            # Round-trip mismatch — keep staging in place for forensics.
+            _log(
+                "7b.recover",
+                "error",
+                f"recovery copy {staging}→{name} mismatch: "
+                f"staging had {staging_count}, copied {copied}; "
+                f"staging RETAINED for manual review",
+                data={"collection": name, "staging": staging,
+                      "staging_count": staging_count, "copied": copied,
+                      "branch": "recover_mismatch"},
+            )
+            return "ambiguous"
+        _delete_class(staging, weaviate_url=weaviate_url)
+        _log(
+            "7b.recover",
+            "ok",
+            f"recovered {copied} objects from {staging} → {name}",
+            data={"collection": name, "staging": staging,
+                  "objects_copied": copied, "branch": "recover"},
+        )
+        return "recovered"
+
+    # SAFE-DROP — `<name>` has at least as many objects as staging.
+    if name_count >= staging_count:
+        _delete_class(staging, weaviate_url=weaviate_url)
+        _log(
+            "7b.recover",
+            "ok",
+            f"safe-drop orphan {staging} (name={name_count} >= staging={staging_count})",
+            data={"collection": name, "staging": staging,
+                  "name_count": name_count, "staging_count": staging_count,
+                  "branch": "safe_drop"},
+        )
+        return "dropped"
+
+    # AMBIGUOUS — `<name>` has fewer objects than staging.
+    _log(
+        "7b.recover",
+        "error",
+        f"AMBIGUOUS: {name} has {name_count} objects but staging "
+        f"{staging} has {staging_count}; staging RETAINED — manual "
+        f"recovery may be needed: inspect both, then "
+        f"copy_collection_with_vectors({staging!r}, {name!r}) if staging "
+        f"is canonical, else delete_class({staging!r})",
+        data={"collection": name, "staging": staging,
+              "name_count": name_count, "staging_count": staging_count,
+              "branch": "ambiguous"},
+    )
+    return "ambiguous"
+
+
+def _drop_orphan_staging(name: str, weaviate_url: Optional[str] = None) -> bool:
+    """Backward-compat shim for the pre-BLOCKER-1 API. Calls
+    `_recover_or_drop_orphan_staging` without a target schema, so it
+    cannot recover — only the SAFE-DROP / no-staging branches are
+    reachable. New code should call the recover-aware function with the
+    target schema. Returns True iff staging was actually dropped (or
+    recovered+dropped).
+    """
+    outcome = _recover_or_drop_orphan_staging(
+        name, target_def=None, weaviate_url=weaviate_url,
+    )
+    return outcome in ("dropped", "recovered")
 
 
 def _connect_v4_client(weaviate_url: Optional[str] = None):
@@ -782,23 +952,57 @@ def migrate_collections(
     weaviate_url = weaviate_url or _weaviate_url_default()
     result: dict = {"plan": [], "dry_run": dry_run, "errors": []}
 
-    # Crash-recovery: drop orphan staging classes from prior failed runs.
-    # We inspect the env-configured collections only; that's enough for
-    # the common case (KG + Dev). A foreign orphan (different project)
-    # is left alone — nothing to do with us.
-    for env_key in ("KG_COLLECTION", "DEVELOPMENT_COLLECTION"):
+    # Crash-recovery: classify and recover/drop orphan staging classes from
+    # prior failed runs. We inspect the env-configured collections only;
+    # that's enough for the common case (KG + Dev). A foreign orphan
+    # (different project) is left alone — nothing to do with us.
+    #
+    # Pass the target schema so that if `<name>` is gone but staging holds
+    # the only surviving copy, we can recover it (BLOCKER-1 fix).
+    _recover_targets = {
+        "KG_COLLECTION": kg_class_definition,
+        "DEVELOPMENT_COLLECTION": development_class_definition,
+    }
+    for env_key, target_fn in _recover_targets.items():
         name = os.environ.get(env_key, "")
         if not name:
             continue
         try:
-            if _drop_orphan_staging(name, weaviate_url=weaviate_url):
-                _log("7b.0", "ok",
+            target_def = target_fn(name)
+            outcome = _recover_or_drop_orphan_staging(
+                name, target_def=target_def,
+                weaviate_url=weaviate_url, log_event=log_event,
+            )
+            if outcome == "recovered":
+                _log("7b.recover", "ok",
+                     f"recovered data from orphan staging: {name}{_STAGING_SUFFIX} → {name}",
+                     data={"collection": name, "staging": name + _STAGING_SUFFIX,
+                           "branch": "recover"})
+            elif outcome == "dropped":
+                _log("7b.recover", "ok",
                      f"dropped orphan staging: {name}{_STAGING_SUFFIX}",
-                     data={"collection": name + _STAGING_SUFFIX})
+                     data={"collection": name + _STAGING_SUFFIX, "branch": "safe_drop"})
+            elif outcome == "ambiguous":
+                # AMBIGUOUS staging — surface as an error so the caller's
+                # deferral integration (HIGH-1 sibling fix) treats it as a
+                # blocker requiring human review. Don't fail the whole
+                # migrate; the orphan is retained for inspection.
+                result["errors"].append({
+                    "collection": name,
+                    "action": "recover",
+                    "error": (f"ambiguous orphan staging {name}{_STAGING_SUFFIX} — "
+                              "manual recovery required; staging RETAINED"),
+                })
+            # outcome == "none" → no staging present, nothing to log.
         except Exception as e:
-            _log("7b.0", "error",
-                 f"orphan-staging drop failed for {name}: {e}",
+            _log("7b.recover", "error",
+                 f"orphan-staging recovery failed for {name}: {e}",
                  data={"collection": name + _STAGING_SUFFIX, "error": str(e)})
+            result["errors"].append({
+                "collection": name,
+                "action": "recover",
+                "error": str(e),
+            })
 
     # Build the plan.
     try:
@@ -842,7 +1046,7 @@ def migrate_collections(
         objects_copied = 0
 
         try:
-            _log("7b.x", "start", f"{name}: {action}",
+            _log(f"7b.{action}", "start", f"{name}: {action}",
                  data={"collection": name, "action": action})
             print(f"  {action:13s} {name}", file=sys.stderr)
 
@@ -893,7 +1097,7 @@ def migrate_collections(
                 raise RuntimeError(f"unknown action: {action}")
 
             elapsed_ms = int((time.monotonic() - t_start) * 1000)
-            _log("7b.x", "ok", f"{name}: {action}",
+            _log(f"7b.{action}", "ok", f"{name}: {action}",
                  data={"collection": name, "action": action,
                        "objects_copied": objects_copied,
                        "elapsed_ms": elapsed_ms})
@@ -907,10 +1111,81 @@ def migrate_collections(
         except Exception as e:
             elapsed_ms = int((time.monotonic() - t_start) * 1000)
             err_msg = f"{type(e).__name__}: {e}"
-            _log("7b.x", "error", f"{name}: {action}: {err_msg}",
+            _log(f"7b.{action}", "error", f"{name}: {action}: {err_msg}",
                  data={"collection": name, "action": action,
                        "error": err_msg, "elapsed_ms": elapsed_ms})
             print(f"    ! migrate failed: {err_msg}", file=sys.stderr)
+
+            # HIGH-5: best-effort rollback for the copy action. If the
+            # failure occurred between step 3 (delete `<name>`) and step 5
+            # (staging→new copy completes), `<name>` is gone but staging
+            # holds the data. Try to recover; if recovery fails, leave
+            # staging in place + log explicit manual recovery instructions.
+            if action == "copy":
+                staging = f"{name}{_STAGING_SUFFIX}"
+                staging_present = False
+                name_present = True
+                try:
+                    staging_present = _fetch_schema(
+                        staging, weaviate_url=weaviate_url,
+                    ) is not None
+                    name_present = _fetch_schema(
+                        name, weaviate_url=weaviate_url,
+                    ) is not None
+                except Exception:
+                    # Existence probe failed — fall through to log only.
+                    pass
+
+                if staging_present and not name_present:
+                    # Try inline recovery using the same target schema.
+                    try:
+                        recovery_def = dict(target)
+                        recovery_def["class"] = name
+                        _create_class(
+                            recovery_def, weaviate_url=weaviate_url,
+                        )
+                        recovered = _copy_collection_with_vectors(
+                            staging, name, weaviate_url=weaviate_url,
+                        )
+                        _delete_class(staging, weaviate_url=weaviate_url)
+                        _log(
+                            "7b.copy.rollback",
+                            "ok",
+                            f"recovered {recovered} objects from {staging} → {name} after copy failure",
+                            data={"collection": name, "staging": staging,
+                                  "objects_copied": recovered,
+                                  "branch": "rollback_recovered"},
+                        )
+                        objects_copied = recovered
+                    except Exception as e2:
+                        # Recovery itself failed — leave staging in place.
+                        _log(
+                            "7b.copy.rollback",
+                            "error",
+                            (f"DATA IN STAGING; original error: {err_msg}; "
+                             f"recovery error: {type(e2).__name__}: {e2}; "
+                             f"manual recovery: copy_collection_with_vectors("
+                             f"{staging!r}, {name!r}); delete_class({staging!r})"),
+                            data={"collection": name, "staging": staging,
+                                  "original_error": err_msg,
+                                  "recovery_error": f"{type(e2).__name__}: {e2}",
+                                  "branch": "rollback_failed"},
+                        )
+                elif staging_present and name_present:
+                    # Both alive — staging may hold a partial or full copy.
+                    # Don't auto-drop; surface manual instructions.
+                    _log(
+                        "7b.copy.rollback",
+                        "error",
+                        (f"DATA IN STAGING (both {name} and {staging} present); "
+                         f"manual recovery: inspect both, then if staging is "
+                         f"canonical run copy_collection_with_vectors("
+                         f"{staging!r}, {name!r}) and delete_class({staging!r})"),
+                        data={"collection": name, "staging": staging,
+                              "original_error": err_msg,
+                              "branch": "rollback_both_present"},
+                    )
+
             result["errors"].append({
                 "collection": name,
                 "action": action,

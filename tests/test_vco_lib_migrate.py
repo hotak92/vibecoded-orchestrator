@@ -181,13 +181,18 @@ class DropOrphanStagingTests(unittest.TestCase):
             dmock.assert_not_called()
 
     def test_orphan_present_drops_and_returns_true(self):
+        # Post-BLOCKER-1: the back-compat shim now classifies before
+        # dropping. With no target schema supplied and `<name>` reported
+        # present (the mock returns the same dict for any name) but
+        # `_count_objects` returning 0 (mocked URL → connection fails),
+        # we hit the "both empty → safe drop" path inside the recover
+        # branch. Result: shim returns True, _delete_class called.
         with mock.patch.object(project_init, "_fetch_schema",
-                               return_value={"class": "Foo_KnowledgeGraph__staging"}) as fmock, \
+                               return_value={"class": "Foo_KnowledgeGraph__staging"}), \
+             mock.patch.object(project_init, "_count_objects", return_value=0), \
              mock.patch.object(project_init, "_delete_class") as dmock:
             self.assertTrue(project_init._drop_orphan_staging(
                 "Foo_KnowledgeGraph", weaviate_url="http://x:1"))
-            fmock.assert_called_once_with(
-                "Foo_KnowledgeGraph__staging", weaviate_url="http://x:1")
             dmock.assert_called_once_with(
                 "Foo_KnowledgeGraph__staging", weaviate_url="http://x:1")
 
@@ -225,7 +230,7 @@ class MigrateDispatchUnitTests(unittest.TestCase):
             "Foo_KnowledgeGraph":  _missing_index_null_state_only(),
             "Foo_Development":     _at_target(),
         })
-        with mock.patch.object(project_init, "_drop_orphan_staging", return_value=False), \
+        with mock.patch.object(project_init, "_recover_or_drop_orphan_staging", return_value="none"), \
              mock.patch.object(project_init, "_create_class") as cmock, \
              mock.patch.object(project_init, "_post_property") as pmock, \
              mock.patch.object(project_init, "_copy_collection_with_vectors") as copmock, \
@@ -251,7 +256,7 @@ class MigrateDispatchUnitTests(unittest.TestCase):
             "Foo_KnowledgeGraph":  _missing_index_null_state_only(),
             "Foo_Development":     _at_target(),
         })
-        with mock.patch.object(project_init, "_drop_orphan_staging", return_value=False), \
+        with mock.patch.object(project_init, "_recover_or_drop_orphan_staging", return_value="none"), \
              mock.patch.object(project_init, "_create_class") as cmock, \
              mock.patch.object(project_init, "_copy_collection_with_vectors", return_value=42) as copmock, \
              mock.patch.object(project_init, "_delete_class") as dmock:
@@ -276,7 +281,7 @@ class MigrateDispatchUnitTests(unittest.TestCase):
             "Foo_KnowledgeGraph":  _missing_props_only(),
             "Foo_Development":     _at_target(),
         })
-        with mock.patch.object(project_init, "_drop_orphan_staging", return_value=False), \
+        with mock.patch.object(project_init, "_recover_or_drop_orphan_staging", return_value="none"), \
              mock.patch.object(project_init, "_post_property") as pmock, \
              mock.patch.object(project_init, "_copy_collection_with_vectors") as copmock:
             result = project_init.migrate_collections(
@@ -296,7 +301,7 @@ class MigrateDispatchUnitTests(unittest.TestCase):
             # KG missing entirely; Dev present at target.
             "Foo_Development":     _at_target(),
         })
-        with mock.patch.object(project_init, "_drop_orphan_staging", return_value=False), \
+        with mock.patch.object(project_init, "_recover_or_drop_orphan_staging", return_value="none"), \
              mock.patch.object(project_init, "_create_class") as cmock:
             result = project_init.migrate_collections(
                 self.args, dry_run=False, schema_fetcher=fetcher,
@@ -315,7 +320,7 @@ class MigrateDispatchUnitTests(unittest.TestCase):
             "Foo_Development":    _at_target(),
         })
         args = argparse.Namespace(force_rebuild=True)
-        with mock.patch.object(project_init, "_drop_orphan_staging", return_value=False), \
+        with mock.patch.object(project_init, "_recover_or_drop_orphan_staging", return_value="none"), \
              mock.patch.object(project_init, "_fetch_schema",
                                side_effect=lambda n, weaviate_url=None: fetcher(n)), \
              mock.patch.object(project_init, "_delete_class") as dmock:
@@ -333,7 +338,7 @@ class MigrateDispatchUnitTests(unittest.TestCase):
             "Foo_KnowledgeGraph": _legacy_single_vector(),
             "Foo_Development":    _at_target(),
         })
-        with mock.patch.object(project_init, "_drop_orphan_staging", return_value=False), \
+        with mock.patch.object(project_init, "_recover_or_drop_orphan_staging", return_value="none"), \
              mock.patch.object(project_init, "_fetch_schema",
                                side_effect=lambda n, weaviate_url=None: fetcher(n)), \
              mock.patch.object(project_init, "_delete_class") as dmock, \
@@ -350,18 +355,22 @@ class MigrateDispatchUnitTests(unittest.TestCase):
 
     def test_orphan_staging_dropped_before_planning(self):
         """Pre-existing <name>__staging from prior failed run gets dropped
-        before plan execution."""
+        (or recovered) before plan execution."""
         fetcher = self._fetcher_returning({
             "Foo_KnowledgeGraph": _at_target(),
             "Foo_Development":    _at_target(),
         })
-        with mock.patch.object(project_init, "_drop_orphan_staging",
-                               return_value=True) as drop_mock:
+        with mock.patch.object(project_init, "_recover_or_drop_orphan_staging",
+                               return_value="dropped") as drop_mock:
             project_init.migrate_collections(
                 self.args, dry_run=True, schema_fetcher=fetcher,
             )
         # Called once per env-configured collection (2: KG + Dev).
         self.assertEqual(drop_mock.call_count, 2)
+        # Each call passes the target schema definition for recovery use.
+        for call in drop_mock.call_args_list:
+            self.assertIn("target_def", call.kwargs)
+            self.assertIsInstance(call.kwargs["target_def"], dict)
 
 
 # ---------------------------------------------------------------------------
@@ -625,6 +634,213 @@ class LiveMigrateIntegrationTest(unittest.TestCase):
             project_init._fetch_schema(orphan_name, weaviate_url=self.url),
         )
         self.assertEqual(result["errors"], [])
+
+    def test_crash_recovery_recovers_data_when_name_deleted_mid_copy(self):
+        """BLOCKER-1 repro: prior run died between step 3 (`_delete_class(name)`)
+        and step 5 (staging→new copy). Staging holds the only surviving
+        copy — migrate must RECOVER, not destroy it.
+
+        Pre-condition setup:
+          - `<name>` does NOT exist (simulating mid-copy crash after
+            step 3 deleted it).
+          - `<name>__staging` exists with 5 dummy objects + named vectors.
+
+        Post-condition assertions:
+          - `<name>` exists with target schema (3 named-vector slots +
+            indexNullState).
+          - All 5 original UUIDs are in `<name>` (data preserved).
+          - `<name>__staging` is gone (cleaned up post-recovery).
+        """
+        # 1. DO NOT pre-create `<name>` — simulates mid-copy crash.
+        # 2. Pre-create staging using a "staging-flavoured" KG schema
+        #    (target schema would also be fine; we use a 2-slot schema
+        #    here to verify the recovery path applies the FULL target
+        #    schema afterward, not the staging's old shape).
+        staging_name = f"{self.KG_NAME}__staging"
+        old_staging_def = {
+            "class": staging_name,
+            "description": "test staging from prior crashed run",
+            "vectorConfig": {
+                "qwen3_embed":  {"vectorizer": {"none": {}}, "vectorIndexType": "hnsw"},
+                "ollama_embed": {"vectorizer": {"none": {}}, "vectorIndexType": "hnsw"},
+            },
+            "invertedIndexConfig": {"indexNullState": False},
+            "properties": [
+                {"name": "title",   "dataType": ["text"]},
+                {"name": "content", "dataType": ["text"]},
+            ],
+        }
+        project_init._create_class(old_staging_def, weaviate_url=self.url)
+
+        # Populate staging with 5 dummy objects + named vectors.
+        import uuid
+        import weaviate
+        host = self.url.replace("http://", "").replace("https://", "").split(":")[0]
+        port = int(self.url.rsplit(":", 1)[-1].split("/")[0])
+        client = weaviate.connect_to_custom(
+            http_host=host, http_port=port, http_secure=False,
+            grpc_host=host,
+            grpc_port=int(os.environ.get("GRPC_PORT", "50052")),
+            grpc_secure=False, skip_init_checks=True,
+        )
+        original_uuids: set[str] = set()
+        try:
+            col = client.collections.get(staging_name)
+            with col.batch.dynamic() as bw:
+                for i in range(5):
+                    uid = str(uuid.uuid4())
+                    original_uuids.add(uid)
+                    bw.add_object(
+                        properties={"title": f"recover-{i}",
+                                    "content": f"orig-body-{i}"},
+                        uuid=uid,
+                        vector={
+                            "qwen3_embed":  [float(i)] * 1024,
+                            "ollama_embed": [float(i + 100)] * 1024,
+                        },
+                    )
+        finally:
+            client.close()
+        self.assertEqual(len(original_uuids), 5)
+
+        # Sanity: `<name>` doesn't exist; staging exists with 5 objects.
+        self.assertIsNone(
+            project_init._fetch_schema(self.KG_NAME, weaviate_url=self.url),
+        )
+        self.assertIsNotNone(
+            project_init._fetch_schema(staging_name, weaviate_url=self.url),
+        )
+
+        # Dev: leave at target so migrate runs cleanly on it too.
+        project_init._create_class(
+            project_init.development_class_definition(self.DEV_NAME),
+            weaviate_url=self.url,
+        )
+
+        # 3. Run migrate.
+        args = argparse.Namespace(force_rebuild=False)
+        result = project_init.migrate_collections(
+            args, dry_run=False, weaviate_url=self.url,
+        )
+
+        # 4. Assertions.
+        # (a) no errors — recovery succeeded.
+        self.assertEqual(result["errors"], [], msg=f"plan: {result}")
+        # (b) `<name>` now exists with the target schema (3 named-vector
+        #     slots + indexNullState=true).
+        new_schema = project_init._fetch_schema(self.KG_NAME, weaviate_url=self.url)
+        self.assertIsNotNone(new_schema, msg="recovery did not create <name>")
+        self.assertEqual(
+            set(new_schema["vectorConfig"].keys()),
+            {"qwen3_embed", "ollama_embed", "openai_embed"},
+        )
+        self.assertTrue(new_schema["invertedIndexConfig"]["indexNullState"])
+        # (c) all 5 original UUIDs are in `<name>` post-recovery.
+        count, uuids_after = self._count_objects(self.KG_NAME)
+        self.assertEqual(count, 5,
+                         msg=f"expected 5 recovered objects, got {count}")
+        self.assertEqual(uuids_after, original_uuids,
+                         msg="UUIDs not preserved through recovery copy")
+        # (d) staging cleaned up post-recovery.
+        self.assertIsNone(
+            project_init._fetch_schema(staging_name, weaviate_url=self.url),
+        )
+
+    def test_crash_recovery_drops_orphan_when_name_already_intact(self):
+        """SAFE-DROP branch: `<name>` is fine, staging is a leftover from
+        an earlier crash with fewer (or equal) objects. Drop staging,
+        leave `<name>` untouched, no data loss.
+        """
+        # 1. Pre-create `<name>` with 5 objects (canonical).
+        project_init._create_class(
+            project_init.kg_class_definition(self.KG_NAME),
+            weaviate_url=self.url,
+        )
+        project_init._create_class(
+            project_init.development_class_definition(self.DEV_NAME),
+            weaviate_url=self.url,
+        )
+        # Populate KG with 5 objects.
+        import uuid
+        import weaviate
+        host = self.url.replace("http://", "").replace("https://", "").split(":")[0]
+        port = int(self.url.rsplit(":", 1)[-1].split("/")[0])
+        client = weaviate.connect_to_custom(
+            http_host=host, http_port=port, http_secure=False,
+            grpc_host=host,
+            grpc_port=int(os.environ.get("GRPC_PORT", "50052")),
+            grpc_secure=False, skip_init_checks=True,
+        )
+        kg_uuids: set[str] = set()
+        try:
+            col = client.collections.get(self.KG_NAME)
+            with col.batch.dynamic() as bw:
+                for i in range(5):
+                    uid = str(uuid.uuid4())
+                    kg_uuids.add(uid)
+                    bw.add_object(
+                        properties={"title": f"kg-{i}",
+                                    "content": f"kg-body-{i}"},
+                        uuid=uid,
+                        vector={
+                            "qwen3_embed":  [float(i)] * 1024,
+                            "ollama_embed": [float(i + 100)] * 1024,
+                            "openai_embed": [float(i + 200)] * 1024,
+                        },
+                    )
+        finally:
+            client.close()
+        self.assertEqual(len(kg_uuids), 5)
+
+        # 2. Pre-create staging with 0-2 dummy objects (orphan from
+        #    earlier crash where copy was only partially complete).
+        staging_name = f"{self.KG_NAME}__staging"
+        project_init._create_class(
+            {**project_init.kg_class_definition(staging_name)},
+            weaviate_url=self.url,
+        )
+        client = weaviate.connect_to_custom(
+            http_host=host, http_port=port, http_secure=False,
+            grpc_host=host,
+            grpc_port=int(os.environ.get("GRPC_PORT", "50052")),
+            grpc_secure=False, skip_init_checks=True,
+        )
+        try:
+            col = client.collections.get(staging_name)
+            with col.batch.dynamic() as bw:
+                for i in range(2):
+                    bw.add_object(
+                        properties={"title": f"orphan-{i}"},
+                        uuid=str(uuid.uuid4()),
+                        vector={
+                            "qwen3_embed":  [float(i)] * 1024,
+                            "ollama_embed": [float(i + 100)] * 1024,
+                            "openai_embed": [float(i + 200)] * 1024,
+                        },
+                    )
+        finally:
+            client.close()
+
+        # 3. Run migrate. Target schema is at `<name>` already → noop
+        #    for the action plan, but the recovery sweep should drop
+        #    the orphan.
+        args = argparse.Namespace(force_rebuild=False)
+        result = project_init.migrate_collections(
+            args, dry_run=False, weaviate_url=self.url,
+        )
+
+        # 4. Assertions.
+        # (a) no errors.
+        self.assertEqual(result["errors"], [], msg=f"plan: {result}")
+        # (b) staging dropped.
+        self.assertIsNone(
+            project_init._fetch_schema(staging_name, weaviate_url=self.url),
+        )
+        # (c) `<name>` untouched — all 5 original UUIDs survive.
+        count, uuids_after = self._count_objects(self.KG_NAME)
+        self.assertEqual(count, 5)
+        self.assertEqual(uuids_after, kg_uuids,
+                         msg="`<name>` was modified during safe-drop sweep")
 
 
 if __name__ == "__main__":
