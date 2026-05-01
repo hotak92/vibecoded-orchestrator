@@ -29,7 +29,11 @@ def _rule(name: str, pattern: str, explanation: str) -> None:
 # === 1. Destructive filesystem operations ===
 _rule(
     "rm_root",
-    r"rm\s+(-[a-zA-Z]*f[a-zA-Z]*\s+)*(/\s*$|/\*|~\s*$|~/|/home\b|/etc\b|/usr\b|/var\b|/boot\b|/dev\b)",
+    # NB: flags-block is a single non-repeating group, NOT `(...)*`. The
+    # earlier form with `*` was flagged as ReDoS (CodeQL py/redos) because
+    # adversarial input like "rm -ff -ff -ff ..." caused exponential
+    # backtracking. Real `rm` invocations never repeat flag-blocks anyway.
+    r"rm\s+(?:-[a-zA-Z]*f[a-zA-Z]*\s+)?(/\s*$|/\*|~\s*$|~/|/home\b|/etc\b|/usr\b|/var\b|/boot\b|/dev\b)",
     "Destructive rm targeting system/home directories",
 )
 _rule(
