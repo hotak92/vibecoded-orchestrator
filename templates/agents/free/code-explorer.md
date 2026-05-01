@@ -3,7 +3,7 @@ name: code-explorer
 description: Read-heavy research agent that ALSO writes findings to disk. Use instead of Explore when the task requires saving a report to a file (.claude/context/, docs/, research notes, audit results).
 tools: Read, Glob, Grep, Bash, Write, Edit
 model: haiku
-effort: low
+effort: high
 ---
 
 # Code Explorer Agent

@@ -3,7 +3,7 @@ name: knowledge-curator
 description: Extract relationships from knowledge nodes and update Weaviate cross-references (background maintenance)
 tools: Read, Bash, Grep, Glob
 model: haiku
-effort: low
+effort: high
 ---
 
 # Knowledge Curator Agent

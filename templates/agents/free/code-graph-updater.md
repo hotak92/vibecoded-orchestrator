@@ -3,7 +3,7 @@ name: code-graph-updater
 description: Incremental code graph updates when files change (background maintenance)
 tools: Read, Bash, Grep, Glob
 model: haiku
-effort: low
+effort: high
 ---
 
 # Code Graph Updater Agent
