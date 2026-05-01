@@ -5,7 +5,14 @@
 
 import { writable, derived, get } from 'svelte/store';
 import { invoke, tauriAvailable } from '$lib/tauri';
-import type { ProjectView, ProjectHost, SwitchHostResult } from '$lib/types/launcher';
+import type {
+  ProjectView,
+  ProjectHost,
+  SwitchHostResult,
+  CreateProjectResult,
+  RenameProjectResult,
+} from '$lib/types/launcher';
+import { toast } from '$lib/stores/toast';
 
 const SELECTED_KEY = 'vct.selected_project_id';
 
@@ -73,9 +80,15 @@ function createProjectsStore() {
     },
 
     async create(name: string, folder_path: string, host: ProjectHost): Promise<ProjectView> {
-      const project = await invoke<ProjectView>('create_project_v2', {
+      // BLOCKER-2 (2026-05-01): the Rust command returns
+      // CreateProjectResult { project, warnings }, not a bare ProjectView.
+      // Pre-fix this generic was <ProjectView> — `result.id` was undefined
+      // and the wrapper object was being stored as if it were a project.
+      const result = await invoke<CreateProjectResult>('create_project_v2', {
         req: { name, folder_path, host },
       });
+      const project = result.project;
+      for (const w of result.warnings) toast.error(w);
       update((s) => ({
         ...s,
         projects: [...s.projects, project],
@@ -87,10 +100,36 @@ function createProjectsStore() {
     },
 
     async rename(id: string, newName: string): Promise<ProjectView> {
-      const updated = await invoke<ProjectView>('rename_project_v2', {
+      // HIGH-7 (2026-05-01): rename now returns RenameProjectResult so env
+      // refresh failures surface as warnings instead of disappearing into
+      // eprintln on the Rust side.
+      const result = await invoke<RenameProjectResult>('rename_project_v2', {
         id,
         newName,
       });
+      const updated = result.project;
+      for (const w of result.warnings) toast.error(w);
+      update((s) => ({
+        ...s,
+        projects: s.projects.map((p) => (p.id === id ? updated : p)),
+      }));
+      return updated;
+    },
+
+    /**
+     * MEDIUM-1 (2026-05-01): toggle the project's SHARED_KG_OPT_OUT setting.
+     * Persists to DB AND refreshes the 3 launcher-owned env surfaces
+     * (.vscode/settings.json, .claude/env, .claude/settings.json) so the new
+     * value takes effect without a relaunch. The Svelte UI control is a
+     * follow-up — this is just the wiring.
+     */
+    async setSharedKgOptOut(id: string, optOut: boolean): Promise<ProjectView> {
+      const result = await invoke<RenameProjectResult>('set_shared_kg_opt_out', {
+        projectId: id,
+        optOut,
+      });
+      const updated = result.project;
+      for (const w of result.warnings) toast.error(w);
       update((s) => ({
         ...s,
         projects: s.projects.map((p) => (p.id === id ? updated : p)),

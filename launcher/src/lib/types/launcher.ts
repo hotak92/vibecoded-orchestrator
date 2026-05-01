@@ -48,6 +48,33 @@ export interface SwitchHostResult {
   modules_preserved: ModuleInstallRow[];
 }
 
+/**
+ * Mirror of Rust `CreateProjectResult` (commands/projects_v2.rs).
+ *
+ * BLOCKER-2 (2026-05-01): PR 7's signature change wrapped ProjectView in
+ * this {project, warnings} envelope, but the TS caller was still using
+ * `<ProjectView>` as the invoke generic. Result: every newly-created
+ * project landed in the store as the wrapper object, project.id was
+ * undefined, and every downstream UI surface that keys off id broke.
+ */
+export interface CreateProjectResult {
+  project: ProjectView;
+  /** Non-fatal warnings (env-write failures, stale .env, etc.). */
+  warnings: string[];
+}
+
+/**
+ * Mirror of Rust `RenameProjectResult` (commands/projects_v2.rs).
+ *
+ * HIGH-7 (2026-05-01): rename mirrors create's warning surface so env
+ * refresh failures during rename can be toasted instead of eprintln'd.
+ * Also reused as the return type of `set_shared_kg_opt_out` (MEDIUM-1).
+ */
+export interface RenameProjectResult {
+  project: ProjectView;
+  warnings: string[];
+}
+
 export interface TierCacheView {
   orchestrator_tier: LicenseTier | string;
   module_licenses: Record<string, unknown>;

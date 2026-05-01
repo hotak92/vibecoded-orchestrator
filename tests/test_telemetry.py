@@ -725,5 +725,55 @@ class ConsentFlowTests(unittest.TestCase):
         self.assertFalse(consent["hardware"])
 
 
+class TelemetryCanonicalKeyTests(unittest.TestCase):
+    """B7 (2026-05-01): VCT_TELEMETRY is canonical; VIBECODED_TELEMETRY is a
+    read-time alias for back-compat.  Both must gate telemetry correctly."""
+
+    def setUp(self) -> None:
+        self._home_ctx = _fresh_home()
+        self._home = self._home_ctx.__enter__()
+        env_patch = {
+            "HOME": self._home,
+            "VCT_TELEMETRY": "",
+            "VIBECODED_TELEMETRY": "",
+        }
+        self._env_patch = mock.patch.dict(os.environ, env_patch, clear=False)
+        self._env_patch.start()
+        _, _, self.collector_mod, self.uploader_mod, _ = _reload_telemetry_modules()
+
+    def tearDown(self) -> None:
+        self._env_patch.stop()
+        self._home_ctx.__exit__(None, None, None)
+
+    def test_vct_telemetry_true_enables(self) -> None:
+        with mock.patch.dict(os.environ, {"VCT_TELEMETRY": "true", "VIBECODED_TELEMETRY": ""}):
+            _, _, collector_mod, _, _ = _reload_telemetry_modules()
+            self.assertTrue(collector_mod.telemetry_enabled())
+
+    def test_vct_telemetry_false_disables(self) -> None:
+        with mock.patch.dict(os.environ, {"VCT_TELEMETRY": "false", "VIBECODED_TELEMETRY": ""}):
+            _, _, collector_mod, _, _ = _reload_telemetry_modules()
+            self.assertFalse(collector_mod.telemetry_enabled())
+
+    def test_vibecoded_telemetry_alias_still_works(self) -> None:
+        """VIBECODED_TELEMETRY=true is recognised as opt-in (back-compat alias)."""
+        with mock.patch.dict(os.environ, {"VIBECODED_TELEMETRY": "true", "VCT_TELEMETRY": ""}):
+            _, _, collector_mod, _, _ = _reload_telemetry_modules()
+            self.assertTrue(collector_mod.telemetry_enabled())
+
+    def test_canonical_wins_over_alias_when_both_set(self) -> None:
+        """VCT_TELEMETRY=false beats VIBECODED_TELEMETRY=true (canonical takes precedence)."""
+        with mock.patch.dict(os.environ, {"VCT_TELEMETRY": "false", "VIBECODED_TELEMETRY": "true"}):
+            _, _, collector_mod, _, _ = _reload_telemetry_modules()
+            # VCT_TELEMETRY is preferred (non-empty), so false wins.
+            self.assertFalse(collector_mod.telemetry_enabled())
+
+    def test_canonical_wins_over_alias_true(self) -> None:
+        """VCT_TELEMETRY=true beats VIBECODED_TELEMETRY=false."""
+        with mock.patch.dict(os.environ, {"VCT_TELEMETRY": "true", "VIBECODED_TELEMETRY": "false"}):
+            _, _, collector_mod, _, _ = _reload_telemetry_modules()
+            self.assertTrue(collector_mod.telemetry_enabled())
+
+
 if __name__ == "__main__":
     unittest.main()

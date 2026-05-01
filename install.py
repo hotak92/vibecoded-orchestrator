@@ -85,6 +85,7 @@ if str(PROJECT_ROOT) not in sys.path:
 # Moved to vco_lib.project_init in PR 2 — kept as shim for existing
 # callers; will be removed in PR 9 (cleanup).
 from vco_lib import project_init as _project_init  # noqa: E402
+from vco_lib.deferral_report import DeferralEntry, DeferralReport  # noqa: E402
 
 
 # 2026-04-29 fix (wizard install-path lockdown): defensive sanity check
@@ -1459,6 +1460,28 @@ def main() -> int:
                              "even if the running collection is on an older "
                              "schema. Use to defer the rebuild for a later "
                              "session (search may misbehave until rebuilt).")
+    parser.add_argument("--migrate-dry-run", "--dry-run-migrate",
+                        dest="migrate_dry_run", action="store_true", default=False,
+                        help="With --rebuild-collections: report the migration "
+                             "plan only, do NOT mutate Weaviate. Useful to "
+                             "preview which collections will be patched in "
+                             "place vs copied vs rebuilt.")
+    parser.add_argument("--force-rebuild", action="store_true", default=False,
+                        help="With --rebuild-collections: bypass smart "
+                             "copy-with-vectors path and always drop + "
+                             "re-embed (the OLD behaviour, escape hatch). "
+                             "Use when the source has legacy single-vector "
+                             "format or you suspect vector corruption.")
+    parser.add_argument("--apply-deferred", action="store_true", default=False,
+                        help="During --update, attempt to apply each pending entry "
+                             "in .claude/context/UPDATE_DEFERRED.md. Resolved entries "
+                             "are removed; the file is deleted when zero entries remain.")
+    parser.add_argument("--project-folder", type=str, default=None,
+                        help="Folder where .claude/context/UPDATE_DEFERRED.md should "
+                             "land. Defaults to the orchestrator's PROJECT_ROOT "
+                             "(self-update behavior). End-user managed projects pass "
+                             "their own project root so deferral entries are visible "
+                             "in their workspace, not the orchestrator clone.")
     parser.add_argument("--quiet", action="store_true",
                         help="Minimal output")
     parser.add_argument("--with-joern", action="store_true", default=False,
@@ -1560,6 +1583,12 @@ def main() -> int:
                              "Default: CLAUDE.md,.claude/CONTEXT_STATE.md,"
                              ".claude/PROJECT_REGISTRY.md,.env")
     args = parser.parse_args()
+
+    # Deferral report — accumulates non-auto-resolvable conditions detected
+    # during this run; written to .claude/context/UPDATE_DEFERRED.md at end.
+    # Using a distinct name to avoid shadowing the conflict-resolve `report`
+    # local below.
+    _deferral_report = DeferralReport()
 
     # Windows install gate: refuse install when PowerShell 5.1+ isn't on
     # PATH (the .ps1 hooks would have nothing to run them). Non-Windows
@@ -1696,7 +1725,8 @@ def main() -> int:
                     print(f"  [{name}] aborted: {d['evidence']}")
             return 1
 
-        _start_services(sysinfo, args, embed_config, decisions)
+        _start_services(sysinfo, args, embed_config, decisions,
+                        deferral_report=_deferral_report)
         if not args.skip_models:
             _wait_for_ollama()
             _pull_ollama_models(_build_ollama_pull_list(embed_config, sysinfo))
@@ -1724,12 +1754,165 @@ def main() -> int:
         # state — sources, env, settings stay intact. After drop,
         # _ensure_collections recreates with the fresh schema and
         # _seed_weaviate re-ingests from sources.
-        if _maybe_prompt_rebuild_collections(args):
-            _rebuild_collections(args)
-        _ensure_collections(embed_config, decisions=decisions, args=args)
-        # Seed Weaviate with bundled knowledge/ + docs/. Idempotent;
-        # safe to re-run on update.
-        _seed_weaviate(args)
+        # Track whether migrate_collections performed a "rebuild" action this
+        # run. If so AND a later step (ensure/seed) crashes, the deferral
+        # entry must signal "rebuild_pending_seed" so the operator knows the
+        # collection was dropped and is awaiting re-seed (HIGH-4).
+        _rebuild_was_performed = False
+
+        if _maybe_prompt_rebuild_collections(args, deferral_report=_deferral_report):
+            # PR 3: smart per-collection dispatch (copy-with-vectors etc.)
+            # replaces the old drop-and-re-embed default. --force-rebuild
+            # is the escape hatch back to today's behaviour.
+            if getattr(args, "force_rebuild", False):
+                _rebuild_collections(args)
+                _rebuild_was_performed = True
+            else:
+                # HIGH-1 fix (2026-05-01): capture migrate_collections result
+                # and emit a per-collection deferral entry for every entry in
+                # result["errors"]. Previously the dict was discarded silently.
+                _migrate_result = _project_init.migrate_collections(
+                    args,
+                    dry_run=getattr(args, "migrate_dry_run", False),
+                    log_event=_log_install_event,
+                )
+                if _migrate_result and not _migrate_result.get("dry_run", False):
+                    if any(
+                        entry.get("action") == "rebuild"
+                        for entry in _migrate_result.get("plan", [])
+                    ):
+                        _rebuild_was_performed = True
+                    for err in _migrate_result.get("errors", []) or []:
+                        _err_collection = err.get("collection") or "unknown"
+                        _err_action = err.get("action") or "unknown"
+                        _err_msg = err.get("error") or "(no error message)"
+                        # condition_id includes the collection name so multiple
+                        # failures across collections do NOT deduplicate.
+                        _deferral_report.add_entry(
+                            DeferralEntry(
+                                condition_id=(
+                                    f"migrate_collections_partial_failure_"
+                                    f"{_err_collection}"
+                                ),
+                                title=(
+                                    f"Schema migration failed for "
+                                    f"`{_err_collection}`"
+                                ),
+                                detected=(
+                                    f"Action `{_err_action}` raised: {_err_msg}"
+                                ),
+                                why_deferred=(
+                                    "Migration partial failure leaves the "
+                                    "collection in an inconsistent state; "
+                                    "manual recovery required."
+                                ),
+                                command_to_apply=(
+                                    "python install.py --update "
+                                    "--rebuild-collections --force-rebuild "
+                                    "(last-resort drop+re-embed) OR see logs at "
+                                    "state/logs/install.jsonl stage 7b.<action>"
+                                ),
+                                severity="critical",
+                                kg_node_refs=[
+                                    ".claude/context/"
+                                    "weaviate-schema-port-research-2026-05-01.md",
+                                ],
+                            )
+                        )
+
+        # PR 6 + MEDIUM-9 + HIGH-4 fix (2026-05-01): wrap _ensure_collections
+        # AND _seed_weaviate in the same try/except so Weaviate-down conditions
+        # emit a deferral entry instead of crashing the install. Includes a
+        # podman-restart soft-recovery attempt. If a rebuild action dropped a
+        # collection earlier this run AND seed/ensure later crashes, the
+        # deferral entry includes `rebuild_pending_seed` so the operator knows
+        # what was lost.
+        try:
+            _ensure_collections(embed_config, decisions=decisions, args=args)
+            # Seed Weaviate with bundled knowledge/ + docs/. Idempotent;
+            # safe to re-run on update.
+            _seed_weaviate(args)
+        except Exception as _weaviate_err:
+            # PR 6: Weaviate is unreachable (or refused connection) after the
+            # containers were started. Attempt a soft-recovery restart
+            # via podman before emitting a deferral.
+            _weaviate_down_msg = str(_weaviate_err)
+            _restarted = False
+            try:
+                subprocess.run(
+                    ["podman", "start", "weaviate_claude"],
+                    capture_output=True, timeout=30,
+                )
+                import time as _time
+                _time.sleep(3)  # brief settle
+                _ensure_collections(embed_config, decisions=decisions, args=args)
+                _seed_weaviate(args)
+                _restarted = True
+            except Exception:
+                pass
+            if not _restarted:
+                print(
+                    f"WARNING: Weaviate unreachable after restart attempt "
+                    f"({_weaviate_down_msg}). Collections not bootstrapped. "
+                    "Deferral entry written."
+                )
+                _deferral_report.add_entry(
+                    DeferralEntry(
+                        condition_id="weaviate_unreachable_at_update",
+                        title="Weaviate unreachable at update",
+                        detected=(
+                            f"Weaviate refused connection during --update "
+                            f"({_weaviate_down_msg}). Auto-restart via "
+                            "`podman start weaviate_claude` also failed."
+                        ),
+                        why_deferred=(
+                            "Collection bootstrap and schema migration require "
+                            "a live Weaviate. Cannot proceed without it."
+                        ),
+                        command_to_apply=(
+                            "podman start weaviate_claude && "
+                            "python install.py --update --skip-rebuild-prompt"
+                        ),
+                        severity="critical",
+                        kg_node_refs=[],
+                    )
+                )
+                # HIGH-4: if a rebuild action dropped collections this run,
+                # warn the operator that the collection is GONE and needs
+                # re-seed once Weaviate is back.
+                if _rebuild_was_performed:
+                    _deferral_report.add_entry(
+                        DeferralEntry(
+                            condition_id="rebuild_pending_seed",
+                            title="Rebuild dropped collections; seed pending",
+                            detected=(
+                                "A `rebuild` action dropped one or more "
+                                "collections during this run, and a "
+                                "subsequent ensure/seed step crashed before "
+                                "the collections could be recreated and "
+                                "re-ingested. See `state/logs/install.jsonl` "
+                                "stage `7b.rebuild snapshot` for the per-"
+                                "collection object count + sample UUIDs that "
+                                "were present immediately before the drop."
+                            ),
+                            why_deferred=(
+                                "Cannot recreate + re-ingest without a live "
+                                "Weaviate. The .md sources in knowledge/ + "
+                                "docs/ are intact and will be re-ingested by "
+                                "the next install.py --update run."
+                            ),
+                            command_to_apply=(
+                                "podman start weaviate_claude && "
+                                "python install.py --update "
+                                "--skip-rebuild-prompt"
+                            ),
+                            severity="critical",
+                            kg_node_refs=[
+                                ".claude/context/"
+                                "weaviate-schema-port-research-2026-05-01.md",
+                            ],
+                        )
+                    )
     else:
         print("\n[skip] Container services (--no-containers)")
         print("[skip] Weaviate seeding (--no-containers)")
@@ -1780,6 +1963,23 @@ def main() -> int:
     # decide whether the install completed start-to-end.
     _log_install_event("session", "ok", f"{mode} finished cleanly")
 
+    # HIGH-2 fix (2026-05-01): deferral file lands in the user-project folder
+    # when --project-folder is passed. Default = PROJECT_ROOT preserves the
+    # orchestrator self-update behaviour.
+    _deferral_folder = (
+        Path(args.project_folder)
+        if getattr(args, "project_folder", None)
+        else PROJECT_ROOT
+    )
+
+    # Apply pending deferrals if requested (--update --apply-deferred).
+    if args.update and getattr(args, "apply_deferred", False):
+        _apply_deferred_entries(_deferral_report, _deferral_folder)
+
+    # Write (or delete) the deferral report. On install runs, this is a no-op
+    # (nothing accumulates); on update runs, any unresolved conditions land here.
+    _deferral_report.write(_deferral_folder)
+
     print()
     print("=" * 62)
     print("  Installation complete!")
@@ -1787,6 +1987,83 @@ def main() -> int:
     print()
     _print_next_steps(sysinfo, args)
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Deferral-apply helper
+# ---------------------------------------------------------------------------
+
+def _apply_deferred_entries(
+    current_run_report: DeferralReport,
+    project_root: Path,
+) -> None:
+    """Attempt to apply each entry in the persisted deferral report.
+
+    Reads the on-disk ``UPDATE_DEFERRED.md``, attempts a best-effort
+    resolution for each known condition, and marks successful ones resolved.
+    The merged result (on-disk resolved entries removed + any new entries from
+    the current run) is written back by the caller (``_deferral_report.write()``
+    at end of ``main()``).
+
+    Conditions handled:
+      - ``schema_drift_rebuild_required``: not auto-applied here; requires
+        ``--rebuild-collections`` flag to be present.  We skip to preserve
+        the conservative "no silent data churn" contract.  If the user passed
+        ``--rebuild-collections`` the drift is already resolved before we arrive.
+      - ``weaviate_unreachable_at_update``: try ``podman start weaviate_claude``
+        then check reachability; mark resolved if now reachable.
+      - ``compose_overlay_ambiguous``: cannot auto-resolve (requires human
+        decision); emit informational note.
+    """
+    persisted = DeferralReport.read(project_root)
+    if not persisted:
+        return
+
+    print()
+    print("[apply-deferred] Processing pending deferral entries ...")
+
+    for entry in persisted.entries:
+        cid = entry.condition_id
+
+        if cid == "schema_drift_rebuild_required":
+            # Requires explicit --rebuild-collections; not auto-applied.
+            print(f"  [skip] {cid}: requires --rebuild-collections (manual action)")
+            current_run_report.add_entry(entry)
+
+        elif cid == "weaviate_unreachable_at_update":
+            print(f"  [try]  {cid}: attempting podman start weaviate_claude ...")
+            try:
+                subprocess.run(
+                    ["podman", "start", "weaviate_claude"],
+                    capture_output=True, timeout=30,
+                )
+                import time as _t
+                _t.sleep(3)
+                weaviate_url = os.environ.get(
+                    "WEAVIATE_URL",
+                    f"http://localhost:{DEFAULT_WEAVIATE_PORT}",
+                )
+                urllib.request.urlopen(
+                    f"{weaviate_url}/v1/.well-known/ready", timeout=5
+                )
+                print(f"  [ok]   {cid}: Weaviate is now reachable. Marking resolved.")
+                # Resolved: do NOT re-add to current_run_report.
+            except Exception as exc:
+                print(f"  [fail] {cid}: still unreachable ({exc}). Keeping entry.")
+                current_run_report.add_entry(entry)
+
+        elif cid == "compose_overlay_ambiguous":
+            # Cannot auto-resolve — needs human GPU vendor selection.
+            print(
+                f"  [skip] {cid}: ambiguous GPU overlay requires user decision. "
+                "Pass --gpu or set VCT_GPU_VENDOR and re-run."
+            )
+            current_run_report.add_entry(entry)
+
+        else:
+            # Unknown condition: preserve it to avoid silently losing info.
+            print(f"  [unknown] {cid}: no handler. Preserving entry.")
+            current_run_report.add_entry(entry)
 
 
 # ---------------------------------------------------------------------------
@@ -3890,8 +4167,13 @@ def _detect_existing_volume_paths() -> dict:
     return volumes
 
 
-def _start_services(sysinfo: SystemInfo, args: argparse.Namespace,
-                    embed_config: dict, decisions: dict | None = None) -> None:
+def _start_services(
+    sysinfo: SystemInfo,
+    args: argparse.Namespace,
+    embed_config: dict,
+    decisions: dict | None = None,
+    deferral_report: "DeferralReport | None" = None,
+) -> None:
     print(f"\n[5/10] Starting services via {sysinfo.container_cmd} ... ", flush=True)
     _log_install_event(
         "5/10", "start",
@@ -4007,6 +4289,47 @@ def _start_services(sysinfo: SystemInfo, args: argparse.Namespace,
     # `deploy.resources.reservations.devices`; Podman uses CDI form
     # `devices: [nvidia.com/gpu=all]`). Pick by `sysinfo.container_cmd`.
     is_podman = "podman" in (sysinfo.container_cmd or "").lower()
+
+    # Compose-overlay ambiguity check: if both the NVIDIA overlay file and
+    # the AMD ROCm overlay file exist, and both GPU tools respond, we cannot
+    # safely pick the right one without user input. Emit a deferral so the
+    # user can resolve explicitly (e.g. by passing --gpu or --cpu-only).
+    if sysinfo.has_gpu and deferral_report is not None:
+        _nvidia_file = infra_dir / ("podman-compose.gpu.yml" if is_podman else "docker-compose.gpu.yml")
+        _amd_file = infra_dir / ("podman-compose.amd-rocm.yml" if is_podman else "docker-compose.amd-rocm.yml")
+        if _nvidia_file.exists() and _amd_file.exists():
+            # Both overlay files present. Probe GPU tools to see if both are live.
+            _nvidia_live = subprocess.run(
+                ["nvidia-smi", "-L"], capture_output=True, timeout=10,
+            ).returncode == 0
+            _amd_live = subprocess.run(
+                ["rocm-smi", "--showid"], capture_output=True, timeout=10,
+            ).returncode == 0
+            if _nvidia_live and _amd_live:
+                deferral_report.add_entry(
+                    DeferralEntry(
+                        condition_id="compose_overlay_ambiguous",
+                        title="Compose GPU overlay ambiguous",
+                        detected=(
+                            "Both nvidia-smi and rocm-smi report a live GPU, and "
+                            "both NVIDIA and AMD ROCm compose overlay files exist. "
+                            "Cannot safely pick an overlay automatically."
+                        ),
+                        why_deferred=(
+                            "Picking the wrong overlay causes Ollama to silently "
+                            "run CPU-only. User must specify the GPU vendor."
+                        ),
+                        command_to_apply=(
+                            "# For NVIDIA:\n"
+                            "python install.py --gpu --update\n"
+                            "# For AMD ROCm:\n"
+                            "python install.py --gpu --update  # after setting VCT_GPU_VENDOR=amd"
+                        ),
+                        severity="warning",
+                        kg_node_refs=[],
+                    )
+                )
+
     if sysinfo.has_gpu:
         if sysinfo.gpu_vendor == "amd":
             rocm_file_name = "podman-compose.amd-rocm.yml" if is_podman else "docker-compose.amd-rocm.yml"
@@ -4486,8 +4809,15 @@ def _ensure_collections(embed_config: dict,
 _detect_kg_schema_drift = _project_init._detect_kg_schema_drift
 
 
-def _maybe_prompt_rebuild_collections(args: argparse.Namespace) -> bool:
+def _maybe_prompt_rebuild_collections(
+    args: argparse.Namespace,
+    deferral_report: "DeferralReport | None" = None,
+) -> bool:
     """During --update, detect schema drift and prompt the user.
+
+    When *deferral_report* is provided, a ``schema_drift_rebuild_required``
+    entry is added to it whenever the rebuild is deferred (non-interactive
+    shell without ``--yes``, or ``--skip-rebuild-prompt``).
 
     Returns True iff the rebuild should run. Exits silently with False
     on:
@@ -4519,38 +4849,74 @@ def _maybe_prompt_rebuild_collections(args: argparse.Namespace) -> bool:
 
     print()
     print("=" * 70)
-    print("⚠️  SCHEMA REBUILD REQUIRED")
+    print("SCHEMA REBUILD REQUIRED")
     print("=" * 70)
     print()
     print(f"The running KG collection ({kg_collection}) is on an older schema:")
     for feat in missing:
         print(f"  - missing: {feat}")
     print()
-    print("Today's code requires these invariants. Weaviate ≤1.30 doesn't")
-    print("allow adding them via Reconfigure — the collections must be")
-    print("dropped and re-ingested from `knowledge/` and `docs/`.")
+    print("Today's code requires these invariants. Weaviate <=1.30 doesn't")
+    print("allow adding them via Reconfigure -- but most cases can be fixed")
+    print("by COPYING with vectors (no Ollama re-embed). PR 3 smart migrate")
+    print("will pick: noop / patch_props / copy-with-vectors / rebuild per")
+    print("collection.")
     print()
     print("What gets touched:")
-    print("  ✓ Weaviate collections (DROPPED + recreated + re-ingested)")
-    print("  ✗ Your .md source files in knowledge/ and docs/  (untouched)")
-    print("  ✗ .env / .vscode/settings.json / .claude/settings.json (untouched)")
-    print("  ✗ The launcher's project bindings (untouched)")
+    print("  + Weaviate collections (rebuilt with copy-with-vectors when possible)")
+    print("  - Your .md source files in knowledge/ and docs/  (untouched)")
+    print("  - .env / .vscode/settings.json / .claude/settings.json (untouched)")
+    print("  - The launcher's project bindings (untouched)")
     print()
-    print("Estimated time: ~3-5 minutes (Ollama re-embeds ~600 nodes).")
+    print("Estimated time: ~30-60s for copy path (vs 3-5min for legacy rebuild).")
+    print("Pass --force-rebuild to bypass smart path and drop+re-embed instead.")
     print()
+
+    def _emit_drift_deferral(missing_feats: list) -> None:
+        """Emit a deferral entry for schema drift when deferral_report given."""
+        if deferral_report is None:
+            return
+        missing_str = ", ".join(missing_feats) if missing_feats else "unknown"
+        deferral_report.add_entry(
+            DeferralEntry(
+                condition_id="schema_drift_rebuild_required",
+                title="Schema rebuild required",
+                detected=(
+                    f"KG_COLLECTION `{kg_collection}` schema is on an older "
+                    f"version. Missing: {missing_str}."
+                ),
+                why_deferred=(
+                    "Schema rebuild touches Weaviate state -- non-interactive "
+                    "shells without --yes defer to avoid silent data churn."
+                ),
+                command_to_apply="python install.py --update --rebuild-collections",
+                severity="warning",
+                # HIGH-3 fix (2026-05-01): kg_node_refs now points at the
+                # actual schema-port research report. Path is relative to the
+                # claude-orchestrator project root (the meta-project that owns
+                # research reports), not VCO. Cross-repo reference is intentional.
+                kg_node_refs=[
+                    ".claude/context/weaviate-schema-port-research-2026-05-01.md",
+                ],
+            )
+        )
 
     # Non-interactive flow: respect --yes; otherwise refuse to nuke data.
     if not sys.stdin.isatty():
         if getattr(args, "yes", False):
             print("(non-interactive --yes: proceeding with rebuild)")
             return True
-        print("Non-interactive shell + no --yes — DEFERRING rebuild.")
-        print("Re-run with `install.py --update --rebuild-collections` to apply.")
+        print("Non-interactive shell + no --yes -- DEFERRING rebuild.")
+        print("DEFERRED -- re-run with `install.py --update --rebuild-collections` to apply.")
         print("Note: search may misbehave until rebuild completes.")
+        _emit_drift_deferral(list(missing))
         return False
 
     answer = input("Proceed with rebuild? [y/N]: ").strip().lower()
-    return answer in ("y", "yes")
+    if answer not in ("y", "yes"):
+        _emit_drift_deferral(list(missing))
+        return False
+    return True
 
 
 # Moved to vco_lib.project_init in PR 2 — kept as shim for existing callers;
@@ -5066,7 +5432,10 @@ def _write_env_config(embed_config: dict, args: argparse.Namespace, joern_availa
     lines.extend([
         "# Anonymous telemetry (default: off — README promise)",
         "# Set to 'true' to enable; collector + uploader both honour this.",
-        f"VIBECODED_TELEMETRY={'true' if telemetry_enabled else 'false'}",
+        # B7 (2026-05-01): canonical key is VCT_TELEMETRY (matches template at
+        # line ~4986 and Rust). VIBECODED_TELEMETRY remains as a read-time alias
+        # in the telemetry module for ~3 releases of back-compat.
+        f"VCT_TELEMETRY={'true' if telemetry_enabled else 'false'}",
         "",
     ])
 
@@ -5129,6 +5498,11 @@ def _configure_claude_settings(embed_config: dict) -> None:
     env_block: dict[str, str] = {
         "WEAVIATE_URL": f"http://localhost:{weaviate_port}",
         "OLLAMA_URL": f"http://localhost:{ollama_port}",
+        # B8 (2026-05-01): .claude/settings.json surface uses GRPC_PORT (legacy
+        # alias). Canonical key is WEAVIATE_GRPC_PORT (written to .env at line
+        # ~5178). weaviate_mcp/server.py reads both, prefers WEAVIATE_GRPC_PORT.
+        # Keep GRPC_PORT in this surface for back-compat until all surfaces are
+        # migrated to the canonical key in a future PR.
         "GRPC_PORT": str(weaviate_grpc),
         "EMBEDDING_MODEL": embed_config["text_model"],
         # See note at the .env-write block above. Per-profile slot mapping.
