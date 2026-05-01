@@ -3,6 +3,7 @@ name: orchestrator-installer
 description: Installs VibeCoded Orchestrator workflow system on new machines with all shared infrastructure
 tools: Read, Write, Edit, Bash, Glob
 model: opus
+effort: xhigh
 ---
 
 # Orchestrator Installer Agent

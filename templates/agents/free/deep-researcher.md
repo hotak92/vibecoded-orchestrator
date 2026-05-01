@@ -3,7 +3,7 @@ name: deep-researcher
 description: Comprehensive web research with recursive sub-agent spawning for thorough investigation
 tools: WebSearch, WebFetch, Task, Read, Write
 model: sonnet
-effort: low
+effort: xhigh
 ---
 
 # Deep Researcher Agent

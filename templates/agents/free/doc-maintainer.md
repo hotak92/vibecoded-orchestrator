@@ -3,7 +3,7 @@ name: doc-maintainer
 description: Maintain and update documentation with knowledge extraction before archival
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
-effort: low
+effort: high
 ---
 
 # Documentation Maintainer Agent

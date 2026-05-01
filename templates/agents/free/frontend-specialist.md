@@ -3,7 +3,7 @@ name: frontend-specialist
 description: Frontend implementation - React, Vue, UI components, client-side logic
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
-effort: low
+effort: high
 isolation: worktree
 skills:
   - react-patterns

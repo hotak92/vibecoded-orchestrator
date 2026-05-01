@@ -3,7 +3,7 @@ name: code-migrator
 description: Migrate code between languages/frameworks with architecture review
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
-effort: low
+effort: high
 isolation: worktree
 skills:
   - architecture-consultant

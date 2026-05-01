@@ -3,7 +3,7 @@ name: project-bootstrapper
 description: Creates new Claude Code project configuration from scratch with full Orchestrator workflow setup
 tools: Read, Write, Edit, Glob, Bash, Task, AskUserQuestion
 model: sonnet
-effort: low
+effort: high
 ---
 
 # Project Bootstrapper Agent
