@@ -1459,6 +1459,18 @@ def main() -> int:
                              "even if the running collection is on an older "
                              "schema. Use to defer the rebuild for a later "
                              "session (search may misbehave until rebuilt).")
+    parser.add_argument("--migrate-dry-run", "--dry-run-migrate",
+                        dest="migrate_dry_run", action="store_true", default=False,
+                        help="With --rebuild-collections: report the migration "
+                             "plan only, do NOT mutate Weaviate. Useful to "
+                             "preview which collections will be patched in "
+                             "place vs copied vs rebuilt.")
+    parser.add_argument("--force-rebuild", action="store_true", default=False,
+                        help="With --rebuild-collections: bypass smart "
+                             "copy-with-vectors path and always drop + "
+                             "re-embed (the OLD behaviour, escape hatch). "
+                             "Use when the source has legacy single-vector "
+                             "format or you suspect vector corruption.")
     parser.add_argument("--quiet", action="store_true",
                         help="Minimal output")
     parser.add_argument("--with-joern", action="store_true", default=False,
@@ -1725,7 +1737,17 @@ def main() -> int:
         # _ensure_collections recreates with the fresh schema and
         # _seed_weaviate re-ingests from sources.
         if _maybe_prompt_rebuild_collections(args):
-            _rebuild_collections(args)
+            # PR 3: smart per-collection dispatch (copy-with-vectors etc.)
+            # replaces the old drop-and-re-embed default. --force-rebuild
+            # is the escape hatch back to today's behaviour.
+            if getattr(args, "force_rebuild", False):
+                _rebuild_collections(args)
+            else:
+                _project_init.migrate_collections(
+                    args,
+                    dry_run=getattr(args, "migrate_dry_run", False),
+                    log_event=_log_install_event,
+                )
         _ensure_collections(embed_config, decisions=decisions, args=args)
         # Seed Weaviate with bundled knowledge/ + docs/. Idempotent;
         # safe to re-run on update.
@@ -4528,16 +4550,19 @@ def _maybe_prompt_rebuild_collections(args: argparse.Namespace) -> bool:
         print(f"  - missing: {feat}")
     print()
     print("Today's code requires these invariants. Weaviate ≤1.30 doesn't")
-    print("allow adding them via Reconfigure — the collections must be")
-    print("dropped and re-ingested from `knowledge/` and `docs/`.")
+    print("allow adding them via Reconfigure — but most cases can be fixed")
+    print("by COPYING with vectors (no Ollama re-embed). PR 3 smart migrate")
+    print("will pick: noop / patch_props / copy-with-vectors / rebuild per")
+    print("collection.")
     print()
     print("What gets touched:")
-    print("  ✓ Weaviate collections (DROPPED + recreated + re-ingested)")
+    print("  ✓ Weaviate collections (rebuilt with copy-with-vectors when possible)")
     print("  ✗ Your .md source files in knowledge/ and docs/  (untouched)")
     print("  ✗ .env / .vscode/settings.json / .claude/settings.json (untouched)")
     print("  ✗ The launcher's project bindings (untouched)")
     print()
-    print("Estimated time: ~3-5 minutes (Ollama re-embeds ~600 nodes).")
+    print("Estimated time: ~30-60s for copy path (vs 3-5min for legacy rebuild).")
+    print("Pass --force-rebuild to bypass smart path and drop+re-embed instead.")
     print()
 
     # Non-interactive flow: respect --yes; otherwise refuse to nuke data.
@@ -4546,7 +4571,7 @@ def _maybe_prompt_rebuild_collections(args: argparse.Namespace) -> bool:
             print("(non-interactive --yes: proceeding with rebuild)")
             return True
         print("Non-interactive shell + no --yes — DEFERRING rebuild.")
-        print("Re-run with `install.py --update --rebuild-collections` to apply.")
+        print("DEFERRED — re-run with `install.py --update --rebuild-collections` to apply.")
         print("Note: search may misbehave until rebuild completes.")
         return False
 
