@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Code Graph Query wrapper - Semantic and structural code search
+# Usage: code-graph-query search "query"
+#        code-graph-query similar "full.function.name"
+#        code-graph-query structure dependencies "path/to/module.py"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Probe canonical .venv locations. install-root/.venv is the OSS install
+# layout; claude_mcp_servers/.venv is the legacy private-Claude-orch
+# path. Hardcoding only the legacy one broke real OSS installs.
+VENV_PATH=""
+for _c in "$SCRIPT_DIR/../../.venv" "$SCRIPT_DIR/../../claude_mcp_servers/.venv"; do
+    if [ -x "$_c/bin/python" ] || [ -x "$_c/bin/python3" ]; then
+        VENV_PATH="$_c"
+        break
+    fi
+done
+
+if [ -n "$VENV_PATH" ]; then
+    source "$VENV_PATH/bin/activate"
+fi
+
+# Run the Python script
+python3 "$SCRIPT_DIR/query_code_graph.py" "$@"
