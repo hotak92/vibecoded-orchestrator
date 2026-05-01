@@ -5,11 +5,12 @@
 //! is fully migrated to call these, we'll retire the old commands.
 
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tauri::{command, AppHandle, State};
 use uuid::Uuid;
 
 use crate::commands::codegraph;
+use crate::commands::installer::{detect_system, find_local_repo_root};
 use crate::db::code_graph_builds::status as build_status;
 use crate::db::models::{ModuleInstallRow, ProjectHost, ProjectRow};
 use crate::db::Db;
@@ -283,10 +284,287 @@ pub async fn create_project_v2(
         }
     }
 
+    // PR 4 (2026-05-01): bootstrap Weaviate collections + install per-project
+    // bundle (hooks/scripts/agents/skills/settings/infrastructure). Both run
+    // via Python subprocess into vco_lib.project_init — single source of
+    // truth shared with install.py. Soft-fail at every step: a Weaviate-down
+    // condition or a missing template tree must NOT block project creation.
+    //
+    // Order matters: env files were written above, so the bundle install
+    // and bootstrap pick up the right KG_COLLECTION via the project's .env.
+    // Bootstrap first (ensures the per-project + shared collections exist
+    // with current schema invariants); bundle second (drops the hooks +
+    // scripts that depend on the collections existing).
+    for w in run_bootstrap_collections(folder, &req.name).await {
+        warnings.push(w);
+    }
+    for w in run_install_bundle(folder).await {
+        warnings.push(w);
+    }
+
     Ok(CreateProjectResult {
         project: ProjectView::from_row(row, 0),
         warnings,
     })
+}
+
+/// PR 4 (2026-05-01): subprocess-call vco_lib.project_init bootstrap-collections.
+///
+/// Soft-fail policy:
+///   - Python missing → push a warning, return (project create still succeeds).
+///   - Orchestrator root unfindable → push a warning, return.
+///   - Subprocess non-zero exit → push warnings parsed from JSON `errors[]`
+///     (hard collection-create failures); return.
+///   - JSON `deferred=true` → push an info warning that points to
+///     `<folder>/.claude/context/UPDATE_DEFERRED.md`.
+///   - JSON parse failure → push a warning carrying stderr tail.
+///
+/// Returns the list of warnings to surface to the UI. Never returns Err.
+async fn run_bootstrap_collections(folder: &Path, project_name: &str) -> Vec<String> {
+    let mut warnings: Vec<String> = Vec::new();
+
+    let system = match detect_system().await {
+        Ok(s) => s,
+        Err(e) => {
+            warnings.push(format!(
+                "bootstrap-collections skipped: detect_system failed: {}. \
+                 Per-project Weaviate collections will be created lazily by the \
+                 MCP server on first write — schema may be incomplete until \
+                 the next manual `python -m vco_lib.project_init bootstrap-collections \
+                 --name {:?} --json` run.",
+                e, project_name
+            ));
+            return warnings;
+        }
+    };
+    if !system.has_python {
+        warnings.push(
+            "bootstrap-collections skipped: no Python 3.11+ on PATH. \
+             Per-project Weaviate collections will be created lazily on first \
+             write (schema may drift). Install Python and re-run setup."
+            .to_string(),
+        );
+        return warnings;
+    }
+
+    let orch_root = match find_local_repo_root() {
+        Ok(p) => p,
+        Err(e) => {
+            warnings.push(format!(
+                "bootstrap-collections skipped: orchestrator root not found: {}. \
+                 Per-project collections will be created lazily by the MCP server.",
+                e
+            ));
+            return warnings;
+        }
+    };
+
+    let folder_str = folder.to_string_lossy().to_string();
+    let mut cmd = tokio::process::Command::new(&system.python_cmd);
+    cmd.args([
+        "-m",
+        "vco_lib.project_init",
+        "bootstrap-collections",
+        "--name",
+        project_name,
+        "--project-folder",
+        &folder_str,
+        "--json",
+    ])
+    .current_dir(&orch_root)
+    .stdin(std::process::Stdio::null());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+
+    let out = match cmd.output().await {
+        Ok(o) => o,
+        Err(e) => {
+            warnings.push(format!(
+                "bootstrap-collections subprocess failed to start: {}. \
+                 Per-project collections will be created lazily on first write.",
+                e
+            ));
+            return warnings;
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    // Try to parse the JSON envelope first; fall back to a stderr tail
+    // on parse failure (which usually means Python crashed before
+    // emitting JSON).
+    match serde_json::from_str::<serde_json::Value>(&stdout) {
+        Ok(v) => {
+            if v.get("deferred").and_then(|x| x.as_bool()).unwrap_or(false) {
+                warnings.push(format!(
+                    "Weaviate collection bootstrap deferred — Weaviate was \
+                     unreachable during project creation. The launcher attempted \
+                     `podman start weaviate_claude` but it did not become \
+                     healthy in time. The deferral is recorded at \
+                     {}/.claude/context/UPDATE_DEFERRED.md; collections will \
+                     be created when Weaviate is up and you re-run \
+                     `python -m vco_lib.project_init bootstrap-collections \
+                     --name {:?}`.",
+                    folder_str, project_name
+                ));
+            }
+            if let Some(errs) = v.get("errors").and_then(|x| x.as_array()) {
+                for e in errs {
+                    let coll = e.get("collection")
+                        .and_then(|c| c.as_str()).unwrap_or("?");
+                    let msg = e.get("error")
+                        .and_then(|c| c.as_str()).unwrap_or("?");
+                    warnings.push(format!(
+                        "bootstrap-collections error on {}: {}. \
+                         Lazy creation by the MCP server may produce a stale \
+                         schema; re-run bootstrap manually once Weaviate is healthy.",
+                        coll, msg
+                    ));
+                }
+            }
+            if !out.status.success() {
+                // Non-zero exit but JSON parsed — already surfaced via errors[].
+                eprintln!("[vct] bootstrap-collections exit {} (errors surfaced via warnings)", out.status);
+            }
+        }
+        Err(parse_err) => {
+            warnings.push(format!(
+                "bootstrap-collections produced unparseable output ({}): \
+                 stderr tail: {}. Per-project collections will be created \
+                 lazily on first write.",
+                parse_err,
+                stderr.lines().rev().take(3)
+                    .collect::<Vec<_>>().into_iter().rev()
+                    .collect::<Vec<_>>().join(" | ")
+            ));
+        }
+    }
+    warnings
+}
+
+/// PR 4 (2026-05-01): subprocess-call vco_lib.project_init install-bundle.
+///
+/// Same soft-fail discipline as `run_bootstrap_collections`. JSON `errors[]`
+/// entries (per-file write failures) become individual warnings. The function
+/// never blocks project creation.
+async fn run_install_bundle(folder: &Path) -> Vec<String> {
+    let mut warnings: Vec<String> = Vec::new();
+
+    let system = match detect_system().await {
+        Ok(s) => s,
+        Err(e) => {
+            warnings.push(format!(
+                "install-bundle skipped: detect_system failed: {}. \
+                 Per-project hooks/scripts/agents/skills will not be installed \
+                 — Claude Code session running in this folder won't have the \
+                 orchestrator's automation. Manual fix: run \
+                 `python -m vco_lib.project_init install-bundle --folder <path>`.",
+                e
+            ));
+            return warnings;
+        }
+    };
+    if !system.has_python {
+        warnings.push(
+            "install-bundle skipped: no Python 3.11+ on PATH. \
+             Hooks/scripts/agents/skills not installed; install Python and \
+             re-run setup."
+            .to_string(),
+        );
+        return warnings;
+    }
+
+    let orch_root: PathBuf = match find_local_repo_root() {
+        Ok(p) => p,
+        Err(e) => {
+            warnings.push(format!(
+                "install-bundle skipped: orchestrator root not found: {}. \
+                 Per-project hooks/scripts/agents/skills will not be installed.",
+                e
+            ));
+            return warnings;
+        }
+    };
+
+    let folder_str = folder.to_string_lossy().to_string();
+    let orch_str = orch_root.to_string_lossy().to_string();
+    let mut cmd = tokio::process::Command::new(&system.python_cmd);
+    cmd.args([
+        "-m",
+        "vco_lib.project_init",
+        "install-bundle",
+        "--folder",
+        &folder_str,
+        "--orchestrator-root",
+        &orch_str,
+        "--project-folder",
+        &folder_str,
+        "--json",
+    ])
+    .current_dir(&orch_root)
+    .stdin(std::process::Stdio::null());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+
+    let out = match cmd.output().await {
+        Ok(o) => o,
+        Err(e) => {
+            warnings.push(format!(
+                "install-bundle subprocess failed to start: {}. \
+                 Hooks/scripts/agents/skills not installed.",
+                e
+            ));
+            return warnings;
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    match serde_json::from_str::<serde_json::Value>(&stdout) {
+        Ok(v) => {
+            if let Some(errs) = v.get("errors").and_then(|x| x.as_array()) {
+                for e in errs {
+                    let p = e.get("path").and_then(|c| c.as_str()).unwrap_or("?");
+                    let msg = e.get("error").and_then(|c| c.as_str()).unwrap_or("?");
+                    warnings.push(format!(
+                        "install-bundle file error on {}: {}",
+                        p, msg
+                    ));
+                }
+            }
+            if let Some(ws) = v.get("warnings").and_then(|x| x.as_array()) {
+                for w in ws {
+                    if let Some(s) = w.as_str() {
+                        warnings.push(format!("install-bundle: {}", s));
+                    }
+                }
+            }
+            if !out.status.success() {
+                eprintln!("[vct] install-bundle exit {} (errors surfaced via warnings)", out.status);
+            }
+        }
+        Err(parse_err) => {
+            warnings.push(format!(
+                "install-bundle produced unparseable output ({}): \
+                 stderr tail: {}. Hooks/scripts/agents/skills may be incomplete.",
+                parse_err,
+                stderr.lines().rev().take(3)
+                    .collect::<Vec<_>>().into_iter().rev()
+                    .collect::<Vec<_>>().join(" | ")
+            ));
+        }
+    }
+    warnings
 }
 
 /// Bug 23 + 30: write per-project env files for every Claude Code surface.
@@ -1839,5 +2117,370 @@ mod tests {
                    "RenameProjectResult.warnings must capture the env-refresh failure");
         assert!(warnings[0].contains("rename env refresh"),
                 "warning must identify the failing surface: {:?}", warnings[0]);
+    }
+
+    // ─── PR 4 (2026-05-01): bundle install + bootstrap collections ─────
+
+    /// Build a minimal fake orchestrator tree under `root` with enough
+    /// templates/ + infrastructure/ files to exercise install_project_bundle.
+    /// Mirrors `_make_fake_orchestrator` in tests/test_install_bundle.py
+    /// but trimmed to what the Rust integration test needs.
+    #[allow(dead_code)]
+    fn make_fake_orchestrator(root: &Path) {
+        std::fs::write(root.join("vct-module.json"), "{}\n").unwrap();
+        let templates = root.join("templates");
+        std::fs::create_dir_all(templates.join("hooks").join("_lib")).unwrap();
+        std::fs::write(
+            templates.join("hooks").join("foo.sh"),
+            "#!/bin/sh\necho v1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            templates.join("hooks").join("foo.ps1"),
+            "Write-Host 'v1'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            templates.join("hooks").join("_lib").join("find-python.sh"),
+            "# find-python v1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            templates.join("hooks").join("_lib").join("find-python.ps1"),
+            "# find-python.ps1 v1\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(templates.join("scripts")).unwrap();
+        std::fs::write(
+            templates.join("scripts").join("kg-search"),
+            "#!/usr/bin/env python3\nprint('search')\n",
+        )
+        .unwrap();
+        std::fs::write(
+            templates.join("scripts").join("claude_token_counter.py"),
+            "def count(): return 0\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(templates.join("agents").join("free")).unwrap();
+        std::fs::write(
+            templates.join("agents").join("free").join("coder.md"),
+            "Orchestrator at {{ORCHESTRATOR_ROOT}}\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(templates.join("skills").join("architect")).unwrap();
+        std::fs::write(
+            templates
+                .join("skills")
+                .join("architect")
+                .join("SKILL.md"),
+            "Home: {{HOME}}\n",
+        )
+        .unwrap();
+        let settings_tmpl = serde_json::json!({
+            "$schema": "test",
+            "permissions": {"allow": ["Bash"]},
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "*",
+                    "hooks": [{"type": "command", "command": "vco-foo"}]
+                }]
+            }
+        });
+        std::fs::write(
+            templates.join("settings.json.linux.template"),
+            serde_json::to_string_pretty(&settings_tmpl).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            templates.join("settings.json.windows.template"),
+            serde_json::to_string_pretty(&settings_tmpl).unwrap(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("infrastructure")).unwrap();
+        std::fs::write(
+            root.join("infrastructure").join("docker-compose.yml"),
+            "services: {}\n",
+        )
+        .unwrap();
+    }
+
+    /// Find the absolute path to the actual repo root (the worktree's root,
+    /// containing `vct-module.json`). Used by tests that need to invoke the
+    /// REAL `python -m vco_lib.project_init install-bundle` against the real
+    /// templates/ tree (not a fake). Walks up from CARGO_MANIFEST_DIR.
+    #[allow(dead_code)]
+    fn real_repo_root() -> std::path::PathBuf {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let mut current = std::path::PathBuf::from(manifest_dir);
+        for _ in 0..6 {
+            if current.join("vct-module.json").exists() {
+                return current;
+            }
+            if !current.pop() {
+                break;
+            }
+        }
+        panic!("could not find repo root from CARGO_MANIFEST_DIR={}", manifest_dir);
+    }
+
+    /// PR 4: invoke the install-bundle Python subprocess against a fake
+    /// orchestrator and assert all expected files land + manifest written.
+    /// We invoke Python from the REAL repo root (where vco_lib lives) but
+    /// pass the FAKE orchestrator as --orchestrator-root, so the source of
+    /// truth for templates is the fake tree.
+    ///
+    /// This is the integration test the PR 4 spec calls "the critical
+    /// Rust integration test against a fake orchestrator root with
+    /// sample templates".
+    #[test]
+    fn install_bundle_subprocess_writes_full_tree() {
+        // Skip if no Python — CI without python3 shouldn't fail this test.
+        let py = if std::process::Command::new("python3").arg("--version")
+            .output().map(|o| o.status.success()).unwrap_or(false)
+        {
+            "python3".to_string()
+        } else if std::process::Command::new("python").arg("--version")
+            .output().map(|o| o.status.success()).unwrap_or(false)
+        {
+            "python".to_string()
+        } else {
+            eprintln!("[skip] no python on PATH");
+            return;
+        };
+
+        let real_root = real_repo_root();
+        let tmp = std::env::temp_dir().join(format!(
+            "vct-bundle-rs-{}", uuid::Uuid::new_v4().simple()
+        ));
+        let fake_orch = tmp.join("orch");
+        let proj = tmp.join("proj");
+        std::fs::create_dir_all(&fake_orch).unwrap();
+        std::fs::create_dir_all(&proj).unwrap();
+        make_fake_orchestrator(&fake_orch);
+
+        let out = std::process::Command::new(&py)
+            .args([
+                "-m", "vco_lib.project_init",
+                "install-bundle",
+                "--folder", &proj.to_string_lossy(),
+                "--orchestrator-root", &fake_orch.to_string_lossy(),
+                "--json",
+            ])
+            .current_dir(&real_root)
+            .output()
+            .expect("subprocess failed to start");
+
+        assert!(out.status.success(),
+                "install-bundle exit {}\nstdout={}\nstderr={}",
+                out.status,
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr));
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let payload: serde_json::Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("non-JSON stdout: {}\nraw={}", e, stdout));
+
+        // Manifest written.
+        assert!(payload["manifest_written"].as_bool().unwrap_or(false),
+                "manifest must be written");
+        assert!(proj.join(".claude").join(".vco-manifest.json").exists());
+
+        // Hook present (OS-aware: sh on Linux/macOS, ps1 on Windows).
+        #[cfg(target_os = "windows")]
+        let hook_name = "foo.ps1";
+        #[cfg(not(target_os = "windows"))]
+        let hook_name = "foo.sh";
+        assert!(proj.join(".claude").join("hooks").join(hook_name).exists(),
+                "hook {} must land in .claude/hooks/", hook_name);
+
+        // _lib hook always-overwritten.
+        #[cfg(target_os = "windows")]
+        let lib_name = "find-python.ps1";
+        #[cfg(not(target_os = "windows"))]
+        let lib_name = "find-python.sh";
+        assert!(proj.join(".claude").join("hooks").join("_lib").join(lib_name).exists());
+
+        // Scripts present (notably claude_token_counter.py — the ship-blocker
+        // gap from the orchestrator-full-surface-inventory).
+        assert!(proj.join(".claude").join("scripts").join("kg-search").exists());
+        assert!(proj.join(".claude").join("scripts").join("claude_token_counter.py").exists());
+
+        // Agents with substitutions applied.
+        let coder = std::fs::read_to_string(
+            proj.join(".claude").join("agents").join("coder.md"),
+        ).unwrap();
+        assert!(coder.contains(&fake_orch.to_string_lossy().to_string()),
+                "agent must have {{{{ORCHESTRATOR_ROOT}}}} substituted: {}", coder);
+        assert!(!coder.contains("{{ORCHESTRATOR_ROOT}}"),
+                "placeholder must NOT remain: {}", coder);
+
+        // Skill recursively copied.
+        assert!(proj.join(".claude").join("skills").join("architect").join("SKILL.md").exists());
+
+        // Infrastructure compose file copied.
+        assert!(proj.join("infrastructure").join("docker-compose.yml").exists());
+
+        // Settings template smart-merged.
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(proj.join(".claude").join("settings.json")).unwrap()
+        ).unwrap();
+        // The hooks block from the template is now in the project's
+        // settings.json.
+        assert!(settings["hooks"]["PreToolUse"].is_array(),
+                "settings.json must carry the hooks block from template: {}", settings);
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// PR 4: install-bundle is idempotent — second run must produce no
+    /// "create" actions on top of an unchanged orchestrator.
+    #[test]
+    fn install_bundle_subprocess_idempotent_on_second_run() {
+        let py = if std::process::Command::new("python3").arg("--version")
+            .output().map(|o| o.status.success()).unwrap_or(false)
+        {
+            "python3".to_string()
+        } else if std::process::Command::new("python").arg("--version")
+            .output().map(|o| o.status.success()).unwrap_or(false)
+        {
+            "python".to_string()
+        } else {
+            eprintln!("[skip] no python on PATH");
+            return;
+        };
+        let real_root = real_repo_root();
+        let tmp = std::env::temp_dir().join(format!(
+            "vct-bundle-rs-idem-{}", uuid::Uuid::new_v4().simple()
+        ));
+        let fake_orch = tmp.join("orch");
+        let proj = tmp.join("proj");
+        std::fs::create_dir_all(&fake_orch).unwrap();
+        std::fs::create_dir_all(&proj).unwrap();
+        make_fake_orchestrator(&fake_orch);
+
+        // First run.
+        let out1 = std::process::Command::new(&py)
+            .args([
+                "-m", "vco_lib.project_init", "install-bundle",
+                "--folder", &proj.to_string_lossy(),
+                "--orchestrator-root", &fake_orch.to_string_lossy(),
+                "--json",
+            ])
+            .current_dir(&real_root)
+            .output()
+            .unwrap();
+        assert!(out1.status.success());
+
+        // Second run.
+        let out2 = std::process::Command::new(&py)
+            .args([
+                "-m", "vco_lib.project_init", "install-bundle",
+                "--folder", &proj.to_string_lossy(),
+                "--orchestrator-root", &fake_orch.to_string_lossy(),
+                "--json",
+            ])
+            .current_dir(&real_root)
+            .output()
+            .unwrap();
+        assert!(out2.status.success());
+        let payload: serde_json::Value = serde_json::from_str(
+            &String::from_utf8_lossy(&out2.stdout)
+        ).unwrap();
+        // Second run: zero "create" actions (every file is already there
+        // from run 1).
+        let creates = payload["actions"]["create"].as_array()
+            .map(|a| a.len()).unwrap_or(0);
+        assert_eq!(creates, 0, "second run produced {} creates", creates);
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Grab a free localhost port and immediately drop the listener so the
+    /// port is unbound when the caller subprocess tries to connect. The
+    /// kernel won't reuse the port for another process within the test
+    /// duration (TIME_WAIT semantics + parallel tests get distinct ports
+    /// each), so each test instance gets its own guaranteed-refused port.
+    ///
+    /// Why this matters (flake hunt 2026-05-01): hard-coding a port like
+    /// `:1` or `:8081` collides under default `cargo test --lib`
+    /// parallelism — two parallel subprocess invocations probing the same
+    /// port can race on `_attempt_container_restart`'s
+    /// `podman start weaviate_claude` side-effect, causing one of them to
+    /// see the real Weaviate come up between probes.
+    fn unused_local_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind 127.0.0.1:0 for port reservation");
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        port
+    }
+
+    /// PR 4: bootstrap-collections soft-fails to a deferral when Weaviate
+    /// is unreachable. Drives `--weaviate-url http://127.0.0.1:<free-port>`
+    /// (a port we just released so it's guaranteed-refused) and asserts the
+    /// deferral .md lands at `<folder>/.claude/context/UPDATE_DEFERRED.md`.
+    ///
+    /// Note: this test exercises Python end-to-end including the podman
+    /// restart attempt (which fails because the URL points at a port no
+    /// container is bound to). The test passes regardless of whether the
+    /// host has podman installed.
+    #[test]
+    fn bootstrap_collections_soft_fails_to_deferral() {
+        let py = if std::process::Command::new("python3").arg("--version")
+            .output().map(|o| o.status.success()).unwrap_or(false)
+        {
+            "python3".to_string()
+        } else if std::process::Command::new("python").arg("--version")
+            .output().map(|o| o.status.success()).unwrap_or(false)
+        {
+            "python".to_string()
+        } else {
+            eprintln!("[skip] no python on PATH");
+            return;
+        };
+        let real_root = real_repo_root();
+        let tmp = std::env::temp_dir().join(format!(
+            "vct-bootstrap-rs-{}", uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Per-test free port → no collision with parallel tests probing
+        // the same Weaviate URL.
+        let dead_url = format!("http://127.0.0.1:{}", unused_local_port());
+        let out = std::process::Command::new(&py)
+            .args([
+                "-m", "vco_lib.project_init",
+                "bootstrap-collections",
+                "--name", "VideoFrames",
+                "--weaviate-url", &dead_url,
+                "--project-folder", &tmp.to_string_lossy(),
+                "--json",
+            ])
+            .current_dir(&real_root)
+            .output()
+            .expect("subprocess failed to start");
+
+        // Soft-fail: exit 0 even though Weaviate was unreachable.
+        assert!(out.status.success(),
+                "bootstrap-collections must exit 0 on soft-fail (Weaviate down). \
+                 stdout={} stderr={}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr));
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let payload: serde_json::Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("non-JSON stdout: {}\n{}", e, stdout));
+        assert_eq!(payload["weaviate_reachable"], false);
+        assert_eq!(payload["deferred"], true);
+
+        // Deferral .md landed in the user-project folder.
+        let deferral = tmp.join(".claude").join("context").join("UPDATE_DEFERRED.md");
+        assert!(deferral.exists(),
+                "expected UPDATE_DEFERRED.md at {}", deferral.display());
+        let body = std::fs::read_to_string(&deferral).unwrap();
+        assert!(body.contains("weaviate_unreachable_at_bootstrap"),
+                "deferral entry condition_id must match: {}", body);
+
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }

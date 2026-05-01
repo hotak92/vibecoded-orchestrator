@@ -46,10 +46,12 @@ import json
 import os
 import re
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -1272,6 +1274,1227 @@ _migrate_collections = migrate_collections
 
 
 # ---------------------------------------------------------------------------
+# Collection bootstrap (PR 4) — POST schema with podman-restart soft-fail.
+#
+# Used by:
+#   - launcher `create_project_v2` (subprocess via `bootstrap-collections`)
+#   - install.py first-install / adopt-mode (eventually — currently
+#     install.py has its own `_ensure_collections`; PR 5+ may dedupe).
+#
+# Idempotent: existence-checks each target before POST, so a re-run on a
+# project whose collections already exist is a no-op (no errors).
+#
+# Soft-fail policy (per PR 4 spec):
+#   1. If Weaviate unreachable, attempt `podman start weaviate_claude` (or
+#      `docker start` fallback) once and wait up to 10s for healthy.
+#   2. If still unreachable, write a `weaviate_unreachable_at_bootstrap`
+#      deferral entry to `<project_folder>/.claude/context/UPDATE_DEFERRED.md`
+#      and return success — NEVER block project creation. The hook
+#      `ensure-containers.sh` is the second-line backstop for the next
+#      Claude Code session.
+#
+# Shared KG (`VibeCodedTools_KnowledgeGraph`): created when missing
+# regardless of any per-project SHARED_KG_OPT_OUT toggle. Per the
+# coordinator's 2026-05-01 directive: every project ALWAYS reads the
+# shared KG; the toggle is purely a runtime write-gate. Creation is not
+# gated on it.
+# ---------------------------------------------------------------------------
+
+
+_SHARED_KG_NAME = "VibeCodedTools_KnowledgeGraph"
+_DEFAULT_RESTART_CONTAINER = "weaviate_claude"
+
+
+def _is_weaviate_reachable(weaviate_url: str, *, timeout: float = 5.0) -> bool:
+    """Probe `/v1/.well-known/ready`. Returns True only on HTTP 200."""
+    base = weaviate_url.rstrip("/")
+    try:
+        status, _body = _http_request(
+            "GET", f"{base}/v1/.well-known/ready", timeout=timeout,
+        )
+        return status == 200
+    except Exception:
+        return False
+
+
+def _attempt_container_restart(
+    container_name: str = _DEFAULT_RESTART_CONTAINER,
+    *,
+    log_event: Optional[Callable[..., None]] = None,
+) -> bool:
+    """Try `podman start <name>` first, fall back to `docker start`.
+
+    Returns True if the start command succeeded (which doesn't guarantee
+    the service is HEALTHY yet — caller should follow up with a readiness
+    probe). Returns False if both runtimes are missing or the start fails.
+    """
+    import shutil
+    import subprocess as _sp
+
+    def _log(step: str, phase: str, detail: str = "", *, data=None) -> None:
+        if log_event is None:
+            return
+        try:
+            log_event(step, phase, detail, data=data)
+        except TypeError:
+            log_event(step, phase, detail)
+
+    for runtime in ("podman", "docker"):
+        if shutil.which(runtime) is None:
+            continue
+        try:
+            res = _sp.run(
+                [runtime, "start", container_name],
+                capture_output=True, text=True, timeout=15,
+            )
+            if res.returncode == 0:
+                _log(
+                    "7b.bootstrap.restart", "ok",
+                    f"{runtime} start {container_name} succeeded",
+                    data={"runtime": runtime, "container": container_name},
+                )
+                return True
+            else:
+                _log(
+                    "7b.bootstrap.restart", "warn",
+                    f"{runtime} start {container_name}: rc={res.returncode}: {res.stderr.strip()[:200]}",
+                    data={"runtime": runtime, "container": container_name,
+                          "stderr": res.stderr.strip()[:200]},
+                )
+        except Exception as e:
+            _log(
+                "7b.bootstrap.restart", "warn",
+                f"{runtime} start {container_name} raised: {type(e).__name__}: {e}",
+                data={"runtime": runtime, "error": str(e)[:200]},
+            )
+    return False
+
+
+def _wait_for_weaviate_ready(
+    weaviate_url: str, *, timeout: float = 10.0, interval: float = 0.5,
+) -> bool:
+    """Poll `_is_weaviate_reachable` until it returns True or timeout."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _is_weaviate_reachable(weaviate_url, timeout=2.0):
+            return True
+        time.sleep(interval)
+    return False
+
+
+def bootstrap_collections(
+    project_name: str,
+    weaviate_url: Optional[str] = None,
+    *,
+    dry_run: bool = False,
+    kg_only: bool = False,
+    project_folder: Optional[Path] = None,
+    log_event: Optional[Callable[..., None]] = None,
+) -> dict:
+    """POST Weaviate schema for the per-project KG, Dev, and shared KG
+    collections. Idempotent — existing classes are left untouched.
+
+    Args:
+        project_name: Raw project name (sanitization applied internally).
+        weaviate_url: Override; defaults to WEAVIATE_URL env or
+            http://localhost:8081.
+        dry_run: Plan only — no Weaviate mutations.
+        kg_only: Skip the per-project Development collection (used by
+            tests and minimal-bootstrap scenarios). The shared KG is
+            still created either way (per the coordinator directive: all
+            projects always need read access to the shared KG).
+        project_folder: When set, deferral entries (Weaviate-unreachable)
+            land in `<project_folder>/.claude/context/UPDATE_DEFERRED.md`.
+            When None, deferral writes are skipped (the caller is expected
+            to handle the no-folder case — e.g. CLI run from a shell
+            unrelated to any user project).
+        log_event: Optional forensic logger compatible with install.py's
+            `_log_install_event`.
+
+    Returns a JSON-serialisable dict:
+      {
+        "weaviate_reachable": bool,
+        "restart_attempted": bool,
+        "restart_succeeded": bool,
+        "deferred": bool,
+        "dry_run": bool,
+        "actions": [{"collection": str, "action": "create"|"exists"|"would-create", "ok": bool}],
+        "errors": [{"collection": str, "error": str}],
+      }
+
+    Soft-fail contract: the function NEVER raises for transport errors or
+    for individual collection creation failures. A non-empty `errors`
+    array signals partial failure that the caller should surface (e.g.
+    via `CreateProjectResult.warnings`), but the project create can still
+    proceed.
+    """
+    def _log(step: str, phase: str, detail: str = "", *, data=None) -> None:
+        if log_event is None:
+            return
+        try:
+            log_event(step, phase, detail, data=data)
+        except TypeError:
+            log_event(step, phase, detail)
+
+    weaviate_url = weaviate_url or _weaviate_url_default()
+    derived = derive_project_collection_names(project_name)
+    result: dict = {
+        "weaviate_reachable": False,
+        "restart_attempted": False,
+        "restart_succeeded": False,
+        "deferred": False,
+        "dry_run": bool(dry_run),
+        "actions": [],
+        "errors": [],
+    }
+
+    # 1. Reachability probe + soft restart on failure.
+    reachable = _is_weaviate_reachable(weaviate_url)
+    if not reachable and not dry_run:
+        result["restart_attempted"] = True
+        _log("7b.bootstrap", "warn",
+             f"weaviate unreachable at {weaviate_url}, attempting restart",
+             data={"weaviate_url": weaviate_url})
+        if _attempt_container_restart(log_event=log_event):
+            result["restart_succeeded"] = True
+            reachable = _wait_for_weaviate_ready(weaviate_url, timeout=10.0)
+    result["weaviate_reachable"] = reachable
+
+    if not reachable:
+        # Defer + return cleanly. Dry-run skips both the restart attempt
+        # and the deferral write — it's a planning preview only.
+        if dry_run:
+            _log("7b.bootstrap", "warn",
+                 "weaviate unreachable; would defer (dry-run, no write)",
+                 data={"weaviate_url": weaviate_url})
+            return result
+        result["deferred"] = True
+        _log("7b.bootstrap", "warn",
+             "weaviate unreachable after restart attempt; writing deferral",
+             data={"weaviate_url": weaviate_url})
+        if project_folder is not None:
+            try:
+                _write_bootstrap_deferral(
+                    Path(project_folder),
+                    project_name=project_name,
+                    weaviate_url=weaviate_url,
+                    derived=derived,
+                    kg_only=kg_only,
+                )
+            except Exception as e:
+                _log("7b.bootstrap", "error",
+                     f"deferral write failed: {type(e).__name__}: {e}",
+                     data={"error": str(e)[:200]})
+                result["errors"].append({
+                    "collection": None,
+                    "error": f"deferral write failed: {e}",
+                })
+        return result
+
+    # 2. Build the target list.
+    targets: list[tuple[str, dict]] = [
+        (derived["kg_collection"],     kg_class_definition(derived["kg_collection"])),
+    ]
+    if not kg_only:
+        targets.append(
+            (derived["development_collection"],
+             development_class_definition(derived["development_collection"])),
+        )
+    # Shared KG: always created when missing (per coordinator: shared KG is
+    # READ by every project regardless of per-project opt-out, so creation
+    # is unconditional). The opt-out toggle is purely a write-gate enforced
+    # at MCP-call time, not a creation gate.
+    targets.append((_SHARED_KG_NAME, kg_class_definition(_SHARED_KG_NAME)))
+
+    # 3. Iterate: existence check + POST when missing.
+    for name, definition in targets:
+        try:
+            existing = _fetch_schema(name, weaviate_url=weaviate_url)
+        except Exception as e:
+            _log("7b.bootstrap", "error",
+                 f"schema probe for {name} failed: {type(e).__name__}: {e}",
+                 data={"collection": name, "error": str(e)[:200]})
+            result["errors"].append({
+                "collection": name,
+                "error": f"schema probe failed: {e}",
+            })
+            continue
+
+        if existing is not None:
+            result["actions"].append({
+                "collection": name, "action": "exists", "ok": True,
+            })
+            _log("7b.bootstrap", "ok",
+                 f"{name}: already exists",
+                 data={"collection": name, "action": "exists"})
+            continue
+
+        if dry_run:
+            result["actions"].append({
+                "collection": name, "action": "would-create", "ok": True,
+            })
+            continue
+
+        try:
+            _create_class(definition, weaviate_url=weaviate_url)
+            result["actions"].append({
+                "collection": name, "action": "create", "ok": True,
+            })
+            _log("7b.bootstrap", "ok",
+                 f"{name}: created with target schema",
+                 data={"collection": name, "action": "create"})
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            _log("7b.bootstrap", "error",
+                 f"{name}: create failed: {err}",
+                 data={"collection": name, "error": err})
+            result["actions"].append({
+                "collection": name, "action": "create", "ok": False,
+            })
+            result["errors"].append({"collection": name, "error": err})
+
+    return result
+
+
+def _write_bootstrap_deferral(
+    project_folder: Path,
+    *,
+    project_name: str,
+    weaviate_url: str,
+    derived: dict,
+    kg_only: bool,
+) -> None:
+    """Emit a `weaviate_unreachable_at_bootstrap` deferral entry. Used by
+    `bootstrap_collections` when Weaviate is down + restart fails.
+
+    Lazy import of `vco_lib.deferral_report` so non-bootstrap code paths
+    don't pull the module.
+    """
+    from vco_lib.deferral_report import DeferralEntry, DeferralReport
+
+    cmd_lines = [
+        "# 1. Bring Weaviate up.",
+        "podman start weaviate_claude  # or: docker start weaviate_claude",
+        "",
+        "# 2. Re-run bootstrap (idempotent).",
+        f"python -m vco_lib.project_init bootstrap-collections "
+        f"--name {project_name!r} --weaviate-url {weaviate_url!r} "
+        f"--project-folder {str(project_folder)!r}",
+    ]
+    if kg_only:
+        cmd_lines[-1] += " --kg-only"
+
+    entry = DeferralEntry(
+        condition_id="weaviate_unreachable_at_bootstrap",
+        title="Weaviate collection bootstrap deferred",
+        detected=(
+            f"Weaviate at {weaviate_url} was unreachable during project "
+            f"creation, and the auto-restart attempt did not bring it back. "
+            f"The project's KG collections "
+            f"({derived['kg_collection']}, "
+            f"{derived['development_collection']}, {_SHARED_KG_NAME}) "
+            f"have not been created. Knowledge-graph search and writes will "
+            f"fail until Weaviate is up and bootstrap is re-run."
+        ),
+        why_deferred=(
+            "Soft-fail policy: project creation must never block on "
+            "Weaviate availability. The collections are created lazily on "
+            "next bootstrap once Weaviate is healthy."
+        ),
+        command_to_apply="\n".join(cmd_lines),
+        severity="warning",
+        kg_node_refs=[
+            "knowledge/concepts/weaviate-schema-evolution.md",
+        ],
+    )
+    report = DeferralReport.read(project_folder)
+    report.add_entry(entry)
+    report.write(project_folder)
+
+
+# ---------------------------------------------------------------------------
+# Bundle install (PR 4) — copy hooks/scripts/agents/skills/settings/
+# infrastructure into a user project folder.
+#
+# Single source of truth for the per-project bundle. `install.py` keeps
+# its own copy logic for the orchestrator-clone case (in-place install);
+# launcher `create_project_v2` calls THIS via subprocess for user-project
+# bootstrap.
+#
+# Manifest-based update (PR 5 territory; PR 4 lays the foundation):
+#   - First-install: skip-if-exists; preserves user customizations on
+#     pre-existing folders that already had hand-rolled hooks.
+#   - Update mode: hash-based drift detection. If installed file matches
+#     a hash recorded in the manifest, OVERWRITE. Otherwise PRESERVE +
+#     emit deferral. "Default to safety": when the manifest is missing
+#     or the source/installed hashes both differ from manifest, treat as
+#     user-modified and preserve.
+#
+# Manifest schema (`<folder>/.claude/.vco-manifest.json`):
+#   {
+#     "schema_version": 1,
+#     "vco_version": "<orchestrator HEAD or release tag>",
+#     "installed_at": "ISO-8601",
+#     "files": {
+#       "<rel-path-from-folder>": {
+#         "sha256": "<hex>",            # hash of the SHIPPED source at
+#                                       # install time (NOT the on-disk
+#                                       # copy after user edits)
+#         "source": "<rel-path>",       # path within orchestrator root
+#       },
+#     },
+#   }
+# ---------------------------------------------------------------------------
+
+
+_MANIFEST_REL = Path(".claude") / ".vco-manifest.json"
+_MANIFEST_SCHEMA_VERSION = 1
+
+
+# Placeholder substitutions applied to agent .md files (mirrors
+# install.py:5564). Skill .md files use the same map.
+def _agent_subs(orchestrator_root: Path) -> dict[str, str]:
+    return {
+        "{{ORCHESTRATOR_ROOT}}": str(orchestrator_root),
+        "{{PROJECTS_ROOT}}": str(orchestrator_root.parent),
+        "{{HOME}}": str(Path.home()),
+    }
+
+
+def _hook_glob_for_os() -> str:
+    """`*.sh` on Linux/macOS, `*.ps1` on Windows. Mirrors install.py:5641."""
+    import platform
+    return "*.ps1" if platform.system() == "Windows" else "*.sh"
+
+
+def _settings_template_path(orchestrator_root: Path) -> Path:
+    """Pick the OS-specific settings.json template file."""
+    import platform
+    name = (
+        "settings.json.windows.template"
+        if platform.system() == "Windows"
+        else "settings.json.linux.template"
+    )
+    return orchestrator_root / "templates" / name
+
+
+def _file_sha256(path: Path) -> str:
+    """SHA256 hex digest of a file's bytes. Returns empty string if the
+    file is missing."""
+    import hashlib
+    if not path.exists() or not path.is_file():
+        return ""
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _bytes_sha256(data: bytes) -> str:
+    """SHA256 hex digest of an in-memory byte string."""
+    import hashlib
+    return hashlib.sha256(data).hexdigest()
+
+
+def _read_manifest(folder: Path) -> dict:
+    """Parse `.claude/.vco-manifest.json` if present. Returns
+    `{"schema_version": ..., "files": {}}` on missing / unparseable file
+    so callers can treat it uniformly."""
+    target = folder / _MANIFEST_REL
+    if not target.exists():
+        return {"schema_version": _MANIFEST_SCHEMA_VERSION, "files": {}}
+    try:
+        data = json.loads(target.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {"schema_version": _MANIFEST_SCHEMA_VERSION, "files": {}}
+        if "files" not in data or not isinstance(data["files"], dict):
+            data["files"] = {}
+        return data
+    except Exception:
+        # Corrupt manifest — treat as missing to avoid blocking the install.
+        return {"schema_version": _MANIFEST_SCHEMA_VERSION, "files": {}}
+
+
+def _write_manifest_atomic(folder: Path, manifest: dict) -> None:
+    """Atomic-write the manifest via tempfile + os.replace. Same pattern as
+    `deferral_report.write`."""
+    target = folder / _MANIFEST_REL
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(target.parent), suffix=".tmp", prefix=".vco-manifest-",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+        os.replace(tmp_path, str(target))
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _resolve_vco_version(orchestrator_root: Path) -> str:
+    """Best-effort orchestrator version string for the manifest. Uses
+    `git rev-parse --short HEAD` when available, falls back to "unknown".
+    Never raises.
+    """
+    import subprocess as _sp
+    try:
+        res = _sp.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(orchestrator_root),
+            capture_output=True, text=True, timeout=5,
+        )
+        if res.returncode == 0:
+            sha = res.stdout.strip()
+            if sha:
+                return sha
+    except Exception:
+        pass
+    return "unknown"
+
+
+@dataclass
+class _BundleFileOp:
+    """One copy unit for `install_project_bundle`.
+
+    `dest_rel` is relative to `<folder>`. `source_abs` is the absolute path
+    of the shipped file. `transform` is None for byte-copy or a callable
+    `(bytes) -> bytes` for substitution (e.g. agent placeholder rewrites).
+    `always_overwrite=True` for files that aren't user-customisable
+    (e.g. hooks/_lib).
+    """
+    dest_rel: str
+    source_abs: Path
+    source_rel: str = ""  # rel to orchestrator_root, for manifest
+    transform: Optional[Callable[[bytes], bytes]] = None
+    always_overwrite: bool = False
+
+
+def _enumerate_bundle_files(orchestrator_root: Path) -> list[_BundleFileOp]:
+    """Build the list of files to install. OS-aware (hooks pick .sh vs .ps1).
+
+    Layout:
+      .claude/hooks/<name>.{sh,ps1}        from templates/hooks/  (skip _lib)
+      .claude/hooks/_lib/<name>.{sh,ps1}   from templates/hooks/_lib/  (always overwrite)
+      .claude/scripts/<name>               from templates/scripts/  (all flavours)
+      .claude/agents/<name>.md             from templates/agents/free/  (with substitutions)
+      .claude/skills/<rel>                 from templates/skills/<rel>  (recursive; .md substituted)
+      infrastructure/<name>                from infrastructure/<name>   (only docker/podman compose)
+    Settings template handled separately (smart-merge, not a plain copy).
+    """
+    ops: list[_BundleFileOp] = []
+    templates = orchestrator_root / "templates"
+    hook_glob = _hook_glob_for_os()
+
+    # Hooks (top-level only — _lib handled below).
+    hooks_src = templates / "hooks"
+    if hooks_src.exists():
+        for hook_file in sorted(hooks_src.glob(hook_glob)):
+            if hook_file.parent.name == "_lib":
+                continue
+            ops.append(_BundleFileOp(
+                dest_rel=str(Path(".claude") / "hooks" / hook_file.name),
+                source_abs=hook_file,
+                source_rel=str(hook_file.relative_to(orchestrator_root)),
+                transform=None,
+                always_overwrite=False,
+            ))
+
+    # Hooks _lib (always overwrite — not user-customisable).
+    lib_src = hooks_src / "_lib"
+    if lib_src.exists():
+        for lib_file in sorted(lib_src.glob(hook_glob)):
+            ops.append(_BundleFileOp(
+                dest_rel=str(Path(".claude") / "hooks" / "_lib" / lib_file.name),
+                source_abs=lib_file,
+                source_rel=str(lib_file.relative_to(orchestrator_root)),
+                transform=None,
+                always_overwrite=True,
+            ))
+
+    # Scripts: copy ALL recognized flavours (mirrors install.py:5729).
+    scripts_src = templates / "scripts"
+    if scripts_src.exists():
+        script_patterns = ["*.py", "*.sh", "*.ps1", "kg-*", "code-graph-*", "cost-summary"]
+        seen: set[str] = set()
+        for pat in script_patterns:
+            for script_file in sorted(scripts_src.glob(pat)):
+                if script_file.is_dir() or script_file.name in seen:
+                    continue
+                seen.add(script_file.name)
+                ops.append(_BundleFileOp(
+                    dest_rel=str(Path(".claude") / "scripts" / script_file.name),
+                    source_abs=script_file,
+                    source_rel=str(script_file.relative_to(orchestrator_root)),
+                    transform=None,
+                    always_overwrite=False,
+                ))
+
+    # Agents (with placeholder substitution).
+    agents_src = templates / "agents" / "free"
+    subs = _agent_subs(orchestrator_root)
+
+    def _apply_subs(buf: bytes) -> bytes:
+        text = buf.decode("utf-8", errors="replace")
+        for k, v in subs.items():
+            text = text.replace(k, v)
+        return text.encode("utf-8")
+
+    if agents_src.exists():
+        for agent_file in sorted(agents_src.glob("*.md")):
+            ops.append(_BundleFileOp(
+                dest_rel=str(Path(".claude") / "agents" / agent_file.name),
+                source_abs=agent_file,
+                source_rel=str(agent_file.relative_to(orchestrator_root)),
+                transform=_apply_subs,
+                always_overwrite=False,
+            ))
+
+    # Skills (recursive; .md gets substitutions, others byte-copy).
+    skills_src = templates / "skills"
+    if skills_src.exists():
+        for skill_dir in sorted(p for p in skills_src.iterdir() if p.is_dir()):
+            for f in sorted(skill_dir.rglob("*")):
+                if f.is_dir():
+                    continue
+                rel_in_skills = f.relative_to(skills_src)
+                dest_rel = str(Path(".claude") / "skills" / rel_in_skills)
+                ops.append(_BundleFileOp(
+                    dest_rel=dest_rel,
+                    source_abs=f,
+                    source_rel=str(f.relative_to(orchestrator_root)),
+                    transform=_apply_subs if f.suffix == ".md" else None,
+                    always_overwrite=False,
+                ))
+
+    # Infrastructure compose files. Copy all docker-* / podman-* yml at
+    # the top level of `infrastructure/`. The hook `ensure-containers.sh`
+    # picks the right overlay at runtime; we just need the files present.
+    infra_src = orchestrator_root / "infrastructure"
+    if infra_src.exists():
+        for compose_file in sorted(infra_src.iterdir()):
+            if not compose_file.is_file():
+                continue
+            n = compose_file.name
+            if not (
+                (n.startswith("docker-compose") or n.startswith("podman-compose"))
+                and (n.endswith(".yml") or n.endswith(".yaml"))
+            ):
+                continue
+            ops.append(_BundleFileOp(
+                dest_rel=str(Path("infrastructure") / n),
+                source_abs=compose_file,
+                source_rel=str(compose_file.relative_to(orchestrator_root)),
+                transform=None,
+                always_overwrite=False,
+            ))
+
+    return ops
+
+
+def _file_action(
+    op: _BundleFileOp,
+    target_path: Path,
+    *,
+    update_mode: bool,
+    manifest: dict,
+) -> tuple[str, bytes]:
+    """Decide the per-file action and return (action, source_bytes).
+
+    Actions:
+      "create"          — target missing, write source.
+      "overwrite"       — file exists, content matches manifest's prior-shipped
+                          hash → safe to update with new shipped content.
+      "preserve"        — file exists, user-modified vs manifest. Skip; emit
+                          deferral.
+      "noop"            — file exists, source identical to installed (no-op).
+      "always-overwrite"— `op.always_overwrite=True` (e.g. hooks/_lib).
+      "skip-existing"   — first-install (update_mode=False) and target exists.
+    """
+    # Compute the source bytes (after transform if any). We always need
+    # the bytes to compute hashes; reading is cheap relative to the rest.
+    raw = op.source_abs.read_bytes()
+    if op.transform is not None:
+        source_bytes = op.transform(raw)
+    else:
+        source_bytes = raw
+
+    if op.always_overwrite:
+        return ("always-overwrite", source_bytes)
+
+    if not target_path.exists():
+        return ("create", source_bytes)
+
+    # File exists — compare.
+    installed_hash = _file_sha256(target_path)
+    new_source_hash = _bytes_sha256(source_bytes)
+
+    if installed_hash == new_source_hash:
+        # Already up to date.
+        return ("noop", source_bytes)
+
+    if not update_mode:
+        # First-install semantics: never touch existing files (preserves
+        # any user customizations on pre-existing folders).
+        return ("skip-existing", source_bytes)
+
+    # Update mode: consult the manifest. If installed_hash matches what
+    # we previously shipped, the user hasn't touched it → safe to
+    # overwrite. Otherwise the user has modified it → preserve + defer.
+    prior = manifest.get("files", {}).get(op.dest_rel, {})
+    prior_hash = prior.get("sha256", "")
+    if prior_hash and installed_hash == prior_hash:
+        return ("overwrite", source_bytes)
+    # Default to safety: user-modified (or unknown provenance).
+    return ("preserve", source_bytes)
+
+
+def _write_file_atomic(target: Path, data: bytes, *, mode: Optional[int] = None) -> None:
+    """Atomic file write: temp file in same dir + os.replace. Optionally
+    sets a unix mode bit (0o755 for shell scripts to preserve executable).
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(target.parent),
+        suffix=".tmp",
+        prefix=f".{target.name}.",
+    )
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp_path, str(target))
+        if mode is not None:
+            try:
+                os.chmod(str(target), mode)
+            except OSError:
+                # chmod is a no-op on Windows; don't fail.
+                pass
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _format_file_list_md(paths: list[str], cap: int = 20) -> str:
+    """Render a bullet-list of file paths for inclusion in a deferral entry.
+
+    Caps at `cap` entries with a "... and N more" trailer when oversize so
+    the deferral .md doesn't grow unbounded for large preserve / skip lists
+    (a fresh-folder install over a previously-installed orchestrator could
+    plausibly produce dozens of skipped paths).
+    """
+    if len(paths) <= cap:
+        return "\n".join(f"  - `{p}`" for p in paths)
+    head = "\n".join(f"  - `{p}`" for p in paths[:cap])
+    return f"{head}\n  - ... and {len(paths) - cap} more"
+
+
+def _emit_user_modified_deferral(
+    folder: Path, modified_files: list[str], orchestrator_root: Path,
+) -> None:
+    """Emit `bundle_user_modified_preserved`: one deferral entry per project
+    listing every file that diverged from the prior-shipped hash during an
+    `--update` run.
+
+    The user has three options:
+    1. Accept shipped versions wholesale: `--update --force`.
+    2. Keep customizations and dismiss the deferral via `dismiss-deferral`
+       (PR 5+ command — placeholder in the message for now).
+    3. Manually merge per-file.
+
+    Per-project grouping (single entry, file list inside) is intentional —
+    one entry per file would generate dozens of deferrals that all
+    duplicate the same actionable command.
+    """
+    if not modified_files:
+        return
+    from vco_lib.deferral_report import DeferralEntry, DeferralReport
+
+    files_md = _format_file_list_md(sorted(modified_files))
+    cmd = (
+        f"# Inspect the differences (per file):\n"
+        f"#   diff -u <orchestrator>/<source-rel> {folder}/<dest-rel>\n"
+        f"# Then either accept shipped versions (forces overwrite):\n"
+        f"python -m vco_lib.project_init install-bundle "
+        f"--folder {str(folder)!r} --orchestrator-root "
+        f"{str(orchestrator_root)!r} --update --force --json\n"
+        f"# OR keep your customizations and dismiss this deferral:\n"
+        f"python -m vco_lib.project_init dismiss-deferral "
+        f"--folder {str(folder)!r} "
+        f"--condition-id bundle_user_modified_preserved"
+    )
+    entry = DeferralEntry(
+        condition_id="bundle_user_modified_preserved",
+        title="User-modified bundle files preserved during update",
+        detected=(
+            f"During an `install-bundle --update` run, "
+            f"{len(modified_files)} file(s) under the project's `.claude/` "
+            f"tree were found to differ from the version this orchestrator "
+            f"originally shipped. They were preserved (not overwritten):\n"
+            f"{files_md}"
+        ),
+        why_deferred=(
+            "Default-to-safety: when an installed file's hash differs "
+            "from the prior-shipped hash recorded in .vco-manifest.json, "
+            "we preserve the on-disk version. If your edits are "
+            "intentional, dismiss the deferral; if you'd rather take the "
+            "shipped version, re-run with `--force`."
+        ),
+        command_to_apply=cmd,
+        severity="info",
+        kg_node_refs=[],
+    )
+    report = DeferralReport.read(folder)
+    report.add_entry(entry)
+    report.write(folder)
+
+
+def _emit_skipped_existing_deferral(
+    folder: Path, skipped_files: list[str], orchestrator_root: Path,
+) -> None:
+    """Emit `bundle_skipped_existing_files`: one deferral entry per project
+    listing pre-existing files that the first-install path SKIPPED because
+    their content differs from the orchestrator's shipped version.
+
+    Why: a Claude Code session opening this folder needs to know the bundle
+    install was incomplete — the user may have a stale custom hook that
+    will silently miss new orchestrator-side improvements until they
+    explicitly run `--update --force`.
+
+    Severity is `info` (not `warning`) — the project is functional, just
+    not 100% in lockstep with the orchestrator's defaults.
+
+    Per-project grouping (single entry, file list inside): one entry per
+    file would be noisy and harder to action. The single entry's command
+    fixes ALL of them in one go.
+    """
+    if not skipped_files:
+        return
+    from vco_lib.deferral_report import DeferralEntry, DeferralReport
+
+    files_md = _format_file_list_md(sorted(skipped_files))
+    cmd = (
+        f"# Accept the orchestrator's shipped versions for ALL skipped files:\n"
+        f"python -m vco_lib.project_init install-bundle "
+        f"--folder {str(folder)!r} --orchestrator-root "
+        f"{str(orchestrator_root)!r} --update --force --json"
+    )
+    entry = DeferralEntry(
+        condition_id="bundle_skipped_existing_files",
+        title="Pre-existing files preserved during first-install",
+        detected=(
+            f"During the first-install of this project's bundle, "
+            f"{len(skipped_files)} file(s) under `.claude/` and "
+            f"`infrastructure/` already existed AND differed from the "
+            f"orchestrator's shipped versions. They were preserved to "
+            f"avoid overwriting user customizations:\n"
+            f"{files_md}"
+        ),
+        why_deferred=(
+            "These files already existed when the bundle was first "
+            "installed and differ from the orchestrator's shipped "
+            "versions. We preserved them to avoid overwriting user "
+            "customizations. If you intended to use the orchestrator's "
+            "defaults, run "
+            "`python -m vco_lib.project_init install-bundle --folder "
+            "<path> --update --force` to overwrite."
+        ),
+        command_to_apply=cmd,
+        severity="info",
+        kg_node_refs=[],
+    )
+    report = DeferralReport.read(folder)
+    report.add_entry(entry)
+    report.write(folder)
+
+
+def install_project_bundle(
+    folder: Path,
+    orchestrator_root: Optional[Path] = None,
+    *,
+    update_mode: bool = False,
+    force: bool = False,
+    dry_run: bool = False,
+    log_event: Optional[Callable[..., None]] = None,
+) -> dict:
+    """Install (or update) the per-project Claude bundle in `folder`.
+
+    Args:
+        folder: target user-project folder (must exist).
+        orchestrator_root: source of truth — the vibecoded-orchestrator
+            clone. Default: walk up from this module looking for
+            `vct-module.json`.
+        update_mode: True → manifest-driven hash diff for overwrites;
+            False → first-install skip-if-exists.
+        force: in update mode, treat user-modified files as overwritable
+            (still respects the no-changes "noop" case).
+        dry_run: enumerate + classify but make no filesystem mutations.
+        log_event: optional forensic logger.
+
+    Returns a JSON-serialisable dict:
+      {
+        "folder": str,
+        "orchestrator_root": str,
+        "update_mode": bool,
+        "force": bool,
+        "dry_run": bool,
+        "actions": {
+            "create": [<rel>...],
+            "overwrite": [<rel>...],
+            "always-overwrite": [<rel>...],
+            "noop": [<rel>...],
+            "preserve": [<rel>...],
+            "skip-existing": [<rel>...],
+        },
+        "settings_action": "created"|"merged"|"unchanged"|"unchanged (user file unparseable)"|"" ,
+        "manifest_written": bool,
+        "vco_version": str,
+        "warnings": [...],
+        "errors": [...],
+      }
+
+    Soft-fail: per-file errors land in `errors[]`; the function never
+    raises for individual file failures. A missing template tree (e.g.
+    `templates/skills/` absent) just means fewer entries in `actions`.
+    """
+    def _log(step: str, phase: str, detail: str = "", *, data=None) -> None:
+        if log_event is None:
+            return
+        try:
+            log_event(step, phase, detail, data=data)
+        except TypeError:
+            log_event(step, phase, detail)
+
+    folder = Path(folder).resolve()
+    if not folder.exists() or not folder.is_dir():
+        return {
+            "folder": str(folder),
+            "orchestrator_root": "",
+            "update_mode": bool(update_mode),
+            "force": bool(force),
+            "dry_run": bool(dry_run),
+            "actions": {k: [] for k in
+                        ("create", "overwrite", "always-overwrite",
+                         "noop", "preserve", "skip-existing")},
+            "settings_action": "",
+            "manifest_written": False,
+            "vco_version": "unknown",
+            "warnings": [],
+            "errors": [{"path": str(folder), "error": "folder does not exist or is not a directory"}],
+        }
+
+    orchestrator_root = (
+        Path(orchestrator_root).resolve()
+        if orchestrator_root is not None
+        else _find_orchestrator_root_from_module()
+    )
+
+    result: dict = {
+        "folder": str(folder),
+        "orchestrator_root": str(orchestrator_root),
+        "update_mode": bool(update_mode),
+        "force": bool(force),
+        "dry_run": bool(dry_run),
+        "actions": {k: [] for k in
+                    ("create", "overwrite", "always-overwrite",
+                     "noop", "preserve", "skip-existing")},
+        "settings_action": "",
+        "manifest_written": False,
+        "vco_version": _resolve_vco_version(orchestrator_root),
+        "warnings": [],
+        "errors": [],
+    }
+
+    if not orchestrator_root.exists():
+        result["errors"].append({
+            "path": str(orchestrator_root),
+            "error": "orchestrator_root does not exist",
+        })
+        return result
+
+    manifest = _read_manifest(folder)
+    new_files: dict[str, dict] = {}
+    user_modified_paths: list[str] = []
+    skipped_existing_paths: list[str] = []
+
+    ops = _enumerate_bundle_files(orchestrator_root)
+    _log("4.bundle", "start",
+         f"enumerate: {len(ops)} ops",
+         data={"folder": str(folder), "ops": len(ops)})
+
+    for op in ops:
+        target_path = folder / op.dest_rel
+        try:
+            action, source_bytes = _file_action(
+                op, target_path, update_mode=update_mode, manifest=manifest,
+            )
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            _log("4.bundle", "error",
+                 f"{op.dest_rel}: classify failed: {err}",
+                 data={"path": op.dest_rel, "error": err})
+            result["errors"].append({"path": op.dest_rel, "error": err})
+            continue
+
+        # Honour --force: in update mode, treat preserve as overwrite.
+        if force and update_mode and action == "preserve":
+            action = "overwrite"
+
+        # Compute the new shipped hash regardless of action — needed for
+        # manifest update on every file we recognize.
+        shipped_hash = _bytes_sha256(source_bytes)
+
+        # Record into manifest only when we actually deposited the
+        # shipped content (or when we previously did and it's still
+        # what's on disk — noop / always-overwrite cases).
+        record_in_manifest = False
+
+        if action == "preserve":
+            user_modified_paths.append(op.dest_rel)
+            # Keep the manifest's prior entry (don't update hash) so the
+            # next update still recognizes the prior baseline.
+            existing = manifest.get("files", {}).get(op.dest_rel)
+            if existing is not None:
+                new_files[op.dest_rel] = existing
+
+        elif action == "skip-existing":
+            # First-install with pre-existing file: do not overwrite, but
+            # also don't claim ownership in the manifest (it's not ours).
+            # Track for the per-project deferral so Claude Code knows the
+            # bundle install was incomplete (user has stale customizations
+            # that won't track future orchestrator improvements).
+            skipped_existing_paths.append(op.dest_rel)
+
+        elif action == "noop":
+            # File matches what we'd write. Manifest entry should reflect
+            # the shipped hash (in case a previous install pre-dated the
+            # manifest mechanism).
+            record_in_manifest = True
+
+        elif action in ("create", "overwrite", "always-overwrite"):
+            if not dry_run:
+                try:
+                    mode: Optional[int] = None
+                    # Preserve executable bit for shell scripts on POSIX.
+                    if op.dest_rel.endswith((".sh",)) or "/scripts/" in op.dest_rel.replace("\\", "/"):
+                        # Many launcher scripts have no extension (kg-search,
+                        # code-graph-query, cost-summary). Mark all of
+                        # .claude/scripts/ + *.sh as executable. 0o700
+                        # (owner-only rwx) — CodeQL py/overly-permissive-file
+                        # flagged both 0o755 (world) and 0o750 (group) as
+                        # overly permissive. The project folder belongs to
+                        # the user; group/world access is unnecessary.
+                        mode = 0o700
+                    _write_file_atomic(target_path, source_bytes, mode=mode)
+                except Exception as e:
+                    err = f"{type(e).__name__}: {e}"
+                    _log("4.bundle", "error",
+                         f"{op.dest_rel}: write failed: {err}",
+                         data={"path": op.dest_rel, "error": err})
+                    result["errors"].append({"path": op.dest_rel, "error": err})
+                    continue
+            record_in_manifest = True
+
+        if record_in_manifest:
+            new_files[op.dest_rel] = {
+                "sha256": shipped_hash,
+                "source": op.source_rel,
+            }
+
+        result["actions"][action].append(op.dest_rel)
+
+    # Smart-merge settings.json template separately. The template carries
+    # the orchestrator's hooks block + permissions defaults. The merge
+    # logic mirrors install.py:_merge_settings_template + _smart_merge_settings.
+    settings_template = _settings_template_path(orchestrator_root)
+    if settings_template.exists():
+        try:
+            settings_action = _merge_settings_template_for_bundle(
+                settings_template, folder / ".claude" / "settings.json",
+                dry_run=dry_run,
+            )
+            result["settings_action"] = settings_action
+            _log("4.bundle.settings", "ok",
+                 f"settings.json: {settings_action}",
+                 data={"action": settings_action})
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            _log("4.bundle.settings", "error",
+                 f"settings.json merge failed: {err}",
+                 data={"error": err})
+            result["warnings"].append(f"settings.json merge failed: {err}")
+
+    # Manifest write (always after a successful pass — even dry-run skips).
+    if not dry_run:
+        try:
+            manifest_payload = {
+                "schema_version": _MANIFEST_SCHEMA_VERSION,
+                "vco_version": result["vco_version"],
+                "installed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "files": dict(sorted(new_files.items())),
+            }
+            _write_manifest_atomic(folder, manifest_payload)
+            result["manifest_written"] = True
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            _log("4.bundle.manifest", "error",
+                 f"manifest write failed: {err}",
+                 data={"error": err})
+            result["errors"].append({"path": str(_MANIFEST_REL), "error": err})
+
+    # Per-project deferral entries — single entry per case, listing all
+    # affected files. Two distinct cases are tracked:
+    #
+    # 1. update-mode `preserve`: files the user modified, diverging from
+    #    the prior-shipped manifest hash. Emitted unless --force was used.
+    # 2. first-install `skip-existing`: files that pre-existed AND differ
+    #    from what we would have shipped. Emitted regardless of mode (the
+    #    user has stale customizations that won't auto-update).
+    #
+    # Both deferrals share the same UPDATE_DEFERRED.md file via PR 6's
+    # `DeferralReport.add_entry` (last-write-wins per condition_id, so a
+    # subsequent install run that resolves the condition will overwrite
+    # the entry with the new state, or remove it when the list is empty).
+    if not dry_run:
+        if update_mode and user_modified_paths and not force:
+            try:
+                _emit_user_modified_deferral(
+                    folder, user_modified_paths, orchestrator_root,
+                )
+            except Exception as e:
+                err = f"{type(e).__name__}: {e}"
+                _log("4.bundle.deferral", "error",
+                     f"user-modified deferral write failed: {err}",
+                     data={"error": err})
+                result["warnings"].append(
+                    f"user-modified deferral write failed: {err}"
+                )
+
+        if skipped_existing_paths:
+            try:
+                _emit_skipped_existing_deferral(
+                    folder, skipped_existing_paths, orchestrator_root,
+                )
+            except Exception as e:
+                err = f"{type(e).__name__}: {e}"
+                _log("4.bundle.deferral", "error",
+                     f"skipped-existing deferral write failed: {err}",
+                     data={"error": err})
+                result["warnings"].append(
+                    f"skipped-existing deferral write failed: {err}"
+                )
+
+    return result
+
+
+def _find_orchestrator_root_from_module() -> Path:
+    """Walk up from this module's location looking for `vct-module.json`.
+    Used when callers don't pass `--orchestrator-root` explicitly."""
+    here = Path(__file__).resolve()
+    for parent in [here.parent, *here.parents]:
+        if (parent / "vct-module.json").exists():
+            return parent
+    # Fallback: parent of this module's parent (vco_lib/) — best effort.
+    return here.parent.parent
+
+
+def _merge_settings_template_for_bundle(
+    template_path: Path, target_path: Path, *, dry_run: bool,
+) -> str:
+    """Mirror of install.py:_merge_settings_template + _smart_merge_settings.
+
+    Inlined here (rather than importing from install.py) so vco_lib stays
+    import-free of install.py — install.py imports vco_lib, not the other
+    way around.
+    """
+    template_data = json.loads(template_path.read_text(encoding="utf-8"))
+
+    if not target_path.exists():
+        if dry_run:
+            return "would-create"
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        _write_file_atomic(
+            target_path,
+            (json.dumps(template_data, indent=2) + "\n").encode("utf-8"),
+        )
+        return "created"
+
+    try:
+        existing = json.loads(target_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return "unchanged (user file unparseable)"
+
+    merged = _smart_merge_for_bundle(existing, template_data)
+    if merged == existing:
+        return "unchanged"
+
+    if dry_run:
+        return "would-merge"
+
+    _write_file_atomic(
+        target_path,
+        (json.dumps(merged, indent=2) + "\n").encode("utf-8"),
+    )
+    return "merged"
+
+
+def _smart_merge_for_bundle(user: dict, template: dict) -> dict:
+    """Recursive dict merge with hooks-block special-case (mirror of
+    install.py:_smart_merge_settings)."""
+    out = dict(user)
+    for key, tval in template.items():
+        if key not in out:
+            out[key] = tval
+            continue
+        uval = out[key]
+        if key == "hooks" and isinstance(uval, dict) and isinstance(tval, dict):
+            out[key] = _merge_hooks_for_bundle(uval, tval)
+        elif isinstance(uval, dict) and isinstance(tval, dict):
+            out[key] = _smart_merge_for_bundle(uval, tval)
+        # else: user wins.
+    return out
+
+
+def _merge_hooks_for_bundle(user_hooks: dict, template_hooks: dict) -> dict:
+    """Per-event hook array merge — append template entries whose inner
+    `command` strings aren't already present (mirror of install.py)."""
+    out = dict(user_hooks)
+    for event, t_entries in template_hooks.items():
+        if event not in out:
+            out[event] = list(t_entries)
+            continue
+        u_entries = out[event] if isinstance(out[event], list) else []
+        existing_cmds: set = set()
+        for entry in u_entries:
+            if not isinstance(entry, dict):
+                continue
+            for h in entry.get("hooks", []):
+                if isinstance(h, dict) and h.get("command"):
+                    existing_cmds.add(h["command"])
+        merged_entries = list(u_entries)
+        for t_entry in t_entries:
+            if not isinstance(t_entry, dict):
+                continue
+            t_cmds = [
+                h.get("command")
+                for h in t_entry.get("hooks", [])
+                if isinstance(h, dict) and h.get("command")
+            ]
+            if t_cmds and all(c in existing_cmds for c in t_cmds):
+                continue
+            merged_entries.append(t_entry)
+        out[event] = merged_entries
+    return out
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point (Rust subprocess interface)
 # ---------------------------------------------------------------------------
 
@@ -1332,6 +2555,105 @@ def _cmd_migrate_collections(args: argparse.Namespace) -> int:
     return 1 if result["errors"] else 0
 
 
+def _cmd_bootstrap_collections(args: argparse.Namespace) -> int:
+    """`bootstrap-collections --name <n> [--weaviate-url <url>] [--dry-run]
+    [--kg-only] [--project-folder <path>] --json`
+
+    POSTs Weaviate schema for `<sanitized>_KnowledgeGraph` and
+    `<sanitized>_Development` (and the shared KG). Idempotent.
+
+    Exit 0 on success (including soft-fail with deferral). Exit 1 only
+    when individual collection POSTs failed AND the function couldn't
+    soft-recover. Weaviate-down + restart-fail is treated as a deferred
+    success (exit 0 with `deferred: true`) so launcher project-create
+    never blocks.
+    """
+    project_folder = (
+        Path(args.project_folder).resolve() if args.project_folder else None
+    )
+    result = bootstrap_collections(
+        args.name,
+        weaviate_url=args.weaviate_url,
+        dry_run=bool(args.dry_run),
+        kg_only=bool(args.kg_only),
+        project_folder=project_folder,
+    )
+    if args.json:
+        print(json.dumps(result))
+    else:
+        print(f"weaviate_reachable: {result['weaviate_reachable']}")
+        print(f"deferred: {result['deferred']}")
+        for a in result["actions"]:
+            print(f"  {a['action']:13s} {a['collection']}  ok={a['ok']}")
+        for err in result["errors"]:
+            print(f"  ERROR {err['collection']}: {err['error']}")
+    # Soft-fail policy: deferred path returns success so create_project_v2
+    # doesn't propagate it as a hard error. Hard errors only when there
+    # were per-collection failures we couldn't defer.
+    return 1 if result["errors"] else 0
+
+
+def _cmd_install_bundle(args: argparse.Namespace) -> int:
+    """`install-bundle --folder <path> [--orchestrator-root <path>]
+    [--update] [--force] [--dry-run] [--project-folder <path>] --json`
+
+    Copies `templates/` + `infrastructure/` into the user project folder.
+    See `install_project_bundle` for full semantics.
+
+    Exit 0 on clean install (including update with deferred entries).
+    Exit 1 when at least one file failed to write or the manifest write
+    failed.
+
+    `--project-folder` is accepted as an alias / explicit form of
+    `--folder` for symmetry with the bootstrap subcommand. If both are
+    given they must match.
+    """
+    folder = Path(args.folder).resolve()
+    if args.project_folder:
+        explicit = Path(args.project_folder).resolve()
+        if explicit != folder:
+            print(
+                f"error: --folder ({folder}) and --project-folder ({explicit}) "
+                "must refer to the same path",
+                file=sys.stderr,
+            )
+            return 2
+
+    orchestrator_root = (
+        Path(args.orchestrator_root).resolve() if args.orchestrator_root else None
+    )
+    result = install_project_bundle(
+        folder,
+        orchestrator_root=orchestrator_root,
+        update_mode=bool(args.update),
+        force=bool(args.force),
+        dry_run=bool(args.dry_run),
+    )
+    if args.json:
+        print(json.dumps(result))
+    else:
+        print(f"folder: {result['folder']}")
+        print(f"orchestrator_root: {result['orchestrator_root']}")
+        print(f"update_mode: {result['update_mode']}  dry_run: {result['dry_run']}")
+        for category, paths in result["actions"].items():
+            if not paths:
+                continue
+            print(f"  {category} ({len(paths)}):")
+            for p in paths[:8]:
+                print(f"    {p}")
+            if len(paths) > 8:
+                print(f"    ... +{len(paths) - 8} more")
+        if result["settings_action"]:
+            print(f"  settings.json: {result['settings_action']}")
+        if result["manifest_written"]:
+            print(f"  manifest written: .claude/.vco-manifest.json")
+        for w in result["warnings"]:
+            print(f"  WARNING {w}")
+        for err in result["errors"]:
+            print(f"  ERROR {err.get('path', '?')}: {err['error']}")
+    return 1 if result["errors"] else 0
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m vco_lib.project_init",
@@ -1384,6 +2706,90 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Emit a single JSON object on stdout.",
     )
     p_migrate.set_defaults(func=_cmd_migrate_collections)
+
+    # bootstrap-collections (PR 4) ---------------------------------------
+    p_bootstrap = sub.add_parser(
+        "bootstrap-collections",
+        help=(
+            "POST Weaviate schema for the per-project KG/Dev/Shared "
+            "collections. Idempotent. Soft-fails on Weaviate-down "
+            "(podman start retry, then deferral .md). Used by launcher "
+            "create_project_v2."
+        ),
+    )
+    p_bootstrap.add_argument(
+        "--name", required=True,
+        help="Project name (raw; sanitization applied internally).",
+    )
+    p_bootstrap.add_argument(
+        "--weaviate-url", default=None,
+        help="Override Weaviate URL (default: WEAVIATE_URL env or "
+             "http://localhost:8081).",
+    )
+    p_bootstrap.add_argument(
+        "--dry-run", action="store_true",
+        help="Plan only, no Weaviate mutations.",
+    )
+    p_bootstrap.add_argument(
+        "--kg-only", action="store_true",
+        help="Skip the per-project Development collection. Shared KG is "
+             "still created (every project depends on read access).",
+    )
+    p_bootstrap.add_argument(
+        "--project-folder", default=None,
+        help="Path to the user-project folder. When set, "
+             "Weaviate-unreachable conditions emit a deferral entry to "
+             "<folder>/.claude/context/UPDATE_DEFERRED.md.",
+    )
+    p_bootstrap.add_argument(
+        "--json", action="store_true",
+        help="Emit a single JSON object on stdout.",
+    )
+    p_bootstrap.set_defaults(func=_cmd_bootstrap_collections)
+
+    # install-bundle (PR 4) ----------------------------------------------
+    p_bundle = sub.add_parser(
+        "install-bundle",
+        help=(
+            "Copy hooks/scripts/agents/skills/settings/infrastructure "
+            "into a user-project folder. Manifest-driven on --update. "
+            "Used by launcher create_project_v2 + (PR 5) update_project_v2."
+        ),
+    )
+    p_bundle.add_argument(
+        "--folder", required=True,
+        help="Target user-project folder (must exist).",
+    )
+    p_bundle.add_argument(
+        "--orchestrator-root", default=None,
+        help="Orchestrator clone root (source of truth for templates/ + "
+             "infrastructure/). Default: walk up from this module looking "
+             "for vct-module.json.",
+    )
+    p_bundle.add_argument(
+        "--update", action="store_true",
+        help="Manifest-driven update mode: hash-based drift detection, "
+             "preserves user-modified files, emits deferral entries.",
+    )
+    p_bundle.add_argument(
+        "--force", action="store_true",
+        help="In update mode: overwrite user-modified files anyway. "
+             "No-op without --update.",
+    )
+    p_bundle.add_argument(
+        "--dry-run", action="store_true",
+        help="Enumerate + classify without filesystem mutations.",
+    )
+    p_bundle.add_argument(
+        "--project-folder", default=None,
+        help="Alias / explicit form of --folder (kept for symmetry with "
+             "bootstrap-collections). If both are given they must match.",
+    )
+    p_bundle.add_argument(
+        "--json", action="store_true",
+        help="Emit a single JSON object on stdout.",
+    )
+    p_bundle.set_defaults(func=_cmd_install_bundle)
 
     return parser
 
