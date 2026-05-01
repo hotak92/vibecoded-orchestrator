@@ -59,13 +59,18 @@ detection + per-file upsert in `sync_knowledge_graph.py`).
 
 ## Default behaviour
 
-- **Opt-IN by default.** Every project tri-write block (VS Code settings,
+- **Read is unconditional.** Every project tri-write block (VS Code settings,
   `.claude/env`, `.claude/settings.json`) carries
-  `SHARED_KG_COLLECTION=VibeCodedTools_KnowledgeGraph` and
-  `SHARED_KG_OPT_OUT=false`.
-- **Per-project opt-out.** Setting `SHARED_KG_OPT_OUT=true` in any of the three
-  surfaces zeroes `SHARED_KG_COLLECTION` for that project's MCP server, so
-  `hybrid_search` / `semantic_graph_search` query only the per-project KG.
+  `SHARED_KG_COLLECTION=VibeCodedTools_KnowledgeGraph` and the MCP server's
+  read paths (`hybrid_search`, `semantic_graph_search`) ALWAYS include it.
+  This is non-negotiable: knowledge accumulation across projects is the
+  headline value prop of the orchestrator.
+- **Asymmetric write gate (since 2026-05-01).** Setting
+  `SHARED_KG_WRITE_DISABLED=true` refuses `store_knowledge_node(scope="shared")`
+  calls from THIS project with a clear error. Reads stay on. Legacy alias
+  `SHARED_KG_OPT_OUT` kept for ~3 releases as a write-gate fallback (target
+  removal: 2026-08); pre-2026-05-01 the same flag also zeroed reads — that
+  behaviour was retired with the rename.
 
 ## Reading from the shared KG
 

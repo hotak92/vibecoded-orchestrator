@@ -92,9 +92,22 @@ class DeriveProjectCollectionNamesTests(unittest.TestCase):
                 "development_collection": "VideoFrames_Development",
                 "project_name": "VideoFrames",
                 "shared_kg_collection": "VibeCodedTools_KnowledgeGraph",
+                "shared_kg_write_disabled": "false",
                 "kg_basename": "VideoFrames",
             },
         )
+
+    def test_shared_kg_write_disabled_default_false(self):
+        """The per-project shared-KG write gate defaults to 'false' (writes
+        allowed). Spec'd as a string because the value is propagated through
+        4 env surfaces verbatim — keep one canonical type."""
+        for name in ("VideoFrames", "my-project", "Acme Corp"):
+            self.assertEqual(
+                project_init.derive_project_collection_names(name)[
+                    "shared_kg_write_disabled"
+                ],
+                "false",
+            )
 
     def test_project_name_is_raw_not_sanitized(self):
         # project_name field must preserve the user's input verbatim,
@@ -190,6 +203,7 @@ class CliEntryPointTests(unittest.TestCase):
         self.assertEqual(payload["development_collection"], "VideoFrames_Development")
         self.assertEqual(payload["project_name"], "VideoFrames")
         self.assertEqual(payload["shared_kg_collection"], "VibeCodedTools_KnowledgeGraph")
+        self.assertEqual(payload["shared_kg_write_disabled"], "false")
         self.assertEqual(payload["kg_basename"], "VideoFrames")
 
     def test_derive_human_readable_without_json(self):
