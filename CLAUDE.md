@@ -596,6 +596,23 @@ read_document("/path/to/large_file.py", task="find the authentication logic")  #
 
 ---
 
+## Update flow
+
+Two distinct "update" actions live in the launcher:
+
+- **Update orchestrator** (Settings → Updates) — `git pull` + `install.py --update` against the orchestrator clone itself. Refreshes the global venv, the orchestrator's own hooks/MCP servers, the templates folder.
+- **Update bundle** (per-project Settings page → "Update bundle" button) — propagates newly-shipped orchestrator files to ONE existing user project without overwriting user customizations. Backed by `update_project_v2` Tauri command → `python -m vco_lib.project_init install-bundle --update`. PR 5 (2026-05-01).
+
+The "Update bundle" path is manifest-driven via `<project>/.claude/.vco-manifest.json`:
+- New shipped file → created in the project.
+- Installed file matches the manifest's prior-shipped hash (= user untouched) → overwritten with the new shipped version.
+- Installed file differs from the manifest's prior-shipped hash (= user-modified) → preserved on disk; `bundle_user_modified_preserved` deferral entry written to `<project>/.claude/context/UPDATE_DEFERRED.md` listing each preserved file + the explicit `--force` command to accept the orchestrator's defaults.
+- Schema drift detected (Weaviate target schema differs from on-disk) → `schema_migration_required` deferral entry; the destructive migration is NOT auto-applied. Requires explicit consent via `python -m vco_lib.project_init migrate-collections --name <project>`.
+
+The toast summarises the result ("5 files updated, 2 user-modifications preserved"). Soft-fail throughout: subprocess errors flow through warnings, never block.
+
+---
+
 ## Quick Reference
 
 - Start: read `.claude/CONTEXT_STATE.md`.

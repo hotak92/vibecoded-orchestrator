@@ -5,12 +5,18 @@
   import { invoke } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
   import Toast from '$lib/components/Toast.svelte';
+  import { projects } from '$lib/stores/projects';
   import type { ProjectView, RenameProjectResult } from '$lib/types/launcher';
 
   let projectId = $derived($page.params.id);
   let project = $state<ProjectView | null>(null);
   let newName = $state('');
   let saving = $state(false);
+  // PR 5 (2026-05-01): "Update bundle" button — re-runs the per-project
+  // bundle install in update mode. Subprocess can take 5-15s (Python
+  // startup + file copies + Weaviate probe), so we lock the button while
+  // it's in flight and toast the one-line summary on completion.
+  let updating = $state(false);
 
   // Env vars: stored in module install rows? We don't have a single-project
   // env API yet — expose via the project_state secret_refs path for guidance
@@ -44,6 +50,31 @@
       toast.error(e);
     } finally {
       saving = false;
+    }
+  }
+
+  /**
+   * PR 5 (2026-05-01): re-run the per-project bundle install in update
+   * mode. Picks up new orchestrator-shipped files (hooks, scripts,
+   * agents, skills, settings, infrastructure) without overwriting user
+   * customizations. The store handles toasts for the per-action summary
+   * + every deferral / file error.
+   */
+  async function updateBundle() {
+    if (!project || updating) return;
+    updating = true;
+    try {
+      // The store's `update` toasts the summary + warnings; we just
+      // refresh the local copy after it returns. Errors thrown by the
+      // invoke (project not in DB, folder gone) are caught here and
+      // surfaced as their own error toast — soft-fail conditions never
+      // throw; they flow through `result.warnings`.
+      const result = await projects.update(project.id);
+      project = result.project;
+    } catch (e) {
+      toast.error(`Update bundle failed: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      updating = false;
     }
   }
 
@@ -83,6 +114,21 @@
         </div>
         <button class="ps-btn-primary" onclick={rename} disabled={saving || newName === project.name}>
           {saving ? 'Saving…' : 'Save name'}
+        </button>
+      </section>
+
+      <section class="ps-section">
+        <h2>Bundle</h2>
+        <p class="ps-hint">
+          Re-run the per-project bundle install to pick up newly-shipped orchestrator files
+          (hooks, scripts, agents, skills, infrastructure) WITHOUT overwriting your
+          customizations. Files you've edited are preserved and listed in
+          <code>.claude/context/UPDATE_DEFERRED.md</code> with a
+          <code>bundle_user_modified_preserved</code> entry. The bundle install can take
+          5–15 seconds.
+        </p>
+        <button class="ps-btn-primary" onclick={updateBundle} disabled={updating}>
+          {updating ? 'Updating bundle…' : 'Update bundle'}
         </button>
       </section>
 
