@@ -75,6 +75,49 @@ export interface RenameProjectResult {
   warnings: string[];
 }
 
+/**
+ * Mirror of Rust `UpdateSummary` (commands/projects_v2.rs).
+ *
+ * PR 5 (2026-05-01): per-action counts produced by the bundle install
+ * during an `update_project_v2` run. Drives the toast summary line
+ * ("5 files updated, 2 user-modifications preserved") plus optional
+ * detail breakdowns. Field naming mirrors the Rust struct (snake_case).
+ */
+export interface UpdateSummary {
+  /** Newly-shipped orchestrator files that didn't exist before. */
+  created: number;
+  /** Files whose installed content matched the prior-shipped manifest hash;
+   *  now overwritten with the new shipped version. */
+  overwritten: number;
+  /** Files where installed content diverged from the prior-shipped hash
+   *  (= user-modified). Preserved on disk; surfaced via the
+   *  `bundle_user_modified_preserved` deferral entry. */
+  preserved: number;
+  /** Files whose installed content already matches what we'd write. */
+  noop: number;
+  /** Files unconditionally overwritten (not user-customisable, e.g.
+   *  `.claude/hooks/_lib/*`). */
+  always_overwritten: number;
+  /** First-install only — always 0 in update mode (kept for symmetry). */
+  skipped_existing: number;
+  /** Number of `errors[]` entries in the JSON envelope (per-file write
+   *  failures). Each is also surfaced as a string in `warnings`. */
+  errors_count: number;
+}
+
+/**
+ * Mirror of Rust `UpdateProjectResult` (commands/projects_v2.rs).
+ *
+ * PR 5 (2026-05-01): structured envelope for the launcher's "Update bundle"
+ * action. `warnings` flow as toasts; `summary` drives the one-line summary
+ * toast.
+ */
+export interface UpdateProjectResult {
+  project: ProjectView;
+  warnings: string[];
+  summary: UpdateSummary;
+}
+
 export interface TierCacheView {
   orchestrator_tier: LicenseTier | string;
   module_licenses: Record<string, unknown>;
