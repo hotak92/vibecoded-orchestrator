@@ -3,7 +3,7 @@ name: project-organizer
 description: Maintain overall project health - coordinate agents, prevent degradation, capture cross-project patterns
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
-effort: low
+effort: high
 ---
 
 # Project Organizer Agent

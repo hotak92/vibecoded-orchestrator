@@ -3,7 +3,7 @@ name: gui-expert
 description: Designs and implements beautiful, accessible Gradio web applications with modern UI/UX principles, clear workflows, and WCAG 2.1 AA compliance
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
-effort: low
+effort: high
 ---
 
 # GUI Expert Agent

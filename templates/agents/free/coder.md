@@ -3,7 +3,7 @@ name: coder
 description: Writes clean, explicit, production-ready code following specifications and leveraging proven patterns
 tools: Read, Write, Edit, Grep, Glob, Bash
 model: sonnet
-effort: low
+effort: high
 isolation: worktree
 mcpServers:
   orchestrator-tools:

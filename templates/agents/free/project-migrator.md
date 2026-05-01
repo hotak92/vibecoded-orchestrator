@@ -3,7 +3,7 @@ name: project-migrator
 description: Migrates existing Claude Code projects to VibeCoded Orchestrator workflow system
 tools: Read, Write, Edit, Glob, Bash, Task, AskUserQuestion
 model: sonnet
-effort: low
+effort: high
 ---
 
 # Project Migrator Agent
