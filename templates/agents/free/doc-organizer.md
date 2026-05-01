@@ -3,7 +3,7 @@ name: doc-organizer
 description: Organize documentation - prevent duplicates, maintain folder structure, archive old docs, keep root clean
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
-effort: low
+effort: high
 ---
 
 # Doc Organizer Agent

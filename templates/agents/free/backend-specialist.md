@@ -3,7 +3,7 @@ name: backend-specialist
 description: Backend implementation - APIs, services, databases, business logic
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
-effort: low
+effort: high
 isolation: worktree
 skills:
   - api-designer
