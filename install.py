@@ -4363,23 +4363,22 @@ def _ensure_collections(embed_config: dict,
     #   1. KG_COLLECTION env var (Claude Code workspace override)
     #   2. Adopt mode: derive from project basename (don't pollute with
     #      bare `KnowledgeGraph`)
-    #   3. Otherwise: bare default (we own the Weaviate)
+    #   3. Otherwise: derive from PROJECT_ROOT basename. Pre-2026-05-01 this
+    #      branch hardcoded bare `"KnowledgeGraph"` / `"Development"`, which
+    #      collided with sibling installs and silently routed writes to
+    #      collections shared across every vco install on the same Weaviate.
     env_kg = os.environ.get("KG_COLLECTION")
     if env_kg:
         kg_name = env_kg
-    elif adopt_mode:
-        kg_name = _derive_project_kg_name(PROJECT_ROOT)
     else:
-        kg_name = "KnowledgeGraph"
+        kg_name = _derive_project_kg_name(PROJECT_ROOT)
 
     # Per-project Development collection: same logic.
     env_dev = os.environ.get("DEVELOPMENT_COLLECTION")
     if env_dev:
         dev_name = env_dev
-    elif adopt_mode:
-        dev_name = _derive_project_dev_name(PROJECT_ROOT)
     else:
-        dev_name = "Development"
+        dev_name = _derive_project_dev_name(PROJECT_ROOT)
 
     # Cross-project shared KG. All vibecoded installs read from the same shared
     # collection name (default "VibeCodedTools_KnowledgeGraph"); the projects
