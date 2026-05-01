@@ -55,6 +55,37 @@ pub struct CreateProjectResult {
     pub warnings: Vec<String>,
 }
 
+/// Result returned by `rename_project_v2`.
+///
+/// HIGH-7 (2026-05-01): mirrors `CreateProjectResult` so rename can surface
+/// env-write failures to the UI instead of swallowing them via eprintln.
+/// Without this, a rename whose env refresh fails silently leaves all 4
+/// surfaces stale until the user manually re-runs setup.
+#[derive(Debug, Clone, Serialize)]
+pub struct RenameProjectResult {
+    pub project: ProjectView,
+    /// Non-fatal warnings (e.g. env refresh failed, .env stale).
+    /// Empty on a clean rename.
+    pub warnings: Vec<String>,
+}
+
+/// MEDIUM-1 (2026-05-01): sentinel module_id used for project-level settings
+/// stored in the `module_settings` k/v table. Settings under this id apply
+/// to the project itself rather than any installed module.
+pub const PROJECT_SETTINGS_MODULE_ID: &str = "__project__";
+
+/// MEDIUM-1: setting key for the per-project SHARED_KG_OPT_OUT toggle. When
+/// `true`, the project's env surfaces are written with `SHARED_KG_OPT_OUT=true`,
+/// which the MCP server reads to skip the cross-project shared KG.
+pub const SETTING_KEY_SHARED_KG_OPT_OUT: &str = "shared_kg_opt_out";
+
+/// Read the current SHARED_KG_OPT_OUT toggle from the DB. Defaults to `false`
+/// (opt-in to shared KG) when no row exists.
+pub fn get_shared_kg_opt_out(db: &Db, project_id: &str) -> Result<bool, String> {
+    let val = db.get_setting(project_id, PROJECT_SETTINGS_MODULE_ID, SETTING_KEY_SHARED_KG_OPT_OUT)?;
+    Ok(val.and_then(|v| v.as_bool()).unwrap_or(false))
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SwitchHostResult {
     pub project: ProjectView,
@@ -142,7 +173,11 @@ pub async fn create_project_v2(
     // `.claude/settings.json` env block (CLI + Desktop app + VS Code).
     // We swallow individual errors here: create_project must not fail
     // just because the user's folder is read-only or mid-edit.
-    if let Err(e) = write_project_env_files(folder, &req.name) {
+    // MEDIUM-1: read the persisted SHARED_KG_OPT_OUT toggle for this project
+    // so the env files reflect it. Newly-created projects will not have a row
+    // yet → defaults to false (opt-in).
+    let opt_out = get_shared_kg_opt_out(&db, &row.id).unwrap_or(false);
+    if let Err(e) = write_project_env_files(folder, &req.name, Some(opt_out)) {
         // B10 (2026-05-01): surface env-write failures to the UI instead of
         // silent eprintln. Project creation still succeeds; the UI should show
         // a warning toast so the user knows manual env setup is required.
@@ -269,7 +304,17 @@ pub async fn create_project_v2(
 ///
 /// Returns Ok(()) only when ALL succeed; the caller currently logs and
 /// swallows the error so project creation never fails over an env file.
-pub fn write_project_env_files(folder: &Path, project_name: &str) -> Result<(), String> {
+///
+/// MEDIUM-1 (2026-05-01): `shared_kg_opt_out` is now plumbed through.
+/// `None` keeps the legacy behaviour (writes "false"); `Some(b)` writes the
+/// caller-supplied bool. The DB-resolved value should be passed by callers
+/// that have a `Db` handle (`create_project_v2`, `rename_project_v2`,
+/// `set_shared_kg_opt_out`); test callers can keep passing `None`.
+pub fn write_project_env_files(
+    folder: &Path,
+    project_name: &str,
+    shared_kg_opt_out: Option<bool>,
+) -> Result<(), String> {
     let kg_basename = sanitize_kg_collection(project_name);
     // Suffix the basename to match `.env` (line ~458) and the rest of the
     // ecosystem. Pre-2026-05-01 the three Claude Code env surfaces wrote
@@ -291,9 +336,10 @@ pub fn write_project_env_files(folder: &Path, project_name: &str) -> Result<(), 
     // disables it for THIS project without affecting others.
     let shared_kg_collection = "VibeCodedTools_KnowledgeGraph";
     // Default: opt-IN. Users who want a sandboxed project flip this via the
-    // launcher Preferences toggle (which re-runs write_project_env_files
-    // with opt_out=true).
-    let shared_kg_opt_out = "false";
+    // launcher Preferences toggle (set_shared_kg_opt_out command, which
+    // persists to the project-settings k/v table and re-runs
+    // write_project_env_files with the new value).
+    let shared_kg_opt_out = if shared_kg_opt_out.unwrap_or(false) { "true" } else { "false" };
 
     // VS Code path (extension reads claude-code.env).
     //
@@ -716,7 +762,7 @@ pub async fn rename_project_v2(
     id: String,
     new_name: String,
     db: State<'_, Db>,
-) -> Result<ProjectView, String> {
+) -> Result<RenameProjectResult, String> {
     // Generate a fresh slug derived from the new name so URLs track
     // renames. The old slug becomes invalid; existing bookmarks 404
     // gracefully via the /p/[slug] resolver. Documented in
@@ -727,6 +773,7 @@ pub async fn rename_project_v2(
         .get_project(&id)?
         .ok_or_else(|| format!("project {} not found after rename", id))?;
     let count = db.list_module_installs_for_project(&id)?.len() as u32;
+    let mut warnings: Vec<String> = Vec::new();
 
     // B9 (2026-05-01): re-run env writers after DB rename so all 4 surfaces
     // reflect the new KG_COLLECTION, DEVELOPMENT_COLLECTION, PROJECT_NAME.
@@ -734,8 +781,19 @@ pub async fn rename_project_v2(
     // KG_COLLECTION values in .claude/env, .vscode/settings.json, and
     // .claude/settings.json until the user manually re-ran env setup.
     let folder = Path::new(&row.folder_path);
-    if let Err(e) = write_project_env_files(folder, &new_name) {
-        eprintln!("[vct] warning: rename env refresh (write_project_env_files) failed for {}: {}", id, e);
+    let opt_out = get_shared_kg_opt_out(&db, &id).unwrap_or(false);
+    // HIGH-7 (2026-05-01): env-write failures now surface as structured
+    // warnings instead of silent eprintln. Without this, a failed env refresh
+    // leaves the project's 4 env surfaces stale until the next launcher
+    // session and the user has no idea anything is wrong.
+    if let Err(e) = write_project_env_files(folder, &new_name, Some(opt_out)) {
+        let msg = format!(
+            "rename env refresh (write_project_env_files) failed: {}. \
+             KG routing for the renamed project may be stale until manual repair.",
+            e
+        );
+        eprintln!("[vct] warning: {}", msg);
+        warnings.push(msg);
     }
     // ensure_project_env_template is append-only, so .env may still carry the
     // old KG_COLLECTION value as an active line. Log a warning when the stale
@@ -743,16 +801,72 @@ pub async fn rename_project_v2(
     if let Ok(env_text) = std::fs::read_to_string(folder.join(".env")) {
         let new_kg = format!("{}_KnowledgeGraph", sanitize_kg_collection(&new_name));
         if !env_text.contains(&format!("KG_COLLECTION={}", new_kg)) {
-            eprintln!(
-                "[vct] warning: .env at {} still contains stale KG_COLLECTION after rename; \
+            let msg = format!(
+                ".env at {} still contains stale KG_COLLECTION after rename; \
                  run repair-env (PR 5) to fix. Expected KG_COLLECTION={}",
                 row.folder_path, new_kg
             );
+            eprintln!("[vct] warning: {}", msg);
+            warnings.push(msg);
         }
     }
 
     let _ = db.log_change("projects", "update", Some(&id), Some(&id));
-    Ok(ProjectView::from_row(row, count))
+    Ok(RenameProjectResult {
+        project: ProjectView::from_row(row, count),
+        warnings,
+    })
+}
+
+/// MEDIUM-1 (2026-05-01): persist the SHARED_KG_OPT_OUT toggle and refresh
+/// all per-project env surfaces so the new value takes effect immediately.
+///
+/// This is the wiring half of the spec; the Svelte UI control is a follow-up.
+#[command]
+pub async fn set_shared_kg_opt_out(
+    project_id: String,
+    opt_out: bool,
+    db: State<'_, Db>,
+) -> Result<RenameProjectResult, String> {
+    let row = db
+        .get_project(&project_id)?
+        .ok_or_else(|| format!("project {} not found", project_id))?;
+    let count = db.list_module_installs_for_project(&project_id)?.len() as u32;
+
+    // Persist to the project-settings k/v table.
+    db.set_setting(
+        &project_id,
+        PROJECT_SETTINGS_MODULE_ID,
+        SETTING_KEY_SHARED_KG_OPT_OUT,
+        &serde_json::Value::Bool(opt_out),
+    )?;
+
+    // Refresh all 4 env surfaces with the new value. Use the same warning
+    // surface as create / rename so the UI can toast on partial failure.
+    let mut warnings: Vec<String> = Vec::new();
+    let folder = Path::new(&row.folder_path);
+    if let Err(e) = write_project_env_files(folder, &row.name, Some(opt_out)) {
+        let msg = format!(
+            "shared-KG opt-out env refresh failed: {}. \
+             Toggle persisted to DB but env files may be stale.",
+            e
+        );
+        eprintln!("[vct] warning: {}", msg);
+        warnings.push(msg);
+    }
+
+    db.audit(
+        "project_shared_kg_opt_out",
+        Some(&project_id),
+        None,
+        &serde_json::json!({ "opt_out": opt_out }),
+    )?;
+    let _ = db.log_change("projects", "update", Some(&project_id), Some(&project_id));
+
+    Ok(RenameProjectResult {
+        project: ProjectView::from_row(row, count),
+        warnings,
+    })
 }
 
 #[command]
@@ -997,7 +1111,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&tmp).unwrap();
 
-        write_project_env_files(&tmp, "My Test").unwrap();
+        write_project_env_files(&tmp, "My Test", None).unwrap();
 
         // 1. VS Code path
         let vscode_settings = tmp.join(".vscode/settings.json");
@@ -1063,7 +1177,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&tmp).unwrap();
 
-        write_project_env_files(&tmp, "VideoFrames").unwrap();
+        write_project_env_files(&tmp, "VideoFrames", None).unwrap();
         ensure_project_env_template(&tmp, "VideoFrames").unwrap();
 
         let env_text = std::fs::read_to_string(tmp.join(".env")).unwrap();
@@ -1107,7 +1221,7 @@ mod tests {
         )
         .unwrap();
 
-        write_project_env_files(&tmp, "MyProject").unwrap();
+        write_project_env_files(&tmp, "MyProject", None).unwrap();
 
         let raw = std::fs::read_to_string(&path).unwrap();
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -1147,7 +1261,7 @@ mod tests {
         )
         .unwrap();
 
-        write_project_env_files(&tmp, "MyProject").unwrap();
+        write_project_env_files(&tmp, "MyProject", None).unwrap();
 
         let raw = std::fs::read_to_string(&path).unwrap();
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -1172,7 +1286,7 @@ mod tests {
         let path = tmp.join(".claude/settings.json");
         std::fs::write(&path, "{ this is not valid json").unwrap();
 
-        write_project_env_files(&tmp, "MyProject").expect("must not crash");
+        write_project_env_files(&tmp, "MyProject", None).expect("must not crash");
 
         let raw = std::fs::read_to_string(&path).unwrap();
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -1250,7 +1364,7 @@ mod tests {
         assert_eq!(row.name, name);
 
         // Mirror the env-file write the real command does.
-        write_project_env_files(&folder, name).expect("env files");
+        write_project_env_files(&folder, name, None).expect("env files");
 
         // The contract: after onboarding, at least one project row
         // exists. The user reported ending up with zero — that's the
@@ -1430,7 +1544,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&tmp).unwrap();
 
-        write_project_env_files(&tmp, "Acme").unwrap();
+        write_project_env_files(&tmp, "Acme", None).unwrap();
         ensure_project_env_template(&tmp, "Acme").unwrap();
 
         // .env
@@ -1498,11 +1612,11 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
 
         // Initial create
-        write_project_env_files(&tmp, "FooBar").unwrap();
+        write_project_env_files(&tmp, "FooBar", None).unwrap();
         ensure_project_env_template(&tmp, "FooBar").unwrap();
 
         // Simulate rename — re-run env writers with new name.
-        write_project_env_files(&tmp, "BazQux").unwrap();
+        write_project_env_files(&tmp, "BazQux", None).unwrap();
 
         // VS Code surface
         let vsc: serde_json::Value = serde_json::from_str(
@@ -1546,7 +1660,7 @@ mod tests {
         std::fs::write(tmp.join(".env"), "KG_COLLECTION=KnowledgeGraph\nMY_VAR=hello\n").unwrap();
 
         // Run env writers (as create_project_v2 does).
-        write_project_env_files(&tmp, "Acme").unwrap();
+        write_project_env_files(&tmp, "Acme", None).unwrap();
         // ensure_project_env_template is append-only; it will not overwrite the stale line.
         ensure_project_env_template(&tmp, "Acme").unwrap();
 
@@ -1587,7 +1701,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&tmp).unwrap();
 
-        write_project_env_files(&tmp, "Acme").unwrap();
+        write_project_env_files(&tmp, "Acme", None).unwrap();
 
         // .vscode/settings.json — Rust does not inject GRPC_PORT here.
         let vsc: serde_json::Value = serde_json::from_str(
@@ -1602,5 +1716,128 @@ mod tests {
                 ".claude/env must not contain GRPC_PORT");
 
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// MEDIUM-1: SHARED_KG_OPT_OUT toggle round-trip. Set the toggle, then
+    /// re-render env surfaces and verify all 4 reflect the new value.
+    /// (`.env` is owned by ensure_project_env_template — it doesn't carry
+    /// SHARED_KG_OPT_OUT, so the relevant surfaces here are the 3 written by
+    /// write_project_env_files.)
+    #[test]
+    fn shared_kg_opt_out_toggle_flips_all_env_surfaces() {
+        let tmp = std::env::temp_dir().join(format!(
+            "vct-medium1-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Default (None / false) → SHARED_KG_OPT_OUT="false" everywhere.
+        write_project_env_files(&tmp, "Acme", None).unwrap();
+        let read_all = || -> (String, String, String) {
+            let vsc: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(tmp.join(".vscode/settings.json")).unwrap(),
+            ).unwrap();
+            let cs: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(tmp.join(".claude/settings.json")).unwrap(),
+            ).unwrap();
+            let env_sh = std::fs::read_to_string(tmp.join(".claude/env")).unwrap();
+            (
+                vsc["claude-code.env"]["SHARED_KG_OPT_OUT"].as_str().unwrap().to_string(),
+                cs["env"]["SHARED_KG_OPT_OUT"].as_str().unwrap().to_string(),
+                env_sh,
+            )
+        };
+
+        let (a, b, c) = read_all();
+        assert_eq!(a, "false");
+        assert_eq!(b, "false");
+        assert!(c.contains(r#"export SHARED_KG_OPT_OUT="false""#));
+
+        // Flip to true.
+        write_project_env_files(&tmp, "Acme", Some(true)).unwrap();
+        let (a, b, c) = read_all();
+        assert_eq!(a, "true");
+        assert_eq!(b, "true");
+        assert!(c.contains(r#"export SHARED_KG_OPT_OUT="true""#));
+        assert!(!c.contains(r#"export SHARED_KG_OPT_OUT="false""#));
+
+        // Flip back to false.
+        write_project_env_files(&tmp, "Acme", Some(false)).unwrap();
+        let (a, b, c) = read_all();
+        assert_eq!(a, "false");
+        assert_eq!(b, "false");
+        assert!(c.contains(r#"export SHARED_KG_OPT_OUT="false""#));
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// MEDIUM-1: get_shared_kg_opt_out reads the persisted toggle, defaulting
+    /// to false on a project with no row. The DB k/v round-trip exercises the
+    /// `module_settings` table with the `__project__` sentinel module_id.
+    #[test]
+    fn shared_kg_opt_out_db_roundtrip() {
+        let db = Db::open_in_memory().unwrap();
+        let pid = uuid::Uuid::new_v4().to_string();
+        db.insert_project(
+            &pid,
+            "Acme",
+            "/tmp/acme",
+            ProjectHost::Base,
+            "acme",
+        ).unwrap();
+
+        // Default: no row → false.
+        assert_eq!(get_shared_kg_opt_out(&db, &pid).unwrap(), false);
+
+        // Persist true.
+        db.set_setting(
+            &pid,
+            PROJECT_SETTINGS_MODULE_ID,
+            SETTING_KEY_SHARED_KG_OPT_OUT,
+            &serde_json::Value::Bool(true),
+        ).unwrap();
+        assert_eq!(get_shared_kg_opt_out(&db, &pid).unwrap(), true);
+
+        // Flip to false.
+        db.set_setting(
+            &pid,
+            PROJECT_SETTINGS_MODULE_ID,
+            SETTING_KEY_SHARED_KG_OPT_OUT,
+            &serde_json::Value::Bool(false),
+        ).unwrap();
+        assert_eq!(get_shared_kg_opt_out(&db, &pid).unwrap(), false);
+    }
+
+    /// HIGH-7: when write_project_env_files fails (folder gone / unwritable),
+    /// the failure is captured as a structured warning rather than swallowed
+    /// via eprintln. We exercise the helper directly: a non-existent parent
+    /// directory makes the inner mkdir fail, returning Err — which the
+    /// rename_project_v2 caller turns into a `RenameProjectResult.warnings`
+    /// entry.
+    #[test]
+    fn rename_env_refresh_failure_surfaces_as_warning() {
+        // Folder that doesn't exist AND whose parent doesn't exist either,
+        // forcing mkdir(.vscode) to fail.
+        let bogus = std::path::PathBuf::from("/nonexistent-vct-test-root-9d1f7a/sub/proj");
+        let res = write_project_env_files(&bogus, "Acme", Some(false));
+        assert!(res.is_err(),
+                "write_project_env_files must fail under a non-existent root");
+
+        // Mirror the rename_project_v2 surface logic to confirm the Err is
+        // captured (the public command needs a Db state, so we exercise the
+        // warning-construction path here).
+        let mut warnings: Vec<String> = Vec::new();
+        if let Err(e) = res {
+            let msg = format!(
+                "rename env refresh (write_project_env_files) failed: {}. \
+                 KG routing for the renamed project may be stale until manual repair.",
+                e
+            );
+            warnings.push(msg);
+        }
+        assert_eq!(warnings.len(), 1,
+                   "RenameProjectResult.warnings must capture the env-refresh failure");
+        assert!(warnings[0].contains("rename env refresh"),
+                "warning must identify the failing surface: {:?}", warnings[0]);
     }
 }

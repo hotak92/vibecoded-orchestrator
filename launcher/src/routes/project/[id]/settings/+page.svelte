@@ -5,7 +5,7 @@
   import { invoke } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
   import Toast from '$lib/components/Toast.svelte';
-  import type { ProjectView } from '$lib/types/launcher';
+  import type { ProjectView, RenameProjectResult } from '$lib/types/launcher';
 
   let projectId = $derived($page.params.id);
   let project = $state<ProjectView | null>(null);
@@ -32,11 +32,13 @@
     if (!newName.trim() || !project) return;
     saving = true;
     try {
-      const updated = await invoke<ProjectView>('rename_project_v2', {
+      // HIGH-7: rename_project_v2 returns RenameProjectResult { project, warnings }.
+      const result = await invoke<RenameProjectResult>('rename_project_v2', {
         id: project.id,
         newName: newName.trim(),
       });
-      project = updated;
+      project = result.project;
+      for (const w of result.warnings) toast.error(w);
       toast.success('Renamed');
     } catch (e) {
       toast.error(e);
