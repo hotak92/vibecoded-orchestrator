@@ -109,7 +109,9 @@ def prompt_consent_if_needed(*, force: bool = False) -> Dict[str, Any]:
 
     Returns the consent dict that was ultimately persisted.
     """
-    env_opt_out = os.environ.get("VIBECODED_TELEMETRY", "").strip().lower()
+    # B7 (2026-05-01): VCT_TELEMETRY is canonical; VIBECODED_TELEMETRY is a
+    # read-time alias kept for ~3 releases of back-compat. Prefer canonical.
+    env_opt_out = (os.environ.get("VCT_TELEMETRY") or os.environ.get("VIBECODED_TELEMETRY", "")).strip().lower()
     if env_opt_out in ("false", "0", "no", "off"):
         consent = _default_consent(accept_optin=False)
         _save_consent(consent)
