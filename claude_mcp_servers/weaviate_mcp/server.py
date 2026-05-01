@@ -143,7 +143,11 @@ VECTOR_SCHEMES: dict[str, dict[str, int]] = {
 CODE_SCHEME_COLLECTIONS = {
     "CodeModule", "CodeClass", "CodeFunction", "CodeAPI", "CodeInteraction",
 }
-GRPC_PORT = int(os.getenv("GRPC_PORT", "50052"))
+# B8 (2026-05-01): WEAVIATE_GRPC_PORT is canonical (VCT prefix convention,
+# matches install.py:5179 .env key). GRPC_PORT is the legacy .claude/settings.json
+# key (install.py:5301) kept as a read-time alias for back-compat. Prefer
+# WEAVIATE_GRPC_PORT when both are set.
+GRPC_PORT = int(os.getenv("WEAVIATE_GRPC_PORT", "").strip() or os.getenv("GRPC_PORT", "").strip() or "50052")
 
 # Node formats sidecar — pre-generated descriptions/summaries for progressive disclosure.
 # Loaded lazily on first use. Maps file_path → {title, description, summary, generated_at}.

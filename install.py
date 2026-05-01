@@ -5316,7 +5316,10 @@ def _write_env_config(embed_config: dict, args: argparse.Namespace, joern_availa
     lines.extend([
         "# Anonymous telemetry (default: off — README promise)",
         "# Set to 'true' to enable; collector + uploader both honour this.",
-        f"VIBECODED_TELEMETRY={'true' if telemetry_enabled else 'false'}",
+        # B7 (2026-05-01): canonical key is VCT_TELEMETRY (matches template at
+        # line ~4986 and Rust). VIBECODED_TELEMETRY remains as a read-time alias
+        # in the telemetry module for ~3 releases of back-compat.
+        f"VCT_TELEMETRY={'true' if telemetry_enabled else 'false'}",
         "",
     ])
 
@@ -5379,6 +5382,11 @@ def _configure_claude_settings(embed_config: dict) -> None:
     env_block: dict[str, str] = {
         "WEAVIATE_URL": f"http://localhost:{weaviate_port}",
         "OLLAMA_URL": f"http://localhost:{ollama_port}",
+        # B8 (2026-05-01): .claude/settings.json surface uses GRPC_PORT (legacy
+        # alias). Canonical key is WEAVIATE_GRPC_PORT (written to .env at line
+        # ~5178). weaviate_mcp/server.py reads both, prefers WEAVIATE_GRPC_PORT.
+        # Keep GRPC_PORT in this surface for back-compat until all surfaces are
+        # migrated to the canonical key in a future PR.
         "GRPC_PORT": str(weaviate_grpc),
         "EMBEDDING_MODEL": embed_config["text_model"],
         # See note at the .env-write block above. Per-profile slot mapping.
