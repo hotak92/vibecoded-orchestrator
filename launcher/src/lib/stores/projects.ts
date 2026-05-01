@@ -175,16 +175,19 @@ function createProjectsStore() {
     },
 
     /**
-     * MEDIUM-1 (2026-05-01): toggle the project's SHARED_KG_OPT_OUT setting.
+     * MEDIUM-1 (refactored 2026-05-01): toggle the project's
+     * SHARED_KG_WRITE_DISABLED setting. Asymmetric model — gates WRITES
+     * to the cross-project shared KG only; reads remain unconditional.
+     *
      * Persists to DB AND refreshes the 3 launcher-owned env surfaces
-     * (.vscode/settings.json, .claude/env, .claude/settings.json) so the new
-     * value takes effect without a relaunch. The Svelte UI control is a
-     * follow-up — this is just the wiring.
+     * (.vscode/settings.json, .claude/env, .claude/settings.json) so the
+     * new value takes effect without a relaunch. The Svelte UI control
+     * is a follow-up — this is just the wiring.
      */
-    async setSharedKgOptOut(id: string, optOut: boolean): Promise<ProjectView> {
-      const result = await invoke<RenameProjectResult>('set_shared_kg_opt_out', {
+    async setSharedKgWriteDisabled(id: string, writeDisabled: boolean): Promise<ProjectView> {
+      const result = await invoke<RenameProjectResult>('set_shared_kg_write_disabled', {
         projectId: id,
-        optOut,
+        writeDisabled,
       });
       const updated = result.project;
       for (const w of result.warnings) toast.error(w);
@@ -193,6 +196,19 @@ function createProjectsStore() {
         projects: s.projects.map((p) => (p.id === id ? updated : p)),
       }));
       return updated;
+    },
+
+    /**
+     * Deprecated alias of `setSharedKgWriteDisabled`. Kept for ~3 releases
+     * (target removal: 2026-08) so any UI code still calling the old name
+     * keeps working through the rename. Emits a console warning per call.
+     */
+    async setSharedKgOptOut(id: string, optOut: boolean): Promise<ProjectView> {
+      console.warn(
+        '[vct] setSharedKgOptOut is deprecated — use setSharedKgWriteDisabled. ' +
+        'The toggle now gates WRITES only; reads of the shared KG are always on.',
+      );
+      return this.setSharedKgWriteDisabled(id, optOut);
     },
 
     async switchHost(id: string, newHost: ProjectHost): Promise<SwitchHostResult> {

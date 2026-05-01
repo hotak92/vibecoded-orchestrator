@@ -99,4 +99,24 @@ impl Db {
             .map_err(|e| format!("clear settings: {}", e))?;
         Ok(())
     }
+
+    /// Delete a single setting row. Idempotent: returns Ok(()) whether or
+    /// not the row existed. Used by the SHARED_KG_OPT_OUT → SHARED_KG_WRITE_DISABLED
+    /// migration helper to retire the legacy key after copying its value.
+    pub fn delete_setting(
+        &self,
+        project_id: &str,
+        module_id: &str,
+        key: &str,
+    ) -> Result<(), String> {
+        let guard = self.lock();
+        guard
+            .execute(
+                "DELETE FROM module_settings
+                  WHERE project_id = ?1 AND module_id = ?2 AND setting_key = ?3",
+                params![project_id, module_id, key],
+            )
+            .map_err(|e| format!("delete setting: {}", e))?;
+        Ok(())
+    }
 }

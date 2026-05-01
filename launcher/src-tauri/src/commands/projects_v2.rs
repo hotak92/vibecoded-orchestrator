@@ -139,16 +139,91 @@ pub struct UpdateProjectResult {
 /// to the project itself rather than any installed module.
 pub const PROJECT_SETTINGS_MODULE_ID: &str = "__project__";
 
-/// MEDIUM-1: setting key for the per-project SHARED_KG_OPT_OUT toggle. When
-/// `true`, the project's env surfaces are written with `SHARED_KG_OPT_OUT=true`,
-/// which the MCP server reads to skip the cross-project shared KG.
-pub const SETTING_KEY_SHARED_KG_OPT_OUT: &str = "shared_kg_opt_out";
+/// Per-project setting key for the SHARED_KG_WRITE_DISABLED toggle (asymmetric
+/// model since 2026-05-01: gates WRITES to the shared KG; reads are always on).
+/// When `true`, the project's env surfaces carry `SHARED_KG_WRITE_DISABLED=true`,
+/// which the MCP server reads to refuse `store_knowledge_node(scope='shared')`
+/// calls. Reads of the cross-project shared KG remain unconditional.
+pub const SETTING_KEY_SHARED_KG_WRITE_DISABLED: &str = "shared_kg_write_disabled";
 
-/// Read the current SHARED_KG_OPT_OUT toggle from the DB. Defaults to `false`
-/// (opt-in to shared KG) when no row exists.
+/// Legacy alias kept for ~3 releases (slated for removal 2026-08). DB rows
+/// stored under the old key are silently migrated to the new key on first
+/// read via `get_shared_kg_write_disabled` — see the migration helper below.
+pub const SETTING_KEY_SHARED_KG_OPT_OUT_LEGACY: &str = "shared_kg_opt_out";
+
+/// Back-compat alias of the canonical key. Existing internal call sites
+/// (and the legacy Tauri command) still reference this; new code should use
+/// `SETTING_KEY_SHARED_KG_WRITE_DISABLED` directly. Slated for removal in
+/// the same window as the legacy command + env var.
+pub const SETTING_KEY_SHARED_KG_OPT_OUT: &str = SETTING_KEY_SHARED_KG_WRITE_DISABLED;
+
+/// One-shot, idempotent migration: if a DB row exists under the LEGACY key
+/// (`shared_kg_opt_out`) but NOT under the canonical key
+/// (`shared_kg_write_disabled`), copy it across and delete the legacy row.
+/// Safe to call from any read path.
+///
+/// Returns the migrated value (Some(bool)) if a migration occurred,
+/// Some(canonical_value) if the canonical row already existed, or None when
+/// neither row exists. Callers usually just discard the return — the side
+/// effect on the DB is the point.
+fn _migrate_shared_kg_setting(db: &Db, project_id: &str) -> Result<Option<bool>, String> {
+    // Canonical row wins outright — drop any stale legacy row to avoid
+    // confusing future reads.
+    if let Some(canonical) =
+        db.get_setting(project_id, PROJECT_SETTINGS_MODULE_ID, SETTING_KEY_SHARED_KG_WRITE_DISABLED)?
+    {
+        // Best-effort cleanup of legacy row; never fail the migration over it.
+        let _ = db.delete_setting(
+            project_id,
+            PROJECT_SETTINGS_MODULE_ID,
+            SETTING_KEY_SHARED_KG_OPT_OUT_LEGACY,
+        );
+        return Ok(Some(canonical.as_bool().unwrap_or(false)));
+    }
+
+    // Otherwise check the legacy row and forward it.
+    if let Some(legacy) =
+        db.get_setting(project_id, PROJECT_SETTINGS_MODULE_ID, SETTING_KEY_SHARED_KG_OPT_OUT_LEGACY)?
+    {
+        let bool_val = legacy.as_bool().unwrap_or(false);
+        db.set_setting(
+            project_id,
+            PROJECT_SETTINGS_MODULE_ID,
+            SETTING_KEY_SHARED_KG_WRITE_DISABLED,
+            &serde_json::Value::Bool(bool_val),
+        )?;
+        let _ = db.delete_setting(
+            project_id,
+            PROJECT_SETTINGS_MODULE_ID,
+            SETTING_KEY_SHARED_KG_OPT_OUT_LEGACY,
+        );
+        eprintln!(
+            "[vct] migrated project setting `shared_kg_opt_out` → \
+             `shared_kg_write_disabled` for project {}",
+            project_id
+        );
+        return Ok(Some(bool_val));
+    }
+    Ok(None)
+}
+
+/// Read the current SHARED_KG_WRITE_DISABLED toggle from the DB. Defaults to
+/// `false` (writes allowed) when no row exists. Triggers a one-shot migration
+/// from the legacy `shared_kg_opt_out` key if present — idempotent on repeat
+/// calls.
+pub fn get_shared_kg_write_disabled(db: &Db, project_id: &str) -> Result<bool, String> {
+    Ok(_migrate_shared_kg_setting(db, project_id)?.unwrap_or(false))
+}
+
+/// Deprecated alias of `get_shared_kg_write_disabled`. Will be removed once
+/// the legacy command + env var are dropped (target: 2026-08).
+#[deprecated(
+    since = "2026-05-01",
+    note = "Use `get_shared_kg_write_disabled` — the toggle now gates WRITES \
+            only. Reads of the shared KG are always on."
+)]
 pub fn get_shared_kg_opt_out(db: &Db, project_id: &str) -> Result<bool, String> {
-    let val = db.get_setting(project_id, PROJECT_SETTINGS_MODULE_ID, SETTING_KEY_SHARED_KG_OPT_OUT)?;
-    Ok(val.and_then(|v| v.as_bool()).unwrap_or(false))
+    get_shared_kg_write_disabled(db, project_id)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -238,11 +313,12 @@ pub async fn create_project_v2(
     // `.claude/settings.json` env block (CLI + Desktop app + VS Code).
     // We swallow individual errors here: create_project must not fail
     // just because the user's folder is read-only or mid-edit.
-    // MEDIUM-1: read the persisted SHARED_KG_OPT_OUT toggle for this project
-    // so the env files reflect it. Newly-created projects will not have a row
-    // yet → defaults to false (opt-in).
-    let opt_out = get_shared_kg_opt_out(&db, &row.id).unwrap_or(false);
-    if let Err(e) = write_project_env_files(folder, &req.name, Some(opt_out)) {
+    // MEDIUM-1: read the persisted SHARED_KG_WRITE_DISABLED toggle for this
+    // project so the env files reflect it. Newly-created projects will not
+    // have a row yet → defaults to false (writes allowed). Reads of the
+    // shared KG are unconditional and not gated by this flag.
+    let write_disabled = get_shared_kg_write_disabled(&db, &row.id).unwrap_or(false);
+    if let Err(e) = write_project_env_files(folder, &req.name, Some(write_disabled)) {
         // B10 (2026-05-01): surface env-write failures to the UI instead of
         // silent eprintln. Project creation still succeeds; the UI should show
         // a warning toast so the user knows manual env setup is required.
@@ -1094,15 +1170,23 @@ pub async fn update_project_v2(
 /// Returns Ok(()) only when ALL succeed; the caller currently logs and
 /// swallows the error so project creation never fails over an env file.
 ///
-/// MEDIUM-1 (2026-05-01): `shared_kg_opt_out` is now plumbed through.
-/// `None` keeps the legacy behaviour (writes "false"); `Some(b)` writes the
-/// caller-supplied bool. The DB-resolved value should be passed by callers
-/// that have a `Db` handle (`create_project_v2`, `rename_project_v2`,
-/// `set_shared_kg_opt_out`); test callers can keep passing `None`.
+/// MEDIUM-1 (2026-05-01): `shared_kg_write_disabled` is the per-project
+/// WRITE gate (asymmetric model: all projects always READ the shared KG;
+/// only writes are gated). `None` keeps the default (writes allowed,
+/// "false" everywhere); `Some(b)` writes the caller-supplied bool. The
+/// DB-resolved value should be passed by callers that have a `Db` handle
+/// (`create_project_v2`, `rename_project_v2`, `set_shared_kg_write_disabled`);
+/// test callers can keep passing `None`.
+///
+/// Both env keys are written for back-compat: `SHARED_KG_WRITE_DISABLED`
+/// (canonical) AND `SHARED_KG_OPT_OUT` (legacy alias) carry the same value.
+/// The MCP server resolves write-gate state from the canonical key first,
+/// falling back to the legacy alias when only it is present. Kept for
+/// ~3 releases (target removal: 2026-08).
 pub fn write_project_env_files(
     folder: &Path,
     project_name: &str,
-    shared_kg_opt_out: Option<bool>,
+    shared_kg_write_disabled: Option<bool>,
 ) -> Result<(), String> {
     let kg_basename = sanitize_kg_collection(project_name);
     // Suffix the basename to match `.env` (line ~458) and the rest of the
@@ -1121,14 +1205,21 @@ pub fn write_project_env_files(
     // env files would just confuse users and leave stale entries. Removed.
     // Shared cross-project KG. Same name across all projects on this machine
     // — bundled with the orchestrator install (seeded from
-    // vibecoded-orchestrator/knowledge/). Per-project SHARED_KG_OPT_OUT
-    // disables it for THIS project without affecting others.
+    // vibecoded-orchestrator/knowledge/). Per-project
+    // SHARED_KG_WRITE_DISABLED gates WRITES for THIS project; reads are
+    // unconditional.
     let shared_kg_collection = "VibeCodedTools_KnowledgeGraph";
-    // Default: opt-IN. Users who want a sandboxed project flip this via the
-    // launcher Preferences toggle (set_shared_kg_opt_out command, which
-    // persists to the project-settings k/v table and re-runs
-    // write_project_env_files with the new value).
-    let shared_kg_opt_out = if shared_kg_opt_out.unwrap_or(false) { "true" } else { "false" };
+    // Default: writes allowed. Users who want to bottle up their project's
+    // contributions to the shared KG flip this via the launcher Preferences
+    // toggle (set_shared_kg_write_disabled command, which persists to the
+    // project-settings k/v table and re-runs write_project_env_files with
+    // the new value). Reads of the shared KG are NOT gated by this flag.
+    let shared_kg_write_disabled = if shared_kg_write_disabled.unwrap_or(false) { "true" } else { "false" };
+    // Legacy alias (kept for ~3 releases, target removal 2026-08). The MCP
+    // server reads the canonical key first; we mirror the same value into
+    // the legacy alias so existing tooling that still reads SHARED_KG_OPT_OUT
+    // sees a consistent view of the project's write-gate state.
+    let shared_kg_opt_out_legacy = shared_kg_write_disabled;
 
     // VS Code path (extension reads claude-code.env).
     //
@@ -1171,7 +1262,10 @@ pub fn write_project_env_files(
         "PROJECT_NAME": project_name,
         "DEVELOPMENT_COLLECTION": dev_collection,
         "SHARED_KG_COLLECTION": shared_kg_collection,
-        "SHARED_KG_OPT_OUT": shared_kg_opt_out,
+        // Canonical write-gate key (asymmetric semantic since 2026-05-01).
+        "SHARED_KG_WRITE_DISABLED": shared_kg_write_disabled,
+        // Legacy alias — same value, removed in ~3 releases.
+        "SHARED_KG_OPT_OUT": shared_kg_opt_out_legacy,
     });
     if let Some(obj) = vscode_root.as_object_mut() {
         obj.insert("claude-code.env".to_string(), vscode_env_block);
@@ -1198,12 +1292,17 @@ pub fn write_project_env_files(
          export PROJECT_NAME=\"{}\"\n\
          export DEVELOPMENT_COLLECTION=\"{}\"\n\
          export SHARED_KG_COLLECTION=\"{}\"\n\
+         # Asymmetric shared-KG access (2026-05-01): reads always-on; this\n\
+         # gates WRITES only. SHARED_KG_OPT_OUT is the legacy alias kept\n\
+         # for ~3 releases (target removal: 2026-08).\n\
+         export SHARED_KG_WRITE_DISABLED=\"{}\"\n\
          export SHARED_KG_OPT_OUT=\"{}\"\n",
         kg_collection,
         project_name,
         dev_collection,
         shared_kg_collection,
-        shared_kg_opt_out,
+        shared_kg_write_disabled,
+        shared_kg_opt_out_legacy,
     );
     std::fs::write(&env_path, env_content)
         .map_err(|e| format!("write {}: {}", env_path.display(), e))?;
@@ -1250,7 +1349,10 @@ pub fn write_project_env_files(
         "PROJECT_NAME": project_name,
         "DEVELOPMENT_COLLECTION": dev_collection,
         "SHARED_KG_COLLECTION": shared_kg_collection,
-        "SHARED_KG_OPT_OUT": shared_kg_opt_out,
+        // Canonical write-gate key (asymmetric semantic since 2026-05-01).
+        "SHARED_KG_WRITE_DISABLED": shared_kg_write_disabled,
+        // Legacy alias — same value, removed in ~3 releases.
+        "SHARED_KG_OPT_OUT": shared_kg_opt_out_legacy,
     });
     if let Some(obj) = settings.as_object_mut() {
         obj.insert("env".to_string(), env_block);
@@ -1570,12 +1672,12 @@ pub async fn rename_project_v2(
     // KG_COLLECTION values in .claude/env, .vscode/settings.json, and
     // .claude/settings.json until the user manually re-ran env setup.
     let folder = Path::new(&row.folder_path);
-    let opt_out = get_shared_kg_opt_out(&db, &id).unwrap_or(false);
+    let write_disabled = get_shared_kg_write_disabled(&db, &id).unwrap_or(false);
     // HIGH-7 (2026-05-01): env-write failures now surface as structured
     // warnings instead of silent eprintln. Without this, a failed env refresh
     // leaves the project's 4 env surfaces stale until the next launcher
     // session and the user has no idea anything is wrong.
-    if let Err(e) = write_project_env_files(folder, &new_name, Some(opt_out)) {
+    if let Err(e) = write_project_env_files(folder, &new_name, Some(write_disabled)) {
         let msg = format!(
             "rename env refresh (write_project_env_files) failed: {}. \
              KG routing for the renamed project may be stale until manual repair.",
@@ -1607,14 +1709,18 @@ pub async fn rename_project_v2(
     })
 }
 
-/// MEDIUM-1 (2026-05-01): persist the SHARED_KG_OPT_OUT toggle and refresh
-/// all per-project env surfaces so the new value takes effect immediately.
+/// MEDIUM-1 (2026-05-01, refactored): persist the SHARED_KG_WRITE_DISABLED
+/// toggle and refresh all per-project env surfaces so the new value takes
+/// effect immediately.
 ///
-/// This is the wiring half of the spec; the Svelte UI control is a follow-up.
+/// Asymmetric semantic: this gates WRITES to the cross-project shared KG
+/// (`store_knowledge_node(scope='shared')`). Reads of the shared KG are
+/// always on for every project. See module docstring of
+/// `claude_mcp_servers/weaviate_mcp/server.py`.
 #[command]
-pub async fn set_shared_kg_opt_out(
+pub async fn set_shared_kg_write_disabled(
     project_id: String,
-    opt_out: bool,
+    write_disabled: bool,
     db: State<'_, Db>,
 ) -> Result<RenameProjectResult, String> {
     let row = db
@@ -1622,21 +1728,31 @@ pub async fn set_shared_kg_opt_out(
         .ok_or_else(|| format!("project {} not found", project_id))?;
     let count = db.list_module_installs_for_project(&project_id)?.len() as u32;
 
-    // Persist to the project-settings k/v table.
+    // Persist to the project-settings k/v table under the canonical key.
+    // The legacy alias row, if any, is retired by the migration helper that
+    // backstops `get_shared_kg_write_disabled`.
     db.set_setting(
         &project_id,
         PROJECT_SETTINGS_MODULE_ID,
-        SETTING_KEY_SHARED_KG_OPT_OUT,
-        &serde_json::Value::Bool(opt_out),
+        SETTING_KEY_SHARED_KG_WRITE_DISABLED,
+        &serde_json::Value::Bool(write_disabled),
     )?;
+    // Best-effort: clear any stale legacy row so `get_setting` reads stop
+    // reporting both keys. The migration helper handles this on read too,
+    // but proactively clearing here keeps the DB tidy.
+    let _ = db.delete_setting(
+        &project_id,
+        PROJECT_SETTINGS_MODULE_ID,
+        SETTING_KEY_SHARED_KG_OPT_OUT_LEGACY,
+    );
 
     // Refresh all 4 env surfaces with the new value. Use the same warning
     // surface as create / rename so the UI can toast on partial failure.
     let mut warnings: Vec<String> = Vec::new();
     let folder = Path::new(&row.folder_path);
-    if let Err(e) = write_project_env_files(folder, &row.name, Some(opt_out)) {
+    if let Err(e) = write_project_env_files(folder, &row.name, Some(write_disabled)) {
         let msg = format!(
-            "shared-KG opt-out env refresh failed: {}. \
+            "shared-KG write-disabled env refresh failed: {}. \
              Toggle persisted to DB but env files may be stale.",
             e
         );
@@ -1645,10 +1761,10 @@ pub async fn set_shared_kg_opt_out(
     }
 
     db.audit(
-        "project_shared_kg_opt_out",
+        "project_shared_kg_write_disabled",
         Some(&project_id),
         None,
-        &serde_json::json!({ "opt_out": opt_out }),
+        &serde_json::json!({ "write_disabled": write_disabled }),
     )?;
     let _ = db.log_change("projects", "update", Some(&project_id), Some(&project_id));
 
@@ -1656,6 +1772,29 @@ pub async fn set_shared_kg_opt_out(
         project: ProjectView::from_row(row, count),
         warnings,
     })
+}
+
+/// Deprecated alias of `set_shared_kg_write_disabled`. Logs a deprecation
+/// notice to stderr and delegates. Slated for removal once the legacy env
+/// var + DB key are fully retired (target: 2026-08, ~3 releases).
+///
+/// The Svelte client ships a matching `setSharedKgOptOut` deprecated
+/// alias — both go away together.
+#[command]
+pub async fn set_shared_kg_opt_out(
+    project_id: String,
+    opt_out: bool,
+    db: State<'_, Db>,
+) -> Result<RenameProjectResult, String> {
+    eprintln!(
+        "[vct] DEPRECATED: Tauri command `set_shared_kg_opt_out` was called \
+         (project_id={}, opt_out={}). The toggle now gates WRITES only — \
+         reads of the shared KG are always on. Use \
+         `set_shared_kg_write_disabled` instead. The legacy command will be \
+         removed in ~3 releases (target: 2026-08).",
+        project_id, opt_out,
+    );
+    set_shared_kg_write_disabled(project_id, opt_out, db).await
 }
 
 #[command]
@@ -1923,6 +2062,9 @@ mod tests {
         assert!(env.get("CONVERSATION_COLLECTION").is_none());
         // Shared-KG fields propagate to all three surfaces.
         assert_eq!(env["SHARED_KG_COLLECTION"], "VibeCodedTools_KnowledgeGraph");
+        // Canonical write-gate key (asymmetric semantic since 2026-05-01).
+        assert_eq!(env["SHARED_KG_WRITE_DISABLED"], "false");
+        // Legacy alias mirrors the canonical value (kept for ~3 releases).
         assert_eq!(env["SHARED_KG_OPT_OUT"], "false");
 
         // 2. CLI shell file path
@@ -1935,6 +2077,7 @@ mod tests {
         // B5: CONVERSATION_COLLECTION must NOT be in .claude/env.
         assert!(!env_raw.contains("CONVERSATION_COLLECTION"));
         assert!(env_raw.contains(r#"export SHARED_KG_COLLECTION="VibeCodedTools_KnowledgeGraph""#));
+        assert!(env_raw.contains(r#"export SHARED_KG_WRITE_DISABLED="false""#));
         assert!(env_raw.contains(r#"export SHARED_KG_OPT_OUT="false""#));
 
         // 3. Bug 30: canonical .claude/settings.json env block
@@ -1949,6 +2092,7 @@ mod tests {
         // B5: CONVERSATION_COLLECTION must NOT be in .claude/settings.json env.
         assert!(env.get("CONVERSATION_COLLECTION").is_none());
         assert_eq!(env["SHARED_KG_COLLECTION"], "VibeCodedTools_KnowledgeGraph");
+        assert_eq!(env["SHARED_KG_WRITE_DISABLED"], "false");
         assert_eq!(env["SHARED_KG_OPT_OUT"], "false");
 
         std::fs::remove_dir_all(&tmp).ok();
@@ -2507,22 +2651,26 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// MEDIUM-1: SHARED_KG_OPT_OUT toggle round-trip. Set the toggle, then
-    /// re-render env surfaces and verify all 4 reflect the new value.
+    /// MEDIUM-1 (refactored 2026-05-01): SHARED_KG_WRITE_DISABLED toggle
+    /// round-trip. Set the toggle, then re-render env surfaces and verify
+    /// the canonical key plus the legacy alias both reflect the new value.
     /// (`.env` is owned by ensure_project_env_template — it doesn't carry
-    /// SHARED_KG_OPT_OUT, so the relevant surfaces here are the 3 written by
+    /// the gate, so the relevant surfaces are the 3 written by
     /// write_project_env_files.)
     #[test]
-    fn shared_kg_opt_out_toggle_flips_all_env_surfaces() {
+    fn shared_kg_write_disabled_toggle_flips_all_env_surfaces() {
         let tmp = std::env::temp_dir().join(format!(
             "vct-medium1-{}",
             uuid::Uuid::new_v4().simple()
         ));
         std::fs::create_dir_all(&tmp).unwrap();
 
-        // Default (None / false) → SHARED_KG_OPT_OUT="false" everywhere.
+        // Default (None / false) → both keys "false" everywhere.
         write_project_env_files(&tmp, "Acme", None).unwrap();
-        let read_all = || -> (String, String, String) {
+
+        // Helper returning (vsc_canonical, vsc_legacy, cs_canonical,
+        // cs_legacy, env_sh_text) so we can assert on every surface.
+        let read_all = || -> (String, String, String, String, String) {
             let vsc: serde_json::Value = serde_json::from_str(
                 &std::fs::read_to_string(tmp.join(".vscode/settings.json")).unwrap(),
             ).unwrap();
@@ -2531,40 +2679,53 @@ mod tests {
             ).unwrap();
             let env_sh = std::fs::read_to_string(tmp.join(".claude/env")).unwrap();
             (
+                vsc["claude-code.env"]["SHARED_KG_WRITE_DISABLED"].as_str().unwrap().to_string(),
                 vsc["claude-code.env"]["SHARED_KG_OPT_OUT"].as_str().unwrap().to_string(),
+                cs["env"]["SHARED_KG_WRITE_DISABLED"].as_str().unwrap().to_string(),
                 cs["env"]["SHARED_KG_OPT_OUT"].as_str().unwrap().to_string(),
                 env_sh,
             )
         };
 
-        let (a, b, c) = read_all();
-        assert_eq!(a, "false");
-        assert_eq!(b, "false");
-        assert!(c.contains(r#"export SHARED_KG_OPT_OUT="false""#));
+        let (vsc_new, vsc_old, cs_new, cs_old, env_sh) = read_all();
+        assert_eq!(vsc_new, "false");
+        assert_eq!(vsc_old, "false");
+        assert_eq!(cs_new, "false");
+        assert_eq!(cs_old, "false");
+        assert!(env_sh.contains(r#"export SHARED_KG_WRITE_DISABLED="false""#));
+        assert!(env_sh.contains(r#"export SHARED_KG_OPT_OUT="false""#));
 
         // Flip to true.
         write_project_env_files(&tmp, "Acme", Some(true)).unwrap();
-        let (a, b, c) = read_all();
-        assert_eq!(a, "true");
-        assert_eq!(b, "true");
-        assert!(c.contains(r#"export SHARED_KG_OPT_OUT="true""#));
-        assert!(!c.contains(r#"export SHARED_KG_OPT_OUT="false""#));
+        let (vsc_new, vsc_old, cs_new, cs_old, env_sh) = read_all();
+        assert_eq!(vsc_new, "true");
+        assert_eq!(vsc_old, "true");
+        assert_eq!(cs_new, "true");
+        assert_eq!(cs_old, "true");
+        assert!(env_sh.contains(r#"export SHARED_KG_WRITE_DISABLED="true""#));
+        assert!(env_sh.contains(r#"export SHARED_KG_OPT_OUT="true""#));
+        assert!(!env_sh.contains(r#"export SHARED_KG_WRITE_DISABLED="false""#));
+        assert!(!env_sh.contains(r#"export SHARED_KG_OPT_OUT="false""#));
 
         // Flip back to false.
         write_project_env_files(&tmp, "Acme", Some(false)).unwrap();
-        let (a, b, c) = read_all();
-        assert_eq!(a, "false");
-        assert_eq!(b, "false");
-        assert!(c.contains(r#"export SHARED_KG_OPT_OUT="false""#));
+        let (vsc_new, vsc_old, cs_new, cs_old, env_sh) = read_all();
+        assert_eq!(vsc_new, "false");
+        assert_eq!(vsc_old, "false");
+        assert_eq!(cs_new, "false");
+        assert_eq!(cs_old, "false");
+        assert!(env_sh.contains(r#"export SHARED_KG_WRITE_DISABLED="false""#));
+        assert!(env_sh.contains(r#"export SHARED_KG_OPT_OUT="false""#));
 
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// MEDIUM-1: get_shared_kg_opt_out reads the persisted toggle, defaulting
-    /// to false on a project with no row. The DB k/v round-trip exercises the
-    /// `module_settings` table with the `__project__` sentinel module_id.
+    /// MEDIUM-1 (refactored 2026-05-01): get_shared_kg_write_disabled reads
+    /// the persisted toggle, defaulting to false on a project with no row.
+    /// The DB k/v round-trip exercises the `module_settings` table with the
+    /// `__project__` sentinel module_id.
     #[test]
-    fn shared_kg_opt_out_db_roundtrip() {
+    fn shared_kg_write_disabled_db_roundtrip() {
         let db = Db::open_in_memory().unwrap();
         let pid = uuid::Uuid::new_v4().to_string();
         db.insert_project(
@@ -2576,25 +2737,178 @@ mod tests {
         ).unwrap();
 
         // Default: no row → false.
-        assert_eq!(get_shared_kg_opt_out(&db, &pid).unwrap(), false);
+        assert_eq!(get_shared_kg_write_disabled(&db, &pid).unwrap(), false);
 
-        // Persist true.
+        // Persist true under the canonical key.
         db.set_setting(
             &pid,
             PROJECT_SETTINGS_MODULE_ID,
-            SETTING_KEY_SHARED_KG_OPT_OUT,
+            SETTING_KEY_SHARED_KG_WRITE_DISABLED,
             &serde_json::Value::Bool(true),
         ).unwrap();
-        assert_eq!(get_shared_kg_opt_out(&db, &pid).unwrap(), true);
+        assert_eq!(get_shared_kg_write_disabled(&db, &pid).unwrap(), true);
 
         // Flip to false.
         db.set_setting(
             &pid,
             PROJECT_SETTINGS_MODULE_ID,
-            SETTING_KEY_SHARED_KG_OPT_OUT,
+            SETTING_KEY_SHARED_KG_WRITE_DISABLED,
             &serde_json::Value::Bool(false),
         ).unwrap();
+        assert_eq!(get_shared_kg_write_disabled(&db, &pid).unwrap(), false);
+    }
+
+    /// One-shot legacy migration: a row stored under the old
+    /// `shared_kg_opt_out` key is silently relocated to the canonical
+    /// `shared_kg_write_disabled` key on first read. The legacy row is
+    /// deleted to keep the DB tidy. Idempotent on repeat reads.
+    #[test]
+    fn shared_kg_legacy_setting_migrates_on_first_read() {
+        let db = Db::open_in_memory().unwrap();
+        let pid = uuid::Uuid::new_v4().to_string();
+        db.insert_project(
+            &pid,
+            "Acme",
+            "/tmp/acme",
+            ProjectHost::Base,
+            "acme",
+        ).unwrap();
+
+        // Seed only the legacy row (simulating a project upgraded from
+        // pre-rename launcher).
+        db.set_setting(
+            &pid,
+            PROJECT_SETTINGS_MODULE_ID,
+            SETTING_KEY_SHARED_KG_OPT_OUT_LEGACY,
+            &serde_json::Value::Bool(true),
+        ).unwrap();
+        // Sanity: no canonical row yet.
+        assert!(db
+            .get_setting(&pid, PROJECT_SETTINGS_MODULE_ID, SETTING_KEY_SHARED_KG_WRITE_DISABLED)
+            .unwrap()
+            .is_none());
+
+        // First read triggers migration AND returns the legacy value.
+        assert_eq!(get_shared_kg_write_disabled(&db, &pid).unwrap(), true);
+
+        // After the read: canonical row exists, legacy row removed.
+        let canonical = db
+            .get_setting(&pid, PROJECT_SETTINGS_MODULE_ID, SETTING_KEY_SHARED_KG_WRITE_DISABLED)
+            .unwrap();
+        assert_eq!(canonical, Some(serde_json::Value::Bool(true)));
+        let legacy = db
+            .get_setting(&pid, PROJECT_SETTINGS_MODULE_ID, SETTING_KEY_SHARED_KG_OPT_OUT_LEGACY)
+            .unwrap();
+        assert!(legacy.is_none(), "legacy row must be deleted after migration");
+
+        // Second read is idempotent — still returns the same value, leaves
+        // canonical row in place.
+        assert_eq!(get_shared_kg_write_disabled(&db, &pid).unwrap(), true);
+    }
+
+    /// When BOTH the canonical row and the legacy row exist (e.g. a buggy
+    /// older shim wrote both), the canonical one wins and the legacy one is
+    /// dropped. Defends against split-brain after the rename.
+    #[test]
+    fn shared_kg_canonical_wins_over_legacy_when_both_present() {
+        let db = Db::open_in_memory().unwrap();
+        let pid = uuid::Uuid::new_v4().to_string();
+        db.insert_project(
+            &pid,
+            "Acme",
+            "/tmp/acme",
+            ProjectHost::Base,
+            "acme",
+        ).unwrap();
+
+        db.set_setting(
+            &pid,
+            PROJECT_SETTINGS_MODULE_ID,
+            SETTING_KEY_SHARED_KG_WRITE_DISABLED,
+            &serde_json::Value::Bool(false),
+        ).unwrap();
+        db.set_setting(
+            &pid,
+            PROJECT_SETTINGS_MODULE_ID,
+            SETTING_KEY_SHARED_KG_OPT_OUT_LEGACY,
+            &serde_json::Value::Bool(true),
+        ).unwrap();
+
+        assert_eq!(get_shared_kg_write_disabled(&db, &pid).unwrap(), false,
+                   "canonical 'false' must win over legacy 'true'");
+        // Legacy row pruned.
+        let legacy = db
+            .get_setting(&pid, PROJECT_SETTINGS_MODULE_ID, SETTING_KEY_SHARED_KG_OPT_OUT_LEGACY)
+            .unwrap();
+        assert!(legacy.is_none());
+    }
+
+    /// Deprecated `get_shared_kg_opt_out` shim still works and returns the
+    /// same value as the new function. Removed once the legacy command +
+    /// env var fully retire.
+    #[test]
+    #[allow(deprecated)]
+    fn legacy_get_shared_kg_opt_out_delegates_correctly() {
+        let db = Db::open_in_memory().unwrap();
+        let pid = uuid::Uuid::new_v4().to_string();
+        db.insert_project(&pid, "Acme", "/tmp/acme", ProjectHost::Base, "acme").unwrap();
+
+        // No row → both functions return false.
         assert_eq!(get_shared_kg_opt_out(&db, &pid).unwrap(), false);
+        assert_eq!(get_shared_kg_write_disabled(&db, &pid).unwrap(), false);
+
+        // Set the canonical row → both functions return true.
+        db.set_setting(
+            &pid,
+            PROJECT_SETTINGS_MODULE_ID,
+            SETTING_KEY_SHARED_KG_WRITE_DISABLED,
+            &serde_json::Value::Bool(true),
+        ).unwrap();
+        assert_eq!(get_shared_kg_opt_out(&db, &pid).unwrap(), true);
+        assert_eq!(get_shared_kg_write_disabled(&db, &pid).unwrap(), true);
+    }
+
+    /// Tauri command level: legacy `set_shared_kg_opt_out` delegates to
+    /// `set_shared_kg_write_disabled`. Both write under the canonical DB
+    /// key and refresh env surfaces. We exercise the underlying logic
+    /// (skipping the actual #[command] async wrapping, which needs the
+    /// Tauri runtime) by setting the row and confirming env files reflect
+    /// it — same code path the deprecated command takes.
+    #[test]
+    fn deprecated_set_shared_kg_opt_out_writes_canonical_key() {
+        let db = Db::open_in_memory().unwrap();
+        let pid = uuid::Uuid::new_v4().to_string();
+        let tmp = std::env::temp_dir().join(format!(
+            "vct-deprecated-set-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        db.insert_project(&pid, "Acme", tmp.to_str().unwrap(), ProjectHost::Base, "acme").unwrap();
+
+        // Simulate the legacy command: same DB write the new command does.
+        db.set_setting(
+            &pid,
+            PROJECT_SETTINGS_MODULE_ID,
+            SETTING_KEY_SHARED_KG_WRITE_DISABLED,
+            &serde_json::Value::Bool(true),
+        ).unwrap();
+
+        // The canonical const aliases the new key, so legacy callers that
+        // referenced SETTING_KEY_SHARED_KG_OPT_OUT now write under the
+        // canonical key automatically — no double-write hazard.
+        assert_eq!(SETTING_KEY_SHARED_KG_OPT_OUT, SETTING_KEY_SHARED_KG_WRITE_DISABLED);
+        assert_ne!(SETTING_KEY_SHARED_KG_OPT_OUT_LEGACY, SETTING_KEY_SHARED_KG_WRITE_DISABLED);
+
+        // The persisted value flows through write_project_env_files
+        // identically regardless of which command name persisted the row.
+        write_project_env_files(&tmp, "Acme", Some(true)).unwrap();
+        let cs: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(tmp.join(".claude/settings.json")).unwrap(),
+        ).unwrap();
+        assert_eq!(cs["env"]["SHARED_KG_WRITE_DISABLED"], "true");
+        assert_eq!(cs["env"]["SHARED_KG_OPT_OUT"], "true");
+
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     /// HIGH-7: when write_project_env_files fails (folder gone / unwritable),

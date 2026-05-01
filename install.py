@@ -5008,15 +5008,20 @@ def _seed_weaviate(args: argparse.Namespace) -> None:
     # by file_path), so re-running on unchanged content yields the same
     # collection state. The cost on a 50-node tree is ~30s on warm Ollama.
     #
-    # Honor SHARED_KG_OPT_OUT=true at install time too (skip seeding) so
-    # power-users who explicitly disabled the shared KG don't get it
-    # re-populated by a subsequent install / update.
-    shared_opt_out = os.environ.get("SHARED_KG_OPT_OUT", "").lower() in ("1", "true", "yes")
+    # Honor SHARED_KG_WRITE_DISABLED=true at install time too (skip seeding)
+    # so power-users who explicitly gated shared-KG writes don't get the
+    # collection re-populated by a subsequent install / update.
+    # Legacy alias SHARED_KG_OPT_OUT is still consulted for ~3 releases —
+    # canonical key wins when both are set (mirroring the MCP server).
+    shared_write_disabled = (
+        os.environ.get("SHARED_KG_WRITE_DISABLED")
+        or os.environ.get("SHARED_KG_OPT_OUT", "")
+    ).lower() in ("1", "true", "yes")
     shared_collection = os.environ.get(
         "SHARED_KG_COLLECTION", "VibeCodedTools_KnowledgeGraph"
     )
-    if shared_opt_out:
-        print("  → shared KG seed: skipped (SHARED_KG_OPT_OUT=true)")
+    if shared_write_disabled:
+        print("  → shared KG seed: skipped (SHARED_KG_WRITE_DISABLED=true)")
     elif not shared_collection:
         print("  → shared KG seed: skipped (SHARED_KG_COLLECTION empty)")
     elif sync_kg.exists():
@@ -5403,10 +5408,13 @@ def _write_env_config(embed_config: dict, args: argparse.Namespace, joern_availa
         f"DEVELOPMENT_COLLECTION={os.environ.get('DEVELOPMENT_COLLECTION', 'Development')}",
         "",
         "# Cross-project shared KG (all vco installs on this machine read",
-        "# from it alongside their own KG). Seeded at install time from",
-        "# vibecoded-orchestrator/knowledge/. Set SHARED_KG_OPT_OUT=true to",
-        "# disable the shared collection per-project.",
+        "# from it alongside their own KG — read access is unconditional).",
+        "# Seeded at install time from vibecoded-orchestrator/knowledge/.",
+        "# Set SHARED_KG_WRITE_DISABLED=true to gate WRITES from this project",
+        "# only (reads stay on). SHARED_KG_OPT_OUT is the legacy alias kept",
+        "# for ~3 releases (target removal: 2026-08).",
         f"SHARED_KG_COLLECTION={os.environ.get('SHARED_KG_COLLECTION', 'VibeCodedTools_KnowledgeGraph')}",
+        "SHARED_KG_WRITE_DISABLED=false",
         "SHARED_KG_OPT_OUT=false",
         "",
     ]
@@ -5510,6 +5518,10 @@ def _configure_claude_settings(embed_config: dict) -> None:
         "KG_COLLECTION": "KnowledgeGraph",
         "DEVELOPMENT_COLLECTION": "Development",
         "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
+        # Asymmetric shared-KG access (since 2026-05-01): reads always-on,
+        # writes gated by SHARED_KG_WRITE_DISABLED. SHARED_KG_OPT_OUT kept
+        # as a legacy alias for ~3 releases (target removal: 2026-08).
+        "SHARED_KG_WRITE_DISABLED": "false",
         "SHARED_KG_OPT_OUT": "false",
         "CODE_EMBED_BACKEND": embed_config["code_backend"],
         "CODE_EMBED_SERVICE_URL": f"http://localhost:{code_embed_port}",

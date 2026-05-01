@@ -87,11 +87,12 @@ The MCP server (`claude_mcp_servers/weaviate_mcp/server.py`) reads these on star
 | `KG_COLLECTION` | `<ProjectName>` | Per-project Weaviate collection. Knowledge nodes from `knowledge/` land here. |
 | `DEVELOPMENT_COLLECTION` | `<ProjectName>_development` | Per-project Weaviate collection for `docs/`. Auto-paired with KG by the launcher. Same chunker + named-vector slot logic as KG. |
 | `SHARED_KG_COLLECTION` | `VibeCodedTools_KnowledgeGraph` | Cross-project shared KG. All projects on this machine query it alongside their own KG. Seeded by `install.py` Step 7d from `vibecoded-orchestrator/knowledge/`. |
-| `SHARED_KG_OPT_OUT` | `false` | Per-project opt-out. Set to `true` (or `1`/`yes`) to disable shared-KG queries for this project. The shared collection itself is unaffected — other projects keep using it. |
+| `SHARED_KG_WRITE_DISABLED` | `false` | Per-project WRITE gate (asymmetric model since 2026-05-01). Set to `true` (or `1`/`yes`) to refuse `store_knowledge_node(scope="shared")` calls from this project. **Reads are unconditional** — every project always queries the shared KG when configured. |
+| `SHARED_KG_OPT_OUT` | `false` | Legacy alias of `SHARED_KG_WRITE_DISABLED`. Kept for back-compat ~3 releases (target removal: 2026-08). The canonical key wins when both are set. NOTE: pre-2026-05-01 this also gated reads — that behaviour is gone. |
 | `SHARED_KG_NODE_FORMATS` | (unset) | Override path for the shared KG's `.node_formats.json` sidecar. Used by tests; in production the sidecar is read from `<orchestrator>/knowledge/.node_formats.json` via `_SERVER_INFERRED_BASE`. |
 | `KG_TIER_MIN` / `KG_TIER_SINGLE_CHUNK` / `KG_TIER_THREE_CHUNKS` / `KG_TIER_FULL` | `0.42` / `0.55` / `0.65` / `0.75` | Score thresholds for the auto-tier retrieval system. See `knowledge/concepts/score-driven-retrieval-tiers.md`. |
 
-**Opt-out semantics**: `SHARED_KG_OPT_OUT=true` zeros `SHARED_KG_COLLECTION` for this MCP process. `hybrid_search` / `semantic_graph_search` then skip the dual-collection merge entirely. Writes via `store_knowledge_node(scope="shared")` fall back to writing to the project KG (no silent black-hole writes).
+**Asymmetric semantics (since 2026-05-01)**: `SHARED_KG_WRITE_DISABLED=true` refuses `store_knowledge_node(scope="shared")` calls with a clear error (`"Shared KG writes are disabled for this project. Set SHARED_KG_WRITE_DISABLED=false to enable, or use scope='project' for the per-project KG."`) — NOT a silent reroute to the project KG. `hybrid_search` / `semantic_graph_search` continue to merge the shared collection regardless of the gate; reads are never disabled per-project. Pre-2026-05-01 the same flag also zeroed reads — that behaviour is gone, by design.
 
 **Power-user override**: point `SHARED_KG_COLLECTION` at a private team-shared collection (e.g. `AcmeTeam_SharedKG`) to share knowledge across an internal team without exposing it via the public bundled name.
 
@@ -177,7 +178,7 @@ By default, every project queries both its per-project KG and a shared cross-pro
 Three control points:
 
 - **`SHARED_KG_COLLECTION`** — name of the shared collection. Default `VibeCodedTools_KnowledgeGraph`. Override to point at a private team-shared collection (`AcmeTeam_SharedKG`) without exposing it via the public bundled name.
-- **`SHARED_KG_OPT_OUT=true`** — per-project opt-out. Zeros `SHARED_KG_COLLECTION` for this project's MCP server; `hybrid_search` and `semantic_graph_search` then query only the per-project KG. The shared collection itself is unaffected — other projects keep using it.
+- **`SHARED_KG_WRITE_DISABLED=true`** — per-project WRITE gate. Refuses `store_knowledge_node(scope="shared")` from this project with a clear error. Reads of the shared collection remain unconditional — knowledge accumulation across projects is the headline value prop. Legacy alias: `SHARED_KG_OPT_OUT` (kept for ~3 releases, target removal 2026-08).
 - **`store_knowledge_node(scope="shared")`** — explicit write to the shared collection. The default scope is `"project"` so arbitrary projects don't pollute the shared collection by accident.
 
 Install does NOT auto-adopt a foreign shared KG it finds on the host (e.g. an existing `ClaudeKnowledgeGraph` from an earlier install). Reason: the orphan-prune pass in `sync_knowledge_graph.py` deletes entries whose `file_path` no longer exists in the active project; two installs sharing one collection would silently delete each other's nodes. VibeCoded Orchestrator (VCO) always creates `VibeCodedTools_KnowledgeGraph` fresh (or skips creation if the exact name already exists).

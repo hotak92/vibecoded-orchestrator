@@ -17,6 +17,20 @@ Core Tools:
 - search_code_graph: Find code entities by concept/purpose
 - query_code_structure: Query dependencies, callers, inheritance, interactions
 
+Shared KG access (asymmetric, since 2026-05-01):
+- READ paths (hybrid_search, semantic_graph_search) ALWAYS query the shared
+  collection when SHARED_KG_COLLECTION is set. This is non-negotiable: the
+  headline value prop of the orchestrator is that knowledge accumulates
+  across all projects. There is NO per-project read opt-out.
+- WRITE paths (store_knowledge_node with scope='shared', or any write whose
+  resolved target is SHARED_KG_COLLECTION) consult SHARED_KG_WRITE_DISABLED.
+  When true, writes are REFUSED with a clear error rather than silently
+  rerouted to the project KG — silent reroutes used to mislead callers
+  into thinking their cross-project insight had landed in the shared KG.
+- Legacy alias: SHARED_KG_OPT_OUT (boolean) is honoured as a read-only
+  alias for SHARED_KG_WRITE_DISABLED for ~3 releases (2026-05 → 2026-08).
+  The new key wins when both are set.
+
 Connection:
 - HTTP: localhost:8081 (configurable via WEAVIATE_URL)
 - gRPC: localhost:50052 (configurable via GRPC_PORT)
@@ -546,15 +560,55 @@ def _format_result_by_tier(
 KG_COLLECTION = os.getenv("KG_COLLECTION", "ClaudeKnowledgeGraph")
 # Cross-project shared collection. Defaults to "VibeCodedTools_KnowledgeGraph"
 # (the bundled cross-project KG seeded at install time from
-# vibecoded-orchestrator/knowledge/). Per-project opt-out via
-# SHARED_KG_OPT_OUT=true (see below).
+# vibecoded-orchestrator/knowledge/).
+#
+# Asymmetric access (2026-05-01): SHARED_KG_COLLECTION is ALWAYS exposed to
+# read paths when set. There is no per-project read opt-out — every project
+# always reads the shared KG. The per-project gate below restricts WRITES
+# only.
 _SHARED_KG_DEFAULT = "VibeCodedTools_KnowledgeGraph"
 _SHARED_KG_RAW = os.getenv("SHARED_KG_COLLECTION", _SHARED_KG_DEFAULT)
-# Per-project opt-out: when true, the shared collection is treated as if
-# unset for THIS process (no shared-collection queries, no shared writes via
-# scope='shared' fallback). Default false (opt-in by default).
-SHARED_KG_OPT_OUT = os.getenv("SHARED_KG_OPT_OUT", "").lower() in ("1", "true", "yes")
-SHARED_KG_COLLECTION = "" if SHARED_KG_OPT_OUT else _SHARED_KG_RAW
+SHARED_KG_COLLECTION = _SHARED_KG_RAW
+
+# Per-project WRITE gate. When true, store_knowledge_node refuses writes
+# whose resolved target is SHARED_KG_COLLECTION (scope='shared' or explicit
+# match). Reads are unaffected. Default false (writes allowed by default).
+#
+# Legacy alias: SHARED_KG_OPT_OUT used to gate BOTH reads and writes. We
+# now honour it as a write-only fallback when SHARED_KG_WRITE_DISABLED is
+# unset, so existing per-project env files keep restricting writes after
+# the rename. Removal targeted for ~3 releases (2026-08).
+def _resolve_shared_kg_write_disabled() -> bool:
+    """Resolve the write-disabled flag from env, honouring the legacy alias.
+
+    Precedence:
+      1. SHARED_KG_WRITE_DISABLED (canonical key) — wins if set, even when
+         set to a falsy spelling like "false" / "0" / "" so users can
+         explicitly RE-ENABLE writes on a project that previously had the
+         legacy SHARED_KG_OPT_OUT=true.
+      2. SHARED_KG_OPT_OUT (legacy alias) — read only when the canonical
+         key is unset (i.e. literally absent from the environment).
+      3. False otherwise (default: writes allowed).
+
+    Returns:
+        True if shared-KG writes are disabled, False otherwise.
+    """
+    canonical = os.environ.get("SHARED_KG_WRITE_DISABLED")
+    if canonical is not None:
+        return canonical.strip().lower() in ("1", "true", "yes")
+    legacy = os.environ.get("SHARED_KG_OPT_OUT")
+    if legacy is not None:
+        return legacy.strip().lower() in ("1", "true", "yes")
+    return False
+
+
+SHARED_KG_WRITE_DISABLED = _resolve_shared_kg_write_disabled()
+# Back-compat module attribute. Existing tests and callers may still read
+# `SHARED_KG_OPT_OUT` from this module — keep the symbol pointing at the
+# resolved write-disabled value so its observable semantics match the new
+# write gate (legacy callers that relied on this to gate reads will, by
+# design, now read the shared KG anyway).
+SHARED_KG_OPT_OUT = SHARED_KG_WRITE_DISABLED
 # Project-specific documentation collection (e.g. ProjectName_development).
 # When set, hybrid_search also searches this collection automatically.
 # Auto-pairing convention: the launcher should set `KG_COLLECTION=Foo` AND
@@ -1572,9 +1626,11 @@ async def semantic_graph_search(
     stale = _stale_filter(include_stale=include_stale)
 
     # Determine all collections to search. Mirrors hybrid_search: project KG +
-    # shared KG (when configured and not opted out). We do NOT include
-    # DEVELOPMENT_COLLECTION here — graph traversal relies on WikiLinks which
-    # are a knowledge-graph convention, not present in dev docs.
+    # shared KG (when configured). The shared KG read is unconditional —
+    # there is NO per-project read opt-out (asymmetric semantic, see module
+    # docstring). We do NOT include DEVELOPMENT_COLLECTION here — graph
+    # traversal relies on WikiLinks which are a knowledge-graph convention,
+    # not present in dev docs.
     collections_to_search: list[str] = [KG_COLLECTION]
     if SHARED_KG_COLLECTION and SHARED_KG_COLLECTION != KG_COLLECTION:
         collections_to_search.append(SHARED_KG_COLLECTION)
@@ -2119,6 +2175,9 @@ async def store_knowledge_node(
         scope: "project" (default) — writes to KG_COLLECTION (project-scoped).
                "shared" — writes to SHARED_KG_COLLECTION (cross-project knowledge).
                Falls back to KG_COLLECTION if SHARED_KG_COLLECTION is not configured.
+               Refuses (does NOT silently fall back) when
+               SHARED_KG_WRITE_DISABLED=true for this project — see the
+               module docstring for the asymmetric read/write semantic.
 
     Returns:
         JSON with success status and file_written flag
@@ -2127,8 +2186,33 @@ async def store_knowledge_node(
         client = get_weaviate_client()
         # Determine target collection based on scope
         target_collection_name = KG_COLLECTION
-        if scope == "shared" and SHARED_KG_COLLECTION and SHARED_KG_COLLECTION != KG_COLLECTION:
+        targets_shared = (
+            scope == "shared"
+            and SHARED_KG_COLLECTION
+            and SHARED_KG_COLLECTION != KG_COLLECTION
+        )
+        if targets_shared:
             target_collection_name = SHARED_KG_COLLECTION
+
+        # Asymmetric write gate (2026-05-01). Refuse — don't silently reroute —
+        # when the resolved target is the shared collection AND the write
+        # gate is on. Resolving the gate at call time (not import time) means
+        # the env var is honoured even when overridden mid-session, and lets
+        # the test suite reload the value without re-importing the module.
+        if target_collection_name == SHARED_KG_COLLECTION and SHARED_KG_COLLECTION:
+            if _resolve_shared_kg_write_disabled():
+                return json.dumps({
+                    "status": "error",
+                    "error": (
+                        "Shared KG writes are disabled for this project. "
+                        "Set SHARED_KG_WRITE_DISABLED=false to enable, or "
+                        "use scope='project' for the per-project KG."
+                    ),
+                    "target_collection": target_collection_name,
+                    "scope": scope,
+                    "file_written": False,
+                }, indent=2)
+
         collection = client.collections.get(target_collection_name)
 
         # --- Auto-correct file_path before anything else -------------------------
@@ -3442,10 +3526,11 @@ async def backfill_embeddings(
 if __name__ == "__main__":
     logger.info(f"Starting Claude Orchestrator Weaviate MCP Server")
     logger.info(f"Primary Collection: {KG_COLLECTION}")
-    if SHARED_KG_OPT_OUT:
-        logger.info(f"Shared Collection: opted out via SHARED_KG_OPT_OUT (would have been '{_SHARED_KG_RAW}')")
+    logger.info(f"Shared Collection: {SHARED_KG_COLLECTION if SHARED_KG_COLLECTION else 'None'} (read: always-on)")
+    if SHARED_KG_WRITE_DISABLED:
+        logger.info("Shared Collection writes: DISABLED (SHARED_KG_WRITE_DISABLED=true)")
     else:
-        logger.info(f"Shared Collection: {SHARED_KG_COLLECTION if SHARED_KG_COLLECTION else 'None'}")
+        logger.info("Shared Collection writes: enabled")
     logger.info(f"Dual Embedding: {DUAL_EMBEDDING_ENABLED} (active: {ACTIVE_EMBEDDING})")
     logger.info(f"Weaviate: {WEAVIATE_URL}")
     logger.info(f"Code Graph Project: {CODE_GRAPH_PROJECT if CODE_GRAPH_PROJECT else '(all projects)'}")
