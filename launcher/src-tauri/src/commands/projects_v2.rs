@@ -216,8 +216,18 @@ pub async fn create_project_v2(
 /// Returns Ok(()) only when ALL succeed; the caller currently logs and
 /// swallows the error so project creation never fails over an env file.
 pub fn write_project_env_files(folder: &Path, project_name: &str) -> Result<(), String> {
-    let kg_collection = sanitize_kg_collection(project_name);
-    let dev_collection = format!("{}_development", kg_collection);
+    let kg_basename = sanitize_kg_collection(project_name);
+    // Suffix the basename to match `.env` (line ~458) and the rest of the
+    // ecosystem. Pre-2026-05-01 the three Claude Code env surfaces wrote
+    // the BARE basename here — install.py / kg-sync / hooks then resolved
+    // KG_COLLECTION to a non-existent class while `.env` correctly carried
+    // the suffixed form, producing 4-way drift. Match the canonical form.
+    let kg_collection = format!("{}_KnowledgeGraph", kg_basename);
+    // Uppercase D for Development across every surface — matches `.env`
+    // template (line ~460) and install.py. Weaviate class names are
+    // case-sensitive so a lowercase `_development` resolves to a
+    // distinct (non-existent) collection.
+    let dev_collection = format!("{}_Development", kg_basename);
     // FIXME(2026-04-30): CONVERSATION_COLLECTION was deprecated along
     // with the capture flow. The MCP server no longer reads it. We still
     // write the env var here for backward-compat with older installs
@@ -225,7 +235,7 @@ pub fn write_project_env_files(folder: &Path, project_name: &str) -> Result<(), 
     // will see this env var pointing to a never-populated collection.
     // TODO: remove all conversation_collection references from this
     // file in a follow-up PR (see install.py 2026-04-30 removal).
-    let conv_collection = format!("{}_conversations", kg_collection);
+    let conv_collection = format!("{}_conversations", kg_basename);
     // Shared cross-project KG. Same name across all projects on this machine
     // — bundled with the orchestrator install (seeded from
     // vibecoded-orchestrator/knowledge/). Per-project SHARED_KG_OPT_OUT
@@ -274,7 +284,7 @@ pub fn write_project_env_files(folder: &Path, project_name: &str) -> Result<(), 
     }
     let vscode_env_block = serde_json::json!({
         "KG_COLLECTION": kg_collection,
-        "PROJECT_NAME": kg_collection,
+        "PROJECT_NAME": project_name,
         "DEVELOPMENT_COLLECTION": dev_collection,
         "CONVERSATION_COLLECTION": conv_collection,
         "SHARED_KG_COLLECTION": shared_kg_collection,
@@ -308,7 +318,7 @@ pub fn write_project_env_files(folder: &Path, project_name: &str) -> Result<(), 
          export SHARED_KG_COLLECTION=\"{}\"\n\
          export SHARED_KG_OPT_OUT=\"{}\"\n",
         kg_collection,
-        kg_collection,
+        project_name,
         dev_collection,
         conv_collection,
         shared_kg_collection,
@@ -356,7 +366,7 @@ pub fn write_project_env_files(folder: &Path, project_name: &str) -> Result<(), 
 
     let env_block = serde_json::json!({
         "KG_COLLECTION": kg_collection,
-        "PROJECT_NAME": kg_collection,
+        "PROJECT_NAME": project_name,
         "DEVELOPMENT_COLLECTION": dev_collection,
         "CONVERSATION_COLLECTION": conv_collection,
         "SHARED_KG_COLLECTION": shared_kg_collection,
@@ -925,9 +935,17 @@ mod tests {
         let raw = std::fs::read_to_string(&vscode_settings).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let env = &parsed["claude-code.env"];
-        assert_eq!(env["KG_COLLECTION"], "MyTest");
-        assert_eq!(env["PROJECT_NAME"], "MyTest");
-        assert_eq!(env["DEVELOPMENT_COLLECTION"], "MyTest_development");
+        // 2026-05-01: KG_COLLECTION carries the FULL Weaviate class name
+        // (suffixed), matching `.env` and the rest of the ecosystem. Was
+        // bare `MyTest` until the bare-kg fix.
+        assert_eq!(env["KG_COLLECTION"], "MyTest_KnowledgeGraph");
+        // PROJECT_NAME is the raw user-supplied name, not the sanitized
+        // Weaviate basename. Was `MyTest` (sanitized) before; now matches
+        // install.py + the .env template.
+        assert_eq!(env["PROJECT_NAME"], "My Test");
+        // Uppercase D for Development across every surface — Weaviate
+        // class names are case-sensitive.
+        assert_eq!(env["DEVELOPMENT_COLLECTION"], "MyTest_Development");
         assert_eq!(env["CONVERSATION_COLLECTION"], "MyTest_conversations");
         // Shared-KG fields propagate to all three surfaces.
         assert_eq!(env["SHARED_KG_COLLECTION"], "VibeCodedTools_KnowledgeGraph");
@@ -937,9 +955,9 @@ mod tests {
         let claude_env = tmp.join(".claude/env");
         assert!(claude_env.exists());
         let env_raw = std::fs::read_to_string(&claude_env).unwrap();
-        assert!(env_raw.contains(r#"export KG_COLLECTION="MyTest""#));
-        assert!(env_raw.contains(r#"export PROJECT_NAME="MyTest""#));
-        assert!(env_raw.contains(r#"export DEVELOPMENT_COLLECTION="MyTest_development""#));
+        assert!(env_raw.contains(r#"export KG_COLLECTION="MyTest_KnowledgeGraph""#));
+        assert!(env_raw.contains(r#"export PROJECT_NAME="My Test""#));
+        assert!(env_raw.contains(r#"export DEVELOPMENT_COLLECTION="MyTest_Development""#));
         assert!(env_raw.contains(r#"export SHARED_KG_COLLECTION="VibeCodedTools_KnowledgeGraph""#));
         assert!(env_raw.contains(r#"export SHARED_KG_OPT_OUT="false""#));
 
@@ -949,12 +967,47 @@ mod tests {
         let raw = std::fs::read_to_string(&claude_settings).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let env = &parsed["env"];
-        assert_eq!(env["KG_COLLECTION"], "MyTest");
-        assert_eq!(env["PROJECT_NAME"], "MyTest");
-        assert_eq!(env["DEVELOPMENT_COLLECTION"], "MyTest_development");
+        assert_eq!(env["KG_COLLECTION"], "MyTest_KnowledgeGraph");
+        assert_eq!(env["PROJECT_NAME"], "My Test");
+        assert_eq!(env["DEVELOPMENT_COLLECTION"], "MyTest_Development");
         assert_eq!(env["CONVERSATION_COLLECTION"], "MyTest_conversations");
         assert_eq!(env["SHARED_KG_COLLECTION"], "VibeCodedTools_KnowledgeGraph");
         assert_eq!(env["SHARED_KG_OPT_OUT"], "false");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn env_surfaces_agree_after_write_project_env_files() {
+        // 4-way equality regression: KG_COLLECTION must be IDENTICAL across
+        // .env (template), .vscode/settings.json claude-code.env block,
+        // .claude/env POSIX exports, and .claude/settings.json env block.
+        // Pre-fix: bare in three, suffixed in .env → the bug VideoFrames hit.
+        let tmp = std::env::temp_dir().join(format!(
+            "vct-env-parity-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        write_project_env_files(&tmp, "VideoFrames").unwrap();
+        ensure_project_env_template(&tmp, "VideoFrames").unwrap();
+
+        let env_text = std::fs::read_to_string(tmp.join(".env")).unwrap();
+        let vsc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(tmp.join(".vscode/settings.json")).unwrap()).unwrap();
+        let claude_env_text = std::fs::read_to_string(tmp.join(".claude/env")).unwrap();
+        let cs: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(tmp.join(".claude/settings.json")).unwrap()).unwrap();
+
+        assert!(env_text.contains("KG_COLLECTION=VideoFrames_KnowledgeGraph"));
+        assert_eq!(vsc["claude-code.env"]["KG_COLLECTION"], "VideoFrames_KnowledgeGraph");
+        assert!(claude_env_text.contains(r#"export KG_COLLECTION="VideoFrames_KnowledgeGraph""#));
+        assert_eq!(cs["env"]["KG_COLLECTION"], "VideoFrames_KnowledgeGraph");
+
+        assert!(env_text.contains("DEVELOPMENT_COLLECTION=VideoFrames_Development"));
+        assert_eq!(vsc["claude-code.env"]["DEVELOPMENT_COLLECTION"], "VideoFrames_Development");
+        assert!(claude_env_text.contains(r#"export DEVELOPMENT_COLLECTION="VideoFrames_Development""#));
+        assert_eq!(cs["env"]["DEVELOPMENT_COLLECTION"], "VideoFrames_Development");
 
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -986,7 +1039,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
 
         // env block was replaced with our values
-        assert_eq!(v["env"]["KG_COLLECTION"], "MyProject");
+        assert_eq!(v["env"]["KG_COLLECTION"], "MyProject_KnowledgeGraph");
         assert_eq!(v["env"]["PROJECT_NAME"], "MyProject");
         // Old env keys are gone — top-level env is replaced wholesale.
         assert!(v["env"].get("OLD_KEY").is_none());
@@ -1026,7 +1079,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(v["editor.formatOnSave"], true);
         assert_eq!(v["python.defaultInterpreterPath"], "/usr/bin/python3");
-        assert_eq!(v["claude-code.env"]["KG_COLLECTION"], "MyProject");
+        assert_eq!(v["claude-code.env"]["KG_COLLECTION"], "MyProject_KnowledgeGraph");
         // Old env key is gone — claude-code.env is replaced wholesale.
         assert!(v["claude-code.env"].get("OLD_KEY").is_none());
 
@@ -1049,7 +1102,7 @@ mod tests {
 
         let raw = std::fs::read_to_string(&path).unwrap();
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(v["env"]["KG_COLLECTION"], "MyProject");
+        assert_eq!(v["env"]["KG_COLLECTION"], "MyProject_KnowledgeGraph");
 
         std::fs::remove_dir_all(&tmp).ok();
     }

@@ -428,9 +428,13 @@ class EnsureCollectionsAdoptModeTests(unittest.TestCase):
         finally:
             server.shutdown()
 
-    def test_self_managed_keeps_bare_defaults(self):
-        """When we own the Weaviate (not adopt), bare defaults are fine
-        and we must not derive basename-prefixed names."""
+    def test_self_managed_uses_derived_kg_name(self):
+        """When we own the Weaviate (not adopt), derive per-project names from
+        PROJECT_ROOT basename — bare `KnowledgeGraph` / `Development` collide
+        with sibling installs sharing the same Weaviate. Was previously
+        ``test_self_managed_keeps_bare_defaults``; the bare-default behaviour
+        was the source of the VideoFrames KG-collision bug fixed 2026-05-01.
+        """
         server, port, _ = _start_server()
         try:
             _Handler.schema = {"classes": []}
@@ -447,8 +451,13 @@ class EnsureCollectionsAdoptModeTests(unittest.TestCase):
                     {}, decisions=decisions, args=_ns(yes=True),
                 )
             posted_classes = [p.get("class") for p in _Handler.posted]
-            self.assertIn("KnowledgeGraph", posted_classes)
-            self.assertIn("Development", posted_classes)
+            expected_kg = install._derive_project_kg_name(install.PROJECT_ROOT)
+            expected_dev = install._derive_project_dev_name(install.PROJECT_ROOT)
+            self.assertIn(expected_kg, posted_classes)
+            self.assertIn(expected_dev, posted_classes)
+            # Defence in depth: bare names must NOT be created.
+            self.assertNotIn("KnowledgeGraph", posted_classes)
+            self.assertNotIn("Development", posted_classes)
         finally:
             for k in ("KG_COLLECTION", "DEVELOPMENT_COLLECTION",
                       "SHARED_KG_COLLECTION"):
