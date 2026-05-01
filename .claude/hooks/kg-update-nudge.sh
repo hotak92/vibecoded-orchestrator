@@ -48,8 +48,9 @@ set -uo pipefail
 INPUT="$(cat 2>/dev/null || true)"
 [ -z "$INPUT" ] && exit 0
 
-FIRST_THRESHOLD="${KG_NUDGE_FIRST:-500000}"
-INTERVAL="${KG_NUDGE_INTERVAL:-200000}"
+FIRST_THRESHOLD="${KG_NUDGE_FIRST:-175000}"
+INTERVAL="${KG_NUDGE_INTERVAL:-50000}"
+METRIC_VERSION="v10"
 METRICS_DIR="$HOME/.claude/metrics"
 METRICS_FILE="$METRICS_DIR/kg_update_tokens.jsonl"
 
@@ -67,6 +68,7 @@ INPUT = """$INPUT"""
 FIRST_THRESHOLD = $FIRST_THRESHOLD
 INTERVAL = $INTERVAL
 METRICS_FILE = "$METRICS_FILE"
+METRIC_VERSION = "$METRIC_VERSION"
 
 try:
     payload = json.loads(INPUT)
@@ -172,17 +174,31 @@ if os.path.isfile(os.path.join(_scripts_dir, "claude_token_counter.py")):
         pass
 
 if _have_scanner and transcript_path and os.path.exists(transcript_path):
+    # v10.1: import the marker-scan helper that strips hook-body fingerprints
+    # before regex match (B13 self-suppression fix). Falls back gracefully
+    # if old version of the module is loaded.
+    try:
+        from claude_token_counter import iter_assistant_text_for_marker_scan
+        _iter_for_marker = iter_assistant_text_for_marker_scan
+    except ImportError:
+        _iter_for_marker = iter_assistant_text  # legacy fallback (v10)
+
     _escape_holder = [0]
-    def _on_msg(entry, msg, running_cc):
-        # Escape-hatch detection: only top-level assistant text.
-        # Capture session_total at the time of the LATEST marker so the
-        # baseline-reset logic can compare against current baseline.
-        for t in iter_assistant_text(msg):
+    def _on_msg(entry, msg, running_units):
+        # Escape-hatch detection: only top-level assistant text, with
+        # nudge-body fingerprint stripping. Capture work_units_total at
+        # the time of the LATEST marker so the baseline-reset logic can
+        # compare against current baseline.
+        for t in _iter_for_marker(msg):
             if NO_KG_UPDATE_MARKER_RE.search(t):
-                _escape_holder[0] = running_cc
+                _escape_holder[0] = running_units
                 break
     scan_result = TranscriptScanner().scan(transcript_path, on_assistant_message=_on_msg)
-    session_total = scan_result.cache_creation_total
+    # v10.1 (B1 fix): use work_units_total (production+intake) instead of
+    # cache_creation_total (cost-only). cache_creation grew with hook-injected
+    # context per turn, not with what the model actually produced or
+    # processed — wrong signal for "work done since last KG save".
+    session_total = scan_result.work_units_total
     escape_marker_token_total = _escape_holder[0]
 
 # --- Read existing state ---
@@ -204,13 +220,23 @@ if os.path.exists(METRICS_FILE):
     except OSError:
         pass
 
-current = state.get(session_id, {
+# v10.1 (B14): drop pre-v10.1 entries on metric-version mismatch.
+# Earlier versions stored cache_creation-scale baselines (~10× larger
+# than v10.1's work_units_total). Without this migration, baseline can
+# move backwards on first KG-write reset under v10.1, suppressing
+# nudges indefinitely. Dropping the entry triggers a fresh baseline
+# from current scan, which is correct.
+existing = state.get(session_id)
+if existing and existing.get("metric_version") != METRIC_VERSION:
+    existing = None
+current = existing if existing else {
     "session_id": session_id,
     "baseline": 0,
     "last_nudge_at": 0,
     "last_seen_total": 0,
     "fired_once": False,
-})
+    "metric_version": METRIC_VERSION,
+}
 
 # --- Escape-hatch: "[No KG update needed]" marker in latest assistant turn ---
 # v6 (2026-04-30): if the assistant explicitly declared no-KG-needed for
@@ -264,11 +290,15 @@ elif is_user_prompt:
     if should_fire:
         kilo = round(delta / 1000)
         if not fired_once:
-            preamble = f"📚 KG-update nudge: ~{kilo}k tokens of work since the last knowledge-graph update."
+            preamble = (
+                f"📚 KG-update nudge: ~{kilo}k work units accumulated since the last "
+                f"knowledge-graph update (cumulative session work, not live context size — "
+                f"work units = output tokens + intake from Read/Web/Agent/Bash + file edits authored)."
+            )
         else:
             since_last = round((session_total - last_nudge_at) / 1000)
             preamble = (
-                f"📚 KG-update nudge ({kilo}k tokens since last KG-write, "
+                f"📚 KG-update nudge ({kilo}k work units since last KG-write, "
                 f"{since_last}k since last nudge — escalating because no KG node was written between nudges)."
             )
         msg = preamble + """ Counter resets on Write or Edit to knowledge/**/*.md OR store_knowledge_node calls.
@@ -298,6 +328,7 @@ else:
 if session_total:
     current["last_seen_total"] = session_total
 current["updated_at"] = datetime.now(timezone.utc).isoformat()
+current["metric_version"] = METRIC_VERSION
 state[session_id] = current
 
 # --- Atomic write ---
