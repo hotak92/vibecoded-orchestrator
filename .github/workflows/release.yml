@@ -189,7 +189,12 @@ jobs:
       # `-experimental` binary, others attest the canonical filename.
       - name: Generate build provenance attestation
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: actions/attest-build-provenance@v2
+        # v4 wraps actions/attest@v4 — both run on Node 24, fixing the
+        # Node 20 deprecation warnings (Node 20 removed from runners
+        # 2026-09-16). v4 also marks attest-build-provenance as a thin
+        # compat wrapper; new logic should call actions/attest directly,
+        # but for an existing release pipeline v4 is the minimal upgrade.
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: launcher/dist/${{ matrix.target }}/_release/${{ (startsWith(matrix.target, 'macos-')) && format('vct-launcher-{0}-experimental', matrix.target) || matrix.binary }}
 
