@@ -58,6 +58,9 @@ Default-on. Copies bundled agent templates from `templates/agents/free/` into `~
 ### `--with-skills` / `--no-skills`
 Default-on. Copies skill directories from `templates/skills/` into `~/.claude/skills/`. `.md` files get placeholder substitution; other files are copied raw.
 
+### `--no-compile`
+Skips Step 11b (bytecode pre-compile of orchestrator Python modules). Default is to run `python -m compileall` against `VCThelpers/`, `claude_mcp_servers/`, `tools/`, `vco_lib/`, and `.claude/scripts/` so first-import is ~50-200ms faster per cold module. Best-effort: per-directory failures warn but never abort. Cross-OS via stdlib `compileall`. Skip in dev/CI runs where the speedup doesn't matter.
+
 ### `--telemetry on|off`
 Explicit telemetry consent for the generated `.env`. Default is prompt-on-TTY; non-interactive defaults to `off`. The generated `.env` always contains an explicit `VIBECODED_TELEMETRY=true|false` line so consent state is auditable.
 
@@ -75,7 +78,7 @@ Switches the installer to uninstall mode. Pairs with `--keep-data`, `--remove-pr
 ## Installation Steps
 
 ### Step ordering (1/10 … 10/10)
-install.py runs 10 numbered steps: (1) Python version, (2) system detection, (2b) optional companions, (3) embedding config, (4) venv creation, (5) pip install, (6) container services + model pull, (7b) Weaviate collection bootstrap, (8) `state/` creation, (9) `.env` write, (9b) agents/skills, (10) Claude CLI check.
+install.py runs 10 numbered steps: (1) Python version, (2) system detection, (2b) optional companions, (3) embedding config, (4) venv creation, (5) pip install, (6) container services + model pull, (7b) Weaviate collection bootstrap, (8) `state/` creation, (9) `.env` write, (9b) agents/skills, (10) Claude CLI check. Followed by an optional Step 11b (bytecode pre-compile, opt-out via `--no-compile`).
 
 ### Idempotency
 Each step checks before acting. Venv creation is skipped if `.venv/bin/python` exists. `.env` write is skipped if `.env` already exists. Agents/skills skip files already present. Weaviate collection creation is skipped per-collection if it already exists (tolerates 422 "already exists" race). Container start probes service ports first and skips services already running.
