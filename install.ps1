@@ -43,6 +43,9 @@
     Install MAO-tier specialist agents.
 .PARAMETER NoSkills
     Skip installing Claude skills.
+.PARAMETER NoCompile
+    Skip the bytecode-compile step (Step 11b). First import of orchestrator
+    modules will be ~50-200ms slower; useful for dev/CI runs.
 .PARAMETER NonInteractive
     Refuse to auto-install Python; fail with a hint instead.
 #>
@@ -62,6 +65,7 @@ param(
     [switch]$NoAgents,
     [switch]$WithMaoAgents,
     [switch]$NoSkills,
+    [switch]$NoCompile,
     [switch]$NonInteractive
 )
 
@@ -243,6 +247,7 @@ if ($NoJoern)       { $installArgs += "--no-joern" }
 if ($NoAgents)      { $installArgs += "--no-agents" }
 if ($WithMaoAgents) { $installArgs += "--with-mao-agents" }
 if ($NoSkills)      { $installArgs += "--no-skills" }
+if ($NoCompile)     { $installArgs += "--no-compile" }
 
 if ($pythonArgs.Count -gt 0) {
     & $pythonCmd @pythonArgs install.py @installArgs
