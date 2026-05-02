@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6] — 2026-05-02
+
+### Changed
+- **Project install/update overhaul.** `create_project_v2` now bundles all
+  orchestrator infrastructure on first install (hooks, scripts, agents,
+  skills, MCP servers, per-project Weaviate collection bootstrap). New
+  `update_project_v2` keeps installed projects in sync non-destructively
+  via a manifest-based drift detector — user-modified files are preserved,
+  conflicts produce a `.md` reference note for Claude Code to resolve.
+  Schema migrations port existing collection data instead of recomputing
+  embeddings. Install/init logic extracted into `vco_lib/project_init.py`
+  as a single source of truth shared by launcher and CLI.
+- **Asymmetric SHARED_KG semantics.** All projects can READ the shared
+  knowledge graph; per-project toggle now gates only WRITES. Lets a
+  project consume cross-project patterns without polluting the shared
+  collection.
+- **KG-update-nudge counter (v10.1).** Replaced the v9 `cache_creation`
+  proxy (cost-accurate but work-blind) with a `work_units_total` formula
+  that sums output tokens + bounded intake from Read/Write/Edit/Web/
+  Agent/Bash. Thresholds: 175k first nudge, 50k subsequent. Per-tool
+  caps prevent any single call from triggering on its own. Two
+  adversarial Opus reviews validated the design.
+
+### Added
+- **Full cross-OS hook parity.** Every `.sh` hook now ships with a
+  matching `.ps1` sibling. macOS bash 3.2 quirks fixed (no `[[ ]]`
+  regex, no `${var,,}`, no associative arrays). Zero `OS-EXEMPT-PARITY`
+  shortcuts.
+- **Bytecode pre-compile (Step 11b).** New default-on install step runs
+  `python -m compileall` on orchestrator Python directories so first
+  import is ~50-200ms faster per cold module. Opt-out via `--no-compile`
+  (Linux/macOS) or `-NoCompile` (Windows). Best-effort: per-directory
+  failures warn but never abort. Cross-OS via stdlib `compileall`.
+- Vercel token-leak guard hook bundled into installed projects.
+- AMD ROCm overlay + VRAM-aware Ollama model selection.
+- Phase 1 `~/.vct-secrets/` shared/per-project secret layout with
+  legacy-path fallback.
+
+### Fixed
+- Bare `KG_COLLECTION` bug across all 4 env surfaces; canonical
+  per-project collection naming end-to-end.
+- KG-nudge baseline reset on `Edit`/`Write` to any `**/knowledge/**.md`
+  (not only project-local).
+- Agent effort frontmatter recalibrated per-model (Opus 4.7 caps
+  `xhigh`, Haiku → `high`).
+
 ### Security
 - Sanitized leaked Lemon Squeezy webhook signing secret from
   `launcher/docs/SETUP.md` and `launcher/docs/HANDOFF-MARTINO.md`. The
@@ -47,5 +93,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Default-OFF telemetry (explicit opt-in required; default `.env` writes `VIBECODED_TELEMETRY=false`).
 - Public alias for license validation (`https://api.vibecodedtools.it/validate-tier`); internal Supabase URLs are not committed to public source.
 
-[Unreleased]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.1.5...v0.1.6
 [0.1.0]: https://github.com/hotak92/vibecoded-orchestrator/releases/tag/v0.1.0

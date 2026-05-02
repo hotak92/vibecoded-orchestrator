@@ -1502,6 +1502,10 @@ def main() -> int:
                         help="Install Claude Code hooks + merge .claude/settings.json (default: on)")
     parser.add_argument("--no-hooks", dest="with_hooks", action="store_false",
                         help="Skip installing hooks and the settings.json template")
+    parser.add_argument("--no-compile", dest="compile_pyc", action="store_false", default=True,
+                        help="Skip the bytecode-compile step (Step 11b). First import of "
+                             "orchestrator modules will be ~50-200ms slower; useful for "
+                             "dev/CI runs where the speedup doesn't matter.")
     parser.add_argument("--telemetry", choices=["on", "off"], default=None,
                         help="Anonymous telemetry consent. Default: prompt; "
                              "non-interactive runs default to 'off'.")
@@ -1946,6 +1950,15 @@ def main() -> int:
 
     # Step 11: Initial code graph analysis (if repo has code)
     # Skipped on first install — user runs manually after setup
+
+    # Step 11b: Bytecode compilation. Pre-compile installed Python
+    # modules to .pyc so first import doesn't pay per-module compile
+    # cost (~50-200ms savings per cold module). Cross-OS: stdlib
+    # `compileall` is identical on Linux/macOS/Windows.
+    if args.compile_pyc:
+        _compile_python_modules(venv_python)
+    else:
+        print("[skip] Bytecode compilation (--no-compile)")
 
     # Deliverable 2 (2026-04-28): snapshot the post-install state-hash
     # set (requirements.txt / Cargo.lock / package.json / knowledge/).
@@ -5980,6 +5993,79 @@ def _install_playwright_browsers() -> None:
         print(f"  WARN: chromium install failed: {e}")
         _log_install_event("playwright", "warn",
                            f"npx playwright install chromium failed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Step 11b: Bytecode compilation (D8 of nuitka-decisions-2026-04-25)
+# ---------------------------------------------------------------------------
+
+def _compile_python_modules(venv_python: Path) -> None:
+    """Pre-compile installed Python modules to .pyc for faster first import.
+
+    Runs ``python -m compileall -q -j 0`` (stdlib, cross-OS) on every
+    orchestrator-managed Python directory that exists. The compiled
+    .pyc files land in ``__pycache__/`` next to the source — the runtime
+    Python interpreter picks them up automatically on first import.
+
+    Speedup: ~50-200ms per cold module (covers ~95% of the perceived
+    "slow startup" complaint without the build-chain complexity of
+    ahead-of-time compilers like Nuitka).
+
+    Idempotent: safe to re-run on ``--update`` (compileall just refreshes
+    existing .pyc when source mtime is newer).
+
+    Best-effort: per-directory failures log a WARN line but never abort
+    the install. The runtime falls back to compile-on-import for any
+    module whose .pyc didn't land — only cost is one-shot startup
+    latency, never a correctness issue.
+
+    Cross-OS: ``compileall`` is part of the Python stdlib on every
+    platform; no extra dependency required.
+    """
+    print("[+] Compiling Python modules to bytecode ... ",
+          end="", flush=True)
+
+    # Orchestrator-managed Python dirs that benefit from pre-compile.
+    # vco_lib, .claude/scripts (relocated 2026-04-30 in PR #80), and
+    # claude_mcp_servers are hot-imported by hooks; VCThelpers + tools
+    # are hit during install/maintenance flows.
+    candidate_paths = [
+        "VCThelpers",
+        "claude_mcp_servers",
+        "tools",
+        "vco_lib",
+        ".claude/scripts",
+    ]
+    targets = [
+        PROJECT_ROOT / rel for rel in candidate_paths
+        if (PROJECT_ROOT / rel).is_dir()
+    ]
+
+    if not targets:
+        print("SKIP (no Python module dirs found)")
+        return
+
+    error_dirs: list[str] = []
+    for target in targets:
+        cmd = [str(venv_python), "-m", "compileall",
+               "-q", "-j", "0", str(target)]
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=120,
+            )
+            if result.returncode != 0:
+                error_dirs.append(target.name)
+        except subprocess.TimeoutExpired:
+            error_dirs.append(f"{target.name} (timeout)")
+        except OSError as e:
+            error_dirs.append(f"{target.name} ({e})")
+
+    if not error_dirs:
+        print(f"OK ({len(targets)} dirs)")
+    else:
+        print(f"WARN ({len(error_dirs)}/{len(targets)} dirs had errors: "
+              f"{', '.join(error_dirs)}; install ok, first import of "
+              f"affected modules will rebuild bytecode at runtime)")
 
 
 # ---------------------------------------------------------------------------
