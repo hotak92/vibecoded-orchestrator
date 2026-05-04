@@ -41,7 +41,7 @@ ollama>=0.6.1
 
 # ─── Code embedding service (runs in container, but needed for CPU fallback) ───
 # sentence-transformers (Apache 2.0)
-sentence-transformers>=3.0
+sentence-transformers>=5.4.1
 # transformers pinned for CodeSage Conv1D compatibility
 transformers>=4.40.0,<5.0.0
 # PyTorch (BSD-3-Clause) — for RL pipeline (Pro) and code embeddings (CPU fallback)
