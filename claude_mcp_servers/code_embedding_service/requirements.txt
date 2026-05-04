@@ -1,4 +1,8 @@
 sentence-transformers>=5.0.0
+# transformers must stay <5 — see root requirements.txt for the full
+# rationale. Tl;dr: CodeSage-Large-v2's modeling_codesage.py never calls
+# post_init(), and transformers v5 crashes (by design) on models that
+# don't. Validated 2026-05-04 against v5.0.0 and v5.7.0.
 transformers>=4.40.0,<5.0.0
 fastapi>=0.136.1
 uvicorn>=0.46.0
