@@ -24,6 +24,11 @@ pub enum InstallStage {
     Clone,
     PostInstall,
     Done,
+    // TODO: emit on install error (today errors propagate via Result and
+    // the progress channel never receives a Failed stage event — UI just
+    // sees the channel hang up). Wire a `report_error(stage, msg)` path
+    // through `installer_engine::run` to send Failed before propagating.
+    #[allow(dead_code)]
     Failed,
 }
 

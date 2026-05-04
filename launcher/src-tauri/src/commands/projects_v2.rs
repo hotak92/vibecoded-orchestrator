@@ -108,6 +108,7 @@ pub struct UpdateSummary {
 impl UpdateSummary {
     /// Total operations classified across all action buckets. Used in
     /// tests to verify counts tally with the JSON envelope.
+    #[allow(dead_code)]
     pub fn total_ops(&self) -> u32 {
         self.created
             + self.overwritten
@@ -155,6 +156,7 @@ pub const SETTING_KEY_SHARED_KG_OPT_OUT_LEGACY: &str = "shared_kg_opt_out";
 /// (and the legacy Tauri command) still reference this; new code should use
 /// `SETTING_KEY_SHARED_KG_WRITE_DISABLED` directly. Slated for removal in
 /// the same window as the legacy command + env var.
+#[allow(dead_code)]
 pub const SETTING_KEY_SHARED_KG_OPT_OUT: &str = SETTING_KEY_SHARED_KG_WRITE_DISABLED;
 
 /// One-shot, idempotent migration: if a DB row exists under the LEGACY key
@@ -222,6 +224,7 @@ pub fn get_shared_kg_write_disabled(db: &Db, project_id: &str) -> Result<bool, S
     note = "Use `get_shared_kg_write_disabled` — the toggle now gates WRITES \
             only. Reads of the shared KG are always on."
 )]
+#[allow(dead_code)]
 pub fn get_shared_kg_opt_out(db: &Db, project_id: &str) -> Result<bool, String> {
     get_shared_kg_write_disabled(db, project_id)
 }

@@ -2,9 +2,12 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tauri::{command, Emitter, Window};
 
-/// Upstream GitHub repo (used ONLY by auto-update — initial install is a
-/// local file copy from the launcher's own bundled repo source, see
-/// `find_local_repo_root` + `copy_orchestrator_to_sync`).
+/// Upstream GitHub repo. Auto-update isn't fully wired yet — initial
+/// install is a local file copy from the launcher's bundled repo source
+/// (see `find_local_repo_root` + `copy_orchestrator_to_sync`). This
+/// constant is here for the future auto-update path that fetches
+/// new bundled-orchestrator releases from upstream.
+#[allow(dead_code)]
 const ORCHESTRATOR_REPO: &str = "https://github.com/hotak92/vibecoded-orchestrator.git";
 
 // ---------------------------------------------------------------------------
@@ -2362,20 +2365,6 @@ pub fn parse_meminfo_total_kb(meminfo: &str) -> Option<u64> {
     None
 }
 
-/// Convert MemTotal kB → GB with half-step rounding so 65857132 kB
-/// (≈62.8 GiB / 67.4 GB worth of binary kB) rounds to 64 GB cleanly.
-/// Without the +0.5 nudge sysinfo's plain divide reports 62.
-///
-/// Kept around for tests / callers that want raw GiB. Production
-/// display uses `snap_to_common_ram_gb` instead so the user sees the
-/// marketed stick capacity (e.g. "64 GB") rather than the post-kernel-
-/// reserve value (e.g. "62 GB").
-pub fn meminfo_kb_to_gb(kb: u64) -> u64 {
-    // 1 GB (binary) = 1024 * 1024 kB. Add half a GB for round-to-nearest.
-    let denom: u64 = 1024 * 1024;
-    (kb + denom / 2) / denom
-}
-
 /// Snap MemTotal (kB) to the closest common DDR stick capacity in
 /// decimal GB. Linux's `MemTotal` reports physical RAM minus kernel
 /// reserves, which on a "64 GB" machine yields ~62.4 GiB. We snap UP
@@ -3293,16 +3282,9 @@ MemAvailable:   23456789 kB
 ";
         let kb = parse_meminfo_total_kb(sample).unwrap();
         assert_eq!(kb, 65857132);
-        // 65857132 kB ≈ 62.81 GiB, rounds to 63 → BUT user wants 64.
-        // The half-step divisor is GB (binary) so we truncate-with-round.
-        let gb = meminfo_kb_to_gb(kb);
-        // 65857132 / (1024*1024) = 62.8 → +0.5 → 63 (binary GiB).
-        // The user's 62 GB display from sysinfo comes from sysinfo
-        // reporting MemAvailable rather than MemTotal. Reading
-        // MemTotal directly already gets us to ≥63 GiB which displays
-        // as the manufacturer's "64 GB" sticker after rounding up at
-        // the OS-vendor level.
-        assert!(gb >= 62);
+        // 65857132 kB ≈ 62.81 GiB. Production display goes through
+        // `snap_to_common_ram_gb` which snaps to 64 (the marketed
+        // stick capacity); a separate test below pins that behaviour.
     }
 
     #[test]
@@ -3424,18 +3406,6 @@ MemAvailable:   23456789 kB
         // settings.json (json parse), CLAUDE.md (empty), vct-module.json (missing)
         assert!(bad >= 3, "expected ≥3 bad checks, got {:?}", s.config_health);
         fs::remove_dir_all(&p).ok();
-    }
-
-    #[test]
-    fn test_meminfo_kb_to_gb_half_step_rounding() {
-        // 1 GB exactly
-        assert_eq!(meminfo_kb_to_gb(1024 * 1024), 1);
-        // 1.4 GB → 1
-        assert_eq!(meminfo_kb_to_gb((1024 * 1024) * 14 / 10), 1);
-        // 1.6 GB → 2
-        assert_eq!(meminfo_kb_to_gb((1024 * 1024) * 16 / 10), 2);
-        // 0 → 0
-        assert_eq!(meminfo_kb_to_gb(0), 0);
     }
 
     // ─── Bug 29: shared-container detection ────────────────────────

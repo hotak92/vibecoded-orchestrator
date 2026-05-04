@@ -397,6 +397,32 @@ pub async fn set_project_kg_binding(
     Ok(row)
 }
 
+/// Remove a project's KG binding for a given role. Used by the launcher
+/// GUI when the user wants to unbind a project from a KG collection
+/// (e.g. revoke "shared" so the project no longer mounts the shared KG,
+/// or fully unbind "primary" so the project temporarily has no KG of
+/// its own). Does NOT delete the underlying Weaviate collection — that
+/// stays around so other projects bound to the same collection still
+/// see their data, and so the user can re-bind without losing nodes.
+///
+/// Idempotent: removing a non-existent (project_id, role) pair is a
+/// no-op (DELETE … WHERE returns 0 affected rows, never errors).
+#[command]
+pub async fn delete_project_kg_binding(
+    project_id: String,
+    role: String,
+    db: State<'_, Db>,
+) -> Result<(), String> {
+    db.delete_project_kg_binding(&project_id, &role)?;
+    db.audit(
+        "project_kg_binding_delete",
+        Some(&project_id),
+        None,
+        &serde_json::json!({ "role": role }),
+    )?;
+    Ok(())
+}
+
 /// POSTs a canonical KG-collection schema to Weaviate `/v1/schema` if
 /// the collection does not yet exist. Schema mirrors the layout used
 /// across multiple orchestrator instances:
@@ -522,4 +548,31 @@ pub async fn set_project_codegraph_binding(
         &serde_json::json!({ "prefix": req.collection_prefix }),
     )?;
     Ok(row)
+}
+
+/// Remove a project's codegraph binding. Used by the launcher GUI when
+/// the user wants to unbind a project from its codegraph index (e.g.
+/// stop maintaining a code graph for a finished sub-project, or rebind
+/// to a different collection prefix). Does NOT delete the underlying
+/// Weaviate collection — that stays around so the user can re-bind
+/// without losing parsed entities.
+///
+/// Codegraph binding is single-keyed on project_id (no role concept,
+/// unlike KG which has primary/shared/archive), so this command takes
+/// only a project_id.
+///
+/// Idempotent: removing a non-existent project_id is a no-op.
+#[command]
+pub async fn delete_project_codegraph_binding(
+    project_id: String,
+    db: State<'_, Db>,
+) -> Result<(), String> {
+    db.delete_project_codegraph_binding(&project_id)?;
+    db.audit(
+        "project_codegraph_binding_delete",
+        Some(&project_id),
+        None,
+        &serde_json::json!({}),
+    )?;
+    Ok(())
 }

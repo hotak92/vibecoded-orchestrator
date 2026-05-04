@@ -36,6 +36,11 @@ use crate::secrets::{self, SecretScope};
 
 // ─── Secrets ────────────────────────────────────────────────────────────
 
+// TODO: wire — defined for the secrets-list UI but no command emits it
+// yet. The current secret list page reads `get_secret_status_v2` per
+// key. When we add a "list all secrets for this project" panel, that
+// command should return Vec<SecretMetadata>.
+#[allow(dead_code)]
 #[derive(Debug, Serialize)]
 pub struct SecretMetadata {
     pub key: String,

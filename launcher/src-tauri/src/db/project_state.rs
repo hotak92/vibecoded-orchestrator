@@ -1225,6 +1225,58 @@ mod tests {
     }
 
     #[test]
+    fn delete_kg_binding_removes_only_target_role() {
+        let db = make_db();
+        seed_project(&db, "p1", "Project One");
+        db.set_project_kg_binding(
+            "p1", "primary", "P1Primary", None, None, None, None, &JsonValue::Null,
+        )
+        .unwrap();
+        db.set_project_kg_binding(
+            "p1", "shared", "SharedKG", None, None, None, None, &JsonValue::Null,
+        )
+        .unwrap();
+        // Both bindings present.
+        let bindings = db.list_project_kg_bindings("p1").unwrap();
+        assert_eq!(bindings.len(), 2);
+
+        // Remove only the shared role; primary stays.
+        db.delete_project_kg_binding("p1", "shared").unwrap();
+        let bindings = db.list_project_kg_bindings("p1").unwrap();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].role, "primary");
+
+        // Idempotent: deleting again is a no-op (0 affected rows, no error).
+        db.delete_project_kg_binding("p1", "shared").unwrap();
+        let bindings = db.list_project_kg_bindings("p1").unwrap();
+        assert_eq!(bindings.len(), 1);
+    }
+
+    #[test]
+    fn delete_codegraph_binding_unbinds_cleanly() {
+        let db = make_db();
+        seed_project(&db, "p1", "Project One");
+        db.set_project_codegraph_binding(
+            "p1",
+            "P1Code",
+            Some("CodeSage-Large-v2"),
+            Some(2048),
+            None,
+            None,
+            true,
+            &JsonValue::Null,
+        )
+        .unwrap();
+        assert!(db.get_project_codegraph_binding("p1").unwrap().is_some());
+
+        db.delete_project_codegraph_binding("p1").unwrap();
+        assert!(db.get_project_codegraph_binding("p1").unwrap().is_none());
+
+        // Idempotent.
+        db.delete_project_codegraph_binding("p1").unwrap();
+    }
+
+    #[test]
     fn permissions_multiple_per_subject() {
         let db = make_db();
         seed_project(&db, "p1", "Project One");
