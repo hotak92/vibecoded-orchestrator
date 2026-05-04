@@ -5135,7 +5135,7 @@ dependencies = [
  "tauri-plugin-opener",
  "tempfile",
  "tokio",
- "toml 0.8.2",
+ "toml 0.9.12+spec-1.1.0",
  "tower-http",
  "uuid",
 ]

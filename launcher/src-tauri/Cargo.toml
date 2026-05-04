@@ -57,7 +57,7 @@ mac_address = "1"
 hex = "0.4"
 
 # Bug 31: launcher.toml config (volume location, etc.)
-toml = "0.8"
+toml = "0.9"
 
 # Bug 31 tests: tempdir for filesystem fixtures (also used by Bug 31
 # volumes module for non-test tempdir uses).
