@@ -1,3 +1,29 @@
+# Dependabot configuration for hotak92/vibecoded-orchestrator.
+#
+# Each ecosystem uses `groups:` so that minor + patch bumps land in a single
+# rolled-up PR per week instead of one PR per dependency. Major bumps still
+# get individual PRs — they need closer review and often have breaking
+# changes (see e.g. the transformers v4 → v5 case where pytest CI greenness
+# is a misleading signal because the load-bearing test path is the runtime
+# embedding service, not the unit-test sweep).
+#
+# Past behaviour (no groups): one Monday spawned 19 open PRs across the 5
+# ecosystems below. Most were patch-level and individually green; the noise
+# obscured the few that needed real review.
+#
+# New behaviour with groups + `applies-to: version-updates`:
+#   - 1 grouped PR per ecosystem covering all minor+patch bumps that week.
+#   - Per-PR for any major bump (and per-PR for security fixes regardless
+#     of bump level — Dependabot creates security PRs outside the group).
+#
+# Grouping policy notes:
+#   - We deliberately put both minor AND patch into one group: pinning
+#     constraints in our requirements.txt are >= floors, so minor bumps
+#     are usually as safe as patches and worth bundling.
+#   - Major bumps stay individual so we can run targeted runtime validation
+#     before merging (esp. transformers/sentence-transformers, where
+#     CodeSage-Large-v2 needs a real /embed call to confirm compatibility).
+
 version: 2
 updates:
   # Python dependencies (root requirements files)
@@ -15,6 +41,12 @@ updates:
     commit-message:
       prefix: "deps"
       include: "scope"
+    groups:
+      python-minor-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
 
   # MCP server Python dependencies
   - package-ecosystem: "pip"
@@ -32,6 +64,12 @@ updates:
     commit-message:
       prefix: "deps(mcp)"
       include: "scope"
+    groups:
+      mcp-python-minor-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
 
   # GitHub Actions
   - package-ecosystem: "github-actions"
@@ -48,8 +86,19 @@ updates:
     commit-message:
       prefix: "ci"
       include: "scope"
+    groups:
+      github-actions-all:
+        applies-to: version-updates
+        # Roll up everything — major bumps for actions are usually safe
+        # (they're version aliases, e.g. checkout@v4 → @v6 is non-breaking
+        # for typical use). Already manually validated this batch on
+        # 2026-05-04 with #101/#102/#103.
+        update-types:
+          - "major"
+          - "minor"
+          - "patch"
 
-  # npm — launcher GUI (Tauri + React under launcher/)
+  # npm — launcher GUI (Tauri + Svelte under launcher/)
   - package-ecosystem: "npm"
     directory: "/launcher"
     schedule:
@@ -65,6 +114,12 @@ updates:
     commit-message:
       prefix: "deps(launcher)"
       include: "scope"
+    groups:
+      launcher-npm-minor-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
 
   # cargo — launcher Tauri Rust backend
   - package-ecosystem: "cargo"
@@ -82,3 +137,16 @@ updates:
     commit-message:
       prefix: "deps(launcher)"
       include: "scope"
+    groups:
+      launcher-cargo-minor-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+        # Note on Rust 0.x crates: per Cargo semver, 0.X → 0.Y is
+        # technically breaking. Dependabot still groups them here because
+        # we accept that risk for our launcher dependency tree (small,
+        # CI-tested with `cargo test --lib`). For load-bearing crates
+        # like rusqlite or tauri itself, Dependabot tends to space them
+        # out anyway because each is a separate PR until the lockfile
+        # rebases settle.
