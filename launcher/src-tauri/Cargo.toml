@@ -44,7 +44,7 @@ keyring = { version = "3", features = ["apple-native", "windows-native", "sync-s
 shlex = "1"
 
 # Hashing for machine ID (sha256 of MAC matches Python validator.py)
-sha2 = "0.10"
+sha2 = "0.11"
 
 # Regex for manifest validation patterns + PII scrub
 regex = "1"
