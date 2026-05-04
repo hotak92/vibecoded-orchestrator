@@ -1,32 +1,34 @@
 # Dependabot configuration for hotak92/vibecoded-orchestrator.
 #
-# Each ecosystem uses `groups:` so that minor + patch bumps land in a single
-# rolled-up PR per week instead of one PR per dependency. Major bumps still
-# get individual PRs — they need closer review and often have breaking
-# changes (see e.g. the transformers v4 → v5 case where pytest CI greenness
-# is a misleading signal because the load-bearing test path is the runtime
-# embedding service, not the unit-test sweep).
+# Grouping policy
+# ---------------
+# Each ecosystem rolls minor + patch bumps into a single weekly PR.
+# Major bumps still fire individually because they often need targeted
+# runtime validation (e.g. transformers v4→v5 vs CodeSage-Large-v2's
+# trust_remote_code modeling file — see knowledge/concepts notes for
+# the post_init() incompatibility we discovered 2026-05-04).
 #
-# Past behaviour (no groups): one Monday spawned 19 open PRs across the 5
-# ecosystems below. Most were patch-level and individually green; the noise
-# obscured the few that needed real review.
+# History
+# -------
+# Pre-grouping (until 2026-05-04): one Monday could spawn 19 individual
+# PRs across the 5 ecosystems below. Most were patch-level and green;
+# the noise obscured the few that needed real review.
 #
-# New behaviour with groups + `applies-to: version-updates`:
-#   - 1 grouped PR per ecosystem covering all minor+patch bumps that week.
-#   - Per-PR for any major bump (and per-PR for security fixes regardless
-#     of bump level — Dependabot creates security PRs outside the group).
+# First grouping pass (2026-05-04, PR #120): added `applies-to:
+# version-updates + update-types` but omitted `patterns: ["*"]`.
+# The npm and Cargo groups worked on the next Monday batch (#125, #128
+# rolled up), but all 5 pip PRs (#122 #123 #124 #126 #127) fired
+# individually — Dependabot needs an explicit `patterns:` to match
+# unnamed dependencies into a group.
 #
-# Grouping policy notes:
-#   - We deliberately put both minor AND patch into one group: pinning
-#     constraints in our requirements.txt are >= floors, so minor bumps
-#     are usually as safe as patches and worth bundling.
-#   - Major bumps stay individual so we can run targeted runtime validation
-#     before merging (esp. transformers/sentence-transformers, where
-#     CodeSage-Large-v2 needs a real /embed call to confirm compatibility).
+# Current pass (2026-05-04 followup): added `patterns: ["*"]` to every
+# group + tightened `update-types` semantics. Expect ~3-5 PRs/week
+# total (1 per ecosystem with non-major activity, plus one per major
+# bump that fires through the ungrouped path).
 
 version: 2
 updates:
-  # Python dependencies (root requirements files)
+  # ─── Python (root requirements files) ────────────────────────────────
   - package-ecosystem: "pip"
     directory: "/"
     schedule:
@@ -34,7 +36,7 @@ updates:
       day: "monday"
       time: "06:00"
       timezone: "Etc/UTC"
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 10
     labels:
       - "dependencies"
       - "python"
@@ -44,11 +46,13 @@ updates:
     groups:
       python-minor-patch:
         applies-to: version-updates
+        patterns:
+          - "*"
         update-types:
           - "minor"
           - "patch"
 
-  # MCP server Python dependencies
+  # ─── Python (MCP server requirements) ────────────────────────────────
   - package-ecosystem: "pip"
     directory: "/claude_mcp_servers"
     schedule:
@@ -56,7 +60,7 @@ updates:
       day: "monday"
       time: "06:00"
       timezone: "Etc/UTC"
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 10
     labels:
       - "dependencies"
       - "python"
@@ -67,11 +71,17 @@ updates:
     groups:
       mcp-python-minor-patch:
         applies-to: version-updates
+        patterns:
+          - "*"
         update-types:
           - "minor"
           - "patch"
 
-  # GitHub Actions
+  # ─── GitHub Actions ──────────────────────────────────────────────────
+  # GHA version aliases are typically non-breaking even at major (e.g.
+  # actions/checkout@v4 → @v6 was a transparent upgrade for our usage).
+  # Group ALL update-types here — that batch on 2026-05-04 (#101 #102
+  # #103) merged with no behavioural change.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
@@ -89,16 +99,14 @@ updates:
     groups:
       github-actions-all:
         applies-to: version-updates
-        # Roll up everything — major bumps for actions are usually safe
-        # (they're version aliases, e.g. checkout@v4 → @v6 is non-breaking
-        # for typical use). Already manually validated this batch on
-        # 2026-05-04 with #101/#102/#103.
+        patterns:
+          - "*"
         update-types:
           - "major"
           - "minor"
           - "patch"
 
-  # npm — launcher GUI (Tauri + Svelte under launcher/)
+  # ─── npm (launcher GUI: Tauri + Svelte) ──────────────────────────────
   - package-ecosystem: "npm"
     directory: "/launcher"
     schedule:
@@ -106,7 +114,7 @@ updates:
       day: "monday"
       time: "06:00"
       timezone: "Etc/UTC"
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 10
     labels:
       - "dependencies"
       - "npm"
@@ -117,11 +125,18 @@ updates:
     groups:
       launcher-npm-minor-patch:
         applies-to: version-updates
+        patterns:
+          - "*"
         update-types:
           - "minor"
           - "patch"
 
-  # cargo — launcher Tauri Rust backend
+  # ─── Cargo (launcher Tauri Rust backend) ─────────────────────────────
+  # Note on Rust 0.x crates: per Cargo semver, 0.X → 0.Y is technically
+  # major (breaking). Cargo bumps for 0.x crates classified as `major`
+  # by Dependabot will fire individually — that's appropriate here
+  # because our launcher uses several load-bearing 0.x crates (rusqlite,
+  # toml, sha2, axum) and each major bump deserves a runtime smoke-test.
   - package-ecosystem: "cargo"
     directory: "/launcher/src-tauri"
     schedule:
@@ -129,7 +144,7 @@ updates:
       day: "monday"
       time: "06:00"
       timezone: "Etc/UTC"
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 10
     labels:
       - "dependencies"
       - "cargo"
@@ -140,13 +155,8 @@ updates:
     groups:
       launcher-cargo-minor-patch:
         applies-to: version-updates
+        patterns:
+          - "*"
         update-types:
           - "minor"
           - "patch"
-        # Note on Rust 0.x crates: per Cargo semver, 0.X → 0.Y is
-        # technically breaking. Dependabot still groups them here because
-        # we accept that risk for our launcher dependency tree (small,
-        # CI-tested with `cargo test --lib`). For load-bearing crates
-        # like rusqlite or tauri itself, Dependabot tends to space them
-        # out anyway because each is a separate PR until the lockfile
-        # rebases settle.

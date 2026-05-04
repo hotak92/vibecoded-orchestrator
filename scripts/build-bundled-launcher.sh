@@ -70,13 +70,47 @@ fi
 
 echo "[build-bundled] Using $PKG_MGR; target arch: $HOST_TARGET"
 
-# Install JS deps if missing.
+# Install JS deps if missing OR if the lockfile is newer than node_modules.
+# The latter case bites maintainers who `git pull` after a Dependabot bump
+# (lockfile updated, node_modules stale): Tauri's version-mismatch check
+# uses the installed @tauri-apps/api in node_modules — not the lockfile —
+# and refuses to build with an error like:
+#     tauri (v2.11.0) : @tauri-apps/api (v2.10.1)
+# Use the npm-written marker (node_modules/.package-lock.json) to detect
+# whether the install matches the current lockfile. With pnpm we use
+# node_modules/.modules.yaml instead. If either marker is missing or
+# older than the lockfile, reinstall.
+NEEDS_INSTALL=0
 if [ ! -d node_modules ]; then
-    echo "[build-bundled] $PKG_MGR install"
+    NEEDS_INSTALL=1
+    INSTALL_REASON="node_modules missing"
+elif [ "$PKG_MGR" = "pnpm" ]; then
+    if [ ! -f node_modules/.modules.yaml ] || [ pnpm-lock.yaml -nt node_modules/.modules.yaml ]; then
+        NEEDS_INSTALL=1
+        INSTALL_REASON="pnpm-lock.yaml newer than installed snapshot"
+    fi
+else
+    if [ ! -f node_modules/.package-lock.json ] || [ package-lock.json -nt node_modules/.package-lock.json ]; then
+        NEEDS_INSTALL=1
+        INSTALL_REASON="package-lock.json newer than installed snapshot"
+    fi
+fi
+
+if [ "$NEEDS_INSTALL" -eq 1 ]; then
+    echo "[build-bundled] $PKG_MGR install ($INSTALL_REASON)"
     if [ "$PKG_MGR" = "pnpm" ]; then
-        pnpm install
+        # `pnpm install --frozen-lockfile` matches `npm ci` semantics —
+        # fails fast if lockfile is out of sync, never silently re-resolves.
+        pnpm install --frozen-lockfile
     else
-        npm install
+        # `npm ci` is strict about lockfile match (vs `npm install`, which
+        # may silently update the lockfile). Falls back to `npm install`
+        # if the lockfile is missing — but for our repo it always exists.
+        if [ -f package-lock.json ]; then
+            npm ci
+        else
+            npm install
+        fi
     fi
 fi
 
