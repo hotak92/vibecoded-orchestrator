@@ -33,7 +33,7 @@ watchdog>=4.0
 
 # ─── Database ───
 # asyncpg (Apache 2.0) — optional, for persistent state
-asyncpg>=0.29
+asyncpg>=0.31.0
 
 # ─── Ollama client ───
 # Ollama Python client (MIT) — for local LLM inference MCP
