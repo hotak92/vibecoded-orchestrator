@@ -25,7 +25,7 @@ pydantic>=2.13.3
 
 # ─── YAML parsing ───
 # PyYAML (MIT)
-pyyaml>=6.0
+pyyaml>=6.0.3
 
 # ─── File watching ───
 # Watchdog (Apache 2.0)
