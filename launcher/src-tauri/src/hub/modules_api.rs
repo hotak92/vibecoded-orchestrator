@@ -108,6 +108,13 @@ struct InstalledQuery {
     project_id: String,
 }
 
+// Module install request body. Currently the `install` handler returns
+// 501 NOT_IMPLEMENTED and doesn't read the fields, but the struct
+// validates that the body shape is correct (deny-extra-fields via
+// serde) and locks in the schema for when the handler is wired (see
+// the planned IPC channel back to the Tauri main thread, documented
+// in the install handler comment below).
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct InstallReq {
     project_id: String,

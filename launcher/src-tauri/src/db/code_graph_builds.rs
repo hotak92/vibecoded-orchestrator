@@ -157,6 +157,12 @@ impl Db {
     /// Note: 'running' is intentionally NOT included here. A 'running'
     /// row after a launcher crash is a stale ghost (the subprocess is
     /// dead). Rebuild-on-startup logic should treat such rows as failed.
+    ///
+    /// TODO: wire — startup logic should call this on launcher boot to
+    /// detect pending builds and resume them. Not currently called; if
+    /// the launcher crashes mid-build, the row stays 'pending' forever
+    /// and the user has to manually rebuild.
+    #[allow(dead_code)]
     pub fn list_pending_code_graph_builds(&self) -> Result<Vec<String>, String> {
         let guard = self.lock();
         let mut stmt = guard

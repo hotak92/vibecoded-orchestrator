@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tauri::command;
 
-use crate::types::{McpServerConfig, McpSetting, OrchestratorConfig, OrchestratorTier};
+use crate::types::{McpServerConfig, OrchestratorConfig, OrchestratorTier};
 
 // ---------------------------------------------------------------------------
 // Config persistence: ~/.vct/orchestrator.json

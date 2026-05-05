@@ -103,28 +103,20 @@ pub async fn codegraph_grant_access(
     Ok(())
 }
 
-// ─── Query proxy ─────────────────────────────────────────────────────────
+// ─── Access check ────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
-pub struct CodegraphQueryReq {
-    pub acting_project_id: String,
-    pub target_project_id: String,
-    pub query_type: String, // "search" | "dependencies" | "callers" | "methods" | "interactions"
-    pub params: serde_json::Value,
-}
-
-/// Proxy a codegraph query through the launcher with access enforcement.
+/// Returns the acting project's access level on the target project's
+/// codegraph, so the UI can render badges (read / denied) and the
+/// codegraph MCP can enforce permissions before returning results.
 ///
-/// The heavy lifting (actual Weaviate GraphQL / SQLite queries) lives in the
-/// vct-codegraph MCP that's running for the target project. This command
-/// simply checks the access matrix and forwards. For V1 we accept that the
-/// MCP is exposed on stdio and the launcher does NOT directly embed the
-/// query logic — the caller is expected to use the codegraph MCP for the
-/// actual queries. This command exists primarily for UI-side stats (node
-/// counts, access badges) where a full MCP call is overkill.
-///
-/// Returns the acting project's access level so the UI can badge
-/// "read" / "denied" on the result.
+/// Note: there used to be a planned launcher-side query-proxy command
+/// (`CodegraphQueryReq` + a forwarder) that would funnel codegraph
+/// queries through the launcher with access enforcement, intended for
+/// lightweight UI stats. That was deleted in 2026-05 — UI-side stats
+/// come from `codegraph_summary` (below) which proxies to Weaviate
+/// directly with the same access check, and full queries go through
+/// the codegraph MCP. Access enforcement happens at the MCP layer +
+/// at this command for UI-side decisions.
 #[command]
 pub async fn codegraph_check_access(
     acting_project_id: String,
