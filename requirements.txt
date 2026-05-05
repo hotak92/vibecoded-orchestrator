@@ -29,7 +29,7 @@ pyyaml>=6.0.3
 
 # ─── File watching ───
 # Watchdog (Apache 2.0)
-watchdog>=4.0
+watchdog>=6.0.0
 
 # ─── Database ───
 # asyncpg (Apache 2.0) — optional, for persistent state
