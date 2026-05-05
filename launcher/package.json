@@ -15,22 +15,22 @@
   },
   "license": "AGPL-3.0-or-later",
   "dependencies": {
-    "@supabase/supabase-js": "^2.98.0",
+    "@supabase/supabase-js": "^2.105.3",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-dialog": "^2",
     "@tauri-apps/plugin-opener": "^2",
-    "graphology": "^0.25.4",
+    "graphology": "^0.26.0",
     "marked": "^18.0.3",
     "sigma": "^3.0.3"
   },
   "devDependencies": {
     "@sveltejs/adapter-static": "^3.0.6",
-    "@sveltejs/kit": "^2.59.0",
+    "@sveltejs/kit": "^2.59.1",
     "@sveltejs/vite-plugin-svelte": "^5.0.0",
     "@tailwindcss/vite": "^4.2.1",
     "@tauri-apps/cli": "^2",
     "svelte": "^5.0.0",
-    "svelte-check": "^4.4.7",
+    "svelte-check": "^4.4.8",
     "tailwindcss": "^4.2.4",
     "typescript": "~6.0.3",
     "vite": "^6.0.3"
