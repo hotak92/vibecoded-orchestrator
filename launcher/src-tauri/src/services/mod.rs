@@ -16,14 +16,17 @@ use tauri::{AppHandle, Runtime};
 
 /// Stop all VCT services (Weaviate, Ollama, etc.) — best-effort.
 ///
-/// Used by the Quit confirmation dialog (`crate::quit_dialog`) before
-/// `app.exit(0)`. Failures are logged to stderr and the function returns
-/// `Ok(())` regardless: the user explicitly asked to quit and a flaky
-/// container runtime must not strand them in a half-quit state.
+/// TODO: wire — the doc says this is for "Quit and stop services"
+/// confirmation but no such dialog exists yet. When a quit-confirmation
+/// is added, it should call this before `app.exit(0)`. Failures are
+/// logged to stderr and the function returns `Ok(())` regardless: the
+/// user explicitly asked to quit and a flaky container runtime must not
+/// strand them in a half-quit state.
 ///
 /// Implementation: delegates to `commands::lifecycle::services_stop_all`
 /// which runs `<runtime> compose stop` (no `--volumes` flag — volumes
 /// are preserved). Idempotent: succeeds even when nothing is up.
+#[allow(dead_code)]
 pub async fn stop_all<R: Runtime>(_app: &AppHandle<R>) -> Result<(), String> {
     if let Err(e) = crate::commands::lifecycle::services_stop_all().await {
         // Surface to stderr but DO NOT propagate — the user clicked

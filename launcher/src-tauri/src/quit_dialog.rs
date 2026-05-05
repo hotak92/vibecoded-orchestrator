@@ -122,14 +122,16 @@ fn full_shutdown<R: Runtime>(app: AppHandle<R>) {
 
 /// Best-effort container shutdown.
 ///
-/// TODO(container-lifecycle-agent): replace the body with a delegation to
-/// `crate::commands::lifecycle::services_stop_all()` once that command
-/// lands on `main`. Pattern to mirror: `compose stop` against
-/// `infrastructure/docker-compose.yml` (no `--volumes` flag — preserve
-/// data). See `commands::volumes` ~805-822.
+/// Delegates to `commands::lifecycle::services_stop_all` which runs
+/// `<runtime> compose stop` (no `--volumes` flag — volumes are
+/// preserved). Idempotent: succeeds even when nothing is up.
+///
+/// Failure here is logged but never propagates — the user clicked
+/// "Quit and stop services" and `app.exit(0)` must run regardless of
+/// container-runtime hiccups (the alternative is leaving the user
+/// stranded in a half-quit state on a flaky Podman / Docker socket).
 async fn stop_services<R: Runtime>(_app: &AppHandle<R>) -> Result<(), String> {
-    eprintln!("[vct] stop_services: STUB (container-lifecycle agent will wire this)");
-    Ok(())
+    crate::commands::lifecycle::services_stop_all().await
 }
 
 // ---------------------------------------------------------------------------

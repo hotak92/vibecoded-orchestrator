@@ -79,7 +79,7 @@ impl Db {
     /// The caller receives a `MutexGuard<Connection>`. Drop it promptly —
     /// do NOT hold it across an `.await`. For async operations, collect
     /// needed data under the lock then release before awaiting.
-    pub fn lock(&self) -> std::sync::MutexGuard<Connection> {
+    pub fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.0.lock().expect("db mutex poisoned")
     }
 

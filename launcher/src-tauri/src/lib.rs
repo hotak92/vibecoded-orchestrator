@@ -152,6 +152,8 @@ pub fn run() {
             commands::modules::list_installed_modules,
             commands::modules::module_status_v2,
             commands::modules::set_module_enabled_v2,
+            commands::modules::module_start_v2,
+            commands::modules::module_stop_v2,
             // Per-project orchestrator state (agents/skills/hooks/permissions/secrets/KG/codegraph)
             commands::project_state_cmd::list_project_agents,
             commands::project_state_cmd::list_project_skills,
@@ -173,7 +175,9 @@ pub fn run() {
             commands::project_state_cmd::set_project_secret_ref,
             commands::project_state_cmd::delete_project_secret_ref,
             commands::project_state_cmd::set_project_kg_binding,
+            commands::project_state_cmd::delete_project_kg_binding,
             commands::project_state_cmd::set_project_codegraph_binding,
+            commands::project_state_cmd::delete_project_codegraph_binding,
             // Secrets + settings
             commands::secrets_cmd::set_secret_v2,
             commands::secrets_cmd::clear_secret_v2,

@@ -87,10 +87,10 @@ impl ModuleCatalogEntry {
 /// so it ships its own slim shape.
 #[derive(Debug, Deserialize)]
 struct OrchestratorManifest {
-    #[serde(default = "default_orch_id")]
-    id: String,
-    #[serde(default = "default_orch_name")]
-    name: String,
+    // `id` and `name` were parsed with defaults but never read. Removed
+    // 2026-05-04. If a future caller needs them, re-add with #[serde(default)]
+    // — vct-module.json always has them, but we only display version +
+    // description + components in the catalog UI.
     version: String,
     description: String,
     #[serde(default)]
@@ -102,13 +102,6 @@ struct OrchestratorComponent {
     id: String,
     name: String,
     description: String,
-}
-
-fn default_orch_id() -> String {
-    "orchestrator".into()
-}
-fn default_orch_name() -> String {
-    "VibeCoded Orchestrator".into()
 }
 
 /// Find `vct-module.json` at the repo root. We walk up from
@@ -596,9 +589,24 @@ pub async fn set_module_enabled_v2(
     Ok(())
 }
 
-// ─── Ignore `ProjectHost` import warning shim ─────────────────────────
-#[allow(dead_code)]
-fn _unused_host_import(_h: ProjectHost) {}
+// ─── Per-module start/stop ─────────────────────────────────────────────
+//
+// Modules in this codebase are the installable orchestrator add-ons (RL
+// Reranker, etc., listed in `modules/catalog`). Independent of the
+// underlying container services (Weaviate / Ollama / etc., which live
+// in `commands/lifecycle.rs::services_*`). A module is "running" when
+// the orchestrator is actively using it for a given project; "stopped"
+// means the binding stays in place but no work is dispatched to it.
+//
+// V1 implementation: state-only. We update the ModuleStatus row from
+// Running ↔ Stopped and emit an audit event. A future iteration will
+// hook process supervision (per-module sidecar processes, pause/resume
+// signalling, etc.) — but for V1 the orchestrator runtime checks this
+// status flag before dispatching, so the toggle is observable end-to-end
+// without any process-management plumbing.
+//
+// Idempotent: calling start on an already-Running module is a no-op
+// (status row update is upserted; audit row records the request).
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -606,6 +614,47 @@ pub struct StartStopReq {
     pub project_id: String,
     pub module_id: String,
 }
+
+#[command]
+pub async fn module_start_v2(
+    req: StartStopReq,
+    db: State<'_, Db>,
+) -> Result<(), String> {
+    db.set_module_status(&req.project_id, &req.module_id, ModuleStatus::Running, None)?;
+    db.audit(
+        "module_start",
+        Some(&req.project_id),
+        Some(&req.module_id),
+        &serde_json::json!({}),
+    )?;
+    Ok(())
+}
+
+#[command]
+pub async fn module_stop_v2(
+    req: StartStopReq,
+    db: State<'_, Db>,
+) -> Result<(), String> {
+    db.set_module_status(&req.project_id, &req.module_id, ModuleStatus::Stopped, None)?;
+    db.audit(
+        "module_stop",
+        Some(&req.project_id),
+        Some(&req.module_id),
+        &serde_json::json!({}),
+    )?;
+    Ok(())
+}
+
+// ─── Ignore `ProjectHost` import warning shim ─────────────────────────
+//
+// `ProjectHost` is imported by `use crate::db::models` at the top of
+// this file because several other functions in this module use it.
+// Rust's unused-warning is per-import-line, so we keep this shim to
+// silence the warning when `ProjectHost` is referenced only inside
+// the function-bodies the compiler considers "external" to its
+// staticanalysis.
+#[allow(dead_code)]
+fn _unused_host_import(_h: ProjectHost) {}
 
 #[cfg(test)]
 mod tests {

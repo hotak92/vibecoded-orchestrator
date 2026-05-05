@@ -29,7 +29,15 @@ pub struct ServiceEntry {
 }
 
 // --- Download progress ---
-
+//
+// TODO: wire — defined for emitting download-progress events during
+// module install (used by the install-progress UI panel). Today the
+// install path streams `InstallProgress` events instead (see
+// `installer_engine.rs`). DownloadProgress is structurally distinct
+// (per-byte download metrics vs per-step install metrics) and is
+// reserved for the planned multi-source module download path
+// (Lemon Squeezy CDN downloads, etc.).
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownloadProgress {
     pub app_id: String,
