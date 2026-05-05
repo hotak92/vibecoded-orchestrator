@@ -12,7 +12,7 @@ mcp>=1.27.0
 
 # ─── Weaviate ───
 # Weaviate Python client (BSD-3-Clause)
-weaviate-client>=4.9
+weaviate-client>=4.21.0
 
 # ─── HTTP / async ───
 aiohttp>=3.13.5
