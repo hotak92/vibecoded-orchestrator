@@ -83,3 +83,144 @@ jobs:
         run: npm ci
       - name: npm run check
         run: npm run check
+
+  # PR-4 (2026-05-06): regression guard for the audit class
+  # "developer machine paths leak into shipped launcher binary".
+  # Builds the launcher in release mode (no bundle, just the
+  # raw binary — same `cargo build --release --bin` invocation
+  # the bundle script ultimately runs), then `strings`-greps
+  # the result for personal-username-shaped paths.
+  #
+  # Allowed paths in the binary:
+  #   /home/runner/...      ← GitHub-hosted Linux runners
+  #   /Users/runner/...     ← GitHub-hosted macOS runners
+  #   C:\Users\runneradmin\... ← GitHub-hosted Windows runners
+  #     (we don't run this job on Windows yet — Linux suffices
+  #     for the leak class because Cargo.toml + .cargo/config.toml
+  #     apply uniformly across hosts; Windows leak surface is
+  #     covered by the same flags + `strip`.)
+  #
+  # Disallowed: any /home/<other-username>/... or /Users/... or
+  # C:\Users\... that references a real developer's name.
+  #
+  # The grep is intentionally conservative: it triggers only on
+  # path-shaped strings starting with the exact user-directory
+  # prefix and containing a username segment that ISN'T `runner`.
+  # If a future GH-hosted runner image starts using a different
+  # generic username, add it to the allowlist below.
+  launcher-leak-check:
+    name: Launcher binary leak-check
+    runs-on: ubuntu-latest
+    needs: rust    # don't waste minutes if cargo test failed
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: launcher/src-tauri
+
+      - name: Install Tauri Linux build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev
+
+      # Build the binary directly via cargo (no tauri bundle, no
+      # frontend embedding). Skipping the bundle skips the
+      # SvelteKit frontend build — that's intentional for this
+      # job because the leak class is in the Rust binary's path
+      # rodata, not in the embedded frontend assets.
+      #
+      # We DO export RUSTFLAGS to add the host-specific
+      # username remap on top of the .cargo/config.toml
+      # generic-prefix remaps. On GH-hosted runners $HOME =
+      # /home/runner so the remap rewrites it to <home>; on a
+      # contributor's local cargo run the same env-var pattern
+      # rewrites their personal home dir. See
+      # `launcher/src-tauri/.cargo/config.toml` for the
+      # full two-layer strategy.
+      - name: cargo build --release (no bundle)
+        env:
+          RUSTFLAGS: --remap-path-prefix=${{ env.HOME }}=<home> --remap-path-prefix=${{ env.HOME }}/.cargo=<cargo>
+        run: |
+          cargo build --release \
+            --bin vct-launcher-temp \
+            --manifest-path launcher/src-tauri/Cargo.toml
+
+      # The actual leak-check. Three independent greps, each
+      # with its own allowlist. Anything matched outside the
+      # allowlist fails the job.
+      #
+      # Why three greps not one regex: easier to read in CI
+      # logs (failures point at one OS class), and easier to
+      # extend without nested-group escaping nightmares.
+      - name: Verify no developer paths in release binary
+        run: |
+          set -euo pipefail
+          BIN=launcher/src-tauri/target/release/vct-launcher-temp
+          if [ ! -f "$BIN" ]; then
+            echo "::error::Expected $BIN not found"
+            exit 1
+          fi
+
+          fail=0
+
+          echo "::group::Linux home paths"
+          # /home/<user>/... where <user> != runner.
+          if strings "$BIN" \
+              | grep -E '^/home/[^/]+/' \
+              | grep -vE '^/home/runner(/|$)' \
+              | head -10
+          then
+            echo "::error::Found /home/<user>/... paths in $BIN (not /home/runner)."
+            echo "         strip = \"symbols\" + .cargo/config.toml remaps should have caught these."
+            echo "         If a new GH-runner username is in use, add it to the allowlist in this job."
+            fail=1
+          else
+            echo "OK — no leaking /home/<user>/ paths"
+          fi
+          echo "::endgroup::"
+
+          echo "::group::macOS home paths"
+          if strings "$BIN" \
+              | grep -E '^/Users/[^/]+/' \
+              | grep -vE '^/Users/runner(/|$)' \
+              | head -10
+          then
+            echo "::error::Found /Users/<user>/... paths in $BIN (not /Users/runner)."
+            fail=1
+          else
+            echo "OK — no leaking /Users/<user>/ paths"
+          fi
+          echo "::endgroup::"
+
+          echo "::group::Windows home paths"
+          # `strings` finds backslash-pathed strings on a Linux
+          # binary too (rustc embeds Windows-flavored paths
+          # whenever a Windows-targeted dep ships pre-baked
+          # debug info in its source crate). Grep both forms.
+          if strings "$BIN" \
+              | grep -E '(^|[[:space:]])C:\\Users\\[^\\]+\\' \
+              | grep -vE 'C:\\Users\\runneradmin\\' \
+              | head -10
+          then
+            echo "::error::Found C:\\Users\\<user>\\... paths in $BIN (not runneradmin)."
+            fail=1
+          else
+            echo "OK — no leaking C:\\Users\\<user>\\ paths"
+          fi
+          echo "::endgroup::"
+
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::Launcher leak-check FAILED. See groups above for the leaking paths."
+            echo "         Fix: ensure RUSTFLAGS in this job and"
+            echo "         launcher/src-tauri/.cargo/config.toml are still applied."
+            echo "         See docs/REPO_CLEANLINESS.md §5."
+            exit 1
+          fi
+          echo "Launcher leak-check passed."
