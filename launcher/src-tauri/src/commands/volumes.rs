@@ -477,6 +477,19 @@ fn free_bytes_at(path: &Path) -> Option<u64> {
     if rc != 0 {
         return None;
     }
+    // We deliberately use f_bavail (not f_bfree) — f_bavail subtracts
+    // ext4's reserved blocks (default 5% of total, root-only). Rootless
+    // Podman runs as the unprivileged user and writes through the user's
+    // quota, so reserved blocks ARE unusable. This matches `df -h`'s
+    // "Available" column, which is the authoritative number for the
+    // rootless-container use case.
+    //
+    // GNOME's "Files" / Disks app reports f_bfree (free including reserved)
+    // — that is misleadingly optimistic for our context: a 2 TB volume can
+    // show ~100 GB more free in GNOME than the rootless Podman runtime
+    // can actually write. If a user reports a discrepancy ("Files says
+    // 243 GB, launcher says 143 GB") the launcher is correct; do not
+    // "fix" by switching to f_bfree.
     Some((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
 }
 
@@ -984,8 +997,11 @@ async fn wait_until_healthy(timeout_secs: u64) -> bool {
         Ok(c) => c,
         Err(_) => return false,
     };
+    // /v1/meta is the right liveness probe for Weaviate — see
+    // commands/lifecycle.rs::canonical_services for why
+    // /v1/.well-known/ready is too strict.
     let urls = [
-        "http://localhost:8081/v1/.well-known/ready",
+        "http://localhost:8081/v1/meta",
         "http://localhost:11435/api/tags",
     ];
     while std::time::Instant::now() < deadline {

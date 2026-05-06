@@ -149,14 +149,29 @@ def _save_cached(result: LicenseResult) -> None:
 
 
 _DEFAULT_VALIDATE_URL = (
-    # Public alias documented in the module docstring; resolves to the
-    # /validate-tier Supabase edge function (matches the canonical path
-    # used by the Rust launcher's commands/licensing.rs and by the actual
-    # Supabase function source at launcher/supabase/functions/validate-tier/).
-    # Internal infra URLs are not committed to public source — operators
-    # set VIBECODED_LICENSE_URL to override (or VCT_VALIDATE_TIER_URL to
-    # match the Rust launcher's env var; both are honored).
-    "https://api.vibecodedtools.it/validate-tier"
+    # Default = Supabase project's canonical /validate-tier function URL.
+    #
+    # The earlier default `https://api.vibecodedtools.it/validate-tier` was
+    # wishful thinking — that DNS record was never created (verified
+    # 2026-05-06: `dig api.vibecodedtools.it` returns NXDOMAIN; only the
+    # apex `vibecodedtools.it` resolves, and it points at Vercel for the
+    # marketing site). Every license refresh from default config returned
+    # NXDOMAIN and silently fell back to the 3-day cache grace.
+    #
+    # Two reasons not to fix by adding the DNS:
+    #   1. Cross-subdomain risk: the apex serves the website on Vercel.
+    #      Putting the API on api.<apex> shares cookie scope and CORS
+    #      surface with the marketing site.
+    #   2. DNS-config drift: one IONOS panel mistake and we're back to
+    #      NXDOMAIN. The Supabase URL is stable as long as the project
+    #      exists.
+    #
+    # Operators override via VIBECODED_LICENSE_URL or VCT_VALIDATE_TIER_URL
+    # (both honored) for staging/dev or for a future custom-domain plan
+    # (e.g. api.vct.cloud, kept distinct from the website apex).
+    #
+    # Mirrors `launcher/src-tauri/src/commands/licensing.rs::DEFAULT_VALIDATE_TIER_URL`.
+    "https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/validate-tier"
 )
 
 

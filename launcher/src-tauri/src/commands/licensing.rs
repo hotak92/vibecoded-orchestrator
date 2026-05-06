@@ -14,11 +14,27 @@ use crate::secrets::{self, SecretScope};
 
 /// The validate-tier edge function URL.
 ///
-/// Public alias documented in the module docstring; resolves to the
-/// licensing edge function. Internal infra URLs are not committed to public
-/// source — operators set `VCT_VALIDATE_TIER_URL` to override for staging/dev.
+/// Default = the Supabase project's canonical functions URL. The earlier
+/// default `https://api.vibecodedtools.it/validate-tier` was wishful
+/// thinking — that DNS record was never created (IONOS zone has no
+/// `api` subdomain; verified 2026-05-06 with `dig`). Every license
+/// refresh from default config returned NXDOMAIN and fell back to the
+/// 3-day cache grace, masking activation/deactivation issues.
+///
+/// Two reasons not to "fix" by adding the DNS:
+///   1. Cross-subdomain risk: `vibecodedtools.it` apex serves the
+///      Vercel website. Putting the API on `api.<apex>` shares cookies
+///      and CORS surface with the marketing site.
+///   2. DNS-config drift: one IONOS panel slip and we're back to NXDOMAIN.
+///      The Supabase URL is stable as long as the project exists.
+///
+/// Operators override via `VCT_VALIDATE_TIER_URL` for staging/dev or for
+/// a future custom-domain plan (e.g. `api.vct.cloud`, kept distinct from
+/// the website apex).
+///
 /// Mirrors `VCThelpers/license/validator.py::_DEFAULT_VALIDATE_URL`.
-const DEFAULT_VALIDATE_TIER_URL: &str = "https://api.vibecodedtools.it/validate-tier";
+const DEFAULT_VALIDATE_TIER_URL: &str =
+    "https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/validate-tier";
 
 fn validate_tier_url() -> String {
     std::env::var("VCT_VALIDATE_TIER_URL").unwrap_or_else(|_| DEFAULT_VALIDATE_TIER_URL.to_string())
