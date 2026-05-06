@@ -1204,8 +1204,11 @@ mod cli_kg_integration_tests {
             Ok(c) => c,
             Err(_) => return false,
         };
+        // /v1/meta — see commands/lifecycle.rs::canonical_services for why
+        // we don't use /v1/.well-known/ready (too strict; can return 503
+        // during normal operation while queries still work).
         match client
-            .get(format!("{}/v1/.well-known/ready", weaviate_url()))
+            .get(format!("{}/v1/meta", weaviate_url()))
             .send()
             .await
         {

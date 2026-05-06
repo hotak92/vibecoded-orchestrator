@@ -112,7 +112,7 @@ All writes to `.claude/settings.json` and `.vscode/settings.json` perform a read
 The install path contains zero destructive container operations. Audit-tested and confirmed in `CHANGELOG.md [0.1.0] Security`.
 
 ### Local-first by default
-Weaviate and Ollama run on-device. No data leaves the machine unless the user sets `VIBECODED_TELEMETRY=true` or the license validator reaches `https://api.vibecodedtools.it/validate-tier`.
+Weaviate and Ollama run on-device. No data leaves the machine unless the user sets `VIBECODED_TELEMETRY=true` or the license validator reaches `https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/validate-tier`.
 
 ---
 

@@ -267,8 +267,10 @@ async fn probe_one(url: &str) -> bool {
 /// Probe all shared services concurrently. Wall time bounded by
 /// `PROBE_TIMEOUT`, not the sum.
 async fn probe_services() -> ServiceSnapshot {
+    // /v1/meta is more reliable than /v1/.well-known/ready for "is
+    // Weaviate usable?" — see commands/lifecycle.rs::canonical_services.
     let weaviate_url = format!(
-        "http://localhost:{}/v1/.well-known/ready",
+        "http://localhost:{}/v1/meta",
         WEAVIATE_PORT
     );
     let ollama_url = format!("http://localhost:{}/api/tags", OLLAMA_PORT);

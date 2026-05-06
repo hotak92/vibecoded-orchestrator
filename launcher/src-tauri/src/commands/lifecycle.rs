@@ -91,7 +91,15 @@ pub struct ServicesRuntimeSnapshot {
 fn canonical_services() -> [(&'static str, u16, fn(u16) -> String); 3] {
     [
         ("weaviate", DEFAULT_WEAVIATE_PORT, |p| {
-            format!("http://localhost:{}/v1/.well-known/ready", p)
+            // /v1/meta — Weaviate's metadata endpoint. Returns 200 with a
+            // version + module list as soon as the HTTP server is up and
+            // can answer queries. We deliberately do NOT use
+            // /v1/.well-known/ready — that endpoint can return 503 during
+            // bootstrap/recovery even when Weaviate is fully usable for
+            // queries (false-negative observed 2026-05-06: detector
+            // reported Weaviate "not running" while /v1/meta returned a
+            // full module list and `hybrid_search` answered correctly).
+            format!("http://localhost:{}/v1/meta", p)
         }),
         ("ollama", DEFAULT_OLLAMA_PORT, |p| {
             format!("http://localhost:{}/api/tags", p)
@@ -126,7 +134,9 @@ async fn probe_url(url: &str) -> bool {
 /// code_embed can be slower to come up and aren't blockers for the modal
 /// suppression.
 async fn services_already_running() -> bool {
-    let url = format!("http://localhost:{}/v1/.well-known/ready", DEFAULT_WEAVIATE_PORT);
+    // /v1/meta is the right liveness probe (see canonical_services note
+    // for why /v1/.well-known/ready is too strict).
+    let url = format!("http://localhost:{}/v1/meta", DEFAULT_WEAVIATE_PORT);
     probe_url(&url).await
 }
 

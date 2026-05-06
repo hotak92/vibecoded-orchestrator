@@ -14,11 +14,27 @@ use crate::secrets::{self, SecretScope};
 
 /// The validate-tier edge function URL.
 ///
-/// Public alias documented in the module docstring; resolves to the
-/// licensing edge function. Internal infra URLs are not committed to public
-/// source — operators set `VCT_VALIDATE_TIER_URL` to override for staging/dev.
+/// Default = the Supabase project's canonical functions URL. The earlier
+/// default `https://api.vibecodedtools.it/validate-tier` was wishful
+/// thinking — that DNS record was never created (IONOS zone has no
+/// `api` subdomain; verified 2026-05-06 with `dig`). Every license
+/// refresh from default config returned NXDOMAIN and fell back to the
+/// 3-day cache grace, masking activation/deactivation issues.
+///
+/// Two reasons not to "fix" by adding the DNS:
+///   1. Cross-subdomain risk: `vibecodedtools.it` apex serves the
+///      Vercel website. Putting the API on `api.<apex>` shares cookies
+///      and CORS surface with the marketing site.
+///   2. DNS-config drift: one IONOS panel slip and we're back to NXDOMAIN.
+///      The Supabase URL is stable as long as the project exists.
+///
+/// Operators override via `VCT_VALIDATE_TIER_URL` for staging/dev or for
+/// a future custom-domain plan (e.g. `api.vct.cloud`, kept distinct from
+/// the website apex).
+///
 /// Mirrors `VCThelpers/license/validator.py::_DEFAULT_VALIDATE_URL`.
-const DEFAULT_VALIDATE_TIER_URL: &str = "https://api.vibecodedtools.it/validate-tier";
+const DEFAULT_VALIDATE_TIER_URL: &str =
+    "https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/validate-tier";
 
 fn validate_tier_url() -> String {
     std::env::var("VCT_VALIDATE_TIER_URL").unwrap_or_else(|_| DEFAULT_VALIDATE_TIER_URL.to_string())
@@ -218,46 +234,27 @@ pub async fn license_deactivate(db: State<'_, Db>) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    /// Endpoint safety: the default validate-tier URL must be a public alias,
-    /// not a `*.supabase.co` project URL. Mirrors
-    /// `tests/test_license_validator.py::TestEndpointSafety::test_default_url_is_public_alias_only`.
-    /// The Python side already had this guard; the Rust side previously leaked
-    /// the internal Supabase project ID — this test prevents regressions.
+    /// Endpoint safety: URL must be HTTPS. (No more "must contain
+    /// vibecodedtools.it" / "must not contain supabase.co" — those guards
+    /// were defending against information disclosure of the project ID,
+    /// but the project ID is already publicly disclosed in
+    /// `launcher/supabase/config.toml` which ships in the AGPL source
+    /// repo. URL secrecy in the binary was theatre. Per the 2026-05-06
+    /// security review at
+    /// `.claude/context/supabase-license-security-review-2026-05-06.md`
+    /// — verdict "SAFE WITH CAVEATS, ship the bare URL".
+    ///
+    /// Real license-validation hardening (env-var allowlist for
+    /// VCT_VALIDATE_TIER_URL, rate limiting on the Supabase function,
+    /// signed cache to prevent local tampering) is tracked separately
+    /// as F14/F1/F15 hardening tickets — not addressed by URL secrecy.
     #[test]
-    fn default_validate_tier_url_is_public_alias_only() {
+    fn default_validate_tier_url_is_https() {
         let url = DEFAULT_VALIDATE_TIER_URL;
-        assert!(
-            !url.contains("supabase.co"),
-            "DEFAULT_VALIDATE_TIER_URL must not leak the internal Supabase project URL: {}",
-            url
-        );
         assert!(
             url.starts_with("https://"),
             "DEFAULT_VALIDATE_TIER_URL must be HTTPS: {}",
             url
-        );
-        assert!(
-            url.contains("vibecodedtools.it"),
-            "DEFAULT_VALIDATE_TIER_URL must be the public vibecodedtools.it alias: {}",
-            url
-        );
-    }
-
-    /// Source-level audit: the licensing module's executable source must not
-    /// contain any `*.supabase.co` project hostnames. Strips comments and
-    /// docstrings before scanning so prose mentions stay legal.
-    #[test]
-    fn no_supabase_co_in_licensing_source() {
-        let repo_root = super::super::installer::find_local_repo_root().expect("repo root");
-        let licensing_rs = repo_root.join("launcher/src-tauri/src/commands/licensing.rs");
-        let content = std::fs::read_to_string(&licensing_rs).expect("read licensing.rs");
-        let scan_end = content.find("#[cfg(test)]").unwrap_or(content.len());
-        let production = &content[..scan_end];
-        let cleaned = strip_for_audit(production);
-        assert!(
-            !cleaned.contains("supabase.co"),
-            "FORBIDDEN: 'supabase.co' found in production source of {} — use the public alias",
-            licensing_rs.display()
         );
     }
 

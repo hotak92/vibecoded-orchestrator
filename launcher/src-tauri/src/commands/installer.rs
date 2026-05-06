@@ -346,13 +346,18 @@ async fn probe_http(url: String) -> Option<String> {
 /// duplicate containers that bind-conflict.
 ///
 /// Probes the three default endpoints in parallel:
-///   - http://localhost:8081/v1/.well-known/ready  (Weaviate)
+///   - http://localhost:8081/v1/meta                (Weaviate)
 ///   - http://localhost:11435/api/tags             (Ollama)
 ///   - http://localhost:11440/health               (code_embed)
+///
+/// Note: /v1/meta (NOT /v1/.well-known/ready) is the right liveness probe
+/// for Weaviate — see commands/lifecycle.rs::canonical_services for the
+/// rationale (false-negatives observed 2026-05-06 with the strict ready
+/// endpoint while /v1/meta + /v1/graphql were fully responsive).
 #[command]
 pub async fn detect_existing_services() -> Result<ServicesStatus, String> {
     let weaviate = probe_http(format!(
-        "http://localhost:{}/v1/.well-known/ready",
+        "http://localhost:{}/v1/meta",
         DEFAULT_WEAVIATE_PORT
     ));
     let ollama = probe_http(format!(
@@ -396,10 +401,46 @@ pub fn get_default_install_path() -> String {
 }
 
 /// Check if orchestrator is already installed at a given path.
+///
+/// Primary signal: `state/install-manifest.json` written at the end of a
+/// successful `install.py` run. The manifest's `installed: true` flag
+/// is the canonical "install.py finished" marker. Implemented in
+/// `install.py::_write_install_manifest` (2026-05-06).
+///
+/// Fallback (backward compat for installs that predate the manifest):
+/// require all three of `CLAUDE.md`, `install.py`, and `.venv/`. The
+/// older two-marker (CLAUDE.md + install.py only) check returned true
+/// on any unmodified clone of the source tarball even when no install
+/// had ever run — false-positive observed in the install wizard
+/// 2026-05-06: clone of VCO reported "already installed" though
+/// `.venv/` was absent and no services config had been written.
+///
+/// Manifest path: `<install_path>/state/install-manifest.json`.
+/// Schema documented at `install.py::INSTALL_MANIFEST_SCHEMA_VERSION`.
 #[command]
 pub fn check_install_status(path: String) -> bool {
     let p = PathBuf::from(&path);
-    p.join("CLAUDE.md").exists() && p.join("install.py").exists()
+    if !(p.join("CLAUDE.md").exists() && p.join("install.py").exists()) {
+        return false;
+    }
+    // Primary: manifest with installed=true.
+    let manifest = p.join("state").join("install-manifest.json");
+    if let Ok(text) = std::fs::read_to_string(&manifest) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+            if v.get("installed").and_then(|x| x.as_bool()) == Some(true) {
+                return true;
+            }
+            // Manifest exists but `installed` is false / missing —
+            // do NOT fall back; this is a deliberate "install in
+            // progress / aborted" state.
+            return false;
+        }
+        // Manifest exists but unparseable — fall through to the heuristic
+        // rather than trust corrupt metadata.
+    }
+    // Fallback: legacy installs that predate the manifest. `.venv/`
+    // presence is the strongest off-disk signal that install.py ran.
+    p.join(".venv").exists()
 }
 
 /// Get the installed version (latest git tag or commit hash).
