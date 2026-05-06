@@ -373,36 +373,16 @@ pub async fn create_project_v2(
     )?;
     let _ = db.log_change("projects", "insert", Some(&row.id), Some(&row.id));
 
-    // Gap 2 (OSS launch 2026-05-12): kick off the initial code-graph
-    // build in the background so `search_code_graph` returns useful
-    // results out of the box. This must NOT block project creation —
-    // the user gets their `ProjectView` back immediately.
-    //
-    // We swallow any DB error from the pending-row insert because a
-    // failure here is purely cosmetic (the user just won't see a build
-    // status pill); the project itself is already committed.
-    let now = chrono::Utc::now().timestamp_millis();
-    if let Err(e) = db.upsert_code_graph_build(
-        &row.id,
-        build_status::PENDING,
-        Some(now),
-        None,
-        None,
-        0,
-        None,
-        false,
-        None,
-        None,
-    ) {
-        eprintln!("[vct] warning: could not queue code-graph build for {}: {}", row.id, e);
-    } else {
-        codegraph::spawn_initial_build(
-            app,
-            row.id.clone(),
-            row.name.clone(),
-            row.folder_path.clone(),
-        );
-    }
+    // Bug fix (2026-05-06): defer the codegraph spawn until AFTER
+    // `run_install_bundle` has dropped `.claude/scripts/code-graph-analyze`
+    // into the project folder. Pre-fix, this block ran here (before
+    // bundle install) and the background task raced ahead — by the time
+    // `resolve_analyzer_script` looked for the wrapper, the bundle
+    // install hadn't yet finished writing it, and the build immediately
+    // failed with "code-graph-analyze script not found". Same shape as
+    // the populate-ordering race fixed in PR #149: side-effect ordering
+    // matters across `run_install_bundle`. The codegraph block now lives
+    // below, after bootstrap → bundle install → post-bundle populate.
 
     // B12 (2026-05-01): detect stale .env from pre-existing folder registration.
     // ensure_project_env_template is append-only, so a folder that already had a
@@ -474,6 +454,46 @@ pub async fn create_project_v2(
             eprintln!("[vct] populate (post-bundle) warning ({}): {}", row.id, w);
             warnings.push(format!("populate (post-bundle): {}", w));
         }
+    }
+
+    // Gap 2 (OSS launch 2026-05-12): kick off the initial code-graph
+    // build in the background so `search_code_graph` returns useful
+    // results out of the box. This must NOT block project creation —
+    // the user gets their `ProjectView` back immediately.
+    //
+    // We swallow any DB error from the pending-row insert because a
+    // failure here is purely cosmetic (the user just won't see a build
+    // status pill); the project itself is already committed.
+    //
+    // ORDER MATTERS (2026-05-06 race fix): this block was previously
+    // BEFORE `run_install_bundle`. The bundle install drops the analyzer
+    // wrapper at `<folder>/.claude/scripts/code-graph-analyze`; running
+    // the spawn earlier let the background task race ahead of the bundle
+    // install, hit `resolve_analyzer_script` before the script existed,
+    // and fail with "code-graph-analyze script not found". The fix is
+    // simple: spawn LAST, after (a) bundle install, (b) post-bundle
+    // populate. Same shape as the populate-ordering bug fixed in PR #149.
+    let now = chrono::Utc::now().timestamp_millis();
+    if let Err(e) = db.upsert_code_graph_build(
+        &row.id,
+        build_status::PENDING,
+        Some(now),
+        None,
+        None,
+        0,
+        None,
+        false,
+        None,
+        None,
+    ) {
+        eprintln!("[vct] warning: could not queue code-graph build for {}: {}", row.id, e);
+    } else {
+        codegraph::spawn_initial_build(
+            app,
+            row.id.clone(),
+            row.name.clone(),
+            row.folder_path.clone(),
+        );
     }
 
     Ok(CreateProjectResult {

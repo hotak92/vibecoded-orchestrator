@@ -1413,5 +1413,102 @@ mod build_tests {
         }
         fs::remove_dir_all(&d).ok();
     }
+
+    /// Race-fix regression test (2026-05-06): codifies the invariant that
+    /// `create_project_v2` must establish before `spawn_initial_build`
+    /// runs. Pre-fix the spawn was issued BEFORE `run_install_bundle`
+    /// dropped `.claude/scripts/code-graph-analyze`; the background
+    /// build task therefore raced ahead, found nothing, and failed with
+    /// "code-graph-analyze script not found".
+    ///
+    /// This test simulates BOTH states of a fresh project folder:
+    ///   1. Empty (just `.claude/`) — analyzer absent, project-local
+    ///      lookup MUST return None (or fall through to a non-project
+    ///      hit found via $PATH / $VCT_LAUNCHER_SCRIPTS_DIR — but never
+    ///      a project-local hit). This is the broken state the spawn
+    ///      task previously observed.
+    ///   2. Bundle-installed (script present at the expected path) —
+    ///      project-local lookup MUST resolve to the dropped script.
+    ///      This is the state the spawn task now observes after the
+    ///      ordering fix.
+    ///
+    /// If `create_project_v2` ever regresses and the spawn block migrates
+    /// back above `run_install_bundle`, the production effect becomes
+    /// "state 1" rather than "state 2" — and the build immediately
+    /// reports "code-graph-analyze script not found", just as before
+    /// the fix. We can't directly trap `create_project_v2`'s ordering
+    /// in a unit test (it requires a Tauri AppHandle + real subprocess
+    /// + populate DB), but we CAN trap the side-effect difference: a
+    /// project-local hit is impossible without a prior bundle install.
+    #[test]
+    fn resolve_analyzer_requires_bundle_install_before_project_local_hit() {
+        let d = tmpdir("race-invariant");
+        let scripts = d.join(".claude").join("scripts");
+        let bin = if cfg!(windows) {
+            "code-graph-analyze.ps1"
+        } else {
+            "code-graph-analyze"
+        };
+        let script = scripts.join(bin);
+
+        // Isolate from a polluted dev environment: the test machine may
+        // have $PATH / $VCT_LAUNCHER_SCRIPTS_DIR / sibling-of-exe hits
+        // that would mask the project-local-only assertion. Save & wipe
+        // env-derived lookup paths so steps 2-4 of `resolve_analyzer_script`
+        // can't smuggle in a hit. (Step 3 — `current_exe` traversal — we
+        // can't control; we explicitly tolerate a non-project-local hit
+        // there and only assert the project-local lookup itself.)
+        // SAFETY: cargo test runs this crate single-threaded by default.
+        let saved_path = std::env::var_os("PATH");
+        let saved_override = std::env::var_os("VCT_LAUNCHER_SCRIPTS_DIR");
+        unsafe {
+            std::env::set_var("PATH", "");
+            std::env::remove_var("VCT_LAUNCHER_SCRIPTS_DIR");
+        }
+
+        // STATE 1: pre-bundle (the buggy pre-fix order). The folder has
+        // a `.claude/` from `populate_project_state_from_filesystem` but
+        // NO scripts dir yet — bundle hasn't run. Project-local lookup
+        // must NOT find a script under `<d>/.claude/scripts/`.
+        fs::create_dir_all(d.join(".claude")).unwrap();
+        let pre_resolved = resolve_analyzer_script(&d);
+        assert!(
+            pre_resolved.as_ref().map_or(true, |p| !p.starts_with(&d)),
+            "pre-bundle: project-local hit IMPOSSIBLE — got {:?}",
+            pre_resolved,
+        );
+
+        // STATE 2: post-bundle (the fixed order). `run_install_bundle`
+        // has dropped the analyzer wrapper; project-local lookup MUST
+        // find it now and prefer it (step 1 of the resolve order is
+        // strictly highest priority).
+        fs::create_dir_all(&scripts).unwrap();
+        fs::write(&script, b"#!/usr/bin/env bash\necho ok\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script, perms).unwrap();
+        }
+        let post_resolved = resolve_analyzer_script(&d).expect(
+            "post-bundle: project-local script MUST resolve — \
+             this is the invariant the create_project_v2 ordering fix establishes",
+        );
+        assert_eq!(
+            post_resolved, script,
+            "post-bundle: must prefer project-local script over fallbacks"
+        );
+
+        // Restore env to avoid polluting later tests in the same process.
+        if let Some(p) = saved_path {
+            unsafe { std::env::set_var("PATH", p); }
+        }
+        if let Some(p) = saved_override {
+            unsafe { std::env::set_var("VCT_LAUNCHER_SCRIPTS_DIR", p); }
+        }
+
+        fs::remove_dir_all(&d).ok();
+    }
 }
 
