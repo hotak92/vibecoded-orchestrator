@@ -1247,6 +1247,46 @@ pub async fn install_orchestrator(
         .stdin(std::process::Stdio::null())
         .current_dir(&install_path);
 
+    // PR-3 (2026-05-06): forward the launcher's adopted service ports to
+    // install.py. Pre-PR-3, install.py read `WEAVIATE_PORT` / `OLLAMA_PORT`
+    // from `os.environ` (install.py:4243-4244) but the launcher never set
+    // them — the subprocess inherited the launcher's env, which was
+    // empty for these keys. Multi-stack setups silently fell through to
+    // the canonical default ports. We now bridge launcher state into
+    // the install.py subprocess env via `services.toml` adoption +
+    // explicit overrides. See `launcher-settings-propagation-audit-2026-05-06.md` §9.
+    let services_state = crate::services::adoption::read();
+    let pick_port = |name: &str, default: u16| -> u16 {
+        if let Some(svc) = services_state.get(name) {
+            match svc.mode {
+                crate::services::adoption::AdoptionMode::Parallel => {
+                    if let Some(p) = svc.parallel_port {
+                        return p;
+                    }
+                }
+                crate::services::adoption::AdoptionMode::Adopt => {
+                    if let Some(url) = svc.external_url.as_deref() {
+                        // Inline minimal port-extractor (kept here to avoid
+                        // a cross-module dep on commands::project_env_settings).
+                        let after = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+                        let host_port = after.split('/').next().unwrap_or(after);
+                        if let Some(p) = host_port.rsplit(':').next().and_then(|s| s.parse::<u16>().ok()) {
+                            return p;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        default
+    };
+    let weaviate_port = pick_port("weaviate", DEFAULT_WEAVIATE_PORT);
+    let ollama_port = pick_port("ollama", DEFAULT_OLLAMA_PORT);
+    let code_embed_port = pick_port("code_embed", DEFAULT_CODE_EMBED_PORT);
+    cmd.env("WEAVIATE_PORT", weaviate_port.to_string())
+        .env("OLLAMA_PORT", ollama_port.to_string())
+        .env("CODE_EMBED_PORT", code_embed_port.to_string());
+
     // Windows: suppress the transient cmd console window that pops up
     // when Tauri (a windowed app, no console) spawns a subprocess.
     // Without CREATE_NO_WINDOW, Windows materialises an empty cmd
