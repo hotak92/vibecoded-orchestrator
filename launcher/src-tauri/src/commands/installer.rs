@@ -2126,7 +2126,12 @@ fn check_file_health(path: &Path, parser: impl FnOnce(&str) -> Result<(), String
 pub fn inspect_orchestrator_at(path: String) -> OrchestratorState {
     let root = PathBuf::from(&path);
     let claude_dir = root.join(".claude");
-    let installed = claude_dir.exists() || root.join("vct-module.json").exists();
+    // `vct-module.json` is the canonical VCO-clone marker (validate_source_repo
+    // also gates on its presence, plus install.py + first-install.sh). A
+    // project folder may have `.claude/` left behind by a non-destructive
+    // unregister (PR #150) — that should NOT count as "orchestrator
+    // installed here". Use the canonical marker only.
+    let installed = root.join("vct-module.json").exists();
 
     if !installed {
         return OrchestratorState {
@@ -2316,12 +2321,17 @@ pub async fn update_orchestrator_at(path: String, window: Window) -> Result<(), 
     if !target.exists() {
         return Err(format!("update target {} does not exist", target.display()));
     }
-    if !target.join(".claude").exists() && !target.join("vct-module.json").exists() {
-        return Err(format!(
-            "{} does not look like an orchestrator install (no .claude/ or vct-module.json)",
-            target.display()
-        ));
-    }
+    // VCO-clone gate: refuse to run against project folders that happen to
+    // have `.claude/` left behind by a non-destructive unregister (PR #150).
+    // `update_orchestrator_at` is a "sync VCO clone from a newer source"
+    // operation; running it against a project folder copies orchestrator-
+    // machinery into the project. The validate_source_repo check (install.py
+    // + first-install.sh) is the canonical VCO-clone discriminator.
+    //
+    // Project-update path is separate: see `update_project_v2` /
+    // `run_install_bundle_update` (`projects_v2.rs:782`) for the bundle-only
+    // update that operates on registered project folders.
+    validate_source_repo(&target)?;
     emit_progress(&window, "locate", "Locating bundled source...", 5.0);
     let source = find_local_repo_root()?;
     emit_progress(&window, "copy", "Copying updated files...", 25.0);
@@ -3979,18 +3989,70 @@ MemAvailable:   23456789 kB
     #[test]
     fn test_inspect_orchestrator_at_corrupt_settings() {
         let p = tmp();
+        // vct-module.json is the canonical VCO-clone marker (gates `installed`
+        // post-fix). Make it malformed JSON so it ALSO contributes a bad
+        // health entry, exercising the corrupt-config path end-to-end.
+        fs::write(p.join("vct-module.json"), "not json either").unwrap();
         fs::create_dir_all(p.join(".claude")).unwrap();
         fs::write(p.join(".claude/settings.json"), "this is not json").unwrap();
         // Empty CLAUDE.md is also "corrupt" by our health check.
         fs::write(p.join("CLAUDE.md"), "").unwrap();
-        // No vct-module.json → version unknown.
 
         let s = inspect_orchestrator_at(p.to_string_lossy().to_string());
         assert!(s.installed);
         assert_eq!(s.version_status, "unknown");
         let bad = s.config_health.iter().filter(|c| !c.ok).count();
-        // settings.json (json parse), CLAUDE.md (empty), vct-module.json (missing)
+        // settings.json (json parse), CLAUDE.md (empty), vct-module.json (json parse)
         assert!(bad >= 3, "expected ≥3 bad checks, got {:?}", s.config_health);
+        fs::remove_dir_all(&p).ok();
+    }
+
+    /// Regression test for the post-PR-#150 false-positive: a non-destructive
+    /// `unregister_project` preserves `.claude/agents/` and `.claude/skills/`
+    /// inside user project folders. Before the fix, `inspect_orchestrator_at`
+    /// returned `installed: true` for such folders (it OR'd `.claude/` and
+    /// `vct-module.json`), which routed the user through the orchestrator
+    /// adopt-choice modal — conceptually wrong for project folders. The fix
+    /// gates `installed` on `vct-module.json` alone (the canonical VCO-clone
+    /// marker, also enforced by `validate_source_repo`).
+    #[test]
+    fn test_inspect_at_project_folder_with_only_dot_claude_returns_not_installed() {
+        let p = tmp();
+        // Simulate a project folder post-unregister: `.claude/agents/` and
+        // a leftover skill .md file remain, but there is NO `vct-module.json`.
+        fs::create_dir_all(p.join(".claude/agents")).unwrap();
+        fs::write(p.join(".claude/agents/some.md"), "# leftover agent\n").unwrap();
+        fs::create_dir_all(p.join(".claude/skills/foo")).unwrap();
+        fs::write(p.join(".claude/skills/foo/SKILL.md"), "# leftover skill\n").unwrap();
+
+        let s = inspect_orchestrator_at(p.to_string_lossy().to_string());
+        assert!(
+            !s.installed,
+            "project folder with only .claude/ leftovers must NOT register as installed"
+        );
+        assert_eq!(s.version_status, "unknown");
+        assert!(s.config_health.is_empty());
+        fs::remove_dir_all(&p).ok();
+    }
+
+    /// Counterpart: a real VCO clone (vct-module.json present, parseable,
+    /// with a `version` field) MUST register as installed. This locks in the
+    /// canonical-marker semantics so a future "tighten validation further"
+    /// refactor doesn't regress the orchestrator self-onboarding flow.
+    #[test]
+    fn test_inspect_at_vco_clone_with_vct_module_returns_installed() {
+        let p = tmp();
+        // Minimal VCO-clone shape: vct-module.json with a version field, and
+        // a `.claude/` directory (a real clone always has one, but `installed`
+        // is no longer gated on it).
+        fs::write(p.join("vct-module.json"), r#"{"version":"1.2.3"}"#).unwrap();
+        fs::create_dir_all(p.join(".claude")).unwrap();
+        fs::write(p.join(".claude/settings.json"), "{}").unwrap();
+        fs::write(p.join("CLAUDE.md"), "# clone\n").unwrap();
+
+        let s = inspect_orchestrator_at(p.to_string_lossy().to_string());
+        assert!(s.installed, "VCO clone with vct-module.json must register as installed");
+        assert_eq!(s.version.as_deref(), Some("1.2.3"));
         fs::remove_dir_all(&p).ok();
     }
 
@@ -5106,6 +5168,62 @@ MemAvailable:   23456789 kB
         fs::write(p.join("first-install.sh"), "#!/usr/bin/env bash\n").unwrap();
         let res = validate_source_repo(&p);
         assert!(res.is_ok(), "validate_source_repo rejected a source repo: {:?}", res);
+        fs::remove_dir_all(&p).ok();
+    }
+
+    // ---- update_orchestrator_at VCO-clone gate (post-PR-#150) -----------
+    //
+    // After PR #150 unregister became non-destructive (preserves
+    // `.claude/agents/` + `.claude/skills/`). The previous existence-only
+    // check (`.claude/` OR `vct-module.json` present) would let a project
+    // folder with leftover `.claude/` slip through and trigger an
+    // orchestrator-machinery copy into the project. update_orchestrator_at
+    // now calls `validate_source_repo` — same gate as install_orchestrator
+    // — so the test surface is identical to the install_orchestrator_*
+    // block above. Project-update is the separate `update_project_v2` /
+    // `run_install_bundle_update` path in projects_v2.rs.
+
+    #[test]
+    fn test_update_orchestrator_at_refuses_project_folder_with_only_dot_claude() {
+        // Simulate a project folder post-non-destructive-unregister: leftover
+        // `.claude/agents/` + content, but NO install.py / first-install.sh.
+        // The new gate must refuse this with the validate_source_repo error.
+        let p = tmp();
+        fs::create_dir_all(p.join(".claude/agents")).unwrap();
+        fs::write(p.join(".claude/agents/some.md"), "# leftover agent\n").unwrap();
+
+        let res = validate_source_repo(&p);
+        assert!(
+            res.is_err(),
+            "project folder with only .claude/ leftovers must be refused"
+        );
+        let msg = res.unwrap_err();
+        assert!(
+            msg.contains("install.py") && msg.contains("first-install.sh"),
+            "error message must name the two required files; got: {}",
+            msg
+        );
+        fs::remove_dir_all(&p).ok();
+    }
+
+    #[test]
+    fn test_update_orchestrator_at_accepts_vco_clone() {
+        // A real VCO clone has install.py + first-install.sh side-by-side
+        // (plus a `.git/`, but the gate doesn't require it). The gate-pass
+        // is what we test here — the actual copy still runs in the real
+        // command and is exercised by integration / manual QA, not unit
+        // tests (it requires a Window handle and the bundled source repo).
+        let p = tmp();
+        fs::write(p.join("install.py"), "# install\n").unwrap();
+        fs::write(p.join("first-install.sh"), "#!/usr/bin/env bash\n").unwrap();
+        fs::create_dir_all(p.join(".git")).unwrap();
+
+        let res = validate_source_repo(&p);
+        assert!(
+            res.is_ok(),
+            "VCO clone with install.py + first-install.sh must pass the gate: {:?}",
+            res
+        );
         fs::remove_dir_all(&p).ok();
     }
 }
