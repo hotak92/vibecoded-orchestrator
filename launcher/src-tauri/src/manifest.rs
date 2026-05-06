@@ -431,7 +431,10 @@ impl PlaceholderCtx {
         let home = directories::UserDirs::new()
             .map(|d| d.home_dir().to_path_buf())
             .unwrap_or_else(|| PathBuf::from("/"));
-        let vct_root = home.join(".vct");
+        // {VCT_ROOT}/{VCT_MODULES}/{VCT_DATA}/{VCT_LOGS} resolve to
+        // VCT_STATE_DIR if set, else ~/.vct/. {HOME} is always the OS
+        // home (used by some manifests for `{HOME}/.config/...` patterns).
+        let vct_root = crate::paths::vct_root_dir();
         Self {
             vct_modules: vct_root.join("modules"),
             vct_data: vct_root.join("data"),

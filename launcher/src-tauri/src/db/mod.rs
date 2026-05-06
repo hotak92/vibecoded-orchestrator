@@ -28,12 +28,11 @@ pub mod slug;
 pub mod change_log;
 pub mod code_graph_builds;
 pub mod secret_active;
+pub mod app_state;
 
-/// Resolve the launcher DB path: `~/.vct/launcher.db`.
+/// Resolve the launcher DB path: `<VCT_STATE_DIR or ~/.vct>/launcher.db`.
 pub fn db_path() -> PathBuf {
-    directories::UserDirs::new()
-        .map(|d| d.home_dir().join(".vct").join("launcher.db"))
-        .unwrap_or_else(|| PathBuf::from(".vct/launcher.db"))
+    crate::paths::vct_root_dir().join("launcher.db")
 }
 
 /// Thread-safe connection handle stored in Tauri managed state.

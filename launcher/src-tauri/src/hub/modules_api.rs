@@ -338,12 +338,10 @@ async fn project_env(
 
 fn scan_manifests() -> Vec<(std::path::PathBuf, crate::manifest::ModuleManifest)> {
     let mut out = Vec::new();
-    let Some(home) = directories::UserDirs::new() else {
-        return out;
-    };
+    let vct_root = crate::paths::vct_root_dir();
     for subdir in [
-        home.home_dir().join(".vct").join("modules"),
-        home.home_dir().join(".vct").join("bundled_manifests"),
+        vct_root.join("modules"),
+        vct_root.join("bundled_manifests"),
     ] {
         if !subdir.is_dir() {
             continue;

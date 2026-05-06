@@ -9,9 +9,7 @@ use crate::types::{McpServerConfig, OrchestratorConfig, OrchestratorTier};
 // ---------------------------------------------------------------------------
 
 fn config_path() -> PathBuf {
-    directories::UserDirs::new()
-        .map(|d| d.home_dir().join(".vct").join("orchestrator.json"))
-        .unwrap_or_else(|| PathBuf::from(".vct/orchestrator.json"))
+    crate::paths::vct_root_dir().join("orchestrator.json")
 }
 
 fn load_config() -> OrchestratorConfig {

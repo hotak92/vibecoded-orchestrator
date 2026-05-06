@@ -131,9 +131,7 @@ struct UpdateState {
 // ---------------------------------------------------------------------------
 
 fn state_file_path() -> PathBuf {
-    directories::UserDirs::new()
-        .map(|d| d.home_dir().join(".vct").join("launcher-update-state.json"))
-        .unwrap_or_else(|| PathBuf::from(".vct/launcher-update-state.json"))
+    crate::paths::vct_root_dir().join("launcher-update-state.json")
 }
 
 fn load_state() -> UpdateState {

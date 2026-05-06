@@ -3637,8 +3637,11 @@ _HEALTH_PATHS = {
 
 
 def _services_toml_path() -> Path:
-    """Path to `~/.vct/services.toml` — shared with launcher::services::adoption."""
-    return Path.home() / ".vct" / "services.toml"
+    """Path to `<VCT_STATE_DIR or ~/.vct>/services.toml` — shared with
+    launcher::services::adoption (Rust). Both sides honour ``VCT_STATE_DIR``
+    so a dev launcher's state stays isolated from production state."""
+    from vco_lib.paths import vct_root_dir
+    return vct_root_dir() / "services.toml"
 
 
 def _read_services_toml() -> dict:
@@ -6169,7 +6172,9 @@ def _run_uninstall(args: argparse.Namespace) -> int:
     else:
         print(f"  [2] [skip] Container volumes preserved (--keep-data)")
 
-    launcher_db = Path.home() / ".vct" / "launcher.db"
+    # Honour VCT_STATE_DIR so a dev launcher's state isolates cleanly.
+    from vco_lib.paths import vct_root_dir
+    launcher_db = vct_root_dir() / "launcher.db"
     will_remove_launcher_db = launcher_db.exists()
     if will_remove_launcher_db:
         print(f"  [3] Remove launcher state: {launcher_db}")
