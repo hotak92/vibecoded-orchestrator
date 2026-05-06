@@ -1214,6 +1214,76 @@ mod tests {
         assert!(!cols.iter().any(|c| c == "value" || c == "secret_value"));
     }
 
+    /// PR-3 Commit 5 (2026-05-06): the SecretsPanel ↔ SecretsTab bridge.
+    /// When the user sets a per-project secret value via the global
+    /// SecretsPanel, the launcher also calls `set_project_secret_ref`
+    /// so the per-project SecretsTab populates. This test pins the
+    /// underlying DB contract: after a registration with the bridge's
+    /// canonical args, `list_project_secret_refs` reflects the new ref
+    /// AND the upsert is idempotent on a second registration with the
+    /// same key.
+    #[test]
+    fn bridge_registration_appears_in_per_project_list_and_is_idempotent() {
+        let db = make_db();
+        seed_project(&db, "p1", "Project One");
+
+        // First registration — mirrors what `secrets.setValue` calls
+        // through `invoke('set_project_secret_ref', ...)` on a per-
+        // project scope. resolution=keychain-per-project; is_set=true
+        // (the keychain write that preceded it succeeded).
+        db.set_project_secret_ref(
+            "p1",
+            "ANTHROPIC_API_KEY",
+            "keychain-per-project",
+            None,
+            None,
+            Some("user"),
+            &[],
+            "",
+            true,
+        )
+        .unwrap();
+
+        let refs = db.list_project_secret_refs("p1").unwrap();
+        assert_eq!(refs.len(), 1, "first registration must create the ref row");
+        assert_eq!(refs[0].secret_key, "ANTHROPIC_API_KEY");
+        assert_eq!(refs[0].resolution, "keychain-per-project");
+        assert_eq!(refs[0].source_module.as_deref(), Some("user"));
+        assert!(refs[0].is_set);
+
+        // Second registration of the SAME key (e.g. user updated the
+        // value via the panel) — must upsert, not duplicate. The
+        // `set_secret_v2` → `set_project_secret_ref` bridge fires on
+        // every value-set, so re-runs MUST be idempotent.
+        db.set_project_secret_ref(
+            "p1",
+            "ANTHROPIC_API_KEY",
+            "keychain-per-project",
+            None,
+            None,
+            Some("user"),
+            &[],
+            "",
+            true,
+        )
+        .unwrap();
+        let refs = db.list_project_secret_refs("p1").unwrap();
+        assert_eq!(
+            refs.len(),
+            1,
+            "second registration must upsert, not duplicate"
+        );
+
+        // Per-project tab shows zero refs to start with for project p2 —
+        // proves the bridge correctly scopes by project_id.
+        seed_project(&db, "p2", "Project Two");
+        let p2_refs = db.list_project_secret_refs("p2").unwrap();
+        assert!(
+            p2_refs.is_empty(),
+            "ref registered for p1 must NOT appear in p2's list"
+        );
+    }
+
     #[test]
     fn kg_binding_role_validation() {
         let db = make_db();

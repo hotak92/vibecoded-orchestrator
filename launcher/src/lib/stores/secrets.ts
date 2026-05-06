@@ -163,6 +163,39 @@ function createSecretsStore() {
           validationRegex: null,
           sensitive: entry.sensitive,
         });
+        // PR-3 Commit 5 (2026-05-06): bridge SecretsPanel ↔ SecretsTab.
+        // When a value is set in the SecretsPanel for the per-project
+        // scope, also register a ref row in `project_secret_refs` so the
+        // per-project SecretsTab actually populates. Pre-PR-3 the two
+        // stores were unconnected — `set_secret_v2` wrote the keychain
+        // but never registered the ref, leaving the per-project tab
+        // showing zero refs even after the user had set the value
+        // (see secrets-and-access-matrix-audit-2026-05-06.md §6).
+        if (entry.scope === 'per_project') {
+          try {
+            await invoke<void>('set_project_secret_ref', {
+              projectId: entry.project_id,
+              req: {
+                secret_key: entry.key,
+                // Per-project keychain entry written by `set_secret_v2`
+                // above lives at `vct.<project_id>.<module_id>.<key>`.
+                resolution: 'keychain-per-project',
+                file_path: null,
+                env_name: null,
+                source_module: entry.module_id,
+                required_for: [],
+                description: '',
+                is_set: true,
+              },
+            });
+          } catch (refErr) {
+            // Non-fatal: the keychain write succeeded; the ref-row
+            // failure means the per-project tab won't show this entry.
+            // Surface as a warning rather than rolling back the
+            // keychain write (which the user explicitly asked for).
+            console.warn('set_project_secret_ref failed (per-project tab may not reflect this entry)', refErr);
+          }
+        }
         await this.refresh(entry);
         update((s) => ({ ...s, busy: false }));
       } catch (e) {
