@@ -104,14 +104,19 @@ struct OrchestratorComponent {
     description: String,
 }
 
-/// Find `vct-module.json` at the repo root. We walk up from
-/// CARGO_MANIFEST_DIR (the launcher/src-tauri/) to the repo root. Only used
-/// at runtime in dev/source builds; release builds will have to ship the
-/// JSON inside the bundled resources, but for now the dev build path is what
-/// matters since users run `npm run tauri:dev` against the repo checkout.
+/// Find `vct-module.json` at the repo root by walking up from the
+/// running binary. Privacy note (2026-05-06): an earlier version used
+/// `env!("CARGO_MANIFEST_DIR")` which embeds the build-host absolute
+/// path as a static string in the release binary (leaking the
+/// developer's username/layout to anyone running `strings`). We use
+/// `std::env::current_exe()` instead — only a runtime path read, no
+/// build-time string baked in. The walk handles both shipped binaries
+/// (`<clone>/launcher/dist/<arch>/vct-launcher`, walks up 4 levels) and
+/// `cargo run` builds (`<clone>/launcher/src-tauri/target/<profile>/`,
+/// walks up 4-5 levels — both find the clone root).
 fn find_orchestrator_manifest() -> Option<PathBuf> {
-    let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let mut p = here.as_path();
+    let exe = std::env::current_exe().ok()?;
+    let mut p = exe.parent()?;
     loop {
         let candidate = p.join("vct-module.json");
         if candidate.is_file() {
