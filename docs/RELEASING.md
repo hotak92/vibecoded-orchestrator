@@ -18,12 +18,20 @@ The orchestrator itself (Python side) doesn't carry a separate semver yet; it tr
 
 Pre-flight checklist:
 
-- [ ] CI is green on `main` (Rust + Python + svelte-check). See `.github/workflows/ci.yml`.
+- [ ] CI is green on `main` (Rust + Python + svelte-check + **Launcher binary leak-check**). See `.github/workflows/ci.yml`.
 - [ ] Local `cargo test --lib --manifest-path launcher/src-tauri/Cargo.toml` passes.
 - [ ] Local `pytest tests/ -q` passes.
 - [ ] Local `cd launcher && npm run check` passes.
 - [ ] Smoke-test the install on a clean machine (or VM): `./install.sh && claude`.
 - [ ] Ollama image pin in `infrastructure/docker-compose.yml` and `claude_mcp_servers/compose.yaml` is current.
+- [ ] **Rebuild the launcher binaries** following the per-platform procedure in
+  [`launcher/dist/README.md` § "Updating the bundled binaries"](../launcher/dist/README.md#updating-the-bundled-binaries).
+  The procedure MANDATES `RUSTFLAGS` for path-privacy AND
+  `pnpm tauri build --no-bundle` (NOT plain `cargo build --release`,
+  which produces a binary that tries to load its frontend from a
+  `localhost:1420` dev server and hangs at startup with
+  "Could not connect to localhost: Connection refused"). Verify each
+  rebuilt binary has zero leaks via the `strings` command in that doc.
 
 Steps:
 

@@ -129,6 +129,35 @@ Combined with `[profile.release] strip = "symbols"` and the
 config.toml`, this is the regression guard for the audit class
 "developer machine paths leaked into shipped binary."
 
+### How to rebuild the bundled `dist/` binary safely
+
+There are TWO recurring mistakes that produce a broken or leaky
+binary. Both are easy to make and the symptoms are downstream:
+
+1. **Plain `cargo build --release`** (instead of `pnpm tauri build
+   --no-bundle`). The cargo command produces a binary that tries to
+   load its frontend from `http://localhost:1420` (the Vite dev
+   server) at startup. Symptom: the launcher window opens with
+   "Could not connect to localhost: Connection refused". Only
+   `pnpm tauri build` runs the frontend build pipeline (vite + svelte-
+   adapter-static) and embeds the static assets via Tauri's resource
+   system, so the WebView can load from `tauri://localhost/` at
+   runtime. The `--no-bundle` flag skips installer-bundle generation
+   (`.deb`, `.AppImage`, `.dmg`, `.msi`) — those go to GitHub Releases
+   later, not into `dist/`.
+
+2. **Forgetting `RUSTFLAGS`**. The checked-in `.cargo/config.toml`
+   only remaps OS-level prefixes (`/home`, `/Users`, `C:\Users`).
+   Without an env-var-driven per-user remap, the binary embeds your
+   username in every `cargo registry` source path. CI doesn't catch
+   this on hosted runners (their username is the generic `runner`),
+   so the leak only shows up on dev-box rebuilds.
+
+Canonical commands are in
+[`launcher/dist/README.md` § "Updating the bundled binaries"](../launcher/dist/README.md#updating-the-bundled-binaries).
+The release pre-flight in [`docs/RELEASING.md`](RELEASING.md) points
+back at it.
+
 ## 6. When to extend this policy
 
 Adding a new path to either column requires:
