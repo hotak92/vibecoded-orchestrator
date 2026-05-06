@@ -867,47 +867,75 @@ MERGE_BLOCK_START = "<!-- vct-merge-pending -->"
 MERGE_BLOCK_END = "<!-- /vct-merge-pending -->"
 
 # Hard whitelist of paths the orchestrator install is allowed to copy
-# from `source` into `install_path`. **Mirror of `ORCHESTRATOR_MANAGED_PATHS`
-# in `launcher/src-tauri/src/commands/installer.rs`** — keep in lockstep;
-# the test `test_managed_paths_python_rust_lockstep` (added in PR-2) asserts
-# the two sets are byte-identical.
+# from `source` into `install_path`. Anything else at the source is
+# left behind; anything else at the install_path is left untouched.
 #
-# **Architectural intent (2026-05-06):** ONE VCO clone is shared by all
-# projects; per-project folders never receive the orchestrator's own
-# machinery. Entries here must be either (a) project-meaningful
-# configuration / docs that legitimately live alongside a user project
-# (`.claude/`, `CLAUDE.md`, `knowledge/`, `docs/`, `tools/`,
-# `infrastructure/`) or (b) the version-pinning manifest the launcher
-# reads to detect an existing install (`vct-module.json`).
+# Source of truth: ``orchestrator-managed-paths.txt`` at the repo root
+# (sibling of this file). Edit there ONLY — both Rust
+# (``installer.rs`` via ``include_str!``) and Python (here, at import
+# time) parse the same file with the same rules. A cross-language
+# consistency test (``tests/test_managed_paths_consistency.py``) pins
+# the two languages to the file contents.
 #
-# **Explicitly excluded** (the PR-1 / PR-2 trim, 2026-05-06):
-#   - `install.py` / `install.sh` / `install.ps1` — orchestrator entry
-#     points; never copied into a user project (VideoFrames bug).
-#   - `state/` — per-install metadata; copying it into a project means a
-#     stale install-manifest with the wrong install_path, plus accidental
-#     RL artifact bleed-over.
-#   - `claude_mcp_servers/` — orchestrator-only Python package; user
-#     projects reach it via `$VCT_ORCHESTRATOR_ROOT` (.claude/env) per
-#     PR-2, never by file copy.
-#   - `templates/` — SOURCE for `_enumerate_bundle_files` per-project
-#     bundle installs, never the destination at a user project.
-#   - `requirements.txt` / `requirements-dev.txt` — orchestrator's own
-#     Python deps; project-side `.venv` is independent.
-#   - `BOOTSTRAP.md` — orchestrator setup doc, irrelevant to a user
-#     project that already has the orchestrator running.
-#   - `config/` — legacy entry; directory does not exist in the repo.
-#
-# Anything else at the source is left behind; anything else at the
-# install_path is left untouched.
-ORCHESTRATOR_MANAGED_PATHS: tuple[str, ...] = (
-    ".claude",
-    "CLAUDE.md",
-    "knowledge",
-    "docs",
-    "tools",
-    "infrastructure",
-    "vct-module.json",
+# The .txt file lists itself, so ``update_orchestrator_at`` propagates
+# freshly-edited editions of the list into every existing install.
+
+# Path resolution: __file__ → install.py at repo root → the .txt is
+# its sibling. We use Path(__file__).resolve() so the lookup is robust
+# even when install.py is invoked via a relative path or symlink.
+_MANAGED_PATHS_FILE: Path = (
+    Path(__file__).resolve().parent / "orchestrator-managed-paths.txt"
 )
+
+
+def _parse_managed_paths_text(text: str) -> tuple[str, ...]:
+    """Parse ``orchestrator-managed-paths.txt`` content into an allowlist.
+
+    Parse rules (must match ``parse_managed_paths_text`` in
+    ``launcher/src-tauri/src/commands/installer.rs``):
+
+      * Lines are stripped of leading/trailing whitespace.
+      * Empty lines are skipped.
+      * Lines whose first non-whitespace character is ``#`` are
+        comments and are skipped entirely (no inline comments — ``#``
+        is only a line prefix).
+
+    Order is preserved so the resulting tuple has the same shape as
+    the file, which makes diff output legible when entries change.
+    """
+    out: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        out.append(stripped)
+    return tuple(out)
+
+
+def _load_orchestrator_managed_paths() -> tuple[str, ...]:
+    """Read + parse the source-of-truth .txt file at import time.
+
+    Read errors are fatal: if the file is missing or unreadable, the
+    install logic has no allowlist to enforce and silently falling
+    back to a hard-coded default would re-introduce the drift bug
+    PR-5 was written to fix. We surface a clear error pointing the
+    user at the file path and the upstream repo so they can recover.
+    """
+    try:
+        text = _MANAGED_PATHS_FILE.read_text(encoding="utf-8")
+    except OSError as e:
+        raise RuntimeError(
+            f"Could not read orchestrator allowlist file at "
+            f"{_MANAGED_PATHS_FILE}: {e}. This file is the source of "
+            f"truth for ORCHESTRATOR_MANAGED_PATHS and is required by "
+            f"install.py. If you cloned the orchestrator repo "
+            f"correctly the file should be present; otherwise re-fetch "
+            f"from https://github.com/hotak92/vibecoded-orchestrator."
+        ) from e
+    return _parse_managed_paths_text(text)
+
+
+ORCHESTRATOR_MANAGED_PATHS: tuple[str, ...] = _load_orchestrator_managed_paths()
 
 
 def _normalize_conflict_strategy(s: str) -> str:
