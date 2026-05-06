@@ -11,6 +11,7 @@
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
   import { projects, selectedProject } from '$lib/stores/projects';
+  import { ui } from '$lib/stores/ui';
   import Toast from '$lib/components/Toast.svelte';
 
   onMount(() => {
@@ -32,6 +33,9 @@
   <header class="pl-header">
     <button class="pl-back" onclick={() => goto('/')}>← Home</button>
     <h1>Projects</h1>
+    <button class="pl-add" onclick={() => ui.openCreateProject()}>
+      + Add Project
+    </button>
     <button class="pl-refresh" onclick={() => projects.load()} disabled={state.loading}>
       {state.loading ? 'Loading…' : 'Refresh'}
     </button>
@@ -40,10 +44,12 @@
   {#if state.loading && state.projects.length === 0}
     <p class="pl-empty">Loading…</p>
   {:else if state.projects.length === 0}
-    <p class="pl-empty">
-      No projects registered yet. Create one from the home dashboard's
-      project picker.
-    </p>
+    <div class="pl-empty">
+      <p>No projects registered yet.</p>
+      <button class="pl-add" onclick={() => ui.openCreateProject()}>
+        + Add your first project
+      </button>
+    </div>
   {:else}
     <div class="pl-grid">
       {#each state.projects as p (p.id)}
@@ -74,17 +80,26 @@
     display: flex; align-items: center; gap: 12px; margin-bottom: 24px;
   }
   .pl-header h1 { margin: 0; font-size: 22px; flex: 1; }
-  .pl-back, .pl-refresh {
+  .pl-back, .pl-refresh, .pl-add {
     padding: 6px 12px; border-radius: 4px; cursor: pointer;
     background: rgba(255,255,255,0.06);
     border: 1px solid rgba(255,255,255,0.12);
     color: inherit; font-size: 13px;
   }
-  .pl-back:hover, .pl-refresh:hover:not(:disabled) {
+  .pl-back:hover, .pl-refresh:hover:not(:disabled), .pl-add:hover {
     background: rgba(255,255,255,0.1);
+  }
+  .pl-add {
+    border-color: rgba(0,191,166,0.4);
+    color: rgb(0,191,166);
+  }
+  .pl-add:hover {
+    background: rgba(0,191,166,0.08);
+    border-color: rgba(0,191,166,0.6);
   }
   .pl-refresh:disabled { opacity: 0.5; cursor: default; }
   .pl-empty { color: #888; padding: 40px; text-align: center; }
+  .pl-empty p { margin: 0 0 16px; }
 
   .pl-grid {
     display: grid;

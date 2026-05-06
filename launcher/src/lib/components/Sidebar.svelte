@@ -57,7 +57,7 @@
           match: (p) => p.startsWith('/store'),
         },
         {
-          href: projectId ? `/project/${projectId}` : '/project',
+          href: '/projects',
           label: 'Project',
           sub: 'Agents, skills, hooks, permissions, secrets',
           match: (p) => p.startsWith('/project'),
