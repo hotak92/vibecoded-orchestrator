@@ -318,7 +318,11 @@
     if (deleteConfirmText !== deletingProject.name) return;
     deleting = true;
     try {
-      await projects.delete(deletingProject.id, false);
+      // Pass null → backend defaults apply: purgeLauncherFiles=true,
+      // purgeCollections=false. The selector's quick-trash flow keeps
+      // the original UX: "remove project from launcher" with sensible
+      // defaults. The settings-tab Danger zone exposes the full options.
+      await projects.delete(deletingProject.id, null);
       deletingProject = null;
       deleteConfirmText = '';
     } catch (e) {

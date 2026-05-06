@@ -120,6 +120,47 @@ export interface UpdateProjectResult {
   summary: UpdateSummary;
 }
 
+/**
+ * Mirror of Rust `UnregisterOptions` (commands/projects_v2.rs).
+ *
+ * 2026-05-06: drives the per-project "Unregister project" action. Both
+ * fields are optional on the Tauri side (`#[serde(default)]`). Sending
+ * `null` from the UI maps to backend defaults via `Option<UnregisterOptions>`.
+ *
+ *   - `purgeLauncherFiles` (default true): surgically remove launcher-
+ *     managed files (.claude/hooks, .claude/scripts, .claude/env, infra
+ *     compose YAMLs) AND strip canonical env keys from .env / .claude/env
+ *     / .claude/settings.json env / .vscode/settings.json claude-code.env.
+ *     User content (agents/skills/CONTEXT_STATE/CLAUDE.md/source code/
+ *     user-added .env keys) is preserved.
+ *   - `purgeCollections` (default false): drop the project's OWN Weaviate
+ *     collections (`<Project>_KnowledgeGraph`, `<Project>_Development`).
+ *     Shared collections never touched. OFF by default — collections can
+ *     always be rebuilt from /knowledge + source code via
+ *     install-bundle --update.
+ */
+export interface UnregisterOptions {
+  purgeLauncherFiles?: boolean;
+  purgeCollections?: boolean;
+}
+
+/**
+ * Mirror of Rust `UnregisterReport` (commands/projects_v2.rs).
+ *
+ * Returned by `delete_project_v2`. The launcher's settings-tab toast uses
+ * `filesPurged.length`, `keysPurgedFromEnv.length`, and
+ * `collectionsDropped.length` for a one-line summary; `warnings[]` is
+ * surfaced as additional error toasts when non-empty.
+ */
+export interface UnregisterReport {
+  projectId: string;
+  projectName: string;
+  filesPurged: string[];
+  keysPurgedFromEnv: string[];
+  collectionsDropped: string[];
+  warnings: string[];
+}
+
 export interface TierCacheView {
   orchestrator_tier: LicenseTier | string;
   module_licenses: Record<string, unknown>;

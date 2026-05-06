@@ -2856,6 +2856,76 @@ def _cmd_bootstrap_collections(args: argparse.Namespace) -> int:
     return 1 if result["errors"] else 0
 
 
+def _cmd_drop_collections(args: argparse.Namespace) -> int:
+    """`drop-collections --name <project_name> [--weaviate-url <url>] --json`
+
+    Drop the project's OWN Weaviate collections (`<sanitized>_KnowledgeGraph`,
+    `<sanitized>_Development`). The shared KG (`VibeCodedTools_KnowledgeGraph`
+    or whatever `_SHARED_KG_NAME` resolves to) is NEVER touched — every
+    project depends on read access to it, and it's owned by the
+    orchestrator install, not by any individual project.
+
+    Used by the launcher's `delete_project_v2` when the user opts in to
+    `purge_collections: true` on unregister. Soft-fails idempotently:
+    a 404 from Weaviate (collection already gone) counts as a successful
+    drop. Connection errors land in `errors[]`, never raise, exit 1.
+
+    JSON stdout schema:
+      {"dropped": ["<Project>_KnowledgeGraph", "<Project>_Development"],
+       "skipped_shared": "VibeCodedTools_KnowledgeGraph",
+       "errors": [{"collection": <name>, "error": <str>}]}
+
+    Exit 0 on clean drop (incl. 404). Exit 1 when at least one drop
+    request hit a non-404 HTTP error.
+    """
+    derived = derive_project_collection_names(args.name)
+    targets = [derived["kg_collection"], derived["development_collection"]]
+    weaviate_url = args.weaviate_url
+
+    result: dict = {
+        "dropped": [],
+        "skipped_shared": _SHARED_KG_NAME,
+        "errors": [],
+    }
+
+    for name in targets:
+        # Defense in depth: refuse to drop anything that looks like a
+        # shared collection. The shared name is fixed at install time,
+        # but a future config knob could let users override it; if we
+        # ever ship that knob, the override has to flow through here so
+        # this guard stays correct.
+        if name == _SHARED_KG_NAME:
+            result["errors"].append({
+                "collection": name,
+                "error": (
+                    f"refusing to drop shared collection {name!r} — "
+                    f"shared KG is install-owned, not project-owned"
+                ),
+            })
+            continue
+        try:
+            _delete_class(name, weaviate_url=weaviate_url)
+            result["dropped"].append(name)
+        except Exception as e:
+            # Connection refused, timeout, malformed URL — surface as
+            # a per-collection error rather than crashing the whole
+            # JSON envelope. Rust caller wraps these as warnings.
+            result["errors"].append({
+                "collection": name,
+                "error": f"{type(e).__name__}: {e}",
+            })
+
+    if args.json:
+        print(json.dumps(result))
+    else:
+        for n in result["dropped"]:
+            print(f"dropped: {n}")
+        print(f"skipped (shared): {result['skipped_shared']}")
+        for err in result["errors"]:
+            print(f"  ERROR {err['collection']}: {err['error']}")
+    return 1 if result["errors"] else 0
+
+
 def _cmd_install_bundle(args: argparse.Namespace) -> int:
     """`install-bundle --folder <path> [--orchestrator-root <path>]
     [--update] [--force] [--dry-run] [--project-folder <path>] --json`
@@ -3016,6 +3086,31 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Emit a single JSON object on stdout.",
     )
     p_bootstrap.set_defaults(func=_cmd_bootstrap_collections)
+
+    # drop-collections (2026-05-06 unregister) ---------------------------
+    p_drop = sub.add_parser(
+        "drop-collections",
+        help=(
+            "Drop the project's OWN Weaviate collections "
+            "(<Project>_KnowledgeGraph, <Project>_Development). Shared "
+            "KG is NEVER touched. Used by launcher delete_project_v2 "
+            "when --purge-collections is opted in."
+        ),
+    )
+    p_drop.add_argument(
+        "--name", required=True,
+        help="Project name (raw; sanitization applied internally).",
+    )
+    p_drop.add_argument(
+        "--weaviate-url", default=None,
+        help="Override Weaviate URL (default: WEAVIATE_URL env or "
+             "http://localhost:8081).",
+    )
+    p_drop.add_argument(
+        "--json", action="store_true",
+        help="Emit a single JSON object on stdout.",
+    )
+    p_drop.set_defaults(func=_cmd_drop_collections)
 
     # install-bundle (PR 4) ----------------------------------------------
     p_bundle = sub.add_parser(

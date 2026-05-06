@@ -12,6 +12,8 @@ import type {
   CreateProjectResult,
   RenameProjectResult,
   UpdateProjectResult,
+  UnregisterOptions,
+  UnregisterReport,
 } from '$lib/types/launcher';
 import { toast } from '$lib/stores/toast';
 
@@ -223,8 +225,31 @@ function createProjectsStore() {
       return result;
     },
 
-    async delete(id: string, deleteFolder: boolean = false): Promise<void> {
-      await invoke<void>('delete_project_v2', { id, deleteFolder });
+    /**
+     * Unregister a project from the launcher.
+     *
+     * 2026-05-06: replaced the old `deleteFolder: boolean` (always
+     * ignored — launcher never touched the user's folder) with a richer
+     * `UnregisterOptions` object that lets the user pick:
+     *   - `purgeLauncherFiles` (default true): surgical removal of
+     *     launcher-managed files (.claude/hooks, .claude/scripts,
+     *     infrastructure compose YAMLs) + canonical env-key strip.
+     *     User content (agents/skills/CONTEXT_STATE/CLAUDE.md/source
+     *     code/user-added .env keys) is preserved.
+     *   - `purgeCollections` (default false): drop the project's OWN
+     *     Weaviate collections. Shared collections never touched.
+     *
+     * Returns the `UnregisterReport` with counts the UI can toast.
+     * `options=null` (or omitted) → backend defaults apply.
+     */
+    async delete(
+      id: string,
+      options: UnregisterOptions | null = null,
+    ): Promise<UnregisterReport> {
+      const report = await invoke<UnregisterReport>('delete_project_v2', {
+        id,
+        options,
+      });
       update((s) => {
         const projects = s.projects.filter((p) => p.id !== id);
         let selectedId = s.selectedId;
@@ -234,6 +259,7 @@ function createProjectsStore() {
         }
         return { ...s, projects, selectedId };
       });
+      return report;
     },
 
     clearError() {
