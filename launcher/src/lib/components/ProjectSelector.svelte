@@ -18,11 +18,22 @@
   import Dropdown from '$lib/components/Dropdown.svelte';
   import DialogRoot from '$lib/components/DialogRoot.svelte';
 
-  // When the user picks a folder, run inspect_orchestrator_at to
-  // detect whether an orchestrator is already there and what shape it's
-  // in. The status panel below the path input shows the result and
-  // gives the user three explicit choices (use as-is / update / install
-  // fresh).
+  // When the user picks a folder, run inspect_orchestrator_at to detect
+  // whether the folder is a VCO orchestrator clone (i.e. has a
+  // `vct-module.json`). Add Project is for registering USER PROJECT
+  // FOLDERS — projects bind to the orchestrator, they ARE NOT
+  // orchestrator clones. So if the inspector reports `installed=true`
+  // we surface a clear error and refuse the create.
+  //
+  // Orchestrator self-onboarding ("install this VCO clone as the active
+  // orchestrator") is a separate flow handled by OnboardingWizard.svelte.
+  // The previous adopt-choice modal (use as-is / update / install fresh)
+  // was removed from this component on 2026-05-06 to prevent the
+  // post-PR-#150 false-positive where a project folder with leftover
+  // `.claude/` from a non-destructive unregister was misclassified as a
+  // VCO clone and routed through the wizard's adopt flow. With the
+  // inspector now gating on `vct-module.json` only, `installed=true`
+  // here means "really a VCO clone", which is wrong for Add Project.
   type ConfigHealth = { file: string; ok: boolean; error: string | null };
   type OrchestratorState = {
     installed: boolean;
@@ -33,15 +44,6 @@
   };
   let orchestratorState = $state<OrchestratorState | null>(null);
   let inspecting = $state(false);
-  // 'use_as_is' | 'update' | 'install_fresh' — only meaningful when a
-  // pre-existing install was detected at the chosen project folder
-  // (i.e. the user is pointing the wizard at a folder that already
-  // contains a VCO clone, an orchestrator self-onboarding scenario).
-  // 2026-05-06 (PR-1): the "no orchestrator → install it here" branch
-  // and its `installAfterCreate` checkbox were removed; the launcher
-  // architecture is ONE shared VCO clone, never installed INTO project
-  // folders. See `.claude/context/install-paths-audit-2026-05-06.md` §J.
-  let adoptChoice = $state<'use_as_is' | 'update' | 'install_fresh'>('use_as_is');
   let inspectDebounce: ReturnType<typeof setTimeout> | null = null;
 
   // Host options used by the create modal. Bug 3d: MAO is hidden until it
@@ -127,16 +129,10 @@
     inspecting = true;
     try {
       orchestratorState = await invoke<OrchestratorState>('inspect_orchestrator_at', { path });
-      if (orchestratorState.installed) {
-        // Pre-existing orchestrator at the chosen folder — default the
-        // adopt action based on whether the bundled launcher ships a
-        // newer version.
-        adoptChoice = orchestratorState.version_status === 'outdated' ? 'update' : 'use_as_is';
-      }
-      // No-orchestrator-at-path branch is intentionally a no-op: the
-      // launcher never installs into project folders, so there is no
-      // toggle to default. The status panel below simply hides the
-      // existing-install UI in that case.
+      // No defaulting / branching here: Add Project never installs or
+      // updates an orchestrator. `installed=true` is surfaced as a
+      // validation error in handleCreate; `installed=false` is the
+      // normal happy path.
     } catch (e) {
       orchestratorState = null;
       console.error('inspect_orchestrator_at failed', e);
@@ -245,35 +241,24 @@
         submitPath = home + submitPath.slice(1);
       }
     }
+    // Reject VCO clones up front. After the 2026-05-06 inspector fix,
+    // `installed=true` means the folder has a `vct-module.json` (the
+    // canonical VCO-clone marker), which makes this folder an
+    // orchestrator clone, not a user project folder. Add Project is
+    // for registering project folders only — orchestrator
+    // self-onboarding is a separate flow (OnboardingWizard).
+    if (orchestratorState?.installed) {
+      createError =
+        'This folder appears to be a VCO orchestrator clone ' +
+        '(vct-module.json found). Add Project is for registering user ' +
+        "project folders, not orchestrator clones. If you're trying to " +
+        "install or adopt the orchestrator, use the Wizard's " +
+        'self-onboarding flow instead.';
+      return;
+    }
+
     creating = true;
     try {
-      // Bug 20: handle pre-existing orchestrator state before creating
-      // the project record so the user's choice is honored. This branch
-      // covers the orchestrator self-onboarding flow only — when the
-      // user points the wizard at a folder that already contains a VCO
-      // clone. 2026-05-06 (PR-1): the "no orchestrator at path → install
-      // it here" branch was removed because the architecture is ONE
-      // shared VCO clone, never installed INTO project folders. See
-      // `.claude/context/install-paths-audit-2026-05-06.md`.
-      if (orchestratorState?.installed) {
-        if (adoptChoice === 'update') {
-          await invoke('update_orchestrator_at', { path: submitPath });
-        } else if (adoptChoice === 'install_fresh') {
-          await invoke('install_orchestrator', {
-            config: {
-              install_path: submitPath,
-              use_gpu: false,
-              cpu_only: false,
-              openai_key: null,
-              container_runtime: null,
-              skip_containers: true,
-            },
-            confirmOverwrite: true,
-          });
-        }
-        // 'use_as_is' → no action, just register.
-      }
-
       await projects.create(createName.trim(), submitPath, createHost);
       showCreate = false;
       createName = '';
@@ -491,64 +476,32 @@
 
         {#if inTauri && createPath.trim() && orchestratorState?.installed}
           <!--
-            2026-05-06 (PR-1): the "no orchestrator at this path → install
-            into this folder" branch + checkbox were removed. The
-            launcher architecture is ONE shared VCO clone; project
-            folders never receive the orchestrator. The branch below
-            only fires when the user has pointed the wizard at a folder
-            that ALREADY contains a VCO clone (orchestrator
-            self-onboarding flow). See
-            `.claude/context/install-paths-audit-2026-05-06.md` §J for
-            the rationale.
+            2026-05-06 (PR-2): adopt-choice (use_as_is / update /
+            install_fresh) was removed from the Add Project flow. Add
+            Project is for registering user project folders, not
+            orchestrator clones — `installed=true` here means the
+            inspector found a `vct-module.json` (the canonical VCO-clone
+            marker, gated post-inspector-fix). Surface a clear warning
+            and block submission; orchestrator self-onboarding is the
+            OnboardingWizard's job.
           -->
-          <div class="orch-status orch-existing">
+          <div class="orch-status orch-warn-block">
             <p class="orch-row">
-              <span class="orch-icon orch-ok">✓</span>
+              <span class="orch-icon orch-warn">!</span>
               <span>
-                Existing orchestrator detected
+                This folder is a <strong>VCO orchestrator clone</strong>
                 {#if orchestratorState.version}
-                  — installed: <strong>v{orchestratorState.version}</strong>
-                {/if}
-                {#if orchestratorState.version_status === 'outdated' && orchestratorState.bundled_version}
-                  <span class="orch-mid">(bundled v{orchestratorState.bundled_version} available)</span>
-                {:else if orchestratorState.version_status === 'unknown'}
-                  <span class="orch-mid">(version unknown)</span>
-                {/if}
+                  (v{orchestratorState.version})
+                {/if}.
               </span>
             </p>
-            {#if orchestratorState.config_health.length > 0}
-              {@const bad = orchestratorState.config_health.filter((c) => !c.ok)}
-              {#if bad.length === 0}
-                <p class="orch-row orch-mid">
-                  Config: all {orchestratorState.config_health.length} files parse OK
-                </p>
-              {:else}
-                <p class="orch-row orch-warn">
-                  Config: {orchestratorState.config_health.length - bad.length} of
-                  {orchestratorState.config_health.length} files parse OK; flagged:
-                  {bad.map((c) => c.file).join(', ')}
-                </p>
-              {/if}
-            {/if}
-            <div class="orch-choices" role="radiogroup">
-              <label class="orch-radio" class:active={adoptChoice === 'use_as_is'}>
-                <input type="radio" name="adopt-choice" value="use_as_is" bind:group={adoptChoice} />
-                <span>Use as-is</span>
-              </label>
-              <label class="orch-radio" class:active={adoptChoice === 'update'}>
-                <input type="radio" name="adopt-choice" value="update" bind:group={adoptChoice} />
-                <span>
-                  Update
-                  {#if orchestratorState.bundled_version}
-                    to v{orchestratorState.bundled_version}
-                  {/if}
-                </span>
-              </label>
-              <label class="orch-radio" class:active={adoptChoice === 'install_fresh'}>
-                <input type="radio" name="adopt-choice" value="install_fresh" bind:group={adoptChoice} />
-                <span>Install fresh (overwrite)</span>
-              </label>
-            </div>
+            <p class="orch-row orch-mid">
+              Add Project registers <em>user project folders</em>, not
+              orchestrator clones. If you want to install or adopt the
+              orchestrator, use the Wizard's self-onboarding flow
+              instead. Pick a different folder, or create one for your
+              project.
+            </p>
           </div>
         {:else if inTauri && createPath.trim() && inspecting}
           <p class="form-hint orch-inspecting">Inspecting folder…</p>
@@ -992,9 +945,11 @@
   }
 
   /* Bug 20: orchestrator state panel inside project-create modal.
-     2026-05-06 (PR-1): `.orch-fresh` + `.orch-toggle` removed along with
-     the "install orchestrator into this folder" checkbox; only the
-     existing-install adopt-choice panel remains. */
+     2026-05-06 (PR-2): adopt-choice radios + `.orch-choices` /
+     `.orch-radio` removed — Add Project no longer routes through the
+     orchestrator self-onboarding flow. Replaced with `.orch-warn-block`
+     which surfaces a clear "this is a VCO clone, pick a different
+     folder" warning when the inspector reports installed=true. */
   .orch-status {
     margin: 14px 0;
     padding: 10px 12px;
@@ -1003,6 +958,10 @@
     border-radius: 8px;
     font-size: 12px;
   }
+  .orch-warn-block {
+    border-color: rgba(245, 179, 66, 0.45);
+    background: rgba(245, 179, 66, 0.08);
+  }
   .orch-row {
     display: flex; align-items: flex-start; gap: 8px;
     margin: 0 0 6px;
@@ -1010,25 +969,16 @@
     line-height: 1.5;
   }
   .orch-icon { font-weight: 700; color: rgb(0,191,166); }
-  .orch-icon.orch-ok { color: rgb(0,191,166); }
+  .orch-icon.orch-warn {
+    color: #f5b342;
+    width: 16px; height: 16px;
+    display: inline-flex; align-items: center; justify-content: center;
+    border: 1px solid #f5b342; border-radius: 50%;
+    font-size: 11px; line-height: 1;
+  }
   .orch-mid { color: var(--color-mid); }
   .orch-warn { color: #f5b342; }
   .orch-inspecting { color: var(--color-mid); margin-top: 8px; }
-  .orch-choices {
-    display: flex; flex-direction: column; gap: 4px;
-    margin-top: 8px;
-  }
-  .orch-radio {
-    display: flex; align-items: center; gap: 8px;
-    padding: 6px 8px;
-    border: 1px solid transparent;
-    border-radius: 6px;
-    cursor: pointer;
-    font-size: 12px;
-    color: var(--color-text);
-  }
-  .orch-radio:hover { background: rgba(255,255,255,0.04); }
-  .orch-radio.active { border-color: rgba(0,191,166,0.4); background: rgba(0,191,166,0.08); }
 
   .path-row {
     display: flex;
