@@ -318,8 +318,43 @@ async fn project_env(
                 env.insert(s.key.clone(), serde_json::Value::String(as_str));
             }
         }
-        // Secrets (resolved from keychain)
+        // Secrets (resolved from keychain).
+        //
+        // PR-3 Commit 3 (2026-05-06): gate every keychain read on
+        // `is_secret_active`. Pre-PR-3 the hub returned the cleartext
+        // VALUE of paused secrets to subprocesses while the launcher's
+        // GUI correctly reported them as unset — an asymmetric leak
+        // (the GUI lies "secret unset", the hub still serves the value
+        // to consumers). This contradicted the Lifecycle B contract
+        // implemented in PR #60 / commands/secrets_cmd.rs.
+        //
+        // Inactive entries are OMITTED from the response (not returned
+        // as empty strings). Consumers that test for presence — e.g.
+        // `if env_var_set("OPENAI_API_KEY"): use_real_api()` — see
+        // "not set" rather than "set to empty", which is the contract
+        // we promise in `is_secret_set` / `get_secret_preview`.
+        //
+        // See secrets-and-access-matrix-audit-2026-05-06.md §6 (canary
+        // test asymmetric-leak diagnosis) and the matching unit-test
+        // `inactive_secret_does_not_leak_preview` in secrets_cmd.rs.
         for s in &manifest.secrets {
+            // Resolve the same scope-string the active-flag DB uses.
+            // Mirrors `enforce_scope_invariants` in secrets_cmd.rs.
+            let scope_str = match s.scope.as_str() {
+                "global" => "global",
+                "shared" => "shared",
+                _ => "per_project",
+            };
+            // Active-flag gate. `is_secret_active` defaults to true
+            // when no row exists, so secrets that pre-existed
+            // migration 007 still resolve normally.
+            let active = h
+                .0
+                .is_secret_active(scope_str, &project.id, &manifest.id, &s.key)
+                .unwrap_or(true);
+            if !active {
+                continue;
+            }
             let scope = match s.scope.as_str() {
                 "global" => crate::secrets::SecretScope::Global,
                 "shared" => crate::secrets::SecretScope::Shared { project_id: &project.id },
@@ -332,6 +367,38 @@ async fn project_env(
     }
 
     Json(serde_json::Value::Object(env)).into_response()
+}
+
+/// PR-3 Commit 3 (2026-05-06): pure helper for the gate decision used by
+/// `project_env`'s secrets loop. Returns the cleartext value when the
+/// secret is active AND the keychain has it; `None` otherwise (never
+/// served to subprocesses). Inactive entries omit the env var entirely
+/// — consumers see "not set" rather than "set to empty", matching the
+/// `is_secret_set` / `get_secret_preview` contract.
+///
+/// Returning `Option<String>` rather than emitting a `serde_json::Value`
+/// keeps this independent of the response shape so the unit test can
+/// pin behaviour without standing up axum + a hub server.
+#[cfg(test)]
+pub(crate) fn resolve_secret_for_subprocess_env(
+    db: &crate::db::Db,
+    scope_str: &str,
+    project_id: &str,
+    module_id: &str,
+    key: &str,
+) -> Option<String> {
+    let active = db
+        .is_secret_active(scope_str, project_id, module_id, key)
+        .unwrap_or(true);
+    if !active {
+        return None;
+    }
+    let scope = match scope_str {
+        "global" => crate::secrets::SecretScope::Global,
+        "shared" => crate::secrets::SecretScope::Shared { project_id },
+        _ => crate::secrets::SecretScope::PerProject { project_id },
+    };
+    crate::secrets::get(scope, module_id, key).ok().flatten()
 }
 
 // ─── Manifest scanning (shared with commands::modules) ──────────────────
@@ -369,4 +436,135 @@ fn scan_manifests() -> Vec<(std::path::PathBuf, crate::manifest::ModuleManifest)
     // ProjectHost import only needed for the type system to resolve.
     let _ = std::marker::PhantomData::<ProjectHost>;
     out
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Db;
+
+    /// Probe whether the OS keychain backend is available in this test
+    /// environment. CI containers and headless build hosts typically
+    /// have no Secret Service / Keychain / Credential Manager running,
+    /// so any test that exercises the actual keychain has to short-circuit.
+    fn keyring_available() -> bool {
+        let entry = match keyring::Entry::new("vct.test.hub.probe", "probe") {
+            Ok(e) => e,
+            Err(_) => return false,
+        };
+        if entry.set_password("canary").is_err() {
+            return false;
+        }
+        let _ = entry.delete_credential();
+        true
+    }
+
+    /// PR-3 Commit 3 canary: the hub's per-subprocess secret resolver MUST
+    /// honour `is_secret_active`. A paused secret (Lifecycle B Unset)
+    /// returns the value through the keychain (the value is preserved on
+    /// purpose) but the active flag in launcher.db is false — readers
+    /// MUST see "not set" rather than the cleartext value.
+    ///
+    /// Pre-PR-3 this resolver bypassed the active flag and served the
+    /// cleartext value to subprocesses, contradicting the canary test
+    /// `inactive_secret_does_not_leak_preview` in secrets_cmd.rs (which
+    /// only covered the Tauri-side preview path, not the hub HTTP API).
+    /// See secrets-and-access-matrix-audit-2026-05-06.md §6.
+    #[test]
+    fn paused_secret_does_not_leak_to_hub_subprocess_env() {
+        if !keyring_available() {
+            eprintln!("[skip] no OS keychain backend in this test env");
+            return;
+        }
+
+        let db = Db::open_in_memory().unwrap();
+        let scope_str = "global";
+        let project_id = "_global_";
+        let module_id = "user";
+        let canary = format!(
+            "test-hub-leak-canary-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        );
+        let key = format!(
+            "HUB_CANARY_KEY_{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        );
+
+        // Set + activate.
+        crate::secrets::set(
+            crate::secrets::SecretScope::Global,
+            module_id,
+            &key,
+            &canary,
+        )
+        .unwrap();
+        db.mark_secret_active(scope_str, project_id, module_id, &key)
+            .unwrap();
+
+        // While ACTIVE: the resolver returns the cleartext value (the
+        // launcher's contract for unwrapped subprocess env vars).
+        let resolved =
+            resolve_secret_for_subprocess_env(&db, scope_str, project_id, module_id, &key);
+        assert_eq!(resolved.as_deref(), Some(canary.as_str()));
+
+        // Unset (Lifecycle B): keychain UNTOUCHED, active flag flipped.
+        db.mark_secret_inactive(scope_str, project_id, module_id, &key)
+            .unwrap();
+
+        // The keychain still has the value (proves Lifecycle B):
+        let kc = crate::secrets::get(
+            crate::secrets::SecretScope::Global,
+            module_id,
+            &key,
+        )
+        .unwrap();
+        assert_eq!(kc.as_deref(), Some(canary.as_str()));
+
+        // But the hub-side resolver MUST refuse to serve it. This is
+        // the bug we're fixing in PR-3 Commit 3.
+        let resolved_paused =
+            resolve_secret_for_subprocess_env(&db, scope_str, project_id, module_id, &key);
+        assert!(
+            resolved_paused.is_none(),
+            "paused secret leaked through hub resolver: {:?}",
+            resolved_paused
+        );
+
+        // Reactivate: resolver works again with no value re-entry.
+        db.mark_secret_active(scope_str, project_id, module_id, &key)
+            .unwrap();
+        let resolved_reactivated =
+            resolve_secret_for_subprocess_env(&db, scope_str, project_id, module_id, &key);
+        assert_eq!(resolved_reactivated.as_deref(), Some(canary.as_str()));
+
+        // Cleanup keychain (best-effort).
+        let _ = crate::secrets::delete(
+            crate::secrets::SecretScope::Global,
+            module_id,
+            &key,
+        );
+        let _ = db.forget_secret_active_state(scope_str, project_id, module_id, &key);
+    }
+
+    #[test]
+    fn resolver_returns_none_when_keychain_empty_even_if_active() {
+        // Active flag default is true; if the keychain has no value the
+        // resolver returns None (omits the env var). Doesn't require the
+        // keychain backend — `is_set` returns false on a never-written key.
+        if !keyring_available() {
+            eprintln!("[skip] no OS keychain backend in this test env");
+            return;
+        }
+        let db = Db::open_in_memory().unwrap();
+        let res = resolve_secret_for_subprocess_env(
+            &db,
+            "global",
+            "_global_",
+            "user",
+            "NEVER_SET_KEY_PR3_TEST",
+        );
+        assert!(res.is_none());
+    }
 }
