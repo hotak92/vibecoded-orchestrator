@@ -79,11 +79,9 @@ async fn try_bind(base_addr: SocketAddr, retries: u16) -> Result<tokio::net::Tcp
     unreachable!()
 }
 
-/// Write port to ~/.vct/hub.port so apps can discover the hub.
+/// Write port to `<VCT_STATE_DIR or ~/.vct>/hub.port` so apps can discover the hub.
 async fn write_port_file(port: u16) {
-    let path = directories::UserDirs::new()
-        .map(|d| d.home_dir().join(".vct").join("hub.port"))
-        .unwrap_or_else(|| ".vct/hub.port".into());
+    let path = crate::paths::vct_root_dir().join("hub.port");
 
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await.ok();

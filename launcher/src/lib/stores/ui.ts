@@ -2,6 +2,7 @@
 // settings panel / activation modal / install wizard / mcp dashboard.
 
 import { writable } from 'svelte/store';
+import { clearOnboardingComplete } from '$lib/onboarding';
 
 // Sections rendered by SettingsPanel.svelte's left nav. Exported so
 // callers (e.g. SecretsTab "Open secrets panel") can request a specific
@@ -74,13 +75,18 @@ function createUIStore() {
     closeMcpDashboard: () =>
       update((s) => ({ ...s, showMcpDashboard: false })),
     // Explicit re-run by the user (Settings → Re-run, Preferences →
-    // Re-run). Clears the onboarding-complete localStorage flag, opens
+    // Re-run). Clears the onboarding-complete flag in launcher.db, opens
     // the wizard, AND sets onboardingForced=true so the wizard's
     // preflight knows not to auto-close even if projects already
     // exist. Existing projects and settings are unaffected — only the
     // completion marker is removed so the wizard re-runs from step 1.
+    //
+    // Bug 14 fix (2026-05-05): the flag moved from WebView localStorage
+    // to launcher.db (via $lib/onboarding) so VCT_STATE_DIR isolation
+    // works. The clear is fire-and-forget — best-effort, never throws,
+    // and the wizard opens regardless.
     openOnboarding: () => {
-      try { localStorage.removeItem('vct.onboarding_complete'); } catch {}
+      void clearOnboardingComplete();
       update((s) => ({
         ...s,
         showOnboarding: true,

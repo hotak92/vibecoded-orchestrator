@@ -2,11 +2,9 @@ use crate::state::AppManager;
 use crate::types::ServiceEntry;
 use std::collections::HashMap;
 
-/// Path: ~/.vct/services.json
+/// Path: `<VCT_STATE_DIR or ~/.vct>/services.json`.
 pub fn registry_path() -> std::path::PathBuf {
-    directories::UserDirs::new()
-        .map(|d| d.home_dir().join(".vct").join("services.json"))
-        .unwrap_or_else(|| std::path::PathBuf::from(".vct/services.json"))
+    crate::paths::vct_root_dir().join("services.json")
 }
 
 /// Load last-known service states from disk (called at startup).

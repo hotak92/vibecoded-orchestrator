@@ -12,11 +12,9 @@ use std::sync::{Arc, Mutex};
 
 pub type Db = Arc<Mutex<Connection>>;
 
-/// Database path: ~/.vct/hub.db
+/// Database path: `<VCT_STATE_DIR or ~/.vct>/hub.db`.
 pub fn db_path() -> PathBuf {
-    directories::UserDirs::new()
-        .map(|d| d.home_dir().join(".vct").join("hub.db"))
-        .unwrap_or_else(|| PathBuf::from(".vct/hub.db"))
+    crate::paths::vct_root_dir().join("hub.db")
 }
 
 /// Open (or create) the hub database and run migrations.

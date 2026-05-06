@@ -1,7 +1,20 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
+  import { getVersion } from '@tauri-apps/api/app';
   import { currentUser } from '$lib/stores/auth';
 
   let appCount = $derived($currentUser?.apps?.length ?? 0);
+  let version = $state('');
+
+  onMount(async () => {
+    try {
+      version = await getVersion();
+    } catch {
+      // getVersion may fail in dev/web preview without Tauri runtime —
+      // leave version blank rather than show a stale hardcoded number.
+      version = '';
+    }
+  });
 </script>
 
 <footer class="status-bar">
@@ -11,8 +24,10 @@
   </div>
   <div class="status-right">
     <span>{appCount} app{appCount !== 1 ? 's' : ''} activated</span>
-    <span class="status-sep">|</span>
-    <span>v0.1.0</span>
+    {#if version}
+      <span class="status-sep">|</span>
+      <span>v{version}</span>
+    {/if}
   </div>
 </footer>
 

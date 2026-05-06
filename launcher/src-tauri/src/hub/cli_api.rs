@@ -291,31 +291,29 @@ async fn activate_license(
         None,
         &serde_json::json!({ "via": "cli", "queued": true }),
     );
-    // Persist the key to ~/.vct/license.key for the launcher to pick up.
-    let key_path = directories::UserDirs::new()
-        .map(|d| d.home_dir().join(".vct").join("license.key"));
-    if let Some(p) = key_path {
-        if let Some(parent) = p.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        if let Err(e) = std::fs::write(&p, &req.key) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("write license.key: {}", e)).into_response();
-        }
+    // Persist the key for the launcher to pick up. Path resolves through
+    // VCT_STATE_DIR (Bug 14): production launcher uses ~/.vct/, dev
+    // launcher uses ~/.vct-dev/, etc. Without this, a dev launcher's
+    // Hub server would clobber the production license file.
+    let key_path = crate::paths::vct_root_dir().join("license.key");
+    if let Some(parent) = key_path.parent() {
+        std::fs::create_dir_all(parent).ok();
     }
+    if let Err(e) = std::fs::write(&key_path, &req.key) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("write license.key: {}", e)).into_response();
+    }
+    let display = key_path.display().to_string();
     Json(serde_json::json!({
         "ok": true,
         "queued": true,
-        "note": "License key saved to ~/.vct/license.key. Open the launcher GUI to validate against the licensing service."
+        "note": format!("License key saved to {}. Open the launcher GUI to validate against the licensing service.", display)
     }))
     .into_response()
 }
 
 async fn deactivate_license(State(h): State<LauncherDbHandle>) -> impl IntoResponse {
-    let key_path = directories::UserDirs::new()
-        .map(|d| d.home_dir().join(".vct").join("license.key"));
-    if let Some(p) = key_path {
-        let _ = std::fs::remove_file(&p);
-    }
+    let key_path = crate::paths::vct_root_dir().join("license.key");
+    let _ = std::fs::remove_file(&key_path);
     let _ = h.0.audit("license_deactivate", None, None, &serde_json::json!({ "via": "cli" }));
     Json(serde_json::json!({ "ok": true })).into_response()
 }
@@ -365,11 +363,12 @@ async fn set_hook_enabled(
 // ─── Telemetry ──────────────────────────────────────────────────────────
 
 async fn telemetry_status(_state: State<LauncherDbHandle>) -> impl IntoResponse {
-    // Read consent from ~/.vct/telemetry.json — cheap, no DB call.
-    let path = directories::UserDirs::new()
-        .map(|d| d.home_dir().join(".vct").join("telemetry.json"));
-    let consent = path
-        .and_then(|p| std::fs::read_to_string(&p).ok())
+    // Read consent from <VCT_STATE_DIR>/telemetry.json — cheap, no DB call.
+    // Path resolves through Bug 14's vct_root_dir() so dev/prod don't share
+    // a single consent file.
+    let path = crate::paths::vct_root_dir().join("telemetry.json");
+    let consent = std::fs::read_to_string(&path)
+        .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .and_then(|v| v.get("consent").and_then(|c| c.as_bool()))
         .unwrap_or(false);
@@ -385,16 +384,15 @@ async fn set_telemetry_consent(
     State(h): State<LauncherDbHandle>,
     Json(req): Json<TelemetryConsentReq>,
 ) -> impl IntoResponse {
-    let path = directories::UserDirs::new()
-        .map(|d| d.home_dir().join(".vct").join("telemetry.json"));
-    if let Some(p) = path {
-        if let Some(parent) = p.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        let body = serde_json::json!({ "consent": req.consent });
-        if let Err(e) = std::fs::write(&p, body.to_string()) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("write telemetry.json: {}", e)).into_response();
-        }
+    // Path resolves through Bug 14's vct_root_dir() — dev launcher writes
+    // to ~/.vct-dev/, prod writes to ~/.vct/.
+    let path = crate::paths::vct_root_dir().join("telemetry.json");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let body = serde_json::json!({ "consent": req.consent });
+    if let Err(e) = std::fs::write(&path, body.to_string()) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("write telemetry.json: {}", e)).into_response();
     }
     let _ = h.0.audit(
         "telemetry_consent",

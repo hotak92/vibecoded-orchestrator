@@ -93,9 +93,7 @@ impl AdoptionState {
 // ---------------------------------------------------------------------------
 
 pub fn config_path() -> PathBuf {
-    directories::UserDirs::new()
-        .map(|d| d.home_dir().join(".vct").join("services.toml"))
-        .unwrap_or_else(|| PathBuf::from(".vct/services.toml"))
+    crate::paths::vct_root_dir().join("services.toml")
 }
 
 pub fn read() -> AdoptionState {

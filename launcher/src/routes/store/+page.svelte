@@ -3,10 +3,24 @@
   import RightSidebar from '$lib/components/RightSidebar.svelte';
   import { currentUser, auth } from '$lib/stores/auth';
   import { orchestrator } from '$lib/stores/orchestrator';
+  import { modules } from '$lib/stores/modules';
   import { ui } from '$lib/stores/ui';
+
+  // Catalog overrides hardcoded versions per `id`. Loaded at mount; while
+  // pending, the hardcoded version is shown so the card never renders an
+  // empty version string. Once the catalog resolves, the displayed version
+  // becomes the source-of-truth from `list_module_catalog`.
+  const catalogVersionById = $derived.by<Record<string, string>>(() => {
+    const m: Record<string, string> = {};
+    for (const e of $modules.catalog) {
+      m[e.id] = e.version;
+    }
+    return m;
+  });
 
   onMount(() => {
     orchestrator.checkStatus();
+    modules.loadCatalog();
     const handleFocus = () => auth.refreshProfile();
     window.addEventListener('focus', handleFocus);
     return () => window.removeEventListener('focus', handleFocus);
@@ -29,8 +43,8 @@
   // MAO is rendered as Coming Soon; clicking the card surfaces an early-access
   // hint rather than a checkout link.
   const allApps: AppItem[] = [
-    { id: 'orchestrator', name: 'Orchestrator', desc: 'Knowledge graph, code graph, and workflow automation for Claude Code. Free tier — persistent memory for your AI.', color: 'teal', icon: 'O', version: '0.1.0', checkoutUrl: '' },
-    { id: 'orchestrator-pro', name: 'Orchestrator Pro', desc: 'RL-scored retrieval that learns from your usage, curated agent packs, auto-updates. €19/mo · €149/yr · €199 lifetime.', color: 'purple', icon: 'O+', version: '0.1.0', checkoutUrl: '' },
+    { id: 'orchestrator', name: 'Orchestrator', desc: 'Knowledge graph, code graph, and workflow automation for Claude Code. Free tier — persistent memory for your AI.', color: 'teal', icon: 'O', version: '0.1.6', checkoutUrl: '' },
+    { id: 'orchestrator-pro', name: 'Orchestrator Pro', desc: 'RL-scored retrieval that learns from your usage, curated agent packs, auto-updates. €19/mo · €149/yr · €199 lifetime.', color: 'purple', icon: 'O+', version: '0.1.6', checkoutUrl: '' },
     { id: 'mao', name: 'Multi-Agent Orchestrator (MAO)', desc: 'Coming soon — 10 specialist agents + Maestro coordinator + Planner pipeline + Tauri UI on top of Standard.', color: 'pink', icon: 'M', version: 'preview', checkoutUrl: '' },
     { id: 'transcrypt', name: 'Transcrypt', desc: 'Audio transcription with AI-powered correction and vocabulary support', color: 'teal', icon: 'T', version: '2.1.0', checkoutUrl: '' },
     { id: 'arzillibus', name: 'Arzillibus', desc: 'Smart ticketing system for events and venue management', color: 'purple', icon: 'A', version: '1.4.0', checkoutUrl: '' },
@@ -127,7 +141,7 @@
             <h3 class="app-card-name">{app.name}</h3>
             <p class="app-card-desc">{app.desc}</p>
             <div class="app-card-footer">
-              <span class="app-card-version">v{app.version}</span>
+              <span class="app-card-version">v{catalogVersionById[app.id] ?? app.version}</span>
               {#if app.id === 'orchestrator'}
                 {#if orchState.status === 'installed'}
                   <button class="btn-3d btn-3d-ghost btn-3d-sm" onclick={(e) => { e.stopPropagation(); ui.openMcpDashboard(); }}>

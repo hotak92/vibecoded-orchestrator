@@ -53,6 +53,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "secret_active_state: per-secret active flag (Lifecycle B + Storage A — Bug 3 follow-up)",
         sql: include_str!("migrations/007_secret_active_state.sql"),
     },
+    Migration {
+        version: 8,
+        description: "app_state: key-value table for VCT_STATE_DIR-isolated launcher flags (Bug 14 fix — onboarding_complete moves out of localStorage)",
+        sql: include_str!("migrations/008_app_state.sql"),
+    },
 ];
 
 /// Apply every migration whose version is greater than the current max applied.
