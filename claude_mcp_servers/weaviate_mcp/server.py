@@ -1467,7 +1467,18 @@ async def _rl_cache_and_rerank(
 
     # Try rl_server for reranking.
     try:
-        payload = {"task_id": task_id, "query": query, "nodes": all_nodes, "limit": limit}
+        # Forward ACTIVE_EMBEDDING so the RL server can verify or override
+        # its startup-time tag if the two processes ever drift (e.g. user
+        # flipped ACTIVE_EMBEDDING in one shell but the RL server is still
+        # running with the previous value). The RL server uses this for
+        # logging/tagging; it does not switch networks per-request.
+        payload = {
+            "task_id": task_id,
+            "query": query,
+            "nodes": all_nodes,
+            "limit": limit,
+            "embedding_source": ACTIVE_EMBEDDING,
+        }
         timeout = aiohttp.ClientTimeout(total=3.0)   # tight timeout — don't block Claude
         async with aiohttp.ClientSession(timeout=timeout) as sess:
             async with sess.post(f"{RL_SERVER_URL}/cache_nodes", json=payload) as resp:
@@ -1700,6 +1711,11 @@ async def semantic_graph_search(
     # Sort merged candidates by score so RL sees a clean list (top-k semantics).
     all_formatted.sort(key=lambda x: x.get("score", 0.0), reverse=True)
 
+    # Collapse multi-chunk matches of the same node BEFORE the RL rerank, for
+    # the same reason hybrid_search does (retrieval_rl.py keys on title; two
+    # chunks of the same node would silently collide in `signed[title]`).
+    all_formatted = _collapse_to_one_per_node(all_formatted, score_field="score")
+
     # RL: rerank + cache using all over-fetched nodes; return top-k primary results.
     task_id = str(uuid.uuid4())
     primary_results = await _rl_cache_and_rerank(task_id, query, all_formatted, limit)
@@ -1900,6 +1916,57 @@ async def _hybrid_search_single_collection(
     return combined
 
 
+def _collapse_to_one_per_node(
+    results: list[dict],
+    score_field: str = "combined_score",
+) -> list[dict]:
+    """
+    Collapse multi-chunk matches of the same node into a single entry, keeping
+    the highest-scoring chunk's full record and recording how many chunks of
+    that node matched the query.
+
+    Why: the per-collection dedup keys on (title, chunk_number) — correct for
+    merging semantic+keyword hits on the SAME chunk. But two different chunks
+    of the same node both survive into the candidate list. To the agent this
+    looks like duplicates; to the RL server (which keys EVERYTHING on title),
+    the second chunk's signal silently overwrites the first's in
+    retrieval_rl.py — corrupting both online training and offline logs.
+
+    Collapsing here, upstream of _rl_cache_and_rerank, gives:
+      - Clean user-visible top-K (no apparent duplicates)
+      - Clean RL candidate pool (one entry per node title)
+      - Clean offline training log (one record per node)
+      - New `chunks_matched` field — useful learning signal: a node matched
+        on N chunks is plausibly a stronger semantic match than one matched
+        on a single chunk, even at the same combined_score.
+
+    Key: (file_path or '', title) — file_path disambiguates rare cross-collection
+    title collisions (e.g. same node title in shared and project KG).
+
+    Returns: collapsed list, sorted by score_field desc. Each kept entry
+    carries the WINNING chunk's score, content, and metadata, plus:
+      - chunks_matched: int — number of distinct chunks of this node in input
+      - best_chunk_number: int|None — the surviving chunk's number (None for
+        unchunked nodes)
+    """
+    by_node: dict[tuple, dict] = {}
+    counts: dict[tuple, int] = {}
+    for r in results:
+        key = (r.get("file_path") or "", r.get("title") or "")
+        counts[key] = counts.get(key, 0) + 1
+        existing = by_node.get(key)
+        if existing is None or r.get(score_field, 0.0) > existing.get(score_field, 0.0):
+            by_node[key] = r
+    collapsed = []
+    for key, r in by_node.items():
+        r = dict(r)  # don't mutate caller's dict
+        r["chunks_matched"] = counts[key]
+        r["best_chunk_number"] = r.get("chunk_number")
+        collapsed.append(r)
+    collapsed.sort(key=lambda x: x.get(score_field, 0.0), reverse=True)
+    return collapsed
+
+
 @mcp.tool()
 async def hybrid_search(
     query: str,
@@ -2007,6 +2074,14 @@ async def hybrid_search(
 
     # Sort all over-fetched candidates by combined score
     all_results = sorted(merged.values(), key=lambda x: x["combined_score"], reverse=True)
+
+    # Collapse multi-chunk matches of the same node into one entry per node.
+    # Runs before the RL rerank so the candidate pool the RL server sees has
+    # one record per node-title (retrieval_rl.py keys on title — see notes in
+    # _collapse_to_one_per_node). Strict superset of the previous behaviour:
+    # unchunked nodes pass through untouched; multi-chunk-matched nodes
+    # collapse to their best chunk + a chunks_matched signal.
+    all_results = _collapse_to_one_per_node(all_results)
 
     # Preserve combined_score → score (BUG-SCORE-DROP fix). RL server may
     # overwrite this with its own normalised score; if not, the merged

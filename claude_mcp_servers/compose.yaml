@@ -38,6 +38,15 @@ services:
       DEFAULT_VECTORIZER_MODULE: "none"
       ENABLE_API_BASED_MODULES: "true"
       CLUSTER_HOSTNAME: "node1"
+      # Disk usage thresholds (default 80%/90%/95%): raised to allow
+      # operation on a nearly-full disk where the user has knowingly
+      # accepted the risk. Warning at 95% so 80-94% disk doesn't spam
+      # the launcher's logs and trigger spurious "unhealthy" states
+      # (Bug 2026-05-05: at ~90% disk the rootlessport proxy can stall,
+      # leaving the container Up-but-unreachable on the host port —
+      # see knowledge/concepts/launcher-state-isolation-vct-state-dir.md
+      # Lesson 3 for the recovery procedure).
+      DISK_USE_WARNING_PERCENTAGE: "95"
       DISK_USE_READONLY_PERCENTAGE: "98"
       DISK_USE_IMMUTABLE_PERCENTAGE: "99"
       ENABLE_MODULES: ""
