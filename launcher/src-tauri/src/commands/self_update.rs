@@ -166,15 +166,22 @@ fn save_state(state: &UpdateState) -> Result<(), String> {
 /// release would either ship its own updater or rely on the OS package
 /// manager — out of scope.
 pub fn find_launcher_repo_root() -> Result<PathBuf, String> {
-    // Strategy 1: walk up from binary.
+    // Walk up from the running binary looking for a `.git/`. This handles
+    // every release-binary scenario the launcher cares about (binary
+    // shipped at `<clone>/launcher/dist/<arch>/vct-launcher`, walking up
+    // four levels to the clone root).
+    //
+    // Privacy note (2026-05-06): an earlier implementation also tried
+    // `option_env!("CARGO_MANIFEST_DIR")` as a fallback for `cargo run`
+    // dev launches. That macro embeds the build-host's absolute manifest
+    // path as a static string in the binary, which `--remap-path-prefix`
+    // does NOT rewrite — it leaked the developer's path on every release
+    // shipped from a dev box. Dev launches via `cargo run` are now
+    // expected to pre-set `current_exe()` correctly via the binary's
+    // location under `target/release/`, which still lives inside the
+    // clone, so Strategy 1 finds the repo root the same way.
     if let Ok(exe) = std::env::current_exe() {
         if let Some(found) = walk_up_for_git(&exe) {
-            return Ok(found);
-        }
-    }
-    // Strategy 2: walk up from CARGO_MANIFEST_DIR (works in `cargo run`).
-    if let Some(manifest) = option_env!("CARGO_MANIFEST_DIR") {
-        if let Some(found) = walk_up_for_git(Path::new(manifest)) {
             return Ok(found);
         }
     }

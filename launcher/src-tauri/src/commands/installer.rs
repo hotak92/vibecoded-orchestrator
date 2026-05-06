@@ -1425,7 +1425,15 @@ pub async fn update_orchestrator(
 /// 1. Build-time `VCT_REPO_ROOT` env var (set by the bundler when the
 ///    binary is shipped with the repo embedded next to it).
 /// 2. Walk up from the running binary's directory.
-/// 3. Walk up from `CARGO_MANIFEST_DIR` (works in dev / `cargo run`).
+///
+/// Privacy note (2026-05-06): an earlier version added a Strategy 3
+/// fallback using `env!("CARGO_MANIFEST_DIR")`. That macro embeds the
+/// build-host's absolute manifest path as a string literal, which
+/// `--remap-path-prefix` does NOT rewrite — every release shipped from
+/// a dev box leaked the developer's username and on-disk layout. The
+/// fallback was unreachable on healthy release builds (Strategy 2 always
+/// succeeds when the binary lives under the clone), so removing it is
+/// pure privacy improvement.
 pub fn find_local_repo_root() -> Result<PathBuf, String> {
     // Strategy 1: build-time env var
     if let Some(p) = option_env!("VCT_REPO_ROOT") {
@@ -1447,18 +1455,6 @@ pub fn find_local_repo_root() -> Result<PathBuf, String> {
                     break;
                 }
             }
-        }
-    }
-
-    // Strategy 3: walk up from CARGO_MANIFEST_DIR (dev-mode fallback)
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let mut current = PathBuf::from(manifest_dir);
-    for _ in 0..6 {
-        if current.join("vct-module.json").exists() {
-            return Ok(current);
-        }
-        if !current.pop() {
-            break;
         }
     }
 
