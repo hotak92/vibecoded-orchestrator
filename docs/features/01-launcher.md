@@ -184,7 +184,7 @@ For the full tier model, see [06-license-and-commercial.md](06-license-and-comme
 Five tiers: `free`, `pro`, `mao`, `enterprise`, `admin`. The `admin` tier was added in migration 005 via SQLite table-recreate (SQLite cannot drop CHECK constraints in place).
 
 ### license_refresh Command
-POSTs `{license_key, machine_id_hash}` to `https://api.vibecodedtools.it/validate-tier` (8s timeout). On 401 drops immediately to `free`; on other errors keeps existing cached tier and records the error.
+POSTs `{license_key, machine_id_hash}` to `https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/validate-tier` (8s timeout). On 401 drops immediately to `free`; on other errors keeps existing cached tier and records the error.
 
 ### Machine ID Binding
 `machine_id_hash()` derives SHA-256 of the 6-byte MAC address, matching `VCThelpers/license/validator.py::_machine_id_hash`. Used for server-side machine binding.
@@ -193,7 +193,7 @@ POSTs `{license_key, machine_id_hash}` to `https://api.vibecodedtools.it/validat
 `license_activate` writes the key to the OS keychain under `vct.global.licensing.VIBECODED_LICENSE_KEY`, audits the action (key prefix only), then calls `license_refresh`. `license_deactivate` deletes the keychain entry and resets tier to `free`.
 
 ### `VCT_VALIDATE_TIER_URL` Override
-Operators can set `VCT_VALIDATE_TIER_URL` to point at a staging or dev validate-tier endpoint without modifying source. The hard-coded default in `commands/licensing.rs:21` is `https://api.vibecodedtools.it/validate-tier` (a public alias; the real Supabase project ref is never committed to source).
+Operators can set `VCT_VALIDATE_TIER_URL` to point at a staging or dev validate-tier endpoint without modifying source. The hard-coded default in `commands/licensing.rs:21` is `https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/validate-tier` (a public alias; the real Supabase project ref is never committed to source).
 
 ### Security Audit Tests
 `licensing.rs` includes source-level audit tests: (1) default validate URL must not contain `supabase.co`, (2) production source must not contain bypass symbols (`MAINTAINER_TOKEN`, `ed25519_dalek`, etc.). Run as Rust unit tests to prevent accidental regression.

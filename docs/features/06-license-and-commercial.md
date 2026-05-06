@@ -53,7 +53,7 @@ The Python client's job is narrow: find a license key (env var, file, argument),
 `validate_license()` resolves the license key in order: (1) `VIBECODED_TIER=free` env forces free tier immediately; (2) explicit `key` argument; (3) `VIBECODED_LICENSE_KEY` env var; (4) `~/.vct-secrets/shared/license_key` file (preferred) or legacy `~/.vct-secrets/license_key` (fallback). First non-empty value wins. No key → free tier.
 
 ### Remote validation via Supabase edge function
-`_remote_validate()` POSTs `{license_key, machine_id_hash}` to `https://api.vibecodedtools.it/validate-tier` (or `VIBECODED_LICENSE_URL` / `VCT_VALIDATE_TIER_URL` env overrides). Both env var names are honored for compatibility with the Rust launcher.
+`_remote_validate()` POSTs `{license_key, machine_id_hash}` to `https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/validate-tier` (or `VIBECODED_LICENSE_URL` / `VCT_VALIDATE_TIER_URL` env overrides). Both env var names are honored for compatibility with the Rust launcher.
 
 <details>
 <summary>Details</summary>
@@ -296,7 +296,7 @@ WAL mode. Schema: `events(id, event_type, payload_json, created_at, uploaded_at)
 Pulls up to 100 oldest un-uploaded events. Retries 3× with exponential backoff (1s, 4s, 16s) on network errors, 5xx, and 429. 4xx (non-429) → permanent failure, events left in queue for inspection.
 
 ### Pre-launch diversion to `telemetry_pending.jsonl`
-Until `https://api.vibecodedtools.it/telemetry` is deployed, opted-in events are written to `~/.vibecoded/telemetry_pending.jsonl` (one JSON object per line) instead of POSTed. `UploadResult.error == "endpoint_pending_deployment"` signals this path.
+Until `https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/telemetry` is deployed, opted-in events are written to `~/.vibecoded/telemetry_pending.jsonl` (one JSON object per line) instead of POSTed. `UploadResult.error == "endpoint_pending_deployment"` signals this path.
 
 ### `VIBECODED_TELEMETRY_URL` — endpoint override
 Set to any live endpoint to bypass the pre-launch diversion and post events normally. Allows staging/custom deployments without code changes.

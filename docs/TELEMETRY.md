@@ -5,7 +5,7 @@ explicit `VIBECODED_TELEMETRY=true` environment variable**.
 
 ## v0.1.0 status: pre-launch deployment
 
-The upload endpoint (`https://api.vibecodedtools.it/telemetry`) hasn't
+The upload endpoint (`https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/telemetry`) hasn't
 shipped yet. Until it's live, the uploader writes opted-in events to
 `~/.vibecoded/telemetry_pending.jsonl` instead of POSTing them. Users who
 turn telemetry on can inspect exactly what the orchestrator would have
@@ -65,7 +65,7 @@ on anything other than `"true" / "1" / "yes" / "on"`.
 
 Operators (us) will:
 
-1. Deploy a Supabase edge function at `https://api.vibecodedtools.it/telemetry`.
+1. Deploy a Supabase edge function at `https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/telemetry`.
 2. Bump `VCThelpers/telemetry/uploader.py` to point at it as the new
    default — or leave it; the env var override path already works.
 3. Backfill any user's `telemetry_pending.jsonl` by reading the file
