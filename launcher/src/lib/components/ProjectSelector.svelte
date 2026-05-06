@@ -13,6 +13,7 @@
   import { pickDirectory, suggestProjectFolder } from '$lib/dialog';
   import { isTauriRuntime, invoke } from '$lib/tauri';
   import { projectColor } from '$lib/project-color';
+  import { ui } from '$lib/stores/ui';
   import type { ProjectHost, ProjectView } from '$lib/types/launcher';
   import Dropdown from '$lib/components/Dropdown.svelte';
   import DialogRoot from '$lib/components/DialogRoot.svelte';
@@ -141,6 +142,17 @@
   // above (otherwise we'd only inspect on manual edits / browse).
   $effect(() => {
     if (showCreate && createPath) scheduleInspect();
+  });
+
+  // Cross-component trigger: when a route (e.g. /projects list page's
+  // "+ Add Project" button) calls ui.openCreateProject(), open our modal
+  // here. We immediately clear the store flag so subsequent close→reopen
+  // cycles work — the store is purely a one-shot signal.
+  $effect(() => {
+    if ($ui.showCreateProject && !showCreate) {
+      ui.closeCreateProject();
+      void openCreate();
+    }
   });
 
   function closeCreate() {
