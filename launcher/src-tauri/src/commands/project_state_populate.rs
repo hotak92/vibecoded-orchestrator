@@ -37,6 +37,13 @@ pub struct PopulateReport {
     pub hooks_inserted: usize,
     pub kg_bindings_inserted: usize,
     pub codegraph_bindings_inserted: usize,
+    /// PR-3 Commit 2 (2026-05-06): default kg_collection_access rows
+    /// written for the new project (own primary + own dev + shared
+    /// read-only). Pre-PR-3 the access matrix was permanently empty for
+    /// fresh projects, which made every collection read fail with
+    /// `project X has no read access to collection Y` until the user
+    /// manually granted via the GUI access matrix.
+    pub kg_access_rows_inserted: usize,
     /// Soft errors, one entry per row that could not be inserted. The
     /// caller logs these but does NOT fail the project creation.
     pub warnings: Vec<String>,
@@ -63,6 +70,7 @@ pub fn populate_project_state_from_filesystem(
         // depend on the filesystem at all.
         populate_kg_bindings(project_id, project_name, db, &mut report);
         populate_codegraph_binding(project_id, project_name, db, &mut report);
+        populate_kg_collection_access(project_id, project_name, db, &mut report);
         return report;
     }
 
@@ -71,8 +79,90 @@ pub fn populate_project_state_from_filesystem(
     populate_hooks(project_id, &claude_dir, db, &mut report);
     populate_kg_bindings(project_id, project_name, db, &mut report);
     populate_codegraph_binding(project_id, project_name, db, &mut report);
+    populate_kg_collection_access(project_id, project_name, db, &mut report);
 
     report
+}
+
+// ─── KG collection access defaults (PR-3 Commit 2, 2026-05-06) ────────
+//
+// Why default-grant: the read gate `require_kg_read` (commands/kg.rs +
+// hub/cli_api.rs) rejects every collection access the project doesn't
+// have an explicit row for. Pre-PR-3 the access matrix was permanently
+// empty for fresh projects, so every search/read of the project's own
+// KG (or the shared bundled KG) failed with "project X has no read
+// access to collection Y". The user had to manually grant via the GUI
+// access matrix before the launcher's own UI worked.
+//
+// Default-deny is the right posture for cross-project access (other
+// projects' KGs / codegraphs); but for a project's OWN KG and the
+// machine-shared bundled KG, default-grant matches user expectation.
+//
+// Idempotent: a pre-existing row at (project_id, collection_name)
+// preserves the user-set level, so a re-onboarding flow doesn't
+// silently undo a level the user changed.
+
+fn populate_kg_collection_access(
+    project_id: &str,
+    project_name: &str,
+    db: &Db,
+    report: &mut PopulateReport,
+) {
+    let pascal = sanitize_kg_collection(project_name);
+    let primary_collection = format!("{}_KnowledgeGraph", pascal);
+    let dev_collection = format!("{}_Development", pascal);
+    let shared_collection = "VibeCodedTools_KnowledgeGraph";
+
+    // Project's OWN primary KG: write access by default. The project's
+    // hooks + MCP server need to write to this — the .claude/env carries
+    // KG_COLLECTION pointing here.
+    grant_default_access(db, project_id, &primary_collection, "write", report);
+
+    // Project's OWN development collection: write access by default.
+    // Same rationale — the development collection is the project's
+    // private workspace for in-flight notes.
+    grant_default_access(db, project_id, &dev_collection, "write", report);
+
+    // Cross-project SHARED KG: read access by default. Writes to the
+    // shared KG are gated separately via `SHARED_KG_WRITE_DISABLED` env
+    // (asymmetric semantic since 2026-05-01) — the access-matrix row
+    // is purely a read-gate. Users who want to grant write access can
+    // flip the level via the GUI access matrix; users who want to
+    // bottle up writes flip `SHARED_KG_WRITE_DISABLED=true` via the
+    // shared-KG toggle (which doesn't touch this row).
+    grant_default_access(db, project_id, shared_collection, "read", report);
+}
+
+fn grant_default_access(
+    db: &Db,
+    project_id: &str,
+    collection: &str,
+    level: &str,
+    report: &mut PopulateReport,
+) {
+    // Idempotency: preserve any user-set level by short-circuiting when
+    // a row already exists for this (project, collection). The `kg_set_access`
+    // helper would otherwise upsert and clobber.
+    match db.kg_get_access(project_id, collection) {
+        Ok(Some(_)) => {
+            // User-set or previously-defaulted row already exists.
+            // Leave alone.
+        }
+        Ok(None) => {
+            if let Err(e) = db.kg_set_access(project_id, collection, level) {
+                report
+                    .warnings
+                    .push(format!("kg_set_access({}): {}", collection, e));
+            } else {
+                report.kg_access_rows_inserted += 1;
+            }
+        }
+        Err(e) => {
+            report
+                .warnings
+                .push(format!("kg_get_access({}): {}", collection, e));
+        }
+    }
 }
 
 // ─── Agents ────────────────────────────────────────────────────────────
@@ -757,6 +847,83 @@ mod tests {
         let shared = bindings.iter().find(|b| b.role == "shared").unwrap();
         assert_eq!(shared.collection_name, "VibeCodedTools_KnowledgeGraph");
 
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    // ─── PR-3 Commit 2: kg_collection_access auto-population ──────────
+
+    #[test]
+    fn populate_kg_collection_access_grants_own_and_shared() {
+        let folder = scratch_dir("kg-access-default");
+        let db = make_db_with_project("p1", "Acme");
+        let report =
+            populate_project_state_from_filesystem("p1", "Acme", &folder, &db);
+
+        // 3 default rows: own primary (write), own dev (write), shared (read)
+        assert_eq!(report.kg_access_rows_inserted, 3);
+
+        let access = db.kg_list_access("p1").unwrap();
+        let by_collection: std::collections::HashMap<&str, &str> = access
+            .iter()
+            .map(|(c, l)| (c.as_str(), l.as_str()))
+            .collect();
+        assert_eq!(by_collection.get("Acme_KnowledgeGraph"), Some(&"write"));
+        assert_eq!(by_collection.get("Acme_Development"), Some(&"write"));
+        assert_eq!(
+            by_collection.get("VibeCodedTools_KnowledgeGraph"),
+            Some(&"read")
+        );
+
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    #[test]
+    fn populate_kg_collection_access_idempotent_preserves_user_level() {
+        // The user explicitly downgrades the shared collection to "none",
+        // then re-populates. The level must survive — default-grant should
+        // not run on a (project, collection) that already has a row.
+        let folder = scratch_dir("kg-access-preserve");
+        let db = make_db_with_project("p1", "Acme");
+        populate_project_state_from_filesystem("p1", "Acme", &folder, &db);
+
+        // User downgrades shared collection.
+        db.kg_set_access("p1", "VibeCodedTools_KnowledgeGraph", "none")
+            .unwrap();
+        // User upgrades own dev to write (was already write — confirm
+        // it stays write after re-run).
+        db.kg_set_access("p1", "Acme_Development", "write").unwrap();
+
+        // Re-run.
+        let report =
+            populate_project_state_from_filesystem("p1", "Acme", &folder, &db);
+        // No new rows inserted — every default already exists.
+        assert_eq!(report.kg_access_rows_inserted, 0);
+
+        let access = db.kg_list_access("p1").unwrap();
+        let by_collection: std::collections::HashMap<&str, &str> = access
+            .iter()
+            .map(|(c, l)| (c.as_str(), l.as_str()))
+            .collect();
+        // User's downgrade survived re-populate.
+        assert_eq!(
+            by_collection.get("VibeCodedTools_KnowledgeGraph"),
+            Some(&"none"),
+            "user-set 'none' must NOT be reset to default 'read'"
+        );
+
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    #[test]
+    fn populate_kg_collection_access_runs_for_empty_project_folder() {
+        // Even when `.claude/` doesn't exist, default access rows must
+        // be written — otherwise the bundle install (which lands later)
+        // can't read its own KG.
+        let folder = scratch_dir("kg-access-empty");
+        let db = make_db_with_project("p1", "Empty");
+        let report =
+            populate_project_state_from_filesystem("p1", "Empty", &folder, &db);
+        assert_eq!(report.kg_access_rows_inserted, 3);
         std::fs::remove_dir_all(&folder).ok();
     }
 
