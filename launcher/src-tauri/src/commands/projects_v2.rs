@@ -449,6 +449,33 @@ pub async fn create_project_v2(
         warnings.push(w);
     }
 
+    // Bug fix (2026-05-06): the first populate call earlier in this fn
+    // ran BEFORE `run_install_bundle` dropped the per-project bundle
+    // into `<folder>/.claude/{agents,skills,hooks}/`. At that point
+    // those subdirs don't exist yet, so `populate_agents/skills/hooks`
+    // each saw zero `.md` files and inserted zero rows — leaving the
+    // GUI's per-project Agents/Skills/Hooks tabs permanently empty
+    // even though the bundle install succeeded.
+    //
+    // Re-call populate now that the bundle has dropped its files.
+    // The underlying register_* helpers are idempotent upserts that
+    // leave the `enabled` column untouched on conflict, so this second
+    // call:
+    //   - DOES insert agents/skills/hooks rows (the whole point)
+    //   - Does NOT clobber kg_collection_access / project_kg_bindings
+    //     populated in the first call (which derived from project name,
+    //     not from disk — those were correct at first-pass time)
+    //   - Preserves any user toggles set in the GUI between the two
+    //     populate calls (window is microseconds; not a real concern)
+    let populate_report_2 = crate::commands::project_state_populate::
+        populate_project_state_from_filesystem(&row.id, &req.name, folder, &db);
+    if !populate_report_2.warnings.is_empty() {
+        for w in &populate_report_2.warnings {
+            eprintln!("[vct] populate (post-bundle) warning ({}): {}", row.id, w);
+            warnings.push(format!("populate (post-bundle): {}", w));
+        }
+    }
+
     Ok(CreateProjectResult {
         project: ProjectView::from_row(row, 0),
         warnings,

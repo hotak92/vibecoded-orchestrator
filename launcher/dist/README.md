@@ -101,26 +101,99 @@ To regenerate metadata after a rebuild, use `scripts/build-bundled-launcher.sh`
 ## Updating the bundled binaries
 
 Maintainers cutting a vco release should rebuild + restage all platform
-binaries:
+binaries.
+
+### Privacy: ALWAYS set RUSTFLAGS before building
+
+Rust release binaries embed the build host's absolute paths (panic-message
+metadata, `cargo registry` source paths, etc.) inside `rodata`. The
+checked-in `launcher/src-tauri/.cargo/config.toml` has remaps for
+`/home`, `/Users`, and `C:\Users` prefixes — those are **not enough**.
+The username segment (`/home/<your-user>/.cargo/...`) survives without
+an additional env-var-driven remap.
+
+**Every release rebuild MUST set RUSTFLAGS** to include the per-user
+remaps before invoking `tauri build`:
+
+```bash
+# Linux / macOS:
+export RUSTFLAGS="--remap-path-prefix=$HOME=<home> --remap-path-prefix=$HOME/.cargo=<cargo>"
+
+# Windows (PowerShell):
+$env:RUSTFLAGS = "--remap-path-prefix=$env:USERPROFILE=<home> --remap-path-prefix=$env:USERPROFILE\.cargo=<cargo>"
+```
+
+Cargo concatenates the env-var RUSTFLAGS with the `[build] rustflags`
+in `.cargo/config.toml`, so both sets of remaps are applied.
+
+The `Launcher binary leak-check` CI job (in `.github/workflows/ci.yml`)
+verifies the produced binary has zero matches for `^/home/<user>/`,
+`^/Users/<user>/`, or `C:\\Users\\<user>\\` patterns. CI builds on
+GitHub-hosted runners use the generic username `runner` so they pass
+without the per-user RUSTFLAGS, but **local dev rebuilds need it
+explicitly** — without it, the binary committed to `dist/` will leak
+your username.
+
+### NEVER use plain `cargo build --release` to produce the dist binary
+
+`cargo build --release` produces a binary that loads its frontend from
+`http://localhost:1420` (the Vite dev server) — that binary will hang
+with "Could not connect to localhost: Connection refused" when run
+without `pnpm tauri dev` running in another terminal.
+
+`pnpm tauri build --no-bundle` is the only command that produces a
+**release binary that embeds the static frontend** (built via `npm run
+build` into `launcher/build/`) and serves it via `tauri://localhost/`
+at runtime. The `--no-bundle` flag skips installer-bundle generation
+(`.deb`, `.AppImage`, `.dmg`, `.msi`) which we don't need for the
+`dist/` checkin.
+
+### Build commands (per platform)
+
+**Recommended: use the wrapper script** at
+[`launcher/scripts/rebuild-dist-binary.sh`](../scripts/rebuild-dist-binary.sh).
+It encapsulates the privacy + correctness invariants AND verifies zero
+leaks AND verifies the binary actually contains the embedded static
+frontend (catches the `cargo build --release` mistake) before staging.
+
+```bash
+# Linux + macOS:
+cd launcher
+bash scripts/rebuild-dist-binary.sh
+git add dist/<arch>/
+```
+
+If you'd rather invoke the underlying commands directly:
 
 ```bash
 # Linux x64 (run on a Linux x64 host or in a Linux container)
 cd launcher
 pnpm install
+export RUSTFLAGS="--remap-path-prefix=$HOME=<home> --remap-path-prefix=$HOME/.cargo=<cargo>"
 pnpm tauri build --no-bundle
 cp src-tauri/target/release/vct-launcher dist/linux-x64/vct-launcher
 chmod +x dist/linux-x64/vct-launcher
+# Verify zero leaks:
+strings dist/linux-x64/vct-launcher | grep -E "^/home/[^/]+/" | wc -l   # must be 0
+# Verify it's a tauri build (NOT cargo-only):
+strings dist/linux-x64/vct-launcher | grep -q "tauri://localhost" && echo OK
 
 # Windows x64 (run on Windows or via a Windows CI runner)
 cd launcher
+$env:RUSTFLAGS = "--remap-path-prefix=$env:USERPROFILE=<home> --remap-path-prefix=$env:USERPROFILE\.cargo=<cargo>"
 pnpm tauri build --no-bundle
 copy src-tauri\target\release\vct-launcher.exe dist\windows-x64\
+# Verify zero leaks (PowerShell):
+strings.exe dist\windows-x64\vct-launcher.exe | Select-String "^C:\\Users\\[^\\]+\\" | Measure-Object   # Count must be 0
 
 # macOS arm64 (run on Apple Silicon)
 cd launcher
+export RUSTFLAGS="--remap-path-prefix=$HOME=<home> --remap-path-prefix=$HOME/.cargo=<cargo>"
 pnpm tauri build --no-bundle
 cp -R src-tauri/target/release/bundle/macos/vct-launcher.app dist/experimental_macOS/
 xattr -cr dist/experimental_macOS/vct-launcher.app
+# Verify zero leaks:
+strings dist/experimental_macOS/vct-launcher.app/Contents/MacOS/vct-launcher | grep -E "^/Users/[^/]+/" | wc -l   # must be 0
 ```
 
 Then regenerate the third-party license inventory:
