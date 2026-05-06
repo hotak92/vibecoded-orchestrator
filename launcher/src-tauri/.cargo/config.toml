@@ -1,0 +1,59 @@
+# Cargo build flags for the launcher crate.
+#
+# Purpose: privacy. Rust release builds embed the build host's
+# absolute paths (e.g. /home/martino/.cargo/registry/...,
+# C:\Users\marti\OneDrive\Desktop\...) inside panic-message
+# metadata and rodata. Released binaries shipped from a developer
+# machine then leak the dev's username and on-disk layout to anyone
+# who runs `strings vct-launcher`.
+#
+# `--remap-path-prefix=<from>=<to>` rewrites path prefixes during
+# compilation. Two-layer strategy:
+#
+# Layer 1 (this file, applies on every host):
+#   Remap the OS-level user-directory roots:
+#     /home   -> <home>     (Linux)
+#     /Users  -> <home>     (macOS)
+#     C:\Users -> <home>    (Windows)
+#   This converts `/home/<user>/.cargo/...` to
+#   `<home>/<user>/.cargo/...`. The username segment still leaks
+#   here. For CI-built binaries that's already acceptable: GitHub-
+#   hosted runners use the generic username `runner`, so the path
+#   reads `<home>/runner/.cargo/...`. No personal data exposed.
+#
+# Layer 2 (build-host RUSTFLAGS, additive, applied via env):
+#   For local dev builds where the username IS personal, set
+#   RUSTFLAGS in the shell before running cargo. Recommended:
+#     export RUSTFLAGS="--remap-path-prefix=$HOME=<home> \
+#                       --remap-path-prefix=$CARGO_HOME=<cargo>"
+#     cargo build --release
+#   cargo CONCATENATES the env-var RUSTFLAGS with the [build]
+#   rustflags below (verified cargo 1.94 reference). Both sets of
+#   `--remap-path-prefix` flags get passed to rustc, and rustc
+#   applies them in order; the more specific username-aware
+#   remaps win because they're textually longer prefixes.
+#
+# IMPORTANT: cargo's config.toml `rustflags` field does NOT expand
+# env vars (`$HOME`, `${CARGO_HOME}`, etc. are passed literally).
+# That's why the per-user remaps live in env-var RUSTFLAGS, not
+# here. The `[env]` section IS env-substituted, but its values
+# don't feed back into rustflags.
+#
+# Companion: `[profile.release] strip = "symbols"` in Cargo.toml.
+# Strip removes most debug-symbol-derived path strings post-link;
+# this file's remaps cover the rodata-baked paths that strip can't
+# touch. CI verifies the combined effect with a `strings | grep`
+# regression check (.github/workflows/ci.yml :: launcher-leak-check).
+
+[build]
+rustflags = [
+    # Linux: /home/<user>/...
+    "--remap-path-prefix=/home=<home>",
+    # macOS: /Users/<user>/...
+    "--remap-path-prefix=/Users=<home>",
+    # Windows: C:\Users\<user>\...
+    # rustc emits Windows paths with backslashes; the TOML
+    # double-backslash escaping yields the single-backslash literal
+    # rustc expects to match.
+    "--remap-path-prefix=C:\\Users=<home>",
+]

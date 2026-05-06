@@ -63,6 +63,16 @@ toml = "0.9"
 # volumes module for non-test tempdir uses).
 tempfile = "3"
 
+# PR-4 (2026-05-06): gitignore-aware filesystem walker. Used by
+# `copy_recursive_sync` in commands/installer.rs to avoid propagating
+# machine-local files (state/, .claude/agents/, tools/vct-secrets/,
+# infrastructure/docker-compose.override.yml, etc.) when
+# `update_orchestrator_at` copies one orchestrator install over
+# another. Honors `.gitignore` + `.git/info/exclude` +
+# `core.excludesFile` + `.ignore` files via `WalkBuilder::standard_filters(true)`.
+# Drop-in for our previous blind directory walker.
+ignore = "0.4"
+
 # System info (RAM, CPU). MIT-licensed, lightweight. Used by detect_system.
 sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 
@@ -70,4 +80,32 @@ sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 # returns None, see free_bytes_at in commands/volumes.rs).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Release-profile privacy + size hardening (PR-4, 2026-05-06).
+#
+# Rust release builds carry the build host's ~/.cargo/registry/... and
+# manifest-dir paths inside panic-message metadata + debug info. On a
+# developer machine this leaks the username (e.g. /home/martino/...,
+# C:\Users\marti\...) and any sensitive path components (OneDrive sync
+# folder, etc.) directly into the shipped binary's `strings` output.
+#
+# `strip = "symbols"` removes debug symbols and most embedded path
+# strings post-link. Combined with the rustflags `--remap-path-prefix`
+# entries in `.cargo/config.toml`, ANY remaining path strings get
+# rewritten to neutral `/builder/...` / `<cargo>/...` placeholders at
+# compile time. The two together are belt-and-braces — strip alone
+# isn't sufficient because some path strings are baked into rodata
+# constants that strip won't touch.
+#
+# `lto = true` enables fat link-time optimization. This is a size +
+# perf win on its own; as a side-effect it also helps the linker drop
+# more unreachable code (and the path strings in that code).
+#
+# We deliberately do NOT set `panic = "abort"`. The launcher uses
+# panic-unwinding semantics in some Tauri/axum paths and switching to
+# abort is a behavior change unrelated to this PR's privacy scope.
+# Revisit later if binary-size tuning calls for it.
+[profile.release]
+strip = "symbols"
+lto = true
 

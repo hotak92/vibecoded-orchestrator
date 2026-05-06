@@ -1470,7 +1470,140 @@ pub fn find_local_repo_root() -> Result<PathBuf, String> {
 /// Synchronous recursive copy. Symlinks are resolved (file content
 /// follows). Used by `copy_orchestrator_to_sync` so the caller (which is
 /// already an async Tauri command) can `tokio::task::spawn_blocking` it.
+///
+/// **Gitignore-aware contract** (PR-4, 2026-05-06): when `src` is inside
+/// a git repository (any ancestor contains `.git/`), the walker honors
+/// `.gitignore` + `.git/info/exclude` + `core.excludesFile` + `.ignore`
+/// files via the `ignore` crate (`WalkBuilder::standard_filters(true)`).
+/// This prevents `update_orchestrator_at` from propagating machine-local
+/// files between clones — `tools/vct-secrets/*.token`,
+/// `.claude/agents/`, `.claude/skills/`, `.claude/logs/`,
+/// `infrastructure/docker-compose.override.yml`, `state/`, etc. — which
+/// the previous blind walker copied verbatim despite being gitignored
+/// in the source tree.
+///
+/// Untracked-but-not-gitignored files ARE still copied (e.g. a file the
+/// user just `touch`ed but hasn't committed yet) — `standard_filters`
+/// only excludes things gitignore would exclude, not everything `git
+/// status --porcelain` lists as `??`.
+///
+/// **Fallback contract**: if `src` isn't inside a git repo (no `.git/`
+/// in any ancestor), we fall back to the old blind walker. This
+/// preserves existing behavior for non-git fixtures (test harnesses
+/// that mock the source dir) and for shipped non-checkout bundles.
 fn copy_recursive_sync(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let meta = std::fs::metadata(src)?;
+    if !meta.is_dir() {
+        // Single-file copy path. The walker variants below are only
+        // useful when `src` is a directory; for a plain file we just
+        // copy it through.
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(src, dst)?;
+        return Ok(());
+    }
+
+    if has_git_root(src) {
+        copy_recursive_gitignore_aware(src, dst)
+    } else {
+        eprintln!(
+            "[vct] copy_recursive_sync: source {} has no .git/ ancestor; \
+             falling back to blind walker (gitignored files WILL be copied). \
+             This is expected for non-checkout bundles and test fixtures.",
+            src.display()
+        );
+        copy_recursive_blind(src, dst)
+    }
+}
+
+/// True iff `start` or any ancestor contains a `.git` entry (file OR
+/// directory — `.git` is a file in worktrees, a directory in the main
+/// checkout). Used to gate gitignore-aware copying.
+fn has_git_root(start: &Path) -> bool {
+    let mut current = Some(start);
+    while let Some(dir) = current {
+        if dir.join(".git").exists() {
+            return true;
+        }
+        current = dir.parent();
+    }
+    false
+}
+
+/// Gitignore-honoring recursive copy. Walks `src` via
+/// `ignore::WalkBuilder` so `.gitignore`, `.git/info/exclude`,
+/// `core.excludesFile`, and `.ignore` entries are respected. Each
+/// visited entry is copied to `dst` at the same relative path.
+fn copy_recursive_gitignore_aware(src: &Path, dst: &Path) -> std::io::Result<()> {
+    use ignore::WalkBuilder;
+
+    std::fs::create_dir_all(dst)?;
+
+    let walker = WalkBuilder::new(src)
+        // Honor .gitignore, .git/info/exclude, core.excludesFile, .ignore.
+        // This is the SAME default ripgrep uses; chosen for behavioral
+        // parity with what a developer would expect from `git ls-files
+        // --cached --others --exclude-standard`.
+        .standard_filters(true)
+        // We DO want to descend into hidden dirs that aren't gitignored
+        // (`.claude/` is a hidden dir but partially tracked). Default
+        // `standard_filters(true)` already enables this for non-ignored
+        // hidden entries.
+        .hidden(false)
+        // Don't follow symlinks — matches the old `std::fs::metadata`
+        // behavior. (`metadata` follows; `symlink_metadata` doesn't.
+        // The old walker used `metadata` so it followed; for a copy
+        // operation that's fine — we WANT the file content, not the
+        // dangling link.) The `ignore` crate defaults to NOT following
+        // symlinks; we leave that default alone.
+        .build();
+
+    for result in walker {
+        let entry = match result {
+            Ok(e) => e,
+            Err(e) => {
+                // Permission error on a single subtree shouldn't abort
+                // the whole copy. Mirror walkdir convention: log and
+                // continue. (Catches the rare case where a `.git/`
+                // sub-object is unreadable on shared developer boxes.)
+                eprintln!("[vct] walker error: {}", e);
+                continue;
+            }
+        };
+        let path = entry.path();
+        let rel = match path.strip_prefix(src) {
+            Ok(r) => r,
+            Err(_) => continue, // Defensive — shouldn't happen with WalkBuilder.
+        };
+        // The walker emits the root itself first; rel is empty for it.
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+        let dst_path = dst.join(rel);
+        let file_type = entry.file_type();
+        match file_type {
+            Some(ft) if ft.is_dir() => {
+                std::fs::create_dir_all(&dst_path)?;
+            }
+            Some(ft) if ft.is_file() => {
+                if let Some(parent) = dst_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::copy(path, &dst_path)?;
+            }
+            // Symlinks / sockets / other: skip silently. Matches the
+            // intent of an orchestrator-state copy operation.
+            _ => continue,
+        }
+    }
+    Ok(())
+}
+
+/// Blind recursive copy — the pre-PR-4 behavior. Used as a fallback
+/// when `src` isn't inside a git repo. Preserved verbatim so non-git
+/// callers (test fixtures, shipped non-checkout bundles) keep working.
+fn copy_recursive_blind(src: &Path, dst: &Path) -> std::io::Result<()> {
     let meta = std::fs::metadata(src)?;
     if meta.is_dir() {
         std::fs::create_dir_all(dst)?;
@@ -1478,7 +1611,7 @@ fn copy_recursive_sync(src: &Path, dst: &Path) -> std::io::Result<()> {
             let entry = entry?;
             let s = entry.path();
             let d = dst.join(entry.file_name());
-            copy_recursive_sync(&s, &d)?;
+            copy_recursive_blind(&s, &d)?;
         }
     } else {
         if let Some(parent) = dst.parent() {
@@ -3495,6 +3628,236 @@ infrastructure
             "parse rules drifted: lines are trimmed, blank lines and \
              #-prefixed lines are skipped (no inline comments)."
         );
+    }
+
+    // ─── PR-4: gitignore-aware copy_recursive_sync ─────────────────
+    //
+    // Re-review of PR-1 flagged that `copy_recursive_sync` was
+    // gitignore-blind. Even with `ORCHESTRATOR_MANAGED_PATHS` filtered
+    // at the entry level, the kept entries (`tools/`, `.claude/`,
+    // `infrastructure/`) drag in gitignored subpaths verbatim during
+    // `update_orchestrator_at`:
+    //   - tools/vct-secrets/*.token  (real secret leak risk)
+    //   - .claude/agents/, .claude/skills/, .claude/logs/
+    //   - infrastructure/docker-compose.override.yml
+    // PR-4 swaps in `ignore::WalkBuilder` to honor `.gitignore` etc.
+    // These tests pin that behavior + the non-git fallback.
+
+    /// Initialize `dir` as a git repo with an empty initial commit.
+    /// Skips the test (returns `false`) if `git` is not on PATH —
+    /// developer machines without git installed (rare but possible
+    /// on CI shards) shouldn't fail the suite. Production caller
+    /// (`update_orchestrator_at`) only runs when find_local_repo_root
+    /// resolves a real checkout, so the fallback path is exercised by
+    /// the bundle-install case which doesn't need git.
+    fn try_git_init(dir: &Path) -> bool {
+        let init = std::process::Command::new("git")
+            .args(["init", "-q", "--initial-branch=main"])
+            .current_dir(dir)
+            .status();
+        let init_ok = matches!(init, Ok(s) if s.success());
+        if !init_ok {
+            return false;
+        }
+        // Local user.name/email so `git commit` doesn't blow up on
+        // shards where git's global config isn't set.
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(dir)
+            .status();
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.name", "test"])
+            .current_dir(dir)
+            .status();
+        true
+    }
+
+    fn try_git_commit(dir: &Path, files: &[&str]) -> bool {
+        for f in files {
+            let st = std::process::Command::new("git")
+                .args(["add", "--", f])
+                .current_dir(dir)
+                .status();
+            if !matches!(st, Ok(s) if s.success()) {
+                return false;
+            }
+        }
+        let st = std::process::Command::new("git")
+            .args(["commit", "-q", "-m", "init"])
+            .current_dir(dir)
+            .status();
+        matches!(st, Ok(s) if s.success())
+    }
+
+    #[test]
+    fn test_copy_recursive_sync_honors_gitignore() {
+        let src = tmp();
+        // Layout:
+        //   .gitignore         (says: secret.txt)
+        //   keep.txt           (tracked)
+        //   also.txt           (untracked, NOT gitignored — must copy)
+        //   secret.txt         (gitignored — must NOT copy)
+        fs::write(src.join(".gitignore"), "secret.txt\n").unwrap();
+        fs::write(src.join("keep.txt"), "keep").unwrap();
+        fs::write(src.join("also.txt"), "also").unwrap();
+        fs::write(src.join("secret.txt"), "SECRET").unwrap();
+
+        if !try_git_init(&src) {
+            eprintln!("[test] git not available — skipping");
+            fs::remove_dir_all(&src).ok();
+            return;
+        }
+        // Only commit the tracked file. `also.txt` stays untracked
+        // but uningored; gitignore-aware walker should still copy it.
+        if !try_git_commit(&src, &[".gitignore", "keep.txt"]) {
+            eprintln!("[test] git commit failed — skipping");
+            fs::remove_dir_all(&src).ok();
+            return;
+        }
+
+        let dst = tmp();
+        copy_recursive_sync(&src, &dst).unwrap();
+
+        assert!(dst.join("keep.txt").exists(), "tracked file must copy");
+        assert!(
+            dst.join("also.txt").exists(),
+            "untracked-but-uningored file must copy"
+        );
+        assert!(
+            !dst.join("secret.txt").exists(),
+            "gitignored file MUST NOT copy"
+        );
+
+        fs::remove_dir_all(&src).ok();
+        fs::remove_dir_all(&dst).ok();
+    }
+
+    #[test]
+    fn test_copy_recursive_sync_blocks_real_leak_paths() {
+        // Specifically pins the leak cases the audit flagged:
+        //   - tools/vct-secrets/foo.token  (matched by *.token in real .gitignore)
+        //   - .claude/agents/coder.md      (matched by .claude/agents/)
+        //   - infrastructure/docker-compose.override.yml
+        let src = tmp();
+
+        // Mirror the production .gitignore subset relevant to these paths.
+        fs::write(
+            src.join(".gitignore"),
+            "*.token\n\
+             .claude/agents/\n\
+             infrastructure/docker-compose.override.yml\n",
+        )
+        .unwrap();
+
+        // Tracked content that MUST survive the copy.
+        fs::create_dir_all(src.join("tools/vct-secrets")).unwrap();
+        fs::write(src.join("tools/vct-secrets/README.md"), "readme").unwrap();
+        fs::create_dir_all(src.join(".claude")).unwrap();
+        fs::write(src.join(".claude/settings.json"), "{}").unwrap();
+        fs::create_dir_all(src.join("infrastructure")).unwrap();
+        fs::write(
+            src.join("infrastructure/compose.yaml"),
+            "services: {}\n",
+        )
+        .unwrap();
+
+        // Leak content that MUST NOT propagate.
+        fs::write(src.join("tools/vct-secrets/foo.token"), "LEAK").unwrap();
+        fs::create_dir_all(src.join(".claude/agents")).unwrap();
+        fs::write(src.join(".claude/agents/coder.md"), "LEAK").unwrap();
+        fs::write(
+            src.join("infrastructure/docker-compose.override.yml"),
+            "LEAK\n",
+        )
+        .unwrap();
+
+        if !try_git_init(&src) {
+            fs::remove_dir_all(&src).ok();
+            return;
+        }
+        if !try_git_commit(
+            &src,
+            &[
+                ".gitignore",
+                "tools/vct-secrets/README.md",
+                ".claude/settings.json",
+                "infrastructure/compose.yaml",
+            ],
+        ) {
+            fs::remove_dir_all(&src).ok();
+            return;
+        }
+
+        let dst = tmp();
+        copy_recursive_sync(&src, &dst).unwrap();
+
+        // Tracked content survives.
+        assert!(dst.join("tools/vct-secrets/README.md").exists());
+        assert!(dst.join(".claude/settings.json").exists());
+        assert!(dst.join("infrastructure/compose.yaml").exists());
+
+        // Leak content blocked.
+        assert!(
+            !dst.join("tools/vct-secrets/foo.token").exists(),
+            "*.token gitignore must block secret leak"
+        );
+        assert!(
+            !dst.join(".claude/agents/coder.md").exists(),
+            ".claude/agents/ gitignore must block per-machine agent files"
+        );
+        assert!(
+            !dst.join("infrastructure/docker-compose.override.yml").exists(),
+            "infrastructure override gitignore must block per-machine compose"
+        );
+
+        fs::remove_dir_all(&src).ok();
+        fs::remove_dir_all(&dst).ok();
+    }
+
+    #[test]
+    fn test_copy_recursive_sync_falls_back_for_non_git_source() {
+        // No `.git/` anywhere → walker drops back to the blind
+        // recursive copy. Verifies the fallback contract: gitignore
+        // files are NOT consulted and EVERYTHING gets copied. This
+        // matches the pre-PR-4 behavior for shipped non-checkout
+        // bundles and test fixtures.
+        let src = tmp();
+        // Even though there's a .gitignore file present, without `.git/`
+        // the walker should NOT honor it (no repo context to resolve
+        // includes/excludes against). Belt-and-braces test.
+        fs::write(src.join(".gitignore"), "should-not-apply.txt\n").unwrap();
+        fs::write(src.join("a.txt"), "a").unwrap();
+        fs::write(src.join("should-not-apply.txt"), "b").unwrap();
+
+        let dst = tmp();
+        copy_recursive_sync(&src, &dst).unwrap();
+
+        assert!(dst.join("a.txt").exists());
+        assert!(
+            dst.join("should-not-apply.txt").exists(),
+            "no .git/ → fallback walker must copy everything (gitignore ignored)"
+        );
+
+        fs::remove_dir_all(&src).ok();
+        fs::remove_dir_all(&dst).ok();
+    }
+
+    #[test]
+    fn test_has_git_root_walks_up_to_ancestor_git_dir() {
+        // Sanity-check the helper that gates which walker we use.
+        let root = tmp();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        let nested = root.join("a/b/c");
+        fs::create_dir_all(&nested).unwrap();
+
+        assert!(has_git_root(&root));
+        assert!(has_git_root(&nested));
+
+        let unrelated = tmp();
+        assert!(!has_git_root(&unrelated));
+
+        fs::remove_dir_all(&root).ok();
+        fs::remove_dir_all(&unrelated).ok();
     }
 
     // ─── Bug 18: RAM detection ─────────────────────────────────────
