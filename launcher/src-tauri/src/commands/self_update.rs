@@ -351,6 +351,13 @@ pub async fn check_for_launcher_update<R: Runtime>(
 ///
 /// Does NOT refuse on untracked files in user-owned dirs (e.g. an actively
 /// edited `.claude/CONTEXT_STATE.md`) — git won't overwrite those.
+///
+/// Non-fast-forward handling (Option γ, 2026-05-07): if `git pull --ff-only`
+/// fails because the local clone diverged from upstream (the case after the
+/// 2026-05-06 history rewrite), we don't auto-recover. We return a JSON
+/// payload the frontend recognizes and renders as a "Resync" modal. See
+/// `force_resync_launcher` for the recovery path the user opts into from
+/// that modal.
 #[command]
 pub async fn apply_launcher_update<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     if !git_available().await {
@@ -390,18 +397,94 @@ pub async fn apply_launcher_update<R: Runtime>(app: AppHandle<R>) -> Result<(), 
     let needs_npm = changed_paths_need_npm(&pre_diff);
 
     // Step 3: ff-only pull. Conservative — never rewrites history, never
-    // creates merge commits. If we're on a diverged branch (shouldn't be
-    // possible for users, but possible for devs), pull will fail loudly.
-    run_git(&repo, &["pull", "--ff-only", "origin", &branch]).await?;
+    // creates merge commits. If we're on a diverged branch we surface a
+    // structured error the frontend recognizes as a non-FF event so it
+    // can render the resync modal instead of a raw error string.
+    if let Err(e) = run_git(&repo, &["pull", "--ff-only", "origin", &branch]).await {
+        if is_non_fast_forward(&e) {
+            // Best-effort: capture local + remote SHAs so the modal can
+            // show users what their clone has vs. what upstream has.
+            let local = current_sha(&repo).await.ok();
+            let remote = ls_remote_sha(&repo, &branch).await.ok();
+            return Err(serialize_non_ff_error(
+                &branch,
+                local.as_deref(),
+                remote.as_deref(),
+                &e,
+            ));
+        }
+        return Err(e);
+    }
 
+    finish_apply_after_pull(app, &repo, needs_cargo, needs_npm).await
+}
+
+/// Recovery path after a non-fast-forward detection. Hard-resets the
+/// launcher's tracked files to `origin/<branch>`. **Destructive** —
+/// untracked files (user state, `.env`, `state/`, `~/.vct/`, etc.) are
+/// left untouched, but any tracked-file edits the user made locally
+/// are lost.
+///
+/// We deliberately do NOT re-assert clean tree here (unlike
+/// `apply_launcher_update`): the whole point is to override divergence
+/// the user has already opted into via the modal. The frontend modal
+/// makes the "your tracked-file changes will be lost" warning explicit.
+///
+/// Sequence:
+///   1. fetch origin/<branch>
+///   2. compute pre-reset diff for rebuild gating (HEAD..origin/<branch>)
+///   3. reset --hard origin/<branch>
+///   4. rebuild + restart (shared with `apply_launcher_update`)
+#[command]
+pub async fn force_resync_launcher<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+    if !git_available().await {
+        return Err("git not found on PATH — cannot resync".into());
+    }
+    let repo = find_launcher_repo_root()?;
+    let branch = current_branch(&repo)
+        .await
+        .unwrap_or_else(|_| "main".to_string());
+
+    // Fetch first so origin/<branch> is fresh.
+    fetch_origin(&repo).await?;
+
+    // Diff BEFORE reset so we know which builds to run. After the reset
+    // HEAD == origin/<branch> and the diff would be empty.
+    let pre_diff = run_git(
+        &repo,
+        &[
+            "diff",
+            "--name-only",
+            &format!("HEAD..origin/{}", branch),
+        ],
+    )
+    .await
+    .unwrap_or_default();
+    let needs_cargo = changed_paths_need_cargo(&pre_diff);
+    let needs_npm = changed_paths_need_npm(&pre_diff);
+
+    // Destructive step. After this point local divergent commits are gone.
+    run_git(&repo, &["reset", "--hard", &format!("origin/{}", branch)]).await?;
+
+    finish_apply_after_pull(app, &repo, needs_cargo, needs_npm).await
+}
+
+/// Shared post-pull / post-reset rebuild + restart sequence. Extracted so
+/// `apply_launcher_update` and `force_resync_launcher` can't drift apart.
+async fn finish_apply_after_pull<R: Runtime>(
+    app: AppHandle<R>,
+    repo: &Path,
+    needs_cargo: bool,
+    needs_npm: bool,
+) -> Result<(), String> {
     // Step 4: rebuild. We do this synchronously (the user clicked "Update
-    // now" — they're waiting). Failures bubble up and the launcher stays
-    // on the old binary, which is the safe behavior.
+    // now" / "Resync now" — they're waiting). Failures bubble up and the
+    // launcher stays on the old binary, which is the safe behavior.
     if needs_cargo {
-        rebuild_cargo(&repo).await?;
+        rebuild_cargo(repo).await?;
     }
     if needs_npm {
-        rebuild_frontend(&repo).await?;
+        rebuild_frontend(repo).await?;
     }
 
     // Step 5: restart. Spawn the same binary path as a new process, then
@@ -413,7 +496,7 @@ pub async fn apply_launcher_update<R: Runtime>(app: AppHandle<R>) -> Result<(), 
         .spawn()
         .map_err(|e| format!("failed to spawn new launcher: {}", e))?;
     // Programmatic shutdown: bypass the Quit confirmation dialog (the
-    // user already approved the update; a second confirm here would be
+    // user already approved the action; a second confirm here would be
     // confusing and could leave the new launcher orphaned if dismissed).
     crate::quit_dialog::force_quit();
     app.exit(0);
@@ -432,6 +515,89 @@ pub fn get_user_owned_paths() -> Vec<String> {
 // ---------------------------------------------------------------------------
 // Helpers (clean-tree assertion + rebuild gating)
 // ---------------------------------------------------------------------------
+
+/// Detect whether a `run_git` error string came from a non-fast-forward
+/// `git pull --ff-only`. We match on the canonical phrases git emits in
+/// English locales — the launcher does not run git with a forced locale
+/// (would risk breaking other diagnostics) so this is best-effort. False
+/// negatives just mean the user sees the raw error string instead of the
+/// resync modal; no harm.
+///
+/// Phrases observed on git 2.34+ across Linux/macOS/Windows:
+///   - "Not possible to fast-forward, aborting."
+///   - "fatal: Not possible to fast-forward, aborting."
+///   - "hint: ... non-fast-forward updates were rejected"   (push, but git
+///     sometimes echoes 'non-fast-forward' inside hints during pull too)
+///   - "fatal: refusing to merge unrelated histories"
+///   - "have diverged" / "and have N and M different commits each"
+///
+/// We err on the side of including 'diverged' since the post-rewrite case
+/// is exactly that.
+fn is_non_fast_forward(err: &str) -> bool {
+    let lower = err.to_lowercase();
+    lower.contains("not possible to fast-forward")
+        || lower.contains("non-fast-forward")
+        || lower.contains("have diverged")
+        || lower.contains("refusing to merge unrelated histories")
+}
+
+/// Serialize a non-FF error as a JSON string the Svelte side can parse.
+/// Frontend tries `JSON.parse(err)` and falls back to displaying the raw
+/// string if it doesn't look like JSON. The `kind` field is the
+/// discriminator.
+///
+/// Schema (kept inline so the .rs file is self-documenting; if this grows
+/// we'll lift it into a `serde::Serialize` struct):
+///   {
+///     "kind": "non_fast_forward",
+///     "branch": "main",
+///     "local_sha":  "abc..." | null,
+///     "remote_sha": "def..." | null,
+///     "git_stderr": "<raw error>"
+///   }
+fn serialize_non_ff_error(
+    branch: &str,
+    local: Option<&str>,
+    remote: Option<&str>,
+    git_stderr: &str,
+) -> String {
+    // Manual JSON: the four values are short, controllable strings; pulling
+    // serde_json in for a one-shot serialize would be heavier than the
+    // string concat. Escape only the stderr (the only field that can
+    // contain quotes / backslashes / newlines).
+    let stderr_esc = json_escape(git_stderr);
+    let local_field = match local {
+        Some(s) => format!("\"{}\"", s),
+        None => "null".to_string(),
+    };
+    let remote_field = match remote {
+        Some(s) => format!("\"{}\"", s),
+        None => "null".to_string(),
+    };
+    format!(
+        "{{\"kind\":\"non_fast_forward\",\"branch\":\"{}\",\"local_sha\":{},\"remote_sha\":{},\"git_stderr\":\"{}\"}}",
+        branch, local_field, remote_field, stderr_esc
+    )
+}
+
+/// Minimal JSON string escape — covers the characters git stderr can
+/// realistically contain. Doesn't handle every Unicode edge case (we
+/// don't need to: stderr is mostly ASCII English error messages).
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
 
 /// Returns the first tracked-file change that would be clobbered by `git
 /// pull --ff-only`. Untracked files (status code `??`) are ignored —
@@ -685,6 +851,93 @@ mod tests {
         assert!(v.iter().any(|p| p == ".claude/CONTEXT_STATE.md"));
         assert!(v.iter().any(|p| p == "state"));
         assert!(v.iter().any(|p| p == "~/.vct"));
+    }
+
+    #[test]
+    fn non_ff_detection_matches_git_phrases() {
+        // Real stderr samples from git 2.34+.
+        assert!(is_non_fast_forward(
+            "git pull --ff-only origin main: fatal: Not possible to fast-forward, aborting."
+        ));
+        assert!(is_non_fast_forward(
+            "fatal: refusing to merge unrelated histories"
+        ));
+        assert!(is_non_fast_forward(
+            "hint: Updates were rejected because the tip of your current branch is behind\n\
+             hint: its remote counterpart. (non-fast-forward)"
+        ));
+        // The post-rewrite case: git often phrases it as "have diverged".
+        assert!(is_non_fast_forward(
+            "Your branch and 'origin/main' have diverged,\n\
+             and have 12 and 47 different commits each, respectively."
+        ));
+    }
+
+    #[test]
+    fn non_ff_detection_ignores_unrelated_errors() {
+        assert!(!is_non_fast_forward("fatal: not a git repository"));
+        assert!(!is_non_fast_forward("Could not resolve host: github.com"));
+        assert!(!is_non_fast_forward(
+            "error: Your local changes to the following files would be overwritten"
+        ));
+        assert!(!is_non_fast_forward(""));
+    }
+
+    #[test]
+    fn non_ff_detection_is_case_insensitive() {
+        // Some packagings shout. Make sure we still match.
+        assert!(is_non_fast_forward(
+            "FATAL: NOT POSSIBLE TO FAST-FORWARD, ABORTING."
+        ));
+    }
+
+    #[test]
+    fn serialize_non_ff_produces_parseable_json() {
+        let s = serialize_non_ff_error(
+            "main",
+            Some("abc1234"),
+            Some("def5678"),
+            "fatal: Not possible to fast-forward, aborting.",
+        );
+        // Must start with {"kind":"non_fast_forward" so the frontend's
+        // try/catch fast-path recognizes it.
+        assert!(s.starts_with("{\"kind\":\"non_fast_forward\""));
+        assert!(s.contains("\"branch\":\"main\""));
+        assert!(s.contains("\"local_sha\":\"abc1234\""));
+        assert!(s.contains("\"remote_sha\":\"def5678\""));
+        // serde_json must be able to parse it (sanity — we hand-rolled
+        // the writer, parser does the validation).
+        let v: serde_json::Value = serde_json::from_str(&s).expect("valid JSON");
+        assert_eq!(v["kind"], "non_fast_forward");
+        assert_eq!(v["branch"], "main");
+    }
+
+    #[test]
+    fn serialize_non_ff_handles_null_shas() {
+        // current_sha / ls_remote_sha can fail (offline, etc.) — we still
+        // want to emit a usable payload.
+        let s = serialize_non_ff_error("main", None, None, "boom");
+        assert!(s.contains("\"local_sha\":null"));
+        assert!(s.contains("\"remote_sha\":null"));
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert!(v["local_sha"].is_null());
+    }
+
+    #[test]
+    fn serialize_non_ff_escapes_stderr_special_chars() {
+        // Real git stderr can contain quotes, backslashes, newlines.
+        let s = serialize_non_ff_error(
+            "main",
+            None,
+            None,
+            "fatal: \"weird\" error\nwith newline\\and backslash",
+        );
+        // Roundtrip via serde_json — if escaping is wrong, this throws.
+        let v: serde_json::Value = serde_json::from_str(&s).expect("escapes correctly");
+        let stderr = v["git_stderr"].as_str().unwrap();
+        assert!(stderr.contains("\"weird\""));
+        assert!(stderr.contains("\nwith newline"));
+        assert!(stderr.contains("\\and backslash"));
     }
 
     #[test]
