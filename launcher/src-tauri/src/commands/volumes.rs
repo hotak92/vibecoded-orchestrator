@@ -168,9 +168,9 @@ pub struct MigrationPlan {
 // ---------------------------------------------------------------------------
 
 pub fn launcher_config_path() -> PathBuf {
-    directories::UserDirs::new()
-        .map(|d| d.home_dir().join(".vct").join("launcher.toml"))
-        .unwrap_or_else(|| PathBuf::from(".vct/launcher.toml"))
+    // Bug 14: route through VCT_STATE_DIR so dev launcher's volume-config
+    // doesn't clobber the production launcher.toml.
+    crate::paths::vct_root_dir().join("launcher.toml")
 }
 
 /// Find the orchestrator repo root by walking up from this binary's

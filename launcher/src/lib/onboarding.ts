@@ -66,19 +66,26 @@ export async function isOnboardingComplete(): Promise<boolean> {
     }
 
     if (legacyVal === 'true') {
-      // Copy → DB, then remove the legacy key so future reads come straight
-      // from the DB and the dev/prod split actually isolates from now on.
+      // Copy → DB, then ONLY remove the legacy key if the DB write
+      // succeeded. If the DB write threw, the legacy key remains so the
+      // next session can retry the upgrade. Treating the upgrade as
+      // atomic (LS+DB removal together) would silently drop the user's
+      // onboarding state on a transient DB error.
+      let dbWriteOk = false;
       try {
         await invoke('app_state_set_bool', { key: KEY, value: true });
+        dbWriteOk = true;
       } catch (e) {
         // Non-fatal — user will just see the wizard again on next launch.
         // Don't surface an error toast for this.
         console.warn('[onboarding] migrate localStorage→DB failed:', e);
       }
-      try {
-        localStorage.removeItem(LEGACY_LS_KEY);
-      } catch {
-        // ignore
+      if (dbWriteOk) {
+        try {
+          localStorage.removeItem(LEGACY_LS_KEY);
+        } catch {
+          // ignore
+        }
       }
       _cache = true;
       _cacheLoaded = true;
