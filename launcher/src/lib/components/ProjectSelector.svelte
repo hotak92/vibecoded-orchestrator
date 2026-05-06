@@ -13,6 +13,7 @@
   import { pickDirectory, suggestProjectFolder } from '$lib/dialog';
   import { isTauriRuntime, invoke } from '$lib/tauri';
   import { projectColor } from '$lib/project-color';
+  import { ui } from '$lib/stores/ui';
   import type { ProjectHost, ProjectView } from '$lib/types/launcher';
   import Dropdown from '$lib/components/Dropdown.svelte';
   import DialogRoot from '$lib/components/DialogRoot.svelte';
@@ -32,9 +33,14 @@
   };
   let orchestratorState = $state<OrchestratorState | null>(null);
   let inspecting = $state(false);
-  let installAfterCreate = $state(true);
   // 'use_as_is' | 'update' | 'install_fresh' — only meaningful when a
-  // pre-existing install was detected.
+  // pre-existing install was detected at the chosen project folder
+  // (i.e. the user is pointing the wizard at a folder that already
+  // contains a VCO clone, an orchestrator self-onboarding scenario).
+  // 2026-05-06 (PR-1): the "no orchestrator → install it here" branch
+  // and its `installAfterCreate` checkbox were removed; the launcher
+  // architecture is ONE shared VCO clone, never installed INTO project
+  // folders. See `.claude/context/install-paths-audit-2026-05-06.md` §J.
   let adoptChoice = $state<'use_as_is' | 'update' | 'install_fresh'>('use_as_is');
   let inspectDebounce: ReturnType<typeof setTimeout> | null = null;
 
@@ -121,14 +127,16 @@
     inspecting = true;
     try {
       orchestratorState = await invoke<OrchestratorState>('inspect_orchestrator_at', { path });
-      // If a fresh path was chosen, default the toggle ON so the
-      // checkbox reflects the most-likely intent.
-      if (!orchestratorState.installed) {
-        installAfterCreate = true;
-      } else {
-        // For pre-existing installs, default action depends on health.
+      if (orchestratorState.installed) {
+        // Pre-existing orchestrator at the chosen folder — default the
+        // adopt action based on whether the bundled launcher ships a
+        // newer version.
         adoptChoice = orchestratorState.version_status === 'outdated' ? 'update' : 'use_as_is';
       }
+      // No-orchestrator-at-path branch is intentionally a no-op: the
+      // launcher never installs into project folders, so there is no
+      // toggle to default. The status panel below simply hides the
+      // existing-install UI in that case.
     } catch (e) {
       orchestratorState = null;
       console.error('inspect_orchestrator_at failed', e);
@@ -141,6 +149,17 @@
   // above (otherwise we'd only inspect on manual edits / browse).
   $effect(() => {
     if (showCreate && createPath) scheduleInspect();
+  });
+
+  // Cross-component trigger: when a route (e.g. /projects list page's
+  // "+ Add Project" button) calls ui.openCreateProject(), open our modal
+  // here. We immediately clear the store flag so subsequent close→reopen
+  // cycles work — the store is purely a one-shot signal.
+  $effect(() => {
+    if ($ui.showCreateProject && !showCreate) {
+      ui.closeCreateProject();
+      void openCreate();
+    }
   });
 
   function closeCreate() {
@@ -229,7 +248,13 @@
     creating = true;
     try {
       // Bug 20: handle pre-existing orchestrator state before creating
-      // the project record so the user's choice is honored.
+      // the project record so the user's choice is honored. This branch
+      // covers the orchestrator self-onboarding flow only — when the
+      // user points the wizard at a folder that already contains a VCO
+      // clone. 2026-05-06 (PR-1): the "no orchestrator at path → install
+      // it here" branch was removed because the architecture is ONE
+      // shared VCO clone, never installed INTO project folders. See
+      // `.claude/context/install-paths-audit-2026-05-06.md`.
       if (orchestratorState?.installed) {
         if (adoptChoice === 'update') {
           await invoke('update_orchestrator_at', { path: submitPath });
@@ -247,18 +272,6 @@
           });
         }
         // 'use_as_is' → no action, just register.
-      } else if (installAfterCreate) {
-        await invoke('install_orchestrator', {
-          config: {
-            install_path: submitPath,
-            use_gpu: false,
-            cpu_only: false,
-            openai_key: null,
-            container_runtime: null,
-            skip_containers: true,
-          },
-          confirmOverwrite: false,
-        });
       }
 
       await projects.create(createName.trim(), submitPath, createHost);
@@ -472,73 +485,67 @@
           </p>
         </div>
 
-        {#if inTauri && createPath.trim() && orchestratorState}
-          {#if !orchestratorState.installed}
-            <div class="orch-status orch-fresh">
-              <p class="orch-row">
-                <span class="orch-icon">+</span>
-                <span>No orchestrator at this path.</span>
-              </p>
-              <label class="orch-toggle">
-                <input type="checkbox" bind:checked={installAfterCreate} />
-                <span>Install orchestrator into this folder
+        {#if inTauri && createPath.trim() && orchestratorState?.installed}
+          <!--
+            2026-05-06 (PR-1): the "no orchestrator at this path → install
+            into this folder" branch + checkbox were removed. The
+            launcher architecture is ONE shared VCO clone; project
+            folders never receive the orchestrator. The branch below
+            only fires when the user has pointed the wizard at a folder
+            that ALREADY contains a VCO clone (orchestrator
+            self-onboarding flow). See
+            `.claude/context/install-paths-audit-2026-05-06.md` §J for
+            the rationale.
+          -->
+          <div class="orch-status orch-existing">
+            <p class="orch-row">
+              <span class="orch-icon orch-ok">✓</span>
+              <span>
+                Existing orchestrator detected
+                {#if orchestratorState.version}
+                  — installed: <strong>v{orchestratorState.version}</strong>
+                {/if}
+                {#if orchestratorState.version_status === 'outdated' && orchestratorState.bundled_version}
+                  <span class="orch-mid">(bundled v{orchestratorState.bundled_version} available)</span>
+                {:else if orchestratorState.version_status === 'unknown'}
+                  <span class="orch-mid">(version unknown)</span>
+                {/if}
+              </span>
+            </p>
+            {#if orchestratorState.config_health.length > 0}
+              {@const bad = orchestratorState.config_health.filter((c) => !c.ok)}
+              {#if bad.length === 0}
+                <p class="orch-row orch-mid">
+                  Config: all {orchestratorState.config_health.length} files parse OK
+                </p>
+              {:else}
+                <p class="orch-row orch-warn">
+                  Config: {orchestratorState.config_health.length - bad.length} of
+                  {orchestratorState.config_health.length} files parse OK; flagged:
+                  {bad.map((c) => c.file).join(', ')}
+                </p>
+              {/if}
+            {/if}
+            <div class="orch-choices" role="radiogroup">
+              <label class="orch-radio" class:active={adoptChoice === 'use_as_is'}>
+                <input type="radio" name="adopt-choice" value="use_as_is" bind:group={adoptChoice} />
+                <span>Use as-is</span>
+              </label>
+              <label class="orch-radio" class:active={adoptChoice === 'update'}>
+                <input type="radio" name="adopt-choice" value="update" bind:group={adoptChoice} />
+                <span>
+                  Update
                   {#if orchestratorState.bundled_version}
-                    <span class="orch-mid">(v{orchestratorState.bundled_version})</span>
+                    to v{orchestratorState.bundled_version}
                   {/if}
                 </span>
               </label>
+              <label class="orch-radio" class:active={adoptChoice === 'install_fresh'}>
+                <input type="radio" name="adopt-choice" value="install_fresh" bind:group={adoptChoice} />
+                <span>Install fresh (overwrite)</span>
+              </label>
             </div>
-          {:else}
-            <div class="orch-status orch-existing">
-              <p class="orch-row">
-                <span class="orch-icon orch-ok">✓</span>
-                <span>
-                  Existing orchestrator detected
-                  {#if orchestratorState.version}
-                    — installed: <strong>v{orchestratorState.version}</strong>
-                  {/if}
-                  {#if orchestratorState.version_status === 'outdated' && orchestratorState.bundled_version}
-                    <span class="orch-mid">(bundled v{orchestratorState.bundled_version} available)</span>
-                  {:else if orchestratorState.version_status === 'unknown'}
-                    <span class="orch-mid">(version unknown)</span>
-                  {/if}
-                </span>
-              </p>
-              {#if orchestratorState.config_health.length > 0}
-                {@const bad = orchestratorState.config_health.filter((c) => !c.ok)}
-                {#if bad.length === 0}
-                  <p class="orch-row orch-mid">
-                    Config: all {orchestratorState.config_health.length} files parse OK
-                  </p>
-                {:else}
-                  <p class="orch-row orch-warn">
-                    Config: {orchestratorState.config_health.length - bad.length} of
-                    {orchestratorState.config_health.length} files parse OK; flagged:
-                    {bad.map((c) => c.file).join(', ')}
-                  </p>
-                {/if}
-              {/if}
-              <div class="orch-choices" role="radiogroup">
-                <label class="orch-radio" class:active={adoptChoice === 'use_as_is'}>
-                  <input type="radio" name="adopt-choice" value="use_as_is" bind:group={adoptChoice} />
-                  <span>Use as-is</span>
-                </label>
-                <label class="orch-radio" class:active={adoptChoice === 'update'}>
-                  <input type="radio" name="adopt-choice" value="update" bind:group={adoptChoice} />
-                  <span>
-                    Update
-                    {#if orchestratorState.bundled_version}
-                      to v{orchestratorState.bundled_version}
-                    {/if}
-                  </span>
-                </label>
-                <label class="orch-radio" class:active={adoptChoice === 'install_fresh'}>
-                  <input type="radio" name="adopt-choice" value="install_fresh" bind:group={adoptChoice} />
-                  <span>Install fresh (overwrite)</span>
-                </label>
-              </div>
-            </div>
-          {/if}
+          </div>
         {:else if inTauri && createPath.trim() && inspecting}
           <p class="form-hint orch-inspecting">Inspecting folder…</p>
         {/if}
@@ -980,7 +987,10 @@
     margin-top: 4px;
   }
 
-  /* Bug 20: orchestrator state panel inside project-create modal */
+  /* Bug 20: orchestrator state panel inside project-create modal.
+     2026-05-06 (PR-1): `.orch-fresh` + `.orch-toggle` removed along with
+     the "install orchestrator into this folder" checkbox; only the
+     existing-install adopt-choice panel remains. */
   .orch-status {
     margin: 14px 0;
     padding: 10px 12px;
@@ -988,10 +998,6 @@
     background: rgba(0,191,166,0.05);
     border-radius: 8px;
     font-size: 12px;
-  }
-  .orch-status.orch-fresh {
-    border-color: rgba(255,255,255,0.12);
-    background: rgba(255,255,255,0.02);
   }
   .orch-row {
     display: flex; align-items: flex-start; gap: 8px;
@@ -1004,11 +1010,6 @@
   .orch-mid { color: var(--color-mid); }
   .orch-warn { color: #f5b342; }
   .orch-inspecting { color: var(--color-mid); margin-top: 8px; }
-  .orch-toggle {
-    display: flex; align-items: center; gap: 8px;
-    font-size: 12px; color: var(--color-text);
-    margin-top: 6px;
-  }
   .orch-choices {
     display: flex; flex-direction: column; gap: 4px;
     margin-top: 8px;

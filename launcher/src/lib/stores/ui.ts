@@ -26,6 +26,12 @@ interface UIState {
   showInstallWizard: boolean;
   showMcpDashboard: boolean;
   showOnboarding: boolean;
+  // Cross-component trigger for ProjectSelector's "Create project" modal.
+  // Set by routes that don't render their own form (e.g. /projects list
+  // page's "+ Add Project" button) so the modal opens from the globally-
+  // mounted ProjectSelector in MenuBar. ProjectSelector consumes and
+  // resets this on close.
+  showCreateProject: boolean;
   // True when the wizard was opened by an explicit user action
   // (Settings → Re-run, Preferences → Re-run) rather than the
   // automatic first-launch gate. The wizard's preflight uses this to
@@ -44,6 +50,7 @@ function createUIStore() {
     showMcpDashboard: false,
     showOnboarding: false,
     onboardingForced: false,
+    showCreateProject: false,
   });
 
   return {
@@ -111,6 +118,10 @@ function createUIStore() {
         showOnboarding: false,
         onboardingForced: false,
       })),
+    openCreateProject: () =>
+      update((s) => ({ ...s, showCreateProject: true })),
+    closeCreateProject: () =>
+      update((s) => ({ ...s, showCreateProject: false })),
   };
 }
 
