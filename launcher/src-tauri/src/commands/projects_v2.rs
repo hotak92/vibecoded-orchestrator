@@ -3911,4 +3911,198 @@ mod tests {
 
         std::fs::remove_dir_all(&tmp).ok();
     }
+
+    // ─── PR-3 Commit 8: deep-merge + .claude/env BEGIN/END marker tests ─
+
+    #[test]
+    fn merge_env_object_canonical_creates_block_when_missing() {
+        let mut parent = serde_json::Map::new();
+        let pairs: Vec<(&str, String)> =
+            vec![("KG_COLLECTION", "Acme_KnowledgeGraph".to_string())];
+        merge_env_object_canonical(&mut parent, "env", &pairs);
+        let env = parent.get("env").unwrap().as_object().unwrap();
+        assert_eq!(env.len(), 1);
+        assert_eq!(env["KG_COLLECTION"], "Acme_KnowledgeGraph");
+    }
+
+    #[test]
+    fn merge_env_object_canonical_preserves_user_keys() {
+        let mut parent = serde_json::Map::new();
+        parent.insert(
+            "env".to_string(),
+            serde_json::json!({
+                "USER_KEY_1": "preserved",
+                "USER_KEY_2": "also preserved",
+                "KG_COLLECTION": "OldStaleValue",
+            }),
+        );
+        let pairs: Vec<(&str, String)> =
+            vec![("KG_COLLECTION", "NewValue".to_string())];
+        merge_env_object_canonical(&mut parent, "env", &pairs);
+
+        let env = parent.get("env").unwrap().as_object().unwrap();
+        // Canonical key overwritten.
+        assert_eq!(env["KG_COLLECTION"], "NewValue");
+        // User keys preserved.
+        assert_eq!(env["USER_KEY_1"], "preserved");
+        assert_eq!(env["USER_KEY_2"], "also preserved");
+    }
+
+    #[test]
+    fn merge_env_object_canonical_replaces_non_object_with_fresh() {
+        // If the existing value isn't an object (e.g. a stringified
+        // legacy form), we replace rather than crash. No user keys to
+        // preserve in this case.
+        let mut parent = serde_json::Map::new();
+        parent.insert("env".to_string(), serde_json::json!("legacy=value"));
+        let pairs: Vec<(&str, String)> =
+            vec![("KG_COLLECTION", "Acme_KG".to_string())];
+        merge_env_object_canonical(&mut parent, "env", &pairs);
+        let env = parent.get("env").unwrap().as_object().unwrap();
+        assert_eq!(env["KG_COLLECTION"], "Acme_KG");
+    }
+
+    #[test]
+    fn build_claude_env_managed_block_emits_begin_end_markers() {
+        let pairs: Vec<(&str, String)> = vec![
+            ("KG_COLLECTION", "Acme_KG".to_string()),
+            ("PROJECT_NAME", "Acme".to_string()),
+        ];
+        // `with_defaults` leaves orchestrator_root = None so the PR-2
+        // portability lines are silently omitted — keeps this test focused
+        // on the marker / canonical-pair contract.
+        let settings = ProjectEnvSettings::with_defaults("Acme");
+        let block = build_claude_env_managed_block(&pairs, &settings);
+        assert!(block.starts_with(CLAUDE_ENV_MANAGED_BEGIN));
+        assert!(block.contains("export KG_COLLECTION=\"Acme_KG\""));
+        assert!(block.contains("export PROJECT_NAME=\"Acme\""));
+        assert!(block.contains(CLAUDE_ENV_MANAGED_END));
+    }
+
+    #[test]
+    fn merge_claude_env_managed_block_no_prior_returns_managed_only() {
+        let settings = ProjectEnvSettings::with_defaults("Acme");
+        let managed = build_claude_env_managed_block(
+            &[("KG_COLLECTION", "Acme_KG".to_string())],
+            &settings,
+        );
+        let out = merge_claude_env_managed_block(None, &managed);
+        assert_eq!(out, managed);
+    }
+
+    #[test]
+    fn merge_claude_env_managed_block_replaces_in_place_preserving_user_lines() {
+        let user_pre = "# user-added note\nexport MY_TOKEN=\"abc\"\n\n";
+        let user_post = "\n# trailer\nexport ANOTHER=\"xyz\"\n";
+        let old_managed = format!(
+            "{}\nexport KG_COLLECTION=\"Old_KG\"\n{}\n",
+            CLAUDE_ENV_MANAGED_BEGIN, CLAUDE_ENV_MANAGED_END
+        );
+        let prior = format!("{}{}{}", user_pre, old_managed, user_post);
+
+        let new_pairs: Vec<(&str, String)> =
+            vec![("KG_COLLECTION", "New_KG".to_string())];
+        let settings = ProjectEnvSettings::with_defaults("Acme");
+        let new_managed = build_claude_env_managed_block(&new_pairs, &settings);
+        let out = merge_claude_env_managed_block(Some(&prior), &new_managed);
+
+        // User content before + after the managed block must survive.
+        assert!(out.starts_with(user_pre), "user pre-block content lost");
+        assert!(out.ends_with(user_post), "user post-block content lost");
+        // Old managed value gone.
+        assert!(!out.contains("Old_KG"));
+        // New managed value present.
+        assert!(out.contains("New_KG"));
+        // Markers present (in-place replace, not duplicated).
+        assert_eq!(
+            out.matches(CLAUDE_ENV_MANAGED_BEGIN).count(),
+            1,
+            "managed BEGIN marker must appear exactly once"
+        );
+        assert_eq!(
+            out.matches(CLAUDE_ENV_MANAGED_END).count(),
+            1,
+            "managed END marker must appear exactly once"
+        );
+    }
+
+    #[test]
+    fn merge_claude_env_managed_block_legacy_file_appends_block() {
+        // Pre-PR-3 file (no markers). The full prior content is
+        // preserved and the managed block appends. On the next round-
+        // trip the markers exist and in-place replace activates.
+        let prior = "# legacy file written by old launcher\nexport KG_COLLECTION=\"Legacy_KG\"\n";
+        let settings = ProjectEnvSettings::with_defaults("Acme");
+        let new_managed = build_claude_env_managed_block(
+            &[("KG_COLLECTION", "New_KG".to_string())],
+            &settings,
+        );
+        let out = merge_claude_env_managed_block(Some(prior), &new_managed);
+        // Legacy content preserved verbatim.
+        assert!(out.starts_with(prior));
+        // Managed block appended.
+        assert!(out.contains(CLAUDE_ENV_MANAGED_BEGIN));
+        assert!(out.contains("New_KG"));
+    }
+
+    #[test]
+    fn merge_claude_env_managed_block_round_trip_idempotent() {
+        // Apply the merge twice with the same managed block — the file
+        // must converge (not grow on each call).
+        let settings = ProjectEnvSettings::with_defaults("Acme");
+        let new_managed = build_claude_env_managed_block(
+            &[("KG_COLLECTION", "Acme_KG".to_string())],
+            &settings,
+        );
+        let after_first = merge_claude_env_managed_block(None, &new_managed);
+        let after_second =
+            merge_claude_env_managed_block(Some(&after_first), &new_managed);
+        assert_eq!(
+            after_first, after_second,
+            "second merge with same managed block must be a no-op"
+        );
+    }
+
+    #[test]
+    fn write_then_rewrite_preserves_user_added_env_key_round_trip() {
+        // End-to-end: write project env files, hand-add a user env key
+        // to the rendered .claude/settings.json, write again, and
+        // confirm the user key survives. Pins the Commit-6 contract at
+        // the public API level (not just the merge helpers).
+        let tmp = std::env::temp_dir().join(format!(
+            "vct-pr3-deep-merge-e2e-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // First write — rendered env block carries only the launcher's
+        // canonical keys.
+        write_project_env_files(&tmp, &ProjectEnvSettings::with_defaults("Acme"))
+            .unwrap();
+
+        // User opens .claude/settings.json and adds a custom env value.
+        let path = tmp.join(".claude/settings.json");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        v["env"]["USER_PROJECT_API_BASE"] =
+            serde_json::Value::String("http://internal-api.example.com".into());
+        std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+
+        // Second write — typical re-run case (rename, shared-KG toggle,
+        // re-create). Pre-PR-3 this would silently drop USER_PROJECT_API_BASE.
+        write_project_env_files(&tmp, &ProjectEnvSettings::with_defaults("Acme"))
+            .unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        // Canonical keys still correct.
+        assert_eq!(v["env"]["KG_COLLECTION"], "Acme_KnowledgeGraph");
+        // User key survived deep-merge round-trip.
+        assert_eq!(
+            v["env"]["USER_PROJECT_API_BASE"],
+            "http://internal-api.example.com"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
 }
