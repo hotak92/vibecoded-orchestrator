@@ -15,7 +15,12 @@ Design:
       once per N enqueues, nightly cron, etc).
 
 Endpoint:
-    Default https://api.vibecodedtools.it/telemetry (stub — pending deploy).
+    Default https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/telemetry
+    (canonical Supabase functions URL). The telemetry edge function is
+    NOT deployed yet — the URL exists but the function will return 404
+    until deployment. The pending-jsonl fallback path stays in place
+    for that interim window (writes to ~/.vibecoded/telemetry_pending.jsonl
+    when the upload returns the not-yet-deployed marker).
     Override via VIBECODED_TELEMETRY_URL.
 """
 from __future__ import annotations
@@ -33,15 +38,17 @@ from .queue import TelemetryQueue, get_queue
 
 log = logging.getLogger(__name__)
 
-# Public alias for the telemetry edge function. Internal infra URLs are not
-# committed to public source — operators set VIBECODED_TELEMETRY_URL to override.
+# Default = canonical Supabase project's functions URL. Matches the same
+# pattern as licensing.rs (no DNS alias indirection — the project ID is
+# already in the public AGPL source via launcher/supabase/config.toml,
+# so URL secrecy is theatre per the 2026-05-06 security review).
 #
-# v0.1.0 status: the upload endpoint is NOT yet deployed (pending
-# infra task — see docs/TELEMETRY.md). Until it's live, opted-in
-# telemetry events are written to ~/.vibecoded/telemetry_pending.jsonl
-# instead of posted, so users can see what would have been sent. Set
-# VIBECODED_TELEMETRY_URL to a real endpoint when one is deployed.
-DEFAULT_URL = "https://api.vibecodedtools.it/telemetry"
+# v0.1.0 status: the telemetry edge function is NOT deployed yet. The
+# URL exists but returns 404 until deployment. The pending-jsonl
+# fallback path (_write_pending_jsonl) handles the interim — opted-in
+# events go to ~/.vibecoded/telemetry_pending.jsonl until the function
+# lands and replies 200. Override via VIBECODED_TELEMETRY_URL.
+DEFAULT_URL = "https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/telemetry"
 BATCH_SIZE = 100
 RETRY_DELAYS = (1.0, 4.0, 16.0)  # len = number of retries after the first try
 REQUEST_TIMEOUT = 10.0
@@ -157,10 +164,20 @@ def _write_pending_jsonl(events: List[dict]) -> int:
 
 
 def _is_pre_launch_stub_endpoint(url: str) -> bool:
-    """True iff the URL is the not-yet-deployed default endpoint.
+    """True iff the URL points at the canonical (but not-yet-deployed)
+    Supabase telemetry function. Used to short-circuit upload_pending()
+    to the pending-jsonl path BEFORE doing a network request that we
+    know will return 404.
 
-    Real custom endpoints set via VIBECODED_TELEMETRY_URL bypass this — the
-    operator has explicitly accepted that they're posting somewhere live.
+    Real custom endpoints set via VIBECODED_TELEMETRY_URL bypass this —
+    the operator has explicitly accepted that they're posting somewhere
+    live.
+
+    Once the telemetry function is actually deployed, switch this to
+    return False unconditionally (or delete the function and its caller),
+    and posts will go through normally. The same DEFAULT_URL keeps
+    pointing at the right endpoint either way — only the "do we trust
+    that it answers?" decision changes.
     """
     return url == DEFAULT_URL
 
@@ -302,7 +319,29 @@ def upload_pending(
                 status_code=status,
             )
 
-        # 4xx (other than 429): do NOT retry, body is probably malformed
+        # 404: the endpoint URL is wrong OR the function is not deployed
+        # yet. Treat this the same as the pre-launch stub path: write to
+        # pending-jsonl, mark events uploaded so they don't infinitely
+        # retry. The user can inspect ~/.vibecoded/telemetry_pending.jsonl
+        # to see what would have been sent. Distinct error code so callers
+        # can distinguish from a deployed-but-misbehaving endpoint.
+        if status == 404:
+            try:
+                _write_pending_jsonl(body_obj["events"])
+                marked = q.mark_uploaded(ids)
+                return UploadResult(
+                    uploaded_count=marked,
+                    error="endpoint_not_found",
+                    retryable=False,
+                    attempts=attempts,
+                    status_code=status,
+                )
+            except OSError as e:
+                log.debug("Telemetry pending-file write failed (404 fallback): %s", e)
+                # Fall through to the generic 4xx path below so the queue
+                # doesn't lose events silently.
+
+        # 4xx (other than 429 / 404): do NOT retry, body is probably malformed
         # or the endpoint rejected schema. Leave events in queue so the
         # user can inspect via the dashboard CLI.
         body_snippet = ""

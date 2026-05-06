@@ -29,7 +29,7 @@ How VibeCoded Orchestrator gates paid features.
 3. Orchestrator startup calls `validate_license()`:
    1. Reads key (env var → file).
    2. POSTs `{license_key, machine_id_hash}` to
-      `https://api.vibecodedtools.it/validate` (override:
+      `https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/validate-tier` (override:
       `VIBECODED_LICENSE_URL`).
    3. The Supabase edge function calls LS `licenses/validate` +
       `licenses/activate`, looks up the variant in `VARIANT_MAP`, and

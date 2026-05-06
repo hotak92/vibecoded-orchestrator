@@ -113,7 +113,7 @@ npx supabase functions deploy lemon-squeezy-webhook --no-verify-jwt
 
 ### Lemon Squeezy Webhook Configuration
 1. Go to **app.lemonsqueezy.com** → **Settings** → **Webhooks** → **Add Webhook**
-2. **URL**: `https://api.vibecodedtools.it/lemon-squeezy-webhook`
+2. **URL**: `https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/lemon-squeezy-webhook`
    (or `https://<project-ref>.supabase.co/functions/v1/lemon-squeezy-webhook`
    while the public alias is being set up)
 3. **Signing Secret**: `<paste the same value used for LEMON_SQUEEZY_WEBHOOK_SECRET above>`
