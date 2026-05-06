@@ -409,12 +409,19 @@ class TestAdminTier:
 
 
 class TestEndpointSafety:
-    def test_default_url_is_public_alias_only(self, fresh_validator):
+    def test_default_url_is_https(self, fresh_validator):
+        # Per the 2026-05-06 security review:
+        # `.claude/context/supabase-license-security-review-2026-05-06.md`
+        # — the prior "must contain vibecodedtools.it / must not contain
+        # supabase.co" guards were defending against information disclosure
+        # of the project ID, but the project ID is ALREADY publicly
+        # disclosed in launcher/supabase/config.toml which ships in the AGPL
+        # source repo. URL secrecy in the binary was theatre.
+        # Real license-validation hardening (env-var allowlist, rate limit,
+        # signed cache) is tracked separately as F14/F1/F15 hardening
+        # tickets — URL secrecy doesn't help against any of them.
         url = fresh_validator._DEFAULT_VALIDATE_URL
-        # Public alias, no Supabase project ID, no `*.supabase.co` subdomain.
-        assert "supabase.co" not in url
-        assert url.startswith("https://")
-        assert "vibecodedtools.it" in url
+        assert url.startswith("https://"), f"default URL must be HTTPS: {url}"
 
     def test_env_override_wins(self, fresh_validator, monkeypatch):
         monkeypatch.setenv("VIBECODED_LICENSE_KEY", "GOOD-UUID")
