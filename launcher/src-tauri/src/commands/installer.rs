@@ -2321,12 +2321,17 @@ pub async fn update_orchestrator_at(path: String, window: Window) -> Result<(), 
     if !target.exists() {
         return Err(format!("update target {} does not exist", target.display()));
     }
-    if !target.join(".claude").exists() && !target.join("vct-module.json").exists() {
-        return Err(format!(
-            "{} does not look like an orchestrator install (no .claude/ or vct-module.json)",
-            target.display()
-        ));
-    }
+    // VCO-clone gate: refuse to run against project folders that happen to
+    // have `.claude/` left behind by a non-destructive unregister (PR #150).
+    // `update_orchestrator_at` is a "sync VCO clone from a newer source"
+    // operation; running it against a project folder copies orchestrator-
+    // machinery into the project. The validate_source_repo check (install.py
+    // + first-install.sh) is the canonical VCO-clone discriminator.
+    //
+    // Project-update path is separate: see `update_project_v2` /
+    // `run_install_bundle_update` (`projects_v2.rs:782`) for the bundle-only
+    // update that operates on registered project folders.
+    validate_source_repo(&target)?;
     emit_progress(&window, "locate", "Locating bundled source...", 5.0);
     let source = find_local_repo_root()?;
     emit_progress(&window, "copy", "Copying updated files...", 25.0);
@@ -5163,6 +5168,62 @@ MemAvailable:   23456789 kB
         fs::write(p.join("first-install.sh"), "#!/usr/bin/env bash\n").unwrap();
         let res = validate_source_repo(&p);
         assert!(res.is_ok(), "validate_source_repo rejected a source repo: {:?}", res);
+        fs::remove_dir_all(&p).ok();
+    }
+
+    // ---- update_orchestrator_at VCO-clone gate (post-PR-#150) -----------
+    //
+    // After PR #150 unregister became non-destructive (preserves
+    // `.claude/agents/` + `.claude/skills/`). The previous existence-only
+    // check (`.claude/` OR `vct-module.json` present) would let a project
+    // folder with leftover `.claude/` slip through and trigger an
+    // orchestrator-machinery copy into the project. update_orchestrator_at
+    // now calls `validate_source_repo` — same gate as install_orchestrator
+    // — so the test surface is identical to the install_orchestrator_*
+    // block above. Project-update is the separate `update_project_v2` /
+    // `run_install_bundle_update` path in projects_v2.rs.
+
+    #[test]
+    fn test_update_orchestrator_at_refuses_project_folder_with_only_dot_claude() {
+        // Simulate a project folder post-non-destructive-unregister: leftover
+        // `.claude/agents/` + content, but NO install.py / first-install.sh.
+        // The new gate must refuse this with the validate_source_repo error.
+        let p = tmp();
+        fs::create_dir_all(p.join(".claude/agents")).unwrap();
+        fs::write(p.join(".claude/agents/some.md"), "# leftover agent\n").unwrap();
+
+        let res = validate_source_repo(&p);
+        assert!(
+            res.is_err(),
+            "project folder with only .claude/ leftovers must be refused"
+        );
+        let msg = res.unwrap_err();
+        assert!(
+            msg.contains("install.py") && msg.contains("first-install.sh"),
+            "error message must name the two required files; got: {}",
+            msg
+        );
+        fs::remove_dir_all(&p).ok();
+    }
+
+    #[test]
+    fn test_update_orchestrator_at_accepts_vco_clone() {
+        // A real VCO clone has install.py + first-install.sh side-by-side
+        // (plus a `.git/`, but the gate doesn't require it). The gate-pass
+        // is what we test here — the actual copy still runs in the real
+        // command and is exercised by integration / manual QA, not unit
+        // tests (it requires a Window handle and the bundled source repo).
+        let p = tmp();
+        fs::write(p.join("install.py"), "# install\n").unwrap();
+        fs::write(p.join("first-install.sh"), "#!/usr/bin/env bash\n").unwrap();
+        fs::create_dir_all(p.join(".git")).unwrap();
+
+        let res = validate_source_repo(&p);
+        assert!(
+            res.is_ok(),
+            "VCO clone with install.py + first-install.sh must pass the gate: {:?}",
+            res
+        );
         fs::remove_dir_all(&p).ok();
     }
 }
