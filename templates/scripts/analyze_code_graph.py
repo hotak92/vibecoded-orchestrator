@@ -120,8 +120,16 @@ SCRIPT_DIR = Path(__file__).parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 # Smart code truncation — import from weaviate_mcp package.
-# Falls back to naive char-based truncation if the module is unavailable.
-_mcp_dir = Path(__file__).resolve().parent.parent.parent / "claude_mcp_servers"
+# PR-2 portability (2026-05-06): orchestrator clone resolved via
+# $VCT_ORCHESTRATOR_ROOT (.claude/env) with in-tree fallback. Falls back
+# to naive char-based truncation if the module is unavailable (CPU-only
+# user projects without the venv). Pure utility import (no service
+# runtime); see PR-2 design notes.
+_env_root = os.environ.get("VCT_ORCHESTRATOR_ROOT", "").strip()
+if _env_root and (Path(_env_root) / "claude_mcp_servers").is_dir():
+    _mcp_dir = Path(_env_root) / "claude_mcp_servers"
+else:
+    _mcp_dir = Path(__file__).resolve().parent.parent.parent / "claude_mcp_servers"
 if str(_mcp_dir) not in sys.path:
     sys.path.insert(0, str(_mcp_dir))
 try:

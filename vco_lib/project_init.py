@@ -1660,11 +1660,36 @@ _MANIFEST_SCHEMA_VERSION = 1
 
 # Placeholder substitutions applied to agent .md files (mirrors
 # install.py:5564). Skill .md files use the same map.
+#
+# PR-2 portability (2026-05-06):
+#
+# `{{ORCHESTRATOR_ROOT}}` resolves to an ABSOLUTE PATH at install time.
+# This is necessary because Claude Code's agent .md frontmatter parses
+# YAML mcpServers `command:` fields straight to `execvp()` — shell-style
+# `${VAR}` expansion does NOT happen there. Baking the absolute path is
+# the only mechanism that lets Claude Code spawn the orchestrator-tools
+# MCP. Trade-off: moving the orchestrator clone breaks every project's
+# MCP wiring until `install-bundle --update` is rerun (which the launcher
+# triggers on rename and adoption). The manifest-driven hash compare in
+# `_file_action` already heals stale baked paths when the prior-shipped
+# hash matches the installed file (i.e. user hasn't customised it).
+#
+# `{{VCT_ORCHESTRATOR_ROOT}}` resolves to the LITERAL string
+# `${VCT_ORCHESTRATOR_ROOT}` so it can be expanded by shell or by Python
+# `os.environ` lookups at run time. Use this placeholder in agent .md
+# bodies, hook scripts, or any context where a runtime-relocatable path
+# is acceptable.
 def _agent_subs(orchestrator_root: Path) -> dict[str, str]:
     return {
         "{{ORCHESTRATOR_ROOT}}": str(orchestrator_root),
         "{{PROJECTS_ROOT}}": str(orchestrator_root.parent),
         "{{HOME}}": str(Path.home()),
+        # Runtime-resolvable form for shell / Python contexts. The literal
+        # ${VCT_ORCHESTRATOR_ROOT} string survives substitution as-is so the
+        # consumer expands it at use time. Templates SHOULD prefer this
+        # placeholder unless the consumer is a YAML execvp boundary (see
+        # the {{ORCHESTRATOR_ROOT}} note above).
+        "{{VCT_ORCHESTRATOR_ROOT}}": "${VCT_ORCHESTRATOR_ROOT}",
     }
 
 
@@ -1904,12 +1929,88 @@ def _enumerate_bundle_files(orchestrator_root: Path) -> list[_BundleFileOp]:
     return ops
 
 
+def _stale_orchestrator_root_heal_match(
+    raw: bytes,
+    target_path: Path,
+    orchestrator_root: Path,
+) -> bool:
+    """PR-2 portability heal (2026-05-06).
+
+    Detect the case where an agent .md was install-stamped against an
+    OLD orchestrator-clone path (e.g. user moved/renamed the clone) and
+    is now stale. If we substitute the SAME placeholders against an
+    `old_root` extracted from the installed file and reproduce the
+    installed bytes, then the user did NOT customise — they just have
+    a stale baked path. Return True in that case so the caller can
+    overwrite safely.
+
+    Conservative: returns False on any ambiguity. Only matches when
+    the installed file contains a path-shaped string of the form
+    `<old_root>/claude_mcp_servers/...` and round-tripping with that
+    `old_root` reproduces the file byte-for-byte. False on Windows
+    paths (case-insensitive FS makes the round-trip unreliable).
+    """
+    try:
+        installed = target_path.read_bytes()
+        installed_text = installed.decode("utf-8", errors="strict")
+    except (OSError, UnicodeDecodeError):
+        return False
+
+    # Look for a baked path of the form `<root>/claude_mcp_servers/`. Use
+    # a byte-anchor + back-walk so we don't try to grep arbitrary regex
+    # over the whole file. The first match wins; we tolerate at most one
+    # candidate orchestrator-root prefix per file.
+    needle = "/claude_mcp_servers/"
+    idx = installed_text.find(needle)
+    if idx <= 0:
+        return False
+    # Walk back to the start of the path. Acceptable path chars: anything
+    # that's not whitespace, quote, colon (YAML separator), or comma.
+    end = idx
+    start = end
+    while start > 0:
+        c = installed_text[start - 1]
+        if c.isspace() or c in ('"', "'", ":", ",", "(", ")", "<", ">"):
+            break
+        start -= 1
+    if start == end:
+        return False
+    candidate = installed_text[start:end]
+    if not candidate.startswith("/"):
+        # POSIX absolute paths only. Skip Windows / relative.
+        return False
+    old_root = Path(candidate).resolve()
+    if old_root == orchestrator_root.resolve():
+        # Same path → not a stale-root case (the hash compare would have
+        # caught it as noop).
+        return False
+
+    # Round-trip: build subs map for the OLD root, transform the source,
+    # compare to the installed bytes. If they match, the user didn't
+    # touch it; the stale path is the only difference.
+    subs = {
+        "{{ORCHESTRATOR_ROOT}}": str(old_root),
+        "{{PROJECTS_ROOT}}": str(old_root.parent),
+        "{{HOME}}": str(Path.home()),
+        "{{VCT_ORCHESTRATOR_ROOT}}": "${VCT_ORCHESTRATOR_ROOT}",
+    }
+    try:
+        text = raw.decode("utf-8", errors="replace")
+        for k, v in subs.items():
+            text = text.replace(k, v)
+        round_trip = text.encode("utf-8")
+    except Exception:
+        return False
+    return round_trip == installed
+
+
 def _file_action(
     op: _BundleFileOp,
     target_path: Path,
     *,
     update_mode: bool,
     manifest: dict,
+    orchestrator_root: Optional[Path] = None,
 ) -> tuple[str, bytes]:
     """Decide the per-file action and return (action, source_bytes).
 
@@ -1922,6 +2023,12 @@ def _file_action(
       "noop"            — file exists, source identical to installed (no-op).
       "always-overwrite"— `op.always_overwrite=True` (e.g. hooks/_lib).
       "skip-existing"   — first-install (update_mode=False) and target exists.
+
+    PR-2 heal (2026-05-06): if `orchestrator_root` is supplied and the
+    file was produced via `_apply_subs` (transform present), an installed
+    file that round-trips to the source bytes under a DIFFERENT (stale)
+    orchestrator root is treated as overwritable — the user moved the
+    clone, didn't edit the file. See `_stale_orchestrator_root_heal_match`.
     """
     # Compute the source bytes (after transform if any). We always need
     # the bytes to compute hashes; reading is cheap relative to the rest.
@@ -1957,6 +2064,19 @@ def _file_action(
     prior_hash = prior.get("sha256", "")
     if prior_hash and installed_hash == prior_hash:
         return ("overwrite", source_bytes)
+
+    # PR-2 heal: stale-orchestrator-root scenario. Only kick in when the
+    # file is `_apply_subs`-transformed AND we have a current
+    # orchestrator_root to compare against. Doesn't fire for
+    # non-substituted files (hooks, scripts, compose) because their
+    # transform is None.
+    if (
+        op.transform is not None
+        and orchestrator_root is not None
+        and _stale_orchestrator_root_heal_match(raw, target_path, orchestrator_root)
+    ):
+        return ("overwrite", source_bytes)
+
     # Default to safety: user-modified (or unknown provenance).
     return ("preserve", source_bytes)
 
@@ -2338,6 +2458,7 @@ def install_project_bundle(
         try:
             action, source_bytes = _file_action(
                 op, target_path, update_mode=update_mode, manifest=manifest,
+                orchestrator_root=orchestrator_root,
             )
         except Exception as e:
             err = f"{type(e).__name__}: {e}"

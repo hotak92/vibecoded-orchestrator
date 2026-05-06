@@ -867,26 +867,45 @@ MERGE_BLOCK_START = "<!-- vct-merge-pending -->"
 MERGE_BLOCK_END = "<!-- /vct-merge-pending -->"
 
 # Hard whitelist of paths the orchestrator install is allowed to copy
-# from `source` into `install_path`. Mirror of ORCHESTRATOR_MANAGED_PATHS
-# in installer.rs. Anything else at the source is left behind; anything
-# else at the install_path is left untouched.
+# from `source` into `install_path`. **Mirror of `ORCHESTRATOR_MANAGED_PATHS`
+# in `launcher/src-tauri/src/commands/installer.rs`** — keep in lockstep;
+# the test `test_managed_paths_python_rust_lockstep` (added in PR-2) asserts
+# the two sets are byte-identical.
+#
+# **Architectural intent (2026-05-06):** ONE VCO clone is shared by all
+# projects; per-project folders never receive the orchestrator's own
+# machinery. Entries here must be either (a) project-meaningful
+# configuration / docs that legitimately live alongside a user project
+# (`.claude/`, `CLAUDE.md`, `knowledge/`, `docs/`, `tools/`,
+# `infrastructure/`) or (b) the version-pinning manifest the launcher
+# reads to detect an existing install (`vct-module.json`).
+#
+# **Explicitly excluded** (the PR-1 / PR-2 trim, 2026-05-06):
+#   - `install.py` / `install.sh` / `install.ps1` — orchestrator entry
+#     points; never copied into a user project (VideoFrames bug).
+#   - `state/` — per-install metadata; copying it into a project means a
+#     stale install-manifest with the wrong install_path, plus accidental
+#     RL artifact bleed-over.
+#   - `claude_mcp_servers/` — orchestrator-only Python package; user
+#     projects reach it via `$VCT_ORCHESTRATOR_ROOT` (.claude/env) per
+#     PR-2, never by file copy.
+#   - `templates/` — SOURCE for `_enumerate_bundle_files` per-project
+#     bundle installs, never the destination at a user project.
+#   - `requirements.txt` / `requirements-dev.txt` — orchestrator's own
+#     Python deps; project-side `.venv` is independent.
+#   - `BOOTSTRAP.md` — orchestrator setup doc, irrelevant to a user
+#     project that already has the orchestrator running.
+#   - `config/` — legacy entry; directory does not exist in the repo.
+#
+# Anything else at the source is left behind; anything else at the
+# install_path is left untouched.
 ORCHESTRATOR_MANAGED_PATHS: tuple[str, ...] = (
     ".claude",
     "CLAUDE.md",
     "knowledge",
-    "claude_mcp_servers",
-    "state",
-    "config",
     "docs",
-    "templates",
     "tools",
     "infrastructure",
-    "requirements.txt",
-    "requirements-dev.txt",
-    "install.sh",
-    "install.ps1",
-    "install.py",
-    "BOOTSTRAP.md",
     "vct-module.json",
 )
 
