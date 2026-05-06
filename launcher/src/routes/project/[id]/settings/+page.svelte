@@ -25,6 +25,25 @@
   let newEnvKey = $state('');
   let newEnvValue = $state('');
 
+  // 2026-05-06: Danger zone — non-destructive unregister UX.
+  // Two checkboxes + type-to-confirm gate the action. Both checkboxes
+  // map to fields on the new `UnregisterOptions` Tauri command shape:
+  //   - purgeLauncherFiles: ON by default; surgically removes hooks/
+  //     scripts/compose/canonical-env-keys, preserves user content.
+  //   - purgeCollections: OFF by default (opt-in); drops the project's
+  //     own Weaviate collections. Shared never touched. Tooltip
+  //     surfaces the rebuild path so users don't fear the choice.
+  let purgeLauncherFiles = $state(true);
+  let purgeCollections = $state(false);
+  let unregisterConfirmText = $state('');
+  let unregistering = $state(false);
+  // The Unregister button is enabled only when the user has typed the
+  // exact project name. Case-sensitive — matches the muscle memory of
+  // GitHub's "delete repo" gate.
+  let unregisterReady = $derived(
+    !!project && unregisterConfirmText === project.name && !unregistering,
+  );
+
   async function load() {
     try {
       project = await invoke<ProjectView>('get_project_v2', { id: projectId });
@@ -86,6 +105,55 @@
   }
   function removeEnv(idx: number) {
     envEntries = envEntries.filter((_, i) => i !== idx);
+  }
+
+  /**
+   * 2026-05-06: invoke the new non-destructive unregister flow.
+   *
+   * The store's `delete()` returns the `UnregisterReport` so we can
+   * surface a one-line summary toast with the actual counts of what
+   * was removed. Soft-fail warnings come back via `report.warnings[]`
+   * and get their own toasts (matches the bundle-install pattern).
+   *
+   * On success we navigate back to /projects — the deleted project
+   * is no longer in the store, so /project/<id> would 404.
+   */
+  async function unregister() {
+    if (!project || !unregisterReady) return;
+    unregistering = true;
+    try {
+      const report = await projects.delete(project.id, {
+        purgeLauncherFiles,
+        purgeCollections,
+      });
+
+      // Surface every soft-fail warning as its own error toast (each is
+      // distinct enough that batching would lose information).
+      for (const w of report.warnings) toast.error(w);
+
+      // One-line summary toast — counts give the user a confirmation
+      // anchor without forcing them to read the full warning stream.
+      const parts: string[] = [];
+      if (report.filesPurged.length > 0) {
+        parts.push(`${report.filesPurged.length} files removed`);
+      }
+      if (report.keysPurgedFromEnv.length > 0) {
+        parts.push(`${report.keysPurgedFromEnv.length} env keys cleaned`);
+      }
+      if (report.collectionsDropped.length > 0) {
+        parts.push(`${report.collectionsDropped.length} collections dropped`);
+      }
+      const summary = parts.length > 0
+        ? `Unregistered "${report.projectName}" — ${parts.join(', ')}`
+        : `Unregistered "${report.projectName}"`;
+      toast.success(summary);
+
+      goto('/projects');
+    } catch (e) {
+      toast.error(e);
+    } finally {
+      unregistering = false;
+    }
   }
 
   onMount(load);
@@ -156,6 +224,66 @@
           </tbody>
         </table>
       </section>
+
+      <section class="ps-section ps-danger">
+        <h2>Danger zone</h2>
+
+        <div class="ps-danger-block">
+          <h3>Unregister project</h3>
+          <p class="ps-danger-lead">Remove this project from the launcher.</p>
+
+          <label class="ps-danger-check">
+            <input type="checkbox" bind:checked={purgeLauncherFiles} />
+            <span>
+              <strong>Remove launcher-managed files</strong>
+              <small>
+                Removes <code>.claude/hooks/</code>, <code>.claude/scripts/</code>,
+                infra compose YAMLs, and the canonical keys from your
+                <code>.env</code> / <code>.claude/env</code> /
+                <code>.claude/settings.json</code> /
+                <code>.vscode/settings.json</code>.
+                Your agents, skills, <code>CONTEXT_STATE.md</code>,
+                <code>CLAUDE.md</code>, source code, and user-added
+                <code>.env</code> values are preserved.
+              </small>
+            </span>
+          </label>
+
+          <label class="ps-danger-check">
+            <input type="checkbox" bind:checked={purgeCollections} />
+            <span>
+              <strong>Drop Weaviate collections</strong>
+              <small>
+                Drops <code>{project.name}_KnowledgeGraph</code> and
+                <code>{project.name}_Development</code>. Shared collections
+                are not touched.
+                <em>Tip: collections can always be rebuilt from
+                <code>/knowledge</code> + source code via
+                <code>install-bundle --update</code>.</em>
+              </small>
+            </span>
+          </label>
+
+          <label class="ps-danger-confirm">
+            <span>Type <code>{project.name}</code> to confirm:</span>
+            <input
+              type="text"
+              bind:value={unregisterConfirmText}
+              placeholder={project.name}
+              autocomplete="off"
+              spellcheck="false"
+            />
+          </label>
+
+          <button
+            class="ps-btn-danger"
+            onclick={unregister}
+            disabled={!unregisterReady}
+          >
+            {unregistering ? 'Unregistering…' : 'Unregister'}
+          </button>
+        </div>
+      </section>
     </main>
   {/if}
 </div>
@@ -195,4 +323,50 @@
   }
   .ps-btn-link { background: none; border: none; color: #f99; cursor: pointer; font-size: 11px; padding: 0; }
   .ps-btn-link:hover { text-decoration: underline; }
+
+  /* Danger zone — distinct red border + dark accent so it doesn't look
+     like just another section. Mirrors the GitHub "Danger zone" pattern. */
+  .ps-section.ps-danger {
+    border: 1px solid rgba(239, 83, 80, 0.45);
+    background: rgba(239, 83, 80, 0.04);
+  }
+  .ps-danger h2 { color: #ef9a9a; }
+  .ps-danger-block { display: flex; flex-direction: column; gap: 12px; }
+  .ps-danger-block h3 {
+    margin: 0; font-size: 13px; color: #ef9a9a;
+    border-bottom: 1px solid rgba(239, 83, 80, 0.2); padding-bottom: 4px;
+  }
+  .ps-danger-lead { margin: 0; font-size: 12px; color: #ddd; }
+  .ps-danger-check {
+    display: flex; gap: 10px; align-items: flex-start;
+    padding: 8px 10px; background: rgba(0,0,0,0.2); border-radius: 4px;
+    cursor: pointer; user-select: none;
+  }
+  .ps-danger-check input[type='checkbox'] { margin-top: 2px; flex-shrink: 0; }
+  .ps-danger-check span { display: flex; flex-direction: column; gap: 4px; flex: 1; }
+  .ps-danger-check strong { font-size: 12px; color: #f5f5f5; font-weight: 600; }
+  .ps-danger-check small { font-size: 11px; color: #aaa; line-height: 1.5; }
+  .ps-danger-check em { color: #c4b3ff; font-style: normal; }
+  .ps-danger-check code, .ps-danger-block code {
+    background: rgba(0,0,0,0.3); padding: 1px 4px; border-radius: 3px;
+    font-family: ui-monospace, monospace; font-size: 10px;
+  }
+  .ps-danger-confirm {
+    display: flex; flex-direction: column; gap: 4px;
+    margin-top: 4px; font-size: 12px; color: #ddd;
+  }
+  .ps-danger-confirm input {
+    background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.12); color: inherit;
+    padding: 5px 8px; border-radius: 4px; font-size: 13px; font-family: ui-monospace, monospace;
+  }
+  .ps-btn-danger {
+    background: #d32f2f; border: none; color: #fff;
+    padding: 6px 16px; border-radius: 4px; cursor: pointer;
+    font-size: 12px; font-weight: 600; align-self: flex-start;
+  }
+  .ps-btn-danger:hover:not(:disabled) { background: #e53935; }
+  .ps-btn-danger:disabled {
+    background: rgba(211, 47, 47, 0.4); color: rgba(255,255,255,0.5);
+    cursor: not-allowed;
+  }
 </style>
