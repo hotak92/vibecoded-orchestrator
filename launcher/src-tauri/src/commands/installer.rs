@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use tauri::{command, Emitter, Window};
 
 /// Upstream GitHub repo. Auto-update isn't fully wired yet — initial
@@ -113,16 +114,55 @@ pub struct InstallDiff {
     pub user_paths_preserved: bool,
 }
 
+/// Embedded copy of the source-of-truth file at the repo root. The file
+/// is read at compile time (NOT runtime) so the launcher binary stays
+/// self-contained and can't drift from the orchestrator clone it was
+/// built against. Updates to the launcher binary are how new entries
+/// reach existing installs of the launcher; the file at the user's
+/// orchestrator clone is then copied across via `update_orchestrator_at`
+/// (which itself reads ORCHESTRATOR_MANAGED_PATHS — see the entry for
+/// `orchestrator-managed-paths.txt` in the file, which makes the
+/// propagation self-referential and fail-safe).
+///
+/// Path: 4 levels up from this file (commands → src → src-tauri →
+/// launcher → repo root).
+const ORCHESTRATOR_MANAGED_PATHS_TXT: &str =
+    include_str!("../../../../orchestrator-managed-paths.txt");
+
+/// Parse the embedded text file into a list of allowlist entries.
+///
+/// Parse rules (must match `_parse_managed_paths_text` in `install.py`):
+///   - Lines are stripped of leading/trailing whitespace.
+///   - Empty lines are skipped.
+///   - Lines whose first non-whitespace character is `#` are comments
+///     and are skipped entirely (no inline comments).
+fn parse_managed_paths_text(text: &'static str) -> Vec<&'static str> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect()
+}
+
 /// Hard whitelist of paths the orchestrator install is allowed to touch
 /// at the project root. Everything else is treated as user code.
 ///
+/// **Source of truth:** `orchestrator-managed-paths.txt` at the repo
+/// root. Edit there ONLY — both Rust (via `include_str!`, here) and
+/// Python (`install.py::ORCHESTRATOR_MANAGED_PATHS`, read at import
+/// time) parse the same file with the same rules. A cross-language
+/// consistency test (`tests/test_managed_paths_consistency.py`) pins
+/// the two languages to the file contents.
+///
 /// **Architectural intent (2026-05-06):** ONE VCO clone is shared by all
 /// projects; per-project folders never receive the orchestrator's own
-/// machinery. Entries here must be either (a) project-meaningful
+/// machinery. Entries in the .txt must be either (a) project-meaningful
 /// configuration / docs that legitimately live alongside a user project
 /// (`.claude/`, `CLAUDE.md`, `knowledge/`, `docs/`, `tools/`,
-/// `infrastructure/`) or (b) the version-pinning manifest the launcher
-/// reads to detect an existing install (`vct-module.json`).
+/// `infrastructure/`), (b) the version-pinning manifest the launcher
+/// reads to detect an existing install (`vct-module.json`), or (c) the
+/// source-of-truth file itself (`orchestrator-managed-paths.txt`) so
+/// `update_orchestrator_at` propagates new editions of the list into
+/// every existing install.
 ///
 /// **Explicitly excluded:** `install.py` / `install.sh` / `install.ps1`
 /// (orchestrator entry points), `state/` (per-install metadata; the
@@ -139,15 +179,8 @@ pub struct InstallDiff {
 /// `install_orchestrator`'s plain-copy path), `apply_conflict_strategy`,
 /// `classify_install_target`, and `diff_install`. The frontend mirrors a
 /// humanized version in the confirm modal.
-pub const ORCHESTRATOR_MANAGED_PATHS: &[&str] = &[
-    ".claude",
-    "CLAUDE.md",
-    "knowledge",
-    "docs",
-    "tools",
-    "infrastructure",
-    "vct-module.json",
-];
+pub static ORCHESTRATOR_MANAGED_PATHS: LazyLock<Vec<&'static str>> =
+    LazyLock::new(|| parse_managed_paths_text(ORCHESTRATOR_MANAGED_PATHS_TXT));
 
 // ---------------------------------------------------------------------------
 // Re-install conflict resolution (4-option modal)
@@ -556,7 +589,7 @@ pub fn classify_install_target(install_path: &Path) -> InstallMode {
     }
 
     // Look for any orchestrator-managed artifact
-    for managed in ORCHESTRATOR_MANAGED_PATHS {
+    for managed in ORCHESTRATOR_MANAGED_PATHS.iter() {
         if install_path.join(managed).exists() {
             return InstallMode::Adopt;
         }
@@ -575,7 +608,7 @@ pub fn diff_install(install_path: &Path) -> InstallDiff {
     let mut will_overwrite: Vec<String> = Vec::new();
     let mut will_add: Vec<String> = Vec::new();
 
-    for managed in ORCHESTRATOR_MANAGED_PATHS {
+    for managed in ORCHESTRATOR_MANAGED_PATHS.iter() {
         let p = install_path.join(managed);
         if p.exists() {
             will_overwrite.push(managed.to_string());
@@ -1430,7 +1463,7 @@ pub fn copy_orchestrator_to_sync(source: &Path, target: &Path) -> Result<(), Str
     std::fs::create_dir_all(target)
         .map_err(|e| format!("cannot create target {}: {}", target.display(), e))?;
 
-    for managed in ORCHESTRATOR_MANAGED_PATHS {
+    for managed in ORCHESTRATOR_MANAGED_PATHS.iter() {
         let src = source.join(managed);
         let dst = target.join(managed);
         if !src.exists() {
@@ -1681,7 +1714,7 @@ pub fn apply_conflict_strategy(
             // Iterate the orchestrator-managed allowlist. For each entry:
             //  - if it's a directory, recurse and apply preserve-aware copy.
             //  - if it's a file, apply preserve-aware copy directly.
-            for managed in ORCHESTRATOR_MANAGED_PATHS {
+            for managed in ORCHESTRATOR_MANAGED_PATHS.iter() {
                 let src = source.join(managed);
                 let dst = target.join(managed);
                 if !src.exists() {
@@ -1732,7 +1765,7 @@ pub fn apply_conflict_strategy(
 /// that overwrite-all so the report can show how many files moved.
 fn copy_orchestrator_with_count(source: &Path, target: &Path) -> Result<usize, String> {
     let mut count = 0usize;
-    for managed in ORCHESTRATOR_MANAGED_PATHS {
+    for managed in ORCHESTRATOR_MANAGED_PATHS.iter() {
         let src = source.join(managed);
         let dst = target.join(managed);
         if !src.exists() {
@@ -3330,8 +3363,41 @@ mod tests {
     /// rationale. The architectural intent is ONE VCO clone shared by
     /// all projects; per-project folders never receive orchestrator
     /// entry points or per-install metadata.
+    ///
+    /// 2026-05-06 (PR-5, single-source refactor): the constant is now
+    /// derived from `orchestrator-managed-paths.txt` at the repo root
+    /// via `include_str!`. This test pins (a) the exact post-trim set
+    /// the file is expected to contain, (b) the banned-entries
+    /// invariant from PR-1, and (c) the self-reference invariant — the
+    /// .txt file lists itself so `update_orchestrator_at` propagates
+    /// new editions of the list across existing installs.
     #[test]
-    fn test_managed_paths_excludes_orchestrator_only_files() {
+    fn test_managed_paths_matches_source_of_truth() {
+        // (a) Exact set: the parsed list must equal the post-trim
+        // expected entries. If you intentionally add or remove a path,
+        // edit `orchestrator-managed-paths.txt` AND this assertion in
+        // the same commit.
+        let expected: &[&str] = &[
+            ".claude",
+            "CLAUDE.md",
+            "knowledge",
+            "docs",
+            "tools",
+            "infrastructure",
+            "vct-module.json",
+            "orchestrator-managed-paths.txt",
+        ];
+        let actual: Vec<&str> = ORCHESTRATOR_MANAGED_PATHS.iter().copied().collect();
+        assert_eq!(
+            actual, expected,
+            "ORCHESTRATOR_MANAGED_PATHS (parsed from \
+             orchestrator-managed-paths.txt) drifted from the expected \
+             post-trim set. Edit the .txt and this test together."
+        );
+
+        // (b) Banned entries (PR-1 invariant): orchestrator-only
+        // machinery must never reach a per-project folder via
+        // copy_orchestrator_to_sync.
         let banned: &[&str] = &[
             "install.py",
             "install.sh",
@@ -3352,22 +3418,43 @@ mod tests {
                 entry,
             );
         }
-        // Sanity: the trimmed list still contains the project-meaningful
-        // entries the launcher relies on for detecting / refreshing an
-        // installed orchestrator.
-        for required in &[
-            ".claude",
-            "CLAUDE.md",
-            "knowledge",
-            "docs",
-            "vct-module.json",
-        ] {
-            assert!(
-                ORCHESTRATOR_MANAGED_PATHS.contains(required),
-                "ORCHESTRATOR_MANAGED_PATHS missing project-meaningful entry {:?}",
-                required,
-            );
-        }
+
+        // (c) Self-reference invariant: the source-of-truth file lists
+        // itself so `update_orchestrator_at` syncs a freshly-edited
+        // version into every existing install. Dropping this entry
+        // would silently freeze the whitelist at its current contents
+        // for any user who installed before the next launcher release.
+        assert!(
+            ORCHESTRATOR_MANAGED_PATHS.contains(&"orchestrator-managed-paths.txt"),
+            "orchestrator-managed-paths.txt must list itself so \
+             update_orchestrator_at propagates edits to existing installs",
+        );
+    }
+
+    /// Parse-rule contract for `orchestrator-managed-paths.txt`. The
+    /// Python side (`install.py::_parse_managed_paths_text`) implements
+    /// the same rules — see
+    /// `tests/test_managed_paths_consistency.py` for the cross-language
+    /// pin.
+    #[test]
+    fn test_parse_managed_paths_text_rules() {
+        let sample = "\
+# leading comment
+# another comment
+.claude
+
+CLAUDE.md
+   docs
+\t# indented comment
+infrastructure
+";
+        let parsed = parse_managed_paths_text(sample);
+        assert_eq!(
+            parsed,
+            vec![".claude", "CLAUDE.md", "docs", "infrastructure"],
+            "parse rules drifted: lines are trimmed, blank lines and \
+             #-prefixed lines are skipped (no inline comments)."
+        );
     }
 
     // ─── Bug 18: RAM detection ─────────────────────────────────────
