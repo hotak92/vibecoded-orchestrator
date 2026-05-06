@@ -49,9 +49,21 @@ services:
 
   # Code embedding service (GPU — only started with --gpu flag or GPU compose overlay)
   # CPU users: set CODE_EMBED_BACKEND=ollama in .env to use Ollama fallback instead
+  #
+  # PR-2 portability fix 2026-05-06: build context is env-var-overridable so
+  # the compose file works both in the orchestrator clone (where the source
+  # tree sits at ../claude_mcp_servers/code_embedding_service) AND in user
+  # projects, where the source tree is NOT bundled. The `gpu` profile gate
+  # below means CPU users never trigger this build at all; GPU users in a
+  # per-project layout must either:
+  #   (a) point VCT_CODE_EMBED_BUILD_CONTEXT at the orchestrator clone's
+  #       claude_mcp_servers/code_embedding_service path, OR
+  #   (b) keep the service orchestrator-only (don't enable the gpu profile
+  #       on user-project compose runs), OR
+  #   (c) switch to CODE_EMBED_BACKEND=ollama and skip this service.
   code_embed:
     build:
-      context: ../claude_mcp_servers/code_embedding_service
+      context: ${VCT_CODE_EMBED_BUILD_CONTEXT:-../claude_mcp_servers/code_embedding_service}
       dockerfile: Dockerfile
     # Kept as `vct_code_embed` (historical) — the launcher's
     # types.rs::command and volumes.rs::volume_role still reference this

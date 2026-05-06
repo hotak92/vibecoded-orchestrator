@@ -22,9 +22,20 @@ from typing import List, Dict, Tuple
 from datetime import datetime
 import re
 
-# Add MCP server to path
+# Add MCP server to path.
+#
+# PR-2 portability (2026-05-06): claude_mcp_servers/ only lives in the
+# orchestrator clone, not in user projects. Prefer $VCT_ORCHESTRATOR_ROOT
+# (set by .claude/env), fall back to in-tree resolution. This script uses
+# weaviate's Python client directly (no MCP package symbols imported), so
+# the sys.path entry is only kept for the legacy ~/.claude/workflow/scripts
+# helpers (which may also live alongside the MCP package on dev hosts).
 sys.path.insert(0, str(Path.home() / ".claude" / "workflow" / "scripts"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "claude_mcp_servers"))
+_env_root = os.environ.get("VCT_ORCHESTRATOR_ROOT", "").strip()
+if _env_root and (Path(_env_root) / "claude_mcp_servers").is_dir():
+    sys.path.insert(0, str(Path(_env_root) / "claude_mcp_servers"))
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "claude_mcp_servers"))
 
 import weaviate
 from weaviate.classes.query import Filter, MetadataQuery
