@@ -3,8 +3,10 @@
 //! All state that outlives a single launcher session lives here (apart from
 //! secrets, which go to the OS keychain — see `crate::secrets`).
 //!
-//! The DB lives at `~/.vct/launcher.db`. It is opened in WAL mode so reads
-//! don't block writers and so crashed writes don't corrupt the file.
+//! The DB lives at `<VCT_STATE_DIR or ~/.vct>/launcher.db` (Bug 14:
+//! VCT_STATE_DIR overrides for dev/prod isolation; see `crate::paths::vct_root_dir`).
+//! It is opened in WAL mode so reads don't block writers and so crashed
+//! writes don't corrupt the file.
 //!
 //! We use synchronous `rusqlite` calls wrapped in `tokio::task::spawn_blocking`
 //! at the call sites in `commands/*.rs`. Each command captures the `DbPool`
@@ -28,12 +30,11 @@ pub mod slug;
 pub mod change_log;
 pub mod code_graph_builds;
 pub mod secret_active;
+pub mod app_state;
 
-/// Resolve the launcher DB path: `~/.vct/launcher.db`.
+/// Resolve the launcher DB path: `<VCT_STATE_DIR or ~/.vct>/launcher.db`.
 pub fn db_path() -> PathBuf {
-    directories::UserDirs::new()
-        .map(|d| d.home_dir().join(".vct").join("launcher.db"))
-        .unwrap_or_else(|| PathBuf::from(".vct/launcher.db"))
+    crate::paths::vct_root_dir().join("launcher.db")
 }
 
 /// Thread-safe connection handle stored in Tauri managed state.
@@ -50,7 +51,7 @@ impl Db {
         let path = db_path();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
-                .map_err(|e| format!("create ~/.vct/: {}", e))?;
+                .map_err(|e| format!("create {}: {}", parent.display(), e))?;
         }
 
         let conn = Connection::open(&path)

@@ -293,8 +293,9 @@ fn builtin_catalog_entries(db: &Db) -> Vec<ModuleCatalogEntry> {
 /// uninstalled modules too.
 fn catalog_scan_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    if let Some(home) = directories::UserDirs::new() {
-        let modules = home.home_dir().join(".vct").join("modules");
+    let vct_root = crate::paths::vct_root_dir();
+    {
+        let modules = vct_root.join("modules");
         if modules.is_dir() {
             if let Ok(entries) = std::fs::read_dir(&modules) {
                 for e in entries.flatten() {
@@ -306,7 +307,7 @@ fn catalog_scan_paths() -> Vec<PathBuf> {
             }
         }
         // Also scan bundled-with-launcher manifests, if present.
-        let bundled = home.home_dir().join(".vct").join("bundled_manifests");
+        let bundled = vct_root.join("bundled_manifests");
         if bundled.is_dir() {
             if let Ok(entries) = std::fs::read_dir(&bundled) {
                 for e in entries.flatten() {
@@ -518,11 +519,9 @@ pub async fn uninstall_module_v2(
 
     if purge_data {
         // Scrub {VCT_DATA}/{MODULE_ID}/ when user explicitly asked to wipe.
-        if let Some(home) = directories::UserDirs::new() {
-            let data_dir = home.home_dir().join(".vct").join("data").join(&module_id);
-            if data_dir.exists() {
-                let _ = tokio::fs::remove_dir_all(&data_dir).await;
-            }
+        let data_dir = crate::paths::vct_root_dir().join("data").join(&module_id);
+        if data_dir.exists() {
+            let _ = tokio::fs::remove_dir_all(&data_dir).await;
         }
     }
 

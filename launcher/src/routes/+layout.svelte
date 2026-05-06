@@ -5,6 +5,7 @@
   import { page } from '$app/stores';
   import { ui } from '$lib/stores/ui';
   import { orchestrator } from '$lib/stores/orchestrator';
+  import { isOnboardingComplete, clearOnboardingComplete } from '$lib/onboarding';
   import { onMount } from 'svelte';
 
   import MenuBar from '$lib/components/MenuBar.svelte';
@@ -75,30 +76,38 @@
 
   onMount(() => {
     // Check onboarding / changelog gates once per app load.
-    try {
-      // Bug 14: `vct.onboarding_force` is set by Settings → Preferences →
-      // Run setup wizard. Honor it ahead of the normal "completed" check so
-      // users with a populated ~/.vct/launcher.db can still re-trigger the
-      // wizard on demand. We clear the force flag immediately so it only
-      // fires once.
-      // 2026-04-28: distinguish explicit re-run (forced=true, came in
-      // via a SettingsPanel reload that set vct.onboarding_force) from
-      // first-launch auto-open (no flag, just the absence of
-      // vct.onboarding_complete). The wizard's preflight uses this to
-      // decide whether to auto-close on "projects already exist".
-      const forced = localStorage.getItem('vct.onboarding_force') === '1';
-      if (forced) {
-        localStorage.removeItem('vct.onboarding_force');
-        localStorage.removeItem('vct.onboarding_complete');
-        ui.openOnboarding(); // sets onboardingForced=true in the store
-      } else if (localStorage.getItem('vct.onboarding_complete') !== 'true') {
-        ui.autoOpenOnboarding(); // first-launch auto-open; preflight may auto-close
+    //
+    // Bug 14 fix (2026-05-05): the `onboarding_complete` flag now lives in
+    // launcher.db (via crate::paths::vct_root_dir) instead of WebView
+    // localStorage, so VCT_STATE_DIR isolation actually works. The
+    // `onboarding_force` flag stays in localStorage — it's a one-shot
+    // signal from the Settings page that gets consumed on the very next
+    // mount, never crosses launcher instances.
+    //
+    // The async wrapper handles a one-shot localStorage→DB upgrade for
+    // existing users so they don't see the wizard again after this fix
+    // ships.
+    (async () => {
+      try {
+        const forced = localStorage.getItem('vct.onboarding_force') === '1';
+        if (forced) {
+          localStorage.removeItem('vct.onboarding_force');
+          await clearOnboardingComplete();
+          ui.openOnboarding(); // sets onboardingForced=true in the store
+        } else {
+          const complete = await isOnboardingComplete();
+          if (!complete) {
+            ui.autoOpenOnboarding(); // first-launch auto-open; preflight may auto-close
+          }
+        }
+        if (localStorage.getItem('vct.show_changelog_after_update') === '1') {
+          localStorage.removeItem('vct.show_changelog_after_update');
+          showChangelog = true;
+        }
+      } catch (e) {
+        console.warn('[layout] onboarding gate failed:', e);
       }
-      if (localStorage.getItem('vct.show_changelog_after_update') === '1') {
-        localStorage.removeItem('vct.show_changelog_after_update');
-        showChangelog = true;
-      }
-    } catch {}
+    })();
 
     // Start the change-log poller (P7). Re-fetches the project list
     // whenever any window mutates `projects`. Other stores subscribe to

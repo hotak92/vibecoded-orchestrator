@@ -4,6 +4,7 @@ mod hub;
 mod installer_engine;
 mod manifest;
 mod mcp_registration;
+mod paths;
 mod quit_dialog;
 mod registry;
 mod secrets;
@@ -100,6 +101,14 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            // App-state key-value table — backs the Bug 14 fix that moved
+            // `vct.onboarding_complete` and similar flags out of the
+            // WebView's localStorage into launcher.db so VCT_STATE_DIR
+            // isolation works. See db/app_state.rs + commands/app_state_cmd.rs.
+            commands::app_state_cmd::app_state_get,
+            commands::app_state_cmd::app_state_set,
+            commands::app_state_cmd::app_state_get_bool,
+            commands::app_state_cmd::app_state_set_bool,
             // Container-services lifecycle (Podman/Docker compose).
             // App-launch suite (launch_app/kill_app/get_app_status/etc.) was
             // archived 2026-04-28: zero FE consumers (Svelte) and zero Hub
@@ -318,9 +327,7 @@ pub fn run() {
 }
 
 fn load_projects_from_disk() -> HashMap<String, types::Project> {
-    let path = directories::UserDirs::new()
-        .map(|d| d.home_dir().join(".vct").join("projects.json"))
-        .unwrap_or_else(|| ".vct/projects.json".into());
+    let path = paths::vct_root_dir().join("projects.json");
 
     if !path.exists() {
         return HashMap::new();

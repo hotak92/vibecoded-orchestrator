@@ -5,6 +5,7 @@
   import { projects } from '$lib/stores/projects';
   import { pickDirectory, suggestProjectFolder } from '$lib/dialog';
   import { isTauriRuntime } from '$lib/tauri';
+  import { isOnboardingComplete, markOnboardingComplete } from '$lib/onboarding';
   import DialogRoot from '$lib/components/DialogRoot.svelte';
 
   let {
@@ -43,7 +44,10 @@
 
   const inTauri = isTauriRuntime();
 
-  const KEY = 'vct.onboarding_complete';
+  // Bug 14 fix (2026-05-05): the `onboarding_complete` flag now lives in
+  // launcher.db (via $lib/onboarding helpers). The previous localStorage
+  // key `vct.onboarding_complete` is migrated on first DB read; see
+  // $lib/onboarding for the upgrade logic.
 
   let step = $state<1 | 2 | 3 | 4>(1);
 
@@ -451,7 +455,7 @@
     } catch {
       // Non-fatal — at worst the project is still listed; user can pick it.
     }
-    try { localStorage.setItem(KEY, 'true'); } catch {}
+    try { void markOnboardingComplete(); } catch {}
     onClose?.();
     onComplete?.();
   }
@@ -470,7 +474,7 @@
       await projects.create(name, path, 'base');
       toast.success(`Project "${name}" recreated`);
       duplicateProjectPrompt = null;
-      try { localStorage.setItem(KEY, 'true'); } catch {}
+      try { void markOnboardingComplete(); } catch {}
       onClose?.();
       onComplete?.();
     } catch (e) {
@@ -518,7 +522,7 @@
         await projects.create(projectName.trim(), conflict.install_path, 'base');
         toast.success(`Project "${projectName.trim()}" created`);
         // Trigger the same close-on-success flow as the regular finish.
-        try { localStorage.setItem(KEY, 'true'); } catch {}
+        try { void markOnboardingComplete(); } catch {}
         onClose?.();
         onComplete?.();
       } catch (e) {
@@ -632,7 +636,7 @@
         creatingProject = false;
       }
     }
-    try { localStorage.setItem(KEY, 'true'); } catch {}
+    try { void markOnboardingComplete(); } catch {}
     onClose?.();
     onComplete?.();
   }
@@ -717,7 +721,7 @@
   // until the user creates one from the main UI; that's fine — better
   // than a wizard that won't go away. Reported 2026-04-28.
   function skip() {
-    try { localStorage.setItem(KEY, 'true'); } catch {}
+    try { void markOnboardingComplete(); } catch {}
     pendingConflict = null;
     conflictResumeStep4 = false;
     creatingProject = false;
@@ -762,7 +766,7 @@
       try {
         const projects = await invoke<unknown[]>('list_projects_v2');
         if (!force && Array.isArray(projects) && projects.length > 0) {
-          try { localStorage.setItem(KEY, 'true'); } catch {}
+          try { void markOnboardingComplete(); } catch {}
           onClose?.();
           preflightChecked = true;
           onComplete?.();
@@ -794,9 +798,14 @@
     void preflightSkipIfAlreadyInstalled();
   });
 
-  export function shouldShow(): boolean {
-    try { return localStorage.getItem(KEY) !== 'true'; }
-    catch { return true; }
+  // Async sibling of the now-removed sync `shouldShow` export. The
+  // launcher.db check is async, so external callers MUST await this.
+  // Currently no Svelte caller imports this export directly — the gate
+  // lives in routes/+layout.svelte via `isOnboardingComplete()` from
+  // `$lib/onboarding`. Kept as a thin re-export so external consumers
+  // (CLI, embedded preview tools) still have a stable surface.
+  export async function shouldShow(): Promise<boolean> {
+    return !(await isOnboardingComplete());
   }
 </script>
 

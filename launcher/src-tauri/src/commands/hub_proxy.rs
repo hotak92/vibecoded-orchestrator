@@ -8,9 +8,7 @@ use serde_json::Value;
 use tauri::command;
 
 fn hub_port() -> Result<u16, String> {
-    let path = directories::UserDirs::new()
-        .map(|d| d.home_dir().join(".vct").join("hub.port"))
-        .ok_or("home dir not found")?;
+    let path = crate::paths::vct_root_dir().join("hub.port");
     let raw = std::fs::read_to_string(&path).map_err(|e| format!("read hub.port: {}", e))?;
     raw.trim()
         .parse::<u16>()

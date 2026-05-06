@@ -1,10 +1,22 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
+  import { getVersion } from '@tauri-apps/api/app';
   import { auth, currentUser } from '$lib/stores/auth';
   import { settings } from '$lib/stores/settings';
   import { ui } from '$lib/stores/ui';
   import { invoke } from '$lib/tauri';
+  import { clearOnboardingComplete } from '$lib/onboarding';
   import SecretsPanel from './SecretsPanel.svelte';
   import DialogRoot from '$lib/components/DialogRoot.svelte';
+
+  let appVersion = $state('');
+  onMount(async () => {
+    try {
+      appVersion = await getVersion();
+    } catch {
+      appVersion = '';
+    }
+  });
 
   let { open = $bindable(false) }: { open: boolean } = $props();
 
@@ -233,15 +245,18 @@
     { id: 'about' as const, label: 'About' },
   ];
 
-  // Bug 14: onboarding can only ever fire once because it gates on
-  // `vct.onboarding_complete` in localStorage. Users with a populated
-  // ~/.vct/launcher.db never see it again. Set a force flag here that the
-  // root layout reads on next reload to re-mount the wizard.
-  function rerunOnboarding() {
+  // Bug 14 fix (2026-05-05): onboarding-completion now lives in launcher.db
+  // (per VCT_STATE_DIR-isolated paths). Re-running clears the DB flag via
+  // the `clearOnboardingComplete` helper, then sets a one-shot localStorage
+  // signal `vct.onboarding_force` that survives only until the next layout
+  // mount (which consumes + deletes it). The signal stays in localStorage
+  // because it's request-scoped, not state-scoped — it never crosses
+  // launcher instances.
+  async function rerunOnboarding() {
+    await clearOnboardingComplete();
     try {
       localStorage.setItem('vct.onboarding_force', '1');
-      localStorage.removeItem('vct.onboarding_complete');
-    } catch {}
+    } catch { /* ignore */ }
     open = false;
     // Trigger a reload so layout's onMount re-evaluates the gate. Avoids
     // having to plumb the force flag through Svelte stores.
@@ -492,7 +507,7 @@
               </div>
               <div>
                 <p class="about-name">VCT Launcher</p>
-                <p class="about-version">v0.1.0</p>
+                <p class="about-version">{appVersion ? `v${appVersion}` : ''}</p>
               </div>
             </div>
             <div class="about-rows">
