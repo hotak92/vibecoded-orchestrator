@@ -345,13 +345,20 @@ async fn project_env(
                 "shared" => "shared",
                 _ => "per_project",
             };
-            // Active-flag gate. `is_secret_active` defaults to true
-            // when no row exists, so secrets that pre-existed
+            // Active-flag gate (cross-launcher, Option γ — PR-3 Commit 4).
+            // The OS keychain is shared across dev/prod launchers, so a
+            // pause anywhere must take effect everywhere. Walks the own
+            // DB plus every discovered sibling launcher.db; refuses to
+            // serve if ANY says inactive. `is_secret_active` defaults to
+            // true when no row exists, so secrets that pre-existed
             // migration 007 still resolve normally.
-            let active = h
-                .0
-                .is_secret_active(scope_str, &project.id, &manifest.id, &s.key)
-                .unwrap_or(true);
+            let active = crate::db::secret_active::is_secret_active_cross_launcher(
+                &h.0,
+                scope_str,
+                &project.id,
+                &manifest.id,
+                &s.key,
+            );
             if !active {
                 continue;
             }
@@ -387,9 +394,11 @@ pub(crate) fn resolve_secret_for_subprocess_env(
     module_id: &str,
     key: &str,
 ) -> Option<String> {
-    let active = db
-        .is_secret_active(scope_str, project_id, module_id, key)
-        .unwrap_or(true);
+    // PR-3 Commit 4: cross-launcher pause check (Option γ). A secret
+    // paused in any launcher's DB blocks the read here.
+    let active = crate::db::secret_active::is_secret_active_cross_launcher(
+        db, scope_str, project_id, module_id, key,
+    );
     if !active {
         return None;
     }
