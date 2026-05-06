@@ -232,4 +232,19 @@ echo "Using Python: $PYTHON ($("$PYTHON" --version))"
 # Change to script directory
 cd "$(dirname "$0")"
 
-exec "$PYTHON" install.py "$@"
+# Translate install.sh-only flags to ones install.py accepts.
+# install.sh advertises --non-interactive in its own help (used to skip
+# the Python auto-install prompt). Earlier versions forwarded the literal
+# string to install.py, which argparse-rejected because install.py only
+# knows --yes / --quiet. Translate before forwarding so the public flag
+# surface stays consistent. (Reported 2026-05-06: bash first-install.sh
+# --non-interactive failed with "unrecognized arguments: --non-interactive".)
+INSTALL_PY_ARGS=()
+for arg in "$@"; do
+    case "$arg" in
+        --non-interactive) INSTALL_PY_ARGS+=("--yes") ;;
+        *) INSTALL_PY_ARGS+=("$arg") ;;
+    esac
+done
+
+exec "$PYTHON" install.py "${INSTALL_PY_ARGS[@]}"

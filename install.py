@@ -1993,6 +1993,13 @@ def main() -> int:
     # (nothing accumulates); on update runs, any unresolved conditions land here.
     _deferral_report.write(_deferral_folder)
 
+    # Drop the install-manifest at state/install-manifest.json so the launcher
+    # (and operators auditing an install) can verify install actually finished.
+    # Earlier the launcher inferred "installed" from .venv/ presence, which
+    # produced false positives on developer source checkouts that had a venv
+    # but no install.py run (false-positive observed in wizard 2026-05-06).
+    _write_install_manifest(sysinfo, args, install_method="install.py")
+
     print()
     print("=" * 62)
     print("  Installation complete!")
@@ -5103,6 +5110,160 @@ def _create_state_directory() -> None:
         "state/logs/ directory present",
         data={"state_dir": str(state_dir)},
     )
+
+
+# ---------------------------------------------------------------------------
+# Install manifest — written at end of successful install
+# ---------------------------------------------------------------------------
+
+INSTALL_MANIFEST_SCHEMA_VERSION = 1
+
+
+def _read_tauri_version() -> str | None:
+    """Read the canonical version string from launcher/src-tauri/tauri.conf.json.
+
+    This is the single source of truth for "what version is this install?"
+    (matches the version baked into the launcher binary by Tauri at build
+    time — see commands/licensing.rs::DEFAULT_VALIDATE_TIER_URL section in
+    tauri.conf.json). Returns None if the file is missing (CLI-only install
+    without a launcher tree)."""
+    conf = PROJECT_ROOT / "launcher" / "src-tauri" / "tauri.conf.json"
+    if not conf.is_file():
+        return None
+    try:
+        with conf.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        v = data.get("version")
+        return str(v) if v else None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _read_git_rev() -> tuple[str | None, str | None]:
+    """Best-effort: read current commit + branch from .git/. Returns
+    (commit, branch). Either may be None if .git/ is missing or the
+    repo is in a detached state we can't parse simply."""
+    git_dir = PROJECT_ROOT / ".git"
+    if not git_dir.exists():
+        return (None, None)
+    head = git_dir / "HEAD"
+    if not head.is_file():
+        return (None, None)
+    try:
+        head_content = head.read_text(encoding="utf-8").strip()
+    except OSError:
+        return (None, None)
+    if head_content.startswith("ref: "):
+        ref_path = head_content[5:].strip()
+        branch = ref_path.split("/")[-1] if "/" in ref_path else ref_path
+        ref_file = git_dir / ref_path
+        try:
+            commit = ref_file.read_text(encoding="utf-8").strip() if ref_file.is_file() else None
+        except OSError:
+            commit = None
+        return (commit, branch)
+    # Detached HEAD — head_content is the commit hash itself.
+    return (head_content, None)
+
+
+def _write_install_manifest(sysinfo, args, install_method: str = "install.py") -> None:
+    """Write state/install-manifest.json. Idempotent: an existing manifest
+    is replaced, with the prior `installed_at` preserved when present so
+    the field semantically means "first ever successful install" not
+    "most recent install run".
+
+    install_method:
+      - "install.py"        — direct invocation (CLI / first-install.sh path)
+      - "wizard"            — Tauri install_orchestrator command
+      - "update"            — re-run with --update flag
+
+    Failures are logged but never raised — the install IS complete by the
+    time we reach this; manifest absence is recoverable, install rollback
+    isn't.
+    """
+    state_dir = PROJECT_ROOT / "state"
+    manifest_path = state_dir / "install-manifest.json"
+
+    # Preserve original installed_at if a prior manifest exists (update path).
+    installed_at = _utc_iso_now()
+    if manifest_path.is_file():
+        try:
+            with manifest_path.open("r", encoding="utf-8") as f:
+                prior = json.load(f)
+            prior_installed_at = prior.get("installed_at")
+            if isinstance(prior_installed_at, str) and prior_installed_at:
+                installed_at = prior_installed_at
+                # Update path: re-running install.py with --update.
+                if install_method == "install.py" and getattr(args, "update", False):
+                    install_method = "update"
+        except (OSError, json.JSONDecodeError):
+            # Corrupt / unreadable prior manifest — overwrite cleanly.
+            pass
+
+    commit, branch = _read_git_rev()
+
+    skipped = {
+        "joern":   getattr(args, "no_joern", False),
+        "agents":  getattr(args, "no_agents", False),
+        "skills":  getattr(args, "no_skills", False),
+        "hooks":   getattr(args, "no_hooks", False),
+        "containers": getattr(args, "no_containers", False),
+        "models":  getattr(args, "skip_models", False),
+        "compile": getattr(args, "no_compile", False),
+        "lean_ctx": getattr(args, "no_lean_ctx", False),
+    }
+
+    # Volume mountpoints — capture which named/host paths the compose stack
+    # is bound to. Best-effort: we read them from the docker-compose.override.yml
+    # if it exists, else fall back to the defaults documented in the compose file.
+    volumes: dict = {"managed_by": None, "paths": {}}
+    override = PROJECT_ROOT / "infrastructure" / "docker-compose.override.yml"
+    if override.is_file():
+        volumes["managed_by"] = "override"
+        # We don't parse YAML here to keep zero deps. The override file is
+        # short — leave it as a path the operator can inspect.
+        volumes["override_path"] = str(override)
+    else:
+        volumes["managed_by"] = "default"
+
+    manifest = {
+        "schema_version":   INSTALL_MANIFEST_SCHEMA_VERSION,
+        "installed":        True,
+        "installed_at":     installed_at,
+        "completed_at":     _utc_iso_now(),
+        "version":          _read_tauri_version(),
+        "source_commit":    commit,
+        "source_branch":    branch,
+        "install_method":   install_method,
+        "python_version":   "%d.%d.%d" % (sys.version_info[0], sys.version_info[1], sys.version_info[2]),
+        "python_executable": sys.executable,
+        "container_runtime": getattr(sysinfo, "container_cmd", None),
+        "cpu_only":         bool(getattr(args, "cpu_only", False)),
+        "use_gpu":          bool(getattr(args, "gpu", False)),
+        "low_resource":     bool(getattr(args, "low_resource", False)),
+        "skipped":          skipped,
+        "vct_state_dir":    os.environ.get("VCT_STATE_DIR") or None,
+        "install_path":     str(PROJECT_ROOT),
+        "volumes":          volumes,
+    }
+
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        with manifest_path.open("w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        _log_install_event(
+            "manifest", "ok",
+            "wrote install-manifest.json",
+            data={"path": str(manifest_path), "version": manifest["version"]},
+        )
+    except OSError as exc:
+        # Don't fail the install for this — it's diagnostic metadata, not
+        # required for operation.
+        _log_install_event(
+            "manifest", "warn",
+            f"could not write install-manifest.json: {exc}",
+        )
 
 
 # ---------------------------------------------------------------------------
