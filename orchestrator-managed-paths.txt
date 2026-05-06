@@ -1,0 +1,25 @@
+# Hard whitelist of paths the orchestrator install allows to copy
+# from `source` into `install_path`. Anything else at the source is
+# left behind; anything else at the install_path is left untouched.
+#
+# Edited here ONLY. Both Rust (installer.rs) and Python (install.py)
+# read this file at compile time / import time.
+#
+# Parse rules (kept identical across languages):
+#   - Lines are stripped of leading/trailing whitespace.
+#   - Empty lines are skipped.
+#   - Lines whose first non-whitespace character is `#` are comments
+#     and are skipped entirely (no inline comments — `#` is only a
+#     line prefix).
+#
+# Self-reference: this file is itself listed below so that
+# `update_orchestrator_at` propagates a freshly-edited version into
+# every existing install when the user pulls a new VCO clone.
+.claude
+CLAUDE.md
+knowledge
+docs
+tools
+infrastructure
+vct-module.json
+orchestrator-managed-paths.txt
