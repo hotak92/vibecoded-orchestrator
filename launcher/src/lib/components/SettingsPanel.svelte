@@ -233,6 +233,79 @@
     launchOnStartup = s.launchOnStartup;
   });
 
+  // PR-3 Commit 7 (2026-05-06): ACTIVE_EMBEDDING UI. The launcher used
+  // to bake `ACTIVE_EMBEDDING` once at install time (install.py:5571-5575)
+  // and never expose a way to change it post-install. Per-project envs
+  // never carried it at all — see launcher-settings-propagation-audit-2026-05-06.md
+  // §7. Now backed by `app_state` key `embedding.active_profile`; the
+  // value flows into per-project envs via `ProjectEnvSettings::populate`
+  // (Commit 1).
+  type EmbeddingProfile = 'qwen3' | 'arctic' | 'codesage' | 'openai';
+  // Match `ProjectEnvSettings::DEFAULT_ACTIVE_EMBEDDING` in
+  // commands/project_env_settings.rs.
+  const APP_STATE_KEY_ACTIVE_EMBEDDING = 'embedding.active_profile';
+  const EMBEDDING_DEFAULT: EmbeddingProfile = 'qwen3';
+  let activeEmbedding = $state<EmbeddingProfile>(EMBEDDING_DEFAULT);
+  let activeEmbeddingLoading = $state(false);
+  let activeEmbeddingSaving = $state(false);
+  let activeEmbeddingError = $state<string | null>(null);
+  let activeEmbeddingSaved = $state(false);
+
+  async function loadActiveEmbedding() {
+    activeEmbeddingLoading = true;
+    activeEmbeddingError = null;
+    try {
+      const res = await invoke<{ key: string; is_set: boolean; value: string | null }>(
+        'app_state_get',
+        { key: APP_STATE_KEY_ACTIVE_EMBEDDING },
+      );
+      if (res.is_set && res.value) {
+        // Defensive: if a future profile name is added but the UI doesn't
+        // know about it, fall through to default rather than rendering
+        // a broken `<select>` value.
+        const known: EmbeddingProfile[] = ['qwen3', 'arctic', 'codesage', 'openai'];
+        if ((known as string[]).includes(res.value)) {
+          activeEmbedding = res.value as EmbeddingProfile;
+        } else {
+          console.warn('Unknown active_embedding value, falling back to default:', res.value);
+          activeEmbedding = EMBEDDING_DEFAULT;
+        }
+      } else {
+        activeEmbedding = EMBEDDING_DEFAULT;
+      }
+    } catch (e) {
+      activeEmbeddingError = String(e);
+    } finally {
+      activeEmbeddingLoading = false;
+    }
+  }
+
+  async function saveActiveEmbedding(value: EmbeddingProfile) {
+    activeEmbeddingSaving = true;
+    activeEmbeddingError = null;
+    activeEmbeddingSaved = false;
+    try {
+      await invoke<void>('app_state_set', {
+        key: APP_STATE_KEY_ACTIVE_EMBEDDING,
+        value,
+      });
+      activeEmbedding = value;
+      activeEmbeddingSaved = true;
+      setTimeout(() => { activeEmbeddingSaved = false; }, 2000);
+    } catch (e) {
+      activeEmbeddingError = String(e);
+    } finally {
+      activeEmbeddingSaving = false;
+    }
+  }
+
+  // Load once when the user opens Preferences.
+  $effect(() => {
+    if (activeSection === 'preferences' && !activeEmbeddingLoading) {
+      void loadActiveEmbedding();
+    }
+  });
+
   function handleKeydown(e: KeyboardEvent) {
     if (e.key === 'Escape') open = false;
   }
@@ -413,6 +486,46 @@
                 </li>
               </ul>
               <button class="btn-3d" onclick={refreshServices}>Refresh</button>
+            {/if}
+          </div>
+
+          <!-- PR-3 Commit 7 (2026-05-06): ACTIVE_EMBEDDING setting.
+               Controls which embedding model the orchestrator uses
+               cluster-wide. Persisted to launcher.db `app_state` table
+               under `embedding.active_profile`; flows into per-project
+               envs via the create-project / rename / shared-KG-toggle
+               paths (see commands/project_env_settings.rs). -->
+          <div class="form-group" style="margin-top: 18px;">
+            <h4 class="subsection-title">Embedding profile</h4>
+            <p class="form-hint" style="margin: 0 0 8px;">
+              Which model the launcher uses for KG / Codegraph embeddings.
+              Changing this affects every project created or refreshed
+              from now on; existing collections keep their stored
+              embeddings until re-synced.
+            </p>
+            <label for="settings-active-embedding" class="form-label-inline">Active profile</label>
+            <select
+              id="settings-active-embedding"
+              class="form-input form-input-sm"
+              value={activeEmbedding}
+              onchange={(e) => {
+                const target = e.currentTarget as HTMLSelectElement;
+                void saveActiveEmbedding(target.value as EmbeddingProfile);
+              }}
+              disabled={activeEmbeddingLoading || activeEmbeddingSaving}
+            >
+              <option value="qwen3">qwen3 (1024-dim, default)</option>
+              <option value="arctic">arctic (1024-dim, legacy)</option>
+              <option value="codesage">codesage (2048-dim, code-only)</option>
+              <option value="openai">openai (3072-dim, paid)</option>
+            </select>
+            {#if activeEmbeddingSaving}
+              <span class="form-hint" style="margin-left: 8px;">Saving…</span>
+            {:else if activeEmbeddingSaved}
+              <span class="save-msg" style="margin-left: 8px;">Saved!</span>
+            {/if}
+            {#if activeEmbeddingError}
+              <p class="form-hint" style="color: #f99;">Couldn't save: {activeEmbeddingError}</p>
             {/if}
           </div>
 
