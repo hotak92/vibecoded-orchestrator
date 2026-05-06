@@ -116,26 +116,36 @@ pub struct InstallDiff {
 /// Hard whitelist of paths the orchestrator install is allowed to touch
 /// at the project root. Everything else is treated as user code.
 ///
-/// Keep this list in sync with the bundled install manifest (BOOTSTRAP.md
-/// and install.py). The frontend mirrors a humanized version in the
-/// confirm modal.
+/// **Architectural intent (2026-05-06):** ONE VCO clone is shared by all
+/// projects; per-project folders never receive the orchestrator's own
+/// machinery. Entries here must be either (a) project-meaningful
+/// configuration / docs that legitimately live alongside a user project
+/// (`.claude/`, `CLAUDE.md`, `knowledge/`, `docs/`, `tools/`,
+/// `infrastructure/`) or (b) the version-pinning manifest the launcher
+/// reads to detect an existing install (`vct-module.json`).
+///
+/// **Explicitly excluded:** `install.py` / `install.sh` / `install.ps1`
+/// (orchestrator entry points), `state/` (per-install metadata; the
+/// 2026-05 VideoFrames over-copy bug traced to this entry being copied
+/// into a user project), `claude_mcp_servers/` (orchestrator-only Python
+/// package, never installed into projects — see install-paths-audit
+/// 2026-05-06 §B and install-adaptation-audit Gap #1), `templates/`
+/// (the SOURCE for `_enumerate_bundle_files` per-project bundle
+/// installs, never the destination), `requirements*.txt` (orchestrator's
+/// own Python deps), `BOOTSTRAP.md` (orchestrator setup doc), `config/`
+/// (legacy entry, directory does not exist in the repo).
+///
+/// Used by `copy_orchestrator_to_sync` (`update_orchestrator_at` +
+/// `install_orchestrator`'s plain-copy path), `apply_conflict_strategy`,
+/// `classify_install_target`, and `diff_install`. The frontend mirrors a
+/// humanized version in the confirm modal.
 pub const ORCHESTRATOR_MANAGED_PATHS: &[&str] = &[
     ".claude",
     "CLAUDE.md",
     "knowledge",
-    "claude_mcp_servers",
-    "state",
-    "config",
     "docs",
-    "templates",
     "tools",
     "infrastructure",
-    "requirements.txt",
-    "requirements-dev.txt",
-    "install.sh",
-    "install.ps1",
-    "install.py",
-    "BOOTSTRAP.md",
     "vct-module.json",
 ];
 
@@ -3309,6 +3319,55 @@ mod tests {
         assert!(err.contains("not an orchestrator repo"));
         fs::remove_dir_all(&source).ok();
         fs::remove_dir_all(&target).ok();
+    }
+
+    /// 2026-05-06 (PR-1, install-flow): the managed-paths whitelist must
+    /// NOT include orchestrator-only machinery. The VideoFrames anomaly
+    /// (project folder receiving `install.py` + `state/install-manifest.json`)
+    /// traced to those two entries being in this list and reachable via
+    /// `copy_orchestrator_to_sync`. See `.claude/context/install-paths-
+    /// audit-2026-05-06.md` §B and §J recommendation #1 for the full
+    /// rationale. The architectural intent is ONE VCO clone shared by
+    /// all projects; per-project folders never receive orchestrator
+    /// entry points or per-install metadata.
+    #[test]
+    fn test_managed_paths_excludes_orchestrator_only_files() {
+        let banned: &[&str] = &[
+            "install.py",
+            "install.sh",
+            "install.ps1",
+            "state",
+            "claude_mcp_servers",
+            "templates",
+            "requirements.txt",
+            "requirements-dev.txt",
+            "BOOTSTRAP.md",
+            "config",
+        ];
+        for entry in banned {
+            assert!(
+                !ORCHESTRATOR_MANAGED_PATHS.contains(entry),
+                "ORCHESTRATOR_MANAGED_PATHS must not contain orchestrator-only entry {:?} \
+                 (project folders should never receive it via copy_orchestrator_to_sync)",
+                entry,
+            );
+        }
+        // Sanity: the trimmed list still contains the project-meaningful
+        // entries the launcher relies on for detecting / refreshing an
+        // installed orchestrator.
+        for required in &[
+            ".claude",
+            "CLAUDE.md",
+            "knowledge",
+            "docs",
+            "vct-module.json",
+        ] {
+            assert!(
+                ORCHESTRATOR_MANAGED_PATHS.contains(required),
+                "ORCHESTRATOR_MANAGED_PATHS missing project-meaningful entry {:?}",
+                required,
+            );
+        }
     }
 
     // ─── Bug 18: RAM detection ─────────────────────────────────────
