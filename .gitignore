@@ -157,3 +157,33 @@ claude_mcp_servers/runs/
 # Internal Lemon Squeezy inventory snapshots (contain customer/store IDs)
 docs/license/LS_INVENTORY_*.md
 docs/ADMIN_LICENSE.md
+
+# ─── RL module (Pro-tier IP — NEVER in public AGPL repo) ────────────
+# Actual model architecture, training loop, weights, and v2 log
+# schema migration live in MultiagentOrchestrator. This VCO_dev
+# clone has them in the working tree (untracked) for development
+# convenience. Explicit gitignore so `git add -A` or a stray
+# subagent commit can't accidentally publish them. Pro/MAO ships
+# the RL module as signed binary via CDN, NOT as source.
+#
+# `rl_kg_search.py` (a thin client that CALLS the RL server) is the
+# only RL-named file legitimately tracked — it's a consumer, not
+# the model/training IP. Negate it explicitly so the broader
+# pattern doesn't catch it.
+claude_mcp_servers/rl_server/
+claude_mcp_servers/scripts/rl_*.py
+!claude_mcp_servers/scripts/rl_kg_search.py
+claude_mcp_servers/scripts/migrate_rl_log_*.py
+claude_mcp_servers/scripts/offline_trainer*.py
+claude_mcp_servers/scripts/retrieval_rl*.py
+state/rl_*.pt
+state/rl_*.json
+state/rl_events*.jsonl
+state/routing_*.jsonl
+state/qlearning_*.json
+tests/test_rl_*.py
+tests/test_mcp_rl_*.py
+# Also: the import-helper that pulls RL from the upstream
+# orchestrator. Tracked elsewhere when needed.
+vco_lib/import_from_orchestrator.py
+tests/test_import_from_orchestrator.py
