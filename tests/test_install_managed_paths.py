@@ -93,6 +93,27 @@ class ParseManagedPathsTextTests(unittest.TestCase):
             install._parse_managed_paths_text("# a\n# b\n#c\n   # d\n"), ()
         )
 
+    def test_strips_utf8_bom_from_first_line(self) -> None:
+        # Saved-from-Windows-Notepad files routinely carry a UTF-8 BOM
+        # (\\ufeff) at the start. str.strip() does NOT remove it. Without
+        # explicit handling, the first allowlist entry silently fails to
+        # match — a real bug raised by the PR-5 reviewer 2026-05-06.
+        sample = "﻿.claude\nCLAUDE.md\n"
+        self.assertEqual(
+            install._parse_managed_paths_text(sample),
+            (".claude", "CLAUDE.md"),
+        )
+
+    def test_bom_only_stripped_from_start_not_inside_lines(self) -> None:
+        # Defensive: a stray BOM mid-content (not at file start) is
+        # still treated as part of the line. Real files won't have one;
+        # the test pins the conservative behavior.
+        sample = ".claude\n﻿CLAUDE.md\n"
+        self.assertEqual(
+            install._parse_managed_paths_text(sample),
+            (".claude", "﻿CLAUDE.md"),
+        )
+
     def test_returns_tuple_not_list(self) -> None:
         # Callers (e.g. iteration in copy_orchestrator_to_sync) expect
         # an immutable allowlist. A tuple makes accidental mutation a
