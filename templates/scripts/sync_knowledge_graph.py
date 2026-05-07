@@ -22,42 +22,12 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 import uuid
 
-# Resolve the claude_mcp_servers/ Python package.
-#
-# PR-2 portability strategy (2026-05-06): scripts ship to user projects via
-# the per-project bundle, but `claude_mcp_servers/` ONLY exists in the
-# orchestrator clone — it is never copied into projects. Resolution order:
-#   1. $VCT_ORCHESTRATOR_ROOT/claude_mcp_servers   (set by .claude/env)
-#   2. <project>/claude_mcp_servers                (orchestrator clone fallback)
-# When invoked from a user project where neither is reachable, we raise a
-# clear error pointing at .claude/env instead of the legacy ImportError.
-# This script needs the weaviate_mcp.chunking module — pure utility code,
-# no service runtime — so importing it directly is the right call here.
-# (vendor-via-env approach; see PR-2 for the alternatives considered.)
+# Add MCP server to path. We resolve relative to this script's location
+# rather than a hardcoded path so the script ships portable across Linux,
+# macOS, and Windows installs (audit finding 2026-04-30).
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _PROJECT_HOME = _SCRIPT_DIR.parent.parent  # .claude/scripts/X → .claude → project
-
-
-def _resolve_mcp_servers_dir() -> Path:
-    """Return the Path to claude_mcp_servers/, or raise with a helpful hint."""
-    env_root = os.environ.get("VCT_ORCHESTRATOR_ROOT", "").strip()
-    if env_root:
-        candidate = Path(env_root) / "claude_mcp_servers"
-        if candidate.is_dir():
-            return candidate
-    candidate = _PROJECT_HOME / "claude_mcp_servers"
-    if candidate.is_dir():
-        return candidate
-    raise RuntimeError(
-        "claude_mcp_servers/ not found. This script needs the orchestrator "
-        "clone's MCP package. Set VCT_ORCHESTRATOR_ROOT in your shell or in "
-        ".claude/env to point at the orchestrator clone (e.g. "
-        "VCT_ORCHESTRATOR_ROOT=/path/to/vibecoded-orchestrator)."
-    )
-
-
-_MCP_DIR = _resolve_mcp_servers_dir()
-sys.path.insert(0, str(_MCP_DIR))
+sys.path.insert(0, str(_PROJECT_HOME / "claude_mcp_servers"))
 
 import weaviate
 from weaviate.classes.query import Filter

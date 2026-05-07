@@ -23,36 +23,9 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
-# Add paths.
-#
-# PR-2 portability (2026-05-06): claude_mcp_servers/ ONLY exists in the
-# orchestrator clone, never bundled to user projects. Resolution order:
-#   1. $VCT_ORCHESTRATOR_ROOT/claude_mcp_servers (set by .claude/env)
-#   2. $CLAUDE_PROJECT_ROOT/claude_mcp_servers   (legacy override)
-#   3. <project>/claude_mcp_servers              (orchestrator clone fallback)
-# The MCP module is imported as a pure utility (chunking + collection
-# bootstrap) — no service runtime needed. See PR-2 for the design notes.
+# Add paths
 PROJECT_ROOT = Path(os.environ.get("CLAUDE_PROJECT_ROOT", str(Path(__file__).resolve().parent.parent.parent)))
-
-
-def _resolve_mcp_servers_dir() -> Path:
-    """Return the Path to claude_mcp_servers/, or raise with a hint."""
-    env_root = os.environ.get("VCT_ORCHESTRATOR_ROOT", "").strip()
-    if env_root:
-        candidate = Path(env_root) / "claude_mcp_servers"
-        if candidate.is_dir():
-            return candidate
-    candidate = PROJECT_ROOT / "claude_mcp_servers"
-    if candidate.is_dir():
-        return candidate
-    raise RuntimeError(
-        "claude_mcp_servers/ not found. Set VCT_ORCHESTRATOR_ROOT in your "
-        "shell or .claude/env to point at the orchestrator clone."
-    )
-
-
-_MCP_DIR = _resolve_mcp_servers_dir()
-sys.path.insert(0, str(_MCP_DIR / "weaviate_mcp"))
+sys.path.insert(0, str(PROJECT_ROOT / "claude_mcp_servers/weaviate_mcp"))
 
 from server import WeaviateMCPServer
 from chunking import chunk_text, TokenCounter

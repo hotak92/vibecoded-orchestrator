@@ -80,14 +80,18 @@ if [ -z "$LAUNCHER_BIN" ]; then
             echo "  - $b" >&2
         done
         echo "" >&2
-        echo "Rebuild with: bash scripts/build-bundled-launcher.sh" >&2
+        echo "Rebuild with: cd launcher && bash scripts/rebuild-dist-binary.sh" >&2
     fi
     echo "" >&2
     echo "Run ./first-install.sh first to set up VibeCoded Tools." >&2
     echo "If you already did, the launcher binary may not have been built yet." >&2
-    echo "Build it manually:" >&2
-    echo "  cd launcher && pnpm install && pnpm tauri build" >&2
-    echo "(Or: cargo build --release --manifest-path launcher/src-tauri/Cargo.toml)" >&2
+    echo "Build it with the wrapper script (handles RUSTFLAGS + tauri --no-bundle):" >&2
+    echo "  cd launcher && bash scripts/rebuild-dist-binary.sh" >&2
+    echo "" >&2
+    echo "DO NOT use 'cargo build --release' — it produces a binary with no" >&2
+    echo "embedded SvelteKit frontend that hangs at startup with" >&2
+    echo "'Could not connect to localhost'. The wrapper runs" >&2
+    echo "'pnpm tauri build --no-bundle', which is the only correct path." >&2
     exit 1
 fi
 

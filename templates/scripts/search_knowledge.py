@@ -29,18 +29,11 @@ DUAL_EMBEDDING_ENABLED = os.getenv("DUAL_EMBEDDING_ENABLED", "true").lower() == 
 # Query token limit (same as embedding limit)
 MAX_QUERY_TOKENS = 2500
 
-# Import shared tier helpers from the MCP server (single source of truth).
-# PR-2 portability (2026-05-06): the orchestrator clone is resolved via
-# $VCT_ORCHESTRATOR_ROOT (set in .claude/env) with an in-tree fallback.
-# The graceful try/except is retained because this script can run on a
-# CPU-only host without the venv — in that case --detail is silently
-# ignored. Pure utility import (no service runtime); see PR-2 design notes.
+# Import shared tier helpers from the MCP server (single source of truth)
+# Falls back to a no-op formatter if the import fails (e.g. running standalone
+# without the venv) — in that case --detail is silently ignored.
 try:
-    _env_root = os.environ.get("VCT_ORCHESTRATOR_ROOT", "").strip()
-    if _env_root and (Path(_env_root) / "claude_mcp_servers").is_dir():
-        sys.path.insert(0, str(Path(_env_root) / "claude_mcp_servers"))
-    else:
-        sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "claude_mcp_servers"))
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "claude_mcp_servers"))
     from weaviate_mcp.server import (
         _get_result_verbosity_by_score,
         _format_result_by_tier,

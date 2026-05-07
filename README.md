@@ -286,6 +286,7 @@ If the wrappers can't auto-install (for example, no `winget` on older Windows or
 | `code_embed` container fails on CPU-only host | GPU profile enabled despite no NVIDIA GPU | Run with `--cpu-only` (or `--low-resource`) — these set `CODE_EMBED_BACKEND=ollama` instead |
 | Joern download/install fails | Network blocked or JDK install rejected | Skip with `--no-joern`; install separately later from https://docs.joern.io/installation/ |
 | Hooks don't fire on Windows | Hooks ship as `.ps1` on Windows; PowerShell 5.1+ required | Install/upgrade PowerShell — Windows 10/11 ships with 5.1 by default. Legacy `.sh`-only helpers (instinct pipeline) need Git Bash for full coverage. |
+| `git pull` fails with "non-fast-forward" / launcher "Update now" errors | Clone predates the 2026-05-06 21:35 UTC history rewrite (we removed internal-docs leaks via `git filter-repo`) | See [docs/RECOVERY-2026-05-06.md](docs/RECOVERY-2026-05-06.md) — choose re-clone (cleanest) or hard-reset (preserves untracked files). The launcher will surface a Resync modal in v0.1.7+; on older binaries use the doc. |
 | Existing Weaviate / Ollama on default ports | The installer detects foreign services on `8081` / `11435` / `11440` and runs ours on a free alt-port by default — no collision, no pollution. Override with `--on-conflict adopt\|abort`. See [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md#coexisting-with-other-weaviate-or-ollama-installs). | — |
 
 For deeper issues see [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
