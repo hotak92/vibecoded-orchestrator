@@ -2300,6 +2300,13 @@ pub(crate) const UNREGISTER_PURGE_PATHS: &[&str] = &[
     ".claude/hooks",
     ".claude/scripts",
     ".claude/env",
+    // Launcher-managed install manifest (written by
+    // vco_lib.project_init at install time; tracks bundle version,
+    // shipped-file hashes for self-merge, and install ledger). It's
+    // pure launcher metadata — no user content lives here. Without
+    // this entry the file persisted across unregister + re-register
+    // and confused future installs. Follow-up #12 (CONTEXT_STATE).
+    ".claude/.vco-manifest.json",
     "infrastructure/docker-compose.yml",
     "infrastructure/docker-compose.gpu.yml",
     "infrastructure/docker-compose.amd-rocm.yml",
@@ -5076,6 +5083,10 @@ export USER_PROJECT_VAR=\"keep me\"
         std::fs::write(tmp.join(".claude/env"),
             "# vco-managed-begin\nexport KG_COLLECTION=\"X_KnowledgeGraph\"\n# vco-managed-end\n",
         ).unwrap();
+        // Launcher install manifest (per follow-up #12).
+        std::fs::write(tmp.join(".claude/.vco-manifest.json"),
+            r#"{"bundle_version":"0.1.6","installed_at":"2026-05-07T00:00:00Z"}"#,
+        ).unwrap();
         std::fs::create_dir_all(tmp.join("infrastructure")).unwrap();
         std::fs::write(tmp.join("infrastructure/docker-compose.yml"), "version: '3'\n").unwrap();
         std::fs::write(tmp.join("infrastructure/podman-compose.gpu.yml"), "version: '3'\n").unwrap();
@@ -5112,6 +5123,10 @@ export USER_PROJECT_VAR=\"keep me\"
         assert!(!tmp.join(".claude/hooks").exists(), "hooks/ should be purged");
         assert!(!tmp.join(".claude/scripts").exists(), "scripts/ should be purged");
         assert!(!tmp.join(".claude/env").exists(), ".claude/env should be purged");
+        assert!(
+            !tmp.join(".claude/.vco-manifest.json").exists(),
+            ".vco-manifest.json should be purged"
+        );
         assert!(!tmp.join("infrastructure/docker-compose.yml").exists());
         assert!(!tmp.join("infrastructure/podman-compose.gpu.yml").exists());
 
