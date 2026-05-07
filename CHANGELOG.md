@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Iteration since v0.1.6. Substantial install-flow architectural
+overhaul, freeze-investigation hardening, drift-guard work, and
+maintenance. Headline themes:
+
+- **Install-flow overhaul** (PRs #139–#152, 2026-05-06): the
+  user's "ONE VCO clone shared by all projects" model fully
+  implemented. `ORCHESTRATOR_MANAGED_PATHS` as single source of
+  truth (Rust + Python parse the same file). `ProjectEnvSettings`
+  plumbs launcher state into per-project envs. Gitignore-aware
+  `copy_recursive_sync`. Inspector + `update_orchestrator_at`
+  gated by `validate_source_repo`. Codegraph venv resolution
+  prefers `VCT_INSTALL_ROOT`. Plus: history rewrite via
+  `git filter-repo` to scrub 11 internal-doc paths from prior
+  commits; force-pushed to public main.
+- **New-user readiness** (PR #153, 2026-05-06/07): drift gate
+  for `.claude/` ↔ `templates/` lockstep; GUI Option γ for non-FF
+  auto-resync; `start-launcher.sh` build-hint fix; README links
+  recovery doc.
+- **Security + tightening** (PRs #154–#157, #163, 2026-05-07):
+  tauri 2.11.0 → 2.11.1 CVE bump (origin confusion); cookie
+  0.7.2 via npm overrides (Dependabot #1); BOM-strip in
+  managed-paths parsers; `.vco-manifest.json` purge on unregister;
+  codegraph mid-build unregister race silent.
+- **Drift-guard fragility** (PRs #158, #162, #165, 2026-05-07):
+  canonical env-key NAMES single source of truth (install ↔
+  unregister structurally locked); CI cross-language
+  managed-paths diff; full hook lockstep + sentinel rewire blocks
+  for 7 PR-2-rewired scripts (drift gate's `EXPECTED_ASYMMETRIC`
+  now empty).
+- **UX polish + cleanliness** (PRs #159–#161, #164, 2026-05-07):
+  `{{PROJECT_ROOT}}` placeholder in agent template subs;
+  orchestrator-update banner clarification on per-project page;
+  previously-registered leftovers banner in Add Project; gitignore
+  hardening to prevent accidental RL Pro-tier IP leak.
+
+Filed upstream:
+- `anthropics/claude-code#56876` — `/tmp/claude-{uid}/.../tasks/`
+  null-padded files (missing `ftruncate`).
+- `tauri-apps/tauri#15353` — `generate_context!()` embeds
+  `CARGO_MANIFEST_DIR` despite RUSTFLAGS remap.
+
+Net change since v0.1.6: 23+ PRs to main; install flow
+architecturally clean; all 4 declared Dependabot alerts triaged
+or fixed.
+
+## [0.1.1] – [0.1.5] — internal iterations
+
+These versions existed only as internal pre-release iterations
+during the 2026-04 → 2026-05 window. Substantive work happened
+across many small commits without numbered releases; the
+collected work landed as v0.1.6. Future released versions will
+follow Keep a Changelog discipline more strictly per release.
+
 ## [0.1.6] — 2026-05-02
 
 ### Changed
