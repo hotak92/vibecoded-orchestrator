@@ -13,10 +13,22 @@ set -e
 PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
 PROJECT_NAME=$(basename "$PROJECT_DIR")
 
+# Resolve a Python interpreter portably (python3 → python → py).
+# See audit findings F5 + F6, 2026-04-30.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=_lib/find-python.sh disable=SC1091
+[ -f "$SCRIPT_DIR/_lib/find-python.sh" ] && . "$SCRIPT_DIR/_lib/find-python.sh"
+
 # Optional RL retrieval server (Pro tier). Auto-launches if installed,
 # otherwise silently no-ops — free tier ships with KG + code graph only.
-RL_LAUNCHER="${RL_SERVER_LAUNCHER:-$HOME/.claude/scripts/start-rl-server.sh}"
-if [ -x "$RL_LAUNCHER" ]; then
+# Resolve $HOME via Python if the env var is unset (cmd.exe on Windows
+# doesn't expose $HOME — see audit finding F5).
+USER_HOME="${HOME:-}"
+if [ -z "$USER_HOME" ] && [ -n "${PY:-}" ]; then
+    USER_HOME=$("$PY" -c "from pathlib import Path; print(Path.home())" 2>/dev/null || echo "")
+fi
+RL_LAUNCHER="${RL_SERVER_LAUNCHER:-$USER_HOME/.claude/scripts/start-rl-server.sh}"
+if [ -n "$USER_HOME" ] && [ -x "$RL_LAUNCHER" ]; then
     export RL_SERVER_PORT="${RL_SERVER_PORT:-11439}"
     export RL_PROJECT_ROOT="${RL_PROJECT_ROOT:-$PROJECT_DIR}"
     bash "$RL_LAUNCHER" 2>/dev/null || true
@@ -46,8 +58,8 @@ EOF
 
 # Re-inject enabled /loop jobs from cron-jobs.json
 CRON_FILE="$PROJECT_DIR/.claude/cron-jobs.json"
-if [ -f "$CRON_FILE" ]; then
-    ACTIVE_JOBS=$(python3 - <<'PYEOF' "$CRON_FILE"
+if [ -f "$CRON_FILE" ] && [ -n "${PY:-}" ]; then
+    ACTIVE_JOBS=$("$PY" - <<'PYEOF' "$CRON_FILE"
 import sys, json
 path = sys.argv[1]
 try:

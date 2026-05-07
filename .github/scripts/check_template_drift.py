@@ -33,6 +33,16 @@ Two kinds of intentional divergence
 Adding to either list requires touching this file, which forces a CR
 discussion (the goal — drift should be intentional, not accidental).
 
+Hook drift resolution (2026-05-07, follow-up #6)
+------------------------------------------------
+The 12 hooks formerly on EXPECTED_ASYMMETRIC have been brought into
+lockstep between `.claude/hooks/` and `templates/hooks/`. The merged
+canonical version preserves both the audit-driven portability scaffolding
+(find-python.sh, notify.py wrapper, cross-platform port probes,
+last-compact-marker, etc.) and the auth-mode detection that landed in
+.claude/-side cost-tracker.sh on 2026-05-01. Each .sh edit was paired
+with the matching .ps1 update to satisfy the hook OS-parity gate.
+
 Behaviour
 ---------
 - Walks both dirs, compares pairs by name (extension matters).
@@ -72,22 +82,21 @@ EXPECTED_ONESIDED = {
 }
 
 # Pairs allowed to differ in content. Format: relative path under EITHER
-# canonical or mirror (we match by suffix). The most common cause is the
+# canonical or mirror (we match by suffix). The remaining cause is the
 # PR-2/PR-143 rewiring: templates/scripts/*.py resolve
 # claude_mcp_servers/ via $VCT_ORCHESTRATOR_ROOT, .claude/scripts/*.py
 # resolve via in-tree _SCRIPT_DIR.parent.parent. The rest of each file is
 # typically identical; only the resolution block at the top diverges.
 #
-# The 12 hooks below are also asymmetric: .claude/hooks/*.sh has accumulated
-# audit-driven enhancements (auth-mode detection, pruned-context-summary,
-# etc.) that templates/hooks/*.sh hasn't picked up yet. Resolving that
-# drift requires careful per-file review + matching .ps1 updates (the
-# Hook OS-Parity gate enforces .sh ↔ .ps1 lockstep). Tracked in
-# follow-up #6 of .claude/CONTEXT_STATE.md ("Bidirectional .claude/hooks/
-# ↔ templates/hooks/ per-file sync"). Until that lands, this allowlist
-# pins the current known-good state so NEW drift gets caught.
+# Hook drift was resolved 2026-05-07 (follow-up #6); all 12 hooks formerly
+# listed here are now byte-identical between .claude/ and templates/ on
+# both .sh and .ps1.
 EXPECTED_ASYMMETRIC = {
     # PR-2 / PR-143 rewiring: env-var lookup vs in-tree resolution.
+    # Future cleanup: wrap the rewire block in sentinel comments
+    # (`# VCO-REWIRE-BEGIN/END: orchestrator-root-resolution`) and have
+    # this gate strip those sections before comparing the rest. See
+    # knowledge/concepts/template-vs-runtime-rewiring-asymmetry.md.
     "scripts/analyze_code_graph.py",
     "scripts/detect_duplicates.py",
     "scripts/generate-kg-summary.py",
@@ -95,20 +104,6 @@ EXPECTED_ASYMMETRIC = {
     "scripts/process_documents.py",
     "scripts/search_knowledge.py",
     "scripts/sync_knowledge_graph.py",
-    # Hook drift accumulated from .claude/-side audit enhancements;
-    # resolving requires .sh+.ps1 lockstep updates. See follow-up #6.
-    "hooks/compact-context-reinject.sh",
-    "hooks/cost-tracker.sh",
-    "hooks/ensure-code-embed-service.sh",
-    "hooks/notify-stop.sh",
-    "hooks/post-compact.sh",
-    "hooks/post-file-edit.sh",
-    "hooks/post-git-commit-kg-sync.sh",
-    "hooks/post-tool-security.sh",
-    "hooks/pre-compact-save.sh",
-    "hooks/pre-edit-context-inject.sh",
-    "hooks/session-start-kg-loader.sh",
-    "hooks/stop-failure-notify.sh",
 }
 
 
