@@ -22,12 +22,14 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 import uuid
 
+# VCO-REWIRE-BEGIN: orchestrator-root-resolution
 # Add MCP server to path. We resolve relative to this script's location
 # rather than a hardcoded path so the script ships portable across Linux,
 # macOS, and Windows installs (audit finding 2026-04-30).
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _PROJECT_HOME = _SCRIPT_DIR.parent.parent  # .claude/scripts/X → .claude → project
 sys.path.insert(0, str(_PROJECT_HOME / "claude_mcp_servers"))
+# VCO-REWIRE-END: orchestrator-root-resolution
 
 import weaviate
 from weaviate.classes.query import Filter

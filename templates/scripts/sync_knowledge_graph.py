@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 import uuid
 
+# VCO-REWIRE-BEGIN: orchestrator-root-resolution
 # Resolve the claude_mcp_servers/ Python package.
 #
 # PR-2 portability strategy (2026-05-06): scripts ship to user projects via
@@ -58,6 +59,7 @@ def _resolve_mcp_servers_dir() -> Path:
 
 _MCP_DIR = _resolve_mcp_servers_dir()
 sys.path.insert(0, str(_MCP_DIR))
+# VCO-REWIRE-END: orchestrator-root-resolution
 
 import weaviate
 from weaviate.classes.query import Filter

@@ -24,9 +24,11 @@ from datetime import datetime, timezone
 from typing import Dict, List, Set, Tuple
 import re
 
+# VCO-REWIRE-BEGIN: orchestrator-root-resolution
 # Add paths
 PROJECT_ROOT = Path(os.environ.get("CLAUDE_PROJECT_ROOT", str(Path(__file__).resolve().parent.parent.parent)))
 sys.path.insert(0, str(PROJECT_ROOT / "claude_mcp_servers/weaviate_mcp"))
+# VCO-REWIRE-END: orchestrator-root-resolution
 
 from server import WeaviateMCPServer
 from weaviate.classes.query import Filter

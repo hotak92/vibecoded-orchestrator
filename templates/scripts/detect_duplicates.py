@@ -22,6 +22,7 @@ from typing import List, Dict, Tuple
 from datetime import datetime
 import re
 
+# VCO-REWIRE-BEGIN: orchestrator-root-resolution
 # Add MCP server to path.
 #
 # PR-2 portability (2026-05-06): claude_mcp_servers/ only lives in the
@@ -36,6 +37,7 @@ if _env_root and (Path(_env_root) / "claude_mcp_servers").is_dir():
     sys.path.insert(0, str(Path(_env_root) / "claude_mcp_servers"))
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "claude_mcp_servers"))
+# VCO-REWIRE-END: orchestrator-root-resolution
 
 import weaviate
 from weaviate.classes.query import Filter, MetadataQuery

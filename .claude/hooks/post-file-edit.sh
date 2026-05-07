@@ -55,10 +55,11 @@ if [[ "$EDITED_FILE" == "$KNOWLEDGE_ROOT"* ]]; then
     fi
 fi
 
-# 2. Auto-sync development documentation files via the same kg-sync entry
-#    point as knowledge/ (path-routed: docs/* → dev collection sync_doc;
-#    knowledge/* → KG sync_node). Audit-driven 2026-04-30 replacement
-#    for upload_docs.py. Same chunker, named-vector slot, archive-skip.
+# 2. Auto-sync development documentation files. Uses the same kg-sync
+#    entry point as knowledge/ — it routes by path: docs/* → dev
+#    collection (sync_doc), knowledge/* → KG (sync_node). Same chunker,
+#    same named-vector slot logic, same archive-skip behaviour.
+#    Audit-driven 2026-04-30; replaces the old upload_docs.py path.
 DOCS_DIR="$PROJECT_ROOT/docs"
 if [[ "$EDITED_FILE" == "$DOCS_DIR"* ]] && [[ "$EDITED_FILE" == *.md ]]; then
     echo "📚 Documentation edited: $EDITED_FILE"
