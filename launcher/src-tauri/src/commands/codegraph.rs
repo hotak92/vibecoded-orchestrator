@@ -682,9 +682,32 @@ pub fn spawn_initial_build(
     });
 }
 
+/// True when the project still exists in the launcher DB. Used by
+/// `run_build_task` to short-circuit if the user unregistered the
+/// project mid-build (follow-up #11): we want neither an
+/// `eprintln!` warning when the upsert hits a missing FK nor a
+/// stray `code-graph-build-progress` event for a project the GUI
+/// no longer renders. Any DB error is treated as "still exists" —
+/// we'd rather emit a misleading event than swallow a real failure.
+fn project_still_exists(app: &AppHandle, project_id: &str) -> bool {
+    app.state::<Db>()
+        .get_project(project_id)
+        .map(|opt| opt.is_some())
+        .unwrap_or(true)
+}
+
 /// Body of the spawned task. Errors here are recorded in the build row,
 /// never propagated. Each transition emits a `code-graph-build-progress`
 /// event so the GUI updates live.
+///
+/// Mid-build unregister race (follow-up #11): if the user calls
+/// `delete_project_v2` while this task is in flight, the DB row vanishes
+/// and any subsequent upsert hits an FK violation that prints a
+/// `[vct] warning: ...` to stderr. We check `project_still_exists`
+/// before each major transition and exit silently if the project is
+/// gone — the build's partial work doesn't matter (codegraph rows are
+/// scoped to a project that's been deleted) and the user has already
+/// seen the "Unregistered ..." toast.
 async fn run_build_task(
     app: AppHandle,
     project_id: String,
@@ -692,6 +715,13 @@ async fn run_build_task(
     folder_path: String,
 ) {
     let started_at = chrono::Utc::now().timestamp_millis();
+
+    // Race check #0 (defensive): the spawn could be enqueued and the
+    // user could unregister before the task picks up. Bail before any
+    // DB write or event emit.
+    if !project_still_exists(&app, &project_id) {
+        return;
+    }
 
     // 1. Mark RUNNING + emit. We deliberately recompute the languages
     //    pre-check here so the user sees a "scanning…" pill the moment
@@ -715,6 +745,14 @@ async fn run_build_task(
     let detected = match detect_supported_languages(std::path::Path::new(&folder_path), 3) {
         Ok(set) => set,
         Err(e) => {
+            // Race check: skip the finalize if the project's been
+            // unregistered (follow-up #11). The folder-scan error is
+            // expected when the user just deleted the install — no
+            // need for a confusing "scan folder failed" toast on top
+            // of "Unregistered ...".
+            if !project_still_exists(&app, &project_id) {
+                return;
+            }
             finalize_failed(
                 &app,
                 &project_id,
@@ -727,6 +765,11 @@ async fn run_build_task(
     };
 
     if detected.is_empty() {
+        // Race check (follow-up #11): user unregistered while we were
+        // scanning. Skip the SKIPPED-status write — project's gone.
+        if !project_still_exists(&app, &project_id) {
+            return;
+        }
         let finished_at = chrono::Utc::now().timestamp_millis();
         upsert_quiet(
             &app,
@@ -770,6 +813,13 @@ async fn run_build_task(
     let script = match resolve_analyzer_script(std::path::Path::new(&folder_path)) {
         Some(p) => p,
         None => {
+            // Race check (follow-up #11): the unregister policy purges
+            // .claude/scripts/, so post-unregister this branch is the
+            // most likely failure path. Skip the toast if the project
+            // is gone.
+            if !project_still_exists(&app, &project_id) {
+                return;
+            }
             finalize_failed(
                 &app,
                 &project_id,
@@ -926,6 +976,14 @@ async fn run_build_task(
     };
 
     // 6. Persist + emit terminal event.
+    //    Race check (follow-up #11): if the user unregistered while
+    //    code-graph-analyze was running, the project row is gone.
+    //    Writing the build row would print an FK warning to stderr and
+    //    the GUI would receive a `code-graph-build-progress` for a
+    //    project it no longer renders. Skip both quietly.
+    if !project_still_exists(&app, &project_id) {
+        return;
+    }
     upsert_quiet(
         &app,
         &project_id,
