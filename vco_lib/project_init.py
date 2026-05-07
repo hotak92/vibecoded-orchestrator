@@ -1679,9 +1679,22 @@ _MANIFEST_SCHEMA_VERSION = 1
 # `os.environ` lookups at run time. Use this placeholder in agent .md
 # bodies, hook scripts, or any context where a runtime-relocatable path
 # is acceptable.
-def _agent_subs(orchestrator_root: Path) -> dict[str, str]:
+#
+# `{{PROJECT_ROOT}}` (added 2026-05-07, follow-up #9) resolves to the
+# project folder being installed into — the directory containing
+# `.claude/`, `CLAUDE.md`, the user's source. Use this for agent .md
+# bodies that need to reference project-relative paths cleanly without
+# hardcoding the full absolute path. `project_root` is None on
+# orchestrator self-install (where there's no separate project folder);
+# in that case `{{PROJECT_ROOT}}` resolves to the orchestrator root
+# itself, since the orchestrator IS its own project at install time.
+def _agent_subs(
+    orchestrator_root: Path,
+    project_root: Path | None = None,
+) -> dict[str, str]:
     return {
         "{{ORCHESTRATOR_ROOT}}": str(orchestrator_root),
+        "{{PROJECT_ROOT}}": str(project_root if project_root else orchestrator_root),
         "{{PROJECTS_ROOT}}": str(orchestrator_root.parent),
         "{{HOME}}": str(Path.home()),
         # Runtime-resolvable form for shell / Python contexts. The literal
@@ -1807,8 +1820,16 @@ class _BundleFileOp:
     always_overwrite: bool = False
 
 
-def _enumerate_bundle_files(orchestrator_root: Path) -> list[_BundleFileOp]:
+def _enumerate_bundle_files(
+    orchestrator_root: Path,
+    project_root: Path | None = None,
+) -> list[_BundleFileOp]:
     """Build the list of files to install. OS-aware (hooks pick .sh vs .ps1).
+
+    `project_root` (optional) is the install target folder. When given,
+    `{{PROJECT_ROOT}}` placeholder substitution in agent / skill .md
+    bodies resolves to that folder. Defaults to the orchestrator root
+    (matches old behaviour for orchestrator self-installs).
 
     Layout:
       .claude/hooks/<name>.{sh,ps1}        from templates/hooks/  (skip _lib)
@@ -1869,7 +1890,7 @@ def _enumerate_bundle_files(orchestrator_root: Path) -> list[_BundleFileOp]:
 
     # Agents (with placeholder substitution).
     agents_src = templates / "agents" / "free"
-    subs = _agent_subs(orchestrator_root)
+    subs = _agent_subs(orchestrator_root, project_root)
 
     def _apply_subs(buf: bytes) -> bytes:
         text = buf.decode("utf-8", errors="replace")
@@ -2448,7 +2469,7 @@ def install_project_bundle(
     user_modified_paths: list[str] = []
     skipped_existing_paths: list[str] = []
 
-    ops = _enumerate_bundle_files(orchestrator_root)
+    ops = _enumerate_bundle_files(orchestrator_root, project_root=folder)
     _log("4.bundle", "start",
          f"enumerate: {len(ops)} ops",
          data={"folder": str(folder), "ops": len(ops)})
