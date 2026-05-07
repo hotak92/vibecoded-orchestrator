@@ -96,6 +96,71 @@ class AgentSubsTests(unittest.TestCase):
         # B: literal env var (for shell / Python consumers)
         self.assertIn("${VCT_ORCHESTRATOR_ROOT}/claude_mcp_servers/foo", body)
 
+    # ── {{PROJECT_ROOT}} placeholder (follow-up #9, 2026-05-07) ──
+
+    def test_project_root_resolves_to_install_target(self):
+        """`project_root` arg = the project folder being installed into.
+        `{{PROJECT_ROOT}}` resolves to its absolute path so agent .md
+        bodies can reference project-relative paths cleanly."""
+        orch = Path("/opt/vco-clone")
+        proj = Path("/home/user/MyProject")
+        subs = project_init._agent_subs(orch, project_root=proj)
+        self.assertEqual(subs["{{PROJECT_ROOT}}"], "/home/user/MyProject")
+        # Sanity: doesn't shadow {{ORCHESTRATOR_ROOT}}.
+        self.assertEqual(subs["{{ORCHESTRATOR_ROOT}}"], "/opt/vco-clone")
+
+    def test_project_root_falls_back_to_orchestrator_when_none(self):
+        """Orchestrator self-install: `project_root` is None.
+        `{{PROJECT_ROOT}}` resolves to the orchestrator root (the
+        orchestrator IS its own project at install time). Lets agent
+        templates be installed into the orchestrator without
+        substitution failing."""
+        orch = Path("/opt/vco-clone")
+        subs = project_init._agent_subs(orch)
+        self.assertEqual(subs["{{PROJECT_ROOT}}"], "/opt/vco-clone")
+        # And explicit None has the same fallback.
+        subs2 = project_init._agent_subs(orch, project_root=None)
+        self.assertEqual(subs2["{{PROJECT_ROOT}}"], "/opt/vco-clone")
+
+    def test_project_root_substitution_round_trip(self):
+        """Apply substitutions to an agent body using all 4 placeholders,
+        confirm they each resolve to the correct distinct value."""
+        orch = Path("/opt/vco-clone")
+        proj = Path("/home/user/MyProject")
+        subs = project_init._agent_subs(orch, project_root=proj)
+        body = (
+            "# Agent body\n"
+            "Orchestrator: {{ORCHESTRATOR_ROOT}}\n"
+            "Project: {{PROJECT_ROOT}}\n"
+            "Projects parent: {{PROJECTS_ROOT}}\n"
+            "Env-var form: {{VCT_ORCHESTRATOR_ROOT}}\n"
+            "Project file: {{PROJECT_ROOT}}/CLAUDE.md\n"
+        )
+        for k, v in subs.items():
+            body = body.replace(k, v)
+        self.assertIn("Orchestrator: /opt/vco-clone", body)
+        self.assertIn("Project: /home/user/MyProject", body)
+        self.assertIn("Projects parent: /opt", body)
+        self.assertIn("Env-var form: ${VCT_ORCHESTRATOR_ROOT}", body)
+        self.assertIn("Project file: /home/user/MyProject/CLAUDE.md", body)
+
+    def test_project_root_distinct_from_orchestrator_root(self):
+        """Most realistic case: project lives next to (not inside) the
+        orchestrator clone. Both placeholders MUST resolve to distinct
+        absolute paths so agents can reference each independently."""
+        orch = Path("/home/user/Desktop/PROGETTI/vibecoded-orchestrator")
+        proj = Path("/home/user/Desktop/PROGETTI/MyProject")
+        subs = project_init._agent_subs(orch, project_root=proj)
+        self.assertNotEqual(subs["{{ORCHESTRATOR_ROOT}}"], subs["{{PROJECT_ROOT}}"])
+        self.assertEqual(
+            subs["{{ORCHESTRATOR_ROOT}}"],
+            "/home/user/Desktop/PROGETTI/vibecoded-orchestrator",
+        )
+        self.assertEqual(
+            subs["{{PROJECT_ROOT}}"],
+            "/home/user/Desktop/PROGETTI/MyProject",
+        )
+
 
 # ---------------------------------------------------------------------------
 # 2. Stale-orchestrator-root heal
