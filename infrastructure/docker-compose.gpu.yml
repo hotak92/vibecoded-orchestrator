@@ -4,11 +4,18 @@
 #   Podman:        podman-compose -f docker-compose.yml -f docker-compose.gpu.yml --profile gpu up -d
 #
 # Requires (any container engine):
-#   - NVIDIA Container Toolkit on host
+#   - NVIDIA Container Toolkit ≥ 1.18.0 on host
 #     (https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)
-#   - For Podman: also run `sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml`
-#     once after installing the toolkit. This generates the CDI spec
-#     Podman uses to expose GPUs. Docker doesn't need this step.
+#   - For Podman: Container Toolkit ≥ 1.18.0 ships systemd units
+#     (nvidia-cdi-refresh.path + .service) that auto-write
+#     /var/run/cdi/nvidia.yaml on every driver upgrade. install.py
+#     verifies these are enabled. **DO NOT manually run
+#     `sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml`** —
+#     Podman reads /etc/cdi/ before /var/run/cdi/, so a manual file
+#     shadows the auto-refreshed one and breaks GPU containers after
+#     the next driver upgrade. Verify the auto-refresh:
+#       systemctl is-enabled nvidia-cdi-refresh.path   # → enabled
+#     Docker doesn't need any CDI setup (uses runtime hook).
 #
 # The `driver: nvidia` form below works for BOTH Docker and Podman with
 # Container Toolkit ≥ 1.14 (CDI-aware). Older Podman releases needed

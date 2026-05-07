@@ -10,8 +10,12 @@
 # Logs:  podman-compose logs -f <service>
 #
 # GPU support (optional):
-#   Requires nvidia-container-toolkit + CDI generation:
-#     sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+#   Requires NVIDIA Container Toolkit ≥ 1.18.0. The toolkit ships
+#   `nvidia-cdi-refresh.path` + `.service` systemd units that auto-write
+#   /var/run/cdi/nvidia.yaml on every driver install/upgrade. **DO NOT
+#   write /etc/cdi/nvidia.yaml manually** — Podman reads /etc/cdi/ first,
+#   shadowing the auto-refresh and breaking GPU containers on every
+#   subsequent driver update. Verify: `systemctl is-enabled nvidia-cdi-refresh.path`.
 
 name: vibecoded
 
