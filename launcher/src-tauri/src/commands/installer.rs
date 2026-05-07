@@ -5374,6 +5374,26 @@ MemAvailable:   23456789 kB
     // UTF-8 BOM at the start, and `str::trim` does NOT remove it. Without
     // this, the first allowlist entry silently fails to match.
 
+    /// CI-only print test (follow-up #5). Emits the resolved
+    /// `ORCHESTRATOR_MANAGED_PATHS` list to stdout one entry per line
+    /// prefixed with `MANAGED_PATH:`. The CI script
+    /// `.github/scripts/check_managed_paths_cross_language.sh` greps
+    /// for that prefix to extract the Rust-side parse, then diffs it
+    /// against an independent Python re-parse of the same .txt file.
+    /// Catches the failure mode where both languages' `EXPECTED`
+    /// literals are wrong but matching their respective parsers.
+    ///
+    /// `#[ignore]` so the normal `cargo test --lib` run doesn't get
+    /// noisy stdout. The CI script invokes it explicitly with
+    /// `--ignored --nocapture`.
+    #[test]
+    #[ignore = "CI-only — invoked explicitly by check_managed_paths_cross_language.sh"]
+    fn print_managed_paths_for_ci() {
+        for entry in ORCHESTRATOR_MANAGED_PATHS.iter() {
+            println!("MANAGED_PATH: {}", entry);
+        }
+    }
+
     #[test]
     fn test_parse_managed_paths_strips_leading_bom() {
         let text: &'static str = "\u{feff}.claude\nCLAUDE.md\n";
