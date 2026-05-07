@@ -7,6 +7,8 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # Run incremental code graph analysis on a code file edit.
 # Triggered by post-file-edit.ps1.
 
+. "$PSScriptRoot/_lib/stderr-cap.ps1"
+
 param(
     [Parameter(Position=0,Mandatory=$true)] [string]$EditedFile,
     [Parameter(Position=1)] [string]$RepoPath = "",

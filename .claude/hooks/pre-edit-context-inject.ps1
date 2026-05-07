@@ -7,6 +7,8 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # Pre-edit context injection — KG + code graph context for the file being edited.
 # Always exit 0 (never block the edit).
 
+. "$PSScriptRoot/_lib/stderr-cap.ps1"
+
 param(
     [Parameter(Position=0)] [string]$ToolName = "",
     [Parameter(Position=1)] [string]$ToolArgs = ""

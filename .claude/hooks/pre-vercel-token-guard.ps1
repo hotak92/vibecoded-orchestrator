@@ -8,6 +8,8 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # token back into stdout (Claude Code shows tool output to the user/agent).
 # Mirror of pre-vercel-token-guard.sh.
 
+. "$PSScriptRoot/_lib/stderr-cap.ps1"
+
 param(
     [Parameter(Position=0)] [string]$ToolName = "",
     [Parameter(Position=1)] [string]$UserMessage = "",

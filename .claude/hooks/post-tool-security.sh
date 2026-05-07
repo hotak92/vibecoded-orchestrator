@@ -6,6 +6,8 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 # Fires after Write/Edit. Non-blocking (always exits 0).
 # Scans for accidentally committed credentials and notifies.
 
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
+
 EDITED_FILE="$1"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

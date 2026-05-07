@@ -43,6 +43,8 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 set -uo pipefail
 
 # Bypass switch.
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
+
 [ "${KG_NUDGE_OFF:-0}" = "1" ] && exit 0
 
 INPUT="$(cat 2>/dev/null || true)"

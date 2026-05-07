@@ -13,6 +13,8 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 # Payload available via stdin:
 #   {"trigger": "manual|auto", "compact_summary": "...", "session_id": "..."}
 
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
+
 PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
 PROJECT_NAME=$(basename "$PROJECT_DIR")
 

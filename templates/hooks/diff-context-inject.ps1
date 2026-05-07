@@ -14,6 +14,8 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # bash-side --old-line-format leak that caused the 2026-05-07 GUI freeze
 # in the .sh sibling. Parity-touch only — no behavioural change.
 
+. "$PSScriptRoot/_lib/stderr-cap.ps1"
+
 $ContextFile = ".claude/CONTEXT_STATE.md"
 $Tmp = if ($env:TMPDIR) { $env:TMPDIR } elseif ($env:TEMP) { $env:TEMP } else { "C:\Windows\Temp" }
 $SnapshotDir = Join-Path $Tmp "claude_ctx_snapshots"

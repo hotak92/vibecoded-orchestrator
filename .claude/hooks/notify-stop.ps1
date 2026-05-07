@@ -7,6 +7,8 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # Fires on Stop event — Claude finished responding.
 # Desktop notification via .claude/scripts/notify.py (cross-platform).
 
+. "$PSScriptRoot/_lib/stderr-cap.ps1"
+
 $ProjectDir = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
 $ProjectName = Split-Path $ProjectDir -Leaf
 

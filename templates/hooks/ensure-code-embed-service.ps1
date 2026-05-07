@@ -8,6 +8,8 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # Mirror of ensure-code-embed-service.sh. No flock on Windows; we use a
 # best-effort lockfile (sentinel) instead.
 
+. "$PSScriptRoot/_lib/stderr-cap.ps1"
+
 $Port = if ($env:CODE_EMBED_PORT) { $env:CODE_EMBED_PORT } else { "11440" }
 $ContainerName = if ($env:VCT_CODE_EMBED_CONTAINER) { $env:VCT_CODE_EMBED_CONTAINER } else { "code_embed" }
 $Tmp = if ($env:TMPDIR) { $env:TMPDIR } elseif ($env:TEMP) { $env:TEMP } else { "C:\Windows\Temp" }

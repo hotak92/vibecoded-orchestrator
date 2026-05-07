@@ -4,6 +4,8 @@
 # the same Python heredoc that uses claude_token_counter.py.
 
 # Scrub sensitive env vars before any subprocess spawning.
+. "$PSScriptRoot/_lib/stderr-cap.ps1"
+
 $secretEnvNames = @(
     "SUPABASE_KEY", "SUPABASE_URL", "GITHUB_TOKEN", "GH_TOKEN",
     "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "AWS_SECRET_ACCESS_KEY",

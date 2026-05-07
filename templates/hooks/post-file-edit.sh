@@ -13,6 +13,8 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 
 set -e
 
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 KNOWLEDGE_ROOT="$PROJECT_ROOT/knowledge"

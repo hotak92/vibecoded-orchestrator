@@ -7,6 +7,8 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # Fires on ConfigChange event — logs all settings changes for audit trail.
 # Background: does NOT write to stdout (not injected into context).
 
+. "$PSScriptRoot/_lib/stderr-cap.ps1"
+
 $ProjectDir = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
 $LogFile = Join-Path $ProjectDir ".claude/logs/config_changes.jsonl"
 

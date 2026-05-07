@@ -7,6 +7,8 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # Pre-tool-use hook: SSRF guard, shell injection scan, tool logging,
 # Build Anchor Protocol, file backup, KG search suggestion.
 
+. "$PSScriptRoot/_lib/stderr-cap.ps1"
+
 param(
     [Parameter(Position=0)] [string]$ToolName = "",
     [Parameter(Position=1)] [string]$UserMessage = "",

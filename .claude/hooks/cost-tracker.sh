@@ -29,6 +29,8 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 set -euo pipefail
 
 # Read stdin payload
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
+
 PAYLOAD=$(cat)
 
 # Extract fields using python (already in PATH)

@@ -22,6 +22,8 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 # Bypass: VCT_DISABLE_HOOKS=1 in the shell, or remove this hook from
 # .claude/settings.json.
 
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
+
 TOOL_NAME="$1"
 TOOL_ARGS="$3"
 

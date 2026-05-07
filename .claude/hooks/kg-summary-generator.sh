@@ -13,6 +13,8 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
 
 # Don't run for agent subprocesses
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
+
 [ -n "$CLAUDE_CODE_DISABLE_AUTO_MEMORY" ] && exit 0
 
 set -e

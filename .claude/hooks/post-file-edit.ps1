@@ -6,6 +6,8 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # post-file-edit.ps1
 # Mirror of post-file-edit.sh. Auto-syncs knowledge/, docs/, and code files.
 
+. "$PSScriptRoot/_lib/stderr-cap.ps1"
+
 param(
     [Parameter(Position=0)] [string]$EditedFile = ""
 )

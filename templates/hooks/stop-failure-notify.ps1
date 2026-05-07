@@ -7,6 +7,8 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # Fires on StopFailure event — when a turn ends due to API error.
 # Sends urgent desktop notification and logs the failure.
 
+. "$PSScriptRoot/_lib/stderr-cap.ps1"
+
 $ProjectDir = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
 $ProjectName = Split-Path $ProjectDir -Leaf
 

@@ -7,6 +7,8 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # Fires on SessionStart matcher "compact"
 # Re-injects critical session context to stdout (becomes additionalContext).
 
+. "$PSScriptRoot/_lib/stderr-cap.ps1"
+
 $ProjectDir = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
 
 # 1. CONTEXT_STATE.md (uncapped)

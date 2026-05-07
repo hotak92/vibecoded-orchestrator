@@ -7,6 +7,8 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # Fires after Write/Edit. Non-blocking (always exits 0).
 # Scans for accidentally committed credentials and notifies.
 
+. "$PSScriptRoot/_lib/stderr-cap.ps1"
+
 param(
     [Parameter(Position=0)]
     [string]$EditedFile = ""

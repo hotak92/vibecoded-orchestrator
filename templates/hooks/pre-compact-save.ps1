@@ -8,6 +8,8 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # Saves a snapshot of current working state so compact-context-reinject.ps1
 # can restore it after compaction.
 
+. "$PSScriptRoot/_lib/stderr-cap.ps1"
+
 $ProjectDir = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
 $SnapshotFile = Join-Path $ProjectDir ".claude/context/pre-compact-snapshot.md"
 $SnapshotDir = Split-Path $SnapshotFile -Parent

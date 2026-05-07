@@ -13,6 +13,8 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # populated when auth_mode == "api". Subscription rows still log token
 # counts (useful for usage analysis) but cost_usd is null.
 
+. "$PSScriptRoot/_lib/stderr-cap.ps1"
+
 $LibDir = Join-Path $PSScriptRoot "_lib"
 $FindPy = Join-Path $LibDir "find-python.ps1"
 if (Test-Path $FindPy) { . $FindPy }
