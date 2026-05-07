@@ -146,9 +146,17 @@ Content:
 
 
 def get_chunks_from_weaviate(title: str) -> list[tuple[int, str]]:
-    """Fetch all chunks for a node from Weaviate, sorted by chunk_num."""
+    """Fetch all chunks for a node from Weaviate, sorted by chunk_num.
+
+    PR-2 portability (2026-05-06): the weaviate Python client is the only
+    thing imported here, but historically sys.path was also extended to
+    pick up claude_mcp_servers/ from the orchestrator clone. Honor
+    $VCT_ORCHESTRATOR_ROOT first, fall back to in-tree resolution.
+    """
     try:
+        # VCO-REWIRE-BEGIN: orchestrator-root-resolution
         sys.path.insert(0, str(CLAUDE_PROJECT / "claude_mcp_servers"))
+        # VCO-REWIRE-END: orchestrator-root-resolution
         import weaviate
         from weaviate.classes.query import Filter
 

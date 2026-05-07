@@ -43,11 +43,33 @@ last-compact-marker, etc.) and the auth-mode detection that landed in
 .claude/-side cost-tracker.sh on 2026-05-01. Each .sh edit was paired
 with the matching .ps1 update to satisfy the hook OS-parity gate.
 
+Sentinel-marked rewire blocks (2026-05-07, follow-up #6 phase 3)
+----------------------------------------------------------------
+The 7 PR-2-rewired scripts retain their orchestrator-root-resolution
+asymmetry, but the asymmetric region is now wrapped in matching sentinel
+comments on BOTH sides:
+
+    # VCO-REWIRE-BEGIN: orchestrator-root-resolution
+    ...different on .claude/ vs templates/...
+    # VCO-REWIRE-END: orchestrator-root-resolution
+
+Before comparing two such files this gate strips any text between
+matching sentinel pairs (inclusive of the sentinel lines themselves)
+and compares the rest. If anything OUTSIDE the sentinel block diverges,
+the gate fails — so unrelated drift still gets caught.
+
+This means new asymmetric files don't need entries in EXPECTED_ASYMMETRIC
+at all; just wrap the divergent region in a sentinel pair on both sides.
+EXPECTED_ASYMMETRIC remains as an escape hatch for files that genuinely
+can't be sentinel-wrapped (none currently — the 7 scripts are kept on
+the list as belt-and-braces while we validate the sentinel approach).
+
 Behaviour
 ---------
 - Walks both dirs, compares pairs by name (extension matters).
 - Asymmetric extras: blocking unless listed in EXPECTED_ONESIDED.
-- Content drift: blocking unless the pair is in EXPECTED_ASYMMETRIC.
+- Content drift: blocking unless EITHER (a) sentinel-strip equality holds,
+  or (b) the pair is in EXPECTED_ASYMMETRIC.
 - Files under `_lib/`, `lib/`, `__pycache__/`: excluded (helpers /
   generated).
 
@@ -66,6 +88,14 @@ import filecmp
 import sys
 from pathlib import Path
 
+# Sentinel markers for "rewire-block" asymmetry. Lines BETWEEN matching
+# BEGIN/END pairs (inclusive) are stripped before content comparison so
+# both sides can carry a different orchestrator-root-resolution scheme
+# without the drift gate flagging it. The trailing tag (after the colon)
+# is a free-text label for humans — we match on the prefix only.
+SENTINEL_BEGIN = "# VCO-REWIRE-BEGIN:"
+SENTINEL_END = "# VCO-REWIRE-END:"
+
 # (canonical, mirror) pairs to compare.
 PAIRS = [
     (".claude/hooks", "templates/hooks"),
@@ -81,30 +111,25 @@ EXPECTED_ONESIDED = {
     "templates/scripts/query_code_graph.py",
 }
 
-# Pairs allowed to differ in content. Format: relative path under EITHER
-# canonical or mirror (we match by suffix). The remaining cause is the
-# PR-2/PR-143 rewiring: templates/scripts/*.py resolve
-# claude_mcp_servers/ via $VCT_ORCHESTRATOR_ROOT, .claude/scripts/*.py
-# resolve via in-tree _SCRIPT_DIR.parent.parent. The rest of each file is
-# typically identical; only the resolution block at the top diverges.
+# Pairs allowed to differ in content WITHOUT sentinel-marked rewire blocks.
+# Format: relative path under EITHER canonical or mirror (we match by suffix).
 #
-# Hook drift was resolved 2026-05-07 (follow-up #6); all 12 hooks formerly
-# listed here are now byte-identical between .claude/ and templates/ on
-# both .sh and .ps1.
-EXPECTED_ASYMMETRIC = {
-    # PR-2 / PR-143 rewiring: env-var lookup vs in-tree resolution.
-    # Future cleanup: wrap the rewire block in sentinel comments
-    # (`# VCO-REWIRE-BEGIN/END: orchestrator-root-resolution`) and have
-    # this gate strip those sections before comparing the rest. See
-    # knowledge/concepts/template-vs-runtime-rewiring-asymmetry.md.
-    "scripts/analyze_code_graph.py",
-    "scripts/detect_duplicates.py",
-    "scripts/generate-kg-summary.py",
-    "scripts/maintain_knowledge_graph.py",
-    "scripts/process_documents.py",
-    "scripts/search_knowledge.py",
-    "scripts/sync_knowledge_graph.py",
-}
+# Hook drift was resolved 2026-05-07 (follow-up #6 phase 1+2); all 12 hooks
+# formerly listed here are now byte-identical between .claude/ and templates/
+# on both .sh and .ps1.
+#
+# The 7 PR-2-rewired scripts (analyze_code_graph.py, detect_duplicates.py,
+# generate-kg-summary.py, maintain_knowledge_graph.py, process_documents.py,
+# search_knowledge.py, sync_knowledge_graph.py) formerly listed here have
+# been migrated to the sentinel-block approach (follow-up #6 phase 3,
+# 2026-05-07). Their orchestrator-root-resolution divergence is wrapped in
+# matching `# VCO-REWIRE-BEGIN/END: orchestrator-root-resolution` markers
+# on both sides; the gate strips those blocks before comparing, so any
+# OTHER drift in those files still gets caught.
+#
+# This set is empty by design as of 2026-05-07. Prefer wrapping new
+# divergence in a sentinel pair over adding entries here.
+EXPECTED_ASYMMETRIC: set[str] = set()
 
 
 def annotate(level: str, message: str, file: str | None = None) -> None:
@@ -128,6 +153,76 @@ def list_files(root: Path) -> set[str]:
             continue
         out.add(str(rel))
     return out
+
+
+def _strip_sentinel_blocks(text: str) -> tuple[str, int]:
+    """Drop any `VCO-REWIRE-BEGIN ... VCO-REWIRE-END` blocks (inclusive).
+
+    A block is matched when both BEGIN and END markers are seen in order;
+    if a BEGIN appears without a matching END, all remaining lines are
+    treated as inside the block (and thus stripped) — that keeps the
+    behaviour predictable for malformed files instead of silently skipping
+    the strip.
+
+    Returns
+    -------
+    (stripped_text, blocks_stripped)
+        `stripped_text` has the sentinel lines and everything between them
+        removed. `blocks_stripped` is the number of complete pairs found
+        (useful for diagnostics; an unterminated BEGIN counts as 1).
+    """
+    out_lines: list[str] = []
+    inside = False
+    blocks = 0
+    for line in text.splitlines(keepends=True):
+        stripped = line.lstrip()
+        if not inside:
+            if stripped.startswith(SENTINEL_BEGIN):
+                inside = True
+                continue
+            out_lines.append(line)
+        else:
+            if stripped.startswith(SENTINEL_END):
+                inside = False
+                blocks += 1
+                continue
+            # else: line is inside the block, drop it
+    if inside:
+        # Unterminated BEGIN — count it for diagnostics. Lines after the
+        # BEGIN have already been dropped, which is the safe default.
+        blocks += 1
+    return "".join(out_lines), blocks
+
+
+def _files_match_after_sentinel_strip(c_path: Path, m_path: Path) -> bool:
+    """Compare two files for equality after stripping sentinel blocks.
+
+    Read errors → False (treated as drift, lets the operator see the
+    issue rather than silently passing). Files larger than ~5MB are
+    declined (sentinel approach is for source files; anything bigger
+    is a binary or generated artefact and shouldn't be on the gate's
+    radar anyway).
+    """
+    SIZE_LIMIT = 5 * 1024 * 1024
+    try:
+        if c_path.stat().st_size > SIZE_LIMIT or m_path.stat().st_size > SIZE_LIMIT:
+            return False
+        c_text = c_path.read_text(encoding="utf-8", errors="strict")
+        m_text = m_path.read_text(encoding="utf-8", errors="strict")
+    except (OSError, UnicodeDecodeError):
+        return False
+
+    c_stripped, c_blocks = _strip_sentinel_blocks(c_text)
+    m_stripped, m_blocks = _strip_sentinel_blocks(m_text)
+
+    # Both sides must carry sentinels (otherwise the drift is real, not
+    # an intentional rewire-block divergence) AND they must agree on the
+    # block count. A mismatched count means one side wrapped a block the
+    # other didn't, which is itself drift worth reporting.
+    if c_blocks == 0 or m_blocks == 0 or c_blocks != m_blocks:
+        return False
+
+    return c_stripped == m_stripped
 
 
 def main() -> int:
@@ -174,6 +269,11 @@ def main() -> int:
             c_path = c_root / rel
             m_path = m_root / rel
             if filecmp.cmp(c_path, m_path, shallow=False):
+                continue
+            # Sentinel-strip pass: if both sides carry matching
+            # VCO-REWIRE-BEGIN/END blocks and agree everywhere else,
+            # that's an intentional rewire-block asymmetry, not drift.
+            if _files_match_after_sentinel_strip(c_path, m_path):
                 continue
             asym_key = f"{canonical_suffix}{rel}"
             if asym_key in EXPECTED_ASYMMETRIC:

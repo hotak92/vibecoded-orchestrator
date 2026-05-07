@@ -22,9 +22,11 @@ from typing import List, Dict, Tuple
 from datetime import datetime
 import re
 
+# VCO-REWIRE-BEGIN: orchestrator-root-resolution
 # Add MCP server to path
 sys.path.insert(0, str(Path.home() / ".claude" / "workflow" / "scripts"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "claude_mcp_servers"))
+# VCO-REWIRE-END: orchestrator-root-resolution
 
 import weaviate
 from weaviate.classes.query import Filter, MetadataQuery

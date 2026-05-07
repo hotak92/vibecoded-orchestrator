@@ -119,6 +119,7 @@ DUAL_EMBEDDING_ENABLED = os.getenv("DUAL_EMBEDDING_ENABLED", "true").lower() == 
 SCRIPT_DIR = Path(__file__).parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
+# VCO-REWIRE-BEGIN: orchestrator-root-resolution
 # Smart code truncation — import from weaviate_mcp package.
 # PR-2 portability (2026-05-06): orchestrator clone resolved via
 # $VCT_ORCHESTRATOR_ROOT (.claude/env) with in-tree fallback. Falls back
@@ -132,6 +133,7 @@ else:
     _mcp_dir = Path(__file__).resolve().parent.parent.parent / "claude_mcp_servers"
 if str(_mcp_dir) not in sys.path:
     sys.path.insert(0, str(_mcp_dir))
+# VCO-REWIRE-END: orchestrator-root-resolution
 try:
     from weaviate_mcp.code_truncation import (
         truncate_function_for_embedding,

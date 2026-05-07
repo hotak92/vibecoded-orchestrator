@@ -36,11 +36,13 @@ MAX_QUERY_TOKENS = 2500
 # CPU-only host without the venv — in that case --detail is silently
 # ignored. Pure utility import (no service runtime); see PR-2 design notes.
 try:
+    # VCO-REWIRE-BEGIN: orchestrator-root-resolution
     _env_root = os.environ.get("VCT_ORCHESTRATOR_ROOT", "").strip()
     if _env_root and (Path(_env_root) / "claude_mcp_servers").is_dir():
         sys.path.insert(0, str(Path(_env_root) / "claude_mcp_servers"))
     else:
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "claude_mcp_servers"))
+    # VCO-REWIRE-END: orchestrator-root-resolution
     from weaviate_mcp.server import (
         _get_result_verbosity_by_score,
         _format_result_by_tier,

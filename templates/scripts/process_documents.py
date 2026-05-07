@@ -23,6 +23,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
+# VCO-REWIRE-BEGIN: orchestrator-root-resolution
 # Add paths.
 #
 # PR-2 portability (2026-05-06): claude_mcp_servers/ ONLY exists in the
@@ -53,6 +54,7 @@ def _resolve_mcp_servers_dir() -> Path:
 
 _MCP_DIR = _resolve_mcp_servers_dir()
 sys.path.insert(0, str(_MCP_DIR / "weaviate_mcp"))
+# VCO-REWIRE-END: orchestrator-root-resolution
 
 from server import WeaviateMCPServer
 from chunking import chunk_text, TokenCounter

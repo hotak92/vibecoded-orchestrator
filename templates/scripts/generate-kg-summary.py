@@ -154,11 +154,13 @@ def get_chunks_from_weaviate(title: str) -> list[tuple[int, str]]:
     $VCT_ORCHESTRATOR_ROOT first, fall back to in-tree resolution.
     """
     try:
+        # VCO-REWIRE-BEGIN: orchestrator-root-resolution
         env_root = os.environ.get("VCT_ORCHESTRATOR_ROOT", "").strip()
         if env_root and (Path(env_root) / "claude_mcp_servers").is_dir():
             sys.path.insert(0, str(Path(env_root) / "claude_mcp_servers"))
         else:
             sys.path.insert(0, str(CLAUDE_PROJECT / "claude_mcp_servers"))
+        # VCO-REWIRE-END: orchestrator-root-resolution
         import weaviate
         from weaviate.classes.query import Filter
 
