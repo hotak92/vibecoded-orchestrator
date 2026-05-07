@@ -128,15 +128,41 @@
     {/if}
   </header>
 
+  <!--
+    Orchestrator-update banner.
+
+    Edge-case-only after PR-151 (2026-05-06): `inspect_orchestrator_at`
+    only returns `installed: true` for actual VCO clones (gated by
+    `vct-module.json` presence). Normal user-project folders return
+    `installed: false`, so this banner stays hidden for them. The
+    banner DOES appear when a user has registered the VCO clone
+    itself as a project (a legitimate edge case for orchestrator
+    self-development); in that case the banner offers the same
+    `update_orchestrator_at` flow that lives on the Settings tab.
+
+    Followup-#14 review (2026-05-07): banner kept rather than removed.
+    `runUpdate` here calls the SAME backend command as
+    `Settings → Update orchestrator`, so the two paths can't drift.
+    Removing it would silently lose the edge-case ability to update
+    from the project page; leaving it preserves it without breakage
+    for normal projects.
+
+    The guard chain that keeps this safe:
+      1. `inspect_orchestrator_at` returns `installed: false` for
+         project folders (PR-151).
+      2. `update_orchestrator_at` (the handler) is gated by
+         `validate_source_repo` (also PR-151) — refuses to run on
+         non-VCO targets even if the GUI somehow tried.
+  -->
   {#if orchState && orchState.installed && orchState.version_status === 'outdated' && orchState.bundled_version}
     <div class="orch-banner">
       <span class="orch-banner-text">
-        Orchestrator
+        Orchestrator clone at this path
         {#if orchState.version}v{orchState.version}{/if}
-        — update to v{orchState.bundled_version} available
+        — bundled launcher ships v{orchState.bundled_version}
       </span>
       <button class="orch-banner-btn" onclick={runUpdate} disabled={updating}>
-        {updating ? 'Updating…' : 'Update this project'}
+        {updating ? 'Updating…' : 'Update orchestrator clone'}
       </button>
     </div>
   {/if}
