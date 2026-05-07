@@ -46,6 +46,26 @@
   let inspecting = $state(false);
   let inspectDebounce: ReturnType<typeof setTimeout> | null = null;
 
+  // Follow-up #13 (2026-05-07): when a user picks a folder that already
+  // contains preserved orchestrator-managed content (e.g. PR-150's
+  // non-destructive unregister kept `.claude/agents`, `.claude/skills`,
+  // `.claude/CONTEXT_STATE.md`, `CLAUDE.md` from a prior install),
+  // surface the counts in an info banner so they know what's there
+  // BEFORE clicking Create. The install path itself is already
+  // idempotent (preserves user content per PR-150's surgical-purge
+  // policy); this is purely a UX heads-up.
+  type ProjectLeftovers = {
+    has_leftovers: boolean;
+    agent_count: number;
+    skill_count: number;
+    hook_count: number;
+    script_count: number;
+    has_context_state: boolean;
+    has_claude_md: boolean;
+    has_vco_manifest: boolean;
+  };
+  let leftovers = $state<ProjectLeftovers | null>(null);
+
   // Host options used by the create modal. Bug 3d: MAO is hidden until it
   // ships as a managed module.
   const HOST_OPTIONS: { value: ProjectHost; label: string }[] = [
@@ -124,6 +144,7 @@
     const path = (createPath || '').trim();
     if (!path) {
       orchestratorState = null;
+      leftovers = null;
       return;
     }
     inspecting = true;
@@ -136,6 +157,14 @@
     } catch (e) {
       orchestratorState = null;
       console.error('inspect_orchestrator_at failed', e);
+    }
+    // Independent probe for previously-registered-project leftovers.
+    // Failures here are non-fatal — the banner just doesn't render.
+    try {
+      leftovers = await invoke<ProjectLeftovers>('inspect_project_leftovers', { path });
+    } catch (e) {
+      leftovers = null;
+      console.error('inspect_project_leftovers failed', e);
     } finally {
       inspecting = false;
     }
@@ -163,6 +192,7 @@
     pathTouched = false;
     createError = null;
     orchestratorState = null;
+    leftovers = null;
     if (inspectDebounce) {
       clearTimeout(inspectDebounce);
       inspectDebounce = null;
@@ -266,6 +296,7 @@
       createHost = 'base';
       pathTouched = false;
       orchestratorState = null;
+      leftovers = null;
       open = false;
     } catch (e) {
       createError = e instanceof Error ? e.message : String(e);
@@ -501,6 +532,32 @@
               orchestrator, use the Wizard's self-onboarding flow
               instead. Pick a different folder, or create one for your
               project.
+            </p>
+          </div>
+        {:else if inTauri && createPath.trim() && leftovers?.has_leftovers}
+          <!--
+            Follow-up #13 (2026-05-07): "previously-registered" banner.
+            The folder has launcher-managed content from a prior
+            registration (PR-150's non-destructive unregister keeps
+            agents/skills/CONTEXT_STATE/CLAUDE.md). The install path is
+            already idempotent (preserves user content per PR-150's
+            surgical-purge policy), so this banner is INFORMATIONAL —
+            it doesn't block creation, just tells the user what they're
+            walking into.
+          -->
+          <div class="orch-status orch-info-block">
+            <p class="orch-row">
+              <span class="orch-icon orch-info">i</span>
+              <span>
+                This folder has <strong>previous orchestrator content</strong>
+                from an earlier registration.
+              </span>
+            </p>
+            <p class="orch-row orch-mid">
+              {#if leftovers.agent_count > 0}{leftovers.agent_count} agent{leftovers.agent_count === 1 ? '' : 's'}{/if}{#if leftovers.agent_count > 0 && (leftovers.skill_count > 0 || leftovers.has_context_state || leftovers.has_claude_md)}, {/if}{#if leftovers.skill_count > 0}{leftovers.skill_count} skill{leftovers.skill_count === 1 ? '' : 's'}{/if}{#if leftovers.skill_count > 0 && (leftovers.has_context_state || leftovers.has_claude_md)}, {/if}{#if leftovers.has_context_state}CONTEXT_STATE.md{/if}{#if leftovers.has_context_state && leftovers.has_claude_md}, {/if}{#if leftovers.has_claude_md}CLAUDE.md{/if} will be <strong>preserved</strong>; hooks, scripts and the env block will be re-installed fresh.
+              {#if leftovers.has_vco_manifest}
+                <br /><span class="form-hint">An install manifest already exists here — proceeding will treat this as an update.</span>
+              {/if}
             </p>
           </div>
         {:else if inTauri && createPath.trim() && inspecting}
@@ -961,6 +1018,20 @@
   .orch-warn-block {
     border-color: rgba(245, 179, 66, 0.45);
     background: rgba(245, 179, 66, 0.08);
+  }
+  /* Follow-up #13 — informational (blue) variant for "previously
+     registered" leftover-content notices. Distinct from the warn
+     (yellow) variant so users don't read this as a problem. */
+  .orch-info-block {
+    border-color: rgba(70, 140, 220, 0.45);
+    background: rgba(70, 140, 220, 0.08);
+  }
+  .orch-icon.orch-info {
+    color: #6aa8e0;
+    width: 16px; height: 16px;
+    display: inline-flex; align-items: center; justify-content: center;
+    border: 1px solid #6aa8e0; border-radius: 50%;
+    font-size: 11px; line-height: 1;
   }
   .orch-row {
     display: flex; align-items: flex-start; gap: 8px;

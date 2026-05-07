@@ -2208,6 +2208,95 @@ pub fn inspect_orchestrator_at(path: String) -> OrchestratorState {
     }
 }
 
+/// State of leftover orchestrator-managed content at a candidate project
+/// path. Lets the Add-Project flow distinguish:
+///
+///   * empty / fresh folder → no leftovers, install proceeds normally
+///   * folder with leftover preserved content (PR-150 unregister policy
+///     keeps `.claude/agents`, `.claude/skills`, `.claude/CONTEXT_STATE.md`,
+///     `CLAUDE.md`, etc. when a project was previously registered then
+///     unregistered) → wizard surfaces a "previously registered" banner so
+///     the user knows the install will reuse those files rather than
+///     surprising them at install time
+///
+/// Closes follow-up #13 (2026-05-07): "Repair adopt-choice for
+/// previously-registered or incomplete-install projects". Pre-fix, the
+/// Add-Project flow gave no signal that prior content existed; the
+/// install reported preserved-file counts only AFTER the bundle write.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectLeftovers {
+    /// Folder is non-empty AND contains at least one launcher-shipped path.
+    pub has_leftovers: bool,
+    /// Per-category counts. Zero means category has no leftovers.
+    pub agent_count: u32,
+    pub skill_count: u32,
+    pub hook_count: u32,
+    pub script_count: u32,
+    /// Convenience flags for single-file artifacts.
+    pub has_context_state: bool,
+    pub has_claude_md: bool,
+    pub has_vco_manifest: bool,
+}
+
+#[command]
+pub fn inspect_project_leftovers(path: String) -> ProjectLeftovers {
+    let root = PathBuf::from(&path);
+
+    let mut out = ProjectLeftovers {
+        has_leftovers: false,
+        agent_count: 0,
+        skill_count: 0,
+        hook_count: 0,
+        script_count: 0,
+        has_context_state: false,
+        has_claude_md: false,
+        has_vco_manifest: false,
+    };
+
+    if !root.is_dir() {
+        return out;
+    }
+
+    let claude_dir = root.join(".claude");
+
+    let count_md_files = |dir: &Path| -> u32 {
+        match std::fs::read_dir(dir) {
+            Ok(rd) => rd
+                .flatten()
+                .filter(|e| {
+                    e.file_type().map(|t| t.is_file()).unwrap_or(false)
+                        && e.path().extension().is_some_and(|x| x == "md")
+                })
+                .count() as u32,
+            Err(_) => 0,
+        }
+    };
+    let count_dir_entries = |dir: &Path| -> u32 {
+        match std::fs::read_dir(dir) {
+            Ok(rd) => rd.flatten().count() as u32,
+            Err(_) => 0,
+        }
+    };
+
+    out.agent_count = count_md_files(&claude_dir.join("agents"));
+    out.skill_count = count_dir_entries(&claude_dir.join("skills"));
+    out.hook_count = count_dir_entries(&claude_dir.join("hooks"));
+    out.script_count = count_dir_entries(&claude_dir.join("scripts"));
+    out.has_context_state = claude_dir.join("CONTEXT_STATE.md").is_file();
+    out.has_claude_md = root.join("CLAUDE.md").is_file();
+    out.has_vco_manifest = claude_dir.join(".vco-manifest.json").is_file();
+
+    out.has_leftovers = out.agent_count > 0
+        || out.skill_count > 0
+        || out.hook_count > 0
+        || out.script_count > 0
+        || out.has_context_state
+        || out.has_claude_md
+        || out.has_vco_manifest;
+
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Bug 22: optional GitHub PAT for future auto-update flows that pull
 // upstream commits into the bundled source. The PAT is NOT required for
@@ -4009,6 +4098,72 @@ MemAvailable:   23456789 kB
         let bad = s.config_health.iter().filter(|c| !c.ok).count();
         // settings.json (json parse), CLAUDE.md (empty), vct-module.json (json parse)
         assert!(bad >= 3, "expected ≥3 bad checks, got {:?}", s.config_health);
+        fs::remove_dir_all(&p).ok();
+    }
+
+    // ── inspect_project_leftovers (follow-up #13, 2026-05-07) ────────
+
+    #[test]
+    fn inspect_project_leftovers_empty_dir_has_none() {
+        let p = tmp();
+        let lo = inspect_project_leftovers(p.to_string_lossy().to_string());
+        assert!(!lo.has_leftovers);
+        assert_eq!(lo.agent_count, 0);
+        assert_eq!(lo.skill_count, 0);
+        assert_eq!(lo.hook_count, 0);
+        assert_eq!(lo.script_count, 0);
+        assert!(!lo.has_context_state);
+        assert!(!lo.has_claude_md);
+        assert!(!lo.has_vco_manifest);
+        fs::remove_dir_all(&p).ok();
+    }
+
+    #[test]
+    fn inspect_project_leftovers_missing_dir_returns_none() {
+        // Non-existent path is fine — no panic, just zeros.
+        let p = std::env::temp_dir()
+            .join(format!("vct-no-such-dir-{}", uuid::Uuid::new_v4().simple()));
+        let lo = inspect_project_leftovers(p.to_string_lossy().to_string());
+        assert!(!lo.has_leftovers);
+    }
+
+    #[test]
+    fn inspect_project_leftovers_post_unregister_finds_preserved_content() {
+        // Mimic the state after PR-150's non-destructive unregister: hooks
+        // and scripts purged, agents/skills/CONTEXT_STATE/CLAUDE.md preserved.
+        let p = tmp();
+        fs::create_dir_all(p.join(".claude").join("agents")).unwrap();
+        fs::write(p.join(".claude/agents/coder.md"), "# coder\n").unwrap();
+        fs::write(p.join(".claude/agents/tester.md"), "# tester\n").unwrap();
+        fs::create_dir_all(p.join(".claude").join("skills").join("foo")).unwrap();
+        fs::write(p.join(".claude/skills/foo/SKILL.md"), "# foo\n").unwrap();
+        fs::write(p.join(".claude/CONTEXT_STATE.md"), "# state\n").unwrap();
+        fs::write(p.join("CLAUDE.md"), "# project\n").unwrap();
+
+        let lo = inspect_project_leftovers(p.to_string_lossy().to_string());
+        assert!(lo.has_leftovers);
+        assert_eq!(lo.agent_count, 2);
+        assert_eq!(lo.skill_count, 1); // 1 entry under skills/ (the foo dir)
+        assert_eq!(lo.hook_count, 0);
+        assert_eq!(lo.script_count, 0);
+        assert!(lo.has_context_state);
+        assert!(lo.has_claude_md);
+        assert!(!lo.has_vco_manifest);
+        fs::remove_dir_all(&p).ok();
+    }
+
+    #[test]
+    fn inspect_project_leftovers_only_user_code_has_none() {
+        // A user-code-only folder (no .claude/, no CLAUDE.md) should
+        // surface NO leftovers — the wizard should treat it as fresh.
+        let p = tmp();
+        fs::write(p.join("main.py"), "print('hi')\n").unwrap();
+        fs::create_dir_all(p.join("src")).unwrap();
+        fs::write(p.join("src/lib.rs"), "fn main() {}\n").unwrap();
+
+        let lo = inspect_project_leftovers(p.to_string_lossy().to_string());
+        assert!(!lo.has_leftovers);
+        assert_eq!(lo.agent_count, 0);
         fs::remove_dir_all(&p).ok();
     }
 

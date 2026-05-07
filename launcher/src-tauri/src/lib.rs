@@ -271,6 +271,7 @@ pub fn run() {
             commands::installer::update_orchestrator,
             commands::installer::get_local_repo_source,
             commands::installer::inspect_orchestrator_at,
+            commands::installer::inspect_project_leftovers,
             commands::installer::update_orchestrator_at,
             // GitHub PAT lifecycle. `register_github_pat` is wired in the
             // OnboardingWizard (Bug 22). The read/clear surface (has/preview/
