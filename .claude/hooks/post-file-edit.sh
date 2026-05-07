@@ -49,11 +49,15 @@ if [[ "$EDITED_FILE" == "$KNOWLEDGE_ROOT"* ]]; then
     COUNT=$((COUNT + 1))
     echo "$COUNT" > "$EDIT_COUNT_FILE"
 
-    # Check for duplicates every 10 edits
+    # Check for duplicates every 10 edits.
+    # Cap output upstream of the grep filter — kg-duplicates is O(n²) over KG
+    # nodes so on large KGs the raw output can be thousands of lines. Audit
+    # fix 2026-05-07.
     if [ $((COUNT % 10)) -eq 0 ]; then
         echo "🔍 Running duplicate detection (every 10 edits)..."
-        (.claude/scripts/kg-duplicates --threshold 0.95 2>&1 | \
-         grep -E "(✅|⚠️|📊)" || true) &
+        (.claude/scripts/kg-duplicates --threshold 0.95 2>&1 \
+            | head -c 204800 | head -200 \
+            | grep -E "(✅|⚠️|📊)" || true) &
     fi
 fi
 

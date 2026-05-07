@@ -127,6 +127,9 @@ if ($IsCode) {
 Remove-Item $KgTmp.FullName, $CodeTmp.FullName -Force -ErrorAction SilentlyContinue
 
 # Dedup against this session's seen nodes.
+# Note (audit fix 2026-05-07): the .ps1 sibling already uses a hashtable
+# (`$seen = @{}`) for O(1) lookups, so the bash-side bug (per-line grep
+# scaling O(input × seen)) does not exist here. Parity-touch only.
 function Filter-Seen([string]$input) {
     if (-not $input) { return "" }
     $filtered = New-Object System.Text.StringBuilder

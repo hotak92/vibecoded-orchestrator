@@ -58,7 +58,11 @@ METRICS_FILE="$METRICS_DIR/kg_update_tokens.jsonl"
 
 mkdir -p "$METRICS_DIR" 2>/dev/null || exit 0
 
-python3 <<PYTHON_EOF || true
+# Pass INPUT (untrusted JSON payload) via env var — payload containing """,
+# backslashes, or shell metacharacters can no longer break the Python parser.
+# Other substitutions (FIRST_THRESHOLD/INTERVAL/etc.) are under our control
+# and stay direct for readability. Audit fix 2026-05-07.
+KG_NUDGE_INPUT="$INPUT" python3 <<PYTHON_EOF || true
 import json
 import os
 import sys
@@ -66,7 +70,7 @@ import fcntl
 import tempfile
 from datetime import datetime, timezone
 
-INPUT = """$INPUT"""
+INPUT = os.environ.get("KG_NUDGE_INPUT", "")
 FIRST_THRESHOLD = $FIRST_THRESHOLD
 INTERVAL = $INTERVAL
 METRICS_FILE = "$METRICS_FILE"

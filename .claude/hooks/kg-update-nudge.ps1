@@ -50,6 +50,10 @@ if (-not $pythonCmd) {
 }
 
 # Hand the payload to Python via stdin; pass thresholds + paths via env.
+# Note (audit fix 2026-05-07): the .ps1 sibling already passes INPUT via env
+# var rather than interpolating it into the Python heredoc, so the bash-side
+# bug (Python SyntaxError on triple-quoted INPUT) does not exist here.
+# Parity-touch only — no behavioural change.
 $env:_KG_NUDGE_INPUT       = $input_json
 $env:_KG_NUDGE_FIRST       = $FIRST_THRESHOLD
 $env:_KG_NUDGE_INTERVAL    = $INTERVAL

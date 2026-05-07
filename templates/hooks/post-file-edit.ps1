@@ -53,6 +53,10 @@ if ($EditedFile.StartsWith($KnowledgeRoot, [StringComparison]::OrdinalIgnoreCase
         Write-Output "Running duplicate detection (every 10 edits)..."
         $dupPs1 = Join-Path $ProjectRoot ".claude/scripts/kg-duplicates.ps1"
         $dupSh = Join-Path $ProjectRoot ".claude/scripts/kg-duplicates"
+        # Note (audit fix 2026-05-07): the .ps1 sibling already discards
+        # output via `Start-Process -WindowStyle Hidden | Out-Null`, so the
+        # bash-side bug (unbounded grep buffer) does not exist here.
+        # Parity-touch only — no behavioural change.
         if (Test-Path $dupPs1) {
             Start-Process -FilePath "pwsh" -ArgumentList @('-NoProfile','-File',$dupPs1,'--threshold','0.95') -WorkingDirectory $ProjectRoot -WindowStyle Hidden | Out-Null
         } elseif ((Test-Path $dupSh) -and (Get-Command bash -ErrorAction SilentlyContinue)) {

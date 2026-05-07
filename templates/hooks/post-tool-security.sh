@@ -42,7 +42,20 @@ check_pattern "Generic secret"           '(SECRET|API_KEY|ACCESS_TOKEN|PRIVATE_K
 
 if [ ${#ALERTS[@]} -gt 0 ]; then
     MSG="Possible credential in $(basename "$EDITED_FILE"): ${ALERTS[*]}"
-    echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"file\":\"$EDITED_FILE\",\"patterns\":\"${ALERTS[*]}\"}" >> "$ALERT_LOG" 2>/dev/null || true
+    # Build the JSONL line via Python so EDITED_FILE / ALERTS[] / patterns
+    # are properly JSON-escaped. Audit fix 2026-05-07.
+    JSONL=$(EDITED_FILE_FOR_PY="$EDITED_FILE" PATTERNS_FOR_PY="${ALERTS[*]}" python3 -c '
+import json, os, sys
+from datetime import datetime, timezone
+sys.stdout.write(json.dumps({
+    "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "file": os.environ.get("EDITED_FILE_FOR_PY", ""),
+    "patterns": os.environ.get("PATTERNS_FOR_PY", ""),
+}))
+' 2>/dev/null)
+    if [ -n "$JSONL" ]; then
+        printf '%s\n' "$JSONL" >> "$ALERT_LOG" 2>/dev/null || true
+    fi
     # Cross-platform notification (Linux/macOS/Windows). See audit F2.
     if [ -n "${PY:-}" ] && [ -f "$PROJECT_ROOT/.claude/scripts/notify.py" ]; then
         "$PY" "$PROJECT_ROOT/.claude/scripts/notify.py" \

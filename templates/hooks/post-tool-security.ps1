@@ -49,9 +49,16 @@ foreach ($p in $patterns) {
 if ($alerts.Count -gt 0) {
     $base = Split-Path $EditedFile -Leaf
     $msg = "Possible credential in ${base}: $($alerts -join ' ')"
-    $ts = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-    $fileEsc = $EditedFile -replace '\\', '\\\\' -replace '"', '\"'
-    $line = "{""timestamp"":""$ts"",""file"":""$fileEsc"",""patterns"":""$($alerts -join ' ')""}"
+    # Build the JSONL line via ConvertTo-Json so all fields are properly
+    # escaped (paths with quotes, future labels with metacharacters, etc.).
+    # -Compress keeps it on one line; -Depth 5 is plenty for this flat shape.
+    # Audit fix 2026-05-07.
+    $entry = [ordered]@{
+        timestamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        file      = $EditedFile
+        patterns  = ($alerts -join ' ')
+    }
+    $line = $entry | ConvertTo-Json -Compress -Depth 5
     try { Add-Content -Path $AlertLog -Value $line -ErrorAction Stop } catch { }
 
     $NotifyScript = Join-Path $ProjectRoot ".claude/scripts/notify.py"

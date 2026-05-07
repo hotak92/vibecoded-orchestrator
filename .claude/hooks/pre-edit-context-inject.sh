@@ -150,17 +150,29 @@ rm -f "$KG_TMP" "$CODE_TMP"
 # === Dedup: filter out nodes already injected this session ===
 # KG result lines start with "Title | type | score=..." — extract title (first field before |)
 # Code graph lines vary but typically have the entity name as first field
+#
+# Performance: load SEEN_NODES_FILE once into an associative array rather
+# than per-line grep. Output semantics identical. Audit fix 2026-05-07.
 _filter_seen() {
     local input="$1"
     local filtered=""
     touch "$SEEN_NODES_FILE"
+
+    # Load existing seen titles into a hash table (one file scan, O(n)).
+    declare -A seen_titles
+    while IFS= read -r seen_line; do
+        [ -z "$seen_line" ] && continue
+        seen_titles["$seen_line"]=1
+    done < "$SEEN_NODES_FILE"
+
     while IFS= read -r line; do
         [ -z "$line" ] && continue
         # Extract title: first field before " | " (KG) or first meaningful token (code graph)
         local title
         title=$(echo "$line" | sed 's/ | .*//' | head -c 100)
-        if [ -n "$title" ] && ! grep -qFx "$title" "$SEEN_NODES_FILE" 2>/dev/null; then
+        if [ -n "$title" ] && [ -z "${seen_titles[$title]:-}" ]; then
             filtered="${filtered}${line}"$'\n'
+            seen_titles["$title"]=1
             echo "$title" >> "$SEEN_NODES_FILE"
         fi
     done <<< "$input"
