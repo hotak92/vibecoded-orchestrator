@@ -132,11 +132,16 @@ const ORCHESTRATOR_MANAGED_PATHS_TXT: &str =
 /// Parse the embedded text file into a list of allowlist entries.
 ///
 /// Parse rules (must match `_parse_managed_paths_text` in `install.py`):
+///   - A leading UTF-8 BOM (`\u{feff}`) on the first line is stripped.
+///     Saved-from-Windows-Notepad files routinely carry one and
+///     `str::trim` does NOT remove BOM characters; without this, the
+///     first allowlist entry silently fails to match.
 ///   - Lines are stripped of leading/trailing whitespace.
 ///   - Empty lines are skipped.
 ///   - Lines whose first non-whitespace character is `#` are comments
 ///     and are skipped entirely (no inline comments).
 fn parse_managed_paths_text(text: &'static str) -> Vec<&'static str> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     text.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
@@ -5204,6 +5209,36 @@ MemAvailable:   23456789 kB
             msg
         );
         fs::remove_dir_all(&p).ok();
+    }
+
+    // ---- managed-paths parser ------------------------------------------
+    //
+    // Parser must match `_parse_managed_paths_text` in install.py. The
+    // BOM-strip case below pins fix from the PR-5 reviewer follow-up
+    // (2026-05-06): saved-from-Windows-Notepad files routinely carry a
+    // UTF-8 BOM at the start, and `str::trim` does NOT remove it. Without
+    // this, the first allowlist entry silently fails to match.
+
+    #[test]
+    fn test_parse_managed_paths_strips_leading_bom() {
+        let text: &'static str = "\u{feff}.claude\nCLAUDE.md\n";
+        assert_eq!(parse_managed_paths_text(text), vec![".claude", "CLAUDE.md"]);
+    }
+
+    #[test]
+    fn test_parse_managed_paths_no_bom_unaffected() {
+        let text: &'static str = ".claude\nCLAUDE.md\n";
+        assert_eq!(parse_managed_paths_text(text), vec![".claude", "CLAUDE.md"]);
+    }
+
+    #[test]
+    fn test_parse_managed_paths_bom_only_at_start() {
+        // A stray BOM mid-file is still treated as part of the line. We
+        // only strip a BOM at file start (matching install.py).
+        let text: &'static str = ".claude\n\u{feff}CLAUDE.md\n";
+        let got = parse_managed_paths_text(text);
+        assert_eq!(got[0], ".claude");
+        assert_eq!(got[1], "\u{feff}CLAUDE.md");
     }
 
     #[test]

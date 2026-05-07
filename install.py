@@ -894,6 +894,11 @@ def _parse_managed_paths_text(text: str) -> tuple[str, ...]:
     Parse rules (must match ``parse_managed_paths_text`` in
     ``launcher/src-tauri/src/commands/installer.rs``):
 
+      * A leading UTF-8 BOM (``\\ufeff``) on the first line is
+        stripped. Saved-from-Windows-Notepad files routinely carry one
+        and ``str.strip()`` does NOT remove BOM characters; without
+        this, the first allowlist entry silently fails to match and
+        the file gets treated as if its first line were missing.
       * Lines are stripped of leading/trailing whitespace.
       * Empty lines are skipped.
       * Lines whose first non-whitespace character is ``#`` are
@@ -903,6 +908,8 @@ def _parse_managed_paths_text(text: str) -> tuple[str, ...]:
     Order is preserved so the resulting tuple has the same shape as
     the file, which makes diff output legible when entries change.
     """
+    if text.startswith("﻿"):
+        text = text[1:]
     out: list[str] = []
     for line in text.splitlines():
         stripped = line.strip()
