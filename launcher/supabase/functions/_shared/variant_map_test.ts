@@ -5,8 +5,9 @@
 // CI runs the same command (no Supabase project required — purely
 // pure-function tests on lookupVariant + isAdminVariant).
 
-import { assertEquals } from "https://deno.land/std@0.224.0/assert/mod.ts";
+import { assertEquals, assertThrows } from "https://deno.land/std@0.224.0/assert/mod.ts";
 import {
+  assertNoPlaceholderKeysInProduction,
   constantTimeEq,
   isAdminVariant,
   lookupVariant,
@@ -75,8 +76,8 @@ Deno.test("lookupVariant: admin variant returns admin tier on orchestrator", () 
 
 Deno.test("lookupVariant: admin classification overrides any static map entry", () => {
   // Even if 999 were in VARIANT_MAP as a Pro key, admin env would win.
-  withAdminEnv(["ORCHESTRATOR_PRO_MONTHLY_TODO"], () => {
-    const m = lookupVariant("ORCHESTRATOR_PRO_MONTHLY_TODO");
+  withAdminEnv(["ORCHESTRATOR_PRO_MONTHLY_PLACEHOLDER"], () => {
+    const m = lookupVariant("ORCHESTRATOR_PRO_MONTHLY_PLACEHOLDER");
     assertEquals(m, { appId: "orchestrator", tier: "admin" });
   });
 });
@@ -200,4 +201,62 @@ Deno.test("lookupVaultAdminToken: array (not object) at top level returns null",
     lookupVaultAdminToken(TEST_TOKEN_ALICE, TEST_MACHINE_HASH, JSON.stringify([1, 2, 3])),
     null,
   );
+});
+
+// ─── Placeholder-key production guard (audit blocker #3, 2026-05-07) ──
+
+Deno.test("assertNoPlaceholderKeysInProduction: throws when NODE_ENV=production", () => {
+  // Current VARIANT_MAP still has *_PLACEHOLDER keys (pre-launch state).
+  // The guard MUST throw under production env to prevent silent webhook
+  // failure on launch day.
+  assertThrows(
+    () =>
+      assertNoPlaceholderKeysInProduction({ NODE_ENV: "production" }),
+    Error,
+    "placeholder",
+  );
+});
+
+Deno.test("assertNoPlaceholderKeysInProduction: throws when DENO_DEPLOYMENT_ID is set", () => {
+  // Supabase edge functions don't set NODE_ENV but DO set
+  // DENO_DEPLOYMENT_ID — both signal production.
+  assertThrows(
+    () =>
+      assertNoPlaceholderKeysInProduction({ DENO_DEPLOYMENT_ID: "abc-123" }),
+    Error,
+    "placeholder",
+  );
+});
+
+Deno.test("assertNoPlaceholderKeysInProduction: silent in dev (no env)", () => {
+  // Local dev / unit tests: empty env → no NODE_ENV, no
+  // DENO_DEPLOYMENT_ID → guard skips. Test as no-throw.
+  assertNoPlaceholderKeysInProduction({});
+});
+
+Deno.test("assertNoPlaceholderKeysInProduction: silent in dev (NODE_ENV=development)", () => {
+  assertNoPlaceholderKeysInProduction({ NODE_ENV: "development" });
+});
+
+Deno.test("assertNoPlaceholderKeysInProduction: error message names offending keys", () => {
+  // Useful for the on-call engineer: error tells them WHICH keys to fix.
+  try {
+    assertNoPlaceholderKeysInProduction({ NODE_ENV: "production" });
+    throw new Error("expected throw");
+  } catch (e) {
+    const msg = (e as Error).message;
+    // Each of the 6 placeholder keys should be named.
+    for (const k of [
+      "ORCHESTRATOR_PRO_MONTHLY_PLACEHOLDER",
+      "ORCHESTRATOR_PRO_ANNUAL_PLACEHOLDER",
+      "ORCHESTRATOR_PRO_LIFETIME_PLACEHOLDER",
+      "MAO_MONTHLY_PLACEHOLDER",
+      "MAO_ANNUAL_PLACEHOLDER",
+      "MAO_LIFETIME_PLACEHOLDER",
+    ]) {
+      if (!msg.includes(k)) {
+        throw new Error(`error message missing key ${k}: ${msg}`);
+      }
+    }
+  }
 });

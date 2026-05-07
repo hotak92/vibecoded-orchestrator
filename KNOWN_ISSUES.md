@@ -25,12 +25,12 @@ flagging for early adopters and the next iteration.
 
 - [ ] **Launcher binary not yet code-signed (Windows + macOS)** — Windows shows SmartScreen "Windows
       protected your PC"; macOS Gatekeeper shows "damaged and can't be opened". Both are expected for
-      v0.1.0. Workarounds documented in [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#first-install-issues).
-      Code signing is on the v0.1.1 backlog.
+      v0.1.x. Workarounds documented in [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#first-install-issues).
+      Code signing is on the v0.2 backlog.
 
 - [ ] **Apple Developer enrollment / notarization pending** — the macOS `.dmg` is built unattended in
-      CI without notarization. Intel Mac users must build from source for v0.1.0; a Universal binary
-      is planned for v0.1.1.
+      CI without notarization. Intel Mac users must build from source for v0.1.x; a Universal binary
+      is planned for v0.2.
 
 - [ ] **Linux .desktop double-click requires per-file-manager config** — documented in
       [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#linux-desktop-file-doesnt-open-on-double-click).
@@ -45,7 +45,7 @@ flagging for early adopters and the next iteration.
       transitive dep of `weaviate-client`, and several "No abstraction level tag" /
       "Tag 'LoRA' uses camelCase" vocabulary warnings from the bundled seed nodes in
       `knowledge/concepts/`. None affect correctness; the install completes successfully.
-      Vocabulary cleanup of seed nodes is a v0.1.1 chore.
+      Vocabulary cleanup of seed nodes is on the v0.1.x chore backlog.
 
 - [ ] **First-install grew by ~150 MB for Playwright MCP** — the default-enabled
       `playwright` MCP entry pre-caches Chromium during `install.py` so the first
@@ -78,7 +78,7 @@ flagging for early adopters and the next iteration.
       or click Refresh on the MCP tab. Fix on v0.1.x backlog.
 
 - [ ] **Apple Developer enrollment / notarization pending** — already in this list under Install/first-run;
-      tracked as v0.1.1 priority. Without notarization the macOS `.dmg` requires manual Gatekeeper override.
+      tracked as v0.2 priority. Without notarization the macOS `.dmg` requires manual Gatekeeper override.
 
 - [ ] **Lightweight Rust wiring for `--lightweight` re-install** — the Python path is shipped (`install.py
       --lightweight` skips model pulls + seeding + agent/skill copy; `--lightweight-old-path` rewrites

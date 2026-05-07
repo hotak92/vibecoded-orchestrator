@@ -10,7 +10,7 @@ This repo is licensed **AGPL-3.0**. Any source file you create or modify under `
 
 **Before answering any non-trivial question:**
 1. Read `.claude/CONTEXT_STATE.md` — current task, recent progress, blockers.
-2. For architecture/system questions → check `docs/ARCHITECTURE.md` if the project ships one.
+2. For architecture/system questions → check `docs/features/` (per-area design notes: MCPs + agents, code graph, KG, RL retrieval, install flow, etc.).
 3. For any other project question → search the KG / code graph **before** generating a response.
 
 **Never explain project state from memory.** If you don't know something with certainty, look it up first.

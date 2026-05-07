@@ -1,10 +1,20 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-import { lookupVariant } from "../_shared/variant_map.ts";
+import {
+  assertNoPlaceholderKeysInProduction,
+  lookupVariant,
+} from "../_shared/variant_map.ts";
 import {
   HANDLED_EVENTS,
   activateAppForUser,
   dispatchLifecycleEvent,
 } from "./orchestrator_additions.ts";
+
+// Pre-flight: hard-fail at module init if VARIANT_MAP still ships
+// placeholder keys in a production deployment. Prevents the silent
+// failure where every Pro purchase falls through to "unknown variant"
+// and never sets the customer's tier. See variant_map.ts JSDoc for the
+// full failure-mode rationale (audit blocker #3, 2026-05-07).
+assertNoPlaceholderKeysInProduction();
 
 // Constant-time string comparison. Avoids leaking signature bytes via
 // short-circuit timing of `===`. Both inputs are hex strings of equal length

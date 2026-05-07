@@ -11,12 +11,18 @@
 
 import {
   appendAdminAuthLog,
+  assertNoPlaceholderKeysInProduction,
   bindVaultAdminMachine,
   fetchVaultAdminTokensJson,
   lookupVariant,
   lookupVaultAdminToken,
   type OrchestratorTier,
 } from "../_shared/variant_map.ts";
+
+// Pre-flight: hard-fail at module init if VARIANT_MAP still has
+// placeholder keys in production. Same rationale as
+// lemon-squeezy-webhook (audit blocker #3, 2026-05-07).
+assertNoPlaceholderKeysInProduction();
 
 const LS_BASE = "https://api.lemonsqueezy.com/v1";
 const LS_TIMEOUT_MS = 8000;

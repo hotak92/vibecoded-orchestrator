@@ -37,14 +37,82 @@ export const VARIANT_MAP: Record<string, VariantMapping> = {
 
   // ─── Orchestrator tier products ───────────────────────────────────────────
   // appId is always "orchestrator"; tier determines what's unlocked.
-  // Replace the *_TODO keys with the real variant_id from each LS product URL.
-  "ORCHESTRATOR_PRO_MONTHLY_TODO":  { appId: "orchestrator", tier: "pro" },
-  "ORCHESTRATOR_PRO_ANNUAL_TODO":   { appId: "orchestrator", tier: "pro" },
-  "ORCHESTRATOR_PRO_LIFETIME_TODO": { appId: "orchestrator", tier: "pro" },
-  "MAO_MONTHLY_TODO":               { appId: "orchestrator", tier: "mao" },
-  "MAO_ANNUAL_TODO":                { appId: "orchestrator", tier: "mao" },
-  "MAO_LIFETIME_TODO":              { appId: "orchestrator", tier: "mao" },
+  //
+  // **PLACEHOLDER KEYS — NOT REAL VARIANT IDs.** The 6 keys below are
+  // sentinel strings, not actual Lemon Squeezy variant_ids (LS variant
+  // IDs are numeric strings like "123456"). They exist so the type
+  // shape + tier mapping are testable without leaking the real IDs
+  // into the public AGPL repo before the products go live.
+  //
+  // Pre-launch checklist (track in fork):
+  //   1. Create the 6 LS products in the dashboard.
+  //   2. Replace the `*_PLACEHOLDER` keys with the numeric variant_ids
+  //      from each LS product URL.
+  //   3. Confirm assertNoPlaceholderKeysInProduction() at the bottom
+  //      of this file no longer throws when run with NODE_ENV=production.
+  //
+  // RUNTIME GUARD: assertNoPlaceholderKeysInProduction() (called at
+  // edge-function init) hard-fails if any *_PLACEHOLDER key reaches
+  // a production environment. Preserves the testable shape during dev
+  // while preventing a silent webhook failure on launch day where a
+  // real LS purchase would fall through (because no real variant_id
+  // matches the sentinel strings).
+  "ORCHESTRATOR_PRO_MONTHLY_PLACEHOLDER":  { appId: "orchestrator", tier: "pro" },
+  "ORCHESTRATOR_PRO_ANNUAL_PLACEHOLDER":   { appId: "orchestrator", tier: "pro" },
+  "ORCHESTRATOR_PRO_LIFETIME_PLACEHOLDER": { appId: "orchestrator", tier: "pro" },
+  "MAO_MONTHLY_PLACEHOLDER":               { appId: "orchestrator", tier: "mao" },
+  "MAO_ANNUAL_PLACEHOLDER":                { appId: "orchestrator", tier: "mao" },
+  "MAO_LIFETIME_PLACEHOLDER":              { appId: "orchestrator", tier: "mao" },
 };
+
+/**
+ * Pre-flight guard against shipping placeholder variant IDs to production.
+ *
+ * Call from edge-function module init (so the function fails to start
+ * rather than silently 200ing every webhook on launch day). The launch
+ * scenario this prevents:
+ *
+ *   - User buys Pro subscription via Lemon Squeezy.
+ *   - LS sends webhook with the REAL variant_id (e.g. "987654").
+ *   - Edge function calls lookupVariant("987654") → undefined (real ID
+ *     not in VARIANT_MAP because still placeholders).
+ *   - Webhook returns 200 (per the catch-all `unknown variant` log+drop
+ *     path in lemon-squeezy-webhook). User's profile never gets
+ *     `tier=pro`. Customer support nightmare.
+ *
+ * Hard-failing at module init makes the misconfiguration impossible to
+ * miss — Supabase logs flag the function as crashing on every call.
+ *
+ * Skip in development (NODE_ENV !== "production") so placeholder-keyed
+ * unit tests still work.
+ */
+export function assertNoPlaceholderKeysInProduction(
+  env: { NODE_ENV?: string; DENO_DEPLOYMENT_ID?: string } = {
+    // deno-lint-ignore no-explicit-any
+    NODE_ENV: (globalThis as any).Deno?.env?.get?.("NODE_ENV"),
+    // deno-lint-ignore no-explicit-any
+    DENO_DEPLOYMENT_ID: (globalThis as any).Deno?.env?.get?.("DENO_DEPLOYMENT_ID"),
+  },
+): void {
+  // Production = explicit NODE_ENV=production OR running on Supabase
+  // (DENO_DEPLOYMENT_ID is set by the platform). Local dev / unit tests
+  // satisfy neither and skip the assert.
+  const isProduction =
+    env.NODE_ENV === "production" || !!env.DENO_DEPLOYMENT_ID;
+  if (!isProduction) return;
+
+  const offenders = Object.keys(VARIANT_MAP).filter((k) =>
+    k.includes("_PLACEHOLDER")
+  );
+  if (offenders.length > 0) {
+    throw new Error(
+      `VARIANT_MAP contains ${offenders.length} placeholder key(s) that ` +
+        `must NOT ship to production: ${offenders.join(", ")}. Replace them ` +
+        `with real Lemon Squeezy variant_ids from the LS dashboard before ` +
+        `deploying.`,
+    );
+  }
+}
 
 /**
  * Look up the mapping for a given variant_id.

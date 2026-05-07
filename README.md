@@ -124,7 +124,7 @@ You use Claude Code the way you already do. The orchestrator runs in the backgro
 - **19 free agents + 28 skills** — shipped via `install.py` templates. The opt-in MAO add-on installs 10 more specialist agents.
 - **Workflow plumbing** — session state tracking, plans, memory management, compaction-preserving context replay
 
-## Downloads (Launcher GUI — v0.1.0+)
+## Downloads (Launcher GUI — v0.1.6+)
 
 The launcher GUI ships as a per-OS standalone artifact on [GitHub
 Releases](https://github.com/hotak92/vibecoded-orchestrator/releases). It's
@@ -134,7 +134,7 @@ wizard on first run.
 
 | OS | Artifact | Notes |
 |---|---|---|
-| **Windows 10/11 (x64)** | `vct-launcher-windows-x64.exe` | Portable, no installer. **First run**: SmartScreen will warn "Windows protected your PC" because the build is unsigned. Click **More info** → **Run anyway**. Code signing is on the v0.1.1 backlog. |
+| **Windows 10/11 (x64)** | `vct-launcher-windows-x64.exe` | Portable, no installer. **First run**: SmartScreen will warn "Windows protected your PC" because the build is unsigned. Click **More info** → **Run anyway**. Code signing is on the v0.2 backlog. |
 | **Linux (x64)** | `*.AppImage` (portable) or `*.deb` (Debian/Ubuntu) | AppImage: `chmod +x VCT_Launcher_*.AppImage && ./VCT_Launcher_*.AppImage`. .deb: `sudo dpkg -i vct-launcher_*.deb`. |
 | **macOS (Apple Silicon, experimental)** | `vct-launcher-macos-arm64.dmg` | See "macOS (experimental)" below. We have no Mac to test on, so quality is best-effort. |
 
@@ -152,10 +152,10 @@ We can't test on Mac. The .dmg is built unattended in CI. Try at your own risk.
    ```
 4. Open the app from /Applications.
 
-If it works, please open an issue saying "v0.1.0 worked on macOS [version] [arch]". That helps us prioritise Apple Developer enrollment.
+If it works, please open an issue saying "v0.1.6 worked on macOS [version] [arch]". That helps us prioritise Apple Developer enrollment.
 If it doesn't, please open an issue with macOS version, architecture (`uname -m`), and the error message.
 
-Apple Developer enrollment + notarization are on the post-launch backlog. Intel Mac users: build from source for v0.1.0; a Universal binary is planned for v0.1.1.
+Apple Developer enrollment + notarization are on the post-launch backlog. Intel Mac users: build from source for v0.1.6; a Universal binary is planned for v0.2.
 
 ## Quick Install
 
@@ -369,8 +369,9 @@ vibecoded-orchestrator/
     docker-compose.gpu.yml   # NVIDIA GPU overlay
   VCThelpers/           # License validator + telemetry (opt-in)
   knowledge/            # Knowledge graph nodes — your persistent memory
-  config/               # Configuration templates
+  vco_lib/              # Shared install/init logic (used by launcher + CLI)
   docs/                 # Documentation
+  tools/                # Developer tooling (vct-secrets CLI, etc.)
   CLAUDE.md             # Instructions for Claude Code when opening this repo
 ```
 
@@ -442,8 +443,10 @@ Contributions welcome — small fixes and bug reports especially. See [CONTRIBUT
 - [Configuration philosophy](docs/CONFIGURATION.md) — minimal global, max per-project; where each config lives
 - [Troubleshooting](docs/TROUBLESHOOTING.md) — bypass-permissions, container/MCP issues, first-run problems
 - [Getting started](docs/GETTING_STARTED.md) — install, first-session walkthrough, and cross-project setup
-- [Positioning](docs/POSITIONING.md) — target market + competitive framing (launch asset, not user docs)
+- [Architecture features](docs/features/) — per-area design notes (MCPs + agents, code graph, KG, RL retrieval, install flow)
 - [Dependency licenses](docs/DEPENDENCY_LICENSES.md) — transitive licensing audit for the AGPL-3.0 release
+- [Releasing](docs/RELEASING.md) — pre-flight build procedure (binary rebuild via wrapper script)
+- [Recovery (post-history-rewrite)](docs/RECOVERY-2026-05-06.md) — for users with pre-2026-05-06 clones
 - [Templates README](templates/README.md) — what agents and skills install.py will drop into `.claude/`
 
 ## Links
