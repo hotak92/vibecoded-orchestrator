@@ -438,6 +438,25 @@ def _allocate_tier_within_budget(
             return ("summary", 0)
 
 
+# search_code_graph tier policy (Option A, 2026-05-07).
+# See claude-orchestrator commit fbed0e0+ for design rationale.
+#
+# Ranks 1-2 (full_xl): untruncated content + function_body / class_body.
+# Ranks 3-4 (full_l): truncated at CODE_TRUNC_CHARS (default 1200, was 200).
+# Ranks 5+ (ref): metadata-only refs.
+#
+# Top-2 also get adjacent siblings in the same source file (CodeFunction /
+# CodeClass only): up to CODE_SIBLINGS_RANK_1 (default 7) for rank 1,
+# CODE_SIBLINGS_RANK_2 (default 5) for rank 2 — counts include the seed.
+#
+# Subgraph expansion is now capped independently at CODE_EXPANSION_LIMIT
+# (default 8) instead of sharing the seed `limit` budget.
+CODE_SIBLINGS_RANK_1: int = int(os.getenv("CODE_SIBLINGS_RANK_1", "7"))
+CODE_SIBLINGS_RANK_2: int = int(os.getenv("CODE_SIBLINGS_RANK_2", "5"))
+CODE_TRUNC_CHARS: int = int(os.getenv("CODE_TRUNC_CHARS", "1200"))
+CODE_EXPANSION_LIMIT: int = int(os.getenv("CODE_EXPANSION_LIMIT", "8"))
+
+
 def _chunk_summaries_header(
     file_path: str,
     shown_chunk_nums: list[int] | None = None,
@@ -2712,22 +2731,141 @@ async def search_code_graph(
                 return "/".join(parts[:-1]) if len(parts) > 1 else p["full_name"]
             return ""
 
-        # Determine per-result verbosity. Backward-compatible default ("auto")
-        # mirrors the legacy "top 4 full / rest refs" heuristic. Explicit
-        # detail values apply uniformly. Decision: code graph has no sidecar,
-        # so we cannot do score-threshold tiering — we use position-based
-        # tiering (rank order) for "auto" instead. The score is still in every
-        # result for client-side filtering.
+        # Determine per-result verbosity. Code graph has no sidecar, so we
+        # use position-based tiering (rank order) for "auto" rather than
+        # score-threshold tiering. The score is still in every result for
+        # client-side filtering. Explicit detail values apply uniformly.
         if detail not in ("auto", "titles", "full"):
-            # Map legacy/unknown values onto sane defaults rather than 500ing.
             detail = "auto"
 
+        def _truncate(s: str, n: int) -> str:
+            return s[:n] + "..." if len(s) > n else s
+
+        def _format_full(coll_name: str, p: dict, *, untruncated: bool) -> dict:
+            """Build the full-tier fields for a result.
+
+            untruncated=True: top-2 ranks — include function_body / class_body
+            untruncated, all doc/summary/description fields untruncated.
+            untruncated=False: ranks 3-4 — same fields as top-2 EXCEPT no
+            function_body/class_body (those are large), and doc/summary/
+            description truncated at CODE_TRUNC_CHARS (default 1200, was 200).
+            """
+            out: dict = {}
+            if coll_name == "CodeFunction":
+                doc = p.get("doc", "") or ""
+                out["full_name"] = p.get("full_name", "")
+                out["signature"] = p.get("signature", "")
+                out["doc"] = doc if untruncated else _truncate(doc, CODE_TRUNC_CHARS)
+                out["location"] = f"{p.get('start_line','?')}-{p.get('end_line','?')}"
+                out["is_async"] = p.get("is_async", False)
+                if untruncated:
+                    body = p.get("function_body", "") or ""
+                    if body:
+                        out["function_body"] = body
+            elif coll_name == "CodeClass":
+                doc = p.get("doc", "") or ""
+                out["full_name"] = p.get("full_name", "")
+                out["signature"] = p.get("signature", "")
+                out["doc"] = doc if untruncated else _truncate(doc, CODE_TRUNC_CHARS)
+                out["methods"] = p.get("methods", [])
+                out["method_count"] = len(p.get("methods", []))
+                out["location"] = f"{p.get('start_line','?')}-{p.get('end_line','?')}"
+                if untruncated:
+                    body = p.get("class_body", "") or ""
+                    if body:
+                        out["class_body"] = body
+            elif coll_name == "CodeModule":
+                summary = p.get("module_summary", "") or ""
+                out["path"] = p.get("path", "")
+                out["language"] = p.get("language", "")
+                out["loc"] = p.get("loc", 0)
+                out["summary"] = summary if untruncated else _truncate(summary, CODE_TRUNC_CHARS)
+            elif coll_name == "CodeAPI":
+                desc = p.get("api_description", "") or ""
+                out["endpoint"] = p.get("endpoint", "")
+                out["method"] = p.get("method", "")
+                out["description"] = desc if untruncated else _truncate(desc, CODE_TRUNC_CHARS)
+                out["parameters"] = p.get("parameters", [])
+            elif coll_name == "CodeInteraction":
+                desc = p.get("description", "") or ""
+                out["interaction_type"] = p.get("interaction_type", "")
+                out["direction"] = p.get("direction", "")
+                out["protocol"] = p.get("protocol", "")
+                out["endpoint"] = p.get("endpoint", "")
+                out["confidence"] = p.get("confidence", "")
+                out["description"] = desc if untruncated else _truncate(desc, CODE_TRUNC_CHARS)
+            return out
+
+        def _format_ref(coll_name: str, p: dict) -> dict:
+            """Metadata-only ref for lower-ranked results and expansions."""
+            out: dict = {}
+            if coll_name in ("CodeFunction", "CodeClass"):
+                out["full_name"] = p.get("full_name", "")
+            elif coll_name == "CodeModule":
+                out["path"] = p.get("path", "")
+                out["language"] = p.get("language", "")
+            elif coll_name == "CodeAPI":
+                out["endpoint"] = p.get("endpoint", "")
+                out["method"] = p.get("method", "")
+            elif coll_name == "CodeInteraction":
+                out["endpoint"] = p.get("endpoint", "")
+                out["protocol"] = p.get("protocol", "")
+                out["interaction_type"] = p.get("interaction_type", "")
+            return out
+
+        def _fetch_file_siblings(file_path: str, hit_start_line: int, max_total: int, exclude_full_name: str) -> list[dict]:
+            """Fetch up to (max_total - 1) siblings in the same source file,
+            ordered by start_line, centred on hit_start_line. Returns formatted
+            metadata-ref dicts (siblings are context, not primary results).
+            Returns [] on any failure or if file_path is missing.
+            """
+            if not file_path or max_total <= 1:
+                return []
+            try:
+                fn_coll = client.collections.get(_project_collection("CodeFunction"))
+                cls_coll = client.collections.get(_project_collection("CodeClass"))
+            except Exception as exc:
+                logger.debug("search_code_graph: sibling collection unavailable (%s)", exc)
+                return []
+            collected: list[tuple[int, str, dict]] = []
+            for coll_obj, c_name in ((fn_coll, "CodeFunction"), (cls_coll, "CodeClass")):
+                try:
+                    sib_filter = Filter.by_property("file_path").equal(file_path)
+                    if effective_project:
+                        sib_filter = sib_filter & Filter.by_property("project").equal(effective_project)
+                    sib_resp = coll_obj.query.fetch_objects(filters=sib_filter, limit=64)
+                    for obj in sib_resp.objects:
+                        sp = obj.properties or {}
+                        if sp.get("full_name") == exclude_full_name:
+                            continue
+                        sl = sp.get("start_line")
+                        try:
+                            sl_int = int(sl) if sl is not None else 0
+                        except (TypeError, ValueError):
+                            sl_int = 0
+                        collected.append((sl_int, c_name, sp))
+                except Exception as exc:
+                    logger.debug("search_code_graph: sibling fetch %s failed: %s", c_name, exc)
+            if not collected:
+                return []
+            collected.sort(key=lambda t: abs(t[0] - hit_start_line))
+            picked = collected[: max_total - 1]
+            picked.sort(key=lambda t: t[0])
+            siblings: list[dict] = []
+            for sl_int, c_name, sp in picked:
+                ref = _format_ref(c_name, sp)
+                ref["sibling"] = True
+                ref["start_line"] = sl_int
+                ref["collection"] = c_name
+                siblings.append(ref)
+            return siblings
+
         def _is_full_tier(idx: int) -> bool:
+            """Backward-compat helper for callers that still want the boolean."""
             if detail == "full":
                 return True
             if detail == "titles":
                 return False
-            # auto: top 4 get full, rest get refs
             return idx < 4
 
         results = []
@@ -2740,67 +2878,41 @@ async def search_code_graph(
                 "file_path": _file_path(coll_name, p),
             }
 
-            if _is_full_tier(i):
-                # Full details
-                if coll_name == "CodeFunction":
-                    doc = p.get("doc", "")
-                    base.update({
-                        "full_name": p.get("full_name", ""),
-                        "signature": p.get("signature", ""),
-                        "doc": doc[:200] + "..." if len(doc) > 200 else doc,
-                        "location": f"{p.get('start_line','?')}-{p.get('end_line','?')}",
-                        "is_async": p.get("is_async", False),
-                    })
-                elif coll_name == "CodeClass":
-                    doc = p.get("doc", "")
-                    base.update({
-                        "full_name": p.get("full_name", ""),
-                        "signature": p.get("signature", ""),
-                        "doc": doc[:200] + "..." if len(doc) > 200 else doc,
-                        "methods": p.get("methods", []),
-                        "method_count": len(p.get("methods", [])),
-                        "location": f"{p.get('start_line','?')}-{p.get('end_line','?')}",
-                    })
-                elif coll_name == "CodeModule":
-                    summary = p.get("module_summary", "")
-                    base.update({
-                        "path": p.get("path", ""),
-                        "language": p.get("language", ""),
-                        "loc": p.get("loc", 0),
-                        "summary": summary[:200] + "..." if len(summary) > 200 else summary,
-                    })
-                elif coll_name == "CodeAPI":
-                    desc = p.get("api_description", "")
-                    base.update({
-                        "endpoint": p.get("endpoint", ""),
-                        "method": p.get("method", ""),
-                        "description": desc[:200] + "..." if len(desc) > 200 else desc,
-                        "parameters": p.get("parameters", []),
-                    })
-                elif coll_name == "CodeInteraction":
-                    desc = p.get("description", "")
-                    base.update({
-                        "interaction_type": p.get("interaction_type", ""),
-                        "direction": p.get("direction", ""),
-                        "protocol": p.get("protocol", ""),
-                        "endpoint": p.get("endpoint", ""),
-                        "confidence": p.get("confidence", ""),
-                        "description": desc[:200] + "..." if len(desc) > 200 else desc,
-                    })
+            if detail == "titles":
+                tier = "ref"
+            elif detail == "full":
+                tier = "full_xl"
             else:
-                # Metadata-only ref for lower-ranked results
-                if coll_name in ("CodeFunction", "CodeClass"):
-                    base["full_name"] = p.get("full_name", "")
-                elif coll_name == "CodeModule":
-                    base["path"] = p.get("path", "")
-                    base["language"] = p.get("language", "")
-                elif coll_name == "CodeAPI":
-                    base["endpoint"] = p.get("endpoint", "")
-                    base["method"] = p.get("method", "")
-                elif coll_name == "CodeInteraction":
-                    base["endpoint"] = p.get("endpoint", "")
-                    base["protocol"] = p.get("protocol", "")
-                    base["interaction_type"] = p.get("interaction_type", "")
+                if i < 2:
+                    tier = "full_xl"
+                elif i < 4:
+                    tier = "full_l"
+                else:
+                    tier = "ref"
+
+            if tier == "full_xl":
+                base.update(_format_full(coll_name, p, untruncated=True))
+            elif tier == "full_l":
+                base.update(_format_full(coll_name, p, untruncated=False))
+            else:
+                base.update(_format_ref(coll_name, p))
+
+            if (
+                detail == "auto"
+                and i < 2
+                and coll_name in ("CodeFunction", "CodeClass")
+                and base["file_path"]
+            ):
+                try:
+                    hit_line = int(p.get("start_line") or 0)
+                except (TypeError, ValueError):
+                    hit_line = 0
+                max_total = CODE_SIBLINGS_RANK_1 if i == 0 else CODE_SIBLINGS_RANK_2
+                sibs = _fetch_file_siblings(
+                    base["file_path"], hit_line, max_total, p.get("full_name", "")
+                )
+                if sibs:
+                    base["siblings"] = sibs
 
             results.append(base)
 
@@ -2835,7 +2947,7 @@ async def search_code_graph(
                     next_queue: list[tuple[str, str, int]] = []
 
                     for coll_name, identifier, _prev_hop in expansion_queue:
-                        if len(results) + len(expanded_results) >= limit:
+                        if len(expanded_results) >= CODE_EXPANSION_LIMIT:
                             break
 
                         if coll_name == "CodeFunction":
@@ -2854,7 +2966,7 @@ async def search_code_graph(
                                     for callee_name in called_names:
                                         if callee_name in visited_full_names:
                                             continue
-                                        if len(results) + len(expanded_results) >= limit:
+                                        if len(expanded_results) >= CODE_EXPANSION_LIMIT:
                                             break
                                         # Fetch the callee node
                                         callee_resp = func_coll.query.fetch_objects(
@@ -2889,7 +3001,7 @@ async def search_code_graph(
                                         limit=20,
                                     )
                                     for ix_obj in ix_resp.objects:
-                                        if len(results) + len(expanded_results) >= limit:
+                                        if len(expanded_results) >= CODE_EXPANSION_LIMIT:
                                             break
                                         ixp = ix_obj.properties
                                         ep = ixp.get("endpoint", "")
@@ -2925,7 +3037,7 @@ async def search_code_graph(
                                         limit=20,
                                     )
                                     for ix_obj in ix_resp.objects:
-                                        if len(results) + len(expanded_results) >= limit:
+                                        if len(expanded_results) >= CODE_EXPANSION_LIMIT:
                                             break
                                         ixp = ix_obj.properties
                                         ep = ixp.get("endpoint", "")
