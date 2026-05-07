@@ -8,6 +8,11 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # First prompt: create baseline snapshot (full injection done by SessionStart hook).
 # Subsequent prompts: output only changed sections (or nothing if unchanged).
 # After /compact: reset baseline (detected via compact flag).
+#
+# Note: this PowerShell port uses a hash-set lookup (line content presence)
+# rather than `diff` line-number extraction, so it is NOT affected by the
+# bash-side --old-line-format leak that caused the 2026-05-07 GUI freeze
+# in the .sh sibling. Parity-touch only — no behavioural change.
 
 $ContextFile = ".claude/CONTEXT_STATE.md"
 $Tmp = if ($env:TMPDIR) { $env:TMPDIR } elseif ($env:TEMP) { $env:TEMP } else { "C:\Windows\Temp" }
