@@ -317,6 +317,7 @@ pub fn run() {
             // Launcher self-update (git-pull based, daily check)
             commands::self_update::check_for_launcher_update,
             commands::self_update::apply_launcher_update,
+            commands::self_update::force_resync_launcher,
             commands::self_update::get_user_owned_paths,
             commands::self_update::get_cached_update_status,
             commands::self_update::set_auto_check_enabled,

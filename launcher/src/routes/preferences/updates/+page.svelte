@@ -26,14 +26,50 @@
     error: string | null;
   };
 
+  // Structured payload returned by `apply_launcher_update` when the local
+  // clone has diverged from upstream (post-2026-05-06 history rewrite).
+  // Backend serializes this as a JSON string; we parse below.
+  type NonFastForwardError = {
+    kind: 'non_fast_forward';
+    branch: string;
+    local_sha: string | null;
+    remote_sha: string | null;
+    git_stderr: string;
+  };
+
   let status = $state<UpdateStatus | null>(null);
   let checking = $state(false);
   let applying = $state(false);
   let confirmingApply = $state(false);
+  let resyncing = $state(false);
+  // When set, the resync modal is shown.
+  let nonFastForward = $state<NonFastForwardError | null>(null);
   let userOwnedPaths = $state<string[]>([]);
   let autoCheckEnabled = $state(true);
 
   let unlisten: (() => void) | null = null;
+
+  /**
+   * Parse the error returned by `apply_launcher_update`. The backend
+   * either returns a plain string (legacy / unrecognized errors) OR a
+   * JSON-encoded `NonFastForwardError` for the post-rewrite divergence
+   * case. We try to parse JSON first and only treat it as structured
+   * when `kind === 'non_fast_forward'` — every other shape stays a
+   * plain error string.
+   */
+  function parseUpdateError(raw: unknown): NonFastForwardError | null {
+    if (typeof raw !== 'string') return null;
+    if (!raw.startsWith('{')) return null;
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && parsed.kind === 'non_fast_forward') {
+        return parsed as NonFastForwardError;
+      }
+    } catch {
+      // not JSON — fall through to legacy string handling
+    }
+    return null;
+  }
 
   async function loadCached() {
     // get_cached_update_status is non-blocking — pulls from
@@ -76,9 +112,33 @@
       await invoke<void>('apply_launcher_update');
       toast.success('Launcher will restart…');
     } catch (e) {
-      toast.error(`Update failed: ${e}`);
+      // Detect the post-history-rewrite divergence case. If the backend
+      // returned a structured non-FF error we open the resync modal
+      // instead of just toasting an opaque message.
+      const nff = parseUpdateError(e);
+      if (nff) {
+        nonFastForward = nff;
+      } else {
+        toast.error(`Update failed: ${e}`);
+      }
     } finally {
       applying = false;
+    }
+  }
+
+  async function resyncNow() {
+    if (!nonFastForward) return;
+    resyncing = true;
+    try {
+      // Like apply_launcher_update, this command doesn't return on
+      // success — the launcher restarts after rebuild.
+      await invoke<void>('force_resync_launcher');
+      toast.success('Launcher will restart…');
+      nonFastForward = null;
+    } catch (e) {
+      toast.error(`Resync failed: ${e}`);
+    } finally {
+      resyncing = false;
     }
   }
 
@@ -219,6 +279,56 @@
         <div class="upd-modal-actions">
           <button class="upd-btn" onclick={() => (confirmingApply = false)}>Cancel</button>
           <button class="upd-btn upd-btn-primary" onclick={applyUpdate}>Continue</button>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  {#if nonFastForward}
+    <div
+      class="upd-modal-backdrop"
+      onclick={() => {
+        if (!resyncing) nonFastForward = null;
+      }}
+    >
+      <div class="upd-modal" onclick={(e) => e.stopPropagation()}>
+        <h3>Local clone diverged from upstream</h3>
+        <p>
+          Your local copy can't fast-forward to the latest version because history
+          has diverged (likely because we rewrote git history on 2026-05-06 to remove
+          internal docs from older commits).
+        </p>
+        <p>
+          <strong>Resyncing will discard any tracked-file changes you've made locally.</strong>
+          Untracked files (your projects, <code>.env</code>, <code>state/</code>, <code>~/.vct/</code>)
+          are safe.
+        </p>
+        <p class="upd-modal-hint">
+          Want to back up first? See <code>docs/RECOVERY-2026-05-06.md</code>.
+        </p>
+        <dl class="upd-meta">
+          <dt>Branch</dt>
+          <dd><code>{nonFastForward.branch}</code></dd>
+          <dt>Local</dt>
+          <dd><code>{shortSha(nonFastForward.local_sha)}</code></dd>
+          <dt>Remote</dt>
+          <dd><code>{shortSha(nonFastForward.remote_sha)}</code></dd>
+        </dl>
+        <div class="upd-modal-actions">
+          <button
+            class="upd-btn"
+            disabled={resyncing}
+            onclick={() => (nonFastForward = null)}
+          >
+            Cancel
+          </button>
+          <button
+            class="upd-btn upd-btn-primary"
+            disabled={resyncing}
+            onclick={resyncNow}
+          >
+            {resyncing ? 'Resyncing…' : 'Resync now'}
+          </button>
         </div>
       </div>
     </div>
