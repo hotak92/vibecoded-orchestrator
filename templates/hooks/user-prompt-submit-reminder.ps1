@@ -6,6 +6,8 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # user-prompt-submit-reminder.ps1
 # Context preservation reminder triggered on output volume.
 
+. "$PSScriptRoot/_lib/stderr-cap.ps1"
+
 $ProjectDir = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
 $ProjectName = Split-Path $ProjectDir -Leaf
 $ContextFile = Join-Path $ProjectDir ".claude/CONTEXT_STATE.md"

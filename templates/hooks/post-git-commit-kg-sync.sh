@@ -9,6 +9,8 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 # Non-blocking: agent runs in background.
 
 # Don't run for orchestrator agent subprocesses
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
+
 [ -n "$CLAUDE_CODE_DISABLE_AUTO_MEMORY" ] && exit 0
 
 set -e

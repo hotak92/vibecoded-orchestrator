@@ -10,6 +10,8 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 set -e
 
 # Configuration
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
+
 PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
 PROJECT_NAME=$(basename "$PROJECT_DIR")
 

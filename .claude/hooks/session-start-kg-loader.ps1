@@ -6,6 +6,8 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # SessionStart Hook: Knowledge Graph Reference Provider (PowerShell port)
 # Purpose: Display paths to relevant KG resources (no auto-loading)
 
+. "$PSScriptRoot/_lib/stderr-cap.ps1"
+
 $ProjectDir = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
 
 $LibDir = Join-Path $PSScriptRoot "_lib"

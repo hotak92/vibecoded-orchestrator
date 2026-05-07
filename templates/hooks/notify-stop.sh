@@ -8,6 +8,8 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 # NOTE: RL training is now handled inside the weaviate MCP server (_rl_answer_monitor),
 #       not here — Stop hooks don't fire in the VS Code extension.
 
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
+
 PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
 PROJECT_NAME=$(basename "$PROJECT_DIR")
 

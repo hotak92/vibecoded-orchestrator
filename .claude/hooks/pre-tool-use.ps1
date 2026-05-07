@@ -7,6 +7,8 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # Pre-tool-use hook: SSRF guard, shell injection scan, tool logging,
 # Build Anchor Protocol, file backup, KG search suggestion.
 
+. "$PSScriptRoot/_lib/stderr-cap.ps1"
+
 param(
     [Parameter(Position=0)] [string]$ToolName = "",
     [Parameter(Position=1)] [string]$UserMessage = "",
@@ -47,11 +49,23 @@ function Write-SecurityLine([string]$json) {
 }
 
 # === Tool call logging ===
+# UserMessage may contain newlines and metacharacters that the previous
+# manual escape (only \ and ") didn't cover. Use ConvertTo-Json so every
+# field round-trips correctly. ToolArgs is parsed when possible to keep
+# structured logging; falls back to string on parse failure.
+# Audit fix 2026-05-07.
 $ToucanLog = Join-Path $ProjectRoot ".claude/logs/toucan_dataset.jsonl"
-$ts = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-$umEsc = $UserMessage -replace '\\', '\\\\' -replace '"', '\"'
-$argsRaw = if ($ToolArgs) { $ToolArgs } else { "{}" }
-$line = "{""timestamp"":""$ts"",""query"":""$umEsc"",""chosen_tool"":""$ToolName"",""tool_args"":$argsRaw}"
+$toolArgsVal = $null
+if ($ToolArgs) {
+    try { $toolArgsVal = $ToolArgs | ConvertFrom-Json -ErrorAction Stop } catch { $toolArgsVal = $ToolArgs }
+}
+$entry = [ordered]@{
+    timestamp   = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+    query       = $UserMessage
+    chosen_tool = $ToolName
+    tool_args   = $toolArgsVal
+}
+$line = $entry | ConvertTo-Json -Compress -Depth 8
 try { Add-Content -Path $ToucanLog -Value $line -ErrorAction Stop } catch { }
 
 # === 1. SSRF GUARD ===

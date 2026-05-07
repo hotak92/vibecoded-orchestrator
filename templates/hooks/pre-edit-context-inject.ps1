@@ -7,6 +7,8 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # Pre-edit context injection — KG + code graph context for the file being edited.
 # Always exit 0 (never block the edit).
 
+. "$PSScriptRoot/_lib/stderr-cap.ps1"
+
 param(
     [Parameter(Position=0)] [string]$ToolName = "",
     [Parameter(Position=1)] [string]$ToolArgs = ""
@@ -125,6 +127,9 @@ if ($IsCode) {
 Remove-Item $KgTmp.FullName, $CodeTmp.FullName -Force -ErrorAction SilentlyContinue
 
 # Dedup against this session's seen nodes.
+# Note (audit fix 2026-05-07): the .ps1 sibling already uses a hashtable
+# (`$seen = @{}`) for O(1) lookups, so the bash-side bug (per-line grep
+# scaling O(input × seen)) does not exist here. Parity-touch only.
 function Filter-Seen([string]$input) {
     if (-not $input) { return "" }
     $filtered = New-Object System.Text.StringBuilder

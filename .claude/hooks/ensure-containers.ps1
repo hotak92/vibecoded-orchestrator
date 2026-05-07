@@ -16,6 +16,8 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # Container names come from the shared `_lib\container-names.ps1` registry
 # so the hook and the bundled docker-compose.yml cannot disagree.
 
+. "$PSScriptRoot/_lib/stderr-cap.ps1"
+
 $ScriptDir = $PSScriptRoot
 $RepoRoot = (Resolve-Path (Join-Path $ScriptDir "..\..")).Path
 

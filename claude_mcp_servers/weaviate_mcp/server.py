@@ -364,6 +364,99 @@ def _get_result_verbosity_by_score(score: float) -> str:
     return "full"
 
 
+# Total chunk budget shared across all results in a single auto-mode call.
+# Defaults to 2×7 + 2×3 = 20 chunks — enough for the top 2 results to render
+# at "full" tier (7 chunks each) plus the next 2 at "three_chunks" (3 each),
+# with anything else degrading to summary/single_chunk regardless of score.
+#
+# Why a *shared* budget rather than per-result caps:
+# - Score-gating still decides what each result is *allowed* to render at;
+#   the budget only enforces how many results can use the expensive tiers.
+# - A result with fewer chunks than its tier window costs less, naturally
+#   freeing budget for later results (e.g. a 1-chunk top hit at "full"
+#   only consumes 1, leaving 19 for results 2..N).
+# - Caps the total bytes a single auto-mode call can emit at roughly
+#   N_CHUNKS × ~8000 chars/chunk = ~160 KB worst case (default 20).
+#   Defense-in-depth against the freeze threshold (~14 MB observed).
+#
+# Bypassed for explicit detail values (full, three_chunks, etc.) — the
+# caller asked for uniform output, so we honour it without budget logic.
+_HYBRID_CHUNK_BUDGET: int = int(os.getenv("KG_HYBRID_CHUNK_BUDGET", "20"))
+
+# Tier downgrade chain: if budget can't cover the score-allowed tier, drop
+# one step. summary always succeeds (cost 0).
+_TIER_DOWNGRADE: dict[str, str] = {
+    "full":         "three_chunks",
+    "three_chunks": "single_chunk",
+    "single_chunk": "summary",
+}
+
+
+def _tier_chunk_cost(tier: str, total_chunks: int) -> int:
+    """How many chunks this tier would consume from the budget for a given node.
+
+    A node with fewer chunks than the tier window costs only what it has —
+    e.g. "full" on a 1-chunk node costs 1, not 7. Tiers that don't assemble
+    chunks (titles, summary, discard) cost 0.
+    """
+    window = _TIER_CHUNK_WINDOW.get(tier, 0)
+    if window == 0:
+        return 0
+    try:
+        tc = int(total_chunks) if total_chunks else 1
+    except (TypeError, ValueError):
+        tc = 1
+    return min(window, max(1, tc))
+
+
+def _allocate_tier_within_budget(
+    score: float,
+    total_chunks: int,
+    remaining_budget: int,
+) -> tuple[str, int]:
+    """Pick a tier for one result given its score and the remaining shared budget.
+
+    Returns (tier, chunks_consumed). The tier is the highest one the score
+    permits AND the budget can fund. If the score-allowed tier doesn't fit,
+    we downgrade through three_chunks → single_chunk → summary until
+    something fits. Summary always fits (cost 0).
+
+    A "discard" score (below _TIER_THRESHOLDS["min"]) returns ("discard", 0)
+    regardless of budget — discarded results never render.
+    """
+    score_allowed = _get_result_verbosity_by_score(score)
+    if score_allowed == "discard":
+        return ("discard", 0)
+
+    tier = score_allowed
+    while True:
+        cost = _tier_chunk_cost(tier, total_chunks)
+        if cost <= remaining_budget:
+            return (tier, cost)
+        tier = _TIER_DOWNGRADE.get(tier, "summary")
+        if tier == "summary":
+            return ("summary", 0)
+
+
+# search_code_graph tier policy (Option A, 2026-05-07).
+# See claude-orchestrator commit fbed0e0+ for design rationale.
+#
+# Ranks 1-2 (full_xl): untruncated content + function_body / class_body.
+# Ranks 3-4 (full_l): truncated at CODE_TRUNC_CHARS (default 1200, was 200).
+# Ranks 5+ (ref): metadata-only refs.
+#
+# Top-2 also get adjacent siblings in the same source file (CodeFunction /
+# CodeClass only): up to CODE_SIBLINGS_RANK_1 (default 7) for rank 1,
+# CODE_SIBLINGS_RANK_2 (default 5) for rank 2 — counts include the seed.
+#
+# Subgraph expansion is now capped independently at CODE_EXPANSION_LIMIT
+# (default 8) instead of sharing the seed `limit` budget.
+CODE_SIBLINGS_RANK_1: int = int(os.getenv("CODE_SIBLINGS_RANK_1", "7"))
+CODE_SIBLINGS_RANK_2: int = int(os.getenv("CODE_SIBLINGS_RANK_2", "5"))
+CODE_TRUNC_CHARS: int = int(os.getenv("CODE_TRUNC_CHARS", "1200"))
+CODE_EXPANSION_LIMIT: int = int(os.getenv("CODE_EXPANSION_LIMIT", "8"))
+
+
 def _chunk_summaries_header(
     file_path: str,
     shown_chunk_nums: list[int] | None = None,
@@ -1724,24 +1817,39 @@ async def semantic_graph_search(
             d = r.get("distance")
             r["score"] = (1.0 - d) if isinstance(d, (int, float)) else 0.0
 
-    # Apply tiering to primary results (mirrors hybrid_search behaviour).
-    # Use per-result collection so chunk fetch and sidecar lookup go to the
-    # right place when results come from the shared KG.
+    # Apply tiering to primary results (mirrors hybrid_search behaviour,
+    # including shared chunk budget for auto-mode). Use per-result collection
+    # so chunk fetch and sidecar lookup go to the right place when results
+    # come from the shared KG.
     legacy_aliases = {"descriptions": "summary"}
     primary_formatted: list[dict] = []
-    for r in primary_results:
-        if detail == "auto":
-            tier = _get_result_verbosity_by_score(r.get("score", 0.0) or 0.0)
-        else:
-            tier = legacy_aliases.get(detail, detail)
-        if tier == "discard":
-            continue
-        result_coll_name = r.get("collection") or KG_COLLECTION
-        entry = _format_result_by_tier(
-            r, tier, sidecar_db=None, coll=_coll_for(result_coll_name)
-        )
-        if entry is not None:
-            primary_formatted.append(entry)
+    if detail == "auto":
+        ordered = sorted(primary_results, key=lambda r: r.get("score", 0.0) or 0.0, reverse=True)
+        budget = _HYBRID_CHUNK_BUDGET
+        for r in ordered:
+            score = r.get("score", 0.0) or 0.0
+            total_chunks = r.get("total_chunks") or 1
+            tier, cost = _allocate_tier_within_budget(score, total_chunks, budget)
+            if tier == "discard":
+                continue
+            budget -= cost
+            result_coll_name = r.get("collection") or KG_COLLECTION
+            entry = _format_result_by_tier(
+                r, tier, sidecar_db=None, coll=_coll_for(result_coll_name)
+            )
+            if entry is not None:
+                primary_formatted.append(entry)
+    else:
+        tier = legacy_aliases.get(detail, detail)
+        for r in primary_results:
+            if tier == "discard":
+                continue
+            result_coll_name = r.get("collection") or KG_COLLECTION
+            entry = _format_result_by_tier(
+                r, tier, sidecar_db=None, coll=_coll_for(result_coll_name)
+            )
+            if entry is not None:
+                primary_formatted.append(entry)
 
     # Extract WikiLinks only from the top-k returned to Claude. We sort the
     # raw_primary list by distance so the "top-k" heuristic is honoured even
@@ -2126,30 +2234,44 @@ async def hybrid_search(
             coll_handles[name] = None
             return None
 
-    # Apply detail level. "auto" → per-result tier from score; explicit value →
-    # uniform across all results.
+    # Apply detail level. "auto" → per-result tier from score, with shared
+    # chunk budget across all results (see _allocate_tier_within_budget).
+    # Explicit value (e.g. detail="full") → uniform tier, no budget.
     formatted: list[dict] = []
     legacy_aliases = {"descriptions": "summary"}
-    for r in results:
-        if detail == "auto":
+    if detail == "auto":
+        # Score-ordered allocation. Results coming out of _rl_cache_and_rerank
+        # are already top-k score-ordered, but re-sort defensively.
+        ordered = sorted(results, key=lambda r: r.get("score", 0.0) or 0.0, reverse=True)
+        budget = _HYBRID_CHUNK_BUDGET
+        for r in ordered:
             score = r.get("score", 0.0) or 0.0
-            tier = _get_result_verbosity_by_score(score)
-        else:
-            tier = legacy_aliases.get(detail, detail)
-        # Decision: skip discarded results outright; the agent never sees noise.
-        if tier == "discard":
-            continue
+            total_chunks = r.get("total_chunks") or 1
+            tier, cost = _allocate_tier_within_budget(score, total_chunks, budget)
+            if tier == "discard":
+                continue
+            budget -= cost
+            # Pick the chunk-fetch collection from the result's source — without
+            # this, shared-KG hits would fall back to snippet because their chunks
+            # don't live in KG_COLLECTION.
+            result_coll = r.get("collection") or KG_COLLECTION
+            entry = _format_result_by_tier(r, tier, sidecar_db=None, coll=_coll_for(result_coll))
+            if entry is not None:
+                formatted.append(entry)
+    else:
+        # Explicit detail — uniform across all results, no budget.
         # Decision: when explicit detail == "full" was requested historically, the
         # behaviour was "300-char snippet". The new "full" tier additionally
         # assembles chunks for chunked nodes — strictly more useful, no regression
         # for unchunked nodes (still returns the snippet via the fallback path).
-        # Pick the chunk-fetch collection from the result's source — without
-        # this, shared-KG hits would fall back to snippet because their chunks
-        # don't live in KG_COLLECTION.
-        result_coll = r.get("collection") or KG_COLLECTION
-        entry = _format_result_by_tier(r, tier, sidecar_db=None, coll=_coll_for(result_coll))
-        if entry is not None:
-            formatted.append(entry)
+        tier = legacy_aliases.get(detail, detail)
+        for r in results:
+            if tier == "discard":
+                continue
+            result_coll = r.get("collection") or KG_COLLECTION
+            entry = _format_result_by_tier(r, tier, sidecar_db=None, coll=_coll_for(result_coll))
+            if entry is not None:
+                formatted.append(entry)
     results = formatted
 
     # Log detail level for RL training signal
@@ -2609,22 +2731,141 @@ async def search_code_graph(
                 return "/".join(parts[:-1]) if len(parts) > 1 else p["full_name"]
             return ""
 
-        # Determine per-result verbosity. Backward-compatible default ("auto")
-        # mirrors the legacy "top 4 full / rest refs" heuristic. Explicit
-        # detail values apply uniformly. Decision: code graph has no sidecar,
-        # so we cannot do score-threshold tiering — we use position-based
-        # tiering (rank order) for "auto" instead. The score is still in every
-        # result for client-side filtering.
+        # Determine per-result verbosity. Code graph has no sidecar, so we
+        # use position-based tiering (rank order) for "auto" rather than
+        # score-threshold tiering. The score is still in every result for
+        # client-side filtering. Explicit detail values apply uniformly.
         if detail not in ("auto", "titles", "full"):
-            # Map legacy/unknown values onto sane defaults rather than 500ing.
             detail = "auto"
 
+        def _truncate(s: str, n: int) -> str:
+            return s[:n] + "..." if len(s) > n else s
+
+        def _format_full(coll_name: str, p: dict, *, untruncated: bool) -> dict:
+            """Build the full-tier fields for a result.
+
+            untruncated=True: top-2 ranks — include function_body / class_body
+            untruncated, all doc/summary/description fields untruncated.
+            untruncated=False: ranks 3-4 — same fields as top-2 EXCEPT no
+            function_body/class_body (those are large), and doc/summary/
+            description truncated at CODE_TRUNC_CHARS (default 1200, was 200).
+            """
+            out: dict = {}
+            if coll_name == "CodeFunction":
+                doc = p.get("doc", "") or ""
+                out["full_name"] = p.get("full_name", "")
+                out["signature"] = p.get("signature", "")
+                out["doc"] = doc if untruncated else _truncate(doc, CODE_TRUNC_CHARS)
+                out["location"] = f"{p.get('start_line','?')}-{p.get('end_line','?')}"
+                out["is_async"] = p.get("is_async", False)
+                if untruncated:
+                    body = p.get("function_body", "") or ""
+                    if body:
+                        out["function_body"] = body
+            elif coll_name == "CodeClass":
+                doc = p.get("doc", "") or ""
+                out["full_name"] = p.get("full_name", "")
+                out["signature"] = p.get("signature", "")
+                out["doc"] = doc if untruncated else _truncate(doc, CODE_TRUNC_CHARS)
+                out["methods"] = p.get("methods", [])
+                out["method_count"] = len(p.get("methods", []))
+                out["location"] = f"{p.get('start_line','?')}-{p.get('end_line','?')}"
+                if untruncated:
+                    body = p.get("class_body", "") or ""
+                    if body:
+                        out["class_body"] = body
+            elif coll_name == "CodeModule":
+                summary = p.get("module_summary", "") or ""
+                out["path"] = p.get("path", "")
+                out["language"] = p.get("language", "")
+                out["loc"] = p.get("loc", 0)
+                out["summary"] = summary if untruncated else _truncate(summary, CODE_TRUNC_CHARS)
+            elif coll_name == "CodeAPI":
+                desc = p.get("api_description", "") or ""
+                out["endpoint"] = p.get("endpoint", "")
+                out["method"] = p.get("method", "")
+                out["description"] = desc if untruncated else _truncate(desc, CODE_TRUNC_CHARS)
+                out["parameters"] = p.get("parameters", [])
+            elif coll_name == "CodeInteraction":
+                desc = p.get("description", "") or ""
+                out["interaction_type"] = p.get("interaction_type", "")
+                out["direction"] = p.get("direction", "")
+                out["protocol"] = p.get("protocol", "")
+                out["endpoint"] = p.get("endpoint", "")
+                out["confidence"] = p.get("confidence", "")
+                out["description"] = desc if untruncated else _truncate(desc, CODE_TRUNC_CHARS)
+            return out
+
+        def _format_ref(coll_name: str, p: dict) -> dict:
+            """Metadata-only ref for lower-ranked results and expansions."""
+            out: dict = {}
+            if coll_name in ("CodeFunction", "CodeClass"):
+                out["full_name"] = p.get("full_name", "")
+            elif coll_name == "CodeModule":
+                out["path"] = p.get("path", "")
+                out["language"] = p.get("language", "")
+            elif coll_name == "CodeAPI":
+                out["endpoint"] = p.get("endpoint", "")
+                out["method"] = p.get("method", "")
+            elif coll_name == "CodeInteraction":
+                out["endpoint"] = p.get("endpoint", "")
+                out["protocol"] = p.get("protocol", "")
+                out["interaction_type"] = p.get("interaction_type", "")
+            return out
+
+        def _fetch_file_siblings(file_path: str, hit_start_line: int, max_total: int, exclude_full_name: str) -> list[dict]:
+            """Fetch up to (max_total - 1) siblings in the same source file,
+            ordered by start_line, centred on hit_start_line. Returns formatted
+            metadata-ref dicts (siblings are context, not primary results).
+            Returns [] on any failure or if file_path is missing.
+            """
+            if not file_path or max_total <= 1:
+                return []
+            try:
+                fn_coll = client.collections.get(_project_collection("CodeFunction"))
+                cls_coll = client.collections.get(_project_collection("CodeClass"))
+            except Exception as exc:
+                logger.debug("search_code_graph: sibling collection unavailable (%s)", exc)
+                return []
+            collected: list[tuple[int, str, dict]] = []
+            for coll_obj, c_name in ((fn_coll, "CodeFunction"), (cls_coll, "CodeClass")):
+                try:
+                    sib_filter = Filter.by_property("file_path").equal(file_path)
+                    if effective_project:
+                        sib_filter = sib_filter & Filter.by_property("project").equal(effective_project)
+                    sib_resp = coll_obj.query.fetch_objects(filters=sib_filter, limit=64)
+                    for obj in sib_resp.objects:
+                        sp = obj.properties or {}
+                        if sp.get("full_name") == exclude_full_name:
+                            continue
+                        sl = sp.get("start_line")
+                        try:
+                            sl_int = int(sl) if sl is not None else 0
+                        except (TypeError, ValueError):
+                            sl_int = 0
+                        collected.append((sl_int, c_name, sp))
+                except Exception as exc:
+                    logger.debug("search_code_graph: sibling fetch %s failed: %s", c_name, exc)
+            if not collected:
+                return []
+            collected.sort(key=lambda t: abs(t[0] - hit_start_line))
+            picked = collected[: max_total - 1]
+            picked.sort(key=lambda t: t[0])
+            siblings: list[dict] = []
+            for sl_int, c_name, sp in picked:
+                ref = _format_ref(c_name, sp)
+                ref["sibling"] = True
+                ref["start_line"] = sl_int
+                ref["collection"] = c_name
+                siblings.append(ref)
+            return siblings
+
         def _is_full_tier(idx: int) -> bool:
+            """Backward-compat helper for callers that still want the boolean."""
             if detail == "full":
                 return True
             if detail == "titles":
                 return False
-            # auto: top 4 get full, rest get refs
             return idx < 4
 
         results = []
@@ -2637,67 +2878,41 @@ async def search_code_graph(
                 "file_path": _file_path(coll_name, p),
             }
 
-            if _is_full_tier(i):
-                # Full details
-                if coll_name == "CodeFunction":
-                    doc = p.get("doc", "")
-                    base.update({
-                        "full_name": p.get("full_name", ""),
-                        "signature": p.get("signature", ""),
-                        "doc": doc[:200] + "..." if len(doc) > 200 else doc,
-                        "location": f"{p.get('start_line','?')}-{p.get('end_line','?')}",
-                        "is_async": p.get("is_async", False),
-                    })
-                elif coll_name == "CodeClass":
-                    doc = p.get("doc", "")
-                    base.update({
-                        "full_name": p.get("full_name", ""),
-                        "signature": p.get("signature", ""),
-                        "doc": doc[:200] + "..." if len(doc) > 200 else doc,
-                        "methods": p.get("methods", []),
-                        "method_count": len(p.get("methods", [])),
-                        "location": f"{p.get('start_line','?')}-{p.get('end_line','?')}",
-                    })
-                elif coll_name == "CodeModule":
-                    summary = p.get("module_summary", "")
-                    base.update({
-                        "path": p.get("path", ""),
-                        "language": p.get("language", ""),
-                        "loc": p.get("loc", 0),
-                        "summary": summary[:200] + "..." if len(summary) > 200 else summary,
-                    })
-                elif coll_name == "CodeAPI":
-                    desc = p.get("api_description", "")
-                    base.update({
-                        "endpoint": p.get("endpoint", ""),
-                        "method": p.get("method", ""),
-                        "description": desc[:200] + "..." if len(desc) > 200 else desc,
-                        "parameters": p.get("parameters", []),
-                    })
-                elif coll_name == "CodeInteraction":
-                    desc = p.get("description", "")
-                    base.update({
-                        "interaction_type": p.get("interaction_type", ""),
-                        "direction": p.get("direction", ""),
-                        "protocol": p.get("protocol", ""),
-                        "endpoint": p.get("endpoint", ""),
-                        "confidence": p.get("confidence", ""),
-                        "description": desc[:200] + "..." if len(desc) > 200 else desc,
-                    })
+            if detail == "titles":
+                tier = "ref"
+            elif detail == "full":
+                tier = "full_xl"
             else:
-                # Metadata-only ref for lower-ranked results
-                if coll_name in ("CodeFunction", "CodeClass"):
-                    base["full_name"] = p.get("full_name", "")
-                elif coll_name == "CodeModule":
-                    base["path"] = p.get("path", "")
-                    base["language"] = p.get("language", "")
-                elif coll_name == "CodeAPI":
-                    base["endpoint"] = p.get("endpoint", "")
-                    base["method"] = p.get("method", "")
-                elif coll_name == "CodeInteraction":
-                    base["endpoint"] = p.get("endpoint", "")
-                    base["protocol"] = p.get("protocol", "")
-                    base["interaction_type"] = p.get("interaction_type", "")
+                if i < 2:
+                    tier = "full_xl"
+                elif i < 4:
+                    tier = "full_l"
+                else:
+                    tier = "ref"
+
+            if tier == "full_xl":
+                base.update(_format_full(coll_name, p, untruncated=True))
+            elif tier == "full_l":
+                base.update(_format_full(coll_name, p, untruncated=False))
+            else:
+                base.update(_format_ref(coll_name, p))
+
+            if (
+                detail == "auto"
+                and i < 2
+                and coll_name in ("CodeFunction", "CodeClass")
+                and base["file_path"]
+            ):
+                try:
+                    hit_line = int(p.get("start_line") or 0)
+                except (TypeError, ValueError):
+                    hit_line = 0
+                max_total = CODE_SIBLINGS_RANK_1 if i == 0 else CODE_SIBLINGS_RANK_2
+                sibs = _fetch_file_siblings(
+                    base["file_path"], hit_line, max_total, p.get("full_name", "")
+                )
+                if sibs:
+                    base["siblings"] = sibs
 
             results.append(base)
 
@@ -2732,7 +2947,7 @@ async def search_code_graph(
                     next_queue: list[tuple[str, str, int]] = []
 
                     for coll_name, identifier, _prev_hop in expansion_queue:
-                        if len(results) + len(expanded_results) >= limit:
+                        if len(expanded_results) >= CODE_EXPANSION_LIMIT:
                             break
 
                         if coll_name == "CodeFunction":
@@ -2751,7 +2966,7 @@ async def search_code_graph(
                                     for callee_name in called_names:
                                         if callee_name in visited_full_names:
                                             continue
-                                        if len(results) + len(expanded_results) >= limit:
+                                        if len(expanded_results) >= CODE_EXPANSION_LIMIT:
                                             break
                                         # Fetch the callee node
                                         callee_resp = func_coll.query.fetch_objects(
@@ -2786,7 +3001,7 @@ async def search_code_graph(
                                         limit=20,
                                     )
                                     for ix_obj in ix_resp.objects:
-                                        if len(results) + len(expanded_results) >= limit:
+                                        if len(expanded_results) >= CODE_EXPANSION_LIMIT:
                                             break
                                         ixp = ix_obj.properties
                                         ep = ixp.get("endpoint", "")
@@ -2822,7 +3037,7 @@ async def search_code_graph(
                                         limit=20,
                                     )
                                     for ix_obj in ix_resp.objects:
-                                        if len(results) + len(expanded_results) >= limit:
+                                        if len(expanded_results) >= CODE_EXPANSION_LIMIT:
                                             break
                                         ixp = ix_obj.properties
                                         ep = ixp.get("endpoint", "")

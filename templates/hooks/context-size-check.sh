@@ -16,6 +16,8 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
 
 # --- Configuration ---
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
+
 MAX_LINES=400
 WARN_LINES=300
 CONTEXT_FILE=".claude/CONTEXT_STATE.md"

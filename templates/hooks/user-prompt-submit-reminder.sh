@@ -5,6 +5,8 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 # Context preservation reminder - triggers on output volume (words as proxy for tokens)
 set -e
 
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
+
 PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
 PROJECT_NAME=$(basename "$PROJECT_DIR")
 CONTEXT_FILE="$PROJECT_DIR/.claude/CONTEXT_STATE.md"

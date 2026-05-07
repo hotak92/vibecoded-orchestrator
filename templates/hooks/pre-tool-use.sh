@@ -12,6 +12,8 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 #   5. File backup before Write/Edit on existing files
 #   6. KG search suggestion before Edit/Write
 
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
@@ -39,8 +41,32 @@ except Exception:
 }
 
 # === TOOL CALL LOGGING ===
+# USER_MESSAGE may contain newlines, quotes, JSON metacharacters; TOOL_ARGS
+# is JSON but isn't trustworthy when concatenated into another JSON string.
+# Build the JSONL line through Python so every field is properly escaped.
+# Audit fix 2026-05-07.
 TOUCAN_LOG="$PROJECT_ROOT/.claude/logs/toucan_dataset.jsonl"
-echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"query\":\"$USER_MESSAGE\",\"chosen_tool\":\"$TOOL_NAME\",\"tool_args\":$TOOL_ARGS}" >> "$TOUCAN_LOG" 2>/dev/null || true
+TOUCAN_JSONL=$(USER_MESSAGE_FOR_PY="$USER_MESSAGE" \
+    TOOL_NAME_FOR_PY="$TOOL_NAME" \
+    TOOL_ARGS_FOR_PY="$TOOL_ARGS" \
+    python3 -c '
+import json, os, sys
+from datetime import datetime, timezone
+tool_args_raw = os.environ.get("TOOL_ARGS_FOR_PY", "")
+try:
+    tool_args_val = json.loads(tool_args_raw) if tool_args_raw else None
+except (json.JSONDecodeError, TypeError):
+    tool_args_val = tool_args_raw
+sys.stdout.write(json.dumps({
+    "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "query": os.environ.get("USER_MESSAGE_FOR_PY", ""),
+    "chosen_tool": os.environ.get("TOOL_NAME_FOR_PY", ""),
+    "tool_args": tool_args_val,
+}))
+' 2>/dev/null)
+if [ -n "$TOUCAN_JSONL" ]; then
+    printf '%s\n' "$TOUCAN_JSONL" >> "$TOUCAN_LOG" 2>/dev/null || true
+fi
 
 # === 1. SSRF GUARD ===
 if [[ "$TOOL_NAME" == "WebFetch" ]] || [[ "$TOOL_NAME" == "mcp__search__fetch_page" ]]; then

@@ -13,6 +13,8 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 
 set -euo pipefail
 
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
+
 PORT="${CODE_EMBED_PORT:-11440}"
 CONTAINER_NAME="${VCT_CODE_EMBED_CONTAINER:-code_embed}"
 LOCKFILE="${TMPDIR:-${XDG_RUNTIME_DIR:-/tmp}}/code_embed_service.lock"

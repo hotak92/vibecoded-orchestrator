@@ -27,6 +27,8 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 
 set -e
 
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
+
 EDITED_FILE="$1"
 REPO_PATH="${2:-${CLAUDE_PROJECT_DIR:-$(pwd)}}"
 PROJECT_NAME="${3:-$(basename "$REPO_PATH")}"

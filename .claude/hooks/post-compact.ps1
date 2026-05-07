@@ -7,6 +7,8 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # Fires on PostCompact event — after context compaction completes.
 # Logs the event to ~/.claude/metrics/compactions.jsonl and notifies.
 
+. "$PSScriptRoot/_lib/stderr-cap.ps1"
+
 $ProjectDir = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
 $ProjectName = Split-Path $ProjectDir -Leaf
 

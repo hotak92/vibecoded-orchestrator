@@ -7,6 +7,8 @@ if ($env:CLAUDE_CODE_DISABLE_AUTO_MEMORY) { exit 0 }
 # kg-summary-generator.ps1
 # PostToolUse hook: spawn a background agent to refresh KG node summaries.
 
+. "$PSScriptRoot/_lib/stderr-cap.ps1"
+
 $ScriptDir = $PSScriptRoot
 $ProjectRoot = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Resolve-Path (Join-Path $ScriptDir "..\..")).Path }
 

@@ -8,6 +8,8 @@
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
 
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
+
 CONTEXT_FILE=".claude/CONTEXT_STATE.md"
 SNAPSHOT_DIR="${TMPDIR:-/tmp}/claude_ctx_snapshots"
 SESSION_ID="${CLAUDE_SESSION_ID:-default}"
@@ -35,9 +37,14 @@ if cmp -s "$CONTEXT_FILE" "$SNAPSHOT_FILE"; then
     exit 0
 fi
 
-# Files differ — find which ## sections changed using diff
-# Get line numbers that changed
-changed_lines=$(diff --unchanged-line-format='' --new-line-format='%dn ' "$SNAPSHOT_FILE" "$CONTEXT_FILE" 2>/dev/null || true)
+# Files differ — find which ## sections changed using diff.
+# Get line numbers from the NEW file. We MUST also suppress old-side line
+# content (default --old-line-format is "%l\n"), otherwise content of removed
+# lines leaks into $changed_lines and the integer test below floods stderr
+# with "integer expression expected". Captured uncapped into JSONL hook
+# attachments, that produced 14-23 MB stderr blobs and triggered the
+# 2026-05-07 GUI freeze (Bug B / main-thread streaming stall).
+changed_lines=$(diff --unchanged-line-format='' --old-line-format='' --new-line-format='%dn ' "$SNAPSHOT_FILE" "$CONTEXT_FILE" 2>/dev/null || true)
 
 if [ -z "$changed_lines" ]; then
     # diff found differences but no new lines — file got shorter

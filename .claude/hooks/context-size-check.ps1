@@ -6,6 +6,8 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # Context Size Check Hook (PowerShell port)
 # Monitor CONTEXT_STATE.md size and surface a warning when threshold exceeded.
 
+. "$PSScriptRoot/_lib/stderr-cap.ps1"
+
 $MaxLines = 400
 $WarnLines = 300
 $ContextFile = ".claude/CONTEXT_STATE.md"

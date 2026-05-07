@@ -8,6 +8,8 @@ if ($env:CLAUDE_CODE_DISABLE_AUTO_MEMORY) { exit 0 }
 # Spawn a background Haiku agent to review the commit diff and update relevant
 # KG nodes / docs to keep everything in sync. Mirror of post-git-commit-kg-sync.sh.
 
+. "$PSScriptRoot/_lib/stderr-cap.ps1"
+
 if (-not (Get-Command claude -ErrorAction SilentlyContinue)) { exit 0 }
 
 $ProjectRoot = (& git rev-parse --show-toplevel 2>$null | Out-String).Trim()

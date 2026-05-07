@@ -7,6 +7,8 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 # Saves a snapshot of current working state to disk so compact-context-reinject.sh
 # can restore it after compaction. Does NOT write to stdout (not added to context).
 
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
+
 PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
 SNAPSHOT_FILE="$PROJECT_DIR/.claude/context/pre-compact-snapshot.md"
 
