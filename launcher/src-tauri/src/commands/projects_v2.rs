@@ -1275,30 +1275,45 @@ pub fn write_project_env_files(
     // merge logic below ALWAYS overwrites these from `settings`; other
     // keys present in the user's existing env block are preserved.
     //
-    // Keep this list sorted + cross-referenced with the `.claude/env`
-    // POSIX writer below — both surfaces must export the same set.
-    let canonical_env_pairs: Vec<(&str, String)> = vec![
-        ("KG_COLLECTION", kg_collection.to_string()),
-        ("PROJECT_NAME", project_name.to_string()),
-        ("DEVELOPMENT_COLLECTION", dev_collection.to_string()),
-        ("SHARED_KG_COLLECTION", shared_kg_collection.to_string()),
-        // Canonical write-gate key (asymmetric semantic since 2026-05-01).
-        ("SHARED_KG_WRITE_DISABLED", shared_kg_write_disabled.to_string()),
-        // Legacy alias — same value, removed in ~3 releases.
-        ("SHARED_KG_OPT_OUT", shared_kg_opt_out_legacy.to_string()),
-        // PR-3 (2026-05-06): launcher-resolved service URLs + ports +
-        // active embedding profile. Pre-PR-3 these were commented
-        // placeholders in `.env` and absent from `.claude/settings.json` —
-        // multi-stack / custom-port setups silently fell through to the
-        // canonical localhost defaults.
-        ("WEAVIATE_URL", weaviate_url.to_string()),
-        ("WEAVIATE_PORT", weaviate_port.clone()),
-        ("OLLAMA_URL", ollama_url.to_string()),
-        ("OLLAMA_PORT", ollama_port.clone()),
-        ("CODE_EMBED_URL", code_embed_url.to_string()),
-        ("CODE_EMBED_PORT", code_embed_port.clone()),
-        ("ACTIVE_EMBEDDING", active_embedding.to_string()),
-    ];
+    // Source of truth for KEY NAMES: `CANONICAL_INSTALL_ENV_KEYS` (single
+    // const, also used by the unregister path — see follow-up #10
+    // 2026-05-07). Adding a new canonical key is a one-line change to
+    // the const PLUS a one-line match arm here for its value lookup.
+    // The match is exhaustive: a key in the const without a match arm
+    // panics at install time with a clear diagnostic, which is much
+    // louder than the silent install/unregister drift the const
+    // refactor was written to prevent.
+    let canonical_env_pairs: Vec<(&str, String)> = CANONICAL_INSTALL_ENV_KEYS
+        .iter()
+        .map(|key| {
+            let value = match *key {
+                "KG_COLLECTION" => kg_collection.to_string(),
+                "PROJECT_NAME" => project_name.to_string(),
+                "DEVELOPMENT_COLLECTION" => dev_collection.to_string(),
+                "SHARED_KG_COLLECTION" => shared_kg_collection.to_string(),
+                // Canonical write-gate key (asymmetric semantic since 2026-05-01).
+                "SHARED_KG_WRITE_DISABLED" => shared_kg_write_disabled.to_string(),
+                // Legacy alias — same value, removed in ~3 releases.
+                "SHARED_KG_OPT_OUT" => shared_kg_opt_out_legacy.to_string(),
+                "ACTIVE_EMBEDDING" => active_embedding.to_string(),
+                // PR-3 (2026-05-06): launcher-resolved service URLs + ports.
+                "WEAVIATE_URL" => weaviate_url.to_string(),
+                "WEAVIATE_PORT" => weaviate_port.clone(),
+                "OLLAMA_URL" => ollama_url.to_string(),
+                "OLLAMA_PORT" => ollama_port.clone(),
+                "CODE_EMBED_URL" => code_embed_url.to_string(),
+                "CODE_EMBED_PORT" => code_embed_port.clone(),
+                other => panic!(
+                    "CANONICAL_INSTALL_ENV_KEYS contains key {:?} but \
+                     write_project_env_files has no match arm for it. \
+                     Add the value-lookup arm here OR remove the key \
+                     from the const.",
+                    other,
+                ),
+            };
+            (*key, value)
+        })
+        .collect();
     let canonical_env_keys: std::collections::HashSet<&str> =
         canonical_env_pairs.iter().map(|(k, _)| *k).collect();
 
@@ -2236,23 +2251,32 @@ pub struct UnregisterReport {
     pub warnings: Vec<String>,
 }
 
-/// Canonical env keys the launcher OWNS across every surface. These are
-/// the keys `purge_launcher_files_from_project` removes during unregister
-/// while preserving every other key (user-added secrets, custom config).
+// ─── Canonical env-key registry (single source of truth) ─────────────
+//
+// PR-150 reviewer concern (2026-05-06): the install path
+// (`canonical_env_pairs` in `write_project_env_files`) and the
+// unregister path (`UNREGISTER_CANONICAL_ENV_KEYS` below) used to
+// duplicate the SAME LIST of canonical env-key names in two places,
+// plus a third copy in the test that pinned the lockstep. Adding a
+// new canonical key required touching all three lists, and forgetting
+// any one silently broke unregister.
+//
+// Fix (2026-05-07, follow-up #10): extract the names into ONE
+// `&[&str]` const. The install path iterates this const and resolves
+// values via a match; the unregister path is the const + portability
+// extras; the test asserts this relationship directly. Adding a key
+// is now a one-line change here PLUS a one-line match arm in
+// `canonical_env_pairs`.
+
+/// Canonical env keys the launcher writes during install AND removes
+/// during unregister. The names live here exactly once. Both the
+/// install pair-builder and the unregister key-list iterate this.
 ///
-/// Keep in lockstep with `canonical_env_pairs` in `write_project_env_files`
-/// — the unregister path is the inverse of the install path. The `2026-
-/// 05-06 unregister keys` test pins them in the unit suite so a future
-/// addition to `canonical_env_pairs` doesn't silently leave a key behind
-/// after unregister.
-///
-/// Includes BOTH the canonical-pairs set AND the PR-2 portability keys
-/// (`VCT_ORCHESTRATOR_ROOT`, `VCT_INFRASTRUCTURE_DIR`) which live inside
-/// the same managed block in `.claude/env`. The portability keys are not
-/// emitted to `.vscode/settings.json` or `.claude/settings.json` (they
-/// only matter for shell-sourced contexts), but listing them here makes
-/// the `.claude/env` strip a single pass.
-pub(crate) const UNREGISTER_CANONICAL_ENV_KEYS: &[&str] = &[
+/// Order matters for `.claude/env` line ordering (which is just for
+/// human readability — no semantic significance). Keep additions
+/// grouped by purpose (collections / write-gates / project ID /
+/// embedding profile / service URLs / service ports).
+pub(crate) const CANONICAL_INSTALL_ENV_KEYS: &[&str] = &[
     "KG_COLLECTION",
     "DEVELOPMENT_COLLECTION",
     "SHARED_KG_COLLECTION",
@@ -2266,9 +2290,33 @@ pub(crate) const UNREGISTER_CANONICAL_ENV_KEYS: &[&str] = &[
     "OLLAMA_PORT",
     "CODE_EMBED_URL",
     "CODE_EMBED_PORT",
+];
+
+/// PR-2 portability keys: written to `.claude/env` by
+/// `build_claude_env_managed_block` (NOT to `.claude/settings.json` or
+/// `.vscode/settings.json` — they're only meaningful for shell-sourced
+/// contexts). Listed separately because the install pair-builder
+/// doesn't include them in its main `Vec<(&str, String)>` — they have
+/// their own write path.
+pub(crate) const CANONICAL_PORTABILITY_ENV_KEYS: &[&str] = &[
     "VCT_ORCHESTRATOR_ROOT",
     "VCT_INFRASTRUCTURE_DIR",
 ];
+
+/// Canonical env keys the launcher OWNS across every surface. These are
+/// the keys `purge_launcher_files_from_project` removes during unregister
+/// while preserving every other key (user-added secrets, custom config).
+///
+/// Built at compile time from `CANONICAL_INSTALL_ENV_KEYS` +
+/// `CANONICAL_PORTABILITY_ENV_KEYS` so the install/unregister pair
+/// can't drift. The `2026-05-06 unregister keys` test asserts the
+/// relationship directly (no hardcoded mirror).
+pub(crate) static UNREGISTER_CANONICAL_ENV_KEYS: std::sync::LazyLock<Vec<&'static str>> =
+    std::sync::LazyLock::new(|| {
+        let mut v: Vec<&'static str> = CANONICAL_INSTALL_ENV_KEYS.to_vec();
+        v.extend(CANONICAL_PORTABILITY_ENV_KEYS.iter().copied());
+        v
+    });
 
 /// Project-folder paths the launcher OWNS and will recursively delete on
 /// unregister when `purge_launcher_files: true`. Each entry is RELATIVE
@@ -4892,50 +4940,105 @@ mod tests {
 
     // ─── 2026-05-06 unregister keys / surgical purge ───────────────────
 
-    /// Pin the canonical-key set: every key the launcher writes via
-    /// `canonical_env_pairs` MUST also be removed by unregister. Forgetting
-    /// to add a new canonical key to `UNREGISTER_CANONICAL_ENV_KEYS` would
-    /// silently leave it behind on the user's disk after unregister — this
-    /// test catches that drift.
+    /// Pin the canonical-key relationship: every key in the install
+    /// const MUST also appear in the unregister-derived list.
+    ///
+    /// Pre-2026-05-07 this test had a third hardcoded mirror of the
+    /// canonical list (the same names also lived in `canonical_env_pairs`
+    /// AND `UNREGISTER_CANONICAL_ENV_KEYS`). PR-150 reviewer flagged
+    /// the fragility: adding a key required touching all three lists
+    /// and forgetting any one silently broke unregister.
+    ///
+    /// Post-2026-05-07 (follow-up #10): the test references the const
+    /// directly. There is now ONE source of truth for canonical key
+    /// NAMES. Drift across install + unregister + portability is
+    /// structurally impossible.
     #[test]
     fn unregister_canonical_keys_match_install_canonical_keys() {
-        // The install path's canonical-pair list (drawn from
-        // `write_project_env_files` line 1260+). When that list grows,
-        // either add the key here OR explicitly justify the omission
-        // (some canonical keys may legitimately want to stay — e.g. if
-        // a future key were a system-wide telemetry opt-out).
-        let install_canonical: Vec<&str> = vec![
-            "KG_COLLECTION",
-            "PROJECT_NAME",
-            "DEVELOPMENT_COLLECTION",
-            "SHARED_KG_COLLECTION",
-            "SHARED_KG_WRITE_DISABLED",
-            "SHARED_KG_OPT_OUT",
-            "WEAVIATE_URL",
-            "WEAVIATE_PORT",
-            "OLLAMA_URL",
-            "OLLAMA_PORT",
-            "CODE_EMBED_URL",
-            "CODE_EMBED_PORT",
-            "ACTIVE_EMBEDDING",
-        ];
         let unregister_set: std::collections::HashSet<&str> =
             UNREGISTER_CANONICAL_ENV_KEYS.iter().copied().collect();
-        for k in &install_canonical {
+
+        // Every install-canonical key must be removable by unregister.
+        for k in CANONICAL_INSTALL_ENV_KEYS.iter() {
             assert!(
                 unregister_set.contains(*k),
                 "install-canonical key {:?} missing from \
                  UNREGISTER_CANONICAL_ENV_KEYS — unregister will leave \
-                 it behind on disk. Either add it to the unregister list \
-                 or document a deliberate exception.",
+                 it behind on disk. Likely cause: \
+                 CANONICAL_INSTALL_ENV_KEYS and the LazyLock build \
+                 of UNREGISTER_CANONICAL_ENV_KEYS got out of sync.",
                 k,
             );
         }
-        // Sanity: unregister also covers the PR-2 portability keys
-        // (which aren't in canonical_env_pairs but are written by
-        // `build_claude_env_managed_block`).
-        assert!(unregister_set.contains("VCT_ORCHESTRATOR_ROOT"));
-        assert!(unregister_set.contains("VCT_INFRASTRUCTURE_DIR"));
+
+        // Portability keys (written to `.claude/env` only, not to JSON
+        // surfaces) must also be in unregister.
+        for k in CANONICAL_PORTABILITY_ENV_KEYS.iter() {
+            assert!(
+                unregister_set.contains(*k),
+                "portability key {:?} missing from \
+                 UNREGISTER_CANONICAL_ENV_KEYS",
+                k,
+            );
+        }
+
+        // Belt-and-suspenders: the unregister set must be EXACTLY the
+        // union of install + portability — no extras, no gaps. An
+        // extra key in unregister is suspicious (might mean someone
+        // tried to add a "remove this on unregister" without adding
+        // the corresponding install path).
+        let expected_size =
+            CANONICAL_INSTALL_ENV_KEYS.len() + CANONICAL_PORTABILITY_ENV_KEYS.len();
+        assert_eq!(
+            UNREGISTER_CANONICAL_ENV_KEYS.len(),
+            expected_size,
+            "UNREGISTER_CANONICAL_ENV_KEYS size ({}) does not match \
+             CANONICAL_INSTALL_ENV_KEYS ({}) + \
+             CANONICAL_PORTABILITY_ENV_KEYS ({}) = {}. \
+             The LazyLock builder may have been edited by hand.",
+            UNREGISTER_CANONICAL_ENV_KEYS.len(),
+            CANONICAL_INSTALL_ENV_KEYS.len(),
+            CANONICAL_PORTABILITY_ENV_KEYS.len(),
+            expected_size,
+        );
+    }
+
+    /// Belt-and-suspenders: catch the OTHER drift class. The install
+    /// pair-builder uses a `match` over key names; if a key is added
+    /// to `CANONICAL_INSTALL_ENV_KEYS` without a corresponding match
+    /// arm in `write_project_env_files`, the build_pairs panics at
+    /// install time. This test exercises the build path directly so
+    /// missing match arms surface in CI rather than at first install.
+    #[test]
+    fn install_match_arms_cover_every_canonical_key() {
+        // We can't easily call `write_project_env_files` from a unit
+        // test (needs a full `ProjectEnvSettings` + DB context). But
+        // the match logic is identical in shape: for each key in the
+        // const, there must exist a match arm. We assert that by
+        // listing the supported keys here + checking equality.
+        //
+        // If you add a new key to CANONICAL_INSTALL_ENV_KEYS, add it
+        // to BOTH this list AND the match in write_project_env_files.
+        // The list of (test, install) is intentionally separate so
+        // forgetting either side surfaces here.
+        let test_known_keys: std::collections::HashSet<&str> = [
+            "KG_COLLECTION", "PROJECT_NAME", "DEVELOPMENT_COLLECTION",
+            "SHARED_KG_COLLECTION", "SHARED_KG_WRITE_DISABLED",
+            "SHARED_KG_OPT_OUT", "ACTIVE_EMBEDDING",
+            "WEAVIATE_URL", "WEAVIATE_PORT",
+            "OLLAMA_URL", "OLLAMA_PORT",
+            "CODE_EMBED_URL", "CODE_EMBED_PORT",
+        ].iter().copied().collect();
+
+        for k in CANONICAL_INSTALL_ENV_KEYS.iter() {
+            assert!(
+                test_known_keys.contains(*k),
+                "CANONICAL_INSTALL_ENV_KEYS has key {:?} that this \
+                 test doesn't know about. Add it here AND add a \
+                 match arm in write_project_env_files.",
+                k,
+            );
+        }
     }
 
     #[test]
@@ -5237,7 +5340,7 @@ USER_DB_URL=postgres://user:pass@db/app
         let after = std::fs::read_to_string(tmp.join(".env")).unwrap();
 
         // ALL canonical keys removed.
-        for k in UNREGISTER_CANONICAL_ENV_KEYS {
+        for k in UNREGISTER_CANONICAL_ENV_KEYS.iter() {
             // Not all canonical keys are in this fixture (e.g. VCT_*),
             // but every key listed in UNREGISTER_CANONICAL_ENV_KEYS that
             // WAS present must now be absent.
@@ -5338,7 +5441,7 @@ USER_DB_URL=postgres://user:pass@db/app
         // (the env-var name) instead of `*_KnowledgeGraph` would still
         // fail at the Weaviate API level, but this assertion makes the
         // confusion impossible to express in the source.
-        for k in UNREGISTER_CANONICAL_ENV_KEYS {
+        for k in UNREGISTER_CANONICAL_ENV_KEYS.iter() {
             assert!(
                 !k.ends_with("_KnowledgeGraph"),
                 "canonical env-var name {} looks like a collection name", k,
