@@ -16,18 +16,27 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
 PROJECT_NAME=$(basename "$PROJECT_DIR")
 
+# Resolve a Python interpreter portably (python3 → python → py).
+# See audit finding F6, 2026-04-30. _lib/find-python.sh sets $PY.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=_lib/find-python.sh disable=SC1091
+[ -f "$SCRIPT_DIR/_lib/find-python.sh" ] && . "$SCRIPT_DIR/_lib/find-python.sh"
+
 PAYLOAD=$(cat)
-TRIGGER=$(echo "$PAYLOAD" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('trigger','unknown'))" 2>/dev/null || echo "unknown")
+TRIGGER="unknown"
+if [ -n "${PY:-}" ]; then
+    TRIGGER=$(echo "$PAYLOAD" | "$PY" -c "import sys,json; d=json.load(sys.stdin); print(d.get('trigger','unknown'))" 2>/dev/null || echo "unknown")
+fi
 
 # Log the compaction event
 LOG_DIR="$HOME/.claude/metrics"
 mkdir -p "$LOG_DIR"
 echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"project\":\"$PROJECT_NAME\",\"trigger\":\"$TRIGGER\"}" >> "$LOG_DIR/compactions.jsonl"
 
-# Desktop notification
-notify-send \
-    --icon=dialog-information \
-    --expire-time=5000 \
-    --urgency=low \
-    "Context compacted — $PROJECT_NAME" \
-    "Trigger: $TRIGGER. Context re-injected." 2>/dev/null || true
+# Cross-platform desktop notification (Linux/macOS/Windows). See audit F2.
+if [ -n "${PY:-}" ] && [ -f "$PROJECT_DIR/.claude/scripts/notify.py" ]; then
+    "$PY" "$PROJECT_DIR/.claude/scripts/notify.py" \
+        "Context compacted — $PROJECT_NAME" "Trigger: $TRIGGER. Context re-injected." \
+        --urgency low --icon dialog-information --expire-time 5000 \
+        2>/dev/null || true
+fi

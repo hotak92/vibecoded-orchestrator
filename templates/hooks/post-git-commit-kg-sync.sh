@@ -14,6 +14,11 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 set -e
 
 # Silent fallback: if claude CLI isn't installed, exit clean.
+# Audit F18 (2026-04-30): `command -v` is POSIX and works under any shell
+# that runs this hook (bash on Linux/macOS, Git Bash on Windows). The hook
+# is unreachable from cmd.exe / PowerShell because settings.json wires it
+# with a `bash …` prefix; that's covered by audit F1, not here. The
+# silent no-op below is correct behavior on hosts without `claude` on PATH.
 command -v claude >/dev/null 2>&1 || exit 0
 
 # Auto-detect project root from cwd (the project being committed to)

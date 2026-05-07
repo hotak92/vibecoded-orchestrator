@@ -11,6 +11,11 @@ EDITED_FILE="$1"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
+# Resolve a Python interpreter portably (python3 → python → py).
+# See audit finding F6, 2026-04-30. _lib/find-python.sh sets $PY.
+# shellcheck source=_lib/find-python.sh disable=SC1091
+[ -f "$SCRIPT_DIR/_lib/find-python.sh" ] && . "$SCRIPT_DIR/_lib/find-python.sh"
+
 ALERT_LOG="$PROJECT_ROOT/.claude/logs/credential_alerts.jsonl"
 mkdir -p "$(dirname "$ALERT_LOG")"
 
@@ -36,7 +41,12 @@ check_pattern "Generic secret"           '(SECRET|API_KEY|ACCESS_TOKEN|PRIVATE_K
 if [ ${#ALERTS[@]} -gt 0 ]; then
     MSG="Possible credential in $(basename "$EDITED_FILE"): ${ALERTS[*]}"
     echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"file\":\"$EDITED_FILE\",\"patterns\":\"${ALERTS[*]}\"}" >> "$ALERT_LOG" 2>/dev/null || true
-    notify-send "Claude Code Security Alert" "$MSG" 2>/dev/null || true
+    # Cross-platform notification (Linux/macOS/Windows). See audit F2.
+    if [ -n "${PY:-}" ] && [ -f "$PROJECT_ROOT/.claude/scripts/notify.py" ]; then
+        "$PY" "$PROJECT_ROOT/.claude/scripts/notify.py" \
+            "Claude Code Security Alert" "$MSG" \
+            --urgency critical --icon dialog-warning 2>/dev/null || true
+    fi
     echo "⚠️  $MSG"
     echo "   Review: $EDITED_FILE"
 fi
