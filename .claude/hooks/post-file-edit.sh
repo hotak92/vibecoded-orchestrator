@@ -19,8 +19,23 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 KNOWLEDGE_ROOT="$PROJECT_ROOT/knowledge"
 
-# Get the file that was edited (passed as argument)
-EDITED_FILE="$1"
+# Hook input arrives as JSON on stdin per Claude Code v2.1.x spec.
+# Positional args ($1) are EMPTY because $CLAUDE_TOOL_ARG_FILE_PATH and
+# similar env vars don't exist — settings.json substitutes to "". Verified
+# 2026-05-08 via stdin-capture diagnostic.
+HOOK_STDIN=$(cat 2>/dev/null || echo "")
+EDITED_FILE=$(printf '%s' "$HOOK_STDIN" | python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    ti = d.get('tool_input', {})
+    print(ti.get('file_path', ''))
+except Exception:
+    print('')
+" 2>/dev/null || echo "")
+
+# Nothing to do if extraction failed or file path is empty.
+[ -z "$EDITED_FILE" ] && exit 0
 
 # 1. Auto-sync knowledge graph files (with integrated inference)
 if [[ "$EDITED_FILE" == "$KNOWLEDGE_ROOT"* ]]; then

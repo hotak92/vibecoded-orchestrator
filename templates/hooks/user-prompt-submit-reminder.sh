@@ -7,6 +7,13 @@ set -euo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
 
+# Hook input contract (v2.1.x): JSON on stdin, NOT $CLAUDE_TOOL_NAME env var.
+# Reading the env var under `set -u` aborts the hook with "unbound variable"
+# before the staleness check ever runs — that was a long-standing latent bug
+# (confirmed empirically 2026-05-08). We drain stdin (best-effort) and use a
+# `${VAR:-}` default so the script can run on any event without aborting.
+HOOK_STDIN=$(cat 2>/dev/null || echo "")
+
 PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
 PROJECT_NAME=$(basename "$PROJECT_DIR")
 CONTEXT_FILE="$PROJECT_DIR/.claude/CONTEXT_STATE.md"
@@ -17,22 +24,17 @@ if [ ! -f "$SESSION_LOG" ]; then
     echo "0" > "$SESSION_LOG"  # Total words this session
 fi
 
-# Estimate output volume based on tool usage
-# Only count if substantial work happened (file operations, tool calls)
+# Estimate output volume. UserPromptSubmit hooks don't see tool_name, so per-
+# tool accounting is moot under v2.1.x. Kept as a defensive default in case
+# a future runtime ever populates the env var; today it always evaluates 0.
 WORDS_THIS_TURN=0
-
-# Check if any files were modified/created (PostToolUse context)
-if [ -n "$CLAUDE_TOOL_NAME" ]; then
+if [ -n "${CLAUDE_TOOL_NAME:-}" ]; then
     case "$CLAUDE_TOOL_NAME" in
-        Read|Write|Edit) WORDS_THIS_TURN=1000 ;;  # File operations = substantial
-        Bash) WORDS_THIS_TURN=500 ;;              # Commands = moderate
-        Task) WORDS_THIS_TURN=2000 ;;             # Agent spawns = heavy
-        *) WORDS_THIS_TURN=200 ;;                 # Other tools = light
+        Read|Write|Edit) WORDS_THIS_TURN=1000 ;;
+        Bash) WORDS_THIS_TURN=500 ;;
+        Task) WORDS_THIS_TURN=2000 ;;
+        *) WORDS_THIS_TURN=200 ;;
     esac
-else
-    # UserPromptSubmit without tool context - check if user message is long
-    # Assume short exchanges don't need counting
-    WORDS_THIS_TURN=0
 fi
 
 # Only increment if substantial work

@@ -28,36 +28,57 @@ GENERATOR="$PROJECT_ROOT/.claude/scripts/generate-kg-summary.py"
 [ -x "$VENV" ] || exit 0
 [ -f "$GENERATOR" ] || exit 0
 
-# Resolve the file path depending on which tool triggered us
+# Resolve the file path depending on which tool triggered us.
+#
+# Hook input arrives as JSON on stdin per Claude Code v2.1.x spec.
+# The legacy $CLAUDE_TOOL_ARG_FILE_PATH env-var fallback was removed
+# 2026-05-08 — that env var is NOT populated by Claude Code, so it
+# always evaluated to empty and the fallback path silently skipped to
+# the MCP branch. Verified via stdin-capture diagnostic.
 FILE_PATH=""
 
-# Read hook input from stdin
+# Read hook input from stdin (single read; reused by both branches)
 INPUT=$(cat)
 
-if [ -n "$CLAUDE_TOOL_ARG_FILE_PATH" ]; then
-    # Edit/Write tool — file path passed directly
-    FILE_PATH="$CLAUDE_TOOL_ARG_FILE_PATH"
-elif echo "$INPUT" | grep -q "store_knowledge_node"; then
-    # MCP store_knowledge_node — extract file_path from tool response
-    FILE_PATH=$(echo "$INPUT" | python3 -c "
-import sys, json
+# Single Python extractor handles both Edit/Write (tool_input.file_path)
+# and MCP store_knowledge_node (tool_response.absolute_path or
+# tool_input.file_path). Branches by tool_name internally.
+FILE_PATH=$(printf '%s' "$INPUT" | python3 -c "
+import sys, json, re
 try:
-    d = json.load(sys.stdin)
-    # Try tool_response first (contains absolute_path)
-    resp = d.get('tool_response', '')
-    if isinstance(resp, str):
-        import re
-        m = re.search(r'absolute_path[\":\s]+([^\",}]+)', resp)
-        if m: print(m.group(1).strip()); sys.exit(0)
-    # Try tool_input
-    inp = d.get('tool_input', {})
-    if isinstance(inp, str): inp = json.loads(inp)
-    fp = inp.get('file_path', '')
-    if fp: print(fp)
+    d = json.loads(sys.stdin.read())
+    tool_name = d.get('tool_name', '') or ''
+    inp = d.get('tool_input', {}) or {}
+    if isinstance(inp, str):
+        try:
+            inp = json.loads(inp)
+        except Exception:
+            inp = {}
+    # Edit/Write path — file_path lives under tool_input
+    if tool_name in ('Edit', 'Write'):
+        print(inp.get('file_path', '') or '')
+        sys.exit(0)
+    # MCP store_knowledge_node — try tool_response.absolute_path first,
+    # then fall back to tool_input.file_path
+    if tool_name == 'mcp__weaviate-kg__store_knowledge_node':
+        resp = d.get('tool_response', '')
+        if isinstance(resp, dict):
+            ap = resp.get('absolute_path', '')
+            if ap:
+                print(ap)
+                sys.exit(0)
+        elif isinstance(resp, str) and resp:
+            m = re.search(r'absolute_path[\":\\s]+([^\",}]+)', resp)
+            if m:
+                print(m.group(1).strip())
+                sys.exit(0)
+        print(inp.get('file_path', '') or '')
+        sys.exit(0)
+    # Unknown tool — fall through to nothing
+    print('')
 except Exception:
-    pass
-" 2>/dev/null)
-fi
+    print('')
+" 2>/dev/null || echo "")
 
 # Validate it's a knowledge file
 if [[ -z "$FILE_PATH" ]] || [[ "$FILE_PATH" != *"knowledge/"* ]] || [[ "$FILE_PATH" != *.md ]]; then

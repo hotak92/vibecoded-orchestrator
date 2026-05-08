@@ -24,13 +24,40 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
 
-TOOL_NAME="$1"
-TOOL_ARGS="$3"
+# Hook input arrives as JSON on stdin per Claude Code v2.1.x spec.
+# Positional args ($1/$2) are EMPTY because $CLAUDE_TOOL_NAME etc. don't exist
+# as env vars — settings.json substitutes them to "". Verified empirically
+# 2026-05-08 via stdin-capture diagnostic.
+HOOK_STDIN=$(cat 2>/dev/null || echo "")
+TOOL_NAME=$(printf '%s' "$HOOK_STDIN" | python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print(d.get('tool_name', ''))
+except Exception:
+    print('')
+" 2>/dev/null || echo "")
+TOOL_ARGS=$(printf '%s' "$HOOK_STDIN" | python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print(json.dumps(d.get('tool_input', {})))
+except Exception:
+    print('{}')
+" 2>/dev/null || echo "{}")
 
 # Only inspect Bash invocations
 [[ "$TOOL_NAME" != "Bash" ]] && exit 0
 
-CMD="$TOOL_ARGS"
+# Extract the command string from the tool_input JSON
+CMD=$(printf '%s' "$TOOL_ARGS" | python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print(d.get('command', ''))
+except Exception:
+    print('')
+" 2>/dev/null || echo "")
 
 # Match `vercel` (or its absolute/local-bin paths) followed somewhere by
 # --token=... or --token <value>. We accept any preceding pipeline stages.
