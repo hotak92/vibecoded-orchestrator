@@ -1,3 +1,4 @@
+# Parity-touch 2026-05-08: bash shebang of sibling .sh switched from #!/bin/bash to #!/usr/bin/env bash for macOS portability. PS1 has no shebang to change; this comment is the parity-required modification.
 # Scrub sensitive env vars before any subprocess spawning
 foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
@@ -10,14 +11,26 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
 
-param(
-    [Parameter(Position=0)] [string]$ToolName = "",
-    [Parameter(Position=1)] [string]$UserMessage = "",
-    [Parameter(Position=2)] [string]$ToolArgs = ""
-)
+# Hook input arrives as JSON on stdin per Claude Code v2.1.x spec.
+# Positional args ($args) and $env:CLAUDE_TOOL_NAME etc. are EMPTY —
+# verified empirically 2026-05-08 via stdin-capture diagnostic.
+$HookStdin = ""
+try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
+$ToolName = ""
+$cmd = ""
+try {
+    $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
+    if ($payload) {
+        if ($payload.tool_name) { $ToolName = [string]$payload.tool_name }
+        if ($payload.tool_input -and $payload.tool_input.command) {
+            $cmd = [string]$payload.tool_input.command
+        }
+    }
+} catch {
+    # Empty/malformed stdin — keep variables at defaults
+}
 
 if ($ToolName -ne "Bash") { exit 0 }
-$cmd = $ToolArgs
 
 # Match `vercel` (or path/local-bin variants) followed somewhere by --token=... or --token <value>.
 $hasVercel = $cmd -match '(^|[\s/])vercel(\s|$)'

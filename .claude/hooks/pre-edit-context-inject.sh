@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Pre-edit context injection hook
 # Fires BEFORE Edit tool executes — injects KG + code graph context for the file being edited
 # Output goes to stdout → becomes additionalContext the LLM sees before executing the edit
@@ -15,8 +15,27 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
 
-TOOL_NAME="$1"
-TOOL_ARGS="$2"
+# Hook input arrives as JSON on stdin per Claude Code v2.1.x spec.
+# Positional args ($1/$2) are EMPTY because $CLAUDE_TOOL_NAME etc. don't
+# exist as env vars — settings.json substitutes them to "". Verified
+# empirically 2026-05-08 via stdin-capture diagnostic.
+HOOK_STDIN=$(cat 2>/dev/null || echo "")
+TOOL_NAME=$(printf '%s' "$HOOK_STDIN" | python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print(d.get('tool_name', ''))
+except Exception:
+    print('')
+" 2>/dev/null || echo "")
+TOOL_ARGS=$(printf '%s' "$HOOK_STDIN" | python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print(json.dumps(d.get('tool_input', {})))
+except Exception:
+    print('{}')
+" 2>/dev/null || echo "{}")
 
 # Only fire for Edit tool
 if [[ "$TOOL_NAME" != "Edit" ]]; then
@@ -72,6 +91,32 @@ CACHE_FILE="$CACHE_DIR/$FILE_HASH"
 
 mkdir -p "$CACHE_DIR" 2>/dev/null || true
 
+# === Helper: emit context as PreToolUse JSON envelope ===
+# Plain stdout is silently discarded by Claude Code's hook runner — only
+# `hookSpecificOutput.additionalContext` reaches the LLM (system reminder
+# wrapper). 10k char cap per the documented contract. Pre-2026-05-08 this
+# hook printed plain stdout that never reached the LLM context, so all
+# the KG/codegraph injection work was effectively dead. Confirmed by
+# checking that no `[Pre-edit context for ...]` system-reminders ever
+# appeared in real Edit-tool transcripts.
+_emit_context_json() {
+    local ctx="$1"
+    [ -z "$ctx" ] && return 0
+    [ -z "${PY:-}" ] && return 0
+    local truncated
+    truncated=$(printf '%s' "$ctx" | head -c 10000)
+    "$PY" -c "
+import json, sys
+print(json.dumps({
+    'hookSpecificOutput': {
+        'hookEventName': 'PreToolUse',
+        'permissionDecision': 'allow',
+        'additionalContext': sys.stdin.read(),
+    }
+}))
+" <<< "$truncated" 2>/dev/null || true
+}
+
 # === Check cache (10 min TTL) ===
 # Use Python for mtime — `stat -c %Y` is GNU-only; macOS BSD stat needs
 # `-f %m`. Without this, every macOS install treats the cache as expired.
@@ -84,7 +129,7 @@ if [[ -f "$CACHE_FILE" ]]; then
     fi
     FILE_AGE=$(( $(date +%s) - CACHE_MTIME ))
     if [[ "$FILE_AGE" -lt "$CACHE_TTL" ]]; then
-        cat "$CACHE_FILE"
+        _emit_context_json "$(cat "$CACHE_FILE")"
         exit 0
     fi
 fi
@@ -205,10 +250,11 @@ if [[ "$HAS_CODE" == "1" ]]; then
     OUTPUT+="Related code: ${CODE_RESULT}"$'\n'
 fi
 
-# === Cache the result ===
+# === Cache the plain-text form + emit JSON envelope ===
+# Cache stores the human-readable form so re-emission produces identical
+# content. _emit_context_json wraps it for Claude Code's PreToolUse contract.
 echo "$OUTPUT" > "$CACHE_FILE" 2>/dev/null || true
 
-# === Output to stdout (becomes additionalContext) ===
-echo "$OUTPUT"
+_emit_context_json "$OUTPUT"
 
 exit 0

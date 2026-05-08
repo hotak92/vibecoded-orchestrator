@@ -15,6 +15,12 @@ permissions:
   packages: read
   actions: read
 
+# Cancel previous CodeQL runs on the same branch when a new commit is
+# pushed. Pre-fork audit item #4 (2026-05-08).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})

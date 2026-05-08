@@ -1,6 +1,7 @@
 pub mod app_state_cmd;
 pub mod audit;
 pub mod changes_cmd;
+pub mod gpu;
 pub mod codegraph;
 pub mod coordination;
 pub mod dashboard;

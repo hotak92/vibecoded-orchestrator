@@ -10,8 +10,12 @@
 # Logs:  podman-compose logs -f <service>
 #
 # GPU support (optional):
-#   Requires nvidia-container-toolkit + CDI generation:
-#     sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+#   Requires NVIDIA Container Toolkit ≥ 1.18.0. The toolkit ships
+#   `nvidia-cdi-refresh.path` + `.service` systemd units that auto-write
+#   /var/run/cdi/nvidia.yaml on every driver install/upgrade. **DO NOT
+#   write /etc/cdi/nvidia.yaml manually** — Podman reads /etc/cdi/ first,
+#   shadowing the auto-refresh and breaking GPU containers on every
+#   subsequent driver update. Verify: `systemctl is-enabled nvidia-cdi-refresh.path`.
 
 name: vibecoded
 
@@ -53,10 +57,23 @@ services:
     volumes:
       - weaviate_data:/var/lib/weaviate
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/v1/.well-known/ready"]
+      # Use /v1/meta, NOT /v1/.well-known/ready. Root cause of the
+      # 2026-05-08 weaviate restart-loop / port-mapping desync was that
+      # /v1/.well-known/ready returns 503 during legitimate operations
+      # (vector-cache prefill, shard load, compactions). The strict
+      # endpoint produced healthcheck flap → restart:unless-stopped → race
+      # between podman restart N+1 and restart N's teardown → conmon /
+      # rootlessport / state-DB desync that left the container in a
+      # zombie "running but port dead" state. /v1/meta returns 200 as
+      # long as the HTTP server itself is up, which is the right signal
+      # for "container is functional".
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/v1/meta"]
       interval: 30s
       timeout: 5s
       retries: 5
+      # Boot can take 20-40s on a multi-GB KG (raft init + shard load +
+      # vector-cache prefill). Don't count failures during this window.
+      start_period: 60s
     networks:
       - vibecoded-network
 

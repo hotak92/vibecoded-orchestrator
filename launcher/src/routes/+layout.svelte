@@ -19,6 +19,7 @@
   import McpDashboard from '$lib/components/McpDashboard.svelte';
   import OnboardingWizard from '$lib/components/OnboardingWizard.svelte';
   import ChangelogModal from '$lib/components/ChangelogModal.svelte';
+  import CdiDriftModal from '$lib/components/CdiDriftModal.svelte';
   import ExternalServicesDialog from '$lib/components/ExternalServicesDialog.svelte';
   import NoContainerRuntimeDialog from '$lib/components/NoContainerRuntimeDialog.svelte';
   import InstallHealthGate from '$lib/components/InstallHealthGate.svelte';
@@ -192,6 +193,11 @@
   <ChangelogModal bind:open={showChangelog} />
   <ExternalServicesDialog />
   <NoContainerRuntimeDialog />
+  <!-- CDI / NVIDIA driver-version drift detector. Runs once at app
+       startup; auto-opens a blocking modal only when it finds drift
+       (Linux + NVIDIA + stale CDI spec). Silent on macOS, Windows, or
+       hosts without nvidia-smi. See gpu.rs for forensics. -->
+  <CdiDriftModal />
   <!-- Highest-priority gate: blocks the UI when the launcher binary is
        running from inside an install root that never had first-install
        executed. Self-bypasses in developer mode and once the user has

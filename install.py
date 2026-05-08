@@ -2705,6 +2705,36 @@ def _detect_container_runtime() -> str:
     return ""
 
 
+def _container_runtime_reachable(container_cmd: str) -> bool:
+    """Quick proactive check that the container daemon/socket is responsive.
+
+    Used by `_start_services()` before compose-up to surface a
+    cross-platform actionable hint when the runtime is installed but
+    not running. Without this, compose-up takes 10-30s to fail with
+    a cryptic stderr ("Cannot connect to the Docker daemon" or
+    "Cannot connect to Podman socket"), which we then have to parse.
+
+    Returns False if the runtime isn't on PATH OR `<runtime> info`
+    fails. Returns True if the daemon/socket is responsive.
+
+    Why `info` (not `version`): `version` only checks the client
+    binary; `info` round-trips to the daemon/socket and exercises the
+    same code path that compose-up needs. Catches stopped Docker
+    Desktop on macOS, stopped podman.socket on Linux rootless,
+    unstarted podman machine on Windows.
+    """
+    if not container_cmd or not shutil.which(container_cmd):
+        return False
+    try:
+        result = subprocess.run(
+            [container_cmd, "info"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
 def _detect_installed_runtime() -> str:
     """Lightweight presence check — returns the FIRST container-runtime
     binary on PATH regardless of whether its daemon is running.
@@ -2724,69 +2754,103 @@ def _detect_installed_runtime() -> str:
 
 
 def _ensure_nvidia_cdi_spec_for_podman() -> None:
-    """Generate the NVIDIA CDI spec for Podman if missing.
+    """Verify NVIDIA Container Toolkit's auto-refresh CDI service is active.
 
-    Podman needs a CDI YAML at /etc/cdi/nvidia.yaml to expose
-    `nvidia.com/gpu=all` device entries. The NVIDIA Container Toolkit
-    ships `nvidia-ctk` for this. We invoke it idempotently before
-    compose-up.
+    Background (revised 2026-05-08):
 
-    Behavior:
-      - Skip silently on macOS / Windows (CDI is a Linux concept).
-      - Skip if /etc/cdi/nvidia.yaml already exists (idempotent).
-      - Skip if `nvidia-ctk` isn't on PATH — print a one-line hint with
-        the NVIDIA Container Toolkit install URL so the user can fix it.
-        Compose-up will fail loudly afterwards, which is the right
-        signal in this case.
-      - On Linux with nvidia-ctk present: run `sudo nvidia-ctk cdi
-        generate --output=/etc/cdi/nvidia.yaml`. Sudo prompt surfaces
-        in the controlling terminal. If sudo is non-interactive (CI),
-        this fails; user re-runs install with sudo or sets up CDI
-        manually.
+    Earlier versions of this function wrote `/etc/cdi/nvidia.yaml` directly
+    via `sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml`. That
+    was the right advice for nvidia-container-toolkit < 1.18, but it's
+    actively harmful in 2026:
 
-    No-op + non-fatal by design — install.py prints what happened and
-    moves on. The compose-up that follows will surface the real error
-    if CDI didn't get set up.
+      1. NVIDIA Container Toolkit ≥ 1.18.0 ships `nvidia-cdi-refresh.path`
+         + `nvidia-cdi-refresh.service` systemd units that AUTO-regenerate
+         the CDI spec on every driver install/upgrade. They write to
+         `/var/run/cdi/nvidia.yaml` (a runtime tmpfs path).
+
+      2. Podman reads `/etc/cdi/` BEFORE `/var/run/cdi/`. So a manually
+         written `/etc/cdi/nvidia.yaml` SHADOWS the auto-refreshed one.
+
+      3. After an apt/dnf-driven driver upgrade, the manual `/etc/cdi/`
+         spec keeps referencing the OLD driver's library files (e.g.
+         libEGL_nvidia.so.590.48.01). Those files were deleted by the
+         driver upgrade. Result: every GPU container fails to start with
+         `runc: failed to fulfil mount request: ... no such file`.
+
+      4. We hit this exact bug on the dev machine 2026-05-07 — entire
+         compose stack came down because ollama/code_embed couldn't mount
+         a stale lib path. See `.claude/context/handoff-2026-05-08-*.md`.
+
+    Correct behaviour now:
+      - DO NOT write `/etc/cdi/nvidia.yaml` from this installer.
+      - DELETE any pre-existing `/etc/cdi/nvidia.yaml` left over from prior
+        installs of VCO (they are time-bombs).
+      - Verify the system's auto-refresh service is present + enabled.
+        If toolkit < 1.18 is installed (no auto-refresh units): warn user
+        to upgrade. If units exist but are disabled: print the enable cmd.
+
+    No /etc/cdi/ writes. Ever. The launcher's startup-time drift detector
+    is the second line of defense if the user somehow re-creates a stale
+    spec.
     """
     if platform.system() != "Linux":
         # macOS Podman runs in a VM; CDI generation happens inside
         # the VM via Podman Machine, not on the host. Skip for now.
         return
 
-    cdi_path = Path("/etc/cdi/nvidia.yaml")
-    if cdi_path.exists():
-        # Already configured. nvidia-ctk is idempotent so we could
-        # re-run anyway, but the no-op is cheaper.
-        return
-
     if not shutil.which("nvidia-ctk"):
         print(
             "  [!] Podman + NVIDIA: `nvidia-ctk` not on PATH. Install the "
-            "NVIDIA Container Toolkit:\n"
+            "NVIDIA Container Toolkit (≥ 1.18.0 strongly recommended):\n"
             "      https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html\n"
             "      (then re-run install — compose-up will fail until CDI is set up)"
         )
         return
 
-    print("  Generating NVIDIA CDI spec for Podman (sudo required) ...")
+    # Step 1: surface + offer to delete any stale `/etc/cdi/nvidia.yaml`
+    # left by a previous install of VCO or by a user following old docs.
+    # Stale specs SHADOW the auto-refreshed `/var/run/cdi/nvidia.yaml`
+    # and break GPU containers after every driver update.
+    cdi_etc = Path("/etc/cdi/nvidia.yaml")
+    if cdi_etc.exists():
+        print(
+            "  [!] Found stale /etc/cdi/nvidia.yaml — this shadows the\n"
+            "      system's auto-refreshed /var/run/cdi/nvidia.yaml and\n"
+            "      breaks GPU containers after driver updates. Remove with:\n"
+            "          sudo rm /etc/cdi/nvidia.yaml\n"
+            "      (run after install completes; the auto-refresh service\n"
+            "      will keep /var/run/cdi/nvidia.yaml fresh from now on)"
+        )
+
+    # Step 2: verify nvidia-cdi-refresh.{path,service} exist + enabled.
+    # systemctl `is-enabled` returns 0 only when the unit is active in the
+    # boot manifest. Anything else means user needs to fix it.
     try:
         result = subprocess.run(
-            ["sudo", "nvidia-ctk", "cdi", "generate",
-             "--output=/etc/cdi/nvidia.yaml"],
-            capture_output=True, text=True, timeout=60,
+            ["systemctl", "is-enabled", "nvidia-cdi-refresh.path"],
+            capture_output=True, text=True, timeout=5,
         )
         if result.returncode == 0:
-            print("    ✓ /etc/cdi/nvidia.yaml created")
-        else:
-            print(
-                f"    ! nvidia-ctk exited {result.returncode}; "
-                f"compose-up may fail to find GPU. Stderr: "
-                f"{result.stderr.strip()[:200]}"
-            )
-    except subprocess.TimeoutExpired:
-        print("    ! nvidia-ctk timed out (>60s); skipping")
-    except Exception as e:
-        print(f"    ! nvidia-ctk failed: {e}")
+            # Auto-refresh is on. Nothing more to do.
+            print("    ✓ NVIDIA Container Toolkit auto-refresh active "
+                  "(nvidia-cdi-refresh.path enabled)")
+            return
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        # systemctl not on PATH (highly unusual on a Linux host with
+        # podman) or hung. Fall through to install hint.
+        pass
+
+    print(
+        "  [!] nvidia-cdi-refresh systemd units are not enabled. They ship\n"
+        "      with NVIDIA Container Toolkit ≥ 1.18.0 and auto-regenerate\n"
+        "      the CDI spec on every driver upgrade. To enable:\n"
+        "          sudo systemctl enable --now nvidia-cdi-refresh.path\n"
+        "          sudo systemctl enable --now nvidia-cdi-refresh.service\n"
+        "      If your nvidia-container-toolkit version is < 1.18, upgrade\n"
+        "      first. Without these units, you must manually regenerate the\n"
+        "      CDI spec after every NVIDIA driver upgrade or GPU containers\n"
+        "      will fail to start."
+    )
 
 
 def _prompt_install_container_runtime(args: argparse.Namespace) -> bool:
@@ -4349,6 +4413,33 @@ def _start_services(
         print("  All required services already running — reusing them.")
         print("  (Set VCT_FORCE_SEPARATE_CONTAINERS=1 for separate per-install containers.)")
         return
+
+    # Proactive runtime-reachability check (2026-05-08). Catches "daemon
+    # not running" / "rootless socket not started" BEFORE we attempt
+    # compose-up — without this we used to wait for compose-up to fail
+    # with cryptic stderr ("Cannot connect to the Docker daemon" /
+    # "Cannot connect to Podman socket"), parse it, and emit a hint. Now
+    # we surface the actionable hint upfront with the OS-correct
+    # recovery command, saving 10-30s and giving the user a clearer
+    # signal.
+    if not _container_runtime_reachable(sysinfo.container_cmd):
+        print(
+            f"  [!] {sysinfo.container_cmd} is installed but its daemon/socket\n"
+            f"      isn't responding to `{sysinfo.container_cmd} info`. The compose-up\n"
+            f"      below will fail. Most common fixes:"
+        )
+        if sysinfo.container_cmd == "docker":
+            print("        Linux:   sudo systemctl start docker")
+            print("        macOS:   open Docker Desktop and wait for it to start")
+            print("        Windows: start Docker Desktop")
+        else:
+            print("        Linux:   systemctl --user start podman.socket")
+            print("        macOS:   podman machine start")
+            print("        Windows: podman machine start")
+        print(
+            "      Re-run install.py once the runtime is reachable. (Skipping the\n"
+            "      compose-up below would leave the install in a partial state.)"
+        )
 
     compose_cmd = _get_compose_command(sysinfo.container_cmd)
 

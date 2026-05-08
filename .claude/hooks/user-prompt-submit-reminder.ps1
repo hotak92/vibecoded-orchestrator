@@ -1,3 +1,4 @@
+# Parity-touch 2026-05-08: bash shebang of sibling .sh switched from #!/bin/bash to #!/usr/bin/env bash for macOS portability. PS1 has no shebang to change; this comment is the parity-required modification.
 # Scrub sensitive env vars before any subprocess spawning
 foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
@@ -7,6 +8,22 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # Context preservation reminder triggered on output volume.
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
+
+# Hook input contract (v2.1.x): JSON on stdin, NOT $CLAUDE_TOOL_NAME env var.
+# Drain stdin (best-effort) so it doesn't block any caller. UserPromptSubmit
+# hooks don't see tool_name in the payload either, so per-tool accounting is
+# moot under v2.1.x — kept as a defensive default in case a future runtime
+# ever populates the env var. Today $env:CLAUDE_TOOL_NAME is always empty.
+# Verified empirically 2026-05-08 via stdin-capture diagnostic.
+$HookStdin = ""
+try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
+$ToolNameFromStdin = ""
+try {
+    $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
+    if ($payload -and $payload.tool_name) { $ToolNameFromStdin = [string]$payload.tool_name }
+} catch {
+    # Empty/malformed stdin — fall through
+}
 
 $ProjectDir = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
 $ProjectName = Split-Path $ProjectDir -Leaf
@@ -19,8 +36,9 @@ if (-not (Test-Path $SessionLog)) {
 }
 
 $WordsThisTurn = 0
-if ($env:CLAUDE_TOOL_NAME) {
-    switch ($env:CLAUDE_TOOL_NAME) {
+$EffectiveToolName = if ($ToolNameFromStdin) { $ToolNameFromStdin } elseif ($env:CLAUDE_TOOL_NAME) { $env:CLAUDE_TOOL_NAME } else { "" }
+if ($EffectiveToolName) {
+    switch ($EffectiveToolName) {
         { $_ -in 'Read', 'Write', 'Edit' } { $WordsThisTurn = 1000 }
         'Bash' { $WordsThisTurn = 500 }
         'Task' { $WordsThisTurn = 2000 }

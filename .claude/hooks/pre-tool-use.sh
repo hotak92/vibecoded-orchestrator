@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Scrub sensitive env vars before any subprocess spawning
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
@@ -17,11 +17,46 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-TOOL_NAME="$1"
-USER_MESSAGE="$2"
-TOOL_ARGS="$3"
+# Hook input arrives as JSON on stdin per Claude Code v2.1.x spec.
+# Positional args ($1/$2/$3) are EMPTY because $CLAUDE_TOOL_NAME etc.
+# don't exist as env vars. Without this, every toucan log entry is
+# {"query":"","chosen_tool":"","tool_args":null} — silently broken.
+# Verified empirically 2026-05-08 via stdin-capture diagnostic.
+HOOK_STDIN=$(cat 2>/dev/null || echo "")
+TOOL_NAME=$(printf '%s' "$HOOK_STDIN" | python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print(d.get('tool_name', ''))
+except Exception:
+    print('')
+" 2>/dev/null || echo "")
+TOOL_ARGS=$(printf '%s' "$HOOK_STDIN" | python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print(json.dumps(d.get('tool_input', {})))
+except Exception:
+    print('{}')
+" 2>/dev/null || echo "{}")
+USER_MESSAGE=$(printf '%s' "$HOOK_STDIN" | python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print(d.get('user_message', ''))
+except Exception:
+    print('')
+" 2>/dev/null || echo "")
+SESSION_ID_FROM_STDIN=$(printf '%s' "$HOOK_STDIN" | python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print(d.get('session_id', ''))
+except Exception:
+    print('')
+" 2>/dev/null || echo "")
 
-SESSION_ID="${CLAUDE_SESSION_ID:-$(date +%Y%m%d_%H)}"
+SESSION_ID="${SESSION_ID_FROM_STDIN:-${CLAUDE_SESSION_ID:-$(date +%Y%m%d_%H)}}"
 SESSION_READS_FILE="${TMPDIR:-${XDG_RUNTIME_DIR:-/tmp}}/.claude_reads_${SESSION_ID}"
 BACKUP_DIR="${TMPDIR:-${XDG_RUNTIME_DIR:-/tmp}}/.claude_backups"
 SECURITY_LOG="$PROJECT_ROOT/.claude/logs/security_events.jsonl"

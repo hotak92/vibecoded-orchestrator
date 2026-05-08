@@ -16,15 +16,29 @@
 #
 # Prerequisites (Podman, run ONCE on the host BEFORE compose-up):
 #
-#   1. Install NVIDIA Container Toolkit:
+#   1. Install NVIDIA Container Toolkit ≥ 1.18.0:
 #      https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
 #
-#   2. Generate the CDI spec — install.py does this automatically when it
-#      detects podman + nvidia-smi at install time. Manual fallback:
-#        sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+#   2. Container Toolkit ≥ 1.18.0 ships `nvidia-cdi-refresh.path` +
+#      `.service` systemd units that AUTO-write the CDI spec to
+#      /var/run/cdi/nvidia.yaml on every driver install/upgrade. install.py
+#      verifies these units are enabled. **DO NOT** write
+#      /etc/cdi/nvidia.yaml manually — Podman reads /etc/cdi/ before
+#      /var/run/cdi/, so a manual file shadows the auto-refreshed one and
+#      goes stale on the next driver upgrade. Symptom of a stale spec:
+#      every GPU container fails with `runc: failed to fulfil mount
+#      request: ... libEGL_nvidia.so.<old-version>: no such file`.
+#
+#      Verify auto-refresh active:
+#        systemctl is-enabled nvidia-cdi-refresh.path   # → enabled
+#
+#      If you (or an old install of this project) wrote /etc/cdi/nvidia.yaml,
+#      remove it: `sudo rm /etc/cdi/nvidia.yaml`. /var/run/cdi/ takes over.
+#
+#   3. Configure podman runtime once:
 #        sudo nvidia-ctk runtime configure --runtime=podman
 #
-#   3. Verify with:  podman run --rm --device nvidia.com/gpu=all \
+#   4. Verify with:  podman run --rm --device nvidia.com/gpu=all \
 #                      ubuntu nvidia-smi
 #
 # References:

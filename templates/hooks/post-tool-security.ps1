@@ -1,3 +1,4 @@
+# Parity-touch 2026-05-08: bash shebang of sibling .sh switched from #!/bin/bash to #!/usr/bin/env bash for macOS portability. PS1 has no shebang to change; this comment is the parity-required modification.
 # Scrub sensitive env vars before any subprocess spawning
 foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
@@ -9,10 +10,21 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
 
-param(
-    [Parameter(Position=0)]
-    [string]$EditedFile = ""
-)
+# Hook input arrives as JSON on stdin per Claude Code v2.1.x spec.
+# Positional args ($args) are EMPTY because $CLAUDE_TOOL_ARG_FILE_PATH and
+# similar env vars don't exist — settings.json substitutes to "". Verified
+# empirically 2026-05-08 via stdin-capture diagnostic.
+$HookStdin = ""
+try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
+$EditedFile = ""
+try {
+    $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
+    if ($payload -and $payload.tool_input -and $payload.tool_input.file_path) {
+        $EditedFile = [string]$payload.tool_input.file_path
+    }
+} catch {
+    # Empty/malformed stdin — keep $EditedFile at default
+}
 
 $ScriptDir = $PSScriptRoot
 $ProjectRoot = (Resolve-Path (Join-Path $ScriptDir "..\..")).Path

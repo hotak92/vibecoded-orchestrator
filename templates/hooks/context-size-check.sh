@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Context Size Check Hook Template
 #
 # Purpose: Monitor CONTEXT_STATE.md size and trigger doc-maintainer agent when threshold exceeded
@@ -9,7 +9,7 @@
 # - MAX_LINES: Trigger threshold (default: 200 lines)
 # - WARN_LINES: Warning threshold (default: 150 lines)
 
-set -e
+set -euo pipefail
 
 # Scrub sensitive env vars (this hook doesn't need credentials)
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN 2>/dev/null

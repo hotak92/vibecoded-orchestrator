@@ -54,6 +54,12 @@
           },
           {
             "type": "command",
+            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/verify-container-ports.sh",
+            "timeout": 30,
+            "background": true
+          },
+          {
+            "type": "command",
             "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/ensure-code-embed-service.sh",
             "timeout": 15,
             "background": true
@@ -143,12 +149,13 @@
         ]
       },
       {
-        "matcher": "Edit(*)",
+        "matcher": "Edit",
         "hooks": [
           {
             "type": "command",
             "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/pre-edit-context-inject.sh \"$CLAUDE_TOOL_NAME\" \"$CLAUDE_TOOL_ARGS\"",
-            "timeout": 8
+            "timeout": 8,
+            "if": "Edit(*)"
           }
         ]
       }
@@ -197,51 +204,56 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "Edit(*)|Write(*)",
+        "matcher": "Edit|Write",
         "hooks": [
           {
             "type": "command",
             "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/post-file-edit.sh \"$CLAUDE_TOOL_ARG_FILE_PATH\"",
             "timeout": 5,
-            "background": true
+            "background": true,
+            "if": "Edit(*)|Write(*)"
           }
         ]
       },
       {
-        "matcher": "Edit(*)|Write(*)",
+        "matcher": "Edit|Write",
         "hooks": [
           {
             "type": "command",
             "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/post-tool-security.sh \"$CLAUDE_TOOL_ARG_FILE_PATH\"",
             "timeout": 5,
-            "background": true
+            "background": true,
+            "if": "Edit(*)|Write(*)"
           }
         ]
       },
       {
-        "matcher": "Write(*.py)",
+        "matcher": "Write",
         "hooks": [
           {
             "type": "command",
             "command": "python -m py_compile \"$CLAUDE_TOOL_ARG_PATH\" 2>&1 || echo 'Syntax error'",
-            "timeout": 10
+            "timeout": 10,
+            "if": "Write(*.py)"
           }
         ]
       },
       {
-        "matcher": "Edit(knowledge/**/*.md)|Write(knowledge/**/*.md)",
+        "matcher": "Edit|Write",
         "hooks": [
           {
             "type": "command",
             "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || python .claude/scripts/sync_knowledge_graph.py \"$CLAUDE_TOOL_ARG_FILE_PATH\" 2>&1 || true",
             "timeout": 15,
-            "background": true
+            "background": true,
+            "if": "Edit(knowledge/**/*.md)|Write(knowledge/**/*.md)"
           },
           {
             "type": "command",
             "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/kg-summary-generator.sh",
             "timeout": 5,
-            "background": true
+            "background": true,
+            "if": "Edit(knowledge/**/*.md)|Write(knowledge/**/*.md)"
           }
         ]
       },

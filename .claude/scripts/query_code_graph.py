@@ -461,8 +461,17 @@ def main():
         parser.print_help()
         return 1
 
+    # Resolve project: explicit --project wins; otherwise fall back to
+    # CODE_GRAPH_PROJECT or PROJECT_NAME env vars (same priority as the
+    # MCP server's CODE_GRAPH_PROJECT resolution). Without this, the CLI
+    # always queries unprefixed `CodeFunction` etc., which never exist in
+    # multi-project Weaviate setups — every project ships its own
+    # `<Project>_CodeFunction` collection. Pre-2026-05-08 the CLI was
+    # effectively dead unless the user remembered to pass --project.
+    effective_project = getattr(args, 'project', None) or os.getenv("CODE_GRAPH_PROJECT") or os.getenv("PROJECT_NAME") or None
+
     # Create query interface
-    querier = CodeGraphQuery(project=getattr(args, 'project', None))
+    querier = CodeGraphQuery(project=effective_project)
 
     # Connect to Weaviate
     if not querier.connect():

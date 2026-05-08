@@ -10,9 +10,24 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
 
+# Hook input contract (v2.1.x): session_id arrives as JSON on stdin, not as
+# the $CLAUDE_SESSION_ID env var (which Claude Code does NOT populate —
+# confirmed empirically 2026-05-08). Reading the env var meant every session
+# in this project shared the same `default` snapshot file, so two concurrent
+# sessions silently stomped on each other's diff baseline.
+HOOK_STDIN=$(cat 2>/dev/null || echo "")
+SESSION_ID=$(printf '%s' "$HOOK_STDIN" | python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print(d.get('session_id', '') or 'default')
+except Exception:
+    print('default')
+" 2>/dev/null || echo "default")
+[ -z "$SESSION_ID" ] && SESSION_ID="default"
+
 CONTEXT_FILE=".claude/CONTEXT_STATE.md"
 SNAPSHOT_DIR="${TMPDIR:-/tmp}/claude_ctx_snapshots"
-SESSION_ID="${CLAUDE_SESSION_ID:-default}"
 SNAPSHOT_FILE="$SNAPSHOT_DIR/snapshot_${SESSION_ID}"
 COMPACT_FLAG="$SNAPSHOT_DIR/compact_flag_${SESSION_ID}"
 
