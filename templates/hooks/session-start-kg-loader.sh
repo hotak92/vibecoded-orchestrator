@@ -2,6 +2,14 @@
 # Scrub sensitive env vars before any subprocess spawning
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
+
+# VCO-CENTRALIZED-KG: reference provider only (PR #171 / 0.1.7).
+#   Prints paths to KG resources (kg-search, kg-info wrappers); does NOT
+#   query Weaviate KG or codegraph collections itself. May launch the
+#   optional Pro-tier RL retrieval server via start-rl-server.{sh,ps1}.
+#   The access matrix (VCT_KG_ACCESS_LIST / VCT_CODE_GRAPH_ACCESS_LIST)
+#   is N/A — no collections are touched. No centralization possible or needed.
+
 # SessionStart Hook: Knowledge Graph Reference Provider
 #
 # Purpose: Display paths to relevant KG resources (no auto-loading)

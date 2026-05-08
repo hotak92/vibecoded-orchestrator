@@ -39,6 +39,36 @@ except ImportError:
     print("Error: weaviate-client not installed. Install with: pip install weaviate-client", file=sys.stderr)
     sys.exit(1)
 
+# P1-D (2026-05-08): centralized access-matrix helper. Resolved via
+# $VCT_ORCHESTRATOR_ROOT (the orchestrator clone is where
+# claude_mcp_servers/scripts/kg_access.py lives) with an in-tree
+# fallback for the orchestrator self path. The graceful fallback is a
+# self-only no-op so the CLI keeps working on a hand-edited venv.
+try:
+    # VCO-REWIRE-BEGIN: orchestrator-root-resolution
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "claude_mcp_servers" / "scripts"))
+    # VCO-REWIRE-END: orchestrator-root-resolution
+    from kg_access import code_graph_collections_to_query as _code_graph_collections_to_query  # type: ignore[import-not-found]
+except Exception:
+    def _code_graph_collections_to_query(  # type: ignore[no-redef]
+        self_project: str,
+        bases=None,
+    ):
+        bases_t = tuple(bases) if bases is not None else (
+            "CodeFunction", "CodeClass", "CodeModule", "CodeAPI", "CodeInteraction",
+        )
+        if not self_project:
+            return [(b, "") for b in bases_t]
+        # Mirror sanitize_collection_prefix's contract for the fallback
+        # path. Best-effort only — this branch fires when the helper
+        # isn't on sys.path, which means the user is in a degraded
+        # environment anyway.
+        import re as _re
+        prefix = _re.sub(r"[^a-zA-Z0-9_]", "_", self_project)
+        if prefix and not prefix[0].isupper():
+            prefix = prefix[0].upper() + prefix[1:]
+        return [(f"{prefix}_{b}", self_project) for b in bases_t]
+
 # Load MCP config
 CONFIG_PATH = Path.home() / ".claude/workflow/config/mcp-config.json"
 
@@ -132,6 +162,14 @@ class CodeGraphQuery:
     def search_by_concept(self, query: str, collection: str = "CodeFunction", limit: int = 5, detail: str = "auto"):
         """Semantic search for code by concept.
 
+        P1-D (2026-05-08): when ``self.project`` is set, fan out across
+        self + every peer in ``VCT_CODE_GRAPH_ACCESS_LIST``. Each
+        per-collection query stays bounded to ``limit`` over-fetched
+        candidates; results are merged and re-ranked by distance before
+        truncation. When ``self.project`` is unset (cross-tenant
+        "search all projects" path), behaviour is unchanged: a single
+        bare-collection query.
+
         detail:
           "auto" (default) — top-4 results get full per-collection details, rest
                               get name + score refs (matches MCP search_code_graph behavior).
@@ -145,27 +183,77 @@ class CodeGraphQuery:
                 print("❌ Failed to generate query embedding")
                 return
 
-            coll = self.client.collections.get(self._coll(collection))
-
-            # Build query with near_vector
-            nv_kwargs = dict(
-                near_vector=query_embedding,
-                limit=limit,
-                return_metadata=MetadataQuery(distance=True),
+            # Build per-(collection_name, project_filter_value) fan-out
+            # list. Self comes first; peers appear in
+            # VCT_CODE_GRAPH_ACCESS_LIST order. The helper handles
+            # dedupe + the cross-tenant fallback.
+            pairs = _code_graph_collections_to_query(
+                self_project=self.project or "",
+                bases=(collection,),
             )
-            if self.project:
-                nv_kwargs["filters"] = Filter.by_property("project").equal(self.project)
-            response = coll.query.near_vector(**nv_kwargs)
 
-            # Format and print results
+            # Header: show the fan-out scope so the user sees what was
+            # actually queried (especially useful when the access list
+            # is set in env and the user has forgotten what's granted).
             print(f"\n🔍 Semantic search in {collection}: '{query}'  (detail={detail})")
             if self.project:
-                print(f"   Project filter: {self.project}")
-            print(f"   Found {len(response.objects)} results:\n")
+                peer_count = len(pairs) - 1
+                if peer_count > 0:
+                    peer_names = ", ".join(p_filter for _, p_filter in pairs[1:] if p_filter)
+                    print(f"   Project filter: {self.project} (+ {peer_count} peer(s): {peer_names})")
+                else:
+                    print(f"   Project filter: {self.project}")
 
-            for i, obj in enumerate(response.objects, 1):
+            # Fan-out: query each (collection, filter) pair, merge by
+            # ascending distance. We over-fetch by `limit` per
+            # collection so the merge has enough candidates to fill
+            # `limit` even when the top-K is concentrated in peers.
+            merged: list[tuple[float, str, object]] = []  # (distance, source_label, obj)
+            for coll_name, project_filter in pairs:
+                try:
+                    coll = self.client.collections.get(coll_name)
+                except Exception:
+                    # Peer never indexed this base — skip silently.
+                    continue
+                nv_kwargs = dict(
+                    near_vector=query_embedding,
+                    limit=limit,
+                    return_metadata=MetadataQuery(distance=True),
+                )
+                if project_filter:
+                    nv_kwargs["filters"] = Filter.by_property("project").equal(project_filter)
+                try:
+                    response = coll.query.near_vector(**nv_kwargs)
+                except Exception:
+                    # Collection exists but query failed (e.g. wrong
+                    # vector dim from a stale schema). Skip and keep
+                    # going so peer issues don't break self queries.
+                    continue
+                for obj in response.objects:
+                    distance = obj.metadata.distance if obj.metadata.distance is not None else 1.0
+                    merged.append((distance, project_filter or "", obj))
+
+            # Sort by distance asc; truncate to limit. Multi-collection
+            # fan-out can return the same full_name from multiple
+            # collections (it shouldn't, but a misconfigured access list
+            # with overlapping projects could) — dedupe by full_name
+            # keeping the lowest-distance candidate.
+            merged.sort(key=lambda t: t[0])
+            seen_keys: set[str] = set()
+            top: list[tuple[float, str, object]] = []
+            for distance, source, obj in merged:
+                key = obj.properties.get("full_name") or obj.properties.get("name") or str(obj.uuid)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                top.append((distance, source, obj))
+                if len(top) >= limit:
+                    break
+
+            print(f"   Found {len(top)} results:\n")
+
+            for i, (distance, source, obj) in enumerate(top, 1):
                 props = obj.properties
-                distance = obj.metadata.distance if obj.metadata.distance is not None else -1.0
                 similarity = 1.0 - distance if distance >= 0 else 0.0
 
                 # Per-result tier — mirrors search_code_graph MCP semantics
@@ -176,7 +264,13 @@ class CodeGraphQuery:
                 else:  # auto: top-4 full, rest as refs
                     show_full = i <= 4
 
-                print(f"{i}. {props.get('full_name', props.get('name', 'Unknown'))}")
+                # Source-project annotation for fan-out clarity. Empty
+                # for self-only queries (the pre-P1-D shape).
+                src_label = ""
+                if self.project and source and source != self.project:
+                    src_label = f"  [peer:{source}]"
+
+                print(f"{i}. {props.get('full_name', props.get('name', 'Unknown'))}{src_label}")
                 print(f"   Distance: {distance:.3f} (similarity: {similarity:.3f})")
 
                 if not show_full:

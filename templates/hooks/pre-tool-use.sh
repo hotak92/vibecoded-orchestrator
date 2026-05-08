@@ -2,6 +2,16 @@
 # Scrub sensitive env vars before any subprocess spawning
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
+
+# VCO-CENTRALIZED-KG: read-side delegator on the KG-suggestion path (PR #171 / 0.1.7).
+#   The "KG search suggestion" branch (Edit/Write only, see section 5
+#   below) calls .claude/scripts/kg-search; that wrapper invokes
+#   search_knowledge.py which honors VCT_KG_ACCESS_LIST through the
+#   shared helper. Other branches (SSRF guard, shell-injection scan,
+#   Build Anchor, file backup, tool logging) do not touch KG/codegraph.
+#   Env propagation: $(...) subshells inherit env. No centralization
+#   needed in this hook itself.
+
 # Pre-tool-use hook — Security enforcement + tool logging + KG suggestion
 # Triggers: Before all tool uses
 # Actions:

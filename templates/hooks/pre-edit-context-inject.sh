@@ -13,6 +13,17 @@
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
 
+# VCO-CENTRALIZED-KG: read-side delegator (PR #171 / 0.1.7).
+#   Delegates KG search to claude_mcp_servers/scripts/rl_kg_search.py and
+#   code-graph search to .claude/scripts/code-graph-query — both call the
+#   access-aware helpers (_kg_collections_to_search /
+#   code_graph_collections_to_query) in claude_mcp_servers/weaviate_mcp/
+#   server.py, which read VCT_KG_ACCESS_LIST + VCT_CODE_GRAPH_ACCESS_LIST.
+#   This hook does NOT query Weaviate directly. Env propagation is by
+#   subprocess inheritance (no `env -i`, no `unset VCT_KG_ACCESS_LIST`).
+#   See knowledge/concepts/multi-source-kg-runtime.md and
+#   tests/test_kg_access_list.py for the consumer contract.
+
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
 
 # Hook input arrives as JSON on stdin per Claude Code v2.1.x spec.

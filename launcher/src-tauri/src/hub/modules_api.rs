@@ -38,6 +38,43 @@ pub fn router() -> Router<LauncherDbHandle> {
         .route("/projects/{project_id}", get(get_project))
         .route("/projects/{project_id}/env", get(project_env))
         .route("/projects/by-slug/{slug}", get(get_project_by_slug_route))
+        .route("/projects/by-path", get(get_project_by_path_route))
+}
+
+// ─── Error envelope ─────────────────────────────────────────────────────
+//
+// Stable JSON error shape consumed by the bundled secrets-resolver helper
+// (`templates/scripts/vct_secrets_resolve.sh|.ps1`) and any third-party
+// caller. Errors used to be raw strings (returned as `text/plain`) which
+// forced consumers to read the HTTP status to disambiguate. The envelope
+// makes the failure mode machine-parseable without breaking 200-OK
+// responses (those keep their existing flat-object shape).
+
+fn error_response(status: StatusCode, code: &str, message: impl Into<String>) -> axum::response::Response {
+    (
+        status,
+        Json(serde_json::json!({
+            "error": {
+                "code": code,
+                "message": message.into(),
+            }
+        })),
+    )
+        .into_response()
+}
+
+/// Internal-server-error helper that takes a `String` from the DB layer,
+/// logs it for the launcher operator, and returns a generic envelope to
+/// the caller. Never echoes the raw DB error verbatim — those messages
+/// can include path prefixes, schema hints, or sqlite filenames that we
+/// don't want to leak across the localhost boundary even on 127.0.0.1.
+fn db_error_response(context: &str, raw: String) -> axum::response::Response {
+    eprintln!("[vct-hub] {} failed: {}", context, raw);
+    error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "internal_error",
+        format!("{} failed", context),
+    )
 }
 
 // ─── Types ───────────────────────────────────────────────────────────────
@@ -159,7 +196,7 @@ async fn installed(
             let views: Vec<InstalledRowView> = rows.iter().map(InstalledRowView::from).collect();
             Json(serde_json::json!({ "modules": views })).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(e) => db_error_response("list module installs", e),
     }
 }
 
@@ -170,12 +207,12 @@ async fn module_status(
 ) -> impl IntoResponse {
     match h.0.get_module_install(&q.project_id, &module_id) {
         Ok(Some(row)) => Json(InstalledRowView::from(&row)).into_response(),
-        Ok(None) => (
+        Ok(None) => error_response(
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "not installed" })),
-        )
-            .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+            "module_not_installed",
+            format!("module {} not installed for project {}", module_id, q.project_id),
+        ),
+        Err(e) => db_error_response("get module install", e),
     }
 }
 
@@ -215,7 +252,7 @@ async fn list_projects(State(h): State<LauncherDbHandle>) -> impl IntoResponse {
                 .collect();
             Json(serde_json::json!({ "projects": summaries })).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(e) => db_error_response("list projects", e),
     }
 }
 
@@ -232,12 +269,12 @@ async fn get_project(
                 .unwrap_or(0);
             Json(ProjectSummary::from_row(&row, count)).into_response()
         }
-        Ok(None) => (
+        Ok(None) => error_response(
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "project not found" })),
-        )
-            .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+            "project_not_found",
+            format!("project {} not found", project_id),
+        ),
+        Err(e) => db_error_response("get project", e),
     }
 }
 
@@ -254,18 +291,115 @@ async fn get_project_by_slug_route(
                 .unwrap_or(0);
             Json(ProjectSummary::from_row(&row, count)).into_response()
         }
-        Ok(None) => (
+        Ok(None) => error_response(
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "project not found" })),
-        )
-            .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+            "project_not_found",
+            format!("project with slug {:?} not found", slug),
+        ),
+        Err(e) => db_error_response("get project by slug", e),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ByPathQuery {
+    path: String,
+}
+
+/// Resolve a folder path → registered project. Used by bundled wrappers
+/// that know their cwd but not the project's hex UUID. Matches by the
+/// canonical (lossless-canonicalized when possible) absolute path; falls
+/// back to a literal-string match when canonicalization fails (e.g. the
+/// path doesn't exist on disk anymore but the project is still registered
+/// in launcher.db with the original path).
+///
+/// Returns 404 when no project owns the given path; 400 when the path
+/// query parameter is missing or empty.
+async fn get_project_by_path_route(
+    State(h): State<LauncherDbHandle>,
+    Query(q): Query<ByPathQuery>,
+) -> impl IntoResponse {
+    let raw = q.path.trim();
+    if raw.is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "missing_path",
+            "query parameter `path` must be a non-empty absolute path",
+        );
+    }
+
+    let projects = match h.0.list_projects() {
+        Ok(p) => p,
+        Err(e) => return db_error_response("list projects (by-path)", e),
+    };
+
+    let canonical_query = std::fs::canonicalize(raw)
+        .ok()
+        .and_then(|p| p.to_str().map(|s| s.to_string()));
+
+    let matched = projects.iter().find(|p| {
+        if p.folder_path == raw {
+            return true;
+        }
+        // Best-effort canonical match — bridges the case where the
+        // launcher stored a non-canonical path (e.g. with a trailing
+        // slash, a symlinked prefix, or a relative-to-home variant).
+        if let Some(qcan) = canonical_query.as_deref() {
+            if let Ok(reg_can) = std::fs::canonicalize(&p.folder_path) {
+                if reg_can.to_str() == Some(qcan) {
+                    return true;
+                }
+            }
+        }
+        false
+    });
+
+    match matched {
+        Some(row) => {
+            let count = h
+                .0
+                .list_module_installs_for_project(&row.id)
+                .map(|v| v.len() as u32)
+                .unwrap_or(0);
+            Json(ProjectSummary::from_row(row, count)).into_response()
+        }
+        None => error_response(
+            StatusCode::NOT_FOUND,
+            "project_not_found",
+            format!("no registered project at path {:?}", raw),
+        ),
     }
 }
 
 /// Return the merged env dict the launcher would inject into a workflow
 /// running in this project. Secrets are resolved from the keychain;
 /// settings from the DB.
+///
+/// ─── Response contract (stable, consumed by `vct_secrets_resolve`) ───
+///
+/// On success (200): a flat JSON object mapping env-var names to string
+/// values. Always includes:
+///   * `VCT_PROJECT_ID`   — the project's UUID
+///   * `VCT_PROJECT_HOST` — the host kind (`base`, etc.)
+///   * `VCT_PROJECT_PATH` — the folder path on disk
+///
+/// Plus, for every module installed for this project, every (key,
+/// value) pair the manifest declares as `settings` or `secrets` AND
+/// (for secrets) is `active=true` per the cross-launcher active-flag
+/// gate. Inactive secrets are OMITTED (not present as null / empty
+/// string). Consumers that test for presence get a clean "not set"
+/// signal rather than "set to empty".
+///
+/// On failure: a JSON envelope `{error: {code, message}}` with the
+/// HTTP status set:
+///   * 404 `project_not_found`     — no project with the given id
+///   * 500 `internal_error`        — DB read failed (logged on the
+///                                   launcher side; opaque to caller)
+///
+/// Filtering by query parameter:
+///   * `?key=NAME` — return only that single env var (still wrapped
+///     in the flat-object shape). Returns 404 if the project exists
+///     but the key isn't active for it. Useful for the resolver
+///     helper which needs a single value per call.
 ///
 /// **Security**: this endpoint returns secret values in cleartext. It is
 /// bound to 127.0.0.1 only. Apps that consume it (e.g. the orchestrator
@@ -274,20 +408,29 @@ async fn get_project_by_slug_route(
 /// Future work (tracked in LAUNCHER_BACKEND_API.md §10): require a caller
 /// auth token so scripts running under a different user can't siphon
 /// secrets via a local port scan.
+#[derive(Debug, Deserialize, Default)]
+struct ProjectEnvQuery {
+    /// Optional single-key filter. When set, the response only includes
+    /// the named env var (returning 404 if it isn't active for this
+    /// project). Used by the `vct_secrets_resolve` helper.
+    key: Option<String>,
+}
+
 async fn project_env(
     State(h): State<LauncherDbHandle>,
     Path(project_id): Path<String>,
+    Query(q): Query<ProjectEnvQuery>,
 ) -> impl IntoResponse {
     let project = match h.0.get_project(&project_id) {
         Ok(Some(p)) => p,
         Ok(None) => {
-            return (
+            return error_response(
                 StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "error": "project not found" })),
-            )
-                .into_response();
+                "project_not_found",
+                format!("project {} not found", project_id),
+            );
         }
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(e) => return db_error_response("get project (env)", e),
     };
 
     let mut env = serde_json::Map::new();
@@ -371,6 +514,37 @@ async fn project_env(
                 env.insert(s.key.clone(), serde_json::Value::String(val));
             }
         }
+    }
+
+    // Optional single-key filter — used by the `vct_secrets_resolve`
+    // helper so it doesn't have to ship the full env dict over the
+    // wire (and so a missing key gets a clean 404 rather than the
+    // helper having to grep the map itself).
+    if let Some(want) = q.key.as_deref() {
+        let want = want.trim();
+        if want.is_empty() {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_key",
+                "query parameter `key` must be non-empty",
+            );
+        }
+        return match env.get(want) {
+            Some(v) => {
+                let mut single = serde_json::Map::new();
+                single.insert(want.to_string(), v.clone());
+                Json(serde_json::Value::Object(single)).into_response()
+            }
+            None => error_response(
+                StatusCode::NOT_FOUND,
+                "key_not_active",
+                format!(
+                    "key {:?} is not active for project {} (not declared by any installed module, \
+                     or paused via the secret active-flag)",
+                    want, project.id
+                ),
+            ),
+        };
     }
 
     Json(serde_json::Value::Object(env)).into_response()
@@ -575,5 +749,251 @@ mod tests {
             "NEVER_SET_KEY_PR3_TEST",
         );
         assert!(res.is_none());
+    }
+
+    // ─── HTTP-level endpoint tests (post-Fix-#3 hardening, 0.1.7) ─────
+    //
+    // These tests bring up the modules_api router on a random local port
+    // and exercise the response contract via real HTTP requests. They
+    // pin:
+    //   * `GET /projects/{id}/env` returns the documented flat-object
+    //     shape with VCT_PROJECT_* keys baked in.
+    //   * `GET /projects/{id}/env` returns a 404 + JSON envelope for
+    //     unknown projects (not a raw string body).
+    //   * `GET /projects/{id}/env?key=NAME` returns 404 +
+    //     `key_not_active` envelope when the key isn't active for the
+    //     project (no installed module declares it).
+    //   * `GET /projects/by-path?path=...` resolves a folder path to a
+    //     registered project; returns 404 envelope when no match.
+    //   * `GET /projects/by-path` (no path) returns 400 + `missing_path`.
+    //
+    // Pattern mirrors `cli_api.rs::cli_kg_integration_tests::spawn_test_hub`.
+    // Tests that would need to set up keychain values to verify secret
+    // resolution are intentionally omitted — that path is already
+    // covered by `paused_secret_does_not_leak_to_hub_subprocess_env`
+    // above, which tests the same gate at a lower level without
+    // requiring a real keychain backend in CI.
+
+    use axum::Router;
+    use std::sync::Arc;
+
+    async fn spawn_modules_api_hub() -> (String, LauncherDbHandle) {
+        let db = Db::open_in_memory().expect("in-memory db");
+        let handle = LauncherDbHandle(Arc::new(db));
+        let app: Router =
+            Router::new().nest("/api/v1", super::router().with_state(handle.clone()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{}/api/v1", addr), handle)
+    }
+
+    fn seed_project(db: &Db, id: &str, name: &str, folder: &str) {
+        let now = chrono::Utc::now().timestamp_millis();
+        let guard = db.lock();
+        guard
+            .execute(
+                "INSERT INTO projects (id, name, folder_path, host, slug, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'base', ?2, ?4, ?4)",
+                rusqlite::params![id, name, folder, now],
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn project_env_returns_404_envelope_for_unknown_project() {
+        let (base, _h) = spawn_modules_api_hub().await;
+        let resp = reqwest::get(format!("{}/projects/ghost-id/env", base))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 404);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        let err = body.get("error").expect("error envelope");
+        assert_eq!(
+            err.get("code").and_then(|v| v.as_str()),
+            Some("project_not_found"),
+            "expected project_not_found envelope, got: {}",
+            body
+        );
+        // The envelope MUST carry a non-empty message so wrapper scripts
+        // can surface it to the user without bespoke string formatting.
+        assert!(err
+            .get("message")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false));
+    }
+
+    #[tokio::test]
+    async fn project_env_includes_baked_in_vct_project_keys_for_registered_project() {
+        let (base, h) = spawn_modules_api_hub().await;
+        seed_project(&h.0, "p-test-1", "Test Project", "/tmp/test-project-1");
+
+        let resp = reqwest::get(format!("{}/projects/p-test-1/env", base))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        // Documented baked-in keys.
+        assert_eq!(
+            body.get("VCT_PROJECT_ID").and_then(|v| v.as_str()),
+            Some("p-test-1")
+        );
+        assert_eq!(
+            body.get("VCT_PROJECT_PATH").and_then(|v| v.as_str()),
+            Some("/tmp/test-project-1")
+        );
+        assert_eq!(
+            body.get("VCT_PROJECT_HOST").and_then(|v| v.as_str()),
+            Some("base")
+        );
+        // No installed modules → no other keys, but the structure must
+        // still be a flat object (not an array, not a wrapped envelope).
+        assert!(body.is_object());
+    }
+
+    #[tokio::test]
+    async fn project_env_filter_by_key_returns_404_when_key_not_active() {
+        let (base, h) = spawn_modules_api_hub().await;
+        seed_project(&h.0, "p-test-2", "Test Project Two", "/tmp/test-project-2");
+
+        // Asking for a never-declared key → 404 with key_not_active envelope.
+        let resp = reqwest::get(format!(
+            "{}/projects/p-test-2/env?key=GITHUB_TOKEN",
+            base
+        ))
+        .await
+        .expect("hub reachable");
+        assert_eq!(resp.status(), 404);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        let err = body.get("error").expect("error envelope");
+        assert_eq!(
+            err.get("code").and_then(|v| v.as_str()),
+            Some("key_not_active")
+        );
+    }
+
+    #[tokio::test]
+    async fn project_env_filter_by_key_returns_baked_in_vct_project_id() {
+        // The baked-in VCT_PROJECT_* keys are always "active" for a
+        // registered project, so a key=VCT_PROJECT_ID query MUST round-trip
+        // a 200-OK with that single key — proves the filter path works
+        // end-to-end without needing a manifest declaration.
+        let (base, h) = spawn_modules_api_hub().await;
+        seed_project(&h.0, "p-test-3", "Test Project Three", "/tmp/test-project-3");
+
+        let resp = reqwest::get(format!(
+            "{}/projects/p-test-3/env?key=VCT_PROJECT_ID",
+            base
+        ))
+        .await
+        .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            body.get("VCT_PROJECT_ID").and_then(|v| v.as_str()),
+            Some("p-test-3")
+        );
+        // Filter mode → ONLY the requested key, no VCT_PROJECT_HOST or
+        // VCT_PROJECT_PATH bleed-through.
+        assert!(
+            body.get("VCT_PROJECT_PATH").is_none(),
+            "filter leaked VCT_PROJECT_PATH: {}",
+            body
+        );
+    }
+
+    #[tokio::test]
+    async fn project_env_filter_rejects_empty_key_with_400() {
+        let (base, h) = spawn_modules_api_hub().await;
+        seed_project(&h.0, "p-test-4", "Test Project Four", "/tmp/test-project-4");
+        let resp = reqwest::get(format!(
+            "{}/projects/p-test-4/env?key=",
+            base
+        ))
+        .await
+        .expect("hub reachable");
+        assert_eq!(resp.status(), 400);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            body.get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(|v| v.as_str()),
+            Some("invalid_key")
+        );
+    }
+
+    #[tokio::test]
+    async fn by_path_resolves_registered_project_to_id() {
+        let (base, h) = spawn_modules_api_hub().await;
+        // Use a tempdir so canonicalize works even on macOS where
+        // /tmp is a symlink to /private/tmp.
+        let tmp = std::env::temp_dir().join(format!(
+            "vct-by-path-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let folder = tmp.to_string_lossy().to_string();
+        seed_project(&h.0, "p-bypath", "By Path", &folder);
+
+        let resp = reqwest::Client::new()
+            .get(format!("{}/projects/by-path", base))
+            .query(&[("path", folder.as_str())])
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(body.get("id").and_then(|v| v.as_str()), Some("p-bypath"));
+        assert_eq!(
+            body.get("folder_path").and_then(|v| v.as_str()),
+            Some(folder.as_str())
+        );
+
+        // Cleanup — best effort.
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn by_path_returns_404_envelope_for_unregistered_path() {
+        let (base, _h) = spawn_modules_api_hub().await;
+        let resp = reqwest::Client::new()
+            .get(format!("{}/projects/by-path", base))
+            .query(&[("path", "/nonexistent/never-registered/path")])
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 404);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            body.get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(|v| v.as_str()),
+            Some("project_not_found")
+        );
+    }
+
+    #[tokio::test]
+    async fn by_path_returns_400_when_path_query_missing_or_empty() {
+        let (base, _h) = spawn_modules_api_hub().await;
+        // Empty path.
+        let resp = reqwest::Client::new()
+            .get(format!("{}/projects/by-path", base))
+            .query(&[("path", "")])
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 400);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            body.get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(|v| v.as_str()),
+            Some("missing_path")
+        );
     }
 }

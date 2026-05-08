@@ -4,6 +4,18 @@ foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_A
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
+
+# VCO-CENTRALIZED-KG: read-side delegator (PR #171 / 0.1.7).
+#   Delegates KG search to claude_mcp_servers/scripts/rl_kg_search.py and
+#   code-graph search to .claude/scripts/code-graph-query — both call the
+#   access-aware helpers (_kg_collections_to_search /
+#   code_graph_collections_to_query) in claude_mcp_servers/weaviate_mcp/
+#   server.py, which read VCT_KG_ACCESS_LIST + VCT_CODE_GRAPH_ACCESS_LIST.
+#   This hook does NOT query Weaviate directly. Env propagation is by
+#   subprocess inheritance (Start-Process / & inherit env by default).
+#   See knowledge/concepts/multi-source-kg-runtime.md and
+#   tests/test_kg_access_list.py for the consumer contract.
+
 # pre-edit-context-inject.ps1
 # Pre-edit context injection — KG + code graph context for the file being edited.
 # Always exit 0 (never block the edit).

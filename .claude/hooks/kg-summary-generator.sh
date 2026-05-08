@@ -12,6 +12,13 @@
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
 
+# VCO-CENTRALIZED-KG: write-side delegator (PR #171 / 0.1.7).
+#   Calls .claude/scripts/generate-kg-summary.py to refresh
+#   knowledge/.node_formats.json — operates on the project's OWN KG only
+#   (per-node summary cache, not a Weaviate collection write either).
+#   No multi-source fan-out involvement. VCT_KG_ACCESS_LIST is read-side
+#   only; no centralization needed here.
+
 # Don't run for agent subprocesses
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
 

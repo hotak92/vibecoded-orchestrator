@@ -4,6 +4,14 @@ foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_A
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
+
+# VCO-CENTRALIZED-KG: write-side delegator (PR #171 / 0.1.7).
+#   Calls .claude/scripts/analyze_code_graph.py against the project's
+#   own code-graph collections (auto-detected for sibling repos via
+#   detect-project.ps1). Writes do NOT consult VCT_CODE_GRAPH_ACCESS_LIST
+#   — that env var is read-side only (fan-out across peer codegraphs).
+#   No centralization needed. See knowledge/concepts/multi-source-kg-runtime.md.
+
 # code-graph-incremental.ps1
 # Run incremental code graph analysis on a code file edit.
 # Triggered by post-file-edit.ps1.

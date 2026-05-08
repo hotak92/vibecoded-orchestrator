@@ -2,6 +2,14 @@
 # Scrub sensitive env vars before any subprocess spawning
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
+
+# VCO-CENTRALIZED-KG: write-side delegator (PR #171 / 0.1.7).
+#   Calls .claude/scripts/analyze_code_graph.py against the project's
+#   own code-graph collections (auto-detected for sibling repos via
+#   detect-project.sh). Writes do NOT consult VCT_CODE_GRAPH_ACCESS_LIST
+#   — that env var is read-side only (fan-out across peer codegraphs).
+#   No centralization needed. See knowledge/concepts/multi-source-kg-runtime.md.
+
 # Code Graph Incremental Update Hook
 # Runs incremental code graph analysis on every code file edit.
 # Triggered by PostToolUse on code file edits.

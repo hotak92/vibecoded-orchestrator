@@ -4,6 +4,16 @@ foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_A
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
+
+# VCO-CENTRALIZED-KG: write-side delegator (PR #171 / 0.1.7).
+#   Calls .claude/scripts/kg-sync (writes to the project's own
+#   KG_COLLECTION / DEVELOPMENT_COLLECTION) and code-graph-incremental.ps1
+#   (writes to the project's own code-graph collections via
+#   analyze_code_graph.py). Writes do NOT consult VCT_KG_ACCESS_LIST or
+#   VCT_CODE_GRAPH_ACCESS_LIST — those env vars are read-side only
+#   (fan-out search across peer KGs). This hook is correct as-is; no
+#   centralization needed. See knowledge/concepts/multi-source-kg-runtime.md.
+
 # post-file-edit.ps1
 # Mirror of post-file-edit.sh. Auto-syncs knowledge/, docs/, and code files.
 

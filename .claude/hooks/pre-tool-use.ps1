@@ -4,6 +4,16 @@ foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_A
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
+
+# VCO-CENTRALIZED-KG: read-side delegator on the KG-suggestion path (PR #171 / 0.1.7).
+#   The "KG search suggestion" branch (Edit/Write only, see section 5
+#   below) calls .claude/scripts/kg-search.ps1 (or kg-search via bash);
+#   that wrapper invokes search_knowledge.py which honors
+#   VCT_KG_ACCESS_LIST through the shared helper. Other branches (SSRF
+#   guard, shell-injection scan, Build Anchor, file backup, tool logging)
+#   do not touch KG/codegraph. Env propagation: & / Start-Process
+#   inherit env by default. No centralization needed in this hook itself.
+
 # pre-tool-use.ps1
 # Pre-tool-use hook: SSRF guard, shell injection scan, tool logging,
 # Build Anchor Protocol, file backup, KG search suggestion.

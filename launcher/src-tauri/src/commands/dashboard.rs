@@ -238,8 +238,10 @@ pub async fn update_mcp_setting(
         // the env emission for this key (existing `if !value.is_empty()` is
         // gone — we now skip explicitly via the type check). The keychain
         // is the authoritative store; the consuming MCP server is expected
-        // to read its own secrets via `~/.vct-secrets/` (Fix #3 bridge) or
-        // its native env-from-keychain path.
+        // to read its own secrets via the launcher hub's
+        // `GET /api/v1/projects/{id}/env` endpoint (resolved via the shared
+        // helper `templates/scripts/vct_secrets_resolve.sh`), which gates
+        // every read on the per-project active flag.
         let scope = crate::secrets::SecretScope::Global;
         let module_id = mcp_secret_module_id(&mcp_id);
         if setting_value.is_empty() {
@@ -499,10 +501,10 @@ async fn apply_mcp_to_claude_settings(config: &OrchestratorConfig) -> Result<(),
         // P1-B fix (2026-05-08): Secret-typed settings are NEVER emitted
         // here — they live in the OS keychain (see `update_mcp_setting`)
         // and the consuming MCP server is expected to read them via the
-        // standard mechanism (the keychain → ~/.vct-secrets/ bridge in
-        // Fix #3, or its own env-from-keychain wrapper). Emitting the
-        // empty placeholder would mask a real keychain miss as "secret =
-        // empty string", which is worse than absent.
+        // launcher hub's `/api/v1/projects/{id}/env` endpoint (resolved
+        // via the shared `vct_secrets_resolve` helper). Emitting the
+        // empty placeholder here would mask a real keychain miss as
+        // "secret = empty string", which is worse than absent.
         for server in &config.mcp_servers {
             if server.enabled {
                 for (key, setting) in &server.settings {
@@ -587,7 +589,6 @@ mod tests {
     struct EnvGuard {
         prev_state: Option<std::ffi::OsString>,
         prev_home: Option<std::ffi::OsString>,
-        prev_secrets: Option<std::ffi::OsString>,
         _lock: std::sync::MutexGuard<'static, ()>,
     }
 
@@ -601,10 +602,6 @@ mod tests {
                 Some(v) => std::env::set_var("HOME", v),
                 None => std::env::remove_var("HOME"),
             }
-            match self.prev_secrets.take() {
-                Some(v) => std::env::set_var("VCT_SECRETS_DIR", v),
-                None => std::env::remove_var("VCT_SECRETS_DIR"),
-            }
         }
     }
 
@@ -617,16 +614,17 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let prev_state = std::env::var_os("VCT_STATE_DIR");
         let prev_home = std::env::var_os("HOME");
-        let prev_secrets = std::env::var_os("VCT_SECRETS_DIR");
         std::env::set_var("VCT_STATE_DIR", &tmp);
         std::env::set_var("HOME", &tmp);
-        // Isolate the keychain → ~/.vct-secrets/ bridge too so toggle
-        // tests don't pollute the real user's secret files.
-        std::env::set_var("VCT_SECRETS_DIR", tmp.join(".vct-secrets"));
+        // Note: previous Fix #3 also isolated `VCT_SECRETS_DIR` here so
+        // the keychain → ~/.vct-secrets/ bridge stayed in the temp dir.
+        // The bridge has been removed in 0.1.7 (the launcher hub's
+        // `/projects/{id}/env` endpoint replaces it); secrets::set/delete
+        // are pure-keychain again, so no per-test secrets-root isolation
+        // is needed here.
         let guard = EnvGuard {
             prev_state,
             prev_home,
-            prev_secrets,
             _lock: lock,
         };
         (tmp, guard)

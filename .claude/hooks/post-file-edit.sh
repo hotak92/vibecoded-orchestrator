@@ -2,6 +2,16 @@
 # Scrub sensitive env vars before any subprocess spawning
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
+
+# VCO-CENTRALIZED-KG: write-side delegator (PR #171 / 0.1.7).
+#   Calls .claude/scripts/kg-sync (writes to the project's own
+#   KG_COLLECTION / DEVELOPMENT_COLLECTION) and code-graph-incremental.sh
+#   (writes to the project's own code-graph collections via
+#   analyze_code_graph.py). Writes do NOT consult VCT_KG_ACCESS_LIST or
+#   VCT_CODE_GRAPH_ACCESS_LIST — those env vars are read-side only
+#   (fan-out search across peer KGs). This hook is correct as-is; no
+#   centralization needed. See knowledge/concepts/multi-source-kg-runtime.md.
+
 # Claude Orchestrator post-file-edit hook
 #
 # Actions:

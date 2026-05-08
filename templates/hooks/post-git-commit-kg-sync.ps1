@@ -5,6 +5,17 @@ foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_A
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 if ($env:CLAUDE_CODE_DISABLE_AUTO_MEMORY) { exit 0 }
+
+# VCO-CENTRALIZED-KG: spawns a background `claude` CLI subprocess (PR #171 / 0.1.7).
+#   The Haiku agent invokes the weaviate-kg MCP tools (hybrid_search,
+#   store_knowledge_node) — those go through claude_mcp_servers/weaviate_mcp/
+#   server.py which is access-aware via VCT_KG_ACCESS_LIST. Hybrid_search
+#   reads from self+shared+peers; store_knowledge_node writes to the
+#   project's own collection (writes are not multi-source). This hook
+#   itself does NOT query Weaviate. Env propagation: Start-Process
+#   inherits the current process env, so VCT_KG_ACCESS_LIST flows into
+#   the spawned `claude` process and from there into the MCP server.
+
 # post-git-commit-kg-sync.ps1
 # Spawn a background Haiku agent to review the commit diff and update relevant
 # KG nodes / docs to keep everything in sync. Mirror of post-git-commit-kg-sync.sh.

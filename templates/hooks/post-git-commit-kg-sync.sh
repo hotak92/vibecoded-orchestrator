@@ -2,6 +2,17 @@
 # Scrub sensitive env vars before any subprocess spawning
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
+
+# VCO-CENTRALIZED-KG: spawns a background `claude` CLI subprocess (PR #171 / 0.1.7).
+#   The Haiku agent invokes the weaviate-kg MCP tools (hybrid_search,
+#   store_knowledge_node) — those go through claude_mcp_servers/weaviate_mcp/
+#   server.py which is access-aware via VCT_KG_ACCESS_LIST. Hybrid_search
+#   reads from self+shared+peers; store_knowledge_node writes to the
+#   project's own collection (writes are not multi-source). This hook
+#   itself does NOT query Weaviate. Env propagation: nohup/Start-Process
+#   inherits the current process env, so VCT_KG_ACCESS_LIST flows into
+#   the spawned `claude` process and from there into the MCP server.
+
 # Post-git-commit hook: spawn a background Haiku agent to review the commit diff
 # and update relevant KG nodes and documentation to keep everything in sync.
 #
