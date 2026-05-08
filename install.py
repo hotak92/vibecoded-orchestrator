@@ -2705,6 +2705,36 @@ def _detect_container_runtime() -> str:
     return ""
 
 
+def _container_runtime_reachable(container_cmd: str) -> bool:
+    """Quick proactive check that the container daemon/socket is responsive.
+
+    Used by `_start_services()` before compose-up to surface a
+    cross-platform actionable hint when the runtime is installed but
+    not running. Without this, compose-up takes 10-30s to fail with
+    a cryptic stderr ("Cannot connect to the Docker daemon" or
+    "Cannot connect to Podman socket"), which we then have to parse.
+
+    Returns False if the runtime isn't on PATH OR `<runtime> info`
+    fails. Returns True if the daemon/socket is responsive.
+
+    Why `info` (not `version`): `version` only checks the client
+    binary; `info` round-trips to the daemon/socket and exercises the
+    same code path that compose-up needs. Catches stopped Docker
+    Desktop on macOS, stopped podman.socket on Linux rootless,
+    unstarted podman machine on Windows.
+    """
+    if not container_cmd or not shutil.which(container_cmd):
+        return False
+    try:
+        result = subprocess.run(
+            [container_cmd, "info"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
 def _detect_installed_runtime() -> str:
     """Lightweight presence check — returns the FIRST container-runtime
     binary on PATH regardless of whether its daemon is running.
@@ -4383,6 +4413,33 @@ def _start_services(
         print("  All required services already running — reusing them.")
         print("  (Set VCT_FORCE_SEPARATE_CONTAINERS=1 for separate per-install containers.)")
         return
+
+    # Proactive runtime-reachability check (2026-05-08). Catches "daemon
+    # not running" / "rootless socket not started" BEFORE we attempt
+    # compose-up — without this we used to wait for compose-up to fail
+    # with cryptic stderr ("Cannot connect to the Docker daemon" /
+    # "Cannot connect to Podman socket"), parse it, and emit a hint. Now
+    # we surface the actionable hint upfront with the OS-correct
+    # recovery command, saving 10-30s and giving the user a clearer
+    # signal.
+    if not _container_runtime_reachable(sysinfo.container_cmd):
+        print(
+            f"  [!] {sysinfo.container_cmd} is installed but its daemon/socket\n"
+            f"      isn't responding to `{sysinfo.container_cmd} info`. The compose-up\n"
+            f"      below will fail. Most common fixes:"
+        )
+        if sysinfo.container_cmd == "docker":
+            print("        Linux:   sudo systemctl start docker")
+            print("        macOS:   open Docker Desktop and wait for it to start")
+            print("        Windows: start Docker Desktop")
+        else:
+            print("        Linux:   systemctl --user start podman.socket")
+            print("        macOS:   podman machine start")
+            print("        Windows: podman machine start")
+        print(
+            "      Re-run install.py once the runtime is reachable. (Skipping the\n"
+            "      compose-up below would leave the install in a partial state.)"
+        )
 
     compose_cmd = _get_compose_command(sysinfo.container_cmd)
 
