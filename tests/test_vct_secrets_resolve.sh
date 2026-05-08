@@ -42,6 +42,15 @@ PYEOF
 
     # Tiny fake hub in Python — listens on $port, dispatches based on
     # request line, returns canned responses from $responses_dir.
+    #
+    # H5 additions:
+    #   * Records the Authorization header of every request to
+    #     <responses_dir>/last_authorization.txt so tests can assert
+    #     "the resolver sent Bearer <token>".
+    #   * Honours <responses_dir>/_require_token (one line: the
+    #     expected token). If present, requests without a matching
+    #     `Authorization: Bearer <token>` get a 401 + JSON envelope.
+    #     This emulates the real hub's auth gate.
     python3 - "$responses_dir" "$port" <<'PYEOF' &
 import http.server
 import json
@@ -56,7 +65,50 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a, **kw):
         pass
 
+    def _check_auth(self):
+        """Return None if request passes the auth gate, else a (status,body) 401 tuple.
+
+        The auth gate is only enforced when <responses_dir>/_require_token
+        exists. When it does, its first line is the expected token; any
+        request without `Authorization: Bearer <token>` gets a 401."""
+        require_path = os.path.join(responses_dir, "_require_token")
+        if not os.path.exists(require_path):
+            return None
+        with open(require_path) as f:
+            expected = f.read().strip()
+        auth = self.headers.get("Authorization", "")
+        # Canonical form: "Bearer <token>". The real hub uses
+        # case-insensitive scheme match; mirror that here.
+        parts = auth.split(None, 1)
+        if len(parts) != 2 or parts[0].lower() != "bearer":
+            return (401, json.dumps({
+                "error": {"code": "unauthorized", "message": "missing bearer"}
+            }))
+        if parts[1].strip() != expected:
+            return (401, json.dumps({
+                "error": {"code": "unauthorized", "message": "wrong token"}
+            }))
+        return None
+
     def do_GET(self):
+        # Record the Authorization header for assertion in tests.
+        # Truncate-and-write so each test gets a clean slate (tests
+        # explicitly clear it before exercising the assertion).
+        with open(os.path.join(responses_dir, "last_authorization.txt"), "w") as f:
+            f.write(self.headers.get("Authorization", ""))
+
+        # Auth gate (only active when _require_token sentinel exists).
+        gate = self._check_auth()
+        if gate is not None:
+            status, body = gate
+            body_b = body.encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body_b)))
+            self.end_headers()
+            self.wfile.write(body_b)
+            return
+
         # Map "GET /api/v1/projects/abc/env?key=FOO" → file basename:
         # "GET_projects_abc_env_key=FOO". Slashes in the query value
         # (e.g. ?path=/tmp/foo) are also collapsed to underscores so
@@ -126,6 +178,17 @@ scratch="$(mktemp -d)"
 trap "stop_fake_hub '$scratch/hub.pid' || true; rm -rf '$scratch'" EXIT
 mkdir -p "$scratch/responses"
 
+# ── Auth token (H5, 2026-05-08) ─────────────────────────────────────────
+# The resolver now requires `Authorization: Bearer <token>`. We inject
+# a canary token via VCT_HUB_TOKEN — the resolver's env override means
+# we don't have to scaffold a real ~/.vct/hub.token file.
+# An isolated VCT_STATE_DIR ensures any real hub.token on the dev's
+# machine doesn't leak into these tests.
+export VCT_STATE_DIR="$scratch/state-dir"
+mkdir -p "$VCT_STATE_DIR"
+HUB_TOKEN_CANARY="canary-bearer-tok-1234567890abcdef1234567890abcdef"
+export VCT_HUB_TOKEN="$HUB_TOKEN_CANARY"
+
 # ── Test 1: hub unreachable → exit 1 ────────────────────────────────────
 # Use a port we know nothing is listening on.
 no_hub_port=1
@@ -141,6 +204,18 @@ out=$(VCT_HUB_PORT="$no_hub_port" "$RESOLVER" some-project-id GITHUB_TOKEN 2>/de
 rc=$?
 set -e
 assert_eq "$rc" "1" "test_vct_secrets_resolve_exits_1_when_hub_unreachable"
+
+# ── Test 1b: token file missing AND env override unset → exit 1 ─────────
+# Mirrors the "hub.token doesn't exist yet" path (launcher hasn't
+# written it / launcher isn't running). We unset VCT_HUB_TOKEN AND
+# point VCT_STATE_DIR at a fresh empty dir so neither lookup wins.
+set +e
+out=$(VCT_STATE_DIR="$scratch/empty-state-dir" \
+      env -u VCT_HUB_TOKEN \
+      "$RESOLVER" some-project-id GITHUB_TOKEN 2>/dev/null)
+rc=$?
+set -e
+assert_eq "$rc" "1" "test_vct_secrets_resolve_exits_1_when_token_file_missing"
 
 # ── Spin up the fake hub for the rest ───────────────────────────────────
 start_fake_hub "$scratch/responses" "$scratch/port" "$scratch/hub.pid"
@@ -238,6 +313,85 @@ rc=$?
 set -e
 assert_eq "$rc" "0" "test_vct_secrets_resolve_subcommand_resolve_project/exit_code"
 assert_eq "$out" "p-resolved-id" "test_vct_secrets_resolve_subcommand_resolve_project/value"
+
+# ── Test 7 (H5): resolver sends Authorization: Bearer <token> ───────────
+# This is the keystone test for the hub auth-token gate. We assert two
+# things:
+#   (a) the resolver passes through `Authorization: Bearer $VCT_HUB_TOKEN`
+#       on a successful 200 path, and
+#   (b) when the fake hub has the `_require_token` sentinel set to the
+#       same token, the resolver succeeds — i.e. the gate only lets
+#       authenticated requests through.
+# The fake hub records every Authorization header to
+# `<responses>/last_authorization.txt` so we can read it back.
+rm -f "$scratch/responses/last_authorization.txt"
+set +e
+out=$(VCT_HUB_PORT="$HUB_PORT" "$RESOLVER" p1 GITHUB_TOKEN 2>/dev/null)
+rc=$?
+set -e
+assert_eq "$rc" "0" "test_vct_secrets_resolve_sends_authorization_header/exit_code"
+assert_eq "$out" "ghp_canary123abc" "test_vct_secrets_resolve_sends_authorization_header/value"
+got_auth=""
+if [[ -f "$scratch/responses/last_authorization.txt" ]]; then
+    got_auth=$(<"$scratch/responses/last_authorization.txt")
+fi
+assert_eq "$got_auth" "Bearer $HUB_TOKEN_CANARY" \
+    "test_vct_secrets_resolve_sends_authorization_header/header_value"
+
+# ── Test 8 (H5): hub gate enforced — wrong token → 401 → exit 1 ─────────
+# Activate the fake hub's auth gate and point the resolver at a token
+# that doesn't match. We expect exit 1 (mapped from 401) — see the
+# resolver's note on stale-token semantics.
+echo -n "$HUB_TOKEN_CANARY" >"$scratch/responses/_require_token"
+set +e
+VCT_HUB_PORT="$HUB_PORT" VCT_HUB_TOKEN="wrong-token-$$" \
+    "$RESOLVER" p1 GITHUB_TOKEN 2>/dev/null
+rc=$?
+set -e
+assert_eq "$rc" "1" "test_vct_secrets_resolve_exits_1_on_401"
+
+# ── Test 9 (H5): hub gate enforced — right token → success ─────────────
+# Sanity check: with the gate active and the correct token, the same
+# request still succeeds. This pins the contract end-to-end.
+set +e
+out=$(VCT_HUB_PORT="$HUB_PORT" VCT_HUB_TOKEN="$HUB_TOKEN_CANARY" \
+        "$RESOLVER" p1 GITHUB_TOKEN 2>/dev/null)
+rc=$?
+set -e
+assert_eq "$rc" "0" "test_vct_secrets_resolve_passes_gate_with_correct_token/exit_code"
+assert_eq "$out" "ghp_canary123abc" "test_vct_secrets_resolve_passes_gate_with_correct_token/value"
+
+# Tidy up the gate sentinel for any future tests appended below.
+rm -f "$scratch/responses/_require_token"
+
+# ── Test 10 (H5): token reads from file when env var unset ──────────────
+# The resolver's documented order is env → state-dir/hub.token. Pull
+# the env override out, write the token to the state-dir, and confirm
+# the request still authenticates correctly.
+file_token="canary-from-file-$$-abcdef"
+echo -n "$file_token" >"$scratch/state-dir/hub.token"
+chmod 600 "$scratch/state-dir/hub.token" || true
+echo -n "$file_token" >"$scratch/responses/_require_token"
+rm -f "$scratch/responses/last_authorization.txt"
+
+set +e
+out=$(env -u VCT_HUB_TOKEN VCT_HUB_PORT="$HUB_PORT" VCT_STATE_DIR="$scratch/state-dir" \
+        "$RESOLVER" p1 GITHUB_TOKEN 2>/dev/null)
+rc=$?
+set -e
+assert_eq "$rc" "0" "test_vct_secrets_resolve_reads_token_from_file/exit_code"
+assert_eq "$out" "ghp_canary123abc" "test_vct_secrets_resolve_reads_token_from_file/value"
+got_auth=""
+if [[ -f "$scratch/responses/last_authorization.txt" ]]; then
+    got_auth=$(<"$scratch/responses/last_authorization.txt")
+fi
+assert_eq "$got_auth" "Bearer $file_token" \
+    "test_vct_secrets_resolve_reads_token_from_file/header_value"
+
+# Tidy up so subsequent tests (none today, but future-proof) get clean
+# state.
+rm -f "$scratch/responses/_require_token"
+rm -f "$scratch/state-dir/hub.token"
 
 # ── Summary ─────────────────────────────────────────────────────────────
 printf '\n%s\n' "── Summary: $PASS passed, $FAIL failed"

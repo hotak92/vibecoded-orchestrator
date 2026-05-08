@@ -250,6 +250,11 @@ enum CodegraphCmd {
 struct Hub {
     base: String,
     client: reqwest::blocking::Client,
+    /// Bearer token read from `<vct_root_dir>/hub.token`. `None` when
+    /// the file is missing or empty — we still try the request (so
+    /// `health` and other unauthenticated endpoints keep working) but
+    /// authenticated endpoints will get a 401 from the server.
+    token: Option<String>,
 }
 
 impl Hub {
@@ -260,15 +265,26 @@ impl Hub {
             .timeout(std::time::Duration::from_secs(15))
             .build()
             .context("build http client")?;
-        Ok(Self { base, client })
+        let token = resolve_token();
+        Ok(Self { base, client, token })
     }
 
     fn url(&self) -> &str {
         &self.base
     }
 
+    /// Apply the Authorization: Bearer <token> header if we have one.
+    /// Centralised here so every method gets it consistently.
+    fn with_auth(&self, b: reqwest::blocking::RequestBuilder) -> reqwest::blocking::RequestBuilder {
+        if let Some(t) = self.token.as_ref() {
+            b.bearer_auth(t)
+        } else {
+            b
+        }
+    }
+
     fn get_json<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T> {
-        let resp = self.client.get(format!("{}{}", self.base, path)).send()
+        let resp = self.with_auth(self.client.get(format!("{}{}", self.base, path))).send()
             .map_err(|e| anyhow!("Cannot reach launcher hub: {}. Is the launcher running?", e))?;
         let status = resp.status();
         let body = resp.text().context("read response body")?;
@@ -283,7 +299,7 @@ impl Hub {
         path: &str,
         body: &B,
     ) -> Result<T> {
-        let resp = self.client.post(format!("{}{}", self.base, path)).json(body).send()
+        let resp = self.with_auth(self.client.post(format!("{}{}", self.base, path)).json(body)).send()
             .map_err(|e| anyhow!("Cannot reach launcher hub: {}. Is the launcher running?", e))?;
         let status = resp.status();
         let body = resp.text().context("read response body")?;
@@ -298,7 +314,7 @@ impl Hub {
         path: &str,
         body: &B,
     ) -> Result<T> {
-        let resp = self.client.patch(format!("{}{}", self.base, path)).json(body).send()
+        let resp = self.with_auth(self.client.patch(format!("{}{}", self.base, path)).json(body)).send()
             .map_err(|e| anyhow!("Cannot reach launcher hub: {}. Is the launcher running?", e))?;
         let status = resp.status();
         let body = resp.text().context("read response body")?;
@@ -309,7 +325,7 @@ impl Hub {
     }
 
     fn delete_json<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T> {
-        let resp = self.client.delete(format!("{}{}", self.base, path)).send()
+        let resp = self.with_auth(self.client.delete(format!("{}{}", self.base, path))).send()
             .map_err(|e| anyhow!("Cannot reach launcher hub: {}. Is the launcher running?", e))?;
         let status = resp.status();
         let body = resp.text().context("read response body")?;
@@ -317,6 +333,45 @@ impl Hub {
             return Err(anyhow!("hub error {}: {}", status, body));
         }
         serde_json::from_str(&body).with_context(|| format!("decode {}", path))
+    }
+}
+
+/// Read the auth token from `<VCT_STATE_DIR or ~/.vct>/hub.token`.
+///
+/// Returns None if the file is missing/empty. We don't fail the
+/// command here — sending a request without the header lets the
+/// server return a precise 401 (which we then surface as the hub
+/// error). Empty-vs-missing token: same outcome from the server's
+/// view, so we collapse both to None at the client.
+fn resolve_token() -> Option<String> {
+    // Honour VCT_HUB_TOKEN (set by tests / dev harnesses) for the
+    // same reason resolve_port honours VCT_HUB_PORT — no need to
+    // round-trip through a tempdir VCT_STATE_DIR if a test just
+    // wants to inject a known token.
+    if let Ok(t) = std::env::var("VCT_HUB_TOKEN") {
+        let trimmed = t.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    // Standard path: read from disk, mirroring server.rs's
+    // `auth::write_token_file`. We honour VCT_STATE_DIR the same
+    // way `resolve_port` does so dev launchers / tests stay
+    // isolated from the production state dir.
+    let state_dir = std::env::var("VCT_STATE_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            directories::UserDirs::new().map(|d| d.home_dir().join(".vct"))
+        })?;
+    let path = state_dir.join("hub.token");
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
 }
 

@@ -54,11 +54,11 @@
 
   "secrets": [
     {
-      "key": "GITHUB_TOKEN",
+      "key": "github_pat",
       "prompt": "GitHub personal access token (optional)",
-      "description": "Raises GitHub rate limit from 60 to 5000 requests/hour. Create at https://github.com/settings/tokens with 'public_repo' scope.",
+      "description": "Raises GitHub rate limit from 60 to 5000 requests/hour. Create at https://github.com/settings/tokens with 'public_repo' scope. Wrappers consume the resolved value as the GITHUB_TOKEN env var (the wrapper renames the key — keychain stores the lowercase canonical form to match `~/.vct-secrets/shared/github_pat` and the OnboardingWizard's `register_github_pat` flow).",
       "required": false,
-      "scope": "global",
+      "scope": "shared",
       "sensitive": true
     },
     {
@@ -90,7 +90,7 @@
       "windows": "{install_dir}\\.venv\\Scripts\\python.exe"
     },
     "cwd": "{install_dir}",
-    "env_from_secrets": ["GITHUB_TOKEN", "OPENALEX_EMAIL"],
+    "env_from_secrets": ["github_pat", "OPENALEX_EMAIL"],
     "env_from_settings": ["SEARXNG_URL"],
     "env_fixed": {
       "PYTHONPATH": "{install_dir}"

@@ -83,12 +83,41 @@ if (-not (Test-Path $CacheDir)) {
     New-Item -ItemType Directory -Path $CacheDir -Force | Out-Null
 }
 
+# === Emit context as PreToolUse JSON envelope ===
+# Plain stdout is silently discarded by Claude Code's hook runner — only
+# `hookSpecificOutput.additionalContext` reaches the LLM (system reminder
+# wrapper). 10k char cap mirrors the .sh sibling's contract. Pre-2026-05-08
+# this hook printed plain stdout that never reached the LLM context on
+# Windows, so all the KG/codegraph injection work was effectively dead on
+# the Windows side. Confirmed by checking that no `[Pre-edit context for ...]`
+# system-reminders ever appeared in real Edit-tool transcripts. The .sh
+# sibling was fixed in PR #168; the .ps1 fix landed alongside the
+# fork-readiness sweep for 0.1.7.
+function Emit-ContextJson([string]$ctx) {
+    if (-not $ctx) { return }
+    $truncated = if ($ctx.Length -gt 10000) { $ctx.Substring(0, 10000) } else { $ctx }
+    $envelope = [ordered]@{
+        hookSpecificOutput = [ordered]@{
+            hookEventName      = 'PreToolUse'
+            permissionDecision = 'allow'
+            additionalContext  = $truncated
+        }
+    }
+    # Compress + Depth 8 matches the .sh side's json.dumps default-compact
+    # form (no indentation, default escape behaviour). UTF-8 stdout via
+    # Write-Output is fine here — Claude Code reads stdout as UTF-8.
+    $json = $envelope | ConvertTo-Json -Compress -Depth 8
+    Write-Output $json
+}
+
 # Check cache (10-min TTL) — uses .NET file mtime, no cross-OS stat issues.
 if (Test-Path $CacheFile) {
     $mtime = (Get-Item $CacheFile).LastWriteTime
     $age = ((Get-Date) - $mtime).TotalSeconds
     if ($age -lt $CacheTtl) {
-        Get-Content $CacheFile -Raw
+        $cached = ""
+        try { $cached = (Get-Content $CacheFile -Raw -ErrorAction Stop) } catch { }
+        Emit-ContextJson $cached
         exit 0
     }
 }
@@ -192,6 +221,8 @@ if ($HasCode) {
 }
 
 $outStr = $out.ToString()
+# Cache stores the human-readable form so re-emission produces identical
+# content. Emit-ContextJson wraps it for Claude Code's PreToolUse contract.
 try { Set-Content -Path $CacheFile -Value $outStr -Encoding UTF8 -NoNewline } catch { }
-Write-Output $outStr
+Emit-ContextJson $outStr
 exit 0

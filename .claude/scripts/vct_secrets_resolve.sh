@@ -27,6 +27,20 @@
 #      on startup; mirrors `launcher/src-tauri/src/hub/server.rs`)
 #   3. Default 7700 (matches `DEFAULT_PORT` in server.rs).
 #
+# Auth (H5, 2026-05-08):
+#   Every request carries `Authorization: Bearer <token>` where
+#   <token> is read from:
+#     1. $VCT_HUB_TOKEN env var (tests / dev harnesses)
+#     2. ${VCT_STATE_DIR:-$HOME/.vct}/hub.token (written by the
+#        launcher on startup, mode 0o600 on Unix). Mirrors
+#        `launcher/src-tauri/src/hub/auth.rs::write_token_file`.
+#   If the token file is missing → exit 1 ("hub unreachable" — the
+#   launcher hasn't started yet, or it crashed before persisting the
+#   token). The hub also returns 401 if the token is wrong (e.g. file
+#   stale because the launcher restarted between resolves); we map 401
+#   to exit 1 too, so callers see one consistent "talk to the launcher"
+#   diagnostic.
+#
 # Project ID resolution (when the first arg looks like a path, not a UUID):
 #   GET /api/v1/projects/by-path?path=<folder>  → project_id
 #
@@ -73,22 +87,64 @@ hub_port() {
     printf '7700\n'
 }
 
+# ── Hub auth-token discovery ────────────────────────────────────────────
+#
+# Returns the token on stdout, or empty string if no token file exists.
+# Caller treats empty as "hub not running" (callers can't authenticate
+# without it; the hub will return 401).
+hub_token() {
+    if [[ -n "${VCT_HUB_TOKEN:-}" ]]; then
+        printf '%s' "$VCT_HUB_TOKEN"
+        return 0
+    fi
+    local state_dir="${VCT_STATE_DIR:-$HOME/.vct}"
+    local token_file="$state_dir/hub.token"
+    if [[ -f "$token_file" ]]; then
+        # Strip ALL whitespace including stray trailing newline.
+        # Same pattern as hub_port — robust against editor-saved files.
+        tr -d '[:space:]' < "$token_file"
+        return 0
+    fi
+    # No token file → emit empty. Caller maps that to exit 1.
+    printf ''
+}
+
 # ── HTTP helpers ────────────────────────────────────────────────────────
 #
 # We use curl directly so we can capture the HTTP status separately from
 # the body. `--fail` would conflate 404 (project not found) and connection
 # refused (hub unreachable) into the same exit code, which is exactly the
 # distinction the contract needs to preserve.
+#
+# Auth: every call carries `Authorization: Bearer <token>`. The token
+# is passed via `--header @-` so it's NEVER visible in `ps`/process
+# listings (curl reads the header from stdin via the `@-` form).
+# Without this, `--header "Authorization: Bearer abc..."` would put the
+# secret on argv where any process on the box could read it via
+# /proc/<pid>/cmdline.
 hub_get() {
     # $1 = path-with-query (no leading slash)
     # echoes "<status>\t<body>" on stdout; exit non-zero only when curl
-    # itself fails (e.g. connection refused, not 4xx).
+    # itself fails (e.g. connection refused, not 4xx). Returns exit 2
+    # specifically when no token file exists (so caller can map it
+    # to "hub unreachable" without trying the request).
     local path="$1"
-    local port
+    local port token
     port=$(hub_port)
+    token=$(hub_token)
+    if [[ -z "$token" ]]; then
+        return 2
+    fi
     local url="http://127.0.0.1:${port}/api/v1/${path}"
     local body status
-    if ! body=$(curl --silent --show-error --max-time 5 --output - --write-out '\n%{http_code}' "$url" 2>&1); then
+    # `--header @-` reads the header line from stdin. We feed exactly
+    # one line: "Authorization: Bearer <token>". This keeps the token
+    # off argv. The `<<<` here-string gives us a single-line stdin
+    # without an extra subshell.
+    if ! body=$(curl --silent --show-error --max-time 5 \
+                     --header @- \
+                     --output - --write-out '\n%{http_code}' "$url" \
+                     <<<"Authorization: Bearer ${token}" 2>&1); then
         return 1
     fi
     # Last line is the status; everything before is the body.
@@ -187,8 +243,16 @@ resolve_project_id() {
         return 0
     fi
     # Folder lookup via /projects/by-path?path=<arg>.
-    local result status body
-    if ! result=$(hub_get "projects/by-path?path=$(url_encode "$arg")"); then
+    local result status body rc
+    set +e
+    result=$(hub_get "projects/by-path?path=$(url_encode "$arg")")
+    rc=$?
+    set -e
+    if [[ $rc -eq 2 ]]; then
+        err "hub.token missing; is the launcher running?"
+        return 1
+    fi
+    if [[ $rc -ne 0 ]]; then
         err "hub unreachable; is the launcher running?"
         return 1
     fi
@@ -203,6 +267,15 @@ resolve_project_id() {
                 return 2
             fi
             printf '%s' "$id"
+            ;;
+        401)
+            # Stale token (launcher restarted between resolves) or the
+            # token file we read doesn't match what the hub generated.
+            # Treat as "hub unreachable" so callers see one consistent
+            # diagnostic. The user fix is the same: restart resolver
+            # / re-source env.
+            err "hub returned 401 unauthorized; the launcher may have restarted (token rotated). Try again."
+            return 1
             ;;
         404)
             err "no project registered at path: $arg"
@@ -242,8 +315,16 @@ read_key() {
         # resolve_project_id already mapped the exit code (1 or 2).
         return $?
     fi
-    local result status body
-    if ! result=$(hub_get "projects/$(url_encode "$pid")/env?key=$(url_encode "$key")"); then
+    local result status body rc
+    set +e
+    result=$(hub_get "projects/$(url_encode "$pid")/env?key=$(url_encode "$key")")
+    rc=$?
+    set -e
+    if [[ $rc -eq 2 ]]; then
+        err "hub.token missing; is the launcher running?"
+        return 1
+    fi
+    if [[ $rc -ne 0 ]]; then
         err "hub unreachable; is the launcher running?"
         return 1
     fi
@@ -258,6 +339,13 @@ read_key() {
                 return 4
             fi
             printf '%s' "$val"
+            ;;
+        401)
+            # See note in resolve_project_id: stale token → exit 1 to
+            # match the "hub unreachable" semantics callers already
+            # know how to surface.
+            err "hub returned 401 unauthorized; the launcher may have restarted (token rotated). Try again."
+            return 1
             ;;
         404)
             local code

@@ -85,23 +85,80 @@ impl ModuleCatalogEntry {
 /// repo root. The full ModuleManifest schema is for installable modules; the
 /// orchestrator core is not installable as a module — it IS the orchestrator —
 /// so it ships its own slim shape.
+///
+/// 0.1.7 fork-readiness sweep (2026-05-08, item H1): the orchestrator's
+/// manifest now carries an OPTIONAL `bundled_secrets` block. When present,
+/// the hub's `/api/v1/projects/{id}/env` resolver treats those secret
+/// declarations as if they were declared by an always-installed module
+/// owned by the orchestrator core. This is what makes the resolver path
+/// for `github_pat` work end-to-end without the user having to install
+/// the `vct-search` module first — the OnboardingWizard's keychain entry
+/// is reachable via `vct_secrets_resolve.sh <path> github_pat` for every
+/// `host=base` project the moment the launcher starts.
+///
+/// Schema mirrors the `secrets[]` block of a regular module manifest
+/// (see `manifest::SecretDecl`) so a reader can convert between the two
+/// without a translation layer. The hub's resolver consumes this list
+/// alongside per-module installs to build the project's env dict.
+///
+/// `OrchestratorBundledSecret` deliberately deserializes a SUPERSET of
+/// the fields the hub actually reads — anything extra in the JSON is
+/// ignored (forward compat with future manifest versions). Only `key` +
+/// `scope` are load-bearing for resolution; the rest are documentation.
 #[derive(Debug, Deserialize)]
-struct OrchestratorManifest {
+pub(crate) struct OrchestratorManifest {
     // `id` and `name` were parsed with defaults but never read. Removed
     // 2026-05-04. If a future caller needs them, re-add with #[serde(default)]
     // — vct-module.json always has them, but we only display version +
     // description + components in the catalog UI.
-    version: String,
-    description: String,
+    pub(crate) version: String,
+    pub(crate) description: String,
     #[serde(default)]
-    components: Vec<OrchestratorComponent>,
+    pub(crate) components: Vec<OrchestratorComponent>,
+    /// Orchestrator-level secrets surfaced by the launcher core. Read by
+    /// the hub's `/api/v1/projects/{id}/env` resolver for every `host=base`
+    /// project. See module-level rustdoc for the rationale.
+    #[serde(default)]
+    pub(crate) bundled_secrets: Vec<OrchestratorBundledSecret>,
 }
 
 #[derive(Debug, Deserialize)]
-struct OrchestratorComponent {
-    id: String,
-    name: String,
-    description: String,
+pub(crate) struct OrchestratorComponent {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) description: String,
+}
+
+/// Single entry in `OrchestratorManifest::bundled_secrets`. Declares a
+/// secret the orchestrator core knows about and the hub should resolve
+/// against the launcher's keychain for every base-host project.
+///
+/// Fields:
+///   * `key`        — env-var name AND keychain key. Lower-case canonical
+///                    form (e.g. `github_pat`); the wrapper renames it
+///                    if needed.
+///   * `scope`      — `"shared"` | `"global"` | `"per-project"`. The
+///                    hub maps this onto the same scope-string the
+///                    `secret_active_state` table uses
+///                    (`shared`/`global`/`per_project`).
+///   * `module_id`  — keychain `module_id` segment. Defaults to
+///                    `"installer"` for parity with what the
+///                    OnboardingWizard's `register_github_pat` flow
+///                    writes (see commands/installer.rs::GITHUB_PAT_MODULE_ID).
+///   * `description` — informational; not load-bearing for the hub.
+#[derive(Debug, Deserialize)]
+pub(crate) struct OrchestratorBundledSecret {
+    pub(crate) key: String,
+    pub(crate) scope: String,
+    #[serde(default = "default_orchestrator_secret_module_id")]
+    pub(crate) module_id: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub(crate) description: String,
+}
+
+fn default_orchestrator_secret_module_id() -> String {
+    "installer".to_string()
 }
 
 /// Find `vct-module.json` at the repo root by walking up from the
@@ -114,7 +171,7 @@ struct OrchestratorComponent {
 /// (`<clone>/launcher/dist/<arch>/vct-launcher`, walks up 4 levels) and
 /// `cargo run` builds (`<clone>/launcher/src-tauri/target/<profile>/`,
 /// walks up 4-5 levels — both find the clone root).
-fn find_orchestrator_manifest() -> Option<PathBuf> {
+pub(crate) fn find_orchestrator_manifest() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let mut p = exe.parent()?;
     loop {
@@ -129,7 +186,7 @@ fn find_orchestrator_manifest() -> Option<PathBuf> {
     }
 }
 
-fn read_orchestrator_manifest() -> Option<OrchestratorManifest> {
+pub(crate) fn read_orchestrator_manifest() -> Option<OrchestratorManifest> {
     let path = find_orchestrator_manifest()?;
     let raw = std::fs::read_to_string(&path).ok()?;
     serde_json::from_str(&raw).ok()
@@ -740,6 +797,109 @@ mod tests {
                 !forbidden.contains(&e.id.as_str()),
                 "FORBIDDEN: vapor module id '{}' resurfaced in builtin_catalog_entries",
                 e.id
+            );
+        }
+    }
+
+    // ─── Bundled manifest schema regression tests (0.1.7 fork-readiness) ──
+    //
+    // The bundled manifests under `launcher/bundled_manifests/` declare the
+    // secret keys that the launcher's hub `/projects/{id}/env` endpoint
+    // exposes to bundled MCP wrappers (e.g. `claude_mcp_servers/search_mcp/
+    // wrapper.sh`). Pre-0.1.7 the search MCP manifest declared
+    // `GITHUB_TOKEN` (uppercase, scope=global), but the wrapper queries the
+    // resolver for `github_pat` (lowercase, scope=shared). That mismatch
+    // meant the resolver always returned `key_not_active`, so the wrapper
+    // fell through to its `VCT_LEGACY_FILE_FALLBACK=1` path on every call.
+    //
+    // These tests pin:
+    //   * The bundled `vct-search.json` parses as a valid `ModuleManifest`.
+    //   * The `github_pat` secret is declared with `scope: "shared"` —
+    //     matching what `wrapper.sh` queries and what
+    //     `commands/installer.rs::register_github_pat` writes to
+    //     `~/.vct-secrets/shared/github_pat` (the file path the
+    //     OnboardingWizard still uses; keychain migration is Open Q #1
+    //     deferred to 0.1.8).
+    //   * `runtime.env_from_secrets` references `github_pat` (not the
+    //     legacy `GITHUB_TOKEN`), so when launcher-managed runtime
+    //     injection lands it picks up the right keychain entry.
+    //
+    // If any of these assertions fail, the resolver path will silently
+    // 404 again — same regression we just fixed.
+    fn bundled_search_manifest_path() -> std::path::PathBuf {
+        // CARGO_MANIFEST_DIR is /<repo>/launcher/src-tauri at compile time.
+        // The bundled manifest tree lives at /<repo>/launcher/bundled_manifests.
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("bundled_manifests")
+            .join("vct-search.json")
+    }
+
+    #[test]
+    fn bundled_search_manifest_parses_cleanly() {
+        let path = bundled_search_manifest_path();
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
+        let parsed = ModuleManifest::from_json(&raw)
+            .unwrap_or_else(|e| panic!("vct-search.json failed to parse: {}", e));
+        assert_eq!(parsed.id, "vct-search");
+    }
+
+    #[test]
+    fn bundled_search_manifest_declares_github_pat_shared_not_uppercase_global() {
+        let path = bundled_search_manifest_path();
+        let raw = std::fs::read_to_string(&path).expect("read vct-search.json");
+        let parsed = ModuleManifest::from_json(&raw).expect("parse vct-search.json");
+
+        // The wrapper at claude_mcp_servers/search_mcp/wrapper.sh queries
+        // the resolver for `github_pat` (lowercase, scope=shared). The
+        // manifest MUST declare it under that exact key+scope or the hub's
+        // `project_env` endpoint will never resolve it from the keychain
+        // and the resolver will return exit 4 (`key_not_active`).
+        let github = parsed
+            .secrets
+            .iter()
+            .find(|s| s.key == "github_pat")
+            .expect(
+                "vct-search.json must declare a `github_pat` secret. Found keys: \
+                 see env_from_secrets / wrapper.sh — the wrapper resolves \
+                 `github_pat` (lowercase) shared, NOT GITHUB_TOKEN uppercase",
+            );
+        assert_eq!(
+            github.scope, "shared",
+            "github_pat MUST be scope=shared (matches ~/.vct-secrets/shared/github_pat \
+             and OnboardingWizard's register_github_pat); got {:?}",
+            github.scope
+        );
+
+        // Belt-and-suspenders: the legacy uppercase key shape would break
+        // the resolver path. Fail loudly if anyone re-introduces it.
+        assert!(
+            !parsed.secrets.iter().any(|s| s.key == "GITHUB_TOKEN"),
+            "vct-search.json must NOT re-declare GITHUB_TOKEN (legacy uppercase) — \
+             wrapper.sh resolves `github_pat` and renames the env var itself"
+        );
+    }
+
+    #[test]
+    fn bundled_search_manifest_runtime_env_matches_secret_keys() {
+        let path = bundled_search_manifest_path();
+        let raw = std::fs::read_to_string(&path).expect("read vct-search.json");
+        let parsed = ModuleManifest::from_json(&raw).expect("parse vct-search.json");
+
+        // Every key in `runtime.env_from_secrets` must correspond to an
+        // actual `secrets[].key` declaration. Mismatches mean the
+        // launcher-managed runtime would try to inject from a keychain
+        // entry that nothing writes to — silent breakage.
+        let declared: std::collections::HashSet<&str> =
+            parsed.secrets.iter().map(|s| s.key.as_str()).collect();
+        for env_key in &parsed.runtime.env_from_secrets {
+            assert!(
+                declared.contains(env_key.as_str()),
+                "runtime.env_from_secrets references {:?} but no matching `secrets[].key` is declared. \
+                 Declared keys: {:?}",
+                env_key,
+                declared,
             );
         }
     }

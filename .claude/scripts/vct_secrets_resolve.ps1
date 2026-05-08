@@ -20,6 +20,15 @@
 #   1. $Env:VCT_HUB_PORT
 #   2. ${VCT_STATE_DIR or $HOME\.vct}\hub.port
 #   3. Default 7700.
+#
+# Auth (H5, 2026-05-08):
+#   Every request carries `Authorization: Bearer <token>` where
+#   <token> is read from:
+#     1. $Env:VCT_HUB_TOKEN (tests / dev harnesses)
+#     2. ${VCT_STATE_DIR or $HOME\.vct}\hub.token (written by the
+#        launcher on startup). Mirrors the .sh helper.
+#   If the file is missing → exit 1 ("hub unreachable"). If the hub
+#   returns 401 (token rotated by a launcher restart) → also exit 1.
 
 [CmdletBinding()]
 param(
@@ -56,13 +65,39 @@ function Get-HubPort {
     return 7700
 }
 
+function Get-HubToken {
+    # Returns the auth token string, or $null if no token can be
+    # resolved. Caller treats $null as "hub unreachable" (the launcher
+    # hasn't written hub.token yet — it isn't running).
+    if ($Env:VCT_HUB_TOKEN) {
+        $t = $Env:VCT_HUB_TOKEN.Trim()
+        if ($t.Length -gt 0) { return $t }
+    }
+    $stateDir = if ($Env:VCT_STATE_DIR) { $Env:VCT_STATE_DIR } else { Join-Path $HOME ".vct" }
+    $tokenFile = Join-Path $stateDir "hub.token"
+    if (Test-Path $tokenFile) {
+        $raw = (Get-Content -Raw -Path $tokenFile).Trim()
+        if ($raw.Length -gt 0) { return $raw }
+    }
+    return $null
+}
+
 function Invoke-Hub {
     param([string]$PathAndQuery)
     $port = Get-HubPort
+    $token = Get-HubToken
+    if ($null -eq $token) {
+        # Sentinel result the caller can detect alongside the
+        # connection-refused $null. We use a distinct shape (Status=0)
+        # so error-message wiring can give a more useful message
+        # ("token missing" vs "connection refused").
+        return @{ Status = 0; Body = "hub.token missing" }
+    }
     $url = "http://127.0.0.1:$port/api/v1/$PathAndQuery"
+    $headers = @{ "Authorization" = "Bearer $token" }
     try {
         $response = Invoke-WebRequest -Uri $url -Method Get -UseBasicParsing `
-            -TimeoutSec 5 -ErrorAction Stop
+            -Headers $headers -TimeoutSec 5 -ErrorAction Stop
         return @{
             Status = [int]$response.StatusCode
             Body   = $response.Content
@@ -111,6 +146,18 @@ function Resolve-ProjectId {
         return @{ ExitCode = 1 }
     }
     switch ($result.Status) {
+        0 {
+            # Status=0 is our internal sentinel from Get-HubToken
+            # returning $null. Surface as exit 1 with the token-missing
+            # diagnostic — same family as "hub unreachable" because
+            # both mean "launcher isn't fully up".
+            Write-Err "hub.token missing; is the launcher running?"
+            return @{ ExitCode = 1 }
+        }
+        401 {
+            Write-Err "hub returned 401 unauthorized; the launcher may have restarted (token rotated). Try again."
+            return @{ ExitCode = 1 }
+        }
         200 {
             try {
                 $obj = $result.Body | ConvertFrom-Json
@@ -154,6 +201,14 @@ function Read-Key {
         return 1
     }
     switch ($result.Status) {
+        0 {
+            Write-Err "hub.token missing; is the launcher running?"
+            return 1
+        }
+        401 {
+            Write-Err "hub returned 401 unauthorized; the launcher may have restarted (token rotated). Try again."
+            return 1
+        }
         200 {
             try {
                 $obj = $result.Body | ConvertFrom-Json

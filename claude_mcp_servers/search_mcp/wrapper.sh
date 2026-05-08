@@ -10,28 +10,47 @@
 #   workaround is a wrapper script that reads the secret and exec's the
 #   real binary.
 #
-# How (post-Fix-#3 cleanup, 0.1.7):
-#   1. Resolve GITHUB_TOKEN via the launcher hub:
-#        vct_secrets_resolve.sh <project_path> github_pat
-#      The launcher's keychain is the authoritative source-of-truth;
-#      the hub adds the per-project active-flag gate. No file-side
-#      mirror at ~/.vct-secrets/.
-#   2. Fall back to the legacy ~/.vct-secrets/shared/github_pat read
-#      ONLY if the hub is unreachable AND a $VCT_LEGACY_FILE_FALLBACK
-#      env opt-in is set. This is a one-release-cycle migration safety
-#      net for users who upgrade Fix-#3 → 0.1.7 with a stopped
-#      launcher; it will be removed in 0.1.8.
-#   3. Export GITHUB_TOKEN and exec the real server.
+# How (0.1.7 final, post-fork-readiness sweep 2026-05-08):
+#   Two resolution paths, in order:
+#
+#   1. Env-first (canonical 0.1.7 path): if $GITHUB_TOKEN is already
+#      exported, use it. The launcher's `write_project_env_files`
+#      writes GITHUB_TOKEN to `.claude/env`, `.claude/settings.json`
+#      `env`, and `.vscode/settings.json` `claude-code.env` for every
+#      registered project, sourced from the keychain entry at
+#      `vct._user_shared_.shared.installer/github_pat`. Subprocesses
+#      spawned in any registered project's Claude Code session inherit
+#      it directly — no resolver call needed.
+#
+#   2. Resolver helper (`vct_secrets_resolve.sh <path> github_pat`):
+#      reads from the launcher's hub HTTP API at
+#      `GET /api/v1/projects/{id}/env?key=github_pat`, which:
+#         - resolves the keychain at SENTINEL_SHARED + module_id="installer"
+#           (matches what `register_github_pat` writes to)
+#         - applies the cross-launcher active-flag gate
+#         - finds the manifest declaration via the orchestrator's
+#           `vct-module.json::bundled_secrets[]` block (NEW in
+#           0.1.7 fork-readiness sweep, item H1)
+#      End-to-end working for every base-host project the moment the
+#      launcher starts — no module-install required.
+#
+# The legacy `~/.vct-secrets/shared/github_pat` file fallback that
+# existed in earlier 0.1.7 pre-releases (gated behind
+# $VCT_LEGACY_FILE_FALLBACK=1) has been REMOVED in the 0.1.7
+# fork-readiness sweep (item H4, 2026-05-08). Both canonical paths
+# above (env-first and resolver) work end-to-end now, so the file
+# fallback is no longer needed. Users with a stale
+# `~/.vct-secrets/shared/github_pat` file from a pre-fix install will
+# have it migrated into the keychain by the next
+# `register_github_pat` call (see `migrate_github_pat_file_to_keychain`
+# in commands/installer.rs); manual migration via the
+# OnboardingWizard works too.
 #
 # Configuration via env (override defaults):
 #   VCT_PROJECT_PATH       project folder used to resolve the secret
 #                          (default: $PWD; the launcher sets this
 #                          for `vibecoded`-spawned wrappers).
 #   VCT_HUB_PORT           override hub port (else read ~/.vct/hub.port).
-#   VCT_LEGACY_FILE_FALLBACK
-#                          when set to "1", fall back to
-#                          ~/.vct-secrets/shared/github_pat on hub
-#                          failure. Off by default.
 #   SEARCH_MCP_PYTHON      default: $REPO_ROOT/claude_mcp_servers/.venv/bin/python
 #   SEARCH_MCP_SERVER      default: $REPO_ROOT/claude_mcp_servers/search_mcp/server.py
 #
@@ -63,17 +82,31 @@ for candidate in \
 done
 
 # ── Resolve GITHUB_TOKEN ─────────────────────────────────────────────────────
-GITHUB_TOKEN=""
+# Two paths, in order (legacy file fallback retired in 0.1.7 final, item H4):
+#   1. $GITHUB_TOKEN already exported in the environment — canonical 0.1.7
+#      path. Set by the launcher's `write_project_env_files` for every
+#      registered project, sourced from the keychain entry at
+#      `vct._user_shared_.shared.installer/github_pat`.
+#   2. Resolver helper (`vct_secrets_resolve.sh <path> github_pat`) —
+#      reads the keychain via the launcher hub. Works end-to-end for
+#      every base-host project after 0.1.7 H1: the orchestrator's
+#      `vct-module.json::bundled_secrets[]` declares `github_pat`, so
+#      the hub's `/projects/{id}/env` resolver finds it without any
+#      module install required. The resolver itself uses SENTINEL_SHARED
+#      for the keychain lookup (matches the writer side).
 project_path="${VCT_PROJECT_PATH:-$PWD}"
 
-if [[ -n "$RESOLVER" ]]; then
+# Path 1: env-first.
+if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    : # already in env via launcher's per-project env-file emission
+elif [[ -n "$RESOLVER" ]]; then
     set +e
     GITHUB_TOKEN=$("$RESOLVER" "$project_path" github_pat 2>/dev/null)
     rc=$?
     set -e
     case "$rc" in
         0)
-            : # ok
+            : # ok — resolver returned the value
             ;;
         1)
             echo "[search-mcp-wrapper] WARN: launcher hub unreachable; the launcher must be running to resolve secrets" >&2
@@ -86,38 +119,29 @@ if [[ -n "$RESOLVER" ]]; then
             exit 1
             ;;
         4)
-            echo "[search-mcp-wrapper] WARN: github_pat not declared by any installed module for $project_path" >&2
+            echo "[search-mcp-wrapper] WARN: github_pat not declared by any installed module nor by the orchestrator's bundled_secrets for $project_path" >&2
             ;;
         *)
-            echo "[search-mcp-wrapper] WARN: resolver exited with $rc; falling back to legacy file path" >&2
+            echo "[search-mcp-wrapper] WARN: resolver exited with code $rc" >&2
             ;;
     esac
 else
     echo "[search-mcp-wrapper] WARN: vct_secrets_resolve.sh not found; orchestrator may not be installed" >&2
 fi
 
-# ── Legacy file fallback (gated, one-release-cycle migration safety) ─────────
-if [[ -z "$GITHUB_TOKEN" && "${VCT_LEGACY_FILE_FALLBACK:-0}" == "1" ]]; then
-    VCT_DIR="${VCT_SECRETS_DIR:-$HOME/.vct-secrets}"
-    SECRET_FILE="$VCT_DIR/shared/github_pat"
-    [[ ! -f "$SECRET_FILE" ]] && [[ -f "$VCT_DIR/github_pat" ]] && SECRET_FILE="$VCT_DIR/github_pat"
-    if [[ -f "$SECRET_FILE" ]]; then
-        perms=$(stat -c %a "$SECRET_FILE" 2>/dev/null || stat -f %Lp "$SECRET_FILE" 2>/dev/null || echo "")
-        if [[ "$perms" == "600" || "$perms" == "400" ]]; then
-            GITHUB_TOKEN=$(tr -d '[:space:]' < "$SECRET_FILE")
-            echo "[search-mcp-wrapper] DEPRECATION: read github_pat from legacy $SECRET_FILE; this fallback will be removed in 0.1.8" >&2
-        else
-            echo "[search-mcp-wrapper] WARN: legacy file $SECRET_FILE has perms $perms (want 600); skipping" >&2
-        fi
-    fi
-fi
-
-if [[ -z "$GITHUB_TOKEN" ]]; then
+if [[ -z "${GITHUB_TOKEN:-}" ]]; then
     echo "[search-mcp-wrapper] ERROR: could not resolve github_pat" >&2
-    echo "[search-mcp-wrapper] Fix:" >&2
+    echo "[search-mcp-wrapper] Canonical fix (0.1.7+):" >&2
     echo "  1. Make sure the VCO Launcher is running" >&2
-    echo "  2. Open the launcher's Secrets panel and set 'github_pat' (shared scope)" >&2
-    echo "  3. Verify with: $RESOLVER \"$project_path\" github_pat" >&2
+    echo "  2. Open the launcher's OnboardingWizard or Settings → GitHub Token" >&2
+    echo "     (writes to keychain at vct._user_shared_.shared.installer/github_pat)" >&2
+    echo "  3. The launcher auto-writes GITHUB_TOKEN to every registered project's" >&2
+    echo "     .claude/env, .claude/settings.json env, and .vscode/settings.json" >&2
+    echo "     claude-code.env. Verify: grep '^export GITHUB_TOKEN=' .claude/env" >&2
+    echo "  4. If the env var is set but you're still seeing this error, restart" >&2
+    echo "     your Claude Code session (env files are read at session start)." >&2
+    echo "  5. As a last resort, run vct_secrets_resolve.sh \"\$PWD\" github_pat" >&2
+    echo "     directly to see the resolver's exit code + diagnostic output." >&2
     exit 1
 fi
 export GITHUB_TOKEN

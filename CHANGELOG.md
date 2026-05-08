@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-05-08
+
 Iteration since v0.1.6. Substantial install-flow architectural
 overhaul, freeze-investigation hardening, drift-guard work, and
 maintenance. Headline themes:
@@ -146,6 +148,7 @@ follow Keep a Changelog discipline more strictly per release.
 - Default-OFF telemetry (explicit opt-in required; default `.env` writes `VIBECODED_TELEMETRY=false`).
 - Public alias for license validation (`https://api.vibecodedtools.it/validate-tier`); internal Supabase URLs are not committed to public source.
 
-[Unreleased]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.1.6...HEAD
+[Unreleased]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.1.6...v0.2.0
 [0.1.6]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.1.5...v0.1.6
 [0.1.0]: https://github.com/hotak92/vibecoded-orchestrator/releases/tag/v0.1.0

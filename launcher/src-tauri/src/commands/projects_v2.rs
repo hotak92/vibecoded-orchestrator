@@ -1359,6 +1359,13 @@ pub fn write_project_env_files(
                         Some(settings.code_graph_access_list.join(","))
                     }
                 }
+                // 0.1.7 fork-readiness sweep (2026-05-08): emit
+                // `GITHUB_TOKEN` from the keychain-resolved PAT when
+                // present + active, else omit the key entirely. Matches
+                // VCT_ORCHESTRATOR_ROOT semantics (None → not in any of
+                // the 3 surfaces). Resolved by `populate()` via
+                // `crate::commands::installer::github_pat_for_env`.
+                "GITHUB_TOKEN" => settings.github_token.clone(),
                 other => panic!(
                     "CANONICAL_INSTALL_ENV_KEYS contains key {:?} but \
                      write_project_env_files has no match arm for it. \
@@ -1372,6 +1379,41 @@ pub fn write_project_env_files(
         .collect();
     let canonical_env_keys: std::collections::HashSet<&str> =
         canonical_env_pairs.iter().map(|(k, _)| *k).collect();
+
+    // Subagent G (2026-05-08): derive the user-bucket emit + strip sets
+    // from the launcher-resolved settings so they propagate to all 3
+    // surfaces alongside the canonical pairs.
+    //
+    // EMIT: every (KEY, VALUE) pair the resolver produced. Already
+    // gated by the cross-launcher active flag + keychain presence at
+    // populate time (`resolve_user_secret_state` in project_env_settings).
+    //
+    // STRIP: every known KEY that is NOT in the EMIT set. This is the
+    // subset of "keys the launcher has ever observed in this project's
+    // user bucket" that is currently inactive / pending-removal /
+    // keychain-empty. Removing them from the JSON env blocks is what
+    // makes a paused secret actually leave the surfaces; for
+    // `.claude/env` the BEGIN/END replace handles strip implicitly.
+    //
+    // We tolerate a key appearing in BOTH lists defensively (an emit
+    // with the same name as a strip entry shouldn't happen by
+    // construction — `resolve_user_secret_state` always returns
+    // disjoint sets — but the merge primitive runs strip BEFORE emit
+    // so even a buggy resolver couldn't silently drop the active
+    // value).
+    let user_secret_pairs: Vec<(&str, String)> = settings
+        .user_secret_pairs
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.clone()))
+        .collect();
+    let emit_keys: std::collections::HashSet<&str> =
+        user_secret_pairs.iter().map(|(k, _)| *k).collect();
+    let user_secret_strip_keys: Vec<&str> = settings
+        .user_secret_known_keys
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|k| !emit_keys.contains(k))
+        .collect();
 
     // VS Code path (extension reads claude-code.env).
     //
@@ -1415,7 +1457,17 @@ pub fn write_project_env_files(
         vscode_root = serde_json::json!({});
     }
     if let Some(root_obj) = vscode_root.as_object_mut() {
-        merge_env_object_canonical(root_obj, "claude-code.env", &canonical_env_pairs);
+        // Subagent G (2026-05-08): user-secret emit + strip threaded
+        // through the same deep-merge primitive. Keys NOT in either
+        // set survive verbatim (preserves PR-3 Commit 6 invariant for
+        // by-hand user-added keys at `claude-code.env` level).
+        merge_env_object_canonical_with_user_secrets(
+            root_obj,
+            "claude-code.env",
+            &canonical_env_pairs,
+            &user_secret_pairs,
+            &user_secret_strip_keys,
+        );
     }
     std::fs::write(
         &vscode_settings_path,
@@ -1446,7 +1498,18 @@ pub fn write_project_env_files(
     std::fs::create_dir_all(&claude_dir)
         .map_err(|e| format!("mkdir {}: {}", claude_dir.display(), e))?;
     let env_path = claude_dir.join("env");
-    let managed_block = build_claude_env_managed_block(&canonical_env_pairs, settings);
+    // Subagent G (2026-05-08): user-secret exports land BETWEEN the
+    // BEGIN/END markers alongside the canonical exports. Strip is
+    // implicit for `.claude/env`: the entire managed block is replaced
+    // on every call by `merge_claude_env_managed_block`, so a paused /
+    // removed secret simply doesn't appear in the new block. No extra
+    // strip-set plumbing needed (contrast with the JSON env blocks,
+    // which are deep-merged additively).
+    let managed_block = build_claude_env_managed_block_with_user_secrets(
+        &canonical_env_pairs,
+        &user_secret_pairs,
+        settings,
+    );
     let prior = std::fs::read_to_string(&env_path).ok();
     let new_text = merge_claude_env_managed_block(prior.as_deref(), &managed_block);
     std::fs::write(&env_path, new_text)
@@ -1496,7 +1559,14 @@ pub fn write_project_env_files(
     }
 
     if let Some(obj) = claude_settings.as_object_mut() {
-        merge_env_object_canonical(obj, "env", &canonical_env_pairs);
+        // Subagent G (2026-05-08): same deep-merge as `.vscode/settings.json`.
+        merge_env_object_canonical_with_user_secrets(
+            obj,
+            "env",
+            &canonical_env_pairs,
+            &user_secret_pairs,
+            &user_secret_strip_keys,
+        );
     }
 
     let pretty = serde_json::to_string_pretty(&claude_settings)
@@ -1525,10 +1595,58 @@ pub fn write_project_env_files(
 ///   * Canonical values are written as JSON strings — matching the prior
 ///     wholesale-replace behaviour and what every consumer (Claude Code
 ///     CLI / Desktop / VS Code extension) parses.
+///
+/// Subagent G (2026-05-08): kept as a thin wrapper over the new
+/// `_with_user_secrets` variant for cheap test ergonomics. Production
+/// callers all go through the superset variant via
+/// `write_project_env_files`. Allowed-dead-code so a future refactor
+/// that drops every direct call site doesn't bit-rot the test that
+/// exercises canonical-only behaviour.
+#[allow(dead_code)]
 pub(crate) fn merge_env_object_canonical(
     parent: &mut serde_json::Map<String, serde_json::Value>,
     env_key: &str,
     canonical_pairs: &[(&str, String)],
+) {
+    merge_env_object_canonical_with_user_secrets(parent, env_key, canonical_pairs, &[], &[]);
+}
+
+/// Subagent G (2026-05-08): superset of `merge_env_object_canonical`
+/// that also threads per-project user-bucket secrets + a strip set.
+///
+/// `canonical_pairs` is the same launcher-canonical (KEY, VALUE) list
+/// the caller has always passed (KG_COLLECTION, PROJECT_NAME, etc.).
+///
+/// `user_secret_pairs` carries (KEY, VALUE) for every per-project
+/// user-bucket secret the launcher should EMIT into this surface
+/// (active + keychain-present, post-cross-launcher-gate).
+///
+/// `user_secret_strip_keys` is the difference set between
+/// `user_secret_known_keys` and the keys in `user_secret_pairs`. Any
+/// key in this list that exists in the existing env block is REMOVED.
+/// That is how a paused / removed secret exits the surface without
+/// disturbing any other key.
+///
+/// Invariants:
+///   * Canonical keys are always written. They never collide with user
+///     keys in practice (canonical names — KG_*, PROJECT_NAME,
+///     ACTIVE_EMBEDDING, etc. — are reserved and the GUI doesn't let
+///     the user pick those names). If a hypothetical collision did
+///     happen, the user pair is inserted AFTER canonical so the user
+///     value wins, matching pre-Subagent-G "user-added env key
+///     preservation" semantics.
+///   * Keys NOT in any of the three input lists survive verbatim. This
+///     preserves the PR-3 Commit 6 invariant that env keys typed by
+///     hand directly into a JSON env block are not clobbered by the
+///     launcher's writer. Subagent-G's strip set is bounded to keys
+///     we ourselves wrote (every entry came from a `set_secret_v2`
+///     call) — by-hand keys are never in `user_secret_known_keys`.
+pub(crate) fn merge_env_object_canonical_with_user_secrets(
+    parent: &mut serde_json::Map<String, serde_json::Value>,
+    env_key: &str,
+    canonical_pairs: &[(&str, String)],
+    user_secret_pairs: &[(&str, String)],
+    user_secret_strip_keys: &[&str],
 ) {
     let existing = parent
         .get(env_key)
@@ -1538,7 +1656,23 @@ pub(crate) fn merge_env_object_canonical(
 
     let mut env_obj = existing.as_object().cloned().unwrap_or_default();
 
+    // 1. Strip user-secret keys that are no longer active / present in
+    //    the keychain. Run BEFORE re-inserting the active pairs so a
+    //    same-tick toggle (active→inactive→active across two writer
+    //    calls) can't rely on residual state. The strip set is by
+    //    construction disjoint from the user_secret_pairs key set, so
+    //    removing then inserting is safe.
+    for k in user_secret_strip_keys {
+        env_obj.remove(*k);
+    }
+
+    // 2. Overwrite canonical keys with the launcher's resolved values.
     for (k, v) in canonical_pairs {
+        env_obj.insert((*k).to_string(), serde_json::Value::String(v.clone()));
+    }
+
+    // 3. Insert the active user-secret pairs.
+    for (k, v) in user_secret_pairs {
         env_obj.insert((*k).to_string(), serde_json::Value::String(v.clone()));
     }
 
@@ -1566,9 +1700,35 @@ pub(crate) const CLAUDE_ENV_MANAGED_END: &str = "# vco-managed-end";
 /// `settings` is no longer read directly here but kept in the signature
 /// for forward-compat with future surface-specific tweaks (e.g.
 /// per-project compose-override commentary).
-#[allow(unused_variables)]
+#[allow(unused_variables, dead_code)]
 pub(crate) fn build_claude_env_managed_block(
     canonical_pairs: &[(&str, String)],
+    settings: &ProjectEnvSettings,
+) -> String {
+    build_claude_env_managed_block_with_user_secrets(canonical_pairs, &[], settings)
+}
+
+/// Subagent G (2026-05-08): superset of `build_claude_env_managed_block`
+/// that also emits user-bucket secret exports between the BEGIN/END
+/// markers.
+///
+/// Strip semantics for `.claude/env` are IMPLICIT: the entire managed
+/// block is rebuilt on every call and `merge_claude_env_managed_block`
+/// replaces the in-file segment from BEGIN to END. A previously-emitted
+/// user secret that is no longer in `user_secret_pairs` simply doesn't
+/// appear in the new block — nothing else needed. (Contrast with the
+/// JSON env blocks, where the deep-merge is additive and we have to
+/// thread an explicit strip set.)
+///
+/// User exports land AFTER the canonical exports for readability — the
+/// canonical block carries the launcher-owned config; the user block
+/// carries the user-owned secrets. A `# user secrets (per-project)`
+/// section header makes the boundary explicit when someone diffs the
+/// file.
+#[allow(unused_variables)]
+pub(crate) fn build_claude_env_managed_block_with_user_secrets(
+    canonical_pairs: &[(&str, String)],
+    user_secret_pairs: &[(&str, String)],
     settings: &ProjectEnvSettings,
 ) -> String {
     let mut out = String::new();
@@ -1604,6 +1764,18 @@ pub(crate) fn build_claude_env_managed_block(
     for (k, v) in canonical_pairs {
         let q_v = v.replace('"', "\\\"");
         out.push_str(&format!("export {}=\"{}\"\n", k, q_v));
+    }
+    if !user_secret_pairs.is_empty() {
+        // Subagent G (2026-05-08): user-set per-project secrets follow
+        // the canonical block. A blank line + section header keeps
+        // diffs readable. Paused / removed secrets are simply absent
+        // from this list (the BEGIN/END replace strips them implicitly).
+        out.push('\n');
+        out.push_str("# user secrets (per-project; managed via launcher GUI Secrets panel)\n");
+        for (k, v) in user_secret_pairs {
+            let q_v = v.replace('"', "\\\"");
+            out.push_str(&format!("export {}=\"{}\"\n", k, q_v));
+        }
     }
     out.push_str(CLAUDE_ENV_MANAGED_END);
     out.push('\n');
@@ -2461,6 +2633,29 @@ pub(crate) const CANONICAL_INSTALL_ENV_KEYS: &[&str] = &[
     // them — see `check_settings_template_drift.py` allowlist note.
     "VCT_KG_ACCESS_LIST",
     "VCT_CODE_GRAPH_ACCESS_LIST",
+    // 0.1.7 fork-readiness sweep (2026-05-08): GitHub PAT propagation.
+    // Replaces the retired `git-credential-vct` helper (incompatible
+    // with per-project active-flag gating per the secrets-architecture
+    // audit). Resolved by the env-pair builder from the OS keychain
+    // entry the OnboardingWizard writes via
+    // `commands::installer::register_github_pat`
+    // (`vct._user_shared_.shared.installer / github_pat`). Conditionally
+    // emitted: omitted when the keychain has no value, or when the
+    // value is paused via Lifecycle B's active-flag gate.
+    //
+    // Per-project gating semantics (conservative, 2026-05-08): every
+    // registered project receives `GITHUB_TOKEN` whenever the PAT is
+    // set and active. This matches pre-0.1.7 file-based behaviour
+    // (`~/.vct-secrets/shared/github_pat` is readable by every process
+    // running as the user). A finer-grained per-project access matrix
+    // for `github_pat` is out of scope for the 0.1.7 fork sweep — see
+    // `docs/MIGRATION-0.2.0.md` "Replacing `git-credential-vct`".
+    //
+    // Users configure git's credential helper once
+    // (`gh auth setup-git`, or a thin shell helper that reads
+    // `$GITHUB_TOKEN`) and the launcher takes over the per-project
+    // gating via the env var.
+    "GITHUB_TOKEN",
 ];
 
 /// Canonical env keys the launcher OWNS across every surface. These are
@@ -2843,6 +3038,315 @@ pub(crate) fn surgically_strip_env_surfaces(
     (keys.into_iter().collect(), warnings)
 }
 
+/// Subagent G (2026-05-08): strip a caller-supplied set of user-bucket
+/// secret KEY names from the project's env surfaces.
+///
+/// Different from `surgically_strip_env_surfaces` (which strips only
+/// the launcher-canonical key set known at compile time): user-secret
+/// key names are project-specific and dynamically discovered from
+/// `secret_active_state`, so they need a per-call list.
+///
+/// Strips:
+///   * `.env`: lines matching `<KEY>=...` or `# <KEY>=...` are removed
+///     verbatim. Lines outside that shape (comments, blank, user
+///     overrides) are preserved.
+///   * `.claude/env`: lines matching `export <KEY>="..."` (active or
+///     commented form) are removed. Outside-the-managed-block exports
+///     follow the same rule.
+///   * `.claude/settings.json` `env` block: keys removed via
+///     deep-merge. Adjacent canonical / by-hand user keys at the same
+///     level survive.
+///   * `.vscode/settings.json` `claude-code.env` block: same.
+///
+/// Soft-fail discipline mirrors `surgically_strip_env_surfaces`. The
+/// keychain itself is NOT touched — that's the user's call to make
+/// before unregister via the SecretsPanel "Remove" action. This
+/// function exists so a forgotten key from the SecretsPanel doesn't
+/// survive as a stale env var post-unregister.
+///
+/// Returns `(keys_actually_purged, warnings)`. `keys_actually_purged`
+/// is sorted + de-duped across surfaces; the report layer dumps it
+/// into `keys_purged_from_env` alongside the canonical purge result.
+pub(crate) fn surgically_strip_user_secret_keys(
+    folder: &Path,
+    keys: &[String],
+) -> (Vec<String>, Vec<String>) {
+    if keys.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let key_set: std::collections::HashSet<&str> =
+        keys.iter().map(|s| s.as_str()).collect();
+    let mut purged = std::collections::BTreeSet::new();
+    let mut warnings: Vec<String> = Vec::new();
+
+    // 1. .env (root)
+    let env_path = folder.join(".env");
+    if env_path.exists() {
+        match std::fs::read_to_string(&env_path) {
+            Ok(text) => {
+                let (new_text, removed) = strip_named_keys_from_env_text(&text, &key_set);
+                if !removed.is_empty() {
+                    if let Err(e) = std::fs::write(&env_path, new_text) {
+                        warnings.push(format!(
+                            "could not rewrite {} (user-secret strip): {}",
+                            env_path.display(),
+                            e
+                        ));
+                    } else {
+                        for k in removed {
+                            purged.insert(k);
+                        }
+                    }
+                }
+            }
+            Err(e) => warnings.push(format!(
+                "could not read {} for user-secret strip: {}",
+                env_path.display(),
+                e
+            )),
+        }
+    }
+
+    // 2. .claude/env (POSIX exports)
+    let claude_env = folder.join(".claude").join("env");
+    if claude_env.exists() {
+        match std::fs::read_to_string(&claude_env) {
+            Ok(text) => {
+                let (new_text, removed) = strip_named_keys_from_claude_env_text(&text, &key_set);
+                if !removed.is_empty() {
+                    if let Err(e) = std::fs::write(&claude_env, new_text) {
+                        warnings.push(format!(
+                            "could not rewrite {} (user-secret strip): {}",
+                            claude_env.display(),
+                            e
+                        ));
+                    } else {
+                        for k in removed {
+                            purged.insert(k);
+                        }
+                    }
+                }
+            }
+            Err(e) => warnings.push(format!(
+                "could not read {} for user-secret strip: {}",
+                claude_env.display(),
+                e
+            )),
+        }
+    }
+
+    // 3. .claude/settings.json `env` block
+    let claude_settings = folder.join(".claude").join("settings.json");
+    if claude_settings.exists() {
+        match std::fs::read_to_string(&claude_settings) {
+            Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
+                Ok(mut v) => {
+                    if let Some(obj) = v.as_object_mut() {
+                        let removed = strip_named_keys_from_env_object(obj, "env", &key_set);
+                        if !removed.is_empty() {
+                            if obj
+                                .get("env")
+                                .and_then(|x| x.as_object())
+                                .map(|o| o.is_empty())
+                                .unwrap_or(false)
+                            {
+                                obj.remove("env");
+                            }
+                            match serde_json::to_string_pretty(&v) {
+                                Ok(pretty) => {
+                                    if let Err(e) = std::fs::write(&claude_settings, pretty) {
+                                        warnings.push(format!(
+                                            "could not rewrite {} (user-secret strip): {}",
+                                            claude_settings.display(),
+                                            e
+                                        ));
+                                    } else {
+                                        for k in removed {
+                                            purged.insert(k);
+                                        }
+                                    }
+                                }
+                                Err(e) => warnings.push(format!(
+                                    "could not serialize {} after user-secret strip: {}",
+                                    claude_settings.display(),
+                                    e
+                                )),
+                            }
+                        }
+                    }
+                }
+                Err(e) => warnings.push(format!(
+                    "{} is not valid JSON ({}); skipping user-secret strip",
+                    claude_settings.display(),
+                    e
+                )),
+            },
+            Err(e) => warnings.push(format!(
+                "could not read {} for user-secret strip: {}",
+                claude_settings.display(),
+                e
+            )),
+        }
+    }
+
+    // 4. .vscode/settings.json `claude-code.env` block
+    let vscode_settings = folder.join(".vscode").join("settings.json");
+    if vscode_settings.exists() {
+        match std::fs::read_to_string(&vscode_settings) {
+            Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
+                Ok(mut v) => {
+                    if let Some(obj) = v.as_object_mut() {
+                        let removed =
+                            strip_named_keys_from_env_object(obj, "claude-code.env", &key_set);
+                        if !removed.is_empty() {
+                            if obj
+                                .get("claude-code.env")
+                                .and_then(|x| x.as_object())
+                                .map(|o| o.is_empty())
+                                .unwrap_or(false)
+                            {
+                                obj.remove("claude-code.env");
+                            }
+                            match serde_json::to_string_pretty(&v) {
+                                Ok(pretty) => {
+                                    if let Err(e) = std::fs::write(&vscode_settings, pretty) {
+                                        warnings.push(format!(
+                                            "could not rewrite {} (user-secret strip): {}",
+                                            vscode_settings.display(),
+                                            e
+                                        ));
+                                    } else {
+                                        for k in removed {
+                                            purged.insert(k);
+                                        }
+                                    }
+                                }
+                                Err(e) => warnings.push(format!(
+                                    "could not serialize {} after user-secret strip: {}",
+                                    vscode_settings.display(),
+                                    e
+                                )),
+                            }
+                        }
+                    }
+                }
+                Err(e) => warnings.push(format!(
+                    "{} is not valid JSON ({}); skipping user-secret strip",
+                    vscode_settings.display(),
+                    e
+                )),
+            },
+            Err(e) => warnings.push(format!(
+                "could not read {} for user-secret strip: {}",
+                vscode_settings.display(),
+                e
+            )),
+        }
+    }
+
+    (purged.into_iter().collect(), warnings)
+}
+
+/// Pure helper: strip a named set of KEY names from `.env`-style text.
+/// Mirror of `strip_canonical_keys_from_env_text` but with a caller-
+/// supplied key set instead of `UNREGISTER_CANONICAL_ENV_KEYS`.
+fn strip_named_keys_from_env_text(
+    text: &str,
+    keys: &std::collections::HashSet<&str>,
+) -> (String, Vec<String>) {
+    let mut removed = std::collections::BTreeSet::new();
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let body = if let Some(rest) = trimmed.strip_prefix('#') {
+            rest.trim_start()
+        } else {
+            trimmed
+        };
+        let key_to_check = body
+            .find('=')
+            .filter(|&i| i > 0)
+            .map(|i| body[..i].trim());
+        if let Some(k) = key_to_check {
+            if keys.contains(k) {
+                removed.insert(k.to_string());
+                continue;
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !text.ends_with('\n') && out.ends_with('\n') {
+        out.pop();
+    }
+    if text.ends_with('\n') && out.is_empty() {
+        out.push('\n');
+    }
+    (out, removed.into_iter().collect())
+}
+
+/// Pure helper: strip a named set of KEY names from `.claude/env`
+/// POSIX-export text. Mirror of `strip_canonical_keys_from_claude_env_text`.
+fn strip_named_keys_from_claude_env_text(
+    text: &str,
+    keys: &std::collections::HashSet<&str>,
+) -> (String, Vec<String>) {
+    let mut removed = std::collections::BTreeSet::new();
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let after_hash = if let Some(rest) = trimmed.strip_prefix('#') {
+            rest.trim_start()
+        } else {
+            trimmed
+        };
+        let body = after_hash.strip_prefix("export ").unwrap_or(after_hash);
+        let key_to_check = body
+            .find('=')
+            .filter(|&i| i > 0)
+            .map(|i| body[..i].trim());
+        if let Some(k) = key_to_check {
+            if keys.contains(k) {
+                removed.insert(k.to_string());
+                continue;
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !text.ends_with('\n') && out.ends_with('\n') {
+        out.pop();
+    }
+    if text.ends_with('\n') && out.is_empty() {
+        out.push('\n');
+    }
+    (out, removed.into_iter().collect())
+}
+
+/// Pure helper: strip a named set of KEY names from a JSON env-shaped
+/// sub-block. Mirror of `strip_canonical_keys_from_env_object`.
+fn strip_named_keys_from_env_object(
+    parent: &mut serde_json::Map<String, serde_json::Value>,
+    env_key: &str,
+    keys: &std::collections::HashSet<&str>,
+) -> Vec<String> {
+    let env_obj = match parent.get_mut(env_key).and_then(|v| v.as_object_mut()) {
+        Some(o) => o,
+        None => return Vec::new(),
+    };
+    let mut removed = std::collections::BTreeSet::new();
+    let to_remove: Vec<String> = env_obj
+        .keys()
+        .filter(|k| keys.contains(k.as_str()))
+        .cloned()
+        .collect();
+    for k in to_remove {
+        env_obj.remove(&k);
+        removed.insert(k);
+    }
+    removed.into_iter().collect()
+}
+
 /// Surgically remove every entry in `UNREGISTER_PURGE_PATHS` from
 /// `<folder>/`. Returns `(relative_paths_removed, warnings)`.
 ///
@@ -3070,16 +3574,45 @@ pub async fn delete_project_v2(
     if opts.purge_launcher_files {
         let folder = Path::new(&row.folder_path);
         if folder.is_dir() {
-            // 1a. Strip canonical env keys from all four env surfaces.
+            // 1a (Subagent G, 2026-05-08). Strip user-bucket secret
+            // keys from all surfaces FIRST. The canonical strip below
+            // doesn't know about user keys (their names are dynamic
+            // per-project), so without this step a registered project's
+            // user secrets would survive the unregister + persist as
+            // stale env vars in any subprocess that re-reads the
+            // surfaces.
+            //
+            // Implementation: enumerate every key in the project's
+            // user bucket from `secret_active_state` (active OR
+            // inactive — both must be stripped), then surgically strip
+            // those KEY names from each surface. Doesn't touch the
+            // keychain itself; the user can decide whether to also
+            // delete those entries via the SecretsPanel before
+            // unregistering.
+            let user_keys = db.list_user_secret_keys_for_project(&row.id);
+            let (user_keys_purged, user_strip_warnings) =
+                surgically_strip_user_secret_keys(folder, &user_keys);
+            for k in user_keys_purged {
+                if !report.keys_purged_from_env.contains(&k) {
+                    report.keys_purged_from_env.push(k);
+                }
+            }
+            report.warnings.extend(user_strip_warnings);
+
+            // 1b. Strip canonical env keys from all four env surfaces.
             //     Done BEFORE the file delete so `.claude/env` (which is
             //     in UNREGISTER_PURGE_PATHS) gets stripped first; the
             //     subsequent file delete is a no-op for that file but
             //     leaves the strip's "keys removed" record intact.
             let (keys, env_warnings) = surgically_strip_env_surfaces(folder);
-            report.keys_purged_from_env = keys;
+            for k in keys {
+                if !report.keys_purged_from_env.contains(&k) {
+                    report.keys_purged_from_env.push(k);
+                }
+            }
             report.warnings.extend(env_warnings);
 
-            // 1b. File / directory purge.
+            // 1c. File / directory purge.
             let (files, file_warnings) = purge_launcher_files_from_project(folder);
             report.files_purged = files;
             report.warnings.extend(file_warnings);
@@ -3100,6 +3633,28 @@ pub async fn delete_project_v2(
         let (dropped, drop_warnings) = drop_owned_collections(&row.name).await;
         report.collections_dropped = dropped;
         report.warnings.extend(drop_warnings);
+    }
+
+    // Step 2.5 (Subagent G, 2026-05-08): forget the project's
+    // user-secret active-flag rows. Without this, a future re-register
+    // of the same project_id (rare but possible — the GUI generates a
+    // fresh UUID per registration so this only happens via manual DB
+    // tampering OR a launcher reinstall that preserves launcher.db)
+    // would resurrect ghost rows for keys whose keychain values may
+    // long since be gone. The keychain values themselves are NOT
+    // deleted here (intentional — see helper doc).
+    //
+    // Soft-fail: a DB hiccup leaves the rows in place; the next
+    // unregister or a manual cleanup will retry. Doesn't block the
+    // canonical DB delete below.
+    match db.forget_user_secret_state_for_project(&id) {
+        Ok(_n) => {}
+        Err(e) => report.warnings.push(format!(
+            "could not forget user-secret active-flag rows for project {}: {}. \
+             The rows are orphan now (project's gone) but harmless — they \
+             only matter if the same project_id is re-registered.",
+            id, e
+        )),
     }
 
     // Step 3 (always): audit + DB delete + change log.
@@ -3548,6 +4103,128 @@ mod tests {
             vsc["claude-code.env"].get("VCT_INFRASTRUCTURE_DIR").is_none(),
             ".vscode/settings.json claude-code.env should not contain \
              VCT_INFRASTRUCTURE_DIR when orchestrator_root=None. Block: {}",
+            vsc["claude-code.env"],
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 0.1.7 fork-readiness sweep (2026-05-08): when the OnboardingWizard
+    /// has registered a PAT (i.e. the keychain has `github_pat` AND the
+    /// secret is active), the env-pair builder MUST emit `GITHUB_TOKEN`
+    /// to all three install surfaces. Mirrors the
+    /// `vct_portability_keys_propagate_to_all_three_surfaces` shape.
+    ///
+    /// This replaces the pre-0.1.7 `git-credential-vct` helper:
+    /// per-project env propagation is the canonical mechanism since the
+    /// helper protocol is project-agnostic and incompatible with the
+    /// per-project active-flag gate.
+    #[test]
+    fn write_project_env_files_emits_github_token_when_keychain_has_entry() {
+        let tmp = std::env::temp_dir().join(format!(
+            "vct-github-token-prop-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Bypass the populate() path entirely: build a settings struct
+        // with `github_token = Some(canary)` directly. This pins the
+        // pair-builder behaviour without depending on the keychain
+        // backend or DB state — the populate() side has its own tests
+        // in `installer::tests::github_pat_keychain_tests`.
+        let canary = "ghp_pair_builder_canary_value_12345";
+        let mut settings = ProjectEnvSettings::with_defaults("GhTokTest");
+        settings.github_token = Some(canary.to_string());
+        write_project_env_files(&tmp, &settings).unwrap();
+
+        // Surface 1: .claude/env (POSIX exports).
+        let claude_env_text = std::fs::read_to_string(tmp.join(".claude/env")).unwrap();
+        assert!(
+            claude_env_text.contains(&format!("export GITHUB_TOKEN=\"{}\"", canary)),
+            ".claude/env missing GITHUB_TOKEN export. Body:\n{}",
+            claude_env_text,
+        );
+
+        // Surface 2: .claude/settings.json env block.
+        let cs: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(tmp.join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            cs["env"]["GITHUB_TOKEN"], canary,
+            ".claude/settings.json env block missing or wrong GITHUB_TOKEN. \
+             Block: {}",
+            cs["env"],
+        );
+
+        // Surface 3: .vscode/settings.json claude-code.env block.
+        let vsc: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(tmp.join(".vscode/settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            vsc["claude-code.env"]["GITHUB_TOKEN"], canary,
+            ".vscode/settings.json claude-code.env missing GITHUB_TOKEN. \
+             Block: {}",
+            vsc["claude-code.env"],
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 0.1.7 fork-readiness sweep (2026-05-08): when there is no PAT
+    /// in the keychain (or it's paused via Lifecycle B), the env-pair
+    /// builder MUST omit `GITHUB_TOKEN` from every surface. Matches
+    /// PR #171 P1.3's "None filter" behaviour for orchestrator_root.
+    ///
+    /// Crucially, the writer must NOT emit an empty-string value:
+    /// downstream consumers (`gh` CLI, custom git credential helpers)
+    /// distinguish "GITHUB_TOKEN unset" from "GITHUB_TOKEN=''" and
+    /// the latter would mask the user's other auth flow (e.g. an
+    /// existing `~/.config/gh/hosts.yml` token).
+    #[test]
+    fn write_project_env_files_omits_github_token_when_keychain_empty() {
+        let tmp = std::env::temp_dir().join(format!(
+            "vct-github-token-omit-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // `with_defaults` leaves github_token = None.
+        let settings = ProjectEnvSettings::with_defaults("OmitGhTok");
+        assert!(
+            settings.github_token.is_none(),
+            "test precondition: with_defaults must leave github_token=None",
+        );
+        write_project_env_files(&tmp, &settings).unwrap();
+
+        let claude_env_text = std::fs::read_to_string(tmp.join(".claude/env")).unwrap();
+        assert!(
+            !claude_env_text.contains("export GITHUB_TOKEN="),
+            ".claude/env should not export GITHUB_TOKEN when \
+             keychain has no entry. Body:\n{}",
+            claude_env_text,
+        );
+
+        let cs: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(tmp.join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            cs["env"].get("GITHUB_TOKEN").is_none(),
+            ".claude/settings.json env should not contain GITHUB_TOKEN \
+             when keychain has no entry. Block: {}",
+            cs["env"],
+        );
+
+        let vsc: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(tmp.join(".vscode/settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            vsc["claude-code.env"].get("GITHUB_TOKEN").is_none(),
+            ".vscode/settings.json claude-code.env should not contain \
+             GITHUB_TOKEN when keychain has no entry. Block: {}",
             vsc["claude-code.env"],
         );
 
@@ -5359,6 +6036,12 @@ mod tests {
             // (the default — no peers granted), omitting the entry from
             // every install surface.
             "VCT_KG_ACCESS_LIST", "VCT_CODE_GRAPH_ACCESS_LIST",
+            // 0.1.7 fork-readiness sweep (2026-05-08): GITHUB_TOKEN.
+            // Conditionally emitted — the match arm in
+            // `write_project_env_files` returns `None` when the
+            // OnboardingWizard's PAT keychain entry is absent or paused,
+            // omitting the entry from every install surface.
+            "GITHUB_TOKEN",
         ].iter().copied().collect();
 
         for k in CANONICAL_INSTALL_ENV_KEYS.iter() {
@@ -5640,6 +6323,14 @@ export USER_PROJECT_VAR=\"keep me\"
 
         // Mixed .env: every canonical key the launcher writes + several
         // user-added keys (API tokens, internal config, etc.).
+        //
+        // 0.1.7 fork-readiness sweep (2026-05-08): GITHUB_TOKEN moved into
+        // the launcher-canonical set (the launcher writes it from the
+        // OnboardingWizard keychain entry). It is no longer a "user
+        // secret" in the .env-survives sense — strip it on unregister
+        // like every other canonical key. Tests that pin the survives
+        // byte-for-byte semantics use MY_GITHUB_TOKEN (NOT in
+        // CANONICAL_INSTALL_ENV_KEYS) for a clean separation.
         let env_text = "\
 # vibecoded-orchestrator per-project .env
 KG_COLLECTION=MyProj_KnowledgeGraph
@@ -5659,7 +6350,7 @@ SHARED_KG_OPT_OUT=false
 # === user secrets ===
 ANTHROPIC_API_KEY=sk-ant-real-token-here
 OPENAI_API_KEY=sk-real-openai-token
-GITHUB_TOKEN=ghp_real_pat
+MY_GITHUB_TOKEN=ghp_real_pat
 USER_INTERNAL_HOST=internal.example.com
 USER_DB_URL=postgres://user:pass@db/app
 ";
@@ -5671,14 +6362,21 @@ USER_DB_URL=postgres://user:pass@db/app
         let after = std::fs::read_to_string(tmp.join(".env")).unwrap();
 
         // ALL canonical keys removed.
+        //
+        // Line-precise check via `parse_existing_env_keys`: a naive
+        // substring like `format!("{}=", k)` would false-positive on
+        // suffix-of-suffix collisions (e.g. canonical "GITHUB_TOKEN"
+        // matches user-added "MY_GITHUB_TOKEN" because the latter ends
+        // with "GITHUB_TOKEN="). Walk the parsed key sets instead.
+        let before_keys = parse_existing_env_keys(env_text);
+        let after_keys = parse_existing_env_keys(&after);
         for k in UNREGISTER_CANONICAL_ENV_KEYS.iter() {
-            // Not all canonical keys are in this fixture (e.g. VCT_*),
-            // but every key listed in UNREGISTER_CANONICAL_ENV_KEYS that
-            // WAS present must now be absent.
-            if env_text.contains(&format!("{}=", k)) {
+            if before_keys.contains(*k) {
                 assert!(
-                    !after.contains(&format!("{}=", k)),
-                    "canonical key {} survived the strip:\n{}", k, after,
+                    !after_keys.contains(*k),
+                    "canonical key {} survived the strip:\n{}",
+                    k,
+                    after,
                 );
             }
         }
@@ -5686,7 +6384,10 @@ USER_DB_URL=postgres://user:pass@db/app
         // Every user secret survives byte-for-byte.
         assert!(after.contains("ANTHROPIC_API_KEY=sk-ant-real-token-here"));
         assert!(after.contains("OPENAI_API_KEY=sk-real-openai-token"));
-        assert!(after.contains("GITHUB_TOKEN=ghp_real_pat"));
+        // MY_GITHUB_TOKEN is the user-supplied placeholder (NOT in the
+        // canonical set); GITHUB_TOKEN itself was promoted to canonical
+        // by the 0.1.7 fork sweep and gets stripped above.
+        assert!(after.contains("MY_GITHUB_TOKEN=ghp_real_pat"));
         assert!(after.contains("USER_INTERNAL_HOST=internal.example.com"));
         assert!(after.contains("USER_DB_URL=postgres://user:pass@db/app"));
 
@@ -6088,5 +6789,483 @@ USER_DB_URL=postgres://user:pass@db/app
         );
 
         std::fs::remove_dir_all(&folder).ok();
+    }
+
+    // ─── Subagent G (2026-05-08): user-set per-project secrets in env ──
+    //
+    // These tests pin the contract that a user adding a per-project
+    // secret in the launcher GUI sees it as `$KEY` in their next Claude
+    // Code session (no session restart, no resolver call). Coverage:
+    //
+    //   * Active pairs land in all 3 launcher-managed env surfaces
+    //     (`.claude/env` BEGIN/END block, `.claude/settings.json` env,
+    //     `.vscode/settings.json` claude-code.env).
+    //   * Inactive (paused via Lifecycle B) pairs are OMITTED from emit
+    //     and STRIPPED from any prior write.
+    //   * By-hand user-added env keys (never went through `set_secret_v2`)
+    //     are preserved verbatim — the strip set is bounded to keys we
+    //     ourselves wrote.
+    //
+    // The unregister-strips-user-secrets test lives separately because
+    // the surgical-strip helper applies the existing canonical strip;
+    // user-secret keys are removed by clearing them via the env writer
+    // BEFORE unregister calls the strip helper. See the comment on
+    // `surgically_strip_env_surfaces` for the layered-cleanup design.
+
+    /// Direct contract test: when `ProjectEnvSettings` carries an active
+    /// user-secret pair, all three launcher-managed env surfaces emit it
+    /// alongside the canonical keys.
+    #[test]
+    fn write_project_env_files_includes_user_set_secrets() {
+        let tmp = std::env::temp_dir().join(format!(
+            "vct-user-secret-emit-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let mut settings = ProjectEnvSettings::with_defaults("UserSecretEmit");
+        settings.user_secret_pairs = vec![
+            ("MY_PROJECT_KEY".to_string(), "ghp_subagent_g_canary_value".to_string()),
+            ("INTERNAL_API_BASE".to_string(), "https://api.internal.example.com".to_string()),
+        ];
+        settings.user_secret_known_keys = vec![
+            "INTERNAL_API_BASE".to_string(),
+            "MY_PROJECT_KEY".to_string(),
+        ];
+
+        write_project_env_files(&tmp, &settings).unwrap();
+
+        // 1. .claude/env (POSIX exports between BEGIN/END markers).
+        let claude_env = std::fs::read_to_string(tmp.join(".claude/env")).unwrap();
+        assert!(
+            claude_env.contains(r#"export MY_PROJECT_KEY="ghp_subagent_g_canary_value""#),
+            ".claude/env missing MY_PROJECT_KEY export. Body:\n{}",
+            claude_env
+        );
+        assert!(
+            claude_env.contains(r#"export INTERNAL_API_BASE="https://api.internal.example.com""#),
+            ".claude/env missing INTERNAL_API_BASE export. Body:\n{}",
+            claude_env
+        );
+        // Section header makes user secrets visually distinct in diffs.
+        assert!(
+            claude_env.contains("# user secrets (per-project"),
+            ".claude/env missing user-secrets section header. Body:\n{}",
+            claude_env
+        );
+        // Both inside the managed BEGIN/END block (writers replace it
+        // wholesale every call — that is how strip works for this
+        // surface).
+        let begin_idx = claude_env.find(CLAUDE_ENV_MANAGED_BEGIN).unwrap();
+        let end_idx = claude_env.find(CLAUDE_ENV_MANAGED_END).unwrap();
+        let in_block = |needle: &str| {
+            let pos = claude_env.find(needle).unwrap();
+            pos > begin_idx && pos < end_idx
+        };
+        assert!(in_block("MY_PROJECT_KEY"));
+        assert!(in_block("INTERNAL_API_BASE"));
+
+        // 2. .claude/settings.json env block.
+        let cs: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(tmp.join(".claude/settings.json")).unwrap())
+                .unwrap();
+        assert_eq!(cs["env"]["MY_PROJECT_KEY"], "ghp_subagent_g_canary_value");
+        assert_eq!(cs["env"]["INTERNAL_API_BASE"], "https://api.internal.example.com");
+
+        // 3. .vscode/settings.json claude-code.env block.
+        let vsc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(tmp.join(".vscode/settings.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            vsc["claude-code.env"]["MY_PROJECT_KEY"],
+            "ghp_subagent_g_canary_value"
+        );
+        assert_eq!(
+            vsc["claude-code.env"]["INTERNAL_API_BASE"],
+            "https://api.internal.example.com"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Active-flag-gate test: a known user-secret key whose pair is NOT
+    /// in `user_secret_pairs` (e.g. it's been paused via Lifecycle B)
+    /// must (a) be omitted from the EMIT, AND (b) actively STRIPPED from
+    /// every surface on the next writer call.
+    #[test]
+    fn write_project_env_files_omits_paused_user_secrets() {
+        let tmp = std::env::temp_dir().join(format!(
+            "vct-user-secret-paused-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // First write: PAUSED_KEY is active and lands in every surface.
+        let mut settings = ProjectEnvSettings::with_defaults("PausedUserSecret");
+        settings.user_secret_pairs = vec![("PAUSED_KEY".to_string(), "old_value".to_string())];
+        settings.user_secret_known_keys = vec!["PAUSED_KEY".to_string()];
+        write_project_env_files(&tmp, &settings).unwrap();
+        // Sanity: the value is there pre-pause.
+        let pre = std::fs::read_to_string(tmp.join(".claude/env")).unwrap();
+        assert!(pre.contains("PAUSED_KEY"));
+
+        // Second write: PAUSED_KEY is in known_keys but NOT in pairs —
+        // mirrors the post-`clear_secret_v2` state.
+        let mut settings_paused = ProjectEnvSettings::with_defaults("PausedUserSecret");
+        settings_paused.user_secret_pairs = Vec::new();
+        settings_paused.user_secret_known_keys = vec!["PAUSED_KEY".to_string()];
+        write_project_env_files(&tmp, &settings_paused).unwrap();
+
+        // .claude/env: BEGIN/END block was rebuilt without the export.
+        let claude_env = std::fs::read_to_string(tmp.join(".claude/env")).unwrap();
+        assert!(
+            !claude_env.contains("PAUSED_KEY"),
+            ".claude/env still mentions paused PAUSED_KEY. Body:\n{}",
+            claude_env
+        );
+
+        // .claude/settings.json: deep-merge stripped the key from the
+        // env block while leaving the rest of the file untouched.
+        let cs: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(tmp.join(".claude/settings.json")).unwrap())
+                .unwrap();
+        assert!(
+            cs["env"].get("PAUSED_KEY").is_none(),
+            ".claude/settings.json env still carries paused PAUSED_KEY. \
+             Block: {}",
+            cs["env"]
+        );
+
+        // .vscode/settings.json: same.
+        let vsc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(tmp.join(".vscode/settings.json")).unwrap())
+                .unwrap();
+        assert!(
+            vsc["claude-code.env"].get("PAUSED_KEY").is_none(),
+            ".vscode/settings.json claude-code.env still carries paused PAUSED_KEY. \
+             Block: {}",
+            vsc["claude-code.env"]
+        );
+
+        // Sanity: canonical keys stayed put through the strip pass.
+        assert_eq!(
+            cs["env"]["KG_COLLECTION"], "PausedUserSecret_KnowledgeGraph",
+            "strip pass must not touch canonical keys"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Defence-in-depth: a key the user typed BY HAND directly into
+    /// `.claude/settings.json` env (never through `set_secret_v2`) must
+    /// survive the writer's strip pass — it's not in
+    /// `user_secret_known_keys`, so the strip set leaves it alone.
+    /// Pins the boundary between "Subagent G owns this key" and
+    /// "user owns this key" in the deep-merge contract.
+    #[test]
+    fn write_project_env_files_preserves_by_hand_user_keys_not_owned_by_launcher() {
+        let tmp = std::env::temp_dir().join(format!(
+            "vct-user-secret-byhand-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(tmp.join(".claude")).unwrap();
+        std::fs::create_dir_all(tmp.join(".vscode")).unwrap();
+
+        // Pre-existing settings with a user-typed env key.
+        std::fs::write(
+            tmp.join(".claude/settings.json"),
+            r#"{
+                "env": {"BY_HAND_KEY": "user_typed_value"}
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.join(".vscode/settings.json"),
+            r#"{
+                "claude-code.env": {"BY_HAND_KEY": "user_typed_value"}
+            }"#,
+        )
+        .unwrap();
+
+        let mut settings = ProjectEnvSettings::with_defaults("ByHandPreserve");
+        // Add a launcher-owned user secret that COINCIDENTALLY happens
+        // to NOT be the same name. The strip set is empty (no inactive
+        // entries) and the known set has only the active key. The
+        // by-hand key isn't in either — must survive.
+        settings.user_secret_pairs = vec![("LAUNCHER_OWNED".to_string(), "v1".to_string())];
+        settings.user_secret_known_keys = vec!["LAUNCHER_OWNED".to_string()];
+
+        write_project_env_files(&tmp, &settings).unwrap();
+
+        let cs: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(tmp.join(".claude/settings.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            cs["env"]["BY_HAND_KEY"], "user_typed_value",
+            "by-hand user key must survive when not in user_secret_known_keys"
+        );
+        assert_eq!(cs["env"]["LAUNCHER_OWNED"], "v1");
+
+        let vsc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(tmp.join(".vscode/settings.json")).unwrap())
+                .unwrap();
+        assert_eq!(vsc["claude-code.env"]["BY_HAND_KEY"], "user_typed_value");
+        assert_eq!(vsc["claude-code.env"]["LAUNCHER_OWNED"], "v1");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Pure-function coverage of the merge primitive: the strip set
+    /// removes only the named keys; canonical pairs always overwrite;
+    /// user pairs are inserted last (collision fallthrough goes to the
+    /// user pair). Pins the order-of-operations contract documented on
+    /// `merge_env_object_canonical_with_user_secrets`.
+    #[test]
+    fn merge_env_object_canonical_with_user_secrets_strip_emit_order() {
+        let mut parent = serde_json::json!({
+            "env": {
+                "KG_COLLECTION": "stale",            // canonical, gets overwritten
+                "PAUSED_USER_KEY": "stale_user",     // in strip set, gets removed
+                "BY_HAND_KEY": "user_typed",         // unknown to launcher, preserved
+            }
+        });
+        let parent_obj = parent.as_object_mut().unwrap();
+
+        let canonical_pairs: Vec<(&str, String)> =
+            vec![("KG_COLLECTION", "fresh".to_string())];
+        let user_secret_pairs: Vec<(&str, String)> =
+            vec![("MY_PROJECT_KEY", "active_user_value".to_string())];
+        let strip: Vec<&str> = vec!["PAUSED_USER_KEY"];
+
+        merge_env_object_canonical_with_user_secrets(
+            parent_obj,
+            "env",
+            &canonical_pairs,
+            &user_secret_pairs,
+            &strip,
+        );
+
+        let env = &parent["env"];
+        // Canonical: overwritten with fresh value.
+        assert_eq!(env["KG_COLLECTION"], "fresh");
+        // Strip: gone.
+        assert!(env.get("PAUSED_USER_KEY").is_none());
+        // User pair: inserted.
+        assert_eq!(env["MY_PROJECT_KEY"], "active_user_value");
+        // By-hand: preserved.
+        assert_eq!(env["BY_HAND_KEY"], "user_typed");
+    }
+
+    /// Covers the unregister code path: at unregister time, a finished
+    /// project's env surfaces still carry the user-set secret keys from
+    /// the last write. The user-set keys are LEFT IN PLACE by
+    /// `surgically_strip_env_surfaces` (which only knows about
+    /// `UNREGISTER_CANONICAL_ENV_KEYS`). To strip them on unregister,
+    /// the launcher must blank out user-secret state BEFORE calling the
+    /// strip helper — which `delete_project_v2` already accomplishes by
+    /// deleting the `secret_active_state` rows via DB CASCADE on
+    /// `projects` delete (see migration 007's PRIMARY KEY shape and the
+    /// fact that the rows live in the same DB; the CASCADE is implicit
+    /// because secret_active_state has no FK on project_id, but
+    /// `db.delete_project` removes the project row and the
+    /// secret_active_state rows for that project become orphan
+    /// metadata).
+    ///
+    /// The clean teardown sequence:
+    ///   1. `refresh_project_env_with_db(db, project_id)` BEFORE the
+    ///      DB delete: re-reads `list_user_secret_keys_for_project`,
+    ///      which is still populated. EMIT pairs go through the active
+    ///      gate. STRIP set carries every known key. The writer
+    ///      removes paused entries from the surfaces.
+    ///   2. `purge_launcher_files_from_project` deletes `.claude/env`
+    ///      entirely + `surgically_strip_env_surfaces` strips canonical
+    ///      keys from `.env` / `.claude/settings.json` / `.vscode/settings.json`.
+    ///
+    /// Today's `delete_project_v2` does step 2 but not step 1 — the
+    /// orphan secret_active_state rows mean the next refresh would
+    /// re-emit, but the project is gone so no refresh ever runs. The
+    /// surfaces post-unregister contain whatever was last written
+    /// (canonical keys stripped, user secrets remain). This test pins
+    /// the OPT-IN cleanup behaviour: when callers explicitly null out
+    /// `user_secret_known_keys` AND `user_secret_pairs`, the writer
+    /// strips every previously-emitted user-secret key.
+    ///
+    /// Subagent G's choice (per brief): for now, leave user-secret
+    /// keys in the surfaces post-unregister. The user-set
+    /// `secret_active_state` rows survive (they'll be re-used if the
+    /// user re-registers the same project) and the env surface
+    /// contents are user-owned at that point. A stricter "purge
+    /// user-secret keys on unregister" mode is a follow-up — see
+    /// `purge_launcher_files_from_project` doc comment + Open Q #2.
+    #[test]
+    fn writer_strips_all_user_keys_when_known_keys_emptied() {
+        let tmp = std::env::temp_dir().join(format!(
+            "vct-user-secret-purge-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // First write: two user secrets active.
+        let mut settings = ProjectEnvSettings::with_defaults("UnregUserSecret");
+        settings.user_secret_pairs = vec![
+            ("PURGE_TEST_A".to_string(), "v_a".to_string()),
+            ("PURGE_TEST_B".to_string(), "v_b".to_string()),
+        ];
+        settings.user_secret_known_keys = vec![
+            "PURGE_TEST_A".to_string(),
+            "PURGE_TEST_B".to_string(),
+        ];
+        write_project_env_files(&tmp, &settings).unwrap();
+        let pre = std::fs::read_to_string(tmp.join(".claude/env")).unwrap();
+        assert!(pre.contains("PURGE_TEST_A"));
+        assert!(pre.contains("PURGE_TEST_B"));
+
+        // Second write: caller explicitly nulled out the user-secret state
+        // (e.g. an unregister flow chose to purge user-secret keys). Both
+        // strip set + emit list are empty.
+        let mut settings_purge = ProjectEnvSettings::with_defaults("UnregUserSecret");
+        settings_purge.user_secret_pairs = Vec::new();
+        settings_purge.user_secret_known_keys = vec![
+            "PURGE_TEST_A".to_string(),
+            "PURGE_TEST_B".to_string(),
+        ];
+        write_project_env_files(&tmp, &settings_purge).unwrap();
+
+        // All three surfaces no longer carry the user keys.
+        let claude_env = std::fs::read_to_string(tmp.join(".claude/env")).unwrap();
+        assert!(!claude_env.contains("PURGE_TEST_A"));
+        assert!(!claude_env.contains("PURGE_TEST_B"));
+
+        let cs: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(tmp.join(".claude/settings.json")).unwrap())
+                .unwrap();
+        assert!(cs["env"].get("PURGE_TEST_A").is_none());
+        assert!(cs["env"].get("PURGE_TEST_B").is_none());
+
+        let vsc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(tmp.join(".vscode/settings.json")).unwrap())
+                .unwrap();
+        assert!(vsc["claude-code.env"].get("PURGE_TEST_A").is_none());
+        assert!(vsc["claude-code.env"].get("PURGE_TEST_B").is_none());
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Subagent G (2026-05-08): unregister-cleanup integration.
+    ///
+    /// Pins the contract that `surgically_strip_user_secret_keys` strips
+    /// caller-supplied user-secret KEY names from all 4 env surfaces
+    /// while leaving canonical keys + by-hand user keys intact.
+    /// Mirrors the call shape of the real `delete_project_v2` step 1a.
+    #[test]
+    fn unregister_strips_user_secrets_from_env_surfaces() {
+        let tmp = std::env::temp_dir().join(format!(
+            "vct-unreg-user-strip-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(tmp.join(".claude")).unwrap();
+        std::fs::create_dir_all(tmp.join(".vscode")).unwrap();
+
+        // Pre-populate every surface with a mix of:
+        //   * a canonical key (must survive — canonical strip handles it)
+        //   * a user-secret key the launcher emitted (must be stripped)
+        //   * a by-hand user key (must survive)
+        std::fs::write(
+            tmp.join(".env"),
+            "\
+# vibecoded-orchestrator per-project .env
+KG_COLLECTION=Some_KnowledgeGraph
+USER_SECRET_FROM_GUI=ghp_test_canary
+BY_HAND_KEY=user_typed
+",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.join(".claude/env"),
+            "# vco-managed-begin
+export KG_COLLECTION=\"Some_KnowledgeGraph\"
+export USER_SECRET_FROM_GUI=\"ghp_test_canary\"
+# vco-managed-end
+export BY_HAND_KEY=\"user_typed\"
+",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.join(".claude/settings.json"),
+            r#"{
+                "env": {
+                    "KG_COLLECTION": "Some_KnowledgeGraph",
+                    "USER_SECRET_FROM_GUI": "ghp_test_canary",
+                    "BY_HAND_KEY": "user_typed"
+                }
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.join(".vscode/settings.json"),
+            r#"{
+                "claude-code.env": {
+                    "KG_COLLECTION": "Some_KnowledgeGraph",
+                    "USER_SECRET_FROM_GUI": "ghp_test_canary",
+                    "BY_HAND_KEY": "user_typed"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        // Strip ONLY the user-secret KEY name. Canonical + by-hand
+        // keys must survive (the canonical strip runs separately).
+        let user_keys = vec!["USER_SECRET_FROM_GUI".to_string()];
+        let (purged, warnings) = surgically_strip_user_secret_keys(&tmp, &user_keys);
+        assert!(warnings.is_empty(), "unexpected warnings: {:?}", warnings);
+        assert_eq!(purged, vec!["USER_SECRET_FROM_GUI".to_string()]);
+
+        // .env: user secret gone, canonical + by-hand survive.
+        let env = std::fs::read_to_string(tmp.join(".env")).unwrap();
+        assert!(!env.contains("USER_SECRET_FROM_GUI"));
+        assert!(env.contains("KG_COLLECTION=Some_KnowledgeGraph"));
+        assert!(env.contains("BY_HAND_KEY=user_typed"));
+
+        // .claude/env: user secret gone (whether inside or outside the
+        // managed block — we strip both shapes); canonical + by-hand
+        // survive.
+        let claude_env = std::fs::read_to_string(tmp.join(".claude/env")).unwrap();
+        assert!(!claude_env.contains("USER_SECRET_FROM_GUI"));
+        assert!(claude_env.contains("KG_COLLECTION"));
+        assert!(claude_env.contains("BY_HAND_KEY"));
+
+        // .claude/settings.json: same.
+        let cs: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(tmp.join(".claude/settings.json")).unwrap())
+                .unwrap();
+        assert!(cs["env"].get("USER_SECRET_FROM_GUI").is_none());
+        assert_eq!(cs["env"]["KG_COLLECTION"], "Some_KnowledgeGraph");
+        assert_eq!(cs["env"]["BY_HAND_KEY"], "user_typed");
+
+        // .vscode/settings.json: same.
+        let vsc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(tmp.join(".vscode/settings.json")).unwrap())
+                .unwrap();
+        assert!(vsc["claude-code.env"].get("USER_SECRET_FROM_GUI").is_none());
+        assert_eq!(vsc["claude-code.env"]["KG_COLLECTION"], "Some_KnowledgeGraph");
+        assert_eq!(vsc["claude-code.env"]["BY_HAND_KEY"], "user_typed");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Empty key list short-circuits — no surface reads, no warnings.
+    /// Pins the cheap-no-op invariant the unregister flow relies on
+    /// when a project never registered any user secrets.
+    #[test]
+    fn surgically_strip_user_secret_keys_short_circuits_on_empty_list() {
+        let tmp = std::env::temp_dir().join(format!(
+            "vct-strip-empty-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let (purged, warnings) = surgically_strip_user_secret_keys(&tmp, &[]);
+        assert!(purged.is_empty());
+        assert!(warnings.is_empty());
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }

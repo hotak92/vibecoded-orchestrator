@@ -227,11 +227,25 @@ if [ -n "$CONCEPTS" ]; then
     MATCH_COUNT=$(echo "$MATCHES" | grep -c "^knowledge/" 2>/dev/null || echo "0")
 
     if [ "$MATCH_COUNT" -ge 2 ]; then
-        echo ""
-        echo "💡 Found $MATCH_COUNT related patterns for: $CONCEPTS"
-        echo "$MATCHES" | sed 's/^/   /'
-        echo ""
-        echo "   Search more: 'Search knowledge graph for [concept]'"
-        echo ""
+        # PreToolUse hooks must wrap LLM-bound stdout in
+        # `hookSpecificOutput.additionalContext` — plain stdout is silently
+        # discarded by Claude Code's hook runner. Pre-fork-sweep this
+        # branch printed plaintext that never reached the LLM. Same fix
+        # class as pre-edit-context-inject (PR #168). 10k char cap matches
+        # that hook's contract. Falls back to no-op if python3 is missing.
+        SUGGESTION_TEXT=$(printf '\n💡 Found %s related patterns for: %s\n%s\n\n   Search more: '\''Search knowledge graph for [concept]'\''\n' "$MATCH_COUNT" "$CONCEPTS" "$(echo "$MATCHES" | sed 's/^/   /')")
+        if command -v python3 >/dev/null 2>&1; then
+            SUGGESTION_TRUNCATED=$(printf '%s' "$SUGGESTION_TEXT" | head -c 10000)
+            python3 -c "
+import json, sys
+print(json.dumps({
+    'hookSpecificOutput': {
+        'hookEventName': 'PreToolUse',
+        'permissionDecision': 'allow',
+        'additionalContext': sys.stdin.read(),
+    }
+}))
+" <<< "$SUGGESTION_TRUNCATED" 2>/dev/null || true
+        fi
     fi
 fi

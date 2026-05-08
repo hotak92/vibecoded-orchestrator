@@ -569,6 +569,13 @@ mod tests {
     // Process-wide serialisation for env-var-mutating tests. `HOME` and
     // `VCT_STATE_DIR` are global; if two tests change them concurrently
     // they race. The launcher's `paths.rs::tests` uses the same pattern.
+    //
+    // 0.1.7 H1: kept for backward-compat with any future test in this
+    // module that wants intra-module-only serialisation. Production
+    // tests now route through the shared
+    // `crate::secrets::test_serialize::keychain_serialize_lock` so they
+    // serialise against installer + modules_api hub-resolver tests too.
+    #[allow(dead_code)]
     static SERIALIZE: Mutex<()> = Mutex::new(());
 
     fn keyring_available() -> bool {
@@ -606,7 +613,14 @@ mod tests {
     }
 
     fn setup_temp_env() -> (std::path::PathBuf, EnvGuard) {
-        let lock = SERIALIZE.lock().expect("serialize lock");
+        // 0.1.7 H1 fork-readiness sweep (2026-05-08): use the process-wide
+        // keychain mutex from `crate::secrets::test_serialize` so the
+        // dashboard plaintext-migration tests serialise against installer
+        // and modules_api hub-resolver tests that hit the same keychain
+        // slots. The pre-H1 module-private `SERIALIZE` only blocked
+        // intra-module races — see the docstring on the new shared mutex
+        // in `secrets.rs::test_serialize` for the cross-module rationale.
+        let lock = crate::secrets::test_serialize::keychain_serialize_lock();
         let tmp = std::env::temp_dir().join(format!(
             "vct-dashboard-test-{}",
             uuid::Uuid::new_v4().simple()
