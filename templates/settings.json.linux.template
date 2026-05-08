@@ -84,6 +84,11 @@
             "type": "command",
             "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/compact-context-reinject.sh",
             "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/kg-update-nudge.sh",
+            "timeout": 4
           }
         ]
       }
@@ -124,6 +129,11 @@
             "type": "command",
             "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/diff-context-inject.sh",
             "timeout": 3
+          },
+          {
+            "type": "command",
+            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/kg-update-nudge.sh",
+            "timeout": 4
           }
         ]
       }
@@ -281,6 +291,17 @@
             "background": true
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/kg-update-nudge.sh",
+            "background": true,
+            "timeout": 3
+          }
+        ],
+        "matcher": "*"
       }
     ]
   },
