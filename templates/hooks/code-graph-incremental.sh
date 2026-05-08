@@ -25,7 +25,7 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 #   VCT_ANALYZER_SCRIPT  - path to analyze_code_graph.py
 #   VCT_PYTHON           - python interpreter (default: looks for .venv first)
 
-set -e
+set -euo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
 

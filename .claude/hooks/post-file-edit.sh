@@ -11,7 +11,7 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 # 4. Remind to update project expert when CONTEXT_STATE.md changes significantly
 # 5. Suggest workflow optimization when Skills/Agents/hooks are edited
 
-set -e
+set -euo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
 

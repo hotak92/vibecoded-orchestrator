@@ -7,7 +7,7 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 # Purpose: Display paths to relevant KG resources (no auto-loading)
 # Date: 2026-01-29
 
-set -e
+set -euo pipefail
 
 # Configuration
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
