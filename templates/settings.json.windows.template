@@ -55,6 +55,12 @@
           },
           {
             "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\verify-container-ports.ps1",
+            "timeout": 30,
+            "background": true
+          },
+          {
+            "type": "command",
             "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\ensure-code-embed-service.ps1",
             "timeout": 15,
             "background": true

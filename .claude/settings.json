@@ -54,6 +54,12 @@
           },
           {
             "type": "command",
+            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/verify-container-ports.sh",
+            "timeout": 30,
+            "background": true
+          },
+          {
+            "type": "command",
             "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/ensure-code-embed-service.sh",
             "timeout": 15,
             "background": true
