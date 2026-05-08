@@ -6027,12 +6027,17 @@ def _install_hooks_and_settings(args: argparse.Namespace) -> str:
     hooks_dst.mkdir(parents=True, exist_ok=True)
 
     installed_hooks = 0
-    skipped_hooks = 0
+    skipped_hooks = 0  # kept for the summary string; always 0 after the P2.2 fix.
     for hook_file in sorted(hooks_src.glob(hook_glob)):
         target = hooks_dst / hook_file.name
-        if target.exists():
-            skipped_hooks += 1
-            continue
+        # Always overwrite top-level hooks. Same rationale as `_lib/` below:
+        # hooks are NOT user-customisable; they're canonical orchestrator
+        # runtime. Pre-fix behaviour was skip-if-exists, which meant
+        # install.py re-runs never updated hooks — discovered after the
+        # 2026-05-08 stdin-JSON contract migration didn't reach
+        # already-installed orchestrators until users manually deleted hook
+        # files first. If a user truly needs to bypass a hook, the supported
+        # path is VCT_DISABLE_HOOKS=1, not hand-editing the file.
         # copy2 preserves the executable bit and mtime — important for hooks.
         shutil.copy2(hook_file, target)
         installed_hooks += 1
