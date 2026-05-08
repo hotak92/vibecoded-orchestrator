@@ -66,24 +66,24 @@
 <svelte:window onkeydown={handleKeydown} />
 
 {#if open && report?.kind === 'drift'}
-  <DialogRoot {open} onclose={close}>
-    <div class="cdi-drift-modal" role="alertdialog" aria-labelledby="cdi-drift-title">
+  {@const drift = report}
+  <DialogRoot bind:open onClose={close} width="720px">
+    {#snippet header()}
       <h2 id="cdi-drift-title">⚠️ NVIDIA / CDI version mismatch</h2>
-
-      <pre class="cdi-message">{report.message}</pre>
-
-      <div class="cdi-actions">
-        <button type="button" class="primary" onclick={close}>
-          Got it — I'll run the fix
-        </button>
-      </div>
-
+    {/snippet}
+    {#snippet body()}
+      <pre class="cdi-message">{drift.message}</pre>
       <p class="cdi-footnote">
         The launcher detected this once at startup. After you run the fix and
         restart the GPU containers, this dialog will not reappear unless the
         mismatch returns (e.g. after another driver upgrade).
       </p>
-    </div>
+    {/snippet}
+    {#snippet footer()}
+      <button type="button" class="primary" onclick={close}>
+        Got it — I'll run the fix
+      </button>
+    {/snippet}
   </DialogRoot>
 {/if}
 
