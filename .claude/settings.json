@@ -143,7 +143,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/pre-tool-use.sh \"$CLAUDE_TOOL_NAME\" \"$CLAUDE_USER_MESSAGE\" \"$CLAUDE_TOOL_ARGS\"",
+            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/pre-tool-use.sh \"$CLAUDE_TOOL_NAME\" \"$CLAUDE_USER_MESSAGE\"",
             "timeout": 3
           }
         ]
@@ -153,7 +153,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/pre-edit-context-inject.sh \"$CLAUDE_TOOL_NAME\" \"$CLAUDE_TOOL_ARGS\"",
+            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/pre-edit-context-inject.sh",
             "timeout": 8,
             "if": "Edit(*)"
           }
@@ -219,7 +219,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/post-file-edit.sh \"$CLAUDE_TOOL_ARG_FILE_PATH\"",
+            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/post-file-edit.sh",
             "timeout": 5,
             "background": true,
             "if": "Edit(*)|Write(*)"
@@ -231,7 +231,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/post-tool-security.sh \"$CLAUDE_TOOL_ARG_FILE_PATH\"",
+            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/post-tool-security.sh",
             "timeout": 5,
             "background": true,
             "if": "Edit(*)|Write(*)"
@@ -243,7 +243,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python -m py_compile \"$CLAUDE_TOOL_ARG_PATH\" 2>&1 || echo 'Syntax error'",
+            "command": "python3 -c \"import json,sys,py_compile; d=json.loads(sys.stdin.read()) if not sys.stdin.isatty() else {}; fp=d.get('tool_input',{}).get('file_path',''); py_compile.compile(fp) if fp else None\" 2>&1 || echo \"Syntax error\"",
             "timeout": 10,
             "if": "Write(*.py)"
           }
@@ -254,7 +254,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || python .claude/scripts/sync_knowledge_graph.py \"$CLAUDE_TOOL_ARG_FILE_PATH\" 2>&1 || true",
+            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || python3 -c \"import json,sys,subprocess,os; d=json.loads(sys.stdin.read()) if not sys.stdin.isatty() else {}; fp=d.get('tool_input',{}).get('file_path',''); subprocess.run(['python','.claude/scripts/sync_knowledge_graph.py',fp]) if fp else None\" 2>&1 || true",
             "timeout": 15,
             "background": true,
             "if": "Edit(knowledge/**/*.md)|Write(knowledge/**/*.md)"

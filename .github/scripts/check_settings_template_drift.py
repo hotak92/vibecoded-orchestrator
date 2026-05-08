@@ -111,12 +111,25 @@ def normalise_hook_command(cmd: str) -> str | None:
     if m:
         return m.group(1)
 
-    # python invocation referencing a hook/script directory (Linux + Windows
-    # variants: `python .claude/scripts/X.py` and
-    # `powershell ... try { python .claude/scripts/X.py ... } catch { }`).
-    m = re.search(r"python3?\s+\.claude[/\\](?:hooks|scripts)[/\\]([A-Za-z0-9_\-]+)\.py\b", cmd)
+    # python invocation referencing a hook/script directory. Matches
+    # multiple wrapper styles:
+    #   - direct: `python .claude/scripts/X.py`
+    #   - powershell wrapper: `... try { python .claude/scripts/X.py ... }`
+    #   - subprocess.run list literal: `subprocess.run(['python','.claude/scripts/X.py',fp])`
+    #   - python -m: `python -m py_compile` (matched separately below)
+    # Strategy: find any `.claude/(hooks|scripts)/<name>.py` reference in the
+    # command string regardless of the surrounding wrapper.
+    m = re.search(r"\.claude[/\\](?:hooks|scripts)[/\\]([A-Za-z0-9_\-]+)\.py\b", cmd)
     if m:
         return m.group(1)
+
+    # `py_compile` recognized as the synthetic hook "py_compile" —
+    # matches multiple invocation styles:
+    #   - `python -m py_compile ...` (Windows direct or wrapped form)
+    #   - `python3 -c "import py_compile; py_compile.compile(fp) ..."` (Linux
+    #      stdin-reading inline form)
+    if re.search(r"\bpy_compile\b", cmd):
+        return "py_compile"
 
     # Inline command not referencing a hook script — out of scope.
     return None

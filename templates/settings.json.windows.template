@@ -144,7 +144,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\pre-vercel-token-guard.ps1 \"$CLAUDE_TOOL_NAME\" \"$CLAUDE_USER_MESSAGE\" \"$CLAUDE_TOOL_ARGS\"",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\pre-vercel-token-guard.ps1 \"$CLAUDE_TOOL_NAME\" \"$CLAUDE_USER_MESSAGE\"",
             "timeout": 2,
             "if": "Bash(*vercel*--token*)"
           }
@@ -155,7 +155,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\pre-tool-use.ps1 \"$CLAUDE_TOOL_NAME\" \"$CLAUDE_USER_MESSAGE\" \"$CLAUDE_TOOL_ARGS\"",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\pre-tool-use.ps1 \"$CLAUDE_TOOL_NAME\" \"$CLAUDE_USER_MESSAGE\"",
             "timeout": 3
           }
         ]
@@ -165,7 +165,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\pre-edit-context-inject.ps1 \"$CLAUDE_TOOL_NAME\" \"$CLAUDE_TOOL_ARGS\"",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\pre-edit-context-inject.ps1",
             "timeout": 8,
             "if": "Edit(*)"
           }
@@ -220,7 +220,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\post-file-edit.ps1 \"$CLAUDE_TOOL_ARG_FILE_PATH\"",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\post-file-edit.ps1",
             "timeout": 5,
             "background": true,
             "if": "Edit(*)|Write(*)"
@@ -232,7 +232,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\post-tool-security.ps1 \"$CLAUDE_TOOL_ARG_FILE_PATH\"",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\post-tool-security.ps1",
             "timeout": 5,
             "background": true,
             "if": "Edit(*)|Write(*)"
@@ -244,7 +244,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -Command \"try { python -m py_compile $env:CLAUDE_TOOL_ARG_PATH } catch { Write-Output 'Syntax error' }\"",
+            "command": "powershell -NoProfile -Command \"try { $payload = [Console]::In.ReadToEnd() | ConvertFrom-Json; $fp = $payload.tool_input.file_path; if ($fp) { python -m py_compile $fp 2>&1 } } catch { Write-Output \\\"Syntax error\\\" }\"",
             "timeout": 10,
             "if": "Write(*.py)"
           }
@@ -255,7 +255,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -Command \"try { python .claude/scripts/sync_knowledge_graph.py $env:CLAUDE_TOOL_ARG_FILE_PATH } catch { }\"",
+            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || powershell -NoProfile -Command \"try { $payload = [Console]::In.ReadToEnd() | ConvertFrom-Json; $fp = $payload.tool_input.file_path; if ($fp) { python .claude/scripts/sync_knowledge_graph.py $fp } } catch { }\"",
             "timeout": 15,
             "background": true,
             "if": "Edit(knowledge/**/*.md)|Write(knowledge/**/*.md)"
