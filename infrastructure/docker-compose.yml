@@ -19,10 +19,24 @@ services:
       CLUSTER_HOSTNAME: node1
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/v1/.well-known/ready"]
-      interval: 10s
+      # Use /v1/meta, NOT /v1/.well-known/ready. Root cause of the
+      # 2026-05-08 weaviate restart-loop / port-mapping desync was that
+      # /v1/.well-known/ready returns 503 during legitimate operations
+      # (vector-cache prefill, shard load, compactions). The strict
+      # endpoint produced healthcheck flap → restart:unless-stopped → race
+      # between podman restart N+1 and restart N's teardown → conmon /
+      # rootlessport / state-DB desync that left the container in a
+      # zombie "running but port dead" state. /v1/meta returns 200 as
+      # long as the HTTP server itself is up, which is the right signal
+      # for "container is functional". Same fix already applied in the
+      # launcher's Rust health probe (PR #141) — compose was missed.
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/v1/meta"]
+      interval: 30s
       timeout: 5s
       retries: 5
+      # Boot can take 20-40s on a multi-GB KG (raft init + shard load +
+      # vector-cache prefill). Don't count failures during this window.
+      start_period: 60s
 
   ollama:
     # Pinned for supply-chain trust + reproducibility. Bump deliberately when
