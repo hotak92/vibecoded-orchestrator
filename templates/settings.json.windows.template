@@ -130,12 +130,13 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "Bash(*vercel*--token*)",
+        "matcher": "Bash",
         "hooks": [
           {
             "type": "command",
             "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\pre-vercel-token-guard.ps1 \"$CLAUDE_TOOL_NAME\" \"$CLAUDE_USER_MESSAGE\" \"$CLAUDE_TOOL_ARGS\"",
-            "timeout": 2
+            "timeout": 2,
+            "if": "Bash(*vercel*--token*)"
           }
         ]
       },
@@ -150,12 +151,13 @@
         ]
       },
       {
-        "matcher": "Edit(*)",
+        "matcher": "Edit",
         "hooks": [
           {
             "type": "command",
             "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\pre-edit-context-inject.ps1 \"$CLAUDE_TOOL_NAME\" \"$CLAUDE_TOOL_ARGS\"",
-            "timeout": 8
+            "timeout": 8,
+            "if": "Edit(*)"
           }
         ]
       }
@@ -204,51 +206,56 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "Edit(*)|Write(*)",
+        "matcher": "Edit|Write",
         "hooks": [
           {
             "type": "command",
             "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\post-file-edit.ps1 \"$CLAUDE_TOOL_ARG_FILE_PATH\"",
             "timeout": 5,
-            "background": true
+            "background": true,
+            "if": "Edit(*)|Write(*)"
           }
         ]
       },
       {
-        "matcher": "Edit(*)|Write(*)",
+        "matcher": "Edit|Write",
         "hooks": [
           {
             "type": "command",
             "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\post-tool-security.ps1 \"$CLAUDE_TOOL_ARG_FILE_PATH\"",
             "timeout": 5,
-            "background": true
+            "background": true,
+            "if": "Edit(*)|Write(*)"
           }
         ]
       },
       {
-        "matcher": "Write(*.py)",
+        "matcher": "Write",
         "hooks": [
           {
             "type": "command",
             "command": "powershell -NoProfile -Command \"try { python -m py_compile $env:CLAUDE_TOOL_ARG_PATH } catch { Write-Output 'Syntax error' }\"",
-            "timeout": 10
+            "timeout": 10,
+            "if": "Write(*.py)"
           }
         ]
       },
       {
-        "matcher": "Edit(knowledge/**/*.md)|Write(knowledge/**/*.md)",
+        "matcher": "Edit|Write",
         "hooks": [
           {
             "type": "command",
             "command": "powershell -NoProfile -Command \"try { python .claude/scripts/sync_knowledge_graph.py $env:CLAUDE_TOOL_ARG_FILE_PATH } catch { }\"",
             "timeout": 15,
-            "background": true
+            "background": true,
+            "if": "Edit(knowledge/**/*.md)|Write(knowledge/**/*.md)"
           },
           {
             "type": "command",
             "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\kg-summary-generator.ps1",
             "timeout": 5,
-            "background": true
+            "background": true,
+            "if": "Edit(knowledge/**/*.md)|Write(knowledge/**/*.md)"
           }
         ]
       },

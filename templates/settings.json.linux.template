@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
-  "_template_origin": "vibecoded-orchestrator v0.1.0+ — copied by install.py",
-  "_comment": "Project-scoped Claude Code settings for VibeCoded Orchestrator-managed projects. Hooks fire by default — set VCT_DISABLE_HOOKS=1 in your shell to opt out per-shell, or remove blocks here for project-wide opt-out.",
+  "_template_origin": "vibecoded-orchestrator v0.1.0+ \u2014 copied by install.py",
+  "_comment": "Project-scoped Claude Code settings for VibeCoded Orchestrator-managed projects. Hooks fire by default \u2014 set VCT_DISABLE_HOOKS=1 in your shell to opt out per-shell, or remove blocks here for project-wide opt-out.",
   "permissions": {
     "allow": [
       "Bash(pytest *)",
@@ -130,12 +130,13 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "Bash(*vercel*--token*)",
+        "matcher": "Bash",
         "hooks": [
           {
             "type": "command",
             "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/pre-vercel-token-guard.sh \"$CLAUDE_TOOL_NAME\" \"$CLAUDE_USER_MESSAGE\" \"$CLAUDE_TOOL_ARGS\"",
-            "timeout": 2
+            "timeout": 2,
+            "if": "Bash(*vercel*--token*)"
           }
         ]
       },
@@ -150,12 +151,13 @@
         ]
       },
       {
-        "matcher": "Edit(*)",
+        "matcher": "Edit",
         "hooks": [
           {
             "type": "command",
             "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/pre-edit-context-inject.sh \"$CLAUDE_TOOL_NAME\" \"$CLAUDE_TOOL_ARGS\"",
-            "timeout": 8
+            "timeout": 8,
+            "if": "Edit(*)"
           }
         ]
       }
@@ -204,51 +206,56 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "Edit(*)|Write(*)",
+        "matcher": "Edit|Write",
         "hooks": [
           {
             "type": "command",
             "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/post-file-edit.sh \"$CLAUDE_TOOL_ARG_FILE_PATH\"",
             "timeout": 5,
-            "background": true
+            "background": true,
+            "if": "Edit(*)|Write(*)"
           }
         ]
       },
       {
-        "matcher": "Edit(*)|Write(*)",
+        "matcher": "Edit|Write",
         "hooks": [
           {
             "type": "command",
             "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/post-tool-security.sh \"$CLAUDE_TOOL_ARG_FILE_PATH\"",
             "timeout": 5,
-            "background": true
+            "background": true,
+            "if": "Edit(*)|Write(*)"
           }
         ]
       },
       {
-        "matcher": "Write(*.py)",
+        "matcher": "Write",
         "hooks": [
           {
             "type": "command",
             "command": "python -m py_compile \"$CLAUDE_TOOL_ARG_PATH\" 2>&1 || echo 'Syntax error'",
-            "timeout": 10
+            "timeout": 10,
+            "if": "Write(*.py)"
           }
         ]
       },
       {
-        "matcher": "Edit(knowledge/**/*.md)|Write(knowledge/**/*.md)",
+        "matcher": "Edit|Write",
         "hooks": [
           {
             "type": "command",
             "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || python .claude/scripts/sync_knowledge_graph.py \"$CLAUDE_TOOL_ARG_FILE_PATH\" 2>&1 || true",
             "timeout": 15,
-            "background": true
+            "background": true,
+            "if": "Edit(knowledge/**/*.md)|Write(knowledge/**/*.md)"
           },
           {
             "type": "command",
             "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/kg-summary-generator.sh",
             "timeout": 5,
-            "background": true
+            "background": true,
+            "if": "Edit(knowledge/**/*.md)|Write(knowledge/**/*.md)"
           }
         ]
       },
@@ -277,5 +284,5 @@
       }
     ]
   },
-  "_env_comment": "Set VCT_DISABLE_HOOKS=1 in your shell to opt out of all hooks for that shell (e.g. when debugging). Set it in .vscode/settings.json claude-code.env to disable per-project. Note: the orchestrator's own settings.json wires BASH_ENV to .claude/scripts/leanctx-bash-env.sh — this template intentionally omits that, since lean-ctx is orchestrator-specific."
+  "_env_comment": "Set VCT_DISABLE_HOOKS=1 in your shell to opt out of all hooks for that shell (e.g. when debugging). Set it in .vscode/settings.json claude-code.env to disable per-project. Note: the orchestrator's own settings.json wires BASH_ENV to .claude/scripts/leanctx-bash-env.sh \u2014 this template intentionally omits that, since lean-ctx is orchestrator-specific."
 }
