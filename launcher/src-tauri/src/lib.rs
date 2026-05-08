@@ -56,6 +56,47 @@ pub fn run() {
                 }
             }
 
+            // P1-B (2026-05-08): one-shot migration of plaintext MCP-server
+            // secret settings from `~/.vct/orchestrator.json` into the OS
+            // keychain. Self-gated by an `app_state` flag — runs at most
+            // once per install and skips silently when nothing needs
+            // moving. Soft-fail: the launcher must boot even if the
+            // keychain backend is unreachable (the migration just
+            // postpones itself to the next start).
+            {
+                use tauri::Manager;
+                if let Some(db) = app.try_state::<db::Db>() {
+                    match commands::dashboard::migrate_plaintext_mcp_secrets_to_keychain(
+                        db.inner(),
+                    ) {
+                        Ok(report) => {
+                            if !report.migrated_keys.is_empty() {
+                                eprintln!(
+                                    "[vct] migrated {} MCP secret(s) to keychain: {:?}",
+                                    report.migrated_keys.len(),
+                                    report.migrated_keys,
+                                );
+                            }
+                            if !report.skipped_keys.is_empty() {
+                                eprintln!(
+                                    "[vct] warning: {} MCP secret(s) could not be migrated \
+                                     to the keychain (will retry on next boot): {:?}",
+                                    report.skipped_keys.len(),
+                                    report.skipped_keys,
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[vct] warning: MCP secret migration failed: {}. \
+                                 Will retry on next boot.",
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+
             // Start the Hub API server in the background
             tauri::async_runtime::spawn(async {
                 match hub::server::start_hub_server().await {
@@ -148,6 +189,11 @@ pub fn run() {
             // Deprecated alias — delegates to set_shared_kg_write_disabled,
             // logs a deprecation warning. Slated for removal ~2026-08.
             commands::projects_v2::set_shared_kg_opt_out,
+            // P1-D (2026-05-08): re-run env writers for a project so the
+            // current state of the launcher's access matrix lands in the
+            // 3 surfaces. Auto-invoked by access-matrix setters; FE may
+            // also call directly after bulk edits.
+            commands::projects_v2::refresh_project_env,
             commands::projects_v2::switch_project_host_v2,
             commands::projects_v2::delete_project_v2,
             commands::projects_v2::launch_project_in_editor,

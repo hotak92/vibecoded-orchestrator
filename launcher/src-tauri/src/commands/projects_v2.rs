@@ -1340,6 +1340,25 @@ pub fn write_project_env_files(
                     .orchestrator_root
                     .as_ref()
                     .map(|p| p.join("infrastructure").display().to_string()),
+                // P1-D (2026-05-08): cross-project access lists. Comma-
+                // separated. We omit the key entirely when the list is
+                // empty (matching the orchestrator_root semantics) so the
+                // hooks don't have to disambiguate "set to empty" vs
+                // "unset" — both mean "no peers granted".
+                "VCT_KG_ACCESS_LIST" => {
+                    if settings.kg_access_list.is_empty() {
+                        None
+                    } else {
+                        Some(settings.kg_access_list.join(","))
+                    }
+                }
+                "VCT_CODE_GRAPH_ACCESS_LIST" => {
+                    if settings.code_graph_access_list.is_empty() {
+                        None
+                    } else {
+                        Some(settings.code_graph_access_list.join(","))
+                    }
+                }
                 other => panic!(
                     "CANONICAL_INSTALL_ENV_KEYS contains key {:?} but \
                      write_project_env_files has no match arm for it. \
@@ -2149,6 +2168,69 @@ pub async fn set_shared_kg_opt_out(
     set_shared_kg_write_disabled(project_id, opt_out, db).await
 }
 
+/// P1-D (2026-05-08): re-run `write_project_env_files` for a registered
+/// project so the launcher's current view of the access matrix lands in
+/// `.claude/env`, `.claude/settings.json env`, and
+/// `.vscode/settings.json claude-code.env`. Wired from the access-matrix
+/// setters (`kg_set_collection_access_mode` and the codegraph
+/// equivalents) so a running Claude Code session picks up newly-granted
+/// peer KGs without a session restart.
+///
+/// Soft-fail: a write hiccup leaves the matrix DB row in place; the
+/// next refresh / project-create / rename call will retry. Returns the
+/// list of warnings produced by `write_project_env_files`, plus the
+/// access lists this run resolved (so the FE can show "now exporting
+/// VCT_KG_ACCESS_LIST=Foo,Bar" feedback).
+#[command]
+pub async fn refresh_project_env(
+    project_id: String,
+    db: State<'_, Db>,
+) -> Result<RefreshProjectEnvResult, String> {
+    refresh_project_env_with_db(&db, &project_id)
+}
+
+/// Free-function variant of `refresh_project_env` that takes `&Db` so
+/// other commands (kg/codegraph access setters) can invoke it without
+/// the Tauri `State` plumbing. Single source of truth — the `#[command]`
+/// wrapper above just delegates here.
+pub fn refresh_project_env_with_db(
+    db: &Db,
+    project_id: &str,
+) -> Result<RefreshProjectEnvResult, String> {
+    let row = db
+        .get_project(project_id)?
+        .ok_or_else(|| format!("project {} not found", project_id))?;
+    let folder = Path::new(&row.folder_path);
+    let env_settings = project_env_settings::populate(db, &row.name, Some(project_id));
+
+    let kg_access_list = env_settings.kg_access_list.clone();
+    let code_graph_access_list = env_settings.code_graph_access_list.clone();
+
+    let mut warnings: Vec<String> = Vec::new();
+    if let Err(e) = write_project_env_files(folder, &env_settings) {
+        let msg = format!(
+            "refresh_project_env (write_project_env_files) failed: {}. \
+             Access-matrix env vars may be stale until next refresh.",
+            e
+        );
+        eprintln!("[vct] warning: {}", msg);
+        warnings.push(msg);
+    }
+
+    Ok(RefreshProjectEnvResult {
+        kg_access_list,
+        code_graph_access_list,
+        warnings,
+    })
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RefreshProjectEnvResult {
+    pub kg_access_list: Vec<String>,
+    pub code_graph_access_list: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
 #[command]
 pub async fn switch_project_host_v2(
     id: String,
@@ -2362,6 +2444,23 @@ pub(crate) const CANONICAL_INSTALL_ENV_KEYS: &[&str] = &[
     // when `settings.orchestrator_root` is `None`. See doc comment above.
     "VCT_ORCHESTRATOR_ROOT",
     "VCT_INFRASTRUCTURE_DIR",
+    // Multi-source KG / code-graph access lists (P1-D, 2026-05-08). Each
+    // env var carries a comma-separated list of peer project names the
+    // current project has READ access to via the launcher's access matrix.
+    // Consumed by `weaviate_mcp/server.py::_kg_collections_to_search` +
+    // `search_code_graph` and by the bundled `rl_kg_search.py` to fan out
+    // queries across peers. Conditionally emitted: the pair-builder skips
+    // each key when its respective list is empty (the default — no peers
+    // granted access).
+    //
+    // settings.json/.claude-code.env hooks consume these via the MCP env
+    // block, so they're added to all 3 surfaces via the same canonical
+    // pipeline as the rest. Hooks invoked by `settings.json` directly do
+    // NOT reference these names (they bubble up via the MCP server +
+    // `rl_kg_search.py`), so the drift gate doesn't need to know about
+    // them — see `check_settings_template_drift.py` allowlist note.
+    "VCT_KG_ACCESS_LIST",
+    "VCT_CODE_GRAPH_ACCESS_LIST",
 ];
 
 /// Canonical env keys the launcher OWNS across every surface. These are
@@ -5254,6 +5353,12 @@ mod tests {
             // `settings.orchestrator_root` is `None`, omitting the
             // entry from every install surface.
             "VCT_ORCHESTRATOR_ROOT", "VCT_INFRASTRUCTURE_DIR",
+            // P1-D (2026-05-08): cross-project access lists. Conditionally
+            // emitted — the match arm in `write_project_env_files`
+            // returns `None` when the corresponding access list is empty
+            // (the default — no peers granted), omitting the entry from
+            // every install surface.
+            "VCT_KG_ACCESS_LIST", "VCT_CODE_GRAPH_ACCESS_LIST",
         ].iter().copied().collect();
 
         for k in CANONICAL_INSTALL_ENV_KEYS.iter() {
@@ -5696,5 +5801,292 @@ USER_DB_URL=postgres://user:pass@db/app
         assert!(files.is_empty());
         assert!(w_env.is_empty(), "env warnings on missing folder: {:?}", w_env);
         assert!(w_file.is_empty(), "file warnings on missing folder: {:?}", w_file);
+    }
+
+    // ─── Fix #4: VCT_KG_ACCESS_LIST / VCT_CODE_GRAPH_ACCESS_LIST ────────
+    //
+    // Pin the multi-source access matrix → runtime env propagation. The
+    // launcher GUI used to grant cross-project KG / codegraph reads, but
+    // no runtime code consumed the rows — the matrix was a UI-only
+    // feature. P1-D wires
+    //   ProjectEnvSettings.kg_access_list / code_graph_access_list
+    //     ↓ (write_project_env_files match arms)
+    //   `.claude/env`, `.claude/settings.json env`,
+    //   `.vscode/settings.json claude-code.env` →
+    //   VCT_KG_ACCESS_LIST=Foo,Bar / VCT_CODE_GRAPH_ACCESS_LIST=Foo,Bar
+    //
+    // The Python side (weaviate_mcp/server.py + rl_kg_search.py) consumes
+    // these env vars to fan-out searches across peer KGs/codegraphs; that
+    // half is covered by hand-pinning the env-var contract here +
+    // runtime probing on the Python side (out of Rust unit-test scope).
+
+    #[test]
+    fn test_write_project_env_files_includes_access_list_when_peers_granted() {
+        let tmp = std::env::temp_dir().join(format!(
+            "vct-access-list-prop-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let mut settings = ProjectEnvSettings::with_defaults("AccessProj");
+        settings.kg_access_list = vec!["PeerA".to_string(), "PeerB".to_string()];
+        settings.code_graph_access_list = vec!["PeerC".to_string()];
+        write_project_env_files(&tmp, &settings).unwrap();
+
+        // Surface 1: .claude/env (POSIX exports). Comma-joined.
+        let env_text = std::fs::read_to_string(tmp.join(".claude/env")).unwrap();
+        assert!(
+            env_text.contains("export VCT_KG_ACCESS_LIST=\"PeerA,PeerB\""),
+            ".claude/env missing VCT_KG_ACCESS_LIST. Body:\n{}",
+            env_text
+        );
+        assert!(
+            env_text.contains("export VCT_CODE_GRAPH_ACCESS_LIST=\"PeerC\""),
+            ".claude/env missing VCT_CODE_GRAPH_ACCESS_LIST. Body:\n{}",
+            env_text
+        );
+
+        // Surface 2: .claude/settings.json env block.
+        let cs: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(tmp.join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            cs["env"]["VCT_KG_ACCESS_LIST"], "PeerA,PeerB",
+            ".claude/settings.json env block missing or wrong VCT_KG_ACCESS_LIST. \
+             Block: {}",
+            cs["env"]
+        );
+        assert_eq!(
+            cs["env"]["VCT_CODE_GRAPH_ACCESS_LIST"], "PeerC",
+            ".claude/settings.json env block missing or wrong VCT_CODE_GRAPH_ACCESS_LIST. \
+             Block: {}",
+            cs["env"]
+        );
+
+        // Surface 3: .vscode/settings.json claude-code.env block.
+        let vsc: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(tmp.join(".vscode/settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            vsc["claude-code.env"]["VCT_KG_ACCESS_LIST"], "PeerA,PeerB",
+            ".vscode/settings.json claude-code.env missing VCT_KG_ACCESS_LIST. \
+             Block: {}",
+            vsc["claude-code.env"]
+        );
+        assert_eq!(
+            vsc["claude-code.env"]["VCT_CODE_GRAPH_ACCESS_LIST"], "PeerC",
+            ".vscode/settings.json claude-code.env missing VCT_CODE_GRAPH_ACCESS_LIST. \
+             Block: {}",
+            vsc["claude-code.env"]
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn test_write_project_env_files_omits_access_list_when_no_peers() {
+        let tmp = std::env::temp_dir().join(format!(
+            "vct-access-list-omit-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Default `with_defaults` has empty access lists.
+        let settings = ProjectEnvSettings::with_defaults("NoPeers");
+        assert!(settings.kg_access_list.is_empty());
+        assert!(settings.code_graph_access_list.is_empty());
+        write_project_env_files(&tmp, &settings).unwrap();
+
+        // No surface should contain either key (omit, not empty-string).
+        let env_text = std::fs::read_to_string(tmp.join(".claude/env")).unwrap();
+        assert!(
+            !env_text.contains("export VCT_KG_ACCESS_LIST="),
+            ".claude/env should not export VCT_KG_ACCESS_LIST when list is empty. \
+             Body:\n{}",
+            env_text
+        );
+        assert!(
+            !env_text.contains("export VCT_CODE_GRAPH_ACCESS_LIST="),
+            ".claude/env should not export VCT_CODE_GRAPH_ACCESS_LIST when list is empty. \
+             Body:\n{}",
+            env_text
+        );
+
+        let cs: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(tmp.join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            cs["env"].get("VCT_KG_ACCESS_LIST").is_none(),
+            ".claude/settings.json env should omit VCT_KG_ACCESS_LIST when empty"
+        );
+        assert!(
+            cs["env"].get("VCT_CODE_GRAPH_ACCESS_LIST").is_none(),
+            ".claude/settings.json env should omit VCT_CODE_GRAPH_ACCESS_LIST when empty"
+        );
+
+        let vsc: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(tmp.join(".vscode/settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            vsc["claude-code.env"].get("VCT_KG_ACCESS_LIST").is_none(),
+            ".vscode/settings.json claude-code.env should omit VCT_KG_ACCESS_LIST when empty"
+        );
+        assert!(
+            vsc["claude-code.env"]
+                .get("VCT_CODE_GRAPH_ACCESS_LIST")
+                .is_none(),
+            ".vscode/settings.json claude-code.env should omit VCT_CODE_GRAPH_ACCESS_LIST when empty"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Pin the populate path: when project P has KG access rows pointing
+    /// at PeerA's collection, populate's `kg_access_list` includes PeerA
+    /// (and excludes self + the shared collection).
+    #[test]
+    fn populate_resolves_kg_access_peers_from_matrix() {
+        use crate::commands::project_env_settings::populate;
+        use crate::db::Db;
+
+        let db = Db::open_in_memory().unwrap();
+        // Seed two registered projects.
+        let folder_a = std::env::temp_dir().join(format!("vct-pop-a-{}", uuid::Uuid::new_v4().simple()));
+        let folder_b = std::env::temp_dir().join(format!("vct-pop-b-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&folder_a).unwrap();
+        std::fs::create_dir_all(&folder_b).unwrap();
+        let row_a = db
+            .insert_project(
+                "proj-a",
+                "Alpha",
+                folder_a.to_str().unwrap(),
+                crate::db::models::ProjectHost::Base,
+                "alpha",
+            )
+            .unwrap();
+        let _row_b = db
+            .insert_project(
+                "proj-b",
+                "Beta",
+                folder_b.to_str().unwrap(),
+                crate::db::models::ProjectHost::Base,
+                "beta",
+            )
+            .unwrap();
+
+        // Grant Alpha read access to Beta's KG collection. That's the
+        // shape `populate_kg_collection_access` produces under the hood.
+        db.kg_set_access(&row_a.id, "Beta_KnowledgeGraph", "read").unwrap();
+        // And to a Beta dev collection (to verify dedup logic — both
+        // map to the same peer "Beta" after suffix-strip).
+        db.kg_set_access(&row_a.id, "Beta_Development", "read").unwrap();
+        // And to the shared collection (must be excluded).
+        db.kg_set_access(&row_a.id, "VibeCodedTools_KnowledgeGraph", "read").unwrap();
+        // And Alpha's OWN collection (must be excluded).
+        db.kg_set_access(&row_a.id, "Alpha_KnowledgeGraph", "write").unwrap();
+        // A `none` row must be filtered out.
+        db.kg_set_access(&row_a.id, "Gamma_KnowledgeGraph", "none").unwrap();
+
+        let settings = populate(&db, "Alpha", Some(&row_a.id));
+        assert_eq!(
+            settings.kg_access_list,
+            vec!["Beta".to_string()],
+            "expected just Beta as peer; got {:?}",
+            settings.kg_access_list
+        );
+
+        std::fs::remove_dir_all(&folder_a).ok();
+        std::fs::remove_dir_all(&folder_b).ok();
+    }
+
+    /// Pin the populate path: codegraph access list resolves grantor
+    /// project names from the access matrix (only `read` rows, not `none`).
+    #[test]
+    fn populate_resolves_code_graph_access_peers_from_matrix() {
+        use crate::commands::project_env_settings::populate;
+        use crate::db::Db;
+
+        let db = Db::open_in_memory().unwrap();
+        let folder_a = std::env::temp_dir().join(format!("vct-pop-cg-a-{}", uuid::Uuid::new_v4().simple()));
+        let folder_b = std::env::temp_dir().join(format!("vct-pop-cg-b-{}", uuid::Uuid::new_v4().simple()));
+        let folder_c = std::env::temp_dir().join(format!("vct-pop-cg-c-{}", uuid::Uuid::new_v4().simple()));
+        for f in [&folder_a, &folder_b, &folder_c] {
+            std::fs::create_dir_all(f).unwrap();
+        }
+        let _ = db.insert_project(
+            "proj-a", "Alpha", folder_a.to_str().unwrap(),
+            crate::db::models::ProjectHost::Base, "alpha",
+        ).unwrap();
+        let _ = db.insert_project(
+            "proj-b", "Beta", folder_b.to_str().unwrap(),
+            crate::db::models::ProjectHost::Base, "beta",
+        ).unwrap();
+        let _ = db.insert_project(
+            "proj-c", "Gamma", folder_c.to_str().unwrap(),
+            crate::db::models::ProjectHost::Base, "gamma",
+        ).unwrap();
+
+        // Beta grants Alpha read access to its codegraph.
+        db.codegraph_grant("proj-b", "proj-a", "read").unwrap();
+        // Gamma denies Alpha (none row).
+        db.codegraph_grant("proj-c", "proj-a", "none").unwrap();
+
+        let settings = populate(&db, "Alpha", Some("proj-a"));
+        assert_eq!(
+            settings.code_graph_access_list,
+            vec!["Beta".to_string()],
+            "expected just Beta as codegraph peer; got {:?}",
+            settings.code_graph_access_list
+        );
+
+        for f in [&folder_a, &folder_b, &folder_c] {
+            std::fs::remove_dir_all(f).ok();
+        }
+    }
+
+    /// `refresh_project_env_with_db` re-runs the env writer for a given
+    /// project and surfaces the resolved access lists in its return
+    /// value. Used by the kg/codegraph access setters as a hot-reload
+    /// path so running Claude Code sessions pick up new peer grants
+    /// without restart.
+    #[test]
+    fn refresh_project_env_with_db_re_runs_env_writer() {
+        use crate::db::Db;
+
+        let db = Db::open_in_memory().unwrap();
+        let folder = std::env::temp_dir().join(format!("vct-refresh-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let row = db.insert_project(
+            "proj-r", "Refresh", folder.to_str().unwrap(),
+            crate::db::models::ProjectHost::Base, "refresh",
+        ).unwrap();
+
+        // No grants yet — refresh runs and reports empty lists.
+        let r1 = refresh_project_env_with_db(&db, &row.id).unwrap();
+        assert!(r1.kg_access_list.is_empty());
+        assert!(r1.code_graph_access_list.is_empty());
+        assert!(folder.join(".claude/env").exists(),
+            "refresh did not write .claude/env");
+        let env1 = std::fs::read_to_string(folder.join(".claude/env")).unwrap();
+        assert!(!env1.contains("VCT_KG_ACCESS_LIST="),
+            "empty list should produce no VCT_KG_ACCESS_LIST line");
+
+        // Grant Refresh read access to a peer's KG, then refresh again.
+        // refresh re-runs populate which re-reads the matrix.
+        db.kg_set_access(&row.id, "PeerProj_KnowledgeGraph", "read").unwrap();
+        let r2 = refresh_project_env_with_db(&db, &row.id).unwrap();
+        assert_eq!(r2.kg_access_list, vec!["PeerProj".to_string()]);
+        let env2 = std::fs::read_to_string(folder.join(".claude/env")).unwrap();
+        assert!(
+            env2.contains("export VCT_KG_ACCESS_LIST=\"PeerProj\""),
+            "post-grant refresh did not propagate VCT_KG_ACCESS_LIST. Body:\n{}",
+            env2,
+        );
+
+        std::fs::remove_dir_all(&folder).ok();
     }
 }

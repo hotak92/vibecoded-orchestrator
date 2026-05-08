@@ -2,7 +2,26 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tauri::command;
 
-use crate::types::{McpServerConfig, OrchestratorConfig, OrchestratorTier};
+use crate::types::{McpServerConfig, McpSettingType, OrchestratorConfig, OrchestratorTier};
+
+// ---------------------------------------------------------------------------
+// MCP secret keychain routing (P1-B, 2026-05-08)
+// ---------------------------------------------------------------------------
+//
+// Settings flagged `setting_type == Secret` MUST NOT land in
+// `~/.vct/orchestrator.json` or in `<install>/.claude/settings.json env` as
+// plaintext. Route them through the OS keychain instead.
+//
+// Service namespace: `vct.global.mcp.<mcp_id>` (SecretScope::Global with
+// module_id=`"mcp.<id>"`). Keep this constant — migration code reads from it.
+const MCP_SECRET_MODULE_PREFIX: &str = "mcp.";
+
+/// Build the (scope, module_id) tuple this module uses for storing MCP-server
+/// secrets in the OS keychain. Centralised so `update_mcp_setting`,
+/// `apply_mcp_to_claude_settings`, and the migration helper agree.
+fn mcp_secret_module_id(mcp_id: &str) -> String {
+    format!("{}{}", MCP_SECRET_MODULE_PREFIX, mcp_id)
+}
 
 // ---------------------------------------------------------------------------
 // Config persistence: ~/.vct/orchestrator.json
@@ -135,6 +154,18 @@ pub fn get_mcp_servers() -> Vec<McpServerConfig> {
 }
 
 /// Toggle an MCP server on/off.
+///
+/// Side effects (P1-A fix, 2026-05-08):
+/// 1. Persists `enabled` flag into `~/.vct/orchestrator.json`.
+/// 2. Mirrors into `~/.claude.json mcpServers.<id>`:
+///      - `enabled=true` → register the entry (Claude Code spawns the server).
+///      - `enabled=false` → deregister the entry (Claude Code stops spawning).
+/// 3. Re-runs `apply_mcp_to_claude_settings` so the orchestrator install's
+///    `.claude/settings.json env` block reflects only enabled MCP settings.
+///
+/// Without step 2 the GUI would say "off" while Claude Code kept launching
+/// the disabled server (the original bug). Mirrors the pattern in
+/// `add_custom_mcp_server` / `remove_mcp_server`.
 #[command]
 pub async fn toggle_mcp_server(mcp_id: String, enabled: bool, user_apps: Vec<String>) -> Result<Vec<McpServerConfig>, String> {
     let tier = OrchestratorTier::from_apps(&user_apps);
@@ -153,15 +184,34 @@ pub async fn toggle_mcp_server(mcp_id: String, enabled: bool, user_apps: Vec<Str
     }
 
     server.enabled = enabled;
+    // Snapshot the entry shape for ~/.claude.json BEFORE we drop the &mut.
+    let entry = mcp_server_to_claude_entry(server);
     save_config(&config).await?;
 
-    // Apply to Claude Code settings.json
+    // Mirror the toggle into ~/.claude.json so Claude Code actually
+    // honours the GUI flip. Soft-fail: a write hiccup must not roll back
+    // the launcher's own config (the user already saw the toggle land).
+    let target = crate::mcp_registration::user_claude_json();
+    if enabled {
+        crate::mcp_registration::register_mcp(&target, &mcp_id, &entry)?;
+    } else {
+        crate::mcp_registration::deregister_mcp(&target, &mcp_id)?;
+    }
+
+    // Apply to Claude Code settings.json (env block in orchestrator install).
     apply_mcp_to_claude_settings(&config).await?;
 
     Ok(config.mcp_servers)
 }
 
 /// Update an MCP server setting (e.g., change port, URL, collection name).
+///
+/// P1-B fix (2026-05-08): when `setting.setting_type == Secret`, the value
+/// is routed through the OS keychain (`secrets::set` under
+/// `SecretScope::Global` / `module_id = "mcp.<mcp_id>"`) instead of being
+/// persisted into `~/.vct/orchestrator.json`. The JSON value is cleared
+/// (empty string) so Secret material never lands in launcher settings on
+/// disk. Non-Secret settings keep the existing JSON-only persistence.
 #[command]
 pub async fn update_mcp_setting(
     mcp_id: String,
@@ -181,7 +231,28 @@ pub async fn update_mcp_setting(
         return Err(format!("Setting '{}' is not editable", setting_key));
     }
 
-    setting.value = setting_value;
+    if setting.setting_type == McpSettingType::Secret {
+        // Route to keychain. We persist an EMPTY string in the JSON config
+        // so Secret material never sits at rest in `~/.vct/orchestrator.json`.
+        // An empty string also means `apply_mcp_to_claude_settings` skips
+        // the env emission for this key (existing `if !value.is_empty()` is
+        // gone — we now skip explicitly via the type check). The keychain
+        // is the authoritative store; the consuming MCP server is expected
+        // to read its own secrets via `~/.vct-secrets/` (Fix #3 bridge) or
+        // its native env-from-keychain path.
+        let scope = crate::secrets::SecretScope::Global;
+        let module_id = mcp_secret_module_id(&mcp_id);
+        if setting_value.is_empty() {
+            // Empty string from the GUI = "clear this secret". Delete from
+            // keychain and leave the JSON value empty.
+            let _ = crate::secrets::delete(scope, &module_id, &setting_key);
+        } else {
+            crate::secrets::set(scope, &module_id, &setting_key, &setting_value)?;
+        }
+        setting.value = String::new();
+    } else {
+        setting.value = setting_value;
+    }
     let updated = server.clone();
 
     save_config(&config).await?;
@@ -271,6 +342,122 @@ pub async fn remove_mcp_server(mcp_id: String) -> Result<Vec<McpServerConfig>, S
 }
 
 // ---------------------------------------------------------------------------
+// One-shot migration: plaintext Secret values → keychain (P1-B, 2026-05-08)
+// ---------------------------------------------------------------------------
+
+/// `app_state` flag — set after the migration runs successfully so a launcher
+/// upgrade only does the sweep once. Stale launchers (pre-fix) never write
+/// this row, so the first post-fix start finds it `None` and runs the sweep.
+const APP_STATE_KEY_MCP_SECRETS_MIGRATED: &str = "mcp_secrets.plaintext_to_keychain.v1";
+
+/// Sweep `~/.vct/orchestrator.json` once: any non-empty `value` on a
+/// Secret-typed setting is moved into the OS keychain (same namespace
+/// `update_mcp_setting` writes to) and cleared from the JSON config.
+///
+/// Idempotent and self-gated:
+///   * If the app_state flag is already set → returns immediately.
+///   * If the config file doesn't exist → flips the flag and returns.
+///   * Per-secret keychain write failures don't abort the migration; we
+///     leave that one secret alone (so the user retains the plaintext
+///     copy in JSON until they re-set it via the GUI), and keep going.
+///
+/// Soft-fail by design: a migration hiccup must NEVER block launcher
+/// startup. The caller logs warnings; the app boots regardless.
+pub fn migrate_plaintext_mcp_secrets_to_keychain(
+    db: &crate::db::Db,
+) -> Result<MigrationReport, String> {
+    let mut report = MigrationReport::default();
+
+    // Already migrated? skip silently.
+    let already = db
+        .app_state_get_bool(APP_STATE_KEY_MCP_SECRETS_MIGRATED)
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+    if already {
+        report.already_done = true;
+        return Ok(report);
+    }
+
+    let path = config_path();
+    if !path.exists() {
+        // Nothing to migrate — flip the flag so we don't re-scan on every boot.
+        db.app_state_set_bool(APP_STATE_KEY_MCP_SECRETS_MIGRATED, true)?;
+        return Ok(report);
+    }
+
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let mut config: OrchestratorConfig = match serde_json::from_str(&raw) {
+        Ok(c) => c,
+        Err(e) => {
+            // Don't try to repair a corrupt config — record the warning,
+            // skip the migration, do NOT flip the flag (so a future fix
+            // can retry).
+            return Err(format!("parse {}: {}", path.display(), e));
+        }
+    };
+
+    let mut config_dirty = false;
+    for server in config.mcp_servers.iter_mut() {
+        for (key, setting) in server.settings.iter_mut() {
+            if setting.setting_type != McpSettingType::Secret {
+                continue;
+            }
+            if setting.value.is_empty() {
+                continue;
+            }
+            // Move to keychain.
+            let module_id = mcp_secret_module_id(&server.id);
+            match crate::secrets::set(
+                crate::secrets::SecretScope::Global,
+                &module_id,
+                key,
+                &setting.value,
+            ) {
+                Ok(()) => {
+                    setting.value = String::new();
+                    config_dirty = true;
+                    report.migrated_keys.push(format!("{}/{}", server.id, key));
+                }
+                Err(e) => {
+                    // Keychain failure (no Secret Service / Keychain on this
+                    // host) — leave the JSON value as is. The user retains
+                    // their secret; they can re-set it through the GUI once
+                    // the keychain backend comes back. We do NOT flip the
+                    // flag in this case so a future boot retries.
+                    report.skipped_keys.push(format!("{}/{}: {}", server.id, key, e));
+                }
+            }
+        }
+    }
+
+    if config_dirty {
+        let json = serde_json::to_string_pretty(&config)
+            .map_err(|e| format!("serialize: {}", e))?;
+        std::fs::write(&path, json)
+            .map_err(|e| format!("write {}: {}", path.display(), e))?;
+    }
+
+    // Only flip the flag if EVERY found secret was migrated successfully.
+    // A partial migration leaves the flag unset so a later boot re-tries.
+    if report.skipped_keys.is_empty() {
+        db.app_state_set_bool(APP_STATE_KEY_MCP_SECRETS_MIGRATED, true)?;
+        report.flag_set = true;
+    }
+
+    Ok(report)
+}
+
+#[derive(Debug, Default)]
+pub struct MigrationReport {
+    pub already_done: bool,
+    pub migrated_keys: Vec<String>,
+    pub skipped_keys: Vec<String>,
+    pub flag_set: bool,
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -307,10 +494,21 @@ async fn apply_mcp_to_claude_settings(config: &OrchestratorConfig) -> Result<(),
         .and_then(|v| v.as_object_mut());
 
     if let Some(env_map) = env {
-        // Inject MCP server settings into env
+        // Inject MCP server settings into env.
+        //
+        // P1-B fix (2026-05-08): Secret-typed settings are NEVER emitted
+        // here — they live in the OS keychain (see `update_mcp_setting`)
+        // and the consuming MCP server is expected to read them via the
+        // standard mechanism (the keychain → ~/.vct-secrets/ bridge in
+        // Fix #3, or its own env-from-keychain wrapper). Emitting the
+        // empty placeholder would mask a real keychain miss as "secret =
+        // empty string", which is worse than absent.
         for server in &config.mcp_servers {
             if server.enabled {
                 for (key, setting) in &server.settings {
+                    if setting.setting_type == McpSettingType::Secret {
+                        continue;
+                    }
                     env_map.insert(key.clone(), serde_json::Value::String(setting.value.clone()));
                 }
             }
@@ -330,4 +528,487 @@ async fn apply_mcp_to_claude_settings(config: &OrchestratorConfig) -> Result<(),
         .map_err(|e| format!("Write settings: {}", e))?;
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests (P1-A, P1-B — 2026-05-08)
+// ---------------------------------------------------------------------------
+//
+// These tests pin the GUI-correctness fixes in this file:
+//
+//   * `toggle_mcp_server` mirrors enable/disable into `~/.claude.json
+//     mcpServers.<id>` so Claude Code stops/starts spawning the server
+//     in lockstep with the GUI flip. Without this mirror the GUI lied —
+//     a "disabled" MCP kept running, a "newly-enabled" MCP didn't start.
+//
+//   * `update_mcp_setting` routes Secret-typed values to the OS keychain
+//     instead of `~/.vct/orchestrator.json` plaintext, and
+//     `apply_mcp_to_claude_settings` omits Secret values from the env
+//     block emission. Plus a first-run migration sweep moves any
+//     pre-fix plaintext secrets into the keychain.
+//
+// Test isolation pattern:
+//   - `VCT_STATE_DIR` overrides the launcher's state root → temp dir,
+//     so the test's orchestrator.json doesn't touch the real user's.
+//   - `HOME` is overridden so `user_claude_json()` resolves into the
+//     temp dir → the test's ~/.claude.json doesn't touch the real one.
+//   - A process-wide Mutex serialises tests that mutate these env vars
+//     so parallel runs don't observe each other.
+//   - Keychain-touching tests probe via `keyring_available()`; CI
+//     hosts without an OS keychain backend skip silently.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{McpSetting, McpSettingType};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    // Process-wide serialisation for env-var-mutating tests. `HOME` and
+    // `VCT_STATE_DIR` are global; if two tests change them concurrently
+    // they race. The launcher's `paths.rs::tests` uses the same pattern.
+    static SERIALIZE: Mutex<()> = Mutex::new(());
+
+    fn keyring_available() -> bool {
+        let entry = match keyring::Entry::new("vct.test.dashboard.probe", "probe") {
+            Ok(e) => e,
+            Err(_) => return false,
+        };
+        if entry.set_password("canary").is_err() {
+            return false;
+        }
+        let _ = entry.delete_credential();
+        true
+    }
+
+    /// Set up a temp dir as the launcher's state root + the user's HOME.
+    /// Returns a guard that restores prior env on drop and the temp path.
+    /// Run the closure under the SERIALIZE mutex.
+    struct EnvGuard {
+        prev_state: Option<std::ffi::OsString>,
+        prev_home: Option<std::ffi::OsString>,
+        prev_secrets: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.prev_state.take() {
+                Some(v) => std::env::set_var("VCT_STATE_DIR", v),
+                None => std::env::remove_var("VCT_STATE_DIR"),
+            }
+            match self.prev_home.take() {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match self.prev_secrets.take() {
+                Some(v) => std::env::set_var("VCT_SECRETS_DIR", v),
+                None => std::env::remove_var("VCT_SECRETS_DIR"),
+            }
+        }
+    }
+
+    fn setup_temp_env() -> (std::path::PathBuf, EnvGuard) {
+        let lock = SERIALIZE.lock().expect("serialize lock");
+        let tmp = std::env::temp_dir().join(format!(
+            "vct-dashboard-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let prev_state = std::env::var_os("VCT_STATE_DIR");
+        let prev_home = std::env::var_os("HOME");
+        let prev_secrets = std::env::var_os("VCT_SECRETS_DIR");
+        std::env::set_var("VCT_STATE_DIR", &tmp);
+        std::env::set_var("HOME", &tmp);
+        // Isolate the keychain → ~/.vct-secrets/ bridge too so toggle
+        // tests don't pollute the real user's secret files.
+        std::env::set_var("VCT_SECRETS_DIR", tmp.join(".vct-secrets"));
+        let guard = EnvGuard {
+            prev_state,
+            prev_home,
+            prev_secrets,
+            _lock: lock,
+        };
+        (tmp, guard)
+    }
+
+    /// Pre-seed `~/.vct/orchestrator.json` with a default config so
+    /// `toggle_mcp_server` finds the built-in MCPs. Returns the path.
+    fn seed_default_config(state_dir: &std::path::Path) -> std::path::PathBuf {
+        std::fs::create_dir_all(state_dir).unwrap();
+        let config = OrchestratorConfig::default();
+        let path = state_dir.join("orchestrator.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&config).unwrap(),
+        )
+        .unwrap();
+        path
+    }
+
+    fn user_apps_free() -> Vec<String> {
+        Vec::new()
+    }
+
+    fn read_claude_json(home: &std::path::Path) -> serde_json::Value {
+        let p = home.join(".claude.json");
+        if !p.exists() {
+            return serde_json::json!({});
+        }
+        let raw = std::fs::read_to_string(&p).unwrap();
+        serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({}))
+    }
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    // ─── Fix #1: toggle_mcp_server mirrors to ~/.claude.json ─────────────
+
+    /// Bug repro for P1-A: `toggle_mcp_server(enabled=false)` flipped the
+    /// flag in orchestrator.json but left `~/.claude.json mcpServers.<id>`
+    /// in place, so Claude Code kept spawning the "disabled" server.
+    /// Post-fix: the entry is removed from ~/.claude.json on disable.
+    #[test]
+    fn test_toggle_mcp_server_off_removes_from_claude_json() {
+        let (home, _guard) = setup_temp_env();
+        seed_default_config(&home);
+
+        // Pre-seed ~/.claude.json with the ollama entry registered (mimic
+        // post-install state where the launcher had already mirrored
+        // every default-enabled server during install).
+        let claude_json = home.join(".claude.json");
+        std::fs::write(
+            &claude_json,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mcpServers": {
+                    "ollama": {
+                        "type": "stdio",
+                        "command": "claude_mcp_servers/ollama_mcp/server.py",
+                        "args": [],
+                        "env": {}
+                    }
+                }
+            })).unwrap(),
+        )
+        .unwrap();
+
+        rt().block_on(async {
+            toggle_mcp_server("ollama".to_string(), false, user_apps_free())
+                .await
+                .expect("toggle_mcp_server off");
+        });
+
+        let cj = read_claude_json(&home);
+        assert!(
+            cj["mcpServers"].get("ollama").is_none(),
+            "expected `ollama` removed from ~/.claude.json mcpServers, got: {}",
+            cj["mcpServers"]
+        );
+
+        // And the launcher's own config carries enabled=false.
+        let cfg_text = std::fs::read_to_string(home.join("orchestrator.json")).unwrap();
+        let cfg: serde_json::Value = serde_json::from_str(&cfg_text).unwrap();
+        let ollama = cfg["mcp_servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["id"] == "ollama")
+            .expect("ollama entry");
+        assert_eq!(ollama["enabled"], serde_json::Value::Bool(false));
+    }
+
+    /// Inverse of the off-case: toggle on must register the entry back
+    /// into ~/.claude.json with the canonical {type, command, args, env}
+    /// shape so Claude Code starts spawning it.
+    #[test]
+    fn test_toggle_mcp_server_on_re_registers_in_claude_json() {
+        let (home, _guard) = setup_temp_env();
+        // Seed config with code-embed disabled (its default state).
+        seed_default_config(&home);
+
+        rt().block_on(async {
+            toggle_mcp_server("code-embed".to_string(), true, user_apps_free())
+                .await
+                .expect("toggle_mcp_server on");
+        });
+
+        let cj = read_claude_json(&home);
+        let entry = &cj["mcpServers"]["code-embed"];
+        assert!(
+            entry.is_object(),
+            "expected `code-embed` registered in ~/.claude.json mcpServers, got: {}",
+            cj["mcpServers"]
+        );
+        // Canonical shape ({type:stdio, command, args, env}) — same as
+        // `mcp_server_to_claude_entry` produces.
+        assert_eq!(entry["type"], "stdio");
+        assert!(
+            entry.get("command").is_some(),
+            "missing command field: {}",
+            entry
+        );
+        assert!(
+            entry.get("args").is_some(),
+            "missing args field: {}",
+            entry
+        );
+        assert!(
+            entry.get("env").is_some(),
+            "missing env field: {}",
+            entry
+        );
+    }
+
+    // ─── Fix #2: Secret-typed settings route through keychain ────────────
+
+    /// P1-B: `update_mcp_setting` with a Secret-typed setting must route
+    /// the value to the keychain and leave the JSON config value EMPTY.
+    /// Pre-fix the value landed verbatim in orchestrator.json.
+    ///
+    /// Skipped when the OS keychain backend is unavailable (CI containers,
+    /// headless build hosts).
+    #[test]
+    fn test_update_mcp_setting_secret_routes_to_keychain_not_json() {
+        if !keyring_available() {
+            eprintln!("[skip] no OS keychain backend in this test env");
+            return;
+        }
+        let (home, _guard) = setup_temp_env();
+        seed_default_config(&home);
+
+        // The default `search` MCP has a Secret-typed `GITHUB_TOKEN`.
+        // Use a unique canary so we can detect leakage anywhere.
+        let canary = format!("canary-test-pat-{}", uuid::Uuid::new_v4().simple());
+
+        rt().block_on(async {
+            update_mcp_setting(
+                "search".to_string(),
+                "GITHUB_TOKEN".to_string(),
+                canary.clone(),
+            )
+            .await
+            .expect("update_mcp_setting Secret");
+        });
+
+        // 1) JSON config value is EMPTY (NOT the canary).
+        let cfg_text = std::fs::read_to_string(home.join("orchestrator.json")).unwrap();
+        assert!(
+            !cfg_text.contains(&canary),
+            "leaked canary into orchestrator.json: {}",
+            cfg_text
+        );
+        let cfg: OrchestratorConfig = serde_json::from_str(&cfg_text).unwrap();
+        let search_entry = cfg
+            .mcp_servers
+            .iter()
+            .find(|s| s.id == "search")
+            .expect("search MCP");
+        let token = search_entry
+            .settings
+            .get("GITHUB_TOKEN")
+            .expect("GITHUB_TOKEN setting");
+        assert_eq!(
+            token.value, "",
+            "GITHUB_TOKEN value should be cleared in JSON: {:?}",
+            token
+        );
+        assert_eq!(token.setting_type, McpSettingType::Secret);
+
+        // 2) Keychain has the canary at the documented namespace.
+        let kc = crate::secrets::get(
+            crate::secrets::SecretScope::Global,
+            &mcp_secret_module_id("search"),
+            "GITHUB_TOKEN",
+        )
+        .expect("keychain get");
+        assert_eq!(
+            kc.as_deref(),
+            Some(canary.as_str()),
+            "keychain did not receive the secret"
+        );
+
+        // Cleanup keychain best-effort.
+        let _ = crate::secrets::delete(
+            crate::secrets::SecretScope::Global,
+            &mcp_secret_module_id("search"),
+            "GITHUB_TOKEN",
+        );
+    }
+
+    /// P1-B: when the orchestrator install's `.claude/settings.json` is
+    /// rewritten with `apply_mcp_to_claude_settings`, Secret-typed
+    /// settings MUST NOT appear in the env block. Pre-fix the cleared
+    /// empty string still landed in env (same key, value=""), masking a
+    /// keychain miss as "secret = empty string" which is worse than
+    /// absent.
+    #[test]
+    fn test_apply_mcp_to_claude_settings_omits_secret_values() {
+        let (home, _guard) = setup_temp_env();
+
+        // Build a config whose install_path is a temp dir with a seeded
+        // .claude/settings.json. The function reads the existing file
+        // and merges the env block.
+        let install_dir = home.join("orch-install");
+        let claude_dir = install_dir.join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let settings_path = claude_dir.join("settings.json");
+        std::fs::write(
+            &settings_path,
+            r#"{"env": {"PRE_EXISTING": "keep"}}"#,
+        )
+        .unwrap();
+
+        let mut config = OrchestratorConfig::default();
+        config.install_path = install_dir.display().to_string();
+        // Inject a fake MCP with one Secret-typed setting + one Text-typed.
+        let mut mcp_settings: HashMap<String, McpSetting> = HashMap::new();
+        mcp_settings.insert(
+            "MY_SECRET".to_string(),
+            McpSetting {
+                label: "My Secret".to_string(),
+                value: "should-not-appear".to_string(),
+                setting_type: McpSettingType::Secret,
+                description: String::new(),
+                editable: true,
+            },
+        );
+        mcp_settings.insert(
+            "MY_VISIBLE".to_string(),
+            McpSetting {
+                label: "Visible".to_string(),
+                value: "ok-emit".to_string(),
+                setting_type: McpSettingType::Text,
+                description: String::new(),
+                editable: true,
+            },
+        );
+        let test_mcp = McpServerConfig {
+            id: "test-mcp".to_string(),
+            name: "Test MCP".to_string(),
+            description: String::new(),
+            enabled: true,
+            command: "test".to_string(),
+            args: vec![],
+            env: HashMap::new(),
+            min_tier: OrchestratorTier::Free,
+            port: None,
+            configurable: true,
+            settings: mcp_settings,
+        };
+        config.mcp_servers.push(test_mcp);
+
+        rt().block_on(async {
+            apply_mcp_to_claude_settings(&config).await.unwrap();
+        });
+
+        let raw = std::fs::read_to_string(&settings_path).unwrap();
+        // Even string-search the raw file: the canary value MUST NOT be
+        // anywhere on disk under .claude/settings.json.
+        assert!(
+            !raw.contains("should-not-appear"),
+            "Secret value leaked into .claude/settings.json: {}",
+            raw
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let env = &parsed["env"];
+        assert!(
+            env.get("MY_SECRET").is_none(),
+            "Secret key emitted into env block: {}",
+            env
+        );
+        // Non-Secret value still emitted, pre-existing keys preserved.
+        assert_eq!(env["MY_VISIBLE"], "ok-emit");
+        assert_eq!(env["PRE_EXISTING"], "keep");
+    }
+
+    /// P1-B: the one-shot migration on first launcher start must move
+    /// pre-existing plaintext Secret values from `~/.vct/orchestrator.json`
+    /// into the keychain and clear the JSON values. Idempotent: a second
+    /// run finds the app_state flag set and does nothing.
+    #[test]
+    fn test_first_run_migrates_plaintext_secrets_to_keychain() {
+        if !keyring_available() {
+            eprintln!("[skip] no OS keychain backend in this test env");
+            return;
+        }
+        let (home, _guard) = setup_temp_env();
+
+        // Seed orchestrator.json with a plaintext Secret value (the
+        // pre-fix bad state). Use a unique canary.
+        let canary = format!(
+            "migration-canary-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let mut config = OrchestratorConfig::default();
+        // Mutate the bundled `search` MCP's GITHUB_TOKEN setting to
+        // carry the canary plaintext.
+        for server in config.mcp_servers.iter_mut() {
+            if server.id == "search" {
+                if let Some(s) = server.settings.get_mut("GITHUB_TOKEN") {
+                    s.value = canary.clone();
+                }
+            }
+        }
+        // Note: VCT_STATE_DIR points at `home`, so config_path() resolves
+        // to `home/orchestrator.json`. (Setting it to `home/.vct` would
+        // also work but the env override in setup_temp_env uses `home`
+        // directly to avoid a redundant subdir.)
+        let path = home.join("orchestrator.json");
+        std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+
+        let db = crate::db::Db::open_in_memory().unwrap();
+
+        // Run #1: should migrate.
+        let report = migrate_plaintext_mcp_secrets_to_keychain(&db).unwrap();
+        assert!(
+            !report.already_done,
+            "first run should not be already_done"
+        );
+        assert!(
+            report.migrated_keys.iter().any(|k| k == "search/GITHUB_TOKEN"),
+            "expected search/GITHUB_TOKEN migrated, got: {:?}",
+            report.migrated_keys
+        );
+        assert!(
+            report.flag_set,
+            "flag should flip after a clean migration"
+        );
+
+        // JSON cleared.
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !after.contains(&canary),
+            "canary still in orchestrator.json post-migration: {}",
+            after
+        );
+
+        // Keychain has it.
+        let kc = crate::secrets::get(
+            crate::secrets::SecretScope::Global,
+            &mcp_secret_module_id("search"),
+            "GITHUB_TOKEN",
+        )
+        .unwrap();
+        assert_eq!(kc.as_deref(), Some(canary.as_str()));
+
+        // Run #2: idempotent — already_done short-circuits.
+        let report2 = migrate_plaintext_mcp_secrets_to_keychain(&db).unwrap();
+        assert!(report2.already_done, "second run should be a no-op");
+        assert!(
+            report2.migrated_keys.is_empty(),
+            "second run should report nothing migrated: {:?}",
+            report2.migrated_keys
+        );
+
+        // Cleanup.
+        let _ = crate::secrets::delete(
+            crate::secrets::SecretScope::Global,
+            &mcp_secret_module_id("search"),
+            "GITHUB_TOKEN",
+        );
+    }
 }

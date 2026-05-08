@@ -130,6 +130,25 @@ pub struct ProjectEnvSettings {
     /// rather than being a side-channel `find_local_repo_root()` call
     /// inside the writer body.
     pub orchestrator_root: Option<PathBuf>,
+
+    /// Multi-source KG access list (P1-D, 2026-05-08). Sorted, deduped list
+    /// of peer project names (sanitized — i.e. the prefix used in the
+    /// peer's `<Name>_KnowledgeGraph` collection) the current project has
+    /// READ access to via the launcher's access matrix. Empty when the
+    /// project only has access to its own + the shared KG (the default).
+    /// Emitted as `VCT_KG_ACCESS_LIST=Foo,Bar,Baz` to all three install
+    /// surfaces; consumed by `weaviate_mcp/server.py::_kg_collections_to_search`
+    /// and the bundled `rl_kg_search.py` to fan-out searches across peers.
+    pub kg_access_list: Vec<String>,
+
+    /// Multi-source code-graph access list (P1-D, 2026-05-08). Sorted,
+    /// deduped list of peer project names whose code graph the current
+    /// project has READ access to (`codegraph_access` table, where the
+    /// current project is `grantee` and `access_level == 'read'`). Each
+    /// peer maps to 5 prefixed Weaviate collections (`<Name>_CodeFunction`,
+    /// `<Name>_CodeClass`, etc.). Empty by default. Emitted as
+    /// `VCT_CODE_GRAPH_ACCESS_LIST=Foo,Bar,Baz`.
+    pub code_graph_access_list: Vec<String>,
 }
 
 impl ProjectEnvSettings {
@@ -156,6 +175,8 @@ impl ProjectEnvSettings {
             use_gpu: false,
             project_name: project_name.to_string(),
             orchestrator_root: None,
+            kg_access_list: Vec::new(),
+            code_graph_access_list: Vec::new(),
         }
     }
 
@@ -327,6 +348,23 @@ pub fn populate(
         .unwrap_or(false);
 
     let kg_basename = sanitize_kg_collection(project_name);
+    let own_kg = format!("{}_KnowledgeGraph", kg_basename);
+    let own_dev = format!("{}_Development", kg_basename);
+
+    // P1-D (2026-05-08): resolve cross-project KG + codegraph access lists
+    // from the launcher's access matrix. These flow into env vars on the
+    // 3 surfaces and are consumed by `weaviate_mcp/server.py` + the
+    // bundled `rl_kg_search.py` to fan-out searches across peers. Soft-fail
+    // (empty list) on any DB error — env-file writes must never block on a
+    // matrix-read hiccup.
+    let kg_access_list = match project_id {
+        Some(pid) => resolve_kg_access_peers(db, pid, &own_kg, &own_dev, &shared_kg_collection),
+        None => Vec::new(),
+    };
+    let code_graph_access_list = match project_id {
+        Some(pid) => resolve_code_graph_access_peers(db, pid),
+        None => Vec::new(),
+    };
 
     ProjectEnvSettings {
         active_embedding,
@@ -337,8 +375,8 @@ pub fn populate(
         ollama_port,
         code_embed_port,
         container_runtime: detect_runtime_sync(),
-        kg_collection: format!("{}_KnowledgeGraph", kg_basename),
-        dev_collection: format!("{}_Development", kg_basename),
+        kg_collection: own_kg,
+        dev_collection: own_dev,
         shared_kg_collection,
         shared_kg_write_disabled,
         cpu_only: !use_gpu,
@@ -349,7 +387,97 @@ pub fn populate(
         // produces a usable `.claude/env` (the bundled hooks' in-tree
         // fallback path takes over).
         orchestrator_root: find_local_repo_root().ok(),
+        kg_access_list,
+        code_graph_access_list,
     }
+}
+
+/// Extract peer project names from the launcher's `kg_collection_access`
+/// matrix for a given project. Returns the SANITIZED prefix of every
+/// `<X>_KnowledgeGraph` collection the project has read/write access to,
+/// excluding the project's own KG/dev collections and the cross-project
+/// shared collection. Sorted + deduped for deterministic env output.
+///
+/// Soft-fail: any DB error → empty list (the access-list feature is a
+/// strict opt-in extension; a populate-time read failure must never
+/// degrade the basic env write).
+///
+/// Naming round-trip: `kg_set_access` writes `<Sanitized>_KnowledgeGraph`
+/// from `populate_kg_collection_access`; we strip the trailing
+/// `_KnowledgeGraph` (or `_Development`) and feed the prefix back to the
+/// MCP server, which re-applies its own `_sanitize_collection_prefix`
+/// (idempotent for already-sanitized inputs) before resolving the full
+/// collection name. This keeps the env-var contract project-name-shaped
+/// rather than collection-name-shaped, matching the design in
+/// `vco-multi-source-kg-access-design.md`.
+fn resolve_kg_access_peers(
+    db: &Db,
+    project_id: &str,
+    own_kg: &str,
+    own_dev: &str,
+    shared_kg: &str,
+) -> Vec<String> {
+    let rows = match db.kg_list_access(project_id) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let mut peers: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (collection_name, access_level) in rows {
+        if access_level != "read" && access_level != "write" {
+            continue;
+        }
+        if collection_name == own_kg
+            || collection_name == own_dev
+            || collection_name == shared_kg
+        {
+            continue;
+        }
+        if let Some(stripped) = collection_name
+            .strip_suffix("_KnowledgeGraph")
+            .or_else(|| collection_name.strip_suffix("_Development"))
+        {
+            if !stripped.is_empty() {
+                peers.insert(stripped.to_string());
+            }
+        }
+    }
+    peers.into_iter().collect()
+}
+
+/// Extract peer project names whose code graph the given project can read.
+/// Reads the `codegraph_access` table for rows where `grantee_project_id =
+/// project_id` and `access_level = 'read'`, then resolves grantor IDs to
+/// human-readable project names. Sorted by sanitized peer name for
+/// deterministic env output. Soft-fail to empty list on any DB error.
+fn resolve_code_graph_access_peers(db: &Db, project_id: &str) -> Vec<String> {
+    let rows = match db.codegraph_list_grants_to(project_id) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let mut peers: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (grantor_id, access_level) in rows {
+        if access_level != "read" {
+            continue;
+        }
+        if grantor_id == project_id {
+            continue;
+        }
+        // Resolve grantor's name → sanitized prefix (matches the per-project
+        // code-graph collection naming `<Sanitized>_CodeFunction` etc.).
+        match db.get_project(&grantor_id) {
+            Ok(Some(row)) => {
+                let sanitized = sanitize_kg_collection(&row.name);
+                if !sanitized.is_empty() {
+                    peers.insert(sanitized);
+                }
+            }
+            // Dangling grantor (project deleted): skip silently.
+            Ok(None) => {}
+            // DB error per row: skip the row, keep going.
+            Err(_) => {}
+        }
+    }
+    peers.into_iter().collect()
 }
 
 #[cfg(test)]

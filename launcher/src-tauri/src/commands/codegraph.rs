@@ -100,6 +100,14 @@ pub async fn codegraph_grant_access(
             "access_level": req.access_level,
         }),
     )?;
+    // P1-D (2026-05-08): refresh the GRANTEE's env files (the access list
+    // is keyed on grantee → which projects this grantee can read), so a
+    // running Claude Code session in the grantee's terminal picks up
+    // VCT_CODE_GRAPH_ACCESS_LIST without a restart. Soft-fail.
+    let _ = crate::commands::projects_v2::refresh_project_env_with_db(
+        &db,
+        &req.grantee_project_id,
+    );
     Ok(())
 }
 

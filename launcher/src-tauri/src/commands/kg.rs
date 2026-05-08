@@ -300,6 +300,11 @@ pub async fn kg_set_collection_access(
         None,
         &serde_json::json!({ "collection": collection, "access": access }),
     )?;
+    // P1-D (2026-05-08): refresh the project's env files so a running
+    // Claude Code session sees the new VCT_KG_ACCESS_LIST without a
+    // restart. Soft-fail: never roll back the matrix change on a
+    // refresh hiccup.
+    let _ = crate::commands::projects_v2::refresh_project_env_with_db(&db, &project_id);
     Ok(())
 }
 
@@ -804,6 +809,17 @@ pub async fn kg_set_collection_access_mode(
             "project_count": req.project_ids.len(),
         }),
     )?;
+    // P1-D (2026-05-08): refresh env files for every affected project so
+    // running sessions pick up the new VCT_KG_ACCESS_LIST without a
+    // restart. The mode setter modifies every other project's row, so
+    // we refresh all projects (small bounded set in practice; access
+    // matrix changes are rare). Soft-fail per project; one bad write
+    // does not abort the remaining refreshes.
+    if let Ok(all) = db.list_projects() {
+        for p in all {
+            let _ = crate::commands::projects_v2::refresh_project_env_with_db(&db, &p.id);
+        }
+    }
     Ok(())
 }
 
