@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # kg-summary-generator.sh — PostToolUse hook
 # Spawns a background Haiku agent to generate/update summaries for KG nodes.
 # Fires on: Edit(knowledge/**/*.md), Write(knowledge/**/*.md), mcp__weaviate-kg__store_knowledge_node

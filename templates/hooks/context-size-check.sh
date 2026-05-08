@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Context Size Check Hook Template
 #
 # Purpose: Monitor CONTEXT_STATE.md size and trigger doc-maintainer agent when threshold exceeded

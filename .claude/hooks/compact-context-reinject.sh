@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # compact-context-reinject.sh
 # Fires on SessionStart with matcher "compact"
 # Re-injects critical session context that compaction may have dropped.

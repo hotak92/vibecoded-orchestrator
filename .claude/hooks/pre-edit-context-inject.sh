@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Pre-edit context injection hook
 # Fires BEFORE Edit tool executes — injects KG + code graph context for the file being edited
 # Output goes to stdout → becomes additionalContext the LLM sees before executing the edit
