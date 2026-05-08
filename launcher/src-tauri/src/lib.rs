@@ -243,6 +243,10 @@ pub fn run() {
             commands::installer::detect_existing_services,
             commands::installer::get_default_install_path,
             commands::installer::check_install_status,
+            // GPU/CDI drift check (Linux+NVIDIA only). Runs once at app
+            // startup from +layout.svelte. Returns a tagged enum:
+            // Ok | Drift{...} | NotApplicable{reason}. Never errors.
+            commands::gpu::check_cdi_drift,
             commands::installer::get_installed_version,
             commands::installer::check_for_updates,
             commands::installer::install_orchestrator,
