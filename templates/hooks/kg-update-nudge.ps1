@@ -1,3 +1,4 @@
+# Parity-touch 2026-05-08: bash shebang of sibling .sh switched from #!/bin/bash to #!/usr/bin/env bash for macOS portability. PS1 has no shebang to change; this comment is the parity-required modification.
 #!/usr/bin/env pwsh
 # KG-update nudge — PowerShell sibling of kg-update-nudge.sh
 # Same v10.1 logic; cross-OS sibling for Windows. Both shells delegate to

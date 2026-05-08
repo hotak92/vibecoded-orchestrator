@@ -1,8 +1,13 @@
 # verify-container-ports.ps1 — host-side container-port watchdog (2026-05-08).
 #
-# PowerShell sibling of verify-container-ports.sh. Same purpose: detect
-# the podman state-DB desync where `podman ps` says "running" but the
-# host port is unbound. Recovery: `podman rm -f` + `podman-compose up -d`.
+# PowerShell sibling of verify-container-ports.sh. Engine-agnostic:
+# detects "container says running but host port doesn't answer" for
+# both podman (state-DB desync) and docker (silent app-level crash).
+# Recovery is engine-specific: podman → rm -f + compose up; docker
+# → restart.
+#
+# Engine selection: $env:VCT_CONTAINER_RUNTIME wins; otherwise prefer
+# podman (project convention), fall back to docker.
 #
 # Bypass: $env:VCT_SKIP_PORT_WATCHDOG = "1"
 # Verbose: $env:VCT_PORT_WATCHDOG_VERBOSE = "1"
@@ -11,7 +16,29 @@
 
 if ($env:VCT_SKIP_PORT_WATCHDOG -eq "1") { return }
 
-if (-not (Get-Command podman -ErrorAction SilentlyContinue)) { return }
+# Engine selection.
+$runtime = $env:VCT_CONTAINER_RUNTIME
+if (-not $runtime) {
+    if (Get-Command podman -ErrorAction SilentlyContinue) {
+        $runtime = "podman"
+    } elseif (Get-Command docker -ErrorAction SilentlyContinue) {
+        $runtime = "docker"
+    } else {
+        return
+    }
+}
+if (-not (Get-Command $runtime -ErrorAction SilentlyContinue)) { return }
+
+# Compose driver (`podman-compose` / `podman compose` / `docker compose`).
+if ($runtime -eq "podman") {
+    if (Get-Command podman-compose -ErrorAction SilentlyContinue) {
+        $composeArgs = @("podman-compose")
+    } else {
+        $composeArgs = @("podman", "compose")
+    }
+} else {
+    $composeArgs = @("docker", "compose")
+}
 
 # Container | host_port | probe_kind | probe_endpoint
 $watch = @(
@@ -50,17 +77,20 @@ function Test-PortTcp {
 
 function Test-ContainerRunning {
     param([string]$Name)
-    $names = & podman ps --filter "name=^$Name`$" --format "{{.Names}}" 2>$null
+    $names = & $runtime ps --filter "name=^$Name`$" --format "{{.Names}}" 2>$null
     return $names -contains $Name
 }
 
 function Test-ContainerPidAlive {
     param([string]$Name)
-    $pidStr = & podman inspect $Name --format "{{.State.Pid}}" 2>$null
-    if (-not $pidStr -or $pidStr -eq "0") { return $false }
-    # On Windows + podman-machine, the PID is inside the VM and we
-    # can't /proc-check it from the host. Assume alive on non-Linux.
+    # Docker has no zombie state-DB issue (centralised daemon manages
+    # state honestly). Always treat docker containers' "running" as
+    # truthful. Same for any runtime where the container PID lives in
+    # a VM (Docker Desktop on macOS/Windows, Podman Machine).
+    if ($runtime -ne "podman") { return $true }
     if (-not $IsLinux) { return $true }
+    $pidStr = & $runtime inspect $Name --format "{{.State.Pid}}" 2>$null
+    if (-not $pidStr -or $pidStr -eq "0") { return $false }
     return Test-Path "/proc/$pidStr"
 }
 
@@ -120,24 +150,35 @@ foreach ($z in $zombies) {
     $name = $z.Name
     $port = $z.Port
     $service = $name -replace "_claude$", ""
-    Write-Output "   → recovering $name (port :$port)"
-    & podman rm -f $name *>$null
-    if ($LASTEXITCODE -eq 0) {
-        if ($composeDir) {
-            Push-Location $composeDir
-            try {
-                & podman-compose up -d $service *>$null
-                if ($LASTEXITCODE -ne 0) {
-                    Write-Output "     ! podman-compose up -d $service failed; manual: cd $composeDir && podman-compose up -d $service"
+    Write-Output "   → recovering $name (port :$port) via $runtime"
+    if ($runtime -eq "podman") {
+        # Podman state-DB desync: force-rm + recreate. `podman restart`
+        # is a no-op because Podman thinks the container is alive.
+        & $runtime rm -f $name *>$null
+        if ($LASTEXITCODE -eq 0) {
+            if ($composeDir) {
+                Push-Location $composeDir
+                try {
+                    & $composeArgs[0] $composeArgs[1..($composeArgs.Length - 1)] up -d $service *>$null
+                    if ($LASTEXITCODE -ne 0) {
+                        Write-Output "     ! $($composeArgs -join ' ') up -d $service failed; manual: cd $composeDir; $($composeArgs -join ' ') up -d $service"
+                    }
+                } finally {
+                    Pop-Location
                 }
-            } finally {
-                Pop-Location
+            } else {
+                Write-Output "     ! could not auto-detect compose dir; manual: $($composeArgs -join ' ') up -d $service"
             }
         } else {
-            Write-Output "     ! could not auto-detect compose dir; manual: podman-compose up -d $service"
+            Write-Output "     ! $runtime rm -f $name failed"
         }
     } else {
-        Write-Output "     ! podman rm -f $name failed"
+        # Docker silent-crash: state DB is reliable, so the app inside
+        # has wedged. Restart cycles PID 1 and is enough.
+        & $runtime restart $name *>$null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Output "     ! $runtime restart $name failed; manual: $runtime logs $name"
+        }
     }
 }
 

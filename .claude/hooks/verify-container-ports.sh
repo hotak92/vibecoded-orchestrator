@@ -1,20 +1,30 @@
 #!/usr/bin/env bash
 # verify-container-ports.sh — host-side container-port watchdog (2026-05-08).
 #
-# Wired as a SessionStart:startup hook. Detects the Podman state-DB desync
-# pattern observed 2026-05-07/08: `podman ps` says a container is "Up X
-# hours (running)", but the host port is unbound and `curl` fails. The
-# container's main PID is dead (and conmon vanished without writing the
-# exit event) — Podman's view of the world is wrong. Only a force-rm +
-# recreate clears it; `podman restart` is a no-op because Podman thinks
-# the container is already running.
+# Wired as a SessionStart:startup hook. Detects two related failure modes
+# where `<runtime> ps` reports a container as "running" but the host port
+# isn't actually answering:
 #
-# Detection: host-side TCP probe of each declared port, NOT podman ps
-# (which lies). If a port is listed in the table below AND the
-# corresponding container is running per `podman ps` AND the port can't
-# be reached from the host, that's the zombie state.
+#   1. Podman state-DB desync (Podman-specific, observed 2026-05-07/08):
+#      conmon vanished without writing the exit event, so Podman's state
+#      DB stays stuck on "running" after the main PID died. Only a
+#      force-rm + recreate clears it; `podman restart` is a no-op because
+#      Podman thinks the container is already running.
+#   2. App-level silent crash (engine-agnostic): the container is alive
+#      and PID 1 is responsive, but the app inside has crashed/wedged
+#      and stopped accepting connections on its port.
 #
-# Recovery: podman rm -f <container> && podman-compose up -d <service>.
+# Both look the same from the host's POV (TCP probe fails despite ps
+# saying "running"). Recovery is engine-specific:
+#   - Podman: distinguish via PID-alive cross-check; recover dead-PID
+#     case with `podman rm -f` + compose up. Live PID = slow warm-up,
+#     skip recovery.
+#   - Docker: state-DB desync doesn't exist (daemon manages state
+#     centrally). Live `<runtime> ps` is trustworthy. Recovery is just
+#     `docker restart <name>` for the silent-crash case.
+#
+# Engine detection: prefer podman per project convention, fall back to
+# docker. VCT_CONTAINER_RUNTIME env var explicitly overrides.
 #
 # Bypass: VCT_SKIP_PORT_WATCHDOG=1
 # Verbose:  VCT_PORT_WATCHDOG_VERBOSE=1 (default: only prints when it
@@ -26,7 +36,34 @@ set -uo pipefail
 
 [ "${VCT_SKIP_PORT_WATCHDOG:-0}" = "1" ] && exit 0
 
-command -v podman >/dev/null 2>&1 || exit 0
+# Engine selection: explicit env override wins; otherwise prefer podman
+# (project convention), fall back to docker. Bail if neither is on PATH.
+RUNTIME="${VCT_CONTAINER_RUNTIME:-}"
+if [ -z "$RUNTIME" ]; then
+    if command -v podman >/dev/null 2>&1; then
+        RUNTIME="podman"
+    elif command -v docker >/dev/null 2>&1; then
+        RUNTIME="docker"
+    else
+        exit 0
+    fi
+fi
+command -v "$RUNTIME" >/dev/null 2>&1 || exit 0
+
+# Compose driver matches engine (podman-compose for podman, docker compose
+# for docker). Both honour the same compose.yaml format.
+case "$RUNTIME" in
+    podman)
+        COMPOSE_CMD=("podman-compose")
+        command -v podman-compose >/dev/null 2>&1 || COMPOSE_CMD=("podman" "compose")
+        ;;
+    docker)
+        COMPOSE_CMD=("docker" "compose")
+        ;;
+    *)
+        exit 0
+        ;;
+esac
 
 # Container | host_port | probe_kind | probe_endpoint
 # probe_kind: "http" → curl with --max-time 3
@@ -55,14 +92,22 @@ probe_port() {
 
 container_running() {
     local name="$1"
-    podman ps --filter "name=^${name}$" --format '{{.Names}}' 2>/dev/null \
+    "$RUNTIME" ps --filter "name=^${name}$" --format '{{.Names}}' 2>/dev/null \
         | grep -qx "$name"
 }
 
+# Podman-only: tells real "running" from zombie state-DB entries by
+# checking whether the registered PID is alive in /proc. Docker doesn't
+# have this failure mode (centralised daemon keeps its state honest)
+# AND on Docker Desktop / Windows the container PID lives inside a VM
+# we can't /proc-check from the host, so always assume alive there.
 container_pid_alive() {
     local name="$1"
+    if [ "$RUNTIME" != "podman" ]; then
+        return 0
+    fi
     local pid
-    pid=$(podman inspect "$name" --format '{{.State.Pid}}' 2>/dev/null)
+    pid=$("$RUNTIME" inspect "$name" --format '{{.State.Pid}}' 2>/dev/null)
     [ -n "$pid" ] && [ "$pid" != "0" ] && [ -d "/proc/$pid" ]
 }
 
@@ -111,16 +156,27 @@ done
 for entry in "${zombies[@]}"; do
     IFS='|' read -r name port <<< "$entry"
     service="${name%_claude}"
-    echo "   → recovering $name (port :$port)"
-    if podman rm -f "$name" >/dev/null 2>&1; then
-        if [ -n "$compose_dir" ]; then
-            ( cd "$compose_dir" && podman-compose up -d "$service" >/dev/null 2>&1 ) || \
-                echo "     ! podman-compose up -d $service failed; manual: cd $compose_dir && podman-compose up -d $service"
+    echo "   → recovering $name (port :$port) via $RUNTIME"
+    if [ "$RUNTIME" = "podman" ]; then
+        # Podman state-DB desync: force-rm + recreate. `podman restart`
+        # would be a no-op because Podman thinks the container is alive.
+        if "$RUNTIME" rm -f "$name" >/dev/null 2>&1; then
+            if [ -n "$compose_dir" ]; then
+                ( cd "$compose_dir" && "${COMPOSE_CMD[@]}" up -d "$service" >/dev/null 2>&1 ) || \
+                    echo "     ! ${COMPOSE_CMD[*]} up -d $service failed; manual: cd $compose_dir && ${COMPOSE_CMD[*]} up -d $service"
+            else
+                echo "     ! could not auto-detect compose dir; manual: ${COMPOSE_CMD[*]} up -d $service"
+            fi
         else
-            echo "     ! could not auto-detect compose dir; manual: podman-compose up -d $service"
+            echo "     ! $RUNTIME rm -f $name failed"
         fi
     else
-        echo "     ! podman rm -f $name failed"
+        # Docker silent-crash: state DB is reliable, so this means the
+        # app inside the container has wedged. `docker restart` cycles
+        # PID 1 and is enough.
+        if ! "$RUNTIME" restart "$name" >/dev/null 2>&1; then
+            echo "     ! $RUNTIME restart $name failed; manual: $RUNTIME logs $name"
+        fi
     fi
 done
 
