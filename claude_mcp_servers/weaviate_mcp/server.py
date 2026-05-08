@@ -816,23 +816,139 @@ def _code_collection(base: str) -> str:
 _MAX_SINGLE_CHUNK_TOKENS = 2000
 
 
+class WeaviateUnreachable(Exception):
+    """Raised when Weaviate is not reachable (HTTP refused / gRPC down).
+
+    Carries a user-actionable message in `.user_msg` for the MCP layer to
+    surface to the agent. The bare exception message stays terse; the
+    full hint (commands to verify + recover) is in user_msg.
+    """
+    def __init__(self, msg: str, user_msg: str):
+        super().__init__(msg)
+        self.user_msg = user_msg
+
+
 def get_weaviate_client():
-    """Get or create Weaviate client"""
+    """Get or create Weaviate client.
+
+    Raises WeaviateUnreachable on connection failure with an actionable
+    user_msg pointing at the most likely root causes (port-binding
+    desync, container down, healthcheck flap).
+    """
     global weaviate_client
     if weaviate_client is None:
         http_host = WEAVIATE_URL.replace("http://", "").replace("https://", "").split(":")[0]
         http_port = int(WEAVIATE_URL.split(":")[-1]) if ":" in WEAVIATE_URL else 8081
 
-        weaviate_client = weaviate.connect_to_custom(
-            http_host=http_host,
-            http_port=http_port,
-            http_secure=False,
-            grpc_host=http_host,
-            grpc_port=GRPC_PORT,
-            grpc_secure=False
-        )
+        try:
+            weaviate_client = weaviate.connect_to_custom(
+                http_host=http_host,
+                http_port=http_port,
+                http_secure=False,
+                grpc_host=http_host,
+                grpc_port=GRPC_PORT,
+                grpc_secure=False
+            )
+        except Exception as exc:
+            # Loud-fail v2 (2026-05-08 silent-zero antipattern fix). Don't
+            # cache failed client (global stays None so the next call retries;
+            # transient port-binding glitches recover automatically).
+            weaviate_client = None
+            raise WeaviateUnreachable(str(exc), _build_unreachable_hint(exc)) from exc
         logger.info(f"✓ Connected to Weaviate at {WEAVIATE_URL}")
     return weaviate_client
+
+
+def _weaviate_unreachable_response(exc: WeaviateUnreachable, query: str = "") -> str:
+    """Format WeaviateUnreachable as the structured failure response that
+    MCP search tools (hybrid_search / semantic_graph_search /
+    search_code_graph / query_code_structure) return verbatim. Loud-fail
+    per 2026-05-08 silent-zero antipattern fix.
+    """
+    return json.dumps({
+        "success": False,
+        "error": "Weaviate unreachable",
+        "error_class": "WeaviateUnreachable",
+        "query": query,
+        "hint": exc.user_msg,
+    }, indent=2)
+
+
+def _build_unreachable_hint(exc: Exception) -> str:
+    """Build the actionable user_msg shown to the agent on loud-fail."""
+    return (
+        f"Weaviate unreachable at {WEAVIATE_URL} (gRPC :{GRPC_PORT}). "
+        "This is the loud-fail behaviour added 2026-05-08 — earlier the MCP "
+        "would silently return success:true count:0 on connection refused, "
+        "which let multi-hour sessions run thinking the KG was empty. "
+        "Common causes + fixes:\n"
+        "  1. Container down: `podman ps | grep weaviate` and check status.\n"
+        "  2. Host port unbound while container reports 'running' (Podman state-DB "
+        "desync): `curl -sf http://localhost:8081/v1/meta` from host. If it fails, "
+        "force-recreate: `podman rm -f weaviate_claude && podman-compose up -d weaviate`.\n"
+        "  3. Stuck healthcheck restart-loop (pre-2026-05-08 compose used the "
+        "strict `/v1/.well-known/ready` endpoint that 503s during legitimate "
+        "operations): verify compose.yaml's healthcheck uses `/v1/meta` + "
+        "`start_period: 60s`.\n"
+        "Underlying error: " + str(exc)[:200]
+    )
+
+
+def _classify_weaviate_failure(exc: Exception):
+    """Return a WeaviateUnreachable if `exc` indicates Weaviate is
+    unreachable (either at connection time or mid-query). Return None
+    for other failure classes.
+
+    Two cases (both surfaced 2026-05-08):
+      1. Connection-time: weaviate.connect_to_custom() raises
+         WeaviateConnectionError when the gRPC/HTTP port can't be opened
+         at all (container down, port-binding desync).
+      2. Query-time: a cached, previously-valid client whose backing
+         Weaviate has since stopped raises WeaviateQueryError /
+         WeaviateGRPCUnavailableError on .query.* calls. The naive
+         loud-fail v1 fix only caught case 1; case 2 fell through to
+         the generic `except Exception` and produced silent-zero.
+
+    Cache invalidation: callers that catch WeaviateUnreachable should
+    also call _reset_weaviate_client_cache() so the next call forces a
+    fresh connect.
+    """
+    if isinstance(exc, WeaviateUnreachable):
+        return exc
+    try:
+        from weaviate.exceptions import (
+            WeaviateBaseError,
+            WeaviateConnectionError,
+            WeaviateGRPCUnavailableError,
+            WeaviateQueryError,
+        )
+    except ImportError:
+        msg = str(exc).lower()
+        if "connection refused" in msg or "unavailable" in msg or "failed to connect" in msg:
+            return WeaviateUnreachable(str(exc), _build_unreachable_hint(exc))
+        return None
+    if isinstance(exc, (WeaviateConnectionError, WeaviateQueryError, WeaviateGRPCUnavailableError)):
+        return WeaviateUnreachable(str(exc), _build_unreachable_hint(exc))
+    if isinstance(exc, WeaviateBaseError):
+        msg = str(exc).lower()
+        if "connection refused" in msg or "unavailable" in msg or "failed to connect" in msg or "grpc" in msg:
+            return WeaviateUnreachable(str(exc), _build_unreachable_hint(exc))
+    return None
+
+
+def _reset_weaviate_client_cache() -> None:
+    """Drop the cached client so the next call forces a fresh connect.
+    Called from search-tool exception handlers when WeaviateUnreachable
+    is detected so transient port-binding glitches recover automatically
+    on the next user-driven retry.
+    """
+    global weaviate_client
+    if weaviate_client is not None:
+        try:
+            weaviate_client.close()
+        except Exception:
+            pass
+        weaviate_client = None
 
 
 async def get_ollama_embedding(text: str) -> list[float] | None:
@@ -1721,7 +1837,33 @@ async def semantic_graph_search(
         neighbors discovered via WikiLink traversal). Each result carries title,
         file_path, node_type, score, tier, and content at the chosen detail.
     """
-    client = get_weaviate_client()
+    # Loud-fail wrapper (2026-05-08 silent-zero antipattern fix v2).
+    # Catches BOTH connection-time and query-time Weaviate failures.
+    try:
+        client = get_weaviate_client()
+        return await _semantic_graph_search_body(client, query, limit, depth, detail, include_stale)
+    except WeaviateUnreachable as exc:
+        _reset_weaviate_client_cache()
+        return _weaviate_unreachable_response(exc, query=query)
+    except Exception as exc:
+        unreachable = _classify_weaviate_failure(exc)
+        if unreachable is not None:
+            _reset_weaviate_client_cache()
+            return _weaviate_unreachable_response(unreachable, query=query)
+        raise
+
+
+async def _semantic_graph_search_body(
+    client,
+    query: str,
+    limit: int,
+    depth: int,
+    detail: str,
+    include_stale: bool,
+) -> str:
+    """Implementation body for semantic_graph_search. Extracted so the
+    public tool can wrap the entire query path with the v2 loud-fail
+    handler without indenting 300 lines."""
     coll = client.collections.get(KG_COLLECTION)
 
     fetch_limit = limit * _RL_OVERFETCH
@@ -2132,6 +2274,38 @@ async def hybrid_search(
         Each result includes title, file_path, node_type, score (0..1), tier (the
         verbosity actually applied), and content at the requested detail level.
     """
+    # Loud-fail wrapper (2026-05-08 silent-zero antipattern fix v2).
+    # Catches BOTH connection-time (get_weaviate_client raises
+    # WeaviateUnreachable) and query-time (cached client + Weaviate
+    # stopped mid-session → WeaviateQueryError raised from inside
+    # _hybrid_search_single_collection's per-collection except, which we
+    # changed below to classify+raise instead of swallow).
+    try:
+        return await _hybrid_search_body(
+            query, limit, node_type, tags, days, detail, include_stale,
+        )
+    except WeaviateUnreachable as exc:
+        _reset_weaviate_client_cache()
+        return _weaviate_unreachable_response(exc, query=query)
+    except Exception as exc:
+        unreachable = _classify_weaviate_failure(exc)
+        if unreachable is not None:
+            _reset_weaviate_client_cache()
+            return _weaviate_unreachable_response(unreachable, query=query)
+        raise
+
+
+async def _hybrid_search_body(
+    query: str,
+    limit: int,
+    node_type: str,
+    tags: list,
+    days: int,
+    detail: str,
+    include_stale: bool,
+) -> str:
+    """Implementation body for hybrid_search. Extracted so the public tool
+    can wrap the entire query path with v2 loud-fail handling."""
     # Build type/tag filter
     filters = []
     if node_type:
@@ -2178,6 +2352,13 @@ async def hybrid_search(
                 if key not in merged or item["combined_score"] > merged[key]["combined_score"]:
                     merged[key] = item
         except Exception as e:
+            # Loud-fail v2: don't swallow Weaviate-unreachable. Connection-time
+            # failures fire from get_weaviate_client(); query-time failures
+            # (cached client + Weaviate stopped mid-session) fire here.
+            unreachable = _classify_weaviate_failure(e)
+            if unreachable is not None:
+                _reset_weaviate_client_cache()
+                raise unreachable from e
             logger.warning(f"hybrid_search: error searching {coll_name}: {e}")
 
     # Sort all over-fetched candidates by combined score
@@ -3077,7 +3258,19 @@ async def search_code_graph(
             "results": results,
         })
 
+    except WeaviateUnreachable as exc:
+        # Loud-fail per 2026-05-08 silent-zero antipattern fix.
+        _reset_weaviate_client_cache()
+        return _weaviate_unreachable_response(exc, query=query)
     except Exception as e:
+        # Loud-fail v2: query-time failures (cached client + Weaviate
+        # stopped mid-session) raise WeaviateQueryError, not
+        # WeaviateUnreachable. Classify before falling through to the
+        # generic error handler.
+        unreachable = _classify_weaviate_failure(e)
+        if unreachable is not None:
+            _reset_weaviate_client_cache()
+            return _weaviate_unreachable_response(unreachable, query=query)
         logger.error(f"Error in code graph search: {e}")
         return json.dumps({"success": False, "error": str(e)}, indent=2)
 
@@ -3413,7 +3606,16 @@ def query_code_structure(
             "results": results
         })
 
+    except WeaviateUnreachable as exc:
+        # Loud-fail per 2026-05-08 silent-zero antipattern fix.
+        _reset_weaviate_client_cache()
+        return _weaviate_unreachable_response(exc, query=f"{query_type}:{target}")
     except Exception as e:
+        # Loud-fail v2: classify query-time failures as unreachable.
+        unreachable = _classify_weaviate_failure(e)
+        if unreachable is not None:
+            _reset_weaviate_client_cache()
+            return _weaviate_unreachable_response(unreachable, query=f"{query_type}:{target}")
         logger.error(f"Error in code structure query: {e}")
         return json.dumps({
             "success": False,
