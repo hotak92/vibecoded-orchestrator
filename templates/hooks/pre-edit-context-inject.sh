@@ -72,6 +72,32 @@ CACHE_FILE="$CACHE_DIR/$FILE_HASH"
 
 mkdir -p "$CACHE_DIR" 2>/dev/null || true
 
+# === Helper: emit context as PreToolUse JSON envelope ===
+# Plain stdout is silently discarded by Claude Code's hook runner — only
+# `hookSpecificOutput.additionalContext` reaches the LLM (system reminder
+# wrapper). 10k char cap per the documented contract. Pre-2026-05-08 this
+# hook printed plain stdout that never reached the LLM context, so all
+# the KG/codegraph injection work was effectively dead. Confirmed by
+# checking that no `[Pre-edit context for ...]` system-reminders ever
+# appeared in real Edit-tool transcripts.
+_emit_context_json() {
+    local ctx="$1"
+    [ -z "$ctx" ] && return 0
+    [ -z "${PY:-}" ] && return 0
+    local truncated
+    truncated=$(printf '%s' "$ctx" | head -c 10000)
+    "$PY" -c "
+import json, sys
+print(json.dumps({
+    'hookSpecificOutput': {
+        'hookEventName': 'PreToolUse',
+        'permissionDecision': 'allow',
+        'additionalContext': sys.stdin.read(),
+    }
+}))
+" <<< "$truncated" 2>/dev/null || true
+}
+
 # === Check cache (10 min TTL) ===
 # Use Python for mtime — `stat -c %Y` is GNU-only; macOS BSD stat needs
 # `-f %m`. Without this, every macOS install treats the cache as expired.
@@ -84,7 +110,7 @@ if [[ -f "$CACHE_FILE" ]]; then
     fi
     FILE_AGE=$(( $(date +%s) - CACHE_MTIME ))
     if [[ "$FILE_AGE" -lt "$CACHE_TTL" ]]; then
-        cat "$CACHE_FILE"
+        _emit_context_json "$(cat "$CACHE_FILE")"
         exit 0
     fi
 fi
@@ -205,10 +231,11 @@ if [[ "$HAS_CODE" == "1" ]]; then
     OUTPUT+="Related code: ${CODE_RESULT}"$'\n'
 fi
 
-# === Cache the result ===
+# === Cache the plain-text form + emit JSON envelope ===
+# Cache stores the human-readable form so re-emission produces identical
+# content. _emit_context_json wraps it for Claude Code's PreToolUse contract.
 echo "$OUTPUT" > "$CACHE_FILE" 2>/dev/null || true
 
-# === Output to stdout (becomes additionalContext) ===
-echo "$OUTPUT"
+_emit_context_json "$OUTPUT"
 
 exit 0
