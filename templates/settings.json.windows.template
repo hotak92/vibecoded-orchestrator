@@ -84,6 +84,11 @@
             "type": "command",
             "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\compact-context-reinject.ps1",
             "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\kg-update-nudge.ps1",
+            "timeout": 4
           }
         ]
       }
@@ -124,6 +129,11 @@
             "type": "command",
             "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\diff-context-inject.ps1",
             "timeout": 3
+          },
+          {
+            "type": "command",
+            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\kg-update-nudge.ps1",
+            "timeout": 4
           }
         ]
       }
@@ -281,6 +291,17 @@
             "background": true
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\kg-update-nudge.ps1",
+            "background": true,
+            "timeout": 3
+          }
+        ],
+        "matcher": "*"
       }
     ]
   },

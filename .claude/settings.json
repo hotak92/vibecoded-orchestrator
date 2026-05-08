@@ -158,6 +158,17 @@
             "if": "Edit(*)"
           }
         ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Bash(*vercel*--token*)",
+            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/pre-vercel-token-guard.sh",
+            "timeout": 2
+          }
+        ]
       }
     ],
     "ConfigChange": [

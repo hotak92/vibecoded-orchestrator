@@ -1283,26 +1283,63 @@ pub fn write_project_env_files(
     // panics at install time with a clear diagnostic, which is much
     // louder than the silent install/unregister drift the const
     // refactor was written to prevent.
+    //
+    // Install-flow audit (2026-05-08, P1 #2): the match arm produces an
+    // `Option<String>` so a key that is "owned by the launcher but only
+    // applicable when some upstream condition holds" (e.g.
+    // `VCT_ORCHESTRATOR_ROOT` requires `settings.orchestrator_root` to be
+    // `Some`) can return `None` and be filtered out before reaching the
+    // writers. This preserves the "every const key has a match arm"
+    // panic invariant while letting individual keys be conditionally
+    // emitted. `None`-valued keys are simply omitted from all three
+    // surfaces (.claude/env, .claude/settings.json env block,
+    // .vscode/settings.json claude-code.env block) — same as the
+    // pre-2026-05-08 behaviour for VCT_ORCHESTRATOR_ROOT in
+    // `.claude/env` only.
     let canonical_env_pairs: Vec<(&str, String)> = CANONICAL_INSTALL_ENV_KEYS
         .iter()
-        .map(|key| {
-            let value = match *key {
-                "KG_COLLECTION" => kg_collection.to_string(),
-                "PROJECT_NAME" => project_name.to_string(),
-                "DEVELOPMENT_COLLECTION" => dev_collection.to_string(),
-                "SHARED_KG_COLLECTION" => shared_kg_collection.to_string(),
+        .filter_map(|key| {
+            let value: Option<String> = match *key {
+                "KG_COLLECTION" => Some(kg_collection.to_string()),
+                "PROJECT_NAME" => Some(project_name.to_string()),
+                "DEVELOPMENT_COLLECTION" => Some(dev_collection.to_string()),
+                "SHARED_KG_COLLECTION" => Some(shared_kg_collection.to_string()),
                 // Canonical write-gate key (asymmetric semantic since 2026-05-01).
-                "SHARED_KG_WRITE_DISABLED" => shared_kg_write_disabled.to_string(),
+                "SHARED_KG_WRITE_DISABLED" => Some(shared_kg_write_disabled.to_string()),
                 // Legacy alias — same value, removed in ~3 releases.
-                "SHARED_KG_OPT_OUT" => shared_kg_opt_out_legacy.to_string(),
-                "ACTIVE_EMBEDDING" => active_embedding.to_string(),
+                "SHARED_KG_OPT_OUT" => Some(shared_kg_opt_out_legacy.to_string()),
+                "ACTIVE_EMBEDDING" => Some(active_embedding.to_string()),
                 // PR-3 (2026-05-06): launcher-resolved service URLs + ports.
-                "WEAVIATE_URL" => weaviate_url.to_string(),
-                "WEAVIATE_PORT" => weaviate_port.clone(),
-                "OLLAMA_URL" => ollama_url.to_string(),
-                "OLLAMA_PORT" => ollama_port.clone(),
-                "CODE_EMBED_URL" => code_embed_url.to_string(),
-                "CODE_EMBED_PORT" => code_embed_port.clone(),
+                "WEAVIATE_URL" => Some(weaviate_url.to_string()),
+                "WEAVIATE_PORT" => Some(weaviate_port.clone()),
+                "OLLAMA_URL" => Some(ollama_url.to_string()),
+                "OLLAMA_PORT" => Some(ollama_port.clone()),
+                "CODE_EMBED_URL" => Some(code_embed_url.to_string()),
+                "CODE_EMBED_PORT" => Some(code_embed_port.clone()),
+                // Install-flow audit (2026-05-08, P1 #2): portability keys
+                // were previously written ONLY to `.claude/env` via a
+                // hardcoded special-case in `build_claude_env_managed_block`
+                // because the comment at the old `CANONICAL_PORTABILITY_ENV_KEYS`
+                // claimed they were "only meaningful for shell-sourced
+                // contexts". That claim was empirically wrong: Claude Code
+                // propagates `.claude/settings.json env` and
+                // `.vscode/settings.json claude-code.env` to hook
+                // subprocesses, so VS Code-extension users (the dominant
+                // Linux/macOS/Windows path) silently lost these vars and
+                // hooks fell back to a non-existent
+                // `claude_mcp_servers/.venv` path inside managed projects.
+                // Now they flow through the same pair-builder as the rest
+                // of the canonical keys; `None` (launcher running outside
+                // a git checkout) omits the entry from all surfaces, same
+                // as the pre-fix behaviour for `.claude/env`.
+                "VCT_ORCHESTRATOR_ROOT" => settings
+                    .orchestrator_root
+                    .as_ref()
+                    .map(|p| p.display().to_string()),
+                "VCT_INFRASTRUCTURE_DIR" => settings
+                    .orchestrator_root
+                    .as_ref()
+                    .map(|p| p.join("infrastructure").display().to_string()),
                 other => panic!(
                     "CANONICAL_INSTALL_ENV_KEYS contains key {:?} but \
                      write_project_env_files has no match arm for it. \
@@ -1311,7 +1348,7 @@ pub fn write_project_env_files(
                     other,
                 ),
             };
-            (*key, value)
+            value.map(|v| (*key, v))
         })
         .collect();
     let canonical_env_keys: std::collections::HashSet<&str> =
@@ -1376,10 +1413,16 @@ pub fn write_project_env_files(
     // emitted between vco-managed BEGIN/END markers so a re-run can
     // replace the block in place without clobbering user-added exports.
     // Lines outside the markers (custom user exports added by hand) are
-    // preserved verbatim across re-writes. The PR-2 portability exports
-    // (`VCT_ORCHESTRATOR_ROOT` / `VCT_INFRASTRUCTURE_DIR`) are emitted
-    // INSIDE the managed block when `settings.orchestrator_root` is
-    // `Some`, so they get refreshed alongside the canonical pairs.
+    // preserved verbatim across re-writes.
+    //
+    // Install-flow audit (2026-05-08, P1 #2): the PR-2 portability keys
+    // (`VCT_ORCHESTRATOR_ROOT` / `VCT_INFRASTRUCTURE_DIR`) used to be
+    // written only here via a hardcoded special-case in
+    // `build_claude_env_managed_block`; they're now part of
+    // `canonical_env_pairs` so they reach the JSON env surfaces too.
+    // The pair-builder filters them out when `settings.orchestrator_root`
+    // is `None`, preserving the "omit when launcher runs outside a git
+    // checkout" semantics.
     let claude_dir = folder.join(".claude");
     std::fs::create_dir_all(&claude_dir)
         .map_err(|e| format!("mkdir {}: {}", claude_dir.display(), e))?;
@@ -1493,12 +1536,18 @@ pub(crate) const CLAUDE_ENV_MANAGED_END: &str = "# vco-managed-end";
 /// Build the launcher-managed `.claude/env` block (the BEGIN/END-delimited
 /// section of the file). Pure function for ease of testing.
 ///
-/// PR-2 portability lines (`VCT_ORCHESTRATOR_ROOT` /
-/// `VCT_INFRASTRUCTURE_DIR`) are emitted INSIDE the managed block when
-/// `settings.orchestrator_root` is `Some` so they get refreshed alongside
-/// the canonical pairs on every re-run. When `None` (launcher running
-/// outside a git checkout) the lines are simply omitted — the in-tree
-/// hook fallback resolution path takes over.
+/// Install-flow audit (2026-05-08, P1 #2): the PR-2 portability keys
+/// (`VCT_ORCHESTRATOR_ROOT` / `VCT_INFRASTRUCTURE_DIR`) are now part of
+/// `canonical_pairs` rather than a hardcoded special-case here. The
+/// pair-builder in `write_project_env_files` returns `None` for those
+/// keys when `settings.orchestrator_root` is `None`, so they get
+/// omitted from every surface (this file + the two JSON env blocks)
+/// without a separate code path. Embedded double-quotes are escaped
+/// defensively (rare on POSIX; legitimate on Windows + git-bash).
+/// `settings` is no longer read directly here but kept in the signature
+/// for forward-compat with future surface-specific tweaks (e.g.
+/// per-project compose-override commentary).
+#[allow(unused_variables)]
 pub(crate) fn build_claude_env_managed_block(
     canonical_pairs: &[(&str, String)],
     settings: &ProjectEnvSettings,
@@ -1521,31 +1570,21 @@ pub(crate) fn build_claude_env_managed_block(
     );
     out.push_str("# gates WRITES only. SHARED_KG_OPT_OUT is the legacy alias kept\n");
     out.push_str("# for ~3 releases (target removal: 2026-08).\n");
+    out.push_str(
+        "# Portability keys VCT_ORCHESTRATOR_ROOT / VCT_INFRASTRUCTURE_DIR\n",
+    );
+    out.push_str(
+        "# (when present) point at the orchestrator clone + its infrastructure/\n",
+    );
+    out.push_str(
+        "# dir; consumed by .claude/hooks/ensure-containers.sh and the\n",
+    );
+    out.push_str(
+        "# bundled Python scripts that need the claude_mcp_servers/ package.\n",
+    );
     for (k, v) in canonical_pairs {
-        out.push_str(&format!("export {}=\"{}\"\n", k, v));
-    }
-    if let Some(orch_root) = settings.orchestrator_root.as_ref() {
-        let orch_str = orch_root.display().to_string();
-        let infra_str = orch_root.join("infrastructure").display().to_string();
-        // Quote so paths with spaces / special characters survive sourcing.
-        // Escape embedded double quotes defensively (rare on POSIX paths,
-        // but legitimate on Windows + git-bash).
-        let q_orch = orch_str.replace('"', "\\\"");
-        let q_infra = infra_str.replace('"', "\\\"");
-        out.push_str(
-            "# PR-2 portability: orchestrator clone root + infrastructure dir.\n",
-        );
-        out.push_str(
-            "# Consumed by .claude/hooks/ensure-containers.sh and the bundled\n",
-        );
-        out.push_str(
-            "# Python scripts in .claude/scripts/ that need the\n",
-        );
-        out.push_str(
-            "# claude_mcp_servers/ Python package (only present in the orch clone).\n",
-        );
-        out.push_str(&format!("export VCT_ORCHESTRATOR_ROOT=\"{}\"\n", q_orch));
-        out.push_str(&format!("export VCT_INFRASTRUCTURE_DIR=\"{}\"\n", q_infra));
+        let q_v = v.replace('"', "\\\"");
+        out.push_str(&format!("export {}=\"{}\"\n", k, q_v));
     }
     out.push_str(CLAUDE_ENV_MANAGED_END);
     out.push('\n');
@@ -2267,6 +2306,15 @@ pub struct UnregisterReport {
 // extras; the test asserts this relationship directly. Adding a key
 // is now a one-line change here PLUS a one-line match arm in
 // `canonical_env_pairs`.
+//
+// Install-flow audit (2026-05-08, P1 #2): the former
+// `CANONICAL_PORTABILITY_ENV_KEYS` is gone — its two members
+// (`VCT_ORCHESTRATOR_ROOT` / `VCT_INFRASTRUCTURE_DIR`) are now in
+// `CANONICAL_INSTALL_ENV_KEYS` so they propagate to all three install
+// surfaces (.claude/env, .claude/settings.json env block,
+// .vscode/settings.json claude-code.env block) instead of just
+// `.claude/env`. See the doc comment on `CANONICAL_INSTALL_ENV_KEYS`
+// for the full rationale.
 
 /// Canonical env keys the launcher writes during install AND removes
 /// during unregister. The names live here exactly once. Both the
@@ -2275,7 +2323,25 @@ pub struct UnregisterReport {
 /// Order matters for `.claude/env` line ordering (which is just for
 /// human readability — no semantic significance). Keep additions
 /// grouped by purpose (collections / write-gates / project ID /
-/// embedding profile / service URLs / service ports).
+/// embedding profile / service URLs / service ports / portability).
+///
+/// Install-flow audit (2026-05-08, P1 #2): the portability keys
+/// (`VCT_ORCHESTRATOR_ROOT` / `VCT_INFRASTRUCTURE_DIR`) were previously
+/// kept in a separate `CANONICAL_PORTABILITY_ENV_KEYS` const and only
+/// emitted into `.claude/env` by `build_claude_env_managed_block`. The
+/// rationale ("only meaningful for shell-sourced contexts") was wrong:
+/// Claude Code propagates the `env` block of `.claude/settings.json` AND
+/// the `claude-code.env` block of `.vscode/settings.json` to hook
+/// subprocesses, so VS Code-extension users (the dominant path on
+/// Linux/macOS/Windows for dev users) silently lost these vars. The
+/// hooks then fell back to a non-existent
+/// `claude_mcp_servers/.venv` path inside managed projects (managed
+/// projects don't ship `claude_mcp_servers/`). The two consts are now
+/// merged so the existing pair-builder propagates them to all three
+/// surfaces. The pair-builder's match arm returns `Option<String>` and
+/// emits `None` when `settings.orchestrator_root` is `None` — the entry
+/// is then omitted from every surface, preserving the "launcher running
+/// outside a git checkout silently omits these lines" semantics.
 pub(crate) const CANONICAL_INSTALL_ENV_KEYS: &[&str] = &[
     "KG_COLLECTION",
     "DEVELOPMENT_COLLECTION",
@@ -2290,15 +2356,10 @@ pub(crate) const CANONICAL_INSTALL_ENV_KEYS: &[&str] = &[
     "OLLAMA_PORT",
     "CODE_EMBED_URL",
     "CODE_EMBED_PORT",
-];
-
-/// PR-2 portability keys: written to `.claude/env` by
-/// `build_claude_env_managed_block` (NOT to `.claude/settings.json` or
-/// `.vscode/settings.json` — they're only meaningful for shell-sourced
-/// contexts). Listed separately because the install pair-builder
-/// doesn't include them in its main `Vec<(&str, String)>` — they have
-/// their own write path.
-pub(crate) const CANONICAL_PORTABILITY_ENV_KEYS: &[&str] = &[
+    // Portability keys (merged from the former
+    // `CANONICAL_PORTABILITY_ENV_KEYS` const on 2026-05-08, install-flow
+    // audit P1 #2). Conditionally emitted: the pair-builder skips them
+    // when `settings.orchestrator_root` is `None`. See doc comment above.
     "VCT_ORCHESTRATOR_ROOT",
     "VCT_INFRASTRUCTURE_DIR",
 ];
@@ -2307,16 +2368,14 @@ pub(crate) const CANONICAL_PORTABILITY_ENV_KEYS: &[&str] = &[
 /// the keys `purge_launcher_files_from_project` removes during unregister
 /// while preserving every other key (user-added secrets, custom config).
 ///
-/// Built at compile time from `CANONICAL_INSTALL_ENV_KEYS` +
-/// `CANONICAL_PORTABILITY_ENV_KEYS` so the install/unregister pair
-/// can't drift. The `2026-05-06 unregister keys` test asserts the
-/// relationship directly (no hardcoded mirror).
+/// Install-flow audit (2026-05-08, P1 #2): now identical to
+/// `CANONICAL_INSTALL_ENV_KEYS` after the portability keys merged in
+/// (the former `CANONICAL_PORTABILITY_ENV_KEYS` is gone). The
+/// `2026-05-06 unregister keys` test still asserts the relationship
+/// directly (no hardcoded mirror) — see
+/// `unregister_canonical_keys_match_install_canonical_keys` below.
 pub(crate) static UNREGISTER_CANONICAL_ENV_KEYS: std::sync::LazyLock<Vec<&'static str>> =
-    std::sync::LazyLock::new(|| {
-        let mut v: Vec<&'static str> = CANONICAL_INSTALL_ENV_KEYS.to_vec();
-        v.extend(CANONICAL_PORTABILITY_ENV_KEYS.iter().copied());
-        v
-    });
+    std::sync::LazyLock::new(|| CANONICAL_INSTALL_ENV_KEYS.to_vec());
 
 /// Project-folder paths the launcher OWNS and will recursively delete on
 /// unregister when `purge_launcher_files: true`. Each entry is RELATIVE
@@ -3239,6 +3298,159 @@ mod tests {
                 "writer emitted empty VCT_ORCHESTRATOR_ROOT — should omit instead",
             );
         }
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Install-flow audit (2026-05-08, P1 #2): VCT_ORCHESTRATOR_ROOT
+    /// and VCT_INFRASTRUCTURE_DIR must reach the JSON env surfaces too,
+    /// not just `.claude/env`. Pre-fix the launcher only wrote them to
+    /// `.claude/env`, which is sourced by the `tools/claude` wrapper —
+    /// VS Code-extension users (the dominant Linux/macOS/Windows path)
+    /// silently lost these vars and the bundled hooks fell back to a
+    /// non-existent `claude_mcp_servers/.venv` path inside managed
+    /// projects.
+    ///
+    /// Asserts: when `settings.orchestrator_root` is `Some`, both
+    /// portability keys appear in
+    ///   * `.claude/env`               (POSIX export form)
+    ///   * `.claude/settings.json`     (JSON `env` block)
+    ///   * `.vscode/settings.json`     (JSON `claude-code.env` block)
+    ///
+    /// And conversely: when `orchestrator_root` is `None`, neither
+    /// surface contains the keys (omit, don't write empty).
+    #[test]
+    fn vct_portability_keys_propagate_to_all_three_surfaces() {
+        let tmp = std::env::temp_dir().join(format!(
+            "vct-portability-prop-{}", uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Use a fixed synthetic path so the assertion is independent of
+        // whether the test binary is running inside a real orch clone.
+        let synthetic_orch = std::env::temp_dir()
+            .join(format!("vct-portability-orch-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&synthetic_orch).unwrap();
+
+        let mut settings = ProjectEnvSettings::with_defaults("PortabilityTest");
+        settings.orchestrator_root = Some(synthetic_orch.clone());
+        write_project_env_files(&tmp, &settings).unwrap();
+
+        let orch_str = synthetic_orch.display().to_string();
+        let infra_str = synthetic_orch.join("infrastructure").display().to_string();
+
+        // Surface 1: .claude/env (POSIX exports).
+        let claude_env_text = std::fs::read_to_string(tmp.join(".claude/env")).unwrap();
+        assert!(
+            claude_env_text.contains(&format!("export VCT_ORCHESTRATOR_ROOT=\"{}\"", orch_str)),
+            ".claude/env missing VCT_ORCHESTRATOR_ROOT export. Body:\n{}",
+            claude_env_text,
+        );
+        assert!(
+            claude_env_text.contains(&format!("export VCT_INFRASTRUCTURE_DIR=\"{}\"", infra_str)),
+            ".claude/env missing VCT_INFRASTRUCTURE_DIR export. Body:\n{}",
+            claude_env_text,
+        );
+
+        // Surface 2: .claude/settings.json env block.
+        let cs: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(tmp.join(".claude/settings.json")).unwrap()
+        ).unwrap();
+        assert_eq!(
+            cs["env"]["VCT_ORCHESTRATOR_ROOT"], orch_str,
+            ".claude/settings.json env block missing or wrong VCT_ORCHESTRATOR_ROOT. \
+             Block: {}", cs["env"],
+        );
+        assert_eq!(
+            cs["env"]["VCT_INFRASTRUCTURE_DIR"], infra_str,
+            ".claude/settings.json env block missing or wrong VCT_INFRASTRUCTURE_DIR. \
+             Block: {}", cs["env"],
+        );
+
+        // Surface 3: .vscode/settings.json claude-code.env block.
+        let vsc: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(tmp.join(".vscode/settings.json")).unwrap()
+        ).unwrap();
+        assert_eq!(
+            vsc["claude-code.env"]["VCT_ORCHESTRATOR_ROOT"], orch_str,
+            ".vscode/settings.json claude-code.env missing VCT_ORCHESTRATOR_ROOT. \
+             Block: {}", vsc["claude-code.env"],
+        );
+        assert_eq!(
+            vsc["claude-code.env"]["VCT_INFRASTRUCTURE_DIR"], infra_str,
+            ".vscode/settings.json claude-code.env missing VCT_INFRASTRUCTURE_DIR. \
+             Block: {}", vsc["claude-code.env"],
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&synthetic_orch).ok();
+    }
+
+    /// Install-flow audit (2026-05-08, P1 #2): the omit-on-`None`
+    /// semantics from the pre-fix `.claude/env` writer must extend to
+    /// all three surfaces. When the launcher runs outside a git
+    /// checkout (`settings.orchestrator_root = None`), neither
+    /// portability key should appear in any surface — and crucially
+    /// not as empty-string values that would mask the in-tree fallback
+    /// resolution path the hooks rely on.
+    #[test]
+    fn vct_portability_keys_omitted_on_all_surfaces_when_none() {
+        let tmp = std::env::temp_dir().join(format!(
+            "vct-portability-omit-{}", uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // `with_defaults` leaves orchestrator_root = None.
+        let settings = ProjectEnvSettings::with_defaults("OmitTest");
+        assert!(settings.orchestrator_root.is_none(),
+            "test precondition: with_defaults must leave orchestrator_root=None");
+        write_project_env_files(&tmp, &settings).unwrap();
+
+        let claude_env_text = std::fs::read_to_string(tmp.join(".claude/env")).unwrap();
+        // No `export VCT_*=...` lines, and crucially no empty literals
+        // that would shadow the fallback resolver. The header comment
+        // legitimately mentions the names so we look for the export-
+        // form prefix specifically.
+        assert!(
+            !claude_env_text.contains("export VCT_ORCHESTRATOR_ROOT="),
+            ".claude/env should not export VCT_ORCHESTRATOR_ROOT when \
+             orchestrator_root=None. Body:\n{}", claude_env_text,
+        );
+        assert!(
+            !claude_env_text.contains("export VCT_INFRASTRUCTURE_DIR="),
+            ".claude/env should not export VCT_INFRASTRUCTURE_DIR when \
+             orchestrator_root=None. Body:\n{}", claude_env_text,
+        );
+
+        let cs: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(tmp.join(".claude/settings.json")).unwrap()
+        ).unwrap();
+        assert!(
+            cs["env"].get("VCT_ORCHESTRATOR_ROOT").is_none(),
+            ".claude/settings.json env should not contain VCT_ORCHESTRATOR_ROOT \
+             when orchestrator_root=None. Block: {}", cs["env"],
+        );
+        assert!(
+            cs["env"].get("VCT_INFRASTRUCTURE_DIR").is_none(),
+            ".claude/settings.json env should not contain VCT_INFRASTRUCTURE_DIR \
+             when orchestrator_root=None. Block: {}", cs["env"],
+        );
+
+        let vsc: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(tmp.join(".vscode/settings.json")).unwrap()
+        ).unwrap();
+        assert!(
+            vsc["claude-code.env"].get("VCT_ORCHESTRATOR_ROOT").is_none(),
+            ".vscode/settings.json claude-code.env should not contain \
+             VCT_ORCHESTRATOR_ROOT when orchestrator_root=None. Block: {}",
+            vsc["claude-code.env"],
+        );
+        assert!(
+            vsc["claude-code.env"].get("VCT_INFRASTRUCTURE_DIR").is_none(),
+            ".vscode/settings.json claude-code.env should not contain \
+             VCT_INFRASTRUCTURE_DIR when orchestrator_root=None. Block: {}",
+            vsc["claude-code.env"],
+        );
 
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -4953,6 +5165,14 @@ mod tests {
     /// directly. There is now ONE source of truth for canonical key
     /// NAMES. Drift across install + unregister + portability is
     /// structurally impossible.
+    ///
+    /// Install-flow audit (2026-05-08, P1 #2): the former
+    /// `CANONICAL_PORTABILITY_ENV_KEYS` const is gone — its two
+    /// members are now folded into `CANONICAL_INSTALL_ENV_KEYS` so all
+    /// three install surfaces (.claude/env + both JSON env blocks)
+    /// receive them. The unregister set is now identical to the
+    /// install set (LazyLock just `.to_vec()`s it). Test simplified
+    /// accordingly.
     #[test]
     fn unregister_canonical_keys_match_install_canonical_keys() {
         let unregister_set: std::collections::HashSet<&str> =
@@ -4971,35 +5191,34 @@ mod tests {
             );
         }
 
-        // Portability keys (written to `.claude/env` only, not to JSON
-        // surfaces) must also be in unregister.
-        for k in CANONICAL_PORTABILITY_ENV_KEYS.iter() {
-            assert!(
-                unregister_set.contains(*k),
-                "portability key {:?} missing from \
-                 UNREGISTER_CANONICAL_ENV_KEYS",
-                k,
-            );
-        }
-
         // Belt-and-suspenders: the unregister set must be EXACTLY the
-        // union of install + portability — no extras, no gaps. An
-        // extra key in unregister is suspicious (might mean someone
-        // tried to add a "remove this on unregister" without adding
-        // the corresponding install path).
-        let expected_size =
-            CANONICAL_INSTALL_ENV_KEYS.len() + CANONICAL_PORTABILITY_ENV_KEYS.len();
+        // install set — no extras, no gaps. An extra key in unregister
+        // is suspicious (might mean someone tried to add a "remove
+        // this on unregister" without adding the corresponding install
+        // path).
         assert_eq!(
             UNREGISTER_CANONICAL_ENV_KEYS.len(),
-            expected_size,
+            CANONICAL_INSTALL_ENV_KEYS.len(),
             "UNREGISTER_CANONICAL_ENV_KEYS size ({}) does not match \
-             CANONICAL_INSTALL_ENV_KEYS ({}) + \
-             CANONICAL_PORTABILITY_ENV_KEYS ({}) = {}. \
-             The LazyLock builder may have been edited by hand.",
+             CANONICAL_INSTALL_ENV_KEYS size ({}). The LazyLock builder \
+             may have been edited by hand to diverge.",
             UNREGISTER_CANONICAL_ENV_KEYS.len(),
             CANONICAL_INSTALL_ENV_KEYS.len(),
-            CANONICAL_PORTABILITY_ENV_KEYS.len(),
-            expected_size,
+        );
+
+        // The portability keys are part of the canonical install set
+        // post-2026-05-08 (install-flow audit P1 #2). Pin their presence
+        // so a future "let's split portability back out" refactor sees
+        // a loud test failure first.
+        assert!(
+            unregister_set.contains("VCT_ORCHESTRATOR_ROOT"),
+            "VCT_ORCHESTRATOR_ROOT missing from canonical set — \
+             install-flow audit P1 #2 says it must be there",
+        );
+        assert!(
+            unregister_set.contains("VCT_INFRASTRUCTURE_DIR"),
+            "VCT_INFRASTRUCTURE_DIR missing from canonical set — \
+             install-flow audit P1 #2 says it must be there",
         );
     }
 
@@ -5028,6 +5247,13 @@ mod tests {
             "WEAVIATE_URL", "WEAVIATE_PORT",
             "OLLAMA_URL", "OLLAMA_PORT",
             "CODE_EMBED_URL", "CODE_EMBED_PORT",
+            // Install-flow audit (2026-05-08, P1 #2): portability keys
+            // moved here from the now-deleted CANONICAL_PORTABILITY_ENV_KEYS.
+            // The match arm in `write_project_env_files` returns
+            // `Option<String>` for these — `None` when
+            // `settings.orchestrator_root` is `None`, omitting the
+            // entry from every install surface.
+            "VCT_ORCHESTRATOR_ROOT", "VCT_INFRASTRUCTURE_DIR",
         ].iter().copied().collect();
 
         for k in CANONICAL_INSTALL_ENV_KEYS.iter() {

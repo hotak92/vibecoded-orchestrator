@@ -67,3 +67,23 @@ jobs:
       - name: Run set-discipline check
         run: |
           python3 .github/scripts/check_hook_set_directives.py
+
+  settings-template-drift:
+    # Catches the failure mode where .claude/settings.json wires a hook (e.g.
+    # kg-update-nudge) but the install templates ship without it — fresh
+    # installs then get a dead hook script. Rooted by the 2026-05-08
+    # install-flow audit (3 missing kg-update-nudge wirings).
+    name: Check .claude/settings.json ↔ install-templates drift
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Run settings-template drift check
+        run: |
+          python3 .github/scripts/check_settings_template_drift.py
