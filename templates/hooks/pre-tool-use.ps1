@@ -10,11 +10,28 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
 
-param(
-    [Parameter(Position=0)] [string]$ToolName = "",
-    [Parameter(Position=1)] [string]$UserMessage = "",
-    [Parameter(Position=2)] [string]$ToolArgs = ""
-)
+# Hook input arrives as JSON on stdin per Claude Code v2.1.x spec.
+# Positional args ($args) and $env:CLAUDE_TOOL_NAME etc. are EMPTY because
+# Claude Code does NOT populate those env vars — verified empirically
+# 2026-05-08 via stdin-capture diagnostic. Without this, every toucan log
+# entry is {"query":"","chosen_tool":"","tool_args":null} — silently broken.
+$HookStdin = ""
+try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
+$ToolName = ""
+$ToolArgs = ""
+$UserMessage = ""
+$SessionIdFromStdin = ""
+try {
+    $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
+    if ($payload) {
+        if ($payload.tool_name)    { $ToolName = [string]$payload.tool_name }
+        if ($payload.tool_input)   { $ToolArgs = ($payload.tool_input | ConvertTo-Json -Compress -Depth 8) }
+        if ($payload.user_message) { $UserMessage = [string]$payload.user_message }
+        if ($payload.session_id)   { $SessionIdFromStdin = [string]$payload.session_id }
+    }
+} catch {
+    # Empty/malformed stdin — keep variables at defaults
+}
 
 $ScriptDir = $PSScriptRoot
 $ProjectRoot = (Resolve-Path (Join-Path $ScriptDir "..\..")).Path
@@ -23,7 +40,7 @@ $LibDir = Join-Path $ScriptDir "_lib"
 $FindPy = Join-Path $LibDir "find-python.ps1"
 if (Test-Path $FindPy) { . $FindPy }
 
-$SessionId = if ($env:CLAUDE_SESSION_ID) { $env:CLAUDE_SESSION_ID } else { (Get-Date).ToString("yyyyMMdd_HH") }
+$SessionId = if ($SessionIdFromStdin) { $SessionIdFromStdin } elseif ($env:CLAUDE_SESSION_ID) { $env:CLAUDE_SESSION_ID } else { (Get-Date).ToString("yyyyMMdd_HH") }
 $Tmp = if ($env:TMPDIR) { $env:TMPDIR } elseif ($env:TEMP) { $env:TEMP } else { "C:\Windows\Temp" }
 $SessionReadsFile = Join-Path $Tmp ".claude_reads_$SessionId"
 $BackupDir = Join-Path $Tmp ".claude_backups"

@@ -11,14 +11,26 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
 
-param(
-    [Parameter(Position=0)] [string]$ToolName = "",
-    [Parameter(Position=1)] [string]$UserMessage = "",
-    [Parameter(Position=2)] [string]$ToolArgs = ""
-)
+# Hook input arrives as JSON on stdin per Claude Code v2.1.x spec.
+# Positional args ($args) and $env:CLAUDE_TOOL_NAME etc. are EMPTY —
+# verified empirically 2026-05-08 via stdin-capture diagnostic.
+$HookStdin = ""
+try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
+$ToolName = ""
+$cmd = ""
+try {
+    $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
+    if ($payload) {
+        if ($payload.tool_name) { $ToolName = [string]$payload.tool_name }
+        if ($payload.tool_input -and $payload.tool_input.command) {
+            $cmd = [string]$payload.tool_input.command
+        }
+    }
+} catch {
+    # Empty/malformed stdin — keep variables at defaults
+}
 
 if ($ToolName -ne "Bash") { exit 0 }
-$cmd = $ToolArgs
 
 # Match `vercel` (or path/local-bin variants) followed somewhere by --token=... or --token <value>.
 $hasVercel = $cmd -match '(^|[\s/])vercel(\s|$)'

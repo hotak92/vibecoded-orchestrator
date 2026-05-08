@@ -9,9 +9,21 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
 
-param(
-    [Parameter(Position=0)] [string]$EditedFile = ""
-)
+# Hook input arrives as JSON on stdin per Claude Code v2.1.x spec.
+# Positional args ($args) are EMPTY because $CLAUDE_TOOL_ARG_FILE_PATH and
+# similar env vars don't exist — settings.json substitutes to "". Verified
+# empirically 2026-05-08 via stdin-capture diagnostic.
+$HookStdin = ""
+try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
+$EditedFile = ""
+try {
+    $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
+    if ($payload -and $payload.tool_input -and $payload.tool_input.file_path) {
+        $EditedFile = [string]$payload.tool_input.file_path
+    }
+} catch {
+    # Empty/malformed stdin — keep $EditedFile at default
+}
 
 $ScriptDir = $PSScriptRoot
 $ProjectRoot = (Resolve-Path (Join-Path $ScriptDir "..\..")).Path

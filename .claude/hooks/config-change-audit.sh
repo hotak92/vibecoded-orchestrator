@@ -13,4 +13,26 @@ LOG_FILE="$PROJECT_DIR/.claude/logs/config_changes.jsonl"
 
 mkdir -p "$(dirname "$LOG_FILE")"
 
-echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"config_change\",\"tool\":\"${CLAUDE_TOOL_NAME:-unknown}\",\"args\":${CLAUDE_TOOL_ARGS:-{}}}" >> "$LOG_FILE" 2>/dev/null || true
+# Hook input arrives as JSON on stdin per Claude Code v2.1.x spec.
+# $CLAUDE_TOOL_NAME / $CLAUDE_TOOL_ARGS env vars are EMPTY — verified
+# empirically 2026-05-08 via stdin-capture diagnostic. Without this,
+# every config-change audit entry was {"tool":"unknown","args":{}}.
+HOOK_STDIN=$(cat 2>/dev/null || echo "")
+TOOL_NAME=$(printf '%s' "$HOOK_STDIN" | python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print(d.get('tool_name', '') or 'unknown')
+except Exception:
+    print('unknown')
+" 2>/dev/null || echo "unknown")
+TOOL_ARGS=$(printf '%s' "$HOOK_STDIN" | python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print(json.dumps(d.get('tool_input', {})))
+except Exception:
+    print('{}')
+" 2>/dev/null || echo "{}")
+
+echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"config_change\",\"tool\":\"${TOOL_NAME}\",\"args\":${TOOL_ARGS}}" >> "$LOG_FILE" 2>/dev/null || true

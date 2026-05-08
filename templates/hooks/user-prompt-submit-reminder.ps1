@@ -9,6 +9,22 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
 
+# Hook input contract (v2.1.x): JSON on stdin, NOT $CLAUDE_TOOL_NAME env var.
+# Drain stdin (best-effort) so it doesn't block any caller. UserPromptSubmit
+# hooks don't see tool_name in the payload either, so per-tool accounting is
+# moot under v2.1.x — kept as a defensive default in case a future runtime
+# ever populates the env var. Today $env:CLAUDE_TOOL_NAME is always empty.
+# Verified empirically 2026-05-08 via stdin-capture diagnostic.
+$HookStdin = ""
+try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
+$ToolNameFromStdin = ""
+try {
+    $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
+    if ($payload -and $payload.tool_name) { $ToolNameFromStdin = [string]$payload.tool_name }
+} catch {
+    # Empty/malformed stdin — fall through
+}
+
 $ProjectDir = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
 $ProjectName = Split-Path $ProjectDir -Leaf
 $ContextFile = Join-Path $ProjectDir ".claude/CONTEXT_STATE.md"
@@ -20,8 +36,9 @@ if (-not (Test-Path $SessionLog)) {
 }
 
 $WordsThisTurn = 0
-if ($env:CLAUDE_TOOL_NAME) {
-    switch ($env:CLAUDE_TOOL_NAME) {
+$EffectiveToolName = if ($ToolNameFromStdin) { $ToolNameFromStdin } elseif ($env:CLAUDE_TOOL_NAME) { $env:CLAUDE_TOOL_NAME } else { "" }
+if ($EffectiveToolName) {
+    switch ($EffectiveToolName) {
         { $_ -in 'Read', 'Write', 'Edit' } { $WordsThisTurn = 1000 }
         'Bash' { $WordsThisTurn = 500 }
         'Task' { $WordsThisTurn = 2000 }

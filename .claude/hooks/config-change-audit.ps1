@@ -10,6 +10,24 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
 
+# Hook input arrives as JSON on stdin per Claude Code v2.1.x spec.
+# $env:CLAUDE_TOOL_NAME / $env:CLAUDE_TOOL_ARGS are EMPTY — verified
+# empirically 2026-05-08 via stdin-capture diagnostic. Without this,
+# every config-change audit entry was {"tool":"unknown","args":{}}.
+$HookStdin = ""
+try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
+$tool = "unknown"
+$argsRaw = "{}"
+try {
+    $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
+    if ($payload) {
+        if ($payload.tool_name)  { $tool = [string]$payload.tool_name }
+        if ($payload.tool_input) { $argsRaw = ($payload.tool_input | ConvertTo-Json -Compress -Depth 8) }
+    }
+} catch {
+    # Empty/malformed stdin — keep defaults
+}
+
 $ProjectDir = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
 $LogFile = Join-Path $ProjectDir ".claude/logs/config_changes.jsonl"
 
@@ -19,8 +37,6 @@ if (-not (Test-Path $LogDir)) {
 }
 
 $ts = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-$tool = if ($env:CLAUDE_TOOL_NAME) { $env:CLAUDE_TOOL_NAME } else { "unknown" }
-$argsRaw = if ($env:CLAUDE_TOOL_ARGS) { $env:CLAUDE_TOOL_ARGS } else { "{}" }
 # Avoid double-encoding: emit a JSON line literally so $argsRaw is embedded as-is
 # (matching the .sh behavior where args is a JSON object pasted into the line).
 $line = "{""timestamp"":""$ts"",""event"":""config_change"",""tool"":""$tool"",""args"":$argsRaw}"

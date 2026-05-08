@@ -16,10 +16,25 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
 
+# Hook input contract (v2.1.x): session_id arrives as JSON on stdin, not as
+# the $CLAUDE_SESSION_ID env var (which Claude Code does NOT populate —
+# verified empirically 2026-05-08). Reading the env var meant every session
+# in this project shared the same `default` snapshot file, so two concurrent
+# sessions silently stomped on each other's diff baseline.
+$HookStdin = ""
+try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
+$SessionIdFromStdin = ""
+try {
+    $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
+    if ($payload -and $payload.session_id) { $SessionIdFromStdin = [string]$payload.session_id }
+} catch {
+    # Empty/malformed stdin — fall back to env var, then "default"
+}
+
 $ContextFile = ".claude/CONTEXT_STATE.md"
 $Tmp = if ($env:TMPDIR) { $env:TMPDIR } elseif ($env:TEMP) { $env:TEMP } else { "C:\Windows\Temp" }
 $SnapshotDir = Join-Path $Tmp "claude_ctx_snapshots"
-$SessionId = if ($env:CLAUDE_SESSION_ID) { $env:CLAUDE_SESSION_ID } else { "default" }
+$SessionId = if ($SessionIdFromStdin) { $SessionIdFromStdin } elseif ($env:CLAUDE_SESSION_ID) { $env:CLAUDE_SESSION_ID } else { "default" }
 $SnapshotFile = Join-Path $SnapshotDir "snapshot_$SessionId"
 $CompactFlag = Join-Path $SnapshotDir "compact_flag_$SessionId"
 

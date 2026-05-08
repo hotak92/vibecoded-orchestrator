@@ -23,39 +23,61 @@ $generator = Join-Path $ProjectRoot ".claude/scripts/generate-kg-summary.py"
 if (-not (Test-Path $venvPy)) { exit 0 }
 if (-not (Test-Path $generator)) { exit 0 }
 
-# Read stdin payload
+# Hook input arrives as JSON on stdin per Claude Code v2.1.x spec.
+# The legacy $env:CLAUDE_TOOL_ARG_FILE_PATH env-var fallback was removed
+# 2026-05-08 — that env var is NOT populated by Claude Code, so it
+# always evaluated to empty and the fallback path silently skipped to
+# the MCP branch. Verified via stdin-capture diagnostic.
 $Input = ""
 try { $Input = [Console]::In.ReadToEnd() } catch { }
 
 $FilePath = ""
-if ($env:CLAUDE_TOOL_ARG_FILE_PATH) {
-    $FilePath = $env:CLAUDE_TOOL_ARG_FILE_PATH
-} elseif ($Input -match "store_knowledge_node") {
-    # Extract file_path via Python.
-    $LibDir = Join-Path $ScriptDir "_lib"
-    $FindPy = Join-Path $LibDir "find-python.ps1"
-    if (Test-Path $FindPy) { . $FindPy }
-    if ($PY) {
-        $code = @'
+# Single Python extractor handles both Edit/Write (tool_input.file_path)
+# and MCP store_knowledge_node (tool_response.absolute_path or
+# tool_input.file_path). Branches by tool_name internally.
+$LibDir = Join-Path $ScriptDir "_lib"
+$FindPy = Join-Path $LibDir "find-python.ps1"
+if (Test-Path $FindPy) { . $FindPy }
+if ($PY) {
+    $code = @'
 import sys, json, re
 try:
-    d = json.load(sys.stdin)
-    resp = d.get('tool_response', '')
-    if isinstance(resp, str):
-        m = re.search(r'absolute_path[":\s]+([^",}]+)', resp)
-        if m:
-            print(m.group(1).strip()); sys.exit(0)
-    inp = d.get('tool_input', {})
-    if isinstance(inp, str): inp = json.loads(inp)
-    fp = inp.get('file_path', '')
-    if fp: print(fp)
+    d = json.loads(sys.stdin.read())
+    tool_name = d.get('tool_name', '') or ''
+    inp = d.get('tool_input', {}) or {}
+    if isinstance(inp, str):
+        try:
+            inp = json.loads(inp)
+        except Exception:
+            inp = {}
+    # Edit/Write path — file_path lives under tool_input
+    if tool_name in ('Edit', 'Write'):
+        print(inp.get('file_path', '') or '')
+        sys.exit(0)
+    # MCP store_knowledge_node — try tool_response.absolute_path first,
+    # then fall back to tool_input.file_path
+    if tool_name == 'mcp__weaviate-kg__store_knowledge_node':
+        resp = d.get('tool_response', '')
+        if isinstance(resp, dict):
+            ap = resp.get('absolute_path', '')
+            if ap:
+                print(ap)
+                sys.exit(0)
+        elif isinstance(resp, str) and resp:
+            m = re.search(r'absolute_path["\s:]+([^",}]+)', resp)
+            if m:
+                print(m.group(1).strip())
+                sys.exit(0)
+        print(inp.get('file_path', '') or '')
+        sys.exit(0)
+    # Unknown tool — fall through to nothing
+    print('')
 except Exception:
-    pass
+    print('')
 '@
-        try {
-            $FilePath = ($Input | & $PY -c $code 2>$null | Out-String).Trim()
-        } catch { }
-    }
+    try {
+        $FilePath = ($Input | & $PY -c $code 2>$null | Out-String).Trim()
+    } catch { }
 }
 
 if (-not $FilePath -or $FilePath -notlike "*knowledge/*" -or -not ($FilePath -like "*.md")) { exit 0 }
