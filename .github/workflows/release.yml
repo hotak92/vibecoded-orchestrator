@@ -278,10 +278,10 @@ jobs:
           echo "archive_name=${archive_name}" >> "$GITHUB_OUTPUT"
           echo "Archive will be: ${archive_name}"
 
-      # Build the staging tree at dist/<archive_base>/. We use rsync's
-      # exclude rules on Linux/macOS for deterministic filtering;
-      # Windows runners get robocopy with its own --exclude flags. Both
-      # produce the same on-disk layout.
+      # Build the staging tree at dist/<archive_base>/. We copy via
+      # `tar c | tar x` with --exclude rules so the same shell logic
+      # runs on Linux, macOS, and the Windows Git Bash runner (rsync
+      # is not on the Windows runner image; tar is).
       - name: Stage archive contents
         shell: bash
         env:
@@ -327,32 +327,37 @@ jobs:
           fi
 
           # 3. Subtree copies — claude_mcp_servers, templates, .claude,
-          # infrastructure, tools. rsync filters keep the runtime
-          # detritus out of the shipped archive.
-          rsync_args=(
-            -a
-            --exclude='.venv/'
-            --exclude='__pycache__/'
+          # infrastructure, tools. tar's --exclude filters keep runtime
+          # detritus out of the shipped archive. The `tar c | tar x`
+          # idiom preserves modes and is available on all three runner
+          # OSes (Git Bash on Windows ships GNU tar).
+          base_excludes=(
+            --exclude='.venv'
+            --exclude='__pycache__'
             --exclude='*.pyc'
             --exclude='*.pyo'
-            --exclude='.pytest_cache/'
-            --exclude='.mypy_cache/'
-            --exclude='node_modules/'
+            --exclude='.pytest_cache'
+            --exclude='.mypy_cache'
+            --exclude='node_modules'
           )
-          rsync "${rsync_args[@]}" claude_mcp_servers/ "$stage_root/claude_mcp_servers/"
-          rsync "${rsync_args[@]}" templates/ "$stage_root/templates/"
-          rsync "${rsync_args[@]}" infrastructure/ "$stage_root/infrastructure/"
-          rsync "${rsync_args[@]}" tools/ "$stage_root/tools/"
+          copy_subtree() {
+            local src="$1"; local dst="$2"; shift 2
+            mkdir -p "$dst"
+            tar -cf - "${base_excludes[@]}" "$@" -C "$src" . | tar -xf - -C "$dst"
+          }
+          copy_subtree claude_mcp_servers "$stage_root/claude_mcp_servers"
+          copy_subtree templates "$stage_root/templates"
+          copy_subtree infrastructure "$stage_root/infrastructure"
+          copy_subtree tools "$stage_root/tools"
 
           # .claude/ has additional exclusions for runtime state we
           # never want shipped: logs, metrics, ephemeral context.
-          rsync "${rsync_args[@]}" \
-            --exclude='logs/' \
-            --exclude='metrics/' \
-            --exclude='context/' \
+          copy_subtree .claude "$stage_root/.claude" \
+            --exclude='logs' \
+            --exclude='metrics' \
+            --exclude='context' \
             --exclude='cron-jobs.json' \
-            --exclude='cron-dashboard.html' \
-            .claude/ "$stage_root/.claude/"
+            --exclude='cron-dashboard.html'
 
           # 4. Installer scripts — OS-specific picks.
           if [ "${MATRIX_TARGET}" = "windows-x64" ]; then
