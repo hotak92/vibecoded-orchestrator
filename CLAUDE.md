@@ -510,6 +510,17 @@ Output: Where to save
 - `run_in_background: true` runs the agent in background; you get notified on completion. Use for independent work that doesn't block your next step.
 - Resume stopped agents with `SendMessage({to: agentId})` (the `resume` param on the Agent tool was removed in v2.1.74+).
 
+**⚠️ CRITICAL — parallel agents MUST use isolated worktrees**:
+When 2+ agents work on the same git repo concurrently, they trip over each other's working tree. One agent's `git checkout -b` switches the branch; the other agent's uncommitted edits get carried onto the wrong branch or staged onto a sibling agent's commit. Real damage seen 2026-04-29: **work was lost when agents shared the main worktree** (one agent's edits never made it to git because the other reset the working tree).
+
+**Mandatory pattern when spawning 2+ parallel agents on the same repo**:
+- Spawn each agent with `isolation: "worktree"` in the Agent call (auto-creates a temp git worktree, auto-cleaned on no-changes), OR
+- In the agent's prompt, explicitly tell it: "Run in an isolated worktree. Use `git worktree add /tmp/<task-name> <base-branch>` and work there. Do NOT touch the main repo path." Then verify in its report that it used a worktree path.
+- Agents that need to test build artifacts (cargo build, full launcher rebuild) STILL must use isolated worktrees — they can run the build inside their worktree.
+- Single-agent work on the repo is fine without worktree isolation; the rule only kicks in at parallelism ≥2.
+
+**Verification before finalizing**: when reviewing parallel agent work, check `git worktree list` — every agent's branch should show its own worktree path under `/tmp/` or similar. If any agent committed from the main repo path while others were also active, treat its work as suspect (the other agents may have shifted its working tree mid-task).
+
 **Skill Frontmatter** (in `.claude/skills/NAME/SKILL.md`):
 - VS Code validates: `name`, `description`, `argument-hint`, `disable-model-invocation`, `user-invocable`, `compatibility`, `license`, `metadata`.
 - CLI/runtime also accepts (VS Code warns but they work): `model`, `effort`, `allowed-tools`, `context: fork`, `agent`, `hooks`.
