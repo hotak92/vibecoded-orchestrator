@@ -26,8 +26,29 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 PAYLOAD=$(cat)
 TRIGGER="unknown"
+SESSION_ID=""
 if [ -n "${PY:-}" ]; then
-    TRIGGER=$(echo "$PAYLOAD" | "$PY" -c "import sys,json; d=json.load(sys.stdin); print(d.get('trigger','unknown'))" 2>/dev/null || echo "unknown")
+    _PARSED=$(echo "$PAYLOAD" | "$PY" -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    print(d.get('trigger', 'unknown'))
+    print(d.get('session_id', ''))
+except Exception:
+    print('unknown')
+    print('')
+" 2>/dev/null || printf 'unknown\n\n')
+    TRIGGER=$(printf '%s' "$_PARSED" | sed -n '1p')
+    SESSION_ID=$(printf '%s' "$_PARSED" | sed -n '2p')
+fi
+
+# Wipe the KG/codegraph injection dedup state for this session — the LLM
+# just lost the context that included those previously-injected nodes, so
+# re-injecting them on subsequent edits is now correct (and helpful).
+# pre-edit-context-inject.sh writes to .claude/state/seen_kg_titles_<id>.txt.
+if [ -n "$SESSION_ID" ]; then
+    SEEN_FILE="$PROJECT_DIR/.claude/state/seen_kg_titles_${SESSION_ID}.txt"
+    [ -f "$SEEN_FILE" ] && rm -f "$SEEN_FILE"
 fi
 
 # Log the compaction event

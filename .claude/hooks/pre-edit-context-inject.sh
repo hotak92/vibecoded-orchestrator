@@ -31,22 +31,23 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 # exist as env vars — settings.json substitutes them to "". Verified
 # empirically 2026-05-08 via stdin-capture diagnostic.
 HOOK_STDIN=$(cat 2>/dev/null || echo "")
-TOOL_NAME=$(printf '%s' "$HOOK_STDIN" | python3 -c "
+# Parse all fields we need in a single Python invocation (avoids re-parsing the
+# JSON 3+ times). Outputs three lines: tool_name, session_id, tool_input as JSON.
+_PARSED=$(printf '%s' "$HOOK_STDIN" | python3 -c "
 import json, sys
 try:
     d = json.loads(sys.stdin.read())
     print(d.get('tool_name', ''))
-except Exception:
-    print('')
-" 2>/dev/null || echo "")
-TOOL_ARGS=$(printf '%s' "$HOOK_STDIN" | python3 -c "
-import json, sys
-try:
-    d = json.loads(sys.stdin.read())
+    print(d.get('session_id', ''))
     print(json.dumps(d.get('tool_input', {})))
 except Exception:
+    print('')
+    print('')
     print('{}')
-" 2>/dev/null || echo "{}")
+" 2>/dev/null || printf '\n\n{}\n')
+TOOL_NAME=$(printf '%s' "$_PARSED" | sed -n '1p')
+SESSION_ID=$(printf '%s' "$_PARSED" | sed -n '2p')
+TOOL_ARGS=$(printf '%s' "$_PARSED" | sed -n '3p')
 
 # Only fire for Edit tool
 if [[ "$TOOL_NAME" != "Edit" ]]; then
@@ -61,17 +62,21 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # shellcheck source=_lib/find-python.sh disable=SC1091
 [ -f "$SCRIPT_DIR/_lib/find-python.sh" ] && . "$SCRIPT_DIR/_lib/find-python.sh"
 
-SESSION_ID="${CLAUDE_SESSION_ID:-default}"
+# session_id from stdin JSON is the canonical per-conversation key. Falls
+# back to "default" only if the payload is malformed (which would mean the
+# hook contract itself is broken — see _PARSED above).
+[ -z "$SESSION_ID" ] && SESSION_ID="default"
 CACHE_BASE="${TMPDIR:-/tmp}/claude_edit_cache_${SESSION_ID}"
 CACHE_TTL=600  # 10 minutes in seconds
 
 # === Dedup tracking: skip KG/codegraph nodes already injected this session ===
-SEEN_NODES_FILE="${TMPDIR:-/tmp}/claude_seen_nodes_${SESSION_ID}"
-COMPACT_FLAG="${TMPDIR:-/tmp}/claude_ctx_snapshots/compact_flag_${SESSION_ID}"
-# Reset seen nodes on compaction
-if [ -f "$COMPACT_FLAG" ] && [ -f "$SEEN_NODES_FILE" ]; then
-    rm -f "$SEEN_NODES_FILE"
-fi
+# State lives in the project directory (not /tmp/) so it survives reboots and
+# is co-located with the session's other ephemeral state. Wiped by the
+# PostCompact hook when the LLM's context is trimmed (so the dedup window
+# matches the actual context window the LLM sees).
+SEEN_DIR="$PROJECT_ROOT/.claude/state"
+mkdir -p "$SEEN_DIR" 2>/dev/null
+SEEN_NODES_FILE="$SEEN_DIR/seen_kg_titles_${SESSION_ID}.txt"
 
 # === Extract fields from TOOL_ARGS JSON ===
 _extract_field() {
@@ -204,11 +209,20 @@ fi
 rm -f "$KG_TMP" "$CODE_TMP"
 
 # === Dedup: filter out nodes already injected this session ===
-# KG result lines start with "Title | type | score=..." — extract title (first field before |)
-# Code graph lines vary but typically have the entity name as first field
+# The KG/codegraph result blocks emitted by rl_kg_search.py and
+# query_code_graph have the shape:
 #
-# Performance: load SEEN_NODES_FILE once into an associative array rather
-# than per-line grep. Output semantics identical. Audit fix 2026-05-07.
+#   KG: <title> | <type> | score=<n.nn> | <body...>
+#   <body line 1>
+#   <body line 2>
+#   ...
+#   (blank line separates blocks)
+#
+# We dedup by title (the part between "KG: " and the first " | "), and
+# we suppress the ENTIRE block — title line plus its body — if the title
+# has already been shown this session. The previous implementation
+# extracted a "title" from every line including body content, which
+# filled the seen-list with body fragments and let titles re-appear.
 _filter_seen() {
     local input="$1"
     local filtered=""
@@ -221,17 +235,46 @@ _filter_seen() {
         seen_titles["$seen_line"]=1
     done < "$SEEN_NODES_FILE"
 
+    local current_title=""
+    local current_block=""
+    local current_skip=0
+
+    _flush_block() {
+        if [ -n "$current_title" ] && [ "$current_skip" = "0" ] && [ -z "${seen_titles[$current_title]:-}" ]; then
+            filtered="${filtered}${current_block}"
+            seen_titles["$current_title"]=1
+            echo "$current_title" >> "$SEEN_NODES_FILE"
+        fi
+        current_title=""
+        current_block=""
+        current_skip=0
+    }
+
     while IFS= read -r line; do
-        [ -z "$line" ] && continue
-        # Extract title: first field before " | " (KG) or first meaningful token (code graph)
-        local title
-        title=$(echo "$line" | sed 's/ | .*//' | head -c 100)
-        if [ -n "$title" ] && [ -z "${seen_titles[$title]:-}" ]; then
+        # Header line starts a new block. Format: "KG: <title> | ..." or
+        # "CODE: <full_name> | ..." — the first field after the prefix and
+        # before the next " | " is the dedup key.
+        if [[ "$line" =~ ^(KG|CODE):\ (.+)$ ]]; then
+            _flush_block
+            local rest="${BASH_REMATCH[2]}"
+            current_title="${rest%% | *}"
+            # Cap to 200 chars defensively (some code-graph entity names can be long)
+            current_title="${current_title:0:200}"
+            current_block="${line}"$'\n'
+            # If already seen, mark the block so we drop it AND its body lines.
+            if [ -n "${seen_titles[$current_title]:-}" ]; then
+                current_skip=1
+            fi
+        elif [ -n "$current_title" ]; then
+            # Body line for the current block — accumulate.
+            current_block="${current_block}${line}"$'\n'
+        else
+            # Pre-amble or stray line not part of any block — pass through verbatim.
             filtered="${filtered}${line}"$'\n'
-            seen_titles["$title"]=1
-            echo "$title" >> "$SEEN_NODES_FILE"
         fi
     done <<< "$input"
+    _flush_block
+
     echo "$filtered"
 }
 

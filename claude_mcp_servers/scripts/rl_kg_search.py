@@ -148,7 +148,7 @@ async def main():
             node_type = entry.get("node_type", "")
             label_map = {
                 "summary":      "SUMMARY",
-                "single_chunk": "FULL",         # legacy label preserved for hook regex
+                "single_chunk": "1 CHUNK",
                 "three_chunks": "3 CHUNKS",
                 "full":         "FULL NODE",
             }

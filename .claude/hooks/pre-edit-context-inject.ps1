@@ -30,11 +30,13 @@ $HookStdin = ""
 try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
 $ToolName = ""
 $ToolArgs = ""
+$SessionId = ""
 try {
     $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
     if ($payload) {
-        if ($payload.tool_name)  { $ToolName = [string]$payload.tool_name }
-        if ($payload.tool_input) { $ToolArgs = ($payload.tool_input | ConvertTo-Json -Compress -Depth 8) }
+        if ($payload.tool_name)   { $ToolName = [string]$payload.tool_name }
+        if ($payload.tool_input)  { $ToolArgs = ($payload.tool_input | ConvertTo-Json -Compress -Depth 8) }
+        if ($payload.session_id)  { $SessionId = [string]$payload.session_id }
     }
 } catch {
     # Empty/malformed stdin — keep variables at defaults
@@ -49,16 +51,23 @@ $LibDir = Join-Path $ScriptDir "_lib"
 $FindPy = Join-Path $LibDir "find-python.ps1"
 if (Test-Path $FindPy) { . $FindPy }
 
-$SessionId = if ($env:CLAUDE_SESSION_ID) { $env:CLAUDE_SESSION_ID } else { "default" }
+# session_id from stdin JSON is the canonical per-conversation key. Falls
+# back to "default" only if the payload is malformed (which would mean the
+# hook contract itself is broken — see ConvertFrom-Json above).
+if (-not $SessionId) { $SessionId = "default" }
 $Tmp = if ($env:TMPDIR) { $env:TMPDIR } elseif ($env:TEMP) { $env:TEMP } else { "C:\Windows\Temp" }
 $CacheBase = Join-Path $Tmp "claude_edit_cache_$SessionId"
 $CacheTtl = 600
 
-$SeenNodesFile = Join-Path $Tmp "claude_seen_nodes_$SessionId"
-$CompactFlag = Join-Path $Tmp "claude_ctx_snapshots\compact_flag_$SessionId"
-if ((Test-Path $CompactFlag) -and (Test-Path $SeenNodesFile)) {
-    Remove-Item $SeenNodesFile -Force -ErrorAction SilentlyContinue
+# State lives in the project directory (not /tmp/) so it survives reboots and
+# is co-located with the session's other ephemeral state. Wiped by the
+# PostCompact hook when the LLM's context is trimmed (so the dedup window
+# matches the actual context window the LLM sees).
+$SeenDir = Join-Path $ProjectRoot ".claude/state"
+if (-not (Test-Path $SeenDir)) {
+    New-Item -ItemType Directory -Path $SeenDir -Force -ErrorAction SilentlyContinue | Out-Null
 }
+$SeenNodesFile = Join-Path $SeenDir "seen_kg_titles_$SessionId.txt"
 
 function Get-JsonField([string]$field) {
     if (-not $PY -or -not $ToolArgs) { return "" }
@@ -182,25 +191,65 @@ if ($IsCode) {
 Remove-Item $KgTmp.FullName, $CodeTmp.FullName -Force -ErrorAction SilentlyContinue
 
 # Dedup against this session's seen nodes.
-# Note (audit fix 2026-05-07): the .ps1 sibling already uses a hashtable
-# (`$seen = @{}`) for O(1) lookups, so the bash-side bug (per-line grep
-# scaling O(input × seen)) does not exist here. Parity-touch only.
+#
+# The KG/codegraph result blocks have the shape:
+#
+#   KG: <title> | <type> | score=<n.nn> | <body...>
+#   <body line 1>
+#   <body line 2>
+#   ...
+#
+# We dedup by title (the part between "KG: " and the first " | "), and we
+# suppress the ENTIRE block — title line plus its body — if the title has
+# already been shown this session. The previous implementation extracted a
+# "title" from every line including body content, which filled the seen-list
+# with body fragments and let titles re-appear.
 function Filter-Seen([string]$input) {
     if (-not $input) { return "" }
     $filtered = New-Object System.Text.StringBuilder
     if (-not (Test-Path $SeenNodesFile)) { New-Item -ItemType File -Path $SeenNodesFile -Force | Out-Null }
     $seen = @{}
     foreach ($l in Get-Content $SeenNodesFile -ErrorAction SilentlyContinue) { $seen[$l] = $true }
-    foreach ($line in $input -split "`n") {
-        if (-not $line) { continue }
-        $title = ($line -split ' \| ')[0]
-        if ($title.Length -gt 100) { $title = $title.Substring(0, 100) }
-        if ($title -and -not $seen.ContainsKey($title)) {
-            [void]$filtered.AppendLine($line)
-            Add-Content -Path $SeenNodesFile -Value $title -ErrorAction SilentlyContinue
-            $seen[$title] = $true
+
+    $currentTitle = ""
+    $currentBlock = New-Object System.Text.StringBuilder
+    $currentSkip = $false
+
+    $flushBlock = {
+        param($title, $block, $skip, $filteredRef, $seenRef, $seenFile)
+        if ($title -and -not $skip -and -not $seenRef.Value.ContainsKey($title)) {
+            [void]$filteredRef.Value.Append($block)
+            $seenRef.Value[$title] = $true
+            Add-Content -Path $seenFile -Value $title -ErrorAction SilentlyContinue
         }
     }
+
+    foreach ($line in $input -split "`n") {
+        # Header line starts a new block. Format: "KG: <title> | ..." or
+        # "CODE: <full_name> | ..." — the first field after the prefix and
+        # before the next " | " is the dedup key.
+        if ($line -match '^(KG|CODE):\s+(.+)$') {
+            # Flush previous block.
+            & $flushBlock $currentTitle $currentBlock.ToString() $currentSkip ([ref]$filtered) ([ref]$seen) $SeenNodesFile
+            $rest = $Matches[2]
+            $currentTitle = ($rest -split ' \| ')[0]
+            # Cap to 200 chars defensively (some code-graph entity names can be long)
+            if ($currentTitle.Length -gt 200) { $currentTitle = $currentTitle.Substring(0, 200) }
+            $currentBlock = New-Object System.Text.StringBuilder
+            [void]$currentBlock.AppendLine($line)
+            # If already seen, mark the block so we drop it AND its body lines.
+            $currentSkip = $seen.ContainsKey($currentTitle)
+        } elseif ($currentTitle) {
+            # Body line for the current block — accumulate.
+            [void]$currentBlock.AppendLine($line)
+        } else {
+            # Pre-amble or stray line not part of any block — pass through verbatim.
+            [void]$filtered.AppendLine($line)
+        }
+    }
+    # Flush the final block.
+    & $flushBlock $currentTitle $currentBlock.ToString() $currentSkip ([ref]$filtered) ([ref]$seen) $SeenNodesFile
+
     return $filtered.ToString()
 }
 
