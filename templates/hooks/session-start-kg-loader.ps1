@@ -4,6 +4,14 @@ foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_A
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
+
+# VCO-CENTRALIZED-KG: reference provider only (PR #171 / 0.1.7).
+#   Prints paths to KG resources (kg-search, kg-info wrappers); does NOT
+#   query Weaviate KG or codegraph collections itself. May launch the
+#   optional Pro-tier RL retrieval server via start-rl-server.ps1.
+#   The access matrix (VCT_KG_ACCESS_LIST / VCT_CODE_GRAPH_ACCESS_LIST)
+#   is N/A — no collections are touched. No centralization possible or needed.
+
 # SessionStart Hook: Knowledge Graph Reference Provider (PowerShell port)
 # Purpose: Display paths to relevant KG resources (no auto-loading)
 

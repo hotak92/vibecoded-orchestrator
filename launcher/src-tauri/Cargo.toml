@@ -1,6 +1,6 @@
 [package]
 name = "vct-launcher-temp"
-version = "0.1.6"
+version = "0.2.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -58,6 +58,19 @@ hex = "0.4"
 
 # Bug 31: launcher.toml config (volume location, etc.)
 toml = "0.9"
+
+# H5 (2026-05-08): cryptographically random hub auth tokens.
+# We generate a fresh 32-byte token on every hub startup and persist it
+# to `~/.vct/hub.token` (mode 0o600). The middleware in
+# `hub/auth.rs` requires `Authorization: Bearer <token>` on every
+# request that returns secrets — without this, any process running as
+# the same OS user could curl `/projects/<id>/env` and exfiltrate the
+# user's keychain values. `OsRng` here pulls bytes directly from the
+# OS CSPRNG (getrandom on Linux, BCryptGenRandom on Windows,
+# SecRandomCopyBytes on macOS); already in the dep tree transitively
+# via several existing crates, so promoting to a direct dep adds zero
+# binary size.
+rand = { version = "0.9", default-features = false, features = ["std", "std_rng", "os_rng"] }
 
 # Bug 31 tests: tempdir for filesystem fixtures (also used by Bug 31
 # volumes module for non-test tempdir uses).

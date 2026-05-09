@@ -2,6 +2,15 @@
 # Scrub sensitive env vars before any subprocess spawning
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
+
+# VCO-CENTRALIZED-KG: counter-only hook (PR #171 / 0.1.7).
+#   Does NOT query Weaviate KG or codegraph collections. Reads the
+#   transcript JSONL via claude_token_counter.py (work_units_total) and
+#   detects KG-write events by tool_name ('mcp__weaviate-kg__store_knowledge_node',
+#   'Write', 'Edit') + file_path matching knowledge/**/*.md. The access
+#   matrix (VCT_KG_ACCESS_LIST / VCT_CODE_GRAPH_ACCESS_LIST) is N/A here —
+#   no collections are touched. No centralization possible or needed.
+
 # KG-update nudge hook — fires a stderr <system-reminder> when the assistant
 # has used substantial tokens since the last knowledge-graph write OR
 # store_knowledge_node call.

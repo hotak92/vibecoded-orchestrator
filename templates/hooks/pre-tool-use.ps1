@@ -4,6 +4,16 @@ foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_A
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
+
+# VCO-CENTRALIZED-KG: read-side delegator on the KG-suggestion path (PR #171 / 0.1.7).
+#   The "KG search suggestion" branch (Edit/Write only, see section 5
+#   below) calls .claude/scripts/kg-search.ps1 (or kg-search via bash);
+#   that wrapper invokes search_knowledge.py which honors
+#   VCT_KG_ACCESS_LIST through the shared helper. Other branches (SSRF
+#   guard, shell-injection scan, Build Anchor, file backup, tool logging)
+#   do not touch KG/codegraph. Env propagation: & / Start-Process
+#   inherit env by default. No centralization needed in this hook itself.
+
 # pre-tool-use.ps1
 # Pre-tool-use hook: SSRF guard, shell injection scan, tool logging,
 # Build Anchor Protocol, file backup, KG search suggestion.
@@ -218,12 +228,31 @@ if (Test-Path $kgSearchPs1) {
 if ($matchOutput) {
     $arr = @($matchOutput)
     if ($arr.Count -ge 2) {
-        Write-Output ""
-        Write-Output "Found $($arr.Count) related patterns for: $concepts"
-        foreach ($m in $arr) { Write-Output "   $m" }
-        Write-Output ""
-        Write-Output "   Search more: 'Search knowledge graph for [concept]'"
-        Write-Output ""
+        # PreToolUse hooks must wrap LLM-bound stdout in
+        # `hookSpecificOutput.additionalContext` — plain stdout is silently
+        # discarded by Claude Code's hook runner. Pre-fork-sweep this
+        # branch printed plaintext that never reached the LLM on either
+        # OS. Same fix class as pre-edit-context-inject (PR #168). 10k
+        # char cap matches that hook's contract.
+        $sb = [System.Text.StringBuilder]::new()
+        [void]$sb.AppendLine("")
+        [void]$sb.AppendLine("Found $($arr.Count) related patterns for: $concepts")
+        foreach ($m in $arr) { [void]$sb.AppendLine("   $m") }
+        [void]$sb.AppendLine("")
+        [void]$sb.AppendLine("   Search more: 'Search knowledge graph for [concept]'")
+        [void]$sb.AppendLine("")
+        $suggestionText = $sb.ToString()
+        if ($suggestionText.Length -gt 10000) {
+            $suggestionText = $suggestionText.Substring(0, 10000)
+        }
+        $envelope = [ordered]@{
+            hookSpecificOutput = [ordered]@{
+                hookEventName      = 'PreToolUse'
+                permissionDecision = 'allow'
+                additionalContext  = $suggestionText
+            }
+        }
+        Write-Output ($envelope | ConvertTo-Json -Compress -Depth 8)
     }
 }
 exit 0

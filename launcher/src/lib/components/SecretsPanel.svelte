@@ -262,10 +262,18 @@
   </div>
 
   <!-- Scope description: explain semantics so the user knows what
-       lifetime each tab implies. -->
+       lifetime each tab implies.
+       Subagent G (2026-05-08): per-project tab gets an extra line
+       calling out the env-var auto-emission contract. Closes the "GUI
+       says secret is set, but I can't actually use it" gap from the
+       user's perspective — they now understand that adding a key here
+       makes it appear as $KEY in their next Claude Code session for
+       that project. -->
   <p class="scope-desc">
     {#if scope === 'per_project'}
       Tied to a specific project. Visible only to modules running in that project's context.
+      Auto-emitted as <code>$KEY</code> env vars in the project's Claude Code session
+      (no session restart needed).
     {:else if scope === 'shared'}
       Shared across <em>all</em> of your projects. Not visible to other users on this machine.
     {:else}
@@ -614,6 +622,20 @@
     color: var(--color-teal);
     font-style: normal;
     font-weight: 600;
+  }
+
+  /* Subagent G (2026-05-08): inline `<code>` for the env-var hint in
+   * the per-project scope description. Mono so it's visually distinct
+   * from prose, matches the entry-key + entry-preview mono treatment
+   * elsewhere in this panel. */
+  .scope-desc code {
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    font-size: 10px;
+    background: rgba(255, 255, 255, 0.06);
+    padding: 1px 5px;
+    border-radius: 3px;
+    color: var(--color-text);
+    font-style: normal;
   }
 
   .project-picker {

@@ -24,6 +24,85 @@
   // Onboarding re-trigger state
   let showOnboardingConfirm = $state(false);
 
+  // ── GitHub access token (Manage Token UI, wired 2026-05-09) ───────
+  // Reads via has_github_pat / get_github_pat_preview, writes via
+  // register_github_pat (with EXISTS_DIFFERENT: replace-guard), clears
+  // via clear_github_pat. Token is stored in the OS keychain — never
+  // displayed in clear, never written to GUI-readable files.
+  const PAT_REPLACE_GUARD = 'EXISTS_DIFFERENT:';
+  let patPresent = $state(false);
+  let patPreview = $state<string | null>(null);
+  let patEditing = $state(false);
+  let patNewValue = $state('');
+  let patSaving = $state(false);
+  let patError = $state<string | null>(null);
+  let patClearing = $state(false);
+  let showPatClearConfirm = $state(false);
+
+  async function loadPat() {
+    try {
+      patPresent = await invoke<boolean>('has_github_pat');
+      if (patPresent) {
+        patPreview = await invoke<string | null>('get_github_pat_preview');
+      } else {
+        patPreview = null;
+      }
+    } catch (e) {
+      patError = String(e);
+    }
+  }
+
+  async function savePat() {
+    patError = null;
+    const token = patNewValue.trim();
+    if (!token) {
+      patError = 'Token is empty.';
+      return;
+    }
+    patSaving = true;
+    try {
+      try {
+        await invoke('register_github_pat', { token, force: false });
+      } catch (e) {
+        const msg = String(e);
+        if (msg.startsWith(PAT_REPLACE_GUARD)) {
+          const reason = msg.slice(PAT_REPLACE_GUARD.length).trim()
+            || 'A different GitHub token is already saved.';
+          if (!confirm(`${reason}\n\nReplace the existing token?`)) {
+            patError = 'Token not saved (existing keychain entry kept).';
+            return;
+          }
+          await invoke('register_github_pat', { token, force: true });
+        } else {
+          throw e;
+        }
+      }
+      patNewValue = '';
+      patEditing = false;
+      await loadPat();
+      toast.success('GitHub token saved');
+    } catch (e) {
+      patError = String(e);
+    } finally {
+      patSaving = false;
+    }
+  }
+
+  async function clearPat() {
+    showPatClearConfirm = false;
+    patClearing = true;
+    patError = null;
+    try {
+      await invoke('clear_github_pat');
+      await loadPat();
+      toast.success('GitHub token removed');
+    } catch (e) {
+      patError = String(e);
+    } finally {
+      patClearing = false;
+    }
+  }
+
   function confirmRerunOnboarding() {
     showOnboardingConfirm = false;
     ui.openOnboarding();
@@ -71,7 +150,10 @@
     }
   }
 
-  onMount(load);
+  onMount(() => {
+    void load();
+    void loadPat();
+  });
   $effect(() => { if (project) void load(); });
 </script>
 
@@ -152,6 +234,75 @@
         </button>
       </div>
     </section>
+
+    <section class="pr-section">
+      <h2 class="pr-section-title">GitHub access token</h2>
+      <div class="pr-pat-row">
+        <div class="pr-onboarding-text">
+          <strong>
+            {patPresent ? 'Token saved' : 'No token saved'}
+            {#if patPresent && patPreview}<span class="pr-pat-preview">{patPreview}</span>{/if}
+          </strong>
+          <span class="pr-onboarding-hint">
+            Stored in your OS keychain. Used by the launcher's update flow and propagated to
+            registered projects' env files (<code>GITHUB_TOKEN</code>) when active. Replacing
+            the token rotates it everywhere; clearing it removes it from the keychain (your
+            <code>~/.vct-secrets/shared/github_pat</code> file, if any, is left untouched).
+          </span>
+        </div>
+        <div class="pr-pat-actions">
+          {#if !patEditing}
+            <button class="pr-btn" onclick={() => { patEditing = true; patError = null; }}>
+              {patPresent ? 'Replace…' : 'Add token…'}
+            </button>
+            {#if patPresent}
+              <button
+                class="pr-btn pr-btn-danger"
+                disabled={patClearing}
+                onclick={() => (showPatClearConfirm = true)}
+              >
+                {patClearing ? 'Clearing…' : 'Clear'}
+              </button>
+            {/if}
+          {/if}
+        </div>
+      </div>
+
+      {#if patEditing}
+        <div class="pr-pat-edit">
+          <input
+            class="pr-pat-input"
+            type="password"
+            placeholder="ghp_…"
+            bind:value={patNewValue}
+            disabled={patSaving}
+          />
+          <div class="pr-pat-edit-actions">
+            <button
+              class="pr-btn"
+              onclick={() => { patEditing = false; patNewValue = ''; patError = null; }}
+              disabled={patSaving}
+            >
+              Cancel
+            </button>
+            <button
+              class="pr-btn-primary"
+              onclick={savePat}
+              disabled={patSaving || !patNewValue.trim()}
+            >
+              {patSaving ? 'Saving…' : 'Save'}
+            </button>
+          </div>
+          <p class="pr-pat-hint">
+            Generate at github.com → Settings → Developer settings → Personal access tokens.
+            Scope <code>repo</code> is enough for read-only update checks; add <code>workflow</code>
+            if you need to push commits that modify <code>.github/workflows/</code>.
+          </p>
+        </div>
+      {/if}
+
+      {#if patError}<p class="pr-error">{patError}</p>{/if}
+    </section>
   </main>
 </div>
 
@@ -170,6 +321,25 @@
       <div class="pr-modal-actions">
         <button class="pr-btn" onclick={() => (showOnboardingConfirm = false)}>Cancel</button>
         <button class="pr-btn-primary" onclick={confirmRerunOnboarding}>Show wizard</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
+{#if showPatClearConfirm}
+  <div class="pr-overlay" role="presentation" onclick={() => (showPatClearConfirm = false)}>
+    <div class="pr-modal" role="dialog" aria-modal="true" aria-labelledby="pr-pat-clear-title"
+         onclick={(e) => e.stopPropagation()}>
+      <h3 id="pr-pat-clear-title" class="pr-modal-title">Clear GitHub token?</h3>
+      <p class="pr-modal-body">
+        Removes the token from your OS keychain and strips <code>GITHUB_TOKEN</code>
+        from every registered project's env files on the next refresh. The
+        <code>~/.vct-secrets/shared/github_pat</code> file (if any) is left untouched —
+        delete it manually if you want it gone too.
+      </p>
+      <div class="pr-modal-actions">
+        <button class="pr-btn" onclick={() => (showPatClearConfirm = false)}>Cancel</button>
+        <button class="pr-btn-primary" onclick={clearPat}>Clear token</button>
       </div>
     </div>
   </div>
@@ -219,6 +389,45 @@
     font-size: 12px; font-weight: 600; white-space: nowrap;
   }
   .pr-btn-primary:hover { background: rgb(0,210,183); }
+
+  /* GitHub PAT section */
+  .pr-pat-row {
+    display: flex; align-items: center; justify-content: space-between; gap: 16px;
+    padding: 10px 14px; background: rgba(255,255,255,0.03); border-radius: 6px;
+    border: 1px solid rgba(255,255,255,0.06);
+  }
+  .pr-pat-preview {
+    margin-left: 8px; font-family: ui-monospace, monospace; font-size: 11px;
+    color: #888; background: rgba(255,255,255,0.06); padding: 1px 6px; border-radius: 3px;
+  }
+  .pr-pat-actions { display: flex; gap: 6px; flex-shrink: 0; }
+  .pr-btn-danger {
+    background: rgba(229,77,77,0.12);
+    border: 1px solid rgba(229,77,77,0.3);
+    color: rgb(255,140,140);
+  }
+  .pr-btn-danger:hover { background: rgba(229,77,77,0.2); }
+  .pr-pat-edit {
+    margin-top: 8px; padding: 12px 14px; background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.06); border-radius: 6px;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .pr-pat-input {
+    background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.1);
+    color: #e8e8ee; padding: 6px 10px; border-radius: 4px; font-size: 12px;
+    font-family: ui-monospace, monospace;
+  }
+  .pr-pat-edit-actions { display: flex; gap: 6px; justify-content: flex-end; }
+  .pr-pat-hint { font-size: 11px; color: #888; line-height: 1.5; margin: 0; }
+  .pr-pat-hint code {
+    background: rgba(255,255,255,0.06); padding: 1px 4px; border-radius: 3px;
+    font-size: 10.5px;
+  }
+  .pr-error {
+    margin-top: 8px; padding: 8px 12px;
+    background: rgba(229,77,77,0.1); border: 1px solid rgba(229,77,77,0.25);
+    border-radius: 4px; color: rgb(255,140,140); font-size: 11px;
+  }
 
   /* Confirmation modal */
   .pr-overlay {

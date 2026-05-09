@@ -130,6 +130,103 @@ pub struct ProjectEnvSettings {
     /// rather than being a side-channel `find_local_repo_root()` call
     /// inside the writer body.
     pub orchestrator_root: Option<PathBuf>,
+
+    /// Multi-source KG access list (P1-D, 2026-05-08). Sorted, deduped list
+    /// of peer project names (sanitized — i.e. the prefix used in the
+    /// peer's `<Name>_KnowledgeGraph` collection) the current project has
+    /// READ access to via the launcher's access matrix. Empty when the
+    /// project only has access to its own + the shared KG (the default).
+    /// Emitted as `VCT_KG_ACCESS_LIST=Foo,Bar,Baz` to all three install
+    /// surfaces; consumed by `weaviate_mcp/server.py::_kg_collections_to_search`
+    /// and the bundled `rl_kg_search.py` to fan-out searches across peers.
+    pub kg_access_list: Vec<String>,
+
+    /// Multi-source code-graph access list (P1-D, 2026-05-08). Sorted,
+    /// deduped list of peer project names whose code graph the current
+    /// project has READ access to (`codegraph_access` table, where the
+    /// current project is `grantee` and `access_level == 'read'`). Each
+    /// peer maps to 5 prefixed Weaviate collections (`<Name>_CodeFunction`,
+    /// `<Name>_CodeClass`, etc.). Empty by default. Emitted as
+    /// `VCT_CODE_GRAPH_ACCESS_LIST=Foo,Bar,Baz`.
+    pub code_graph_access_list: Vec<String>,
+
+    /// GitHub PAT (0.1.7 fork-readiness sweep, 2026-05-08). Resolved at
+    /// `populate` time from the OS keychain entry the OnboardingWizard
+    /// writes via `commands::installer::register_github_pat`
+    /// (`vct._user_shared_.shared.installer / github_pat`). Honours the
+    /// active-flag gate (`is_secret_active_cross_launcher`) so a paused
+    /// secret in any sibling launcher's DB returns `None` here too.
+    ///
+    /// Replaces the pre-0.1.7 `git-credential-vct` helper: instead of
+    /// having git's credential protocol invoke a per-project
+    /// helper (incompatible with the active-flag gate), the launcher
+    /// now writes `GITHUB_TOKEN=<value>` to each registered project's
+    /// env files. Users configure git's credential helper once
+    /// (`gh auth setup-git`, or a thin shell helper that reads
+    /// `$GITHUB_TOKEN`) and the launcher takes over the per-project
+    /// gating via the env var.
+    ///
+    /// `None` means: no keychain entry, OR entry paused via Lifecycle B,
+    /// OR keychain backend unreachable. The pair-builder filter omits
+    /// the key from all 3 surfaces in that case (matching the
+    /// `VCT_ORCHESTRATOR_ROOT` / `VCT_KG_ACCESS_LIST` semantics).
+    ///
+    /// Conservative per-project gating: today, every registered project
+    /// receives `GITHUB_TOKEN` whenever the keychain has it active. That
+    /// matches the pre-0.1.7 file-based behaviour
+    /// (`~/.vct-secrets/shared/github_pat` is readable by every process
+    /// running as the user). A finer-grained per-project access matrix
+    /// for `github_pat` is out of scope for the 0.1.7 fork sweep — see
+    /// `docs/MIGRATION-0.2.0.md` "Replacing `git-credential-vct`".
+    pub github_token: Option<String>,
+
+    /// Subagent G (2026-05-08): per-project user-bucket secrets resolved
+    /// at populate time. Pairs of (KEY, VALUE) for entries that are both
+    /// (a) active under the cross-launcher gate, and (b) currently
+    /// keychain-present. Emitted alongside the canonical keys into all 3
+    /// launcher-managed env surfaces (`.claude/env`,
+    /// `.claude/settings.json` `env`, `.vscode/settings.json`
+    /// `claude-code.env`).
+    ///
+    /// Closes the "GUI says secret is set, but I can't actually use it"
+    /// gap: a user adding `MY_PROJECT_KEY` in the SecretsPanel now sees
+    /// it appear as a normal env var in their next Claude Code session
+    /// for that project (no session restart, courtesy of the
+    /// `refresh_project_env_with_db` hook in the secret-mutation
+    /// commands).
+    ///
+    /// Threat model note: any subprocess spawned in the project's
+    /// Claude Code session can read these as normal env vars —
+    /// including bundled MCP servers + hooks. Same exposure profile
+    /// `~/.vct-secrets/` already had pre-Subagent A.
+    ///
+    /// Disjoint from `github_token` (Subagent D): that resolves the
+    /// SHARED-scope keychain entry written by the OnboardingWizard
+    /// (`scope='shared'`, `module_id='installer'`). User-bucket secrets
+    /// here are at `scope='per_project'`, `module_id='user'`. The two
+    /// flows never enumerate each other's rows.
+    pub user_secret_pairs: Vec<(String, String)>,
+
+    /// Subagent G (2026-05-08): every KEY name the launcher has ever
+    /// observed for this project's user-bucket (`scope='per_project'`,
+    /// `module_id='user'`), regardless of active flag. ASCII-sorted by
+    /// key for deterministic env diffs.
+    ///
+    /// Used by the env writer as the STRIP set: any key in this list
+    /// that is NOT in `user_secret_pairs` is removed from every env
+    /// surface on the next write. This is how "paused" / "removed"
+    /// secrets get out of the surfaces — without this, a previously-
+    /// emitted user secret would persist stale even after the GUI says
+    /// it's off.
+    ///
+    /// Invariant: superset of the keys in `user_secret_pairs`. The
+    /// difference set is exactly the inactive / pending-removal
+    /// entries. Keys here that the user added BY HAND directly to a
+    /// JSON env block (never through `set_secret_v2`) DO NOT appear —
+    /// those are tracked solely in the JSON files and the writer
+    /// preserves them via the existing `merge_env_object_canonical`
+    /// deep-merge.
+    pub user_secret_known_keys: Vec<String>,
 }
 
 impl ProjectEnvSettings {
@@ -156,6 +253,19 @@ impl ProjectEnvSettings {
             use_gpu: false,
             project_name: project_name.to_string(),
             orchestrator_root: None,
+            kg_access_list: Vec::new(),
+            code_graph_access_list: Vec::new(),
+            // Tests use `with_defaults`; they get an absent token so the
+            // pair-builder omits `GITHUB_TOKEN` from the surfaces. Tests
+            // that exercise the GITHUB_TOKEN propagation path construct
+            // a settings struct directly and override this field.
+            github_token: None,
+            // Subagent G (2026-05-08): tests using `with_defaults` get
+            // empty user-secret state (no active pairs, no known keys).
+            // Tests that exercise the user-secret propagation path
+            // construct a settings struct directly + override.
+            user_secret_pairs: Vec::new(),
+            user_secret_known_keys: Vec::new(),
         }
     }
 
@@ -327,6 +437,57 @@ pub fn populate(
         .unwrap_or(false);
 
     let kg_basename = sanitize_kg_collection(project_name);
+    let own_kg = format!("{}_KnowledgeGraph", kg_basename);
+    let own_dev = format!("{}_Development", kg_basename);
+
+    // P1-D (2026-05-08): resolve cross-project KG + codegraph access lists
+    // from the launcher's access matrix. These flow into env vars on the
+    // 3 surfaces and are consumed by `weaviate_mcp/server.py` + the
+    // bundled `rl_kg_search.py` to fan-out searches across peers. Soft-fail
+    // (empty list) on any DB error — env-file writes must never block on a
+    // matrix-read hiccup.
+    let kg_access_list = match project_id {
+        Some(pid) => resolve_kg_access_peers(db, pid, &own_kg, &own_dev, &shared_kg_collection),
+        None => Vec::new(),
+    };
+    let code_graph_access_list = match project_id {
+        Some(pid) => resolve_code_graph_access_peers(db, pid),
+        None => Vec::new(),
+    };
+
+    // 0.1.7 fork-readiness sweep (2026-05-08): the OnboardingWizard's
+    // GitHub PAT is now in the OS keychain (replaces the legacy
+    // `~/.vct-secrets/shared/github_pat` file). Resolve here so the
+    // env-pair builder in `write_project_env_files` can emit
+    // `GITHUB_TOKEN=<value>` to all 3 install surfaces. Soft-fail
+    // (None) on keychain unreachable / no entry / paused — the
+    // pair-builder omits the key in that case, matching the
+    // VCT_ORCHESTRATOR_ROOT / VCT_KG_ACCESS_LIST semantics.
+    //
+    // See `commands::installer::github_pat_from_keychain` for the
+    // (scope, module_id, key) tuple + active-flag gate.
+    let github_token = crate::commands::installer::github_pat_for_env(db);
+
+    // Subagent G (2026-05-08): resolve user-set per-project secrets so
+    // they auto-emit into all 3 launcher-managed env surfaces.
+    //
+    // Two parallel outputs:
+    //   * `user_secret_pairs`: (KEY, VALUE) for entries that are both
+    //     active under the cross-launcher gate AND keychain-present.
+    //     The env writer EMITS these.
+    //   * `user_secret_known_keys`: every KEY ever observed in the
+    //     per-project user-bucket regardless of active flag. Used as
+    //     the STRIP set so paused / removed secrets get out of the
+    //     surfaces (otherwise a previously-emitted secret persists
+    //     stale even after the GUI says it's off).
+    //
+    // Without `project_id` (test contexts where the project row hasn't
+    // been inserted yet) we skip the resolution — empty pairs + empty
+    // known set means the writer behaves identically to pre-Subagent-G.
+    let (user_secret_pairs, user_secret_known_keys) = match project_id {
+        Some(pid) => resolve_user_secret_state(db, pid),
+        None => (Vec::new(), Vec::new()),
+    };
 
     ProjectEnvSettings {
         active_embedding,
@@ -337,8 +498,8 @@ pub fn populate(
         ollama_port,
         code_embed_port,
         container_runtime: detect_runtime_sync(),
-        kg_collection: format!("{}_KnowledgeGraph", kg_basename),
-        dev_collection: format!("{}_Development", kg_basename),
+        kg_collection: own_kg,
+        dev_collection: own_dev,
         shared_kg_collection,
         shared_kg_write_disabled,
         cpu_only: !use_gpu,
@@ -349,7 +510,270 @@ pub fn populate(
         // produces a usable `.claude/env` (the bundled hooks' in-tree
         // fallback path takes over).
         orchestrator_root: find_local_repo_root().ok(),
+        kg_access_list,
+        code_graph_access_list,
+        github_token,
+        user_secret_pairs,
+        user_secret_known_keys,
     }
+}
+
+/// Extract peer project names from the launcher's `kg_collection_access`
+/// matrix for a given project. Returns the SANITIZED prefix of every
+/// `<X>_KnowledgeGraph` collection the project has read/write access to,
+/// excluding the project's own KG/dev collections and the cross-project
+/// shared collection. Sorted + deduped for deterministic env output.
+///
+/// Soft-fail: any DB error → empty list (the access-list feature is a
+/// strict opt-in extension; a populate-time read failure must never
+/// degrade the basic env write).
+///
+/// Naming round-trip: `kg_set_access` writes `<Sanitized>_KnowledgeGraph`
+/// from `populate_kg_collection_access`; we strip the trailing
+/// `_KnowledgeGraph` (or `_Development`) and feed the prefix back to the
+/// MCP server, which re-applies its own `_sanitize_collection_prefix`
+/// (idempotent for already-sanitized inputs) before resolving the full
+/// collection name. This keeps the env-var contract project-name-shaped
+/// rather than collection-name-shaped, matching the design in
+/// `vco-multi-source-kg-access-design.md`.
+fn resolve_kg_access_peers(
+    db: &Db,
+    project_id: &str,
+    own_kg: &str,
+    own_dev: &str,
+    shared_kg: &str,
+) -> Vec<String> {
+    let rows = match db.kg_list_access(project_id) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let mut peers: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (collection_name, access_level) in rows {
+        if access_level != "read" && access_level != "write" {
+            continue;
+        }
+        if collection_name == own_kg
+            || collection_name == own_dev
+            || collection_name == shared_kg
+        {
+            continue;
+        }
+        if let Some(stripped) = collection_name
+            .strip_suffix("_KnowledgeGraph")
+            .or_else(|| collection_name.strip_suffix("_Development"))
+        {
+            if !stripped.is_empty() {
+                peers.insert(stripped.to_string());
+            }
+        }
+    }
+    peers.into_iter().collect()
+}
+
+/// Extract peer project names whose code graph the given project can read.
+/// Reads the `codegraph_access` table for rows where `grantee_project_id =
+/// project_id` and `access_level = 'read'`, then resolves grantor IDs to
+/// human-readable project names. Sorted by sanitized peer name for
+/// deterministic env output. Soft-fail to empty list on any DB error.
+fn resolve_code_graph_access_peers(db: &Db, project_id: &str) -> Vec<String> {
+    let rows = match db.codegraph_list_grants_to(project_id) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let mut peers: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (grantor_id, access_level) in rows {
+        if access_level != "read" {
+            continue;
+        }
+        if grantor_id == project_id {
+            continue;
+        }
+        // Resolve grantor's name → sanitized prefix (matches the per-project
+        // code-graph collection naming `<Sanitized>_CodeFunction` etc.).
+        match db.get_project(&grantor_id) {
+            Ok(Some(row)) => {
+                let sanitized = sanitize_kg_collection(&row.name);
+                if !sanitized.is_empty() {
+                    peers.insert(sanitized);
+                }
+            }
+            // Dangling grantor (project deleted): skip silently.
+            Ok(None) => {}
+            // DB error per row: skip the row, keep going.
+            Err(_) => {}
+        }
+    }
+    peers.into_iter().collect()
+}
+
+/// Subagent G (2026-05-08), broadened by H2 (2026-05-08): resolve the
+/// user-bucket secret state for the env-pair builder. Covers all THREE
+/// SecretsPanel tabs:
+///
+///   * Per-project tab → `(scope='per_project', project_id, module_id='user')`
+///   * Shared tab      → `(scope='shared',      '_user_shared_', 'user')`
+///   * Global tab      → `(scope='global',      '_global_',      'user')`
+///
+/// Pre-H2 only the per-project bucket flowed into env surfaces. Shared
+/// and Global rows existed in the keychain + active-flag DB but no
+/// consumer enumerated them, so a key the user added via the Shared
+/// tab was silent to every project's `.claude/env`. H2 closes that
+/// gap by merging all three buckets at populate time.
+///
+/// Returns `(active_pairs, known_keys)`:
+///
+///   * `active_pairs`: `(KEY, VALUE)` for every key (across all three
+///     buckets) where the cross-launcher active gate says active AND
+///     the OS keychain currently holds a value. Order is per-project
+///     keys first (ASCII-sorted), then shared (ASCII-sorted), then
+///     global (ASCII-sorted) — bucket-stable so env-surface diffs
+///     stay readable.
+///
+///   * `known_keys`: every KEY ever observed in any of the three
+///     buckets regardless of active flag. Same ordering as
+///     `active_pairs`. Superset of the keys in `active_pairs`.
+///
+/// The env writer uses the difference set (`known_keys` − keys-in-`active_pairs`)
+/// as its STRIP set: any of those keys still present in the env
+/// surfaces from a prior write get removed on this write. That is how
+/// paused / pending-removal secrets exit the surfaces — without it, a
+/// previously-emitted user secret would persist stale even after the
+/// GUI toggles it off.
+///
+/// Bucket-collision handling: if the same KEY exists in two buckets
+/// (e.g. a user adds `MY_KEY` per-project AND in Shared), the
+/// per-project value wins by virtue of bucket order — it lands in
+/// `active_pairs` first, and the writer's pair-canonicalization keeps
+/// the first occurrence. This matches the SecretsPanel's read-time
+/// resolution comment ("Per-project bag for P → Shared → Global,
+/// first hit wins").
+///
+/// Soft-fail: keychain backend unreachable / DB hiccup → empty pairs
+/// (the key vanishes from EMIT but stays in the strip set if its row
+/// exists). The env-file writes must never block on a metadata-read
+/// failure.
+///
+/// Disjoint from `github_pat_for_env` (Subagent D): that one targets
+/// the SHARED-scope `github_pat` keychain entry under
+/// `module_id='installer'`. This function only enumerates
+/// `module_id='user'` rows. The two flows never enumerate each
+/// other's entries — there is zero overlap.
+fn resolve_user_secret_state(db: &Db, project_id: &str) -> (Vec<(String, String)>, Vec<String>) {
+    // Per-project bucket (existing behaviour, byte-identical to pre-H2).
+    let per_project_keys = db.list_user_secret_keys_for_project(project_id);
+    // Shared bucket — applies to every registered project for this user.
+    let shared_keys = db.list_shared_user_secret_keys();
+    // Global bucket — applies machine-wide.
+    let global_keys = db.list_global_user_secret_keys();
+
+    let mut pairs: Vec<(String, String)> =
+        Vec::with_capacity(per_project_keys.len() + shared_keys.len() + global_keys.len());
+    let mut known_keys: Vec<String> =
+        Vec::with_capacity(per_project_keys.len() + shared_keys.len() + global_keys.len());
+
+    // Helper closure: resolve one bucket. `scope_str` drives the active-flag
+    // gate; `slot_project_id` drives both the active-flag gate AND the
+    // keychain lookup (matches the writer's slot — SENTINEL_SHARED for
+    // shared, SENTINEL_GLOBAL for global, real UUID for per-project).
+    // Shared and global use module_id='user' across the board.
+    fn resolve_one_bucket(
+        db: &Db,
+        keys: &[String],
+        scope_str: &str,
+        slot_project_id: &str,
+        keychain_scope: crate::secrets::SecretScope<'_>,
+        out_pairs: &mut Vec<(String, String)>,
+        out_known: &mut Vec<String>,
+        already_emitted: &std::collections::HashSet<String>,
+    ) {
+        for key in keys {
+            // The known-keys list always carries the key (drives strip
+            // set on the writer side). De-duplication on `out_known`
+            // prevents the same key showing up twice if it lives in
+            // multiple buckets.
+            if !out_known.iter().any(|k| k == key) {
+                out_known.push(key.clone());
+            }
+            // Skip emit if a previous bucket already populated this key.
+            // Bucket order = per-project → shared → global, so
+            // per-project wins (matches SecretsPanel's read order).
+            if already_emitted.contains(key) {
+                continue;
+            }
+            let active = crate::db::secret_active::is_secret_active_cross_launcher(
+                db,
+                scope_str,
+                slot_project_id,
+                "user",
+                key,
+            );
+            if !active {
+                continue;
+            }
+            match crate::secrets::get(keychain_scope, "user", key) {
+                Ok(Some(v)) => {
+                    out_pairs.push((key.clone(), v));
+                }
+                // Keychain has no value for this row (e.g. user removed
+                // via the OS keychain UI directly) — skip emit. The
+                // strip set still carries the key.
+                Ok(None) => {}
+                // Keychain backend unreachable — soft-fail.
+                Err(_) => {}
+            }
+        }
+    }
+
+    // Track keys already emitted so collisions across buckets resolve
+    // first-bucket-wins.
+    let mut emitted: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // 1. Per-project bucket — wins on collisions with shared/global.
+    resolve_one_bucket(
+        db,
+        &per_project_keys,
+        "per_project",
+        project_id,
+        crate::secrets::SecretScope::PerProject { project_id },
+        &mut pairs,
+        &mut known_keys,
+        &emitted,
+    );
+    for (k, _) in pairs.iter() {
+        emitted.insert(k.clone());
+    }
+
+    // 2. Shared bucket.
+    let shared_pairs_start = pairs.len();
+    resolve_one_bucket(
+        db,
+        &shared_keys,
+        "shared",
+        "_user_shared_",
+        crate::secrets::SecretScope::Shared {
+            project_id: "_user_shared_",
+        },
+        &mut pairs,
+        &mut known_keys,
+        &emitted,
+    );
+    for (k, _) in &pairs[shared_pairs_start..] {
+        emitted.insert(k.clone());
+    }
+
+    // 3. Global bucket.
+    resolve_one_bucket(
+        db,
+        &global_keys,
+        "global",
+        "_global_",
+        crate::secrets::SecretScope::Global,
+        &mut pairs,
+        &mut known_keys,
+        &emitted,
+    );
+
+    (pairs, known_keys)
 }
 
 #[cfg(test)]

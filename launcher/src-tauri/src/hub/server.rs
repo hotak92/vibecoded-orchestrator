@@ -3,12 +3,21 @@
 //! The server runs in a background tokio task. It exposes a REST API
 //! that any local app/service can call to register, send messages,
 //! query data, etc.
+//!
+//! ─── Authentication (H5, 2026-05-08) ─────────────────────────────
+//!
+//! Every request to `/api/v1/*` (except `/health`) requires
+//! `Authorization: Bearer <token>` where `<token>` is the value the
+//! hub wrote to `<vct_root_dir>/hub.token` on startup. Same threat
+//! model as `~/.vct/hub.port` — same-user-only by file mode (0o600 on
+//! Unix, default ACL on Windows). See `hub::auth` for the full
+//! rationale and exempt-paths discussion.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 
-use super::{api, cli_api, db, modules_api, project_state_api};
+use super::{api, auth, cli_api, db, modules_api, project_state_api};
 
 const DEFAULT_PORT: u16 = 7700;
 
@@ -28,11 +37,44 @@ pub async fn start_hub_server() -> Result<u16, String> {
         .map_err(|e| format!("Failed to open launcher.db: {}", e))?;
     let launcher_state = modules_api::LauncherDbHandle(Arc::new(launcher_db));
 
+    // ── Auth token (H5) ──────────────────────────────────────────
+    // Generate a fresh token on every startup and persist before we
+    // accept any connections. If either step fails we refuse to
+    // start the server: serving secrets without auth would be
+    // strictly worse than the launcher being temporarily down.
+    let auth_token = auth::generate_token()
+        .map_err(|e| format!("Failed to generate hub auth token: {}", e))?;
+    auth::write_token_file(&auth_token)
+        .map_err(|e| format!("Failed to write hub.token: {}", e))?;
+    let auth_state = auth::AuthState::new(auth_token);
+
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
-        .allow_headers(Any);
+        // `Any` for headers wouldn't include `Authorization` in some
+        // browsers' interpretations of the spec; spell it out so a
+        // future browser-side client can't be tripped up by a CORS
+        // preflight that strips Authorization from the allowlist.
+        .allow_headers([
+            axum::http::header::AUTHORIZATION,
+            axum::http::header::CONTENT_TYPE,
+        ]);
 
+    // Layer order (axum applies layers in reverse-of-declaration on
+    // the way IN to a request, so the LAST layer added runs FIRST):
+    //
+    //   request → cors → require_auth → routes → response
+    //
+    // Why this order:
+    //   * `cors` must wrap the auth check so OPTIONS preflights get
+    //     CORS headers attached even if they would otherwise 401
+    //     (the auth middleware does pass OPTIONS through, but having
+    //     cors as the outermost layer means the response always
+    //     carries the right Access-Control-Allow-* headers).
+    //   * `require_auth` must wrap the route handlers so an
+    //     unauthenticated request never even reaches the secret-
+    //     serving logic. The `Extension` carries `AuthState` into
+    //     the middleware closure.
     let app = axum::Router::new()
         .nest("/api/v1", api::router(database))
         .nest("/api/v1", modules_api::router().with_state(launcher_state.clone()))
@@ -41,6 +83,8 @@ pub async fn start_hub_server() -> Result<u16, String> {
             project_state_api::router().with_state(launcher_state.clone()),
         )
         .nest("/api/v1", cli_api::router().with_state(launcher_state))
+        .layer(axum::middleware::from_fn(auth::require_auth))
+        .layer(axum::Extension(auth_state))
         .layer(cors);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));

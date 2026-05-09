@@ -4,10 +4,29 @@
 #   - Tag push matching v*.*.* (e.g. v0.1.0) → cuts a GitHub Release.
 #   - Manual workflow_dispatch → useful for dry-runs / re-cutting artifacts.
 #
-# What we ship per OS:
-#   - Linux x64 (ubuntu-latest):    vct-launcher          + .metadata.json
-#   - Windows x64 (windows-latest): vct-launcher.exe      + .metadata.json
-#   - macOS arm64 (macos-latest):   vct-launcher          + .metadata.json
+# What we ship per OS (two asset classes per matrix entry):
+#
+#   1. Standalone launcher binary (legacy, kept for GUI-only users):
+#      - Linux x64 (ubuntu-latest):    vct-launcher          + .metadata.json
+#      - Windows x64 (windows-latest): vct-launcher.exe      + .metadata.json
+#      - macOS arm64 (macos-latest):   vct-launcher          + .metadata.json
+#
+#   2. Full release archive (recommended path, since v0.2.0):
+#      - Linux x64:    vibecoded-orchestrator-<version>-linux-x64.tar.gz
+#      - Windows x64:  vibecoded-orchestrator-<version>-windows-x64.zip
+#      - macOS arm64:  vibecoded-orchestrator-<version>-macos-arm64.tar.gz
+#      Each archive contains:
+#        - launcher binary + vct-cli (vco) binary
+#        - claude_mcp_servers/ (Python MCP stack — venv stripped)
+#        - templates/ (agents, skills, hooks templates)
+#        - .claude/ (hooks, scripts, settings.json — no runtime state)
+#        - infrastructure/ (compose files)
+#        - tools/ (Claude wrapper, secrets helpers)
+#        - install.{sh,ps1,py} + first-install.* + start-launcher.*
+#          (OS-appropriate set per archive)
+#        - BOOTSTRAP.md, README.md, LICENSE, vct-module.json,
+#          orchestrator-managed-paths.txt, MIGRATION-<version>.md
+#      Plus .sha256 sidecar per archive.
 #
 # Intel Macs (x86_64) intentionally NOT shipped: the `macos-13` GitHub
 # runner image was fully deprecated 2025-12-04 (actions/runner-images
@@ -178,6 +197,281 @@ jobs:
           esac
           ls -lh "$stage"
 
+      # Build the vct-cli (`vco`) binary that ships alongside the launcher.
+      # Separate Cargo workspace at launcher/tools/vct-cli/Cargo.toml. The
+      # binary name is `vco` (renamed from `vct` to avoid collision with
+      # the bash secrets tool at tools/vct-secrets/vct — see
+      # launcher/tools/vct-cli/Cargo.toml `[[bin]] name = "vco"` for the
+      # rationale and docs/CLI.md for the user-facing rename note).
+      #
+      # We don't reuse `Swatinem/rust-cache` for this build — the
+      # workspace is only ~7 deps and the build is sub-30s on a cold
+      # cache. Adding a second cache entry would risk cache thrash with
+      # the launcher's much larger entry above.
+      - name: Build vct-cli (vco) binary
+        shell: bash
+        run: |
+          cargo build --release \
+            --manifest-path launcher/tools/vct-cli/Cargo.toml
+
+      # Stage the full release archive layout. The archive ships the
+      # launcher binary plus everything an end user needs to run it
+      # standalone: claude_mcp_servers (Python MCP stack), templates
+      # (agents/skills/hooks templates), .claude (project-scoped hooks
+      # + scripts + settings), infrastructure (compose files), tools
+      # (Claude wrapper + secrets helpers), the install scripts, and
+      # the doc surface (BOOTSTRAP / README / LICENSE / MIGRATION).
+      #
+      # The version string in the archive name is sourced from
+      # launcher/src-tauri/Cargo.toml so the workflow stays valid
+      # across future version bumps without re-editing — single source
+      # of truth pattern same as build-bundled-launcher.sh.
+      #
+      # Exclusions are conservative: we strip runtime/state pollution
+      # (.venv, __pycache__, *.pyc, .claude/logs, .claude/metrics)
+      # but keep agents/skills/hooks/scripts/settings.json which the
+      # installer wires into the user's project on first run. None of
+      # these excluded paths exist in CI's checkout (clean clone), but
+      # the patterns are defensive in case the workflow is ever run
+      # locally via `act` against a developer's working tree.
+      - name: Determine release version and archive name
+        id: archive_meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Pull version from the SAME source the launcher embeds at
+          # build time (launcher/src-tauri/Cargo.toml `version = "..."`).
+          # Cargo metadata would be cleaner but adds a JSON parse step;
+          # grep is enough for a single well-formed line.
+          version="$(grep -m1 '^version = ' launcher/src-tauri/Cargo.toml \
+            | sed -E 's/^version *= *"([^"]+)".*/\1/')"
+          if [ -z "$version" ]; then
+            echo "::error::Could not extract version from launcher/src-tauri/Cargo.toml"
+            exit 1
+          fi
+
+          # On tag push, sanity-check that the tag matches the Cargo
+          # version. Catches the failure mode "tag v0.2.0 pushed but
+          # forgot to bump Cargo.toml" — would otherwise produce an
+          # archive named after the OLD version under the NEW tag.
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            tag_version="${GITHUB_REF#refs/tags/v}"
+            if [ "$tag_version" != "$version" ]; then
+              echo "::error::Tag version ($tag_version) does not match Cargo.toml version ($version)."
+              echo "         Bump launcher/src-tauri/Cargo.toml to $tag_version before tagging,"
+              echo "         OR retag from a commit where the versions agree."
+              exit 1
+            fi
+          fi
+
+          archive_base="vibecoded-orchestrator-${version}-${{ matrix.target }}"
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            archive_ext="zip"
+          else
+            archive_ext="tar.gz"
+          fi
+          archive_name="${archive_base}.${archive_ext}"
+
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "archive_base=${archive_base}" >> "$GITHUB_OUTPUT"
+          echo "archive_ext=${archive_ext}" >> "$GITHUB_OUTPUT"
+          echo "archive_name=${archive_name}" >> "$GITHUB_OUTPUT"
+          echo "Archive will be: ${archive_name}"
+
+      # Build the staging tree at dist/<archive_base>/. We use rsync's
+      # exclude rules on Linux/macOS for deterministic filtering;
+      # Windows runners get robocopy with its own --exclude flags. Both
+      # produce the same on-disk layout.
+      - name: Stage archive contents
+        shell: bash
+        env:
+          ARCHIVE_BASE: ${{ steps.archive_meta.outputs.archive_base }}
+          MATRIX_TARGET: ${{ matrix.target }}
+          MATRIX_BINARY: ${{ matrix.binary }}
+        run: |
+          set -euo pipefail
+          stage_root="dist/${ARCHIVE_BASE}"
+          rm -rf "$stage_root"
+          mkdir -p "$stage_root"
+
+          # 1. Launcher binary (from the bundled-script staging dir;
+          # this is the SAME binary the existing workflow uploads as a
+          # standalone asset, so SLSA attestation downstream still
+          # binds correctly to the launcher inside the archive).
+          src_launcher="launcher/dist/${MATRIX_TARGET}/${MATRIX_BINARY}"
+          if [ ! -f "$src_launcher" ]; then
+            echo "::error::Expected launcher binary at $src_launcher"
+            exit 1
+          fi
+          cp "$src_launcher" "$stage_root/${MATRIX_BINARY}"
+
+          # 2. vct-cli (vco) binary
+          if [ "${MATRIX_TARGET}" = "windows-x64" ]; then
+            vco_src="launcher/tools/vct-cli/target/release/vco.exe"
+            vco_dst="$stage_root/vco.exe"
+          else
+            vco_src="launcher/tools/vct-cli/target/release/vco"
+            vco_dst="$stage_root/vco"
+          fi
+          if [ ! -f "$vco_src" ]; then
+            echo "::error::Expected vct-cli binary at $vco_src"
+            ls -la launcher/tools/vct-cli/target/release/ || true
+            exit 1
+          fi
+          cp "$vco_src" "$vco_dst"
+          # Preserve executable bit on Unix (rsync below also preserves
+          # it for the directory copies, but a direct cp drops it on
+          # some host configurations).
+          if [ "${MATRIX_TARGET}" != "windows-x64" ]; then
+            chmod +x "$stage_root/${MATRIX_BINARY}" "$vco_dst"
+          fi
+
+          # 3. Subtree copies — claude_mcp_servers, templates, .claude,
+          # infrastructure, tools. rsync filters keep the runtime
+          # detritus out of the shipped archive.
+          rsync_args=(
+            -a
+            --exclude='.venv/'
+            --exclude='__pycache__/'
+            --exclude='*.pyc'
+            --exclude='*.pyo'
+            --exclude='.pytest_cache/'
+            --exclude='.mypy_cache/'
+            --exclude='node_modules/'
+          )
+          rsync "${rsync_args[@]}" claude_mcp_servers/ "$stage_root/claude_mcp_servers/"
+          rsync "${rsync_args[@]}" templates/ "$stage_root/templates/"
+          rsync "${rsync_args[@]}" infrastructure/ "$stage_root/infrastructure/"
+          rsync "${rsync_args[@]}" tools/ "$stage_root/tools/"
+
+          # .claude/ has additional exclusions for runtime state we
+          # never want shipped: logs, metrics, ephemeral context.
+          rsync "${rsync_args[@]}" \
+            --exclude='logs/' \
+            --exclude='metrics/' \
+            --exclude='context/' \
+            --exclude='cron-jobs.json' \
+            --exclude='cron-dashboard.html' \
+            .claude/ "$stage_root/.claude/"
+
+          # 4. Installer scripts — OS-specific picks.
+          if [ "${MATRIX_TARGET}" = "windows-x64" ]; then
+            # Windows users get the .ps1 + .bat entry points and the
+            # cross-platform install.py. The .sh + .command + .desktop
+            # entries are Linux/macOS-only and would just confuse a
+            # Windows user.
+            cp install.ps1 "$stage_root/"
+            cp install.py "$stage_root/"
+            cp first-install.bat "$stage_root/"
+            cp start-launcher.bat "$stage_root/"
+          else
+            # Linux + macOS share the .sh entry points; the .command
+            # variant is macOS-friendly (Finder double-click) and the
+            # .desktop variant is Linux-friendly (GNOME/KDE), but
+            # shipping both is harmless on either OS — they just get
+            # ignored by the wrong platform's file manager.
+            cp install.sh "$stage_root/"
+            cp install.py "$stage_root/"
+            cp first-install.sh "$stage_root/"
+            cp first-install.command "$stage_root/"
+            cp first-install.desktop "$stage_root/"
+            cp start-launcher.sh "$stage_root/"
+            cp start-launcher.command "$stage_root/"
+            cp start-launcher.desktop "$stage_root/"
+          fi
+
+          # 5. Top-level docs + manifests.
+          cp BOOTSTRAP.md "$stage_root/"
+          cp README.md "$stage_root/"
+          cp LICENSE "$stage_root/"
+          cp vct-module.json "$stage_root/"
+          cp orchestrator-managed-paths.txt "$stage_root/"
+          cp requirements.txt "$stage_root/"
+          # MIGRATION-0.2.0.md is the per-release migration doc; if a
+          # docs/MIGRATION-<version>.md file matches the archive
+          # version, ship it at archive root for visibility (users
+          # extract → see migration notes immediately, before they
+          # have to know about docs/).
+          version="${ARCHIVE_BASE#vibecoded-orchestrator-}"
+          version="${version%-${MATRIX_TARGET}}"
+          migration_doc="docs/MIGRATION-${version}.md"
+          if [ -f "$migration_doc" ]; then
+            cp "$migration_doc" "$stage_root/MIGRATION-${version}.md"
+          fi
+
+          # Sanity ls — surfaces sizes in the run log so a regression
+          # (e.g. someone accidentally including a 200MB cache dir)
+          # is visible without needing to dig into the artifact.
+          echo "::group::Staging tree summary"
+          du -sh "$stage_root"
+          du -sh "$stage_root"/* 2>/dev/null || true
+          echo "::endgroup::"
+
+      - name: Create archive (Linux/macOS)
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        env:
+          ARCHIVE_BASE: ${{ steps.archive_meta.outputs.archive_base }}
+          ARCHIVE_NAME: ${{ steps.archive_meta.outputs.archive_name }}
+        run: |
+          set -euo pipefail
+          # GNU tar on Linux respects --owner=0 --group=0 --numeric-owner
+          # for reproducibility. macOS ships BSD tar which doesn't have
+          # the same flag set; we accept the slight loss of
+          # reproducibility there since macOS releases are tier-2 alpha.
+          # gzip -n strips the embedded mtime + filename for archive-
+          # level reproducibility (still varies across runners due to
+          # build timestamps embedded in the binary, but at least the
+          # tar wrapper is stable).
+          cd dist
+          if tar --version 2>&1 | grep -q GNU; then
+            tar --owner=0 --group=0 --numeric-owner \
+                --sort=name \
+                -cf - "${ARCHIVE_BASE}" | gzip -n > "${ARCHIVE_NAME}"
+          else
+            tar -czf "${ARCHIVE_NAME}" "${ARCHIVE_BASE}"
+          fi
+          ls -lh "${ARCHIVE_NAME}"
+
+      - name: Create archive (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        env:
+          ARCHIVE_BASE: ${{ steps.archive_meta.outputs.archive_base }}
+          ARCHIVE_NAME: ${{ steps.archive_meta.outputs.archive_name }}
+        run: |
+          # PowerShell's Compress-Archive ships in every Windows runner
+          # image. -CompressionLevel Optimal trades CPU for ~5-10%
+          # smaller .zip vs default. -Force overwrites any leftover
+          # archive from a previous run on the same runner.
+          $stage = Join-Path "dist" $env:ARCHIVE_BASE
+          $out   = Join-Path "dist" $env:ARCHIVE_NAME
+          if (-not (Test-Path $stage)) {
+              Write-Error "Staging dir not found: $stage"
+              exit 1
+          }
+          Compress-Archive -Path "$stage\*" `
+                           -DestinationPath $out `
+                           -CompressionLevel Optimal `
+                           -Force
+          Get-Item $out | Format-List Name, Length, LastWriteTime
+
+      - name: Compute archive checksum
+        shell: bash
+        env:
+          ARCHIVE_NAME: ${{ steps.archive_meta.outputs.archive_name }}
+        run: |
+          set -euo pipefail
+          cd dist
+          # sha256sum is GNU coreutils on Linux; macOS ships shasum -a 256;
+          # Git Bash on Windows ships sha256sum (msys2 build).
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${ARCHIVE_NAME}" > "${ARCHIVE_NAME}.sha256"
+          else
+            shasum -a 256 "${ARCHIVE_NAME}" > "${ARCHIVE_NAME}.sha256"
+          fi
+          cat "${ARCHIVE_NAME}.sha256"
+
       # SLSA build provenance attestation. Generates a Sigstore-signed
       # in-toto provenance predicate (SLSA Build Level 2 by default on
       # GitHub-hosted runners) for the launcher binary. End users can
@@ -198,25 +492,46 @@ jobs:
         with:
           subject-path: launcher/dist/${{ matrix.target }}/_release/${{ (startsWith(matrix.target, 'macos-')) && format('vct-launcher-{0}-experimental', matrix.target) || matrix.binary }}
 
-      # Upload the binary + metadata as Release assets. softprops/action-gh-release@v3
-      # auto-creates the release on tag push if it doesn't exist yet, and
-      # is a no-op for workflow_dispatch runs without a tag (files still
-      # show up as workflow artifacts via the separate upload-artifact
-      # step below — useful for dry-runs).
+      # Upload the binary + metadata + full release archive as Release
+      # assets. softprops/action-gh-release@v3 auto-creates the release
+      # on tag push if it doesn't exist yet, and is a no-op for
+      # workflow_dispatch runs without a tag (files still show up as
+      # workflow artifacts via the separate upload-artifact step below
+      # — useful for dry-runs).
+      #
+      # Two asset classes per OS:
+      #   1. Standalone launcher binary + metadata (legacy path, kept
+      #      for users who only want the GUI without the Python stack)
+      #   2. Full release archive (vibecoded-orchestrator-X.Y.Z-<os>.tar.gz
+      #      or .zip) + .sha256 (recommended path — bundles launcher,
+      #      vct-cli, MCP servers, templates, hooks, installers)
       - name: Upload to GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v3
         with:
           files: |
             launcher/dist/${{ matrix.target }}/_release/*
+            dist/${{ steps.archive_meta.outputs.archive_name }}
+            dist/${{ steps.archive_meta.outputs.archive_name }}.sha256
 
       # Always upload as workflow artifacts too — lets workflow_dispatch
-      # runs (no tag) still produce downloadable binaries for QA.
-      - name: Upload as workflow artifact
+      # runs (no tag) still produce downloadable binaries + archives
+      # for QA. Two artifacts per matrix entry: the legacy launcher-only
+      # bundle and the full release archive.
+      - name: Upload launcher binary as workflow artifact
         uses: actions/upload-artifact@v7
         with:
           name: vct-launcher-${{ matrix.target }}
           path: |
             launcher/dist/${{ matrix.target }}/${{ matrix.binary }}
             launcher/dist/${{ matrix.target }}/${{ matrix.binary }}.metadata.json
+          if-no-files-found: error
+
+      - name: Upload release archive as workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.archive_meta.outputs.archive_base }}
+          path: |
+            dist/${{ steps.archive_meta.outputs.archive_name }}
+            dist/${{ steps.archive_meta.outputs.archive_name }}.sha256
           if-no-files-found: error

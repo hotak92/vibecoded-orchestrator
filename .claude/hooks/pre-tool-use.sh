@@ -2,6 +2,16 @@
 # Scrub sensitive env vars before any subprocess spawning
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
+
+# VCO-CENTRALIZED-KG: read-side delegator on the KG-suggestion path (PR #171 / 0.1.7).
+#   The "KG search suggestion" branch (Edit/Write only, see section 5
+#   below) calls .claude/scripts/kg-search; that wrapper invokes
+#   search_knowledge.py which honors VCT_KG_ACCESS_LIST through the
+#   shared helper. Other branches (SSRF guard, shell-injection scan,
+#   Build Anchor, file backup, tool logging) do not touch KG/codegraph.
+#   Env propagation: $(...) subshells inherit env. No centralization
+#   needed in this hook itself.
+
 # Pre-tool-use hook — Security enforcement + tool logging + KG suggestion
 # Triggers: Before all tool uses
 # Actions:
@@ -217,11 +227,25 @@ if [ -n "$CONCEPTS" ]; then
     MATCH_COUNT=$(echo "$MATCHES" | grep -c "^knowledge/" 2>/dev/null || echo "0")
 
     if [ "$MATCH_COUNT" -ge 2 ]; then
-        echo ""
-        echo "💡 Found $MATCH_COUNT related patterns for: $CONCEPTS"
-        echo "$MATCHES" | sed 's/^/   /'
-        echo ""
-        echo "   Search more: 'Search knowledge graph for [concept]'"
-        echo ""
+        # PreToolUse hooks must wrap LLM-bound stdout in
+        # `hookSpecificOutput.additionalContext` — plain stdout is silently
+        # discarded by Claude Code's hook runner. Pre-fork-sweep this
+        # branch printed plaintext that never reached the LLM. Same fix
+        # class as pre-edit-context-inject (PR #168). 10k char cap matches
+        # that hook's contract. Falls back to no-op if python3 is missing.
+        SUGGESTION_TEXT=$(printf '\n💡 Found %s related patterns for: %s\n%s\n\n   Search more: '\''Search knowledge graph for [concept]'\''\n' "$MATCH_COUNT" "$CONCEPTS" "$(echo "$MATCHES" | sed 's/^/   /')")
+        if command -v python3 >/dev/null 2>&1; then
+            SUGGESTION_TRUNCATED=$(printf '%s' "$SUGGESTION_TEXT" | head -c 10000)
+            python3 -c "
+import json, sys
+print(json.dumps({
+    'hookSpecificOutput': {
+        'hookEventName': 'PreToolUse',
+        'permissionDecision': 'allow',
+        'additionalContext': sys.stdin.read(),
+    }
+}))
+" <<< "$SUGGESTION_TRUNCATED" 2>/dev/null || true
+        fi
     fi
 fi

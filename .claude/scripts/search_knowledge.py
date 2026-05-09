@@ -37,7 +37,9 @@ MAX_QUERY_TOKENS = 2500
 # ignored. Pure utility import (no service runtime); see PR-2 design notes.
 try:
     # VCO-REWIRE-BEGIN: orchestrator-root-resolution
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "claude_mcp_servers"))
+    _local_mcp = Path(__file__).resolve().parent.parent.parent / "claude_mcp_servers"
+    sys.path.insert(0, str(_local_mcp))
+    sys.path.insert(0, str(_local_mcp / "scripts"))
     # VCO-REWIRE-END: orchestrator-root-resolution
     from weaviate_mcp.server import (
         _get_result_verbosity_by_score,
@@ -47,6 +49,24 @@ try:
     HAS_TIER_HELPERS = True
 except Exception:
     HAS_TIER_HELPERS = False
+
+# P1-D (2026-05-08): centralized access-matrix helper. Falls back to a
+# self-only inline implementation if the helper isn't on sys.path
+# (e.g. user hand-edited their venv). The fallback yields the
+# pre-P1-D behaviour: just self [+ shared].
+try:
+    from kg_access import kg_collections_to_search as _kg_collections_to_search  # type: ignore[import-not-found]
+except Exception:
+    def _kg_collections_to_search(  # type: ignore[no-redef]
+        self_kg: str,
+        shared_kg: str = "",
+        development: str = "",
+        include_dev: bool = False,
+    ) -> list[str]:
+        out = [self_kg]
+        if shared_kg and shared_kg != self_kg:
+            out.append(shared_kg)
+        return out
 
 # Try to import query logger
 try:
@@ -201,10 +221,18 @@ def search_knowledge(
             for f in filters[1:]:
                 weaviate_filter = weaviate_filter & f
 
-        # Determine which collections to query
-        collections_to_query = [KG_COLLECTION]
-        if SHARED_KG_COLLECTION and SHARED_KG_COLLECTION != KG_COLLECTION:
-            collections_to_query.append(SHARED_KG_COLLECTION)
+        # P1-D (2026-05-08): determine which collections to query, honouring
+        # the launcher's access matrix (VCT_KG_ACCESS_LIST). Pre-P1-D this
+        # was just self [+ shared]; now it's self + shared + every peer the
+        # access matrix has granted. The helper handles dedupe, empty/missing
+        # env vars, and self/shared collisions defensively. include_dev=False
+        # because this CLI doesn't currently render development-collection
+        # results (mirrors the semantic_graph_search MCP semantics).
+        collections_to_query = _kg_collections_to_search(
+            self_kg=KG_COLLECTION,
+            shared_kg=SHARED_KG_COLLECTION,
+            include_dev=False,
+        )
 
         fetch_limit = limit * 3
 
@@ -274,12 +302,24 @@ def search_knowledge(
                 distance = obj.metadata.distance if obj.metadata and obj.metadata.distance is not None else 1.0
                 score = max(0.0, min(1.0, 1.0 - distance))
 
+                # P1-D (2026-05-08): label the source collection. Three
+                # buckets: self project, shared cross-project KG, peer
+                # project (anything else in collections_to_query that isn't
+                # self/shared). Pre-P1-D the only options were self/shared,
+                # so peer-collection results were mislabelled "[project]".
                 source_label = ""
                 if collections_searched > 1:
                     if collection_source == SHARED_KG_COLLECTION:
                         source_label = " [shared]"
-                    else:
+                    elif collection_source == KG_COLLECTION:
                         source_label = " [project]"
+                    else:
+                        # Strip the canonical "_KnowledgeGraph" suffix so the
+                        # label is the bare peer-project name.
+                        peer = collection_source
+                        if peer.endswith("_KnowledgeGraph"):
+                            peer = peer[: -len("_KnowledgeGraph")]
+                        source_label = f" [peer:{peer}]"
 
                 # Build a result dict in the shape _format_result_by_tier expects
                 result_dict = {

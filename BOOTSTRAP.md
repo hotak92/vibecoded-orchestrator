@@ -15,6 +15,33 @@ The next steps depend on how you got here.
 
 ---
 
+## Quick start (recommended)
+
+Download the latest archive for your OS from
+[Releases](https://github.com/hotak92/vibecoded-orchestrator/releases):
+
+- Linux x64: `vibecoded-orchestrator-0.2.0-linux-x64.tar.gz`
+- macOS arm64: `vibecoded-orchestrator-0.2.0-macos-arm64.tar.gz`
+- Windows x64: `vibecoded-orchestrator-0.2.0-windows-x64.zip`
+
+Extract, then double-click `first-install.{sh,command,desktop,bat}` for
+your platform. The installer will:
+- Detect or auto-install Python 3.11+ (asks before sudo)
+- Detect or prompt for Podman/Docker
+- Set up the venv and pull container images on first run
+
+System requirements: Python 3.11+, Podman or Docker, ~2GB free disk.
+The first-install script handles the Python auto-install via your
+platform's package manager (apt/dnf/pacman/brew on Linux/macOS;
+winget on Windows). It does NOT install Podman/Docker — you'll be
+prompted to install one before the launcher runs.
+
+If you already have a clone from GitHub, the rest of this document
+walks you through the standalone path (Path B below). If you opened
+this through the VCT Launcher desktop app, see Path A.
+
+---
+
 ## Path A: You opened this through the VCT Launcher
 
 If you installed via the **VCT Launcher** desktop app, almost everything is already wired up:

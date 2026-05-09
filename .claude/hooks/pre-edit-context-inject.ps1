@@ -1,9 +1,22 @@
+# OS-EXEMPT-PARITY: Windows-only fix 2026-05-08 — added hookSpecificOutput/additionalContext JSON envelope. The .sh sibling already emitted that envelope from earlier work; no .sh change needed in this commit.
 # Parity-touch 2026-05-08: bash shebang of sibling .sh switched from #!/bin/bash to #!/usr/bin/env bash for macOS portability. PS1 has no shebang to change; this comment is the parity-required modification.
 # Scrub sensitive env vars (this hook doesn't need credentials)
 foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN') {
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
+
+# VCO-CENTRALIZED-KG: read-side delegator (PR #171 / 0.1.7).
+#   Delegates KG search to claude_mcp_servers/scripts/rl_kg_search.py and
+#   code-graph search to .claude/scripts/code-graph-query — both call the
+#   access-aware helpers (_kg_collections_to_search /
+#   code_graph_collections_to_query) in claude_mcp_servers/weaviate_mcp/
+#   server.py, which read VCT_KG_ACCESS_LIST + VCT_CODE_GRAPH_ACCESS_LIST.
+#   This hook does NOT query Weaviate directly. Env propagation is by
+#   subprocess inheritance (Start-Process / & inherit env by default).
+#   See knowledge/concepts/multi-source-kg-runtime.md and
+#   tests/test_kg_access_list.py for the consumer contract.
+
 # pre-edit-context-inject.ps1
 # Pre-edit context injection — KG + code graph context for the file being edited.
 # Always exit 0 (never block the edit).
@@ -71,12 +84,41 @@ if (-not (Test-Path $CacheDir)) {
     New-Item -ItemType Directory -Path $CacheDir -Force | Out-Null
 }
 
+# === Emit context as PreToolUse JSON envelope ===
+# Plain stdout is silently discarded by Claude Code's hook runner — only
+# `hookSpecificOutput.additionalContext` reaches the LLM (system reminder
+# wrapper). 10k char cap mirrors the .sh sibling's contract. Pre-2026-05-08
+# this hook printed plain stdout that never reached the LLM context on
+# Windows, so all the KG/codegraph injection work was effectively dead on
+# the Windows side. Confirmed by checking that no `[Pre-edit context for ...]`
+# system-reminders ever appeared in real Edit-tool transcripts. The .sh
+# sibling was fixed in PR #168; the .ps1 fix landed alongside the
+# fork-readiness sweep for 0.1.7.
+function Emit-ContextJson([string]$ctx) {
+    if (-not $ctx) { return }
+    $truncated = if ($ctx.Length -gt 10000) { $ctx.Substring(0, 10000) } else { $ctx }
+    $envelope = [ordered]@{
+        hookSpecificOutput = [ordered]@{
+            hookEventName      = 'PreToolUse'
+            permissionDecision = 'allow'
+            additionalContext  = $truncated
+        }
+    }
+    # Compress + Depth 8 matches the .sh side's json.dumps default-compact
+    # form (no indentation, default escape behaviour). UTF-8 stdout via
+    # Write-Output is fine here — Claude Code reads stdout as UTF-8.
+    $json = $envelope | ConvertTo-Json -Compress -Depth 8
+    Write-Output $json
+}
+
 # Check cache (10-min TTL) — uses .NET file mtime, no cross-OS stat issues.
 if (Test-Path $CacheFile) {
     $mtime = (Get-Item $CacheFile).LastWriteTime
     $age = ((Get-Date) - $mtime).TotalSeconds
     if ($age -lt $CacheTtl) {
-        Get-Content $CacheFile -Raw
+        $cached = ""
+        try { $cached = (Get-Content $CacheFile -Raw -ErrorAction Stop) } catch { }
+        Emit-ContextJson $cached
         exit 0
     }
 }
@@ -180,6 +222,8 @@ if ($HasCode) {
 }
 
 $outStr = $out.ToString()
+# Cache stores the human-readable form so re-emission produces identical
+# content. Emit-ContextJson wraps it for Claude Code's PreToolUse contract.
 try { Set-Content -Path $CacheFile -Value $outStr -Encoding UTF8 -NoNewline } catch { }
-Write-Output $outStr
+Emit-ContextJson $outStr
 exit 0

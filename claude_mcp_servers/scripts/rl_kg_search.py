@@ -38,6 +38,7 @@ async def main():
         _rl_cache_and_rerank,
         _get_result_verbosity_by_score,
         _format_result_by_tier,
+        _kg_collections_to_search,
         KG_COLLECTION,
         EMBEDDING_SOURCE,
         _RL_OVERFETCH,
@@ -46,36 +47,82 @@ async def main():
 
     client = get_weaviate_client()
     try:
-        coll = client.collections.get(KG_COLLECTION)
+        # P1-D (2026-05-08): fan out across self + shared + peer KGs from
+        # the launcher's access matrix (VCT_KG_ACCESS_LIST). Pre-fix this
+        # script queried only KG_COLLECTION, so the pre-edit hook missed
+        # peer-project context that the launcher GUI had granted —
+        # turning the access matrix into a UI-only feature with no
+        # runtime effect.
+        collections_to_search = _kg_collections_to_search(include_dev=False)
 
         fetch_limit = args.limit * _RL_OVERFETCH
 
-        # Same search path as hybrid_search / semantic_graph_search
+        # Run the search across each collection and merge candidates by
+        # title-keyed best score. The MCP server's hybrid_search /
+        # semantic_graph_search already do this — we replicate the
+        # minimum: per-collection over-fetch, then sort + take top-k for
+        # the RL rerank.
         if EMBEDDING_SOURCE == "weaviate":
-            primary = coll.query.near_text(
-                query=args.query, limit=fetch_limit, return_metadata=["distance"]
-            )
+            vector = None
+            target_name = None
         else:
             vector, target_name = await _get_search_vector(args.query)
-            nv_kwargs = dict(near_vector=vector, limit=fetch_limit, return_metadata=["distance"])
-            if target_name:
-                nv_kwargs["target_vector"] = target_name
-            primary = coll.query.near_vector(**nv_kwargs)
 
-        if not primary.objects:
+        all_formatted: list[dict] = []
+        for coll_name in collections_to_search:
+            try:
+                coll = client.collections.get(coll_name)
+            except Exception as exc:
+                # Collection may not exist (peer never indexed yet) —
+                # skip silently.
+                continue
+            try:
+                if EMBEDDING_SOURCE == "weaviate":
+                    primary = coll.query.near_text(
+                        query=args.query,
+                        limit=fetch_limit,
+                        return_metadata=["distance"],
+                    )
+                else:
+                    nv_kwargs = dict(
+                        near_vector=vector,
+                        limit=fetch_limit,
+                        return_metadata=["distance"],
+                    )
+                    if target_name:
+                        nv_kwargs["target_vector"] = target_name
+                    primary = coll.query.near_vector(**nv_kwargs)
+            except Exception:
+                continue
+            if not primary.objects:
+                continue
+            coll_formatted = [
+                _format_obj(obj, coll_name, obj.metadata.distance)
+                for obj in primary.objects
+            ]
+            coll_formatted = _enrich_with_adjacent_chunks(coll, coll_formatted, coll_name)
+            all_formatted.extend(coll_formatted)
+
+        if not all_formatted:
             return
 
-        all_formatted = [
-            _format_obj(obj, KG_COLLECTION, obj.metadata.distance)
-            for obj in primary.objects
-        ]
-        all_formatted = _enrich_with_adjacent_chunks(coll, all_formatted, KG_COLLECTION)
+        # Use the primary KG collection handle for the tier helper's
+        # sidecar lookups. This matches the hybrid_search behaviour —
+        # the formatter only needs A handle for chunk fetches; results
+        # carry their own source-collection info.
+        coll = client.collections.get(KG_COLLECTION)
 
         # Preserve a normalised score (1 - distance) for the tier helper.
         for r in all_formatted:
             if "score" not in r:
                 d = r.get("distance")
                 r["score"] = (1.0 - d) if isinstance(d, (int, float)) else 0.0
+
+        # Multi-collection merge: sort by score so the RL server sees a
+        # clean top-k regardless of which collection each result came
+        # from. Without this, peer-collection results would be appended
+        # below self-collection results even when their score is higher.
+        all_formatted.sort(key=lambda x: x.get("score", 0.0), reverse=True)
 
         # RL rerank (calls RL server, falls back to Weaviate order)
         task_id = f"pre_edit_{uuid.uuid4().hex[:8]}"

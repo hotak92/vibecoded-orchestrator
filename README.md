@@ -40,7 +40,30 @@ If you don't use Claude Code: the KG / code graph / MCPs / launcher GUI still al
 
 ---
 
-## TL;DR — install + launch
+## Quick start (recommended)
+
+Download the latest archive for your OS from
+[Releases](https://github.com/hotak92/vibecoded-orchestrator/releases):
+
+- Linux x64: `vibecoded-orchestrator-0.2.0-linux-x64.tar.gz`
+- macOS arm64: `vibecoded-orchestrator-0.2.0-macos-arm64.tar.gz`
+- Windows x64: `vibecoded-orchestrator-0.2.0-windows-x64.zip`
+
+Extract, then double-click `first-install.{sh,command,desktop,bat}` for
+your platform. The installer will:
+- Detect or auto-install Python 3.11+ (asks before sudo)
+- Detect or prompt for Podman/Docker
+- Set up the venv and pull container images on first run
+
+System requirements: Python 3.11+, Podman or Docker, ~2GB free disk.
+The first-install script handles the Python auto-install via your
+platform's package manager (apt/dnf/pacman/brew on Linux/macOS;
+winget on Windows). It does NOT install Podman/Docker — you'll be
+prompted to install one before the launcher runs.
+
+---
+
+## Quick start (developers / contributors — clone)
 
 After cloning the repo, run the install entry point for your OS, then double-click the launcher entry point:
 
@@ -124,7 +147,7 @@ You use Claude Code the way you already do. The orchestrator runs in the backgro
 - **19 free agents + 28 skills** — shipped via `install.py` templates. The opt-in MAO add-on installs 10 more specialist agents.
 - **Workflow plumbing** — session state tracking, plans, memory management, compaction-preserving context replay
 
-## Downloads (Launcher GUI — v0.1.6+)
+## Downloads (Launcher GUI — v0.2.0+)
 
 The launcher GUI ships as a per-OS standalone artifact on [GitHub
 Releases](https://github.com/hotak92/vibecoded-orchestrator/releases). It's
@@ -152,10 +175,10 @@ We can't test on Mac. The .dmg is built unattended in CI. Try at your own risk.
    ```
 4. Open the app from /Applications.
 
-If it works, please open an issue saying "v0.1.6 worked on macOS [version] [arch]". That helps us prioritise Apple Developer enrollment.
+If it works, please open an issue saying "v0.2.0 worked on macOS [version] [arch]". That helps us prioritise Apple Developer enrollment.
 If it doesn't, please open an issue with macOS version, architecture (`uname -m`), and the error message.
 
-Apple Developer enrollment + notarization are on the post-launch backlog. Intel Mac users: build from source for v0.1.6; a Universal binary is planned for v0.2.
+Apple Developer enrollment + notarization are on the post-launch backlog. Intel Mac users: build from source for v0.2.0; a Universal binary is planned for v0.3.
 
 ## Quick Install
 
@@ -286,7 +309,7 @@ If the wrappers can't auto-install (for example, no `winget` on older Windows or
 | `code_embed` container fails on CPU-only host | GPU profile enabled despite no NVIDIA GPU | Run with `--cpu-only` (or `--low-resource`) — these set `CODE_EMBED_BACKEND=ollama` instead |
 | Joern download/install fails | Network blocked or JDK install rejected | Skip with `--no-joern`; install separately later from https://docs.joern.io/installation/ |
 | Hooks don't fire on Windows | Hooks ship as `.ps1` on Windows; PowerShell 5.1+ required | Install/upgrade PowerShell — Windows 10/11 ships with 5.1 by default. Legacy `.sh`-only helpers (instinct pipeline) need Git Bash for full coverage. |
-| `git pull` fails with "non-fast-forward" / launcher "Update now" errors | Clone predates the 2026-05-06 21:35 UTC history rewrite (we removed internal-docs leaks via `git filter-repo`) | See [docs/RECOVERY-2026-05-06.md](docs/RECOVERY-2026-05-06.md) — choose re-clone (cleanest) or hard-reset (preserves untracked files). The launcher will surface a Resync modal in v0.1.7+; on older binaries use the doc. |
+| `git pull` fails with "non-fast-forward" / launcher "Update now" errors | Clone predates the 2026-05-06 21:35 UTC history rewrite (we removed internal-docs leaks via `git filter-repo`) | See [docs/RECOVERY-2026-05-06.md](docs/RECOVERY-2026-05-06.md) — choose re-clone (cleanest) or hard-reset (preserves untracked files). The launcher will surface a Resync modal in v0.2.0+; on older binaries use the doc. |
 | Existing Weaviate / Ollama on default ports | The installer detects foreign services on `8081` / `11435` / `11440` and runs ours on a free alt-port by default — no collision, no pollution. Override with `--on-conflict adopt\|abort`. See [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md#coexisting-with-other-weaviate-or-ollama-installs). | — |
 
 For deeper issues see [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).

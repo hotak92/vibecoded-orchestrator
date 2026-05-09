@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# search-mcp wrapper — runs the search MCP server with GITHUB_TOKEN populated
-# from VCT secrets, never leaking the secret to the calling shell.
+# search-mcp wrapper — runs the search MCP server with GITHUB_TOKEN
+# populated from the launcher's keychain (via the hub HTTP API), never
+# leaking the secret to the calling shell.
 #
 # Why a wrapper:
 #   Claude Code's ~/.claude.json `env:` block does not expand ${VAR}
@@ -9,18 +10,52 @@
 #   workaround is a wrapper script that reads the secret and exec's the
 #   real binary.
 #
-# How:
-#   1. Locate the secret at ~/.vct-secrets/shared/github_pat (or legacy
-#      flat ~/.vct-secrets/github_pat as a fallback).
-#   2. Read it (must be mode 600 or 400; we refuse weaker perms).
-#   3. Export GITHUB_TOKEN and exec the real server.
+# How (0.1.7 final, post-fork-readiness sweep 2026-05-08):
+#   Two resolution paths, in order:
+#
+#   1. Env-first (canonical 0.1.7 path): if $GITHUB_TOKEN is already
+#      exported, use it. The launcher's `write_project_env_files`
+#      writes GITHUB_TOKEN to `.claude/env`, `.claude/settings.json`
+#      `env`, and `.vscode/settings.json` `claude-code.env` for every
+#      registered project, sourced from the keychain entry at
+#      `vct._user_shared_.shared.installer/github_pat`. Subprocesses
+#      spawned in any registered project's Claude Code session inherit
+#      it directly — no resolver call needed.
+#
+#   2. Resolver helper (`vct_secrets_resolve.sh <path> github_pat`):
+#      reads from the launcher's hub HTTP API at
+#      `GET /api/v1/projects/{id}/env?key=github_pat`, which:
+#         - resolves the keychain at SENTINEL_SHARED + module_id="installer"
+#           (matches what `register_github_pat` writes to)
+#         - applies the cross-launcher active-flag gate
+#         - finds the manifest declaration via the orchestrator's
+#           `vct-module.json::bundled_secrets[]` block (NEW in
+#           0.1.7 fork-readiness sweep, item H1)
+#      End-to-end working for every base-host project the moment the
+#      launcher starts — no module-install required.
+#
+# The legacy `~/.vct-secrets/shared/github_pat` file fallback that
+# existed in earlier 0.1.7 pre-releases (gated behind
+# $VCT_LEGACY_FILE_FALLBACK=1) has been REMOVED in the 0.1.7
+# fork-readiness sweep (item H4, 2026-05-08). Both canonical paths
+# above (env-first and resolver) work end-to-end now, so the file
+# fallback is no longer needed. Users with a stale
+# `~/.vct-secrets/shared/github_pat` file from a pre-fix install will
+# have it migrated into the keychain by the next
+# `register_github_pat` call (see `migrate_github_pat_file_to_keychain`
+# in commands/installer.rs); manual migration via the
+# OnboardingWizard works too.
 #
 # Configuration via env (override defaults):
-#   VCT_SECRETS_DIR  default: $HOME/.vct-secrets
-#   SEARCH_MCP_PYTHON  default: $REPO_ROOT/claude_mcp_servers/.venv/bin/python
-#   SEARCH_MCP_SERVER  default: $REPO_ROOT/claude_mcp_servers/search_mcp/server.py
+#   VCT_PROJECT_PATH       project folder used to resolve the secret
+#                          (default: $PWD; the launcher sets this
+#                          for `vibecoded`-spawned wrappers).
+#   VCT_HUB_PORT           override hub port (else read ~/.vct/hub.port).
+#   SEARCH_MCP_PYTHON      default: $REPO_ROOT/claude_mcp_servers/.venv/bin/python
+#   SEARCH_MCP_SERVER      default: $REPO_ROOT/claude_mcp_servers/search_mcp/server.py
 #
-# REPO_ROOT is computed from this script's location (../../ from search_mcp/wrapper.sh).
+# REPO_ROOT is computed from this script's location (../../ from
+# search_mcp/wrapper.sh).
 
 set -euo pipefail
 
@@ -28,27 +63,90 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-VCT_DIR="${VCT_SECRETS_DIR:-$HOME/.vct-secrets}"
-SECRET_FILE="$VCT_DIR/shared/github_pat"
-[[ ! -f "$SECRET_FILE" ]] && [[ -f "$VCT_DIR/github_pat" ]] && SECRET_FILE="$VCT_DIR/github_pat"
-
 PYTHON_BIN="${SEARCH_MCP_PYTHON:-$REPO_ROOT/claude_mcp_servers/.venv/bin/python}"
 SERVER_PY="${SEARCH_MCP_SERVER:-$REPO_ROOT/claude_mcp_servers/search_mcp/server.py}"
 
-# ── Sanity checks ────────────────────────────────────────────────────────────
-if [[ ! -f "$SECRET_FILE" ]]; then
-    echo "[search-mcp-wrapper] ERROR: github_pat not found at $VCT_DIR/shared/ or $VCT_DIR/" >&2
-    echo "[search-mcp-wrapper] Fix:  vct set --project SHARED --key github_pat   (paste token via stdin)" >&2
-    exit 1
+# ── Locate the resolver ──────────────────────────────────────────────────────
+# Prefer the orchestrator-bundled copy at .claude/scripts/. Fall back
+# to templates/scripts/ in the same repo (covers the developer running
+# this wrapper from the source clone before they've installed the
+# orchestrator into a project).
+RESOLVER=""
+for candidate in \
+    "$REPO_ROOT/.claude/scripts/vct_secrets_resolve.sh" \
+    "$REPO_ROOT/templates/scripts/vct_secrets_resolve.sh"; do
+    if [[ -x "$candidate" ]]; then
+        RESOLVER="$candidate"
+        break
+    fi
+done
+
+# ── Resolve GITHUB_TOKEN ─────────────────────────────────────────────────────
+# Two paths, in order (legacy file fallback retired in 0.1.7 final, item H4):
+#   1. $GITHUB_TOKEN already exported in the environment — canonical 0.1.7
+#      path. Set by the launcher's `write_project_env_files` for every
+#      registered project, sourced from the keychain entry at
+#      `vct._user_shared_.shared.installer/github_pat`.
+#   2. Resolver helper (`vct_secrets_resolve.sh <path> github_pat`) —
+#      reads the keychain via the launcher hub. Works end-to-end for
+#      every base-host project after 0.1.7 H1: the orchestrator's
+#      `vct-module.json::bundled_secrets[]` declares `github_pat`, so
+#      the hub's `/projects/{id}/env` resolver finds it without any
+#      module install required. The resolver itself uses SENTINEL_SHARED
+#      for the keychain lookup (matches the writer side).
+project_path="${VCT_PROJECT_PATH:-$PWD}"
+
+# Path 1: env-first.
+if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    : # already in env via launcher's per-project env-file emission
+elif [[ -n "$RESOLVER" ]]; then
+    set +e
+    GITHUB_TOKEN=$("$RESOLVER" "$project_path" github_pat 2>/dev/null)
+    rc=$?
+    set -e
+    case "$rc" in
+        0)
+            : # ok — resolver returned the value
+            ;;
+        1)
+            echo "[search-mcp-wrapper] WARN: launcher hub unreachable; the launcher must be running to resolve secrets" >&2
+            ;;
+        2)
+            echo "[search-mcp-wrapper] WARN: project $project_path not registered with the launcher" >&2
+            ;;
+        3)
+            echo "[search-mcp-wrapper] ERROR: github_pat is paused for project $project_path; reactivate it via the launcher GUI" >&2
+            exit 1
+            ;;
+        4)
+            echo "[search-mcp-wrapper] WARN: github_pat not declared by any installed module nor by the orchestrator's bundled_secrets for $project_path" >&2
+            ;;
+        *)
+            echo "[search-mcp-wrapper] WARN: resolver exited with code $rc" >&2
+            ;;
+    esac
+else
+    echo "[search-mcp-wrapper] WARN: vct_secrets_resolve.sh not found; orchestrator may not be installed" >&2
 fi
 
-perms=$(stat -c %a "$SECRET_FILE" 2>/dev/null || stat -f %Lp "$SECRET_FILE" 2>/dev/null || echo "")
-if [[ "$perms" != "600" && "$perms" != "400" ]]; then
-    echo "[search-mcp-wrapper] ERROR: $SECRET_FILE has perms $perms (want 600 or 400)" >&2
-    echo "[search-mcp-wrapper] Fix:  chmod 600 $SECRET_FILE   (or run 'vct doctor')" >&2
+if [[ -z "${GITHUB_TOKEN:-}" ]]; then
+    echo "[search-mcp-wrapper] ERROR: could not resolve github_pat" >&2
+    echo "[search-mcp-wrapper] Canonical fix (0.1.7+):" >&2
+    echo "  1. Make sure the VCO Launcher is running" >&2
+    echo "  2. Open the launcher's OnboardingWizard or Settings → GitHub Token" >&2
+    echo "     (writes to keychain at vct._user_shared_.shared.installer/github_pat)" >&2
+    echo "  3. The launcher auto-writes GITHUB_TOKEN to every registered project's" >&2
+    echo "     .claude/env, .claude/settings.json env, and .vscode/settings.json" >&2
+    echo "     claude-code.env. Verify: grep '^export GITHUB_TOKEN=' .claude/env" >&2
+    echo "  4. If the env var is set but you're still seeing this error, restart" >&2
+    echo "     your Claude Code session (env files are read at session start)." >&2
+    echo "  5. As a last resort, run vct_secrets_resolve.sh \"\$PWD\" github_pat" >&2
+    echo "     directly to see the resolver's exit code + diagnostic output." >&2
     exit 1
 fi
+export GITHUB_TOKEN
 
+# ── Sanity checks for the python runtime ─────────────────────────────────────
 if [[ ! -x "$PYTHON_BIN" ]]; then
     echo "[search-mcp-wrapper] ERROR: python not found at $PYTHON_BIN" >&2
     echo "[search-mcp-wrapper] Set SEARCH_MCP_PYTHON env var, or create the venv:" >&2
@@ -62,9 +160,5 @@ if [[ ! -f "$SERVER_PY" ]]; then
     exit 1
 fi
 
-# ── Load secret + exec ───────────────────────────────────────────────────────
-GITHUB_TOKEN=$(tr -d '[:space:]' < "$SECRET_FILE")
-[[ -z "$GITHUB_TOKEN" ]] && { echo "[search-mcp-wrapper] ERROR: $SECRET_FILE is empty" >&2; exit 1; }
-export GITHUB_TOKEN
-
+# ── Exec ─────────────────────────────────────────────────────────────────────
 exec "$PYTHON_BIN" "$SERVER_PY" "$@"

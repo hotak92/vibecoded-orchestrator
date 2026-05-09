@@ -711,6 +711,86 @@ SHARED_KG_OPT_OUT = SHARED_KG_WRITE_DISABLED
 # uses KG_COLLECTION only — docs have no WikiLinks so graph traversal can't
 # find useful neighbors there.
 DEVELOPMENT_COLLECTION = os.getenv("DEVELOPMENT_COLLECTION", "")
+
+
+# ─── Multi-source access matrix (P1-D, 2026-05-08) ─────────────────────────
+#
+# The launcher's GUI access matrix is propagated into env vars that the MCP
+# server (and bundled hooks) read at process start to fan-out KG / code-graph
+# searches across peer projects. Without these vars, the matrix was a
+# launcher-internal feature with no runtime effect.
+#
+# Format (set by `write_project_env_files` in Rust, in
+# `.claude/env`, `.claude/settings.json env`, and
+# `.vscode/settings.json claude-code.env`):
+#
+#   VCT_KG_ACCESS_LIST=PeerA,PeerB,PeerC
+#       Comma-separated peer project NAMES (already sanitized to the
+#       collection-prefix shape). Empty / unset = no peers granted (the
+#       default).
+#   VCT_CODE_GRAPH_ACCESS_LIST=PeerA,PeerB
+#       Same shape, for the code-graph access matrix.
+#
+# Each peer maps to one KG collection (`<Peer>_KnowledgeGraph`) for KG and
+# 5 collections (`<Peer>_CodeFunction`, `<Peer>_CodeClass`, ...) for code.
+# Resolution is done via `_sanitize_collection_prefix` which is idempotent
+# for already-sanitized inputs.
+
+def _parse_csv_env(name: str) -> list[str]:
+    """Parse a comma-separated env var, dropping empties and stripping
+    whitespace. Returns [] when the var is unset or empty."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return []
+    return [p.strip() for p in raw.split(",") if p.strip()]
+
+
+def _kg_peer_collections() -> list[str]:
+    """Return the list of peer-project KG collection names this process
+    should search, derived from VCT_KG_ACCESS_LIST. Each peer name is
+    sanitized + suffixed with `_KnowledgeGraph` to recover the canonical
+    Weaviate collection name. Sorted, deduped, never includes
+    KG_COLLECTION or SHARED_KG_COLLECTION (the caller of
+    `_kg_collections_to_search` adds those separately).
+    """
+    peers = _parse_csv_env("VCT_KG_ACCESS_LIST")
+    out: list[str] = []
+    seen: set[str] = set()
+    for p in peers:
+        # `_sanitize_collection_prefix` is idempotent for already-sanitized
+        # input; this lets the launcher pass either form (it always passes
+        # the sanitized form, but we tolerate both for forward-compat with
+        # tooling that builds its own VCT_KG_ACCESS_LIST).
+        prefix = _sanitize_collection_prefix(p)
+        if not prefix:
+            continue
+        coll = f"{prefix}_KnowledgeGraph"
+        if coll in seen:
+            continue
+        seen.add(coll)
+        out.append(coll)
+    return out
+
+
+def _kg_collections_to_search(include_dev: bool = False) -> list[str]:
+    """Return the union of KG collections this process should fan-out
+    across: self + shared (when configured + distinct) + every peer in
+    `VCT_KG_ACCESS_LIST`. Order: self first, shared second, peers after.
+    Caller may pass `include_dev=True` to also include
+    `DEVELOPMENT_COLLECTION` (only `hybrid_search` does — graph traversal
+    skips dev docs, see existing comment at the call site).
+    """
+    out: list[str] = [KG_COLLECTION]
+    if SHARED_KG_COLLECTION and SHARED_KG_COLLECTION != KG_COLLECTION:
+        out.append(SHARED_KG_COLLECTION)
+    for coll in _kg_peer_collections():
+        if coll == KG_COLLECTION or coll == SHARED_KG_COLLECTION:
+            continue
+        if coll not in out:
+            out.append(coll)
+    if include_dev and DEVELOPMENT_COLLECTION and DEVELOPMENT_COLLECTION not in out:
+        out.append(DEVELOPMENT_COLLECTION)
+    return out
 # Base directory for KG markdown files. When set, store_knowledge_node will
 # write the .md file if it doesn't already exist (file_path is relative to this dir).
 KG_BASE_DIR = os.getenv("KG_BASE_DIR", "")
@@ -1872,14 +1952,13 @@ async def _semantic_graph_search_body(
     stale = _stale_filter(include_stale=include_stale)
 
     # Determine all collections to search. Mirrors hybrid_search: project KG +
-    # shared KG (when configured). The shared KG read is unconditional —
-    # there is NO per-project read opt-out (asymmetric semantic, see module
-    # docstring). We do NOT include DEVELOPMENT_COLLECTION here — graph
-    # traversal relies on WikiLinks which are a knowledge-graph convention,
-    # not present in dev docs.
-    collections_to_search: list[str] = [KG_COLLECTION]
-    if SHARED_KG_COLLECTION and SHARED_KG_COLLECTION != KG_COLLECTION:
-        collections_to_search.append(SHARED_KG_COLLECTION)
+    # shared KG (when configured) + peer-project KGs from the launcher's
+    # access matrix (VCT_KG_ACCESS_LIST, P1-D 2026-05-08). The shared KG
+    # read is unconditional — there is NO per-project read opt-out
+    # (asymmetric semantic, see module docstring). We do NOT include
+    # DEVELOPMENT_COLLECTION here — graph traversal relies on WikiLinks
+    # which are a knowledge-graph convention, not present in dev docs.
+    collections_to_search: list[str] = _kg_collections_to_search(include_dev=False)
 
     # Per-collection handle cache (shared with the connected-node lookup below).
     coll_handles: dict[str, object] = {KG_COLLECTION: coll}
@@ -2334,12 +2413,10 @@ async def _hybrid_search_body(
 
     fetch_limit = limit * _RL_OVERFETCH
 
-    # Determine all collections to search
-    collections_to_search: list[str] = [KG_COLLECTION]
-    if SHARED_KG_COLLECTION and SHARED_KG_COLLECTION != KG_COLLECTION:
-        collections_to_search.append(SHARED_KG_COLLECTION)
-    if DEVELOPMENT_COLLECTION and DEVELOPMENT_COLLECTION not in collections_to_search:
-        collections_to_search.append(DEVELOPMENT_COLLECTION)
+    # Determine all collections to search: self + shared + peers (from
+    # VCT_KG_ACCESS_LIST, P1-D 2026-05-08) + DEVELOPMENT_COLLECTION when
+    # configured. Single source of truth: `_kg_collections_to_search`.
+    collections_to_search: list[str] = _kg_collections_to_search(include_dev=True)
 
     # Search all collections and merge by (title, chunk) key, keeping best score per key
     merged: dict = {}
@@ -2835,17 +2912,57 @@ async def search_code_graph(
     else:
         effective_project = CODE_GRAPH_PROJECT or None
 
-    # Helper to get per-project collection name for a given project
+    # P1-D (2026-05-08): build the list of project prefixes to search.
+    # When `effective_project` is set, fan out across self + every peer in
+    # VCT_CODE_GRAPH_ACCESS_LIST. When None ("search all projects"), fall
+    # back to the bare-collection path (no per-project prefix, no project
+    # filter). The peer list is consumed only when an effective_project is
+    # set — otherwise the caller is explicitly asking for cross-tenant
+    # search and we don't want to re-scope it.
+    base_names = _SCOPES.get(scope, _SCOPES["all"])
+    if effective_project:
+        self_prefix = _sanitize_collection_prefix(effective_project)
+        prefixes: list[tuple[str, str]] = [(self_prefix, effective_project)]
+        for peer in _parse_csv_env("VCT_CODE_GRAPH_ACCESS_LIST"):
+            peer_prefix = _sanitize_collection_prefix(peer)
+            if not peer_prefix or peer_prefix == self_prefix:
+                continue
+            # Dedupe by prefix; the second tuple element carries the
+            # project-property filter value (which is the un-sanitized
+            # name as stored by the analyzer in the `project` property).
+            if any(p == peer_prefix for p, _ in prefixes):
+                continue
+            prefixes.append((peer_prefix, peer))
+    else:
+        prefixes = [("", "")]  # bare collections, no filter
+
+    # Build per-(prefix, base) collection-name list and reverse-map:
+    #   collection_name -> (base, project_filter_value or "")
+    # `project_filter_value` is the value to pass to the
+    # `Filter.by_property("project").equal(...)` clause; "" disables the
+    # filter (cross-tenant search path).
+    collections: list[str] = []
+    coll_meta: dict[str, tuple[str, str]] = {}
+    for prefix, project_filter in prefixes:
+        for base in base_names:
+            coll_name = f"{prefix}_{base}" if prefix else base
+            collections.append(coll_name)
+            coll_meta[coll_name] = (base, project_filter)
+
+    # Self-only collection-name resolver kept for the expansion paths
+    # (callers/callees, neighbour fetch). Expansion stays self-scoped on
+    # purpose: chasing call graphs across peer projects would explode the
+    # result set with cross-tenant noise that the user did not ask for —
+    # peer fan-out is opt-in via the seed search above.
     def _project_collection(base: str) -> str:
         if effective_project:
             prefix = _sanitize_collection_prefix(effective_project)
             return f"{prefix}_{base}"
         return base
-
-    # Map base names to per-project collection names
-    collections = [_project_collection(b) for b in _SCOPES.get(scope, _SCOPES["all"])]
-    # Keep a reverse map for formatting (per-project name -> base name)
-    _base_for = {_project_collection(b): b for b in _SCOPES.get(scope, _SCOPES["all"])}
+    # Reverse map for backward-compat at the few remaining call sites
+    # below that look up `_base_for[coll_name]` after fetching by self
+    # collection.
+    _base_for = {_project_collection(b): b for b in base_names}
 
     try:
         query_embedding = await get_code_embedding(query)
@@ -2870,11 +2987,12 @@ async def search_code_graph(
                         kwargs["target_vector"] = "codesage_embed"
                     else:
                         kwargs["target_vector"] = "ollama_code_embed"
-                # Build filters: project + optional layer
+                # Build filters: project (per-collection) + optional layer.
+                base_name, project_filter = coll_meta.get(coll_name, (coll_name, ""))
                 active_filters = []
-                if effective_project:
-                    active_filters.append(Filter.by_property("project").equal(effective_project))
-                if layer and _base_for.get(coll_name, coll_name) in ("CodeFunction", "CodeClass"):
+                if project_filter:
+                    active_filters.append(Filter.by_property("project").equal(project_filter))
+                if layer and base_name in ("CodeFunction", "CodeClass"):
                     active_filters.append(Filter.by_property("layer").equal(layer.lower()))
                 if active_filters:
                     combined = active_filters[0]
@@ -2887,7 +3005,6 @@ async def search_code_graph(
                     distance = obj.metadata.distance if (hasattr(obj.metadata, "distance") and obj.metadata.distance is not None) else 1.0
                     score = 1.0 - distance
                     # Store base name (e.g. "CodeFunction") for formatting, not per-project name
-                    base_name = _base_for.get(coll_name, coll_name)
                     candidates.append({"_c": base_name, "_s": score, "_d": distance, "_p": p})
             except Exception as e:
                 logger.warning(f"search_code_graph: {coll_name} failed: {e}")

@@ -3,7 +3,7 @@
   "schema_version": "1",
   "id": "orchestrator",
   "name": "VibeCoded Orchestrator",
-  "version": "0.1.6",
+  "version": "0.2.0",
   "description": "The core: 20 hooks, 29 bundled agents, 28 skills, KG + Code Graph, 5 MCP servers (4 containerized + Playwright via npx). Runs locally in Podman/Docker.",
   "license": {
     "spdx": "AGPL-3.0-or-later",
@@ -24,6 +24,15 @@
       "name": "Code Graph",
       "path": "claude_mcp_servers/code_embedding_service",
       "description": "AST analysis via Tree-sitter for 10+ languages. Optional Joern integration for CFG/PDG."
+    }
+  ],
+  "_bundled_secrets_doc": "0.2.0 fork-readiness sweep (item H1, 2026-05-08): the orchestrator core declares the secrets the launcher itself manages (PAT for GitHub auth, etc.) so the hub's `/api/v1/projects/{id}/env` resolver can serve them to bundled wrappers without the user having to install a separate module first. Each entry maps a single keychain slot — the hub uses the SENTINEL_SHARED project_id for shared scope (so all base-host projects see the same value) and the OnboardingWizard's `register_github_pat` writes to the matching slot.",
+  "bundled_secrets": [
+    {
+      "key": "github_pat",
+      "scope": "shared",
+      "module_id": "installer",
+      "description": "GitHub personal access token written by the launcher's OnboardingWizard via `register_github_pat`. Resolved by the hub for every base-host project; consumed by `claude_mcp_servers/search_mcp/wrapper.sh` (renamed to GITHUB_TOKEN) and bundled hooks that need to talk to GitHub."
     }
   ]
 }
