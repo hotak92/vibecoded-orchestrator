@@ -86,6 +86,8 @@ These four persistence layers exist for a reason — future-you, future-agents, 
 
 **Default: check sources first, reason second.**
 
+**If you retrieve knowledge that's clearly outdated, bring it up to date immediately** — don't act on stale information and don't defer the fix. Memory entries, KG nodes, reference docs, and instruction files (CLAUDE.md, MEMORY.md, etc.) are point-in-time snapshots; they drift as the codebase evolves. When you spot drift (a memory cites a guard hook that doesn't exist, a KG node names a project that's been renamed, a CLAUDE.md instruction references a subsystem that's been replaced), fix the source-of-truth document in the same turn you discovered the drift, before continuing the original task. Rewrite the affected section and update any index entries that point at it. The cost of a 60-second fix is far less than the cost of every future agent re-deriving the same outdated conclusion.
+
 ---
 
 ## Search Systems
