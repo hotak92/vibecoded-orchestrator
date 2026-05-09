@@ -23,8 +23,6 @@ Each project is assigned one host at creation: `"base"` (Claude Orchestrator) or
 ### Project Deletion (Zero-Destruction)
 `delete_project_v2` removes the DB row (cascading to `module_installs`, `project_agents`, etc.) but never touches the user's folder on disk. The `delete_folder` parameter is accepted for API parity but is intentionally a no-op.
 
-### Legacy Project Commands (`commands/projects.rs`)
-Five commands kept alongside `projects_v2.rs` for the small set of React components not yet migrated to the SQLite-backed v2 layer: `create_project`, `get_projects`, `update_project`, `open_project`, `close_project`. Backed by a JSON file at `~/.vct/projects.json`. Slated for removal once UI migration is complete; new code should use the v2 commands.
 
 ### Auto-select Single Project
 The `projects` store auto-selects a project when exactly one exists, so a freshly-onboarded user never lands on an empty state.
@@ -187,13 +185,13 @@ Five tiers: `free`, `pro`, `mao`, `enterprise`, `admin`. The `admin` tier was ad
 POSTs `{license_key, machine_id_hash}` to `https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/validate-tier` (8s timeout). On 401 drops immediately to `free`; on other errors keeps existing cached tier and records the error.
 
 ### Machine ID Binding
-`machine_id_hash()` derives SHA-256 of the 6-byte MAC address, matching `VCThelpers/license/validator.py::_machine_id_hash`. Used for server-side machine binding.
+`machine_id_hash()` derives SHA-256 of the 6-byte MAC zero-padded to 8 bytes (high 2 bytes set to zero, low 6 bytes = the MAC). Same algorithm as `VCThelpers/license/validator.py::_machine_id_hash`, which uses `uuid.getnode().to_bytes(8, "big")`. Used for server-side machine binding.
 
 ### License Activate / Deactivate
 `license_activate` writes the key to the OS keychain under `vct.global.licensing.VIBECODED_LICENSE_KEY`, audits the action (key prefix only), then calls `license_refresh`. `license_deactivate` deletes the keychain entry and resets tier to `free`.
 
 ### `VCT_VALIDATE_TIER_URL` Override
-Operators can set `VCT_VALIDATE_TIER_URL` to point at a staging or dev validate-tier endpoint without modifying source. The hard-coded default in `commands/licensing.rs:21` is `https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/validate-tier` (a public alias; the real Supabase project ref is never committed to source).
+Operators can set `VCT_VALIDATE_TIER_URL` to point at a staging or dev validate-tier endpoint without modifying source. The hard-coded default in `commands/licensing.rs::DEFAULT_VALIDATE_TIER_URL` is `https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/validate-tier` (a public alias; the real Supabase project ref is never committed to source).
 
 ### Security Audit Tests
 `licensing.rs` includes source-level audit tests: (1) default validate URL must not contain `supabase.co`, (2) production source must not contain bypass symbols (`MAINTAINER_TOKEN`, `ed25519_dalek`, etc.). Run as Rust unit tests to prevent accidental regression.
@@ -274,7 +272,7 @@ Migration emits phase-level `volumes://migrate-progress` Tauri events so the UI 
 
 ## Hub API
 
-The Hub is the launcher's local HTTP face — used by the headless `vco` CLI, by ecosystem apps (Transcrypt, Arzillibus), and by other VCT processes that need to talk to the launcher without going through Tauri IPC. It runs on `127.0.0.1` only and writes its bound port to `~/.vct/hub.port` so consumers don't have to guess.
+The Hub is the launcher's local HTTP face — used by the headless `vco` CLI, by ecosystem apps (Transcrypt, Arzillibus), and by other VCT processes that need to talk to the launcher without going through Tauri IPC. It runs on `127.0.0.1` only, gates every request on a Bearer token, and writes its bound port to `~/.vct/hub.port` so consumers don't have to guess.
 
 ### Local HTTP Server (port 7700)
 `hub/server.rs` starts an Axum HTTP server on `127.0.0.1:7700` (or `VCT_HUB_PORT`) as a background tokio task at launcher startup. Uses WAL mode for the SQLite connection so it coexists with the Tauri-side DB handle.
@@ -282,20 +280,23 @@ The Hub is the launcher's local HTTP face — used by the headless `vco` CLI, by
 ### Port Discovery (`~/.vct/hub.port`)
 After binding, the hub writes the actual port to `~/.vct/hub.port`. Consumers (CLI, MCP servers, other apps) read this file to discover the hub — especially useful when the default 7700 is taken.
 
+### Auth Token (`~/.vct/hub.token`)
+On every startup the hub generates a fresh 32-byte CSPRNG token and writes it to `<vct_root_dir>/hub.token` (mode `0o600` on Unix). Every `/api/v1/*` request must carry `Authorization: Bearer <token>` — same-user processes that can read `hub.token` authenticate transparently; other-user processes get 401. The token is regenerated on every launcher start to bound the leak window. See `launcher/src-tauri/src/hub/auth.rs` for the threat model.
+
 ### Port Retry
 `try_bind` tries the base port and up to 5 increments before failing. Actual bound port is written to `hub.port` regardless of which offset was chosen.
 
 ### Hub API Routes
 Four sub-routers nested under `/api/v1`, each in its own file under `launcher/src-tauri/src/hub/`:
 - `api.rs` — core operations: health, app catalog (register/deregister/heartbeat), cross-app messaging (send/poll/ack), data catalog (register/query). 10 routes.
-- `modules_api.rs` — module catalog + installed list + install + project list + project env. 8 routes.
+- `modules_api.rs` — module catalog + installed list + install + project list + project env + project lookup by slug/path. 9 routes.
 - `project_state_api.rs` — full per-project agent/skill/hook/permission/secret-ref/KG-binding/codegraph-binding registry. ~16 method+path combos.
-- `cli_api.rs` — mirror of Tauri commands for headless `vco` CLI access (project CRUD, audit list, license, hooks toggle, telemetry consent). 10 routes.
+- `cli_api.rs` — mirror of Tauri commands for headless `vco` CLI access (project CRUD, audit list, license, hooks toggle, telemetry consent, KG/codegraph search). 14 routes.
 
 For the full route enumeration → see [Hub HTTP API — Routes](#hub-http-api--routes) below.
 
 ### CORS Wildcard
-Hub server has `CorsLayer` with `allow_origin(Any)` — intentionally permissive for a localhost-only server.
+Hub server has `CorsLayer` with `allow_origin(Any)` — permissive at the CORS layer because the auth boundary is the Bearer token gate (see [Auth Token](#auth-token-vcthubtoken)), not the origin header.
 
 ### Hub Proxy Tauri Commands
 `commands/hub_proxy.rs` exposes `hub_info`, `hub_list_apps`, `hub_poll_messages`, `hub_data_catalog` for the SvelteKit UI to talk to the same hub API its CLI consumers use, without re-implementing every endpoint as a Tauri command.
@@ -313,7 +314,7 @@ One SQLite file (`~/.vct/launcher.db`) is the entire persistent state of the lau
 All persistent launcher state lives in a single SQLite file. No server process, no network dependency.
 
 ### Migration System
-`db/migrations.rs` runs numbered SQL migrations at startup. Five migrations: `001_initial.sql` (projects, module_installs, tier_cache, audit_log), `002_project_state.sql` (agents/skills/hooks/permissions/secrets/KG/codegraph bindings), `003_project_slug.sql` (slug column), `004_audit_actor.sql` (OS `$USER` actor column), `005_tier_cache_admin.sql` (extends tier CHECK to include `'admin'`).
+`db/migrations.rs` runs numbered SQL migrations at startup. Eight migrations as of v0.1.0: `001_initial.sql` (projects, module_installs, tier_cache, audit_log), `002_project_state.sql` (agents/skills/hooks/permissions/secrets/KG/codegraph bindings), `003_project_slug.sql` (slug column), `004_audit_actor.sql` (OS `$USER` actor column), `005_tier_cache_admin.sql` (extends tier CHECK to include `'admin'`), `006_code_graph_build_status.sql` (code-graph build state per project), `007_secret_active_state.sql` (secret-ref active flag), `008_app_state.sql` (per-app launch state for ecosystem apps).
 
 ### In-Memory DB for Tests
 `Db::open_in_memory()` provides an in-memory SQLite instance used by unit tests without touching the user's real database.
@@ -427,19 +428,23 @@ Empties the local queue without uploading. Audits the action.
 
 ## Installer Commands (`commands/installer.rs`)
 
-Seventeen commands wired in `lib.rs` cover the orchestrator-installer surface used by the install screen and the GitHub-PAT keychain UI.
+Twenty-one commands wired in `lib.rs` cover the orchestrator-installer surface used by the install screen and the GitHub-PAT keychain UI.
 
 ### Detection
 - `detect_system()` — OS, Python version, container runtime, GPU.
 - `detect_existing_services()` — probes Weaviate / Ollama / code-embed ports for shared-service reuse.
+- `detect_existing_install_root()` — best-effort lookup of an existing orchestrator install root.
 - `get_default_install_path()` — platform-appropriate default install directory.
 - `get_local_repo_source()` — returns the path to the bundled OSS repo source if running in a launcher with embedded source.
 
 ### State / version
 - `check_install_status(path)` — true/false: is an orchestrator installed at that path?
+- `check_install_health(path)` — runs the lightweight health probe (containers up, schema seeded).
+- `read_install_log(path)` — returns the last install/update log content for the diagnostics panel.
 - `get_installed_version(path)` — reads version from installed `.env` or repo state.
 - `check_for_updates(path)` — compares installed vs latest available.
 - `inspect_orchestrator_at(path)` — full state probe of an existing install at a given path.
+- `inspect_project_leftovers(path)` — checks for residual `.claude/` artefacts after uninstall.
 
 ### Install / update flow
 - `preview_install(config)` — diff-style preview of what an install would change. Read-only.
@@ -494,7 +499,7 @@ Returns the current high-water sequence number. The UI calls this once at load t
 
 ## Hub HTTP API — Routes
 
-The hub HTTP server (`hub/server.rs`, port 7700) nests four sub-routers under `/api/v1`. All routes are localhost-only with permissive CORS (intentional — see [CORS Wildcard](#cors-wildcard)). Routes by source module:
+The hub HTTP server (`hub/server.rs`, port 7700) nests four sub-routers under `/api/v1`. All routes bind to `127.0.0.1` only and require `Authorization: Bearer <token>` (token at `~/.vct/hub.token`); CORS is permissive because the auth gate is on the bearer token, not the origin (see [Auth Token](#auth-token-vcthubtoken) and [CORS Wildcard](#cors-wildcard)). Routes by source module:
 
 ### Core operations (`hub/api.rs`)
 - `GET /api/v1/health` — liveness probe; returns `{ok: true, version}`.
@@ -517,6 +522,7 @@ The hub HTTP server (`hub/server.rs`, port 7700) nests four sub-routers under `/
 - `GET /api/v1/projects/{project_id}` — single project detail.
 - `GET /api/v1/projects/{project_id}/env` — resolved per-project env (KG_COLLECTION, etc.) for shells / CI.
 - `GET /api/v1/projects/by-slug/{slug}` — project lookup by URL slug.
+- `GET /api/v1/projects/by-path` — project lookup by absolute filesystem path (used by the `tools/claude` wrapper to resolve the project context from `$PWD`).
 
 ### Per-project state (`hub/project_state_api.rs`)
 - `GET /api/v1/projects/{project_id}/state` — full snapshot (agents/skills/hooks/permissions/secrets/bindings).
@@ -545,6 +551,10 @@ Mirror of Tauri commands so the headless `vco` CLI can drive the launcher withou
 - `PATCH /api/v1/cli/hooks/{hook_id}/enabled` — toggle hook enabled.
 - `GET /api/v1/cli/telemetry` — telemetry status.
 - `POST /api/v1/cli/telemetry/consent` — set telemetry consent.
+- `GET /api/v1/cli/kg/collections` — list KG collections + per-project access for CLI consumers.
+- `POST /api/v1/cli/kg/search` — KG hybrid search (mirrors `kg_search` Tauri command).
+- `GET /api/v1/cli/codegraph/collections` — list code-graph collections per project.
+- `POST /api/v1/cli/codegraph/search` — code-graph search (mirrors `search_code_graph`).
 
 ---
 

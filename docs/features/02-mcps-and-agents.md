@@ -1,6 +1,6 @@
 # MCP Servers & Infrastructure Scripts
 
-Four MCP servers ship with the Claude Orchestrator: semantic search, free local inference, web search, and GPU-accelerated code embeddings. All run as Python processes from `claude_mcp_servers/.venv`. Source in `claude_mcp_servers/`.
+Five MCP servers ship with the Claude Orchestrator: semantic search (Weaviate-KG), free local inference (Ollama), web search, GPU-accelerated code embeddings, and Playwright (browser automation, registered automatically and pre-cached at install time via npx). The first four run as Python processes from `claude_mcp_servers/.venv`; Playwright runs from `npx -y @playwright/mcp@latest`. Source for the Python MCPs in `claude_mcp_servers/`; Playwright install logic in `install.py::_install_playwright_browsers`.
 
 For agents, skills, and hooks built on top of these MCPs → see [03-agents-skills-hooks.md](03-agents-skills-hooks.md). For the knowledge graph and code graph data layer → see [04-knowledge-and-code-graph.md](04-knowledge-and-code-graph.md).
 
@@ -85,11 +85,6 @@ Use `search_code_graph` first to discover entity names, then `query_code_structu
 
 </details>
 
-### `natural_language_code_query`
-Translates a natural language question about code structure into a `query_code_structure` call automatically.
-
-Params: `question` (NL question), `model` (`"claude/haiku"` default | `"ollama/qwen3.5:9b"` or `"ollama/gemma4:e4b"`), `project`. Use `model="ollama/gemma4:e4b"` to avoid API costs on the interpretation step.
-
 ### RL Reranking (ambient, opt-in)
 When `RL_SERVER_URL` is reachable, KG search results pass through a reinforcement-learning reranker before being returned. When it's not, free-tier installs see plain cosine-ordered results — no error, no warning. The RL server (`rl_server.py` in MultiagentOrchestrator) is a **Pro-tier component** and is not in the OSS bundle.
 
@@ -113,14 +108,14 @@ When `RL_SERVER_URL` is reachable, KG search results pass through a reinforcemen
 Local inference and embeddings via Ollama. Everything runs on-device, so the bill for trivial generations (docstring rewrites, classification, summary extraction) is zero. Three tools.
 
 ### `chat`
-Run inference against any Ollama model. Default model: `qwen3.5:9b` (text + vision); `gemma4:e4b` for fast summarization on low-power machines.
+Run inference against any Ollama model. Default model: `qwen3.5:0.8b` (small + fast for trivial generations). Override to `qwen3.5:9b` for vision and bigger reasoning, or `gemma4:e4b` for summarization on 12-24 GB-RAM hosts.
 
 <details>
 <summary>Details</summary>
 
-Params: `prompt`, `model` (default `qwen3.5:9b`), `system_prompt`, `temperature` (default 0.7), `max_tokens` (default 500). Returns response plus metrics (total_duration_ms, output_tokens, tokens_per_sec). Use for: quick analysis, rewrites, docstring improvements, classification — any task where you'd otherwise burn Claude API tokens on a trivial generation. For complex reasoning + vision, qwen3.5:9b is default. For fast summarization on low-power, use gemma4:e4b.
+Params: `prompt`, `model` (default `qwen3.5:0.8b`), `system_prompt`, `temperature` (default 0.7), `max_tokens` (default 500). Returns response plus metrics (total_duration_ms, output_tokens, tokens_per_sec). Use for: quick analysis, rewrites, docstring improvements, classification — any task where you'd otherwise burn Claude API tokens on a trivial generation. Bigger workloads can pin `qwen3.5:9b` (vision + larger reasoning) or `gemma4:e4b` (low-VRAM summarization).
 
-Supported models: `qwen3.5:9b` (text + vision, default), `gemma4:e4b` (fast summarization), `qwen3-coder:latest` (30.5B for code), `devstral:24b` (23.6B), `olmo-3:7b` (7.3B). All free, local.
+Models documented in the Ollama MCP requirement table include `qwen3.5:0.8b` (default), `qwen3.5:9b`, `gemma4:e4b`, `gemma3:4b`. Hardware-gated selection in `claude_mcp_servers/ollama_mcp/server.py::TEXT_MODEL_TIERS`. All models run locally (no API cost).
 
 </details>
 
@@ -130,7 +125,7 @@ Summarize or extract information from a file using a local Ollama model. Handles
 <details>
 <summary>Details</summary>
 
-Params: `file_path` (absolute), `model` (default `qwen3.5:9b`), `task` (`"summarize"`, `"extract_key_points"`, `"analyze_structure"`, or freeform instruction), `context_lines` (chunk size for large files, default 50).
+Params: `file_path` (absolute), `model` (default per Ollama MCP — see `read_document` signature in `ollama_mcp/server.py`), `task` (`"summarize"`, `"extract_key_points"`, `"analyze_structure"`, or freeform instruction), `context_lines` (chunk size for large files, default 50).
 
 Files ≤ ~100k chars: processed whole. Larger files: chunked scanning mode activates automatically. All models free, local.
 
@@ -159,7 +154,7 @@ Search GitHub code via the REST Search API. Supports GitHub qualifier syntax (`c
 <details>
 <summary>Details</summary>
 
-Params: `query`, `language` (optional), `repo` (optional `owner/repo` filter), `limit` (1-30, default 10). Rate-limited to 0.5 req/s. Requires `GITHUB_TOKEN` env var (30 req/min with PAT vs 10 without). The search MCP is launched via `~/.vct-secrets/search-mcp-wrapper.sh` which reads the PAT at runtime — the token never appears in `~/.claude.json`.
+Params: `query`, `language` (optional), `repo` (optional `owner/repo` filter), `limit` (1-30, default 10). Rate-limited to 0.5 req/s. Requires `GITHUB_TOKEN` env var (30 req/min with PAT vs 10 without). The search MCP is launched via `claude_mcp_servers/search_mcp/wrapper.sh`. As of v0.1.7 the wrapper resolves `GITHUB_TOKEN` in two stages: (1) env-first — `$GITHUB_TOKEN` already exported by the launcher's per-project env-file writer; (2) resolver helper — `vct_secrets_resolve.sh` reads from the launcher's hub HTTP API at `GET /api/v1/projects/{id}/env?key=github_pat`, which fetches the keychain entry. The legacy `~/.vct-secrets/shared/github_pat` file fallback was removed in the 0.1.7 fork-readiness sweep. Either way the token never appears in `~/.claude.json`.
 
 </details>
 
@@ -189,6 +184,16 @@ The `ensure-code-embed-service.sh` SessionStart hook auto-starts this container 
 Environment vars: `CODE_EMBED_BACKEND`, `CODE_EMBED_MODEL`, `CODE_EMBED_DEVICE`, `CODE_EMBED_DTYPE` (bfloat16 default), `CODE_EMBED_PORT`, `CODE_EMBED_BATCH_SIZE` (32 default), `CODE_EMBED_MAX_CONCURRENT` (4 default).
 
 </details>
+
+---
+
+## MCP: Playwright (`@playwright/mcp` via npx)
+
+Browser automation MCP. Not in `claude_mcp_servers/` — registered against `~/.claude.json` and pre-cached at install time so first browser launch doesn't stall.
+
+Install path: `install.py::_install_playwright_browsers` runs `npx -y @playwright/mcp@latest --version` (caches the package) then `npx playwright install chromium` (fetches the Chromium binary). Skip with `VCT_SKIP_PLAYWRIGHT=1`. Exposed to Claude Code as the `playwright` MCP server (tool prefix `mcp__playwright__browser_*`). Used by the `gui-tester` agent and the `gui-test` skill for visual regression / GUI smoke runs.
+
+Failure modes: `npx` not on PATH → install step skips with WARN; Chromium fetch timeout (600 s) → install step skips with WARN. The orchestrator works without Playwright; only `gui-tester` / `gui-test` go inert.
 
 ---
 

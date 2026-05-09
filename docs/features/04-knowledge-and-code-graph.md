@@ -2,7 +2,7 @@
 
 The semantic memory layer: an Obsidian-style knowledge graph (`knowledge/`), a five-collection code graph (AST + optional Joern), the Weaviate schemas behind both, the embedding pipeline (text and code), and the shell scripts that let Claude — and human adopters — drive all of it from the CLI. Source mostly in `claude_mcp_servers/weaviate_mcp/`, `.claude/scripts/`, and `knowledge/`.
 
-The OSS bundle ships seven canonical node types (`project`, `concept`, `tool`, `model`, `hardware`, `research`, `coordination`), but seed content only populates four folders (`concepts/`, `models/`, `tools/`, `patterns/`) — the rest are present-but-empty for adopters to fill in as they author. `patterns/` is a content category, not a node type; pattern nodes carry `type: concept` in frontmatter. See the full reconciliation in [Bundled Seed Content](#knowledge-graph-bundled-seed-content) below.
+The OSS bundle ships seven canonical node types (`project`, `concept`, `tool`, `model`, `hardware`, `research`, `coordination`), but seed content only populates four folders (`concepts/`, `models/`, `tools/`, `patterns/`) — the rest ship empty for adopters to fill in as they author. `patterns/` is a content category, not a node type; pattern nodes carry `type: concept` in frontmatter. See the full reconciliation in [Bundled Seed Content](#knowledge-graph-bundled-seed-content) below.
 
 For MCP tools that query this layer → see [02-mcps-and-agents.md](02-mcps-and-agents.md). For CLI scripts → also [02-mcps-and-agents.md](02-mcps-and-agents.md#infrastructure-scripts).
 
@@ -44,10 +44,10 @@ The working limit is 2500 tokens (`MAX_EMBEDDING_TOKENS = 2500` in `sync_knowled
 
 ## Knowledge Graph: Bundled Seed Content
 
-### 50 seed nodes total — 34 concepts / 5 models / 9 tools / 2 patterns
-A new install ships with 50 pre-authored `.md` nodes under `knowledge/`. Adopters get a semantic retrieval base on day one rather than an empty graph. Counts verified against the OSS bundle at v0.1.0: `ls knowledge/concepts/ | wc -l` → 34, `ls knowledge/models/` → 5, `ls knowledge/tools/` → 9, `ls knowledge/patterns/` → 2. The other three canonical node-type folders (`hardware/`, `research/`, `coordination/`) ship empty for the adopter to populate.
+### 64 seed nodes total — 48 concepts / 6 models / 9 tools / 1 pattern
+A new install ships with 64 pre-authored `.md` nodes under `knowledge/`. Adopters get a semantic retrieval base on day one rather than an empty graph. Counts verified against the OSS bundle at v0.1.0: `ls knowledge/concepts/ | wc -l` → 48, `ls knowledge/models/` → 6, `ls knowledge/tools/` → 9, `ls knowledge/patterns/` → 1. The other three canonical node-type folders (`hardware/`, `research/`, `coordination/`) ship empty for the adopter to populate.
 
-### 34 concept nodes
+### 48 concept nodes
 `knowledge/concepts/` covers AI/ML and orchestration topics, grouped roughly:
 - **RL & alignment** — actor-critic, DPO, PPO, reward shaping, reinforcement learning, constitutional AI, LLM alignment.
 - **Retrieval & inference** — RAG, GraphRAG, hybrid search, semantic search, chunking strategies for LLM RAG, structured output, speculative decoding, LLM inference optimization, model quantization.
@@ -56,7 +56,7 @@ A new install ships with 50 pre-authored `.md` nodes under `knowledge/`. Adopter
 - **Coordination & infrastructure** — agent orchestration, MCP architecture, blackboard coordination, RAFT consensus, AI infrastructure budget configurations.
 
 ### 6 model nodes
-`knowledge/models/` covers the models the orchestrator actually uses: `qwen3.5` (default text + vision), `gemma4-e4b` (low-VRAM fallback), `qwen3-embedding` (text embeddings, primary), `snowflake-arctic-embed2` (legacy text embeddings), `codesage-large-v2` (code embeddings, GPU), `jina-embeddings-v2-base-code` (code embeddings, CPU fallback).
+`knowledge/models/` covers the models the orchestrator actually uses: `qwen3.5` (text + vision), `gemma4-e4b` (low-VRAM fallback), `qwen3-embedding` (text embeddings, primary), `snowflake-arctic-embed2` (legacy text embeddings), `codesage-large-v2` (code embeddings, GPU), `jina-embeddings-v2-base-code` (code embeddings, CPU fallback).
 
 ### 9 tool nodes
 `knowledge/tools/` covers: `weaviate` (vector DB), `weaviate-usage-patterns` (collection design), `ollama` (local LLM server), `ollama-mcp-server` (MCP wrapper), `fastapi` (Python web framework), `fastmcp` (MCP boilerplate), `llama-cpp` (GGUF inference), `claude-code-cli-headless` (programmatic CLI), `claude-code-mcp-configuration` (MCP config patterns).
@@ -172,7 +172,7 @@ Two embedding stacks: text (KG, docs) and code (code-graph entities). Each has a
 768-dimensional vectors under named vector `ollama_code_embed`. Preserved for backward compatibility; CPU fallback path.
 
 ### `ACTIVE_EMBEDDING` env var
-Controls which named vector is used for search queries. KG values: `"qwen3"` (default), `"ollama"` (legacy arctic), `"openai"`. Code values: `"codesage"` (default), `"ollama"` (legacy jina), `"openai"`. Switch without re-indexing as long as both named vectors are populated.
+Controls which named vector is used for search queries. KG values: `"qwen3"` (default → `qwen3_embed`), `"openai"` (→ `openai_embed`), any other value (legacy → `ollama_embed`). Code values follow the same pattern: `"codesage"` (default → `codesage_embed`), `"openai"`, otherwise → `ollama_code_embed`. Switch without re-indexing as long as the target slot is populated.
 
 ### `DUAL_EMBEDDING_ENABLED` env var
 When `true` (default for fresh installs), objects are stored with all named vectors populated simultaneously. Existing collections need migration before enabling.
@@ -215,8 +215,8 @@ Validates and auto-corrects node frontmatter against the formal vocabulary: cano
 
 ## Document Ingestion
 
-### `documents/` folder auto-processing
-Files placed in `documents/` (markdown or PDF) are automatically processed by the `PostToolUse` hook on `Write(documents/**/*.md)` and `Write(documents/**/*.pdf)`.
+### `documents/` folder ingestion script
+Files placed in `documents/` (markdown or PDF) can be ingested via `python .claude/scripts/process_documents.py <file>` or `--all`. There is no auto-trigger hook in the default `.claude/settings.json`; previous versions wired a `PostToolUse Write(documents/**)` hook but that wiring was removed. Run the script manually or wire it in a project-local settings overlay.
 
 ### `process_documents.py`
 Full ingestion pipeline: (1) chunk content to 800–2000 tokens, (2) store chunks in `DocumentChunks` Weaviate collection, (3) create or update a KG node with a document summary, (4) link the document node to relevant existing nodes via WikiLinks, (5) maintain bidirectional links.
@@ -259,6 +259,6 @@ Enforcement: `_active_named_vector_for_kg()` in `sync_knowledge_graph.py` assert
 - **OpenAI profile** (`--openai-key`): `text-embedding-3-small` for both text and code
 - **Low-resource profile** (`--low-resource` opt-in): snowflake-arctic-embed2 (text) + jina-v2-base-code (code)
 
-Each profile sets `ACTIVE_EMBEDDING` to the matching slot name (`qwen3` / `qwen3` / `openai` / `arctic`). The MCP server reads `ACTIVE_EMBEDDING` to pick the named-vector slot for queries — automatic per-machine selection.
+Each profile sets `ACTIVE_EMBEDDING` to the corresponding identifier (`qwen3` / `qwen3` / `openai` / `arctic`). The MCP server reads `ACTIVE_EMBEDDING` to pick the named-vector slot for queries — automatic per-machine selection. (`arctic` is not a directly-recognized branch in the MCP — it routes via the negation branch to `ollama_embed`; see [§ACTIVE_EMBEDDING env var](#active_embedding-env-var).)
 
 To switch profile post-install: drop the affected collections and re-ingest with the new profile, OR upgrade Weaviate to ≥ 1.31 and use `Reconfigure.NamedVectors.add()`.

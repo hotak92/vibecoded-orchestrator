@@ -1,6 +1,6 @@
 # Agents, Skills & Hooks
 
-The Claude Code automation surface: 29 bundled agents, 28 skills, and 20 hooks. Templates in `templates/agents/` and `templates/skills/`; hooks in `.claude/hooks/`, registered in `.claude/settings.json`.
+The Claude Code automation surface: 29 bundled agents, 28 skills, and 23 hooks (22 wired in default `.claude/settings.json`, 1 available but not wired). Templates in `templates/agents/` and `templates/skills/`; hooks in `.claude/hooks/`, registered in `.claude/settings.json`.
 
 For the MCP servers that agents use → see [02-mcps-and-agents.md](02-mcps-and-agents.md).
 
@@ -8,7 +8,7 @@ For the MCP servers that agents use → see [02-mcps-and-agents.md](02-mcps-and-
 
 ## Bundled Agents (`templates/agents/free/`)
 
-Free agents install to `~/.claude/agents/` via `install.py --with-agents` (default-on). Each agent is a single `.md` file with YAML frontmatter: `name`, `description`, `model` (required), plus optional `tools`, `effort`, `isolation`, `skills`, `mcpServers`. The 19 agents below are split roughly into builders (write code), researchers (read & report), and lifecycle helpers (install / migrate / bootstrap).
+Free agents install to `~/.claude/agents/` via `install.py --with-agents` (default-on). Each agent is a single `.md` file with YAML frontmatter: `name`, `description`, `model` (required), plus optional `tools`, `effort`, `isolation`, `skills`, `mcpServers`. The 29 agents below split roughly into builders (write code), researchers (read & report), and lifecycle helpers (install / migrate / bootstrap).
 
 ### `coder` (Sonnet, `isolation: worktree`)
 Writes code from a spec, following patterns from the KG. Runs in git worktree isolation by default.
@@ -43,7 +43,7 @@ Migrate code between languages, frameworks, or versions. Injects `architecture-c
 Create hooks, scripts, agents, and skills. Self-improves the automation system.
 
 ### `doc-extractor` (Sonnet)
-Pulls knowledge out of scattered docs and into KG nodes. Read-only at runtime, enforced by the `validate-readonly.sh` `PreToolUse` hook.
+Pulls knowledge out of scattered docs and into KG nodes. Frontmatter declares an agent-scoped `PreToolUse Write|Edit` hook pointing at `.claude/scripts/validate-readonly.sh`; the script doesn't ship in v0.1.0, so the read-only enforcement is convention-only at the moment. Tracked as a code-doc gap.
 
 ### `doc-maintainer` (Sonnet)
 Keeps documentation current and prunes stale material — but always extracts to the KG before archival, so context isn't lost when files are removed.
@@ -130,10 +130,10 @@ Agents with `isolation: worktree` run in a temporary git worktree (isolated bran
 
 ## `orchestrator-tools` MCP (referenced in templates)
 
-Agent frontmatter `mcpServers: orchestrator-tools` references `{{ORCHESTRATOR_ROOT}}/claude_mcp_servers/orchestrator_tools_mcp/server.py`. This MCP is a **Pro-tier MAO component** — the implementation is not present in the OSS bundle. Free-tier agents use `weaviate-kg`, `ollama`, and `search` MCPs directly.
+Agent frontmatter `mcpServers: orchestrator-tools` references `{{ORCHESTRATOR_ROOT}}/claude_mcp_servers/orchestrator_tools_mcp/server.py`. The implementation is not present in the OSS bundle (paid module). Free-tier agents use `weaviate-kg`, `ollama`, and `search` MCPs directly.
 
 ### Graceful degradation behaviour
-Three agents (`coder`, `tester`, `planner`) reference `orchestrator-tools` in their frontmatter. The OSS bundle does not ship this MCP server. Claude Code silently ignores MCP entries it cannot find on disk, so the agents install and start cleanly — calls to `orchestrator-tools` tools simply fail at runtime, not at install time. Same pattern applies to any agent that references `orchestrator-tools` (MCP not in OSS bundle): installs cleanly, fails at tool-call time only.
+Seven agents reference `orchestrator-tools` in their frontmatter as of v0.1.0: `coder`, `tester`, `planner`, `expert-coder`, `project-architect`, `project-coordinator`, `ai-agentic-architect`. The OSS bundle does not ship this MCP server. Claude Code silently ignores MCP entries it cannot find on disk, so the agents install and start cleanly — calls to `orchestrator-tools` tools fail at runtime, not at install time.
 
 ---
 
@@ -207,7 +207,9 @@ Skills are smaller and lighter than agents — they're injected into context as 
 
 ## Hooks (`.claude/hooks/`)
 
-20 shell scripts that fire at well-defined points in the Claude Code lifecycle (`SessionStart`, `PreToolUse`, `PostToolUse`, `Stop`, etc.). Two project-wide invariants: every hook checks `VCT_DISABLE_HOOKS=1` as its first action (so you can disable all automation in one shell), and every hook scrubs `SUPABASE_KEY`, `GITHUB_TOKEN`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, AWS credentials, and similar before spawning any subprocess.
+23 shell scripts that fire at well-defined points in the Claude Code lifecycle (`SessionStart`, `PreToolUse`, `PostToolUse`, `Stop`, etc.). 22 are wired in the default `.claude/settings.json`; `code-graph-incremental.sh` ships but is not wired. Two project-wide invariants: every hook checks `VCT_DISABLE_HOOKS=1` as its first action (so you can disable all automation in one shell), and every hook scrubs `SUPABASE_KEY`, `GITHUB_TOKEN`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, AWS credentials, and similar before spawning any subprocess.
+
+Hook input contract (PR #176, 2026-05): hooks receive their event payload as JSON on stdin per Claude Code v2.1.x spec. `session_id`, `tool_name`, and other fields are read from stdin via `python -c 'import json,sys; d=json.loads(sys.stdin.read()); ...'`. Positional args (`$1`, `$2`) are present for backward compatibility but are empty when invoked by Claude Code v2.1.x.
 
 ### `ensure-containers.sh` — SessionStart (startup, background)
 Auto-start required containers (Weaviate, Ollama, code embedding service) if stopped.
@@ -257,7 +259,7 @@ First prompt: creates a baseline snapshot. Subsequent prompts: diffs against sna
 
 </details>
 
-### `pre-tool-use.sh` — PreToolUse (all tools, blocking)
+### `pre-tool-use.sh` — PreToolUse `*` (all tools, blocking)
 Security enforcement + tool call logging + file backup.
 
 <details>
@@ -273,7 +275,7 @@ Exit 2 blocks the tool call. Exit 0 allows it. Security events logged to `.claud
 
 </details>
 
-### `pre-edit-context-inject.sh` — PreToolUse Edit(*) (blocking)
+### `pre-edit-context-inject.sh` — PreToolUse Edit (blocking)
 Inject KG + code graph context for the file being edited before the Edit executes.
 
 <details>
@@ -283,7 +285,7 @@ Fires only for the `Edit` tool (not `Write` — new files have less prior contex
 
 </details>
 
-### `post-file-edit.sh` — PostToolUse Edit(*)|Write(*) (background)
+### `post-file-edit.sh` — PostToolUse Edit|Write (background)
 Auto-sync edited files to the appropriate Weaviate collection based on path.
 
 <details>
@@ -304,20 +306,29 @@ Spawns a background Haiku agent to generate/update summary descriptions for KG n
 ### `post-git-commit-kg-sync.sh` — PostToolUse Bash(git commit *)
 Spawn a background Haiku agent to review the commit diff and update relevant KG nodes and docs. Non-blocking. Guards with `CLAUDE_CODE_DISABLE_AUTO_MEMORY` to prevent infinite recursion inside agent subprocesses.
 
-### `post-tool-security.sh` — PostToolUse Edit(*)|Write(*) (background)
+### `post-tool-security.sh` — PostToolUse Edit|Write (background)
 Scan written files for accidentally included credentials. Non-blocking; alerts logged to `.claude/logs/credential_alerts.jsonl` with desktop notification.
 
 ### `config-change-audit.sh` — ConfigChange (background)
 Log all settings.json changes to `.claude/logs/config_changes.jsonl` for audit trail.
 
 ### `cost-tracker.sh` — Stop (background)
-Parse the Stop event payload and append `{timestamp, session_id, model, input_tokens, output_tokens, cache_read_tokens, cost_usd}` to `~/.claude/metrics/costs.jsonl`.
+Parse the Stop event payload and append `{timestamp, session_id, model, input_tokens, output_tokens, cache_read_tokens, auth_mode, cost_usd}` to `~/.claude/metrics/costs.jsonl`. `auth_mode` is `"subscription"` (OAuth login — `cost_usd: null`, tokens free) or `"api"` (API key — cost calculated from token counts).
 
 ### `notify-stop.sh` — Stop (background)
 Send a desktop notification (`notify-send`) when Claude finishes a response. Note: Stop hooks do not fire in the VS Code extension (CLI/Desktop only).
 
 ### `stop-failure-notify.sh` — StopFailure (background)
 Send an urgent desktop notification when a turn fails (rate limit, auth error, etc.) and log to `~/.claude/metrics/failures.jsonl`.
+
+### `kg-update-nudge.sh` — UserPromptSubmit + Stop (background)
+Counts substantive work tokens since the last KG node write; nudges to write a KG node when the threshold (~150k tokens) is exceeded. Bypass with `KG_NUDGE_OFF=1`.
+
+### `verify-container-ports.sh` — SessionStart (startup, background)
+Verifies that the Weaviate / Ollama / code-embed container ports are bound and reachable. Logs to `.claude/logs/container_port_check.jsonl`. Non-blocking.
+
+### `pre-vercel-token-guard.sh` — PreToolUse Bash (blocking)
+Blocks `vercel ... --token=...` invocations because the Vercel CLI echoes the token back in the `next:` block of stdout, leaking it into tool output. Forces use of `VERCEL_TOKEN` env var instead. Exit 2 on `--token=` match.
 
 ### `code-graph-incremental.sh` — (available, not wired in default settings.json)
 Incremental code graph analysis on every code file edit. Auto-detects the project from the edited file path and supports Joern CFG/PDG extraction when Joern is on PATH.
