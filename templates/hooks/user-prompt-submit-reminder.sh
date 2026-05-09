@@ -7,17 +7,31 @@ set -euo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
 
-# Hook input contract (v2.1.x): JSON on stdin, NOT $CLAUDE_TOOL_NAME env var.
-# Reading the env var under `set -u` aborts the hook with "unbound variable"
-# before the staleness check ever runs — that was a long-standing latent bug
-# (confirmed empirically 2026-05-08). We drain stdin (best-effort) and use a
-# `${VAR:-}` default so the script can run on any event without aborting.
+# Hook input contract (v2.1.x): JSON on stdin, NOT $CLAUDE_TOOL_NAME or
+# $CLAUDE_SESSION_ID env vars. Reading those env vars under `set -u` aborts
+# the hook with "unbound variable" before the staleness check ever runs —
+# that was a long-standing latent bug (confirmed empirically 2026-05-08).
+# We drain stdin once, parse session_id from the JSON payload, and use
+# `${VAR:-}` defaults so the script can run on any event without aborting.
+# session_id is the canonical per-conversation key; falling back to
+# "default" only on malformed JSON keeps concurrent sessions from sharing
+# state files (PR #176 cross-OS sweep — see knowledge/concepts/
+# hook-session-id-stdin-pattern.md).
 HOOK_STDIN=$(cat 2>/dev/null || echo "")
+SESSION_ID=$(printf '%s' "$HOOK_STDIN" | python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print(d.get('session_id', '') or 'default')
+except Exception:
+    print('default')
+" 2>/dev/null || echo "default")
+[ -z "$SESSION_ID" ] && SESSION_ID="default"
 
 PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
 PROJECT_NAME=$(basename "$PROJECT_DIR")
 CONTEXT_FILE="$PROJECT_DIR/.claude/CONTEXT_STATE.md"
-SESSION_LOG="${TMPDIR:-${XDG_RUNTIME_DIR:-/tmp}}/claude-session-$PROJECT_NAME"
+SESSION_LOG="${TMPDIR:-${XDG_RUNTIME_DIR:-/tmp}}/claude-session-${PROJECT_NAME}-${SESSION_ID}"
 
 # Initialize session tracking
 if [ ! -f "$SESSION_LOG" ]; then
@@ -48,7 +62,7 @@ fi
 
 # Trigger at 200K words (~300K tokens, about 30% of 1M context on Opus)
 if [ "$TOTAL_WORDS" -ge 200000 ]; then
-    MARKER="${TMPDIR:-${XDG_RUNTIME_DIR:-/tmp}}/claude-ctx-warn-$PROJECT_NAME"
+    MARKER="${TMPDIR:-${XDG_RUNTIME_DIR:-/tmp}}/claude-ctx-warn-${PROJECT_NAME}-${SESSION_ID}"
     [ -f "$MARKER" ] && exit 0
 
     echo ""
@@ -62,17 +76,39 @@ if [ "$TOTAL_WORDS" -ge 200000 ]; then
     exit 0
 fi
 
-# Also check CONTEXT_STATE.md staleness (every ~40K words)
-if [ $((TOTAL_WORDS % 40000)) -lt 1500 ] && [ -f "$CONTEXT_FILE" ]; then
-    MODIFIED=$(stat -c %Y "$CONTEXT_FILE" 2>/dev/null || stat -f %m "$CONTEXT_FILE" 2>/dev/null || echo 0)
-    NOW=$(date +%s)
-    AGE_MIN=$(( (NOW - MODIFIED) / 60 ))
-
-    if [ "$AGE_MIN" -gt 30 ]; then
-        echo ""
-        echo "💾 Update CONTEXT_STATE.md (last update: ${AGE_MIN}min ago)"
-        echo ""
+# CONTEXT_STATE staleness — counter-based, one-shot per ~120K-word window
+# since the LAST nudge or last actual edit (whichever is more recent).
+#
+# Replaces the prior time-based 30-min staleness check that fired 4-5x
+# during long deep-work sessions. The new condition is "enough work has
+# accumulated that a CONTEXT_STATE refresh is genuinely useful," not
+# "the file is old."
+#
+# The staleness marker file is keyed by both PROJECT_NAME and SESSION_ID
+# so concurrent Claude Code sessions on the same project don't stomp on
+# each other's counter (the same concurrency fix as PR #176 applied to
+# 11 other hooks — see knowledge/concepts/hook-session-id-stdin-pattern.md).
+STALENESS_MARKER="${TMPDIR:-${XDG_RUNTIME_DIR:-/tmp}}/claude-ctx-staleness-${PROJECT_NAME}-${SESSION_ID}"
+LAST_FIRE_WORDS=0
+if [ -f "$STALENESS_MARKER" ]; then
+    LAST_FIRE_WORDS=$(cat "$STALENESS_MARKER" 2>/dev/null || echo 0)
+    if [ -f "$CONTEXT_FILE" ]; then
+        CTX_MTIME=$(stat -c %Y "$CONTEXT_FILE" 2>/dev/null || stat -f %m "$CONTEXT_FILE" 2>/dev/null || echo 0)
+        MARKER_MTIME=$(stat -c %Y "$STALENESS_MARKER" 2>/dev/null || stat -f %m "$STALENESS_MARKER" 2>/dev/null || echo 0)
+        if [ "$CTX_MTIME" -gt "$MARKER_MTIME" ]; then
+            echo "$TOTAL_WORDS" > "$STALENESS_MARKER"
+            LAST_FIRE_WORDS="$TOTAL_WORDS"
+        fi
     fi
+fi
+DELTA=$(( TOTAL_WORDS - LAST_FIRE_WORDS ))
+if [ "$DELTA" -ge 120000 ]; then
+    echo ""
+    echo "💾 ~${DELTA} words of work since last CONTEXT_STATE update."
+    echo "   Append a 1-2 line progress note now (what shipped + what's next),"
+    echo "   before context grows further or /compact lands."
+    echo ""
+    echo "$TOTAL_WORDS" > "$STALENESS_MARKER"
 fi
 
 exit 0
