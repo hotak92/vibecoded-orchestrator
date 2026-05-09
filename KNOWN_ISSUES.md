@@ -73,9 +73,9 @@ flagging for early adopters and the next iteration.
 - [ ] **Custom MCP tab is not populated by initial project registration** — `project_state_populate`
       mirrors `.claude/settings.json::mcpServers` into the launcher's per-project DB on `create_project_v2`,
       but doesn't flag user-added entries (anything beyond bundled `weaviate-kg` / `ollama` / `search` /
-      `code-embedding`) as `is_user_added=true`. Tab reads with that filter so user-added servers show up
-      blank. Workaround: re-add via the launcher's "Add MCP" button (writes the row with the correct flag),
-      or click Refresh on the MCP tab. Fix on v0.2.x backlog.
+      `code-embedding` / `playwright`) as `is_user_added=true`. Tab reads with that filter so user-added
+      servers show up blank. Workaround: re-add via the launcher's "Add MCP" button (writes the row with
+      the correct flag), or click Refresh on the MCP tab. Fix on v0.2.x backlog.
 
 - [ ] **Apple Developer enrollment / notarization pending** — already in this list under Install/first-run;
       deferred from 0.2.0, tracked for a future minor release. Without notarization the macOS `.dmg` requires manual Gatekeeper override.

@@ -174,7 +174,7 @@ the user loses:
   graph visualisation, score-driven retrieval tier inspection)
 - **Code graph dashboard** (CodeFunction/Class/Module/API/Interaction
   views, cross-service interaction map, similar-code search)
-- **Hook toggles** (per-project enable/disable for the 20+ shipped
+- **Hook toggles** (per-project enable/disable for the 23 shipped
   hooks: KG-summary, RL-context, security scan, audit, etc.)
 - **Audit log viewer** (filterable, with cli/gui/api source attribution)
 - **Module install/uninstall flow** (paid module catalog, license
