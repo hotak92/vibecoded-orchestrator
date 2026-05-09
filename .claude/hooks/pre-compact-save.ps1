@@ -11,6 +11,22 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
 
+# Read stdin once and reuse. The hook contract delivers the full payload
+# (including session_id and transcript_path) via stdin JSON; CLAUDE_*
+# env vars are NOT populated by Claude Code (verified 2026-05-08).
+$HookStdin = ""
+try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
+if (-not $HookStdin) { $HookStdin = "{}" }
+
+$SessionId = ""
+try {
+    $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
+    if ($payload -and $payload.session_id) { $SessionId = [string]$payload.session_id }
+} catch {
+    # Malformed/empty stdin — fall through to "default" below.
+}
+if (-not $SessionId) { $SessionId = "default" }
+
 $ProjectDir = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
 $SnapshotFile = Join-Path $ProjectDir ".claude/context/pre-compact-snapshot.md"
 $SnapshotDir = Split-Path $SnapshotFile -Parent
@@ -63,9 +79,8 @@ if (Test-Path $FindPy) { . $FindPy }
 
 $PruneScript = Join-Path $ProjectDir ".claude/scripts/precompact_prune.py"
 if ($PY -and (Test-Path $PruneScript)) {
-    $hookStdin = if ($env:CLAUDE_HOOK_STDIN) { $env:CLAUDE_HOOK_STDIN } else { "{}" }
     try {
-        $hookStdin | & $PY $PruneScript 2>$null | Out-Null
+        $HookStdin | & $PY $PruneScript 2>$null | Out-Null
     } catch { }
 }
 
@@ -81,7 +96,6 @@ $SnapshotDir2 = Join-Path $Tmp "claude_ctx_snapshots"
 if (-not (Test-Path $SnapshotDir2)) {
     New-Item -ItemType Directory -Path $SnapshotDir2 -Force | Out-Null
 }
-$sessionId = if ($env:CLAUDE_SESSION_ID) { $env:CLAUDE_SESSION_ID } else { "default" }
-$flag = Join-Path $SnapshotDir2 "compact_flag_$sessionId"
+$flag = Join-Path $SnapshotDir2 "compact_flag_$SessionId"
 New-Item -ItemType File -Path $flag -Force | Out-Null
 exit 0

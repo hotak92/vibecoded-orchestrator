@@ -96,6 +96,8 @@ state/
 .claude/context/pre-compact-snapshot.md
 .claude/cron-jobs.json
 .claude/worktrees/
+# Hook ephemeral state (per-session dedup, etc.)
+.claude/state/
 # Per-machine orchestrator install artifacts — populated by install.py, NEVER commit
 .claude/agents/
 .claude/skills/

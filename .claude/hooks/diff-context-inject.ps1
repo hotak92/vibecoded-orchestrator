@@ -1,3 +1,4 @@
+# OS-EXEMPT-PARITY: Windows-only fix — drop the dead `$env:CLAUDE_SESSION_ID` middle branch from the SessionId resolution cascade. The .sh sibling never had this branch (audit confirmed; sh went straight from stdin-parse-fail to "default"), so there's no symmetrical change to make on the .sh side.
 # Scrub sensitive env vars (this hook doesn't need credentials)
 foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN') {
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
@@ -28,13 +29,13 @@ try {
     $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
     if ($payload -and $payload.session_id) { $SessionIdFromStdin = [string]$payload.session_id }
 } catch {
-    # Empty/malformed stdin — fall back to env var, then "default"
+    # Empty/malformed stdin — fall back to "default"
 }
 
 $ContextFile = ".claude/CONTEXT_STATE.md"
 $Tmp = if ($env:TMPDIR) { $env:TMPDIR } elseif ($env:TEMP) { $env:TEMP } else { "C:\Windows\Temp" }
 $SnapshotDir = Join-Path $Tmp "claude_ctx_snapshots"
-$SessionId = if ($SessionIdFromStdin) { $SessionIdFromStdin } elseif ($env:CLAUDE_SESSION_ID) { $env:CLAUDE_SESSION_ID } else { "default" }
+$SessionId = if ($SessionIdFromStdin) { $SessionIdFromStdin } else { "default" }
 $SnapshotFile = Join-Path $SnapshotDir "snapshot_$SessionId"
 $CompactFlag = Join-Path $SnapshotDir "compact_flag_$SessionId"
 

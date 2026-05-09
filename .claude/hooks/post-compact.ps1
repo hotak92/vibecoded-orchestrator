@@ -22,11 +22,27 @@ $Payload = ""
 try { $Payload = [Console]::In.ReadToEnd() } catch { }
 
 $Trigger = "unknown"
-if ($PY -and $Payload) {
+$SessionId = ""
+if ($Payload) {
     try {
-        $Trigger = ($Payload | & $PY -c "import sys,json; d=json.load(sys.stdin); print(d.get('trigger','unknown'))" 2>$null)
-        if (-not $Trigger) { $Trigger = "unknown" }
-    } catch { $Trigger = "unknown" }
+        $payloadObj = $Payload | ConvertFrom-Json -ErrorAction Stop
+        if ($payloadObj) {
+            if ($payloadObj.trigger)    { $Trigger = [string]$payloadObj.trigger }
+            if ($payloadObj.session_id) { $SessionId = [string]$payloadObj.session_id }
+        }
+    } catch { }
+}
+if (-not $Trigger) { $Trigger = "unknown" }
+
+# Wipe the KG/codegraph injection dedup state for this session — the LLM
+# just lost the context that included those previously-injected nodes, so
+# re-injecting them on subsequent edits is now correct (and helpful).
+# pre-edit-context-inject.ps1 writes to .claude/state/seen_kg_titles_<id>.txt.
+if ($SessionId) {
+    $SeenFile = Join-Path $ProjectDir ".claude/state/seen_kg_titles_$SessionId.txt"
+    if (Test-Path $SeenFile) {
+        Remove-Item $SeenFile -Force -ErrorAction SilentlyContinue
+    }
 }
 
 # Log compaction event under the user's home metrics dir.
