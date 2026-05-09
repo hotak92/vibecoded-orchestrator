@@ -33,15 +33,20 @@ mkdir -p "$PROJECT_DIR/.claude/context"
     echo ""
 } > "$SNAPSHOT_FILE"
 
+# Read stdin once and reuse. The hook contract delivers the full payload
+# (including session_id and transcript_path) via stdin JSON; CLAUDE_*
+# env vars are NOT populated by Claude Code.
+HOOK_STDIN=$(cat 2>/dev/null || echo "{}")
+[ -z "$HOOK_STDIN" ] && HOOK_STDIN="{}"
+
 # Generate pruned activity summary scoped to "since last compact".
-# Pipe the original hook stdin through so the script can read transcript_path.
+# precompact_prune.py reads transcript_path from the JSON stdin.
 # Resolve python interpreter portably via the shared helper (Windows ships
 # python.exe / py.exe, not python3 — see audit finding F6, 2026-04-30).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=_lib/find-python.sh disable=SC1091
 [ -f "$SCRIPT_DIR/_lib/find-python.sh" ] && . "$SCRIPT_DIR/_lib/find-python.sh"
 if [ -n "${PY:-}" ] && [ -f "$PROJECT_DIR/.claude/scripts/precompact_prune.py" ]; then
-    HOOK_STDIN="${CLAUDE_HOOK_STDIN:-{}}"
     echo "$HOOK_STDIN" | "$PY" "$PROJECT_DIR/.claude/scripts/precompact_prune.py" 2>/dev/null || true
 fi
 
@@ -51,7 +56,18 @@ fi
 MARKER="$PROJECT_DIR/.claude/context/last-compact-marker"
 date +%s > "$MARKER" 2>/dev/null || true
 
-# Set compact flag for diff-context-inject.sh to reset its baseline
+# Set compact flag for diff-context-inject.sh to reset its baseline.
+# session_id from stdin JSON is the canonical per-conversation key — see
+# diff-context-inject.sh for the same pattern. Falls back to "default"
+# only if the payload is malformed.
+SESSION_ID=$(echo "$HOOK_STDIN" | python3 -c "
+import json, sys
+try:
+    print(json.loads(sys.stdin.read()).get('session_id', ''))
+except Exception:
+    print('')
+" 2>/dev/null || echo "")
+[ -z "$SESSION_ID" ] && SESSION_ID="default"
 SNAPSHOT_DIR="${TMPDIR:-/tmp}/claude_ctx_snapshots"
 mkdir -p "$SNAPSHOT_DIR"
-touch "$SNAPSHOT_DIR/compact_flag_${CLAUDE_SESSION_ID:-default}"
+touch "$SNAPSHOT_DIR/compact_flag_${SESSION_ID}"

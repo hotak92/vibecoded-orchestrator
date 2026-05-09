@@ -28,13 +28,13 @@ try {
     $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
     if ($payload -and $payload.session_id) { $SessionIdFromStdin = [string]$payload.session_id }
 } catch {
-    # Empty/malformed stdin — fall back to env var, then "default"
+    # Empty/malformed stdin — fall back to "default"
 }
 
 $ContextFile = ".claude/CONTEXT_STATE.md"
 $Tmp = if ($env:TMPDIR) { $env:TMPDIR } elseif ($env:TEMP) { $env:TEMP } else { "C:\Windows\Temp" }
 $SnapshotDir = Join-Path $Tmp "claude_ctx_snapshots"
-$SessionId = if ($SessionIdFromStdin) { $SessionIdFromStdin } elseif ($env:CLAUDE_SESSION_ID) { $env:CLAUDE_SESSION_ID } else { "default" }
+$SessionId = if ($SessionIdFromStdin) { $SessionIdFromStdin } else { "default" }
 $SnapshotFile = Join-Path $SnapshotDir "snapshot_$SessionId"
 $CompactFlag = Join-Path $SnapshotDir "compact_flag_$SessionId"
 
