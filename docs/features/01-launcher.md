@@ -12,7 +12,7 @@ Projects are the launcher's primary unit. Each one has a stable UUID, a slug for
 `create_project_v2` in `commands/projects_v2.rs` creates a folder (`mkdir -p` if absent), generates a UUID v4 id, derives a URL slug, inserts a DB row, writes per-project env files to three surfaces, and records an audit event — all in one command.
 
 ### Project Host Assignment
-Each project is assigned one host at creation: `"base"` (Claude Orchestrator) or `"mao"` (MAO). Enforced at the DB level (`CHECK (host IN ('base','mao'))`); cannot be changed without `switch_project_host_v2`.
+Each project is assigned one host at creation: `"base"` (VCO) or `"mao"`. Enforced at the DB level (`CHECK (host IN ('base','mao'))`); cannot be changed without `switch_project_host_v2`.
 
 ### Host Switch with Module Pruning
 `switch_project_host_v2` transitions between `base` and `mao` hosts, automatically removing MAO-only modules (suffix `-mao` or known MAO-only IDs). Returns `{project, modules_removed, modules_preserved}`.
@@ -182,7 +182,7 @@ For the full tier model, see [06-license-and-commercial.md](06-license-and-comme
 Five tiers: `free`, `pro`, `mao`, `enterprise`, `admin`. The `admin` tier was added in migration 005 via SQLite table-recreate (SQLite cannot drop CHECK constraints in place).
 
 ### license_refresh Command
-POSTs `{license_key, machine_id_hash}` to `https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/validate-tier` (8s timeout). On 401 drops immediately to `free`; on other errors keeps existing cached tier and records the error.
+POSTs `{license_key, machine_id_hash}` to the configured `validate-tier` endpoint (8s timeout). On 401 drops immediately to `free`; on other errors keeps existing cached tier and records the error.
 
 ### Machine ID Binding
 `machine_id_hash()` derives SHA-256 of the 6-byte MAC zero-padded to 8 bytes (high 2 bytes set to zero, low 6 bytes = the MAC). Same algorithm as `VCThelpers/license/validator.py::_machine_id_hash`, which uses `uuid.getnode().to_bytes(8, "big")`. Used for server-side machine binding.
@@ -191,7 +191,7 @@ POSTs `{license_key, machine_id_hash}` to `https://ovpdtijpdchzlxbojhsg.supabase
 `license_activate` writes the key to the OS keychain under `vct.global.licensing.VIBECODED_LICENSE_KEY`, audits the action (key prefix only), then calls `license_refresh`. `license_deactivate` deletes the keychain entry and resets tier to `free`.
 
 ### `VCT_VALIDATE_TIER_URL` Override
-Operators can set `VCT_VALIDATE_TIER_URL` to point at a staging or dev validate-tier endpoint without modifying source. The hard-coded default in `commands/licensing.rs::DEFAULT_VALIDATE_TIER_URL` is `https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/validate-tier` (a public alias; the real Supabase project ref is never committed to source).
+Operators can set `VCT_VALIDATE_TIER_URL` to point at a staging or dev validate-tier endpoint without modifying source. The compiled-in default lives in `commands/licensing.rs::DEFAULT_VALIDATE_TIER_URL`.
 
 ### Security Audit Tests
 `licensing.rs` includes source-level audit tests: (1) default validate URL must not contain `supabase.co`, (2) production source must not contain bypass symbols (`MAINTAINER_TOKEN`, `ed25519_dalek`, etc.). Run as Rust unit tests to prevent accidental regression.

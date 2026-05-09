@@ -1,6 +1,6 @@
 # Architecture & Cross-cutting Concerns
 
-Properties of `vibecoded-orchestrator` that come from how the three subsystems (VCT Launcher, Claude Orchestrator, `vct-secrets`) compose, rather than from any one of them. Also: repo hygiene, CI, security posture, release process.
+Properties of `vibecoded-orchestrator` that come from how the three subsystems (VCT Launcher, VCO orchestrator, `vct-secrets`) compose, rather than from any one of them. Also: repo hygiene, CI, security posture, release process.
 
 ---
 
@@ -112,7 +112,7 @@ All writes to `.claude/settings.json` and `.vscode/settings.json` perform a read
 The install path contains zero destructive container operations. Audit-tested and confirmed in `CHANGELOG.md [0.1.0] Security`.
 
 ### Local-first by default
-Weaviate and Ollama run on-device. No data leaves the machine unless the user sets `VIBECODED_TELEMETRY=true` or the license validator reaches `https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/validate-tier`.
+Weaviate and Ollama run on-device. No data leaves the machine unless the user sets `VIBECODED_TELEMETRY=true` or the license validator reaches the configured `validate-tier` endpoint.
 
 ---
 

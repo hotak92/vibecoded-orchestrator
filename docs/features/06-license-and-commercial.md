@@ -53,12 +53,12 @@ The Python client's job is narrow: find a license key (env var, file, argument),
 `validate_license()` resolves the license key in order: (1) `VIBECODED_TIER=free` env forces free tier immediately; (2) explicit `key` argument; (3) `VIBECODED_LICENSE_KEY` env var; (4) `~/.vct-secrets/shared/license_key` file (preferred) or legacy `~/.vct-secrets/license_key` (fallback). First non-empty value wins. No key → free tier.
 
 ### Remote validation via Supabase edge function
-`_remote_validate()` POSTs `{license_key, machine_id_hash}` to `https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/validate-tier` (or `VIBECODED_LICENSE_URL` / `VCT_VALIDATE_TIER_URL` env overrides). Both env var names are honored for compatibility with the Rust launcher.
+`_remote_validate()` POSTs `{license_key, machine_id_hash}` to the configured `validate-tier` endpoint (`VIBECODED_LICENSE_URL` / `VCT_VALIDATE_TIER_URL` env overrides; both honored for compatibility with the Rust launcher).
 
 <details>
 <summary>Details</summary>
 
-The endpoint URL is a public alias; the real Supabase project ref is never committed to source. The function call sequence: LS `/licenses/validate` → LS `/licenses/activate` (machine binding) → variant_id→tier mapping → signed response. The Python layer only calls the Supabase function; it never calls LS directly.
+The function call sequence: LS `/licenses/validate` → LS `/licenses/activate` (machine binding) → variant_id→tier mapping → signed response. The Python layer only calls the Supabase function; it never calls LS directly.
 
 </details>
 
@@ -233,9 +233,6 @@ The `validate-tier` function is the read path; the `lemon-squeezy-webhook` funct
 ### `activateAppForUser` — idempotent entitlement grant
 Adds `appId` to `profiles.apps` array (array_append, idempotent) and sets `profiles.orchestrator_tier` if `appId === "orchestrator"`. Service role bypasses RLS.
 
-### Webhook secret historical leak — blocklisted
-`wh_vct_ls_2026_s3cur3k3y` is in `scripts/check-no-secrets.sh` BLOCKLIST (leaked in commit 2f1cc88, 2026-03-07). Any future commit containing this string is rejected.
-
 ---
 
 ## Supabase Schema & RLS
@@ -295,8 +292,8 @@ WAL mode. Schema: `events(id, event_type, payload_json, created_at, uploaded_at)
 ### Batch uploader — `upload_pending(endpoint, batch_size, queue)`
 Pulls up to 100 oldest un-uploaded events. Retries 3× with exponential backoff (1s, 4s, 16s) on network errors, 5xx, and 429. 4xx (non-429) → permanent failure, events left in queue for inspection.
 
-### Pre-launch diversion to `telemetry_pending.jsonl`
-Until `https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/telemetry` is deployed, opted-in events are written to `~/.vibecoded/telemetry_pending.jsonl` (one JSON object per line) instead of POSTed. `UploadResult.error == "endpoint_pending_deployment"` signals this path.
+### Diversion to `telemetry_pending.jsonl`
+When no upload endpoint is configured, opted-in events are written to `~/.vibecoded/telemetry_pending.jsonl` (one JSON object per line) instead of POSTed. `UploadResult.error == "endpoint_pending_deployment"` signals this path.
 
 ### `VIBECODED_TELEMETRY_URL` — endpoint override
 Set to any live endpoint to bypass the pre-launch diversion and post events normally. Allows staging/custom deployments without code changes.
@@ -312,10 +309,7 @@ Enforced by the collection layer; the queue schema stores only what the `collect
 ## Secrets & Key Rotation
 
 ### `scripts/check-no-secrets.sh` — pre-commit blocklist guard
-Scans staged files (or full tracked tree with `--all`) for known-leaked tokens. Exits non-zero with instructions. Wire as a pre-commit hook via `ln -sf ../../scripts/check-no-secrets.sh .git/hooks/pre-commit`.
-
-### Blocklist contents (historical leaks)
-Two entries as of v0.1.0: (1) `wh_vct_ls_2026_s3cur3k3y` — LS webhook signing secret leaked in commit 2f1cc88; (2) `ltnlwhaxnpbiifordlbk` — Supabase project ref leaked alongside it.
+Scans staged files (or full tracked tree with `--all`) for blocklisted token patterns. Exits non-zero with instructions. Wire as a pre-commit hook via `ln -sf ../../scripts/check-no-secrets.sh .git/hooks/pre-commit`.
 
 ### Env scrubbing in hooks
 All 23 project hooks scrub `SUPABASE_KEY`, `GITHUB_TOKEN`, `OPENAI_API_KEY`, AWS credentials, `TELEGRAM_BOT_TOKEN`, etc. before spawning subprocesses. See `SECURITY.md`.

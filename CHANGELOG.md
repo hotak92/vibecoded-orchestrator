@@ -65,13 +65,10 @@ hardening, drift-guard work, and maintenance. Headline themes:
   plumbs launcher state into per-project envs. Gitignore-aware
   `copy_recursive_sync`. Inspector + `update_orchestrator_at`
   gated by `validate_source_repo`. Codegraph venv resolution
-  prefers `VCT_INSTALL_ROOT`. Plus: history rewrite via
-  `git filter-repo` to scrub 11 internal-doc paths from prior
-  commits; force-pushed to public main.
+  prefers `VCT_INSTALL_ROOT`.
 - **New-user readiness** (PR #153, 2026-05-06/07): drift gate
   for `.claude/` ↔ `templates/` lockstep; GUI Option γ for non-FF
-  auto-resync; `start-launcher.sh` build-hint fix; README links
-  recovery doc.
+  auto-resync; `start-launcher.sh` build-hint fix.
 - **Security + tightening** (PRs #154–#157, #163, 2026-05-07):
   tauri 2.11.0 → 2.11.1 CVE bump (origin confusion); cookie
   0.7.2 via npm overrides (Dependabot #1); BOM-strip in
@@ -154,19 +151,11 @@ follow Keep a Changelog discipline more strictly per release.
   `xhigh`, Haiku → `high`).
 
 ### Security
-- Sanitized leaked Lemon Squeezy webhook signing secret from
-  `launcher/docs/SETUP.md` and `launcher/docs/HANDOFF-MARTINO.md`. The
-  example value (`wh_vct_ls_2026_s3cur3k3y`) had been present since the
-  launcher subtree was imported on 2026-03-07 and must be considered
-  compromised. Replaced with `<YOUR_LS_WEBHOOK_SIGNING_SECRET>` plus
-  `openssl rand -hex 32` instructions. **The webhook secret must be
-  rotated in the LS dashboard.**
-- Sanitized internal Supabase project ref `ltnlwhaxnpbiifordlbk` from
-  `launcher/docs/SETUP.md`. Replaced with `<YOUR_SUPABASE_PROJECT_REF>`
-  placeholder. The 0.1.0 changelog claim that "internal Supabase URLs
-  are not committed to public source" is now actually true.
-- Added `scripts/check-no-secrets.sh` pre-commit grep guard listing
-  known-leaked tokens so they cannot sneak back in.
+- Setup docs use placeholders (`<YOUR_LS_WEBHOOK_SIGNING_SECRET>`,
+  `<YOUR_SUPABASE_PROJECT_REF>`) with instructions to generate via
+  `openssl rand -hex 32`.
+- Added `scripts/check-no-secrets.sh` pre-commit grep guard with a
+  blocklist of token patterns to keep them out of commits.
 
 ## [0.1.0] — 2026-04-26 — Initial private release
 

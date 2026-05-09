@@ -1,7 +1,7 @@
 # Repo Cleanliness Policy
 
 **Status:** policy doc, normative for contributions.
-**Last updated:** 2026-05-06 (PR-4 — privacy + history rewrite)
+**Last updated:** 2026-05-06
 
 This repo enforces a hard split between **tracked source-of-truth**
 files and **machine-local artifacts**. Anything that was generated

@@ -386,8 +386,20 @@ jobs:
           fi
 
           # 5. Top-level docs + manifests.
+          # README, CLAUDE.md (Claude Code session-start instructions),
+          # and KNOWN_ISSUES are needed at archive root for users / Claude
+          # to find them on extraction. CHANGELOG, CONTRIBUTING, CLA,
+          # CODE_OF_CONDUCT, SECURITY are community/legal docs that
+          # belong at the root of any open-source release.
           cp BOOTSTRAP.md "$stage_root/"
           cp README.md "$stage_root/"
+          cp CLAUDE.md "$stage_root/"
+          cp KNOWN_ISSUES.md "$stage_root/"
+          cp CHANGELOG.md "$stage_root/"
+          cp CONTRIBUTING.md "$stage_root/"
+          cp CLA.md "$stage_root/"
+          cp CODE_OF_CONDUCT.md "$stage_root/"
+          cp SECURITY.md "$stage_root/"
           cp LICENSE "$stage_root/"
           cp vct-module.json "$stage_root/"
           cp orchestrator-managed-paths.txt "$stage_root/"
@@ -403,6 +415,12 @@ jobs:
           if [ -f "$migration_doc" ]; then
             cp "$migration_doc" "$stage_root/MIGRATION-${version}.md"
           fi
+
+          # 6. Public docs/ folder. Internal maintainer docs live in the
+          # top-level internal/ directory which is NOT shipped — see
+          # internal/README.md. The launcher subtree is excluded from
+          # docs/ explicitly; subtree docs live under launcher/ already.
+          copy_subtree docs "$stage_root/docs"
 
           # Sanity ls — surfaces sizes in the run log so a regression
           # (e.g. someone accidentally including a 200MB cache dir)
