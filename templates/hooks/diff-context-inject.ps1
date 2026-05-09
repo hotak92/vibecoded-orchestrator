@@ -1,3 +1,4 @@
+# OS-EXEMPT-PARITY: Windows-only fix — drop the dead `$env:CLAUDE_SESSION_ID` middle branch from the SessionId resolution cascade. The .sh sibling never had this branch (audit confirmed; sh went straight from stdin-parse-fail to "default"), so there's no symmetrical change to make on the .sh side.
 # Scrub sensitive env vars (this hook doesn't need credentials)
 foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN') {
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
