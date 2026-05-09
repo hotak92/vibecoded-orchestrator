@@ -2,11 +2,9 @@
 
 A unified primitive for per-project secrets, replacing ad-hoc mixes of
 per-service wrapper scripts, flat global token files, and `.env` files
-scattered across an ecosystem of related projects.
+scattered across multiple projects on one machine.
 
-This doc describes **phase 1** (the bash `vct` CLI shipped in this repo
-under `tools/vct-secrets/`). Phases 2–4 (Rust port, GUI, daemon) are
-sketched at the end and implemented in the closed-source VCT Launcher.
+This doc describes the bash `vct` CLI shipped under `tools/vct-secrets/`.
 
 ---
 
@@ -272,31 +270,19 @@ delete it once you've confirmed nothing references the old path.
 
 ---
 
-## Phase 2+ (out of scope for this doc)
+## Design choices
 
-- **Phase 2** — Rust binary with the same CLI surface, distributed
-  inside the VCT Launcher installer. Drop-in replacement.
-- **Phase 3** — Launcher GUI for add/rotate/revoke + audit-log viewer.
-- **Phase 4** — Optional secrets daemon (`vct-secretsd`) that auto-starts
-  on login or VS Code workspace open, exposing a Unix-domain socket for
-  faster repeated lookups + centralised audit. Not required — phase 1
-  works fine with direct file reads.
+1. **Shared secret fallback is on by default.** Projects can opt out
+   by placing a `~/.vct-secrets/projects/<NAME>/.no-shared-fallback`
+   marker file.
+2. **Cross-project copy requires confirmation.** `vct copy`
+   prompts unless `--yes`. Prevents accidental token leaks.
+3. **`vct get --trusted` is required in a TTY** (interactive
+   shell, where scrollback / history capture are the risk). In scripts
+   the choice is already explicit.
+4. **Audit log is unbounded.** Hundreds of bytes per call, years before
+   rotation matters.
 
 The on-disk layout (`~/.vct-secrets/`) and CLI contract are stable, so
 all callers (git credential helper, MCP wrappers, project hooks) keep
-working unchanged across phases.
-
----
-
-## Open design points
-
-1. **Shared secret fallback — on by default?** Yes. Projects can opt out
-   by placing a `~/.vct-secrets/projects/<NAME>/.no-shared-fallback`
-   marker file. (Phase 2 will honour this; phase 1 always falls back.)
-2. **Cross-project copy — confirmation required?** Yes. `vct copy`
-   prompts unless `--yes`. Prevents accidental token leaks.
-3. **`vct get` `--trusted` requirement.** Required in a TTY (interactive
-   shell, where scrollback / history capture are the risk). In scripts
-   the choice is already explicit.
-4. **Audit log rotation.** Phase 2 concern. For phase 1, unbounded
-   growth is fine — hundreds of bytes per call, years before it matters.
+working across implementations.

@@ -1,12 +1,12 @@
-# Asciinema Demo Script — VibeCoded Tools Orchestrator
+# Asciinema Demo Script — VibeCoded Orchestrator
 
 Target duration: **75 seconds** (range 60-90s).
-Output: terminal recording embedded in README. No voiceover — pacing relies on prompt timing and visible output.
+Output: terminal recording embedded in README. No voiceover.
 
 Record with:
 
 ```bash
-asciinema rec -i 1.5 --title "VibeCoded Tools Orchestrator — persistent memory for Claude Code" demo.cast
+asciinema rec -i 1.5 --title "VibeCoded Orchestrator — persistent memory for Claude Code" demo.cast
 ```
 
 `-i 1.5` caps idle time at 1.5s so viewers aren't waiting on real LLM responses.
@@ -62,12 +62,10 @@ $ ls
 auth.py  knowledge/
 ```
 
-`# note: small real project, no orchestrator yet`
-
 ### 2. One-command install (t=2s, ~8s)
 
 ```bash
-$ curl -sSL https://vibecodedtools.it/install.sh | bash
+$ git clone https://github.com/hotak92/vibecoded-orchestrator.git && cd vibecoded-orchestrator && bash first-install.sh
 [ok] docker detected
 [ok] weaviate container started (port 8081)
 [ok] ollama container started (port 11435)
@@ -75,8 +73,6 @@ $ curl -sSL https://vibecodedtools.it/install.sh | bash
 [ok] orchestrator installed in .claude/
 Done. Run `claude` to start.
 ```
-
-`# note: real install is ~2 min; asciinema -i 1.5 compresses this`
 
 ### 3. Index the existing project into the code graph (t=10s, ~6s)
 
@@ -86,8 +82,6 @@ Parsing 1 file... auth.py (2 functions)
 Embedded with CodeSage-Large-v2 (2048-dim)
 Indexed: 1 module, 0 classes, 2 functions
 ```
-
-`# note: AST-based, not regex`
 
 ### 4. Sync the seeded KG node (t=16s, ~3s)
 
@@ -111,8 +105,6 @@ refresh_session. The decision to skip JWT was deliberate —
 see knowledge/concepts/auth-strategy.md.
 ```
 
-`# note: Claude cited the KG node it was never explicitly shown`
-
 ### 6. Make a decision, have Claude capture it (t=29s, ~8s)
 
 ```bash
@@ -129,8 +121,6 @@ Noted. Captured as decisions/token-middleware-v2.md.
 > /exit
 $ exit
 ```
-
-`# note: session gone. Real "context amnesia" moment.`
 
 ### 8. New terminal, same project (t=40s, ~3s)
 
@@ -151,8 +141,6 @@ We decided to move token validation to a middleware in v2.
 Current implementation is inline in auth.py:validate_token.
 ```
 
-`# note: persisted across session restart — this is the core value prop`
-
 ### 10. Code graph query — instant, no LLM call (t=51s, ~6s)
 
 ```bash
@@ -163,8 +151,6 @@ CodeFunction: auth.validate_token  (score 0.89)
   Validate JWT token against our auth service.
 ```
 
-`# note: semantic code search, ~200ms, runs fully local`
-
 ### 11. Structural query — callers, dependencies, inheritance (t=57s, ~6s)
 
 ```bash
@@ -173,15 +159,13 @@ No callers found (0 references in indexed code).
 Suggestion: this function is defined but unused in demo project.
 ```
 
-`# note: AST-level truth, not grep`
-
 ### 12. Final frame — link to repo (t=63s, ~4s)
 
 ```bash
-$ echo "github.com/VibeCoded-Tools/orchestrator"
-github.com/VibeCoded-Tools/orchestrator
-$ echo "AGPL-3.0 | runs 100% local | alpha"
-AGPL-3.0 | runs 100% local | alpha
+$ echo "github.com/hotak92/vibecoded-orchestrator"
+github.com/hotak92/vibecoded-orchestrator
+$ echo "AGPL-3.0 | runs 100% local"
+AGPL-3.0 | runs 100% local
 ```
 
 Total: ~67s (fits 60-90s window with buffer).
@@ -194,8 +178,8 @@ Total: ~67s (fits 60-90s window with buffer).
 2. Drop into README under a "See it work" heading above the feature list.
 3. If GIF >3MB, regenerate with `agg --font-size 14 --speed 1.3`.
 
-## Known risks to rehearse
+## Pre-recording checks
 
-- Step 2 install output must match current install.sh messages — verify before recording.
-- Step 5/9 hook output format depends on `pre-edit-context-inject.sh` — check it still prints the `[UserPromptSubmit hook]` prefix.
-- Step 6 assumes Claude will call `store_knowledge_node` autonomously. If the model doesn't, fall back to `kg add` CLI.
+- Step 2 install output must match current `first-install.sh` messages — verify before recording.
+- Step 5/9 hook output format depends on `pre-edit-context-inject.sh` — confirm it still prints the `[UserPromptSubmit hook]` prefix.
+- Step 6 assumes Claude calls `store_knowledge_node` autonomously. If the model doesn't, fall back to direct write into `knowledge/decisions/`.

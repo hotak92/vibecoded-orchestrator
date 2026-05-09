@@ -468,7 +468,6 @@ Contributions welcome — small fixes and bug reports especially. See [CONTRIBUT
 - [Getting started](docs/GETTING_STARTED.md) — install, first-session walkthrough, and cross-project setup
 - [Architecture features](docs/features/) — per-area design notes (MCPs + agents, code graph, KG, RL retrieval, install flow)
 - [Dependency licenses](docs/DEPENDENCY_LICENSES.md) — transitive licensing audit for the AGPL-3.0 release
-- [Releasing](docs/RELEASING.md) — pre-flight build procedure (binary rebuild via wrapper script)
 - [Recovery (post-history-rewrite)](docs/RECOVERY-2026-05-06.md) — for users with pre-2026-05-06 clones
 - [Templates README](templates/README.md) — what agents and skills install.py will drop into `.claude/`
 

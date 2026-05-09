@@ -67,7 +67,7 @@ Pull requests run a deliberately small CI matrix on every push (`.github/workflo
 
 CI stays small at this stage. When the launcher gets release tags, a separate workflow will add the full per-OS bundle build, signing, and artifact upload.
 
-For maintainers cutting a release, see [`docs/RELEASING.md`](docs/RELEASING.md). [`CHANGELOG.md`](CHANGELOG.md) follows the Keep a Changelog format.
+[`CHANGELOG.md`](CHANGELOG.md) follows the Keep a Changelog format.
 
 ---
 
