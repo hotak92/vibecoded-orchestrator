@@ -3,7 +3,7 @@
 Telemetry is **opt-in, off by default, and never sends data without an
 explicit `VIBECODED_TELEMETRY=true` environment variable**.
 
-## v0.1.0 status: pre-launch deployment
+## v0.2.x status: pre-launch deployment
 
 The upload endpoint (`https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/telemetry`) hasn't
 shipped yet. Until it's live, the uploader writes opted-in events to
@@ -43,8 +43,8 @@ user-identifying information beyond an installer-generated UUID hash.
 # Default location:
 cat ~/.vibecoded/telemetry_pending.jsonl | jq .
 
-# Or, when v0.2 ships, the planned `vct-cli` integration:
-vct-cli telemetry pending     # roadmap — see launcher/tools/vct-cli/
+# Or via the `vco` CLI (shipped in 0.2.0; binary at launcher/tools/vct-cli/):
+vco telemetry status
 ```
 
 Each line is one event. Safe to delete or hand-edit at any time.

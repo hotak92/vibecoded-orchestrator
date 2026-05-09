@@ -10,9 +10,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.2.0] — 2026-05-08
 
 Iteration since v0.1.6. Substantial install-flow architectural
-overhaul, freeze-investigation hardening, drift-guard work, and
-maintenance. Headline themes:
+overhaul, secrets-architecture overhaul, freeze-investigation
+hardening, drift-guard work, and maintenance. Headline themes:
 
+- **Secrets architecture overhaul** (PR #171, 2026-05-08):
+  keychain-canonical for everything written through the launcher
+  (Onboarding `register_github_pat` and the new `/preferences`
+  Manage Token panel both write to the OS keychain, not to disk).
+  Hub `/projects/{id}/env` resolver path is the canonical reader;
+  bundled wrappers consume it via the new
+  `templates/scripts/vct_secrets_resolve.{sh,ps1}` helper. Items
+  H1-H4 close the per-project / cross-launcher / shared-tab gaps;
+  the in-tree `claude_mcp_servers/search_mcp/wrapper.sh` reads
+  `$GITHUB_TOKEN` env first, hub resolver second. The legacy
+  `~/.vct-secrets/git-credential-vct` helper is retired in favour
+  of per-project `GITHUB_TOKEN` env propagation. The user-facing
+  `vct` CLI under `tools/vct-secrets/` is unchanged. See
+  [docs/MIGRATION-0.2.0.md](docs/MIGRATION-0.2.0.md) for the full
+  matrix and migration recipe.
+- **Hub authentication gate** (item H5, 2026-05-08): the launcher
+  hub at `127.0.0.1:7700` now requires
+  `Authorization: Bearer <token>` on every `/api/v1/*` route except
+  `/api/v1/health`. The token is a fresh 32-byte CSPRNG value
+  regenerated per launcher startup, persisted to
+  `<vct_root_dir>/hub.token` (mode `0o600` on Unix). Closes the
+  "any same-user process can curl localhost and exfiltrate the
+  active secrets set" attack class. In-tree clients (resolver
+  helpers, `vco` CLI, `hub_proxy`) read the token transparently.
+- **Per-OS release archives** (`.github/workflows/release.yml`,
+  2026-05-08): tag push (`v*.*.*`) builds and publishes
+  `vibecoded-orchestrator-<version>-{linux-x64,macos-arm64,windows-x64}.{tar.gz,zip}`
+  to GitHub Releases, with a `.sha256` sidecar each, alongside the
+  existing standalone launcher binaries. SLSA build provenance
+  attestation (Sigstore-signed) generated for the launcher binary
+  inside each archive.
+- **Non-destructive contract on user-owned files**: launcher
+  unregister and `clear_github_pat` no longer rewrite or delete
+  `.claude/env` outside the managed BEGIN/END block; user shell
+  exports survive. The launcher never touches user-owned
+  `~/.vct-secrets/projects/<project>/<key>` files written by the
+  user-facing `vct` CLI.
+- **Replace-existing guard on `register_github_pat`**: returns
+  `EXISTS_DIFFERENT:<masked-prefix>` instead of silently
+  overwriting a different PAT; GUI surfaces a confirm dialog.
+  `force=true` proceeds with overwrite.
+- **`/preferences` Manage Token UI**: rotate or clear the GitHub
+  PAT outside the OnboardingWizard. Routes through the
+  replace-existing guard above; "Clear" strips `GITHUB_TOKEN`
+  from every registered project's env surface.
 - **Install-flow overhaul** (PRs #139–#152, 2026-05-06): the
   user's "ONE VCO clone shared by all projects" model fully
   implemented. `ORCHESTRATOR_MANAGED_PATHS` as single source of

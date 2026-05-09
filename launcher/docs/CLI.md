@@ -1,8 +1,8 @@
 # vco CLI
 
-Command-line interface for the VCT Launcher. Mirrors most GUI capabilities
-so power users can script project lifecycle, audit pulls, and license
-operations from a terminal or CI job.
+Command-line interface for the VCT Launcher (current version: **0.2.0**).
+Mirrors most GUI capabilities so power users can script project lifecycle,
+audit pulls, and license operations from a terminal or CI job.
 
 ## Install
 
@@ -34,6 +34,17 @@ vco: Cannot reach launcher hub: ... Is the launcher running?
 
 In order: `--port <N>` (CLI flag) > `VCT_HUB_PORT` env > `~/.vct/hub.port`
 (file written by the launcher on startup) > 7700 (default).
+
+## Hub authentication (0.2.0+)
+
+Every `/api/v1/*` route (except `/api/v1/health`) requires
+`Authorization: Bearer <token>`. The launcher writes a fresh 32-byte
+CSPRNG token to `~/.vct/hub.token` (mode `0o600`) on every startup. The
+`vco` CLI reads it transparently — no extra flag needed. If the launcher
+has not been started since boot, the file is missing and `vco` exits with
+"Cannot reach launcher hub". See
+[docs/MIGRATION-0.2.0.md → Hub authentication](../../docs/MIGRATION-0.2.0.md#hub-authentication)
+for the threat model and the recipe for third-party clients.
 
 ## Commands
 
