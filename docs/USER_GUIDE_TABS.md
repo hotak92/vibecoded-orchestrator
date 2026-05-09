@@ -466,7 +466,7 @@ DB; the binding row is the launcher's record of what those should be.
 #### How rows get there
 
 - Auto-populated by `populate_kg_bindings()`:
-  - `primary` row → `collection_name = sanitize_kg_collection(project_name) + "_KnowledgeGraph"`. For a project named `Acme` that's `Agape_KnowledgeGraph`. The sanitizer strips non-alphanumerics and TitleCases (`my project name` → `MyProjectName`).
+  - `primary` row → `collection_name = sanitize_kg_collection(project_name) + "_KnowledgeGraph"`. For a project named `Acme` that's `Acme_KnowledgeGraph`. The sanitizer strips non-alphanumerics and TitleCases (`my project name` → `MyProjectName`).
   - `shared` row → `collection_name = "VibeCodedTools_KnowledgeGraph"` (cross-project shared KG used by all projects).
   - Both default to `weaviate_url = http://localhost:8081`,
     `embedding_model = qwen3-embedding:0.6b`, `embedding_dim = 1024`.
@@ -537,15 +537,15 @@ code entities.
 
 #### Namespaced classes
 
-A project with prefix `Acme` ends up with `Agape_CodeFunction`,
-`Agape_CodeClass`, `Agape_CodeModule`, `Agape_CodeAPI`,
-`Agape_CodeInteraction` in Weaviate.
+A project with prefix `Acme` ends up with `Acme_CodeFunction`,
+`Acme_CodeClass`, `Acme_CodeModule`, `Acme_CodeAPI`,
+`Acme_CodeInteraction` in Weaviate.
 
 | Project name | `collection_prefix` | Resulting classes |
 |---|---|---|
-| `Acme` | `Acme` | `Agape_CodeFunction`, … |
+| `Acme` | `Acme` | `Acme_CodeFunction`, … |
 | `my project name` | `MyProjectName` | `MyProjectName_CodeFunction`, … |
-| `ImageDataset` | `ImageDataset` | `SD15_CodeFunction`, … |
+| `ImageDataset` | `ImageDataset` | `ImageDataset_CodeFunction`, … |
 
 The prefix is derived by `sanitize_kg_collection(project_name)` —
 same function as KG bindings.
@@ -567,7 +567,7 @@ same function as KG bindings.
 | Column | Meaning |
 |---|---|
 | `collection_prefix` | Prefix prepended to `_CodeFunction` etc. Must be alphanumeric, starting with a letter. |
-| `embedding_model` | `codesage-large-v2` default (2048-dim, served by the code embedding service on port 11438). Legacy alternative: `unclemusclez/jina-embeddings-v2-base-code` (768-dim, CPU-only Ollama fallback). |
+| `embedding_model` | `codesage-large-v2` default (2048-dim, served by the code embedding service on port 11440). Legacy alternative: `unclemusclez/jina-embeddings-v2-base-code` (768-dim, CPU-only Ollama fallback). |
 | `embedding_dim` | 2048 (CodeSage) or 768 (Jina). Must match the model. |
 | `last_analyzed_commit` | Git SHA of the last `code-graph-analyze` run. Used to decide whether re-analysis is needed. |
 | `last_analyzed_at` | Unix-millis of the last analysis. |
@@ -597,12 +597,12 @@ same function as KG bindings.
 
 - Renaming a project does not rename its prefix automatically. If
   you change `collection_prefix`, you must rebuild the code graph
-  from scratch — the old `Agape_CodeFunction` collection won't be
+  from scratch — the old `Acme_CodeFunction` collection won't be
   queried under the new prefix.
 - `embedding_dim` mismatches with `embedding_model` will produce
   garbage results silently. The launcher does not validate the
   pairing.
-- The CodeSage service (port 11438) must be running. If you set
+- The CodeSage service (port 11440) must be running. If you set
   `CODE_EMBED_BACKEND=ollama` in the env, the launcher row is
   display-only — actual embeddings come from Ollama.
 

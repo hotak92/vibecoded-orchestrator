@@ -51,11 +51,12 @@ Each line is one event. Safe to delete or hand-edit at any time.
 
 ## Disabling telemetry
 
-The `.env` written by `install.py` defaults to `VIBECODED_TELEMETRY=false`.
-To turn it back off after opting in:
+The `.env` written by `install.py` defaults to `VCT_TELEMETRY=false`
+(canonical key since 2026-05-01; `VIBECODED_TELEMETRY` is read as a
+back-compat alias). To turn it back off after opting in:
 
 ```bash
-echo "VIBECODED_TELEMETRY=false" >> .env
+echo "VCT_TELEMETRY=false" >> .env
 ```
 
 Or simply unset the variable. Both the collector and uploader fail-closed

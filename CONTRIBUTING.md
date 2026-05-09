@@ -29,7 +29,7 @@ The entire repository is licensed under **AGPL-3.0-or-later**. New source files 
 
 For shell scripts, use `# SPDX-License-Identifier: ...`. For JS/TS, use `// SPDX-License-Identifier: ...`.
 
-Paid modules (Pro, MAO, etc.) are distributed as pre-compiled, signed binaries through a signed-URL CDN. They aren't covered by any source license; there is no separate source-license tier in this repo.
+Paid modules (Pro, etc.) are distributed as pre-compiled, signed binaries through a signed-URL CDN. They aren't covered by any source license; there is no separate source-license tier in this repo.
 
 ---
 

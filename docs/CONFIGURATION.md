@@ -98,7 +98,7 @@ The MCP server (`claude_mcp_servers/weaviate_mcp/server.py`) reads these on star
 
 ## Agents and skills
 
-See [templates/README.md](../templates/README.md) for the tier split (free vs MAO) and install-flag reference.
+See [templates/README.md](../templates/README.md) for the bundled agents and skills (29 + 28) and install-flag reference.
 
 ## Parallel agents (3-5x speedup)
 

@@ -293,4 +293,4 @@ test -w "${TMPDIR:-/tmp}" && echo "writable" || echo "NOT writable"
 
 - GitHub Issues: <https://github.com/hotak92/vibecoded-orchestrator/issues>
 - Community channel: (TBD — linked from vibecodedtools.it at launch)
-- Commercial support: Pro and MAO tiers include email support.
+- Commercial support: Pro tier includes email support.

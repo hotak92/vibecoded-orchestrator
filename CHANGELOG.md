@@ -173,10 +173,10 @@ follow Keep a Changelog discipline more strictly per release.
 ### Added
 - VCT Launcher v1.0 + v1.1 (Tauri 2 desktop app): 17 GUI screens including project management, KG / code-graph dashboards, audit log, modules catalog, license activation, settings, onboarding wizard.
 - Knowledge Graph with semantic search (Weaviate + qwen3-embedding 1024-dim, optional OpenAI vectors, GraphRAG-style WikiLink traversal).
-- Code Graph (Tree-sitter AST analysis, 5 entity types: `CodeModule`, `CodeClass`, `CodeFunction`, `CodeAPI`, `CodeInteraction`; optional Joern integration for CFG / PDG).
+- Code Graph (Python AST + regex-based analysis across 9 languages, 5 entity types: `CodeModule`, `CodeClass`, `CodeFunction`, `CodeAPI`, `CodeInteraction`; optional Joern integration for CFG / PDG).
 - 20 automation hooks (`PreToolUse`, `PostToolUse`, `SessionStart`, `Stop`, `PreCompact`, `PostCompact`, `StopFailure`, `SessionEnd`, …).
 - 4 MCP servers: `weaviate-kg`, `ollama`, `search`, `code-embedding`.
-- 19 specialist agents + 28 skills as templates dropped into `.claude/` at install time. Optional MAO add-on adds 10 more agents.
+- 19 agents + 28 skills as templates dropped into `.claude/` at install time.
 - Multi-surface compatibility: Claude Code CLI + VS Code extension + Claude Code Desktop app.
 - Per-project env injection via `.claude/settings.json` (Anthropic-canonical) + `.vscode/settings.json` (VS Code) + `.claude/env` (CLI shell). User code is never touched.
 - Container runtime support for podman and docker; shared services across projects on a single machine.
