@@ -283,30 +283,13 @@ async fn fetch_class_count(client: &reqwest::Client, class: &str) -> Result<u32,
         .unwrap_or(0) as u32)
 }
 
-#[command]
-pub async fn kg_set_collection_access(
-    project_id: String,
-    collection: String,
-    access: String,
-    db: State<'_, Db>,
-) -> Result<(), String> {
-    if !matches!(access.as_str(), "read" | "write" | "none") {
-        return Err(format!("invalid access level: {}", access));
-    }
-    db.kg_set_access(&project_id, &collection, &access)?;
-    db.audit(
-        "kg_collection_access_change",
-        Some(&project_id),
-        None,
-        &serde_json::json!({ "collection": collection, "access": access }),
-    )?;
-    // P1-D (2026-05-08): refresh the project's env files so a running
-    // Claude Code session sees the new VCT_KG_ACCESS_LIST without a
-    // restart. Soft-fail: never roll back the matrix change on a
-    // refresh hiccup.
-    let _ = crate::commands::projects_v2::refresh_project_env_with_db(&db, &project_id);
-    Ok(())
-}
+// `kg_set_collection_access` (the singular per-row setter) was removed
+// 2026-05-09 as part of the dead-code sweep. The GUI uses
+// `kg_set_collection_access_mode` (mode-based, fans out access rows for
+// every project) exclusively, and that function calls `db.kg_set_access`
+// directly. No external consumer depended on the singular Tauri command.
+// If a future caller needs the per-row primitive, expose `db.kg_set_access`
+// (already public on the Db handle) instead of re-adding a Tauri command.
 
 // ─── Graph load for Obsidian-style view ─────────────────────────────────
 

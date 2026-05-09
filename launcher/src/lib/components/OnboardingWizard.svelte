@@ -182,6 +182,11 @@
   // was removed — the install path is no longer user-pickable. See the
   // `installPath` $state declaration above for rationale.
 
+  // Sentinel prefix returned by `register_github_pat` when the
+  // keychain already holds a different token. We catch it, prompt the
+  // user, and re-invoke with `force: true` only on explicit consent.
+  const PAT_REPLACE_GUARD = 'EXISTS_DIFFERENT:';
+
   async function savePat() {
     patError = null;
     if (!githubPat.trim()) {
@@ -189,8 +194,24 @@
       return;
     }
     savingPat = true;
+    const token = githubPat.trim();
     try {
-      await invoke('register_github_pat', { token: githubPat.trim() });
+      try {
+        await invoke('register_github_pat', { token, force: false });
+      } catch (e) {
+        const msg = String(e);
+        if (msg.startsWith(PAT_REPLACE_GUARD)) {
+          const reason = msg.slice(PAT_REPLACE_GUARD.length).trim()
+            || 'A different GitHub token is already saved.';
+          if (!confirm(`${reason}\n\nReplace the existing token?`)) {
+            patError = 'Token not saved (existing keychain entry kept).';
+            return;
+          }
+          await invoke('register_github_pat', { token, force: true });
+        } else {
+          throw e;
+        }
+      }
       patSaved = true;
       githubPat = '';
       toast.success('GitHub token saved');
@@ -1155,7 +1176,7 @@
               hour (anonymous). With token = 5000/hour.
             </p>
             {#if patSaved}
-              <p class="ow-ok">Token saved to <code class="ow-mono">~/.vct-secrets/shared/github_pat</code>.</p>
+              <p class="ow-ok">Token saved to your OS keychain.</p>
             {:else}
               <label class="ow-label">
                 <span>GitHub token (optional)</span>

@@ -253,7 +253,12 @@ pub fn run() {
             // KG dashboard
             commands::kg::kg_list_collections,
             commands::kg::codegraph_list_projects,
-            commands::kg::kg_set_collection_access,
+            // (kg_set_collection_access — the singular per-row setter — is
+            //  not registered: the GUI uses kg_set_collection_access_mode
+            //  exclusively, which is the higher-level mode-based API that
+            //  internally calls db.kg_set_access. The Rust function stays
+            //  in commands/kg.rs as the underlying primitive; dropped from
+            //  the Tauri invoke surface 2026-05-09 to reduce attack surface.)
             commands::kg::kg_load_graph,
             commands::kg::kg_search,
             commands::kg::kg_get_node,
@@ -324,12 +329,10 @@ pub fn run() {
             commands::installer::inspect_project_leftovers,
             commands::installer::update_orchestrator_at,
             // GitHub PAT lifecycle. `register_github_pat` is wired in the
-            // OnboardingWizard (Bug 22). The read/clear surface (has/preview/
-            // clear) is registered for the v1.x "Manage Token" UI which
-            // hasn't been built yet — keep registered so the next FE sweep
-            // can wire it without backend churn.
-            // TODO(v1.x): wire has_github_pat / get_github_pat_preview /
-            //   clear_github_pat to a Manage Token settings page.
+            // OnboardingWizard (Bug 22) for first-run capture, AND in the
+            // /preferences "GitHub access token" section for ongoing
+            // status / replace / clear (added 2026-05-09 alongside the
+            // non-destructive secrets fix).
             commands::installer::has_github_pat,
             commands::installer::get_github_pat_preview,
             commands::installer::register_github_pat,

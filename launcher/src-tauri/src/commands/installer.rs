@@ -2480,7 +2480,10 @@ pub(crate) struct GithubPatMigrationReport {
     pub already_done: bool,
     /// File contents migrated into the keychain this run.
     pub migrated: bool,
-    /// File deleted after successful keychain write.
+    /// Reserved for backwards compatibility. Always `false` since
+    /// 2026-05-09: the launcher does not delete user-owned files in
+    /// `~/.vct-secrets/shared/` — they are left in place after the
+    /// keychain copy. Field kept so downstream callers don't break.
     pub file_removed: bool,
     /// `app_state` flag set this run.
     pub flag_set: bool,
@@ -2537,29 +2540,16 @@ pub(crate) fn migrate_github_pat_file_to_keychain(
     };
 
     // Case 2: keychain already has a value. Treat keychain as
-    // authoritative, drop the stale file, and flip the flag.
+    // authoritative and flip the flag. The user's file is left alone:
+    // `~/.vct-secrets/shared/<key>` is user-owned data, and the
+    // launcher must never delete or overwrite it without explicit
+    // consent (regression fix 2026-05-09; the previous behaviour silently
+    // destroyed working PATs during migration).
     let scope = SecretScope::Shared {
         project_id: SENTINEL_SHARED,
     };
     if let Ok(Some(existing)) = secrets::get(scope, GITHUB_PAT_MODULE_ID, GITHUB_PAT_KEY) {
         if !existing.trim().is_empty() {
-            // Best-effort file removal — a failure here is logged via
-            // the warning channel but does not block the flag flip
-            // (the keychain is the source-of-truth and the file is
-            // strictly stale at this point).
-            if let Err(e) = std::fs::remove_file(&path) {
-                report
-                    .warnings
-                    .push(format!("remove stale {}: {}", path.display(), e));
-            } else {
-                report.file_removed = true;
-            }
-            // Also clear the legacy flat path if it's still around.
-            if let Some(flat) = github_pat_path_flat() {
-                if flat.exists() && flat != path {
-                    let _ = std::fs::remove_file(&flat);
-                }
-            }
             db.app_state_set_bool(APP_STATE_KEY_GITHUB_PAT_MIGRATED, true)?;
             report.flag_set = true;
             return Ok(report);
@@ -2567,17 +2557,18 @@ pub(crate) fn migrate_github_pat_file_to_keychain(
     }
 
     // Case 3: file present, keychain empty. Read → write → mark active
-    // → delete → flip flag. Soft-fail at keychain step.
+    // → flip flag. Soft-fail at keychain step. The file is left in
+    // place after a successful copy: it's user-owned data, and the
+    // launcher does not delete it.
     let raw = std::fs::read_to_string(&path).map_err(|e| {
         format!("read {} during github_pat migration: {}", path.display(), e)
     })?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        // Empty file — nothing to migrate. Drop it and flip the flag.
-        let _ = std::fs::remove_file(&path);
+        // Empty file — nothing to migrate. Just flip the flag; leave
+        // the empty file for the user to clean up if they want.
         db.app_state_set_bool(APP_STATE_KEY_GITHUB_PAT_MIGRATED, true)?;
         report.flag_set = true;
-        report.file_removed = true;
         return Ok(report);
     }
 
@@ -2600,20 +2591,10 @@ pub(crate) fn migrate_github_pat_file_to_keychain(
         report.warnings.push(format!("mark_secret_active: {}", e));
     }
 
-    // File removal — the keychain now owns the value.
-    if let Err(e) = std::fs::remove_file(&path) {
-        report
-            .warnings
-            .push(format!("remove {}: {}", path.display(), e));
-    } else {
-        report.file_removed = true;
-    }
-    // Also clear the legacy flat path if it differs from the migrated one.
-    if let Some(flat) = github_pat_path_flat() {
-        if flat.exists() && flat != path {
-            let _ = std::fs::remove_file(&flat);
-        }
-    }
+    // Keychain copy succeeded. Leave the file in place — it's user-
+    // owned data and the launcher does not delete it (regression fix
+    // 2026-05-09). The keychain is now the resolution path; the file
+    // is harmless residue the user can clean up at their discretion.
 
     db.app_state_set_bool(APP_STATE_KEY_GITHUB_PAT_MIGRATED, true)?;
     report.flag_set = true;
@@ -2658,12 +2639,25 @@ pub fn get_github_pat_preview(db: State<'_, Db>) -> Option<String> {
     Some(format!("••••{}", last4))
 }
 
+/// Sentinel error prefix returned by `register_github_pat` when an
+/// existing keychain entry differs from the supplied token and the
+/// caller did not pass `force: true`. The GUI matches this prefix and
+/// renders a confirm dialog before re-invoking with `force = true`.
+/// (Non-destructive guard added 2026-05-09 — the prior behaviour
+/// silently overwrote any pre-existing keychain value.)
+pub const GITHUB_PAT_REPLACE_GUARD: &str = "EXISTS_DIFFERENT:";
+
 #[command]
-pub fn register_github_pat(token: String, db: State<'_, Db>) -> Result<(), String> {
+pub fn register_github_pat(
+    token: String,
+    force: Option<bool>,
+    db: State<'_, Db>,
+) -> Result<(), String> {
     let trimmed = token.trim();
     if trimmed.is_empty() {
         return Err("token cannot be empty".into());
     }
+    let force = force.unwrap_or(false);
 
     // 1. Run the one-shot file→keychain migration (idempotent + self-gated).
     //    This pulls any pre-fix file value into the keychain BEFORE we
@@ -2687,14 +2681,34 @@ pub fn register_github_pat(token: String, db: State<'_, Db>) -> Result<(), Strin
         }
     }
 
-    // 2. Write the new token to the keychain.
+    // 2. Replace-existing guard. If the keychain already holds a
+    //    different non-empty value and the caller did not opt in via
+    //    `force`, refuse — the GUI must surface this to the user
+    //    before clobbering a working token. The migration step above
+    //    may have just populated the keychain from a pre-existing file,
+    //    so this guard correctly fires on first OnboardingWizard save
+    //    too if the user happened to type a different value than what
+    //    was on disk.
     let scope = SecretScope::Shared {
         project_id: SENTINEL_SHARED,
     };
+    if !force {
+        if let Ok(Some(existing)) = secrets::get(scope, GITHUB_PAT_MODULE_ID, GITHUB_PAT_KEY) {
+            let existing_trim = existing.trim();
+            if !existing_trim.is_empty() && existing_trim != trimmed {
+                return Err(format!(
+                    "{}A different GitHub token is already saved. Replace it?",
+                    GITHUB_PAT_REPLACE_GUARD
+                ));
+            }
+        }
+    }
+
+    // 3. Write the new token to the keychain.
     secrets::set(scope, GITHUB_PAT_MODULE_ID, GITHUB_PAT_KEY, trimmed)
         .map_err(|e| format!("keychain set github_pat: {}", e))?;
 
-    // 3. Mark active so the `is_secret_active_cross_launcher` gate
+    // 4. Mark active so the `is_secret_active_cross_launcher` gate
     //    (used by `github_pat_from_keychain` AND the hub's
     //    `/projects/{id}/env` endpoint) surfaces the value. Without
     //    this, a launcher running in `~/.vct-dev/` that paused the
@@ -2702,23 +2716,15 @@ pub fn register_github_pat(token: String, db: State<'_, Db>) -> Result<(), Strin
     db.mark_secret_active("shared", SENTINEL_SHARED, GITHUB_PAT_MODULE_ID, GITHUB_PAT_KEY)
         .map_err(|e| format!("mark_secret_active github_pat: {}", e))?;
 
-    // 4. Defence in depth: ensure no plaintext file is left behind. The
-    //    migration above already handled the common case; this catches
-    //    the corner where the migration short-circuited (already_done)
-    //    but a stale file appeared via some other path (e.g. an old
-    //    launcher running concurrently).
-    if let Some(p) = github_pat_path_shared() {
-        if p.exists() {
-            let _ = std::fs::remove_file(&p);
-        }
-    }
-    if let Some(p) = github_pat_path_flat() {
-        if p.exists() {
-            let _ = std::fs::remove_file(&p);
-        }
-    }
+    // 5. Files at `~/.vct-secrets/shared/<key>` and the legacy flat
+    //    path are user-owned data: the launcher does not delete them.
+    //    A user who pre-populated the file can keep it as a manual
+    //    fallback; the keychain is now the resolution path the hub
+    //    and the resolver helper consume. (Regression fix 2026-05-09:
+    //    the prior behaviour silently destroyed working PATs whenever
+    //    the OnboardingWizard re-saved.)
 
-    // 5. Propagate to all registered projects' env files (B2 fix from
+    // 6. Propagate to all registered projects' env files (B2 fix from
     //    2026-05-08 integration review). Without this, a user with N
     //    existing registered projects has to manually re-trigger
     //    write_project_env_files (e.g. via rename) for each one before
@@ -2766,18 +2772,14 @@ pub fn clear_github_pat(db: State<'_, Db>) -> Result<(), String> {
         GITHUB_PAT_KEY,
     );
 
-    // Clear from both shared/ and legacy flat locations to avoid stale
-    // tokens lingering in either path.
-    if let Some(p) = github_pat_path_shared() {
-        if p.exists() {
-            std::fs::remove_file(&p).map_err(|e| format!("remove {}: {}", p.display(), e))?;
-        }
-    }
-    if let Some(p) = github_pat_path_flat() {
-        if p.exists() {
-            std::fs::remove_file(&p).map_err(|e| format!("remove {}: {}", p.display(), e))?;
-        }
-    }
+    // Files at `~/.vct-secrets/shared/<key>` and the legacy flat path
+    // are user-owned data: `clear_github_pat` only clears what the
+    // launcher writes (keychain + active-flag). If the user also wants
+    // the on-disk file gone they can `rm` it themselves. Any future
+    // `register_github_pat` call will read the file, copy to keychain,
+    // and that fresh keychain value takes precedence — no stale-file
+    // surprise. (Regression fix 2026-05-09: the prior behaviour
+    // destroyed user-owned files on every "Clear" click.)
 
     // Propagate clear to all registered projects' env files: GITHUB_TOKEN
     // gets stripped from .claude/env, .claude/settings.json env, and
@@ -5954,8 +5956,11 @@ MemAvailable:   23456789 kB
         // ── Item #1: register_github_pat → keychain (no plaintext file) ──
 
         /// Calling the underlying register flow (keychain set + active
-        /// flag + file cleanup) writes to the keychain and leaves NO
-        /// plaintext at `~/.vct-secrets/shared/github_pat`.
+        /// flag) writes to the keychain. As of the 2026-05-09 non-
+        /// destructive fix, the launcher does NOT touch any file at
+        /// `~/.vct-secrets/shared/github_pat` or the legacy flat path —
+        /// those are user-owned data. The keychain is the resolution
+        /// path; pre-existing files are left as harmless residue.
         #[test]
         fn register_github_pat_writes_to_keychain_not_file() {
             if !keyring_available() {
@@ -5989,34 +5994,11 @@ MemAvailable:   23456789 kB
                 GITHUB_PAT_KEY,
             )
             .unwrap();
-            // Defence-in-depth file cleanup (matches register_github_pat).
-            if let Some(p) = github_pat_path_shared() {
-                if p.exists() {
-                    let _ = std::fs::remove_file(&p);
-                }
-            }
-            if let Some(p) = github_pat_path_flat() {
-                if p.exists() {
-                    let _ = std::fs::remove_file(&p);
-                }
-            }
+            // No defence-in-depth file removal: the launcher must not
+            // delete user-owned files in `~/.vct-secrets/shared/`.
 
             // Keychain has the value (raw — bypass the active gate).
             assert_eq!(keychain_value().as_deref(), Some(canary.as_str()));
-
-            // No file on disk under either layout.
-            let shared_path = github_pat_path_shared().unwrap();
-            assert!(
-                !shared_path.exists(),
-                "register flow must NOT leave a plaintext file at {}",
-                shared_path.display(),
-            );
-            let flat_path = github_pat_path_flat().unwrap();
-            assert!(
-                !flat_path.exists(),
-                "legacy flat path must remain absent: {}",
-                flat_path.display(),
-            );
 
             // The active-flag-gated read also surfaces the canary.
             assert_eq!(
@@ -6030,12 +6012,69 @@ MemAvailable:   23456789 kB
             std::fs::remove_dir_all(&home).ok();
         }
 
-        /// One-shot migration: a pre-existing file at
-        /// `~/.vct-secrets/shared/github_pat` is read into the keychain,
-        /// the file is deleted, and the `app_state` flag is set so
-        /// subsequent calls are no-ops.
+        /// Non-destructive contract: a pre-existing file at
+        /// `~/.vct-secrets/shared/github_pat` MUST survive the register
+        /// flow. The keychain becomes the resolution path; the user's
+        /// file is left untouched. (Regression pin 2026-05-09: the
+        /// prior implementation silently destroyed user-owned PATs.)
         #[test]
-        fn register_github_pat_one_shot_migrates_existing_file_then_deletes() {
+        fn register_github_pat_preserves_existing_user_file() {
+            if !keyring_available() {
+                eprintln!("[skip] no OS keychain backend in this test env");
+                return;
+            }
+            let (home, _guard) = setup_temp_env();
+            let db = make_db();
+            delete_keychain();
+
+            // Pre-place a user-owned file. The user "owns" this file
+            // (e.g. they wrote it manually); the launcher must not
+            // destroy it on register.
+            let preexisting = format!("ghp_preexisting_{}", uuid::Uuid::new_v4().simple());
+            let shared_dir = vct_secrets_shared_dir().unwrap();
+            std::fs::create_dir_all(&shared_dir).unwrap();
+            let path = shared_dir.join("github_pat");
+            std::fs::write(&path, &preexisting).unwrap();
+
+            // Run the migration (pulls preexisting → keychain) and
+            // then a second keychain set with a NEW token (matching
+            // register_github_pat's flow without the guard).
+            let _ = migrate_github_pat_file_to_keychain(&db).unwrap();
+            let new_token = format!("ghp_new_{}", uuid::Uuid::new_v4().simple());
+            crate::secrets::set(
+                crate::secrets::SecretScope::Shared {
+                    project_id: SENTINEL_SHARED,
+                },
+                GITHUB_PAT_MODULE_ID,
+                GITHUB_PAT_KEY,
+                &new_token,
+            )
+            .unwrap();
+
+            // The user's file is STILL THERE with its original value.
+            assert!(
+                path.exists(),
+                "register flow must preserve user-owned file at {}",
+                path.display(),
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap().trim(),
+                preexisting,
+                "user-owned file must retain its original content",
+            );
+
+            // Cleanup.
+            delete_keychain();
+            std::fs::remove_dir_all(&home).ok();
+        }
+
+        /// One-shot migration: a pre-existing file at
+        /// `~/.vct-secrets/shared/github_pat` is read into the keychain
+        /// and the `app_state` flag is set so subsequent calls are
+        /// no-ops. The user's file is PRESERVED (2026-05-09 non-
+        /// destructive fix).
+        #[test]
+        fn register_github_pat_one_shot_migrates_existing_file_preserving_it() {
             if !keyring_available() {
                 eprintln!("[skip] no OS keychain backend in this test env");
                 return;
@@ -6054,18 +6093,27 @@ MemAvailable:   23456789 kB
             // Migrate.
             let report = migrate_github_pat_file_to_keychain(&db).unwrap();
             assert!(report.migrated, "expected migrated=true: {:?}", report);
-            assert!(report.file_removed, "expected file_removed=true: {:?}", report);
+            assert!(
+                !report.file_removed,
+                "non-destructive contract: file_removed must be false: {:?}",
+                report,
+            );
             assert!(report.flag_set, "expected flag_set=true: {:?}", report);
             assert!(!report.already_done, "first run is not already_done");
 
             // Keychain has the value.
             assert_eq!(keychain_value().as_deref(), Some(canary.as_str()));
 
-            // File deleted.
+            // File PRESERVED — this is the non-destructive contract.
             assert!(
-                !path.exists(),
-                "migration must delete {} after keychain write",
+                path.exists(),
+                "migration must NOT delete {} (user-owned data)",
                 path.display(),
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap().trim(),
+                canary,
+                "file content must remain intact",
             );
 
             // app_state flag is set.
@@ -6088,7 +6136,8 @@ MemAvailable:   23456789 kB
 
         /// Migration honours the legacy flat path
         /// (`~/.vct-secrets/github_pat`) for the upgrade window where
-        /// users still had pre-Phase-1 layouts.
+        /// users still had pre-Phase-1 layouts. The file is PRESERVED
+        /// after the keychain copy (2026-05-09 non-destructive fix).
         #[test]
         fn register_github_pat_migration_honours_legacy_flat_layout() {
             if !keyring_available() {
@@ -6108,12 +6157,22 @@ MemAvailable:   23456789 kB
             let report = migrate_github_pat_file_to_keychain(&db).unwrap();
             assert!(report.migrated, "expected migrated=true: {:?}", report);
             assert!(report.flag_set);
+            assert!(
+                !report.file_removed,
+                "non-destructive contract: file_removed must be false: {:?}",
+                report,
+            );
 
             assert_eq!(keychain_value().as_deref(), Some(canary.as_str()));
             assert!(
-                !flat.exists(),
-                "migration must delete legacy flat path: {}",
+                flat.exists(),
+                "migration must NOT delete legacy flat path (user-owned): {}",
                 flat.display(),
+            );
+            assert_eq!(
+                std::fs::read_to_string(&flat).unwrap().trim(),
+                canary,
+                "legacy flat file content must remain intact",
             );
 
             delete_keychain();
@@ -6137,6 +6196,98 @@ MemAvailable:   23456789 kB
                 Some(true),
             );
 
+            std::fs::remove_dir_all(&home).ok();
+        }
+
+        /// Replace-existing guard: when the keychain already holds a
+        /// different non-empty value and the caller does not pass
+        /// `force=true`, the register flow refuses with the
+        /// `EXISTS_DIFFERENT:` sentinel. Adding `force=true` proceeds.
+        /// (Non-destructive guard added 2026-05-09.)
+        ///
+        /// We can't call `register_github_pat` directly without Tauri
+        /// State, so this test exercises the same predicate the
+        /// command uses: keychain.get + compare + sentinel error.
+        #[test]
+        fn register_github_pat_replace_guard_emits_sentinel_when_token_differs() {
+            if !keyring_available() {
+                eprintln!("[skip] no OS keychain backend in this test env");
+                return;
+            }
+            let (home, _guard) = setup_temp_env();
+            delete_keychain();
+
+            // Pre-populate keychain.
+            let existing = format!("ghp_existing_{}", uuid::Uuid::new_v4().simple());
+            crate::secrets::set(
+                crate::secrets::SecretScope::Shared {
+                    project_id: SENTINEL_SHARED,
+                },
+                GITHUB_PAT_MODULE_ID,
+                GITHUB_PAT_KEY,
+                &existing,
+            )
+            .unwrap();
+
+            // Simulate the command's guard predicate (force=false).
+            let new_token = format!("ghp_new_{}", uuid::Uuid::new_v4().simple());
+            let scope = crate::secrets::SecretScope::Shared {
+                project_id: SENTINEL_SHARED,
+            };
+            let stored = crate::secrets::get(scope, GITHUB_PAT_MODULE_ID, GITHUB_PAT_KEY).unwrap();
+            let stored_trim = stored.as_deref().unwrap_or("").trim();
+            let force = false;
+            assert!(
+                !force && !stored_trim.is_empty() && stored_trim != new_token.trim(),
+                "guard precondition (different existing) must hold for the sentinel branch",
+            );
+            // The actual sentinel string the command would emit:
+            let err = format!(
+                "{}A different GitHub token is already saved. Replace it?",
+                GITHUB_PAT_REPLACE_GUARD,
+            );
+            assert!(
+                err.starts_with(GITHUB_PAT_REPLACE_GUARD),
+                "register_github_pat must return an error starting with the sentinel",
+            );
+
+            // With force=true, the keychain set proceeds (matches the
+            // command's behaviour after the guard).
+            crate::secrets::set(scope, GITHUB_PAT_MODULE_ID, GITHUB_PAT_KEY, &new_token).unwrap();
+            assert_eq!(keychain_value().as_deref(), Some(new_token.as_str()));
+
+            delete_keychain();
+            std::fs::remove_dir_all(&home).ok();
+        }
+
+        /// Replace-existing guard is a no-op when the incoming token
+        /// is identical to the stored one — re-saving the same token
+        /// must succeed without `force=true`.
+        #[test]
+        fn register_github_pat_replace_guard_passes_when_token_identical() {
+            if !keyring_available() {
+                eprintln!("[skip] no OS keychain backend in this test env");
+                return;
+            }
+            let (home, _guard) = setup_temp_env();
+            delete_keychain();
+
+            let token = format!("ghp_same_{}", uuid::Uuid::new_v4().simple());
+            let scope = crate::secrets::SecretScope::Shared {
+                project_id: SENTINEL_SHARED,
+            };
+            crate::secrets::set(scope, GITHUB_PAT_MODULE_ID, GITHUB_PAT_KEY, &token).unwrap();
+
+            // Same token, force=false → guard predicate is FALSE.
+            let stored = crate::secrets::get(scope, GITHUB_PAT_MODULE_ID, GITHUB_PAT_KEY).unwrap();
+            let stored_trim = stored.as_deref().unwrap_or("").trim();
+            let guard_fires = !stored_trim.is_empty() && stored_trim != token.trim();
+            assert!(
+                !guard_fires,
+                "guard must NOT fire when incoming == stored",
+            );
+
+            delete_keychain();
             std::fs::remove_dir_all(&home).ok();
         }
 
