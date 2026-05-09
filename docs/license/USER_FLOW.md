@@ -2,16 +2,18 @@
 
 ## Activation (first machine)
 
-1. User completes LS checkout → receives license key (UUID) by email.
+1. User completes Lemon Squeezy checkout → receives license key (UUID) by email.
 2. User pastes the key into the launcher GUI **OR** writes it to
-   `~/.vct-secrets/license_key` (`chmod 600`, plain UUID, no surrounding quotes).
+   `~/.vct-secrets/shared/license_key` (`chmod 600`, plain UUID, no
+   surrounding quotes). The legacy flat path
+   `~/.vct-secrets/license_key` is still honored as a fallback.
 3. Launcher restarts the orchestrator with `VIBECODED_LICENSE_KEY` set.
 4. Validator POSTs to `validate-tier` with `{license_key, machine_id_hash}`.
 5. Edge function calls LS `licenses/activate` with `instance_name=machine_hash`.
    LS treats this as a fresh activation, increments `activation_count`.
 6. Edge function returns `{valid: true, tier: "pro", expires_at, machine_count: 1, machine_limit: 3}`.
 7. Validator writes `~/.vibecoded/license_cache.json` and the orchestrator
-   reports tier=pro on next session start.
+   reports `tier=pro` on next session start.
 
 ## Re-activation (same machine)
 
@@ -30,18 +32,13 @@ a machine slot.
 
 ## Deactivation (free up a slot)
 
-User signs in to **vibecodedtools.it/account** (the Vercel dashboard,
-backed by Supabase). The dashboard lists all `machine_count` slots with
-their last-seen timestamp. User clicks **Deactivate** on one slot →
-dashboard calls a Supabase edge function that calls LS
+User signs in to **vibecodedtools.it/account**. The dashboard lists all
+`machine_count` slots with their last-seen timestamp. User clicks
+**Deactivate** on one slot → the dashboard calls Lemon Squeezy
 `licenses/deactivate` with the corresponding `instance_id`.
 
 After deactivation, the freed slot is available; the user can activate a
 new machine immediately.
-
-> **Note**: this dashboard route is owned by the launcher branch
-> (`launcher/`) and the Vercel-hosted `vibecodedtools` project. It is not
-> part of this repo.
 
 ## Transfer (move Pro to a new machine)
 
