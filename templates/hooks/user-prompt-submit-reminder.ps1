@@ -9,27 +9,38 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
 
-# Hook input contract (v2.1.x): JSON on stdin, NOT $CLAUDE_TOOL_NAME env var.
-# Drain stdin (best-effort) so it doesn't block any caller. UserPromptSubmit
-# hooks don't see tool_name in the payload either, so per-tool accounting is
-# moot under v2.1.x — kept as a defensive default in case a future runtime
-# ever populates the env var. Today $env:CLAUDE_TOOL_NAME is always empty.
-# Verified empirically 2026-05-08 via stdin-capture diagnostic.
+# Hook input contract (v2.1.x): JSON on stdin, NOT $env:CLAUDE_TOOL_NAME or
+# $env:CLAUDE_SESSION_ID env vars. Drain stdin once and parse session_id
+# from the JSON payload — session_id is the canonical per-conversation key.
+# Falling back to "default" only on malformed JSON keeps concurrent
+# Claude Code sessions on the same project from sharing state files
+# (PR #176 cross-OS sweep — see knowledge/concepts/
+# hook-session-id-stdin-pattern.md).
+# UserPromptSubmit hooks don't see tool_name in the payload either, so
+# per-tool accounting is moot under v2.1.x — kept as a defensive default
+# in case a future runtime ever populates the env var. Today
+# $env:CLAUDE_TOOL_NAME is always empty. Verified empirically 2026-05-08
+# via stdin-capture diagnostic.
 $HookStdin = ""
 try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
 $ToolNameFromStdin = ""
+$SessionId = ""
 try {
     $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
-    if ($payload -and $payload.tool_name) { $ToolNameFromStdin = [string]$payload.tool_name }
+    if ($payload) {
+        if ($payload.tool_name)  { $ToolNameFromStdin = [string]$payload.tool_name }
+        if ($payload.session_id) { $SessionId = [string]$payload.session_id }
+    }
 } catch {
-    # Empty/malformed stdin — fall through
+    # Empty/malformed stdin — fall through to defaults
 }
+if (-not $SessionId) { $SessionId = "default" }
 
 $ProjectDir = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
 $ProjectName = Split-Path $ProjectDir -Leaf
 $ContextFile = Join-Path $ProjectDir ".claude/CONTEXT_STATE.md"
 $Tmp = if ($env:TMPDIR) { $env:TMPDIR } elseif ($env:TEMP) { $env:TEMP } else { "C:\Windows\Temp" }
-$SessionLog = Join-Path $Tmp "claude-session-$ProjectName"
+$SessionLog = Join-Path $Tmp "claude-session-$ProjectName-$SessionId"
 
 if (-not (Test-Path $SessionLog)) {
     Set-Content -Path $SessionLog -Value "0" -Encoding ascii
@@ -55,7 +66,7 @@ if ($WordsThisTurn -gt 0) {
 }
 
 if ($TotalWords -ge 200000) {
-    $Marker = Join-Path $Tmp "claude-ctx-warn-$ProjectName"
+    $Marker = Join-Path $Tmp "claude-ctx-warn-$ProjectName-$SessionId"
     if (Test-Path $Marker) { exit 0 }
     Write-Output ""
     Write-Output "Session checkpoint (~300K tokens used)"
@@ -67,14 +78,38 @@ if ($TotalWords -ge 200000) {
     exit 0
 }
 
-# Also check CONTEXT_STATE.md staleness (every ~40K words)
-if (($TotalWords % 40000) -lt 1500 -and (Test-Path $ContextFile)) {
-    $Modified = (Get-Item $ContextFile).LastWriteTime
-    $AgeMin = [int]([math]::Floor(((Get-Date) - $Modified).TotalMinutes))
-    if ($AgeMin -gt 30) {
-        Write-Output ""
-        Write-Output "Update CONTEXT_STATE.md (last update: ${AgeMin}min ago)"
-        Write-Output ""
+# CONTEXT_STATE staleness — counter-based, one-shot per ~120K-word window
+# since the LAST nudge or last actual edit (whichever is more recent).
+#
+# Replaces the prior time-based 30-min staleness check that fired 4-5x
+# during long deep-work sessions. The new condition is "enough work has
+# accumulated that a CONTEXT_STATE refresh is genuinely useful," not
+# "the file is old."
+#
+# The staleness marker file is keyed by both ProjectName and SessionId
+# so concurrent Claude Code sessions on the same project don't stomp on
+# each other's counter (the same concurrency fix as PR #176 applied to
+# 11 other hooks — see knowledge/concepts/hook-session-id-stdin-pattern.md).
+$StalenessMarker = Join-Path $Tmp "claude-ctx-staleness-$ProjectName-$SessionId"
+$LastFireWords = 0
+if (Test-Path $StalenessMarker) {
+    try { $LastFireWords = [int](Get-Content $StalenessMarker -Raw -ErrorAction Stop).Trim() } catch { $LastFireWords = 0 }
+    if (Test-Path $ContextFile) {
+        $CtxMtime = (Get-Item $ContextFile -ErrorAction SilentlyContinue).LastWriteTime.ToFileTime()
+        $MarkerMtime = (Get-Item $StalenessMarker -ErrorAction SilentlyContinue).LastWriteTime.ToFileTime()
+        if ($CtxMtime -gt $MarkerMtime) {
+            Set-Content -Path $StalenessMarker -Value $TotalWords -Encoding ascii
+            $LastFireWords = $TotalWords
+        }
     }
+}
+$Delta = $TotalWords - $LastFireWords
+if ($Delta -ge 120000) {
+    Write-Output ""
+    Write-Output "~${Delta} words of work since last CONTEXT_STATE update."
+    Write-Output "   Append a 1-2 line progress note now (what shipped + what's next),"
+    Write-Output "   before context grows further or /compact lands."
+    Write-Output ""
+    Set-Content -Path $StalenessMarker -Value $TotalWords -Encoding ascii
 }
 exit 0
