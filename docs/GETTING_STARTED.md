@@ -248,6 +248,42 @@ This extracts `CodeModule`, `CodeClass`, `CodeFunction`, `CodeAPI`, and `CodeInt
 .claude/scripts/code-graph-query search "auth middleware"
 ```
 
+## Pre-installed assumptions
+
+The installer fails clearly (no auto-install path) if any of these are missing — most desktop OSes have them by default, but minimal images (Alpine, NixOS minimal, stripped-down WSL distros) may not.
+
+- **`bash`** (Linux / macOS) or **`cmd.exe`** + **`PowerShell 5.1+`** (Windows) — POSIX / Windows guarantees
+- **`curl` OR `wget`** — needed for downloading the Joern installer and (when not bundled) the launcher binary from GitHub Releases. macOS always has `curl`; Linux Alpine / NixOS minimal may have neither and need `apk add curl` / `nix-env -iA curl` first
+- **`hdiutil`** (macOS only, for mounting `.dmg`) — ships with macOS
+- **`pkexec`** (Linux only, for graphical sudo prompts during Podman / apt installs) — present on most desktop distros, missing on minimal server images
+
+## Recommended companions
+
+Tools the installer detects and integrates with when present, but doesn't require:
+
+### lean-ctx — CLI output compression
+
+[lean-ctx](https://github.com/yvgude/lean-ctx) (MIT license, zero telemetry) wraps common CLI commands (`git`, `npm`, `pip`, `grep`, `ls`, etc.) and compresses their output by 90–97% by stripping boilerplate, progress bars, and redundant lines. This translates directly to:
+
+- shorter Claude context windows
+- lower token costs per session
+- faster response time on commands that produce verbose output
+
+The orchestrator's installer detects lean-ctx automatically and wires it into Claude Code's non-interactive Bash subprocesses via `BASH_ENV`. If you install it after the orchestrator, re-run `install.py` to activate.
+
+Install:
+```bash
+cargo install lean-ctx
+# or
+curl -fsSL https://leanctx.com/install.sh | sh
+```
+
+Skip with `--no-lean-ctx` if you don't want the auto-detection prompt.
+
+### Joern — control-flow + program-dependence metrics
+
+[Joern](https://docs.joern.io/installation/) is a ~600 MB JVM-based code property graph tool. When installed, the orchestrator's code-graph analyzer can populate CFG (control-flow graph) and PDG (program-dependence graph) metrics on indexed functions. Skip with `--no-joern` if you don't need those metrics.
+
 ## Common next steps
 
 - Read [docs/CONFIGURATION.md](CONFIGURATION.md) to understand where each config file lives and why

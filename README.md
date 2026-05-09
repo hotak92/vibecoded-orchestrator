@@ -1,480 +1,251 @@
-# VibeCoded Tools — Orchestrator
+# VibeCoded Orchestrator
 
 [![CI](https://img.shields.io/github/actions/workflow/status/hotak92/vibecoded-orchestrator/ci.yml?branch=main&label=CI)](https://github.com/hotak92/vibecoded-orchestrator/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/hotak92/vibecoded-orchestrator)](https://github.com/hotak92/vibecoded-orchestrator/releases)
 [![License: AGPL-3.0](https://img.shields.io/github/license/hotak92/vibecoded-orchestrator)](LICENSE)
 [![Stability: alpha](https://img.shields.io/badge/stability-alpha-orange)](KNOWN_ISSUES.md)
 
-**VibeCoded Orchestrator (VCO)** — persistent memory, code-graph search, and workflow automation for [Claude Code](https://claude.ai/code).
+A local knowledge graph and code graph for [Claude Code](https://claude.ai/code), so it stops forgetting your project between sessions.
 
-> **Stability**: alpha (v0.2.x). Validated end-to-end on Linux + Windows; macOS Tier-2. Expect rough edges; please report them via Issues.
+> **Status**: alpha (v0.2.x). Validated end-to-end on Linux + Windows; macOS is Tier-2 (script-ready, no signed binary). Bugs and rough edges expected — please file Issues. License: AGPL-3.0. Runs entirely on your machine.
 
-Open source. Runs locally. Learns from how you work.
+<!-- DEMO_PLACEHOLDER
+Drop a 30–60s GIF or MP4 here showing:
+  Session 1: edit a file, make a decision in chat, exit.
+  Session 2: open Claude Code, ask a question that requires recalling
+             session 1's decision — Claude answers correctly, references
+             the file, no re-explanation needed.
+Caption: "Session 2 picks up where session 1 left off — no manual context dump."
+-->
 
-## Who this is for
+## What it actually does
 
-If you use **VS Code (or any IDE) with [Claude Code](https://claude.ai/code)** as your AI coding assistant, this is for you. The orchestrator runs **entirely in the background** — it indexes your knowledge, your codebase, your tool calls, and feeds Claude richer context every time you talk to it. **Your workflow doesn't change.** You keep writing prompts in Claude Code exactly the same way; Claude just gets persistent memory and code-aware retrieval automatically.
+Three concrete pains everyone using Claude Code hits, and what VCO does about each:
 
-Concretely: hooks fire when you edit files, search runs in the background, embeddings sync to a local Weaviate, agents and skills become available to Claude — and you never have to think about any of it. Open VS Code, talk to Claude, ship code. The orchestrator does its job out of sight.
+| Pain | What VCO does |
+|------|---------------|
+| Claude has no memory between sessions — you re-explain the project every time | A persistent **Knowledge Graph** (markdown nodes + Weaviate vector index) that hooks read on session start and inject into the context window |
+| Claude can't see your codebase structure — it greps blind, misses callers, re-reads the same files | A **Code Graph** built from Tree-sitter AST: modules, classes, functions, APIs, and cross-service calls, queryable by purpose ("find auth middleware") not just name |
+| You set up the same `.claude/` config and hooks in every new project | An installer that drops 23 automation hooks + 28 skills + 29 agents into `.claude/`, wires the MCP servers, and stays out of your way |
 
-If you don't use Claude Code: the KG / code graph / MCPs / launcher GUI still all work standalone, but you'll get the most value when there's an AI client driving them. See the [Optional](#requirements) section.
+You don't change how you use Claude Code. The orchestrator runs in the background through hooks. Open VS Code, talk to Claude, ship code.
 
-> **Requirements at a glance**
-> - **Python 3.11 or newer** (3.12 recommended; 3.13 also supported)
-> - **Docker** or **Podman**
-> - **Node.js 18+** with `npm` (only when building the launcher GUI from source — not needed if using the bundled prebuilt binary)
-> - **A Claude subscription** (Pro / Max / Team / Enterprise). Required to actually use Claude as your AI coding client — the orchestrator's whole reason to exist is to feed it context. Free Anthropic accounts work for browsing docs but won't authenticate Claude Code.
-> - *(recommended)* **A Claude Code client** — the primary target is **VS Code with the [Claude Code extension](https://docs.anthropic.com/en/docs/claude-code/ide-integrations)**. VCO works with any Claude Code client that reads the project's `.claude/` folder. The standalone `claude` CLI (`@anthropic-ai/claude-code` from npm) is optional — VCO uses it to summarize new KG nodes when present, and falls back to a local Ollama model otherwise.
->
-> The `first-install.*` entry points detect and (when missing) auto-install
-> the dependencies above plus a few build-time/optional tools: `pnpm` (via
-> `npm`), Tauri's Linux build deps (`libwebkit2gtk-4.1-dev`, `libgtk-3-dev`,
-> `libayatana-appindicator3-dev`, `librsvg2-dev`, `libsoup-3.0-dev`,
-> `libjavascriptcoregtk-4.1-dev`, plus `build-essential curl wget file` —
-> apt only; other distros get a manual-install hint), the Claude Code CLI,
-> and optionally [Joern](https://docs.joern.io/installation/) (~600 MB
-> JVM-based, code-graph CFG/PDG metrics) and [lean-ctx](https://github.com/yvgude/lean-ctx)
-> (~95% Claude API token savings). Install ladder: silent with `--yes` →
-> interactive prompt → URL fallback. See [Prerequisites](#requirements)
-> below.
+## Install (≈5 min + first-run downloads)
 
----
+> **Primary install guide**: [vibecodedtools.com/quickstart](https://www.vibecodedtools.com/quickstart) — same content, more readable, kept in sync with releases.
 
-## Quick start (recommended)
+After cloning, run the entry point for your OS:
 
-Download the latest archive for your OS from
-[Releases](https://github.com/hotak92/vibecoded-orchestrator/releases):
+| OS            | Install (one-time)                                         | Start launcher                                       |
+|---------------|------------------------------------------------------------|------------------------------------------------------|
+| **Linux**     | `bash first-install.sh` or double-click `first-install.desktop` | `bash start-launcher.sh` or `start-launcher.desktop` |
+| **macOS**     | Double-click `first-install.command` (or `bash first-install.sh`) | Double-click `start-launcher.command`                |
+| **Windows**   | Double-click `first-install.bat` (or `.\first-install.bat` from a terminal — the leading `.\` is required in cmd/PowerShell) | Double-click `start-launcher.bat` |
 
-- Linux x64: `vibecoded-orchestrator-0.2.0-linux-x64.tar.gz`
-- macOS arm64: `vibecoded-orchestrator-0.2.0-macos-arm64.tar.gz`
-- Windows x64: `vibecoded-orchestrator-0.2.0-windows-x64.zip`
-
-Extract, then double-click `first-install.{sh,command,desktop,bat}` for
-your platform. The installer will:
-- Detect or auto-install Python 3.11+ (asks before sudo)
-- Detect or prompt for Podman/Docker
-- Set up the venv and pull container images on first run
-
-System requirements: Python 3.11+, Podman or Docker, ~2GB free disk.
-The first-install script handles the Python auto-install via your
-platform's package manager (apt/dnf/pacman/brew on Linux/macOS;
-winget on Windows). It does NOT install Podman/Docker — you'll be
-prompted to install one before the launcher runs.
-
----
-
-## Quick start (developers / contributors — clone)
-
-After cloning the repo, run the install entry point for your OS, then double-click the launcher entry point:
-
-| OS | Install (one-time) | Start the launcher |
-|---|---|---|
-| **Linux** | `bash first-install.sh` (or double-click `first-install.desktop`) | `bash start-launcher.sh` (or `start-launcher.desktop`) |
-| **macOS** | Double-click `first-install.command` (or `bash first-install.sh`) | Double-click `start-launcher.command` |
-| **Windows** | Double-click `first-install.bat`, **or** from a terminal: `.\first-install.bat` | Double-click `start-launcher.bat`, **or** `.\start-launcher.bat` |
-
-> **Windows terminal note**: cmd.exe and PowerShell don't put the current directory on `PATH` by default, so plain `first-install.bat` fails with "not recognized". Use `.\first-install.bat` (with the leading `.\`) when running from a terminal.
-
-The launcher binary is checked at startup for an embedded SvelteKit frontend; broken builds are skipped with a clear `rebuild with scripts/build-bundled-launcher.sh` hint instead of opening to a blank "Could not connect to localhost" page.
-
-If the GUI fails to open or shows an empty window, see [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) and [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
-
----
-
-## Quick Start (zero-dependency click-to-install)
-
-Brand-new machine, no Python, no Node, no container runtime? Two ways to start:
-
-> **Platform support**: Linux + Windows are both **validated** end-to-end on real
-> machines (install + launcher build + first project create + tab navigation). macOS is
-> **experimental Tier-2** — script-ready but no bundled binary yet (build from source on
-> macOS works with the existing scripts). On macOS expect to run `xattr -dr com.apple.quarantine .`
-> after extracting a downloaded zip, and to install Homebrew + Python 3.11+ before the
-> installer proceeds. See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for the full list of platform caveats.
->
-> If `bash first-install.sh` fails partway through, paste the prompt from
-> [`docs/INSTALL_RECOVERY.md`](docs/INSTALL_RECOVERY.md) into Claude Code — it walks Claude
-> through diagnosing the failure and finishing the build.
-
-### A. One-liner from a terminal (Linux / macOS)
-
-From the directory you want to install into:
-
+One-liner (Linux / macOS):
 ```bash
 git clone https://github.com/hotak92/vibecoded-orchestrator.git && cd vibecoded-orchestrator && bash first-install.sh
 ```
 
-(macOS: same command works in Terminal. Or after cloning, double-click `first-install.command` from Finder — see B.)
+The installer auto-handles Python, the container runtime (Podman or Docker), GPU detection, and the launcher binary. Allow ~5–10 min plus first-run image downloads (~5 GB: Weaviate + Ollama qwen3 weights, +2.5 GB if GPU mode pulls CodeSage-Large-v2).
 
-### B. Double-click
+If anything fails partway through, paste [`docs/INSTALL_RECOVERY.md`](docs/INSTALL_RECOVERY.md) into Claude Code — it walks Claude through diagnosing and finishing the build.
 
-After cloning or downloading a [Release](https://github.com/hotak92/vibecoded-orchestrator/releases), open the repo folder and double-click the file for your OS:
+## Who this is for
 
-| OS | Install file | Launcher file |
-|---|---|---|
-| **Linux** | `first-install.desktop` (or `first-install.sh` from a terminal) | `start-launcher.desktop` (or `start-launcher.sh`) |
-| **macOS** | `first-install.command` | `start-launcher.command` |
-| **Windows** | `first-install.bat` | `start-launcher.bat` |
+If you use **VS Code (or any IDE) with [Claude Code](https://claude.ai/code)**, this is for you. The orchestrator runs entirely in the background — it indexes your knowledge, your codebase, your tool calls, and feeds Claude richer context every time you talk to it. **Your workflow doesn't change.**
 
-The installer auto-handles Python, the container runtime (Podman/Docker), GPU detection, and the launcher binary — interactive prompts only when needed. Allow ~5–10 minutes plus first-run image downloads (~5 GB).
-
-After install: double-click `start-launcher.<ext>` for your OS to start the launcher GUI.
-
-> **Linux note**: Some file managers require enabling "Run executable text files on activation" before `.sh`/`.desktop` files become double-clickable (GNOME Files → Preferences → Behavior). The `.desktop` variants are the most reliable double-click target across DEs (GNOME, KDE, XFCE, Cinnamon).
-
-> **Prefer the CLI?** See [Quick Install](#quick-install) below.
+If you don't use Claude Code: the KG, code graph, MCP servers, and launcher GUI all work standalone, but the value is highest when there's an AI client driving them. See [Compatibility](#compatibility).
 
 ---
 
-## What it does
-
-An infrastructure layer for Claude Code that addresses three things no single tool covers today:
-
-| Problem | What we add |
-|---------|----------------|
-| Context amnesia between sessions | Knowledge Graph with semantic search — Claude reads it on session start |
-| Code blindness | Code graph indexes modules, classes, functions, APIs, and cross-service calls |
-| Repetitive setup and ops | 19 free agents + 28 skills installed into `.claude/`; 20 hooks for sync, secret scans, context injection. Optional MAO add-on adds 10 specialist agents. |
-
-You use Claude Code the way you already do. The orchestrator runs in the background via hooks and MCP servers.
-
 ## Features
 
-- **Knowledge Graph** — Markdown nodes with typed WikiLinks, indexed in Weaviate with semantic embeddings (qwen3 1024-dim by default; optional OpenAI)
-- **Code Graph** — AST analysis via Tree-sitter across 10+ languages: `CodeModule`, `CodeClass`, `CodeFunction`, `CodeAPI`, `CodeInteraction`
-- **20 automation hooks** — SessionStart through Stop: context injection, auto-sync on file edits, credential scans, KG/code-graph maintenance. `install.py` copies the hooks into the project's `.claude/hooks/` and merges the hook registrations into `.claude/settings.json`.
-- **5 MCP servers** — Weaviate (semantic search), Ollama (local LLM + embeddings + **vision-aware image reading via qwen3.5:9b** + document summarization via `read_document`), search (web + code + arXiv), code-embedding (CodeSage-Large-v2 via FastAPI), and Playwright (browser automation, screenshots, GUI testing via [`@playwright/mcp`](https://www.npmjs.com/package/@playwright/mcp), Microsoft, Apache-2.0). All run locally; no per-tool API keys required for the default tier. The Playwright MCP auto-installs Chromium (~150 MB) during first-install; set `VCT_SKIP_PLAYWRIGHT=1` to skip if you don't need browser automation.
-- **19 free agents + 28 skills** — shipped via `install.py` templates. The opt-in MAO add-on installs 10 more specialist agents.
-- **Workflow plumbing** — session state tracking, plans, memory management, compaction-preserving context replay
+- **Knowledge Graph** — Obsidian-style markdown nodes with typed WikiLinks, indexed in Weaviate via qwen3 embeddings (1024-dim, local). Optional OpenAI embeddings.
+- **Code Graph** — Tree-sitter AST analysis across 10+ languages, populating `CodeModule`, `CodeClass`, `CodeFunction`, `CodeAPI`, `CodeInteraction` collections. Optional Joern integration for CFG/PDG metrics.
+- **23 automation hooks** — context injection on prompt submit, KG/code-graph auto-sync on file edit, credential scans, compaction-preserving context replay, security checks. Linux/macOS use `.sh`; Windows ships native `.ps1`.
+- **5 MCP servers** — Weaviate (semantic + graph search), Ollama (local LLM, embeddings, vision via qwen3.5:9b, document summarization), search (web + GitHub code + arXiv), code-embedding (CodeSage-Large-v2 via FastAPI), and Playwright (browser automation, screenshots, GUI testing). All local; no per-tool API keys for the default tier.
+- **29 agents + 28 skills** — shipped via `install.py` templates. Agents handle planning, coding, testing, doc maintenance, KG navigation, code-graph health. Skills cover security review, debugging, architecture, RAG advisory, accessibility, etc.
+- **Workflow plumbing** — session state tracking (`CONTEXT_STATE.md`), plan files, memory management, pre-/post-compact context replay so a `/compact` doesn't lose your thread.
 
-## Downloads (Launcher GUI — v0.2.0+)
-
-The launcher GUI ships as a per-OS standalone artifact on [GitHub
-Releases](https://github.com/hotak92/vibecoded-orchestrator/releases). It's
-the path of least resistance if you'd rather not touch the CLI; the
-backend (Python + containers) is installed by the launcher's on-screen
-wizard on first run.
-
-| OS | Artifact | Notes |
-|---|---|---|
-| **Windows 10/11 (x64)** | `vct-launcher-windows-x64.exe` | Portable, no installer. **First run**: SmartScreen will warn "Windows protected your PC" because the build is unsigned. Click **More info** → **Run anyway**. Code signing is on the post-0.2.0 backlog. |
-| **Linux (x64)** | `*.AppImage` (portable) or `*.deb` (Debian/Ubuntu) | AppImage: `chmod +x VCT_Launcher_*.AppImage && ./VCT_Launcher_*.AppImage`. .deb: `sudo dpkg -i vct-launcher_*.deb`. |
-| **macOS (Apple Silicon, experimental)** | `vct-launcher-macos-arm64.dmg` | See "macOS (experimental)" below. We have no Mac to test on, so quality is best-effort. |
-
-**No GUI yet?** The CLI install path (next section) works on all three OSes.
-
-### macOS (experimental)
-
-We can't test on Mac. The .dmg is built unattended in CI. Try at your own risk.
-
-1. Download `vct-launcher-macos-arm64.dmg` from [Releases](https://github.com/hotak92/vibecoded-orchestrator/releases).
-2. Open the .dmg, drag **VCT Launcher** into Applications.
-3. **First run**: Gatekeeper will say "VCT Launcher is damaged and can't be opened". That's the unsigned-binary warning, not actual damage. Strip the quarantine attribute:
-   ```bash
-   xattr -cr /Applications/VCT\ Launcher.app
-   ```
-4. Open the app from /Applications.
-
-If it works, please open an issue saying "v0.2.0 worked on macOS [version] [arch]". That helps us prioritise Apple Developer enrollment.
-If it doesn't, please open an issue with macOS version, architecture (`uname -m`), and the error message.
-
-Apple Developer enrollment + notarization are on the post-launch backlog. Intel Mac users: build from source for v0.2.0; a Universal binary is planned for v0.3.
-
-## Quick Install
-
-**Time budget**: ~5 min interactive setup + 10–30 min initial container/model
-downloads on first run (~5 GB total — Weaviate image + Ollama qwen3 weights;
-GPU mode also pulls CodeSage-Large-v2 ~2.5 GB). Subsequent installs reuse the
-cached images and finish in seconds.
-
-### One-click entry points (clone, then double-click)
-
-After cloning the repo, the easiest way to install is to double-click the
-file matching your OS:
-
-| OS | First-time install | Start launcher (after install) |
-|---|---|---|
-| Linux | `first-install.sh` | `start-launcher.sh` |
-| macOS | `first-install.command` | `start-launcher.command` |
-| Windows | `first-install.bat` | `start-launcher.bat` |
-
-`first-install.*` carries no pre-install dependencies — it auto-installs
-Python, prompts to install Podman/Docker if neither is found, and runs the
-full setup. `start-launcher.*` runs after install completes.
-
-### Linux / macOS (terminal)
-```bash
-git clone https://github.com/hotak92/vibecoded-orchestrator.git
-cd vibecoded-orchestrator
-bash first-install.sh
-```
-
-### Windows (PowerShell)
-```powershell
-git clone https://github.com/hotak92/vibecoded-orchestrator.git
-cd vibecoded-orchestrator
-# Double-click first-install.bat, or from PowerShell:
-.\first-install.bat
-```
-
-**Windows notes**:
-- The installer and MCP servers run natively on Windows.
-- **Automation hooks ship as native PowerShell** (`.ps1`) on Windows. The installer
-  copies the OS-active flavour only — Linux/macOS get `*.sh`, Windows gets `*.ps1`.
-- **Required**: PowerShell 5.1+ (preinstalled on Windows 10/11). The installer
-  hard-fails if neither `pwsh` (PowerShell 7+) nor `powershell` (Windows
-  PowerShell 5.1) is on PATH. Older Windows: install via https://aka.ms/PSWindows.
-- **Recommended**: Git Bash (`winget install Git.Git`) as a fallback for legacy
-  helpers. The instinct-pipeline data-collection hooks are Linux-only by design
-  (marked `OS-EXEMPT-PARITY`); without Git Bash they simply don't fire on Windows.
-- PowerShell wrappers (`.ps1`) are provided for the main CLI tools: `kg-search.ps1`, `kg-sync.ps1`, `kg-info.ps1`, `code-graph-query.ps1`, `code-graph-analyze.ps1`.
-- Docker Desktop is the recommended container runtime on Windows. Podman Desktop also works.
-
-### Options
-```
-python install.py --gpu               # Enable NVIDIA GPU acceleration
-python install.py --cpu-only          # Force CPU mode
-python install.py --low-resource      # Lightest models (low-RAM/low-VRAM machines)
-python install.py --openai-key KEY    # Use OpenAI embeddings instead of local
-python install.py --no-containers     # Skip Docker/Podman (manual setup)
-python install.py --container docker  # Force Docker (default: auto-detect)
-python install.py --no-agents         # Skip installing agent templates
-python install.py --no-skills         # Skip installing skill templates
-python install.py --with-joern        # Install Joern for richer code-graph metrics (~600MB JVM)
-python install.py --no-joern          # Skip Joern detection (don't prompt)
-python install.py --skip-models       # Don't pre-pull Ollama models (do it manually later)
-python install.py --update            # Re-run on an existing install (preserves .env / settings)
-```
-
-For non-interactive / CI installs:
-```
-python install.py --quiet --no-joern --no-containers
-```
-
-<a id="requirements"></a>
-### Requirements
-
-**Required (the install will halt and ask if missing):**
-- **Python 3.11 or newer** — 3.12 is the version we develop and CI-test on; 3.13 is supported. 3.10 and older are rejected (we depend on stdlib `tomllib`, which lands in 3.11).
-- **Docker** or **Podman** (for Weaviate + Ollama containers)
-- **Node.js 18+** with `npm` — needed only for building the launcher GUI from source AND for installing Claude Code (if you want it). NOT needed if you use the bundled prebuilt at `launcher/dist/<arch>/` and don't intend to install Claude Code.
-- **A Claude subscription** (Pro, Max, Team, or Enterprise) — Claude Code authenticates against your subscription, and the orchestrator exists to feed Claude better context. Free Anthropic web accounts can browse `claude.ai` but cannot authenticate Claude Code. We don't auto-handle billing — pick a tier at https://claude.ai/upgrade before install if you don't already have one.
-
-**Recommended (improves the experience but the orchestrator works without it):**
-- **A Claude Code client** — the primary target is **VS Code with the [Claude Code extension](https://docs.anthropic.com/en/docs/claude-code/ide-integrations)**. VCO works with any Claude Code client that reads the project's `.claude/` folder (extension, Desktop app, or the standalone `claude` CLI). The standalone CLI (`npm install -g @anthropic-ai/claude-code`) is optional — VCO uses it to summarize new KG nodes when present, and falls back to a local Ollama model (sized to your hardware) otherwise. Without any Claude client at all, KG nodes still get stored (with Ollama-generated summaries) and the agents/skills/hooks stay dormant; the KG, code graph, MCPs, and launcher GUI all keep working standalone.
-
-**Auto-installed when needed (install attempts these without further prompts beyond the per-tool [Y/n]):**
-- **`pnpm`** — installed via `npm install -g pnpm` if Node is present and pnpm is missing. Falls back to plain `npm` if the global install fails.
-- **Tauri Linux build deps** (apt only) — `libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, `libayatana-appindicator3-dev`, `librsvg2-dev`, `libsoup-3.0-dev`, `libjavascriptcoregtk-4.1-dev`, `build-essential`, `curl`, `wget`, `file`. Other distros get a manual-install hint with the equivalent package names. Only needed when building the launcher from source (skipped when the bundled prebuilt is present).
-- **GPU drivers** — detected, not auto-installed. The install prints download URLs for NVIDIA / AMD / Apple Silicon paths if no driver is detected.
-
-**Optional companion tools (the install asks; default Y):**
-- **[Joern](https://docs.joern.io/installation/)** — ~600 MB JVM-based code-property-graph tool. Adds CFG (control-flow) and PDG (program-dependence) metrics to the code-graph. Skip with `--no-joern`.
-- **[lean-ctx](https://github.com/yvgude/lean-ctx)** — Rust binary that compresses CLI output by ~95%. Wires `BASH_ENV` so non-interactive subshells get the same compression. Auto-installs via Homebrew / Cargo / AUR (yay/paru) when one of those is present. Skip with `--no-lean-ctx`.
-
-**Pre-installed assumptions (the install will fail clearly if missing — no auto-install path):**
-- **`bash`** (Linux/macOS) or **`cmd.exe`** + **`PowerShell 5.1+`** (Windows) — POSIX/Windows guarantees.
-- **`curl` OR `wget`** — needed for downloading the Joern installer and (when not bundled) the launcher binary from GitHub Releases. macOS always has `curl`; Linux Alpine/NixOS minimal may have neither and need `apt install curl` first.
-- **`hdiutil`** (macOS only, for mounting `.dmg`) — ships with macOS.
-- **`pkexec`** (Linux only, for graphical sudo prompts during Podman/apt installs) — present on most desktop distros.
-
-> Already running Weaviate or Ollama? See [docs/GETTING_STARTED.md → Coexisting with other Weaviate or Ollama installs](docs/GETTING_STARTED.md#coexisting-with-other-weaviate-or-ollama-installs) — install detects existing services by content and adopts cleanly without polluting host collections.
-
-#### Installing Python 3.12
-
-`first-install.*` detects a missing or too-old Python and installs one automatically (T1 silent with `--yes`, T3 interactive prompt, T4 URL fallback). To install manually:
-
-| OS | Command |
-|---|---|
-| **Ubuntu / Debian** | `sudo apt install python3.12 python3.12-venv python3-pip` |
-| **Fedora / RHEL** | `sudo dnf install python3.12` |
-| **Arch** | `sudo pacman -S python python-pip` |
-| **macOS** (Homebrew) | `brew install python@3.12` |
-| **Windows** (winget) | `winget install Python.Python.3.12` |
-| Any | Download from <https://python.org/downloads/> |
-
-If the wrappers can't auto-install (for example, no `winget` on older Windows or no Homebrew on macOS) they fail with a manual hint and the URL above. CI / non-interactive runs (`--quiet` or `VCT_NON_INTERACTIVE=1`) never auto-install — they fail loudly so you can fix it in your CI image.
-
-### Install Troubleshooting
-
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| `ERROR: Python 3.11+ required` | System Python is older or missing `venv` | `sudo apt install python3.12 python3-venv` (Debian/Ubuntu); `brew install python@3.12` (macOS) |
-| `Failed to create venv` | `python3-venv` package not installed (Debian-family) | `sudo apt install python3-venv` and re-run |
-| `pip upgrade` fails | Network / corporate proxy / outdated CA bundle | Set `https_proxy=...` env, or upgrade your distro CA bundle |
-| `No container runtime found` | Neither podman nor docker on `PATH` | Install Podman (`sudo apt install podman` / `brew install podman`) or Docker; or pass `--no-containers` and start them manually |
-| Compose fails on Linux with podman | `podman-compose` and the `podman compose` plugin both missing | `pip install --user podman-compose` (or upgrade Podman to 4.x+ for the plugin) |
-| Ollama timeout waiting for `/api/tags` | Container started but slow to come up on first run | Wait and re-run with `--update`; check `podman logs ollama` |
-| Ollama model pull fails | No network in container, or huge model on slow link | Re-run later with `--update`; or pull manually: `curl -X POST http://localhost:11435/api/pull -d '{"name":"qwen3-embedding:0.6b"}'` |
-| `code_embed` container fails on CPU-only host | GPU profile enabled despite no NVIDIA GPU | Run with `--cpu-only` (or `--low-resource`) — these set `CODE_EMBED_BACKEND=ollama` instead |
-| Joern download/install fails | Network blocked or JDK install rejected | Skip with `--no-joern`; install separately later from https://docs.joern.io/installation/ |
-| Hooks don't fire on Windows | Hooks ship as `.ps1` on Windows; PowerShell 5.1+ required | Install/upgrade PowerShell — Windows 10/11 ships with 5.1 by default. Legacy `.sh`-only helpers (instinct pipeline) need Git Bash for full coverage. |
-| `git pull` fails with "non-fast-forward" / launcher "Update now" errors | Clone predates the 2026-05-06 21:35 UTC history rewrite (we removed internal-docs leaks via `git filter-repo`) | See [docs/RECOVERY-2026-05-06.md](docs/RECOVERY-2026-05-06.md) — choose re-clone (cleanest) or hard-reset (preserves untracked files). The launcher will surface a Resync modal in v0.2.0+; on older binaries use the doc. |
-| Existing Weaviate / Ollama on default ports | The installer detects foreign services on `8081` / `11435` / `11440` and runs ours on a free alt-port by default — no collision, no pollution. Override with `--on-conflict adopt\|abort`. See [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md#coexisting-with-other-weaviate-or-ollama-installs). | — |
-
-For deeper issues see [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
-
-### Hardware
-
-| Setup | Text Embeddings | Code Embeddings | Notes |
-|-------|----------------|-----------------|-------|
-| NVIDIA GPU (4GB+ VRAM) | qwen3-embedding via Ollama | CodeSage-Large-v2 (GPU) | Best quality |
-| CPU only | qwen3-embedding via Ollama | qwen3-embedding (fallback) | Slower, good quality |
-| OpenAI API key | text-embedding-3-small | text-embedding-3-small | Fast, requires API key |
-| Apple Silicon | qwen3-embedding (Metal) | qwen3-embedding | Ollama uses Metal natively |
-
-## Compatibility
-
-Works with all three Claude Code surfaces. The primary target is the **VS Code extension**; the Desktop app and standalone CLI are also supported. Hooks fire, agents and skills load, and MCP servers connect regardless of which surface you launch from:
-
-- **VS Code extension** (primary): Per-project env via
-  `.claude/settings.json` `env`, plus `.vscode/settings.json`'s
-  `claude-code.env` for compatibility (both auto-generated by the
-  launcher with identical values).
-- **Claude Desktop app** (macOS / Windows): Per-project env via
-  `.claude/settings.json` `env` — the only env path that reaches
-  Desktop app users. MCP servers connect via `~/.claude.json`.
-  Linux Desktop app is not yet shipped by Anthropic.
-- **Claude Code CLI** (`claude` binary, optional): Per-project env via the
-  canonical `.claude/settings.json` `env` block (auto-generated by
-  the launcher). The shell-sourceable `.claude/env` file is also
-  written for users who want to extend env via the bundled
-  `tools/claude` wrapper or direnv. VCO uses the CLI, when present,
-  to summarize new KG nodes; otherwise it falls back to a local
-  Ollama model.
-
-The launcher writes three files when it creates a project:
-`.claude/settings.json` (canonical), `.vscode/settings.json` (extension
-compat), and `.claude/env` (shell wrapper). All three carry the same
-values, so you can switch surfaces without reconfiguring.
-
-See [`docs/CLAUDE_CODE_COMPATIBILITY.md`](docs/CLAUDE_CODE_COMPATIBILITY.md)
-for the full surface matrix, known caveats, and direnv alternative.
-
-## How It Works
+## How it works
 
 ```
 You type in Claude Code
         |
         v
 [UserPromptSubmit hook]
-  -> Searches Knowledge Graph for relevant context
+  -> Searches Knowledge Graph for relevant nodes
+  -> Searches code graph for relevant entities
   -> Injects results into Claude's context window
         |
         v
-Claude generates response
+Claude generates response, edits files
         |
         v
 [PostToolUse hooks]
-  -> Auto-syncs edited files to KG / Code Graph
+  -> Auto-syncs edited knowledge / code to KG / Code Graph
   -> Scans for credential leaks
-  -> Runs security checks
+  -> Updates session state
 ```
 
-## Project Structure
+## Where this fits
+
+VCO sits on top of Claude Code rather than replacing your AI assistant. The comparison below is for buyers choosing how to spend their AI-coding attention — VCO + Claude Code, vs. an all-in-one closed product, vs. another open-source extension.
+
+| Dimension | Cursor | GitHub Copilot | Augment | Devin | OpenAI Codex CLI | Aider | Cline | **VCO + Claude Code** |
+|---|---|---|---|---|---|---|---|---|
+| Open source | No | No | Partial (some components) | No | Yes (CLI) | Yes (MIT) | Yes (Apache-2.0) | **Yes (AGPL-3.0)** |
+| Runs locally (no code in vendor cloud) | Partial (cloud Composer) | No | No | No | Partial (CLI local, API cloud) | Yes | Yes | **Yes** |
+| Persistent memory across sessions | No | Yes (Copilot Memory, repo-scoped, 28-day expiry) | Partial (team memory) | Partial (session-bound) | No | No | No | **Yes (KG, no expiry)** |
+| Code graph (AST, callers, APIs) | Partial (file index, opaque) | Partial (vector index) | Yes (Context Engine) | Yes | No | Yes (repomap) | Partial (Tree-sitter, not persisted) | **Yes (persisted graph)** |
+| Bring your own LLM subscription | Partial (chat only) | No | Partial (BYO agent, not LLM) | No | Yes (OpenAI) | Yes (75+ providers) | Yes (30+ providers) | **Yes (Claude)** |
+| User-extensible (hooks / agents / skills) | Yes (hooks + skills, no marketplace) | No | Limited (MCP only) | No | Limited (skills as prompts) | Yes (open source) | Yes (open source) | **Yes (23 hooks, 28 skills, 29 agents)** |
+| Pricing model | $20/mo SaaS | $10–20/user/mo | BYOA + cloud compute | $20/mo + usage | Per-token OpenAI | Free + your LLM | Free + your LLM | **Free + your Claude sub; €19/mo Pro** |
+| Polished v1 product (vs. alpha) | Yes | Yes | Yes | Yes | Yes | Yes | Yes | **No — alpha** |
+
+**Reading the table**: Cursor, Copilot, Augment, and Devin are closed all-in-ones — they ship the editor, the AI, the context layer, and the cloud, bundled. Aider, Cline, Continue, and Codex CLI are open-source / BYOL but lack persistent memory and (in most cases) a structural code graph. VCO is the combination that doesn't otherwise exist: open-source, local, BYO-Claude-subscription, *and* it has both persistent memory and a code graph. The trade you're making for that is product polish — VCO is alpha, the others are stable v1+.
+
+Facts current as of May 2026. Competitor products move fast — verify the row you care about before quoting.
+
+## Compatibility
+
+Works with all three Claude Code surfaces. Primary target is the **VS Code extension**; the Desktop app and standalone CLI are also supported. Hooks fire, agents and skills load, and MCP servers connect regardless of which surface you launch from.
+
+The launcher writes three config files when it creates a project — `.claude/settings.json` (canonical), `.vscode/settings.json` (extension compat), and `.claude/env` (shell wrapper) — all carrying the same values, so switching surfaces requires no reconfig.
+
+See [`docs/CLAUDE_CODE_COMPATIBILITY.md`](docs/CLAUDE_CODE_COMPATIBILITY.md) for the surface matrix and known caveats.
+
+## Downloads (Launcher GUI)
+
+The launcher GUI ships as a per-OS standalone artifact on [GitHub Releases](https://github.com/hotak92/vibecoded-orchestrator/releases).
+
+| OS                                  | Artifact                                              | Notes |
+|-------------------------------------|-------------------------------------------------------|-------|
+| **Windows 10/11 (x64)**             | `vct-launcher-windows-x64.exe`                        | Portable, no installer. Unsigned — SmartScreen → "More info" → "Run anyway" on first run. Code signing on backlog. |
+| **Linux (x64)**                     | `*.AppImage` (portable) or `*.deb`                    | AppImage: `chmod +x VCT_Launcher_*.AppImage && ./VCT_Launcher_*.AppImage`. .deb: `sudo dpkg -i vct-launcher_*.deb`. |
+| **macOS (Apple Silicon, experimental)** | `vct-launcher-macos-arm64.dmg`                    | Built unattended in CI; we have no Mac to test on. See macOS notes in [KNOWN_ISSUES.md](KNOWN_ISSUES.md). |
+
+No GUI yet? The CLI install path (above) covers all three OSes.
+
+## Requirements
+
+**Required (install halts and prompts if missing):**
+- **Python 3.11+** (3.12 is what we develop and CI-test on; 3.13 supported). 3.10 and older are rejected — we depend on stdlib `tomllib`.
+- **Docker or Podman** (for Weaviate + Ollama containers).
+- **Node.js 18+** with `npm` — only when building the launcher GUI from source AND/OR installing the Claude Code CLI. Not needed if you use the bundled prebuilt launcher and the VS Code extension.
+- **A Claude subscription** (Pro / Max / Team / Enterprise) — Claude Code authenticates against your subscription; the orchestrator exists to feed it context. Free Anthropic accounts can browse `claude.ai` but cannot authenticate Claude Code.
+
+**Recommended:**
+- **VS Code with the [Claude Code extension](https://docs.anthropic.com/en/docs/claude-code/ide-integrations)** — primary target.
+- **The standalone Claude Code CLI** (`npm install -g @anthropic-ai/claude-code`) — VCO uses it to summarize new KG nodes when present, falls back to a local Ollama model otherwise.
+
+**Auto-installed when needed:**
+- `pnpm` (via `npm install -g`, falls back to plain `npm`).
+- Tauri Linux build deps (apt only) — needed only when building the launcher from source.
+- GPU drivers — detected, not installed; the install prints download URLs if missing.
+
+**Optional companions (install asks; default Y):**
+- **[Joern](https://docs.joern.io/installation/)** — ~600 MB JVM-based code-property-graph tool. Adds CFG and PDG metrics. Skip with `--no-joern`.
+- **[lean-ctx](https://github.com/yvgude/lean-ctx)** — Rust binary, MIT, zero telemetry. Compresses CLI output by 90–97%, which translates to shorter Claude context windows and lower token costs. Auto-installs via Homebrew / Cargo / AUR when available. Skip with `--no-lean-ctx`.
+
+### Hardware
+
+| Setup                  | Text embeddings              | Code embeddings                   | Notes                              |
+|------------------------|------------------------------|-----------------------------------|------------------------------------|
+| NVIDIA GPU (4 GB+ VRAM) | qwen3-embedding via Ollama   | CodeSage-Large-v2 (GPU)           | Best quality                       |
+| CPU only               | qwen3-embedding via Ollama   | qwen3-embedding (fallback)        | Slower, still good quality         |
+| OpenAI API key         | text-embedding-3-small       | text-embedding-3-small            | Fast, requires API key             |
+| Apple Silicon          | qwen3-embedding (Metal)      | qwen3-embedding                   | Ollama uses Metal natively         |
+
+## Install options & troubleshooting
+
+The full flag list (`--gpu`, `--cpu-only`, `--low-resource`, `--openai-key`, `--update`, etc.) and the troubleshooting matrix live in:
+- [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) — install flags, first-session walkthrough, cross-project setup
+- [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — bypass-permissions, container / MCP issues, first-run problems
+
+Non-interactive / CI: `python install.py --quiet --no-joern --no-containers`
+
+## Project structure
 
 ```
 vibecoded-orchestrator/
-  .claude/
-    hooks/               # 20 automation hooks (SessionStart → Stop)
-    scripts/             # CLI tools for KG and code graph
-    settings.json        # Claude Code configuration
-  claude_mcp_servers/
-    weaviate_mcp/        # Semantic search MCP server
-    ollama_mcp/          # Local LLM inference MCP server
-    search_mcp/          # Web + code + paper search MCP server
-    code_embedding_service/   # GPU code embedding service (CodeSage-Large-v2)
-  templates/
-    agents/free/         # 29 bundled agents (all free, copied to .claude/agents/ at install time)
-    skills/              # 28 skills copied to .claude/skills/ at install time
-  infrastructure/
-    docker-compose.yml       # Weaviate + Ollama containers
-    docker-compose.gpu.yml   # NVIDIA GPU overlay
-  VCThelpers/           # License validator + telemetry (opt-in)
-  knowledge/            # Knowledge graph nodes — your persistent memory
-  vco_lib/              # Shared install/init logic (used by launcher + CLI)
-  docs/                 # Documentation
-  tools/                # Developer tooling (vct-secrets CLI, etc.)
-  CLAUDE.md             # Instructions for Claude Code when opening this repo
+├── .claude/
+│   ├── hooks/                 # 23 automation hooks (.sh + .ps1 per hook)
+│   ├── scripts/               # CLI tools for KG and code graph
+│   └── settings.json          # Claude Code configuration
+├── claude_mcp_servers/
+│   ├── weaviate_mcp/          # Semantic + graph search
+│   ├── ollama_mcp/            # Local LLM, embeddings, vision
+│   ├── search_mcp/            # Web + GitHub + arXiv
+│   └── code_embedding_service/ # CodeSage-Large-v2 via FastAPI
+├── templates/
+│   ├── agents/free/           # 29 bundled agents
+│   └── skills/                # 28 bundled skills
+├── infrastructure/
+│   ├── docker-compose.yml     # Weaviate + Ollama
+│   └── docker-compose.gpu.yml # NVIDIA overlay
+├── knowledge/                 # Knowledge graph nodes (your persistent memory)
+├── docs/                      # Documentation
+└── CLAUDE.md                  # Instructions for Claude when opening this repo
 ```
-
-## Comparison
-
-| Feature | Cursor | Copilot | Augment Code | Devin | **VibeCoded Tools** |
-|---------|--------|---------|-------------|-------|---------------------|
-| Knowledge Graph | No | No | Partial | No | **Yes** |
-| Code Graph (AST) | No | No | No | No | **Yes** |
-| RL-Scored Retrieval | No | No | No | No | **Pro** |
-| Multi-Agent Orchestration | No | No | No | Partial | **MAO** |
-| Runs 100% locally | No | No | No | No | **Yes** |
-| Open source | No | No | No | No | **Yes (AGPL-3.0)** |
 
 ## Tiers
 
-> Pricing is finalized at launch. Numbers below are the current working target, subject to change.
+The whole repository is AGPL-3.0. The codebase you see here is the Free tier — fully functional. Optional paid modules ship as separate signed binaries delivered through the launcher; their source is not in this repo.
 
-| Tier | Target price | What you get |
-|------|-------|-------------|
-| **Free** | €0 | Full orchestrator: KG, code graph, hooks, MCP servers, 19 agents, 28 skills. AGPL-3.0 licensed. |
-| **Pro** | €19/mo, €149/yr, €199 lifetime (cap 100) | Free + RL-scored retrieval reranking, curated agent packs, auto-updates |
-| **MAO** | TBD — sign up for the waitlist | Pro + 10 specialist agents + Tauri desktop UI + multi-agent maestro runtime |
-| **Enterprise** | TBD — [contact us](mailto:team@vibecodedtools.com) | MAO + SOC 2 compliance track, priority support, commercial AGPL exemption, custom SLAs |
+| Tier            | Price                | What you get                                                                                  |
+|-----------------|----------------------|-----------------------------------------------------------------------------------------------|
+| **Free**        | €0                   | Full orchestrator: KG, code graph, 23 hooks, 5 MCP servers, 29 agents, 28 skills. AGPL-3.0.   |
+| **Pro**         | €19/month            | Free + RL-scored retrieval reranking module + coordination layer (Telegram groups + shared decision/task channels). Modules ship as separate signed binaries via the launcher. Self-host the coordination DB at no extra cost, or use our hosted instance for a small additional fee. |
+| **Enterprise**  | Contact us           | Free + commercial AGPL exemption, priority support, custom SLAs. [team@vibecodedtools.com](mailto:team@vibecodedtools.com) |
 
-Pro and MAO tiers activate additional features via a license key issued at purchase, validated against our Supabase endpoint. Free tier works fully without a key — RL retrieval falls back to cosine ordering.
+Pricing finalized at module launch. The Free tier is the whole repository — no source-level dual licensing, no feature gating in the OSS code. RL retrieval falls back to cosine ordering when the Pro module isn't installed.
 
-### Telemetry
+## Telemetry
 
-**Telemetry is OPT-IN.** Nothing is sent unless you explicitly enable it during install (or later via the launcher's Settings → Telemetry panel). When opted in, we collect ONE thing only:
+**Telemetry is OPT-IN.** Nothing is sent unless you explicitly enable it during install (or later via Settings → Telemetry). When opted in, we collect ONE thing only:
 
-- **Multi-sentence-level retrieval embeddings** — the dense vectors produced by the local embedding model when it indexes your KG / code-graph chunks (~2-8 sentences per chunk), paired with which chunks were retrieved and which the user/agent actually used.
+- **Retrieval-chunk embeddings** — dense vectors (~2–8 sentences per chunk) produced by the local embedder when it indexes your KG / code graph, paired with which chunks were retrieved and which the user/agent actually used.
 
-These embeddings are used **exclusively** to refine the RL reranker — the neural model that decides which retrieved nodes are most relevant for a given query. Better signal → better re-ordering for everyone. The training pipeline is part of the open-source codebase you can inspect (`claude_mcp_servers/` + `state/rl_*`).
+These are used **exclusively** to refine the RL reranker. The training pipeline is open source (`claude_mcp_servers/` + `state/rl_*`).
 
-**What we do NOT collect (ever, even with telemetry on):**
-- Raw text content of your KG nodes, code, files, or queries
+**Never collected, even with telemetry on:**
+- Raw text of your KG nodes, code, files, or queries
 - File paths, project names, repo identifiers
 - API keys, secrets, environment variables
 - Personal info, IP, hostname, machine identifiers
-- Any payload that could reconstruct your codebase or workspace
 
-Embeddings are dense numeric vectors — they're aggregated, irreversible representations of the chunks that produced them, not the chunks themselves. We can't reconstruct the source text from the vectors we receive.
+Embeddings are aggregated, irreversible representations — we can't reconstruct the source text from the vectors we receive.
 
-**Toggle it off anytime**: Settings → Telemetry → Disable, or set `VCT_TELEMETRY=0` in `.env`. Disabling stops collection immediately; previously-collected data isn't deleted retroactively unless you email `privacy@vibecodedtools.it`.
-
-The telemetry endpoint runs on our Supabase project; payload schema is open in `claude_mcp_servers/`. AGPL applies to the collector code — you can self-host it for your own RL fine-tuning if you fork.
+**Toggle off anytime**: Settings → Telemetry → Disable, or `VCT_TELEMETRY=0` in `.env`. Disabling stops collection immediately; previously-collected data isn't deleted retroactively unless you email `privacy@vibecodedtools.it`.
 
 ## Licensing
 
-The entire repository is licensed under **[AGPL-3.0-or-later](LICENSE)**. There is no source-level dual licensing.
+Entire repository is **[AGPL-3.0-or-later](LICENSE)**. No source-level dual licensing.
 
-**Plain-language summary**:
-- Individuals and non-commercial users: use freely under AGPL.
-- Companies running this in a service or product: either open-source your modifications under AGPL, or buy a commercial license / subscription. Email team@vibecodedtools.com.
+- **Individuals and non-commercial users**: use freely under AGPL.
+- **Companies running this in a service or product**: either open-source your modifications under AGPL, or buy a commercial license / Enterprise subscription. Email [team@vibecodedtools.com](mailto:team@vibecodedtools.com).
 
-**How the commercial model works**: free source under AGPL, plus paid binaries delivered via signed-URL CDN. Pro and MAO are subscriptions distributed as pre-compiled, Ed25519-signed artifacts gated by Lemon Squeezy — subscribers receive binaries, not source. No source license applies to those artifacts because no source is published for them. The license validator and telemetry components in this repo (`VCThelpers/`) are AGPL like the rest; the trust root for paid-module access is server-side (Supabase + Lemon Squeezy + signature verification on download).
-
-## Recommended Companions
-
-**[lean-ctx](https://github.com/yvgude/lean-ctx)** — MIT license, zero telemetry. Wraps common CLI commands (`git`, `npm`, `pip`, `grep`, `ls`, etc.) and compresses their output by 90-97% by stripping boilerplate, progress bars, and redundant lines. This translates directly to shorter Claude context windows, lower token costs, and faster responses. The installer detects lean-ctx automatically and wires it into Claude Code's non-interactive Bash subprocesses via `BASH_ENV`; if you install it later, re-run `install.py` to activate. Install: `cargo install lean-ctx` or `curl -fsSL https://leanctx.com/install.sh | sh`.
+**Commercial-module model**: free source under AGPL, plus optional paid binaries delivered via signed-URL CDN. Paid modules ship as pre-compiled, Ed25519-signed artifacts gated by Lemon Squeezy — subscribers receive binaries, not source. The license validator in this repo (`VCThelpers/`) is AGPL like the rest; the trust root for paid-module access is server-side (Supabase + Lemon Squeezy + signature verification on download).
 
 ## Contributing
 
-Contributions welcome — small fixes and bug reports especially. See [CONTRIBUTING.md](CONTRIBUTING.md) for the workflow and [CLA.md](CLA.md) for the Contributor License Agreement (accepted via `git commit -s`).
+Small fixes and bug reports especially welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for workflow and [CLA.md](CLA.md) for the Contributor License Agreement (accepted via `git commit -s`).
 
 ## Documentation
 
 - [Configuration philosophy](docs/CONFIGURATION.md) — minimal global, max per-project; where each config lives
+- [Getting started](docs/GETTING_STARTED.md) — install, first-session walkthrough, cross-project setup
 - [Troubleshooting](docs/TROUBLESHOOTING.md) — bypass-permissions, container/MCP issues, first-run problems
-- [Getting started](docs/GETTING_STARTED.md) — install, first-session walkthrough, and cross-project setup
-- [Architecture features](docs/features/) — per-area design notes (MCPs + agents, code graph, KG, RL retrieval, install flow)
+- [Claude Code compatibility](docs/CLAUDE_CODE_COMPATIBILITY.md) — surface matrix and caveats
 - [Dependency licenses](docs/DEPENDENCY_LICENSES.md) — transitive licensing audit for the AGPL-3.0 release
-- [Recovery (post-history-rewrite)](docs/RECOVERY-2026-05-06.md) — for users with pre-2026-05-06 clones
-- [Templates README](templates/README.md) — what agents and skills install.py will drop into `.claude/`
+- [Templates README](templates/README.md) — what `install.py` drops into `.claude/`
 
 ## Links
 
 - [Report Issues](https://github.com/hotak92/vibecoded-orchestrator/issues)
-- [VibeCoded Tools](https://vibecodedtools.it)
+- [vibecodedtools.it](https://vibecodedtools.it)
 
 ---
 
