@@ -158,8 +158,8 @@ Three independent CI jobs (Rust / Python / Frontend), no docs-only skip. The mat
 ### Rust job: cargo test --lib
 Runs `cargo test --lib --manifest-path launcher/src-tauri/Cargo.toml` on `ubuntu-latest`. Installs Tauri 2 Linux build deps. Full Tauri bundle builds are gated behind the release workflow.
 
-### Python job: pytest (73+ trust-critical tests)
-Runs `pytest tests/` against Python 3.12. Covers the trust-critical helpers: license validator, telemetry PII scrubbing, consent gating, install-flow detection.
+### Python job: pytest (~100 trust-critical tests)
+Runs `pytest tests/` against Python 3.12. ~99 tests across 37 files at v0.1.0. Covers the trust-critical helpers: license validator, telemetry PII scrubbing, consent gating, install-flow detection, hook KG-access propagation, install-conflict resolution.
 
 ### Frontend job: svelte-check (TypeScript type-check)
 Runs `npm run check` in the `launcher/` working directory (Node 20). No frontend runtime unit tests at v0.1.0 — acknowledged gap in `CONTRIBUTING.md`. PRs adding Playwright smoke tests are explicitly invited.

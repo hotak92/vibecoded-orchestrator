@@ -81,7 +81,7 @@ Caches the validated tier for the process lifetime in `_cached_tier`. Pass `forc
 Returns `get_tier() == "admin"`. Cached via `get_tier()`. Does not consult any env var or signing key on the client — the admin classification is made server-side (by either the Vault-token Path A or the LS-variant Path B in `validate-tier`) and the client only sees the resulting cached `tier="admin"` response.
 
 ### Machine ID hash — one-way, never raw hardware
-`_machine_id_hash()` returns `sha256(mac_address_bytes)` as a hex string. Only this hash is sent to the validation endpoint; raw MAC addresses never leave the process. Same algorithm used in telemetry.
+`_machine_id_hash()` returns `sha256(uuid.getnode().to_bytes(8, "big"))` as a hex string — i.e. the 6-byte MAC zero-padded to 8 bytes, hashed. Only this hash is sent to the validation endpoint; raw MAC addresses never leave the process. The Rust launcher mirrors the same algorithm in `commands/licensing.rs::machine_id_hash`. Same hash is used in telemetry.
 
 ### `VIBECODED_TIER=free` — dev override
 Setting this env var to `"free"` short-circuits all validation and returns `LicenseResult(tier="free", valid=True)` immediately. Values other than `"free"` are ignored (no env-var-claimed paid tiers without a validated key).
@@ -318,7 +318,7 @@ Scans staged files (or full tracked tree with `--all`) for known-leaked tokens. 
 Two entries as of v0.1.0: (1) `wh_vct_ls_2026_s3cur3k3y` — LS webhook signing secret leaked in commit 2f1cc88; (2) `ltnlwhaxnpbiifordlbk` — Supabase project ref leaked alongside it.
 
 ### Env scrubbing in hooks
-All 20 project hooks scrub `SUPABASE_KEY`, `GITHUB_TOKEN`, `OPENAI_API_KEY`, AWS credentials, `TELEGRAM_BOT_TOKEN`, etc. before spawning subprocesses. See `SECURITY.md`.
+All 23 project hooks scrub `SUPABASE_KEY`, `GITHUB_TOKEN`, `OPENAI_API_KEY`, AWS credentials, `TELEGRAM_BOT_TOKEN`, etc. before spawning subprocesses. See `SECURITY.md`.
 
 ### Supabase key rotation runbook
 Secrets rotation runbook (maintainer docs): (1) Roll key in Supabase dashboard, (2) write to `~/.vct-secrets/shared/supabase_token`, (3) `supabase secrets set`, (4) update Vercel env, (5) restart local services. Old key valid ~24 h (zero-downtime window).
