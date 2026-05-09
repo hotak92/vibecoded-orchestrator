@@ -504,18 +504,19 @@ jobs:
       # workflow artifacts via the separate upload-artifact step below
       # — useful for dry-runs).
       #
-      # Two asset classes per OS:
-      #   1. Standalone launcher binary + metadata (legacy path, kept
-      #      for users who only want the GUI without the Python stack)
-      #   2. Full release archive (vibecoded-orchestrator-X.Y.Z-<os>.tar.gz
-      #      or .zip) + .sha256 (recommended path — bundles launcher,
-      #      vct-cli, MCP servers, templates, hooks, installers)
+      # One asset class per OS: the full release archive plus its
+      # .sha256 sidecar. The archive bundles the launcher, vct-cli,
+      # MCP servers, templates, hooks, and install scripts — i.e. the
+      # standalone launcher binary is included inside the archive, so
+      # we no longer publish it as a separate Release asset (avoids a
+      # confusing 12-asset list per release; the launcher binary +
+      # metadata.json are still produced and kept as workflow artifacts
+      # for QA, see the Upload-as-workflow-artifact steps below).
       - name: Upload to GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v3
         with:
           files: |
-            launcher/dist/${{ matrix.target }}/_release/*
             dist/${{ steps.archive_meta.outputs.archive_name }}
             dist/${{ steps.archive_meta.outputs.archive_name }}.sha256
 
