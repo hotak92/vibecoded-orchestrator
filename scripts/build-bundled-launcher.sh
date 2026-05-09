@@ -20,7 +20,7 @@
 #   - Node + pnpm (or npm)
 #   - Rust toolchain (cargo)
 #   - Linux only: libwebkit2gtk-4.1-dev + the rest of the Tauri Linux
-#     build deps. See docs/RELEASING.md.
+#     build deps. See internal/RELEASING.md.
 
 set -euo pipefail
 
@@ -340,7 +340,7 @@ if [ "$BUILD_ALL" -eq 1 ]; then
     echo
     echo "[build-bundled] --all requested but only the host arch was built."
     echo "                Cross-arch builds need either:"
-    echo "                  - GitHub Actions matrix (see docs/RELEASING.md)"
+    echo "                  - GitHub Actions matrix (see internal/RELEASING.md)"
     echo "                  - Run this script directly on each platform"
     echo "                  - Tauri's cross-build via 'cross' (advanced)"
 fi

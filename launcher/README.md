@@ -8,7 +8,7 @@ The launcher is the operator's cockpit for everything the orchestrator manages o
 
 - **Projects** — register Claude Code projects, install/update the orchestrator into each one, and switch between them. Per-project env injection writes the right `KG_COLLECTION` / `OLLAMA_URL` / etc. into `.claude/settings.json` (Claude Code), `.vscode/settings.json` (VS Code), and `.claude/env` (CLI shell). User code is never touched.
 - **Secrets** — OS-keychain-backed storage for API keys (Anthropic, OpenAI, GitHub PAT, Lemon Squeezy license, …), exposed to MCP servers as scoped env vars. No plaintext on disk.
-- **Modules** — catalog of orchestrator components and add-ons (Knowledge Graph, Code Graph, RL Reranker, MAO). Status, version, license tier, install action.
+- **Modules** — catalog of orchestrator components and add-ons (Knowledge Graph, Code Graph, RL Reranker). Status, version, license tier, install action.
 - **Knowledge Graph dashboard** — node count, recent writes, search, sync state, duplicates audit.
 - **Code Graph dashboard** — modules / classes / functions / APIs / interactions, last analysis run, re-index trigger.
 - **MCP Dashboard** — running state of `weaviate-kg`, `ollama`, `search`, `code-embedding` servers; restart / view logs.
@@ -45,7 +45,7 @@ Produces a platform-native installer (AppImage / .deb on Linux, .dmg on macOS, .
 
 ## Architecture (one paragraph)
 
-Tauri 2 desktop shell + Svelte 5 (runes) frontend talking to a Rust backend over Tauri's IPC bridge. The Rust side owns all privileged operations (subprocess spawn, settings rewrites, container compose) via `tokio::process::Command` with parameterised args (no shell injection). State is a single SQLite database at `~/.vct/launcher.db` (projects, audit log, license tier cache). Optional companion runtime: an embedded `axum` HTTP hub (default port 7700) for module-to-module RPC, gated since 0.2.0 by `Authorization: Bearer <token>` against a fresh per-startup token at `~/.vct/hub.token` (mode `0o600`). Secrets live in the OS keychain (`keyring` crate); license tiers are validated against the public alias `https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/validate-tier` with a 3-day offline grace window.
+Tauri 2 desktop shell + Svelte 5 (runes) frontend talking to a Rust backend over Tauri's IPC bridge. The Rust side owns all privileged operations (subprocess spawn, settings rewrites, container compose) via `tokio::process::Command` with parameterised args (no shell injection). State is a single SQLite database at `~/.vct/launcher.db` (projects, audit log, license tier cache). Optional companion runtime: an embedded `axum` HTTP hub (default port 7700) for module-to-module RPC, gated since 0.2.0 by `Authorization: Bearer <token>` against a fresh per-startup token at `~/.vct/hub.token` (mode `0o600`). Secrets live in the OS keychain (`keyring` crate); license tiers are validated against the canonical Supabase functions URL `https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/validate-tier` (override via `VCT_VALIDATE_TIER_URL`) with a 3-day offline grace window.
 
 ## Where to read more
 

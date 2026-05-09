@@ -155,8 +155,6 @@ binary. Both are easy to make and the symptoms are downstream:
 
 Canonical commands are in
 [`launcher/dist/README.md` § "Updating the bundled binaries"](../launcher/dist/README.md#updating-the-bundled-binaries).
-The release pre-flight in [`docs/RELEASING.md`](RELEASING.md) points
-back at it.
 
 ## 6. When to extend this policy
 

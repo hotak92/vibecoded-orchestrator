@@ -220,5 +220,5 @@ installer bundles. Reasons:
   already inside the cloned repo.
 
 The proper installer bundles are published to GitHub Releases on each tagged
-version (see [docs/RELEASING.md](../../docs/RELEASING.md)) for users who prefer
-a one-click install workflow.
+version (see [internal/RELEASING.md](../../internal/RELEASING.md)) for users
+who prefer a one-click install workflow.

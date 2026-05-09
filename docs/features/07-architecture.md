@@ -17,7 +17,7 @@ The composition contract is one-directional: Launcher writes, Orchestrator reads
 </details>
 
 ### Hub API contract (`~/.vct/hub.port`)
-The Launcher writes its IPC port to `~/.vct/hub.port`; the Orchestrator and CLI tools query `http://localhost:<port>/` for per-project module enablement status and to resolve per-project secrets without touching the keychain directly. See `docs/LAUNCHER_SUBTREE.md`.
+The Launcher writes its IPC port to `~/.vct/hub.port`; the Orchestrator and CLI tools query `http://localhost:<port>/` for per-project module enablement status and to resolve per-project secrets without touching the keychain directly.
 
 ### Launcher as git subtree (`launcher/`)
 The `launcher/` directory is a `git subtree` of `pb992/VCT-Launcher`, branch `feature/orchestrator-hub`. A single `git clone` gives contributors the full Tauri source without `--recursive`. Direct edits to `launcher/` should originate in the VCT-Launcher repo and flow in via `git subtree pull --prefix=launcher vct-launcher feature/orchestrator-hub --squash`.
@@ -172,7 +172,7 @@ CI uses `Swatinem/rust-cache@v2` scoped to `launcher/src-tauri` to avoid re-comp
 ## Release Model
 
 ### Semver with manual tagging
-Version numbers live in three places: `launcher/package.json` `version`, `launcher/src-tauri/Cargo.toml` `[package].version`, and `CHANGELOG.md` section headers. Manual tagging is a deliberate policy — automated tag-on-merge would push releases out faster than the maintainers can verify them on a clean machine, and the cost of a bad release is much higher than the cost of remembering to tag. See `docs/RELEASING.md`.
+Version numbers live in three places: `launcher/package.json` `version`, `launcher/src-tauri/Cargo.toml` `[package].version`, and `CHANGELOG.md` section headers. Tagging is manual — a tag means "this is the commit external users should pin to", and is reserved for the maintainer to do explicitly after pre-flight passes.
 
 ### CHANGELOG follows Keep a Changelog format
 Uses the [Keep a Changelog](https://keepachangelog.com/) format with `[Unreleased]` at the top. Release commit moves `[Unreleased]` entries to a `[x.y.z] — YYYY-MM-DD` section.
@@ -183,7 +183,7 @@ Branch from the most recent tag (`git checkout -b hotfix/x.y.z+1 vx.y.z`), apply
 ### Pre-release identifiers
 `0.2.0-alpha.1`, `0.2.0-beta.1`, `0.2.0-rc.1` pattern. Pre-release GitHub releases are marked as such.
 
-### Release pre-flight checklist (`docs/RELEASING.md`)
+### Release pre-flight checklist
 Seven items: CI green, local `cargo test --lib`, local `pytest tests/ -q`, local `npm run check`, smoke-test install on clean machine/VM, Ollama image pin is current in both compose files.
 
 ---
@@ -213,14 +213,11 @@ The uninstall path removes only orchestrator-managed files. User project code is
 | `docs/ARCHITECTURE.md` | High-level system architecture |
 | `docs/CONFIGURATION.md` | Configuration philosophy, per-project vs global env vars |
 | `docs/CLAUDE_CODE_COMPATIBILITY.md` | Surface matrix (hooks/agents/MCP by surface) |
-| `docs/RELEASING.md` | Release process, semver, pre-flight checklist |
 | `docs/TROUBLESHOOTING.md` | Common failure modes with causes and fixes |
 | `docs/DEPENDENCY_LICENSES.md` | Transitive dependency license audit |
 | `docs/VCT_SECRETS_PRIMITIVE.md` | vct-secrets design |
-| Secrets rotation runbook | Key rotation runbooks (maintainer docs) |
 | `docs/TELEMETRY.md` | Opt-in telemetry model |
 | `docs/ADMIN_LICENSE.md` | Admin tier architecture — both Path A (Vault-token) and Path B (LS variant) with operational runbooks |
-| `docs/LAUNCHER_SUBTREE.md` | Git subtree workflow for launcher/ |
 | `SECURITY.md` | Security posture, hardening notes, disclosure process |
 | `CLA.md` | Contributor License Agreement |
 | `CODE_OF_CONDUCT.md` | Contributor Covenant v2.1 |
