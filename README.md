@@ -7,7 +7,7 @@
 
 **VibeCoded Orchestrator (VCO)** — persistent memory, code-graph search, and workflow automation for [Claude Code](https://claude.ai/code).
 
-> **Stability**: alpha (v0.1.x). Validated end-to-end on Linux + Windows; macOS Tier-2. Expect rough edges; please report them via Issues.
+> **Stability**: alpha (v0.2.x). Validated end-to-end on Linux + Windows; macOS Tier-2. Expect rough edges; please report them via Issues.
 
 Open source. Runs locally. Learns from how you work.
 
@@ -157,7 +157,7 @@ wizard on first run.
 
 | OS | Artifact | Notes |
 |---|---|---|
-| **Windows 10/11 (x64)** | `vct-launcher-windows-x64.exe` | Portable, no installer. **First run**: SmartScreen will warn "Windows protected your PC" because the build is unsigned. Click **More info** → **Run anyway**. Code signing is on the v0.2 backlog. |
+| **Windows 10/11 (x64)** | `vct-launcher-windows-x64.exe` | Portable, no installer. **First run**: SmartScreen will warn "Windows protected your PC" because the build is unsigned. Click **More info** → **Run anyway**. Code signing is on the post-0.2.0 backlog. |
 | **Linux (x64)** | `*.AppImage` (portable) or `*.deb` (Debian/Ubuntu) | AppImage: `chmod +x VCT_Launcher_*.AppImage && ./VCT_Launcher_*.AppImage`. .deb: `sudo dpkg -i vct-launcher_*.deb`. |
 | **macOS (Apple Silicon, experimental)** | `vct-launcher-macos-arm64.dmg` | See "macOS (experimental)" below. We have no Mac to test on, so quality is best-effort. |
 

@@ -45,7 +45,7 @@ Produces a platform-native installer (AppImage / .deb on Linux, .dmg on macOS, .
 
 ## Architecture (one paragraph)
 
-Tauri 2 desktop shell + Svelte 5 (runes) frontend talking to a Rust backend over Tauri's IPC bridge. The Rust side owns all privileged operations (subprocess spawn, settings rewrites, container compose) via `tokio::process::Command` with parameterised args (no shell injection). State is a single SQLite database at `~/.vct/launcher.db` (projects, audit log, license tier cache). Optional companion runtime: an embedded `axum` HTTP hub (port 11445) for module-to-module RPC. Secrets live in the OS keychain (`keyring` crate); license tiers are validated against the public alias `https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/validate-tier` with a 3-day offline grace window.
+Tauri 2 desktop shell + Svelte 5 (runes) frontend talking to a Rust backend over Tauri's IPC bridge. The Rust side owns all privileged operations (subprocess spawn, settings rewrites, container compose) via `tokio::process::Command` with parameterised args (no shell injection). State is a single SQLite database at `~/.vct/launcher.db` (projects, audit log, license tier cache). Optional companion runtime: an embedded `axum` HTTP hub (default port 7700) for module-to-module RPC, gated since 0.2.0 by `Authorization: Bearer <token>` against a fresh per-startup token at `~/.vct/hub.token` (mode `0o600`). Secrets live in the OS keychain (`keyring` crate); license tiers are validated against the public alias `https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/validate-tier` with a 3-day offline grace window.
 
 ## Where to read more
 

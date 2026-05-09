@@ -33,16 +33,16 @@ xattr -cr /Applications/VCT\ Launcher.app
 
 Then open the app from `/Applications`. This is the standard macOS procedure for unsigned third-party software; it does not bypass Gatekeeper, it tells Gatekeeper you trust this specific app.
 
-Code signing and Apple Developer notarization are on the post-v1.0 backlog.
+Code signing and Apple Developer notarization are on the post-0.2.0 backlog.
 
 ### Windows: "Windows protected your PC" (SmartScreen)
 
-The first run of an unsigned Windows executable shows SmartScreen's blue dialog. This is expected for v0.1.0 — the build is not yet code-signed.
+The first run of an unsigned Windows executable shows SmartScreen's blue dialog. This is expected for v0.2.x — the build is not yet code-signed.
 
 1. Click **More info**.
 2. Click **Run anyway**.
 
-SmartScreen remembers the choice per binary hash; subsequent runs on the same machine open without the dialog. Code signing is on the v0.1.1 backlog.
+SmartScreen remembers the choice per binary hash; subsequent runs on the same machine open without the dialog. Code signing is on the post-0.2.0 backlog.
 
 ### Linux: `.desktop` file doesn't open on double-click
 
@@ -79,7 +79,7 @@ Resolved in commit `03eb485`. Earlier launcher builds registered projects withou
 
 Click the **Refresh** button on the affected tab if you're on a build before `03eb485` and don't want to re-clone. New registrations on current builds populate immediately.
 
-(Custom MCP servers added via `.claude/settings.json` outside the launcher's "Add MCP" flow are still skipped by the initial populate — known gap on the v0.1.x backlog. Workaround: re-add via the launcher's "Add MCP" button, or click **Refresh** on the MCP tab.)
+(Custom MCP servers added via `.claude/settings.json` outside the launcher's "Add MCP" flow are still skipped by the initial populate — known gap on the v0.2.x backlog. Workaround: re-add via the launcher's "Add MCP" button, or click **Refresh** on the MCP tab.)
 
 ### Bundled launcher binary is stale (built from a different launcher source)
 
@@ -230,6 +230,17 @@ claude mcp list
 1. **Editor opened before containers started**: restart your Claude Code session (VS Code window reload, restart the CLI, or reopen Claude Desktop) once `docker ps` / `podman ps` shows Weaviate + Ollama running.
 2. **Wrong Python in MCP config**: `MCP_PYTHON` must point at the `install.py`-created venv, not system Python — check `.vscode/settings.json` → `claude-code.env` (VS Code extension) **or** `.claude/settings.json` → `env` (CLI / Desktop app).
 3. **Embedding model mismatch**: `ACTIVE_EMBEDDING` must match a model actually loaded by Ollama. Default is `qwen3` with model `qwen3-embedding:0.6b`. Verify with `podman exec ollama_claude ollama list`.
+
+## Launcher hub returns 401 Unauthorized
+
+Symptom: a script or wrapper calling `http://127.0.0.1:7700/api/v1/...` directly gets `401 Unauthorized` with `{"error":{"code":"unauthorized",...}}`.
+
+Since 0.2.0 the launcher's hub gates every `/api/v1/*` route (except `/api/v1/health`) with `Authorization: Bearer <token>`. The token is regenerated on every launcher startup and persisted to `~/.vct/hub.token` (mode `0o600` on Unix).
+
+- **In-tree wrappers** (`claude_mcp_servers/search_mcp/wrapper.sh`, `vco` CLI, the `vct_secrets_resolve.{sh,ps1}` helpers) read the token automatically and don't need any extra config — make sure the launcher is running.
+- **Custom scripts** that talk to the hub directly need to read the token and send the header. See [docs/MIGRATION-0.2.0.md → Hub authentication](MIGRATION-0.2.0.md#hub-authentication) for the recipe.
+- **Token stale after launcher restart**: long-lived scripts that cache the token will fail with 401 after the launcher restarts. Re-read `~/.vct/hub.token` per call (or per failure-and-retry).
+- **`hub.token` missing**: the launcher hasn't started, or your `VCT_STATE_DIR` overrides the default. `cat ~/.vct/hub.token` to confirm; if empty, restart the launcher.
 
 ## Scripts in `.claude/scripts/` don't run
 

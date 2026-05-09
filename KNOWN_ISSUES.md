@@ -15,22 +15,22 @@ flagging for early adopters and the next iteration.
 
 ## Install / first-run
 
-- [ ] **macOS support is experimental for v1.0** — only minimal smoke-tested on a single Apple
+- [ ] **macOS support is experimental** — only minimal smoke-tested on a single Apple
       Silicon machine (Bash 3.2 empty-array fix landed during that test, see commit `cb3df13`).
       Known macOS-specific gotchas: Apple ships Bash 3.2 (the rest of the world uses 4.x+), Finder
       strips the exec bit on zip downloads, `.command` files need `xattr -dr com.apple.quarantine`
       after zip extraction, and Homebrew is not installed by default. The full Linux path is
       validated; the macOS path beyond `first-install.command` reaching `install.sh` is
-      not. Linux is the recommended platform for v1.0; macOS Tier-2.
+      not. Linux is the recommended platform for v0.2.x; macOS Tier-2.
 
 - [ ] **Launcher binary not yet code-signed (Windows + macOS)** — Windows shows SmartScreen "Windows
       protected your PC"; macOS Gatekeeper shows "damaged and can't be opened". Both are expected for
-      v0.1.x. Workarounds documented in [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#first-install-issues).
-      Code signing is on the v0.2 backlog.
+      v0.2.x. Workarounds documented in [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#first-install-issues).
+      Code signing is on the post-0.2.0 backlog.
 
 - [ ] **Apple Developer enrollment / notarization pending** — the macOS `.dmg` is built unattended in
-      CI without notarization. Intel Mac users must build from source for v0.1.x; a Universal binary
-      is planned for v0.2.
+      CI without notarization. Intel Mac users must build from source for v0.2.x; a Universal binary
+      is on the post-0.2.0 backlog.
 
 - [ ] **Linux .desktop double-click requires per-file-manager config** — documented in
       [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#linux-desktop-file-doesnt-open-on-double-click).
@@ -45,7 +45,7 @@ flagging for early adopters and the next iteration.
       transitive dep of `weaviate-client`, and several "No abstraction level tag" /
       "Tag 'LoRA' uses camelCase" vocabulary warnings from the bundled seed nodes in
       `knowledge/concepts/`. None affect correctness; the install completes successfully.
-      Vocabulary cleanup of seed nodes is on the v0.1.x chore backlog.
+      Vocabulary cleanup of seed nodes is on the v0.2.x chore backlog.
 
 - [ ] **First-install grew by ~150 MB for Playwright MCP** — the default-enabled
       `playwright` MCP entry pre-caches Chromium during `install.py` so the first
@@ -68,22 +68,22 @@ flagging for early adopters and the next iteration.
       handling in our launcher (`@sveltejs/adapter-static` builds to a
       static SPA — no SSR cookie path is exercised at runtime).
 
-## Pending v0.1.x
+## Pending v0.2.x
 
 - [ ] **Custom MCP tab is not populated by initial project registration** — `project_state_populate`
       mirrors `.claude/settings.json::mcpServers` into the launcher's per-project DB on `create_project_v2`,
       but doesn't flag user-added entries (anything beyond bundled `weaviate-kg` / `ollama` / `search` /
       `code-embedding`) as `is_user_added=true`. Tab reads with that filter so user-added servers show up
       blank. Workaround: re-add via the launcher's "Add MCP" button (writes the row with the correct flag),
-      or click Refresh on the MCP tab. Fix on v0.1.x backlog.
+      or click Refresh on the MCP tab. Fix on v0.2.x backlog.
 
 - [ ] **Apple Developer enrollment / notarization pending** — already in this list under Install/first-run;
-      tracked as v0.2 priority. Without notarization the macOS `.dmg` requires manual Gatekeeper override.
+      deferred from 0.2.0, tracked for a future minor release. Without notarization the macOS `.dmg` requires manual Gatekeeper override.
 
 - [ ] **Lightweight Rust wiring for `--lightweight` re-install** — the Python path is shipped (`install.py
       --lightweight` skips model pulls + seeding + agent/skill copy; `--lightweight-old-path` rewrites
       absolute paths in settings/env files). The launcher's "Reinstall" button currently calls full install;
-      wiring it to the lightweight path is a v0.1.x polish item.
+      wiring it to the lightweight path is a v0.2.x polish item.
 
 ## Recently fixed
 

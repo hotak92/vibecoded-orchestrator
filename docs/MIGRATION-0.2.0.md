@@ -553,6 +553,55 @@ the per-project access decision, and a wrapper asking for a key that
 isn't active for the project gets a clean 404 with `key_not_active`
 rather than a stale cleartext value.
 
+## Related 0.2.0 changes
+
+The 0.2.0 fork-readiness sweep also shipped three smaller-but-noticeable
+behaviour changes that complement the secrets-architecture overhaul:
+
+### Replace-existing guard on `register_github_pat`
+
+If a different PAT is already in the keychain when the OnboardingWizard
+or the `/preferences` Manage Token panel calls `register_github_pat`,
+the command no longer silently overwrites it. Instead, it returns the
+sentinel string `EXISTS_DIFFERENT:<masked-existing-prefix>` and the GUI
+surfaces a confirm dialog ("A different GitHub PAT is already registered
+— replace it?"). Adding `force=true` to the call proceeds with the
+overwrite. The `EXISTS_DIFFERENT:` sentinel is a stable contract that
+third-party callers can match against if they want their own confirm
+flow. Implementation: `commands::installer::GITHUB_PAT_REPLACE_GUARD` in
+`launcher/src-tauri/src/commands/installer.rs`.
+
+### `/preferences` → Manage Token UI
+
+The launcher gained a Manage Token panel under `/preferences` so users
+can rotate or clear the GitHub PAT outside the OnboardingWizard flow.
+The panel surfaces the masked prefix of the active PAT, a one-shot
+"Replace…" button (which routes through the replace-existing guard
+above), and a "Clear" button that calls `clear_github_pat` to strip the
+keychain entry AND `GITHUB_TOKEN` from every registered project's env
+surface (`.claude/env`, `.claude/settings.json::env`,
+`.vscode/settings.json::claude-code.env`).
+
+### Non-destructive contract on user-owned files
+
+The launcher writes only inside well-defined managed regions:
+
+- **`.claude/env`** — the launcher reads and writes only the
+  `# >>> VCO MANAGED BLOCK BEGIN >>>` … `# <<< VCO MANAGED BLOCK END <<<`
+  region. Anything outside that block — user shell exports, direnv
+  customisations, comments — is preserved across `clear_github_pat`
+  and project unregister.
+- **`~/.vct-secrets/projects/<project>/<key>`** — files written by the
+  user-facing `vct` CLI under `tools/vct-secrets/` are not touched by
+  the launcher. The CLI's storage is owned by the user.
+
+General rule: launcher-managed paths are managed; everything else is
+user-owned and the launcher will not delete it. The managed-paths
+whitelist (`orchestrator-managed-paths.txt`, parsed by both the Rust
+launcher and `install.py`) and the non-destructive subprocess audit
+guard (`test_no_destructive_subprocess_calls_in_install_path`) enforce
+this at the source level.
+
 ## Open questions deliberately deferred
 
 - **OnboardingWizard's `register_github_pat`** ~~still writes
