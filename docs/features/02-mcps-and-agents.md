@@ -1,6 +1,6 @@
 # MCP Servers & Infrastructure Scripts
 
-Five MCP servers ship with the Claude Orchestrator: semantic search (Weaviate-KG), free local inference (Ollama), web search, GPU-accelerated code embeddings, and Playwright (browser automation, registered automatically and pre-cached at install time via npx). The first four run as Python processes from `claude_mcp_servers/.venv`; Playwright runs from `npx -y @playwright/mcp@latest`. Source for the Python MCPs in `claude_mcp_servers/`; Playwright install logic in `install.py::_install_playwright_browsers`.
+Five MCP servers ship with VCO: semantic search (Weaviate-KG), free local inference (Ollama), web search, GPU-accelerated code embeddings, and Playwright (browser automation, registered automatically and pre-cached at install time via npx). The first four run as Python processes from `claude_mcp_servers/.venv`; Playwright runs from `npx -y @playwright/mcp@latest`. Source for the Python MCPs in `claude_mcp_servers/`; Playwright install logic in `install.py::_install_playwright_browsers`.
 
 For agents, skills, and hooks built on top of these MCPs → see [03-agents-skills-hooks.md](03-agents-skills-hooks.md). For the knowledge graph and code graph data layer → see [04-knowledge-and-code-graph.md](04-knowledge-and-code-graph.md).
 

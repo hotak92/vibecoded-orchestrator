@@ -3,16 +3,11 @@
 Telemetry is **opt-in, off by default, and never sends data without an
 explicit `VIBECODED_TELEMETRY=true` environment variable**.
 
-## v0.2.x status: pre-launch deployment
+## Endpoint configuration
 
-The upload endpoint (`https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/telemetry`) hasn't
-shipped yet. Until it's live, the uploader writes opted-in events to
-`~/.vibecoded/telemetry_pending.jsonl` instead of POSTing them. Users who
-turn telemetry on can inspect exactly what the orchestrator would have
-shipped — every line is one JSON event in the same shape as the upload body.
+The upload endpoint is configured via `VIBECODED_TELEMETRY_URL`. When unset, opted-in events are written to `~/.vibecoded/telemetry_pending.jsonl` instead of POSTed. Users who turn telemetry on can inspect exactly what the orchestrator would have shipped — every line is one JSON event in the same shape as the upload body.
 
-You can override the default by pointing the uploader at any deployed
-endpoint:
+To point the uploader at a deployed endpoint:
 
 ```bash
 export VIBECODED_TELEMETRY_URL=https://my-staging.example/telemetry
@@ -64,13 +59,6 @@ on anything other than `"true" / "1" / "yes" / "on"`.
 
 ## When the endpoint goes live
 
-Operators (us) will:
-
-1. Deploy a Supabase edge function at `https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/telemetry`.
-2. Bump `VCThelpers/telemetry/uploader.py` to point at it as the new
-   default — or leave it; the env var override path already works.
-3. Backfill any user's `telemetry_pending.jsonl` by reading the file
-   and POSTing it via a one-shot upload script (planned in `scripts/`).
-4. Document that flow here.
+Self-host: deploy your own Supabase / equivalent edge function with a compatible request shape, set `VIBECODED_TELEMETRY_URL` to its URL, and the uploader will POST events there instead of writing to the pending file.
 
 Until then telemetry stays local, on disk, and visible.

@@ -106,7 +106,7 @@ The chosen action per service is recorded in `~/.vct/services.toml` and re-read 
 
 #### Collection naming in adopt mode
 
-When install adopts an existing Weaviate, it must not pollute the host with bare top-level `KnowledgeGraph` / `Development` collections — many users run Weaviate with per-project namespacing (`ARTup_KnowledgeGraph`, `ClaudeKnowledgeGraph`, etc.). Adopt mode therefore:
+When install adopts an existing Weaviate, it must not pollute the host with bare top-level `KnowledgeGraph` / `Development` collections — many users run Weaviate with per-project namespacing (`MyProject_KnowledgeGraph`, etc.). Adopt mode therefore:
 
 1. **Derives the per-install KG name from the project basename** — installing in `~/projects/myapp/` writes to `Myapp_KnowledgeGraph` and `Myapp_Development`. Hyphens / underscores in the basename are PascalCased; pure-punctuation basenames fall back to `vct_KnowledgeGraph`.
 2. **Honors `KG_COLLECTION` / `DEVELOPMENT_COLLECTION` env vars** if set (typically via `.vscode/settings.json` `claude-code.env`) — explicit override wins over the basename derivation.

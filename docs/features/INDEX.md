@@ -6,7 +6,7 @@
 
 **VCT Launcher** — cross-platform desktop app (Tauri 2 + SvelteKit) for project management, module installs, secrets, the knowledge graph viewer, and Claude Code configuration. Writes per-project env files that the rest of the system reads at startup.
 
-**Claude Orchestrator** — a workflow engine for Claude Code: five MCP servers (semantic search, local inference, web search, code embeddings, Playwright), a Weaviate-backed knowledge graph, an AST-extracted code graph, 29 free agents, 28 skills, and 23 hooks. Gives Claude Code persistent memory, free local inference, and a place to put automation that would otherwise live in shell aliases.
+**VibeCoded Orchestrator (VCO)** — a workflow engine for Claude Code: five MCP servers (semantic search, local inference, web search, code embeddings, Playwright), a Weaviate-backed knowledge graph, an AST-extracted code graph, 29 free agents, 28 skills, and 23 hooks. Gives Claude Code persistent memory, free local inference, and a place to put automation that would otherwise live in shell aliases.
 
 **vct-secrets** — zero-dependency Bash CLI (`tools/vct-secrets/vct`) for keeping API keys and tokens out of `.env` files, git history, and shell history. Handles per-project scoping, `exec`-time injection, and an append-only audit log.
 

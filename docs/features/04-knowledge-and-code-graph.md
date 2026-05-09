@@ -80,7 +80,7 @@ The Weaviate side is intentionally simple: one main KG collection per project, p
 Main KG collection. Properties: `title`, `content`, `file_path`, `node_type`, `tags` (text array), `links` (text array, untyped WikiLinks), `typed_links` (nested objects: `{relation, target}`), `created_at`, `updated_at`, `valid_from`, `valid_until`, `status`. Named vectors: `qwen3_embed` (1024d, active default), `ollama_embed` (1024d, legacy snowflake-arctic-embed2, preserved), `openai_embed` (1536d).
 
 ### `SHARED_KG_COLLECTION` (optional)
-Second KG collection searched transparently alongside `KG_COLLECTION`. Set via env var. Used for cross-project shared knowledge when running multiple Claude Orchestrator instances.
+Second KG collection searched transparently alongside `KG_COLLECTION`. Set via env var. Used for cross-project shared knowledge when running multiple VCO instances.
 
 ### `DEVELOPMENT_COLLECTION` (project docs)
 Per-project verbose documentation collection (e.g. `ClaudeOrchestrator_development`). Set via env var. `hybrid_search` fans out to it automatically alongside the KG collections — agents don't need to specify which collection to search.
