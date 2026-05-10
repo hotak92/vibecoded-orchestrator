@@ -23,7 +23,7 @@ files relate to each other.
 | CLAUDE.md auto-load | ✓ | ✓ | ✓ |
 | Slash commands | ✓ | ✓ | ✓ |
 | Per-project env injection | `.claude/settings.json` env + `.vscode/settings.json` claude-code.env | `.claude/settings.json` env + `.claude/env` shell file | `.claude/settings.json` env |
-| Stop hooks (`notify-stop.sh` etc.) | ✗ | ✓ | ✓ |
+| Stop hooks (`notify-stop.sh` etc.) | ✓ | ✓ | ✓ |
 
 ## Per-project env files
 
@@ -89,10 +89,18 @@ ceremony, easiest to forget.
 
 ## Known caveats
 
-- **Stop-event hooks**: `Stop`, `StopFailure`, `SessionEnd` don't fire in
-  the VS Code extension as of v2.1.x — use the CLI or Desktop for any
-  Stop-event automation. The orchestrator's `notify-stop.sh` and
-  `cost-tracker.sh` are affected.
+- **Stop-event hooks** (refreshed 2026-05-11): `Stop`, `StopFailure`,
+  `SessionEnd` are documented universally per the current
+  [hooks reference](https://code.claude.com/docs/en/hooks) — no
+  VS Code carve-out. The earlier note here claimed VS Code didn't
+  fire these in v2.1.x; that claim no longer matches the official
+  docs, and the [VS Code feature-gap table](https://code.claude.com/docs/en/vs-code)
+  doesn't list hook events as missing. The orchestrator's
+  `notify-stop.sh` and `cost-tracker.sh` should fire on every
+  surface that loads `.claude/settings.json`. (Empirical probe in
+  VS Code v2.1.138+ recommended before relying on this; if the
+  hooks don't fire in practice, file via `/feedback` since docs
+  claim parity.)
 - **Backgrounded subagents**: spawning `run_in_background: true` agents
   works on all three surfaces, but the notification format differs.
 - **Effort levels**: `/effort high|max` works on all surfaces but is
