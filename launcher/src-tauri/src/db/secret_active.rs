@@ -19,10 +19,46 @@ use rusqlite::{params, Connection};
 
 use super::Db;
 
+/// Sentinel row that means "applies to every requester unless a more
+/// specific (scope, project_id, module_id, key, requester) row overrides
+/// it." Migration 009 backfills shared / global rows with this sentinel
+/// so the legacy single-row API keeps working.
+pub const REQUESTER_ANY: &str = "*";
+
+/// Default-on-new-project rule: for a given owning scope + project_id,
+/// what's the canonical requester column when the legacy single-row API
+/// is called?
+///
+/// - `shared` / `global`: `*` sentinel — one row covers all requesters.
+/// - `per_project`: literal owner project_id — only the owner sees by
+///   default; other projects need a row in `secret_grants`.
+///
+/// Used by the legacy `is_secret_active` / `mark_secret_*` /
+/// `forget_secret_active_state` functions which only reason about the
+/// canonical row. The new `*_for_requester` siblings let callers
+/// address other rows (e.g. shared secrets paused per-project).
+fn canonical_requester<'a>(scope: &str, owner_project_id: &'a str) -> &'a str {
+    match scope {
+        "shared" | "global" => REQUESTER_ANY,
+        _ => owner_project_id,
+    }
+}
+
 impl Db {
-    /// Read the active flag for a (scope, project_id, module_id, key)
-    /// tuple. Returns `true` when no row exists (default-active for any
-    /// secret that pre-existed migration 007 or was just registered).
+    // ──────────────────────────────────────────────────────────────────
+    // Legacy single-row API.
+    //
+    // These functions operate on the canonical row for a secret —
+    // `requester_project_id = canonical_requester(scope, project_id)`.
+    // They preserve the pre-migration-009 contract: one row per secret,
+    // shared with no per-requester pause discrimination. Use the
+    // `*_for_requester` siblings below for per-(secret × requester)
+    // operations.
+    // ──────────────────────────────────────────────────────────────────
+
+    /// Read the active flag for a secret on its canonical row. Returns
+    /// `true` when no row exists (default-active for any secret that
+    /// pre-existed migration 007 or was just registered).
     pub fn is_secret_active(
         &self,
         scope: &str,
@@ -30,20 +66,11 @@ impl Db {
         module_id: &str,
         key: &str,
     ) -> Result<bool, String> {
-        let guard = self.lock();
-        let row: Option<i64> = guard
-            .query_row(
-                "SELECT active FROM secret_active_state
-                  WHERE scope = ?1 AND project_id = ?2 AND module_id = ?3 AND key = ?4",
-                params![scope, project_id, module_id, key],
-                |r| r.get(0),
-            )
-            .ok();
-        Ok(row.map(|v| v != 0).unwrap_or(true))
+        let requester = canonical_requester(scope, project_id);
+        self.is_secret_active_for_requester(scope, project_id, module_id, key, requester)
     }
 
-    /// Mark a secret active. Idempotent — safe to call from `set` and
-    /// `reactivate` paths alike. Stamps `updated_at` to now.
+    /// Mark a secret active on its canonical row. Idempotent.
     pub fn mark_secret_active(
         &self,
         scope: &str,
@@ -51,24 +78,14 @@ impl Db {
         module_id: &str,
         key: &str,
     ) -> Result<(), String> {
-        let now = chrono::Utc::now().timestamp_millis();
-        let guard = self.lock();
-        guard
-            .execute(
-                "INSERT INTO secret_active_state (scope, project_id, module_id, key, active, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, 1, ?5)
-                 ON CONFLICT(scope, project_id, module_id, key)
-                 DO UPDATE SET active = 1, updated_at = excluded.updated_at",
-                params![scope, project_id, module_id, key, now],
-            )
-            .map_err(|e| format!("mark_secret_active: {}", e))?;
-        Ok(())
+        let requester = canonical_requester(scope, project_id).to_string();
+        self.mark_secret_active_for_requester(scope, project_id, module_id, key, &requester)
     }
 
-    /// Mark a secret inactive. The keychain value is NOT touched — that is
-    /// the whole point of Lifecycle B (Bug 3 fix). After this call, the
-    /// public read API (`is_secret_set`, `get_secret_preview`) MUST refuse
-    /// to surface the value.
+    /// Mark a secret inactive on its canonical row. The keychain value
+    /// is NOT touched — that is the whole point of Lifecycle B (Bug 3
+    /// fix). After this call, the public read API (`is_secret_set`,
+    /// `get_secret_preview`) MUST refuse to surface the value.
     pub fn mark_secret_inactive(
         &self,
         scope: &str,
@@ -76,22 +93,13 @@ impl Db {
         module_id: &str,
         key: &str,
     ) -> Result<(), String> {
-        let now = chrono::Utc::now().timestamp_millis();
-        let guard = self.lock();
-        guard
-            .execute(
-                "INSERT INTO secret_active_state (scope, project_id, module_id, key, active, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, 0, ?5)
-                 ON CONFLICT(scope, project_id, module_id, key)
-                 DO UPDATE SET active = 0, updated_at = excluded.updated_at",
-                params![scope, project_id, module_id, key, now],
-            )
-            .map_err(|e| format!("mark_secret_inactive: {}", e))?;
-        Ok(())
+        let requester = canonical_requester(scope, project_id).to_string();
+        self.mark_secret_inactive_for_requester(scope, project_id, module_id, key, &requester)
     }
 
-    /// Drop the active-state row entirely. Used by Remove (the entry no
-    /// longer exists, so any "active" metadata for it is stale). Idempotent.
+    /// Drop EVERY active-state row for this secret (canonical + any
+    /// per-requester opt-out rows). Used by Remove — the entry no longer
+    /// exists, so all metadata for it is stale. Idempotent.
     pub fn forget_secret_active_state(
         &self,
         scope: &str,
@@ -107,6 +115,148 @@ impl Db {
                 params![scope, project_id, module_id, key],
             )
             .map_err(|e| format!("forget_secret_active_state: {}", e))?;
+        Ok(())
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Per-(secret × requester) API (added 0.2.1, migration 009).
+    //
+    // Lookup contract:
+    //   1. Look up the literal (scope, project_id, module_id, key,
+    //      requester_project_id=requester) row first.
+    //   2. If absent, fall back to the (..., requester=`*`) row.
+    //   3. If neither row exists, default-active (matches the legacy
+    //      contract for absent rows).
+    //
+    // Write contract: each function targets exactly the literal
+    // requester row passed in. To pause a shared secret for project B
+    // while leaving it active for everyone else, call
+    // `mark_secret_inactive_for_requester(scope='shared',
+    //                                     project_id='_user_shared_',
+    //                                     module_id, key,
+    //                                     requester='B')`.
+    // The `*` row is left alone, so other projects keep seeing the
+    // secret.
+    // ──────────────────────────────────────────────────────────────────
+
+    /// Read the active flag for `(secret × requester)`. Two-step lookup:
+    /// the literal-requester row first, the `*` sentinel as fallback,
+    /// default-active when neither exists.
+    pub fn is_secret_active_for_requester(
+        &self,
+        scope: &str,
+        project_id: &str,
+        module_id: &str,
+        key: &str,
+        requester_project_id: &str,
+    ) -> Result<bool, String> {
+        let guard = self.lock();
+
+        // Step 1: literal-requester row.
+        let specific: Option<i64> = guard
+            .query_row(
+                "SELECT active FROM secret_active_state
+                  WHERE scope = ?1 AND project_id = ?2 AND module_id = ?3
+                    AND key = ?4 AND requester_project_id = ?5",
+                params![scope, project_id, module_id, key, requester_project_id],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(v) = specific {
+            return Ok(v != 0);
+        }
+
+        // Step 2: `*` sentinel fallback. Skip when the requester WAS
+        // already `*` — we'd just be re-reading the same row.
+        if requester_project_id != REQUESTER_ANY {
+            let fallback: Option<i64> = guard
+                .query_row(
+                    "SELECT active FROM secret_active_state
+                      WHERE scope = ?1 AND project_id = ?2 AND module_id = ?3
+                        AND key = ?4 AND requester_project_id = ?5",
+                    params![scope, project_id, module_id, key, REQUESTER_ANY],
+                    |r| r.get(0),
+                )
+                .ok();
+            if let Some(v) = fallback {
+                return Ok(v != 0);
+            }
+        }
+
+        // Step 3: default-active.
+        Ok(true)
+    }
+
+    /// Mark a secret active for a specific requester. Idempotent.
+    pub fn mark_secret_active_for_requester(
+        &self,
+        scope: &str,
+        project_id: &str,
+        module_id: &str,
+        key: &str,
+        requester_project_id: &str,
+    ) -> Result<(), String> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let guard = self.lock();
+        guard
+            .execute(
+                "INSERT INTO secret_active_state
+                    (scope, project_id, module_id, key, requester_project_id, active, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)
+                 ON CONFLICT(scope, project_id, module_id, key, requester_project_id)
+                 DO UPDATE SET active = 1, updated_at = excluded.updated_at",
+                params![scope, project_id, module_id, key, requester_project_id, now],
+            )
+            .map_err(|e| format!("mark_secret_active_for_requester: {}", e))?;
+        Ok(())
+    }
+
+    /// Mark a secret inactive for a specific requester. Idempotent.
+    pub fn mark_secret_inactive_for_requester(
+        &self,
+        scope: &str,
+        project_id: &str,
+        module_id: &str,
+        key: &str,
+        requester_project_id: &str,
+    ) -> Result<(), String> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let guard = self.lock();
+        guard
+            .execute(
+                "INSERT INTO secret_active_state
+                    (scope, project_id, module_id, key, requester_project_id, active, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)
+                 ON CONFLICT(scope, project_id, module_id, key, requester_project_id)
+                 DO UPDATE SET active = 0, updated_at = excluded.updated_at",
+                params![scope, project_id, module_id, key, requester_project_id, now],
+            )
+            .map_err(|e| format!("mark_secret_inactive_for_requester: {}", e))?;
+        Ok(())
+    }
+
+    /// Drop the active-state row for a single (secret × requester).
+    /// After this call the legacy fallback path takes over (the `*`
+    /// row, or default-active if no `*` row exists). Used when a
+    /// project explicitly "resets to default" its opt-out toggle for
+    /// a shared/granted secret. Idempotent.
+    pub fn forget_secret_active_state_for_requester(
+        &self,
+        scope: &str,
+        project_id: &str,
+        module_id: &str,
+        key: &str,
+        requester_project_id: &str,
+    ) -> Result<(), String> {
+        let guard = self.lock();
+        guard
+            .execute(
+                "DELETE FROM secret_active_state
+                  WHERE scope = ?1 AND project_id = ?2 AND module_id = ?3
+                    AND key = ?4 AND requester_project_id = ?5",
+                params![scope, project_id, module_id, key, requester_project_id],
+            )
+            .map_err(|e| format!("forget_secret_active_state_for_requester: {}", e))?;
         Ok(())
     }
 
@@ -795,5 +945,118 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ─── 0.2.1: per-(secret × requester) lookup tests ──────────────────
+
+    /// Default-active when neither literal nor `*` row exists. Matches
+    /// the legacy contract for absent rows.
+    #[test]
+    fn per_requester_default_active_with_no_rows() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(db
+            .is_secret_active_for_requester("shared", "_user_shared_", "u", "K", "p1")
+            .unwrap());
+    }
+
+    /// `*` sentinel row covers a project that has no specific row.
+    /// This mirrors the migration-009 backfill path for shared/global.
+    #[test]
+    fn per_requester_falls_back_to_star_sentinel() {
+        let db = Db::open_in_memory().unwrap();
+        // Pause via the canonical (`*`) row.
+        db.mark_secret_inactive("shared", "_user_shared_", "u", "K")
+            .unwrap();
+        // Any specific requester sees the paused state via fallback.
+        assert!(!db
+            .is_secret_active_for_requester("shared", "_user_shared_", "u", "K", "p1")
+            .unwrap());
+        assert!(!db
+            .is_secret_active_for_requester("shared", "_user_shared_", "u", "K", "p2")
+            .unwrap());
+    }
+
+    /// Specific row overrides the `*` sentinel. Project A active,
+    /// project B paused, on the same shared secret.
+    #[test]
+    fn per_requester_specific_overrides_star() {
+        let db = Db::open_in_memory().unwrap();
+        // Canonical row: active for everyone (this is the
+        // post-migration default for newly-set shared secrets).
+        db.mark_secret_active("shared", "_user_shared_", "u", "K")
+            .unwrap();
+        // Project B opts out.
+        db.mark_secret_inactive_for_requester("shared", "_user_shared_", "u", "K", "B")
+            .unwrap();
+        // Project A still sees it (falls through to `*`).
+        assert!(db
+            .is_secret_active_for_requester("shared", "_user_shared_", "u", "K", "A")
+            .unwrap());
+        // Project B does not.
+        assert!(!db
+            .is_secret_active_for_requester("shared", "_user_shared_", "u", "K", "B")
+            .unwrap());
+    }
+
+    /// `forget_*_for_requester` removes ONLY the specific row, leaving
+    /// the `*` sentinel intact so the requester reverts to the default.
+    #[test]
+    fn forget_for_requester_falls_back_to_star() {
+        let db = Db::open_in_memory().unwrap();
+        db.mark_secret_active("shared", "_user_shared_", "u", "K")
+            .unwrap();
+        db.mark_secret_inactive_for_requester("shared", "_user_shared_", "u", "K", "B")
+            .unwrap();
+        // Reset B's opt-out.
+        db.forget_secret_active_state_for_requester("shared", "_user_shared_", "u", "K", "B")
+            .unwrap();
+        // B now sees the secret again via `*` fallback.
+        assert!(db
+            .is_secret_active_for_requester("shared", "_user_shared_", "u", "K", "B")
+            .unwrap());
+    }
+
+    /// `forget_secret_active_state` (legacy) drops every row for a
+    /// secret — both the canonical and any per-requester opt-outs.
+    /// Used by Remove. After it returns, the secret is default-active
+    /// for everyone (no rows means default).
+    #[test]
+    fn forget_legacy_drops_all_rows_for_secret() {
+        let db = Db::open_in_memory().unwrap();
+        db.mark_secret_inactive("shared", "_user_shared_", "u", "K")
+            .unwrap();
+        db.mark_secret_inactive_for_requester("shared", "_user_shared_", "u", "K", "B")
+            .unwrap();
+        db.forget_secret_active_state("shared", "_user_shared_", "u", "K")
+            .unwrap();
+        // Everything reverts to default-active.
+        assert!(db
+            .is_secret_active_for_requester("shared", "_user_shared_", "u", "K", "A")
+            .unwrap());
+        assert!(db
+            .is_secret_active_for_requester("shared", "_user_shared_", "u", "K", "B")
+            .unwrap());
+    }
+
+    /// Per-project secret canonical row maps to the owner literally
+    /// (not `*`), so other projects see default-active on the literal-
+    /// requester lookup but the legacy API still operates on the
+    /// owner's row only.
+    #[test]
+    fn per_project_canonical_uses_owner_not_star() {
+        let db = Db::open_in_memory().unwrap();
+        // Owner pauses their own secret via legacy API.
+        db.mark_secret_inactive("per_project", "owner-A", "u", "K")
+            .unwrap();
+        // Owner's literal-requester lookup sees the pause.
+        assert!(!db
+            .is_secret_active_for_requester("per_project", "owner-A", "u", "K", "owner-A")
+            .unwrap());
+        // A different project's literal-requester lookup falls
+        // through to default-active because no `*` row exists for
+        // per-project secrets.
+        assert!(db
+            .is_secret_active_for_requester("per_project", "owner-A", "u", "K", "other-B")
+            .unwrap());
     }
 }

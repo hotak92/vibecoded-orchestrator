@@ -30,6 +30,7 @@ pub mod slug;
 pub mod change_log;
 pub mod code_graph_builds;
 pub mod secret_active;
+pub mod secret_grants;
 pub mod app_state;
 
 /// Resolve the launcher DB path: `<VCT_STATE_DIR or ~/.vct>/launcher.db`.
