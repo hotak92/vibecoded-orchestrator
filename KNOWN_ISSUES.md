@@ -62,6 +62,21 @@ flagging for early adopters and the next iteration.
 
 ## Recently fixed
 
+- **`register_github_pat` ↔ SecretsPanel write-path module_id unification** —
+  the OnboardingWizard / `/preferences` Manage Token flow wrote the PAT at
+  `vct._user_shared_.shared.installer/github_pat` while the SecretsPanel
+  "Shared (this user)" tab wrote at `vct._user_shared_.shared.user/github_pat`.
+  A user who registered via the wizard and later edited via the
+  SecretsPanel ended up with two divergent keychain rows; reads through
+  either path returned only that path's value, so the alternate row sat
+  as a stale shadow. Both writers now use `module_id="user"` (matching
+  the SecretsPanel's `UI_MODULE_BUCKET` constant); existing 0.2.0 installs
+  are migrated on next `register_github_pat` call by
+  `migrate_github_pat_installer_to_user_module_id` (audited as
+  `github_pat_module_id_migration`). Hub resolver + `github_pat_for_env`
+  fall back to the legacy slot during the upgrade window so existing
+  tokens stay reachable until the migration runs.
+
 - **`cookie@0.6.0` (CVE-2024-47764) `npm audit` flag** — SvelteKit 2.59.1 bumped
   its transitive `cookie` to ^0.7.0 ([GHSA-pxg6-pf52-xh8x](https://github.com/advisories/GHSA-pxg6-pf52-xh8x)
   patched in 0.7.0), so we added an explicit `overrides: { "cookie": "^0.7.0" }`

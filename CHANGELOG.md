@@ -7,10 +7,127 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-05-10
+
+26 commits since 0.2.0 (#172–#197). Themes: per-project secret grants
++ per-requester active gate (the headline 0.2.1 work, #187/#188),
+launcher GUI polish from the post-0.2.0 backlog (#196/#197),
+hook-contract audit findings (#190 + sweep), release-pipeline
+modernisation (uniform `.zip`, externalized local config, archive
+contents), and a substantial doc-audit pass (#180–#183).
+
+### Added
+
+- **Per-project secret grants + per-requester active gate** (#187, #188).
+  Migration 009 extends `secret_active_state` with a
+  `requester_project_id` PK column and adds a new `secret_grants`
+  table. The hub `project_env` resolver walks `list_grants_by_grantee`
+  for the consuming project and threads the project_id as the
+  per-(secret × requester) gate, so a per-project pause on a shared
+  secret takes effect even though the keychain row is shared, and a
+  per-project grant lets one project see another's secret without
+  re-entry. Five new Tauri commands surface the grants/pause UX:
+  `grant_secret`, `revoke_secret_grant_cmd`, `list_grants_for_project`,
+  `pause_secret_for_project`, `resume_secret_for_project`. Cross-
+  launcher schema-compat path probes a sibling DB's
+  `secret_active_state` for the `requester_project_id` column via
+  `PRAGMA table_info` and falls back to the legacy single-row query
+  when the sibling pre-dates migration 009.
+- **`vct-config.toml` local-machine config** (#189, #192). New
+  `LocalConfig` loaded at launcher startup from next to the binary.
+  Resolution order: env-var override → `vct-config.toml` →
+  compiled default. First externalized field is `weaviate_url` (the
+  user's local KG instance address). Product-fixed URLs (license
+  validate, GitHub repo) stay baked in. Release archive ships
+  `vct-config.toml` (renamed from `vct-config.example.toml` source)
+  alongside the binary.
+- **GUI: shared-tab key-collision badge, "Update all projects" button,
+  per-project MCP toggle UI** (#197). Three post-0.2.0 backlog items:
+  - SecretsPanel rows render a "shadowed" badge when a key is set at
+    multiple scopes (`per_project > shared > global` precedence). New
+    `list_user_secret_keys_v2` returns `is_shadowed` + `winning_scope`
+    per row.
+  - New `update_all_projects(opts)` Tauri command iterates registered
+    projects sequentially. New three-phase `UpdateAllProjectsModal`
+    Svelte component drives the UX (confirm → running → report).
+  - PermissionsTab gains an MCP-servers section above the generic
+    permissions table. New `list_project_mcp_permissions` +
+    `set_project_mcp_permission` commands. Default-enabled semantic:
+    enable=DELETE the row, disable=UPSERT explicit
+    `config.enabled=false`. Env-writer mirrors disabled state into
+    `.claude/settings.json::disabledMcpjsonServers`.
+- **Custom MCP tab now populated by initial project registration** (#196).
+  Migration 010 adds `project_mcp_servers` table, populated by a new
+  `populate_mcp_servers` step in `project_state_populate.rs` that
+  mirrors `<folder>/.claude/settings.json::mcpServers` AND
+  `<folder>/.mcp.json` into the table. `is_user_added=true` flag
+  driven by a bundled-allowlist (`weaviate-kg`, `ollama`, `search`,
+  `code-embedding`, `playwright`, `vct-coordination`). Startup
+  backfill in `lib.rs::run` re-runs the populate step for projects
+  registered before migration 010 (idempotent — preserves user
+  toggles).
+- **Lightweight Rust wiring for `--lightweight` re-install** (#196).
+  `InstallConfig` carries `lightweight: bool` and
+  `lightweight_old_path: Option<String>`; `install_orchestrator`
+  honours them by skipping the file-copy stage and invoking
+  `install.py --lightweight [--lightweight-old-path <path>]`
+  directly. The OnboardingWizard's re-install conflict modal exposes
+  a "Fast reinstall" checkbox + optional previous-path text input.
+- **Code-graph rank-tier helper extraction** (#191). New
+  `_format_code_result_by_rank` shared helper in
+  `claude_mcp_servers/weaviate_mcp/server.py`; used by both the MCP
+  `search_code_graph` path and the `.claude/scripts/query_code_graph.py`
+  CLI (which the pre-edit hook invokes). Result content is now
+  byte-identical across the two surfaces. Rank-keyed tier policy
+  preserved (top-2 = full + siblings; rank 3-4 = truncated 1200 chars;
+  rank 5+ = ref-only).
+- **Hook-contract audit fixes** (#190). Five-fix wave: (1)
+  `config-change-audit` reads stdin JSON instead of empty
+  `$CLAUDE_TOOL_NAME`/`$CLAUDE_TOOL_ARGS` env vars (audit log was
+  silently empty before); (2) `post-tool-security` routes credential
+  alerts through `hookSpecificOutput.additionalContext` so the model
+  actually sees them (was plain stdout, dropped by the PostToolUse
+  contract); (3) `post-file-edit` rewrite — pure-status banners
+  deleted, three real LLM nudges (CONTEXT_STATE expert-skill,
+  workflow-system file edits, code-edit reminder) routed through
+  `additionalContext`; (4) env-scrub + `VCT_DISABLE_HOOKS` short-
+  circuit added to three hooks that lacked them; (5) new
+  `LEAK_TEST_KEY` recognizer pattern so smoke tests use a synthetic
+  marker instead of real-looking AWS-key fixtures.
+
+### Changed
+
+- **Release archives are uniform `.zip` for all OSes** (#192).
+  Linux + macOS switch from `.tar.gz` to `.zip`; `.sha256` sidecar
+  per archive. `zip` is preinstalled on `ubuntu-latest` and
+  `macos-latest` runners; Windows continues to use `Compress-Archive`.
+- **Release pipeline ships only per-OS archives + sha256** (#175).
+  Standalone launcher binaries dropped from Release assets — they
+  now live only inside the per-OS archive. Workflow artifacts retain
+  the standalone binary for QA.
+- **Cross-OS staging via `tar+excludes` instead of `rsync`** (#172).
+  `rsync` is not preinstalled on the Windows GitHub-hosted runner;
+  switching to `tar -cf - --excludes ... | tar -xf - ...` lets the
+  same staging logic run on all three runner OSes.
+- **Release archives now ship `docs/`, root `*.md`, `CLAUDE.md`,
+  `KNOWN_ISSUES.md`, `MIGRATION-<version>.md`** (#185). Users get the
+  full doc surface on extract; previous archives shipped only
+  `BOOTSTRAP.md` + `LICENSE`. Doc-leak scrubber runs in CI before
+  upload.
+- **Mass-rename `background: true` → `async: true`** in all settings
+  files (#190, 36 occurrences). Per current docs, `async` is the
+  canonical hook-handler field; `background` was at best an
+  undocumented alias.
+- **Stale OS-EXEMPT-PARITY markers cleaned** (#191, 5 hooks). The
+  `.sh` siblings of `pre-compact-save`, `code-graph-incremental`,
+  `cost-tracker`, `kg-update-nudge`, `kg-summary-generator` had
+  parity markers that were superseded by genuine cross-OS parity
+  via `find-python.{sh,ps1}` helpers.
+
 ### Fixed
 
 - **`register_github_pat` ↔ SecretsPanel `module_id` unification**
-  (post-0.2.0 backlog #6, 2026-05-10). The OnboardingWizard /
+  (post-0.2.0 backlog #6, #195). The OnboardingWizard /
   `/preferences` Manage Token flow wrote the PAT at
   `vct._user_shared_.shared.installer/github_pat` while the SecretsPanel
   "Shared (this user)" tab wrote at
@@ -27,6 +144,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one because the SecretsPanel write happened later in time) and
   deletes the old keychain row plus its active-flag entry. Audited as
   `github_pat_module_id_migration` for traceability.
+- **Pre-edit hook cache typo: `$KG_TMP_RAW` / `$CODE_TMP_RAW` →
+  `$KG_RAW` / `$CODE_RAW`**. The cache file was always empty
+  post-search because the wrong variable names were referenced; every
+  subsequent edit of the same file re-ran the live search instead of
+  replaying the cached blocks. Now the cache populates as designed
+  and TTL replays work.
+- **Pre-edit hook KG/codegraph injection dedup correctness +
+  session_id-from-stdin sweep** (#176, #186). Producer/consumer header
+  drift fixed: `rl_kg_search.py --hook-format` and
+  `query_code_graph.py search --hook-format` now emit `KG: <title>`
+  and `CODE: <full_name>` headers the pre-edit hook's regex actually
+  matches. Whitespace-only filtered output no longer surfaces an
+  empty `[Pre-edit context for ...]:` system-reminder. Cache stores
+  raw pre-dedup blocks so replays apply the current seen-list.
+  Universal stdin-JSON sweep across 13 hooks via
+  `_lib/find-python.{sh,ps1}` resolves cross-OS Python invocation
+  (`python3` is missing on Windows; `md5sum` and `stat -c %Y` are
+  GNU-only).
+- **CONTEXT_STATE.md staleness nudge: counter-based + session_id
+  keying** (#177). The KG-update-nudge hook now triggers once per
+  session_id when the cumulative work-units counter crosses
+  thresholds, instead of firing repeatedly on every prompt. Atomic
+  state persistence under `~/.claude/projects/<project>/state/`.
+- **Column-rename migration recorded for column drift** (#184). A
+  prior in-place column rename in `launcher.db` was never captured in
+  the migrations registry; this PR adds the retroactive entry so
+  fresh installs match upgraded ones byte-for-byte.
+- **`post-git-commit-kg-sync` echoed "KG sync agent spawned" to stdout
+  under `async: true`** (#193). PostToolUse plain stdout is silently
+  dropped per the v2.1.x contract AND the wiring is fire-and-forget,
+  so the line was doubly discarded. Replaced with a contract-explainer
+  comment so future audits don't flag it.
+- **`cookie@0.6.0` CVE-2024-47764 npm audit alert** (#194).
+  `launcher/package.json` carries `overrides: { "cookie": "^0.7.0" }`
+  pinning the lockfile to `cookie@0.7.2`; `npm audit` from `launcher/`
+  reports 0 vulnerabilities.
+- **Latent `query_code_graph.py::search_by_concept` bug**: was
+  calling `near_vector` without `target_vector` on the dual-vector
+  collections (which the new Weaviate client rejects). Fixed alongside
+  the helper extraction (#191).
+
+### Docs
+
+- **Doc-audit Groups A–D** (#180, #181, #182, #183). Four-pass sweep
+  across user-facing root + core (Group A), license module (Group C),
+  features pages (Group B), and maintainer-doc triage (Group D).
+  Factual + tone refresh; maintainer-internal references scrubbed
+  from public files; `internal/` directory split for repo-only
+  content.
+- **README rewrite + verified comparison table** (#179). New
+  comparison table grounded in feature-by-feature verification rather
+  than marketing claims.
+- **Post-ship 0.2.0 sweep** (#173). Version-ref drift, roadmap-label
+  consistency, hub-auth section refresh.
+- **CLAUDE.md guidance**: agents fix outdated knowledge they retrieve
+  in the same turn rather than acting on stale info (#174); warning
+  about parallel-agent worktree isolation failure modes (#178). The
+  worktree-isolation warning was load-bearing for this 0.2.1 cycle —
+  see the fresh KG node `parallel-pr-coordination-gotchas-2026-05-10`
+  for the failure modes hit during the parallel-PR push.
+
+### Notes for upgraders from 0.2.0
+
+- The `register_github_pat` migration is automatic and runs on first
+  invocation of the wizard / Manage Token flow after upgrade; the
+  legacy `installer/` keychain slot is read-fallback-then-removed.
+  No user action required.
+- The migration-010 `project_mcp_servers` backfill runs at startup
+  for every registered project that has zero rows (i.e. every
+  pre-0.2.1 project). Per-project, idempotent; user toggles are
+  preserved across runs.
+- `vct-config.toml` is shipped at the archive root; users can edit it
+  in place after install. Env-var overrides (`VCT_WEAVIATE_URL`,
+  legacy `WEAVIATE_URL`) take precedence.
+- Settings files use `async: true` instead of `background: true` —
+  no behaviour change today (both currently work) but the doc-aligned
+  spelling de-risks future versions.
 
 ## [0.2.0] — 2026-05-08
 
