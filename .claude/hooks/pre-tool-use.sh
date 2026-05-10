@@ -23,7 +23,16 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 #   6. KG search suggestion before Edit/Write
 
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
-. "$(dirname "${BASH_SOURCE[0]}")/_lib/emit-context.sh"
+# Source emit-context.sh ONLY if the file exists. If the helper is
+# missing (partial install or just-after-clone before _lib/ is fully
+# populated), the hook still runs its other branches (logging,
+# security guards). The KG-suggestion branch below checks
+# `command -v emit_additional_context` before calling it.
+# We deliberately do NOT trail with `|| true`: a syntax error inside
+# an existing helper is a real bug we want surfaced.
+if [ -f "$(dirname "${BASH_SOURCE[0]}")/_lib/emit-context.sh" ]; then
+    . "$(dirname "${BASH_SOURCE[0]}")/_lib/emit-context.sh"
+fi
 # Resolve Python portably — bare `python3` is missing on Windows.
 # shellcheck source=_lib/find-python.sh disable=SC1091
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/find-python.sh"
@@ -240,6 +249,10 @@ if [ -n "$CONCEPTS" ]; then
         # in _lib/emit-context.sh handles the JSON envelope, the 10k char
         # cap, and (defense-in-depth) the whitespace-only-content guard.
         SUGGESTION_TEXT=$(printf '\n💡 Found %s related patterns for: %s\n%s\n\n   Search more: '\''Search knowledge graph for [concept]'\''\n' "$MATCH_COUNT" "$CONCEPTS" "$(echo "$MATCHES" | sed 's/^/   /')")
-        emit_additional_context "$SUGGESTION_TEXT" PreToolUse
+        # Defense: if the helper failed to load, skip emission rather
+        # than crash. Other branches of this hook are unaffected.
+        if command -v emit_additional_context >/dev/null 2>&1; then
+            emit_additional_context "$SUGGESTION_TEXT" PreToolUse
+        fi
     fi
 fi

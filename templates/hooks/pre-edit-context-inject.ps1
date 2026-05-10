@@ -22,7 +22,15 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # Always exit 0 (never block the edit).
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
-. "$PSScriptRoot/_lib/emit-context.ps1"
+# Source emit-context.ps1 ONLY if the file exists. If the helper is
+# missing (partial install or just-after-clone before _lib/ is fully
+# populated), the hook still runs its dedup/state work. The
+# Emit-ContextJson wrapper tolerates a missing Emit-AdditionalContext
+# function via Get-Command. We deliberately do NOT swallow source
+# errors — a syntax error in an existing helper is a real bug.
+if (Test-Path "$PSScriptRoot/_lib/emit-context.ps1") {
+    . "$PSScriptRoot/_lib/emit-context.ps1"
+}
 
 # Hook input arrives as JSON on stdin per Claude Code v2.1.x spec.
 # Positional args ($args) and $env:CLAUDE_TOOL_NAME etc. are EMPTY —
@@ -102,7 +110,14 @@ if (-not (Test-Path $CacheDir)) {
 # Windows; the .sh sibling was fixed in PR #168 and the .ps1 fix landed
 # alongside the fork-readiness sweep for 0.1.7.
 function Emit-ContextJson([string]$ctx) {
-    Emit-AdditionalContext $ctx 'PreToolUse'
+    # If the helper sourced (normal case), delegate. If it didn't (the
+    # `_lib/emit-context.ps1` file was missing at hook startup), fall
+    # back to a silent no-op rather than crashing on an undefined
+    # function. The hook's other work (dedup state, cache write)
+    # remains valid.
+    if (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue) {
+        Emit-AdditionalContext $ctx 'PreToolUse'
+    }
 }
 
 # Check cache (10-min TTL) — uses .NET file mtime, no cross-OS stat issues.

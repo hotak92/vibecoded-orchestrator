@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# OS-EXEMPT-PARITY: bash-side-only fix — three changes brought bash up to PowerShell-native equivalents that the .ps1 sibling already had: (1) `_lib/find-python.sh` sourced + bare `python3` → `"$PY"` (Windows ships python.exe/py); (2) `md5sum` → Python hashlib (md5sum is GNU-only, absent on macOS / minimal Linux); (3) `stat -c %Y` → Python os.path.getmtime (GNU-only; macOS BSD stat needs `-f %m`). The .ps1 sibling already uses .NET MD5, .NET LastWriteTime, and Get-Command python — already cross-OS-correct.
 # kg-summary-generator.sh — PostToolUse hook
 # Spawns a background Haiku agent to generate/update summaries for KG nodes.
 # Fires on: Edit(knowledge/**/*.md), Write(knowledge/**/*.md), mcp__weaviate-kg__store_knowledge_node

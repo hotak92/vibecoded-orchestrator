@@ -25,7 +25,16 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 #   tests/test_kg_access_list.py for the consumer contract.
 
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
-. "$(dirname "${BASH_SOURCE[0]}")/_lib/emit-context.sh"
+# Source emit-context.sh ONLY if it exists. If the helper is missing
+# (partial install, just-after-clone before _lib/ is fully populated),
+# the conditional simply skips the source — the hook then runs without
+# `emit_additional_context` defined; the wrapper `_emit_context_json`
+# below tolerates this via `command -v`. We deliberately do NOT use
+# `|| true` after the source: a syntax error inside an existing helper
+# is a real bug we want surfaced, not silently swallowed.
+if [ -f "$(dirname "${BASH_SOURCE[0]}")/_lib/emit-context.sh" ]; then
+    . "$(dirname "${BASH_SOURCE[0]}")/_lib/emit-context.sh"
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -132,7 +141,14 @@ mkdir -p "$CACHE_DIR" 2>/dev/null || true
 # checking that no `[Pre-edit context for ...]` system-reminders ever
 # appeared in real Edit-tool transcripts.
 _emit_context_json() {
-    emit_additional_context "$1" PreToolUse
+    # If the helper sourced (normal case), delegate. If it didn't (the
+    # `_lib/emit-context.sh` file was missing at hook startup), fall
+    # back to a silent no-op rather than crashing on an undefined
+    # function under `set -e` / `set -u` discipline. The hook's other
+    # work (dedup state, cache write) remains valid.
+    if command -v emit_additional_context >/dev/null 2>&1; then
+        emit_additional_context "$1" PreToolUse
+    fi
 }
 
 # === Check cache (10 min TTL) ===

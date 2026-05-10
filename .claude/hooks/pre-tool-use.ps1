@@ -19,7 +19,14 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # Build Anchor Protocol, file backup, KG search suggestion.
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
-. "$PSScriptRoot/_lib/emit-context.ps1"
+# Source emit-context.ps1 ONLY if the file exists. If the helper is
+# missing (partial install or just-after-clone before _lib/ is fully
+# populated), the hook still runs its other branches (logging,
+# security guards). The KG-suggestion branch below uses Get-Command
+# to tolerate a missing Emit-AdditionalContext.
+if (Test-Path "$PSScriptRoot/_lib/emit-context.ps1") {
+    . "$PSScriptRoot/_lib/emit-context.ps1"
+}
 
 # Hook input arrives as JSON on stdin per Claude Code v2.1.x spec.
 # Positional args ($args) and $env:CLAUDE_TOOL_NAME etc. are EMPTY because
@@ -244,7 +251,12 @@ if ($matchOutput) {
         [void]$sb.AppendLine("")
         [void]$sb.AppendLine("   Search more: 'Search knowledge graph for [concept]'")
         [void]$sb.AppendLine("")
-        Emit-AdditionalContext $sb.ToString() 'PreToolUse'
+        # Defense: if the helper failed to load (file missing at hook
+        # startup), skip emission rather than crash. Other branches of
+        # this hook are unaffected.
+        if (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue) {
+            Emit-AdditionalContext $sb.ToString() 'PreToolUse'
+        }
     }
 }
 exit 0
