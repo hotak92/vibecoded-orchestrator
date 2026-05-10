@@ -244,6 +244,12 @@ pub fn run() {
             commands::secrets_cmd::get_setting_v2,
             commands::secrets_cmd::set_setting_v2,
             commands::secrets_cmd::list_module_settings_v2,
+            // 0.2.1 grants & per-requester pause API
+            commands::secrets_cmd::grant_secret,
+            commands::secrets_cmd::revoke_secret_grant_cmd,
+            commands::secrets_cmd::list_grants_for_project,
+            commands::secrets_cmd::pause_secret_for_project,
+            commands::secrets_cmd::resume_secret_for_project,
             // Licensing
             commands::licensing::license_get_tier,
             commands::licensing::license_is_admin,

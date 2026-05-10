@@ -494,10 +494,18 @@ pub async fn get_secret_status_v2(
     // `is_active` field stays own-DB so the GUI can distinguish "this
     // launcher paused it" from "another launcher paused it" if a
     // future UI surfaces that detail.
-    let active_cross = crate::db::secret_active::is_secret_active_cross_launcher(
-        &db, &scope, &project_id, &module_id, &key,
+    // 0.2.1: per-requester gate. The GUI is asking "does THIS project see
+    // the secret as active?", so the requester is `project_id`. For
+    // shared/global scopes the requester is the project that's about to
+    // consume the secret — same project_id the GUI already knows. For
+    // per_project scope, owner == requester == project_id, so the
+    // semantics are identical to the legacy single-row gate.
+    let active_cross = crate::db::secret_active::is_secret_active_cross_launcher_for_requester(
+        &db, &scope, &project_id, &module_id, &key, &project_id,
     );
-    let active_own = db.is_secret_active(&scope, &project_id, &module_id, &key)?;
+    let active_own = db.is_secret_active_for_requester(
+        &scope, &project_id, &module_id, &key, &project_id,
+    )?;
     let has_saved_value = secrets::is_set(scope_enum, &module_id, &key)?;
     Ok(SecretStatus {
         is_set: active_cross && has_saved_value,
@@ -532,8 +540,13 @@ pub async fn is_secret_set(
     // and to any module asking via this command. We check the gate FIRST
     // to avoid an unnecessary keychain round-trip when the entry is
     // paused.
-    let active = crate::db::secret_active::is_secret_active_cross_launcher(
-        &db, &scope, &project_id, &module_id, &key,
+    // 0.2.1: per-requester gate. The caller is asking "is this secret
+    // set for THIS project right now?" — same project_id is the
+    // requester. For per_project scope, owner == requester so the
+    // semantics are identical to the legacy single-row gate; for
+    // shared/global, the requester drives a per-project pause check.
+    let active = crate::db::secret_active::is_secret_active_cross_launcher_for_requester(
+        &db, &scope, &project_id, &module_id, &key, &project_id,
     );
     if !active {
         return Ok(false);
@@ -573,8 +586,11 @@ pub async fn get_secret_preview(
     // pause anywhere takes effect everywhere — no GUI/consumer
     // disagreement. See `is_secret_set` doc comment for the asymmetry
     // we're closing.
-    let active = crate::db::secret_active::is_secret_active_cross_launcher(
-        &db, &scope, &project_id, &module_id, &key,
+    // 0.2.1: per-requester gate (same rule as is_secret_set). The
+    // preview path must agree with what `project_env` will actually
+    // serve, so a per-project pause hides the masked preview too.
+    let active = crate::db::secret_active::is_secret_active_cross_launcher_for_requester(
+        &db, &scope, &project_id, &module_id, &key, &project_id,
     );
     if !active {
         return Ok(None);
@@ -624,6 +640,170 @@ pub async fn list_module_settings_v2(
         .into_iter()
         .map(|(key, value)| SettingEntry { key, value })
         .collect())
+}
+
+// ─── 0.2.1 grants & per-requester pause commands ─────────────────────────
+//
+// Five Tauri commands that surface the migration-009 grants table and
+// per-(secret × requester) active-flag rows to the launcher GUI:
+//
+//   * `grant_secret`              — owner grants read access to grantee
+//   * `revoke_secret_grant_cmd`   — owner revokes a grant
+//   * `list_grants_for_project`   — return owner-issued + grantee-received
+//                                    grants for the GUI's "Per-project" /
+//                                    "Shared" tabs
+//   * `pause_secret_for_project`  — flip the per-(secret × requester)
+//                                    flag to inactive (grantee self-opt-out
+//                                    or owner pausing for a specific peer)
+//   * `resume_secret_for_project` — drop the per-requester pause row so the
+//                                    canonical / `*` row takes over
+//
+// Authorisation policy (deliberately enforced in Rust, not SQL):
+//   * `grant_secret`: only the OWNER project may grant.
+//   * `revoke_secret_grant_cmd`: only the OWNER project may revoke.
+//   * `pause_secret_for_project` / `resume_secret_for_project`: any
+//     project that's a valid requester (owner OR grantee, OR — for
+//     shared/global — itself) may pause for itself. Pausing for someone
+//     else is restricted to the OWNER. The CHECK on `secret_grants`
+//     keeps the schema honest; this layer keeps the user-facing ergonomic.
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SecretGrantView {
+    pub scope: String,
+    pub owner_project_id: String,
+    pub module_id: String,
+    pub key: String,
+    pub grantee_project_id: String,
+    pub granted_at: i64,
+    pub granted_by_actor: Option<String>,
+    pub note: Option<String>,
+}
+
+impl From<crate::db::secret_grants::SecretGrant> for SecretGrantView {
+    fn from(g: crate::db::secret_grants::SecretGrant) -> Self {
+        Self {
+            scope: g.scope,
+            owner_project_id: g.owner_project_id,
+            module_id: g.module_id,
+            key: g.key,
+            grantee_project_id: g.grantee_project_id,
+            granted_at: g.granted_at,
+            granted_by_actor: g.granted_by_actor,
+            note: g.note,
+        }
+    }
+}
+
+/// Wraps `list_grants_for_project` output: the GUI's per-project tab
+/// renders both the grants this project ISSUED (as owner) and the
+/// grants it RECEIVED (as grantee) on the same screen.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProjectGrantsView {
+    pub issued: Vec<SecretGrantView>,
+    pub received: Vec<SecretGrantView>,
+}
+
+#[command]
+pub async fn grant_secret(
+    owner_project_id: String,
+    module_id: String,
+    key: String,
+    grantee_project_id: String,
+    note: Option<String>,
+    db: State<'_, Db>,
+) -> Result<bool, String> {
+    if owner_project_id == grantee_project_id {
+        return Err("grant_secret: owner and grantee must differ".to_string());
+    }
+    // Schema CHECK enforces scope='per_project'. The command takes no
+    // scope arg — granting global/shared is meaningless because they're
+    // already cross-project, and exposing the choice would be footgun.
+    db.insert_secret_grant(
+        "per_project",
+        &owner_project_id,
+        &module_id,
+        &key,
+        &grantee_project_id,
+        Some("user"),
+        note.as_deref(),
+    )
+}
+
+#[command]
+pub async fn revoke_secret_grant_cmd(
+    owner_project_id: String,
+    module_id: String,
+    key: String,
+    grantee_project_id: String,
+    db: State<'_, Db>,
+) -> Result<bool, String> {
+    db.revoke_secret_grant(
+        "per_project",
+        &owner_project_id,
+        &module_id,
+        &key,
+        &grantee_project_id,
+    )
+}
+
+#[command]
+pub async fn list_grants_for_project(
+    project_id: String,
+    db: State<'_, Db>,
+) -> Result<ProjectGrantsView, String> {
+    let issued = db
+        .list_grants_by_owner(&project_id)?
+        .into_iter()
+        .map(SecretGrantView::from)
+        .collect();
+    let received = db
+        .list_grants_by_grantee(&project_id)?
+        .into_iter()
+        .map(SecretGrantView::from)
+        .collect();
+    Ok(ProjectGrantsView { issued, received })
+}
+
+#[command]
+pub async fn pause_secret_for_project(
+    scope: String,
+    project_id: String,
+    module_id: String,
+    key: String,
+    requester_project_id: String,
+    db: State<'_, Db>,
+) -> Result<(), String> {
+    enforce_scope_invariants(&scope, &project_id, &db)?;
+    db.mark_secret_inactive_for_requester(
+        &scope,
+        &project_id,
+        &module_id,
+        &key,
+        &requester_project_id,
+    )
+}
+
+#[command]
+pub async fn resume_secret_for_project(
+    scope: String,
+    project_id: String,
+    module_id: String,
+    key: String,
+    requester_project_id: String,
+    db: State<'_, Db>,
+) -> Result<(), String> {
+    enforce_scope_invariants(&scope, &project_id, &db)?;
+    // Resume = drop the per-requester row so the canonical (`*` or
+    // owner-literal) row takes over. We do NOT explicitly mark active —
+    // that would create a row on every resume and pollute the table
+    // with default-state entries we'd otherwise prune as no-ops.
+    db.forget_secret_active_state_for_requester(
+        &scope,
+        &project_id,
+        &module_id,
+        &key,
+        &requester_project_id,
+    )
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────
