@@ -55,19 +55,6 @@ flagging for early adopters and the next iteration.
       its first browser-launch instead. The pre-cache is non-fatal — if `npx` is
       missing or the download fails, the install logs a warn event and continues.
 
-## Dev-only / upstream-blocked security alerts
-
-- [ ] **`cookie@0.6.0` (low) — out-of-bounds chars in name/path/domain
-      ([GHSA-pxg6-pf52-xh8x](https://github.com/advisories/GHSA-pxg6-pf52-xh8x))**.
-      Pulled in transitively via `@sveltejs/kit@2.58.0` (latest), which
-      pins `cookie@^0.6.0`. No in-range fix: `npm audit fix --force`
-      would downgrade `@sveltejs/kit` to `0.0.30` (breaking). Tracked
-      upstream; will pick up the patch when SvelteKit bumps its `cookie`
-      dependency. Surfaces as 3 transitive low alerts (`cookie`,
-      `@sveltejs/kit`, `@sveltejs/adapter-static`). No runtime cookie
-      handling in our launcher (`@sveltejs/adapter-static` builds to a
-      static SPA — no SSR cookie path is exercised at runtime).
-
 ## Pending v0.2.x
 
 - [ ] **Custom MCP tab is not populated by initial project registration** — `project_state_populate`
@@ -87,20 +74,13 @@ flagging for early adopters and the next iteration.
 
 ## Recently fixed
 
-- **`register_github_pat` ↔ SecretsPanel write-path module_id unification** —
-  the OnboardingWizard / `/preferences` Manage Token flow wrote the PAT at
-  `vct._user_shared_.shared.installer/github_pat` while the SecretsPanel
-  "Shared (this user)" tab wrote at `vct._user_shared_.shared.user/github_pat`.
-  A user who registered via the wizard and later edited via the
-  SecretsPanel ended up with two divergent keychain rows; reads through
-  either path returned only that path's value, so the alternate row sat
-  as a stale shadow. Both writers now use `module_id="user"` (matching
-  the SecretsPanel's `UI_MODULE_BUCKET` constant); existing 0.2.0 installs
-  are migrated on next `register_github_pat` call by
-  `migrate_github_pat_installer_to_user_module_id` (audited as
-  `github_pat_module_id_migration`). Hub resolver + `github_pat_for_env`
-  fall back to the legacy slot during the upgrade window so existing
-  tokens stay reachable until the migration runs.
+- **`cookie@0.6.0` (CVE-2024-47764) `npm audit` flag** — SvelteKit 2.59.1 bumped
+  its transitive `cookie` to ^0.7.0 ([GHSA-pxg6-pf52-xh8x](https://github.com/advisories/GHSA-pxg6-pf52-xh8x)
+  patched in 0.7.0), so we added an explicit `overrides: { "cookie": "^0.7.0" }`
+  entry to `launcher/package.json` to pin the lockfile to `cookie@0.7.2`. `npm audit`
+  from `launcher/` now reports 0 vulnerabilities. The launcher's static-SPA build
+  never exercised the SSR cookie code in practice, but the alert is gone for
+  scanner-hygiene reasons too.
 
 - **Wizard step 3 install-path field allowed orphan installs** — the install-path text input + Browse button let
   users target any empty folder, after which the installer copied a SUBSET of files (per `ORCHESTRATOR_MANAGED_PATHS`)
