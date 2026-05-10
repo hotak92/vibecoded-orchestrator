@@ -104,6 +104,8 @@ Skip if the commit is purely cosmetic or test-only.
     $line = "{""timestamp"":""$ts"",""commit"":""$CommitHash"",""message"":""$msgEsc"",""pid"":$($proc.Id)}"
     try { Add-Content -Path (Join-Path $LogDir "kg-commit-reviews.jsonl") -Value $line -ErrorAction Stop } catch { }
 
-    Write-Output "KG sync agent spawned for commit $CommitHash"
+# No stdout: PostToolUse plain stdout is dropped per the v2.1.x
+# contract, AND this hook runs `async: true` (fire-and-forget). Any
+# emit here would be doubly discarded — leave it silent.
 } finally { Pop-Location }
 exit 0
