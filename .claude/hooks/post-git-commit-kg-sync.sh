@@ -103,4 +103,7 @@ nohup claude -p "$PROMPT" \
 echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"commit\":\"${COMMIT_HASH}\",\"message\":\"${COMMIT_MSG}\",\"pid\":$!}" \
     >> "$LOG_DIR/kg-commit-reviews.jsonl" 2>/dev/null || true
 
-echo "KG sync agent spawned for commit ${COMMIT_HASH}"
+# No stdout: PostToolUse plain stdout is dropped per the v2.1.x
+# contract, AND this hook runs `async: true` (fire-and-forget). Any
+# emit here would be doubly discarded — leave it silent so future
+# audits do not flag it as a candidate for envelope routing.
