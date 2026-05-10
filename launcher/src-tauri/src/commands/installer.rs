@@ -2317,12 +2317,32 @@ pub fn inspect_project_leftovers(path: String) -> ProjectLeftovers {
 // 0.1.7's secrets-architecture audit explicitly flagged "the launcher
 // writes a secret in plaintext to a file" as fork-blocking.
 //
-// 0.1.7 fix: the PAT now lives in the OS keychain at
-// `vct._user_shared_.shared.installer / github_pat`, written/read via
+// 0.1.7 fix: the PAT now lives in the OS keychain, written/read via
 // `crate::secrets::set/get` exactly like the other shared secrets the
 // launcher manages. The active-flag row is set so the cross-launcher
 // pause check (`is_secret_active_cross_launcher`) and the hub's
 // `/api/v1/projects/{id}/env` endpoint surface the PAT correctly.
+//
+// ─── module_id unification (post-0.2.0 backlog #6, 2026-05-10) ───────
+//
+// 0.2.0 wrote the PAT at `vct._user_shared_.shared.installer/github_pat`
+// (`GITHUB_PAT_MODULE_ID = "installer"`), but the SecretsPanel's
+// "Shared (this user)" tab uses `UI_MODULE_BUCKET = "user"` for every
+// user-added entry. A user who registered via the wizard AND later
+// added `github_pat` via the SecretsPanel ended up with TWO different
+// keychain rows, with reads from either path returning only that
+// path's value — the alternate row sat as a stale shadow.
+//
+// Resolution: the wizard's writer now uses `module_id = "user"` to
+// match the canonical user-bucket path enforced by `is_user_emit_bucket`
+// in `commands/secrets_cmd.rs`. The keychain slot is now
+// `vct._user_shared_.shared.user/github_pat` for both writers. Existing
+// installs are migrated on next `register_github_pat` call (or hub
+// startup, whichever comes first) by `migrate_github_pat_installer_to_user_module_id`,
+// which copies the old `installer/` value into the new `user/` slot
+// (unless the new slot already has a non-empty value — in which case
+// the user-bucket write happened later in time and wins) and deletes
+// the old row. Audited as `github_pat_module_id_migration`.
 //
 // Migration: existing installs that have a file at
 // `~/.vct-secrets/shared/github_pat` (or the legacy flat
@@ -2355,14 +2375,35 @@ const SENTINEL_SHARED: &str = "_user_shared_";
 /// onboarding-wizard GitHub PAT. Pinned here because the migration
 /// helper, `register_github_pat`, `has_github_pat`, etc. all need to
 /// agree on the (scope, module_id, key) tuple.
-pub(crate) const GITHUB_PAT_MODULE_ID: &str = "installer";
+///
+/// 2026-05-10: changed from `"installer"` to `"user"` to match the
+/// canonical user-bucket path enforced by `is_user_emit_bucket` in
+/// `commands/secrets_cmd.rs` (which the SecretsPanel "Shared (this
+/// user)" tab uses for every user-added entry). See module-level
+/// "module_id unification" doc-comment above for the rationale and
+/// the migration path.
+pub(crate) const GITHUB_PAT_MODULE_ID: &str = "user";
+
+/// Pre-2026-05-10 module_id. Read-only target for the one-shot
+/// `installer → user` migration. Do not use for any new write path.
+pub(crate) const GITHUB_PAT_LEGACY_MODULE_ID: &str = "installer";
+
 pub(crate) const GITHUB_PAT_KEY: &str = "github_pat";
 
-/// `app_state` flag — set after the one-shot migration runs successfully
-/// so a launcher upgrade only does the file→keychain sweep once. Stale
-/// launchers (pre-fix) never write this row, so the first post-fix call
-/// to `register_github_pat` finds it `None` and runs the sweep.
+/// `app_state` flag — set after the one-shot file→keychain migration
+/// runs successfully so a launcher upgrade only does the sweep once.
+/// Stale launchers (pre-fix) never write this row, so the first
+/// post-fix call to `register_github_pat` finds it `None` and runs
+/// the sweep.
 const APP_STATE_KEY_GITHUB_PAT_MIGRATED: &str = "github_pat.file_to_keychain.v1";
+
+/// `app_state` flag — set after the one-shot `installer → user`
+/// module_id consolidation runs (post-0.2.0 backlog #6, 2026-05-10).
+/// Idempotent: `migrate_github_pat_installer_to_user_module_id` short-
+/// circuits when this flag is `true`. Pre-fix launchers never write
+/// this row, so the first post-fix call runs the migration once.
+const APP_STATE_KEY_PAT_MODULE_ID_MIGRATED: &str =
+    "github_pat.installer_to_user_module_id.v1";
 
 fn vct_secrets_dir() -> Option<PathBuf> {
     // Honour `VCT_SECRETS_DIR` for parity with the user-facing `vct` CLI
@@ -2442,35 +2483,70 @@ pub fn github_pat_for_env(db: &Db) -> Option<String> {
 ///
 /// Returns `Some(value)` when:
 ///   * keychain has a non-empty value at
-///     `vct._user_shared_.shared.installer / github_pat`, AND
+///     `vct._user_shared_.shared.user / github_pat`, AND
 ///   * the active-flag row says active (default-active when no row).
 ///
 /// Returns `None` for any other state (no entry, paused, keychain
 /// backend unreachable, etc.). Callers that need to distinguish
 /// "paused" from "absent" must read the active flag separately.
+///
+/// 2026-05-10 (post-0.2.0 backlog #6): a 0.2.0 user who already
+/// registered a PAT has their value at the LEGACY
+/// `vct._user_shared_.shared.installer / github_pat` slot. Until
+/// `migrate_github_pat_installer_to_user_module_id` runs (on next
+/// `register_github_pat` call), reads that miss the new user/ slot
+/// fall back to the legacy installer/ slot so the upgrade is seamless.
+/// The fallback is gated by the legacy slot's active-flag row too —
+/// a paused PAT stays paused across the const flip.
 fn github_pat_from_keychain(db: &Db) -> Option<String> {
     let scope = SecretScope::Shared {
         project_id: SENTINEL_SHARED,
     };
-    let value = secrets::get(scope, GITHUB_PAT_MODULE_ID, GITHUB_PAT_KEY)
+
+    // Primary: new user-bucket slot.
+    if let Some(v) = secrets::get(scope, GITHUB_PAT_MODULE_ID, GITHUB_PAT_KEY).ok().flatten() {
+        if !v.trim().is_empty() {
+            // Gate on the active flag (cross-launcher — a pause in any
+            // sibling launcher's DB blocks the read here, matching the
+            // hub's behaviour).
+            let active = crate::db::secret_active::is_secret_active_cross_launcher(
+                db,
+                "shared",
+                SENTINEL_SHARED,
+                GITHUB_PAT_MODULE_ID,
+                GITHUB_PAT_KEY,
+            );
+            if active {
+                return Some(v);
+            }
+            // Paused new slot wins over a stale legacy slot — once a
+            // user touches the new path the legacy is dead state.
+            return None;
+        }
+    }
+
+    // Fallback: legacy `installer/` slot (post-0.2.0 backlog #6
+    // upgrade window). Only honoured until the next
+    // `register_github_pat` call triggers
+    // `migrate_github_pat_installer_to_user_module_id`. After that,
+    // the legacy slot is empty and this branch returns None.
+    let legacy_v = secrets::get(scope, GITHUB_PAT_LEGACY_MODULE_ID, GITHUB_PAT_KEY)
         .ok()
         .flatten()?;
-    if value.trim().is_empty() {
+    if legacy_v.trim().is_empty() {
         return None;
     }
-    // Gate on the active flag (cross-launcher — a pause in any sibling
-    // launcher's DB blocks the read here, matching the hub's behaviour).
-    let active = crate::db::secret_active::is_secret_active_cross_launcher(
+    let legacy_active = crate::db::secret_active::is_secret_active_cross_launcher(
         db,
         "shared",
         SENTINEL_SHARED,
-        GITHUB_PAT_MODULE_ID,
+        GITHUB_PAT_LEGACY_MODULE_ID,
         GITHUB_PAT_KEY,
     );
-    if !active {
+    if !legacy_active {
         return None;
     }
-    Some(value)
+    Some(legacy_v)
 }
 
 /// Migration outcome surfaced to callers/tests.
@@ -2492,6 +2568,206 @@ pub(crate) struct GithubPatMigrationReport {
     pub warnings: Vec<String>,
 }
 
+/// Migration outcome surfaced to callers/tests for the
+/// `installer → user` module_id consolidation.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct GithubPatModuleIdMigrationReport {
+    /// Migration was already done in a previous launcher run.
+    pub already_done: bool,
+    /// Old `installer/` keychain row had a non-empty value when we
+    /// looked.
+    pub had_old_value: bool,
+    /// New `user/` keychain row had a non-empty value when we looked.
+    pub had_new_value: bool,
+    /// `"old"` if the old `installer/` value was promoted to the new
+    /// `user/` slot; `"new"` if the existing user-bucket value was
+    /// kept (later-write wins); `"none"` if neither slot held a value.
+    pub winner: &'static str,
+    /// Old `installer/` keychain row deleted.
+    pub deleted_old_keychain_row: bool,
+    /// Old `installer/` active-flag row dropped.
+    pub forgot_old_active_state: bool,
+    /// `app_state` flag set this run.
+    pub flag_set: bool,
+    /// Soft-fail diagnostics (e.g. keychain backend unreachable).
+    /// Non-empty means we did NOT flip the flag, so the next call
+    /// retries.
+    pub warnings: Vec<String>,
+}
+
+/// One-shot consolidation: pre-2026-05-10 launchers wrote the
+/// onboarding-wizard PAT at `vct._user_shared_.shared.installer/github_pat`.
+/// The canonical user-bucket path (matching SecretsPanel's
+/// `UI_MODULE_BUCKET = "user"` write-path) is now
+/// `vct._user_shared_.shared.user/github_pat`. This helper walks the
+/// old slot to the new one in a single idempotent step.
+///
+/// Idempotent and self-gated. Decision matrix on the two slots:
+///
+/// | old `installer/` | new `user/` | action                                         |
+/// |------------------|-------------|------------------------------------------------|
+/// | empty            | empty       | flip flag, no copy, no delete (`winner=none`)  |
+/// | non-empty        | empty       | copy old → new, mark active on new, delete old |
+/// | empty            | non-empty   | flip flag, drop legacy active row, no copy     |
+/// | non-empty        | non-empty   | keep new (later-write wins), delete old        |
+///
+/// Soft-fail on the keychain side: a `set` failure leaves the old
+/// slot intact and does NOT flip the flag, so a future call retries.
+/// A `delete` failure on the old slot is logged but doesn't block —
+/// the new slot is the resolution path; the stale `installer/` row
+/// is harmless residue (no reader still looks there after the const
+/// flip).
+///
+/// Audited as `github_pat_module_id_migration` with the full report
+/// payload so the move is traceable in `audit_log`.
+pub(crate) fn migrate_github_pat_installer_to_user_module_id(
+    db: &Db,
+) -> Result<GithubPatModuleIdMigrationReport, String> {
+    let mut report = GithubPatModuleIdMigrationReport {
+        winner: "none",
+        ..Default::default()
+    };
+
+    let already = db
+        .app_state_get_bool(APP_STATE_KEY_PAT_MODULE_ID_MIGRATED)
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+    if already {
+        report.already_done = true;
+        return Ok(report);
+    }
+
+    let scope = SecretScope::Shared {
+        project_id: SENTINEL_SHARED,
+    };
+
+    // Probe both slots. A keychain backend hiccup on EITHER read makes
+    // the consolidation unsafe to run (we'd risk the "destroy old
+    // before confirming new took" failure mode), so bail with a
+    // warning and don't flip the flag.
+    let old_val = match secrets::get(scope, GITHUB_PAT_LEGACY_MODULE_ID, GITHUB_PAT_KEY) {
+        Ok(v) => v,
+        Err(e) => {
+            report.warnings.push(format!(
+                "keychain get old slot during module_id migration: {}",
+                e
+            ));
+            return Ok(report);
+        }
+    };
+    let new_val = match secrets::get(scope, GITHUB_PAT_MODULE_ID, GITHUB_PAT_KEY) {
+        Ok(v) => v,
+        Err(e) => {
+            report.warnings.push(format!(
+                "keychain get new slot during module_id migration: {}",
+                e
+            ));
+            return Ok(report);
+        }
+    };
+
+    let old_nonempty = old_val.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+    let new_nonempty = new_val.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+    report.had_old_value = old_nonempty;
+    report.had_new_value = new_nonempty;
+
+    // Case 1: old non-empty, new empty → promote old to new.
+    if old_nonempty && !new_nonempty {
+        let old_trim = old_val.as_ref().unwrap().trim();
+        if let Err(e) = secrets::set(scope, GITHUB_PAT_MODULE_ID, GITHUB_PAT_KEY, old_trim) {
+            // Don't delete the old slot; don't flip the flag. Next
+            // call retries.
+            report.warnings.push(format!(
+                "keychain set new slot during module_id migration: {}",
+                e
+            ));
+            return Ok(report);
+        }
+        if let Err(e) = db.mark_secret_active(
+            "shared",
+            SENTINEL_SHARED,
+            GITHUB_PAT_MODULE_ID,
+            GITHUB_PAT_KEY,
+        ) {
+            // Active-flag write failure is recoverable — default for
+            // an absent row is ACTIVE. Log and continue.
+            report.warnings.push(format!("mark_secret_active new slot: {}", e));
+        }
+        report.winner = "old";
+    } else if old_nonempty && new_nonempty {
+        // Case 2: both non-empty — user-bucket write happened later in
+        // time (the SecretsPanel only writes to `user/`, never to
+        // `installer/`), so the new slot wins. Just drop the old row.
+        report.winner = "new";
+    } else if !old_nonempty && new_nonempty {
+        // Case 3: only new has a value (e.g. user already migrated via
+        // SecretsPanel, or this is a fresh install). Nothing to copy;
+        // just flip the flag and drop the (empty) old active-flag row
+        // to keep audit_log tidy.
+        report.winner = "new";
+    } else {
+        // Case 4: neither slot has a value. Nothing to consolidate.
+        report.winner = "none";
+    }
+
+    // Delete the old keychain row whenever it had a non-empty value
+    // (cases 1 and 2). For empty old slot we still drop the active-
+    // flag row below — the keychain `delete` is a NoEntry no-op.
+    if old_nonempty {
+        if let Err(e) = secrets::delete(scope, GITHUB_PAT_LEGACY_MODULE_ID, GITHUB_PAT_KEY) {
+            report.warnings.push(format!(
+                "keychain delete old slot during module_id migration: {}",
+                e
+            ));
+        } else {
+            report.deleted_old_keychain_row = true;
+        }
+    }
+
+    // Drop the legacy active-flag row regardless of keychain outcome.
+    // `forget_secret_active_state` is idempotent (no-op when no row
+    // exists) so this is safe even when the old slot was empty all
+    // along.
+    if let Err(e) = db.forget_secret_active_state(
+        "shared",
+        SENTINEL_SHARED,
+        GITHUB_PAT_LEGACY_MODULE_ID,
+        GITHUB_PAT_KEY,
+    ) {
+        report
+            .warnings
+            .push(format!("forget_secret_active_state old slot: {}", e));
+    } else {
+        report.forgot_old_active_state = true;
+    }
+
+    // Audit-log the move so the keychain delta is traceable.
+    let detail = serde_json::json!({
+        "from_module_id": GITHUB_PAT_LEGACY_MODULE_ID,
+        "to_module_id": GITHUB_PAT_MODULE_ID,
+        "key": GITHUB_PAT_KEY,
+        "scope": "shared",
+        "had_old_value": report.had_old_value,
+        "had_new_value": report.had_new_value,
+        "winner": report.winner,
+        "deleted_old_keychain_row": report.deleted_old_keychain_row,
+        "forgot_old_active_state": report.forgot_old_active_state,
+    });
+    if let Err(e) = db.audit(
+        "github_pat_module_id_migration",
+        None,
+        Some(GITHUB_PAT_MODULE_ID),
+        &detail,
+    ) {
+        report.warnings.push(format!("audit row: {}", e));
+    }
+
+    db.app_state_set_bool(APP_STATE_KEY_PAT_MODULE_ID_MIGRATED, true)?;
+    report.flag_set = true;
+    Ok(report)
+}
+
 /// One-shot migration: existing PAT file → keychain.
 ///
 /// Idempotent and self-gated:
@@ -2501,7 +2777,7 @@ pub(crate) struct GithubPatMigrationReport {
 ///     flips the flag (so we don't re-scan on every register call) and
 ///     returns.
 ///   * If keychain already has a non-empty value at
-///     `vct._user_shared_.shared.installer / github_pat` → flips the
+///     `vct._user_shared_.shared.user / github_pat` → flips the
 ///     flag and removes the stale file (treating the keychain as
 ///     authoritative when both stores have a value).
 ///   * Otherwise: read file → keychain set → mark active → delete file
@@ -2659,11 +2935,36 @@ pub fn register_github_pat(
     }
     let force = force.unwrap_or(false);
 
-    // 1. Run the one-shot file→keychain migration (idempotent + self-gated).
-    //    This pulls any pre-fix file value into the keychain BEFORE we
-    //    overwrite with the user's new token. We intentionally swallow
-    //    migration errors here — the caller's token write is the
-    //    source-of-truth path, and the migration is best-effort cleanup.
+    // 1a. Run the `installer → user` module_id consolidation FIRST.
+    //     Idempotent + self-gated. This collapses any pre-2026-05-10
+    //     PAT row at `shared.installer/github_pat` into the canonical
+    //     user-bucket slot at `shared.user/github_pat` so we don't
+    //     leave stale shadow values when a user who registered via
+    //     the wizard later edits via the SecretsPanel "Shared" tab.
+    //     Errors are swallowed: the caller's token write below is the
+    //     source-of-truth path; the migration is best-effort cleanup.
+    match migrate_github_pat_installer_to_user_module_id(&db) {
+        Ok(report) => {
+            if !report.warnings.is_empty() {
+                eprintln!(
+                    "[vct] github_pat module_id migration warnings: {:?}",
+                    report.warnings
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "[vct] github_pat module_id migration failed (will retry next call): {}",
+                e
+            );
+        }
+    }
+
+    // 1b. Run the one-shot file→keychain migration (idempotent + self-gated).
+    //     This pulls any pre-fix file value into the keychain BEFORE we
+    //     overwrite with the user's new token. We intentionally swallow
+    //     migration errors here — the caller's token write is the
+    //     source-of-truth path, and the migration is best-effort cleanup.
     match migrate_github_pat_file_to_keychain(&db) {
         Ok(report) => {
             if !report.warnings.is_empty() {
@@ -5858,8 +6159,11 @@ MemAvailable:   23456789 kB
     //   * Each keychain-touching test calls `delete_keychain()` at
     //     entry + exit so leftover state from a previous test (or a
     //     parallel run targeting the same well-known keychain entry
-    //     `vct._user_shared_.shared.installer/github_pat`) doesn't
-    //     leak in.
+    //     `vct._user_shared_.shared.user/github_pat` — post-2026-05-10;
+    //     pre-fix this was `installer/github_pat`) doesn't leak in.
+    //     The module_id consolidation tests also clear the legacy
+    //     `installer/` slot so a residual canary there doesn't mask
+    //     a regression.
     //
     // These tests use `pub(crate)` helpers (`migrate_github_pat_file_to_keychain`,
     // `github_pat_for_env`) and the module-private constants from the
@@ -5879,10 +6183,11 @@ MemAvailable:   23456789 kB
         // SERIALIZE: Mutex<()>` that only blocked within-module races.
         // Parallel tests in `hub::modules_api::tests` (the H1 hub-resolver
         // tests) and `commands::dashboard::tests` (plaintext-migration)
-        // also touch the same `vct._user_shared_.shared.installer/github_pat`
-        // keychain slot — without a shared mutex they overwrote each
-        // other's canaries. The new shared mutex serialises all keychain
-        // tests across the launcher binary.
+        // also touch the same `vct._user_shared_.shared.user/github_pat`
+        // keychain slot (post-2026-05-10; pre-fix this was
+        // `installer/github_pat`) — without a shared mutex they overwrote
+        // each other's canaries. The new shared mutex serialises all
+        // keychain tests across the launcher binary.
 
         struct EnvGuard {
             prev_secrets_dir: Option<std::ffi::OsString>,
@@ -5943,12 +6248,39 @@ MemAvailable:   23456789 kB
             .flatten()
         }
 
+        /// Read directly from the LEGACY (`installer/`) keychain slot.
+        /// Used by the module_id consolidation tests to check the old
+        /// slot was emptied after migration. Pre-2026-05-10 this was
+        /// the only writer slot; post-fix it's read-only and gets
+        /// drained on first `register_github_pat` call.
+        fn keychain_value_legacy() -> Option<String> {
+            crate::secrets::get(
+                crate::secrets::SecretScope::Shared {
+                    project_id: SENTINEL_SHARED,
+                },
+                GITHUB_PAT_LEGACY_MODULE_ID,
+                GITHUB_PAT_KEY,
+            )
+            .ok()
+            .flatten()
+        }
+
         fn delete_keychain() {
+            // Wipe BOTH slots (post-2026-05-10 + pre-2026-05-10) so a
+            // residue from a previous test run targeting either slot
+            // doesn't mask a regression. `delete` returns Ok on NoEntry.
             let _ = crate::secrets::delete(
                 crate::secrets::SecretScope::Shared {
                     project_id: SENTINEL_SHARED,
                 },
                 GITHUB_PAT_MODULE_ID,
+                GITHUB_PAT_KEY,
+            );
+            let _ = crate::secrets::delete(
+                crate::secrets::SecretScope::Shared {
+                    project_id: SENTINEL_SHARED,
+                },
+                GITHUB_PAT_LEGACY_MODULE_ID,
                 GITHUB_PAT_KEY,
             );
         }
@@ -6418,6 +6750,417 @@ MemAvailable:   23456789 kB
 
             assert_eq!(github_pat_for_env(&db).as_deref(), Some(canary.as_str()));
 
+            std::fs::remove_dir_all(&home).ok();
+        }
+
+        // ── Item #6 (post-0.2.0 backlog, 2026-05-10): module_id unification ──
+        //
+        // Pre-fix `register_github_pat` wrote at `shared.installer/github_pat`
+        // while the SecretsPanel "Shared" tab wrote at `shared.user/github_pat`.
+        // A user who registered via wizard then later edited via SecretsPanel
+        // ended up with two divergent keychain rows. These tests pin:
+        //   1. `register_github_pat`'s writer-side const points at the
+        //      canonical user-bucket slot (`module_id="user"`).
+        //   2. `migrate_github_pat_installer_to_user_module_id` is
+        //      idempotent and self-gated by an `app_state` flag.
+        //   3. The migration moves a value at the OLD `installer/` slot
+        //      to the NEW `user/` slot when only the old has a value.
+        //   4. When BOTH slots have values, the migration keeps the new
+        //      one (later-write wins) and drops the old row.
+        //   5. When neither has a value, the migration is a no-op that
+        //      still flips the flag.
+        //   6. An audit row is written tagged `github_pat_module_id_migration`.
+
+        /// Item #6.1: writer-side contract — `GITHUB_PAT_MODULE_ID` is
+        /// the canonical user-bucket id (`"user"`), matching the
+        /// SecretsPanel `UI_MODULE_BUCKET` constant. This is the
+        /// invariant the entire fix rests on; if a future commit flips
+        /// it back this test catches it.
+        #[test]
+        fn register_github_pat_writes_to_user_module_id_not_installer() {
+            assert_eq!(
+                GITHUB_PAT_MODULE_ID, "user",
+                "register_github_pat must write to module_id='user' to match the SecretsPanel UI_MODULE_BUCKET. \
+                 If you changed this, you also need to update vct-module.json::bundled_secrets[0].module_id \
+                 and ensure migrate_github_pat_installer_to_user_module_id still walks the previous slot."
+            );
+            assert_eq!(
+                GITHUB_PAT_LEGACY_MODULE_ID, "installer",
+                "GITHUB_PAT_LEGACY_MODULE_ID must remain 'installer' — it's the read-only target of the \
+                 one-shot migration; changing it strands users who upgraded from 0.2.0."
+            );
+            assert_ne!(
+                GITHUB_PAT_MODULE_ID, GITHUB_PAT_LEGACY_MODULE_ID,
+                "the migration must walk OLD → NEW; identical consts collapse the migration to a no-op",
+            );
+        }
+
+        /// Item #6.2: end-to-end keychain canary — when `register_github_pat`
+        /// runs (here we exercise the same keychain set the command
+        /// performs after its guard), the value lands at the
+        /// `shared.user/github_pat` slot, NOT the legacy `installer/`
+        /// slot.
+        #[test]
+        fn register_github_pat_lands_value_at_user_slot_not_installer_slot() {
+            if !keyring_available() {
+                eprintln!("[skip] no OS keychain backend in this test env");
+                return;
+            }
+            let (home, _guard) = setup_temp_env();
+            delete_keychain();
+
+            let canary = format!("ghp_user_slot_{}", uuid::Uuid::new_v4().simple());
+            let scope = crate::secrets::SecretScope::Shared {
+                project_id: SENTINEL_SHARED,
+            };
+            // Mirror register_github_pat's keychain set step.
+            crate::secrets::set(scope, GITHUB_PAT_MODULE_ID, GITHUB_PAT_KEY, &canary).unwrap();
+
+            // The new (user) slot has the value.
+            assert_eq!(
+                keychain_value().as_deref(),
+                Some(canary.as_str()),
+                "register flow must write to the user slot",
+            );
+            // The legacy (installer) slot stays empty — no shadow row.
+            assert!(
+                keychain_value_legacy().is_none(),
+                "register flow must NOT write to the legacy installer slot",
+            );
+
+            delete_keychain();
+            std::fs::remove_dir_all(&home).ok();
+        }
+
+        /// Item #6.3: migration with old slot only — value is promoted
+        /// to the new slot, old row deleted, flag set, winner=old.
+        #[test]
+        fn pat_module_id_migration_old_only_promotes_to_user_slot() {
+            if !keyring_available() {
+                eprintln!("[skip] no OS keychain backend in this test env");
+                return;
+            }
+            let (home, _guard) = setup_temp_env();
+            let db = make_db();
+            delete_keychain();
+
+            let canary = format!("ghp_old_only_{}", uuid::Uuid::new_v4().simple());
+            let scope = crate::secrets::SecretScope::Shared {
+                project_id: SENTINEL_SHARED,
+            };
+            // Seed the LEGACY slot only.
+            crate::secrets::set(scope, GITHUB_PAT_LEGACY_MODULE_ID, GITHUB_PAT_KEY, &canary)
+                .unwrap();
+            // Pre-condition: new slot empty, old slot full.
+            assert!(keychain_value().is_none(), "new slot must start empty");
+            assert_eq!(
+                keychain_value_legacy().as_deref(),
+                Some(canary.as_str()),
+                "old slot must hold the seed",
+            );
+
+            let report = migrate_github_pat_installer_to_user_module_id(&db).unwrap();
+            assert!(!report.already_done);
+            assert!(report.had_old_value);
+            assert!(!report.had_new_value);
+            assert_eq!(report.winner, "old");
+            assert!(report.deleted_old_keychain_row);
+            assert!(report.forgot_old_active_state);
+            assert!(report.flag_set);
+            assert!(
+                report.warnings.is_empty(),
+                "expected no warnings: {:?}",
+                report.warnings
+            );
+
+            // Post-condition: new slot has the value, old slot empty.
+            assert_eq!(
+                keychain_value().as_deref(),
+                Some(canary.as_str()),
+                "value must be promoted to the user slot",
+            );
+            assert!(
+                keychain_value_legacy().is_none(),
+                "old installer slot must be empty after migration",
+            );
+            assert_eq!(
+                db.app_state_get_bool(APP_STATE_KEY_PAT_MODULE_ID_MIGRATED).unwrap(),
+                Some(true),
+                "migration flag must be set",
+            );
+
+            delete_keychain();
+            std::fs::remove_dir_all(&home).ok();
+        }
+
+        /// Item #6.4: migration with BOTH slots populated — the new
+        /// (user) value is kept (later-write wins), the old slot is
+        /// dropped. Winner=new.
+        #[test]
+        fn pat_module_id_migration_both_keeps_new_drops_old() {
+            if !keyring_available() {
+                eprintln!("[skip] no OS keychain backend in this test env");
+                return;
+            }
+            let (home, _guard) = setup_temp_env();
+            let db = make_db();
+            delete_keychain();
+
+            let old_canary = format!("ghp_old_{}", uuid::Uuid::new_v4().simple());
+            let new_canary = format!("ghp_new_{}", uuid::Uuid::new_v4().simple());
+            let scope = crate::secrets::SecretScope::Shared {
+                project_id: SENTINEL_SHARED,
+            };
+            // Seed BOTH slots — simulates user who used the wizard
+            // (writes to old slot in 0.2.0) THEN the SecretsPanel
+            // Shared tab (writes to new slot).
+            crate::secrets::set(scope, GITHUB_PAT_LEGACY_MODULE_ID, GITHUB_PAT_KEY, &old_canary)
+                .unwrap();
+            crate::secrets::set(scope, GITHUB_PAT_MODULE_ID, GITHUB_PAT_KEY, &new_canary).unwrap();
+
+            let report = migrate_github_pat_installer_to_user_module_id(&db).unwrap();
+            assert!(report.had_old_value);
+            assert!(report.had_new_value);
+            assert_eq!(
+                report.winner, "new",
+                "both slots populated → new wins (later-write); got {:?}",
+                report.winner
+            );
+            assert!(report.deleted_old_keychain_row);
+            assert!(report.flag_set);
+
+            // Post-condition: new slot retains its value, old slot empty.
+            assert_eq!(
+                keychain_value().as_deref(),
+                Some(new_canary.as_str()),
+                "new slot value must NOT be overwritten when both slots had values",
+            );
+            assert!(
+                keychain_value_legacy().is_none(),
+                "old installer slot must be cleared regardless of winner",
+            );
+
+            delete_keychain();
+            std::fs::remove_dir_all(&home).ok();
+        }
+
+        /// Item #6.5: migration with neither slot populated — no-op
+        /// that still flips the flag. Subsequent calls short-circuit.
+        #[test]
+        fn pat_module_id_migration_neither_is_idempotent_noop() {
+            // Doesn't strictly need keychain — both gets return None
+            // when the keychain backend is unreachable, which the
+            // migration treats as "empty slot". But we keep the gate
+            // for symmetry with sibling tests.
+            if !keyring_available() {
+                eprintln!("[skip] no OS keychain backend in this test env");
+                return;
+            }
+            let (home, _guard) = setup_temp_env();
+            let db = make_db();
+            delete_keychain();
+
+            let report = migrate_github_pat_installer_to_user_module_id(&db).unwrap();
+            assert!(!report.already_done, "first run must not be already_done");
+            assert!(!report.had_old_value);
+            assert!(!report.had_new_value);
+            assert_eq!(report.winner, "none");
+            assert!(!report.deleted_old_keychain_row);
+            assert!(report.flag_set);
+
+            // Both slots still empty.
+            assert!(keychain_value().is_none());
+            assert!(keychain_value_legacy().is_none());
+
+            // Run #2: idempotent — already_done short-circuits.
+            let report2 = migrate_github_pat_installer_to_user_module_id(&db).unwrap();
+            assert!(report2.already_done);
+            assert_eq!(report2.winner, "none");
+            assert!(!report2.flag_set, "flag was already set; we don't re-set it");
+
+            std::fs::remove_dir_all(&home).ok();
+        }
+
+        /// Item #6.6: migration writes an `audit_log` row tagged
+        /// `github_pat_module_id_migration` with the full state
+        /// payload so the keychain delta is traceable.
+        #[test]
+        fn pat_module_id_migration_writes_audit_row() {
+            if !keyring_available() {
+                eprintln!("[skip] no OS keychain backend in this test env");
+                return;
+            }
+            let (home, _guard) = setup_temp_env();
+            let db = make_db();
+            delete_keychain();
+
+            let canary = format!("ghp_audit_{}", uuid::Uuid::new_v4().simple());
+            let scope = crate::secrets::SecretScope::Shared {
+                project_id: SENTINEL_SHARED,
+            };
+            crate::secrets::set(scope, GITHUB_PAT_LEGACY_MODULE_ID, GITHUB_PAT_KEY, &canary)
+                .unwrap();
+
+            let report = migrate_github_pat_installer_to_user_module_id(&db).unwrap();
+            assert_eq!(report.winner, "old");
+
+            // Audit row exists with the operation tag and module_id.
+            let events = db
+                .audit_list(None, None, None, None, Some("github_pat_module_id_migration"), 100)
+                .unwrap();
+            assert!(
+                events.iter().any(|e| e.operation == "github_pat_module_id_migration"
+                    && e.module_id.as_deref() == Some("user")),
+                "expected an audit row tagged github_pat_module_id_migration with module_id='user'; got {:?}",
+                events.iter().map(|e| &e.operation).collect::<Vec<_>>(),
+            );
+
+            // The detail JSON carries the from/to/winner triple.
+            let row = events
+                .iter()
+                .find(|e| e.operation == "github_pat_module_id_migration")
+                .expect("audit row present");
+            let detail: serde_json::Value =
+                serde_json::from_str(&row.detail).expect("audit detail is JSON");
+            assert_eq!(detail.get("from_module_id").and_then(|v| v.as_str()), Some("installer"));
+            assert_eq!(detail.get("to_module_id").and_then(|v| v.as_str()), Some("user"));
+            assert_eq!(detail.get("winner").and_then(|v| v.as_str()), Some("old"));
+            assert_eq!(detail.get("had_old_value").and_then(|v| v.as_bool()), Some(true));
+            assert_eq!(detail.get("had_new_value").and_then(|v| v.as_bool()), Some(false));
+
+            delete_keychain();
+            std::fs::remove_dir_all(&home).ok();
+        }
+
+        /// Item #6.6b: upgrade-window fallback — until the module_id
+        /// migration runs, `github_pat_for_env` falls back to the
+        /// legacy `installer/` slot so a 0.2.0 user's existing PAT
+        /// stays reachable across the const flip. After migration the
+        /// legacy slot is empty and the fallback is a no-op.
+        #[test]
+        fn github_pat_for_env_falls_back_to_legacy_installer_slot_pre_module_id_migration() {
+            if !keyring_available() {
+                eprintln!("[skip] no OS keychain backend in this test env");
+                return;
+            }
+            let (home, _guard) = setup_temp_env();
+            let db = make_db();
+            delete_keychain();
+
+            // Simulate a 0.2.0 install: PAT lives at the LEGACY slot
+            // only, no migration has run yet.
+            let canary = format!("ghp_legacy_window_{}", uuid::Uuid::new_v4().simple());
+            let scope = crate::secrets::SecretScope::Shared {
+                project_id: SENTINEL_SHARED,
+            };
+            crate::secrets::set(scope, GITHUB_PAT_LEGACY_MODULE_ID, GITHUB_PAT_KEY, &canary)
+                .unwrap();
+
+            // The fallback surfaces it.
+            assert_eq!(
+                github_pat_for_env(&db).as_deref(),
+                Some(canary.as_str()),
+                "upgrade-window fallback must surface the legacy installer slot value",
+            );
+
+            // Run the module_id migration. After that, the value lives
+            // at the new slot AND the legacy slot is empty.
+            let report = migrate_github_pat_installer_to_user_module_id(&db).unwrap();
+            assert!(report.flag_set);
+            assert_eq!(
+                github_pat_for_env(&db).as_deref(),
+                Some(canary.as_str()),
+                "post-migration, the same value resolves through the new slot",
+            );
+            assert!(
+                keychain_value_legacy().is_none(),
+                "legacy slot must be empty post-migration",
+            );
+
+            delete_keychain();
+            std::fs::remove_dir_all(&home).ok();
+        }
+
+        /// Item #6.6c: the upgrade-window fallback honours the legacy
+        /// slot's active-flag gate. A paused 0.2.0 PAT MUST NOT leak.
+        #[test]
+        fn github_pat_for_env_legacy_fallback_honours_paused_state() {
+            if !keyring_available() {
+                eprintln!("[skip] no OS keychain backend in this test env");
+                return;
+            }
+            let (home, _guard) = setup_temp_env();
+            let db = make_db();
+            delete_keychain();
+
+            let canary = format!("ghp_legacy_paused_{}", uuid::Uuid::new_v4().simple());
+            let scope = crate::secrets::SecretScope::Shared {
+                project_id: SENTINEL_SHARED,
+            };
+            crate::secrets::set(scope, GITHUB_PAT_LEGACY_MODULE_ID, GITHUB_PAT_KEY, &canary)
+                .unwrap();
+            // Pause the legacy slot.
+            db.mark_secret_inactive("shared", SENTINEL_SHARED, GITHUB_PAT_LEGACY_MODULE_ID, GITHUB_PAT_KEY)
+                .unwrap();
+
+            assert_eq!(
+                github_pat_for_env(&db),
+                None,
+                "paused legacy PAT must NOT leak through the upgrade-window fallback",
+            );
+
+            // Cleanup.
+            db.forget_secret_active_state(
+                "shared",
+                SENTINEL_SHARED,
+                GITHUB_PAT_LEGACY_MODULE_ID,
+                GITHUB_PAT_KEY,
+            )
+            .unwrap();
+            delete_keychain();
+            std::fs::remove_dir_all(&home).ok();
+        }
+
+        /// Item #6.7: after the module_id migration runs, a subsequent
+        /// `migrate_github_pat_file_to_keychain` (the OTHER migration —
+        /// file → keychain) writes to the NEW user slot, not the old
+        /// installer slot. This pins ordering: const flip + module_id
+        /// migration + file→keychain migration must compose correctly.
+        #[test]
+        fn pat_file_to_keychain_migration_uses_user_slot_after_module_id_flip() {
+            if !keyring_available() {
+                eprintln!("[skip] no OS keychain backend in this test env");
+                return;
+            }
+            let (home, _guard) = setup_temp_env();
+            let db = make_db();
+            delete_keychain();
+
+            // Seed a file-fallback PAT — simulates a fresh install
+            // where the user has `~/.vct-secrets/shared/github_pat`
+            // but no keychain entries yet.
+            let file_canary = format!("ghp_file_{}", uuid::Uuid::new_v4().simple());
+            let shared_dir = vct_secrets_shared_dir().unwrap();
+            std::fs::create_dir_all(&shared_dir).unwrap();
+            std::fs::write(shared_dir.join("github_pat"), &file_canary).unwrap();
+
+            // Run the file→keychain migration. After our 2026-05-10
+            // const flip, this writes via GITHUB_PAT_MODULE_ID="user".
+            let report = migrate_github_pat_file_to_keychain(&db).unwrap();
+            assert!(report.migrated, "file→keychain must have run: {:?}", report);
+
+            // Value lands at the user slot, not the legacy installer slot.
+            assert_eq!(
+                keychain_value().as_deref(),
+                Some(file_canary.as_str()),
+                "file→keychain migration must write to the user slot post-flip",
+            );
+            assert!(
+                keychain_value_legacy().is_none(),
+                "file→keychain migration must NOT write to the legacy installer slot",
+            );
+
+            delete_keychain();
             std::fs::remove_dir_all(&home).ok();
         }
     }

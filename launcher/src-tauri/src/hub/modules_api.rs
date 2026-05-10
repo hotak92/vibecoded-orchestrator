@@ -595,16 +595,47 @@ async fn project_env(
                 &bs.key,
                 &project.id,
             );
-            if !active {
-                continue;
-            }
             let scope = match bs.scope.as_str() {
                 "global" => crate::secrets::SecretScope::Global,
                 "shared" => crate::secrets::SecretScope::Shared { project_id: SENTINEL_SHARED },
                 _ => crate::secrets::SecretScope::PerProject { project_id: &project.id },
             };
-            if let Ok(Some(val)) = crate::secrets::get(scope, &bs.module_id, &bs.key) {
-                env.insert(bs.key.clone(), serde_json::Value::String(val));
+            if active {
+                if let Ok(Some(val)) = crate::secrets::get(scope, &bs.module_id, &bs.key) {
+                    if !val.trim().is_empty() {
+                        env.insert(bs.key.clone(), serde_json::Value::String(val));
+                        continue;
+                    }
+                }
+            }
+
+            // 2026-05-10 (post-0.2.0 backlog #6): legacy slot fallback
+            // for `github_pat`. 0.2.0 launchers wrote the wizard PAT at
+            // `shared.installer/github_pat`; post-fix the canonical
+            // path is `shared.user/github_pat`. Until the user runs
+            // `register_github_pat` again (which triggers
+            // `migrate_github_pat_installer_to_user_module_id` to
+            // consolidate the slots), reads through the hub fall back
+            // to the legacy slot so existing tokens stay reachable
+            // across the upgrade. Once the migration has run the
+            // legacy slot is empty and this branch is a no-op.
+            if bs.scope == "shared" && bs.key == "github_pat" && bs.module_id == "user" {
+                let legacy_module_id = "installer";
+                let legacy_active = crate::db::secret_active::is_secret_active_cross_launcher_for_requester(
+                    &h.0,
+                    scope_str,
+                    lookup_project_id,
+                    legacy_module_id,
+                    &bs.key,
+                    &project.id,
+                );
+                if legacy_active {
+                    if let Ok(Some(val)) = crate::secrets::get(scope, legacy_module_id, &bs.key) {
+                        if !val.trim().is_empty() {
+                            env.insert(bs.key.clone(), serde_json::Value::String(val));
+                        }
+                    }
+                }
             }
         }
     }
@@ -1147,6 +1178,13 @@ mod tests {
     //      the SecretsPanel "Shared (this user)" tab) writes at
     //      `vct._user_shared_.shared.<module>`. Guaranteed miss.
     //
+    //      (post-0.2.0 backlog #6, 2026-05-10): the `<module>` segment
+    //      itself was also divergent — `register_github_pat` wrote
+    //      `installer/`, the SecretsPanel "Shared" tab wrote `user/`.
+    //      Both writers now use `user/` (`GITHUB_PAT_MODULE_ID`); the
+    //      hub-side bundled_secrets manifest entry below also pins
+    //      `module_id="user"` so the lookup tuple matches.
+    //
     //   2. Even after fixing the lookup-slot, the orchestrator core had
     //      no `secrets[]` declarations the hub could iterate over —
     //      `vct-module.json` is parsed as the slim `OrchestratorManifest`
@@ -1170,9 +1208,10 @@ mod tests {
     // lands at the repo root just like in prod).
     //
     // Test isolation: every test below writes to the SAME keychain slot
-    // (`vct._user_shared_.shared.installer/github_pat`) — that's the
-    // slot `vct-module.json::bundled_secrets` declares, and we can't
-    // use a different slot without forking the JSON for tests. Tests
+    // (`vct._user_shared_.shared.user/github_pat` — post-2026-05-10;
+    // pre-fix this was `installer/github_pat`). That's the slot
+    // `vct-module.json::bundled_secrets` declares, and we can't use a
+    // different slot without forking the JSON for tests. Tests
     // serialise via the process-wide
     // `crate::secrets::test_serialize::keychain_serialize_lock`, which
     // is the SAME mutex used by `commands::installer::github_pat_keychain_tests`
@@ -1215,11 +1254,12 @@ mod tests {
     /// H1 (item H1, 2026-05-08): the hub's `/projects/{id}/env?key=github_pat`
     /// must resolve through the keychain entry the OnboardingWizard +
     /// SecretsPanel "Shared (this user)" tab write to (`vct._user_shared_.
-    /// shared.installer/github_pat`), surfaced via the orchestrator's
+    /// shared.user/github_pat`, post-2026-05-10 unification — pre-fix
+    /// this was `installer/github_pat`), surfaced via the orchestrator's
     /// `vct-module.json::bundled_secrets` declaration.
     ///
     /// Pre-fix: returned 404 + `key_not_active` because the resolver
-    /// looked at `vct.<project.id>.shared.installer/github_pat` (a
+    /// looked at `vct.<project.id>.shared.<...>/github_pat` (a
     /// per-project slot the writer never touches).
     ///
     /// Skipped without an OS keychain backend (CI containers).
@@ -1233,7 +1273,7 @@ mod tests {
 
         // Best-effort cleanup from any prior test that crashed before
         // its tail cleanup ran — `delete` returns Ok on NoEntry.
-        delete_shared_keychain_canary("installer", "github_pat");
+        delete_shared_keychain_canary("user", "github_pat");
 
         // Fresh canary so a leftover from a previous run doesn't
         // accidentally pass the test. A timestamp suffix keeps it unique.
@@ -1241,7 +1281,7 @@ mod tests {
         let canary = format!("h1-shared-resolver-canary-{}", ts);
         // Write at the SENTINEL_SHARED slot — same shape the launcher's
         // writer uses.
-        write_shared_keychain_canary("installer", "github_pat", &canary);
+        write_shared_keychain_canary("user", "github_pat", &canary);
 
         let (base, h) = spawn_modules_api_hub().await;
         seed_project(&h.0, "h1-proj", "H1 Test Project", "/tmp/h1-test-project");
@@ -1249,7 +1289,7 @@ mod tests {
         // The orchestrator's `vct-module.json` (resolved by
         // `find_orchestrator_manifest()` walking up from current_exe())
         // declares `bundled_secrets[].key = "github_pat", scope =
-        // "shared", module_id = "installer"`. The hub iterates that
+        // "shared", module_id = "user"`. The hub iterates that
         // list during `project_env` and looks up the keychain at the
         // SENTINEL_SHARED slot.
         let resp = reqwest::get(format!(
@@ -1263,7 +1303,7 @@ mod tests {
         // strand a live PAT-shaped string in the user's OS keychain.
         let resp_status = resp.status();
         let resp_body: serde_json::Value = resp.json().await.expect("json body");
-        delete_shared_keychain_canary("installer", "github_pat");
+        delete_shared_keychain_canary("user", "github_pat");
 
         assert_eq!(
             resp_status, 200,
@@ -1294,7 +1334,7 @@ mod tests {
             return;
         }
         let _lock = h1_lock();
-        delete_shared_keychain_canary("installer", "github_pat");
+        delete_shared_keychain_canary("user", "github_pat");
 
         // Sanity: the on-disk manifest has a github_pat declaration. If
         // someone strips this, every fork user's resolver path silently
@@ -1307,7 +1347,7 @@ mod tests {
             .find(|bs| bs.key == "github_pat")
             .expect(
                 "vct-module.json::bundled_secrets[] must declare `github_pat` \
-                 (scope=shared, module_id=installer). Without it, the hub's \
+                 (scope=shared, module_id=user). Without it, the hub's \
                  /projects/{id}/env resolver has no manifest entry for \
                  github_pat and returns key_not_active.",
             );
@@ -1316,14 +1356,14 @@ mod tests {
             "github_pat declared in bundled_secrets must use scope=shared (matches register_github_pat)"
         );
         assert_eq!(
-            pat_decl.module_id, "installer",
-            "github_pat declared in bundled_secrets must use module_id=installer (matches register_github_pat's GITHUB_PAT_MODULE_ID const)"
+            pat_decl.module_id, "user",
+            "github_pat declared in bundled_secrets must use module_id=user (matches register_github_pat's GITHUB_PAT_MODULE_ID const, post-2026-05-10 unification with the SecretsPanel UI_MODULE_BUCKET)"
         );
 
         // End-to-end: keychain → hub → response body.
         let ts = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let canary = format!("h1-bundled-canary-{}", ts);
-        write_shared_keychain_canary("installer", "github_pat", &canary);
+        write_shared_keychain_canary("user", "github_pat", &canary);
 
         let (base, h) = spawn_modules_api_hub().await;
         seed_project(
@@ -1340,7 +1380,7 @@ mod tests {
         .expect("hub reachable");
         let status = resp.status();
         let body: serde_json::Value = resp.json().await.expect("json body");
-        delete_shared_keychain_canary("installer", "github_pat");
+        delete_shared_keychain_canary("user", "github_pat");
 
         assert_eq!(status, 200, "expected 200 with github_pat resolved; body: {}", body);
         assert_eq!(
@@ -1366,11 +1406,11 @@ mod tests {
             return;
         }
         let _lock = h1_lock();
-        delete_shared_keychain_canary("installer", "github_pat");
+        delete_shared_keychain_canary("user", "github_pat");
 
         let ts = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let canary = format!("h1-pause-canary-{}", ts);
-        write_shared_keychain_canary("installer", "github_pat", &canary);
+        write_shared_keychain_canary("user", "github_pat", &canary);
 
         let (base, h) = spawn_modules_api_hub().await;
         seed_project(
@@ -1384,7 +1424,7 @@ mod tests {
         // would reach this state when the user clicked "Unset" on the
         // shared github_pat entry. The keychain value stays put
         // (Lifecycle B), only the active flag flips.
-        h.0.mark_secret_inactive("shared", "_user_shared_", "installer", "github_pat")
+        h.0.mark_secret_inactive("shared", "_user_shared_", "user", "github_pat")
             .unwrap();
 
         let resp = reqwest::get(format!(
@@ -1397,9 +1437,9 @@ mod tests {
         let body: serde_json::Value = resp.json().await.expect("json body");
 
         // Cleanup BEFORE asserting so a failure doesn't strand state.
-        h.0.forget_secret_active_state("shared", "_user_shared_", "installer", "github_pat")
+        h.0.forget_secret_active_state("shared", "_user_shared_", "user", "github_pat")
             .unwrap();
-        delete_shared_keychain_canary("installer", "github_pat");
+        delete_shared_keychain_canary("user", "github_pat");
 
         // Hub MUST refuse to serve the value: the active-flag gate is
         // honoured at the SENTINEL_SHARED slot. Returns 404 + key_not_active.
@@ -1412,6 +1452,121 @@ mod tests {
             body.get("error").and_then(|e| e.get("code")).and_then(|v| v.as_str()),
             Some("key_not_active"),
             "expected key_not_active envelope; body: {}",
+            body
+        );
+    }
+
+    /// post-0.2.0 backlog #6 (2026-05-10): the hub's bundled_secrets
+    /// resolver falls back to the legacy `installer/` keychain slot
+    /// when the new `user/` slot is empty. This is the upgrade-window
+    /// guarantee: a 0.2.0 user whose PAT lives at the legacy slot
+    /// keeps getting their token from the hub until they trigger
+    /// `register_github_pat` again (which runs the consolidation
+    /// migration). Without this fallback, every 0.2.0 install would
+    /// silently lose `GITHUB_TOKEN` from its env files until the user
+    /// noticed and re-registered.
+    ///
+    /// Skipped without an OS keychain backend.
+    #[tokio::test]
+    async fn hub_resolver_falls_back_to_legacy_installer_slot_when_user_slot_empty() {
+        if !keyring_available() {
+            eprintln!("[skip] no OS keychain backend in this test env");
+            return;
+        }
+        let _lock = h1_lock();
+
+        // Wipe BOTH slots so a residue from a prior test doesn't
+        // mask the fallback path.
+        delete_shared_keychain_canary("user", "github_pat");
+        delete_shared_keychain_canary("installer", "github_pat");
+
+        // Seed the LEGACY slot only — simulates a 0.2.0 install that
+        // hasn't run the module_id migration yet.
+        let ts = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let canary = format!("h1-legacy-fallback-{}", ts);
+        write_shared_keychain_canary("installer", "github_pat", &canary);
+
+        let (base, h) = spawn_modules_api_hub().await;
+        seed_project(
+            &h.0,
+            "h1-legacy-fb-proj",
+            "H1 Legacy Fallback",
+            "/tmp/h1-legacy-fb-test-project",
+        );
+        let resp = reqwest::get(format!(
+            "{}/projects/h1-legacy-fb-proj/env?key=github_pat",
+            base
+        ))
+        .await
+        .expect("hub reachable");
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.expect("json body");
+
+        // Cleanup BEFORE asserting so a failure doesn't strand a
+        // PAT-shaped string in the user's OS keychain.
+        delete_shared_keychain_canary("installer", "github_pat");
+        delete_shared_keychain_canary("user", "github_pat");
+
+        assert_eq!(
+            status, 200,
+            "hub must return 200 with the legacy-slot PAT during the upgrade window; body: {}",
+            body
+        );
+        assert_eq!(
+            body.get("github_pat").and_then(|v| v.as_str()),
+            Some(canary.as_str()),
+            "hub must surface the legacy `installer/` slot value when `user/` is empty; body: {}",
+            body
+        );
+    }
+
+    /// post-0.2.0 backlog #6 (2026-05-10): the legacy fallback is
+    /// SUPPRESSED when the new `user/` slot has its OWN value. The new
+    /// slot wins (later-write semantics). Pins the precedence contract.
+    ///
+    /// Skipped without an OS keychain backend.
+    #[tokio::test]
+    async fn hub_resolver_user_slot_wins_when_both_slots_populated() {
+        if !keyring_available() {
+            eprintln!("[skip] no OS keychain backend in this test env");
+            return;
+        }
+        let _lock = h1_lock();
+
+        delete_shared_keychain_canary("user", "github_pat");
+        delete_shared_keychain_canary("installer", "github_pat");
+
+        let ts = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let new_canary = format!("h1-new-wins-{}", ts);
+        let old_canary = format!("h1-old-loses-{}", ts);
+        // Both slots populated.
+        write_shared_keychain_canary("user", "github_pat", &new_canary);
+        write_shared_keychain_canary("installer", "github_pat", &old_canary);
+
+        let (base, h) = spawn_modules_api_hub().await;
+        seed_project(
+            &h.0,
+            "h1-precedence-fb-proj",
+            "H1 Precedence Fallback",
+            "/tmp/h1-precedence-fb-test-project",
+        );
+        let resp = reqwest::get(format!(
+            "{}/projects/h1-precedence-fb-proj/env?key=github_pat",
+            base
+        ))
+        .await
+        .expect("hub reachable");
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.expect("json body");
+
+        delete_shared_keychain_canary("user", "github_pat");
+        delete_shared_keychain_canary("installer", "github_pat");
+
+        assert_eq!(status, 200, "expected 200; body: {}", body);
+        assert_eq!(
+            body.get("github_pat").and_then(|v| v.as_str()),
+            Some(new_canary.as_str()),
+            "user slot must win when both slots are populated; got body: {}",
             body
         );
     }
@@ -1438,7 +1593,7 @@ mod tests {
             return;
         }
         let _lock = h1_lock();
-        delete_shared_keychain_canary("installer", "github_pat");
+        delete_shared_keychain_canary("user", "github_pat");
 
         // Step 1: write the canary at the SENTINEL_SHARED slot. Both an
         // installed-module manifest and the orchestrator's bundled list
@@ -1446,7 +1601,7 @@ mod tests {
         // declaration is what's being read, not the bundled fallback.
         let ts = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let canary = format!("h1-precedence-canary-{}", ts);
-        write_shared_keychain_canary("installer", "github_pat", &canary);
+        write_shared_keychain_canary("user", "github_pat", &canary);
 
         let (base, h) = spawn_modules_api_hub().await;
         seed_project(
@@ -1468,7 +1623,7 @@ mod tests {
         .expect("hub reachable");
         let status = resp.status();
         let body: serde_json::Value = resp.json().await.expect("json body");
-        delete_shared_keychain_canary("installer", "github_pat");
+        delete_shared_keychain_canary("user", "github_pat");
 
         assert_eq!(
             status, 200,
