@@ -60,13 +60,17 @@ date +%s > "$MARKER" 2>/dev/null || true
 # session_id from stdin JSON is the canonical per-conversation key — see
 # diff-context-inject.sh for the same pattern. Falls back to "default"
 # only if the payload is malformed.
-SESSION_ID=$(echo "$HOOK_STDIN" | python3 -c "
+if [ -n "${PY:-}" ]; then
+    SESSION_ID=$(echo "$HOOK_STDIN" | "$PY" -c "
 import json, sys
 try:
     print(json.loads(sys.stdin.read()).get('session_id', ''))
 except Exception:
     print('')
 " 2>/dev/null || echo "")
+else
+    SESSION_ID=""
+fi
 [ -z "$SESSION_ID" ] && SESSION_ID="default"
 SNAPSHOT_DIR="${TMPDIR:-/tmp}/claude_ctx_snapshots"
 mkdir -p "$SNAPSHOT_DIR"

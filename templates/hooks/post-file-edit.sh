@@ -24,6 +24,10 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 set -euo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
+# Resolve Python portably — bare `python3` is missing on Windows.
+# shellcheck source=_lib/find-python.sh disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/find-python.sh"
+[ -z "${PY:-}" ] && exit 0  # No Python available — silent no-op
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -34,7 +38,7 @@ KNOWLEDGE_ROOT="$PROJECT_ROOT/knowledge"
 # similar env vars don't exist — settings.json substitutes to "". Verified
 # 2026-05-08 via stdin-capture diagnostic.
 HOOK_STDIN=$(cat 2>/dev/null || echo "")
-EDITED_FILE=$(printf '%s' "$HOOK_STDIN" | python3 -c "
+EDITED_FILE=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
 import json, sys
 try:
     d = json.loads(sys.stdin.read())

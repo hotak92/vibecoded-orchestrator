@@ -7,6 +7,9 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 # Background: does NOT write to stdout (not injected into context).
 
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
+# Resolve Python portably — bare `python3` is missing on Windows.
+# shellcheck source=_lib/find-python.sh disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/find-python.sh"
 
 PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
 LOG_FILE="$PROJECT_DIR/.claude/logs/config_changes.jsonl"
@@ -18,7 +21,8 @@ mkdir -p "$(dirname "$LOG_FILE")"
 # empirically 2026-05-08 via stdin-capture diagnostic. Without this,
 # every config-change audit entry was {"tool":"unknown","args":{}}.
 HOOK_STDIN=$(cat 2>/dev/null || echo "")
-TOOL_NAME=$(printf '%s' "$HOOK_STDIN" | python3 -c "
+if [ -n "${PY:-}" ]; then
+    TOOL_NAME=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
 import json, sys
 try:
     d = json.loads(sys.stdin.read())
@@ -26,7 +30,7 @@ try:
 except Exception:
     print('unknown')
 " 2>/dev/null || echo "unknown")
-TOOL_ARGS=$(printf '%s' "$HOOK_STDIN" | python3 -c "
+    TOOL_ARGS=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
 import json, sys
 try:
     d = json.loads(sys.stdin.read())
@@ -34,5 +38,9 @@ try:
 except Exception:
     print('{}')
 " 2>/dev/null || echo "{}")
+else
+    TOOL_NAME="unknown"
+    TOOL_ARGS="{}"
+fi
 
 echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"config_change\",\"tool\":\"${TOOL_NAME}\",\"args\":${TOOL_ARGS}}" >> "$LOG_FILE" 2>/dev/null || true

@@ -8,12 +8,23 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+# Resolve a Python interpreter portably (python3 → python → py). Must run
+# BEFORE the stdin-parsing step below because Windows ships python.exe / py
+# but not python3 — bare `python3` would silently fail on Windows.
+# See audit finding F6, 2026-04-30. _lib/find-python.sh sets $PY.
+# shellcheck source=_lib/find-python.sh disable=SC1091
+[ -f "$SCRIPT_DIR/_lib/find-python.sh" ] && . "$SCRIPT_DIR/_lib/find-python.sh"
+[ -z "${PY:-}" ] && exit 0  # No Python — silent no-op (security log skipped)
+
 # Hook input arrives as JSON on stdin per Claude Code v2.1.x spec.
 # Positional args ($1) are EMPTY because $CLAUDE_TOOL_ARG_FILE_PATH and
 # similar env vars don't exist — settings.json substitutes to "". Verified
 # 2026-05-08 via stdin-capture diagnostic.
 HOOK_STDIN=$(cat 2>/dev/null || echo "")
-EDITED_FILE=$(printf '%s' "$HOOK_STDIN" | python3 -c "
+EDITED_FILE=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
 import json, sys
 try:
     d = json.loads(sys.stdin.read())
@@ -22,14 +33,6 @@ try:
 except Exception:
     print('')
 " 2>/dev/null || echo "")
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-
-# Resolve a Python interpreter portably (python3 → python → py).
-# See audit finding F6, 2026-04-30. _lib/find-python.sh sets $PY.
-# shellcheck source=_lib/find-python.sh disable=SC1091
-[ -f "$SCRIPT_DIR/_lib/find-python.sh" ] && . "$SCRIPT_DIR/_lib/find-python.sh"
 
 ALERT_LOG="$PROJECT_ROOT/.claude/logs/credential_alerts.jsonl"
 mkdir -p "$(dirname "$ALERT_LOG")"
@@ -57,7 +60,7 @@ if [ ${#ALERTS[@]} -gt 0 ]; then
     MSG="Possible credential in $(basename "$EDITED_FILE"): ${ALERTS[*]}"
     # Build the JSONL line via Python so EDITED_FILE / ALERTS[] / patterns
     # are properly JSON-escaped. Audit fix 2026-05-07.
-    JSONL=$(EDITED_FILE_FOR_PY="$EDITED_FILE" PATTERNS_FOR_PY="${ALERTS[*]}" python3 -c '
+    JSONL=$(EDITED_FILE_FOR_PY="$EDITED_FILE" PATTERNS_FOR_PY="${ALERTS[*]}" "$PY" -c '
 import json, os, sys
 from datetime import datetime, timezone
 sys.stdout.write(json.dumps({

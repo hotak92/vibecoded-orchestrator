@@ -53,6 +53,10 @@ set -uo pipefail
 
 # Bypass switch.
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
+# Resolve Python portably — bare `python3` is missing on Windows.
+# shellcheck source=_lib/find-python.sh disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/find-python.sh"
+[ -z "${PY:-}" ] && exit 0  # No Python — silent no-op
 
 [ "${KG_NUDGE_OFF:-0}" = "1" ] && exit 0
 
@@ -71,7 +75,7 @@ mkdir -p "$METRICS_DIR" 2>/dev/null || exit 0
 # backslashes, or shell metacharacters can no longer break the Python parser.
 # Other substitutions (FIRST_THRESHOLD/INTERVAL/etc.) are under our control
 # and stay direct for readability. Audit fix 2026-05-07.
-KG_NUDGE_INPUT="$INPUT" python3 <<PYTHON_EOF || true
+KG_NUDGE_INPUT="$INPUT" "$PY" <<PYTHON_EOF || true
 import json
 import os
 import sys

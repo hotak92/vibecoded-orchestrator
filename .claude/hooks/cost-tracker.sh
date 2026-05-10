@@ -30,11 +30,15 @@ set -euo pipefail
 
 # Read stdin payload
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
+# Resolve Python portably — bare `python3` is missing on Windows.
+# shellcheck source=_lib/find-python.sh disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/find-python.sh"
+[ -z "${PY:-}" ] && exit 0  # No Python — silent no-op
 
 PAYLOAD=$(cat)
 
-# Extract fields using python (already in PATH)
-python3 - <<'PYEOF' "$PAYLOAD"
+# Extract fields using python (resolved portably above)
+"$PY" - <<'PYEOF' "$PAYLOAD"
 import sys, json, os, pathlib
 from datetime import datetime, timezone
 

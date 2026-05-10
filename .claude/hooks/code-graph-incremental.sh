@@ -65,13 +65,21 @@ if [[ ! "$EDITED_FILE" =~ \.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|j
     exit 0
 fi
 
-# Resolve python: prefer venv, fall back to system python3
+# Resolve python: prefer venv, fall back to system python (cross-OS).
+# Bare `python3` is missing on Windows (only python.exe / py exist).
+# Try POSIX venv layout first, then Windows venv layout, then system PATH
+# via _lib/find-python.sh (python3 → python → py).
 PYTHON="${VCT_PYTHON:-}"
 if [ -z "$PYTHON" ]; then
+    SCRIPT_DIR_CGI="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     if [ -x "$VENV/bin/python" ]; then
         PYTHON="$VENV/bin/python"
+    elif [ -x "$VENV/Scripts/python.exe" ]; then
+        PYTHON="$VENV/Scripts/python.exe"
     else
-        PYTHON="$(command -v python3 || true)"
+        # shellcheck source=_lib/find-python.sh disable=SC1091
+        [ -f "$SCRIPT_DIR_CGI/_lib/find-python.sh" ] && . "$SCRIPT_DIR_CGI/_lib/find-python.sh"
+        PYTHON="${PY:-}"
     fi
 fi
 

@@ -27,7 +27,13 @@ async def main():
     parser = argparse.ArgumentParser(description="KG search with RL reranking")
     parser.add_argument("query", help="Search query")
     parser.add_argument("--limit", type=int, default=1, help="Max results (default: 1)")
+    parser.add_argument(
+        "--hook-format",
+        action="store_true",
+        help="Prefix each result header with 'KG: ' so the pre-edit hook can dedup by title",
+    )
     args = parser.parse_args()
+    header_prefix = "KG: " if args.hook_format else ""
 
     # Import the MCP server's internals
     from weaviate_mcp.server import (
@@ -164,17 +170,17 @@ async def main():
                     or entry.get("summary")
                     or entry.get("content", "")
                 )
-                print(f"{title} | {node_type} | score={score:.2f} | {body}")
+                print(f"{header_prefix}{title} | {node_type} | score={score:.2f} | {body}")
             elif chunks_shown and chunks_total and chunks_total > 1:
                 body = entry.get("content", "")
                 print(
-                    f"{title} | {node_type} | score={score:.2f} | "
+                    f"{header_prefix}{title} | {node_type} | score={score:.2f} | "
                     f"{label} ({chunks_shown}/{chunks_total} chunks):"
                 )
                 print(body)
             else:
                 body = entry.get("content", "")
-                print(f"{title} | {node_type} | score={score:.2f} | {label}:")
+                print(f"{header_prefix}{title} | {node_type} | score={score:.2f} | {label}:")
                 print(body)
     finally:
         client.close()

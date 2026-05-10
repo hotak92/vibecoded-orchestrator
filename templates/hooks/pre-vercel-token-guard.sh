@@ -23,13 +23,17 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 # .claude/settings.json.
 
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
+# Resolve Python portably — bare `python3` is missing on Windows.
+# shellcheck source=_lib/find-python.sh disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/find-python.sh"
+[ -z "${PY:-}" ] && exit 0  # No Python available — silent no-op (guard offline)
 
 # Hook input arrives as JSON on stdin per Claude Code v2.1.x spec.
 # Positional args ($1/$2) are EMPTY because $CLAUDE_TOOL_NAME etc. don't exist
 # as env vars — settings.json substitutes them to "". Verified empirically
 # 2026-05-08 via stdin-capture diagnostic.
 HOOK_STDIN=$(cat 2>/dev/null || echo "")
-TOOL_NAME=$(printf '%s' "$HOOK_STDIN" | python3 -c "
+TOOL_NAME=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
 import json, sys
 try:
     d = json.loads(sys.stdin.read())
@@ -37,7 +41,7 @@ try:
 except Exception:
     print('')
 " 2>/dev/null || echo "")
-TOOL_ARGS=$(printf '%s' "$HOOK_STDIN" | python3 -c "
+TOOL_ARGS=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
 import json, sys
 try:
     d = json.loads(sys.stdin.read())
@@ -50,7 +54,7 @@ except Exception:
 [[ "$TOOL_NAME" != "Bash" ]] && exit 0
 
 # Extract the command string from the tool_input JSON
-CMD=$(printf '%s' "$TOOL_ARGS" | python3 -c "
+CMD=$(printf '%s' "$TOOL_ARGS" | "$PY" -c "
 import json, sys
 try:
     d = json.loads(sys.stdin.read())

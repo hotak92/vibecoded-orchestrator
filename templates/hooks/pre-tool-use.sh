@@ -23,6 +23,11 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 #   6. KG search suggestion before Edit/Write
 
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/emit-context.sh"
+# Resolve Python portably — bare `python3` is missing on Windows.
+# shellcheck source=_lib/find-python.sh disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/find-python.sh"
+[ -z "${PY:-}" ] && exit 0  # No Python — silent no-op (logging+guards skipped)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -33,7 +38,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # {"query":"","chosen_tool":"","tool_args":null} — silently broken.
 # Verified empirically 2026-05-08 via stdin-capture diagnostic.
 HOOK_STDIN=$(cat 2>/dev/null || echo "")
-TOOL_NAME=$(printf '%s' "$HOOK_STDIN" | python3 -c "
+TOOL_NAME=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
 import json, sys
 try:
     d = json.loads(sys.stdin.read())
@@ -41,7 +46,7 @@ try:
 except Exception:
     print('')
 " 2>/dev/null || echo "")
-TOOL_ARGS=$(printf '%s' "$HOOK_STDIN" | python3 -c "
+TOOL_ARGS=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
 import json, sys
 try:
     d = json.loads(sys.stdin.read())
@@ -49,7 +54,7 @@ try:
 except Exception:
     print('{}')
 " 2>/dev/null || echo "{}")
-USER_MESSAGE=$(printf '%s' "$HOOK_STDIN" | python3 -c "
+USER_MESSAGE=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
 import json, sys
 try:
     d = json.loads(sys.stdin.read())
@@ -57,7 +62,7 @@ try:
 except Exception:
     print('')
 " 2>/dev/null || echo "")
-SESSION_ID_FROM_STDIN=$(printf '%s' "$HOOK_STDIN" | python3 -c "
+SESSION_ID_FROM_STDIN=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
 import json, sys
 try:
     d = json.loads(sys.stdin.read())
@@ -75,7 +80,7 @@ mkdir -p "$PROJECT_ROOT/.claude/logs"
 
 # === HELPER: safe JSON field extraction ===
 _get_field() {
-    python3 -c "
+    "$PY" -c "
 import sys, json
 try:
     d = json.loads(sys.stdin.read())
@@ -94,7 +99,7 @@ TOUCAN_LOG="$PROJECT_ROOT/.claude/logs/toucan_dataset.jsonl"
 TOUCAN_JSONL=$(USER_MESSAGE_FOR_PY="$USER_MESSAGE" \
     TOOL_NAME_FOR_PY="$TOOL_NAME" \
     TOOL_ARGS_FOR_PY="$TOOL_ARGS" \
-    python3 -c '
+    "$PY" -c '
 import json, os, sys
 from datetime import datetime, timezone
 tool_args_raw = os.environ.get("TOOL_ARGS_FOR_PY", "")
@@ -161,7 +166,7 @@ if [[ "$TOOL_NAME" == "Bash" ]]; then
     # Extended security scan via bash_security.py
     SECURITY_SCRIPT="$PROJECT_ROOT/.claude/scripts/bash_security.py"
     if [[ -f "$SECURITY_SCRIPT" ]]; then
-        SECURITY_RESULT=$(echo "$CMD" | python3 "$SECURITY_SCRIPT" 2>&1)
+        SECURITY_RESULT=$(echo "$CMD" | "$PY" "$SECURITY_SCRIPT" 2>&1)
         SECURITY_EXIT=$?
         if [[ "$SECURITY_EXIT" -eq 2 ]]; then
             echo "🚨 Bash security scanner blocked this command:"
@@ -231,21 +236,10 @@ if [ -n "$CONCEPTS" ]; then
         # `hookSpecificOutput.additionalContext` — plain stdout is silently
         # discarded by Claude Code's hook runner. Pre-fork-sweep this
         # branch printed plaintext that never reached the LLM. Same fix
-        # class as pre-edit-context-inject (PR #168). 10k char cap matches
-        # that hook's contract. Falls back to no-op if python3 is missing.
+        # class as pre-edit-context-inject (PR #168). The shared helper
+        # in _lib/emit-context.sh handles the JSON envelope, the 10k char
+        # cap, and (defense-in-depth) the whitespace-only-content guard.
         SUGGESTION_TEXT=$(printf '\n💡 Found %s related patterns for: %s\n%s\n\n   Search more: '\''Search knowledge graph for [concept]'\''\n' "$MATCH_COUNT" "$CONCEPTS" "$(echo "$MATCHES" | sed 's/^/   /')")
-        if command -v python3 >/dev/null 2>&1; then
-            SUGGESTION_TRUNCATED=$(printf '%s' "$SUGGESTION_TEXT" | head -c 10000)
-            python3 -c "
-import json, sys
-print(json.dumps({
-    'hookSpecificOutput': {
-        'hookEventName': 'PreToolUse',
-        'permissionDecision': 'allow',
-        'additionalContext': sys.stdin.read(),
-    }
-}))
-" <<< "$SUGGESTION_TRUNCATED" 2>/dev/null || true
-        fi
+        emit_additional_context "$SUGGESTION_TEXT" PreToolUse
     fi
 fi

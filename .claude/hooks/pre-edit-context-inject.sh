@@ -25,6 +25,18 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 #   tests/test_kg_access_list.py for the consumer contract.
 
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/emit-context.sh"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+# Resolve a Python interpreter portably (python3 → python → py). Must run
+# BEFORE the stdin-parsing step below — bare `python3` is missing on
+# Windows (only python.exe / py exist) and would silently fail there.
+# See audit F4 + F6.
+# shellcheck source=_lib/find-python.sh disable=SC1091
+[ -f "$SCRIPT_DIR/_lib/find-python.sh" ] && . "$SCRIPT_DIR/_lib/find-python.sh"
+[ -z "${PY:-}" ] && exit 0  # No Python — silent no-op (KG/codegraph injection skipped)
 
 # Hook input arrives as JSON on stdin per Claude Code v2.1.x spec.
 # Positional args ($1/$2) are EMPTY because $CLAUDE_TOOL_NAME etc. don't
@@ -33,7 +45,7 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 HOOK_STDIN=$(cat 2>/dev/null || echo "")
 # Parse all fields we need in a single Python invocation (avoids re-parsing the
 # JSON 3+ times). Outputs three lines: tool_name, session_id, tool_input as JSON.
-_PARSED=$(printf '%s' "$HOOK_STDIN" | python3 -c "
+_PARSED=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
 import json, sys
 try:
     d = json.loads(sys.stdin.read())
@@ -53,14 +65,6 @@ TOOL_ARGS=$(printf '%s' "$_PARSED" | sed -n '3p')
 if [[ "$TOOL_NAME" != "Edit" ]]; then
     exit 0
 fi
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-
-# Resolve a Python interpreter portably (python3 → python → py).
-# Used for JSON arg parsing and cross-platform mtime; see audit F4 + F6.
-# shellcheck source=_lib/find-python.sh disable=SC1091
-[ -f "$SCRIPT_DIR/_lib/find-python.sh" ] && . "$SCRIPT_DIR/_lib/find-python.sh"
 
 # session_id from stdin JSON is the canonical per-conversation key. Falls
 # back to "default" only if the payload is malformed (which would mean the
@@ -101,36 +105,34 @@ if [[ -z "$FILE_PATH" ]]; then
 fi
 
 # === Build cache key from file path ===
-FILE_HASH=$(echo "$FILE_PATH" | md5sum | cut -d' ' -f1)
+# Use Python's hashlib for portability — `md5sum` is GNU-only and absent
+# on macOS (which has `md5 -q` instead) and minimal Linux installs.
+# Without this, every Mac install would compute an empty FILE_HASH and
+# every file would share the same cache key, corrupting the per-file
+# cache. Falls back to a sanitized FILE_PATH if Python is unavailable
+# (degrades to "no caching across paths" but stays correct).
+if [ -n "${PY:-}" ]; then
+    FILE_HASH=$(printf '%s' "$FILE_PATH" | "$PY" -c "import hashlib,sys; print(hashlib.md5(sys.stdin.buffer.read()).hexdigest())" 2>/dev/null)
+fi
+if [ -z "${FILE_HASH:-}" ]; then
+    # Sanitize path → safe filename (no slashes). Last-resort fallback.
+    FILE_HASH=$(printf '%s' "$FILE_PATH" | tr '/' '_' | tr ' ' '_' | head -c 100)
+fi
 CACHE_DIR="$CACHE_BASE"
 CACHE_FILE="$CACHE_DIR/$FILE_HASH"
 
 mkdir -p "$CACHE_DIR" 2>/dev/null || true
 
 # === Helper: emit context as PreToolUse JSON envelope ===
-# Plain stdout is silently discarded by Claude Code's hook runner — only
-# `hookSpecificOutput.additionalContext` reaches the LLM (system reminder
-# wrapper). 10k char cap per the documented contract. Pre-2026-05-08 this
-# hook printed plain stdout that never reached the LLM context, so all
-# the KG/codegraph injection work was effectively dead. Confirmed by
+# Wraps emit_additional_context from _lib/emit-context.sh — the helper
+# also gates on whitespace-only content so we don't surface empty
+# system-reminder blocks when dedup suppresses every result. Pre-2026-05-08
+# this hook printed plain stdout that never reached the LLM context, so
+# all the KG/codegraph injection work was effectively dead. Confirmed by
 # checking that no `[Pre-edit context for ...]` system-reminders ever
 # appeared in real Edit-tool transcripts.
 _emit_context_json() {
-    local ctx="$1"
-    [ -z "$ctx" ] && return 0
-    [ -z "${PY:-}" ] && return 0
-    local truncated
-    truncated=$(printf '%s' "$ctx" | head -c 10000)
-    "$PY" -c "
-import json, sys
-print(json.dumps({
-    'hookSpecificOutput': {
-        'hookEventName': 'PreToolUse',
-        'permissionDecision': 'allow',
-        'additionalContext': sys.stdin.read(),
-    }
-}))
-" <<< "$truncated" 2>/dev/null || true
+    emit_additional_context "$1" PreToolUse
 }
 
 # === Check cache (10 min TTL) ===
@@ -257,6 +259,11 @@ _filter_seen() {
         if [[ "$line" =~ ^(KG|CODE):\ (.+)$ ]]; then
             _flush_block
             local rest="${BASH_REMATCH[2]}"
+            # Defensive: strip any accidentally-doubled "KG: " / "CODE: " that
+            # could slip in from a formatting transition (e.g. an old cache
+            # written before the producers added their own prefix).
+            rest="${rest#KG: }"
+            rest="${rest#CODE: }"
             current_title="${rest%% | *}"
             # Cap to 200 chars defensively (some code-graph entity names can be long)
             current_title="${current_title:0:200}"
@@ -269,14 +276,41 @@ _filter_seen() {
             # Body line for the current block — accumulate.
             current_block="${current_block}${line}"$'\n'
         else
-            # Pre-amble or stray line not part of any block — pass through verbatim.
-            filtered="${filtered}${line}"$'\n'
+            # Pre-amble or stray line not part of any block — pass through
+            # only if it has non-whitespace content. Blank separators
+            # between fully-deduped blocks would otherwise leak through
+            # and make $filtered look "non-empty" to downstream HAS_KG
+            # checks, producing an empty system-reminder block.
+            if [[ "$line" =~ [^[:space:]] ]]; then
+                filtered="${filtered}${line}"$'\n'
+            fi
         fi
     done <<< "$input"
     _flush_block
 
     echo "$filtered"
 }
+
+# === Cache replay: if we have a cache hit, dedup it against the current
+# seen-list and emit. If everything in the cache is already seen, exit
+# silently (don't re-inject). The cache stores RAW per-result blocks
+# (KG:/CODE: headers) so this filter pass is meaningful.
+if [[ "$CACHE_HIT" == "1" ]]; then
+    FILTERED_CACHE=$(_filter_seen "$CACHE_BLOB")
+    TRIMMED=$(printf '%s' "$FILTERED_CACHE" | sed -e 's/^[[:space:]]*$//' | tr -d '\n')
+    if [[ -z "$TRIMMED" ]]; then
+        exit 0
+    fi
+    OUTPUT="[Pre-edit context for ${BASENAME}]:"$'\n'$'\n'"${FILTERED_CACHE}"
+    _emit_context_json "$OUTPUT"
+    exit 0
+fi
+
+# Capture raw producer output (pre-dedup) for the cache. Caching post-dedup
+# would perma-suppress titles seen at write-time but eligible to re-appear
+# after a /compact wipe.
+KG_RAW="$KG_RESULT"
+CODE_RAW="$CODE_RESULT"
 
 if [[ -n "$KG_RESULT" ]]; then
     KG_RESULT=$(_filter_seen "$KG_RESULT")
@@ -290,24 +324,35 @@ HAS_KG=$([[ -n "$KG_RESULT" ]] && echo "1" || echo "0")
 HAS_CODE=$([[ -n "$CODE_RESULT" ]] && echo "1" || echo "0")
 
 if [[ "$HAS_KG" == "0" ]] && [[ "$HAS_CODE" == "0" ]]; then
+    # Still cache raw (pre-dedup) results so a later edit of the same file
+    # within the TTL window can replay them through current dedup state.
+    RAW_CACHE=""
+    [[ -n "$KG_RAW" ]] && RAW_CACHE+="${KG_RAW}"$'\n'
+    [[ -n "$CODE_RAW" ]] && RAW_CACHE+="${CODE_RAW}"$'\n'
+    [[ -n "$RAW_CACHE" ]] && echo "$RAW_CACHE" > "$CACHE_FILE" 2>/dev/null || true
     exit 0
 fi
 
 # === Format output ===
+# Per-result headers already carry "KG: " / "CODE: " prefixes from the
+# producers (--hook-format). Don't add an extra block-level label.
 OUTPUT="[Pre-edit context for ${BASENAME}]:"$'\n'$'\n'
 
 if [[ "$HAS_KG" == "1" ]]; then
-    OUTPUT+="KG: ${KG_RESULT}"$'\n'
+    OUTPUT+="${KG_RESULT}"$'\n'
 fi
 
 if [[ "$HAS_CODE" == "1" ]]; then
-    OUTPUT+="Related code: ${CODE_RESULT}"$'\n'
+    OUTPUT+="${CODE_RESULT}"$'\n'
 fi
 
-# === Cache the plain-text form + emit JSON envelope ===
-# Cache stores the human-readable form so re-emission produces identical
-# content. _emit_context_json wraps it for Claude Code's PreToolUse contract.
-echo "$OUTPUT" > "$CACHE_FILE" 2>/dev/null || true
+# === Cache RAW per-result blocks (pre-dedup) so replays apply current
+# dedup state. Caching post-dedup output would perma-suppress titles
+# legitimately re-eligible after a /compact wipe.
+RAW_CACHE=""
+[[ -n "$KG_RAW" ]] && RAW_CACHE+="${KG_RAW}"$'\n'
+[[ -n "$CODE_RAW" ]] && RAW_CACHE+="${CODE_RAW}"$'\n'
+[[ -n "$RAW_CACHE" ]] && echo "$RAW_CACHE" > "$CACHE_FILE" 2>/dev/null || true
 
 _emit_context_json "$OUTPUT"
 

@@ -6,6 +6,9 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 set -euo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
+# Resolve Python portably — bare `python3` is missing on Windows.
+# shellcheck source=_lib/find-python.sh disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/find-python.sh"
 
 # Hook input contract (v2.1.x): JSON on stdin, NOT $CLAUDE_TOOL_NAME or
 # $CLAUDE_SESSION_ID env vars. Reading those env vars under `set -u` aborts
@@ -18,7 +21,8 @@ set -euo pipefail
 # state files (PR #176 cross-OS sweep — see knowledge/concepts/
 # hook-session-id-stdin-pattern.md).
 HOOK_STDIN=$(cat 2>/dev/null || echo "")
-SESSION_ID=$(printf '%s' "$HOOK_STDIN" | python3 -c "
+if [ -n "${PY:-}" ]; then
+    SESSION_ID=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
 import json, sys
 try:
     d = json.loads(sys.stdin.read())
@@ -26,6 +30,9 @@ try:
 except Exception:
     print('default')
 " 2>/dev/null || echo "default")
+else
+    SESSION_ID="default"
+fi
 [ -z "$SESSION_ID" ] && SESSION_ID="default"
 
 PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
