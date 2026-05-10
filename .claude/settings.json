@@ -50,19 +50,19 @@
             "type": "command",
             "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/ensure-containers.sh",
             "timeout": 15,
-            "background": true
+            "async": true
           },
           {
             "type": "command",
             "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/verify-container-ports.sh",
             "timeout": 30,
-            "background": true
+            "async": true
           },
           {
             "type": "command",
             "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/ensure-code-embed-service.sh",
             "timeout": 15,
-            "background": true
+            "async": true
           },
           {
             "type": "command",
@@ -178,7 +178,7 @@
             "type": "command",
             "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/config-change-audit.sh",
             "timeout": 2,
-            "background": true
+            "async": true
           }
         ]
       }
@@ -190,13 +190,13 @@
             "type": "command",
             "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/cost-tracker.sh",
             "timeout": 5,
-            "background": true
+            "async": true
           },
           {
             "type": "command",
             "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/notify-stop.sh",
             "timeout": 5,
-            "background": true
+            "async": true
           }
         ]
       }
@@ -208,7 +208,7 @@
             "type": "command",
             "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/stop-failure-notify.sh",
             "timeout": 5,
-            "background": true
+            "async": true
           }
         ]
       }
@@ -220,9 +220,7 @@
           {
             "type": "command",
             "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/post-file-edit.sh",
-            "timeout": 5,
-            "background": true,
-            "if": "Edit(*)|Write(*)"
+            "timeout": 5
           }
         ]
       },
@@ -232,9 +230,7 @@
           {
             "type": "command",
             "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/post-tool-security.sh",
-            "timeout": 5,
-            "background": true,
-            "if": "Edit(*)|Write(*)"
+            "timeout": 5
           }
         ]
       },
@@ -256,14 +252,14 @@
             "type": "command",
             "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || python3 -c \"import json,sys,subprocess,os; d=json.loads(sys.stdin.read()) if not sys.stdin.isatty() else {}; fp=d.get('tool_input',{}).get('file_path',''); subprocess.run(['python','.claude/scripts/sync_knowledge_graph.py',fp]) if fp else None\" 2>&1 || true",
             "timeout": 15,
-            "background": true,
+            "async": true,
             "if": "Edit(knowledge/**/*.md)|Write(knowledge/**/*.md)"
           },
           {
             "type": "command",
             "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/kg-summary-generator.sh",
             "timeout": 5,
-            "background": true,
+            "async": true,
             "if": "Edit(knowledge/**/*.md)|Write(knowledge/**/*.md)"
           }
         ]
@@ -275,7 +271,7 @@
             "type": "command",
             "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/kg-summary-generator.sh",
             "timeout": 5,
-            "background": true
+            "async": true
           }
         ]
       },
@@ -287,7 +283,7 @@
             "if": "Bash(git commit *)",
             "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/post-git-commit-kg-sync.sh",
             "timeout": 10,
-            "background": true
+            "async": true
           }
         ]
       },
@@ -297,7 +293,7 @@
           {
             "type": "command",
             "command": "bash .claude/hooks/kg-update-nudge.sh",
-            "background": true,
+            "async": true,
             "timeout": 3
           }
         ]

@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# OS-EXEMPT-PARITY: bash-side-only fix — switched bare `python3` to `"$PY"` via _lib/find-python.sh because Windows ships python.exe/py (no python3). The .ps1 sibling parses JSON natively via ConvertFrom-Json and never invokes Python, so it's already cross-OS-correct; no functional change applies on the PowerShell side.
 # Scrub sensitive env vars before any subprocess spawning
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
@@ -13,18 +12,29 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 #   (fan-out search across peer KGs). This hook is correct as-is; no
 #   centralization needed. See knowledge/concepts/multi-source-kg-runtime.md.
 
-# Claude Orchestrator post-file-edit hook
+# post-file-edit.sh — PostToolUse hook
 #
-# Actions:
-# 1. Auto-sync knowledge/ files to Weaviate (knowledge graph)
-# 2. Auto-sync docs/ files to Weaviate (development collection)
-# 3. Queue code graph updates for code files
-# 4. Remind to update project expert when CONTEXT_STATE.md changes significantly
-# 5. Suggest workflow optimization when Skills/Agents/hooks are edited
+# Side-effects (background):
+#   1. Auto-sync knowledge/ files to Weaviate
+#   2. Auto-sync docs/ files to Weaviate (development collection)
+#   3. Queue code-graph incremental update for code files
+#
+# LLM-visible reminders (routed through additionalContext envelope):
+#   4. CONTEXT_STATE.md significant-changes → expert-skill update prompt
+#   5. .claude/skills or .claude/hooks edits → workflow-test prompt
+#   6. Code-file edits → CONTEXT_STATE / KG capture reminder
+#
+# Plain stdout from PostToolUse hooks is silently dropped per the
+# v2.1.x contract (see `.claude/context/hook-audit-2026-05-10.md`),
+# so reminders intended for the model MUST go through
+# `emit_additional_context` from `_lib/emit-context.sh`. Status
+# banners ("syncing…", "done") are NOT emitted at all — they had
+# no consumer.
 
 set -euo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
+[ -f "$(dirname "${BASH_SOURCE[0]}")/_lib/emit-context.sh" ] && . "$(dirname "${BASH_SOURCE[0]}")/_lib/emit-context.sh"
 # Resolve Python portably — bare `python3` is missing on Windows.
 # shellcheck source=_lib/find-python.sh disable=SC1091
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/find-python.sh"
@@ -34,10 +44,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 KNOWLEDGE_ROOT="$PROJECT_ROOT/knowledge"
 
+# Accumulate LLM-visible reminders here, emit one envelope at the end.
+LLM_NUDGE=""
+_add_nudge() {
+    if [ -n "$LLM_NUDGE" ]; then
+        LLM_NUDGE="${LLM_NUDGE}
+
+$1"
+    else
+        LLM_NUDGE="$1"
+    fi
+}
+
 # Hook input arrives as JSON on stdin per Claude Code v2.1.x spec.
-# Positional args ($1) are EMPTY because $CLAUDE_TOOL_ARG_FILE_PATH and
-# similar env vars don't exist — settings.json substitutes to "". Verified
-# 2026-05-08 via stdin-capture diagnostic.
 HOOK_STDIN=$(cat 2>/dev/null || echo "")
 EDITED_FILE=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
 import json, sys
@@ -49,117 +68,83 @@ except Exception:
     print('')
 " 2>/dev/null || echo "")
 
-# Nothing to do if extraction failed or file path is empty.
 [ -z "$EDITED_FILE" ] && exit 0
 
-# 1. Auto-sync knowledge graph files (with integrated inference)
+# 1. Auto-sync knowledge graph files (background side-effect).
 if [[ "$EDITED_FILE" == "$KNOWLEDGE_ROOT"* ]]; then
-    echo "🔄 Knowledge file edited: $EDITED_FILE"
-    echo "   Syncing to Weaviate (inference happens during sync)..."
-
-    # Get relative path from project root
     REL_PATH="${EDITED_FILE#$PROJECT_ROOT/}"
-
-    # Run sync (inference now integrated - runs BEFORE storing to Weaviate)
     cd "$PROJECT_ROOT"
     .claude/scripts/kg-sync "$REL_PATH" &
 
-    echo "✅ Background sync started for knowledge graph"
-
-    # Run duplicate detection periodically (every 10th edit to avoid overhead)
     EDIT_COUNT_FILE="$PROJECT_ROOT/.claude/logs/.kg_edit_count"
     mkdir -p "$PROJECT_ROOT/.claude/logs"
-
     if [ -f "$EDIT_COUNT_FILE" ]; then
         COUNT=$(cat "$EDIT_COUNT_FILE")
     else
         COUNT=0
     fi
-
     COUNT=$((COUNT + 1))
     echo "$COUNT" > "$EDIT_COUNT_FILE"
-
-    # Check for duplicates every 10 edits.
-    # Cap output upstream of the grep filter — kg-duplicates is O(n²) over KG
-    # nodes so on large KGs the raw output can be thousands of lines. Audit
-    # fix 2026-05-07.
     if [ $((COUNT % 10)) -eq 0 ]; then
-        echo "🔍 Running duplicate detection (every 10 edits)..."
         (.claude/scripts/kg-duplicates --threshold 0.95 2>&1 \
             | head -c 204800 | head -200 \
             | grep -E "(✅|⚠️|📊)" || true) &
     fi
 fi
 
-# 2. Auto-sync development documentation files. Uses the same kg-sync
-#    entry point as knowledge/ — it routes by path: docs/* → dev
-#    collection (sync_doc), knowledge/* → KG (sync_node). Same chunker,
-#    same named-vector slot logic, same archive-skip behaviour.
-#    Audit-driven 2026-04-30; replaces the old upload_docs.py path.
+# 2. Auto-sync development documentation files (background side-effect).
 DOCS_DIR="$PROJECT_ROOT/docs"
 if [[ "$EDITED_FILE" == "$DOCS_DIR"* ]] && [[ "$EDITED_FILE" == *.md ]]; then
-    echo "📚 Documentation edited: $EDITED_FILE"
-    echo "   Syncing to Weaviate development collection..."
-
     REL_PATH="${EDITED_FILE#$PROJECT_ROOT/}"
     cd "$PROJECT_ROOT"
     .claude/scripts/kg-sync "$REL_PATH" &
-
-    echo "✅ Background sync started for development docs"
 fi
 
-# 3. Code file changes: incremental code graph update (debounced, 120s)
+# 3. Code file changes: incremental code graph update + LLM nudge.
 if [[ "$EDITED_FILE" =~ \.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$ ]]; then
-    echo "💻 Code file edited: $(basename "$EDITED_FILE")"
-
     bash "$SCRIPT_DIR/code-graph-incremental.sh" \
         "$EDITED_FILE" \
         "$PROJECT_ROOT" \
         "ClaudeOrchestrator"
 
-    echo "🧠 [Reminder] When done coding: update CONTEXT_STATE.md + add KG node if new patterns emerged."
+    _add_nudge "[Code edit reminder] $(basename "$EDITED_FILE") was just edited.
+When you're done with this work item:
+- Update CONTEXT_STATE.md with what changed and what's next.
+- Capture any non-obvious learnings as a KG node under knowledge/concepts/."
 fi
 
-# 4. Check for CONTEXT_STATE.md updates (project expert reminder)
+# 4. CONTEXT_STATE.md significant-changes → expert-skill nudge.
 if [[ "$EDITED_FILE" == *"CONTEXT_STATE.md" ]]; then
     EXPERT_SKILL="$PROJECT_ROOT/.claude/skills/project-experts/claude-orchestrator-expert.md"
-
     if [ -f "$EXPERT_SKILL" ]; then
-        # Count significant changes
         CHANGES=$(grep -E "(✅|##\s+(Status|Current Work|Next Steps|Knowledge Captured))" "$EDITED_FILE" | wc -l)
-
         if [ "$CHANGES" -gt 5 ]; then
-            echo ""
-            echo "📝 Significant changes to CONTEXT_STATE.md detected ($CHANGES markers)"
-            echo "   Consider updating: .claude/skills/project-experts/claude-orchestrator-expert.md"
-            echo ""
-            echo "   Update if:"
-            echo "   - Major milestone completed (Skills system, knowledge graph, etc.)"
-            echo "   - Architecture changed (MCP, agents, workflow)"
-            echo "   - New scripts/commands added (kg-*, wrappers)"
-            echo "   - Recent work section needs refresh"
-            echo ""
+            _add_nudge "[CONTEXT_STATE.md updated — expert-skill review] ${CHANGES} significant markers detected.
+Consider updating .claude/skills/project-experts/claude-orchestrator-expert.md if any of:
+  - Major milestone completed (Skills system, knowledge graph, etc.)
+  - Architecture changed (MCP, agents, workflow)
+  - New scripts/commands added (kg-*, wrappers)
+  - Recent work section needs refresh"
         fi
     fi
 fi
 
-# 5. Check for workflow system changes (Skills/Agents/hooks)
+# 5. Workflow-system edits (Skills/Agents/hooks) → workflow-test nudge.
 WORKFLOW_CHANGED=false
-
-
-# Check project-specific Skills/hooks
 if [[ "$EDITED_FILE" == "$PROJECT_ROOT/.claude/skills"* ]] || \
    [[ "$EDITED_FILE" == "$PROJECT_ROOT/.claude/hooks"* ]]; then
     WORKFLOW_CHANGED=true
 fi
-
 if [ "$WORKFLOW_CHANGED" = true ]; then
-    echo ""
-    echo "⚙️  Workflow system file edited: $(basename "$EDITED_FILE")"
-    echo "   Consider:"
-    echo "   - Test the change in actual usage"
-    echo "   - Update documentation if structure changed"
-    echo "   - Run /workflow-optimizer to check for optimizations"
-    echo "   - Update skills-setup-guide.md if setup process changed"
-    echo ""
+    _add_nudge "[Workflow file edited] $(basename "$EDITED_FILE") was changed.
+Consider:
+  - Test the change in actual usage before assuming it works.
+  - Update documentation if the structure changed.
+  - Run /workflow-optimizer to check for optimizations.
+  - Update skills-setup-guide.md if the setup process changed."
+fi
+
+# Emit accumulated nudges as a single PostToolUse envelope.
+if [ -n "$LLM_NUDGE" ] && command -v emit_additional_context >/dev/null 2>&1; then
+    emit_additional_context "$LLM_NUDGE" PostToolUse
 fi

@@ -1,4 +1,3 @@
-# Parity-touch 2026-05-08: bash shebang of sibling .sh switched from #!/bin/bash to #!/usr/bin/env bash for macOS portability. PS1 has no shebang to change; this comment is the parity-required modification.
 # Scrub sensitive env vars before any subprocess spawning
 foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
@@ -14,15 +13,33 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 #   (fan-out search across peer KGs). This hook is correct as-is; no
 #   centralization needed. See knowledge/concepts/multi-source-kg-runtime.md.
 
-# post-file-edit.ps1
-# Mirror of post-file-edit.sh. Auto-syncs knowledge/, docs/, and code files.
+# post-file-edit.ps1 — PostToolUse hook
+#
+# Side-effects (background): KG / docs sync, code-graph incremental.
+# LLM-visible reminders (additionalContext envelope):
+#   - Code-file edits → CONTEXT_STATE / KG capture reminder
+#   - CONTEXT_STATE.md significant-changes → expert-skill update prompt
+#   - .claude/skills or .claude/hooks edits → workflow-test prompt
+#
+# Plain stdout from PostToolUse hooks is silently dropped per the
+# v2.1.x contract — reminders intended for the model MUST go through
+# `Emit-AdditionalContext` from `_lib/emit-context.ps1`.
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
+$EmitContextLib = Join-Path $PSScriptRoot "_lib/emit-context.ps1"
+if (Test-Path $EmitContextLib) { . $EmitContextLib }
+
+# Accumulate LLM-visible reminders, emit one envelope at the end.
+$LlmNudge = ""
+function Add-Nudge([string]$msg) {
+    if ($script:LlmNudge) {
+        $script:LlmNudge = "$script:LlmNudge`n`n$msg"
+    } else {
+        $script:LlmNudge = $msg
+    }
+}
 
 # Hook input arrives as JSON on stdin per Claude Code v2.1.x spec.
-# Positional args ($args) are EMPTY because $CLAUDE_TOOL_ARG_FILE_PATH and
-# similar env vars don't exist — settings.json substitutes to "". Verified
-# empirically 2026-05-08 via stdin-capture diagnostic.
 $HookStdin = ""
 try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
 $EditedFile = ""
@@ -42,11 +59,8 @@ $DocsDir = Join-Path $ProjectRoot "docs"
 
 if (-not $EditedFile) { exit 0 }
 
-# 1. Knowledge graph auto-sync.
+# 1. Knowledge graph auto-sync (background side-effect).
 if ($EditedFile.StartsWith($KnowledgeRoot, [StringComparison]::OrdinalIgnoreCase)) {
-    Write-Output "Knowledge file edited: $EditedFile"
-    Write-Output "   Syncing to Weaviate (inference happens during sync)..."
-
     $relPath = $EditedFile
     if ($EditedFile.StartsWith($ProjectRoot, [StringComparison]::OrdinalIgnoreCase)) {
         $relPath = $EditedFile.Substring($ProjectRoot.Length).TrimStart('\','/')
@@ -59,7 +73,6 @@ if ($EditedFile.StartsWith($KnowledgeRoot, [StringComparison]::OrdinalIgnoreCase
     } elseif ((Test-Path $kgSyncSh) -and (Get-Command bash -ErrorAction SilentlyContinue)) {
         Start-Process -FilePath "bash" -ArgumentList @($kgSyncSh, $relPath) -WorkingDirectory $ProjectRoot -WindowStyle Hidden | Out-Null
     }
-    Write-Output "Background sync started for knowledge graph"
 
     # Duplicate detection every 10 edits.
     $editCountFile = Join-Path $ProjectRoot ".claude/logs/.kg_edit_count"
@@ -73,13 +86,8 @@ if ($EditedFile.StartsWith($KnowledgeRoot, [StringComparison]::OrdinalIgnoreCase
     Set-Content -Path $editCountFile -Value $count -Encoding ascii
 
     if (($count % 10) -eq 0) {
-        Write-Output "Running duplicate detection (every 10 edits)..."
         $dupPs1 = Join-Path $ProjectRoot ".claude/scripts/kg-duplicates.ps1"
         $dupSh = Join-Path $ProjectRoot ".claude/scripts/kg-duplicates"
-        # Note (audit fix 2026-05-07): the .ps1 sibling already discards
-        # output via `Start-Process -WindowStyle Hidden | Out-Null`, so the
-        # bash-side bug (unbounded grep buffer) does not exist here.
-        # Parity-touch only — no behavioural change.
         if (Test-Path $dupPs1) {
             Start-Process -FilePath "pwsh" -ArgumentList @('-NoProfile','-File',$dupPs1,'--threshold','0.95') -WorkingDirectory $ProjectRoot -WindowStyle Hidden | Out-Null
         } elseif ((Test-Path $dupSh) -and (Get-Command bash -ErrorAction SilentlyContinue)) {
@@ -88,10 +96,8 @@ if ($EditedFile.StartsWith($KnowledgeRoot, [StringComparison]::OrdinalIgnoreCase
     }
 }
 
-# 2. Docs auto-sync.
+# 2. Docs auto-sync (background side-effect).
 if ($EditedFile.StartsWith($DocsDir, [StringComparison]::OrdinalIgnoreCase) -and ($EditedFile -like "*.md")) {
-    Write-Output "Documentation edited: $EditedFile"
-    Write-Output "   Syncing to Weaviate development collection..."
     $venvPy = Join-Path (if ($env:VCT_INSTALL_ROOT) { $env:VCT_INSTALL_ROOT } else { $ProjectRoot }) "claude_mcp_servers\.venv\Scripts\python.exe"
     if (-not (Test-Path $venvPy)) {
         $venvPy = Join-Path (if ($env:VCT_INSTALL_ROOT) { $env:VCT_INSTALL_ROOT } else { $ProjectRoot }) "claude_mcp_servers/.venv/bin/python"
@@ -100,37 +106,32 @@ if ($EditedFile.StartsWith($DocsDir, [StringComparison]::OrdinalIgnoreCase) -and
     if ((Test-Path $venvPy) -and (Test-Path $uploadScript)) {
         Start-Process -FilePath $venvPy -ArgumentList @($uploadScript, $EditedFile) -WorkingDirectory $ProjectRoot -WindowStyle Hidden | Out-Null
     }
-    Write-Output "Background sync started for development docs"
 }
 
-# 3. Code file changes: code graph incremental update.
+# 3. Code file changes: code graph incremental update + LLM nudge.
 if ($EditedFile -match '\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$') {
     $bn = Split-Path $EditedFile -Leaf
-    Write-Output "Code file edited: $bn"
     $cgIncPs1 = Join-Path $ScriptDir "code-graph-incremental.ps1"
     if (Test-Path $cgIncPs1) {
         & pwsh -NoProfile -File $cgIncPs1 $EditedFile $ProjectRoot "ClaudeOrchestrator"
     }
-    Write-Output "Reminder: when done coding, update CONTEXT_STATE.md + add KG node if new patterns emerged."
+    Add-Nudge "[Code edit reminder] $bn was just edited.`nWhen you're done with this work item:`n- Update CONTEXT_STATE.md with what changed and what's next.`n- Capture any non-obvious learnings as a KG node under knowledge/concepts/."
 }
 
-# 4. CONTEXT_STATE.md update reminder.
+# 4. CONTEXT_STATE.md significant-changes → expert-skill nudge.
 if ($EditedFile.EndsWith("CONTEXT_STATE.md", [StringComparison]::OrdinalIgnoreCase)) {
     $expertSkill = Join-Path $ProjectRoot ".claude/skills/project-experts/claude-orchestrator-expert.md"
     if (Test-Path $expertSkill) {
         try {
             $changes = (Select-String -Path $EditedFile -Pattern '(✅|##\s+(Status|Current Work|Next Steps|Knowledge Captured))' -ErrorAction SilentlyContinue | Measure-Object).Count
             if ($changes -gt 5) {
-                Write-Output ""
-                Write-Output "Significant changes to CONTEXT_STATE.md detected ($changes markers)"
-                Write-Output "   Consider updating: .claude/skills/project-experts/claude-orchestrator-expert.md"
-                Write-Output ""
+                Add-Nudge "[CONTEXT_STATE.md updated — expert-skill review] $changes significant markers detected.`nConsider updating .claude/skills/project-experts/claude-orchestrator-expert.md if any of:`n  - Major milestone completed (Skills system, knowledge graph, etc.)`n  - Architecture changed (MCP, agents, workflow)`n  - New scripts/commands added (kg-*, wrappers)`n  - Recent work section needs refresh"
             }
         } catch { }
     }
 }
 
-# 5. Workflow system change reminder.
+# 5. Workflow-system edits → workflow-test nudge.
 $workflowChanged = $false
 $skillsDir = Join-Path $ProjectRoot ".claude/skills"
 $hooksDir = Join-Path $ProjectRoot ".claude/hooks"
@@ -139,13 +140,12 @@ if ($EditedFile.StartsWith($skillsDir, [StringComparison]::OrdinalIgnoreCase) -o
     $workflowChanged = $true
 }
 if ($workflowChanged) {
-    Write-Output ""
-    Write-Output "Workflow system file edited: $(Split-Path $EditedFile -Leaf)"
-    Write-Output "   Consider:"
-    Write-Output "   - Test the change in actual usage"
-    Write-Output "   - Update documentation if structure changed"
-    Write-Output "   - Run /workflow-optimizer to check for optimizations"
-    Write-Output "   - Update skills-setup-guide.md if setup process changed"
-    Write-Output ""
+    $bn = Split-Path $EditedFile -Leaf
+    Add-Nudge "[Workflow file edited] $bn was changed.`nConsider:`n  - Test the change in actual usage before assuming it works.`n  - Update documentation if the structure changed.`n  - Run /workflow-optimizer to check for optimizations.`n  - Update skills-setup-guide.md if the setup process changed."
+}
+
+# Emit accumulated nudges as a single PostToolUse envelope.
+if ($LlmNudge -and (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue)) {
+    Emit-AdditionalContext $LlmNudge PostToolUse
 }
 exit 0
