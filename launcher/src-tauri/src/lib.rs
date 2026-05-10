@@ -106,6 +106,68 @@ pub fn run() {
                 }
             }
 
+            // Migration 010 follow-up (2026-05-10): backfill the
+            // `project_mcp_servers` table for projects registered before
+            // this migration shipped. For each existing project with zero
+            // MCP rows, re-run `populate_project_state_from_filesystem`
+            // to seed the `.claude/settings.json::mcpServers` +
+            // `.mcp.json` mirror. The populate function is idempotent
+            // and preserves user toggles — running it on already-seeded
+            // projects is a no-op for non-MCP rows.
+            //
+            // Soft-fail: a single project's populate hiccup MUST NOT
+            // block launcher boot. We log + continue.
+            //
+            // Cost: O(projects) on disk reads, capped at ~10ms per
+            // project on healthy disks. Fine for a startup hook.
+            {
+                use tauri::Manager;
+                if let Some(db) = app.try_state::<db::Db>() {
+                    if let Ok(rows) = db.list_projects() {
+                        let mut seeded = 0usize;
+                        for proj in &rows {
+                            // Only act on projects that haven't been
+                            // populated yet (count==0). New projects
+                            // created post-010 already have rows from
+                            // create_project_v2's populate call.
+                            let needs_seed = matches!(
+                                db.count_project_mcp_servers(&proj.id),
+                                Ok(0)
+                            );
+                            if !needs_seed {
+                                continue;
+                            }
+                            let folder = std::path::Path::new(&proj.folder_path);
+                            if !folder.is_dir() {
+                                continue;
+                            }
+                            let report = crate::commands::project_state_populate::
+                                populate_project_state_from_filesystem(
+                                    &proj.id,
+                                    &proj.name,
+                                    folder,
+                                    db.inner(),
+                                );
+                            if report.mcp_servers_inserted > 0 {
+                                seeded += 1;
+                            }
+                            for w in &report.warnings {
+                                eprintln!(
+                                    "[vct] mcp-backfill warning ({}): {}",
+                                    proj.id, w
+                                );
+                            }
+                        }
+                        if seeded > 0 {
+                            eprintln!(
+                                "[vct] mcp-backfill: seeded MCP servers for {} project(s) (migration 010)",
+                                seeded
+                            );
+                        }
+                    }
+                }
+            }
+
             // Start the Hub API server in the background
             tauri::async_runtime::spawn(async {
                 match hub::server::start_hub_server().await {
@@ -245,6 +307,11 @@ pub fn run() {
             commands::project_state_cmd::delete_project_kg_binding,
             commands::project_state_cmd::set_project_codegraph_binding,
             commands::project_state_cmd::delete_project_codegraph_binding,
+            // Per-project MCP servers (migration 010 — Custom MCP tab feed).
+            commands::project_state_cmd::list_project_mcp_servers,
+            commands::project_state_cmd::list_user_added_project_mcp_servers,
+            commands::project_state_cmd::set_project_mcp_server_enabled,
+            commands::project_state_cmd::unregister_project_mcp_server,
             // Secrets + settings
             commands::secrets_cmd::set_secret_v2,
             commands::secrets_cmd::clear_secret_v2,

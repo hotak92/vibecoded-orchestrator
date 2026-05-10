@@ -271,6 +271,16 @@
   let conflictPreserveText = $state<string>(DEFAULT_PRESERVE_LIST.join('\n'));
   let conflictShowPreserveEditor = $state(false);
 
+  // KNOWN_ISSUES.md (v0.2.x) — lightweight reinstall path. When the
+  // user picks "Adopt as-is" (or simply wants a fast refresh of state
+  // files without re-pulling models / re-seeding the KG), enabling this
+  // checkbox forwards `--lightweight` to `install.py`. Optional
+  // `lightweightOldPath` rewrites absolute paths in `.env` /
+  // `.claude/settings.json` / `.vscode/settings.json` for users who
+  // moved the orchestrator clone to a new location.
+  let lightweightChecked = $state(false);
+  let lightweightOldPath = $state('');
+
   /**
    * Try to parse a Tauri Err string as an InstallConflictError. Tauri
    * surfaces our JSON-encoded error wrapped as a plain string, so we
@@ -372,6 +382,11 @@
   async function runInstall(
     confirmOverwrite = false,
     conflict: { strategy: ConflictStrategy; preserve_paths?: string[] } | null = null,
+    // KNOWN_ISSUES.md (v0.2.x) — lightweight reinstall opt-in, forwarded
+    // straight to install.py via the `lightweight` / `lightweight_old_path`
+    // fields on InstallConfig. When undefined the full install path runs
+    // unchanged.
+    lightweight: { lightweight?: boolean; lightweight_old_path?: string } | undefined = undefined,
   ) {
     installing = true;
     installError = null;
@@ -407,15 +422,24 @@
       // Conflict resolution: if `conflict` is null AND the target is an
       // Adopt-target, the Rust side returns InstallConflictError which we
       // catch below to render the 4-option modal.
+      const config = {
+        ...buildInstallConfig(),
+        lightweight: lightweight?.lightweight ?? false,
+        lightweight_old_path: lightweight?.lightweight_old_path,
+      };
       await invoke('install_orchestrator', {
-        config: buildInstallConfig(),
+        config,
         confirmOverwrite,
         conflict,
       });
       installed = true;
       pendingDiff = null;
       pendingConflict = null;
-      toast.success('Orchestrator installed');
+      toast.success(
+        lightweight?.lightweight
+          ? 'Lightweight reinstall complete'
+          : 'Orchestrator installed',
+      );
     } catch (e) {
       const raw = String(e);
       const conflictErr = tryParseConflictError(raw);
@@ -525,6 +549,16 @@
             .map((s) => s.trim())
             .filter(Boolean)
         : undefined;
+    // Lightweight reinstall opts out of the file-copy stage entirely
+    // and goes straight to install.py --lightweight. The conflict
+    // strategy is irrelevant on that path (no copy = no conflict to
+    // resolve) so we ignore the radio selection. Empty old-path string
+    // is normalised to undefined so the Rust side's serde-default
+    // catches it.
+    const lightweight = lightweightChecked;
+    const lightweight_old_path = lightweightChecked
+      ? (lightweightOldPath.trim() || undefined)
+      : undefined;
     pendingConflict = null;
     if (conflictResumeStep4) {
       // Came from step 4 — call install_orchestrator directly with the
@@ -542,6 +576,8 @@
             openai_key: null,
             container_runtime: null,
             skip_containers: true,
+            lightweight,
+            lightweight_old_path,
           },
           confirmOverwrite: false,
           conflict: { strategy: conflictStrategy, preserve_paths },
@@ -562,7 +598,7 @@
     await runInstall(false, {
       strategy: conflictStrategy,
       preserve_paths,
-    });
+    }, { lightweight, lightweight_old_path });
   }
 
   function cancelConflictResolution() {
@@ -1506,6 +1542,57 @@
         {/if}
       </div>
     {/if}
+
+    <!--
+      KNOWN_ISSUES.md (v0.2.x) — lightweight reinstall opt-in.
+
+      When checked, the launcher passes `--lightweight` to install.py.
+      The lightweight path skips model pulls, Weaviate seeding, agent /
+      skill copy, and full GPU detection — finishing in seconds rather
+      than minutes. Useful when the existing install is healthy and the
+      user just wants to refresh path-rewrites or env files.
+
+      The optional "previous path" input maps to `--lightweight-old-path`,
+      which install.py uses to rewrite absolute occurrences of the prior
+      install root in `.env` / `.claude/settings.json` /
+      `.vscode/settings.json` to the current location. Leave blank when
+      no path-rewrite is needed.
+
+      Bypasses the conflict-strategy radio above: with lightweight
+      enabled, no file copy happens, so the strategy is irrelevant.
+    -->
+    <div class="ow-lightweight">
+      <label class="ow-checkbox" style="margin-top:14px;">
+        <input type="checkbox" bind:checked={lightweightChecked} />
+        <span>
+          <strong>Fast reinstall (skip model pulls + KG seeding)</strong>
+        </span>
+      </label>
+      <p class="ow-secondary" style="margin:4px 0 0 22px;font-size:11px;">
+        Forwards <code>--lightweight</code> to <code>install.py</code>. Reuses
+        the existing <code>.venv</code> when healthy and skips the slow
+        steps. The strategy radio above is ignored when this is on.
+      </p>
+      {#if lightweightChecked}
+        <div style="margin:8px 0 0 22px;">
+          <label class="ow-label" style="margin:0;">
+            <span>Previous install path (optional)</span>
+            <input
+              type="text"
+              bind:value={lightweightOldPath}
+              placeholder="/old/path/to/vibecoded-orchestrator"
+            />
+          </label>
+          <p class="ow-secondary" style="margin:4px 0 0;font-size:11px;">
+            If set, <code>install.py</code> rewrites absolute occurrences
+            of this path in <code>.env</code> /
+            <code>.claude/settings.json</code> /
+            <code>.vscode/settings.json</code> to the current install
+            location. Leave blank if you didn't move the install.
+          </p>
+        </div>
+      {/if}
+    </div>
   {/snippet}
   {#snippet footer()}
     <div class="ow-confirm-actions">

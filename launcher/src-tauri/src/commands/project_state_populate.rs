@@ -17,16 +17,30 @@
 //! over a populate hiccup.
 //!
 //! Out of scope here (tracked separately, not yet investigated):
-//!   - `mcp_servers` table population (verify the table exists + whether
-//!     other code already auto-populates it before adding code here).
 //!   - The "Open project" button on the launcher's own self-tile.
 //!   - The RL reranker's misleading "Open" button.
+//!
+//! KNOWN_ISSUES.md (v0.2.x) entry resolved 2026-05-10:
+//!   "Custom MCP tab is not populated by initial project registration —
+//!    `project_state_populate` mirrors `.claude/settings.json::mcpServers`
+//!    into the launcher's per-project DB on `create_project_v2`, but
+//!    doesn't flag user-added entries (anything beyond bundled
+//!    `weaviate-kg` / `ollama` / `search` / `code-embedding` /
+//!    `playwright`) as `is_user_added=true`."
+//!
+//! `populate_mcp_servers` (added in this file 2026-05-10) reads
+//! `<folder>/.claude/settings.json::mcpServers` AND `<folder>/.mcp.json`
+//! (Anthropic project-scoped MCP config), inserts one row per entry into
+//! `project_mcp_servers`, and computes `is_user_added` from
+//! `BUNDLED_MCP_NAMES` (see `crate::db::project_mcp_servers`). Idempotent
+//! UPSERT preserves the `enabled` toggle.
 
 use std::path::Path;
 
 use serde_json::Value as JsonValue;
 
 use crate::commands::projects_v2::sanitize_kg_collection;
+use crate::db::project_mcp_servers::is_bundled_mcp;
 use crate::db::Db;
 
 /// Result summary for diagnostic logging. Not exposed to the frontend.
@@ -44,6 +58,12 @@ pub struct PopulateReport {
     /// `project X has no read access to collection Y` until the user
     /// manually granted via the GUI access matrix.
     pub kg_access_rows_inserted: usize,
+    /// Migration 010 (2026-05-10): MCP server rows seeded into
+    /// `project_mcp_servers` from `.claude/settings.json::mcpServers` +
+    /// `.mcp.json`. Counts both bundled and user-added entries; the
+    /// is_user_added flag is computed from the bundled-name allowlist
+    /// in `crate::db::project_mcp_servers::BUNDLED_MCP_NAMES`.
+    pub mcp_servers_inserted: usize,
     /// Soft errors, one entry per row that could not be inserted. The
     /// caller logs these but does NOT fail the project creation.
     pub warnings: Vec<String>,
@@ -71,6 +91,11 @@ pub fn populate_project_state_from_filesystem(
         populate_kg_bindings(project_id, project_name, db, &mut report);
         populate_codegraph_binding(project_id, project_name, db, &mut report);
         populate_kg_collection_access(project_id, project_name, db, &mut report);
+        // MCP servers can also live in `<folder>/.mcp.json` (Anthropic's
+        // project-scoped MCP config), which exists outside `.claude/`.
+        // Run the populator so a project with `.mcp.json` but no
+        // `.claude/` directory still surfaces user-added MCPs.
+        populate_mcp_servers(project_id, folder_path, db, &mut report);
         return report;
     }
 
@@ -80,6 +105,7 @@ pub fn populate_project_state_from_filesystem(
     populate_kg_bindings(project_id, project_name, db, &mut report);
     populate_codegraph_binding(project_id, project_name, db, &mut report);
     populate_kg_collection_access(project_id, project_name, db, &mut report);
+    populate_mcp_servers(project_id, folder_path, db, &mut report);
 
     report
 }
@@ -378,6 +404,120 @@ fn populate_hooks(
                 } else {
                     report.hooks_inserted += 1;
                 }
+            }
+        }
+    }
+}
+
+// ─── MCP servers (migration 010, 2026-05-10) ───────────────────────────
+//
+// Reads two source files and merges them into `project_mcp_servers`:
+//   1. `<folder>/.claude/settings.json::mcpServers` — the conventional
+//      per-project Claude Code surface. Empty in our default templates;
+//      user-added entries land here.
+//   2. `<folder>/.mcp.json` — Anthropic's project-scoped MCP config,
+//      flat top-level `{ "mcpServers": { ... } }` with the same entry
+//      shape. Some users prefer this file because it doesn't share a
+//      surface with hooks/permissions/env.
+//
+// `is_user_added` is the discriminator the Custom MCP tab filters on.
+// Computed via `is_bundled_mcp(name)`: true when the name is NOT in the
+// orchestrator's bundled allowlist.
+//
+// Idempotency: `register_project_mcp_server` UPSERTs on
+// (project_id, mcp_name) and leaves `enabled` untouched on conflict.
+// Re-running this function is safe and preserves user toggles.
+//
+// What we DO NOT scan: the global `~/.claude.json::mcpServers`. Those
+// entries are launcher-owned; the orchestrator DOES register the bundled
+// MCPs there for Claude Code to spawn, but they are not project-scoped.
+// Mirroring them into every project would inflate every Custom MCP tab
+// with the same global rows. The bundled set is seeded explicitly by
+// the orchestrator install path (when settings.json carries them) or
+// can be backfilled by a separate migration step if needed.
+
+fn populate_mcp_servers(
+    project_id: &str,
+    folder_path: &Path,
+    db: &Db,
+    report: &mut PopulateReport,
+) {
+    // Two source files in priority order. A name appearing in both files
+    // wins from `.mcp.json` (last-write semantics — UPSERT replaces the
+    // earlier row's config_json). This matches Claude Code's own
+    // precedence (project-scoped `.mcp.json` overrides settings.json).
+    let candidates: [(std::path::PathBuf, &str); 2] = [
+        (
+            folder_path.join(".claude").join("settings.json"),
+            ".claude/settings.json",
+        ),
+        (folder_path.join(".mcp.json"), ".mcp.json"),
+    ];
+
+    for (path, rel_label) in candidates.iter() {
+        if !path.is_file() {
+            continue;
+        }
+        let raw = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => {
+                report
+                    .warnings
+                    .push(format!("read {}: {}", path.display(), e));
+                continue;
+            }
+        };
+        let parsed: JsonValue = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(e) => {
+                // settings.json with invalid JSON is already warned about
+                // by populate_hooks; avoid double-warning by suppressing
+                // here when the path matches. `.mcp.json` parse errors
+                // ARE worth reporting though.
+                if rel_label != &".claude/settings.json" {
+                    report.warnings.push(format!(
+                        "{} parse error: {} (skipping mcp population)",
+                        path.display(),
+                        e
+                    ));
+                }
+                continue;
+            }
+        };
+        let mcp_obj = match parsed.get("mcpServers").and_then(|v| v.as_object()) {
+            Some(o) => o,
+            None => continue,
+        };
+        for (name, entry) in mcp_obj {
+            // Convenience top-level command lookup. Some MCP entries use
+            // `{ "command": "x" }`, others nest under `{ "transport":
+            // {"type": "stdio", "command": "x"} }`. We only persist the
+            // top-level field here for fast list rendering; the full
+            // entry survives in config_json.
+            let command = entry.get("command").and_then(|v| v.as_str());
+            let user_added = !is_bundled_mcp(name);
+            // Source attribution: bundled names get source='bundled'
+            // even when populated from a user-edited file, because the
+            // discriminator the rest of the codebase reads is
+            // `is_user_added`, not `source`. Keep the SQL CHECK happy
+            // (allowed values: bundled|user|paid-module|project).
+            let source = if user_added { "user" } else { "bundled" };
+            if let Err(e) = db.register_project_mcp_server(
+                project_id,
+                name,
+                user_added,
+                source,
+                None,
+                Some(rel_label),
+                command,
+                entry,
+            ) {
+                report.warnings.push(format!(
+                    "register_project_mcp_server({}/{}): {}",
+                    rel_label, name, e
+                ));
+            } else {
+                report.mcp_servers_inserted += 1;
             }
         }
     }
@@ -1097,6 +1237,271 @@ mod tests {
         assert_eq!(report.hooks_inserted, 0);
         assert_eq!(report.kg_bindings_inserted, 2);
         assert_eq!(report.codegraph_bindings_inserted, 1);
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    // ─── MCP servers (migration 010, 2026-05-10) ───────────────────
+
+    #[test]
+    fn populate_mcp_servers_from_settings_json_flags_user_added() {
+        // settings.json carries one bundled (weaviate-kg) and one
+        // user-added (transcrypt-live) entry. Populate must flag them
+        // correctly so the Custom MCP tab filters surface only the
+        // user-added one.
+        let folder = scratch_dir("mcp-settings");
+        let claude = folder.join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        let settings = serde_json::json!({
+            "mcpServers": {
+                "weaviate-kg": {
+                    "command": "/usr/bin/python3",
+                    "args": ["-m", "weaviate_mcp.server"],
+                    "env": {"OLLAMA_URL": "http://localhost:11435"}
+                },
+                "transcrypt-live": {
+                    "command": "/usr/local/bin/transcrypt-live",
+                    "args": []
+                }
+            }
+        });
+        std::fs::write(
+            claude.join("settings.json"),
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+
+        let db = make_db_with_project("p1", "Acme");
+        let report =
+            populate_project_state_from_filesystem("p1", "Acme", &folder, &db);
+
+        assert_eq!(report.mcp_servers_inserted, 2);
+        let mcp = db.list_project_mcp_servers("p1").unwrap();
+        assert_eq!(mcp.len(), 2);
+        let by_name: std::collections::HashMap<&str, &crate::db::project_mcp_servers::ProjectMcpServer> =
+            mcp.iter().map(|m| (m.mcp_name.as_str(), m)).collect();
+        let weaviate = by_name.get("weaviate-kg").expect("weaviate-kg row");
+        assert!(!weaviate.is_user_added, "weaviate-kg is bundled");
+        assert_eq!(weaviate.source, "bundled");
+        assert_eq!(weaviate.command.as_deref(), Some("/usr/bin/python3"));
+        assert_eq!(weaviate.source_file.as_deref(), Some(".claude/settings.json"));
+
+        let transcrypt = by_name.get("transcrypt-live").expect("transcrypt-live row");
+        assert!(transcrypt.is_user_added, "transcrypt-live is user-added");
+        assert_eq!(transcrypt.source, "user");
+
+        // Custom MCP tab feed surfaces only the user-added entry.
+        let custom = db.list_user_added_mcp_servers("p1").unwrap();
+        assert_eq!(custom.len(), 1);
+        assert_eq!(custom[0].mcp_name, "transcrypt-live");
+
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    #[test]
+    fn populate_mcp_servers_from_mcp_json_works_without_claude_dir() {
+        // Project folder has `.mcp.json` at the top level but NO
+        // `.claude/` subdirectory yet. The populate dispatcher's
+        // empty-folder branch must still pick up MCP servers from
+        // `.mcp.json`.
+        let folder = scratch_dir("mcp-only-mcpjson");
+        let mcp_json = serde_json::json!({
+            "mcpServers": {
+                "my-custom-mcp": {
+                    "command": "/path/to/mcp",
+                    "args": ["--port", "9000"]
+                }
+            }
+        });
+        std::fs::write(
+            folder.join(".mcp.json"),
+            serde_json::to_string_pretty(&mcp_json).unwrap(),
+        )
+        .unwrap();
+
+        let db = make_db_with_project("p1", "Acme");
+        let report =
+            populate_project_state_from_filesystem("p1", "Acme", &folder, &db);
+
+        assert_eq!(report.mcp_servers_inserted, 1);
+        let rows = db.list_user_added_mcp_servers("p1").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].mcp_name, "my-custom-mcp");
+        assert_eq!(rows[0].source_file.as_deref(), Some(".mcp.json"));
+        assert_eq!(rows[0].command.as_deref(), Some("/path/to/mcp"));
+
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    #[test]
+    fn populate_mcp_servers_merges_settings_and_mcp_json() {
+        // Both source files present with overlapping names — `.mcp.json`
+        // wins (last-write semantics). Documents the precedence so the
+        // Custom MCP tab matches Claude Code's own loader behaviour.
+        let folder = scratch_dir("mcp-both-files");
+        let claude = folder.join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(
+            claude.join("settings.json"),
+            serde_json::json!({
+                "mcpServers": {
+                    "shared-name": {"command": "/from/settings.json"},
+                    "settings-only": {"command": "/only/in/settings"}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            folder.join(".mcp.json"),
+            serde_json::json!({
+                "mcpServers": {
+                    "shared-name": {"command": "/from/mcp.json"},
+                    "mcp-only": {"command": "/only/in/mcp"}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let db = make_db_with_project("p1", "Acme");
+        let report =
+            populate_project_state_from_filesystem("p1", "Acme", &folder, &db);
+
+        // 4 register calls: 2 from settings.json + 2 from .mcp.json. The
+        // shared-name UPSERTs once, so the table has 3 distinct rows but
+        // the inserted counter logs the call count.
+        assert_eq!(report.mcp_servers_inserted, 4);
+        let rows = db.list_project_mcp_servers("p1").unwrap();
+        assert_eq!(rows.len(), 3);
+        let shared = rows
+            .iter()
+            .find(|r| r.mcp_name == "shared-name")
+            .expect("shared-name");
+        assert_eq!(
+            shared.command.as_deref(),
+            Some("/from/mcp.json"),
+            ".mcp.json should override settings.json"
+        );
+        assert_eq!(
+            shared.source_file.as_deref(),
+            Some(".mcp.json"),
+            "source_file reflects the last write"
+        );
+
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    #[test]
+    fn populate_mcp_servers_idempotent_preserves_user_disable() {
+        let folder = scratch_dir("mcp-idempotent");
+        let claude = folder.join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(
+            claude.join("settings.json"),
+            serde_json::json!({
+                "mcpServers": {
+                    "my-mcp": {"command": "x"}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let db = make_db_with_project("p1", "Acme");
+        populate_project_state_from_filesystem("p1", "Acme", &folder, &db);
+        // User disables it via the GUI.
+        db.set_project_mcp_server_enabled("p1", "my-mcp", false).unwrap();
+        // Re-run populate — disabled flag must survive.
+        populate_project_state_from_filesystem("p1", "Acme", &folder, &db);
+        let rows = db.list_project_mcp_servers("p1").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(
+            !rows[0].enabled,
+            "user's disabled flag must survive re-populate"
+        );
+
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    #[test]
+    fn populate_mcp_servers_no_settings_no_mcpjson_inserts_zero() {
+        // Empty project folder — neither file exists. Populate must
+        // simply insert zero rows and return zero warnings (a missing
+        // file is not an error condition).
+        let folder = scratch_dir("mcp-none");
+        let db = make_db_with_project("p1", "Acme");
+        let report =
+            populate_project_state_from_filesystem("p1", "Acme", &folder, &db);
+        assert_eq!(report.mcp_servers_inserted, 0);
+        // The KG/codegraph/access populators run unconditionally and
+        // generate no MCP-related warnings.
+        let mcp_warnings: Vec<_> = report
+            .warnings
+            .iter()
+            .filter(|w| w.contains("mcp") || w.contains("settings.json"))
+            .collect();
+        assert!(
+            mcp_warnings.is_empty(),
+            "no MCP warnings expected, got: {:?}",
+            mcp_warnings
+        );
+
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    #[test]
+    fn populate_mcp_servers_corrupt_mcpjson_warns_continues() {
+        // `.mcp.json` parse error must surface in warnings so a typo
+        // doesn't silently hide every user-added MCP. settings.json
+        // parse errors are already warned about by populate_hooks; we
+        // intentionally skip a duplicate warning there.
+        let folder = scratch_dir("mcp-corrupt");
+        std::fs::write(folder.join(".mcp.json"), "{not json").unwrap();
+
+        let db = make_db_with_project("p1", "Acme");
+        let report =
+            populate_project_state_from_filesystem("p1", "Acme", &folder, &db);
+        assert_eq!(report.mcp_servers_inserted, 0);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains(".mcp.json") && w.contains("parse error")),
+            "expected parse-error warning for .mcp.json, got: {:?}",
+            report.warnings
+        );
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    #[test]
+    fn populate_mcp_servers_appears_in_snapshot() {
+        // The GUI reads via get_project_state_snapshot; confirm
+        // mcp_servers field is wired through.
+        let folder = scratch_dir("mcp-snapshot");
+        let claude = folder.join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(
+            claude.join("settings.json"),
+            serde_json::json!({
+                "mcpServers": {
+                    "weaviate-kg": {"command": "/x"},
+                    "my-mcp": {"command": "/y"}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let db = make_db_with_project("p1", "Acme");
+        populate_project_state_from_filesystem("p1", "Acme", &folder, &db);
+        let snap = db.get_project_state_snapshot("p1").unwrap();
+        assert_eq!(snap.mcp_servers.len(), 2);
+        let user_added: Vec<&str> = snap
+            .mcp_servers
+            .iter()
+            .filter(|m| m.is_user_added)
+            .map(|m| m.mcp_name.as_str())
+            .collect();
+        assert_eq!(user_added, vec!["my-mcp"]);
         std::fs::remove_dir_all(&folder).ok();
     }
 

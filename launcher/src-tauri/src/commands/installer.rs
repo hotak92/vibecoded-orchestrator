@@ -53,6 +53,24 @@ pub struct InstallConfig {
     pub openai_key: Option<String>,
     pub container_runtime: Option<String>, // "docker" | "podman" | null (auto)
     pub skip_containers: bool,
+    /// KNOWN_ISSUES.md (v0.2.x) entry resolved 2026-05-10: when true,
+    /// pass `--lightweight` to install.py. The lightweight path skips
+    /// model pulls, Weaviate seeding, agent/skill copy, and full GPU
+    /// detection — completing in seconds instead of minutes. Used by
+    /// the launcher's reinstall flow when the existing install is
+    /// healthy and the user just wants path-rewrite + venv refresh.
+    ///
+    /// When None / false, the full install path runs as before.
+    #[serde(default)]
+    pub lightweight: bool,
+    /// Used together with `lightweight=true`: forwarded to install.py
+    /// as `--lightweight-old-path`. install.py rewrites absolute
+    /// occurrences of this path in `.env` / `.claude/settings.json` /
+    /// `.vscode/settings.json` to the new install location. Leave None
+    /// when no path-rewrite is needed (e.g. a re-install that simply
+    /// regenerates state files in place).
+    #[serde(default)]
+    pub lightweight_old_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1128,6 +1146,26 @@ pub async fn install_orchestrator(
         return Err(err.into_err_string());
     }
 
+    // KNOWN_ISSUES.md (v0.2.x) entry resolved 2026-05-10: lightweight
+    // re-install path. When `config.lightweight` is set, skip the
+    // file-copy stage entirely and go straight to `install.py
+    // --lightweight`. install.py's lightweight path:
+    //   - Skips model pulls (qwen3-embedding, codesage, etc.)
+    //   - Skips Weaviate seeding (idempotent upserts already done)
+    //   - Skips agent/skill copy (templates → .claude/)
+    //   - Reuses existing healthy `.venv` (recreates only on Python
+    //     version mismatch or requirements.txt drift)
+    //   - Optionally rewrites absolute paths in `.env` /
+    //     `.claude/settings.json` / `.vscode/settings.json` when
+    //     `--lightweight-old-path` is supplied.
+    //
+    // Total runtime: seconds vs the full path's minutes. Used by the
+    // launcher's reinstall flow when the user just wants a refresh of
+    // state files without re-pulling models or re-seeding the KG.
+    if config.lightweight {
+        return run_install_orchestrator_lightweight(config, install_path, window).await;
+    }
+
     // Stage 1: Locate local source
     emit_progress(&window, "locate", "Locating orchestrator source...", 5.0);
     let source = find_local_repo_root()?;
@@ -1342,6 +1380,184 @@ pub async fn install_orchestrator(
         success: true,
         install_path: config.install_path,
         message: "Orchestrator installed successfully".to_string(),
+        system,
+    })
+}
+
+/// Lightweight re-install path. Skips file copy, skips model pulls,
+/// skips Weaviate seeding — invokes `install.py --lightweight` directly.
+///
+/// KNOWN_ISSUES.md (v0.2.x) entry resolved 2026-05-10:
+///   "Lightweight Rust wiring for `--lightweight` re-install — the
+///    Python path is shipped (`install.py --lightweight` skips model
+///    pulls + seeding + agent/skill copy; `--lightweight-old-path`
+///    rewrites absolute paths in settings/env files). The launcher's
+///    'Reinstall' button currently calls full install; wiring it to
+///    the lightweight path is a v0.2.x polish item."
+///
+/// Builds the install.py argv for the subprocess. Extracted as a
+/// pub(crate) helper so unit tests can verify the argv shape WITHOUT
+/// spawning a real subprocess (which would require a Python interpreter
+/// + an installed VCO clone in the test env).
+pub(crate) fn build_lightweight_install_argv(
+    use_gpu: bool,
+    cpu_only: bool,
+    container_runtime: Option<&str>,
+    skip_containers: bool,
+    lightweight_old_path: Option<&str>,
+) -> Vec<String> {
+    let mut argv = vec![
+        "install.py".to_string(),
+        "--quiet".to_string(),
+        "--no-joern".to_string(),
+        "--lightweight".to_string(),
+    ];
+    if let Some(old) = lightweight_old_path {
+        if !old.is_empty() {
+            argv.push("--lightweight-old-path".to_string());
+            argv.push(old.to_string());
+        }
+    }
+    // Forward the same hardware-flag set that the full install path
+    // accepts. install.py's lightweight branch ignores most of these
+    // (it doesn't pull models or detect GPU), but the flags themselves
+    // are still parsed; passing them keeps argv shape consistent and
+    // lets a future lightweight-path enhancement use them without
+    // a launcher-side change.
+    if use_gpu {
+        argv.push("--gpu".to_string());
+    }
+    if cpu_only {
+        argv.push("--cpu-only".to_string());
+    }
+    if let Some(runtime) = container_runtime {
+        if !runtime.is_empty() {
+            argv.push("--container".to_string());
+            argv.push(runtime.to_string());
+        }
+    }
+    if skip_containers {
+        argv.push("--no-containers".to_string());
+    }
+    argv
+}
+
+async fn run_install_orchestrator_lightweight(
+    config: InstallConfig,
+    install_path: PathBuf,
+    window: Window,
+) -> Result<InstallResult, String> {
+    let system = detect_system().await?;
+    if !system.has_python {
+        return Err(
+            "Python 3.11+ is required for lightweight reinstall. Install from https://python.org"
+                .to_string(),
+        );
+    }
+
+    // Lightweight runs IN PLACE — install_path must already be a VCO
+    // source repo. The caller (wizard) gates this with the same
+    // validate_source_repo check that the full path uses; we re-check
+    // here defensively in case a future caller forgets.
+    if !install_path.is_dir() {
+        return Err(format!(
+            "lightweight install: path {} is not a directory",
+            install_path.display()
+        ));
+    }
+
+    emit_progress(&window, "lightweight", "Running install.py --lightweight...", 20.0);
+
+    let argv = build_lightweight_install_argv(
+        config.use_gpu,
+        config.cpu_only,
+        config.container_runtime.as_deref(),
+        config.skip_containers,
+        config.lightweight_old_path.as_deref(),
+    );
+
+    let python_cmd = &system.python_cmd;
+    let mut cmd = tokio::process::Command::new(python_cmd);
+    cmd.args(&argv)
+        .stdin(std::process::Stdio::null())
+        .current_dir(&install_path);
+
+    // Forward the same launcher-resolved service ports the full path
+    // does. install.py's lightweight branch reads these so a port
+    // override survives a re-install. See `install.py:1352
+    // _run_lightweight` and the env-write block in
+    // `_lightweight_rewrite_paths`.
+    let services_state = crate::services::adoption::read();
+    let pick_port = |name: &str, default: u16| -> u16 {
+        if let Some(svc) = services_state.get(name) {
+            match svc.mode {
+                crate::services::adoption::AdoptionMode::Parallel => {
+                    if let Some(p) = svc.parallel_port {
+                        return p;
+                    }
+                }
+                crate::services::adoption::AdoptionMode::Adopt => {
+                    if let Some(url) = svc.external_url.as_deref() {
+                        let after = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+                        let host_port = after.split('/').next().unwrap_or(after);
+                        if let Some(p) =
+                            host_port.rsplit(':').next().and_then(|s| s.parse::<u16>().ok())
+                        {
+                            return p;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        default
+    };
+    let weaviate_port = pick_port("weaviate", DEFAULT_WEAVIATE_PORT);
+    let ollama_port = pick_port("ollama", DEFAULT_OLLAMA_PORT);
+    let code_embed_port = pick_port("code_embed", DEFAULT_CODE_EMBED_PORT);
+    cmd.env("WEAVIATE_PORT", weaviate_port.to_string())
+        .env("OLLAMA_PORT", ollama_port.to_string())
+        .env("CODE_EMBED_PORT", code_embed_port.to_string());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+
+    let output = cmd
+        .output()
+        .await
+        .map_err(|e| format!("install.py --lightweight failed to start: {}", e))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if !output.status.success() {
+        emit_progress(
+            &window,
+            "error",
+            &format!("Lightweight reinstall failed: {}", stderr),
+            0.0,
+        );
+        return Err(format!(
+            "install.py --lightweight failed (exit {}):\n{}\n{}",
+            output.status, stdout, stderr
+        ));
+    }
+
+    emit_progress(&window, "verify", "Verifying installation...", 90.0);
+    let installed = check_install_status(install_path.to_string_lossy().to_string());
+    if !installed {
+        return Err(
+            "Lightweight reinstall completed but verification failed".to_string(),
+        );
+    }
+    emit_progress(&window, "done", "Lightweight reinstall complete", 100.0);
+
+    Ok(InstallResult {
+        success: true,
+        install_path: install_path.to_string_lossy().to_string(),
+        message: "Lightweight reinstall complete".to_string(),
         system,
     })
 }
@@ -7162,6 +7378,136 @@ MemAvailable:   23456789 kB
 
             delete_keychain();
             std::fs::remove_dir_all(&home).ok();
+        }
+    }
+
+    // ─── Lightweight reinstall argv builder (KNOWN_ISSUES v0.2.x) ──────
+    //
+    // These tests verify the argv shape the launcher passes to
+    // install.py for the lightweight reinstall flow. Spawning the real
+    // subprocess would require a Python interpreter + an installed VCO
+    // clone in the test env; the argv builder is the testable seam.
+
+    mod lightweight_argv_tests {
+        use super::*;
+
+        #[test]
+        fn lightweight_argv_minimal_no_old_path() {
+            let argv = build_lightweight_install_argv(false, false, None, false, None);
+            // Order matters — install.py argument parser is order-insensitive
+            // but we lock the shape so the wizard's expected behaviour stays
+            // observable in test output.
+            assert_eq!(
+                argv,
+                vec![
+                    "install.py".to_string(),
+                    "--quiet".to_string(),
+                    "--no-joern".to_string(),
+                    "--lightweight".to_string(),
+                ]
+            );
+        }
+
+        #[test]
+        fn lightweight_argv_with_old_path() {
+            let argv = build_lightweight_install_argv(
+                false,
+                false,
+                None,
+                false,
+                Some("/old/install/path"),
+            );
+            assert!(argv.contains(&"--lightweight".to_string()));
+            assert!(argv.contains(&"--lightweight-old-path".to_string()));
+            // Argv contains the literal old-path string AS the next element
+            // after the flag — install.py reads it as a positional.
+            let i = argv
+                .iter()
+                .position(|s| s == "--lightweight-old-path")
+                .expect("flag");
+            assert_eq!(argv.get(i + 1).map(String::as_str), Some("/old/install/path"));
+        }
+
+        #[test]
+        fn lightweight_argv_empty_old_path_omits_flag() {
+            // Empty string in `Some("")` must NOT produce a stray flag —
+            // install.py would reject it. Defensive guard against the
+            // wizard sending an empty text input.
+            let argv = build_lightweight_install_argv(false, false, None, false, Some(""));
+            assert!(!argv.contains(&"--lightweight-old-path".to_string()));
+        }
+
+        #[test]
+        fn lightweight_argv_forwards_hardware_flags() {
+            let argv = build_lightweight_install_argv(
+                true,            // gpu
+                false,           // not cpu_only
+                Some("podman"),  // container runtime
+                false,           // skip_containers
+                None,
+            );
+            assert!(argv.contains(&"--gpu".to_string()));
+            assert!(!argv.contains(&"--cpu-only".to_string()));
+            assert!(argv.contains(&"--container".to_string()));
+            assert!(argv.contains(&"podman".to_string()));
+            assert!(!argv.contains(&"--no-containers".to_string()));
+        }
+
+        #[test]
+        fn lightweight_argv_mutually_exclusive_gpu_cpu_only() {
+            // Both flags can be passed; install.py validates exclusivity
+            // itself. The launcher's job is to forward what the user
+            // selected — we don't second-guess.
+            let argv =
+                build_lightweight_install_argv(true, true, None, false, None);
+            assert!(argv.contains(&"--gpu".to_string()));
+            assert!(argv.contains(&"--cpu-only".to_string()));
+        }
+
+        #[test]
+        fn lightweight_argv_skip_containers() {
+            let argv =
+                build_lightweight_install_argv(false, false, None, true, None);
+            assert!(argv.contains(&"--no-containers".to_string()));
+        }
+
+        #[test]
+        fn lightweight_argv_empty_container_runtime_omits_flag() {
+            let argv = build_lightweight_install_argv(false, false, Some(""), false, None);
+            assert!(!argv.contains(&"--container".to_string()));
+        }
+
+        #[test]
+        fn install_config_deserialises_lightweight_fields() {
+            // Frontend payload validation: a JSON payload missing the
+            // new `lightweight` and `lightweight_old_path` fields must
+            // still deserialise (defaults to false / None).
+            let json_minimal = serde_json::json!({
+                "install_path": "/x",
+                "use_gpu": false,
+                "cpu_only": false,
+                "openai_key": null,
+                "container_runtime": null,
+                "skip_containers": false,
+            });
+            let cfg: InstallConfig = serde_json::from_value(json_minimal).unwrap();
+            assert!(!cfg.lightweight, "default lightweight=false");
+            assert!(cfg.lightweight_old_path.is_none(), "default old_path=None");
+
+            // Full payload roundtrips both fields.
+            let json_full = serde_json::json!({
+                "install_path": "/x",
+                "use_gpu": true,
+                "cpu_only": false,
+                "openai_key": null,
+                "container_runtime": "podman",
+                "skip_containers": false,
+                "lightweight": true,
+                "lightweight_old_path": "/old/path"
+            });
+            let cfg: InstallConfig = serde_json::from_value(json_full).unwrap();
+            assert!(cfg.lightweight);
+            assert_eq!(cfg.lightweight_old_path.as_deref(), Some("/old/path"));
         }
     }
 }

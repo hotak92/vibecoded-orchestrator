@@ -63,6 +63,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "secrets: per-(secret × requester_project) active flag + secret_grants table for cross-project sharing (0.2.1)",
         sql: include_str!("migrations/009_per_project_active_and_grants.sql"),
     },
+    Migration {
+        version: 10,
+        description: "project_mcp_servers: per-project mirror of `.claude/settings.json::mcpServers` + `.mcp.json` with is_user_added flag for Custom MCP tab (KNOWN_ISSUES v0.2.x)",
+        sql: include_str!("migrations/010_project_mcp_servers.sql"),
+    },
 ];
 
 /// Apply every migration whose version is greater than the current max applied.

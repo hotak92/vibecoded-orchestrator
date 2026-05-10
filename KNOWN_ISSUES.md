@@ -70,20 +70,8 @@ flagging for early adopters and the next iteration.
 
 ## Pending v0.2.x
 
-- [ ] **Custom MCP tab is not populated by initial project registration** — `project_state_populate`
-      mirrors `.claude/settings.json::mcpServers` into the launcher's per-project DB on `create_project_v2`,
-      but doesn't flag user-added entries (anything beyond bundled `weaviate-kg` / `ollama` / `search` /
-      `code-embedding` / `playwright`) as `is_user_added=true`. Tab reads with that filter so user-added
-      servers show up blank. Workaround: re-add via the launcher's "Add MCP" button (writes the row with
-      the correct flag), or click Refresh on the MCP tab. Fix on v0.2.x backlog.
-
 - [ ] **Apple Developer enrollment / notarization pending** — already in this list under Install/first-run;
       deferred from 0.2.0, tracked for a future minor release. Without notarization the macOS `.dmg` requires manual Gatekeeper override.
-
-- [ ] **Lightweight Rust wiring for `--lightweight` re-install** — the Python path is shipped (`install.py
-      --lightweight` skips model pulls + seeding + agent/skill copy; `--lightweight-old-path` rewrites
-      absolute paths in settings/env files). The launcher's "Reinstall" button currently calls full install;
-      wiring it to the lightweight path is a v0.2.x polish item.
 
 ## Recently fixed
 
@@ -101,6 +89,25 @@ flagging for early adopters and the next iteration.
   `github_pat_module_id_migration`). Hub resolver + `github_pat_for_env`
   fall back to the legacy slot during the upgrade window so existing
   tokens stay reachable until the migration runs.
+
+- **Custom MCP tab is not populated by initial project registration** — fixed 2026-05-10 by adding
+  migration `010_project_mcp_servers.sql` (per-project `project_mcp_servers` table) plus a
+  `populate_mcp_servers` step in `project_state_populate.rs` that mirrors
+  `<folder>/.claude/settings.json::mcpServers` AND `<folder>/.mcp.json` into the table. Each entry is
+  flagged `is_user_added=true` when its name is not in the bundled allowlist (`weaviate-kg` /
+  `ollama` / `search` / `code-embedding` / `playwright` / `vct-coordination`). A startup backfill
+  in `lib.rs::run` re-runs the populate step for projects registered before migration 010
+  (idempotent — preserves user toggles). Tauri commands `list_project_mcp_servers`,
+  `list_user_added_project_mcp_servers`, `set_project_mcp_server_enabled`, and
+  `unregister_project_mcp_server` are wired for the Custom MCP tab.
+
+- **Lightweight Rust wiring for `--lightweight` re-install** — fixed 2026-05-10. `InstallConfig`
+  now carries optional `lightweight: bool` and `lightweight_old_path: Option<String>` fields;
+  `install_orchestrator` honours them by skipping the file-copy stage and invoking
+  `install.py --lightweight [--lightweight-old-path <path>]` directly. The OnboardingWizard's
+  re-install conflict modal exposes a "Fast reinstall" checkbox + optional previous-path text input
+  so the user can opt into the lightweight path. Strategy radio is ignored when lightweight is on
+  (no copy = no conflict to resolve).
 
 - **Wizard step 3 install-path field allowed orphan installs** — the install-path text input + Browse button let
   users target any empty folder, after which the installer copied a SUBSET of files (per `ORCHESTRATOR_MANAGED_PATHS`)
