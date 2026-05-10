@@ -87,6 +87,33 @@ def _hook_path(hook_dir: Path, name: str, ext: str) -> Path:
     return hook_dir / f"{name}.{ext}"
 
 
+def _envelope_text(hook_dir: Path, hook_path: Path, ext: str) -> str:
+    """Return hook source text PLUS the shared emit-context helper if
+    the hook sources it.
+
+    Background (2026-05-10): the JSON envelope assembly was extracted
+    from each hook into ``_lib/emit-context.{sh,ps1}`` so the
+    whitespace-only-content guard could be applied uniformly. After the
+    refactor, the literal strings ``hookSpecificOutput`` /
+    ``additionalContext`` / ``10000`` / ``json.dumps`` /
+    ``ConvertTo-Json`` no longer live in each hook's body — they live
+    in the helper. The test must validate the FULL envelope-emission
+    path, not just the hook's own bytes.
+
+    Resolution: if the hook sources the helper, concatenate the
+    helper's bytes onto the hook's bytes before running the literal
+    asserts. Static check only — we're asking "across the hook plus
+    the helper it explicitly sources, do all the invariants appear".
+    """
+    text = hook_path.read_text()
+    helper_marker = "_lib/emit-context." + ext
+    if helper_marker in text:
+        helper = hook_dir / "_lib" / f"emit-context.{ext}"
+        if helper.exists():
+            text = text + "\n# --- helper: emit-context ---\n" + helper.read_text()
+    return text
+
+
 # --- Static envelope checks -------------------------------------------
 
 
@@ -108,12 +135,14 @@ def test_sh_pretooluse_hook_uses_json_envelope(hook_dir: Path, name: str) -> Non
     if not path.exists():
         pytest.fail(f"expected hook missing: {path}")
 
-    text = path.read_text()
+    text = _envelope_text(hook_dir, path, "sh")
 
     assert "hookSpecificOutput" in text, (
         f"{path}: missing literal `hookSpecificOutput` — PreToolUse hooks "
         f"that emit LLM-bound stdout must wrap output in the JSON envelope, "
-        f"otherwise Claude Code silently discards it. See PR #168."
+        f"otherwise Claude Code silently discards it. Either inline the "
+        f"envelope OR source `_lib/emit-context.sh` and call "
+        f"`emit_additional_context`. See PR #168 + 2026-05-10 helper extraction."
     )
     assert "additionalContext" in text, (
         f"{path}: missing literal `additionalContext` — required envelope "
@@ -148,14 +177,16 @@ def test_ps1_pretooluse_hook_uses_json_envelope(hook_dir: Path, name: str) -> No
     if not path.exists():
         pytest.fail(f"expected hook missing: {path}")
 
-    text = path.read_text()
+    text = _envelope_text(hook_dir, path, "ps1")
 
     assert "hookSpecificOutput" in text, (
         f"{path}: missing literal `hookSpecificOutput` — PreToolUse hooks "
         f"that emit LLM-bound stdout must wrap output in the JSON envelope, "
-        f"otherwise Claude Code silently discards it. Pre-2026-05-08 the "
-        f".ps1 side missed this fix from PR #168 and KG injection on "
-        f"Windows was effectively dead."
+        f"otherwise Claude Code silently discards it. Either inline the "
+        f"envelope OR source `_lib/emit-context.ps1` and call "
+        f"`Emit-AdditionalContext`. Pre-2026-05-08 the .ps1 side missed "
+        f"this fix from PR #168 and KG injection on Windows was effectively "
+        f"dead."
     )
     assert "additionalContext" in text, (
         f"{path}: missing literal `additionalContext` — required envelope "

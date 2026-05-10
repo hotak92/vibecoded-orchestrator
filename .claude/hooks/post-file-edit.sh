@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# OS-EXEMPT-PARITY: bash-side-only fix — switched bare `python3` to `"$PY"` via _lib/find-python.sh because Windows ships python.exe/py (no python3). The .ps1 sibling parses JSON natively via ConvertFrom-Json and never invokes Python, so it's already cross-OS-correct; no functional change applies on the PowerShell side.
 # Scrub sensitive env vars before any subprocess spawning
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
@@ -24,6 +25,10 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 set -euo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
+# Resolve Python portably — bare `python3` is missing on Windows.
+# shellcheck source=_lib/find-python.sh disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/find-python.sh"
+[ -z "${PY:-}" ] && exit 0  # No Python available — silent no-op
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -34,7 +39,7 @@ KNOWLEDGE_ROOT="$PROJECT_ROOT/knowledge"
 # similar env vars don't exist — settings.json substitutes to "". Verified
 # 2026-05-08 via stdin-capture diagnostic.
 HOOK_STDIN=$(cat 2>/dev/null || echo "")
-EDITED_FILE=$(printf '%s' "$HOOK_STDIN" | python3 -c "
+EDITED_FILE=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
 import json, sys
 try:
     d = json.loads(sys.stdin.read())

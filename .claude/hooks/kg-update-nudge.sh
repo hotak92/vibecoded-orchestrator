@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# OS-EXEMPT-PARITY: bash-side-only fix — sourced _lib/find-python.sh and switched bare `python3` heredoc invocation to `"$PY"` (Windows ships python.exe/py, not python3). The .ps1 sibling does the equivalent transcript-token scan via .NET / native PowerShell file IO and Get-Command for python; the helper module path is computed via PowerShell-native logic. Already cross-OS-correct on the .ps1 side.
 # Scrub sensitive env vars before any subprocess spawning
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
@@ -53,6 +54,10 @@ set -uo pipefail
 
 # Bypass switch.
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
+# Resolve Python portably — bare `python3` is missing on Windows.
+# shellcheck source=_lib/find-python.sh disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/find-python.sh"
+[ -z "${PY:-}" ] && exit 0  # No Python — silent no-op
 
 [ "${KG_NUDGE_OFF:-0}" = "1" ] && exit 0
 
@@ -71,7 +76,7 @@ mkdir -p "$METRICS_DIR" 2>/dev/null || exit 0
 # backslashes, or shell metacharacters can no longer break the Python parser.
 # Other substitutions (FIRST_THRESHOLD/INTERVAL/etc.) are under our control
 # and stay direct for readability. Audit fix 2026-05-07.
-KG_NUDGE_INPUT="$INPUT" python3 <<PYTHON_EOF || true
+KG_NUDGE_INPUT="$INPUT" "$PY" <<PYTHON_EOF || true
 import json
 import os
 import sys

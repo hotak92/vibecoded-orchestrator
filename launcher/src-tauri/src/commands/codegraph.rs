@@ -888,9 +888,21 @@ async fn run_build_task(
         .map(|p| p.to_path_buf());
 
     fn looks_like_install_root(p: &std::path::Path) -> bool {
+        // POSIX venv layout: .venv/bin/python(3)
         p.join(".venv").join("bin").join("python").is_file()
             || p.join(".venv").join("bin").join("python3").is_file()
             || p.join("claude_mcp_servers").join(".venv").join("bin").join("python").is_file()
+            // Windows venv layout: .venv/Scripts/python.exe — without this,
+            // launcher-managed Windows installs fall through to the
+            // launcher-binary fallback path even when a venv exists right
+            // next to the analyzer script. Verified against the OSS install
+            // layout's Windows shape (.venv at install root, see install.ps1).
+            || p.join(".venv").join("Scripts").join("python.exe").is_file()
+            || p.join("claude_mcp_servers")
+                .join(".venv")
+                .join("Scripts")
+                .join("python.exe")
+                .is_file()
     }
 
     let install_root = match from_script {

@@ -46,11 +46,7 @@ except ImportError:
 # self-only no-op so the CLI keeps working on a hand-edited venv.
 try:
     # VCO-REWIRE-BEGIN: orchestrator-root-resolution
-    _env_root = os.environ.get("VCT_ORCHESTRATOR_ROOT", "").strip()
-    if _env_root and (Path(_env_root) / "claude_mcp_servers" / "scripts").is_dir():
-        sys.path.insert(0, str(Path(_env_root) / "claude_mcp_servers" / "scripts"))
-    else:
-        sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "claude_mcp_servers" / "scripts"))
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "claude_mcp_servers" / "scripts"))
     # VCO-REWIRE-END: orchestrator-root-resolution
     from kg_access import code_graph_collections_to_query as _code_graph_collections_to_query  # type: ignore[import-not-found]
 except Exception:
@@ -163,7 +159,7 @@ class CodeGraphQuery:
             print(f"❌ Failed to connect to Weaviate: {e}", file=sys.stderr)
             return False
 
-    def search_by_concept(self, query: str, collection: str = "CodeFunction", limit: int = 5, detail: str = "auto"):
+    def search_by_concept(self, query: str, collection: str = "CodeFunction", limit: int = 5, detail: str = "auto", hook_format: bool = False):
         """Semantic search for code by concept.
 
         P1-D (2026-05-08): when ``self.project`` is set, fan out across
@@ -179,6 +175,11 @@ class CodeGraphQuery:
                               get name + score refs (matches MCP search_code_graph behavior).
           "titles"         — name + score only for every result.
           "full"           — full details for every result.
+
+        hook_format: when True, emit a stable per-result header line
+          'CODE: <full_name> | <collection> | distance=<d>' and skip the human
+          banner. The pre-edit hook uses this header to dedup repeat injections
+          by entity name across a session.
         """
         try:
             # Generate query embedding
@@ -199,14 +200,17 @@ class CodeGraphQuery:
             # Header: show the fan-out scope so the user sees what was
             # actually queried (especially useful when the access list
             # is set in env and the user has forgotten what's granted).
-            print(f"\n🔍 Semantic search in {collection}: '{query}'  (detail={detail})")
-            if self.project:
-                peer_count = len(pairs) - 1
-                if peer_count > 0:
-                    peer_names = ", ".join(p_filter for _, p_filter in pairs[1:] if p_filter)
-                    print(f"   Project filter: {self.project} (+ {peer_count} peer(s): {peer_names})")
-                else:
-                    print(f"   Project filter: {self.project}")
+            # Suppressed under --hook-format (the pre-edit hook only wants
+            # parser-friendly per-result lines).
+            if not hook_format:
+                print(f"\n🔍 Semantic search in {collection}: '{query}'  (detail={detail})")
+                if self.project:
+                    peer_count = len(pairs) - 1
+                    if peer_count > 0:
+                        peer_names = ", ".join(p_filter for _, p_filter in pairs[1:] if p_filter)
+                        print(f"   Project filter: {self.project} (+ {peer_count} peer(s): {peer_names})")
+                    else:
+                        print(f"   Project filter: {self.project}")
 
             # Fan-out: query each (collection, filter) pair, merge by
             # ascending distance. We over-fetch by `limit` per
@@ -254,7 +258,8 @@ class CodeGraphQuery:
                 if len(top) >= limit:
                     break
 
-            print(f"   Found {len(top)} results:\n")
+            if not hook_format:
+                print(f"   Found {len(top)} results:\n")
 
             for i, (distance, source, obj) in enumerate(top, 1):
                 props = obj.properties
@@ -274,8 +279,17 @@ class CodeGraphQuery:
                 if self.project and source and source != self.project:
                     src_label = f"  [peer:{source}]"
 
-                print(f"{i}. {props.get('full_name', props.get('name', 'Unknown'))}{src_label}")
-                print(f"   Distance: {distance:.3f} (similarity: {similarity:.3f})")
+                full_name = props.get('full_name', props.get('name', 'Unknown'))
+                if hook_format:
+                    # Stable parser-friendly header. The pre-edit hook regex
+                    # `^(KG|CODE):\ (.+)$` matches this and dedups by full_name.
+                    # `source` (peer project name) goes in a trailing field so
+                    # the dedup key doesn't change when fan-out is on.
+                    src_suffix = f" | source={source}" if (self.project and source and source != self.project) else ""
+                    print(f"CODE: {full_name} | {collection} | distance={distance:.3f}{src_suffix}")
+                else:
+                    print(f"{i}. {full_name}{src_label}")
+                    print(f"   Distance: {distance:.3f} (similarity: {similarity:.3f})")
 
                 if not show_full:
                     print()
@@ -532,6 +546,10 @@ def main():
                               help=("Verbosity per result. 'auto' (default) = top-4 full, "
                                     "rest as refs (matches search_code_graph MCP). "
                                     "'titles' = name+score only. 'full' = full details for all."))
+    search_parser.add_argument('--hook-format', action='store_true',
+                              help=("Emit one-line 'CODE: <full_name> | <collection> | "
+                                    "distance=<d>' header per result so the pre-edit hook "
+                                    "can dedup by entity name. Suppresses banner lines."))
 
     # Similar code
     similar_parser = subparsers.add_parser('similar', help='Find similar code')
@@ -578,7 +596,8 @@ def main():
     try:
         # Execute command
         if args.command == 'search':
-            querier.search_by_concept(args.query, args.collection, args.limit, args.detail)
+            querier.search_by_concept(args.query, args.collection, args.limit, args.detail,
+                                       hook_format=getattr(args, 'hook_format', False))
         elif args.command == 'similar':
             querier.find_similar(args.reference, args.collection, args.limit)
         elif args.command == 'structure':

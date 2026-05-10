@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# OS-EXEMPT-PARITY: bash-side-only fix — switched the session_id-parse `python3` invocation to `"$PY"` via the already-sourced _lib/find-python.sh. The .ps1 sibling parses session_id from stdin JSON via ConvertFrom-Json natively (no Python), so it was already cross-OS-correct.
 # Scrub sensitive env vars before any subprocess spawning
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
@@ -60,13 +61,17 @@ date +%s > "$MARKER" 2>/dev/null || true
 # session_id from stdin JSON is the canonical per-conversation key — see
 # diff-context-inject.sh for the same pattern. Falls back to "default"
 # only if the payload is malformed.
-SESSION_ID=$(echo "$HOOK_STDIN" | python3 -c "
+if [ -n "${PY:-}" ]; then
+    SESSION_ID=$(echo "$HOOK_STDIN" | "$PY" -c "
 import json, sys
 try:
     print(json.loads(sys.stdin.read()).get('session_id', ''))
 except Exception:
     print('')
 " 2>/dev/null || echo "")
+else
+    SESSION_ID=""
+fi
 [ -z "$SESSION_ID" ] && SESSION_ID="default"
 SNAPSHOT_DIR="${TMPDIR:-/tmp}/claude_ctx_snapshots"
 mkdir -p "$SNAPSHOT_DIR"

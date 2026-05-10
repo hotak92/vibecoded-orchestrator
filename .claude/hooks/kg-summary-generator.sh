@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# OS-EXEMPT-PARITY: bash-side-only fix — three changes brought bash up to PowerShell-native equivalents that the .ps1 sibling already had: (1) `_lib/find-python.sh` sourced + bare `python3` → `"$PY"` (Windows ships python.exe/py); (2) `md5sum` → Python hashlib (md5sum is GNU-only, absent on macOS / minimal Linux); (3) `stat -c %Y` → Python os.path.getmtime (GNU-only; macOS BSD stat needs `-f %m`). The .ps1 sibling already uses .NET MD5, .NET LastWriteTime, and Get-Command python — already cross-OS-correct.
 # kg-summary-generator.sh — PostToolUse hook
 # Spawns a background Haiku agent to generate/update summaries for KG nodes.
 # Fires on: Edit(knowledge/**/*.md), Write(knowledge/**/*.md), mcp__weaviate-kg__store_knowledge_node
@@ -28,7 +29,20 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
-VENV="${VCT_INSTALL_ROOT:-$PROJECT_ROOT}/claude_mcp_servers/.venv/bin/python"
+
+# Resolve a Python interpreter portably (python3 → python → py).
+# Bare `python3` doesn't exist on Windows (only `python.exe`/`py`); on
+# minimal Linux distros only `python` is on PATH. find-python.sh sets
+# $PY to the first working candidate.
+# shellcheck source=_lib/find-python.sh disable=SC1091
+[ -f "$SCRIPT_DIR/_lib/find-python.sh" ] && . "$SCRIPT_DIR/_lib/find-python.sh"
+[ -z "${PY:-}" ] && exit 0  # No Python available — silent no-op
+
+# Cross-OS venv path: POSIX uses .venv/bin/python; Windows venvs use
+# .venv/Scripts/python.exe. Try both.
+INSTALL_ROOT="${VCT_INSTALL_ROOT:-$PROJECT_ROOT}"
+VENV="$INSTALL_ROOT/claude_mcp_servers/.venv/bin/python"
+[ -x "$VENV" ] || VENV="$INSTALL_ROOT/claude_mcp_servers/.venv/Scripts/python.exe"
 GENERATOR="$PROJECT_ROOT/.claude/scripts/generate-kg-summary.py"
 
 # Silent fallback: if venv or generator script not present, exit clean.
@@ -50,7 +64,7 @@ INPUT=$(cat)
 # Single Python extractor handles both Edit/Write (tool_input.file_path)
 # and MCP store_knowledge_node (tool_response.absolute_path or
 # tool_input.file_path). Branches by tool_name internally.
-FILE_PATH=$(printf '%s' "$INPUT" | python3 -c "
+FILE_PATH=$(printf '%s' "$INPUT" | "$PY" -c "
 import sys, json, re
 try:
     d = json.loads(sys.stdin.read())
@@ -103,11 +117,17 @@ fi
 # Debounce: skip if we generated for this file in the last 60 seconds
 DEBOUNCE_DIR="${TMPDIR:-${XDG_RUNTIME_DIR:-/tmp}}/.kg-summary-debounce"
 mkdir -p "$DEBOUNCE_DIR"
-FILE_HASH=$(echo "$FILE_PATH" | md5sum | cut -d' ' -f1)
+# Portable hash: `md5sum` is GNU-only (macOS uses `md5 -q`). Python's
+# hashlib works on every OS we support.
+FILE_HASH=$(printf '%s' "$FILE_PATH" | "$PY" -c "import hashlib,sys; print(hashlib.md5(sys.stdin.buffer.read()).hexdigest())" 2>/dev/null)
+[ -z "$FILE_HASH" ] && FILE_HASH=$(printf '%s' "$FILE_PATH" | tr '/' '_' | tr ' ' '_' | head -c 100)
 STAMP="$DEBOUNCE_DIR/$FILE_HASH"
 
 if [ -f "$STAMP" ]; then
-    AGE=$(( $(date +%s) - $(stat -c %Y "$STAMP" 2>/dev/null || echo 0) ))
+    # Portable mtime: `stat -c %Y` is GNU; macOS BSD stat needs `-f %m`.
+    # Python avoids the divergence.
+    STAMP_MTIME=$("$PY" -c "import os,sys; print(int(os.path.getmtime(sys.argv[1])))" "$STAMP" 2>/dev/null || echo 0)
+    AGE=$(( $(date +%s) - STAMP_MTIME ))
     if [ "$AGE" -lt 60 ]; then
         exit 0
     fi

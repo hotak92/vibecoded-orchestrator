@@ -19,6 +19,14 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # Build Anchor Protocol, file backup, KG search suggestion.
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
+# Source emit-context.ps1 ONLY if the file exists. If the helper is
+# missing (partial install or just-after-clone before _lib/ is fully
+# populated), the hook still runs its other branches (logging,
+# security guards). The KG-suggestion branch below uses Get-Command
+# to tolerate a missing Emit-AdditionalContext.
+if (Test-Path "$PSScriptRoot/_lib/emit-context.ps1") {
+    . "$PSScriptRoot/_lib/emit-context.ps1"
+}
 
 # Hook input arrives as JSON on stdin per Claude Code v2.1.x spec.
 # Positional args ($args) and $env:CLAUDE_TOOL_NAME etc. are EMPTY because
@@ -232,8 +240,10 @@ if ($matchOutput) {
         # `hookSpecificOutput.additionalContext` — plain stdout is silently
         # discarded by Claude Code's hook runner. Pre-fork-sweep this
         # branch printed plaintext that never reached the LLM on either
-        # OS. Same fix class as pre-edit-context-inject (PR #168). 10k
-        # char cap matches that hook's contract.
+        # OS. Same fix class as pre-edit-context-inject (PR #168). The
+        # shared helper in _lib/emit-context.ps1 handles the JSON envelope,
+        # the 10k char cap, and (defense-in-depth) the whitespace-only-
+        # content guard.
         $sb = [System.Text.StringBuilder]::new()
         [void]$sb.AppendLine("")
         [void]$sb.AppendLine("Found $($arr.Count) related patterns for: $concepts")
@@ -241,18 +251,12 @@ if ($matchOutput) {
         [void]$sb.AppendLine("")
         [void]$sb.AppendLine("   Search more: 'Search knowledge graph for [concept]'")
         [void]$sb.AppendLine("")
-        $suggestionText = $sb.ToString()
-        if ($suggestionText.Length -gt 10000) {
-            $suggestionText = $suggestionText.Substring(0, 10000)
+        # Defense: if the helper failed to load (file missing at hook
+        # startup), skip emission rather than crash. Other branches of
+        # this hook are unaffected.
+        if (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue) {
+            Emit-AdditionalContext $sb.ToString() 'PreToolUse'
         }
-        $envelope = [ordered]@{
-            hookSpecificOutput = [ordered]@{
-                hookEventName      = 'PreToolUse'
-                permissionDecision = 'allow'
-                additionalContext  = $suggestionText
-            }
-        }
-        Write-Output ($envelope | ConvertTo-Json -Compress -Depth 8)
     }
 }
 exit 0

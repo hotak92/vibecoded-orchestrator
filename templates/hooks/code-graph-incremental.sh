@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# OS-EXEMPT-PARITY: bash-side-only fix — venv python resolution now tries POSIX `bin/python`, Windows `Scripts/python.exe`, then `_lib/find-python.sh` ($PY = python3 → python → py). The .ps1 sibling already used `Scripts\python.exe` natively and never had this gap.
 # Scrub sensitive env vars before any subprocess spawning
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
@@ -65,13 +66,21 @@ if [[ ! "$EDITED_FILE" =~ \.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|j
     exit 0
 fi
 
-# Resolve python: prefer venv, fall back to system python3
+# Resolve python: prefer venv, fall back to system python (cross-OS).
+# Bare `python3` is missing on Windows (only python.exe / py exist).
+# Try POSIX venv layout first, then Windows venv layout, then system PATH
+# via _lib/find-python.sh (python3 → python → py).
 PYTHON="${VCT_PYTHON:-}"
 if [ -z "$PYTHON" ]; then
+    SCRIPT_DIR_CGI="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     if [ -x "$VENV/bin/python" ]; then
         PYTHON="$VENV/bin/python"
+    elif [ -x "$VENV/Scripts/python.exe" ]; then
+        PYTHON="$VENV/Scripts/python.exe"
     else
-        PYTHON="$(command -v python3 || true)"
+        # shellcheck source=_lib/find-python.sh disable=SC1091
+        [ -f "$SCRIPT_DIR_CGI/_lib/find-python.sh" ] && . "$SCRIPT_DIR_CGI/_lib/find-python.sh"
+        PYTHON="${PY:-}"
     fi
 fi
 

@@ -22,6 +22,15 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # Always exit 0 (never block the edit).
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
+# Source emit-context.ps1 ONLY if the file exists. If the helper is
+# missing (partial install or just-after-clone before _lib/ is fully
+# populated), the hook still runs its dedup/state work. The
+# Emit-ContextJson wrapper tolerates a missing Emit-AdditionalContext
+# function via Get-Command. We deliberately do NOT swallow source
+# errors — a syntax error in an existing helper is a real bug.
+if (Test-Path "$PSScriptRoot/_lib/emit-context.ps1") {
+    . "$PSScriptRoot/_lib/emit-context.ps1"
+}
 
 # Hook input arrives as JSON on stdin per Claude Code v2.1.x spec.
 # Positional args ($args) and $env:CLAUDE_TOOL_NAME etc. are EMPTY —
@@ -94,41 +103,35 @@ if (-not (Test-Path $CacheDir)) {
 }
 
 # === Emit context as PreToolUse JSON envelope ===
-# Plain stdout is silently discarded by Claude Code's hook runner — only
-# `hookSpecificOutput.additionalContext` reaches the LLM (system reminder
-# wrapper). 10k char cap mirrors the .sh sibling's contract. Pre-2026-05-08
+# Wraps Emit-AdditionalContext from _lib/emit-context.ps1 — the helper
+# gates on whitespace-only content so we don't surface empty
+# system-reminder blocks when dedup suppresses every result. Pre-2026-05-08
 # this hook printed plain stdout that never reached the LLM context on
-# Windows, so all the KG/codegraph injection work was effectively dead on
-# the Windows side. Confirmed by checking that no `[Pre-edit context for ...]`
-# system-reminders ever appeared in real Edit-tool transcripts. The .sh
-# sibling was fixed in PR #168; the .ps1 fix landed alongside the
-# fork-readiness sweep for 0.1.7.
+# Windows; the .sh sibling was fixed in PR #168 and the .ps1 fix landed
+# alongside the fork-readiness sweep for 0.1.7.
 function Emit-ContextJson([string]$ctx) {
-    if (-not $ctx) { return }
-    $truncated = if ($ctx.Length -gt 10000) { $ctx.Substring(0, 10000) } else { $ctx }
-    $envelope = [ordered]@{
-        hookSpecificOutput = [ordered]@{
-            hookEventName      = 'PreToolUse'
-            permissionDecision = 'allow'
-            additionalContext  = $truncated
-        }
+    # If the helper sourced (normal case), delegate. If it didn't (the
+    # `_lib/emit-context.ps1` file was missing at hook startup), fall
+    # back to a silent no-op rather than crashing on an undefined
+    # function. The hook's other work (dedup state, cache write)
+    # remains valid.
+    if (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue) {
+        Emit-AdditionalContext $ctx 'PreToolUse'
     }
-    # Compress + Depth 8 matches the .sh side's json.dumps default-compact
-    # form (no indentation, default escape behaviour). UTF-8 stdout via
-    # Write-Output is fine here — Claude Code reads stdout as UTF-8.
-    $json = $envelope | ConvertTo-Json -Compress -Depth 8
-    Write-Output $json
 }
 
 # Check cache (10-min TTL) — uses .NET file mtime, no cross-OS stat issues.
+# Cache stores RAW per-result blocks (with KG:/CODE: headers) so dedup can
+# still apply on replay against the latest seen-list. Replay runs further
+# down, after Filter-Seen is in scope.
+$CacheHit = $false
+$CacheBlob = ""
 if (Test-Path $CacheFile) {
     $mtime = (Get-Item $CacheFile).LastWriteTime
     $age = ((Get-Date) - $mtime).TotalSeconds
     if ($age -lt $CacheTtl) {
-        $cached = ""
-        try { $cached = (Get-Content $CacheFile -Raw -ErrorAction Stop) } catch { }
-        Emit-ContextJson $cached
-        exit 0
+        $CacheHit = $true
+        try { $CacheBlob = (Get-Content $CacheFile -Raw -ErrorAction Stop) } catch { }
     }
 }
 
@@ -158,7 +161,8 @@ if (-not (Test-Path $VenvPy)) {
 $RlScript = Join-Path $ProjectRoot "claude_mcp_servers/scripts/rl_kg_search.py"
 if ((Test-Path $VenvPy) -and (Test-Path $RlScript)) {
     try {
-        & $VenvPy $RlScript $Query --limit 1 2>$null | Select-Object -First 40 | Set-Content -Path $KgTmp.FullName
+        # --hook-format prepends "KG: " to each result header so dedup can match by title.
+        & $VenvPy $RlScript $Query --limit 1 --hook-format 2>$null | Select-Object -First 40 | Set-Content -Path $KgTmp.FullName
     } catch { }
 }
 
@@ -168,13 +172,14 @@ if ($FilePath -match '\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|
     $cgQueryPs1 = Join-Path $ProjectRoot ".claude/scripts/code-graph-query.ps1"
     $cgQuerySh = Join-Path $ProjectRoot ".claude/scripts/code-graph-query"
     try {
+        # --hook-format emits "CODE: <full_name> | <collection> | distance=..." headers.
         if (Test-Path $cgQueryPs1) {
-            $out = & pwsh -NoProfile -File $cgQueryPs1 search $Query @CodeGraphProjectArg --limit 2 2>$null |
+            $out = & pwsh -NoProfile -File $cgQueryPs1 search $Query @CodeGraphProjectArg --limit 2 --hook-format 2>$null |
                 Where-Object { $_ -notlike "*$FilePath*" } |
                 Select-Object -First 20
             $out | Set-Content -Path $CodeTmp.FullName
         } elseif ((Test-Path $cgQuerySh) -and (Get-Command bash -ErrorAction SilentlyContinue)) {
-            $out = & bash $cgQuerySh search $Query @CodeGraphProjectArg --limit 2 2>$null |
+            $out = & bash $cgQuerySh search $Query @CodeGraphProjectArg --limit 2 --hook-format 2>$null |
                 Where-Object { $_ -notlike "*$FilePath*" } |
                 Select-Object -First 20
             $out | Set-Content -Path $CodeTmp.FullName
@@ -232,6 +237,11 @@ function Filter-Seen([string]$input) {
             # Flush previous block.
             & $flushBlock $currentTitle $currentBlock.ToString() $currentSkip ([ref]$filtered) ([ref]$seen) $SeenNodesFile
             $rest = $Matches[2]
+            # Defensive: strip any accidentally-doubled "KG: " / "CODE: " that
+            # could slip in from a formatting transition (e.g. an old cache
+            # written before the producers added their own prefix).
+            if ($rest.StartsWith("KG: "))   { $rest = $rest.Substring(4) }
+            if ($rest.StartsWith("CODE: ")) { $rest = $rest.Substring(6) }
             $currentTitle = ($rest -split ' \| ')[0]
             # Cap to 200 chars defensively (some code-graph entity names can be long)
             if ($currentTitle.Length -gt 200) { $currentTitle = $currentTitle.Substring(0, 200) }
@@ -243,8 +253,13 @@ function Filter-Seen([string]$input) {
             # Body line for the current block — accumulate.
             [void]$currentBlock.AppendLine($line)
         } else {
-            # Pre-amble or stray line not part of any block — pass through verbatim.
-            [void]$filtered.AppendLine($line)
+            # Pre-amble or stray line not part of any block — pass through
+            # only if it has non-whitespace content. Blank separators
+            # between fully-deduped blocks would otherwise leak through
+            # and surface an empty system-reminder block to the LLM.
+            if ($line -match '\S') {
+                [void]$filtered.AppendLine($line)
+            }
         }
     }
     # Flush the final block.
@@ -253,26 +268,63 @@ function Filter-Seen([string]$input) {
     return $filtered.ToString()
 }
 
+# Cache replay: if we have a cache hit, dedup it against the current
+# seen-list and emit. If everything in the cache is already seen, exit
+# silently. The cache stores RAW per-result blocks (KG:/CODE: headers).
+if ($CacheHit) {
+    $filteredCache = Filter-Seen $CacheBlob
+    $trimmed = ($filteredCache -replace '\s+', '')
+    if (-not $trimmed) { exit 0 }
+    $replayOut = [System.Text.StringBuilder]::new()
+    [void]$replayOut.AppendLine("[Pre-edit context for ${Basename}]:")
+    [void]$replayOut.AppendLine("")
+    [void]$replayOut.Append($filteredCache)
+    Emit-ContextJson $replayOut.ToString()
+    exit 0
+}
+
+# Capture raw producer output (pre-dedup) for the cache. Caching post-dedup
+# would perma-suppress titles eligible to re-appear after a /compact wipe.
+$KgRaw   = $KgResult
+$CodeRaw = $CodeResult
+
 if ($KgResult)   { $KgResult   = Filter-Seen $KgResult }
 if ($CodeResult) { $CodeResult = Filter-Seen $CodeResult }
 
 $HasKg   = [bool]$KgResult
 $HasCode = [bool]$CodeResult
-if (-not $HasKg -and -not $HasCode) { exit 0 }
 
+# Build raw cache blob (used in both empty-output and emit branches).
+$rawCache = ""
+if ($KgRaw)   { $rawCache += $KgRaw + "`n" }
+if ($CodeRaw) { $rawCache += $CodeRaw + "`n" }
+
+if (-not $HasKg -and -not $HasCode) {
+    if ($rawCache) {
+        try { Set-Content -Path $CacheFile -Value $rawCache -Encoding UTF8 -NoNewline } catch { }
+    }
+    exit 0
+}
+
+# Per-result headers already carry "KG: " / "CODE: " prefixes from the
+# producers (--hook-format). Don't add an extra block-level label.
 $out = [System.Text.StringBuilder]::new()
 [void]$out.AppendLine("[Pre-edit context for ${Basename}]:")
 [void]$out.AppendLine("")
 if ($HasKg) {
-    [void]$out.AppendLine("KG: $KgResult")
+    [void]$out.Append($KgResult)
+    [void]$out.AppendLine("")
 }
 if ($HasCode) {
-    [void]$out.AppendLine("Related code: $CodeResult")
+    [void]$out.Append($CodeResult)
+    [void]$out.AppendLine("")
 }
 
-$outStr = $out.ToString()
-# Cache stores the human-readable form so re-emission produces identical
-# content. Emit-ContextJson wraps it for Claude Code's PreToolUse contract.
-try { Set-Content -Path $CacheFile -Value $outStr -Encoding UTF8 -NoNewline } catch { }
-Emit-ContextJson $outStr
+# Cache RAW per-result blocks (pre-dedup) so replays apply current dedup
+# state. Caching post-dedup would perma-suppress titles legitimately
+# re-eligible after a /compact wipe.
+if ($rawCache) {
+    try { Set-Content -Path $CacheFile -Value $rawCache -Encoding UTF8 -NoNewline } catch { }
+}
+Emit-ContextJson $out.ToString()
 exit 0
