@@ -265,11 +265,17 @@ jobs:
           fi
 
           archive_base="vibecoded-orchestrator-${version}-${{ matrix.target }}"
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            archive_ext="zip"
-          else
-            archive_ext="tar.gz"
-          fi
+          # Uniform `.zip` for all three OSes (2026-05-10 packaging
+          # direction). Pre-this-PR Linux + macOS used `.tar.gz`, which
+          # required users to know the difference between `tar -xzf` and
+          # double-clicking. `.zip` is the universal archive format —
+          # macOS Finder / GNOME Archive Manager / Windows Explorer all
+          # extract it natively. The reproducibility loss vs the GNU-tar
+          # `--owner=0 --group=0 --numeric-owner --sort=name` path is
+          # accepted (zip carries per-file uid/gid + mtime; SLSA build
+          # provenance binds to the launcher binary inside the archive,
+          # not the archive wrapper, so attestation isn't affected).
+          archive_ext="zip"
           archive_name="${archive_base}.${archive_ext}"
 
           echo "version=${version}" >> "$GITHUB_OUTPUT"
@@ -404,6 +410,16 @@ jobs:
           cp vct-module.json "$stage_root/"
           cp orchestrator-managed-paths.txt "$stage_root/"
           cp requirements.txt "$stage_root/"
+          # Local-machine config (per the 2026-05-10 packaging direction).
+          # Source ships as `vct-config.example.toml` to keep it out of
+          # `git status` noise during dev; the archive renames it to
+          # `vct-config.toml` because that's what the launcher reads at
+          # runtime via `std::env::current_exe() → parent → vct-config.toml`.
+          # User edits in place after install; the example name is only
+          # the source-tree convention.
+          if [ -f vct-config.example.toml ]; then
+            cp vct-config.example.toml "$stage_root/vct-config.toml"
+          fi
           # MIGRATION-0.2.0.md is the per-release migration doc; if a
           # docs/MIGRATION-<version>.md file matches the archive
           # version, ship it at archive root for visibility (users
@@ -430,7 +446,7 @@ jobs:
           du -sh "$stage_root"/* 2>/dev/null || true
           echo "::endgroup::"
 
-      - name: Create archive (Linux/macOS)
+      - name: Create archive (Linux/macOS — zip)
         if: matrix.os != 'windows-latest'
         shell: bash
         env:
@@ -438,25 +454,19 @@ jobs:
           ARCHIVE_NAME: ${{ steps.archive_meta.outputs.archive_name }}
         run: |
           set -euo pipefail
-          # GNU tar on Linux respects --owner=0 --group=0 --numeric-owner
-          # for reproducibility. macOS ships BSD tar which doesn't have
-          # the same flag set; we accept the slight loss of
-          # reproducibility there since macOS releases are tier-2 alpha.
-          # gzip -n strips the embedded mtime + filename for archive-
-          # level reproducibility (still varies across runners due to
-          # build timestamps embedded in the binary, but at least the
-          # tar wrapper is stable).
+          # `zip` is preinstalled on `ubuntu-latest` and `macos-latest`
+          # GitHub-hosted runners. -r recurses; -X strips OS-extra
+          # extended attributes for cross-platform stability; -9 picks
+          # the maximum compression level (CI minutes are cheap; user
+          # download bandwidth isn't). The trailing `--symlinks` flag
+          # preserves any symlinks in the staged tree (we don't ship
+          # any today, but the flag is cheap insurance against a future
+          # subtree introducing one).
           cd dist
-          if tar --version 2>&1 | grep -q GNU; then
-            tar --owner=0 --group=0 --numeric-owner \
-                --sort=name \
-                -cf - "${ARCHIVE_BASE}" | gzip -n > "${ARCHIVE_NAME}"
-          else
-            tar -czf "${ARCHIVE_NAME}" "${ARCHIVE_BASE}"
-          fi
+          zip -r -X -9 --symlinks "${ARCHIVE_NAME}" "${ARCHIVE_BASE}"
           ls -lh "${ARCHIVE_NAME}"
 
-      - name: Create archive (Windows)
+      - name: Create archive (Windows — Compress-Archive)
         if: matrix.os == 'windows-latest'
         shell: pwsh
         env:
@@ -467,6 +477,9 @@ jobs:
           # image. -CompressionLevel Optimal trades CPU for ~5-10%
           # smaller .zip vs default. -Force overwrites any leftover
           # archive from a previous run on the same runner.
+          # Note: Linux/macOS use `zip -9 -X --symlinks`; Compress-Archive
+          # has no equivalent flags but produces a compatible .zip
+          # readable by every platform's archive manager.
           $stage = Join-Path "dist" $env:ARCHIVE_BASE
           $out   = Join-Path "dist" $env:ARCHIVE_NAME
           if (-not (Test-Path $stage)) {

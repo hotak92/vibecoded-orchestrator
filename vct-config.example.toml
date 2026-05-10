@@ -1,0 +1,36 @@
+# vct-config.toml — local-machine config for the VCO launcher.
+#
+# This file lives next to the launcher binary. The launcher reads it once
+# at startup and stores the resolved values in Tauri's managed state.
+# Edit and restart the launcher to pick up changes — there's no live
+# reload (the values are referenced from many code paths and a reload
+# would have to invalidate every cached resolution).
+#
+# Resolution order per field (highest priority first):
+#   1. Environment variable override (when set + non-empty)
+#   2. The matching key in this file
+#   3. The compiled-default constant in launcher/src-tauri/src/config.rs
+#
+# Missing or unparseable file falls through to compiled defaults silently
+# (the launcher logs a one-line warning at startup so you can see what it
+# picked, but doesn't refuse to start).
+#
+# What's IN scope (per-machine local defaults):
+#   * `weaviate_url` — the user's local Weaviate KG instance address.
+#     Override via env: VCT_WEAVIATE_URL (canonical) or WEAVIATE_URL
+#     (legacy alias kept for back-compat with developer shells).
+#
+# What's OUT of scope (NOT in this file — product-fixed, same for everyone):
+#   * License-validation Supabase URL → env override only
+#     (`VCT_VALIDATE_TIER_URL`); the canonical default is baked into
+#     the binary because changing it per-machine would break licensing.
+#   * The canonical orchestrator GitHub repo URL.
+#   * Per-service ports already overridable via the launcher's
+#     `services.toml` adoption flow (different mechanism, kept stable).
+#
+# ─────────────────────────────────────────────────────────────────────
+
+# Local Weaviate instance address. Compiled default: http://localhost:8081.
+# Change this if you run Weaviate on a different port (port conflict with
+# another service) or in a VM with port forwarding.
+weaviate_url = "http://localhost:8081"
