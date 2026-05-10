@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 async def main():
     parser = argparse.ArgumentParser(description="KG search with RL reranking")
     parser.add_argument("query", help="Search query")
-    parser.add_argument("--limit", type=int, default=1, help="Max results (default: 1)")
+    parser.add_argument("--limit", type=int, default=3, help="Max results (default: 3)")
     parser.add_argument(
         "--hook-format",
         action="store_true",

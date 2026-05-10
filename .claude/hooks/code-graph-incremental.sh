@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# OS-EXEMPT-PARITY: bash-side-only fix — venv python resolution now tries POSIX `bin/python`, Windows `Scripts/python.exe`, then `_lib/find-python.sh` ($PY = python3 → python → py). The .ps1 sibling already used `Scripts\python.exe` natively and never had this gap.
 # Scrub sensitive env vars before any subprocess spawning
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0

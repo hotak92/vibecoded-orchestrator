@@ -39,6 +39,32 @@ except ImportError:
     print("Error: weaviate-client not installed. Install with: pip install weaviate-client", file=sys.stderr)
     sys.exit(1)
 
+# Import the shared rank-tier formatter from the MCP server module so the
+# CLI emits results identically to `search_code_graph` MCP. The script
+# lives at .claude/scripts/query_code_graph.py and the MCP module at
+# claude_mcp_servers/weaviate_mcp/server.py — derive the project root
+# from this file's location so the layout works without hardcoded paths.
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_MCP_SERVERS_PATH = _PROJECT_ROOT / "claude_mcp_servers"
+if str(_MCP_SERVERS_PATH) not in sys.path:
+    sys.path.insert(0, str(_MCP_SERVERS_PATH))
+
+try:
+    from weaviate_mcp.server import (
+        _format_code_result_by_rank,
+        _format_code_result_ref,
+        CODE_SIBLINGS_RANK_1,
+        CODE_SIBLINGS_RANK_2,
+    )
+except ImportError as exc:  # pragma: no cover — surface a clear error
+    print(
+        f"Error: could not import weaviate_mcp.server rank-tier helper: {exc}\n"
+        f"  Expected module at: {_MCP_SERVERS_PATH}/weaviate_mcp/server.py\n"
+        "  This script requires the MCP server module for shared rendering.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
 # P1-D (2026-05-08): centralized access-matrix helper. Resolved via
 # $VCT_ORCHESTRATOR_ROOT (the orchestrator clone is where
 # claude_mcp_servers/scripts/kg_access.py lives) with an in-tree
@@ -170,16 +196,25 @@ class CodeGraphQuery:
         "search all projects" path), behaviour is unchanged: a single
         bare-collection query.
 
+        Uses the shared rank-tier formatter (`_format_code_result_by_rank`)
+        so output matches `search_code_graph` MCP exactly. Tier policy:
+          - rank 0-1: full untruncated content + sibling rows in same file
+          - rank 2-3: full content with doc/summary truncated at
+            CODE_TRUNC_CHARS (default 1200)
+          - rank 4+:  metadata-only refs
+
         detail:
-          "auto" (default) — top-4 results get full per-collection details, rest
-                              get name + score refs (matches MCP search_code_graph behavior).
-          "titles"         — name + score only for every result.
-          "full"           — full details for every result.
+          "auto"   — rank-driven tiering (top-2 + siblings, mid truncated, rest refs)
+          "titles" — metadata refs for every result
+          "full"   — full untruncated for every result
 
         hook_format: when True, emit a stable per-result header line
-          'CODE: <full_name> | <collection> | distance=<d>' and skip the human
-          banner. The pre-edit hook uses this header to dedup repeat injections
-          by entity name across a session.
+          'CODE: <full_name> | <collection> | distance=<d>' (with optional
+          ' | source=<peer>' suffix for cross-tenant fan-out) and skip the
+          human banner. The pre-edit hook uses this header to dedup repeat
+          injections by entity name across a session via the regex
+          ``^(KG|CODE):\\ (.+)$``. Body lines follow as ordinary indented
+          content; blank lines separate blocks.
         """
         try:
             # Generate query embedding
@@ -227,6 +262,7 @@ class CodeGraphQuery:
                     near_vector=query_embedding,
                     limit=limit,
                     return_metadata=MetadataQuery(distance=True),
+                    target_vector=_ACTIVE_CODE_VECTOR,
                 )
                 if project_filter:
                     nv_kwargs["filters"] = Filter.by_property("project").equal(project_filter)
@@ -258,70 +294,258 @@ class CodeGraphQuery:
                 if len(top) >= limit:
                     break
 
+            # Sibling fetcher: closes over self.client + self.project so
+            # the shared helper stays Weaviate-agnostic. Only invoked for
+            # top-2 ranks in auto mode by `_format_code_result_by_rank`.
+            # Note: siblings come from the SELF project only — peer
+            # projects don't expose their full source files for the
+            # sibling enrichment path. This matches the MCP behaviour
+            # where _project_collection scopes the sibling lookup.
+            def _sibling_fetcher(file_path: str, hit_start_line: int, max_total: int, exclude_full_name: str) -> list[dict]:
+                if not file_path or max_total <= 1:
+                    return []
+                try:
+                    fn_coll = self.client.collections.get(self._coll("CodeFunction"))
+                    cls_coll = self.client.collections.get(self._coll("CodeClass"))
+                except Exception:
+                    return []
+                collected = []  # (start_line, c_name, properties)
+                for coll_obj, c_name in ((fn_coll, "CodeFunction"), (cls_coll, "CodeClass")):
+                    try:
+                        sib_filter = Filter.by_property("file_path").equal(file_path)
+                        if self.project:
+                            sib_filter = sib_filter & Filter.by_property("project").equal(self.project)
+                        sib_resp = coll_obj.query.fetch_objects(filters=sib_filter, limit=64)
+                        for obj in sib_resp.objects:
+                            sp = obj.properties or {}
+                            if sp.get("full_name") == exclude_full_name:
+                                continue
+                            sl = sp.get("start_line")
+                            try:
+                                sl_int = int(sl) if sl is not None else 0
+                            except (TypeError, ValueError):
+                                sl_int = 0
+                            collected.append((sl_int, c_name, sp))
+                    except Exception:
+                        continue
+                if not collected:
+                    return []
+                collected.sort(key=lambda t: abs(t[0] - hit_start_line))
+                picked = collected[: max_total - 1]
+                picked.sort(key=lambda t: t[0])
+                siblings = []
+                for sl_int, c_name, sp in picked:
+                    ref = _format_code_result_ref(c_name, sp)
+                    ref["sibling"] = True
+                    ref["start_line"] = sl_int
+                    ref["collection"] = c_name
+                    siblings.append(ref)
+                return siblings
+
             if not hook_format:
                 print(f"   Found {len(top)} results:\n")
 
-            for i, (distance, source, obj) in enumerate(top, 1):
+            # Render through shared helper. i is 0-based for the helper;
+            # human output uses 1-based numbering.
+            for i, (distance, source, obj) in enumerate(top):
                 props = obj.properties
-                similarity = 1.0 - distance if distance >= 0 else 0.0
-
-                # Per-result tier — mirrors search_code_graph MCP semantics
-                if detail == "titles":
-                    show_full = False
-                elif detail == "full":
-                    show_full = True
-                else:  # auto: top-4 full, rest as refs
-                    show_full = i <= 4
-
+                score = (1.0 - distance) if distance >= 0 else 0.0
+                rendered = _format_code_result_by_rank(
+                    props,
+                    collection,
+                    rank=i,
+                    detail=detail,
+                    score=score,
+                    distance=distance,
+                    sibling_fetcher=_sibling_fetcher,
+                )
                 # Source-project annotation for fan-out clarity. Empty
                 # for self-only queries (the pre-P1-D shape).
                 src_label = ""
+                src_suffix = ""
                 if self.project and source and source != self.project:
                     src_label = f"  [peer:{source}]"
-
-                full_name = props.get('full_name', props.get('name', 'Unknown'))
-                if hook_format:
-                    # Stable parser-friendly header. The pre-edit hook regex
-                    # `^(KG|CODE):\ (.+)$` matches this and dedups by full_name.
-                    # `source` (peer project name) goes in a trailing field so
-                    # the dedup key doesn't change when fan-out is on.
-                    src_suffix = f" | source={source}" if (self.project and source and source != self.project) else ""
-                    print(f"CODE: {full_name} | {collection} | distance={distance:.3f}{src_suffix}")
-                else:
-                    print(f"{i}. {full_name}{src_label}")
-                    print(f"   Distance: {distance:.3f} (similarity: {similarity:.3f})")
-
-                if not show_full:
-                    print()
-                    continue
-
-                if collection == "CodeFunction":
-                    print(f"   Signature: {props.get('signature')}")
-                    if props.get('doc'):
-                        print(f"   Doc: {props.get('doc')[:100]}...")
-                    print(f"   Location: {props.get('start_line')}-{props.get('end_line')}")
-                elif collection == "CodeClass":
-                    print(f"   Methods: {len(props.get('methods', []))} methods")
-                    if props.get('doc'):
-                        print(f"   Doc: {props.get('doc')[:100]}...")
-                elif collection == "CodeModule":
-                    print(f"   Path: {props.get('path')}")
-                    print(f"   LOC: {props.get('loc')}, Complexity: {props.get('complexity')}")
-                elif collection == "CodeAPI":
-                    print(f"   Endpoint: {props.get('method', '')} {props.get('endpoint', '')}")
-                    if props.get('api_description'):
-                        print(f"   Description: {props.get('api_description')[:100]}")
-                elif collection == "CodeInteraction":
-                    print(f"   Type: {props.get('interaction_type', '')} | {props.get('direction', '')}")
-                    print(f"   {props.get('protocol', '')} → {props.get('endpoint', '')}")
-                    print(f"   Confidence: {props.get('confidence', '')} | Project: {props.get('source_project', '')}")
-                    if props.get('description'):
-                        print(f"   {props.get('description', '')[:100]}")
-
-                print()
+                    src_suffix = f" | source={source}"
+                self._print_code_result(
+                    rendered, rank=i, hook_format=hook_format,
+                    src_label=src_label, src_suffix=src_suffix,
+                )
 
         except Exception as e:
             print(f"❌ Search error: {e}", file=sys.stderr)
+
+    @staticmethod
+    def _print_code_result(rendered: dict, rank: int, hook_format: bool,
+                           src_label: str = "", src_suffix: str = "") -> None:
+        """Print one rank-tier-formatted code-graph result.
+
+        Both surfaces (hook + human) walk the same rendered dict so the
+        body content is identical; only the per-block header differs.
+
+        Hook format: ``CODE: <full_name> | <collection> | distance=<d>``
+        first line (with optional ``| source=<peer>`` suffix), body lines
+        indented two spaces, terminating blank line. The pre-edit hook
+        regex ``^(KG|CODE):\\ (.+)$`` matches the header; indented body
+        lines fall through to the block-content accumulator.
+
+        Human format: ``<rank>. <full_name>`` with optional ``[peer:<src>]``
+        and similarity / tier annotation, body lines indented three
+        spaces, terminating blank line.
+        """
+        collection = rendered.get("collection", "")
+        tier = rendered.get("tier", "ref")
+        score_str = rendered.get("score", "")
+        distance_str = rendered.get("distance", "")
+
+        # Identifier for the dedup key: full_name when present, else the
+        # closest substitute per collection. Mirrors the MCP _format_ref
+        # priorities so the dedup key is stable across surfaces.
+        full_name = rendered.get("full_name", "")
+        if not full_name:
+            if collection == "CodeModule":
+                full_name = rendered.get("path", "Unknown")
+            elif collection in ("CodeAPI", "CodeInteraction"):
+                ep = rendered.get("endpoint", "")
+                method = rendered.get("method", "")
+                full_name = f"{method} {ep}".strip() or rendered.get("interaction_type", "Unknown")
+            else:
+                full_name = "Unknown"
+
+        if hook_format:
+            print(f"CODE: {full_name} | {collection} | distance={distance_str}{src_suffix}")
+            CodeGraphQuery._print_body(rendered, indent="  ", hook_format=True)
+            # Blank line terminates the block (matches the KG block
+            # contract that pre-edit-context-inject.sh _filter_seen
+            # parses).
+            print()
+        else:
+            similarity = 0.0
+            try:
+                similarity = 1.0 - float(distance_str) if distance_str else 0.0
+            except (TypeError, ValueError):
+                similarity = 0.0
+            tier_suffix = f"  [tier={tier}]"
+            print(f"{rank + 1}. {full_name}{src_label}{tier_suffix}")
+            print(f"   Distance: {distance_str} (similarity: {similarity:.3f}, score: {score_str})")
+            if tier == "ref":
+                print()
+                return
+            CodeGraphQuery._print_body(rendered, indent="   ", hook_format=False)
+            print()
+
+    @staticmethod
+    def _print_body(rendered: dict, indent: str, hook_format: bool) -> None:
+        """Render the per-collection body section of a code-graph result.
+
+        Uses the same fields the shared helper populates so the output
+        is byte-identical between MCP JSON consumers and CLI human
+        consumers (after stripping the prefix). Sibling rows render
+        underneath the seed for top-2 ranks.
+        """
+        collection = rendered.get("collection", "")
+        if collection == "CodeFunction":
+            sig = rendered.get("signature", "")
+            if sig:
+                print(f"{indent}Signature: {sig}")
+            doc = rendered.get("doc", "")
+            if doc:
+                if hook_format:
+                    print(f"{indent}Doc: {doc}")
+                else:
+                    snippet = doc[:200] + ("..." if len(doc) > 200 else "")
+                    print(f"{indent}Doc: {snippet}")
+            loc = rendered.get("location", "")
+            if loc:
+                print(f"{indent}Location: {loc}")
+            body = rendered.get("function_body", "")
+            if body and hook_format:
+                print(f"{indent}Body:")
+                for body_line in body.splitlines():
+                    print(f"{indent}  {body_line}")
+        elif collection == "CodeClass":
+            sig = rendered.get("signature", "")
+            if sig:
+                print(f"{indent}Signature: {sig}")
+            doc = rendered.get("doc", "")
+            if doc:
+                if hook_format:
+                    print(f"{indent}Doc: {doc}")
+                else:
+                    snippet = doc[:200] + ("..." if len(doc) > 200 else "")
+                    print(f"{indent}Doc: {snippet}")
+            method_count = rendered.get("method_count")
+            if method_count is not None:
+                print(f"{indent}Methods: {method_count} methods")
+            loc = rendered.get("location", "")
+            if loc:
+                print(f"{indent}Location: {loc}")
+            body = rendered.get("class_body", "")
+            if body and hook_format:
+                print(f"{indent}Body:")
+                for body_line in body.splitlines():
+                    print(f"{indent}  {body_line}")
+        elif collection == "CodeModule":
+            path = rendered.get("path", "")
+            if path:
+                print(f"{indent}Path: {path}")
+            lang = rendered.get("language", "")
+            loc = rendered.get("loc", 0)
+            if lang or loc:
+                print(f"{indent}Language: {lang}, LOC: {loc}")
+            summary = rendered.get("summary", "")
+            if summary:
+                if hook_format:
+                    print(f"{indent}Summary: {summary}")
+                else:
+                    snippet = summary[:200] + ("..." if len(summary) > 200 else "")
+                    print(f"{indent}Summary: {snippet}")
+        elif collection == "CodeAPI":
+            ep = rendered.get("endpoint", "")
+            method = rendered.get("method", "")
+            if ep or method:
+                print(f"{indent}Endpoint: {method} {ep}".rstrip())
+            desc = rendered.get("description", "")
+            if desc:
+                if hook_format:
+                    print(f"{indent}Description: {desc}")
+                else:
+                    snippet = desc[:200] + ("..." if len(desc) > 200 else "")
+                    print(f"{indent}Description: {snippet}")
+        elif collection == "CodeInteraction":
+            itype = rendered.get("interaction_type", "")
+            direction = rendered.get("direction", "")
+            if itype or direction:
+                print(f"{indent}Type: {itype} | {direction}")
+            proto = rendered.get("protocol", "")
+            ep = rendered.get("endpoint", "")
+            if proto or ep:
+                print(f"{indent}{proto} -> {ep}")
+            confidence = rendered.get("confidence", "")
+            if confidence:
+                print(f"{indent}Confidence: {confidence}")
+            desc = rendered.get("description", "")
+            if desc:
+                if hook_format:
+                    print(f"{indent}Description: {desc}")
+                else:
+                    snippet = desc[:200] + ("..." if len(desc) > 200 else "")
+                    print(f"{indent}Description: {snippet}")
+
+        # Sibling rows: only present for top-2 ranks in auto mode. Render
+        # as one indented line each so the pre-edit hook treats them as
+        # body content of the parent CODE: block.
+        siblings = rendered.get("siblings") or []
+        if siblings:
+            print(f"{indent}Siblings ({len(siblings)}):")
+            for sib in siblings:
+                sib_coll = sib.get("collection", "")
+                sib_name = (
+                    sib.get("full_name")
+                    or sib.get("path")
+                    or sib.get("endpoint", "")
+                )
+                start_line = sib.get("start_line", "?")
+                print(f"{indent}  - [{sib_coll}] {sib_name} (line {start_line})")
 
     def find_similar(self, reference_name: str, collection: str = "CodeFunction", limit: int = 5):
         """Find code similar to reference."""
