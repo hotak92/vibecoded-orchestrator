@@ -13,13 +13,18 @@
   import { projects, selectedProject } from '$lib/stores/projects';
   import { ui } from '$lib/stores/ui';
   import Toast from '$lib/components/Toast.svelte';
+  import UpdateAllProjectsModal from '$lib/components/UpdateAllProjectsModal.svelte';
 
   onMount(() => {
     void projects.load();
   });
 
-  const state = $derived($projects);
+  const store = $derived($projects);
   const active = $derived($selectedProject);
+
+  // 0.2.x backlog #4 (2026-05-10): "Update all" modal state. Driven by
+  // a $state boolean — see UpdateAllProjectsModal for the lifecycle.
+  let updateAllOpen = $state(false);
 
   function open(id: string) {
     projects.select(id);
@@ -28,6 +33,7 @@
 </script>
 
 <Toast />
+<UpdateAllProjectsModal bind:open={updateAllOpen} />
 
 <div class="pl-page">
   <header class="pl-header">
@@ -36,14 +42,25 @@
     <button class="pl-add" onclick={() => ui.openCreateProject()}>
       + Add Project
     </button>
-    <button class="pl-refresh" onclick={() => projects.load()} disabled={state.loading}>
-      {state.loading ? 'Loading…' : 'Refresh'}
+    <!-- 0.2.x backlog #4: power-user "Update all" button. Sequential
+         iteration; the modal shows per-project status. Disabled when
+         no projects are registered (nothing to update). -->
+    <button
+      class="pl-update-all"
+      onclick={() => (updateAllOpen = true)}
+      disabled={store.loading || store.projects.length === 0}
+      title="Re-run bundle install on every registered project, sequentially"
+    >
+      ⟳ Update all
+    </button>
+    <button class="pl-refresh" onclick={() => projects.load()} disabled={store.loading}>
+      {store.loading ? 'Loading…' : 'Refresh'}
     </button>
   </header>
 
-  {#if state.loading && state.projects.length === 0}
+  {#if store.loading && store.projects.length === 0}
     <p class="pl-empty">Loading…</p>
-  {:else if state.projects.length === 0}
+  {:else if store.projects.length === 0}
     <div class="pl-empty">
       <p>No projects registered yet.</p>
       <button class="pl-add" onclick={() => ui.openCreateProject()}>
@@ -52,7 +69,7 @@
     </div>
   {:else}
     <div class="pl-grid">
-      {#each state.projects as p (p.id)}
+      {#each store.projects as p (p.id)}
         <article
           class="pl-card"
           class:active={active?.id === p.id}
@@ -80,14 +97,27 @@
     display: flex; align-items: center; gap: 12px; margin-bottom: 24px;
   }
   .pl-header h1 { margin: 0; font-size: 22px; flex: 1; }
-  .pl-back, .pl-refresh, .pl-add {
+  .pl-back, .pl-refresh, .pl-add, .pl-update-all {
     padding: 6px 12px; border-radius: 4px; cursor: pointer;
     background: rgba(255,255,255,0.06);
     border: 1px solid rgba(255,255,255,0.12);
     color: inherit; font-size: 13px;
   }
-  .pl-back:hover, .pl-refresh:hover:not(:disabled), .pl-add:hover {
+  .pl-back:hover, .pl-refresh:hover:not(:disabled), .pl-add:hover,
+  .pl-update-all:hover:not(:disabled) {
     background: rgba(255,255,255,0.1);
+  }
+  /* 0.2.x backlog #4: distinct teal accent so the power-user action
+   * reads as an action button, not a chrome control. Matches the Add
+   * button's accent treatment. */
+  .pl-update-all {
+    border-color: rgba(0,191,166,0.3);
+    color: rgb(0,191,166);
+  }
+  .pl-update-all:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+    color: var(--color-mid, #aaa);
   }
   .pl-add {
     border-color: rgba(0,191,166,0.4);

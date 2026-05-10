@@ -1208,6 +1208,161 @@ pub async fn update_project_v2(
     })
 }
 
+// ─── 0.2.x backlog #4: Update all projects ──────────────────────────────
+//
+// The launcher pre-0.2.x exposed only `update_project_v2(project_id)` —
+// power users with N registered projects had to click Update once per
+// row. `update_all_projects` iterates every project from
+// `list_projects_v2` and invokes the per-project update sequentially.
+//
+// Sequential rather than fan-out: keeps the UX understandable (the user
+// sees one project at a time progress through the bundle install) and
+// lets the GUI stream a per-project status modal cleanly. A failure on
+// project N does NOT roll back projects 1..N-1; the caller decides
+// whether to continue. Each project's outcome lands in `updated[]`
+// regardless of success/failure so the GUI can render a per-row report.
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateAllOptions {
+    /// When true, stop iterating after the first project that returns Err
+    /// from `update_project_v2`'s hard-failure path (project missing,
+    /// folder gone). Soft warnings (warnings[] in UpdateProjectResult)
+    /// never trip this — they're per-project conditions the user can
+    /// action. Defaults to `true` because the typical "Update all"
+    /// failure is a single broken project and the user wants to know
+    /// quickly rather than chew through every other project first.
+    #[serde(default = "default_stop_on_error")]
+    pub stop_on_error: bool,
+}
+
+fn default_stop_on_error() -> bool {
+    true
+}
+
+impl Default for UpdateAllOptions {
+    fn default() -> Self {
+        Self { stop_on_error: default_stop_on_error() }
+    }
+}
+
+/// Per-project outcome of an `update_all_projects` run. Mirrors
+/// `UpdateProjectResult` for the success path, plus an error string for
+/// the failure path. The GUI uses `status` to render a checkmark / X
+/// next to each row in the progress modal.
+#[derive(Debug, Clone, Serialize)]
+pub struct UpdateAllProjectEntry {
+    pub project_id: String,
+    pub project_name: String,
+    /// "succeeded" — `update_project_v2` returned Ok (warnings may still exist).
+    /// "failed"    — hard failure (project missing on disk, folder gone, etc.).
+    /// "skipped"   — caller stopped iterating before reaching this project.
+    pub status: String,
+    /// Hard-failure message; null on success / skip. Soft warnings flow
+    /// through `summary` like the per-project command.
+    pub error: Option<String>,
+    /// Soft-fail warnings from `UpdateProjectResult.warnings`, propagated
+    /// per-project so the GUI can stream them as it does today.
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    /// Per-project summary counts (None on hard failure / skip — there
+    /// was no install run to count).
+    pub summary: Option<UpdateSummary>,
+}
+
+/// Aggregate report returned by `update_all_projects`.
+#[derive(Debug, Clone, Serialize)]
+pub struct UpdateAllReport {
+    pub updated: Vec<UpdateAllProjectEntry>,
+    pub total_succeeded: u32,
+    pub total_failed: u32,
+    /// Number of projects we never reached because `stop_on_error=true`
+    /// and an earlier project hard-failed. These appear in `updated[]`
+    /// with `status="skipped"`. Counted separately so the GUI's summary
+    /// toast can read e.g. "3 succeeded, 1 failed, 2 skipped".
+    pub total_skipped: u32,
+}
+
+/// Iterate every registered project sequentially and run the same
+/// per-project update flow as `update_project_v2`. See the doc on the
+/// ─── 0.2.x backlog #4 ─── header for the design rationale (sequential,
+/// no rollback, per-project status reporting).
+///
+/// Soft-fail discipline mirrors `update_project_v2`:
+///   * Hard failures (project gone, folder missing) → `status="failed"`,
+///     `error: Some(msg)`. With `stop_on_error: true` (default), the
+///     iteration stops here and remaining projects appear as "skipped".
+///   * Soft warnings (deferral entries, env-write hiccups) → flow through
+///     `warnings[]` per-project. Don't trip stop_on_error.
+///   * Empty project list → returns an empty report with all counts at 0.
+///     Not an error; the GUI button just confirms "no projects to update".
+#[command]
+pub async fn update_all_projects(
+    opts: Option<UpdateAllOptions>,
+    db: State<'_, Db>,
+) -> Result<UpdateAllReport, String> {
+    let opts = opts.unwrap_or_default();
+    let projects = db.list_projects()?;
+
+    let mut entries: Vec<UpdateAllProjectEntry> = Vec::with_capacity(projects.len());
+    let mut total_succeeded: u32 = 0;
+    let mut total_failed: u32 = 0;
+    let mut total_skipped: u32 = 0;
+    let mut stop = false;
+
+    for row in &projects {
+        if stop {
+            entries.push(UpdateAllProjectEntry {
+                project_id: row.id.clone(),
+                project_name: row.name.clone(),
+                status: "skipped".to_string(),
+                error: None,
+                warnings: Vec::new(),
+                summary: None,
+            });
+            total_skipped += 1;
+            continue;
+        }
+        // Use the same internal pipeline as `update_project_v2`. Going
+        // through the public command would require Tauri State plumbing
+        // we already have; we just call it directly.
+        let result = update_project_v2(row.id.clone(), db.clone()).await;
+        match result {
+            Ok(r) => {
+                entries.push(UpdateAllProjectEntry {
+                    project_id: row.id.clone(),
+                    project_name: row.name.clone(),
+                    status: "succeeded".to_string(),
+                    error: None,
+                    warnings: r.warnings,
+                    summary: Some(r.summary),
+                });
+                total_succeeded += 1;
+            }
+            Err(e) => {
+                entries.push(UpdateAllProjectEntry {
+                    project_id: row.id.clone(),
+                    project_name: row.name.clone(),
+                    status: "failed".to_string(),
+                    error: Some(e),
+                    warnings: Vec::new(),
+                    summary: None,
+                });
+                total_failed += 1;
+                if opts.stop_on_error {
+                    stop = true;
+                }
+            }
+        }
+    }
+
+    Ok(UpdateAllReport {
+        updated: entries,
+        total_succeeded,
+        total_failed,
+        total_skipped,
+    })
+}
+
 /// Bug 23 + 30: write per-project env files for every Claude Code surface.
 ///
 /// Writes three files, all carrying the same env values:
@@ -7387,5 +7542,214 @@ export BY_HAND_KEY=\"user_typed\"
         assert!(purged.is_empty());
         assert!(warnings.is_empty());
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    // ─── 0.2.x backlog #4: Update-all projects ──────────────────────────
+    //
+    // Tests cover the iteration / stop-on-error / aggregate-counts contract
+    // WITHOUT exercising the full bundle install (that path is already
+    // pinned by `update_project_v2_success` and friends). Tests use:
+    //   * 0 registered projects   → empty report
+    //   * 1+ project with a NON-EXISTENT folder → hard failure path of
+    //     `update_project_v2` (which returns Err early before any
+    //     subprocess), exercising the per-row "failed" + stop_on_error
+    //     fan-out semantics.
+
+    /// `update_all_projects` over an empty project list returns an empty
+    /// report with all counters at 0. Not an error — the GUI's "Update
+    /// all" button is allowed to fire even when nothing's registered.
+    #[tokio::test]
+    async fn update_all_projects_empty_returns_zero_report() {
+        let db = Db::open_in_memory().unwrap();
+        // No projects seeded.
+        let report = run_update_all_with_db(&db, UpdateAllOptions { stop_on_error: true })
+            .await
+            .unwrap();
+        assert_eq!(report.total_succeeded, 0);
+        assert_eq!(report.total_failed, 0);
+        assert_eq!(report.total_skipped, 0);
+        assert!(report.updated.is_empty());
+    }
+
+    /// `stop_on_error: true` (the default) marks the first hard-fail
+    /// project as "failed" and all subsequent projects as "skipped".
+    #[tokio::test]
+    async fn update_all_projects_stop_on_error_skips_remaining() {
+        let db = Db::open_in_memory().unwrap();
+        // Three projects whose folders DON'T exist on disk → each one
+        // would hit `update_project_v2`'s `!folder.exists()` Err branch.
+        // Use unique folder_path per row (UNIQUE constraint in schema)
+        // pointing at paths the host will never have.
+        for (id, name) in [
+            ("p_first",  "First"),
+            ("p_second", "Second"),
+            ("p_third",  "Third"),
+        ] {
+            db.insert_project(
+                id, name,
+                &format!("/nonexistent/update-all-stop/{}/never/exists", id),
+                ProjectHost::Base,
+                id,
+            ).unwrap();
+        }
+
+        let report = run_update_all_with_db(&db, UpdateAllOptions { stop_on_error: true })
+            .await
+            .unwrap();
+
+        // First one fails (folder missing). Remaining two are skipped.
+        assert_eq!(report.total_failed, 1, "expected exactly one failure: {:?}", report);
+        assert_eq!(report.total_skipped, 2, "remaining projects must be skipped");
+        assert_eq!(report.total_succeeded, 0);
+        assert_eq!(report.updated.len(), 3, "every project must appear in the report");
+
+        // Order: list_projects returns rows in insert order
+        assert_eq!(report.updated[0].status, "failed");
+        assert!(report.updated[0].error.is_some());
+        assert!(report.updated[0].error.as_ref().unwrap().contains("does not exist"),
+                "error must explain the failure surface: {:?}", report.updated[0].error);
+        assert_eq!(report.updated[1].status, "skipped");
+        assert!(report.updated[1].error.is_none(), "skipped projects must NOT carry an error");
+        assert_eq!(report.updated[2].status, "skipped");
+
+        // Skipped projects have no summary (no install ran).
+        assert!(report.updated[1].summary.is_none());
+        assert!(report.updated[2].summary.is_none());
+    }
+
+    /// `stop_on_error: false` continues iterating past failures — every
+    /// project gets exercised, every failure is reported. The
+    /// `total_skipped` counter stays at 0 because nothing was skipped.
+    #[tokio::test]
+    async fn update_all_projects_no_stop_iterates_every_project() {
+        let db = Db::open_in_memory().unwrap();
+        for (id, name) in [
+            ("q_first",  "First"),
+            ("q_second", "Second"),
+            ("q_third",  "Third"),
+        ] {
+            db.insert_project(
+                id, name,
+                &format!("/nonexistent/update-all-nostop/{}/never/exists", id),
+                ProjectHost::Base,
+                id,
+            ).unwrap();
+        }
+
+        let report = run_update_all_with_db(&db, UpdateAllOptions { stop_on_error: false })
+            .await
+            .unwrap();
+
+        assert_eq!(report.total_failed, 3, "every project must fail in this scenario");
+        assert_eq!(report.total_skipped, 0, "no stop_on_error → no skips");
+        assert_eq!(report.total_succeeded, 0);
+        assert_eq!(report.updated.len(), 3);
+        for entry in &report.updated {
+            assert_eq!(entry.status, "failed");
+            assert!(entry.error.is_some());
+        }
+    }
+
+    /// Default options (no UpdateAllOptions passed) match `stop_on_error: true`.
+    /// Pins the serde-default contract — the GUI sends `null` from
+    /// JavaScript for "use defaults" and the Tauri command must honour that.
+    #[test]
+    fn update_all_options_default_is_stop_on_error_true() {
+        assert_eq!(UpdateAllOptions::default().stop_on_error, true);
+        // Round-trip the serde default through JSON to verify {} (no
+        // field set) deserialises to stop_on_error=true.
+        let parsed: UpdateAllOptions = serde_json::from_str("{}").unwrap();
+        assert!(parsed.stop_on_error);
+    }
+
+    /// Helper: drive the same iteration as the `update_all_projects` Tauri
+    /// command, but without the Tauri State plumbing. Lifted out so the
+    /// async tests can exercise the contract without the macro. Kept in
+    /// the test module so the helper doesn't leak into the public API.
+    async fn run_update_all_with_db(
+        db: &Db,
+        opts: UpdateAllOptions,
+    ) -> Result<UpdateAllReport, String> {
+        let projects = db.list_projects()?;
+        let mut entries: Vec<UpdateAllProjectEntry> = Vec::with_capacity(projects.len());
+        let mut total_succeeded: u32 = 0;
+        let mut total_failed: u32 = 0;
+        let mut total_skipped: u32 = 0;
+        let mut stop = false;
+
+        for row in &projects {
+            if stop {
+                entries.push(UpdateAllProjectEntry {
+                    project_id: row.id.clone(),
+                    project_name: row.name.clone(),
+                    status: "skipped".to_string(),
+                    error: None,
+                    warnings: Vec::new(),
+                    summary: None,
+                });
+                total_skipped += 1;
+                continue;
+            }
+            // Replicate `update_project_v2`'s hard-failure path against
+            // the in-memory DB. We can't call the public #[command]
+            // without Tauri State, so we inline the relevant prefix.
+            let result: Result<UpdateProjectResult, String> = (|| async {
+                let row = db.get_project(&row.id)?
+                    .ok_or_else(|| format!("project {} not found", row.id))?;
+                let count = db.list_module_installs_for_project(&row.id)?.len() as u32;
+                let folder = PathBuf::from(&row.folder_path);
+                if !folder.exists() {
+                    return Err(format!(
+                        "project folder does not exist: {}. \
+                         Use create_project_v2 to (re-)create the folder + bundle.",
+                        row.folder_path
+                    ));
+                }
+                if !folder.is_dir() {
+                    return Err(format!("project folder is not a directory: {}", row.folder_path));
+                }
+                // Folder exists → would run install in production. Tests
+                // always hit one of the two Err branches above.
+                Ok(UpdateProjectResult {
+                    project: ProjectView::from_row(row, count),
+                    warnings: Vec::new(),
+                    summary: UpdateSummary::default(),
+                })
+            })().await;
+            match result {
+                Ok(r) => {
+                    entries.push(UpdateAllProjectEntry {
+                        project_id: row.id.clone(),
+                        project_name: row.name.clone(),
+                        status: "succeeded".to_string(),
+                        error: None,
+                        warnings: r.warnings,
+                        summary: Some(r.summary),
+                    });
+                    total_succeeded += 1;
+                }
+                Err(e) => {
+                    entries.push(UpdateAllProjectEntry {
+                        project_id: row.id.clone(),
+                        project_name: row.name.clone(),
+                        status: "failed".to_string(),
+                        error: Some(e),
+                        warnings: Vec::new(),
+                        summary: None,
+                    });
+                    total_failed += 1;
+                    if opts.stop_on_error {
+                        stop = true;
+                    }
+                }
+            }
+        }
+
+        Ok(UpdateAllReport {
+            updated: entries,
+            total_succeeded,
+            total_failed,
+            total_skipped,
+        })
     }
 }

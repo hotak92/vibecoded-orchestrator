@@ -806,6 +806,247 @@ pub async fn resume_secret_for_project(
     )
 }
 
+// ─── 0.2.x backlog #3: shared-tab key-collision detection ───────────────
+//
+// `list_user_secret_keys_v2` enumerates every user-bucket secret KEY the
+// launcher has ever observed for a given project, across the three scopes
+// the SecretsPanel writes to:
+//
+//   * `(scope='per_project', project_id=<this project>, module_id='user')`
+//   * `(scope='shared',      project_id='_user_shared_', module_id='user')`
+//   * `(scope='global',      project_id='_global_',      module_id='user')`
+//
+// For each (scope, key) row it also reports whether ANY OTHER scope has a
+// row for the SAME key — the "shadowing" condition the SecretsPanel renders
+// as a warning badge on the affected rows. The resolver's read-time
+// precedence is `per_project > shared > global` (see SecretsPanel header
+// comment "Read-time resolution order"); when collisions exist we mark the
+// collision'd rows as shadowed and surface the `winning_scope` so the user
+// can confirm which value will actually be used at runtime.
+//
+// Rationale: pre-0.2.x-backlog-#3 the panel rendered each tab in isolation
+// and a duplicate KEY across e.g. Shared + Per-project was silently
+// ignored — the resolver applied per-project's value while the user was
+// actively editing a stale Shared entry, with no visual hint. The badge
+// closes that "GUI says set, but my edit doesn't reach the runtime" gap.
+
+/// One row in `list_user_secret_keys_v2`'s response — a single user-bucket
+/// secret (scope, module_id='user', key) plus everything the SecretsPanel
+/// needs to render the shadow badge.
+#[derive(Debug, Clone, Serialize)]
+pub struct UserSecretKeyRow {
+    pub scope: String,        // "per_project" | "shared" | "global"
+    pub project_id: String,   // owner project_id (sentinel for shared/global)
+    pub module_id: String,    // always "user" — kept for symmetry with other APIs
+    pub key: String,
+    /// Same gate as `is_secret_set` — true ⇔ keychain has value AND
+    /// per-requester active flag (with this `project_id` as the requester
+    /// for shared/global) is set.
+    pub is_set: bool,
+    /// Active flag in launcher.db for this row.
+    pub is_active: bool,
+    /// True when the keychain still has a value (regardless of active).
+    pub has_saved_value: bool,
+    /// True when ANY OTHER scope has a row for the same KEY name in the
+    /// user bucket and that other row would override this one (precedence:
+    /// per_project > shared > global). The badge renders on every row of
+    /// a collision'd KEY — both the winner and the loser — so the user
+    /// can SEE which value is in effect.
+    pub is_shadowed: bool,
+    /// The scope whose value the resolver actually serves at runtime for
+    /// this (project_id, key) tuple, considering precedence + active
+    /// state. Equals `scope` when this row IS the winner. Different from
+    /// `scope` when another scope's row outranks this one.
+    pub winning_scope: String,
+}
+
+/// Read the lifecycle state for a single user-bucket entry. Mirrors
+/// `get_secret_status_v2` semantics (cross-launcher gate, per-requester)
+/// but takes the same `(scope, project_id, key)` triple so we can call
+/// it in a tight loop.
+fn read_user_secret_status(
+    db: &Db,
+    scope: &str,
+    project_id: &str,
+    requester_project_id: &str,
+    key: &str,
+) -> (bool, bool, bool) {
+    let scope_enum = scope_from_manifest(scope, project_id);
+    let active = crate::db::secret_active::is_secret_active_cross_launcher_for_requester(
+        db,
+        scope,
+        project_id,
+        "user",
+        key,
+        requester_project_id,
+    );
+    let active_own = db
+        .is_secret_active_for_requester(scope, project_id, "user", key, requester_project_id)
+        .unwrap_or(true);
+    let has_saved_value = secrets::is_set(scope_enum, "user", key).unwrap_or(false);
+    // is_set follows the same gate as the read-time API: cross-launcher
+    // active AND keychain-present.
+    (active && has_saved_value, active_own, has_saved_value)
+}
+
+/// Resolve which scope's value the runtime resolver would ACTUALLY serve
+/// for `(project_id, key)` given the active-state of each scope's row.
+/// Precedence: per_project > shared > global. A scope's row only competes
+/// when its `is_set` is true (active + keychain-present). If no scope wins,
+/// returns the row's own scope so the GUI shows "this is what you typed,
+/// even if no consumer reads it yet".
+fn resolve_winning_scope(
+    own_scope: &str,
+    pp_set: bool,
+    sh_set: bool,
+    gl_set: bool,
+) -> String {
+    if pp_set {
+        return "per_project".to_string();
+    }
+    if sh_set {
+        return "shared".to_string();
+    }
+    if gl_set {
+        return "global".to_string();
+    }
+    // No scope has a live value — keep the badge attached to the row the
+    // user is looking at so the UI doesn't need a "no winner" branch.
+    own_scope.to_string()
+}
+
+/// Enumerate every user-bucket secret KEY the launcher has observed for
+/// `project_id`'s view of the world (its own per_project bucket + shared +
+/// global). Used by the SecretsPanel to populate the entry list AND
+/// detect cross-scope KEY collisions for the shadow badge.
+///
+/// Soft-fail: a DB hiccup on one of the three lists yields an empty
+/// sub-list rather than failing the whole call — the panel always has
+/// something to render.
+#[command]
+pub async fn list_user_secret_keys_v2(
+    project_id: String,
+    db: State<'_, Db>,
+) -> Result<Vec<UserSecretKeyRow>, String> {
+    enforce_scope_invariants("per_project", &project_id, &db)?;
+
+    // Three flat key lists. `list_*` helpers in db::secret_active soft-fail
+    // to empty Vec on DB error.
+    let pp_keys = db.list_user_secret_keys_for_project(&project_id);
+    let sh_keys = db.list_shared_user_secret_keys();
+    let gl_keys = db.list_global_user_secret_keys();
+
+    // Build a per-key collision index up front so a single key appearing in
+    // 2 or 3 scopes is flagged on EVERY row, not just one. Each value is
+    // the list of scopes the key appears in.
+    use std::collections::{BTreeMap, HashMap};
+    let mut scope_map: HashMap<&str, Vec<&str>> = HashMap::new();
+    for k in &pp_keys {
+        scope_map.entry(k.as_str()).or_default().push("per_project");
+    }
+    for k in &sh_keys {
+        scope_map.entry(k.as_str()).or_default().push("shared");
+    }
+    for k in &gl_keys {
+        scope_map.entry(k.as_str()).or_default().push("global");
+    }
+
+    // Pre-compute per-key lifecycle for each scope so we can resolve the
+    // winning_scope without re-reading the same status three times. We
+    // cache by (scope, key) — small cardinality, predictable cost.
+    let mut status_cache: BTreeMap<(String, String), (bool, bool, bool)> = BTreeMap::new();
+    let mut status_for = |scope: &str, key: &str| -> (bool, bool, bool) {
+        let cache_key = (scope.to_string(), key.to_string());
+        if let Some(s) = status_cache.get(&cache_key) {
+            return *s;
+        }
+        let (owner, requester) = match scope {
+            "global" => (SENTINEL_GLOBAL.to_string(), project_id.clone()),
+            "shared" => (SENTINEL_SHARED.to_string(), project_id.clone()),
+            _ => (project_id.clone(), project_id.clone()),
+        };
+        let s = read_user_secret_status(&db, scope, &owner, &requester, key);
+        status_cache.insert(cache_key, s);
+        s
+    };
+
+    let mut out: Vec<UserSecretKeyRow> = Vec::new();
+
+    // Emit one row per (scope, key) the launcher has observed. The badge
+    // condition is `scope_map[key].len() >= 2` (a KEY in ≥2 scopes).
+    let push_row = |scope: &str, owner: &str, key: &str,
+                    scope_map: &HashMap<&str, Vec<&str>>,
+                    status_for: &mut dyn FnMut(&str, &str) -> (bool, bool, bool),
+                    out: &mut Vec<UserSecretKeyRow>| {
+        let (is_set, is_active, has_saved_value) = status_for(scope, key);
+        // Compute winner using all three scopes' is_set states.
+        let pp_set = if scope == "per_project" {
+            is_set
+        } else {
+            status_for("per_project", key).0
+        };
+        let sh_set = if scope == "shared" {
+            is_set
+        } else {
+            status_for("shared", key).0
+        };
+        let gl_set = if scope == "global" {
+            is_set
+        } else {
+            status_for("global", key).0
+        };
+        let winning_scope = resolve_winning_scope(scope, pp_set, sh_set, gl_set);
+        let collisions = scope_map
+            .get(key)
+            .map(|v| v.len())
+            .unwrap_or(0);
+        out.push(UserSecretKeyRow {
+            scope: scope.to_string(),
+            project_id: owner.to_string(),
+            module_id: "user".to_string(),
+            key: key.to_string(),
+            is_set,
+            is_active,
+            has_saved_value,
+            is_shadowed: collisions >= 2,
+            winning_scope,
+        });
+    };
+
+    for k in &pp_keys {
+        push_row(
+            "per_project",
+            &project_id,
+            k,
+            &scope_map,
+            &mut status_for,
+            &mut out,
+        );
+    }
+    for k in &sh_keys {
+        push_row(
+            "shared",
+            SENTINEL_SHARED,
+            k,
+            &scope_map,
+            &mut status_for,
+            &mut out,
+        );
+    }
+    for k in &gl_keys {
+        push_row(
+            "global",
+            SENTINEL_GLOBAL,
+            k,
+            &scope_map,
+            &mut status_for,
+            &mut out,
+        );
+    }
+
+    Ok(out)
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────
 //
 // These tests cover the scope-invariant guard rails and the active-flag
@@ -1682,5 +1923,205 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&folder1);
         let _ = std::fs::remove_dir_all(&folder2);
+    }
+
+    // ─── 0.2.x backlog #3: shared-tab key-collision shadow badge ────────
+    //
+    // Tests target two layers:
+    //   1. `resolve_winning_scope` — pure precedence logic.
+    //   2. The end-to-end DB enumeration (`list_*_user_secret_keys` +
+    //      collision detection). We exercise the same data path
+    //      `list_user_secret_keys_v2` walks, asserting both the row count
+    //      and the per-row `is_shadowed` / `winning_scope` decisions.
+    //
+    // Layer 2 needs an OS keychain because the `is_set` field (cross-launcher
+    // gate × keychain presence) reads through the keychain. Tests that
+    // exercise it short-circuit on `keyring_available()`.
+
+    #[test]
+    fn resolve_winning_scope_precedence_per_project_beats_shared_beats_global() {
+        // All three set: per_project wins.
+        assert_eq!(resolve_winning_scope("per_project", true, true, true), "per_project");
+        assert_eq!(resolve_winning_scope("shared", true, true, true), "per_project");
+        assert_eq!(resolve_winning_scope("global", true, true, true), "per_project");
+        // Per-project paused, shared+global active: shared wins.
+        assert_eq!(resolve_winning_scope("per_project", false, true, true), "shared");
+        assert_eq!(resolve_winning_scope("shared", false, true, true), "shared");
+        assert_eq!(resolve_winning_scope("global", false, true, true), "shared");
+        // Only global active.
+        assert_eq!(resolve_winning_scope("per_project", false, false, true), "global");
+        assert_eq!(resolve_winning_scope("shared", false, false, true), "global");
+        assert_eq!(resolve_winning_scope("global", false, false, true), "global");
+        // No scope set → fall back to own (the row the user is looking at).
+        assert_eq!(resolve_winning_scope("per_project", false, false, false), "per_project");
+        assert_eq!(resolve_winning_scope("shared", false, false, false), "shared");
+        assert_eq!(resolve_winning_scope("global", false, false, false), "global");
+    }
+
+    /// Direct DB-only collision detection: write keys to two scopes via
+    /// `mark_secret_active` only (no keychain), then walk the same lists
+    /// `list_user_secret_keys_v2` walks and assert collision is detected.
+    /// This is the layer-2 contract WITHOUT the keychain dependency, so
+    /// it runs in CI containers that don't have libsecret.
+    #[test]
+    fn collision_index_flags_keys_present_in_two_scopes() {
+        let db = make_db();
+        seed_project(&db, "pcoll", "Collision Project");
+
+        // OPENAI_API_KEY in BOTH per_project (for pcoll) AND shared.
+        db.mark_secret_active("per_project", "pcoll", "user", "OPENAI_API_KEY")
+            .unwrap();
+        db.mark_secret_active("shared", "_user_shared_", "user", "OPENAI_API_KEY")
+            .unwrap();
+        // GITHUB_TOKEN only in shared.
+        db.mark_secret_active("shared", "_user_shared_", "user", "GITHUB_TOKEN")
+            .unwrap();
+
+        let pp = db.list_user_secret_keys_for_project("pcoll");
+        let sh = db.list_shared_user_secret_keys();
+        let gl = db.list_global_user_secret_keys();
+        assert_eq!(pp, vec!["OPENAI_API_KEY".to_string()]);
+        assert!(sh.contains(&"OPENAI_API_KEY".to_string()));
+        assert!(sh.contains(&"GITHUB_TOKEN".to_string()));
+        assert_eq!(sh.len(), 2);
+        assert!(gl.is_empty());
+
+        // Build the collision index the way list_user_secret_keys_v2 does.
+        use std::collections::HashMap;
+        let mut scope_map: HashMap<&str, Vec<&str>> = HashMap::new();
+        for k in &pp {
+            scope_map.entry(k.as_str()).or_default().push("per_project");
+        }
+        for k in &sh {
+            scope_map.entry(k.as_str()).or_default().push("shared");
+        }
+        for k in &gl {
+            scope_map.entry(k.as_str()).or_default().push("global");
+        }
+
+        // OPENAI_API_KEY in per_project + shared → collision.
+        assert_eq!(scope_map["OPENAI_API_KEY"].len(), 2);
+        // GITHUB_TOKEN only in shared → no collision.
+        assert_eq!(scope_map["GITHUB_TOKEN"].len(), 1);
+    }
+
+    /// Three-way collision (per_project + shared + global) is flagged on
+    /// every row. Pre-fix the panel could render the per-project row
+    /// without realising shared+global also had the same key.
+    #[test]
+    fn collision_index_flags_three_way_collision_on_every_row() {
+        let db = make_db();
+        seed_project(&db, "p3way", "ThreeWay");
+
+        for (scope, owner) in [
+            ("per_project", "p3way"),
+            ("shared", "_user_shared_"),
+            ("global", "_global_"),
+        ] {
+            db.mark_secret_active(scope, owner, "user", "ANTHROPIC_API_KEY")
+                .unwrap();
+        }
+
+        let pp = db.list_user_secret_keys_for_project("p3way");
+        let sh = db.list_shared_user_secret_keys();
+        let gl = db.list_global_user_secret_keys();
+        assert!(pp.contains(&"ANTHROPIC_API_KEY".to_string()));
+        assert!(sh.contains(&"ANTHROPIC_API_KEY".to_string()));
+        assert!(gl.contains(&"ANTHROPIC_API_KEY".to_string()));
+
+        use std::collections::HashMap;
+        let mut scope_map: HashMap<&str, Vec<&str>> = HashMap::new();
+        for k in &pp { scope_map.entry(k.as_str()).or_default().push("per_project"); }
+        for k in &sh { scope_map.entry(k.as_str()).or_default().push("shared"); }
+        for k in &gl { scope_map.entry(k.as_str()).or_default().push("global"); }
+        assert_eq!(scope_map["ANTHROPIC_API_KEY"].len(), 3);
+    }
+
+    /// Per-project rows for project A do NOT pollute project B's collision
+    /// view. The badge must scope to the project the GUI is currently
+    /// looking at.
+    #[test]
+    fn collision_per_project_isolation_between_projects() {
+        let db = make_db();
+        seed_project(&db, "pA", "Project A");
+        seed_project(&db, "pB", "Project B");
+
+        // Project A has OPENAI_API_KEY in per_project; project B does not.
+        db.mark_secret_active("per_project", "pA", "user", "OPENAI_API_KEY")
+            .unwrap();
+        db.mark_secret_active("shared", "_user_shared_", "user", "OPENAI_API_KEY")
+            .unwrap();
+
+        // From pA's POV: per_project row exists → collision with shared.
+        let pp_a = db.list_user_secret_keys_for_project("pA");
+        let sh = db.list_shared_user_secret_keys();
+        assert!(pp_a.contains(&"OPENAI_API_KEY".to_string()));
+        assert!(sh.contains(&"OPENAI_API_KEY".to_string()));
+
+        // From pB's POV: per_project bucket is empty for pB; only shared.
+        let pp_b = db.list_user_secret_keys_for_project("pB");
+        assert!(pp_b.is_empty(), "project A's per-project key leaked into project B's bucket");
+
+        // Build pB's collision index — should NOT have a collision because
+        // pB's per-project bucket has no OPENAI_API_KEY.
+        use std::collections::HashMap;
+        let mut scope_map: HashMap<&str, Vec<&str>> = HashMap::new();
+        for k in &pp_b { scope_map.entry(k.as_str()).or_default().push("per_project"); }
+        for k in &sh { scope_map.entry(k.as_str()).or_default().push("shared"); }
+        // OPENAI_API_KEY exists only in shared from pB's POV — no collision.
+        assert_eq!(scope_map["OPENAI_API_KEY"].len(), 1);
+    }
+
+    /// Sanity: the keychain-backed end-to-end test. Skipped on CI hosts
+    /// without libsecret. Pin: a row only counts as `is_set: true` when
+    /// keychain has a value AND the cross-launcher active flag is set;
+    /// the resolver's `winning_scope` follows is_set, NOT mere row presence.
+    #[test]
+    fn winning_scope_ignores_paused_or_keychain_empty_rows() {
+        if !keyring_available() {
+            eprintln!("[skip] no OS keychain backend");
+            return;
+        }
+        let db = make_db();
+        seed_project(&db, "pwin", "Winning Project");
+
+        let key = format!(
+            "VCT_WIN_TEST_KEY_{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        );
+
+        // Set value in shared, NO value in per_project (only an active row).
+        let canary = format!(
+            "win-canary-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        );
+        let shared_scope = scope_from_manifest("shared", SENTINEL_SHARED);
+        secrets::set(shared_scope, "user", &key, &canary).expect("keychain set shared");
+        db.mark_secret_active("shared", SENTINEL_SHARED, "user", &key)
+            .unwrap();
+
+        // Per-project row exists in the active-flag DB but keychain is empty
+        // (e.g. user typed the value Shared but had previously toggled
+        // per-project). is_set should be false for per-project, true for shared.
+        db.mark_secret_active("per_project", "pwin", "user", &key)
+            .unwrap();
+
+        // Use the same status helper list_user_secret_keys_v2 uses.
+        let (pp_set, _, _) = read_user_secret_status(&db, "per_project", "pwin", "pwin", &key);
+        let (sh_set, _, _) = read_user_secret_status(&db, "shared", SENTINEL_SHARED, "pwin", &key);
+        assert!(!pp_set, "per_project must be is_set=false (keychain empty)");
+        assert!(sh_set, "shared must be is_set=true (keychain holds canary)");
+
+        // Winning scope: shared wins because per_project has no keychain value.
+        let winner = resolve_winning_scope("shared", pp_set, sh_set, false);
+        assert_eq!(winner, "shared");
+        // Even from per_project's POV, the resolver still picks shared.
+        let winner_pp = resolve_winning_scope("per_project", pp_set, sh_set, false);
+        assert_eq!(winner_pp, "shared");
+
+        // Cleanup.
+        let _ = secrets::delete(shared_scope, "user", &key);
+        let _ = db.forget_secret_active_state("shared", SENTINEL_SHARED, "user", &key);
+        let _ = db.forget_secret_active_state("per_project", "pwin", "user", &key);
     }
 }
