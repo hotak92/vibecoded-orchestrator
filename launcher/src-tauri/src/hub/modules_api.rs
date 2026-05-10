@@ -524,19 +524,21 @@ async fn project_env(
                 "shared" => SENTINEL_SHARED,
                 _ => &project.id,
             };
-            // Active-flag gate (cross-launcher, Option γ — PR-3 Commit 4).
-            // The OS keychain is shared across dev/prod launchers, so a
-            // pause anywhere must take effect everywhere. Walks the own
-            // DB plus every discovered sibling launcher.db; refuses to
-            // serve if ANY says inactive. `is_secret_active` defaults to
-            // true when no row exists, so secrets that pre-existed
-            // migration 007 still resolve normally.
-            let active = crate::db::secret_active::is_secret_active_cross_launcher(
+            // Active-flag gate (cross-launcher, per-requester — 0.2.1
+            // migration 009). The consuming project's id is the requester
+            // so a per-project pause on a shared/global secret takes
+            // effect even though the keychain row is shared. The
+            // `_for_requester` variant follows the same lookup contract
+            // as the legacy gate (literal-requester row → `*` sentinel
+            // fallback → default-active when no row exists), so secrets
+            // that pre-date migration 009 still resolve normally.
+            let active = crate::db::secret_active::is_secret_active_cross_launcher_for_requester(
                 &h.0,
                 scope_str,
                 lookup_project_id,
                 &manifest.id,
                 &s.key,
+                &project.id,
             );
             if !active {
                 continue;
@@ -585,12 +587,13 @@ async fn project_env(
                 "shared" => SENTINEL_SHARED,
                 _ => &project.id,
             };
-            let active = crate::db::secret_active::is_secret_active_cross_launcher(
+            let active = crate::db::secret_active::is_secret_active_cross_launcher_for_requester(
                 &h.0,
                 scope_str,
                 lookup_project_id,
                 &bs.module_id,
                 &bs.key,
+                &project.id,
             );
             if !active {
                 continue;
@@ -602,6 +605,51 @@ async fn project_env(
             };
             if let Ok(Some(val)) = crate::secrets::get(scope, &bs.module_id, &bs.key) {
                 env.insert(bs.key.clone(), serde_json::Value::String(val));
+            }
+        }
+    }
+
+    // 0.2.1: cross-project grants resolution (migration 009 § secret_grants).
+    //
+    // Walk every grant where this project is the GRANTEE — i.e. another
+    // project (the OWNER) has explicitly granted us read access to one
+    // of its per_project secrets. Each grant row resolves to a keychain
+    // read against the OWNER's per_project bucket, gated on the same
+    // per-(secret × requester) active flag the owned-secrets loop above
+    // uses. The grantee can self-opt-out by pausing the secret for its
+    // own project_id — the grant row stays so the owner sees "B has
+    // paused this grant" without losing the relationship.
+    //
+    // Grants are `per_project` scope only by schema (the CHECK on
+    // secret_grants enforces this), so we don't need to dispatch on
+    // `scope` here — the keychain read is always against
+    // `SecretScope::PerProject { project_id: <owner> }`.
+    //
+    // Precedence: an installed-module declaration with the same key
+    // wins (the `if env.contains_key` guard mirrors the orchestrator-
+    // bundled loop above). Same rationale: explicit module declarations
+    // are an opt-in contract; grants are an additive sharing surface.
+    if let Ok(grants) = h.0.list_grants_by_grantee(&project.id) {
+        for g in &grants {
+            if env.contains_key(&g.key) {
+                continue;
+            }
+            let active = crate::db::secret_active::is_secret_active_cross_launcher_for_requester(
+                &h.0,
+                "per_project",
+                &g.owner_project_id,
+                &g.module_id,
+                &g.key,
+                &project.id,
+            );
+            if !active {
+                continue;
+            }
+            let scope = crate::secrets::SecretScope::PerProject {
+                project_id: &g.owner_project_id,
+            };
+            if let Ok(Some(val)) = crate::secrets::get(scope, &g.module_id, &g.key) {
+                env.insert(g.key.clone(), serde_json::Value::String(val));
             }
         }
     }

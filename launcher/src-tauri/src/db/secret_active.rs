@@ -577,6 +577,158 @@ pub fn is_secret_active_cross_launcher(
     true
 }
 
+/// Read per-(secret × requester) active-flag from a sibling launcher DB.
+///
+/// Migration-009 schema-compat: a sibling DB may pre-date migration 009
+/// (no `requester_project_id` column — five-column PK). We probe the new
+/// schema first; if the column is missing we fall back to the legacy
+/// four-column query so an older sibling still contributes its opinion.
+///
+/// Lookup contract mirrors `is_secret_active_for_requester`:
+///   1. literal-requester row first
+///   2. `*` sentinel row as fallback
+///   3. default-active when neither exists
+///
+/// Returns:
+///   * `Some(true)`  — sibling has an active row OR no row (default-active)
+///   * `Some(false)` — sibling has an explicit `active=0` row for this
+///                     requester (or for `*`, when the requester row is absent)
+///   * `None`        — DB unreadable / table missing / non-SQLite file
+pub fn read_is_active_for_requester_from_db_file(
+    db_path: &Path,
+    scope: &str,
+    project_id: &str,
+    module_id: &str,
+    key: &str,
+    requester_project_id: &str,
+) -> Option<bool> {
+    let conn = match Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) {
+        Ok(c) => c,
+        Err(_) => return None,
+    };
+
+    // Probe migration-009 column. If absent, the sibling pre-dates the
+    // migration; fall back to the legacy single-row query so the
+    // sibling still contributes its opinion.
+    let has_requester_col = sibling_has_requester_column(&conn);
+
+    if !has_requester_col {
+        // Pre-migration-009 sibling: only the canonical row exists.
+        // Treat its single `active` value as the answer for any requester
+        // — that's the legacy contract.
+        let row: rusqlite::Result<i64> = conn.query_row(
+            "SELECT active FROM secret_active_state
+              WHERE scope = ?1 AND project_id = ?2 AND module_id = ?3 AND key = ?4",
+            params![scope, project_id, module_id, key],
+            |r| r.get(0),
+        );
+        return match row {
+            Ok(v) => Some(v != 0),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Some(true),
+            Err(_) => None,
+        };
+    }
+
+    // Step 1: literal-requester row.
+    let specific: rusqlite::Result<i64> = conn.query_row(
+        "SELECT active FROM secret_active_state
+          WHERE scope = ?1 AND project_id = ?2 AND module_id = ?3
+            AND key = ?4 AND requester_project_id = ?5",
+        params![scope, project_id, module_id, key, requester_project_id],
+        |r| r.get(0),
+    );
+    match specific {
+        Ok(v) => return Some(v != 0),
+        Err(rusqlite::Error::QueryReturnedNoRows) => {}
+        Err(_) => return None,
+    }
+
+    // Step 2: `*` sentinel fallback. Skip if the requester WAS already
+    // `*` to avoid re-querying the same row.
+    if requester_project_id != REQUESTER_ANY {
+        let fallback: rusqlite::Result<i64> = conn.query_row(
+            "SELECT active FROM secret_active_state
+              WHERE scope = ?1 AND project_id = ?2 AND module_id = ?3
+                AND key = ?4 AND requester_project_id = ?5",
+            params![scope, project_id, module_id, key, REQUESTER_ANY],
+            |r| r.get(0),
+        );
+        match fallback {
+            Ok(v) => return Some(v != 0),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {}
+            Err(_) => return None,
+        }
+    }
+
+    // Step 3: default-active.
+    Some(true)
+}
+
+/// Check whether a sibling DB's `secret_active_state` table has the
+/// migration-009 `requester_project_id` column. Returns `false` on any
+/// pragma read error so the caller falls back to the legacy query path
+/// rather than mis-classifying the sibling.
+fn sibling_has_requester_column(conn: &Connection) -> bool {
+    let mut stmt = match conn.prepare("PRAGMA table_info(secret_active_state)") {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let rows = match stmt.query_map([], |r| r.get::<_, String>(1)) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    for row in rows.flatten() {
+        if row == "requester_project_id" {
+            return true;
+        }
+    }
+    false
+}
+
+/// Cross-launcher per-(secret × requester) active read. Same Option γ
+/// rule as the legacy `is_secret_active_cross_launcher`: any launcher
+/// reporting inactive flips the result.
+///
+/// Used by the hub's `project_env` resolver in 0.2.1 — every secret-
+/// resolution call site passes the consuming project's ID as the
+/// requester so a project-specific pause takes effect even when the
+/// secret is shared/global.
+pub fn is_secret_active_cross_launcher_for_requester(
+    own_db: &Db,
+    scope: &str,
+    project_id: &str,
+    module_id: &str,
+    key: &str,
+    requester_project_id: &str,
+) -> bool {
+    // Own DB first — short-circuit a pause without paying sibling cost.
+    let own_active = own_db
+        .is_secret_active_for_requester(scope, project_id, module_id, key, requester_project_id)
+        .unwrap_or(true);
+    if !own_active {
+        return false;
+    }
+
+    let own_root = crate::paths::vct_root_dir();
+    for sibling in discover_other_launcher_dbs(&own_root) {
+        match read_is_active_for_requester_from_db_file(
+            &sibling,
+            scope,
+            project_id,
+            module_id,
+            key,
+            requester_project_id,
+        ) {
+            Some(false) => return false,
+            Some(true) | None => continue,
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1036,6 +1188,131 @@ mod tests {
         assert!(db
             .is_secret_active_for_requester("shared", "_user_shared_", "u", "K", "B")
             .unwrap());
+    }
+
+    // ─── 0.2.1: per-requester cross-launcher reads ──────────────────────
+
+    /// New-schema sibling DB: an explicit `(scope, project, module, key,
+    /// requester=B)` row with active=0 should read as `Some(false)` for
+    /// the matching requester and `Some(true)` for any other.
+    #[test]
+    fn read_for_requester_literal_requester_row_wins() {
+        let dir = scratch_dir("read-fr-literal");
+        let db_path = dir.join("launcher.db");
+        let db = make_db_at_path(&db_path);
+
+        // Per-project requester pause: only B sees inactive, A sees default-active.
+        db.mark_secret_inactive_for_requester("shared", "_user_shared_", "u", "K", "B")
+            .unwrap();
+        drop(db);
+
+        let active_for_b = read_is_active_for_requester_from_db_file(
+            &db_path, "shared", "_user_shared_", "u", "K", "B",
+        );
+        assert_eq!(active_for_b, Some(false), "literal requester row should be honoured");
+
+        let active_for_a = read_is_active_for_requester_from_db_file(
+            &db_path, "shared", "_user_shared_", "u", "K", "A",
+        );
+        assert_eq!(active_for_a, Some(true), "no row for A → default-active");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// New-schema sibling DB: a `*` sentinel row drives the answer for
+    /// any requester that has no literal row of its own.
+    #[test]
+    fn read_for_requester_falls_back_to_star_sentinel() {
+        let dir = scratch_dir("read-fr-star");
+        let db_path = dir.join("launcher.db");
+        let db = make_db_at_path(&db_path);
+
+        // Legacy `mark_secret_inactive` writes the canonical row, which
+        // for shared scope is the `*` sentinel.
+        db.mark_secret_inactive("shared", "_user_shared_", "u", "K").unwrap();
+        drop(db);
+
+        // Any requester should see the `*` row's pause.
+        for r in ["A", "B", "C"] {
+            let active = read_is_active_for_requester_from_db_file(
+                &db_path, "shared", "_user_shared_", "u", "K", r,
+            );
+            assert_eq!(
+                active,
+                Some(false),
+                "* sentinel should pause for requester {}",
+                r
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Pre-migration-009 sibling DB (no `requester_project_id` column):
+    /// the schema-compat path should fall back to the legacy single-row
+    /// query so an older sibling still contributes its opinion.
+    #[test]
+    fn read_for_requester_old_schema_sibling_compat() {
+        let dir = scratch_dir("read-fr-oldschema");
+        let db_path = dir.join("launcher.db");
+
+        // Build an old-schema DB by hand: four-column PK, no
+        // `requester_project_id` column. Mirrors what migration-008 left
+        // behind. The migrations module brings the table up to migration
+        // 009 automatically, so we open a fresh connection and skip the
+        // migrator entirely.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute(
+                "CREATE TABLE secret_active_state (
+                    scope TEXT NOT NULL,
+                    project_id TEXT NOT NULL,
+                    module_id TEXT NOT NULL,
+                    key TEXT NOT NULL,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (scope, project_id, module_id, key)
+                )",
+                [],
+            )
+            .unwrap();
+            // Explicit pause on the legacy single-row API surface.
+            conn.execute(
+                "INSERT INTO secret_active_state
+                  (scope, project_id, module_id, key, active, updated_at)
+                  VALUES ('global', '_global_', 'u', 'K', 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Any requester (literal or `*`) should see the legacy pause —
+        // the schema-compat path treats the single row as authoritative
+        // because the sibling is older than per-(secret × requester)
+        // semantics.
+        for r in ["A", "B", "*"] {
+            let active = read_is_active_for_requester_from_db_file(
+                &db_path, "global", "_global_", "u", "K", r,
+            );
+            assert_eq!(
+                active,
+                Some(false),
+                "old-schema sibling pause should propagate for requester {}",
+                r
+            );
+        }
+
+        // And a missing row in old-schema should default-active.
+        let missing = read_is_active_for_requester_from_db_file(
+            &db_path, "global", "_global_", "u", "MISSING", "A",
+        );
+        assert_eq!(
+            missing,
+            Some(true),
+            "old-schema absent row should default-active per legacy contract"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Per-project secret canonical row maps to the owner literally

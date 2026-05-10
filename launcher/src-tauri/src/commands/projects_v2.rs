@@ -3665,6 +3665,23 @@ pub async fn delete_project_v2(
         )),
     }
 
+    // 0.2.1: drop every secret-grant row touching this project (either
+    // side — owner OR grantee). Without this, a future re-register of
+    // the same project_id would inherit grants the owner never re-
+    // approved (privacy violation), and dangling grants where the
+    // owner's already gone produce 404s on the resolver path. Same
+    // soft-fail policy as the active-flag cleanup above.
+    match db.forget_grants_for_project(&id) {
+        Ok(_n) => {}
+        Err(e) => report.warnings.push(format!(
+            "could not forget secret-grant rows for project {}: {}. \
+             Any grants where this project was the owner or grantee \
+             will linger in secret_grants — re-registering the same \
+             project_id would inadvertently inherit them.",
+            id, e
+        )),
+    }
+
     // Step 3 (always): audit + DB delete + change log.
     db.audit(
         "project_delete",
