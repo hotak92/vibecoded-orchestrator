@@ -1,4 +1,5 @@
 mod commands;
+mod config;
 mod db;
 mod hub;
 mod installer_engine;
@@ -37,12 +38,20 @@ pub fn run() {
         std::process::exit(1);
     });
 
+    // Load per-machine local config (env > vct-config.toml > compiled
+    // defaults). Never fails — malformed/missing file falls through to
+    // defaults so the launcher still boots and the operator can fix
+    // the file via the GUI. See `config.rs` for the externalization
+    // policy (what's IN scope vs. what stays compiled).
+    let local_config = config::LocalConfig::load();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(app_manager)
         .manage(project_store)
         .manage(db_handle)
+        .manage(local_config)
         .setup(|app| {
             // Windows-only: clean up the previous launcher's .old.exe
             // left behind by `apply_launcher_update`'s rename-then-build
