@@ -18,30 +18,37 @@ LOG_FILE="$PROJECT_DIR/.claude/logs/config_changes.jsonl"
 mkdir -p "$(dirname "$LOG_FILE")"
 
 # Hook input arrives as JSON on stdin per Claude Code v2.1.x spec.
-# $CLAUDE_TOOL_NAME / $CLAUDE_TOOL_ARGS env vars are EMPTY — verified
-# empirically 2026-05-08 via stdin-capture diagnostic. Without this,
-# every config-change audit entry was {"tool":"unknown","args":{}}.
+# Audit row keeps the full payload under `payload` so future analysis
+# can pick up event-specific fields (e.g. ConfigChange's `setting`,
+# `old_value`, `new_value`) without re-modifying this hook.
 HOOK_STDIN=$(cat 2>/dev/null || echo "")
 if [ -n "${PY:-}" ]; then
-    TOOL_NAME=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
-import json, sys
-try:
-    d = json.loads(sys.stdin.read())
-    print(d.get('tool_name', '') or 'unknown')
-except Exception:
-    print('unknown')
-" 2>/dev/null || echo "unknown")
-    TOOL_ARGS=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
-import json, sys
-try:
-    d = json.loads(sys.stdin.read())
-    print(json.dumps(d.get('tool_input', {})))
-except Exception:
-    print('{}')
-" 2>/dev/null || echo "{}")
-else
-    TOOL_NAME="unknown"
-    TOOL_ARGS="{}"
-fi
+    HOOK_STDIN="$HOOK_STDIN" LOG_FILE="$LOG_FILE" "$PY" - <<'PYEOF' 2>/dev/null || true
+import json, os, sys
+from datetime import datetime, timezone
 
-echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"config_change\",\"tool\":\"${TOOL_NAME}\",\"args\":${TOOL_ARGS}}" >> "$LOG_FILE" 2>/dev/null || true
+raw = os.environ.get("HOOK_STDIN", "")
+log_file = os.environ.get("LOG_FILE", "")
+
+try:
+    payload = json.loads(raw) if raw else {}
+except (json.JSONDecodeError, ValueError):
+    payload = {"_parse_error": "stdin was not valid JSON", "_raw_preview": raw[:200]}
+
+record = {
+    "timestamp": datetime.now(timezone.utc).isoformat(),
+    "event": "config_change",
+    "session_id": payload.get("session_id", ""),
+    "hook_event_name": payload.get("hook_event_name", ""),
+    "cwd": payload.get("cwd", ""),
+    "payload": payload,
+}
+
+if log_file:
+    try:
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, default=str) + "\n")
+    except OSError:
+        sys.exit(0)
+PYEOF
+fi

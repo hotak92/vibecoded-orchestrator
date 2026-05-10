@@ -11,21 +11,31 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
 
 # Hook input arrives as JSON on stdin per Claude Code v2.1.x spec.
-# $env:CLAUDE_TOOL_NAME / $env:CLAUDE_TOOL_ARGS are EMPTY — verified
-# empirically 2026-05-08 via stdin-capture diagnostic. Without this,
-# every config-change audit entry was {"tool":"unknown","args":{}}.
+# Audit row keeps the full payload under `payload` so future analysis
+# can pick up event-specific fields (e.g. ConfigChange's `setting`,
+# `old_value`, `new_value`) without re-modifying this hook. Mirrors
+# the .sh sibling's payload-capture schema.
 $HookStdin = ""
 try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
-$tool = "unknown"
-$argsRaw = "{}"
+
+# Re-parse stdin as a structured PSCustomObject; emit the original
+# payload as a value under `payload`. ConvertFrom-Json gives us the
+# whole tree natively — no need to extract individual fields except
+# for the top-level envelope columns the audit doc reads quickly.
+$payload = $null
+$payloadJson = "{}"
+$parseError = $null
 try {
-    $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
-    if ($payload) {
-        if ($payload.tool_name)  { $tool = [string]$payload.tool_name }
-        if ($payload.tool_input) { $argsRaw = ($payload.tool_input | ConvertTo-Json -Compress -Depth 8) }
+    if ($HookStdin) {
+        $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
+        # Re-serialise the parsed object so log lines are normalised
+        # (whitespace-stripped, deterministic key order from PS).
+        $payloadJson = ($payload | ConvertTo-Json -Compress -Depth 8)
     }
 } catch {
-    # Empty/malformed stdin — keep defaults
+    $parseError = $_.Exception.Message
+    $preview = if ($HookStdin.Length -gt 200) { $HookStdin.Substring(0, 200) } else { $HookStdin }
+    $payloadJson = (@{ _parse_error = $parseError; _raw_preview = $preview } | ConvertTo-Json -Compress)
 }
 
 $ProjectDir = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
@@ -36,10 +46,19 @@ if (-not (Test-Path $LogDir)) {
     New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
 }
 
-$ts = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-# Avoid double-encoding: emit a JSON line literally so $argsRaw is embedded as-is
-# (matching the .sh behavior where args is a JSON object pasted into the line).
-$line = "{""timestamp"":""$ts"",""event"":""config_change"",""tool"":""$tool"",""args"":$argsRaw}"
+# Build the audit record as a hashtable then ConvertTo-Json so escaping
+# stays correct for unicode / quotes / nested objects. `payload` is
+# embedded as the parsed object so it rehydrates cleanly on read.
+$record = @{
+    timestamp        = (Get-Date).ToUniversalTime().ToString("o")
+    event            = "config_change"
+    session_id       = if ($payload -and $payload.session_id)      { [string]$payload.session_id      } else { "" }
+    hook_event_name  = if ($payload -and $payload.hook_event_name) { [string]$payload.hook_event_name } else { "" }
+    cwd              = if ($payload -and $payload.cwd)             { [string]$payload.cwd             } else { "" }
+    payload          = $payload
+}
+$line = $record | ConvertTo-Json -Compress -Depth 8
+
 try {
     Add-Content -Path $LogFile -Value $line -ErrorAction Stop
 } catch { }
