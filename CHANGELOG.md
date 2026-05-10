@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`register_github_pat` ↔ SecretsPanel `module_id` unification**
+  (post-0.2.0 backlog #6, 2026-05-10). The OnboardingWizard /
+  `/preferences` Manage Token flow wrote the PAT at
+  `vct._user_shared_.shared.installer/github_pat` while the SecretsPanel
+  "Shared (this user)" tab wrote at
+  `vct._user_shared_.shared.user/github_pat`. A user who registered via
+  the wizard and later edited via the SecretsPanel ended up with two
+  divergent keychain rows; reads from either path returned only that
+  path's value, so the alternate row sat as a stale shadow. Both
+  writers now use `module_id="user"` (the canonical user-bucket
+  enforced by `is_user_emit_bucket`) and `vct-module.json::bundled_secrets[0].module_id`
+  matches. Existing 0.2.0 installs are migrated on next
+  `register_github_pat` call by `migrate_github_pat_installer_to_user_module_id`,
+  which copies the value at the old `installer/` slot into the new
+  `user/` slot (or, if both slots have values, keeps the user-bucket
+  one because the SecretsPanel write happened later in time) and
+  deletes the old keychain row plus its active-flag entry. Audited as
+  `github_pat_module_id_migration` for traceability.
+
 ## [0.2.0] — 2026-05-08
 
 Iteration since v0.1.6. Substantial install-flow architectural

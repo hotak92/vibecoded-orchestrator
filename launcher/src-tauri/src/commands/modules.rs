@@ -142,9 +142,14 @@ pub(crate) struct OrchestratorComponent {
 ///                    `secret_active_state` table uses
 ///                    (`shared`/`global`/`per_project`).
 ///   * `module_id`  — keychain `module_id` segment. Defaults to
-///                    `"installer"` for parity with what the
+///                    `"user"` for parity with what the
 ///                    OnboardingWizard's `register_github_pat` flow
-///                    writes (see commands/installer.rs::GITHUB_PAT_MODULE_ID).
+///                    AND the SecretsPanel "Shared (this user)" tab
+///                    write (see commands/installer.rs::GITHUB_PAT_MODULE_ID
+///                    and commands/secrets_cmd.rs::is_user_emit_bucket).
+///                    Pre-2026-05-10 the default was `"installer"`;
+///                    post-0.2.0 backlog #6 unified the two writers
+///                    on the canonical user-bucket path.
 ///   * `description` — informational; not load-bearing for the hub.
 #[derive(Debug, Deserialize)]
 pub(crate) struct OrchestratorBundledSecret {
@@ -158,7 +163,7 @@ pub(crate) struct OrchestratorBundledSecret {
 }
 
 fn default_orchestrator_secret_module_id() -> String {
-    "installer".to_string()
+    "user".to_string()
 }
 
 /// Find `vct-module.json` at the repo root by walking up from the

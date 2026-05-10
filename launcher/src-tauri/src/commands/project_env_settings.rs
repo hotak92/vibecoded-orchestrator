@@ -153,9 +153,11 @@ pub struct ProjectEnvSettings {
     /// GitHub PAT (0.1.7 fork-readiness sweep, 2026-05-08). Resolved at
     /// `populate` time from the OS keychain entry the OnboardingWizard
     /// writes via `commands::installer::register_github_pat`
-    /// (`vct._user_shared_.shared.installer / github_pat`). Honours the
-    /// active-flag gate (`is_secret_active_cross_launcher`) so a paused
-    /// secret in any sibling launcher's DB returns `None` here too.
+    /// (`vct._user_shared_.shared.user / github_pat` — post-2026-05-10
+    /// module_id unification with the SecretsPanel UI_MODULE_BUCKET).
+    /// Honours the active-flag gate (`is_secret_active_cross_launcher`)
+    /// so a paused secret in any sibling launcher's DB returns `None`
+    /// here too.
     ///
     /// Replaces the pre-0.1.7 `git-credential-vct` helper: instead of
     /// having git's credential protocol invoke a per-project

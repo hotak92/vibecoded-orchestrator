@@ -50,10 +50,19 @@
 //! "the launcher writes a secret in plaintext to a file" path, flagged
 //! as fork-blocking by the secrets-architecture audit. It now uses
 //! `secrets::set(SecretScope::Shared { project_id: SENTINEL_SHARED },
-//! "installer", "github_pat", &token)` — see the doc comment on the
+//! "user", "github_pat", &token)` — see the doc comment on the
 //! `register_github_pat` block in `commands/installer.rs` for the
 //! migration semantics (`migrate_github_pat_file_to_keychain`,
-//! gated behind the `app_state` flag `github_pat.file_to_keychain.v1`).
+//! gated behind the `app_state` flag `github_pat.file_to_keychain.v1`,
+//! plus `migrate_github_pat_installer_to_user_module_id` gated behind
+//! `github_pat.installer_to_user_module_id.v1`).
+//!
+//! 2026-05-10 (post-0.2.0 backlog #6): the module_id segment changed
+//! from `"installer"` (which only `register_github_pat` used) to
+//! `"user"` (the canonical user-bucket the SecretsPanel "Shared (this
+//! user)" tab also writes to). Both writers now share one keychain
+//! row, eliminating the stale-shadow row that appeared when a user
+//! used both UI flows over time.
 //!
 //! That tuple is also what the env-pair builder in
 //! `commands/projects_v2.rs::write_project_env_files` reads when
@@ -77,7 +86,9 @@
 //!
 //! TESTS are different. `cargo test --lib` runs ~8 threads in
 //! parallel; multiple test modules write/delete the same keychain
-//! entries (most pressingly `vct._user_shared_.shared.installer/github_pat`)
+//! entries (most pressingly `vct._user_shared_.shared.user/github_pat`
+//! — and, for the module_id-consolidation migration tests, the legacy
+//! `vct._user_shared_.shared.installer/github_pat` slot too)
 //! within a few hundred milliseconds. The daemon side handles each
 //! D-Bus request atomically, but under that write rate gnome-keyring
 //! has been seen to return `keyring::Error::PlatformFailure` (and on
@@ -247,11 +258,12 @@ pub fn mask_preview(value: &str) -> String {
 // (`commands::installer::github_pat_keychain_tests`,
 // `commands::dashboard::tests`, `hub::modules_api::tests`) all write
 // to overlapping OS-keychain slots — most prominently
-// `vct._user_shared_.shared.installer/github_pat`, which is the
-// canonical slot every github_pat consumer reads from. Running those
-// modules' tests in parallel makes the keychain reads non-deterministic:
-// test A writes canary X, test B writes canary Y, test A asserts and
-// reads back B's canary.
+// `vct._user_shared_.shared.user/github_pat` (post-2026-05-10 unification;
+// pre-fix this was `installer/github_pat`), which is the canonical slot
+// every github_pat consumer reads from. Running those modules' tests
+// in parallel makes the keychain reads non-deterministic: test A writes
+// canary X, test B writes canary Y, test A asserts and reads back B's
+// canary.
 //
 // Each module previously used its OWN private `static SERIALIZE` mutex,
 // which only solved within-module races. To close the cross-module gap
@@ -280,8 +292,9 @@ pub(crate) mod test_serialize {
     ///
     /// Hold for the duration of any test that mutates a keychain slot
     /// the launcher's runtime code reads (currently the most contended
-    /// is `vct._user_shared_.shared.installer/github_pat`). Release
-    /// happens automatically on drop.
+    /// is `vct._user_shared_.shared.user/github_pat`, post-2026-05-10
+    /// module_id unification — pre-fix this was the `installer/` slot).
+    /// Release happens automatically on drop.
     pub fn keychain_serialize_lock() -> MutexGuard<'static, ()> {
         KEYCHAIN_SERIALIZE.lock().unwrap_or_else(|p| p.into_inner())
     }

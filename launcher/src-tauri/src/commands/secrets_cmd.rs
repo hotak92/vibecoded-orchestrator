@@ -1356,10 +1356,11 @@ mod tests {
         let db = make_db();
         let folder = seed_project_with_real_folder(&db, "p_skip", "SkipBucketProj");
 
-        // Module-owned shared (e.g. installer's github_pat written by
-        // register_github_pat — that has its own dedicated env-file
-        // refresh path in installer.rs after H2's B2 fix). MUST skip
-        // here.
+        // Module-owned shared (legacy `installer` bucket — pre-2026-05-10
+        // register_github_pat wrote here; post-fix it writes to the user
+        // bucket. The predicate must still treat any non-user module_id
+        // as module-owned regardless, so the H2 skip contract holds for
+        // any future shared-scope module bucket too.) MUST skip here.
         refresh_env_after_user_secret_change(
             &db,
             "_user_shared_",

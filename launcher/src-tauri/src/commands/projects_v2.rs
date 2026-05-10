@@ -2639,9 +2639,10 @@ pub(crate) const CANONICAL_INSTALL_ENV_KEYS: &[&str] = &[
     // audit). Resolved by the env-pair builder from the OS keychain
     // entry the OnboardingWizard writes via
     // `commands::installer::register_github_pat`
-    // (`vct._user_shared_.shared.installer / github_pat`). Conditionally
-    // emitted: omitted when the keychain has no value, or when the
-    // value is paused via Lifecycle B's active-flag gate.
+    // (`vct._user_shared_.shared.user / github_pat` — post-2026-05-10
+    // module_id unification with the SecretsPanel UI_MODULE_BUCKET).
+    // Conditionally emitted: omitted when the keychain has no value,
+    // or when the value is paused via Lifecycle B's active-flag gate.
     //
     // Per-project gating semantics (conservative, 2026-05-08): every
     // registered project receives `GITHUB_TOKEN` whenever the PAT is
