@@ -127,6 +127,11 @@ pub struct ProjectStateSnapshot {
     pub secret_refs: Vec<ProjectSecretRef>,
     pub kg_bindings: Vec<ProjectKgBinding>,
     pub codegraph_binding: Option<ProjectCodegraphBinding>,
+    /// Migration 010: per-project MCP server registry. Populated from
+    /// `<folder>/.claude/settings.json::mcpServers` + `<folder>/.mcp.json`
+    /// by `populate_project_state_from_filesystem`. The Custom MCP tab
+    /// reads with `is_user_added=true` filtering applied client-side.
+    pub mcp_servers: Vec<crate::db::project_mcp_servers::ProjectMcpServer>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -992,6 +997,7 @@ impl Db {
             secret_refs: self.list_project_secret_refs(project_id)?,
             kg_bindings: self.list_project_kg_bindings(project_id)?,
             codegraph_binding: self.get_project_codegraph_binding(project_id)?,
+            mcp_servers: self.list_project_mcp_servers(project_id)?,
         })
     }
 }

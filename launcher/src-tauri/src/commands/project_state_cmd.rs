@@ -7,6 +7,7 @@ use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use tauri::{command, State};
 
+use crate::db::project_mcp_servers::ProjectMcpServer;
 use crate::db::project_state::{
     ProjectAgent, ProjectCodegraphBinding, ProjectHook, ProjectKgBinding, ProjectPermission,
     ProjectSecretRef, ProjectSkill, ProjectStateSnapshot,
@@ -61,6 +62,66 @@ pub async fn get_project_state_snapshot(
     db: State<'_, Db>,
 ) -> Result<ProjectStateSnapshot, String> {
     db.get_project_state_snapshot(&project_id)
+}
+
+// ─── MCP servers (migration 010, 2026-05-10) ─────────────────────────────
+//
+// Resolves the KNOWN_ISSUES.md "Custom MCP tab is not populated by initial
+// project registration" entry. The Custom MCP tab calls
+// `list_user_added_project_mcp_servers` to surface only entries where
+// `is_user_added=true` (anything beyond the bundled allowlist in
+// `crate::db::project_mcp_servers::BUNDLED_MCP_NAMES`).
+//
+// The full unfiltered list is also exposed so a future "all MCPs" tab
+// can render bundled + user-added together.
+
+#[command]
+pub async fn list_project_mcp_servers(
+    project_id: String,
+    db: State<'_, Db>,
+) -> Result<Vec<ProjectMcpServer>, String> {
+    db.list_project_mcp_servers(&project_id)
+}
+
+#[command]
+pub async fn list_user_added_project_mcp_servers(
+    project_id: String,
+    db: State<'_, Db>,
+) -> Result<Vec<ProjectMcpServer>, String> {
+    db.list_user_added_mcp_servers(&project_id)
+}
+
+#[command]
+pub async fn set_project_mcp_server_enabled(
+    project_id: String,
+    mcp_name: String,
+    enabled: bool,
+    db: State<'_, Db>,
+) -> Result<(), String> {
+    db.set_project_mcp_server_enabled(&project_id, &mcp_name, enabled)?;
+    db.audit(
+        "project_mcp_server_set_enabled",
+        Some(&project_id),
+        None,
+        &serde_json::json!({ "mcp": mcp_name, "enabled": enabled }),
+    )?;
+    Ok(())
+}
+
+#[command]
+pub async fn unregister_project_mcp_server(
+    project_id: String,
+    mcp_name: String,
+    db: State<'_, Db>,
+) -> Result<(), String> {
+    db.unregister_project_mcp_server(&project_id, &mcp_name)?;
+    db.audit(
+        "project_mcp_server_unregister",
+        Some(&project_id),
+        None,
+        &serde_json::json!({ "mcp": mcp_name }),
+    )?;
+    Ok(())
 }
 
 // ─── Mutations ───────────────────────────────────────────────────────────
