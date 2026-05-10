@@ -16,8 +16,30 @@
 use serde::{Deserialize, Serialize};
 use tauri::{command, AppHandle, Emitter, Manager, State};
 
+use crate::config::LocalConfig;
 use crate::db::code_graph_builds::{status as build_status, CodeGraphBuildRow};
 use crate::db::Db;
+
+/// Resolve the local Weaviate URL, mirroring the precedence rules in
+/// `commands::kg::weaviate_url`: env (`VCT_WEAVIATE_URL`, then legacy
+/// `WEAVIATE_URL`) > `LocalConfig` > compiled default. Kept private to
+/// this module instead of factoring a shared helper because the only
+/// other caller (`commands::kg`) already has its own version in tight
+/// coupling with its `State<LocalConfig>` access pattern; sharing would
+/// require pulling LocalConfig out of Tauri state in awkward places.
+fn resolve_weaviate_url(cfg: &LocalConfig) -> String {
+    if let Ok(v) = std::env::var("VCT_WEAVIATE_URL") {
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    if let Ok(v) = std::env::var("WEAVIATE_URL") {
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    cfg.weaviate_url.clone()
+}
 
 #[derive(Debug, Serialize)]
 pub struct ProjectRef {
@@ -152,6 +174,7 @@ pub async fn codegraph_summary(
     acting_project_id: String,
     target_project_id: String,
     db: State<'_, Db>,
+    cfg: State<'_, LocalConfig>,
 ) -> Result<CodegraphSummary, String> {
     if acting_project_id != target_project_id {
         let level = db.codegraph_check(&target_project_id, &acting_project_id)?;
@@ -171,7 +194,7 @@ pub async fn codegraph_summary(
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| format!("http client: {}", e))?;
-    let base = std::env::var("WEAVIATE_URL").unwrap_or_else(|_| "http://localhost:8081".to_string());
+    let base = resolve_weaviate_url(&cfg);
 
     let project_tag = &target.name; // codegraph entities are tagged by project name
 
@@ -281,6 +304,7 @@ pub async fn codegraph_load_graph(
     target_project_id: String,
     max_nodes: Option<u32>,
     db: State<'_, Db>,
+    cfg: State<'_, LocalConfig>,
 ) -> Result<CodegraphViz, String> {
     if acting_project_id != target_project_id {
         let level = db.codegraph_check(&target_project_id, &acting_project_id)?;
@@ -301,7 +325,7 @@ pub async fn codegraph_load_graph(
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|e| format!("http client: {}", e))?;
-    let base = std::env::var("WEAVIATE_URL").unwrap_or_else(|_| "http://localhost:8081".to_string());
+    let base = resolve_weaviate_url(&cfg);
 
     let mut nodes: Vec<CgVizNode> = Vec::new();
     let mut name_to_id: std::collections::HashMap<String, String> =
@@ -468,6 +492,7 @@ pub struct EntityBulkFailure {
 pub async fn codegraph_set_entity_access_bulk(
     req: EntityAccessBulkReq,
     db: State<'_, Db>,
+    cfg: State<'_, LocalConfig>,
 ) -> Result<EntityBulkAccessResult, String> {
     if !matches!(req.mode.as_str(), "shared" | "projects" | "private") {
         return Err(format!("invalid mode: {}", req.mode));
@@ -494,7 +519,7 @@ pub async fn codegraph_set_entity_access_bulk(
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|e| format!("http client: {}", e))?;
-    let base = std::env::var("WEAVIATE_URL").unwrap_or_else(|_| "http://localhost:8081".to_string());
+    let base = resolve_weaviate_url(&cfg);
 
     let mut succeeded = 0usize;
     let mut failures: Vec<EntityBulkFailure> = Vec::new();

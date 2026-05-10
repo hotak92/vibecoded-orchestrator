@@ -438,7 +438,26 @@ const CODEGRAPH_CLASSES: &[&str] = &[
 ];
 
 fn weaviate_url() -> String {
-    std::env::var("WEAVIATE_URL").unwrap_or_else(|_| "http://localhost:8081".to_string())
+    // Env-var precedence mirrors `commands::kg::weaviate_url` — see
+    // `config.rs` for the full externalization policy. The hub server
+    // doesn't have access to Tauri's managed `LocalConfig` state because
+    // it runs in a parallel axum runtime with its own handle struct
+    // (`LauncherDbHandle`); plumbing the config through every handler
+    // here would balloon the diff. So we honour the same env-var keys
+    // and fall through to `config::DEFAULT_WEAVIATE_URL` when neither
+    // is set. Operators editing `vct-config.toml` see the change in the
+    // Tauri command path immediately; the hub picks it up on next
+    // restart only if they also export `VCT_WEAVIATE_URL`. Acceptable
+    // for 0.2.x since the hub-only KG endpoints are CLI-tools-only.
+    if let Ok(v) = std::env::var("VCT_WEAVIATE_URL") {
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    std::env::var("WEAVIATE_URL")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| crate::config::DEFAULT_WEAVIATE_URL.to_string())
 }
 
 fn weaviate_client() -> Result<reqwest::Client, String> {
