@@ -457,6 +457,235 @@ CODE_TRUNC_CHARS: int = int(os.getenv("CODE_TRUNC_CHARS", "1200"))
 CODE_EXPANSION_LIMIT: int = int(os.getenv("CODE_EXPANSION_LIMIT", "8"))
 
 
+# ---------------------------------------------------------------------------
+# Shared rank-tier formatter for code-graph results.
+#
+# Both `search_code_graph` (MCP) and `.claude/scripts/query_code_graph.py`
+# (CLI used by the pre-edit hook) format Weaviate code-graph hits with the
+# same rank-tier policy documented at `# search_code_graph tier policy`
+# above. Before the helper extraction (2026-05-10) the policy was inlined
+# in both places, with the CLI silently drifting to a simpler "top-4 full,
+# rest titles" model. The helper below is the single source of truth so
+# the pre-edit hook injects context formatted identically to what MCP
+# returns interactively.
+# ---------------------------------------------------------------------------
+
+
+def _truncate_code_field(s: str, n: int) -> str:
+    """Truncation helper used by the rank-tier formatter.
+
+    Returns the first ``n`` characters with ``...`` appended when the input
+    exceeds ``n``; otherwise returns the input verbatim.
+    """
+    return s[:n] + "..." if len(s) > n else s
+
+
+def _code_result_file_path(coll_name: str, p: dict) -> str:
+    """Best-effort source file path from a code-graph object's properties.
+
+    Mirrors the behaviour of the previous inline `_file_path` closure in
+    `search_code_graph` so the helper can be called without a closure
+    over the local `_file_path` function.
+    """
+    if p.get("file_path"):
+        return p["file_path"]
+    if p.get("path"):
+        return p["path"]
+    if p.get("full_name"):
+        parts = p["full_name"].split(".")
+        return "/".join(parts[:-1]) if len(parts) > 1 else p["full_name"]
+    return ""
+
+
+def _format_code_result_full(coll_name: str, p: dict, *, untruncated: bool) -> dict:
+    """Build the full-tier fields for a code-graph result.
+
+    untruncated=True: top-2 ranks — include function_body / class_body
+    untruncated, all doc/summary/description fields untruncated.
+    untruncated=False: ranks 3-4 — same fields as top-2 EXCEPT no
+    function_body/class_body (those are large), and doc/summary/
+    description truncated at CODE_TRUNC_CHARS (default 1200, was 200).
+    """
+    out: dict = {}
+    if coll_name == "CodeFunction":
+        doc = p.get("doc", "") or ""
+        out["full_name"] = p.get("full_name", "")
+        out["signature"] = p.get("signature", "")
+        out["doc"] = doc if untruncated else _truncate_code_field(doc, CODE_TRUNC_CHARS)
+        out["location"] = f"{p.get('start_line','?')}-{p.get('end_line','?')}"
+        out["is_async"] = p.get("is_async", False)
+        if untruncated:
+            body = p.get("function_body", "") or ""
+            if body:
+                out["function_body"] = body
+    elif coll_name == "CodeClass":
+        doc = p.get("doc", "") or ""
+        out["full_name"] = p.get("full_name", "")
+        out["signature"] = p.get("signature", "")
+        out["doc"] = doc if untruncated else _truncate_code_field(doc, CODE_TRUNC_CHARS)
+        out["methods"] = p.get("methods", [])
+        out["method_count"] = len(p.get("methods", []))
+        out["location"] = f"{p.get('start_line','?')}-{p.get('end_line','?')}"
+        if untruncated:
+            body = p.get("class_body", "") or ""
+            if body:
+                out["class_body"] = body
+    elif coll_name == "CodeModule":
+        summary = p.get("module_summary", "") or ""
+        out["path"] = p.get("path", "")
+        out["language"] = p.get("language", "")
+        out["loc"] = p.get("loc", 0)
+        out["summary"] = summary if untruncated else _truncate_code_field(summary, CODE_TRUNC_CHARS)
+    elif coll_name == "CodeAPI":
+        desc = p.get("api_description", "") or ""
+        out["endpoint"] = p.get("endpoint", "")
+        out["method"] = p.get("method", "")
+        out["description"] = desc if untruncated else _truncate_code_field(desc, CODE_TRUNC_CHARS)
+        out["parameters"] = p.get("parameters", [])
+    elif coll_name == "CodeInteraction":
+        desc = p.get("description", "") or ""
+        out["interaction_type"] = p.get("interaction_type", "")
+        out["direction"] = p.get("direction", "")
+        out["protocol"] = p.get("protocol", "")
+        out["endpoint"] = p.get("endpoint", "")
+        out["confidence"] = p.get("confidence", "")
+        out["description"] = desc if untruncated else _truncate_code_field(desc, CODE_TRUNC_CHARS)
+    return out
+
+
+def _format_code_result_ref(coll_name: str, p: dict) -> dict:
+    """Metadata-only ref for lower-ranked results, expansions, and siblings."""
+    out: dict = {}
+    if coll_name in ("CodeFunction", "CodeClass"):
+        out["full_name"] = p.get("full_name", "")
+    elif coll_name == "CodeModule":
+        out["path"] = p.get("path", "")
+        out["language"] = p.get("language", "")
+    elif coll_name == "CodeAPI":
+        out["endpoint"] = p.get("endpoint", "")
+        out["method"] = p.get("method", "")
+    elif coll_name == "CodeInteraction":
+        out["endpoint"] = p.get("endpoint", "")
+        out["protocol"] = p.get("protocol", "")
+        out["interaction_type"] = p.get("interaction_type", "")
+    return out
+
+
+def _resolve_code_tier(rank: int, detail: str) -> str:
+    """Map (rank, detail) → tier label.
+
+    Returns one of "full_xl" (top-2 untruncated), "full_l" (rank 3-4
+    truncated), or "ref" (metadata-only). ``detail="full"`` and
+    ``detail="titles"`` collapse all ranks to a single tier; ``"auto"``
+    uses the rank-position policy.
+
+    Pathological case: when rank exceeds the result limit (e.g. caller
+    asks for limit=2 but iterates further), ranks ≥ 4 keep returning
+    "ref" — there is no upper bound on rank in the policy.
+    """
+    if detail == "titles":
+        return "ref"
+    if detail == "full":
+        return "full_xl"
+    if rank < 2:
+        return "full_xl"
+    if rank < 4:
+        return "full_l"
+    return "ref"
+
+
+def _format_code_result_by_rank(
+    properties: dict,
+    collection: str,
+    rank: int,
+    *,
+    detail: str = "auto",
+    score: float | None = None,
+    distance: float | None = None,
+    sibling_fetcher=None,
+) -> dict:
+    """Render one code-graph result per the rank-tier policy.
+
+    Single source of truth shared between `search_code_graph` (MCP) and
+    `query_code_graph.py` (CLI / pre-edit hook). Both paths emit the
+    same shape so the LLM sees identical context regardless of which
+    surface fetched it.
+
+    Args:
+        properties: Weaviate object's ``properties`` dict.
+        collection: Base collection name.
+        rank: 0-based rank in the merged result list. Negative values
+            clamp to 0; values ≥ 4 collapse to the metadata-ref tier.
+        detail: ``"auto"`` (rank-driven), ``"full"``, or ``"titles"``.
+            Unknown values normalise to ``"auto"``.
+        score: Similarity score (1 - distance), pre-computed by caller.
+        distance: Raw distance from Weaviate metadata.
+        sibling_fetcher: Optional callable
+            ``(file_path, hit_start_line, max_total, exclude_full_name)
+            -> list[dict]`` for top-2 sibling enrichment. ``None``
+            skips the sibling lookup.
+
+    Returns:
+        Dict with ``collection``, ``score``/``distance`` (when
+        provided), ``file_path``, ``tier``, plus tier-specific fields
+        merged in by collection. Siblings appear under ``siblings``
+        when applicable.
+    """
+    if rank < 0:
+        rank = 0
+    if detail not in ("auto", "titles", "full"):
+        detail = "auto"
+
+    tier = _resolve_code_tier(rank, detail)
+    file_path = _code_result_file_path(collection, properties)
+
+    base: dict = {"collection": collection}
+    if score is not None:
+        base["score"] = f"{score:.3f}"
+    if distance is not None:
+        base["distance"] = f"{distance:.3f}"
+    base["file_path"] = file_path
+    base["tier"] = tier
+
+    if tier == "full_xl":
+        base.update(_format_code_result_full(collection, properties, untruncated=True))
+    elif tier == "full_l":
+        base.update(_format_code_result_full(collection, properties, untruncated=False))
+    else:
+        base.update(_format_code_result_ref(collection, properties))
+
+    # Sibling-fetch eligibility: only when the result has a REAL `file_path`
+    # property (not the synthesized fallback `_code_result_file_path` derives
+    # from `full_name` when the real field is missing). The synthesized form
+    # ("alpha" derived from "alpha.foo") is fine for display but is not a
+    # valid source-file path to filter same-file code-graph siblings against
+    # — passing it to the fetcher results in wasted collection round-trips
+    # against fixtures or partially-indexed entries, AND breaks tests that
+    # mock a one-collection-per-call contract.
+    real_file_path = properties.get("file_path")
+    if (
+        detail == "auto"
+        and rank < 2
+        and collection in ("CodeFunction", "CodeClass")
+        and real_file_path
+        and sibling_fetcher is not None
+    ):
+        try:
+            hit_line = int(properties.get("start_line") or 0)
+        except (TypeError, ValueError):
+            hit_line = 0
+        max_total = CODE_SIBLINGS_RANK_1 if rank == 0 else CODE_SIBLINGS_RANK_2
+        try:
+            sibs = sibling_fetcher(file_path, hit_line, max_total, properties.get("full_name", ""))
+        except Exception as exc:  # noqa: BLE001 — sibling lookup is best-effort
+            logger.debug("sibling_fetcher failed: %s", exc)
+            sibs = []
+        if sibs:
+            base["siblings"] = sibs
+
+    return base
+
+
 def _chunk_summaries_header(
     file_path: str,
     shown_chunk_nums: list[int] | None = None,
@@ -3013,109 +3242,22 @@ async def search_code_graph(
         candidates.sort(key=lambda x: x["_s"], reverse=True)
         candidates = candidates[:limit]
 
-        def _file_path(coll_name: str, p: dict) -> str:
-            """Best-effort source file path from stored properties."""
-            # Explicit file_path property (present if analyzer stored it)
-            if p.get("file_path"):
-                return p["file_path"]
-            # CodeModule has 'path' as the file path
-            if p.get("path"):
-                return p["path"]
-            # CodeFunction/CodeClass: full_name encodes module path (dots), no explicit file
-            if p.get("full_name"):
-                parts = p["full_name"].split(".")
-                # Drop last 1 part (function/method name) or last 2 (class.method)
-                # Best effort: return module portion
-                return "/".join(parts[:-1]) if len(parts) > 1 else p["full_name"]
-            return ""
-
-        # Determine per-result verbosity. Code graph has no sidecar, so we
-        # use position-based tiering (rank order) for "auto" rather than
-        # score-threshold tiering. The score is still in every result for
-        # client-side filtering. Explicit detail values apply uniformly.
+        # Normalize detail before tier selection. The shared formatter
+        # tolerates unknown values but normalising here keeps the surface
+        # detail matching the input back in the JSON envelope below.
         if detail not in ("auto", "titles", "full"):
             detail = "auto"
-
-        def _truncate(s: str, n: int) -> str:
-            return s[:n] + "..." if len(s) > n else s
-
-        def _format_full(coll_name: str, p: dict, *, untruncated: bool) -> dict:
-            """Build the full-tier fields for a result.
-
-            untruncated=True: top-2 ranks — include function_body / class_body
-            untruncated, all doc/summary/description fields untruncated.
-            untruncated=False: ranks 3-4 — same fields as top-2 EXCEPT no
-            function_body/class_body (those are large), and doc/summary/
-            description truncated at CODE_TRUNC_CHARS (default 1200, was 200).
-            """
-            out: dict = {}
-            if coll_name == "CodeFunction":
-                doc = p.get("doc", "") or ""
-                out["full_name"] = p.get("full_name", "")
-                out["signature"] = p.get("signature", "")
-                out["doc"] = doc if untruncated else _truncate(doc, CODE_TRUNC_CHARS)
-                out["location"] = f"{p.get('start_line','?')}-{p.get('end_line','?')}"
-                out["is_async"] = p.get("is_async", False)
-                if untruncated:
-                    body = p.get("function_body", "") or ""
-                    if body:
-                        out["function_body"] = body
-            elif coll_name == "CodeClass":
-                doc = p.get("doc", "") or ""
-                out["full_name"] = p.get("full_name", "")
-                out["signature"] = p.get("signature", "")
-                out["doc"] = doc if untruncated else _truncate(doc, CODE_TRUNC_CHARS)
-                out["methods"] = p.get("methods", [])
-                out["method_count"] = len(p.get("methods", []))
-                out["location"] = f"{p.get('start_line','?')}-{p.get('end_line','?')}"
-                if untruncated:
-                    body = p.get("class_body", "") or ""
-                    if body:
-                        out["class_body"] = body
-            elif coll_name == "CodeModule":
-                summary = p.get("module_summary", "") or ""
-                out["path"] = p.get("path", "")
-                out["language"] = p.get("language", "")
-                out["loc"] = p.get("loc", 0)
-                out["summary"] = summary if untruncated else _truncate(summary, CODE_TRUNC_CHARS)
-            elif coll_name == "CodeAPI":
-                desc = p.get("api_description", "") or ""
-                out["endpoint"] = p.get("endpoint", "")
-                out["method"] = p.get("method", "")
-                out["description"] = desc if untruncated else _truncate(desc, CODE_TRUNC_CHARS)
-                out["parameters"] = p.get("parameters", [])
-            elif coll_name == "CodeInteraction":
-                desc = p.get("description", "") or ""
-                out["interaction_type"] = p.get("interaction_type", "")
-                out["direction"] = p.get("direction", "")
-                out["protocol"] = p.get("protocol", "")
-                out["endpoint"] = p.get("endpoint", "")
-                out["confidence"] = p.get("confidence", "")
-                out["description"] = desc if untruncated else _truncate(desc, CODE_TRUNC_CHARS)
-            return out
-
-        def _format_ref(coll_name: str, p: dict) -> dict:
-            """Metadata-only ref for lower-ranked results and expansions."""
-            out: dict = {}
-            if coll_name in ("CodeFunction", "CodeClass"):
-                out["full_name"] = p.get("full_name", "")
-            elif coll_name == "CodeModule":
-                out["path"] = p.get("path", "")
-                out["language"] = p.get("language", "")
-            elif coll_name == "CodeAPI":
-                out["endpoint"] = p.get("endpoint", "")
-                out["method"] = p.get("method", "")
-            elif coll_name == "CodeInteraction":
-                out["endpoint"] = p.get("endpoint", "")
-                out["protocol"] = p.get("protocol", "")
-                out["interaction_type"] = p.get("interaction_type", "")
-            return out
 
         def _fetch_file_siblings(file_path: str, hit_start_line: int, max_total: int, exclude_full_name: str) -> list[dict]:
             """Fetch up to (max_total - 1) siblings in the same source file,
             ordered by start_line, centred on hit_start_line. Returns formatted
             metadata-ref dicts (siblings are context, not primary results).
             Returns [] on any failure or if file_path is missing.
+
+            Closes over `client`, `effective_project`, and `_project_collection`
+            from the enclosing search_code_graph call. Passed to the shared
+            `_format_code_result_by_rank` helper as `sibling_fetcher` so the
+            helper itself stays Weaviate-agnostic.
             """
             if not file_path or max_total <= 1:
                 return []
@@ -3151,68 +3293,28 @@ async def search_code_graph(
             picked.sort(key=lambda t: t[0])
             siblings: list[dict] = []
             for sl_int, c_name, sp in picked:
-                ref = _format_ref(c_name, sp)
+                ref = _format_code_result_ref(c_name, sp)
                 ref["sibling"] = True
                 ref["start_line"] = sl_int
                 ref["collection"] = c_name
                 siblings.append(ref)
             return siblings
 
-        def _is_full_tier(idx: int) -> bool:
-            """Backward-compat helper for callers that still want the boolean."""
-            if detail == "full":
-                return True
-            if detail == "titles":
-                return False
-            return idx < 4
-
+        # Render each candidate via the shared rank-tier formatter so
+        # the MCP path and the CLI / pre-edit hook path emit identically
+        # shaped results. The formatter handles tier selection, content
+        # truncation, and (for top-2) sibling enrichment via the
+        # closure above.
         results = []
         for i, r in enumerate(candidates):
             coll_name, p, score, dist = r["_c"], r["_p"], r["_s"], r["_d"]
-            base = {
-                "collection": coll_name,
-                "score": f"{score:.3f}",
-                "distance": f"{dist:.3f}",
-                "file_path": _file_path(coll_name, p),
-            }
-
-            if detail == "titles":
-                tier = "ref"
-            elif detail == "full":
-                tier = "full_xl"
-            else:
-                if i < 2:
-                    tier = "full_xl"
-                elif i < 4:
-                    tier = "full_l"
-                else:
-                    tier = "ref"
-
-            if tier == "full_xl":
-                base.update(_format_full(coll_name, p, untruncated=True))
-            elif tier == "full_l":
-                base.update(_format_full(coll_name, p, untruncated=False))
-            else:
-                base.update(_format_ref(coll_name, p))
-
-            if (
-                detail == "auto"
-                and i < 2
-                and coll_name in ("CodeFunction", "CodeClass")
-                and base["file_path"]
-            ):
-                try:
-                    hit_line = int(p.get("start_line") or 0)
-                except (TypeError, ValueError):
-                    hit_line = 0
-                max_total = CODE_SIBLINGS_RANK_1 if i == 0 else CODE_SIBLINGS_RANK_2
-                sibs = _fetch_file_siblings(
-                    base["file_path"], hit_line, max_total, p.get("full_name", "")
-                )
-                if sibs:
-                    base["siblings"] = sibs
-
-            results.append(base)
+            results.append(_format_code_result_by_rank(
+                p, coll_name, i,
+                detail=detail,
+                score=score,
+                distance=dist,
+                sibling_fetcher=_fetch_file_siblings,
+            ))
 
         # --- Subgraph expansion ---
         effective_hops = max(0, min(expand_hops, 2))
