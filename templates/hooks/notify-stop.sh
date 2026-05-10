@@ -5,8 +5,13 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 # notify-stop.sh
 # Fires on Stop event — Claude finished responding.
 # Desktop notification via notify-send.
-# NOTE: RL training is now handled inside the weaviate MCP server (_rl_answer_monitor),
-#       not here — Stop hooks don't fire in the VS Code extension.
+# NOTE: RL training is handled inside the weaviate MCP server
+#       (`_rl_answer_monitor`), not here — different concern, same
+#       trigger point. The earlier note here claimed "Stop hooks don't
+#       fire in the VS Code extension"; per current Claude Code docs
+#       (https://code.claude.com/docs/en/hooks, 2026-05-11) Stop is
+#       documented universally with no VS Code carve-out, so this hook
+#       runs on every surface that loads `.claude/settings.json`.
 
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
 

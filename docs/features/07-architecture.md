@@ -50,8 +50,8 @@ Bash hooks (`.claude/hooks/*.sh`) require WSL2 on Windows to fire automatically.
 ### Full surface compatibility matrix
 `docs/CLAUDE_CODE_COMPATIBILITY.md` contains the authoritative table of which features (hooks, agents, skills, MCP, slash commands, per-project env, Stop-event hooks) work on each surface.
 
-### Stop-event hook gap (VS Code)
-`Stop`, `StopFailure`, `SessionEnd` hooks do not fire in the VS Code extension as of v2.1.x. `notify-stop.sh` and `cost-tracker.sh` are affected. Users who need Stop-event automation should use the CLI or Desktop surface.
+### Stop-event hooks — VS Code parity (refreshed 2026-05-11)
+`Stop`, `StopFailure`, `SessionEnd` are documented universally per the current [hooks reference](https://code.claude.com/docs/en/hooks); the [VS Code feature-gap table](https://code.claude.com/docs/en/vs-code) doesn't list hook events as missing. The orchestrator's `notify-stop.sh` and `cost-tracker.sh` should fire on every surface that loads `.claude/settings.json`. The prior claim here (VS Code-side carve-out in v2.1.x) is no longer supported by the official docs; if these hooks empirically don't fire in your VS Code build, file via `/feedback`.
 
 ---
 
