@@ -620,6 +620,29 @@ impl Db {
             .map_err(|e| format!("delete_project_permission: {}", e))?;
         Ok(())
     }
+
+    /// 0.2.x backlog #5 (2026-05-10): delete a permission row by its
+    /// natural key `(project_id, subject, kind, value)`. Used by
+    /// `set_project_mcp_permission(enabled=true)` to remove any explicit
+    /// per-project row so the row falls back to the default-enabled
+    /// state. Idempotent: a missing row is a no-op (0 rows affected).
+    pub fn delete_project_permission_by_key(
+        &self,
+        project_id: &str,
+        subject: &str,
+        kind: &str,
+        value: &str,
+    ) -> Result<(), String> {
+        let guard = self.lock();
+        guard
+            .execute(
+                "DELETE FROM project_permissions
+                  WHERE project_id = ?1 AND subject = ?2 AND kind = ?3 AND value = ?4",
+                params![project_id, subject, kind, value],
+            )
+            .map_err(|e| format!("delete_project_permission_by_key: {}", e))?;
+        Ok(())
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════

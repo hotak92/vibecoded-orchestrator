@@ -121,6 +121,53 @@ export interface UpdateProjectResult {
 }
 
 /**
+ * Mirror of Rust `UpdateAllOptions` (commands/projects_v2.rs).
+ *
+ * 0.2.x backlog #4 (2026-05-10): drives the "Update all projects" power-
+ * user button. `stop_on_error: true` (default) makes the launcher halt at
+ * the first project that hard-fails (folder missing, project unregistered)
+ * so the user sees the broken project promptly instead of chewing through
+ * the remaining N-1 first. `false` continues past failures.
+ */
+export interface UpdateAllOptions {
+  stop_on_error?: boolean;
+}
+
+/**
+ * Mirror of Rust `UpdateAllProjectEntry` (commands/projects_v2.rs).
+ *
+ * Per-project outcome of an `update_all_projects` run. `status` is one of:
+ *   - "succeeded": `update_project_v2` returned Ok (warnings may still
+ *     populate `warnings[]` for soft-fail conditions).
+ *   - "failed":    hard failure (project missing on disk / folder gone).
+ *     `error` carries the explanatory message.
+ *   - "skipped":   `stop_on_error=true` halted iteration before reaching
+ *     this project. `error` is null, `summary` is null.
+ */
+export interface UpdateAllProjectEntry {
+  project_id: string;
+  project_name: string;
+  status: 'succeeded' | 'failed' | 'skipped';
+  error: string | null;
+  warnings: string[];
+  summary: UpdateSummary | null;
+}
+
+/**
+ * Mirror of Rust `UpdateAllReport` (commands/projects_v2.rs).
+ *
+ * Aggregate counts after an `update_all_projects` run. The launcher
+ * renders these in the progress modal's footer summary
+ * ("3 updated, 1 failed, 0 skipped").
+ */
+export interface UpdateAllReport {
+  updated: UpdateAllProjectEntry[];
+  total_succeeded: number;
+  total_failed: number;
+  total_skipped: number;
+}
+
+/**
  * Mirror of Rust `UnregisterOptions` (commands/projects_v2.rs).
  *
  * 2026-05-06: drives the per-project "Unregister project" action. Both

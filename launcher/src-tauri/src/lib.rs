@@ -236,6 +236,9 @@ pub fn run() {
             commands::project_state_cmd::unregister_project_hook,
             commands::project_state_cmd::add_project_permission,
             commands::project_state_cmd::delete_project_permission,
+            // 0.2.x backlog #5: per-project MCP toggle UI.
+            commands::project_state_cmd::list_project_mcp_permissions,
+            commands::project_state_cmd::set_project_mcp_permission,
             commands::project_state_cmd::set_project_secret_ref,
             commands::project_state_cmd::delete_project_secret_ref,
             commands::project_state_cmd::set_project_kg_binding,
@@ -259,6 +262,10 @@ pub fn run() {
             commands::secrets_cmd::list_grants_for_project,
             commands::secrets_cmd::pause_secret_for_project,
             commands::secrets_cmd::resume_secret_for_project,
+            // 0.2.x backlog #3: shared-tab key-collision shadow badge.
+            commands::secrets_cmd::list_user_secret_keys_v2,
+            // 0.2.x backlog #4: Update-all sequential iteration.
+            commands::projects_v2::update_all_projects,
             // Licensing
             commands::licensing::license_get_tier,
             commands::licensing::license_is_admin,

@@ -4,6 +4,11 @@
 // endpoint. The UI tracks an in-memory map of (project_id, module_id, scope, key)
 // → { is_set, preview }. Components seed this map by registering known
 // secret keys and calling refresh().
+//
+// 0.2.x backlog #3 (2026-05-10): user-bucket entries can also be hydrated
+// from the backend in bulk via `loadFromBackend(projectId)` — surfaces
+// `is_shadowed` + `winning_scope` so the SecretsPanel can render the
+// shared-tab key-collision badge.
 
 import { writable, get } from 'svelte/store';
 import { invoke, tauriAvailable } from '$lib/tauri';
@@ -32,6 +37,18 @@ export interface SecretEntry {
    *  ghost row; we treat it as EMPTY.) */
   has_saved_value: boolean;
   preview: string | null;
+  /** 0.2.x backlog #3: true when the same KEY name exists at another
+   * scope in this project's view of the user-bucket. The resolver's
+   * read-time precedence is `per_project > shared > global`; when this
+   * row's `scope !== winning_scope`, the row is being shadowed by a
+   * higher-precedence row. Both the winner and the loser of a collision
+   * carry `is_shadowed: true` so the user sees the conflict from any
+   * tab they happen to be looking at. */
+  is_shadowed: boolean;
+  /** 0.2.x backlog #3: which scope's value the resolver actually serves
+   * for `(project_id, key)`. Equals `scope` when this row is the winner.
+   * Only meaningful when `is_shadowed === true`. */
+  winning_scope: SecretScope;
 }
 
 /** Lifecycle states the UI renders. Derived from is_active +
@@ -68,7 +85,7 @@ function createSecretsStore() {
     /** Register a known secret key for the UI to track + render.
      * Idempotent. Does not call the backend. Use refresh() to fetch the
      * current lifecycle state. */
-    register(entry: Omit<SecretEntry, 'is_set' | 'is_active' | 'has_saved_value' | 'preview'>) {
+    register(entry: Omit<SecretEntry, 'is_set' | 'is_active' | 'has_saved_value' | 'preview' | 'is_shadowed' | 'winning_scope'>) {
       update((s) => {
         const k = entryKey(entry);
         if (s.entries.has(k)) return s;
@@ -79,6 +96,8 @@ function createSecretsStore() {
           is_active: true,
           has_saved_value: false,
           preview: null,
+          is_shadowed: false,
+          winning_scope: entry.scope,
         });
         return { ...s, entries: map };
       });
@@ -147,6 +166,81 @@ function createSecretsStore() {
       }
     },
 
+    /**
+     * 0.2.x backlog #3: enumerate every user-bucket secret KEY the
+     * launcher has observed for `projectId`'s view (its own per_project
+     * bucket + shared + global), populating the store with the response.
+     *
+     * Backed by the new `list_user_secret_keys_v2` Tauri command. Each
+     * row carries `is_shadowed` + `winning_scope` so the SecretsPanel
+     * can render the shared-tab key-collision badge without computing
+     * collisions client-side.
+     *
+     * Idempotent: re-running merges new rows with the existing store
+     * (preserves any not-yet-saved register() calls from the add-form
+     * flow). Existing entries are updated with the latest is_set /
+     * is_active / has_saved_value / shadow status from the backend.
+     *
+     * Module-bucket entries (e.g. licensing's VIBECODED_LICENSE_KEY)
+     * are NOT enumerated — this command targets only the user emit
+     * bucket the SecretsPanel writes to. The SecretsPanel still seeds
+     * the licensing global key separately via `register()`.
+     */
+    async loadFromBackend(projectId: string): Promise<void> {
+      if (!tauriAvailable()) return;
+      try {
+        interface UserSecretKeyRow {
+          scope: SecretScope;
+          project_id: string;
+          module_id: string;
+          key: string;
+          is_set: boolean;
+          is_active: boolean;
+          has_saved_value: boolean;
+          is_shadowed: boolean;
+          winning_scope: SecretScope;
+        }
+        const rows = await invoke<UserSecretKeyRow[]>('list_user_secret_keys_v2', {
+          projectId,
+        });
+        update((s) => {
+          const map = new Map(s.entries);
+          for (const r of rows) {
+            const partial = {
+              project_id: r.project_id,
+              module_id: r.module_id,
+              scope: r.scope,
+              key: r.key,
+            };
+            const k = entryKey(partial);
+            const existing = map.get(k);
+            map.set(k, {
+              project_id: r.project_id,
+              module_id: r.module_id,
+              scope: r.scope,
+              key: r.key,
+              // The backend doesn't track sensitive-ness (it's a UI hint set
+              // at add time). Default true on first observation; preserve
+              // the existing flag if the entry was already registered.
+              sensitive: existing?.sensitive ?? true,
+              is_set: r.is_set,
+              is_active: r.is_active,
+              has_saved_value: r.has_saved_value,
+              preview: existing?.preview ?? null,
+              is_shadowed: r.is_shadowed,
+              winning_scope: r.winning_scope,
+            });
+          }
+          return { ...s, entries: map };
+        });
+      } catch (e) {
+        update((s) => ({
+          ...s,
+          error: e instanceof Error ? e.message : String(e),
+        }));
+      }
+    },
+
     async setValue(
       entry: Pick<SecretEntry, 'project_id' | 'module_id' | 'scope' | 'key' | 'sensitive'>,
       value: string,
@@ -197,6 +291,12 @@ function createSecretsStore() {
           }
         }
         await this.refresh(entry);
+        // NOTE: callers that need the 0.2.x backlog #3 shadow-status
+        // badges updated after a mutation should call
+        // `loadFromBackend(viewProjectId)` separately. We don't auto-call
+        // here because shared/global mutations come in with a sentinel
+        // `project_id` and we'd have to plumb the user's current
+        // view-project through the entry to do it correctly.
         update((s) => ({ ...s, busy: false }));
       } catch (e) {
         update((s) => ({

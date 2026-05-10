@@ -274,6 +274,156 @@ pub async fn delete_project_permission(perm_id: i64, db: State<'_, Db>) -> Resul
     db.delete_project_permission(perm_id)
 }
 
+// ─── 0.2.x backlog #5: per-project MCP toggle ───────────────────────────
+//
+// MCP servers (weaviate-kg, ollama, search, custom user-added servers) are
+// configured globally in `~/.claude.json mcpServers`. By default Claude
+// Code spawns every enabled MCP server for every project the user opens.
+// Power users want per-project enable/disable: a project that doesn't need
+// browser automation shouldn't pay the startup cost of e.g. `playwright`.
+//
+// Storage: `project_permissions` rows with:
+//   * `kind = 'mcp_server'`
+//   * `value = <mcp server id>`  (e.g. "playwright", "weaviate-kg")
+//   * `subject = '@project'`     (per-project gate, not per-subagent)
+//   * `config = {"enabled": false}` when the user explicitly disabled.
+//
+// Semantics:
+//   * NO ROW for (project_id, server_id) → DEFAULT-ENABLED. Backwards-
+//     compatible: every project pre-0.2.x has zero rows and sees every
+//     server, same as before.
+//   * Row with `config.enabled = false` → disabled for this project. The
+//     env-writer emits the server_id into `.claude/settings.json`'s
+//     `disabledMcpjsonServers` array so Claude Code skips it.
+//   * Row with `config.enabled = true`  → explicitly enabled (rare; the
+//     enabled command path DELETES instead of writing this state, so the
+//     row falls back to the default. Kept legible for future "explicit
+//     enable wins over global disable" semantics if we ever add a
+//     machine-wide kill switch.)
+
+const MCP_PERMISSION_SUBJECT: &str = "@project";
+
+/// One row in `list_project_mcp_permissions`'s response.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProjectMcpPermission {
+    pub server_id: String,
+    pub enabled: bool,
+    /// True iff the launcher has an explicit `project_permissions` row
+    /// for this (project, server). When false, `enabled` is reporting
+    /// the default state and the GUI should NOT render an active-toggle
+    /// indicator beyond the regular on/off switch.
+    pub explicit: bool,
+}
+
+/// List the per-project enable/disable state for every MCP server the
+/// caller is interested in. Caller passes the canonical list of server
+/// IDs (typically the keys from `get_mcp_servers()` + any custom servers
+/// from `~/.claude.json`); the backend looks up each one and reports
+/// the resolved state.
+///
+/// Rationale for caller-supplied IDs: the `mcp_servers` source-of-truth
+/// is `OrchestratorConfig.mcp_servers` (in `~/.vct/orchestrator.json`)
+/// + `~/.claude.json` for custom user-added servers — both live OUTSIDE
+/// this DB. Asking the caller to pass IDs keeps this command pure-DB
+/// (no JSON file probes) and lets the GUI render `<list of all servers>
+/// + <toggle for each>` in one round trip without a second API call.
+#[command]
+pub async fn list_project_mcp_permissions(
+    project_id: String,
+    server_ids: Vec<String>,
+    db: State<'_, Db>,
+) -> Result<Vec<ProjectMcpPermission>, String> {
+    // Single query for every (project_id, kind='mcp_server') row, then
+    // join in-memory against `server_ids`. The mcp_server permission
+    // count per project is bounded (one row per known MCP server) so
+    // the table scan is cheap; we keep the SELECT WHERE kind='mcp_server'
+    // narrow rather than joining each server_id with a separate query.
+    let rows = db.list_project_permissions(&project_id)?;
+    let mut out: Vec<ProjectMcpPermission> = Vec::with_capacity(server_ids.len());
+    for server_id in &server_ids {
+        let row = rows.iter().find(|r| {
+            r.kind == "mcp_server"
+                && r.subject == MCP_PERMISSION_SUBJECT
+                && r.value == *server_id
+        });
+        let (enabled, explicit) = match row {
+            Some(r) => {
+                // Pull `config.enabled` if present; default to true when
+                // the config object doesn't carry the field (forward-
+                // compat with any future field additions).
+                let enabled = r
+                    .config
+                    .get("enabled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                (enabled, true)
+            }
+            None => (true, false),
+        };
+        out.push(ProjectMcpPermission {
+            server_id: server_id.clone(),
+            enabled,
+            explicit,
+        });
+    }
+    Ok(out)
+}
+
+/// Toggle a per-project MCP server's enabled state.
+///
+/// * `enabled = true`  → DELETE any explicit row so the (project, server)
+///   pair falls back to the default-enabled state. No-op when there was
+///   no row to begin with.
+/// * `enabled = false` → UPSERT a row with `config.enabled = false`. The
+///   env-writer reads this row's existence into the
+///   `.claude/settings.json` `disabledMcpjsonServers` array.
+///
+/// The DELETE-on-enable shape (rather than UPSERT-with-enabled=true)
+/// keeps the table small AND lets a future global-default flip from
+/// enabled to disabled work without rewriting every existing row.
+#[command]
+pub async fn set_project_mcp_permission(
+    project_id: String,
+    server_id: String,
+    enabled: bool,
+    db: State<'_, Db>,
+) -> Result<(), String> {
+    if server_id.is_empty() {
+        return Err("server_id must not be empty".to_string());
+    }
+    if enabled {
+        db.delete_project_permission_by_key(
+            &project_id,
+            MCP_PERMISSION_SUBJECT,
+            "mcp_server",
+            &server_id,
+        )?;
+        db.audit(
+            "project_mcp_permission_enable",
+            Some(&project_id),
+            None,
+            &serde_json::json!({ "server_id": server_id }),
+        )?;
+    } else {
+        // Upsert a disabled row. `add_project_permission` is upsert by
+        // (project_id, subject, kind, value).
+        db.add_project_permission(
+            &project_id,
+            MCP_PERMISSION_SUBJECT,
+            "mcp_server",
+            &server_id,
+            &serde_json::json!({ "enabled": false }),
+        )?;
+        db.audit(
+            "project_mcp_permission_disable",
+            Some(&project_id),
+            None,
+            &serde_json::json!({ "server_id": server_id }),
+        )?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SetSecretRefReq {
     pub secret_key: String,
@@ -575,4 +725,202 @@ pub async fn delete_project_codegraph_binding(
         &serde_json::json!({}),
     )?;
     Ok(())
+}
+
+// ─── Tests ──────────────────────────────────────────────────────────────
+//
+// These tests cover the 0.2.x backlog #5 per-project MCP toggle. They
+// exercise the DB-only path so they run in any environment (no keychain,
+// no Tauri runtime). The two commands are pure wrappers over the
+// `project_permissions` table; tests target the resolution logic in
+// `list_project_mcp_permissions` and the upsert/delete semantics in
+// `set_project_mcp_permission`.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::models::ProjectHost;
+    use crate::db::Db;
+
+    fn make_db() -> Db {
+        Db::open_in_memory().unwrap()
+    }
+
+    fn seed_project(db: &Db, id: &str, name: &str) {
+        // folder_path must be unique per project (UNIQUE constraint).
+        db.insert_project(id, name, &format!("/tmp/mcp-perm-test/{}", id), ProjectHost::Base, id)
+            .unwrap();
+    }
+
+    /// Replicate `list_project_mcp_permissions`'s DB-only logic (the
+    /// #[command] requires Tauri State, but the inner work is just
+    /// `list_project_permissions` + an in-memory join).
+    fn list_mcp_perms(db: &Db, project_id: &str, server_ids: &[&str]) -> Vec<ProjectMcpPermission> {
+        let rows = db.list_project_permissions(project_id).unwrap();
+        server_ids
+            .iter()
+            .map(|sid| {
+                let row = rows.iter().find(|r| {
+                    r.kind == "mcp_server"
+                        && r.subject == MCP_PERMISSION_SUBJECT
+                        && r.value == *sid
+                });
+                let (enabled, explicit) = match row {
+                    Some(r) => {
+                        let enabled = r
+                            .config
+                            .get("enabled")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true);
+                        (enabled, true)
+                    }
+                    None => (true, false),
+                };
+                ProjectMcpPermission {
+                    server_id: sid.to_string(),
+                    enabled,
+                    explicit,
+                }
+            })
+            .collect()
+    }
+
+    /// Default: no rows in `project_permissions` → every requested server
+    /// reports `enabled: true, explicit: false`. Pre-0.2.x projects MUST
+    /// pass through this branch (zero rows) and see every MCP server as
+    /// enabled, identical to pre-fix behaviour.
+    #[test]
+    fn list_mcp_permissions_defaults_to_enabled_when_no_rows() {
+        let db = make_db();
+        seed_project(&db, "pdef", "Default");
+
+        let perms = list_mcp_perms(&db, "pdef", &["weaviate-kg", "ollama", "playwright"]);
+        assert_eq!(perms.len(), 3);
+        for p in &perms {
+            assert!(p.enabled, "{} must default-enabled", p.server_id);
+            assert!(!p.explicit, "{} must be marked non-explicit", p.server_id);
+        }
+    }
+
+    /// Disable one server → that row reports `enabled: false, explicit: true`;
+    /// the other servers still default to enabled.
+    #[test]
+    fn disable_one_server_leaves_others_default_enabled() {
+        let db = make_db();
+        seed_project(&db, "ponly", "OnlyOne");
+
+        // Disable playwright.
+        db.add_project_permission(
+            "ponly",
+            MCP_PERMISSION_SUBJECT,
+            "mcp_server",
+            "playwright",
+            &serde_json::json!({ "enabled": false }),
+        )
+        .unwrap();
+
+        let perms = list_mcp_perms(&db, "ponly", &["weaviate-kg", "ollama", "playwright"]);
+        let by_id: std::collections::HashMap<_, _> =
+            perms.iter().map(|p| (p.server_id.as_str(), p)).collect();
+        assert!(by_id["weaviate-kg"].enabled);
+        assert!(!by_id["weaviate-kg"].explicit);
+        assert!(by_id["ollama"].enabled);
+        assert!(!by_id["ollama"].explicit);
+        assert!(!by_id["playwright"].enabled);
+        assert!(by_id["playwright"].explicit);
+    }
+
+    /// Re-enabling DELETES the row so the (project, server) pair falls
+    /// back to the default-enabled state. Verified via direct
+    /// `list_project_permissions` check — the row must be gone, not just
+    /// flipped to `config.enabled=true`.
+    #[test]
+    fn enabling_back_deletes_the_row() {
+        let db = make_db();
+        seed_project(&db, "pflip", "Flip");
+
+        // Disable, then re-enable.
+        db.add_project_permission(
+            "pflip",
+            MCP_PERMISSION_SUBJECT,
+            "mcp_server",
+            "playwright",
+            &serde_json::json!({ "enabled": false }),
+        )
+        .unwrap();
+        // Row exists post-disable.
+        let rows = db.list_project_permissions("pflip").unwrap();
+        assert!(rows.iter().any(|r| r.kind == "mcp_server" && r.value == "playwright"));
+
+        // Now re-enable using the same DELETE-by-key path the command takes.
+        db.delete_project_permission_by_key(
+            "pflip",
+            MCP_PERMISSION_SUBJECT,
+            "mcp_server",
+            "playwright",
+        )
+        .unwrap();
+
+        // Row gone — explicit=false again.
+        let rows = db.list_project_permissions("pflip").unwrap();
+        assert!(!rows.iter().any(|r| r.kind == "mcp_server" && r.value == "playwright"));
+        let perms = list_mcp_perms(&db, "pflip", &["playwright"]);
+        assert!(perms[0].enabled);
+        assert!(!perms[0].explicit, "row must be gone, not just flipped");
+    }
+
+    /// Per-project isolation: disabling a server for project A does NOT
+    /// affect project B's default state. Pin: the permission rows are
+    /// scoped on `project_id`, not on the server_id alone.
+    #[test]
+    fn disabling_for_one_project_does_not_affect_another() {
+        let db = make_db();
+        seed_project(&db, "pA_iso", "A");
+        seed_project(&db, "pB_iso", "B");
+
+        db.add_project_permission(
+            "pA_iso",
+            MCP_PERMISSION_SUBJECT,
+            "mcp_server",
+            "playwright",
+            &serde_json::json!({ "enabled": false }),
+        )
+        .unwrap();
+
+        // pA sees disabled+explicit, pB still sees default-enabled.
+        let a = list_mcp_perms(&db, "pA_iso", &["playwright"]);
+        let b = list_mcp_perms(&db, "pB_iso", &["playwright"]);
+        assert!(!a[0].enabled);
+        assert!(a[0].explicit);
+        assert!(b[0].enabled);
+        assert!(!b[0].explicit);
+    }
+
+    /// Re-disabling an already-disabled row is idempotent — UPSERT
+    /// semantic. Same row in `project_permissions`, no error, audit
+    /// fires once per call.
+    #[test]
+    fn disable_is_idempotent_upsert() {
+        let db = make_db();
+        seed_project(&db, "pidem", "Idem");
+
+        for _ in 0..3 {
+            db.add_project_permission(
+                "pidem",
+                MCP_PERMISSION_SUBJECT,
+                "mcp_server",
+                "playwright",
+                &serde_json::json!({ "enabled": false }),
+            )
+            .unwrap();
+        }
+
+        // Still one row.
+        let rows = db.list_project_permissions("pidem").unwrap();
+        let mcp_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| r.kind == "mcp_server" && r.value == "playwright")
+            .collect();
+        assert_eq!(mcp_rows.len(), 1, "UPSERT must collapse to a single row");
+    }
 }

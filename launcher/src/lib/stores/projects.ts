@@ -12,6 +12,8 @@ import type {
   CreateProjectResult,
   RenameProjectResult,
   UpdateProjectResult,
+  UpdateAllOptions,
+  UpdateAllReport,
   UnregisterOptions,
   UnregisterReport,
 } from '$lib/types/launcher';
@@ -157,6 +159,46 @@ function createProjectsStore() {
       }));
 
       return result;
+    },
+
+    /**
+     * 0.2.x backlog #4 (2026-05-10): iterate every registered project
+     * and run `update_project_v2` sequentially. Power-user shortcut for
+     * users who don't want to click Update N times.
+     *
+     * Sequential (not fan-out): keeps the UX understandable + lets the
+     * GUI stream per-project progress cleanly. The `opts.stop_on_error`
+     * flag (default true) controls whether the iteration halts at the
+     * first hard failure or continues through every project. Returns
+     * the aggregate `UpdateAllReport`; the modal renders it.
+     *
+     * On hard env failure (DB query, etc.), this re-throws the original
+     * Tauri error so the caller can render a fatal-error UI. Per-project
+     * failures are NOT thrown — they land in `report.updated[]` with
+     * `status="failed"` and the caller surfaces them as needed.
+     */
+    async updateAll(opts: UpdateAllOptions | null = null): Promise<UpdateAllReport> {
+      const report = await invoke<UpdateAllReport>('update_all_projects', { opts });
+
+      // Refresh local cache for every successfully-updated project — the
+      // bumped `updated_at` lives in `report.updated[i].summary` only on
+      // the server side; the cheapest UI sync is just to re-call list().
+      // Call the store via the module-level singleton instead of `this`:
+      // `this` inside an object-literal method has no inferred type under
+      // strict TS, which breaks the return-type inference of the whole
+      // object and propagates as a "Cannot use 'state' as a store" error
+      // on every `$projects` use site downstream.
+      if (report.total_succeeded > 0) {
+        try {
+          await projects.load();
+        } catch {
+          // Non-fatal: the per-project info was already returned in the
+          // report; a stale cache here just means the next manual refresh
+          // will pick it up.
+        }
+      }
+
+      return report;
     },
 
     async rename(id: string, newName: string): Promise<ProjectView> {

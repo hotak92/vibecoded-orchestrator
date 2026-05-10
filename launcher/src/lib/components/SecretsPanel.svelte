@@ -117,13 +117,25 @@
     // populates immediately (other parts of the app may not have
     // loaded it yet — load() is idempotent).
     await projects.load();
+    // 0.2.x backlog #3: hydrate the user-bucket entries (per_project for
+    // the current project + shared + global) from the backend so the
+    // panel knows about pre-existing entries from past sessions AND
+    // each row carries the cross-scope shadow / winning_scope flags.
+    if (formProjectId) {
+      await secrets.loadFromBackend(formProjectId);
+    }
     secrets.refreshAll();
   });
 
   $effect(() => {
     // When project filter changes, refresh per-project + shared
-    // entries so the "is_set" state matches the new scope.
+    // entries so the "is_set" state matches the new scope, AND re-fetch
+    // the shadow status from the new POV (per-project rows from a
+    // different project change which keys collide).
     void formProjectId;
+    if (formProjectId) {
+      void secrets.loadFromBackend(formProjectId);
+    }
     secrets.refreshAll();
   });
 
@@ -131,10 +143,50 @@
     return `${e.scope}::${e.module_id}::${e.key}`;
   }
 
+  // 0.2.x backlog #3: human-readable scope name for tooltips and
+  // collision badges. Mirrors the Per-project / Shared / Global tab
+  // labels above so the badge text stays consistent with the UI.
+  function formatScope(s: SecretScope): string {
+    if (s === 'per_project') return 'per-project';
+    if (s === 'shared') return 'shared';
+    return 'global';
+  }
+
+  // 0.2.x backlog #3: enumerate every OTHER scope that has a row for
+  // the same KEY name as `e`. Used by the winner-side badge tooltip
+  // ("shadows shared, global"). Reads the in-memory store; bounded to
+  // at most 2 entries (the other 2 scopes when this row is one of 3).
+  function shadowOtherScopes(e: SecretEntry): string[] {
+    const out: string[] = [];
+    for (const other of sState.entries.values()) {
+      if (other.key !== e.key) continue;
+      if (other.module_id !== e.module_id) continue;
+      if (other.scope === e.scope) continue;
+      // Filter to entries that are part of THIS project's view: the
+      // entry must be either shared/global (visible to all) or the
+      // per-project entry for the project we're currently looking at.
+      if (other.scope === 'per_project' && other.project_id !== formProjectId) continue;
+      out.push(formatScope(other.scope));
+    }
+    return out;
+  }
+
   function projectIdForScope(s: SecretScope): string {
     if (s === 'global') return '_global_';
     if (s === 'shared') return '_user_shared_';
     return formProjectId ?? '';
+  }
+
+  // 0.2.x backlog #3: re-fetch the shadow / winning_scope status from
+  // the current project's POV after a mutation. The badge needs to
+  // update on EVERY affected row when a collision changes — adding a
+  // per-project value flips an existing shared row from un-shadowed to
+  // shadowed (and vice versa). Skipped silently when no formProjectId is
+  // chosen yet (per-project tab requires one anyway).
+  async function refreshShadowState() {
+    if (formProjectId) {
+      await secrets.loadFromBackend(formProjectId);
+    }
   }
 
   async function handleAdd() {
@@ -158,6 +210,7 @@
       };
       secrets.register(entry);
       await secrets.setValue(entry, newValue);
+      await refreshShadowState();
       newKey = '';
       newValue = '';
     } catch (e) {
@@ -172,6 +225,7 @@
     busy = true;
     try {
       await secrets.setValue(e, editValue);
+      await refreshShadowState();
       editingKey = null;
       editValue = '';
       editShowValue = false;
@@ -186,6 +240,7 @@
     busy = true;
     try {
       await secrets.unsetValue(e);
+      await refreshShadowState();
     } catch (err) {
       console.error('unset secret failed', err);
     } finally {
@@ -197,6 +252,7 @@
     busy = true;
     try {
       await secrets.reactivateValue(e);
+      await refreshShadowState();
     } catch (err) {
       console.error('reactivate secret failed', err);
     } finally {
@@ -209,6 +265,7 @@
     busy = true;
     try {
       await secrets.removeEntry(removeConfirm);
+      await refreshShadowState();
       removeConfirm = null;
     } catch (err) {
       console.error('remove secret failed', err);
@@ -351,6 +408,28 @@
                 {/if}
                 {#if entry.sensitive}
                   <span class="badge-hint">sensitive</span>
+                {/if}
+                <!-- 0.2.x backlog #3: shared-tab key-collision badge.
+                     Renders on EVERY row of a collision'd KEY, both the
+                     winner and the shadowed losers. Tooltip explains the
+                     resolver's `per_project > shared > global` precedence
+                     so the user sees which value is in effect at runtime. -->
+                {#if entry.is_shadowed}
+                  {#if entry.scope === entry.winning_scope}
+                    <span
+                      class="badge badge-shadow-winner"
+                      title={`This entry's value wins. The same KEY also exists at: ${shadowOtherScopes(entry).join(', ')}. Resolver precedence: per_project > shared > global.`}
+                    >
+                      ⚠ shadows {shadowOtherScopes(entry).join(' + ')}
+                    </span>
+                  {:else}
+                    <span
+                      class="badge badge-shadow-loser"
+                      title={`Shadowed by the ${formatScope(entry.winning_scope)} value for this project. The resolver returns the higher-precedence value at runtime (precedence: per_project > shared > global).`}
+                    >
+                      ⚠ shadowed by {formatScope(entry.winning_scope)}
+                    </span>
+                  {/if}
                 {/if}
               </span>
             </div>
@@ -740,6 +819,32 @@
   .badge-unset {
     color: var(--color-muted);
     background: rgba(255, 255, 255, 0.04);
+  }
+
+  /* 0.2.x backlog #3: shared-tab key-collision badges.
+   * Two visual variants depending on whether the row's value wins or is
+   * shadowed at runtime. Both share the warning-amber palette so the
+   * collision reads at a glance, but the winner gets a slightly stronger
+   * border to communicate "this one is live" vs. the loser's "this one
+   * is being overridden". The amber matches the existing inactive-state
+   * badge so the user already associates it with "needs attention". */
+  .badge-shadow-winner {
+    color: #ffc800;
+    background: rgba(255, 200, 0, 0.16);
+    border: 1px solid rgba(255, 200, 0, 0.4);
+    cursor: help;
+  }
+
+  .badge-shadow-loser {
+    color: #ffb300;
+    background: rgba(255, 200, 0, 0.08);
+    border: 1px solid rgba(255, 200, 0, 0.2);
+    text-transform: none;
+    letter-spacing: 0.2px;
+    cursor: help;
+    /* De-emphasise relative to the winner — the user can still see the
+     * row but the visual weight tells them "not the live value". */
+    opacity: 0.95;
   }
 
   /* Subtle de-emphasis on inactive rows so the lifecycle state reads at
