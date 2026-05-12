@@ -461,8 +461,74 @@ impl ProgressCounts {
     }
 }
 
+/// Default stall-watchdog timeout in seconds. Used when
+/// `KG_SYNC_STALL_TIMEOUT_SECS` is unset or unparsable.
+///
+/// 300 s (5 min) is conservative for the slowest path we've seen in
+/// practice: an Ollama node embedding a single ~8 KB body on a CPU-only
+/// machine under heavy load takes ~30-60 s. A KG node that ingests a long
+/// PDF appendix can produce ~6-10 embedding batches each at that latency,
+/// so a full file with no intermediate stdout could plausibly take a few
+/// minutes between progress lines. 300 s gives substantial headroom over
+/// observed worst-case while still bounding the wedge-recovery window —
+/// far better than the unbounded hangs that motivated the 2026-05-12 fix.
+/// Override via env if hardware/network is unusually slow.
+const DEFAULT_STALL_TIMEOUT_SECS: u64 = 300;
+
+/// Stall-watchdog: resolved from `KG_SYNC_STALL_TIMEOUT_SECS` at task start.
+/// 0 disables the watchdog entirely (escape hatch for benchmark / debug).
+fn resolve_stall_timeout() -> Option<std::time::Duration> {
+    let raw = std::env::var("KG_SYNC_STALL_TIMEOUT_SECS").ok();
+    let secs = match raw.as_deref() {
+        None => DEFAULT_STALL_TIMEOUT_SECS,
+        Some(v) => match v.trim().parse::<u64>() {
+            Ok(n) => n,
+            Err(_) => {
+                eprintln!(
+                    "[vct] warning: KG_SYNC_STALL_TIMEOUT_SECS={:?} is not a non-negative \
+                     integer; falling back to default {}s",
+                    v, DEFAULT_STALL_TIMEOUT_SECS
+                );
+                DEFAULT_STALL_TIMEOUT_SECS
+            }
+        },
+    };
+    if secs == 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_secs(secs))
+    }
+}
+
+/// Bug-3 v0.2.x (2026-05-12): tag for the concurrent-drain channel.
+///
+/// `run_subprocess` formerly drained stdout to EOF and ONLY THEN drained
+/// stderr. Linux pipe buffers default to ~64 KiB; once `sync_knowledge_graph.py`
+/// emitted enough stderr (weaviate-client warnings, Python tracebacks,
+/// urllib3 retry chatter, etc.) the kernel blocked its next stderr write
+/// in `anon_pipe_write`. Python blocked → no further stdout → the
+/// launcher's stdout reader saw an indefinite quiescent stream → stderr
+/// reader never started because it was sequenced AFTER the stdout drain.
+/// Symptom: kg-sync wedged at "embedding 14/68" with no progress and no
+/// crash. We now spawn two reader tasks that drain both pipes
+/// concurrently into a single `mpsc::channel`, restoring forward progress
+/// guarantees on both sides regardless of which one outpaces the other.
+#[derive(Debug)]
+enum PipeLine {
+    Stdout(String),
+    Stderr(String),
+}
+
 /// Run the kg-sync subprocess, stream stdout+stderr line-by-line for live
 /// progress events, and parse the summary lines for the final counts.
+///
+/// Concurrent drain (Bug-3 v0.2.x, 2026-05-12): stdout and stderr are
+/// read by two `tokio::spawn` tasks feeding a shared `mpsc::channel`.
+/// The main loop awaits messages, tagged with their origin pipe, and
+/// dispatches parsing only on stdout lines — preserving the existing
+/// single-threaded deterministic parse semantics while removing the
+/// stderr-side back-pressure deadlock. Stall watchdog runs alongside
+/// via `tokio::time::timeout` on the channel `recv()`.
 #[allow(clippy::too_many_arguments)]
 async fn run_subprocess(
     program: std::path::PathBuf,
@@ -476,6 +542,7 @@ async fn run_subprocess(
     docs_total_pre: u32,
 ) -> SubprocessOutcome {
     use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::sync::mpsc;
 
     let mut cmd = tokio::process::Command::new(&program);
     cmd.args(&base_args)
@@ -556,76 +623,176 @@ async fn run_subprocess(
     let app_clone = app.clone();
     let project_id_owned = project_id.to_string();
 
-    // Spawn a stdout reader. We process lines synchronously inside the
-    // async context (no concurrent stderr; we drain stderr after the
-    // process exits to keep parsing single-threaded and deterministic).
-    if let Some(out) = stdout {
-        let mut reader = BufReader::new(out).lines();
-        loop {
-            match reader.next_line().await {
-                Ok(Some(line)) => {
-                    combined.push_str(&line);
-                    combined.push('\n');
+    // Bug-3 v0.2.x (2026-05-12): concurrent drain of stdout + stderr.
+    //
+    // The channel is bounded but generously sized (1024 lines): bursty
+    // weaviate-client retry chatter can produce hundreds of lines/second
+    // briefly, and we don't want the reader tasks to block on `send`
+    // (which would re-introduce the pipe-buffer back-pressure deadlock,
+    // just one indirection away). 1024 lines × ~120 B avg = ~120 KiB
+    // worst-case in-flight, which is negligible.
+    let (tx, mut rx) = mpsc::channel::<PipeLine>(1024);
 
-                    if let Some(found) = parse_found_header(&line) {
-                        // "📚 Found N markdown files in knowledge/" or
-                        // "📚 Found N markdown files in docs/"
-                        if found.kind == FoundKind::Knowledge {
-                            counts.kg_total = found.count;
-                            current_phase = "knowledge";
-                        } else {
-                            counts.docs_total = found.count;
-                            current_phase = "docs";
-                        }
-                    } else if line.contains("🔄 Syncing node:") {
-                        kg_seen = kg_seen.saturating_add(1);
-                        counts.kg_succeeded = kg_seen; // optimistic; reconciled by summary
-                        current_phase = "knowledge";
-                    } else if line.contains("🔄 Syncing doc:") {
-                        docs_seen = docs_seen.saturating_add(1);
-                        counts.docs_succeeded = docs_seen; // optimistic; reconciled by summary
-                        current_phase = "docs";
-                    } else if let Some((s, f)) = parse_summary_line(&line, "📊 KG:") {
-                        counts.kg_succeeded = s;
-                        counts.kg_failed = f;
-                        kg_summary_seen = true;
-                    } else if let Some((s, f)) = parse_summary_line(&line, "📊 Docs:") {
-                        counts.docs_succeeded = s;
-                        counts.docs_failed = f;
-                        docs_summary_seen = true;
-                    }
-
-                    // Emit progress on syncing lines (the high-frequency
-                    // events that drive the pill counter). Header / summary
-                    // lines also emit so the totals refresh, but those are
-                    // rare.
-                    emit_sync(
-                        &app_clone,
-                        &project_id_owned,
-                        sync_status::RUNNING,
-                        counts,
-                        Some(current_phase),
-                        None,
-                    );
+    let stdout_handle = stdout.map(|out| {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(out).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                // `send` returns Err if the receiver was dropped. That
+                // can happen if the main loop bails on a stall — in
+                // which case quietly stop draining; the subprocess will
+                // be killed shortly anyway.
+                if tx.send(PipeLine::Stdout(line)).await.is_err() {
+                    break;
                 }
-                Ok(None) => break,
-                Err(_) => break,
+            }
+        })
+    });
+
+    let stderr_handle = stderr.map(|err| {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(err).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                if tx.send(PipeLine::Stderr(line)).await.is_err() {
+                    break;
+                }
+            }
+        })
+    });
+
+    // Drop the original sender — once both reader tasks finish and
+    // drop their clones, the channel closes and `recv()` returns None.
+    drop(tx);
+
+    let stall_timeout = resolve_stall_timeout();
+    let mut stalled = false;
+
+    // Drain the merged stream. We dispatch parsing only on Stdout
+    // variants — preserving the existing single-threaded, deterministic
+    // parse semantics. Stderr lines are accumulated into `combined`
+    // so `tail_log` and the crash-snippet logic see them too (matches
+    // the previous post-exit drain semantics).
+    loop {
+        let next = match stall_timeout {
+            Some(t) => match tokio::time::timeout(t, rx.recv()).await {
+                Ok(msg) => msg,
+                Err(_) => {
+                    // No line on either pipe for the watchdog window.
+                    // Force-terminate the subprocess; the resulting
+                    // non-zero exit + reconcile_optimistic_counts_on_crash
+                    // will surface a clear `failed` row to the user.
+                    stalled = true;
+                    let _ = child.start_kill();
+                    break;
+                }
+            },
+            None => rx.recv().await,
+        };
+
+        let Some(msg) = next else {
+            // Channel closed — both reader tasks have finished.
+            break;
+        };
+
+        match msg {
+            PipeLine::Stdout(line) => {
+                combined.push_str(&line);
+                combined.push('\n');
+
+                if let Some(found) = parse_found_header(&line) {
+                    // "📚 Found N markdown files in knowledge/" or
+                    // "📚 Found N markdown files in docs/"
+                    if found.kind == FoundKind::Knowledge {
+                        counts.kg_total = found.count;
+                        current_phase = "knowledge";
+                    } else {
+                        counts.docs_total = found.count;
+                        current_phase = "docs";
+                    }
+                } else if line.contains("🔄 Syncing node:") {
+                    kg_seen = kg_seen.saturating_add(1);
+                    counts.kg_succeeded = kg_seen; // optimistic; reconciled by summary
+                    current_phase = "knowledge";
+                } else if line.contains("🔄 Syncing doc:") {
+                    docs_seen = docs_seen.saturating_add(1);
+                    counts.docs_succeeded = docs_seen; // optimistic; reconciled by summary
+                    current_phase = "docs";
+                } else if let Some((s, f)) = parse_summary_line(&line, "📊 KG:") {
+                    counts.kg_succeeded = s;
+                    counts.kg_failed = f;
+                    kg_summary_seen = true;
+                } else if let Some((s, f)) = parse_summary_line(&line, "📊 Docs:") {
+                    counts.docs_succeeded = s;
+                    counts.docs_failed = f;
+                    docs_summary_seen = true;
+                }
+
+                // Emit progress on syncing lines (the high-frequency
+                // events that drive the pill counter). Header / summary
+                // lines also emit so the totals refresh, but those are
+                // rare.
+                emit_sync(
+                    &app_clone,
+                    &project_id_owned,
+                    sync_status::RUNNING,
+                    counts,
+                    Some(current_phase),
+                    None,
+                );
+            }
+            PipeLine::Stderr(line) => {
+                // Stderr is accumulated for log_tail / crash-snippet
+                // diagnostics but does NOT drive parsing — same as the
+                // pre-fix sequential drain post-exit semantics.
+                combined.push_str(&line);
+                combined.push('\n');
             }
         }
     }
 
-    // Drain stderr after stdout closes so we have a complete picture for
-    // the log_tail without interleaving complexity.
-    if let Some(err) = stderr {
-        let mut reader = BufReader::new(err).lines();
-        while let Ok(Some(line)) = reader.next_line().await {
-            combined.push_str(&line);
-            combined.push('\n');
-        }
+    // Reap reader tasks. After a stall we've already dropped `rx`
+    // (which causes outstanding `send` calls to return Err and the
+    // tasks to break their loops) and called `start_kill`; on the
+    // normal path the tasks have already finished. Either way, we
+    // await them so they don't outlive this function.
+    if let Some(h) = stdout_handle {
+        let _ = h.await;
+    }
+    if let Some(h) = stderr_handle {
+        let _ = h.await;
     }
 
     let exit_status = child.wait().await;
     let tail = tail_log(&combined);
+
+    // If we tripped the stall watchdog, override the natural exit
+    // analysis with an explicit stall error. The subprocess almost
+    // certainly exited with a signal (SIGKILL / TerminateProcess code)
+    // — code() == None on Unix in that case — and the generic
+    // "exited -1" message would be misleading.
+    if stalled {
+        let secs = stall_timeout.map(|d| d.as_secs()).unwrap_or(0);
+        // Stall ⇒ reconcile optimistic counts: we DEFINITIVELY didn't
+        // see the script's summary, by definition (no output at all
+        // for >timeout seconds). Mirror the post-exit reconcile so
+        // banner counts reflect reality rather than mid-flight intent.
+        reconcile_optimistic_counts_on_crash(
+            &mut counts,
+            kg_summary_seen,
+            docs_summary_seen,
+        );
+        return SubprocessOutcome {
+            status: sync_status::FAILED.to_string(),
+            counts,
+            error_message: Some(format!(
+                "kg-sync stalled (no output for {}s); subprocess killed. \
+                 Set KG_SYNC_STALL_TIMEOUT_SECS to override (0 disables the watchdog).",
+                secs,
+            )),
+            log_tail: Some(tail),
+        };
+    }
 
     // Bug-2 v0.2.4 (2026-05-12): counter reconciliation on crash.
     // sync_knowledge_graph.py only prints its `📊 KG: ... succeeded`
@@ -1297,5 +1464,254 @@ mod tests {
         reconcile_optimistic_counts_on_crash(&mut counts, false, false);
         assert_eq!(counts.kg_failed, 58);
         assert_eq!(counts.docs_failed, 0);
+    }
+
+    // ─── Bug-3 v0.2.x (2026-05-12): stall-watchdog timeout resolution ────
+    //
+    // Env vars are process-global; cargo runs unit tests in parallel by
+    // default. These four tests mutate `KG_SYNC_STALL_TIMEOUT_SECS` so
+    // they must serialize on a local mutex. We can't rely on the
+    // single-thread assumption that codegraph.rs's older comment makes;
+    // empirically these tests race when run with the default rayon-
+    // sized pool. Using a poisoned-safe mutex pattern (grab the lock,
+    // ignore poisoning so one assert-failure doesn't cascade across
+    // sibling tests).
+    fn env_test_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+            std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    #[test]
+    fn resolve_stall_timeout_uses_default_when_unset() {
+        let _g = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var_os("KG_SYNC_STALL_TIMEOUT_SECS");
+        unsafe {
+            std::env::remove_var("KG_SYNC_STALL_TIMEOUT_SECS");
+        }
+        let t = resolve_stall_timeout();
+        if let Some(v) = saved {
+            unsafe { std::env::set_var("KG_SYNC_STALL_TIMEOUT_SECS", v); }
+        }
+        assert_eq!(t, Some(std::time::Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn resolve_stall_timeout_honours_env_override() {
+        let _g = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var_os("KG_SYNC_STALL_TIMEOUT_SECS");
+        unsafe {
+            std::env::set_var("KG_SYNC_STALL_TIMEOUT_SECS", "42");
+        }
+        let t = resolve_stall_timeout();
+        match saved {
+            Some(v) => unsafe { std::env::set_var("KG_SYNC_STALL_TIMEOUT_SECS", v) },
+            None => unsafe { std::env::remove_var("KG_SYNC_STALL_TIMEOUT_SECS") },
+        }
+        assert_eq!(t, Some(std::time::Duration::from_secs(42)));
+    }
+
+    #[test]
+    fn resolve_stall_timeout_zero_disables_watchdog() {
+        let _g = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var_os("KG_SYNC_STALL_TIMEOUT_SECS");
+        unsafe {
+            std::env::set_var("KG_SYNC_STALL_TIMEOUT_SECS", "0");
+        }
+        let t = resolve_stall_timeout();
+        match saved {
+            Some(v) => unsafe { std::env::set_var("KG_SYNC_STALL_TIMEOUT_SECS", v) },
+            None => unsafe { std::env::remove_var("KG_SYNC_STALL_TIMEOUT_SECS") },
+        }
+        assert_eq!(t, None);
+    }
+
+    #[test]
+    fn resolve_stall_timeout_falls_back_on_garbage() {
+        let _g = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var_os("KG_SYNC_STALL_TIMEOUT_SECS");
+        unsafe {
+            std::env::set_var("KG_SYNC_STALL_TIMEOUT_SECS", "not-a-number");
+        }
+        let t = resolve_stall_timeout();
+        match saved {
+            Some(v) => unsafe { std::env::set_var("KG_SYNC_STALL_TIMEOUT_SECS", v) },
+            None => unsafe { std::env::remove_var("KG_SYNC_STALL_TIMEOUT_SECS") },
+        }
+        assert_eq!(t, Some(std::time::Duration::from_secs(300)));
+    }
+
+    // ─── Bug-3 v0.2.x (2026-05-12): concurrent-drain deadlock regression ──
+    //
+    // These tests reproduce the deadlock CAUSE (stderr volume larger than
+    // the pipe buffer) and validate that the fix drains both pipes
+    // concurrently. They drive `tokio::process::Command` directly with
+    // a small shell helper rather than exercising `run_subprocess` end-
+    // to-end (which would require a Tauri AppHandle + Db). The drain
+    // logic itself is the load-bearing change — exercising it through
+    // a real OS pipe is the highest-value verification.
+    //
+    // Unix-only because the helpers use `sh -c`. Windows uses `cmd /C`
+    // and `PowerShell`; we trust the same Tokio drain pattern on both
+    // platforms (Tokio normalizes `AsyncBufReadExt` across them and
+    // `tokio::process::Child::start_kill` works on both — see Tokio
+    // docs on `Child::start_kill`).
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concurrent_drain_does_not_deadlock_on_large_stderr() {
+        use std::time::Duration;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::sync::mpsc;
+        use tokio::time::timeout;
+
+        // The Linux default pipe buffer is 16 × 4 KiB = 64 KiB.
+        // Emit 128 KiB to stderr (well over) BEFORE any stdout writes,
+        // so the pre-fix sequential drain would block in
+        // `anon_pipe_write` waiting for the launcher to read stderr —
+        // which never happened because the launcher was waiting on
+        // stdout. The script also emits a few stdout lines AFTER the
+        // stderr burst, which can only come through if stderr was
+        // drained concurrently.
+        //
+        // 2048 × 64 bytes ≈ 128 KiB. `yes` produces a deterministic
+        // line; `head -c` doesn't preserve newlines, so we use
+        // printf in a loop instead.
+        let script = r#"
+            i=0
+            while [ $i -lt 2048 ]; do
+                printf 'STDERR-PADDING-LINE-%04d-XXXXXXXXXXXXXXXXXXXXXXXX\n' "$i" >&2
+                i=$((i+1))
+            done
+            echo "STDOUT-LINE-1"
+            echo "STDOUT-LINE-2"
+            echo "STDOUT-LINE-3"
+        "#;
+
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn sh");
+
+        let stdout = child.stdout.take().expect("stdout pipe");
+        let stderr = child.stderr.take().expect("stderr pipe");
+
+        let (tx, mut rx) = mpsc::channel::<(bool, String)>(1024);
+
+        let tx_out = tx.clone();
+        let h_out = tokio::spawn(async move {
+            let mut r = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = r.next_line().await {
+                if tx_out.send((true, line)).await.is_err() { break; }
+            }
+        });
+        let tx_err = tx.clone();
+        let h_err = tokio::spawn(async move {
+            let mut r = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = r.next_line().await {
+                if tx_err.send((false, line)).await.is_err() { break; }
+            }
+        });
+        drop(tx);
+
+        let mut stdout_count = 0usize;
+        let mut stderr_count = 0usize;
+        // Bound the whole receive loop to a generous wall-clock budget.
+        // If the deadlock regresses, this trips and the test fails
+        // loudly (rather than hanging forever).
+        let drain = async {
+            while let Some((is_stdout, _line)) = rx.recv().await {
+                if is_stdout { stdout_count += 1; } else { stderr_count += 1; }
+            }
+        };
+        timeout(Duration::from_secs(15), drain)
+            .await
+            .expect(
+                "concurrent drain deadlocked: stderr buffer fills before stdout \
+                 drains and one reader never makes progress (regression of \
+                 the Bug-3 2026-05-12 fix)",
+            );
+
+        let _ = h_out.await;
+        let _ = h_err.await;
+        let _ = child.wait().await;
+
+        assert_eq!(
+            stdout_count, 3,
+            "all 3 stdout lines must arrive even though stderr emitted 128 KiB first"
+        );
+        assert_eq!(stderr_count, 2048, "all 2048 stderr lines must be drained");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stall_watchdog_kills_silent_subprocess() {
+        use std::time::Duration;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::sync::mpsc;
+
+        // `sleep 30` emits nothing on either pipe; the watchdog must
+        // detect the stall and kill it. We use a 1-second watchdog to
+        // keep the test fast.
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn sh");
+
+        let stdout = child.stdout.take().expect("stdout pipe");
+        let stderr = child.stderr.take().expect("stderr pipe");
+
+        let (tx, mut rx) = mpsc::channel::<PipeLine>(16);
+        let tx_out = tx.clone();
+        let h_out = tokio::spawn(async move {
+            let mut r = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = r.next_line().await {
+                if tx_out.send(PipeLine::Stdout(line)).await.is_err() { break; }
+            }
+        });
+        let tx_err = tx.clone();
+        let h_err = tokio::spawn(async move {
+            let mut r = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = r.next_line().await {
+                if tx_err.send(PipeLine::Stderr(line)).await.is_err() { break; }
+            }
+        });
+        drop(tx);
+
+        let watchdog = Duration::from_secs(1);
+        let started = std::time::Instant::now();
+        let mut stalled = false;
+        loop {
+            match tokio::time::timeout(watchdog, rx.recv()).await {
+                Ok(Some(_)) => continue,
+                Ok(None) => break, // pipes closed without a stall
+                Err(_) => {
+                    stalled = true;
+                    let _ = child.start_kill();
+                    break;
+                }
+            }
+        }
+        let elapsed = started.elapsed();
+
+        assert!(stalled, "watchdog must trip on a subprocess that emits nothing");
+        // 1 s watchdog + small scheduler slack: must be well under the
+        // 30-second sleep duration we asked the subprocess to run.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "watchdog should trip quickly; took {:?}",
+            elapsed,
+        );
+
+        let _ = h_out.await;
+        let _ = h_err.await;
+        let exit = child.wait().await.expect("wait");
+        assert!(!exit.success(), "killed subprocess must report failure");
     }
 }

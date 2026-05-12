@@ -401,6 +401,28 @@ class ExtractSimilarClassNameTests(unittest.TestCase):
             "my_old.Project_KnowledgeGraph",
         )
 
+    def test_extracts_from_bytes_repr_wrapped_422(self):
+        """The shape Weaviate's Python SDK actually produces in the wild:
+        the response BYTES are wrapped in a `b'...'` repr and embedded in
+        a RuntimeError string. That means the inner JSON's `\\"` escape
+        becomes `\\\\"` in the final str — TWO backslashes before the quote.
+
+        Regression test for v0.2.4 SD15 ship: the single-backslash regex
+        matched the canonical_422 test above but missed the bytes-repr
+        form, so case-conflict recovery silently failed for the real bug
+        it was written to fix. Lesson: tests should match the EXACT
+        error string produced by the runtime, not the simplified form.
+        """
+        body = (
+            "RuntimeError: POST /v1/schema (SD15_Development) → HTTP 422: "
+            "b'{\"error\":[{\"message\":\"class already exists: found similar "
+            "class \\\\\"SD15_development\\\\\"\"}]}\\n'"
+        )
+        self.assertEqual(
+            project_init._extract_similar_class_name(body),
+            "SD15_development",
+        )
+
     def test_returns_none_on_unrelated_message(self):
         self.assertIsNone(
             project_init._extract_similar_class_name(

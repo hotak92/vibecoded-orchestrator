@@ -1344,13 +1344,16 @@ _DEFAULT_RESTART_CONTAINER = "weaviate_claude"
 # a case-insensitive class-name collision. The actual name is captured in
 # the first group.
 #
-# We accept BOTH the unescaped form (`similar class "X"`) and the JSON-
-# escaped form (`similar class \"X\"`) — Weaviate's error body is JSON,
-# so the underlying response bytes contain `\"` around the name. The
-# wrapping quote may also be a single ASCII apostrophe in some legacy
+# We accept multiple escaping variants — Weaviate's error body is JSON,
+# and what we see depends on how it propagates up to Python:
+#   - Plain JSON-decoded:  `similar class "X"`
+#   - Single-escaped:      `similar class \"X\"` (one layer of escape)
+#   - Double-escaped:      `similar class \\"X\\"` (from `str(bytes_repr)`,
+#     which is what RuntimeError(str) of a bytes-wrapped response produces)
+# The wrapping quote may also be a single ASCII apostrophe in some legacy
 # error variants, so the regex is permissive about the delimiter.
 _SIMILAR_CLASS_RE = re.compile(
-    r'similar\s+class\s+\\?["\']([^"\'\\]+)\\?["\']',
+    r'similar\s+class\s+\\{0,2}["\']([^"\'\\]+)\\{0,2}["\']',
     re.IGNORECASE,
 )
 

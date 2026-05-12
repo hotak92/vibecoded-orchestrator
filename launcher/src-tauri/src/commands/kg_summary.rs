@@ -730,12 +730,32 @@ async fn invoke_summariser_once(
     let mut stdout_buf = String::new();
     let mut stderr_buf = String::new();
 
-    if let Some(mut stdout) = child.stdout.take() {
-        let _ = stdout.read_to_string(&mut stdout_buf).await;
-    }
-    if let Some(mut stderr) = child.stderr.take() {
-        let _ = stderr.read_to_string(&mut stderr_buf).await;
-    }
+    // Bug-3 v0.2.x (2026-05-12): drain stdout + stderr concurrently.
+    //
+    // The previous sequential pattern (`stdout.read_to_string().await`
+    // then `stderr.read_to_string().await`) is structurally identical
+    // to the kg_sync.rs deadlock fixed alongside this: if the Python
+    // subprocess fills the ~64 KiB stderr pipe buffer before exiting,
+    // its next stderr write blocks in `anon_pipe_write`, no further
+    // stdout flows, and the launcher's stdout reader hangs forever
+    // because stderr is sequenced after stdout. In practice
+    // generate-kg-summary.py emits very little per file and won't trip
+    // the buffer, but the structural defect is identical and the fix
+    // is cheap. `tokio::join!` drives both reads concurrently so
+    // either side can drain without back-pressuring the other.
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let stdout_fut = async {
+        if let Some(mut s) = stdout_pipe {
+            let _ = s.read_to_string(&mut stdout_buf).await;
+        }
+    };
+    let stderr_fut = async {
+        if let Some(mut s) = stderr_pipe {
+            let _ = s.read_to_string(&mut stderr_buf).await;
+        }
+    };
+    tokio::join!(stdout_fut, stderr_fut);
 
     let exit_status = child.wait().await;
 
