@@ -7,6 +7,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] — 2026-05-12
+
+Single-commit cycle focused on closing the add-project KG-sync gap and
+elevating background-task status from pills to full-width banners.
+
+Originated from the SimRacing_AI revival (2026-05-12): user added a
+project with ~58 pre-existing `knowledge/**/*.md` nodes via the launcher
+GUI, but `SimRacingAI_KnowledgeGraph` stayed empty until a manual
+`.claude/scripts/kg-sync --all`. The launcher add-project flow now
+handles this automatically — same lifecycle pattern as the existing
+code-graph build.
+
+### Added
+
+- **KG auto-sync on add-project** (`commands::kg_sync`,
+  `db::kg_syncs`, migration 011). After bundle install,
+  `create_project_v2` queues a `kg_syncs` row and spawns
+  `.claude/scripts/kg-sync --all` as a background task. Progress
+  streams to the GUI via the `kg-sync-progress` Tauri event;
+  failure surfaces a Retry button. Mirrors
+  `commands::codegraph::spawn_initial_build` line-by-line — same DB
+  shape, same cross-platform script resolution
+  (`kg-sync.ps1` on Windows, `kg-sync` POSIX wrapper elsewhere),
+  same `CREATE_NO_WINDOW` Windows handling, same
+  `eq_ignore_ascii_case` for macOS HFS+ folding.
+
+- **`Re-sync KG` header button** on `/project/[id]`, next to
+  the existing `Re-build code graph`. Mirrors `rebuildCodeGraph`
+  end-to-end (same `.rebuild-btn` style, loading-state guard,
+  toast convention).
+
+- **Resume-after-crash** for both background task types. On
+  launcher boot (in `lib.rs::setup()`), two-phase sweep:
+  Phase 1 marks any `status='running'` rows as `failed` with
+  `"launcher crashed mid-run; click Retry to re-run"` — the
+  banner renders the failed state so the broken lifecycle stays
+  visible (silent re-spawn would mask the crash). Phase 2
+  re-spawns `status='pending'` rows via the same mechanism as
+  `create_project_v2`. Honors the long-standing
+  `list_pending_code_graph_builds` docstring contract that
+  'running' rows are NOT auto-resumed.
+
+### Changed
+
+- **Pills → full-width banners** on `/project/[id]`. New
+  `KgSyncBanner.svelte` + `CodeGraphBuildBanner.svelte` replace
+  the previous pills above the tab-nav, stacked vertically
+  (KG-on-top — newer task). Self-managed visibility:
+  `pending`/`running`/`failed` always visible; `success`/`skipped`
+  auto-hide 30 s after `finished_at_iso`. Inline expand-on-click
+  for failure detail + Retry. Modeled after
+  `BrowserModeBanner` (row decoration) + `.orch-banner` (action-row
+  layout). Slimmed-down passive pills remain on the projects-list
+  page (`/project`) where a banner-per-row would break the grid.
+
+- `list_pending_code_graph_builds` is no longer dead code —
+  `#[allow(dead_code)]` stripped now that
+  `codegraph::resume_pending_builds` wires it from launcher boot.
+
+### Tests
+
+- **+ 7 new tests** (550 total, was 543). New coverage:
+  `mark_orphaned_running_*` helpers (insert 'running' row → marked
+  failed with crash-recovery message, no new task spawned);
+  `list_pending_*` round-trip (insert 'pending' → respawn yields
+  fresh task); kg_syncs row CRUD + state transitions +
+  `log_tail` truncation + project FK cascade.
+
+### Notes for upgraders
+
+- **No migration required for users**. Existing projects keep
+  their `code_graph_builds` rows; new `kg_syncs` table is created
+  on first boot via migration 011 (no data backfill — pre-existing
+  projects can opt-in via the new `Re-sync KG` header button).
+- **First boot after upgrade** may sweep stale `running` rows from
+  a previous launcher session (now marked failed with the recovery
+  message). The boot log line
+  `[vct] resume-sweep: code-graph (running→failed: N, pending respawned: M); kg-sync (...)`
+  reports the counts.
+
+---
+
 ## [0.2.1] — 2026-05-10
 
 26 commits since 0.2.0 (#172–#197). Themes: per-project secret grants
