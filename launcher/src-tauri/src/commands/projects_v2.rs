@@ -696,6 +696,56 @@ async fn run_bootstrap_collections(folder: &Path, project_name: &str) -> Vec<Str
                     folder_str, project_name
                 ));
             }
+            // Bug-1 v0.2.4 (2026-05-12): regenerated[] surfacing. The
+            // Python side detects pre-existing schema-incompatible
+            // collections (case-only name conflict, legacy multi-vector
+            // configs, missing indexNullState) and drops + recreates
+            // them with the current spec. The subsequent kg-sync
+            // re-populates from disk, so the user's data is preserved
+            // — but we want them to know it happened so they understand
+            // why the kg-sync banner is doing more work than usual.
+            if let Some(regens) = v.get("regenerated").and_then(|x| x.as_array()) {
+                let n = regens.len();
+                for (idx, r) in regens.iter().enumerate() {
+                    let coll = r.get("collection")
+                        .and_then(|c| c.as_str()).unwrap_or("?");
+                    let reason_tag = r.get("reason")
+                        .and_then(|c| c.as_str()).unwrap_or("schema-mismatch");
+                    let dropped_name = r.get("dropped_name")
+                        .and_then(|c| c.as_str()).unwrap_or(coll);
+                    let detail = r.get("detail")
+                        .and_then(|c| c.as_str()).unwrap_or("");
+                    let counter = if n > 1 {
+                        format!(" ({}/{})", idx + 1, n)
+                    } else {
+                        String::new()
+                    };
+                    let pretty_reason = match reason_tag {
+                        "case-conflict" => "case-only name conflict",
+                        "legacy-single-vector" => "legacy single-vector schema",
+                        "multi-vector" => "legacy multi-named-vector schema",
+                        "index-null-state" => "missing indexNullState invariant",
+                        _ => "schema mismatch with current spec",
+                    };
+                    let detail_clause = if detail.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" — {}", detail)
+                    };
+                    let dropped_clause = if dropped_name != coll {
+                        format!(" (dropped pre-existing `{}`)", dropped_name)
+                    } else {
+                        String::new()
+                    };
+                    warnings.push(format!(
+                        "Migrated Weaviate schema for `{}`{}{}{}: {}. The \
+                         collection was recreated with the current spec; \
+                         knowledge/**/*.md on disk is the source of truth, \
+                         so the subsequent kg-sync re-populates everything.",
+                        coll, counter, dropped_clause, detail_clause, pretty_reason,
+                    ));
+                }
+            }
             if let Some(errs) = v.get("errors").and_then(|x| x.as_array()) {
                 for e in errs {
                     let coll = e.get("collection")

@@ -7,6 +7,97 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4] — 2026-05-12
+
+Same-day follow-up to 0.2.3. Three bugs surfaced while adding SD15 (a
+project registered by a pre-v0.2.0 orchestrator) via the v0.2.3
+launcher.
+
+### Fixed
+
+- **Schema incompatibility on pre-existing Weaviate collections**
+  (blocking). Two distinct mismatches stopped add-project for users
+  with old orchestrator state:
+    1. **Case-only naming conflict** — old lowercase `<Project>_development`
+       blocked the new capital `<Project>_Development` (Weaviate
+       treats case-only differences as "similar"). POST /v1/schema
+       returned 422 "class already exists: found similar class".
+    2. **Multi-named-vector mismatch** — pre-2026-04 collections
+       carried both `ollama_embed` (legacy snowflake) AND
+       `qwen3_embed` named vectors. Current sync sends a single
+       vector. Insert returned 422 "configured with multiple named
+       vectors, but received a single vector".
+  `vco_lib.project_init.bootstrap_collections` now diffs the actual
+  schema of any pre-existing target against the current spec.
+  Detection is narrow: additive property drift still fixes via the
+  in-place `patch_props` path (Weaviate 1.28.4 allows it); regen is
+  reserved for what genuinely cannot be patched on a running
+  collection (vectorConfig slot changes, indexNullState, legacy
+  no-vectorConfig). When regen IS needed, the collection is dropped
+  + recreated with current spec; the existing post-bootstrap
+  `kg-sync` task re-ingests from `knowledge/**/*.md` (the lossless
+  source of truth). Sub-second per collection on a healthy Weaviate.
+  Surfaced via the existing `warnings[]` channel of
+  `run_bootstrap_collections` — no new banner state (JSON envelope's
+  `regenerated[]` array IS forward-compatible with a real banner if
+  promoted later).
+
+- **Optimistic counter lie on subprocess crash**. `kg_syncs` rows
+  could report `kg_succeeded: N` despite the script crashing on the
+  very first insert — every `🔄 Syncing node:` log line incremented
+  the optimistic counter; the final `📊 KG: X succeeded, Y failed`
+  summary never emitted; the optimistic count persisted as truth.
+  `commands::kg_sync.rs::run_sync_task` now reconciles on crash: if
+  the subprocess exits non-zero AND the canonical summary line was
+  not parsed, the not-yet-summarized stage's counters reset to
+  (succeeded=0, failed=total). Stage-aware: KG-completed-then-Docs-
+  crashed only resets the Docs counters. Investigation finding:
+  `commands::kg_summary.rs` and `commands::codegraph.rs` do NOT have
+  this pattern — kg_summary returns a per-invocation `NodeOutcome`
+  enum (always confirmed outcomes); codegraph parses
+  `files_analyzed` only on `out.status.success()` (failure branch
+  explicitly uses 0). Fix scoped to kg_sync only.
+
+- **AddProject dialog "previous orchestrator content" banner
+  rendered as 3 broken columns**. The pre-existing-content sentence
+  was passed as separate Svelte children into a flex container,
+  splitting "X agents, Y skills will be" / "preserved" / "; hooks…"
+  into adjacent boxes — "preserved" hidden behind the X close
+  button. Fix: `leftoverSummaryText()` TypeScript helper assembles
+  the full sentence as a single string; rendered as plain text in a
+  single block. The inline `<strong>preserved</strong>` emphasis is
+  dropped (reintroducing it would require `@html` plus explicit
+  escaping of every dynamic count — risky for decorative emphasis).
+  Plain sentence reads cleanly and matches the dialog's flat tone.
+
+### Tests
+
+- **+ 23 new tests** (Rust 579, was 575; Python 837, was 818 net of
+  one pre-existing unrelated failure):
+  - 19 Python tests in `test_vco_lib_project_init.py` covering
+    `_schema_incompatible` decision matrix,
+    `_extract_similar_class_name` (both JSON-escaped + unescaped 422
+    bodies), `_drop_and_recreate` happy path + Weaviate-down failure
+    path, and the end-to-end bootstrap regen flow.
+  - 4 Rust tests in `commands::kg_sync` for
+    `reconcile_optimistic_counts_on_crash` (KG-only, Docs-only,
+    both-stages, summary-parsed-no-reset).
+
+### Notes for upgraders
+
+- **Existing projects with stale schemas** will trigger one regen
+  pass on their next bootstrap (via the `Re-sync KG` header button
+  or a manual `python -m vco_lib.project_init
+  bootstrap-collections`). The regen is lossless — Weaviate is
+  re-populated from `knowledge/**/*.md` immediately afterward. No
+  data on disk is touched.
+- The `regenerated[]` JSON envelope field is new in 0.2.4. External
+  tooling parsing the bootstrap-collections JSON output should
+  ignore unknown fields (the existing `actions[]` / `errors[]`
+  channels are unchanged).
+
+---
+
 ## [0.2.3] — 2026-05-12
 
 Same-day follow-up to 0.2.2. Adds the third instance of the

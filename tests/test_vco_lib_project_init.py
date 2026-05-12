@@ -17,6 +17,7 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -297,6 +298,322 @@ class SchemaDefinitionTests(unittest.TestCase):
             install._development_class_definition("FooDev"),
             project_init.development_class_definition("FooDev"),
         )
+
+
+class SchemaIncompatibleTests(unittest.TestCase):
+    """Bug-1 v0.2.4 (2026-05-12): _schema_incompatible — detect pre-existing
+    collections whose schema diverges from the current spec in non-additive
+    ways. Drives the bootstrap-collections regen path."""
+
+    def _at_target(self) -> dict:
+        return project_init.kg_class_definition("ClaudeKnowledgeGraph")
+
+    def test_target_schema_is_compatible(self):
+        actual = self._at_target()
+        incompatible, reason = project_init._schema_incompatible(
+            actual, project_init.kg_class_definition, "ClaudeKnowledgeGraph",
+        )
+        self.assertFalse(incompatible, msg=f"unexpected: {reason}")
+        self.assertEqual(reason, "")
+
+    def test_legacy_single_vector_is_incompatible(self):
+        # ArcAgi-style: no vectorConfig at all.
+        actual = {
+            "class": "ClaudeKnowledgeGraph",
+            "invertedIndexConfig": {"indexNullState": False},
+            "properties": [],
+        }
+        incompatible, reason = project_init._schema_incompatible(
+            actual, project_init.kg_class_definition, "ClaudeKnowledgeGraph",
+        )
+        self.assertTrue(incompatible)
+        self.assertIn("single-vector", reason)
+
+    def test_missing_named_vector_slot_is_incompatible(self):
+        # SD15_KnowledgeGraph case: pre-2026-04 schema has ollama_embed +
+        # qwen3_embed but missing openai_embed slot. New code's
+        # sync_knowledge_graph.py writes a single named vector and Weaviate
+        # rejects mismatched slot sets with HTTP 422.
+        actual = self._at_target()
+        del actual["vectorConfig"]["openai_embed"]
+        incompatible, reason = project_init._schema_incompatible(
+            actual, project_init.kg_class_definition, "ClaudeKnowledgeGraph",
+        )
+        self.assertTrue(incompatible)
+        self.assertIn("named-vector mismatch", reason)
+        self.assertIn("openai_embed", reason)
+
+    def test_extra_named_vector_slot_is_incompatible(self):
+        # User added a slot we don't know about — still incompatible
+        # because sync_knowledge_graph.py only knows the canonical 3.
+        actual = self._at_target()
+        actual["vectorConfig"]["snowflake_legacy"] = {
+            "vectorizer": {"none": {}}, "vectorIndexType": "hnsw",
+        }
+        incompatible, reason = project_init._schema_incompatible(
+            actual, project_init.kg_class_definition, "ClaudeKnowledgeGraph",
+        )
+        self.assertTrue(incompatible)
+        self.assertIn("extra slots", reason)
+
+    def test_missing_index_null_state_is_incompatible(self):
+        actual = self._at_target()
+        actual["invertedIndexConfig"] = {"indexNullState": False}
+        incompatible, reason = project_init._schema_incompatible(
+            actual, project_init.kg_class_definition, "ClaudeKnowledgeGraph",
+        )
+        self.assertTrue(incompatible)
+        self.assertIn("indexNullState", reason)
+
+    def test_additive_property_drift_alone_is_compatible(self):
+        # Properties missing from actual are not a regen trigger — the
+        # smart migrate's patch_props branch fixes those in-place, and
+        # the bootstrap-then-sync path re-ingests anyway. Reserve regen
+        # for the changes that genuinely cannot be patched.
+        actual = self._at_target()
+        actual["properties"] = actual["properties"][:-2]  # drop last 2
+        incompatible, reason = project_init._schema_incompatible(
+            actual, project_init.kg_class_definition, "ClaudeKnowledgeGraph",
+        )
+        self.assertFalse(incompatible, msg=f"unexpected: {reason}")
+
+
+class ExtractSimilarClassNameTests(unittest.TestCase):
+    """Bug-1 v0.2.4 (2026-05-12): _extract_similar_class_name — recover the
+    actual case from Weaviate's `found similar class "X"` HTTP 422 response
+    so we can drop the old-cased collection."""
+
+    def test_extracts_from_canonical_422(self):
+        body = (
+            'POST /v1/schema (SD15_Development) → HTTP 422: '
+            '{"error":[{"message":"class already exists: found similar '
+            'class \\"SD15_development\\""}]}'
+        )
+        self.assertEqual(
+            project_init._extract_similar_class_name(body),
+            "SD15_development",
+        )
+
+    def test_extracts_with_dotted_names(self):
+        body = 'found similar class "my_old.Project_KnowledgeGraph"'
+        self.assertEqual(
+            project_init._extract_similar_class_name(body),
+            "my_old.Project_KnowledgeGraph",
+        )
+
+    def test_returns_none_on_unrelated_message(self):
+        self.assertIsNone(
+            project_init._extract_similar_class_name(
+                "POST /v1/schema (Foo) → HTTP 500: server exploded",
+            ),
+        )
+
+    def test_returns_none_on_empty(self):
+        self.assertIsNone(project_init._extract_similar_class_name(""))
+        self.assertIsNone(project_init._extract_similar_class_name(None))  # type: ignore[arg-type]
+
+
+class RegenReasonTagTests(unittest.TestCase):
+    """Bug-1 v0.2.4 (2026-05-12): _regen_reason_tag — keep the JSON
+    envelope's ``reason`` field finite for UI banner text."""
+
+    def test_case_conflict(self):
+        self.assertEqual(
+            project_init._regen_reason_tag(
+                "case-only name conflict ('foo' → 'Foo')",
+            ),
+            "case-conflict",
+        )
+
+    def test_legacy_single_vector(self):
+        self.assertEqual(
+            project_init._regen_reason_tag(
+                "legacy single-vector schema (no vectorConfig)",
+            ),
+            "legacy-single-vector",
+        )
+
+    def test_multi_vector(self):
+        self.assertEqual(
+            project_init._regen_reason_tag(
+                "named-vector mismatch (missing slots: openai_embed)",
+            ),
+            "multi-vector",
+        )
+
+    def test_index_null_state(self):
+        self.assertEqual(
+            project_init._regen_reason_tag(
+                "indexNullState=True required but not set",
+            ),
+            "index-null-state",
+        )
+
+    def test_unknown_falls_back(self):
+        self.assertEqual(
+            project_init._regen_reason_tag("something arbitrary"),
+            "schema-mismatch",
+        )
+
+
+class BootstrapCollectionsRegenTests(unittest.TestCase):
+    """Bug-1 v0.2.4 (2026-05-12): bootstrap_collections schema-regen and
+    case-conflict paths. Drives the JSON envelope with monkey-patched
+    HTTP helpers so no live Weaviate is required."""
+
+    def setUp(self):
+        # Save originals; per-test patches are applied via mock.patch.
+        self._orig_reachable = project_init._is_weaviate_reachable
+        # Always pretend Weaviate is up so we exercise the iteration loop.
+        project_init._is_weaviate_reachable = lambda url, timeout=5.0: True
+
+    def tearDown(self):
+        project_init._is_weaviate_reachable = self._orig_reachable
+
+    def test_existing_compatible_collection_marked_as_exists(self):
+        target = project_init.kg_class_definition("VideoFrames_KnowledgeGraph")
+        # Fetcher returns the target schema verbatim for every name → all
+        # collections are at-target.
+        with mock.patch.object(project_init, "_fetch_schema", return_value=target):
+            with mock.patch.object(project_init, "_create_class"):
+                with mock.patch.object(project_init, "_delete_class"):
+                    result = project_init.bootstrap_collections("VideoFrames")
+        actions = {a["collection"]: a for a in result["actions"]}
+        # KG, Dev, Shared all "exists" (the same compatible target is returned
+        # for every fetch).
+        self.assertTrue(all(a["action"] == "exists" and a["ok"] for a in actions.values()),
+                        msg=f"actions: {actions}")
+        self.assertEqual(result["regenerated"], [])
+        self.assertEqual(result["errors"], [])
+
+    def test_existing_incompatible_collection_triggers_regen(self):
+        # Legacy single-vector schema → regen.
+        legacy = {
+            "class": "VideoFrames_KnowledgeGraph",
+            "invertedIndexConfig": {"indexNullState": False},
+            "properties": [],
+        }
+        # Fetcher returns the legacy schema only for the KG; the other
+        # two collections come back as None (don't exist) so they
+        # follow the create path.
+        def fetcher(name, weaviate_url=None):
+            if name == "VideoFrames_KnowledgeGraph":
+                return legacy
+            return None
+
+        with mock.patch.object(project_init, "_fetch_schema", side_effect=fetcher):
+            with mock.patch.object(project_init, "_create_class") as create_mock:
+                with mock.patch.object(project_init, "_delete_class") as delete_mock:
+                    with mock.patch.object(
+                        project_init, "_snapshot_collection_for_rebuild",
+                        return_value={"object_count": 42, "sample_uuids": []},
+                    ):
+                        result = project_init.bootstrap_collections("VideoFrames")
+
+        # Regen surfaces in the envelope.
+        regens = {r["collection"]: r for r in result["regenerated"]}
+        self.assertIn("VideoFrames_KnowledgeGraph", regens)
+        self.assertEqual(regens["VideoFrames_KnowledgeGraph"]["reason"],
+                         "legacy-single-vector")
+        # The dropped name matches the canonical (not a case-conflict).
+        self.assertEqual(regens["VideoFrames_KnowledgeGraph"]["dropped_name"],
+                         "VideoFrames_KnowledgeGraph")
+        # delete_class invoked for the regenerated collection.
+        delete_calls = [c.args[0] for c in delete_mock.call_args_list]
+        self.assertIn("VideoFrames_KnowledgeGraph", delete_calls)
+        # create_class invoked at least for the regen + the 2 missing.
+        create_calls = [c.args[0]["class"] for c in create_mock.call_args_list]
+        self.assertIn("VideoFrames_KnowledgeGraph", create_calls)
+        self.assertEqual(result["errors"], [])
+
+    def test_case_only_conflict_drops_old_and_creates_new(self):
+        # SD15 case: existence-probe says None (no exact-name match),
+        # but POST returns 422 "found similar class 'SD15_development'".
+        # Recovery: drop the old-cased class, recreate with the target name.
+        target_kg = project_init.kg_class_definition("SD15_KnowledgeGraph")
+        # Fetcher: KG already exists at-target so it's marked exists; Dev
+        # doesn't exist (None); Shared also exists at-target.
+        def fetcher(name, weaviate_url=None):
+            if name == "SD15_KnowledgeGraph":
+                return target_kg
+            if name == "SD15_Development":
+                return None  # We pretend it's missing, then 422 on POST.
+            # Shared KG exists at-target.
+            if name == project_init._SHARED_KG_NAME:
+                return project_init.kg_class_definition(project_init._SHARED_KG_NAME)
+            return None
+
+        # First call to _create_class for SD15_Development raises a
+        # "similar class" error; the recovery call for SD15_development
+        # then succeeds.
+        create_calls: list[str] = []
+        def create_side_effect(payload, weaviate_url=None):
+            create_calls.append(payload["class"])
+            if payload["class"] == "SD15_Development" and len(create_calls) == 1:
+                raise RuntimeError(
+                    'POST /v1/schema (SD15_Development) → HTTP 422: '
+                    '{"error":[{"message":"class already exists: found '
+                    'similar class \\"SD15_development\\""}]}'
+                )
+            # Subsequent calls (recovery + others) succeed silently.
+            return None
+
+        delete_targets: list[str] = []
+        def delete_side_effect(name, weaviate_url=None):
+            delete_targets.append(name)
+
+        with mock.patch.object(project_init, "_fetch_schema", side_effect=fetcher):
+            with mock.patch.object(project_init, "_create_class",
+                                   side_effect=create_side_effect):
+                with mock.patch.object(project_init, "_delete_class",
+                                       side_effect=delete_side_effect):
+                    with mock.patch.object(
+                        project_init, "_snapshot_collection_for_rebuild",
+                        return_value={"object_count": 0, "sample_uuids": []},
+                    ):
+                        result = project_init.bootstrap_collections("SD15")
+
+        # Regen envelope flags case-conflict with the lowercase old name.
+        regens = {r["collection"]: r for r in result["regenerated"]}
+        self.assertIn("SD15_Development", regens)
+        self.assertEqual(regens["SD15_Development"]["reason"], "case-conflict")
+        self.assertEqual(regens["SD15_Development"]["dropped_name"],
+                         "SD15_development")
+        # The lowercase collection got dropped during recovery.
+        self.assertIn("SD15_development", delete_targets)
+        # create_class was retried with the target name after the drop.
+        # The first attempt failed with 422; the second (post-drop) succeeded.
+        self.assertGreaterEqual(create_calls.count("SD15_Development"), 2)
+        self.assertEqual(result["errors"], [])
+
+    def test_dry_run_reports_would_regenerate_without_mutating(self):
+        legacy = {
+            "class": "VideoFrames_KnowledgeGraph",
+            "invertedIndexConfig": {"indexNullState": False},
+            "properties": [],
+        }
+        def fetcher(name, weaviate_url=None):
+            if name == "VideoFrames_KnowledgeGraph":
+                return legacy
+            return None
+
+        with mock.patch.object(project_init, "_fetch_schema", side_effect=fetcher):
+            with mock.patch.object(project_init, "_create_class") as create_mock:
+                with mock.patch.object(project_init, "_delete_class") as delete_mock:
+                    result = project_init.bootstrap_collections(
+                        "VideoFrames", dry_run=True,
+                    )
+
+        # Dry-run: regen surfaced as would-regenerate; no destructive ops.
+        actions = [a for a in result["actions"]
+                   if a["collection"] == "VideoFrames_KnowledgeGraph"]
+        self.assertEqual(actions[0]["action"], "would-regenerate")
+        # Nothing mutated.
+        delete_mock.assert_not_called()
+        create_mock.assert_not_called()
+        # Regen entry still recorded so the caller can preview.
+        regens = {r["collection"]: r for r in result["regenerated"]}
+        self.assertIn("VideoFrames_KnowledgeGraph", regens)
 
 
 if __name__ == "__main__":

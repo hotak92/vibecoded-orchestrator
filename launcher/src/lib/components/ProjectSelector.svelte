@@ -102,6 +102,35 @@
       .slice(0, 64);
   }
 
+  /**
+   * Bug-3 v0.2.4 (2026-05-12): single-string assembly of the pre-existing
+   * leftovers summary. The previous markup used a chain of `{#if}` blocks
+   * inside a flex container, which Svelte 5 turned into separate flex
+   * items — the sentence rendered as 3 broken columns. Building the
+   * sentence as a single string here means the template only emits a
+   * single text node, regardless of how many of the four flags are set.
+   *
+   * Tone matches the rest of the dialog: noun list joined by `, ` with
+   * a closing `; ` clause about what the install will refresh.
+   */
+  function leftoverSummaryText(lo: ProjectLeftovers): string {
+    const parts: string[] = [];
+    if (lo.agent_count > 0) {
+      parts.push(`${lo.agent_count} agent${lo.agent_count === 1 ? '' : 's'}`);
+    }
+    if (lo.skill_count > 0) {
+      parts.push(`${lo.skill_count} skill${lo.skill_count === 1 ? '' : 's'}`);
+    }
+    if (lo.has_context_state) {
+      parts.push('CONTEXT_STATE.md');
+    }
+    if (lo.has_claude_md) {
+      parts.push('CLAUDE.md');
+    }
+    const list = parts.length === 0 ? 'previous content' : parts.join(', ');
+    return `${list} will be preserved; hooks, scripts and the env block will be re-installed fresh.`;
+  }
+
   async function openCreate() {
     showCreate = true;
     open = false;
@@ -553,12 +582,24 @@
                 from an earlier registration.
               </span>
             </p>
-            <p class="orch-row orch-mid">
-              {#if leftovers.agent_count > 0}{leftovers.agent_count} agent{leftovers.agent_count === 1 ? '' : 's'}{/if}{#if leftovers.agent_count > 0 && (leftovers.skill_count > 0 || leftovers.has_context_state || leftovers.has_claude_md)}, {/if}{#if leftovers.skill_count > 0}{leftovers.skill_count} skill{leftovers.skill_count === 1 ? '' : 's'}{/if}{#if leftovers.skill_count > 0 && (leftovers.has_context_state || leftovers.has_claude_md)}, {/if}{#if leftovers.has_context_state}CONTEXT_STATE.md{/if}{#if leftovers.has_context_state && leftovers.has_claude_md}, {/if}{#if leftovers.has_claude_md}CLAUDE.md{/if} will be <strong>preserved</strong>; hooks, scripts and the env block will be re-installed fresh.
-              {#if leftovers.has_vco_manifest}
-                <br /><span class="form-hint">An install manifest already exists here — proceeding will treat this as an update.</span>
-              {/if}
+            <!--
+              Bug-3 v0.2.4 (2026-05-12): `.orch-row` was display:flex with
+              gap:8px. The previous markup had a dozen `{#if}` blocks as
+              direct children of the flex container, which Svelte 5 expands
+              into separate flex items — each conditional fragment became
+              its own flex column. The screenshot showed the sentence
+              rendered as 3 broken columns. Switched to a plain block
+              `<p class="orch-leftover-text">` (no flex), with the
+              conditional manifest hint kept as a separate paragraph below.
+            -->
+            <p class="orch-leftover-text">
+              {leftoverSummaryText(leftovers)}
             </p>
+            {#if leftovers.has_vco_manifest}
+              <p class="form-hint orch-leftover-hint">
+                An install manifest already exists here — proceeding will treat this as an update.
+              </p>
+            {/if}
           </div>
         {:else if inTauri && createPath.trim() && inspecting}
           <p class="form-hint orch-inspecting">Inspecting folder…</p>
@@ -1048,6 +1089,22 @@
     font-size: 11px; line-height: 1;
   }
   .orch-mid { color: var(--color-mid); }
+  /* Bug-3 v0.2.4 (2026-05-12): block-flow paragraph for the leftovers
+     summary sentence. Distinct from .orch-row (which is display:flex)
+     to keep the dynamic sentence from being split into flex columns
+     when the conditional content had multiple `{#if}` blocks. The
+     icon column from the first `.orch-row` line above gives us our
+     8px indent; we line up under it manually with margin-left. */
+  .orch-leftover-text {
+    margin: 0 0 6px 24px;
+    line-height: 1.5;
+    color: var(--color-mid);
+  }
+  .orch-leftover-hint {
+    display: block;
+    margin: 0 0 0 24px;
+    line-height: 1.4;
+  }
   .orch-warn { color: #f5b342; }
   .orch-inspecting { color: var(--color-mid); margin-top: 8px; }
 
