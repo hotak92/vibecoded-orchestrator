@@ -11,6 +11,7 @@
   import { projects, selectedProject } from '$lib/stores/projects';
   import { projectColor } from '$lib/project-color';
   import CodeGraphBuildPill from '$lib/components/CodeGraphBuildPill.svelte';
+  import KgSyncPill from '$lib/components/KgSyncPill.svelte';
 
   const pState = $derived($projects);
 
@@ -61,6 +62,7 @@
               <span class="name-row">
                 <span class="name">{p.name}</span>
                 <CodeGraphBuildPill projectId={p.id} compact />
+                <KgSyncPill projectId={p.id} compact />
               </span>
               <span class="meta">
                 <span>{p.host}</span>

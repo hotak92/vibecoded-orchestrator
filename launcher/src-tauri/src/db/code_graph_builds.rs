@@ -156,13 +156,15 @@ impl Db {
     ///
     /// Note: 'running' is intentionally NOT included here. A 'running'
     /// row after a launcher crash is a stale ghost (the subprocess is
-    /// dead). Rebuild-on-startup logic should treat such rows as failed.
+    /// dead). Rebuild-on-startup logic should treat such rows as failed
+    /// via `mark_orphaned_running_code_graph_builds_failed` so the GUI
+    /// banner shows the broken lifecycle with a Retry button — silent
+    /// re-spawn would mask the underlying crash.
     ///
-    /// TODO: wire — startup logic should call this on launcher boot to
-    /// detect pending builds and resume them. Not currently called; if
-    /// the launcher crashes mid-build, the row stays 'pending' forever
-    /// and the user has to manually rebuild.
-    #[allow(dead_code)]
+    /// Wired at launcher boot (2026-05-12): see `lib.rs setup()` →
+    /// `codegraph::resume_pending_builds`. Pre-2026-05-12 this function
+    /// had a `#[allow(dead_code)]` and a "TODO: wire" docstring; both
+    /// are gone now that the boot-time resume pass is live.
     pub fn list_pending_code_graph_builds(&self) -> Result<Vec<String>, String> {
         let guard = self.lock();
         let mut stmt = guard
@@ -176,6 +178,57 @@ impl Db {
             .map_err(|e| format!("query list pending: {}", e))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("collect list pending: {}", e))
+    }
+
+    /// Project IDs whose most recent recorded status is 'running'.
+    /// Exposed for unit-test diagnostics — the production sweep path
+    /// (`mark_orphaned_running_code_graph_builds_failed`) is a single
+    /// UPDATE that doesn't need a pre-list. Used by the resume-after-
+    /// crash tests to assert the fixture row selection.
+    ///
+    /// Mirrors the test-only `Db::list_orphaned_running_kg_syncs`.
+    #[cfg(test)]
+    pub fn list_orphaned_running_code_graph_builds(&self) -> Result<Vec<String>, String> {
+        let guard = self.lock();
+        let mut stmt = guard
+            .prepare(
+                "SELECT project_id FROM code_graph_builds
+                 WHERE status = 'running' ORDER BY started_at ASC",
+            )
+            .map_err(|e| format!("prepare list running code_graph_builds: {}", e))?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| format!("query list running code_graph_builds: {}", e))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("collect list running code_graph_builds: {}", e))
+    }
+
+    /// Single-statement update: flip every row currently in status='running'
+    /// to status='failed' with a fixed error message + finished_at=now.
+    /// Used by the launcher-startup sweep. Returns rows-affected.
+    ///
+    /// Mirrors `Db::mark_orphaned_running_kg_syncs_failed`.
+    pub fn mark_orphaned_running_code_graph_builds_failed(
+        &self,
+        error_message: &str,
+    ) -> Result<usize, String> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let guard = self.lock();
+        let affected = guard
+            .execute(
+                "UPDATE code_graph_builds
+                    SET status = 'failed',
+                        finished_at = ?1,
+                        duration_ms = CASE
+                            WHEN started_at IS NOT NULL THEN ?1 - started_at
+                            ELSE NULL
+                        END,
+                        error_message = ?2
+                  WHERE status = 'running'",
+                params![now_ms, error_message],
+            )
+            .map_err(|e| format!("mark orphaned running code_graph_builds failed: {}", e))?;
+        Ok(affected)
     }
 }
 
@@ -355,6 +408,99 @@ mod tests {
         }
         let pending = db.list_pending_code_graph_builds().unwrap();
         assert_eq!(pending.len(), 2);
+    }
+
+    // ─── Resume-after-crash helpers (boot-time sweep, 2026-05-12) ────────
+
+    /// Build a fixture with multiple projects across different build states
+    /// so the list_* + sweep helpers can be exercised. Mirrors the
+    /// `fresh_db_with_mixed_states` fixture in `kg_syncs.rs`.
+    fn fresh_db_with_mixed_build_states() -> (Db, std::collections::HashMap<&'static str, String>) {
+        let db = Db::open_in_memory().expect("in-memory db");
+        let mut ids = std::collections::HashMap::new();
+        for (idx, (label, st)) in [
+            ("pending_a", status::PENDING),
+            ("pending_b", status::PENDING),
+            ("running_a", status::RUNNING),
+            ("success_a", status::SUCCESS),
+            ("failed_a", status::FAILED),
+            ("skipped_a", status::SKIPPED),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let id = uuid::Uuid::new_v4().to_string();
+            let slug = db.generate_unique_slug(label).unwrap();
+            let folder = fixture_path(&format!("cgbuild-mixed-{}", idx));
+            db.insert_project(&id, label, &folder, ProjectHost::Base, &slug)
+                .unwrap();
+            // started_at = idx for deterministic ASC sort.
+            db.upsert_code_graph_build(
+                &id,
+                st,
+                Some(idx as i64),
+                None,
+                None,
+                0,
+                None,
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+            ids.insert(*label, id);
+        }
+        (db, ids)
+    }
+
+    #[test]
+    fn list_orphaned_running_code_graph_builds_returns_only_running() {
+        let (db, ids) = fresh_db_with_mixed_build_states();
+        let running = db.list_orphaned_running_code_graph_builds().unwrap();
+        assert_eq!(running.len(), 1);
+        assert_eq!(&running[0], ids.get("running_a").unwrap());
+    }
+
+    #[test]
+    fn mark_orphaned_running_code_graph_builds_flips_to_failed() {
+        let (db, ids) = fresh_db_with_mixed_build_states();
+        assert_eq!(db.list_orphaned_running_code_graph_builds().unwrap().len(), 1);
+
+        let n = db
+            .mark_orphaned_running_code_graph_builds_failed(
+                "launcher crashed mid-run; click Retry to re-run",
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+
+        let row = db
+            .get_code_graph_build(ids.get("running_a").unwrap())
+            .unwrap()
+            .expect("row still exists");
+        assert_eq!(row.status, "failed");
+        assert!(row
+            .error_message
+            .as_deref()
+            .unwrap_or("")
+            .contains("launcher crashed"));
+        assert!(row.finished_at.is_some());
+
+        // Other states left untouched.
+        let pending = db.get_code_graph_build(ids.get("pending_a").unwrap()).unwrap().unwrap();
+        assert_eq!(pending.status, "pending");
+        let success = db.get_code_graph_build(ids.get("success_a").unwrap()).unwrap().unwrap();
+        assert_eq!(success.status, "success");
+        // No more orphans.
+        assert!(db.list_orphaned_running_code_graph_builds().unwrap().is_empty());
+    }
+
+    #[test]
+    fn mark_orphaned_running_code_graph_builds_no_op_when_empty() {
+        let (db, _) = fresh_db_with_project();
+        let n = db
+            .mark_orphaned_running_code_graph_builds_failed("ignored")
+            .unwrap();
+        assert_eq!(n, 0);
     }
 
     #[test]

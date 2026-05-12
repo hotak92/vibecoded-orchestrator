@@ -715,6 +715,90 @@ pub fn spawn_initial_build(
     });
 }
 
+/// Launcher-boot resume sweep (2026-05-12). Runs in two phases:
+///
+/// 1. **Mark stale-running rows as failed.** A 'running' row left over
+///    from a previous launcher process is a stale ghost — its subprocess
+///    died with the launcher. We don't silently re-spawn (per
+///    `list_pending_code_graph_builds`'s long-standing contract): the
+///    crash should be visible to the user as a failed banner with a
+///    Retry button so they know their work was interrupted.
+///
+/// 2. **Re-spawn pending rows.** A 'pending' row means the previous
+///    `create_project_v2` / `rebuild_code_graph` inserted the row but
+///    crashed before `spawn_initial_build` actually ran. Re-spawn here
+///    so the build picks up on next boot.
+///
+/// Soft-fail everywhere: a DB lookup hiccup or a missing project FK
+/// must NOT block launcher boot. Each failure is logged + continued
+/// past. Returns counts for the boot-log line.
+///
+/// Called from `lib.rs::setup()` after migrations have run.
+pub fn resume_pending_builds(app: &AppHandle) -> (usize, usize) {
+    let db = app.state::<Db>();
+
+    // Phase 1: stale-running sweep.
+    let swept = match db.mark_orphaned_running_code_graph_builds_failed(
+        "launcher crashed mid-run; click Retry to re-run",
+    ) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!(
+                "[vct] warning: code-graph stale-running sweep failed: {}. \
+                 Stale rows (if any) will appear as 'running' indefinitely; \
+                 user can click Re-build code graph to recover.",
+                e
+            );
+            0
+        }
+    };
+
+    // Phase 2: respawn pending. We resolve project name/folder per id
+    // because `spawn_initial_build` needs both. Drop projects that no
+    // longer exist (cascade-delete should already have removed their
+    // build row, but defend against missed-cascades just in case).
+    let pending_ids = match db.list_pending_code_graph_builds() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "[vct] warning: code-graph pending-list lookup failed: {}. \
+                 Queued builds (if any) will not auto-resume this boot.",
+                e
+            );
+            return (swept, 0);
+        }
+    };
+
+    let mut respawned = 0usize;
+    for pid in &pending_ids {
+        let project = match db.get_project(pid) {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                eprintln!(
+                    "[vct] warning: pending code-graph build references missing project {}; skipping",
+                    pid
+                );
+                continue;
+            }
+            Err(e) => {
+                eprintln!(
+                    "[vct] warning: lookup for pending code-graph build {}: {}; skipping",
+                    pid, e
+                );
+                continue;
+            }
+        };
+        spawn_initial_build(
+            app.clone(),
+            project.id,
+            project.name,
+            project.folder_path,
+        );
+        respawned += 1;
+    }
+    (swept, respawned)
+}
+
 /// True when the project still exists in the launcher DB. Used by
 /// `run_build_task` to short-circuit if the user unregistered the
 /// project mid-build (follow-up #11): we want neither an

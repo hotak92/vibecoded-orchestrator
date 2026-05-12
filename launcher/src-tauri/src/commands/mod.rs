@@ -8,6 +8,7 @@ pub mod dashboard;
 pub mod hub_proxy;
 pub mod installer;
 pub mod kg;
+pub mod kg_sync;
 pub mod lifecycle;
 pub mod licensing;
 pub mod modules;
