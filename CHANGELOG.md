@@ -7,6 +7,128 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] — 2026-05-12
+
+Same-day follow-up to 0.2.2. Adds the third instance of the
+"background task with banner + pill + retry + resume" pattern: auto-
+backfill of `<project>/knowledge/.node_formats.json` (the LLM-generated
+summary sidecar consumed by `hybrid_search`'s `summary` tier, score
+0.42–0.55).
+
+Before 0.2.3, that sidecar was only populated lazily by the
+`PostToolUse` hook `kg-summary-generator.{sh,ps1}` when a user edited
+each KG node in a Claude session. A project with 50 pre-existing
+nodes therefore needed 50 Claude sessions to fully populate. With
+0.2.3 the launcher walks `knowledge/**/*.md` once on add-project and
+shells out to `templates/scripts/generate-kg-summary.py` for each
+file, in the background.
+
+### Added
+
+- **KG-summary auto-backfill on add-project**
+  (`commands::kg_summary`, `db::kg_summaries`, migration 012). After
+  bundle install, `create_project_v2` queues a `kg_summaries` row and
+  spawns the summariser as a background task (in parallel with the
+  kg-sync task added in 0.2.2 — not chained; the summariser reads the
+  `.md` file body directly and only needs Weaviate for the optional
+  per-chunk path on multi-chunk nodes). Progress streams to the GUI
+  via the `kg-summary-progress` Tauri event with live `nodes_total`,
+  `nodes_succeeded`, `nodes_unchanged`, `nodes_failed`,
+  `nodes_skipped`, and `backend` counters. Mirrors
+  `commands::kg_sync::spawn_initial_sync` line-by-line — same DB
+  shape, same `current_dir(std::env::temp_dir())` discipline, same
+  `CREATE_NO_WINDOW` on Windows, same race-checks for
+  user-unregister-mid-run.
+
+- **Three-tier backend fallback in `generate-kg-summary.py`**:
+  `claude` CLI on PATH → Ollama at `KG_SUMMARY_OLLAMA_URL` (default
+  `http://localhost:11435`, model `KG_SUMMARY_OLLAMA_MODEL`,
+  default `qwen3.5:9b`) → `ANTHROPIC_API_KEY` direct → silent skip
+  (`exit 0` with `KG-summary: no backend available`). Forced backend
+  via `KG_SUMMARY_BACKEND=cli|ollama|api|skip`. Per-call timeout via
+  `KG_SUMMARY_TIMEOUT` (default 180 s). The launcher detects the
+  no-backend marker on the first node, hard-stops the walk, and
+  transitions the row to `skipped` with an actionable hint
+  (install `claude` CLI / start Ollama / set `ANTHROPIC_API_KEY`) —
+  no point invoking the same script for the remaining N nodes.
+
+- **`Re-build KG summaries` header button** on `/project/[id]`,
+  third in the row next to `Re-build code graph` (0.2.x) and
+  `Re-sync KG` (0.2.2). Mirrors `resyncKg` end-to-end (same
+  `.rebuild-btn` style, `rebuildingSummaries` loading-state guard,
+  `retry_kg_summary` Tauri command, toast convention). The
+  summariser content-hashes each node, so repeated clicks on an
+  already-summarised project are a cheap no-op (logged as
+  `nodes_unchanged`).
+
+- **Third banner on `/project/[id]`** (`KgSummaryBanner.svelte`),
+  mounted on top of the existing pair (`KgSummaryBanner` →
+  `KgSyncBanner` → `CodeGraphBuildBanner`, top-down). Newest task
+  on top, matching the add-project spawn order (codegraph → kg-sync
+  → kg-summary). Self-managed visibility: `pending`/`running`/
+  `failed` always visible; `success`/`skipped` auto-hide 30 s after
+  `finished_at_iso`. The `skipped` state surfaces the
+  `Show details` button so a user without a summariser backend
+  sees the install hint inline.
+
+- **Third pill on `/project`** (`KgSummaryPill.svelte`), mounted
+  next to `CodeGraphBuildPill` and `KgSyncPill` in each project's
+  list row. Passive read-only — the project page is the action
+  surface.
+
+- **Resume-after-crash extended to a third task type.** On launcher
+  boot (in `lib.rs::setup()`), the existing two-phase sweep
+  (introduced 0.2.2) now also runs `kg_summary::resume_pending_summaries`:
+  phase 1 marks any `kg_summaries.status='running'` rows as `failed`
+  with `"launcher crashed mid-run; click Retry to re-run"`; phase 2
+  re-spawns `status='pending'` rows. The boot-log line now reports
+  three task types:
+  `[vct] resume-sweep: code-graph (...); kg-sync (...); kg-summary (running→failed: N, pending respawned: M)`.
+
+- **Marker-string drift guards.** `commands::kg_summary` ships two
+  unit tests (`no_backend_marker_string_matches_script_log_line`
+  and `unchanged_marker_string_matches_script_log_line`) that hold
+  a literal snippet of the canonical log lines from
+  `generate-kg-summary.py` and assert that the `NO_BACKEND_MARKER`
+  and `UNCHANGED_MARKER` constants still substring-match. A future
+  rename of the script's log message will fail the test loudly
+  rather than silently mis-classifying every run as `succeeded`.
+
+### Changed
+
+- **Boot-log resume-sweep line now reports all three task types**
+  (code-graph + kg-sync + kg-summary). 0.2.2 reported two.
+
+### Tests
+
+- **+25 new tests** (575 total, was 550 after 0.2.2). New coverage:
+  `db::kg_summaries` (9 — row CRUD, state transitions,
+  invalid-status, `log_tail` truncation, FK cascade, resume sweep);
+  `commands::kg_summary` (16 — enumerate-walk × 4,
+  `resolve_summary_script` × 2, `resolve_venv_python` × 3,
+  `parse_backend_from_stdout` × 2, `tail_log` × 2, `append_log` × 1,
+  marker-string drift × 2). `cargo test --lib`: 575 passed, 0 failed,
+  1 ignored. `cargo check`: clean. `svelte-check`: 0 errors.
+
+### Notes for upgraders
+
+- **No migration required for users.** Migration 012 creates
+  `kg_summaries` on first boot; pre-0.2.3 projects can opt-in via
+  the new `Re-build KG summaries` header button. The summariser
+  content-hashes nodes, so existing projects with the sidecar
+  partially populated by the on-edit hook will re-run as
+  `unchanged` (cheap no-op) for any node whose body hasn't changed.
+- **No backend?** Users without `claude` CLI installed and without
+  Ollama running on `KG_SUMMARY_OLLAMA_URL` will see the third
+  banner go yellow `skipped` after the first node's subprocess
+  detects "no backend available". The `Show details` toggle shows
+  the install hint. Summaries also still backfill incrementally on
+  each subsequent `knowledge/**/*.md` edit via the PostToolUse hook
+  `kg-summary-generator.{sh,ps1}` — the 0.2.3 work is purely a
+  startup optimisation; it doesn't change the lazy path.
+- **First boot after upgrade** may sweep stale `running` rows
+  across all three task types from a previous launcher session.
+
 ## [0.2.2] — 2026-05-12
 
 Single-commit cycle focused on closing the add-project KG-sync gap and
@@ -479,7 +601,10 @@ follow Keep a Changelog discipline more strictly per release.
 - Default-OFF telemetry (explicit opt-in required; default `.env` writes `VIBECODED_TELEMETRY=false`).
 - Public alias for license validation (`https://api.vibecodedtools.it/validate-tier`); internal Supabase URLs are not committed to public source.
 
-[Unreleased]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.2...v0.2.3
+[0.2.2]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.1...v0.2.2
+[0.2.1]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.1.6...v0.2.0
 [0.1.6]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.1.5...v0.1.6
 [0.1.0]: https://github.com/hotak92/vibecoded-orchestrator/releases/tag/v0.1.0

@@ -89,6 +89,46 @@ Claude generates response, edits files
   -> Updates session state
 ```
 
+### What runs when you add a project
+
+When you click **Add project** in the launcher GUI, `create_project_v2`
+returns the moment bundle install finishes — but three background tasks
+then fan out in parallel so a project with pre-existing
+`knowledge/**/*.md`, `docs/**/*.md`, or source code lands fully indexed
+without manual CLI invocations:
+
+1. **Code graph build** — `code-graph-analyze` over the project root,
+   populating `CodeModule` / `CodeClass` / `CodeFunction` / `CodeAPI` /
+   `CodeInteraction` collections.
+2. **KG sync** — `.claude/scripts/kg-sync --all` walks
+   `knowledge/**/*.md` and `docs/**/*.md` and embeds them into the
+   per-project Weaviate collections (`<Project>_KnowledgeGraph` and
+   `<Project>_Development`). Added in 0.2.2.
+3. **KG summaries** — `.claude/scripts/generate-kg-summary.py` over
+   each `knowledge/**/*.md` file, producing the
+   `knowledge/.node_formats.json` sidecar consumed by
+   `hybrid_search`'s `summary` tier. Three-tier backend fallback:
+   `claude` CLI on PATH → Ollama at `KG_SUMMARY_OLLAMA_URL` (default
+   `http://localhost:11435`, model `qwen3.5:9b`) →
+   `ANTHROPIC_API_KEY` direct → silent skip. Added in 0.2.3.
+
+The project page shows three stacked status banners (KG summaries,
+KG sync, code graph build) under the project header — `pending` /
+`running` / `failed` always visible, `success` / `skipped` auto-hide
+30 s after completion. The project header carries three retry
+buttons (`Re-build code graph`, `Re-sync KG`, `Re-build KG summaries`).
+The launcher's boot sweep marks any `running` rows left behind by a
+prior crash as `failed` with `"launcher crashed mid-run; click Retry
+to re-run"`, and re-spawns any `pending` rows. The summariser
+content-hashes each node, so retries on an already-summarised
+project are a cheap no-op.
+
+If neither `claude` CLI nor Ollama is available when the KG-summary
+task runs, the third banner goes yellow `skipped` after the first
+node and shows the install hint under `Show details`; summaries then
+backfill incrementally as you edit nodes in Claude Code sessions via
+the `PostToolUse` hook `kg-summary-generator.{sh,ps1}`.
+
 ## Where this fits
 
 VCO sits on top of Claude Code rather than replacing your AI assistant. The comparison below is for buyers choosing how to spend their AI-coding attention — VCO + Claude Code, vs. an all-in-one closed product, vs. another open-source extension.

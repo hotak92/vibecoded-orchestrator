@@ -195,6 +195,36 @@ It also queues a background code graph analysis of the target project.
 
 Alternatively, use the VCT Launcher GUI: it runs the same configuration wizard visually and writes all three config files (`.claude/settings.json`, `.vscode/settings.json`, `.claude/env`) in lockstep so the CLI, VS Code extension, and Claude Desktop app all see the same MCP environment.
 
+### Background tasks the launcher fans out on Add project
+
+The `create_project_v2` Tauri command returns the moment bundle install finishes; three background tasks then run in parallel so a project with pre-existing content lands fully indexed without you running CLI commands by hand:
+
+1. **Code graph build** (`commands::codegraph::spawn_initial_build`) — runs `code-graph-analyze` over the project root.
+2. **KG sync** (`commands::kg_sync::spawn_initial_sync`, added 0.2.2) — runs `.claude/scripts/kg-sync --all` against `knowledge/**/*.md` and `docs/**/*.md`. Idempotent at the Weaviate layer (UUIDs derived from node title); safe to re-run.
+3. **KG summaries** (`commands::kg_summary::spawn_initial_summary`, added 0.2.3) — runs `.claude/scripts/generate-kg-summary.py` per file. Picks the first available backend: `claude` CLI on PATH → Ollama at `KG_SUMMARY_OLLAMA_URL` (default `http://localhost:11435`, model `KG_SUMMARY_OLLAMA_MODEL`, default `qwen3.5:9b`) → `ANTHROPIC_API_KEY` direct → silent skip. Content-hashes each node, so re-runs are a cheap no-op for unchanged nodes.
+
+Each task surfaces its progress in the GUI:
+
+- A **full-width banner** under the project header for the active project. The three banners stack `KgSummaryBanner` → `KgSyncBanner` → `CodeGraphBuildBanner` (newest task on top, matching the add-project spawn order). Banners stay visible in `pending` / `running` / `failed` states; `success` / `skipped` auto-hide 30 s after `finished_at_iso`. Failure detail is inline behind a `Show details` toggle, with a `Retry` button.
+- A **compact pill** in the project list row (`/project`). Read-only mirror — the project page is where you click Retry.
+- A **header retry button** on the project page: `Re-build code graph`, `Re-sync KG`, `Re-build KG summaries`. Each calls the same Tauri command the banner's Retry button uses (`rebuild_code_graph`, `retry_kg_sync`, `retry_kg_summary`).
+
+The three lifecycles share a `pending → running → (success | failed | skipped)` state machine, persisted to the per-task SQLite table in `~/.vct/launcher.db` (`code_graph_builds`, `kg_syncs`, `kg_summaries`).
+
+#### Crash recovery
+
+If the launcher exits while a task is still running, the row stays in `running` until the next launcher boot, when `lib.rs::setup()` runs a two-phase sweep across all three task types: phase 1 marks any `running` row as `failed` with `"launcher crashed mid-run; click Retry to re-run"` (silent re-spawn would mask the crash, so the broken lifecycle stays visible), and phase 2 re-spawns any `pending` rows. The boot log line reports the counts:
+
+```
+[vct] resume-sweep: code-graph (running→failed: N, pending respawned: M); \
+                    kg-sync (running→failed: N, pending respawned: M); \
+                    kg-summary (running→failed: N, pending respawned: M)
+```
+
+#### When the summariser has no backend
+
+If none of `claude` CLI / Ollama / `ANTHROPIC_API_KEY` is reachable when the KG-summary task runs, the launcher detects the script's `KG-summary: no backend available` log line on the first node and hard-stops the walk; the banner goes yellow `skipped` with the install hint under `Show details`. Summaries then backfill incrementally as you edit nodes in Claude Code sessions — the `PostToolUse` hook `kg-summary-generator.{sh,ps1}` runs the same script per file.
+
 ## What runs during a session
 
 Once a project is configured, here is what fires on normal use:

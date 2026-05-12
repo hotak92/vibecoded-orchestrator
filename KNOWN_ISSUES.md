@@ -55,6 +55,26 @@ flagging for early adopters and the next iteration.
       its first browser-launch instead. The pre-cache is non-fatal — if `npx` is
       missing or the download fails, the install logs a warn event and continues.
 
+- [ ] **KG summaries may be empty on add-project if no summariser backend is
+      reachable** (0.2.3, `commands::kg_summary`). The KG-summary background task
+      that runs on `create_project_v2` walks `knowledge/**/*.md` and shells out
+      to `templates/scripts/generate-kg-summary.py`. That script picks the first
+      available backend in order — `claude` CLI on PATH → Ollama at
+      `KG_SUMMARY_OLLAMA_URL` (default `http://localhost:11435`, model
+      `KG_SUMMARY_OLLAMA_MODEL`, default `qwen3.5:9b`) → `ANTHROPIC_API_KEY`
+      direct. If none of the three is reachable, the script logs
+      `KG-summary: no backend available` and exits 0; the launcher detects this
+      marker on the first node, hard-stops the walk, and transitions the
+      `kg_summaries` row to `skipped` with the install hint surfaced under the
+      banner's `Show details`. The `.node_formats.json` sidecar then backfills
+      lazily as the user edits each node in a Claude session (the PostToolUse
+      hook `kg-summary-generator.{sh,ps1}` runs the same script per file).
+      Workaround: install one of the three backends (Ollama is the default for
+      VCO installs; if the install completed normally it should be reachable),
+      then click `Re-build KG summaries` on the project page. Not a launcher
+      bug — the lazy path always existed; the 0.2.3 work is the startup
+      optimisation, not a hard dependency.
+
 ## Pending v0.2.x
 
 - [ ] **Apple Developer enrollment / notarization pending** — already in this list under Install/first-run;

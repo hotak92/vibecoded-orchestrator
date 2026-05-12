@@ -52,6 +52,8 @@ If you installed via the **VCT Launcher** desktop app, almost everything is alre
 - Hooks are wired into `.claude/settings.json`
 - The launcher knows about this project and tracks its agents/skills/permissions matrix
 
+**Expect three background tasks to start running** the moment the launcher registers a project that has pre-existing content under `knowledge/`, `docs/`, or any source-code directories: a code graph build, a KG sync (knowledge/ + docs/ → Weaviate), and a KG-summary backfill (knowledge/ → `.node_formats.json` sidecar). Each surfaces a status banner under the project header in the launcher GUI; `success` / `skipped` banners auto-hide 30 s after they complete. Failures expose `Show details` + `Retry`. See [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md#background-tasks-the-launcher-fans-out-on-add-project) for the full lifecycle.
+
 **What you (the human) should do**: just start coding. Claude Code sessions in this folder will pick up the hooks and MCP servers automatically.
 
 **What the AI assistant reading this should do**: nothing special. The orchestrator is ready. Read [`CLAUDE.md`](CLAUDE.md) for the operating manual.
