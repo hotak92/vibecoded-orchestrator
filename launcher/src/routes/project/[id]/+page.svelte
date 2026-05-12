@@ -13,6 +13,7 @@
   import KgCodegraphTab from '$lib/project-state/KgCodegraphTab.svelte';
   import CodeGraphBuildBanner from '$lib/components/CodeGraphBuildBanner.svelte';
   import KgSyncBanner from '$lib/components/KgSyncBanner.svelte';
+  import KgSummaryBanner from '$lib/components/KgSummaryBanner.svelte';
   import type { ProjectView } from '$lib/types/launcher';
 
   let projectId = $derived($page.params.id);
@@ -34,6 +35,7 @@
   let updating = $state(false);
   let rebuilding = $state(false);
   let resyncingKg = $state(false);
+  let rebuildingSummaries = $state(false);
 
   async function rebuildCodeGraph() {
     if (!project) return;
@@ -62,6 +64,26 @@
       toast.error(e);
     } finally {
       resyncingKg = false;
+    }
+  }
+
+  // v0.2.3 (2026-05-12): third header button alongside "Re-build code
+  // graph" / "Re-sync KG". Mirrors `resyncKg` end-to-end — same
+  // `.rebuild-btn` style, same loading state, same `retry_kg_summary`
+  // Tauri command the banner's Retry button calls. Triggers a full
+  // re-walk of `knowledge/**/*.md` through `generate-kg-summary.py`
+  // (which content-hashes nodes internally, so unchanged nodes are a
+  // cheap no-op even on repeated clicks).
+  async function rebuildKgSummaries() {
+    if (!project) return;
+    rebuildingSummaries = true;
+    try {
+      await invoke('retry_kg_summary', { projectId: project.id });
+      toast.success('KG summaries rebuild started');
+    } catch (e) {
+      toast.error(e);
+    } finally {
+      rebuildingSummaries = false;
     }
   }
 
@@ -151,20 +173,31 @@
       >
         {resyncingKg ? 'Starting…' : 'Re-sync KG'}
       </button>
+      <button
+        class="rebuild-btn"
+        onclick={rebuildKgSummaries}
+        disabled={rebuildingSummaries}
+        title="Re-run generate-kg-summary.py over knowledge/**/*.md for this project (regenerates .node_formats.json summaries)"
+      >
+        {rebuildingSummaries ? 'Starting…' : 'Re-build KG summaries'}
+      </button>
     {/if}
   </header>
 
   {#if project}
-    <!-- Background-task banners (KG sync 2026-05-12; code-graph Gap 2).
-         Stacked vertically below the header. Each banner self-manages
-         its visibility: idle/old-terminal states unmount themselves so
-         this region collapses to zero height when nothing's happening.
-         Order: KG sync on top (Decision 2026-05-12 — "most recently
-         started"; add-project spawns code-graph FIRST then KG-sync, so
-         KG-sync is the newer task and renders above the older one).
-         For the launcher-boot resume path the relative ordering is
-         arbitrary since both are re-spawned in the same setup() pass;
-         keeping the spawn-order-on-add-project sort is the cheap rule. -->
+    <!-- Background-task banners (KG summary v0.2.3; KG sync 2026-05-12;
+         code-graph Gap 2). Stacked vertically below the header. Each
+         banner self-manages its visibility: idle/old-terminal states
+         unmount themselves so this region collapses to zero height when
+         nothing's happening. Order: KG summary on top — newest task,
+         per the v0.2.2 sort rule ("most recently started"; add-project
+         spawns code-graph FIRST, then KG-sync, then KG-summary, so the
+         summary banner is the newest one and renders above the older
+         two). For the launcher-boot resume path the relative ordering
+         is arbitrary since all three are re-spawned in the same setup()
+         pass; keeping the spawn-order-on-add-project sort is the cheap
+         rule. -->
+    <KgSummaryBanner projectId={project.id} />
     <KgSyncBanner projectId={project.id} />
     <CodeGraphBuildBanner projectId={project.id} />
   {/if}

@@ -73,6 +73,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "kg_syncs: per-project initial KG / docs sync status (KG auto-sync on add-project, 2026-05-12)",
         sql: include_str!("migrations/011_kg_syncs.sql"),
     },
+    Migration {
+        version: 12,
+        description: "kg_summaries: per-project initial KG-summary backfill status (auto-backfill on add-project, v0.2.3 / 2026-05-12)",
+        sql: include_str!("migrations/012_kg_summaries.sql"),
+    },
 ];
 
 /// Apply every migration whose version is greater than the current max applied.

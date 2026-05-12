@@ -31,6 +31,7 @@ pub mod slug;
 pub mod change_log;
 pub mod code_graph_builds;
 pub mod kg_syncs;
+pub mod kg_summaries;
 pub mod secret_active;
 pub mod secret_grants;
 pub mod app_state;
