@@ -38,14 +38,42 @@ OLLAMA_DEFAULT_MODEL = os.getenv("KG_SUMMARY_OLLAMA_MODEL", "qwen3.5:9b")
 OLLAMA_URL = os.getenv("KG_SUMMARY_OLLAMA_URL", "http://localhost:11435").rstrip("/")
 TIMEOUT = int(os.getenv("KG_SUMMARY_TIMEOUT", "180"))
 
-# Project root: defaults to the script's parent.parent.parent (Claude orchestrator),
-# but overridable via KG_PROJECT_ROOT env var so this script can summarize KG nodes
-# in *other* repos (e.g. bundled vibecoded-orchestrator/knowledge/).
+# Project root (where knowledge/ + .claude/ live): defaults to the script's
+# parent.parent.parent (Claude orchestrator), but overridable via
+# KG_PROJECT_ROOT env var so this script can summarize KG nodes in *other*
+# repos (e.g. per-project VCO-installed projects).
 _DEFAULT_ROOT = Path(__file__).resolve().parent.parent.parent
 CLAUDE_PROJECT = Path(os.getenv("KG_PROJECT_ROOT", str(_DEFAULT_ROOT))).resolve()
 FORMATS_PATH = CLAUDE_PROJECT / "knowledge" / ".node_formats.json"
 KNOWLEDGE_DIR = CLAUDE_PROJECT / "knowledge"
 LOG_PATH = CLAUDE_PROJECT / ".claude" / "logs" / "kg-summary-generator.log"
+
+
+def _resolve_orchestrator_root() -> Path:
+    """Find the orchestrator clone root (which contains claude_mcp_servers/).
+
+    PR-2 portability contract: per-project installs of this script need to
+    locate the orchestrator's Python deps. Resolution chain:
+      1. VCT_ORCHESTRATOR_ROOT env var (set by the launcher when invoking us
+         from create_project_v2 / retry_kg_summary).
+      2. CLAUDE_PROJECT itself if it contains claude_mcp_servers/ (i.e. the
+         script is running INSIDE the orchestrator clone).
+      3. Script's parent.parent.parent — historical fallback for the
+         orchestrator's own .claude/scripts/.
+    Returns the resolved path; the import call site verifies the
+    claude_mcp_servers subdir actually exists before using it.
+    """
+    env = os.getenv("VCT_ORCHESTRATOR_ROOT", "").strip()
+    if env:
+        candidate = Path(env).resolve()
+        if (candidate / "claude_mcp_servers").is_dir():
+            return candidate
+    if (CLAUDE_PROJECT / "claude_mcp_servers").is_dir():
+        return CLAUDE_PROJECT
+    return _DEFAULT_ROOT
+
+
+ORCHESTRATOR_ROOT = _resolve_orchestrator_root()
 
 SYSTEM_PROMPT = (
     "You are a technical documentation summarizer. "
@@ -354,7 +382,10 @@ Content:
 
 def get_chunks_from_weaviate(title: str) -> list[tuple[int, str]]:
     try:
-        sys.path.insert(0, str(CLAUDE_PROJECT / "claude_mcp_servers"))
+        # ORCHESTRATOR_ROOT honors VCT_ORCHESTRATOR_ROOT (PR-2 portability)
+        # so per-project installs find claude_mcp_servers/ in the orchestrator
+        # clone, not in the project being summarized.
+        sys.path.insert(0, str(ORCHESTRATOR_ROOT / "claude_mcp_servers"))
         import weaviate
         from weaviate.classes.query import Filter
         from urllib.parse import urlparse
