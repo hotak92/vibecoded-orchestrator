@@ -946,15 +946,31 @@ class BootstrapCollectionsTests(unittest.TestCase):
         self.assertIn("VibeCodedTools_KnowledgeGraph", created)
 
     def test_idempotent_when_collections_exist(self):
+        # Bug-1 v0.2.4 (2026-05-12): the existence check now also probes
+        # for schema-compatibility — a pre-existing collection with a
+        # divergent shape (legacy single-vector, missing slots, missing
+        # indexNullState) triggers a regen. To keep this test focused on
+        # the idempotency invariant ("if a compatible collection already
+        # exists, don't touch it"), the stub now returns an at-target
+        # schema. The previous `{"class": "stub"}` stub is no longer
+        # realistic — that shape would correctly trigger a regen.
+        def at_target(name, weaviate_url=None):
+            # Return the canonical target schema for whichever class is
+            # being probed. Same schema works for both KG and Dev for the
+            # purposes of compat (Dev is a subset).
+            return project_init.kg_class_definition(name)
+
         with mock.patch.object(project_init, "_is_weaviate_reachable", return_value=True), \
-             mock.patch.object(project_init, "_fetch_schema", return_value={"class": "stub"}), \
+             mock.patch.object(project_init, "_fetch_schema", side_effect=at_target), \
              mock.patch.object(project_init, "_create_class") as create:
             result = project_init.bootstrap_collections(
                 "VideoFrames", project_folder=self.proj,
             )
-        # Existence check returned non-None for each → no creates.
+        # Existence check returned a compatible schema for each → no creates.
         create.assert_not_called()
         self.assertEqual(result["errors"], [])
+        # No regen on compatible schema.
+        self.assertEqual(result.get("regenerated", []), [])
         # All three actions are "exists".
         for action in result["actions"]:
             self.assertEqual(action["action"], "exists")

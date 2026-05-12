@@ -542,6 +542,16 @@ async fn run_subprocess(
     let mut current_phase = "knowledge";
     let mut kg_seen = 0u32;
     let mut docs_seen = 0u32;
+    // Bug-2 v0.2.4 (2026-05-12): track whether the script printed its
+    // terminal `📊 KG: ... succeeded, ... failed` / `📊 Docs: ... succeeded,
+    // ... failed` summaries. If the subprocess crashes mid-run, the
+    // optimistic per-line counter (incremented on each `🔄 Syncing
+    // node:` log line) is a LIE — the lines log that we're about to try,
+    // not that we succeeded. Without a final summary, we can't trust
+    // them. Force counts to (succeeded=0, failed=total) on crash so
+    // the banner reflects reality.
+    let mut kg_summary_seen = false;
+    let mut docs_summary_seen = false;
 
     let app_clone = app.clone();
     let project_id_owned = project_id.to_string();
@@ -578,9 +588,11 @@ async fn run_subprocess(
                     } else if let Some((s, f)) = parse_summary_line(&line, "📊 KG:") {
                         counts.kg_succeeded = s;
                         counts.kg_failed = f;
+                        kg_summary_seen = true;
                     } else if let Some((s, f)) = parse_summary_line(&line, "📊 Docs:") {
                         counts.docs_succeeded = s;
                         counts.docs_failed = f;
+                        docs_summary_seen = true;
                     }
 
                     // Emit progress on syncing lines (the high-frequency
@@ -615,6 +627,25 @@ async fn run_subprocess(
     let exit_status = child.wait().await;
     let tail = tail_log(&combined);
 
+    // Bug-2 v0.2.4 (2026-05-12): counter reconciliation on crash.
+    // sync_knowledge_graph.py only prints its `📊 KG: ... succeeded`
+    // summary line when it completes normally. The per-`🔄 Syncing node:`
+    // line increments are OPTIMISTIC — they record the script's intent
+    // to attempt the node, not the actual write outcome. If the script
+    // exits non-zero AND we never saw the summary, treat the optimistic
+    // counts as a lie and reset succeeded=0, failed=total. Stage-aware:
+    // we apply the reset independently for KG and Docs so a crash in
+    // the Docs phase doesn't clobber a real `📊 KG:` summary the script
+    // managed to print before dying.
+    let crashed = matches!(exit_status, Ok(ref s) if !s.success()) || exit_status.is_err();
+    if crashed {
+        reconcile_optimistic_counts_on_crash(
+            &mut counts,
+            kg_summary_seen,
+            docs_summary_seen,
+        );
+    }
+
     match exit_status {
         Ok(s) if s.success() => SubprocessOutcome {
             status: sync_status::SUCCESS.to_string(),
@@ -637,12 +668,26 @@ async fn run_subprocess(
                 .chars()
                 .take(200)
                 .collect::<String>();
+            // Bug-2 v0.2.4: when the summary was never printed, prepend
+            // a hint so the user sees that the high `kg_failed` count
+            // reflects the script crashing before completing rather
+            // than per-node Weaviate failures.
+            let crash_hint = if !kg_summary_seen && !docs_summary_seen {
+                "crashed before completing — counts reset; "
+            } else if !kg_summary_seen {
+                "crashed before completing KG phase — KG counts reset; "
+            } else if !docs_summary_seen {
+                "crashed before completing Docs phase — Docs counts reset; "
+            } else {
+                ""
+            };
             SubprocessOutcome {
                 status: sync_status::FAILED.to_string(),
                 counts,
                 error_message: Some(format!(
-                    "kg-sync exited {}: {}",
+                    "kg-sync exited {}: {}{}",
                     exit_code,
+                    crash_hint,
                     if snippet.is_empty() { "see log tail" } else { &snippet },
                 )),
                 log_tail: Some(tail),
@@ -651,9 +696,43 @@ async fn run_subprocess(
         Err(e) => SubprocessOutcome {
             status: sync_status::FAILED.to_string(),
             counts,
-            error_message: Some(format!("kg-sync wait failed: {}", e)),
+            error_message: Some(format!(
+                "kg-sync wait failed: {} (counts reset to total-failed because the \
+                 subprocess never reported a summary)",
+                e,
+            )),
             log_tail: Some(tail),
         },
+    }
+}
+
+/// Bug-2 v0.2.4 (2026-05-12): collapse the optimistic per-line counter
+/// back to the truth-of-the-summary or, when the summary never landed,
+/// to (succeeded=0, failed=total).
+///
+/// Per-line increments on `🔄 Syncing node:` reflect what the script
+/// LOGS BEFORE attempting the write — they're optimistic. The terminal
+/// `📊 KG: N succeeded, M failed` is the only authoritative source. When
+/// the subprocess crashed, we can't trust the optimistic value and
+/// MUST NOT persist it (the SD15 incident on 2026-05-12 reported
+/// `kg_succeeded: 17, kg_failed: 0` despite the very first insert
+/// crashing with HTTP 422 — all 17 came from the per-line log lines,
+/// zero of which actually committed).
+///
+/// Stage-aware: kg_summary_seen / docs_summary_seen are independent.
+/// Only reset the stage whose summary we didn't see.
+fn reconcile_optimistic_counts_on_crash(
+    counts: &mut ProgressCounts,
+    kg_summary_seen: bool,
+    docs_summary_seen: bool,
+) {
+    if !kg_summary_seen {
+        counts.kg_succeeded = 0;
+        counts.kg_failed = counts.kg_total;
+    }
+    if !docs_summary_seen {
+        counts.docs_succeeded = 0;
+        counts.docs_failed = counts.docs_total;
     }
 }
 
@@ -1142,5 +1221,81 @@ mod tests {
         let resolved = resolve_kg_sync_script(&d).expect("must resolve");
         assert_eq!(resolved, p);
         fs::remove_dir_all(&d).ok();
+    }
+
+    // ─── Bug-2 v0.2.4 (2026-05-12): counter reconciliation ──────────────
+
+    #[test]
+    fn reconcile_resets_kg_succeeded_to_zero_when_summary_missing() {
+        // SD15 incident replay: 17 optimistic increments from `🔄 Syncing
+        // node:` markers, subprocess crashed on first insert (422), no
+        // `📊 KG: ... succeeded, ... failed` summary ever landed.
+        // Expectation: succeeded=0, failed=total.
+        let mut counts = ProgressCounts {
+            kg_total: 58,
+            kg_succeeded: 17,
+            kg_failed: 0,
+            docs_total: 0,
+            docs_succeeded: 0,
+            docs_failed: 0,
+        };
+        reconcile_optimistic_counts_on_crash(&mut counts, false, false);
+        assert_eq!(counts.kg_succeeded, 0);
+        assert_eq!(counts.kg_failed, 58);
+        assert_eq!(counts.docs_succeeded, 0);
+        assert_eq!(counts.docs_failed, 0);
+    }
+
+    #[test]
+    fn reconcile_preserves_kg_counts_when_summary_seen() {
+        // Summary was emitted then docs phase crashed — KG counters
+        // reflect reality, docs counters need reset.
+        let mut counts = ProgressCounts {
+            kg_total: 58,
+            kg_succeeded: 56,
+            kg_failed: 2,
+            docs_total: 12,
+            docs_succeeded: 7,
+            docs_failed: 0,
+        };
+        reconcile_optimistic_counts_on_crash(&mut counts, true, false);
+        assert_eq!(counts.kg_succeeded, 56, "KG summary seen, keep");
+        assert_eq!(counts.kg_failed, 2, "KG summary seen, keep");
+        assert_eq!(counts.docs_succeeded, 0, "docs summary missing, reset");
+        assert_eq!(counts.docs_failed, 12, "docs reset to total");
+    }
+
+    #[test]
+    fn reconcile_noop_when_both_summaries_seen() {
+        let mut counts = ProgressCounts {
+            kg_total: 58,
+            kg_succeeded: 56,
+            kg_failed: 2,
+            docs_total: 12,
+            docs_succeeded: 11,
+            docs_failed: 1,
+        };
+        reconcile_optimistic_counts_on_crash(&mut counts, true, true);
+        assert_eq!(counts.kg_succeeded, 56);
+        assert_eq!(counts.kg_failed, 2);
+        assert_eq!(counts.docs_succeeded, 11);
+        assert_eq!(counts.docs_failed, 1);
+    }
+
+    #[test]
+    fn reconcile_handles_zero_total_docs_phase() {
+        // No docs/ folder → docs_total=0; reset should not produce
+        // weird counts.
+        let mut counts = ProgressCounts {
+            kg_total: 58,
+            kg_succeeded: 17,
+            kg_failed: 0,
+            docs_total: 0,
+            docs_succeeded: 0,
+            docs_failed: 0,
+        };
+        reconcile_optimistic_counts_on_crash(&mut counts, false, false);
+        assert_eq!(counts.kg_failed, 58);
+        assert_eq!(counts.docs_failed, 0);
     }
 }

@@ -1312,6 +1312,175 @@ _SHARED_KG_NAME = "VibeCodedTools_KnowledgeGraph"
 _DEFAULT_RESTART_CONTAINER = "weaviate_claude"
 
 
+# ---------------------------------------------------------------------------
+# Bug-1 v0.2.4 (2026-05-12): schema-incompatibility regeneration helpers.
+#
+# Pre-v0.2.0 orchestrators created KG/Dev collections with different schema
+# shapes than the current code expects:
+#
+#   * Case-only name conflicts: old `SD15_development` (lowercase d) vs new
+#     `SD15_Development` (capital D). Weaviate stores class names case-
+#     sensitively but rejects POSTs of "similar" classes with HTTP 422
+#     `class already exists: found similar class "<actual>"`.
+#
+#   * Multi-named-vector legacy schemas with `ollama_embed`+`qwen3_embed`
+#     where new code expects 3 slots (`qwen3_embed`+`ollama_embed`+
+#     `openai_embed`) AND legitimately accepts a single named vector per
+#     object — sync_knowledge_graph.py writes one vector per object,
+#     Weaviate's older multi-vector configs reject that with HTTP 422
+#     "configured with multiple named vectors, but received a single vector".
+#
+# Both cases are losslessly fixable by drop + recreate from disk: the on-
+# disk knowledge/**/*.md is the source of truth and the post-bootstrap
+# kg-sync step re-ingests everything.
+#
+# No version tracking is needed; the actual schema fields tell us
+# everything. If the diff between actual and target is non-trivial, the
+# collection is incompatible.
+# ---------------------------------------------------------------------------
+
+
+# Pattern Weaviate emits in HTTP 422 responses when a POST /v1/schema hits
+# a case-insensitive class-name collision. The actual name is captured in
+# the first group.
+#
+# We accept BOTH the unescaped form (`similar class "X"`) and the JSON-
+# escaped form (`similar class \"X\"`) — Weaviate's error body is JSON,
+# so the underlying response bytes contain `\"` around the name. The
+# wrapping quote may also be a single ASCII apostrophe in some legacy
+# error variants, so the regex is permissive about the delimiter.
+_SIMILAR_CLASS_RE = re.compile(
+    r'similar\s+class\s+\\?["\']([^"\'\\]+)\\?["\']',
+    re.IGNORECASE,
+)
+
+
+def _extract_similar_class_name(error_body: Optional[str]) -> Optional[str]:
+    """Parse Weaviate's `class already exists: found similar class "X"` 422
+    response. Returns the actual server-side name if present, else None.
+
+    Used by bootstrap_collections to recover from case-only name conflicts
+    by dropping the actual-named class and re-creating with the target name.
+
+    Handles both the unescaped form (`similar class "X"`) and the JSON-
+    escaped form (`similar class \\"X\\"`) — Weaviate's REST error body is
+    JSON, so the bytes we see in the response usually contain backslash-
+    escaped quotes around the name.
+    """
+    if not error_body:
+        return None
+    m = _SIMILAR_CLASS_RE.search(error_body)
+    return m.group(1) if m else None
+
+
+def _schema_incompatible(
+    actual: dict,
+    target_def_fn: Callable[[str], dict],
+    name: str,
+) -> tuple[bool, str]:
+    """Compare an actual Weaviate schema dict against the canonical target.
+
+    Returns ``(incompatible, reason)`` where ``reason`` is a short
+    human-readable explanation (used for forensic logging and the
+    regenerated[] envelope entry). When ``incompatible`` is False the
+    schema is close enough for current code; minor additive property
+    drift is tolerated because the smart-migrate path patches those
+    in-place during `migrate_collections` and the post-bootstrap
+    sync re-ingests anyway.
+
+    Detection rules (intentionally NARROWER than `_schema_delta`):
+      * legacy single-vector (no vectorConfig) → REGEN
+      * named-vector slot set differs from target → REGEN
+      * indexNullState invariant missing → REGEN
+      * properties missing/extra → NOT REGEN (sync re-ingests; smart
+        migrate's patch_props handles the additive case; the destructive
+        regen path is reserved for the changes that can't be fixed any
+        other way).
+
+    The case-only naming conflict is NOT handled here — it's surfaced via
+    the 422 response from _create_class, not via schema inspection (the
+    collision class isn't visible to a `_fetch_schema(target_name)` since
+    we ask for the wrong-cased name in the first place).
+    """
+    target = target_def_fn(name)
+    target_vec = target.get("vectorConfig") or {}
+    actual_vec = actual.get("vectorConfig")
+
+    if not actual_vec:
+        return (True, "legacy single-vector schema (no vectorConfig)")
+
+    expected_slots = set(target_vec.keys())
+    actual_slots = set(actual_vec.keys())
+    if expected_slots != actual_slots:
+        missing = sorted(expected_slots - actual_slots)
+        extra = sorted(actual_slots - expected_slots)
+        bits: list[str] = []
+        if missing:
+            bits.append(f"missing slots: {','.join(missing)}")
+        if extra:
+            bits.append(f"extra slots: {','.join(extra)}")
+        return (True, f"named-vector mismatch ({'; '.join(bits)})")
+
+    target_inv = target.get("invertedIndexConfig") or {}
+    actual_inv = actual.get("invertedIndexConfig") or {}
+    if target_inv.get("indexNullState", False) and not actual_inv.get(
+        "indexNullState", False
+    ):
+        return (True, "indexNullState=True required but not set")
+
+    return (False, "")
+
+
+def _drop_and_recreate(
+    name: str,
+    definition: dict,
+    *,
+    weaviate_url: Optional[str],
+    log_event: Optional[Callable[..., None]],
+    reason: str,
+) -> None:
+    """Drop ``name`` if present, then POST the canonical definition.
+
+    Used by bootstrap_collections when an existing collection's schema
+    has diverged from the current spec in a non-additive way (different
+    named-vector set, indexNullState missing, legacy single-vector).
+
+    Lossless from the user's perspective: the on-disk `knowledge/**/*.md`
+    is the source of truth and the subsequent kg-sync re-ingests.
+    Forensic snapshot is captured BEFORE the drop so a mid-drop crash
+    leaves a trail.
+    """
+    def _log(step: str, phase: str, detail: str = "", *, data=None) -> None:
+        if log_event is None:
+            return
+        try:
+            log_event(step, phase, detail, data=data)
+        except TypeError:
+            log_event(step, phase, detail)
+
+    # Snapshot before destroying — same forensics hook used by
+    # migrate_collections's rebuild branch (HIGH-4, 2026-05-01).
+    snap = _snapshot_collection_for_rebuild(name, weaviate_url=weaviate_url)
+    _log(
+        "7b.bootstrap.regen",
+        "snapshot",
+        f"{name}: pre-drop snapshot ({reason})",
+        data={
+            "collection": name,
+            "reason": reason,
+            "object_count": snap["object_count"],
+            "sample_uuids": snap["sample_uuids"],
+        },
+    )
+
+    _delete_class(name, weaviate_url=weaviate_url)
+    # Important: definition's `class` field may not match `name` (e.g.
+    # case-conflict path where we drop the wrong-cased existing then
+    # create with the canonical name). Trust `definition["class"]` for
+    # the POST.
+    _create_class(definition, weaviate_url=weaviate_url)
+
+
 def _is_weaviate_reachable(weaviate_url: str, *, timeout: float = 5.0) -> bool:
     """Probe `/v1/.well-known/ready`. Returns True only on HTTP 200."""
     base = weaviate_url.rstrip("/")
@@ -1425,9 +1594,19 @@ def bootstrap_collections(
         "restart_succeeded": bool,
         "deferred": bool,
         "dry_run": bool,
-        "actions": [{"collection": str, "action": "create"|"exists"|"would-create", "ok": bool}],
+        "actions": [{"collection": str, "action": "create"|"exists"|"would-create"|"regenerated", "ok": bool}],
+        "regenerated": [{"collection": str, "reason": "case-conflict"|"multi-vector"|"legacy-single-vector"|"index-null-state"|"named-vector-mismatch", "dropped_name": str}],
         "errors": [{"collection": str, "error": str}],
       }
+
+    Bug-1 v0.2.4 (2026-05-12): when an existing collection's schema is
+    incompatible with the current spec (case-only name conflict, legacy
+    multi-vector config, missing indexNullState, etc.) the function
+    drops the old collection and recreates with the target schema. The
+    Rust caller parses ``regenerated[]`` to drive the banner's
+    "Migrating Weaviate schema for X..." state. Lossless: knowledge/**/*.md
+    on disk is the source of truth and the subsequent kg-sync step
+    re-populates Weaviate.
 
     Soft-fail contract: the function NEVER raises for transport errors or
     for individual collection creation failures. A non-empty `errors`
@@ -1452,6 +1631,10 @@ def bootstrap_collections(
         "deferred": False,
         "dry_run": bool(dry_run),
         "actions": [],
+        # Bug-1 v0.2.4 (2026-05-12): collections regenerated due to schema
+        # incompatibility. Empty under normal first-install conditions.
+        # See _schema_incompatible for the regen trigger conditions.
+        "regenerated": [],
         "errors": [],
     }
 
@@ -1498,23 +1681,26 @@ def bootstrap_collections(
                 })
         return result
 
-    # 2. Build the target list.
-    targets: list[tuple[str, dict]] = [
-        (derived["kg_collection"],     kg_class_definition(derived["kg_collection"])),
+    # 2. Build the target list. Each tuple carries the canonical target
+    # name AND the def-fn (so we can re-derive the spec when regenerating
+    # under a case-conflict alias). Order matters: KG first, Dev second,
+    # shared KG last.
+    targets: list[tuple[str, Callable[[str], dict]]] = [
+        (derived["kg_collection"], kg_class_definition),
     ]
     if not kg_only:
         targets.append(
-            (derived["development_collection"],
-             development_class_definition(derived["development_collection"])),
+            (derived["development_collection"], development_class_definition),
         )
     # Shared KG: always created when missing (per coordinator: shared KG is
     # READ by every project regardless of per-project opt-out, so creation
     # is unconditional). The opt-out toggle is purely a write-gate enforced
     # at MCP-call time, not a creation gate.
-    targets.append((_SHARED_KG_NAME, kg_class_definition(_SHARED_KG_NAME)))
+    targets.append((_SHARED_KG_NAME, kg_class_definition))
 
-    # 3. Iterate: existence check + POST when missing.
-    for name, definition in targets:
+    # 3. Iterate: existence check + schema probe + POST.
+    for name, target_def_fn in targets:
+        definition = target_def_fn(name)
         try:
             existing = _fetch_schema(name, weaviate_url=weaviate_url)
         except Exception as e:
@@ -1528,12 +1714,73 @@ def bootstrap_collections(
             continue
 
         if existing is not None:
-            result["actions"].append({
-                "collection": name, "action": "exists", "ok": True,
-            })
-            _log("7b.bootstrap", "ok",
-                 f"{name}: already exists",
-                 data={"collection": name, "action": "exists"})
+            # Bug-1 v0.2.4: schema-incompatibility regen. Compare actual
+            # schema fields against the canonical target; if non-trivially
+            # divergent (different named-vector set, missing
+            # indexNullState, legacy single-vector), drop + recreate.
+            incompatible, reason = _schema_incompatible(
+                existing, target_def_fn, name,
+            )
+            if not incompatible:
+                result["actions"].append({
+                    "collection": name, "action": "exists", "ok": True,
+                })
+                _log("7b.bootstrap", "ok",
+                     f"{name}: already exists with compatible schema",
+                     data={"collection": name, "action": "exists"})
+                continue
+
+            # Regen path. In dry-run mode we report the intent without
+            # mutating; the Rust caller surfaces the banner state.
+            if dry_run:
+                result["regenerated"].append({
+                    "collection": name,
+                    "reason": _regen_reason_tag(reason),
+                    "dropped_name": name,
+                    "detail": reason,
+                })
+                result["actions"].append({
+                    "collection": name, "action": "would-regenerate", "ok": True,
+                })
+                _log("7b.bootstrap", "ok",
+                     f"{name}: WOULD regenerate ({reason})",
+                     data={"collection": name, "action": "would-regenerate",
+                           "reason": reason})
+                continue
+
+            try:
+                _drop_and_recreate(
+                    name, definition,
+                    weaviate_url=weaviate_url,
+                    log_event=log_event,
+                    reason=reason,
+                )
+                result["regenerated"].append({
+                    "collection": name,
+                    "reason": _regen_reason_tag(reason),
+                    "dropped_name": name,
+                    "detail": reason,
+                })
+                result["actions"].append({
+                    "collection": name, "action": "regenerated", "ok": True,
+                })
+                _log("7b.bootstrap", "ok",
+                     f"{name}: regenerated ({reason})",
+                     data={"collection": name, "action": "regenerated",
+                           "reason": reason})
+            except Exception as e:
+                err = f"{type(e).__name__}: {e}"
+                _log("7b.bootstrap", "error",
+                     f"{name}: regenerate failed: {err}",
+                     data={"collection": name, "error": err,
+                           "reason": reason})
+                result["actions"].append({
+                    "collection": name, "action": "regenerated", "ok": False,
+                })
+                result["errors"].append({
+                    "collection": name,
+                    "error": f"regenerate failed ({reason}): {err}",
+                })
             continue
 
         if dry_run:
@@ -1551,6 +1798,61 @@ def bootstrap_collections(
                  f"{name}: created with target schema",
                  data={"collection": name, "action": "create"})
         except Exception as e:
+            # Bug-1 v0.2.4: case-only name conflict path. Weaviate POSTs
+            # are case-sensitive (so our existence-probe missed the old
+            # `<Project>_development` lowercase variant), but the server-
+            # side dedup rejects creating `<Project>_Development` with
+            # HTTP 422 `class already exists: found similar class "<actual>"`.
+            # Extract the actual existing name, drop it, retry the POST.
+            err_str = str(e)
+            actual_name = _extract_similar_class_name(err_str)
+            if actual_name and actual_name != name:
+                _log("7b.bootstrap", "warn",
+                     f"{name}: case-conflict with existing {actual_name!r}; "
+                     f"dropping old and recreating with target name",
+                     data={"collection": name,
+                           "conflicting_name": actual_name,
+                           "branch": "case-conflict"})
+                try:
+                    _drop_and_recreate(
+                        actual_name, definition,
+                        weaviate_url=weaviate_url,
+                        log_event=log_event,
+                        reason=f"case-only name conflict ({actual_name!r} → {name!r})",
+                    )
+                    result["regenerated"].append({
+                        "collection": name,
+                        "reason": "case-conflict",
+                        "dropped_name": actual_name,
+                        "detail": f"existing {actual_name!r} replaced with target name {name!r}",
+                    })
+                    result["actions"].append({
+                        "collection": name, "action": "regenerated", "ok": True,
+                    })
+                    _log("7b.bootstrap", "ok",
+                         f"{name}: regenerated from case-conflict {actual_name!r}",
+                         data={"collection": name, "action": "regenerated",
+                               "dropped_name": actual_name,
+                               "branch": "case-conflict"})
+                    continue
+                except Exception as e2:
+                    err2 = f"{type(e2).__name__}: {e2}"
+                    _log("7b.bootstrap", "error",
+                         f"{name}: case-conflict recovery failed: {err2}",
+                         data={"collection": name, "error": err2,
+                               "dropped_name": actual_name,
+                               "branch": "case-conflict-failed"})
+                    result["actions"].append({
+                        "collection": name, "action": "create", "ok": False,
+                    })
+                    result["errors"].append({
+                        "collection": name,
+                        "error": (f"case-conflict recovery failed (existing "
+                                  f"{actual_name!r}): {err2}"),
+                    })
+                    continue
+
+            # Generic create-failure path.
             err = f"{type(e).__name__}: {e}"
             _log("7b.bootstrap", "error",
                  f"{name}: create failed: {err}",
@@ -1561,6 +1863,23 @@ def bootstrap_collections(
             result["errors"].append({"collection": name, "error": err})
 
     return result
+
+
+def _regen_reason_tag(reason: str) -> str:
+    """Map a free-form regen reason string to a stable tag the Rust
+    caller can dispatch on. Keeps the JSON envelope's ``reason`` field
+    finite for UI banner text.
+    """
+    r = reason.lower()
+    if "case" in r:
+        return "case-conflict"
+    if "single-vector" in r or "no vectorconfig" in r:
+        return "legacy-single-vector"
+    if "named-vector" in r or "slot" in r:
+        return "multi-vector"
+    if "indexnullstate" in r:
+        return "index-null-state"
+    return "schema-mismatch"
 
 
 def _write_bootstrap_deferral(
