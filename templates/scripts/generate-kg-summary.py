@@ -3,42 +3,93 @@
 Generate LLM summaries for a KG node and store in .node_formats.json.
 
 Called by PostToolUse hook on knowledge/**/*.md edits.
-Uses Claude Haiku via the Anthropic API for high-quality summaries.
+
+Three-tier model selection (in order):
+  1. `claude` CLI on PATH      → best quality, requires CLI install (Max sub or API key)
+  2. Ollama (local, FREE)      → http://localhost:11435, no extra dep beyond what
+                                  the orchestrator already requires for embeddings
+  3. ANTHROPIC_API_KEY direct  → opt-in fallback, cost warning logged
+  4. Silent skip               → friendly log line, exits 0
+
+Env overrides:
+  KG_SUMMARY_BACKEND        → force "cli" | "ollama" | "api" | "skip" (auto-detect default)
+  KG_SUMMARY_OLLAMA_MODEL   → Ollama model tag (default: qwen3.5:9b for 16GB+ VRAM,
+                                                          gemma4:e4b for low-VRAM/CPU)
+  KG_SUMMARY_OLLAMA_URL     → Ollama base URL (default: http://localhost:11435)
+  KG_SUMMARY_TIMEOUT        → per-call timeout seconds (default: 180)
 
 For multi-chunk nodes: generates both a whole-node summary and per-chunk summaries.
 For single-chunk nodes: generates description + summary only.
-
-Schema in .node_formats.json:
-{
-  "knowledge/concepts/foo.md": {
-    "title": "Foo Pattern",
-    "description": "3-4 sentence description of what, how, why.",
-    "summary": "1-2 sentence whole-node summary (always present).",
-    "chunk_summaries": {           # only for multi-chunk nodes
-      "1": "Summary of chunk 1...",
-      "2": "Summary of chunk 2...",
-    },
-    "total_chunks": 3,
-    "generated_at": "2026-04-10T...",
-    "content_hash": "sha256..."    # skip regeneration if unchanged
-  }
-}
 """
 
 import argparse
 import hashlib
 import json
 import os
+import shutil
 import sys
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Haiku model ID
-MODEL = "claude-haiku-4-5-20251001"
+ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
+OLLAMA_DEFAULT_MODEL = os.getenv("KG_SUMMARY_OLLAMA_MODEL", "qwen3.5:9b")
+OLLAMA_URL = os.getenv("KG_SUMMARY_OLLAMA_URL", "http://localhost:11435").rstrip("/")
+TIMEOUT = int(os.getenv("KG_SUMMARY_TIMEOUT", "180"))
 
-CLAUDE_PROJECT = Path(__file__).resolve().parent.parent.parent
+# Project root (where knowledge/ + .claude/ live): defaults to the script's
+# parent.parent.parent (Claude orchestrator), but overridable via
+# KG_PROJECT_ROOT env var so this script can summarize KG nodes in *other*
+# repos (e.g. per-project VCO-installed projects).
+_DEFAULT_ROOT = Path(__file__).resolve().parent.parent.parent
+CLAUDE_PROJECT = Path(os.getenv("KG_PROJECT_ROOT", str(_DEFAULT_ROOT))).resolve()
 FORMATS_PATH = CLAUDE_PROJECT / "knowledge" / ".node_formats.json"
 KNOWLEDGE_DIR = CLAUDE_PROJECT / "knowledge"
+LOG_PATH = CLAUDE_PROJECT / ".claude" / "logs" / "kg-summary-generator.log"
+
+
+def _resolve_orchestrator_root() -> Path:
+    """Find the orchestrator clone root (which contains claude_mcp_servers/).
+
+    PR-2 portability contract: per-project installs of this script need to
+    locate the orchestrator's Python deps. Resolution chain:
+      1. VCT_ORCHESTRATOR_ROOT env var (set by the launcher when invoking us
+         from create_project_v2 / retry_kg_summary).
+      2. CLAUDE_PROJECT itself if it contains claude_mcp_servers/ (i.e. the
+         script is running INSIDE the orchestrator clone).
+      3. Script's parent.parent.parent — historical fallback for the
+         orchestrator's own .claude/scripts/.
+    Returns the resolved path; the import call site verifies the
+    claude_mcp_servers subdir actually exists before using it.
+    """
+    env = os.getenv("VCT_ORCHESTRATOR_ROOT", "").strip()
+    if env:
+        candidate = Path(env).resolve()
+        if (candidate / "claude_mcp_servers").is_dir():
+            return candidate
+    if (CLAUDE_PROJECT / "claude_mcp_servers").is_dir():
+        return CLAUDE_PROJECT
+    return _DEFAULT_ROOT
+
+
+ORCHESTRATOR_ROOT = _resolve_orchestrator_root()
+
+SYSTEM_PROMPT = (
+    "You are a technical documentation summarizer. "
+    "Write concise, specific, factual summaries. No filler words, no preamble. "
+    "Start directly with the content."
+)
+
+
+def log(msg: str) -> None:
+    print(msg)
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(f"[{datetime.now().isoformat(timespec='seconds')}] {msg}\n")
+    except Exception:
+        pass
 
 
 def load_formats() -> dict:
@@ -60,11 +111,10 @@ def content_hash(text: str) -> str:
 
 
 def read_node(file_path: Path) -> tuple[str, str, str]:
-    """Read a KG node file. Returns (title, frontmatter_yaml, body)."""
+    """Read a KG node file. Returns (title, full_text, body)."""
     text = file_path.read_text(encoding="utf-8")
     title = ""
     body = text
-    # Parse YAML frontmatter
     if text.startswith("---"):
         parts = text.split("---", 2)
         if len(parts) >= 3:
@@ -74,7 +124,6 @@ def read_node(file_path: Path) -> tuple[str, str, str]:
                 if line.startswith("title:"):
                     title = line.split(":", 1)[1].strip().strip("'\"")
     if not title:
-        # Fallback: first # heading
         for line in body.splitlines():
             if line.startswith("# "):
                 title = line[2:].strip()
@@ -82,25 +131,30 @@ def read_node(file_path: Path) -> tuple[str, str, str]:
     return title, text, body
 
 
-def call_haiku(prompt: str, max_tokens: int = 300) -> str:
-    """Call Claude Haiku via the `claude` CLI (inherits OAuth auth).
+# ──────────────────────────────────────────────────────────────────────
+# Backend: Claude CLI
+# ──────────────────────────────────────────────────────────────────────
+def cli_available() -> bool:
+    return shutil.which("claude") is not None
 
-    Uses `claude -p` with --model haiku for single-turn prompt execution.
-    This avoids needing a raw API key — the CLI handles authentication.
-    """
+
+def call_cli(prompt: str) -> str:
     import subprocess
 
-    full_prompt = (
-        "You are a technical documentation summarizer. "
-        "Write concise, specific, factual summaries. No filler words, no preamble. "
-        "Start directly with the content.\n\n" + prompt
-    )
+    # Resolve the absolute path so subprocess honors PATHEXT on Windows
+    # (where `claude` may ship as `claude.cmd` / `claude.bat` via npm).
+    # cli_available() already returned True via shutil.which, but Python's
+    # subprocess.run won't apply PATHEXT to bare names on Windows.
+    claude_path = shutil.which("claude")
+    if claude_path is None:
+        raise RuntimeError("claude CLI not found on PATH at call time")
 
+    full_prompt = SYSTEM_PROMPT + "\n\n" + prompt
     result = subprocess.run(
-        ["claude", "-p", full_prompt, "--model", "haiku", "--max-turns", "1"],
+        [claude_path, "-p", full_prompt, "--model", "haiku", "--max-turns", "1"],
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=TIMEOUT,
         env={**os.environ, "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"},
     )
     if result.returncode != 0:
@@ -108,9 +162,192 @@ def call_haiku(prompt: str, max_tokens: int = 300) -> str:
     return result.stdout.strip()
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Backend: Ollama
+# ──────────────────────────────────────────────────────────────────────
+# Per-model generation params for short technical summarization. Override
+# via env: KG_SUMMARY_OLLAMA_OPTIONS='{"temperature":0.5,"num_ctx":16000}'
+#
+# num_ctx 24576 (24k) comfortably fits ~3 × 8k chunks of input + system + output.
+# Our prompts are ~1.5k tokens (4000-char body truncation) + 350 num_predict.
+#
+# qwen3.5:* defaults to thinking-mode and emits <think>...</think> blocks
+# unless suppressed. Ollama exposes a `think: false` toggle on /api/generate
+# (added in 0.5+). We pass it AND post-strip any leaked think blocks defensively.
+OLLAMA_MODEL_DEFAULTS: dict[str, dict] = {
+    "qwen3.5": {
+        "temperature": 0.5,
+        "top_p": 0.8,
+        "top_k": 20,
+        "num_ctx": 32768,
+        "num_predict": 1024,
+        "repeat_penalty": 1.1,
+    },
+    "qwen3": {  # fallback for plain qwen3 tags
+        "temperature": 0.5,
+        "top_p": 0.8,
+        "top_k": 20,
+        "num_ctx": 32768,
+        "num_predict": 1024,
+        "repeat_penalty": 1.1,
+    },
+    "gemma4": {
+        "temperature": 0.8,
+        "top_p": 0.95,
+        "top_k": 64,
+        "num_ctx": 32768,
+        "num_predict": 1024,
+    },
+    "gemma3": {  # fallback for plain gemma3 tags
+        "temperature": 0.8,
+        "top_p": 0.95,
+        "top_k": 64,
+        "num_ctx": 32768,
+        "num_predict": 1024,
+    },
+}
+
+
+def _ollama_options_for(model: str) -> dict:
+    user_override = os.getenv("KG_SUMMARY_OLLAMA_OPTIONS")
+    if user_override:
+        try:
+            return json.loads(user_override)
+        except json.JSONDecodeError:
+            pass
+    family = model.split(":", 1)[0].lower()
+    return OLLAMA_MODEL_DEFAULTS.get(family, {
+        "temperature": 0.4,
+        "top_p": 0.9,
+        "num_ctx": 32768,
+        "num_predict": 1024,
+    })
+
+
+def _strip_think_blocks(text: str) -> str:
+    """Remove <think>...</think> reasoning blocks (qwen3 family)."""
+    import re
+    return re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL).strip()
+
+
+def ollama_available() -> bool:
+    try:
+        with urllib.request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=3) as resp:
+            return resp.status == 200
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError):
+        return False
+
+
+def call_ollama(prompt: str, model: str = OLLAMA_DEFAULT_MODEL) -> str:
+    options = _ollama_options_for(model)
+    body = {
+        "model": model,
+        "prompt": prompt,
+        "system": SYSTEM_PROMPT,
+        "stream": False,
+        "options": options,
+    }
+    family = model.split(":", 1)[0].lower()
+    if family.startswith("qwen3"):
+        body["think"] = False  # Ollama 0.5+ recognizes this; older versions ignore
+    payload = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        f"{OLLAMA_URL}/api/generate",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    return _strip_think_blocks(data.get("response", "").strip())
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Backend: Anthropic API (direct)
+# ──────────────────────────────────────────────────────────────────────
+def api_available() -> bool:
+    return bool(os.getenv("ANTHROPIC_API_KEY"))
+
+
+def call_api(prompt: str) -> str:
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    payload = json.dumps(
+        {
+            "model": ANTHROPIC_MODEL,
+            "max_tokens": 350,
+            "system": SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    blocks = data.get("content", [])
+    return "".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip()
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Tier dispatch
+# ──────────────────────────────────────────────────────────────────────
+_BACKEND_CACHE: dict[str, str] = {}
+
+
+def select_backend() -> str:
+    """Pick the best backend on first call, cache for subsequent prompts."""
+    if "choice" in _BACKEND_CACHE:
+        return _BACKEND_CACHE["choice"]
+
+    forced = os.getenv("KG_SUMMARY_BACKEND", "").lower().strip()
+    if forced in {"cli", "ollama", "api", "skip"}:
+        _BACKEND_CACHE["choice"] = forced
+        log(f"  KG-summary backend: {forced} (forced via env)")
+        return forced
+
+    if cli_available():
+        _BACKEND_CACHE["choice"] = "cli"
+        log("  KG-summary backend: cli (claude on PATH)")
+        return "cli"
+    if ollama_available():
+        _BACKEND_CACHE["choice"] = "ollama"
+        log(f"  KG-summary backend: ollama ({OLLAMA_DEFAULT_MODEL})")
+        return "ollama"
+    if api_available():
+        _BACKEND_CACHE["choice"] = "api"
+        log("  KG-summary backend: api (ANTHROPIC_API_KEY) — costs apply")
+        return "api"
+
+    _BACKEND_CACHE["choice"] = "skip"
+    log(
+        "  KG-summary: no backend available (no claude CLI, no Ollama at "
+        f"{OLLAMA_URL}, no ANTHROPIC_API_KEY). Skipping."
+    )
+    return "skip"
+
+
+def call_llm(prompt: str) -> str:
+    backend = select_backend()
+    if backend == "cli":
+        return call_cli(prompt)
+    if backend == "ollama":
+        return call_ollama(prompt)
+    if backend == "api":
+        return call_api(prompt)
+    raise RuntimeError("no backend available")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Prompts
+# ──────────────────────────────────────────────────────────────────────
 def generate_description(title: str, body: str) -> str:
-    """3-4 sentence description: what, key details, why it matters."""
-    # Truncate body to ~3000 chars for the prompt
     body_trunc = body[:3000] + ("..." if len(body) > 3000 else "")
     prompt = f"""Summarize this knowledge node in exactly 3-4 sentences.
 Sentence 1: What it is (definition/purpose).
@@ -121,11 +358,10 @@ Title: {title}
 
 Content:
 {body_trunc}"""
-    return call_haiku(prompt, max_tokens=250)
+    return call_llm(prompt)
 
 
 def generate_summary(title: str, body: str) -> str:
-    """1-2 sentence whole-node summary."""
     body_trunc = body[:4000] + ("..." if len(body) > 4000 else "")
     prompt = f"""Write a 1-2 sentence summary of this knowledge node. Be maximally specific and technical. Include the single most important fact.
 
@@ -133,39 +369,35 @@ Title: {title}
 
 Content:
 {body_trunc}"""
-    return call_haiku(prompt, max_tokens=120)
+    return call_llm(prompt)
 
 
 def generate_chunk_summary(title: str, chunk_num: int, total: int, chunk_content: str) -> str:
-    """1-2 sentence summary of a specific chunk."""
     prompt = f"""Write a 1-sentence summary of this section (chunk {chunk_num}/{total}) of the knowledge node "{title}". Be specific about what THIS chunk covers.
 
 Content:
 {chunk_content[:2000]}"""
-    return call_haiku(prompt, max_tokens=100)
+    return call_llm(prompt)
 
 
 def get_chunks_from_weaviate(title: str) -> list[tuple[int, str]]:
-    """Fetch all chunks for a node from Weaviate, sorted by chunk_num.
-
-    PR-2 portability (2026-05-06): the weaviate Python client is the only
-    thing imported here, but historically sys.path was also extended to
-    pick up claude_mcp_servers/ from the orchestrator clone. Honor
-    $VCT_ORCHESTRATOR_ROOT first, fall back to in-tree resolution.
-    """
     try:
-        # VCO-REWIRE-BEGIN: orchestrator-root-resolution
-        env_root = os.environ.get("VCT_ORCHESTRATOR_ROOT", "").strip()
-        if env_root and (Path(env_root) / "claude_mcp_servers").is_dir():
-            sys.path.insert(0, str(Path(env_root) / "claude_mcp_servers"))
-        else:
-            sys.path.insert(0, str(CLAUDE_PROJECT / "claude_mcp_servers"))
-        # VCO-REWIRE-END: orchestrator-root-resolution
+        # ORCHESTRATOR_ROOT honors VCT_ORCHESTRATOR_ROOT (PR-2 portability)
+        # so per-project installs find claude_mcp_servers/ in the orchestrator
+        # clone, not in the project being summarized.
+        sys.path.insert(0, str(ORCHESTRATOR_ROOT / "claude_mcp_servers"))
         import weaviate
         from weaviate.classes.query import Filter
+        from urllib.parse import urlparse
 
         kg_collection = os.getenv("KG_COLLECTION", "ClaudeKnowledgeGraph")
-        client = weaviate.connect_to_local(host="localhost", port=8081, grpc_port=50052)
+        # Honor WEAVIATE_URL when the launcher (or env) sets it to a non-default
+        # endpoint; otherwise default to localhost:8081 to match historical behavior.
+        weaviate_url = urlparse(os.getenv("WEAVIATE_URL", "http://localhost:8081"))
+        weaviate_host = weaviate_url.hostname or "localhost"
+        weaviate_port = weaviate_url.port or 8081
+        weaviate_grpc = int(os.getenv("GRPC_PORT", "50052"))
+        client = weaviate.connect_to_local(host=weaviate_host, port=weaviate_port, grpc_port=weaviate_grpc)
         coll = client.collections.get(kg_collection)
         resp = coll.query.fetch_objects(
             filters=Filter.by_property("title").equal(title),
@@ -195,7 +427,6 @@ def main():
         print(f"File not found: {file_path}", file=sys.stderr)
         sys.exit(1)
 
-    # Compute relative path for the key
     try:
         rel_path = str(file_path.relative_to(CLAUDE_PROJECT))
     except ValueError:
@@ -203,10 +434,10 @@ def main():
 
     title, full_text, body = read_node(file_path)
     if not title:
-        print(f"  No title found in {rel_path}, skipping", file=sys.stderr)
+        # Pre-write hook should have blocked this, but guard anyway.
+        log(f"  No title in {rel_path} (pre-write hook should have caught this), skipping")
         sys.exit(0)
 
-    # Check if content changed
     c_hash = content_hash(full_text)
     formats = load_formats()
     existing = formats.get(rel_path, {})
@@ -214,9 +445,11 @@ def main():
         print(f"  {title}: unchanged (hash match), skipping")
         sys.exit(0)
 
-    print(f"  Generating summaries for: {title}")
+    if select_backend() == "skip":
+        sys.exit(0)
 
-    # Generate description + summary from the full body
+    log(f"  Generating summaries for: {title}")
+
     description = generate_description(title, body)
     summary = generate_summary(title, body)
     print(f"  Description: {description[:80]}...")
@@ -228,9 +461,9 @@ def main():
         "summary": summary,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "content_hash": c_hash,
+        "backend": _BACKEND_CACHE.get("choice", "?"),
     }
 
-    # Check for multi-chunk nodes
     chunks = get_chunks_from_weaviate(title)
     total_chunks = len(chunks) if chunks else 1
 
@@ -246,7 +479,7 @@ def main():
 
     formats[rel_path] = entry
     save_formats(formats)
-    print(f"  Saved to {FORMATS_PATH}")
+    log(f"  Saved {rel_path} via {entry['backend']}")
 
 
 if __name__ == "__main__":

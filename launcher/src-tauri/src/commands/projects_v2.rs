@@ -11,9 +11,11 @@ use uuid::Uuid;
 
 use crate::commands::codegraph;
 use crate::commands::installer::{detect_system, find_local_repo_root};
+use crate::commands::kg_summary;
 use crate::commands::kg_sync;
 use crate::commands::project_env_settings::{self, ProjectEnvSettings};
 use crate::db::code_graph_builds::status as build_status;
+use crate::db::kg_summaries::status as kg_summary_status;
 use crate::db::kg_syncs::status as kg_sync_status;
 use crate::db::models::{ModuleInstallRow, ProjectHost, ProjectRow};
 use crate::db::Db;
@@ -528,6 +530,54 @@ pub async fn create_project_v2(
         eprintln!("[vct] warning: could not queue kg-sync for {}: {}", row.id, e);
     } else {
         kg_sync::spawn_initial_sync(
+            app.clone(),
+            row.id.clone(),
+            row.name.clone(),
+            row.folder_path.clone(),
+        );
+    }
+
+    // KG summary auto-backfill (v0.2.3 / 2026-05-12): kick off the
+    // initial `generate-kg-summary.py` pass in the background so any
+    // pre-existing `knowledge/**/*.md` content lands in the project's
+    // `.node_formats.json` sidecar (consumed by `hybrid_search`'s
+    // `summary` tier). Same ordering discipline as the kg-sync spawn
+    // above: this MUST live after `run_install_bundle` so the project-
+    // local `generate-kg-summary.py` exists by the time the background
+    // task resolves it. The pending row is queued first so the GUI can
+    // render an immediate "Queued" banner state while the task picks up.
+    //
+    // Spawned in parallel with the kg-sync task — not chained. The
+    // summariser works directly off the `.md` files (it doesn't need
+    // Weaviate to be populated for the description/summary path), and
+    // its per-chunk path (only used for multi-chunk nodes) gracefully
+    // degrades to single-summary mode when Weaviate has no chunks yet.
+    // Mirrors the parallel-spawn pattern already established for
+    // code-graph + kg-sync.
+    //
+    // Failure isolation: a DB error on the pending insert is logged
+    // (cosmetic — the user just won't see a summary banner); never
+    // propagated. Backfill failure (no backend available, venv missing,
+    // every subprocess crashing) lands in `kg_summaries.error_message`
+    // and surfaces as a "Retry" affordance on the GUI banner — project
+    // create itself is already committed.
+    if let Err(e) = db.upsert_kg_summary(
+        &row.id,
+        kg_summary_status::PENDING,
+        Some(now),
+        None,
+        None,
+        0, 0, 0, 0, 0,
+        None,
+        None,
+        None,
+    ) {
+        eprintln!(
+            "[vct] warning: could not queue kg-summary backfill for {}: {}",
+            row.id, e,
+        );
+    } else {
+        kg_summary::spawn_initial_summary(
             app,
             row.id.clone(),
             row.name.clone(),

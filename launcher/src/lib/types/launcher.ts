@@ -343,6 +343,53 @@ export interface KgSyncView {
   current_phase: string | null;
 }
 
+/**
+ * KG summary auto-backfill (v0.2.3 / 2026-05-12): per-project initial
+ * `generate-kg-summary.py` pass status.
+ *
+ * Mirrors `KgSummaryView` in commands::kg_summary (Rust). Fired on the
+ * `kg-summary-progress` Tauri event during a backfill, and returned by
+ * `get_kg_summary_status`. Shape parallels `KgSyncView` — same lifecycle
+ * states, same optional timestamps, same `current_phase` field for live
+ * events. Adds `backend` (which fallback chain the summariser picked)
+ * and per-node counters (succeeded / unchanged / failed / skipped)
+ * specific to the per-file invocation pattern.
+ */
+export type KgSummaryStatus =
+  | 'pending'
+  | 'running'
+  | 'success'
+  | 'failed'
+  | 'skipped';
+
+export interface KgSummaryView {
+  project_id: string;
+  status: KgSummaryStatus;
+  /** ISO 8601 (RFC 3339); null until the backfill starts. */
+  started_at_iso: string | null;
+  /** ISO 8601; null until the backfill reaches a terminal state. */
+  finished_at_iso: string | null;
+  duration_ms: number | null;
+  /** Total `.md` files discovered under knowledge/. */
+  nodes_total: number;
+  /** Files where the summariser wrote a new entry. */
+  nodes_succeeded: number;
+  /** Files where the summariser detected an existing hash-match (no-op). */
+  nodes_unchanged: number;
+  /** Files where the summariser raised an exception (sub-fatal). */
+  nodes_failed: number;
+  /** Files where the summariser exited 0 with "no backend" or "no title". */
+  nodes_skipped: number;
+  /** Backend the summariser picked: "cli" | "ollama" | "api" | "skip" | null.
+   *  null on terminal `skipped`/`failed` rows where nothing ran. */
+  backend: string | null;
+  error_message: string | null;
+  /** Last ~4 KiB of aggregated subprocess output — debugging aid. */
+  log_tail: string | null;
+  /** Live phase indicator on `running` events ("scan" | "summarise"). */
+  current_phase: string | null;
+}
+
 /** Mirrors `InstallHealth` in commands/installer.rs. Returned by
  *  `check_install_health` once at app startup. When `all_ok` is false the
  *  layout renders `InstallHealthGate.svelte` as a blocking modal. */

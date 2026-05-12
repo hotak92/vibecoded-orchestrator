@@ -224,11 +224,20 @@ pub fn run() {
                 commands::codegraph::resume_pending_builds(resume_handle);
             let (kg_swept, kg_resumed) =
                 commands::kg_sync::resume_pending_syncs(resume_handle);
-            if cg_swept + cg_resumed + kg_swept + kg_resumed > 0 {
+            // KG summary backfill (v0.2.3 / 2026-05-12) — extends the
+            // resume sweep to a third task type. Same two-phase contract:
+            //   (1) running rows → marked failed with "launcher crashed
+            //       mid-run; click Retry to re-run".
+            //   (2) pending rows → re-spawned via spawn_initial_summary.
+            // See commands::kg_summary::resume_pending_summaries.
+            let (sum_swept, sum_resumed) =
+                commands::kg_summary::resume_pending_summaries(resume_handle);
+            if cg_swept + cg_resumed + kg_swept + kg_resumed + sum_swept + sum_resumed > 0 {
                 eprintln!(
                     "[vct] resume-sweep: code-graph (running→failed: {}, pending respawned: {}); \
-                     kg-sync (running→failed: {}, pending respawned: {})",
-                    cg_swept, cg_resumed, kg_swept, kg_resumed
+                     kg-sync (running→failed: {}, pending respawned: {}); \
+                     kg-summary (running→failed: {}, pending respawned: {})",
+                    cg_swept, cg_resumed, kg_swept, kg_resumed, sum_swept, sum_resumed
                 );
             }
 
@@ -480,6 +489,15 @@ pub fn run() {
             // user having to manually run `.claude/scripts/kg-sync --all`.
             commands::kg_sync::get_kg_sync_status,
             commands::kg_sync::retry_kg_sync,
+            // KG summary auto-backfill (v0.2.3 / 2026-05-12): initial
+            // generate-kg-summary.py pass over knowledge/**/*.md. Mirrors
+            // the kg-sync pattern — spawned from `create_project_v2`
+            // alongside kg-sync so pre-existing markdown nodes get their
+            // .node_formats.json sidecar entry without the user having to
+            // edit each node in a Claude session for the PostToolUse hook
+            // to backfill it lazily.
+            commands::kg_summary::get_kg_summary_status,
+            commands::kg_summary::retry_kg_summary,
             // Hub proxy (v1.1)
             commands::hub_proxy::hub_info,
             commands::hub_proxy::hub_list_apps,
