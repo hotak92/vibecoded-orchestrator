@@ -11,8 +11,10 @@ use uuid::Uuid;
 
 use crate::commands::codegraph;
 use crate::commands::installer::{detect_system, find_local_repo_root};
+use crate::commands::kg_sync;
 use crate::commands::project_env_settings::{self, ProjectEnvSettings};
 use crate::db::code_graph_builds::status as build_status;
+use crate::db::kg_syncs::status as kg_sync_status;
 use crate::db::models::{ModuleInstallRow, ProjectHost, ProjectRow};
 use crate::db::Db;
 
@@ -489,6 +491,43 @@ pub async fn create_project_v2(
         eprintln!("[vct] warning: could not queue code-graph build for {}: {}", row.id, e);
     } else {
         codegraph::spawn_initial_build(
+            app.clone(),
+            row.id.clone(),
+            row.name.clone(),
+            row.folder_path.clone(),
+        );
+    }
+
+    // KG auto-sync (2026-05-12): kick off the initial `kg-sync --all`
+    // run in the background so any pre-existing `knowledge/**/*.md` and
+    // `docs/**/*.md` content lands in Weaviate without the user having
+    // to manually run `.claude/scripts/kg-sync --all`. Same ordering
+    // discipline as the codegraph spawn above: this MUST live after
+    // `run_install_bundle` so the project-local `kg-sync` wrapper
+    // exists by the time the background task resolves it. The pending
+    // row is queued first so the GUI can render an immediate "Queued"
+    // pill state while the task picks up.
+    //
+    // Failure isolation: a DB error on the pending insert is logged
+    // (cosmetic — the user just won't see a sync pill); never propagated.
+    // Sync failure (Weaviate down, Ollama down, embedding model missing,
+    // network glitch) lands in `kg_syncs.error_message` and surfaces as
+    // a "Retry sync" affordance on the GUI pill — project create itself
+    // is already committed.
+    if let Err(e) = db.upsert_kg_sync(
+        &row.id,
+        kg_sync_status::PENDING,
+        Some(now),
+        None,
+        None,
+        0, 0, 0,
+        0, 0, 0,
+        None,
+        None,
+    ) {
+        eprintln!("[vct] warning: could not queue kg-sync for {}: {}", row.id, e);
+    } else {
+        kg_sync::spawn_initial_sync(
             app,
             row.id.clone(),
             row.name.clone(),

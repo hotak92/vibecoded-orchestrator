@@ -304,6 +304,45 @@ export interface CodeGraphBuildView {
   current_phase: string | null;
 }
 
+/**
+ * KG auto-sync (2026-05-12): per-project initial `kg-sync --all` status.
+ *
+ * Mirrors `KgSyncView` in commands::kg_sync (Rust). Fired on the
+ * `kg-sync-progress` Tauri event during a sync, and returned by
+ * `get_kg_sync_status`. Shape parallels `CodeGraphBuildView` — same
+ * lifecycle states, same optional timestamps, same `current_phase`
+ * field for live events.
+ */
+export type KgSyncStatus =
+  | 'pending'
+  | 'running'
+  | 'success'
+  | 'failed'
+  | 'skipped';
+
+export interface KgSyncView {
+  project_id: string;
+  status: KgSyncStatus;
+  /** ISO 8601 (RFC 3339); null until the sync starts. */
+  started_at_iso: string | null;
+  /** ISO 8601; null until the sync reaches a terminal state. */
+  finished_at_iso: string | null;
+  duration_ms: number | null;
+  /** Total `.md` files in knowledge/ (per the script's "📚 Found N" header). */
+  kg_total: number;
+  kg_succeeded: number;
+  kg_failed: number;
+  /** Total `.md` files in docs/ (per the script's "📚 Found N" header). */
+  docs_total: number;
+  docs_succeeded: number;
+  docs_failed: number;
+  error_message: string | null;
+  /** Last ~4 KiB of subprocess stdout/stderr — debugging aid. */
+  log_tail: string | null;
+  /** Live phase indicator on `running` events ("scan" | "knowledge" | "docs" | "embed"). */
+  current_phase: string | null;
+}
+
 /** Mirrors `InstallHealth` in commands/installer.rs. Returned by
  *  `check_install_health` once at app startup. When `all_ok` is false the
  *  layout renders `InstallHealthGate.svelte` as a blocking modal. */

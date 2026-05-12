@@ -68,6 +68,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "project_mcp_servers: per-project mirror of `.claude/settings.json::mcpServers` + `.mcp.json` with is_user_added flag for Custom MCP tab (KNOWN_ISSUES v0.2.x)",
         sql: include_str!("migrations/010_project_mcp_servers.sql"),
     },
+    Migration {
+        version: 11,
+        description: "kg_syncs: per-project initial KG / docs sync status (KG auto-sync on add-project, 2026-05-12)",
+        sql: include_str!("migrations/011_kg_syncs.sql"),
+    },
 ];
 
 /// Apply every migration whose version is greater than the current max applied.

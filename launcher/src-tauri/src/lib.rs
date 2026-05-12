@@ -196,6 +196,42 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 commands::lifecycle::auto_start_on_boot(app_handle_for_services).await;
             });
+
+            // Resume background tasks left behind by a previous launcher
+            // process (crash, force-quit, OOM). Two-phase, soft-fail —
+            // see `codegraph::resume_pending_builds` and
+            // `kg_sync::resume_pending_syncs` for the contract:
+            //   1. status='running' rows → marked failed with a clear
+            //      "launcher crashed mid-run; click Retry to re-run"
+            //      message. The GUI banner renders the failed state
+            //      with a Retry button, so the user sees the broken
+            //      lifecycle (silent re-spawn would mask the crash).
+            //   2. status='pending' rows → re-spawned via the same
+            //      mechanism as `create_project_v2`.
+            //
+            // Runs INSIDE setup() (not a spawned task) because:
+            //   - both functions return after enqueuing tokio::spawn —
+            //     no long-lived work blocks setup.
+            //   - we want the sweep to land before the GUI mounts, so
+            //     the user never sees a stale 'running' banner.
+            //   - if a project's create_project_v2 was mid-flight when
+            //     the launcher crashed, that row was 'pending' (the
+            //     RUNNING transition is the first thing
+            //     `run_build_task` / `run_sync_task` does after
+            //     spawn) — so phase 2 above is what actually picks it up.
+            let resume_handle = app.handle();
+            let (cg_swept, cg_resumed) =
+                commands::codegraph::resume_pending_builds(resume_handle);
+            let (kg_swept, kg_resumed) =
+                commands::kg_sync::resume_pending_syncs(resume_handle);
+            if cg_swept + cg_resumed + kg_swept + kg_resumed > 0 {
+                eprintln!(
+                    "[vct] resume-sweep: code-graph (running→failed: {}, pending respawned: {}); \
+                     kg-sync (running→failed: {}, pending respawned: {})",
+                    cg_swept, cg_resumed, kg_swept, kg_resumed
+                );
+            }
+
             Ok(())
         })
         // Intercept window-close (X / Cmd+Q) on the main window. We
@@ -437,6 +473,13 @@ pub fn run() {
             // Codegraph — Gap 2: initial build status + manual rebuild
             commands::codegraph::get_code_graph_build_status,
             commands::codegraph::rebuild_code_graph,
+            // KG auto-sync (2026-05-12): initial knowledge/ + docs/ sync
+            // status + manual retry. Mirrors the codegraph Gap-2 pattern —
+            // spawned from `create_project_v2` after bundle install so
+            // pre-existing markdown nodes land in Weaviate without the
+            // user having to manually run `.claude/scripts/kg-sync --all`.
+            commands::kg_sync::get_kg_sync_status,
+            commands::kg_sync::retry_kg_sync,
             // Hub proxy (v1.1)
             commands::hub_proxy::hub_info,
             commands::hub_proxy::hub_list_apps,

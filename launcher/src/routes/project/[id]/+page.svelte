@@ -11,7 +11,8 @@
   import PermissionsTab from '$lib/project-state/PermissionsTab.svelte';
   import SecretsTab from '$lib/project-state/SecretsTab.svelte';
   import KgCodegraphTab from '$lib/project-state/KgCodegraphTab.svelte';
-  import CodeGraphBuildPill from '$lib/components/CodeGraphBuildPill.svelte';
+  import CodeGraphBuildBanner from '$lib/components/CodeGraphBuildBanner.svelte';
+  import KgSyncBanner from '$lib/components/KgSyncBanner.svelte';
   import type { ProjectView } from '$lib/types/launcher';
 
   let projectId = $derived($page.params.id);
@@ -32,6 +33,7 @@
   let orchState = $state<OrchestratorState | null>(null);
   let updating = $state(false);
   let rebuilding = $state(false);
+  let resyncingKg = $state(false);
 
   async function rebuildCodeGraph() {
     if (!project) return;
@@ -43,6 +45,23 @@
       toast.error(e);
     } finally {
       rebuilding = false;
+    }
+  }
+
+  // Mirror of `rebuildCodeGraph` for the new KG-sync header button
+  // (Decision 2026-05-12 — option B: keep both buttons in the project
+  // header, smallest diff). `retry_kg_sync` already exists as a Tauri
+  // command and is the same one invoked from the failure-state banner.
+  async function resyncKg() {
+    if (!project) return;
+    resyncingKg = true;
+    try {
+      await invoke('retry_kg_sync', { projectId: project.id });
+      toast.success('KG sync started');
+    } catch (e) {
+      toast.error(e);
+    } finally {
+      resyncingKg = false;
     }
   }
 
@@ -112,7 +131,6 @@
         <p class="project-meta">
           <code>{project.folder_path}</code>
           <span class="host-badge host-{project.host}">{project.host}</span>
-          <CodeGraphBuildPill projectId={project.id} />
         </p>
       {/if}
     </div>
@@ -125,8 +143,31 @@
       >
         {rebuilding ? 'Starting…' : 'Re-build code graph'}
       </button>
+      <button
+        class="rebuild-btn"
+        onclick={resyncKg}
+        disabled={resyncingKg}
+        title="Re-run kg-sync --all on this project's knowledge/ and docs/ folders"
+      >
+        {resyncingKg ? 'Starting…' : 'Re-sync KG'}
+      </button>
     {/if}
   </header>
+
+  {#if project}
+    <!-- Background-task banners (KG sync 2026-05-12; code-graph Gap 2).
+         Stacked vertically below the header. Each banner self-manages
+         its visibility: idle/old-terminal states unmount themselves so
+         this region collapses to zero height when nothing's happening.
+         Order: KG sync on top (Decision 2026-05-12 — "most recently
+         started"; add-project spawns code-graph FIRST then KG-sync, so
+         KG-sync is the newer task and renders above the older one).
+         For the launcher-boot resume path the relative ordering is
+         arbitrary since both are re-spawned in the same setup() pass;
+         keeping the spawn-order-on-add-project sort is the cheap rule. -->
+    <KgSyncBanner projectId={project.id} />
+    <CodeGraphBuildBanner projectId={project.id} />
+  {/if}
 
   <!--
     Orchestrator-update banner.

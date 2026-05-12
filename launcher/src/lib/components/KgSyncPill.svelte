@@ -1,56 +1,42 @@
 <script lang="ts">
   // Compact, passive status pill for the projects-list grid
-  // (`routes/project/+page.svelte`). Indicates whether each project's
-  // code-graph build is queued / running / failed / etc. without
-  // taking up a list-row's full width.
+  // (`routes/project/+page.svelte`). Mirrors `CodeGraphBuildPill.svelte`
+  // — same passive design, same list-row scope, same rationale:
   //
-  // **Not** used on the project page itself — that surface uses
-  // `CodeGraphBuildBanner.svelte` (full-width, action-bearing, with the
-  // "Retry build" button and the failure-detail expansion). This pill is
-  // intentionally passive: no click target, no popover, no retry — the
-  // user navigates into the project to act on a failure. Keeping the
-  // pill display-only avoids two clickable status surfaces fighting
-  // (one in the list row, one as a banner once you're inside).
+  //   * Project-page surface uses `KgSyncBanner.svelte` (full-width,
+  //     action-bearing, with the "Retry sync" button and the failure-
+  //     detail expansion).
+  //   * This pill is intentionally passive: no click target, no popover,
+  //     no retry. The user navigates into the project to act on a
+  //     failure. Keeps the list row uncluttered.
   //
-  // History: before 2026-05-12 there was one `CodeGraphBuildPill` that
-  // did both list-row AND project-page duty (with a `compact` prop to
-  // distinguish). The project-page surface was promoted to a banner for
-  // visibility (Decision 2026-05-12 — see
-  // `.claude/context/kg-autosync-patch-2026-05-12.md`); this file
-  // survives as the passive list-row indicator.
+  // See `CodeGraphBuildPill.svelte` for the historical context — same
+  // design lineage (Decision 2026-05-12 banner promotion).
 
   import { onDestroy, onMount } from 'svelte';
   import { listen, safeInvoke } from '$lib/tauri';
-  import type {
-    CodeGraphBuildView,
-    CodeGraphBuildStatus,
-  } from '$lib/types/launcher';
+  import type { KgSyncStatus, KgSyncView } from '$lib/types/launcher';
 
   interface Props {
     projectId: string;
-    /** Compat with the pre-banner API: `compact` strips the text label,
-     *  rendering only the glyph. The list-row caller always passes
-     *  `compact` today. Left as a prop in case a future caller wants a
-     *  labelled pill in a denser surface than the banner. */
+    /** `compact` strips the text label, rendering only the glyph. The
+     *  list-row caller always passes `compact` today. */
     compact?: boolean;
   }
 
   let { projectId, compact = false }: Props = $props();
 
-  let view = $state<CodeGraphBuildView | null>(null);
+  let view = $state<KgSyncView | null>(null);
   let unlisten: (() => void) | null = null;
 
   async function load() {
-    view = await safeInvoke<CodeGraphBuildView | null>(
-      'get_code_graph_build_status',
-      { projectId },
-    );
+    view = await safeInvoke<KgSyncView | null>('get_kg_sync_status', { projectId });
   }
 
   onMount(async () => {
     await load();
-    unlisten = await listen<CodeGraphBuildView>(
-      'code-graph-build-progress',
+    unlisten = await listen<KgSyncView>(
+      'kg-sync-progress',
       (e) => {
         if (e.payload.project_id !== projectId) return;
         view = {
@@ -60,15 +46,23 @@
             started_at_iso: null,
             finished_at_iso: null,
             duration_ms: null,
-            files_analyzed: 0,
-            languages: [],
-            joern_used: false,
+            kg_total: 0,
+            kg_succeeded: 0,
+            kg_failed: 0,
+            docs_total: 0,
+            docs_succeeded: 0,
+            docs_failed: 0,
             error_message: null,
             log_tail: null,
             current_phase: null,
           }),
           status: e.payload.status,
-          files_analyzed: e.payload.files_analyzed ?? view?.files_analyzed ?? 0,
+          kg_total: e.payload.kg_total ?? view?.kg_total ?? 0,
+          kg_succeeded: e.payload.kg_succeeded ?? view?.kg_succeeded ?? 0,
+          kg_failed: e.payload.kg_failed ?? view?.kg_failed ?? 0,
+          docs_total: e.payload.docs_total ?? view?.docs_total ?? 0,
+          docs_succeeded: e.payload.docs_succeeded ?? view?.docs_succeeded ?? 0,
+          docs_failed: e.payload.docs_failed ?? view?.docs_failed ?? 0,
           current_phase: e.payload.current_phase,
           error_message: e.payload.error_message ?? view?.error_message ?? null,
         };
@@ -87,7 +81,7 @@
     unlisten?.();
   });
 
-  function statusGlyph(s: CodeGraphBuildStatus): string {
+  function statusGlyph(s: KgSyncStatus): string {
     switch (s) {
       case 'pending': return '·';
       case 'running': return '⟳';
@@ -97,22 +91,26 @@
     }
   }
 
-  function statusLabel(v: CodeGraphBuildView): string {
+  function statusLabel(v: KgSyncView): string {
+    const done = v.kg_succeeded + v.docs_succeeded;
+    const total = v.kg_total + v.docs_total;
     switch (v.status) {
-      case 'pending': return 'Queued';
-      case 'running': return v.current_phase === 'scan' ? 'Scanning…' : 'Indexing…';
+      case 'pending': return 'KG queued';
+      case 'running':
+        if (v.current_phase === 'scan') return 'KG scanning…';
+        if (total > 0) return `KG ${done}/${total}`;
+        return 'KG embedding…';
       case 'success':
-        if (v.files_analyzed === 0) return 'Indexed';
-        return `Indexed · ${v.files_analyzed} file${v.files_analyzed === 1 ? '' : 's'}`;
-      case 'failed': return 'Index failed';
-      case 'skipped': return 'No source files';
+        if (total === 0) return 'KG synced';
+        return `KG ${total} node${total === 1 ? '' : 's'}`;
+      case 'failed': return 'KG sync failed';
+      case 'skipped': return 'KG no content';
     }
   }
 
-  function tooltip(v: CodeGraphBuildView): string {
-    const parts: string[] = [`Code graph: ${statusLabel(v)}`];
+  function tooltip(v: KgSyncView): string {
+    const parts: string[] = [`KG sync: ${statusLabel(v)}`];
     if (v.error_message) parts.push(v.error_message);
-    if (v.languages.length > 0) parts.push(`Languages: ${v.languages.join(', ')}`);
     if (v.duration_ms != null) parts.push(`Took ${(v.duration_ms / 1000).toFixed(1)}s`);
     return parts.join(' · ');
   }
@@ -123,7 +121,7 @@
     class="pill status-{view.status}"
     class:compact
     title={tooltip(view)}
-    aria-label={`Code graph: ${statusLabel(view)}`}
+    aria-label={`KG sync: ${statusLabel(view)}`}
     role="status"
   >
     <span class="glyph" class:spin={view.status === 'running'} aria-hidden="true">
@@ -136,9 +134,8 @@
 {/if}
 
 <style>
-  /* Styles cloned from the pre-2026-05-12 pill, minus the failure-
-     popover plumbing (this is the passive list-row variant — failure
-     details live on the project-page banner instead). */
+  /* Styles cloned verbatim from CodeGraphBuildPill so the two pills
+     line up visually in the projects-list grid. */
   .pill {
     display: inline-flex;
     align-items: center;
