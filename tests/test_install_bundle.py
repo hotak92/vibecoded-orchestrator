@@ -209,10 +209,15 @@ class InstallBundleFreshTests(unittest.TestCase):
         manifest_path = self.proj / ".claude" / ".vco-manifest.json"
         self.assertTrue(manifest_path.exists())
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        self.assertEqual(manifest["schema_version"], 1)
+        # Schema v2 (2026-05-13, deferral-ux-polish item 5): bumped from 1
+        # to add the `preserved_files` section. Reader code defaults the
+        # section to `{}` for v1 manifests, so no migration is required.
+        self.assertEqual(manifest["schema_version"], 2)
         self.assertIn("vco_version", manifest)
         self.assertIn("installed_at", manifest)
         self.assertIn("files", manifest)
+        self.assertIn("preserved_files", manifest)
+        self.assertIsInstance(manifest["preserved_files"], dict)
         # Manifest entries carry sha256 + source.
         for rel, info in manifest["files"].items():
             self.assertIn("sha256", info)
@@ -831,6 +836,639 @@ class SmartMergeSettingsTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
+class DeferralCommandPortabilityTests(unittest.TestCase):
+    """Item 4 / Gap 7 (deferral-ux-polish 2026-05-13): the `command_to_apply`
+    in every bundle deferral must reference `$VCT_ORCHESTRATOR_ROOT` (env
+    var sourced from `.claude/env`), NOT a baked literal path. Otherwise
+    the command breaks when the project is synced to another machine.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="vct-cmdport-"))
+        self.orch = self.tmp / "orchestrator"
+        self.proj = self.tmp / "project"
+        self.orch.mkdir()
+        self.proj.mkdir()
+        _make_fake_orchestrator(self.orch)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(str(self.tmp), ignore_errors=True)
+
+    def test_skip_existing_command_uses_env_var(self):
+        """Pre-fix: command embedded `/tmp/.../orchestrator` literal.
+        Post-fix: command references `$VCT_ORCHESTRATOR_ROOT`.
+        """
+        is_windows = platform.system() == "Windows"
+        ext = "ps1" if is_windows else "sh"
+        target = self.proj / ".claude" / "hooks" / f"foo.{ext}"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("USER CUSTOM\n", encoding="utf-8")
+
+        project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch, update_mode=False,
+        )
+        deferral = (self.proj / ".claude" / "context" / "UPDATE_DEFERRED.md") \
+            .read_text(encoding="utf-8")
+        # Env-var form is present (the literal `$VCT_ORCHESTRATOR_ROOT`
+        # string survives shell quoting because we emit it inside double
+        # quotes for portability).
+        self.assertIn("$VCT_ORCHESTRATOR_ROOT", deferral)
+        # Literal orchestrator path is NOT in the deferral.
+        self.assertNotIn(str(self.orch), deferral,
+                         f"orchestrator path leaked: deferral contains {self.orch!s}")
+
+    def test_user_modified_command_uses_env_var(self):
+        """Same invariant for the update-mode preserve deferral."""
+        is_windows = platform.system() == "Windows"
+        ext = "ps1" if is_windows else "sh"
+        # Seed install + user modification.
+        project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch, update_mode=False,
+        )
+        foo = self.proj / ".claude" / "hooks" / f"foo.{ext}"
+        foo.write_text("USER EDIT\n", encoding="utf-8")
+        (self.orch / "templates" / "hooks" / f"foo.{ext}").write_text(
+            "v2\n", encoding="utf-8",
+        )
+        project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch, update_mode=True,
+        )
+        deferral = (self.proj / ".claude" / "context" / "UPDATE_DEFERRED.md") \
+            .read_text(encoding="utf-8")
+        self.assertIn("$VCT_ORCHESTRATOR_ROOT", deferral)
+        self.assertNotIn(str(self.orch), deferral,
+                         f"orchestrator path leaked: deferral contains {self.orch!s}")
+
+
+class DeferralFileListCapTests(unittest.TestCase):
+    """Item 3 / Gap 2 (deferral-ux-polish 2026-05-13): the file-list cap in
+    `_format_file_list_md` was 20, which silently truncated SD15's 36-file
+    deferral. Bumped to 100 so realistic preserve/skip lists land inline.
+    """
+
+    def test_thirtyfive_paths_all_land_inline(self):
+        """Pre-fix: only the first 20 of 35 paths rendered; the rest were
+        hidden behind `... and N more`. Post-fix: all 35 inline, no
+        truncation trailer."""
+        paths = [f"a/b/file_{i:03d}.txt" for i in range(35)]
+        rendered = project_init._format_file_list_md(paths)
+        # Every path present.
+        for p in paths:
+            self.assertIn(f"`{p}`", rendered,
+                          f"path {p} missing from rendered list")
+        # No truncation trailer.
+        self.assertNotIn("and ", rendered.split("\n")[-1].lower(),
+                         f"unexpected trailer in:\n{rendered}")
+        # Sanity: 35 lines, one per path (34 newlines between them).
+        self.assertEqual(rendered.count("\n"), 34)
+
+    def test_oversize_list_still_truncates(self):
+        """Sanity: a pathological 150-entry list still caps at 100 with
+        the trailer (cap bumped to 100, not removed)."""
+        paths = [f"x/{i}.txt" for i in range(150)]
+        rendered = project_init._format_file_list_md(paths)
+        # Trailer present, naming the overflow count.
+        self.assertIn("... and 50 more", rendered)
+        # First 100 included; entries 100-149 absent.
+        self.assertIn("`x/0.txt`", rendered)
+        self.assertIn("`x/99.txt`", rendered)
+        self.assertNotIn("`x/100.txt`", rendered)
+
+
+class DeferralReconcileTests(unittest.TestCase):
+    """Gap 11 fix (deferral-ux-polish 2026-05-13, item 1): when an install
+    fully resolves a deferral condition, the stale entry must be removed
+    from UPDATE_DEFERRED.md (and the file unlinked if no entries remain).
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="vct-reconcile-"))
+        self.orch = self.tmp / "orchestrator"
+        self.proj = self.tmp / "project"
+        self.orch.mkdir()
+        self.proj.mkdir()
+        _make_fake_orchestrator(self.orch)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(str(self.tmp), ignore_errors=True)
+
+    def _deferral_path(self) -> Path:
+        return self.proj / ".claude" / "context" / "UPDATE_DEFERRED.md"
+
+    def test_force_update_clears_stale_skipped_existing_deferral(self):
+        """The SD15 smoking-gun bug: first-install preserves files →
+        UPDATE_DEFERRED.md written with bundle_skipped_existing_files. User
+        then runs --update --force which overwrites every preserved file.
+        Pre-fix: the deferral .md still exists with the stale entry,
+        because the emit function is guarded behind a non-empty list.
+        Post-fix: the reconcile pass detects that no skipped paths remain
+        and unlinks the file.
+        """
+        is_windows = platform.system() == "Windows"
+        ext = "ps1" if is_windows else "sh"
+        target = self.proj / ".claude" / "hooks" / f"foo.{ext}"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("USER CUSTOM\n", encoding="utf-8")
+
+        # First install: emits deferral.
+        project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch, update_mode=False,
+        )
+        self.assertTrue(self._deferral_path().exists(),
+                        "fresh-install with skipped file should emit deferral")
+        report = DeferralReport.read(self.proj)
+        self.assertTrue(report.has_condition("bundle_skipped_existing_files"))
+
+        # Resolve with --update --force: every file now matches shipped.
+        project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch,
+            update_mode=True, force=True,
+        )
+        # Post-fix: deferral file is unlinked because the sole bundle
+        # condition has been resolved.
+        self.assertFalse(
+            self._deferral_path().exists(),
+            "--update --force must clear stale bundle_skipped_existing_files deferral",
+        )
+
+    def test_force_update_clears_stale_user_modified_deferral(self):
+        """`bundle_user_modified_preserved` written during a non-force
+        --update → resolved by a follow-up --update --force. Stale entry
+        must be removed.
+        """
+        is_windows = platform.system() == "Windows"
+        ext = "ps1" if is_windows else "sh"
+        # Seed.
+        project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch, update_mode=False,
+        )
+        # User modifies + orchestrator bumps → --update preserves.
+        foo = self.proj / ".claude" / "hooks" / f"foo.{ext}"
+        foo.write_text("USER EDIT\n", encoding="utf-8")
+        (self.orch / "templates" / "hooks" / f"foo.{ext}").write_text(
+            "v2\n", encoding="utf-8",
+        )
+        project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch, update_mode=True,
+        )
+        report = DeferralReport.read(self.proj)
+        self.assertTrue(report.has_condition("bundle_user_modified_preserved"))
+
+        # Force resolves it.
+        project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch,
+            update_mode=True, force=True,
+        )
+        self.assertFalse(self._deferral_path().exists())
+
+    def test_reconcile_preserves_unrelated_conditions(self):
+        """Only `bundle_*` condition_ids are owned by install_bundle. Other
+        conditions (e.g. schema_migration_required, written by a separate
+        code path) must NOT be touched by the reconcile pass.
+        """
+        from vco_lib.deferral_report import DeferralEntry, DeferralReport as DR
+        # Seed clean install.
+        project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch, update_mode=False,
+        )
+        # Inject an unrelated deferral entry that this install can't see.
+        report = DR.read(self.proj)
+        report.add_entry(DeferralEntry(
+            condition_id="schema_migration_required",
+            title="Pretend migration",
+            detected="Pretend.",
+            why_deferred="Pretend.",
+            command_to_apply="echo nope",
+            severity="warning",
+        ))
+        report.write(self.proj)
+        self.assertTrue(self._deferral_path().exists())
+
+        # Re-run install with nothing skipped. Reconcile should leave
+        # the unrelated entry alone.
+        project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch, update_mode=True,
+        )
+        self.assertTrue(
+            self._deferral_path().exists(),
+            "unrelated condition_id must NOT be cleared by bundle reconcile",
+        )
+        report_after = DR.read(self.proj)
+        self.assertTrue(report_after.has_condition("schema_migration_required"))
+
+    def test_partial_resolution_keeps_remaining_entries(self):
+        """If a previous run wrote BOTH bundle conditions to the deferral
+        and the current run only resolves ONE of them, the surviving
+        condition_id keeps its entry in the deferral file (file is
+        rewritten, not unlinked).
+
+        We construct this state by seeding both entries manually, then
+        running an install that only resolves one of them.
+        """
+        is_windows = platform.system() == "Windows"
+        ext = "ps1" if is_windows else "sh"
+        # Seed install + user-modify a file so --update writes the
+        # bundle_user_modified_preserved entry.
+        project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch, update_mode=False,
+        )
+        foo = self.proj / ".claude" / "hooks" / f"foo.{ext}"
+        foo.write_text("USER FOO\n", encoding="utf-8")
+        (self.orch / "templates" / "hooks" / f"foo.{ext}").write_text(
+            "v2 foo\n", encoding="utf-8",
+        )
+        project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch, update_mode=True,
+        )
+        self.assertTrue(self._deferral_path().exists())
+
+        # Manually inject a stale bundle_skipped_existing_files entry into
+        # the deferral file (simulates a prior fresh-install run that left
+        # it behind — the SD15 starting condition).
+        from vco_lib.deferral_report import DeferralEntry, DeferralReport as DR
+        report = DR.read(self.proj)
+        report.add_entry(DeferralEntry(
+            condition_id="bundle_skipped_existing_files",
+            title="Pretend stale skipped",
+            detected="Pretend.",
+            why_deferred="Pretend.",
+            command_to_apply="echo replay",
+            severity="info",
+        ))
+        report.write(self.proj)
+
+        # Now run --update --force: resolves the user-modified entry only.
+        # The stale skipped-existing entry should be cleared too (its
+        # condition is also empty: 0 skipped paths this run).
+        project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch,
+            update_mode=True, force=True,
+        )
+        # Both conditions resolved → file unlinked.
+        self.assertFalse(self._deferral_path().exists())
+
+
+def _ship_project_level_templates(root: Path) -> None:
+    """Add the three project-level template stubs to a fake orchestrator.
+
+    Mirrors what VCO actually ships under `templates/` for item 7 / Obs 7.
+    Kept separate from `_make_fake_orchestrator` so tests that don't care
+    about templates aren't paying for the extra fixture surface.
+    """
+    templates = root / "templates"
+    templates.mkdir(exist_ok=True)
+    (templates / "CLAUDE.md.template").write_text(
+        "# {{PROJECT_NAME}} — Project Instructions\n"
+        "\n"
+        "Project root: {{PROJECT_ROOT}}\n"
+        "Orchestrator: {{ORCHESTRATOR_ROOT}}\n"
+        "\n"
+        "## SESSION START\n"
+        "Read .claude/CONTEXT_STATE.md first.\n",
+        encoding="utf-8",
+    )
+    (templates / "CONTEXT_STATE.md.template").write_text(
+        "# {{PROJECT_NAME}} — Context State\n"
+        "\n"
+        "## Current Status\n"
+        "_(Describe what's currently being worked on...)_\n",
+        encoding="utf-8",
+    )
+    (templates / "MEMORY.md.template").write_text(
+        "# Memory — {{PROJECT_NAME}}\n"
+        "\n"
+        "## Index\n"
+        "_(none yet — add entries as the project accumulates stable patterns.)_\n",
+        encoding="utf-8",
+    )
+
+
+class ProjectLevelTemplatesTests(unittest.TestCase):
+    """Item 7 / Obs 7 (deferral-ux-polish 2026-05-13): VCO ships minimal
+    stubs for the three project-level files (CLAUDE.md, CONTEXT_STATE.md,
+    MEMORY.md). Missing → install stub as the live file. Present → write
+    a `.reference.md` sidecar under `.claude/context/templates/` and emit
+    a `template_review_pending` deferral when meaningfully diverged.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="vct-templates-"))
+        self.orch = self.tmp / "orchestrator"
+        self.proj = self.tmp / "MyTestProject"
+        self.orch.mkdir()
+        self.proj.mkdir()
+        _make_fake_orchestrator(self.orch)
+        _ship_project_level_templates(self.orch)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(str(self.tmp), ignore_errors=True)
+
+    def test_missing_files_get_substituted_stubs(self):
+        """Pre-fix: a fresh project had no CLAUDE.md / CONTEXT_STATE.md /
+        MEMORY.md unless project-bootstrapper ran. Post-fix: VCO ships
+        minimal substituted stubs so the project is self-sufficient
+        on first install."""
+        # Sanity: none of the three exist yet.
+        self.assertFalse((self.proj / "CLAUDE.md").exists())
+        self.assertFalse((self.proj / ".claude" / "CONTEXT_STATE.md").exists())
+        self.assertFalse((self.proj / "MEMORY.md").exists())
+
+        result = project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch, update_mode=False,
+        )
+        # All three live files present after install.
+        claude_md = (self.proj / "CLAUDE.md").read_text(encoding="utf-8")
+        ctx_md = (self.proj / ".claude" / "CONTEXT_STATE.md").read_text(encoding="utf-8")
+        mem_md = (self.proj / "MEMORY.md").read_text(encoding="utf-8")
+        # Substitution applied: project name = folder basename ("MyTestProject").
+        self.assertIn("MyTestProject", claude_md)
+        self.assertIn("MyTestProject", ctx_md)
+        self.assertIn("MyTestProject", mem_md)
+        # Placeholders fully replaced — no leftover braces.
+        for body in (claude_md, ctx_md, mem_md):
+            self.assertNotIn("{{PROJECT_NAME}}", body)
+            self.assertNotIn("{{PROJECT_ROOT}}", body)
+        # Result dict surfaces the new install.
+        self.assertIn("templates", result)
+        self.assertIn("CLAUDE.md", result["templates"]["live_created"])
+        self.assertIn(str(Path(".claude") / "CONTEXT_STATE.md"),
+                      result["templates"]["live_created"])
+        # When the live file is freshly created, no .reference.md is
+        # written (the live file IS the reference at this moment).
+        ref_path = self.proj / ".claude" / "context" / "templates" / "CLAUDE.md.reference.md"
+        self.assertFalse(ref_path.exists(),
+                         "fresh install: reference sidecar should not be written")
+        # And no template_review_pending deferral (nothing diverged yet).
+        report = DeferralReport.read(self.proj)
+        self.assertFalse(report.has_condition("template_review_pending"))
+
+    def test_existing_file_gets_reference_sidecar_only(self):
+        """If CLAUDE.md already exists in the project, VCO MUST NOT
+        overwrite it. Instead, the substituted template lands at
+        `.claude/context/templates/CLAUDE.md.reference.md` so the user can
+        diff."""
+        original = "# My Existing Custom CLAUDE.md\n\nUser content.\n"
+        (self.proj / "CLAUDE.md").write_text(original, encoding="utf-8")
+
+        project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch, update_mode=False,
+        )
+        # On-disk CLAUDE.md is byte-identical to what the user had.
+        # (Modulo any reminder-block injection from Item 2 — verify the
+        # USER CONTENT survives.)
+        body = (self.proj / "CLAUDE.md").read_text(encoding="utf-8")
+        self.assertIn("# My Existing Custom CLAUDE.md", body)
+        self.assertIn("User content.", body)
+        # Reference sidecar present, substituted.
+        ref = (self.proj / ".claude" / "context" / "templates"
+               / "CLAUDE.md.reference.md").read_text(encoding="utf-8")
+        self.assertIn("MyTestProject", ref)
+        self.assertNotIn("{{PROJECT_NAME}}", ref)  # substituted, not literal
+        # Diverged → template_review_pending deferral emitted.
+        report = DeferralReport.read(self.proj)
+        self.assertTrue(report.has_condition("template_review_pending"))
+
+    def test_matching_file_no_deferral(self):
+        """If the user's existing file already matches the reference
+        template byte-for-byte (modulo trailing whitespace), no
+        `template_review_pending` deferral is emitted — there's nothing
+        to nudge them about."""
+        # Pre-place the existing file as a substituted copy of the
+        # CLAUDE.md template — same shape VCO would ship.
+        existing = (
+            "# MyTestProject — Project Instructions\n"
+            "\n"
+            f"Project root: {self.proj}\n"
+            f"Orchestrator: {self.orch}\n"
+            "\n"
+            "## SESSION START\n"
+            "Read .claude/CONTEXT_STATE.md first.\n"
+        )
+        (self.proj / "CLAUDE.md").write_text(existing, encoding="utf-8")
+
+        project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch, update_mode=False,
+        )
+        # No template_review_pending entry — the existing CLAUDE.md is
+        # already aligned with the reference shape.
+        report = DeferralReport.read(self.proj)
+        # CONTEXT_STATE.md and MEMORY.md don't exist → they get installed
+        # fresh; only CLAUDE.md matches. With only CLAUDE.md aligned and
+        # the other two newly-installed (so not "diverged" — they're the
+        # SAME as reference because we just wrote them), the deferral
+        # should NOT fire.
+        self.assertFalse(
+            report.has_condition("template_review_pending"),
+            f"unexpected template deferral; diverged set should be empty",
+        )
+
+    def test_whitespace_only_diff_does_not_flag(self):
+        """A file that only differs from the reference in trailing
+        whitespace / trailing newlines is NOT considered diverged."""
+        # Same content + trailing whitespace and an extra blank line.
+        existing = (
+            "# MyTestProject — Project Instructions   \n"  # trailing spaces
+            "\n"
+            f"Project root: {self.proj}\n"
+            f"Orchestrator: {self.orch}\n"
+            "\n"
+            "## SESSION START\n"
+            "Read .claude/CONTEXT_STATE.md first.\n"
+            "\n\n\n"  # extra blank lines at EOF
+        )
+        (self.proj / "CLAUDE.md").write_text(existing, encoding="utf-8")
+
+        project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch, update_mode=False,
+        )
+        report = DeferralReport.read(self.proj)
+        # Whitespace-only diff → no deferral.
+        self.assertFalse(report.has_condition("template_review_pending"))
+
+    def test_dry_run_no_template_writes(self):
+        """Dry-run must not mutate the filesystem — no live install, no
+        sidecar write."""
+        result = project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch,
+            update_mode=False, dry_run=True,
+        )
+        # No files written.
+        self.assertFalse((self.proj / "CLAUDE.md").exists())
+        self.assertFalse((self.proj / "MEMORY.md").exists())
+        self.assertFalse((self.proj / ".claude" / "context" / "templates").exists())
+        # But the classification still ran (templates result populated).
+        self.assertIn("templates", result)
+
+    def test_diverged_then_resolved_clears_deferral(self):
+        """Item 1 reconcile pass also clears `template_review_pending`
+        when the project's CLAUDE.md catches up with the reference (or
+        the reference catches up with the project)."""
+        # Diverged: user has a non-template CLAUDE.md.
+        (self.proj / "CLAUDE.md").write_text(
+            "# Diverged content\n", encoding="utf-8",
+        )
+        project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch, update_mode=False,
+        )
+        report = DeferralReport.read(self.proj)
+        self.assertTrue(report.has_condition("template_review_pending"))
+
+        # Now align CLAUDE.md with the reference. Read the reference,
+        # write it back to the live file. Item 2's reminder block
+        # may have been injected (Item 1 deferral is also active);
+        # to keep this test focused on item 7's reconcile, just write
+        # the same exact reference content back.
+        ref = (self.proj / ".claude" / "context" / "templates"
+               / "CLAUDE.md.reference.md").read_text(encoding="utf-8")
+        (self.proj / "CLAUDE.md").write_text(ref, encoding="utf-8")
+
+        # Re-run install → template_review_pending should be cleared.
+        project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch, update_mode=False,
+        )
+        report2 = DeferralReport.read(self.proj)
+        self.assertFalse(
+            report2.has_condition("template_review_pending"),
+            "reconcile pass should clear template_review_pending when the "
+            "live file aligns with the reference",
+        )
+
+
+class ManifestPreservedFilesTests(unittest.TestCase):
+    """Schema v2 (deferral-ux-polish 2026-05-13, item 5): the manifest tracks
+    preserved files so a future install (or auditor) can answer "did VCO ever
+    try to install file X here?" after the deferral is resolved.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="vct-manifest-preserved-"))
+        self.orch = self.tmp / "orchestrator"
+        self.proj = self.tmp / "project"
+        self.orch.mkdir()
+        self.proj.mkdir()
+        _make_fake_orchestrator(self.orch)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(str(self.tmp), ignore_errors=True)
+
+    def _manifest(self) -> dict:
+        return json.loads(
+            (self.proj / ".claude" / ".vco-manifest.json").read_text(encoding="utf-8")
+        )
+
+    def test_fresh_install_writes_schema_v2_with_empty_preserved(self):
+        """Bug-scenario pre-fix: a v1 manifest had no permanent record of
+        preserved files. Post-fix: every install emits schema_version=2 with
+        a `preserved_files` section (empty on the happy path)."""
+        project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch, update_mode=False,
+        )
+        m = self._manifest()
+        self.assertEqual(m["schema_version"], 2)
+        self.assertIn("preserved_files", m)
+        self.assertEqual(m["preserved_files"], {})
+
+    def test_skip_existing_records_preserved_entry(self):
+        """First-install with a pre-existing custom file → `preserved_files`
+        records the entry with reason='skip-existing'.
+        """
+        is_windows = platform.system() == "Windows"
+        ext = "ps1" if is_windows else "sh"
+        target = self.proj / ".claude" / "hooks" / f"foo.{ext}"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("USER CUSTOM\n", encoding="utf-8")
+
+        project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch, update_mode=False,
+        )
+        m = self._manifest()
+        rel = str(Path(".claude") / "hooks" / f"foo.{ext}")
+        self.assertIn(rel, m["preserved_files"])
+        entry = m["preserved_files"][rel]
+        self.assertEqual(entry["reason"], "skip-existing")
+        self.assertEqual(len(entry["shipped_sha256"]), 64)
+        self.assertTrue(entry["preserved_at"].endswith("Z"))
+        # Source rel is recorded so an auditor can re-derive what would
+        # have shipped at install time.
+        self.assertIn(f"foo.{ext}", entry["shipped_source"])
+
+    def test_preserve_in_update_mode_records_preserved_entry(self):
+        """`--update` with a user-modified file → `preserved_files` records
+        the entry with reason='preserve'.
+        """
+        is_windows = platform.system() == "Windows"
+        ext = "ps1" if is_windows else "sh"
+        # Seed install.
+        project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch, update_mode=False,
+        )
+        # User edits foo.sh, orchestrator bumps it too.
+        foo = self.proj / ".claude" / "hooks" / f"foo.{ext}"
+        foo.write_text("USER EDIT\n", encoding="utf-8")
+        (self.orch / "templates" / "hooks" / f"foo.{ext}").write_text(
+            "#!/bin/sh\necho v_pf\n", encoding="utf-8",
+        )
+
+        project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch, update_mode=True,
+        )
+        m = self._manifest()
+        rel = str(Path(".claude") / "hooks" / f"foo.{ext}")
+        self.assertIn(rel, m["preserved_files"])
+        self.assertEqual(m["preserved_files"][rel]["reason"], "preserve")
+
+    def test_force_resolves_preserved_entry_in_manifest(self):
+        """`--update --force` overwrites a preserved file → the manifest's
+        `preserved_files` section no longer references it on the next run.
+        Each install run rebuilds the section from scratch, so converged
+        files automatically fall off.
+        """
+        is_windows = platform.system() == "Windows"
+        ext = "ps1" if is_windows else "sh"
+        target = self.proj / ".claude" / "hooks" / f"foo.{ext}"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("USER CUSTOM\n", encoding="utf-8")
+
+        # First install: file preserved.
+        project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch, update_mode=False,
+        )
+        rel = str(Path(".claude") / "hooks" / f"foo.{ext}")
+        self.assertIn(rel, self._manifest()["preserved_files"])
+
+        # Force-resolve: file overwritten → preserved_files entry gone.
+        project_init.install_project_bundle(
+            self.proj, orchestrator_root=self.orch,
+            update_mode=True, force=True,
+        )
+        self.assertNotIn(rel, self._manifest()["preserved_files"])
+
+    def test_v1_manifest_read_back_defaults_preserved_to_empty(self):
+        """Forward-compat: a manifest written by an old VCO (schema v1, no
+        `preserved_files` key) reads back with an empty preserved_files
+        dict so callers can treat the shape uniformly."""
+        claude = self.proj / ".claude"
+        claude.mkdir()
+        # Hand-roll a v1-shaped manifest (no preserved_files key).
+        (claude / ".vco-manifest.json").write_text(
+            json.dumps({
+                "schema_version": 1,
+                "vco_version": "abc1234",
+                "installed_at": "2026-04-01T00:00:00Z",
+                "files": {"a.txt": {"sha256": "deadbeef", "source": "t/a.txt"}},
+            }),
+            encoding="utf-8",
+        )
+        m = project_init._read_manifest(self.proj)
+        self.assertEqual(m["preserved_files"], {})
+        # Original v1 data still accessible.
+        self.assertIn("a.txt", m["files"])
+
+
 class ManifestRoundTripTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="vct-manifest-"))
@@ -841,8 +1479,11 @@ class ManifestRoundTripTests(unittest.TestCase):
 
     def test_read_returns_empty_when_missing(self):
         m = project_init._read_manifest(self.tmp)
-        self.assertEqual(m["schema_version"], 1)
+        # Schema bumped to v2 on 2026-05-13 (deferral-ux-polish item 5).
+        self.assertEqual(m["schema_version"], 2)
         self.assertEqual(m["files"], {})
+        # preserved_files section is part of v2's empty-manifest shape.
+        self.assertEqual(m["preserved_files"], {})
 
     def test_write_atomic_creates_directory(self):
         # No .claude/ yet — writer must mkdir.

@@ -912,5 +912,165 @@ class TestHighFixesIntegration(unittest.TestCase):
         self.assertEqual(kg_plan["action"], "rebuild")
 
 
+class TestClaudeMdReminder(unittest.TestCase):
+    """Item 2 / Gap 10 (deferral-ux-polish 2026-05-13): writing a non-empty
+    deferral injects a wrapped reminder block into ``<folder>/CLAUDE.md``;
+    deleting the deferral strips it. Both helpers are best-effort (missing
+    CLAUDE.md is a no-op, never raises).
+
+    Mirrors install.py's `<!-- vct-merge-pending -->` pattern: wrapped HTML
+    comments, idempotent rewrite-in-place, no duplication on re-injection.
+    """
+
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.mkdtemp()
+        self.folder = Path(self._tmpdir)
+
+    def tearDown(self) -> None:
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _claude_md(self) -> Path:
+        return self.folder / "CLAUDE.md"
+
+    def test_write_injects_block_when_claude_md_lacks_frontmatter(self):
+        """No frontmatter → block lands at the very top of CLAUDE.md."""
+        self._claude_md().write_text(
+            "# My Project\n\nSome existing content here.\n",
+            encoding="utf-8",
+        )
+        report = DeferralReport()
+        report.add_entry(_make_entry("test_cond_no_fm"))
+        report.write(self.folder)
+
+        body = self._claude_md().read_text(encoding="utf-8")
+        # Block present, ONCE.
+        self.assertEqual(body.count("<!-- vco-deferral-reminder-begin -->"), 1)
+        self.assertEqual(body.count("<!-- vco-deferral-reminder-end -->"), 1)
+        # User content survives.
+        self.assertIn("# My Project", body)
+        self.assertIn("Some existing content here.", body)
+        # Block precedes user content (no frontmatter case → top).
+        self.assertLess(
+            body.find("<!-- vco-deferral-reminder-begin -->"),
+            body.find("# My Project"),
+        )
+
+    def test_write_injects_block_after_frontmatter(self):
+        """Frontmatter present → block lands immediately after the
+        closing fence, before the body content."""
+        self._claude_md().write_text(
+            "---\n"
+            "title: My Project\n"
+            "version: 1.0\n"
+            "---\n"
+            "\n"
+            "# My Project\n",
+            encoding="utf-8",
+        )
+        report = DeferralReport()
+        report.add_entry(_make_entry("test_cond_fm"))
+        report.write(self.folder)
+
+        body = self._claude_md().read_text(encoding="utf-8")
+        # Block landed after the frontmatter (after the SECOND `---\n`).
+        # Frontmatter must still be intact at the top.
+        self.assertTrue(body.startswith("---\n"),
+                        f"frontmatter clobbered:\n{body!r}")
+        # Block precedes body heading.
+        block_pos = body.find("<!-- vco-deferral-reminder-begin -->")
+        heading_pos = body.find("# My Project")
+        fm_close_pos = body.find("---\n", 4)  # second --- line
+        self.assertGreater(block_pos, fm_close_pos,
+                           "block must come AFTER closing frontmatter fence")
+        self.assertLess(block_pos, heading_pos,
+                        "block must come BEFORE first body heading")
+
+    def test_idempotent_re_injection_does_not_duplicate(self):
+        """Two writes with the same content → block appears ONCE."""
+        self._claude_md().write_text(
+            "# Existing\n", encoding="utf-8",
+        )
+        report = DeferralReport()
+        report.add_entry(_make_entry("idem_cond"))
+        report.write(self.folder)
+        report.write(self.folder)
+        report.write(self.folder)  # third write for paranoia
+
+        body = self._claude_md().read_text(encoding="utf-8")
+        self.assertEqual(body.count("<!-- vco-deferral-reminder-begin -->"), 1)
+        self.assertEqual(body.count("<!-- vco-deferral-reminder-end -->"), 1)
+
+    def test_empty_write_strips_block(self):
+        """When the deferral is resolved (empty entries → write returns
+        False + unlinks the file), the wrapped block must be removed
+        from CLAUDE.md too."""
+        self._claude_md().write_text(
+            "# Project\n\nOriginal body.\n", encoding="utf-8",
+        )
+        # Write a deferral so the block is injected.
+        report = DeferralReport()
+        report.add_entry(_make_entry("strip_cond"))
+        report.write(self.folder)
+        self.assertIn(
+            "<!-- vco-deferral-reminder-begin -->",
+            self._claude_md().read_text(encoding="utf-8"),
+        )
+
+        # Resolve → empty write strips the block.
+        empty = DeferralReport()
+        self.assertFalse(empty.write(self.folder))
+        body = self._claude_md().read_text(encoding="utf-8")
+        self.assertNotIn("<!-- vco-deferral-reminder-begin -->", body)
+        self.assertNotIn("<!-- vco-deferral-reminder-end -->", body)
+        # User content survives.
+        self.assertIn("# Project", body)
+        self.assertIn("Original body.", body)
+
+    def test_missing_claude_md_is_noop(self):
+        """No CLAUDE.md in the project → helpers do nothing, don't create
+        one (bootstrapper owns CLAUDE.md creation, per coordinator
+        directive). The deferral itself is still written normally."""
+        # No CLAUDE.md present.
+        self.assertFalse(self._claude_md().exists())
+
+        report = DeferralReport()
+        report.add_entry(_make_entry("noop_cond"))
+        self.assertTrue(report.write(self.folder))
+
+        # CLAUDE.md still doesn't exist.
+        self.assertFalse(self._claude_md().exists())
+        # But the deferral DID land.
+        self.assertTrue((self.folder / _DEFERRED_REL).exists())
+
+    def test_unicode_user_content_preserved(self):
+        """CLAUDE.md content with emoji and non-ASCII chars must round-trip
+        through inject + strip unchanged (UTF-8 invariant; coord cross-cutting
+        reminder: deferral entries can carry emoji)."""
+        original = (
+            "# Projet 🚀\n"
+            "\n"
+            "Notes: café, naïve, déjà vu. 中文 also fine.\n"
+            "Emoji line: ✅ ❌ ⚠️\n"
+        )
+        self._claude_md().write_text(original, encoding="utf-8")
+
+        report = DeferralReport()
+        report.add_entry(_make_entry("unicode_cond"))
+        report.write(self.folder)
+        # Inject preserved all unicode.
+        body_after_inject = self._claude_md().read_text(encoding="utf-8")
+        self.assertIn("Projet 🚀", body_after_inject)
+        self.assertIn("café, naïve, déjà vu. 中文", body_after_inject)
+        self.assertIn("✅ ❌ ⚠️", body_after_inject)
+
+        # Strip restores original (modulo the block being gone).
+        DeferralReport().write(self.folder)
+        body_after_strip = self._claude_md().read_text(encoding="utf-8")
+        self.assertNotIn("vco-deferral-reminder", body_after_strip)
+        self.assertEqual(body_after_strip, original,
+                         "strip must restore CLAUDE.md byte-for-byte")
+
+
 if __name__ == "__main__":
     unittest.main()
