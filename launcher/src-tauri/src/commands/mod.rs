@@ -5,6 +5,7 @@ pub mod gpu;
 pub mod codegraph;
 pub mod coordination;
 pub mod dashboard;
+pub mod desktop_shortcut;
 pub mod hub_proxy;
 pub mod installer;
 pub mod kg;
