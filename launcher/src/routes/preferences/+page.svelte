@@ -1,7 +1,7 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, onDestroy } from 'svelte';
   import { goto } from '$app/navigation';
-  import { invoke } from '$lib/tauri';
+  import { invoke, safeInvoke, listen as tauriListen } from '$lib/tauri';
   import { selectedProject } from '$lib/stores/projects';
   import { toast } from '$lib/stores/toast';
   import { ui } from '$lib/stores/ui';
@@ -103,6 +103,130 @@
     }
   }
 
+  // ── Hardware re-detection (Bug B, v0.2.5) ──────────────────────────
+  // Two-stage UX:
+  //   1. "Re-detect hardware" → runs detect_system server-side, persists
+  //      a fresh snapshot, returns a diff against the previous snapshot.
+  //   2. If changed_fields is non-empty, surface "Apply reconfiguration"
+  //      which spawns `install.py --update <flags>` from the known
+  //      install path and streams progress events into a log panel.
+  interface HardwareSnapshot {
+    has_nvidia_gpu: boolean;
+    gpu_name: string;
+    has_apple_silicon: boolean;
+    ram_gb: number;
+    use_gpu: boolean;
+    low_resource: boolean;
+  }
+  interface HardwareDetectionDiff {
+    before: HardwareSnapshot | null;
+    after: HardwareSnapshot;
+    changed_fields: string[];
+  }
+  interface ReconfigReport {
+    success: boolean;
+    exit_code: number;
+    log_path: string;
+  }
+
+  let hwDiff = $state<HardwareDetectionDiff | null>(null);
+  let hwDetecting = $state(false);
+  let hwApplying = $state(false);
+  let hwError = $state<string | null>(null);
+  let hwLog = $state<string[]>([]);
+  let hwLastReport = $state<ReconfigReport | null>(null);
+  let unlistenHwProgress: (() => void) | null = null;
+
+  async function loadInitialHardwareSnapshot() {
+    // Render the persisted snapshot (seeded at first boot) so the user
+    // sees the current hardware fingerprint even before clicking
+    // Re-detect. Soft-fail: an empty / missing app_state row just leaves
+    // the section in the "no snapshot yet" state.
+    const raw = await safeInvoke<{ value: string | null; is_set: boolean }>(
+      'app_state_get',
+      { key: 'launcher.hardware_snapshot' },
+    );
+    if (raw && raw.is_set && raw.value) {
+      try {
+        const snap = JSON.parse(raw.value) as HardwareSnapshot;
+        hwDiff = { before: null, after: snap, changed_fields: [] };
+      } catch {
+        // Corrupted row — ignore; the next Re-detect will overwrite it.
+      }
+    }
+  }
+
+  async function redetectHardware() {
+    hwError = null;
+    hwDetecting = true;
+    try {
+      const diff = await invoke<HardwareDetectionDiff>('redetect_hardware');
+      hwDiff = diff;
+      if (diff.changed_fields.length === 0) {
+        toast.success('Hardware unchanged');
+      } else {
+        toast.success(`Hardware changed (${diff.changed_fields.length} field(s))`);
+      }
+    } catch (e) {
+      hwError = String(e);
+      toast.error(e);
+    } finally {
+      hwDetecting = false;
+    }
+  }
+
+  async function applyHardwareReconfig() {
+    hwError = null;
+    hwLog = [];
+    hwLastReport = null;
+    hwApplying = true;
+    try {
+      // Subscribe to progress events for the duration of this run.
+      unlistenHwProgress = await tauriListen<string>(
+        'hardware_reconfig_progress',
+        (event) => {
+          hwLog = [...hwLog, event.payload];
+        },
+      );
+      const report = await invoke<ReconfigReport>('apply_hardware_reconfig');
+      hwLastReport = report;
+      if (report.success) {
+        toast.success('Hardware reconfiguration complete');
+      } else {
+        toast.error(`Reconfiguration failed (exit ${report.exit_code})`);
+      }
+    } catch (e) {
+      hwError = String(e);
+      toast.error(e);
+    } finally {
+      hwApplying = false;
+      if (unlistenHwProgress) {
+        unlistenHwProgress();
+        unlistenHwProgress = null;
+      }
+    }
+  }
+
+  function formatHwField(name: string, snap: HardwareSnapshot | null): string {
+    if (!snap) return '—';
+    switch (name) {
+      case 'has_nvidia_gpu': return snap.has_nvidia_gpu ? 'yes' : 'no';
+      case 'gpu_name': return snap.gpu_name || '(none)';
+      case 'has_apple_silicon': return snap.has_apple_silicon ? 'yes' : 'no';
+      case 'ram_gb': return `${snap.ram_gb} GB`;
+      case 'use_gpu': return snap.use_gpu ? 'GPU' : 'CPU-only';
+      case 'low_resource': return snap.low_resource ? 'low-resource mode' : 'standard';
+      default: return '—';
+    }
+  }
+
+  onDestroy(() => {
+    if (unlistenHwProgress) {
+      unlistenHwProgress();
+      unlistenHwProgress = null;
+    }
+  });
+
   function confirmRerunOnboarding() {
     showOnboardingConfirm = false;
     ui.openOnboarding();
@@ -153,6 +277,7 @@
   onMount(() => {
     void load();
     void loadPat();
+    void loadInitialHardwareSnapshot();
   });
   $effect(() => { if (project) void load(); });
 </script>
@@ -303,6 +428,99 @@
 
       {#if patError}<p class="pr-error">{patError}</p>{/if}
     </section>
+
+    <!-- Hardware re-detection (Bug B, v0.2.5).
+         Two-stage UX: Re-detect → optional Apply reconfig. The persisted
+         snapshot is seeded at first launcher boot so the "currently
+         detected" panel renders even before the user clicks Re-detect. -->
+    <section class="pr-section">
+      <h2 class="pr-section-title">Hardware</h2>
+      <div class="pr-hw-card">
+        <div class="pr-hw-header">
+          <div class="pr-onboarding-text">
+            <strong>Detected hardware</strong>
+            <span class="pr-onboarding-hint">
+              Updated at install time and whenever you click Re-detect. If you upgrade
+              your GPU or RAM, re-detect so the orchestrator's containers and models can
+              be reconfigured to use the new resources.
+            </span>
+          </div>
+          <button
+            class="pr-btn"
+            onclick={() => void redetectHardware()}
+            disabled={hwDetecting || hwApplying}
+          >
+            {hwDetecting ? 'Detecting…' : 'Re-detect hardware'}
+          </button>
+        </div>
+
+        {#if hwDiff}
+          <div class="pr-hw-grid">
+            <div class="pr-hw-row"><span class="pr-hw-label">GPU (NVIDIA)</span>
+              <span class="pr-hw-value">{formatHwField('has_nvidia_gpu', hwDiff.after)}</span></div>
+            <div class="pr-hw-row"><span class="pr-hw-label">GPU name</span>
+              <span class="pr-hw-value">{formatHwField('gpu_name', hwDiff.after)}</span></div>
+            <div class="pr-hw-row"><span class="pr-hw-label">Apple Silicon</span>
+              <span class="pr-hw-value">{formatHwField('has_apple_silicon', hwDiff.after)}</span></div>
+            <div class="pr-hw-row"><span class="pr-hw-label">RAM</span>
+              <span class="pr-hw-value">{formatHwField('ram_gb', hwDiff.after)}</span></div>
+            <div class="pr-hw-row"><span class="pr-hw-label">Compute mode</span>
+              <span class="pr-hw-value">{formatHwField('use_gpu', hwDiff.after)}</span></div>
+            <div class="pr-hw-row"><span class="pr-hw-label">Resource tier</span>
+              <span class="pr-hw-value">{formatHwField('low_resource', hwDiff.after)}</span></div>
+          </div>
+        {:else}
+          <p class="pr-hw-empty">No hardware snapshot yet — click Re-detect.</p>
+        {/if}
+
+        {#if hwDiff && hwDiff.changed_fields.length > 0 && hwDiff.before}
+          <div class="pr-hw-diff">
+            <h3 class="pr-hw-diff-title">Changes since last detection</h3>
+            <ul class="pr-hw-diff-list">
+              {#each hwDiff.changed_fields as field}
+                <li class="pr-hw-diff-row">
+                  <span class="pr-hw-diff-field">{field}</span>
+                  <span class="pr-hw-diff-before">{formatHwField(field, hwDiff.before)}</span>
+                  <span class="pr-hw-diff-arrow">→</span>
+                  <span class="pr-hw-diff-after">{formatHwField(field, hwDiff.after)}</span>
+                </li>
+              {/each}
+            </ul>
+            <button
+              class="pr-btn-primary"
+              onclick={() => void applyHardwareReconfig()}
+              disabled={hwApplying || hwDetecting}
+            >
+              {hwApplying ? 'Applying…' : 'Apply reconfiguration'}
+            </button>
+            <p class="pr-onboarding-hint">
+              Runs <code>install.py --update</code> from the known install path with
+              flags derived from the detected hardware. Containers and models will be
+              reconfigured — services may restart briefly.
+            </p>
+          </div>
+        {/if}
+
+        {#if hwLog.length > 0}
+          <div class="pr-hw-log">
+            <div class="pr-hw-log-header">
+              <strong>Reconfiguration output</strong>
+              {#if hwLastReport}
+                <span class={hwLastReport.success ? 'pr-hw-log-ok' : 'pr-hw-log-fail'}>
+                  exit {hwLastReport.exit_code} ({hwLastReport.success ? 'ok' : 'failed'})
+                </span>
+              {/if}
+            </div>
+            <pre class="pr-hw-log-body">{hwLog.join('\n')}</pre>
+            {#if hwLastReport}
+              <p class="pr-onboarding-hint">Log: <code>{hwLastReport.log_path}</code></p>
+            {/if}
+          </div>
+        {/if}
+
+        {#if hwError}<p class="pr-error">{hwError}</p>{/if}
+      </div>
+    </section>
   </main>
 </div>
 
@@ -441,4 +659,49 @@
   .pr-modal-title { font-size: 14px; font-weight: 600; color: #e8e8ee; margin: 0 0 10px; }
   .pr-modal-body { font-size: 12px; color: #888; line-height: 1.6; margin: 0 0 16px; }
   .pr-modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
+
+  /* Hardware re-detection (Bug B, v0.2.5) */
+  .pr-hw-card {
+    padding: 12px 14px; background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.06); border-radius: 6px;
+    display: flex; flex-direction: column; gap: 12px;
+  }
+  .pr-hw-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+  .pr-hw-empty { font-size: 11px; color: #888; margin: 0; }
+  .pr-hw-grid {
+    display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px 16px; font-size: 11.5px;
+  }
+  .pr-hw-row { display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px solid rgba(255,255,255,0.04); }
+  .pr-hw-label { color: #888; }
+  .pr-hw-value { color: #ccc; font-family: ui-monospace, monospace; }
+  .pr-hw-diff {
+    padding: 10px 12px; background: rgba(255,200,80,0.06);
+    border: 1px solid rgba(255,200,80,0.2); border-radius: 6px;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .pr-hw-diff-title { font-size: 12px; font-weight: 600; color: rgb(255,200,120); margin: 0; }
+  .pr-hw-diff-list { list-style: none; padding: 0; margin: 0; font-size: 11.5px; }
+  .pr-hw-diff-row {
+    display: grid; grid-template-columns: 1fr auto auto auto;
+    gap: 8px; align-items: center; padding: 3px 0;
+  }
+  .pr-hw-diff-field { color: #ccc; font-family: ui-monospace, monospace; }
+  .pr-hw-diff-before { color: #888; font-family: ui-monospace, monospace; text-decoration: line-through; }
+  .pr-hw-diff-arrow { color: #666; }
+  .pr-hw-diff-after { color: rgb(0,191,166); font-family: ui-monospace, monospace; font-weight: 500; }
+  .pr-hw-log {
+    padding: 10px 12px; background: rgba(0,0,0,0.4);
+    border: 1px solid rgba(255,255,255,0.06); border-radius: 6px;
+    display: flex; flex-direction: column; gap: 6px;
+  }
+  .pr-hw-log-header { display: flex; align-items: center; justify-content: space-between; }
+  .pr-hw-log-header strong { font-size: 11.5px; color: #ccc; font-weight: 500; }
+  .pr-hw-log-ok { font-size: 11px; color: rgb(120,220,180); }
+  .pr-hw-log-fail { font-size: 11px; color: rgb(255,140,140); }
+  .pr-hw-log-body {
+    margin: 0; padding: 8px 10px; background: rgba(0,0,0,0.4);
+    border-radius: 4px; font-family: ui-monospace, monospace; font-size: 10.5px;
+    color: #ccc; max-height: 240px; overflow: auto; white-space: pre-wrap; word-break: break-word;
+  }
 </style>

@@ -94,23 +94,44 @@ function createOrchestratorStore() {
       return system;
     },
 
-    /** Check if orchestrator is installed and get version — soft-no-op in browser mode */
+    /** Check if orchestrator is installed and get version — soft-no-op in browser mode.
+     *
+     * Bug A (v0.2.5): probes `get_known_install_path` FIRST. That command
+     * walks app_state + the launcher binary's ancestor tree looking for a
+     * real install — so a user who installed VCO at, say,
+     * `/home/x/Desktop/PROGETTI/VCO_dev/` is no longer told "Not installed"
+     * because the hard-coded `$HOME/vibecoded-orchestrator` happens to be
+     * empty. Falls back to `get_default_install_path` (used as a SUGGESTION
+     * for the install wizard pre-fill, NOT as the probed location) when no
+     * existing install is discoverable.
+     */
     async checkStatus(): Promise<void> {
-      const defaultPath = await safeInvoke<string>('get_default_install_path');
+      // 1. Known-install discovery. Returns a real path (Some) or null when
+      //    no install is detected. Tauri-less environments (browser mode)
+      //    return null from safeInvoke — treat the same as "no install".
+      const knownPath = await safeInvoke<string | null>('get_known_install_path');
 
-      // Browser mode: nothing to check, leave status as-is.
+      // 2. Default-path probe — used both as the wizard pre-fill and as a
+      //    Tauri-availability gate. Browser mode short-circuits here.
+      const defaultPath = await safeInvoke<string>('get_default_install_path');
       if (defaultPath === null) return;
 
-      update((s) => {
-        if (!s.installPath) return { ...s, installPath: defaultPath };
-        return s;
-      });
+      let currentPath = knownPath ?? '';
 
-      let currentPath = '';
-      const unsub = subscribe((s) => { currentPath = s.installPath; });
-      unsub();
+      if (!currentPath) {
+        // No discoverable install — fall back to the stored installPath
+        // (if user already picked one in the wizard) or the OS-aware
+        // default. This matches the old behavior for fresh-install users.
+        let stored = '';
+        const unsub = subscribe((s) => { stored = s.installPath; });
+        unsub();
+        currentPath = stored || defaultPath;
+      }
 
-      if (!currentPath) currentPath = defaultPath;
+      // Push the resolved path through the store so the wizard pre-fills
+      // correctly (Bug A's UX requirement: the install_path must flow from
+      // discovery → store → wizard input).
+      update((s) => ({ ...s, installPath: currentPath }));
 
       const installed = await safeInvoke<boolean>('check_install_status', { path: currentPath });
       if (installed === null) return;

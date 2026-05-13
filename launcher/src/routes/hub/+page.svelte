@@ -63,6 +63,16 @@
     <button class="hub-refresh" onclick={load}>Refresh</button>
   </header>
 
+  <div class="hub-coming-soon">
+    <div class="hub-coming-soon-badge">Coming soon</div>
+    <h2 class="hub-coming-soon-title">Hub: the centralised coordinator for your VibeCoded Tools apps</h2>
+    <p class="hub-coming-soon-body">
+      A single place to register your VibeCoded Tools apps, send cross-app
+      messages, and share data catalogs between them. The pieces below are
+      early plumbing — the full hub experience lands in a future release.
+    </p>
+  </div>
+
   {#if !inTauri}
     <p class="hub-placeholder">
       The Orchestrator Hub requires the desktop app. Run
@@ -190,4 +200,35 @@
   .hub-list { list-style: none; padding: 0; margin: 0; font-size: 12px; }
   .hub-list li { padding: 4px 0; border-bottom: 1px solid rgba(255,255,255,0.04); }
   .hub-list small { color: #888; margin-left: 6px; }
+
+  .hub-coming-soon {
+    margin: 16px 24px 0;
+    padding: 16px 18px;
+    background: linear-gradient(135deg, rgba(196, 179, 255, 0.10), rgba(0, 191, 166, 0.06));
+    border: 1px solid rgba(196, 179, 255, 0.25);
+    border-radius: 10px;
+  }
+  .hub-coming-soon-badge {
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    padding: 2px 8px;
+    border-radius: 3px;
+    background: rgba(241, 196, 15, 0.18);
+    color: #f1c40f;
+    margin-bottom: 8px;
+  }
+  .hub-coming-soon-title {
+    font-size: 15px;
+    margin: 0 0 6px;
+    color: #e8e8ee;
+  }
+  .hub-coming-soon-body {
+    margin: 0;
+    color: #aaa;
+    font-size: 12px;
+    line-height: 1.5;
+  }
 </style>
