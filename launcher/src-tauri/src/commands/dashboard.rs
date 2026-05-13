@@ -736,23 +736,39 @@ mod tests {
     /// Inverse of the off-case: toggle on must register the entry back
     /// into ~/.claude.json with the canonical {type, command, args, env}
     /// shape so Claude Code starts spawning it.
+    ///
+    /// (v0.2.5: previously used `code-embed` because it shipped disabled
+    /// by default. After `code-embed` was removed from the MCP registry
+    /// — it's a backend HTTP service consumed by `weaviate-kg`, not an
+    /// MCP — we exercise the toggle-on path by first flipping `ollama`
+    /// off in the seeded config and then toggling it back on.)
     #[test]
     fn test_toggle_mcp_server_on_re_registers_in_claude_json() {
         let (home, _guard) = setup_temp_env();
-        // Seed config with code-embed disabled (its default state).
-        seed_default_config(&home);
+        let cfg_path = seed_default_config(&home);
+
+        // Flip `ollama` to disabled in the seeded config so the toggle-on
+        // call has something disabled to enable.
+        let mut cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+        for entry in cfg["mcp_servers"].as_array_mut().unwrap() {
+            if entry["id"] == "ollama" {
+                entry["enabled"] = serde_json::Value::Bool(false);
+            }
+        }
+        std::fs::write(&cfg_path, serde_json::to_string_pretty(&cfg).unwrap()).unwrap();
 
         rt().block_on(async {
-            toggle_mcp_server("code-embed".to_string(), true, user_apps_free())
+            toggle_mcp_server("ollama".to_string(), true, user_apps_free())
                 .await
                 .expect("toggle_mcp_server on");
         });
 
         let cj = read_claude_json(&home);
-        let entry = &cj["mcpServers"]["code-embed"];
+        let entry = &cj["mcpServers"]["ollama"];
         assert!(
             entry.is_object(),
-            "expected `code-embed` registered in ~/.claude.json mcpServers, got: {}",
+            "expected `ollama` registered in ~/.claude.json mcpServers, got: {}",
             cj["mcpServers"]
         );
         // Canonical shape ({type:stdio, command, args, env}) — same as
