@@ -492,6 +492,18 @@ async fn finish_apply_after_pull<R: Runtime>(
     // the path that was used to launch us, which is what we want post-
     // rebuild because the new binary lives at the same path.
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+
+    // C3 (v0.2.6): refresh the desktop shortcut so it picks up any
+    // change in binary path/contents post-rebuild. The launcher repo is
+    // the install path here (self-update operates on the launcher's
+    // enclosing checkout). Soft-fail: never block restart.
+    if let Err(e) = crate::commands::desktop_shortcut::refresh_desktop_shortcut(repo, &exe) {
+        eprintln!(
+            "[apply_launcher_update] desktop shortcut refresh failed (non-fatal): {}",
+            e
+        );
+    }
+
     std::process::Command::new(&exe)
         .spawn()
         .map_err(|e| format!("failed to spawn new launcher: {}", e))?;

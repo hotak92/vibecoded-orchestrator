@@ -11,6 +11,7 @@
 
 pub mod adoption;
 pub mod runtime;
+pub mod watcher;
 
 use tauri::{AppHandle, Runtime};
 

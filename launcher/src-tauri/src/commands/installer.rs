@@ -3873,6 +3873,21 @@ pub async fn update_orchestrator_at(path: String, window: Window) -> Result<(), 
     .await
     .map_err(|e| format!("copy task panicked: {}", e))?;
     copy_result?;
+
+    // C2 (v0.2.6): refresh the desktop shortcut so it points at the
+    // currently-running launcher binary. Critical for users whose
+    // install path moved (e.g. they cloned into a new directory) —
+    // pre-0.2.6 the .desktop file would keep pointing at the stale
+    // binary path silently. Soft-fail: never block "Update complete".
+    if let Ok(exe) = std::env::current_exe() {
+        if let Err(e) = crate::commands::desktop_shortcut::refresh_desktop_shortcut(&target, &exe) {
+            eprintln!(
+                "[update_orchestrator_at] desktop shortcut refresh failed (non-fatal): {}",
+                e
+            );
+        }
+    }
+
     emit_progress(&window, "done", "Update complete", 100.0);
     Ok(())
 }

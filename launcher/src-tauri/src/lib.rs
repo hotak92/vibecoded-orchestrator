@@ -206,6 +206,15 @@ pub fn run() {
                 commands::lifecycle::auto_start_on_boot(app_handle_for_services).await;
             });
 
+            // v0.2.6 (Bug D3): background watcher that polls services
+            // every 30s and auto-restarts on running→stopped transitions.
+            // Logs to <install>/state/logs/services-watcher.jsonl. User
+            // can disable via Preferences → Services (writes the
+            // `launcher.services_watcher_enabled` app_state row to
+            // `false`); default is ENABLED. Soft-fail throughout: never
+            // takes the launcher down.
+            services::watcher::spawn(app.handle().clone());
+
             // Resume background tasks left behind by a previous launcher
             // process (crash, force-quit, OOM). Two-phase, soft-fail —
             // see `codegraph::resume_pending_builds` and

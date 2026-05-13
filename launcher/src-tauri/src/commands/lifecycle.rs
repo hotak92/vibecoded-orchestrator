@@ -315,59 +315,282 @@ pub async fn services_restart_all() -> Result<(), String> {
     run_compose(&info, ["restart"]).await
 }
 
-/// Start a single service by canonical name. Errors if the user has
-/// Adopted/Refused it (we don't manage someone else's containers).
+/// Start a single service by canonical name.
+///
+/// v0.2.6 (D1): adoption mode is INFORMATIONAL, not control-gating.
+/// Previously we refused for `Adopt`/`Refuse` modes; the user reported
+/// this was wrong — they want control over their services regardless of
+/// who started the underlying container.
+///
+/// Routing (D2):
+///   - `Adopt` / `Refuse` / `Unresolved` → look up the actual container
+///     name via `<runtime> ps` filtered by `com.docker.compose.service`
+///     label + port, then drive `<runtime> start` directly. This handles
+///     the common case where the container was brought up by a different
+///     compose project (e.g. `claude_mcp_servers/compose.yaml`) and our
+///     VCO compose project filter would miss it.
+///   - `Parallel` → use compose. Our parallel-port copy IS managed by
+///     our compose stack.
 #[command]
 pub async fn service_start(name: String) -> Result<(), String> {
     validate_service_name(&name)?;
     let info = detect_runtime()
         .await
         .ok_or("No container runtime found.")?;
-    let state = adoption::read();
-    let mode = state.get(&name).map(|s| s.mode).unwrap_or(AdoptionMode::Unresolved);
-    if matches!(mode, AdoptionMode::Adopt | AdoptionMode::Refuse) {
-        return Err(format!(
-            "{} is externally managed (mode={:?}); the launcher does not control it.",
-            name, mode
-        ));
-    }
-    run_compose(&info, ["up", "-d", &name]).await
+    route_service_action(&info, &name, "start").await
 }
 
-/// Stop a single service.
+/// Stop a single service. See `service_start` doc for routing rules.
 #[command]
 pub async fn service_stop(name: String) -> Result<(), String> {
     validate_service_name(&name)?;
     let info = detect_runtime()
         .await
         .ok_or("No container runtime found.")?;
-    let state = adoption::read();
-    let mode = state.get(&name).map(|s| s.mode).unwrap_or(AdoptionMode::Unresolved);
-    if matches!(mode, AdoptionMode::Adopt | AdoptionMode::Refuse) {
-        return Err(format!(
-            "{} is externally managed (mode={:?}); the launcher does not control it.",
-            name, mode
-        ));
-    }
-    run_compose(&info, ["stop", &name]).await
+    route_service_action(&info, &name, "stop").await
 }
 
-/// Restart a single service.
+/// Restart a single service. See `service_start` doc for routing rules.
 #[command]
 pub async fn service_restart(name: String) -> Result<(), String> {
     validate_service_name(&name)?;
     let info = detect_runtime()
         .await
         .ok_or("No container runtime found.")?;
+    route_service_action(&info, &name, "restart").await
+}
+
+/// Dispatch a single-service action to the right backend based on adoption
+/// mode. Pure routing — the actual work lives in `run_compose` and
+/// `control_adopted_container`.
+async fn route_service_action(
+    info: &RuntimeInfo,
+    name: &str,
+    action: &str,
+) -> Result<(), String> {
     let state = adoption::read();
-    let mode = state.get(&name).map(|s| s.mode).unwrap_or(AdoptionMode::Unresolved);
-    if matches!(mode, AdoptionMode::Adopt | AdoptionMode::Refuse) {
+    let mode = state
+        .get(name)
+        .map(|s| s.mode)
+        .unwrap_or(AdoptionMode::Unresolved);
+    let canonical_port = canonical_port_for(name);
+    let effective = effective_port(name, canonical_port, &state);
+
+    match mode {
+        AdoptionMode::Parallel => {
+            // Our compose copy on an alt port — driven by compose, same as
+            // before. Compose-name maps 1:1 to service-name.
+            let verb = match action {
+                "start" => "up",
+                other => other,
+            };
+            let mut args: Vec<&str> = if verb == "up" {
+                vec!["up", "-d", name]
+            } else {
+                vec![verb, name]
+            };
+            // Borrow-checker happiness: `args` is &[&str], no allocation.
+            let _ = effective; // not needed by compose (it reads override.yaml)
+            run_compose(info, args.drain(..)).await
+        }
+        AdoptionMode::Adopt | AdoptionMode::Refuse | AdoptionMode::Unresolved => {
+            // Drive the runtime directly. We look up the container by
+            // service label + port so we hit the SAME container even when
+            // it's part of a foreign compose project (the user's existing
+            // claude_mcp_servers stack).
+            control_adopted_container(info, name, effective, action).await
+        }
+    }
+}
+
+/// Return the canonical (default) port for one of our three managed
+/// services. Mirrors `canonical_services()` — kept as a tiny helper so
+/// `route_service_action` doesn't need to scan the array.
+fn canonical_port_for(name: &str) -> u16 {
+    match name {
+        "weaviate" => DEFAULT_WEAVIATE_PORT,
+        "ollama" => DEFAULT_OLLAMA_PORT,
+        "code_embed" => DEFAULT_CODE_EMBED_PORT,
+        _ => 0, // validate_service_name() rejects unknown names before us
+    }
+}
+
+/// Drive `podman` / `docker` directly on a single container. Used for
+/// adopted services where compose isn't appropriate (the container was
+/// started by a foreign compose project, or no compose at all).
+///
+/// Discovery: filter by the compose service label first, falling back to
+/// the canonical port via `port` inspection. First matching container
+/// wins. `action` is one of `"start"`, `"stop"`, `"restart"`.
+///
+/// Discovery details:
+///   - `<runtime> ps -a --filter "label=com.docker.compose.service=<name>"
+///     --format "{{.Names}}\t{{.Ports}}\t{{.Status}}"`
+///   - we also accept `io.podman.compose.service` (the legacy podman-compose
+///     v0 label) for older user stacks.
+///   - If multiple containers match the service label, prefer one whose
+///     ports include the canonical/effective port; otherwise take the
+///     first row.
+///   - If no service-label match, fall back to scanning all containers
+///     for one bound to the port (rare — e.g. a hand-`podman-run`'d
+///     container with no labels).
+///
+/// Soft contract: returns Ok(()) when the action succeeds. Returns Err
+/// with the runtime's stderr trimmed when the action fails.
+pub(crate) async fn control_adopted_container(
+    info: &RuntimeInfo,
+    service: &str,
+    port: u16,
+    action: &str,
+) -> Result<(), String> {
+    if !matches!(action, "start" | "stop" | "restart") {
         return Err(format!(
-            "{} is externally managed (mode={:?}); the launcher does not control it.",
-            name, mode
+            "invalid action '{}' (expected start | stop | restart)",
+            action
         ));
     }
-    run_compose(&info, ["restart", &name]).await
+
+    let container = find_container_for_service(info, service, port).await?;
+    let argv = build_control_argv(info.runtime.binary(), action, &container);
+
+    // We don't go through `info.compose_command()` here — we want the
+    // raw runtime binary, not compose. The first argv entry is the
+    // action verb (start/stop/restart), the second is the container.
+    let mut cmd = tokio::process::Command::new(&info.binary_path);
+    for a in argv.iter().skip(1) {
+        cmd.arg(a);
+    }
+    let output = cmd
+        .output()
+        .await
+        .map_err(|e| format!("spawn {} {}: {}", info.runtime.binary(), action, e))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "{} {} {} failed (status {}): {}",
+            info.runtime.binary(),
+            action,
+            container,
+            output.status,
+            stderr.trim()
+        ));
+    }
+    Ok(())
+}
+
+/// Pure argv builder for `control_adopted_container`. Extracted so tests
+/// can verify the exact argv shape without mocking the subprocess.
+///
+/// Always returns 3 elements: `[runtime_bin, action, container]`.
+/// Example: `["podman", "start", "weaviate_claude"]`.
+pub(crate) fn build_control_argv(
+    runtime_bin: &str,
+    action: &str,
+    container: &str,
+) -> Vec<String> {
+    vec![
+        runtime_bin.to_string(),
+        action.to_string(),
+        container.to_string(),
+    ]
+}
+
+/// Locate the container backing a managed service. Search order:
+///   1. `--filter label=com.docker.compose.service=<service>` — modern
+///      compose project (docker-compose, podman-compose v1+).
+///   2. `--filter label=io.podman.compose.service=<service>` — legacy
+///      podman-compose.
+///   3. Port-binding fallback: scan all containers whose published ports
+///      include `<port>`.
+///
+/// Returns the first matching container name. We deliberately don't sort
+/// by status (running > stopped) — `start` on an already-running container
+/// is a no-op for podman/docker, so picking either is fine.
+async fn find_container_for_service(
+    info: &RuntimeInfo,
+    service: &str,
+    port: u16,
+) -> Result<String, String> {
+    // Try the two label variants in order.
+    let label_filters = [
+        format!("label=com.docker.compose.service={}", service),
+        format!("label=io.podman.compose.service={}", service),
+    ];
+    for label in &label_filters {
+        let mut cmd = tokio::process::Command::new(&info.binary_path);
+        cmd.args([
+            "ps",
+            "-a",
+            "--filter",
+            label.as_str(),
+            "--format",
+            "{{.Names}}\t{{.Ports}}",
+        ]);
+        let out = cmd
+            .output()
+            .await
+            .map_err(|e| format!("spawn {} ps: {}", info.runtime.binary(), e))?;
+        if !out.status.success() {
+            continue;
+        }
+        let body = String::from_utf8_lossy(&out.stdout);
+        if let Some(name) = pick_container_row(&body, port) {
+            return Ok(name);
+        }
+    }
+
+    // Port-only fallback. List ALL containers, find one whose port
+    // mapping matches.
+    let mut cmd = tokio::process::Command::new(&info.binary_path);
+    cmd.args(["ps", "-a", "--format", "{{.Names}}\t{{.Ports}}"]);
+    let out = cmd
+        .output()
+        .await
+        .map_err(|e| format!("spawn {} ps: {}", info.runtime.binary(), e))?;
+    if out.status.success() {
+        let body = String::from_utf8_lossy(&out.stdout);
+        if let Some(name) = pick_container_row(&body, port) {
+            return Ok(name);
+        }
+    }
+
+    Err(format!(
+        "no container found for service '{}' on port {}; the launcher cannot \
+         control an unmanaged service that has no running container",
+        service, port
+    ))
+}
+
+/// Given the output of `<runtime> ps --format "{{.Names}}\t{{.Ports}}"`,
+/// pick the first container name whose port column mentions `port`.
+/// Falls back to the first row when no row references the port (better
+/// than nothing — the service-label filter already proved relevance).
+///
+/// Extracted as a pure function so it can be unit-tested without spawning
+/// a real container runtime.
+fn pick_container_row(body: &str, port: u16) -> Option<String> {
+    let mut first_seen: Option<String> = None;
+    let port_needle_a = format!(":{}->", port); // "0.0.0.0:8081->8081/tcp"
+    let port_needle_b = format!(":{}/", port);  // "8081/tcp" (no host mapping)
+    for line in body.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(2, '\t');
+        let name = match parts.next() {
+            Some(n) if !n.is_empty() => n,
+            _ => continue,
+        };
+        let ports = parts.next().unwrap_or("");
+        if first_seen.is_none() {
+            first_seen = Some(name.to_string());
+        }
+        if ports.contains(&port_needle_a) || ports.contains(&port_needle_b) {
+            return Some(name.to_string());
+        }
+    }
+    first_seen
 }
 
 /// Hard-coded allowlist — only the three canonical services are valid
@@ -748,5 +971,91 @@ mod services_lifecycle_tests {
     async fn find_free_port_rejects_invalid_range() {
         let err = services_find_free_port(2000, 1000).await.unwrap_err();
         assert!(err.contains("invalid range"));
+    }
+
+    // ---- v0.2.6 Bug D unit tests --------------------------------------
+
+    #[test]
+    fn build_control_argv_shape_is_fixed() {
+        // Always exactly 3 elements: [runtime, action, container]. Any
+        // change in shape would silently break the subprocess spawn.
+        let v = build_control_argv("podman", "start", "weaviate_claude");
+        assert_eq!(v, vec!["podman", "start", "weaviate_claude"]);
+        let v = build_control_argv("docker", "stop", "myapp_ollama_1");
+        assert_eq!(v, vec!["docker", "stop", "myapp_ollama_1"]);
+        let v = build_control_argv("podman", "restart", "code_embed");
+        assert_eq!(v, vec!["podman", "restart", "code_embed"]);
+    }
+
+    #[test]
+    fn canonical_port_for_known_services() {
+        assert_eq!(canonical_port_for("weaviate"), DEFAULT_WEAVIATE_PORT);
+        assert_eq!(canonical_port_for("ollama"), DEFAULT_OLLAMA_PORT);
+        assert_eq!(canonical_port_for("code_embed"), DEFAULT_CODE_EMBED_PORT);
+        // Unknown name returns 0 (validate_service_name catches before).
+        assert_eq!(canonical_port_for("postgres"), 0);
+    }
+
+    #[test]
+    fn pick_container_row_prefers_port_match() {
+        // Real-world podman ps output: `<name>\t<ports>`.
+        let body = "weaviate_other\t8090/tcp\nweaviate_claude\t0.0.0.0:8081->8081/tcp\n";
+        let chosen = pick_container_row(body, 8081);
+        assert_eq!(chosen.as_deref(), Some("weaviate_claude"));
+    }
+
+    #[test]
+    fn pick_container_row_falls_back_to_first_when_no_port_match() {
+        // No row mentions port 9999, but we still return *something* —
+        // the label filter already vouched for relevance.
+        let body = "weaviate_a\t8081/tcp\nweaviate_b\t8082/tcp\n";
+        let chosen = pick_container_row(body, 9999);
+        assert_eq!(chosen.as_deref(), Some("weaviate_a"));
+    }
+
+    #[test]
+    fn pick_container_row_handles_no_port_publish() {
+        // Compose `expose:` (no `ports:`) shows up as `8081/tcp` with no
+        // host-side mapping. We still match on the bare protocol form.
+        let body = "ollama_claude\t11435/tcp\n";
+        let chosen = pick_container_row(body, 11435);
+        assert_eq!(chosen.as_deref(), Some("ollama_claude"));
+    }
+
+    #[test]
+    fn pick_container_row_empty_input_returns_none() {
+        assert!(pick_container_row("", 8081).is_none());
+        assert!(pick_container_row("\n\n", 8081).is_none());
+    }
+
+    #[test]
+    fn pick_container_row_ignores_lines_without_name() {
+        let body = "\t8081/tcp\nvalid_ctr\t8081/tcp\n";
+        let chosen = pick_container_row(body, 8081);
+        assert_eq!(chosen.as_deref(), Some("valid_ctr"));
+    }
+
+    /// Watcher decision function: given a previous + current snapshot,
+    /// classify the transition. Tested separately from any subprocess
+    /// or timer plumbing.
+    #[test]
+    fn watcher_classifies_transitions_correctly() {
+        use crate::services::watcher::{classify_transition, WatcherTransition};
+        assert!(matches!(
+            classify_transition(true, true),
+            WatcherTransition::Stable
+        ));
+        assert!(matches!(
+            classify_transition(false, false),
+            WatcherTransition::Stable
+        ));
+        assert!(matches!(
+            classify_transition(true, false),
+            WatcherTransition::Stopped
+        ));
+        assert!(matches!(
+            classify_transition(false, true),
+            WatcherTransition::Recovered
+        ));
     }
 }

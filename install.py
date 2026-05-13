@@ -1640,7 +1640,30 @@ def main() -> int:
                              "preserve under --conflict-strategy=overwrite-preserve. "
                              "Default: CLAUDE.md,.claude/CONTEXT_STATE.md,"
                              ".claude/PROJECT_REGISTRY.md,.env")
+    # v0.2.6 (Bug C1): desktop-icon lifecycle. Direct `python install.py`
+    # runs (without first-install.sh wrapping) previously skipped the
+    # icon-creation step entirely. The orchestrator now invokes
+    # `scripts/post-install-launcher.sh` (or .ps1 on Windows when present)
+    # at the end of a successful full install — UNLESS opted out via
+    # `--no-desktop-icon` / `VCT_NO_DESKTOP_ICON=1`. `--desktop-icon-only`
+    # skips the actual install steps and runs ONLY the icon step (for
+    # users who declined the first time and changed their mind).
+    parser.add_argument("--no-desktop-icon", action="store_true", default=False,
+                        help="Skip the desktop-icon creation step at end of install. "
+                             "Equivalent to VCT_NO_DESKTOP_ICON=1.")
+    parser.add_argument("--desktop-icon-only", action="store_true", default=False,
+                        help="Run ONLY the desktop-icon step (post-install-launcher.sh) "
+                             "and exit. Useful when you skipped the icon during the "
+                             "initial install and want to add it later.")
     args = parser.parse_args()
+
+    # v0.2.6 Bug C1 — `--desktop-icon-only` short-circuits: run JUST the
+    # icon step (post-install-launcher.sh) and exit. Skips Python version
+    # checks, venv creation, etc. because the user already has a working
+    # install and just wants the icon now.
+    if getattr(args, "desktop_icon_only", False):
+        _run_desktop_icon_step(args)
+        return 0
 
     # Deferral report — accumulates non-auto-resolvable conditions detected
     # during this run; written to .claude/context/UPDATE_DEFERRED.md at end.
@@ -2053,6 +2076,12 @@ def main() -> int:
     # produced false positives on developer source checkouts that had a venv
     # but no install.py run (false-positive observed in wizard 2026-05-06).
     _write_install_manifest(sysinfo, args, install_method="install.py")
+
+    # v0.2.6 Bug C1: invoke the desktop-icon step so direct `python install.py`
+    # runs get an icon too. first-install.sh-wrapped runs already trigger
+    # this script independently; the helper is idempotent so the second
+    # invocation is a no-op (writes the same .desktop body).
+    _run_desktop_icon_step(args)
 
     print()
     print("=" * 62)
@@ -5312,6 +5341,92 @@ def _read_git_rev() -> tuple[str | None, str | None]:
         return (commit, branch)
     # Detached HEAD — head_content is the commit hash itself.
     return (head_content, None)
+
+
+def _run_desktop_icon_step(args: argparse.Namespace) -> None:
+    """v0.2.6 Bug C1 — invoke `scripts/post-install-launcher.sh` to create
+    the desktop icon. Best-effort: any failure is logged but never aborts
+    the install. Respects `--no-desktop-icon`, `VCT_NO_DESKTOP_ICON=1`,
+    and the existing `VCT_NO_AUTO_LAUNCH=1` (we always pass
+    `--no-auto-launch` because install.py exits next anyway and we don't
+    want a duplicate launcher spawn).
+
+    Cross-OS:
+      - Linux + macOS: `bash scripts/post-install-launcher.sh <root>`
+        (the .sh handles both via its `case "${OSTYPE:-}" in darwin*|linux*`
+        switch).
+      - Windows: `scripts/post-install-launcher.ps1` if present; else a
+        single-line note in the install log + stdout — Windows users
+        currently get their icon from first-install.bat, which has its
+        own inline shortcut writer.
+    """
+    if getattr(args, "no_desktop_icon", False):
+        return
+    if os.environ.get("VCT_NO_DESKTOP_ICON") == "1":
+        return
+
+    helper_sh = PROJECT_ROOT / "scripts" / "post-install-launcher.sh"
+    helper_ps1 = PROJECT_ROOT / "scripts" / "post-install-launcher.ps1"
+
+    if sys.platform == "win32":
+        if helper_ps1.exists():
+            cmd = [
+                "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                "-File", str(helper_ps1),
+                "-RepoRoot", str(PROJECT_ROOT),
+                "-NoAutoLaunch",
+            ]
+        else:
+            # Windows path: first-install.bat owns initial shortcut. Flag
+            # for follow-up so we don't silently skip on direct-run
+            # install.py invocations.
+            print("  [desktop-icon] Skipping on Windows: scripts/post-install-launcher.ps1 "
+                  "not present. Initial shortcut is written by first-install.bat. "
+                  "Re-run from first-install.bat to refresh, or wait for the PS1 "
+                  "helper (TODO).")
+            _log_install_event(
+                "desktop-icon", "skip",
+                "windows: post-install-launcher.ps1 missing",
+            )
+            return
+    else:
+        if not helper_sh.exists():
+            # The helper is required for the Linux/macOS icon path. A
+            # missing helper means the install tree is incomplete (e.g.
+            # a partial extract). Log + return — don't crash.
+            print(f"  [desktop-icon] Skipping: {helper_sh} not present.")
+            _log_install_event(
+                "desktop-icon", "skip",
+                f"helper not found at {helper_sh}",
+            )
+            return
+        cmd = [
+            "bash", str(helper_sh), str(PROJECT_ROOT),
+            "--yes",  # non-interactive: no prompts inside a Python wrapper
+            "--no-auto-launch",  # install.py exits next; the user starts launcher manually
+        ]
+
+    # Run as the current user (no sudo). Stream output so the user sees
+    # what the helper is doing. Soft-fail: rc != 0 is logged but doesn't
+    # propagate.
+    print()
+    print("  [desktop-icon] Creating desktop shortcut...")
+    try:
+        rc = subprocess.call(cmd, cwd=str(PROJECT_ROOT))
+    except OSError as e:
+        print(f"  [desktop-icon] helper invocation failed: {e}")
+        _log_install_event("desktop-icon", "error",
+                           f"helper spawn failed: {e}")
+        return
+    if rc != 0:
+        print(f"  [desktop-icon] helper exited with rc={rc} (non-fatal)")
+        _log_install_event(
+            "desktop-icon", "error",
+            f"helper exit rc={rc}",
+            data={"rc": rc},
+        )
+    else:
+        _log_install_event("desktop-icon", "ok", "shortcut helper completed")
 
 
 def _write_install_manifest(sysinfo, args, install_method: str = "install.py") -> None:
