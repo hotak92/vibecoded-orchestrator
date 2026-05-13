@@ -1,0 +1,84 @@
+# {{PROJECT_NAME}} — Project Instructions
+
+These instructions are loaded by Claude Code whenever you open this project. Adapt the placeholder sections below to reflect what {{PROJECT_NAME}} actually is.
+
+---
+
+## Project Overview
+
+_(Describe what this project does in 2–4 sentences. What problem does it solve? What are its primary users? Skip the "history" — focus on the current shape.)_
+
+## Tech Stack
+
+_(List the primary languages, frameworks, and infrastructure. Examples: "Python 3.12 + FastAPI", "Rust + Tauri 2 + Svelte 5", "TypeScript + Next.js". Keep it tight.)_
+
+## Key Paths
+
+- Project root: `{{PROJECT_ROOT}}`
+- Orchestrator (VCO_dev): `{{ORCHESTRATOR_ROOT}}` — source-of-truth for hooks, scripts, agents, skills shipped under `.claude/`.
+- KG nodes: `knowledge/` (if this project has its own KG; otherwise the orchestrator's `ClaudeKnowledgeGraph`).
+- Active context: `.claude/CONTEXT_STATE.md` (current task, recent progress, blockers).
+- Active plans: `.claude/context/plans/` (referenced, not auto-loaded).
+
+_(Edit this list to match {{PROJECT_NAME}}'s actual layout.)_
+
+---
+
+## SESSION START (always)
+
+**Before answering any non-trivial question:**
+
+1. Read `.claude/CONTEXT_STATE.md` — current task, recent progress, blockers.
+2. For architecture / system questions → search the KG **before** generating a response.
+3. For any other project question → search KG / code graph **before** answering.
+
+**Never explain project state from memory.** If you don't know something with certainty, look it up first.
+
+---
+
+## KG / Context / Memory / Plans are LOAD-BEARING
+
+These four persistence layers exist for a reason — future-you, future-agents, and the user rely on them. Treat them like commits to a codebase, not optional notes:
+
+- **Knowledge Graph**: cross-project patterns, concepts, decisions. Write a node BEFORE moving on after learning a non-obvious fact (architecture, gotcha, decision rationale, post-incident insight).
+- **CONTEXT_STATE.md**: current task, recent progress, blockers. Update DURING work, not at end. Stale state = future-you starts confused.
+- **MEMORY.md** (`~/.claude/projects/.../memory/MEMORY.md`): user preferences, recurring fixes, stable facts. NOT in git. First 200 lines auto-loaded each session.
+- **Plans** (`.claude/context/plans/`): non-trivial work breakdowns with rationale. Active plans here; archived plans in `archive/`. Update when scope changes.
+
+**Concrete rule**: if you've done >2 hours of substantive work or learned a non-obvious thing, write the KG node BEFORE the user has to ask.
+
+---
+
+## KG-First Search Policy
+
+Before searching OR reasoning about project topics, choose the right tool:
+
+1. Conceptual question → `hybrid_search` (Weaviate MCP) — searches KG + docs together.
+2. Relational ("what links to what") → `semantic_graph_search`.
+3. Code by purpose → `search_code_graph`.
+4. Architecture / callers / deps → `query_code_structure`.
+5. Known exact term/tag/title → `kg-search` CLI (~100 ms).
+6. Quick analysis or rewrite → `chat` (Ollama MCP, FREE).
+
+**This applies to reasoning too** — do NOT explain what the codebase does, what patterns exist, or what was previously decided from memory alone.
+
+Only use `Grep` / `Read` when the user provides an exact file path, you're hunting literal strings, the file is already in context, or you need line-by-line detail.
+
+---
+
+## VCO-Managed Files
+
+This project's `.claude/hooks/`, `.claude/scripts/`, `.claude/agents/`, `.claude/skills/`, and `.claude/settings.json` are shipped by VCO (the orchestrator). To update them, run from the orchestrator root:
+
+```bash
+python -m vco_lib.project_init install-bundle \
+  --folder '{{PROJECT_ROOT}}' \
+  --orchestrator-root "$VCT_ORCHESTRATOR_ROOT" \
+  --update
+```
+
+Add `--force` to accept the shipped versions for files you've intentionally modified. Files preserved by VCO are tracked in `.claude/.vco-manifest.json` under `preserved_files`.
+
+---
+
+_(Add project-specific sections below: build commands, deployment notes, conventions, anything else a fresh Claude session needs.)_

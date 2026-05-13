@@ -1,0 +1,47 @@
+# {{PROJECT_NAME}} — Context State
+
+_(Active working memory for {{PROJECT_NAME}}. Update DURING work, not just at the end. Target 250–350 lines, max 500.)_
+
+---
+
+## Current Status
+
+_(One-paragraph summary: what's the active sprint / task / focus right now? Updated by Claude or the user whenever the focus shifts. Keep it tight.)_
+
+## Recent Progress
+
+_(Bullet list of recent completed sub-tasks. Mark with ✅. Trim entries older than ~1 week into a "Past Work" section below or into a node in the KG.)_
+
+- ✅ _(example: implemented X, see commit abc1234)_
+- ✅ _(example: KG node `knowledge/concepts/foo.md` written 2026-MM-DD)_
+
+## Next Steps
+
+_(Bullet list of the next 3–5 concrete actions. Concrete = "edit file X to do Y", not "improve quality".)_
+
+- _(action 1)_
+- _(action 2)_
+
+## Open Blockers
+
+_(Anything stopping forward progress that requires an external answer / decision / dependency. Empty list is good news.)_
+
+- _(none, or describe blocker + who/what unblocks)_
+
+## Last Session Action
+
+_(One line at the end of every session: what was the LAST thing done, and what's the FIRST thing the next session should pick up. Helps a fresh Claude session orient in 5 seconds.)_
+
+Example: "Last: landed PR #N for {{PROJECT_NAME}} feature X. Next: review CI, then start spec for feature Y."
+
+---
+
+_(Sections below are optional but recommended once the project grows.)_
+
+## Past Work
+
+_(Roll-up of older completed sub-tasks. Trim aggressively — most belongs in commit messages, the KG, or a session summary node.)_
+
+## Active Plans
+
+_(Pointers to `.claude/context/plans/` files currently in flight, not full plan contents.)_

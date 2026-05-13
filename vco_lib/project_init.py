@@ -1961,7 +1961,7 @@ def _write_bootstrap_deferral(
 #
 # Manifest schema (`<folder>/.claude/.vco-manifest.json`):
 #   {
-#     "schema_version": 1,
+#     "schema_version": 2,
 #     "vco_version": "<orchestrator HEAD or release tag>",
 #     "installed_at": "ISO-8601",
 #     "files": {
@@ -1972,12 +1972,26 @@ def _write_bootstrap_deferral(
 #         "source": "<rel-path>",       # path within orchestrator root
 #       },
 #     },
+#     "preserved_files": {              # schema v2 (2026-05-13): tracks
+#                                       # files VCO chose NOT to overwrite.
+#       "<rel-path-from-folder>": {
+#         "shipped_sha256": "<hex>",    # what VCO would have written.
+#         "preserved_at": "ISO-8601",   # most-recent install time the file
+#                                       # was preserved.
+#         "shipped_source": "<rel>",    # path within orchestrator root.
+#         "reason": "preserve|skip-existing",  # update-mode vs first-install.
+#       },
+#     },
 #   }
+#
+# Schema-version compatibility: readers default `preserved_files` to `{}` when
+# absent (v1 manifests). No migration step is required — the next install run
+# upgrades the file in place by writing schema_version=2.
 # ---------------------------------------------------------------------------
 
 
 _MANIFEST_REL = Path(".claude") / ".vco-manifest.json"
-_MANIFEST_SCHEMA_VERSION = 1
+_MANIFEST_SCHEMA_VERSION = 2
 
 
 # Placeholder substitutions applied to agent .md files (mirrors
@@ -2066,21 +2080,32 @@ def _bytes_sha256(data: bytes) -> str:
 
 def _read_manifest(folder: Path) -> dict:
     """Parse `.claude/.vco-manifest.json` if present. Returns
-    `{"schema_version": ..., "files": {}}` on missing / unparseable file
-    so callers can treat it uniformly."""
+    `{"schema_version": ..., "files": {}, "preserved_files": {}}` on
+    missing / unparseable file so callers can treat it uniformly.
+
+    Forward-compat: v1 manifests (no `preserved_files` key) read back with
+    an empty dict for that section — no migration needed."""
     target = folder / _MANIFEST_REL
+    empty = {
+        "schema_version": _MANIFEST_SCHEMA_VERSION,
+        "files": {},
+        "preserved_files": {},
+    }
     if not target.exists():
-        return {"schema_version": _MANIFEST_SCHEMA_VERSION, "files": {}}
+        return dict(empty)
     try:
         data = json.loads(target.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
-            return {"schema_version": _MANIFEST_SCHEMA_VERSION, "files": {}}
+            return dict(empty)
         if "files" not in data or not isinstance(data["files"], dict):
             data["files"] = {}
+        # preserved_files added in schema v2; default to empty for v1 readers.
+        if "preserved_files" not in data or not isinstance(data["preserved_files"], dict):
+            data["preserved_files"] = {}
         return data
     except Exception:
         # Corrupt manifest — treat as missing to avoid blocking the install.
-        return {"schema_version": _MANIFEST_SCHEMA_VERSION, "files": {}}
+        return dict(empty)
 
 
 def _write_manifest_atomic(folder: Path, manifest: dict) -> None:
@@ -2452,13 +2477,17 @@ def _write_file_atomic(target: Path, data: bytes, *, mode: Optional[int] = None)
         raise
 
 
-def _format_file_list_md(paths: list[str], cap: int = 20) -> str:
+def _format_file_list_md(paths: list[str], cap: int = 100) -> str:
     """Render a bullet-list of file paths for inclusion in a deferral entry.
 
     Caps at `cap` entries with a "... and N more" trailer when oversize so
-    the deferral .md doesn't grow unbounded for large preserve / skip lists
-    (a fresh-folder install over a previously-installed orchestrator could
-    plausibly produce dozens of skipped paths).
+    the deferral .md doesn't grow unbounded for large preserve / skip lists.
+
+    Item 3 (Gap 2, 2026-05-13): cap bumped from 20 to 100. The SD15
+    smoking-gun case had 36 preserved files; the old 20-cap silently hid
+    the tail. A 100-cap covers every realistic install (the entire
+    orchestrator bundle is currently ~114 files) while still bounding
+    pathological writes.
     """
     if len(paths) <= cap:
         return "\n".join(f"  - `{p}`" for p in paths)
@@ -2488,13 +2517,21 @@ def _emit_user_modified_deferral(
     from vco_lib.deferral_report import DeferralEntry, DeferralReport
 
     files_md = _format_file_list_md(sorted(modified_files))
+    # Item 4 (Gap 7, 2026-05-13): emit $VCT_ORCHESTRATOR_ROOT instead of a
+    # baked literal path so the command stays portable across machines and
+    # surviving orchestrator-clone relocations. The env var is set by
+    # `.claude/env` (sourced by every VCO-installed project's tooling); if
+    # the user runs from a shell without it, the prose tells them how to
+    # set it manually.
     cmd = (
         f"# Inspect the differences (per file):\n"
         f"#   diff -u <orchestrator>/<source-rel> {folder}/<dest-rel>\n"
-        f"# Then either accept shipped versions (forces overwrite):\n"
+        f"# Run from a shell where `.claude/env` has been sourced (or\n"
+        f"# prepend VCT_ORCHESTRATOR_ROOT=/path/to/VCO_dev). Then either\n"
+        f"# accept shipped versions (forces overwrite):\n"
         f"python -m vco_lib.project_init install-bundle "
         f"--folder {str(folder)!r} --orchestrator-root "
-        f"{str(orchestrator_root)!r} --update --force --json\n"
+        f"\"$VCT_ORCHESTRATOR_ROOT\" --update --force --json\n"
         f"# OR keep your customizations and dismiss this deferral:\n"
         f"python -m vco_lib.project_init dismiss-deferral "
         f"--folder {str(folder)!r} "
@@ -2550,11 +2587,16 @@ def _emit_skipped_existing_deferral(
     from vco_lib.deferral_report import DeferralEntry, DeferralReport
 
     files_md = _format_file_list_md(sorted(skipped_files))
+    # Item 4 (Gap 7, 2026-05-13): emit $VCT_ORCHESTRATOR_ROOT (set by
+    # `.claude/env`) instead of a baked literal path so the command is
+    # portable across machines / orchestrator clone relocations.
     cmd = (
-        f"# Accept the orchestrator's shipped versions for ALL skipped files:\n"
+        f"# Run from a shell where `.claude/env` has been sourced, or\n"
+        f"# prepend VCT_ORCHESTRATOR_ROOT=/path/to/VCO_dev. Then accept\n"
+        f"# the orchestrator's shipped versions for ALL skipped files:\n"
         f"python -m vco_lib.project_init install-bundle "
         f"--folder {str(folder)!r} --orchestrator-root "
-        f"{str(orchestrator_root)!r} --update --force --json"
+        f"\"$VCT_ORCHESTRATOR_ROOT\" --update --force --json"
     )
     entry = DeferralEntry(
         condition_id="bundle_skipped_existing_files",
@@ -2583,6 +2625,238 @@ def _emit_skipped_existing_deferral(
     report = DeferralReport.read(folder)
     report.add_entry(entry)
     report.write(folder)
+
+
+# ---------------------------------------------------------------------------
+# Project-level templates (Item 7 / Observation 7, 2026-05-13)
+#
+# VCO ships minimal stubs for the three project-level files that aren't
+# bundled like hooks/scripts/agents because they're per-project bespoke:
+#   - CLAUDE.md             — project-instructions (Claude Code loads on session start)
+#   - .claude/CONTEXT_STATE.md — active working memory
+#   - MEMORY.md (template)  — auto-memory index (LIVE file is under ~/.claude/projects/...)
+#
+# Install-time semantics:
+#   - File missing in project → write the substituted template as the
+#     real file (gives fresh projects a sensible starting point).
+#   - File exists → write the substituted template to a sibling reference
+#     path under .claude/context/templates/<NAME>.reference.md so the
+#     user / Claude can diff. If the existing file meaningfully differs
+#     from the reference, emit a `template_review_pending` deferral so
+#     future sessions are nudged to review.
+#
+# Schema-bump compatibility: this is purely additive — projects with no
+# CLAUDE.md and no MEMORY.md get fresh stubs; existing projects get a
+# `.reference.md` sidecar but their on-disk files are never touched.
+# ---------------------------------------------------------------------------
+
+# Each entry: (template filename under templates/, project-relative destination
+# for the LIVE file, project-relative destination for the .reference.md sidecar).
+_PROJECT_LEVEL_TEMPLATES = (
+    (
+        "CLAUDE.md.template",
+        Path("CLAUDE.md"),
+        Path(".claude") / "context" / "templates" / "CLAUDE.md.reference.md",
+    ),
+    (
+        "CONTEXT_STATE.md.template",
+        Path(".claude") / "CONTEXT_STATE.md",
+        Path(".claude") / "context" / "templates" / "CONTEXT_STATE.md.reference.md",
+    ),
+    (
+        "MEMORY.md.template",
+        Path("MEMORY.md"),
+        Path(".claude") / "context" / "templates" / "MEMORY.md.reference.md",
+    ),
+)
+
+
+def _project_template_subs(
+    orchestrator_root: Path,
+    project_root: Path,
+    project_name: str,
+) -> dict[str, str]:
+    """Placeholder map for project-level templates. Superset of
+    ``_agent_subs`` plus ``{{PROJECT_NAME}}``.
+
+    Plain-text substitution via ``str.replace`` (per coordinator: no fancy
+    templating engine). Keep keys delimited so partial matches don't
+    accidentally substitute. The orchestrator root is included so the
+    auto-generated `--orchestrator-root` lines in CLAUDE.md point at the
+    user's actual clone.
+    """
+    base = _agent_subs(orchestrator_root, project_root)
+    base["{{PROJECT_NAME}}"] = project_name
+    return base
+
+
+def _apply_template_subs(buf: bytes, subs: dict[str, str]) -> bytes:
+    """Apply placeholder substitutions; UTF-8 in / UTF-8 out (emoji-safe)."""
+    text = buf.decode("utf-8", errors="replace")
+    for k, v in subs.items():
+        text = text.replace(k, v)
+    return text.encode("utf-8")
+
+
+def _normalise_for_diff(text: str) -> list[str]:
+    """Normalise a file for the "meaningfully differs" check.
+
+    Strips trailing whitespace per line and trims trailing blank lines
+    so a one-line whitespace change doesn't flag the file for review.
+    Anything beyond whitespace + EOL normalisation counts as a real diff.
+    """
+    lines = [ln.rstrip() for ln in text.splitlines()]
+    # Trim trailing all-empty lines.
+    while lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+
+def _emit_template_review_pending_deferral(
+    folder: Path,
+    *,
+    diverged_files: list[str],
+) -> None:
+    """Emit `template_review_pending` when project-level template stubs
+    differ from the existing on-disk versions.
+
+    Per-project single entry listing all diverged files (mirrors the
+    bundle deferral pattern). The user resolves by either updating the
+    on-disk file to match the reference, dismissing the deferral, or
+    simply ignoring it (severity is `info` — the project is functional;
+    this is a "you might want to look at this" nudge, not a blocker).
+    """
+    if not diverged_files:
+        return
+    from vco_lib.deferral_report import DeferralEntry, DeferralReport
+
+    files_md = _format_file_list_md(sorted(diverged_files))
+    cmd = (
+        f"# Compare each file against VCO's reference template:\n"
+        f"#   diff -u {folder}/<file> "
+        f"{folder}/.claude/context/templates/<NAME>.reference.md\n"
+        f"# Adopt structure/sections you want; keep your project-specific\n"
+        f"# content. The reference files refresh on every install run, so\n"
+        f"# they always reflect VCO's current shipping shape.\n"
+        f"# To silence this nudge without changing anything:\n"
+        f"python -m vco_lib.project_init dismiss-deferral "
+        f"--folder {str(folder)!r} "
+        f"--condition-id template_review_pending"
+    )
+    entry = DeferralEntry(
+        condition_id="template_review_pending",
+        title="Project-level template review pending",
+        detected=(
+            f"VCO ships minimal-stub templates for CLAUDE.md, "
+            f"CONTEXT_STATE.md, and MEMORY.md to give fresh projects a "
+            f"starting point. {len(diverged_files)} file(s) in this "
+            f"project meaningfully differ from the current shipping "
+            f"reference — that's expected for established projects, but "
+            f"you may want to review whether any new sections (e.g. "
+            f"`Session Start Discipline`, `KG-First Search Policy`) are "
+            f"worth pulling in:\n"
+            f"{files_md}"
+        ),
+        why_deferred=(
+            "Project-level files are bespoke (CLAUDE.md sections, "
+            "CONTEXT_STATE.md state) — VCO never overwrites them. The "
+            "reference templates ship as `.reference.md` sidecars under "
+            "`.claude/context/templates/` so you can diff and selectively "
+            "adopt."
+        ),
+        command_to_apply=cmd,
+        severity="info",
+        kg_node_refs=[],
+    )
+    report = DeferralReport.read(folder)
+    report.add_entry(entry)
+    report.write(folder)
+
+
+def _install_project_level_templates(
+    folder: Path,
+    *,
+    orchestrator_root: Path,
+    project_name: str,
+    dry_run: bool,
+) -> dict:
+    """Install (or refresh) the three project-level template stubs.
+
+    Returns a result dict for the install_project_bundle response::
+
+        {
+          "live_created":  [<rel>...],  # template stub installed as the
+                                        # actual project file (was missing).
+          "reference_written": [<rel>...],  # .reference.md sidecar refreshed.
+          "diverged":      [<rel>...],  # existing file ≠ reference template.
+        }
+
+    Idempotent. On every run the reference sidecars are rewritten with
+    the current shipping shape (atomic write, no-op when bytes match).
+    """
+    out = {
+        "live_created": [],
+        "reference_written": [],
+        "diverged": [],
+    }
+
+    templates_dir = orchestrator_root / "templates"
+    subs = _project_template_subs(orchestrator_root, folder, project_name)
+
+    for template_name, live_rel, ref_rel in _PROJECT_LEVEL_TEMPLATES:
+        src = templates_dir / template_name
+        if not src.exists():
+            # Templates not shipped on this orchestrator clone — skip
+            # silently. The bundle pre-install gate (`orchestrator_root`
+            # validation) covers the catastrophic case.
+            continue
+
+        try:
+            raw = src.read_bytes()
+        except OSError:
+            continue
+        substituted = _apply_template_subs(raw, subs)
+
+        live_target = folder / live_rel
+        if not live_target.exists():
+            # Missing project-level file → install the stub.
+            if not dry_run:
+                try:
+                    _write_file_atomic(live_target, substituted)
+                except OSError:
+                    # Best-effort: skip this template if the write fails;
+                    # don't fail the whole install.
+                    continue
+            out["live_created"].append(str(live_rel))
+            # Don't write the reference sidecar in this case — the live
+            # file IS the reference at this moment, so a sidecar is
+            # redundant. A future install run (after the user edits the
+            # live file) will create the sidecar then.
+            continue
+
+        # Live file already exists → refresh the reference sidecar.
+        ref_target = folder / ref_rel
+        if not dry_run:
+            try:
+                _write_file_atomic(ref_target, substituted)
+            except OSError:
+                continue
+        out["reference_written"].append(str(ref_rel))
+
+        # Compare existing vs reference. "Meaningfully differs" =
+        # anything beyond whitespace + trailing-newline normalisation
+        # (per coordinator: keep the check simple).
+        try:
+            existing_text = live_target.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            # Can't read — don't flag for review; the user has a bigger
+            # problem than a template diff.
+            continue
+        reference_text = substituted.decode("utf-8", errors="replace")
+        if _normalise_for_diff(existing_text) != _normalise_for_diff(reference_text):
+            out["diverged"].append(str(live_rel))
+
+    return out
 
 
 def _emit_migrate_required_deferral(
@@ -2788,6 +3062,11 @@ def install_project_bundle(
 
     manifest = _read_manifest(folder)
     new_files: dict[str, dict] = {}
+    # Schema v2: preserved_files records every file VCO chose not to
+    # overwrite during this run (`preserve` in update mode + `skip-existing`
+    # in first-install mode). Rebuilt from scratch each run so converged
+    # files (no longer diverged) automatically fall off.
+    new_preserved: dict[str, dict] = {}
     user_modified_paths: list[str] = []
     skipped_existing_paths: list[str] = []
 
@@ -2831,6 +3110,14 @@ def install_project_bundle(
             existing = manifest.get("files", {}).get(op.dest_rel)
             if existing is not None:
                 new_files[op.dest_rel] = existing
+            # Schema v2: record the preservation so a future install (or
+            # auditor) can answer "did VCO ever try to install file X here?".
+            new_preserved[op.dest_rel] = {
+                "shipped_sha256": shipped_hash,
+                "preserved_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "shipped_source": op.source_rel,
+                "reason": "preserve",
+            }
 
         elif action == "skip-existing":
             # First-install with pre-existing file: do not overwrite, but
@@ -2839,6 +3126,13 @@ def install_project_bundle(
             # bundle install was incomplete (user has stale customizations
             # that won't track future orchestrator improvements).
             skipped_existing_paths.append(op.dest_rel)
+            # Schema v2: record the preservation under reason="skip-existing".
+            new_preserved[op.dest_rel] = {
+                "shipped_sha256": shipped_hash,
+                "preserved_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "shipped_source": op.source_rel,
+                "reason": "skip-existing",
+            }
 
         elif action == "noop":
             # File matches what we'd write. Manifest entry should reflect
@@ -2899,6 +3193,36 @@ def install_project_bundle(
                  data={"error": err})
             result["warnings"].append(f"settings.json merge failed: {err}")
 
+    # Project-level templates (item 7 / Obs 7, 2026-05-13). Minimal stubs
+    # for CLAUDE.md, CONTEXT_STATE.md, MEMORY.md. Missing → install stub
+    # as the live file; present → refresh the `.reference.md` sidecar and
+    # flag for review when meaningfully diverged.
+    template_review_diverged: list[str] = []
+    try:
+        # Project name derived from folder basename — kept simple per
+        # coord ("no fancy templating engine"). Callers that want a
+        # different display name can edit CLAUDE.md after install.
+        derived_project_name = folder.name or "Project"
+        templates_result = _install_project_level_templates(
+            folder,
+            orchestrator_root=orchestrator_root,
+            project_name=derived_project_name,
+            dry_run=dry_run,
+        )
+        result["templates"] = templates_result
+        template_review_diverged = list(templates_result.get("diverged", []))
+        _log("4.bundle.templates", "ok",
+             f"templates: live_created={len(templates_result['live_created'])}, "
+             f"reference_written={len(templates_result['reference_written'])}, "
+             f"diverged={len(template_review_diverged)}",
+             data=templates_result)
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        _log("4.bundle.templates", "error",
+             f"project-level templates failed: {err}",
+             data={"error": err})
+        result["warnings"].append(f"project-level templates failed: {err}")
+
     # Manifest write (always after a successful pass — even dry-run skips).
     if not dry_run:
         try:
@@ -2907,6 +3231,10 @@ def install_project_bundle(
                 "vco_version": result["vco_version"],
                 "installed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "files": dict(sorted(new_files.items())),
+                # Schema v2 (2026-05-13): foundation for audit/diff tooling
+                # (item 5 of deferral-ux-polish sprint). See the schema
+                # docstring above the constants for the per-entry shape.
+                "preserved_files": dict(sorted(new_preserved.items())),
             }
             _write_manifest_atomic(folder, manifest_payload)
             result["manifest_written"] = True
@@ -2930,6 +3258,13 @@ def install_project_bundle(
     # `DeferralReport.add_entry` (last-write-wins per condition_id, so a
     # subsequent install run that resolves the condition will overwrite
     # the entry with the new state, or remove it when the list is empty).
+    #
+    # Reconcile pass (Gap 11 fix, 2026-05-13): after emitting any
+    # still-applicable entries, walk the on-disk deferral and DROP entries
+    # for conditions this install fully resolved. Without this, an
+    # `--update --force` run that overwrites every preserved file leaves a
+    # stale `bundle_skipped_existing_files` entry behind because the emit
+    # functions are guarded behind non-empty lists.
     if not dry_run:
         if update_mode and user_modified_paths and not force:
             try:
@@ -2959,7 +3294,90 @@ def install_project_bundle(
                     f"skipped-existing deferral write failed: {err}"
                 )
 
+        # Item 7 (2026-05-13): emit `template_review_pending` when any of
+        # the three project-level templates meaningfully differ from the
+        # current shipping reference. Severity is info — purely a nudge.
+        if template_review_diverged:
+            try:
+                _emit_template_review_pending_deferral(
+                    folder, diverged_files=template_review_diverged,
+                )
+            except Exception as e:
+                err = f"{type(e).__name__}: {e}"
+                _log("4.bundle.deferral", "error",
+                     f"template-review deferral write failed: {err}",
+                     data={"error": err})
+                result["warnings"].append(
+                    f"template-review deferral write failed: {err}"
+                )
+
+        # Reconcile + trim: drop entries this install resolved.
+        try:
+            _reconcile_bundle_deferrals(
+                folder,
+                still_user_modified=bool(user_modified_paths) and not force,
+                still_skipped_existing=bool(skipped_existing_paths),
+                still_template_review_pending=bool(template_review_diverged),
+            )
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            _log("4.bundle.deferral", "error",
+                 f"deferral reconcile failed: {err}",
+                 data={"error": err})
+            result["warnings"].append(
+                f"deferral reconcile failed: {err}"
+            )
+
     return result
+
+
+def _reconcile_bundle_deferrals(
+    folder: Path,
+    *,
+    still_user_modified: bool,
+    still_skipped_existing: bool,
+    still_template_review_pending: bool = False,
+) -> None:
+    """Trim bundle-specific deferral entries that this install resolved.
+
+    Walks the on-disk UPDATE_DEFERRED.md and removes any entry whose
+    `condition_id` corresponds to a state the current install fully
+    cleared (no surviving preserved files in that bucket). Other
+    condition_ids (schema_migration_required, weaviate_unreachable, etc.)
+    are left untouched — they're owned by separate code paths.
+
+    `DeferralReport.write` already deletes the file when the entry list
+    becomes empty, so this function is the single place where "force-
+    resolved → stale deferral cleanup" happens.
+    """
+    from vco_lib.deferral_report import DeferralReport
+
+    bundle_conditions = {
+        "bundle_user_modified_preserved": still_user_modified,
+        "bundle_skipped_existing_files": still_skipped_existing,
+        # Item 7 (2026-05-13): template_review_pending is also owned by
+        # install_bundle — every run recomputes the diverged set, so when
+        # the user updates their CLAUDE.md to match the reference (or
+        # vice versa) the next install clears the stale entry.
+        "template_review_pending": still_template_review_pending,
+    }
+
+    report = DeferralReport.read(folder)
+    initial_ids = {e.condition_id for e in report.entries}
+    if not initial_ids & set(bundle_conditions):
+        # Nothing on-disk we own → no reconciliation to do.
+        return
+
+    changed = False
+    for condition_id, still_applicable in bundle_conditions.items():
+        if not still_applicable and report.has_condition(condition_id):
+            report.mark_resolved(condition_id)
+            changed = True
+
+    if changed:
+        # write() unlinks the file if the entry list is now empty,
+        # otherwise atomic-writes the trimmed report.
+        report.write(folder)
 
 
 def _find_orchestrator_root_from_module() -> Path:

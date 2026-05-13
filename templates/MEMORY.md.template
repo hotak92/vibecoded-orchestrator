@@ -1,0 +1,13 @@
+# Memory — {{PROJECT_NAME}}
+
+_(Auto-loaded by Claude Code on every session start in {{PROJECT_NAME}}. First 200 lines only — hard cap. Keep this file as a CONCISE INDEX. Put detail in topic files (e.g. `feedback_*.md`, `reference_*.md`, `project_*.md`) sibling to this one. Edit via `/memory` or by asking Claude directly ("remember that...").)_
+
+_(NOT in git. Lives at `~/.claude/projects/<id>/memory/MEMORY.md` per the user's claude.ai install — the path under `~/.claude/` is hashed from the project root.)_
+
+---
+
+## Index
+
+_(Add entries here as you accumulate stable facts, recurring fixes, user preferences. One line per entry under ~200 chars. Move detail into topic files.)_
+
+_(none yet — add entries as the project accumulates stable patterns.)_

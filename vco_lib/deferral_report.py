@@ -50,9 +50,208 @@ _SECTION_SEP = "---"
 # Allowed severity values (ordered worst→best for max computation).
 SEVERITY_ORDER = ("critical", "warning", "info")
 
+# ---------------------------------------------------------------------------
+# CLAUDE.md reminder block (item 2 / Gap 10, 2026-05-13)
+#
+# When a deferral is written, project_init.DeferralReport.write() also
+# injects a wrapped reminder block into the project's CLAUDE.md so future
+# Claude sessions opening the project see "go read UPDATE_DEFERRED.md"
+# at session start. Block is removed when the deferral is unlinked.
+#
+# Marker pattern mirrors install.py's `<!-- vct-merge-pending -->` block
+# (install.py:1035) — wrapped HTML comments are idempotent-rewrite-friendly
+# and survive Markdown renderers (they don't show in the rendered output).
+# ---------------------------------------------------------------------------
+
+_CLAUDE_MD_REL = Path("CLAUDE.md")
+_REMINDER_BEGIN = "<!-- vco-deferral-reminder-begin -->"
+_REMINDER_END = "<!-- vco-deferral-reminder-end -->"
+
+# Leading frontmatter detector: ``^---\n<body>\n---\n``. The trailing
+# newline after the closing fence is captured so we can splice the
+# reminder block after it cleanly.
+_LEADING_FRONTMATTER_RE = re.compile(
+    r"\A---\n.*?^---\n", re.DOTALL | re.MULTILINE,
+)
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _reminder_block() -> str:
+    """Render the wrapped CLAUDE.md reminder block.
+
+    Idempotency contract (matches install.py's vct-merge-pending pattern):
+    the prose inside MUST NOT contain literal _REMINDER_BEGIN /
+    _REMINDER_END markers, otherwise the find-and-replace path would
+    miscount. References to those markers are oblique ("the HTML-comment
+    markers wrapping this block").
+    """
+    return (
+        f"{_REMINDER_BEGIN}\n"
+        "**Pending VCO action**: `.claude/context/UPDATE_DEFERRED.md` exists.\n"
+        "Read it at session start — it contains commands to resolve\n"
+        "unresolved VCO install actions.\n"
+        "\n"
+        "To remove THIS reminder block: once the deferral is resolved (e.g.\n"
+        "via `--update --force`), VCO's next install run will delete\n"
+        "UPDATE_DEFERRED.md AND strip this block. Manual cleanup if needed:\n"
+        "delete everything between the HTML-comment markers wrapping this\n"
+        "block.\n"
+        f"{_REMINDER_END}\n"
+    )
+
+
+def _splice_reminder_into_claude_md(existing: str) -> str:
+    """Return ``existing`` with the reminder block injected idempotently.
+
+    Three insertion points (in priority order):
+
+    1. If a previous reminder block exists (find the begin/end markers):
+       replace it in place — preserves position chosen on the original
+       insertion, prevents block migration on every install.
+    2. Else if ``existing`` opens with YAML frontmatter (``---\n...\n---\n``):
+       prepend the block immediately AFTER the closing fence, separated
+       by a blank line.
+    3. Else: prepend the block at the very top, separated by a blank line
+       from whatever follows.
+
+    The trailing blank line is normalised so we don't accumulate empty
+    lines on repeat injections.
+    """
+    block = _reminder_block()
+
+    # Case 1: existing block — replace in place.
+    start = existing.find(_REMINDER_BEGIN)
+    if start != -1:
+        end_rel = existing[start:].find(_REMINDER_END)
+        if end_rel != -1:
+            end = start + end_rel + len(_REMINDER_END)
+            after = existing[end:]
+            # Strip a single leading newline so re-injections don't
+            # accumulate blank lines.
+            if after.startswith("\n"):
+                after = after[1:]
+            return existing[:start] + block + after
+        # Begin marker without a matching end — treat as corrupt; fall
+        # through and prepend a fresh block. The orphan begin marker
+        # stays in place; the user can manually clean it. We prefer
+        # corrupt + accurate over silent loss.
+
+    # Case 2: frontmatter — splice after closing fence.
+    fm_match = _LEADING_FRONTMATTER_RE.match(existing)
+    if fm_match:
+        head = existing[: fm_match.end()]
+        tail = existing[fm_match.end():]
+        # Normalise: ensure exactly one blank line between fm and block,
+        # and one between block and tail.
+        if tail.startswith("\n"):
+            tail = tail.lstrip("\n")
+        sep = "" if head.endswith("\n") else "\n"
+        return f"{head}{sep}\n{block}\n{tail}"
+
+    # Case 3: no frontmatter — prepend at top.
+    tail = existing.lstrip("\n")
+    return f"{block}\n{tail}" if tail else block
+
+
+def _strip_reminder_from_claude_md(existing: str) -> str:
+    """Return ``existing`` with the wrapped reminder block removed.
+
+    No-op (returns the original string) when no block is found. Cleans
+    up the blank-line separator that ``_splice_reminder_into_claude_md``
+    inserts on each side of the block, in either insertion case (block at
+    top-of-file or block after frontmatter).
+    """
+    start = existing.find(_REMINDER_BEGIN)
+    if start == -1:
+        return existing
+    end_rel = existing[start:].find(_REMINDER_END)
+    if end_rel == -1:
+        # Orphan begin marker: don't try to guess the end — preserve the
+        # file. The user can clean it manually.
+        return existing
+    end = start + end_rel + len(_REMINDER_END)
+
+    before = existing[:start]
+    after = existing[end:]
+
+    # Trim the trailing newline the splicer added immediately after the
+    # block AND the blank-line separator (if any).
+    if after.startswith("\n"):
+        after = after[1:]
+    if after.startswith("\n"):
+        after = after[1:]
+
+    # Trim the blank-line separator the splicer inserted before the
+    # block — only the SECOND-to-last newline (the blank line itself),
+    # leaving the newline that ends the preceding logical line intact.
+    if before.endswith("\n\n"):
+        before = before[:-1]
+
+    return before + after
+
+
+def _ensure_claude_md_reminder(folder: Path) -> None:
+    """Inject (or refresh) the reminder block in ``<folder>/CLAUDE.md``.
+
+    No-op if CLAUDE.md is missing — the project-bootstrapper owns CLAUDE.md
+    creation, not the deferral writer. Best-effort: never raises into the
+    caller (an install run shouldn't fail just because the user holds an
+    exclusive lock on CLAUDE.md).
+    """
+    target = folder / _CLAUDE_MD_REL
+    try:
+        if not target.exists():
+            return
+        existing = target.read_text(encoding="utf-8")
+        updated = _splice_reminder_into_claude_md(existing)
+        if updated != existing:
+            _atomic_write_text(target, updated)
+    except OSError:
+        # Best-effort: leave CLAUDE.md untouched if I/O fails.
+        return
+
+
+def _strip_claude_md_reminder(folder: Path) -> None:
+    """Remove the reminder block from ``<folder>/CLAUDE.md``.
+
+    No-op if CLAUDE.md is missing or contains no block. Best-effort.
+    """
+    target = folder / _CLAUDE_MD_REL
+    try:
+        if not target.exists():
+            return
+        existing = target.read_text(encoding="utf-8")
+        updated = _strip_reminder_from_claude_md(existing)
+        if updated != existing:
+            _atomic_write_text(target, updated)
+    except OSError:
+        return
+
+
+def _atomic_write_text(target: Path, content: str) -> None:
+    """Atomic text write via temp file + os.replace in the same dir.
+
+    Same primitive as ``DeferralReport.write``; pulled out so the reminder
+    helpers can re-use it. Preserves UTF-8 (Unicode emoji-safe — some
+    deferral entries carry emoji)."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(target.parent), suffix=".tmp",
+        prefix=f".{target.name}.reminder.",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        os.replace(tmp_path, str(target))
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 @dataclass
@@ -305,6 +504,15 @@ class DeferralReport:
     def write(self, folder: Path) -> bool:
         """Atomic-write the deferral report to ``<folder>/.claude/context/UPDATE_DEFERRED.md``.
 
+        Side effect (item 2 / Gap 10, 2026-05-13): when writing a
+        non-empty deferral, also injects a wrapped reminder block into
+        ``<folder>/CLAUDE.md`` so future Claude sessions see "go read
+        UPDATE_DEFERRED.md" at session start. When deleting the deferral
+        (empty entries), strips the block from CLAUDE.md too.
+
+        Both CLAUDE.md helpers are best-effort: a missing or unwritable
+        CLAUDE.md does NOT cause this method to fail or raise.
+
         Returns:
             True  — entries present, file written.
             False — no entries; existing file deleted (if any).
@@ -314,6 +522,8 @@ class DeferralReport:
         if not self._entries:
             if target.exists():
                 target.unlink()
+            # Strip the reminder block since the deferral is gone.
+            _strip_claude_md_reminder(folder)
             return False
 
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -339,6 +549,9 @@ class DeferralReport:
             except OSError:
                 pass
             raise
+
+        # Inject/refresh the wrapped reminder block in CLAUDE.md.
+        _ensure_claude_md_reminder(folder)
 
         return True
 
