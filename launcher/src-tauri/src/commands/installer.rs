@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
-use tauri::{command, Emitter, State, Window};
+use tauri::{command, Emitter, Manager, State, Window};
 
 use crate::db::Db;
 use crate::secrets::{self, SecretScope};
@@ -13,6 +13,27 @@ use crate::secrets::{self, SecretScope};
 /// new bundled-orchestrator releases from upstream.
 #[allow(dead_code)]
 const ORCHESTRATOR_REPO: &str = "https://github.com/hotak92/vibecoded-orchestrator.git";
+
+/// app_state key for the last-known install path. Cached after a successful
+/// install + opportunistically backfilled by `get_known_install_path` when
+/// it discovers an install via the exe-walk strategy. The wizard's
+/// `checkStatus()` uses this to avoid the hard-coded `$HOME/...` default
+/// (which produced a false-negative "Not installed" banner when users
+/// installed somewhere else, e.g. `/home/x/Desktop/PROGETTI/VCO_dev`).
+pub(crate) const APP_STATE_KEY_INSTALL_PATH: &str = "launcher.install_path";
+
+/// app_state key for the last-detected hardware snapshot. Populated on
+/// first launcher boot and refreshed by the "Re-detect hardware" button
+/// in Preferences. Comparing the persisted snapshot against a fresh
+/// detection drives the "Apply reconfiguration" UX in Preferences →
+/// Hardware (Bug B).
+pub(crate) const APP_STATE_KEY_HARDWARE_SNAPSHOT: &str = "launcher.hardware_snapshot";
+
+/// app_state key for the ISO8601 timestamp of the last successful
+/// `apply_hardware_reconfig` run. Surfaced in the Hardware preferences
+/// card so the user can see when containers were last reconfigured.
+pub(crate) const APP_STATE_KEY_HARDWARE_LAST_RECONFIGURED: &str =
+    "launcher.hardware_last_reconfigured_at";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -87,6 +108,46 @@ pub struct InstallResult {
     pub install_path: String,
     pub message: String,
     pub system: SystemDetection,
+}
+
+/// Compact hardware fingerprint persisted across launcher boots. Used by
+/// the "Re-detect hardware" Preferences flow (Bug B) to surface drift when
+/// the user upgrades RAM / adds a GPU after the initial install.
+///
+/// `use_gpu` and `low_resource` are DERIVED from the raw detection fields
+/// and stored eagerly so the install.py reconfig flags can be reproduced
+/// from a single persisted blob without re-running the full
+/// `detect_system()` join.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HardwareSnapshot {
+    pub has_nvidia_gpu: bool,
+    pub gpu_name: String,
+    pub has_apple_silicon: bool,
+    pub ram_gb: u32,
+    /// Derived: NVIDIA OR Apple Silicon. Determines whether install.py
+    /// gets `--gpu` or `--cpu-only` on a reconfig run.
+    pub use_gpu: bool,
+    /// Derived: ram_gb < 8. Triggers install.py's `--low-resource` path
+    /// (smaller models, narrower service stack).
+    pub low_resource: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HardwareDetectionDiff {
+    /// `None` when no prior snapshot existed (first-ever detection).
+    pub before: Option<HardwareSnapshot>,
+    pub after: HardwareSnapshot,
+    /// Field names that differ between `before` and `after`. Empty when
+    /// `before` is None OR all fields match. Drives whether the FE shows
+    /// the "Apply reconfiguration" CTA.
+    pub changed_fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReconfigReport {
+    pub success: bool,
+    pub exit_code: i32,
+    pub log_path: String,
 }
 
 /// Bug 29: shared-container detection. Reports which of the three default
@@ -742,6 +803,447 @@ pub fn detect_existing_install_root() -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Bug A (v0.2.5): path-agnostic install discovery.
+//
+// The wizard's `checkStatus()` previously probed only `$HOME/vibecoded-
+// orchestrator`, producing a false "Not installed" banner for users who
+// installed VCO at a custom location (real-world example:
+// `/home/martino/Desktop/PROGETTI/VCO_dev/`).
+//
+// `get_known_install_path` is the FE entry point for "where is the
+// install on this machine?". It tries two strategies in order:
+//
+//   1. Look up `launcher.install_path` in app_state. If set AND the path
+//      still passes `check_install_status`, return it.
+//   2. Walk up from `current_exe()` looking for the fixed install-root
+//      markers (`install.py` + `CLAUDE.md`). The relative path between
+//      the launcher binary and these files is fixed by the installer, so
+//      a short bounded walk is sufficient. On a hit, write it back to
+//      app_state so step 1 picks it up next time.
+//
+// Returns `Ok(None)` when no install is discoverable — that's not an
+// error, just "no install yet". Only DB errors propagate as `Err`.
+// ---------------------------------------------------------------------------
+
+/// Resolve the install root from the launcher binary's location.
+///
+/// The folder layout is fixed by the installer — relative paths between
+/// the launcher exe and the install root never change once shipped, so
+/// we can rely on a structural walk rather than fingerprinting markers
+/// with stale-state semantics (`installed: true` in a manifest that may
+/// or may not exist for a hand-cloned dev tree).
+///
+/// Layouts in play:
+///   • Tauri release bundle (Linux/Windows): `<install>/launcher/src-tauri/target/release/launcher`
+///   • Tauri dev / `cargo run`:               `<install>/launcher/src-tauri/target/debug/launcher`
+///   • macOS .app bundle:                     `<install>/launcher/<...>/Contents/MacOS/launcher`
+///
+/// The first two are exactly 4 parents up from the exe. The .app case is
+/// deeper but still bounded, so a short walk that stops at the first
+/// directory containing `install.py` + `CLAUDE.md` covers all three
+/// without requiring per-platform branching. Sanity-only check (the two
+/// files), no manifest gating — a dev clone with no `state/install-manifest.json`
+/// is still a valid install root for launcher-discovery purposes.
+fn walk_for_install_markers() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let mut current = exe.parent()?.to_path_buf();
+    for _ in 0..8 {
+        if current.join("install.py").is_file() && current.join("CLAUDE.md").is_file() {
+            return Some(current);
+        }
+        if !current.pop() {
+            break;
+        }
+    }
+    None
+}
+
+/// FE entry point — see module-level Bug A comment for the contract.
+///
+/// Soft on failure by design: a missing app_state row, a stale cached
+/// path, or a no-match exe walk all collapse to `Ok(None)`. Only a real
+/// DB read error propagates.
+#[command]
+pub async fn get_known_install_path(db: State<'_, Db>) -> Result<Option<String>, String> {
+    // Strategy 1: cached path from app_state. Validate it still looks
+    // like a finished install — a user can rename / delete the install
+    // directory out from under the launcher, and we'd rather fall
+    // through to Strategy 2 than hand the FE a phantom path.
+    if let Some(cached) = db.app_state_get(APP_STATE_KEY_INSTALL_PATH)? {
+        if !cached.is_empty() && check_install_status(cached.clone()) {
+            return Ok(Some(cached));
+        }
+        // Cached row exists but the path no longer resolves; fall
+        // through. We deliberately do NOT delete the stale row here —
+        // the user may simply have the install on an unmounted drive,
+        // and a successful Strategy 2 will overwrite it anyway.
+    }
+
+    // Strategy 2: walk up from the launcher binary.
+    if let Some(found) = walk_for_install_markers() {
+        let s = found.to_string_lossy().to_string();
+        // Sticky cache: future calls take the fast Strategy 1 path.
+        // DB write failure here is non-fatal — log and proceed.
+        if let Err(e) = db.app_state_set(APP_STATE_KEY_INSTALL_PATH, &s) {
+            eprintln!(
+                "[vct] get_known_install_path: failed to cache install_path: {}",
+                e
+            );
+        }
+        return Ok(Some(s));
+    }
+
+    Ok(None)
+}
+
+// ---------------------------------------------------------------------------
+// Bug B (v0.2.5): re-detect hardware + apply reconfiguration.
+// See `HardwareSnapshot` / `HardwareDetectionDiff` / `ReconfigReport` for
+// the wire types.
+// ---------------------------------------------------------------------------
+
+/// Build a `HardwareSnapshot` from a freshly-detected `SystemDetection`.
+/// Derives `use_gpu` and `low_resource` according to the same rules
+/// install.py uses to map detection results onto its CLI flags.
+pub(crate) fn snapshot_from_system(s: &SystemDetection) -> HardwareSnapshot {
+    let ram_gb_u32 = u32::try_from(s.ram_gb).unwrap_or(u32::MAX);
+    let use_gpu = s.has_nvidia_gpu || s.has_apple_silicon;
+    let low_resource = ram_gb_u32 > 0 && ram_gb_u32 < 8;
+    HardwareSnapshot {
+        has_nvidia_gpu: s.has_nvidia_gpu,
+        gpu_name: s.gpu_name.clone(),
+        has_apple_silicon: s.has_apple_silicon,
+        ram_gb: ram_gb_u32,
+        use_gpu,
+        low_resource,
+    }
+}
+
+fn snapshot_changed_fields(a: &HardwareSnapshot, b: &HardwareSnapshot) -> Vec<String> {
+    let mut out = Vec::new();
+    if a.has_nvidia_gpu != b.has_nvidia_gpu {
+        out.push("has_nvidia_gpu".to_string());
+    }
+    if a.gpu_name != b.gpu_name {
+        out.push("gpu_name".to_string());
+    }
+    if a.has_apple_silicon != b.has_apple_silicon {
+        out.push("has_apple_silicon".to_string());
+    }
+    if a.ram_gb != b.ram_gb {
+        out.push("ram_gb".to_string());
+    }
+    if a.use_gpu != b.use_gpu {
+        out.push("use_gpu".to_string());
+    }
+    if a.low_resource != b.low_resource {
+        out.push("low_resource".to_string());
+    }
+    out
+}
+
+/// Read the persisted hardware snapshot, if any. Soft-fails parse errors
+/// (returns `Ok(None)`) so a corrupted row can be overwritten by the
+/// next `redetect_hardware` call rather than wedging the Preferences UI.
+pub(crate) fn read_persisted_hardware_snapshot(db: &Db) -> Result<Option<HardwareSnapshot>, String> {
+    let raw = match db.app_state_get(APP_STATE_KEY_HARDWARE_SNAPSHOT)? {
+        Some(s) if !s.is_empty() => s,
+        _ => return Ok(None),
+    };
+    match serde_json::from_str::<HardwareSnapshot>(&raw) {
+        Ok(snap) => Ok(Some(snap)),
+        Err(e) => {
+            eprintln!(
+                "[vct] hardware_snapshot row is unparseable; ignoring: {}",
+                e
+            );
+            Ok(None)
+        }
+    }
+}
+
+fn write_persisted_hardware_snapshot(db: &Db, snap: &HardwareSnapshot) -> Result<(), String> {
+    let json = serde_json::to_string(snap)
+        .map_err(|e| format!("serialize hardware snapshot: {}", e))?;
+    db.app_state_set(APP_STATE_KEY_HARDWARE_SNAPSHOT, &json)
+}
+
+/// Re-run detection and return a diff against the persisted snapshot.
+/// Also persists the FRESH snapshot so a subsequent
+/// `apply_hardware_reconfig` call sees the current state, not the
+/// pre-detection one.
+#[command]
+pub async fn redetect_hardware(db: State<'_, Db>) -> Result<HardwareDetectionDiff, String> {
+    let before = read_persisted_hardware_snapshot(db.inner())?;
+    let system = detect_system().await?;
+    let after = snapshot_from_system(&system);
+
+    write_persisted_hardware_snapshot(db.inner(), &after)?;
+
+    let changed_fields = match &before {
+        Some(prev) => snapshot_changed_fields(prev, &after),
+        None => Vec::new(),
+    };
+
+    Ok(HardwareDetectionDiff {
+        before,
+        after,
+        changed_fields,
+    })
+}
+
+/// Spawn `install.py --update <flags>` from the known install path,
+/// streaming subprocess output line-by-line as `hardware_reconfig_progress`
+/// Tauri events. Returns a final `ReconfigReport`.
+///
+/// Flags are derived from the persisted (already-refreshed) snapshot:
+///   - `use_gpu=true`  → `--gpu`
+///   - `use_gpu=false` → `--cpu-only`
+///   - `low_resource=true` → `--low-resource`
+///
+/// Refuses to run when `launcher.install_path` is unset / invalid OR
+/// when `launcher.hardware_snapshot` is unset (caller must hit Re-detect
+/// first).
+#[command]
+pub async fn apply_hardware_reconfig(
+    db: State<'_, Db>,
+    window: Window,
+) -> Result<ReconfigReport, String> {
+    let install_path_str = db
+        .app_state_get(APP_STATE_KEY_INSTALL_PATH)?
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            "No known install — run the install wizard first.".to_string()
+        })?;
+    if !check_install_status(install_path_str.clone()) {
+        return Err(format!(
+            "Cached install path is no longer a valid VCO install: {}. \
+             Re-run the install wizard.",
+            install_path_str
+        ));
+    }
+    let install_path = PathBuf::from(&install_path_str);
+
+    let snap = read_persisted_hardware_snapshot(db.inner())?
+        .ok_or_else(|| "Run Re-detect first.".to_string())?;
+
+    let system = detect_system().await?;
+    if !system.has_python {
+        return Err(
+            "Python 3.11+ is required for hardware reconfiguration. Install from https://python.org"
+                .to_string(),
+        );
+    }
+
+    // Build the install.py argv. Mirrors the lightweight argv builder
+    // contract — explicit, no auto-add of unrelated flags.
+    let mut argv: Vec<String> = vec![
+        "install.py".to_string(),
+        "--update".to_string(),
+    ];
+    if snap.use_gpu {
+        argv.push("--gpu".to_string());
+    } else {
+        argv.push("--cpu-only".to_string());
+    }
+    if snap.low_resource {
+        argv.push("--low-resource".to_string());
+    }
+
+    // Prepare log file. We tee subprocess output to disk so the user can
+    // still inspect what happened after the launcher restarts. Best-effort
+    // — failure to create the log dir does NOT block the reconfig run.
+    let log_dir = install_path.join("state").join("logs");
+    let _ = std::fs::create_dir_all(&log_dir);
+    let log_stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let log_path = log_dir.join(format!("hardware-reconfig-{}.log", log_stamp));
+    let log_path_str = log_path.to_string_lossy().to_string();
+
+    let mut log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .ok();
+    if let Some(f) = log_file.as_mut() {
+        use std::io::Write;
+        let _ = writeln!(
+            f,
+            "[vct] hardware-reconfig START argv={:?} install_path={}",
+            argv, install_path_str
+        );
+    }
+
+    let python_cmd = &system.python_cmd;
+    let mut cmd = tokio::process::Command::new(python_cmd);
+    cmd.args(&argv)
+        .current_dir(&install_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("install.py --update failed to start: {}", e))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "install.py --update: stdout pipe missing".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "install.py --update: stderr pipe missing".to_string())?;
+
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let window_out = window.clone();
+    let log_path_out = log_path.clone();
+    let stdout_task = tokio::spawn(async move {
+        let reader = BufReader::new(stdout);
+        let mut lines = reader.lines();
+        // Re-open the log file per task to keep the borrows simple — the
+        // OS-level append mode serialises writes between stdout/stderr
+        // tasks just fine.
+        let mut log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path_out)
+            .ok();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if let Some(f) = log.as_mut() {
+                use std::io::Write;
+                let _ = writeln!(f, "{}", line);
+            }
+            let _ = window_out.emit("hardware_reconfig_progress", line);
+        }
+    });
+
+    let window_err = window.clone();
+    let log_path_err = log_path.clone();
+    let stderr_task = tokio::spawn(async move {
+        let reader = BufReader::new(stderr);
+        let mut lines = reader.lines();
+        let mut log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path_err)
+            .ok();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if let Some(f) = log.as_mut() {
+                use std::io::Write;
+                let _ = writeln!(f, "[stderr] {}", line);
+            }
+            let _ = window_err.emit("hardware_reconfig_progress", line);
+        }
+    });
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("install.py --update failed to await: {}", e))?;
+
+    // Drain both pipes before returning. We don't propagate join errors —
+    // the subprocess result is the source of truth.
+    let _ = stdout_task.await;
+    let _ = stderr_task.await;
+
+    let exit_code = status.code().unwrap_or(-1);
+    let success = status.success();
+
+    if let Some(f) = log_file.as_mut() {
+        use std::io::Write;
+        let _ = writeln!(
+            f,
+            "[vct] hardware-reconfig END success={} exit_code={}",
+            success, exit_code
+        );
+    }
+
+    if success {
+        let now = chrono::Utc::now().to_rfc3339();
+        if let Err(e) =
+            db.app_state_set(APP_STATE_KEY_HARDWARE_LAST_RECONFIGURED, &now)
+        {
+            eprintln!("[vct] failed to persist hardware_last_reconfigured_at: {}", e);
+        }
+    }
+
+    Ok(ReconfigReport {
+        success,
+        exit_code,
+        log_path: log_path_str,
+    })
+}
+
+/// Boot-time seed: if `launcher.hardware_snapshot` is unset, run a
+/// detection and persist. Called from `lib.rs::setup`.
+///
+/// Implementation note: setup() runs INSIDE the Tauri async runtime, so
+/// we cannot block on a fresh `tokio::runtime::Runtime` (panics with
+/// "Cannot start a runtime from within a runtime"). Instead we spawn the
+/// detection as a background task — boot continues immediately, the
+/// snapshot lands in app_state ~hundreds of ms later. Re-detect calls
+/// already overwrite this asynchronously, so the eventual-consistency
+/// model is consistent end-to-end.
+///
+/// The caller passes an owned `AppHandle` so the spawned task can
+/// re-acquire the Db State without borrowing across an `.await` (Db
+/// itself is `!Clone` — it wraps a `Mutex<Connection>`).
+///
+/// Soft-fails every error path so a detection hiccup never affects boot.
+pub fn seed_initial_hardware_snapshot_if_missing<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+) {
+    // Synchronous fast-path: skip the spawn entirely when the row is
+    // already populated.
+    if let Some(db) = app.try_state::<Db>() {
+        match db.app_state_get(APP_STATE_KEY_HARDWARE_SNAPSHOT) {
+            Ok(Some(s)) if !s.is_empty() => return,
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("[vct] seed hw snapshot: app_state read failed: {}", e);
+                return;
+            }
+        }
+    } else {
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        let system = match detect_system().await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[vct] seed hw snapshot: detect_system failed: {}", e);
+                return;
+            }
+        };
+        let snap = snapshot_from_system(&system);
+        let Some(db) = app.try_state::<Db>() else {
+            return;
+        };
+        // Re-check inside the task: a race with Re-detect Preferences
+        // action would otherwise clobber a fresher snapshot.
+        match db.app_state_get(APP_STATE_KEY_HARDWARE_SNAPSHOT) {
+            Ok(Some(s)) if !s.is_empty() => return,
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("[vct] seed hw snapshot: app_state recheck failed: {}", e);
+                return;
+            }
+        }
+        if let Err(e) = write_persisted_hardware_snapshot(db.inner(), &snap) {
+            eprintln!("[vct] seed hw snapshot: persist failed: {}", e);
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Bug 32: pre-flight install safety check.
 //
 // Before the user confirms an install, we surface EXACTLY what will and
@@ -1376,6 +1878,15 @@ pub async fn install_orchestrator(
 
     emit_progress(&window, "done", "Orchestrator installed successfully!", 100.0);
 
+    // Bug A (v0.2.5): persist the chosen install path so the launcher
+    // can find it again on next boot regardless of where it was placed.
+    // Soft-fail: a DB hiccup must not block install completion.
+    if let Some(db) = window.app_handle().try_state::<Db>() {
+        if let Err(e) = db.app_state_set(APP_STATE_KEY_INSTALL_PATH, &config.install_path) {
+            eprintln!("[vct] install_orchestrator: failed to persist install_path: {}", e);
+        }
+    }
+
     Ok(InstallResult {
         success: true,
         install_path: config.install_path,
@@ -1554,9 +2065,22 @@ async fn run_install_orchestrator_lightweight(
     }
     emit_progress(&window, "done", "Lightweight reinstall complete", 100.0);
 
+    // Bug A (v0.2.5): refresh the persisted install_path on a successful
+    // lightweight reinstall — covers the case where the user pointed the
+    // launcher at a different existing VCO clone since the last full install.
+    let install_path_str = install_path.to_string_lossy().to_string();
+    if let Some(db) = window.app_handle().try_state::<Db>() {
+        if let Err(e) = db.app_state_set(APP_STATE_KEY_INSTALL_PATH, &install_path_str) {
+            eprintln!(
+                "[vct] run_install_orchestrator_lightweight: failed to persist install_path: {}",
+                e
+            );
+        }
+    }
+
     Ok(InstallResult {
         success: true,
-        install_path: install_path.to_string_lossy().to_string(),
+        install_path: install_path_str,
         message: "Lightweight reinstall complete".to_string(),
         system,
     })

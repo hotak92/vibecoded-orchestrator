@@ -167,8 +167,8 @@ fn default_mcp_servers() -> Vec<McpServerConfig> {
     vec![
         McpServerConfig {
             id: "weaviate-kg".to_string(),
-            name: "Knowledge Graph".to_string(),
-            description: "Semantic search across knowledge graph and project docs".to_string(),
+            name: "Knowledge & Code Graph".to_string(),
+            description: "Semantic + structural search across KG nodes and code entities".to_string(),
             enabled: true,
             command: "claude_mcp_servers/weaviate_mcp/server.py".to_string(),
             args: vec![],
@@ -216,8 +216,8 @@ fn default_mcp_servers() -> Vec<McpServerConfig> {
         },
         McpServerConfig {
             id: "search".to_string(),
-            name: "Web & Code Search".to_string(),
-            description: "Free web search, GitHub code search, and academic paper search".to_string(),
+            name: "Web & Paper Search".to_string(),
+            description: "Free web search (SearXNG), GitHub code-snippet search, and academic paper search (OpenAlex/arXiv). Note: 'code search' here is GitHub-text-search, NOT the codegraph — codegraph lives in `weaviate-kg`.".to_string(),
             enabled: true,
             command: "claude_mcp_servers/search_mcp/server.py".to_string(),
             args: vec![],
@@ -235,34 +235,15 @@ fn default_mcp_servers() -> Vec<McpServerConfig> {
                 }),
             ]),
         },
-        McpServerConfig {
-            id: "code-embed".to_string(),
-            name: "Code Embeddings".to_string(),
-            description: "GPU-accelerated code embeddings via CodeSage-Large-v2 (containerized)".to_string(),
-            enabled: false, // Disabled by default — requires GPU; enabled by installer when GPU detected
-            command: "container:vct_code_embed".to_string(), // Container-managed, not bare process
-            args: vec![],
-            env: HashMap::new(),
-            min_tier: OrchestratorTier::Free,
-            port: Some(11440),
-            configurable: true,
-            settings: HashMap::from([
-                ("CODE_EMBED_BACKEND".to_string(), McpSetting {
-                    label: "Backend".to_string(),
-                    value: "gpu".to_string(),
-                    setting_type: McpSettingType::Select,
-                    description: "gpu (CodeSage container, NVIDIA GPU) or ollama (CPU fallback via Ollama)".to_string(),
-                    editable: true,
-                }),
-                ("CODE_EMBED_PORT".to_string(), McpSetting {
-                    label: "Port".to_string(),
-                    value: "11440".to_string(),
-                    setting_type: McpSettingType::Number,
-                    description: "HTTP port for the code embedding service".to_string(),
-                    editable: true,
-                }),
-            ]),
-        },
+        // NOTE: `code-embed` (CodeSage-Large-v2 container at port 11440) is
+        // NOT an MCP — it's a backend HTTP service consumed by `weaviate-kg`
+        // for code-graph embeddings. It lives in the Services tab, not the
+        // MCP registry. Removed from this list 2026-05-13 after surfacing as
+        // "global off" in the per-project Permissions tab (misclassification:
+        // the per-project toggle has no semantic meaning since weaviate-kg's
+        // codegraph features need the service either way). The container is
+        // managed via `services.toml` (adopt mode); the launcher tray
+        // (`tray.rs::services` list) correctly tracks it as a service.
         McpServerConfig {
             id: "playwright".to_string(),
             name: "Browser automation".to_string(),

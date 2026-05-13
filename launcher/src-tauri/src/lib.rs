@@ -106,6 +106,15 @@ pub fn run() {
                 }
             }
 
+            // Bug B (v0.2.5): seed the initial hardware snapshot on
+            // first launcher boot. Soft-fails so a detection hiccup
+            // (e.g. nvidia-smi not on PATH) never blocks boot. The
+            // Preferences → Hardware "Re-detect" button overwrites this
+            // later with a fresh snapshot.
+            commands::installer::seed_initial_hardware_snapshot_if_missing(
+                app.handle().clone(),
+            );
+
             // Migration 010 follow-up (2026-05-10): backfill the
             // `project_mcp_servers` table for projects registered before
             // this migration shipped. For each existing project with zero
@@ -437,6 +446,17 @@ pub fn run() {
             commands::installer::install_orchestrator,
             commands::installer::preview_install,
             commands::installer::detect_existing_install_root,
+            // Bug A (v0.2.5): path-agnostic install discovery. FE's
+            // `checkStatus()` calls this BEFORE falling back to
+            // `get_default_install_path`. See commands::installer for
+            // the two-strategy contract.
+            commands::installer::get_known_install_path,
+            // Bug B (v0.2.5): re-detect hardware + apply reconfig
+            // (Preferences → Hardware). See commands::installer for the
+            // HardwareSnapshot / HardwareDetectionDiff / ReconfigReport
+            // wire types.
+            commands::installer::redetect_hardware,
+            commands::installer::apply_hardware_reconfig,
             // Install health gate. Runs once at app startup from
             // `+layout.svelte` to detect the .exe-only install scenario
             // (user downloads launcher binary from a Release, skips

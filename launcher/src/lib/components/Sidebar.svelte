@@ -17,6 +17,12 @@
     sub: string;
     /** match() returns true if the route is "active" for this item. */
     match: (path: string) => boolean;
+    /** When true, this item requires an active Pro/MAO/admin license. Free
+     *  tier users see it greyed out + a 'Pro' badge; clicking routes to
+     *  /store instead of the gated page. The Team-section v1.x rollout
+     *  surfaces the affordance early so users discover the upgrade path
+     *  before the section's full UI lands. */
+    proOnly?: boolean;
   };
 
   type NavGroup = {
@@ -30,6 +36,17 @@
   // this client-side reveals the routes but not the server-gated
   // capabilities they exercise.
   const isAdmin = $derived(($license.cache?.orchestrator_tier ?? 'free') === 'admin');
+
+  /** True when the current orchestrator tier unlocks Pro-gated UI
+   *  surfaces (Team section etc.). `pro`, `mao`, `enterprise`, and
+   *  `admin` all qualify; `free` does not. Server-side gates back
+   *  this client-side hint: a free user clicking a proOnly link gets
+   *  redirected to /store, and the underlying Tauri commands the
+   *  page would call also enforce tier. */
+  const hasPro = $derived.by(() => {
+    const tier = $license.cache?.orchestrator_tier ?? 'free';
+    return tier === 'pro' || tier === 'mao' || tier === 'enterprise' || tier === 'admin';
+  });
 
   const groups = $derived<NavGroup[]>([
     {
@@ -91,12 +108,14 @@
           label: 'Coordination',
           sub: 'Send and receive team messages',
           match: (p) => p.startsWith('/coordination'),
+          proOnly: true,
         },
         {
           href: '/hub',
           label: 'Hub',
           sub: 'Cross-tool data and apps',
           match: (p) => p.startsWith('/hub'),
+          proOnly: true,
         },
       ],
     },
@@ -188,8 +207,22 @@
         <div class="group-label">{group.label}</div>
         {#each group.items as item}
           {@const active = item.match(currentPath)}
-          <a class="nav-item" class:active href={item.href}>
-            <span class="nav-label">{item.label}</span>
+          {@const locked = item.proOnly === true && !hasPro}
+          <a
+            class="nav-item"
+            class:active
+            class:locked
+            href={locked ? '/store' : item.href}
+            title={locked
+              ? `${item.label} is a Pro feature. Click to activate Pro.`
+              : item.sub}
+          >
+            <span class="nav-label">
+              {item.label}
+              {#if locked}
+                <span class="nav-pro-badge">Pro</span>
+              {/if}
+            </span>
             <span class="nav-sub">{item.sub}</span>
           </a>
         {/each}
@@ -264,5 +297,35 @@
 
   .nav-item.active .nav-sub {
     color: var(--color-mid);
+  }
+
+  /* Pro-gated items on free tier: greyed out + Pro badge. Still
+   * clickable (routes to /store instead of the gated page) so users
+   * discover the upgrade path. */
+  .nav-item.locked {
+    opacity: 0.55;
+  }
+
+  .nav-item.locked:hover {
+    opacity: 0.85;
+  }
+
+  .nav-label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .nav-pro-badge {
+    display: inline-block;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    padding: 1px 5px;
+    border-radius: 3px;
+    background: rgba(241, 196, 15, 0.18);
+    color: #f1c40f;
+    line-height: 1;
   }
 </style>

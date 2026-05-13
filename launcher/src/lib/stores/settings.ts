@@ -7,8 +7,15 @@ export interface Settings {
 }
 
 const STORAGE_KEY = 'vct_settings';
+// Bug A (v0.2.5): nothing should depend on a hard-coded default install
+// path — the install script + wizard each provide the path on first use,
+// and `get_known_install_path` + `get_default_install_path` (OS-aware)
+// fill this in afterwards. Hard-coding `C:\VCT-Tools` (a) advertised the
+// wrong OS on non-Windows, (b) misled the wizard pre-fill, and (c)
+// confused the "checkStatus" probe into thinking a Windows-only path
+// was the install root.
 const DEFAULT_SETTINGS: Settings = {
-  installPath: 'C:\\VCT-Tools',
+  installPath: '',
   autoUpdate: true,
   launchOnStartup: false,
 };
