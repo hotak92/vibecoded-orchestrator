@@ -29,7 +29,7 @@
     "@sveltejs/vite-plugin-svelte": "^5.0.0",
     "@tailwindcss/vite": "^4.2.1",
     "@tauri-apps/cli": "^2",
-    "svelte": "^5.0.0",
+    "svelte": "^5.55.7",
     "svelte-check": "^4.4.8",
     "tailwindcss": "^4.2.4",
     "typescript": "~6.0.3",
