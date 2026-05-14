@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="UTF-16"?>
+<!--
+  Windows Task Scheduler XML for the Claude MCP container stack.
+
+  v0.2.10 (Bug L2 — cross-OS boot-service materialization): on Windows
+  the systemd unit / launchd plist concepts map to a Scheduled Task
+  registered against the user's logon trigger. install.py renders this
+  template and imports it via `schtasks /Create /XML <file> /F`. Runs
+  per-user without admin elevation.
+
+  Why this exists:
+    - The wrapper script scripts/launch-claude-mcp-stack.sh is bash; it
+      doesn't run natively on cmd.exe / PowerShell. The Actions/Exec
+      below invokes `bash` (Git Bash, WSL bash, or any bash on PATH),
+      passing the wrapper script as the argument. Git Bash + WSL are
+      already prerequisites in the orchestrator's general install path
+      (Windows users without bash should install Git for Windows).
+    - StartWhenAvailable + per-user logon trigger matches the Linux
+      "systemctl --user enable" + "loginctl enable-linger" pair: the
+      task runs whenever the user logs in, no admin scope required.
+
+  GPU note (Windows):
+    Docker Desktop on Windows uses the WSL2 backend; GPU passthrough
+    requires the NVIDIA-WSL2 driver (host-side, separate install) AND
+    Docker Desktop ≥ 4.16. podman on Windows runs via podman-machine
+    (also WSL2-backed); same WSL2 GPU semantics apply. The wrapper's
+    NVIDIA / CDI detection is Linux-only (it shells out to nvidia-smi
+    and reads /var/run/cdi/nvidia.yaml — neither exists on Windows host).
+    On Windows the wrapper currently falls through to CPU-only compose;
+    a future revision could shell into the WSL2 distro to probe. Out of
+    scope for v0.2.10.
+
+  Template substitutions (filled in by install.py):
+    {{LABEL}}              — task name (no path separators)
+    {{WORKING_DIR}}        — directory containing compose.yaml
+    {{WRAPPER_SCRIPT}}     — absolute path to launch-claude-mcp-stack.sh
+                             (use forward slashes; bash translates them)
+    {{CREATED_AT}}         — ISO8601 timestamp at materialization time
+    {{USER_ID}}            — Windows user ID (e.g. DOMAIN\\user) for the
+                             logon trigger context
+-->
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Date>{{CREATED_AT}}</Date>
+    <Author>{{USER_ID}}</Author>
+    <Description>Claude MCP container stack (weaviate, ollama, code_embed, model_router, searxng) — brings up at user logon via launch-claude-mcp-stack.sh.</Description>
+    <URI>\{{LABEL}}</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>{{USER_ID}}</UserId>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{{USER_ID}}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>bash</Command>
+      <Arguments>"{{WRAPPER_SCRIPT}}"</Arguments>
+      <WorkingDirectory>{{WORKING_DIR}}</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>

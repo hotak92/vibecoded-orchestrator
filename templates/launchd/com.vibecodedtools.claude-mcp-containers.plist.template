@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  {{INSTALLED_AT_PATH}}
+
+  macOS launchd LaunchAgent for the Claude MCP container stack.
+
+  v0.2.10 (Bug L2 — cross-OS boot-service materialization): on macOS the
+  systemd unit template doesn't apply; the platform-native equivalent is
+  a per-user LaunchAgent under ~/Library/LaunchAgents/. install.py
+  renders this template and installs it via `launchctl bootstrap` (or
+  `launchctl load -w` on legacy macOS).
+
+  Why this exists:
+    - The wrapper script scripts/launch-claude-mcp-stack.sh works
+      identically on macOS (it's portable bash), but cron/systemd are
+      Linux concepts. launchd is Apple's per-user job scheduler.
+    - RunAtLoad=true + KeepAlive=false matches the systemd Type=oneshot
+      semantics: bring the stack up at login, then exit. Container
+      restart policies handle individual container recovery thereafter.
+
+  GPU note (Apple Silicon):
+    Docker Desktop on Apple Silicon does NOT pass through the Metal GPU
+    to containers — workloads stay CPU-only (or use the host's Metal
+    via Apple-native processes, not the container). podman on Apple
+    Silicon runs in a podman-machine VM with no GPU passthrough either.
+    The wrapper falls through to CPU-only compose, which is the right
+    answer on this platform.
+
+  Template substitutions (filled in by install.py):
+    {{INSTALLED_AT_PATH}}  — absolute path where this plist landed
+    {{LABEL}}              — launchd label (reverse-DNS, must match filename)
+    {{WORKING_DIR}}        — directory containing compose.yaml
+    {{WRAPPER_SCRIPT}}     — absolute path to launch-claude-mcp-stack.sh
+    {{LOG_FILE}}           — absolute path to the stdout/stderr log
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{{LABEL}}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>{{WRAPPER_SCRIPT}}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>WorkingDirectory</key>
+    <string>{{WORKING_DIR}}</string>
+    <key>StandardOutPath</key>
+    <string>{{LOG_FILE}}</string>
+    <key>StandardErrorPath</key>
+    <string>{{LOG_FILE}}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>VCT_STACK_WORKING_DIR</key>
+        <string>{{WORKING_DIR}}</string>
+        <key>VCT_STACK_LOG_FILE</key>
+        <string>{{LOG_FILE}}</string>
+    </dict>
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
