@@ -573,15 +573,38 @@ pub fn check_install_status(path: String) -> bool {
     p.join(".venv").exists()
 }
 
-/// Get the installed version (latest git tag or commit hash).
+/// Bug F (v0.2.8): get the installed version from canonical files, not
+/// `git describe`. See `commands/manifest.rs` for the full rationale —
+/// summary: a file-mirror install or a release-zip install gives the
+/// wrong answer (or no answer at all) when keyed off git history,
+/// because the .git/ history reflects the SOURCE repo at copy time, not
+/// the files actually on disk.
+///
+/// Priority chain (delegated to `read_version_from_install_files`):
+///   1. state/install-manifest.json `version`
+///   2. vct-module.json `version`
+///   3. launcher/package.json `version`
+///   4. launcher/src-tauri/Cargo.toml `[package] version`
+///   5. launcher/src-tauri/tauri.conf.json `version`
+///
+/// Falls back to `git describe --tags --abbrev=0` only when ALL five
+/// canonical sources return None — keeps the existing dev-environment
+/// "no version files but a git repo" path working.
 #[command]
 pub async fn get_installed_version(path: String) -> Result<String, String> {
     let p = PathBuf::from(&path);
+
+    // Bug F: canonical-files first.
+    if let Some(v) = crate::commands::manifest::read_version_from_install_files(&p) {
+        return Ok(v);
+    }
+
+    // Fallback path: `git describe`. Requires .git/ — without it we have
+    // nothing left to try.
     if !p.join(".git").exists() {
         return Err("Not a git repository".to_string());
     }
 
-    // Try tag first
     let tag_output = tokio::process::Command::new("git")
         .args(["describe", "--tags", "--abbrev=0"])
         .current_dir(&p)
@@ -596,7 +619,6 @@ pub async fn get_installed_version(path: String) -> Result<String, String> {
         }
     }
 
-    // Fall back to short commit hash
     let hash_output = tokio::process::Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
         .current_dir(&p)
@@ -3886,6 +3908,19 @@ pub async fn update_orchestrator_at(path: String, window: Window) -> Result<(), 
                 e
             );
         }
+    }
+
+    // Bug G (v0.2.8): refresh state/install-manifest.json so the
+    // launcher's "what version is at this path?" reads the just-copied
+    // vct-module.json's version, not the prior one. Soft-fail: never
+    // block "Update complete" — the manifest is diagnostic.
+    if let Err(e) =
+        crate::commands::manifest::refresh_install_manifest(&target, "orchestrator_update")
+    {
+        eprintln!(
+            "[update_orchestrator_at] install-manifest refresh failed (non-fatal): {}",
+            e
+        );
     }
 
     emit_progress(&window, "done", "Update complete", 100.0);

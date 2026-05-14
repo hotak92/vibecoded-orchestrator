@@ -426,3 +426,46 @@ function resolveProjectId(entry: Pick<SecretEntry, 'project_id' | 'scope'>): str
 
 export const secrets = createSecretsStore();
 export { entryKey };
+
+// ─── Bug H (v0.2.8): secrets-import client ─────────────────────────────
+//
+// One-shot import surface for the migration from on-disk secret stores
+// (project .env files, ~/.vct-secrets/shared/) into the launcher
+// keychain. The value-handling rule is INVIOLABLE: the FE only ever
+// holds the KEY and the SOURCE descriptor — never the value. The
+// backend reads the value itself when `registerSecretFromSource` is
+// called.
+
+export interface ImportableSecretKey {
+  /** The secret key (e.g. "GITHUB_TOKEN"). Never contains the value. */
+  key: string;
+  /** Opaque source descriptor returned by the backend; pass it back
+   *  unchanged to `registerSecretFromSource`. Format:
+   *  "env_file:<abs_path>" or "vct_secrets_shared:<abs_path>". */
+  source: string;
+  /** Whether the launcher's shared keychain already has this key.
+   *  FE renders an "already imported" badge for true. */
+  already_in_keychain: boolean;
+}
+
+/** Enumerate importable secret keys from the canonical on-disk sources.
+ *  Returns one row per (key, source) pair. The list is deterministic
+ *  across calls (sorted by source-priority then filename). */
+export async function listImportableSecretKeys(): Promise<ImportableSecretKey[]> {
+  if (!tauriAvailable) return [];
+  return await invoke<ImportableSecretKey[]>('list_importable_secret_keys', {});
+}
+
+/** Register a secret by KEY only. The backend reads the value from the
+ *  source itself and writes it to the shared keychain under
+ *  `module_id="user"`. Returns void on success; throws on error.
+ *  The error message NEVER includes the raw value (backend contract). */
+export async function registerSecretFromSource(
+  key: string,
+  source: string
+): Promise<void> {
+  if (!tauriAvailable) {
+    throw new Error('register_secret_from_source: Tauri unavailable');
+  }
+  await invoke('register_secret_from_source', { key, source });
+}

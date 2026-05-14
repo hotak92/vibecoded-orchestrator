@@ -396,6 +396,12 @@ pub fn run() {
             commands::secrets_cmd::resume_secret_for_project,
             // 0.2.x backlog #3: shared-tab key-collision shadow badge.
             commands::secrets_cmd::list_user_secret_keys_v2,
+            // Bug H (v0.2.8 / Phase 5): register secrets by KEY only.
+            // The launcher reads the value from the source itself; no
+            // value ever crosses the IPC boundary. See
+            // commands/secrets_import.rs for the value-handling rules.
+            commands::secrets_import::list_importable_secret_keys,
+            commands::secrets_import::register_secret_from_source,
             // 0.2.x backlog #4: Update-all sequential iteration.
             commands::projects_v2::update_all_projects,
             // Licensing
