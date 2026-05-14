@@ -1,0 +1,64 @@
+# {{INSTALLED_AT_PATH}}
+#
+# Brings up the Claude MCP container stack at user-session start.
+#
+# v0.2.9 (Bug J): the prior version ran `podman-compose up -d` directly,
+# which raced `nvidia-cdi-refresh.service` on boot. Result observed
+# 2026-05-14: ollama_claude and code_embed_claude failed with
+# "unresolvable CDI devices nvidia.com/gpu=all" because
+# /var/run/cdi/nvidia.yaml wasn't written yet.
+#
+# Fix: ExecStart now points at `scripts/launch-claude-mcp-stack.sh`,
+# which:
+#   - Waits up to 30s for /var/run/cdi/nvidia.yaml to exist + parse.
+#   - On CDI ready: compose-up with the GPU overlay.
+#   - On CDI timeout: degrades to CPU-only compose-up + log warning.
+#   - On no NVIDIA: plain CPU compose-up.
+#   - Detects runtime from state/install/runtime.txt OR `which`.
+#
+# Failure-isolation rules (revised 2026-05-08, preserved here):
+#
+#   1. NO `ExecStop=podman-compose down`. The previous version had this
+#      and it was a footgun: ANY single container failing to start
+#      (e.g. stale CDI mount path after an NVIDIA driver upgrade) made
+#      `up -d` exit non-zero, systemd marked the unit as failed, ran
+#      ExecStop, and took down ALL the other (healthy) containers as
+#      collateral.
+#
+#   2. `SuccessExitStatus=0 125` — exit 125 from podman-compose means
+#      "one or more containers failed to start". We tolerate that at
+#      the unit level (other containers' `restart: unless-stopped`
+#      policy still recovers them individually).
+#
+# Template substitutions (filled in by install.py):
+#   {{INSTALLED_AT_PATH}}  — absolute path where this unit landed
+#   {{WORKING_DIR}}        — directory containing compose.yaml
+#   {{WRAPPER_SCRIPT}}     — absolute path to launch-claude-mcp-stack.sh
+#   {{LOG_FILE}}           — absolute path to the unit's log file
+#
+[Unit]
+Description=Claude MCP containers (weaviate, ollama, code_embed, model_router, searxng)
+After=network.target
+# v0.2.9 (Bug J): wait for NVIDIA CDI refresh to finish writing the
+# /var/run/cdi/nvidia.yaml spec before bringing up GPU containers.
+# Soft dependency (Wants= without Requires=) so the unit still runs on
+# non-NVIDIA hosts where this unit doesn't exist. The wrapper script
+# is the second layer of defense — it polls the CDI yaml directly and
+# degrades to CPU on timeout.
+After=nvidia-cdi-refresh.service
+Wants=nvidia-cdi-refresh.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory={{WORKING_DIR}}
+Environment=VCT_STACK_WORKING_DIR={{WORKING_DIR}}
+Environment=VCT_STACK_LOG_FILE={{LOG_FILE}}
+ExecStart=/usr/bin/env bash {{WRAPPER_SCRIPT}}
+# Tolerate exit 125 from podman-compose (some containers failed, others OK).
+SuccessExitStatus=0 125
+StandardOutput=append:{{LOG_FILE}}
+StandardError=append:{{LOG_FILE}}
+
+[Install]
+WantedBy=default.target

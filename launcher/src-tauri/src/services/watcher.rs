@@ -61,15 +61,37 @@ pub enum WatcherTransition {
     /// Service went `running=false` → `running=true`. Reset backoff +
     /// log the recovery.
     Recovered,
+    /// v0.2.9 (Bug I): first observation of this service in the launcher
+    /// session reports `running=false`. This is the "down-since-boot" case
+    /// — the service was already dead by the time the watcher woke up
+    /// (sleep/wake cycle, failed systemd compose-up, CDI race). The
+    /// `Stopped` branch would NEVER fire for this case because there's no
+    /// `true → false` transition. Drives one restart attempt via the
+    /// existing backoff machinery; subsequent failures fall back to the
+    /// normal give-up logic.
+    ColdStart,
 }
 
 /// Pure classifier — given prev + current run state, return what to do.
 /// Extracted so tests don't need a real watcher loop.
-pub fn classify_transition(prev_running: bool, now_running: bool) -> WatcherTransition {
+///
+/// `prev_running` is `Some(bool)` after the first tick, `None` on cold
+/// start. The `None → false` arm is the v0.2.9 Bug I fix: a service that's
+/// been down since the launcher started gets a `ColdStart` transition (a
+/// one-shot restart synthesis) instead of `Stable` (forever-silent).
+pub fn classify_transition(
+    prev_running: Option<bool>,
+    now_running: bool,
+) -> WatcherTransition {
     match (prev_running, now_running) {
-        (true, false) => WatcherTransition::Stopped,
-        (false, true) => WatcherTransition::Recovered,
-        _ => WatcherTransition::Stable,
+        (Some(true), false) => WatcherTransition::Stopped,
+        (Some(false), true) => WatcherTransition::Recovered,
+        (Some(_), _) => WatcherTransition::Stable,
+        // First observation in this launcher session:
+        //   - running=true → Stable (nothing to do, just record).
+        //   - running=false → ColdStart (synthesize a restart attempt).
+        (None, true) => WatcherTransition::Stable,
+        (None, false) => WatcherTransition::ColdStart,
     }
 }
 
@@ -163,12 +185,7 @@ async fn handle_service_tick<R: Runtime + 'static>(
 ) {
     let entry = state.entry(svc.name.clone()).or_default();
     let prev = entry.last_running;
-    let transition = match prev {
-        Some(prev_running) => classify_transition(prev_running, svc.running),
-        // First time we've seen this service this session — no prior to
-        // compare against; record state and move on.
-        None => WatcherTransition::Stable,
-    };
+    let transition = classify_transition(prev, svc.running);
     entry.last_running = Some(svc.running);
 
     match transition {
@@ -195,12 +212,20 @@ async fn handle_service_tick<R: Runtime + 'static>(
             entry.attempts = 0;
             entry.given_up = false;
         }
-        WatcherTransition::Stopped => {
+        WatcherTransition::Stopped | WatcherTransition::ColdStart => {
+            // Distinguish in the log so post-incident forensics can tell
+            // the two apart, but otherwise share the same restart path.
+            let (event_label, prev_running_logged) = match transition {
+                WatcherTransition::Stopped => ("transition", Some(true)),
+                // v0.2.9 (Bug I): cold-start synthesis. `prev=None,
+                // now=false` — service was already dead at launcher boot.
+                _ => ("cold_start", None),
+            };
             log_event(WatcherLogEvent {
                 ts: now_iso(),
                 service: &svc.name,
-                event: "transition",
-                prev_running: Some(true),
+                event: event_label,
+                prev_running: prev_running_logged,
                 new_running: Some(false),
                 attempt: None,
                 error: None,
@@ -224,7 +249,7 @@ async fn handle_service_tick<R: Runtime + 'static>(
                     ts: now_iso(),
                     service: &svc.name,
                     event: "needs_user_pick",
-                    prev_running: Some(true),
+                    prev_running: prev_running_logged,
                     new_running: Some(false),
                     attempt: None,
                     error: None,
@@ -454,11 +479,11 @@ mod tests {
     #[test]
     fn classify_transition_stable_when_unchanged() {
         assert_eq!(
-            classify_transition(true, true),
+            classify_transition(Some(true), true),
             WatcherTransition::Stable
         );
         assert_eq!(
-            classify_transition(false, false),
+            classify_transition(Some(false), false),
             WatcherTransition::Stable
         );
     }
@@ -466,7 +491,7 @@ mod tests {
     #[test]
     fn classify_transition_detects_stopped() {
         assert_eq!(
-            classify_transition(true, false),
+            classify_transition(Some(true), false),
             WatcherTransition::Stopped
         );
     }
@@ -474,9 +499,49 @@ mod tests {
     #[test]
     fn classify_transition_detects_recovered() {
         assert_eq!(
-            classify_transition(false, true),
+            classify_transition(Some(false), true),
             WatcherTransition::Recovered
         );
+    }
+
+    /// v0.2.9 Bug I — the down-since-boot case. First observation is
+    /// `running=false`; without ColdStart synthesis the watcher would
+    /// classify this Stable and never heal the service.
+    #[test]
+    fn classify_transition_cold_start_when_down_at_boot() {
+        assert_eq!(
+            classify_transition(None, false),
+            WatcherTransition::ColdStart
+        );
+    }
+
+    /// First-observation-running is a no-op record, NOT a ColdStart
+    /// (the service is healthy; we just had no prior to compare to).
+    #[test]
+    fn classify_transition_first_running_is_stable() {
+        assert_eq!(
+            classify_transition(None, true),
+            WatcherTransition::Stable
+        );
+    }
+
+    /// Cold-start must only fire ONCE per launcher session per service.
+    /// After the synthesized restart attempt records `last_running=Some(false)`,
+    /// a subsequent `false` observation must classify as `Stable`, not
+    /// re-fire ColdStart. (The give_up flag is the second layer of defense;
+    /// this tests the classifier's contribution.)
+    #[test]
+    fn classify_transition_cold_start_fires_only_once() {
+        // First observation: cold-start case.
+        let first = classify_transition(None, false);
+        assert_eq!(first, WatcherTransition::ColdStart);
+
+        // After the handler runs, last_running is set to Some(false). The
+        // next tick that still sees the service down is Stable — the
+        // backoff machinery (attempts, given_up) governs whether to
+        // retry, NOT the classifier.
+        let next = classify_transition(Some(false), false);
+        assert_eq!(next, WatcherTransition::Stable);
     }
 
     /// Backoff schedule must contain at least one delay AND not be too
@@ -502,7 +567,7 @@ mod tests {
         entry.attempts = 2;
         entry.given_up = false;
         // Recovered.
-        if let WatcherTransition::Recovered = classify_transition(false, true) {
+        if let WatcherTransition::Recovered = classify_transition(Some(false), true) {
             entry.attempts = 0;
             entry.given_up = false;
         }

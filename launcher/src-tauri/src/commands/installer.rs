@@ -118,7 +118,7 @@ pub struct InstallResult {
 /// and stored eagerly so the install.py reconfig flags can be reproduced
 /// from a single persisted blob without re-running the full
 /// `detect_system()` join.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HardwareSnapshot {
     pub has_nvidia_gpu: bool,
     pub gpu_name: String,
@@ -130,6 +130,27 @@ pub struct HardwareSnapshot {
     /// Derived: ram_gb < 8. Triggers install.py's `--low-resource` path
     /// (smaller models, narrower service stack).
     pub low_resource: bool,
+    /// v0.2.9 (Bug K): total VRAM (GB) for the primary discrete GPU.
+    /// 0.0 when no discrete GPU OR when the probe failed. Stored on the
+    /// snapshot so reconfig flows can re-evaluate the threshold without
+    /// re-running `nvidia-smi` / `rocm-smi`. `serde(default)` for
+    /// backward-compat with v0.2.8 snapshots persisted in app_state.
+    #[serde(default)]
+    pub vram_gb: f64,
+    /// v0.2.9 (Bug K): derived GPU mode based on the VRAM threshold.
+    /// `Gpu` | `Cpu` | `Metal`. Drives whether the reconfig run uses
+    /// `--gpu` or `--cpu-only`. `serde(default)` falls back to `Cpu` for
+    /// pre-v0.2.9 snapshots — a subsequent redetect-hardware run will
+    /// populate it correctly.
+    #[serde(default = "default_gpu_mode")]
+    pub gpu_mode_decided: crate::commands::gpu_policy::GpuMode,
+}
+
+/// Default for the `gpu_mode_decided` serde fallback. We treat older
+/// snapshots as `Cpu` until a redetect populates the real value — safer
+/// than assuming `Gpu` and then failing to start the GPU overlay.
+fn default_gpu_mode() -> crate::commands::gpu_policy::GpuMode {
+    crate::commands::gpu_policy::GpuMode::Cpu
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -929,7 +950,25 @@ pub async fn get_known_install_path(db: State<'_, Db>) -> Result<Option<String>,
 /// install.py uses to map detection results onto its CLI flags.
 pub(crate) fn snapshot_from_system(s: &SystemDetection) -> HardwareSnapshot {
     let ram_gb_u32 = u32::try_from(s.ram_gb).unwrap_or(u32::MAX);
-    let use_gpu = s.has_nvidia_gpu || s.has_apple_silicon;
+    let vram_gb = s.vram_gb as f64;
+    // v0.2.9 (Bug K): map raw detection → GpuMode via the VRAM threshold.
+    // No user override at the snapshot layer — the override only applies
+    // at the install.py CLI surface (--gpu / --cpu-only).
+    let gpu_mode_decided = crate::commands::gpu_policy::decide_gpu_mode(
+        vram_gb,
+        s.has_nvidia_gpu,
+        s.has_apple_silicon,
+        None,
+        crate::commands::gpu_policy::DEFAULT_GPU_VRAM_THRESHOLD_GB,
+    );
+    // use_gpu retains its pre-v0.2.9 semantics for backward compat with
+    // any external consumer that reads the persisted field — but the
+    // reconfig flow now consults `gpu_mode_decided` for the actual flag
+    // pick. See `apply_hardware_reconfig`.
+    let use_gpu = matches!(
+        gpu_mode_decided,
+        crate::commands::gpu_policy::GpuMode::Gpu | crate::commands::gpu_policy::GpuMode::Metal
+    );
     let low_resource = ram_gb_u32 > 0 && ram_gb_u32 < 8;
     HardwareSnapshot {
         has_nvidia_gpu: s.has_nvidia_gpu,
@@ -938,6 +977,8 @@ pub(crate) fn snapshot_from_system(s: &SystemDetection) -> HardwareSnapshot {
         ram_gb: ram_gb_u32,
         use_gpu,
         low_resource,
+        vram_gb,
+        gpu_mode_decided,
     }
 }
 
@@ -960,6 +1001,14 @@ fn snapshot_changed_fields(a: &HardwareSnapshot, b: &HardwareSnapshot) -> Vec<St
     }
     if a.low_resource != b.low_resource {
         out.push("low_resource".to_string());
+    }
+    // v0.2.9 (Bug K): VRAM is a float; treat as changed if |diff| > 0.1 GB
+    // to avoid spurious change events from rounding noise in the probes.
+    if (a.vram_gb - b.vram_gb).abs() > 0.1 {
+        out.push("vram_gb".to_string());
+    }
+    if a.gpu_mode_decided != b.gpu_mode_decided {
+        out.push("gpu_mode_decided".to_string());
     }
     out
 }
@@ -1059,14 +1108,20 @@ pub async fn apply_hardware_reconfig(
 
     // Build the install.py argv. Mirrors the lightweight argv builder
     // contract — explicit, no auto-add of unrelated flags.
+    //
+    // v0.2.9 (Bug K): the flag picked is driven by `gpu_mode_decided`
+    // (which already applied the VRAM threshold + Apple Silicon logic),
+    // not the legacy `use_gpu` boolean. Metal is treated as a GPU-mode
+    // pick at the install.py surface — install.py itself recognises Apple
+    // Silicon and routes to the metal compose overlay.
     let mut argv: Vec<String> = vec![
         "install.py".to_string(),
         "--update".to_string(),
     ];
-    if snap.use_gpu {
-        argv.push("--gpu".to_string());
-    } else {
-        argv.push("--cpu-only".to_string());
+    use crate::commands::gpu_policy::GpuMode;
+    match snap.gpu_mode_decided {
+        GpuMode::Gpu | GpuMode::Metal => argv.push("--gpu".to_string()),
+        GpuMode::Cpu => argv.push("--cpu-only".to_string()),
     }
     if snap.low_resource {
         argv.push("--low-resource".to_string());
