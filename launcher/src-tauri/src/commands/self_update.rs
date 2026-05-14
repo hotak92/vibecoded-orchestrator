@@ -504,6 +504,21 @@ async fn finish_apply_after_pull<R: Runtime>(
         );
     }
 
+    // Bug G (v0.2.8): refresh the install-manifest's `version` /
+    // `source_commit` / `completed_at` so the next session reports the
+    // new launcher version. `repo` here is the launcher's enclosing
+    // install root (find_launcher_repo_root returns the dir containing
+    // launcher/). The cargo+npm rebuild above has already produced the
+    // new binary; the version-source files (vct-module.json,
+    // package.json, Cargo.toml, tauri.conf.json) are all on disk in the
+    // new state. Soft-fail: never block restart.
+    if let Err(e) = crate::commands::manifest::refresh_install_manifest(repo, "launcher_update") {
+        eprintln!(
+            "[apply_launcher_update] install-manifest refresh failed (non-fatal): {}",
+            e
+        );
+    }
+
     std::process::Command::new(&exe)
         .spawn()
         .map_err(|e| format!("failed to spawn new launcher: {}", e))?;

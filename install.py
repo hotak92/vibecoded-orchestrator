@@ -1451,6 +1451,14 @@ def _run_lightweight(args: argparse.Namespace) -> int:
     # has the right baseline.
     _record_state_hashes(PROJECT_ROOT)
     print("[4/4] State-hashes snapshot: written")
+
+    # Bug G (v0.2.8): refresh install-manifest.json on lightweight too.
+    # Previously the manifest was written only on the full install path,
+    # so an install that was set up at v0.1.x and lightweight-reinstalled
+    # at v0.2.x kept reporting v0.1.x forever. sysinfo=None — the
+    # manifest writer falls back to prior values for the affected fields.
+    _write_install_manifest(None, args, install_method="lightweight")
+
     _log_install_event(
         "lightweight", "ok",
         "lightweight re-install complete",
@@ -5299,11 +5307,11 @@ INSTALL_MANIFEST_SCHEMA_VERSION = 1
 def _read_tauri_version() -> str | None:
     """Read the canonical version string from launcher/src-tauri/tauri.conf.json.
 
-    This is the single source of truth for "what version is this install?"
-    (matches the version baked into the launcher binary by Tauri at build
-    time — see commands/licensing.rs::DEFAULT_VALIDATE_TIER_URL section in
-    tauri.conf.json). Returns None if the file is missing (CLI-only install
-    without a launcher tree)."""
+    Pre-v0.2.8 this was the sole version source. v0.2.8 (Bug F) makes
+    `_read_install_version` the canonical entry point, which falls back
+    through several files before reaching tauri.conf.json. Kept as a
+    helper so the priority chain stays explicit.
+    """
     conf = PROJECT_ROOT / "launcher" / "src-tauri" / "tauri.conf.json"
     if not conf.is_file():
         return None
@@ -5314,6 +5322,90 @@ def _read_tauri_version() -> str | None:
         return str(v) if v else None
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def _read_install_version(root: Path | None = None) -> str | None:
+    """Bug F (v0.2.8): canonical version read for the installed tree.
+
+    Priority order mirrors the Rust-side `read_version_from_install_files`,
+    EXCLUDING state/install-manifest.json itself — this helper is used
+    by the manifest writer, so consulting the manifest would be
+    circular (re-write the stale value we're trying to refresh):
+
+      1. vct-module.json (always shipped with releases)
+      2. launcher/package.json
+      3. launcher/src-tauri/Cargo.toml (`version = "..."` line)
+      4. launcher/src-tauri/tauri.conf.json
+    Returns None if no source yields a non-empty string.
+
+    Defaults to PROJECT_ROOT so existing callsites pick up the new
+    behavior without code changes.
+    """
+    base = root or PROJECT_ROOT
+
+    # 1. vct-module.json
+    vm = base / "vct-module.json"
+    if vm.is_file():
+        try:
+            with vm.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            v = data.get("version")
+            if v:
+                return str(v)
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    # 2. launcher/package.json
+    pj = base / "launcher" / "package.json"
+    if pj.is_file():
+        try:
+            with pj.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            v = data.get("version")
+            if v:
+                return str(v)
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    # 3. launcher/src-tauri/Cargo.toml — parse the first top-level
+    #    `version = "..."` line in the [package] block.
+    cargo = base / "launcher" / "src-tauri" / "Cargo.toml"
+    if cargo.is_file():
+        try:
+            txt = cargo.read_text(encoding="utf-8")
+        except OSError:
+            txt = ""
+        in_pkg = False
+        for line in txt.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("[") and stripped.endswith("]"):
+                in_pkg = stripped == "[package]"
+                continue
+            if in_pkg and stripped.startswith("version"):
+                # `version = "0.2.7"` or `version="0.2.7"`
+                _, _, rhs = stripped.partition("=")
+                v = rhs.strip().strip('"').strip("'")
+                if v:
+                    return v
+
+    # 4. tauri.conf.json (legacy)
+    tv = _read_tauri_version() if base == PROJECT_ROOT else None
+    if tv:
+        return tv
+    # If `root` differs from PROJECT_ROOT, also probe its tauri.conf.json
+    if base != PROJECT_ROOT:
+        tc = base / "launcher" / "src-tauri" / "tauri.conf.json"
+        if tc.is_file():
+            try:
+                with tc.open("r", encoding="utf-8") as f:
+                    data = json.load(f)
+                v = data.get("version")
+                if v:
+                    return str(v)
+            except (OSError, json.JSONDecodeError):
+                pass
+
+    return None
 
 
 def _read_git_rev() -> tuple[str | None, str | None]:
@@ -5439,6 +5531,26 @@ def _write_install_manifest(sysinfo, args, install_method: str = "install.py") -
       - "install.py"        — direct invocation (CLI / first-install.sh path)
       - "wizard"            — Tauri install_orchestrator command
       - "update"            — re-run with --update flag
+      - "lightweight"       — `--lightweight` re-install path
+
+    Bug G (v0.2.8): this helper now runs unconditionally on every install
+    path that mutates the install tree — fresh install, `--update`,
+    `--lightweight`, and the Rust-side update / launcher self-update.
+    Pre-v0.2.8 the manifest was written ONCE at first install and never
+    refreshed, so `version` would drift for months until the user
+    nuked + reinstalled. The contract is now:
+
+      installed_at    — preserved across rewrites (true first-install ts)
+      completed_at    — refreshed every rewrite (most recent successful run)
+      version         — re-read from vct-module.json / tauri.conf.json each
+                        time so launcher reads the live install's version,
+                        not the stale one baked at first-install time
+      source_commit   — refreshed (current .git/HEAD)
+      source_branch   — refreshed (current .git/HEAD)
+
+    sysinfo may be None on the lightweight / Rust-driven refresh paths
+    where we don't have a freshly-detected SystemInfo handy; the manifest
+    falls back to read-from-prior or "" for the affected fields.
 
     Failures are logged but never raised — the install IS complete by the
     time we reach this; manifest absence is recoverable, install rollback
@@ -5449,10 +5561,13 @@ def _write_install_manifest(sysinfo, args, install_method: str = "install.py") -
 
     # Preserve original installed_at if a prior manifest exists (update path).
     installed_at = _utc_iso_now()
+    prior: dict = {}
     if manifest_path.is_file():
         try:
             with manifest_path.open("r", encoding="utf-8") as f:
-                prior = json.load(f)
+                loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    prior = loaded
             prior_installed_at = prior.get("installed_at")
             if isinstance(prior_installed_at, str) and prior_installed_at:
                 installed_at = prior_installed_at
@@ -5461,7 +5576,7 @@ def _write_install_manifest(sysinfo, args, install_method: str = "install.py") -
                     install_method = "update"
         except (OSError, json.JSONDecodeError):
             # Corrupt / unreadable prior manifest — overwrite cleanly.
-            pass
+            prior = {}
 
     commit, branch = _read_git_rev()
 
@@ -5489,18 +5604,27 @@ def _write_install_manifest(sysinfo, args, install_method: str = "install.py") -
     else:
         volumes["managed_by"] = "default"
 
+    # Container runtime: on full install/update we have sysinfo; on
+    # lightweight (sysinfo=None) we re-use the prior manifest's value if
+    # one was recorded so the field doesn't regress to null.
+    container_runtime = getattr(sysinfo, "container_cmd", None)
+    if container_runtime is None:
+        prior_cr = prior.get("container_runtime")
+        if isinstance(prior_cr, str) and prior_cr:
+            container_runtime = prior_cr
+
     manifest = {
         "schema_version":   INSTALL_MANIFEST_SCHEMA_VERSION,
         "installed":        True,
         "installed_at":     installed_at,
         "completed_at":     _utc_iso_now(),
-        "version":          _read_tauri_version(),
+        "version":          _read_install_version(),
         "source_commit":    commit,
         "source_branch":    branch,
         "install_method":   install_method,
         "python_version":   "%d.%d.%d" % (sys.version_info[0], sys.version_info[1], sys.version_info[2]),
         "python_executable": sys.executable,
-        "container_runtime": getattr(sysinfo, "container_cmd", None),
+        "container_runtime": container_runtime,
         "cpu_only":         bool(getattr(args, "cpu_only", False)),
         "use_gpu":          bool(getattr(args, "gpu", False)),
         "low_resource":     bool(getattr(args, "low_resource", False)),
