@@ -1068,6 +1068,24 @@ mod tests {
         Db(Mutex::new(conn))
     }
 
+    /// Acquire the process-wide keychain test mutex. Every test in this
+    /// module that touches the OS keyring (directly via `secrets::*` or
+    /// indirectly via `refresh_env_after_user_secret_change` /
+    /// `set_secret_v2` / `delete_secret_v2`) MUST hold this guard for
+    /// the duration of the test body. Pre-2026-05-13 some tests skipped
+    /// the lock; under heavy parallel-test load gnome-keyring-daemon
+    /// SIGTRAP'd, taking the SSH-agent integration down with it. See
+    /// `crate::secrets`'s module-level "Concurrency model" doc and the
+    /// KG node "VCO keyring SIGTRAP" for the threat model.
+    ///
+    /// Returned as `_lock` (underscored) so the caller doesn't get an
+    /// "unused variable" warning — the value's lifetime IS the lock
+    /// scope. Hold it until end of test by binding to a `_`-prefixed
+    /// local; do NOT bind to `_` alone or RAII drops the lock immediately.
+    fn keychain_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::secrets::test_serialize::keychain_serialize_lock()
+    }
+
     fn seed_project(db: &Db, id: &str, name: &str) {
         // Placeholder folder_path string — never resolved against disk by
         // these tests. Use a platform-appropriate prefix so the value isn't
@@ -1186,6 +1204,9 @@ mod tests {
     /// would silently break every entry written before migration 007.
     #[test]
     fn active_flag_defaults_active_when_no_row() {
+        // Serialize against other keychain-touching tests across
+        // the crate. Required since 2026-05-13 — see crate::secrets docs.
+        let _kc_lock = keychain_test_lock();
         let db = make_db();
         assert!(db.is_secret_active("global", SENTINEL_GLOBAL, "u", "K").unwrap());
     }
@@ -1216,6 +1237,9 @@ mod tests {
     /// or pass through to a workstation pre-merge.
     #[test]
     fn inactive_secret_does_not_leak_preview() {
+        // Serialize against other keychain-touching tests across
+        // the crate. Required since 2026-05-13 — see crate::secrets docs.
+        let _kc_lock = keychain_test_lock();
         if !keyring_available() {
             eprintln!("[skip] no OS keychain backend in this test env");
             return;
@@ -1444,6 +1468,9 @@ mod tests {
     /// Skipped without an OS keychain (most CI containers).
     #[tokio::test]
     async fn set_secret_v2_triggers_env_refresh() {
+        // Serialize against other keychain-touching tests across
+        // the crate. Required since 2026-05-13 — see crate::secrets docs.
+        let _kc_lock = keychain_test_lock();
         if !keyring_available() {
             eprintln!("[skip] no OS keychain backend");
             return;
@@ -1520,6 +1547,9 @@ mod tests {
     /// Skipped without OS keychain.
     #[tokio::test]
     async fn delete_secret_v2_strips_secret_from_env_surfaces() {
+        // Serialize against other keychain-touching tests across
+        // the crate. Required since 2026-05-13 — see crate::secrets docs.
+        let _kc_lock = keychain_test_lock();
         if !keyring_available() {
             eprintln!("[skip] no OS keychain backend");
             return;
@@ -1594,6 +1624,9 @@ mod tests {
     /// after a module-owned secret op.
     #[test]
     fn refresh_env_after_user_secret_change_skips_module_owned_buckets() {
+        // Serialize against other keychain-touching tests across
+        // the crate. Required since 2026-05-13 — see crate::secrets docs.
+        let _kc_lock = keychain_test_lock();
         let db = make_db();
         let folder = seed_project_with_real_folder(&db, "p_skip", "SkipBucketProj");
 
@@ -1672,6 +1705,9 @@ mod tests {
     /// project's env files saw the key.
     #[tokio::test]
     async fn set_secret_v2_shared_user_bucket_propagates_to_all_registered_projects() {
+        // Serialize against other keychain-touching tests across
+        // the crate. Required since 2026-05-13 — see crate::secrets docs.
+        let _kc_lock = keychain_test_lock();
         if !keyring_available() {
             eprintln!("[skip] no OS keychain backend");
             return;
@@ -1737,6 +1773,9 @@ mod tests {
     /// in, only that it's in some user-emit bucket.
     #[tokio::test]
     async fn set_secret_v2_global_user_bucket_propagates_to_all_registered_projects() {
+        // Serialize against other keychain-touching tests across
+        // the crate. Required since 2026-05-13 — see crate::secrets docs.
+        let _kc_lock = keychain_test_lock();
         if !keyring_available() {
             eprintln!("[skip] no OS keychain backend");
             return;
@@ -1798,6 +1837,9 @@ mod tests {
     /// projects.
     #[tokio::test]
     async fn delete_secret_v2_shared_user_bucket_strips_from_all_projects() {
+        // Serialize against other keychain-touching tests across
+        // the crate. Required since 2026-05-13 — see crate::secrets docs.
+        let _kc_lock = keychain_test_lock();
         if !keyring_available() {
             eprintln!("[skip] no OS keychain backend");
             return;
@@ -1872,6 +1914,9 @@ mod tests {
     /// test.
     #[tokio::test]
     async fn delete_secret_v2_global_user_bucket_strips_from_all_projects() {
+        // Serialize against other keychain-touching tests across
+        // the crate. Required since 2026-05-13 — see crate::secrets docs.
+        let _kc_lock = keychain_test_lock();
         if !keyring_available() {
             eprintln!("[skip] no OS keychain backend");
             return;
@@ -2079,6 +2124,9 @@ mod tests {
     /// the resolver's `winning_scope` follows is_set, NOT mere row presence.
     #[test]
     fn winning_scope_ignores_paused_or_keychain_empty_rows() {
+        // Serialize against other keychain-touching tests across
+        // the crate. Required since 2026-05-13 — see crate::secrets docs.
+        let _kc_lock = keychain_test_lock();
         if !keyring_available() {
             eprintln!("[skip] no OS keychain backend");
             return;

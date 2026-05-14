@@ -53,8 +53,18 @@ jobs:
             librsvg2-dev \
             libsoup-3.0-dev \
             libjavascriptcoregtk-4.1-dev
-      - name: cargo test --lib
-        run: cargo test --lib --manifest-path launcher/src-tauri/Cargo.toml
+      # 2026-05-13 (post-SIGTRAP audit): run launcher tests
+      # single-threaded. The launcher's keychain-touching tests
+      # overwhelmed gnome-keyring-daemon under parallel execution on
+      # local workstations (observed crashes 2026-05-08, 2026-05-13).
+      # GitHub's ubuntu-latest runner uses an ephemeral keychain that
+      # didn't reproduce the crash, but the underlying contention is
+      # the same — single-threaded execution is cheap insurance and
+      # eliminates the entire class of "keychain-induced flake" CI
+      # failures. See scripts/test-keychain-safe.sh for the threat
+      # model and crate::secrets's module-level docs.
+      - name: cargo test --lib (keychain-safe wrapper)
+        run: bash scripts/test-keychain-safe.sh
 
   managed-paths-cross-language:
     name: Managed-paths cross-language consistency
