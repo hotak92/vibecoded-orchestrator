@@ -301,6 +301,8 @@ pub fn run() {
             commands::lifecycle::services_get_adoption,
             commands::lifecycle::services_reset_adoption,
             commands::lifecycle::services_find_free_port,
+            commands::lifecycle::services_enumerate_candidates,
+            commands::lifecycle::services_pick_container,
             // Container-runtime install (no-runtime modal). Linux uses
             // pkexec to elevate apt/dnf/pacman; macOS/Windows just open
             // the canonical install page in the user's default browser.

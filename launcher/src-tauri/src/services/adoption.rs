@@ -64,6 +64,26 @@ pub struct ServiceAdoption {
     /// to. None otherwise. Used when generating override yaml.
     #[serde(default)]
     pub parallel_port: Option<u16>,
+    /// v0.2.7 (Bug E1): the EXACT container name the launcher manages
+    /// for this service. Persisted across launcher restarts. When
+    /// `None`, the launcher hasn't picked a container yet (first
+    /// detection pending) or the previous pick has been invalidated
+    /// (container deleted).
+    ///
+    /// On every Start/Stop/Restart action,
+    /// `control_adopted_container` uses this name DIRECTLY — no
+    /// re-discovery. This prevents the v0.2.6 regression where two
+    /// containers shared the `com.docker.compose.service=<name>`
+    /// label (e.g. a user's `claude-mcp` stack AND a stale
+    /// `infrastructure` stack) and the watcher non-deterministically
+    /// picked the broken one, locking the working container out of
+    /// the canonical port.
+    ///
+    /// If the named container is missing,
+    /// `control_adopted_container` returns an error of kind
+    /// `"container_missing"` so the FE can surface the re-detect CTA.
+    #[serde(default)]
+    pub container_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -137,12 +157,14 @@ mod tests {
             mode: AdoptionMode::Adopt,
             external_url: Some("http://localhost:8081".into()),
             parallel_port: None,
+            container_name: Some("weaviate_claude".into()),
         });
         state.upsert(ServiceAdoption {
             name: "ollama".into(),
             mode: AdoptionMode::Parallel,
             external_url: Some("http://localhost:11435".into()),
             parallel_port: Some(11445),
+            container_name: None,
         });
         let body = toml::to_string_pretty(&state).unwrap();
         let decoded: AdoptionState = toml::from_str(&body).unwrap();
@@ -162,15 +184,63 @@ mod tests {
             mode: AdoptionMode::Unresolved,
             external_url: None,
             parallel_port: None,
+            container_name: None,
         });
         state.upsert(ServiceAdoption {
             name: "weaviate".into(),
             mode: AdoptionMode::Adopt,
             external_url: Some("http://localhost:8081".into()),
             parallel_port: None,
+            container_name: Some("weaviate_claude".into()),
         });
         assert_eq!(state.services.len(), 1);
         assert_eq!(state.get("weaviate").unwrap().mode, AdoptionMode::Adopt);
+        assert_eq!(
+            state.get("weaviate").unwrap().container_name.as_deref(),
+            Some("weaviate_claude"),
+            "upsert must overwrite container_name from the new entry"
+        );
+    }
+
+    /// v0.2.7: pre-existing services.toml files (written by v0.2.6 or by
+    /// install.py before the schema bumped) parse cleanly with
+    /// `container_name: None` because the field is `#[serde(default)]`.
+    /// Pinned here so a future refactor can't accidentally make the
+    /// field mandatory and break upgrade flows.
+    #[test]
+    fn parses_v026_toml_without_container_name() {
+        let raw = r#"[[services]]
+name = "weaviate"
+mode = "adopt"
+external_url = "http://localhost:8081"
+"#;
+        let parsed: AdoptionState = toml::from_str(raw).expect("legacy schema must parse");
+        let svc = parsed.get("weaviate").expect("weaviate entry");
+        assert_eq!(svc.mode, AdoptionMode::Adopt);
+        assert!(
+            svc.container_name.is_none(),
+            "legacy entry must default container_name to None"
+        );
+    }
+
+    /// v0.2.7: round-trip serialization preserves `container_name` so
+    /// the launcher reads back the same string it wrote.
+    #[test]
+    fn container_name_roundtrips() {
+        let mut state = AdoptionState::default();
+        state.upsert(ServiceAdoption {
+            name: "weaviate".into(),
+            mode: AdoptionMode::Adopt,
+            external_url: Some("http://localhost:8081".into()),
+            parallel_port: None,
+            container_name: Some("my_weaviate_container_v2".into()),
+        });
+        let body = toml::to_string_pretty(&state).unwrap();
+        let decoded: AdoptionState = toml::from_str(&body).unwrap();
+        assert_eq!(
+            decoded.get("weaviate").unwrap().container_name.as_deref(),
+            Some("my_weaviate_container_v2")
+        );
     }
 
     #[test]

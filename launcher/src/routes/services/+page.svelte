@@ -3,6 +3,13 @@
   // per-service controls + Re-detect adoption for externally-managed
   // services. Polls `services_status` on a 5s timer to keep state fresh
   // (matches the tray pill's cadence).
+  //
+  // v0.2.7 (Bug E1+E2): each row shows the pinned container name (the
+  // container the launcher is configured to manage) and exposes a
+  // "Re-detect" button that enumerates candidates and opens a picker
+  // modal. The picker modal also surfaces "fullness" probes per
+  // candidate (collection / model counts, etc.) so the user can tell a
+  // working container from a stale one.
 
   import { onMount, onDestroy } from 'svelte';
   import { invoke, listen } from '$lib/tauri';
@@ -14,6 +21,7 @@
     url: string;
     externally_managed: boolean;
     adoption_mode: 'unresolved' | 'adopt' | 'parallel' | 'refuse';
+    container_name: string | null;
   }
   interface ServicesRuntimeSnapshot {
     services: ServiceRuntimeState[];
@@ -26,6 +34,39 @@
     message: string;
   }
 
+  // Discriminated union mirroring `ContainerFullness` in
+  // launcher/src-tauri/src/services/picker.rs. Serde emits `kind` as the
+  // discriminator (snake_case).
+  type ContainerFullness =
+    | {
+        kind: 'weaviate';
+        collection_count: number;
+        canonical_collections_present: string[];
+        weaviate_version: string | null;
+      }
+    | {
+        kind: 'ollama';
+        model_count: number;
+        canonical_models_present: string[];
+      }
+    | {
+        kind: 'code_embed';
+        backend: string | null;
+        model: string | null;
+        dim: number | null;
+      };
+
+  interface ContainerCandidate {
+    container_name: string;
+    compose_project: string | null;
+    image: string;
+    status: string;
+    health: string | null;
+    port_published: number | null;
+    restart_count: number;
+    fullness: ContainerFullness | null;
+  }
+
   // services.toml-backed adoption config (read-only mirror of `services_get_adoption`).
   // Useful for "why is this service routed externally?" diagnostics; the per-row
   // `adoption_mode` on the snapshot is the runtime-classified value used for UI.
@@ -34,6 +75,7 @@
     mode: string;
     external_url?: string | null;
     parallel_port?: number | null;
+    container_name?: string | null;
   }
   interface AdoptionState {
     services: ServiceAdoptionConfig[];
@@ -46,6 +88,12 @@
   let progress = $state<LifecycleProgress | null>(null);
   let pollerHandle: ReturnType<typeof setInterval> | null = null;
   let unlistenProgress: (() => void) | null = null;
+
+  // Picker-modal state. Open when `pickerService != null`.
+  let pickerService = $state<string | null>(null);
+  let pickerCandidates = $state<ContainerCandidate[]>([]);
+  let pickerLoading = $state(false);
+  let pickerError = $state<string | null>(null);
 
   async function refresh() {
     try {
@@ -95,43 +143,43 @@
     }
   }
 
+  // Per-service action wrapper. v0.2.7: if the backend returns a
+  // structured error (`multiple_candidates: …` / `container_missing: …`),
+  // auto-open the picker for the offending service. We match by the
+  // colon-prefix to keep parsing trivial — the kinds are pinned by the
+  // ERR_KIND_* constants in launcher/src-tauri/src/commands/lifecycle.rs.
+  async function runServiceAction(
+    name: string,
+    cmd: 'service_start' | 'service_stop' | 'service_restart',
+  ) {
+    loading = true;
+    error = null;
+    try {
+      await invoke(cmd, { name });
+      await refresh();
+    } catch (e) {
+      const msg = String(e);
+      if (msg.startsWith('multiple_candidates:') || msg.startsWith('container_missing:') || msg.startsWith('no_candidates:')) {
+        // Surface the kind to the user in the modal — they need to
+        // know whether to pick, re-detect, or install something.
+        error = msg;
+        await openPicker(name);
+      } else {
+        error = msg;
+      }
+    } finally {
+      loading = false;
+    }
+  }
+
   async function startOne(name: string) {
-    loading = true;
-    error = null;
-    try {
-      await invoke('service_start', { name });
-      await refresh();
-    } catch (e) {
-      error = String(e);
-    } finally {
-      loading = false;
-    }
+    await runServiceAction(name, 'service_start');
   }
-
   async function stopOne(name: string) {
-    loading = true;
-    error = null;
-    try {
-      await invoke('service_stop', { name });
-      await refresh();
-    } catch (e) {
-      error = String(e);
-    } finally {
-      loading = false;
-    }
+    await runServiceAction(name, 'service_stop');
   }
-
   async function restartOne(name: string) {
-    loading = true;
-    error = null;
-    try {
-      await invoke('service_restart', { name });
-      await refresh();
-    } catch (e) {
-      error = String(e);
-    } finally {
-      loading = false;
-    }
+    await runServiceAction(name, 'service_restart');
   }
 
   async function resetAdoption() {
@@ -144,6 +192,98 @@
       error = String(e);
     } finally {
       loading = false;
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Picker modal
+  // ---------------------------------------------------------------------
+
+  async function openPicker(service: string) {
+    pickerService = service;
+    pickerCandidates = [];
+    pickerError = null;
+    pickerLoading = true;
+    try {
+      pickerCandidates = await invoke<ContainerCandidate[]>(
+        'services_enumerate_candidates',
+        { service },
+      );
+    } catch (e) {
+      pickerError = String(e);
+    } finally {
+      pickerLoading = false;
+    }
+  }
+
+  function closePicker() {
+    pickerService = null;
+    pickerCandidates = [];
+    pickerError = null;
+  }
+
+  async function pickCandidate(candidate: ContainerCandidate) {
+    if (!pickerService) return;
+    pickerLoading = true;
+    pickerError = null;
+    try {
+      await invoke('services_pick_container', {
+        service: pickerService,
+        containerName: candidate.container_name,
+      });
+      closePicker();
+      // Refresh both snapshot + adoption config so the row reflects the
+      // new pin immediately.
+      await refresh();
+      try {
+        adoptionConfig = await invoke<AdoptionState>('services_get_adoption');
+      } catch (e) {
+        console.warn('services_get_adoption (post-pick) failed:', e);
+      }
+    } catch (e) {
+      pickerError = String(e);
+    } finally {
+      pickerLoading = false;
+    }
+  }
+
+  function fullnessSummary(c: ContainerCandidate): string {
+    if (!c.fullness) {
+      return c.status === 'running' ? 'probe failed' : '—';
+    }
+    switch (c.fullness.kind) {
+      case 'weaviate': {
+        const f = c.fullness;
+        const canon = f.canonical_collections_present.length;
+        const ver = f.weaviate_version ? `, v${f.weaviate_version}` : '';
+        return `${f.collection_count} collections (${canon} canonical${ver})`;
+      }
+      case 'ollama': {
+        const f = c.fullness;
+        const canon = f.canonical_models_present.length;
+        return `${f.model_count} models (${canon} canonical)`;
+      }
+      case 'code_embed': {
+        const f = c.fullness;
+        const bits = [
+          f.backend ?? 'unknown backend',
+          f.model ?? 'unknown model',
+          f.dim ? `${f.dim}d` : '',
+        ].filter(Boolean);
+        return bits.join(' · ');
+      }
+    }
+  }
+
+  function fullnessDetails(c: ContainerCandidate): string[] {
+    if (!c.fullness) return [];
+    switch (c.fullness.kind) {
+      case 'weaviate':
+        return c.fullness.canonical_collections_present.slice(0, 5);
+      case 'ollama':
+        return c.fullness.canonical_models_present.slice(0, 5);
+      case 'code_embed':
+        return [];
     }
   }
 
@@ -223,7 +363,7 @@
         Restart All
       </button>
       <button onclick={resetAdoption} disabled={loading} class="secondary">
-        Re-detect
+        Reset adoption
       </button>
     </div>
 
@@ -243,6 +383,7 @@
           <th>Status</th>
           <th>Port</th>
           <th>Mode</th>
+          <th>Managing</th>
           <th>Actions</th>
         </tr>
       </thead>
@@ -266,33 +407,127 @@
                   ?.external_url ?? ''
               }
             >{svc.adoption_mode}</td>
+            <td class="container-cell">
+              {#if svc.container_name}
+                <code>{svc.container_name}</code>
+              {:else}
+                <span class="muted">unpinned</span>
+              {/if}
+            </td>
             <td class="actions-cell">
               <button
                 onclick={() => startOne(svc.name)}
-                disabled={loading || svc.externally_managed}
-                title={svc.externally_managed
-                  ? 'Externally managed — launcher does not control this service'
-                  : ''}
+                disabled={loading}
               >
                 Start
               </button>
               <button
                 onclick={() => stopOne(svc.name)}
-                disabled={loading || svc.externally_managed}
+                disabled={loading}
               >
                 Stop
               </button>
               <button
                 onclick={() => restartOne(svc.name)}
-                disabled={loading || svc.externally_managed}
+                disabled={loading}
               >
                 Restart
+              </button>
+              <button
+                onclick={() => openPicker(svc.name)}
+                disabled={loading}
+                class="secondary"
+                title="Enumerate candidate containers for this service"
+              >
+                Re-detect
               </button>
             </td>
           </tr>
         {/each}
       </tbody>
     </table>
+  {/if}
+
+  {#if pickerService}
+    <div
+      class="modal-backdrop"
+      onclick={closePicker}
+      onkeydown={(e) => { if (e.key === 'Escape') closePicker(); }}
+      role="presentation"
+    >
+      <div
+        class="modal"
+        onclick={(e) => e.stopPropagation()}
+        onkeydown={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        aria-label="Pick a container for {pickerService}"
+      >
+        <header class="modal-header">
+          <h2>Pick a container for <code>{pickerService}</code></h2>
+          <button class="close" onclick={closePicker} aria-label="Close">×</button>
+        </header>
+
+        {#if pickerLoading}
+          <p>Enumerating containers…</p>
+        {:else if pickerError}
+          <div class="banner error">{pickerError}</div>
+        {:else if pickerCandidates.length === 0}
+          <p class="muted">
+            No candidate containers found for <code>{pickerService}</code>.
+            Either nothing is running yet, or the launcher's container
+            runtime can't see your existing stack. Click "Start All" to
+            create fresh containers, or check your runtime config.
+          </p>
+        {:else}
+          <p class="muted">
+            {pickerCandidates.length} candidate{pickerCandidates.length === 1 ? '' : 's'} found.
+            Pick the one the launcher should manage.
+          </p>
+          <div class="candidates">
+            {#each pickerCandidates as c}
+              <article class="candidate {c.status === 'running' ? 'running' : 'stopped'}">
+                <header>
+                  <code class="cname">{c.container_name}</code>
+                  <span class="status {c.status === 'running' ? 'up' : 'down'}">
+                    {c.status}
+                  </span>
+                  {#if c.health}
+                    <span class="health {c.health}">{c.health}</span>
+                  {/if}
+                </header>
+                <dl class="meta">
+                  {#if c.compose_project}
+                    <dt>project</dt><dd><code>{c.compose_project}</code></dd>
+                  {/if}
+                  <dt>image</dt><dd><code>{c.image}</code></dd>
+                  <dt>port</dt><dd>
+                    {#if c.port_published}{c.port_published}{:else}—{/if}
+                  </dd>
+                  <dt>restarts</dt><dd>{c.restart_count}</dd>
+                  <dt>fullness</dt><dd>{fullnessSummary(c)}</dd>
+                </dl>
+                {#if fullnessDetails(c).length > 0}
+                  <ul class="fullness-list">
+                    {#each fullnessDetails(c) as d}
+                      <li><code>{d}</code></li>
+                    {/each}
+                  </ul>
+                {/if}
+                <footer>
+                  <button
+                    onclick={() => pickCandidate(c)}
+                    disabled={pickerLoading}
+                  >
+                    Pick this one
+                  </button>
+                </footer>
+              </article>
+            {/each}
+          </div>
+        {/if}
+      </div>
+    </div>
   {/if}
 </section>
 
@@ -389,8 +624,122 @@
     font-family: monospace;
     color: var(--text-muted, #aaa);
   }
+  .container-cell {
+    font-family: monospace;
+    font-size: 0.85rem;
+    color: var(--text-muted, #aaa);
+  }
+  .container-cell .muted {
+    margin: 0;
+  }
   .actions-cell {
     display: flex;
     gap: 0.25rem;
+    flex-wrap: wrap;
+  }
+
+  /* ---------- Picker modal ---------- */
+  .modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.55);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+  }
+  .modal {
+    background: var(--modal-bg, #1c1c1c);
+    border: 1px solid var(--border, #333);
+    border-radius: 6px;
+    padding: 1.25rem;
+    max-width: 720px;
+    width: 90vw;
+    max-height: 85vh;
+    overflow: auto;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+  }
+  .modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 0.75rem;
+  }
+  .modal-header h2 {
+    margin: 0;
+    font-size: 1.15rem;
+  }
+  .close {
+    background: transparent;
+    border: none;
+    color: inherit;
+    font-size: 1.5rem;
+    cursor: pointer;
+    padding: 0 0.4rem;
+  }
+  .candidates {
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+  }
+  .candidate {
+    border: 1px solid var(--border, #333);
+    border-radius: 4px;
+    padding: 0.6rem 0.8rem;
+    background: rgba(255, 255, 255, 0.02);
+  }
+  .candidate.stopped {
+    opacity: 0.75;
+  }
+  .candidate header {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    margin-bottom: 0.4rem;
+  }
+  .candidate .cname {
+    font-weight: 600;
+  }
+  .health {
+    text-transform: uppercase;
+    font-size: 0.7rem;
+    padding: 0.1rem 0.3rem;
+    border-radius: 3px;
+  }
+  .health.healthy {
+    background: rgba(34, 197, 94, 0.2);
+    color: #4ade80;
+  }
+  .health.unhealthy {
+    background: rgba(239, 68, 68, 0.2);
+    color: #fca5a5;
+  }
+  .health.starting {
+    background: rgba(245, 158, 11, 0.2);
+    color: #fbbf24;
+  }
+  .candidate .meta {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 0.15rem 0.6rem;
+    font-size: 0.85rem;
+    margin: 0.2rem 0;
+  }
+  .candidate .meta dt {
+    color: var(--text-muted, #aaa);
+  }
+  .candidate .meta dd {
+    margin: 0;
+  }
+  .fullness-list {
+    margin: 0.3rem 0 0.5rem 0;
+    padding-left: 1.2rem;
+    font-size: 0.8rem;
+    color: var(--text-muted, #aaa);
+  }
+  .candidate footer {
+    margin-top: 0.4rem;
+    display: flex;
+    justify-content: flex-end;
   }
 </style>
