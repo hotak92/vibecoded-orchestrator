@@ -1349,20 +1349,33 @@ mod services_lifecycle_tests {
     fn watcher_classifies_transitions_correctly() {
         use crate::services::watcher::{classify_transition, WatcherTransition};
         assert!(matches!(
-            classify_transition(true, true),
+            classify_transition(Some(true), true),
             WatcherTransition::Stable
         ));
         assert!(matches!(
-            classify_transition(false, false),
+            classify_transition(Some(false), false),
             WatcherTransition::Stable
         ));
         assert!(matches!(
-            classify_transition(true, false),
+            classify_transition(Some(true), false),
             WatcherTransition::Stopped
         ));
         assert!(matches!(
-            classify_transition(false, true),
+            classify_transition(Some(false), true),
             WatcherTransition::Recovered
+        ));
+        // v0.2.9 (Bug I) — down-since-boot must classify as ColdStart so
+        // the watcher actually attempts recovery instead of marking the
+        // service Stable forever.
+        assert!(matches!(
+            classify_transition(None, false),
+            WatcherTransition::ColdStart
+        ));
+        // First observation running → Stable (no prior, but no recovery
+        // needed either).
+        assert!(matches!(
+            classify_transition(None, true),
+            WatcherTransition::Stable
         ));
     }
 }

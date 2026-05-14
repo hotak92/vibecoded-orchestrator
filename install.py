@@ -1497,6 +1497,15 @@ def main() -> int:
                         help="Skip GPU driver probing entirely (for environments where nvidia-smi/rocm-smi hangs)")
     parser.add_argument("--low-resource", action="store_true",
                         help="Lightest mode: Jina V2 (768d) via Ollama. For low-RAM/low-VRAM machines.")
+    # v0.2.9 (Bug K): VRAM threshold for auto GPU vs CPU mode pick.
+    # Default 8.0 GB — see `_DEFAULT_GPU_VRAM_THRESHOLD_GB` rationale.
+    parser.add_argument("--gpu-vram-threshold-gb", type=float,
+                        default=_DEFAULT_GPU_VRAM_THRESHOLD_GB,
+                        help=(f"VRAM threshold (GB) for auto GPU mode "
+                              f"selection. Below this, the install falls "
+                              f"back to CPU-only even with a discrete GPU "
+                              f"present. Default: "
+                              f"{_DEFAULT_GPU_VRAM_THRESHOLD_GB}."))
     parser.add_argument("--openai-key", type=str, default="",
                         help="Use OpenAI embeddings (provide API key)")
     parser.add_argument("--container", type=str, choices=["docker", "podman"],
@@ -2350,6 +2359,42 @@ def _detect_system(args: argparse.Namespace) -> SystemInfo:
     # was NVIDIA-only).
     final_has_gpu = has_gpu or args.gpu
     final_vendor = gpu_vendor or ("nvidia" if args.gpu else "")
+
+    # v0.2.9 (Bug K): resolve user override → tri-state.
+    #   --gpu       => override=True
+    #   --cpu-only  => override=False
+    #   neither     => override=None (auto)
+    # When --openai-key is set, treat as override=False (we don't need
+    # local GPU at all — embeddings come from OpenAI). --no-gpu-check is
+    # ALSO override=False — the user explicitly suppressed the probe.
+    user_override: "bool | None" = None
+    if args.gpu:
+        user_override = True
+    elif args.cpu_only or args.openai_key or getattr(args, "no_gpu_check", False):
+        user_override = False
+    threshold_gb = float(getattr(
+        args, "gpu_vram_threshold_gb", _DEFAULT_GPU_VRAM_THRESHOLD_GB,
+    ))
+    gpu_mode = _decide_gpu_mode(
+        vram_gb=vram_gb,
+        vendor=final_vendor,
+        user_override=user_override,
+        threshold_gb=threshold_gb,
+    )
+    # If the threshold demoted a discrete GPU to CPU, tell the user
+    # explicitly — they may want to override or change the threshold.
+    if (
+        user_override is None
+        and final_vendor in ("nvidia", "amd")
+        and vram_gb > 0
+        and gpu_mode == "cpu"
+    ):
+        print(
+            f"  GPU mode: CPU (VRAM {vram_gb:.1f} GB < threshold "
+            f"{threshold_gb:.1f} GB — pass "
+            f"--gpu-vram-threshold-gb to override, or --gpu to force GPU)"
+        )
+
     if ram_gb > 0:
         print(f"  RAM: {ram_gb:.1f} GB")
     info = SystemInfo(
@@ -2362,6 +2407,12 @@ def _detect_system(args: argparse.Namespace) -> SystemInfo:
         ram_gb=ram_gb,
         gpu_vendor=final_vendor,
     )
+    # v0.2.9 (Bug K): stash the resolved mode on args so the manifest
+    # writer can record it without re-running detection.
+    args._gpu_mode = gpu_mode  # type: ignore[attr-defined]
+    args._vram_gb_resolved = vram_gb  # type: ignore[attr-defined]
+    args._gpu_vram_threshold_resolved = threshold_gb  # type: ignore[attr-defined]
+
     _log_install_event(
         "2/10", "ok",
         f"system detected: {os_name}",
@@ -2375,6 +2426,8 @@ def _detect_system(args: argparse.Namespace) -> SystemInfo:
             "gpu_vendor": final_vendor,
             "vram_gb": vram_gb,
             "ram_gb": ram_gb,
+            "gpu_mode": gpu_mode,
+            "gpu_vram_threshold_gb": threshold_gb,
         },
     )
     return info
@@ -2482,6 +2535,72 @@ def _detect_amd_rocm() -> tuple[bool, str]:
         return True, "AMD GPU (ROCm detected)"
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return False, ""
+
+
+# v0.2.9 (Bug K): VRAM-threshold gating for GPU mode.
+#
+# Default threshold (GB) below which we degrade to CPU-only even if a
+# discrete GPU is present. Tuned for the default model stack:
+#
+#   qwen3-embedding:0.6b  ~1.2 GB
+#   CodeSage-Large-v2     ~2.6 GB
+#   qwen3.5:9b (Q4)       ~6.0 GB
+#
+# An 8 GB card can hold the inference model OR the embedders, but
+# thrashes when both are loaded — degrading to CPU is faster than
+# partial offload. Configurable via `--gpu-vram-threshold-gb` for users
+# running a different model selection. Keep in sync with the Rust side
+# (`launcher::commands::gpu_policy::DEFAULT_GPU_VRAM_THRESHOLD_GB`).
+_DEFAULT_GPU_VRAM_THRESHOLD_GB = 8.0
+
+
+def _decide_gpu_mode(
+    vram_gb: float,
+    vendor: str,
+    user_override: "bool | None" = None,
+    threshold_gb: float = _DEFAULT_GPU_VRAM_THRESHOLD_GB,
+) -> str:
+    """Pure decision function: pick `"gpu"`, `"cpu"`, or `"metal"`.
+
+    Precedence:
+      1. `user_override` (when not None) wins. Apple Silicon owners
+         passing override=True still get `"metal"` (no CUDA on M-series);
+         everyone else passing override=True gets `"gpu"`.
+      2. vendor=="metal" → `"metal"` (no threshold — unified memory).
+      3. vendor in ("nvidia","amd") AND vram_gb >= threshold → `"gpu"`.
+      4. Else → `"cpu"`.
+
+    Mirrors the Rust `decide_gpu_mode` in
+    `launcher::commands::gpu_policy`. Pure (no side effects); test from
+    `tests/test_install_gpu_mode_decision.py`.
+
+    Args:
+      vram_gb:        Probed VRAM in GB. 0.0 means "no GPU" OR "probe
+                      failed". Conservative path: probe-failed → cpu.
+      vendor:         "nvidia" | "amd" | "metal" | "" (from
+                      `_detect_*` probes).
+      user_override:  `True` for `--gpu`, `False` for `--cpu-only`,
+                      `None` for "auto".
+      threshold_gb:   VRAM threshold in GB (inclusive). Default 8.0.
+
+    Returns:
+      One of: `"gpu"`, `"cpu"`, `"metal"`.
+    """
+    if user_override is not None:
+        if user_override:
+            # User-forced GPU mode. Apple Silicon still gets metal
+            # (their hardware can't do CUDA); everyone else gets gpu
+            # even below the threshold — user has accepted the tradeoff.
+            return "metal" if vendor == "metal" else "gpu"
+        return "cpu"
+
+    if vendor == "metal":
+        return "metal"
+
+    if vendor in ("nvidia", "amd") and vram_gb >= threshold_gb:
+        return "gpu"
+
+    return "cpu"
 
 
 def _probe_nvidia_vram_gb() -> float:
@@ -5613,6 +5732,29 @@ def _write_install_manifest(sysinfo, args, install_method: str = "install.py") -
         if isinstance(prior_cr, str) and prior_cr:
             container_runtime = prior_cr
 
+    # v0.2.9 (Bug K): record the decided GPU mode + VRAM + threshold so
+    # the launcher's reconfig flow (Rust side) can stay in sync without
+    # re-running probes. Fields are best-effort: lightweight / Rust-driven
+    # paths may not have a fresh sysinfo, in which case we preserve the
+    # prior manifest values to avoid regressing to nulls.
+    gpu_mode = getattr(args, "_gpu_mode", None)
+    if not isinstance(gpu_mode, str):
+        prior_mode = prior.get("gpu_mode")
+        gpu_mode = prior_mode if isinstance(prior_mode, str) else None
+
+    vram_gb = getattr(args, "_vram_gb_resolved", None)
+    if not isinstance(vram_gb, (int, float)):
+        prior_vram = prior.get("vram_gb")
+        vram_gb = prior_vram if isinstance(prior_vram, (int, float)) else None
+
+    vram_threshold = getattr(args, "_gpu_vram_threshold_resolved", None)
+    if not isinstance(vram_threshold, (int, float)):
+        prior_thr = prior.get("gpu_vram_threshold_gb")
+        vram_threshold = (
+            prior_thr if isinstance(prior_thr, (int, float))
+            else _DEFAULT_GPU_VRAM_THRESHOLD_GB
+        )
+
     manifest = {
         "schema_version":   INSTALL_MANIFEST_SCHEMA_VERSION,
         "installed":        True,
@@ -5632,6 +5774,10 @@ def _write_install_manifest(sysinfo, args, install_method: str = "install.py") -
         "vct_state_dir":    os.environ.get("VCT_STATE_DIR") or None,
         "install_path":     str(PROJECT_ROOT),
         "volumes":          volumes,
+        # v0.2.9 (Bug K) — GPU mode decision artefacts.
+        "gpu_mode":         gpu_mode,
+        "vram_gb":          vram_gb,
+        "gpu_vram_threshold_gb": vram_threshold,
     }
 
     try:
@@ -5651,6 +5797,26 @@ def _write_install_manifest(sysinfo, args, install_method: str = "install.py") -
             "manifest", "warn",
             f"could not write install-manifest.json: {exc}",
         )
+
+    # v0.2.9 (Bug J): also drop a single-line `state/install/runtime.txt`
+    # recording the detected container runtime ("podman" or "docker") so
+    # boot-time wrapper scripts (scripts/launch-claude-mcp-stack.sh) can
+    # pick the right compose binary without re-probing PATH. Best-effort.
+    if container_runtime:
+        # The first whitespace-separated token is the binary name; the
+        # rest is the version string. We only want the binary.
+        runtime_token = container_runtime.split()[0].lower()
+        if runtime_token in ("podman", "docker"):
+            install_subdir = state_dir / "install"
+            runtime_file = install_subdir / "runtime.txt"
+            try:
+                install_subdir.mkdir(parents=True, exist_ok=True)
+                runtime_file.write_text(runtime_token + "\n", encoding="utf-8")
+            except OSError as exc:
+                _log_install_event(
+                    "manifest", "warn",
+                    f"could not write runtime.txt: {exc}",
+                )
 
 
 # ---------------------------------------------------------------------------
