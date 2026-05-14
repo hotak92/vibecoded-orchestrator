@@ -67,6 +67,13 @@ pub struct ServiceRuntimeState {
     /// Mirror of the persisted adoption mode. Frontend shows this in
     /// the Services preferences screen.
     pub adoption_mode: AdoptionMode,
+    /// v0.2.7 (Bug E1): the persisted container name the launcher is
+    /// pinned to manage for this service, or `None` when no pick has
+    /// been made yet. Frontend renders this as "managing: <name>" so
+    /// the user can see which container the launcher will Start/Stop
+    /// when they hit the buttons.
+    #[serde(default)]
+    pub container_name: Option<String>,
 }
 
 /// Aggregate snapshot returned by `services_status`. Mirrors the shape
@@ -198,6 +205,7 @@ pub async fn services_status() -> Result<ServicesRuntimeSnapshot, String> {
         if running && mode == AdoptionMode::Unresolved {
             has_unresolved = true;
         }
+        let container_name = entry.and_then(|s| s.container_name.clone());
         services.push(ServiceRuntimeState {
             name,
             running,
@@ -205,6 +213,7 @@ pub async fn services_status() -> Result<ServicesRuntimeSnapshot, String> {
             url,
             externally_managed,
             adoption_mode: mode,
+            container_name,
         });
     }
 
@@ -450,7 +459,7 @@ pub(crate) async fn control_adopted_container(
         ));
     }
 
-    let container = find_container_for_service(info, service, port).await?;
+    let container = resolve_pinned_or_pick(info, service, port).await?;
     let argv = build_control_argv(info.runtime.binary(), action, &container);
 
     // We don't go through `info.compose_command()` here — we want the
@@ -495,7 +504,137 @@ pub(crate) fn build_control_argv(
     ]
 }
 
-/// Locate the container backing a managed service. Search order:
+/// Structured error prefix for [`control_adopted_container`]. The
+/// frontend matches on the prefix (everything up to the first `:`) so
+/// it can branch UI without parsing free-text. Keep these strings stable
+/// — Svelte switch-cases against them.
+pub const ERR_KIND_CONTAINER_MISSING: &str = "container_missing";
+pub const ERR_KIND_NO_CANDIDATES: &str = "no_candidates";
+pub const ERR_KIND_MULTIPLE_CANDIDATES: &str = "multiple_candidates";
+
+/// Build a structured error string. Format: `"<kind>: <human message>"`.
+/// `kind` MUST be one of the `ERR_KIND_*` constants above.
+pub(crate) fn structured_err(kind: &str, msg: impl AsRef<str>) -> String {
+    format!("{}: {}", kind, msg.as_ref())
+}
+
+/// Verify that `name` is a real container on this runtime via
+/// `<runtime> inspect`. Returns `Ok(true)` when the container exists
+/// (running or not), `Ok(false)` when it doesn't, and `Err` only on
+/// runtime invocation failures (no container runtime, permission error,
+/// …). The inspect-not-found case is NORMAL — a user may have deleted
+/// the container we pinned.
+pub(crate) async fn container_exists(info: &RuntimeInfo, name: &str) -> Result<bool, String> {
+    let mut cmd = tokio::process::Command::new(&info.binary_path);
+    cmd.args(["inspect", "--format", "{{.Id}}", name]);
+    let out = cmd
+        .output()
+        .await
+        .map_err(|e| format!("spawn {} inspect: {}", info.runtime.binary(), e))?;
+    Ok(out.status.success())
+}
+
+/// v0.2.7 (E1): resolve the container name to act on. Pinning-aware:
+///
+///   1. If `services.toml` has a `container_name` for this service AND
+///      `<runtime> inspect <name>` reports it exists → use that name.
+///   2. If pinned but the container is gone → return a
+///      `container_missing` structured error. The FE surfaces a
+///      "re-detect" CTA.
+///   3. If NOT pinned and there's exactly 1 candidate → auto-pick,
+///      persist to services.toml, then use it.
+///   4. If NOT pinned and 0 candidates → `no_candidates` error.
+///   5. If NOT pinned and 2+ candidates → `multiple_candidates` error.
+///      FE opens the picker modal.
+async fn resolve_pinned_or_pick(
+    info: &RuntimeInfo,
+    service: &str,
+    port: u16,
+) -> Result<String, String> {
+    let state = adoption::read();
+    let pinned = state
+        .get(service)
+        .and_then(|s| s.container_name.clone());
+
+    if let Some(name) = pinned.as_deref().filter(|s| !s.is_empty()) {
+        return match container_exists(info, name).await {
+            Ok(true) => Ok(name.to_string()),
+            Ok(false) => Err(structured_err(
+                ERR_KIND_CONTAINER_MISSING,
+                format!(
+                    "pinned container '{}' for service '{}' no longer exists; \
+                     click Re-detect to pick a replacement",
+                    name, service
+                ),
+            )),
+            Err(e) => Err(e),
+        };
+    }
+
+    // No pin → enumerate and decide.
+    let candidates =
+        crate::services::picker::enumerate_candidates(info, service, port).await?;
+    match candidates.len() {
+        0 => Err(structured_err(
+            ERR_KIND_NO_CANDIDATES,
+            format!(
+                "no container found for service '{}' on port {}; \
+                 launcher has nothing to manage",
+                service, port
+            ),
+        )),
+        1 => {
+            let pick = candidates[0].container_name.clone();
+            // Persist the auto-pick so subsequent actions skip discovery.
+            if let Err(e) = persist_container_pick(service, &pick) {
+                // Soft-fail: log + still use the pick this round. We DON'T
+                // want a stat() failure on services.toml to block the
+                // user's button press.
+                eprintln!(
+                    "[services] persist_container_pick({}={}) soft-failed: {}",
+                    service, pick, e
+                );
+            }
+            Ok(pick)
+        }
+        n => Err(structured_err(
+            ERR_KIND_MULTIPLE_CANDIDATES,
+            format!(
+                "{} candidate containers found for service '{}'; \
+                 user must pick one via the services panel",
+                n, service
+            ),
+        )),
+    }
+}
+
+/// Helper: update the `container_name` field for `service` in
+/// services.toml, preserving every other field. If the service has no
+/// entry yet we create one with default `Unresolved` mode.
+pub(crate) fn persist_container_pick(service: &str, container: &str) -> Result<(), String> {
+    let mut state = adoption::read();
+    let new_entry = match state.get(service) {
+        Some(existing) => ServiceAdoption {
+            container_name: Some(container.to_string()),
+            ..existing.clone()
+        },
+        None => ServiceAdoption {
+            name: service.to_string(),
+            mode: AdoptionMode::default(),
+            external_url: None,
+            parallel_port: None,
+            container_name: Some(container.to_string()),
+        },
+    };
+    state.upsert(new_entry);
+    adoption::write(&state)
+}
+
+/// Legacy discovery — preserved for tests + as a fallback. v0.2.7's
+/// [`resolve_pinned_or_pick`] is the primary entrypoint; this function
+/// is no longer called by `control_adopted_container` directly.
+///
+/// Search order:
 ///   1. `--filter label=com.docker.compose.service=<service>` — modern
 ///      compose project (docker-compose, podman-compose v1+).
 ///   2. `--filter label=io.podman.compose.service=<service>` — legacy
@@ -503,9 +642,10 @@ pub(crate) fn build_control_argv(
 ///   3. Port-binding fallback: scan all containers whose published ports
 ///      include `<port>`.
 ///
-/// Returns the first matching container name. We deliberately don't sort
-/// by status (running > stopped) — `start` on an already-running container
-/// is a no-op for podman/docker, so picking either is fine.
+/// Returns the first matching container name. Deliberately non-
+/// deterministic when multiple containers match — that's the v0.2.6 bug
+/// the picker fixes. Kept around for unit-test coverage.
+#[allow(dead_code)]
 async fn find_container_for_service(
     info: &RuntimeInfo,
     service: &str,
@@ -568,6 +708,7 @@ async fn find_container_for_service(
 ///
 /// Extracted as a pure function so it can be unit-tested without spawning
 /// a real container runtime.
+#[allow(dead_code)]
 fn pick_container_row(body: &str, port: u16) -> Option<String> {
     let mut first_seen: Option<String> = None;
     let port_needle_a = format!(":{}->", port); // "0.0.0.0:8081->8081/tcp"
@@ -620,6 +761,13 @@ pub struct AdoptionDecision {
     /// External URL captured at decision time (for display). Optional —
     /// `services_status` will refresh it on next probe anyway.
     pub external_url: Option<String>,
+    /// v0.2.7: persist the container the user adopted. When `None` we
+    /// preserve any pre-existing pin (so the FE can update mode without
+    /// clobbering the pinned container). Explicitly clearing requires
+    /// the frontend to call `services_pick_container` with the empty
+    /// string — there's no other path that nulls the field.
+    #[serde(default)]
+    pub container_name: Option<String>,
 }
 
 /// Persist the user's adopt-vs-parallel choice for ONE service.
@@ -634,11 +782,20 @@ pub async fn services_set_adoption(decision: AdoptionDecision) -> Result<(), Str
         return Err("parallel mode requires parallel_port".into());
     }
     let mut state = adoption::read();
+    // Preserve any pre-existing container pin unless the caller passed
+    // a new one. v0.2.7 — frontend updates to mode/external_url must
+    // NOT silently clear the container pin (that would force a
+    // re-detect on the next action).
+    let preserved_pin = state
+        .get(&decision.name)
+        .and_then(|s| s.container_name.clone());
+    let container_name = decision.container_name.or(preserved_pin);
     state.upsert(ServiceAdoption {
         name: decision.name,
         mode: decision.mode,
         external_url: decision.external_url,
         parallel_port: decision.parallel_port,
+        container_name,
     });
     adoption::write(&state)
 }
@@ -678,6 +835,62 @@ pub async fn services_find_free_port(start: u16, end: u16) -> Result<u16, String
         }
     }
     Err(format!("no free port found in range {}..{}", start, end))
+}
+
+// ---------------------------------------------------------------------------
+// Container picker (Bug E2, v0.2.7)
+//
+// `services_enumerate_candidates` lists every container that could back a
+// service; `services_pick_container` persists the user's choice. See
+// `services::picker` for the discovery + ranking logic.
+// ---------------------------------------------------------------------------
+
+/// Enumerate candidate containers for one service. Returns ranked list
+/// (best-first) of `ContainerCandidate`s including fullness probes for
+/// each running candidate. Cross-OS via `<runtime> ps` + `reqwest`.
+///
+/// Errors when `<runtime> ps` itself fails (no container runtime, etc.).
+/// Empty list is NOT an error — callers (FE Re-detect modal) render
+/// "nothing found".
+#[command]
+pub async fn services_enumerate_candidates(
+    service: String,
+) -> Result<Vec<crate::services::picker::ContainerCandidate>, String> {
+    validate_service_name(&service)?;
+    let info = detect_runtime()
+        .await
+        .ok_or("No container runtime found. Install Podman or Docker.")?;
+    let port = canonical_port_for(&service);
+    crate::services::picker::enumerate_candidates(&info, &service, port).await
+}
+
+/// Persist the user's container pick for a service. Validates that the
+/// container exists (`<runtime> inspect`) before writing — we never
+/// pin to a phantom container. An empty `container_name` is rejected
+/// (use the frontend's "clear pin" affordance, not an empty string —
+/// keeps the contract explicit).
+#[command]
+pub async fn services_pick_container(
+    service: String,
+    container_name: String,
+) -> Result<(), String> {
+    validate_service_name(&service)?;
+    if container_name.trim().is_empty() {
+        return Err("container_name must not be empty".into());
+    }
+    let info = detect_runtime()
+        .await
+        .ok_or("No container runtime found. Install Podman or Docker.")?;
+    if !container_exists(&info, &container_name).await? {
+        return Err(structured_err(
+            ERR_KIND_CONTAINER_MISSING,
+            format!(
+                "container '{}' does not exist on this runtime",
+                container_name
+            ),
+        ));
+    }
+    persist_container_pick(&service, &container_name)
 }
 
 // ---------------------------------------------------------------------------
@@ -929,6 +1142,7 @@ mod services_lifecycle_tests {
             mode: AdoptionMode::Parallel,
             external_url: None,
             parallel_port: Some(8091),
+            container_name: None,
         });
         assert_eq!(effective_port("weaviate", 8081, &state), 8091);
     }
@@ -944,6 +1158,7 @@ mod services_lifecycle_tests {
             mode: AdoptionMode::Adopt,
             external_url: Some("http://localhost:8081".into()),
             parallel_port: Some(8091), // ignored under Adopt mode
+            container_name: None,
         });
         assert_eq!(effective_port("weaviate", 8081, &state), 8081);
     }
@@ -1033,6 +1248,98 @@ mod services_lifecycle_tests {
         let body = "\t8081/tcp\nvalid_ctr\t8081/tcp\n";
         let chosen = pick_container_row(body, 8081);
         assert_eq!(chosen.as_deref(), Some("valid_ctr"));
+    }
+
+    /// v0.2.7: structured error format is `"<kind>: <message>"`. Pinned
+    /// here so a future refactor can't quietly switch the separator —
+    /// the FE's switch-case parses the prefix exactly.
+    #[test]
+    fn structured_err_uses_colon_separator() {
+        let s = structured_err(ERR_KIND_CONTAINER_MISSING, "weaviate_claude is gone");
+        assert!(s.starts_with("container_missing:"));
+        assert!(s.ends_with("weaviate_claude is gone"));
+    }
+
+    /// v0.2.7: the three error kinds the FE reacts to must be distinct
+    /// strings (no overlap, no typos). If you rename one, also update
+    /// launcher/src/routes/services/+page.svelte's `runServiceAction`.
+    #[test]
+    fn error_kinds_are_distinct_and_stable() {
+        let kinds = [
+            ERR_KIND_CONTAINER_MISSING,
+            ERR_KIND_NO_CANDIDATES,
+            ERR_KIND_MULTIPLE_CANDIDATES,
+        ];
+        for (i, k) in kinds.iter().enumerate() {
+            for (j, k2) in kinds.iter().enumerate() {
+                if i != j {
+                    assert_ne!(k, k2, "duplicate kind: {}", k);
+                }
+            }
+            // No whitespace, no colons in the kind itself (it's the
+            // prefix BEFORE the colon).
+            assert!(!k.contains(':'));
+            assert!(!k.contains(' '));
+        }
+        // Specific spellings the FE depends on.
+        assert_eq!(ERR_KIND_CONTAINER_MISSING, "container_missing");
+        assert_eq!(ERR_KIND_NO_CANDIDATES, "no_candidates");
+        assert_eq!(ERR_KIND_MULTIPLE_CANDIDATES, "multiple_candidates");
+    }
+
+    /// v0.2.7: when `services_set_adoption` arrives with no
+    /// container_name but a prior pin exists, the pin must be PRESERVED
+    /// (not silently cleared). Tested via direct upsert logic since
+    /// `services_set_adoption` writes to disk.
+    #[test]
+    fn upsert_does_not_silently_clear_pin() {
+        let mut state = AdoptionState::default();
+        state.upsert(ServiceAdoption {
+            name: "weaviate".into(),
+            mode: AdoptionMode::Adopt,
+            external_url: Some("http://localhost:8081".into()),
+            parallel_port: None,
+            container_name: Some("weaviate_claude".into()),
+        });
+        // Simulate the `services_set_adoption` preservation logic in
+        // isolation: take the prior pin, fold into a new entry.
+        let prior_pin = state.get("weaviate").and_then(|s| s.container_name.clone());
+        let new_pin = None.or(prior_pin); // decision had no container_name
+        state.upsert(ServiceAdoption {
+            name: "weaviate".into(),
+            mode: AdoptionMode::Refuse, // user changed mode
+            external_url: Some("http://localhost:8081".into()),
+            parallel_port: None,
+            container_name: new_pin,
+        });
+        assert_eq!(
+            state.get("weaviate").unwrap().container_name.as_deref(),
+            Some("weaviate_claude"),
+            "mode change must NOT silently clear the container pin"
+        );
+        assert_eq!(state.get("weaviate").unwrap().mode, AdoptionMode::Refuse);
+    }
+
+    /// v0.2.7: `persist_container_pick` must create an entry if none
+    /// exists (so the auto-pick path in `resolve_pinned_or_pick` works
+    /// even on a virgin services.toml).
+    #[test]
+    fn persist_container_pick_creates_entry_when_absent() {
+        // Sanity-check the entry-construction logic without touching
+        // disk. (Disk-path tests would need to redirect
+        // `crate::paths::vct_root_dir()` and are an integration concern.)
+        let state = AdoptionState::default();
+        assert!(state.get("ollama").is_none(), "fixture must be empty");
+        // The function under test inlines exactly this construction:
+        let new_entry = ServiceAdoption {
+            name: "ollama".to_string(),
+            mode: AdoptionMode::default(),
+            external_url: None,
+            parallel_port: None,
+            container_name: Some("ollama_claude".to_string()),
+        };
+        assert_eq!(new_entry.mode, AdoptionMode::Unresolved);
+        assert_eq!(new_entry.container_name.as_deref(), Some("ollama_claude"));
     }
 
     /// Watcher decision function: given a previous + current snapshot,

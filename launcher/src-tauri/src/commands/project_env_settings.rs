@@ -843,6 +843,7 @@ mod tests {
             mode: AdoptionMode::Parallel,
             external_url: Some("http://localhost:11435".into()),
             parallel_port: Some(11445),
+            container_name: None,
         });
         let p = resolve_port(
             &db,
@@ -863,6 +864,7 @@ mod tests {
             mode: AdoptionMode::Adopt,
             external_url: Some("http://localhost:8090".into()),
             parallel_port: None,
+            container_name: None,
         });
         let p = resolve_port(
             &db,
@@ -883,6 +885,7 @@ mod tests {
             mode: AdoptionMode::Refuse,
             external_url: Some("http://localhost:9999".into()),
             parallel_port: None,
+            container_name: None,
         });
         let p = resolve_port(
             &db,

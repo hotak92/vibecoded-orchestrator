@@ -204,7 +204,7 @@ async fn handle_service_tick<R: Runtime + 'static>(
                 new_running: Some(false),
                 attempt: None,
                 error: None,
-                container_name: None,
+                container_name: svc.container_name.as_deref(),
                 container_status: None,
             });
             if entry.given_up {
@@ -212,6 +212,40 @@ async fn handle_service_tick<R: Runtime + 'static>(
                 // intervention via the toast.
                 return;
             }
+
+            // v0.2.7 (E1+E2): only attempt restart when we have a real
+            // pinned container to act on. Re-discovery from the watcher
+            // is the v0.2.6 bug — it would auto-spawn a different compose
+            // project's container if our pin was missing. Surface a
+            // `needs_user_pick` alert so the FE can prompt the user
+            // instead.
+            if needs_user_pick(svc).await {
+                log_event(WatcherLogEvent {
+                    ts: now_iso(),
+                    service: &svc.name,
+                    event: "needs_user_pick",
+                    prev_running: Some(true),
+                    new_running: Some(false),
+                    attempt: None,
+                    error: None,
+                    container_name: svc.container_name.as_deref(),
+                    container_status: None,
+                });
+                let _ = app.emit(
+                    EVT_WATCHER_ALERT,
+                    serde_json::json!({
+                        "service": svc.name,
+                        "kind": "needs_user_pick",
+                        "container_name": svc.container_name,
+                    }),
+                );
+                // Mark given_up so we don't re-emit on every poll tick
+                // until the user resolves it. Recovery (the service
+                // coming back) resets this flag.
+                entry.given_up = true;
+                return;
+            }
+
             schedule_restart(app, svc, entry).await;
         }
     }
@@ -332,6 +366,30 @@ async fn schedule_restart<R: Runtime + 'static>(
             }
         }
     });
+}
+
+/// v0.2.7 (E1): true when the watcher MUST NOT auto-restart this
+/// service — either we have no pinned container yet, or the pinned
+/// container is gone. In both cases the FE is prompted to pick.
+async fn needs_user_pick(svc: &ServiceRuntimeState) -> bool {
+    let Some(name) = svc.container_name.as_deref() else {
+        return true; // no pin → can't safely restart
+    };
+    if name.is_empty() {
+        return true;
+    }
+    // Pin exists; verify it still resolves. Soft-fail on runtime
+    // detection — if we can't even find podman/docker, the watcher
+    // doesn't have a path forward either; treat as needs-pick so we
+    // surface the issue.
+    let Some(info) = crate::services::runtime::detect_runtime().await else {
+        return true;
+    };
+    match crate::commands::lifecycle::container_exists(&info, name).await {
+        Ok(true) => false,
+        Ok(false) => true,
+        Err(_) => true,
+    }
 }
 
 /// Read the watcher-enabled toggle from app_state. Returns Ok(None) when
@@ -473,5 +531,37 @@ mod tests {
             "expected .jsonl extension, got {:?}",
             p
         );
+    }
+
+    /// v0.2.7 (E1): `needs_user_pick` short-circuits to `true` when the
+    /// service has no pinned container — without ever invoking the
+    /// runtime. This is the watcher's safety property: missing pin =>
+    /// surface to user, NEVER auto-restart from re-discovery.
+    #[tokio::test]
+    async fn needs_user_pick_short_circuits_when_pin_is_none() {
+        let svc = ServiceRuntimeState {
+            name: "weaviate".to_string(),
+            running: false,
+            port: 8081,
+            url: "http://localhost:8081/v1/meta".to_string(),
+            externally_managed: false,
+            adoption_mode: crate::services::adoption::AdoptionMode::Unresolved,
+            container_name: None,
+        };
+        assert!(needs_user_pick(&svc).await);
+    }
+
+    #[tokio::test]
+    async fn needs_user_pick_short_circuits_when_pin_is_empty_string() {
+        let svc = ServiceRuntimeState {
+            name: "weaviate".to_string(),
+            running: false,
+            port: 8081,
+            url: "http://localhost:8081/v1/meta".to_string(),
+            externally_managed: false,
+            adoption_mode: crate::services::adoption::AdoptionMode::Adopt,
+            container_name: Some("".to_string()),
+        };
+        assert!(needs_user_pick(&svc).await);
     }
 }

@@ -10,6 +10,7 @@
 //! `commands::lifecycle` (services_status, services_start_all, etc.).
 
 pub mod adoption;
+pub mod picker;
 pub mod runtime;
 pub mod watcher;
 
