@@ -172,49 +172,118 @@ wait_for_cdi() {
 }
 
 # ---------------------------------------------------------------------------
-# pick_compose_invocation :: given (runtime, gpu_mode), print the argv that
-# should be invoked (compose binary + flags, NOT including `up -d`).
+# overlay_exists :: pure helper, returns 0 iff the argument is a non-empty
+# existing regular file. Path is resolved relative to $PWD (callers must
+# `cd` into VCT_STACK_WORKING_DIR before invoking, OR pass an absolute
+# path). Kept argument-driven (no env reads) so unit tests can pass any
+# path they like.
 #
-#   runtime  ∈ "docker" | "podman-compose" | "podman compose"
-#   gpu_mode ∈ "gpu" | "cpu"
+# v0.2.10 (Bug L1): the original wrapper unconditionally emitted
+# `-f <overlay>` whenever gpu_mode=gpu, on the assumption that VCO's own
+# overlay-file pattern (`infrastructure/podman-compose.gpu.yml`) was
+# universal. The user's actual Claude orchestrator stack at
+# ~/Desktop/PROGETTI/Claude/claude_mcp_servers/compose.yaml has its GPU
+# devices declared INLINE in the ollama / code_embed service blocks
+# (`devices: - nvidia.com/gpu=all`) — no overlay file exists. The
+# previous behaviour broke on that layout because podman-compose would
+# bail out with "no such file" before any container even started. This
+# helper drives the overlay-vs-inline branch in pick_compose_invocation.
+# ---------------------------------------------------------------------------
+overlay_exists() {
+    local path="$1"
+    [ -n "$path" ] && [ -f "$path" ] && [ -s "$path" ]
+}
+
+# ---------------------------------------------------------------------------
+# pick_compose_invocation :: given (runtime, gpu_mode, [working_dir]), print
+# the argv that should be invoked (compose binary + flags, NOT including
+# `up -d`).
+#
+#   runtime     ∈ "docker" | "podman-compose" | "podman compose"
+#   gpu_mode    ∈ "gpu" | "cpu"
+#   working_dir : optional 3rd arg — directory to resolve overlay path
+#                 against. Defaults to $PWD. Tests pass an explicit dir
+#                 so they don't depend on cwd.
 #
 # Output (one line, space-separated):
 #   docker compose -f compose.yaml -f infrastructure/docker-compose.gpu.yml
 #   podman-compose -f compose.yaml -f infrastructure/podman-compose.gpu.yml
-#   podman compose -f compose.yaml -f infrastructure/docker-compose.gpu.yml
+#   podman compose -f compose.yaml -f infrastructure/podman-compose.gpu.yml
 #   docker compose -f compose.yaml
 #   ...
 #
-# Pure function — no side effects, no env reads outside its arguments
-# and the VCT_STACK_*_OVERLAY env vars (which act as constants from the
-# caller's POV). Tested via tests/test_launch_claude_mcp_stack_pick.py.
+# When gpu_mode=gpu but the overlay file is missing, the invocation is
+# emitted WITHOUT `-f overlay` (inline-GPU compose path) AND the global
+# `OVERLAY_MISSING_WARNED=1` flag is set so callers / tests can detect
+# the fall-through.
+#
+# Pure-ish function — only env reads are VCT_STACK_*_OVERLAY env vars
+# (which act as constants from the caller's POV) and VCT_STACK_COMPOSE_FILE.
+# Tested via tests/test_launch_claude_mcp_stack_pick.py.
 # ---------------------------------------------------------------------------
 pick_compose_invocation() {
     local runtime="$1"
     local gpu_mode="$2"
+    local working_dir="${3:-$PWD}"
+
+    # Pick the right overlay filename per runtime. podman-compose and the
+    # podman compose subcommand both use the podman overlay; docker compose
+    # uses the docker overlay.
+    local overlay=""
+    case "$runtime" in
+        docker)              overlay="$VCT_STACK_GPU_OVERLAY_DOCKER" ;;
+        podman-compose)      overlay="$VCT_STACK_GPU_OVERLAY" ;;
+        "podman compose")    overlay="$VCT_STACK_GPU_OVERLAY" ;;
+    esac
+
+    # Resolve overlay path against working_dir for existence-check, but
+    # emit the path EXACTLY as configured in the env var (so consumers
+    # that already chdir'd to working_dir keep relative paths in the
+    # argv — important for log clarity and matching test expectations).
+    local resolved_overlay=""
+    if [ -n "$overlay" ]; then
+        case "$overlay" in
+            /*) resolved_overlay="$overlay" ;;
+            *)  resolved_overlay="${working_dir}/${overlay}" ;;
+        esac
+    fi
+
+    # The "use the overlay flag" decision is the AND of:
+    #   - gpu_mode is "gpu"
+    #   - an overlay path was configured for this runtime
+    #   - that overlay actually exists on disk
+    local use_overlay=0
+    if [ "$gpu_mode" = "gpu" ] && [ -n "$overlay" ]; then
+        if overlay_exists "$resolved_overlay"; then
+            use_overlay=1
+        else
+            # Surface the inline-GPU fall-through to the caller via a
+            # global flag. Tests assert on this; main() logs a warning.
+            OVERLAY_MISSING_WARNED=1
+        fi
+    fi
 
     case "$runtime" in
         docker)
-            if [ "$gpu_mode" = "gpu" ]; then
+            if [ "$use_overlay" = "1" ]; then
                 printf 'docker compose -f %s -f %s\n' \
-                    "$VCT_STACK_COMPOSE_FILE" "$VCT_STACK_GPU_OVERLAY_DOCKER"
+                    "$VCT_STACK_COMPOSE_FILE" "$overlay"
             else
                 printf 'docker compose -f %s\n' "$VCT_STACK_COMPOSE_FILE"
             fi
             ;;
         podman-compose)
-            if [ "$gpu_mode" = "gpu" ]; then
+            if [ "$use_overlay" = "1" ]; then
                 printf 'podman-compose -f %s -f %s\n' \
-                    "$VCT_STACK_COMPOSE_FILE" "$VCT_STACK_GPU_OVERLAY"
+                    "$VCT_STACK_COMPOSE_FILE" "$overlay"
             else
                 printf 'podman-compose -f %s\n' "$VCT_STACK_COMPOSE_FILE"
             fi
             ;;
         "podman compose")
-            # podman's compose subcommand accepts the docker overlay syntax.
-            if [ "$gpu_mode" = "gpu" ]; then
+            if [ "$use_overlay" = "1" ]; then
                 printf 'podman compose -f %s -f %s\n' \
-                    "$VCT_STACK_COMPOSE_FILE" "$VCT_STACK_GPU_OVERLAY"
+                    "$VCT_STACK_COMPOSE_FILE" "$overlay"
             else
                 printf 'podman compose -f %s\n' "$VCT_STACK_COMPOSE_FILE"
             fi
@@ -283,10 +352,23 @@ main() {
             ;;
     esac
 
+    # OVERLAY_MISSING_WARNED is set by pick_compose_invocation when
+    # gpu_mode=gpu but the configured overlay file doesn't exist. Reset
+    # it here so a previous invocation's state can't leak in.
+    OVERLAY_MISSING_WARNED=0
     local argv
-    if ! argv="$(pick_compose_invocation "$runtime" "$gpu_mode")"; then
+    if ! argv="$(pick_compose_invocation "$runtime" "$gpu_mode" "$VCT_STACK_WORKING_DIR")"; then
         log "FATAL: pick_compose_invocation rejected runtime=$runtime gpu_mode=$gpu_mode"
         exit 4
+    fi
+    if [ "${OVERLAY_MISSING_WARNED:-0}" = "1" ]; then
+        local missing_overlay
+        case "$runtime" in
+            docker)            missing_overlay="$VCT_STACK_GPU_OVERLAY_DOCKER" ;;
+            podman-compose|"podman compose") missing_overlay="$VCT_STACK_GPU_OVERLAY" ;;
+            *)                 missing_overlay="(unknown)" ;;
+        esac
+        log "WARNING: inline-GPU compose assumed — overlay file '${VCT_STACK_WORKING_DIR}/${missing_overlay}' not found, proceeding without overlay"
     fi
     log "exec: $argv up -d"
 

@@ -67,7 +67,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -1459,6 +1459,11 @@ def _run_lightweight(args: argparse.Namespace) -> int:
     # manifest writer falls back to prior values for the affected fields.
     _write_install_manifest(None, args, install_method="lightweight")
 
+    # v0.2.10 (Bug L2): re-materialize boot service on lightweight too —
+    # the wrapper path may have changed if the install was relocated
+    # (--lightweight-old-path). Idempotent for unchanged paths.
+    _materialize_boot_service(PROJECT_ROOT, None, args)
+
     _log_install_event(
         "lightweight", "ok",
         "lightweight re-install complete",
@@ -1651,6 +1656,22 @@ def main() -> int:
                         help="Used with --lightweight. The previous install path "
                              "whose absolute occurrences in .env / settings.json "
                              "should be rewritten to the current PROJECT_ROOT.")
+    # v0.2.10 (Bug L2 — cross-OS boot-service materialization). The
+    # compose-project working directory may not match the install path
+    # (the canonical example: install at ~/.../VCO_dev but compose lives
+    # at ~/.../Claude/claude_mcp_servers). When set, this is the highest-
+    # priority signal for _resolve_compose_working_dir; otherwise we
+    # probe a running container's working_dir label, then fall back to
+    # install-path probes.
+    parser.add_argument("--compose-working-dir", type=str, default=None,
+                        help="Absolute path to the directory containing "
+                             "compose.yaml for the Claude MCP stack. Used by "
+                             "the boot-service materialization step to record "
+                             "WorkingDirectory= in the systemd unit / launchd "
+                             "plist / Task Scheduler XML. When unset, the "
+                             "installer probes a running container's label, "
+                             "then falls back to <install>/claude_mcp_servers/ "
+                             "or <install>/infrastructure/.")
     parser.add_argument("--preserve-paths",
                         type=str, default=None,
                         help="Comma-separated list of install-relative paths to "
@@ -1796,6 +1817,12 @@ def main() -> int:
                 # Re-detect after user-confirmed install. PATH may already
                 # contain the new binary in this Python process.
                 sysinfo = sysinfo._replace(container_cmd=_detect_container_runtime())
+                # v0.2.10 (Bug L3): the post-prompt-install path now refreshes
+                # runtime.txt immediately so a single install run captures
+                # the new runtime for the wrapper script (don't wait for the
+                # later _write_install_manifest call — boot services
+                # materialized later in the same run may read it before then).
+                _persist_runtime_txt(sysinfo.container_cmd)
             if not sysinfo.container_cmd:
                 # Either the user declined, the package manager failed,
                 # or we're on macOS/Windows (URL-only path). Fall through
@@ -2093,6 +2120,13 @@ def main() -> int:
     # produced false positives on developer source checkouts that had a venv
     # but no install.py run (false-positive observed in wizard 2026-05-06).
     _write_install_manifest(sysinfo, args, install_method="install.py")
+
+    # v0.2.10 (Bug L2): auto-materialize the boot service so containers
+    # come back up after a reboot without manual intervention. Cross-OS:
+    # systemd user unit on Linux, LaunchAgent on macOS, Task Scheduler
+    # on Windows. Soft-fail throughout — failure here never blocks
+    # install completion.
+    _materialize_boot_service(PROJECT_ROOT, sysinfo, args)
 
     # v0.2.6 Bug C1: invoke the desktop-icon step so direct `python install.py`
     # runs get an icon too. first-install.sh-wrapped runs already trigger
@@ -5802,21 +5836,577 @@ def _write_install_manifest(sysinfo, args, install_method: str = "install.py") -
     # recording the detected container runtime ("podman" or "docker") so
     # boot-time wrapper scripts (scripts/launch-claude-mcp-stack.sh) can
     # pick the right compose binary without re-probing PATH. Best-effort.
+    # v0.2.10 (Bug L3): extracted to _persist_runtime_txt so the same helper
+    # is callable from --lightweight, --update, and the post-install-runtime
+    # paths without duplicating logic.
     if container_runtime:
-        # The first whitespace-separated token is the binary name; the
-        # rest is the version string. We only want the binary.
-        runtime_token = container_runtime.split()[0].lower()
-        if runtime_token in ("podman", "docker"):
-            install_subdir = state_dir / "install"
-            runtime_file = install_subdir / "runtime.txt"
+        _persist_runtime_txt(container_runtime)
+
+
+def _persist_runtime_txt(container_runtime: str | None) -> None:
+    """Write a single-line `state/install/runtime.txt` recording the
+    container runtime token ("podman" or "docker") for the boot-time
+    wrapper scripts to consume.
+
+    v0.2.10 (Bug L3): runtime.txt was originally written only inside
+    `_write_install_manifest`. That covered fresh install + --update +
+    --lightweight via the existing call sites, but missed the path where
+    `_prompt_install_container_runtime` runs mid-flow and the runtime
+    appears AFTER the initial sysinfo scan. This helper is now also
+    invoked from the post-prompt-install branch so a one-shot
+    install-the-runtime decision propagates to the wrapper immediately
+    on the very same install run (without forcing a second invocation).
+
+    Soft-fail: any I/O error is logged and the install continues. The
+    wrapper script re-probes PATH if runtime.txt is missing.
+    """
+    if not container_runtime:
+        return
+    # The first whitespace-separated token is the binary name; the rest is
+    # the version string. Normalize to lowercase ("Podman" / "Docker"
+    # both seen in the wild on minor versions).
+    runtime_token = container_runtime.split()[0].lower()
+    if runtime_token not in ("podman", "docker"):
+        return
+    state_dir = PROJECT_ROOT / "state"
+    install_subdir = state_dir / "install"
+    runtime_file = install_subdir / "runtime.txt"
+    try:
+        install_subdir.mkdir(parents=True, exist_ok=True)
+        # Idempotent: only write if content differs (avoids unnecessary
+        # mtime churn that could confuse downstream watchers).
+        existing = ""
+        if runtime_file.is_file():
             try:
-                install_subdir.mkdir(parents=True, exist_ok=True)
-                runtime_file.write_text(runtime_token + "\n", encoding="utf-8")
-            except OSError as exc:
-                _log_install_event(
-                    "manifest", "warn",
-                    f"could not write runtime.txt: {exc}",
-                )
+                existing = runtime_file.read_text(encoding="utf-8").strip()
+            except OSError:
+                existing = ""
+        if existing != runtime_token:
+            runtime_file.write_text(runtime_token + "\n", encoding="utf-8")
+    except OSError as exc:
+        _log_install_event(
+            "manifest", "warn",
+            f"could not write runtime.txt: {exc}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Step 7b: Boot-service materialization (v0.2.10 Bug L2 — cross-OS)
+#
+# A short, OS-aware helper that installs a boot-time autostart entry for
+# the Claude MCP container stack so containers come back up after a
+# reboot without manual intervention. Three platform paths:
+#
+#   - Linux:   systemd user unit at ~/.config/systemd/user/<unit>.service
+#              (template at templates/systemd/*.service.template)
+#              + `loginctl enable-linger` so the unit fires at boot
+#              before the user logs in.
+#   - macOS:   launchd LaunchAgent at ~/Library/LaunchAgents/<label>.plist
+#              (template at templates/launchd/*.plist.template), loaded
+#              via `launchctl bootstrap` (modern) or `launchctl load -w`
+#              (legacy fallback).
+#   - Windows: Task Scheduler logon trigger registered via
+#              `schtasks /Create /XML <file> /F` (template at
+#              templates/windows/*.task.xml.template). Runs the bash
+#              wrapper through Git Bash / WSL bash on PATH.
+#
+# Soft-fail throughout: if the OS-specific tool isn't on PATH (e.g.
+# WSL minimal, container hosts, macOS without launchctl, locked-down
+# Windows shells), log a warning and continue. The install MUST NOT be
+# blocked by boot-service materialization failure — the user can always
+# bring the stack up manually.
+#
+# GPU-passthrough support matrix (Linux=full, macOS=no, Windows=via WSL2)
+# is documented in the OS-specific templates' header comments.
+# ---------------------------------------------------------------------------
+
+# Stable filename / label for the boot service across OSes. Reverse-DNS
+# form on macOS (required by launchd), bare filename on Linux + Windows.
+_BOOT_SERVICE_UNIT_NAME = "claude-mcp-containers.service"
+_BOOT_SERVICE_PLIST_LABEL = "com.vibecodedtools.claude-mcp-containers"
+_BOOT_SERVICE_TASK_NAME = "ClaudeMcpContainers"
+
+
+def _resolve_compose_working_dir(
+    install_path: Path,
+    cli_override: str | None,
+    ps_label_value: str | None,
+) -> Optional[Path]:
+    """Decide which directory the compose-up wrapper should chdir into.
+
+    The compose-project dir may NOT be the install path (the canonical
+    example: install at ~/Desktop/PROGETTI/VCO_dev but compose lives at
+    ~/Desktop/PROGETTI/Claude/claude_mcp_servers). Resolution priority:
+
+      1. CLI override (--compose-working-dir) — explicit user choice.
+      2. `ps_label_value` — the value of the
+         `com.docker.compose.project.working_dir` label on a running
+         claude-mcp container, sniffed by the caller via `<runtime> ps`.
+         Soft-input: caller passes None if probing failed.
+      3. `<install_path>/claude_mcp_servers/` if it exists.
+      4. `<install_path>/infrastructure/` if it exists (VCO's own layout
+         where compose.yaml + the overlay both live there).
+      5. None — caller skips materialization with a warning.
+
+    Pure function: no env reads, no subprocess. Caller supplies the ps
+    probe result (so this function is unit-testable without spawning
+    podman). Tested via tests/test_resolve_compose_working_dir.py.
+    """
+    # 1. CLI override
+    if cli_override:
+        candidate = Path(cli_override).expanduser().resolve()
+        if candidate.is_dir():
+            return candidate
+        # Override pointed at a missing dir — that's a user error worth
+        # flagging. Caller logs and falls through.
+        return None
+    # 2. ps label
+    if ps_label_value:
+        candidate = Path(ps_label_value).expanduser().resolve()
+        if candidate.is_dir():
+            return candidate
+    # 3. install_path/claude_mcp_servers
+    candidate = (install_path / "claude_mcp_servers").resolve()
+    if candidate.is_dir():
+        return candidate
+    # 4. install_path/infrastructure (the VCO native layout)
+    candidate = (install_path / "infrastructure").resolve()
+    if candidate.is_dir():
+        return candidate
+    # 5. give up
+    return None
+
+
+def _probe_compose_working_dir_via_ps(container_cmd: str) -> Optional[str]:
+    """Best-effort: ask the running container runtime for the
+    `com.docker.compose.project.working_dir` label of any running
+    `claude-mcp` project container.
+
+    Returns the label value as a string, or None if anything goes wrong
+    (runtime absent, no running containers, label missing, etc.).
+    Soft-fail by design — `_materialize_boot_service` then falls back to
+    install-path probes.
+    """
+    if not container_cmd or not shutil.which(container_cmd):
+        return None
+    try:
+        proc = subprocess.run(
+            [
+                container_cmd, "ps",
+                "--filter", "label=com.docker.compose.project=claude-mcp",
+                "--format", '{{index .Labels "com.docker.compose.project.working_dir"}}',
+            ],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if line:
+            return line
+    return None
+
+
+def _read_template(template_relpath: str) -> Optional[str]:
+    """Read a template file relative to PROJECT_ROOT. Returns None if
+    the file isn't present (e.g. minimal install without the templates/
+    tree shipped). Caller logs + skips."""
+    path = PROJECT_ROOT / template_relpath
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def _render_template(template_text: str, substitutions: dict) -> str:
+    """Naive `{{KEY}}` substitution. We deliberately don't pull in
+    jinja2 / string.Template here — the substitution set is closed and
+    we want install.py to stay stdlib-only for the early steps."""
+    rendered = template_text
+    for key, value in substitutions.items():
+        rendered = rendered.replace("{{" + key + "}}", str(value))
+    return rendered
+
+
+def _backup_and_write_idempotent(
+    target: Path,
+    rendered: str,
+) -> tuple[bool, Optional[Path]]:
+    """Write `rendered` to `target` ONLY if content differs from what's
+    on disk. Backs up the prior file to `<target>.bak-<ISO8601>` before
+    overwriting. Returns (changed, backup_path_or_None).
+
+    Idempotent: re-running install/update with unchanged template +
+    substitutions is a no-op (zero writes, zero backups).
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.is_file():
+        try:
+            existing = target.read_text(encoding="utf-8")
+        except OSError:
+            existing = None
+        if existing == rendered:
+            return False, None
+        # Content differs — back up the prior version.
+        stamp = _utc_iso_now().replace(":", "").replace("-", "")
+        backup = target.with_name(target.name + f".bak-{stamp}")
+        try:
+            backup.write_text(existing or "", encoding="utf-8")
+        except OSError:
+            backup = None
+    else:
+        backup = None
+    target.write_text(rendered, encoding="utf-8")
+    return True, backup
+
+
+def _materialize_boot_service_linux(
+    install_path: Path,
+    working_dir: Path,
+) -> None:
+    """Linux: render the systemd user unit and enable it via
+    `systemctl --user enable` + `loginctl enable-linger`."""
+    template = _read_template("templates/systemd/claude-mcp-containers.service.template")
+    if template is None:
+        _log_install_event(
+            "boot-service", "skip",
+            "templates/systemd/claude-mcp-containers.service.template missing",
+        )
+        return
+
+    unit_dir = Path.home() / ".config" / "systemd" / "user"
+    unit_path = unit_dir / _BOOT_SERVICE_UNIT_NAME
+    wrapper = install_path / "scripts" / "launch-claude-mcp-stack.sh"
+    log_dir = Path.home() / ".local" / "state" / "vct"
+    log_file = log_dir / "claude-mcp-containers.log"
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
+    rendered = _render_template(template, {
+        "INSTALLED_AT_PATH": str(unit_path),
+        "WORKING_DIR": str(working_dir),
+        "WRAPPER_SCRIPT": str(wrapper),
+        "LOG_FILE": str(log_file),
+    })
+    try:
+        changed, backup = _backup_and_write_idempotent(unit_path, rendered)
+    except OSError as exc:
+        _log_install_event(
+            "boot-service", "warn",
+            f"could not write systemd unit: {exc}",
+        )
+        return
+
+    _log_install_event(
+        "boot-service", "ok" if changed else "skip",
+        ("systemd unit written" if changed else "systemd unit unchanged"),
+        data={"unit_path": str(unit_path),
+              "backup": str(backup) if backup else None},
+    )
+
+    # daemon-reload + enable. Soft-fail if systemctl absent (containers,
+    # WSL minimal, etc.).
+    systemctl = shutil.which("systemctl")
+    if not systemctl:
+        _log_install_event(
+            "boot-service", "skip",
+            "systemctl not on PATH — skipping daemon-reload / enable",
+        )
+        return
+    for cmd in (
+        [systemctl, "--user", "daemon-reload"],
+        [systemctl, "--user", "enable", _BOOT_SERVICE_UNIT_NAME],
+    ):
+        try:
+            subprocess.run(cmd, check=False, capture_output=True, timeout=15)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            _log_install_event(
+                "boot-service", "warn",
+                f"systemctl invocation failed: {' '.join(cmd)} → {exc}",
+            )
+
+    # loginctl enable-linger — needed so the user-scoped unit fires at
+    # boot without an active login session. Check existing state first
+    # (idempotent — no-op if already lingering).
+    loginctl = shutil.which("loginctl")
+    if not loginctl:
+        _log_install_event(
+            "boot-service", "skip",
+            "loginctl not on PATH — user-unit will only fire at login",
+        )
+        return
+    user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+    if not user:
+        return
+    try:
+        probe = subprocess.run(
+            [loginctl, "show-user", user, "--property=Linger"],
+            check=False, capture_output=True, text=True, timeout=5,
+        )
+        already_lingering = "Linger=yes" in probe.stdout
+    except (OSError, subprocess.TimeoutExpired):
+        already_lingering = False
+    if not already_lingering:
+        try:
+            subprocess.run(
+                [loginctl, "enable-linger", user],
+                check=False, capture_output=True, timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            _log_install_event(
+                "boot-service", "warn",
+                f"loginctl enable-linger failed: {exc}",
+            )
+
+
+def _materialize_boot_service_macos(
+    install_path: Path,
+    working_dir: Path,
+) -> None:
+    """macOS: render the LaunchAgent plist and bootstrap it via
+    `launchctl bootstrap` (modern) or `launchctl load -w` (legacy)."""
+    template = _read_template(
+        "templates/launchd/com.vibecodedtools.claude-mcp-containers.plist.template"
+    )
+    if template is None:
+        _log_install_event(
+            "boot-service", "skip",
+            "launchd template missing",
+        )
+        return
+
+    plist_dir = Path.home() / "Library" / "LaunchAgents"
+    plist_path = plist_dir / f"{_BOOT_SERVICE_PLIST_LABEL}.plist"
+    wrapper = install_path / "scripts" / "launch-claude-mcp-stack.sh"
+    log_dir = Path.home() / "Library" / "Logs"
+    log_file = log_dir / "claude-mcp-containers.log"
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
+    rendered = _render_template(template, {
+        "INSTALLED_AT_PATH": str(plist_path),
+        "LABEL": _BOOT_SERVICE_PLIST_LABEL,
+        "WORKING_DIR": str(working_dir),
+        "WRAPPER_SCRIPT": str(wrapper),
+        "LOG_FILE": str(log_file),
+    })
+    try:
+        changed, backup = _backup_and_write_idempotent(plist_path, rendered)
+    except OSError as exc:
+        _log_install_event(
+            "boot-service", "warn",
+            f"could not write launchd plist: {exc}",
+        )
+        return
+
+    _log_install_event(
+        "boot-service", "ok" if changed else "skip",
+        ("launchd plist written" if changed else "launchd plist unchanged"),
+        data={"plist_path": str(plist_path),
+              "backup": str(backup) if backup else None},
+    )
+
+    launchctl = shutil.which("launchctl")
+    if not launchctl:
+        _log_install_event(
+            "boot-service", "skip",
+            "launchctl not on PATH — skipping load",
+        )
+        return
+
+    uid = os.getuid() if hasattr(os, "getuid") else 0
+    # Modern syntax (macOS 10.10+): `launchctl bootstrap gui/<uid> <plist>`.
+    # Idempotent: if the agent is already bootstrapped, this returns non-zero
+    # with "Bootstrap failed: 17: File exists" — we tolerate that.
+    bootstrap_rc = -1
+    try:
+        proc = subprocess.run(
+            [launchctl, "bootstrap", f"gui/{uid}", str(plist_path)],
+            check=False, capture_output=True, text=True, timeout=10,
+        )
+        bootstrap_rc = proc.returncode
+    except (OSError, subprocess.TimeoutExpired):
+        bootstrap_rc = -1
+    if bootstrap_rc != 0:
+        # Fall back to legacy `launchctl load -w <plist>`. -w persists the
+        # enable across reboots. Same idempotency tolerance.
+        try:
+            subprocess.run(
+                [launchctl, "load", "-w", str(plist_path)],
+                check=False, capture_output=True, timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            _log_install_event(
+                "boot-service", "warn",
+                f"launchctl load fallback failed: {exc}",
+            )
+
+
+def _materialize_boot_service_windows(
+    install_path: Path,
+    working_dir: Path,
+) -> None:
+    """Windows: render the Task Scheduler XML and import it via
+    `schtasks /Create /XML <file> /F` (per-user logon trigger, no
+    admin scope)."""
+    template = _read_template(
+        "templates/windows/claude-mcp-containers.task.xml.template"
+    )
+    if template is None:
+        _log_install_event(
+            "boot-service", "skip",
+            "Windows Task Scheduler XML template missing",
+        )
+        return
+
+    # We materialize the task XML at <install>/state/installed_boot_task.xml
+    # so idempotency-check on re-runs is a simple file-compare. Also
+    # serves as an audit artefact (operator can inspect what got
+    # registered).
+    state_dir = install_path / "state"
+    task_xml_path = state_dir / "installed_boot_task.xml"
+    wrapper = install_path / "scripts" / "launch-claude-mcp-stack.sh"
+    # Use forward-slash style for the bash arg — Git Bash / WSL bash
+    # accept both, but forward slashes avoid quoting nightmares in the
+    # XML body.
+    wrapper_forward = str(wrapper).replace("\\", "/")
+    working_dir_forward = str(working_dir).replace("\\", "/")
+    user_id = (
+        os.environ.get("USERDOMAIN", "")
+        + ("\\" if os.environ.get("USERDOMAIN") else "")
+        + os.environ.get("USERNAME", "")
+    ).strip("\\")
+    if not user_id:
+        user_id = os.environ.get("USER", "user")
+
+    rendered = _render_template(template, {
+        "LABEL": _BOOT_SERVICE_TASK_NAME,
+        "WORKING_DIR": working_dir_forward,
+        "WRAPPER_SCRIPT": wrapper_forward,
+        "CREATED_AT": _utc_iso_now(),
+        "USER_ID": user_id,
+    })
+    try:
+        changed, backup = _backup_and_write_idempotent(task_xml_path, rendered)
+    except OSError as exc:
+        _log_install_event(
+            "boot-service", "warn",
+            f"could not write Task Scheduler XML: {exc}",
+        )
+        return
+
+    _log_install_event(
+        "boot-service", "ok" if changed else "skip",
+        ("Task XML written" if changed else "Task XML unchanged"),
+        data={"task_xml_path": str(task_xml_path),
+              "backup": str(backup) if backup else None},
+    )
+
+    schtasks = shutil.which("schtasks")
+    if not schtasks:
+        _log_install_event(
+            "boot-service", "skip",
+            "schtasks not on PATH — Task Scheduler import skipped",
+        )
+        return
+    try:
+        subprocess.run(
+            [schtasks, "/Create", "/TN", _BOOT_SERVICE_TASK_NAME,
+             "/XML", str(task_xml_path), "/F"],
+            check=False, capture_output=True, timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        _log_install_event(
+            "boot-service", "warn",
+            f"schtasks /Create failed: {exc}",
+        )
+
+
+def _materialize_boot_service(
+    install_path: Path,
+    sysinfo,
+    args: argparse.Namespace,
+) -> None:
+    """Cross-OS dispatcher for boot-service materialization.
+
+    Calls the OS-specific renderer after resolving the compose-project
+    working dir. Soft-fail throughout — boot-service failure NEVER
+    blocks the install (logged as a warning, install continues).
+
+    OS support matrix (cross-OS / cross-runtime):
+
+      Linux   + podman → systemd user unit + CDI wait (canonical path)
+      Linux   + docker → systemd user unit, no CDI wait (docker hook)
+      macOS   + docker → LaunchAgent; no GPU passthrough on Apple Silicon
+      macOS   + podman → LaunchAgent; podman-machine has no GPU passthrough
+      Windows + docker → Task Scheduler + bash wrapper via Git Bash/WSL
+      Windows + podman → Task Scheduler + bash wrapper via Git Bash/WSL
+                         (podman-machine WSL2 backend; GPU via NVIDIA-WSL2)
+
+    The wrapper script (scripts/launch-claude-mcp-stack.sh) handles
+    runtime detection + GPU-mode detection internally, so this function
+    is runtime-agnostic — it only needs to know the OS.
+    """
+    # Honor the `_BOOT_SERVICE_DISABLE` env var for CI / minimal installs
+    # that don't want a system service materialized.
+    if os.environ.get("VCT_DISABLE_BOOT_SERVICE", "").strip() == "1":
+        _log_install_event(
+            "boot-service", "skip",
+            "VCT_DISABLE_BOOT_SERVICE=1 — skipping",
+        )
+        return
+
+    # `--no-containers` users won't have a stack to autostart.
+    if getattr(args, "no_containers", False):
+        _log_install_event(
+            "boot-service", "skip",
+            "--no-containers — boot service not needed",
+        )
+        return
+
+    cli_override = getattr(args, "compose_working_dir", None)
+    container_cmd = getattr(sysinfo, "container_cmd", "") if sysinfo else ""
+    ps_label = _probe_compose_working_dir_via_ps(container_cmd) if container_cmd else None
+
+    working_dir = _resolve_compose_working_dir(
+        install_path=install_path,
+        cli_override=cli_override,
+        ps_label_value=ps_label,
+    )
+    if working_dir is None:
+        _log_install_event(
+            "boot-service", "warn",
+            "no compose-project dir found — boot service not configured; "
+            "re-run with --compose-working-dir to set it explicitly",
+        )
+        return
+
+    os_name = platform.system()
+    try:
+        if os_name == "Linux":
+            _materialize_boot_service_linux(install_path, working_dir)
+        elif os_name == "Darwin":
+            _materialize_boot_service_macos(install_path, working_dir)
+        elif os_name == "Windows":
+            _materialize_boot_service_windows(install_path, working_dir)
+        else:
+            _log_install_event(
+                "boot-service", "skip",
+                f"unsupported OS for boot-service materialization: {os_name}",
+            )
+    except Exception as exc:  # noqa: BLE001 — soft-fail catch-all
+        # Bug L2 design contract: boot-service materialization NEVER
+        # blocks the install. Catch everything, log, return.
+        _log_install_event(
+            "boot-service", "warn",
+            f"boot-service materialization raised: {exc.__class__.__name__}: {exc}",
+        )
 
 
 # ---------------------------------------------------------------------------
