@@ -3,25 +3,33 @@ title: Orchestrator MCP Servers
 type: concept
 tags: [mid-level-architecture, vibecoded-orchestrator, mcp, tools]
 created: 2026-04-27T18:30:00Z
-updated: 2026-04-27T18:30:00Z
+updated: 2026-05-16T03:52:34Z
 status: active
 ---
 
 # Orchestrator MCP Servers
 
-The orchestrator ships several MCP (Model Context Protocol) servers that extend Claude Code with semantic search, local inference, web search, and team coordination. All servers run as native Python processes registered in the user's MCP config and share a virtual environment at `claude_mcp_servers/.venv`.
+The orchestrator ships MCP (Model Context Protocol) servers that extend Claude Code with semantic search, academic paper search, and team coordination. All servers run as native Python processes registered in the user's MCP config and share a virtual environment at `claude_mcp_servers/.venv`.
 
-[[implements::Model Context Protocol]] [[uses::Weaviate]] [[uses::Ollama]] [[relatedTo::Orchestrator Knowledge Graph]]
+[[implements::Model Context Protocol]] [[uses::Weaviate]] [[uses::Ollama]] [[relatedTo::Orchestrator Knowledge Graph]] [[relatedTo::MCP Simplification v0.2.11]]
 
-## Shipped Servers
+## Shipped Servers (v0.2.11+)
 
 | Server | Purpose | Key Tools |
 |---|---|---|
 | weaviate-kg | Semantic search + KG/code-graph management | hybrid_search, search_code_graph, store_knowledge_node, query_code_structure |
-| ollama | Local LLM inference (FREE) | chat, read_document, read_image |
-| search | Web + academic + GitHub code search | web_search, search_papers, search_code, fetch_page |
-| code-embedding-service | GPU/CPU code-embedding HTTP service (port 11438) | `/embed`, `/health` (REST, not MCP) |
+| search | Academic paper search | search_papers |
+| code-embedding-service | GPU/CPU code-embedding HTTP service (port 11440) | `/embed`, `/health` (REST, not MCP) |
 | coordination | Team coordination notes (Pro tier) | post_coordination_note, read_coordination_notes |
+
+## Removed in v0.2.11
+
+| Server | Rationale |
+|---|---|
+| ollama (chat, read_document, read_image) | Redundant with Claude's native reasoning, Read tool, and built-in vision. For OAuth-subscription users the "FREE" framing was misleading. Ollama continues running as infrastructure for Weaviate embeddings. |
+| search (web_search, fetch_page, search_code) | Redundant with Claude's built-in WebFetch; SearXNG removed from default container stack. `search_papers` kept for structured academic retrieval. |
+
+See `knowledge/concepts/mcp-simplification-v0211.md` for the full architecture decision record.
 
 ## weaviate-kg
 
@@ -89,79 +97,34 @@ query_code_structure(
 ```
 Structural queries without reading source files. `path` type uses BFS (max depth 6) to find the shortest call path between two functions, format `"src.func->dst.func"`.
 
-## ollama
+## ollama (infrastructure only as of v0.2.11)
 
-**Script**: `claude_mcp_servers/ollama_mcp/server.py`
+**Purpose**: Weaviate text embeddings (`qwen3-embedding:0.6b`) and code-embedding service CPU fallback. KG-summary generation (`generate-kg-summary.py`) can also target Ollama directly when the Claude CLI is unavailable.
 
-**Purpose**: local LLM inference. All calls are FREE — runs on local GPU/CPU. Used instead of Claude API for analysis, rewriting, and summarization tasks.
+The Ollama MCP server (`chat`, `read_document`, `read_image`) was removed in v0.2.11 as redundant. Claude's native reasoning replaces `chat`, the `Read` tool replaces `read_document`, and Claude's built-in vision replaces `read_image`. Ollama continues running at `http://localhost:11435` — the container is still started by `ensure-containers.sh`. See [[MCP Simplification v0.2.11]].
 
-**Environment**: `OLLAMA_URL=http://localhost:11435`.
-
-### chat
-```python
-chat(
-    prompt: str,
-    model: str = "qwen3.5:9b",
-    system_prompt: str = None,
-    temperature: float = 0.7,
-    max_tokens: int = 2048
-)
-```
-Direct inference via Ollama API. Default model: `qwen3.5:9b` (text + vision). For fast summarization on low-power machines: `gemma4:e4b`, [[Qwen3.5]] family for vision + text.
-
-### read_document
-```python
-read_document(
-    file_path: str,
-    model: str = "qwen3.5:9b",
-    task: str = "summarize",
-    context_lines: int = 50
-)
-```
-Loads a file and processes it locally. For files >100K chars, auto-switches to chunked-scanning mode (overlapping windows). Used for extracting specific info from large files without consuming the Claude API context budget.
-
-### read_image
-```python
-read_image(file_path: str, prompt: str = None)
-```
-Returns the image as a base64 data URL Claude can see directly, plus an optional local description from a vision model. Memory-aware gating picks a vision model that fits available VRAM/RAM, falling back to a smaller model or skipping the description with a clear reason. See [[read_image — Memory-Aware Vision-Model Gating]].
-
-## search
+## search (search_papers only as of v0.2.11)
 
 **Script**: `claude_mcp_servers/search_mcp/server.py`
 
-**Purpose**: external information retrieval — web, academic papers, GitHub code.
+**Purpose**: structured academic paper retrieval via OpenAlex and arXiv. Returns citation-rich, date-filtered metadata that ad-hoc web search cannot replicate.
 
 **Environment**:
 ```
-GITHUB_TOKEN=<optional>
 OPENALEX_EMAIL=<optional, polite-pool priority>
-SEARXNG_URL=http://localhost:8888
 ```
-
-### web_search
-```python
-web_search(query: str, num_results: int = 10)
-```
-Routes through a local SearXNG instance. Rate-limited (1 req/s). No API key required.
-
-### search_code
-```python
-search_code(query, language=None, repo=None)
-```
-GitHub code search API. Rate-limited (0.5 req/s). Authenticated via `GITHUB_TOKEN` for higher quotas.
 
 ### search_papers
 ```python
 search_papers(query, source="openalex", limit=10)
 ```
-OpenAlex (240M papers) or arXiv (CS/ML preprints, rate-limited 0.333 req/s). `OPENALEX_EMAIL` enables polite-pool priority.
+OpenAlex (240M papers, CC0) or arXiv (CS/ML preprints, rate-limited 0.333 req/s). `OPENALEX_EMAIL` enables polite-pool priority. Calls structured APIs directly — no local search proxy needed.
 
-### fetch_page
-```python
-fetch_page(url: str)
-```
-Fetches the full content of any URL; returns cleaned text (strips HTML, scripts, ads).
+**Removed in v0.2.11** (v0.2.10 and earlier only):
+- `web_search` — routed through SearXNG; superseded by Claude's built-in WebFetch.
+- `fetch_page` — fetched arbitrary URLs; superseded by Claude's built-in WebFetch.
+- `search_code` — GitHub code search; `search_code_graph` covers in-project code search semantically.
+- **SearXNG container** (`SEARXNG_URL=http://localhost:8888`) — removed from `compose.yaml`.
 
 ## code-embedding-service
 
@@ -194,7 +157,7 @@ All servers register via the user's `~/.claude.json` (or per-project MCP config)
 
 **Multi-project routing**: the `KG_COLLECTION` env var in VS Code workspace settings (`.vscode/settings.json::claude-code.env`) determines which collection is active. Opening a different workspace → that project's KG is active. The active VS Code workspace determines the KG target, not which project's files are being discussed.
 
-## Search Decision Tree
+## Search Decision Tree (v0.2.11+)
 
 | Situation | Tool |
 |---|---|
@@ -203,9 +166,9 @@ All servers register via the user's `~/.claude.json` (or per-project MCP config)
 | Relationship exploration | `semantic_graph_search` |
 | Code by purpose | `search_code_graph` |
 | Architecture queries | `query_code_structure` |
-| Quick analysis / rewrites | `chat` (Ollama, FREE) |
-| Large file extraction | `read_document` (Ollama, FREE) |
-| Web / current events | `web_search` |
+| Quick analysis / rewrites | Claude's own reasoning (Ollama MCP removed v0.2.11) |
+| Large file extraction | `Read` tool with `offset`/`limit` |
+| Web / current events | Claude's built-in WebFetch (web_search removed v0.2.11) |
 | Academic research | `search_papers` |
 | Exact strings | Grep |
 | Specific file content | Read |

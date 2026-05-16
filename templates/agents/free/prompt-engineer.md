@@ -315,20 +315,11 @@ You succeed when:
 - **Example**: `search_code_graph("authentication middleware", collection="CodeFunction")` for code examples
 - **Example**: `hybrid_search("agent coordination patterns")` for comprehensive research
 
-**Ollama MCP** - Local LLM for FREE inference:
-- **Purpose**: Simple analysis, quick rewrites, document extraction (NO API COSTS - UNDERUTILIZED!)
-- **When to use**: Simple tasks, analysis, summarization, info extraction (USE THIS MORE!)
-- **Cost**: FREE (runs locally on port 11435)
-- **Tools**:
-  - `chat(prompt, model, system_prompt, temperature, max_tokens)`: Local inference (gemma4:e4b is fast (low-power))
-  - `read_document(file_path, model, task, context_lines)`: Summarize/extract from files; auto-chunked for large files
-- **Models**:
-  - `snowflake-arctic-embed2:latest`: Embeddings (1024 dimensions, used internally by KG)
-  - `gemma4:e4b`: Fast inference + summarization for low-power machines (~50-100 tokens/sec, FREE alternative to Claude for simple tasks)
-  - `qwen3.5:9b`: 8B — better quality for complex analysis
-  - `unclemusclez/jina-embeddings-v2-base-code:latest`: Code embeddings (768 dimensions, used internally by Code Graph)
-- **Example**: `chat("Rewrite this prompt to be clearer: [prompt]", model="gemma4:e4b")` (FREE, ~2-3s)
-- **Example**: `read_document("/path/to/spec.md", task="extract all API endpoints")` (FREE, handles large files)
+**Ollama** - Local LLM infrastructure (embeddings only as of v0.2.11):
+- **Status**: The Ollama MCP (`chat`, `read_document`, `read_image`) was removed in v0.2.11. Ollama still runs as infrastructure for Weaviate text embeddings and code-embedding fallback.
+- **For analysis tasks**: use Claude's own reasoning — it is higher quality than a local 4B/9B model.
+- **For large file extraction**: use the native `Read` tool with `offset`/`limit` parameters.
+- **For image analysis**: use the native `Read` tool on the image path (Claude's built-in vision).
 
 ## MCP Usage Rules (IMPORTANT)
 

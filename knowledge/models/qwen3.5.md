@@ -3,7 +3,7 @@ title: Qwen3.5
 type: model
 tags: [model, llm, vlm, multimodal, ollama, qwen, alibaba, open-source]
 created: 2026-04-27T18:30:00Z
-updated: 2026-04-27T18:30:00Z
+updated: 2026-05-16T03:53:39Z
 status: active
 ---
 
@@ -29,9 +29,9 @@ VRAM figures are approximate practical floors at default quantization with a sma
 
 ## Where the orchestrator uses it
 
-- **Default vision model**: `claude_mcp_servers/ollama_mcp/server.py` defaults `OLLAMA_VISION_MODEL` to `qwen3.5:9b` for `read_image` and document-page description. The same checkpoint serves text inference.
-- **Memory-aware gating**: the Ollama MCP carries a `VISION_MODEL_REQUIREMENTS` table for `qwen3.5:0.8b/2b/4b/7b/9b` and refuses to load a variant that does not fit the host's free VRAM/RAM, falling back to a smaller variant or returning a structured error.
-- **Install bootstrap**: `install.py` does not pull Qwen3.5 by default — it ships the embedding model + `qwen3.5:9b` (default inference + vision) + `gemma4:e4b` (fast summarization on low-power machines) (`ollama pull qwen3.5:9b`).
+- **KG-summary generation**: `generate-kg-summary.py` targets `qwen3.5:9b` on capable hardware (≥24 GB RAM or ≥7.5 GB VRAM) as a fallback when the Claude CLI is unavailable.
+- **Install bootstrap**: `install.py` pulls `qwen3.5:9b` for KG-summary generation on capable machines + `gemma4:e4b` as the low-power fallback.
+- **Note (v0.2.11)**: the Ollama MCP (`read_image`, `chat`) was removed. `qwen3.5:9b`'s vision and inference capabilities are no longer exposed as MCP tools — Claude's native capabilities handle those use cases directly. Ollama continues running at `http://localhost:11435` as infrastructure for Weaviate embeddings.
 
 ## Why this model
 

@@ -3,7 +3,7 @@ title: Orchestrator Security Model
 type: concept
 tags: [mid-level-architecture, vibecoded-orchestrator, security, hooks]
 created: 2026-04-27T18:30:00Z
-updated: 2026-04-27T18:30:00Z
+updated: 2026-05-16T03:52:49Z
 status: active
 ---
 
@@ -58,9 +58,10 @@ Private IP ranges blocked by default:
 
 Whitelist (explicitly allowed localhost services):
 - `localhost:8081` — Weaviate
-- `localhost:11435` — Ollama
-- `localhost:11438` — code-embedding service
-- `localhost:8888` — SearXNG
+- `localhost:11435` — Ollama (infrastructure, embeddings)
+- `localhost:11440` — code-embedding service
+
+Note: `localhost:8888` (SearXNG) was removed from the whitelist in v0.2.11 along with the SearXNG container itself.
 
 Blocked requests exit 1 with an explanation of which range was matched.
 

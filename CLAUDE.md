@@ -67,7 +67,7 @@ These four persistence layers exist for a reason — future-you, future-agents, 
 3. Code by purpose → `search_code_graph` (Weaviate MCP)
 4. Architecture / callers / deps → `query_code_structure` (Weaviate MCP)
 5. Known exact term/tag/title → `kg-search` CLI (~100 ms)
-6. Quick analysis or rewrite → `chat` (Ollama MCP, FREE)
+6. Quick analysis or rewrite → use Claude directly (Ollama MCP removed v0.2.11)
 7. Still unsure → `hybrid_search` (most comprehensive)
 
 **This applies to reasoning too** — do NOT explain what the codebase does, what patterns exist, or what was previously decided from memory alone. Look it up first.
@@ -127,15 +127,10 @@ These four persistence layers exist for a reason — future-you, future-agents, 
 - CLI: `.claude/scripts/code-graph-query search "auth middleware"`.
 - Use when: finding code entities, understanding architecture, cross-service call mapping.
 
-**4. Ollama MCP (Local LLM + Vision)** — FREE:
-- `chat(prompt, model, system_prompt, temperature, max_tokens)` — Local inference (~1–3 s).
-- `read_document(file_path, model, task, context_lines)` — Summarize or extract info from files; auto-switches to chunked scan for large files.
-- `read_image(file_path, max_total_pixels, describe, vision_model, description_prompt)` — Read an image as a base64 data URL Claude can see directly. Optionally get a local text description from a vision model (default `qwen3.5:9b`, unified text+vision; no separate `-vl` tag needed). Auto-resizes images to fit within `max_total_pixels` (default 1,048,576 ≈ 1024×1024) to bound VRAM during local inference. Supports PNG, JPEG, GIF, WebP, BMP, TIFF, SVG.
-  - **Memory-aware gating**: the description tier auto-skips if neither GPU VRAM nor system RAM is sufficient (image base64 is still returned for Claude's own vision). Auto-swaps to a smaller installed VLM when the requested model doesn't fit but a smaller one does. Per-model thresholds: `qwen3.5:9b` ≥7.5 GB VRAM / 12 GB RAM; `qwen3.5:7b` ≥6 / 10; `qwen3.5:4b` ≥4 / 7; `llama3.2-vision:11b` ≥9 / 16; `gemma3:4b` ≥5 / 8. Override default with `OLLAMA_VISION_MODEL` env var.
-  - **Tiered resize budget**: `max_total_pixels` is an UPPER bound and is auto-clamped on tight hardware (1024² → 720² → 512² → 256²) based on free VRAM (or RAM in CPU mode). The clamp is reported as `image_budget_clamped_from`.
-- Models: `gemma4:e4b` (fast inference + summarization for low-power machines), `qwen3-embedding:0.6b` (text embeddings, 1024-dim), `qwen3.5:9b` (text + vision; default for inference, summarization, and `read_image` on machines with ≥24 GB RAM or ≥7.5 GB VRAM).
-- Use when: simple analysis, rewrites, summarizing files, reading images (all FREE).
-- Roadmap: a heavier `image_interpretation_mcp` (object detection, OCR, table extraction via YOLO / Donut / GOT-OCR2) is in design; ships post-1.0 if user demand materializes. Today's `read_image` covers the common case.
+**4. Ollama infrastructure (embeddings only as of v0.2.11)**:
+- The Ollama MCP server (`chat`, `read_document`, `read_image`) was removed in v0.2.11. Claude's own reasoning and the native `Read` tool are strictly better quality for analysis and document extraction; for OAuth-subscription users the "FREE" framing was also misleading (tokens are included in the subscription). Ollama continues to run as infrastructure for Weaviate embeddings (`qwen3-embedding:0.6b`) and the code-embedding service fallback.
+- For image analysis: use the native `Read` tool on image paths — Claude's built-in vision handles this directly without a separate MCP tool.
+- Historical detail: see `knowledge/concepts/mcp-simplification-v0211.md` and `knowledge/concepts/read-image-memory-aware-gating.md` (deprecated).
 
 **Decision Tree**:
 - Known exact terms → `kg-search`
@@ -143,9 +138,10 @@ These four persistence layers exist for a reason — future-you, future-agents, 
 - Relationships/graph → `semantic_graph_search`
 - Code by purpose → `search_code_graph`
 - Architecture queries → `query_code_structure`
-- Quick analysis → `chat` (Ollama, FREE)
-- Summarize/extract from file → `read_document` (Ollama, FREE)
-- Read an image / vision task → `read_image` (Ollama, FREE)
+- Quick analysis → use Claude directly (Ollama MCP removed v0.2.11)
+- Summarize/extract from file → `Read` tool with `offset`/`limit`, or native reasoning
+- Read an image / vision task → `Read` tool on image path (Claude's built-in vision)
+- Academic research → `search_papers` (Search MCP)
 - Literal strings → Grep
 - File content → Read
 
@@ -264,13 +260,12 @@ PowerShell variants (`*.ps1`) ship for Windows users.
 
 ### Ollama Local LLM
 - **URL**: `http://localhost:11435`
-- **Purpose**: FREE local inference and embeddings (internal use).
+- **Purpose**: Local embeddings for Weaviate; code-embedding service CPU fallback. The Ollama MCP (`chat`, `read_document`, `read_image`) was removed in v0.2.11 — Claude's native capabilities serve those use cases better.
 - **Models**:
   - `qwen3-embedding:0.6b` — text embeddings (1024 dim, primary; needs `num_ctx=8192`)
-  - `gemma4:e4b` — fast inference + summarization (low-power default, ~50-100 tok/s on CPU)
-  - `qwen3.5:9b` — default inference + vision + summarization (auto-selected by `_select_text_model` when host has ≥24 GB RAM or ≥7.5 GB VRAM; falls back to `gemma4:e4b` on tighter hardware)
-- **Access**: Ollama MCP tools (`chat`, `read_document`).
-- **Cost**: FREE (runs locally).
+  - `gemma4:e4b` — fast inference for KG-summary generation (invoked by the `generate-kg-summary.py` script, not via MCP)
+  - `qwen3.5:9b` — larger inference model for KG-summary generation on capable hardware
+- **Access**: used internally by Weaviate MCP (for embedding calls) and the `generate-kg-summary.py` script. Not exposed as an MCP tool to Claude as of v0.2.11.
 
 ### Code Embedding Service
 - **URL**: `http://localhost:11440` (default; configurable via `CODE_EMBED_PORT`)
@@ -285,13 +280,16 @@ Located in the user's `~/.claude.json`. Each launches via the project venv (`cla
 - **weaviate-kg** — semantic search and code graph.
   - Command: `claude_mcp_servers/.venv/bin/python claude_mcp_servers/weaviate_mcp/server.py`
   - Env: `WEAVIATE_URL`, `OLLAMA_URL`, `EMBEDDING_MODEL`, `KG_COLLECTION`, `SHARED_KG_COLLECTION`, `DEVELOPMENT_COLLECTION`, `GRPC_PORT`, `SHARED_KG_WRITE_DISABLED` (write gate; legacy alias `SHARED_KG_OPT_OUT` kept for ~3 releases).
-- **ollama** — local LLM inference.
-  - Command: `claude_mcp_servers/.venv/bin/python claude_mcp_servers/ollama_mcp/server.py`
-  - Env: `OLLAMA_URL`.
+- **search** — academic paper search via OpenAlex and arXiv (v0.2.11: narrowed to `search_papers` only; `web_search`, `search_code`, and `fetch_page` removed as redundant with Claude's built-in WebFetch and web capabilities).
+  - Command: `claude_mcp_servers/.venv/bin/python claude_mcp_servers/search_mcp/server.py`
+  - Env: `OPENALEX_EMAIL` (optional, gives polite-pool priority on OpenAlex API).
+  - Tools: `search_papers` only.
 - **coordination** — local KG-backed coordination notes (decisions, tasks, patterns).
   - Command: `claude_mcp_servers/.venv/bin/python claude_mcp_servers/coordination_mcp/server.py`
   - Env: `KG_BASE_DIR` (optional, defaults to project root).
   - Tools: `post_coordination_note`, `read_coordination_notes`.
+
+**Removed in v0.2.11**: the **ollama** MCP (`chat`, `read_document`, `read_image`) was removed as redundant. Claude's native reasoning, `Read` tool, and built-in vision handle the same use cases at higher quality. Ollama continues running as infrastructure for Weaviate text embeddings and the code-embedding service CPU fallback. The **SearXNG** container was also removed from the default stack — `search_papers` calls OpenAlex and arXiv directly without a local search proxy. See `knowledge/concepts/mcp-simplification-v0211.md` for the full rationale.
 
 **Claude SKU pinning** — this fork pins `claude/opus` → `claude-opus-4-6` (not 4-7) inside the orchestrator's model resolver. Don't rewrite that mapping unless you're consciously upgrading; downstream agents and skills assume 4-6's behaviour.
 
@@ -415,7 +413,7 @@ Located in `.claude/hooks/` — automated workflow actions. On Windows the bash 
 - Project-specific pattern → per-project KG.
 - Code entities → code graph.
 - Verbose docs → development collection.
-- Quick local analysis → Ollama MCP (FREE).
+- Quick local analysis → use Claude directly (Ollama MCP removed v0.2.11).
 
 ---
 
@@ -535,7 +533,7 @@ When 2+ agents work on the same git repo concurrently, they trip over each other
 - `tools` / `disallowedTools` — allow/deny tool lists.
 - `permissionMode` — `default` | `acceptEdits` | `dontAsk` | `bypassPermissions` | `plan`.
 - `maxTurns` — max agentic turns before stopping.
-- `effort` — `low` | `medium` | `high` | `xhigh` | `max` — caps per-agent reasoning cost. Frontmatter wins over session level. Cannot be set as Agent-tool parameter — must be in `.md` frontmatter. The env var `CLAUDE_CODE_EFFORT_LEVEL` overrides frontmatter globally; don't set for per-agent control. **When you spawn ad-hoc agents not in our shipped list** (Agent tool with a description but no pre-existing definition file), tell them in the prompt to operate at `xhigh` (Opus 4.7) or `max` (Opus 4.6) for deep-reasoning work — architecture spec, deep code review, security analysis, gnarly multi-system debugging. Trivial sweeps can stay at default. Thinking toggle: on 4.6 / Sonnet 4.6 and earlier the IDE Thinking toggle and `CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1` control fixed-budget thinking; on Opus 4.7 both are no-ops (4.7 uses adaptive thinking governed by effort).
+- `effort` — `low` | `medium` | `high` | `xhigh` | `max` — caps per-agent reasoning cost. Frontmatter wins over session level. Cannot be set as Agent-tool parameter — must be in `.md` frontmatter. The env var `CLAUDE_CODE_EFFORT_LEVEL` overrides frontmatter globally; don't set for per-agent control. **When you spawn ad-hoc agents not in our shipped list** (Agent tool with a description but no pre-existing definition file), tell them in the prompt to operate at `high` effort by default for substantive work — implementation, refactors, multi-file changes, design + code. Reserve `xhigh` (Opus 4.7) or `max` (Opus 4.6) only for genuinely deep-reasoning tasks where `high` has empirically fallen short: gnarly architecture spec across many subsystems, security review of unfamiliar code, hard debugging that already proved resistant to standard effort. Trivial sweeps stay at default. Thinking toggle: on 4.6 / Sonnet 4.6 and earlier the IDE Thinking toggle and `CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1` control fixed-budget thinking; on Opus 4.7 both are no-ops (4.7 uses adaptive thinking governed by effort).
 - `isolation: worktree` — runs in a temporary git worktree (auto-cleaned if no changes).
 - `background: true` — always run as background task.
 - `memory` — `user` | `project` | `local` — enables persistent agent memory directory.
@@ -612,10 +610,12 @@ hybrid_search("code graph collections schema")      # What does KG say about thi
 **Example 3: Quick analysis task**
 
 ```python
-# WRONG: use Claude API for simple task (wastes tokens)
-# CORRECT: use Ollama MCP (FREE)
-chat("Rewrite this docstring to be clearer: [docstring]", model="gemma4:e4b")
-read_document("/path/to/large_file.py", task="find the authentication logic")  # Extract from file, FREE
+# As of v0.2.11, the Ollama MCP has been removed — Claude handles analysis directly.
+# CORRECT: use Claude's native capabilities
+# Read a file section: Read(file_path, offset=N, limit=50)
+# Analyze an image: Read(image_path)  — Claude's built-in vision
+# Summarize a file: Read the relevant section, then reason over it
+# No separate MCP tool needed; Claude's own reasoning is higher quality.
 ```
 
 ---
@@ -645,7 +645,8 @@ The toast summarises the result ("5 files updated, 2 user-modifications preserve
 - Analyze code: `.claude/scripts/code-graph-analyze . --project "MyProject"`.
 - Search code: `.claude/scripts/code-graph-query search "pattern"`.
 - Search knowledge: `hybrid_search("concept")` (Weaviate MCP).
-- Quick analysis (FREE): `chat("prompt", model="gemma4:e4b")` (Ollama MCP).
+- Quick analysis: use Claude directly — Ollama MCP removed in v0.2.11.
+- Academic research: `search_papers("topic")` (Search MCP).
 - MCP venv: `source claude_mcp_servers/.venv/bin/activate`.
 - Active plans: `.claude/context/plans/`.
 - Tag hierarchy: `knowledge/TAG_HIERARCHY.md`.
@@ -654,8 +655,8 @@ The toast summarises the result ("5 files updated, 2 user-modifications preserve
 - Compact with focus: `/compact focus on <topic>`.
 - Fix from PR: `claude --from-pr <PR-URL>`.
 
-**Default ports**: Weaviate `8081` (HTTP) / `50052` (gRPC), Ollama `11435`, code-embed service `11440` (optional GPU).
-**Default models**: text embeddings `qwen3-embedding:0.6b` (1024-dim), code embeddings CodeSage-Large-v2 (2048-dim, GPU) / `qwen3-embedding:0.6b` (CPU fallback), inference `gemma4:e4b` (low-power) / `qwen3.5:9b` (default + vision).
+**Default ports**: Weaviate `8081` (HTTP) / `50052` (gRPC), Ollama `11435` (embeddings + KG-summary generation), code-embed service `11440` (optional GPU).
+**Default models**: text embeddings `qwen3-embedding:0.6b` (1024-dim), code embeddings CodeSage-Large-v2 (2048-dim, GPU) / `qwen3-embedding:0.6b` (CPU fallback). KG-summary generation uses `gemma4:e4b` (low-power) / `qwen3.5:9b` (capable hardware) via the `generate-kg-summary.py` script — not via MCP.
 
 ---
 
@@ -689,7 +690,7 @@ Run these once to confirm the install landed correctly:
 
 ```bash
 claude mcp list
-# Expected: weaviate-kg ✓ Connected, ollama ✓ Connected (and search if configured)
+# Expected: weaviate-kg ✓ Connected, search ✓ Connected (ollama MCP removed v0.2.11; Ollama still runs as infrastructure)
 
 curl -s http://localhost:8081/v1/.well-known/ready    # Weaviate ready
 curl -s http://localhost:11435/api/tags               # Ollama models

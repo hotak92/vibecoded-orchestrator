@@ -354,11 +354,11 @@
   },
   "knowledge/tools/ollama-mcp-server.md": {
     "title": "Ollama MCP Server",
-    "description": "The Ollama MCP Server is a FastMCP-based local LLM inference tool providing FREE document processing without consuming Claude API tokens. It provides `chat` for inference (qwen3.5:0.8b by default, qwen3.5:9b for reasoning) and `read_document` for summarization/extraction, with automatic chunking for large files (>100K chars). The server runs as a stdio subprocess and returns JSON responses including processing results, tokens/second, and execution time. Use it to save API tokens on quick analysis, rewrites, and extraction tasks while keeping documents local; trade reasoning capability for speed and cost.",
-    "summary": "FastMCP-based server providing FREE local LLM inference through Ollama (qwen3.5:0.8b/8B models) with two tools: `chat()` for quick analysis/rewrites and `read_document()` for file summarization that auto-switches to chunked scanning for files >100K characters, eliminating Claude API token consumption for document processing.",
-    "generated_at": "2026-04-27T03:23:22.953745+00:00",
-    "content_hash": "262ef6588c5989fc",
-    "backend": "cli"
+    "description": "DEPRECATED v0.2.11: The Ollama MCP Server (`chat`, `read_document`, `read_image`) was removed in v0.2.11 as redundant with Claude's native capabilities. Ollama continues running as infrastructure for Weaviate text embeddings (`qwen3-embedding:0.6b`) and the code-embedding service CPU fallback. For analysis tasks use Claude's own reasoning; for large-file extraction use the native Read tool with offset/limit; for image analysis use the native Read tool on the image path (Claude's built-in vision).",
+    "summary": "DEPRECATED v0.2.11: Ollama MCP tools (chat, read_document, read_image) removed as redundant with Claude's native reasoning, Read tool, and built-in vision. Ollama still runs as infrastructure for Weaviate embeddings.",
+    "generated_at": "2026-05-16T00:00:00.000000+00:00",
+    "content_hash": "deprecated-v0211",
+    "backend": "manual"
   },
   "knowledge/tools/fastapi.md": {
     "title": "FastAPI",

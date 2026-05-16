@@ -149,27 +149,11 @@ env VCT_DISABLE_HOOKS=1 python install.py --quiet
 
 The guard sits **after** the credential-scrub block in every hook, so secrets are still stripped from the env even when the hook itself no-ops. Coverage is asserted by `tests/test_hooks_disable_guard.py` — a regression that adds a new hook without the guard fails CI.
 
-## Vision (read_image) memory budget
+## Vision and image analysis (v0.2.11+)
 
-The Ollama MCP's `read_image` tool returns an image as a base64 data URL (which Claude can read directly) and optionally a local text description from a vision model. The local description tier is memory-aware:
+The `read_image` Ollama MCP tool was removed in v0.2.11. For image analysis, pass the image file path to Claude using the native `Read` tool — Claude's built-in vision handles it directly. This approach is simpler, requires no local GPU, and works on any hardware.
 
-- Probes free VRAM and system RAM at module load.
-- Picks GPU if VRAM is at or above the per-model threshold; otherwise tries CPU; otherwise auto-falls-back to a smaller installed model.
-- If no model fits, returns the image-as-base64 with `description_skipped_reason` set. Claude still sees the image directly.
-
-Per-model thresholds (q4_K_M; floors include KV cache and image-feature activations):
-
-| Model | VRAM | RAM |
-|---|---|---|
-| qwen3.5:9b (default) | 7.5 GB | 12 GB |
-| qwen3.5:7b | 6.0 GB | 10 GB |
-| qwen3.5:4b | 4.0 GB | 7 GB |
-| llama3.2-vision:11b | 9.0 GB | 16 GB |
-| gemma3:4b / gemma4:e4b | 5.0 GB | 8 GB |
-
-Resize budget is also tiered: `max_total_pixels` (default 1024² = 1,048,576) is clamped DOWN to 720² / 512² / 256² when free VRAM drops below 8 / 6 / 4 GB. The actual budget used is surfaced as `image_budget_clamped_from` in the response.
-
-Override via `OLLAMA_VISION_MODEL=<model_id>` to force a specific model regardless of memory.
+For historical reference on the memory-aware gating that `read_image` implemented, see `knowledge/concepts/read-image-memory-aware-gating.md` (marked deprecated).
 
 ## Sharing knowledge across projects
 
