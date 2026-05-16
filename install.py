@@ -2056,6 +2056,42 @@ def main() -> int:
         _configure_claude_settings(embed_config)
     else:
         print("[skip] Claude settings (preserved during update)")
+        # PR-7 (v0.2.11): on `--update` paths the full settings rewrite is
+        # intentionally skipped (preserves user customisation), but pre-v0.2.11
+        # installs lack the new PROJECT_NAME / CODE_GRAPH_PROJECT keys. Run
+        # the idempotent backfill: it only ADDS missing keys, never modifies
+        # existing values. No-op when both keys are already present.
+        _backfill_result = _backfill_code_graph_project_env()
+        if _backfill_result["action"] == "backfilled":
+            print(
+                f"  Claude settings: backfilled {len(_backfill_result['added_keys'])} "
+                f"missing env key(s): {', '.join(_backfill_result['added_keys'])}"
+            )
+        _log_install_event(
+            "9/10", "info",
+            f"_backfill_code_graph_project_env action={_backfill_result['action']}",
+            data=_backfill_result,
+        )
+
+    # PR-7 / addendum-4 (v0.2.11): .vscode/settings.json watcher/search/
+    # Pylance exclude backfill. Runs on BOTH install and update paths:
+    #   - Fresh install: creates `.vscode/settings.json` with the canonical
+    #     exclude block (the existing `.vscode/settings.json.example` is
+    #     templated for the `claude-code.env` block, which the launcher
+    #     writes on registration — the excludes are an orthogonal concern).
+    #   - Update: adds missing exclude keys only; user-set values
+    #     preserved verbatim (user-wins).
+    _vscode_excludes_result = _backfill_vscode_excludes()
+    if _vscode_excludes_result["action"] in ("created", "backfilled"):
+        print(
+            f"  VS Code excludes: {_vscode_excludes_result['action']} "
+            f"({len(_vscode_excludes_result['added_keys'])} key(s))"
+        )
+    _log_install_event(
+        "9/10", "info",
+        f"_backfill_vscode_excludes action={_vscode_excludes_result['action']}",
+        data=_vscode_excludes_result,
+    )
 
     # Step 9b: Install agents and skills from templates/
     _install_agents_and_skills(args)
@@ -4911,6 +4947,175 @@ _derive_project_kg_name = _project_init._derive_project_kg_name
 _derive_project_dev_name = _project_init._derive_project_dev_name
 
 
+def _derive_orchestrator_project_name() -> str:
+    """Resolve the orchestrator's own project name for env propagation.
+
+    PR-7 (v0.2.11): pre-v0.2.11 the orchestrator's `.claude/settings.json`
+    env block omitted `PROJECT_NAME` and `CODE_GRAPH_PROJECT`. As a result,
+    every hook in every project that derived a fallback ended up sharing the
+    legacy `ClaudeOrchestrator` hardcode. We now write both keys at install
+    time so the orchestrator's own hooks resolve a stable, project-specific
+    name.
+
+    Resolution priority:
+      1. `vct-module.json::name` (canonical — shipped with every release).
+         Sanitized to a Weaviate-safe class basename (same sanitizer as the
+         per-project derivation in `vco_lib.project_init`).
+      2. Hardcoded fallback `"VibeCodedOrchestrator"` — matches what
+         `_install_kg_class_definition`'s naming convention would produce
+         for "VibeCoded Orchestrator" and never collides with a real
+         per-project derivation.
+
+    Returns:
+        A Weaviate-class-safe (PascalCase, alphanum-only) project name.
+    """
+    manifest = PROJECT_ROOT / "vct-module.json"
+    if manifest.is_file():
+        try:
+            with manifest.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            raw = data.get("name") or ""
+            if raw:
+                sanitized = _project_init.sanitize_for_weaviate_class(str(raw))
+                if sanitized and sanitized != _project_init._FALLBACK_PREFIX:
+                    return sanitized
+        except (OSError, json.JSONDecodeError):
+            pass
+    return "VibeCodedOrchestrator"
+
+
+def _backfill_vscode_excludes(settings_file: Path | None = None) -> dict:
+    """Orchestrator-side mirror of
+    `vco_lib.project_init._backfill_vscode_excludes_in_project`.
+
+    PR-7 / addendum-4 (v0.2.11): the orchestrator's own `.vscode/settings.json`
+    benefits from the same watcher / search / Pylance exclude defaults as
+    every project the launcher registers. Without these:
+      - VS Code's file watcher saturates on cargo target/ (~33 GB churn).
+      - Pylance indexes site-packages, blowing memory budget.
+      - OOM kills (verified live 2026-05-16 on multiple workspaces).
+
+    Idempotency contract matches the per-project version: only ADDS
+    missing keys, never overwrites. Returns the same dict shape.
+
+    Args:
+        settings_file: path to `.vscode/settings.json`. Defaults to
+            `<PROJECT_ROOT>/.vscode/settings.json`.
+    """
+    if settings_file is None:
+        settings_file = PROJECT_ROOT / ".vscode" / "settings.json"
+
+    # Delegate to the project_init helper using the parent folder of
+    # `.vscode/`. This keeps the canonical exclude block in ONE place
+    # (project_init._VSCODE_EXCLUDE_DEFAULTS) so the orchestrator and
+    # per-project surfaces never drift.
+    if settings_file.parent.name == ".vscode":
+        parent = settings_file.parent.parent
+    else:
+        # Caller passed a non-canonical path; fall back to the raw
+        # parent. Still safe — the project_init helper looks for
+        # `<parent>/.vscode/settings.json` and would create that path
+        # rather than touching the caller's custom file.
+        parent = settings_file.parent
+    return _project_init._backfill_vscode_excludes_in_project(parent)
+
+
+def _backfill_code_graph_project_env(settings_file: Path | None = None) -> dict:
+    """Idempotent: add `PROJECT_NAME` + `CODE_GRAPH_PROJECT` to an existing
+    `.claude/settings.json` env block when either key is missing.
+
+    PR-7 (v0.2.11): pre-v0.2.11 installs wrote an `env` block that omitted
+    these two keys, which caused the orchestrator's own
+    `post-file-edit.sh` hook to fall back to the hardcoded
+    "ClaudeOrchestrator" literal. The same env block must now carry the
+    two keys so that every project install on
+    the same machine writes code-graph rows into its own `<sanitized>`
+    namespace rather than the legacy collection.
+
+    Idempotency contract:
+      - Missing settings file → no-op (`action="missing"`).
+      - File unparseable JSON → no-op (`action="unparseable"`) so a hand-
+        edited file doesn't get clobbered; the user fixes it manually.
+      - Missing `env` block → create it with both keys.
+      - `env` present, both keys present (any value) → no-op
+        (`action="noop"`). User-set values are preserved verbatim — this
+        function only ever ADDS missing keys, never overwrites.
+      - `env` present, one or both keys missing → fill in the missing
+        keys from `_derive_orchestrator_project_name()` (`action="backfilled"`).
+
+    Args:
+        settings_file: path to `.claude/settings.json`. Defaults to
+            `<PROJECT_ROOT>/.claude/settings.json` — the Orchestrator
+            Project's own settings file.
+
+    Returns:
+        `{"action": str, "added_keys": [str, ...], "path": str}` so callers
+        can log a precise outcome. The dict is also safe to feed into
+        the install-event log directly.
+    """
+    if settings_file is None:
+        settings_file = PROJECT_ROOT / ".claude" / "settings.json"
+
+    result: dict = {
+        "action": "missing",
+        "added_keys": [],
+        "path": str(settings_file),
+    }
+
+    if not settings_file.exists():
+        return result
+
+    try:
+        raw = settings_file.read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except (OSError, json.JSONDecodeError):
+        result["action"] = "unparseable"
+        return result
+
+    if not isinstance(data, dict):
+        result["action"] = "unparseable"
+        return result
+
+    env = data.get("env")
+    if not isinstance(env, dict):
+        env = {}
+        data["env"] = env
+        env_was_missing = True
+    else:
+        env_was_missing = False
+
+    project_name = _derive_orchestrator_project_name()
+    added: list[str] = []
+    if "PROJECT_NAME" not in env:
+        env["PROJECT_NAME"] = project_name
+        added.append("PROJECT_NAME")
+    if "CODE_GRAPH_PROJECT" not in env:
+        env["CODE_GRAPH_PROJECT"] = project_name
+        added.append("CODE_GRAPH_PROJECT")
+
+    if not added and not env_was_missing:
+        result["action"] = "noop"
+        return result
+
+    # Atomic-ish write: write to a sibling tempfile and rename. Same
+    # pattern as `deferral_report.write`. We accept any OSError raised
+    # by the rename and surface it via the action field rather than
+    # propagating — this is a best-effort idempotent backfill, NOT a
+    # critical install step.
+    try:
+        payload = json.dumps(data, indent=2) + "\n"
+        tmp = settings_file.with_suffix(settings_file.suffix + ".tmp")
+        tmp.write_text(payload, encoding="utf-8")
+        os.replace(str(tmp), str(settings_file))
+    except OSError as e:
+        result["action"] = f"write_failed:{type(e).__name__}"
+        return result
+
+    result["action"] = "backfilled"
+    result["added_keys"] = added
+    return result
+
+
 def _ensure_collections(embed_config: dict,
                         decisions: dict | None = None,
                         args: argparse.Namespace | None = None) -> None:
@@ -5934,9 +6139,9 @@ def _resolve_compose_working_dir(
 ) -> Optional[Path]:
     """Decide which directory the compose-up wrapper should chdir into.
 
-    The compose-project dir may NOT be the install path (the canonical
-    example: install at ~/Desktop/PROGETTI/VCO_dev but compose lives at
-    ~/Desktop/PROGETTI/Claude/claude_mcp_servers). Resolution priority:
+    The compose-project dir may NOT be the install path (canonical
+    example: install at one project dir, but compose.yaml lives in a
+    sibling repo's `claude_mcp_servers/`). Resolution priority:
 
       1. CLI override (--compose-working-dir) — explicit user choice.
       2. `ps_label_value` — the value of the
@@ -6840,6 +7045,18 @@ def _configure_claude_settings(embed_config: dict) -> None:
         # as a legacy alias for ~3 releases (target removal: 2026-08).
         "SHARED_KG_WRITE_DISABLED": "false",
         "SHARED_KG_OPT_OUT": "false",
+        # PR-7 (v0.2.11): PROJECT_NAME + CODE_GRAPH_PROJECT pin the
+        # Orchestrator Project's own namespace so its
+        # `post-file-edit.{sh,ps1}` hook resolves a stable name instead of
+        # falling back to the legacy "ClaudeOrchestrator" hardcode. Without
+        # these keys, every user-project install on the same machine wrote
+        # code-graph rows into the shared legacy collection. Resolved at
+        # install time from `vct-module.json::name` via
+        # `_derive_orchestrator_project_name()`; existing installs are
+        # repaired in-place by `_backfill_code_graph_project_env()` during
+        # `--update`.
+        "PROJECT_NAME": _derive_orchestrator_project_name(),
+        "CODE_GRAPH_PROJECT": _derive_orchestrator_project_name(),
         "CODE_EMBED_BACKEND": embed_config["code_backend"],
         "CODE_EMBED_SERVICE_URL": f"http://localhost:{code_embed_port}",
     }

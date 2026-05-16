@@ -101,11 +101,19 @@ if [[ "$EDITED_FILE" == "$DOCS_DIR"* ]] && [[ "$EDITED_FILE" == *.md ]]; then
 fi
 
 # 3. Code file changes: incremental code graph update + LLM nudge.
+# Resolve project name from env (PR-7 / v0.2.11): CODE_GRAPH_PROJECT is the
+# canonical key set by the launcher's settings.json env block;
+# PROJECT_NAME is the historical fallback; basename of the repo root is
+# the last resort (same pattern as code-graph-incremental.sh:42). The
+# pre-v0.2.11 behaviour hardcoded "ClaudeOrchestrator" here, which
+# polluted the legacy collection from every project install. Do NOT
+# re-introduce a hardcoded literal in this position.
 if [[ "$EDITED_FILE" =~ \.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$ ]]; then
+    CODE_GRAPH_PROJECT_RESOLVED="${CODE_GRAPH_PROJECT:-${PROJECT_NAME:-$(basename "$PROJECT_ROOT")}}"
     bash "$SCRIPT_DIR/code-graph-incremental.sh" \
         "$EDITED_FILE" \
         "$PROJECT_ROOT" \
-        "ClaudeOrchestrator"
+        "$CODE_GRAPH_PROJECT_RESOLVED"
 
     _add_nudge "[Code edit reminder] $(basename "$EDITED_FILE") was just edited.
 When you're done with this work item:

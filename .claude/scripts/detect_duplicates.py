@@ -34,7 +34,7 @@ from weaviate.classes.query import Filter, MetadataQuery
 # Configuration
 WEAVIATE_URL = os.getenv("WEAVIATE_URL", "http://localhost:8081")
 GRPC_PORT = int(os.getenv("GRPC_PORT", "50052"))
-COLLECTION_NAME = os.getenv("KG_COLLECTION", "ClaudeKnowledgeGraph")
+COLLECTION_NAME = os.getenv("KG_COLLECTION", "KnowledgeGraph")
 DEFAULT_SIMILARITY_THRESHOLD = 0.95
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 

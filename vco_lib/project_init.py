@@ -3193,6 +3193,47 @@ def install_project_bundle(
                  data={"error": err})
             result["warnings"].append(f"settings.json merge failed: {err}")
 
+    # PR-7 (v0.2.11): backfill PROJECT_NAME + CODE_GRAPH_PROJECT into the
+    # project's `.claude/settings.json::env` block. Idempotent — runs on
+    # every install-bundle pass (first-install AND --update) so that
+    # pre-v0.2.11 projects pick up the keys without requiring the launcher
+    # to re-run env-write. Dry-run paths skip the write but still log the
+    # planned action via `_backfill_code_graph_project_env_in_project`'s
+    # action field (which we filter to no-op on missing/unparseable files).
+    if not dry_run:
+        try:
+            backfill = _backfill_code_graph_project_env_in_project(folder)
+            result["backfill_code_graph_project"] = backfill
+            _log("4.bundle.backfill", "ok",
+                 f"code_graph_project_env: {backfill['action']}",
+                 data=backfill)
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            _log("4.bundle.backfill", "error",
+                 f"backfill failed: {err}",
+                 data={"error": err})
+            result["warnings"].append(f"code_graph_project_env backfill failed: {err}")
+
+    # PR-7 (v0.2.11, addendum-4): backfill VS Code watcher / search /
+    # Pylance exclude blocks into the project's `.vscode/settings.json`.
+    # Without these excludes, large workspaces (>10 GB / >50k files —
+    # typical ML projects with venvs + cargo target/) OOM-kill VS Code
+    # via systemd-oomd during initial indexing. Idempotent: skipped
+    # entirely if every canonical key is already present (user-wins).
+    if not dry_run:
+        try:
+            vscode_backfill = _backfill_vscode_excludes_in_project(folder)
+            result["backfill_vscode_excludes"] = vscode_backfill
+            _log("4.bundle.vscode_excludes", "ok",
+                 f"vscode_excludes: {vscode_backfill['action']}",
+                 data=vscode_backfill)
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            _log("4.bundle.vscode_excludes", "error",
+                 f"backfill failed: {err}",
+                 data={"error": err})
+            result["warnings"].append(f"vscode_excludes backfill failed: {err}")
+
     # Project-level templates (item 7 / Obs 7, 2026-05-13). Minimal stubs
     # for CLAUDE.md, CONTEXT_STATE.md, MEMORY.md. Missing → install stub
     # as the live file; present → refresh the `.reference.md` sidecar and
@@ -3446,6 +3487,336 @@ def _smart_merge_for_bundle(user: dict, template: dict) -> dict:
             out[key] = _smart_merge_for_bundle(uval, tval)
         # else: user wins.
     return out
+
+
+def _backfill_code_graph_project_env_in_project(
+    folder: Path,
+    project_name: Optional[str] = None,
+) -> dict:
+    """Idempotent: add `PROJECT_NAME` + `CODE_GRAPH_PROJECT` to a per-project
+    `.claude/settings.json::env` block when either key is missing.
+
+    PR-7 (v0.2.11): pre-v0.2.11 the launcher wrote `KG_COLLECTION` and
+    `DEVELOPMENT_COLLECTION` into the per-project env block but omitted
+    `PROJECT_NAME` and `CODE_GRAPH_PROJECT`. The Orchestrator Project's
+    own `post-file-edit` hook then fell back to the hardcoded
+    "ClaudeOrchestrator" literal, polluting the legacy code-graph
+    collection. This helper runs during
+    `install-bundle --update` to repair existing installs in place.
+
+    Idempotency contract:
+      - Missing settings file → no-op (`action="missing"`).
+      - File unparseable JSON → no-op (`action="unparseable"`) so a hand-
+        edited file doesn't get clobbered.
+      - Missing `env` block → create it with both keys.
+      - `env` present, both keys present → no-op (`action="noop"`).
+        User-set values are preserved verbatim — this function only ADDS
+        missing keys, never overwrites.
+      - `env` present, one or both keys missing → fill in the missing
+        keys (`action="backfilled"`).
+
+    Project-name resolution (used only when the key is missing):
+      1. Explicit `project_name` argument (preferred — caller-supplied,
+         typically derived from the Rust launcher's project record).
+      2. Existing `env.KG_COLLECTION` minus the `_KnowledgeGraph` suffix
+         (matches the launcher-derived per-project basename).
+      3. Existing `env.PROJECT_NAME` (if PROJECT_NAME is present but
+         CODE_GRAPH_PROJECT is missing — sync the two).
+      4. `folder.name` as last resort, sanitized via
+         `sanitize_for_weaviate_class` for consistency with the launcher's
+         derivation rules.
+
+    Args:
+        folder: target user-project folder.
+        project_name: optional explicit project name. When None, resolved
+            via the chain above.
+
+    Returns:
+        `{"action": str, "added_keys": [str, ...], "path": str,
+          "resolved_name": str}` — `resolved_name` is the value actually
+        written for the missing key(s); empty when the action is noop.
+    """
+    settings_file = folder / ".claude" / "settings.json"
+    result: dict = {
+        "action": "missing",
+        "added_keys": [],
+        "path": str(settings_file),
+        "resolved_name": "",
+    }
+
+    if not settings_file.exists():
+        return result
+
+    try:
+        raw = settings_file.read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except (OSError, json.JSONDecodeError):
+        result["action"] = "unparseable"
+        return result
+
+    if not isinstance(data, dict):
+        result["action"] = "unparseable"
+        return result
+
+    env = data.get("env")
+    if not isinstance(env, dict):
+        env = {}
+        data["env"] = env
+        env_was_missing = True
+    else:
+        env_was_missing = False
+
+    # Resolve the name to write for any missing keys. We do this lazily so
+    # the "both keys present" path skips the resolution work entirely.
+    def _resolve_name() -> str:
+        if project_name:
+            return str(project_name)
+        kg = env.get("KG_COLLECTION") if isinstance(env, dict) else None
+        if isinstance(kg, str) and kg.endswith("_KnowledgeGraph"):
+            return kg[: -len("_KnowledgeGraph")]
+        existing_pn = env.get("PROJECT_NAME") if isinstance(env, dict) else None
+        if isinstance(existing_pn, str) and existing_pn:
+            return existing_pn
+        return sanitize_for_weaviate_class(folder.name or "")
+
+    added: list[str] = []
+    resolved = ""
+    if "PROJECT_NAME" not in env:
+        resolved = resolved or _resolve_name()
+        env["PROJECT_NAME"] = resolved
+        added.append("PROJECT_NAME")
+    if "CODE_GRAPH_PROJECT" not in env:
+        resolved = resolved or _resolve_name()
+        env["CODE_GRAPH_PROJECT"] = resolved
+        added.append("CODE_GRAPH_PROJECT")
+
+    if not added and not env_was_missing:
+        result["action"] = "noop"
+        return result
+
+    # Atomic write via tempfile + rename, mirroring `_write_file_atomic`.
+    # Soft-fail: best-effort backfill, surface error via action field
+    # rather than propagating — the rest of `install-bundle --update`
+    # must continue regardless.
+    try:
+        payload = json.dumps(data, indent=2) + "\n"
+        _write_file_atomic(settings_file, payload.encode("utf-8"))
+    except OSError as e:
+        result["action"] = f"write_failed:{type(e).__name__}"
+        return result
+
+    result["action"] = "backfilled"
+    result["added_keys"] = added
+    result["resolved_name"] = resolved
+    return result
+
+
+# ---------------------------------------------------------------------------
+# .vscode/settings.json exclude-block backfill (PR-7 / v0.2.11)
+# ---------------------------------------------------------------------------
+#
+# Forensic context (00:56 live OOM-kill incident, 2026-05-16):
+#   Opening a large workspace (>10 GB / >50k files — common for ML
+#   projects with venvs, model weights, cargo target/) in VS Code with
+#   the Pylance extension active triggered:
+#     - file watcher scanning every file under the workspace root
+#     - Pylance indexing every Python file it discovered (including
+#       .venv/lib/python3.x/site-packages which is multi-GB of stdlib
+#       wheels)
+#     - Chromium renderer holding the full DOM for the file tree
+#   Result: systemd-oomd killed VS Code's Chromium scope at 86.46%
+#   memory pressure. Reproduced across SD15 (47 GB), Claude (32 GB,
+#   76k files), VCO_dev (cargo target/ 33 GB). Local fix in each case
+#   was to add the canonical files.watcherExclude + python.analysis.*
+#   blocks. PR-7 ships those as launcher-managed defaults so every
+#   project the launcher registers (and `install-bundle --update`s)
+#   gets them automatically.
+#
+# Cross-OS notes:
+#   - JSON path patterns use forward slashes; VS Code normalizes on
+#     Windows, no per-OS branch needed.
+#   - `python.analysis.indexing: false` disables Pylance's persistent
+#     index — the in-memory analysis still works, just doesn't write
+#     a multi-GB cache under ~/.cache/. Users who want indexing back
+#     can override per-project.
+#
+# Coordination with the Rust writer:
+#   The launcher's `write_project_env_files` (Rust, at
+#   commands/projects_v2.rs:1723-1771 as of PR-7) writes ONLY the
+#   `claude-code.env` sub-object inside `.vscode/settings.json`. It
+#   does NOT touch any top-level keys (files.watcherExclude, etc.),
+#   so this Python-side helper can freely add them without conflict.
+#   PR-8 may extend the Rust writer to emit the same canonical block
+#   on first project registration — until then, the backfill helper
+#   below handles both first-install and update flows.
+
+_VSCODE_EXCLUDE_DEFAULTS: dict[str, object] = {
+    # Watcher: prevent inotify / FSEvents / ReadDirectoryChangesW from
+    # firing for these dirs. Heavy churn (cargo target/, node_modules/)
+    # otherwise saturates the watcher queue.
+    "files.watcherExclude": {
+        "**/.git/objects/**": True,
+        "**/.git/subtree-cache/**": True,
+        "**/node_modules/**": True,
+        "**/__pycache__/**": True,
+        "**/.pytest_cache/**": True,
+        "**/.ruff_cache/**": True,
+        "**/.mypy_cache/**": True,
+        "**/.venv/**": True,
+        "**/venv/**": True,
+        "**/site-packages/**": True,
+        "**/dist/**": True,
+        "**/build/**": True,
+        "**/target/**": True,
+        "**/state/**": True,
+        "**/.claude/logs/**": True,
+        "**/.claude/worktrees/**": True,
+    },
+    # File tree: hide noise from the explorer (still searchable via
+    # `search.exclude` carve-out below if user removes it).
+    "files.exclude": {
+        "**/.git": True,
+        "**/node_modules": True,
+        "**/__pycache__": True,
+        "**/.pytest_cache": True,
+        "**/.ruff_cache": True,
+        "**/.mypy_cache": True,
+        "**/.venv": True,
+        "**/dist": True,
+        "**/build": True,
+        "**/target": True,
+    },
+    # Quick-search exclude (Cmd/Ctrl+P, full-text find): skip the heavy
+    # build / cache / log dirs so search latency stays sub-second.
+    "search.exclude": {
+        "**/node_modules": True,
+        "**/__pycache__": True,
+        "**/.venv": True,
+        "**/dist": True,
+        "**/build": True,
+        "**/target": True,
+        "**/state": True,
+        "**/.claude/logs": True,
+        "**/.claude/worktrees": True,
+        "**/*.lock": True,
+    },
+    # Pylance: skip these dirs from type-analysis. Indexing OFF avoids
+    # the persistent multi-GB cache under ~/.cache.
+    "python.analysis.exclude": [
+        "**/.venv/**",
+        "**/venv/**",
+        "**/__pycache__/**",
+        "**/.pytest_cache/**",
+        "**/.mypy_cache/**",
+        "**/.claude/worktrees/**",
+    ],
+    "python.analysis.indexing": False,
+}
+
+# Keys the backfill helpers consider — exposed for tests + the
+# orchestrator-side mirror in install.py.
+_VSCODE_EXCLUDE_KEYS: tuple[str, ...] = (
+    "files.watcherExclude",
+    "files.exclude",
+    "search.exclude",
+    "python.analysis.exclude",
+    "python.analysis.indexing",
+)
+
+
+def _backfill_vscode_excludes_in_project(folder: Path) -> dict:
+    """Idempotent: add VS Code watcher/search/Pylance exclude blocks to
+    a per-project `.vscode/settings.json` when keys are missing.
+
+    PR-7 (v0.2.11): without these excludes, opening a large workspace
+    (>10 GB / >50k files — typical for ML projects with venvs, cargo
+    target/, model weights) in VS Code triggers OOM kills (verified
+    live on Claude/, SD15/, VCO_dev/ on 2026-05-16). The launcher now
+    ships the canonical exclude block as a backfill — existing projects
+    catch up on `install-bundle --update`.
+
+    Idempotency contract:
+      - Missing settings file → create it with just the exclude block
+        + a marker comment. `_template_origin: "vibecoded-orchestrator
+        v0.2.11+ — vscode-excludes backfill"` so the file is identifiable.
+      - File unparseable JSON → action="unparseable" (no-op, preserves
+        user file untouched). Hand-edited JSON with trailing commas is
+        a common case — we don't want to clobber that.
+      - Top-level key already present → user-wins, leave alone (covers
+        the "user set `files.watcherExclude: {}` to explicitly disable
+        the feature" case the addendum calls out).
+      - Top-level key missing → add it with the canonical value.
+
+    Args:
+        folder: target user-project folder.
+
+    Returns:
+        `{"action": str, "added_keys": [str, ...], "path": str}`. Action
+        is one of:
+          - "created"     — file didn't exist, written from canonical defaults
+          - "backfilled"  — file existed; added one or more missing keys
+          - "noop"        — file existed; every canonical key already present
+          - "unparseable" — file existed but couldn't be parsed; left alone
+          - "write_failed:<ErrorClass>" — atomic write raised
+    """
+    settings_file = folder / ".vscode" / "settings.json"
+    result: dict = {
+        "action": "noop",
+        "added_keys": [],
+        "path": str(settings_file),
+    }
+
+    if not settings_file.exists():
+        # Fresh write: include just the exclude block (no claude-code.env
+        # — that's the Rust launcher's responsibility on registration).
+        payload: dict = {
+            "_template_origin": (
+                "vibecoded-orchestrator v0.2.11+ — vscode-excludes backfill"
+            ),
+        }
+        for key, value in _VSCODE_EXCLUDE_DEFAULTS.items():
+            payload[key] = value
+        try:
+            settings_file.parent.mkdir(parents=True, exist_ok=True)
+            text = json.dumps(payload, indent=2) + "\n"
+            _write_file_atomic(settings_file, text.encode("utf-8"))
+        except OSError as e:
+            result["action"] = f"write_failed:{type(e).__name__}"
+            return result
+        result["action"] = "created"
+        result["added_keys"] = list(_VSCODE_EXCLUDE_DEFAULTS.keys())
+        return result
+
+    try:
+        raw = settings_file.read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except (OSError, json.JSONDecodeError):
+        result["action"] = "unparseable"
+        return result
+
+    if not isinstance(data, dict):
+        result["action"] = "unparseable"
+        return result
+
+    added: list[str] = []
+    for key, value in _VSCODE_EXCLUDE_DEFAULTS.items():
+        if key not in data:
+            data[key] = value
+            added.append(key)
+
+    if not added:
+        return result  # action stays "noop"
+
+    try:
+        payload_text = json.dumps(data, indent=2) + "\n"
+        _write_file_atomic(settings_file, payload_text.encode("utf-8"))
+    except OSError as e:
+        result["action"] = f"write_failed:{type(e).__name__}"
+        return result
+
+    result["action"] = "backfilled"
+    result["added_keys"] = added
+    return result
 
 
 def _merge_hooks_for_bundle(user_hooks: dict, template_hooks: dict) -> dict:

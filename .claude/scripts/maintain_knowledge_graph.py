@@ -40,7 +40,11 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "qwen3-embedding:0.6b")
 GRPC_PORT = int(os.getenv("GRPC_PORT", "50052"))
 
 KNOWLEDGE_ROOT = PROJECT_ROOT / "knowledge"
-KNOWLEDGE_COLLECTION = "ClaudeKnowledgeGraph"
+# PR-7 (v0.2.11): respect per-project KG_COLLECTION env. Pre-v0.2.11 this was
+# hardcoded "ClaudeKnowledgeGraph", which made every project's maintain run
+# query the legacy cross-project collection. Fallback is project-neutral
+# "KnowledgeGraph" (matches install.py's _configure_claude_settings default).
+KNOWLEDGE_COLLECTION = os.getenv("KG_COLLECTION", "KnowledgeGraph")
 DOCUMENTS_COLLECTION = "DocumentChunks"
 
 
