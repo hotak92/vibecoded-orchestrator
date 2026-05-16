@@ -1628,40 +1628,6 @@ def _dir_size_human(path: str) -> str:
         return "(size unavailable)"
 
 
-def _resolve_launcher_binary_for_storage(install_root: Path) -> Path | None:
-    """Locate the bundled launcher binary for shell-out persistence.
-
-    Mirrors the convention used by `_resolve_vendored_lean_ctx` —
-    `launcher/dist/<arch>/vct-launcher[.exe]`. Returns None when no
-    binary is present (fresh source-tree install, dev builds without a
-    bundled binary). The caller falls back to a direct Python write of
-    `~/.vct/storage.toml` in that case.
-
-    Group B's PR-23 introduces a richer 4-tier resolver
-    (`_resolve_launcher_binary`) that probes additional locations
-    (`~/.cargo/bin`, repo `target/`, etc.). When that lands, this
-    minimal helper can be replaced — or kept as the install-time
-    fallback. The two are intentionally independent so PR-28 lands
-    without depending on Group B's merge timing.
-    """
-    os_name = platform.system()
-    if os_name == "Windows":
-        arch_dir = "windows-x64"
-        bin_name = "vct-launcher.exe"
-    elif os_name == "Darwin":
-        arch_dir = "experimental_macOS"
-        bin_name = "vct-launcher"
-    elif os_name == "Linux":
-        arch_dir = "linux-x64"
-        bin_name = "vct-launcher"
-    else:
-        return None
-    candidate = install_root / "launcher" / "dist" / arch_dir / bin_name
-    if candidate.is_file():
-        return candidate
-    return None
-
-
 def _vct_state_dir() -> Path:
     """Resolve `~/.vct/` honouring VCT_STATE_DIR (mirrors the Rust path
     resolver in `launcher/src-tauri/src/paths.rs::vct_root_dir`). The
@@ -1794,7 +1760,12 @@ def _persist_storage_choice(choice: dict, install_root: Path) -> str:
     if choice.get("mode") == "deferred":
         return "deferred"
 
-    binary = _resolve_launcher_binary_for_storage(install_root)
+    # Storage-config is an interactive prompt context: skip tiers 2-3
+    # (GitHub download, cargo rebuild) so we never block the user mid-
+    # prompt. Falls back to _write_storage_toml_direct when no bundled
+    # binary is on disk. PR-36 unified this with the MCP-registration
+    # resolver — see `_ensure_launcher_binary`.
+    binary = _ensure_launcher_binary(install_root, prefer_only_bundled=True)
     if binary is not None:
         cmd: list[str] = [str(binary), "--set-storage-config", choice["mode"]]
         for service, path in (choice.get("bind_paths") or {}).items():
@@ -7777,7 +7748,11 @@ def _try_cargo_tauri_build(install_root: Path) -> Optional[Path]:
     return target_path if target_path.is_file() else None
 
 
-def _ensure_launcher_binary(install_root: Path) -> Optional[Path]:
+def _ensure_launcher_binary(
+    install_root: Path,
+    *,
+    prefer_only_bundled: bool = False,
+) -> Optional[Path]:
     """Resolve launcher binary path via 4-tier priority.
 
     1. Bundled binary at launcher/dist/<os>-<arch>/vct-launcher[.exe]
@@ -7788,11 +7763,30 @@ def _ensure_launcher_binary(install_root: Path) -> Optional[Path]:
 
     Soft-fail at every step. Prints progress messages so the user sees
     what's happening without needing to read this code.
+
+    Args:
+        install_root: Repository root containing `launcher/dist/...`.
+        prefer_only_bundled: When True, perform only Tier 1 (bundled
+            binary lookup) and skip Tiers 2-3. Used by latency-sensitive
+            interactive contexts (e.g. PR-28's storage-config prompt)
+            where a 15-25 min cargo rebuild or a multi-second GitHub
+            download would mid-prompt confuse the user. Caller is
+            expected to have a pure-Python fallback when None is
+            returned. Default False preserves the original full chain
+            behaviour for MCP registration.
     """
     # Tier 1: bundled.
     p = _try_bundled_launcher_binary(install_root)
     if p is not None:
         return p
+
+    if prefer_only_bundled:
+        # Interactive fast-path callers do NOT want tiers 2-3 (network
+        # download or cargo rebuild are too slow for an interactive
+        # prompt context). Bail out so the caller's Python fallback
+        # runs immediately.
+        return None
+
     print(
         f"  Launcher binary not found at "
         f"launcher/dist/{_launcher_binary_relative_path()[0]}/."

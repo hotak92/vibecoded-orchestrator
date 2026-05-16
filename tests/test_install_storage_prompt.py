@@ -33,8 +33,8 @@ from install import (
     _LEGACY_VOLUME_PROBES,
     _detect_legacy_volume_paths,
     _dir_size_human,
+    _ensure_launcher_binary,
     _prompt_storage_location,
-    _resolve_launcher_binary_for_storage,
     _vct_state_dir,
     _write_storage_toml_direct,
 )
@@ -386,13 +386,20 @@ def test_vct_state_dir_unset_env_defaults_to_dot_vct(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# _resolve_launcher_binary_for_storage
+# Launcher-binary resolution for the storage prompt (PR-36 unified path)
+#
+# PR-28 originally shipped a `_resolve_launcher_binary_for_storage` stub that
+# only did tier 1 (bundled-binary lookup). PR-36 collapsed that into the
+# shared `_ensure_launcher_binary(install_root, prefer_only_bundled=True)`
+# resolver. The "only-bundled" flag preserves PR-28's UX intent: storage
+# config is set during an interactive prompt, so tiers 2-3 (GitHub download,
+# cargo rebuild) MUST stay skipped to avoid a multi-minute pause mid-prompt.
 # ---------------------------------------------------------------------------
 
 
 def test_resolve_launcher_binary_returns_none_when_absent(tmp_path: Path):
     """Fresh source tree without launcher/dist/ → None (fallback path used)."""
-    assert _resolve_launcher_binary_for_storage(tmp_path) is None
+    assert _ensure_launcher_binary(tmp_path, prefer_only_bundled=True) is None
 
 
 def test_resolve_launcher_binary_finds_existing_binary(tmp_path: Path, monkeypatch):
@@ -418,8 +425,41 @@ def test_resolve_launcher_binary_finds_existing_binary(tmp_path: Path, monkeypat
     if os_name != "Windows":
         target.chmod(0o755)
 
-    resolved = _resolve_launcher_binary_for_storage(tmp_path)
+    resolved = _ensure_launcher_binary(tmp_path, prefer_only_bundled=True)
     assert resolved == target
+
+
+def test_resolve_launcher_binary_storage_path_never_invokes_tiers_2_or_3(
+    tmp_path: Path, monkeypatch
+):
+    """UX contract: storage-config callers MUST NOT trigger tier 2 (GitHub
+    download) or tier 3 (cargo rebuild) even when bundled binary is absent.
+
+    A 15-25 min cargo rebuild triggered mid-prompt would be a terrible UX.
+    PR-28's original `_resolve_launcher_binary_for_storage` stub enforced
+    this by only implementing tier 1; PR-36 preserves the behaviour via
+    `prefer_only_bundled=True`. Regression-guards the contract by patching
+    the tier-2/tier-3 helpers and asserting they're never called.
+    """
+    import install as _install
+
+    called = {"download": 0, "cargo": 0}
+
+    def fake_download(_root):
+        called["download"] += 1
+        return None
+
+    def fake_cargo(_root):
+        called["cargo"] += 1
+        return None
+
+    monkeypatch.setattr(_install, "_try_download_launcher_binary", fake_download)
+    monkeypatch.setattr(_install, "_try_cargo_tauri_build", fake_cargo)
+
+    # No bundled binary on disk → must return None WITHOUT touching tiers 2-3.
+    result = _ensure_launcher_binary(tmp_path, prefer_only_bundled=True)
+    assert result is None
+    assert called == {"download": 0, "cargo": 0}
 
 
 # ---------------------------------------------------------------------------
