@@ -22,7 +22,7 @@ GRPC_PORT = int(os.getenv("GRPC_PORT", "50052"))
 # different KG_COLLECTION. The hardcoded fallback kept it from breaking
 # the orchestrator outright but silently broke every other project's
 # kg-info CLI.
-KG_COLLECTION = os.getenv("KG_COLLECTION", "ClaudeKnowledgeGraph")
+KG_COLLECTION = os.getenv("KG_COLLECTION", "KnowledgeGraph")
 SHARED_KG_COLLECTION = os.getenv("SHARED_KG_COLLECTION", "")
 
 # P1-D (2026-05-08): centralized access-matrix helper. Resolved via

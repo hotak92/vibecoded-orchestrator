@@ -48,7 +48,7 @@ WEAVIATE_URL = os.getenv("WEAVIATE_URL", "http://localhost:8081")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11435")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "qwen3-embedding:0.6b")
 GRPC_PORT = int(os.getenv("GRPC_PORT", "50052"))
-COLLECTION_NAME = os.getenv("KG_COLLECTION", "ClaudeKnowledgeGraph")
+COLLECTION_NAME = os.getenv("KG_COLLECTION", "KnowledgeGraph")
 DUAL_EMBEDDING_ENABLED = os.getenv("DUAL_EMBEDDING_ENABLED", "true").lower() == "true"
 
 # Chunking configuration for embedding limits
@@ -464,7 +464,8 @@ def parse_markdown_node(content: str, file_path: Path) -> Dict:
 
 def ensure_collection_exists(server: WeaviateMCPServer) -> bool:
     """
-    Ensure ClaudeKnowledgeGraph collection exists with proper schema
+    Ensure the project's KG_COLLECTION (env-resolved, fallback "KnowledgeGraph")
+    exists with proper schema
 
     Args:
         server: Weaviate MCP server instance

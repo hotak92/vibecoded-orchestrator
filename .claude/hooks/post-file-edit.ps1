@@ -109,11 +109,22 @@ if ($EditedFile.StartsWith($DocsDir, [StringComparison]::OrdinalIgnoreCase) -and
 }
 
 # 3. Code file changes: code graph incremental update + LLM nudge.
+# Resolve project name from env (PR-7 / v0.2.11): $env:CODE_GRAPH_PROJECT
+# is the canonical key set by the launcher's settings.json env block;
+# $env:PROJECT_NAME is the historical fallback; basename of the repo
+# root is the last resort. Mirrors the .sh sibling at the same line +
+# the code-graph-incremental.ps1 fallback at line 31. The pre-v0.2.11
+# behaviour hardcoded "ClaudeOrchestrator" here, which polluted the
+# legacy collection from every project install. Do NOT re-introduce a
+# hardcoded literal in this position.
 if ($EditedFile -match '\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$') {
     $bn = Split-Path $EditedFile -Leaf
     $cgIncPs1 = Join-Path $ScriptDir "code-graph-incremental.ps1"
     if (Test-Path $cgIncPs1) {
-        & pwsh -NoProfile -File $cgIncPs1 $EditedFile $ProjectRoot "ClaudeOrchestrator"
+        $codeGraphProject = if ($env:CODE_GRAPH_PROJECT) { $env:CODE_GRAPH_PROJECT } `
+            elseif ($env:PROJECT_NAME) { $env:PROJECT_NAME } `
+            else { Split-Path $ProjectRoot -Leaf }
+        & pwsh -NoProfile -File $cgIncPs1 $EditedFile $ProjectRoot $codeGraphProject
     }
     Add-Nudge "[Code edit reminder] $bn was just edited.`nWhen you're done with this work item:`n- Update CONTEXT_STATE.md with what changed and what's next.`n- Capture any non-obvious learnings as a KG node under knowledge/concepts/."
 }

@@ -22,7 +22,7 @@ WEAVIATE_URL = os.getenv("WEAVIATE_URL", "http://localhost:8081")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11435")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "qwen3-embedding:0.6b")
 GRPC_PORT = int(os.getenv("GRPC_PORT", "50052"))
-KG_COLLECTION = os.getenv("KG_COLLECTION", "ClaudeKnowledgeGraph")
+KG_COLLECTION = os.getenv("KG_COLLECTION", "KnowledgeGraph")
 SHARED_KG_COLLECTION = os.getenv("SHARED_KG_COLLECTION", "")
 DUAL_EMBEDDING_ENABLED = os.getenv("DUAL_EMBEDDING_ENABLED", "true").lower() == "true"
 

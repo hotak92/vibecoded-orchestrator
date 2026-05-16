@@ -5,12 +5,11 @@
 //!
 //! ## Why this is a separate module
 //!
-//! There are two on-disk secret stores the user accumulated before the
-//! keychain became the system of record:
+//! There are two on-disk secret stores users may have accumulated before
+//! the keychain became the system of record:
 //!
-//!   1. Project .env files at the canonical Claude project root
-//!      (`/home/martino/Desktop/PROGETTI/Claude/.env` and `.env copy`).
-//!      Lines like `GITHUB_TOKEN=ghp_…`.
+//!   1. Project `.env` files at registered project roots (and a sibling
+//!      `.env copy` if present). Lines like `GITHUB_TOKEN=ghp_…`.
 //!   2. Per-key files under `~/.vct-secrets/shared/<key>` — one filename
 //!      per secret, contents are the value.
 //!
@@ -51,15 +50,14 @@
 //!
 //! ## Cross-OS
 //!
-//! The Claude `.env` path allowlist is **Linux-specific** — the user's
-//! machine layout has these at fixed absolute paths under
-//! `/home/martino/Desktop/PROGETTI/Claude/`. On macOS / Windows the
-//! .env enumeration step returns an empty list. The `~/.vct-secrets/shared/`
-//! path resolution uses `$HOME` (Unix) / `%USERPROFILE%` (Windows) so
-//! it works everywhere a home directory environment variable exists.
-//! Out-of-scope for this PR: making the .env
-//! allowlist configurable per-user / per-OS — Windows/macOS users can
-//! continue to use `set_secret_v2` directly.
+//! As of PR-7 (v0.2.11), the `.env` allowlist is derived from the
+//! `projects` table — one entry per registered project's `.env` and
+//! `.env.local` (when present). The same code path runs on Linux,
+//! macOS, and Windows; there are no `#[cfg(target_os)]` branches.
+//! Empty DB → empty allowlist → enumeration returns nothing (clean
+//! soft-fail). The `~/.vct-secrets/shared/` resolution uses `$HOME`
+//! (Unix) / `%USERPROFILE%` (Windows) and works everywhere a home
+//! directory environment variable exists.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -99,24 +97,56 @@ pub struct ImportableSecretKey {
     pub already_in_keychain: bool,
 }
 
-/// Canonical Linux paths where the user's Claude project .env files
-/// live. The allowlist is intentionally narrow: only these two paths
-/// are ever opened by `list_importable_secret_keys`. Other paths are
-/// rejected.
-#[cfg(target_os = "linux")]
-fn env_file_allowlist() -> Vec<PathBuf> {
-    vec![
-        PathBuf::from("/home/martino/Desktop/PROGETTI/Claude/.env"),
-        PathBuf::from("/home/martino/Desktop/PROGETTI/Claude/.env copy"),
-    ]
-}
+/// Cross-OS .env-file allowlist derived from registered projects.
+///
+/// PR-7 (v0.2.11): pre-v0.2.11 this function returned a hardcoded list
+/// of paths specific to one developer's machine, gated by
+/// `#[cfg(target_os = "linux")]`. That meant:
+///   - macOS / Windows users got an empty allowlist → no .env import.
+///   - Linux users with projects at any OTHER path also got no .env
+///     import (the hardcoded paths weren't theirs).
+///   - When this codebase ships as the public VCO release, every fresh
+///     install on every machine would inherit the same dead paths.
+///
+/// We now enumerate `<project_folder>/.env` and `<project_folder>/.env.local`
+/// for every project the launcher has in its DB. The DB is the same source
+/// of truth the SecretsPanel + ProjectsList read from, so the allowlist
+/// stays in sync with the user's actual project set without any
+/// per-OS branches.
+///
+/// Failure modes:
+///   - DB read failure → empty allowlist (logged via tracing). The
+///     SecretsPanel's `list_importable_secret_keys` then returns only
+///     entries from `~/.vct-secrets/shared/`. The user's import flow
+///     degrades gracefully rather than hard-failing.
+///   - Project with a missing / non-file `folder_path` → silently
+///     skipped during enumeration in `list_importable_secret_keys`
+///     (we keep the path in the allowlist so a freshly-created `.env`
+///     becomes immediately importable without re-querying the DB).
+fn env_file_allowlist(db: &Db) -> Vec<PathBuf> {
+    let projects = match db.list_projects() {
+        Ok(v) => v,
+        Err(e) => {
+            // Soft-fail: degraded mode (no .env import) is preferable to
+            // panicking the SecretsPanel. `~/.vct-secrets/shared/` is
+            // still enumerated by the caller, so most users keep an
+            // import surface.
+            eprintln!(
+                "env_file_allowlist: db.list_projects failed: {} \
+                 (.env import surface degraded — keychain shared/ unaffected)",
+                e
+            );
+            return Vec::new();
+        }
+    };
 
-#[cfg(not(target_os = "linux"))]
-fn env_file_allowlist() -> Vec<PathBuf> {
-    // macOS / Windows users don't have the Linux-specific Claude path
-    // hardcoded in this PR. They can use `set_secret_v2` directly until
-    // we wire up a configurable allowlist.
-    Vec::new()
+    let mut out: Vec<PathBuf> = Vec::with_capacity(projects.len() * 2);
+    for p in projects {
+        let folder = PathBuf::from(&p.folder_path);
+        out.push(folder.join(".env"));
+        out.push(folder.join(".env.local"));
+    }
+    out
 }
 
 /// Resolve the `~/.vct-secrets/shared/` directory in a cross-OS way.
@@ -144,14 +174,13 @@ fn vct_secrets_shared_dir() -> Option<PathBuf> {
 pub async fn list_importable_secret_keys(
     db: State<'_, Db>,
 ) -> Result<Vec<ImportableSecretKey>, String> {
-    let _ = db; // db is reserved for future audit logging of enumeration
-                // calls; not used today because enumeration is read-only
-                // and reveals no value content.
-
+    // PR-7 (v0.2.11): the .env allowlist is now project-discovery-driven
+    // (was a hardcoded list of one developer's machine paths). `db` is the
+    // source of truth — same DB the SecretsPanel + ProjectsList read.
     let mut rows: Vec<ImportableSecretKey> = Vec::new();
 
-    // -- 1. .env files (Linux-only allowlist) --
-    for path in env_file_allowlist() {
+    // -- 1. .env files (cross-OS, per-project allowlist) --
+    for path in env_file_allowlist(db.inner()) {
         if !path.is_file() {
             continue;
         }
@@ -241,7 +270,7 @@ pub async fn register_secret_from_source(
     //    recompute on every call (rather than caching) so a source that
     //    was enumerable a minute ago but isn't anymore (file deleted,
     //    perms changed) fails closed.
-    let enumerated = build_source_allowlist();
+    let enumerated = build_source_allowlist(db.inner());
     if !enumerated.iter().any(|s| s == &source) {
         // Don't leak which sources WERE enumerated — that's still
         // informational about the user's machine layout. Generic msg.
@@ -345,10 +374,13 @@ fn parse_source_descriptor(source: &str) -> Result<(PathBuf, SourceStrategy), St
 /// would emit. Used to validate `register_secret_from_source`'s `source`
 /// argument. Diverges from the enumerator only in that we don't compute
 /// `already_in_keychain` (irrelevant for validation).
-fn build_source_allowlist() -> Vec<String> {
+///
+/// PR-7 (v0.2.11): takes `db` to enumerate per-project .env files via
+/// `env_file_allowlist`. Caller passes `State::<Db>::inner()`.
+fn build_source_allowlist(db: &Db) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
 
-    for path in env_file_allowlist() {
+    for path in env_file_allowlist(db) {
         if path.is_file() {
             for key in parse_env_file_keys(&path) {
                 let _ = key; // keys aren't part of the descriptor
@@ -653,14 +685,138 @@ mod tests {
     /// plumbing), so we exercise the allowlist check directly.
     #[test]
     fn source_allowlist_rejects_arbitrary_paths() {
-        let allow = build_source_allowlist();
+        let db = Db::open_in_memory().expect("in-memory db");
+        let allow = build_source_allowlist(&db);
         // Caller-crafted source pointing at /etc/passwd. Must not appear.
         let evil = "env_file:/etc/passwd".to_string();
         assert!(!allow.contains(&evil));
         // Caller-crafted source with traversal. Must not appear.
-        let traversal = "vct_secrets_shared:/home/martino/.vct-secrets/shared/../../../etc/shadow"
+        let traversal = "vct_secrets_shared:/tmp/fake/.vct-secrets/shared/../../../etc/shadow"
             .to_string();
         assert!(!allow.contains(&traversal));
+    }
+
+    /// PR-7 (v0.2.11): the .env allowlist is derived from the projects
+    /// table, not a hardcoded list. An empty DB yields an empty .env
+    /// allowlist; registering a project adds its `.env` and `.env.local`
+    /// paths. Cross-OS: no `#[cfg(target_os)]` branches; the same logic
+    /// runs on Linux / macOS / Windows.
+    #[test]
+    fn env_allowlist_is_db_driven_empty_db() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        let allow = env_file_allowlist(&db);
+        assert!(
+            allow.is_empty(),
+            "empty DB → empty allowlist; got {:?}",
+            allow
+        );
+    }
+
+    /// Registering a project yields exactly `.env` and `.env.local` under
+    /// its folder. The files don't need to exist for the path to be in
+    /// the allowlist — caller-side `path.is_file()` gate filters absent
+    /// files at enumeration time.
+    #[test]
+    fn env_allowlist_includes_registered_project_env_files() {
+        use crate::db::models::ProjectHost;
+        let db = Db::open_in_memory().expect("in-memory db");
+        let folder = tmp(); // unique tempdir
+        let slug = db.generate_unique_slug("alpha").unwrap();
+        db.insert_project(
+            "p-alpha",
+            "alpha",
+            folder.to_str().unwrap(),
+            ProjectHost::Base,
+            &slug,
+        )
+        .unwrap();
+
+        let allow = env_file_allowlist(&db);
+        assert!(
+            allow.contains(&folder.join(".env")),
+            "allowlist missing {}/.env; got {:?}",
+            folder.display(),
+            allow
+        );
+        assert!(
+            allow.contains(&folder.join(".env.local")),
+            "allowlist missing {}/.env.local; got {:?}",
+            folder.display(),
+            allow
+        );
+        // Exactly two entries per project.
+        assert_eq!(allow.len(), 2);
+        fs::remove_dir_all(&folder).ok();
+    }
+
+    /// Two projects → four entries (`.env` + `.env.local` × 2). Order is
+    /// stable: list_projects orders by name ASC, so we emit folder paths
+    /// in the same order.
+    #[test]
+    fn env_allowlist_enumerates_multiple_projects() {
+        use crate::db::models::ProjectHost;
+        let db = Db::open_in_memory().expect("in-memory db");
+        let f_alpha = tmp();
+        let f_beta = tmp();
+        let s1 = db.generate_unique_slug("alpha").unwrap();
+        let s2 = db.generate_unique_slug("beta").unwrap();
+        db.insert_project(
+            "p-alpha",
+            "alpha",
+            f_alpha.to_str().unwrap(),
+            ProjectHost::Base,
+            &s1,
+        )
+        .unwrap();
+        db.insert_project(
+            "p-beta",
+            "beta",
+            f_beta.to_str().unwrap(),
+            ProjectHost::Base,
+            &s2,
+        )
+        .unwrap();
+
+        let allow = env_file_allowlist(&db);
+        assert_eq!(allow.len(), 4, "got {:?}", allow);
+        assert!(allow.contains(&f_alpha.join(".env")));
+        assert!(allow.contains(&f_alpha.join(".env.local")));
+        assert!(allow.contains(&f_beta.join(".env")));
+        assert!(allow.contains(&f_beta.join(".env.local")));
+        fs::remove_dir_all(&f_alpha).ok();
+        fs::remove_dir_all(&f_beta).ok();
+    }
+
+    /// build_source_allowlist excludes per-project .env entries that
+    /// don't exist on disk (because parse_env_file_keys returns []).
+    /// This is the gate that protects `register_secret_from_source` from
+    /// caller-crafted sources to files that aren't actually project envs.
+    #[test]
+    fn build_source_allowlist_skips_nonexistent_env_files() {
+        use crate::db::models::ProjectHost;
+        let db = Db::open_in_memory().expect("in-memory db");
+        let folder = tmp();
+        let slug = db.generate_unique_slug("alpha").unwrap();
+        db.insert_project(
+            "p-alpha",
+            "alpha",
+            folder.to_str().unwrap(),
+            ProjectHost::Base,
+            &slug,
+        )
+        .unwrap();
+
+        // No .env / .env.local written → build_source_allowlist emits
+        // zero `env_file:` entries for this project.
+        let sources = build_source_allowlist(&db);
+        for s in &sources {
+            assert!(
+                !s.starts_with(&format!("env_file:{}", folder.display())),
+                "nonexistent env file leaked into allowlist: {}",
+                s
+            );
+        }
+        fs::remove_dir_all(&folder).ok();
     }
 
     /// Synthesize a fake ~/.vct-secrets/shared/-style directory and
