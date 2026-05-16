@@ -24,5 +24,6 @@ pub mod runtime_install;
 pub mod secrets_cmd;
 pub mod secrets_import;
 pub mod self_update;
+pub mod storage_ux;
 pub mod telemetry_cmd;
 pub mod volumes;

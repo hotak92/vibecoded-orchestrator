@@ -360,6 +360,24 @@
       </div>
     </section>
 
+    <!-- PR-10A storage UX: deep link to the per-service storage picker. -->
+    <section class="pr-section">
+      <h2 class="pr-section-title">Storage</h2>
+      <div class="pr-onboarding-row">
+        <div class="pr-onboarding-text">
+          <strong>Container data location</strong>
+          <span class="pr-onboarding-hint">
+            Choose named volumes (recommended) or a custom bind path for
+            Weaviate, Ollama, and code-embed data. Pre-existing volumes
+            from earlier installs can be reused in place.
+          </span>
+        </div>
+        <button class="pr-btn" onclick={() => goto('/preferences/storage')}>
+          Open
+        </button>
+      </div>
+    </section>
+
     <section class="pr-section">
       <h2 class="pr-section-title">GitHub access token</h2>
       <div class="pr-pat-row">
