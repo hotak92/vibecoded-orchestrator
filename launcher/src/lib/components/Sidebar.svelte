@@ -31,6 +31,9 @@
   };
 
   const projectId = $derived($selectedProject?.id ?? null);
+  // PR-5 (v0.2.11): show an [ORCHESTRATOR] chip in the sidebar header
+  // when the currently selected project is the Orchestrator Project.
+  const isOrchestratorSelected = $derived($selectedProject?.host === 'orchestrator_root');
   // Server-classified admin tier unlocks the Admin sidebar group with
   // dev-only routes. The check is on the cached tier string — patching
   // this client-side reveals the routes but not the server-gated
@@ -213,6 +216,11 @@
 </script>
 
 <aside class="sidebar">
+  {#if isOrchestratorSelected}
+    <div class="sidebar-orch-header" aria-label="Orchestrator Project active">
+      <span class="sidebar-orch-chip">ORCHESTRATOR</span>
+    </div>
+  {/if}
   <nav class="sidebar-nav">
     {#each groups as group}
       <div class="group">
@@ -251,6 +259,25 @@
     border-right: 1px solid rgba(255, 255, 255, 0.04);
     overflow-y: auto;
     padding: 16px 8px;
+  }
+
+  /* PR-5 (v0.2.11): orchestrator indicator at the top of the sidebar. */
+  .sidebar-orch-header {
+    padding: 6px 10px 4px;
+    margin-bottom: 4px;
+  }
+  .sidebar-orch-chip {
+    display: inline-block;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    padding: 2px 7px;
+    border-radius: 4px;
+    background: rgba(0, 191, 166, 0.12);
+    color: var(--color-teal, #00bfa6);
+    border: 1px solid rgba(0, 191, 166, 0.30);
+    line-height: 1.5;
   }
 
   .sidebar-nav {

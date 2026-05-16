@@ -258,6 +258,17 @@
   // panel that contains a CTA inside) as confusing.
   const hasNoProjects = $derived(!pState.loading && pState.projects.length === 0);
 
+  // PR-5 (v0.2.11): the Orchestrator Project always appears first.
+  // Sort: orchestrator_root row pinned to index 0, all others follow in
+  // their original order (insertion order from the DB).
+  const sortedProjects = $derived(
+    [...pState.projects].sort((a, b) => {
+      const aRoot = a.host === 'orchestrator_root' ? 0 : 1;
+      const bRoot = b.host === 'orchestrator_root' ? 0 : 1;
+      return aRoot - bRoot;
+    })
+  );
+
   onMount(() => {
     projects.load();
   });
@@ -433,7 +444,8 @@
         </div>
       {:else}
         <div class="panel-list">
-          {#each pState.projects as p (p.id)}
+          {#each sortedProjects as p (p.id)}
+            {@const isOrchestratorRoot = p.host === 'orchestrator_root'}
             <div
               class="panel-row"
               class:active={current?.id === p.id}
@@ -453,25 +465,30 @@
                   <span class="row-top">
                     <span class="row-dot" style:background={projectColor(p.id)} aria-hidden="true"></span>
                     <span class="row-name">{p.name}</span>
+                    {#if isOrchestratorRoot}
+                      <span class="row-orch-badge" aria-label="Orchestrator Project">ORCHESTRATOR</span>
+                    {/if}
                   </span>
                   <span class="row-meta">
                     <span class="row-host">{p.host}</span>
                     <span class="row-count">{p.module_count} module{p.module_count !== 1 ? 's' : ''}</span>
                   </span>
                 </button>
-                <div class="row-actions">
-                  <button class="row-action" title="Rename" onclick={() => startRename(p)}>
-                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                      <path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4z"/>
-                    </svg>
-                  </button>
-                  <button class="row-action row-action-danger" title="Delete" onclick={() => startDelete(p)}>
-                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                      <polyline points="3 6 5 6 21 6"/>
-                      <path d="M19 6l-2 14a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L5 6"/>
-                    </svg>
-                  </button>
-                </div>
+                {#if !isOrchestratorRoot}
+                  <div class="row-actions">
+                    <button class="row-action" title="Rename" onclick={() => startRename(p)}>
+                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4z"/>
+                      </svg>
+                    </button>
+                    <button class="row-action row-action-danger" title="Delete" onclick={() => startDelete(p)}>
+                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <polyline points="3 6 5 6 21 6"/>
+                        <path d="M19 6l-2 14a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L5 6"/>
+                      </svg>
+                    </button>
+                  </div>
+                {/if}
               {/if}
             </div>
           {/each}
@@ -899,6 +916,22 @@
   .row-name {
     font-size: 13px;
     font-weight: 600;
+  }
+
+  /* PR-5 (v0.2.11): teal "ORCHESTRATOR" badge on the Orchestrator Project row. */
+  .row-orch-badge {
+    display: inline-block;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    padding: 1px 5px;
+    border-radius: 3px;
+    background: rgba(0, 191, 166, 0.15);
+    color: var(--color-teal, #00bfa6);
+    border: 1px solid rgba(0, 191, 166, 0.35);
+    line-height: 1.4;
+    flex-shrink: 0;
   }
 
   .row-meta {

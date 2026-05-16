@@ -36,12 +36,56 @@
     UpdateProjectIdentityResult,
   } from '$lib/types/identity';
 
+  // PR-5 (v0.2.11): OrchestratorRootView type mirror (from orchestrator_root.rs).
+  interface OrchestratorRootView {
+    id: string | null;
+    name: string;
+    version: string;
+    folder_path: string;
+    is_registered: boolean;
+    is_present: boolean;
+  }
+
   let { projectId }: { projectId: string } = $props();
 
   let identity = $state<ProjectIdentity | null>(null);
   let loading = $state(true);
   let saving = $state(false);
   let redetecting = $state(false);
+
+  // PR-5 (v0.2.11): fetch the orchestrator root view to display the
+  // shared KG collection name for non-root projects.
+  let orchestratorRootView = $state<OrchestratorRootView | null>(null);
+
+  /**
+   * Client-side mirror of Rust's `sanitize_kg_collection`.
+   * Converts a display name to the PascalCase prefix Weaviate uses.
+   * "VibeCoded Orchestrator" → "VibeCodedOrchestrator"
+   */
+  function sanitizeKgCollection(name: string): string {
+    let out = '';
+    let nextUpper = true;
+    for (const ch of name) {
+      if (/[a-zA-Z0-9]/.test(ch)) {
+        out += nextUpper ? ch.toUpperCase() : ch;
+        nextUpper = false;
+      } else {
+        nextUpper = true;
+      }
+    }
+    if (!out) return 'Project';
+    if (/[0-9]/.test(out[0])) out = 'P' + out;
+    return out;
+  }
+
+  // Derived: the shared KG collection name. When the orchestratorRootView
+  // is available, compute it from the root's name. Otherwise falls back
+  // to the canonical default ("VibeCodedOrchestrator_KnowledgeGraph").
+  const sharedKgName = $derived(
+    orchestratorRootView
+      ? `${sanitizeKgCollection(orchestratorRootView.name)}_KnowledgeGraph`
+      : 'VibeCodedOrchestrator_KnowledgeGraph'
+  );
 
   // PR-8: manual entry point for the legacy-collections cleanup, gated to
   // the orchestrator-root tab only (per the brief's C.3 — "separate
@@ -76,6 +120,14 @@
       toast.error(e);
     } finally {
       loading = false;
+    }
+    // PR-5 (v0.2.11): fetch the orchestrator root view to show shared KG
+    // info. Non-fatal — if it fails we just show the canonical default.
+    try {
+      const view = await invoke<OrchestratorRootView | null>('get_orchestrator_root_view');
+      orchestratorRootView = view ?? null;
+    } catch {
+      orchestratorRootView = null;
     }
   }
 
@@ -305,6 +357,37 @@
       </div>
     </div>
 
+    <!-- PR-5 (v0.2.11): Shared KG section — readonly informational card. -->
+    <div class="ps-section ps-section-shared-kg">
+      <h4>Shared KG</h4>
+      {#if identity.is_orchestrator_root}
+        <p class="ps-form-hint ps-shared-kg-text">
+          This project's primary KG binding is the <strong>shared KG</strong>
+          for every other project on this machine. Other projects derive
+          <code>SHARED_KG_COLLECTION</code> from this binding.
+        </p>
+        <p class="ps-form-hint ps-shared-kg-collection">
+          Current shared KG collection:
+          <code>{sharedKgName}</code>
+        </p>
+      {:else}
+        <p class="ps-form-hint ps-shared-kg-text">
+          Shared KG collection derived from the Orchestrator Project's
+          primary KG binding:
+        </p>
+        <p class="ps-form-hint ps-shared-kg-collection">
+          <code>{sharedKgName}</code>
+        </p>
+        {#if !orchestratorRootView?.is_registered}
+          <p class="ps-form-hint ps-shared-kg-warn">
+            No Orchestrator Project detected — shared KG name is the
+            canonical default. Register an orchestrator clone to set a
+            custom shared KG.
+          </p>
+        {/if}
+      {/if}
+    </div>
+
     <!-- PR-8 (v0.2.11): orchestrator-root only — manual entry for the
          legacy code-graph collection cleanup. The auto-detect / one-shot
          banner is wired in `+layout.svelte`; this button re-opens the
@@ -515,4 +598,32 @@
      because the label reads "Orchestrator Root"). */
   .host-orchestrator { background: rgba(0,191,166,0.22); color: #0fc; border: 1px solid rgba(0,191,166,0.4); }
   .host-other { background: rgba(255,255,255,0.10); color: #ccc; }
+
+  /* PR-5 (v0.2.11): Shared KG informational card. */
+  .ps-section-shared-kg {
+    border-left: 3px solid rgba(0,191,166,0.30);
+  }
+  .ps-section-shared-kg h4 {
+    color: #0fc;
+  }
+  .ps-shared-kg-text {
+    margin-bottom: 6px;
+  }
+  .ps-shared-kg-collection {
+    margin-bottom: 0;
+  }
+  .ps-shared-kg-collection code {
+    font-family: ui-monospace, monospace;
+    background: rgba(255,255,255,0.05);
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-size: 11px;
+    word-break: break-all;
+    color: #0fc;
+  }
+  .ps-shared-kg-warn {
+    margin-top: 6px;
+    color: #f5b342;
+    font-style: italic;
+  }
 </style>
