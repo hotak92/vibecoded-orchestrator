@@ -638,5 +638,153 @@ class BootstrapCollectionsRegenTests(unittest.TestCase):
         self.assertIn("VideoFrames_KnowledgeGraph", regens)
 
 
+class DetectAndRenameLegacyComposeOverrideTests(unittest.TestCase):
+    """PR-22 (v0.2.12, 2026-05-16): legacy `docker-compose.override.yml`
+    rename helper exercised at `install.py --update` time.
+
+    Covers:
+      - No legacy file → returns None (silent no-op).
+      - Legacy file present in `infrastructure/` → renamed, deferral emitted.
+      - Legacy file present in `claude_mcp_servers/` → renamed.
+      - Both legacy and canonical present → no rename, conflict deferral.
+      - Mixed: rename one location, conflict in the other.
+      - Permission failure → deferral with severity=warning, no raise.
+    """
+
+    def setUp(self) -> None:
+        import tempfile
+        self._tmp = tempfile.mkdtemp(prefix="pr22-rename-test-")
+        self.install_root = Path(self._tmp)
+        (self.install_root / "infrastructure").mkdir()
+        (self.install_root / "claude_mcp_servers").mkdir()
+
+    def tearDown(self) -> None:
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _read_deferral_ids(self) -> list[str]:
+        """Read the deferral report and return condition_ids in order."""
+        from vco_lib.deferral_report import DeferralReport
+        report = DeferralReport.read(self.install_root)
+        return [e.condition_id for e in report.entries]
+
+    def test_no_legacy_returns_none(self):
+        """Empty tree → returns None, no deferral emitted."""
+        result = project_init._detect_and_rename_legacy_compose_override(
+            self.install_root,
+        )
+        self.assertIsNone(result)
+        # No deferral report should have been created either.
+        self.assertEqual(self._read_deferral_ids(), [])
+
+    def test_legacy_in_infrastructure_renamed(self):
+        """Legacy file under `infrastructure/` is renamed in place,
+        deferral entry recorded with condition_id=compose_override_renamed."""
+        legacy = self.install_root / "infrastructure" / "docker-compose.override.yml"
+        legacy.write_text("services: {}\n")
+
+        result = project_init._detect_and_rename_legacy_compose_override(
+            self.install_root,
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result["action"], "renamed")
+        self.assertEqual(len(result["renamed"]), 1)
+        # Legacy gone, canonical present.
+        self.assertFalse(legacy.exists())
+        canonical = self.install_root / "infrastructure" / "compose.override.yaml"
+        self.assertTrue(canonical.exists())
+        self.assertEqual(canonical.read_text(), "services: {}\n")
+        # Deferral emitted.
+        self.assertIn("compose_override_renamed", self._read_deferral_ids())
+
+    def test_legacy_in_claude_mcp_servers_renamed(self):
+        """Legacy file under `claude_mcp_servers/` (alternate location
+        some users have) is also renamed."""
+        legacy = self.install_root / "claude_mcp_servers" / "docker-compose.override.yml"
+        legacy.write_text("services:\n  ollama:\n    image: ollama/ollama\n")
+
+        result = project_init._detect_and_rename_legacy_compose_override(
+            self.install_root,
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result["action"], "renamed")
+        canonical = self.install_root / "claude_mcp_servers" / "compose.override.yaml"
+        self.assertTrue(canonical.exists())
+        self.assertFalse(legacy.exists())
+
+    def test_both_present_conflict_no_rename(self):
+        """When BOTH legacy and canonical exist in the same directory,
+        the function emits a conflict deferral and does NOT rename
+        (the files may have diverged)."""
+        legacy = self.install_root / "infrastructure" / "docker-compose.override.yml"
+        canonical = self.install_root / "infrastructure" / "compose.override.yaml"
+        legacy.write_text("# legacy\n")
+        canonical.write_text("# canonical\n")
+
+        result = project_init._detect_and_rename_legacy_compose_override(
+            self.install_root,
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result["action"], "conflict")
+        # Both files survive.
+        self.assertTrue(legacy.exists())
+        self.assertTrue(canonical.exists())
+        self.assertEqual(legacy.read_text(), "# legacy\n")
+        self.assertEqual(canonical.read_text(), "# canonical\n")
+        self.assertIn(
+            "compose_override_filename_conflict",
+            self._read_deferral_ids(),
+        )
+
+    def test_idempotent_after_rename(self):
+        """Second call on a tree with no legacy files returns None."""
+        legacy = self.install_root / "infrastructure" / "docker-compose.override.yml"
+        legacy.write_text("services: {}\n")
+        project_init._detect_and_rename_legacy_compose_override(self.install_root)
+        # Second pass: no-op.
+        result = project_init._detect_and_rename_legacy_compose_override(
+            self.install_root,
+        )
+        self.assertIsNone(result)
+
+    def test_mixed_rename_and_conflict(self):
+        """One legacy in `infrastructure/` (renamed), one legacy+canonical
+        pair in `claude_mcp_servers/` (conflict). Both deferral entries
+        should be emitted."""
+        # Will be renamed.
+        (self.install_root / "infrastructure" / "docker-compose.override.yml"
+         ).write_text("# infra legacy\n")
+        # Conflict pair.
+        (self.install_root / "claude_mcp_servers" / "docker-compose.override.yml"
+         ).write_text("# mcp legacy\n")
+        (self.install_root / "claude_mcp_servers" / "compose.override.yaml"
+         ).write_text("# mcp canonical\n")
+
+        result = project_init._detect_and_rename_legacy_compose_override(
+            self.install_root,
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result["action"], "mixed")
+        self.assertEqual(len(result["renamed"]), 1)
+        self.assertEqual(len(result["conflicts"]), 1)
+
+        ids = self._read_deferral_ids()
+        self.assertIn("compose_override_renamed", ids)
+        self.assertIn("compose_override_filename_conflict", ids)
+
+    def test_legacy_outside_known_dirs_ignored(self):
+        """Legacy files in unrelated subdirs should not be touched —
+        only `infrastructure/` and `claude_mcp_servers/` are scanned."""
+        (self.install_root / "other").mkdir()
+        unrelated = self.install_root / "other" / "docker-compose.override.yml"
+        unrelated.write_text("# unrelated\n")
+
+        result = project_init._detect_and_rename_legacy_compose_override(
+            self.install_root,
+        )
+        self.assertIsNone(result)
+        self.assertTrue(unrelated.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -51,6 +51,17 @@ set -u
 #                                 (default: infrastructure/podman-compose.gpu.yml)
 #   - VCT_STACK_GPU_OVERLAY_DOCKER — overlay for docker path
 #                                 (default: infrastructure/docker-compose.gpu.yml)
+#   - VCT_STACK_COMPOSE_OVERRIDE  — user-machine compose override
+#                                 (default: compose.override.yaml). Resolved
+#                                 relative to VCT_STACK_WORKING_DIR; auto-
+#                                 applied iff the file exists and is non-
+#                                 empty. PR-22 (2026-05-16): podman-compose's
+#                                 explicit `-f compose.yaml` bypasses its
+#                                 own auto-load, so this script MUST emit
+#                                 `-f compose.override.yaml` explicitly when
+#                                 the file is present. Without this fix,
+#                                 launcher-managed Storage UX overrides
+#                                 (PR-10A) were silently ignored at boot.
 # ---------------------------------------------------------------------------
 
 VCT_STACK_WORKING_DIR="${VCT_STACK_WORKING_DIR:-${HOME}/Desktop/PROGETTI/Claude/claude_mcp_servers}"
@@ -64,6 +75,7 @@ VCT_STACK_CDI_TIMEOUT="${VCT_STACK_CDI_TIMEOUT:-30}"
 VCT_STACK_GPU_OVERLAY="${VCT_STACK_GPU_OVERLAY:-infrastructure/podman-compose.gpu.yml}"
 VCT_STACK_GPU_OVERLAY_DOCKER="${VCT_STACK_GPU_OVERLAY_DOCKER:-infrastructure/docker-compose.gpu.yml}"
 VCT_STACK_COMPOSE_FILE="${VCT_STACK_COMPOSE_FILE:-compose.yaml}"
+VCT_STACK_COMPOSE_OVERRIDE="${VCT_STACK_COMPOSE_OVERRIDE:-compose.override.yaml}"
 
 # Resolve the directory that contains THIS script — used as one fallback
 # root for runtime.txt resolution. Works whether the script is sourced or
@@ -341,6 +353,8 @@ overlay_exists() {
 #   podman-compose -f compose.yaml -f infrastructure/podman-compose.gpu.yml
 #   podman compose -f compose.yaml -f infrastructure/podman-compose.gpu.yml
 #   docker compose -f compose.yaml
+#   docker compose -f compose.yaml -f compose.override.yaml
+#   podman-compose -f compose.yaml -f infrastructure/podman-compose.gpu.yml -f compose.override.yaml
 #   ...
 #
 # When gpu_mode=gpu but the overlay file is missing, the invocation is
@@ -348,8 +362,17 @@ overlay_exists() {
 # `OVERLAY_MISSING_WARNED=1` flag is set so callers / tests can detect
 # the fall-through.
 #
-# Pure-ish function — only env reads are VCT_STACK_*_OVERLAY env vars
-# (which act as constants from the caller's POV) and VCT_STACK_COMPOSE_FILE.
+# When VCT_STACK_COMPOSE_OVERRIDE points at an existing non-empty file
+# (resolved relative to working_dir if not absolute), the override is
+# emitted as the LAST `-f` flag so it wins on conflicts (compose
+# precedence rule: later files override earlier ones). PR-22
+# (2026-05-16): without this explicit `-f`, podman-compose's
+# auto-load is bypassed by the explicit `-f compose.yaml` and the
+# launcher-managed Storage UX override (PR-10A) is silently ignored.
+#
+# Pure-ish function — only env reads are VCT_STACK_*_OVERLAY env vars,
+# VCT_STACK_COMPOSE_FILE, and VCT_STACK_COMPOSE_OVERRIDE
+# (all of which act as constants from the caller's POV).
 # Tested via tests/test_launch_claude_mcp_stack_pick.py.
 # ---------------------------------------------------------------------------
 pick_compose_invocation() {
@@ -394,31 +417,42 @@ pick_compose_invocation() {
         fi
     fi
 
+    # PR-22 (2026-05-16): user-machine compose override (bind mounts,
+    # alternate ports, extra services). Resolved relative to working_dir
+    # when not absolute. Auto-applied iff the file exists and is non-empty.
+    # podman-compose ordinarily auto-loads `compose.override.yaml`, but
+    # the explicit `-f compose.yaml` below bypasses that auto-load — so
+    # the override flag MUST be emitted here. Silent fall-through (no
+    # `-f`) is expected when the file is absent.
+    local use_override=0
+    local resolved_override=""
+    if [ -n "${VCT_STACK_COMPOSE_OVERRIDE:-}" ]; then
+        case "$VCT_STACK_COMPOSE_OVERRIDE" in
+            /*) resolved_override="$VCT_STACK_COMPOSE_OVERRIDE" ;;
+            *)  resolved_override="${working_dir}/${VCT_STACK_COMPOSE_OVERRIDE}" ;;
+        esac
+        if [ -f "$resolved_override" ] && [ -s "$resolved_override" ]; then
+            use_override=1
+        fi
+    fi
+
+    # Per-runtime emission via a helper so all three compose front-ends
+    # share the same flag-ordering logic. Order matters:
+    #   1. `-f compose.yaml`          (base)
+    #   2. `-f <gpu-overlay>`         (GPU additions, when applicable)
+    #   3. `-f <user-override>`       (LAST so it wins on conflicts)
+    _emit_compose_args() {
+        local cmd="$1"
+        local args="-f $VCT_STACK_COMPOSE_FILE"
+        [ "$use_overlay" = "1" ] && args="$args -f $overlay"
+        [ "$use_override" = "1" ] && args="$args -f $VCT_STACK_COMPOSE_OVERRIDE"
+        printf '%s %s\n' "$cmd" "$args"
+    }
+
     case "$runtime" in
-        docker)
-            if [ "$use_overlay" = "1" ]; then
-                printf 'docker compose -f %s -f %s\n' \
-                    "$VCT_STACK_COMPOSE_FILE" "$overlay"
-            else
-                printf 'docker compose -f %s\n' "$VCT_STACK_COMPOSE_FILE"
-            fi
-            ;;
-        podman-compose)
-            if [ "$use_overlay" = "1" ]; then
-                printf 'podman-compose -f %s -f %s\n' \
-                    "$VCT_STACK_COMPOSE_FILE" "$overlay"
-            else
-                printf 'podman-compose -f %s\n' "$VCT_STACK_COMPOSE_FILE"
-            fi
-            ;;
-        "podman compose")
-            if [ "$use_overlay" = "1" ]; then
-                printf 'podman compose -f %s -f %s\n' \
-                    "$VCT_STACK_COMPOSE_FILE" "$overlay"
-            else
-                printf 'podman compose -f %s\n' "$VCT_STACK_COMPOSE_FILE"
-            fi
-            ;;
+        docker)            _emit_compose_args "docker compose" ;;
+        podman-compose)    _emit_compose_args "podman-compose" ;;
+        "podman compose")  _emit_compose_args "podman compose" ;;
         "")
             # No runtime — caller handles this case before invoking.
             return 1

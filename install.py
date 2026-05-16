@@ -2135,6 +2135,44 @@ def main() -> int:
             data=_backfill_result,
         )
 
+        # PR-22 (v0.2.12, 2026-05-16): rename legacy
+        # `docker-compose.override.yml` to `compose.override.yaml` so
+        # podman-compose's auto-loader recognizes it. PR-10A (v0.2.11)
+        # shipped writing the wrong filename; on `--update` from
+        # v0.2.11 we migrate the file in place + emit a deferral entry.
+        # No-op on fresh installs and on already-migrated trees. Soft-fail:
+        # surfaces failures via deferral entries, never raises.
+        try:
+            from vco_lib.project_init import _detect_and_rename_legacy_compose_override
+            _override_rename = _detect_and_rename_legacy_compose_override(PROJECT_ROOT)
+            if _override_rename is not None:
+                print(
+                    f"  compose override rename: action="
+                    f"{_override_rename['action']}, "
+                    f"renamed={len(_override_rename['renamed'])}, "
+                    f"conflicts={len(_override_rename['conflicts'])}, "
+                    f"errors={len(_override_rename['errors'])}"
+                )
+            _log_install_event(
+                "9/10", "info",
+                "_detect_and_rename_legacy_compose_override "
+                f"result={_override_rename!r}",
+                data=_override_rename or {"action": "noop"},
+            )
+        except Exception as _override_exc:  # pragma: no cover — defensive
+            # Soft-fail: don't let this stop the install.
+            _override_err = f"{type(_override_exc).__name__}: {_override_exc}"
+            print(
+                f"  compose override rename: skipped due to error "
+                f"({_override_err})"
+            )
+            _log_install_event(
+                "9/10", "warn",
+                f"_detect_and_rename_legacy_compose_override failed: "
+                f"{_override_err}",
+                data={"error": _override_err},
+            )
+
     # PR-7 / addendum-4 (v0.2.11): .vscode/settings.json watcher/search/
     # Pylance exclude backfill. Runs on BOTH install and update paths:
     #   - Fresh install: creates `.vscode/settings.json` with the canonical
