@@ -1878,6 +1878,19 @@ def main() -> int:
                              "bypasses the prompt and emits a clarifying deferral "
                              "(no rewrite). Set VCT_REWRITE_STALE_MCPS=all in the "
                              "env to auto-accept all entries (CI / scripted). PR-33.")
+    parser.add_argument("--remove-deprecated-mcps", action="store_true", default=False,
+                        help="On --update, prompt for consent to REMOVE ~/.claude.json "
+                             "mcpServers entries that belong to deprecated default MCPs "
+                             "(e.g. `ollama`, removed in v0.2.11). Without this flag, "
+                             "deprecated entries are only detected + reported via deferral "
+                             "(PR-34 detection-only behavior). With this flag, each "
+                             "matching entry whose command path is inside the current "
+                             "install_root is prompted individually (y/n/all/skip-all). "
+                             "--quiet bypasses the prompt and emits a clarifying deferral "
+                             "(no removal). User-customised entries whose command path is "
+                             "OUTSIDE install_root are never touched. "
+                             "Set VCT_REMOVE_DEPRECATED_MCPS=all in the env to "
+                             "auto-accept all entries (CI / scripted). PR-34.")
     parser.add_argument("--project-folder", type=str, default=None,
                         help="Folder where .claude/context/UPDATE_DEFERRED.md should "
                              "land. Defaults to the orchestrator's PROJECT_ROOT "
@@ -2671,6 +2684,33 @@ def main() -> int:
                 )
                 _log_install_event(
                     "rewrite_stale_mcps", "error",
+                    f"unexpected exception: {exc}",
+                )
+
+        # PR-34 (v0.2.13, 2026-05-16): consent-prompted deprecated-MCP
+        # removal.  _detect_deprecated_mcp_entries (invoked inside
+        # _register_mcps) has already emitted the report-only deferral.
+        # When the user passes --remove-deprecated-mcps we additionally
+        # prompt per entry and remove the accepted ones from ~/.claude.json.
+        # --rewrite-stale-mcps also triggers deprecated-MCP detection
+        # (deprecation is a form of staleness), but removal still requires
+        # the explicit --remove-deprecated-mcps flag.
+        # Soft-fail throughout.
+        if getattr(args, "remove_deprecated_mcps", False):
+            try:
+                _remove_deprecated_mcp_entries(
+                    PROJECT_ROOT,
+                    _deferral_report,
+                    quiet=bool(getattr(args, "quiet", False)),
+                )
+            except Exception as exc:  # noqa: BLE001 — soft-fail by design
+                print(
+                    f"  --remove-deprecated-mcps raised unexpectedly: {exc}. "
+                    "Install will complete; re-run to retry.",
+                    file=sys.stderr,
+                )
+                _log_install_event(
+                    "remove_deprecated_mcps", "error",
                     f"unexpected exception: {exc}",
                 )
 
@@ -8356,6 +8396,10 @@ def _register_mcps(
                 # launcher writer doesn't touch entries outside the
                 # bundled set, so this check is post-write here.
                 _detect_stale_mcp_entries(install_root, claude_json, deferral_report)
+                # Deprecated-MCP-entry detection (PR-34). Same rationale:
+                # the launcher writer only updates the bundled set; any
+                # deprecated entry from a prior install stays behind.
+                _detect_deprecated_mcp_entries(install_root, claude_json, deferral_report)
                 return
             _log_install_event(
                 "register_mcps", "warn",
@@ -8472,6 +8516,9 @@ def _register_mcps(
 
     # Stale-entry check on --update.
     _detect_stale_mcp_entries(install_root, claude_json, deferral_report)
+    # Deprecated-MCP-entry detection (PR-34). Runs unconditionally so
+    # users on the Python-fallback path still see the deferral notice.
+    _detect_deprecated_mcp_entries(install_root, claude_json, deferral_report)
 
 
 def _scan_stale_mcp_entries(
@@ -8883,6 +8930,521 @@ def _rewrite_stale_mcp_entries(
                 "# (plus the writer's own ~/.claude.json.bak)\n"
                 "# Inspect: cat ~/.claude.json.bak-rewrite-*\n"
                 "# Revert:  cp ~/.claude.json.bak-rewrite-<ts> ~/.claude.json"
+            ),
+            severity="info",
+            kg_node_refs=[
+                ".claude/context/mcp-install-pipeline-audit-2026-05-16.md",
+            ],
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# PR-34 (v0.2.13, 2026-05-16): deprecated-MCP-entry detection + removal
+# ---------------------------------------------------------------------------
+#
+# When install.py drops an MCP from the default set (e.g. Ollama MCP in
+# v0.2.11) it leaves behind an entry in ~/.claude.json for users who
+# installed before that release.  The old _check_ollama_mcp_remnants
+# function (PR-14b) fires unconditionally on --update and emits an
+# informational notice, but:
+#
+#   a) it does not distinguish "our" entry (command inside install_root)
+#      from a user's own custom Ollama MCP at a different path;
+#   b) it cannot auto-remove even with consent.
+#
+# PR-34 replaces that with a structured deprecation registry and a
+# consent-prompted removal path.  Three-step design (mirrors PR-33):
+#
+#   1. _DEPRECATED_DEFAULT_MCPS — registry of MCPs dropped from the
+#      default set, with the release version, human-readable reason, and
+#      the opt-in manifest path where the feature moved.
+#   2. _scan_deprecated_mcp_entries — pure function that reads
+#      ~/.claude.json and returns entries whose (a) name is in the
+#      registry AND (b) command path is inside the current install_root
+#      (i.e. "our" entry, not user-customised).
+#   3. _detect_deprecated_mcp_entries — detection-only path called
+#      unconditionally from _register_mcps; emits a deferral for each
+#      match (no rewrite).
+#   4. _remove_deprecated_mcp_entries — consent-prompted removal.
+#      Only runs when --remove-deprecated-mcps is passed.
+#      VCT_REMOVE_DEPRECATED_MCPS=all env override for CI.
+#
+# Composition with PR-33 (--rewrite-stale-mcps):
+#   When --rewrite-stale-mcps is passed, deprecated-MCP detection is
+#   ALSO run (deprecation is a form of staleness).  The removal itself
+#   still requires the explicit --remove-deprecated-mcps flag.
+
+
+#: Registry of MCPs that used to be in the default install set but were
+#: later removed.  Any entry in this dict will be scanned for in
+#: ~/.claude.json on every --update run.
+_DEPRECATED_DEFAULT_MCPS: dict[str, dict] = {
+    "ollama": {
+        "removed_in": "v0.2.11",
+        "reason": (
+            "Ollama MCP server dropped from default install (PR-14a). "
+            "The tools it exposed (chat / read_document / read_image) are "
+            "redundant with Claude's native capabilities. Ollama remains as "
+            "embedding infrastructure (Weaviate vectorizers); only the MCP "
+            "tool-surface was removed."
+        ),
+        "opt_in_manifest": "launcher/bundled_manifests/vct-ollama.json",
+    },
+    # Future deprecations go here, e.g.:
+    # "coordination": {
+    #     "removed_in": "vX.Y.Z",
+    #     "reason": "...",
+    #     "opt_in_manifest": "launcher/bundled_manifests/vct-coordination.json",
+    # },
+}
+
+
+def _scan_deprecated_mcp_entries(
+    install_root: Path,
+    claude_json: Path,
+) -> list[tuple[str, str, dict, dict]]:
+    """Return a list of ``(mcp_name, cmd_path, entry_dict, dep_info)`` for
+    every ``~/.claude.json mcpServers`` entry that:
+
+    a) has a name present in :data:`_DEPRECATED_DEFAULT_MCPS`, AND
+    b) whose ``command`` or ``args[0]`` path lives INSIDE the current
+       install_root (i.e. it was registered by THIS orchestrator install,
+       not a user-added entry at an unrelated path).
+
+    Entries that match the name but whose command is NOT inside
+    install_root are assumed to be user-customised and are left alone.
+
+    Pure function (no deferral side effects, no writes).
+
+    Returns:
+        List of 4-tuples: (name, path_inside_root, entry_dict, dep_info).
+        ``dep_info`` is the value from :data:`_DEPRECATED_DEFAULT_MCPS`.
+    """
+    if not claude_json.is_file():
+        return []
+    try:
+        data = json.loads(claude_json.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    mcp_servers = data.get("mcpServers", {})
+    if not isinstance(mcp_servers, dict):
+        return []
+
+    install_root_str = str(install_root.resolve())
+    results: list[tuple[str, str, dict, dict]] = []
+    for name, dep_info in _DEPRECATED_DEFAULT_MCPS.items():
+        entry = mcp_servers.get(name)
+        if not isinstance(entry, dict):
+            continue
+        # Determine the path candidates (command + first arg).
+        cmd = entry.get("command", "") if isinstance(entry.get("command"), str) else ""
+        first_arg = ""
+        args = entry.get("args", [])
+        if isinstance(args, list) and args and isinstance(args[0], str):
+            first_arg = args[0]
+        # Check whether ANY path candidate is inside install_root.
+        # If none of the candidates are absolute paths inside install_root,
+        # the entry is user-customised → leave it alone.
+        matched_path = ""
+        for candidate in (cmd, first_arg):
+            if not candidate:
+                continue
+            # Only consider absolute paths (cross-OS).
+            if not candidate.startswith(("/", "C:\\", "c:\\", "\\\\")):
+                continue
+            if candidate.startswith(install_root_str):
+                matched_path = candidate
+                break
+        if not matched_path:
+            # Either no absolute path candidates, or the path is outside
+            # install_root → user-customised entry; skip.
+            continue
+        results.append((name, matched_path, entry, dep_info))
+    return results
+
+
+def _detect_deprecated_mcp_entries(
+    install_root: Path,
+    claude_json: Path,
+    deferral_report: "DeferralReport",
+) -> None:
+    """Detection-only path: emit a deferral for each deprecated-MCP entry
+    whose path lives inside the current install_root.
+
+    Called unconditionally from :func:`_register_mcps` (after every
+    successful write via Path A or B).  The companion
+    :func:`_remove_deprecated_mcp_entries` performs the actual removal
+    when ``--remove-deprecated-mcps`` is passed.
+
+    User-customised entries (command outside install_root) are silently
+    skipped — they are the user's concern, not ours.
+    """
+    deprecated = _scan_deprecated_mcp_entries(install_root, claude_json)
+    if not deprecated:
+        return
+
+    install_root_str = str(install_root.resolve())
+    for name, matched_path, _entry, dep_info in deprecated:
+        removed_in = dep_info.get("removed_in", "unknown release")
+        reason = dep_info.get("reason", "")
+        opt_in = dep_info.get("opt_in_manifest", "")
+        opt_in_note = (
+            f"\nOpt-in: if you still want these tools, install the module "
+            f"via the launcher → Modules, or inspect {opt_in}."
+        ) if opt_in else ""
+
+        deferral_report.add_entry(
+            DeferralEntry(
+                condition_id=f"deprecated_mcp_{name}",
+                title=(
+                    f"Deprecated MCP entry `{name}` still in ~/.claude.json "
+                    f"(removed {removed_in})"
+                ),
+                detected=(
+                    f"~/.claude.json contains a `{name}` block under "
+                    f"`mcpServers` whose command path ({matched_path}) points "
+                    f"inside the current install_root ({install_root_str}). "
+                    f"This entry was registered by a previous version of this "
+                    f"orchestrator install and is no longer part of the default "
+                    f"install set.\n\nReason: {reason}{opt_in_note}"
+                ),
+                why_deferred=(
+                    "Auto-removal of ~/.claude.json entries requires user "
+                    "consent. Pass `--remove-deprecated-mcps` (with "
+                    "`--update`) for the consent-prompted removal path. "
+                    "The existing entry is preserved and functional until "
+                    "you remove it."
+                ),
+                command_to_apply=(
+                    f"# Consent-prompted removal (PR-34):\n"
+                    f"python install.py --update --remove-deprecated-mcps\n"
+                    f"# Or, for CI / scripted contexts:\n"
+                    f"#   VCT_REMOVE_DEPRECATED_MCPS=all python install.py "
+                    f"--update --remove-deprecated-mcps\n"
+                    f"# Or, remove manually:\n"
+                    f"#   Edit {claude_json} and delete the `\"{name}\": {{...}}` "
+                    f"entry under `mcpServers`."
+                ),
+                severity="info",
+                kg_node_refs=[
+                    "knowledge/concepts/orchestrator-mcp-servers.md",
+                    ".claude/context/mcp-install-pipeline-audit-2026-05-16.md",
+                ],
+            )
+        )
+
+
+def _remove_deprecated_mcp_entries(
+    install_root: Path,
+    deferral_report: "DeferralReport",
+    quiet: bool = False,
+    input_fn=input,
+    output_fn=print,
+) -> None:
+    """Consent-prompted removal of deprecated ``~/.claude.json mcpServers``
+    entries. PR-34 — ships in v0.2.13.
+
+    Workflow:
+
+    1. Scan via :func:`_scan_deprecated_mcp_entries`. No matches → no-op.
+    2. ``--quiet`` (or no TTY) with no ``VCT_REMOVE_DEPRECATED_MCPS=all``
+       env override → emit a ``deprecated_mcp_removal_quiet_skipped``
+       deferral and return without writing.
+    3. Otherwise prompt the user per-entry; collect accept/reject map.
+    4. If at least one entry is accepted, snapshot ``~/.claude.json`` to
+       ``~/.claude.json.bak-depr-remove-<unix-ts>`` BEFORE writing.
+    5. Remove the accepted entries from ``mcpServers`` and write back
+       atomically (same lock + tmp + rename discipline as the writer).
+
+    Soft-fail throughout. Does NOT run unless ``--remove-deprecated-mcps``
+    is passed. Never auto-removes on a vanilla ``--update``.
+
+    Args:
+        install_root: Resolved path to this orchestrator install.
+        deferral_report: Run-scoped report to append outcome entries to.
+        quiet: If True and no ``VCT_REMOVE_DEPRECATED_MCPS=all``,
+            emit a clarifying deferral and return without prompting.
+        input_fn: Injectable for testing (default: ``input``).
+        output_fn: Injectable for testing (default: ``print``).
+    """
+    claude_json = _user_home_for_install() / ".claude.json"
+    deprecated = _scan_deprecated_mcp_entries(install_root, claude_json)
+    if not deprecated:
+        return
+
+    env_override = os.environ.get("VCT_REMOVE_DEPRECATED_MCPS", "").strip()
+    effective_quiet = quiet or (env_override == "" and not sys.stdin.isatty())
+
+    if effective_quiet and env_override.lower() not in ("all", "yes", "y", "true", "1"):
+        install_root_str = str(install_root.resolve())
+        detected_lines = [f"  - `{name}`: {path}" for name, path, _, _ in deprecated]
+        deferral_report.add_entry(
+            DeferralEntry(
+                condition_id="deprecated_mcp_removal_quiet_skipped",
+                title="Deprecated MCP entries detected but consent prompt bypassed by --quiet",
+                detected=(
+                    f"~/.claude.json contains deprecated MCP entries whose paths "
+                    f"point inside the current install_root ({install_root_str}):\n\n"
+                    + "\n".join(detected_lines)
+                    + "\n\n`--remove-deprecated-mcps` was set, but `--quiet` "
+                    "(or a non-TTY stdin) prevented the consent prompt from "
+                    "running. No removal was performed."
+                ),
+                why_deferred=(
+                    "Removing global MCP entries is destructive. PR-34 requires "
+                    "explicit per-entry consent OR an explicit env override; "
+                    "neither was satisfied."
+                ),
+                command_to_apply=(
+                    "# Re-run interactively (drop --quiet):\n"
+                    "python install.py --update --remove-deprecated-mcps\n"
+                    "# Or auto-accept for CI / scripted contexts:\n"
+                    "VCT_REMOVE_DEPRECATED_MCPS=all "
+                    "python install.py --update --remove-deprecated-mcps"
+                ),
+                severity="warning",
+                kg_node_refs=[
+                    ".claude/context/mcp-install-pipeline-audit-2026-05-16.md",
+                ],
+            )
+        )
+        return
+
+    # Drive the per-entry consent prompt.
+    install_root_str = str(install_root.resolve())
+
+    # Fast-path: explicit env override for CI / scripted runs.
+    if env_override.lower() in ("all", "yes", "y", "true", "1"):
+        consent_map = {name: True for name, _, _, _ in deprecated}
+    else:
+        output_fn("")
+        output_fn(
+            f"Found {len(deprecated)} deprecated ~/.claude.json mcpServers "
+            f"entr{'y' if len(deprecated) == 1 else 'ies'} "
+            "whose paths are inside this install_root:"
+        )
+        for name, path, _, dep_info in deprecated:
+            removed_in = dep_info.get("removed_in", "?")
+            output_fn(f"  - {name}: {path}  (removed {removed_in})")
+        output_fn("")
+        output_fn(
+            "These entries are no longer part of the default install. "
+            "Removing them prevents Claude Code from loading the deprecated "
+            "MCP server subprocesses."
+        )
+        output_fn(
+            "Per-entry choices: [y]es, [n]o (default), [a]ll, [s]kip-all"
+        )
+        output_fn("")
+
+        consent_map: dict[str, bool] = {}
+        blanket: Optional[bool] = None
+        for name, _path, _entry, dep_info in deprecated:
+            if blanket is not None:
+                consent_map[name] = blanket
+                output_fn(
+                    f"  {name} → {'remove' if blanket else 'skip'} (from blanket choice)"
+                )
+                continue
+            removed_in = dep_info.get("removed_in", "?")
+            try:
+                answer = input_fn(
+                    f"  {name} (removed {removed_in}) → remove? [y/N/a/s]: "
+                ).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                output_fn("  (prompt interrupted — treating as skip-all)")
+                for n, _, _, _ in deprecated:
+                    consent_map.setdefault(n, False)
+                return
+            if answer in ("a", "all"):
+                blanket = True
+                consent_map[name] = True
+            elif answer in ("s", "skip-all"):
+                blanket = False
+                consent_map[name] = False
+            elif answer in ("y", "yes"):
+                consent_map[name] = True
+            else:
+                consent_map[name] = False
+
+    accepted = [name for name, ok in consent_map.items() if ok]
+    rejected = [name for name, ok in consent_map.items() if not ok]
+
+    if not accepted:
+        detected_lines = [f"  - `{name}`: {path}" for name, path, _, _ in deprecated]
+        deferral_report.add_entry(
+            DeferralEntry(
+                condition_id="deprecated_mcp_removal_declined",
+                title="Deprecated MCP removal declined by user",
+                detected=(
+                    "User declined to remove the following deprecated entries:\n\n"
+                    + "\n".join(detected_lines)
+                ),
+                why_deferred=(
+                    "PR-34 consent prompt was offered for each entry; "
+                    "every entry was rejected. No removal performed."
+                ),
+                command_to_apply=(
+                    "# To re-prompt and accept some/all entries:\n"
+                    "python install.py --update --remove-deprecated-mcps"
+                ),
+                severity="info",
+                kg_node_refs=[
+                    ".claude/context/mcp-install-pipeline-audit-2026-05-16.md",
+                ],
+            )
+        )
+        return
+
+    # Two-level backup BEFORE writing. The atomic writer does its own .bak;
+    # this adds a unique timestamped snapshot so repeating the command
+    # doesn't clobber the pre-removal state.
+    if claude_json.is_file():
+        ts = int(time.time())
+        bak_path = claude_json.with_name(claude_json.name + f".bak-depr-remove-{ts}")
+        try:
+            shutil.copy2(claude_json, bak_path)
+            output_fn(f"  Snapshot saved: {bak_path}")
+        except OSError as exc:
+            output_fn(f"  (couldn't write {bak_path}: {exc}; relying on writer's .bak)")
+            _log_install_event(
+                "remove_deprecated_mcps", "warn",
+                f"backup copy failed: {exc}",
+            )
+
+    # Perform the removal atomically (same lock + tmp + rename discipline).
+    lock_path = claude_json.with_suffix(claude_json.suffix + ".lock")
+    locked = False
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode("ascii"))
+            os.close(fd)
+            locked = True
+            break
+        except FileExistsError:
+            time.sleep(0.05)
+        except OSError:
+            break
+
+    if not locked:
+        msg = f"could not acquire lock {lock_path} for deprecated-MCP removal"
+        output_fn(f"  WARNING: {msg}")
+        _log_install_event("remove_deprecated_mcps", "warn", msg)
+        deferral_report.add_entry(
+            DeferralEntry(
+                condition_id="deprecated_mcp_removal_lock_failed",
+                title="Deprecated MCP removal could not acquire ~/.claude.json lock",
+                detected=msg,
+                why_deferred=(
+                    "Another process holds the file lock. Re-run after any "
+                    "concurrent install.py / launcher process finishes."
+                ),
+                command_to_apply=(
+                    "python install.py --update --remove-deprecated-mcps"
+                ),
+                severity="warning",
+                kg_node_refs=[
+                    ".claude/context/mcp-install-pipeline-audit-2026-05-16.md",
+                ],
+            )
+        )
+        return
+
+    removal_errors: list[str] = []
+    removed_names: list[str] = []
+    try:
+        try:
+            if claude_json.is_file():
+                raw = claude_json.read_text(encoding="utf-8")
+                data = json.loads(raw) if raw.strip() else {}
+            else:
+                data = {}
+        except (OSError, json.JSONDecodeError) as exc:
+            removal_errors.append(f"read {claude_json}: {exc}")
+            data = None
+
+        if data is not None and isinstance(data, dict):
+            mcp_servers = data.get("mcpServers", {})
+            if isinstance(mcp_servers, dict):
+                for name in accepted:
+                    if name in mcp_servers:
+                        del mcp_servers[name]
+                        removed_names.append(name)
+            try:
+                if claude_json.is_file():
+                    bak = claude_json.with_suffix(claude_json.suffix + ".bak")
+                    shutil.copy2(claude_json, bak)
+                tmp = claude_json.with_suffix(claude_json.suffix + ".tmp")
+                tmp.parent.mkdir(parents=True, exist_ok=True)
+                tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                os.replace(tmp, claude_json)
+            except OSError as exc:
+                removal_errors.append(f"write {claude_json}: {exc}")
+    finally:
+        try:
+            lock_path.unlink()
+        except OSError:
+            pass
+
+    if removal_errors:
+        msg = "; ".join(removal_errors)
+        print(f"  Deprecated MCP removal failed: {msg}", file=sys.stderr)
+        output_fn(f"  Deprecated MCP removal failed: {msg}")
+        _log_install_event(
+            "remove_deprecated_mcps", "warn",
+            f"removal write failed: {msg}",
+        )
+        deferral_report.add_entry(
+            DeferralEntry(
+                condition_id="deprecated_mcp_removal_write_failed",
+                title="Deprecated MCP removal write failed",
+                detected=f"Could not update {claude_json}: {msg}",
+                why_deferred=(
+                    "File-system error during the atomic write. "
+                    "The backup snapshot (if created) preserves the prior state."
+                ),
+                command_to_apply=(
+                    "python install.py --update --remove-deprecated-mcps"
+                ),
+                severity="warning",
+                kg_node_refs=[
+                    ".claude/context/mcp-install-pipeline-audit-2026-05-16.md",
+                ],
+            )
+        )
+        return
+
+    # Summary deferral.
+    summary_lines = []
+    if removed_names:
+        output_fn(f"  Removed deprecated MCP entr{'y' if len(removed_names) == 1 else 'ies'}: "
+                  f"{', '.join(removed_names)}")
+        summary_lines.append(f"Removed: {', '.join(removed_names)}")
+        _log_install_event(
+            "remove_deprecated_mcps", "ok",
+            f"removed deprecated entries: {removed_names}",
+        )
+    if rejected:
+        summary_lines.append(f"Skipped (user said no): {', '.join(rejected)}")
+    deferral_report.add_entry(
+        DeferralEntry(
+            condition_id="deprecated_mcp_removal_summary",
+            title="PR-34 deprecated MCP removal summary",
+            detected="\n".join(summary_lines) or "(no entries processed)",
+            why_deferred=(
+                "Informational. The removal was performed atomically with a "
+                "timestamped backup snapshot before writing."
+            ),
+            command_to_apply=(
+                "# Two-level backup created: ~/.claude.json.bak-depr-remove-<ts>\n"
+                "# (plus the writer's own ~/.claude.json.bak)\n"
+                "# Inspect: cat ~/.claude.json.bak-depr-remove-*\n"
+                "# Revert:  cp ~/.claude.json.bak-depr-remove-<ts> ~/.claude.json"
             ),
             severity="info",
             kg_node_refs=[
