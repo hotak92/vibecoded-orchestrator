@@ -23,12 +23,74 @@
   ];
   const EVENT_OPTIONS = COMMON_EVENTS.map((e) => ({ value: e, label: e }));
 
+  // PR-6 (v0.2.11): per-project lean-ctx toggle. Three logical states map
+  // to two on-disk states for `<project>/.claude/env::VCO_LEAN_CTX_DEFAULT`:
+  //   * 'default' → key absent (the PR-1 hook treats absence as "on")
+  //   * 'on'      → key present, value 'on'
+  //   * 'off'     → key present, value 'off'
+  type LeanCtxChoice = 'default' | 'on' | 'off';
+  const LEAN_CTX_KEY = 'VCO_LEAN_CTX_DEFAULT';
+  const LEAN_CTX_OPTIONS: Array<{ value: LeanCtxChoice; label: string }> = [
+    { value: 'default', label: 'Default (on)' },
+    { value: 'on', label: 'Per-project: on' },
+    { value: 'off', label: 'Per-project: off' },
+  ];
+  let leanCtxChoice = $state<LeanCtxChoice>('default');
+  let leanCtxLoading = $state(true);
+  let leanCtxSaving = $state(false);
+
   async function load() {
     loading = true;
     try {
       hooks = await invoke<ProjectHook[]>('list_project_hooks', { projectId });
     } catch (e) { toast.error(e); }
     finally { loading = false; }
+  }
+
+  async function loadLeanCtx() {
+    leanCtxLoading = true;
+    try {
+      const v = await invoke<string | null>('get_claude_env_value', {
+        projectId,
+        key: LEAN_CTX_KEY,
+      });
+      if (v === null || v === undefined) leanCtxChoice = 'default';
+      else if (v === 'off') leanCtxChoice = 'off';
+      else if (v === 'on') leanCtxChoice = 'on';
+      // Any other value (manual edit) is rendered as "default" in the UI;
+      // the user keeps the on-disk override until they actively change the
+      // toggle, at which point we overwrite cleanly.
+      else leanCtxChoice = 'default';
+    } catch (e) {
+      toast.error(e);
+    } finally {
+      leanCtxLoading = false;
+    }
+  }
+
+  async function setLeanCtx(next: LeanCtxChoice) {
+    if (next === leanCtxChoice) return;
+    leanCtxSaving = true;
+    const previous = leanCtxChoice;
+    leanCtxChoice = next; // optimistic
+    try {
+      const value = next === 'default' ? null : next;
+      await invoke('set_claude_env_value', {
+        projectId,
+        key: LEAN_CTX_KEY,
+        value,
+      });
+      toast.success(
+        next === 'default'
+          ? 'Reverted to default (compression on)'
+          : `Per-project compression set to ${next}`,
+      );
+    } catch (e) {
+      leanCtxChoice = previous;
+      toast.error(e);
+    } finally {
+      leanCtxSaving = false;
+    }
   }
 
   async function toggle(id: number, enabled: boolean) {

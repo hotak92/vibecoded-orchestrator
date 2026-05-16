@@ -1,6 +1,7 @@
 pub mod app_state_cmd;
 pub mod audit;
 pub mod changes_cmd;
+pub mod claude_env;
 pub mod gpu;
 pub mod gpu_policy;
 pub mod codegraph;
