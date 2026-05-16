@@ -42,19 +42,35 @@ ollama>=0.6.2
 # ─── Code embedding service (runs in container, but needed for CPU fallback) ───
 # sentence-transformers (Apache 2.0)
 sentence-transformers>=5.4.1
-# transformers pinned <5 because CodeSage-Large-v2's `modeling_codesage.py`
-# (loaded via trust_remote_code) calls the deprecated `init_weights()` and
-# never calls `post_init()`. transformers v5 makes `post_init()` mandatory
-# (it's where `all_tied_weights_keys` is initialised) and intentionally
-# crashes if missing. Validated 2026-05-04: transformers 5.0.0 / 5.7.0 both
-# fail with `AttributeError: 'CodeSageModel' object has no attribute
-# 'all_tied_weights_keys'`. To unblock: open a PR on
-# https://huggingface.co/codesage/codesage-large-v2 to call `post_init()`
-# in `__init__`, OR migrate to a v5-native code-embedding model
-# (Jina Code v3, Voyage Code 3, etc.). Tracking issue:
-# https://github.com/huggingface/transformers/issues/43883 (closed —
-# upstream confirmed this crash is by-design).
-transformers>=4.40.0,<5.0.0
+# transformers pinned <4.50 because CodeSage-Large-v2's
+# `modeling_codesage.py` (loaded via trust_remote_code) has TWO
+# distinct incompatibilities with newer transformers:
+#
+#   1. v5+: calls the deprecated `init_weights()` and never calls
+#      `post_init()`. v5 makes `post_init()` mandatory (it's where
+#      `all_tied_weights_keys` is initialised) and intentionally
+#      crashes if missing. Validated 2026-05-04: 5.0.0 / 5.7.0 both
+#      fail with `AttributeError: 'CodeSageModel' object has no
+#      attribute 'all_tied_weights_keys'`. Tracking:
+#      https://github.com/huggingface/transformers/issues/43883
+#      (closed — upstream confirmed by-design).
+#
+#   2. v4.50+: `Conv1D` was moved from `transformers.modeling_utils`
+#      to `transformers.pytorch_utils`. CodeSage's modeling_codesage.py
+#      line 11 does `from transformers.modeling_utils import Conv1D`
+#      and fails with `ImportError: cannot import name 'Conv1D' from
+#      'transformers.modeling_utils'`. Symptom: the
+#      code_embedding_service container starts, sentence-transformers
+#      tries to load CodeSage with trust_remote_code=True, the import
+#      fails, FastAPI app exits → restart loop forever (RestartCount
+#      grows unbounded). Validated 2026-05-16 against 4.57.6.
+#
+# To unblock either: open a PR on
+# https://huggingface.co/codesage/codesage-large-v2 to (a) call
+# `post_init()` in `__init__` AND (b) import Conv1D from pytorch_utils
+# with a fallback, OR migrate to a v5-native code-embedding model
+# (Jina Code v3, Voyage Code 3, etc.).
+transformers>=4.40.0,<4.50.0
 # PyTorch (BSD-3-Clause) — for RL pipeline (Pro) and code embeddings (CPU fallback)
 # NOTE: torch>=2.11 ships CUDA 13.0 wheels by default on PyPI. Users with
 # CUDA 12.x drivers, Volta/Pascal/Maxwell GPUs, or CPU-only systems should

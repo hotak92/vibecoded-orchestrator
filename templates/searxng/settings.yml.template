@@ -1,0 +1,98 @@
+# SearXNG configuration for VCO's search-mcp server.
+# Internal use only — serves JSON API for the `web_search` tool exposed
+# by claude_mcp_servers/search_mcp/server.py.
+#
+# JSON API: GET http://localhost:8888/search?q=<query>&format=json
+#
+# This file is rendered from a template by install.py — `{{SECRET_KEY}}`
+# below gets replaced with a fresh `secrets.token_hex(32)` on each fresh
+# install. Subsequent updates preserve the existing secret_key (the
+# installer leaves the file alone if it's already populated with a real
+# secret).
+
+use_default_settings: true
+
+server:
+  # Auto-generated per-install on first install. Keep this secret;
+  # SearXNG uses it for HMAC of session cookies + CSRF tokens.
+  secret_key: "{{SECRET_KEY}}"
+  limiter: false          # No rate limiting — internal-use only.
+  image_proxy: false
+  method: "GET"           # Allow GET requests (easier for agents).
+
+search:
+  safe_search: 0          # No filtering.
+  autocomplete: ""
+  default_lang: "en"
+  formats:
+    - html
+    - json                # REQUIRED: enable JSON API.
+
+# Curated engine list. Disable engines that produce noisy/slow results
+# or break frequently without a maintainer.
+engines:
+  - name: google
+    engine: google
+    shortcut: g
+    disabled: false
+
+  - name: bing
+    engine: bing
+    shortcut: b
+    disabled: false
+
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: ddg
+    disabled: false
+
+  - name: wikipedia
+    engine: wikipedia
+    shortcut: wp
+    disabled: false
+
+  - name: arxiv
+    engine: arxiv
+    shortcut: ax
+    categories: science
+    disabled: false
+
+  - name: github
+    engine: github
+    shortcut: gh
+    categories: it
+    disabled: false
+
+  - name: stackoverflow
+    engine: stackoverflow
+    shortcut: so
+    categories: it
+    disabled: false
+
+  - name: dockerhub
+    engine: dockerhub
+    shortcut: dh
+    categories: it
+    disabled: true        # Frequently returns noisy results.
+
+  - name: google news
+    engine: google_news
+    shortcut: gn
+    categories: news
+    disabled: false
+
+ui:
+  query_in_title: false
+  infinite_scroll: false
+  default_theme: simple
+  center_alignment: false
+
+# Don't log outgoing requests. Tune timeouts upwards if you're behind
+# a slow proxy or expect frequent rate-limit retries.
+outgoing:
+  request_timeout: 5.0
+  max_request_timeout: 10.0
+  useragent_suffix: ""
+  pool_connections: 100
+  pool_maxsize: 20
+  enable_http2: true

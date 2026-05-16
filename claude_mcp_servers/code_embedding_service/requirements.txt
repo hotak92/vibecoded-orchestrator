@@ -1,9 +1,19 @@
 sentence-transformers>=5.0.0
-# transformers must stay <5 — see root requirements.txt for the full
-# rationale. Tl;dr: CodeSage-Large-v2's modeling_codesage.py never calls
-# post_init(), and transformers v5 crashes (by design) on models that
-# don't. Validated 2026-05-04 against v5.0.0 and v5.7.0.
-transformers>=4.40.0,<5.0.0
+# transformers must stay <4.50 — TWO incompatibilities pin the upper bound:
+#   1. v5+: CodeSage-Large-v2's modeling_codesage.py never calls
+#      post_init(), and transformers v5 crashes (by design) on models
+#      that don't. Validated 2026-05-04 against v5.0.0 and v5.7.0.
+#   2. v4.50+: `Conv1D` was moved from `transformers.modeling_utils`
+#      to `transformers.pytorch_utils`. CodeSage's modeling_codesage.py
+#      line 11 does `from transformers.modeling_utils import Conv1D`
+#      and fails to import on 4.50+ with:
+#        ImportError: cannot import name 'Conv1D' from
+#          'transformers.modeling_utils'
+#      Symptom: container starts, sentence-transformers tries to load
+#      CodeSage with trust_remote_code=True, modeling_codesage.py
+#      imports fail, FastAPI app exits → restart loop forever.
+#      Validated 2026-05-16 against 4.57.6.
+transformers>=4.40.0,<4.50.0
 fastapi>=0.136.1
 uvicorn>=0.46.0
 pydantic>=2.13.3

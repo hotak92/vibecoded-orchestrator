@@ -107,7 +107,21 @@ services:
     profiles:
       - gpu  # Only started when `--profile gpu` is passed
 
+# Named volumes — explicit `name:` declarations are required so
+# Bug-31-style overrides in docker-compose.override.yml can alias them
+# to external pre-existing volumes (otherwise podman-compose 1.5.x
+# crashes with "can't merge value of [<vol>] of type NoneType and dict"
+# when the override tries to add `external: true` to a null-valued
+# entry here). Override pattern:
+#
+#   volumes:
+#     <name_above>:
+#       external: true
+#       name: <pre-existing-volume-name>
 volumes:
   weaviate_data:
+    name: vco_weaviate_data
   ollama_data:
+    name: vco_ollama_data
   code_embed_cache:
+    name: vco_code_embed_cache
