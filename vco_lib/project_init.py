@@ -3159,6 +3159,234 @@ def _emit_bash_env_cleanup_deferral(
 
 
 # ---------------------------------------------------------------------------
+# PR-22 (v0.2.12, 2026-05-16): legacy `docker-compose.override.yml` rename
+#
+# PR-10A (v0.2.11) shipped writing the launcher-managed compose override at
+# `infrastructure/docker-compose.override.yml`, but that filename is NOT
+# auto-loaded by podman-compose (it only auto-loads
+# `compose.override.yaml`/`.yml`). The companion boot-script change in
+# `scripts/launch-claude-mcp-stack.sh` now emits `-f compose.override.yaml`
+# explicitly; this helper handles existing on-disk legacy files so an
+# `install.py --update` from v0.2.11 migrates them in place.
+#
+# Scope:
+#   - `<install_root>/infrastructure/docker-compose.override.yml`
+#   - `<install_root>/claude_mcp_servers/docker-compose.override.yml`
+#     (hand-edited legacy location some users have).
+#
+# Behavior (per directory):
+#   - Legacy file absent → no-op.
+#   - Legacy file present + target `compose.override.yaml` absent → rename
+#     in place, emit a `compose_override_renamed` deferral so the operator
+#     can see the migration on next session.
+#   - Both present → conflict; do NOT rename, emit
+#     `compose_override_filename_conflict` so the operator resolves
+#     manually.
+#
+# Idempotent + soft-fail: subsequent runs find the legacy file gone and
+# silently no-op. Permission / disk errors are caught and surfaced as a
+# warning-severity deferral, never raised.
+# ---------------------------------------------------------------------------
+
+
+_LEGACY_COMPOSE_OVERRIDE_NAME = "docker-compose.override.yml"
+_CANONICAL_COMPOSE_OVERRIDE_NAME = "compose.override.yaml"
+_COMPOSE_OVERRIDE_SEARCH_SUBDIRS = ("infrastructure", "claude_mcp_servers")
+
+
+def _detect_and_rename_legacy_compose_override(install_root: Path) -> Optional[dict]:
+    """Detect any legacy `docker-compose.override.yml` files under
+    `install_root` and rename them to `compose.override.yaml` so
+    podman-compose's auto-loader recognizes them.
+
+    Searches the directories listed in `_COMPOSE_OVERRIDE_SEARCH_SUBDIRS`
+    (currently `infrastructure/` and `claude_mcp_servers/`). For each
+    legacy file found:
+
+    - If the target `compose.override.yaml` already exists in the same
+      directory: emit a `compose_override_filename_conflict` deferral
+      entry listing both paths. Do NOT rename — the operator resolves
+      manually (the legacy and canonical files may have diverged).
+    - Else: rename via `Path.rename()`. Emit a `compose_override_renamed`
+      deferral entry naming both the old and new absolute paths so the
+      operator can see the migration in the next-session report.
+
+    Idempotent: calling this on a tree with no legacy files is a no-op
+    (returns `None`). Calling it after a successful rename also returns
+    `None` on the next run.
+
+    Soft-fail: `PermissionError`, `OSError` (disk full, FS read-only,
+    cross-device link), and any other rename failure is caught and
+    converted into a `compose_override_rename_failed` deferral. The
+    install must still complete.
+
+    Args:
+        install_root: Absolute path to the orchestrator install root
+            (typically `Path(__file__).resolve().parent.parent` from
+            `install.py`).
+
+    Returns:
+        A dict shaped like ``{"action": "<...>", "renamed": [paths...],
+        "conflicts": [(old, new), ...], "errors": [(path, err), ...]}``
+        when at least one legacy file was detected, else ``None``. The
+        caller is expected to log + emit deferrals based on this; this
+        function itself emits the deferral entries directly so
+        callers can stay terse.
+
+    PR-22 (2026-05-16). See:
+    - knowledge/concepts/podman-compose-override-comment-yaml-drift-footgun.md
+    - .claude/context/PUBLIC_REPO_FIXES_REPORT_2026-05-16.md (Fixes 1, 2, 11)
+    """
+    from vco_lib.deferral_report import DeferralEntry, DeferralReport
+
+    install_root = Path(install_root)
+    renamed: list[tuple[Path, Path]] = []
+    conflicts: list[tuple[Path, Path]] = []
+    errors: list[tuple[Path, str]] = []
+
+    for subdir in _COMPOSE_OVERRIDE_SEARCH_SUBDIRS:
+        legacy_path = install_root / subdir / _LEGACY_COMPOSE_OVERRIDE_NAME
+        if not legacy_path.is_file():
+            continue
+        target_path = install_root / subdir / _CANONICAL_COMPOSE_OVERRIDE_NAME
+        if target_path.exists():
+            # Conflict: user has both. Don't overwrite their canonical
+            # file with the legacy one (or vice versa) — emit a
+            # deferral and let the operator resolve manually.
+            conflicts.append((legacy_path, target_path))
+            continue
+        try:
+            legacy_path.rename(target_path)
+            renamed.append((legacy_path, target_path))
+        except (OSError, PermissionError) as exc:
+            # Soft-fail: log + record. Most common cause is read-only FS
+            # (e.g. user mounted the install root noexec/ro for hardening).
+            errors.append((legacy_path, f"{type(exc).__name__}: {exc}"))
+
+    if not renamed and not conflicts and not errors:
+        return None
+
+    # Emit deferral entries (separate condition_id per outcome class so
+    # the operator can see at a glance what happened).
+    report = DeferralReport.read(install_root)
+
+    if renamed:
+        renamed_lines = "\n".join(
+            f"- `{old}` → `{new}`" for old, new in renamed
+        )
+        report.add_entry(DeferralEntry(
+            condition_id="compose_override_renamed",
+            title="Legacy compose override renamed to podman-compose auto-load name",
+            detected=(
+                "One or more `docker-compose.override.yml` files were "
+                "detected at `install_root` subdirectories and renamed "
+                "in place to `compose.override.yaml` so podman-compose's "
+                "auto-loader recognizes them. Renames:\n"
+                f"{renamed_lines}"
+            ),
+            why_deferred=(
+                "podman-compose only auto-loads override files named "
+                "`compose.override.yaml` / `compose.override.yml`; the "
+                "legacy Docker-Compose-v1 name `docker-compose.override.yml` "
+                "is NOT auto-loaded. PR-10A (v0.2.11) shipped writing the "
+                "wrong filename; users picking 'bind mount' mode in the "
+                "Storage Settings GUI got a confirmation but the override "
+                "was silently ignored at boot."
+            ),
+            command_to_apply=(
+                "# No action required — the rename has already been applied.\n"
+                "# Verify the canonical files exist:\n"
+                + "\n".join(f"ls -la {new}" for _old, new in renamed)
+            ),
+            severity="info",
+            kg_node_refs=[
+                "knowledge/concepts/podman-compose-override-comment-yaml-drift-footgun.md",
+            ],
+        ))
+
+    if conflicts:
+        conflict_lines = "\n".join(
+            f"- legacy: `{old}` -- canonical: `{new}`"
+            for old, new in conflicts
+        )
+        report.add_entry(DeferralEntry(
+            condition_id="compose_override_filename_conflict",
+            title="Both legacy and canonical compose override files present",
+            detected=(
+                "Detected a legacy `docker-compose.override.yml` AND a "
+                "canonical `compose.override.yaml` in the same directory. "
+                "The rename was NOT applied (the canonical file may already "
+                "carry user changes that differ from the legacy file). "
+                "Conflicting pairs:\n"
+                f"{conflict_lines}"
+            ),
+            why_deferred=(
+                "Auto-merging override YAML is unsafe — the two files may "
+                "encode different volume sources, ports, or service "
+                "additions. The operator must compare them and pick one."
+            ),
+            command_to_apply=(
+                "# Compare each conflicting pair, then delete whichever "
+                "is stale:\n"
+                + "\n".join(
+                    f"diff -u {old} {new}\n"
+                    f"# Then `rm` the one you do NOT want to keep."
+                    for old, new in conflicts
+                )
+            ),
+            severity="warning",
+            kg_node_refs=[
+                "knowledge/concepts/podman-compose-override-comment-yaml-drift-footgun.md",
+            ],
+        ))
+
+    if errors:
+        error_lines = "\n".join(
+            f"- `{path}`: {err}" for path, err in errors
+        )
+        report.add_entry(DeferralEntry(
+            condition_id="compose_override_rename_failed",
+            title="Legacy compose override rename failed",
+            detected=(
+                "One or more legacy `docker-compose.override.yml` files "
+                "could not be renamed to `compose.override.yaml`:\n"
+                f"{error_lines}"
+            ),
+            why_deferred=(
+                "Most common cause is a read-only filesystem, restrictive "
+                "permissions, or a cross-device boundary. The install can "
+                "still complete; podman-compose's auto-load just won't "
+                "pick up the override until the rename is applied."
+            ),
+            command_to_apply=(
+                "# Resolve the underlying cause and rename by hand:\n"
+                + "\n".join(
+                    f"mv {path} {path.parent / _CANONICAL_COMPOSE_OVERRIDE_NAME}"
+                    for path, _err in errors
+                )
+            ),
+            severity="warning",
+            kg_node_refs=[
+                "knowledge/concepts/podman-compose-override-comment-yaml-drift-footgun.md",
+            ],
+        ))
+
+    report.write(install_root)
+
+    return {
+        "action": (
+            "renamed" if renamed and not conflicts and not errors
+            else "conflict" if conflicts and not renamed and not errors
+            else "error" if errors and not renamed and not conflicts
+            else "mixed"
+        ),
+        "renamed": [(str(o), str(n)) for o, n in renamed],
+        "conflicts": [(str(o), str(n)) for o, n in conflicts],
+        "errors": [(str(p), e) for p, e in errors],
+    }
+
+
+# ---------------------------------------------------------------------------
 # PR-10B (v0.2.11): legacy KG / code-graph collection detection on Add Project
 #
 # When a user adds a pre-existing project that has accumulated KG or code-graph

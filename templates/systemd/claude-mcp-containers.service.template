@@ -54,6 +54,12 @@ RemainAfterExit=yes
 WorkingDirectory={{WORKING_DIR}}
 Environment=VCT_STACK_WORKING_DIR={{WORKING_DIR}}
 Environment=VCT_STACK_LOG_FILE={{LOG_FILE}}
+# PR-22 (2026-05-16): explicit compose override filename. podman-compose's
+# auto-load picks up `compose.override.yaml`/`.yml` but the wrapper's
+# explicit `-f compose.yaml` bypasses that auto-load, so the wrapper
+# itself reads this var and emits `-f <override>` when the file exists.
+# Override at user level if you ship overrides under a different name.
+Environment=VCT_STACK_COMPOSE_OVERRIDE=compose.override.yaml
 ExecStart=/usr/bin/env bash {{WRAPPER_SCRIPT}}
 # Tolerate exit 125 from podman-compose (some containers failed, others OK).
 SuccessExitStatus=0 125

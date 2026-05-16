@@ -295,6 +295,191 @@ def test_overlay_paths_override_via_env(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
+# PR-22 (2026-05-16) — VCT_STACK_COMPOSE_OVERRIDE explicit `-f` emission.
+#
+# podman-compose auto-loads `compose.override.yaml`, but the wrapper's
+# explicit `-f compose.yaml` bypasses that auto-load. The wrapper must
+# therefore emit `-f <override>` explicitly when the env var points at
+# an existing non-empty file. Silent fall-through (no flag) is the
+# expected behavior when the file is absent.
+# ---------------------------------------------------------------------------
+
+
+def _call_pick_with_env(
+    runtime: str,
+    gpu_mode: str,
+    working_dir: str,
+    extra_env: dict,
+) -> tuple[int, str, str]:
+    """Variant of _call_pick that passes a custom env block to the
+    subshell. Used to exercise VCT_STACK_COMPOSE_OVERRIDE."""
+    import os
+    env = os.environ.copy()
+    env.update(extra_env)
+    cmd = [
+        BASH or "bash",
+        "-c",
+        f'source "{SCRIPT}"; pick_compose_invocation "$1" "$2" "$3"',
+        "_",
+        runtime,
+        gpu_mode,
+        working_dir,
+    ]
+    proc = subprocess.run(
+        cmd, capture_output=True, text=True, timeout=10, env=env,
+    )
+    return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+
+
+def _materialize_override(working_dir: Path, name: str = "compose.override.yaml") -> Path:
+    """Create a non-empty override file inside working_dir."""
+    f = working_dir / name
+    f.write_text("services: {}\n")
+    return f
+
+
+def test_override_present_emits_explicit_f_flag(tmp_path: Path):
+    """When VCT_STACK_COMPOSE_OVERRIDE points at an existing non-empty
+    file (resolved relative to working_dir), the override `-f` flag MUST
+    appear in the output. This is the PR-22 fix — without it the
+    launcher-managed Storage UX override is silently ignored."""
+    _materialize_override(tmp_path)
+    rc, out, _ = _call_pick_with_env(
+        "podman-compose", "cpu", str(tmp_path),
+        {"VCT_STACK_COMPOSE_OVERRIDE": "compose.override.yaml"},
+    )
+    assert rc == 0
+    assert out == "podman-compose -f compose.yaml -f compose.override.yaml"
+
+
+def test_override_absent_no_flag(tmp_path: Path):
+    """If the override env var points at a missing file, no `-f` flag
+    is emitted. Silent fall-through is the intended behavior (the user
+    may not have any override config yet)."""
+    rc, out, _ = _call_pick_with_env(
+        "podman-compose", "cpu", str(tmp_path),
+        {"VCT_STACK_COMPOSE_OVERRIDE": "compose.override.yaml"},
+    )
+    assert rc == 0
+    assert out == "podman-compose -f compose.yaml"
+
+
+def test_override_empty_file_no_flag(tmp_path: Path):
+    """Empty override file should NOT trigger the flag — `-s` check
+    in pick_compose_invocation rejects zero-byte files (mirrors the
+    overlay_exists policy)."""
+    (tmp_path / "compose.override.yaml").write_text("")
+    rc, out, _ = _call_pick_with_env(
+        "podman-compose", "cpu", str(tmp_path),
+        {"VCT_STACK_COMPOSE_OVERRIDE": "compose.override.yaml"},
+    )
+    assert rc == 0
+    assert out == "podman-compose -f compose.yaml"
+
+
+def test_override_env_pointing_at_missing_file_no_flag(tmp_path: Path):
+    """If VCT_STACK_COMPOSE_OVERRIDE points at a path that doesn't
+    exist, no flag is emitted regardless of which other files exist
+    in working_dir. The default-resolution chain (empty/unset → script
+    default `compose.override.yaml`) is intentional behavior; users
+    who want to disable the override entirely should point the var
+    at a known-missing path (e.g. /dev/null) or set the working_dir
+    to one without the file."""
+    # No compose.override.yaml materialized; point env at a custom name
+    # that also doesn't exist.
+    rc, out, _ = _call_pick_with_env(
+        "podman-compose", "cpu", str(tmp_path),
+        {"VCT_STACK_COMPOSE_OVERRIDE": "does-not-exist.yaml"},
+    )
+    assert rc == 0
+    assert out == "podman-compose -f compose.yaml"
+
+
+def test_override_with_gpu_overlay_both_flags_override_last(tmp_path: Path):
+    """When both the GPU overlay and the user override are present, both
+    `-f` flags must appear AND the override must come LAST (compose
+    precedence: later files win on conflicts). PR-22 ordering rule."""
+    _materialize_overlays(tmp_path)
+    _materialize_override(tmp_path)
+    rc, out, _ = _call_pick_with_env(
+        "podman-compose", "gpu", str(tmp_path),
+        {"VCT_STACK_COMPOSE_OVERRIDE": "compose.override.yaml"},
+    )
+    assert rc == 0
+    assert out == (
+        "podman-compose -f compose.yaml "
+        "-f infrastructure/podman-compose.gpu.yml "
+        "-f compose.override.yaml"
+    )
+    # Cross-check: the override token appears AFTER the overlay token.
+    overlay_idx = out.index("podman-compose.gpu.yml")
+    override_idx = out.index("compose.override.yaml")
+    assert override_idx > overlay_idx, (
+        f"override must come AFTER gpu overlay; got: {out}"
+    )
+
+
+def test_override_docker_runtime(tmp_path: Path):
+    """All 3 runtimes must honor the override flag uniformly. docker."""
+    _materialize_override(tmp_path)
+    rc, out, _ = _call_pick_with_env(
+        "docker", "cpu", str(tmp_path),
+        {"VCT_STACK_COMPOSE_OVERRIDE": "compose.override.yaml"},
+    )
+    assert rc == 0
+    assert out == "docker compose -f compose.yaml -f compose.override.yaml"
+
+
+def test_override_podman_subcommand_runtime(tmp_path: Path):
+    """All 3 runtimes must honor the override flag uniformly. podman compose."""
+    _materialize_override(tmp_path)
+    rc, out, _ = _call_pick_with_env(
+        "podman compose", "cpu", str(tmp_path),
+        {"VCT_STACK_COMPOSE_OVERRIDE": "compose.override.yaml"},
+    )
+    assert rc == 0
+    assert out == "podman compose -f compose.yaml -f compose.override.yaml"
+
+
+def test_override_absolute_path(tmp_path: Path):
+    """When the env var is an absolute path, the resolved path bypasses
+    working_dir concatenation. Useful for users with shared override
+    files at non-default locations."""
+    abs_override = tmp_path / "elsewhere" / "custom.override.yaml"
+    abs_override.parent.mkdir()
+    abs_override.write_text("services: {}\n")
+    rc, out, _ = _call_pick_with_env(
+        "podman-compose", "cpu", str(tmp_path),
+        {"VCT_STACK_COMPOSE_OVERRIDE": str(abs_override)},
+    )
+    assert rc == 0
+    assert out == f"podman-compose -f compose.yaml -f {abs_override}"
+
+
+def test_override_default_env_value_resolves(tmp_path: Path):
+    """When VCT_STACK_COMPOSE_OVERRIDE is NOT set at all, the script's
+    own default (`compose.override.yaml`) is used. Materializing the
+    canonical-named file inside working_dir should trigger the flag."""
+    _materialize_override(tmp_path)
+    import os
+    env = {k: v for k, v in os.environ.items() if k != "VCT_STACK_COMPOSE_OVERRIDE"}
+    cmd = [
+        BASH or "bash",
+        "-c",
+        f'source "{SCRIPT}"; pick_compose_invocation "$1" "$2" "$3"',
+        "_",
+        "podman-compose",
+        "cpu",
+        str(tmp_path),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10, env=env)
+    assert proc.returncode == 0
+    assert proc.stdout.strip() == (
+        "podman-compose -f compose.yaml -f compose.override.yaml"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Script structure smoke test — sourcing must not trigger main().
 # ---------------------------------------------------------------------------
 

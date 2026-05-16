@@ -78,10 +78,27 @@
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
     <Priority>7</Priority>
   </Settings>
+  <!--
+    Action invocation note (PR-22, 2026-05-16):
+
+    Task Scheduler XML has no native env-var declarations in <Actions>.
+    To propagate VCT_STACK_COMPOSE_OVERRIDE (the user-machine compose
+    override filename — see scripts/launch-claude-mcp-stack.sh) we set
+    it inline via `bash -c 'export ...; exec ...'`. This mirrors the
+    systemd unit's `Environment=VCT_STACK_COMPOSE_OVERRIDE=...` line.
+    The default value `compose.override.yaml` matches podman-compose's
+    auto-load convention; without this env var, the launcher-managed
+    Storage UX override (PR-10A) is silently ignored at boot because
+    the wrapper's explicit `-f compose.yaml` bypasses auto-load.
+
+    VCT_STACK_WORKING_DIR is left unset here — pre-existing scope; the
+    wrapper falls back to its own default. Adding it via the same
+    `export` line is a separate, out-of-PR change.
+  -->
   <Actions Context="Author">
     <Exec>
       <Command>bash</Command>
-      <Arguments>"{{WRAPPER_SCRIPT}}"</Arguments>
+      <Arguments>-c "export VCT_STACK_COMPOSE_OVERRIDE=compose.override.yaml; exec bash \"{{WRAPPER_SCRIPT}}\""</Arguments>
       <WorkingDirectory>{{WORKING_DIR}}</WorkingDirectory>
     </Exec>
   </Actions>
