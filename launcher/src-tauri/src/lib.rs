@@ -294,6 +294,10 @@ pub fn run() {
             commands::lifecycle::services_start_all,
             commands::lifecycle::services_stop_all,
             commands::lifecycle::services_restart_all,
+            // PR-15 G2 (v0.2.11): zombie container recovery — Tauri
+            // command driven by the "Recover" button next to a service
+            // marked `zombie: true` in `services_status`.
+            commands::lifecycle::recover_zombie,
             commands::lifecycle::service_start,
             commands::lifecycle::service_stop,
             commands::lifecycle::service_restart,
