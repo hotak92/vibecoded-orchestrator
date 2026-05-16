@@ -3,7 +3,7 @@ title: Orchestrator Context Management
 type: concept
 tags: [mid-level-architecture, vibecoded-orchestrator, context-management, memory, hook-system]
 created: 2026-04-27T18:30:00Z
-updated: 2026-05-16T03:52:42Z
+updated: 2026-05-16T20:30:00Z
 status: active
 ---
 
@@ -221,9 +221,9 @@ Read file1.py | Read file2.py | Grep "pattern" dir/
 
 For multi-file operations (>10 files), spawn a sub-agent rather than reading files sequentially in the main context. The agent's context is separate and doesn't consume the main session's token budget.
 
-### Local Analysis Tasks
+### Ollama for Analysis
 
-Local analysis tasks (rewriting docstrings, summarizing files, extracting info) now use Claude directly. The Ollama MCP path (`chat`, `read_document`) was removed in v0.2.11 as redundant — Claude's native reasoning is strictly better quality, and for OAuth-subscription users the "FREE" framing was misleading (tokens are included in the subscription). Use `Read` with `offset`/`limit` for large-file extraction; Claude reasons over the content natively.
+The Ollama MCP (`chat`, `read_document`) is no longer installed by default as of v0.2.11. If you've opted into the Ollama MCP (Launcher → Modules → "Ollama Local LLM"), you can use `chat` for quick local analysis at zero API cost. Without the opt-in, use Claude's native reasoning and the `Read` tool with `offset`/`limit` for large files instead.
 
 ## Active Plan Files
 

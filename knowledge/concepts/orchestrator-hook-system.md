@@ -3,7 +3,7 @@ title: Orchestrator Hook System
 type: concept
 tags: [mid-level-architecture, vibecoded-orchestrator, hooks, automation, workflow]
 created: 2026-04-27T18:30:00Z
-updated: 2026-04-27T18:30:00Z
+updated: 2026-05-16T20:30:00Z
 status: active
 ---
 
@@ -118,6 +118,12 @@ Context nearing limit
 - Scans for dangerous patterns: `curl | sh`, `eval $(curl ...)`, `base64 | sh`.
 - Delegates to `bash_security.py` which applies 9 rule categories and 20+ rules.
 
+**lean-ctx-rewrite.sh / lean-ctx-rewrite.ps1** (matcher: `Bash(*)`)
+- Bash/PowerShell hook that rewrites Bash commands for token compression via `lean-ctx hook rewrite`.
+- Scrubs sensitive environment variables (`SUPABASE_KEY`, `GITHUB_TOKEN`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `AWS_*`, `TELEGRAM_BOT_TOKEN`, `POSTGRES_PASSWORD`, `VERCEL_TOKEN`, `CLAUDE_API_KEY`) before delegating to the lean-ctx subprocess.
+- Defense-in-depth measure added 2026-05-16 (commit cb7ff88) to prevent accidental credential leakage via lean-ctx's logs or debug output.
+- Graceful no-op when lean-ctx is not installed; symmetric `bypass` support for raw output on a per-call basis.
+
 **pre-edit-context-inject.sh** (matcher: `Edit(*)`)
 - Before editing a file, runs KG search for the filename/concept and code-graph search for related functions.
 - Injects search results as context (live ~2.7s, cached ~31ms via 10-min TTL file cache).
@@ -173,14 +179,33 @@ Context nearing limit
 - Sends urgent desktop notification (different urgency level than normal stop).
 - Appends failure record to `~/.claude/metrics/failures.jsonl`.
 
+## Hook Source Layout
+
+The source-of-truth for all hook scripts is `templates/hooks/*.sh` (and their `.ps1` Windows siblings). The `.claude/hooks/` directory in any installed project is rendered from these templates at install time — it is not an authoritative source. When reading or referencing hook code, use `templates/hooks/*.sh`.
+
+## Python Environment (venv) Resolution
+
+The three hooks that call Python helpers (`code-graph-incremental.sh`, `kg-summary-generator.sh`, `pre-edit-context-inject.sh`) need a Python interpreter from the orchestrator venv. The resolution order (planned for v0.2.12 via Group D / PR-25) is:
+
+1. `$VCT_VENV` — explicit override (highest priority).
+2. `$REPO_ROOT/.venv/bin/python` — top-level venv layout (used by modern installs where `install.py` creates `.venv` at the project root).
+3. `$REPO_ROOT/claude_mcp_servers/.venv/bin/python` — legacy layout fallback (used by installs that placed the venv inside `claude_mcp_servers/`).
+4. Windows path variants of the above (`.venv/Scripts/python.exe`).
+
+Prior to PR-25, these hooks only checked `claude_mcp_servers/.venv` and fell through silently to system python on modern installs, causing code-graph and KG-summary updates to silently break.
+
+## MCP Lifecycle — SIGHUP Env Reload
+
+Planned for v0.2.12 (PR-42): MCP server processes will register a `SIGHUP` handler that calls `sys.exit(0)` (clean exit). Claude Code's MCP supervisor respawns any process that exits cleanly, picking up the latest env from `~/.claude.json` on restart. The launcher's file watcher on `.claude/settings.json` (debounced 1 second) will dispatch the SIGHUP automatically whenever the file changes. A manual "Reload MCP env" button in the launcher's MCP maintenance panel will also dispatch it on demand.
+
 ## Hook Discipline
 
-Every shell hook in `.claude/hooks/*.sh` carries:
+Every shell hook in `templates/hooks/*.sh` carries:
 
 1. **Env-scrub block** at the top — strips `SUPABASE_KEY`, `GITHUB_TOKEN`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `AWS_*`, `TELEGRAM_BOT_TOKEN`, `DATABASE_URL`, etc. before any subprocess inherits the environment.
 2. **VCT_DISABLE_HOOKS escape hatch** immediately after the env-scrub — `VCT_DISABLE_HOOKS=1 claude` disables every hook for debugging or CI. See [[Hook Discipline — VCT_DISABLE_HOOKS Escape Hatch]].
 3. **Cross-OS portability** — `${TMPDIR:-${XDG_RUNTIME_DIR:-/tmp}}` instead of hardcoded `/tmp`. See [[Cross-OS Hook Portability]].
-4. **`bash -n` syntax check** runs in CI on every commit touching `.claude/hooks/`.
+4. **`bash -n` syntax check** runs in CI on every commit touching `templates/hooks/`.
 
 ## Integration Points
 

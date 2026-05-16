@@ -1,15 +1,15 @@
 ---
 title: read_image — Memory-Aware Vision-Model Gating
 type: concept
-tags: [ollama, vision, vlm, memory, mcp, low-level-implementation, vibecoded-orchestrator, deprecated]
+tags: [ollama, vision, vlm, memory, mcp, low-level-implementation, vibecoded-orchestrator]
 created: 2026-04-27T18:30:00Z
-updated: 2026-05-16T03:53:08Z
-status: deprecated
+updated: 2026-05-16T20:30:00Z
+status: active
 ---
 
 # read_image — Memory-Aware Vision-Model Gating
 
-> **Deprecated v0.2.11**: The `read_image` Ollama MCP tool was removed in v0.2.11. Use Claude's native vision instead: pass an image file path to the `Read` tool and Claude sees it directly. The memory-aware gating logic below is preserved as historical reference only.
+**Availability note (v0.2.11+)**: The Ollama MCP server is no longer part of the default VCO install (PR-14a, v0.2.11). The `read_image` tool described below remains in the Ollama MCP source code and is available via opt-in install (Launcher → Modules → "Ollama Local LLM" or the `vct-ollama.json` bundled manifest). The gating logic itself (resize tiers, VRAM thresholds) is unchanged.
 
 The `read_image` MCP tool (Ollama MCP) returns an image as a base64 data URL Claude can see directly. The optional **local description tier** runs a vision model (`qwen3.5:9b` default) on-device. Memory-aware gating probes free VRAM and system RAM at module load and either picks a fitting model, falls back to a smaller installed one, or skips the description with a clear reason. The image-as-base64 path is unchanged — it always returns.
 

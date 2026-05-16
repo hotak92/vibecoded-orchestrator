@@ -3,7 +3,7 @@ title: Orchestrator Code Graph
 type: concept
 tags: [mid-level-architecture, vibecoded-orchestrator, code-analysis, weaviate, semantic-search]
 created: 2026-04-27T18:30:00Z
-updated: 2026-04-27T18:30:00Z
+updated: 2026-05-16T20:30:00Z
 status: active
 ---
 
@@ -43,7 +43,7 @@ Source repository
         |     data_flow_vars — data-flow variable tracking
         |
         +-- Embed via the code-embedding service
-        |   (CodeSage-Large-v2 on GPU, jina-embeddings-v2-base-code on CPU)
+        |   (CodeSage-Large-v2 on GPU, qwen3-embedding:0.6b on CPU via Ollama)
         |
         +-- Upsert to Weaviate per-project collections
 ```
@@ -120,10 +120,10 @@ Cross-service or cross-module call.
 
 ## Embedding
 
-Code entities embed via the orchestrator's code-embedding service (port 11438). Two backends:
+Code entities embed via the orchestrator's code-embedding service (port 11440). Two backends:
 
 - **GPU (default if CUDA available)**: [[CodeSage-Large-v2]] — 2048-dim, 1.3B params, Apache 2.0.
-- **CPU fallback**: [[Jina Embeddings v2 Base Code]] — 768-dim, 161M params, Apache 2.0.
+- **CPU fallback** (`CODE_EMBED_BACKEND=ollama`): `qwen3-embedding:0.6b` via Ollama (1024-dim). Set `CODE_EMBED_MODEL` to override the Ollama model.
 
 Each code collection registers both named vectors (`codesage_embed` + `ollama_code_embed`) so existing entries remain searchable after a backend switch. KG nodes use a separate text embedding ([[Qwen3 Embedding]] / [[Snowflake Arctic Embed 2.0]]); the two embedding spaces are kept disjoint.
 

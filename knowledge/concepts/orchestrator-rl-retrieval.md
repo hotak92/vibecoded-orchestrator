@@ -3,7 +3,7 @@ title: Orchestrator RL Retrieval
 type: concept
 tags: [mid-level-architecture, vibecoded-orchestrator, reinforcement-learning, retrieval, weaviate, context-injection, pro-tier]
 created: 2026-04-27T18:30:00Z
-updated: 2026-04-27T18:30:00Z
+updated: 2026-05-16T20:30:00Z
 status: active
 ---
 
@@ -12,6 +12,22 @@ status: active
 > **Pro-tier feature.** The reinforcement-learning reranker is part of the orchestrator's paid tier. The free tier ships standard hybrid search (BM25 + vector) and works without it.
 
 The RL retrieval system wraps Weaviate searches with a reinforcement-learning reranking layer. When Claude searches the knowledge graph, the system over-fetches candidates from Weaviate, passes them through an RL server for reranking based on learned relevance signals, and returns the reordered results. Online training fires after each search to improve the reranker continuously.
+
+## Per-Project Deployment
+
+Each project gets its own RL server instance with its own neural network state. Cross-project leakage is impossible — different projects' citation patterns are different latent distributions, and a single shared network would mode-collapse to whoever's data dominates.
+
+**Port allocation**: each project's RL server port is project-specific, allocated at project-create time and persisted to the launcher DB. The port is mirrored to `<project>/.claude/settings.json env.RL_SERVER_URL` (e.g., `http://localhost:<project-rl-port>`). Do not hardcode `11439` — that was the legacy fixed port used before per-project allocation was introduced.
+
+Systemd unit canonical pattern for launcher-managed RL lifecycle: `ExecStart=<install_root>/.venv/bin/python -m rl_server.rl_server --port <project_rl_port> --project-root <project_folder> --log-path <home>/.claude/retrieval_rl_data/rl_events_<project_slug>.jsonl --verbose`. `PYTHONPATH` must include `<install_root>/claude_mcp_servers`. `After=claude-mcp-containers.service` so Ollama is up first.
+
+**License-gate behavior**: `feature_enabled("rl_retrieval")` returns `False` on free tier OR when license-validation has been offline >3 days. When `False`, `_rl_cache_and_rerank` at `weaviate_mcp/server.py` short-circuits to Weaviate cosine order without any HTTP call to the RL server. The 3-day grace is in `VCThelpers/license/validator.py`.
+
+There is no client-side bypass that unlocks paid-server features. Patching `feature_enabled` locally would allow the launcher UI to render the toggle as "on" — but the paid container artifact still cannot be pulled without a valid pull-token from the signed-URL gateway (see [[relatedTo::Launcher Packaging & Paid-Module Distribution Design]]).
+
+**Paid-module distribution**: the RL server's Python source ships in a GHCR container image (not in the AGPL public repo's `claude_mcp_servers/`). Image pulled via a short-lived (15-min TTL) per-user pull token issued by Supabase `/rl-artifact-url` after `/validate-tier` confirms Pro tier. Weekly model-weight rotation is the anti-piracy moat — a leaked snapshot degrades vs free-tier `hybrid_search` within ~2 weeks of stopping refreshes. See [[relatedTo::Launcher Packaging & Paid-Module Distribution Design]] for the full distribution plan.
+
+**Online fine-tuning after global model download**: when the launcher polls `/rl-latest-version` and detects a newer weights bundle, it downloads + prompts the user: fine-tune now / fine-tune later / skip. Fine-tune runs against the last 30 days of events from `~/.claude/retrieval_rl_data/rl_events_<project_slug>.jsonl`. On fine-tune failure (OOM, corrupted log, etc.), the global model is kept unmodified. Last-30-days window keeps fine-tune fast even on CPU-only Pro users.
 
 [[implements::Reinforcement Learning]] [[uses::Weaviate]] [[relatedTo::Orchestrator Knowledge Graph]] [[relatedTo::Orchestrator MCP Servers]] [[relatedTo::Orchestrator Context Management]]
 
@@ -35,7 +51,7 @@ Claude calls hybrid_search(query, limit=10)
         |
         +-- Over-fetch from Weaviate: limit * 2 = 20 candidates
         |
-        +-- POST http://localhost:11439/rerank
+        +-- POST http://localhost:<project-rl-port>/rerank
         |     Body: {query, candidates, session_id, call_seq}
         |
         |     RL Server (rl_server.py):
@@ -49,7 +65,7 @@ Claude calls hybrid_search(query, limit=10)
 
 ## RL Server
 
-**URL**: `http://localhost:11439`
+**URL**: `http://localhost:<project-rl-port>` — project-specific port configured in `.claude/settings.json env.RL_SERVER_URL`.
 
 A lightweight FastAPI process that:
 

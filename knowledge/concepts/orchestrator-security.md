@@ -3,7 +3,7 @@ title: Orchestrator Security Model
 type: concept
 tags: [mid-level-architecture, vibecoded-orchestrator, security, hooks]
 created: 2026-04-27T18:30:00Z
-updated: 2026-05-16T03:52:49Z
+updated: 2026-05-16T20:30:00Z
 status: active
 ---
 
@@ -33,21 +33,22 @@ The orchestrator implements a defense-in-depth security model enforced automatic
 **Implementation**: every shell hook that spawns subprocesses contains a scrubbing header that unsets sensitive variables before any subprocess inherits the environment:
 
 ```bash
-unset SUPABASE_KEY SUPABASE_SERVICE_KEY
+unset SUPABASE_KEY SUPABASE_URL
 unset GITHUB_TOKEN GH_TOKEN
 unset OPENAI_API_KEY ANTHROPIC_API_KEY
-unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
 unset TELEGRAM_BOT_TOKEN
-unset DATABASE_URL POSTGRES_PASSWORD
+unset POSTGRES_PASSWORD
+unset VERCEL_TOKEN CLAUDE_API_KEY
 ```
 
-The scrub happens at the top of each hook script, before any other logic. Pattern adopted from the Claude Code leak analysis (see `knowledge/research/`).
+The scrub happens at the top of each hook script, before any other logic. This is enforced by test suite (`tests/test_hooks_disable_guard.py`) to ensure all hooks maintain parity across OSes (bash scripts on POSIX, PowerShell scripts on Windows). Pattern adopted from the Claude Code leak analysis (see `knowledge/research/`).
 
 ## Layer 2: SSRF Guard
 
 **Threat**: a prompt injection or compromised tool call could make Claude issue HTTP requests to internal services (cloud metadata APIs, internal dashboards, localhost services not intended for Claude access).
 
-**Implementation**: PreToolUse hook on `Bash(*)` inspects curl, wget, httpx, and requests calls for target URLs.
+**Implementation**: PreToolUse hook on `WebFetch` and `Bash(*)` inspects curl, wget, httpx, and requests calls for target URLs. (`mcp__search__fetch_page` was previously also guarded but the Search MCP's `fetch_page` tool was removed in v0.2.11.)
 
 Private IP ranges blocked by default:
 - `10.0.0.0/8`
@@ -58,10 +59,10 @@ Private IP ranges blocked by default:
 
 Whitelist (explicitly allowed localhost services):
 - `localhost:8081` — Weaviate
-- `localhost:11435` — Ollama (infrastructure, embeddings)
+- `localhost:11435` — Ollama
 - `localhost:11440` — code-embedding service
 
-Note: `localhost:8888` (SearXNG) was removed from the whitelist in v0.2.11 along with the SearXNG container itself.
+`localhost:8888` (SearXNG) was removed from the whitelist in v0.2.11 when the SearXNG container was dropped from the default install. If you run SearXNG as an opt-in service, add `:8888` back to the whitelist in your project's `.claude/hooks/pre-tool-use.sh`.
 
 Blocked requests exit 1 with an explanation of which range was matched.
 

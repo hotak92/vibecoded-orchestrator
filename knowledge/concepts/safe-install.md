@@ -3,7 +3,7 @@ title: Safe-Install — Content-Based Service Detection
 type: concept
 tags: [install, weaviate, ollama, podman, services, low-level-implementation, vibecoded-orchestrator]
 created: 2026-04-27T18:30:00Z
-updated: 2026-04-27T18:30:00Z
+updated: 2026-05-16T20:30:00Z
 status: active
 ---
 
@@ -13,7 +13,7 @@ status: active
 
 ## What it is
 
-Before bringing up its own Podman/Docker containers, install.py issues HTTP probes to ports 8081 (Weaviate), 11435 (Ollama), 11438 (code-embed). Each probe inspects the response body and classifies the service into one of four states.
+Before bringing up its own Podman/Docker containers, install.py issues HTTP probes to ports 8081 (Weaviate), 11435 (Ollama), 11440 (code-embed). Each probe inspects the response body and classifies the service into one of four states.
 
 ## Decision matrix
 

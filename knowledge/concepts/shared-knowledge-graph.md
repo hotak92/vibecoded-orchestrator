@@ -3,7 +3,7 @@ title: Shared Knowledge Graph (Cross-Project)
 type: concept
 tags: [knowledge-graph, weaviate, vibecoded-tools, mid-level-architecture, retrieval]
 created: 2026-04-27T00:00:00Z
-updated: 2026-04-27T20:00:00Z
+updated: 2026-05-16T20:30:00Z
 status: active
 ---
 

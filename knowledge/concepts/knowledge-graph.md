@@ -3,7 +3,7 @@ title: Knowledge Graph
 type: concept
 tags: [AI, knowledge-graph, graph-database, entities, relationships, ontology, semantic-web]
 created: 2026-03-29T00:00:00Z
-updated: 2026-04-05T14:33:31Z
+updated: 2026-05-16T18:39:18Z
 status: active
 ---
 
@@ -108,12 +108,12 @@ See [[GraphRAG Pattern]] for detailed implementation.
 
 ## This Project's Implementation
 
-- **Storage**: Weaviate at `localhost:8081`, collection `ClaudeKnowledgeGraph`
+- **Storage**: Weaviate at `localhost:8081` (default). Per-project collection: `<ProjectBasename>_KnowledgeGraph`. Shared cross-project collection: `VibecodedOrchestrator_KnowledgeGraph` (renamed from `VibeCodedTools_KnowledgeGraph` in v0.2.12 PR-26; legacy alias kept for ~3 releases).
 - **Nodes**: Markdown files with YAML frontmatter in `knowledge/` directories
 - **Relationships**: Typed WikiLinks (`[[relatedTo::Node]]`, `[[uses::Tool]]`)
 - **Traversal**: `semantic_graph_search` MCP tool (BFS up to depth 3)
-- **Search**: `hybrid_search` combines semantic + keyword across KG + project docs
-- **Embeddings**: `snowflake-arctic-embed2` via Ollama (1024-dim)
+- **Search**: `hybrid_search` combines semantic + keyword across per-project KG + shared `VibecodedOrchestrator_KnowledgeGraph` + project docs
+- **Default embeddings**: `qwen3-embedding:0.6b` via Ollama (1024-dim). Legacy named vectors (`snowflake-arctic-embed2`, `ollama_embed`) are preserved in existing collections for backward compatibility but `qwen3_embed` is the active search vector.
 
 ## Graph Databases
 

@@ -3,7 +3,7 @@ title: Semantic Search
 type: concept
 tags: [AI, search, embeddings, vector-database, retrieval, NLP, information-retrieval]
 created: 2026-02-26T00:00:00Z
-updated: 2026-05-16T03:52:54Z
+updated: 2026-05-16T20:30:00Z
 status: active
 ---
 
@@ -36,10 +36,11 @@ This enables retrieval of conceptually related content even when the query uses 
 
 | Model | Dimensions | Strengths |
 |---|---|---|
-| snowflake-arctic-embed2 | 1024 | Strong retrieval, used in this project |
+| qwen3-embedding:0.6b | 1024 | Compact, fast, default in this project (text + code CPU fallback) |
+| snowflake-arctic-embed2 | 1024 | Strong retrieval, legacy named vector (preserved in existing collections) |
 | text-embedding-3-large | 3072 | OpenAI, best general-purpose |
 | BGE-M3 | 1024 | Multilingual, sparse+dense hybrid |
-| Jina Embeddings v2 | 768 | Code-optimized variant |
+| Jina Embeddings v2 | 768 | Code-optimized variant (legacy code CPU fallback, replaced by qwen3) |
 | E5-large | 1024 | Strong for passage retrieval |
 | nomic-embed-text | 768 | Open source, competitive quality |
 
@@ -100,10 +101,11 @@ Semantic search is the retrieval backbone of RAG (Retrieval-Augmented Generation
 
 ## This Project's Usage
 
-- **Collection**: `ClaudeKnowledgeGraph` in Weaviate at `http://localhost:8081`
-- **Embedding model**: `snowflake-arctic-embed2:latest` (1024-dim) via Ollama
-- **Tools**: `hybrid_search` (default), `semantic_graph_search`, `get_node_connections` (Weaviate MCP)
-- **Code embeddings**: `jina-embeddings-v2-base-code` (768-dim)
+- **Collection**: `<ProjectBasename>_KnowledgeGraph` in Weaviate at `http://localhost:8081` (default port)
+- **Text embedding model**: `qwen3-embedding:0.6b` (1024-dim) via Ollama — default active embedding
+- **Code embedding model**: CodeSage-Large-v2 (2048-dim, GPU) via the code-embedding service; CPU fallback uses `qwen3-embedding:0.6b` via Ollama
+- **Tools**: `hybrid_search` (default), `semantic_graph_search`, `search_code_graph`, `query_code_structure` (Weaviate MCP)
+- **Legacy embeddings**: `snowflake-arctic-embed2` and `jina-embeddings-v2-base-code` are preserved as named vectors in existing collections for backward compatibility but are no longer the active embedding model
 
 ## Embedding Model Selection
 

@@ -3,7 +3,7 @@ title: Model Context Protocol
 type: concept
 tags: [MCP, AI, protocol, tools, integration, Anthropic, agentic]
 created: 2026-02-26T00:00:00Z
-updated: 2026-05-16T03:52:59Z
+updated: 2026-05-16T20:30:00Z
 status: active
 ---
 

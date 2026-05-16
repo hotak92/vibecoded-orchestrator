@@ -3,7 +3,7 @@ title: Orchestrator Knowledge Graph
 type: concept
 tags: [mid-level-architecture, vibecoded-orchestrator, knowledge-graph, weaviate, semantic-search]
 created: 2026-04-27T18:30:00Z
-updated: 2026-04-27T18:30:00Z
+updated: 2026-05-16T20:30:00Z
 status: active
 ---
 
@@ -94,7 +94,9 @@ The `--all` flag on `kg-sync` processes every file in `knowledge/` — used for 
 
 ## Weaviate Collection Schema
 
-Default collection name: `<ProjectBasename>_KnowledgeGraph` (e.g. `Myapp_KnowledgeGraph`). The orchestrator's own shared collection is `VibecodedOrchestrator_KnowledgeGraph` (renamed from `VibeCodedTools_KnowledgeGraph` in v0.2.12 / PR-26 Group E).
+Default collection name: `<ProjectBasename>_KnowledgeGraph` (e.g. `Myapp_KnowledgeGraph`). The shared cross-project collection is `VibecodedOrchestrator_KnowledgeGraph` (renamed from `VibeCodedTools_KnowledgeGraph` in v0.2.12 / PR-26 Group E; the legacy alias is kept as a fallback for ~3 releases) — set as `SHARED_KG_COLLECTION` in workspace env.
+
+**Schema invariant (PR-24, v0.2.12)**: both the KG and Development collections are created with `indexNullState=True`. This is required for `valid_until is_none OR > now` temporal filters to work correctly — without it, Weaviate cannot index null values and filters that test for `null` return no results. See `vco_lib/project_init.kg_class_definition()` and `development_class_definition()`.
 
 | Property | Type | Notes |
 |---|---|---|
