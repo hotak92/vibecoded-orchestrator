@@ -1,24 +1,28 @@
-"""Tests for install-time inference-model tier selection.
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 VibeCoded Tools
+"""Tests for install-time embedding-model selection.
 
-The install-time selector (`_inference_models_for_capability`) MUST mirror
-the runtime selector ladder in
-`claude_mcp_servers/ollama_mcp/server.py:TEXT_MODEL_TIERS`. If they drift,
-"auto" model selection at runtime can pick a model that was never pulled
-during install.
+Originally this file also covered install-time inference-model tier
+selection in lockstep with the Ollama MCP's `TEXT_MODEL_TIERS` runtime
+ladder. In v0.2.11 the Ollama MCP server was removed (its tools were
+redundant with Claude's native chat + Read + vision), so the
+inference-tier table tests were dropped. What remains here only
+exercises embedding-model selection — those models are still required
+by Weaviate (text + code vectors) regardless of whether any LLM tools
+ship in the MCP layer.
 
-These tests are table-driven over the canonical tier ladder. Update them
-in lockstep with both selectors when the ladder changes.
+Future work: when the install pipeline is refactored to stop pulling
+inference models entirely (PR-14b), the test names below may shift.
+The assertions only touch embedding models, so they should survive any
+PR-14b cleanup of inference-tier logic in `install.py`.
 """
 
 from __future__ import annotations
-
-import pytest
 
 from install import (
     EMBEDDING_CONFIGS,
     SystemInfo,
     _build_ollama_pull_list,
-    _inference_models_for_capability,
 )
 
 
@@ -35,111 +39,62 @@ def _sysinfo(*, has_gpu: bool, vram_gb: float, ram_gb: float) -> SystemInfo:
     )
 
 
-# Each row: (label, has_gpu, vram_gb, ram_gb, expected_models)
-INFERENCE_TIER_CASES = [
-    # GPU paths
-    ("16+ GB VRAM workstation", True, 24.0, 64.0,
-     ["qwen3.5:9b", "gemma4:e4b", "qwen3.5:0.8b"]),
-    ("8 GB VRAM mid-tier GPU", True, 8.0, 16.0,
-     ["qwen3.5:9b", "gemma4:e4b", "qwen3.5:0.8b"]),  # 8 >= 7.5
-    ("6 GB VRAM small GPU", True, 6.0, 16.0,
-     ["gemma4:e4b", "qwen3.5:0.8b"]),
-    ("4 GB VRAM laptop GPU", True, 4.0, 16.0,
-     ["qwen3.5:0.8b"]),  # below 5 GB tier, has_gpu still set
-    # CPU paths
-    ("no GPU + 32 GB RAM", False, 0.0, 32.0,
-     ["qwen3.5:9b", "gemma4:e4b", "qwen3.5:0.8b"]),
-    ("no GPU + 16 GB RAM", False, 0.0, 16.0,
-     ["gemma4:e4b", "qwen3.5:0.8b"]),
-    ("no GPU + 12 GB RAM", False, 0.0, 12.0,
-     ["gemma4:e4b", "qwen3.5:0.8b"]),
-    ("no GPU + 8 GB RAM", False, 0.0, 8.0,
-     ["qwen3.5:0.8b"]),
-    # Edge cases
-    ("probe failed (all zeros)", False, 0.0, 0.0,
-     ["qwen3.5:0.8b"]),
-    ("GPU detected but VRAM probe failed", True, 0.0, 16.0,
-     # GPU presence with 0 VRAM falls through to RAM tiers — the
-     # probe-failed safety net.
-     ["gemma4:e4b", "qwen3.5:0.8b"]),
-]
-
-
-@pytest.mark.parametrize("label,has_gpu,vram,ram,expected", INFERENCE_TIER_CASES,
-                         ids=[c[0] for c in INFERENCE_TIER_CASES])
-def test_inference_models_for_capability(label, has_gpu, vram, ram, expected):
-    sysinfo = _sysinfo(has_gpu=has_gpu, vram_gb=vram, ram_gb=ram)
-    assert _inference_models_for_capability(sysinfo) == expected, (
-        f"{label}: wrong model list for has_gpu={has_gpu} vram={vram} ram={ram}"
-    )
-
-
-def test_floor_always_includes_smallest_model():
-    """qwen3.5:0.8b is the always-fits floor — must be in every output."""
-    for case in INFERENCE_TIER_CASES:
-        _, has_gpu, vram, ram, expected = case
-        assert "qwen3.5:0.8b" in expected, (
-            f"floor model missing from tier {case[0]}: {expected}"
-        )
-
-
-def test_low_resource_profile_pull_list_is_capped():
-    """low_resource is opt-in — never layer larger inference tiers on it
-    even on a workstation-class host."""
-    workstation = _sysinfo(has_gpu=True, vram_gb=24.0, ram_gb=64.0)
-    config = dict(EMBEDDING_CONFIGS["low_resource"])
-    pull_list = _build_ollama_pull_list(config, workstation)
-    # Must NOT include qwen3.5:9b even though host could run it.
-    assert "qwen3.5:9b" not in pull_list, (
-        "low_resource profile must be hard-capped, got " + str(pull_list)
-    )
-    assert "gemma4:e4b" in pull_list
-    assert "qwen3.5:0.8b" in pull_list
-    # Embedding side preserved.
-    assert "snowflake-arctic-embed2:latest" in pull_list
-    assert "unclemusclez/jina-embeddings-v2-base-code:latest" in pull_list
-
-
-def test_gpu_profile_layers_inference_on_workstation():
+def test_gpu_profile_pulls_qwen3_text_embedding():
+    """GPU profile uses Ollama for text embeddings (CodeSage on GPU for code)."""
     workstation = _sysinfo(has_gpu=True, vram_gb=24.0, ram_gb=64.0)
     config = dict(EMBEDDING_CONFIGS["gpu"])
     pull_list = _build_ollama_pull_list(config, workstation)
-    # Embedding model from profile.
-    assert "qwen3-embedding:0.6b" in pull_list
-    # Top-tier inference layered on.
-    assert "qwen3.5:9b" in pull_list
-    assert "gemma4:e4b" in pull_list
-    assert "qwen3.5:0.8b" in pull_list
+    assert "qwen3-embedding:0.6b" in pull_list, (
+        f"qwen3-embedding:0.6b missing from gpu profile pull list: {pull_list}"
+    )
 
 
-def test_cpu_profile_low_ram_only_pulls_floor():
-    tight = _sysinfo(has_gpu=False, vram_gb=0.0, ram_gb=8.0)
+def test_cpu_profile_pulls_both_text_and_code_embeddings():
+    """CPU profile serves text + code embeddings via Ollama (no GPU service)."""
+    cpu_host = _sysinfo(has_gpu=False, vram_gb=0.0, ram_gb=16.0)
     config = dict(EMBEDDING_CONFIGS["cpu"])
-    pull_list = _build_ollama_pull_list(config, tight)
-    assert "qwen3.5:9b" not in pull_list
-    assert "gemma4:e4b" not in pull_list
-    assert "qwen3.5:0.8b" in pull_list
-    # Embedding models still pulled.
-    assert "qwen3-embedding:0.6b" in pull_list
-    assert "unclemusclez/jina-embeddings-v2-base-code:latest" in pull_list
+    pull_list = _build_ollama_pull_list(config, cpu_host)
+    assert "qwen3-embedding:0.6b" in pull_list, (
+        f"text embedding missing from cpu profile: {pull_list}"
+    )
+    assert "unclemusclez/jina-embeddings-v2-base-code:latest" in pull_list, (
+        f"code embedding missing from cpu profile: {pull_list}"
+    )
 
 
-def test_pull_list_is_deduplicated():
-    """If the inference tier and embedding list both contain qwen3.5:0.8b
-    (it doesn't today, but defensively) the pull list must not repeat it."""
-    tight = _sysinfo(has_gpu=False, vram_gb=0.0, ram_gb=8.0)
-    config = dict(EMBEDDING_CONFIGS["cpu"])
-    pull_list = _build_ollama_pull_list(config, tight)
-    assert len(pull_list) == len(set(pull_list)), f"dups in pull list: {pull_list}"
-
-
-def test_openai_profile_only_pulls_inference_models():
-    """OpenAI handles embeddings — only inference models need pulling."""
+def test_openai_profile_pulls_no_embeddings():
+    """OpenAI profile handles embeddings via API — no Ollama embedding pulls."""
     workstation = _sysinfo(has_gpu=True, vram_gb=24.0, ram_gb=64.0)
     config = dict(EMBEDDING_CONFIGS["openai"])
     pull_list = _build_ollama_pull_list(config, workstation)
-    # No Ollama-served embedding models.
-    assert "qwen3-embedding:0.6b" not in pull_list
-    assert "snowflake-arctic-embed2:latest" not in pull_list
-    # Inference models still pulled (for tools that need local LLM).
-    assert "qwen3.5:9b" in pull_list
+    assert "qwen3-embedding:0.6b" not in pull_list, (
+        f"openai profile pulled an embedding model it shouldn't: {pull_list}"
+    )
+    assert "snowflake-arctic-embed2:latest" not in pull_list, (
+        f"openai profile pulled an embedding model it shouldn't: {pull_list}"
+    )
+
+
+def test_low_resource_profile_pulls_arctic_and_jina_code_embeddings():
+    """low_resource profile uses Snowflake Arctic for text, Jina v2 for code."""
+    tight = _sysinfo(has_gpu=False, vram_gb=0.0, ram_gb=8.0)
+    config = dict(EMBEDDING_CONFIGS["low_resource"])
+    pull_list = _build_ollama_pull_list(config, tight)
+    assert "snowflake-arctic-embed2:latest" in pull_list, (
+        f"arctic embedding missing from low_resource profile: {pull_list}"
+    )
+    assert "unclemusclez/jina-embeddings-v2-base-code:latest" in pull_list, (
+        f"jina code embedding missing from low_resource profile: {pull_list}"
+    )
+
+
+def test_pull_list_is_deduplicated():
+    """Pull list must not repeat the same model name, even if it appears in
+    both the embedding list and any inference tier."""
+    tight = _sysinfo(has_gpu=False, vram_gb=0.0, ram_gb=8.0)
+    for profile_name in ("cpu", "gpu", "low_resource", "openai"):
+        config = dict(EMBEDDING_CONFIGS[profile_name])
+        pull_list = _build_ollama_pull_list(config, tight)
+        assert len(pull_list) == len(set(pull_list)), (
+            f"duplicates in {profile_name} pull list: {pull_list}"
+        )

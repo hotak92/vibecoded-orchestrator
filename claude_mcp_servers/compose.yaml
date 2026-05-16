@@ -150,30 +150,6 @@ services:
   #   networks:
   #     - vibecoded-network
 
-  # ── SearXNG ─────────────────────────────────────────────────────────
-  # Self-hosted privacy-respecting metasearch. Powers the `web_search`
-  # tool in claude_mcp_servers/search_mcp/server.py (which defaults to
-  # SEARXNG_URL=http://localhost:8888). Pre-0.2.11 the search MCP
-  # assumed SearXNG was running but the compose didn't ship it — out
-  # of the box `web_search` failed with connection refused. Fixed in
-  # 0.2.11: SearXNG is now a first-class default service.
-  #
-  # Disable by either removing this block or setting
-  # SEARXNG_URL=https://searx.example.org/ to point at a public
-  # instance in the search MCP env.
-  searxng:
-    image: docker.io/searxng/searxng:latest
-    container_name: vco_searxng
-    restart: unless-stopped
-    ports:
-      - "${SEARXNG_PORT:-8888}:8080"
-    volumes:
-      - ./searxng:/etc/searxng:Z
-    environment:
-      SEARXNG_BASE_URL: "http://localhost:${SEARXNG_PORT:-8888}/"
-    networks:
-      - vibecoded-network
-
 # ── Named volumes ─────────────────────────────────────────────────────
 # Explicit `name:` declarations are required so Bug-31-style overrides
 # in docker-compose.override.yml can alias them to external
