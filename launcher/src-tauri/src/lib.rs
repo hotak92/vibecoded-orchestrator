@@ -18,8 +18,135 @@ use state::{AppManager, ProjectState, ProjectStore};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+/// PR-23 (v0.2.12, 2026-05-16): CLI mode — `--register-default-mcps <root>`.
+///
+/// install.py shells out to the launcher binary with this flag to wire the
+/// canonical bundled-orchestrator MCP entries into `~/.claude.json` AND
+/// (when a project row already exists) the launcher.db. We dispatch and
+/// `std::process::exit` BEFORE entering the Tauri builder so the GUI never
+/// starts. Pure stdout-only output — never opens a window.
+///
+/// Exit codes:
+///   0  — at least one MCP registered (or zero MCPs requested, edge case)
+///   1  — fatal error (no venv-python, JSON write failure, etc.)
+///
+/// Why parse `std::env::args()` by hand instead of pulling in `clap`:
+///   `clap` is not currently a dependency of the launcher crate; adding it
+///   for one flag would bloat the binary by ~200 KB. The flag-detection
+///   shape here is intentionally trivial and order-tolerant.
+fn maybe_handle_cli_subcommand() {
+    let args: Vec<String> = std::env::args().collect();
+    // Look for `--register-default-mcps <PATH>` anywhere in argv. We do
+    // NOT consume positional args; any other Tauri-style arg (which is
+    // currently none — the launcher takes zero positional args) would
+    // be ignored here and the function returns to let Tauri start.
+    let flag = "--register-default-mcps";
+    let pos = args.iter().position(|a| a == flag);
+    if let Some(idx) = pos {
+        let install_root = match args.get(idx + 1) {
+            Some(p) if !p.starts_with("--") => std::path::PathBuf::from(p),
+            _ => {
+                eprintln!(
+                    "[vct] {} requires a path argument, e.g. \
+                     vct-launcher {} /path/to/orchestrator/install",
+                    flag, flag
+                );
+                std::process::exit(1);
+            }
+        };
+        let exit_code = cli_register_default_mcps(&install_root);
+        std::process::exit(exit_code);
+    }
+}
+
+/// Run the `--register-default-mcps` flow synchronously and return the
+/// process exit code. No GUI, no Tauri builder, no tokio runtime
+/// (mcp_registration is fully sync).
+fn cli_register_default_mcps(install_root: &std::path::Path) -> i32 {
+    // Open the launcher DB best-effort; failure is non-fatal here (the
+    // JSON write is the primary contract, DB sync is the bonus).
+    let db_handle = db::Db::open().ok();
+
+    // No services state available in the CLI path — install.py forwards
+    // the chosen ports via env vars (WEAVIATE_PORT / OLLAMA_PORT /
+    // CODE_EMBED_PORT / WEAVIATE_GRPC_PORT) the same way it does for
+    // the launcher's `install_orchestrator()` invocation. We mirror
+    // that lookup here so a multi-stack adoption stays consistent.
+    let ports = mcp_registration::ServicePorts {
+        weaviate_port: std::env::var("WEAVIATE_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(mcp_registration::DEFAULT_WEAVIATE_PORT),
+        ollama_port: std::env::var("OLLAMA_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(mcp_registration::DEFAULT_OLLAMA_PORT),
+        grpc_port: std::env::var("WEAVIATE_GRPC_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(mcp_registration::DEFAULT_GRPC_PORT),
+        code_embed_port: std::env::var("CODE_EMBED_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(mcp_registration::DEFAULT_CODE_EMBED_PORT),
+    };
+
+    match mcp_registration::register_default_orchestrator_mcps(
+        install_root,
+        ports,
+        None,
+        db_handle.as_ref(),
+    ) {
+        Ok(report) => {
+            println!(
+                "[vct] MCP registration: wrote {} entr{} to {}",
+                report.success_count(),
+                if report.success_count() == 1 { "y" } else { "ies" },
+                report.claude_json_path.display()
+            );
+            for o in &report.outcomes {
+                if o.ok {
+                    println!("[vct]   ok    {}", o.name);
+                } else {
+                    eprintln!(
+                        "[vct]   FAIL  {} : {}",
+                        o.name,
+                        o.error.as_deref().unwrap_or("unknown error")
+                    );
+                }
+                if !o.dropped_keys.is_empty() {
+                    println!(
+                        "[vct]         (dropped {} secret/non-allowlisted env key(s): {:?})",
+                        o.dropped_keys.len(),
+                        o.dropped_keys
+                    );
+                }
+            }
+            for w in &report.db_warnings {
+                eprintln!("[vct] db warning: {}", w);
+            }
+            if report.all_succeeded() {
+                0
+            } else {
+                // Partial success: install.py treats non-zero as a
+                // soft-fail and falls through to the Python JSON path.
+                1
+            }
+        }
+        Err(e) => {
+            eprintln!("[vct] register_default_orchestrator_mcps: {}", e);
+            1
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // PR-23: CLI-only subcommand dispatch. Runs before any Tauri setup so
+    // install.py can invoke us without opening a GUI window. If no CLI
+    // flag is present, fall through to the GUI startup below.
+    maybe_handle_cli_subcommand();
+
     let _initial_registry = registry::load_service_registry();
 
     let app_manager = AppManager(Mutex::new(HashMap::new()));

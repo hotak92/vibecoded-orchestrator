@@ -1945,6 +1945,72 @@ pub async fn install_orchestrator(
 
     emit_progress(&window, "install", "Installation complete", 90.0);
 
+    // PR-23 (v0.2.12, 2026-05-16): wire bundled MCP entries into ~/.claude.json
+    // and the launcher.db. install.py also performs this step via the
+    // `--register-default-mcps` CLI subcommand, so on first install via the
+    // launcher GUI we end up with two register calls — both idempotent
+    // (UPSERT semantics on both sides) so the duplicate is harmless. The
+    // GUI-side call is the authoritative one for the install_orchestrator
+    // flow because it has direct access to the launcher's DB handle +
+    // adopted-services state without re-deriving them.
+    //
+    // Soft-fail by design: install completion must not depend on MCP
+    // registration succeeding. install.py's own post-step (Python-side
+    // fallback) backstops this anyway.
+    emit_progress(&window, "register", "Registering MCP servers in ~/.claude.json...", 92.0);
+    let install_root_path = std::path::PathBuf::from(&config.install_path);
+    let ports = crate::mcp_registration::ServicePorts {
+        weaviate_port,
+        ollama_port,
+        grpc_port: crate::mcp_registration::DEFAULT_GRPC_PORT,
+        code_embed_port,
+    };
+    let db_for_register = window.app_handle().try_state::<Db>();
+    let db_ref = db_for_register.as_ref().map(|s| s.inner());
+    match crate::mcp_registration::register_default_orchestrator_mcps(
+        &install_root_path,
+        ports,
+        None,
+        db_ref,
+    ) {
+        Ok(report) => {
+            eprintln!(
+                "[vct] install_orchestrator: registered {} of {} default MCP(s) to {}",
+                report.success_count(),
+                report.outcomes.len(),
+                report.claude_json_path.display()
+            );
+            for o in &report.outcomes {
+                if !o.ok {
+                    eprintln!(
+                        "[vct] install_orchestrator: MCP `{}` failed: {}",
+                        o.name,
+                        o.error.as_deref().unwrap_or("unknown")
+                    );
+                }
+                if !o.dropped_keys.is_empty() {
+                    eprintln!(
+                        "[vct] install_orchestrator: dropped {} env key(s) from `{}` (allowlist/secret filter): {:?}",
+                        o.dropped_keys.len(),
+                        o.name,
+                        o.dropped_keys
+                    );
+                }
+            }
+            for w in &report.db_warnings {
+                eprintln!("[vct] install_orchestrator: db warning: {}", w);
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "[vct] install_orchestrator: MCP registration failed (soft-fail): {}. \
+                 install.py's Python-side fallback will retry. Manually re-run \
+                 `python install.py --update` or wire ~/.claude.json by hand if needed.",
+                e
+            );
+        }
+    }
+
     // Stage 3: Verify
     emit_progress(&window, "verify", "Verifying installation...", 95.0);
 
