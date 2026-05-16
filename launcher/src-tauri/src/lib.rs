@@ -508,6 +508,14 @@ pub fn run() {
             commands::volumes::set_volumes_config_for_install,
             commands::volumes::set_volumes_config_dry_run,
             commands::volumes::migrate_volumes,
+            // PR-10A storage UX — separate surface from `volumes.rs`'s
+            // install-time picker. Owns Settings -> Storage. STRICT
+            // allowlist enforced in storage_ux::is_recognized_legacy_volume.
+            commands::storage_ux::get_storage_config,
+            commands::storage_ux::set_storage_config,
+            commands::storage_ux::detect_legacy_volumes,
+            commands::storage_ux::migrate_to_named_volume,
+            commands::storage_ux::migrate_to_bind_path,
             commands::installer::update_orchestrator,
             commands::installer::get_local_repo_source,
             commands::installer::inspect_orchestrator_at,

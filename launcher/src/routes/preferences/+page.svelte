@@ -360,6 +360,27 @@
       </div>
     </section>
 
+    <!-- PR-10A storage UX (v0.2.11): deep link to the per-service
+         storage picker. Adjacent to Updates because both are about
+         runtime infrastructure (container data location vs. orchestrator
+         self-update). -->
+    <section class="pr-section">
+      <h2 class="pr-section-title">Storage</h2>
+      <div class="pr-onboarding-row">
+        <div class="pr-onboarding-text">
+          <strong>Container data location</strong>
+          <span class="pr-onboarding-hint">
+            Choose named volumes (recommended) or a custom bind path for
+            Weaviate, Ollama, and code-embed data. Pre-existing volumes
+            from earlier installs can be reused in place.
+          </span>
+        </div>
+        <button class="pr-btn" onclick={() => goto('/preferences/storage')}>
+          Open
+        </button>
+      </div>
+    </section>
+
     <!-- Secrets (PR-4, v0.2.11). Cross-cutting OS-keychain manager;
          deep-linked from the sidebar too. The Open button takes the
          user to the dedicated route so the import sub-page stays one
