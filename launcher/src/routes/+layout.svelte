@@ -23,9 +23,17 @@
   import ExternalServicesDialog from '$lib/components/ExternalServicesDialog.svelte';
   import NoContainerRuntimeDialog from '$lib/components/NoContainerRuntimeDialog.svelte';
   import InstallHealthGate from '$lib/components/InstallHealthGate.svelte';
+  // PR-8 (v0.2.11 / 2026-05-15): one-time legacy-collection notice. Auto-
+  // shown when (a) Weaviate has at least one ClaudeOrchestrator_<Suffix>
+  // class with objects AND (b) at least one user project has a different
+  // code-graph prefix (= victim of the PR-7 hardcoded-name bug) AND
+  // (c) the user hasn't dismissed it before. Hidden silently otherwise.
+  import LegacyCollectionsModal from '$lib/components/LegacyCollectionsModal.svelte';
   import Toast from '$lib/components/Toast.svelte';
+  import { invoke } from '$lib/tauri';
   import { selectedProject, projects } from '$lib/stores/projects';
   import { startChangePoller, onChange } from '$lib/stores/changes';
+  import type { LegacyCodegraphReport } from '$lib/types/identity';
 
   let { children } = $props();
 
@@ -50,6 +58,15 @@
   });
 
   let showChangelog = $state(false);
+
+  // PR-8 (v0.2.11 / 2026-05-15): one-shot legacy-code-graph-collections
+  // notice. Mounted only when (a) the detect command finds at least one
+  // stale `ClaudeOrchestrator_*` Weaviate class with objects + at least
+  // one user project with a non-legacy code-graph prefix AND (b) the
+  // user has not dismissed the notice before. Dismissal is persisted
+  // via `set_legacy_codegraph_notice_dismissed` so subsequent launches
+  // stay quiet.
+  let showLegacyCollections = $state(false);
 
   // 2026-04-28 fix (Bug A): the OnboardingWizard is driven directly by
   // the ui store now — no more local mirror + two-effect bridge. The
@@ -117,6 +134,28 @@
     const unsub = onChange('projects', () => {
       void projects.load();
     });
+
+    // PR-8 (v0.2.11 / 2026-05-15): one-shot legacy-collections check.
+    // Runs in parallel with onboarding so a fresh install isn't blocked
+    // on Weaviate's HTTP `/v1/schema` round-trip. Silent on every
+    // negative outcome (no legacy data, all projects use the legacy
+    // prefix intentionally, Weaviate unreachable, already-dismissed,
+    // running in browser mode without Tauri). The Rust command itself
+    // soft-fails to an empty report so we never error here.
+    (async () => {
+      try {
+        const dismissed = await invoke<boolean>('get_legacy_codegraph_notice_dismissed');
+        if (dismissed) return;
+        const report = await invoke<LegacyCodegraphReport>('list_legacy_codegraph_collections');
+        if (report.action_recommended) {
+          showLegacyCollections = true;
+        }
+      } catch (e) {
+        // Browser mode + Tauri-command-unavailable lands here; not a real failure.
+        console.debug('[layout] legacy-collections check skipped:', e);
+      }
+    })();
+
     return () => unsub();
   });
 
@@ -193,6 +232,12 @@
   <ChangelogModal bind:open={showChangelog} />
   <ExternalServicesDialog />
   <NoContainerRuntimeDialog />
+  <!-- PR-8 (v0.2.11 / 2026-05-15): legacy code-graph collections notice.
+       Self-dismisses by flipping `showLegacyCollections` to false when the
+       user clicks Dismiss / completes cleanup / closes the dialog. -->
+  {#if showLegacyCollections}
+    <LegacyCollectionsModal onClose={() => (showLegacyCollections = false)} />
+  {/if}
   <!-- CDI / NVIDIA driver-version drift detector. Runs once at app
        startup; auto-opens a blocking modal only when it finds drift
        (Linux + NVIDIA + stale CDI spec). Silent on macOS, Windows, or

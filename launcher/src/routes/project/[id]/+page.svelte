@@ -11,6 +11,15 @@
   import PermissionsTab from '$lib/project-state/PermissionsTab.svelte';
   import SecretsTab from '$lib/project-state/SecretsTab.svelte';
   import KgCodegraphTab from '$lib/project-state/KgCodegraphTab.svelte';
+  // PR-8 (v0.2.11 / 2026-05-15): per-project Identity tab + cross-project
+  // access matrix tab. The existing PermissionsTab handles in-project
+  // permissions (write scopes, tool allowlists, MCP toggles); these two
+  // new tabs surface the cross-project access model (KG collections this
+  // project can read, code-graph grants to/from other projects) and the
+  // collection-identity fields (KG_COLLECTION / CODE_GRAPH_PROJECT) that
+  // were previously only editable by hand-patching settings.json.
+  import IdentityTab from '$lib/project-state/IdentityTab.svelte';
+  import CrossProjectAccessTab from '$lib/project-state/CrossProjectAccessTab.svelte';
   import CodeGraphBuildBanner from '$lib/components/CodeGraphBuildBanner.svelte';
   import KgSyncBanner from '$lib/components/KgSyncBanner.svelte';
   import KgSummaryBanner from '$lib/components/KgSummaryBanner.svelte';
@@ -18,7 +27,13 @@
 
   let projectId = $derived($page.params.id);
   let project = $state<ProjectView | null>(null);
-  let activeTab = $state<'agents' | 'skills' | 'hooks' | 'permissions' | 'secrets' | 'kg' | 'settings'>('agents');
+  // PR-8 (v0.2.11): added 'identity' (project fundamentals: name, KG/code-graph
+  // collection names) and 'access' (cross-project KG read levels +
+  // code-graph grants). Position 'identity' first so it's the first
+  // thing users see after agent listings; 'access' sits right after
+  // 'permissions' (which handles intra-project permissions) so the two
+  // permission models live next to each other in the tab strip.
+  let activeTab = $state<'identity' | 'agents' | 'skills' | 'hooks' | 'permissions' | 'access' | 'secrets' | 'kg' | 'settings'>('agents');
 
   // Orchestrator update banner. Loads inspect_orchestrator_at on
   // mount; if version_status === 'outdated' a "Update this project"
@@ -128,10 +143,16 @@
   });
 
   const tabs = [
+    // PR-8 (v0.2.11): Identity first — it's the project's
+    // KG_COLLECTION / CODE_GRAPH_PROJECT identity (the "who am I?" before
+    // anything else). Access is the cross-project counterpart to the
+    // intra-project Permissions tab.
+    { id: 'identity', label: 'Identity' },
     { id: 'agents', label: 'Agents' },
     { id: 'skills', label: 'Skills' },
     { id: 'hooks', label: 'Hooks' },
     { id: 'permissions', label: 'Permissions' },
+    { id: 'access', label: 'Cross-project access' },
     { id: 'secrets', label: 'Secret refs' },
     { id: 'kg', label: 'KG / Codegraph' },
     { id: 'settings', label: 'Settings' },
@@ -254,6 +275,8 @@
   <main class="tab-content">
     {#if !project}
       <p class="loading">Loading…</p>
+    {:else if activeTab === 'identity'}
+      <IdentityTab projectId={project.id} />
     {:else if activeTab === 'agents'}
       <AgentsTab projectId={project.id} />
     {:else if activeTab === 'skills'}
@@ -262,6 +285,8 @@
       <HooksTab projectId={project.id} />
     {:else if activeTab === 'permissions'}
       <PermissionsTab projectId={project.id} />
+    {:else if activeTab === 'access'}
+      <CrossProjectAccessTab projectId={project.id} />
     {:else if activeTab === 'secrets'}
       <SecretsTab projectId={project.id} />
     {:else if activeTab === 'kg'}
