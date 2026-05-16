@@ -5,8 +5,9 @@ Config layout follows one rule: **minimal global, maximum per-project**.
 ## What this means
 
 - **Global `~/.claude/settings.json`**: user preferences only — effort level, output tokens, universal permission denies. No project paths, no MCP server URLs, no environment variables that any specific project depends on.
-- **Per-project `.vscode/settings.json`**: where `claude-code.env` lives for the **VS Code extension**. MCP env vars (Weaviate URL, collection names, embedding backend) live here so opening this project in VS Code wires up its MCP servers correctly without affecting any other project you have open.
-- **Per-project `.claude/settings.json`**: per-project permissions and hook registrations, plus an `env` block read by the **Claude Code CLI and Desktop app**. The launcher writes both files in lockstep so all three surfaces (VS Code extension / CLI / Desktop) see the same MCP environment.
+- **Per-project `.claude/settings.json`**: per-project permissions and hook registrations, plus an `env` block read by Claude Code (CLI, Desktop app, AND the VS Code extension) and propagated to MCP subprocesses. This is the **canonical per-project MCP env channel** as of v0.2.12 (PR-27, 2026-05-16): empirical sentinel testing on Linux Claude Code 2.1.143 confirmed that `.vscode/settings.json` `claude-code.env` does NOT propagate to MCP subprocesses, so the launcher no longer writes that key. See PR-27 commit message + `docs/CLAUDE_CODE_COMPATIBILITY.md` → "Per-project env files" for the full empirical trace.
+- **Per-project `.claude/env`**: POSIX shell-sourceable env file with the same values, for CLI users who source it from their shell rc via the `tools/claude` wrapper.
+- **Per-project `.vscode/settings.json`**: VS Code editor preferences only (Pylance excludes, file-watcher excludes, formatter settings). The launcher's Python-side `_backfill_vscode_excludes_in_project` manages the Pylance/watcher exclude block; the launcher does NOT touch any `claude-code.env` block here.
 - **Per-project secrets**: stored in the OS keychain via the VCT Launcher GUI — not in env files, not in JSON configs. The launcher knows about per-project scoping, so an OpenAI key for one project doesn't leak into another.
 
 ## Why
@@ -15,7 +16,7 @@ It prevents cross-contamination. Global settings apply to every project you open
 
 ## Setup for new users
 
-1. Copy `.vscode/settings.json.example` to `.vscode/settings.json` and adjust if needed (defaults work out of the box for a local Podman+Ollama setup).
+1. Copy `.vscode/settings.json.example` to `.vscode/settings.json` and adjust as needed for editor preferences (Pylance excludes, formatter settings). The example file no longer ships a `claude-code.env` block — per-project MCP env now lives in `.claude/settings.json` `env` instead (see the v0.2.12 PR-27 note in the bullet list above).
 2. The VCT Launcher creates a per-project `.env` from a canonical template when you register a project (see "`.env` template management" below). For non-launcher CLI users, copy `.env.example` manually.
 3. Let `install.py` wire the rest (venv, containers, KG collection creation).
 4. Launch via the VCT Launcher GUI (manages secrets, tier gating, module installs).
@@ -57,8 +58,9 @@ VCT_TELEMETRY
 | Config | Lives in | Scope | Managed by |
 |---|---|---|---|
 | Effort level, max tokens, OS-level denies | `~/.claude/settings.json` | global | you, manually |
-| MCP env (URLs, collection names, paths) — VS Code extension | `.vscode/settings.json` → `claude-code.env` | per-project | VS Code + launcher |
-| MCP env (URLs, collection names, paths) — CLI / Desktop app | `.claude/settings.json` → `env` | per-project | launcher (kept in sync with the VS Code copy) |
+| MCP env (URLs, collection names, paths) — every Claude Code surface (CLI / Desktop / VS Code extension) AND MCP subprocesses | `.claude/settings.json` → `env` | per-project | launcher's `write_project_env_files` |
+| MCP env, POSIX shell-sourceable copy (for the `tools/claude` wrapper) | `.claude/env` | per-project | launcher's `write_project_env_files` |
+| VS Code editor preferences (Pylance excludes, formatOnSave, etc.) | `.vscode/settings.json` | per-project | launcher's Python `_backfill_vscode_excludes_in_project` + you |
 | Shell/script env | `.env` | per-project | you, `.env.example` template |
 | Project permissions + hooks | `.claude/settings.json` | per-project | install.py + launcher |
 | Secrets (license keys, API tokens) | OS keychain | per-project | launcher GUI only |
@@ -80,7 +82,7 @@ If you see any of these in your global `~/.claude/settings.json`, move them to t
 
 ## Knowledge graph env vars
 
-The MCP server (`claude_mcp_servers/weaviate_mcp/server.py`) reads these on startup. They're written to all three per-project surfaces (VS Code `claude-code.env`, `.claude/env`, `.claude/settings.json::env`) by the launcher's `write_project_env_files`.
+The MCP server (`claude_mcp_servers/weaviate_mcp/server.py`) reads these on startup. They're written to the two per-project surfaces — `.claude/env` (POSIX shell-sourceable) and `.claude/settings.json::env` (the canonical channel that actually propagates to MCP subprocesses on Linux) — by the launcher's `write_project_env_files`. The historical third surface (`.vscode/settings.json` `claude-code.env`) was removed in v0.2.12 (PR-27, 2026-05-16); see the bullet at the top of this file for the empirical-trace KG node.
 
 | Var | Default | What it does |
 |---|---|---|

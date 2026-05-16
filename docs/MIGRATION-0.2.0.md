@@ -281,12 +281,18 @@ the legacy file paths during the upgrade window.
 
 The launcher's project-env writer
 (`commands/projects_v2.rs::write_project_env_files`) now emits
-`GITHUB_TOKEN=<value>` to all three install surfaces:
+`GITHUB_TOKEN=<value>` to both install surfaces:
 
 - `.claude/env` (POSIX export form, sourced by `tools/claude` wrapper)
-- `.claude/settings.json` `env` block (read by Claude Code CLI)
-- `.vscode/settings.json` `claude-code.env` block (read by Claude Code
-  VS Code extension)
+- `.claude/settings.json` `env` block (the canonical channel — read by
+  Claude Code CLI, the Desktop app, and the VS Code extension, and
+  propagated to MCP subprocesses)
+
+(v0.2.12 / PR-27 update: a third surface — `.vscode/settings.json`
+`claude-code.env` — was originally part of this list but was removed
+because that block didn't propagate to MCP subprocesses on Linux.
+See `docs/CLAUDE_CODE_COMPATIBILITY.md` → "Per-project env files" for
+the empirical-trace reference.)
 
 The value is resolved at write time from the same keychain entry the
 OnboardingWizard wrote (`vct._user_shared_.shared.installer/github_pat`)
@@ -579,8 +585,11 @@ The panel surfaces the masked prefix of the active PAT, a one-shot
 "Replace…" button (which routes through the replace-existing guard
 above), and a "Clear" button that calls `clear_github_pat` to strip the
 keychain entry AND `GITHUB_TOKEN` from every registered project's env
-surface (`.claude/env`, `.claude/settings.json::env`,
-`.vscode/settings.json::claude-code.env`).
+surface (`.claude/env`, `.claude/settings.json::env`). The historical
+third surface, `.vscode/settings.json::claude-code.env`, is no longer
+written or refreshed by the launcher as of v0.2.12 (PR-27); the
+clear-keychain code path still strips a stale token from a
+pre-existing `.vscode/settings.json` if one is found.
 
 ### Non-destructive contract on user-owned files
 

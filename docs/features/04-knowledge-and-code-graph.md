@@ -102,7 +102,7 @@ Stores chunks from files dropped in `documents/`. Created on demand by `process_
 `hybrid_search` searches `KG_COLLECTION`, `SHARED_KG_COLLECTION` (if set), and `DEVELOPMENT_COLLECTION` (if set) in parallel, merges results, and deduplicates by `file_path`. Agent callers never need to manage routing.
 
 ### Per-project KG routing via `KG_COLLECTION` env var
-Each VS Code workspace overrides `KG_COLLECTION` in `.vscode/settings.json`. Opening a different project workspace redirects all KG reads/writes to that project's collection without code changes.
+Each project sets `KG_COLLECTION` in `.claude/settings.json` `env` — the canonical per-project MCP env channel since v0.2.12 (PR-27, 2026-05-16). Opening a different project workspace redirects all KG reads/writes to that project's collection without code changes. Pre-v0.2.12 the launcher also wrote the same value to `.vscode/settings.json` `claude-code.env`, but empirical sentinel testing on Linux Claude Code 2.1.143 showed that block did not propagate to MCP subprocesses, so the launcher no longer writes it.
 
 ---
 

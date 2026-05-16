@@ -228,7 +228,7 @@ claude mcp list
 **Common causes**:
 
 1. **Editor opened before containers started**: restart your Claude Code session (VS Code window reload, restart the CLI, or reopen Claude Desktop) once `docker ps` / `podman ps` shows Weaviate + Ollama running.
-2. **Wrong Python in MCP config**: `MCP_PYTHON` must point at the `install.py`-created venv, not system Python — check `.vscode/settings.json` → `claude-code.env` (VS Code extension) **or** `.claude/settings.json` → `env` (CLI / Desktop app).
+2. **Wrong Python in MCP config**: `MCP_PYTHON` must point at the `install.py`-created venv, not system Python — check `.claude/settings.json` → `env` (the canonical channel since v0.2.12; CLI / Desktop app / VS Code extension all read it, and MCP subprocesses inherit from it). The historical `.vscode/settings.json` `claude-code.env` surface was removed in v0.2.12 (PR-27) because that block didn't propagate to MCP subprocesses on Linux.
 3. **Embedding model mismatch**: `ACTIVE_EMBEDDING` must match a model actually loaded by Ollama. Default is `qwen3` with model `qwen3-embedding:0.6b`. Verify with `podman exec ollama_claude ollama list`.
 
 ## Launcher hub returns 401 Unauthorized

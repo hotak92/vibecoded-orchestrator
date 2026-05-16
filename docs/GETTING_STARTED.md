@@ -62,7 +62,7 @@ python3 install.py
 2. Detects your hardware (NVIDIA GPU / CPU / Apple Silicon) and sets the embedding backend
 3. Starts Weaviate and Ollama in containers and waits for them to be ready
 4. Pulls embedding models (`qwen3-embedding:0.6b` by default; CodeSage-Large-v2 on GPU installs)
-5. Writes `.env`, `.claude/settings.json`, and `.vscode/settings.json`
+5. Writes `.env`, `.claude/settings.json` (the canonical MCP-env channel), and `.claude/env` (POSIX shell-sourceable copy). `.vscode/settings.json` is only touched for VS Code editor preferences (Pylance/watcher excludes) — `claude-code.env` is no longer written there as of v0.2.12 (PR-27)
 6. Copies 19 agent templates into `.claude/agents/` and 28 skill templates into `.claude/skills/`
 
 ### Common install flags
@@ -109,7 +109,7 @@ The chosen action per service is recorded in `~/.vct/services.toml` and re-read 
 When install adopts an existing Weaviate, it must not pollute the host with bare top-level `KnowledgeGraph` / `Development` collections — many users run Weaviate with per-project namespacing (`MyProject_KnowledgeGraph`, etc.). Adopt mode therefore:
 
 1. **Derives the per-install KG name from the project basename** — installing in `~/projects/myapp/` writes to `Myapp_KnowledgeGraph` and `Myapp_Development`. Hyphens / underscores in the basename are PascalCased; pure-punctuation basenames fall back to `vct_KnowledgeGraph`.
-2. **Honors `KG_COLLECTION` / `DEVELOPMENT_COLLECTION` env vars** if set (typically via `.vscode/settings.json` `claude-code.env`) — explicit override wins over the basename derivation.
+2. **Honors `KG_COLLECTION` / `DEVELOPMENT_COLLECTION` env vars** if set (typically via `.claude/settings.json` `env` — the canonical channel; the historical `.vscode/settings.json` `claude-code.env` source was removed in v0.2.12 / PR-27 because it didn't propagate to MCP subprocesses on Linux) — explicit override wins over the basename derivation.
 3. **Skips creation of any collection that already exists** under the resolved name.
 4. **Skips a `Development` collection entirely** if the host already has any `<X>_development` (the host's namespacing wins).
 5. **Announces every proposed creation and waits for confirmation** in interactive mode. Pass `--yes` for non-interactive runs.
@@ -160,7 +160,7 @@ The MCP server recreates any collection it actively uses on next write, so delet
 After install, open the `vibecoded-orchestrator` directory in one of the three supported surfaces:
 
 - **CLI**: `cd vibecoded-orchestrator && claude --dangerously-skip-permissions`
-- **VS Code extension**: open the folder as a workspace; the extension reads `.vscode/settings.json` for MCP env vars
+- **VS Code extension**: open the folder as a workspace; the extension reads `.claude/settings.json` for MCP env vars (the canonical channel that also propagates to MCP subprocesses). `.vscode/settings.json` is only used for editor preferences
 - **Claude Desktop app**: point it at the install directory
 
 On session start, three things happen automatically (via `SessionStart` hooks):
@@ -184,16 +184,16 @@ The orchestrator can configure another codebase to use its knowledge graph and c
 You: "Set up my FastAPI project at ~/dev/my-api"
 ```
 
-Claude will analyze the codebase and write four files into the target project:
+Claude will analyze the codebase and write these files into the target project:
 
-- `~/dev/my-api/.claude/settings.json` — permissions and hook registrations
-- `~/dev/my-api/.vscode/settings.json` — MCP env with `KG_COLLECTION=MyAPI`
+- `~/dev/my-api/.claude/settings.json` — permissions, hook registrations, and the canonical per-project MCP env block (`KG_COLLECTION=MyAPI`, etc.) that propagates to MCP subprocesses
+- `~/dev/my-api/.claude/env` — POSIX shell-sourceable copy of the same env values, for shell-wrapper users
 - `~/dev/my-api/CLAUDE.md` — project instructions tailored to the detected stack
 - `~/dev/my-api/.claude/CONTEXT_STATE.md` — initial session state
 
 It also queues a background code graph analysis of the target project.
 
-Alternatively, use the VCT Launcher GUI: it runs the same configuration wizard visually and writes all three config files (`.claude/settings.json`, `.vscode/settings.json`, `.claude/env`) in lockstep so the CLI, VS Code extension, and Claude Desktop app all see the same MCP environment.
+Alternatively, use the VCT Launcher GUI: it runs the same configuration wizard visually and writes both env files (`.claude/settings.json` env + `.claude/env`) in lockstep so the CLI, VS Code extension, and Claude Desktop app all see the same MCP environment. As of v0.2.12 (PR-27, 2026-05-16) the launcher no longer writes `.vscode/settings.json` `claude-code.env` — empirical sentinel testing showed that block did not propagate to MCP subprocesses on Linux Claude Code 2.1.143.
 
 ### Background tasks the launcher fans out on Add project
 

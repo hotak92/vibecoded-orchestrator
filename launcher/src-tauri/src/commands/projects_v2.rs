@@ -332,13 +332,17 @@ pub async fn create_project_v2(
     let slug = db.generate_unique_slug(&req.name)?;
     let row = db.insert_project(&id, &req.name, &req.folder_path, req.host.clone(), &slug)?;
 
-    // Bug 23 + 30: write per-project env files for ALL Claude Code
-    // surfaces — VS Code extension (via `.vscode/settings.json`
-    // claude-code.env), Claude Code CLI (via `.claude/env`, sourced by
-    // tools/claude wrapper or user shell rc), AND the canonical
-    // `.claude/settings.json` env block (CLI + Desktop app + VS Code).
-    // We swallow individual errors here: create_project must not fail
-    // just because the user's folder is read-only or mid-edit.
+    // Bug 23 + 30: write per-project env files for every Claude Code
+    // surface — Claude Code CLI (via `.claude/env`, sourced by
+    // tools/claude wrapper or user shell rc) AND the canonical
+    // `.claude/settings.json` env block (CLI + Desktop app + VS Code
+    // extension, AND propagated to MCP subprocesses). The pre-v0.2.12
+    // `.vscode/settings.json` `claude-code.env` surface was removed in
+    // PR-27 (2026-05-16) because it didn't propagate to MCP
+    // subprocesses on Linux — see `write_project_env_files` docstring
+    // for the empirical-trace reference. We swallow individual errors
+    // here: create_project must not fail just because the user's
+    // folder is read-only or mid-edit.
     //
     // PR-3 (2026-05-06): populate a `ProjectEnvSettings` once from the
     // launcher's current state — adopted ports, ACTIVE_EMBEDDING choice,
@@ -1536,16 +1540,24 @@ pub async fn update_all_projects(
 
 /// Bug 23 + 30: write per-project env files for every Claude Code surface.
 ///
-/// Writes three files, all carrying the same env values:
-///   1. `.vscode/settings.json` `claude-code.env` — VS Code extension
-///   2. `.claude/env` — POSIX shell file sourced by the `tools/claude`
+/// Writes two files, both carrying the same env values:
+///   1. `.claude/env` — POSIX shell file sourced by the `tools/claude`
 ///      wrapper (CLI users without VS Code)
-///   3. `.claude/settings.json` `env` — canonical Anthropic per-project
-///      env (read by CLI, Desktop app, and the VS Code extension)
+///   2. `.claude/settings.json` `env` — canonical Anthropic per-project
+///      env (read by CLI, Desktop app, AND propagated to MCP subprocesses
+///      and hook subprocesses on every platform we've tested)
 ///
-/// (3) is the only surface that reaches Claude Code Desktop app users.
-/// (1) and (2) are kept for compatibility / preference. Same values in
-/// all three means there's no precedence conflict to reason about.
+/// (2) is the channel that actually reaches MCP subprocesses on Linux.
+/// (1) is kept for CLI users who source `.claude/env` from their shell rc.
+///
+/// PR-27 (v0.2.12, 2026-05-16) — `.vscode/settings.json` `claude-code.env`
+/// previously a third write target — was removed. As of Claude Code 2.1.143
+/// on Linux, that key does NOT propagate to MCP subprocesses (empirically
+/// verified with sentinel testing on `/proc/<mcp_pid>/environ`). Writing
+/// it caused user confusion: users edited the file expecting changes to
+/// take effect, but nothing did. See the PR-27 commit message and
+/// `docs/CLAUDE_CODE_COMPATIBILITY.md` → "Per-project env files" for the
+/// full trace. The canonical channel is `.claude/settings.json` `env`.
 ///
 /// Returns Ok(()) only when ALL succeed; the caller currently logs and
 /// swallows the error so project creation never fails over an env file.
@@ -1572,12 +1584,12 @@ pub async fn update_all_projects(
 /// ~3 releases (target removal: 2026-08).
 ///
 /// PR-3 Commit 6 (2026-05-06): the `env` sub-block in
-/// `.claude/settings.json`, `.vscode/settings.json` `claude-code.env`,
-/// and the body of `.claude/env` are deep-merged rather than wholesale-
-/// replaced — the canonical keys we own are overwritten with the
-/// launcher's resolved values, but user-added env keys at the same level
-/// are preserved across re-runs. See `secrets-and-access-matrix-audit-2026-05-06.md`
-/// §6 for the prior wholesale-replace bug.
+/// `.claude/settings.json` and the body of `.claude/env` are deep-merged
+/// rather than wholesale-replaced — the canonical keys we own are
+/// overwritten with the launcher's resolved values, but user-added env
+/// keys at the same level are preserved across re-runs. See
+/// `secrets-and-access-matrix-audit-2026-05-06.md` §6 for the prior
+/// wholesale-replace bug.
 pub fn write_project_env_files(
     folder: &Path,
     settings: &ProjectEnvSettings,
@@ -1617,11 +1629,13 @@ pub fn write_project_env_files(
     // `Some`) can return `None` and be filtered out before reaching the
     // writers. This preserves the "every const key has a match arm"
     // panic invariant while letting individual keys be conditionally
-    // emitted. `None`-valued keys are simply omitted from all three
-    // surfaces (.claude/env, .claude/settings.json env block,
-    // .vscode/settings.json claude-code.env block) — same as the
-    // pre-2026-05-08 behaviour for VCT_ORCHESTRATOR_ROOT in
-    // `.claude/env` only.
+    // emitted. `None`-valued keys are simply omitted from both
+    // surfaces (.claude/env, .claude/settings.json env block) — same as
+    // the pre-2026-05-08 behaviour for VCT_ORCHESTRATOR_ROOT in
+    // `.claude/env` only. PR-27 (v0.2.12, 2026-05-16) removed the
+    // historical third surface (.vscode/settings.json claude-code.env)
+    // because it didn't propagate to MCP subprocesses on Linux — see
+    // function-level docstring for the empirical-trace KG node.
     let canonical_env_pairs: Vec<(&str, String)> = CANONICAL_INSTALL_ENV_KEYS
         .iter()
         .filter_map(|key| {
@@ -1662,16 +1676,22 @@ pub fn write_project_env_files(
                 // because the comment at the old `CANONICAL_PORTABILITY_ENV_KEYS`
                 // claimed they were "only meaningful for shell-sourced
                 // contexts". That claim was empirically wrong: Claude Code
-                // propagates `.claude/settings.json env` and
-                // `.vscode/settings.json claude-code.env` to hook
+                // propagates `.claude/settings.json env` to hook
                 // subprocesses, so VS Code-extension users (the dominant
                 // Linux/macOS/Windows path) silently lost these vars and
                 // hooks fell back to a non-existent
                 // `claude_mcp_servers/.venv` path inside managed projects.
                 // Now they flow through the same pair-builder as the rest
                 // of the canonical keys; `None` (launcher running outside
-                // a git checkout) omits the entry from all surfaces, same
+                // a git checkout) omits the entry from every surface, same
                 // as the pre-fix behaviour for `.claude/env`.
+                //
+                // PR-27 (v0.2.12, 2026-05-16) update: the historical third
+                // surface (.vscode/settings.json claude-code.env) was
+                // dropped from the writers — the 2026-05-08 audit ran
+                // pre-empirical-verification of MCP propagation on Linux.
+                // Sentinel testing 2026-05-16 confirmed that block does
+                // NOT reach MCP subprocesses on Claude Code 2.1.143.
                 "VCT_ORCHESTRATOR_ROOT" => settings
                     .orchestrator_root
                     .as_ref()
@@ -1755,76 +1775,25 @@ pub fn write_project_env_files(
         .filter(|k| !emit_keys.contains(k))
         .collect();
 
-    // VS Code path (extension reads claude-code.env).
+    // PR-27 (v0.2.12, 2026-05-16): the historical write to
+    // `.vscode/settings.json` `claude-code.env` was removed here.
+    // Empirical sentinel testing on 2026-05-16 showed that block does
+    // NOT propagate to MCP subprocesses on Linux as of Claude Code
+    // 2.1.143 (see PR-27 commit message for the full trace, including
+    // the `/proc/<mcp_pid>/environ` methodology). Writing it caused
+    // user confusion: users edited the file expecting changes to take
+    // effect but nothing did. The canonical channel is
+    // `.claude/settings.json` `env`, written below. A pre-existing
+    // `.vscode/settings.json` is intentionally not touched here —
+    // Python's `_backfill_vscode_excludes_in_project` (PR-7 / v0.2.11)
+    // still manages the workspace's Pylance/watcher exclude block at a
+    // separate top level, unrelated to MCP env.
     //
-    // Bug 32 (safety): READ-MERGE-WRITE so user settings like
-    // `editor.formatOnSave`, `python.defaultInterpreterPath`, workspace
-    // recommendations etc. survive at the top level.
-    //
-    // PR-3 Commit 6 (2026-05-06): also deep-merge the `claude-code.env`
-    // sub-block. Pre-PR-3 the entire sub-object was REPLACED on every
-    // call, so any user-added env key at that level (e.g. a per-project
-    // `OPENAI_API_BASE` override) was silently lost. Now we overwrite
-    // only the canonical keys and leave non-canonical user keys alone.
-    let vscode_dir = folder.join(".vscode");
-    std::fs::create_dir_all(&vscode_dir)
-        .map_err(|e| format!("mkdir {}: {}", vscode_dir.display(), e))?;
-    let vscode_settings_path = vscode_dir.join("settings.json");
-
-    let mut vscode_root: serde_json::Value = if vscode_settings_path.exists() {
-        match std::fs::read_to_string(&vscode_settings_path) {
-            Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|e| {
-                eprintln!(
-                    "[vct] warning: {} is not valid JSON ({}); replacing with minimal claude-code.env block",
-                    vscode_settings_path.display(),
-                    e
-                );
-                serde_json::json!({})
-            }),
-            Err(e) => {
-                eprintln!(
-                    "[vct] warning: could not read {} ({}); creating fresh",
-                    vscode_settings_path.display(),
-                    e
-                );
-                serde_json::json!({})
-            }
-        }
-    } else {
-        serde_json::json!({})
-    };
-    if !vscode_root.is_object() {
-        vscode_root = serde_json::json!({});
-    }
-    if let Some(root_obj) = vscode_root.as_object_mut() {
-        // Subagent G (2026-05-08): user-secret emit + strip threaded
-        // through the same deep-merge primitive. Keys NOT in either
-        // set survive verbatim (preserves PR-3 Commit 6 invariant for
-        // by-hand user-added keys at `claude-code.env` level).
-        merge_env_object_canonical_with_user_secrets(
-            root_obj,
-            "claude-code.env",
-            &canonical_env_pairs,
-            &user_secret_pairs,
-            &user_secret_strip_keys,
-        );
-        // PR-8 cross-PR handoff note (v0.2.11 / 2026-05-15): the VS Code
-        // watcher / search / Pylance exclude block is intentionally NOT
-        // seeded here. Coordinator analysis 2026-05-15: the few-seconds
-        // window between this write and PR-7's Python
-        // `_backfill_vscode_excludes_in_project` (run via the
-        // `install_bundle` subprocess) is short enough that a
-        // brand-new-folder OOM is implausible — the user is GUI-adding
-        // a new project, not simultaneously opening VS Code on it.
-        // Skipping the Rust seeder avoids Python↔Rust exclude-list
-        // drift between two sources of truth.
-    }
-    std::fs::write(
-        &vscode_settings_path,
-        serde_json::to_string_pretty(&vscode_root)
-            .map_err(|e| format!("serialize settings.json: {}", e))?,
-    )
-    .map_err(|e| format!("write {}: {}", vscode_settings_path.display(), e))?;
+    // The user-secret strip helper (`surgically_strip_user_secret_keys`)
+    // and the unregister-cleanup helper (`surgically_strip_env_surfaces`)
+    // still read `.vscode/settings.json` if it exists, so any
+    // pre-existing or hand-edited `claude-code.env` content is cleaned
+    // up on unregister even though we no longer create the file.
 
     // CLI path: `.claude/env` is sourced by the `tools/claude` wrapper or
     // by the user's shell rc. Plain POSIX export form so any sh-family
@@ -2314,11 +2283,14 @@ fn build_canonical_env_text(settings: &ProjectEnvSettings) -> String {
     // owned by PR-7's `install.py::_env_canonical_template` parity
     // contract, and adding a key here without the Python side would
     // break `env_template_canonical_keys_match_python`. The key DOES
-    // get written to the JSON env blocks (`.claude/settings.json::env`
-    // + `.vscode/settings.json::claude-code.env`) via
-    // `CANONICAL_INSTALL_ENV_KEYS` — those are the surfaces hook
-    // subprocesses + Claude Code consume from, so the bug PR-7 is
-    // fixing closes at the create_project_v2 boundary regardless.
+    // get written to the canonical JSON env block
+    // (`.claude/settings.json::env`) via `CANONICAL_INSTALL_ENV_KEYS`
+    // — that is the surface hook subprocesses + Claude Code consume
+    // from, so the bug PR-7 is fixing closes at the create_project_v2
+    // boundary regardless. (PR-27 / v0.2.12 / 2026-05-16 removed the
+    // historical sibling write to `.vscode/settings.json::claude-code.env`
+    // because that surface didn't propagate to MCP subprocesses on
+    // Linux — see `write_project_env_files` docstring.)
     // PR-3 (2026-05-06): ACTIVE_EMBEDDING is launcher-resolved; pre-PR-3
     // it was only written to the orchestrator-root .env by install.py and
     // never to per-project files. Adding it here lets every per-project
@@ -2657,11 +2629,15 @@ pub async fn rename_project_v2(
     let count = db.list_module_installs_for_project(&id)?.len() as u32;
     let mut warnings: Vec<String> = Vec::new();
 
-    // B9 (2026-05-01): re-run env writers after DB rename so all 4 surfaces
-    // reflect the new KG_COLLECTION, DEVELOPMENT_COLLECTION, PROJECT_NAME.
-    // Before this fix, rename was DB-only — renamed projects kept stale
-    // KG_COLLECTION values in .claude/env, .vscode/settings.json, and
-    // .claude/settings.json until the user manually re-ran env setup.
+    // B9 (2026-05-01): re-run env writers after DB rename so every
+    // surface reflects the new KG_COLLECTION, DEVELOPMENT_COLLECTION,
+    // PROJECT_NAME. Before this fix, rename was DB-only — renamed
+    // projects kept stale KG_COLLECTION values in `.claude/env` and
+    // `.claude/settings.json` until the user manually re-ran env
+    // setup. (PR-27 / v0.2.12 / 2026-05-16 removed a historical third
+    // surface, `.vscode/settings.json` `claude-code.env`, because it
+    // didn't propagate to MCP subprocesses on Linux — refresh now
+    // covers two surfaces, not three.)
     let folder = Path::new(&row.folder_path);
     let env_settings = project_env_settings::populate(&db, &new_name, Some(&id));
     // HIGH-7 (2026-05-01): env-write failures now surface as structured
@@ -2795,11 +2771,13 @@ pub async fn set_shared_kg_opt_out(
 
 /// P1-D (2026-05-08): re-run `write_project_env_files` for a registered
 /// project so the launcher's current view of the access matrix lands in
-/// `.claude/env`, `.claude/settings.json env`, and
-/// `.vscode/settings.json claude-code.env`. Wired from the access-matrix
-/// setters (`kg_set_collection_access_mode` and the codegraph
-/// equivalents) so a running Claude Code session picks up newly-granted
-/// peer KGs without a session restart.
+/// `.claude/env` and `.claude/settings.json env`. (PR-27 / v0.2.12 /
+/// 2026-05-16 removed the historical third surface
+/// `.vscode/settings.json claude-code.env` because it didn't propagate
+/// to MCP subprocesses on Linux.) Wired from the access-matrix setters
+/// (`kg_set_collection_access_mode` and the codegraph equivalents) so
+/// a running Claude Code session picks up newly-granted peer KGs
+/// without a session restart.
 ///
 /// Soft-fail: a write hiccup leaves the matrix DB row in place; the
 /// next refresh / project-create / rename call will retry. Returns the
@@ -2981,11 +2959,14 @@ pub struct UnregisterReport {
     pub project_name: String,
     /// Relative paths actually removed from `<folder>/`.
     pub files_purged: Vec<String>,
-    /// Canonical keys removed from any of the four env surfaces
-    /// (`.env`, `.claude/env`, `.claude/settings.json` `env` block,
-    /// `.vscode/settings.json` `claude-code.env` block). Duplicates
-    /// across surfaces are de-duped — each key appears once even if
-    /// removed from multiple files.
+    /// Canonical keys removed from any of the env surfaces (`.env`,
+    /// `.claude/env`, `.claude/settings.json` `env` block, plus any
+    /// pre-existing `.vscode/settings.json` `claude-code.env` block —
+    /// the launcher no longer authors that surface as of v0.2.12 /
+    /// PR-27, but the unregister strip pass still runs against it
+    /// when present so a hand-edited or pre-PR-27 block is cleaned up
+    /// on uninstall). Duplicates across surfaces are de-duped — each
+    /// key appears once even if removed from multiple files.
     pub keys_purged_from_env: Vec<String>,
     /// Names of dropped Weaviate collections (only populated when
     /// `purge_collections: true` and the drop succeeded).
@@ -3017,11 +2998,13 @@ pub struct UnregisterReport {
 // Install-flow audit (2026-05-08, P1 #2): the former
 // `CANONICAL_PORTABILITY_ENV_KEYS` is gone — its two members
 // (`VCT_ORCHESTRATOR_ROOT` / `VCT_INFRASTRUCTURE_DIR`) are now in
-// `CANONICAL_INSTALL_ENV_KEYS` so they propagate to all three install
-// surfaces (.claude/env, .claude/settings.json env block,
-// .vscode/settings.json claude-code.env block) instead of just
-// `.claude/env`. See the doc comment on `CANONICAL_INSTALL_ENV_KEYS`
-// for the full rationale.
+// `CANONICAL_INSTALL_ENV_KEYS` so they propagate to every install
+// surface (.claude/env, .claude/settings.json env block) instead of
+// just `.claude/env`. See the doc comment on
+// `CANONICAL_INSTALL_ENV_KEYS` for the full rationale. (PR-27 /
+// v0.2.12 / 2026-05-16 removed the historical third surface
+// `.vscode/settings.json claude-code.env` because it didn't propagate
+// to MCP subprocesses on Linux.)
 
 /// Canonical env keys the launcher writes during install AND removes
 /// during unregister. The names live here exactly once. Both the
@@ -3037,18 +3020,25 @@ pub struct UnregisterReport {
 /// kept in a separate `CANONICAL_PORTABILITY_ENV_KEYS` const and only
 /// emitted into `.claude/env` by `build_claude_env_managed_block`. The
 /// rationale ("only meaningful for shell-sourced contexts") was wrong:
-/// Claude Code propagates the `env` block of `.claude/settings.json` AND
-/// the `claude-code.env` block of `.vscode/settings.json` to hook
-/// subprocesses, so VS Code-extension users (the dominant path on
+/// Claude Code propagates the `env` block of `.claude/settings.json` to
+/// hook subprocesses, so VS Code-extension users (the dominant path on
 /// Linux/macOS/Windows for dev users) silently lost these vars. The
-/// hooks then fell back to a non-existent
-/// `claude_mcp_servers/.venv` path inside managed projects (managed
-/// projects don't ship `claude_mcp_servers/`). The two consts are now
-/// merged so the existing pair-builder propagates them to all three
-/// surfaces. The pair-builder's match arm returns `Option<String>` and
-/// emits `None` when `settings.orchestrator_root` is `None` — the entry
-/// is then omitted from every surface, preserving the "launcher running
-/// outside a git checkout silently omits these lines" semantics.
+/// hooks then fell back to a non-existent `claude_mcp_servers/.venv`
+/// path inside managed projects (managed projects don't ship
+/// `claude_mcp_servers/`). The two consts are now merged so the
+/// existing pair-builder propagates them to every surviving surface
+/// (`.claude/env` and `.claude/settings.json` env). The pair-builder's
+/// match arm returns `Option<String>` and emits `None` when
+/// `settings.orchestrator_root` is `None` — the entry is then omitted
+/// from every surface, preserving the "launcher running outside a git
+/// checkout silently omits these lines" semantics.
+///
+/// PR-27 (v0.2.12, 2026-05-16): a historical third surface
+/// (`.vscode/settings.json` `claude-code.env`) was removed because
+/// empirical sentinel testing showed it did not propagate to MCP
+/// subprocesses on Linux Claude Code 2.1.143. The 2026-05-08 audit
+/// comment above predates that empirical verification — `.vscode`
+/// claude-code.env block is NOT in the propagation chain on Linux.
 pub(crate) const CANONICAL_INSTALL_ENV_KEYS: &[&str] = &[
     "KG_COLLECTION",
     "DEVELOPMENT_COLLECTION",
@@ -4176,8 +4166,12 @@ pub async fn delete_project_v2(
 /// continues. Returns immediately on success.
 ///
 /// Bug 24: `surface` selects which Claude Code surface to use:
-/// - "vscode" (default): `code <folder>` (VS Code extension picks up env
-///   from .vscode/settings.json claude-code.env)
+/// - "vscode" (default): `code <folder>` (VS Code extension picks up
+///   env from `.claude/settings.json` `env` — the canonical channel
+///   since v0.2.12 / PR-27, which propagates to MCP subprocesses too;
+///   pre-v0.2.12 the launcher also wrote `.vscode/settings.json`
+///   `claude-code.env` but that surface didn't propagate to MCPs on
+///   Linux and was removed).
 /// - "cli": opens the system terminal in <folder> and runs `claude`. The
 ///   user's shell rc OR our `tools/claude` wrapper sources `.claude/env`
 ///   (Bug 23).
@@ -4461,7 +4455,7 @@ mod tests {
     }
 
     #[test]
-    fn write_project_env_files_creates_all_three_paths() {
+    fn write_project_env_files_creates_both_paths() {
         let tmp = std::env::temp_dir().join(format!(
             "vct-env-test-{}",
             uuid::Uuid::new_v4().simple()
@@ -4470,37 +4464,21 @@ mod tests {
 
         write_project_env_files(&tmp, &ProjectEnvSettings::with_defaults("My Test")).unwrap();
 
-        // 1. VS Code path
-        let vscode_settings = tmp.join(".vscode/settings.json");
-        assert!(vscode_settings.exists());
-        let raw = std::fs::read_to_string(&vscode_settings).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let env = &parsed["claude-code.env"];
-        // 2026-05-01: KG_COLLECTION carries the FULL Weaviate class name
-        // (suffixed), matching `.env` and the rest of the ecosystem. Was
-        // bare `MyTest` until the bare-kg fix.
-        assert_eq!(env["KG_COLLECTION"], "MyTest_KnowledgeGraph");
-        // PROJECT_NAME is the raw user-supplied name, not the sanitized
-        // Weaviate basename. Was `MyTest` (sanitized) before; now matches
-        // install.py + the .env template.
-        assert_eq!(env["PROJECT_NAME"], "My Test");
-        // PR-8 cross-PR handoff (v0.2.11): CODE_GRAPH_PROJECT is the
-        // sanitized Weaviate-safe form of PROJECT_NAME — must show up in
-        // the .vscode/settings.json::claude-code.env block at first install.
-        assert_eq!(env["CODE_GRAPH_PROJECT"], "MyTest");
-        // Uppercase D for Development across every surface — Weaviate
-        // class names are case-sensitive.
-        assert_eq!(env["DEVELOPMENT_COLLECTION"], "MyTest_Development");
-        // B5: CONVERSATION_COLLECTION must NOT be present in any surface.
-        assert!(env.get("CONVERSATION_COLLECTION").is_none());
-        // Shared-KG fields propagate to all three surfaces.
-        assert_eq!(env["SHARED_KG_COLLECTION"], "VibeCodedTools_KnowledgeGraph");
-        // Canonical write-gate key (asymmetric semantic since 2026-05-01).
-        assert_eq!(env["SHARED_KG_WRITE_DISABLED"], "false");
-        // Legacy alias mirrors the canonical value (kept for ~3 releases).
-        assert_eq!(env["SHARED_KG_OPT_OUT"], "false");
+        // PR-27 (v0.2.12, 2026-05-16): the writer no longer authors
+        // `.vscode/settings.json` `claude-code.env`. Assert the launcher
+        // did NOT create the file as a side-effect of the env write —
+        // the function's `vscode_dir` mkdir + write block was removed
+        // because the key didn't propagate to MCP subprocesses on Linux.
+        // The Pylance/watcher exclude block (separate top-level keys)
+        // is still managed by Python's `_backfill_vscode_excludes_in_project`,
+        // run from a different code path entirely. See the function
+        // docstring on `write_project_env_files` for the KG-node reference.
+        assert!(
+            !tmp.join(".vscode/settings.json").exists(),
+            "PR-27: write_project_env_files must not create .vscode/settings.json",
+        );
 
-        // 2. CLI shell file path
+        // 1. CLI shell file path
         let claude_env = tmp.join(".claude/env");
         assert!(claude_env.exists());
         let env_raw = std::fs::read_to_string(&claude_env).unwrap();
@@ -4516,21 +4494,35 @@ mod tests {
         assert!(env_raw.contains(r#"export SHARED_KG_WRITE_DISABLED="false""#));
         assert!(env_raw.contains(r#"export SHARED_KG_OPT_OUT="false""#));
 
-        // 3. Bug 30: canonical .claude/settings.json env block
+        // 2. Bug 30: canonical .claude/settings.json env block — the
+        // channel that actually propagates to MCP subprocesses (the
+        // PR-27 empirical-trace KG node calls this out as the canonical
+        // surface for per-project MCP env on Linux).
         let claude_settings = tmp.join(".claude/settings.json");
         assert!(claude_settings.exists());
         let raw = std::fs::read_to_string(&claude_settings).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let env = &parsed["env"];
+        // 2026-05-01: KG_COLLECTION carries the FULL Weaviate class name
+        // (suffixed), matching `.env` and the rest of the ecosystem. Was
+        // bare `MyTest` until the bare-kg fix.
         assert_eq!(env["KG_COLLECTION"], "MyTest_KnowledgeGraph");
+        // PROJECT_NAME is the raw user-supplied name, not the sanitized
+        // Weaviate basename. Was `MyTest` (sanitized) before; now matches
+        // install.py + the .env template.
         assert_eq!(env["PROJECT_NAME"], "My Test");
         // PR-8 cross-PR handoff: .claude/settings.json env block.
         assert_eq!(env["CODE_GRAPH_PROJECT"], "MyTest");
+        // Uppercase D for Development across every surface — Weaviate
+        // class names are case-sensitive.
         assert_eq!(env["DEVELOPMENT_COLLECTION"], "MyTest_Development");
         // B5: CONVERSATION_COLLECTION must NOT be in .claude/settings.json env.
         assert!(env.get("CONVERSATION_COLLECTION").is_none());
+        // Shared-KG fields propagate to both surfaces.
         assert_eq!(env["SHARED_KG_COLLECTION"], "VibeCodedTools_KnowledgeGraph");
+        // Canonical write-gate key (asymmetric semantic since 2026-05-01).
         assert_eq!(env["SHARED_KG_WRITE_DISABLED"], "false");
+        // Legacy alias mirrors the canonical value (kept for ~3 releases).
         assert_eq!(env["SHARED_KG_OPT_OUT"], "false");
 
         std::fs::remove_dir_all(&tmp).ok();
@@ -4611,12 +4603,18 @@ mod tests {
     /// portability keys appear in
     ///   * `.claude/env`               (POSIX export form)
     ///   * `.claude/settings.json`     (JSON `env` block)
-    ///   * `.vscode/settings.json`     (JSON `claude-code.env` block)
     ///
     /// And conversely: when `orchestrator_root` is `None`, neither
     /// surface contains the keys (omit, don't write empty).
+    ///
+    /// PR-27 (v0.2.12, 2026-05-16): the historical third surface
+    /// (`.vscode/settings.json` `claude-code.env`) was removed because
+    /// it didn't propagate to MCP subprocesses on Linux. The launcher
+    /// must NOT author the file at all from this code path. See the
+    /// function docstring on `write_project_env_files` for the KG-node
+    /// reference.
     #[test]
-    fn vct_portability_keys_propagate_to_all_three_surfaces() {
+    fn vct_portability_keys_propagate_to_both_surfaces() {
         let tmp = std::env::temp_dir().join(format!(
             "vct-portability-prop-{}", uuid::Uuid::new_v4().simple()
         ));
@@ -4663,19 +4661,12 @@ mod tests {
              Block: {}", cs["env"],
         );
 
-        // Surface 3: .vscode/settings.json claude-code.env block.
-        let vsc: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(tmp.join(".vscode/settings.json")).unwrap()
-        ).unwrap();
-        assert_eq!(
-            vsc["claude-code.env"]["VCT_ORCHESTRATOR_ROOT"], orch_str,
-            ".vscode/settings.json claude-code.env missing VCT_ORCHESTRATOR_ROOT. \
-             Block: {}", vsc["claude-code.env"],
-        );
-        assert_eq!(
-            vsc["claude-code.env"]["VCT_INFRASTRUCTURE_DIR"], infra_str,
-            ".vscode/settings.json claude-code.env missing VCT_INFRASTRUCTURE_DIR. \
-             Block: {}", vsc["claude-code.env"],
+        // PR-27: the launcher must NOT have created .vscode/settings.json
+        // as part of the env write — the historical third surface is
+        // gone.
+        assert!(
+            !tmp.join(".vscode/settings.json").exists(),
+            "PR-27: write_project_env_files must not create .vscode/settings.json",
         );
 
         std::fs::remove_dir_all(&tmp).ok();
@@ -4684,13 +4675,20 @@ mod tests {
 
     /// Install-flow audit (2026-05-08, P1 #2): the omit-on-`None`
     /// semantics from the pre-fix `.claude/env` writer must extend to
-    /// all three surfaces. When the launcher runs outside a git
-    /// checkout (`settings.orchestrator_root = None`), neither
-    /// portability key should appear in any surface — and crucially
-    /// not as empty-string values that would mask the in-tree fallback
-    /// resolution path the hooks rely on.
+    /// every surface. When the launcher runs outside a git checkout
+    /// (`settings.orchestrator_root = None`), neither portability key
+    /// should appear in any surface — and crucially not as empty-string
+    /// values that would mask the in-tree fallback resolution path the
+    /// hooks rely on.
+    ///
+    /// PR-27 (v0.2.12, 2026-05-16): post-removal of the
+    /// `.vscode/settings.json` surface, the assertion is reduced to
+    /// `.claude/env` + `.claude/settings.json` — the omit contract now
+    /// holds across the two surviving surfaces. The launcher additionally
+    /// must NOT create `.vscode/settings.json` as a side-effect of the
+    /// env write.
     #[test]
-    fn vct_portability_keys_omitted_on_all_surfaces_when_none() {
+    fn vct_portability_keys_omitted_on_both_surfaces_when_none() {
         let tmp = std::env::temp_dir().join(format!(
             "vct-portability-omit-{}", uuid::Uuid::new_v4().simple()
         ));
@@ -4732,20 +4730,11 @@ mod tests {
              when orchestrator_root=None. Block: {}", cs["env"],
         );
 
-        let vsc: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(tmp.join(".vscode/settings.json")).unwrap()
-        ).unwrap();
+        // PR-27: file must not exist (and therefore cannot carry the
+        // portability keys either).
         assert!(
-            vsc["claude-code.env"].get("VCT_ORCHESTRATOR_ROOT").is_none(),
-            ".vscode/settings.json claude-code.env should not contain \
-             VCT_ORCHESTRATOR_ROOT when orchestrator_root=None. Block: {}",
-            vsc["claude-code.env"],
-        );
-        assert!(
-            vsc["claude-code.env"].get("VCT_INFRASTRUCTURE_DIR").is_none(),
-            ".vscode/settings.json claude-code.env should not contain \
-             VCT_INFRASTRUCTURE_DIR when orchestrator_root=None. Block: {}",
-            vsc["claude-code.env"],
+            !tmp.join(".vscode/settings.json").exists(),
+            "PR-27: write_project_env_files must not create .vscode/settings.json",
         );
 
         std::fs::remove_dir_all(&tmp).ok();
@@ -4799,16 +4788,13 @@ mod tests {
             cs["env"],
         );
 
-        // Surface 3: .vscode/settings.json claude-code.env block.
-        let vsc: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(tmp.join(".vscode/settings.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            vsc["claude-code.env"]["GITHUB_TOKEN"], canary,
-            ".vscode/settings.json claude-code.env missing GITHUB_TOKEN. \
-             Block: {}",
-            vsc["claude-code.env"],
+        // PR-27 (v0.2.12, 2026-05-16): the writer no longer touches
+        // `.vscode/settings.json` — the file must not have been created
+        // by the env write. See function-level docstring for the
+        // empirical-trace KG-node reference.
+        assert!(
+            !tmp.join(".vscode/settings.json").exists(),
+            "PR-27: write_project_env_files must not create .vscode/settings.json",
         );
 
         std::fs::remove_dir_all(&tmp).ok();
@@ -4859,15 +4845,11 @@ mod tests {
             cs["env"],
         );
 
-        let vsc: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(tmp.join(".vscode/settings.json")).unwrap(),
-        )
-        .unwrap();
+        // PR-27: file must not exist (and therefore cannot carry the
+        // token either).
         assert!(
-            vsc["claude-code.env"].get("GITHUB_TOKEN").is_none(),
-            ".vscode/settings.json claude-code.env should not contain \
-             GITHUB_TOKEN when keychain has no entry. Block: {}",
-            vsc["claude-code.env"],
+            !tmp.join(".vscode/settings.json").exists(),
+            "PR-27: write_project_env_files must not create .vscode/settings.json",
         );
 
         std::fs::remove_dir_all(&tmp).ok();
@@ -4875,10 +4857,18 @@ mod tests {
 
     #[test]
     fn env_surfaces_agree_after_write_project_env_files() {
-        // 4-way equality regression: KG_COLLECTION must be IDENTICAL across
-        // .env (template), .vscode/settings.json claude-code.env block,
-        // .claude/env POSIX exports, and .claude/settings.json env block.
+        // 3-way equality regression: KG_COLLECTION must be IDENTICAL across
+        // .env (template), .claude/env POSIX exports, and
+        // .claude/settings.json env block.
+        //
         // Pre-fix: bare in three, suffixed in .env → the bug VideoFrames hit.
+        //
+        // PR-27 (v0.2.12, 2026-05-16): the historical fourth surface
+        // (`.vscode/settings.json claude-code.env`) was removed because
+        // it didn't propagate to MCP subprocesses on Linux. The parity
+        // check is now 3-way; the file must not have been created at
+        // all by the env write. See `write_project_env_files` docstring
+        // for the empirical-trace KG-node reference.
         let tmp = std::env::temp_dir().join(format!(
             "vct-env-parity-{}",
             uuid::Uuid::new_v4().simple()
@@ -4889,21 +4879,24 @@ mod tests {
         ensure_project_env_template(&tmp, &ProjectEnvSettings::with_defaults("VideoFrames")).unwrap();
 
         let env_text = std::fs::read_to_string(tmp.join(".env")).unwrap();
-        let vsc: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(tmp.join(".vscode/settings.json")).unwrap()).unwrap();
         let claude_env_text = std::fs::read_to_string(tmp.join(".claude/env")).unwrap();
         let cs: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(tmp.join(".claude/settings.json")).unwrap()).unwrap();
 
         assert!(env_text.contains("KG_COLLECTION=VideoFrames_KnowledgeGraph"));
-        assert_eq!(vsc["claude-code.env"]["KG_COLLECTION"], "VideoFrames_KnowledgeGraph");
         assert!(claude_env_text.contains(r#"export KG_COLLECTION="VideoFrames_KnowledgeGraph""#));
         assert_eq!(cs["env"]["KG_COLLECTION"], "VideoFrames_KnowledgeGraph");
 
         assert!(env_text.contains("DEVELOPMENT_COLLECTION=VideoFrames_Development"));
-        assert_eq!(vsc["claude-code.env"]["DEVELOPMENT_COLLECTION"], "VideoFrames_Development");
         assert!(claude_env_text.contains(r#"export DEVELOPMENT_COLLECTION="VideoFrames_Development""#));
         assert_eq!(cs["env"]["DEVELOPMENT_COLLECTION"], "VideoFrames_Development");
+
+        // PR-27: file must not exist (and therefore cannot carry the
+        // canonical keys either).
+        assert!(
+            !tmp.join(".vscode/settings.json").exists(),
+            "PR-27: write_project_env_files must not create .vscode/settings.json",
+        );
 
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -4956,41 +4949,48 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// Bug 32: existing `.vscode/settings.json` user keys (formatOnSave,
-    /// defaultInterpreter, etc.) MUST be preserved. Top-level merge.
+    /// PR-27 (v0.2.12, 2026-05-16): existing `.vscode/settings.json` is
+    /// no longer touched by `write_project_env_files`. The writer used
+    /// to deep-merge a `claude-code.env` block in (Bug 32 + PR-3 Commit 6),
+    /// but that block did not propagate to MCP subprocesses on Linux
+    /// as of Claude Code 2.1.143 (empirical trace in PR-27 commit
+    /// message; verified via `/proc/<mcp_pid>/environ` sentinel test).
     ///
-    /// PR-3 Commit 6 (2026-05-06): the `claude-code.env` sub-block is
-    /// also deep-merged now — user-added env keys at that level survive.
+    /// Inverted contract: if the user has a pre-existing
+    /// `.vscode/settings.json` (with their own editor preferences, a
+    /// hand-written `claude-code.env` block, anything), the file must
+    /// survive the env-write call BYTE-FOR-BYTE — the launcher must
+    /// not author anything into it. The user remains the sole author of
+    /// `.vscode/settings.json`; the canonical channel for per-project
+    /// MCP env is now `.claude/settings.json` `env` (asserted by sister
+    /// tests like `write_project_env_files_creates_both_paths`).
     #[test]
-    fn write_preserves_existing_vscode_settings_json() {
+    fn write_does_not_touch_existing_vscode_settings_json() {
         let tmp = std::env::temp_dir().join(format!(
             "vct-vscode-merge-test-{}",
             uuid::Uuid::new_v4().simple()
         ));
         std::fs::create_dir_all(tmp.join(".vscode")).unwrap();
         let path = tmp.join(".vscode/settings.json");
-        std::fs::write(
-            &path,
-            r#"{
+        let pre_existing = r#"{
                 "editor.formatOnSave": true,
                 "python.defaultInterpreterPath": "/usr/bin/python3",
                 "claude-code.env": {"OLD_KEY": "old"}
-            }"#,
-        )
-        .unwrap();
+            }"#;
+        std::fs::write(&path, pre_existing).unwrap();
 
         write_project_env_files(&tmp, &ProjectEnvSettings::with_defaults("MyProject")).unwrap();
 
-        let raw = std::fs::read_to_string(&path).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(v["editor.formatOnSave"], true);
-        assert_eq!(v["python.defaultInterpreterPath"], "/usr/bin/python3");
-        assert_eq!(v["claude-code.env"]["KG_COLLECTION"], "MyProject_KnowledgeGraph");
-        // PR-3 Commit 6: user-added env keys at the env-sub-block level
-        // are preserved by the deep-merge.
+        // The file must be byte-for-byte identical — the launcher's
+        // env-write code path no longer touches `.vscode/settings.json`.
+        // (PR-7's Python-side `_backfill_vscode_excludes_in_project`
+        // is a separate code path with its own tests; it manages the
+        // Pylance/watcher exclude block at the top level and is not
+        // invoked from `write_project_env_files`.)
+        let after = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
-            v["claude-code.env"]["OLD_KEY"], "old",
-            "user-added env keys must be preserved by deep-merge"
+            after, pre_existing,
+            "PR-27: write_project_env_files must leave .vscode/settings.json unchanged"
         );
 
         std::fs::remove_dir_all(&tmp).ok();
@@ -5103,8 +5103,16 @@ mod tests {
         );
 
         // env files must have landed at the project folder.
-        assert!(folder.join(".vscode/settings.json").exists());
+        // PR-27 (v0.2.12, 2026-05-16): only `.claude/env` and (implied by
+        // the writer's `.claude/settings.json` write) the canonical env
+        // block are authored. `.vscode/settings.json` is intentionally
+        // NOT created — see `write_does_not_touch_existing_vscode_settings_json`
+        // for the contract.
         assert!(folder.join(".claude/env").exists());
+        assert!(
+            !folder.join(".vscode/settings.json").exists(),
+            "PR-27: onboarding must not create .vscode/settings.json via the env writer",
+        );
 
         std::fs::remove_dir_all(&folder).ok();
     }
@@ -5274,12 +5282,14 @@ mod tests {
         assert!(!env.contains("CONVERSATION_COLLECTION"),
                 ".env must not contain CONVERSATION_COLLECTION:\n{env}");
 
-        // .vscode/settings.json claude-code.env block
-        let vsc: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(tmp.join(".vscode/settings.json")).unwrap(),
-        ).unwrap();
-        assert!(vsc["claude-code.env"].get("CONVERSATION_COLLECTION").is_none(),
-                ".vscode/settings.json must not have CONVERSATION_COLLECTION");
+        // PR-27 (v0.2.12, 2026-05-16): the writer no longer authors
+        // `.vscode/settings.json`. The B5 contract becomes "absent
+        // surface trivially cannot leak the key" — file must not
+        // exist.
+        assert!(
+            !tmp.join(".vscode/settings.json").exists(),
+            "PR-27: write_project_env_files must not create .vscode/settings.json",
+        );
 
         // .claude/env
         let ce = std::fs::read_to_string(tmp.join(".claude/env")).unwrap();
@@ -5340,12 +5350,14 @@ mod tests {
         // Simulate rename — re-run env writers with new name.
         write_project_env_files(&tmp, &ProjectEnvSettings::with_defaults("BazQux")).unwrap();
 
-        // VS Code surface
-        let vsc: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(tmp.join(".vscode/settings.json")).unwrap(),
-        ).unwrap();
-        assert_eq!(vsc["claude-code.env"]["KG_COLLECTION"], "BazQux_KnowledgeGraph");
-        assert_ne!(vsc["claude-code.env"]["KG_COLLECTION"], "FooBar_KnowledgeGraph");
+        // PR-27 (v0.2.12, 2026-05-16): the VS Code surface
+        // (`.vscode/settings.json` `claude-code.env`) is no longer
+        // written by `write_project_env_files`. Rename refresh now
+        // covers only `.claude/env` and `.claude/settings.json`.
+        assert!(
+            !tmp.join(".vscode/settings.json").exists(),
+            "PR-27: rename refresh must not create .vscode/settings.json",
+        );
 
         // CLI shell file
         let ce = std::fs::read_to_string(tmp.join(".claude/env")).unwrap();
@@ -5425,12 +5437,16 @@ mod tests {
 
         write_project_env_files(&tmp, &ProjectEnvSettings::with_defaults("Acme")).unwrap();
 
-        // .vscode/settings.json — Rust does not inject GRPC_PORT here.
-        let vsc: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(tmp.join(".vscode/settings.json")).unwrap(),
-        ).unwrap();
-        assert!(vsc["claude-code.env"].get("GRPC_PORT").is_none(),
-                ".vscode/settings.json must not have GRPC_PORT (install.py owns that surface)");
+        // PR-27 (v0.2.12, 2026-05-16): `.vscode/settings.json` is no
+        // longer authored by the Rust writer at all, so the "Rust does
+        // not inject GRPC_PORT into VS Code surface" assertion becomes
+        // tautological — the surface itself isn't created. Assert the
+        // file's absence as the strongest possible "no GRPC_PORT here"
+        // statement.
+        assert!(
+            !tmp.join(".vscode/settings.json").exists(),
+            "PR-27: write_project_env_files must not create .vscode/settings.json",
+        );
 
         // .claude/env — same.
         let ce = std::fs::read_to_string(tmp.join(".claude/env")).unwrap();
@@ -5444,10 +5460,17 @@ mod tests {
     /// round-trip. Set the toggle, then re-render env surfaces and verify
     /// the canonical key plus the legacy alias both reflect the new value.
     /// (`.env` is owned by ensure_project_env_template — it doesn't carry
-    /// the gate, so the relevant surfaces are the 3 written by
+    /// the gate, so the relevant surfaces are the 2 written by
     /// write_project_env_files.)
+    ///
+    /// PR-27 (v0.2.12, 2026-05-16): the historical third surface
+    /// (`.vscode/settings.json` `claude-code.env`) was removed because
+    /// it didn't propagate to MCP subprocesses on Linux Claude Code
+    /// 2.1.143. The toggle round-trip now covers only `.claude/env`
+    /// and `.claude/settings.json` env block; the absence of
+    /// `.vscode/settings.json` is itself part of the contract.
     #[test]
-    fn shared_kg_write_disabled_toggle_flips_all_env_surfaces() {
+    fn shared_kg_write_disabled_toggle_flips_both_env_surfaces() {
         let tmp = std::env::temp_dir().join(format!(
             "vct-medium1-{}",
             uuid::Uuid::new_v4().simple()
@@ -5457,28 +5480,28 @@ mod tests {
         // Default (None / false) → both keys "false" everywhere.
         write_project_env_files(&tmp, &ProjectEnvSettings::with_defaults("Acme")).unwrap();
 
-        // Helper returning (vsc_canonical, vsc_legacy, cs_canonical,
-        // cs_legacy, env_sh_text) so we can assert on every surface.
-        let read_all = || -> (String, String, String, String, String) {
-            let vsc: serde_json::Value = serde_json::from_str(
-                &std::fs::read_to_string(tmp.join(".vscode/settings.json")).unwrap(),
-            ).unwrap();
+        // Helper returning (cs_canonical, cs_legacy, env_sh_text) so
+        // we can assert on both surviving surfaces.
+        let read_both = || -> (String, String, String) {
+            // PR-27: `.vscode/settings.json` must NEVER exist after a
+            // write — re-check on every read pass to catch any
+            // regression that re-introduces the surface.
+            assert!(
+                !tmp.join(".vscode/settings.json").exists(),
+                "PR-27: write_project_env_files must not create .vscode/settings.json",
+            );
             let cs: serde_json::Value = serde_json::from_str(
                 &std::fs::read_to_string(tmp.join(".claude/settings.json")).unwrap(),
             ).unwrap();
             let env_sh = std::fs::read_to_string(tmp.join(".claude/env")).unwrap();
             (
-                vsc["claude-code.env"]["SHARED_KG_WRITE_DISABLED"].as_str().unwrap().to_string(),
-                vsc["claude-code.env"]["SHARED_KG_OPT_OUT"].as_str().unwrap().to_string(),
                 cs["env"]["SHARED_KG_WRITE_DISABLED"].as_str().unwrap().to_string(),
                 cs["env"]["SHARED_KG_OPT_OUT"].as_str().unwrap().to_string(),
                 env_sh,
             )
         };
 
-        let (vsc_new, vsc_old, cs_new, cs_old, env_sh) = read_all();
-        assert_eq!(vsc_new, "false");
-        assert_eq!(vsc_old, "false");
+        let (cs_new, cs_old, env_sh) = read_both();
         assert_eq!(cs_new, "false");
         assert_eq!(cs_old, "false");
         assert!(env_sh.contains(r#"export SHARED_KG_WRITE_DISABLED="false""#));
@@ -5486,9 +5509,7 @@ mod tests {
 
         // Flip to true.
         { let mut s = ProjectEnvSettings::with_defaults("Acme"); s.shared_kg_write_disabled = true; write_project_env_files(&tmp, &s) }.unwrap();
-        let (vsc_new, vsc_old, cs_new, cs_old, env_sh) = read_all();
-        assert_eq!(vsc_new, "true");
-        assert_eq!(vsc_old, "true");
+        let (cs_new, cs_old, env_sh) = read_both();
         assert_eq!(cs_new, "true");
         assert_eq!(cs_old, "true");
         assert!(env_sh.contains(r#"export SHARED_KG_WRITE_DISABLED="true""#));
@@ -5498,9 +5519,7 @@ mod tests {
 
         // Flip back to false.
         { let mut s = ProjectEnvSettings::with_defaults("Acme"); s.shared_kg_write_disabled = false; write_project_env_files(&tmp, &s) }.unwrap();
-        let (vsc_new, vsc_old, cs_new, cs_old, env_sh) = read_all();
-        assert_eq!(vsc_new, "false");
-        assert_eq!(vsc_old, "false");
+        let (cs_new, cs_old, env_sh) = read_both();
         assert_eq!(cs_new, "false");
         assert_eq!(cs_old, "false");
         assert!(env_sh.contains(r#"export SHARED_KG_WRITE_DISABLED="false""#));
@@ -7306,22 +7325,12 @@ USER_DB_URL=postgres://user:pass@db/app
             cs["env"]
         );
 
-        // Surface 3: .vscode/settings.json claude-code.env block.
-        let vsc: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(tmp.join(".vscode/settings.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            vsc["claude-code.env"]["VCT_KG_ACCESS_LIST"], "PeerA,PeerB",
-            ".vscode/settings.json claude-code.env missing VCT_KG_ACCESS_LIST. \
-             Block: {}",
-            vsc["claude-code.env"]
-        );
-        assert_eq!(
-            vsc["claude-code.env"]["VCT_CODE_GRAPH_ACCESS_LIST"], "PeerC",
-            ".vscode/settings.json claude-code.env missing VCT_CODE_GRAPH_ACCESS_LIST. \
-             Block: {}",
-            vsc["claude-code.env"]
+        // PR-27 (v0.2.12, 2026-05-16): the historical third surface
+        // (`.vscode/settings.json` `claude-code.env`) was removed. The
+        // writer must not create the file as a side-effect.
+        assert!(
+            !tmp.join(".vscode/settings.json").exists(),
+            "PR-27: write_project_env_files must not create .vscode/settings.json",
         );
 
         std::fs::remove_dir_all(&tmp).ok();
@@ -7369,19 +7378,14 @@ USER_DB_URL=postgres://user:pass@db/app
             ".claude/settings.json env should omit VCT_CODE_GRAPH_ACCESS_LIST when empty"
         );
 
-        let vsc: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(tmp.join(".vscode/settings.json")).unwrap(),
-        )
-        .unwrap();
+        // PR-27 (v0.2.12, 2026-05-16): the writer must not create
+        // `.vscode/settings.json` at all. The historical claude-code.env
+        // surface was removed because it didn't propagate to MCP
+        // subprocesses on Linux. See `write_project_env_files` docstring
+        // for the empirical-trace KG-node reference.
         assert!(
-            vsc["claude-code.env"].get("VCT_KG_ACCESS_LIST").is_none(),
-            ".vscode/settings.json claude-code.env should omit VCT_KG_ACCESS_LIST when empty"
-        );
-        assert!(
-            vsc["claude-code.env"]
-                .get("VCT_CODE_GRAPH_ACCESS_LIST")
-                .is_none(),
-            ".vscode/settings.json claude-code.env should omit VCT_CODE_GRAPH_ACCESS_LIST when empty"
+            !tmp.join(".vscode/settings.json").exists(),
+            "PR-27: write_project_env_files must not create .vscode/settings.json",
         );
 
         std::fs::remove_dir_all(&tmp).ok();
@@ -7554,8 +7558,12 @@ USER_DB_URL=postgres://user:pass@db/app
     // `surgically_strip_env_surfaces` for the layered-cleanup design.
 
     /// Direct contract test: when `ProjectEnvSettings` carries an active
-    /// user-secret pair, all three launcher-managed env surfaces emit it
+    /// user-secret pair, both launcher-managed env surfaces emit it
     /// alongside the canonical keys.
+    ///
+    /// PR-27 (v0.2.12, 2026-05-16): the historical third surface
+    /// (`.vscode/settings.json` `claude-code.env`) was removed because
+    /// it didn't propagate to MCP subprocesses on Linux.
     #[test]
     fn write_project_env_files_includes_user_set_secrets() {
         let tmp = std::env::temp_dir().join(format!(
@@ -7613,17 +7621,12 @@ USER_DB_URL=postgres://user:pass@db/app
         assert_eq!(cs["env"]["MY_PROJECT_KEY"], "ghp_subagent_g_canary_value");
         assert_eq!(cs["env"]["INTERNAL_API_BASE"], "https://api.internal.example.com");
 
-        // 3. .vscode/settings.json claude-code.env block.
-        let vsc: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(tmp.join(".vscode/settings.json")).unwrap())
-                .unwrap();
-        assert_eq!(
-            vsc["claude-code.env"]["MY_PROJECT_KEY"],
-            "ghp_subagent_g_canary_value"
-        );
-        assert_eq!(
-            vsc["claude-code.env"]["INTERNAL_API_BASE"],
-            "https://api.internal.example.com"
+        // PR-27: the writer must not create `.vscode/settings.json` at
+        // all. The historical claude-code.env surface was removed
+        // because it didn't propagate to MCP subprocesses on Linux.
+        assert!(
+            !tmp.join(".vscode/settings.json").exists(),
+            "PR-27: write_project_env_files must not create .vscode/settings.json",
         );
 
         std::fs::remove_dir_all(&tmp).ok();
@@ -7677,15 +7680,15 @@ USER_DB_URL=postgres://user:pass@db/app
             cs["env"]
         );
 
-        // .vscode/settings.json: same.
-        let vsc: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(tmp.join(".vscode/settings.json")).unwrap())
-                .unwrap();
+        // PR-27 (v0.2.12, 2026-05-16): the writer no longer authors
+        // `.vscode/settings.json` on the second call either. There's
+        // nothing to strip from a file that was never created in the
+        // first place; the historical strip-on-pause behaviour for the
+        // `.vscode/settings.json` claude-code.env surface is now
+        // tautologically satisfied.
         assert!(
-            vsc["claude-code.env"].get("PAUSED_KEY").is_none(),
-            ".vscode/settings.json claude-code.env still carries paused PAUSED_KEY. \
-             Block: {}",
-            vsc["claude-code.env"]
+            !tmp.join(".vscode/settings.json").exists(),
+            "PR-27: write_project_env_files must not create .vscode/settings.json",
         );
 
         // Sanity: canonical keys stayed put through the strip pass.
@@ -7703,6 +7706,16 @@ USER_DB_URL=postgres://user:pass@db/app
     /// `user_secret_known_keys`, so the strip set leaves it alone.
     /// Pins the boundary between "Subagent G owns this key" and
     /// "user owns this key" in the deep-merge contract.
+    ///
+    /// PR-27 (v0.2.12, 2026-05-16): the equivalent
+    /// `.vscode/settings.json` `claude-code.env` deep-merge no longer
+    /// runs (the surface itself was removed because it didn't
+    /// propagate to MCP subprocesses on Linux — see PR-27 commit
+    /// message for the empirical trace). The by-hand contract for
+    /// that file is now stricter: a pre-existing
+    /// `.vscode/settings.json` must come out of `write_project_env_files`
+    /// BYTE-FOR-BYTE unchanged — the launcher leaves it entirely alone
+    /// from this code path.
     #[test]
     fn write_project_env_files_preserves_by_hand_user_keys_not_owned_by_launcher() {
         let tmp = std::env::temp_dir().join(format!(
@@ -7720,13 +7733,10 @@ USER_DB_URL=postgres://user:pass@db/app
             }"#,
         )
         .unwrap();
-        std::fs::write(
-            tmp.join(".vscode/settings.json"),
-            r#"{
+        let vscode_pre_existing = r#"{
                 "claude-code.env": {"BY_HAND_KEY": "user_typed_value"}
-            }"#,
-        )
-        .unwrap();
+            }"#;
+        std::fs::write(tmp.join(".vscode/settings.json"), vscode_pre_existing).unwrap();
 
         let mut settings = ProjectEnvSettings::with_defaults("ByHandPreserve");
         // Add a launcher-owned user secret that COINCIDENTALLY happens
@@ -7738,6 +7748,8 @@ USER_DB_URL=postgres://user:pass@db/app
 
         write_project_env_files(&tmp, &settings).unwrap();
 
+        // `.claude/settings.json`: deep-merge contract still applies —
+        // by-hand env key survives, launcher's user secret is added.
         let cs: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(tmp.join(".claude/settings.json")).unwrap())
                 .unwrap();
@@ -7747,11 +7759,16 @@ USER_DB_URL=postgres://user:pass@db/app
         );
         assert_eq!(cs["env"]["LAUNCHER_OWNED"], "v1");
 
-        let vsc: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(tmp.join(".vscode/settings.json")).unwrap())
-                .unwrap();
-        assert_eq!(vsc["claude-code.env"]["BY_HAND_KEY"], "user_typed_value");
-        assert_eq!(vsc["claude-code.env"]["LAUNCHER_OWNED"], "v1");
+        // PR-27: `.vscode/settings.json` must come out byte-for-byte
+        // identical. The launcher no longer authors anything into it —
+        // not even the LAUNCHER_OWNED user secret (which lands in
+        // `.claude/settings.json` env instead, the channel that
+        // actually propagates to MCP subprocesses on Linux).
+        let vscode_after = std::fs::read_to_string(tmp.join(".vscode/settings.json")).unwrap();
+        assert_eq!(
+            vscode_after, vscode_pre_existing,
+            "PR-27: write_project_env_files must leave .vscode/settings.json unchanged",
+        );
 
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -7877,7 +7894,7 @@ USER_DB_URL=postgres://user:pass@db/app
         ];
         write_project_env_files(&tmp, &settings_purge).unwrap();
 
-        // All three surfaces no longer carry the user keys.
+        // Both surviving surfaces no longer carry the user keys.
         let claude_env = std::fs::read_to_string(tmp.join(".claude/env")).unwrap();
         assert!(!claude_env.contains("PURGE_TEST_A"));
         assert!(!claude_env.contains("PURGE_TEST_B"));
@@ -7888,11 +7905,16 @@ USER_DB_URL=postgres://user:pass@db/app
         assert!(cs["env"].get("PURGE_TEST_A").is_none());
         assert!(cs["env"].get("PURGE_TEST_B").is_none());
 
-        let vsc: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(tmp.join(".vscode/settings.json")).unwrap())
-                .unwrap();
-        assert!(vsc["claude-code.env"].get("PURGE_TEST_A").is_none());
-        assert!(vsc["claude-code.env"].get("PURGE_TEST_B").is_none());
+        // PR-27 (v0.2.12, 2026-05-16): the writer never created
+        // `.vscode/settings.json` in either call. The historical
+        // claude-code.env surface was removed because it didn't
+        // propagate to MCP subprocesses on Linux — the
+        // strip-on-pause / strip-on-purge contract for that file is
+        // tautological now (nothing was ever written there).
+        assert!(
+            !tmp.join(".vscode/settings.json").exists(),
+            "PR-27: write_project_env_files must not create .vscode/settings.json",
+        );
 
         std::fs::remove_dir_all(&tmp).ok();
     }
