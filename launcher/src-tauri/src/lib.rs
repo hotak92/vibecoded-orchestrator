@@ -387,6 +387,10 @@ pub fn run() {
             commands::project_state_cmd::list_user_added_project_mcp_servers,
             commands::project_state_cmd::set_project_mcp_server_enabled,
             commands::project_state_cmd::unregister_project_mcp_server,
+            // PR-6 (v0.2.11): per-project .claude/env key reader+writer
+            // (backs the HooksTab VCO_LEAN_CTX_DEFAULT toggle).
+            commands::claude_env::get_claude_env_value,
+            commands::claude_env::set_claude_env_value,
             // Secrets + settings
             commands::secrets_cmd::set_secret_v2,
             commands::secrets_cmd::clear_secret_v2,
