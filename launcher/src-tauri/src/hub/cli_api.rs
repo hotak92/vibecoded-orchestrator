@@ -120,6 +120,18 @@ async fn create_project(
                 .into_response();
         }
     };
+    // Migration 013 (v0.2.11): host='orchestrator_root' is reserved.
+    // Mirror the guard in `create_project_v2`. The auto-registration
+    // path in `Db::open()` is the only sanctioned creator.
+    if host == ProjectHost::OrchestratorRoot {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "host='orchestrator_root' is reserved (auto-registered at launcher startup); use 'base' or 'mao' for user projects"
+            })),
+        )
+            .into_response();
+    }
     let path = std::path::Path::new(&req.folder_path);
     if !path.is_dir() {
         return (

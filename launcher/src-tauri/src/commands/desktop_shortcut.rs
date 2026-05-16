@@ -41,9 +41,17 @@ use std::path::{Path, PathBuf};
 ///   * macOS:   refreshes the `$HOME/Applications/<bundle>` symlink when
 ///              `launcher_binary` is inside a `.app` bundle. No-op
 ///              otherwise (bare binary, e.g. `cargo run` / dev build).
-///   * Windows: TODO — needs a separate PowerShell helper to write a .lnk.
-///              Current behavior: returns Ok(()) without writing anything
-///              so the caller's soft-fail discipline stays clean.
+///   * Windows: intentional no-op. The `.lnk` shortcut is created once
+///              by `first-install.bat` at install time and points at
+///              the launcher binary in its install directory. Because
+///              the launcher binary path is stable across self-update
+///              (`apply_launcher_update` rebuilds in place via cargo
+///              and never relocates the binary), there is nothing to
+///              refresh post-update. If a user manually moves their
+///              install directory the .lnk becomes stale and must be
+///              recreated by re-running `first-install.bat` — that
+///              edge case is documented in
+///              docs/TROUBLESHOOTING.md and is not the refresh path.
 pub fn refresh_desktop_shortcut(
     install_path: &Path,
     launcher_binary: &Path,
@@ -62,10 +70,12 @@ pub fn refresh_desktop_shortcut(
     }
     #[cfg(target_os = "windows")]
     {
-        // No-op for now. Windows shortcut creation requires PowerShell
-        // (CreateShortcut COM call); first-install.bat already handles
-        // initial creation, and refresh-on-update is best deferred to a
-        // dedicated PS helper. See KNOWN_ISSUES.md.
+        // No-op by design. See the docstring on `refresh_desktop_shortcut`
+        // above: `first-install.bat` creates the .lnk once, and the
+        // launcher binary path is stable across self-update, so there
+        // is nothing to refresh. The `install_path` / `launcher_binary`
+        // args are accepted for API parity with Linux/macOS callers
+        // (which DO need them) — discarded here.
         let _ = (install_path, launcher_binary);
         return Ok(());
     }

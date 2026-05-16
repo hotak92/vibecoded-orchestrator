@@ -821,10 +821,12 @@ mod tests {
     //   * The bundled `vct-search.json` parses as a valid `ModuleManifest`.
     //   * The `github_pat` secret is declared with `scope: "shared"` —
     //     matching what `wrapper.sh` queries and what
-    //     `commands/installer.rs::register_github_pat` writes to
-    //     `~/.vct-secrets/shared/github_pat` (the file path the
-    //     OnboardingWizard still uses; keychain migration is Open Q #1
-    //     deferred to 0.1.8).
+    //     `commands/installer.rs::register_github_pat` migrates to the
+    //     OS keychain. The legacy `~/.vct-secrets/shared/github_pat`
+    //     file path is read as a fallback during the one-time keychain
+    //     migration (gated by APP_STATE_KEY_GITHUB_PAT_MIGRATED, landed
+    //     in 0.2.0). Post-migration the keychain entry is the source of
+    //     truth; the file lingers as documentation of past state.
     //   * `runtime.env_from_secrets` references `github_pat` (not the
     //     legacy `GITHUB_TOKEN`), so when launcher-managed runtime
     //     injection lands it picks up the right keychain entry.

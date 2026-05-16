@@ -36,10 +36,16 @@ use crate::secrets::{self, SecretScope};
 
 // ─── Secrets ────────────────────────────────────────────────────────────
 
-// TODO: wire — defined for the secrets-list UI but no command emits it
-// yet. The current secret list page reads `get_secret_status_v2` per
-// key. When we add a "list all secrets for this project" panel, that
-// command should return Vec<SecretMetadata>.
+// Wire-format for the future "list all secrets for this project" panel.
+// No command emits `Vec<SecretMetadata>` today — the current secret list
+// page reads `get_secret_status_v2` per key. The PR-8 Identity/Permissions
+// tab work (v0.2.11) consumes this type from the TypeScript mirror at
+// `launcher/src/lib/types/launcher.ts`, even though the Rust side does
+// not yet have a producer. `#[allow(dead_code)]` keeps the type
+// compiled (no orphan import errors on `Serialize` derives) until the
+// producer command lands. The shape is intentionally minimal: a richer
+// `value_preview` policy (truncation, sensitive-detection) is owned by
+// `get_secret_preview` and is not duplicated here.
 #[allow(dead_code)]
 #[derive(Debug, Serialize)]
 pub struct SecretMetadata {

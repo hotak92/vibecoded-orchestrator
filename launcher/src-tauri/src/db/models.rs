@@ -10,6 +10,18 @@ use serde::{Deserialize, Serialize};
 pub enum ProjectHost {
     Base,
     Mao,
+    /// The orchestrator clone itself, auto-registered as a project row at
+    /// launcher startup so it can participate in FK-strict subsystems
+    /// (codegraph access grants, KG bindings, per-project MCP, etc.).
+    /// Backed by SQL migration 013 (extends the `projects.host` CHECK).
+    ///
+    /// Wire format MUST be the exact string `"orchestrator_root"` — the
+    /// `rename_all = "lowercase"` rule alone would map this variant to
+    /// `"orchestratorroot"` (no separator), which the DB CHECK would
+    /// reject. The explicit `rename` here keeps the JSON/serde round-
+    /// trip aligned with the DB column value the migration accepts.
+    #[serde(rename = "orchestrator_root")]
+    OrchestratorRoot,
 }
 
 impl ProjectHost {
@@ -17,12 +29,14 @@ impl ProjectHost {
         match self {
             ProjectHost::Base => "base",
             ProjectHost::Mao => "mao",
+            ProjectHost::OrchestratorRoot => "orchestrator_root",
         }
     }
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "base" => Some(ProjectHost::Base),
             "mao" => Some(ProjectHost::Mao),
+            "orchestrator_root" => Some(ProjectHost::OrchestratorRoot),
             _ => None,
         }
     }
