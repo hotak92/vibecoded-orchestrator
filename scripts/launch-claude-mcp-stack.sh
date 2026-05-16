@@ -41,7 +41,12 @@ set -u
 #                                 (default: ${HOME}/Desktop/PROGETTI/Claude/claude_mcp_servers)
 #   - VCT_STACK_LOG_FILE      — log path (default: /tmp/claude-mcp-containers.log)
 #   - VCT_STACK_CDI_TIMEOUT   — seconds to wait for CDI yaml (default: 30)
-#   - VCT_STACK_RUNTIME_FILE  — runtime.txt path (default: ${VCT_STACK_WORKING_DIR}/state/install/runtime.txt)
+#   - VCT_STACK_RUNTIME_FILE  — explicit runtime.txt path. When set, this
+#                                 wins over all candidate-path search (PR-12
+#                                 Bug B). When unset, candidates probed in
+#                                 order — see resolve_runtime_file().
+#   - VCT_ORCHESTRATOR_ROOT   — orchestrator install root (used as one of
+#                                 the runtime.txt candidate-path roots).
 #   - VCT_STACK_GPU_OVERLAY   — overlay filename for podman path
 #                                 (default: infrastructure/podman-compose.gpu.yml)
 #   - VCT_STACK_GPU_OVERLAY_DOCKER — overlay for docker path
@@ -51,10 +56,19 @@ set -u
 VCT_STACK_WORKING_DIR="${VCT_STACK_WORKING_DIR:-${HOME}/Desktop/PROGETTI/Claude/claude_mcp_servers}"
 VCT_STACK_LOG_FILE="${VCT_STACK_LOG_FILE:-/tmp/claude-mcp-containers.log}"
 VCT_STACK_CDI_TIMEOUT="${VCT_STACK_CDI_TIMEOUT:-30}"
-VCT_STACK_RUNTIME_FILE="${VCT_STACK_RUNTIME_FILE:-${VCT_STACK_WORKING_DIR}/state/install/runtime.txt}"
+# NOTE (PR-12 Bug B): VCT_STACK_RUNTIME_FILE is no longer eagerly defaulted
+# to ${VCT_STACK_WORKING_DIR}/state/install/runtime.txt — that single path
+# was too narrow when systemd's WorkingDirectory pointed at a stale install
+# location (Bug C). resolve_runtime_file() now probes multiple candidates
+# and picks the first one that contains a USABLE runtime token.
 VCT_STACK_GPU_OVERLAY="${VCT_STACK_GPU_OVERLAY:-infrastructure/podman-compose.gpu.yml}"
 VCT_STACK_GPU_OVERLAY_DOCKER="${VCT_STACK_GPU_OVERLAY_DOCKER:-infrastructure/docker-compose.gpu.yml}"
 VCT_STACK_COMPOSE_FILE="${VCT_STACK_COMPOSE_FILE:-compose.yaml}"
+
+# Resolve the directory that contains THIS script — used as one fallback
+# root for runtime.txt resolution. Works whether the script is sourced or
+# executed directly.
+_VCT_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || _VCT_SCRIPT_DIR=""
 
 # ---------------------------------------------------------------------------
 # log :: append a timestamped line to the log file. Best-effort; never errors.
@@ -67,57 +81,174 @@ log() {
 }
 
 # ---------------------------------------------------------------------------
+# resolve_runtime_file :: prints the path to the FIRST runtime.txt candidate
+# that exists on disk and contains a usable runtime token. Empty string if
+# none usable (PR-12 Bug B).
+#
+# Probe order (first hit wins):
+#   1. ${VCT_STACK_RUNTIME_FILE} if explicitly set (caller override).
+#   2. ${VCT_STACK_WORKING_DIR}/state/install/runtime.txt
+#   3. ${VCT_ORCHESTRATOR_ROOT}/state/install/runtime.txt
+#   4. <script_dir>/../state/install/runtime.txt   (script lives in
+#      <orchestrator>/scripts/, so .. is the orchestrator root).
+#
+# A candidate is "usable" iff:
+#   - the file exists + is readable + non-empty, AND
+#   - the token it contains corresponds to a runtime whose daemon access
+#     check passes (_runtime_usable).
+#
+# We log every candidate that exists-but-is-not-usable so a stale unit
+# WorkingDirectory pointing at a dead install doesn't fail silently.
+# ---------------------------------------------------------------------------
+resolve_runtime_file() {
+    local candidates=()
+    if [ -n "${VCT_STACK_RUNTIME_FILE:-}" ]; then
+        candidates+=("$VCT_STACK_RUNTIME_FILE")
+    fi
+    if [ -n "${VCT_STACK_WORKING_DIR:-}" ]; then
+        candidates+=("${VCT_STACK_WORKING_DIR}/state/install/runtime.txt")
+    fi
+    if [ -n "${VCT_ORCHESTRATOR_ROOT:-}" ]; then
+        candidates+=("${VCT_ORCHESTRATOR_ROOT}/state/install/runtime.txt")
+    fi
+    if [ -n "${_VCT_SCRIPT_DIR:-}" ]; then
+        candidates+=("${_VCT_SCRIPT_DIR}/../state/install/runtime.txt")
+    fi
+
+    local seen_path=""
+    local cand
+    for cand in "${candidates[@]}"; do
+        # De-dup adjacent identical candidates (common when env vars
+        # collapse to the same path on default installs).
+        [ "$cand" = "$seen_path" ] && continue
+        seen_path="$cand"
+        [ -r "$cand" ] || continue
+        local token
+        token="$(head -n 1 "$cand" 2>/dev/null | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+        [ -z "$token" ] && continue
+        if _runtime_usable "$token"; then
+            printf '%s\n' "$cand"
+            return 0
+        else
+            log "runtime.txt at $cand names '$token' but its daemon is not reachable — falling through to live probe"
+        fi
+    done
+    printf ''
+}
+
+# ---------------------------------------------------------------------------
+# _runtime_usable :: given a runtime token (lowercase: "docker" or "podman"),
+# return 0 iff the runtime is actually usable on this host (binary exists
+# AND its daemon / rootless setup is reachable). PR-12 Bug A.
+#
+# This guards the real-world failure mode where Docker Desktop is installed
+# (binary on PATH) but the user is not in the `docker` group → the systemd
+# unit picks runtime=docker, then fails at boot with
+# "permission denied while trying to connect to the Docker daemon socket".
+#
+# Detection rules:
+#   docker → `docker info` exit 0 AND output contains a "Server:" section.
+#            The Client section appears even without daemon access; the
+#            Server section requires a reachable daemon.
+#   podman → `podman info` exit 0 (rootless setup includes its own probes;
+#            podman info exits non-zero if the user namespace / storage
+#            backend isn't initialized).
+#   anything else → not usable.
+#
+# Both probes carry a 5s timeout — a hung daemon socket must NOT block
+# boot indefinitely.
+# ---------------------------------------------------------------------------
+_runtime_usable() {
+    local token="$1"
+    case "$token" in
+        docker)
+            command -v docker >/dev/null 2>&1 || return 1
+            local info_out
+            if ! info_out="$(timeout 5 docker info 2>&1)"; then
+                return 1
+            fi
+            # Server: section presence is the daemon-access proxy.
+            printf '%s\n' "$info_out" | grep -qE '^(Server:|Server Version:)' || return 1
+            return 0
+            ;;
+        podman)
+            command -v podman >/dev/null 2>&1 || return 1
+            timeout 5 podman info >/dev/null 2>&1 || return 1
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
 # detect_runtime :: prints one of "docker", "podman-compose", "podman compose", or ""
 #
-# Order:
-#   1. $VCT_STACK_RUNTIME_FILE (state/install/runtime.txt) if present + non-empty.
-#      Normalised: "docker" → "docker"; "podman" → "podman-compose" if
-#      `podman-compose` exists else "podman compose".
-#   2. `which docker`        → "docker"
-#   3. `which podman-compose` → "podman-compose"
-#   4. `command -v podman` AND `podman compose --help` works → "podman compose"
-#   5. empty (no runtime found)
+# Order (PR-12 Bug A — every candidate validated via _runtime_usable):
+#   1. resolve_runtime_file → token from runtime.txt → expand to compose
+#      invocation IFF the runtime is usable. Otherwise log + fall through.
+#   2. Probe podman first (preferred default — it's the VCO-recommended
+#      runtime, has no group-permission gotcha).
+#   3. Probe docker.
+#   4. Empty (no usable runtime).
 #
-# Pure helper — no side effects beyond stdout.
+# A "usable" docker means `docker info` reaches the daemon (Server section
+# present); a "usable" podman means `podman info` succeeds. This prevents
+# the boot-time "permission denied" failure when Docker Desktop is present
+# but the user is not in the `docker` group.
 # ---------------------------------------------------------------------------
 detect_runtime() {
-    # 1. runtime.txt
-    if [ -r "$VCT_STACK_RUNTIME_FILE" ]; then
+    # 1. runtime.txt — only honored if its named runtime is actually usable.
+    local runtime_file
+    runtime_file="$(resolve_runtime_file)"
+    if [ -n "$runtime_file" ]; then
         local persisted
-        persisted="$(head -n 1 "$VCT_STACK_RUNTIME_FILE" 2>/dev/null | tr -d '[:space:]')"
+        persisted="$(head -n 1 "$runtime_file" 2>/dev/null | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
         case "$persisted" in
             docker)
-                if command -v docker >/dev/null 2>&1; then
-                    printf 'docker\n'
-                    return 0
-                fi
+                # _runtime_usable already validated docker daemon access in
+                # resolve_runtime_file; we trust that result here.
+                printf 'docker\n'
+                return 0
                 ;;
             podman)
                 if command -v podman-compose >/dev/null 2>&1; then
                     printf 'podman-compose\n'
                     return 0
                 fi
-                if command -v podman >/dev/null 2>&1 && podman compose --help >/dev/null 2>&1; then
+                if podman compose --help >/dev/null 2>&1; then
                     printf 'podman compose\n'
                     return 0
                 fi
+                # podman is usable but no compose front-end available —
+                # fall through to live probe (which will also fail, but at
+                # least surfaces the right diagnostic).
                 ;;
         esac
     fi
 
-    # 2-4. Probe in preference order.
-    if command -v docker >/dev/null 2>&1; then
+    # 2. Probe podman first — preferred default, no group-perm gotcha.
+    if _runtime_usable podman; then
+        if command -v podman-compose >/dev/null 2>&1; then
+            printf 'podman-compose\n'
+            return 0
+        fi
+        if podman compose --help >/dev/null 2>&1; then
+            printf 'podman compose\n'
+            return 0
+        fi
+        # podman daemon usable but no compose front-end — log and try docker.
+        log "podman daemon is reachable but neither 'podman-compose' nor 'podman compose' is available — falling through to docker"
+    fi
+
+    # 3. Probe docker (only if its daemon is actually reachable).
+    if _runtime_usable docker; then
         printf 'docker\n'
         return 0
     fi
-    if command -v podman-compose >/dev/null 2>&1; then
-        printf 'podman-compose\n'
-        return 0
-    fi
-    if command -v podman >/dev/null 2>&1 && podman compose --help >/dev/null 2>&1; then
-        printf 'podman compose\n'
-        return 0
-    fi
+
+    # 4. No usable runtime.
     printf ''
 }
 
