@@ -233,9 +233,15 @@ class KgCollectionsToSearchTests(unittest.TestCase):
         )
 
     def test_peer_matching_shared_is_filtered(self) -> None:
-        """Same defensive guard, applied to the shared collection."""
+        """Same defensive guard, applied to the shared collection.
+
+        PR-34 (v0.2.12) renamed the canonical shared KG from
+        VibeCodedTools_KnowledgeGraph to VibecodedOrchestrator_KnowledgeGraph,
+        so the peer that matches "shared" is now "VibecodedOrchestrator"
+        (not the legacy "VibeCodedTools").
+        """
         helper = _fresh_helper(
-            {"VCT_KG_ACCESS_LIST": "VibeCodedTools,Beta"}
+            {"VCT_KG_ACCESS_LIST": "VibecodedOrchestrator,Beta"}
         )
         self.assertEqual(
             helper.kg_collections_to_search(

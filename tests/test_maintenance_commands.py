@@ -38,9 +38,15 @@ COMPONENTS_DIR = REPO_ROOT / "launcher" / "src" / "lib" / "components"
 MCP_PAGE = REPO_ROOT / "launcher" / "src" / "routes" / "mcp" / "+page.svelte"
 SERVICES_PAGE = REPO_ROOT / "launcher" / "src" / "routes" / "services" / "+page.svelte"
 
-# Canonical list of the 7 Tauri commands PR-37 adds. If you add a new
-# maintenance command, update BOTH this list AND lib.rs's
+# Canonical list of Tauri commands the maintenance module exposes. If
+# you add a new maintenance command, update BOTH this list AND lib.rs's
 # generate_handler! block.
+#
+# Historical:
+#   - PR-37 (v0.2.12): first 7 commands (status/migrate/rewrite trio).
+#   - PR-42 (v0.2.12): +reload_mcps_sighup — SIGHUP-driven MCP env
+#     reload, invoked by both the McpMaintenanceSection "Reload MCPs"
+#     button AND the launcher's .claude/settings.json file watcher.
 EXPECTED_COMMANDS = [
     "mcp_registration_status",
     "rerun_mcp_registration",
@@ -49,6 +55,7 @@ EXPECTED_COMMANDS = [
     "run_schema_migrations",
     "stale_mcp_entries",
     "rewrite_stale_mcp_entries",
+    "reload_mcps_sighup",
 ]
 
 

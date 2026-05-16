@@ -129,13 +129,19 @@ class KgAccessListTests(unittest.TestCase):
         """If a peer name happens to match self / shared, the helper
         does not double-list it. Defensive: should not happen in
         practice (the launcher's resolver excludes those) but the
-        helper must be robust to malformed input."""
+        helper must be robust to malformed input.
+
+        PR-34 (v0.2.12) renamed the canonical shared KG from
+        VibeCodedTools_KnowledgeGraph to VibecodedOrchestrator_KnowledgeGraph,
+        so the peer that matches "shared" is now "VibecodedOrchestrator"
+        (not the legacy "VibeCodedTools").
+        """
         srv = _fresh_server({
             "KG_COLLECTION": "Alpha_KnowledgeGraph",
             "SHARED_KG_COLLECTION": "VibecodedOrchestrator_KnowledgeGraph",
-            # `Alpha` matches self, `VibeCodedTools` matches shared
+            # `Alpha` matches self, `VibecodedOrchestrator` matches shared
             # (the sanitization is idempotent).
-            "VCT_KG_ACCESS_LIST": "Alpha,VibeCodedTools,Beta",
+            "VCT_KG_ACCESS_LIST": "Alpha,VibecodedOrchestrator,Beta",
         })
         result = srv._kg_collections_to_search(include_dev=False)
         # Only Beta is added beyond self + shared.
