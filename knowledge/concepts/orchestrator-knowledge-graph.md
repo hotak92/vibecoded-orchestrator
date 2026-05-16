@@ -94,7 +94,7 @@ The `--all` flag on `kg-sync` processes every file in `knowledge/` — used for 
 
 ## Weaviate Collection Schema
 
-Default collection name: `<ProjectBasename>_KnowledgeGraph` (e.g. `Myapp_KnowledgeGraph`). The orchestrator's own collection is `VibeCodedTools_KnowledgeGraph`.
+Default collection name: `<ProjectBasename>_KnowledgeGraph` (e.g. `Myapp_KnowledgeGraph`). The orchestrator's own shared collection is `VibecodedOrchestrator_KnowledgeGraph` (renamed from `VibeCodedTools_KnowledgeGraph` in v0.2.12 / PR-26 Group E).
 
 | Property | Type | Notes |
 |---|---|---|

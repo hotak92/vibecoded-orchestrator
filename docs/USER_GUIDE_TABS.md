@@ -467,7 +467,7 @@ DB; the binding row is the launcher's record of what those should be.
 
 - Auto-populated by `populate_kg_bindings()`:
   - `primary` row → `collection_name = sanitize_kg_collection(project_name) + "_KnowledgeGraph"`. For a project named `Acme` that's `Acme_KnowledgeGraph`. The sanitizer strips non-alphanumerics and TitleCases (`my project name` → `MyProjectName`).
-  - `shared` row → `collection_name = "VibeCodedTools_KnowledgeGraph"` (cross-project shared KG used by all projects).
+  - `shared` row → `collection_name = "VibecodedOrchestrator_KnowledgeGraph"` (cross-project shared KG used by all projects; renamed from `VibeCodedTools_KnowledgeGraph` in v0.2.12 — see the Identity tab "Manage shared KG collection" picker for migration).
   - Both default to `weaviate_url = http://localhost:8081`,
     `embedding_model = qwen3-embedding:0.6b`, `embedding_dim = 1024`.
 - Idempotence: populate **only inserts a binding if no row exists for that role**. User edits to the row survive re-onboarding (in contrast to agents/skills/hooks where `model/file_path/source` get overwritten).
@@ -476,7 +476,8 @@ DB; the binding row is the launcher's record of what those should be.
 
 - **`primary`** = the project's own KG. Notes you write while working
   on this project go here.
-- **`shared`** = `VibeCodedTools_KnowledgeGraph`. Cross-project
+- **`shared`** = `VibecodedOrchestrator_KnowledgeGraph` (renamed from
+  `VibeCodedTools_KnowledgeGraph` in v0.2.12). Cross-project
   patterns, team-wide concepts, anything you want every project's
   `hybrid_search` to find.
 - **`archive`** = reserved (no auto-population). Use it manually if

@@ -86,7 +86,7 @@ The MCP server (`claude_mcp_servers/weaviate_mcp/server.py`) reads these on star
 |---|---|---|
 | `KG_COLLECTION` | `<ProjectName>` | Per-project Weaviate collection. Knowledge nodes from `knowledge/` land here. |
 | `DEVELOPMENT_COLLECTION` | `<ProjectName>_development` | Per-project Weaviate collection for `docs/`. Auto-paired with KG by the launcher. Same chunker + named-vector slot logic as KG. |
-| `SHARED_KG_COLLECTION` | `VibeCodedTools_KnowledgeGraph` | Cross-project shared KG. All projects on this machine query it alongside their own KG. Seeded by `install.py` Step 7d from `vibecoded-orchestrator/knowledge/`. |
+| `SHARED_KG_COLLECTION` | `VibecodedOrchestrator_KnowledgeGraph` (renamed from `VibeCodedTools_KnowledgeGraph` in v0.2.12) | Cross-project shared KG. All projects on this machine query it alongside their own KG. Seeded by `install.py` Step 7d from `vibecoded-orchestrator/knowledge/`. Users with data under the old name can designate it as canonical via the launcher's Identity tab "Manage shared KG collection" picker — see PR-26 Group E. |
 | `SHARED_KG_WRITE_DISABLED` | `false` | Per-project WRITE gate (asymmetric model since 2026-05-01). Set to `true` (or `1`/`yes`) to refuse `store_knowledge_node(scope="shared")` calls from this project. **Reads are unconditional** — every project always queries the shared KG when configured. |
 | `SHARED_KG_OPT_OUT` | `false` | Legacy alias of `SHARED_KG_WRITE_DISABLED`. Kept for back-compat ~3 releases (target removal: 2026-08). The canonical key wins when both are set. NOTE: pre-2026-05-01 this also gated reads — that behaviour is gone. |
 | `SHARED_KG_NODE_FORMATS` | (unset) | Override path for the shared KG's `.node_formats.json` sidecar. Used by tests; in production the sidecar is read from `<orchestrator>/knowledge/.node_formats.json` via `_SERVER_INFERRED_BASE`. |
@@ -157,15 +157,15 @@ For historical reference on the memory-aware gating that `read_image` implemente
 
 ## Sharing knowledge across projects
 
-By default, every project queries both its per-project KG and a shared cross-project collection (`VibeCodedTools_KnowledgeGraph`). Knowledge nodes captured in one project are visible to all others without re-explaining context.
+By default, every project queries both its per-project KG and a shared cross-project collection (`VibecodedOrchestrator_KnowledgeGraph` since v0.2.12 — renamed from `VibeCodedTools_KnowledgeGraph`). Knowledge nodes captured in one project are visible to all others without re-explaining context.
 
 Three control points:
 
-- **`SHARED_KG_COLLECTION`** — name of the shared collection. Default `VibeCodedTools_KnowledgeGraph`. Override to point at a private team-shared collection (`AcmeTeam_SharedKG`) without exposing it via the public bundled name.
+- **`SHARED_KG_COLLECTION`** — name of the shared collection. Default `VibecodedOrchestrator_KnowledgeGraph`. Override to point at a private team-shared collection (`AcmeTeam_SharedKG`) without exposing it via the public bundled name. The launcher's Identity tab ships a "Manage shared KG collection" picker (PR-26 Group E, v0.2.12) that surfaces every orchestrator-shaped class on your Weaviate and lets you pick which one is canonical — useful when migrating from a pre-v0.2.12 install with data still under `VibeCodedTools_KnowledgeGraph`.
 - **`SHARED_KG_WRITE_DISABLED=true`** — per-project WRITE gate. Refuses `store_knowledge_node(scope="shared")` from this project with a clear error. Reads of the shared collection remain unconditional — knowledge accumulation across projects is the headline value prop. Legacy alias: `SHARED_KG_OPT_OUT` (kept for ~3 releases, target removal 2026-08).
 - **`store_knowledge_node(scope="shared")`** — explicit write to the shared collection. The default scope is `"project"` so arbitrary projects don't pollute the shared collection by accident.
 
-Install does NOT auto-adopt a foreign shared KG it finds on the host (e.g. an existing `ClaudeKnowledgeGraph` from an earlier install). Reason: the orphan-prune pass in `sync_knowledge_graph.py` deletes entries whose `file_path` no longer exists in the active project; two installs sharing one collection would silently delete each other's nodes. VibeCoded Orchestrator (VCO) always creates `VibeCodedTools_KnowledgeGraph` fresh (or skips creation if the exact name already exists).
+Install does NOT auto-adopt a foreign shared KG it finds on the host (e.g. an existing `ClaudeKnowledgeGraph` from an earlier install). Reason: the orphan-prune pass in `sync_knowledge_graph.py` deletes entries whose `file_path` no longer exists in the active project; two installs sharing one collection would silently delete each other's nodes. VibeCoded Orchestrator (VCO) always creates `VibecodedOrchestrator_KnowledgeGraph` fresh (or skips creation if the exact name already exists).
 
 ## KG-summary backend selection
 
