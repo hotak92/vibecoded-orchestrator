@@ -105,13 +105,18 @@ $line = $entry | ConvertTo-Json -Compress -Depth 8
 try { Add-Content -Path $ToucanLog -Value $line -ErrorAction Stop } catch { }
 
 # === 1. SSRF GUARD ===
-if ($ToolName -eq "WebFetch" -or $ToolName -eq "mcp__search__fetch_page") {
+if ($ToolName -eq "WebFetch") {
     $url = Get-Field "url"
     if ($url) {
-        $whitelisted = $url -match '(localhost:(8081|8082|11435|7860|8888)|127\.0\.0\.1:(8081|8082|11435|7860|8888))'
+        # Whitelisted local services (Weaviate, Ollama, code-embed, Gradio).
+        # SearXNG (:8888) and the mcp__search__fetch_page tool both
+        # removed in v0.2.11 (see PR-14a). Search MCP now exposes only
+        # `search_papers` which uses OpenAlex+arXiv HTTP directly — its
+        # outbound HTTP doesn't go through this WebFetch SSRF guard.
+        $whitelisted = $url -match '(localhost:(8081|8082|11435|11440|7860)|127\.0\.0\.1:(8081|8082|11435|11440|7860))'
         if (-not $whitelisted -and $url -match '(localhost|127\.|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2[0-9]|3[01])\.\d+\.|192\.168\.\d+\.|169\.254\.\d+\.|0\.0\.0\.0|::1)') {
             Write-Output "SSRF guard: '$url' targets a private/internal network address."
-            Write-Output "   Whitelisted localhost services: Weaviate (:8081), Ollama (:11435), SearXNG (:8888), Gradio (:7860)"
+            Write-Output "   Whitelisted localhost services: Weaviate (:8081), Ollama (:11435), code-embed (:11440), Gradio (:7860)"
             Write-Output "   To allow additional services, add to whitelist in .claude/hooks/pre-tool-use.ps1"
             $urlEsc = $url -replace '\\', '\\\\' -replace '"', '\"'
             Write-SecurityLine "{""timestamp"":""$ts"",""event"":""ssrf_blocked"",""url"":""$urlEsc""}"
