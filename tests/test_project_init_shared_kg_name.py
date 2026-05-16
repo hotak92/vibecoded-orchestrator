@@ -17,14 +17,11 @@ Why the name is `VibecodedOrchestrator_KnowledgeGraph` (lowercase-d
   - Matches the migration script behaviour
     (`scripts/migrate-shared-kg-schema.{sh,ps1}`).
 
-Out-of-scope drift (tracked in the PR-26 commit body):
+Resolved drift (v0.2.12 PR-34 / Group M, follow-up to PR-26 / Group E):
   - `launcher/src-tauri/src/commands/project_env_settings.rs::DEFAULT_SHARED_KG_COLLECTION`
-    still carries the old name. The launcher's Priority-1 app_state
-    override (set by the new picker) takes precedence at runtime, so
-    fresh installs that pick a canonical via the GUI override the
-    default. Updating the Rust constant is intentionally out-of-scope
-    for Group E (Rust default + every test that asserts it is in the
-    cross-PR coordination plan).
+    now also carries the canonical post-rename name. The cross-language
+    invariant `tests/test_shared_kg_constant_consistency.py` pins the
+    Python + Rust constants in lockstep so any future drift fails CI.
 """
 
 from __future__ import annotations

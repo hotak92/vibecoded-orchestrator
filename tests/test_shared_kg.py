@@ -7,7 +7,7 @@ Covers the Python side of the shared-KG feature:
       (no per-project read opt-out — asymmetric model since 2026-05-01).
     - SHARED_KG_WRITE_DISABLED gates writes only.
     - SHARED_KG_OPT_OUT (legacy) is honoured as a write-only fallback.
-    - The default SHARED_KG_COLLECTION resolves to "VibeCodedTools_KnowledgeGraph".
+    - The default SHARED_KG_COLLECTION resolves to "VibecodedOrchestrator_KnowledgeGraph".
     - _load_node_formats_for_collection picks the right sidecar per collection.
     - _format_result_by_tier uses the result's source_collection / collection
       to resolve sidecar fields.
@@ -79,9 +79,9 @@ class SharedKgEnvTests(unittest.TestCase):
 
     def test_default_shared_kg_is_vibecoded(self):
         """Without explicit env, the shared collection defaults to the
-        canonical VibeCodedTools_KnowledgeGraph and writes are allowed."""
+        canonical VibecodedOrchestrator_KnowledgeGraph and writes are allowed."""
         srv = _fresh_server(env_overrides={})
-        self.assertEqual(srv.SHARED_KG_COLLECTION, "VibeCodedTools_KnowledgeGraph")
+        self.assertEqual(srv.SHARED_KG_COLLECTION, "VibecodedOrchestrator_KnowledgeGraph")
         self.assertFalse(srv.SHARED_KG_WRITE_DISABLED)
         # Back-compat alias — points at the resolved write-disabled value.
         self.assertFalse(srv.SHARED_KG_OPT_OUT)
@@ -91,11 +91,11 @@ class SharedKgEnvTests(unittest.TestCase):
         stays populated for read paths. This is the headline asymmetry of
         the 2026-05-01 refactor."""
         srv = _fresh_server({
-            "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
+            "SHARED_KG_COLLECTION": "VibecodedOrchestrator_KnowledgeGraph",
             "SHARED_KG_WRITE_DISABLED": "true",
         })
         # Read surface untouched.
-        self.assertEqual(srv.SHARED_KG_COLLECTION, "VibeCodedTools_KnowledgeGraph")
+        self.assertEqual(srv.SHARED_KG_COLLECTION, "VibecodedOrchestrator_KnowledgeGraph")
         # Write gate is on.
         self.assertTrue(srv.SHARED_KG_WRITE_DISABLED)
 
@@ -105,10 +105,10 @@ class SharedKgEnvTests(unittest.TestCase):
         contract on purpose: keeping legacy alias semantically symmetric
         with the new key prevents two different "true" meanings."""
         srv = _fresh_server({
-            "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
+            "SHARED_KG_COLLECTION": "VibecodedOrchestrator_KnowledgeGraph",
             "SHARED_KG_OPT_OUT": "true",
         })
-        self.assertEqual(srv.SHARED_KG_COLLECTION, "VibeCodedTools_KnowledgeGraph")
+        self.assertEqual(srv.SHARED_KG_COLLECTION, "VibecodedOrchestrator_KnowledgeGraph")
         self.assertTrue(srv.SHARED_KG_WRITE_DISABLED)
         self.assertTrue(srv.SHARED_KG_OPT_OUT)
 
@@ -117,13 +117,13 @@ class SharedKgEnvTests(unittest.TestCase):
         users explicitly RE-ENABLE writes on a project whose .env still
         carries the legacy SHARED_KG_OPT_OUT=true."""
         srv = _fresh_server({
-            "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
+            "SHARED_KG_COLLECTION": "VibecodedOrchestrator_KnowledgeGraph",
             "SHARED_KG_WRITE_DISABLED": "false",
             "SHARED_KG_OPT_OUT": "true",
         })
         self.assertFalse(srv.SHARED_KG_WRITE_DISABLED,
                          "canonical key 'false' must win over legacy 'true'")
-        self.assertEqual(srv.SHARED_KG_COLLECTION, "VibeCodedTools_KnowledgeGraph")
+        self.assertEqual(srv.SHARED_KG_COLLECTION, "VibecodedOrchestrator_KnowledgeGraph")
 
     def test_write_disabled_accepts_truthy_spellings(self):
         """SHARED_KG_WRITE_DISABLED honours common truthy spellings."""
@@ -143,25 +143,25 @@ class SharedKgEnvTests(unittest.TestCase):
         for val in ("false", "FALSE", "0", "no", ""):
             _clear_shared_env()
             srv = _fresh_server({
-                "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
+                "SHARED_KG_COLLECTION": "VibecodedOrchestrator_KnowledgeGraph",
                 "SHARED_KG_WRITE_DISABLED": val,
             })
             self.assertFalse(srv.SHARED_KG_WRITE_DISABLED,
                              f"write-disabled should be false for {val!r}")
-            self.assertEqual(srv.SHARED_KG_COLLECTION, "VibeCodedTools_KnowledgeGraph")
+            self.assertEqual(srv.SHARED_KG_COLLECTION, "VibecodedOrchestrator_KnowledgeGraph")
 
     def test_legacy_alias_truthy_disables_writes(self):
         """When only SHARED_KG_OPT_OUT is set, it gates writes."""
         for val in ("true", "True", "1", "yes"):
             _clear_shared_env()
             srv = _fresh_server({
-                "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
+                "SHARED_KG_COLLECTION": "VibecodedOrchestrator_KnowledgeGraph",
                 "SHARED_KG_OPT_OUT": val,
             })
             self.assertTrue(srv.SHARED_KG_WRITE_DISABLED,
                             f"legacy alias should disable writes for {val!r}")
             # Read still open.
-            self.assertEqual(srv.SHARED_KG_COLLECTION, "VibeCodedTools_KnowledgeGraph")
+            self.assertEqual(srv.SHARED_KG_COLLECTION, "VibecodedOrchestrator_KnowledgeGraph")
 
     def test_explicit_shared_kg_override(self):
         """A user can point SHARED_KG_COLLECTION at a custom name (e.g. for
@@ -210,13 +210,13 @@ class SidecarPerCollectionTests(unittest.TestCase):
         prefix."""
         srv = _fresh_server({
             "KG_COLLECTION": "ProjectKG",
-            "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
+            "SHARED_KG_COLLECTION": "VibecodedOrchestrator_KnowledgeGraph",
             "KG_BASE_DIR": str(self.tmpdir / "project"),
             "SHARED_KG_NODE_FORMATS": str(self.shared_sidecar),
         })
 
         proj = srv._load_node_formats_for_collection("ProjectKG")
-        shared = srv._load_node_formats_for_collection("VibeCodedTools_KnowledgeGraph")
+        shared = srv._load_node_formats_for_collection("VibecodedOrchestrator_KnowledgeGraph")
 
         self.assertIn("knowledge/concepts/foo.md", proj)
         self.assertEqual(
@@ -234,7 +234,7 @@ class SidecarPerCollectionTests(unittest.TestCase):
         rather than blowing up."""
         srv = _fresh_server({
             "KG_COLLECTION": "ProjectKG",
-            "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
+            "SHARED_KG_COLLECTION": "VibecodedOrchestrator_KnowledgeGraph",
         })
         self.assertEqual(
             srv._load_node_formats_for_collection("RandomDevCollection"), {}
@@ -246,7 +246,7 @@ class SidecarPerCollectionTests(unittest.TestCase):
         users."""
         srv = _fresh_server({
             "KG_COLLECTION": "ProjectKG",
-            "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
+            "SHARED_KG_COLLECTION": "VibecodedOrchestrator_KnowledgeGraph",
             "KG_BASE_DIR": str(self.tmpdir / "project"),
             "SHARED_KG_NODE_FORMATS": str(self.shared_sidecar),
         })
@@ -259,7 +259,7 @@ class SidecarPerCollectionTests(unittest.TestCase):
             "tags": [],
             "score": 0.5,  # → summary tier
             "content": "(content body)",
-            "collection": "VibeCodedTools_KnowledgeGraph",
+            "collection": "VibecodedOrchestrator_KnowledgeGraph",
         }
         out = srv._format_result_by_tier(shared_result, "summary")
         self.assertIsNotNone(out)
@@ -292,7 +292,7 @@ class StoreKnowledgeNodeScopeTests(unittest.TestCase):
     def test_scope_shared_targets_shared_collection_when_set(self):
         srv = _fresh_server({
             "KG_COLLECTION": "ProjectKG",
-            "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
+            "SHARED_KG_COLLECTION": "VibecodedOrchestrator_KnowledgeGraph",
             "SHARED_KG_WRITE_DISABLED": "false",
         })
 
@@ -304,7 +304,7 @@ class StoreKnowledgeNodeScopeTests(unittest.TestCase):
         if scope == "shared" and srv.SHARED_KG_COLLECTION and srv.SHARED_KG_COLLECTION != srv.KG_COLLECTION:
             target = srv.SHARED_KG_COLLECTION
 
-        self.assertEqual(target, "VibeCodedTools_KnowledgeGraph")
+        self.assertEqual(target, "VibecodedOrchestrator_KnowledgeGraph")
 
     def test_write_gate_blocks_shared_writes_with_canonical_key(self):
         """SHARED_KG_WRITE_DISABLED=true must make _resolve_shared_kg_write_disabled
@@ -313,11 +313,11 @@ class StoreKnowledgeNodeScopeTests(unittest.TestCase):
         reroute."""
         srv = _fresh_server({
             "KG_COLLECTION": "ProjectKG",
-            "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
+            "SHARED_KG_COLLECTION": "VibecodedOrchestrator_KnowledgeGraph",
             "SHARED_KG_WRITE_DISABLED": "true",
         })
         # The collection still resolves (read path) — but the write gate is on.
-        self.assertEqual(srv.SHARED_KG_COLLECTION, "VibeCodedTools_KnowledgeGraph")
+        self.assertEqual(srv.SHARED_KG_COLLECTION, "VibecodedOrchestrator_KnowledgeGraph")
         self.assertTrue(srv._resolve_shared_kg_write_disabled())
 
     def test_write_gate_uses_legacy_alias_as_fallback(self):
@@ -326,10 +326,10 @@ class StoreKnowledgeNodeScopeTests(unittest.TestCase):
         env files honouring the write gate after the rename."""
         srv = _fresh_server({
             "KG_COLLECTION": "ProjectKG",
-            "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
+            "SHARED_KG_COLLECTION": "VibecodedOrchestrator_KnowledgeGraph",
             "SHARED_KG_OPT_OUT": "true",
         })
-        self.assertEqual(srv.SHARED_KG_COLLECTION, "VibeCodedTools_KnowledgeGraph")
+        self.assertEqual(srv.SHARED_KG_COLLECTION, "VibecodedOrchestrator_KnowledgeGraph")
         self.assertTrue(srv._resolve_shared_kg_write_disabled())
 
     def test_write_gate_canonical_overrides_legacy(self):
@@ -338,7 +338,7 @@ class StoreKnowledgeNodeScopeTests(unittest.TestCase):
         from a stale .env that survived the rename)."""
         srv = _fresh_server({
             "KG_COLLECTION": "ProjectKG",
-            "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
+            "SHARED_KG_COLLECTION": "VibecodedOrchestrator_KnowledgeGraph",
             "SHARED_KG_WRITE_DISABLED": "false",
             "SHARED_KG_OPT_OUT": "true",
         })
@@ -347,7 +347,7 @@ class StoreKnowledgeNodeScopeTests(unittest.TestCase):
     def test_scope_project_always_targets_kg_collection(self):
         srv = _fresh_server({
             "KG_COLLECTION": "ProjectKG",
-            "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
+            "SHARED_KG_COLLECTION": "VibecodedOrchestrator_KnowledgeGraph",
             "SHARED_KG_WRITE_DISABLED": "false",
         })
 
@@ -380,9 +380,9 @@ class ReadPathAlwaysIncludesSharedTests(unittest.TestCase):
     def test_shared_in_search_with_default_env(self):
         srv = _fresh_server({
             "KG_COLLECTION": "ProjectKG",
-            "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
+            "SHARED_KG_COLLECTION": "VibecodedOrchestrator_KnowledgeGraph",
         })
-        self.assertIn("VibeCodedTools_KnowledgeGraph",
+        self.assertIn("VibecodedOrchestrator_KnowledgeGraph",
                       self._collections_to_search(srv))
 
     def test_shared_in_search_when_writes_disabled(self):
@@ -390,10 +390,10 @@ class ReadPathAlwaysIncludesSharedTests(unittest.TestCase):
         STILL read the shared KG."""
         srv = _fresh_server({
             "KG_COLLECTION": "ProjectKG",
-            "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
+            "SHARED_KG_COLLECTION": "VibecodedOrchestrator_KnowledgeGraph",
             "SHARED_KG_WRITE_DISABLED": "true",
         })
-        self.assertIn("VibeCodedTools_KnowledgeGraph",
+        self.assertIn("VibecodedOrchestrator_KnowledgeGraph",
                       self._collections_to_search(srv))
 
     def test_shared_in_search_when_legacy_optout_set(self):
@@ -402,10 +402,10 @@ class ReadPathAlwaysIncludesSharedTests(unittest.TestCase):
         the shared collection."""
         srv = _fresh_server({
             "KG_COLLECTION": "ProjectKG",
-            "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
+            "SHARED_KG_COLLECTION": "VibecodedOrchestrator_KnowledgeGraph",
             "SHARED_KG_OPT_OUT": "true",
         })
-        self.assertIn("VibeCodedTools_KnowledgeGraph",
+        self.assertIn("VibecodedOrchestrator_KnowledgeGraph",
                       self._collections_to_search(srv))
 
 

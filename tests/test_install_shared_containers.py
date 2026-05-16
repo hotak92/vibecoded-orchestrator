@@ -182,7 +182,7 @@ class EnsureCollectionsTests(unittest.TestCase):
             # Pre-seed all three collections (project + dev + shared) so
             # _ensure_collections has nothing to POST. The shared collection
             # name comes from SHARED_KG_COLLECTION (default
-            # VibeCodedTools_KnowledgeGraph) — pin it explicitly here to
+            # VibecodedOrchestrator_KnowledgeGraph) — pin it explicitly here to
             # decouple the test from the default value.
             _Handler.schema = {"classes": [
                 {"class": "TestKG"},
@@ -225,7 +225,7 @@ class EnsureCollectionsTests(unittest.TestCase):
 
     def test_creates_shared_kg_collection(self):
         """Step 7b also bootstraps the cross-project shared KG collection so
-        every install on this machine sees the same VibeCodedTools_KnowledgeGraph."""
+        every install on this machine sees the same VibecodedOrchestrator_KnowledgeGraph."""
         server, port, _ = _start_server()
         try:
             _Handler.schema = {"classes": []}
@@ -233,16 +233,16 @@ class EnsureCollectionsTests(unittest.TestCase):
                 "os.environ",
                 {"WEAVIATE_PORT": str(port), "KG_COLLECTION": "TestKG",
                  "DEVELOPMENT_COLLECTION": "TestDev",
-                 "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph"},
+                 "SHARED_KG_COLLECTION": "VibecodedOrchestrator_KnowledgeGraph"},
             ):
                 install._ensure_collections({})
             posted_classes = [p.get("class") for p in _Handler.posted]
             self.assertIn("TestKG", posted_classes)
             self.assertIn("TestDev", posted_classes)
-            self.assertIn("VibeCodedTools_KnowledgeGraph", posted_classes)
+            self.assertIn("VibecodedOrchestrator_KnowledgeGraph", posted_classes)
             # Shared collection schema mirrors the project KG (same builder).
             shared = next(p for p in _Handler.posted
-                          if p.get("class") == "VibeCodedTools_KnowledgeGraph")
+                          if p.get("class") == "VibecodedOrchestrator_KnowledgeGraph")
             prop_names = {p["name"] for p in shared["properties"]}
             self.assertIn("title", prop_names)
             self.assertIn("content", prop_names)
@@ -326,7 +326,7 @@ class EnsureCollectionsAdoptModeTests(unittest.TestCase):
             # sane *_KnowledgeGraph or vct_KnowledgeGraph.
             kg_posted = [c for c in posted_classes
                          if c.endswith("_KnowledgeGraph")
-                         and c not in ("VibeCodedTools_KnowledgeGraph",
+                         and c not in ("VibecodedOrchestrator_KnowledgeGraph",
                                        "ClaudeKnowledgeGraph",
                                        "Acme_KnowledgeGraph",
                                        "ImageDataset_KnowledgeGraph")]

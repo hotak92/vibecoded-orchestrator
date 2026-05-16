@@ -120,10 +120,10 @@ class CollectionLabelTests(unittest.TestCase):
     def test_shared_collection(self) -> None:
         gni = _fresh_get_node_info({
             "KG_COLLECTION": "Alpha_KnowledgeGraph",
-            "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
+            "SHARED_KG_COLLECTION": "VibecodedOrchestrator_KnowledgeGraph",
         })
         self.assertEqual(
-            gni._collection_label("VibeCodedTools_KnowledgeGraph"),
+            gni._collection_label("VibecodedOrchestrator_KnowledgeGraph"),
             "[shared]",
         )
 
@@ -167,14 +167,14 @@ class GetNodeInfoAccessListTests(unittest.TestCase):
         all get rendered."""
         gni = _fresh_get_node_info({
             "KG_COLLECTION": "Alpha_KnowledgeGraph",
-            "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
+            "SHARED_KG_COLLECTION": "VibecodedOrchestrator_KnowledgeGraph",
             "VCT_KG_ACCESS_LIST": "Beta,Gamma",
         })
         # Title "SharedConcept" exists in self + a peer (simulates a
         # node copied across projects).
         contents = {
             "Alpha_KnowledgeGraph": [_FakeObj("SharedConcept", links=["Foo"])],
-            "VibeCodedTools_KnowledgeGraph": [],
+            "VibecodedOrchestrator_KnowledgeGraph": [],
             "Beta_KnowledgeGraph": [_FakeObj("SharedConcept", links=["Bar"])],
             "Gamma_KnowledgeGraph": [],
         }
@@ -185,7 +185,7 @@ class GetNodeInfoAccessListTests(unittest.TestCase):
             client.collections.requested,
             [
                 "Alpha_KnowledgeGraph",
-                "VibeCodedTools_KnowledgeGraph",
+                "VibecodedOrchestrator_KnowledgeGraph",
                 "Beta_KnowledgeGraph",
                 "Gamma_KnowledgeGraph",
             ],

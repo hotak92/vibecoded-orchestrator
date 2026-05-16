@@ -213,12 +213,15 @@ class DetectLegacyKgTests(unittest.TestCase):
         with mock.patch.object(
             project_init, "_http_request",
             side_effect=_make_http_request_mock(
+                # Legacy-detection: VibeCodedTools_KnowledgeGraph is the
+                # pre-v0.2.12 PR-26 shared-KG name. Keep the literal here
+                # to exercise the "wrong prefix despite KG suffix" path
+                # against a name that actually appears on legacy installs.
                 ["RandomCollection", "AnotherThing", "VibeCodedTools_KnowledgeGraph"],
             ),
         ):
-            # VibeCodedTools_KnowledgeGraph is the shared KG; it has the
-            # KG suffix but the prefix has zero similarity to "Foo" so it
-            # must NOT be returned.
+            # The shared KG (legacy name) has the KG suffix but the prefix
+            # has zero similarity to "Foo" so it must NOT be returned.
             result = project_init._detect_legacy_kg_collections("Foo", URL)
         self.assertEqual(result, [])
 

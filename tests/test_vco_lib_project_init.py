@@ -92,7 +92,11 @@ class DeriveProjectCollectionNamesTests(unittest.TestCase):
                 "kg_collection": "VideoFrames_KnowledgeGraph",
                 "development_collection": "VideoFrames_Development",
                 "project_name": "VideoFrames",
-                "shared_kg_collection": "VibeCodedTools_KnowledgeGraph",
+                # Canonical shared-KG name (renamed from
+                # "VibeCodedTools_KnowledgeGraph" in v0.2.12 PR-26 / Group E).
+                # Cross-language invariant pinned by
+                # tests/test_shared_kg_constant_consistency.py.
+                "shared_kg_collection": "VibecodedOrchestrator_KnowledgeGraph",
                 "shared_kg_write_disabled": "false",
                 "kg_basename": "VideoFrames",
             },
@@ -125,13 +129,14 @@ class DeriveProjectCollectionNamesTests(unittest.TestCase):
         self.assertTrue(result["development_collection"].endswith("_Development"))
 
     def test_shared_kg_collection_constant(self):
-        # The shared cross-project KG name is fixed.
+        # The shared cross-project KG name is fixed (renamed in v0.2.12 PR-26;
+        # cross-language invariant in tests/test_shared_kg_constant_consistency.py).
         for name in ("foo", "MyTest", "VideoFrames"):
             self.assertEqual(
                 project_init.derive_project_collection_names(name)[
                     "shared_kg_collection"
                 ],
-                "VibeCodedTools_KnowledgeGraph",
+                "VibecodedOrchestrator_KnowledgeGraph",
             )
 
 
@@ -203,7 +208,7 @@ class CliEntryPointTests(unittest.TestCase):
         self.assertEqual(payload["kg_collection"], "VideoFrames_KnowledgeGraph")
         self.assertEqual(payload["development_collection"], "VideoFrames_Development")
         self.assertEqual(payload["project_name"], "VideoFrames")
-        self.assertEqual(payload["shared_kg_collection"], "VibeCodedTools_KnowledgeGraph")
+        self.assertEqual(payload["shared_kg_collection"], "VibecodedOrchestrator_KnowledgeGraph")
         self.assertEqual(payload["shared_kg_write_disabled"], "false")
         self.assertEqual(payload["kg_basename"], "VideoFrames")
 
