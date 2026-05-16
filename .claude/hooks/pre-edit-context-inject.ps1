@@ -154,12 +154,39 @@ $Query = "$ModuleName $NewSnippet".Trim()
 $KgTmp = New-TemporaryFile
 $CodeTmp = New-TemporaryFile
 
-$VenvPy = Join-Path (if ($env:VCT_INSTALL_ROOT) { $env:VCT_INSTALL_ROOT } else { $ProjectRoot }) "claude_mcp_servers\.venv\Scripts\python.exe"
-if (-not (Test-Path $VenvPy)) {
-    $VenvPy = Join-Path (if ($env:VCT_INSTALL_ROOT) { $env:VCT_INSTALL_ROOT } else { $ProjectRoot }) "claude_mcp_servers/.venv/bin/python"
+# Dual-layout venv resolution (PR-25 / v0.2.12). Modern installs put the
+# venv at <repo_root>\.venv (top-level); pre-v0.2.x installs had it at
+# <repo_root>\claude_mcp_servers\.venv. Hardcoding only the latter caused
+# this hook to silently fall through to system python on modern installs,
+# where weaviate-client isn't available, so KG search silently broke.
+$VenvBase = if ($env:VCT_INSTALL_ROOT) { $env:VCT_INSTALL_ROOT } else { $ProjectRoot }
+$VenvPy = $null
+if ($env:VCT_VENV) {
+    $cand = Join-Path $env:VCT_VENV "Scripts\python.exe"
+    if (Test-Path $cand) { $VenvPy = $cand }
+    if (-not $VenvPy) {
+        $cand = Join-Path $env:VCT_VENV "bin/python"
+        if (Test-Path $cand) { $VenvPy = $cand }
+    }
+    if (-not $VenvPy -and (Test-Path $env:VCT_VENV -PathType Leaf)) {
+        $VenvPy = $env:VCT_VENV
+    }
 }
+if (-not $VenvPy) {
+    foreach ($cand in @(
+        (Join-Path $VenvBase ".venv\Scripts\python.exe"),
+        (Join-Path $VenvBase ".venv/bin/python"),
+        (Join-Path $VenvBase "claude_mcp_servers\.venv\Scripts\python.exe"),
+        (Join-Path $VenvBase "claude_mcp_servers/.venv/bin/python")
+    )) {
+        if (Test-Path $cand) { $VenvPy = $cand; break }
+    }
+}
+# Final fallback: if no venv resolved, leave $VenvPy as $null — the
+# (Test-Path $VenvPy) gate below skips the KG search subprocess and the
+# hook still exits 0 without blocking the edit.
 $RlScript = Join-Path $ProjectRoot "claude_mcp_servers/scripts/rl_kg_search.py"
-if ((Test-Path $VenvPy) -and (Test-Path $RlScript)) {
+if ($VenvPy -and (Test-Path $VenvPy) -and (Test-Path $RlScript)) {
     try {
         # --hook-format prepends "KG: " to each result header so dedup can match by title.
         & $VenvPy $RlScript $Query --limit 1 --hook-format 2>$null | Select-Object -First 40 | Set-Content -Path $KgTmp.FullName

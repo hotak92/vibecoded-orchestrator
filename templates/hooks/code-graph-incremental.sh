@@ -46,7 +46,24 @@ PROJECT_NAME="${3:-$(basename "$REPO_PATH")}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 ANALYZER="${VCT_ANALYZER_SCRIPT:-$DEFAULT_REPO_ROOT/.claude/scripts/analyze_code_graph.py}"
-VENV="${VCT_VENV:-$DEFAULT_REPO_ROOT/claude_mcp_servers/.venv}"
+# Dual-layout venv resolution (PR-25 / v0.2.12). Modern installs put the
+# venv at <repo_root>/.venv (top-level); pre-v0.2.x installs had it at
+# <repo_root>/claude_mcp_servers/.venv. Hardcoding the latter caused this
+# hook to silently fall through to system python on modern installs —
+# where weaviate-client isn't installed — and crash inside the analyzer.
+# VCT_VENV overrides everything when set explicitly.
+if [ -n "${VCT_VENV:-}" ]; then
+    VENV="$VCT_VENV"
+elif [ -d "$DEFAULT_REPO_ROOT/.venv" ]; then
+    VENV="$DEFAULT_REPO_ROOT/.venv"
+elif [ -d "$DEFAULT_REPO_ROOT/claude_mcp_servers/.venv" ]; then
+    VENV="$DEFAULT_REPO_ROOT/claude_mcp_servers/.venv"
+else
+    # Final fallback: empty → caller falls back to system PATH lookup
+    # via _lib/find-python.sh. Hook may degrade gracefully (no
+    # weaviate-client) but won't hard-fail.
+    VENV=""
+fi
 
 # Auto-detect project from file path (multi-codebase support) — silent if helper absent
 DETECT_HELPER="$DEFAULT_REPO_ROOT/.claude/scripts/detect-project.sh"

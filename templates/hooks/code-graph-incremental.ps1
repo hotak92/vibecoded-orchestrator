@@ -33,7 +33,20 @@ if (-not $ProjectName) { $ProjectName = Split-Path $RepoPath -Leaf }
 $ScriptDir = $PSScriptRoot
 $DefaultRepoRoot = (Resolve-Path (Join-Path $ScriptDir "..\..")).Path
 $Analyzer = if ($env:VCT_ANALYZER_SCRIPT) { $env:VCT_ANALYZER_SCRIPT } else { Join-Path $DefaultRepoRoot ".claude/scripts/analyze_code_graph.py" }
-$Venv = if ($env:VCT_VENV) { $env:VCT_VENV } else { Join-Path $DefaultRepoRoot "claude_mcp_servers/.venv" }
+# Dual-layout venv resolution (PR-25 / v0.2.12). Modern installs put the
+# venv at <repo_root>\.venv (top-level); pre-v0.2.x installs had it at
+# <repo_root>\claude_mcp_servers\.venv. Hardcoding the latter caused this
+# hook to silently fall through to system python on modern installs.
+# VCT_VENV overrides everything when set explicitly.
+if ($env:VCT_VENV) {
+    $Venv = $env:VCT_VENV
+} elseif (Test-Path (Join-Path $DefaultRepoRoot ".venv")) {
+    $Venv = Join-Path $DefaultRepoRoot ".venv"
+} elseif (Test-Path (Join-Path $DefaultRepoRoot "claude_mcp_servers/.venv")) {
+    $Venv = Join-Path $DefaultRepoRoot "claude_mcp_servers/.venv"
+} else {
+    $Venv = ""
+}
 
 # Auto-detect project (best-effort; helper may not exist on Windows).
 $DetectPs1 = Join-Path $DefaultRepoRoot ".claude/scripts/detect-project.ps1"
