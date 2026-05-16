@@ -144,7 +144,19 @@
           href: '/preferences',
           label: 'Preferences',
           sub: 'Tray, updates, behavior',
-          match: (p) => p.startsWith('/preferences'),
+          // Exclude /preferences/secrets so only the Secrets entry below
+          // lights up when the user is on the secrets pages.
+          match: (p) => p.startsWith('/preferences') && !p.startsWith('/preferences/secrets'),
+        },
+        {
+          // Wired in PR-4 of v0.2.11 — mounts SecretsPanel (shipped
+          // v0.2.7) + SecretsImportPanel (v0.2.8) at navigable routes.
+          // The match pattern covers both /preferences/secrets and
+          // /preferences/secrets/import.
+          href: '/preferences/secrets',
+          label: 'Secrets',
+          sub: 'Keychain entries used across projects',
+          match: (p) => p.startsWith('/preferences/secrets'),
         },
         // Bug 9: Audit demoted to second-to-last position. Most users
         // never need it; keeping it visible but unobtrusive.
