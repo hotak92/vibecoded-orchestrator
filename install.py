@@ -1468,7 +1468,28 @@ def _run_lightweight(args: argparse.Namespace) -> int:
     # v0.2.10 (Bug L2): re-materialize boot service on lightweight too —
     # the wrapper path may have changed if the install was relocated
     # (--lightweight-old-path). Idempotent for unchanged paths.
-    _materialize_boot_service(PROJECT_ROOT, None, args)
+    #
+    # PR-12 Bug C: lightweight reinstall is the EXACT path users hit when
+    # upgrading via the launcher's "Update orchestrator" button — pass a
+    # fresh DeferralReport so any stale-unit auto-repair surfaces in
+    # UPDATE_DEFERRED.md the user reads at next session.
+    _lightweight_deferral = DeferralReport()
+    _materialize_boot_service(PROJECT_ROOT, None, args,
+                              deferral_report=_lightweight_deferral)
+    # Best-effort: persist the deferral report. Mirrors the folder
+    # resolution used by the full install path (line ~2169).
+    try:
+        _lightweight_folder = (
+            Path(args.project_folder)
+            if getattr(args, "project_folder", None)
+            else PROJECT_ROOT
+        )
+        _lightweight_deferral.write(_lightweight_folder)
+    except Exception as _exc:  # noqa: BLE001 — soft-fail
+        _log_install_event(
+            "lightweight", "warn",
+            f"could not write lightweight-mode deferral report: {_exc}",
+        )
 
     _log_install_event(
         "lightweight", "ok",
@@ -2184,7 +2205,12 @@ def main() -> int:
     # systemd user unit on Linux, LaunchAgent on macOS, Task Scheduler
     # on Windows. Soft-fail throughout — failure here never blocks
     # install completion.
-    _materialize_boot_service(PROJECT_ROOT, sysinfo, args)
+    #
+    # PR-12 Bug C: pass the run-scoped _deferral_report so any stale
+    # WorkingDirectory= auto-repair surfaces in UPDATE_DEFERRED.md (the
+    # final write happens at line ~2181 below).
+    _materialize_boot_service(PROJECT_ROOT, sysinfo, args,
+                              deferral_report=_deferral_report)
 
     # v0.2.6 Bug C1: invoke the desktop-icon step so direct `python install.py`
     # runs get an icon too. first-install.sh-wrapped runs already trigger
@@ -6168,23 +6194,40 @@ def _resolve_compose_working_dir(
 
     The compose-project dir may NOT be the install path (canonical
     example: install at one project dir, but compose.yaml lives in a
-    sibling repo's `claude_mcp_servers/`). Resolution priority:
+    sibling repo's `claude_mcp_servers/`).
+
+    Resolution priority (PR-12 Bug C — install_path subdirs now BEAT the
+    ps-label probe, so a stale container from a prior install path can't
+    pin the new install's systemd unit to an obsolete WorkingDirectory):
 
       1. CLI override (--compose-working-dir) — explicit user choice.
-      2. `ps_label_value` — the value of the
+      2. `<install_path>/claude_mcp_servers/` if it exists.
+      3. `<install_path>/infrastructure/` if it exists (VCO's own layout
+         where compose.yaml + the overlay both live there).
+      4. `ps_label_value` — the value of the
          `com.docker.compose.project.working_dir` label on a running
          claude-mcp container, sniffed by the caller via `<runtime> ps`.
-         Soft-input: caller passes None if probing failed.
-      3. `<install_path>/claude_mcp_servers/` if it exists.
-      4. `<install_path>/infrastructure/` if it exists (VCO's own layout
-         where compose.yaml + the overlay both live there).
+         Now a LAST RESORT for the rare edge case where the install path
+         has neither subdir locally (e.g. compose.yaml shipped in a
+         sibling repo). Caller passes None if probing failed.
       5. None — caller skips materialization with a warning.
+
+    Why the priority inversion (Bug C, 2026-05-16): when a user upgrades
+    VCO via the launcher GUI / `install.py --update`, pre-existing
+    containers from a PRIOR install carry the
+    `com.docker.compose.project.working_dir=<old-path>` label. The
+    previous priority-2 ps-label probe would re-use that old path in the
+    fresh systemd unit, pinning the user's boot service to a stale
+    directory across upgrades. Inverting the order so install_path
+    subdirs win means the unit's WorkingDirectory tracks the install
+    location whenever it has a recognisable layout — which is the
+    overwhelmingly common case.
 
     Pure function: no env reads, no subprocess. Caller supplies the ps
     probe result (so this function is unit-testable without spawning
     podman). Tested via tests/test_resolve_compose_working_dir.py.
     """
-    # 1. CLI override
+    # 1. CLI override — explicit user choice always wins.
     if cli_override:
         candidate = Path(cli_override).expanduser().resolve()
         if candidate.is_dir():
@@ -6192,19 +6235,22 @@ def _resolve_compose_working_dir(
         # Override pointed at a missing dir — that's a user error worth
         # flagging. Caller logs and falls through.
         return None
-    # 2. ps label
+    # 2. install_path/claude_mcp_servers — the canonical layout.
+    candidate = (install_path / "claude_mcp_servers").resolve()
+    if candidate.is_dir():
+        return candidate
+    # 3. install_path/infrastructure (the VCO-native layout).
+    candidate = (install_path / "infrastructure").resolve()
+    if candidate.is_dir():
+        return candidate
+    # 4. ps_label_value — last-resort fallback (e.g. compose.yaml lives
+    # outside install_path entirely). Pre-PR-12 this was priority 2,
+    # which caused boot-service WorkingDirectory to get pinned to stale
+    # install paths across upgrades.
     if ps_label_value:
         candidate = Path(ps_label_value).expanduser().resolve()
         if candidate.is_dir():
             return candidate
-    # 3. install_path/claude_mcp_servers
-    candidate = (install_path / "claude_mcp_servers").resolve()
-    if candidate.is_dir():
-        return candidate
-    # 4. install_path/infrastructure (the VCO native layout)
-    candidate = (install_path / "infrastructure").resolve()
-    if candidate.is_dir():
-        return candidate
     # 5. give up
     return None
 
@@ -6653,10 +6699,206 @@ def _materialize_searxng_settings(install_path: Path) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# PR-12 Bug C: stale-unit auto-repair on --update
+# ---------------------------------------------------------------------------
+
+# Regex captures the value of the `WorkingDirectory=` line (anywhere in the
+# unit file) WITHOUT consuming surrounding whitespace. systemd unit syntax
+# is permissive about whitespace around `=`, so we match `\s*=\s*`.
+_UNIT_WORKING_DIR_RE = re.compile(
+    r"^(\s*WorkingDirectory\s*=\s*)(.+?)\s*$",
+    re.MULTILINE,
+)
+# Same pattern for the Environment=VCT_STACK_WORKING_DIR= line — the
+# template emits both, and they must stay in lockstep.
+_UNIT_ENV_WORKING_DIR_RE = re.compile(
+    r"^(\s*Environment\s*=\s*VCT_STACK_WORKING_DIR\s*=\s*)(.+?)\s*$",
+    re.MULTILINE,
+)
+
+
+def _repair_systemd_unit_working_dir(
+    install_path: Path,
+    correct_working_dir: Optional[Path] = None,
+    deferral_report: Optional["DeferralReport"] = None,
+) -> Optional[tuple[str, str]]:
+    """Auto-repair the systemd user unit when its `WorkingDirectory=` line
+    points at a stale install path (PR-12 Bug C).
+
+    Reads ``~/.config/systemd/user/claude-mcp-containers.service`` (if
+    present), parses the current ``WorkingDirectory=`` value, and re-renders
+    the unit when it doesn't match the correct path. The "correct" path is
+    derived via the same priority order as ``_resolve_compose_working_dir``:
+    install_path subdirs (claude_mcp_servers/ then infrastructure/), or the
+    explicitly-passed ``correct_working_dir``.
+
+    Behaviour:
+      - Linux only: returns None on every other OS (systemd user units don't
+        exist elsewhere).
+      - Idempotent: when the unit's WorkingDirectory ALREADY matches the
+        correct path, this is a complete no-op (no read churn, no log
+        spam, no deferral entry).
+      - Backup-then-write: when repair is needed, the current unit is
+        backed up to ``<unit>.bak-<ISO8601>`` before being rewritten with
+        the corrected `WorkingDirectory=` AND `Environment=VCT_STACK_WORKING_DIR=`
+        lines (the template emits both — they must stay in lockstep).
+      - Deferral: when a repair lands, an entry with condition_id
+        ``boot_service_path_repaired`` is appended to ``deferral_report``
+        (if provided) listing old → new + the systemd reload command. The
+        unit ITSELF is rewritten on the spot — the deferral exists only
+        so the user sees what changed and can re-run `systemctl --user
+        daemon-reload && systemctl --user restart` at their leisure.
+      - Soft-fail: any OSError reading/writing the unit, any unparseable
+        unit content — log + return None. Never raises.
+
+    Returns:
+      - None when no action was taken (wrong OS, unit missing, already
+        correct, or read/write failed).
+      - ``(old_working_dir, new_working_dir)`` tuple when a repair landed.
+    """
+    # Linux-only — systemd user units are a Linux concept.
+    if platform.system() != "Linux":
+        return None
+
+    unit_path = Path.home() / ".config" / "systemd" / "user" / _BOOT_SERVICE_UNIT_NAME
+    if not unit_path.is_file():
+        # No unit on disk → nothing to repair. _materialize_boot_service
+        # will create one fresh; this helper has no work to do.
+        return None
+
+    # Read the current unit. Soft-fail on permission / encoding errors.
+    try:
+        existing = unit_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        _log_install_event(
+            "boot-service", "warn",
+            f"could not read systemd unit for repair check: {exc}",
+            data={"unit_path": str(unit_path)},
+        )
+        return None
+
+    # Parse current WorkingDirectory= value.
+    wd_match = _UNIT_WORKING_DIR_RE.search(existing)
+    if not wd_match:
+        # Unit has no WorkingDirectory= line at all. Could be a
+        # third-party unit with our filename (unlikely but possible) or a
+        # corrupt template render. Either way, leave it alone — let
+        # _materialize_boot_service handle the rewrite via its normal
+        # idempotent path.
+        return None
+    current_wd = wd_match.group(2).strip()
+
+    # Resolve the correct WorkingDirectory using the same priority order
+    # as the dispatcher. Caller may pass it explicitly to avoid duplicate
+    # resolution work.
+    if correct_working_dir is None:
+        correct_working_dir = _resolve_compose_working_dir(
+            install_path=install_path,
+            cli_override=None,
+            ps_label_value=None,  # don't trust ps labels in repair path —
+                                  # they're literally what caused Bug C
+        )
+    if correct_working_dir is None:
+        # Couldn't resolve a target — punt. _materialize_boot_service
+        # will log its own warn for the same reason.
+        return None
+    correct_wd_str = str(correct_working_dir)
+
+    # Already correct → no-op (the common idempotent case).
+    if current_wd == correct_wd_str:
+        return None
+
+    # Mismatch: rewrite both WorkingDirectory= and the
+    # Environment=VCT_STACK_WORKING_DIR= line so they stay in lockstep.
+    # We do an in-place substitution rather than re-rendering from the
+    # template here, so a user who has manually customised OTHER lines
+    # of their unit (e.g. added an `After=` dependency) keeps those edits.
+    repaired = _UNIT_WORKING_DIR_RE.sub(
+        lambda m: f"{m.group(1)}{correct_wd_str}",
+        existing,
+    )
+    repaired = _UNIT_ENV_WORKING_DIR_RE.sub(
+        lambda m: f"{m.group(1)}{correct_wd_str}",
+        repaired,
+    )
+
+    # Backup the prior unit before overwriting.
+    stamp = _utc_iso_now().replace(":", "").replace("-", "")
+    backup_path = unit_path.with_name(unit_path.name + f".bak-{stamp}")
+    try:
+        backup_path.write_text(existing, encoding="utf-8")
+    except OSError as exc:
+        _log_install_event(
+            "boot-service", "warn",
+            f"could not back up systemd unit before repair: {exc} — aborting repair",
+            data={"unit_path": str(unit_path), "backup_target": str(backup_path)},
+        )
+        return None
+    try:
+        unit_path.write_text(repaired, encoding="utf-8")
+    except OSError as exc:
+        _log_install_event(
+            "boot-service", "warn",
+            f"could not rewrite systemd unit during repair: {exc}",
+            data={"unit_path": str(unit_path)},
+        )
+        return None
+
+    _log_install_event(
+        "boot-service", "ok",
+        "repaired stale WorkingDirectory in systemd unit",
+        data={
+            "unit_path": str(unit_path),
+            "backup": str(backup_path),
+            "old_working_dir": current_wd,
+            "new_working_dir": correct_wd_str,
+        },
+    )
+
+    # Surface the change in the deferral report so the user knows to
+    # reload the unit. The unit ITSELF was already rewritten — this is a
+    # nudge to apply the running-systemd-state change, not a pending
+    # action gate.
+    if deferral_report is not None:
+        try:
+            deferral_report.add_entry(
+                DeferralEntry(
+                    condition_id="boot_service_path_repaired",
+                    title="Boot-service WorkingDirectory was stale; auto-repaired",
+                    detected=(
+                        f"~/.config/systemd/user/{_BOOT_SERVICE_UNIT_NAME} pointed at "
+                        f"`{current_wd}` (a stale path from a prior install). "
+                        f"VCO rewrote the unit to point at `{correct_wd_str}` and saved "
+                        f"the original to `{backup_path.name}`."
+                    ),
+                    why_deferred=(
+                        "The on-disk unit was repaired in place, but the running "
+                        "systemd state still has the old WorkingDirectory cached. "
+                        "Reload + restart manually so the change takes effect now "
+                        "(otherwise it'll only kick in at the next login session)."
+                    ),
+                    command_to_apply=(
+                        "systemctl --user daemon-reload && "
+                        f"systemctl --user restart {_BOOT_SERVICE_UNIT_NAME}"
+                    ),
+                    severity="info",
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 — soft-fail
+            _log_install_event(
+                "boot-service", "warn",
+                f"could not append boot_service_path_repaired deferral: {exc}",
+            )
+
+    return (current_wd, correct_wd_str)
+
+
 def _materialize_boot_service(
     install_path: Path,
     sysinfo,
     args: argparse.Namespace,
+    deferral_report: Optional["DeferralReport"] = None,
 ) -> None:
     """Cross-OS dispatcher for boot-service materialization.
 
@@ -6677,6 +6919,13 @@ def _materialize_boot_service(
     The wrapper script (scripts/launch-claude-mcp-stack.sh) handles
     runtime detection + GPU-mode detection internally, so this function
     is runtime-agnostic — it only needs to know the OS.
+
+    PR-12 Bug C: when ``deferral_report`` is supplied, this dispatcher
+    ALSO runs ``_repair_systemd_unit_working_dir`` BEFORE re-rendering,
+    so a stale unit gets fixed even if subsequent rendering would have
+    been a no-op (idempotent path skipped the write because content
+    "matched", except it didn't — the only thing that matched was the
+    stale-but-consistent state).
     """
     # Honor the `_BOOT_SERVICE_DISABLE` env var for CI / minimal installs
     # that don't want a system service materialized.
@@ -6711,6 +6960,22 @@ def _materialize_boot_service(
             "re-run with --compose-working-dir to set it explicitly",
         )
         return
+
+    # PR-12 Bug C: stale-unit auto-repair runs BEFORE the renderer so a
+    # unit with the wrong WorkingDirectory gets fixed even on update
+    # paths where the renderer would otherwise no-op (template content
+    # already "matches" the stale rendering). Soft-fail; never raises.
+    try:
+        _repair_systemd_unit_working_dir(
+            install_path=install_path,
+            correct_working_dir=working_dir,
+            deferral_report=deferral_report,
+        )
+    except Exception as exc:  # noqa: BLE001 — soft-fail catch-all
+        _log_install_event(
+            "boot-service", "warn",
+            f"systemd unit repair raised: {exc.__class__.__name__}: {exc}",
+        )
 
     os_name = platform.system()
     try:

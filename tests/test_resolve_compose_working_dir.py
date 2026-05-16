@@ -1,17 +1,24 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
 """Pure-function tests for `_resolve_compose_working_dir` and
-`_persist_runtime_txt` (v0.2.10 Bug L2 / L3).
+`_persist_runtime_txt` (v0.2.10 Bug L2 / L3, updated PR-12 v0.2.11 Bug C).
 
 The resolution helper is the cross-OS pivot for boot-service
 materialization: it has to pick the right compose-project directory
-without spawning a container runtime. We test the priority matrix:
+without spawning a container runtime. We test the priority matrix
+(NEW priority order, post-PR-12):
 
     1. CLI override (--compose-working-dir)
-    2. ps-label probe result (caller-supplied so this stays pure)
-    3. <install>/claude_mcp_servers/
-    4. <install>/infrastructure/
+    2. <install>/claude_mcp_servers/
+    3. <install>/infrastructure/
+    4. ps-label probe result (caller-supplied so this stays pure) —
+       last-resort fallback only
     5. None (give up, caller logs)
+
+The PR-12 inversion (ps_label demoted from priority 2 to priority 4)
+prevents stale `com.docker.compose.project.working_dir` labels from
+prior installs from pinning the boot-service WorkingDirectory to an
+obsolete path across upgrades.
 
 These tests do NOT touch the real filesystem outside tmp_path and do
 NOT spawn subprocesses — they're hermetic and run on every OS.
@@ -64,12 +71,40 @@ def test_cli_override_missing_dir_returns_none(tmp_path: Path):
     assert resolved is None
 
 
-def test_ps_label_wins_when_no_cli_override(tmp_path: Path):
+def test_install_subdir_wins_over_ps_label(tmp_path: Path):
+    """PR-12 Bug C: when both `<install>/claude_mcp_servers/` AND a
+    ps_label_value exist, the install subdir wins. This is the priority
+    inversion that prevents stale containers from a prior install path
+    from pinning the new boot-service WorkingDirectory.
+
+    Pre-PR-12 this assertion was the OPPOSITE (ps_label won)."""
     label_dir = tmp_path / "label-compose-dir"
     label_dir.mkdir()
     install_path = tmp_path / "install"
     install_path.mkdir()
-    (install_path / "claude_mcp_servers").mkdir()
+    cms = install_path / "claude_mcp_servers"
+    cms.mkdir()
+
+    resolved = install._resolve_compose_working_dir(
+        install_path=install_path,
+        cli_override=None,
+        ps_label_value=str(label_dir),
+    )
+    # NEW priority order — install subdir wins over ps_label.
+    assert resolved == cms.resolve()
+
+
+def test_ps_label_used_only_when_no_install_subdir(tmp_path: Path):
+    """PR-12 Bug C: ps_label is now the LAST-RESORT fallback (priority
+    4). It only takes effect when neither
+    `<install>/claude_mcp_servers/` nor `<install>/infrastructure/`
+    exists locally — the rare edge case where compose.yaml ships in a
+    sibling repo entirely outside install_path."""
+    label_dir = tmp_path / "label-compose-dir"
+    label_dir.mkdir()
+    install_path = tmp_path / "install"
+    install_path.mkdir()
+    # Note: no claude_mcp_servers/ or infrastructure/ subdirs created.
 
     resolved = install._resolve_compose_working_dir(
         install_path=install_path,
@@ -89,8 +124,33 @@ def test_ps_label_missing_dir_falls_through(tmp_path: Path):
         cli_override=None,
         ps_label_value=str(tmp_path / "label-does-not-exist"),
     )
-    # ps label dir doesn't exist → fall through to install/claude_mcp_servers
+    # ps label dir doesn't exist → install/claude_mcp_servers wins
+    # (also wins on the new priority order even if the label dir DID
+    # exist — covered by test_install_subdir_wins_over_ps_label).
     assert resolved == cms.resolve()
+
+
+def test_ps_label_skipped_when_install_subdir_present(tmp_path: Path):
+    """PR-12 Bug C regression guard: even when ps_label points at a
+    perfectly valid existing dir that is DIFFERENT from the install
+    subdirs, the install subdir still wins. This is the canonical
+    "stale prior-install container" scenario."""
+    install_path = tmp_path / "install"
+    install_path.mkdir()
+    cms = install_path / "claude_mcp_servers"
+    cms.mkdir()
+    # A stale ps-label value pointing at an old install location that
+    # still exists on disk (common: user kept the old install around).
+    stale_old_install = tmp_path / "old-install" / "claude_mcp_servers"
+    stale_old_install.mkdir(parents=True)
+    resolved = install._resolve_compose_working_dir(
+        install_path=install_path,
+        cli_override=None,
+        ps_label_value=str(stale_old_install),
+    )
+    # Must resolve to the NEW install location, not the stale one.
+    assert resolved == cms.resolve()
+    assert resolved != stale_old_install.resolve()
 
 
 def test_install_claude_mcp_servers_fallback(tmp_path: Path):
