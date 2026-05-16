@@ -152,19 +152,29 @@ _emit_context_json() {
 }
 
 # === Check cache (10 min TTL) ===
-# Use Python for mtime — `stat -c %Y` is GNU-only; macOS BSD stat needs
-# `-f %m`. Without this, every macOS install treats the cache as expired.
-# See audit finding F4. Falls back to 0 if Python is missing.
+# Cross-OS mtime: `stat -c %Y` is GNU coreutils (Linux); `stat -f %m` is BSD
+# (macOS). Try GNU first, fall back to BSD; final fallback is Python
+# (find-python.sh has already resolved $PY). Without this, every macOS
+# install treats the cache as expired. See audit finding F4.
+#
+# Cache stores RAW per-result blocks (with KG:/CODE: headers) so dedup can
+# still apply on replay against the latest seen-list. The actual replay
+# happens further down, after `_filter_seen` is defined — here we just
+# capture the cached blob and a flag.
+CACHE_HIT=0
+CACHE_BLOB=""
 if [[ -f "$CACHE_FILE" ]]; then
-    if [ -n "${PY:-}" ]; then
+    CACHE_MTIME=$(stat -c '%Y' "$CACHE_FILE" 2>/dev/null \
+        || stat -f '%m' "$CACHE_FILE" 2>/dev/null \
+        || echo "")
+    if [ -z "$CACHE_MTIME" ] && [ -n "${PY:-}" ]; then
         CACHE_MTIME=$("$PY" -c "import os,sys; print(int(os.path.getmtime(sys.argv[1])))" "$CACHE_FILE" 2>/dev/null || echo 0)
-    else
-        CACHE_MTIME=0
     fi
+    [ -z "$CACHE_MTIME" ] && CACHE_MTIME=0
     FILE_AGE=$(( $(date +%s) - CACHE_MTIME ))
     if [[ "$FILE_AGE" -lt "$CACHE_TTL" ]]; then
-        _emit_context_json "$(cat "$CACHE_FILE")"
-        exit 0
+        CACHE_HIT=1
+        CACHE_BLOB=$(cat "$CACHE_FILE" 2>/dev/null || true)
     fi
 fi
 
@@ -338,16 +348,30 @@ _filter_seen() {
     echo "$filtered"
 }
 
-# Cache-replay branch removed in v0.2.12 PR-35 — the CACHE_HIT and
-# CACHE_BLOB variables this branch depended on were never set anywhere
-# in the codebase, making the entire branch unreachable. (The functional
-# cache hit path is the inline `if [[ -f "$CACHE_FILE" ]]` block earlier
-# in this file, which exits 0 after emitting the cached blob directly.)
-# If a future caching layer wants the dedup-on-replay behaviour the
-# removed branch implemented, restore via git revert. The .ps1 sibling
-# does NOT have this dead-code problem — it sets $CacheHit/$CacheBlob on
-# its own lines 139-148 and the cache-replay branch there is live (and
-# covered by tests/test_hook_ps1_body_parity.py::test_pre_edit_context_inject_ps1_cache_replay_runs_dedup).
+# Cache replay: if we have a cache hit, dedup the cached blob against the
+# current seen-list and emit. If everything in the cache is already seen,
+# exit silently. The cache stores RAW per-result blocks (KG:/CODE: headers)
+# so dedup state stays accurate across replays (a node seen since the
+# cache was written gets filtered out here, rather than being baked into
+# the cache and perma-suppressed after a /compact wipe).
+#
+# Ported from .ps1 sibling 2026-05-16 (PR-38, v0.2.12) — restores
+# cross-OS parity with the cache layer that PR-35 confirmed had never
+# existed on the .sh side. See knowledge/concepts/cross-os-hook-portability.md.
+if [[ "$CACHE_HIT" == "1" ]]; then
+    FILTERED_CACHE=$(_filter_seen "$CACHE_BLOB")
+    # Whitespace-only filtered output → everything was already seen; silent exit.
+    case "$FILTERED_CACHE" in
+        *[![:space:]]*)
+            REPLAY_OUT="[Pre-edit context for ${BASENAME}]:"$'\n'$'\n'"${FILTERED_CACHE}"
+            _emit_context_json "$REPLAY_OUT"
+            exit 0
+            ;;
+        *)
+            exit 0
+            ;;
+    esac
+fi
 
 # Capture raw producer output (pre-dedup) for the cache. Caching post-dedup
 # would perma-suppress titles seen at write-time but eligible to re-appear
