@@ -757,6 +757,49 @@ mod tests {
         assert!(ids.contains(&"code-graph"), "missing code-graph: {:?}", ids);
     }
 
+    /// Regression guard for the v0.1.6 hardcoded-version bug (fix-3, v0.2.13).
+    ///
+    /// `list_module_catalog` must always return an entry for `id="orchestrator"`
+    /// with a non-empty version string. Before fix-3, the Store page was
+    /// showing the hardcoded `version: '0.1.6'` whenever the catalog was empty
+    /// or the orchestrator entry had an empty version. The catalog entry is
+    /// now always present (built-in, sourced from `vct-module.json`) and the
+    /// Store page renders the version only when non-empty.
+    #[test]
+    fn builtin_catalog_orchestrator_entry_has_non_empty_version() {
+        let db = open_db();
+        let entries = builtin_catalog_entries(&db);
+        let orch = entries
+            .iter()
+            .find(|e| e.id == "orchestrator")
+            .expect("orchestrator entry must be present in builtin catalog");
+        assert!(
+            !orch.version.is_empty(),
+            "orchestrator catalog entry must have a non-empty version string; \
+             got empty string (vct-module.json missing or malformed?). \
+             The Store page falls back to the static `version` field in `allApps` \
+             when the catalog returns no version — leaving it empty prevents \
+             showing a stale hardcoded string."
+        );
+    }
+
+    /// The vct-launcher entry must also carry the live CARGO_PKG_VERSION,
+    /// not a hardcoded string. Regression guard added alongside fix-3.
+    #[test]
+    fn builtin_catalog_launcher_entry_has_non_empty_version() {
+        let db = open_db();
+        let entries = builtin_catalog_entries(&db);
+        let launcher = entries
+            .iter()
+            .find(|e| e.id == "vct-launcher")
+            .expect("vct-launcher entry must be present in builtin catalog");
+        assert!(
+            !launcher.version.is_empty(),
+            "vct-launcher catalog entry must have a non-empty version string (CARGO_PKG_VERSION); \
+             got empty. If this fires in CI, check that the Cargo.toml `[package] version` is set."
+        );
+    }
+
     #[test]
     fn builtin_catalog_lists_exactly_one_coming_soon_entry() {
         let db = open_db();

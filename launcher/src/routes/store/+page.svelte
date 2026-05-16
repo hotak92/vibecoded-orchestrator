@@ -42,9 +42,16 @@
   // shows the long-form pitch and the card itself needs only a one-liner.
   // MAO is rendered as Coming Soon; clicking the card surfaces an early-access
   // hint rather than a checkout link.
+  //
+  // `version` here is the static fallback shown ONLY while the catalog is
+  // loading or when `list_module_catalog` returns no entry for this id.
+  // For `orchestrator`, the catalog always returns an entry whose version is
+  // read from `vct-module.json` at the repo root — so the fallback below is
+  // shown for at most ~50 ms. For `orchestrator-pro` (not yet in the catalog)
+  // we leave the version empty so the card never shows a stale hardcoded string.
   const allApps: AppItem[] = [
-    { id: 'orchestrator', name: 'Orchestrator', desc: 'Knowledge graph, code graph, and workflow automation for Claude Code. Free tier — persistent memory for your AI.', color: 'teal', icon: 'O', version: '0.1.6', checkoutUrl: '' },
-    { id: 'orchestrator-pro', name: 'Orchestrator Pro', desc: 'RL-scored retrieval that learns from your usage, curated agent packs, auto-updates. €19/mo · €149/yr · €199 lifetime.', color: 'purple', icon: 'O+', version: '0.1.6', checkoutUrl: '' },
+    { id: 'orchestrator', name: 'Orchestrator', desc: 'Knowledge graph, code graph, and workflow automation for Claude Code. Free tier — persistent memory for your AI.', color: 'teal', icon: 'O', version: '', checkoutUrl: '' },
+    { id: 'orchestrator-pro', name: 'Orchestrator Pro', desc: 'RL-scored retrieval that learns from your usage, curated agent packs, auto-updates. €19/mo · €149/yr · €199 lifetime.', color: 'purple', icon: 'O+', version: '', checkoutUrl: '' },
     { id: 'mao', name: 'Multi-Agent Orchestrator (MAO)', desc: 'Coming soon — 10 specialist agents + Maestro coordinator + Planner pipeline + Tauri UI on top of Standard.', color: 'pink', icon: 'M', version: 'preview', checkoutUrl: '' },
     { id: 'transcrypt', name: 'Transcrypt', desc: 'Audio transcription with AI-powered correction and vocabulary support', color: 'teal', icon: 'T', version: '2.1.0', checkoutUrl: '' },
     { id: 'arzillibus', name: 'Arzillibus', desc: 'Smart ticketing system for events and venue management', color: 'purple', icon: 'A', version: '1.4.0', checkoutUrl: '' },
@@ -141,7 +148,11 @@
             <h3 class="app-card-name">{app.name}</h3>
             <p class="app-card-desc">{app.desc}</p>
             <div class="app-card-footer">
-              <span class="app-card-version">v{catalogVersionById[app.id] ?? app.version}</span>
+              {#if (catalogVersionById[app.id] ?? app.version)}
+                <span class="app-card-version">v{catalogVersionById[app.id] ?? app.version}</span>
+              {:else}
+                <span class="app-card-version"></span>
+              {/if}
               {#if app.id === 'orchestrator'}
                 {#if orchState.status === 'installed'}
                   <button class="btn-3d btn-3d-ghost btn-3d-sm" onclick={(e) => { e.stopPropagation(); ui.openMcpDashboard(); }}>
