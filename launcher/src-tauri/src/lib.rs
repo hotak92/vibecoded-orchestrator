@@ -18,8 +18,102 @@ use state::{AppManager, ProjectState, ProjectStore};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+// ---------------------------------------------------------------------------
+// PR-28 (Group G, v0.2.12) — install-time CLI subcommands
+// ---------------------------------------------------------------------------
+//
+// The launcher binary doubles as a CLI tool for headless install flows.
+// install.py's interactive storage prompt shells out here to persist a
+// storage decision without spinning up the Tauri GUI / system tray.
+//
+// Contract: when `handle_cli_args()` returns `Some(exit_code)` we exit
+// immediately. The GUI startup path is gated on `None`. This MUST stay
+// gated before `tauri::Builder::default()` so a `--set-storage-config`
+// invocation in CI / install.py never tries to materialize a window.
+//
+// Manual arg parsing (no clap dep at this commit). Group B's PR-23 may
+// land its own arg parser later; merge contract: extend the `match`
+// arm in `handle_cli_args()`, do NOT replace the subcommand dispatch
+// table wholesale.
+fn handle_cli_args() -> Option<i32> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 2 {
+        return None;
+    }
+    match args[1].as_str() {
+        "--set-storage-config" => Some(handle_set_storage_config_cli(&args[2..])),
+        _ => None,
+    }
+}
+
+/// `vct-launcher --set-storage-config <named|bind|deferred>
+///                  [--bind-path service=path]...`
+///
+/// Exit codes:
+///   0 — config persisted (or `deferred` no-op).
+///   1 — validation / I/O error (printed to stderr).
+///   2 — usage error (missing mode arg).
+fn handle_set_storage_config_cli(rest: &[String]) -> i32 {
+    if rest.is_empty() {
+        eprintln!(
+            "usage: vct-launcher --set-storage-config <named|bind|deferred> \
+             [--bind-path service=path]..."
+        );
+        return 2;
+    }
+    let mode = &rest[0];
+    let mut bind_paths: Vec<(String, std::path::PathBuf)> = Vec::new();
+    let mut i = 1;
+    while i < rest.len() {
+        if rest[i] == "--bind-path" && i + 1 < rest.len() {
+            // Format: `service=/abs/path`. Anything malformed is logged
+            // + skipped — the helper's normalizer will reject the call
+            // if no valid path survives.
+            if let Some((service, path)) = rest[i + 1].split_once('=') {
+                let s = service.trim();
+                let p = path.trim();
+                if s.is_empty() || p.is_empty() {
+                    eprintln!(
+                        "[vct] warning: --bind-path arg {:?} has empty service or path; \
+                         skipping",
+                        rest[i + 1]
+                    );
+                } else {
+                    bind_paths.push((s.to_string(), std::path::PathBuf::from(p)));
+                }
+            } else {
+                eprintln!(
+                    "[vct] warning: --bind-path arg {:?} missing `=`; expected \
+                     `service=/abs/path` — skipping",
+                    rest[i + 1]
+                );
+            }
+            i += 2;
+        } else if rest[i] == "--bind-path" {
+            eprintln!("[vct] warning: --bind-path missing value; ignoring trailing flag");
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+    match commands::storage_ux::set_storage_config_from_cli(mode, bind_paths) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            1
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // PR-28: CLI subcommand dispatch BEFORE Tauri builder. Exits the
+    // process if a subcommand matched; falls through to the GUI path
+    // when args[1] is absent or unrecognised.
+    if let Some(exit_code) = handle_cli_args() {
+        std::process::exit(exit_code);
+    }
+
     let _initial_registry = registry::load_service_registry();
 
     let app_manager = AppManager(Mutex::new(HashMap::new()));

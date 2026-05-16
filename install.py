@@ -1507,6 +1507,313 @@ def _run_lightweight(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# PR-28 (Group G, v0.2.12) — install-time storage-location prompt
+# ---------------------------------------------------------------------------
+#
+# Users running install.py from the CLI (without the launcher GUI) previously
+# got NO chance to point the orchestrator at pre-existing volume data on the
+# host. Default behaviour creates fresh named volumes; a user with 110 GB of
+# Ollama models at ~/podman_volumes/ollama/models would see their containers
+# come up empty and only notice when `ollama list` returns nothing from
+# inside the new container.
+#
+# The prompt is gated by:
+#   - --quiet / --yes / non-TTY stdin → silent default (mode='deferred').
+#   - EOF on stdin during the prompt → treated as 'deferred' (don't abort).
+#   - No legacy paths detected → silent default ('named').
+#
+# The persistence call shells out to `vct-launcher --set-storage-config ...`
+# when the bundled launcher binary is locatable. Falls through to a direct
+# Python write of `~/.vct/storage.toml` otherwise (sufficient for fresh
+# installs where the launcher hasn't been built / extracted yet).
+
+# Logical-service → list of candidate host paths to probe. Order matters:
+# the first existing path wins. Mirrors the surface area covered by
+# launcher/src-tauri/src/commands/storage_ux.rs::detect_legacy_volumes_inner
+# but operates on the FILESYSTEM rather than `podman volume ls`, because at
+# install time we don't necessarily have a runtime up yet AND the user may
+# have data sitting in a bind-mount directory that no current container
+# references.
+_LEGACY_VOLUME_PROBES: dict[str, tuple[str, ...]] = {
+    # Most common: shared with a sibling-project co-install pattern where
+    # both orchestrators point Ollama at a single host-side directory to
+    # avoid duplicating multi-GB model caches.
+    "ollama": (
+        "~/podman_volumes/ollama/models",
+        "~/.local/share/containers/storage/volumes/ollama_claude/_data",
+        "~/.local/share/containers/storage/volumes/ollama_data/_data",
+    ),
+    "code_embed": (
+        "~/podman_volumes/code_embed_cache",
+        "~/.local/share/containers/storage/volumes/code_embed_cache/_data",
+    ),
+    "weaviate": (
+        "~/podman_volumes/weaviate_claude",
+        "~/.local/share/containers/storage/volumes/weaviate_data/_data",
+    ),
+}
+
+
+def _detect_legacy_volume_paths() -> dict[str, str]:
+    """Probe well-known host-side paths for pre-existing service data.
+
+    Returns a `{service: absolute_path}` map for every probe that resolves
+    to an existing non-empty directory. Empty map when nothing is found.
+
+    Windows hosts typically have nothing under `~/podman_volumes/` (Docker
+    Desktop / Podman Desktop manage volumes via Hyper-V VHDs), so this
+    function naturally returns `{}` on Windows and the install proceeds
+    with the silent default. macOS hosts that ran a previous orchestrator
+    via Podman Desktop may have entries under `~/.local/share/containers/`.
+    """
+    detected: dict[str, str] = {}
+    for service, candidates in _LEGACY_VOLUME_PROBES.items():
+        for raw in candidates:
+            try:
+                resolved = Path(raw).expanduser()
+            except (RuntimeError, OSError):
+                # `Path.expanduser()` raises on a hostile $HOME — skip.
+                continue
+            if not resolved.is_dir():
+                continue
+            # Skip empty directories: they were probably created by a prior
+            # install attempt that never landed any data. We only want to
+            # surface volumes the user actually has STUFF in.
+            try:
+                first = next(resolved.iterdir(), None)
+            except (PermissionError, OSError):
+                continue
+            if first is None:
+                continue
+            detected[service] = str(resolved)
+            break
+    return detected
+
+
+def _dir_size_human(path: str) -> str:
+    """Best-effort human-readable directory size. Soft-fail on permission
+    errors; the user just sees "(size unavailable)" next to the path."""
+    try:
+        root = Path(path)
+        if not root.is_dir():
+            return "(not a directory)"
+        total = 0
+        for child in root.rglob("*"):
+            try:
+                if child.is_file() and not child.is_symlink():
+                    total += child.stat().st_size
+            except (PermissionError, OSError):
+                continue
+            # Cap at ~50K files to keep the prompt snappy on huge model
+            # caches; the human-readable label is just a hint, not an
+            # exact accounting.
+        if total <= 0:
+            return "(empty)"
+        units = ["B", "KB", "MB", "GB", "TB"]
+        idx = 0
+        scaled = float(total)
+        while scaled >= 1024.0 and idx < len(units) - 1:
+            scaled /= 1024.0
+            idx += 1
+        return f"{scaled:.1f} {units[idx]}"
+    except (PermissionError, OSError):
+        return "(size unavailable)"
+
+
+def _resolve_launcher_binary_for_storage(install_root: Path) -> Path | None:
+    """Locate the bundled launcher binary for shell-out persistence.
+
+    Mirrors the convention used by `_resolve_vendored_lean_ctx` —
+    `launcher/dist/<arch>/vct-launcher[.exe]`. Returns None when no
+    binary is present (fresh source-tree install, dev builds without a
+    bundled binary). The caller falls back to a direct Python write of
+    `~/.vct/storage.toml` in that case.
+
+    Group B's PR-23 introduces a richer 4-tier resolver
+    (`_resolve_launcher_binary`) that probes additional locations
+    (`~/.cargo/bin`, repo `target/`, etc.). When that lands, this
+    minimal helper can be replaced — or kept as the install-time
+    fallback. The two are intentionally independent so PR-28 lands
+    without depending on Group B's merge timing.
+    """
+    os_name = platform.system()
+    if os_name == "Windows":
+        arch_dir = "windows-x64"
+        bin_name = "vct-launcher.exe"
+    elif os_name == "Darwin":
+        arch_dir = "experimental_macOS"
+        bin_name = "vct-launcher"
+    elif os_name == "Linux":
+        arch_dir = "linux-x64"
+        bin_name = "vct-launcher"
+    else:
+        return None
+    candidate = install_root / "launcher" / "dist" / arch_dir / bin_name
+    if candidate.is_file():
+        return candidate
+    return None
+
+
+def _vct_state_dir() -> Path:
+    """Resolve `~/.vct/` honouring VCT_STATE_DIR (mirrors the Rust path
+    resolver in `launcher/src-tauri/src/paths.rs::vct_root_dir`). The
+    Python fallback writes storage.toml directly into this directory."""
+    custom = os.environ.get("VCT_STATE_DIR", "").strip()
+    if custom:
+        return Path(custom)
+    return Path.home() / ".vct"
+
+
+def _write_storage_toml_direct(choice: dict) -> Path:
+    """Python fallback when no launcher binary is on disk.
+
+    Schema mirrors `launcher/src-tauri/src/commands/storage_ux.rs::StorageConfig`:
+        mode = "named" | "bind"
+        bind_root = ""
+        [per_service_paths]
+        ollama = "/abs/path"
+        ...
+        [external_aliases]
+    Atomic write (write to .tmp + rename) so a SIGTERM mid-write doesn't
+    leave a half-formed TOML.
+    """
+    mode = choice.get("mode", "named")
+    bind_paths: dict[str, str] = choice.get("bind_paths", {}) or {}
+    state_dir = _vct_state_dir()
+    state_dir.mkdir(parents=True, exist_ok=True)
+    target = state_dir / "storage.toml"
+
+    lines: list[str] = []
+    lines.append(f'mode = "{mode}"')
+    lines.append('bind_root = ""')
+    lines.append("")
+    lines.append("[per_service_paths]")
+    if mode == "bind" and bind_paths:
+        # Sort for stable output (matches the Rust BTreeMap renderer).
+        for service in sorted(bind_paths):
+            path_norm = bind_paths[service].replace("\\", "/")
+            # Escape embedded quotes; TOML basic strings reject them.
+            path_safe = path_norm.replace('"', '\\"')
+            lines.append(f'{service} = "{path_safe}"')
+    lines.append("")
+    lines.append("[external_aliases]")
+    body = "\n".join(lines) + "\n"
+
+    tmp = target.with_suffix(".toml.tmp")
+    tmp.write_text(body, encoding="utf-8")
+    tmp.replace(target)
+    return target
+
+
+def _prompt_storage_location(
+    install_root: Path,
+    args: argparse.Namespace,
+    *,
+    input_fn=input,
+    stdin_isatty=None,
+    detect_fn=None,
+) -> dict:
+    """Prompt for storage layout at install time.
+
+    Returns a dict shaped like:
+        {"mode": "named" | "bind" | "deferred", "bind_paths": {...}}
+
+    - "deferred" → install.py should leave `~/.vct/storage.toml` untouched
+      and let the user configure storage via the launcher GUI later.
+    - "named"   → fresh named volumes (the legacy default behaviour).
+    - "bind"    → bind-mount the auto-detected legacy paths.
+
+    Non-interactive contracts:
+      - `--quiet`, `--yes`, or non-TTY stdin → return 'deferred' silently.
+      - EOF on stdin during the prompt → return 'deferred'.
+      - Detected nothing → return 'named' silently (no legacy data to
+        surface; the default is the right answer).
+
+    `input_fn`, `stdin_isatty`, and `detect_fn` are test seams; production
+    callers pass the defaults.
+    """
+    is_quiet = bool(getattr(args, "quiet", False))
+    is_yes = bool(getattr(args, "yes", False))
+    if stdin_isatty is None:
+        try:
+            tty = sys.stdin.isatty()
+        except (ValueError, OSError):
+            tty = False
+    else:
+        tty = bool(stdin_isatty)
+
+    if is_quiet or is_yes or not tty:
+        return {"mode": "deferred", "bind_paths": {}}
+
+    legacy_paths = (detect_fn or _detect_legacy_volume_paths)()
+    if not legacy_paths:
+        # No legacy data to worry about — silently default to named volumes.
+        return {"mode": "named", "bind_paths": {}}
+
+    print()
+    print("=== Storage configuration ===")
+    print("Detected pre-existing volume data on this machine:")
+    for service in sorted(legacy_paths):
+        path = legacy_paths[service]
+        size = _dir_size_human(path)
+        print(f"  - {service}: {path} ({size})")
+    print()
+    print("How should the orchestrator use this data?")
+    print("  (1) Bind-mount the existing paths (recommended if you have models/data)")
+    print("  (2) Use fresh named volumes (start clean; existing data preserved on disk)")
+    print("  (3) Configure later via the launcher GUI's Storage Settings")
+    print()
+    try:
+        raw = input_fn("Choice [1/2/3, default=3]: ")
+    except (EOFError, KeyboardInterrupt):
+        # User Ctrl+D / Ctrl+C'd — treat as deferred. Do NOT abort the
+        # install; the prompt is opt-in UX, not a blocker.
+        print("\n  (no answer — deferring storage configuration to the launcher)")
+        return {"mode": "deferred", "bind_paths": {}}
+    choice = (raw or "").strip() or "3"
+
+    if choice == "1":
+        return {"mode": "bind", "bind_paths": legacy_paths}
+    if choice == "2":
+        return {"mode": "named", "bind_paths": {}}
+    return {"mode": "deferred", "bind_paths": {}}
+
+
+def _persist_storage_choice(choice: dict, install_root: Path) -> str:
+    """Persist the user's storage choice. Returns a short description of
+    which path was used ('launcher-cli' or 'python-fallback' or 'deferred').
+    Soft-fail throughout — never abort install over a missed write."""
+    if choice.get("mode") == "deferred":
+        return "deferred"
+
+    binary = _resolve_launcher_binary_for_storage(install_root)
+    if binary is not None:
+        cmd: list[str] = [str(binary), "--set-storage-config", choice["mode"]]
+        for service, path in (choice.get("bind_paths") or {}).items():
+            cmd.extend(["--bind-path", f"{service}={path}"])
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode == 0:
+                return "launcher-cli"
+            print(
+                f"  [storage] warning: launcher CLI exited {result.returncode}: "
+                f"{(result.stderr or '').strip()}"
+            )
+            # Fall through to Python fallback so we still record the user's
+            # decision even if the launcher binary is broken.
+        except (subprocess.SubprocessError, OSError) as e:
+            print(f"  [storage] warning: launcher CLI failed: {e}")
+
+    try:
+        target = _write_storage_toml_direct(choice)
+        print(f"  [storage] wrote {target}")
+        return "python-fallback"
+    except (OSError, ValueError) as e:
+        print(f"  [storage] warning: could not write storage.toml: {e}")
+        return "failed"
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1853,6 +2160,23 @@ def main() -> int:
     # Step 3: Determine embedding configuration
     embed_config = _choose_embedding_config(sysinfo, args)
     print(f"\n  Embedding mode: {embed_config['description']}")
+
+    # Step 3b (PR-28, Group G, v0.2.12): storage-location prompt. Runs
+    # BEFORE the container-runtime detection so a user with 110 GB of
+    # legacy Ollama models doesn't end up with empty named volumes after
+    # `_start_services`. Silently skipped on --quiet / --yes / non-TTY
+    # stdin / when no legacy data is detected. Result persisted via the
+    # launcher binary CLI (preferred) or a direct Python write of
+    # ~/.vct/storage.toml (fallback). See
+    # `.claude/context/volume-binding-fix-2026-05-16.md` for the silent-
+    # data-loss footgun this closes.
+    _storage_choice = _prompt_storage_location(PROJECT_ROOT, args)
+    if _storage_choice.get("mode") != "deferred":
+        _persist_storage_choice(_storage_choice, PROJECT_ROOT)
+        _record_install_choice(
+            "storage_mode", _storage_choice["mode"],
+            {"bind_paths": list((_storage_choice.get("bind_paths") or {}).keys())},
+        )
 
     # Step 4: Create virtual environment
     venv_python = _create_venv(PROJECT_ROOT)
