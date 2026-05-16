@@ -853,38 +853,36 @@ mod tests {
     }
 
     #[test]
-    fn bundled_search_manifest_declares_github_pat_shared_not_uppercase_global() {
+    fn bundled_search_manifest_does_not_declare_github_pat_post_v0_2_11() {
+        // PR-14a (v0.2.11) dropped `search_code` from the search MCP
+        // (redundant with Claude's native WebSearch + site:github.com).
+        // PR-14b removed `github_pat` from vct-search.json's secrets
+        // list because no surviving search-MCP tool needs it.
+        //
+        // Regression guard: if a future PR re-introduces a `github_pat`
+        // secret declaration in vct-search.json (or the uppercase
+        // legacy `GITHUB_TOKEN` shape), fail loudly — the search MCP
+        // no longer has a GitHub-querying tool that would consume it,
+        // so the secret would be requested from the user for nothing.
+        //
+        // (`github_pat` is still legitimately requested by the
+        // OnboardingWizard `register_github_pat` flow for git-push
+        // auth + other modules; this test only asserts that the
+        // search MCP doesn't claim it.)
         let path = bundled_search_manifest_path();
         let raw = std::fs::read_to_string(&path).expect("read vct-search.json");
         let parsed = ModuleManifest::from_json(&raw).expect("parse vct-search.json");
 
-        // The wrapper at claude_mcp_servers/search_mcp/wrapper.sh queries
-        // the resolver for `github_pat` (lowercase, scope=shared). The
-        // manifest MUST declare it under that exact key+scope or the hub's
-        // `project_env` endpoint will never resolve it from the keychain
-        // and the resolver will return exit 4 (`key_not_active`).
-        let github = parsed
-            .secrets
-            .iter()
-            .find(|s| s.key == "github_pat")
-            .expect(
-                "vct-search.json must declare a `github_pat` secret. Found keys: \
-                 see env_from_secrets / wrapper.sh — the wrapper resolves \
-                 `github_pat` (lowercase) shared, NOT GITHUB_TOKEN uppercase",
-            );
-        assert_eq!(
-            github.scope, "shared",
-            "github_pat MUST be scope=shared (matches ~/.vct-secrets/shared/github_pat \
-             and OnboardingWizard's register_github_pat); got {:?}",
-            github.scope
+        assert!(
+            !parsed.secrets.iter().any(|s| s.key == "github_pat"),
+            "vct-search.json must NOT declare a `github_pat` secret in v0.2.11+ \
+             (search_code tool dropped — no consumer left). If you re-added a \
+             GitHub-querying tool, document why this guard is being inverted."
         );
-
-        // Belt-and-suspenders: the legacy uppercase key shape would break
-        // the resolver path. Fail loudly if anyone re-introduces it.
         assert!(
             !parsed.secrets.iter().any(|s| s.key == "GITHUB_TOKEN"),
             "vct-search.json must NOT re-declare GITHUB_TOKEN (legacy uppercase) — \
-             wrapper.sh resolves `github_pat` and renames the env var itself"
+             search MCP no longer queries GitHub at all in v0.2.11+."
         );
     }
 

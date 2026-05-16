@@ -361,8 +361,8 @@ def test_no_uncovered_pretooluse_hooks() -> None:
     silently broken on the LLM-context path. Force a triage decision
     when a new one lands.
     """
-    # Hooks confirmed NOT to emit LLM-bound stdout. Added when reviewing
-    # PreToolUse hooks for envelope correctness.
+    # Hooks confirmed NOT to emit LLM-bound stdout from the wrapper itself.
+    # Added when reviewing PreToolUse hooks for envelope correctness.
     EXEMPT_NO_LLM_OUTPUT = {
         # Token-leak guard: rejects vercel CLI invocations with --token=...
         # via exit 2 + stderr. Stderr from blocked actions reaches LLM
@@ -370,6 +370,15 @@ def test_no_uncovered_pretooluse_hooks() -> None:
         # required.
         "pre-vercel-token-guard.sh",
         "pre-vercel-token-guard.ps1",
+        # lean-ctx rewrite shims (PR-1, v0.2.11): the .sh / .ps1 are
+        # thin wrappers that `exec lean-ctx hook rewrite`. The JSON
+        # envelope (hookSpecificOutput.updatedInput.command) is produced
+        # by the lean-ctx binary itself, not by the wrapper file —
+        # so the wrapper file legitimately doesn't contain the
+        # envelope-text invariants this test checks for. Envelope
+        # correctness is the lean-ctx upstream project's responsibility.
+        "lean-ctx-rewrite.sh",
+        "lean-ctx-rewrite.ps1",
     }
 
     registered = _read_settings_template_pretooluse_hooks()
