@@ -338,20 +338,16 @@ _filter_seen() {
     echo "$filtered"
 }
 
-# === Cache replay: if we have a cache hit, dedup it against the current
-# seen-list and emit. If everything in the cache is already seen, exit
-# silently (don't re-inject). The cache stores RAW per-result blocks
-# (KG:/CODE: headers) so this filter pass is meaningful.
-if [[ "$CACHE_HIT" == "1" ]]; then
-    FILTERED_CACHE=$(_filter_seen "$CACHE_BLOB")
-    TRIMMED=$(printf '%s' "$FILTERED_CACHE" | sed -e 's/^[[:space:]]*$//' | tr -d '\n')
-    if [[ -z "$TRIMMED" ]]; then
-        exit 0
-    fi
-    OUTPUT="[Pre-edit context for ${BASENAME}]:"$'\n'$'\n'"${FILTERED_CACHE}"
-    _emit_context_json "$OUTPUT"
-    exit 0
-fi
+# Cache-replay branch removed in v0.2.12 PR-35 — the CACHE_HIT and
+# CACHE_BLOB variables this branch depended on were never set anywhere
+# in the codebase, making the entire branch unreachable. (The functional
+# cache hit path is the inline `if [[ -f "$CACHE_FILE" ]]` block earlier
+# in this file, which exits 0 after emitting the cached blob directly.)
+# If a future caching layer wants the dedup-on-replay behaviour the
+# removed branch implemented, restore via git revert. The .ps1 sibling
+# does NOT have this dead-code problem — it sets $CacheHit/$CacheBlob on
+# its own lines 139-148 and the cache-replay branch there is live (and
+# covered by tests/test_hook_ps1_body_parity.py::test_pre_edit_context_inject_ps1_cache_replay_runs_dedup).
 
 # Capture raw producer output (pre-dedup) for the cache. Caching post-dedup
 # would perma-suppress titles seen at write-time but eligible to re-appear
