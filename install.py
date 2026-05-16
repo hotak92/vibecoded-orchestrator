@@ -1747,6 +1747,13 @@ def main() -> int:
                              "(SearXNG removed from default stack, Ollama MCP removed, "
                              "search MCP env simplified). Use after you have manually "
                              "cleaned up these remnants.")
+    parser.add_argument("--skip-mcp-registration", action="store_true",
+                        default=False,
+                        help="Skip PR-23 (v0.2.12) MCP-server registration to "
+                             "~/.claude.json. Use only for advanced cases where "
+                             "you manage ~/.claude.json mcpServers entries "
+                             "outside the installer (multi-stack adoption, "
+                             "containerised deployment, etc.).")
     args = parser.parse_args()
 
     # v0.2.6 Bug C1 — `--desktop-icon-only` short-circuits: run JUST the
@@ -2247,6 +2254,27 @@ def main() -> int:
         _check_searxng_remnants(PROJECT_ROOT, _deferral_report)
         _check_ollama_mcp_remnants(_deferral_report)
         _check_search_mcp_env_obsolete(_deferral_report)
+
+    # PR-23 (v0.2.12, 2026-05-16): register bundled MCP entries into
+    # ~/.claude.json. Pre-PR-23 install.py performed ZERO MCP registration,
+    # so fresh v0.2.11 installs left Claude Code with no orchestrator MCPs
+    # wired at all. Soft-fail throughout — install must complete even when
+    # MCP registration fully fails. See module docstring of `_register_mcps`
+    # for the 4-tier launcher-binary resolution strategy and the
+    # security-boundary rationale for the env-key allowlist.
+    if not getattr(args, "skip_mcp_registration", False):
+        try:
+            _register_mcps(PROJECT_ROOT, _deferral_report)
+        except Exception as exc:  # noqa: BLE001 — soft-fail by design
+            print(
+                f"  MCP registration raised unexpectedly: {exc}. "
+                "Install will complete; re-run `python install.py --update` to retry.",
+                file=sys.stderr,
+            )
+            _log_install_event(
+                "register_mcps", "error",
+                f"unexpected exception: {exc}",
+            )
 
     # v0.2.10 (Bug L2): auto-materialize the boot service so containers
     # come back up after a reboot without manual intervention. Cross-OS:
@@ -7057,6 +7085,793 @@ def _check_search_mcp_env_obsolete(
             "search_mcp_env_check", "warn",
             f"could not check search MCP env remnants: {exc}",
         )
+
+
+# ---------------------------------------------------------------------------
+# PR-23 (v0.2.12, 2026-05-16): default-MCP registration into ~/.claude.json
+#
+# Audit reference: .claude/context/mcp-install-pipeline-audit-2026-05-16.md
+#
+# Pre-PR-23 install.py performed zero MCP registration. Result: fresh
+# v0.2.11 installs left ~/.claude.json with no bundled MCP servers wired
+# at all → Claude Code couldn't see the orchestrator. The Rust
+# `mcp_registration::register_mcp` helper existed and was tested, but no
+# install code path invoked it.
+#
+# Architecture (FINALIZED 2026-05-16):
+#   - The launcher binary is the single writer of both ~/.claude.json
+#     AND the project_mcp_servers DB table.
+#   - install.py shells out to a CLI subcommand on the launcher:
+#       `<binary> --register-default-mcps <install_root>`
+#   - 4-tier launcher-binary resolution:
+#       1. Bundled binary at `launcher/dist/<os>-<arch>/vct-launcher`.
+#       2. Download from GitHub Releases matching the current version.
+#       3. Rebuild via `cargo tauri build` (slow LAST resort).
+#       4. Pure-Python JSON merge (always succeeds at writing JSON;
+#          launcher DB stays empty until the user opens the GUI and
+#          project_state_populate picks up the JSON entries).
+#
+# Security boundary: `~/.claude.json` is readable by every process running
+# as the user. Therefore secret-shaped env keys (TOKEN, SECRET, PAT,
+# PASSWORD, AUTH, *_KEY) are silently dropped from any written entry, AND
+# per-project keys (KG_COLLECTION, PROJECT_NAME, etc.) are NEVER written —
+# those live in each project's .claude/settings.json env (launcher-managed)
+# instead. Empirical verification 2026-05-16: SD15's MCP subprocess at
+# PID 104741 picked up its KG_COLLECTION from .claude/settings.json env,
+# confirming the per-project env channel is sufficient.
+# ---------------------------------------------------------------------------
+
+# Env-key allowlist for ~/.claude.json mcpServers.*.env. MUST stay in sync
+# with launcher/src-tauri/src/mcp_registration.rs::ALLOWED_ENV_KEYS.
+_ALLOWED_GLOBAL_ENV_KEYS = (
+    "WEAVIATE_URL",
+    "OLLAMA_URL",
+    "GRPC_PORT",
+    "PYTHONPATH",
+    "RL_SERVER_URL",
+    "ACTIVE_EMBEDDING",
+    "EMBEDDING_MODEL",
+    "CODE_EMBED_SERVICE_URL",
+)
+
+# Patterns that MUST be silently dropped (secrets). Case-insensitive
+# substring match for the "contains" group; plus the explicit `_KEY` /
+# `KEY` rule for the suffix group. Mirrors mcp_registration.rs.
+_SECRET_SHAPED_SUBSTRINGS = (
+    "TOKEN", "SECRET", "PAT", "PASSWORD", "PASS", "AUTH",
+)
+
+
+def _is_secret_shaped_env_key(key: str) -> bool:
+    """True iff `key` looks like a credential. See module docstring.
+
+    Matches secret substrings as TOKENS within ``[_\\-]``-delimited
+    env-key parts. Avoids false positives like ``PYTHONPATH`` matching
+    ``PAT`` or ``COMPASS`` matching ``PASS``. The keys we care about
+    (``GITHUB_TOKEN``, ``DB_PASS``, ``MY_PAT``, ``AUTH_HEADER``, etc.)
+    all have the secret token as a distinct segment between underscores
+    or at the boundary of the string.
+    """
+    upper = key.upper()
+    # Split on `_` and `-` (the two common env-key segment separators).
+    parts = re.split(r"[_\-]+", upper)
+    for needle in _SECRET_SHAPED_SUBSTRINGS:
+        if needle in parts:
+            return True
+    # Trailing `_KEY` and exact `KEY` rules (catch STRIPE_KEY etc.).
+    if upper == "KEY" or upper.endswith("_KEY"):
+        return True
+    return False
+
+
+def _filter_env_for_global_json(candidate: dict) -> tuple[dict, list[str]]:
+    """Return (safe_env, dropped_keys). Mirrors Rust filter_env_for_global_json."""
+    safe = {}
+    dropped = []
+    for k, v in candidate.items():
+        if _is_secret_shaped_env_key(k):
+            dropped.append(k)
+            continue
+        if k not in _ALLOWED_GLOBAL_ENV_KEYS:
+            dropped.append(k)
+            continue
+        safe[k] = v
+    return safe, dropped
+
+
+def _resolve_venv_python_for_install(install_root: Path) -> Optional[Path]:
+    """Locate the Python interpreter inside the install's venv.
+
+    Tries the canonical modern layout `<root>/.venv` first, then the legacy
+    `<root>/claude_mcp_servers/.venv`. Returns None if neither exists; the
+    caller treats that as a soft-fail and proceeds to the Python fallback.
+    """
+    sub = "Scripts" if platform.system().lower().startswith("win") else "bin"
+    py_name = "python.exe" if platform.system().lower().startswith("win") else "python"
+    candidates = [
+        install_root / ".venv" / sub / py_name,
+        install_root / "claude_mcp_servers" / ".venv" / sub / py_name,
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return None
+
+
+def _launcher_binary_relative_path() -> tuple[str, str]:
+    """Return (subdir, filename) for the bundled launcher binary on this OS.
+
+    Linux: ('linux-x64', 'vct-launcher')
+    macOS: ('experimental_macOS', 'vct-launcher')   ← matches launcher/dist/ layout
+    Windows: ('windows-x64', 'vct-launcher.exe')
+    """
+    system = platform.system().lower()
+    if system.startswith("win"):
+        return ("windows-x64", "vct-launcher.exe")
+    if system == "darwin":
+        return ("experimental_macOS", "vct-launcher")
+    # Linux + everything else
+    return ("linux-x64", "vct-launcher")
+
+
+def _try_bundled_launcher_binary(install_root: Path) -> Optional[Path]:
+    """Tier 1: bundled binary at launcher/dist/<os>-<arch>/vct-launcher[.exe]."""
+    subdir, fname = _launcher_binary_relative_path()
+    p = install_root / "launcher" / "dist" / subdir / fname
+    if p.is_file() and os.access(p, os.X_OK if not platform.system().lower().startswith("win") else os.F_OK):
+        return p
+    return None
+
+
+def _read_launcher_version(install_root: Path) -> Optional[str]:
+    """Parse `version = "0.2.x"` out of launcher/src-tauri/Cargo.toml. None on failure."""
+    cargo = install_root / "launcher" / "src-tauri" / "Cargo.toml"
+    if not cargo.is_file():
+        return None
+    try:
+        for line in cargo.read_text(encoding="utf-8").splitlines()[:30]:
+            line = line.strip()
+            if line.startswith("version"):
+                # version = "0.2.11"
+                parts = line.split("=", 1)
+                if len(parts) == 2:
+                    raw = parts[1].strip().strip('"').strip("'")
+                    if raw:
+                        return raw
+    except OSError:
+        return None
+    return None
+
+
+def _try_download_launcher_binary(install_root: Path) -> Optional[Path]:
+    """Tier 2: download matching release artifact from GitHub Releases.
+
+    Uses `gh` CLI if available (handles auth + redirects cleanly); falls
+    back to `curl -L` if `gh` is missing. Soft-fail on every error
+    (network down, release missing, auth refused, etc.) — returns None
+    and lets the caller move to Tier 3.
+
+    The downloaded ZIP is extracted to a tempdir; only the binary is
+    moved into place at `launcher/dist/<os>-<arch>/`.
+    """
+    version = _read_launcher_version(install_root)
+    if not version:
+        return None
+    subdir, fname = _launcher_binary_relative_path()
+    target_dir = install_root / "launcher" / "dist" / subdir
+    target_path = target_dir / fname
+    # Release artifact naming convention (see .github/workflows/release.yml +
+    # the public-release pattern documented in CLAUDE.md "Release process").
+    # Pattern: vibecoded-orchestrator-<version>-<os>-<arch>.zip
+    # Confirmed from v0.2.11 release assets (gh release view v0.2.11):
+    #   linux-x64.zip, macos-arm64.zip, windows-x64.zip
+    # Intel Macs (x86_64) are intentionally NOT shipped (see
+    # .github/workflows/release.yml line 31). macos-x64 download will
+    # 404 — those users fall through to tier 3 (cargo rebuild).
+    os_arch_token = {
+        "linux-x64": "linux-x64",
+        "windows-x64": "windows-x64",
+        "experimental_macOS": "macos-arm64",
+    }.get(subdir, subdir)
+    artifact = f"vibecoded-orchestrator-{version}-{os_arch_token}.zip"
+    inner_root = f"vibecoded-orchestrator-{version}-{os_arch_token}"
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="vct-launcher-dl-"))
+    try:
+        zip_path = tmpdir / artifact
+        # Prefer gh; fall back to curl.
+        if shutil.which("gh"):
+            cmd = [
+                "gh", "release", "download", f"v{version}",
+                "--repo", "hotak92/vibecoded-orchestrator",
+                "--pattern", artifact,
+                "--dir", str(tmpdir),
+            ]
+            try:
+                result = subprocess.run(
+                    cmd, capture_output=True, timeout=60, text=True
+                )
+                if result.returncode != 0:
+                    return None
+            except (subprocess.SubprocessError, OSError):
+                return None
+        elif shutil.which("curl"):
+            url = (
+                f"https://github.com/hotak92/vibecoded-orchestrator/"
+                f"releases/download/v{version}/{artifact}"
+            )
+            try:
+                result = subprocess.run(
+                    ["curl", "-fsSL", "-o", str(zip_path), url],
+                    capture_output=True, timeout=60, text=True,
+                )
+                if result.returncode != 0:
+                    return None
+            except (subprocess.SubprocessError, OSError):
+                return None
+        else:
+            return None
+        if not zip_path.is_file():
+            return None
+        # Extract just the binary.
+        import zipfile  # stdlib — defer import to avoid startup cost.
+        try:
+            with zipfile.ZipFile(zip_path) as z:
+                inner = f"{inner_root}/vct-launcher" + (
+                    ".exe" if platform.system().lower().startswith("win") else ""
+                )
+                # Find the binary inside the zip regardless of inner path
+                # (release ZIPs vary; tolerate both flat + nested layouts).
+                candidates = [n for n in z.namelist()
+                              if n.endswith("vct-launcher") or n.endswith("vct-launcher.exe")]
+                if not candidates:
+                    return None
+                member = inner if inner in z.namelist() else candidates[0]
+                with z.open(member) as src:
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    with open(target_path, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+        except (zipfile.BadZipFile, OSError, KeyError):
+            return None
+        # Make executable on Unix.
+        if not platform.system().lower().startswith("win"):
+            try:
+                target_path.chmod(0o755)
+            except OSError:
+                pass
+        if target_path.is_file():
+            return target_path
+        return None
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _try_cargo_tauri_build(install_root: Path) -> Optional[Path]:
+    """Tier 3 (LAST RESORT): rebuild via `cargo tauri build`.
+
+    Slow (15-25 min on a typical dev machine). Only attempts the build
+    if `cargo` AND `rustc` are both on PATH. Soft-fail on every error.
+
+    Note: this function does NOT actually run the build in normal install
+    flows — install.py defers to the bundled binary or download path
+    above. We still ship this code path for users running install.py
+    from a source checkout on a machine without bundled binaries (CI
+    builders, contributor workflows). The orchestrator's central cargo
+    verify is the discipline for ensuring this code path stays compilable.
+    """
+    if not shutil.which("cargo") or not shutil.which("rustc"):
+        return None
+    print(
+        "  Launcher binary not bundled and download failed.\n"
+        "  Falling back to `cargo tauri build` — this takes 15-25 minutes.\n"
+        "  Press Ctrl-C to abort and use the pure-Python fallback.",
+        flush=True,
+    )
+    launcher_dir = install_root / "launcher"
+    if not launcher_dir.is_dir():
+        return None
+    try:
+        result = subprocess.run(
+            ["cargo", "tauri", "build"],
+            cwd=str(launcher_dir),
+            capture_output=True,
+            timeout=1800,  # 30 min
+            text=True,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        print(f"  `cargo tauri build` failed: {exc}", file=sys.stderr)
+        return None
+    if result.returncode != 0:
+        print(
+            f"  `cargo tauri build` exited {result.returncode}; falling back.",
+            file=sys.stderr,
+        )
+        return None
+    # Copy the produced binary to launcher/dist/<os>-<arch>/.
+    subdir, fname = _launcher_binary_relative_path()
+    target_dir = install_root / "launcher" / "dist" / subdir
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_path = target_dir / fname
+    candidates = list((install_root / "launcher" / "src-tauri" / "target" / "release").glob("vct-launcher*"))
+    # Pick the actual binary (not .d / .pdb / etc.) — filter to executable
+    # files only.
+    src = None
+    for c in candidates:
+        if c.is_file() and (
+            c.suffix in ("", ".exe")
+            and not c.name.endswith(".d")
+            and not c.name.endswith(".pdb")
+        ):
+            src = c
+            break
+    if src is None:
+        return None
+    try:
+        shutil.copy2(src, target_path)
+        if not platform.system().lower().startswith("win"):
+            target_path.chmod(0o755)
+    except OSError:
+        return None
+    return target_path if target_path.is_file() else None
+
+
+def _ensure_launcher_binary(install_root: Path) -> Optional[Path]:
+    """Resolve launcher binary path via 4-tier priority.
+
+    1. Bundled binary at launcher/dist/<os>-<arch>/vct-launcher[.exe]
+       (preferred — normal user case).
+    2. Download from GitHub Releases (fast network fallback).
+    3. Rebuild via `cargo tauri build` (slow last resort).
+    4. Returns None — caller falls back to pure-Python JSON merge.
+
+    Soft-fail at every step. Prints progress messages so the user sees
+    what's happening without needing to read this code.
+    """
+    # Tier 1: bundled.
+    p = _try_bundled_launcher_binary(install_root)
+    if p is not None:
+        return p
+    print(
+        f"  Launcher binary not found at "
+        f"launcher/dist/{_launcher_binary_relative_path()[0]}/."
+    )
+
+    # Tier 2: download.
+    print("  Trying to download a matching release artifact from GitHub...")
+    p = _try_download_launcher_binary(install_root)
+    if p is not None:
+        print(f"  Downloaded launcher binary to {p}.")
+        return p
+    print("  Release download not available (no gh/curl, no network, or release artifact missing).")
+
+    # Tier 3: rebuild.
+    p = _try_cargo_tauri_build(install_root)
+    if p is not None:
+        print(f"  Rebuilt launcher binary at {p}.")
+        return p
+
+    # Tier 4: caller falls back to Python JSON path.
+    print(
+        "  Cannot rebuild: cargo or rustc not on PATH. "
+        "Falling back to pure-Python MCP registration."
+    )
+    return None
+
+
+def _build_python_mcp_entries(
+    install_root: Path,
+    venv_python: Path,
+    weaviate_port: int,
+    ollama_port: int,
+    grpc_port: int,
+    code_embed_port: int,
+) -> list[tuple[str, dict, list[str]]]:
+    """Pure-Python mirror of mcp_registration.rs::build_default_mcp_entries.
+
+    Returns a list of (name, entry_dict, dropped_keys). Each entry's `env`
+    field has already been filtered through the allowlist + secret-shape
+    denylist. The Rust path is the authoritative writer; this exists for
+    Tier 4 (pure-Python fallback).
+    """
+    weaviate_url = f"http://localhost:{weaviate_port}"
+    ollama_url = f"http://localhost:{ollama_port}"
+    code_embed_url = f"http://localhost:{code_embed_port}"
+    mcp_root = install_root / "claude_mcp_servers"
+    pythonpath = str(mcp_root)
+    venv_python_str = str(venv_python)
+
+    # weaviate-kg
+    weaviate_server = mcp_root / "weaviate_mcp" / "server.py"
+    weaviate_env_raw = {
+        "WEAVIATE_URL": weaviate_url,
+        "OLLAMA_URL": ollama_url,
+        "GRPC_PORT": str(grpc_port),
+        "PYTHONPATH": pythonpath,
+        "ACTIVE_EMBEDDING": "qwen3",
+        "EMBEDDING_MODEL": "qwen3-embedding:0.6b",
+        "CODE_EMBED_SERVICE_URL": code_embed_url,
+    }
+    weaviate_env, weaviate_dropped = _filter_env_for_global_json(weaviate_env_raw)
+    weaviate_entry = {
+        "type": "stdio",
+        "command": venv_python_str,
+        "args": [str(weaviate_server)],
+        "env": weaviate_env,
+    }
+
+    # search (v0.2.11+: needs no secrets; uses wrapper.sh on Unix)
+    search_server = mcp_root / "search_mcp" / "server.py"
+    search_wrapper = mcp_root / "search_mcp" / "wrapper.sh"
+    if platform.system().lower().startswith("win"):
+        search_cmd, search_args = venv_python_str, [str(search_server)]
+    else:
+        search_cmd, search_args = str(search_wrapper), []
+    search_env_raw = {"PYTHONPATH": pythonpath}
+    search_env, search_dropped = _filter_env_for_global_json(search_env_raw)
+    search_entry = {
+        "type": "stdio",
+        "command": search_cmd,
+        "args": search_args,
+        "env": search_env,
+    }
+
+    return [
+        ("weaviate-kg", weaviate_entry, weaviate_dropped),
+        ("search", search_entry, search_dropped),
+    ]
+
+
+def _python_fallback_write_mcp_entries(
+    claude_json_path: Path,
+    entries: list[tuple[str, dict, list[str]]],
+) -> tuple[int, list[str]]:
+    """Pure-Python JSON merge mirroring mcp_registration.rs discipline.
+
+    Same contract as the Rust register_mcp:
+      - advisory file lock at <path>.lock (create_new)
+      - read existing JSON (or empty {})
+      - mutate ONLY mcpServers.<name>
+      - write to .tmp + atomic rename
+      - backup existing file to <path>.bak before overwrite
+
+    The launcher.db is NOT touched here — `project_state_populate` will
+    pick up the JSON entries when the user opens the launcher GUI.
+
+    Returns (success_count, error_messages). Soft-fail per entry.
+    """
+    # Ensure parent dir exists before lock + write. The fake_home pattern
+    # in tests creates a path like tmp/fake_home/.claude.json where
+    # `fake_home` doesn't exist yet; without this mkdir, os.open() on the
+    # .lock file raises FileNotFoundError and the write returns (0, ...).
+    try:
+        claude_json_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return (0, [f"create parent {claude_json_path.parent}: {exc}"])
+    # Acquire lock.
+    lock_path = claude_json_path.with_suffix(claude_json_path.suffix + ".lock")
+    locked = False
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode("ascii"))
+            os.close(fd)
+            locked = True
+            break
+        except FileExistsError:
+            time.sleep(0.05)
+        except OSError:
+            break
+    if not locked:
+        return (0, [f"could not acquire lock {lock_path}"])
+
+    errors: list[str] = []
+    success = 0
+    try:
+        # Read existing (or empty).
+        try:
+            if claude_json_path.is_file():
+                raw = claude_json_path.read_text(encoding="utf-8")
+                data = json.loads(raw) if raw.strip() else {}
+            else:
+                data = {}
+        except (OSError, json.JSONDecodeError) as exc:
+            return (0, [f"read {claude_json_path}: {exc}"])
+        if not isinstance(data, dict):
+            return (0, [f"{claude_json_path} root is not a JSON object"])
+        if "mcpServers" not in data or not isinstance(data.get("mcpServers"), dict):
+            data["mcpServers"] = {}
+        # Merge entries.
+        for name, entry, _dropped in entries:
+            data["mcpServers"][name] = entry
+            success += 1
+        # Backup + atomic write.
+        try:
+            if claude_json_path.is_file():
+                bak = claude_json_path.with_suffix(claude_json_path.suffix + ".bak")
+                shutil.copy2(claude_json_path, bak)
+            tmp = claude_json_path.with_suffix(claude_json_path.suffix + ".tmp")
+            tmp.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            os.replace(tmp, claude_json_path)
+        except OSError as exc:
+            return (0, [f"write {claude_json_path}: {exc}"])
+        return (success, errors)
+    finally:
+        try:
+            lock_path.unlink()
+        except OSError:
+            pass
+
+
+def _register_mcps(
+    install_root: Path,
+    deferral_report: "DeferralReport",
+) -> None:
+    """Register the bundled-orchestrator MCPs into ~/.claude.json.
+
+    Path A (preferred): invoke the launcher binary CLI:
+      <binary> --register-default-mcps <install_root>
+    Path B (fallback): pure-Python JSON merge.
+
+    Soft-fail throughout. install completion does NOT depend on this
+    succeeding; both paths log clear errors and emit a deferral entry
+    when Path A is unavailable so the user sees what happened.
+
+    Mutates ~/.claude.json (or VCT_USER_HOME_OVERRIDE/.claude.json for
+    tests). Does NOT touch per-project .claude/settings.json — that's
+    managed separately by the launcher's write_project_env_files.
+    """
+    claude_json = _user_home_for_install() / ".claude.json"
+
+    # Resolve ports the same way Rust does (env-var-first, defaults).
+    weaviate_port = int(os.environ.get("WEAVIATE_PORT", DEFAULT_WEAVIATE_PORT))
+    ollama_port = int(os.environ.get("OLLAMA_PORT", DEFAULT_OLLAMA_PORT))
+    grpc_port = int(os.environ.get("WEAVIATE_GRPC_PORT", DEFAULT_WEAVIATE_GRPC_PORT))
+    code_embed_port = int(os.environ.get("CODE_EMBED_PORT", DEFAULT_CODE_EMBED_PORT))
+
+    print()
+    print("Registering bundled MCP servers in ~/.claude.json...")
+
+    # Path A: launcher binary CLI.
+    binary = _ensure_launcher_binary(install_root)
+    if binary is not None:
+        cmd = [str(binary), "--register-default-mcps", str(install_root)]
+        env = os.environ.copy()
+        env["WEAVIATE_PORT"] = str(weaviate_port)
+        env["OLLAMA_PORT"] = str(ollama_port)
+        env["WEAVIATE_GRPC_PORT"] = str(grpc_port)
+        env["CODE_EMBED_PORT"] = str(code_embed_port)
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=env,
+            )
+        except (subprocess.SubprocessError, OSError) as exc:
+            _log_install_event(
+                "register_mcps", "warn",
+                f"launcher binary invocation failed: {exc}",
+            )
+            print(f"  Launcher binary CLI failed: {exc}. Falling back to Python writer.",
+                  file=sys.stderr)
+        else:
+            # Forward the launcher's own stdout/stderr for visibility.
+            if result.stdout:
+                print(result.stdout, end="")
+            if result.stderr:
+                sys.stderr.write(result.stderr)
+            if result.returncode == 0:
+                _log_install_event(
+                    "register_mcps", "ok",
+                    f"registered via launcher binary at {binary}",
+                )
+                # Stale-MCP-entry detection (--update mode only). The
+                # launcher writer doesn't touch entries outside the
+                # bundled set, so this check is post-write here.
+                _detect_stale_mcp_entries(install_root, claude_json, deferral_report)
+                return
+            _log_install_event(
+                "register_mcps", "warn",
+                f"launcher binary exit {result.returncode}; falling back to Python",
+            )
+            print(
+                f"  Launcher binary CLI returned exit {result.returncode}. "
+                "Falling back to Python writer.",
+                file=sys.stderr,
+            )
+
+    # Path B: pure-Python JSON merge. Always runs when Path A is
+    # unavailable; survives missing-binary / missing-cargo / network-down.
+    venv_python = _resolve_venv_python_for_install(install_root)
+    if venv_python is None:
+        msg = (
+            f"could not locate venv-python under {install_root} "
+            "(tried .venv and claude_mcp_servers/.venv). Skipping MCP registration."
+        )
+        print(f"  {msg}", file=sys.stderr)
+        _log_install_event("register_mcps", "warn", msg)
+        deferral_report.add_entry(
+            DeferralEntry(
+                condition_id="mcp_registration_no_venv",
+                title="MCP registration skipped: no venv-python found",
+                detected=msg,
+                why_deferred=(
+                    "Without a Python interpreter inside the install's venv, the "
+                    "MCP server entries in ~/.claude.json cannot be constructed."
+                ),
+                command_to_apply=(
+                    "# Re-run install.py to recreate the venv, then:\n"
+                    f"python install.py --update"
+                ),
+                severity="warning",
+                kg_node_refs=[
+                    ".claude/context/mcp-install-pipeline-audit-2026-05-16.md",
+                ],
+            )
+        )
+        return
+
+    entries = _build_python_mcp_entries(
+        install_root, venv_python,
+        weaviate_port, ollama_port, grpc_port, code_embed_port,
+    )
+    success, errors = _python_fallback_write_mcp_entries(claude_json, entries)
+    if success > 0:
+        print(
+            f"  Wrote {success} MCP entr{'y' if success == 1 else 'ies'} "
+            f"to {claude_json} via Python fallback."
+        )
+        _log_install_event(
+            "register_mcps", "ok",
+            f"Python fallback wrote {success} entries to {claude_json}",
+        )
+        # Surface a soft notice: the launcher DB was NOT updated in this
+        # path; project_state_populate will catch up on next GUI open.
+        deferral_report.add_entry(
+            DeferralEntry(
+                condition_id="mcp_registration_python_fallback",
+                title="MCP registration used Python fallback (launcher binary unavailable)",
+                detected=(
+                    "The launcher binary (vct-launcher) was not bundled, could "
+                    "not be downloaded from GitHub Releases, and `cargo tauri "
+                    "build` was unavailable. install.py wrote "
+                    f"{success} MCP entr{'y' if success == 1 else 'ies'} "
+                    f"to {claude_json} via the pure-Python JSON merge fallback."
+                ),
+                why_deferred=(
+                    "Pure-Python writer cannot update the launcher's SQLite DB "
+                    "(project_mcp_servers table). The DB will be synced "
+                    "automatically the next time you open the launcher GUI "
+                    "(project_state_populate picks up the JSON entries)."
+                ),
+                command_to_apply=(
+                    "# Optional: rebuild + retry the canonical writer.\n"
+                    "cd launcher && cargo tauri build && \\\n"
+                    "python install.py --update"
+                ),
+                severity="info",
+                kg_node_refs=[
+                    ".claude/context/mcp-install-pipeline-audit-2026-05-16.md",
+                ],
+            )
+        )
+    else:
+        msg = "; ".join(errors) if errors else "unknown error"
+        print(f"  MCP registration failed: {msg}", file=sys.stderr)
+        _log_install_event("register_mcps", "warn", f"python fallback failed: {msg}")
+        deferral_report.add_entry(
+            DeferralEntry(
+                condition_id="mcp_registration_failed",
+                title="MCP registration failed in both Rust and Python paths",
+                detected=(
+                    f"install.py could not write bundled MCP entries to "
+                    f"{claude_json}. Errors: {msg}"
+                ),
+                why_deferred=(
+                    "Cannot proceed without a writable home directory. Install "
+                    "completed but Claude Code won't see the orchestrator MCPs "
+                    "until this is resolved."
+                ),
+                command_to_apply=(
+                    f"# Ensure {claude_json.parent} is writable, then:\n"
+                    "python install.py --update"
+                ),
+                severity="critical",
+                kg_node_refs=[
+                    ".claude/context/mcp-install-pipeline-audit-2026-05-16.md",
+                ],
+            )
+        )
+
+    # Stale-entry check on --update.
+    _detect_stale_mcp_entries(install_root, claude_json, deferral_report)
+
+
+def _detect_stale_mcp_entries(
+    install_root: Path,
+    claude_json: Path,
+    deferral_report: "DeferralReport",
+) -> None:
+    """On --update, emit a deferral when ~/.claude.json mcpServers entries
+    point at directories outside the current install_root.
+
+    Doesn't auto-rewrite (rewrite is OUT OF SCOPE for v0.2.12) — just
+    surfaces the stale entry + the explicit command the user would run
+    to fix it (placeholder `--rewrite-stale-mcps` flag; not implemented
+    in this PR). Mirrors the per-project Sync Notice pattern from the
+    launcher's Settings page.
+    """
+    if not claude_json.is_file():
+        return
+    try:
+        data = json.loads(claude_json.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(data, dict):
+        return
+    mcp_servers = data.get("mcpServers", {})
+    if not isinstance(mcp_servers, dict):
+        return
+
+    install_root_str = str(install_root.resolve())
+    stale: list[tuple[str, str]] = []
+    for name, entry in mcp_servers.items():
+        if not isinstance(entry, dict):
+            continue
+        cmd = entry.get("command", "") if isinstance(entry.get("command"), str) else ""
+        first_arg = ""
+        args = entry.get("args", [])
+        if isinstance(args, list) and args and isinstance(args[0], str):
+            first_arg = args[0]
+        for candidate in (cmd, first_arg):
+            if not candidate or not candidate.startswith(("/", "C:\\", "c:\\", "\\\\")):
+                continue
+            # Anchor: only flag paths that look like vco install layouts
+            # (claude_mcp_servers/ or .venv/). Otherwise we'd flag every
+            # user-added MCP that lives in /usr/bin/foo.
+            if "claude_mcp_servers" not in candidate and ".venv" not in candidate:
+                continue
+            if not candidate.startswith(install_root_str):
+                stale.append((name, candidate))
+                break
+
+    if not stale:
+        return
+
+    detected_lines = [f"  - `{name}`: {path}" for name, path in stale]
+    deferral_report.add_entry(
+        DeferralEntry(
+            condition_id="stale_mcp_entry",
+            title="Stale ~/.claude.json MCP entries from a previous install",
+            detected=(
+                f"~/.claude.json contains MCP entries that point at directories "
+                f"outside the current install_root ({install_root_str}):\n\n"
+                + "\n".join(detected_lines)
+                + "\n\nThese were left behind by a previous orchestrator install "
+                "at a different path. Claude Code may spawn duplicate MCP "
+                "subprocesses against the same Weaviate container if both "
+                "installs are still active."
+            ),
+            why_deferred=(
+                "Auto-rewriting global MCP entries is destructive (user may "
+                "have intentional dual-install setups). v0.2.12 detects and "
+                "reports; a future `--rewrite-stale-mcps` flag will offer "
+                "explicit consent-driven rewrite."
+            ),
+            command_to_apply=(
+                "# Manual: edit ~/.claude.json and replace the stale paths with the new install_root.\n"
+                "# Or future-flag (not yet implemented as of v0.2.12):\n"
+                "python install.py --update --rewrite-stale-mcps"
+            ),
+            severity="warning",
+            kg_node_refs=[
+                ".claude/context/mcp-install-pipeline-audit-2026-05-16.md",
+            ],
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
