@@ -1140,6 +1140,36 @@ class WeaviateUnreachable(Exception):
         self.user_msg = user_msg
 
 
+class WeaviateSchemaError(Exception):
+    """Raised when the underlying Weaviate operation fails due to schema
+    mismatch (class missing, property missing, indexNullState missing),
+    NOT a connection problem. Triggers _reset_weaviate_client_cache() so
+    the MCP picks up a freshly-migrated schema on the next call (PR-41,
+    Issue A from mcp-instability-vs-public-repo-2026-05-16.md).
+
+    The user_msg hints at the relevant migration script:
+    scripts/migrate-development-temporal-props.{sh,ps1} for property
+    issues, scripts/migrate-shared-kg-schema.{sh,ps1} for class/index
+    issues.
+    """
+    def __init__(self, msg: str, user_msg: str = ""):
+        super().__init__(msg)
+        self.user_msg = user_msg or msg
+
+
+class WeaviateAuthError(Exception):
+    """Raised when the underlying Weaviate operation fails due to auth
+    (401, 403, invalid API key). Distinct from connection failures (which
+    suggest container restart) and schema failures (which suggest
+    migration). Does NOT trigger cache reset — auth errors are
+    persistent across reconnects (PR-41, Issue F from
+    mcp-instability-vs-public-repo-2026-05-16.md).
+    """
+    def __init__(self, msg: str, user_msg: str = ""):
+        super().__init__(msg)
+        self.user_msg = user_msg or msg
+
+
 def get_weaviate_client():
     """Get or create Weaviate client.
 
@@ -1186,6 +1216,34 @@ def _weaviate_unreachable_response(exc: WeaviateUnreachable, query: str = "") ->
     }, indent=2)
 
 
+def _weaviate_schema_error_response(exc: "WeaviateSchemaError", query: str = "") -> str:
+    """Format WeaviateSchemaError as a structured failure response.
+    Distinct error_class lets downstream agents react with the right
+    recovery (run migration script, NOT restart container). PR-41.
+    """
+    return json.dumps({
+        "success": False,
+        "error": "Weaviate schema error",
+        "error_class": "WeaviateSchemaError",
+        "query": query,
+        "hint": exc.user_msg,
+    }, indent=2)
+
+
+def _weaviate_auth_error_response(exc: "WeaviateAuthError", query: str = "") -> str:
+    """Format WeaviateAuthError as a structured failure response. Distinct
+    error_class lets downstream agents react with the right recovery
+    (check API key in settings, NOT restart container). PR-41.
+    """
+    return json.dumps({
+        "success": False,
+        "error": "Weaviate auth error",
+        "error_class": "WeaviateAuthError",
+        "query": query,
+        "hint": exc.user_msg,
+    }, indent=2)
+
+
 def _build_unreachable_hint(exc: Exception) -> str:
     """Build the actionable user_msg shown to the agent on loud-fail."""
     return (
@@ -1206,27 +1264,137 @@ def _build_unreachable_hint(exc: Exception) -> str:
     )
 
 
+_SCHEMA_ERROR_PATTERNS = (
+    "could not find class",
+    "class not found",
+    "no such prop",
+    "no such property",
+    "build inverted filter",
+    "nested query",
+)
+
+_AUTH_ERROR_PATTERNS = (
+    "unauthorized",
+    "forbidden",
+    "401",
+    "403",
+    "invalid api key",
+    "authentication failed",
+    "authentication",
+)
+
+_CONNECTION_ERROR_PATTERNS = (
+    "connection refused",
+    "unavailable",
+    "failed to connect",
+    "connection error",
+    "cannot connect",
+    # "grpc" alone is too aggressive: every WeaviateQueryError stringifies
+    # with a "protocol GRPC search" prefix even for non-transport failures.
+    # Restrict to phrases that genuinely indicate gRPC transport breakage.
+    "grpc transport",
+    "grpc connection",
+    "grpc unavailable",
+    "grpc server is down",
+    "grpc handshake",
+)
+
+
+def _build_schema_error_hint(exc: Exception, lower_msg: str) -> str:
+    """Build a user-friendly hint for schema errors pointing at the right
+    migration script (PR-41 Issue F)."""
+    if "no such prop" in lower_msg or "no such property" in lower_msg:
+        return (
+            f"Schema error: {exc}. The collection is missing a required "
+            f"property. Run scripts/migrate-development-temporal-props.sh "
+            f"to add temporal properties (created/updated/valid_from/"
+            f"valid_until) to existing *_Development collections."
+        )
+    if "build inverted filter" in lower_msg or "nested query" in lower_msg:
+        return (
+            f"Schema error: {exc}. The collection lacks "
+            f"invertedIndexConfig.indexNullState=True. Weaviate <=1.30 "
+            f"cannot retroactively add this; run "
+            f"scripts/migrate-shared-kg-schema.sh to drop + recreate the "
+            f"shared KG with the correct schema (content is re-synced "
+            f"from knowledge/**/*.md)."
+        )
+    # "could not find class" / "class not found"
+    return (
+        f"Schema error: {exc}. The expected class is not in the Weaviate "
+        f"schema. If you just ran a migration, the MCP's client cache "
+        f"will be reset on retry. If the class was never created, run "
+        f"install.py --update to recreate it, OR use the launcher GUI's "
+        f"Identity tab 'Manage shared KG collection' picker to designate "
+        f"an existing orchestrator-shaped class as canonical."
+    )
+
+
+def _build_auth_error_hint(exc: Exception, lower_msg: str) -> str:
+    """Build a user-friendly hint for auth errors (PR-41 Issue F)."""
+    return (
+        f"Authentication error: {exc}. Check WEAVIATE_API_KEY in your "
+        f".claude/settings.json env block, or remove it if your local "
+        f"Weaviate doesn't require auth (default for podman-managed "
+        f"vco_weaviate container)."
+    )
+
+
 def _classify_weaviate_failure(exc: Exception):
-    """Return a WeaviateUnreachable if `exc` indicates Weaviate is
-    unreachable (either at connection time or mid-query). Return None
-    for other failure classes.
+    """Classify a Weaviate exception into one of:
+      - WeaviateUnreachable (connection-class — container down, port
+        unbound)
+      - WeaviateSchemaError (schema-class — class missing, property
+        missing, index missing → cache reset + migration hint)
+      - WeaviateAuthError (auth-class — invalid API key, 401/403)
+      - None (everything else — payload errors, internal bugs — passed
+        through with original message)
 
-    Two cases (both surfaced 2026-05-08):
-      1. Connection-time: weaviate.connect_to_custom() raises
-         WeaviateConnectionError when the gRPC/HTTP port can't be opened
-         at all (container down, port-binding desync).
-      2. Query-time: a cached, previously-valid client whose backing
-         Weaviate has since stopped raises WeaviateQueryError /
-         WeaviateGRPCUnavailableError on .query.* calls. The naive
-         loud-fail v1 fix only caught case 1; case 2 fell through to
-         the generic `except Exception` and produced silent-zero.
+    PR-41 (2026-05-16) refined the previous binary
+    `WeaviateQueryError → WeaviateUnreachable` mapping (which produced
+    misleading hints about "container down" for schema bugs) into a
+    three-way detection ordered most-specific-first: schema patterns
+    checked BEFORE the connection-class branch so a WeaviateQueryError
+    with schema-shaped message doesn't get mis-classified.
 
-    Cache invalidation: callers that catch WeaviateUnreachable should
-    also call _reset_weaviate_client_cache() so the next call forces a
-    fresh connect.
+    Callers should catch each type explicitly and react:
+      - WeaviateUnreachable → _reset_weaviate_client_cache() + retry
+        once; if still failing, emit "container down" hint.
+      - WeaviateSchemaError → _reset_weaviate_client_cache() + retry
+        once (in case the schema was just migrated); if still failing,
+        emit "run migration script" hint. This is the actual
+        user-impacting fix for Issue A (drop+recreate shared KG no
+        longer requires manual `pkill -f weaviate_mcp`).
+      - WeaviateAuthError → DO NOT reset cache (auth errors persist);
+        emit "check API key" hint.
+      - None → pass through; usually a real bug or a Weaviate internal.
     """
-    if isinstance(exc, WeaviateUnreachable):
+    if isinstance(exc, (WeaviateUnreachable, WeaviateSchemaError, WeaviateAuthError)):
         return exc
+
+    msg = str(exc).lower()
+
+    # SchemaError — most specific. Run first so a WeaviateQueryError with
+    # schema-shaped message doesn't fall into the unreachable branch.
+    if any(p in msg for p in _SCHEMA_ERROR_PATTERNS):
+        return WeaviateSchemaError(
+            str(exc),
+            _build_schema_error_hint(exc, msg),
+        )
+
+    # AuthError — distinct from connection failures. Checked before
+    # connection patterns because some HTTP layers stringify
+    # auth failures with both '401' and 'connection error' in the same
+    # message (e.g. proxy responses).
+    if any(p in msg for p in _AUTH_ERROR_PATTERNS):
+        return WeaviateAuthError(
+            str(exc),
+            _build_auth_error_hint(exc, msg),
+        )
+
+    # Then the existing connection-class detection. The patterns below
+    # preserve loud-fail-v2 behaviour for actual outages (2026-05-08
+    # silent-zero antipattern fix); only the ordering changed.
     try:
         from weaviate.exceptions import (
             WeaviateBaseError,
@@ -1235,16 +1403,36 @@ def _classify_weaviate_failure(exc: Exception):
             WeaviateQueryError,
         )
     except ImportError:
-        msg = str(exc).lower()
-        if "connection refused" in msg or "unavailable" in msg or "failed to connect" in msg:
+        if any(p in msg for p in _CONNECTION_ERROR_PATTERNS):
             return WeaviateUnreachable(str(exc), _build_unreachable_hint(exc))
         return None
-    if isinstance(exc, (WeaviateConnectionError, WeaviateQueryError, WeaviateGRPCUnavailableError)):
+
+    if isinstance(exc, (WeaviateConnectionError, WeaviateGRPCUnavailableError)):
         return WeaviateUnreachable(str(exc), _build_unreachable_hint(exc))
-    if isinstance(exc, WeaviateBaseError):
-        msg = str(exc).lower()
-        if "connection refused" in msg or "unavailable" in msg or "failed to connect" in msg or "grpc" in msg:
+
+    # WeaviateQueryError: ONLY classify as unreachable if msg explicitly
+    # signals connection issues. Schema-shaped queries already caught
+    # above; auth-shaped queries already caught above.
+    if isinstance(exc, WeaviateQueryError):
+        if any(p in msg for p in _CONNECTION_ERROR_PATTERNS):
             return WeaviateUnreachable(str(exc), _build_unreachable_hint(exc))
+        # Otherwise: pass through unchanged (auth errors caught above,
+        # schema errors caught above; remainder are real query bugs and
+        # should propagate with their original message rather than be
+        # wrapped as something they aren't).
+        return None
+
+    if isinstance(exc, WeaviateBaseError):
+        if any(p in msg for p in _CONNECTION_ERROR_PATTERNS):
+            return WeaviateUnreachable(str(exc), _build_unreachable_hint(exc))
+
+    # Final fallback: a generic (non-weaviate-class) exception with a
+    # clear connection-shaped message still classifies as Unreachable.
+    # This preserves the ImportError-branch behaviour above for the
+    # common case (test mocks, third-party wrappers).
+    if any(p in msg for p in _CONNECTION_ERROR_PATTERNS):
+        return WeaviateUnreachable(str(exc), _build_unreachable_hint(exc))
+
     return None
 
 
@@ -2157,11 +2345,26 @@ async def semantic_graph_search(
     except WeaviateUnreachable as exc:
         _reset_weaviate_client_cache()
         return _weaviate_unreachable_response(exc, query=query)
+    except WeaviateSchemaError as exc:
+        # PR-41 Issue A: drop+recreate of a collection invalidates the
+        # cached client's schema view; reset the cache so the next call
+        # re-fetches schema metadata.
+        _reset_weaviate_client_cache()
+        return _weaviate_schema_error_response(exc, query=query)
+    except WeaviateAuthError as exc:
+        # PR-41 Issue F: auth errors persist across reconnects; do NOT
+        # reset the cache (would just churn the connection).
+        return _weaviate_auth_error_response(exc, query=query)
     except Exception as exc:
-        unreachable = _classify_weaviate_failure(exc)
-        if unreachable is not None:
+        classified = _classify_weaviate_failure(exc)
+        if isinstance(classified, WeaviateUnreachable):
             _reset_weaviate_client_cache()
-            return _weaviate_unreachable_response(unreachable, query=query)
+            return _weaviate_unreachable_response(classified, query=query)
+        if isinstance(classified, WeaviateSchemaError):
+            _reset_weaviate_client_cache()
+            return _weaviate_schema_error_response(classified, query=query)
+        if isinstance(classified, WeaviateAuthError):
+            return _weaviate_auth_error_response(classified, query=query)
         raise
 
 
@@ -2598,11 +2801,23 @@ async def hybrid_search(
     except WeaviateUnreachable as exc:
         _reset_weaviate_client_cache()
         return _weaviate_unreachable_response(exc, query=query)
+    except WeaviateSchemaError as exc:
+        # PR-41 Issue A: schema migrations invalidate cached schema.
+        _reset_weaviate_client_cache()
+        return _weaviate_schema_error_response(exc, query=query)
+    except WeaviateAuthError as exc:
+        # PR-41 Issue F: do NOT reset cache on auth errors.
+        return _weaviate_auth_error_response(exc, query=query)
     except Exception as exc:
-        unreachable = _classify_weaviate_failure(exc)
-        if unreachable is not None:
+        classified = _classify_weaviate_failure(exc)
+        if isinstance(classified, WeaviateUnreachable):
             _reset_weaviate_client_cache()
-            return _weaviate_unreachable_response(unreachable, query=query)
+            return _weaviate_unreachable_response(classified, query=query)
+        if isinstance(classified, WeaviateSchemaError):
+            _reset_weaviate_client_cache()
+            return _weaviate_schema_error_response(classified, query=query)
+        if isinstance(classified, WeaviateAuthError):
+            return _weaviate_auth_error_response(classified, query=query)
         raise
 
 
@@ -2664,10 +2879,20 @@ async def _hybrid_search_body(
             # Loud-fail v2: don't swallow Weaviate-unreachable. Connection-time
             # failures fire from get_weaviate_client(); query-time failures
             # (cached client + Weaviate stopped mid-session) fire here.
-            unreachable = _classify_weaviate_failure(e)
-            if unreachable is not None:
+            # PR-41: also surface schema/auth errors with their distinct
+            # classes so the outer wrapper emits the right hint.
+            classified = _classify_weaviate_failure(e)
+            if isinstance(classified, WeaviateUnreachable):
                 _reset_weaviate_client_cache()
-                raise unreachable from e
+                raise classified from e
+            if isinstance(classified, WeaviateSchemaError):
+                # Schema migrations invalidate the cached client's schema
+                # view → reset so the next call re-fetches.
+                _reset_weaviate_client_cache()
+                raise classified from e
+            if isinstance(classified, WeaviateAuthError):
+                # Auth errors persist; don't churn the connection.
+                raise classified from e
             logger.warning(f"hybrid_search: error searching {coll_name}: {e}")
 
     # Sort all over-fetched candidates by combined score
@@ -3484,15 +3709,26 @@ async def search_code_graph(
         # Loud-fail per 2026-05-08 silent-zero antipattern fix.
         _reset_weaviate_client_cache()
         return _weaviate_unreachable_response(exc, query=query)
+    except WeaviateSchemaError as exc:
+        # PR-41 Issue A: cache reset on schema-not-found.
+        _reset_weaviate_client_cache()
+        return _weaviate_schema_error_response(exc, query=query)
+    except WeaviateAuthError as exc:
+        return _weaviate_auth_error_response(exc, query=query)
     except Exception as e:
         # Loud-fail v2: query-time failures (cached client + Weaviate
         # stopped mid-session) raise WeaviateQueryError, not
         # WeaviateUnreachable. Classify before falling through to the
         # generic error handler.
-        unreachable = _classify_weaviate_failure(e)
-        if unreachable is not None:
+        classified = _classify_weaviate_failure(e)
+        if isinstance(classified, WeaviateUnreachable):
             _reset_weaviate_client_cache()
-            return _weaviate_unreachable_response(unreachable, query=query)
+            return _weaviate_unreachable_response(classified, query=query)
+        if isinstance(classified, WeaviateSchemaError):
+            _reset_weaviate_client_cache()
+            return _weaviate_schema_error_response(classified, query=query)
+        if isinstance(classified, WeaviateAuthError):
+            return _weaviate_auth_error_response(classified, query=query)
         logger.error(f"Error in code graph search: {e}")
         return json.dumps({"success": False, "error": str(e)}, indent=2)
 
@@ -3832,12 +4068,23 @@ def query_code_structure(
         # Loud-fail per 2026-05-08 silent-zero antipattern fix.
         _reset_weaviate_client_cache()
         return _weaviate_unreachable_response(exc, query=f"{query_type}:{target}")
+    except WeaviateSchemaError as exc:
+        # PR-41 Issue A: cache reset on schema-not-found.
+        _reset_weaviate_client_cache()
+        return _weaviate_schema_error_response(exc, query=f"{query_type}:{target}")
+    except WeaviateAuthError as exc:
+        return _weaviate_auth_error_response(exc, query=f"{query_type}:{target}")
     except Exception as e:
         # Loud-fail v2: classify query-time failures as unreachable.
-        unreachable = _classify_weaviate_failure(e)
-        if unreachable is not None:
+        classified = _classify_weaviate_failure(e)
+        if isinstance(classified, WeaviateUnreachable):
             _reset_weaviate_client_cache()
-            return _weaviate_unreachable_response(unreachable, query=f"{query_type}:{target}")
+            return _weaviate_unreachable_response(classified, query=f"{query_type}:{target}")
+        if isinstance(classified, WeaviateSchemaError):
+            _reset_weaviate_client_cache()
+            return _weaviate_schema_error_response(classified, query=f"{query_type}:{target}")
+        if isinstance(classified, WeaviateAuthError):
+            return _weaviate_auth_error_response(classified, query=f"{query_type}:{target}")
         logger.error(f"Error in code structure query: {e}")
         return json.dumps({
             "success": False,
