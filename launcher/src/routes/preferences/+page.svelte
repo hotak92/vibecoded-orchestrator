@@ -360,6 +360,28 @@
       </div>
     </section>
 
+    <!-- Secrets (PR-4, v0.2.11). Cross-cutting OS-keychain manager;
+         deep-linked from the sidebar too. The Open button takes the
+         user to the dedicated route so the import sub-page stays one
+         click away from the manager. -->
+    <section class="pr-section">
+      <h2 class="pr-section-title">Secrets</h2>
+      <div class="pr-onboarding-row">
+        <div class="pr-onboarding-text">
+          <strong>Keychain manager</strong>
+          <span class="pr-onboarding-hint">
+            Per-project, shared, and global keychain entries used by orchestrator
+            modules. Includes a bulk-import surface for migrating existing on-disk
+            secrets (<code>~/.vct-secrets/</code> and project <code>.env</code> files)
+            into the OS keychain.
+          </span>
+        </div>
+        <button class="pr-btn" onclick={() => goto('/preferences/secrets')}>
+          Open
+        </button>
+      </div>
+    </section>
+
     <section class="pr-section">
       <h2 class="pr-section-title">GitHub access token</h2>
       <div class="pr-pat-row">
