@@ -7,6 +7,232 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.13] — 2026-05-16
+
+Same-day patch release on top of v0.2.12. Discovered during a real
+v0.2.10 → v0.2.12 launcher-update test on the maintainer's dev machine:
+8 distinct bugs in the update pipeline, all of which would silently
+leave end users on a stale binary, with deprecated MCP entries
+preserved, and with stale UI labels. v0.2.13 makes the update flow
+self-healing.
+
+**Major theme — update flow self-heals**: install.py's 4-tier launcher
+binary resolution now post-rebuild-auto-swaps fresh binaries into
+`launcher/dist/<os>-<arch>/` (Fix 1), retries the launcher-CLI against
+the freshly-built binary when the bundled tier-1 binary times out
+(Fix 5), and always touches `UPDATE_DEFERRED.md` so the user sees the
+final union of all deferral entries (not just the ones generated
+before `_register_mcps` runs, as in v0.2.12) (Fix 6).
+
+**Major theme — deprecated MCP cleanup**: when `install.py` drops an
+MCP from the default set (e.g. Ollama MCP in v0.2.11), existing user
+installs were left with the stale entry in `~/.claude.json`. New
+`--remove-deprecated-mcps` consent-prompted removal path (PR-34)
+detects + offers removal. Detection is unconditional on `--update`;
+removal requires the explicit flag. User-customised entries at paths
+outside the install_root are never touched.
+
+**Major theme — version-string consistency**: `vct-module.json` was
+last bumped to `0.2.4`, never tracking subsequent releases. Bumped
+to `0.2.13` + added to the canonical-release-bump checklist (Fix 9).
+The launcher Store-page no longer hardcodes `version: '0.1.6'` for
+the orchestrator + Pro cards — empty string with `{#if version}`
+guard so the catalog override is the only version source (Fix 3).
+
+**Major theme — security**: bumped Svelte `5.0.0` → `5.55.7` and
+`@sveltejs/kit` `2.59.1` → `2.60.1` + `devalue` `>=5.8.1` override
+to close 4 moderate Svelte XSS CVEs (DOM clobbering, SSR spread
+attributes, SSR Promise serialization) AND 1 high `devalue` DoS CVE
+(Fix 7). `npm audit` is now clean.
+
+**Major theme — release-pipeline hardening**: new
+`commit-dist-binaries` job in `.github/workflows/release.yml`
+auto-commits freshly-built binaries back to `launcher/dist/` on every
+release-tag push — eliminating the "committed binary lags release"
+class of bug that surfaced in v0.2.12 (Fix 8). The auto-commit job
+requires `bypass_actors` configured on the branch-protection ruleset
+(github-actions[bot] integration); on personal-account repos the
+auto-commit job will fail until a PAT-backed `DIST_COMMIT_TOKEN`
+secret is wired (deferred to v0.2.14 — see Known issues).
+
+### Added
+
+- **Post-cargo-rebuild dist-binary auto-swap** (Fix 1, `install.py`):
+  new `_refresh_dist_binary_after_rebuild()` helper, wired into
+  `--update` immediately before `_register_mcps`. Conservative
+  4-condition gate (src exists, src mtime > dist mtime, src produced
+  in this run OR version-stale, `--no-binary-swap` flag not set). The
+  version-stale fallback uses `tauri.conf.json` mtime as a cheap
+  proxy for "the dist binary is built from a version older than the
+  current tauri config". New flag `--no-binary-swap` to opt out.
+  Module-level `_INSTALL_START_TS: Optional[float]` set at the top of
+  `_run_install` provides the "produced in this run" signal.
+
+- **Tier-3 retry of launcher CLI after timeout/non-zero-exit** (Fix 5,
+  `install.py::_register_mcps`): when `Path A` (launcher binary CLI)
+  fails transiently (timeout or non-zero exit) against a tier-1
+  binary, install.py now invokes `_try_cargo_tauri_build()`
+  explicitly to produce a fresh binary, then retries the CLI ONCE
+  with the new binary before falling through to the pure-Python
+  fallback (Path B). Emits `register_mcps_tier3_retry` events for
+  observability. New flags `--prefer-only-bundled` (skip tier-2/3
+  resolution AND the retry) and `--no-rebuild-on-stale` (skip
+  ONLY the retry; resolution unaffected).
+
+- **`UPDATE_DEFERRED.md` always populated on `--update`** (Fix 6,
+  `install.py`): second `_deferral_report.write()` call at the very
+  end of `_run_install` captures entries added AFTER the original
+  write (which ran before `_register_mcps`, the deprecated-MCP
+  detection, `_check_searxng_remnants`, `_check_ollama_mcp_remnants`,
+  `_check_search_mcp_env_obsolete`, `_materialize_boot_service`,
+  and `_rewrite_stale_mcp_entries`). On `--update` runs with zero
+  deferral entries, writes a stub file with `entries: 0` frontmatter
+  so the user has a paper trail that the run completed cleanly.
+
+- **Deprecated-MCP detection + consent-prompted removal** (Fix 4 /
+  PR-34, `install.py`): new `_DEPRECATED_DEFAULT_MCPS` registry maps
+  removed MCP names to their `removed_in` version + reason + opt-in
+  manifest path. New helpers `_scan_deprecated_mcp_entries`,
+  `_detect_deprecated_mcp_entries`, `_remove_deprecated_mcp_entries`
+  follow the same scan/detect/remove pattern as PR-33 stale-rewrite.
+  Detection runs unconditionally on `--update` (hooked into
+  `_register_mcps` after both Path A and Path B). Only entries
+  whose `command` path is INSIDE the current install_root are
+  flagged; user-customised entries at unrelated paths are left
+  alone. New flag `--remove-deprecated-mcps` (per-entry consent
+  prompt) + env override `VCT_REMOVE_DEPRECATED_MCPS=all` for CI.
+  Two-level backup before any write, atomic `lock + tmp + os.replace`
+  discipline. Composes with PR-33 `--rewrite-stale-mcps`. First
+  entry in the registry: `ollama` (removed in v0.2.11).
+
+- **CI auto-commit of dist binaries** (Fix 8,
+  `.github/workflows/release.yml`): new `commit-dist-binaries` job
+  (`needs: build`) downloads the 3 OS binaries from the matrix
+  artifacts, skips byte-identical (`cmp -s`) ones, stages ONLY
+  `launcher/dist/*/vct-launcher[.exe]` + `.metadata.json` paths
+  (guard errors if any non-`launcher/dist/` file sneaks in), and
+  commits `chore(binary): refresh vct-launcher dist binaries for
+  v<version>` to main. New `workflow_dispatch` input
+  `skip_dist_commit` for dry-runs.
+
+- **2 Rust regression tests for the catalog-version invariants**
+  (`launcher/src-tauri/src/commands/modules.rs`):
+  `builtin_catalog_orchestrator_entry_has_non_empty_version` and
+  `builtin_catalog_launcher_entry_has_non_empty_version` — guard
+  against future regressions where `vct-module.json` or
+  `CARGO_PKG_VERSION` returns empty.
+
+- **42 new Python regression tests** across
+  `tests/test_install_binary_resolution.py` (19),
+  `tests/test_install_deprecated_mcps.py` (23). All passing.
+  Full pytest suite: 1264 passed, 5 skipped, 50 subtests.
+
+### Changed
+
+- **`vct-module.json` bumped 0.2.4 → 0.2.13** (Fix 9). Description
+  fixed: "5 MCP servers (4 containerized + Playwright)" →
+  "4 MCP servers (3 containerized + Playwright)" — post-PR-14a
+  Ollama MCP removal. `_canonical_counts_2026_05_16` comment
+  refreshed to reflect PR-39 v0.2.12 ground truth: hooks live in
+  `templates/hooks/*.sh` and are rendered into `.claude/hooks/` at
+  install time, not source-of-truth there. The comment now
+  explicitly lists `vct-module.json` as a release-bump-required file
+  (alongside Cargo.toml + tauri.conf.json + package.json).
+
+- **Svelte `5.0.0` → `5.55.7`** + **`@sveltejs/kit` `2.59.1` →
+  `2.60.1`** + **`devalue` `>=5.8.1`** floor via `overrides`
+  (`launcher/package.json`). Closes the 4 moderate Svelte XSS CVEs
+  (GHSA-pr6f, GHSA-f3cj, GHSA-rcqx, GHSA-9rmh) and the 1 high
+  `devalue` DoS CVE (GHSA-77vg). `npm audit` returns 0
+  vulnerabilities. svelte-check still passes with 0 errors (the 45
+  pre-existing a11y warnings on the dev-only Preferences /
+  Projects / Services pages are unaffected).
+
+- **Store-page `version: '0.1.6'` hardcode removed**
+  (`launcher/src/routes/store/+page.svelte`): the orchestrator and
+  Pro card now default to empty string `version: ''`. The catalog
+  override (`list_module_catalog` → `builtin_catalog_entries` →
+  `vct-module.json`) supplies the real version for the orchestrator
+  card; the orchestrator-pro card has no catalog entry yet and
+  shows no version label until one is added. The version rendering
+  is now guarded by `{#if (catalogVersionById[app.id] ?? app.version)}`
+  so an empty version never renders a bare `v` glyph.
+
+### Fixed
+
+- **Stale `dist/<os>-<arch>/vct-launcher` after `--update`** (Fix 1):
+  in v0.2.12 the bundled binary at `launcher/dist/<os>-<arch>/`
+  could be older than the orchestrator's source tree (e.g.
+  v0.1.6-era), with `install.py --update` doing nothing to refresh
+  it. Users who relied on the desktop icon (which targets
+  `dist/<os>-<arch>/vct-launcher`) saw the wrong version
+  post-update. Now auto-refreshed.
+
+- **Launcher-CLI timeout against stale tier-1 binary fell straight
+  to Python fallback** (Fix 5): when the v0.2.10 tier-1 binary did
+  not recognize the v0.2.12 `--register-default-mcps` flag, it
+  launched the GUI instead, hit the 30s timeout, and install.py
+  fell to the Python writer — missing the tier-3 rebuild that
+  would have produced a binary that DOES recognize the flag. Now
+  retries with the freshly-built binary first.
+
+- **`UPDATE_DEFERRED.md` missing entries from late-stage helpers**
+  (Fix 6): in v0.2.12, deferrals generated by `_register_mcps`,
+  the deprecated-MCP / SearXNG / Ollama / search-env remnant
+  checks, `_materialize_boot_service`, and `_rewrite_stale_mcp_entries`
+  were ALL lost because the single `_deferral_report.write()` ran
+  before any of them. Today's launcher-update test produced 0
+  files instead of the expected ~3-4 entries. Fixed.
+
+- **Deprecated MCPs not auto-removed on `--update`** (Fix 4): in
+  v0.2.12, an end user updating from v0.2.10 to v0.2.12 kept their
+  `~/.claude.json mcpServers.ollama` entry (Ollama MCP was dropped
+  in v0.2.11 PR-14a but install.py didn't detect or offer removal).
+  Now flagged via deferral on every `--update`, removable via
+  `--remove-deprecated-mcps`.
+
+- **Store-page showed `v0.1.6` for orchestrator + Pro cards** (Fix 3):
+  hardcoded default in `allApps[]` was rendered whenever the
+  catalog override returned empty (which is always, for `orchestrator-pro`
+  — no catalog entry exists). Fixed by setting the hardcoded
+  default to empty + guarding the render.
+
+- **`vct-module.json` reported stale version + wrong MCP count**
+  (Fix 9): `0.2.4` since v0.2.4-era; `5 MCP servers` since v0.2.10-era
+  (pre-PR-14a). Bumped + corrected.
+
+### Security
+
+- **Svelte XSS** (Fix 7, 4 moderate CVEs): bumped to 5.55.7. Patches:
+  DOM clobbering of internal framework state (GHSA-pr6f), SSR XSS
+  via spread attributes (GHSA-f3cj), SSR XSS via insecure Promise
+  serialization in hydratable (GHSA-rcqx), and the related GHSA-9rmh
+  family. None of the patches affected behavior we depend on
+  (validated by svelte-check pass + visual inspection of the
+  Promise-serialization use-sites).
+
+- **`devalue` DoS** (Fix 7, 1 high CVE): pulled in via `@sveltejs/kit`
+  bump to 2.60.1 + `overrides.devalue: ">=5.8.1"` floor. Closes
+  GHSA-77vg.
+
+### Known issues / deferred to v0.2.14
+
+- **CI auto-commit job needs `bypass_actors`** (Fix 10, partial):
+  GitHub's branch-protection ruleset API rejected the
+  `bypass_actors` PUT on our personal-account repo with "Actor
+  integration must be part of the ruleset source or owner
+  organization". The auto-commit job in release.yml will silently
+  fail until either (a) the repo is moved to an org where the
+  Integration-type bypass actor pattern works, or (b) a
+  `DIST_COMMIT_TOKEN` secret is created with a fine-grained PAT
+  having `Contents: Write` on this repo, and the auto-commit job
+  is reworked to use that secret in place of the default
+  `GITHUB_TOKEN`. v0.2.13 release will use the manual
+  ruleset-disable trick (same as v0.2.12) for the version-bump push.
+
+- **macOS Intel x64 not built** (carried forward from v0.2.12).
+  Tier-3 cargo rebuild fallback works on Intel Macs but is slow.
+
 ## [0.2.12] — 2026-05-16
 
 Stability + UX release on top of v0.2.11. Closes 11 of 13 MCP-instability
