@@ -128,7 +128,7 @@
         {
           href: '/services',
           label: 'Services',
-          sub: 'Start/stop Weaviate, Ollama, SearXNG, code-embed',
+          sub: 'Start/stop Weaviate, Ollama, code-embed',
           match: (p) => p.startsWith('/services'),
         },
         {

@@ -16,7 +16,6 @@
       "Bash(cp *)",
       "Bash(git *)",
       "mcp__weaviate-kg__*",
-      "mcp__ollama__*",
       "mcp__search__*"
     ],
     "deny": [

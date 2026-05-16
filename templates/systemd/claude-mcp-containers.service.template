@@ -37,7 +37,7 @@
 #   {{LOG_FILE}}           — absolute path to the unit's log file
 #
 [Unit]
-Description=Claude MCP containers (weaviate, ollama, code_embed, model_router, searxng)
+Description=Claude MCP containers (weaviate, ollama, code_embed, model_router)
 After=network.target
 # v0.2.9 (Bug J): wait for NVIDIA CDI refresh to finish writing the
 # /var/run/cdi/nvidia.yaml spec before bringing up GPU containers.
