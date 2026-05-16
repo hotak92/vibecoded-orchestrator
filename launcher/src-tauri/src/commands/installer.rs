@@ -5229,10 +5229,19 @@ mod tests {
         fs::write(p.join("vct-module.json"), "{}").unwrap();
         fs::create_dir_all(p.join(".claude")).unwrap();
         fs::write(p.join(".claude/settings.json"), "{}").unwrap();
+        // CONTEXT_STATE.md is both in the managed allowlist (under .claude/)
+        // AND in DEFAULT_PRESERVE_LIST — so OverwritePreserve produces a
+        // CONTEXT_STATE.new.md sibling when the user has their own version.
+        // (CLAUDE.md was previously the canonical fixture for this case but
+        // PR-31 / v0.2.12 removed CLAUDE.md from the managed allowlist —
+        // user projects render their own from templates/CLAUDE.md.template.)
+        fs::write(p.join(".claude/CONTEXT_STATE.md"), "# upstream context state\n").unwrap();
         fs::create_dir_all(p.join("knowledge")).unwrap();
         fs::write(p.join("knowledge/note.md"), "hello").unwrap();
-        fs::write(p.join("CLAUDE.md"), "# project\n").unwrap();
         // Files NOT in the allowlist — must NOT be copied.
+        // CLAUDE.md remains in the source dir to exercise the "is OUT of
+        // allowlist → not copied" contract.
+        fs::write(p.join("CLAUDE.md"), "# project\n").unwrap();
         fs::write(p.join("README.md"), "readme").unwrap();
         fs::create_dir_all(p.join("scripts")).unwrap();
         fs::write(p.join("scripts/foo.sh"), "echo hi").unwrap();
@@ -6627,10 +6636,14 @@ MemAvailable:   23456789 kB
         assert_eq!(report.preserved_count, 0);
         assert_eq!(report.new_md_count, 0);
 
-        // CLAUDE.md from upstream replaces the user-edited one.
+        // CLAUDE.md is OUTSIDE the managed allowlist as of v0.2.12 (PR-31
+        // removed it — user projects render their own CLAUDE.md from
+        // templates/CLAUDE.md.template, the orchestrator's root CLAUDE.md
+        // is dev-only). So the user-edited CLAUDE.md survives any
+        // conflict strategy because nothing tries to copy onto it.
         assert_eq!(
             fs::read_to_string(target.join("CLAUDE.md")).unwrap(),
-            "# project\n"
+            "# user CLAUDE.md\ncustom rules\n"
         );
         // settings.json overwritten with upstream {}
         assert_eq!(
@@ -6655,6 +6668,12 @@ MemAvailable:   23456789 kB
         let source = fake_repo_source();
         let target = fake_adopt_target();
 
+        // CONTEXT_STATE.md is the canonical preserve-eligible file: it's
+        // both in the managed allowlist (under .claude/) and in
+        // DEFAULT_PRESERVE_LIST. Source has it, target has it → expect
+        // CONTEXT_STATE.new.md sibling.
+        // (CLAUDE.md was the previous canonical fixture but PR-31 / v0.2.12
+        // removed it from the managed allowlist — see fake_repo_source.)
         let preserve: Vec<String> = DEFAULT_PRESERVE_LIST.iter().map(|s| s.to_string()).collect();
         let report = apply_conflict_strategy(
             &source,
@@ -6664,27 +6683,25 @@ MemAvailable:   23456789 kB
         )
         .unwrap();
 
-        // CLAUDE.md is in fake_repo_source (so it's a candidate); user
-        // version exists at target so we expect a CLAUDE.new.md sibling.
-        assert!(target.join("CLAUDE.new.md").exists());
-        assert_eq!(
-            fs::read_to_string(target.join("CLAUDE.new.md")).unwrap(),
-            "# project\n"
-        );
-        // User file untouched.
+        // User CLAUDE.md untouched (outside allowlist, never copied).
         assert_eq!(
             fs::read_to_string(target.join("CLAUDE.md")).unwrap(),
             "# user CLAUDE.md\ncustom rules\n"
         );
-        // CONTEXT_STATE.md is in the preserve list but fake_repo_source
-        // doesn't ship one, so no .new.md is written for it. The
-        // existing user file must be left intact AND the notification
-        // block appended to it.
+        // No CLAUDE.new.md sibling because no copy attempt happened.
+        assert!(!target.join("CLAUDE.new.md").exists());
+        // CONTEXT_STATE.md is in source AND target AND preserve list, so
+        // we expect a CONTEXT_STATE.new.md sibling and the user's file to be
+        // untouched + notification block appended.
+        assert!(target.join(".claude/CONTEXT_STATE.new.md").exists());
+        assert_eq!(
+            fs::read_to_string(target.join(".claude/CONTEXT_STATE.new.md")).unwrap(),
+            "# upstream context state\n"
+        );
         let ctx = fs::read_to_string(target.join(".claude/CONTEXT_STATE.md")).unwrap();
         assert!(ctx.contains("# user CONTEXT_STATE"));
         assert!(ctx.contains(MERGE_BLOCK_START));
         assert!(ctx.contains(MERGE_BLOCK_END));
-        assert!(ctx.contains("CLAUDE.md"));
 
         // Knowledge dir is NOT preserved — the user note gets overwritten.
         assert_eq!(
@@ -6792,8 +6809,11 @@ MemAvailable:   23456789 kB
         let source = fake_repo_source();
         let target = fake_adopt_target();
 
-        // Custom preserve list: only CLAUDE.md, exclude .env and others.
-        let preserve = vec!["CLAUDE.md".to_string()];
+        // Custom preserve list with a single file that IS in the managed
+        // allowlist (.claude/CONTEXT_STATE.md). CLAUDE.md is OUT of the
+        // managed allowlist as of v0.2.12 (PR-31) so putting it on the
+        // preserve list wouldn't exercise the sibling-creation path.
+        let preserve = vec![".claude/CONTEXT_STATE.md".to_string()];
         apply_conflict_strategy(
             &source,
             &target,
@@ -6802,8 +6822,12 @@ MemAvailable:   23456789 kB
         )
         .unwrap();
 
-        // CLAUDE.md preserved, sibling written.
-        assert!(target.join("CLAUDE.new.md").exists());
+        // CONTEXT_STATE.md preserved, sibling written.
+        assert!(target.join(".claude/CONTEXT_STATE.new.md").exists());
+        let ctx = fs::read_to_string(target.join(".claude/CONTEXT_STATE.md")).unwrap();
+        assert!(ctx.contains("# user CONTEXT_STATE"));
+        // User CLAUDE.md untouched regardless of preserve-list inclusion
+        // (it's outside the copy allowlist now).
         assert_eq!(
             fs::read_to_string(target.join("CLAUDE.md")).unwrap(),
             "# user CLAUDE.md\ncustom rules\n"
