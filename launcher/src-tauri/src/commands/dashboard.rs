@@ -324,8 +324,10 @@ fn mcp_server_to_claude_entry(server: &crate::types::McpServerConfig) -> serde_j
 pub async fn remove_mcp_server(mcp_id: String) -> Result<Vec<McpServerConfig>, String> {
     let mut config = load_config();
 
-    // Don't allow removing built-in servers
-    let builtin = ["weaviate-kg", "ollama", "search", "playwright"];
+    // Don't allow removing built-in servers.
+    // Note: "ollama" was removed from the default MCP list in v0.2.11
+    // (Ollama MCP deprecated; Ollama infrastructure unchanged).
+    let builtin = ["weaviate-kg", "search", "playwright"];
     if builtin.contains(&mcp_id.as_str()) {
         return Err(format!("Cannot remove built-in MCP server '{}'. Disable it instead.", mcp_id));
     }
@@ -684,12 +686,15 @@ mod tests {
     /// flag in orchestrator.json but left `~/.claude.json mcpServers.<id>`
     /// in place, so Claude Code kept spawning the "disabled" server.
     /// Post-fix: the entry is removed from ~/.claude.json on disable.
+    ///
+    /// v0.2.11: was `ollama`; now uses `search` (Ollama MCP removed from
+    /// the default install — see types.rs `default_mcp_servers` comment).
     #[test]
     fn test_toggle_mcp_server_off_removes_from_claude_json() {
         let (home, _guard) = setup_temp_env();
         seed_default_config(&home);
 
-        // Pre-seed ~/.claude.json with the ollama entry registered (mimic
+        // Pre-seed ~/.claude.json with the search entry registered (mimic
         // post-install state where the launcher had already mirrored
         // every default-enabled server during install).
         let claude_json = home.join(".claude.json");
@@ -697,9 +702,9 @@ mod tests {
             &claude_json,
             serde_json::to_string_pretty(&serde_json::json!({
                 "mcpServers": {
-                    "ollama": {
+                    "search": {
                         "type": "stdio",
-                        "command": "claude_mcp_servers/ollama_mcp/server.py",
+                        "command": "claude_mcp_servers/search_mcp/server.py",
                         "args": [],
                         "env": {}
                     }
@@ -709,66 +714,65 @@ mod tests {
         .unwrap();
 
         rt().block_on(async {
-            toggle_mcp_server("ollama".to_string(), false, user_apps_free())
+            toggle_mcp_server("search".to_string(), false, user_apps_free())
                 .await
                 .expect("toggle_mcp_server off");
         });
 
         let cj = read_claude_json(&home);
         assert!(
-            cj["mcpServers"].get("ollama").is_none(),
-            "expected `ollama` removed from ~/.claude.json mcpServers, got: {}",
+            cj["mcpServers"].get("search").is_none(),
+            "expected `search` removed from ~/.claude.json mcpServers, got: {}",
             cj["mcpServers"]
         );
 
         // And the launcher's own config carries enabled=false.
         let cfg_text = std::fs::read_to_string(home.join("orchestrator.json")).unwrap();
         let cfg: serde_json::Value = serde_json::from_str(&cfg_text).unwrap();
-        let ollama = cfg["mcp_servers"]
+        let search = cfg["mcp_servers"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|s| s["id"] == "ollama")
-            .expect("ollama entry");
-        assert_eq!(ollama["enabled"], serde_json::Value::Bool(false));
+            .find(|s| s["id"] == "search")
+            .expect("search entry");
+        assert_eq!(search["enabled"], serde_json::Value::Bool(false));
     }
 
     /// Inverse of the off-case: toggle on must register the entry back
     /// into ~/.claude.json with the canonical {type, command, args, env}
     /// shape so Claude Code starts spawning it.
     ///
-    /// (v0.2.5: previously used `code-embed` because it shipped disabled
-    /// by default. After `code-embed` was removed from the MCP registry
-    /// — it's a backend HTTP service consumed by `weaviate-kg`, not an
-    /// MCP — we exercise the toggle-on path by first flipping `ollama`
-    /// off in the seeded config and then toggling it back on.)
+    /// (v0.2.5: previously used `code-embed`. v0.2.11: was `ollama`; now
+    /// uses `search` after Ollama MCP was removed from the default install.
+    /// Exercise the toggle-on path by first flipping `search` off in the
+    /// seeded config and then toggling it back on.)
     #[test]
     fn test_toggle_mcp_server_on_re_registers_in_claude_json() {
         let (home, _guard) = setup_temp_env();
         let cfg_path = seed_default_config(&home);
 
-        // Flip `ollama` to disabled in the seeded config so the toggle-on
+        // Flip `search` to disabled in the seeded config so the toggle-on
         // call has something disabled to enable.
         let mut cfg: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
         for entry in cfg["mcp_servers"].as_array_mut().unwrap() {
-            if entry["id"] == "ollama" {
+            if entry["id"] == "search" {
                 entry["enabled"] = serde_json::Value::Bool(false);
             }
         }
         std::fs::write(&cfg_path, serde_json::to_string_pretty(&cfg).unwrap()).unwrap();
 
         rt().block_on(async {
-            toggle_mcp_server("ollama".to_string(), true, user_apps_free())
+            toggle_mcp_server("search".to_string(), true, user_apps_free())
                 .await
                 .expect("toggle_mcp_server on");
         });
 
         let cj = read_claude_json(&home);
-        let entry = &cj["mcpServers"]["ollama"];
+        let entry = &cj["mcpServers"]["search"];
         assert!(
             entry.is_object(),
-            "expected `ollama` registered in ~/.claude.json mcpServers, got: {}",
+            "expected `search` registered in ~/.claude.json mcpServers, got: {}",
             cj["mcpServers"]
         );
         // Canonical shape ({type:stdio, command, args, env}) — same as
@@ -797,6 +801,11 @@ mod tests {
     /// the value to the keychain and leave the JSON config value EMPTY.
     /// Pre-fix the value landed verbatim in orchestrator.json.
     ///
+    /// v0.2.11: `search` no longer ships a Secret-typed setting (GITHUB_TOKEN
+    /// was removed with the GitHub code-search tool). We inject a synthetic
+    /// custom MCP with a Secret setting to exercise the keychain routing path
+    /// — the underlying mechanism in `update_mcp_setting` is unchanged.
+    ///
     /// Skipped when the OS keychain backend is unavailable (CI containers,
     /// headless build hosts).
     #[test]
@@ -806,16 +815,41 @@ mod tests {
             return;
         }
         let (home, _guard) = setup_temp_env();
-        seed_default_config(&home);
 
-        // The default `search` MCP has a Secret-typed `GITHUB_TOKEN`.
-        // Use a unique canary so we can detect leakage anywhere.
+        // Seed a config that includes a custom MCP with a Secret-typed key.
         let canary = format!("canary-test-pat-{}", uuid::Uuid::new_v4().simple());
+        let mut config = OrchestratorConfig::default();
+        let mut secret_settings = HashMap::new();
+        secret_settings.insert(
+            "MY_API_KEY".to_string(),
+            McpSetting {
+                label: "API Key".to_string(),
+                value: String::new(),
+                setting_type: McpSettingType::Secret,
+                description: "Test secret".to_string(),
+                editable: true,
+            },
+        );
+        config.mcp_servers.push(McpServerConfig {
+            id: "test-secret-mcp".to_string(),
+            name: "Test Secret MCP".to_string(),
+            description: "Synthetic MCP for keychain routing test".to_string(),
+            enabled: true,
+            command: "test".to_string(),
+            args: vec![],
+            env: HashMap::new(),
+            min_tier: OrchestratorTier::Free,
+            port: None,
+            configurable: true,
+            settings: secret_settings,
+        });
+        let path = home.join("orchestrator.json");
+        std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
 
         rt().block_on(async {
             update_mcp_setting(
-                "search".to_string(),
-                "GITHUB_TOKEN".to_string(),
+                "test-secret-mcp".to_string(),
+                "MY_API_KEY".to_string(),
                 canary.clone(),
             )
             .await
@@ -823,34 +857,34 @@ mod tests {
         });
 
         // 1) JSON config value is EMPTY (NOT the canary).
-        let cfg_text = std::fs::read_to_string(home.join("orchestrator.json")).unwrap();
+        let cfg_text = std::fs::read_to_string(&path).unwrap();
         assert!(
             !cfg_text.contains(&canary),
             "leaked canary into orchestrator.json: {}",
             cfg_text
         );
         let cfg: OrchestratorConfig = serde_json::from_str(&cfg_text).unwrap();
-        let search_entry = cfg
+        let mcp_entry = cfg
             .mcp_servers
             .iter()
-            .find(|s| s.id == "search")
-            .expect("search MCP");
-        let token = search_entry
+            .find(|s| s.id == "test-secret-mcp")
+            .expect("test-secret-mcp entry");
+        let key_setting = mcp_entry
             .settings
-            .get("GITHUB_TOKEN")
-            .expect("GITHUB_TOKEN setting");
+            .get("MY_API_KEY")
+            .expect("MY_API_KEY setting");
         assert_eq!(
-            token.value, "",
-            "GITHUB_TOKEN value should be cleared in JSON: {:?}",
-            token
+            key_setting.value, "",
+            "MY_API_KEY value should be cleared in JSON: {:?}",
+            key_setting
         );
-        assert_eq!(token.setting_type, McpSettingType::Secret);
+        assert_eq!(key_setting.setting_type, McpSettingType::Secret);
 
         // 2) Keychain has the canary at the documented namespace.
         let kc = crate::secrets::get(
             crate::secrets::SecretScope::Global,
-            &mcp_secret_module_id("search"),
-            "GITHUB_TOKEN",
+            &mcp_secret_module_id("test-secret-mcp"),
+            "MY_API_KEY",
         )
         .expect("keychain get");
         assert_eq!(
@@ -862,8 +896,8 @@ mod tests {
         // Cleanup keychain best-effort.
         let _ = crate::secrets::delete(
             crate::secrets::SecretScope::Global,
-            &mcp_secret_module_id("search"),
-            "GITHUB_TOKEN",
+            &mcp_secret_module_id("test-secret-mcp"),
+            "MY_API_KEY",
         );
     }
 
@@ -957,6 +991,10 @@ mod tests {
     /// pre-existing plaintext Secret values from `~/.vct/orchestrator.json`
     /// into the keychain and clear the JSON values. Idempotent: a second
     /// run finds the app_state flag set and does nothing.
+    ///
+    /// v0.2.11: `search` no longer has a Secret-typed setting (GITHUB_TOKEN
+    /// removed). We inject a synthetic custom MCP with a Secret setting to
+    /// exercise the migration sweep — the sweep logic is unchanged.
     #[test]
     fn test_first_run_migrates_plaintext_secrets_to_keychain() {
         if !keyring_available() {
@@ -971,16 +1009,32 @@ mod tests {
             "migration-canary-{}",
             uuid::Uuid::new_v4().simple()
         );
+        // Build a config with a synthetic MCP carrying a plaintext Secret.
         let mut config = OrchestratorConfig::default();
-        // Mutate the bundled `search` MCP's GITHUB_TOKEN setting to
-        // carry the canary plaintext.
-        for server in config.mcp_servers.iter_mut() {
-            if server.id == "search" {
-                if let Some(s) = server.settings.get_mut("GITHUB_TOKEN") {
-                    s.value = canary.clone();
-                }
-            }
-        }
+        let mut secret_settings = HashMap::new();
+        secret_settings.insert(
+            "LEGACY_PAT".to_string(),
+            McpSetting {
+                label: "Legacy PAT".to_string(),
+                value: canary.clone(), // plaintext — the pre-fix bad state
+                setting_type: McpSettingType::Secret,
+                description: "Test secret for migration sweep".to_string(),
+                editable: true,
+            },
+        );
+        config.mcp_servers.push(McpServerConfig {
+            id: "legacy-mcp".to_string(),
+            name: "Legacy MCP".to_string(),
+            description: "Synthetic pre-fix MCP for migration test".to_string(),
+            enabled: true,
+            command: "legacy".to_string(),
+            args: vec![],
+            env: HashMap::new(),
+            min_tier: OrchestratorTier::Free,
+            port: None,
+            configurable: true,
+            settings: secret_settings,
+        });
         // Note: VCT_STATE_DIR points at `home`, so config_path() resolves
         // to `home/orchestrator.json`. (Setting it to `home/.vct` would
         // also work but the env override in setup_temp_env uses `home`
@@ -997,8 +1051,8 @@ mod tests {
             "first run should not be already_done"
         );
         assert!(
-            report.migrated_keys.iter().any(|k| k == "search/GITHUB_TOKEN"),
-            "expected search/GITHUB_TOKEN migrated, got: {:?}",
+            report.migrated_keys.iter().any(|k| k == "legacy-mcp/LEGACY_PAT"),
+            "expected legacy-mcp/LEGACY_PAT migrated, got: {:?}",
             report.migrated_keys
         );
         assert!(
@@ -1017,8 +1071,8 @@ mod tests {
         // Keychain has it.
         let kc = crate::secrets::get(
             crate::secrets::SecretScope::Global,
-            &mcp_secret_module_id("search"),
-            "GITHUB_TOKEN",
+            &mcp_secret_module_id("legacy-mcp"),
+            "LEGACY_PAT",
         )
         .unwrap();
         assert_eq!(kc.as_deref(), Some(canary.as_str()));
@@ -1035,8 +1089,8 @@ mod tests {
         // Cleanup.
         let _ = crate::secrets::delete(
             crate::secrets::SecretScope::Global,
-            &mcp_secret_module_id("search"),
-            "GITHUB_TOKEN",
+            &mcp_secret_module_id("legacy-mcp"),
+            "LEGACY_PAT",
         );
     }
 }

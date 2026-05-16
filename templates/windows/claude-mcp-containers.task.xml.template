@@ -43,7 +43,7 @@
   <RegistrationInfo>
     <Date>{{CREATED_AT}}</Date>
     <Author>{{USER_ID}}</Author>
-    <Description>Claude MCP container stack (weaviate, ollama, code_embed, model_router, searxng) — brings up at user logon via launch-claude-mcp-stack.sh.</Description>
+    <Description>Claude MCP container stack (weaviate, ollama, code_embed, model_router) — brings up at user logon via launch-claude-mcp-stack.sh.</Description>
     <URI>\{{LABEL}}</URI>
   </RegistrationInfo>
   <Triggers>

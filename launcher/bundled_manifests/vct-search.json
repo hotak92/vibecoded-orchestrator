@@ -3,14 +3,14 @@
   "manifest_version": 1,
 
   "id": "vct-search",
-  "name": "Web + Code + Paper Search",
-  "version": "0.3.1",
-  "description": "Search MCP: web (via SearXNG), GitHub code, arXiv + OpenAlex papers, full-page fetch. Wraps fetched HTML in an `<fetched-untrusted-content>` tag to guard against prompt injection.",
+  "name": "Academic Paper Search",
+  "version": "0.4.0",
+  "description": "Search MCP: arXiv + OpenAlex academic paper search (240M papers indexed, structured filtering by year/source). Simplified in v0.2.11 — `web_search`, `search_code`, and `fetch_page` were removed because Claude has native equivalents (WebSearch, WebFetch). Only `search_papers` is kept because OpenAlex's structured query DSL + citation graph have no Claude-native equivalent.",
   "publisher": "VibeCoded Tools",
   "repository": "https://github.com/VibeCoded-Tools/orchestrator",
 
   "category": "core",
-  "tags": ["mcp", "search", "web", "github", "arxiv"],
+  "tags": ["mcp", "search", "papers", "arxiv", "openalex"],
 
   "compatibility": {
     "hosts": ["base", "mao"],
@@ -54,14 +54,6 @@
 
   "secrets": [
     {
-      "key": "github_pat",
-      "prompt": "GitHub personal access token (optional)",
-      "description": "Raises GitHub rate limit from 60 to 5000 requests/hour. Create at https://github.com/settings/tokens with 'public_repo' scope. Wrappers consume the resolved value as the GITHUB_TOKEN env var (the wrapper renames the key — keychain stores the lowercase canonical form to match `~/.vct-secrets/shared/github_pat` and the OnboardingWizard's `register_github_pat` flow).",
-      "required": false,
-      "scope": "shared",
-      "sensitive": true
-    },
-    {
       "key": "OPENALEX_EMAIL",
       "prompt": "OpenAlex email (optional)",
       "description": "Identifies you to OpenAlex's polite pool — higher rate limits, no token needed.",
@@ -71,16 +63,7 @@
     }
   ],
 
-  "settings": [
-    {
-      "key": "SEARXNG_URL",
-      "prompt": "SearXNG HTTP URL",
-      "description": "Launcher auto-starts a SearXNG container and fills this in.",
-      "type": "string",
-      "default": "http://localhost:8888",
-      "required": true
-    }
-  ],
+  "settings": [],
 
   "runtime": {
     "type": "mcp_stdio",
@@ -90,8 +73,8 @@
       "windows": "{install_dir}\\.venv\\Scripts\\python.exe"
     },
     "cwd": "{install_dir}",
-    "env_from_secrets": ["github_pat", "OPENALEX_EMAIL"],
-    "env_from_settings": ["SEARXNG_URL"],
+    "env_from_secrets": ["OPENALEX_EMAIL"],
+    "env_from_settings": [],
     "env_fixed": {
       "PYTHONPATH": "{install_dir}"
     },
@@ -125,7 +108,7 @@
     {
       "kind": "mcp_tools",
       "tool_prefix": "search",
-      "description": "web_search, search_code (GitHub), search_papers (OpenAlex + arXiv), fetch_page (with injection-guard wrapper)"
+      "description": "search_papers (OpenAlex + arXiv)"
     }
   ]
 }

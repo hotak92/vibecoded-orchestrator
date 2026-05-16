@@ -1459,12 +1459,6 @@ def _run_lightweight(args: argparse.Namespace) -> int:
     # manifest writer falls back to prior values for the affected fields.
     _write_install_manifest(None, args, install_method="lightweight")
 
-    # 0.2.11: SearXNG settings.yml materialization (mirrors the call in
-    # the full install flow). Lightweight-update users get the new
-    # SearXNG service if they didn't have it before; existing
-    # settings.yml with a real secret_key is left alone.
-    _materialize_searxng_settings(PROJECT_ROOT)
-
     # v0.2.10 (Bug L2): re-materialize boot service on lightweight too —
     # the wrapper path may have changed if the install was relocated
     # (--lightweight-old-path). Idempotent for unchanged paths.
@@ -1474,6 +1468,15 @@ def _run_lightweight(args: argparse.Namespace) -> int:
     # fresh DeferralReport so any stale-unit auto-repair surfaces in
     # UPDATE_DEFERRED.md the user reads at next session.
     _lightweight_deferral = DeferralReport()
+
+    # PR-14b (v0.2.11 MCP simplification): SearXNG no longer ships in the
+    # default compose stack; Ollama MCP is dropped from the default install;
+    # SEARXNG_URL + GITHUB_TOKEN are no longer needed in the search MCP env.
+    # Surface deferral notices so existing users know to clean up manually.
+    if not getattr(args, "suppress_mcp_deprecation_warnings", False):
+        _check_searxng_remnants(PROJECT_ROOT, _lightweight_deferral)
+        _check_ollama_mcp_remnants(_lightweight_deferral)
+        _check_search_mcp_env_obsolete(_lightweight_deferral)
     _materialize_boot_service(PROJECT_ROOT, None, args,
                               deferral_report=_lightweight_deferral)
     # Best-effort: persist the deferral report. Mirrors the folder
@@ -1728,6 +1731,14 @@ def main() -> int:
                         help="Suppress the global lean-ctx hooks detection warning. "
                              "Use when you've reviewed the hooks and intentionally "
                              "keep them (e.g. lean-ctx development).")
+    # PR-14b: MCP-simplification deprecation notices. Power users / CI that
+    # have already acted on the notices can silence the three checks.
+    parser.add_argument("--suppress-mcp-deprecation-warnings", action="store_true",
+                        default=False,
+                        help="Suppress v0.2.11 MCP-simplification deprecation notices "
+                             "(SearXNG removed from default stack, Ollama MCP removed, "
+                             "search MCP env simplified). Use after you have manually "
+                             "cleaned up these remnants.")
     args = parser.parse_args()
 
     # v0.2.6 Bug C1 — `--desktop-icon-only` short-circuits: run JUST the
@@ -2208,13 +2219,16 @@ def main() -> int:
     # but no install.py run (false-positive observed in wizard 2026-05-06).
     _write_install_manifest(sysinfo, args, install_method="install.py")
 
-    # 0.2.11: SearXNG was promoted to a default compose service (the
-    # search MCP server has always required it but pre-0.2.11 it wasn't
-    # shipped). Materialize the bind-mount target dir + render
-    # settings.yml with a fresh random secret_key. Idempotent on
-    # --update: existing files with a non-placeholder secret_key are
-    # left alone.
-    _materialize_searxng_settings(PROJECT_ROOT)
+    # PR-14b (v0.2.11 MCP simplification): SearXNG no longer ships in the
+    # default compose stack; Ollama MCP is dropped from the default install;
+    # SEARXNG_URL + GITHUB_TOKEN are no longer needed in the search MCP env.
+    # Surface deferral notices so existing users know to clean up manually.
+    # Soft-fail: each helper catches its own errors; install completes even
+    # if all three checks fail.
+    if not getattr(args, "suppress_mcp_deprecation_warnings", False):
+        _check_searxng_remnants(PROJECT_ROOT, _deferral_report)
+        _check_ollama_mcp_remnants(_deferral_report)
+        _check_search_mcp_env_obsolete(_deferral_report)
 
     # v0.2.10 (Bug L2): auto-materialize the boot service so containers
     # come back up after a reboot without manual intervention. Cross-OS:
@@ -6651,97 +6665,238 @@ def _materialize_boot_service_windows(
         )
 
 
-def _materialize_searxng_settings(install_path: Path) -> None:
-    """Materialize `<install_path>/claude_mcp_servers/searxng/settings.yml`
-    from `templates/searxng/settings.yml.template`.
+# ---------------------------------------------------------------------------
+# PR-14b: MCP simplification — deprecation deferral helpers (v0.2.11)
+# ---------------------------------------------------------------------------
 
-    SearXNG (added to the canonical compose in 0.2.11) refuses to start
-    without a non-empty `secret_key`. Pre-0.2.11 the search MCP server
-    assumed SearXNG ran at localhost:8888 but no compose service shipped
-    it, so `web_search` failed with connection refused out of the box.
-    This step closes that loop by:
-      - Creating the bind-mount target dir
-        `<install_path>/claude_mcp_servers/searxng/`
-      - Rendering the settings.yml template with a fresh random
-        secret_key (`secrets.token_hex(32)`)
-      - On update, leaving an existing settings.yml ALONE if it has a
-        non-placeholder secret_key (preserves user customizations +
-        the previously-generated secret).
+def _check_searxng_remnants(
+    install_path: Path,
+    deferral_report: "DeferralReport",
+) -> None:
+    """Emit a deferral when pre-0.2.11 SearXNG artefacts are found on disk.
 
-    Cross-OS: the bind mount works identically on Linux/macOS/Windows
-    Docker Desktop (WSL2 backend). For podman rootless on Linux the
-    `:Z` mount flag in compose.yaml relabels the directory for SELinux.
+    SearXNG was removed from the default compose stack in v0.2.11.  The
+    search MCP now ships only ``search_papers`` (OpenAlex + arXiv); the
+    web/code-search tools that depended on SearXNG are gone.
 
-    Soft-fail throughout: missing template / write failure → log warn,
-    skip. SearXNG will then run with its built-in default settings
-    (which include a random secret_key generated by the image at
-    container build time) — `web_search` still works, just without the
-    curated engine list.
+    This helper is soft-fail throughout — any I/O error is caught and
+    logged; install completes regardless.
+
+    Args:
+        install_path:    Orchestrator project root (typically ``PROJECT_ROOT``).
+        deferral_report: Run-scoped :class:`DeferralReport` to append the
+            entry to when artefacts are found.
     """
-    import secrets
-
-    template = _read_template("templates/searxng/settings.yml.template")
-    if template is None:
-        _log_install_event(
-            "searxng", "skip",
-            "templates/searxng/settings.yml.template missing",
-        )
-        return
-
-    target_dir = install_path / "claude_mcp_servers" / "searxng"
-    target_file = target_dir / "settings.yml"
     try:
-        target_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
+        found_paths: list[str] = []
+        searxng_dir = install_path / "claude_mcp_servers" / "searxng"
+        if searxng_dir.exists():
+            found_paths.append(str(searxng_dir))
+        searxng_tpl = install_path / "templates" / "searxng" / "settings.yml.template"
+        if searxng_tpl.exists():
+            found_paths.append(str(searxng_tpl))
+
+        if not found_paths:
+            return
+
+        paths_str = "\n".join(f"  - {p}" for p in found_paths)
+        rm_args = " ".join(found_paths)
+        deferral_report.add_entry(
+            DeferralEntry(
+                condition_id="searxng_removed_from_default_install",
+                title="SearXNG artefacts from pre-0.2.11 install detected",
+                detected=(
+                    f"SearXNG no longer ships by default in v0.2.11. "
+                    f"Existing local settings preserved at:\n{paths_str}"
+                ),
+                why_deferred=(
+                    "Automatic removal of user-customised SearXNG settings "
+                    "would discard any secret_key or engine list the user "
+                    "configured. Manual review required before deletion."
+                ),
+                command_to_apply=(
+                    f"rm -r {rm_args}\n"
+                    "podman rm -f $(podman ps -a --filter name=searxng -q) 2>/dev/null || true\n"
+                    "# Search narrowed to academic-paper search (search_papers MCP)."
+                ),
+                severity="info",
+                kg_node_refs=[
+                    "knowledge/concepts/orchestrator-mcp-servers.md",
+                ],
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 — soft-fail
         _log_install_event(
-            "searxng", "warn",
-            f"could not mkdir {target_dir}: {exc}",
+            "searxng_remnants_check", "warn",
+            f"could not check SearXNG remnants: {exc}",
+        )
+
+
+def _check_ollama_mcp_remnants(
+    deferral_report: "DeferralReport",
+) -> None:
+    """Emit a deferral when the Ollama MCP entry is still in ~/.claude.json.
+
+    The Ollama MCP server (``chat``, ``read_document``, ``read_image``)
+    was removed from the default install in v0.2.11 — those tools are
+    redundant with Claude's native capabilities.  Ollama as embedding
+    *infrastructure* (Weaviate vectorizers) is unchanged.
+
+    Reads ``_user_home_for_install() / ".claude.json"`` if it exists.
+    Soft-fail throughout — missing or malformed JSON is logged and skipped.
+
+    Uses :func:`_user_home_for_install` (introduced by PR-16) so that
+    pytest fixtures can redirect the lookup via ``VCT_USER_HOME_OVERRIDE``
+    without touching the real user home.
+
+    Args:
+        deferral_report: Run-scoped :class:`DeferralReport` to append the
+            entry to when the ``ollama`` MCP block is found.
+    """
+    claude_json = _user_home_for_install() / ".claude.json"
+    if not claude_json.is_file():
+        return
+    try:
+        data = json.loads(claude_json.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        _log_install_event(
+            "ollama_mcp_check", "warn",
+            f"could not read {claude_json}: {exc}",
         )
         return
+    try:
+        if not isinstance(data, dict):
+            return
+        mcp_servers = data.get("mcpServers", {})
+        if not isinstance(mcp_servers, dict):
+            return
+        if "ollama" not in mcp_servers:
+            return
 
-    # Preservation: if a real settings.yml already exists with a
-    # non-placeholder secret_key, leave it alone (idempotent + respects
-    # user customizations on subsequent --update runs).
-    if target_file.exists():
-        try:
-            existing = target_file.read_text(encoding="utf-8")
-            # Heuristic: "real" secret_key is at least 32 hex chars and
-            # does not contain the literal "{{SECRET_KEY}}" placeholder
-            # nor obviously-placeholder text.
-            import re
-            m = re.search(r'secret_key:\s*"([^"]+)"', existing)
-            if m:
-                key = m.group(1)
-                placeholder = ("{{" in key) or ("change-me" in key.lower())
-                if not placeholder and len(key) >= 32:
-                    _log_install_event(
-                        "searxng", "skip",
-                        "settings.yml already populated with a real secret_key",
-                        data={"target": str(target_file)},
+        deferral_report.add_entry(
+            DeferralEntry(
+                condition_id="ollama_mcp_deprecated",
+                title="Ollama MCP server removed from default install in v0.2.11",
+                detected=(
+                    f"An `ollama` block was found under `mcpServers` in "
+                    f"{claude_json}. The Ollama MCP server (chat / "
+                    "read_document / read_image) is no longer part of the "
+                    "default install — those tools are redundant with "
+                    "Claude's native capabilities."
+                ),
+                why_deferred=(
+                    "Auto-removal of ~/.claude.json entries would be brittle "
+                    "and requires user consent. The existing entry is preserved "
+                    "and fully functional; this deferral is informational only."
+                ),
+                command_to_apply=(
+                    "# Remove the `ollama` block from ~/.claude.json manually:\n"
+                    f"# Edit {claude_json} and delete the `\"ollama\": {{...}}` "
+                    "entry under `mcpServers`.\n"
+                    "# Ollama as embedding infrastructure (Weaviate vectorizers) "
+                    "is UNCHANGED — only the MCP tool-surface is removed."
+                ),
+                severity="info",
+                kg_node_refs=[
+                    "knowledge/concepts/orchestrator-mcp-servers.md",
+                ],
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 — soft-fail
+        _log_install_event(
+            "ollama_mcp_check", "warn",
+            f"could not check Ollama MCP remnants: {exc}",
+        )
+
+
+def _check_search_mcp_env_obsolete(
+    deferral_report: "DeferralReport",
+) -> None:
+    """Emit a deferral when obsolete env vars remain in the search MCP entry.
+
+    In v0.2.11 the search MCP was simplified to ``search_papers`` only.
+    ``SEARXNG_URL`` (no longer needed — SearXNG dropped) and
+    ``GITHUB_TOKEN`` (no longer needed — GitHub code search removed) are
+    now obsolete in ``mcpServers.search.env``.
+
+    Reads ``_user_home_for_install() / ".claude.json"`` if it exists.
+    Soft-fail throughout — missing or malformed JSON is logged and skipped.
+
+    Uses :func:`_user_home_for_install` (introduced by PR-16) so that
+    pytest fixtures can redirect the lookup via ``VCT_USER_HOME_OVERRIDE``
+    without touching the real user home.
+
+    Args:
+        deferral_report: Run-scoped :class:`DeferralReport` to append the
+            entry to when obsolete keys are found.
+    """
+    claude_json = _user_home_for_install() / ".claude.json"
+    if not claude_json.is_file():
+        return
+    try:
+        data = json.loads(claude_json.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        _log_install_event(
+            "search_mcp_env_check", "warn",
+            f"could not read {claude_json}: {exc}",
+        )
+        return
+    try:
+        if not isinstance(data, dict):
+            return
+        search_env = (
+            data.get("mcpServers", {})
+            .get("search", {})
+            .get("env", {})
+        )
+        if not isinstance(search_env, dict):
+            return
+
+        obsolete_keys = [
+            k for k in ("SEARXNG_URL", "GITHUB_TOKEN")
+            if k in search_env
+        ]
+        if not obsolete_keys:
+            return
+
+        keys_str = ", ".join(f"`{k}`" for k in obsolete_keys)
+        deferral_report.add_entry(
+            DeferralEntry(
+                condition_id="search_mcp_simplified",
+                title="Obsolete env vars in search MCP entry in ~/.claude.json",
+                detected=(
+                    f"The following env vars in `mcpServers.search.env` of "
+                    f"{claude_json} are no longer used by the search MCP "
+                    f"in v0.2.11: {keys_str}. "
+                    "The search MCP now provides only `search_papers` "
+                    "(OpenAlex + arXiv)."
+                ),
+                why_deferred=(
+                    "Automatic removal of ~/.claude.json env vars would "
+                    "silently break setups where users forward these "
+                    "variables for other purposes. Manual review required."
+                ),
+                command_to_apply=(
+                    f"# Remove obsolete env vars from mcpServers.search.env "
+                    f"in {claude_json}:\n"
+                    + "\n".join(
+                        f"# Delete the `\"{k}\": \"...\"` line from "
+                        "`mcpServers.search.env`."
+                        for k in obsolete_keys
                     )
-                    return
-        except OSError:
-            # Re-render below if we can't read it.
-            pass
-
-    rendered = _render_template(template, {
-        "SECRET_KEY": secrets.token_hex(32),
-    })
-    try:
-        changed, backup = _backup_and_write_idempotent(target_file, rendered)
-    except OSError as exc:
-        _log_install_event(
-            "searxng", "warn",
-            f"could not write {target_file}: {exc}",
+                    + "\n# Only `OPENALEX_EMAIL` is needed going forward."
+                ),
+                severity="info",
+                kg_node_refs=[
+                    "knowledge/concepts/orchestrator-mcp-servers.md",
+                ],
+            )
         )
-        return
-
-    _log_install_event(
-        "searxng", "ok" if changed else "skip",
-        ("settings.yml written" if changed else "settings.yml unchanged"),
-        data={"target": str(target_file),
-              "backup": str(backup) if backup else None},
-    )
+    except Exception as exc:  # noqa: BLE001 — soft-fail
+        _log_install_event(
+            "search_mcp_env_check", "warn",
+            f"could not check search MCP env remnants: {exc}",
+        )
 
 
 # ---------------------------------------------------------------------------

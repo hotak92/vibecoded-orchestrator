@@ -193,31 +193,20 @@ fn default_mcp_servers() -> Vec<McpServerConfig> {
                 }),
             ]),
         },
-        McpServerConfig {
-            id: "ollama".to_string(),
-            name: "Local LLM".to_string(),
-            description: "Free local inference via Ollama (chat, document analysis)".to_string(),
-            enabled: true,
-            command: "claude_mcp_servers/ollama_mcp/server.py".to_string(),
-            args: vec![],
-            env: HashMap::new(),
-            min_tier: OrchestratorTier::Free,
-            port: None,
-            configurable: true,
-            settings: HashMap::from([
-                ("OLLAMA_URL".to_string(), McpSetting {
-                    label: "Ollama URL".to_string(),
-                    value: "http://localhost:11435".to_string(),
-                    setting_type: McpSettingType::Text,
-                    description: "Ollama API endpoint".to_string(),
-                    editable: true,
-                }),
-            ]),
-        },
+        // NOTE: Ollama MCP server (chat / read_document / read_image) was
+        // removed from the default install in v0.2.11 — those tools are
+        // redundant with Claude's native capabilities. Ollama as embedding
+        // infrastructure (Weaviate vectorizers) is unchanged; it continues
+        // to run as a container service. Users who had the ollama MCP entry
+        // in ~/.claude.json will see a deferral notice from install.py
+        // guiding manual cleanup.
         McpServerConfig {
             id: "search".to_string(),
-            name: "Web & Paper Search".to_string(),
-            description: "Free web search (SearXNG), GitHub code-snippet search, and academic paper search (OpenAlex/arXiv). Note: 'code search' here is GitHub-text-search, NOT the codegraph — codegraph lives in `weaviate-kg`.".to_string(),
+            name: "Academic Paper Search".to_string(),
+            // v0.2.11: Search MCP simplified to search_papers only.
+            // SearXNG (web_search) and GitHub code-search (search_code)
+            // removed. Only OPENALEX_EMAIL env var needed going forward.
+            description: "Academic paper search via OpenAlex (240 M papers) and arXiv CS/ML preprints. Uses search_papers tool only.".to_string(),
             enabled: true,
             command: "claude_mcp_servers/search_mcp/server.py".to_string(),
             args: vec![],
@@ -226,11 +215,11 @@ fn default_mcp_servers() -> Vec<McpServerConfig> {
             port: None,
             configurable: true,
             settings: HashMap::from([
-                ("GITHUB_TOKEN".to_string(), McpSetting {
-                    label: "GitHub Token".to_string(),
+                ("OPENALEX_EMAIL".to_string(), McpSetting {
+                    label: "OpenAlex Email".to_string(),
                     value: String::new(),
-                    setting_type: McpSettingType::Secret,
-                    description: "GitHub PAT for code search (optional, increases rate limits)".to_string(),
+                    setting_type: McpSettingType::Text,
+                    description: "Optional email for OpenAlex polite-pool priority (higher rate limits, no token needed).".to_string(),
                     editable: true,
                 }),
             ]),
