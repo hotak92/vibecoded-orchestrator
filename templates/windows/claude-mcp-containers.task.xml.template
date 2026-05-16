@@ -35,9 +35,33 @@
     {{WORKING_DIR}}        — directory containing compose.yaml
     {{WRAPPER_SCRIPT}}     — absolute path to launch-claude-mcp-stack.sh
                              (use forward slashes; bash translates them)
+    {{LOG_FILE}}           — absolute path to the unit's log file
+                             (use forward slashes; bash translates them)
     {{CREATED_AT}}         — ISO8601 timestamp at materialization time
     {{USER_ID}}            — Windows user ID (e.g. DOMAIN\\user) for the
                              logon trigger context
+
+  Environment propagation (PR-32, 2026-05-16):
+    The wrapper script `launch-claude-mcp-stack.sh` reads three env vars
+    set by the systemd unit on Linux:
+
+        VCT_STACK_WORKING_DIR    — directory containing compose.yaml
+        VCT_STACK_LOG_FILE       — absolute path to the unit's log file
+        VCT_STACK_COMPOSE_OVERRIDE — overlay compose file (defaults to
+                                     `compose.override.yaml`)
+
+    Prior to PR-32 this Windows scheduled task fired bash with NONE of
+    them set, so the wrapper silently fell through to its defaults
+    (which on Windows resolve to paths that may not exist for the
+    current user, breaking compose-up). Mirrors the systemd template's
+    `Environment=VCT_STACK_*=...` lines.
+
+    Mechanism: we replace the bare `<Command>bash</Command>` with
+    `cmd.exe /c "set VAR=val && set VAR2=val2 && set VAR3=val3 && bash
+    <script>"`. `cmd.exe` is always on PATH on Windows; the `set` builtin
+    is per-process scope (it does not leak into the user's interactive
+    environment); the `&&` chain ensures bash inherits the variables.
+    Forward slashes in WRAPPER_SCRIPT survive cmd.exe → bash translation.
 -->
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
@@ -79,26 +103,37 @@
     <Priority>7</Priority>
   </Settings>
   <!--
-    Action invocation note (PR-22, 2026-05-16):
+    Action invocation note (PR-22 + PR-32, 2026-05-16, unified at v0.2.12
+    integration merge):
 
     Task Scheduler XML has no native env-var declarations in <Actions>.
-    To propagate VCT_STACK_COMPOSE_OVERRIDE (the user-machine compose
-    override filename — see scripts/launch-claude-mcp-stack.sh) we set
-    it inline via `bash -c 'export ...; exec ...'`. This mirrors the
-    systemd unit's `Environment=VCT_STACK_COMPOSE_OVERRIDE=...` line.
-    The default value `compose.override.yaml` matches podman-compose's
-    auto-load convention; without this env var, the launcher-managed
-    Storage UX override (PR-10A) is silently ignored at boot because
-    the wrapper's explicit `-f compose.yaml` bypasses auto-load.
+    We propagate the three VCT_STACK_* env vars by wrapping the wrapper
+    script in `cmd.exe /c "set ...&& set ...&& bash WRAPPER"`. cmd.exe is
+    chosen over bash because it is always present on Windows PATH (bash
+    requires WSL or git-bash, neither guaranteed on an end-user machine).
 
-    VCT_STACK_WORKING_DIR is left unset here — pre-existing scope; the
-    wrapper falls back to its own default. Adding it via the same
-    `export` line is a separate, out-of-PR change.
+    Env vars set:
+      * VCT_STACK_WORKING_DIR={{WORKING_DIR}}        — wrapper working dir
+      * VCT_STACK_LOG_FILE={{LOG_FILE}}              — wrapper log target
+      * VCT_STACK_COMPOSE_OVERRIDE=compose.override.yaml — user-machine
+        override (see scripts/launch-claude-mcp-stack.sh) that lets the
+        launcher's Storage UX override (PR-10A) take effect at boot.
+        Default value matches podman-compose's auto-load convention;
+        without it the wrapper's explicit `-f compose.yaml` bypasses
+        auto-load.
+
+    Mirrors the systemd unit's three `Environment=` lines (see
+    templates/systemd/claude-mcp-containers.service.template).
+
+    The `&amp;&amp;` chain XML-escapes `&&` so cmd.exe inherits the env
+    var across the chained `set` commands. `&quot;` escapes the inner
+    double-quote around {{WRAPPER_SCRIPT}} so the wrapper path is
+    correctly quoted when bash receives it.
   -->
   <Actions Context="Author">
     <Exec>
-      <Command>bash</Command>
-      <Arguments>-c "export VCT_STACK_COMPOSE_OVERRIDE=compose.override.yaml; exec bash \"{{WRAPPER_SCRIPT}}\""</Arguments>
+      <Command>cmd.exe</Command>
+      <Arguments>/c "set VCT_STACK_WORKING_DIR={{WORKING_DIR}}&amp;&amp; set VCT_STACK_LOG_FILE={{LOG_FILE}}&amp;&amp; set VCT_STACK_COMPOSE_OVERRIDE=compose.override.yaml&amp;&amp; bash &quot;{{WRAPPER_SCRIPT}}&quot;"</Arguments>
       <WorkingDirectory>{{WORKING_DIR}}</WorkingDirectory>
     </Exec>
   </Actions>

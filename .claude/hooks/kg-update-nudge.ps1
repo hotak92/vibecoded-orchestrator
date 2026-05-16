@@ -1,5 +1,24 @@
-# parity-confirmation 2026-05-10: .sh sibling now uses _lib/find-python.sh; this .ps1 already used _lib/find-python.ps1 — true parity, no asymmetric fix.
-# Parity-touch 2026-05-08: bash shebang of sibling .sh switched from #!/bin/bash to #!/usr/bin/env bash for macOS portability. PS1 has no shebang to change; this comment is the parity-required modification.
+# OS-EXEMPT-PARITY: PR-32 body-parity audit + parity-confirmation comments only — no .sh change required (every .sh-side incident fix is already present in this .ps1 sibling; see audit notes below).
+# parity-confirmation 2026-05-16 (PR-32, Group K Phase B): full v10.1 body parity
+# audit confirmed — every .sh-side incident fix is present in this .ps1 sibling:
+#   - stdout-vs-stderr fix (commit f4ebe3e2): nudge text is printed via `print()`
+#     in the embedded Python (line ~254), which surfaces as STDOUT — Claude Code
+#     renders UserPromptSubmit stdout as a system-reminder.
+#   - silent-failure-v3 (commit 5d9606b5): transcript-parse errors are wrapped
+#     in `try/except (json.JSONDecodeError, TypeError): sys.exit(0)` (line ~96).
+#   - search-first workflow (commit 95d09a52): transcript scan via
+#     `TranscriptScanner().scan(transcript_path, on_assistant_message=_on_msg)`
+#     runs BEFORE the threshold check + nudge emit (lines ~155-164).
+#   - 25k-interval baseline reset (commit 95d09a52): KG-write detection
+#     branch resets `current["baseline"]` + `current["fired_once"] = False`
+#     (lines ~208-212). Threshold defaults match .sh (175k first, 50k interval).
+#   - transcript-based escape hatch (commit f1ac0e3f): NO_KG_UPDATE_MARKER_RE
+#     regex (line ~134) + escape_hatch_active branch (lines ~198-201, ~213-216).
+# parity-confirmation 2026-05-10: .sh sibling now uses _lib/find-python.sh;
+# this .ps1 already used _lib/find-python.ps1 — true parity, no asymmetric fix.
+# Parity-touch 2026-05-08: bash shebang of sibling .sh switched from #!/bin/bash
+# to #!/usr/bin/env bash for macOS portability. PS1 has no shebang to change;
+# this comment is the parity-required modification.
 #!/usr/bin/env pwsh
 # KG-update nudge — PowerShell sibling of kg-update-nudge.sh
 # Same v10.1 logic; cross-OS sibling for Windows. Both shells delegate to
