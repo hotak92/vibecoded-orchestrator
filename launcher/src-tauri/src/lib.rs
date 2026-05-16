@@ -785,6 +785,11 @@ pub fn run() {
             commands::project_identity::cleanup_legacy_codegraph_collections,
             commands::project_identity::get_legacy_codegraph_notice_dismissed,
             commands::project_identity::set_legacy_codegraph_notice_dismissed,
+            // PR-26 / Group E (v0.2.12 / 2026-05-16): shared KG canonical-name
+            // picker — surfaces orchestrator-shaped classes on Weaviate so the
+            // IdentityTab can let users pick which class is canonical.
+            commands::project_identity::list_orchestrator_kg_collections,
+            commands::project_identity::set_shared_kg_collection_name,
             // Hub proxy (v1.1)
             commands::hub_proxy::hub_info,
             commands::hub_proxy::hub_list_apps,

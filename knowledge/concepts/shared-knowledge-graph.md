@@ -10,10 +10,13 @@ status: active
 # Shared Knowledge Graph (Cross-Project)
 
 The vibecoded orchestrator ships with a **cross-project shared KG** — a single
-Weaviate collection (`VibeCodedTools_KnowledgeGraph`) seeded at install time
-from `vibecoded-orchestrator/knowledge/`. Every project on the machine queries
-both its own per-project KG **and** the shared KG by default; results are
-merged, de-duped, and re-ranked together.
+Weaviate collection (`VibecodedOrchestrator_KnowledgeGraph`, renamed from
+`VibeCodedTools_KnowledgeGraph` in v0.2.12 / PR-26 Group E) seeded at install
+time from `vibecoded-orchestrator/knowledge/`. Every project on the machine
+queries both its own per-project KG **and** the shared KG by default; results
+are merged, de-duped, and re-ranked together. Users with data still under the
+old name can designate it as canonical via the launcher's Identity tab
+"Manage shared KG collection" picker — no data migration required.
 
 ## Goal
 

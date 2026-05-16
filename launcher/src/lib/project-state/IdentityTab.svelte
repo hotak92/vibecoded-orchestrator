@@ -30,6 +30,7 @@
   import { toast } from '$lib/stores/toast';
   import { projects as projectsStore } from '$lib/stores/projects';
   import LegacyCollectionsModal from '$lib/components/LegacyCollectionsModal.svelte';
+  import SharedKgPicker from '$lib/components/SharedKgPicker.svelte';
   import type {
     ProjectIdentity,
     UpdateProjectIdentityRequest,
@@ -80,11 +81,17 @@
 
   // Derived: the shared KG collection name. When the orchestratorRootView
   // is available, compute it from the root's name. Otherwise falls back
-  // to the canonical default ("VibeCodedOrchestrator_KnowledgeGraph").
+  // to the canonical default ("VibecodedOrchestrator_KnowledgeGraph").
+  //
+  // PR-26 / Group E (v0.2.12 / 2026-05-16): aligned with the canonical
+  // name used by `vco_lib/project_init.py::derive_project_collection_names`
+  // and the existing-installs convention (lowercase-d "Vibecoded"). Was
+  // "VibeCodedOrchestrator_KnowledgeGraph" pre-v0.2.12 — that spelling
+  // never matched the actual class users had on disk.
   const sharedKgName = $derived(
     orchestratorRootView
       ? `${sanitizeKgCollection(orchestratorRootView.name)}_KnowledgeGraph`
-      : 'VibeCodedOrchestrator_KnowledgeGraph'
+      : 'VibecodedOrchestrator_KnowledgeGraph'
   );
 
   // PR-8: manual entry point for the legacy-collections cleanup, gated to
@@ -94,6 +101,55 @@
   // auto-show on first startup; this button is the explicit re-entry
   // point for users who dismissed the auto-notice.
   let showLegacyModal = $state(false);
+
+  // PR-26 / Group E (v0.2.12 / 2026-05-16): orchestrator-shaped KG
+  // collections detected on Weaviate. Loaded on mount via the new
+  // `list_orchestrator_kg_collections` Tauri command (which wraps the
+  // existing `hub::cli_api::detect_orchestrator_kg_collections` probe of
+  // `/v1/schema`). Used to surface a picker when multiple candidates
+  // exist on the user's Weaviate and the derived canonical name doesn't
+  // match exactly one of them — e.g. a user with an old
+  // `VibeCodedTools_KnowledgeGraph` class alongside the new canonical
+  // `VibecodedOrchestrator_KnowledgeGraph` can choose which one is
+  // authoritative without hand-editing env files. Soft-fail: if the
+  // detect call fails (Weaviate unreachable, GUI offline, etc.) the
+  // picker just doesn't show — `sharedKgName` continues to render.
+  let detectedKgClasses = $state<string[]>([]);
+  let showKgPicker = $state(false);
+  let savingSharedKgPick = $state(false);
+
+  async function loadDetectedKgClasses() {
+    try {
+      detectedKgClasses = await invoke<string[]>('list_orchestrator_kg_collections');
+    } catch {
+      detectedKgClasses = [];
+    }
+  }
+
+  // Show the picker affordance when:
+  //   - multiple orchestrator-shaped classes exist on Weaviate, AND
+  //   - the derived canonical name isn't one of them (user almost
+  //     certainly has stale data they want to point at OR a custom
+  //     branded name they want to register as canonical).
+  const showPickerButton = $derived(
+    detectedKgClasses.length > 1 && !detectedKgClasses.includes(sharedKgName),
+  );
+
+  async function persistSharedKgChoice(picked: string) {
+    savingSharedKgPick = true;
+    try {
+      await invoke('set_shared_kg_collection_name', { name: picked });
+      toast.success(`Shared KG canonical name set to ${picked}`);
+      // Refresh the projects store so any project-scoped env-derived
+      // values that depend on the shared KG name update.
+      await projectsStore.load();
+    } catch (e) {
+      toast.error(e);
+    } finally {
+      savingSharedKgPick = false;
+      showKgPicker = false;
+    }
+  }
 
   // Edit-buffer state. Bound to the inputs; flushed to the backend on Save.
   let editKg = $state('');
@@ -214,6 +270,7 @@
   }
 
   onMount(load);
+  onMount(loadDetectedKgClasses);
   $effect(() => {
     if (projectId) void load();
   });
@@ -386,6 +443,29 @@
           </p>
         {/if}
       {/if}
+
+      <!-- PR-26 / Group E (v0.2.12 / 2026-05-16): partial-match picker.
+           When Weaviate has >1 orchestrator-shaped class AND none of
+           them match the derived canonical name, surface the picker so
+           the user can designate an existing class as canonical (common
+           case: a pre-rename `VibeCodedTools_KnowledgeGraph` class
+           alongside the new default). Soft-fail: button hidden when
+           `list_orchestrator_kg_collections` returned <=1 candidate. -->
+      {#if showPickerButton}
+        <p class="ps-form-hint ps-shared-kg-picker-hint">
+          <strong>{detectedKgClasses.length}</strong> orchestrator-shaped
+          KG collections detected on Weaviate, none matching the canonical
+          name. You can designate one as canonical — useful when migrating
+          from a pre-v0.2.12 install or running a custom-branded orchestrator.
+        </p>
+        <button
+          class="ps-btn-secondary"
+          onclick={() => (showKgPicker = true)}
+          disabled={savingSharedKgPick}
+        >
+          Manage shared KG collection ({detectedKgClasses.length} candidates)
+        </button>
+      {/if}
     </div>
 
     <!-- PR-8 (v0.2.11): orchestrator-root only — manual entry for the
@@ -416,6 +496,15 @@
 
 {#if showLegacyModal}
   <LegacyCollectionsModal onClose={() => (showLegacyModal = false)} />
+{/if}
+
+{#if showKgPicker}
+  <SharedKgPicker
+    candidates={detectedKgClasses}
+    currentName={sharedKgName}
+    onPick={persistSharedKgChoice}
+    onClose={() => (showKgPicker = false)}
+  />
 {/if}
 
 <style>
@@ -625,5 +714,15 @@
     margin-top: 6px;
     color: #f5b342;
     font-style: italic;
+  }
+
+  /* PR-26 / Group E (v0.2.12): picker affordance hint. */
+  .ps-shared-kg-picker-hint {
+    margin-top: 10px;
+    padding: 6px 10px;
+    background: rgba(245,179,66,0.06);
+    border-left: 2px solid rgba(245,179,66,0.35);
+    border-radius: 3px;
+    line-height: 1.45;
   }
 </style>

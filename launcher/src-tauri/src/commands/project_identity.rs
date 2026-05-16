@@ -744,6 +744,184 @@ pub async fn set_legacy_codegraph_notice_dismissed(
 
 // ─── Internal helpers ────────────────────────────────────────────────────
 
+// ─── PR-26 / Group E (v0.2.12 / 2026-05-16): shared KG picker ───────────
+//
+// Surfaces ALL orchestrator-shaped KG classes detected on Weaviate so the
+// launcher's IdentityTab can present a partial-match picker. The detection
+// itself mirrors `hub::cli_api::detect_orchestrator_kg_collections`
+// byte-for-byte at the algorithm level (probe `/v1/schema`, keep classes
+// whose properties include the four marker fields `title text` +
+// `node_type text` + `tags text[]` + `typed_links object[]`). It is
+// re-implemented here rather than re-exported because the cli_api helper
+// is private and lifting it to `pub(crate)` would touch a file outside
+// this PR's allowlist. Drift is monitored by the unit test
+// `detects_orchestrator_shaped_classes_only`.
+//
+// Persistence: the picked name lands in the global app_state row
+// `shared_kg.collection_name`. That key is the Priority-1 source
+// consulted by `project_env_settings::populate`, so every project's
+// `SHARED_KG_COLLECTION` env value picks up the new canonical on its
+// next env-surface refresh (idempotent — value-identical writes are
+// ~50 ms no-ops via the deep-merge env writer).
+//
+// Soft-fail: the picker is purely informational. If Weaviate is
+// unreachable the command returns Ok(empty Vec) and the IdentityTab
+// hides the picker button (no toast, no error).
+
+const ORCHESTRATOR_KG_PICKER_MARKERS: &[&str] =
+    &["title", "node_type", "tags", "typed_links"];
+
+/// Marker name to expected Weaviate dataType[0] for the orchestrator-
+/// shape check. Mirrors the closure in `hub::cli_api`.
+fn marker_datatype_matches(marker: &str, dt: &str) -> bool {
+    match marker {
+        "title" | "node_type" => dt == "text",
+        "tags" => dt == "text[]",
+        "typed_links" => dt == "object[]",
+        _ => false,
+    }
+}
+
+/// Parse a Weaviate `/v1/schema` JSON body and return the names of
+/// classes that have ALL orchestrator-shape marker properties. Sorted.
+fn extract_orchestrator_shaped_classes(schema: &serde_json::Value) -> Vec<String> {
+    let classes = match schema.get("classes").and_then(|c| c.as_array()) {
+        Some(arr) => arr,
+        None => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for cls in classes {
+        let name = match cls.get("class").and_then(|v| v.as_str()) {
+            Some(s) if !s.is_empty() => s,
+            _ => continue,
+        };
+        let props = match cls.get("properties").and_then(|p| p.as_array()) {
+            Some(a) => a,
+            None => continue,
+        };
+        let mut by_name: std::collections::HashMap<&str, &str> =
+            std::collections::HashMap::new();
+        for p in props {
+            let pn = p.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let dt = p
+                .get("dataType")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !pn.is_empty() {
+                by_name.insert(pn, dt);
+            }
+        }
+        let has_all = ORCHESTRATOR_KG_PICKER_MARKERS.iter().all(|m| {
+            let dt = by_name.get(*m).copied().unwrap_or("");
+            marker_datatype_matches(m, dt)
+        });
+        if has_all {
+            out.push(name.to_string());
+        }
+    }
+    out.sort();
+    out
+}
+
+/// List every orchestrator-shaped KG class currently in Weaviate. Soft-fails
+/// to an empty vec on any transport / parse failure — the IdentityTab
+/// hides its picker button on empty.
+#[command]
+pub async fn list_orchestrator_kg_collections(
+    cfg: State<'_, LocalConfig>,
+) -> Result<Vec<String>, String> {
+    let base = resolve_weaviate_url(&cfg);
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[vct] list_orchestrator_kg_collections http client: {}", e);
+            return Ok(Vec::new());
+        }
+    };
+    let resp = match client.get(format!("{}/v1/schema", base)).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[vct] list_orchestrator_kg_collections schema fetch: {}", e);
+            return Ok(Vec::new());
+        }
+    };
+    if !resp.status().is_success() {
+        eprintln!(
+            "[vct] list_orchestrator_kg_collections: schema HTTP {}",
+            resp.status().as_u16()
+        );
+        return Ok(Vec::new());
+    }
+    let schema: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[vct] list_orchestrator_kg_collections parse: {}", e);
+            return Ok(Vec::new());
+        }
+    };
+    Ok(extract_orchestrator_shaped_classes(&schema))
+}
+
+/// Persist the user's pick from the SharedKgPicker as the canonical
+/// shared KG class name (`app_state[shared_kg.collection_name]`).
+///
+/// Validation:
+///   * `name` non-empty, length <= 100.
+///   * Matches Weaviate class-name shape (letter-prefix, [A-Za-z0-9_]+).
+///   * Ends with `_KnowledgeGraph` — the launcher's env writers + every
+///     consumer in the codebase assume the shared KG suffix is this
+///     literal string. Refusing other suffixes prevents users from
+///     accidentally pointing the shared-KG knob at a code-graph or
+///     development class.
+///
+/// Audit-logged via `db.audit("shared_kg_collection_name_set", ...)`.
+#[command]
+pub async fn set_shared_kg_collection_name(
+    name: String,
+    db: State<'_, Db>,
+) -> Result<(), String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("shared KG name cannot be empty".into());
+    }
+    if trimmed.len() > 100 {
+        return Err(format!(
+            "shared KG name too long ({} chars; max 100)",
+            trimmed.len()
+        ));
+    }
+    if !is_valid_collection_name(trimmed) {
+        return Err(format!(
+            "shared KG name '{}' contains invalid characters \
+             (allowed: A-Z a-z 0-9 _; must start with a letter)",
+            trimmed
+        ));
+    }
+    if !trimmed.ends_with("_KnowledgeGraph") {
+        return Err(format!(
+            "shared KG name '{}' must end with _KnowledgeGraph",
+            trimmed
+        ));
+    }
+    db.app_state_set(
+        crate::commands::project_env_settings::APP_STATE_KEY_SHARED_KG_NAME,
+        trimmed,
+    )?;
+    db.audit(
+        "shared_kg_collection_name_set",
+        None,
+        None,
+        &serde_json::json!({ "new_value": trimmed }),
+    )
+    .ok();
+    Ok(())
+}
+
 fn resolve_weaviate_url(cfg: &LocalConfig) -> String {
     if let Ok(v) = std::env::var("VCT_WEAVIATE_URL") {
         if !v.is_empty() {
@@ -1056,5 +1234,164 @@ mod tests {
         let tmp = tempfile::tempdir().expect("mkdir tmp");
         assert!(read_vct_module_name(tmp.path()).is_none());
         assert!(read_vct_module_version(tmp.path()).is_none());
+    }
+
+    // ─── PR-26 / Group E: shared KG picker schema-shape detection ─────
+
+    fn make_class(name: &str, props: &[(&str, &str)]) -> serde_json::Value {
+        serde_json::json!({
+            "class": name,
+            "properties": props.iter().map(|(n, dt)| serde_json::json!({
+                "name": n,
+                "dataType": [dt],
+            })).collect::<Vec<_>>()
+        })
+    }
+
+    fn orchestrator_shape_props() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("title", "text"),
+            ("node_type", "text"),
+            ("tags", "text[]"),
+            ("typed_links", "object[]"),
+        ]
+    }
+
+    #[test]
+    fn detects_orchestrator_shaped_classes_only() {
+        let schema = serde_json::json!({
+            "classes": [
+                make_class("FooBar_KnowledgeGraph", &orchestrator_shape_props()),
+                make_class("Acme_KnowledgeGraph", &orchestrator_shape_props()),
+                // Missing typed_links → must be filtered out.
+                make_class("ExampleProj_KnowledgeGraph", &[
+                    ("title", "text"),
+                    ("node_type", "text"),
+                    ("tags", "text[]"),
+                ]),
+                // Code-graph class shape — wrong markers entirely.
+                make_class("FooBar_CodeFunction", &[
+                    ("name", "text"),
+                    ("body", "text"),
+                ]),
+                // tags has wrong dataType → filtered.
+                make_class("WrongTagShape_KnowledgeGraph", &[
+                    ("title", "text"),
+                    ("node_type", "text"),
+                    ("tags", "text"),
+                    ("typed_links", "object[]"),
+                ]),
+            ]
+        });
+        let detected = extract_orchestrator_shaped_classes(&schema);
+        // Sorted alphabetically.
+        assert_eq!(
+            detected,
+            vec![
+                "Acme_KnowledgeGraph".to_string(),
+                "FooBar_KnowledgeGraph".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn detects_empty_when_no_classes_key() {
+        let schema = serde_json::json!({});
+        assert!(extract_orchestrator_shaped_classes(&schema).is_empty());
+    }
+
+    #[test]
+    fn detects_empty_when_classes_is_empty_array() {
+        let schema = serde_json::json!({ "classes": [] });
+        assert!(extract_orchestrator_shaped_classes(&schema).is_empty());
+    }
+
+    #[test]
+    fn detects_skips_classes_with_no_name() {
+        let schema = serde_json::json!({
+            "classes": [
+                {
+                    "class": "",
+                    "properties": [
+                        { "name": "title", "dataType": ["text"] },
+                        { "name": "node_type", "dataType": ["text"] },
+                        { "name": "tags", "dataType": ["text[]"] },
+                        { "name": "typed_links", "dataType": ["object[]"] },
+                    ]
+                },
+                make_class("FooBar_KnowledgeGraph", &orchestrator_shape_props()),
+            ]
+        });
+        assert_eq!(
+            extract_orchestrator_shaped_classes(&schema),
+            vec!["FooBar_KnowledgeGraph".to_string()]
+        );
+    }
+
+    #[test]
+    fn marker_datatype_check_is_strict() {
+        assert!(marker_datatype_matches("title", "text"));
+        assert!(marker_datatype_matches("node_type", "text"));
+        assert!(marker_datatype_matches("tags", "text[]"));
+        assert!(marker_datatype_matches("typed_links", "object[]"));
+        // Wrong type for any marker → false.
+        assert!(!marker_datatype_matches("title", "text[]"));
+        assert!(!marker_datatype_matches("tags", "text"));
+        assert!(!marker_datatype_matches("typed_links", "object"));
+        // Unknown marker → always false (defensive).
+        assert!(!marker_datatype_matches("unknown_marker", "text"));
+    }
+
+    // ─── PR-26 / Group E: set_shared_kg_collection_name validation ────
+    //
+    // Pure validation tests for the helper logic. The async Tauri command
+    // itself is exercised end-to-end in
+    // `tests/test_project_identity_kg_picker.py` (Python integration).
+
+    fn validate_shared_kg_name(name: &str) -> Result<String, String> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err("shared KG name cannot be empty".into());
+        }
+        if trimmed.len() > 100 {
+            return Err(format!(
+                "shared KG name too long ({} chars; max 100)",
+                trimmed.len()
+            ));
+        }
+        if !is_valid_collection_name(trimmed) {
+            return Err(format!(
+                "shared KG name '{}' contains invalid characters",
+                trimmed
+            ));
+        }
+        if !trimmed.ends_with("_KnowledgeGraph") {
+            return Err(format!(
+                "shared KG name '{}' must end with _KnowledgeGraph",
+                trimmed
+            ));
+        }
+        Ok(trimmed.to_string())
+    }
+
+    #[test]
+    fn shared_kg_name_accepts_canonical_shapes() {
+        assert!(validate_shared_kg_name("VibecodedOrchestrator_KnowledgeGraph").is_ok());
+        assert!(validate_shared_kg_name("FooBar_KnowledgeGraph").is_ok());
+        assert!(validate_shared_kg_name("Acme_KnowledgeGraph").is_ok());
+        assert!(validate_shared_kg_name("  FooBar_KnowledgeGraph  ").is_ok());
+    }
+
+    #[test]
+    fn shared_kg_name_rejects_invalid_shapes() {
+        assert!(validate_shared_kg_name("").is_err());
+        assert!(validate_shared_kg_name("   ").is_err());
+        assert!(validate_shared_kg_name("FooBar_CodeFunction").is_err()); // wrong suffix
+        assert!(validate_shared_kg_name("FooBar").is_err()); // no suffix at all
+        assert!(validate_shared_kg_name("_LeadingUnderscore_KnowledgeGraph").is_err());
+        assert!(validate_shared_kg_name("3StartsWithDigit_KnowledgeGraph").is_err());
+        assert!(validate_shared_kg_name("has-dash_KnowledgeGraph").is_err());
+        let too_long = format!("{}_KnowledgeGraph", "F".repeat(95));
+        assert!(validate_shared_kg_name(&too_long).is_err());
     }
 }

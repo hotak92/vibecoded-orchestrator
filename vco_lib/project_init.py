@@ -132,7 +132,7 @@ def derive_project_collection_names(project_name: str) -> dict:
           "kg_collection":              "<sanitized>_KnowledgeGraph",
           "development_collection":     "<sanitized>_Development",   # uppercase D
           "project_name":               <raw, not sanitized>,
-          "shared_kg_collection":       "VibeCodedTools_KnowledgeGraph",
+          "shared_kg_collection":       "VibecodedOrchestrator_KnowledgeGraph",
           "shared_kg_write_disabled":   "false",
           "kg_basename":                "<sanitized>",
         }
@@ -143,11 +143,21 @@ def derive_project_collection_names(project_name: str) -> dict:
     string so all 4 env surfaces can pass it through unchanged.
     """
     basename = sanitize_for_weaviate_class(project_name)
+    # Canonical shared KG class name. Aligned across:
+    #   - this file (vco_lib/project_init.py)
+    #   - launcher/src/lib/project-state/IdentityTab.svelte fallback
+    #   - all migration scripts (scripts/migrate-shared-kg-schema.{sh,ps1})
+    # Renamed from VibeCodedTools_KnowledgeGraph in v0.2.12 (PR-26 / Group E)
+    # to match the orchestrator branding + the convention seen on existing
+    # developer installs (the class on disk uses this exact spelling).
+    # Note casing: lowercase-d "Vibecoded" preserved per existing-installs.
+    # Users with data under the old name can migrate via the launcher's
+    # Shared KG picker (Settings -> Identity -> "Manage shared KG collection").
     return {
         "kg_collection": f"{basename}_KnowledgeGraph",
         "development_collection": f"{basename}_Development",
         "project_name": project_name,
-        "shared_kg_collection": "VibeCodedTools_KnowledgeGraph",
+        "shared_kg_collection": "VibecodedOrchestrator_KnowledgeGraph",
         "shared_kg_write_disabled": "false",
         "kg_basename": basename,
     }
