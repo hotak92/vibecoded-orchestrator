@@ -1929,6 +1929,14 @@ def main() -> int:
                              "to seed, the MCP server creates collections lazily on first "
                              "write. Useful in CI / test runs. Re-run later with "
                              "`kg-sync --all` (handles both knowledge/ and docs/ since 2026-04-30).")
+    # PR-39 (v0.2.12, 2026-05-16): the orchestrator-self's runtime .claude/
+    # is now rendered from templates/ at install time. This flag skips that
+    # step for tests / installs targeting a pre-populated .claude/.
+    parser.add_argument("--skip-materialize-claude-dir", action="store_true",
+                        default=False,
+                        help="Skip rendering .claude/{hooks,scripts,settings.json} "
+                             "from templates/ (PR-39, v0.2.12). Useful in tests or "
+                             "when targeting a pre-populated .claude/ directory.")
     parser.add_argument("--no-resume", action="store_true", default=False,
                         help="Disable resume-from-log. Forces every step to run "
                              "even if state/logs/install.jsonl says a previous "
@@ -2179,6 +2187,20 @@ def main() -> int:
 
     # Step 5: Install/update Python dependencies
     _install_requirements(venv_python, dev=args.dev)
+
+    # Step 5b: Materialize orchestrator-self .claude/ from templates.
+    # PR-39 (v0.2.12): the public repo no longer ships .claude/{hooks,
+    # scripts,settings.json}; install.py renders them from templates/ at
+    # install time (and on every --update). Runs AFTER _install_requirements
+    # so any Python scripts can use the venv, and BEFORE _seed_weaviate so
+    # the orchestrator's KG-sync hooks are in place when seeding runs.
+    if not getattr(args, "skip_materialize_claude_dir", False):
+        _materialize_orchestrator_self_claude_dir(PROJECT_ROOT)
+    else:
+        _log_install_event(
+            "4b/10", "skip",
+            "--skip-materialize-claude-dir set; .claude/ left untouched",
+        )
 
     # Step 6: Container services (restart on update to pick up config changes)
     if not args.no_containers:
@@ -4400,6 +4422,149 @@ def _install_requirements(venv_python: Path, *, dev: bool) -> None:
         sys.exit(1)
     print("  OK")
     _log_install_event("4/10", "ok", "pip install completed")
+
+
+# ---------------------------------------------------------------------------
+# Step 5b: Materialize orchestrator-self .claude/ from templates
+#
+# PR-39 (v0.2.12, 2026-05-16). Before this PR the public repo shipped:
+#   1. 50 .claude/hooks/*.{sh,ps1} files byte-identical with templates/hooks/*
+#      (CI gate check_template_drift.py enforced parity — pure duplication).
+#   2. 36 .claude/scripts/*.py files where templates were NEWER (post commit
+#      c209261 per-project portability fix never reached the active copies).
+#   3. .claude/settings.json — bash-flavored Linux/macOS-only assembled
+#      artifact that would break on Windows installs without bash.
+#
+# User direction (2026-05-16): "anything that is or will be generated from a
+# template at install time should NOT ship in the public repo. Only ship the
+# template itself." Templates are now the single source of truth; this
+# function renders the orchestrator-self's runtime .claude/ from them at
+# install time (and on every --update). Downstream user projects already
+# went through this template-driven render via vco_lib.project_init —
+# orchestrator-self now uses the same pipeline.
+# ---------------------------------------------------------------------------
+
+def _materialize_orchestrator_self_claude_dir(install_root: Path) -> None:
+    """Render the orchestrator-self's runtime .claude/ contents from templates.
+
+    Copies ``templates/hooks/*`` → ``<install_root>/.claude/hooks/`` and
+    ``templates/scripts/*`` → ``<install_root>/.claude/scripts/`` preserving
+    executable bits, then renders the OS-appropriate
+    ``templates/settings.json.{linux,windows}.template`` to
+    ``<install_root>/.claude/settings.json``.
+
+    Idempotent: re-running overwrites with the current templates. Users
+    running ``install.py --update`` after a ``git pull`` get the latest
+    hook/script/settings content automatically.
+
+    Soft-fail: if any individual template file is missing for some reason,
+    a warning is logged and the install continues — a partial hook set
+    is better than aborting an entire install over a single file. The
+    settings.json render is also soft-fail (skipped with warning) so a
+    missing OS template doesn't kill the install on an unexpected
+    platform.
+
+    Honors ``--skip-materialize-claude-dir`` for tests / special-case
+    installs targeting a pre-populated .claude/ directory.
+    """
+    claude_dir = install_root / ".claude"
+    templates_dir = install_root / "templates"
+
+    print("[4b/10] Materializing orchestrator .claude/ from templates ... ",
+          end="", flush=True)
+    _log_install_event("4b/10", "start",
+                       "rendering .claude/{hooks,scripts,settings.json}")
+
+    copied_hooks = 0
+    copied_scripts = 0
+    warnings: list[str] = []
+
+    # 1. Hooks: templates/hooks/* → .claude/hooks/* preserving exec bit.
+    hooks_src = templates_dir / "hooks"
+    hooks_dst = claude_dir / "hooks"
+    if not hooks_src.is_dir():
+        warnings.append(f"templates/hooks/ missing at {hooks_src}")
+    else:
+        hooks_dst.mkdir(parents=True, exist_ok=True)
+        for src in hooks_src.iterdir():
+            if not src.is_file():
+                continue  # Skip _lib/ and other subdirs; handled below.
+            try:
+                shutil.copy2(src, hooks_dst / src.name)
+                copied_hooks += 1
+            except OSError as e:
+                warnings.append(f"failed to copy {src.name}: {e}")
+        # Also copy nested helper dirs (e.g. _lib/) that ship alongside.
+        for sub in hooks_src.iterdir():
+            if sub.is_dir():
+                dst_sub = hooks_dst / sub.name
+                if dst_sub.exists():
+                    shutil.rmtree(dst_sub)
+                try:
+                    shutil.copytree(sub, dst_sub)
+                except OSError as e:
+                    warnings.append(f"failed to copy hooks subdir {sub.name}: {e}")
+
+    # 2. Scripts: same pattern.
+    scripts_src = templates_dir / "scripts"
+    scripts_dst = claude_dir / "scripts"
+    if not scripts_src.is_dir():
+        warnings.append(f"templates/scripts/ missing at {scripts_src}")
+    else:
+        scripts_dst.mkdir(parents=True, exist_ok=True)
+        for src in scripts_src.iterdir():
+            if not src.is_file():
+                continue
+            try:
+                shutil.copy2(src, scripts_dst / src.name)
+                copied_scripts += 1
+            except OSError as e:
+                warnings.append(f"failed to copy {src.name}: {e}")
+
+    # 3. settings.json: OS-dispatch + render.
+    if platform.system() == "Windows":
+        settings_template = templates_dir / "settings.json.windows.template"
+    else:
+        settings_template = templates_dir / "settings.json.linux.template"
+    if not settings_template.is_file():
+        warnings.append(f"settings template missing at {settings_template}")
+    else:
+        try:
+            rendered = settings_template.read_text(encoding="utf-8")
+            # Placeholder substitution (no-op today: the OS templates are
+            # fully concrete and ship without `{{PROJECT_NAME}}` markers).
+            # Kept as a hook for future placeholder rollout. If downstream
+            # user-project install (vco_lib.project_init) adds new
+            # placeholders, mirror them here so the orchestrator-self
+            # gets the same render contract.
+            rendered = rendered.replace("{{PROJECT_NAME}}",
+                                        "VibeCoded Orchestrator")
+            settings_dst = claude_dir / "settings.json"
+            settings_dst.parent.mkdir(parents=True, exist_ok=True)
+            settings_dst.write_text(rendered, encoding="utf-8")
+        except OSError as e:
+            warnings.append(f"failed to render settings.json: {e}")
+
+    if warnings:
+        print("PARTIAL")
+        for w in warnings:
+            print(f"  ! {w}")
+        _log_install_event(
+            "4b/10", "warn",
+            f"materialized {copied_hooks} hooks + {copied_scripts} scripts "
+            f"with {len(warnings)} warnings",
+            data={"warnings": warnings,
+                  "copied_hooks": copied_hooks,
+                  "copied_scripts": copied_scripts},
+        )
+    else:
+        print(f"OK ({copied_hooks} hooks, {copied_scripts} scripts)")
+        _log_install_event(
+            "4b/10", "ok",
+            f"materialized {copied_hooks} hooks + {copied_scripts} scripts",
+            data={"copied_hooks": copied_hooks,
+                  "copied_scripts": copied_scripts},
+        )
 
 
 # ---------------------------------------------------------------------------

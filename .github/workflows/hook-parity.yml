@@ -1,4 +1,15 @@
-name: Hook OS-Parity & Template Drift Gate
+name: Hook OS-Parity Gate
+
+# PR-39 (v0.2.12, 2026-05-16): the public repo no longer ships
+# .claude/{hooks,scripts,settings.json} — those are rendered from templates/
+# at install time. The two former drift gates (check_template_drift.py and
+# check_settings_template_drift.py) compared .claude/ ↔ templates/, which is
+# now meaningless (templates are the single source of truth). Both gates +
+# their workflow jobs were removed alongside the shipped duplicates.
+#
+# The remaining gates are STILL valuable:
+#  - hook-parity: .sh ↔ .ps1 logical equivalence on the TEMPLATE side.
+#  - hook-set-discipline: `set -e` + `pipefail` pairing on template hooks.
 
 on:
   pull_request:
@@ -36,22 +47,6 @@ jobs:
         run: |
           python3 .github/scripts/check_hook_parity.py
 
-  template-drift:
-    name: Check .claude/ ↔ templates/ drift
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-
-      - name: Run drift check
-        run: |
-          python3 .github/scripts/check_template_drift.py
-
   hook-set-discipline:
     name: Check `set -e` always paired with `pipefail`
     runs-on: ubuntu-latest
@@ -67,23 +62,3 @@ jobs:
       - name: Run set-discipline check
         run: |
           python3 .github/scripts/check_hook_set_directives.py
-
-  settings-template-drift:
-    # Catches the failure mode where .claude/settings.json wires a hook (e.g.
-    # kg-update-nudge) but the install templates ship without it — fresh
-    # installs then get a dead hook script. Rooted by the 2026-05-08
-    # install-flow audit (3 missing kg-update-nudge wirings).
-    name: Check .claude/settings.json ↔ install-templates drift
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-
-      - name: Run settings-template drift check
-        run: |
-          python3 .github/scripts/check_settings_template_drift.py

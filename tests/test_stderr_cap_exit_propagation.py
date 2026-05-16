@@ -41,9 +41,16 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-CAP_LIB = REPO_ROOT / ".claude" / "hooks" / "_lib" / "stderr-cap.sh"
-TEMPLATE_CAP_LIB = REPO_ROOT / "templates" / "hooks" / "_lib" / "stderr-cap.sh"
-HOOKS_DIR = REPO_ROOT / ".claude" / "hooks"
+# PR-39 (v0.2.12, 2026-05-16): templates/hooks/ is the single source of
+# truth. Before PR-39 .claude/hooks/ was a byte-identical mirror shipped
+# in the repo; install.py now renders it from templates/ at install
+# time. CAP_LIB and TEMPLATE_CAP_LIB used to point at the two mirrors
+# (and a now-deleted parity test asserted byte-equality). Both names
+# kept as aliases of the single template path for backward compatibility
+# with the parametrize fixtures below.
+CAP_LIB = REPO_ROOT / "templates" / "hooks" / "_lib" / "stderr-cap.sh"
+TEMPLATE_CAP_LIB = CAP_LIB
+HOOKS_DIR = REPO_ROOT / "templates" / "hooks"
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +87,7 @@ def cap_paths() -> list[Path]:
     return paths
 
 
-@pytest.mark.parametrize("cap_path", [CAP_LIB, TEMPLATE_CAP_LIB], ids=["claude", "templates"])
+@pytest.mark.parametrize("cap_path", [CAP_LIB], ids=["templates"])
 @pytest.mark.parametrize(
     ("scenario", "snippet_fmt", "expected"),
     [
@@ -266,29 +273,26 @@ def test_guard_propagates_exit_code(
 
 
 # ---------------------------------------------------------------------------
-# Cap library file integrity: the .claude/ and templates/ copies must stay
-# byte-identical (enforced separately by check_template_drift.py, but we
-# add a lightweight guard here so a developer running pytest locally
-# notices drift before CI does).
+# Cap library file integrity: PR-39 (v0.2.12, 2026-05-16) removed the
+# .claude/ ↔ templates/ duplication that the former check_template_drift.py
+# gate (and the two parity tests below) enforced. templates/hooks/_lib/
+# is now the only source of truth; install.py renders .claude/ from it at
+# install time. The two parity tests retained as no-op stubs only for the
+# duration of one release (target removal: v0.2.13) so an external test
+# runner that hard-coded the names doesn't silently pass via missing-test.
 # ---------------------------------------------------------------------------
 
 
 def test_cap_library_in_sync_across_canonical_and_template() -> None:
-    """`.claude/hooks/_lib/stderr-cap.sh` and its templates/ twin must match.
-
-    The drift gate in CI catches this too, but a fast unit-test failure
-    is friendlier than a CI-only failure when iterating on the cap lib.
-    """
-    a = CAP_LIB.read_bytes()
-    b = TEMPLATE_CAP_LIB.read_bytes()
-    assert a == b, (
-        f"stderr-cap.sh diverged: .claude/ ({len(a)} B) vs templates/ "
-        f"({len(b)} B). Sync them or the template drift gate will fail."
-    )
+    """Retained as no-op stub post-PR-39 — see module-level note."""
+    # PR-39: nothing to compare; templates/ is the only source. Kept as a
+    # passing stub so downstream pytest collection invocations naming this
+    # function explicitly don't error out before v0.2.13.
+    assert CAP_LIB.is_file(), f"cap library missing: {CAP_LIB}"
 
 
 def test_cap_ps1_in_sync_across_canonical_and_template() -> None:
-    """Same invariant for the PowerShell sibling."""
+    """Retained as no-op stub post-PR-39 — see module-level note."""
     ps1_a = CAP_LIB.with_suffix(".ps1")
     ps1_b = TEMPLATE_CAP_LIB.with_suffix(".ps1")
     if not (ps1_a.is_file() and ps1_b.is_file()):

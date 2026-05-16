@@ -28,7 +28,10 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-HOOKS_DIR = REPO_ROOT / ".claude" / "hooks"
+# PR-39 (v0.2.12, 2026-05-16): templates/hooks/ is the single source of truth.
+# .claude/hooks/ used to be a byte-identical mirror shipped in the repo; it's
+# now rendered from templates/ at install time by install.py.
+HOOKS_DIR = REPO_ROOT / "templates" / "hooks"
 
 # Hooks that legitimately produce stdout even when short-circuiting (e.g.
 # session-start banners). Empty for now — populate if a hook fails the

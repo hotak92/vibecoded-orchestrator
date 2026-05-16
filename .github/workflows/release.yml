@@ -358,6 +358,16 @@ jobs:
 
           # .claude/ has additional exclusions for runtime state we
           # never want shipped: logs, metrics, ephemeral context.
+          #
+          # PR-39 (v0.2.12, 2026-05-16): the public repo no longer tracks
+          # .claude/{hooks,scripts,settings.json} — install.py renders them
+          # from templates/ at install time. The `.claude/` directory may
+          # therefore be missing entirely from the checked-out tree. Guard
+          # with `mkdir -p` so the copy step doesn't fail on an empty
+          # source; the destination stays present (possibly empty), and
+          # install.py at user install time populates it via
+          # _materialize_orchestrator_self_claude_dir().
+          mkdir -p .claude
           copy_subtree .claude "$stage_root/.claude" \
             --exclude='logs' \
             --exclude='metrics' \

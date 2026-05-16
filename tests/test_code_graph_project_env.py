@@ -499,9 +499,11 @@ class PostFileEditHookEnvResolutionTests(unittest.TestCase):
     "ClaudeOrchestrator" literal or breaks the env-fallback chain.
     """
 
+    # PR-39 (v0.2.12, 2026-05-16): templates/hooks/ is the single source of
+    # truth. .claude/hooks/ used to be a byte-identical mirror; install.py
+    # now renders it from templates/ at install time.
     HOOK_PATHS = [
         REPO_ROOT / "templates" / "hooks" / "post-file-edit.sh",
-        REPO_ROOT / ".claude" / "hooks" / "post-file-edit.sh",
     ]
 
     def test_no_hardcoded_claudeorchestrator_in_hook_bodies(self):

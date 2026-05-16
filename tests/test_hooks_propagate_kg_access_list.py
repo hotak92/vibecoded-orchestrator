@@ -56,11 +56,11 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# Hook directories. Both must be checked — the orchestrator runs out of
-# .claude/hooks, but newly-registered user projects get templates/hooks
-# dropped in by the install bundle.
+# Hook directories. PR-39 (v0.2.12, 2026-05-16): templates/hooks/ is the
+# single source of truth. .claude/hooks/ used to be a byte-identical mirror
+# shipped in the repo; install.py now renders it from templates/ at install
+# time, so only the template layout is canonical at the git layer.
 HOOKS_DIRS = [
-    REPO_ROOT / ".claude" / "hooks",
     REPO_ROOT / "templates" / "hooks",
 ]
 
