@@ -70,7 +70,7 @@ class KgAccessListTests(unittest.TestCase):
         """
         srv = _fresh_server({
             "KG_COLLECTION": "Alpha_KnowledgeGraph",
-            "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
+            "SHARED_KG_COLLECTION": "VibecodedOrchestrator_KnowledgeGraph",
             "VCT_KG_ACCESS_LIST": "Beta,Gamma",
         })
         result = srv._kg_collections_to_search(include_dev=False)
@@ -79,7 +79,7 @@ class KgAccessListTests(unittest.TestCase):
             result,
             [
                 "Alpha_KnowledgeGraph",
-                "VibeCodedTools_KnowledgeGraph",
+                "VibecodedOrchestrator_KnowledgeGraph",
                 "Beta_KnowledgeGraph",
                 "Gamma_KnowledgeGraph",
             ],
@@ -93,11 +93,11 @@ class KgAccessListTests(unittest.TestCase):
         # Fully unset: no peers.
         srv = _fresh_server({
             "KG_COLLECTION": "Alpha_KnowledgeGraph",
-            "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
+            "SHARED_KG_COLLECTION": "VibecodedOrchestrator_KnowledgeGraph",
         })
         self.assertEqual(
             srv._kg_collections_to_search(include_dev=False),
-            ["Alpha_KnowledgeGraph", "VibeCodedTools_KnowledgeGraph"],
+            ["Alpha_KnowledgeGraph", "VibecodedOrchestrator_KnowledgeGraph"],
         )
 
         # Empty string (the pre-fix shape: launcher wrote
@@ -105,24 +105,24 @@ class KgAccessListTests(unittest.TestCase):
         _clear_access_env()
         srv2 = _fresh_server({
             "KG_COLLECTION": "Alpha_KnowledgeGraph",
-            "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
+            "SHARED_KG_COLLECTION": "VibecodedOrchestrator_KnowledgeGraph",
             "VCT_KG_ACCESS_LIST": "",
         })
         self.assertEqual(
             srv2._kg_collections_to_search(include_dev=False),
-            ["Alpha_KnowledgeGraph", "VibeCodedTools_KnowledgeGraph"],
+            ["Alpha_KnowledgeGraph", "VibecodedOrchestrator_KnowledgeGraph"],
         )
 
         # Whitespace-only entries are filtered: `,, ,` → no peers.
         _clear_access_env()
         srv3 = _fresh_server({
             "KG_COLLECTION": "Alpha_KnowledgeGraph",
-            "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
+            "SHARED_KG_COLLECTION": "VibecodedOrchestrator_KnowledgeGraph",
             "VCT_KG_ACCESS_LIST": ",, ,",
         })
         self.assertEqual(
             srv3._kg_collections_to_search(include_dev=False),
-            ["Alpha_KnowledgeGraph", "VibeCodedTools_KnowledgeGraph"],
+            ["Alpha_KnowledgeGraph", "VibecodedOrchestrator_KnowledgeGraph"],
         )
 
     def test_kg_collections_to_search_dedupes_self_and_shared(self):
@@ -132,7 +132,7 @@ class KgAccessListTests(unittest.TestCase):
         helper must be robust to malformed input."""
         srv = _fresh_server({
             "KG_COLLECTION": "Alpha_KnowledgeGraph",
-            "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
+            "SHARED_KG_COLLECTION": "VibecodedOrchestrator_KnowledgeGraph",
             # `Alpha` matches self, `VibeCodedTools` matches shared
             # (the sanitization is idempotent).
             "VCT_KG_ACCESS_LIST": "Alpha,VibeCodedTools,Beta",
@@ -143,7 +143,7 @@ class KgAccessListTests(unittest.TestCase):
             result,
             [
                 "Alpha_KnowledgeGraph",
-                "VibeCodedTools_KnowledgeGraph",
+                "VibecodedOrchestrator_KnowledgeGraph",
                 "Beta_KnowledgeGraph",
             ],
         )
@@ -153,7 +153,7 @@ class KgAccessListTests(unittest.TestCase):
         append DEVELOPMENT_COLLECTION at the end (after peers)."""
         srv = _fresh_server({
             "KG_COLLECTION": "Alpha_KnowledgeGraph",
-            "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
+            "SHARED_KG_COLLECTION": "VibecodedOrchestrator_KnowledgeGraph",
             "DEVELOPMENT_COLLECTION": "Alpha_Development",
             "VCT_KG_ACCESS_LIST": "Beta",
         })
@@ -161,7 +161,7 @@ class KgAccessListTests(unittest.TestCase):
             srv._kg_collections_to_search(include_dev=True),
             [
                 "Alpha_KnowledgeGraph",
-                "VibeCodedTools_KnowledgeGraph",
+                "VibecodedOrchestrator_KnowledgeGraph",
                 "Beta_KnowledgeGraph",
                 "Alpha_Development",
             ],

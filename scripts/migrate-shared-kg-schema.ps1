@@ -14,7 +14,10 @@
 #
 # Env vars:
 #   $env:WEAVIATE_URL          — defaults to http://localhost:8081
-#   $env:SHARED_KG_COLLECTION  — defaults to VibeCodedTools_KnowledgeGraph
+#   $env:SHARED_KG_COLLECTION  — defaults to VibecodedOrchestrator_KnowledgeGraph
+#                                (renamed from VibeCodedTools_KnowledgeGraph in
+#                                v0.2.12 PR-26 / Group E). Must stay in lockstep
+#                                with vco_lib/project_init.py::_SHARED_KG_NAME.
 #
 # Requires: PowerShell 5.1+ (or PowerShell Core). The post-drop
 # repopulation calls `.claude/scripts/kg-sync.ps1` if present;
@@ -26,7 +29,7 @@ param()
 $ErrorActionPreference = "Continue"
 
 $WeaviateUrl = if ($env:WEAVIATE_URL) { $env:WEAVIATE_URL } else { "http://localhost:8081" }
-$SharedKg    = if ($env:SHARED_KG_COLLECTION) { $env:SHARED_KG_COLLECTION } else { "VibeCodedTools_KnowledgeGraph" }
+$SharedKg    = if ($env:SHARED_KG_COLLECTION) { $env:SHARED_KG_COLLECTION } else { "VibecodedOrchestrator_KnowledgeGraph" }
 
 try {
     $null = Invoke-RestMethod -Uri "$WeaviateUrl/v1/.well-known/ready" -TimeoutSec 5

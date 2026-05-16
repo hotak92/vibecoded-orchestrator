@@ -39,6 +39,7 @@ use std::path::Path;
 
 use serde_json::Value as JsonValue;
 
+use crate::commands::project_env_settings::DEFAULT_SHARED_KG_COLLECTION;
 use crate::commands::projects_v2::sanitize_kg_collection;
 use crate::db::project_mcp_servers::is_bundled_mcp;
 use crate::db::Db;
@@ -137,7 +138,9 @@ fn populate_kg_collection_access(
     let pascal = sanitize_kg_collection(project_name);
     let primary_collection = format!("{}_KnowledgeGraph", pascal);
     let dev_collection = format!("{}_Development", pascal);
-    let shared_collection = "VibeCodedTools_KnowledgeGraph";
+    // Single source of truth — see project_env_settings.rs. Renamed from
+    // "VibeCodedTools_KnowledgeGraph" in v0.2.12 PR-26 / Group E.
+    let shared_collection = DEFAULT_SHARED_KG_COLLECTION;
 
     // Project's OWN primary KG: write access by default. The project's
     // hooks + MCP server need to write to this — the .claude/env carries
@@ -533,7 +536,9 @@ fn populate_kg_bindings(
 ) {
     let pascal = sanitize_kg_collection(project_name);
     let primary_collection = format!("{}_KnowledgeGraph", pascal);
-    let shared_collection = "VibeCodedTools_KnowledgeGraph";
+    // Single source of truth — see project_env_settings.rs. Renamed from
+    // "VibeCodedTools_KnowledgeGraph" in v0.2.12 PR-26 / Group E.
+    let shared_collection = DEFAULT_SHARED_KG_COLLECTION;
     let weaviate_url = "http://localhost:8081";
     let embedding_model = "qwen3-embedding:0.6b";
     let embedding_dim: i64 = 1024;
@@ -985,7 +990,7 @@ mod tests {
             Some("http://localhost:8081")
         );
         let shared = bindings.iter().find(|b| b.role == "shared").unwrap();
-        assert_eq!(shared.collection_name, "VibeCodedTools_KnowledgeGraph");
+        assert_eq!(shared.collection_name, "VibecodedOrchestrator_KnowledgeGraph");
 
         std::fs::remove_dir_all(&folder).ok();
     }
@@ -1010,7 +1015,7 @@ mod tests {
         assert_eq!(by_collection.get("Acme_KnowledgeGraph"), Some(&"write"));
         assert_eq!(by_collection.get("Acme_Development"), Some(&"write"));
         assert_eq!(
-            by_collection.get("VibeCodedTools_KnowledgeGraph"),
+            by_collection.get("VibecodedOrchestrator_KnowledgeGraph"),
             Some(&"read")
         );
 
@@ -1027,7 +1032,7 @@ mod tests {
         populate_project_state_from_filesystem("p1", "Acme", &folder, &db);
 
         // User downgrades shared collection.
-        db.kg_set_access("p1", "VibeCodedTools_KnowledgeGraph", "none")
+        db.kg_set_access("p1", "VibecodedOrchestrator_KnowledgeGraph", "none")
             .unwrap();
         // User upgrades own dev to write (was already write — confirm
         // it stays write after re-run).
@@ -1046,7 +1051,7 @@ mod tests {
             .collect();
         // User's downgrade survived re-populate.
         assert_eq!(
-            by_collection.get("VibeCodedTools_KnowledgeGraph"),
+            by_collection.get("VibecodedOrchestrator_KnowledgeGraph"),
             Some(&"none"),
             "user-set 'none' must NOT be reset to default 'read'"
         );

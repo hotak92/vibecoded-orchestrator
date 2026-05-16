@@ -144,12 +144,12 @@ class SearchKnowledgeAccessListTests(unittest.TestCase):
         order."""
         sk = _fresh_search_knowledge({
             "KG_COLLECTION": "Alpha_KnowledgeGraph",
-            "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
+            "SHARED_KG_COLLECTION": "VibecodedOrchestrator_KnowledgeGraph",
             "VCT_KG_ACCESS_LIST": "Beta,Gamma",
         })
         contents = {
             "Alpha_KnowledgeGraph": [_FakeObj("Foo", distance=0.1)],
-            "VibeCodedTools_KnowledgeGraph": [_FakeObj("Bar", distance=0.2)],
+            "VibecodedOrchestrator_KnowledgeGraph": [_FakeObj("Bar", distance=0.2)],
             "Beta_KnowledgeGraph": [_FakeObj("Baz", distance=0.3)],
             "Gamma_KnowledgeGraph": [_FakeObj("Qux", distance=0.4)],
         }
@@ -161,7 +161,7 @@ class SearchKnowledgeAccessListTests(unittest.TestCase):
             client.collections.requested,
             [
                 "Alpha_KnowledgeGraph",
-                "VibeCodedTools_KnowledgeGraph",
+                "VibecodedOrchestrator_KnowledgeGraph",
                 "Beta_KnowledgeGraph",
                 "Gamma_KnowledgeGraph",
             ],

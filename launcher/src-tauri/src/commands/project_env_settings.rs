@@ -17,9 +17,11 @@
 //!
 //! Key invariants:
 //!   * Defaults match the canonical hardcoded values (`localhost:8081`,
-//!     `localhost:11435`, `localhost:11440`, "qwen3", "VibeCodedTools_KnowledgeGraph",
-//!     etc.) so a launcher with no custom settings produces identical
-//!     output to the pre-refactor code.
+//!     `localhost:11435`, `localhost:11440`, "qwen3",
+//!     "VibecodedOrchestrator_KnowledgeGraph" — renamed from
+//!     "VibeCodedTools_KnowledgeGraph" in v0.2.12 PR-26 — etc.) so a
+//!     launcher with no custom settings produces identical output to the
+//!     pre-refactor code modulo the shared-KG rename.
 //!   * Reads are best-effort: a missing app_state row or unreadable
 //!     services.toml falls through to defaults. The write path must NEVER
 //!     fail because state lookup hiccupped.
@@ -38,8 +40,9 @@ use crate::services::adoption::{self, AdoptionMode};
 pub const APP_STATE_KEY_ACTIVE_EMBEDDING: &str = "embedding.active_profile";
 
 /// `app_state` key for an override of the cross-project shared KG class name.
-/// Default: `"VibeCodedTools_KnowledgeGraph"`. White-label / fork installs
-/// can swap this without recompiling.
+/// Default: `"VibecodedOrchestrator_KnowledgeGraph"` (renamed from
+/// `"VibeCodedTools_KnowledgeGraph"` in v0.2.12 PR-26 / Group E).
+/// White-label / fork installs can swap this without recompiling.
 pub const APP_STATE_KEY_SHARED_KG_NAME: &str = "shared_kg.collection_name";
 
 /// `app_state` keys for explicit port overrides. When set, these win over
@@ -60,7 +63,22 @@ pub const DEFAULT_WEAVIATE_PORT: u16 = 8081;
 pub const DEFAULT_OLLAMA_PORT: u16 = 11435;
 pub const DEFAULT_CODE_EMBED_PORT: u16 = 11440;
 pub const DEFAULT_ACTIVE_EMBEDDING: &str = "qwen3";
-pub const DEFAULT_SHARED_KG_COLLECTION: &str = "VibeCodedTools_KnowledgeGraph";
+
+/// Canonical shared-KG class name. Must stay in lockstep with:
+///   * `vco_lib/project_init.py::_SHARED_KG_NAME`
+///   * `claude_mcp_servers/weaviate_mcp/server.py::_SHARED_KG_DEFAULT`
+///   * `scripts/migrate-shared-kg-schema.{sh,ps1}` defaults
+/// Cross-language invariant test
+/// `tests/test_shared_kg_constant_consistency.py` pins these together so any
+/// drift fails CI loudly.
+pub const DEFAULT_SHARED_KG_COLLECTION: &str = "VibecodedOrchestrator_KnowledgeGraph";
+
+/// Legacy shared-KG class name (pre-v0.2.12 PR-26 rename). Used ONLY by
+/// migration-detection paths (e.g., `commands::kg::list_kg_collections`
+/// recognizing a pre-rename class still living on disk). DO NOT use as a
+/// default for new writes — picker-driven migration is the consent
+/// mechanism for renaming the on-disk class.
+pub const LEGACY_SHARED_KG_COLLECTION: &str = "VibeCodedTools_KnowledgeGraph";
 
 /// Populated once per project-env write call. Plumbed through
 /// `write_project_env_files` and `ensure_project_env_template` so future
@@ -100,7 +118,9 @@ pub struct ProjectEnvSettings {
     pub dev_collection: String,
 
     /// Cross-project shared KG class name. Default
-    /// `"VibeCodedTools_KnowledgeGraph"`; overridable via app_state.
+    /// `"VibecodedOrchestrator_KnowledgeGraph"` (renamed from
+    /// `"VibeCodedTools_KnowledgeGraph"` in v0.2.12 PR-26); overridable
+    /// via app_state.
     pub shared_kg_collection: String,
 
     /// Asymmetric write-gate (read of shared KG is unconditional).
@@ -857,7 +877,7 @@ mod tests {
         let s = ProjectEnvSettings::with_defaults("My Project");
         assert_eq!(s.kg_collection, "MyProject_KnowledgeGraph");
         assert_eq!(s.dev_collection, "MyProject_Development");
-        assert_eq!(s.shared_kg_collection, "VibeCodedTools_KnowledgeGraph");
+        assert_eq!(s.shared_kg_collection, "VibecodedOrchestrator_KnowledgeGraph");
         assert_eq!(s.weaviate_url, "http://localhost:8081");
         assert_eq!(s.ollama_url, "http://localhost:11435");
         assert_eq!(s.code_embed_url, "http://localhost:11440");
@@ -964,7 +984,7 @@ mod tests {
         assert_eq!(s.ollama_port, DEFAULT_OLLAMA_PORT);
         assert_eq!(s.code_embed_port, DEFAULT_CODE_EMBED_PORT);
         assert_eq!(s.kg_collection, "Acme_KnowledgeGraph");
-        assert_eq!(s.shared_kg_collection, "VibeCodedTools_KnowledgeGraph");
+        assert_eq!(s.shared_kg_collection, "VibecodedOrchestrator_KnowledgeGraph");
         assert!(!s.shared_kg_write_disabled);
     }
 

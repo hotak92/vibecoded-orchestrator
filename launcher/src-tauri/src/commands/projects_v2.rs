@@ -2178,7 +2178,9 @@ fn env_canonical_keys() -> Vec<(&'static str, Option<&'static str>)> {
         ("CODE_EMBED_URL", None),
         // Per-project Weaviate collections (active — filled at create time).
         ("KG_COLLECTION", Some("__project__:kg")),
-        ("SHARED_KG_COLLECTION", Some("VibeCodedTools_KnowledgeGraph")),
+        // Default value (renamed from "VibeCodedTools_KnowledgeGraph" in
+        // v0.2.12 PR-26 / Group E). Picker overrides this per-project.
+        ("SHARED_KG_COLLECTION", Some("VibecodedOrchestrator_KnowledgeGraph")),
         ("DEVELOPMENT_COLLECTION", Some("__project__:dev")),
         ("PROJECT_NAME", Some("__project__:raw")),
         // CONVERSATION_COLLECTION removed 2026-04-30 (B5: zombie write cleanup).
@@ -4490,7 +4492,7 @@ mod tests {
         assert!(env_raw.contains(r#"export DEVELOPMENT_COLLECTION="MyTest_Development""#));
         // B5: CONVERSATION_COLLECTION must NOT be in .claude/env.
         assert!(!env_raw.contains("CONVERSATION_COLLECTION"));
-        assert!(env_raw.contains(r#"export SHARED_KG_COLLECTION="VibeCodedTools_KnowledgeGraph""#));
+        assert!(env_raw.contains(r#"export SHARED_KG_COLLECTION="VibecodedOrchestrator_KnowledgeGraph""#));
         assert!(env_raw.contains(r#"export SHARED_KG_WRITE_DISABLED="false""#));
         assert!(env_raw.contains(r#"export SHARED_KG_OPT_OUT="false""#));
 
@@ -4519,7 +4521,7 @@ mod tests {
         // B5: CONVERSATION_COLLECTION must NOT be in .claude/settings.json env.
         assert!(env.get("CONVERSATION_COLLECTION").is_none());
         // Shared-KG fields propagate to both surfaces.
-        assert_eq!(env["SHARED_KG_COLLECTION"], "VibeCodedTools_KnowledgeGraph");
+        assert_eq!(env["SHARED_KG_COLLECTION"], "VibecodedOrchestrator_KnowledgeGraph");
         // Canonical write-gate key (asymmetric semantic since 2026-05-01).
         assert_eq!(env["SHARED_KG_WRITE_DISABLED"], "false");
         // Legacy alias mirrors the canonical value (kept for ~3 releases).
@@ -7095,7 +7097,7 @@ export MY_HELPER_TOKEN=\"keep-me\"
 # vibecoded-orchestrator per-project .env
 KG_COLLECTION=MyProj_KnowledgeGraph
 DEVELOPMENT_COLLECTION=MyProj_Development
-SHARED_KG_COLLECTION=VibeCodedTools_KnowledgeGraph
+SHARED_KG_COLLECTION=VibecodedOrchestrator_KnowledgeGraph
 PROJECT_NAME=MyProj
 ACTIVE_EMBEDDING=qwen3
 WEAVIATE_URL=http://localhost:8081
@@ -7430,8 +7432,10 @@ USER_DB_URL=postgres://user:pass@db/app
         // And to a Beta dev collection (to verify dedup logic — both
         // map to the same peer "Beta" after suffix-strip).
         db.kg_set_access(&row_a.id, "Beta_Development", "read").unwrap();
-        // And to the shared collection (must be excluded).
-        db.kg_set_access(&row_a.id, "VibeCodedTools_KnowledgeGraph", "read").unwrap();
+        // And to the shared collection (must be excluded). Uses the
+        // canonical post-PR-26 name; legacy "VibeCodedTools_KnowledgeGraph"
+        // installs go through the launcher's shared-KG migration picker.
+        db.kg_set_access(&row_a.id, "VibecodedOrchestrator_KnowledgeGraph", "read").unwrap();
         // And Alpha's OWN collection (must be excluded).
         db.kg_set_access(&row_a.id, "Alpha_KnowledgeGraph", "write").unwrap();
         // A `none` row must be filtered out.

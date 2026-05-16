@@ -880,15 +880,18 @@ def _format_result_by_tier(
 
 
 KG_COLLECTION = os.getenv("KG_COLLECTION", "ClaudeKnowledgeGraph")
-# Cross-project shared collection. Defaults to "VibeCodedTools_KnowledgeGraph"
-# (the bundled cross-project KG seeded at install time from
-# vibecoded-orchestrator/knowledge/).
+# Cross-project shared collection. Defaults to
+# "VibecodedOrchestrator_KnowledgeGraph" (renamed from
+# "VibeCodedTools_KnowledgeGraph" in v0.2.12 PR-26 / Group E — see
+# `vco_lib/project_init.py::_LEGACY_SHARED_KG_NAME` for the legacy alias
+# preserved by migration-detection paths). The bundled cross-project KG
+# is seeded at install time from vibecoded-orchestrator/knowledge/.
 #
 # Asymmetric access (2026-05-01): SHARED_KG_COLLECTION is ALWAYS exposed to
 # read paths when set. There is no per-project read opt-out — every project
 # always reads the shared KG. The per-project gate below restricts WRITES
 # only.
-_SHARED_KG_DEFAULT = "VibeCodedTools_KnowledgeGraph"
+_SHARED_KG_DEFAULT = "VibecodedOrchestrator_KnowledgeGraph"
 _SHARED_KG_RAW = os.getenv("SHARED_KG_COLLECTION", _SHARED_KG_DEFAULT)
 SHARED_KG_COLLECTION = _SHARED_KG_RAW
 

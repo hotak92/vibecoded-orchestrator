@@ -1326,15 +1326,37 @@ _migrate_collections = migrate_collections
 #      `ensure-containers.sh` is the second-line backstop for the next
 #      Claude Code session.
 #
-# Shared KG (`VibeCodedTools_KnowledgeGraph`): created when missing
-# regardless of any per-project SHARED_KG_WRITE_DISABLED toggle (or
-# its legacy SHARED_KG_OPT_OUT alias). Per the coordinator's 2026-05-01
-# directive: every project ALWAYS reads the shared KG; the toggle is
-# purely a runtime write-gate. Creation is not gated on it.
+# Shared KG (`VibecodedOrchestrator_KnowledgeGraph`, renamed from
+# `VibeCodedTools_KnowledgeGraph` in v0.2.12 PR-26 — see
+# `_LEGACY_SHARED_KG_NAME` below for the legacy alias still used by
+# migration-detection paths): created when missing regardless of any
+# per-project SHARED_KG_WRITE_DISABLED toggle (or its legacy
+# SHARED_KG_OPT_OUT alias). Per the coordinator's 2026-05-01 directive:
+# every project ALWAYS reads the shared KG; the toggle is purely a
+# runtime write-gate. Creation is not gated on it.
 # ---------------------------------------------------------------------------
 
 
-_SHARED_KG_NAME = "VibeCodedTools_KnowledgeGraph"
+# Canonical shared-KG class name. Must stay in lockstep with:
+#   * `derive_project_collection_names()` above (which returns this value
+#     as `shared_kg_collection`),
+#   * `launcher/src-tauri/src/commands/project_env_settings.rs::DEFAULT_SHARED_KG_COLLECTION`,
+#   * `claude_mcp_servers/weaviate_mcp/server.py::_SHARED_KG_DEFAULT`,
+#   * `scripts/migrate-shared-kg-schema.{sh,ps1}` defaults.
+# The cross-language invariant test `tests/test_shared_kg_constant_consistency.py`
+# pins these in lockstep so any drift fails CI loudly.
+_SHARED_KG_NAME = "VibecodedOrchestrator_KnowledgeGraph"
+
+# Legacy shared-KG class name (pre-v0.2.12 PR-26 rename). Migration-detection
+# code that recognizes user installs still carrying the old class uses THIS
+# constant rather than scattering the literal string across the codebase.
+# DO NOT use this as a default for new writes — only for "did the user
+# install this before the rename?" detection logic. Picker-driven migration
+# (launcher Settings → Identity → "Manage shared KG collection") is the
+# consent mechanism for renaming the on-disk class; this code never
+# auto-renames or auto-drops.
+_LEGACY_SHARED_KG_NAME = "VibeCodedTools_KnowledgeGraph"
+
 _DEFAULT_RESTART_CONTAINER = "weaviate_claude"
 
 
@@ -5094,10 +5116,11 @@ def _cmd_drop_collections(args: argparse.Namespace) -> int:
     """`drop-collections --name <project_name> [--weaviate-url <url>] --json`
 
     Drop the project's OWN Weaviate collections (`<sanitized>_KnowledgeGraph`,
-    `<sanitized>_Development`). The shared KG (`VibeCodedTools_KnowledgeGraph`
-    or whatever `_SHARED_KG_NAME` resolves to) is NEVER touched — every
-    project depends on read access to it, and it's owned by the
-    orchestrator install, not by any individual project.
+    `<sanitized>_Development`). The shared KG (`VibecodedOrchestrator_KnowledgeGraph`,
+    or whatever `_SHARED_KG_NAME` resolves to — was `VibeCodedTools_KnowledgeGraph`
+    pre-v0.2.12 PR-26) is NEVER touched — every project depends on read
+    access to it, and it's owned by the orchestrator install, not by any
+    individual project.
 
     Used by the launcher's `delete_project_v2` when the user opts in to
     `purge_collections: true` on unregister. Soft-fails idempotently:
@@ -5106,7 +5129,7 @@ def _cmd_drop_collections(args: argparse.Namespace) -> int:
 
     JSON stdout schema:
       {"dropped": ["<Project>_KnowledgeGraph", "<Project>_Development"],
-       "skipped_shared": "VibeCodedTools_KnowledgeGraph",
+       "skipped_shared": "VibecodedOrchestrator_KnowledgeGraph",
        "errors": [{"collection": <name>, "error": <str>}]}
 
     Exit 0 on clean drop (incl. 404). Exit 1 when at least one drop

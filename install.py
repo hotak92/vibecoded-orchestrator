@@ -2441,6 +2441,14 @@ def main() -> int:
         # soft-fail; failures convert to deferral entries.
         if _seed_succeeded:
             _run_schema_migration_scripts(_deferral_report)
+
+        # PR-34 (v0.2.12, Group M): detect the pre-rename shared-KG class
+        # left over from a pre-v0.2.12 install. Emit a deferral pointing
+        # at the launcher's "Manage shared KG collection" picker — we
+        # NEVER auto-rename or auto-drop the class (destructive; picker
+        # is the consent mechanism).
+        if mode == "update":
+            _detect_legacy_shared_kg_class(_deferral_report)
     else:
         print("\n[skip] Container services (--no-containers)")
         print("[skip] Weaviate seeding (--no-containers)")
@@ -4571,9 +4579,10 @@ def _probe_service_identity(name: str, port: int) -> tuple[str, str]:
     Heuristic per service:
       - weaviate: GET /v1/.well-known/ready; if 200, GET /v1/schema and
         look for our canonical collections (KnowledgeGraph,
-        VibeCodedTools_KnowledgeGraph). Either present ⇒ vct-managed.
-        Empty schema + no services.toml record ⇒ foreign (we don't claim
-        bare instances).
+        VibecodedOrchestrator_KnowledgeGraph — and the legacy
+        VibeCodedTools_KnowledgeGraph for pre-v0.2.12 PR-26 installs).
+        Either present ⇒ vct-managed. Empty schema + no services.toml
+        record ⇒ foreign (we don't claim bare instances).
       - ollama: GET /api/tags; if 200, look for our pinned embedding model
         (qwen3-embedding:0.6b OR snowflake-arctic-embed2:latest) AS WELL AS
         the services.toml record. Either signal present ⇒ vct-managed.
@@ -4629,7 +4638,14 @@ def _probe_service_identity(name: str, port: int) -> tuple[str, str]:
             #    `_CodeFunction` / `_CodeClass` / `_CodeModule` suffixes
             #    are ours by construction and don't appear in foreign
             #    Weaviates.
-            exact_markers = {"KnowledgeGraph", "VibeCodedTools_KnowledgeGraph",
+            # Legacy-detection: both the canonical post-v0.2.12 PR-26 name
+            # AND the pre-rename "VibeCodedTools_KnowledgeGraph" are
+            # markers of a vct-managed Weaviate (the rename was metadata-only —
+            # pre-rename installs still have the old class on disk until the
+            # user runs the launcher's shared-KG picker).
+            exact_markers = {"KnowledgeGraph",
+                             "VibecodedOrchestrator_KnowledgeGraph",
+                             "VibeCodedTools_KnowledgeGraph",  # legacy-detection
                              "Development", "CodeFunction", "CodeClass",
                              "CodeModule", "CodeAPI", "CodeInteraction"}
             # `_conversations` is a legacy marker (collection deprecated
@@ -5681,11 +5697,13 @@ def _ensure_collections(embed_config: dict,
         dev_name = _derive_project_dev_name(PROJECT_ROOT)
 
     # Cross-project shared KG. All vibecoded installs read from the same shared
-    # collection name (default "VibeCodedTools_KnowledgeGraph"); the projects
-    # only differ in their per-project KG. Bootstrapped once per Weaviate
-    # instance — re-runs are no-ops thanks to the existing-class detection.
+    # collection name (default "VibecodedOrchestrator_KnowledgeGraph" since
+    # v0.2.12 PR-26 / Group E — was "VibeCodedTools_KnowledgeGraph" pre-rename);
+    # the projects only differ in their per-project KG. Bootstrapped once per
+    # Weaviate instance — re-runs are no-ops thanks to the existing-class
+    # detection.
     shared_name = os.environ.get(
-        "SHARED_KG_COLLECTION", "VibeCodedTools_KnowledgeGraph"
+        "SHARED_KG_COLLECTION", "VibecodedOrchestrator_KnowledgeGraph"
     ) or ""
 
     print(f"[7b/10] Checking Weaviate collections at {weaviate_url} "
@@ -6054,9 +6072,10 @@ def _seed_weaviate(args: argparse.Namespace) -> None:
     #
     # Re-runs sync_knowledge_graph.py against the SHARED collection so
     # vibecoded-orchestrator/knowledge/ is also persisted into
-    # VibeCodedTools_KnowledgeGraph. All projects on this machine then read
-    # from this shared collection in addition to their per-project KG (see
-    # weaviate_mcp/server.py: SHARED_KG_COLLECTION).
+    # VibecodedOrchestrator_KnowledgeGraph (renamed from
+    # VibeCodedTools_KnowledgeGraph in v0.2.12 PR-26 / Group E). All projects
+    # on this machine then read from this shared collection in addition to
+    # their per-project KG (see weaviate_mcp/server.py: SHARED_KG_COLLECTION).
     #
     # Idempotency: sync_knowledge_graph.py upserts per file (delete+insert
     # by file_path), so re-running on unchanged content yields the same
@@ -6072,7 +6091,7 @@ def _seed_weaviate(args: argparse.Namespace) -> None:
         or os.environ.get("SHARED_KG_OPT_OUT", "")
     ).lower() in ("1", "true", "yes")
     shared_collection = os.environ.get(
-        "SHARED_KG_COLLECTION", "VibeCodedTools_KnowledgeGraph"
+        "SHARED_KG_COLLECTION", "VibecodedOrchestrator_KnowledgeGraph"
     )
     if shared_write_disabled:
         print("  → shared KG seed: skipped (SHARED_KG_WRITE_DISABLED=true)")
@@ -6263,6 +6282,93 @@ def _run_schema_migration_scripts(deferral_report: "DeferralReport") -> None:
         )
 
     _log_install_event("7d/10", "ok", "schema migrations completed")
+
+
+def _detect_legacy_shared_kg_class(deferral_report: "DeferralReport") -> None:
+    """PR-34 (v0.2.12, Group M) — soft-fail migration deferral.
+
+    When `python install.py --update` runs against a Weaviate that still
+    carries the pre-rename `VibeCodedTools_KnowledgeGraph` class (created
+    by an install <v0.2.12), emit a `legacy_shared_kg_class_present`
+    deferral entry pointing the user at the launcher's "Manage shared KG
+    collection" picker. We NEVER auto-rename or auto-drop the class —
+    that is destructive (would lose any cross-project KG content the user
+    has written) and the picker is the consent mechanism.
+
+    Idempotent + soft-fail:
+      * Weaviate unreachable → skip silently (the schema-rebuild flow
+        upstream already emits a `weaviate_unreachable` deferral).
+      * Legacy class absent → no-op.
+      * Legacy class present → one deferral entry, severity=info.
+
+    The picker (launcher Settings → Identity → "Manage shared KG
+    collection") handles three resolution paths: (a) accept the new
+    canonical and migrate content, (b) keep the legacy name as the
+    per-project shared-KG override, (c) ignore (dismissable).
+    """
+    # Resolve Weaviate URL: prefer env, fall back to canonical default.
+    weaviate_url = (
+        os.environ.get("WEAVIATE_URL")
+        or f"http://localhost:{os.environ.get('WEAVIATE_PORT', '8081')}"
+    )
+    try:
+        resp = urllib.request.urlopen(  # noqa: S310 (localhost only)
+            f"{weaviate_url}/v1/schema", timeout=5,
+        )
+        schema = json.loads(resp.read())
+    except Exception:
+        # Soft-fail: skip silently. Other code paths already deferral
+        # on Weaviate unreachability.
+        return
+
+    classes = {c.get("class", "") for c in schema.get("classes", [])}
+    legacy_name = "VibeCodedTools_KnowledgeGraph"
+    canonical_name = "VibecodedOrchestrator_KnowledgeGraph"
+
+    if legacy_name not in classes:
+        return  # No legacy class — nothing to migrate.
+
+    canonical_present = canonical_name in classes
+    detected_msg = (
+        f"Weaviate at {weaviate_url} still carries the pre-v0.2.12 "
+        f"shared-KG class `{legacy_name}`. The post-rename canonical "
+        f"name is `{canonical_name}` "
+        f"({'already present' if canonical_present else 'not yet created'})."
+    )
+
+    deferral_report.add_entry(
+        DeferralEntry(
+            condition_id="legacy_shared_kg_class_present",
+            title="Legacy shared-KG class still on disk (pre-v0.2.12 PR-26)",
+            detected=detected_msg,
+            why_deferred=(
+                "The shared cross-project KG class was renamed from "
+                f"`{legacy_name}` to `{canonical_name}` in v0.2.12 PR-26. "
+                "The legacy class is still on disk because the rename is "
+                "metadata-only; install.py does NOT auto-rename or "
+                "auto-drop a populated class (destructive — would lose "
+                "any cross-project KG content). Resolve via the "
+                "launcher's Settings → Identity → \"Manage shared KG "
+                "collection\" picker, which lets you pick which class "
+                "becomes the active shared KG for each project."
+            ),
+            command_to_apply=(
+                "Open the launcher (`./vct-launcher`), pick a project, "
+                "go to Settings → Identity, click \"Manage shared KG "
+                "collection\", and select either the legacy "
+                f"`{legacy_name}` or the canonical "
+                f"`{canonical_name}` as the shared KG for that project."
+            ),
+            severity="info",
+            kg_node_refs=[],
+        )
+    )
+    _log_install_event(
+        "7d/10", "info",
+        "legacy shared-KG class detected; deferral emitted",
+        data={"legacy_class": legacy_name,
+              "canonical_present": canonical_present},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -8785,7 +8891,9 @@ def _env_canonical_template(project_name: str = "<project>",
         ("", None, "# Resolved by the launcher when the project is registered. Don't"),
         ("", None, "# edit unless you know what you're doing."),
         ("KG_COLLECTION", f"{project_name}_KnowledgeGraph", None),
-        ("SHARED_KG_COLLECTION", "VibeCodedTools_KnowledgeGraph", None),
+        # Default value (renamed from "VibeCodedTools_KnowledgeGraph" in
+        # v0.2.12 PR-26 / Group E). Picker overrides this per-project.
+        ("SHARED_KG_COLLECTION", "VibecodedOrchestrator_KnowledgeGraph", None),
         ("DEVELOPMENT_COLLECTION", f"{project_name}_Development", None),
         ("PROJECT_NAME", project_name, None),
         # CONVERSATION_COLLECTION removed 2026-04-30 — capture flow deprecated
@@ -9041,7 +9149,7 @@ def _write_env_config(embed_config: dict, args: argparse.Namespace, joern_availa
         "# Set SHARED_KG_WRITE_DISABLED=true to gate WRITES from this project",
         "# only (reads stay on). SHARED_KG_OPT_OUT is the legacy alias kept",
         "# for ~3 releases (target removal: 2026-08).",
-        f"SHARED_KG_COLLECTION={os.environ.get('SHARED_KG_COLLECTION', 'VibeCodedTools_KnowledgeGraph')}",
+        f"SHARED_KG_COLLECTION={os.environ.get('SHARED_KG_COLLECTION', 'VibecodedOrchestrator_KnowledgeGraph')}",
         "SHARED_KG_WRITE_DISABLED=false",
         "SHARED_KG_OPT_OUT=false",
         "",
@@ -9145,7 +9253,9 @@ def _configure_claude_settings(embed_config: dict) -> None:
         "ACTIVE_EMBEDDING": embed_config.get("active_embedding", "qwen3"),
         "KG_COLLECTION": "KnowledgeGraph",
         "DEVELOPMENT_COLLECTION": "Development",
-        "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
+        # Default value (renamed from "VibeCodedTools_KnowledgeGraph" in
+        # v0.2.12 PR-26 / Group E). Picker overrides this per-project.
+        "SHARED_KG_COLLECTION": "VibecodedOrchestrator_KnowledgeGraph",
         # Asymmetric shared-KG access (since 2026-05-01): reads always-on,
         # writes gated by SHARED_KG_WRITE_DISABLED. SHARED_KG_OPT_OUT kept
         # as a legacy alias for ~3 releases (target removal: 2026-08).

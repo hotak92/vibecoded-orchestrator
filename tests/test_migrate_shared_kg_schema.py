@@ -249,11 +249,16 @@ class PowerShellScriptTests(unittest.TestCase):
         self.assertIn("indexNullState", body,
                       "PS script must inspect indexNullState before drop")
 
-    def test_script_defaults_to_vibecodedtools_kg(self):
+    def test_script_defaults_to_canonical_shared_kg(self):
         body = SCRIPT_PS1.read_text(encoding="utf-8")
-        self.assertIn("VibeCodedTools_KnowledgeGraph", body,
+        # PR-34 (v0.2.12, Group M): canonical name unified across all
+        # surfaces (renamed from VibeCodedTools_KnowledgeGraph in PR-26).
+        # The literal must match vco_lib/project_init.py::_SHARED_KG_NAME
+        # and the cross-language invariant in
+        # tests/test_shared_kg_constant_consistency.py.
+        self.assertIn("VibecodedOrchestrator_KnowledgeGraph", body,
                       "PS script must default SHARED_KG_COLLECTION to "
-                      "VibeCodedTools_KnowledgeGraph (matches "
+                      "VibecodedOrchestrator_KnowledgeGraph (matches "
                       "project_init derive_project_collection_names)")
 
 

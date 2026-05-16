@@ -139,10 +139,14 @@ pub async fn kg_list_collections(
             .unwrap_or_else(|| "none".to_string());
         let node_count = fetch_class_count(&client, &base, &name).await.unwrap_or(0);
         // Recognize the canonical cross-project KG name shipped by the
-        // orchestrator (VibeCodedTools_KnowledgeGraph). Falls back to the
-        // historical "shared" substring heuristic + legacy "sharedVCT" name
-        // for back-compat with older installs / custom setups.
-        let is_shared = name == "VibeCodedTools_KnowledgeGraph"
+        // orchestrator (VibecodedOrchestrator_KnowledgeGraph since v0.2.12
+        // PR-26 / Group E; legacy VibeCodedTools_KnowledgeGraph kept here
+        // explicitly as a legacy-detection path so pre-rename installs
+        // still light up the picker's "Manage shared KG collection" UI).
+        // Falls back to the historical "shared" substring heuristic + legacy
+        // "sharedVCT" name for back-compat with older installs / custom setups.
+        let is_shared = name == crate::commands::project_env_settings::DEFAULT_SHARED_KG_COLLECTION
+            || name == crate::commands::project_env_settings::LEGACY_SHARED_KG_COLLECTION
             || name == "sharedVCT"
             || name.to_lowercase().contains("shared");
         out.push(KgCollectionAccess {
