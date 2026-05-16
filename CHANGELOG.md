@@ -7,6 +7,292 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.11] — 2026-05-16
+
+Stability release. The orchestrator's own infrastructure (compose
+files, boot-service auto-wiring, container lifecycle, lean-ctx
+integration, project bundle migration, MCP server surface) had a
+series of latent bugs that surfaced during the 2026-05-15 / 2026-05-16
+debugging session. All fixed with cross-OS coverage on Linux + macOS +
+Windows and "no hardcoded user paths" discipline. Goal: a release
+that doesn't need to be upgraded for a while.
+
+**Major theme — MCP simplification**: Ollama MCP and 3 of 4 Search
+MCP tools were removed as redundant with Claude's native capabilities.
+Ollama remains as embedding infrastructure (Weaviate vectorizers); the
+MCP wrapper layer is gone. Search MCP narrowed to just `search_papers`
+(OpenAlex + arXiv). SearXNG container also dropped (no surviving tool
+needed it). Visible deferral entries surface in
+`<project>/.claude/context/UPDATE_DEFERRED.md` for upgraders with
+existing `~/.claude.json` entries.
+
+**Major theme — container lifecycle hardening**: PR-12 + PR-13 + PR-15
+form a defense-in-depth stack around the 2026-05-16 boot-cascade
+failure mode (docker-without-daemon-access → CDI race → conmon killed
+→ state-DB desync). bash hooks recover at SessionStart, launcher Rust
+recovers continuously while open, install.py auto-repairs stale
+systemd unit `WorkingDirectory=` paths on `--update`.
+
+**Major theme — pytest test-isolation**: PR-16 fixes a class of bug
+where tests called real install code without sandboxing the
+`~/.config/systemd/user/` write path. Every developer running
+`pytest tests/test_materialize_boot_service.py` had been silently
+corrupting their own systemd unit since PR-12 landed. New
+`VCT_USER_HOME_OVERRIDE` env var + autouse fixture make this
+impossible going forward — prevention, not recovery.
+
+### Added
+
+- **Ensure-containers zombie recovery hook** (PR-13,
+  `templates/hooks/ensure-containers.{sh,ps1}`): detects Podman
+  state-DB-desync containers (PID dead per `/proc/<pid>` while
+  `podman ps` still reports "Up") at Claude Code SessionStart.
+  Force-removes the zombie via `runc delete --force` + `podman rm
+  --force`, then recreates via the `launch-claude-mcp-stack.sh`
+  wrapper if shipped (preserves CDI-wait + daemon-access semantics).
+  Audit log to `~/.local/state/vct/container-recovery.jsonl`
+  (Linux) / `$LOCALAPPDATA\vct\container-recovery.jsonl` (Windows).
+
+- **Launcher Rust container-lifecycle defense layer** (PR-15,
+  `launcher/src-tauri/src/services/runtime.rs` +
+  `commands/lifecycle.rs`):
+    - G1: `daemon_usable_probe()` validates `docker info` Server:
+      section / `podman info` exit 0 before committing to a runtime.
+      Prevents the 2026-05-16 cascade-class bug where a user with
+      Docker Desktop installed but not in the docker group got
+      runtime detection succeeding silently while every subsequent
+      compose call failed.
+    - G2: zombie-container detection in `services_status()` plus a
+      new `recover_zombie(container_name)` Tauri command. Frontend
+      can now show a "stuck" indicator with a Recover button.
+      `ServiceRuntimeState` gets a new `zombie: bool` field
+      (serde-defaulted for backward-compat).
+    - G3: launcher's `services_start_all` / `services_restart_all`
+      prefer the `launch-claude-mcp-stack.{sh,ps1}` wrapper over
+      direct `compose up -d`. Prevents the `vco_code_embed` boot
+      race where GPU container compose-up beats the NVIDIA CDI
+      refresh, leaving the container stuck in "CREATED" state.
+
+- **Boot-service auto-repair** (PR-12, `install.py`): new
+  `_repair_systemd_unit_working_dir()` helper fires on
+  `install.py --update`. Detects stale `WorkingDirectory=` values
+  pointing at moved / deleted install paths (a common failure mode
+  for users who relocated their orchestrator clone) and re-renders
+  the unit at the correct path. Emits `boot_service_path_repaired`
+  deferral so Claude Code's next-session check surfaces the change
+  with the exact `systemctl --user daemon-reload` command to apply
+  it.
+
+- **Runtime detection daemon-access check (bash side)** (PR-12,
+  `scripts/launch-claude-mcp-stack.sh`): new `_runtime_usable()`
+  validates `docker info` / `podman info` actually exit-0 before
+  the wrapper commits to that runtime. Pairs with PR-15 G1
+  (launcher Rust side).
+
+- **Runtime.txt multi-path search** (PR-12): the wrapper now probes
+  `$VCT_STACK_RUNTIME_FILE` → `$VCT_STACK_WORKING_DIR/state/install/`
+  → `$VCT_ORCHESTRATOR_ROOT/state/install/` → `<script_dir>/../state/
+  install/` for the persisted runtime choice. Makes the wrapper
+  resilient to a stale systemd unit `WorkingDirectory=` pointing at
+  a deleted path.
+
+- **Global lean-ctx detection** (PR-11, `install.py::_check_global_lean_ctx_hooks()`):
+  defensive check at install start for global lean-ctx artifacts
+  (`~/.claude/settings.json` `hooks.PreToolUse` entries containing
+  "lean-ctx", `~/.claude/hooks/lean-ctx-*` files). When detected,
+  emits a LOUD warning to stderr + `global_lean_ctx_hooks_detected`
+  deferral entry with the exact removal commands. The 2026-04-30
+  and 2026-05-15 fork-bomb incidents both involved global lean-ctx
+  hooks; this surface lets future users hit the same trap less
+  often. New CLI flag `--suppress-lean-ctx-warning` for users who
+  intentionally keep them (e.g. lean-ctx development).
+
+- **Storage UX choice (named vs bind mount)** (PR-10A,
+  `launcher/src-tauri/src/commands/storage_ux.rs` + Svelte
+  Settings → Storage card): user can pick between runtime-managed
+  named volumes (default, recommended) and a user-chosen bind path
+  via the Settings GUI, with auto-detection of pre-existing legacy
+  volumes from prior installs. STRICT volume allowlist (`vco_*`
+  prefix + curated legacy names) prevents the launcher from ever
+  offering to alias another project's data into our compose
+  mountpoints. Override.yml generator covers 3 shapes: empty
+  (named-default), bind-mount per service, external-alias per
+  service. 24 Rust unit tests cover the allowlist boundary +
+  render idempotency + atomic write.
+
+- **Legacy KG / codegraph collection detection on Add Project**
+  (PR-10B, `vco_lib/project_init.py`): when adding a new project,
+  the install pipeline now detects pre-existing same-suffix
+  legacy KG / codegraph collections (Levenshtein-based prefix
+  similarity check + Weaviate REST API call for object counts +
+  embedding-dim sniff via schema). Emits per-project deferral
+  entries listing the candidates so the user can decide to adopt
+  / archive / drop. 35 new tests.
+
+- **GUI lean-ctx toggle in HooksTab** (PR-6,
+  `launcher/src/lib/project-state/HooksTab.svelte` +
+  `launcher/src-tauri/src/commands/claude_env.rs`): per-project
+  3-state toggle (off / on / default) for `VCO_LEAN_CTX_DEFAULT`.
+  Writes `.claude/env`. 19 Rust unit tests for the
+  `get_claude_env_value` / `set_claude_env_value` Tauri commands.
+
+- **Pytest test-isolation sandbox** (PR-16, `install.py` +
+  `tests/test_materialize_boot_service.py`): new
+  `_user_home_for_install()` helper consolidates all
+  systemd-unit / launchd-plist / repair-function writes through a
+  single env-overridable lookup (`VCT_USER_HOME_OVERRIDE`). New
+  autouse fixture sandboxes every test in
+  `test_materialize_boot_service.py` so a forgotten
+  manual-monkeypatch by a future test author can no longer corrupt
+  developer machines' real systemd state. Includes a regression
+  guard test that proves the real user systemd unit `mtime` is
+  unchanged across a full test-suite run.
+
+### Changed
+
+- **MCP server surface simplified** (PR-14a + PR-14b + PR-14c):
+    - Ollama MCP server removed entirely from default install
+      (`claude_mcp_servers/ollama_mcp/` deleted,
+      `mcpServers.ollama` block removed from both Linux + Windows
+      settings templates, manifest `vct-ollama.json` deleted).
+      Ollama as embedding **infrastructure** (Weaviate qwen3-
+      embedding vectorizer + code_embedding_service fallback)
+      remains unchanged.
+    - Search MCP narrowed to only `search_papers` (OpenAlex +
+      arXiv academic paper search). The dropped tools
+      (`web_search`, `search_code`, `fetch_page`) are all
+      redundant with Claude's native WebSearch / WebFetch + the
+      `site:github.com lang:X` qualifier pattern. Manifest
+      `vct-search.json` updated: removed `github_pat` secret +
+      `SEARXNG_URL` setting; version bumped 0.3.1 → 0.4.0.
+    - SearXNG container removed from default compose
+      (`searxng_data` volume gone; `templates/searxng/` template
+      deleted; `install.py::_materialize_searxng_settings()`
+      function removed).
+    - CLAUDE.md / README.md / `docs/features/02-mcps-and-agents.md`
+      / 18 agent templates / 2 skill templates / 8 KG nodes
+      updated to reflect the new shape. New KG node
+      `knowledge/concepts/mcp-simplification-v0211.md` documents
+      the decision rationale.
+    - 3 visible deferral entries for upgraders with existing
+      `~/.claude.json` `ollama` blocks or SearXNG remnants:
+      `searxng_removed_from_default_install`,
+      `ollama_mcp_deprecated`, `search_mcp_simplified`. Nothing
+      auto-removed from user state — clear messages with the
+      exact cleanup commands.
+    - Search MCP wrapper `claude_mcp_servers/search_mcp/server.py`
+      net -322 LOC after stripping dropped tools.
+
+- **SSRF whitelist in `pre-tool-use.{sh,ps1}` hooks** (PR-17):
+  removed `localhost:8888` (SearXNG, no longer ships) and the
+  `mcp__search__fetch_page` tool-name guard (tool removed in
+  PR-14a). Added `localhost:11440` (`code_embed`) which was missing.
+  Explanatory comment retained pointing maintainers at PR-14a
+  for the v0.2.11 deprecation rationale.
+
+- **Effort-level guidance for ad-hoc agent spawning** (PR-14c,
+  `CLAUDE.md`): default recommendation flipped from `xhigh` to
+  `high` for substantive work. Reserve `xhigh` / `max` only for
+  genuinely deep-reasoning tasks where `high` has empirically
+  fallen short. `high` is the right default for ad-hoc spawned
+  agents; `xhigh` is overkill in most cases and adds latency /
+  token cost without proportional quality gain.
+
+- **`vct-module.json` canonical counts updated**: 5 MCP servers →
+  4 (3 Python-stack containerized — weaviate_mcp, search_mcp,
+  code_embedding_service — plus 1 system-managed Playwright). The
+  comment field documents the v0.2.11 simplification.
+
+### Fixed
+
+- **`vco_code_embed` stuck in CREATED state after boot** (PR-15
+  G3 + PR-12 wrapper changes): GPU container compose-up was racing
+  the NVIDIA CDI refresh (`/var/run/cdi/nvidia.yaml` not yet
+  populated). Now the launcher invokes the wrapper script which
+  waits up to ~10s for CDI to be ready before bringing GPU
+  containers up. Prevention, not recovery.
+
+- **Docker-without-daemon-access cascade** (PR-12 + PR-15 G1):
+  users with Docker Desktop installed but not in the `docker`
+  group used to get runtime detection succeeding silently while
+  every subsequent compose call failed permission-denied. Now
+  rejected at detection time, runtime falls through to Podman.
+
+- **Test corruption of user's real systemd unit** (PR-16): see
+  Added section. Was silently corrupting developer machines
+  since PR-12 landed.
+
+- **Stale `WorkingDirectory=` in systemd unit across install
+  moves** (PR-12): when users relocated their orchestrator clone,
+  the systemd unit kept pointing at the old path. Now auto-
+  repaired on `install.py --update` with a visible deferral.
+
+- **Search MCP `vct-search.json` declared `github_pat` secret it
+  no longer needed** (PR-19): cargo test asserted the secret was
+  declared; PR-14a + PR-14b removed it (since `search_code` is
+  gone). Test inverted to assert the secret is NOT declared
+  (regression guard).
+
+- **`check-no-fork-bomb.sh` missing env-scrub line** (PR-19): the
+  hook had the `VCT_DISABLE_HOOKS` opt-out but not the standard
+  `unset SUPABASE_KEY GITHUB_TOKEN ...` scrub. Added for parity
+  with every other VCO hook (defense-in-depth, not active
+  vulnerability — the hook doesn't process secrets).
+
+### Removed
+
+- `claude_mcp_servers/ollama_mcp/` (entire directory + Python module +
+  requirements.txt). MCP layer dropped; Ollama as infrastructure
+  stays.
+- `claude_mcp_servers/search_mcp/server.py` tools: `web_search`,
+  `search_code`, `fetch_page` (only `search_papers` survives).
+- `templates/searxng/` (template directory) + SearXNG service from
+  `claude_mcp_servers/compose.yaml` + `install.py::_materialize_searxng_settings()`
+  + `templates/settings.json.*.template` `SEARXNG_URL` env vars +
+  `launcher/bundled_manifests/vct-ollama.json` manifest.
+- `tests/test_ollama_vision_gating.py` (tested the deleted MCP).
+
+### Migration notes (for users on v0.2.5–v0.2.10)
+
+- **CHANGELOG re-anchoring**: v0.2.5 through v0.2.10 shipped without
+  per-release CHANGELOG entries during a period of fast iteration
+  (see git tags + merged PRs at each version for content). v0.2.11
+  re-establishes the Keep-a-Changelog discipline going forward.
+- **`~/.claude.json` cleanup**: if your file has an `ollama` block
+  under `mcpServers`, you'll see an `ollama_mcp_deprecated` deferral
+  notice on next `install.py --update`. Remove the block manually
+  for a clean state. Ollama-as-infrastructure (the container) is
+  unaffected.
+- **SearXNG container**: if you had it running locally, you'll see
+  a `searxng_removed_from_default_install` deferral with the
+  cleanup commands. No urgency; the container just becomes orphaned
+  cruft.
+- **Stale systemd unit**: `install.py --update` will detect + repair.
+  If you see a `boot_service_path_repaired` deferral, run
+  `systemctl --user daemon-reload` to apply.
+
+### Skipped this release (deferred to v0.2.12)
+
+- Launcher-centralized MCP env architecture (one `~/.claude.json`
+  MCP entry per server + wrapper.sh trampoline reading per-project
+  env from a launcher hub API). 2-3 day Rust + SQL + shell work;
+  too big for the stability release.
+- Install-time storage prompt in install.py CLI (PR-10A ships the
+  launcher GUI surface; CLI prompt requires `install.py` to shell
+  out to the launcher binary).
+- `lean-ctx-rewrite.{sh,ps1}` envelope-coverage runtime test
+  (requires installing lean-ctx in CI; exempted from envelope-
+  literal test for now since envelope is produced by upstream
+  binary not by the wrapper).
+
+## [0.2.5] — [0.2.10] — internal iterations
+
+Multiple releases between 0.2.4 (2026-05-12) and 0.2.11 (2026-05-16)
+shipped without per-release CHANGELOG entries. See `git log
+v0.2.4..v0.2.10` for the commit history and the corresponding GitHub
+release pages for shipped artifacts. v0.2.11 re-establishes the
+Keep-a-Changelog discipline going forward.
+
 ## [0.2.4] — 2026-05-12
 
 Same-day follow-up to 0.2.3. Three bugs surfaced while adding SD15 (a
