@@ -6356,6 +6356,35 @@ def _backup_and_write_idempotent(
     return True, backup
 
 
+def _user_home_for_install() -> Path:
+    """Return the user home directory for boot-service / config writes.
+
+    Honors ``VCT_USER_HOME_OVERRIDE`` env var when set (used by pytest
+    fixtures to redirect systemd-unit / launchd-plist / log writes into
+    a ``tmp_path``-based fake home). Falls back to ``Path.home()``.
+
+    Why this exists (Bug X, 2026-05-16): the boot-service materializer
+    + ``_repair_systemd_unit_working_dir`` historically called
+    ``Path.home()`` directly. Tests that monkeypatched
+    ``install._materialize_boot_service_linux`` to raise (verifying the
+    dispatcher's soft-fail) still hit the repair step BEFORE the
+    patched renderer, and the repair step's ``Path.home()`` returned
+    the real user home — corrupting ``~/.config/systemd/user/claude-mcp-containers.service``
+    on every test run with the pytest ``tmp_path``. This single helper
+    consolidates the lookup so a single env-var monkeypatch sandboxes
+    the entire surface.
+
+    Cross-OS: returns a real or fake home on Linux/macOS/Windows
+    identically; the systemd/launchd/Task Scheduler writers that consume
+    it append their OS-specific subpaths (``.config/systemd/user``,
+    ``Library/LaunchAgents``, etc.).
+    """
+    override = os.environ.get("VCT_USER_HOME_OVERRIDE", "").strip()
+    if override:
+        return Path(override)
+    return Path.home()
+
+
 def _materialize_boot_service_linux(
     install_path: Path,
     working_dir: Path,
@@ -6370,10 +6399,10 @@ def _materialize_boot_service_linux(
         )
         return
 
-    unit_dir = Path.home() / ".config" / "systemd" / "user"
+    unit_dir = _user_home_for_install() / ".config" / "systemd" / "user"
     unit_path = unit_dir / _BOOT_SERVICE_UNIT_NAME
     wrapper = install_path / "scripts" / "launch-claude-mcp-stack.sh"
-    log_dir = Path.home() / ".local" / "state" / "vct"
+    log_dir = _user_home_for_install() / ".local" / "state" / "vct"
     log_file = log_dir / "claude-mcp-containers.log"
     try:
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -6473,10 +6502,10 @@ def _materialize_boot_service_macos(
         )
         return
 
-    plist_dir = Path.home() / "Library" / "LaunchAgents"
+    plist_dir = _user_home_for_install() / "Library" / "LaunchAgents"
     plist_path = plist_dir / f"{_BOOT_SERVICE_PLIST_LABEL}.plist"
     wrapper = install_path / "scripts" / "launch-claude-mcp-stack.sh"
-    log_dir = Path.home() / "Library" / "Logs"
+    log_dir = _user_home_for_install() / "Library" / "Logs"
     log_file = log_dir / "claude-mcp-containers.log"
     try:
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -6958,7 +6987,10 @@ def _repair_systemd_unit_working_dir(
     if platform.system() != "Linux":
         return None
 
-    unit_path = Path.home() / ".config" / "systemd" / "user" / _BOOT_SERVICE_UNIT_NAME
+    unit_path = (
+        _user_home_for_install()
+        / ".config" / "systemd" / "user" / _BOOT_SERVICE_UNIT_NAME
+    )
     if not unit_path.is_file():
         # No unit on disk → nothing to repair. _materialize_boot_service
         # will create one fresh; this helper has no work to do.
