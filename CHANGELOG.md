@@ -7,6 +7,447 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.12] — 2026-05-16
+
+Stability + UX release on top of v0.2.11. Closes 11 of 13 MCP-instability
+bugs identified in the post-v0.2.11 audit (1 deferred to v0.2.13+, 1
+worked around via allowlist tightening). Public repo hygiene: 97
+shipped-duplicate `.claude/{hooks,scripts,settings.json}` files
+deleted — install.py now renders them from `templates/` at install
+time, so the public repo no longer ships rendered-output files that
+would override user customizations on `--update`. Cross-OS scope kept:
+every hook change shipped both `.sh` and `.ps1` bodies, with bash 3.2
+compatibility documented as policy (macOS Apple Silicon ships bash
+3.2.57; users may not have brew bash).
+
+**Major theme — MCP wiring works end-to-end on fresh install**:
+v0.2.11 silently shipped without writing any `mcpServers` entries to
+`~/.claude.json` (PR-23 fixes this). On `--update` we also detect
+stale entries pointing at moved/deleted install paths and offer a
+consent-prompted rewrite (PR-33). Live env reload via SIGHUP + a
+launcher file watcher on `.claude/settings.json` means changing per-
+project env no longer requires restarting Claude Code (PR-42). The
+`~/.claude.json` env allowlist is tightened so per-project values in
+`.claude/settings.json env` can take effect (PR-43) — the spawn-time
+env precedence in Claude Code applies `~/.claude.json mcpServers.*.env`
+LAST, so any key present in both wins on the global side; removing
+per-project-varying keys from the global allowlist is the only way to
+let per-project overrides work today.
+
+**Major theme — launcher GUI maintenance panels**: register-MCPs,
+schema-migration, stale-MCP-rewrite, and reload-MCPs all surfaced as
+buttons on the MCP page (`McpMaintenanceSection`) and Services page
+(`ServicesSchemaSection`) of the launcher. 8 new Tauri commands wire
+to the same install-time helpers, with backend-issued consent tokens
+for destructive operations (PR-37 + PR-42).
+
+**Major theme — schema correctness for temporal queries**: the
+Development collection was missing 4 temporal properties (`created`,
+`updated`, `valid_from`, `valid_until`) and both KG + Development
+were missing `indexNullState=True`. Every `hybrid_search` that used
+the stale-data filter (`valid_until is_none OR > now`) returned 0
+results on those collections with a cryptic "build inverted filter
+allow list" error. Idempotent migration scripts ship for existing
+installs; new installs get the right schema at create time (PR-24).
+
+**Major theme — public-repo hygiene**: 12 internal dev artifacts
+removed from the public clone; root CLAUDE.md (orchestrator-self's
+own large dev-context instructions) removed from the install whitelist
+so user projects don't get it dropped on top of their own CLAUDE.md
+(PR-31). 97 `.claude/{hooks,scripts,settings.json}` files that were
+silently duplicated between source and shipped location were deleted
+from the public repo — install.py renders all of them from `templates/`
+at install time, eliminating the template↔runtime drift class of bugs
+(PR-39).
+
+### Added
+
+- **Install-time MCP registration** (PR-23, `install.py`
+  + `launcher/src-tauri/src/commands/installer.rs`
+  + `launcher/src-tauri/src/mcp_registration.rs`): fresh installs
+  (and `--update` reinstalls) now write the 4 default `mcpServers`
+  entries (`weaviate-kg`, `coordination`, `search`, `vct-coordination`)
+  to `~/.claude.json` via a launcher CLI subcommand
+  `--register-default-mcps`. 4-tier launcher-binary resolution
+  inside `install.py`: shipped bundled binary
+  (`launcher/dist/<os>-<arch>/vct-launcher`) → on-demand GitHub
+  release download → `cargo tauri build` rebuild (LAST resort,
+  15-25 min) → pure-Python fallback (`launcher/src-tauri/src/mcp_registration.rs`
+  ported as a Python helper). macOS ships only `macos-arm64`
+  (Intel Macs not built per `.github/workflows/release.yml`). On
+  upgrade, `--allow-rewrite-mcps` (or the consent-prompted
+  `--rewrite-stale-mcps`) repoints existing `~/.claude.json`
+  entries from `commands::installer::run_install_orchestrator_lightweight`
+  too, so the "lightweight reinstall" path is consistent with the
+  full install path.
+
+- **Stale-MCP-entry detection + consent-prompted rewrite** (PR-33,
+  `install.py`): on `--update`, scans `~/.claude.json` for
+  `mcpServers.*.env` entries whose `command` or `args` point at
+  paths outside the current install root. Reports each stale
+  entry on stderr with the proposed rewrite, then waits for an
+  explicit per-entry yes/no consent prompt (or `--yes` for
+  unattended mode). Auto-rewriting without consent risked
+  overwriting deliberate user customizations (e.g. a power user
+  pointing at a different venv); per-entry granularity preserves
+  intent. `--no-prompt` prints the proposed rewrites without
+  applying them (CI / dry-run mode).
+
+- **Launcher-centralized stale-MCP UX** (PR-37 + PR-42,
+  `launcher/src-tauri/src/commands/maintenance.rs` +
+  `launcher/src/lib/components/{McpMaintenanceSection,StaleMcpModal,
+  SchemaMigrationModal,ServicesSchemaSection}.svelte`): 8 new
+  Tauri commands surfaced on the launcher MCP + Services pages:
+    - `mcp_registration_status` — read which MCPs are registered
+      in `~/.claude.json` + their current path validity.
+    - `rerun_mcp_registration` — invoke `--register-default-mcps`
+      on demand from GUI.
+    - `schema_migration_status` — read whether KG / Development
+      collections need temporal-property or indexNullState
+      migration.
+    - `issue_schema_migration_consent_token` — backend-issued
+      single-use UUID token; FE doesn't generate its own (preserves
+      single-source-of-truth for the destructive op).
+    - `run_schema_migrations` — apply pending migrations after
+      consent.
+    - `stale_mcp_entries` — list stale `~/.claude.json` entries
+      with their proposed rewrites.
+    - `rewrite_stale_mcp_entries` — apply per-entry consent
+      `Vec<(name, bool)>` rewrites; preserves audit trail of
+      unchecked entries.
+    - `reload_mcps_sighup` (PR-42) — send SIGHUP to all running
+      MCP server PIDs to force a clean-exit + Claude-Code respawn,
+      picking up new `.claude/settings.json env` values without
+      restarting Claude Code.
+
+- **SIGHUP-driven MCP env reload + launcher file watcher** (PR-42,
+  `claude_mcp_servers/_lib/sighup_handler.py` +
+  `launcher/src-tauri/src/services/settings_json_watcher.rs`):
+  every Python MCP server registers a SIGHUP handler that calls
+  `sys.exit(0)` (clean exit, not raise) — Claude Code's MCP
+  process supervisor respawns on clean exit, picking up the new
+  env. Launcher's `notify` crate watcher debounces
+  `.claude/settings.json` changes (1s) and dispatches the SIGHUP
+  batch automatically. Same code path is exposed via the manual
+  "Reload MCPs" button in the launcher MCP page for cases where
+  the watcher isn't running (e.g. launcher closed).
+
+- **Weaviate-MCP error classifier hardening** (PR-41,
+  `claude_mcp_servers/weaviate_mcp/server.py`): new
+  `WeaviateSchemaError` class distinguishes schema-not-found /
+  schema-mismatch errors from connectivity (`WeaviateUnreachable`)
+  and auth (`WeaviateAuthError`). Schema-not-found now invalidates
+  the per-collection schema cache (Issue A: schema-cache stale
+  after `--migrate-schema` ran in another process). Error
+  messages surfaced to Claude include the distinguishing path so
+  users (and future-Claude) can act on the right failure mode
+  rather than misattributing schema problems to connectivity.
+
+- **Development collection temporal properties + indexNullState**
+  (PR-24, `vco_lib/project_init.py`
+  + `scripts/migrate-development-temporal-props.{sh,ps1}`
+  + `scripts/migrate-shared-kg-schema.{sh,ps1}`): adds 4
+  temporal properties (`created`, `updated`, `valid_from`,
+  `valid_until`) to `development_class_definition()` so KG-style
+  stale-data filters work on Development collections.
+  `invertedIndexConfig.indexNullState=True` added to BOTH KG and
+  Development at create time. Migration scripts retro-add the 4
+  properties to existing Development collections (POST to
+  `/schema/<class>/properties` works on existing collections);
+  shared-KG-schema migration drops + recreates the shared
+  collection if `indexNullState=False` (Weaviate ≤1.30 can't
+  retro-add it; shared KG is typically empty in user installs so
+  this is non-destructive). `install.py --update` runs both
+  migrations idempotently.
+
+- **Hook dual-layout venv resolution** (PR-25,
+  `templates/hooks/{code-graph-incremental,kg-summary-generator,
+  pre-edit-context-inject}.{sh,ps1}`): the 3 hooks that need
+  Python (for KG/codegraph work) now try `$REPO_ROOT/.venv` first,
+  fall back to `$REPO_ROOT/claude_mcp_servers/.venv`, with
+  `$VCT_VENV` as explicit override. Previously hardcoded
+  `claude_mcp_servers/.venv` only — silently fell through to
+  system python on installs using the modern top-level `.venv`
+  layout. Cross-OS via `.ps1` siblings with the same fallback
+  chain.
+
+- **Shared-KG canonical-name alignment + partial-match picker**
+  (PR-26 + PR-34, `vco_lib/project_init.py` + 5 launcher Rust /
+  Svelte surfaces): canonical name is now
+  `VibecodedOrchestrator_KnowledgeGraph` across all surfaces
+  (install pipeline, launcher GUI default, MCP env, tests). Old
+  alias `VibeCodedTools_KnowledgeGraph` kept for ~3 releases as a
+  fallback in the schema-detection helper. New
+  `SharedKgPicker.svelte` GUI lets users adopt a same-suffix
+  legacy collection without forcing them to rename. The 5
+  surfaces consolidated into a single `VIBECODED_TOOLS_KG_COLLECTION`
+  constant.
+
+- **Install-time storage-location prompt** (PR-28, `install.py`):
+  on installs with legacy bind-mount paths in
+  `$VCO_LEGACY_VOLUME_DIR` (or detected via the same logic as
+  PR-10A's GUI), the CLI now prompts at install start with three
+  options: keep the legacy path, migrate to the runtime-managed
+  named volume (recommended), or pick a new bind path. Same
+  3-shape `compose.override.yaml` generator as PR-10A's GUI; both
+  paths go through the unified launcher-binary resolver added in
+  PR-36. `--storage-mode {named,bind,legacy}` flag for unattended
+  installs.
+
+- **Cross-OS cache layer for pre-edit hook** (PR-38,
+  `templates/hooks/pre-edit-context-inject.sh`): bash port of the
+  `.ps1` cache layer for cross-OS perf parity. Cache key is
+  `<file_path>:<offset>:<limit>` (block-atomic dedup — KG/CODE
+  result blocks are emitted whole or suppressed whole, never
+  partial — so a re-read with a different offset gets a fresh
+  retrieval rather than a stale subset). **bash 3.2 compatible**:
+  uses file-backed seen-set + `grep -Fxq` rather than `declare -A`,
+  so the hook runs on macOS Apple Silicon (default `/bin/bash`
+  is 3.2.57). Reduces re-read overhead from ~2.7s to ~31ms when
+  the cache is warm.
+
+- **VCT_CONTAINER_RUNTIME env honored in launcher GUI** (PR-43,
+  `launcher/src-tauri/src/services/runtime.rs`): the
+  `resolve_runtime()` function now honors a per-process
+  `VCT_CONTAINER_RUNTIME=podman|docker|auto` override before
+  falling back to the auto-detection order. Unrecognized values
+  log a warning to stderr and fall back to default detection.
+  Hooks already honored this env var; the launcher GUI parity is
+  the missing piece.
+
+- **KG node `claude-code-mcp-env-reversed-precedence`** documents
+  the spawn-time env-application order in Claude Code's MCP
+  supervisor for future reference. Anthropic's documented
+  "project scope overrides user scope" semantics applies to chat-
+  process settings but NOT to `mcpServers.*.env` — those entries
+  are applied LAST in the MCP subprocess spawn, so any key
+  present in both `~/.claude.json mcpServers.<name>.env` and
+  `.claude/settings.json env` wins on the global side. The
+  detection heuristic is "would two different projects on the
+  same machine ever want different values for this key?" — if
+  yes, the key must not appear in `~/.claude.json mcpServers.*.env`.
+
+### Changed
+
+- **Public repo no longer ships `.claude/{hooks,scripts,settings.json}`
+  rendered files** (PR-39): 97 duplicated files deleted from the
+  public clone. `install.py` renders all of them from
+  `templates/` at install time with the appropriate path
+  substitutions (`$INSTALL_ROOT`, `$VENV_PYTHON`, etc.). Source
+  of truth is the `templates/` directory; the rendered output
+  lives in the target install's `.claude/` and is no longer a
+  candidate for source-control drift between the template and
+  the shipped copy.
+
+- **Root CLAUDE.md no longer in install whitelist** (PR-31): the
+  orchestrator-self's own dev-context CLAUDE.md (which serves the
+  dev project, not user projects) is no longer copied into user
+  projects at install time. User projects get the project-
+  template CLAUDE.md from `templates/CLAUDE.md.template` instead.
+  Existing user CLAUDE.md is preserved across `--update` (the
+  manifest-based drift detector classifies it as user-modified).
+
+- **`docker-compose.override.yml` → `compose.override.yaml`**
+  (PR-22, `launcher/src-tauri/src/commands/storage_ux.rs` +
+  `scripts/launch-claude-mcp-stack.sh` + Windows task XML
+  template): the dotted `.yaml` form is the one podman-compose
+  actually loads. The dot-yml form was silently ignored, so
+  bind-mount storage UX (PR-10A) shipped non-functional in
+  v0.2.11. Boot script now explicitly adds
+  `-f compose.override.yaml` when present (env-overridable via
+  `VCT_STACK_COMPOSE_OVERRIDE`). Systemd unit + Windows task
+  templates carry the env var. `install.py --update` detects the
+  legacy `.yml` filename + renames it (idempotent) with a
+  `compose_override_renamed` deferral.
+
+- **`.vscode/settings.json claude-code.env` no longer written**
+  (PR-27, `vco_lib/project_init.py`): the channel was empirically
+  shown not to propagate env into MCP server subprocesses on
+  Linux Claude Code 2.1.143. Removed from `write_project_env_files`
+  to avoid creating the false impression that VS Code's
+  `claude-code.env` block was a viable env-override mechanism.
+  The KG node `vscode-claude-code-env-not-propagated-to-mcp-linux.md`
+  documents the empirical finding for future reference.
+
+- **`~/.claude.json mcpServers.*.env` allowlist tightened** (PR-43,
+  `install.py` + `launcher/src-tauri/src/mcp_registration.rs`):
+  removed `EMBEDDING_MODEL` and `RL_SERVER_URL` from
+  `_ALLOWED_GLOBAL_ENV_KEYS`. Both keys legitimately vary per-
+  project. Keeping them in the global allowlist meant the
+  reversed-precedence behavior (`~/.claude.json` wins) shadowed
+  any per-project value. Allowlist now contains only keys whose
+  values are machine-invariant: `WEAVIATE_URL`, `OLLAMA_URL`,
+  `GRPC_PORT`, `PYTHONPATH`, `ACTIVE_EMBEDDING`,
+  `CODE_EMBED_SERVICE_URL`. Per-project-varying keys live ONLY
+  in `.claude/settings.json env`. The detection heuristic for
+  whether a key belongs in the global allowlist is recorded in
+  the KG node `claude-code-mcp-env-reversed-precedence.md`.
+
+- **Launcher-binary resolution DRY'd up across install + storage
+  prompt** (PR-36): PR-23 (MCP registration) and PR-28 (storage
+  prompt) both needed to resolve a launcher binary in the same
+  4-tier order. Consolidated into a single helper. Behavior
+  unchanged; pure refactor.
+
+- **Pre-edit-context-inject cache-replay dead code removed**
+  (PR-35, `templates/hooks/pre-edit-context-inject.sh`): the
+  hook had an unreachable `replay_cached_results()` branch left
+  over from an earlier design. Removed; PR-38's new cache layer
+  is the only cache path.
+
+- **Windows hooks `.ps1` body parity audit** (PR-32, 4 hooks):
+  audited every `.ps1` hook for body-logic drift vs its `.sh`
+  sibling. The only legitimate backport was `check-no-fork-bomb`
+  env-scrub (the `.sh` had it from v0.2.11, the `.ps1` didn't).
+  Other 3 were already in parity; documented in
+  `windows-templates-parity-audit-2026-05-16.md` context note.
+  Windows task XML wrapper now uses `cmd.exe /c "set ..."` for
+  env propagation (the previous `bash -c "export ..."` approach
+  failed on Windows hosts without WSL2 / Git-Bash on PATH).
+  UTF-8 encoding declaration in the task XML (was UTF-16, fixed
+  in fixup commit `8d32c16`).
+
+### Fixed
+
+- **Fresh install left Claude Code with zero MCP servers wired**
+  (PR-23): v0.2.11 install pipeline populated everything except
+  the `~/.claude.json mcpServers` block. Users on a fresh
+  v0.2.11 install would see no orchestrator MCPs in Claude Code
+  and had to hand-edit `~/.claude.json` — the #1 first-install
+  UX failure. Now the install pipeline writes them via the
+  launcher CLI subcommand.
+
+- **`hybrid_search` returned 0 results with cryptic error on
+  Development collection + shared KG** (PR-24): the MCP's
+  stale-data filter (`valid_until is_none OR > now`) hit a
+  Weaviate "build inverted filter allow list" error because
+  Development collections didn't have the 4 temporal props at
+  all, and shared KG didn't have `indexNullState=True` so
+  `is_none` queries failed. Migration script fixes existing
+  installs; new installs get the right schema at create time.
+
+- **Schema-not-found error from MCP misattributed to "Weaviate
+  unreachable"** (PR-41): when a project's KG / Dev collection
+  didn't exist in Weaviate (typically because user hadn't run
+  `install.py --update` after a schema migration), the MCP
+  returned a generic "WeaviateUnreachable" error to Claude,
+  which then suggested checking the container — wasting cycles
+  before the user realized the right action was to run the
+  migration. Now distinguished: `WeaviateSchemaError` with the
+  collection name + suggested migration command.
+
+- **MCP env changes required Claude Code restart to take effect**
+  (PR-42): editing `.claude/settings.json env` to update a per-
+  project KG collection, RL server URL, etc. required quitting
+  and reopening Claude Code to pick up the change (because the
+  MCP subprocess inherits env at spawn time). Now the launcher
+  watches `.claude/settings.json` and SIGHUPs the running MCP
+  PIDs (clean exit → Claude Code respawns) so changes apply
+  within ~1s. Manual button for users without the launcher open.
+
+- **Per-project MCP env values shadowed by `~/.claude.json`** (PR-43):
+  see Changed section. `EMBEDDING_MODEL` and `RL_SERVER_URL` were
+  unconditionally written to `~/.claude.json mcpServers.*.env` at
+  install time, and the reversed-precedence behavior in Claude
+  Code's MCP spawn made those values win against per-project
+  overrides. Allowlist now excludes per-project-varying keys.
+
+- **Stale `~/.claude.json mcpServers` entries from prior install
+  locations** (PR-33): users who relocated their orchestrator
+  clone had `~/.claude.json` entries pointing at the old path.
+  Claude Code would silently fail to spawn the MCP. Now
+  `--update` detects + offers per-entry consent-prompted
+  rewrite.
+
+- **`code-graph-incremental` + `kg-summary-generator` +
+  `pre-edit-context-inject` hooks silently fell through to
+  system python on modern installs** (PR-25): the hooks hardcoded
+  `claude_mcp_servers/.venv` only. Installs using the modern
+  top-level `.venv` layout (since the v0.2.4 install overhaul)
+  saw the hooks "succeed" with system python that didn't have
+  Weaviate / sentence-transformers installed → the hook returned
+  empty results silently. Now tries `$REPO_ROOT/.venv` first.
+
+- **Cache-layer non-determinism in `pre-edit-context-inject.sh`**
+  (PR-38): the bash port of the `.ps1` cache could under
+  concurrent reads emit a partial result block (cache hit on
+  chunk N but cache miss on chunk N+1 of the same KG node, where
+  the node was emitted in 2 chunks). Now block-atomic: the cache
+  key is the file path + offset + limit, and a result block is
+  emitted whole or not at all.
+
+- **Cargo.lock missed `notify` crate dep refresh** (commit
+  `98df441`): PR-42 added the `notify` crate for the file
+  watcher; Cargo.lock wasn't regenerated in the PR. Fixed in a
+  trailing chore commit before push.
+
+- **3 installer conflict-strategy tests asserted root CLAUDE.md
+  was in the install whitelist** (commit `a5b8432`): PR-31
+  removed it from the whitelist but the test fixtures still
+  expected it to be overwritten by `install --strategy overwrite`.
+  Tests updated to assert CLAUDE.md survives independent of
+  strategy (it's now outside the allowlist).
+
+- **4 test fixups for PR-34 (shared-KG canonical name) + PR-42
+  (`reload_mcps_sighup` Tauri command) integration** (commit
+  `952fa96`).
+
+### Removed
+
+- 97 shipped-duplicate `.claude/{hooks,scripts,settings.json}` files
+  from the public repo (PR-39). Source of truth is `templates/`;
+  rendering at install time eliminates the source↔shipped drift
+  bug class.
+- 12 internal dev artifacts from the public repo (PR-31): test
+  scaffolding, dev-only context docs, and dev-laced reference
+  notes that had crept into the shipped tree.
+- Root `CLAUDE.md` from the install whitelist (PR-31). Orchestrator-
+  self's own CLAUDE.md is dev-only; user projects get the project-
+  template CLAUDE.md.
+- `EMBEDDING_MODEL` and `RL_SERVER_URL` from the
+  `_ALLOWED_GLOBAL_ENV_KEYS` allowlist (PR-43). These keys vary
+  per-project; the reversed-precedence behavior in Claude Code
+  meant including them in the global block shadowed per-project
+  values.
+
+### Security
+
+- **Env-scrub on `lean-ctx-rewrite.{sh,ps1}` hooks** (post-v0.2.11
+  patch commit `cb7ff88`): the hook now ships with full env-scrub
+  for parity with every other VCO hook. Defense-in-depth: the
+  hook doesn't process secrets directly, but `unset SUPABASE_KEY
+  GITHUB_TOKEN ...` removes the exposure surface if a future
+  change to the hook were to log the environment.
+- **Backend-issued consent tokens for schema-migration
+  destructive op** (PR-37 + PR-42): the schema-migration modal
+  fetches the consent token from `issue_schema_migration_consent_token`
+  rather than generating its own UUID. Single source of truth
+  for the destructive-op gate; FE typos can't drift away from
+  the contract.
+
+### Known issues / deferred
+
+- **Per-session MCP subprocesses** (Issue G from the v0.2.12 audit):
+  Claude Code's MCP supervisor spawns a fresh MCP subprocess per
+  chat session. The MCP spec doesn't currently support a daemon
+  mode where multiple sessions share one MCP process. Cold-start
+  latency (~300ms) repeats per session. 4 alternative
+  approaches documented in
+  `.claude/context/plans/v0.2.13-candidates-2026-05-16.md`;
+  recommendation is to wait for upstream HTTP-MCP spec movement
+  rather than build a custom daemon shim.
+- **2 cargo test parallelism-sensitive flakes** (pre-existing
+  from v0.2.11): `commands::kg_sync::tests::concurrent_drain_does_not_deadlock_on_large_stderr`
+  + `stall_watchdog_kills_silent_subprocess` (subprocess
+  fork/exec ENOENT under high concurrency). Pass with
+  `--test-threads=1` and in isolation. Documented in
+  `.claude/context/plans/v0.2.13-candidates-2026-05-16.md`.
+- **2 OS-keychain shared-state cargo test flakes**:
+  `commands::installer::tests::github_pat_keychain_tests::pat_file_to_keychain_migration_uses_user_slot_after_module_id_flip`
+  + `register_github_pat_preserves_existing_user_file`. Both
+  pass in isolation; race is on the OS keychain backend's
+  shared state under parallel `cargo test`.
+
 ## [0.2.11] — 2026-05-16
 
 Stability release. The orchestrator's own infrastructure (compose
