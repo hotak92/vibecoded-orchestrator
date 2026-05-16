@@ -60,6 +60,12 @@
 # 4. exec lean-ctx hook rewrite — per-call symmetric bypass handled inside
 #    (commands starting with `lean-ctx ...` emit empty stdout → raw).
 set -u
+# Scrub sensitive env vars before any subprocess spawning (defense-in-depth
+# parity with every other VCO hook — enforced by tests/test_hooks_disable_guard.py).
+# Note: this hook itself doesn't read secrets, but `exec lean-ctx hook rewrite`
+# inherits our env. Scrubbing before the exec means the lean-ctx subprocess
+# can't accidentally leak a credential via its own logs / debug output.
+unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
 # Source .claude/env if present so per-project defaults (VCO_LEAN_CTX_DEFAULT)
 # are visible. The file is plain `KEY=VALUE` shell syntax; sourcing is safe

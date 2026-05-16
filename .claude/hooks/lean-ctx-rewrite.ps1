@@ -27,6 +27,15 @@
 # 3. lean-ctx availability — graceful no-op when missing.
 # 4. & lean-ctx hook rewrite — per-call symmetric bypass inside.
 
+# Scrub sensitive env vars before any subprocess spawning (defense-in-depth
+# parity with every other VCO hook + .sh sibling). The hook itself doesn't
+# read secrets, but `& lean-ctx hook rewrite` inherits our env; scrubbing
+# before delegation means the lean-ctx subprocess can't accidentally leak a
+# credential via its own logs / debug output.
+foreach ($k in @('SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY')) {
+    if (Test-Path "Env:$k") { Remove-Item -LiteralPath "Env:$k" -ErrorAction SilentlyContinue }
+}
+
 # 1. Global kill-switch (one switch for "turn off all VCT hook side-effects").
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 
