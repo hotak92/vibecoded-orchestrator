@@ -1,3 +1,4 @@
+# OS-EXEMPT-PARITY: PR-32 ports the .sh-side env-scrub (already present in .sh, missing here) — Windows-only fix to add defence-in-depth secret scrub before subprocess spawning; no .sh change required.
 # check-no-fork-bomb.ps1 — Windows sibling of check-no-fork-bomb.sh.
 #
 # See check-no-fork-bomb.sh for the full incident background and
@@ -11,6 +12,19 @@
 # past anything legitimate). This hook is the safety net for either OS.
 #
 # See knowledge/concepts/lean-ctx-shim-disabled.md for forensics.
+
+# Ported from sibling .sh in PR-32 (Group K Phase B): scrub sensitive env
+# vars before any subprocess spawning — defence-in-depth parity with every
+# other VCO hook (enforced by tests/test_hooks_disable_guard.py).
+$secretEnvNames = @(
+    'SUPABASE_KEY', 'SUPABASE_URL', 'GITHUB_TOKEN', 'GH_TOKEN',
+    'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'AWS_SECRET_ACCESS_KEY',
+    'AWS_ACCESS_KEY_ID', 'TELEGRAM_BOT_TOKEN', 'POSTGRES_PASSWORD',
+    'VERCEL_TOKEN', 'CLAUDE_API_KEY'
+)
+foreach ($v in $secretEnvNames) {
+    if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
+}
 
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 

@@ -1,4 +1,16 @@
 # OS-EXEMPT-PARITY: Windows-only fix 2026-05-08 — added hookSpecificOutput/additionalContext JSON envelope. The .sh sibling already emitted that envelope from earlier work; no .sh change needed in this commit.
+# parity-confirmation 2026-05-16 (PR-32, Group K Phase B): full body parity
+# audit confirmed — every .sh-side dedup-correctness fix from PR #186 is
+# present in this .ps1 sibling:
+#   - "KG: <title> | ..." / "CODE: <full_name> | ..." header regex
+#     (`^(KG|CODE):\s+(.+)$`) in Filter-Seen (line ~236).
+#   - Blank/separator pass-through gate (`if ($line -match '\S')` at ~260)
+#     prevents empty system-reminder blocks when dedup suppresses all blocks.
+#   - Raw cache (pre-dedup): $KgRaw/$CodeRaw captured BEFORE Filter-Seen
+#     (lines ~288-289), written to $CacheFile so replays apply current
+#     seen-list dedup state rather than perma-suppressing nodes.
+#   - Cache replay re-runs Filter-Seen against current seen-list (line ~275),
+#     exits silently if everything is already seen.
 # Parity-touch 2026-05-08: bash shebang of sibling .sh switched from #!/bin/bash to #!/usr/bin/env bash for macOS portability. PS1 has no shebang to change; this comment is the parity-required modification.
 # Scrub sensitive env vars (this hook doesn't need credentials)
 foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN') {

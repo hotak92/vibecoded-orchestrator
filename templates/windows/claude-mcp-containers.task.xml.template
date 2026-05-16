@@ -35,9 +35,33 @@
     {{WORKING_DIR}}        — directory containing compose.yaml
     {{WRAPPER_SCRIPT}}     — absolute path to launch-claude-mcp-stack.sh
                              (use forward slashes; bash translates them)
+    {{LOG_FILE}}           — absolute path to the unit's log file
+                             (use forward slashes; bash translates them)
     {{CREATED_AT}}         — ISO8601 timestamp at materialization time
     {{USER_ID}}            — Windows user ID (e.g. DOMAIN\\user) for the
                              logon trigger context
+
+  Environment propagation (PR-32, 2026-05-16):
+    The wrapper script `launch-claude-mcp-stack.sh` reads three env vars
+    set by the systemd unit on Linux:
+
+        VCT_STACK_WORKING_DIR    — directory containing compose.yaml
+        VCT_STACK_LOG_FILE       — absolute path to the unit's log file
+        VCT_STACK_COMPOSE_OVERRIDE — overlay compose file (defaults to
+                                     `compose.override.yaml`)
+
+    Prior to PR-32 this Windows scheduled task fired bash with NONE of
+    them set, so the wrapper silently fell through to its defaults
+    (which on Windows resolve to paths that may not exist for the
+    current user, breaking compose-up). Mirrors the systemd template's
+    `Environment=VCT_STACK_*=...` lines.
+
+    Mechanism: we replace the bare `<Command>bash</Command>` with
+    `cmd.exe /c "set VAR=val && set VAR2=val2 && set VAR3=val3 && bash
+    <script>"`. `cmd.exe` is always on PATH on Windows; the `set` builtin
+    is per-process scope (it does not leak into the user's interactive
+    environment); the `&&` chain ensures bash inherits the variables.
+    Forward slashes in WRAPPER_SCRIPT survive cmd.exe → bash translation.
 -->
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
@@ -80,8 +104,8 @@
   </Settings>
   <Actions Context="Author">
     <Exec>
-      <Command>bash</Command>
-      <Arguments>"{{WRAPPER_SCRIPT}}"</Arguments>
+      <Command>cmd.exe</Command>
+      <Arguments>/c "set VCT_STACK_WORKING_DIR={{WORKING_DIR}}&amp;&amp; set VCT_STACK_LOG_FILE={{LOG_FILE}}&amp;&amp; set VCT_STACK_COMPOSE_OVERRIDE=compose.override.yaml&amp;&amp; bash &quot;{{WRAPPER_SCRIPT}}&quot;"</Arguments>
       <WorkingDirectory>{{WORKING_DIR}}</WorkingDirectory>
     </Exec>
   </Actions>

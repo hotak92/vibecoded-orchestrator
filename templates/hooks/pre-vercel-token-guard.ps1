@@ -1,3 +1,16 @@
+# parity-confirmation 2026-05-16 (PR-32, Group K Phase B): full body parity
+# audit confirmed — every .sh-side guard check is present in this .ps1 sibling:
+#   - Sensitive env-var scrub (foreach loop below, lines 3-5) mirrors .sh
+#     `unset SUPABASE_KEY ...` (line 4 of sibling).
+#   - VCT_DISABLE_HOOKS short-circuit (line 6) mirrors `.sh` line 5.
+#   - Tool-name == "Bash" early-out (line 33) mirrors `.sh` line 55.
+#   - Vercel + --token regex match (lines 36-37) mirrors `.sh` lines 69-70.
+#     .sh uses `LEAN_CTX_OFF=1 command grep -qE` to bypass any lean-ctx
+#     wrapping of the grep binary; PowerShell uses the -match operator
+#     (native regex engine, no external binary, no lean-ctx interposition
+#     possible) — same matching semantics, no equivalent guard needed.
+#   - Block + exit 2 with multi-line stderr (lines 39-55) mirrors `.sh`
+#     lines 71-85 (cat heredoc + exit 2).
 # Parity-touch 2026-05-08: bash shebang of sibling .sh switched from #!/bin/bash to #!/usr/bin/env bash for macOS portability. PS1 has no shebang to change; this comment is the parity-required modification.
 # Scrub sensitive env vars before any subprocess spawning
 foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_API_KEY','ANTHROPIC_API_KEY','AWS_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','TELEGRAM_BOT_TOKEN','POSTGRES_PASSWORD','VERCEL_TOKEN','CLAUDE_API_KEY') {
