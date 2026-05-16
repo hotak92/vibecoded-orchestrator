@@ -333,6 +333,12 @@ pub fn run() {
             commands::projects_v2::switch_project_host_v2,
             commands::projects_v2::delete_project_v2,
             commands::projects_v2::launch_project_in_editor,
+            // Orchestrator-root view (v0.2.11, 2026-05-15) — exposes the
+            // auto-registered `host=orchestrator_root` project row to
+            // the UI so Settings / Dashboard can render a card for the
+            // clone itself. Falls back to a synthetic view when the row
+            // is absent (standalone binary, no clone findable on disk).
+            commands::orchestrator_root::get_orchestrator_root_view,
             // Concurrency invalidation (P7) — change_log polling
             commands::changes_cmd::poll_changes,
             commands::changes_cmd::current_change_seq,

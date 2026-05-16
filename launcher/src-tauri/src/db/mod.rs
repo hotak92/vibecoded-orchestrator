@@ -76,6 +76,22 @@ impl Db {
         // Best-effort prune of old change_log rows. Silent failure is fine.
         let cutoff = chrono::Utc::now().timestamp_millis() - 24 * 60 * 60 * 1000;
         let _ = db.prune_change_log(cutoff);
+
+        // Auto-register the orchestrator clone as a project row (migration
+        // 013 prerequisite). Idempotent: a no-op when the row already
+        // exists OR when no clone is detectable from disk (standalone
+        // binary install). Soft-fail: any error here logs and does NOT
+        // block launcher startup — the row is a convenience, the rest of
+        // the launcher continues to work without it.
+        //
+        // Only invoked from the production open() path. `open_in_memory`
+        // (used by tests) deliberately skips this so it doesn't pollute
+        // unrelated tests with a row whose folder_path depends on the
+        // test runner's binary location.
+        if let Err(e) = crate::commands::orchestrator_root::ensure_orchestrator_root(&db) {
+            eprintln!("[vct] warning: ensure_orchestrator_root failed: {}", e);
+        }
+
         Ok(db)
     }
 

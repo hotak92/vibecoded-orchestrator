@@ -310,6 +310,24 @@ pub async fn create_project_v2(
         return Err(format!("not a directory: {}", req.folder_path));
     }
 
+    // Migration 013 (v0.2.11, 2026-05-15): host='orchestrator_root' is a
+    // reserved value with a single fixed slug ('orchestrator-root') and
+    // an auto-registration path in `Db::open()`. Manual creation through
+    // the New Project modal would either fail at the UNIQUE-slug check
+    // (confusing error: "slug taken") or, worse, silently succeed with
+    // a non-canonical slug and leave the user with two orchestrator
+    // roots from the consumer-code perspective. Reject early with a
+    // clear message; the auto-register path is the only sanctioned
+    // way to create this row.
+    if req.host == ProjectHost::OrchestratorRoot {
+        return Err(
+            "host='orchestrator_root' is reserved: the orchestrator clone is \
+             auto-registered at launcher startup. Use the standard host \
+             values ('base' or 'mao') for user projects."
+                .to_string(),
+        );
+    }
+
     let id = Uuid::new_v4().to_string();
     let slug = db.generate_unique_slug(&req.name)?;
     let row = db.insert_project(&id, &req.name, &req.folder_path, req.host.clone(), &slug)?;
@@ -388,27 +406,41 @@ pub async fn create_project_v2(
     // matters across `run_install_bundle`. The codegraph block now lives
     // below, after bootstrap → bundle install → post-bundle populate.
 
-    // B12 (2026-05-01): detect stale .env from pre-existing folder registration.
-    // ensure_project_env_template is append-only, so a folder that already had a
-    // .env with a bare/wrong KG_COLLECTION (e.g. "KnowledgeGraph") will keep it
-    // as the first active KG_COLLECTION line. Detect and warn; full repair with
-    // manifest-based rewrite lands in PR 5. We check for the two known-buggy
-    // defaults: bare "KnowledgeGraph" and bare sanitized name without suffix.
-    if let Ok(env_text) = std::fs::read_to_string(folder.join(".env")) {
-        let kg_basename = sanitize_kg_collection(&req.name);
-        let canonical_kg = format!("{}_KnowledgeGraph", kg_basename);
-        let stale_bare = "KG_COLLECTION=KnowledgeGraph";
-        let stale_nosuffix = format!("KG_COLLECTION={}", kg_basename);
-        let has_stale = env_text.lines().any(|l| {
-            let t = l.trim();
-            t == stale_bare || t == stale_nosuffix
-        });
-        if has_stale && !env_text.contains(&format!("KG_COLLECTION={}", canonical_kg)) {
+    // B12 (2026-05-01, repaired in 0.2.11): rewrite stale .env from pre-existing
+    // folder registration. ensure_project_env_template is append-only, so a
+    // folder that already had a .env with a bare/wrong KG_COLLECTION (e.g.
+    // "KnowledgeGraph" without project suffix, or just the bare sanitized name)
+    // would otherwise keep that stale value as the first active KG_COLLECTION
+    // line, and consumers reading the first match would pick up the wrong
+    // collection. Pre-0.2.11 this block only warned and asked the user to fix
+    // it by hand — that left the bug live in every existing install. Now we
+    // call the testable helper `b12_repair_stale_kg_collection` to rewrite
+    // the first KG_COLLECTION= line in place; audit the result here.
+    let env_path = folder.join(".env");
+    match b12_repair_stale_kg_collection(&env_path, &req.name) {
+        Ok(B12Outcome::Repaired { canonical_kg }) => {
+            eprintln!(
+                "[vct] info: B12: rewrote stale KG_COLLECTION in {} → {}",
+                env_path.display(),
+                canonical_kg
+            );
+            let _ = db.audit(
+                "env_b12_auto_repair",
+                Some(&row.id),
+                None,
+                &serde_json::json!({
+                    "path": env_path.display().to_string(),
+                    "kg_collection": canonical_kg,
+                }),
+            );
+        }
+        Ok(B12Outcome::NoChangeNeeded) => {}
+        Err(e) => {
             let msg = format!(
-                "existing .env has stale KG_COLLECTION (expected {}). \
-                 Full repair deferred to PR 5 (manifest-based). \
-                 You may manually set KG_COLLECTION={} in the .env.",
-                canonical_kg, canonical_kg
+                "B12 auto-repair failed to rewrite {} (KG_COLLECTION stale): {}. \
+                 Manual fix: set KG_COLLECTION=<project>_KnowledgeGraph in the .env.",
+                env_path.display(),
+                e
             );
             eprintln!("[vct] warning: B12: {}", msg);
             warnings.push(msg);
@@ -2480,6 +2512,99 @@ pub fn sanitize_kg_collection(name: &str) -> String {
     out
 }
 
+/// Outcome of `b12_repair_stale_kg_collection`. Either we rewrote the
+/// first stale `KG_COLLECTION=` line (and report the canonical value
+/// that's now in the file), or the file did not need touching.
+#[derive(Debug, PartialEq, Eq)]
+pub enum B12Outcome {
+    Repaired { canonical_kg: String },
+    NoChangeNeeded,
+}
+
+/// B12 auto-repair: rewrite the first stale `KG_COLLECTION=` line in a
+/// project's `.env` to the canonical `<sanitized>_KnowledgeGraph` form.
+///
+/// Pre-0.2.11 a folder that already had a `.env` with `KG_COLLECTION=KnowledgeGraph`
+/// (bare default) or `KG_COLLECTION=<basename>` (no suffix) kept that
+/// stale value as the first active line, and consumers reading the
+/// first match picked up the wrong collection. This helper rewrites the
+/// stale line in place, preserving comments / ordering / other env keys
+/// verbatim, and annotates the rewritten line with the previous value
+/// for forensic clarity.
+///
+/// Returns:
+/// - `Err(io::Error)` if `.env` cannot be read or written.
+/// - `Ok(NoChangeNeeded)` if `.env` does not exist, or the canonical
+///   value is already present (anywhere in the file), or no stale value
+///   was found.
+/// - `Ok(Repaired { canonical_kg })` if the first stale line was rewritten.
+///
+/// Idempotent: a second call after a successful repair is a no-op
+/// because the canonical value is now present in the file.
+pub fn b12_repair_stale_kg_collection(
+    env_path: &Path,
+    project_name: &str,
+) -> std::io::Result<B12Outcome> {
+    let env_text = match std::fs::read_to_string(env_path) {
+        Ok(t) => t,
+        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(B12Outcome::NoChangeNeeded);
+        }
+        Err(e) => return Err(e),
+    };
+
+    let kg_basename = sanitize_kg_collection(project_name);
+    let canonical_kg = format!("{}_KnowledgeGraph", kg_basename);
+    let canonical_line = format!("KG_COLLECTION={}", canonical_kg);
+    let stale_bare = "KG_COLLECTION=KnowledgeGraph";
+    let stale_nosuffix = format!("KG_COLLECTION={}", kg_basename);
+
+    let mut found_canonical = false;
+    let mut found_stale_idx: Option<usize> = None;
+    for (idx, line) in env_text.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed == canonical_line {
+            found_canonical = true;
+            break;
+        }
+        if (trimmed == stale_bare || trimmed == stale_nosuffix)
+            && found_stale_idx.is_none()
+        {
+            found_stale_idx = Some(idx);
+        }
+    }
+    if found_canonical {
+        return Ok(B12Outcome::NoChangeNeeded);
+    }
+    let stale_idx = match found_stale_idx {
+        Some(idx) => idx,
+        None => return Ok(B12Outcome::NoChangeNeeded),
+    };
+
+    let trailing_newline = env_text.ends_with('\n');
+    let rebuilt: Vec<String> = env_text
+        .lines()
+        .enumerate()
+        .map(|(i, l)| {
+            if i == stale_idx {
+                format!(
+                    "{} # B12 auto-repaired 0.2.11: was \"{}\"",
+                    canonical_line,
+                    l.trim()
+                )
+            } else {
+                l.to_string()
+            }
+        })
+        .collect();
+    let mut joined = rebuilt.join("\n");
+    if trailing_newline {
+        joined.push('\n');
+    }
+    std::fs::write(env_path, joined)?;
+    Ok(B12Outcome::Repaired { canonical_kg })
+}
+
 #[command]
 pub async fn rename_project_v2(
     id: String,
@@ -4145,6 +4270,149 @@ mod tests {
         assert_eq!(sanitize_kg_collection(""), "Project");
         assert_eq!(sanitize_kg_collection("...!!!..."), "Project");
         assert_eq!(sanitize_kg_collection("Already CamelCase"), "AlreadyCamelCase");
+    }
+
+    // ─── B12: stale KG_COLLECTION .env auto-repair (0.2.11) ─────────────
+
+    fn b12_tmp_env(content: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "vct-b12-test-{}.env",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn b12_repair_rewrites_bare_stale_kg_collection() {
+        let env = b12_tmp_env(
+            "# project env\n\
+             KG_COLLECTION=KnowledgeGraph\n\
+             OLLAMA_URL=http://localhost:11435\n",
+        );
+        let out = b12_repair_stale_kg_collection(&env, "My Test").unwrap();
+        match out {
+            B12Outcome::Repaired { canonical_kg } => {
+                assert_eq!(canonical_kg, "MyTest_KnowledgeGraph");
+            }
+            other => panic!("expected Repaired, got {:?}", other),
+        }
+        let rewritten = std::fs::read_to_string(&env).unwrap();
+        // First active line is now the canonical one (with audit annotation).
+        assert!(
+            rewritten.contains("KG_COLLECTION=MyTest_KnowledgeGraph # B12 auto-repaired 0.2.11: was \"KG_COLLECTION=KnowledgeGraph\""),
+            "unexpected rewrite: {}",
+            rewritten
+        );
+        // Other lines preserved verbatim.
+        assert!(rewritten.contains("OLLAMA_URL=http://localhost:11435"));
+        assert!(rewritten.starts_with("# project env\n"));
+        let _ = std::fs::remove_file(&env);
+    }
+
+    #[test]
+    fn b12_repair_rewrites_nosuffix_stale_kg_collection() {
+        // Pre-0.2.11 bug: .env carried "KG_COLLECTION=MyTest" instead of
+        // "KG_COLLECTION=MyTest_KnowledgeGraph".
+        let env = b12_tmp_env("KG_COLLECTION=MyTest\n");
+        let out = b12_repair_stale_kg_collection(&env, "My Test").unwrap();
+        assert_eq!(
+            out,
+            B12Outcome::Repaired {
+                canonical_kg: "MyTest_KnowledgeGraph".into()
+            }
+        );
+        let rewritten = std::fs::read_to_string(&env).unwrap();
+        assert!(rewritten.contains("KG_COLLECTION=MyTest_KnowledgeGraph # B12 auto-repaired 0.2.11: was \"KG_COLLECTION=MyTest\""));
+        let _ = std::fs::remove_file(&env);
+    }
+
+    #[test]
+    fn b12_repair_is_idempotent_after_first_run() {
+        // After repair, re-running must be a no-op (canonical line
+        // already present).
+        let env = b12_tmp_env("KG_COLLECTION=KnowledgeGraph\n");
+        let _ = b12_repair_stale_kg_collection(&env, "My Test").unwrap();
+        let out2 = b12_repair_stale_kg_collection(&env, "My Test").unwrap();
+        assert_eq!(out2, B12Outcome::NoChangeNeeded);
+        let _ = std::fs::remove_file(&env);
+    }
+
+    #[test]
+    fn b12_repair_no_change_when_canonical_already_present() {
+        let env = b12_tmp_env(
+            "KG_COLLECTION=MyTest_KnowledgeGraph\n\
+             OTHER=value\n",
+        );
+        let before = std::fs::read_to_string(&env).unwrap();
+        let out = b12_repair_stale_kg_collection(&env, "My Test").unwrap();
+        assert_eq!(out, B12Outcome::NoChangeNeeded);
+        let after = std::fs::read_to_string(&env).unwrap();
+        assert_eq!(before, after, "file must be untouched");
+        let _ = std::fs::remove_file(&env);
+    }
+
+    #[test]
+    fn b12_repair_no_change_when_no_kg_collection_line() {
+        let env = b12_tmp_env("OLLAMA_URL=http://localhost:11435\n");
+        let before = std::fs::read_to_string(&env).unwrap();
+        let out = b12_repair_stale_kg_collection(&env, "My Test").unwrap();
+        assert_eq!(out, B12Outcome::NoChangeNeeded);
+        let after = std::fs::read_to_string(&env).unwrap();
+        assert_eq!(before, after);
+        let _ = std::fs::remove_file(&env);
+    }
+
+    #[test]
+    fn b12_repair_no_change_when_env_file_missing() {
+        let nonexistent = std::env::temp_dir().join(format!(
+            "vct-b12-missing-{}.env",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let out = b12_repair_stale_kg_collection(&nonexistent, "My Test").unwrap();
+        assert_eq!(out, B12Outcome::NoChangeNeeded);
+        // No file created as a side effect.
+        assert!(!nonexistent.exists());
+    }
+
+    #[test]
+    fn b12_repair_rewrites_only_first_stale_line_when_multiple_present() {
+        // Pathological case: user manually appended a second stale line.
+        // We touch only the first one (matches the consumer-reads-first
+        // semantics). The second remains as-is; running again is no-op
+        // because the canonical now precedes it.
+        let env = b12_tmp_env(
+            "KG_COLLECTION=KnowledgeGraph\n\
+             KG_COLLECTION=KnowledgeGraph\n",
+        );
+        let out = b12_repair_stale_kg_collection(&env, "My Test").unwrap();
+        assert!(matches!(out, B12Outcome::Repaired { .. }));
+        let rewritten = std::fs::read_to_string(&env).unwrap();
+        let canonical_count = rewritten.matches("KG_COLLECTION=MyTest_KnowledgeGraph").count();
+        let stale_count = rewritten
+            .lines()
+            .filter(|l| l.trim() == "KG_COLLECTION=KnowledgeGraph")
+            .count();
+        assert_eq!(canonical_count, 1, "exactly one canonical line emitted");
+        assert_eq!(stale_count, 1, "second stale line preserved verbatim");
+        let _ = std::fs::remove_file(&env);
+    }
+
+    #[test]
+    fn b12_repair_preserves_trailing_newline_presence() {
+        // File ends without \n → rewritten file also ends without \n.
+        let env = b12_tmp_env("KG_COLLECTION=KnowledgeGraph");
+        let _ = b12_repair_stale_kg_collection(&env, "My Test").unwrap();
+        let rewritten = std::fs::read_to_string(&env).unwrap();
+        assert!(!rewritten.ends_with('\n'), "no trailing newline added");
+        let _ = std::fs::remove_file(&env);
+
+        // File ends with \n → rewritten preserves trailing \n.
+        let env2 = b12_tmp_env("KG_COLLECTION=KnowledgeGraph\n");
+        let _ = b12_repair_stale_kg_collection(&env2, "My Test").unwrap();
+        let rewritten2 = std::fs::read_to_string(&env2).unwrap();
+        assert!(rewritten2.ends_with('\n'), "trailing newline preserved");
+        let _ = std::fs::remove_file(&env2);
     }
 
     #[test]

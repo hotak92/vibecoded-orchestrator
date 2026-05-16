@@ -7,7 +7,7 @@
 //
 // Keep these in sync. Field naming follows serde defaults (snake_case).
 
-export type ProjectHost = 'base' | 'mao';
+export type ProjectHost = 'base' | 'mao' | 'orchestrator_root';
 
 export type ModuleStatus = 'installing' | 'installed' | 'running' | 'stopped' | 'error';
 
