@@ -128,15 +128,19 @@ if [ -n "$TOUCAN_JSONL" ]; then
 fi
 
 # === 1. SSRF GUARD ===
-if [[ "$TOOL_NAME" == "WebFetch" ]] || [[ "$TOOL_NAME" == "mcp__search__fetch_page" ]]; then
+if [[ "$TOOL_NAME" == "WebFetch" ]]; then
     URL=$(_get_field "url")
     if [[ -n "$URL" ]]; then
-        # Whitelisted local services (Weaviate, Ollama, SearXNG, Gradio)
-        if echo "$URL" | grep -qE "(localhost:(8081|8082|11435|7860|8888)|127\.0\.0\.1:(8081|8082|11435|7860|8888))" 2>/dev/null; then
+        # Whitelisted local services (Weaviate, Ollama, code-embed, Gradio).
+        # SearXNG (:8888) and the mcp__search__fetch_page tool both
+        # removed in v0.2.11 (see PR-14a). Search MCP now exposes only
+        # `search_papers` which uses OpenAlex+arXiv HTTP directly — its
+        # outbound HTTP doesn't go through this WebFetch SSRF guard.
+        if echo "$URL" | grep -qE "(localhost:(8081|8082|11435|11440|7860)|127\.0\.0\.1:(8081|8082|11435|11440|7860))" 2>/dev/null; then
             : # whitelisted — fall through
         elif echo "$URL" | grep -qE "(localhost|127\.|10\.[0-9]+\.[0-9]+\.[0-9]+|172\.(1[6-9]|2[0-9]|3[01])\.[0-9]+\.|192\.168\.[0-9]+\.|169\.254\.[0-9]+\.|0\.0\.0\.0|::1)" 2>/dev/null; then
             echo "🔒 SSRF guard: '$URL' targets a private/internal network address."
-            echo "   Whitelisted localhost services: Weaviate (:8081), Ollama (:11435), SearXNG (:8888), Gradio (:7860)"
+            echo "   Whitelisted localhost services: Weaviate (:8081), Ollama (:11435), code-embed (:11440), Gradio (:7860)"
             echo "   To allow additional services, add to whitelist in .claude/hooks/pre-tool-use.sh"
             echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"ssrf_blocked\",\"url\":\"$URL\"}" >> "$SECURITY_LOG" 2>/dev/null || true
             exit 2
