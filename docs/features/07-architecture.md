@@ -12,7 +12,7 @@ Three subsystems, independent at the file level, designed to compose: the Launch
 <details>
 <summary>Details</summary>
 
-The composition contract is one-directional: Launcher writes, Orchestrator reads. The Orchestrator never calls back into the Launcher binary. `vct-secrets` is orthogonal to both and works without the Launcher installed. The three components can therefore be upgraded or swapped independently; the contract surface is the three env files (`.claude/settings.json`, `.vscode/settings.json`, `.claude/env`) plus the `~/.vct-secrets/` directory layout.
+The composition contract is one-directional: Launcher writes, Orchestrator reads. The Orchestrator never calls back into the Launcher binary. `vct-secrets` is orthogonal to both and works without the Launcher installed. The three components can therefore be upgraded or swapped independently; the contract surface is the two env files (`.claude/settings.json` — the canonical per-project MCP-env channel — and `.claude/env` — POSIX shell-sourceable copy) plus the `~/.vct-secrets/` directory layout. (Pre-v0.2.12 the contract included `.vscode/settings.json` `claude-code.env` as a third surface; it was removed in PR-27, 2026-05-16, because the block didn't propagate to MCP subprocesses on Linux.)
 
 </details>
 
@@ -22,11 +22,11 @@ The Launcher writes its IPC port to `~/.vct/hub.port`; the Orchestrator and CLI 
 ### Launcher as git subtree (`launcher/`)
 The `launcher/` directory is a `git subtree` of `pb992/VCT-Launcher`, branch `feature/orchestrator-hub`. A single `git clone` gives contributors the full Tauri source without `--recursive`. Direct edits to `launcher/` should originate in the VCT-Launcher repo and flow in via `git subtree pull --prefix=launcher vct-launcher feature/orchestrator-hub --squash`.
 
-### Three-way per-project env write
-When the Launcher creates or reconfigures a project, it writes the same env values to three files simultaneously: `.claude/settings.json` `env` block (canonical, all surfaces), `.vscode/settings.json` `claude-code.env` (VS Code extension), and `.claude/env` (POSIX shell-sourceable). All writes are read-merge-write to avoid clobbering existing content. See `docs/CLAUDE_CODE_COMPATIBILITY.md`.
+### Two-way per-project env write
+When the Launcher creates or reconfigures a project, it writes the same env values to two files simultaneously: `.claude/settings.json` `env` block (canonical, all surfaces, propagated to MCP subprocesses) and `.claude/env` (POSIX shell-sourceable). Both writes are read-merge-write to avoid clobbering existing content. See `docs/CLAUDE_CODE_COMPATIBILITY.md`. v0.2.12 (PR-27, 2026-05-16) dropped a historical third surface (`.vscode/settings.json` `claude-code.env`) that did not propagate to MCP subprocesses on Linux.
 
 ### Atomic write pattern for settings files
-All writes to `~/.claude.json` and `.vscode/settings.json` use atomic write semantics (write to a temp file, rename into place). Prevents partial-write corruption when multiple sessions run concurrently.
+All writes to `~/.claude.json` use atomic write semantics (write to a temp file, rename into place). Prevents partial-write corruption when multiple sessions run concurrently.
 
 ---
 
@@ -36,7 +36,7 @@ All writes to `~/.claude.json` and `.vscode/settings.json` use atomic write sema
 `tools/claude` is a drop-in wrapper script that auto-sources `$PWD/.claude/env` before exec'ing the real `claude` binary. Enable via symlink (`~/.local/bin/claude`) or shell alias. See `docs/CLAUDE_CODE_COMPATIBILITY.md` §Option A.
 
 ### VS Code extension surface
-`.vscode/settings.json` `claude-code.env` block provides per-project env to the extension. Written in lockstep with `.claude/settings.json` so values are always identical.
+`.claude/settings.json` `env` provides per-project env to the VS Code extension AND to MCP subprocesses spawned from the extension session — this is the canonical channel since v0.2.12 (PR-27, 2026-05-16). The historical `.vscode/settings.json` `claude-code.env` block was removed because empirical sentinel testing on Linux Claude Code 2.1.143 showed it did not propagate to MCP subprocesses. `.vscode/settings.json` is still used for VS Code editor preferences (Pylance excludes, file-watcher excludes, formatter settings).
 
 ### Claude Desktop app surface
 `.claude/settings.json` `env` block is the only path that reaches Desktop app users (macOS / Windows). MCP servers still connect via `~/.claude.json`. Linux Desktop app is an upstream gap (Anthropic doesn't ship it yet); Linux users must use CLI.
@@ -106,7 +106,7 @@ Maintained blocklist of every token that has ever leaked from this repo's histor
 The installer and Launcher enforce a hard whitelist of orchestrator-managed paths. No write operation touches user code outside those paths. A `preflight_install_safety_check` Tauri command runs before any installation step.
 
 ### Read-merge-write for all settings files
-All writes to `.claude/settings.json` and `.vscode/settings.json` perform a read-merge-write: only the managed key(s) are overwritten; any other content the user has added is preserved.
+All writes to `.claude/settings.json` perform a read-merge-write: only the managed key(s) are overwritten; any other content the user has added is preserved. As of v0.2.12 (PR-27, 2026-05-16) the launcher no longer writes the env block into `.vscode/settings.json` at all — that file is touched only by the Python-side Pylance/watcher exclude backfill, which similarly uses key-level read-merge-write to preserve user customizations.
 
 ### No destructive container ops
 The install path contains zero destructive container operations. Audit-tested and confirmed in `CHANGELOG.md [0.1.0] Security`.

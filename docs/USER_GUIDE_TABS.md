@@ -487,11 +487,17 @@ DB; the binding row is the launcher's record of what those should be.
 
 The harness's `weaviate-kg` MCP server reads `KG_COLLECTION` and
 `SHARED_KG_COLLECTION` from its env (set in
-`<project>/.vscode/settings.json` under `claude-code.env`). The
-launcher writes the binding row, but **does not** write
-`.vscode/settings.json` — the orchestrator install step does. If
-you edit a binding here, also update `.vscode/settings.json` for
-the change to take effect in Claude Code sessions.
+`<project>/.claude/settings.json` under `env` — the canonical
+channel since v0.2.12 / PR-27, 2026-05-16). The launcher writes
+the binding row AND the per-project env via `write_project_env_files`,
+so editing a binding row is normally accompanied by a launcher-
+driven env refresh. The historical `.vscode/settings.json`
+`claude-code.env` surface was removed because that block didn't
+propagate to MCP subprocesses on Linux Claude Code 2.1.143 —
+see `docs/CLAUDE_CODE_COMPATIBILITY.md` for the empirical-trace
+reference. If you edit a binding by hand outside the launcher,
+also update `.claude/settings.json` `env` for the change to take
+effect in MCP subprocesses.
 
 #### Field reference
 
@@ -508,8 +514,9 @@ the change to take effect in Claude Code sessions.
 #### Common operations
 
 - Point a project at a different Weaviate instance: edit
-  `weaviate_url`. Remember to also update `.vscode/settings.json`'s
-  `claude-code.env.WEAVIATE_URL`.
+  `weaviate_url`. Remember to also update `.claude/settings.json`'s
+  `env.WEAVIATE_URL` (the canonical MCP-env channel since
+  v0.2.12 / PR-27).
 - Switch from per-project KG to shared-only: delete the `primary`
   binding (the harness will fall back to whatever `KG_COLLECTION`
   is set in the env).
@@ -641,7 +648,8 @@ tabs are user preferences, not facts to be silently overwritten.
    `collection_prefix`.** Renaming a binding without rebuilding the
    underlying Weaviate data orphans the old collection and produces
    empty search results. If a rename is necessary, do all three:
-   update the binding, update `.vscode/settings.json` env, and
+   update the binding, update `.claude/settings.json` env (the
+   canonical MCP-env channel since v0.2.12 / PR-27), and
    re-run the analyzer (for code graph) or `kg-sync --all` (for KG).
 7. **`source = "bundled"` is reserved for orchestrator-shipped
    rows.** Manually-registered rows should use `source = "project"`

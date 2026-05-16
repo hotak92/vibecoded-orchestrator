@@ -1606,11 +1606,26 @@ mod tests {
             key,
             claude_env,
         );
-        // .vscode/settings.json: same.
-        let vsc: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(folder.join(".vscode/settings.json")).unwrap())
-                .unwrap();
-        assert!(vsc["claude-code.env"].get(key).is_none());
+        // PR-27 (v0.2.12, 2026-05-16): the launcher's env writer no
+        // longer authors `.vscode/settings.json` `claude-code.env`,
+        // so there is nothing to strip from it on secret delete. If
+        // the file exists (because the user authored it by hand or a
+        // pre-PR-27 launcher created it), the strip helper
+        // (`surgically_strip_user_secret_keys`) still runs against it
+        // — but the writer never creates it. Assert the key isn't
+        // present whether or not the file exists.
+        let vscode_path = folder.join(".vscode/settings.json");
+        if vscode_path.exists() {
+            let vsc: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&vscode_path).unwrap()).unwrap();
+            assert!(
+                vsc.get("claude-code.env")
+                    .and_then(|b| b.get(key))
+                    .is_none(),
+                "post-delete: stale {} key in pre-existing .vscode/settings.json",
+                key,
+            );
+        }
 
         std::fs::remove_dir_all(&folder).ok();
     }

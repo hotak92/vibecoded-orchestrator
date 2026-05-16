@@ -4476,14 +4476,23 @@ def _backfill_code_graph_project_env_in_project(
 #     can override per-project.
 #
 # Coordination with the Rust writer:
-#   The launcher's `write_project_env_files` (Rust, at
-#   commands/projects_v2.rs:1723-1771 as of PR-7) writes ONLY the
-#   `claude-code.env` sub-object inside `.vscode/settings.json`. It
-#   does NOT touch any top-level keys (files.watcherExclude, etc.),
-#   so this Python-side helper can freely add them without conflict.
-#   PR-8 may extend the Rust writer to emit the same canonical block
-#   on first project registration — until then, the backfill helper
-#   below handles both first-install and update flows.
+#   Pre-PR-27, the launcher's `write_project_env_files` (Rust, at
+#   commands/projects_v2.rs) wrote a `claude-code.env` sub-object
+#   inside `.vscode/settings.json`. That write was removed in PR-27
+#   (v0.2.12, 2026-05-16) because the key did NOT propagate to MCP
+#   subprocesses on Linux as of Claude Code 2.1.143 — empirical
+#   sentinel testing confirmed (.claude/settings.json env is the
+#   channel that actually reaches MCPs). See PR-27 commit message and
+#   docs/CLAUDE_CODE_COMPATIBILITY.md → "Per-project env files" for
+#   the full trace.
+#
+#   After PR-27 the Rust writer does not touch `.vscode/settings.json`
+#   at all from the env-write code path, so this Python helper is the
+#   ONLY writer of that file across the launcher's project-init flow.
+#   It still adds only top-level keys (files.watcherExclude, etc.) so
+#   any pre-existing `claude-code.env` block authored by the user (or
+#   by a pre-PR-27 launcher) is preserved verbatim — the by-key
+#   backfill never touches a key it doesn't own.
 
 _VSCODE_EXCLUDE_DEFAULTS: dict[str, object] = {
     # Watcher: prevent inotify / FSEvents / ReadDirectoryChangesW from
@@ -4603,7 +4612,11 @@ def _backfill_vscode_excludes_in_project(folder: Path) -> dict:
 
     if not settings_file.exists():
         # Fresh write: include just the exclude block (no claude-code.env
-        # — that's the Rust launcher's responsibility on registration).
+        # — PR-27 (v0.2.12, 2026-05-16) removed the Rust launcher's
+        # write of that block from `.vscode/settings.json` because it
+        # didn't propagate to MCP subprocesses on Linux. The canonical
+        # channel for per-project MCP env is `.claude/settings.json`
+        # env, written by the Rust launcher's `write_project_env_files`.)
         payload: dict = {
             "_template_origin": (
                 "vibecoded-orchestrator v0.2.11+ — vscode-excludes backfill"

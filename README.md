@@ -152,7 +152,7 @@ Facts current as of May 2026. Competitor products move fast — verify the row y
 
 Works with all three Claude Code surfaces. Primary target is the **VS Code extension**; the Desktop app and standalone CLI are also supported. Hooks fire, agents and skills load, and MCP servers connect regardless of which surface you launch from.
 
-The launcher writes three config files when it creates a project — `.claude/settings.json` (canonical), `.vscode/settings.json` (extension compat), and `.claude/env` (shell wrapper) — all carrying the same values, so switching surfaces requires no reconfig.
+The launcher writes two config files when it creates a project — `.claude/settings.json` (canonical, read by every Claude Code surface AND propagated to MCP subprocesses) and `.claude/env` (POSIX shell-sourceable copy) — both carrying the same values, so switching surfaces requires no reconfig. (v0.2.12 / PR-27 / 2026-05-16: a historical third surface, `.vscode/settings.json` `claude-code.env`, was removed because it didn't propagate to MCP subprocesses on Linux. See `docs/CLAUDE_CODE_COMPATIBILITY.md` → "Per-project env files".)
 
 See [`docs/CLAUDE_CODE_COMPATIBILITY.md`](docs/CLAUDE_CODE_COMPATIBILITY.md) for the surface matrix and known caveats.
 

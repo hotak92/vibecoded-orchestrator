@@ -347,4 +347,4 @@ The `project-coordinator` agent implements a blackboard pattern: agents voluntee
 Several hooks spawn background Claude Code agents for heavyweight tasks: `kg-summary-generator.sh` → Haiku agent to update KG summaries; `post-git-commit-kg-sync.sh` → Haiku agent to sync KG after commits. All delegating hooks guard with `CLAUDE_CODE_DISABLE_AUTO_MEMORY` to prevent infinite recursion inside subprocesses.
 
 ### `VCT_DISABLE_HOOKS=1` escape hatch
-Set in your shell (or in `.vscode/settings.json` under `claude-code.env`) to skip all hooks for that session. Every hook checks this variable as its first act.
+Set in your shell (or in `.claude/settings.json` under `env` — the canonical per-project env channel since v0.2.12 / PR-27) to skip all hooks for that session. Every hook checks this variable as its first act.

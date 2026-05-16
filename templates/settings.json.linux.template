@@ -315,5 +315,5 @@
       }
     ]
   },
-  "_env_comment": "Set VCT_DISABLE_HOOKS=1 in your shell to opt out of all hooks for that shell (e.g. when debugging). Set it in .vscode/settings.json claude-code.env to disable per-project. Lean-ctx output compression is delivered via the per-project PreToolUse hook .claude/hooks/lean-ctx-rewrite.sh (registered above). The legacy BASH_ENV shim approach was disabled in 0.2.11 \u2014 see knowledge/concepts/lean-ctx-shim-disabled.md for context."
+  "_env_comment": "Set VCT_DISABLE_HOOKS=1 in your shell to opt out of all hooks for that shell (e.g. when debugging). Set it in .claude/settings.json env to disable per-project (this is the canonical per-project env channel since v0.2.12 / PR-27; the pre-v0.2.12 .vscode/settings.json claude-code.env surface was removed because it didn't propagate to MCP subprocesses on Linux Claude Code 2.1.143). Lean-ctx output compression is delivered via the per-project PreToolUse hook .claude/hooks/lean-ctx-rewrite.sh (registered above). The legacy BASH_ENV shim approach was disabled in 0.2.11 \u2014 see knowledge/concepts/lean-ctx-shim-disabled.md for context."
 }

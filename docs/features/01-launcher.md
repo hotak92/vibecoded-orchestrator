@@ -36,12 +36,13 @@ On project create (and update), `write_project_env_files` writes `KG_COLLECTION`
 <details>
 <summary>Details</summary>
 
-Three surfaces written:
-1. `.vscode/settings.json` → `claude-code.env` block (VS Code extension)
-2. `.claude/env` → POSIX `export` file sourced by `tools/claude` wrapper or shell rc (CLI)
-3. `.claude/settings.json` → `env` block (canonical path read by CLI, Desktop app, and VS Code extension)
+Two surfaces written:
+1. `.claude/env` → POSIX `export` file sourced by `tools/claude` wrapper or shell rc (CLI users)
+2. `.claude/settings.json` → `env` block (canonical path: read by CLI, Desktop app, and VS Code extension, AND propagated to MCP subprocesses on every platform we've tested)
 
-All three use **read-merge-write** semantics: existing keys in the file are preserved. Only the specific keys being written are replaced. Corrupted JSON is handled with a warning and safe overwrite. Covered by four unit tests in `commands/projects_v2.rs`.
+Both use **read-merge-write** semantics: existing keys in the file are preserved. Only the specific keys being written are replaced. Corrupted JSON is handled with a warning and safe overwrite. Covered by unit tests in `commands/projects_v2.rs`.
+
+v0.2.12 (PR-27, 2026-05-16) removed a historical third surface (`.vscode/settings.json` `claude-code.env`). Empirical sentinel testing on Linux Claude Code 2.1.143 confirmed that block did NOT propagate to MCP subprocesses, so the launcher no longer writes it. The Pylance/file-watcher exclude block in `.vscode/settings.json` is still managed by the Python-side `_backfill_vscode_excludes_in_project` (a separate code path). See `docs/CLAUDE_CODE_COMPATIBILITY.md` → "Per-project env files" for the empirical-trace reference.
 
 </details>
 
@@ -206,7 +207,7 @@ Test codes (`test-transcrypt`, `test-arzillibus`, etc.) bypass the webhook and a
 
 ## VS Code & Claude Code Surface Integration
 
-The launcher edits `~/.claude.json` and the project's `.vscode/settings.json` and `.claude/settings.json` to register MCP servers and per-project env. All writes are atomic (`write→rename`) and preserve unrelated keys — the launcher is one of several writers to these files, never the only one.
+The launcher edits `~/.claude.json` and the project's `.claude/settings.json` to register MCP servers and per-project env. All writes are atomic (`write→rename`) and preserve unrelated keys — the launcher is one of several writers to these files, never the only one. As of v0.2.12 (PR-27, 2026-05-16) the launcher no longer writes `claude-code.env` into `.vscode/settings.json` — that block did not propagate to MCP subprocesses on Linux. The Pylance/file-watcher exclude block in `.vscode/settings.json` is still managed by the Python-side `_backfill_vscode_excludes_in_project`.
 
 ### MCP Registration (`mcp_registration.rs`)
 `register_mcp` patches `~/.claude.json` at `mcpServers.<id>` via atomic `write→rename` with an OS pidfile lock (prevents concurrent-session corruption). All other top-level keys are preserved — verified by unit test.

@@ -1,30 +1,21 @@
 {
-  "_comment": "VS Code project settings template for the VibeCoded Orchestrator. Copy this to .vscode/settings.json and fill in the values. The claude-code.env block is read by the Claude Code VS Code extension and passed to MCP server subprocesses — this is how this project wires up Weaviate + Ollama without global config leaking into other projects.",
+  "_comment": "VS Code workspace settings template for the VibeCoded Orchestrator. Copy this to .vscode/settings.json and customize as needed. This file is for VS Code editor preferences (Pylance excludes, file-watcher excludes, formatter settings, etc.) — it is NOT the per-project MCP env channel.",
 
-  "claude-code.env": {
-    "_comment": "Local infrastructure URLs. Defaults match the podman-compose.yml; change only if you run the services on different ports.",
-    "WEAVIATE_URL": "http://localhost:8081",
-    "OLLAMA_URL": "http://localhost:11435",
-    "GRPC_PORT": "50052",
+  "_comment_mcp_env": "The historical claude-code.env block was removed in v0.2.12 (PR-27, 2026-05-16). As of Claude Code 2.1.143 on Linux, .vscode/settings.json claude-code.env does NOT propagate to MCP subprocesses — empirical sentinel testing confirmed this. The canonical channel for per-project MCP env (KG_COLLECTION, PROJECT_NAME, ACTIVE_EMBEDDING, MCP server paths, etc.) is .claude/settings.json env. The VCT launcher writes that file for you when you register a project; if you're setting up manually, see docs/CONFIGURATION.md for the schema. See PR-27 commit message and docs/CLAUDE_CODE_COMPATIBILITY.md → 'Per-project env files' for the full empirical trace and downstream consequences.",
 
-    "_comment_kg": "Knowledge graph collection (per-project) and shared collection for cross-project patterns.",
-    "KG_COLLECTION": "VibeCodedKG",
-    "SHARED_KG_COLLECTION": "",
-    "KG_BASE_DIR": "${workspaceFolder}",
-    "PROJECT_NAME": "VibeCodedOrchestrator",
+  "_comment_pylance_excludes": "Sample Pylance + file-watcher excludes — the launcher's vco_lib._backfill_vscode_excludes_in_project ships these on install/update. Uncomment if you want them in a hand-managed workspace.",
 
-    "_comment_codegraph": "Code graph collection name (per-project) + code embedding service URL.",
-    "CODE_GRAPH_PROJECT": "VibeCodedOrchestrator",
-    "CODE_EMBED_SERVICE_URL": "http://localhost:11438",
+  "_files_watcherExclude_example": {
+    "**/.git/objects/**": true,
+    "**/node_modules/**": true,
+    "**/__pycache__/**": true,
+    "**/.venv/**": true,
+    "**/target/**": true
+  },
 
-    "_comment_embeddings": "Text embedding backend — 'qwen3' (default) or 'snowflake' (legacy).",
-    "ACTIVE_EMBEDDING": "qwen3",
-    "EMBEDDING_MODEL": "qwen3-embedding:0.6b",
-
-    "_comment_mcp_servers": "Paths to MCP server entrypoints in this project. install.py sets these for you.",
-    "MCP_PYTHON": "${workspaceFolder}/.venv/bin/python",
-    "MCP_WEAVIATE_SERVER": "${workspaceFolder}/claude_mcp_servers/weaviate_mcp/server.py",
-    "MCP_OLLAMA_SERVER": "${workspaceFolder}/claude_mcp_servers/ollama_mcp/server.py",
-    "MCP_PYTHONPATH": "${workspaceFolder}/claude_mcp_servers"
-  }
+  "_python_analysis_exclude_example": [
+    "**/.venv/**",
+    "**/__pycache__/**",
+    "**/.mypy_cache/**"
+  ]
 }
