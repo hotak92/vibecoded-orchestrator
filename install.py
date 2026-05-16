@@ -1720,6 +1720,14 @@ def main() -> int:
                         help="Run ONLY the desktop-icon step (post-install-launcher.sh) "
                              "and exit. Useful when you skipped the icon during the "
                              "initial install and want to add it later.")
+    # PR-11: global lean-ctx hook detection warning suppression.
+    # Users who've reviewed the global lean-ctx hooks and decided to keep
+    # them (e.g. for lean-ctx development) can silence the warning.
+    parser.add_argument("--suppress-lean-ctx-warning", action="store_true",
+                        default=False,
+                        help="Suppress the global lean-ctx hooks detection warning. "
+                             "Use when you've reviewed the hooks and intentionally "
+                             "keep them (e.g. lean-ctx development).")
     args = parser.parse_args()
 
     # v0.2.6 Bug C1 — `--desktop-icon-only` short-circuits: run JUST the
@@ -1735,6 +1743,14 @@ def main() -> int:
     # Using a distinct name to avoid shadowing the conflict-resolve `report`
     # local below.
     _deferral_report = DeferralReport()
+
+    # PR-11: warn early when global lean-ctx hooks are present in
+    # ~/.claude/settings.json or ~/.claude/hooks/. These caused two
+    # fork-bomb incidents (2026-04-30, 2026-05-15) before VCO 0.2.11.
+    # Run BEFORE any compose-up or hook installation so the user sees
+    # the warning even if other parts of install fail.
+    if not getattr(args, "suppress_lean_ctx_warning", False):
+        _check_global_lean_ctx_hooks(_deferral_report)
 
     # Windows install gate: refuse install when PowerShell 5.1+ isn't on
     # PATH (the .ps1 hooks would have nothing to run them). Non-Windows
@@ -6696,6 +6712,187 @@ def _materialize_searxng_settings(install_path: Path) -> None:
         ("settings.yml written" if changed else "settings.yml unchanged"),
         data={"target": str(target_file),
               "backup": str(backup) if backup else None},
+    )
+
+
+# ---------------------------------------------------------------------------
+# PR-11: global lean-ctx hooks detection
+# ---------------------------------------------------------------------------
+
+def _check_global_lean_ctx_hooks(
+    deferral_report: "DeferralReport",
+) -> None:
+    """Detect global lean-ctx hooks that may cause fork-bomb incidents.
+
+    Probes two locations in the user's ~/.claude/ directory:
+
+    1. ``~/.claude/settings.json`` — ``hooks.PreToolUse`` entries whose
+       ``command`` field contains "lean-ctx" (case-insensitive).
+    2. ``~/.claude/hooks/lean-ctx-*`` — files matching the lean-ctx hook
+       naming convention (lean-ctx-rewrite, lean-ctx-redirect,
+       lean-ctx-rewrite-native, .lean-ctx.bak, etc.).
+
+    When either is detected, a LOUD warning is printed to stderr and a
+    ``global_lean_ctx_hooks_detected`` deferral entry is added to
+    ``deferral_report`` so Claude Code surfaces it at the next session
+    start.
+
+    Behaviour:
+      - Missing ``~/.claude/`` directory → returns early, no warning.
+      - Unreadable or malformed ``settings.json`` → logs to stderr, returns.
+      - File-iteration errors → caught and skipped individually.
+      - Never raises to the caller (soft-fail throughout).
+
+    Args:
+        deferral_report: The run-scoped :class:`DeferralReport` to append
+            the deferral entry to when lean-ctx artifacts are found.
+    """
+    home = Path.home()
+    claude_dir = home / ".claude"
+
+    if not claude_dir.is_dir():
+        return
+
+    # ------------------------------------------------------------------
+    # 1. Probe ~/.claude/settings.json for PreToolUse hooks referencing
+    #    lean-ctx.
+    # ------------------------------------------------------------------
+    settings_path = claude_dir / "settings.json"
+    offending_settings: list[str] = []
+
+    if settings_path.is_file():
+        try:
+            raw = settings_path.read_text(encoding="utf-8")
+            data = json.loads(raw)
+        except (OSError, json.JSONDecodeError) as exc:
+            sys.stderr.write(
+                f"WARNING: could not read {settings_path} during lean-ctx "
+                f"detection — skipping settings probe: {exc}\n"
+            )
+            data = {}
+
+        pre_tool_use = (
+            data.get("hooks", {}).get("PreToolUse", [])
+            if isinstance(data, dict)
+            else []
+        )
+        for entry in pre_tool_use if isinstance(pre_tool_use, list) else []:
+            cmd = ""
+            if isinstance(entry, dict):
+                cmd = entry.get("command", "") or ""
+            elif isinstance(entry, str):
+                cmd = entry
+            if "lean-ctx" in cmd.lower():
+                offending_settings.append(cmd)
+
+    # ------------------------------------------------------------------
+    # 2. Probe ~/.claude/hooks/ for lean-ctx-* files (any extension).
+    # ------------------------------------------------------------------
+    hooks_dir = claude_dir / "hooks"
+    offending_files: list[Path] = []
+
+    if hooks_dir.is_dir():
+        try:
+            for candidate in hooks_dir.iterdir():
+                name = candidate.name.lower()
+                # Match lean-ctx-* prefix OR .lean-ctx* pattern
+                if name.startswith("lean-ctx-") or name.startswith(".lean-ctx"):
+                    offending_files.append(candidate)
+        except OSError as exc:
+            sys.stderr.write(
+                f"WARNING: could not list {hooks_dir} during lean-ctx "
+                f"detection: {exc}\n"
+            )
+
+    if not offending_settings and not offending_files:
+        return
+
+    # ------------------------------------------------------------------
+    # Build a human-readable summary of what was found.
+    # ------------------------------------------------------------------
+    found_lines: list[str] = []
+    if offending_files:
+        found_lines.append("  Hook files:")
+        for f in sorted(offending_files):
+            found_lines.append(f"    {f}")
+    if offending_settings:
+        found_lines.append("  settings.json PreToolUse entries:")
+        for cmd in offending_settings:
+            found_lines.append(f"    command: {cmd}")
+
+    found_summary = "\n".join(found_lines)
+
+    # Build the rm command listing all detected hook files.
+    if offending_files:
+        rm_targets = " ".join(
+            f'"{f}"' for f in sorted(offending_files)
+        )
+        rm_cmd = f"rm {rm_targets}"
+    else:
+        rm_cmd = "# (no hook files — only settings.json entries found)"
+
+    warning = (
+        "\n"
+        "=" * 70 + "\n"
+        "WARNING  Global lean-ctx hooks detected in ~/.claude/\n"
+        "=" * 70 + "\n"
+        "\n"
+        "These were likely installed by `lean-ctx init --agent claude` and\n"
+        "caused two fork-bomb incidents (2026-04-30 + 2026-05-15) before\n"
+        "VCO 0.2.11.\n"
+        "\n"
+        "Detected artifacts:\n"
+        f"{found_summary}\n"
+        "\n"
+        "VCO ships its own per-project lean-ctx PreToolUse hook (PR-1) with\n"
+        "guards that prevent recursion.  The global ones are now redundant\n"
+        "AND dangerous.\n"
+        "\n"
+        "To remove (recommended):\n"
+        f"  {rm_cmd}\n"
+        "  # Then manually edit ~/.claude/settings.json to remove the\n"
+        "  # hooks.PreToolUse entries that call lean-ctx.\n"
+        "\n"
+        "Or re-run with --suppress-lean-ctx-warning to skip this check.\n"
+        "=" * 70 + "\n"
+    )
+    sys.stderr.write(warning)
+
+    # ------------------------------------------------------------------
+    # Emit deferral entry so Claude Code surfaces this at next session.
+    # ------------------------------------------------------------------
+    detected_desc_parts: list[str] = []
+    if offending_files:
+        file_list = ", ".join(str(f) for f in sorted(offending_files))
+        detected_desc_parts.append(f"Hook files: {file_list}")
+    if offending_settings:
+        cmds = "; ".join(offending_settings)
+        detected_desc_parts.append(
+            f"settings.json PreToolUse commands containing 'lean-ctx': {cmds}"
+        )
+    detected_desc = ". ".join(detected_desc_parts) + "."
+
+    deferral_report.add_entry(
+        DeferralEntry(
+            condition_id="global_lean_ctx_hooks_detected",
+            title="Global lean-ctx hooks detected",
+            detected=detected_desc,
+            why_deferred=(
+                "Auto-removal of ~/.claude/settings.json entries would be "
+                "brittle and require user consent. The user must remove them "
+                "manually to avoid accidental data loss."
+            ),
+            command_to_apply=(
+                f"{rm_cmd}\n"
+                "# Then edit ~/.claude/settings.json and remove the "
+                "hooks.PreToolUse entries calling lean-ctx."
+            ),
+            severity="warning",
+            kg_node_refs=[
+                "knowledge/concepts/lean-ctx-shim-disabled.md",
+                "knowledge/concepts/orchestrator-hook-system.md",
+            ],
+        )
     )
 
 
