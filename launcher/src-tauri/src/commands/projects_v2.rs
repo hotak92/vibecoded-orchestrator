@@ -1596,6 +1596,20 @@ pub fn write_project_env_files(
             let value: Option<String> = match *key {
                 "KG_COLLECTION" => Some(kg_collection.to_string()),
                 "PROJECT_NAME" => Some(project_name.to_string()),
+                // PR-8 cross-PR handoff (v0.2.11): code-graph project tag.
+                // Matches PR-7's documented synonym contract — `PROJECT_NAME`
+                // is the raw user-supplied name; `CODE_GRAPH_PROJECT` is its
+                // sanitized form (Weaviate class-name safe). Both flow to
+                // `.claude/scripts/code-graph-analyze` via the env block; the
+                // analyzer uses `CODE_GRAPH_PROJECT` as the `--project` arg
+                // when present, fallback to sanitized `PROJECT_NAME`.
+                //
+                // Why sanitize here instead of writing `project_name` raw:
+                // `code-graph-analyze` writes Weaviate classes named
+                // `<CODE_GRAPH_PROJECT>_CodeFunction` etc. — those class
+                // names MUST satisfy Weaviate's `[A-Za-z][A-Za-z0-9_]*`
+                // identifier rule, which `sanitize_kg_collection` enforces.
+                "CODE_GRAPH_PROJECT" => Some(sanitize_kg_collection(project_name)),
                 "DEVELOPMENT_COLLECTION" => Some(dev_collection.to_string()),
                 "SHARED_KG_COLLECTION" => Some(shared_kg_collection.to_string()),
                 // Canonical write-gate key (asymmetric semantic since 2026-05-01).
@@ -1762,6 +1776,16 @@ pub fn write_project_env_files(
             &user_secret_pairs,
             &user_secret_strip_keys,
         );
+        // PR-8 cross-PR handoff note (v0.2.11 / 2026-05-15): the VS Code
+        // watcher / search / Pylance exclude block is intentionally NOT
+        // seeded here. Coordinator analysis 2026-05-15: the few-seconds
+        // window between this write and PR-7's Python
+        // `_backfill_vscode_excludes_in_project` (run via the
+        // `install_bundle` subprocess) is short enough that a
+        // brand-new-folder OOM is implausible — the user is GUI-adding
+        // a new project, not simultaneously opening VS Code on it.
+        // Skipping the Rust seeder avoids Python↔Rust exclude-list
+        // drift between two sources of truth.
     }
     std::fs::write(
         &vscode_settings_path,
@@ -2253,6 +2277,16 @@ fn build_canonical_env_text(settings: &ProjectEnvSettings) -> String {
     s.push_str(&format!("SHARED_KG_COLLECTION={}\n", settings.shared_kg_collection));
     s.push_str(&format!("DEVELOPMENT_COLLECTION={}_Development\n", kg_collection_basename));
     s.push_str(&format!("PROJECT_NAME={}\n", project_name));
+    // PR-8 cross-PR handoff note (v0.2.11): `CODE_GRAPH_PROJECT` is
+    // intentionally NOT written here — the `.env` template body is
+    // owned by PR-7's `install.py::_env_canonical_template` parity
+    // contract, and adding a key here without the Python side would
+    // break `env_template_canonical_keys_match_python`. The key DOES
+    // get written to the JSON env blocks (`.claude/settings.json::env`
+    // + `.vscode/settings.json::claude-code.env`) via
+    // `CANONICAL_INSTALL_ENV_KEYS` — those are the surfaces hook
+    // subprocesses + Claude Code consume from, so the bug PR-7 is
+    // fixing closes at the create_project_v2 boundary regardless.
     // PR-3 (2026-05-06): ACTIVE_EMBEDDING is launcher-resolved; pre-PR-3
     // it was only written to the orchestrator-root .env by install.py and
     // never to per-project files. Adding it here lets every per-project
@@ -2897,6 +2931,17 @@ pub(crate) const CANONICAL_INSTALL_ENV_KEYS: &[&str] = &[
     "SHARED_KG_WRITE_DISABLED",
     "SHARED_KG_OPT_OUT",
     "PROJECT_NAME",
+    // PR-8 cross-PR handoff (v0.2.11 / 2026-05-15): added at the
+    // Rust first-install boundary so newly-registered projects get
+    // `CODE_GRAPH_PROJECT` in their env surfaces from minute one,
+    // not just after PR-7's Python `--update` backfill. Value is the
+    // sanitized form of `PROJECT_NAME` — synonym in PR-7's documented
+    // contract; the two are guaranteed to round-trip through
+    // `sanitize_kg_collection` to the same Weaviate-safe identifier.
+    // Idempotent w.r.t. PR-7's Python helper: when both paths run,
+    // the Python backfill sees the key already present + matching
+    // and exits as a noop.
+    "CODE_GRAPH_PROJECT",
     "ACTIVE_EMBEDDING",
     "WEAVIATE_URL",
     "WEAVIATE_PORT",
@@ -4171,6 +4216,10 @@ mod tests {
         // Weaviate basename. Was `MyTest` (sanitized) before; now matches
         // install.py + the .env template.
         assert_eq!(env["PROJECT_NAME"], "My Test");
+        // PR-8 cross-PR handoff (v0.2.11): CODE_GRAPH_PROJECT is the
+        // sanitized Weaviate-safe form of PROJECT_NAME — must show up in
+        // the .vscode/settings.json::claude-code.env block at first install.
+        assert_eq!(env["CODE_GRAPH_PROJECT"], "MyTest");
         // Uppercase D for Development across every surface — Weaviate
         // class names are case-sensitive.
         assert_eq!(env["DEVELOPMENT_COLLECTION"], "MyTest_Development");
@@ -4189,6 +4238,9 @@ mod tests {
         let env_raw = std::fs::read_to_string(&claude_env).unwrap();
         assert!(env_raw.contains(r#"export KG_COLLECTION="MyTest_KnowledgeGraph""#));
         assert!(env_raw.contains(r#"export PROJECT_NAME="My Test""#));
+        // PR-8 cross-PR handoff: .claude/env shell-export form.
+        assert!(env_raw.contains(r#"export CODE_GRAPH_PROJECT="MyTest""#),
+                ".claude/env should carry the CODE_GRAPH_PROJECT export. Body:\n{env_raw}");
         assert!(env_raw.contains(r#"export DEVELOPMENT_COLLECTION="MyTest_Development""#));
         // B5: CONVERSATION_COLLECTION must NOT be in .claude/env.
         assert!(!env_raw.contains("CONVERSATION_COLLECTION"));
@@ -4204,6 +4256,8 @@ mod tests {
         let env = &parsed["env"];
         assert_eq!(env["KG_COLLECTION"], "MyTest_KnowledgeGraph");
         assert_eq!(env["PROJECT_NAME"], "My Test");
+        // PR-8 cross-PR handoff: .claude/settings.json env block.
+        assert_eq!(env["CODE_GRAPH_PROJECT"], "MyTest");
         assert_eq!(env["DEVELOPMENT_COLLECTION"], "MyTest_Development");
         // B5: CONVERSATION_COLLECTION must NOT be in .claude/settings.json env.
         assert!(env.get("CONVERSATION_COLLECTION").is_none());
@@ -6337,7 +6391,16 @@ mod tests {
         // The list of (test, install) is intentionally separate so
         // forgetting either side surfaces here.
         let test_known_keys: std::collections::HashSet<&str> = [
-            "KG_COLLECTION", "PROJECT_NAME", "DEVELOPMENT_COLLECTION",
+            "KG_COLLECTION", "PROJECT_NAME",
+            // PR-8 cross-PR handoff (v0.2.11 / 2026-05-15): added at the
+            // Rust first-install boundary so newly-registered projects
+            // get `CODE_GRAPH_PROJECT` in their env surfaces from minute
+            // one, not just after PR-7's Python `--update` backfill. The
+            // match arm sanitizes via `sanitize_kg_collection` because
+            // Weaviate class names need the `[A-Za-z][A-Za-z0-9_]*`
+            // identifier shape.
+            "CODE_GRAPH_PROJECT",
+            "DEVELOPMENT_COLLECTION",
             "SHARED_KG_COLLECTION", "SHARED_KG_WRITE_DISABLED",
             "SHARED_KG_OPT_OUT", "ACTIVE_EMBEDDING",
             "WEAVIATE_URL", "WEAVIATE_PORT",

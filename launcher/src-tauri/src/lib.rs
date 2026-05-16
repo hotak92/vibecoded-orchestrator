@@ -535,6 +535,20 @@ pub fn run() {
             // to backfill it lazily.
             commands::kg_summary::get_kg_summary_status,
             commands::kg_summary::retry_kg_summary,
+            // PR-8 (v0.2.11 / 2026-05-15): per-project Identity tab +
+            // legacy-collection cleanup. Surfaces `name`,
+            // `KG_COLLECTION`, `CODE_GRAPH_PROJECT` editing and detects
+            // pre-0.2.11 `ClaudeOrchestrator_*` Weaviate collections so
+            // users hit by the PR-7 hardcoded-name bug can re-analyze
+            // affected projects and (optionally, explicitly) clean up
+            // the stale classes. See commands/project_identity.rs.
+            commands::project_identity::get_project_identity,
+            commands::project_identity::update_project_identity,
+            commands::project_identity::redetect_project_identity,
+            commands::project_identity::list_legacy_codegraph_collections,
+            commands::project_identity::cleanup_legacy_codegraph_collections,
+            commands::project_identity::get_legacy_codegraph_notice_dismissed,
+            commands::project_identity::set_legacy_codegraph_notice_dismissed,
             // Hub proxy (v1.1)
             commands::hub_proxy::hub_info,
             commands::hub_proxy::hub_list_apps,
