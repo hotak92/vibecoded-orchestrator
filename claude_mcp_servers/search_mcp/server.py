@@ -31,8 +31,10 @@ import asyncio
 import json
 import logging
 import os
+import sys
 import time
 import xml.etree.ElementTree as ET
+from pathlib import Path
 from typing import Any, Optional
 
 import aiohttp
@@ -40,6 +42,27 @@ from mcp.server.fastmcp import FastMCP
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# PR-42 (v0.2.12): SIGHUP-driven clean exit so the launcher (or the user
+# running `kill -HUP <pid>`) can ask this MCP to pick up an updated
+# `.claude/settings.json env`. The handler exits cleanly with code 0;
+# Claude Code respawns us on the next request with fresh env. See
+# claude_mcp_servers/_lib/sighup_handler.py for the full design rationale.
+try:
+    from _lib.sighup_handler import register_sighup_exit_handler  # type: ignore
+except ImportError:
+    # Make `_lib` resolvable when this file is run as a script via
+    # `python <install>/claude_mcp_servers/search_mcp/server.py`.
+    _parent_dir = str(Path(__file__).resolve().parent.parent)
+    if _parent_dir not in sys.path:
+        sys.path.insert(0, _parent_dir)
+    try:
+        from _lib.sighup_handler import register_sighup_exit_handler  # type: ignore
+    except ImportError:
+        # _lib missing entirely (e.g. partial install) — soft-fail.
+        def register_sighup_exit_handler(_logger):  # type: ignore[no-redef]
+            return False
+register_sighup_exit_handler(logger)
 
 # ---------------------------------------------------------------------------
 # Config from environment

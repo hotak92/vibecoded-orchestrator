@@ -547,6 +547,16 @@ pub fn run() {
             // takes the launcher down.
             services::watcher::spawn(app.handle().clone());
 
+            // PR-42 (v0.2.12 / 2026-05-16): `.claude/settings.json`
+            // watcher. When the user edits env in settings.json, this
+            // debounces 500 ms then SIGHUPs every running orchestrator
+            // MCP — they exit cleanly and Claude Code respawns them
+            // with fresh env on the next request. Fixes Issue B from
+            // the mcp-instability audit. POSIX-only (skipped on
+            // Windows; the manual McpMaintenanceSection button stays
+            // available as the cross-OS fallback).
+            services::settings_json_watcher::spawn(app.handle().clone());
+
             // Resume background tasks left behind by a previous launcher
             // process (crash, force-quit, OOM). Two-phase, soft-fail —
             // see `codegraph::resume_pending_builds` and
@@ -920,6 +930,14 @@ pub fn run() {
             commands::maintenance::run_schema_migrations,
             commands::maintenance::stale_mcp_entries,
             commands::maintenance::rewrite_stale_mcp_entries,
+            // PR-42 (v0.2.12 / 2026-05-16): SIGHUP-driven MCP env reload.
+            // Fixes Issue B from the mcp-instability audit — editing
+            // `.claude/settings.json env` mid-chat now triggers a clean
+            // MCP exit so Claude Code respawns with fresh env on the next
+            // request. The launcher's settings.json watcher fires this
+            // automatically; the GUI button in McpMaintenanceSection
+            // gives users a manual override.
+            commands::maintenance::reload_mcps_sighup,
             // Hub proxy (v1.1)
             commands::hub_proxy::hub_info,
             commands::hub_proxy::hub_list_apps,

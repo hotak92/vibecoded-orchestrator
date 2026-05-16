@@ -86,6 +86,17 @@ tempfile = "3"
 # Drop-in for our previous blind directory walker.
 ignore = "0.4"
 
+# PR-42 (v0.2.12 / 2026-05-16): file watcher for `.claude/settings.json`.
+# When the user edits env in settings.json, the watcher debounces a few
+# hundred ms of "settling" events then fires SIGHUP to all running MCPs
+# so they exit cleanly + respawn with fresh env. `notify` is the standard
+# Rust cross-platform watcher crate (inotify on Linux, FSEvents on macOS,
+# ReadDirectoryChangesW on Windows). Lightweight dep (~250 KB compiled),
+# already widely used in the Rust ecosystem (cargo-watch, mdbook, tauri-
+# plugin-fs-watch all depend on it). No alternative offers cross-OS
+# coverage at this size.
+notify = "8"
+
 # System info (RAM, CPU). MIT-licensed, lightweight. Used by detect_system.
 sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 
