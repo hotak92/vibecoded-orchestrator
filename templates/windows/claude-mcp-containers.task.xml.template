@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="UTF-16"?>
+<?xml version="1.0" encoding="UTF-8"?>
 <!--
   Windows Task Scheduler XML for the Claude MCP container stack.
 
@@ -16,8 +16,12 @@
       already prerequisites in the orchestrator's general install path
       (Windows users without bash should install Git for Windows).
     - StartWhenAvailable + per-user logon trigger matches the Linux
-      "systemctl --user enable" + "loginctl enable-linger" pair: the
+      `systemctl user enable` + `loginctl enable-linger` pair: the
       task runs whenever the user logs in, no admin scope required.
+      (Note: the actual systemctl invocation uses the long flag
+      `systemctl __user enable` — written this way in the comment to
+      avoid the double-hyphen sequence that XML 1.0 forbids inside
+      comments.)
 
   GPU note (Windows):
     Docker Desktop on Windows uses the WSL2 backend; GPU passthrough
