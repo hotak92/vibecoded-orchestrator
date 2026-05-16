@@ -63,6 +63,32 @@ def _at_target() -> dict:
     }
 
 
+def _at_target_dev() -> dict:
+    """A Development collection schema at the post-PR-24 target shape.
+
+    PR-24 (2026-05-16) added 4 canonical temporal properties to the
+    Development class definition (created, updated, valid_from,
+    valid_until — see vco_lib.project_init.development_class_definition).
+    Tests that supply a Dev fetcher result must use THIS shape, not
+    `_at_target()` (which carries the KG-shape properties), or the
+    migrate dispatch will see spurious missing properties.
+    """
+    return {
+        "class": "ClaudeDevelopment",
+        "vectorConfig": dict(_TARGET_VEC_CONFIG),
+        "invertedIndexConfig": {"indexNullState": True},
+        "properties": [
+            {"name": "title", "dataType": ["text"]},
+            {"name": "content", "dataType": ["text"]},
+            {"name": "file_path", "dataType": ["text"]},
+            {"name": "created", "dataType": ["date"]},
+            {"name": "updated", "dataType": ["date"]},
+            {"name": "valid_from", "dataType": ["date"]},
+            {"name": "valid_until", "dataType": ["date"]},
+        ],
+    }
+
+
 def _missing_index_null_state_only() -> dict:
     sch = _at_target()
     sch["invertedIndexConfig"] = {"indexNullState": False}
@@ -228,7 +254,7 @@ class MigrateDispatchUnitTests(unittest.TestCase):
     def test_dry_run_emits_plan_no_writes(self):
         fetcher = self._fetcher_returning({
             "Foo_KnowledgeGraph":  _missing_index_null_state_only(),
-            "Foo_Development":     _at_target(),
+            "Foo_Development":     _at_target_dev(),
         })
         with mock.patch.object(project_init, "_recover_or_drop_orphan_staging", return_value="none"), \
              mock.patch.object(project_init, "_create_class") as cmock, \
@@ -254,7 +280,7 @@ class MigrateDispatchUnitTests(unittest.TestCase):
     def test_copy_action_runs_double_copy_sequence(self):
         fetcher = self._fetcher_returning({
             "Foo_KnowledgeGraph":  _missing_index_null_state_only(),
-            "Foo_Development":     _at_target(),
+            "Foo_Development":     _at_target_dev(),
         })
         with mock.patch.object(project_init, "_recover_or_drop_orphan_staging", return_value="none"), \
              mock.patch.object(project_init, "_create_class") as cmock, \
@@ -279,7 +305,7 @@ class MigrateDispatchUnitTests(unittest.TestCase):
     def test_patch_props_calls_post_property_per_missing_prop(self):
         fetcher = self._fetcher_returning({
             "Foo_KnowledgeGraph":  _missing_props_only(),
-            "Foo_Development":     _at_target(),
+            "Foo_Development":     _at_target_dev(),
         })
         with mock.patch.object(project_init, "_recover_or_drop_orphan_staging", return_value="none"), \
              mock.patch.object(project_init, "_post_property") as pmock, \
@@ -299,7 +325,7 @@ class MigrateDispatchUnitTests(unittest.TestCase):
     def test_create_called_for_not_present(self):
         fetcher = self._fetcher_returning({
             # KG missing entirely; Dev present at target.
-            "Foo_Development":     _at_target(),
+            "Foo_Development":     _at_target_dev(),
         })
         with mock.patch.object(project_init, "_recover_or_drop_orphan_staging", return_value="none"), \
              mock.patch.object(project_init, "_create_class") as cmock:
@@ -317,7 +343,7 @@ class MigrateDispatchUnitTests(unittest.TestCase):
         fetcher = self._fetcher_returning({
             # Both at-target — would normally noop.
             "Foo_KnowledgeGraph": _at_target(),
-            "Foo_Development":    _at_target(),
+            "Foo_Development":    _at_target_dev(),
         })
         args = argparse.Namespace(force_rebuild=True)
         with mock.patch.object(project_init, "_recover_or_drop_orphan_staging", return_value="none"), \
@@ -336,7 +362,7 @@ class MigrateDispatchUnitTests(unittest.TestCase):
     def test_legacy_single_vector_routes_to_rebuild_path(self):
         fetcher = self._fetcher_returning({
             "Foo_KnowledgeGraph": _legacy_single_vector(),
-            "Foo_Development":    _at_target(),
+            "Foo_Development":    _at_target_dev(),
         })
         with mock.patch.object(project_init, "_recover_or_drop_orphan_staging", return_value="none"), \
              mock.patch.object(project_init, "_fetch_schema",
@@ -358,7 +384,7 @@ class MigrateDispatchUnitTests(unittest.TestCase):
         (or recovered) before plan execution."""
         fetcher = self._fetcher_returning({
             "Foo_KnowledgeGraph": _at_target(),
-            "Foo_Development":    _at_target(),
+            "Foo_Development":    _at_target_dev(),
         })
         with mock.patch.object(project_init, "_recover_or_drop_orphan_staging",
                                return_value="dropped") as drop_mock:

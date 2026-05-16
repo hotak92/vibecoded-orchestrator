@@ -241,6 +241,14 @@ def development_class_definition(name: str) -> dict:
 
     Same `indexNullState=True` invariant as the KG schema (see
     `kg_class_definition`).
+
+    Temporal properties (`created`, `updated`, `valid_from`, `valid_until`)
+    mirror the KG schema. The MCP server's `hybrid_search` applies a
+    stale-data filter (``valid_until is_none(True) | valid_until > now``)
+    on every search target; without these properties Development queries
+    fail at the GraphQL layer with "no such prop with name 'valid_until'
+    found in class '<X>_Development'". Date dataType matches the KG
+    definition (see ``kg_class_definition`` properties).
     """
     return {
         "class": name,
@@ -251,6 +259,14 @@ def development_class_definition(name: str) -> dict:
             {"name": "title", "dataType": ["text"]},
             {"name": "content", "dataType": ["text"]},
             {"name": "file_path", "dataType": ["text"]},
+            # Temporal metadata — mirrors the KG schema so MCP filters
+            # (`valid_until is_none(True) | valid_until > now`) work
+            # against Development collections too. Added 2026-05-16
+            # (PR-24).
+            {"name": "created", "dataType": ["date"]},
+            {"name": "updated", "dataType": ["date"]},
+            {"name": "valid_from", "dataType": ["date"]},
+            {"name": "valid_until", "dataType": ["date"]},
         ],
     }
 

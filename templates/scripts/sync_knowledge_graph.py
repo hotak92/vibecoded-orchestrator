@@ -680,8 +680,18 @@ def ensure_dev_collection_exists(server: WeaviateMCPServer) -> bool:
                 Property(name="title", data_type=DataType.TEXT),
                 Property(name="content", data_type=DataType.TEXT),
                 Property(name="file_path", data_type=DataType.TEXT),
+                # Legacy filesystem timestamps (kept for back-compat; older
+                # docs were ingested with these names).
                 Property(name="created_at", data_type=DataType.DATE),
                 Property(name="updated_at", data_type=DataType.DATE),
+                # Canonical temporal metadata — mirrors KG schema +
+                # vco_lib.project_init.development_class_definition.
+                # Required so the MCP `_stale_filter` (valid_until is_none
+                # OR > now) doesn't fail with "no such prop" on Dev
+                # collections. PR-24 (2026-05-16).
+                Property(name="created", data_type=DataType.DATE),
+                Property(name="updated", data_type=DataType.DATE),
+                Property(name="valid_from", data_type=DataType.DATE),
                 Property(name="valid_until", data_type=DataType.DATE),
                 # Chunking support
                 Property(name="chunk_num", data_type=DataType.INT),
