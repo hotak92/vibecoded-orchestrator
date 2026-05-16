@@ -7103,10 +7103,15 @@ def _try_download_launcher_binary(install_root: Path) -> Optional[Path]:
     # Release artifact naming convention (see .github/workflows/release.yml +
     # the public-release pattern documented in CLAUDE.md "Release process").
     # Pattern: vibecoded-orchestrator-<version>-<os>-<arch>.zip
+    # Confirmed from v0.2.11 release assets (gh release view v0.2.11):
+    #   linux-x64.zip, macos-arm64.zip, windows-x64.zip
+    # Intel Macs (x86_64) are intentionally NOT shipped (see
+    # .github/workflows/release.yml line 31). macos-x64 download will
+    # 404 — those users fall through to tier 3 (cargo rebuild).
     os_arch_token = {
         "linux-x64": "linux-x64",
         "windows-x64": "windows-x64",
-        "experimental_macOS": "macos-x64",  # naming may differ; best-effort
+        "experimental_macOS": "macos-arm64",
     }.get(subdir, subdir)
     artifact = f"vibecoded-orchestrator-{version}-{os_arch_token}.zip"
     inner_root = f"vibecoded-orchestrator-{version}-{os_arch_token}"

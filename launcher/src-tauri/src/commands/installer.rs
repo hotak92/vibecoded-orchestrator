@@ -2206,6 +2206,61 @@ async fn run_install_orchestrator_lightweight(
             "Lightweight reinstall completed but verification failed".to_string(),
         );
     }
+
+    // PR-23 follow-up (v0.2.12): re-register MCPs on lightweight reinstall too.
+    // Lightweight is the common upgrade path when the user moves their venv or
+    // upgrades the orchestrator install_root in place. Without this, the
+    // existing `~/.claude.json mcpServers` entries keep pointing at the OLD
+    // venv-python path and the OLD server.py paths, and Claude Code spawns
+    // stale MCP subprocesses. Soft-fail: lightweight is for fast recovery; if
+    // registration fails we log + continue rather than aborting the install.
+    emit_progress(
+        &window,
+        "register",
+        "Refreshing MCP server paths in ~/.claude.json...",
+        95.0,
+    );
+    let install_root_path = std::path::PathBuf::from(install_path.to_string_lossy().to_string());
+    let ports = crate::mcp_registration::ServicePorts {
+        weaviate_port,
+        ollama_port,
+        grpc_port: crate::mcp_registration::DEFAULT_GRPC_PORT,
+        code_embed_port,
+    };
+    let db_for_register = window.app_handle().try_state::<Db>();
+    let db_ref = db_for_register.as_ref().map(|s| s.inner());
+    match crate::mcp_registration::register_default_orchestrator_mcps(
+        &install_root_path,
+        ports,
+        None,
+        db_ref,
+    ) {
+        Ok(report) => {
+            eprintln!(
+                "[vct] lightweight: re-registered {} of {} default MCP(s) to {}",
+                report.success_count(),
+                report.outcomes.len(),
+                report.claude_json_path.display()
+            );
+            for o in &report.outcomes {
+                if !o.ok {
+                    eprintln!(
+                        "[vct] lightweight: MCP `{}` re-register failed: {}",
+                        o.name,
+                        o.error.as_deref().unwrap_or("unknown")
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "[vct] lightweight: MCP re-registration failed (soft-fail): {}. \
+                 Manually re-run `python install.py --update` if MCP paths look stale.",
+                e
+            );
+        }
+    }
+
     emit_progress(&window, "done", "Lightweight reinstall complete", 100.0);
 
     // Bug A (v0.2.5): refresh the persisted install_path on a successful
