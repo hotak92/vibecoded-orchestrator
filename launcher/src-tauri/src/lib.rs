@@ -60,11 +60,19 @@ fn handle_cli_args() -> Option<i32> {
     }
 }
 
-/// `vct-launcher --register-default-mcps <install_root>`
+/// `vct-launcher --register-default-mcps <install_root> [--rewrite [--accept name1,name2,...]]`
 ///
 /// install.py invokes this to wire the canonical bundled-orchestrator MCP
 /// entries into `~/.claude.json` AND (when a project row already exists)
 /// the launcher.db. Pure stdout-only output — never opens a window.
+///
+/// PR-33: when `--rewrite` is also passed, the call rewrites stale
+/// `~/.claude.json mcpServers` entries that point outside the new
+/// `install_root`. By default `--rewrite` is a SCAN-ONLY operation
+/// (prints what would be rewritten) — actual writes require an explicit
+/// `--accept <comma-separated-names>` list. The caller (install.py)
+/// gathers per-entry consent FIRST, then passes only the accepted names
+/// here. We do not re-prompt in this binary.
 ///
 /// Exit codes:
 ///   0 — at least one MCP registered (or zero MCPs requested, edge case)
@@ -82,7 +90,39 @@ fn handle_register_default_mcps_cli(rest: &[String]) -> i32 {
             return 1;
         }
     };
-    cli_register_default_mcps(&install_root)
+    // Parse optional --rewrite and --accept <names> from the remaining args.
+    let mut rewrite_mode = false;
+    let mut accept_names: Vec<String> = Vec::new();
+    let mut i = 1; // skip the install_root positional we consumed above
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--rewrite" => {
+                rewrite_mode = true;
+                i += 1;
+            }
+            "--accept" => {
+                if i + 1 >= rest.len() {
+                    eprintln!("[vct] --accept requires a comma-separated value");
+                    return 1;
+                }
+                accept_names = rest[i + 1]
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                i += 2;
+            }
+            other => {
+                eprintln!("[vct] unknown arg to --register-default-mcps: {}", other);
+                return 1;
+            }
+        }
+    }
+    if rewrite_mode {
+        cli_rewrite_stale_mcps(&install_root, &accept_names)
+    } else {
+        cli_register_default_mcps(&install_root)
+    }
 }
 
 /// Run the `--register-default-mcps` flow synchronously and return the
@@ -159,6 +199,84 @@ fn cli_register_default_mcps(install_root: &std::path::Path) -> i32 {
         }
         Err(e) => {
             eprintln!("[vct] register_default_orchestrator_mcps: {}", e);
+            1
+        }
+    }
+}
+
+/// PR-33: run the rewrite-stale-mcps flow synchronously and return the
+/// process exit code. install.py invokes this AFTER gathering per-entry
+/// consent on its side (see `_consent_for_stale_entries`). `accept_names`
+/// is the user-approved subset; empty `accept_names` triggers a scan-only
+/// dry-run that prints what WOULD be rewritten and exits 0.
+fn cli_rewrite_stale_mcps(install_root: &std::path::Path, accept_names: &[String]) -> i32 {
+    let db_handle = db::Db::open().ok();
+    let ports = mcp_registration::ServicePorts {
+        weaviate_port: std::env::var("WEAVIATE_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(mcp_registration::DEFAULT_WEAVIATE_PORT),
+        ollama_port: std::env::var("OLLAMA_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(mcp_registration::DEFAULT_OLLAMA_PORT),
+        grpc_port: std::env::var("WEAVIATE_GRPC_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(mcp_registration::DEFAULT_GRPC_PORT),
+        code_embed_port: std::env::var("CODE_EMBED_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(mcp_registration::DEFAULT_CODE_EMBED_PORT),
+    };
+    match mcp_registration::rewrite_stale_orchestrator_mcps(
+        install_root,
+        ports,
+        None,
+        db_handle.as_ref(),
+        accept_names,
+    ) {
+        Ok(report) => {
+            if report.stale_entries_found.is_empty() {
+                println!("[vct] rewrite-stale-mcps: no stale entries found, nothing to do");
+                return 0;
+            }
+            println!(
+                "[vct] rewrite-stale-mcps: found {} stale entr{}",
+                report.stale_entries_found.len(),
+                if report.stale_entries_found.len() == 1 { "y" } else { "ies" }
+            );
+            for s in &report.stale_entries_found {
+                println!("[vct]   stale {}: {}", s.name, s.stale_path);
+                if !s.dropping_env_keys.is_empty() {
+                    println!(
+                        "[vct]         (rewrite would drop env keys: {:?})",
+                        s.dropping_env_keys
+                    );
+                }
+            }
+            if accept_names.is_empty() {
+                println!("[vct] rewrite-stale-mcps: scan-only mode (no --accept list); no writes");
+                return 0;
+            }
+            if !report.rewritten.is_empty() {
+                println!("[vct]   rewritten: {:?}", report.rewritten);
+            }
+            if !report.skipped_non_bundled.is_empty() {
+                println!(
+                    "[vct]   skipped (non-bundled, orchestrator owns weaviate-kg/search only): {:?}",
+                    report.skipped_non_bundled
+                );
+            }
+            if let Some(reg) = &report.registration {
+                if !reg.all_succeeded() {
+                    return 1;
+                }
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("[vct] rewrite_stale_orchestrator_mcps: {}", e);
             1
         }
     }
