@@ -1,10 +1,10 @@
 {
-  "source_sha": "e3483c9cf96f77832f03fb37d9a7ce9c23198584",
-  "source_short_sha": "e3483c9",
-  "source_hash": "cef7a686cc96c4348a74dc0ac290d4de3448087c",
-  "built_at": "2026-04-29T20:28:44Z",
-  "launcher_version": "0.1.4",
+  "source_sha": "dad22d931a276799a6706fe93e6b6c06df15526e",
+  "source_short_sha": "dad22d9",
+  "built_at": "2026-05-16T20:09:00Z",
+  "launcher_version": "0.2.13",
   "host_target": "linux-x64",
   "binary_name": "vct-launcher",
-  "binary_size_bytes": 31914832
+  "binary_size_bytes": 23290744,
+  "_provenance": "Manually placed from GitHub Release v0.2.13 zip artifacts because the v0.2.13 release.yml commit-dist-binaries job had a path-typo bug that caused it to fail; fix shipped in v0.2.14."
 }
