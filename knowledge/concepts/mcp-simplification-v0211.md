@@ -67,6 +67,14 @@ The `update_project_v2` ("Update bundle") flow writes three deferral keys to `<p
 | `search_mcp_simplified` | The `search` MCP entry in `~/.claude.json` stays; only its exposed tools change. No manual action needed unless the user pinned `web_search`/`fetch_page`/`search_code` in agent frontmatter. |
 | `searxng_removed_from_default_install` | The SearXNG container is no longer in the default `compose.yaml`. If the user added custom SearXNG config, their `docker-compose.override.yml` continues to work; the base file just no longer references it. |
 
+### Automated Cleanup (v0.2.13)
+
+As of v0.2.13, the install pipeline automatically detects deprecated MCPs during `--update` and offers opt-in removal (Fix 4 in [[Install Pipeline Self-Healing Improvements (v0.2.13)]]). The new `_DEPRECATED_DEFAULT_MCPS` registry in `install.py` maps removed MCPs (currently: `ollama`) to their removal version, reason, and consent path. Users can run:
+- `install.py --update --remove-deprecated-mcps` — per-entry consent prompts
+- `install.py --update` + set `VCT_REMOVE_DEPRECATED_MCPS=all` env override — CI mode, auto-removal
+
+This eliminates manual `.claude.json` editing for standard deprecations while preserving user customizations (only removes entries whose `command` path is inside the orchestrator install root).
+
 ## Date
 
-Architecture decision recorded: 2026-05-16. Shipped in vibecoded-orchestrator v0.2.11.
+Architecture decision recorded: 2026-05-16. Shipped in vibecoded-orchestrator v0.2.11. Automated cleanup added in v0.2.13 (2026-05-16).
