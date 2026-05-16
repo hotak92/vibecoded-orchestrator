@@ -53,7 +53,10 @@ set -uo pipefail
 
 # Bypass switch.
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
-# Resolve Python portably — bare `python3` is missing on Windows.
+# Resolve Python portably — bare `python3` is missing on Windows. The .ps1
+# sibling does the same via py/python3/python probing inline. (Pre-0.2.11
+# the .ps1 referenced a BASH_ENV venv hint from the legacy lean-ctx shim;
+# removed in 0.2.11 — see lean-ctx-shim-disabled KG node. Parity-touch only.)
 # shellcheck source=_lib/find-python.sh disable=SC1091
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/find-python.sh"
 [ -z "${PY:-}" ] && exit 0  # No Python — silent no-op

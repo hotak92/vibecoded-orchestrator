@@ -549,20 +549,29 @@ When 2+ agents work on the same git repo concurrently, they trip over each other
 
 **File Operations**: check before reading (Grep first), use `offset`/`limit` for large files, trust writes (no re-reads), spawn agents for multi-file ops (cap at 3 parallel).
 
-**Lean-ctx shim**: `.claude/scripts/leanctx-bash-env.sh` is sourced automatically via the `BASH_ENV` env var set in `.claude/settings.json`. When `lean-ctx` is on PATH, it compresses CLI output ~90–97% by wrapping common commands (`git`, `npm`, `pip`, `grep`, `ls`, `find`, etc.) and stripping boilerplate, progress bars, and redundant lines. Behaviour is identical, output is just much shorter. Bypass:
-- `LEAN_CTX_OFF=1 some-command` — one-shot disable.
-- `lean-ctx bypass "some-command"` — explicit bypass.
+**Lean-ctx Bash compression**: when `lean-ctx` is on PATH, every `Bash(<cmd>)` tool call goes through the per-project PreToolUse hook `.claude/hooks/lean-ctx-rewrite.sh` (Windows: `lean-ctx-rewrite.ps1`), which delegates to `lean-ctx hook rewrite` and rewrites the command to `lean-ctx -c '<cmd>'`. Result: Claude sees output compressed ~90–97% (boilerplate, progress bars, redundant lines stripped) without losing behaviour. The hook is a graceful no-op when `lean-ctx` isn't installed.
 
-The shim is a no-op when `lean-ctx` isn't installed.
+This replaces the legacy `BASH_ENV` shim that sourced `.claude/scripts/leanctx-bash-env.sh` into every non-interactive Bash subprocess. The old approach was fork-bomb-prone on lean-ctx 3.x (recursive re-sourcing in every child shell, 4000+ procs in seconds, system OOM); disabled in 0.2.11. The shim file is preserved on disk as a `return 0` stub for defense-in-depth (so any stray `BASH_ENV` setting elsewhere no-ops instead of fork-bombing). Full forensic write-up: `knowledge/concepts/lean-ctx-shim-disabled.md`.
 
-**⚠️ Known footgun — silent stderr swallowing on `git commit`**: `lean-ctx`'s default mode can swallow stderr from `git commit` to the point where a hook-failed commit returns exit code 1 with **zero output**, making the failure invisible. Symptom: `git commit` returns exit 1 but no error message; subsequent `git status` shows the file is staged but uncommitted. **Workaround**: prefix any `git commit` (and any command where you suspect lean-ctx is hiding errors) with `LEAN_CTX_OFF=1`:
+**Three-tier bypass hierarchy** — pick the right one for what you want:
+
+| Scope | Mechanism | When to use |
+|---|---|---|
+| Per-call (granular) | `lean-ctx bypass "<cmd>"` or `lean-ctx -c --raw "<cmd>"` | See raw output for ONE command without disabling other VCO hooks. The hook auto-detects commands starting with `lean-ctx` and steps aside — no double-wrap, no recursion. |
+| Per-call inverse | `lean-ctx -c "<cmd>"` | Force-compress a single command when the per-project default is `off`. |
+| Per-project (default) | Add `VCO_LEAN_CTX_DEFAULT=off` to `.claude/env` | Switch the project's default to raw output. Default `on` (compression active) when the line is missing or `.claude/env` doesn't exist. Launcher may surface this as a GUI toggle in a follow-up. |
+| Global (sledgehammer) | `export VCT_DISABLE_HOOKS=1` | Disables ALL `.claude/hooks/*.sh` for the current shell, not just lean-ctx. Use only when debugging hook interactions. |
+
+Override symmetry is intentional: with project default `on`, `lean-ctx bypass "<cmd>"` still produces raw output (rewrite hook recognises the lean-ctx prefix → empty stdout → no rewrite). With default `off`, prefixing `lean-ctx -c "<cmd>"` still produces compressed output (hook exits early, command runs as the user wrote it — compression already in the call).
+
+**⚠️ Known footgun — silent stderr swallowing on `git commit`**: `lean-ctx`'s default mode can swallow stderr from `git commit` to the point where a hook-failed commit returns exit code 1 with **zero output**, making the failure invisible. Symptom: `git commit` returns exit 1 but no error message; subsequent `git status` shows the file is staged but uncommitted. **Workaround**: bypass compression for that command via tier-1 mechanism:
 
 ```bash
 # If `git -c user.name=... commit -m "..."` exits 1 silently:
-LEAN_CTX_OFF=1 git -c user.name=... commit -m "..."
+lean-ctx bypass "git -c user.name=... commit -m \"...\""
 ```
 
-This affects automated agents and Claude Code sessions on this machine. Apply the same workaround for `git push` if it returns silent non-zero (rare, but possible with pre-push hooks). When in doubt, prefix `LEAN_CTX_OFF=1` for any git command that exits non-zero with no output.
+This affects automated agents and Claude Code sessions on this machine. Apply the same workaround for `git push` if it returns silent non-zero (rare, but possible with pre-push hooks). When in doubt, run via `lean-ctx bypass "..."` for any git command that exits non-zero with no output.
 
 **Target Metrics**:
 - Simple: <5K tokens

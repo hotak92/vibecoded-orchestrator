@@ -2056,6 +2056,12 @@ def main() -> int:
         _configure_claude_settings(embed_config)
     else:
         print("[skip] Claude settings (preserved during update)")
+        # 0.2.11: pre-0.2.11 installs wired BASH_ENV in .claude/settings.json
+        # to the lean-ctx shim, which became fork-bomb-prone on lean-ctx 3.x.
+        # Idempotently strip that key + disable the shim file so an upgraded
+        # orchestrator clone doesn't carry the legacy fuse alive. Fresh
+        # installs never see this code path (`mode == "install"` above).
+        _cleanup_legacy_bash_env_shim(args)
 
     # Step 9b: Install agents and skills from templates/
     _install_agents_and_skills(args)
@@ -3421,9 +3427,18 @@ def _detect_optional_companions(args: argparse.Namespace) -> bool:
     print("\n[2b/10] Optional companions ...")
     _log_install_event("2b/10", "start", "probing optional companion tools")
 
-    # lean-ctx (optional — wires BASH_ENV so non-interactive Bash subprocesses
-    # get ~90-97% command-output compression, same as the interactive shell hook).
+    # lean-ctx (optional — the per-project PreToolUse hook
+    # `.claude/hooks/lean-ctx-rewrite.sh` delegates to it for ~90-97%
+    # command-output compression on Claude Code's Bash tool surface).
     # https://github.com/yvgude/lean-ctx
+    #
+    # 0.2.11 redesign: this step only DETECTS / OPTIONALLY INSTALLS the
+    # binary. The legacy BASH_ENV shim wiring (which was fork-bomb-prone
+    # on lean-ctx 3.x — see knowledge/concepts/lean-ctx-shim-disabled.md)
+    # was removed; output compression now flows through the per-project
+    # PreToolUse hook registered in templates/settings.json.*.template.
+    # The hook no-ops gracefully if lean-ctx isn't on PATH, so an absent
+    # binary doesn't break Bash for users without it.
     #
     # Detection: shutil.which checks PATH only. Many users have lean-ctx
     # installed via `cargo install lean-ctx` (canonical landing dir
@@ -3432,26 +3447,22 @@ def _detect_optional_companions(args: argparse.Namespace) -> bool:
     # `bash first-install.sh` from a fresh terminal may not have sourced
     # it yet). Probe known-binary locations as a fallback. Also auto-install
     # via cargo / brew when those are available.
-    shim_path = PROJECT_ROOT / ".claude" / "scripts" / "leanctx-bash-env.sh"
     lean_ctx_path = _find_lean_ctx_binary()
     if not lean_ctx_path and not args.quiet and not args.no_lean_ctx:
         # Try auto-install via the most appropriate package manager.
         lean_ctx_path = _maybe_install_lean_ctx(args)
     if lean_ctx_path:
-        print(f"  lean-ctx: detected at {lean_ctx_path} — wiring BASH_ENV for non-interactive compression")
-        # Write BASH_ENV into .claude/settings.json at install time.
-        # _configure_claude_settings runs later (Step 9), so we patch the env block
-        # directly here so Step 9 picks it up when it serialises the settings dict.
-        # Store the resolved path as a module-level side-effect the step-9 function
-        # can read.  We use a simple module attribute (cleaner than a global dict).
-        import install as _self  # noqa: PLC0415 — self-reference, safe in __main__
-        _self._LEAN_CTX_BASH_ENV = str(shim_path)
-        print(f"  lean-ctx: BASH_ENV will point to {shim_path}")
+        print(
+            f"  lean-ctx: detected at {lean_ctx_path} — PreToolUse hook "
+            f".claude/hooks/lean-ctx-rewrite.sh will use it if registered "
+            f"in settings"
+        )
     else:
         print("  lean-ctx: not installed (optional, recommended for ~95% token savings on CLI output)")
         # OS-aware install hints. Use the canonical channels documented at
         # https://github.com/yvgude/lean-ctx — verified 2026-04-28.
-        print("            Install via your preferred channel, then re-run this installer to wire BASH_ENV:")
+        print("            Install via your preferred channel; the per-project")
+        print("            PreToolUse hook will pick it up on the next session:")
         if shutil.which("brew"):
             print("              Homebrew:   brew tap yvgude/lean-ctx && brew install lean-ctx")
         if shutil.which("cargo"):
@@ -5934,9 +5945,9 @@ def _resolve_compose_working_dir(
 ) -> Optional[Path]:
     """Decide which directory the compose-up wrapper should chdir into.
 
-    The compose-project dir may NOT be the install path (the canonical
-    example: install at ~/Desktop/PROGETTI/VCO_dev but compose lives at
-    ~/Desktop/PROGETTI/Claude/claude_mcp_servers). Resolution priority:
+    The compose-project dir may NOT be the install path (canonical
+    example: install at one project dir, but compose.yaml lives in a
+    sibling repo's `claude_mcp_servers/`). Resolution priority:
 
       1. CLI override (--compose-working-dir) — explicit user choice.
       2. `ps_label_value` — the value of the
@@ -6844,14 +6855,11 @@ def _configure_claude_settings(embed_config: dict) -> None:
         "CODE_EMBED_SERVICE_URL": f"http://localhost:{code_embed_port}",
     }
 
-    # Wire lean-ctx BASH_ENV if the binary was detected in step 2b.
-    # This makes non-interactive Bash subprocesses (Claude Code Bash tool) source
-    # the alias shim, giving the same ~90-97% output compression as interactive shells.
-    import install as _self  # noqa: PLC0415
-    bash_env_path = getattr(_self, "_LEAN_CTX_BASH_ENV", None)
-    if bash_env_path:
-        env_block["BASH_ENV"] = bash_env_path
-        print(f"  Claude settings: BASH_ENV set to {bash_env_path}")
+    # 0.2.11: no BASH_ENV wiring here. Lean-ctx output compression flows
+    # through the per-project PreToolUse hook .claude/hooks/lean-ctx-rewrite.sh
+    # (registered by templates/settings.json.*.template), which avoids the
+    # fork-bomb risk that the BASH_ENV shim carried on lean-ctx 3.x. See
+    # knowledge/concepts/lean-ctx-shim-disabled.md for the incident write-up.
 
     settings = {
         "permissions": {
@@ -6867,6 +6875,139 @@ def _configure_claude_settings(embed_config: dict) -> None:
     settings_file.write_text(
         json.dumps(settings, indent=2) + "\n", encoding="utf-8",
     )
+
+
+def _cleanup_legacy_bash_env_shim(args: argparse.Namespace) -> None:
+    """Idempotent cleanup of pre-0.2.11 BASH_ENV lean-ctx shim.
+
+    Pre-0.2.11 installs wired BASH_ENV in .claude/settings.json pointing at
+    .claude/scripts/leanctx-bash-env.sh. That pattern is fork-bomb-prone on
+    lean-ctx 3.x — replaced in 0.2.11 by per-project PreToolUse hook
+    .claude/hooks/lean-ctx-rewrite.sh. Full write-up:
+    knowledge/concepts/lean-ctx-shim-disabled.md (orchestrator KG).
+
+    This function:
+    - Removes env.BASH_ENV from .claude/settings.json if it points at the
+      shim (project-local or absolute path resolving inside this clone).
+      Keys pointing elsewhere (user-set, unrelated tooling) are left alone.
+    - Disables .claude/scripts/leanctx-bash-env.sh with a `return 0` early
+      exit (preserves the file as defense-in-depth in case BASH_ENV is
+      re-set manually elsewhere). Bundled template copies on disk that
+      already carry the 0.2.11 disabled body are recognized and left
+      alone.
+    - No-op on fresh installs (file doesn't exist) and on already-cleaned
+      installs (BASH_ENV already absent + shim already disabled).
+
+    Called from main() during --update flow only; fresh installs never see
+    the legacy state. Soft-fail throughout — partial cleanup is fine, a
+    later run picks up the rest. Errors are surfaced as warnings, never
+    raised.
+    """
+    settings_file = PROJECT_ROOT / ".claude" / "settings.json"
+    shim_path = PROJECT_ROOT / ".claude" / "scripts" / "leanctx-bash-env.sh"
+
+    # ----- Part 1: strip BASH_ENV from .claude/settings.json -----
+    if settings_file.exists():
+        try:
+            settings_text = settings_file.read_text(encoding="utf-8")
+            settings = json.loads(settings_text)
+        except (OSError, json.JSONDecodeError) as e:
+            print(
+                f"  legacy BASH_ENV cleanup: settings.json read/parse failed "
+                f"({type(e).__name__}: {e}) — skipping (re-run after fixing)"
+            )
+            settings = None
+
+        if isinstance(settings, dict):
+            env_block = settings.get("env")
+            if isinstance(env_block, dict) and "BASH_ENV" in env_block:
+                raw_val = str(env_block.get("BASH_ENV", ""))
+                # Detect the shim — accept both ${CLAUDE_PROJECT_DIR}-templated
+                # and absolute-path forms (older installs wrote literal paths).
+                points_at_shim = (
+                    "leanctx-bash-env.sh" in raw_val
+                    or raw_val.endswith(str(shim_path))
+                )
+                if points_at_shim:
+                    env_block.pop("BASH_ENV", None)
+                    try:
+                        settings_file.write_text(
+                            json.dumps(settings, indent=2) + "\n",
+                            encoding="utf-8",
+                        )
+                        print(
+                            "  legacy BASH_ENV cleanup: removed BASH_ENV "
+                            "from .claude/settings.json (was wired to "
+                            "leanctx-bash-env.sh shim)"
+                        )
+                    except OSError as e:
+                        print(
+                            f"  legacy BASH_ENV cleanup: settings.json write "
+                            f"failed ({type(e).__name__}: {e}) — re-run after "
+                            f"fixing permissions"
+                        )
+                else:
+                    print(
+                        f"  legacy BASH_ENV cleanup: BASH_ENV present in "
+                        f"settings.json but doesn't point at the shim "
+                        f"({raw_val!r}) — leaving alone (user/other tooling)"
+                    )
+            # else: env_block missing or BASH_ENV already gone — no-op.
+
+    # ----- Part 2: disable the shim file itself -----
+    if shim_path.exists():
+        try:
+            shim_body = shim_path.read_text(encoding="utf-8")
+        except OSError as e:
+            print(
+                f"  legacy BASH_ENV cleanup: shim read failed "
+                f"({type(e).__name__}: {e}) — skipping"
+            )
+            shim_body = None
+
+        if shim_body is not None:
+            # The disabled stub ends with `return 0` and contains the
+            # DISABLED banner. Recognize it so we don't rewrite on every
+            # --update.
+            already_disabled = (
+                "DISABLED as of vibecoded-orchestrator 0.2.11" in shim_body
+                and shim_body.rstrip().endswith("return 0")
+            )
+            if not already_disabled:
+                disabled_body = (
+                    "#!/usr/bin/env bash\n"
+                    "# leanctx-bash-env.sh - DISABLED as of "
+                    "vibecoded-orchestrator 0.2.11\n"
+                    "#\n"
+                    "# The BASH_ENV approach is fork-bomb-prone on "
+                    "lean-ctx 3.x (incident\n"
+                    "# 2026-04-30 + recidiva 2026-05-15). Replaced by the "
+                    "per-project\n"
+                    "# PreToolUse hook .claude/hooks/lean-ctx-rewrite.sh. "
+                    "Full forensic\n"
+                    "# write-up: knowledge/concepts/"
+                    "lean-ctx-shim-disabled.md.\n"
+                    "#\n"
+                    "# This file is preserved on disk (rather than "
+                    "deleted) so a stray\n"
+                    "# BASH_ENV pointing here — set manually or left "
+                    "behind by a pre-0.2.11\n"
+                    "# install we missed — still no-ops instead of "
+                    "fork-bombing.\n"
+                    "return 0\n"
+                )
+                try:
+                    shim_path.write_text(disabled_body, encoding="utf-8")
+                    print(
+                        "  legacy BASH_ENV cleanup: disabled "
+                        ".claude/scripts/leanctx-bash-env.sh (defense-in-"
+                        "depth `return 0` stub)"
+                    )
+                except OSError as e:
+                    print(
+                        f"  legacy BASH_ENV cleanup: shim disable failed "
+                        f"({type(e).__name__}: {e}) — re-run after fixing"
+                    )
 
 
 # ---------------------------------------------------------------------------

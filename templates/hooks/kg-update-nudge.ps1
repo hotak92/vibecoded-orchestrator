@@ -47,8 +47,10 @@ if (-not (Test-Path $metricsDir)) {
 }
 $metricsFile = Join-Path $metricsDir "kg_update_tokens.jsonl"
 
-# Find a Python launcher: prefer the project venv if BASH_ENV path hints
-# at it (lean-ctx shim), else fall back to py / python3 / python.
+# Find a Python launcher: probe `py` / `python3` / `python` in order.
+# (Pre-0.2.11 this hook tried to read a venv path from BASH_ENV set by
+# the legacy lean-ctx shim — that shim is gone, see lean-ctx-shim-disabled
+# KG node. Just walk the standard names now.)
 $pythonCmd = $null
 foreach ($candidate in @("py", "python3", "python")) {
     $resolved = Get-Command $candidate -ErrorAction SilentlyContinue

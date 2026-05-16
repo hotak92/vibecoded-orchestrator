@@ -2956,6 +2956,192 @@ def _emit_migrate_required_deferral(
     report.write(folder)
 
 
+def _cleanup_legacy_bash_env_in_project(folder: Path) -> dict:
+    """Idempotent cleanup of pre-0.2.11 BASH_ENV lean-ctx shim in a user project.
+
+    Parallel of install.py:_cleanup_legacy_bash_env_shim for the orchestrator
+    self-update path. Called from `install_project_bundle` during update_mode
+    so the launcher's "Update bundle" button on existing user projects also
+    strips the fork-bomb fuse left over from pre-0.2.11 installs.
+
+    Pre-0.2.11 installs of user projects could end up with `BASH_ENV` wired
+    in `<project>/.claude/settings.json` (either propagated by an old
+    settings template that we no longer ship, or pasted by a user copying
+    from the orchestrator's own settings.json). Independently, the
+    `<project>/.claude/scripts/leanctx-bash-env.sh` file may exist as a
+    leftover from a previous bundle copy. Both are fork-bomb-prone on
+    lean-ctx 3.x (see knowledge/concepts/lean-ctx-shim-disabled.md) and
+    must be neutralized.
+
+    What this function does:
+    - Strips `env.BASH_ENV` from `<project>/.claude/settings.json` if the
+      value points at the project-local shim path. Keys pointing at
+      unrelated paths (user tooling) are left alone.
+    - Does NOT rewrite the shim file itself; that's already handled by the
+      regular bundle copy step, which overwrites
+      `<project>/.claude/scripts/leanctx-bash-env.sh` with the disabled
+      template body via `_enumerate_bundle_files`.
+    - Emits a deferral entry only when the cleanup cannot be applied (file
+      readonly, JSON parse error, unrecognized BASH_ENV value pointing
+      elsewhere). The normal success path is silent (the caller logs from
+      its own context).
+
+    Soft-fail throughout: any error returns a dict describing what
+    happened so the caller can record it in `result["warnings"]` /
+    `result["errors"]` without raising.
+
+    Returns:
+        ``{"action": "removed"|"absent"|"left-alone"|"unparseable"|"write-failed",
+           "detail": <free text>}``
+    """
+    settings_file = folder / ".claude" / "settings.json"
+    shim_rel = folder / ".claude" / "scripts" / "leanctx-bash-env.sh"
+
+    if not settings_file.exists():
+        return {"action": "absent", "detail": "settings.json not present"}
+
+    try:
+        settings = json.loads(settings_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        return {
+            "action": "unparseable",
+            "detail": f"{type(e).__name__}: {e}",
+        }
+
+    if not isinstance(settings, dict):
+        return {"action": "unparseable", "detail": "settings.json root not a dict"}
+
+    env_block = settings.get("env")
+    if not isinstance(env_block, dict) or "BASH_ENV" not in env_block:
+        return {"action": "absent", "detail": "no BASH_ENV in settings.env"}
+
+    raw_val = str(env_block.get("BASH_ENV", ""))
+    points_at_shim = (
+        "leanctx-bash-env.sh" in raw_val
+        or raw_val.endswith(str(shim_rel))
+    )
+    if not points_at_shim:
+        return {
+            "action": "left-alone",
+            "detail": (
+                f"BASH_ENV={raw_val!r} points elsewhere (user tooling); "
+                "not touching"
+            ),
+        }
+
+    env_block.pop("BASH_ENV", None)
+    try:
+        _write_file_atomic(
+            settings_file,
+            (json.dumps(settings, indent=2) + "\n").encode("utf-8"),
+        )
+    except OSError as e:
+        return {
+            "action": "write-failed",
+            "detail": f"{type(e).__name__}: {e}",
+        }
+
+    return {
+        "action": "removed",
+        "detail": (
+            "stripped BASH_ENV (was pointing at the disabled "
+            "leanctx-bash-env.sh shim)"
+        ),
+    }
+
+
+def _emit_bash_env_cleanup_deferral(
+    folder: Path, cleanup_result: dict,
+) -> None:
+    """Emit `legacy_bash_env_cleanup_pending`: the 0.2.11 cleanup couldn't
+    finish (settings.json unparseable, write blocked by file perms, etc.).
+
+    Severity is `warning`: the project is functionally OK as long as the
+    BASH_ENV pointer remains in settings.json (it'd only cause harm if the
+    .claude/scripts/leanctx-bash-env.sh shim was still active, which the
+    bundle copy step disables in the same run). But Claude Code sessions
+    should be nudged to resolve this so a future scenario — manual edit
+    re-enabling the shim, or a shim restored from git — doesn't fork-bomb.
+
+    Per-project grouping: a single entry covers any failed cleanup state.
+    The action field in `cleanup_result` is encoded into the detected
+    block so the operator can tell at a glance what went wrong.
+    """
+    from vco_lib.deferral_report import DeferralEntry, DeferralReport
+
+    action = cleanup_result.get("action", "unknown")
+    detail = cleanup_result.get("detail", "")
+    settings_rel = ".claude/settings.json"
+    shim_rel = ".claude/scripts/leanctx-bash-env.sh"
+
+    if action == "unparseable":
+        detected = (
+            f"During the 0.2.11 legacy BASH_ENV cleanup, "
+            f"`{settings_rel}` could not be parsed as JSON "
+            f"({detail}). The cleanup was skipped to avoid corrupting "
+            f"user state."
+        )
+        cmd = (
+            f"# Inspect / fix the JSON, then re-run the bundle update:\n"
+            f"cat {folder}/{settings_rel} | python -m json.tool\n"
+            f"python -m vco_lib.project_init install-bundle "
+            f"--folder {str(folder)!r} --update --json"
+        )
+    elif action == "write-failed":
+        detected = (
+            f"During the 0.2.11 legacy BASH_ENV cleanup, the write to "
+            f"`{settings_rel}` failed ({detail}). Most common cause is "
+            f"a read-only file system or restrictive permissions."
+        )
+        cmd = (
+            f"# Fix permissions and re-run the bundle update:\n"
+            f"chmod u+w {folder}/{settings_rel}\n"
+            f"python -m vco_lib.project_init install-bundle "
+            f"--folder {str(folder)!r} --update --json"
+        )
+    else:
+        detected = (
+            f"During the 0.2.11 legacy BASH_ENV cleanup, an unexpected "
+            f"state was reached (action={action!r}, detail={detail!r}). "
+            f"Manual inspection recommended."
+        )
+        cmd = (
+            f"# Inspect the BASH_ENV state by hand:\n"
+            f"python -c \"import json; "
+            f"print(json.load(open({str(folder / settings_rel)!r}))"
+            f".get('env', {{}}).get('BASH_ENV'))\"\n"
+            f"# Then re-run after resolving:\n"
+            f"python -m vco_lib.project_init install-bundle "
+            f"--folder {str(folder)!r} --update --json"
+        )
+
+    entry = DeferralEntry(
+        condition_id="legacy_bash_env_cleanup_pending",
+        title="Legacy BASH_ENV lean-ctx shim cleanup pending",
+        detected=detected,
+        why_deferred=(
+            "0.2.11 disabled the BASH_ENV → leanctx-bash-env.sh shim "
+            "(fork-bomb risk on lean-ctx 3.x — incident 2026-04-30 + "
+            "recidiva 2026-05-15, see knowledge/concepts/"
+            "lean-ctx-shim-disabled.md). The orchestrator tried to "
+            f"strip the legacy `BASH_ENV` key from `{settings_rel}` "
+            "during this update and was blocked. The shim file at "
+            f"`{shim_rel}` was still disabled in-place by the bundle "
+            "copy step, so the immediate fork-bomb risk is contained — "
+            "but the dangling BASH_ENV reference should be removed "
+            "before a future change reactivates the shim."
+        ),
+        command_to_apply=cmd,
+        severity="warning",
+        kg_node_refs=[
+            "knowledge/concepts/lean-ctx-shim-disabled.md",
+        ],
+    )
+    report = DeferralReport.read(folder)
+    report.add_entry(entry)
+    report.write(folder)
+
+
 def install_project_bundle(
     folder: Path,
     orchestrator_root: Optional[Path] = None,
@@ -3192,6 +3378,52 @@ def install_project_bundle(
                  f"settings.json merge failed: {err}",
                  data={"error": err})
             result["warnings"].append(f"settings.json merge failed: {err}")
+
+    # 0.2.11 legacy BASH_ENV cleanup. Pre-0.2.11 installs (orchestrator or
+    # user-project) wired BASH_ENV in .claude/settings.json pointing at
+    # .claude/scripts/leanctx-bash-env.sh — a fork-bomb-prone pattern on
+    # lean-ctx 3.x (see knowledge/concepts/lean-ctx-shim-disabled.md).
+    # `_smart_merge_for_bundle` is user-wins on top-level scalars, so the
+    # merge above does NOT strip a pre-existing BASH_ENV key. This explicit
+    # post-merge step removes it (idempotent — no-op on installs that never
+    # had BASH_ENV, or on installs already cleaned by a previous --update).
+    # Runs in update_mode only; first-install never sees the legacy state.
+    if update_mode and not dry_run:
+        try:
+            cleanup_result = _cleanup_legacy_bash_env_in_project(folder)
+            action = cleanup_result.get("action", "unknown")
+            detail = cleanup_result.get("detail", "")
+            if action == "removed":
+                _log("4.bundle.bashenv-cleanup", "ok",
+                     f"legacy BASH_ENV stripped: {detail}",
+                     data=cleanup_result)
+            elif action in ("write-failed", "unparseable"):
+                # Surfacing via warnings (not errors): the rest of the bundle
+                # install is still useful. The deferral entry below also
+                # tells the operator to re-run after fixing the cause.
+                _log("4.bundle.bashenv-cleanup", "warn",
+                     f"legacy BASH_ENV cleanup deferred: {action}: {detail}",
+                     data=cleanup_result)
+                result["warnings"].append(
+                    f"legacy BASH_ENV cleanup deferred ({action}): {detail}"
+                )
+                try:
+                    _emit_bash_env_cleanup_deferral(folder, cleanup_result)
+                except Exception as defer_err:
+                    _log("4.bundle.bashenv-cleanup", "error",
+                         f"deferral write failed: "
+                         f"{type(defer_err).__name__}: {defer_err}",
+                         data={"error": str(defer_err)})
+            # `absent` / `left-alone` paths are silent — they're the normal
+            # no-op case (clean project, or user has unrelated BASH_ENV).
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            _log("4.bundle.bashenv-cleanup", "error",
+                 f"legacy BASH_ENV cleanup crashed: {err}",
+                 data={"error": err})
+            result["warnings"].append(
+                f"legacy BASH_ENV cleanup crashed: {err}"
+            )
 
     # Project-level templates (item 7 / Obs 7, 2026-05-13). Minimal stubs
     # for CLAUDE.md, CONTEXT_STATE.md, MEMORY.md. Missing → install stub

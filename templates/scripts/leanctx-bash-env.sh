@@ -1,73 +1,40 @@
 #!/usr/bin/env bash
-# leanctx-bash-env.sh - lean-ctx alias shim for non-interactive Bash subprocesses
+# leanctx-bash-env.sh - DISABLED as of vibecoded-orchestrator 0.2.11
 #
-# Sourced via BASH_ENV so Claude Code Bash tool subprocesses get the same
-# command-output compression (~90-97%) that interactive shells get via ~/.bashrc.
+# WHAT THIS USED TO BE
+# --------------------
+# Previously this file was sourced via the BASH_ENV env var (set in
+# .claude/settings.json) so every non-interactive Bash subprocess spawned
+# by Claude Code's Bash tool would re-source it and get function-style
+# wrappers around `git`, `npm`, `cargo`, `pip`, etc., that re-invoked the
+# commands through `lean-ctx -c "..."` for ~90-97% output compression.
 #
-# NOTES FOR MAINTAINERS
-# ---------------------
-# Claude Code Bash tool spawns non-interactive subprocesses; ~/.bashrc is NOT
-# sourced. Setting BASH_ENV=<this file> in .claude/settings.json env block makes
-# Bash source this shim before every non-interactive command.
+# WHY IT'S DISABLED
+# -----------------
+# The BASH_ENV approach is fork-bomb-prone on lean-ctx 3.x:
 #
-# PLATFORM QUIRK: Claude Code reads settings.json on startup. BASH_ENV takes
-# effect only after a full VS Code/Claude Code restart. If output looks
-# uncompressed after install, restart VS Code and try again.
+#   1. BASH_ENV propagates to EVERY child bash subprocess.
+#   2. Each subprocess re-sources this file, redefining the wrappers.
+#   3. lean-ctx 3.x's `-c "<cmd>"` semantics now invoke bash itself to
+#      execute <cmd>; that child bash re-sources BASH_ENV; the wrapper
+#      re-invokes lean-ctx -c; recursion explodes.
 #
-# ALIAS LIMITATION: bash non-interactive subprocesses don't expand aliases by
-# default. We use shell functions instead - these work in all bash modes.
+# Real damage observed: 4000+ processes spawned in seconds, 88% memory
+# pressure, system OOM. Incident 2026-04-30 (lean-ctx 3.x rollout) and
+# again on 2026-05-15 (recidiva). Full forensic write-up:
+# knowledge/concepts/lean-ctx-shim-disabled.md (orchestrator KG).
 #
-# BYPASS OPTIONS:
-#   1. One-shot:     LEAN_CTX_OFF=1 git status
-#   2. Helper:       lean-ctx bypass "git status"
+# WHAT REPLACED IT
+# ----------------
+# Per-project PreToolUse hook .claude/hooks/lean-ctx-rewrite.sh registered
+# in .claude/settings.json. The hook intercepts ONLY top-level Bash tool
+# calls from Claude Code (no env-var inheritance, no recursion risk) and
+# delegates to `lean-ctx hook rewrite` for the same compression coverage
+# on the most important surface.
 #
-# VERIFICATION (after install + VS Code restart):
-#   SHIM=<project-root>/.claude/scripts/leanctx-bash-env.sh
-#   env -i HOME=$HOME PATH=/usr/bin:/bin BASH_ENV=$SHIM bash -c 'git status' | wc -c
-#   env -i HOME=$HOME PATH=/usr/bin:/bin bash -c 'git status' | wc -c
-#   env -i HOME=$HOME PATH=/usr/bin:/bin BASH_ENV=$SHIM LEAN_CTX_OFF=1 bash -c 'git status' | wc -c
-
-# Idempotency guard - safe to source multiple times
-[ "${_LEANCTX_BASH_ENV_LOADED:-}" = "1" ] && return 0
-_LEANCTX_BASH_ENV_LOADED=1
-
-# Opt-out: LEAN_CTX_OFF=1 disables all wrapping for this subprocess
-[ "${LEAN_CTX_OFF:-}" = "1" ] && return 0
-
-# Locate the lean-ctx binary
-_lc_bin=""
-if command -v lean-ctx >/dev/null 2>&1; then
-    _lc_bin="$(command -v lean-ctx)"
-elif [ -x "$HOME/.cargo/bin/lean-ctx" ]; then
-    export PATH="$HOME/.cargo/bin:$PATH"
-    _lc_bin="$HOME/.cargo/bin/lean-ctx"
-fi
-
-# Bail silently if lean-ctx is not installed - never break Bash for users without it
-[ -z "$_lc_bin" ] && return 0
-
-# Define wrapper functions (not aliases) - functions work in non-interactive bash.
-# Each wrapper passes the full command + args as a quoted string to lean-ctx -c,
-# which is the invocation form that triggers output compression.
-_lc_make_wrapper() {
-    local cmd="$1" bin="$2"
-    # shellcheck disable=SC2183
-    eval "
-    $cmd() {
-        \"$bin\" -c \"$cmd \$*\"
-    }
-    "
-}
-
-for _lc_cmd in git npm pnpm yarn cargo docker docker-compose gh pip pip3 ruff go golangci-lint eslint prettier tsc grep curl wget; do
-    _lc_make_wrapper "$_lc_cmd" "$_lc_bin"
-done
-
-ls() { "$_lc_bin" -c "ls $*"; }
-find() { "$_lc_bin" -c "find $*"; }
-kubectl() { "$_lc_bin" -c "kubectl $*"; }
-k() { "$_lc_bin" -c "kubectl $*"; }
-
-unset _lc_bin _lc_cmd
-export LEAN_CTX_ENABLED=1
-# No lean-ctx: ON banner - silent in non-interactive subprocesses
+# DEFENSE-IN-DEPTH EARLY EXIT
+# ---------------------------
+# The file is preserved on disk (rather than deleted) so that any stray
+# BASH_ENV pointing at this path — set manually or left behind by a
+# pre-0.2.11 install we missed — still no-ops instead of fork-bombing.
+return 0

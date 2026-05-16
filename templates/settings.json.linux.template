@@ -151,6 +151,16 @@
         ]
       },
       {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/lean-ctx-rewrite.sh",
+            "timeout": 5
+          }
+        ]
+      },
+      {
         "matcher": "*",
         "hooks": [
           {
@@ -301,5 +311,5 @@
       }
     ]
   },
-  "_env_comment": "Set VCT_DISABLE_HOOKS=1 in your shell to opt out of all hooks for that shell (e.g. when debugging). Set it in .vscode/settings.json claude-code.env to disable per-project. Note: the orchestrator's own settings.json wires BASH_ENV to .claude/scripts/leanctx-bash-env.sh \u2014 this template intentionally omits that, since lean-ctx is orchestrator-specific."
+  "_env_comment": "Set VCT_DISABLE_HOOKS=1 in your shell to opt out of all hooks for that shell (e.g. when debugging). Set it in .vscode/settings.json claude-code.env to disable per-project. Lean-ctx output compression is delivered via the per-project PreToolUse hook .claude/hooks/lean-ctx-rewrite.sh (registered above). The legacy BASH_ENV shim approach was disabled in 0.2.11 \u2014 see knowledge/concepts/lean-ctx-shim-disabled.md for context."
 }
