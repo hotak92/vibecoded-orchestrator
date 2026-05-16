@@ -133,6 +133,19 @@ CLAUDE.local.md
 launcher/pnpm-lock.yaml
 pnpm-lock.yaml
 
+# Paid-module manifests (Pro-tier, distributed via private repos +
+# signed-URL gateway). The launcher's catalog discovery scans
+# `<orchestrator_clone>/paid-modules/*/vct-module.json` IF the dir is
+# present on disk (dev convenience), but the dir itself must NOT enter
+# the public AGPL repo — each paid module's manifest ships from its
+# OWN private repo (e.g. `hotak92/vct-rl-reranker` for the RL Reranker
+# module). The container-pull installer recipe (manifest.rs::ContainerPull)
+# is the production discovery path; this gitignore entry stops manifests
+# from leaking via accidental `git add paid-modules/`. To work on a paid
+# module locally, clone it into `paid-modules/<id>/` — the launcher will
+# pick it up automatically without git tracking it.
+paid-modules/
+
 # IDE
 .vscode/settings.json
 .idea/

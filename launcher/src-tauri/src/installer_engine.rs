@@ -85,6 +85,42 @@ pub async fn run_install(
                 ));
             }
         }
+        InstallMethod::ContainerPull => {
+            // Paid-module distribution path. Locks down piracy by:
+            //   1. requiring a Pro-or-higher license tier
+            //   2. requiring a short-lived pull token from the signed-URL
+            //      gateway (no anonymous registry access)
+            //
+            // The actual `podman pull` happens here. The container itself
+            // is registered with the launcher's service supervisor in
+            // Phase 1E (modules.rs:install_module_for_project picks up the
+            // resolved image:tag from manifest.install.container after
+            // run_install completes).
+            let container = manifest
+                .install
+                .container
+                .as_ref()
+                .ok_or("install.method=container_pull requires install.container block")?;
+
+            let tag = if container.tag_from_version {
+                manifest.version.clone()
+            } else {
+                manifest
+                    .install
+                    .r#ref
+                    .clone()
+                    .unwrap_or_else(|| "latest".to_string())
+            };
+
+            container_pull(container, &tag, &manifest.id).await?;
+
+            // For container modules, install_dir is metadata-only — a
+            // marker directory we use to track installed state. Create
+            // it so post_install commands (if any) have a place to land.
+            tokio::fs::create_dir_all(&install_dir)
+                .await
+                .map_err(|e| format!("create install_dir for container module: {}", e))?;
+        }
     }
 
     // ─── Step 2+: post_install commands ──────────────────────────────────
@@ -115,6 +151,248 @@ pub async fn run_install(
     );
 
     Ok(install_dir)
+}
+
+/// Pull a container image from a private registry via a short-lived
+/// signed pull-token (paid-module flow).
+///
+/// Token gateway flow (Phase 3A — gateway not deployed yet):
+///   1. POST validated-tier JWT to `pull_token_endpoint`.
+///   2. Receive `{ image, tag, pull_token, expires_at }` — token TTL ~15min.
+///   3. `podman login` with that token, `podman pull`, `podman logout`.
+///   4. Discard token from memory.
+///
+/// Today (gateway returns 404): falls back to anonymous pull. Anonymous
+/// pull will succeed for public images and 401 for private — both produce
+/// clear errors that help diagnose the gateway-not-deployed-yet state.
+///
+/// Runtime detection: prefers `podman` (rootless, matches the rest of
+/// VCO's container stack). Falls back to `docker` if podman is missing.
+async fn container_pull(
+    container: &crate::manifest::ContainerInstallBlock,
+    tag: &str,
+    module_id: &str,
+) -> Result<(), String> {
+    let image_ref = format!("{}:{}", container.image, tag);
+
+    // ─── Step 1: try to obtain a pull token from the signed-URL gateway ─
+    //
+    // For v0 (Phase 1B) this is a stub: we attempt the POST but treat ANY
+    // failure (network, 404, 401, body-parse) as "gateway not available,
+    // fall through to anonymous pull". Once Phase 3A lands the Supabase
+    // edge function, missing-token will become a hard error (registry is
+    // private, anonymous pull will 401 anyway — better to fail at the
+    // gateway-call site with a clear "your Pro license could not issue
+    // a pull token" message).
+    let token: Option<String> = match request_pull_token(container).await {
+        Ok(tok) => {
+            eprintln!(
+                "[installer_engine] container_pull[{}]: obtained pull token (expires_in={}s)",
+                module_id, tok.expires_in_s
+            );
+            Some(tok.pull_token)
+        }
+        Err(e) => {
+            eprintln!(
+                "[installer_engine] container_pull[{}]: pull-token gateway unavailable ({}). \
+                 Falling back to anonymous pull — will succeed only if the image is public, \
+                 401 if private. Phase 3A will turn this into a hard error.",
+                module_id, e
+            );
+            None
+        }
+    };
+
+    // ─── Step 2: pick container runtime (podman preferred, docker fallback) ─
+    let runtime = detect_container_runtime().await?;
+
+    // ─── Step 3: login (if token), pull, logout ─────────────────────────
+    if let Some(t) = token.as_deref() {
+        let registry = container
+            .registry
+            .clone()
+            .unwrap_or_else(|| infer_registry_from_image(&container.image));
+        container_login(&runtime, &registry, t).await?;
+    }
+
+    let pull_status = Command::new(&runtime)
+        .args(["pull", &image_ref])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .status()
+        .await
+        .map_err(|e| format!("spawn {} pull: {}", runtime, e))?;
+
+    // Always logout if we logged in (even on pull failure) so the token
+    // doesn't linger in the runtime's auth.json.
+    if token.is_some() {
+        let registry = container
+            .registry
+            .clone()
+            .unwrap_or_else(|| infer_registry_from_image(&container.image));
+        let _ = Command::new(&runtime)
+            .args(["logout", &registry])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+    }
+
+    if !pull_status.success() {
+        return Err(format!(
+            "{} pull failed (exit {}): {}{}",
+            runtime,
+            pull_status.code().unwrap_or(-1),
+            image_ref,
+            if token.is_none() {
+                " — likely because no pull token was obtained from the signed-URL gateway \
+                 (Phase 3A) and the image is private (registry returns 401 for anonymous pulls)."
+            } else {
+                ""
+            }
+        ));
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct PullTokenResponse {
+    pub pull_token: String,
+    #[serde(default)]
+    pub expires_in_s: u64,
+}
+
+/// POST validated-tier JWT to the manifest's `pull_token_endpoint`.
+///
+/// Today: stub. Returns Err if the JWT-from-license-cache helper isn't
+/// available or the endpoint returns non-200. Phase 3A makes this the
+/// canonical paid-module auth path; until then, container_pull falls
+/// through to anonymous pull on Err.
+async fn request_pull_token(
+    container: &crate::manifest::ContainerInstallBlock,
+) -> Result<PullTokenResponse, String> {
+    // TODO[Phase 3A]: read the validated-tier JWT from ~/.vibecoded/license_cache.json
+    // (populated by VCThelpers/license/validator.py after /validate-tier success).
+    // For now, treat the absence of that file as "gateway unavailable" — keeps
+    // dev flow working with anonymous pulls.
+    let cache_path = directories::UserDirs::new()
+        .map(|d| d.home_dir().join(".vibecoded/license_cache.json"))
+        .ok_or("cannot resolve ~/.vibecoded/license_cache.json")?;
+
+    if !cache_path.exists() {
+        return Err(format!(
+            "license cache absent ({}); skipping token request",
+            cache_path.display()
+        ));
+    }
+
+    let body = tokio::fs::read_to_string(&cache_path)
+        .await
+        .map_err(|e| format!("read license cache: {}", e))?;
+
+    // POST the cache body verbatim (the cache is opaque to us; the edge
+    // function validates the JWT inside). 15s timeout — short enough to
+    // not block install flow on a stuck gateway.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("build http client: {}", e))?;
+
+    let resp = client
+        .request(
+            container.pull_token_method.parse().unwrap_or(reqwest::Method::POST),
+            &container.pull_token_endpoint,
+        )
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| format!("POST {}: {}", container.pull_token_endpoint, e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!(
+            "pull-token gateway returned {}: {}",
+            resp.status(),
+            container.pull_token_endpoint
+        ));
+    }
+
+    let parsed: PullTokenResponse = resp
+        .json()
+        .await
+        .map_err(|e| format!("parse pull-token response: {}", e))?;
+
+    Ok(parsed)
+}
+
+/// Detect which container runtime to use. Prefers podman (matches the
+/// rest of VCO's container stack), falls back to docker.
+async fn detect_container_runtime() -> Result<String, String> {
+    for candidate in ["podman", "docker"] {
+        let probe = Command::new(candidate)
+            .args(["--version"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+        if probe.map(|s| s.success()).unwrap_or(false) {
+            return Ok(candidate.to_string());
+        }
+    }
+    Err("no container runtime found (tried podman, docker)".into())
+}
+
+/// `<runtime> login <registry> -u <username> --password-stdin` with the
+/// token piped to stdin. Stdin-feed avoids exposing the token in argv
+/// (where `ps` would see it). The username is irrelevant for GHCR PATs
+/// — the registry validates the token, not the username pairing.
+async fn container_login(runtime: &str, registry: &str, token: &str) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut child = Command::new(runtime)
+        .args(["login", registry, "-u", "vct-paid-module", "--password-stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn {} login: {}", runtime, e))?;
+
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or("login stdin not captured")?;
+        stdin
+            .write_all(token.as_bytes())
+            .await
+            .map_err(|e| format!("write token to {} login stdin: {}", runtime, e))?;
+        // stdin drops here → EOF, login proceeds.
+    }
+
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(|e| format!("wait {} login: {}", runtime, e))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "{} login {} failed (exit {}): {}",
+            runtime,
+            registry,
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stderr).chars().take(300).collect::<String>()
+        ));
+    }
+    Ok(())
+}
+
+fn infer_registry_from_image(image: &str) -> String {
+    // "ghcr.io/hotak92/vct-rl-reranker" → "ghcr.io"
+    image
+        .split_once('/')
+        .map(|(head, _)| head.to_string())
+        .unwrap_or_else(|| "docker.io".to_string())
 }
 
 async fn git_clone(source: &str, git_ref: &str, dest: &Path) -> Result<(), String> {

@@ -146,6 +146,51 @@ pub struct InstallBlock {
     pub install_dir: String,
     #[serde(default)]
     pub post_install: Vec<CommandSpec>,
+    /// Container-pull metadata, required when `method = container_pull`.
+    /// Ignored by serde when absent for other install methods.
+    #[serde(default)]
+    pub container: Option<ContainerInstallBlock>,
+}
+
+/// Container-pull install metadata. Carries the registry image reference
+/// + the signed-URL token gateway endpoint. The launcher's installer
+/// engine POSTs the user's validated-tier JWT to `pull_token_endpoint`
+/// before invoking `podman/docker pull` — no anonymous registry access
+/// is ever attempted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContainerInstallBlock {
+    /// Fully-qualified image reference WITHOUT a tag (e.g.
+    /// "ghcr.io/hotak92/vct-rl-reranker"). The tag is determined by
+    /// `tag_from_version` + manifest.version, OR by InstallBlock::r#ref.
+    pub image: String,
+    /// When true, the pulled tag is `manifest.version` (e.g. "0.1.0").
+    /// When false, the tag is read from `InstallBlock::r#ref` (allows
+    /// "latest" floating-tag pulls during early Pro-tier beta).
+    #[serde(default = "default_true")]
+    pub tag_from_version: bool,
+    /// Registry hostname for clarity. Inferred from `image` if absent.
+    #[serde(default)]
+    pub registry: Option<String>,
+    /// HTTPS endpoint that issues short-lived pull tokens against the
+    /// user's validated-tier JWT. POST-only. Returns
+    /// `{ image, tag, pull_token, expires_at }`. TTL ~15 minutes.
+    pub pull_token_endpoint: String,
+    /// HTTP method to use (default POST).
+    #[serde(default = "default_pull_token_method")]
+    pub pull_token_method: String,
+    /// When true, rotate model weights independently of image-version
+    /// pulls. Used by the launcher's weekly-update poller.
+    #[serde(default)]
+    pub rotate_weights: bool,
+    /// HTTPS endpoint that returns the latest available weights bundle
+    /// version + a signed download URL. Polled on launcher startup +
+    /// once per day per VCO_dev's locked decision (2026-05-16).
+    #[serde(default)]
+    pub rotate_weights_endpoint: Option<String>,
+}
+
+fn default_pull_token_method() -> String {
+    "POST".into()
 }
 fn default_install_dir() -> String {
     "{VCT_MODULES}/{MODULE_ID}".into()
@@ -158,6 +203,28 @@ pub enum InstallMethod {
     GitClone,
     /// Use an existing directory at `install_dir` (e.g. user-built locally).
     Local,
+    /// Pull a container image from a private registry via a short-lived
+    /// signed pull-token. Introduced for paid Pro-tier modules (e.g.
+    /// vct-rl-reranker) where source-level distribution would expose the
+    /// model + code to anyone with the repo URL. Requires the manifest's
+    /// `install.container` block (`image`, `tag_from_version`, `registry`,
+    /// `pull_token_endpoint`).
+    ///
+    /// Flow (implemented in installer_engine::run_install):
+    ///   1. Validate license tier locally (require Pro or higher).
+    ///   2. POST current `validate-tier` JWT to `pull_token_endpoint`.
+    ///   3. Receive `{ image, tag, pull_token, expires_at }`. Token TTL is
+    ///      short (~15 min) — single-use only.
+    ///   4. `podman pull` / `docker pull` with that token (env injection,
+    ///      not stored on disk).
+    ///   5. Discard token from memory.
+    ///
+    /// Anti-piracy: registry is private (no anonymous access). Without a
+    /// validated Pro license the user cannot obtain a pull-token, so they
+    /// cannot pull the image at all. Image weights are rotated server-side
+    /// (~weekly) — a leaked snapshot degrades vs free-tier within 2 weeks
+    /// of stopping refreshes.
+    ContainerPull,
     // Reserved methods previously stubbed (tarball / pypi / npm) were
     // removed in v0.1.0 — they returned hard errors and confused users
     // browsing the modules catalog. They will land in v0.2 with real
@@ -531,4 +598,59 @@ pub fn validate_install_dir(candidate: &Path, allowed_root: &Path) -> Result<(),
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Confirms the v0.1.0 vct-rl-reranker manifest deserializes cleanly
+    /// AFTER the InstallMethod::ContainerPull + ContainerInstallBlock
+    /// additions (Phase 1B, 2026-05-16). If serde fields drift later
+    /// (e.g. ContainerInstallBlock gains a required field without a
+    /// default), this test fails fast at CI time before any user hits it.
+    ///
+    /// The manifest lives at <repo>/paid-modules/vct-rl-reranker/vct-module.json
+    /// — a staging dir, NOT shipped via launcher/bundled_manifests/ (paid
+    /// modules ship via the signed-URL gateway, not the AGPL release).
+    #[test]
+    fn vct_rl_reranker_manifest_deserializes() {
+        // Walk up from src-tauri/ to repo root.
+        let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("walk to repo root")
+            .to_path_buf();
+        let path = repo_root.join("paid-modules/vct-rl-reranker/vct-module.json");
+        if !path.exists() {
+            // Test is informational on dev clones that don't have the
+            // paid-modules staging dir checked out. Skip rather than fail.
+            eprintln!(
+                "[test skip] paid-modules/vct-rl-reranker/vct-module.json not present \
+                 (path: {}) — skipping deserialize check",
+                path.display()
+            );
+            return;
+        }
+        let body = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
+        let manifest: ModuleManifest = serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("deserialize {}: {}", path.display(), e));
+
+        assert_eq!(manifest.id, "vct-rl-reranker");
+        assert_eq!(manifest.version, "0.1.0");
+        assert_eq!(manifest.install.method, InstallMethod::ContainerPull);
+        assert!(manifest.license.required);
+        assert_eq!(manifest.license.min_orchestrator_tier, "pro");
+
+        let container = manifest
+            .install
+            .container
+            .as_ref()
+            .expect("install.container present for container_pull method");
+        assert_eq!(container.image, "ghcr.io/hotak92/vct-rl-reranker");
+        assert!(container.tag_from_version);
+        assert!(container.pull_token_endpoint.starts_with("https://"));
+        assert!(container.rotate_weights);
+    }
 }

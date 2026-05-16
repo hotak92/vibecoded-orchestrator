@@ -321,29 +321,49 @@ fn builtin_catalog_entries(db: &Db) -> Vec<ModuleCatalogEntry> {
         });
     }
 
-    // 5. RL Reranker — Pro-tier add-on, not yet shipped. Listed as the ONE
-    //    explicit "Coming Soon" entry on the home page (single vapor item is
-    //    acceptable when clearly marked; multiple is the bad pattern).
+    // 5. RL Reranker — Pro-tier paid module (vct-rl-reranker, v0.1.0).
+    //    Flipped from `coming_soon` to `available` in Phase 1C (2026-05-16)
+    //    once the manifest + container-pull installer recipe landed. Real
+    //    manifest lives in the orchestrator clone at
+    //    `paid-modules/vct-rl-reranker/vct-module.json` during dev; in
+    //    production the launcher fetches it via Phase 3C's
+    //    /rl-latest-version Supabase edge function (catalog discovery
+    //    against an authenticated registry — never bundled in the AGPL
+    //    release because the manifest declares the private GHCR image
+    //    coords + token gateway URL).
+    //
+    //    `kind: "available"` makes the UI render an Install button.
+    //    `is_licensed` is computed dynamically from the tier cache in
+    //    list_module_catalog (this hardcoded placeholder ships as
+    //    is_licensed=false; reality is filled in at catalog-build time).
+    //
+    //    Pre-flip there was a unit test asserting "exactly one coming_soon
+    //    entry, must be rl-reranker". That test was updated in this PR to
+    //    assert "zero coming_soon entries — anything we previously gated
+    //    behind coming_soon is now real". See
+    //    builtin_catalog_lists_zero_coming_soon_entries below.
     out.push(ModuleCatalogEntry {
         id: "rl-reranker".into(),
         name: "RL Reranker".into(),
-        version: "preview".into(),
+        version: "0.1.0".into(),
         description:
-            "Reinforcement-learning-trained reranker that improves retrieval \
-             quality across KG and Code Graph queries. Coming with Pro tier."
+            "Reinforcement-learning reranker for KG + Code Graph retrieval. \
+             Per-embedding-source neural networks personalize on your local \
+             citation patterns. Ships pre-trained; auto-fine-tunes on your \
+             data after each weekly model refresh. Pro tier required."
                 .into(),
-        category: "addon".into(),
-        tags: vec!["pro".into(), "coming-soon".into()],
+        category: "paid-independent".into(),
+        tags: vec!["pro".into(), "reranking".into(), "reinforcement-learning".into()],
         license_required: true,
         license_variant_ids: vec![],
         min_orchestrator_tier: "pro".into(),
-        compatibility_hosts: vec!["base".into()],
+        compatibility_hosts: vec!["base".into(), "orchestrator_root".into()],
         is_licensed: false,
-        manifest_source: "builtin".into(),
-        kind: "coming_soon".into(),
+        manifest_source: "paid-modules/vct-rl-reranker/vct-module.json".into(),
+        kind: "available".into(),
         parent_id: String::new(),
         cta_route: String::new(),
-        coming_soon_tier: "pro".into(),
+        coming_soon_tier: String::new(),
         coming_soon_target: String::new(),
     });
 
@@ -358,6 +378,14 @@ fn builtin_catalog_entries(db: &Db) -> Vec<ModuleCatalogEntry> {
 /// their manifest at the root of their install dir). A future version adds
 /// `https://registry.vibecodedtools.it/modules.json` for discovering
 /// uninstalled modules too.
+///
+/// Phase 1C (2026-05-16): added a dev-only scan of `<orchestrator_clone>/
+/// paid-modules/*/vct-module.json` so the RL Reranker manifest is
+/// discoverable on a dev machine even before the production discovery
+/// path (Phase 3C: `/rl-latest-version` Supabase edge function) lands.
+/// In a real user install the orchestrator clone is read-only and the
+/// paid-modules dir doesn't exist there, so this path is a no-op for
+/// non-dev users.
 fn catalog_scan_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
     let vct_root = crate::paths::vct_root_dir();
@@ -386,6 +414,36 @@ fn catalog_scan_paths() -> Vec<PathBuf> {
             }
         }
     }
+
+    // Dev-only: scan <orchestrator_clone>/paid-modules/*/vct-module.json.
+    // Resolved from VCT_INSTALL_ROOT (set by the launcher at startup to the
+    // active orchestrator clone) OR from $CARGO_MANIFEST_DIR's grandparent
+    // (works at `cargo test` time). Never panics — missing dir is silent.
+    let orchestrator_clone = std::env::var_os("VCT_INSTALL_ROOT")
+        .map(PathBuf::from)
+        .or_else(|| {
+            // Fallback for dev: walk up from cargo manifest dir to repo root.
+            Some(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .parent()? // launcher/
+                    .parent()? // repo root
+                    .to_path_buf(),
+            )
+        });
+    if let Some(clone) = orchestrator_clone {
+        let paid = clone.join("paid-modules");
+        if paid.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&paid) {
+                for module_dir in entries.flatten() {
+                    let p = module_dir.path().join("vct-module.json");
+                    if p.is_file() {
+                        paths.push(p);
+                    }
+                }
+            }
+        }
+    }
+
     paths
 }
 
@@ -801,24 +859,60 @@ mod tests {
     }
 
     #[test]
-    fn builtin_catalog_lists_exactly_one_coming_soon_entry() {
+    fn builtin_catalog_lists_zero_coming_soon_entries() {
+        // Phase 1C (2026-05-16): rl-reranker was promoted from `coming_soon`
+        // to `available` once its manifest landed at
+        // `paid-modules/vct-rl-reranker/vct-module.json` and the launcher's
+        // installer gained the ContainerPull recipe. The pre-flip test
+        // pinned "exactly one coming_soon entry, must be rl-reranker" —
+        // now we pin the inverse: no vapor entries should resurface.
+        // If a future PR re-introduces a `coming_soon` entry, force the
+        // author to justify it by failing this test.
         let db = open_db();
         let entries = builtin_catalog_entries(&db);
         let coming: Vec<&ModuleCatalogEntry> =
             entries.iter().filter(|e| e.kind == "coming_soon").collect();
         assert_eq!(
             coming.len(),
-            1,
-            "expected exactly 1 coming-soon entry; got {}: {:?}",
+            0,
+            "expected zero coming-soon entries; got {}: {:?}. \
+             If you intentionally added a new vapor entry, update this test \
+             and document the public roadmap commitment in the entry's \
+             coming_soon_target field.",
             coming.len(),
             coming.iter().map(|e| &e.id).collect::<Vec<_>>()
         );
-        let rl = coming[0];
-        assert_eq!(rl.id, "rl-reranker");
-        assert_eq!(rl.coming_soon_tier, "pro");
+    }
+
+    #[test]
+    fn builtin_catalog_lists_rl_reranker_as_available_paid_module() {
+        // Phase 1C: confirm rl-reranker is now `available` with the right
+        // tier, host compatibility, and version. This is the inverse of
+        // the old `lists_exactly_one_coming_soon` test — it pins the
+        // post-flip state instead.
+        let db = open_db();
+        let entries = builtin_catalog_entries(&db);
+        let rl = entries
+            .iter()
+            .find(|e| e.id == "rl-reranker")
+            .expect("rl-reranker entry must be present");
+
+        assert_eq!(rl.kind, "available", "rl-reranker should be installable");
+        assert_eq!(rl.version, "0.1.0", "matches manifest.version");
+        assert_eq!(rl.min_orchestrator_tier, "pro");
+        assert!(rl.license_required);
+        assert_eq!(rl.category, "paid-independent");
         assert!(
-            rl.coming_soon_target.is_empty(),
-            "no public target date committed yet"
+            rl.compatibility_hosts.contains(&"base".to_string()),
+            "must support base-host projects"
+        );
+        assert!(
+            rl.compatibility_hosts.contains(&"orchestrator_root".to_string()),
+            "must support orchestrator-root project (VCO_dev itself)"
+        );
+        assert!(
+            rl.manifest_source.contains("vct-rl-reranker"),
+            "manifest_source should reference the paid-modules path"
         );
     }
 
