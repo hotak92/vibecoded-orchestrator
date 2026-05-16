@@ -66,6 +66,11 @@ on:
     tags:
       - "v*.*.*"
   workflow_dispatch:
+    inputs:
+      skip_dist_commit:
+        description: "Skip committing built binaries back to main (dry-run / QA)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write       # needed to attach artifacts to the release
@@ -582,3 +587,181 @@ jobs:
             dist/${{ steps.archive_meta.outputs.archive_name }}
             dist/${{ steps.archive_meta.outputs.archive_name }}.sha256
           if-no-files-found: error
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # commit-dist-binaries
+  #
+  # After all three OS builds succeed, download the built launcher binaries
+  # from workflow artifacts and commit them back to `main` so that
+  # `git clone` always ships a binary that matches HEAD.
+  #
+  # ⚠️  BRANCH-PROTECTION PREREQUISITE — this job pushes directly to main.
+  # The ruleset "enforce PR + tests on main" currently has bypass_actors: [].
+  # Until the GitHub Actions integration is added to bypass_actors, this push
+  # will fail with a 403.  To unblock, run once (owner / admin only):
+  #
+  #   gh api --method PUT repos/hotak92/vibecoded-orchestrator/rulesets/15644739 \
+  #     --input - <<'JSON'
+  #   {
+  #     "bypass_actors": [
+  #       { "actor_id": 41898282, "actor_type": "Integration", "bypass_mode": "always" }
+  #     ]
+  #   }
+  #   JSON
+  #
+  # actor_id 41898282 is the canonical GitHub Actions Bot integration ID.
+  # bypass_mode "always" lets it bypass even without PR review.
+  # Alternatively, change bypass_mode to "pull_request" if you only want it
+  # to bypass required reviews but not other rules — "always" is simpler.
+  #
+  # The commit is skipped (no-op) when:
+  #   - workflow_dispatch input skip_dist_commit == true  (manual override)
+  #   - All three binaries are byte-identical to what is already at HEAD
+  #     (avoids churn commits when only source-only changes release)
+  # ─────────────────────────────────────────────────────────────────────────
+  commit-dist-binaries:
+    name: Commit built binaries back to main
+    needs: build
+    runs-on: ubuntu-latest
+    # Only run on tag pushes or explicit workflow_dispatch (skip in PR checks).
+    # Also honour the manual skip_dist_commit input.
+    if: |
+      (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch')
+      && github.event.inputs.skip_dist_commit != 'true'
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Fetch full history so we can check byte-equality before committing.
+          fetch-depth: 1
+          # Use the default GITHUB_TOKEN — push will fail here (403) until
+          # bypass_actors is configured; the error message will make the
+          # root cause clear (see comment above).
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Download all three OS launcher binaries produced by the build matrix.
+      # Each artifact is named `vct-launcher-<target>` and contains:
+      #   launcher/dist/<target>/vct-launcher[.exe]
+      #   launcher/dist/<target>/vct-launcher[.exe].metadata.json
+      - name: Download linux-x64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: vct-launcher-linux-x64
+          path: _dist-artifacts/linux-x64
+
+      - name: Download windows-x64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: vct-launcher-windows-x64
+          path: _dist-artifacts/windows-x64
+
+      - name: Download macos-arm64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: vct-launcher-macos-arm64
+          path: _dist-artifacts/macos-arm64
+
+      # Copy the freshly-built binaries into the committed dist tree.
+      # Preserve executable bits (download-artifact strips them on Linux).
+      # Compare to HEAD before staging — skip entirely if byte-identical.
+      - name: Stage binaries and detect changes
+        id: stage
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Determine version from Cargo.toml (same source as release.yml build job).
+          version="$(grep -m1 '^version = ' launcher/src-tauri/Cargo.toml \
+            | sed -E 's/^version *= *"([^"]+)".*/\1/')"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+          changed=0
+
+          stage_binary() {
+            local artifact_dir="$1"  # e.g. _dist-artifacts/linux-x64
+            local target="$2"        # e.g. linux-x64
+            local binary="$3"        # e.g. vct-launcher or vct-launcher.exe
+
+            local src="${artifact_dir}/${binary}"
+            local dst="launcher/dist/${target}/${binary}"
+
+            if [ ! -f "$src" ]; then
+              echo "::error::Expected artifact not found: $src"
+              ls -la "$artifact_dir" || true
+              exit 1
+            fi
+
+            # Restore executable bit (download-artifact strips it).
+            chmod +x "$src"
+
+            # Compare: if files are byte-identical, nothing to do for this OS.
+            if [ -f "$dst" ] && cmp -s "$src" "$dst"; then
+              echo "  [skip] ${target}/${binary} — byte-identical to HEAD"
+            else
+              cp "$src" "$dst"
+              chmod +x "$dst"
+              echo "  [stage] ${target}/${binary} — updated"
+              changed=$((changed + 1))
+            fi
+
+            # Always update the metadata.json sidecar (it contains built_at
+            # timestamp so it's always different, but it's tiny — no concern).
+            local meta_src="${artifact_dir}/${binary}.metadata.json"
+            local meta_dst="launcher/dist/${target}/${binary}.metadata.json"
+            if [ -f "$meta_src" ]; then
+              cp "$meta_src" "$meta_dst"
+            fi
+          }
+
+          stage_binary "_dist-artifacts/linux-x64"   "linux-x64"   "vct-launcher"
+          stage_binary "_dist-artifacts/windows-x64" "windows-x64" "vct-launcher.exe"
+          stage_binary "_dist-artifacts/macos-arm64" "macos-arm64" "vct-launcher"
+
+          echo "changed=${changed}" >> "$GITHUB_OUTPUT"
+          echo "Summary: ${changed} binary/binaries updated."
+
+      - name: Commit and push updated binaries
+        if: steps.stage.outputs.changed != '0'
+        shell: bash
+        env:
+          VERSION: ${{ steps.stage.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Stage ONLY the dist binary files — nothing else.
+          git add \
+            launcher/dist/linux-x64/vct-launcher \
+            launcher/dist/linux-x64/vct-launcher.metadata.json \
+            launcher/dist/windows-x64/vct-launcher.exe \
+            launcher/dist/windows-x64/vct-launcher.exe.metadata.json \
+            launcher/dist/macos-arm64/vct-launcher \
+            launcher/dist/macos-arm64/vct-launcher.metadata.json
+
+          # Verify only the expected files are staged — no collateral.
+          staged="$(git diff --cached --name-only)"
+          echo "Staged files:"
+          echo "$staged"
+          unexpected="$(echo "$staged" | grep -v '^launcher/dist/' || true)"
+          if [ -n "$unexpected" ]; then
+            echo "::error::Unexpected files in staging area: $unexpected"
+            exit 1
+          fi
+
+          git commit -m "chore(binary): refresh vct-launcher dist binaries for v${VERSION}
+
+          Auto-committed by release workflow after successful tag build.
+          Binaries: linux-x64, windows-x64, macos-arm64.
+          Source tag: v${VERSION}  Run: ${{ github.run_id }}"
+
+          # Push to main. This will 403 until bypass_actors is configured
+          # (see job-level comment). The error from GitHub will be:
+          # "Push declined by repository rules" — follow the bypass_actors
+          # setup instructions in the comment above this job.
+          git push origin HEAD:main
+
+      - name: Report no-op (all binaries already up to date)
+        if: steps.stage.outputs.changed == '0'
+        run: echo "All dist binaries are byte-identical to HEAD — no commit needed."
