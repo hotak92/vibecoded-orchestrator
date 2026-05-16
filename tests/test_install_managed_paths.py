@@ -35,10 +35,14 @@ import install  # type: ignore  # noqa: E402
 
 # Expected post-trim contents of orchestrator-managed-paths.txt as of
 # PR-1 (which trimmed the Rust constant) plus PR-5's self-reference
-# entry. If you change the file, change this list in the same commit.
+# entry. PR-31 (v0.2.12) removed ``CLAUDE.md`` from this set: the root
+# CLAUDE.md is the orchestrator-self's own development documentation,
+# not a per-project scaffold. User projects render CLAUDE.md from
+# ``templates/CLAUDE.md.template`` via the project-bootstrapper, NOT
+# via the install whitelist. If you change the file, change this list
+# in the same commit.
 EXPECTED_MANAGED_PATHS: tuple[str, ...] = (
     ".claude",
-    "CLAUDE.md",
     "knowledge",
     "docs",
     "tools",
