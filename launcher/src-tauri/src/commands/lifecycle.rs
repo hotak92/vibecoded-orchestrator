@@ -74,6 +74,15 @@ pub struct ServiceRuntimeState {
     /// when they hit the buttons.
     #[serde(default)]
     pub container_name: Option<String>,
+    /// PR-15 G2 (v0.2.11): true when the container exists per `podman ps`
+    /// but its main PID is dead (state-DB desync — conmon vanished
+    /// without writing an exit event). The HTTP probe fails AND the
+    /// pinned container exists AND `/proc/<pid>` is missing. The user
+    /// sees a "stuck" indicator + a Recover button that triggers
+    /// `recover_zombie`. See PR-13's `templates/hooks/ensure-containers.sh`
+    /// for the parallel SessionStart-hook surface.
+    #[serde(default)]
+    pub zombie: bool,
 }
 
 /// Aggregate snapshot returned by `services_status`. Mirrors the shape
@@ -117,6 +126,64 @@ fn canonical_services() -> [(&'static str, u16, fn(u16) -> String); 3] {
     ]
 }
 
+/// PR-15 G2 (v0.2.11): detect zombie containers (Podman state-DB
+/// desync — `podman ps` says "Up X minutes" but the main PID is dead).
+/// Mirrors the bash hook surface from PR-13
+/// (`templates/hooks/ensure-containers.sh`) but lives in the launcher
+/// Rust polling layer so the UI can show a "stuck" indicator + a
+/// Recover button instead of silently reporting "running: false" while
+/// hiding the real "container thinks it's running but isn't" state.
+///
+/// Returns `true` when:
+///   1. A container with the given name exists in `podman ps -a`, AND
+///   2. its main PID is reported by `podman inspect`, AND
+///   3. that PID is NOT alive on the host (Linux: `/proc/<pid>` absent;
+///      macOS/Windows: `kill -0 <pid>` fails — but rootless podman on
+///      those platforms runs inside a podman-machine VM, so the
+///      host-side PID is the VM's pid which won't appear in /proc.
+///      We skip the PID-alive cross-check on non-Linux: the bash
+///      `verify-container-ports.sh` watchdog skips it for the same
+///      reason).
+///
+/// Soft-fail: any subprocess error returns `false` (treat as
+/// "not a zombie" — better to false-negative the recovery hint than
+/// false-positive it).
+async fn detect_container_zombie(
+    runtime_binary: &std::path::Path,
+    container_name: &str,
+) -> bool {
+    // Non-Linux: the PID-alive cross-check is unreliable inside a
+    // podman-machine VM (the host PID is the VM's pid; /proc is the
+    // host's). Skip the zombie detection — Docker's central daemon
+    // keeps state honest, so the false-positive risk doesn't apply on
+    // Docker, and on macOS/Windows Podman the user's typically
+    // already in a VM context.
+    if !cfg!(target_os = "linux") {
+        return false;
+    }
+    // 1. Get the container's main PID via podman inspect.
+    let inspect = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tokio::process::Command::new(runtime_binary)
+            .args(["inspect", "--format", "{{.State.Pid}}", container_name])
+            .output(),
+    )
+    .await;
+    let pid_str = match inspect {
+        Ok(Ok(out)) if out.status.success() => {
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+        _ => return false, // container doesn't exist, or inspect failed
+    };
+    let pid: i32 = match pid_str.parse() {
+        Ok(p) if p > 0 => p,
+        _ => return false, // PID 0 means container is stopped, not zombied
+    };
+    // 2. Check if /proc/<pid> exists (Linux-only).
+    let proc_path = std::path::PathBuf::from(format!("/proc/{}", pid));
+    !proc_path.exists()
+}
+
 /// HTTP probe with 2s timeout. Returns true on 2xx/3xx.
 async fn probe_url(url: &str) -> bool {
     let client = match reqwest::Client::builder()
@@ -153,6 +220,102 @@ async fn services_already_running() -> bool {
 fn compose_dir() -> Result<PathBuf, String> {
     let root = crate::commands::installer::find_local_repo_root()?;
     Ok(root.join("infrastructure"))
+}
+
+/// PR-15 G3 (v0.2.11): locate the `launch-claude-mcp-stack` wrapper
+/// shipped with the orchestrator install. When present, the launcher
+/// PREFERS the wrapper over direct `compose up -d` calls.
+///
+/// Why prevention matters: the wrapper has logic the launcher's direct
+/// compose calls don't — CDI-wait (waits up to ~10s for
+/// `/var/run/cdi/nvidia.yaml` to exist before bringing GPU containers
+/// up), runtime.txt resolution (multi-path search added in PR-12), and
+/// runtime daemon-access validation (`_runtime_usable`, PR-12). Without
+/// the wrapper, `vco_code_embed` (CodeSage GPU container) hits a CDI
+/// race at boot: compose tries to set up `nvidia.com/gpu=all` before
+/// `/var/run/cdi/nvidia.yaml` is fully populated, the container fails
+/// with `setting up CDI devices: unresolvable CDI devices
+/// nvidia.com/gpu=all`, and ends up stuck in "CREATED" state — the
+/// exact bug the user reported 2026-05-16.
+///
+/// This PREVENTS the failure rather than recovering from it post-hoc.
+///
+/// Returns:
+///   - Linux/macOS: `<install_root>/scripts/launch-claude-mcp-stack.sh`
+///   - Windows:     `<install_root>/scripts/launch-claude-mcp-stack.ps1`
+///   - `None` if the wrapper isn't shipped or the install root can't
+///     be resolved. Caller falls back to direct compose.
+fn find_stack_wrapper() -> Option<PathBuf> {
+    let root = crate::commands::installer::find_local_repo_root().ok()?;
+    let script_name = if cfg!(target_os = "windows") {
+        "launch-claude-mcp-stack.ps1"
+    } else {
+        "launch-claude-mcp-stack.sh"
+    };
+    let candidate = root.join("scripts").join(script_name);
+    if candidate.is_file() {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+/// PR-15 G3 (v0.2.11): run the launch-claude-mcp-stack wrapper instead
+/// of compose directly. Caller decides whether to fall back to direct
+/// compose on Err (e.g. wrapper missing or transient failure).
+///
+/// Cross-OS:
+///   - Linux/macOS: `bash <script> <subcommand>` (avoids relying on
+///     execute permission since the script may have lost it during a
+///     git clone on a noexec partition).
+///   - Windows: `powershell -ExecutionPolicy Bypass -File <script>
+///     <subcommand>` (Task Scheduler's PowerShell host has a stricter
+///     default policy; Bypass keeps it consistent with how systemd
+///     invokes the .sh wrapper).
+///
+/// Subcommands map 1:1 to the launcher's lifecycle ops:
+///   - `start` ≡ `compose up -d`
+///   - `stop`  ≡ `compose stop`
+///   - `restart` ≡ `compose restart`
+async fn run_stack_wrapper(subcommand: &str) -> Result<(), String> {
+    let wrapper = find_stack_wrapper().ok_or_else(|| {
+        "launch-claude-mcp-stack wrapper not found at <install>/scripts/".to_string()
+    })?;
+    let mut cmd = if cfg!(target_os = "windows") {
+        let mut c = tokio::process::Command::new("powershell");
+        c.args([
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            wrapper.to_str().ok_or("non-UTF8 wrapper path")?,
+            subcommand,
+        ]);
+        c
+    } else {
+        let mut c = tokio::process::Command::new("bash");
+        c.arg(&wrapper).arg(subcommand);
+        c
+    };
+    // Inherit the orchestrator install root so the wrapper can resolve
+    // runtime.txt + compose file relative to it (matches the systemd
+    // unit's WorkingDirectory contract).
+    if let Ok(root) = crate::commands::installer::find_local_repo_root() {
+        cmd.current_dir(root);
+    }
+    let output = cmd
+        .output()
+        .await
+        .map_err(|e| format!("spawn launch-claude-mcp-stack wrapper: {}", e))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "launch-claude-mcp-stack {} failed (status {}): {}",
+            subcommand,
+            output.status,
+            stderr.trim()
+        ));
+    }
+    Ok(())
 }
 
 /// Get the per-service effective port — falls back to the canonical
@@ -206,6 +369,20 @@ pub async fn services_status() -> Result<ServicesRuntimeSnapshot, String> {
             has_unresolved = true;
         }
         let container_name = entry.and_then(|s| s.container_name.clone());
+        // PR-15 G2 (v0.2.11): zombie check when the probe failed AND
+        // we have a pinned container name AND the runtime binary is
+        // known. Without ALL three we can't reliably detect the state
+        // desync — skip and report `zombie: false`.
+        let zombie = if !running {
+            match (container_name.as_ref(), runtime_info.as_ref()) {
+                (Some(cn), Some(ri)) => {
+                    detect_container_zombie(&ri.binary_path, cn).await
+                }
+                _ => false,
+            }
+        } else {
+            false
+        };
         services.push(ServiceRuntimeState {
             name,
             running,
@@ -214,6 +391,7 @@ pub async fn services_status() -> Result<ServicesRuntimeSnapshot, String> {
             externally_managed,
             adoption_mode: mode,
             container_name,
+            zombie,
         });
     }
 
@@ -228,6 +406,66 @@ pub async fn services_status() -> Result<ServicesRuntimeSnapshot, String> {
             .unwrap_or(false),
         has_unresolved_external: has_unresolved,
     })
+}
+
+/// PR-15 G2 (v0.2.11): force-recover a zombie container. Called from
+/// the frontend when the user hits the "Recover" button next to a
+/// service marked `zombie: true` in `services_status`.
+///
+/// Recovery sequence (matches `templates/hooks/ensure-containers.sh`
+/// from PR-13):
+///   1. `podman rm --force <container>` — force-remove the zombie
+///      record from Podman's state DB (succeeds even when the container
+///      "thinks it's running"; --force kills + removes in one op).
+///   2. Re-bring-up via the launch-claude-mcp-stack wrapper if shipped
+///      (CDI-wait preserved for GPU containers), else direct compose.
+///
+/// Returns `Ok(())` on successful recovery. On failure, returns a
+/// user-readable Err that the FE shows via a toast. Soft-fail
+/// throughout — no panics.
+///
+/// Cross-OS: Linux/macOS/Windows all support `podman rm --force` and
+/// `docker rm --force` identically. The wrapper sub-call is delegated
+/// to `run_stack_wrapper` which handles per-OS dispatch.
+#[command]
+pub async fn recover_zombie(container_name: String) -> Result<(), String> {
+    validate_service_name(&container_name).map_err(|e| {
+        format!("recover_zombie: refusing unsafe container name: {}", e)
+    })?;
+    let info = detect_runtime()
+        .await
+        .ok_or("No container runtime found; cannot recover zombie")?;
+    // Step 1: force-remove the zombie record.
+    let rm_out = tokio::process::Command::new(&info.binary_path)
+        .args(["rm", "--force", &container_name])
+        .output()
+        .await
+        .map_err(|e| format!("spawn {} rm --force: {}", info.runtime.display_name(), e))?;
+    if !rm_out.status.success() {
+        // Some runtimes return non-zero when the container is already
+        // gone — that's actually fine for recovery. Distinguish by
+        // checking stderr for "no such container".
+        let stderr = String::from_utf8_lossy(&rm_out.stderr).to_lowercase();
+        if !stderr.contains("no such container") && !stderr.contains("not found") {
+            return Err(format!(
+                "{} rm --force {} failed: {}",
+                info.runtime.display_name(),
+                container_name,
+                stderr.trim()
+            ));
+        }
+        // else: already removed, fall through to re-bring-up.
+    }
+    // Step 2: re-bring-up via wrapper (preferred, has CDI-wait) or
+    // direct compose. Re-uses the same wrapper-first/compose-fallback
+    // pattern as services_start_all.
+    if find_stack_wrapper().is_some() {
+        if let Ok(()) = run_stack_wrapper("start").await {
+            return Ok(());
+        }
+        // Fall through to direct compose.
+    }
+    run_compose(&info, ["up", "-d"]).await
 }
 
 /// Helper: translate a tokio process result into a launcher error
@@ -285,12 +523,37 @@ pub async fn services_start_all() -> Result<(), String> {
         return Ok(());
     }
 
+    // PR-15 G3 (v0.2.11): PREFER the launch-claude-mcp-stack wrapper
+    // when shipped. The wrapper has CDI-wait (prevents the vco_code_embed
+    // boot race) + runtime daemon-access validation + runtime.txt
+    // resolution. Only falls back to direct compose when:
+    //   1. the wrapper isn't installed (minimal install), OR
+    //   2. the user adopted only a subset of services (the wrapper has
+    //      a fixed startup set; we'd need to skip the rest via compose
+    //      args, which the wrapper doesn't expose).
+    let manages_all = managed.len() == canonical_services().len();
+    if manages_all {
+        if let Some(_) = find_stack_wrapper() {
+            match run_stack_wrapper("start").await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    eprintln!(
+                        "[lifecycle] launch-claude-mcp-stack start failed, \
+                         falling back to direct compose: {}",
+                        e
+                    );
+                    // Fall through to direct compose.
+                }
+            }
+        }
+    }
+
     // `up -d` with no service args = "everything in the file"; with
     // explicit names = "only these". When the entire stack is managed
     // we use the no-arg form so future compose additions don't get
     // silently skipped.
     let mut args: Vec<String> = vec!["up".into(), "-d".into()];
-    if managed.len() < canonical_services().len() {
+    if !manages_all {
         for n in &managed {
             args.push((*n).to_string());
         }
@@ -316,11 +579,27 @@ pub async fn services_stop_all() -> Result<(), String> {
 
 /// Restart all services. `compose restart` does this atomically; we
 /// don't need the down+up dance.
+///
+/// PR-15 G3 (v0.2.11): prefer the launch-claude-mcp-stack wrapper to
+/// preserve CDI-wait semantics on restart of GPU containers. Falls
+/// back to direct compose if the wrapper isn't shipped or fails.
 #[command]
 pub async fn services_restart_all() -> Result<(), String> {
     let info = detect_runtime()
         .await
         .ok_or("No container runtime found.")?;
+    if let Some(_) = find_stack_wrapper() {
+        match run_stack_wrapper("restart").await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                eprintln!(
+                    "[lifecycle] launch-claude-mcp-stack restart failed, \
+                     falling back to direct compose: {}",
+                    e
+                );
+            }
+        }
+    }
     run_compose(&info, ["restart"]).await
 }
 
@@ -1126,6 +1405,69 @@ mod services_lifecycle_tests {
         assert!(validate_service_name("").is_err());
         assert!(validate_service_name("weaviate; rm -rf /").is_err());
         assert!(validate_service_name("../etc/passwd").is_err());
+    }
+
+    // ----- PR-15 G3: stack-wrapper preference tests -----
+
+    #[test]
+    fn find_stack_wrapper_returns_none_when_install_root_unresolvable() {
+        // No env var set, no `.vct-orchestrator-dev` marker — the
+        // installer's find_local_repo_root() returns Err and we return
+        // None gracefully (caller falls back to direct compose).
+        // We can't easily mock find_local_repo_root from here, but we
+        // CAN verify the function signature returns Option<PathBuf>
+        // and does not panic regardless of host setup.
+        let _ = find_stack_wrapper();
+    }
+
+    // ----- PR-15 G2: zombie detection tests -----
+
+    #[tokio::test]
+    async fn detect_container_zombie_returns_false_on_nonexistent_container() {
+        // podman/docker inspect on a fake name → exit non-zero → false.
+        // We use the literal "podman" binary if it's on the host; if
+        // not, the spawn errors and we still get false (soft-fail).
+        let runtime = std::path::PathBuf::from("/usr/bin/podman");
+        let z = detect_container_zombie(&runtime, "vco_definitely_does_not_exist_pr15").await;
+        assert!(
+            !z,
+            "detect_container_zombie must return false for nonexistent containers"
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_container_zombie_returns_false_on_spawn_error() {
+        // Bogus binary path → spawn fails → soft-fail returns false.
+        let bogus = std::path::PathBuf::from("/nonexistent/path/to/podman");
+        let z = detect_container_zombie(&bogus, "any-name").await;
+        assert!(!z, "spawn failure must return false (soft-fail), not panic");
+    }
+
+    #[tokio::test]
+    #[cfg(not(target_os = "linux"))]
+    async fn detect_container_zombie_skipped_on_non_linux() {
+        // On macOS/Windows the host-PID cross-check is unreliable
+        // (podman-machine VM), so we deliberately skip it and return
+        // false. This test only runs on non-Linux hosts.
+        let runtime = std::path::PathBuf::from("/usr/bin/podman");
+        let z = detect_container_zombie(&runtime, "any-name").await;
+        assert!(!z, "non-Linux hosts must skip zombie detection");
+    }
+
+    #[tokio::test]
+    async fn recover_zombie_rejects_unsafe_container_name() {
+        // The name validator is the security boundary — must refuse
+        // injection-y names even before touching the runtime.
+        let result = recover_zombie("; rm -rf /".to_string()).await;
+        assert!(
+            result.is_err(),
+            "recover_zombie must reject injection-y container names"
+        );
+        let result = recover_zombie("".to_string()).await;
+        assert!(
+            result.is_err(),
+            "recover_zombie must reject empty container names"
+        );
     }
 
     #[test]

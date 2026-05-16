@@ -612,6 +612,7 @@ mod tests {
             externally_managed: false,
             adoption_mode: crate::services::adoption::AdoptionMode::Unresolved,
             container_name: None,
+            zombie: false, // PR-15: field added; default false for non-zombie test fixture
         };
         assert!(needs_user_pick(&svc).await);
     }
@@ -626,6 +627,7 @@ mod tests {
             externally_managed: false,
             adoption_mode: crate::services::adoption::AdoptionMode::Adopt,
             container_name: Some("".to_string()),
+            zombie: false, // PR-15: field added; default false for non-zombie test fixture
         };
         assert!(needs_user_pick(&svc).await);
     }
