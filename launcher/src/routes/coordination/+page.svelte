@@ -146,7 +146,7 @@
         <h2>Identity</h2>
         <div class="co-form-grid">
           <label><span>Team username</span>
-            <input bind:value={username} placeholder="hotak92" />
+            <input bind:value={username} placeholder="your-github-handle" />
           </label>
           <label><span>User aliases (comma)</span>
             <input bind:value={aliasesRaw} placeholder="alice, a" />

@@ -87,7 +87,8 @@
   let showHostHelp = $state(false);
   // Once the user manually edits the path field we stop overwriting it.
   let pathTouched = $state(false);
-  // Resolved root for the path autosuggest (e.g. /home/martino/code or
+  // Resolved root for the path autosuggest (e.g. ~/code resolved to an
+  // absolute path on Linux/macOS, %USERPROFILE%\code on Windows, or
   // ~/code as a literal fallback in browser mode).
   let suggestedRoot = $state('~/code');
   const inTauri = isTauriRuntime();
