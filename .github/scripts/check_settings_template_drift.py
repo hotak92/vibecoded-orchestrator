@@ -34,10 +34,13 @@ Hook command normalisation:
 
 What's allowed to differ
 ------------------------
-Top-level `env` block. The orchestrator clone has lean-ctx wiring
-(`BASH_ENV: ${CLAUDE_PROJECT_DIR}/.claude/scripts/leanctx-bash-env.sh`)
-that is orchestrator-specific and intentionally absent from templates.
-This file's `EXPECTED_ENV_DIVERGENCE` set documents allowed differences.
+Top-level `env` block. Historically, the orchestrator clone wired
+`BASH_ENV: ${CLAUDE_PROJECT_DIR}/.claude/scripts/leanctx-bash-env.sh`
+which was orchestrator-specific and intentionally absent from templates;
+0.2.11 removed that wiring entirely (the shim was fork-bomb-prone on
+lean-ctx 3.x — see knowledge/concepts/lean-ctx-shim-disabled.md).
+`EXPECTED_ENV_DIVERGENCE` is now empty by default; add keys here only
+with explicit CR review.
 
 Inline non-hook commands like `python -m py_compile "$CLAUDE_TOOL_ARG_PATH"`
 are NOT in scope of this gate — they don't reference a hook script.
@@ -73,8 +76,12 @@ EXPECTED_ACTIVE_ONLY: set[str] = set()
 EXPECTED_TEMPLATE_ONLY: set[str] = set()
 
 # Top-level keys in `env` that are allowed to differ between active and
-# templates. `BASH_ENV` is orchestrator-specific (lean-ctx integration).
-EXPECTED_ENV_DIVERGENCE: set[str] = {"BASH_ENV"}
+# templates. Zero divergence enforced as of 0.2.11 — the legacy `BASH_ENV`
+# lean-ctx shim was removed (fork-bomb risk on lean-ctx 3.x; see
+# knowledge/concepts/lean-ctx-shim-disabled.md). Output compression is now
+# delivered via the per-project PreToolUse hook lean-ctx-rewrite.{sh,ps1},
+# which is uniform across .claude/settings.json AND both templates.
+EXPECTED_ENV_DIVERGENCE: set[str] = set()
 
 
 def normalise_hook_command(cmd: str) -> str | None:
