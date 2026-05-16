@@ -4,6 +4,10 @@
   import { invoke, safeInvoke, isTauriRuntime } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
   import Toast from '$lib/components/Toast.svelte';
+  // PR-37 (v0.2.12 / 2026-05-16): MCP-page maintenance section.
+  // Surfaces re-register + stale-entry rewrite. Backed by
+  // commands::maintenance::* Tauri commands.
+  import McpMaintenanceSection from '$lib/components/McpMaintenanceSection.svelte';
 
   // McpServerConfig — see launcher/src-tauri/src/types.rs
   interface McpServer {
@@ -141,6 +145,10 @@
       <code>npm run tauri:dev</code> from <code>launcher/</code> to add,
       remove, or toggle servers.
     </p>
+  {/if}
+
+  {#if inTauri}
+    <McpMaintenanceSection />
   {/if}
 
   {#if loading}
