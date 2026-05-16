@@ -420,9 +420,38 @@ pub async fn detect_runtime() -> Option<RuntimeInfo> {
 }
 
 async fn resolve_runtime() -> Option<RuntimeInfo> {
-    // Preference order: Podman > Docker. Per user policy: "check for
-    // availability on podman first".
-    for runtime in [ContainerRuntime::Podman, ContainerRuntime::Docker] {
+    // PR-43 (v0.2.12): honor VCT_CONTAINER_RUNTIME env override so the
+    // GUI matches the hooks' behavior (templates/hooks/ensure-containers.sh,
+    // verify-container-ports.sh, ensure-code-embed-service.sh all check
+    // this var first). Without this, a user setting the var to force a
+    // specific runtime would see hooks pick one and the launcher GUI pick
+    // another — silent split-brain.
+    //
+    // Accepted values: "podman", "docker", "auto" (or unset → auto).
+    // Invalid values fall through to auto-detection with a clear stderr.
+    let override_pref = std::env::var("VCT_CONTAINER_RUNTIME")
+        .ok()
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty() && s != "auto");
+
+    // Preference order: env override first; else Podman > Docker.
+    // Per user policy: "check for availability on podman first".
+    let order: Vec<ContainerRuntime> = match override_pref.as_deref() {
+        Some("podman") => vec![ContainerRuntime::Podman],
+        Some("docker") => vec![ContainerRuntime::Docker],
+        Some(other) => {
+            eprintln!(
+                "[vct] runtime: VCT_CONTAINER_RUNTIME={:?} not recognized \
+                 (expected 'podman', 'docker', or 'auto'); falling back to \
+                 podman-then-docker auto-detection",
+                other
+            );
+            vec![ContainerRuntime::Podman, ContainerRuntime::Docker]
+        }
+        None => vec![ContainerRuntime::Podman, ContainerRuntime::Docker],
+    };
+
+    for runtime in order {
         let bin_path = match which_on_path(runtime.binary()) {
             Some(p) => p,
             None => continue,

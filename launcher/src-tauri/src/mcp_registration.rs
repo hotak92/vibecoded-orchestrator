@@ -208,14 +208,29 @@ fn atomic_write_json(path: &Path, value: &serde_json::Value) -> Result<(), Strin
 /// KG_BASE_DIR) live in each project's `.claude/settings.json env` instead
 /// (launcher writes them via `write_project_env_files`); they are
 /// intentionally absent from this allowlist.
+///
+/// CRITICAL CONTRACT (Issue H.1 from mcp-instability audit 2026-05-16):
+/// Anthropic semantics say "project scope overrides user scope" for env
+/// vars, but Claude Code applies ~/.claude.json mcpServers.*.env keys
+/// LAST to MCP subprocesses — so they WIN against .claude/settings.json
+/// env. This is the wrong direction for any per-project-varying value.
+/// Therefore this allowlist is restricted to keys that are TRULY
+/// machine-invariant.
+///
+/// Removed in PR-43 (post-PR-23):
+///   - RL_SERVER_URL: varies per user setup (VCO_dev: 11442, MAO: 11439,
+///     etc.). Belongs in per-project .claude/settings.json env.
+///   - EMBEDDING_MODEL: users may want per-project override; if it's in
+///     this global allowlist, the per-project value gets overridden the
+///     WRONG WAY due to Claude Code's precedence. MUST stay project-scoped.
+///
+/// MUST stay in sync with install.py::_ALLOWED_GLOBAL_ENV_KEYS.
 const ALLOWED_ENV_KEYS: &[&str] = &[
     "WEAVIATE_URL",
     "OLLAMA_URL",
     "GRPC_PORT",
     "PYTHONPATH",
-    "RL_SERVER_URL",
     "ACTIVE_EMBEDDING",
-    "EMBEDDING_MODEL",
     "CODE_EMBED_SERVICE_URL",
 ];
 
@@ -371,13 +386,20 @@ pub fn build_default_mcp_entries(
 
     // ── weaviate-kg ─────────────────────────────────────────────────────
     let weaviate_server = mcp_root.join("weaviate_mcp").join("server.py");
+    // PR-43 (post-PR-23): EMBEDDING_MODEL + RL_SERVER_URL are intentionally
+    // omitted here. They were originally written as "global defaults that
+    // per-project may override" but Claude Code's actual env precedence
+    // makes ~/.claude.json mcpServers.*.env WIN against
+    // .claude/settings.json env — so the override goes the wrong direction.
+    // The launcher's write_project_env_files puts these in
+    // .claude/settings.json env where they reach MCP subprocesses
+    // correctly. Don't shadow them here.
     let mut weaviate_env = serde_json::Map::new();
     weaviate_env.insert("WEAVIATE_URL".into(), weaviate_url.clone().into());
     weaviate_env.insert("OLLAMA_URL".into(), ollama_url.clone().into());
     weaviate_env.insert("GRPC_PORT".into(), ports.grpc_port.to_string().into());
     weaviate_env.insert("PYTHONPATH".into(), pythonpath.clone().into());
     weaviate_env.insert("ACTIVE_EMBEDDING".into(), "qwen3".into());
-    weaviate_env.insert("EMBEDDING_MODEL".into(), "qwen3-embedding:0.6b".into());
     weaviate_env.insert("CODE_EMBED_SERVICE_URL".into(), code_embed_url.into());
     let (weaviate_env_safe, weaviate_dropped) = filter_env_for_global_json(&weaviate_env);
     let weaviate_entry = serde_json::json!({

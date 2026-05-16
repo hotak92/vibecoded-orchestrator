@@ -270,11 +270,23 @@ class BuildEntriesTests(unittest.TestCase):
             self.assertEqual(entry["env"]["WEAVIATE_URL"], "http://localhost:8081")
             self.assertEqual(entry["env"]["OLLAMA_URL"], "http://localhost:11435")
             self.assertEqual(entry["env"]["GRPC_PORT"], "50052")
-            self.assertEqual(entry["env"]["EMBEDDING_MODEL"], "qwen3-embedding:0.6b")
-            # Per-project keys MUST be absent:
+            self.assertEqual(entry["env"]["ACTIVE_EMBEDDING"], "qwen3")
+            self.assertEqual(entry["env"]["CODE_EMBED_SERVICE_URL"], "http://localhost:11440")
+            # Per-project keys MUST be absent (Claude Code's
+            # ~/.claude.json mcpServers.*.env wins against
+            # .claude/settings.json env, so any per-project-varying
+            # value here would override the launcher's per-project value
+            # the wrong direction):
             self.assertNotIn("KG_COLLECTION", entry["env"])
             self.assertNotIn("PROJECT_NAME", entry["env"])
             self.assertNotIn("DEVELOPMENT_COLLECTION", entry["env"])
+            # PR-43 (post-PR-23): EMBEDDING_MODEL + RL_SERVER_URL removed
+            # from _ALLOWED_GLOBAL_ENV_KEYS — these now live in
+            # .claude/settings.json env per-project so users with custom
+            # embedding models or alternate RL server ports don't get
+            # shadowed.
+            self.assertNotIn("EMBEDDING_MODEL", entry["env"])
+            self.assertNotIn("RL_SERVER_URL", entry["env"])
 
     def test_search_entry_uses_wrapper_on_unix(self):
         """Search MCP must invoke wrapper.sh on Unix (per handoff spec)."""

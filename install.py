@@ -7762,14 +7762,30 @@ def _check_search_mcp_env_obsolete(
 
 # Env-key allowlist for ~/.claude.json mcpServers.*.env. MUST stay in sync
 # with launcher/src-tauri/src/mcp_registration.rs::ALLOWED_ENV_KEYS.
+#
+# CRITICAL CONTRACT (see Issue H.1 from mcp-instability audit 2026-05-16):
+# Anthropic semantics say "project scope overrides user scope" for env
+# vars, but Claude Code applies ~/.claude.json mcpServers.*.env keys LAST
+# to MCP subprocesses — so they WIN against .claude/settings.json env.
+# This is the wrong direction for any per-project-varying value.
+#
+# Therefore this allowlist is restricted to keys that are TRULY
+# machine-invariant (same value across every workspace on the user's
+# machine): service URLs/ports, PYTHONPATH (resolves to the install_root),
+# and ACTIVE_EMBEDDING (the embedding-mode toggle is machine-wide because
+# it determines which named-vector Weaviate column is queried).
+#
+# Removed in PR-43 (post-PR-23): RL_SERVER_URL (varies per user setup —
+# VCO_dev runs a dedicated port-11442 service, MAO uses 11439, etc.),
+# EMBEDDING_MODEL (users may want per-project override; if it's in this
+# global allowlist, the per-project .claude/settings.json env value gets
+# overridden the WRONG WAY due to Claude Code's precedence).
 _ALLOWED_GLOBAL_ENV_KEYS = (
     "WEAVIATE_URL",
     "OLLAMA_URL",
     "GRPC_PORT",
     "PYTHONPATH",
-    "RL_SERVER_URL",
     "ACTIVE_EMBEDDING",
-    "EMBEDDING_MODEL",
     "CODE_EMBED_SERVICE_URL",
 )
 
@@ -8144,13 +8160,19 @@ def _build_python_mcp_entries(
 
     # weaviate-kg
     weaviate_server = mcp_root / "weaviate_mcp" / "server.py"
+    # PR-43 (post-PR-23): EMBEDDING_MODEL + RL_SERVER_URL are intentionally
+    # omitted here. They were originally written as "global defaults that
+    # per-project may override" but Claude Code's actual env precedence
+    # makes ~/.claude.json mcpServers.*.env WIN against .claude/settings.json
+    # env — so the override goes the wrong direction. The launcher's
+    # write_project_env_files puts these in .claude/settings.json env where
+    # they reach MCP subprocesses correctly. Don't shadow them here.
     weaviate_env_raw = {
         "WEAVIATE_URL": weaviate_url,
         "OLLAMA_URL": ollama_url,
         "GRPC_PORT": str(grpc_port),
         "PYTHONPATH": pythonpath,
         "ACTIVE_EMBEDDING": "qwen3",
-        "EMBEDDING_MODEL": "qwen3-embedding:0.6b",
         "CODE_EMBED_SERVICE_URL": code_embed_url,
     }
     weaviate_env, weaviate_dropped = _filter_env_for_global_json(weaviate_env_raw)
