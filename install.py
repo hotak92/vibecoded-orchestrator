@@ -1868,6 +1868,16 @@ def main() -> int:
                         help="During --update, attempt to apply each pending entry "
                              "in .claude/context/UPDATE_DEFERRED.md. Resolved entries "
                              "are removed; the file is deleted when zero entries remain.")
+    parser.add_argument("--rewrite-stale-mcps", action="store_true", default=False,
+                        help="On --update, prompt for consent to rewrite any "
+                             "~/.claude.json mcpServers entries whose paths point "
+                             "outside the current install_root. Without this flag, "
+                             "stale entries are only detected + reported via deferral "
+                             "(PR-23 behavior). With this flag, each stale entry is "
+                             "prompted individually (y/n/all/skip-all). --quiet "
+                             "bypasses the prompt and emits a clarifying deferral "
+                             "(no rewrite). Set VCT_REWRITE_STALE_MCPS=all in the "
+                             "env to auto-accept all entries (CI / scripted). PR-33.")
     parser.add_argument("--project-folder", type=str, default=None,
                         help="Folder where .claude/context/UPDATE_DEFERRED.md should "
                              "land. Defaults to the orchestrator's PROJECT_ROOT "
@@ -2608,6 +2618,31 @@ def main() -> int:
                 "register_mcps", "error",
                 f"unexpected exception: {exc}",
             )
+
+        # PR-33 (v0.2.12, 2026-05-16): consent-prompted rewrite path.
+        # PR-23's _detect_stale_mcp_entries (invoked inside _register_mcps)
+        # has already emitted the report-only deferral. When the user
+        # passes --rewrite-stale-mcps we additionally walk each stale
+        # entry, prompt for consent, and hand off to the same writer.
+        # Soft-fail: any exception is caught and downgraded to a warning
+        # so the install completes.
+        if getattr(args, "rewrite_stale_mcps", False):
+            try:
+                _rewrite_stale_mcp_entries(
+                    PROJECT_ROOT,
+                    _deferral_report,
+                    quiet=bool(getattr(args, "quiet", False)),
+                )
+            except Exception as exc:  # noqa: BLE001 — soft-fail by design
+                print(
+                    f"  --rewrite-stale-mcps raised unexpectedly: {exc}. "
+                    "Install will complete; re-run to retry.",
+                    file=sys.stderr,
+                )
+                _log_install_event(
+                    "rewrite_stale_mcps", "error",
+                    f"unexpected exception: {exc}",
+                )
 
     # v0.2.10 (Bug L2): auto-materialize the boot service so containers
     # come back up after a reboot without manual intervention. Cross-OS:
@@ -8146,34 +8181,39 @@ def _register_mcps(
     _detect_stale_mcp_entries(install_root, claude_json, deferral_report)
 
 
-def _detect_stale_mcp_entries(
+def _scan_stale_mcp_entries(
     install_root: Path,
     claude_json: Path,
-    deferral_report: "DeferralReport",
-) -> None:
-    """On --update, emit a deferral when ~/.claude.json mcpServers entries
-    point at directories outside the current install_root.
+) -> list[tuple[str, str, dict]]:
+    """Return a list of ``(mcp_name, stale_path, entry_dict)`` for every
+    ``~/.claude.json mcpServers`` entry whose ``command`` or ``args[0]``
+    points at a vco-install-shaped path OUTSIDE the current install_root.
 
-    Doesn't auto-rewrite (rewrite is OUT OF SCOPE for v0.2.12) — just
-    surfaces the stale entry + the explicit command the user would run
-    to fix it (placeholder `--rewrite-stale-mcps` flag; not implemented
-    in this PR). Mirrors the per-project Sync Notice pattern from the
-    launcher's Settings page.
+    Pure function (no deferral side effects, no writes). Used by both
+    :func:`_detect_stale_mcp_entries` (reports only) and
+    :func:`_rewrite_stale_mcp_entries` (PR-33 consent-prompted rewrite).
+    The triple includes the full entry dict so the rewrite path can
+    inspect existing ``env`` keys for the secret-leak warning.
+
+    Cross-OS path detection: absolute paths only (``/``, ``C:\\``,
+    ``c:\\``, ``\\\\``-prefixed UNC). Anchored on the ``claude_mcp_servers``
+    or ``.venv`` directory tokens so user-added MCPs at ``/usr/bin/foo``
+    are NOT misclassified as orchestrator-stale.
     """
     if not claude_json.is_file():
-        return
+        return []
     try:
         data = json.loads(claude_json.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return
+        return []
     if not isinstance(data, dict):
-        return
+        return []
     mcp_servers = data.get("mcpServers", {})
     if not isinstance(mcp_servers, dict):
-        return
+        return []
 
     install_root_str = str(install_root.resolve())
-    stale: list[tuple[str, str]] = []
+    stale: list[tuple[str, str, dict]] = []
     for name, entry in mcp_servers.items():
         if not isinstance(entry, dict):
             continue
@@ -8191,13 +8231,30 @@ def _detect_stale_mcp_entries(
             if "claude_mcp_servers" not in candidate and ".venv" not in candidate:
                 continue
             if not candidate.startswith(install_root_str):
-                stale.append((name, candidate))
+                stale.append((name, candidate, entry))
                 break
+    return stale
 
+
+def _detect_stale_mcp_entries(
+    install_root: Path,
+    claude_json: Path,
+    deferral_report: "DeferralReport",
+) -> None:
+    """On --update, emit a deferral when ~/.claude.json mcpServers entries
+    point at directories outside the current install_root.
+
+    Detection-only path (no rewrite). The companion
+    :func:`_rewrite_stale_mcp_entries` (PR-33) consumes the same
+    :func:`_scan_stale_mcp_entries` data and performs consent-prompted
+    rewrites when ``--rewrite-stale-mcps`` is passed.
+    """
+    stale = _scan_stale_mcp_entries(install_root, claude_json)
     if not stale:
         return
 
-    detected_lines = [f"  - `{name}`: {path}" for name, path in stale]
+    install_root_str = str(install_root.resolve())
+    detected_lines = [f"  - `{name}`: {path}" for name, path, _ in stale]
     deferral_report.add_entry(
         DeferralEntry(
             condition_id="stale_mcp_entry",
@@ -8214,15 +8271,327 @@ def _detect_stale_mcp_entries(
             why_deferred=(
                 "Auto-rewriting global MCP entries is destructive (user may "
                 "have intentional dual-install setups). v0.2.12 detects and "
-                "reports; a future `--rewrite-stale-mcps` flag will offer "
-                "explicit consent-driven rewrite."
+                "reports; pass `--rewrite-stale-mcps` for the consent-prompted "
+                "rewrite path (PR-33)."
             ),
             command_to_apply=(
-                "# Manual: edit ~/.claude.json and replace the stale paths with the new install_root.\n"
-                "# Or future-flag (not yet implemented as of v0.2.12):\n"
-                "python install.py --update --rewrite-stale-mcps"
+                "# Re-run with the consent-prompted rewrite flag (PR-33):\n"
+                "python install.py --update --rewrite-stale-mcps\n"
+                "# Or, for CI / scripted contexts that want to accept all:\n"
+                "#   VCT_REWRITE_STALE_MCPS=all python install.py --update --rewrite-stale-mcps"
             ),
             severity="warning",
+            kg_node_refs=[
+                ".claude/context/mcp-install-pipeline-audit-2026-05-16.md",
+            ],
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# PR-33 (v0.2.12, 2026-05-16): consent-prompted rewrite of stale MCP entries
+# ---------------------------------------------------------------------------
+#
+# Detection (PR-23, above) is unconditional on --update. Rewrite (PR-33,
+# this block) is OFF by default — it only runs when the user passes
+# ``--rewrite-stale-mcps``. Even then, every stale entry is prompted
+# individually with y/n/all/skip-all choices. ``--quiet`` cannot prompt;
+# it emits a clarifying deferral and writes nothing. ``VCT_REWRITE_STALE_MCPS=all``
+# env override exists for CI / scripted contexts that explicitly want
+# auto-acceptance.
+#
+# The actual rewrite reuses the same writer that fresh install uses
+# (``register_default_orchestrator_mcps`` on the Rust side, or the Python
+# fallback). That means the env-key allowlist + secret-shaped-key denylist
+# apply uniformly: hand-edited secret keys in stale entries are DROPPED
+# on rewrite, with a clear "we dropped X, Y" warning before confirmation.
+#
+# Two-level backup: ``~/.claude.json.bak-rewrite-<unix-timestamp>`` is
+# copied BEFORE we hand off to the writer. The writer itself produces a
+# separate ``.bak`` via its atomic-write discipline. Belt-and-suspenders
+# for a destructive operation.
+
+
+def _consent_for_stale_entries(
+    stale: list[tuple[str, str, dict]],
+    install_root: Path,
+    quiet: bool,
+    env_override: str,
+    input_fn=input,
+    output_fn=print,
+) -> dict[str, bool]:
+    """Drive the per-entry consent prompt and return a ``{name: accept}`` map.
+
+    Decision tree (mirrors the PR-33 spec):
+
+    * ``quiet=True`` and ``env_override != "all"`` → return all-False
+      (caller emits a clarifying deferral; no prompt possible).
+    * ``env_override == "all"`` → return all-True (CI fast-path).
+    * Otherwise → walk each entry once, accept ``y`` / ``yes``, default
+      reject on empty / ``n`` / ``no``; ``a`` / ``all`` short-circuits
+      remaining entries to True; ``s`` / ``skip-all`` short-circuits
+      to False.
+
+    Soft-fail: an EOF / KeyboardInterrupt on the prompt is treated as
+    skip-all so install does not crash mid-prompt.
+    """
+    # Fast-path: explicit env override for CI / scripted runs.
+    if env_override.lower() in ("all", "yes", "y", "true", "1"):
+        return {name: True for name, _, _ in stale}
+    # Quiet mode cannot prompt — caller handles the deferral.
+    if quiet:
+        return {name: False for name, _, _ in stale}
+
+    install_root_str = str(install_root.resolve())
+    output_fn("")
+    output_fn(
+        f"Found {len(stale)} ~/.claude.json mcpServers entr"
+        f"{'y' if len(stale) == 1 else 'ies'} "
+        "pointing outside this install_root:"
+    )
+    for name, stale_path, _entry in stale:
+        output_fn(f"  - {name}: {stale_path}")
+    output_fn("")
+    output_fn(
+        "These were registered by a different orchestrator install. "
+        "Rewriting will point them at the CURRENT install:"
+    )
+    output_fn(f"  {install_root_str}")
+    output_fn(
+        "Existing config (env block, args extras) is preserved; only "
+        "path components change. Per-entry choices: "
+        "[y]es, [n]o (default), [a]ll, [s]kip-all"
+    )
+    output_fn("")
+
+    choices: dict[str, bool] = {}
+    blanket: Optional[bool] = None
+    for name, _stale_path, entry in stale:
+        if blanket is not None:
+            choices[name] = blanket
+            output_fn(f"  {name} → {'rewrite' if blanket else 'skip'} (from blanket choice)")
+            continue
+        # Secret-leak warning: highlight env keys that will be dropped.
+        env_block = entry.get("env", {}) if isinstance(entry.get("env"), dict) else {}
+        will_drop = [
+            k for k in env_block.keys()
+            if _is_secret_shaped_env_key(k) or k not in _ALLOWED_GLOBAL_ENV_KEYS
+        ]
+        if will_drop:
+            output_fn(
+                f"  WARNING: rewriting `{name}` will drop env keys: {will_drop}. "
+                "These are not in the global-JSON allowlist (secrets go to the "
+                "OS keychain via the launcher; per-project keys live in "
+                ".claude/settings.json env). Lost on rewrite."
+            )
+        try:
+            answer = input_fn(f"  {name} → rewrite? [y/N/a/s]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            # Treat any prompt-failure as skip-all (safest default).
+            output_fn("  (prompt interrupted — treating as skip-all)")
+            for n, _, _ in stale:
+                choices.setdefault(n, False)
+            return choices
+        if answer in ("a", "all"):
+            blanket = True
+            choices[name] = True
+        elif answer in ("s", "skip-all"):
+            blanket = False
+            choices[name] = False
+        elif answer in ("y", "yes"):
+            choices[name] = True
+        else:
+            # Empty / "n" / "no" / unrecognised → skip (safest default).
+            choices[name] = False
+    return choices
+
+
+def _rewrite_stale_mcp_entries(
+    install_root: Path,
+    deferral_report: "DeferralReport",
+    quiet: bool = False,
+    input_fn=input,
+    output_fn=print,
+) -> None:
+    """Consent-prompted rewrite of stale ``~/.claude.json mcpServers``
+    entries. PR-33 — ships in v0.2.12.
+
+    Workflow:
+
+    1. Scan via :func:`_scan_stale_mcp_entries`. No matches → no-op.
+    2. ``--quiet`` (or no TTY) with no ``VCT_REWRITE_STALE_MCPS=all``
+       env override → emit a ``stale_mcp_rewrite_quiet_skipped``
+       deferral and return without writing.
+    3. Otherwise prompt the user per-entry; collect accept/reject map.
+    4. If at least one entry is accepted, snapshot ``~/.claude.json`` to
+       ``~/.claude.json.bak-rewrite-<unix-ts>`` BEFORE calling the writer.
+       This is on top of the writer's own ``.bak``, giving a recoverable
+       two-level backup for a destructive operation.
+    5. Hand off to the same registration code path that fresh install
+       uses, which means the env allowlist + secret denylist apply
+       uniformly. Hand-edited secret keys in stale entries are dropped
+       on rewrite (the consent prompt has already warned the user).
+
+    Soft-fail throughout: a malformed JSON, missing venv, lock timeout,
+    etc. all surface as a warning + deferral; install completes.
+    """
+    claude_json = _user_home_for_install() / ".claude.json"
+    stale = _scan_stale_mcp_entries(install_root, claude_json)
+    if not stale:
+        return
+
+    env_override = os.environ.get("VCT_REWRITE_STALE_MCPS", "").strip()
+    # Detect non-TTY at the consent layer so test injections can stay
+    # explicit. Production: if stdin isn't a TTY and no env override,
+    # treat the same as --quiet.
+    effective_quiet = quiet or (env_override == "" and not sys.stdin.isatty())
+
+    if effective_quiet and env_override.lower() not in ("all", "yes", "y", "true", "1"):
+        # Cannot prompt — emit clarifying deferral and bail.
+        install_root_str = str(install_root.resolve())
+        detected_lines = [f"  - `{name}`: {path}" for name, path, _ in stale]
+        deferral_report.add_entry(
+            DeferralEntry(
+                condition_id="stale_mcp_rewrite_quiet_skipped",
+                title="Stale MCP entries detected but consent prompt bypassed by --quiet",
+                detected=(
+                    f"~/.claude.json contains stale MCP entries pointing outside "
+                    f"the current install_root ({install_root_str}):\n\n"
+                    + "\n".join(detected_lines)
+                    + "\n\n`--rewrite-stale-mcps` was set, but `--quiet` "
+                    "(or a non-TTY stdin) prevented the consent prompt from "
+                    "running. No rewrite was performed."
+                ),
+                why_deferred=(
+                    "Rewriting global MCP entries is destructive. PR-33 requires "
+                    "explicit per-entry consent OR an explicit env override; "
+                    "neither was satisfied."
+                ),
+                command_to_apply=(
+                    "# Re-run interactively (drops --quiet):\n"
+                    "python install.py --update --rewrite-stale-mcps\n"
+                    "# Or auto-accept for CI / scripted contexts:\n"
+                    "VCT_REWRITE_STALE_MCPS=all python install.py --update --rewrite-stale-mcps"
+                ),
+                severity="warning",
+                kg_node_refs=[
+                    ".claude/context/mcp-install-pipeline-audit-2026-05-16.md",
+                ],
+            )
+        )
+        return
+
+    consent_map = _consent_for_stale_entries(
+        stale, install_root, quiet=effective_quiet,
+        env_override=env_override, input_fn=input_fn, output_fn=output_fn,
+    )
+    accepted = [name for name, ok in consent_map.items() if ok]
+    rejected = [name for name, ok in consent_map.items() if not ok]
+
+    if not accepted:
+        # User declined every prompt — emit an informational deferral so
+        # the explicit "I said no" decision is recorded for future runs.
+        install_root_str = str(install_root.resolve())
+        detected_lines = [f"  - `{name}`: {path}" for name, path, _ in stale]
+        deferral_report.add_entry(
+            DeferralEntry(
+                condition_id="stale_mcp_rewrite_declined",
+                title="Stale MCP rewrite declined by user",
+                detected=(
+                    "User declined to rewrite the following stale entries:\n\n"
+                    + "\n".join(detected_lines)
+                ),
+                why_deferred=(
+                    "PR-33 consent prompt was offered for each entry; "
+                    "every entry was rejected. No rewrite performed."
+                ),
+                command_to_apply=(
+                    "# To re-prompt and accept some/all entries:\n"
+                    "python install.py --update --rewrite-stale-mcps"
+                ),
+                severity="info",
+                kg_node_refs=[
+                    ".claude/context/mcp-install-pipeline-audit-2026-05-16.md",
+                ],
+            )
+        )
+        return
+
+    # Two-level backup BEFORE the writer touches the file. The writer
+    # produces its own .bak; this adds a unique timestamped snapshot so
+    # an unfortunate test order or repeat run doesn't clobber the
+    # pre-rewrite state.
+    if claude_json.is_file():
+        ts = int(time.time())
+        bak_rewrite = claude_json.with_name(claude_json.name + f".bak-rewrite-{ts}")
+        try:
+            shutil.copy2(claude_json, bak_rewrite)
+            output_fn(f"  Snapshot saved: {bak_rewrite}")
+        except OSError as exc:
+            # Soft-fail: log + continue. The writer's own .bak still gives
+            # us one level of recovery.
+            output_fn(f"  (couldn't write {bak_rewrite}: {exc}; relying on writer's .bak)")
+            _log_install_event(
+                "rewrite_stale_mcps", "warn",
+                f"backup copy failed: {exc}",
+            )
+
+    # Hand off to the same writer the fresh install uses. We call
+    # `_register_mcps` directly — it will overwrite ONLY the bundled
+    # entries (weaviate-kg, search). Stale entries with those exact
+    # names get overwritten by definition; non-bundled stale entries
+    # (e.g. a hand-added MCP at an old install path) are NOT in the
+    # bundled set and therefore NOT touched. We surface that asymmetry
+    # in the report.
+    bundled_names = {"weaviate-kg", "search"}
+    non_bundled_accepted = [n for n in accepted if n not in bundled_names]
+    bundled_accepted = [n for n in accepted if n in bundled_names]
+
+    # Re-run the registrar to refresh bundled entries at the new path.
+    # Soft-fail: any exception inside _register_mcps already adds its
+    # own deferral; we surface the rewrite outcome separately.
+    if bundled_accepted:
+        try:
+            _register_mcps(install_root, deferral_report)
+        except Exception as exc:  # noqa: BLE001 — soft-fail by design
+            output_fn(f"  Rewrite via _register_mcps raised: {exc} (install continues)")
+            _log_install_event(
+                "rewrite_stale_mcps", "error",
+                f"_register_mcps unexpected exception: {exc}",
+            )
+
+    # Summary deferral: which entries we touched, which we left alone.
+    summary_lines = []
+    if bundled_accepted:
+        summary_lines.append(
+            f"Rewritten (bundled): {', '.join(bundled_accepted)}"
+        )
+    if non_bundled_accepted:
+        summary_lines.append(
+            "Accepted but NOT rewritten (entry name is outside the bundled "
+            f"set — orchestrator owns weaviate-kg/search only): "
+            f"{', '.join(non_bundled_accepted)}. "
+            "Edit ~/.claude.json manually if you want these repointed."
+        )
+    if rejected:
+        summary_lines.append(f"Skipped (user said no): {', '.join(rejected)}")
+    deferral_report.add_entry(
+        DeferralEntry(
+            condition_id="stale_mcp_rewrite_summary",
+            title="PR-33 stale MCP rewrite summary",
+            detected="\n".join(summary_lines) or "(no entries processed)",
+            why_deferred=(
+                "Informational. The actual rewrite (if any) went through "
+                "the standard register_default_orchestrator_mcps writer, "
+                "with the env-key allowlist + secret denylist applied."
+            ),
+            command_to_apply=(
+                "# Two-level backup created: ~/.claude.json.bak-rewrite-<ts>\n"
+                "# (plus the writer's own ~/.claude.json.bak)\n"
+                "# Inspect: cat ~/.claude.json.bak-rewrite-*\n"
+                "# Revert:  cp ~/.claude.json.bak-rewrite-<ts> ~/.claude.json"
+            ),
+            severity="info",
             kg_node_refs=[
                 ".claude/context/mcp-install-pipeline-audit-2026-05-16.md",
             ],

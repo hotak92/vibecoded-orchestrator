@@ -519,6 +519,203 @@ pub fn register_default_orchestrator_mcps(
     Ok(report)
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// PR-33 (v0.2.12, 2026-05-16): consent-prompted rewrite of stale entries
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Detection (PR-23) is unconditional on --update. Rewrite (PR-33) is
+// behind an explicit --rewrite-stale-mcps flag on install.py AND
+// requires per-entry consent on the Python side (the launcher binary's
+// `--register-default-mcps --rewrite` subcommand is invoked AFTER the
+// Python side has gathered consent; the Rust function below does not
+// re-prompt). Two-level backup is the Python side's responsibility.
+//
+// Stale-entry detection here uses the same anchor as the install.py
+// mirror (`_scan_stale_mcp_entries`): only flag paths that look like
+// vco install layouts (claude_mcp_servers/ or .venv/ tokens). User-added
+// MCPs at /usr/bin/foo are not classified as orchestrator-stale.
+
+/// One entry the scan classified as stale.
+#[derive(Debug, Clone)]
+pub struct StaleMcpEntry {
+    pub name: String,
+    pub stale_path: String,
+    /// Env keys on the existing entry that will NOT survive a rewrite
+    /// (because they fail the global-JSON allowlist or match the
+    /// secret-shape denylist). Surfaced for observability; the consent
+    /// prompt on the Python side warns the user about these.
+    pub dropping_env_keys: Vec<String>,
+}
+
+/// Aggregate report from `rewrite_stale_orchestrator_mcps`.
+#[derive(Debug, Clone, Default)]
+pub struct RewriteReport {
+    pub claude_json_path: PathBuf,
+    pub stale_entries_found: Vec<StaleMcpEntry>,
+    pub rewritten: Vec<String>,
+    pub skipped_non_bundled: Vec<String>,
+    /// Underlying RegistrationReport from the actual writer (when we
+    /// invoked it). None when the scan found no stale entries OR when
+    /// the caller didn't accept any.
+    pub registration: Option<RegistrationReport>,
+}
+
+/// Scan `~/.claude.json` (or `claude_json_override`) for `mcpServers`
+/// entries whose `command` or `args[0]` points at a vco-install-shaped
+/// path OUTSIDE `install_root`. Returns the list of `StaleMcpEntry`,
+/// each annotated with the env keys that would be dropped on rewrite.
+///
+/// Pure read; never mutates the file.
+pub fn scan_stale_mcp_entries(
+    install_root: &Path,
+    claude_json_override: Option<&Path>,
+) -> Vec<StaleMcpEntry> {
+    let claude_json = claude_json_override
+        .map(PathBuf::from)
+        .unwrap_or_else(user_claude_json);
+    if !claude_json.is_file() {
+        return Vec::new();
+    }
+    let raw = match fs::read_to_string(&claude_json) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let data: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let mcp_servers = match data.get("mcpServers").and_then(|v| v.as_object()) {
+        Some(m) => m,
+        None => return Vec::new(),
+    };
+
+    let install_root_str = match fs::canonicalize(install_root) {
+        Ok(p) => p.display().to_string(),
+        Err(_) => install_root.display().to_string(),
+    };
+
+    let mut stale = Vec::new();
+    for (name, entry) in mcp_servers.iter() {
+        let entry_obj = match entry.as_object() {
+            Some(o) => o,
+            None => continue,
+        };
+        let cmd = entry_obj
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let first_arg = entry_obj
+            .get("args")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        for candidate in [cmd, first_arg].iter() {
+            if candidate.is_empty() {
+                continue;
+            }
+            // Absolute-path heuristic (cross-OS).
+            let is_abs = candidate.starts_with('/')
+                || candidate.starts_with("C:\\")
+                || candidate.starts_with("c:\\")
+                || candidate.starts_with("\\\\");
+            if !is_abs {
+                continue;
+            }
+            // Anchor on vco install tokens.
+            if !candidate.contains("claude_mcp_servers") && !candidate.contains(".venv") {
+                continue;
+            }
+            if !candidate.starts_with(&install_root_str) {
+                // Compute env keys that would be dropped on rewrite.
+                let mut dropping = Vec::new();
+                if let Some(env) = entry_obj.get("env").and_then(|v| v.as_object()) {
+                    for k in env.keys() {
+                        if is_secret_shaped_env_key(k)
+                            || !ALLOWED_ENV_KEYS.iter().any(|a| *a == k.as_str())
+                        {
+                            dropping.push(k.clone());
+                        }
+                    }
+                }
+                stale.push(StaleMcpEntry {
+                    name: name.clone(),
+                    stale_path: (*candidate).to_string(),
+                    dropping_env_keys: dropping,
+                });
+                break;
+            }
+        }
+    }
+    stale
+}
+
+/// Consent-prompted rewrite path. Caller (the Python install.py side
+/// OR a launcher CLI subcommand) is responsible for gathering per-entry
+/// consent BEFORE invoking this function; we do not prompt in Rust.
+///
+/// When `accept_names` is empty, this function is effectively a scan +
+/// report — no writes happen. When non-empty, the named entries are
+/// rewritten via `register_default_orchestrator_mcps`, which means the
+/// env-key allowlist + secret-shaped-key denylist are applied uniformly
+/// (stale env values like a hand-edited GITHUB_TOKEN are dropped).
+///
+/// Soft-fail: a missing venv-python returns Err — the caller (install.py)
+/// downgrades that to a warning and emits a deferral, just like the
+/// fresh-install path.
+pub fn rewrite_stale_orchestrator_mcps(
+    install_root: &Path,
+    ports: ServicePorts,
+    claude_json_override: Option<&Path>,
+    db: Option<&crate::db::Db>,
+    accept_names: &[String],
+) -> Result<RewriteReport, String> {
+    let claude_json = claude_json_override
+        .map(PathBuf::from)
+        .unwrap_or_else(user_claude_json);
+    let stale = scan_stale_mcp_entries(install_root, Some(&claude_json));
+    let mut report = RewriteReport {
+        claude_json_path: claude_json.clone(),
+        stale_entries_found: stale.clone(),
+        rewritten: Vec::new(),
+        skipped_non_bundled: Vec::new(),
+        registration: None,
+    };
+    if stale.is_empty() {
+        return Ok(report);
+    }
+    if accept_names.is_empty() {
+        // Scan-only call (no consent gathered yet).
+        return Ok(report);
+    }
+
+    // Partition accepted names into bundled (writer can touch) and
+    // non-bundled (writer leaves alone). The bundled set must stay in
+    // sync with `build_default_mcp_entries` — currently weaviate-kg
+    // and search.
+    let bundled = ["weaviate-kg", "search"];
+    let mut accept_bundled = false;
+    for name in accept_names {
+        if bundled.iter().any(|b| *b == name.as_str()) {
+            accept_bundled = true;
+            report.rewritten.push(name.clone());
+        } else {
+            report.skipped_non_bundled.push(name.clone());
+        }
+    }
+
+    if accept_bundled {
+        let reg = register_default_orchestrator_mcps(
+            install_root,
+            ports,
+            Some(&claude_json),
+            db,
+        )?;
+        report.registration = Some(reg);
+    }
+    Ok(report)
+}
+
 /// Look up the project_id whose folder_path matches `target` (canonical
 /// path comparison after `canonicalize`). Returns None when no project
 /// is registered yet — which is the common case at fresh-install time.
