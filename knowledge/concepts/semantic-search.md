@@ -3,7 +3,7 @@ title: Semantic Search
 type: concept
 tags: [AI, search, embeddings, vector-database, retrieval, NLP, information-retrieval]
 created: 2026-02-26T00:00:00Z
-updated: 2026-04-05T14:33:52Z
+updated: 2026-05-16T03:52:54Z
 status: active
 ---
 
@@ -163,5 +163,5 @@ model.fit(train_objectives=[(train_dataloader, train_loss)], epochs=1)
 [[relatedTo::GraphRAG Pattern]]
 [[relatedTo::RAG Pipeline]]
 [[relatedTo::Knowledge Graph]]
-[[relatedTo::Ollama MCP Server]]
+[[relatedTo::Ollama Infrastructure for Embeddings]]
 [[relatedTo::Embedding Token Filtering Three Layer Pattern]]

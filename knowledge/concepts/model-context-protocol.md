@@ -3,7 +3,7 @@ title: Model Context Protocol
 type: concept
 tags: [MCP, AI, protocol, tools, integration, Anthropic, agentic]
 created: 2026-02-26T00:00:00Z
-updated: 2026-04-05T14:33:35Z
+updated: 2026-05-16T03:52:59Z
 status: active
 ---
 
@@ -126,5 +126,5 @@ if __name__ == "__main__":
 [[relatedTo::MCP Multi-Project Configuration for VS Code]]
 [[relatedTo::MCP Request Context Security Pattern]]
 [[relatedTo::FastMCP Server Pattern]]
-[[relatedTo::Ollama MCP Server]]
+[[relatedTo::Ollama Infrastructure for Embeddings]]
 [[relatedTo::Weaviate MCP Server]]

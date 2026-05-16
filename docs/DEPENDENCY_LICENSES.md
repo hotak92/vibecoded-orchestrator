@@ -47,7 +47,6 @@ Users install these via their container runtime; we don't redistribute binaries.
 |---|---|---|
 | Weaviate | BSD-3-Clause | User runs container from official image |
 | Ollama | MIT | User runs container from official image |
-| SearXNG (optional) | AGPL-3.0 | Same license family as us; user runs container |
 | Podman | Apache-2.0 | Installed by user |
 | Docker Engine | Apache-2.0 | Installed by user |
 | Docker Desktop | Proprietary (Docker Inc.) | User chooses; we recommend Podman on Linux for no-commercial-license path |

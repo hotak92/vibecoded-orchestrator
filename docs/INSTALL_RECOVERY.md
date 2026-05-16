@@ -327,9 +327,8 @@ have access to all of it**:
 
 - `hybrid_search` MCP for "tauri build webkit2gtk linux 2026" type
   questions (the bundled KG has hardware/Linux-distro hints)
-- `chat` MCP (Ollama, free) for quick error analysis without burning
-  Claude API tokens
-- `read_document` MCP for parsing the install log if it's large
+- your own reasoning for quick error analysis (the Ollama MCP was removed in v0.2.11; Claude's built-in reasoning handles this directly)
+- `Read` tool with `offset`/`limit` for parsing the install log if it's large
 - `query_code_structure` MCP if you need to understand what file
   references the failing build artifact
 

@@ -1,6 +1,8 @@
 # MCP Servers & Infrastructure Scripts
 
-Five MCP servers ship with VCO: semantic search (Weaviate-KG), free local inference (Ollama), web search, GPU-accelerated code embeddings, and Playwright (browser automation, registered automatically and pre-cached at install time via npx). The first four run as Python processes from `claude_mcp_servers/.venv`; Playwright runs from `npx -y @playwright/mcp@latest`. Source for the Python MCPs in `claude_mcp_servers/`; Playwright install logic in `install.py::_install_playwright_browsers`.
+As of v0.2.11, three MCP servers ship with VCO: semantic search (Weaviate-KG), academic paper search, and Playwright (browser automation). The Python MCPs run from `claude_mcp_servers/.venv`; Playwright runs from `npx -y @playwright/mcp@latest`. Source for the Python MCPs in `claude_mcp_servers/`; Playwright install logic in `install.py::_install_playwright_browsers`.
+
+**Removed in v0.2.11**: the Ollama MCP (`chat`, `read_document`, `read_image`) was removed as redundant. Claude's native reasoning, `Read` tool, and built-in vision serve those use cases at higher quality. The Search MCP was narrowed to `search_papers` only — `web_search`, `search_code`, and `fetch_page` were removed since Claude's built-in WebFetch covers ad-hoc web retrieval, and GitHub code search is rarely needed in the daily Claude Code workflow. SearXNG was removed from the default container stack. See `knowledge/concepts/mcp-simplification-v0211.md`.
 
 For agents, skills, and hooks built on top of these MCPs → see [03-agents-skills-hooks.md](03-agents-skills-hooks.md). For the knowledge graph and code graph data layer → see [04-knowledge-and-code-graph.md](04-knowledge-and-code-graph.md).
 
@@ -103,68 +105,30 @@ When `RL_SERVER_URL` is reachable, KG search results pass through a reinforcemen
 
 ---
 
-## MCP: Ollama (`claude_mcp_servers/ollama_mcp/server.py`)
+## MCP: Ollama — Removed in v0.2.11
 
-Local inference and embeddings via Ollama. Everything runs on-device, so the bill for trivial generations (docstring rewrites, classification, summary extraction) is zero. Three tools.
+The Ollama MCP (`chat`, `read_document`, `read_image`) was present through v0.2.10 and removed in v0.2.11. Rationale: the three tools were redundant with Claude's built-in capabilities — Claude's own reasoning outperforms a small local model for analysis and rewriting tasks, the native `Read` tool with `offset`/`limit` replaces `read_document` for large-file extraction, and Claude's built-in vision (pass an image path to `Read`) replaces `read_image`. For OAuth-subscription users the "FREE" framing was also misleading (tokens are included in the subscription). Ollama continues running as infrastructure: it serves `qwen3-embedding:0.6b` for Weaviate text embeddings and acts as a fallback backend for the code-embedding service. KG-summary generation (`generate-kg-summary.py`) can still target Ollama directly when the Claude CLI is unavailable.
 
-### `chat`
-Run inference against any Ollama model. Default model: `qwen3.5:0.8b` (small + fast for trivial generations). Override to `qwen3.5:9b` for vision and bigger reasoning, or `gemma4:e4b` for summarization on 12-24 GB-RAM hosts.
-
-<details>
-<summary>Details</summary>
-
-Params: `prompt`, `model` (default `qwen3.5:0.8b`), `system_prompt`, `temperature` (default 0.7), `max_tokens` (default 500). Returns response plus metrics (total_duration_ms, output_tokens, tokens_per_sec). Use for: quick analysis, rewrites, docstring improvements, classification — any task where you'd otherwise burn Claude API tokens on a trivial generation. Bigger workloads can pin `qwen3.5:9b` (vision + larger reasoning) or `gemma4:e4b` (low-VRAM summarization).
-
-Models documented in the Ollama MCP requirement table include `qwen3.5:0.8b` (default), `qwen3.5:9b`, `gemma4:e4b`, `gemma3:4b`. Hardware-gated selection in `claude_mcp_servers/ollama_mcp/server.py::TEXT_MODEL_TIERS`. All models run locally (no API cost).
-
-</details>
-
-### `read_document`
-Summarize or extract information from a file using a local Ollama model. Handles large files via automatic chunked scanning.
-
-<details>
-<summary>Details</summary>
-
-Params: `file_path` (absolute), `model` (default per Ollama MCP — see `read_document` signature in `ollama_mcp/server.py`), `task` (`"summarize"`, `"extract_key_points"`, `"analyze_structure"`, or freeform instruction), `context_lines` (chunk size for large files, default 50).
-
-Files ≤ ~100k chars: processed whole. Larger files: chunked scanning mode activates automatically. All models free, local.
-
-</details>
-
-### `read_image`
-Load an image file and return base64 + optional local description via a vision-capable Ollama model. Useful for local analysis of screenshots before passing them to Claude.
+If you need local-LLM inference for a specific use case (e.g., privacy-sensitive processing, offline workflows), Ollama is still running at `http://localhost:11435` — interact with it via the standard Ollama REST API or a custom MCP adapter outside of VCO's default stack.
 
 ---
 
 ## MCP: Search (`claude_mcp_servers/search_mcp/server.py`)
 
-Web, code, and academic paper search. SearXNG runs in the local container stack; OpenAlex and arXiv are public APIs; GitHub code search uses the user's PAT. No paid search APIs. Four tools.
+As of v0.2.11, the Search MCP exposes a single tool: `search_papers`. The tools `web_search`, `fetch_page`, and `search_code` were removed — `web_search` and `fetch_page` are redundant with Claude's built-in WebFetch, and GitHub code search was rarely used in practice compared to the semantic `search_code_graph` tool. SearXNG was removed from the default container stack.
 
-### `web_search`
-Search the web via SearXNG (self-hosted, privacy-respecting). Aggregates Google, Bing, DuckDuckGo, Wikipedia.
-
-Params: `query`, `num_results` (1-20, default 10). Rate-limited to 1 req/s. Returns `{query, total, results: [{title, url, content, engine, score}]}`.
-
-### `fetch_page`
-Fetch and return the full text content of any URL. Strips HTML. Used after `web_search` to read specific pages; caches results within a session.
-
-### `search_code`
-Search GitHub code via the REST Search API. Supports GitHub qualifier syntax (`class:Foo`, `extension:py`, `filename:config`).
-
-<details>
-<summary>Details</summary>
-
-Params: `query`, `language` (optional), `repo` (optional `owner/repo` filter), `limit` (1-30, default 10). Rate-limited to 0.5 req/s. Requires `GITHUB_TOKEN` env var (30 req/min with PAT vs 10 without). The search MCP is launched via `claude_mcp_servers/search_mcp/wrapper.sh`. As of v0.1.7 the wrapper resolves `GITHUB_TOKEN` in two stages: (1) env-first — `$GITHUB_TOKEN` already exported by the launcher's per-project env-file writer; (2) resolver helper — `vct_secrets_resolve.sh` reads from the launcher's hub HTTP API at `GET /api/v1/projects/{id}/env?key=github_pat`, which fetches the keychain entry. The legacy `~/.vct-secrets/shared/github_pat` file fallback was removed in the 0.1.7 fork-readiness sweep. Either way the token never appears in `~/.claude.json`.
-
-</details>
+The `search_papers` tool retains clear value because OpenAlex and arXiv are structured APIs that return citation-rich, date-filtered, deduplicated academic metadata that ad-hoc web search cannot replicate.
 
 ### `search_papers`
-Search academic papers via OpenAlex (240M works, CC0) or arXiv (CS/ML preprints).
+Search academic papers via OpenAlex (240M works, CC0) or arXiv (CS/ML preprints). Returns structured metadata: title, authors, DOI, abstract excerpt, citation count, publication year.
 
-Params: `query`, `limit` (1-25, default 10), `source` (`"openalex"` default | `"arxiv"`), `year_from`. Set `OPENALEX_EMAIL` env var for polite-pool priority on OpenAlex API.
+Params: `query`, `limit` (1-25, default 10), `source` (`"openalex"` default | `"arxiv"`), `year_from`. Set `OPENALEX_EMAIL` env var for polite-pool priority on OpenAlex API. Calls the structured OpenAlex and arXiv HTTP APIs directly — no local search proxy required.
 
-### SearXNG Container (`claude_mcp_servers/searxng/`)
-Self-hosted SearXNG instance configured in `compose.yaml`. Provides the backend for `web_search`. No external search API keys required.
+**Removed in v0.2.11 (v0.2.10 and earlier)**:
+- `web_search` — routed through a local SearXNG instance; superseded by Claude's built-in WebFetch.
+- `fetch_page` — fetched and stripped arbitrary URLs; superseded by Claude's built-in WebFetch.
+- `search_code` — GitHub code search via REST API; rarely used; `search_code_graph` covers in-project code search semantically.
+- **SearXNG container** — the local SearXNG instance that backed `web_search` was removed from `compose.yaml`.
 
 ---
 
