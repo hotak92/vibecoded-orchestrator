@@ -495,13 +495,21 @@ jobs:
           # Note: Linux/macOS use `zip -9 -X --symlinks`; Compress-Archive
           # has no equivalent flags but produces a compatible .zip
           # readable by every platform's archive manager.
+          #
+          # Pass the STAGE DIRECTORY itself (not "$stage\*") so the zip
+          # mirrors Linux/macOS layout: contents nested at
+          # `<archive_base>/...` rather than flat at the zip root.
+          # This was inconsistent through v0.2.13 (Windows zip was flat,
+          # other OSes were nested); fixed in v0.2.14 so end-users get
+          # the same `unzip -j <zip> "<archive_base>/<file>"` extraction
+          # pattern on every OS.
           $stage = Join-Path "dist" $env:ARCHIVE_BASE
           $out   = Join-Path "dist" $env:ARCHIVE_NAME
           if (-not (Test-Path $stage)) {
               Write-Error "Staging dir not found: $stage"
               exit 1
           }
-          Compress-Archive -Path "$stage\*" `
+          Compress-Archive -Path $stage `
                            -DestinationPath $out `
                            -CompressionLevel Optimal `
                            -Force
