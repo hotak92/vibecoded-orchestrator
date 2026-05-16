@@ -105,6 +105,16 @@ state/
 # Per-machine orchestrator install artifacts — populated by install.py, NEVER commit
 .claude/agents/
 .claude/skills/
+# PR-39 (v0.2.12, 2026-05-16): the orchestrator-self's runtime .claude/{hooks,
+# scripts,settings.json} are NOT shipped in the public repo. They are rendered
+# from templates/ at install time by install.py::_materialize_orchestrator_self_claude_dir().
+# Rationale: anything that is or will be generated from a template at install
+# time should NOT ship in the public repo — only ship the template itself.
+# The pre-PR-39 duplication was: 50 byte-identical hook files + 36 scripts +
+# a bash-flavored Linux-only settings.json that broke on Windows installs.
+.claude/hooks/
+.claude/scripts/
+.claude/settings.json
 CLAUDE.local.md
 
 # Internal dev artifacts — must not be tracked in the public repo. The

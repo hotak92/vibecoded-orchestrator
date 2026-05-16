@@ -25,8 +25,11 @@ Hard constraints honored:
     network-attached Weaviate + RL server). Tests are static body-parity
     assertions, mirroring the .ps1-side test discipline in
     test_hook_ps1_body_parity.py.
-  - Drift gate is enforced separately (.github/scripts/check_template_drift.py)
-    so templates/ and .claude/ stay byte-identical.
+  - PR-39 (v0.2.12, 2026-05-16) removed the .claude/ ↔ templates/ duplication
+    that the former check_template_drift.py gate enforced. templates/hooks/ is
+    now the single source of truth; install.py renders .claude/hooks/ from it
+    at install time. The cross-mirror parity test at the end of this file was
+    deleted alongside the gate.
 """
 from __future__ import annotations
 
@@ -34,12 +37,16 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TEMPLATES_HOOKS = REPO_ROOT / "templates" / "hooks"
-CLAUDE_HOOKS = REPO_ROOT / ".claude" / "hooks"
 
 
 def _read(name: str, suffix: str, src: str = "templates") -> str:
-    base = TEMPLATES_HOOKS if src == "templates" else CLAUDE_HOOKS
-    return (base / f"{name}{suffix}").read_text(encoding="utf-8")
+    # PR-39: src parameter retained for API stability; "claude" is no longer
+    # a meaningful source (templates is the only source of truth).
+    if src != "templates":
+        raise ValueError(
+            f"unsupported src={src!r}; only 'templates' is valid post-PR-39"
+        )
+    return (TEMPLATES_HOOKS / f"{name}{suffix}").read_text(encoding="utf-8")
 
 
 # --------------------------------------------------------------------------
@@ -266,21 +273,11 @@ def test_pre_edit_sh_cache_write_is_soft_fail() -> None:
 
 
 # --------------------------------------------------------------------------
-# Cross-mirror parity: templates/ == .claude/ byte-identical
+# Cross-mirror parity: REMOVED in PR-39 (v0.2.12, 2026-05-16).
+#
+# Before PR-39, .claude/hooks/ was a byte-identical mirror of templates/hooks/
+# shipped in the public repo. check_template_drift.py enforced parity in CI,
+# and this section sanity-checked that gate locally. PR-39 deleted the
+# duplicate: install.py now renders .claude/ from templates/ at install time,
+# templates is the only source, and there's nothing to drift FROM.
 # --------------------------------------------------------------------------
-
-
-def test_pre_edit_sh_templates_matches_claude_mirror() -> None:
-    """Drift gate sanity: templates/hooks/pre-edit-context-inject.sh and
-    .claude/hooks/pre-edit-context-inject.sh must be byte-identical.
-    Defended in CI by .github/scripts/check_template_drift.py but
-    re-asserted here so a developer test run catches drift before push.
-    """
-    templates_body = _read("pre-edit-context-inject", ".sh", src="templates")
-    claude_body = _read("pre-edit-context-inject", ".sh", src="claude")
-    assert templates_body == claude_body, (
-        "pre-edit-context-inject.sh DRIFT: templates/hooks/ and "
-        ".claude/hooks/ copies are not byte-identical. Run "
-        "`cp templates/hooks/pre-edit-context-inject.sh "
-        ".claude/hooks/pre-edit-context-inject.sh` to resync."
-    )

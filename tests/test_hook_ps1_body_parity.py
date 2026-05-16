@@ -25,12 +25,17 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TEMPLATES_HOOKS = REPO_ROOT / "templates" / "hooks"
-CLAUDE_HOOKS = REPO_ROOT / ".claude" / "hooks"
 
 
 def _read(name: str, suffix: str, src: str = "templates") -> str:
-    base = TEMPLATES_HOOKS if src == "templates" else CLAUDE_HOOKS
-    return (base / f"{name}{suffix}").read_text(encoding="utf-8")
+    # PR-39 (v0.2.12, 2026-05-16): src param retained for API stability;
+    # only "templates" is meaningful now. The .claude/ mirror was deleted —
+    # install.py renders it from templates/ at install time.
+    if src != "templates":
+        raise ValueError(
+            f"unsupported src={src!r}; only 'templates' is valid post-PR-39"
+        )
+    return (TEMPLATES_HOOKS / f"{name}{suffix}").read_text(encoding="utf-8")
 
 
 # --------------------------------------------------------------------------
@@ -294,23 +299,8 @@ def test_pre_vercel_token_guard_ps1_scrubs_secrets() -> None:
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "name",
-    [
-        "kg-update-nudge",
-        "pre-edit-context-inject",
-        "check-no-fork-bomb",
-        "pre-vercel-token-guard",
-    ],
-)
-def test_ps1_template_and_claude_mirror_are_identical(name: str) -> None:
-    """The template-drift gate enforces this globally, but a targeted
-    test gives a clear failure message naming which file drifted.
-    """
-    template = _read(name, ".ps1", src="templates")
-    mirror = _read(name, ".ps1", src="claude")
-    assert template == mirror, (
-        f"Drift between templates/hooks/{name}.ps1 and "
-        f".claude/hooks/{name}.ps1 — they must be byte-identical. "
-        f"Run: cp templates/hooks/{name}.ps1 .claude/hooks/{name}.ps1"
-    )
+# PR-39 (v0.2.12, 2026-05-16): the former
+# `test_ps1_template_and_claude_mirror_are_identical` parametric test was
+# removed alongside the .claude/hooks/ duplicate. There's nothing to drift
+# FROM — templates is the single source of truth, install.py renders
+# .claude/ from it at install time.

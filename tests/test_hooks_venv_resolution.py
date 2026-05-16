@@ -28,10 +28,14 @@ source text and that each hook tolerates the "no venv anywhere" case
 without exiting non-zero (soft-fail contract — hooks must NOT block the
 host Edit tool just because the venv is missing).
 
-We test against the shipped source files (templates/hooks + .claude/hooks).
-End-to-end execution is hard to exercise in unit tests because the hooks
-read JSON from stdin and call sub-scripts; the parity/source assertions
-are the load-bearing contracts.
+We test against the shipped source files in ``templates/hooks/``.
+
+Note (PR-39, v0.2.12, 2026-05-16): before PR-39 the public repo also
+shipped ``.claude/hooks/`` byte-identical with ``templates/hooks/`` —
+the second entry in ``LAYOUT_DIRS`` covered that mirror. PR-39 deleted
+the duplicate; install.py now renders ``.claude/hooks/`` from
+``templates/hooks/`` at install time. Templates are the sole source of
+truth, so this test now exercises only the template layout.
 """
 from __future__ import annotations
 
@@ -52,7 +56,7 @@ HOOKS_UNDER_TEST = [
     "pre-edit-context-inject",
 ]
 
-LAYOUT_DIRS = ["templates/hooks", ".claude/hooks"]
+LAYOUT_DIRS = ["templates/hooks"]
 
 
 class HookHasDualLayoutResolutionSh(unittest.TestCase):
@@ -256,15 +260,20 @@ class NoVenvPresentSoftFailContract(unittest.TestCase):
             hooks_dest = project / ".claude" / "hooks"
             hooks_dest.mkdir(parents=True)
             # Copy _lib subdir (the hooks `source` files from there).
-            src_lib = REPO_ROOT / ".claude" / "hooks" / "_lib"
+            # PR-39 (v0.2.12): templates/ is the single source of truth.
+            # Before PR-39 this read from .claude/hooks/_lib (byte-identical
+            # mirror); the duplicate was removed when install.py started
+            # rendering .claude/ from templates/ at install time.
+            src_lib = REPO_ROOT / "templates" / "hooks" / "_lib"
             if src_lib.exists():
                 shutil.copytree(src_lib, hooks_dest / "_lib")
             # Copy the hook under test.
             src_hook = REPO_ROOT / hook_relpath
             shutil.copy2(src_hook, hooks_dest / src_hook.name)
             # Also copy any sibling helper scripts the hook references
-            # (detect-project.sh under .claude/scripts/).
-            src_scripts = REPO_ROOT / ".claude" / "scripts"
+            # (detect-project.sh under templates/scripts/, formerly
+            # mirrored at .claude/scripts/ before PR-39).
+            src_scripts = REPO_ROOT / "templates" / "scripts"
             scripts_dest = project / ".claude" / "scripts"
             scripts_dest.mkdir(parents=True, exist_ok=True)
             for helper in ("detect-project.sh",):
@@ -291,7 +300,7 @@ class NoVenvPresentSoftFailContract(unittest.TestCase):
             '"session_id":"t"}'
         )
         cp = self._run_hook_with_no_venv(
-            ".claude/hooks/kg-summary-generator.sh", payload
+            "templates/hooks/kg-summary-generator.sh", payload
         )
         self.assertEqual(
             cp.returncode, 0,
@@ -308,10 +317,14 @@ class NoVenvPresentSoftFailContract(unittest.TestCase):
             project = Path(tmpdir) / "fakeproj"
             hooks_dest = project / ".claude" / "hooks"
             hooks_dest.mkdir(parents=True)
-            src_lib = REPO_ROOT / ".claude" / "hooks" / "_lib"
+            # PR-39 (v0.2.12): templates/ is the single source of truth.
+            # Before PR-39 this read from .claude/hooks/_lib (byte-identical
+            # mirror); the duplicate was removed when install.py started
+            # rendering .claude/ from templates/ at install time.
+            src_lib = REPO_ROOT / "templates" / "hooks" / "_lib"
             if src_lib.exists():
                 shutil.copytree(src_lib, hooks_dest / "_lib")
-            src_hook = REPO_ROOT / ".claude/hooks/code-graph-incremental.sh"
+            src_hook = REPO_ROOT / "templates/hooks/code-graph-incremental.sh"
             shutil.copy2(src_hook, hooks_dest / src_hook.name)
             env = os.environ.copy()
             env.pop("VCT_VENV", None)
@@ -345,10 +358,14 @@ class VctVenvOverrideAcceptedWhenSet(unittest.TestCase):
             project = Path(tmpdir) / "fakeproj"
             hooks_dest = project / ".claude" / "hooks"
             hooks_dest.mkdir(parents=True)
-            src_lib = REPO_ROOT / ".claude" / "hooks" / "_lib"
+            # PR-39 (v0.2.12): templates/ is the single source of truth.
+            # Before PR-39 this read from .claude/hooks/_lib (byte-identical
+            # mirror); the duplicate was removed when install.py started
+            # rendering .claude/ from templates/ at install time.
+            src_lib = REPO_ROOT / "templates" / "hooks" / "_lib"
             if src_lib.exists():
                 shutil.copytree(src_lib, hooks_dest / "_lib")
-            src_hook = REPO_ROOT / ".claude/hooks/kg-summary-generator.sh"
+            src_hook = REPO_ROOT / "templates/hooks/kg-summary-generator.sh"
             shutil.copy2(src_hook, hooks_dest / src_hook.name)
 
             # Build a fake VCT_VENV with `bin/python` symlinked to the
