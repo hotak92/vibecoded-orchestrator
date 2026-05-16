@@ -172,11 +172,47 @@ class WeaviateWrapper:
 WeaviateMCPServer = WeaviateWrapper
 
 
+def _content_signature_excluding_updated(content: str) -> str:
+    """Return a SHA256 of the file content excluding the `updated:` line.
+
+    Used to detect whether a re-sync actually contains substantive changes
+    or just an unchanged file passing through the post-file-edit hook. If
+    the signature is unchanged, the `updated:` timestamp is not bumped —
+    avoiding KG-wide timestamp churn on every install run (v0.2.14).
+    """
+    if not content.strip().startswith('---'):
+        return _sha256_text(content)
+    parts = content.split('---', 2)
+    if len(parts) < 3:
+        return _sha256_text(content)
+    fm_text = parts[1]
+    body = parts[2]
+    # Strip the `updated:` line from the frontmatter for the signature.
+    fm_no_updated = re.sub(r'^updated:.*$\n?', '', fm_text, flags=re.MULTILINE)
+    return _sha256_text(fm_no_updated + body)
+
+
+def _sha256_text(s: str) -> str:
+    import hashlib
+    return hashlib.sha256(s.encode('utf-8')).hexdigest()
+
+
 def _update_frontmatter_timestamp(file_path: Path, content: str) -> str:
     """
-    Update the `updated:` field in YAML frontmatter to current UTC time.
+    Update the `updated:` field in YAML frontmatter to current UTC time
+    ONLY IF the file's content (excluding the `updated:` line itself) has
+    changed since the last sync.
+
     Writes the updated content back to the file and returns it.
-    Called automatically on every sync so the timestamp reflects actual edits.
+
+    Content-aware skip (v0.2.14, fix 3): the previous behavior touched
+    `updated:` on EVERY sync, even for re-sync passes where the file
+    bytes weren't actually changed. Result: every install.py --update
+    run produced 60+ KG-node-timestamp-only commits in the working
+    tree. Now we hash the (frontmatter-minus-updated + body) and
+    compare to the on-disk version of the same hash. If equal,
+    skip the write. The user's actual content edits via Edit/Write
+    tools always change the body and will pass through unchanged.
     """
     if not content.strip().startswith('---'):
         return content
@@ -184,6 +220,19 @@ def _update_frontmatter_timestamp(file_path: Path, content: str) -> str:
     parts = content.split('---', 2)
     if len(parts) < 3:
         return content
+
+    # Content-aware skip: if the file on disk has identical
+    # signature-excluding-updated, we are in a pass-through re-sync.
+    # Don't bump the timestamp.
+    try:
+        on_disk = file_path.read_text(encoding='utf-8')
+        if _content_signature_excluding_updated(on_disk) == _content_signature_excluding_updated(content):
+            return content
+    except (OSError, UnicodeDecodeError):
+        # If we can't read the file (race / permissions / encoding), fall
+        # through to the unconditional update — preserves prior behavior
+        # in edge cases.
+        pass
 
     now_iso = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
     fm_text = parts[1]
