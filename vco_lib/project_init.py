@@ -3142,6 +3142,519 @@ def _emit_bash_env_cleanup_deferral(
     report.write(folder)
 
 
+# ---------------------------------------------------------------------------
+# PR-10B (v0.2.11): legacy KG / code-graph collection detection on Add Project
+#
+# When a user adds a pre-existing project that has accumulated KG or code-graph
+# data under a DIFFERENT collection name (legacy naming, manual rename,
+# imported from another machine), the install-bundle step creates a fresh
+# empty canonical collection while the legacy data sits orphaned.
+#
+# These helpers DETECT such candidates conservatively (prefix-similarity to
+# THIS project only — never collections from other projects) and emit
+# deferral entries so Claude Code surfaces them on next session.  No
+# destructive action is taken without explicit user consent.
+# ---------------------------------------------------------------------------
+
+
+# KG-family suffixes considered for legacy detection.
+_KG_SUFFIXES = ("_KnowledgeGraph", "_Development")
+
+# Code-graph entity suffixes — regenerable from source.
+_CODEGRAPH_SUFFIXES = (
+    "_CodeFunction",
+    "_CodeModule",
+    "_CodeClass",
+    "_CodeAPI",
+    "_CodeInteraction",
+)
+
+
+def _levenshtein(a: str, b: str) -> int:
+    """Iterative Levenshtein distance.  Pure Python — no third-party
+    dependency.  Used only for short prefix-similarity scoring (project
+    basenames are typically <30 chars) so the O(n*m) cost is negligible.
+    """
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    # Two-row DP.
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        curr = [i] + [0] * len(b)
+        for j, cb in enumerate(b, 1):
+            cost = 0 if ca == cb else 1
+            curr[j] = min(
+                curr[j - 1] + 1,        # insertion
+                prev[j] + 1,            # deletion
+                prev[j - 1] + cost,     # substitution
+            )
+        prev = curr
+    return prev[-1]
+
+
+def _http_count_objects(class_name: str, weaviate_url: str) -> Optional[int]:
+    """Count objects in `class_name` via the Weaviate GraphQL Aggregate
+    endpoint.
+
+    Returns:
+        int   — object count when the request succeeds.
+        None  — Weaviate unreachable, malformed response, or class missing.
+                Caller treats `None` as "unknown" (not zero) — we don't want
+                to claim a legacy collection is empty when we couldn't reach
+                the server.
+
+    Soft-fails throughout: never raises into the caller.
+    """
+    base = (weaviate_url or _weaviate_url_default()).rstrip("/")
+    query = (
+        "{ Aggregate { "
+        f"{class_name} {{ meta {{ count }} }}"
+        " } }"
+    )
+    try:
+        status, body = _http_request(
+            "POST", f"{base}/v1/graphql", body={"query": query}, timeout=10.0,
+        )
+    except Exception:
+        return None
+    if status != 200:
+        return None
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except Exception:
+        return None
+    try:
+        agg = payload.get("data", {}).get("Aggregate", {}) or {}
+        rows = agg.get(class_name) or []
+        if not rows:
+            # Aggregate returns empty list for missing class.
+            return 0
+        meta = rows[0].get("meta") or {}
+        count = meta.get("count")
+        if isinstance(count, int):
+            return count
+    except Exception:
+        return None
+    return None
+
+
+def _embedding_dim_from_schema(class_def: dict) -> Optional[int]:
+    """Extract a representative embedding dimension from a fetched schema
+    dict, if discoverable from `vectorIndexConfig.dimensions` or similar.
+
+    Returns None when not knowable from the schema alone (the typical case
+    on Weaviate 1.28.x — dimensions are inferred at first ingest).  The
+    deferral message prefers a concrete number when available but renders
+    a "(dim unknown)" placeholder otherwise.
+    """
+    try:
+        # Multi-named-vector schema: look at the first slot's index config.
+        vec_cfg = class_def.get("vectorConfig") or {}
+        for _slot, slot_cfg in vec_cfg.items():
+            idx_cfg = (slot_cfg or {}).get("vectorIndexConfig") or {}
+            dim = idx_cfg.get("dimensions")
+            if isinstance(dim, int) and dim > 0:
+                return dim
+        # Legacy single-vector format.
+        idx_cfg = class_def.get("vectorIndexConfig") or {}
+        dim = idx_cfg.get("dimensions")
+        if isinstance(dim, int) and dim > 0:
+            return dim
+    except Exception:
+        return None
+    return None
+
+
+def _strip_known_suffix(class_name: str, suffixes: tuple) -> Optional[tuple]:
+    """If `class_name` ends with one of `suffixes`, return (prefix, suffix);
+    else None."""
+    for sfx in suffixes:
+        if class_name.endswith(sfx) and len(class_name) > len(sfx):
+            return (class_name[: -len(sfx)], sfx)
+    return None
+
+
+def _is_similar_prefix(
+    candidate_prefix: str,
+    canonical_prefix: str,
+    *,
+    levenshtein_threshold: int = 3,
+) -> bool:
+    """Conservative similarity heuristic between a legacy class's prefix
+    and THIS project's canonical (sanitized) prefix.
+
+    Match rules (any one is sufficient — case-insensitive throughout):
+      1. Exact match (after lowercasing).
+      2. One is a substring of the other.
+      3. Levenshtein distance ≤ `levenshtein_threshold` (default 3).
+
+    The substring rule catches the common "VCO" → "VCODev" case (project
+    renamed by appending "Dev"). The Levenshtein rule catches small typos
+    or capitalisation drift ("Artup" vs "ARTup", "Foo" vs "FoO").
+
+    Returns False on identical match (caller filters that case separately
+    — the canonical name is NOT a "legacy" candidate).
+    """
+    if not candidate_prefix or not canonical_prefix:
+        return False
+    a = candidate_prefix.lower()
+    b = canonical_prefix.lower()
+    if a == b:
+        # Exact match on prefix → not a legacy candidate (caller's
+        # responsibility to skip the canonical class itself).
+        return True
+    if a in b or b in a:
+        return True
+    if _levenshtein(a, b) <= levenshtein_threshold:
+        return True
+    return False
+
+
+def _detect_legacy_collections_with_suffixes(
+    project_name: str,
+    weaviate_url: str,
+    suffixes: tuple,
+) -> list[dict]:
+    """Shared core for legacy KG + legacy code-graph detection.
+
+    Args:
+        project_name: raw project name as registered with the launcher.
+        weaviate_url: Weaviate REST endpoint.
+        suffixes: tuple of class-name suffixes to inspect (KG family or
+            code-graph family).
+
+    Returns a list of candidate dicts, each with:
+        {
+          "class_name":     "<old class name>",
+          "suffix":         "_KnowledgeGraph" (etc.),
+          "object_count":   int | None,    # None when Weaviate unreachable
+          "embedding_dim":  int | None,    # None when not discoverable
+          "canonical_name": "<canonical class for this project + suffix>",
+        }
+
+    Returns [] in any of these conditions (treated as "nothing to migrate"):
+      - Weaviate unreachable.
+      - No classes match the suffix family.
+      - All matching classes have a different prefix than THIS project's
+        canonical prefix (i.e., they belong to OTHER projects — never auto-
+        suggest migrating someone else's data).
+      - The only matching class IS the canonical name (fresh-install path).
+    """
+    canonical_prefix = sanitize_for_weaviate_class(project_name)
+    if not canonical_prefix:
+        return []
+    # Conservative: if the project name didn't yield a real prefix and we
+    # fell back to `_FALLBACK_PREFIX` ("vct"), do NOT scan — the fallback
+    # is too generic and would match many unrelated classes.
+    if canonical_prefix == _FALLBACK_PREFIX and project_name.strip().lower() != _FALLBACK_PREFIX:
+        return []
+
+    # Schema fetch — soft-fail to empty list if Weaviate is unreachable.
+    base = (weaviate_url or _weaviate_url_default()).rstrip("/")
+    try:
+        status, body = _http_request("GET", f"{base}/v1/schema", timeout=10.0)
+    except Exception:
+        return []
+    if status != 200:
+        return []
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except Exception:
+        return []
+
+    classes = payload.get("classes") or []
+    if not isinstance(classes, list):
+        return []
+
+    candidates: list[dict] = []
+    for cls in classes:
+        if not isinstance(cls, dict):
+            continue
+        class_name = cls.get("class") or ""
+        if not class_name:
+            continue
+
+        decomp = _strip_known_suffix(class_name, suffixes)
+        if decomp is None:
+            continue
+        cand_prefix, sfx = decomp
+
+        canonical_name = f"{canonical_prefix}{sfx}"
+        # Skip the canonical class itself — it's NOT legacy.
+        if class_name == canonical_name:
+            continue
+
+        # Conservative prefix-similarity check.  Without this we'd
+        # mistakenly suggest migrating Agape_KnowledgeGraph just because
+        # the user added a project called "Foo".
+        if not _is_similar_prefix(cand_prefix, canonical_prefix):
+            continue
+
+        # Object count via GraphQL Aggregate (lightweight; no v4 client).
+        count = _http_count_objects(class_name, weaviate_url)
+        emb_dim = _embedding_dim_from_schema(cls)
+
+        candidates.append({
+            "class_name": class_name,
+            "suffix": sfx,
+            "object_count": count,
+            "embedding_dim": emb_dim,
+            "canonical_name": canonical_name,
+        })
+
+    # Stable order: by suffix then class_name (deterministic deferral .md).
+    candidates.sort(key=lambda c: (c["suffix"], c["class_name"]))
+    return candidates
+
+
+def _detect_legacy_kg_collections(
+    project_name: str, weaviate_url: str,
+) -> list[dict]:
+    """Detect KG-family classes (KnowledgeGraph + Development) that look
+    like THIS project's data under a different prefix.
+
+    See `_detect_legacy_collections_with_suffixes` for the full contract.
+    """
+    return _detect_legacy_collections_with_suffixes(
+        project_name, weaviate_url, _KG_SUFFIXES,
+    )
+
+
+def _detect_legacy_codegraph_collections(
+    project_name: str, weaviate_url: str,
+) -> list[dict]:
+    """Detect code-graph-family classes (CodeFunction / CodeModule /
+    CodeClass / CodeAPI / CodeInteraction) that look like THIS project's
+    data under a different prefix.
+
+    Code-graph data is regenerable from source — the deferral entry
+    suggests `code-graph-analyze` re-run rather than copy-with-vectors.
+    """
+    return _detect_legacy_collections_with_suffixes(
+        project_name, weaviate_url, _CODEGRAPH_SUFFIXES,
+    )
+
+
+def _format_legacy_kg_detected(candidates: list[dict]) -> str:
+    """Render the bullet-list detected block for the KG deferral."""
+    lines = []
+    for c in candidates:
+        cnt = c.get("object_count")
+        dim = c.get("embedding_dim")
+        cnt_txt = f"{cnt} object{'s' if cnt != 1 else ''}" if isinstance(cnt, int) else "object count unknown"
+        dim_txt = f", {dim}-dim" if isinstance(dim, int) else ""
+        lines.append(
+            f"  - `{c['class_name']}` ({cnt_txt}{dim_txt}) "
+            f"→ canonical: `{c['canonical_name']}`"
+        )
+    return "\n".join(lines)
+
+
+def _format_legacy_kg_command(
+    project_name: str,
+    weaviate_url: str,
+    candidates: list[dict],
+) -> str:
+    """Render the suggested migration commands for the KG deferral.
+
+    Each candidate gets a one-line python-c command that copies objects
+    from the legacy class to the canonical class via
+    `_copy_collection_with_vectors` (vectors + UUIDs preserved), then
+    drops the legacy class.  This is the safe rename idiom — irreversible
+    once the drop succeeds, hence the explicit-consent gating.
+
+    The canonical name MUST already exist (created during install_bundle's
+    bootstrap step).  If for some reason it doesn't, the user should re-run
+    `bootstrap-collections --name <project>` first.
+    """
+    lines = [
+        "# Per-candidate migration: copy objects (vectors + UUIDs preserved)",
+        "# from the legacy class into the canonical class, then drop the",
+        "# legacy class.  Inspect the dry-run plan first.  The canonical",
+        "# class is created by install-bundle's bootstrap step — verify it",
+        f"# exists before running:  curl -s {weaviate_url}/v1/schema | python -m json.tool",
+        "",
+    ]
+    for c in candidates:
+        old = c["class_name"]
+        new = c["canonical_name"]
+        lines.append(
+            f"# {old} → {new}  ({c.get('object_count', '?')} objects)"
+        )
+        lines.append(
+            "python -c \"from vco_lib.project_init import "
+            "_copy_collection_with_vectors, _delete_class; "
+            f"n = _copy_collection_with_vectors({old!r}, {new!r}, "
+            f"weaviate_url={weaviate_url!r}); "
+            f"print(f'copied {{n}} objects'); "
+            f"_delete_class({old!r}, weaviate_url={weaviate_url!r}); "
+            f"print('dropped {old}')\""
+        )
+        lines.append("")
+    lines.append(
+        "# Once migration succeeds, the canonical class holds the data and"
+    )
+    lines.append(
+        "# the legacy class is gone.  Re-running install-bundle will see no"
+    )
+    lines.append(
+        "# remaining candidates and clear this deferral entry."
+    )
+    return "\n".join(lines)
+
+
+def _format_legacy_codegraph_command(
+    project_name: str,
+    weaviate_url: str,
+    candidates: list[dict],
+) -> str:
+    """Render the suggested cleanup commands for the code-graph deferral.
+
+    Code-graph data is regenerable from source — the safe path is
+    drop legacy + re-run `code-graph-analyze` against the project root.
+    """
+    lines = [
+        "# Code-graph collections are REGENERATED from source — drop the",
+        "# legacy classes and re-run code-graph-analyze on the project.",
+        "",
+    ]
+    for c in candidates:
+        old = c["class_name"]
+        lines.append(
+            f"# Drop {old}  ({c.get('object_count', '?')} objects)"
+        )
+        lines.append(
+            "python -c \"from vco_lib.project_init import _delete_class; "
+            f"_delete_class({old!r}, weaviate_url={weaviate_url!r}); "
+            f"print('dropped {old}')\""
+        )
+        lines.append("")
+    lines.append(
+        "# Then regenerate the canonical code-graph collections from source:"
+    )
+    lines.append(
+        f".claude/scripts/code-graph-analyze . --project {project_name!r}"
+    )
+    return "\n".join(lines)
+
+
+def _emit_legacy_kg_deferral(
+    folder: Path,
+    project_name: str,
+    weaviate_url: str,
+    candidates: list[dict],
+) -> None:
+    """Emit `kg_collection_legacy_candidates`: one or more KG-family classes
+    in Weaviate look like THIS project's data under a non-canonical prefix.
+
+    Severity is `warning`: the project will function with the (empty)
+    canonical class, but the user's accumulated knowledge is orphaned
+    until they consent to migrate.
+
+    Single entry per install run — the body lists every candidate so the
+    user sees the full picture in one place.
+    """
+    if not candidates:
+        return
+    from vco_lib.deferral_report import DeferralEntry, DeferralReport
+
+    detected_lines = _format_legacy_kg_detected(candidates)
+    cmd = _format_legacy_kg_command(project_name, weaviate_url, candidates)
+
+    detected = (
+        f"During the per-project install, Weaviate at `{weaviate_url}` was "
+        f"inspected for legacy knowledge-graph collections that match "
+        f"this project's name under a non-canonical prefix.  The "
+        f"following candidates were detected:\n\n"
+        f"{detected_lines}\n\n"
+        f"The canonical collection(s) for this project (auto-created by "
+        f"install-bundle) are now empty — queries return no results until "
+        f"the legacy data is either migrated into the canonical class or "
+        f"dropped."
+    )
+
+    entry = DeferralEntry(
+        condition_id="kg_collection_legacy_candidates",
+        title="Legacy KG collections detected for this project",
+        detected=detected,
+        why_deferred=(
+            "The migration is destructive (drops the legacy class after "
+            "copy) and the prefix-similarity heuristic, while conservative, "
+            "can in principle return false positives.  Auto-applying it "
+            "without consent could destroy data that belongs to a "
+            "differently-named project the user is keeping intentionally.  "
+            "PR-10B detects + reports; the user (or a future Tauri "
+            "command) runs the migration explicitly."
+        ),
+        command_to_apply=cmd,
+        severity="warning",
+        kg_node_refs=[],
+    )
+
+    report = DeferralReport.read(folder)
+    report.add_entry(entry)
+    report.write(folder)
+
+
+def _emit_legacy_codegraph_deferral(
+    folder: Path,
+    project_name: str,
+    weaviate_url: str,
+    candidates: list[dict],
+) -> None:
+    """Emit `codegraph_collection_legacy_candidates`: one or more code-graph-
+    family classes in Weaviate look like THIS project's data under a non-
+    canonical prefix.
+
+    Severity is `info`: code-graph data is REGENERATED from source on every
+    `code-graph-analyze` run, so even orphaned legacy collections cause no
+    data loss — they're just wasted Weaviate storage.  The deferral nudges
+    the user to drop them + re-analyze.
+    """
+    if not candidates:
+        return
+    from vco_lib.deferral_report import DeferralEntry, DeferralReport
+
+    detected_lines = _format_legacy_kg_detected(candidates)  # same renderer
+    cmd = _format_legacy_codegraph_command(project_name, weaviate_url, candidates)
+
+    detected = (
+        f"During the per-project install, Weaviate at `{weaviate_url}` was "
+        f"inspected for legacy code-graph collections that match this "
+        f"project's name under a non-canonical prefix.  The following "
+        f"candidates were detected:\n\n"
+        f"{detected_lines}\n\n"
+        f"Code-graph collections are regenerated from source — drop the "
+        f"legacy classes and re-run code-graph-analyze on the project "
+        f"after install."
+    )
+
+    entry = DeferralEntry(
+        condition_id="codegraph_collection_legacy_candidates",
+        title="Legacy code-graph collections detected for this project",
+        detected=detected,
+        why_deferred=(
+            "Even though code-graph data is regenerable, dropping a "
+            "Weaviate class is irreversible — and the prefix-similarity "
+            "heuristic can in principle return false positives.  PR-10B "
+            "detects + reports; the user explicitly drops the legacy "
+            "classes and re-runs code-graph-analyze to repopulate the "
+            "canonical collections."
+        ),
+        command_to_apply=cmd,
+        severity="info",
+        kg_node_refs=[],
+    )
+
+    report = DeferralReport.read(folder)
+    report.add_entry(entry)
+    report.write(folder)
+
+
 def install_project_bundle(
     folder: Path,
     orchestrator_root: Optional[Path] = None,
@@ -3585,6 +4098,85 @@ def install_project_bundle(
                     f"template-review deferral write failed: {err}"
                 )
 
+        # PR-10B (v0.2.11): legacy KG / code-graph collection detection.
+        # When a user adds a pre-existing project that already has KG or
+        # code-graph data under a non-canonical prefix, the canonical
+        # collections (just bootstrapped) are empty while the legacy data
+        # is orphaned.  Detect those candidates conservatively and emit
+        # deferral entries — never auto-migrate (destructive).
+        weaviate_url = os.environ.get(
+            "WEAVIATE_URL", _weaviate_url_default(),
+        )
+        legacy_kg_candidates: list[dict] = []
+        legacy_codegraph_candidates: list[dict] = []
+        try:
+            legacy_kg_candidates = _detect_legacy_kg_collections(
+                derived_project_name, weaviate_url,
+            )
+            _log("4.bundle.legacy-kg", "ok",
+                 f"legacy KG candidates: {len(legacy_kg_candidates)}",
+                 data={"count": len(legacy_kg_candidates),
+                       "candidates": [c["class_name"] for c in legacy_kg_candidates]})
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            _log("4.bundle.legacy-kg", "error",
+                 f"legacy-KG detection failed: {err}",
+                 data={"error": err})
+            result["warnings"].append(f"legacy-KG detection failed: {err}")
+
+        try:
+            legacy_codegraph_candidates = _detect_legacy_codegraph_collections(
+                derived_project_name, weaviate_url,
+            )
+            _log("4.bundle.legacy-codegraph", "ok",
+                 f"legacy code-graph candidates: {len(legacy_codegraph_candidates)}",
+                 data={"count": len(legacy_codegraph_candidates),
+                       "candidates": [c["class_name"] for c in legacy_codegraph_candidates]})
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            _log("4.bundle.legacy-codegraph", "error",
+                 f"legacy-codegraph detection failed: {err}",
+                 data={"error": err})
+            result["warnings"].append(f"legacy-codegraph detection failed: {err}")
+
+        if legacy_kg_candidates:
+            try:
+                _emit_legacy_kg_deferral(
+                    folder,
+                    project_name=derived_project_name,
+                    weaviate_url=weaviate_url,
+                    candidates=legacy_kg_candidates,
+                )
+            except Exception as e:
+                err = f"{type(e).__name__}: {e}"
+                _log("4.bundle.deferral", "error",
+                     f"legacy-KG deferral write failed: {err}",
+                     data={"error": err})
+                result["warnings"].append(
+                    f"legacy-KG deferral write failed: {err}"
+                )
+
+        if legacy_codegraph_candidates:
+            try:
+                _emit_legacy_codegraph_deferral(
+                    folder,
+                    project_name=derived_project_name,
+                    weaviate_url=weaviate_url,
+                    candidates=legacy_codegraph_candidates,
+                )
+            except Exception as e:
+                err = f"{type(e).__name__}: {e}"
+                _log("4.bundle.deferral", "error",
+                     f"legacy-codegraph deferral write failed: {err}",
+                     data={"error": err})
+                result["warnings"].append(
+                    f"legacy-codegraph deferral write failed: {err}"
+                )
+
+        # Surface in result for caller introspection / Tauri visibility.
+        result["legacy_kg_candidates"] = legacy_kg_candidates
+        result["legacy_codegraph_candidates"] = legacy_codegraph_candidates
+
         # Reconcile + trim: drop entries this install resolved.
         try:
             _reconcile_bundle_deferrals(
@@ -3592,6 +4184,8 @@ def install_project_bundle(
                 still_user_modified=bool(user_modified_paths) and not force,
                 still_skipped_existing=bool(skipped_existing_paths),
                 still_template_review_pending=bool(template_review_diverged),
+                still_legacy_kg=bool(legacy_kg_candidates),
+                still_legacy_codegraph=bool(legacy_codegraph_candidates),
             )
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
@@ -3611,6 +4205,8 @@ def _reconcile_bundle_deferrals(
     still_user_modified: bool,
     still_skipped_existing: bool,
     still_template_review_pending: bool = False,
+    still_legacy_kg: bool = False,
+    still_legacy_codegraph: bool = False,
 ) -> None:
     """Trim bundle-specific deferral entries that this install resolved.
 
@@ -3634,6 +4230,12 @@ def _reconcile_bundle_deferrals(
         # the user updates their CLAUDE.md to match the reference (or
         # vice versa) the next install clears the stale entry.
         "template_review_pending": still_template_review_pending,
+        # PR-10B (v0.2.11): legacy collection deferrals are recomputed
+        # every install — when the user resolves them (migrates or drops
+        # the legacy class) the next install sees no candidates and clears
+        # the stale entry.
+        "kg_collection_legacy_candidates": still_legacy_kg,
+        "codegraph_collection_legacy_candidates": still_legacy_codegraph,
     }
 
     report = DeferralReport.read(folder)
