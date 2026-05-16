@@ -265,12 +265,20 @@ fn parse_managed_paths_text(text: &'static str) -> Vec<&'static str> {
 /// projects; per-project folders never receive the orchestrator's own
 /// machinery. Entries in the .txt must be either (a) project-meaningful
 /// configuration / docs that legitimately live alongside a user project
-/// (`.claude/`, `CLAUDE.md`, `knowledge/`, `docs/`, `tools/`,
-/// `infrastructure/`), (b) the version-pinning manifest the launcher
-/// reads to detect an existing install (`vct-module.json`), or (c) the
-/// source-of-truth file itself (`orchestrator-managed-paths.txt`) so
+/// (`.claude/`, `knowledge/`, `docs/`, `tools/`, `infrastructure/`),
+/// (b) the version-pinning manifest the launcher reads to detect an
+/// existing install (`vct-module.json`), or (c) the source-of-truth
+/// file itself (`orchestrator-managed-paths.txt`) so
 /// `update_orchestrator_at` propagates new editions of the list into
 /// every existing install.
+///
+/// 2026-05-16 (PR-31 / v0.2.12): `CLAUDE.md` was REMOVED from the
+/// whitelist. The root CLAUDE.md is the orchestrator-self's own
+/// development documentation, not a per-project scaffold. User
+/// projects render CLAUDE.md from `templates/CLAUDE.md.template` via
+/// the project-bootstrapper. `DEFAULT_PRESERVE_LIST` (below) still
+/// includes `CLAUDE.md` because that's the user-edits-on-update
+/// concern, not the whitelist-copy concern this constant governs.
 ///
 /// **Explicitly excluded:** `install.py` / `install.sh` / `install.ps1`
 /// (orchestrator entry points), `state/` (per-install metadata; the
@@ -5069,8 +5077,13 @@ mod tests {
         assert_eq!(diff.mode, InstallMode::Adopt);
         assert!(diff.will_overwrite.contains(&".claude".to_string()));
         assert!(diff.will_overwrite.contains(&"knowledge".to_string()));
-        // CLAUDE.md doesn't exist → in will_add
-        assert!(diff.will_add.contains(&"CLAUDE.md".to_string()));
+        // docs/tools/infrastructure/vct-module.json/orchestrator-
+        // managed-paths.txt don't exist yet → in will_add. (CLAUDE.md
+        // was removed from the whitelist in PR-31; it never appears in
+        // will_add or will_overwrite anymore.)
+        assert!(diff.will_add.contains(&"docs".to_string()));
+        assert!(!diff.will_add.contains(&"CLAUDE.md".to_string()));
+        assert!(!diff.will_overwrite.contains(&"CLAUDE.md".to_string()));
         assert!(diff.user_paths_preserved);
         fs::remove_dir_all(&p).ok();
     }
@@ -5123,9 +5136,13 @@ mod tests {
         assert!(target.join("vct-module.json").exists());
         assert!(target.join(".claude/settings.json").exists());
         assert!(target.join("knowledge/note.md").exists());
-        assert!(target.join("CLAUDE.md").exists());
 
-        // NOT in allowlist: must NOT have been copied.
+        // NOT in allowlist: must NOT have been copied. CLAUDE.md was
+        // removed from the whitelist in PR-31 (v0.2.12) — see the
+        // doc-comment above ORCHESTRATOR_MANAGED_PATHS. User projects
+        // render their CLAUDE.md from templates/CLAUDE.md.template
+        // instead of receiving the orchestrator-self's root CLAUDE.md.
+        assert!(!target.join("CLAUDE.md").exists());
         assert!(!target.join("README.md").exists());
         assert!(!target.join("scripts/foo.sh").exists());
 
@@ -5191,9 +5208,14 @@ mod tests {
         // expected entries. If you intentionally add or remove a path,
         // edit `orchestrator-managed-paths.txt` AND this assertion in
         // the same commit.
+        // PR-31 (v0.2.12): `CLAUDE.md` removed. The root CLAUDE.md is
+        // orchestrator-self dev docs, not a user-project scaffold; user
+        // projects render their CLAUDE.md from
+        // `templates/CLAUDE.md.template` instead. DEFAULT_PRESERVE_LIST
+        // still contains "CLAUDE.md" — that's the preserve-user-edits
+        // concern, not the whitelist-copy concern.
         let expected: &[&str] = &[
             ".claude",
-            "CLAUDE.md",
             "knowledge",
             "docs",
             "tools",

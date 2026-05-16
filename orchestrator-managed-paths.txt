@@ -15,8 +15,24 @@
 # Self-reference: this file is itself listed below so that
 # `update_orchestrator_at` propagates a freshly-edited version into
 # every existing install when the user pulls a new VCO clone.
+#
+# CLAUDE.md was REMOVED from this whitelist in v0.2.12 (PR-31). The
+# root CLAUDE.md at the orchestrator repo root is the orchestrator-
+# self's own development instructions (47 KB documenting how MCP
+# servers, hooks, the knowledge graph, the launcher, etc. are
+# organized INSIDE the orchestrator's own clone) — NOT a template for
+# user projects. User projects always render CLAUDE.md from
+# `templates/CLAUDE.md.template` (a 4 KB scaffold with
+# {{PROJECT_NAME}} / {{PROJECT_ROOT}} / {{ORCHESTRATOR_ROOT}}
+# placeholders), substituted by vco_lib/project_init.py's
+# project-bootstrapper path. Whitelist-copying the root CLAUDE.md
+# would silently drop the wrong 47 KB file into fresh user projects.
+#
+# DEFAULT_PRESERVE_LIST in install.py / installer.rs still lists
+# CLAUDE.md — that is the EXISTING-user-CLAUDE.md preservation
+# concern at update time, NOT the whitelist concern this file
+# governs. The two are deliberately decoupled.
 .claude
-CLAUDE.md
 knowledge
 docs
 tools

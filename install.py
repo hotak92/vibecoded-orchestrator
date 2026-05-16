@@ -879,6 +879,14 @@ MERGE_BLOCK_END = "<!-- /vct-merge-pending -->"
 #
 # The .txt file lists itself, so ``update_orchestrator_at`` propagates
 # freshly-edited editions of the list into every existing install.
+#
+# Note (PR-31 / v0.2.12): ``CLAUDE.md`` was removed from this whitelist.
+# The root CLAUDE.md is orchestrator-self development docs, not a user-
+# project scaffold. User projects render their CLAUDE.md from
+# ``templates/CLAUDE.md.template`` via the project-bootstrapper. The
+# ``DEFAULT_PRESERVE_LIST`` constant above still includes ``CLAUDE.md``
+# — that is the existing-user-CLAUDE.md preservation concern on
+# update, separate from the whitelist concern this section governs.
 
 # Path resolution: __file__ → install.py at repo root → the .txt is
 # its sibling. We use Path(__file__).resolve() so the lookup is robust

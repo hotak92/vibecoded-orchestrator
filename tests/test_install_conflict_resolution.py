@@ -27,7 +27,16 @@ import install  # type: ignore  # noqa: E402
 
 def _fake_repo_source(root: Path) -> Path:
     """Build a fake orchestrator source tree (mirrors `fake_repo_source`
-    in the Rust tests)."""
+    in the Rust tests).
+
+    PR-31 note (v0.2.12): the source tree ships a root ``CLAUDE.md``
+    (the orchestrator-self's own development documentation), but
+    ``CLAUDE.md`` is NO LONGER in the install whitelist, so
+    ``apply_conflict_strategy`` must NOT copy it into the target. The
+    file is included here precisely so the tests can assert it stays
+    behind — the same way ``README.md`` and ``scripts/foo.sh`` test
+    the broader "not in allowlist → not copied" contract.
+    """
     p = root / "src"
     p.mkdir(parents=True, exist_ok=True)
     (p / "vct-module.json").write_text("{}")
@@ -35,8 +44,9 @@ def _fake_repo_source(root: Path) -> Path:
     (p / ".claude" / "settings.json").write_text("{}")
     (p / "knowledge").mkdir()
     (p / "knowledge" / "note.md").write_text("hello")
-    (p / "CLAUDE.md").write_text("# project\n")
-    # Files NOT in the allowlist — must NOT be copied.
+    # Files NOT in the allowlist — must NOT be copied. CLAUDE.md is in
+    # this group as of PR-31 / v0.2.12 (see the module docstring).
+    (p / "CLAUDE.md").write_text("# orchestrator-self CLAUDE.md\n")
     (p / "README.md").write_text("readme")
     (p / "scripts").mkdir()
     (p / "scripts" / "foo.sh").write_text("echo hi")
@@ -188,13 +198,22 @@ class ApplyConflictStrategyTests(unittest.TestCase):
         self.assertEqual(report["preserved_count"], 0)
         self.assertEqual(report["new_md_count"], 0)
 
-        # CLAUDE.md from upstream replaces the user-edited one.
-        self.assertEqual((self.target / "CLAUDE.md").read_text(), "# project\n")
         # settings.json overwritten with upstream {}.
         self.assertEqual(
             (self.target / ".claude" / "settings.json").read_text(), "{}"
         )
-        # No `.new.md` siblings.
+        # CLAUDE.md is NOT in the install whitelist as of PR-31 / v0.2.12
+        # (see the doc-comment on ORCHESTRATOR_MANAGED_PATHS), so even
+        # under overwrite_all the user's CLAUDE.md must stay untouched
+        # — the orchestrator-self's root CLAUDE.md is not copied into
+        # user projects anymore.
+        self.assertEqual(
+            (self.target / "CLAUDE.md").read_text(),
+            "# user CLAUDE.md\ncustom rules\n",
+        )
+        # No `.new.md` siblings (overwrite_all never writes them; and
+        # CLAUDE.md is no longer managed, so even overwrite_preserve
+        # wouldn't write CLAUDE.new.md anymore).
         self.assertFalse((self.target / "CLAUDE.new.md").exists())
         # User code OUTSIDE allowlist preserved.
         self.assertEqual(
@@ -202,27 +221,41 @@ class ApplyConflictStrategyTests(unittest.TestCase):
         )
 
     def test_overwrite_preserve_writes_new_md_siblings_and_notification(self):
-        preserve = list(install.DEFAULT_PRESERVE_LIST)
+        # Inject a managed-path conflict the preserve machinery WILL
+        # exercise: put an upstream-shipped .claude/settings.json in
+        # the preserve list so the apply path writes a .new.json
+        # sibling. (CLAUDE.md is no longer in the whitelist as of
+        # PR-31, so it cannot drive this scenario anymore.)
+        preserve = list(install.DEFAULT_PRESERVE_LIST) + [".claude/settings.json"]
         report = install.apply_conflict_strategy(
             self.source, self.target, "overwrite_preserve", preserve
         )
-        # CLAUDE.md is in fake source AND target → .new.md sibling written.
-        self.assertTrue((self.target / "CLAUDE.new.md").exists())
+        # settings.json is in fake source AND target AND preserve list →
+        # .new.json sibling written, user file untouched.
+        self.assertTrue((self.target / ".claude" / "settings.new.json").exists())
         self.assertEqual(
-            (self.target / "CLAUDE.new.md").read_text(), "# project\n"
+            (self.target / ".claude" / "settings.json").read_text(),
+            '{"old":true}',
         )
-        # User CLAUDE.md untouched.
+        # CLAUDE.md path: as of PR-31 (v0.2.12), CLAUDE.md is NOT in
+        # the install whitelist. apply_conflict_strategy iterates the
+        # whitelist, so CLAUDE.md is never visited — no copy, no
+        # .new.md sibling, user file stays exactly as written.
         self.assertEqual(
             (self.target / "CLAUDE.md").read_text(),
             "# user CLAUDE.md\ncustom rules\n",
         )
+        self.assertFalse((self.target / "CLAUDE.new.md").exists())
         # CONTEXT_STATE.md is in preserve list but fake source doesn't ship
         # one — user file left intact AND notification appended to it.
         ctx_text = (self.target / ".claude" / "CONTEXT_STATE.md").read_text()
         self.assertIn("# user CONTEXT_STATE", ctx_text)
         self.assertIn(install.MERGE_BLOCK_START, ctx_text)
         self.assertIn(install.MERGE_BLOCK_END, ctx_text)
-        self.assertIn("CLAUDE.md", ctx_text)
+        # The notification block lists the preserved-with-new-sibling
+        # files. settings.json is the one driving the .new.json sibling
+        # in this test.
+        self.assertIn("settings.json", ctx_text)
         # knowledge/note.md is NOT preserved → user note overwritten.
         self.assertEqual((self.target / "knowledge" / "note.md").read_text(), "hello")
         self.assertTrue(report["notification_written"])
@@ -270,17 +303,31 @@ class ApplyConflictStrategyTests(unittest.TestCase):
         self.assertGreater(report["copied_count"], 0)
 
     def test_overwrite_preserve_with_custom_preserve_list(self):
-        # Custom preserve list: only CLAUDE.md.
+        # Custom preserve list: a single managed path
+        # (.claude/settings.json) drives the preserve+new-sibling
+        # machinery. We don't use CLAUDE.md here because PR-31
+        # (v0.2.12) removed it from the install whitelist —
+        # apply_conflict_strategy iterates the whitelist, so an entry
+        # not in it never triggers a preserve action.
         report = install.apply_conflict_strategy(
-            self.source, self.target, "overwrite_preserve", ["CLAUDE.md"]
+            self.source,
+            self.target,
+            "overwrite_preserve",
+            [".claude/settings.json"],
         )
-        self.assertTrue((self.target / "CLAUDE.new.md").exists())
+        self.assertTrue((self.target / ".claude" / "settings.new.json").exists())
+        self.assertEqual(
+            (self.target / ".claude" / "settings.json").read_text(),
+            '{"old":true}',
+        )
+        # report counts only the one preserved file.
+        self.assertEqual(report["preserved_count"], 1)
+        # CLAUDE.md untouched on both sides (not in whitelist any more).
         self.assertEqual(
             (self.target / "CLAUDE.md").read_text(),
             "# user CLAUDE.md\ncustom rules\n",
         )
-        # report counts only the one preserved file.
-        self.assertEqual(report["preserved_count"], 1)
+        self.assertFalse((self.target / "CLAUDE.new.md").exists())
 
     def test_rejects_non_orchestrator_source(self):
         bad_source = self.tmp / "no-vct-module"

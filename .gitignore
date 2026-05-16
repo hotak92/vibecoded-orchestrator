@@ -93,7 +93,6 @@ state/
 .claude/logs/*.log
 .claude/logs/*.jsonl
 .claude/logs/.last_reviewed_commit
-.claude/context/pre-compact-snapshot.md
 .claude/cron-jobs.json
 .claude/worktrees/
 # Hook ephemeral state (per-session dedup, etc.)
@@ -102,6 +101,17 @@ state/
 .claude/agents/
 .claude/skills/
 CLAUDE.local.md
+
+# Internal dev artifacts — must not be tracked in the public repo. The
+# orchestrator-self's local .claude/context/ may exist on contributor
+# machines (dated patch reports, code reviews, handoff notes between
+# internal agent sessions) but is not for shipping. The release archive
+# workflow at .github/workflows/release.yml already excludes
+# .claude/context/ from release ZIPs; this rule blocks the same path at
+# the git layer so dev artifacts can't slip into the public tree via
+# `git add -A`. See PR-31 / Group L (v0.2.12) for the audit that
+# surfaced 12 such files tracked at HEAD on 2026-05-16.
+.claude/context/
 
 # pnpm artefacts — launcher uses npm; pnpm-lock.yaml accidentally created by
 # contributors with pnpm on PATH must NOT enter the repo (would fight package-lock.json)

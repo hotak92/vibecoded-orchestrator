@@ -90,11 +90,16 @@ class ManagedPathsLockstepTests(unittest.TestCase):
     def test_managed_paths_includes_required_entries(self):
         """The minimum viable set: project-meaningful configuration that
         legitimately lives alongside a user project. Removing any of
-        these would break the per-project install path."""
+        these would break the per-project install path.
+
+        Note (PR-31, v0.2.12): ``CLAUDE.md`` is intentionally NOT in
+        this set. The root CLAUDE.md is orchestrator-self development
+        documentation; user projects render their CLAUDE.md from
+        ``templates/CLAUDE.md.template`` via the project-bootstrapper,
+        not via the install whitelist."""
         py = self._python_set()
         required = {
             ".claude",
-            "CLAUDE.md",
             "knowledge",
             "docs",
             "tools",
@@ -106,6 +111,24 @@ class ManagedPathsLockstepTests(unittest.TestCase):
             missing, set(),
             f"required entries missing from Python "
             f"ORCHESTRATOR_MANAGED_PATHS: {sorted(missing)}.",
+        )
+
+    def test_managed_paths_excludes_root_claude_md(self):
+        """PR-31 invariant (v0.2.12): the root CLAUDE.md must NOT be in
+        the whitelist. It is orchestrator-self dev docs, not a user-
+        project scaffold. A future revert that re-adds it to the .txt
+        would silently drop 47 KB of orchestrator-internals
+        documentation into every fresh user project — exactly the bug
+        PR-31 was written to fix. User projects always render their
+        CLAUDE.md from ``templates/CLAUDE.md.template`` instead."""
+        py = self._python_set()
+        self.assertNotIn(
+            "CLAUDE.md",
+            py,
+            "Root CLAUDE.md must not appear in ORCHESTRATOR_MANAGED_PATHS. "
+            "User projects get their CLAUDE.md from "
+            "templates/CLAUDE.md.template, never from a whitelist copy of "
+            "the orchestrator-self's own CLAUDE.md. See PR-31 / v0.2.12.",
         )
 
 
