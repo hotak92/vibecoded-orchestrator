@@ -15,6 +15,7 @@ pub mod kg_sync;
 pub mod kg_summary;
 pub mod lifecycle;
 pub mod licensing;
+pub mod maintenance;
 pub mod manifest;
 pub mod modules;
 pub mod orchestrator_root;

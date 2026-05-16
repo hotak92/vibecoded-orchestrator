@@ -790,6 +790,18 @@ pub fn run() {
             // IdentityTab can let users pick which class is canonical.
             commands::project_identity::list_orchestrator_kg_collections,
             commands::project_identity::set_shared_kg_collection_name,
+            // PR-37 (v0.2.12 / 2026-05-16): GUI-surfaced maintenance ops.
+            // Backs `McpMaintenanceSection.svelte` (MCP page) and
+            // `ServicesSchemaSection.svelte` (Services page) — closes the
+            // GUI coverage gap left by PR-23, PR-24 and PR-33 which were
+            // CLI-only.
+            commands::maintenance::mcp_registration_status,
+            commands::maintenance::rerun_mcp_registration,
+            commands::maintenance::schema_migration_status,
+            commands::maintenance::issue_schema_migration_consent_token,
+            commands::maintenance::run_schema_migrations,
+            commands::maintenance::stale_mcp_entries,
+            commands::maintenance::rewrite_stale_mcp_entries,
             // Hub proxy (v1.1)
             commands::hub_proxy::hub_info,
             commands::hub_proxy::hub_list_apps,

@@ -13,6 +13,11 @@
 
   import { onMount, onDestroy } from 'svelte';
   import { invoke, listen } from '$lib/tauri';
+  // PR-37 (v0.2.12 / 2026-05-16): schema-health card surfaces the two
+  // schema migrations introduced in PR-24 (Development temporal props
+  // + shared KG indexNullState). Soft-fails to a "Weaviate not
+  // reachable" hint when /v1/schema is unreachable.
+  import ServicesSchemaSection from '$lib/components/ServicesSchemaSection.svelte';
 
   interface ServiceRuntimeState {
     name: string;
@@ -446,6 +451,8 @@
         {/each}
       </tbody>
     </table>
+
+    <ServicesSchemaSection />
   {/if}
 
   {#if pickerService}
