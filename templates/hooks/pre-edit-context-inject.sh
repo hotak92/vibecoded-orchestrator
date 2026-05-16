@@ -287,21 +287,25 @@ _filter_seen() {
     local filtered=""
     touch "$SEEN_NODES_FILE"
 
-    # Load existing seen titles into a hash table (one file scan, O(n)).
-    declare -A seen_titles
-    while IFS= read -r seen_line; do
-        [ -z "$seen_line" ] && continue
-        seen_titles["$seen_line"]=1
-    done < "$SEEN_NODES_FILE"
+    # Bash-3.2 compatibility (Apple's shipped default on macOS Tier-2):
+    # we deliberately avoid `declare -A` associative arrays — they
+    # require bash 4+ and Apple's bash never gets updated past 3.2
+    # (GPLv3 licensing). Instead the SEEN_NODES_FILE itself is the
+    # source-of-truth set, queried via `grep -Fxq`. Per-emitted-block
+    # we append the title to the file; that keeps in-batch dedup
+    # correct (a duplicate title later in the SAME cache replay reads
+    # back its earlier append). Slower per-lookup than an in-memory
+    # hash but the typical batch is <20 blocks so the overhead is
+    # sub-millisecond on every host.
 
     local current_title=""
     local current_block=""
     local current_skip=0
 
     _flush_block() {
-        if [ -n "$current_title" ] && [ "$current_skip" = "0" ] && [ -z "${seen_titles[$current_title]:-}" ]; then
+        if [ -n "$current_title" ] && [ "$current_skip" = "0" ] \
+            && ! grep -Fxq -- "$current_title" "$SEEN_NODES_FILE"; then
             filtered="${filtered}${current_block}"
-            seen_titles["$current_title"]=1
             echo "$current_title" >> "$SEEN_NODES_FILE"
         fi
         current_title=""
@@ -326,7 +330,7 @@ _filter_seen() {
             current_title="${current_title:0:200}"
             current_block="${line}"$'\n'
             # If already seen, mark the block so we drop it AND its body lines.
-            if [ -n "${seen_titles[$current_title]:-}" ]; then
+            if grep -Fxq -- "$current_title" "$SEEN_NODES_FILE"; then
                 current_skip=1
             fi
         elif [ -n "$current_title" ]; then
