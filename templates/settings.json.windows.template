@@ -49,6 +49,11 @@
         "hooks": [
           {
             "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\check-no-fork-bomb.ps1",
+            "timeout": 5
+          },
+          {
+            "type": "command",
             "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\ensure-containers.ps1",
             "timeout": 15,
             "async": true
