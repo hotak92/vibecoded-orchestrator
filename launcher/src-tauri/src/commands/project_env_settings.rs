@@ -420,11 +420,37 @@ pub fn populate(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| DEFAULT_ACTIVE_EMBEDDING.to_string());
 
+    // PR-9 (v0.2.11): shared KG resolution with three-tier priority.
+    //
+    // Priority 1: explicit user override in `app_state` (preserves any
+    //             manually-set value via the GUI's existing setting).
+    // Priority 2: Orchestrator Project's primary KG binding from
+    //             `project_kg_bindings`. Seeded by
+    //             `orchestrator_root::ensure_orchestrator_root_kg_binding`
+    //             on launcher boot whenever the orchestrator clone is
+    //             detected. This makes every project on the machine
+    //             derive the shared KG from the same source of truth:
+    //             the Orchestrator Project itself.
+    // Priority 3: `DEFAULT_SHARED_KG_COLLECTION` const fallback. Kept
+    //             for two scenarios:
+    //               (a) standalone-binary install (no clone → no row
+    //                   → no binding);
+    //               (b) tests with an empty in-memory DB.
+    //
+    // Explicit empty string (`SHARED_KG_COLLECTION=""`) handling: a
+    // user who has explicitly set `app_state[shared_kg.collection_name]`
+    // to "" gets back DEFAULT_SHARED_KG_COLLECTION here. That's fine —
+    // the per-project gate `SHARED_KG_WRITE_DISABLED` (resolved below)
+    // is the right knob for "opt out of shared KG writes". Forcing
+    // SHARED_KG_COLLECTION to be empty would break the read path too,
+    // which the asymmetric-access model since 2026-05-01 explicitly
+    // says must never be empty.
     let shared_kg_collection = db
         .app_state_get(APP_STATE_KEY_SHARED_KG_NAME)
         .ok()
         .flatten()
         .filter(|s| !s.is_empty())
+        .or_else(|| resolve_shared_kg_from_orchestrator_root(db))
         .unwrap_or_else(|| DEFAULT_SHARED_KG_COLLECTION.to_string());
 
     let shared_kg_write_disabled = match project_id {
@@ -778,6 +804,38 @@ fn resolve_user_secret_state(db: &Db, project_id: &str) -> (Vec<(String, String)
     (pairs, known_keys)
 }
 
+/// PR-9 (v0.2.11): resolve the shared KG collection name from the
+/// Orchestrator Project's primary `project_kg_bindings` entry.
+///
+/// Returns `Some(collection_name)` when:
+///   - the orchestrator-root project row exists in `projects` (migration
+///     013 has run AND `ensure_orchestrator_root` succeeded), AND
+///   - that row has a `project_kg_bindings` entry with `role='primary'`
+///     and a non-empty `collection_name`.
+///
+/// Returns `None` (so the caller falls through to
+/// `DEFAULT_SHARED_KG_COLLECTION`) when:
+///   - the row doesn't exist (standalone-binary install — no clone),
+///   - the binding isn't seeded yet (rare — happens between
+///     migration-013 run and the first `ensure_orchestrator_root` call),
+///   - any DB error (we treat as "not derivable" and let the caller use
+///     the safe fallback rather than crashing env resolution).
+///
+/// Soft-fail throughout. Never panics. The call site is on the hot path
+/// of every project env render, so we use the cheapest possible
+/// lookups (1 SELECT by slug + 1 SELECT bindings list).
+fn resolve_shared_kg_from_orchestrator_root(db: &Db) -> Option<String> {
+    use crate::commands::orchestrator_root::ORCHESTRATOR_ROOT_SLUG;
+
+    let root_row = db.get_project_by_slug(ORCHESTRATOR_ROOT_SLUG).ok().flatten()?;
+    let bindings = db.list_project_kg_bindings(&root_row.id).ok()?;
+    bindings
+        .into_iter()
+        .find(|b| b.role == "primary")
+        .map(|b| b.collection_name)
+        .filter(|s| !s.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -944,5 +1002,129 @@ mod tests {
         db.app_state_set(APP_STATE_KEY_ACTIVE_EMBEDDING, "").unwrap();
         let s = populate(&db, "Acme", None);
         assert_eq!(s.active_embedding, DEFAULT_ACTIVE_EMBEDDING);
+    }
+
+    // ─── PR-9 (v0.2.11): shared KG opzione A — derive from
+    //     Orchestrator Project's primary KG binding ─────────────────
+
+    #[test]
+    fn pr9_shared_kg_resolves_from_orchestrator_root_primary_binding() {
+        use crate::commands::orchestrator_root::ORCHESTRATOR_ROOT_SLUG;
+        use crate::db::models::ProjectHost;
+
+        let db = Db::open_in_memory().unwrap();
+        let root_id = "00000000-0000-0000-0000-000000000099";
+        db.insert_project(
+            root_id,
+            "VibeCoded Orchestrator",
+            "/tmp/orchestrator-root-fake",
+            ProjectHost::OrchestratorRoot,
+            ORCHESTRATOR_ROOT_SLUG,
+        )
+        .unwrap();
+        db.set_project_kg_binding(
+            root_id,
+            "primary",
+            "MyOrchestratorBrand_KnowledgeGraph",
+            None,
+            None,
+            None,
+            None,
+            &serde_json::json!({}),
+        )
+        .unwrap();
+
+        let s = populate(&db, "SomeUserProject", None);
+        assert_eq!(s.shared_kg_collection, "MyOrchestratorBrand_KnowledgeGraph");
+    }
+
+    #[test]
+    fn pr9_shared_kg_app_state_override_wins_over_root_binding() {
+        use crate::commands::orchestrator_root::ORCHESTRATOR_ROOT_SLUG;
+        use crate::db::models::ProjectHost;
+
+        let db = Db::open_in_memory().unwrap();
+        let root_id = "00000000-0000-0000-0000-000000000098";
+        db.insert_project(
+            root_id,
+            "VibeCoded Orchestrator",
+            "/tmp/orchestrator-root-fake-2",
+            ProjectHost::OrchestratorRoot,
+            ORCHESTRATOR_ROOT_SLUG,
+        )
+        .unwrap();
+        db.set_project_kg_binding(
+            root_id,
+            "primary",
+            "ShouldBeIgnored_KG",
+            None, None, None, None,
+            &serde_json::json!({}),
+        )
+        .unwrap();
+        // User explicitly sets a different name via the GUI.
+        db.app_state_set(APP_STATE_KEY_SHARED_KG_NAME, "UserOverride_KG").unwrap();
+
+        let s = populate(&db, "Acme", None);
+        assert_eq!(s.shared_kg_collection, "UserOverride_KG");
+    }
+
+    #[test]
+    fn pr9_shared_kg_no_root_falls_back_to_default_const() {
+        // Standalone-binary install scenario: migration 013 ran but
+        // ensure_orchestrator_root found no clone on disk, so no
+        // projects row + no primary binding. Caller must get the const.
+        let db = Db::open_in_memory().unwrap();
+        let s = populate(&db, "Acme", None);
+        assert_eq!(s.shared_kg_collection, DEFAULT_SHARED_KG_COLLECTION);
+    }
+
+    #[test]
+    fn pr9_shared_kg_root_without_binding_falls_back_to_default_const() {
+        // Edge case: row exists but binding never seeded (e.g. a
+        // pre-PR-9 orchestrator install raced its first boot post-
+        // upgrade). The resolver returns None → caller falls through.
+        use crate::commands::orchestrator_root::ORCHESTRATOR_ROOT_SLUG;
+        use crate::db::models::ProjectHost;
+
+        let db = Db::open_in_memory().unwrap();
+        db.insert_project(
+            "00000000-0000-0000-0000-000000000097",
+            "VibeCoded Orchestrator",
+            "/tmp/orchestrator-root-fake-3",
+            ProjectHost::OrchestratorRoot,
+            ORCHESTRATOR_ROOT_SLUG,
+        )
+        .unwrap();
+        // No binding set.
+        let s = populate(&db, "Acme", None);
+        assert_eq!(s.shared_kg_collection, DEFAULT_SHARED_KG_COLLECTION);
+    }
+
+    #[test]
+    fn pr9_shared_kg_empty_binding_collection_name_falls_back_to_default() {
+        // Defensive: an empty `collection_name` in the binding must not
+        // propagate (would break env resolution downstream). Filter
+        // empties out and fall through to const.
+        use crate::commands::orchestrator_root::ORCHESTRATOR_ROOT_SLUG;
+        use crate::db::models::ProjectHost;
+
+        let db = Db::open_in_memory().unwrap();
+        let root_id = "00000000-0000-0000-0000-000000000096";
+        db.insert_project(
+            root_id,
+            "VibeCoded Orchestrator",
+            "/tmp/orchestrator-root-fake-4",
+            ProjectHost::OrchestratorRoot,
+            ORCHESTRATOR_ROOT_SLUG,
+        )
+        .unwrap();
+        db.set_project_kg_binding(
+            root_id, "primary", "",
+            None, None, None, None,
+            &serde_json::json!({}),
+        )
+        .unwrap();
+        let s = populate(&db, "Acme", None);
+        assert_eq!(s.shared_kg_collection, DEFAULT_SHARED_KG_COLLECTION);
     }
 }

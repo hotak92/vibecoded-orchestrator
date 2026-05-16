@@ -62,6 +62,7 @@ use tauri::{command, State};
 use uuid::Uuid;
 
 use crate::commands::modules::{find_orchestrator_manifest, read_orchestrator_manifest};
+use crate::commands::projects_v2::sanitize_kg_collection;
 use crate::db::models::ProjectHost;
 use crate::db::Db;
 
@@ -153,6 +154,13 @@ fn canonicalize_folder_path(folder: &Path) -> Result<String, String> {
 /// startup continues).
 pub fn ensure_orchestrator_root(db: &Db) -> Result<(), String> {
     if db.has_orchestrator_root_project()? {
+        // PR-9 (v0.2.11): row exists from a prior boot but the primary
+        // KG binding may not. Pre-0.2.11 orchestrator clones never had
+        // the binding because PR-9 introduced it. Seed it idempotently
+        // (the binding upsert is a no-op when present).
+        if let Ok(Some(row)) = db.get_project_by_slug(ORCHESTRATOR_ROOT_SLUG) {
+            ensure_orchestrator_root_kg_binding(db, &row.id);
+        }
         return Ok(());
     }
 
@@ -216,21 +224,91 @@ pub fn ensure_orchestrator_root(db: &Db) -> Result<(), String> {
                 }),
             );
             let _ = db.log_change("projects", "insert", Some(&id), Some(&id));
+            // PR-9 (v0.2.11): seed the Orchestrator Project's primary
+            // KG binding so every other project on this machine derives
+            // the shared KG name from this binding (opzione A — see
+            // .claude/context/plans/0.2.11-release-2026-05-16.md §PR-9).
+            // sanitize_kg_collection("VibeCoded Orchestrator") returns
+            // "VibeCodedOrchestrator"; the canonical KG collection name
+            // for the orchestrator clone is therefore
+            // "VibeCodedOrchestrator_KnowledgeGraph". User can override
+            // by writing to `app_state[shared_kg.collection_name]` (the
+            // existing Priority-1 path in project_env_settings.rs).
+            ensure_orchestrator_root_kg_binding(db, &id);
             Ok(())
         }
         Err(e) => {
             // Race lost (UNIQUE slug or UNIQUE folder_path) — verify
             // the row exists and treat as success. Surface any other
-            // error.
+            // error. Even on the race path we still attempt to seed the
+            // KG binding: if the race-winner already wrote it the
+            // upsert is a no-op, and if it crashed before reaching that
+            // step we recover.
             if db.has_orchestrator_root_project().unwrap_or(false) {
                 eprintln!(
                     "[vct] orchestrator_root row already exists (raced insert: {})",
                     e
                 );
+                if let Ok(Some(row)) = db.get_project_by_slug(ORCHESTRATOR_ROOT_SLUG) {
+                    ensure_orchestrator_root_kg_binding(db, &row.id);
+                }
                 Ok(())
             } else {
                 Err(format!("auto-register orchestrator_root: {}", e))
             }
+        }
+    }
+}
+
+/// PR-9 (v0.2.11): idempotent seed of the Orchestrator Project's
+/// primary KG binding.
+///
+/// The shared KG collection name is derived from the Orchestrator
+/// Project's display name via the canonical `sanitize_kg_collection`
+/// helper (the same one PR-7 + PR-8 use everywhere else for collection
+/// naming). Suffix `_KnowledgeGraph` matches the convention from
+/// `project_state_populate::populate_kg_collection_access` and the
+/// per-project bundle install.
+///
+/// Soft-fail: any error here logs to stderr but does NOT propagate.
+/// The Orchestrator Project row insert succeeded; missing KG binding
+/// only means the shared KG falls back to `DEFAULT_SHARED_KG_COLLECTION`
+/// const for now. The function is called again on next launcher boot
+/// (idempotent via `ON CONFLICT(project_id, role)` upsert in
+/// `set_project_kg_binding`).
+fn ensure_orchestrator_root_kg_binding(db: &Db, root_id: &str) {
+    let collection_name = format!(
+        "{}_KnowledgeGraph",
+        sanitize_kg_collection(ORCHESTRATOR_ROOT_NAME)
+    );
+    match db.set_project_kg_binding(
+        root_id,
+        "primary",
+        &collection_name,
+        // embedding_model / dim / kg_dir / weaviate_url / config left
+        // None — defaults inherit from launcher.toml env block. The
+        // binding's job is to declare ownership of the collection
+        // name; the embedding/host knobs live in the global config.
+        None,
+        None,
+        None,
+        None,
+        &serde_json::json!({"auto_seeded_by": "ensure_orchestrator_root_kg_binding"}),
+    ) {
+        Ok(_) => {
+            eprintln!(
+                "[vct] seeded orchestrator-root primary KG binding: {}",
+                collection_name
+            );
+        }
+        Err(e) => {
+            // Don't propagate — the binding seed is a Priority-2
+            // optimization; without it the shared KG resolution
+            // falls back to DEFAULT_SHARED_KG_COLLECTION.
+            eprintln!(
+                "[vct] WARN: ensure_orchestrator_root_kg_binding failed (non-fatal): {}",
+                e
+            );
         }
     }
 }
