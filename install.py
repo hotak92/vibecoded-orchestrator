@@ -361,6 +361,13 @@ _RESUME_ENABLED: bool = True
 # so no eviction needed.
 _PENDING_EVENTS: list[str] = []
 
+# Fix 1 (v0.2.13): unix timestamp marking the start of the current install
+# run. Populated by _run_install() at entry. Used by
+# _refresh_dist_binary_after_rebuild to distinguish "freshly produced this
+# run" from "weeks-old stale artifact". Module-level so the helper can
+# read it without threading the value through every intermediate call site.
+_INSTALL_START_TS: Optional[float] = None
+
 
 def _install_log_path() -> Path | None:
     """Return path to state/logs/install.jsonl iff the dir exists.
@@ -1836,7 +1843,10 @@ def main() -> int:
     parser.add_argument("--skip-models", action="store_true",
                         help="Skip pulling Ollama models")
     parser.add_argument("--update", action="store_true",
-                        help="Update mode: skip clone, re-install deps + restart services")
+                        help="Update mode: skip clone, re-install deps + restart services. "
+                             "Always writes .claude/context/UPDATE_DEFERRED.md at the end — "
+                             "either with actionable deferral entries OR a stub confirming "
+                             "the run completed cleanly (Fix 6, v0.2.13).")
     parser.add_argument("--rebuild-collections", action="store_true", default=False,
                         help="Drop and re-ingest Weaviate collections (KG + dev). "
                              "Required when the schema invariants change "
@@ -1891,6 +1901,34 @@ def main() -> int:
                              "OUTSIDE install_root are never touched. "
                              "Set VCT_REMOVE_DEPRECATED_MCPS=all in the env to "
                              "auto-accept all entries (CI / scripted). PR-34.")
+    # Fix 1 (v0.2.13): post-cargo-rebuild dist-binary refresh.
+    parser.add_argument("--no-binary-swap", dest="no_binary_swap",
+                        action="store_true", default=False,
+                        help="Skip the v0.2.13 post-rebuild dist-binary refresh. "
+                             "Normally, when a fresh launcher binary is detected at "
+                             "launcher/src-tauri/target/release/vct-launcher-temp "
+                             "(produced during this install run, or newer than the "
+                             "version recorded in tauri.conf.json), install.py copies "
+                             "it into launcher/dist/<os>-<arch>/ so the next "
+                             "_ensure_launcher_binary() returns the fresh artifact. "
+                             "Pass --no-binary-swap to opt out (the dist binary stays "
+                             "untouched even if a fresher build exists).")
+    # Fix 5 (v0.2.13): control the Path A tier-3 retry inside _register_mcps.
+    parser.add_argument("--prefer-only-bundled", dest="prefer_only_bundled",
+                        action="store_true", default=False,
+                        help="MCP registration: restrict launcher-binary resolution "
+                             "to the bundled tier-1 path only — skip tier-2 (download) "
+                             "and tier-3 (cargo rebuild) AND the v0.2.13 Fix-5 retry. "
+                             "Used by latency-sensitive contexts that can't afford a "
+                             "15-25 min cargo build (e.g. mid-prompt registration).")
+    parser.add_argument("--no-rebuild-on-stale", dest="no_rebuild_on_stale",
+                        action="store_true", default=False,
+                        help="MCP registration: skip the v0.2.13 Fix-5 tier-3 retry "
+                             "even when the launcher CLI times out / exits non-zero "
+                             "against a tier-1 (potentially stale) binary. Useful for "
+                             "CI / scripted runs that explicitly opt out of cargo "
+                             "fallback. Tier-1/2/3 binary RESOLUTION itself is "
+                             "unaffected — this only gates the post-failure retry.")
     parser.add_argument("--project-folder", type=str, default=None,
                         help="Folder where .claude/context/UPDATE_DEFERRED.md should "
                              "land. Defaults to the orchestrator's PROJECT_ROOT "
@@ -2133,6 +2171,12 @@ def main() -> int:
         return _run_lightweight(args)
 
     mode = "update" if args.update else "install"
+
+    # Fix 1 (v0.2.13): mark this run's start timestamp so
+    # _refresh_dist_binary_after_rebuild can tell "produced this run" apart
+    # from "stale from weeks ago".
+    global _INSTALL_START_TS
+    _INSTALL_START_TS = time.time()
 
     # Configure resume-from-log behaviour. Loaded BEFORE any step runs so
     # individual step functions can consult _should_skip_step(). The log
@@ -2649,8 +2693,31 @@ def main() -> int:
     # for the 4-tier launcher-binary resolution strategy and the
     # security-boundary rationale for the env-key allowlist.
     if not getattr(args, "skip_mcp_registration", False):
+        # Fix 1 (v0.2.13): if a pipeline step earlier in this run produced
+        # a fresh launcher binary at target/release/vct-launcher-temp,
+        # copy it into launcher/dist/<os>-<arch>/ BEFORE _register_mcps
+        # resolves a binary. This closes the gap where --update finds a
+        # stale dist binary (tier-1 success) and never invokes tier-3 to
+        # refresh it. Gated by --no-binary-swap.
         try:
-            _register_mcps(PROJECT_ROOT, _deferral_report)
+            _refresh_dist_binary_after_rebuild(
+                PROJECT_ROOT,
+                no_swap=bool(getattr(args, "no_binary_swap", False)),
+                install_start_ts=globals().get("_INSTALL_START_TS"),
+            )
+        except Exception as exc:  # noqa: BLE001 — soft-fail by design
+            _log_install_event(
+                "refresh_dist_binary", "error",
+                f"unexpected exception: {exc}",
+            )
+
+        try:
+            _register_mcps(
+                PROJECT_ROOT,
+                _deferral_report,
+                prefer_only_bundled=bool(getattr(args, "prefer_only_bundled", False)),
+                no_rebuild_on_stale=bool(getattr(args, "no_rebuild_on_stale", False)),
+            )
         except Exception as exc:  # noqa: BLE001 — soft-fail by design
             print(
                 f"  MCP registration raised unexpectedly: {exc}. "
@@ -2732,6 +2799,27 @@ def main() -> int:
     # invocation is a no-op (writes the same .desktop body).
     _run_desktop_icon_step(args)
 
+    # Fix 6 (v0.2.13): re-write the deferral report AFTER all post-line-2611
+    # deferral-adding steps complete (_check_searxng_remnants,
+    # _check_ollama_mcp_remnants, _check_search_mcp_env_obsolete,
+    # _register_mcps, _materialize_boot_service, _rewrite_stale_mcp_entries).
+    # The earlier write at line ~2611 happens BEFORE those steps and would
+    # otherwise lose every entry they add.
+    #
+    # Additionally, on --update runs that ended with ZERO entries, write a
+    # stub UPDATE_DEFERRED.md so the user has a paper trail confirming the
+    # update completed cleanly (was previously: NO file at all, indistinguishable
+    # from "no --update run happened").
+    try:
+        wrote_entries = _deferral_report.write(_deferral_folder)
+        if not wrote_entries and args.update:
+            _write_update_deferred_stub(_deferral_folder, mode=mode)
+    except Exception as exc:  # noqa: BLE001 — soft-fail by design
+        _log_install_event(
+            "deferral_report", "warn",
+            f"final write failed: {exc}",
+        )
+
     print()
     print("=" * 62)
     print("  Installation complete!")
@@ -2739,6 +2827,69 @@ def main() -> int:
     print()
     _print_next_steps(sysinfo, args)
     return 0
+
+
+def _write_update_deferred_stub(folder: Path, *, mode: str) -> None:
+    """Fix 6 (v0.2.13): write a stub ``UPDATE_DEFERRED.md`` for paper-trail.
+
+    Called at end of ``--update`` runs that produced ZERO actionable
+    deferral entries. The stub records the timestamp and mode so users
+    grepping ``.claude/context/`` know an update ran cleanly. Previous
+    behaviour was to write NO file in this case, which made successful
+    updates indistinguishable from "no update happened at all".
+
+    Soft-fail throughout: any OSError is swallowed and logged. The install
+    must complete even when this stub write fails.
+
+    Schema: a single-frontmatter Markdown file with no entries. The
+    :class:`DeferralReport` reader treats unknown / empty payloads as an
+    empty report — so reading this file back via ``DeferralReport.read()``
+    yields ``[]`` and apply-deferred is a no-op. Idempotent: overwrites
+    any prior stub.
+    """
+    from datetime import datetime, timezone
+
+    target = folder / ".claude" / "context" / "UPDATE_DEFERRED.md"
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        _log_install_event(
+            "deferral_report_stub", "warn",
+            f"could not create parent {target.parent}: {exc}",
+        )
+        return
+
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    content = (
+        "---\n"
+        "schema_version: 1\n"
+        "generated_by: install.py\n"
+        f"generated_at: {ts}\n"
+        "entries: 0\n"
+        "stub: true\n"
+        "---\n\n"
+        f"# No deferrals from update at {ts}\n\n"
+        f"This file is a stub: `install.py --{mode}` completed cleanly "
+        "with zero actionable deferral conditions.\n\n"
+        "If you expected deferral entries (e.g. you re-ran after fixing "
+        "a known issue), they were resolved during this run. Otherwise "
+        "this file confirms the update ran end-to-end without surfacing "
+        "any conditions requiring follow-up.\n\n"
+        "Safe to delete; install.py re-creates it on the next --update.\n"
+    )
+
+    try:
+        target.write_text(content, encoding="utf-8")
+    except OSError as exc:
+        _log_install_event(
+            "deferral_report_stub", "warn",
+            f"could not write {target}: {exc}",
+        )
+        return
+    _log_install_event(
+        "deferral_report_stub", "ok",
+        f"wrote stub UPDATE_DEFERRED.md at {target} (zero entries)",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -8110,6 +8261,166 @@ def _try_cargo_tauri_build(install_root: Path) -> Optional[Path]:
     return target_path if target_path.is_file() else None
 
 
+def _read_tauri_conf_version(install_root: Path) -> Optional[str]:
+    """Parse ``"version": "..."`` from ``launcher/src-tauri/tauri.conf.json``.
+
+    Returns None on any read / parse failure (soft-fail). Used by
+    :func:`_refresh_dist_binary_after_rebuild` to detect dist binaries
+    that are older than the current source version.
+    """
+    conf = install_root / "launcher" / "src-tauri" / "tauri.conf.json"
+    if not conf.is_file():
+        return None
+    try:
+        data = json.loads(conf.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    version = data.get("version")
+    if isinstance(version, str) and version.strip():
+        return version.strip()
+    return None
+
+
+def _refresh_dist_binary_after_rebuild(
+    install_root: Path,
+    *,
+    no_swap: bool = False,
+    install_start_ts: Optional[float] = None,
+) -> Optional[Path]:
+    """Fix 1 (v0.2.13): copy a freshly-built ``target/release/vct-launcher-temp``
+    into ``launcher/dist/<os>-<arch>/vct-launcher`` when it's genuinely newer.
+
+    Background: ``_try_cargo_tauri_build`` (tier-3) already copies to dist as
+    part of its own flow. But in ``--update`` mode with an existing-but-stale
+    bundled binary at ``dist/linux-x64/vct-launcher``, the tier-1 resolver
+    returns SUCCESS for the stale binary and tier-3 is never invoked.
+    A separate pipeline step (e.g. user-driven launcher rebuild via the
+    launcher's own UI flow, or a CI rebuild on the orchestrator clone) may
+    have produced a fresh ``target/release/vct-launcher-temp`` without
+    copying it to dist. This helper closes that gap.
+
+    Conservative gating (only swap when ALL conditions are met):
+
+      1. ``target/release/vct-launcher-temp`` exists and is a regular file.
+      2. ``vct-launcher-temp`` mtime is strictly newer than the dist binary's
+         mtime (or the dist binary does not exist yet).
+      3. EITHER the source mtime is newer than ``install_start_ts`` (proving
+         it was produced during this install run), OR the dist binary's
+         embedded version is older than ``tauri.conf.json`` (proving the
+         dist artifact is stale w.r.t. the current source).
+      4. ``no_swap`` is False.
+
+    Args:
+        install_root: Repository root.
+        no_swap: When True, this helper is a no-op (mirrors ``--no-binary-swap``).
+        install_start_ts: Optional unix timestamp marking the start of this
+            install run. When provided, source files older than this are
+            considered "stale from a prior run" and ignored (extra safety).
+
+    Returns:
+        The dist path that was refreshed, or None when nothing was done.
+
+    Soft-fail throughout — any OSError is swallowed and a warning is logged.
+    The install must complete even when this helper fails.
+    """
+    if no_swap:
+        _log_install_event(
+            "refresh_dist_binary", "skip",
+            "--no-binary-swap set; skipping post-rebuild dist refresh",
+        )
+        return None
+
+    src = (
+        install_root
+        / "launcher"
+        / "src-tauri"
+        / "target"
+        / "release"
+        / "vct-launcher-temp"
+    )
+    if not src.is_file():
+        return None
+
+    subdir, fname = _launcher_binary_relative_path()
+    dist_dir = install_root / "launcher" / "dist" / subdir
+    dist_path = dist_dir / fname
+
+    try:
+        src_mtime = src.stat().st_mtime
+    except OSError as exc:
+        _log_install_event(
+            "refresh_dist_binary", "warn",
+            f"could not stat src binary: {exc}",
+        )
+        return None
+
+    dist_mtime: Optional[float] = None
+    if dist_path.is_file():
+        try:
+            dist_mtime = dist_path.stat().st_mtime
+        except OSError:
+            dist_mtime = None
+
+    # Gate 2: source must be strictly newer than dist (or dist absent).
+    if dist_mtime is not None and src_mtime <= dist_mtime:
+        return None
+
+    # Gate 3: prove the source was either produced in this run OR the dist
+    # binary is version-stale. Either signal is sufficient (we don't require
+    # both — version-stale dist is enough on its own to justify a swap, and
+    # a fresh in-run build is enough even when no version drift exists).
+    produced_in_run = (
+        install_start_ts is not None and src_mtime >= install_start_ts
+    )
+    version_stale = False
+    if not produced_in_run and dist_path.is_file():
+        # No "fresh in-run" evidence — fall back to version-drift check.
+        current_version = _read_tauri_conf_version(install_root)
+        if current_version is not None:
+            # We don't introspect the binary itself for its embedded version
+            # (no portable, cheap way to do that). Proxy: the dist binary's
+            # mtime is older than the tauri.conf.json's mtime — that's a
+            # strong "dist artifact built against an older source version"
+            # signal. False positives are limited to "user touched
+            # tauri.conf.json after build" which is rare and harmless.
+            conf = install_root / "launcher" / "src-tauri" / "tauri.conf.json"
+            try:
+                version_stale = conf.stat().st_mtime > dist_mtime
+            except OSError:
+                version_stale = False
+    if not produced_in_run and not version_stale and dist_path.is_file():
+        # Conservative bailout: source is newer than dist but we have no
+        # corroborating evidence that this is a real upgrade vs. e.g. a
+        # touched-but-unmodified file. Skip.
+        return None
+
+    # Gate 1+4 already enforced above. Perform the swap.
+    try:
+        dist_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dist_path)
+        if not platform.system().lower().startswith("win"):
+            try:
+                dist_path.chmod(0o755)
+            except OSError:
+                # Best-effort: fall through; the copy itself succeeded.
+                pass
+    except OSError as exc:
+        _log_install_event(
+            "refresh_dist_binary", "warn",
+            f"copy {src} → {dist_path} failed: {exc}",
+        )
+        return None
+
+    _log_install_event(
+        "refresh_dist_binary", "ok",
+        f"refreshed {dist_path} from {src} "
+        f"(produced_in_run={produced_in_run}, version_stale={version_stale})",
+    )
+    return dist_path
+
+
 def _ensure_launcher_binary(
     install_root: Path,
     *,
@@ -8331,11 +8642,20 @@ def _python_fallback_write_mcp_entries(
 def _register_mcps(
     install_root: Path,
     deferral_report: "DeferralReport",
+    *,
+    prefer_only_bundled: bool = False,
+    no_rebuild_on_stale: bool = False,
 ) -> None:
     """Register the bundled-orchestrator MCPs into ~/.claude.json.
 
     Path A (preferred): invoke the launcher binary CLI:
       <binary> --register-default-mcps <install_root>
+    Path A-retry (Fix 5, v0.2.13): if Path A's launcher CLI exits
+      non-zero OR times out AND the resolved binary came from tier-1
+      (bundled, potentially stale), explicitly invoke tier-3
+      (``_try_cargo_tauri_build``) to produce a fresh binary, then
+      retry the CLI ONCE with the rebuilt binary. Skipped when
+      *prefer_only_bundled* or *no_rebuild_on_stale* is True.
     Path B (fallback): pure-Python JSON merge.
 
     Soft-fail throughout. install completion does NOT depend on this
@@ -8345,6 +8665,16 @@ def _register_mcps(
     Mutates ~/.claude.json (or VCT_USER_HOME_OVERRIDE/.claude.json for
     tests). Does NOT touch per-project .claude/settings.json — that's
     managed separately by the launcher's write_project_env_files.
+
+    Args:
+        install_root: Repository root.
+        deferral_report: Run-scoped report to append soft-fail entries to.
+        prefer_only_bundled: When True, restrict to bundled-binary lookup
+            and skip the Fix-5 tier-3 retry (latency-sensitive contexts).
+        no_rebuild_on_stale: When True, skip the Fix-5 tier-3 retry even
+            when Path A appears to have failed against a stale binary.
+            Useful for scripted / CI flows that explicitly opt out of the
+            cargo-rebuild fallback.
     """
     claude_json = _user_home_for_install() / ".claude.json"
 
@@ -8357,10 +8687,18 @@ def _register_mcps(
     print()
     print("Registering bundled MCP servers in ~/.claude.json...")
 
-    # Path A: launcher binary CLI.
-    binary = _ensure_launcher_binary(install_root)
-    if binary is not None:
-        cmd = [str(binary), "--register-default-mcps", str(install_root)]
+    def _invoke_launcher_cli(bin_path: Path) -> tuple[bool, bool]:
+        """Run ``<bin> --register-default-mcps <install_root>``.
+
+        Returns ``(success, transient_failure)`` where:
+          * ``success`` is True when the CLI exited 0.
+          * ``transient_failure`` is True when the CLI either timed out
+            or exited non-zero (signals "stale binary doesn't recognise
+            the flag" — the Fix-5 trigger condition). False when the
+            binary couldn't be invoked at all (OSError / SubprocessError
+            other than timeout).
+        """
+        cmd = [str(bin_path), "--register-default-mcps", str(install_root)]
         env = os.environ.copy()
         env["WEAVIATE_PORT"] = str(weaviate_port)
         env["OLLAMA_PORT"] = str(ollama_port)
@@ -8374,27 +8712,106 @@ def _register_mcps(
                 timeout=30,
                 env=env,
             )
+        except subprocess.TimeoutExpired as exc:
+            _log_install_event(
+                "register_mcps", "warn",
+                f"launcher binary timed out after 30s: {exc}",
+            )
+            print(
+                f"  Launcher binary CLI timed out after 30s "
+                f"(binary may be stale and not recognise --register-default-mcps).",
+                file=sys.stderr,
+            )
+            return (False, True)
         except (subprocess.SubprocessError, OSError) as exc:
             _log_install_event(
                 "register_mcps", "warn",
                 f"launcher binary invocation failed: {exc}",
             )
-            print(f"  Launcher binary CLI failed: {exc}. Falling back to Python writer.",
-                  file=sys.stderr)
-        else:
-            # Forward the launcher's own stdout/stderr for visibility.
-            if result.stdout:
-                print(result.stdout, end="")
-            if result.stderr:
-                sys.stderr.write(result.stderr)
-            if result.returncode == 0:
+            print(
+                f"  Launcher binary CLI failed: {exc}. Falling back to Python writer.",
+                file=sys.stderr,
+            )
+            return (False, False)
+        # Forward the launcher's own stdout/stderr for visibility.
+        if result.stdout:
+            print(result.stdout, end="")
+        if result.stderr:
+            sys.stderr.write(result.stderr)
+        if result.returncode == 0:
+            _log_install_event(
+                "register_mcps", "ok",
+                f"registered via launcher binary at {bin_path}",
+            )
+            return (True, False)
+        _log_install_event(
+            "register_mcps", "warn",
+            f"launcher binary exit {result.returncode}",
+        )
+        print(
+            f"  Launcher binary CLI returned exit {result.returncode}.",
+            file=sys.stderr,
+        )
+        return (False, True)
+
+    # Path A: launcher binary CLI.
+    binary = _ensure_launcher_binary(
+        install_root, prefer_only_bundled=prefer_only_bundled,
+    )
+    path_a_succeeded = False
+    path_a_transient_failure = False
+    if binary is not None:
+        path_a_succeeded, path_a_transient_failure = _invoke_launcher_cli(binary)
+        if path_a_succeeded:
+            # Stale-MCP-entry detection (--update mode only). The
+            # launcher writer doesn't touch entries outside the
+            # bundled set, so this check is post-write here.
+            _detect_stale_mcp_entries(install_root, claude_json, deferral_report)
+            return
+
+    # Fix 5 (v0.2.13): Path A-retry — when Path A's CLI failed transiently
+    # (timeout / non-zero exit) and the resolved binary came from tier-1
+    # (potentially stale bundled artifact), explicitly drive tier-3 to
+    # produce a fresh binary and retry the CLI ONCE. Stale-binary symptom:
+    # bundled binary at dist/<os>-<arch>/ doesn't recognise
+    # ``--register-default-mcps`` (older release without the CLI flag),
+    # tries to launch the GUI instead, hits our 30s timeout, then we
+    # fall straight to Python without ever consulting tier-3.
+    #
+    # Gated OFF when:
+    #   * prefer_only_bundled is True (caller wants only tier-1 — see
+    #     PR-28 storage-config-prompt path), OR
+    #   * no_rebuild_on_stale is True (caller opted out of the cargo
+    #     rebuild fallback), OR
+    #   * Path A succeeded or never ran (binary is None — tier-1 missed,
+    #     so no "stale" hypothesis exists), OR
+    #   * Path A's failure was NOT transient (OSError before invocation),
+    #     because rebuilding a binary that we can't even spawn is unlikely
+    #     to help — fall straight to Python.
+    if (
+        path_a_transient_failure
+        and not prefer_only_bundled
+        and not no_rebuild_on_stale
+        and binary is not None
+    ):
+        fresh_binary = _try_cargo_tauri_build(install_root)
+        if fresh_binary is not None and fresh_binary != binary:
+            _log_install_event(
+                "register_mcps_tier3_retry", "ok",
+                f"retrying CLI with freshly-built binary at {fresh_binary} "
+                f"(original {binary} was stale)",
+            )
+            print(
+                f"  Retrying MCP registration with freshly-built launcher "
+                f"binary at {fresh_binary}.",
+                file=sys.stderr,
+            )
+            retry_succeeded, _ = _invoke_launcher_cli(fresh_binary)
+            if retry_succeeded:
                 _log_install_event(
-                    "register_mcps", "ok",
-                    f"registered via launcher binary at {binary}",
+                    "register_mcps_tier3_retry", "ok",
+                    "tier-3 retry succeeded — bundled binary refreshed",
                 )
-                # Stale-MCP-entry detection (--update mode only). The
-                # launcher writer doesn't touch entries outside the
-                # bundled set, so this check is post-write here.
                 _detect_stale_mcp_entries(install_root, claude_json, deferral_report)
                 # Deprecated-MCP-entry detection (PR-34). Same rationale:
                 # the launcher writer only updates the bundled set; any
@@ -8402,13 +8819,17 @@ def _register_mcps(
                 _detect_deprecated_mcp_entries(install_root, claude_json, deferral_report)
                 return
             _log_install_event(
-                "register_mcps", "warn",
-                f"launcher binary exit {result.returncode}; falling back to Python",
+                "register_mcps_tier3_retry", "warn",
+                "tier-3 retry also failed; falling through to Python writer",
             )
-            print(
-                f"  Launcher binary CLI returned exit {result.returncode}. "
-                "Falling back to Python writer.",
-                file=sys.stderr,
+        else:
+            # cargo unavailable OR cargo produced the same path (already
+            # refreshed by tier-3's own copy logic). Log so observability
+            # shows the retry was attempted-and-skipped.
+            _log_install_event(
+                "register_mcps_tier3_retry", "warn",
+                f"tier-3 retry could not produce a fresh binary "
+                f"(fresh={fresh_binary}); falling through to Python writer",
             )
 
     # Path B: pure-Python JSON merge. Always runs when Path A is
