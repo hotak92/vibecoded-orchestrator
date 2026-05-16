@@ -2014,11 +2014,13 @@ def main() -> int:
         # collection earlier this run AND seed/ensure later crashes, the
         # deferral entry includes `rebuild_pending_seed` so the operator knows
         # what was lost.
+        _seed_succeeded = False
         try:
             _ensure_collections(embed_config, decisions=decisions, args=args)
             # Seed Weaviate with bundled knowledge/ + docs/. Idempotent;
             # safe to re-run on update.
             _seed_weaviate(args)
+            _seed_succeeded = True
         except Exception as _weaviate_err:
             # PR 6: Weaviate is unreachable (or refused connection) after the
             # containers were started. Attempt a soft-recovery restart
@@ -2035,6 +2037,7 @@ def main() -> int:
                 _ensure_collections(embed_config, decisions=decisions, args=args)
                 _seed_weaviate(args)
                 _restarted = True
+                _seed_succeeded = True
             except Exception:
                 pass
             if not _restarted:
@@ -2100,6 +2103,13 @@ def main() -> int:
                             ],
                         )
                     )
+
+        # PR-24 (v0.2.12, 2026-05-16): schema-correctness migrations.
+        # Run AFTER _seed_weaviate so the collections exist before we
+        # attempt additive patches. Both scripts are idempotent and
+        # soft-fail; failures convert to deferral entries.
+        if _seed_succeeded:
+            _run_schema_migration_scripts(_deferral_report)
     else:
         print("\n[skip] Container services (--no-containers)")
         print("[skip] Weaviate seeding (--no-containers)")
@@ -5721,6 +5731,148 @@ def _seed_weaviate(args: argparse.Namespace) -> None:
         )
     else:
         _log_install_event("7c/10", "ok", "all seed sub-steps completed")
+
+
+# ---------------------------------------------------------------------------
+# Schema-correctness migrations (PR-24, v0.2.12, 2026-05-16)
+# ---------------------------------------------------------------------------
+
+
+def _run_schema_migration_scripts(deferral_report: "DeferralReport") -> None:
+    """Run the two schema-correctness migration scripts that ship in
+    ``scripts/``:
+
+      1. ``migrate-development-temporal-props.{sh,ps1}`` — adds the four
+         canonical temporal properties (``created``, ``updated``,
+         ``valid_from``, ``valid_until``) to every existing
+         ``*_Development`` collection. Properties CAN be added
+         retroactively via the Weaviate v1 REST schema API, so this is
+         an additive in-place patch.
+      2. ``migrate-shared-kg-schema.{sh,ps1}`` — drops + recreates the
+         shared KG collection when its schema lacks
+         ``invertedIndexConfig.indexNullState=True``. Weaviate <=1.30
+         cannot add that retroactively, so the only fix is a destructive
+         recreate. Safe because shared-KG content derives from
+         ``knowledge/**/*.md`` and the script re-syncs after recreate.
+
+    Both scripts are idempotent and soft-fail. A non-zero exit (or a
+    failed spawn) emits a ``schema_migration_failed`` deferral entry but
+    does NOT abort install.py. OS dispatch:
+
+      - Linux + macOS: bash ``scripts/<name>.sh``
+      - Windows:       PowerShell ``scripts/<name>.ps1``
+
+    The deferral entry includes the explicit command to apply the
+    migration manually so users can retry on demand.
+    """
+    print("[7d/10] Running schema-correctness migrations ... ", flush=True)
+    _log_install_event("7d/10", "start", "schema migration scripts")
+
+    if sys.platform == "win32":
+        script_ext = ".ps1"
+    else:
+        script_ext = ".sh"
+
+    scripts_dir = PROJECT_ROOT / "scripts"
+    migrations = [
+        ("development_temporal_props",
+         f"migrate-development-temporal-props{script_ext}",
+         "Add temporal properties to existing Development collections."),
+        ("shared_kg_schema",
+         f"migrate-shared-kg-schema{script_ext}",
+         "Drop + recreate the shared KG when indexNullState is missing."),
+    ]
+
+    for migration_id, script_name, description in migrations:
+        script_path = scripts_dir / script_name
+        if not script_path.exists():
+            print(f"  [migrate:{migration_id}] {script_name} not found; skipping.")
+            _log_install_event(
+                "7d/10", "skip",
+                f"{migration_id}: script not present at {script_path}",
+            )
+            continue
+
+        if sys.platform == "win32":
+            cmd = [
+                "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                "-File", str(script_path),
+            ]
+        else:
+            cmd = ["bash", str(script_path)]
+
+        print(f"  [migrate:{migration_id}] {description}")
+        try:
+            rc = subprocess.call(
+                cmd, cwd=str(PROJECT_ROOT), timeout=300,
+            )
+        except (OSError, subprocess.TimeoutExpired) as e:
+            print(f"  [migrate:{migration_id}] spawn failed: {e}")
+            _log_install_event(
+                "7d/10", "error",
+                f"{migration_id}: spawn failed: {e}",
+            )
+            deferral_report.add_entry(
+                DeferralEntry(
+                    condition_id=f"schema_migration_failed_{migration_id}",
+                    title=f"Schema migration failed: {migration_id}",
+                    detected=(
+                        f"Migration script `scripts/{script_name}` failed to "
+                        f"launch: {e}"
+                    ),
+                    why_deferred=(
+                        "The migration script could not be invoked. Search "
+                        "and stale-data filtering may misbehave until the "
+                        "migration is applied manually."
+                    ),
+                    command_to_apply=(
+                        f"{'powershell.exe -File ' if sys.platform == 'win32' else 'bash '}"
+                        f"scripts/{script_name}"
+                    ),
+                    severity="warning",
+                    kg_node_refs=[],
+                )
+            )
+            continue
+
+        if rc != 0:
+            print(f"  [migrate:{migration_id}] exit rc={rc} (non-fatal)")
+            _log_install_event(
+                "7d/10", "warn",
+                f"{migration_id}: exit rc={rc}",
+                data={"rc": rc, "script": str(script_path)},
+            )
+            deferral_report.add_entry(
+                DeferralEntry(
+                    condition_id=f"schema_migration_failed_{migration_id}",
+                    title=f"Schema migration failed: {migration_id}",
+                    detected=(
+                        f"Migration script `scripts/{script_name}` exited "
+                        f"with non-zero status (rc={rc})."
+                    ),
+                    why_deferred=(
+                        "Search and stale-data filtering may misbehave on "
+                        "the affected collections until the migration is "
+                        "applied successfully. Re-run the script manually "
+                        "after addressing the underlying cause (e.g. "
+                        "Weaviate not running, missing jq, etc.)."
+                    ),
+                    command_to_apply=(
+                        f"{'powershell.exe -File ' if sys.platform == 'win32' else 'bash '}"
+                        f"scripts/{script_name}"
+                    ),
+                    severity="warning",
+                    kg_node_refs=[],
+                )
+            )
+            continue
+
+        _log_install_event(
+            "7d/10", "ok",
+            f"{migration_id}: migration script completed",
+        )
+
+    _log_install_event("7d/10", "ok", "schema migrations completed")
 
 
 # ---------------------------------------------------------------------------

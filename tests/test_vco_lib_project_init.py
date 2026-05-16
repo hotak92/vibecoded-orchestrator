@@ -281,6 +281,46 @@ class SchemaDefinitionTests(unittest.TestCase):
         self.assertIn("typed_links", prop_names)
         self.assertIn("status", prop_names)
 
+    def test_development_class_required_properties_present(self):
+        # PR-24 (2026-05-16): Development schema gained the four
+        # canonical temporal properties so the MCP `_stale_filter`
+        # (valid_until is_none(True) | valid_until > now) doesn't fail
+        # with "no such prop with name 'valid_until'" on Development
+        # collections. Names + dataType must mirror the KG schema.
+        schema = project_init.development_class_definition("FooDev")
+        props = {p["name"]: p for p in schema["properties"]}
+        # Base content fields preserved.
+        self.assertIn("title", props)
+        self.assertIn("content", props)
+        self.assertIn("file_path", props)
+        # New temporal fields present with date dataType.
+        for prop_name in ("created", "updated", "valid_from", "valid_until"):
+            self.assertIn(prop_name, props,
+                          f"Development schema missing temporal '{prop_name}'")
+            self.assertEqual(
+                props[prop_name]["dataType"], ["date"],
+                f"Development.{prop_name} must be dataType=['date'] "
+                f"to align with KG schema (was {props[prop_name]['dataType']!r})",
+            )
+
+    def test_development_temporal_props_use_date_dataType(self):
+        # The KG class definition does NOT statically declare temporal
+        # properties — they are added at sync time by
+        # `.claude/scripts/add_temporal_metadata.py`. The Development
+        # class DOES declare them statically (Development docs don't go
+        # through the per-node frontmatter path). The shared invariant
+        # is that whenever temporal props ARE present, they use the
+        # `date` dataType, matching what MCP filters expect.
+        dev = project_init.development_class_definition("FooDev")
+        dev_props = {p["name"]: p["dataType"] for p in dev["properties"]}
+        for prop_name in ("created", "updated", "valid_from", "valid_until"):
+            self.assertEqual(
+                dev_props.get(prop_name), ["date"],
+                f"Development.{prop_name} must be ['date'] (got "
+                f"{dev_props.get(prop_name)!r}); MCP `_stale_filter` "
+                f"requires date-typed properties for is_none/comparison."
+            )
+
     def test_kg_class_name_threaded_through(self):
         # The `class` field carries the caller-supplied name verbatim.
         self.assertEqual(
