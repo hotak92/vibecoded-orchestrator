@@ -596,23 +596,22 @@ jobs:
   # `git clone` always ships a binary that matches HEAD.
   #
   # ⚠️  BRANCH-PROTECTION PREREQUISITE — this job pushes directly to main.
-  # The ruleset "enforce PR + tests on main" currently has bypass_actors: [].
-  # Until the GitHub Actions integration is added to bypass_actors, this push
-  # will fail with a 403.  To unblock, run once (owner / admin only):
+  # If your default branch is protected by a ruleset that requires PR review
+  # or status checks, the push will 403 unless one of two options is in
+  # place:
   #
-  #   gh api --method PUT repos/hotak92/vibecoded-orchestrator/rulesets/15644739 \
-  #     --input - <<'JSON'
-  #   {
-  #     "bypass_actors": [
-  #       { "actor_id": 41898282, "actor_type": "Integration", "bypass_mode": "always" }
-  #     ]
-  #   }
-  #   JSON
+  # Option A (recommended for org-owned repos):
+  #   Add the GitHub Actions bot to the ruleset's `bypass_actors` list:
+  #     { "actor_id": 41898282, "actor_type": "Integration", "bypass_mode": "always" }
+  #   actor_id 41898282 is the canonical GitHub Actions Bot integration ID.
   #
-  # actor_id 41898282 is the canonical GitHub Actions Bot integration ID.
-  # bypass_mode "always" lets it bypass even without PR review.
-  # Alternatively, change bypass_mode to "pull_request" if you only want it
-  # to bypass required reviews but not other rules — "always" is simpler.
+  # Option B (required for personal-account repos):
+  #   The Integration-type bypass actor only works on org-owned repos.
+  #   On a user-owned repo, set a `DIST_COMMIT_TOKEN` repository secret to
+  #   a fine-grained PAT with `Contents: Write` on this repo (the PAT bypasses
+  #   ruleset enforcement when it belongs to a repo admin). The "Push updated
+  #   binaries" step below honours `${{ secrets.DIST_COMMIT_TOKEN }}` when
+  #   present and falls back to `${{ secrets.GITHUB_TOKEN }}` otherwise.
   #
   # The commit is skipped (no-op) when:
   #   - workflow_dispatch input skip_dist_commit == true  (manual override)
@@ -634,10 +633,13 @@ jobs:
         with:
           # Fetch full history so we can check byte-equality before committing.
           fetch-depth: 1
-          # Use the default GITHUB_TOKEN — push will fail here (403) until
-          # bypass_actors is configured; the error message will make the
-          # root cause clear (see comment above).
-          token: ${{ secrets.GITHUB_TOKEN }}
+          # Prefer DIST_COMMIT_TOKEN (a fine-grained PAT with Contents:Write
+          # on this repo, configured as a repository secret). This bypasses
+          # branch-protection on user-owned repos where Integration-type
+          # bypass_actors do not apply. Falls back to GITHUB_TOKEN if the
+          # secret is not set — that path will 403 against a protected
+          # branch but works against unprotected ones.
+          token: ${{ secrets.DIST_COMMIT_TOKEN || secrets.GITHUB_TOKEN }}
 
       # Download all three OS launcher binaries produced by the build matrix.
       # Each artifact is named `vct-launcher-<target>` and contains:
@@ -767,10 +769,12 @@ jobs:
           Binaries: linux-x64, windows-x64, macos-arm64.
           Source tag: v${VERSION}  Run: ${{ github.run_id }}"
 
-          # Push to main. This will 403 until bypass_actors is configured
-          # (see job-level comment). The error from GitHub will be:
-          # "Push declined by repository rules" — follow the bypass_actors
-          # setup instructions in the comment above this job.
+          # Push to main using the token configured at checkout time —
+          # DIST_COMMIT_TOKEN if set (preferred for protected branches),
+          # GITHUB_TOKEN otherwise. On a protected branch with neither
+          # bypass_actors nor a PAT-secret-with-bypass, the push will
+          # 403 with "Push declined by repository rules" — set up either
+          # option per the job-level comment to unblock.
           git push origin HEAD:main
 
       - name: Report no-op (all binaries already up to date)
