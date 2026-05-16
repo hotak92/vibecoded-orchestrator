@@ -18,45 +18,71 @@ use state::{AppManager, ProjectState, ProjectStore};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-/// PR-23 (v0.2.12, 2026-05-16): CLI mode — `--register-default-mcps <root>`.
+// ---------------------------------------------------------------------------
+// v0.2.12 — install-time CLI subcommands
+// ---------------------------------------------------------------------------
+//
+// The launcher binary doubles as a CLI tool for headless install flows.
+// install.py shells out here to perform JSON-merge / storage-config writes
+// without spinning up the Tauri GUI / system tray.
+//
+// Two subcommands are wired today (originally separate PRs, unified at
+// merge time on `integration/v0.2.12`):
+//
+//   * `--register-default-mcps <install_root>` (PR-23, Group B): writes the
+//     canonical bundled-orchestrator MCP entries into `~/.claude.json` AND
+//     (when a project row already exists) the launcher.db. Ports forwarded
+//     by install.py via WEAVIATE_PORT / OLLAMA_PORT / CODE_EMBED_PORT /
+//     WEAVIATE_GRPC_PORT env vars.
+//
+//   * `--set-storage-config <named|bind|deferred> [--bind-path service=path]...`
+//     (PR-28, Group G): persists the user's storage-mode decision from the
+//     install.py interactive prompt to `~/.vct/storage.toml` and regenerates
+//     `infrastructure/compose.override.yaml` if needed.
+//
+// Contract: when `handle_cli_args()` returns `Some(exit_code)` we exit
+// immediately. The GUI startup path is gated on `None`. This MUST stay
+// gated before `tauri::Builder::default()` so a CLI invocation in CI /
+// install.py never tries to materialize a window.
+//
+// Manual arg parsing (no clap dep). Each subcommand has a dedicated
+// handler. To add a new subcommand: extend the `match` arm in
+// `handle_cli_args()`.
+fn handle_cli_args() -> Option<i32> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 2 {
+        return None;
+    }
+    match args[1].as_str() {
+        "--set-storage-config" => Some(handle_set_storage_config_cli(&args[2..])),
+        "--register-default-mcps" => Some(handle_register_default_mcps_cli(&args[2..])),
+        _ => None,
+    }
+}
+
+/// `vct-launcher --register-default-mcps <install_root>`
 ///
-/// install.py shells out to the launcher binary with this flag to wire the
-/// canonical bundled-orchestrator MCP entries into `~/.claude.json` AND
-/// (when a project row already exists) the launcher.db. We dispatch and
-/// `std::process::exit` BEFORE entering the Tauri builder so the GUI never
-/// starts. Pure stdout-only output — never opens a window.
+/// install.py invokes this to wire the canonical bundled-orchestrator MCP
+/// entries into `~/.claude.json` AND (when a project row already exists)
+/// the launcher.db. Pure stdout-only output — never opens a window.
 ///
 /// Exit codes:
-///   0  — at least one MCP registered (or zero MCPs requested, edge case)
-///   1  — fatal error (no venv-python, JSON write failure, etc.)
-///
-/// Why parse `std::env::args()` by hand instead of pulling in `clap`:
-///   `clap` is not currently a dependency of the launcher crate; adding it
-///   for one flag would bloat the binary by ~200 KB. The flag-detection
-///   shape here is intentionally trivial and order-tolerant.
-fn maybe_handle_cli_subcommand() {
-    let args: Vec<String> = std::env::args().collect();
-    // Look for `--register-default-mcps <PATH>` anywhere in argv. We do
-    // NOT consume positional args; any other Tauri-style arg (which is
-    // currently none — the launcher takes zero positional args) would
-    // be ignored here and the function returns to let Tauri start.
-    let flag = "--register-default-mcps";
-    let pos = args.iter().position(|a| a == flag);
-    if let Some(idx) = pos {
-        let install_root = match args.get(idx + 1) {
-            Some(p) if !p.starts_with("--") => std::path::PathBuf::from(p),
-            _ => {
-                eprintln!(
-                    "[vct] {} requires a path argument, e.g. \
-                     vct-launcher {} /path/to/orchestrator/install",
-                    flag, flag
-                );
-                std::process::exit(1);
-            }
-        };
-        let exit_code = cli_register_default_mcps(&install_root);
-        std::process::exit(exit_code);
-    }
+///   0 — at least one MCP registered (or zero MCPs requested, edge case)
+///   1 — fatal error (no venv-python, JSON write failure, etc.) OR partial
+///       success (install.py treats non-zero as a soft-fail and falls
+///       through to the Python JSON path).
+fn handle_register_default_mcps_cli(rest: &[String]) -> i32 {
+    let install_root = match rest.first() {
+        Some(p) if !p.starts_with("--") => std::path::PathBuf::from(p),
+        _ => {
+            eprintln!(
+                "[vct] --register-default-mcps requires a path argument, e.g. \
+                 vct-launcher --register-default-mcps /path/to/orchestrator/install"
+            );
+            return 1;
+        }
+    };
+    cli_register_default_mcps(&install_root)
 }
 
 /// Run the `--register-default-mcps` flow synchronously and return the
@@ -128,8 +154,6 @@ fn cli_register_default_mcps(install_root: &std::path::Path) -> i32 {
             if report.all_succeeded() {
                 0
             } else {
-                // Partial success: install.py treats non-zero as a
-                // soft-fail and falls through to the Python JSON path.
                 1
             }
         }
@@ -140,12 +164,75 @@ fn cli_register_default_mcps(install_root: &std::path::Path) -> i32 {
     }
 }
 
+/// `vct-launcher --set-storage-config <named|bind|deferred>
+///                  [--bind-path service=path]...`
+///
+/// Exit codes:
+///   0 — config persisted (or `deferred` no-op).
+///   1 — validation / I/O error (printed to stderr).
+///   2 — usage error (missing mode arg).
+fn handle_set_storage_config_cli(rest: &[String]) -> i32 {
+    if rest.is_empty() {
+        eprintln!(
+            "usage: vct-launcher --set-storage-config <named|bind|deferred> \
+             [--bind-path service=path]..."
+        );
+        return 2;
+    }
+    let mode = &rest[0];
+    let mut bind_paths: Vec<(String, std::path::PathBuf)> = Vec::new();
+    let mut i = 1;
+    while i < rest.len() {
+        if rest[i] == "--bind-path" && i + 1 < rest.len() {
+            // Format: `service=/abs/path`. Anything malformed is logged
+            // + skipped — the helper's normalizer will reject the call
+            // if no valid path survives.
+            if let Some((service, path)) = rest[i + 1].split_once('=') {
+                let s = service.trim();
+                let p = path.trim();
+                if s.is_empty() || p.is_empty() {
+                    eprintln!(
+                        "[vct] warning: --bind-path arg {:?} has empty service or path; \
+                         skipping",
+                        rest[i + 1]
+                    );
+                } else {
+                    bind_paths.push((s.to_string(), std::path::PathBuf::from(p)));
+                }
+            } else {
+                eprintln!(
+                    "[vct] warning: --bind-path arg {:?} missing `=`; expected \
+                     `service=/abs/path` — skipping",
+                    rest[i + 1]
+                );
+            }
+            i += 2;
+        } else if rest[i] == "--bind-path" {
+            eprintln!("[vct] warning: --bind-path missing value; ignoring trailing flag");
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+    match commands::storage_ux::set_storage_config_from_cli(mode, bind_paths) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            1
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // PR-23: CLI-only subcommand dispatch. Runs before any Tauri setup so
-    // install.py can invoke us without opening a GUI window. If no CLI
-    // flag is present, fall through to the GUI startup below.
-    maybe_handle_cli_subcommand();
+    // v0.2.12 (unified PR-23 + PR-28 dispatch): CLI subcommand dispatch
+    // BEFORE Tauri builder. Exits the process if a subcommand matched
+    // (--register-default-mcps for MCP installation, --set-storage-config
+    // for storage prompt persistence); falls through to the GUI startup
+    // path when args[1] is absent or unrecognised.
+    if let Some(exit_code) = handle_cli_args() {
+        std::process::exit(exit_code);
+    }
 
     let _initial_registry = registry::load_service_registry();
 

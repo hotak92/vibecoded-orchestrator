@@ -855,6 +855,226 @@ pub async fn detect_legacy_volumes() -> Result<Vec<DetectedLegacyVolume>, String
 }
 
 // ---------------------------------------------------------------------------
+// PR-28 (Group G, v0.2.12) — install-time CLI entrypoint
+// ---------------------------------------------------------------------------
+
+/// Persist a storage config chosen by install.py's interactive prompt and
+/// regenerate the compose override. Synchronous, GUI-free counterpart to
+/// `set_storage_config()` so the launcher binary can be invoked as a CLI
+/// (`vct-launcher --set-storage-config <mode> [--bind-path service=path]...`)
+/// from install.py without spinning up Tauri.
+///
+/// `mode` is one of:
+///   - `"named"`  — fresh named volumes (the legacy default behaviour).
+///                   `bind_paths` is ignored.
+///   - `"bind"`   — bind-mount per-service paths. `bind_paths` is the list
+///                  of `(logical_service, host_path)` tuples (e.g.
+///                  `("ollama", "/home/<user>/podman_volumes/ollama/models")`).
+///                  Unknown service keys are silently dropped by the
+///                  normalizer (matches the Tauri-command surface).
+///   - `"deferred"` — caller signalled "configure later via the GUI".
+///                    We intentionally return `Ok(())` without touching
+///                    storage.toml or the override. (install.py treats
+///                    `deferred` as a no-op upstream too; this branch is
+///                    defence-in-depth.)
+///
+/// Reuses `set_storage_config`'s validation + write logic (`normalize_config`,
+/// `write_storage_config_to`, the user-customization guard around the
+/// compose override). NOT async — install.py spawns this as a subprocess
+/// and waits synchronously, so we avoid pulling tokio into the call path.
+pub fn set_storage_config_from_cli(
+    mode: &str,
+    bind_paths: Vec<(String, PathBuf)>,
+) -> Result<(), String> {
+    // Deferred = caller decided to defer to the GUI. No-op; do not touch
+    // any on-disk state so a stale storage.toml from a previous install
+    // attempt is preserved exactly as-is.
+    if mode == "deferred" {
+        return Ok(());
+    }
+
+    // Build a StorageConfig from the CLI args.
+    let mut cfg = StorageConfig::default();
+    cfg.mode = mode.trim().to_ascii_lowercase();
+
+    if cfg.mode == "bind" {
+        for (service, path) in &bind_paths {
+            // Force forward-slash strings — the YAML renderer expects that
+            // shape on every OS. PathBuf preserves the user's slashes so
+            // we normalize here.
+            let path_s = yaml_path_str(path);
+            cfg.per_service_paths
+                .insert(service.clone(), path_s);
+        }
+    }
+
+    let normalized = normalize_config(cfg);
+
+    // Validate (same gates as the Tauri command).
+    if !["named", "bind"].contains(&normalized.mode.as_str()) {
+        return Err(format!(
+            "invalid storage mode {:?} — expected 'named' or 'bind'",
+            normalized.mode
+        ));
+    }
+    if normalized.mode == "bind"
+        && normalized.bind_root.trim().is_empty()
+        && normalized
+            .per_service_paths
+            .iter()
+            .all(|(_, v)| v.trim().is_empty())
+    {
+        return Err(
+            "bind mode requires either bind_root or at least one per_service_path".into(),
+        );
+    }
+
+    let cfg_path = storage_config_path();
+    write_storage_config_to(&cfg_path, &normalized)?;
+
+    // Regenerate override.yml unless it's user-authored. Mirrors the
+    // Tauri-command behaviour exactly so the install-time path produces
+    // bit-identical output to a later Settings → Storage edit.
+    let existing = read_existing_override();
+    if !existing.is_empty() && !is_launcher_managed_override(&existing) {
+        // Deferral helper requires a Python interpreter on PATH — we
+        // skip the emit when install.py drove this path (install.py
+        // already records its own deferrals into the same file).
+        eprintln!(
+            "[storage_ux] override.yml at infrastructure/docker-compose.override.yml \
+             carries user customizations; skipped overwrite. \
+             Remove the file and re-run to accept launcher defaults."
+        );
+    } else {
+        let body = render_override_yaml(&normalized);
+        // Soft-fail when the orchestrator clone root cannot be located
+        // (e.g. launcher binary invoked from outside a checkout during
+        // install.py self-test). storage.toml is still written above so
+        // the user's choice is recorded; the next launcher start will
+        // regenerate the override from it.
+        if let Err(e) = write_compose_override(&body) {
+            eprintln!(
+                "[storage_ux] note: storage.toml written but override.yml could not be \
+                 generated: {}. Will regenerate on next launcher start.",
+                e
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod cli_helper_tests {
+    use super::*;
+
+    fn with_state_dir<F: FnOnce(&Path)>(f: F) {
+        // Isolate ~/.vct/ writes per test.
+        let dir = std::env::temp_dir().join(format!(
+            "vct-pr28-{}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let prev = std::env::var("VCT_STATE_DIR").ok();
+        std::env::set_var("VCT_STATE_DIR", &dir);
+        f(&dir);
+        match prev {
+            Some(v) => std::env::set_var("VCT_STATE_DIR", v),
+            None => std::env::remove_var("VCT_STATE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cli_helper_deferred_is_noop() {
+        with_state_dir(|dir| {
+            let cfg_path = dir.join("storage.toml");
+            assert!(!cfg_path.exists());
+            set_storage_config_from_cli("deferred", vec![]).unwrap();
+            // deferred MUST NOT create storage.toml.
+            assert!(
+                !cfg_path.exists(),
+                "deferred mode unexpectedly wrote storage.toml"
+            );
+        });
+    }
+
+    #[test]
+    fn cli_helper_named_writes_storage_toml() {
+        with_state_dir(|dir| {
+            let cfg_path = dir.join("storage.toml");
+            set_storage_config_from_cli("named", vec![]).unwrap();
+            assert!(cfg_path.exists(), "named mode should write storage.toml");
+            let body = std::fs::read_to_string(&cfg_path).unwrap();
+            assert!(body.contains("mode = \"named\""));
+        });
+    }
+
+    #[test]
+    fn cli_helper_bind_persists_per_service_paths() {
+        with_state_dir(|dir| {
+            let cfg_path = dir.join("storage.toml");
+            let bind_paths = vec![
+                ("ollama".to_string(), PathBuf::from("/foo/bar/ollama")),
+                (
+                    "weaviate".to_string(),
+                    PathBuf::from("/foo/bar/weaviate"),
+                ),
+            ];
+            set_storage_config_from_cli("bind", bind_paths).unwrap();
+            assert!(cfg_path.exists());
+            let body = std::fs::read_to_string(&cfg_path).unwrap();
+            assert!(body.contains("mode = \"bind\""));
+            assert!(body.contains("/foo/bar/ollama"));
+            assert!(body.contains("/foo/bar/weaviate"));
+        });
+    }
+
+    #[test]
+    fn cli_helper_rejects_invalid_mode() {
+        with_state_dir(|_dir| {
+            let err = set_storage_config_from_cli("garbage", vec![])
+                .expect_err("garbage mode should fail validation");
+            assert!(
+                err.contains("invalid storage mode"),
+                "expected 'invalid storage mode' in {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn cli_helper_bind_without_paths_errors() {
+        with_state_dir(|_dir| {
+            let err = set_storage_config_from_cli("bind", vec![])
+                .expect_err("bind mode with empty paths should fail validation");
+            assert!(
+                err.contains("bind mode requires"),
+                "expected 'bind mode requires' in {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn cli_helper_bind_drops_unknown_service_keys() {
+        with_state_dir(|dir| {
+            // 'foozle' is not in LOGICAL_SERVICES — normalize_config
+            // strips it. Combined with a real entry the call must
+            // still succeed.
+            let bind_paths = vec![
+                ("foozle".to_string(), PathBuf::from("/tmp/junk")),
+                ("ollama".to_string(), PathBuf::from("/foo/bar/ollama")),
+            ];
+            set_storage_config_from_cli("bind", bind_paths).unwrap();
+            let body = std::fs::read_to_string(dir.join("storage.toml")).unwrap();
+            assert!(body.contains("/foo/bar/ollama"));
+            assert!(!body.contains("foozle"));
+            assert!(!body.contains("/tmp/junk"));
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Migration helpers
 // ---------------------------------------------------------------------------
 
