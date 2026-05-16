@@ -64,6 +64,32 @@ except ImportError:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# PR-42 (v0.2.12): install a SIGHUP handler so the launcher (or the user
+# running `kill -HUP <pid>`) can ask this MCP to pick up an updated
+# `.claude/settings.json env`. The handler exits cleanly with code 0;
+# Claude Code respawns us on the next request with fresh env. See
+# claude_mcp_servers/_lib/sighup_handler.py for the full design rationale.
+# Import is best-effort: when the MCP is run via
+# `python <install>/claude_mcp_servers/weaviate_mcp/server.py` the parent
+# dir (claude_mcp_servers/) needs to be on sys.path for `_lib` to resolve.
+try:
+    from _lib.sighup_handler import register_sighup_exit_handler  # type: ignore
+except ImportError:
+    # Ensure the parent dir is on sys.path then retry once.
+    _parent_dir = str(Path(__file__).resolve().parent.parent)
+    if _parent_dir not in sys.path:
+        sys.path.insert(0, _parent_dir)
+    try:
+        from _lib.sighup_handler import register_sighup_exit_handler  # type: ignore
+    except ImportError:
+        # _lib missing entirely (e.g. partial install) — soft-fail. The
+        # MCP still works, it just won't auto-reload env on SIGHUP. The
+        # launcher's manual "Reload MCPs" button falls back to a hard
+        # kill in that case.
+        def register_sighup_exit_handler(_logger):  # type: ignore[no-redef]
+            return False
+register_sighup_exit_handler(logger)
+
 # Default truncation limit in Claude Code is ~25K chars.
 # v2.1.91+ supports _meta["anthropic/maxResultSizeChars"] override (up to 500K).
 _MAX_RESULT_SIZE = 200_000  # 200K — generous but not wasteful

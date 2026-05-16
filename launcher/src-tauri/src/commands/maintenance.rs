@@ -974,6 +974,249 @@ pub async fn rewrite_stale_mcp_entries(
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// PR-42 (v0.2.12 / 2026-05-16): SIGHUP-driven MCP env reload
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Fixes Issue B from
+// `.claude/context/mcp-instability-vs-public-repo-2026-05-16.md`:
+// editing `.claude/settings.json env` mid-chat left the running MCP
+// subprocess pinned to the OLD env. Manual `pkill -f weaviate_mcp` was
+// the only recovery.
+//
+// User-direction (2026-05-16):
+//   1. **Safe way** — SIGHUP triggers a CLEAN sys.exit(0) on the MCP
+//      side (see `claude_mcp_servers/_lib/sighup_handler.py`). NOT an
+//      in-process reconnect. Claude Code respawns the MCP on the next
+//      request with fresh env. No half-reloaded state.
+//   2. **Live-reloadable for ALL env vars** — no per-var allowlist.
+//      Any env change → full MCP restart → all vars picked up.
+//   3. **Watcher + button** — the launcher's
+//      `services::settings_json_watcher` auto-fires this command on
+//      `.claude/settings.json` modify events; the GUI button surfaces
+//      a manual path for when the watcher is disabled or the user
+//      wants to force a reload.
+//
+// POSIX-only: `kill` and SIGHUP don't exist natively on Windows.
+// On Windows the function reports zero signaled processes and the
+// user-facing fallback is "restart your Claude Code chat session".
+
+/// Names of the orchestrator MCP server scripts whose processes this
+/// reload command targets. Match arguments for `pgrep -f`.
+///
+/// The patterns are intentionally narrow: a substring like
+/// `weaviate_mcp/server.py` matches the absolute path Claude Code uses
+/// to spawn the MCP (`<install>/claude_mcp_servers/weaviate_mcp/server.py`).
+/// `_mcp/server.py` alone would over-match.
+const MCP_PROCESS_PATTERNS: &[&str] = &[
+    "weaviate_mcp/server.py",
+    "search_mcp/server.py",
+];
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReloadReport {
+    /// Total number of PIDs signaled across all patterns. Zero when no
+    /// MCP processes were found (e.g. user has no Claude Code session
+    /// running yet) — soft-success.
+    pub signaled_count: usize,
+    /// Distinct PIDs we sent SIGHUP to, in discovery order. Surfaced so
+    /// the GUI can show "Signaled PIDs 1234, 5678" for transparency.
+    pub pids: Vec<u32>,
+    /// Per-PID or per-pattern errors. Soft-fail: one stale PID
+    /// disappearing between `pgrep` and `kill` doesn't abort the batch.
+    pub errors: Vec<String>,
+    /// True on Windows native, where SIGHUP doesn't exist. The GUI
+    /// surfaces a "use Claude Code session restart" hint when this is
+    /// set; the command itself reports zero signaled processes (the
+    /// no-op case is not an error).
+    pub posix_only_skipped: bool,
+}
+
+/// Pluggable command runner — production uses `std::process::Command`;
+/// tests inject a stub returning a fake `pgrep` output without touching
+/// real PIDs on the host machine.
+trait MaintCommandRunner {
+    /// Run `pgrep -f <pattern>` and return its stdout (one PID per
+    /// line) or an error string. Empty stdout (no matches) is `Ok("")`,
+    /// NOT an error.
+    fn pgrep(&self, pattern: &str) -> Result<String, String>;
+    /// Send SIGHUP to `pid` via `kill -HUP`. Returns `Ok(())` on success,
+    /// `Err(msg)` on failure (e.g. permission denied, no such process).
+    fn kill_sighup(&self, pid: u32) -> Result<(), String>;
+}
+
+/// Real implementation: shells out to `pgrep` and `kill`. POSIX-only.
+struct ShellMaintRunner;
+
+impl MaintCommandRunner for ShellMaintRunner {
+    fn pgrep(&self, pattern: &str) -> Result<String, String> {
+        let out = std::process::Command::new("pgrep")
+            .arg("-f")
+            .arg(pattern)
+            .output()
+            .map_err(|e| format!("pgrep: {}", e))?;
+        // pgrep exits 1 when no processes match — that's not an error
+        // for us, just zero results. Anything else IS an error.
+        if !out.status.success() && out.status.code() != Some(1) {
+            return Err(format!(
+                "pgrep -f {:?} exit={:?}: {}",
+                pattern,
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    fn kill_sighup(&self, pid: u32) -> Result<(), String> {
+        let out = std::process::Command::new("kill")
+            .arg("-HUP")
+            .arg(pid.to_string())
+            .output()
+            .map_err(|e| format!("kill: {}", e))?;
+        if !out.status.success() {
+            return Err(format!(
+                "kill -HUP {} exit={:?}: {}",
+                pid,
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Parse `pgrep -f` stdout into a Vec<u32>. Whitespace-tolerant; any
+/// line that doesn't parse as a non-zero unsigned int is silently
+/// skipped (defensive against pgrep variants that might add headers).
+fn parse_pgrep_pids(stdout: &str) -> Vec<u32> {
+    stdout
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .filter(|&p| p > 0)
+        .collect()
+}
+
+/// Pure core: given a runner + a list of patterns, send SIGHUP to every
+/// matched PID and return the aggregated report. Extracted from the
+/// Tauri command so unit tests can drive it with a stub runner.
+///
+/// Discipline:
+///   * De-dup PIDs across patterns (a single weaviate-mcp process may
+///     match multiple substrings).
+///   * Per-PID soft-fail: one kill failure doesn't abort the batch.
+///   * Self-kill protection: skip our own PID, just in case a pattern
+///     ever matches the launcher itself.
+fn reload_mcps_with<R: MaintCommandRunner>(runner: &R, patterns: &[&str]) -> ReloadReport {
+    let mut pids: Vec<u32> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    let own_pid = std::process::id();
+
+    for pattern in patterns {
+        let stdout = match runner.pgrep(pattern) {
+            Ok(s) => s,
+            Err(e) => {
+                errors.push(format!("pgrep {:?}: {}", pattern, e));
+                continue;
+            }
+        };
+        for pid in parse_pgrep_pids(&stdout) {
+            if pid == own_pid {
+                continue;
+            }
+            if pids.contains(&pid) {
+                continue;
+            }
+            pids.push(pid);
+        }
+    }
+
+    for &pid in &pids {
+        if let Err(e) = runner.kill_sighup(pid) {
+            // Likely cause: PID dead between pgrep and kill (race) or
+            // permission denied. Log it but don't abort the batch.
+            errors.push(format!("kill -HUP {}: {}", pid, e));
+        }
+    }
+
+    ReloadReport {
+        // signaled_count counts PIDs we successfully signaled — derive
+        // it from `pids - failed`. Simpler: count pids whose kill error
+        // does NOT appear in errors. But `errors` may include
+        // pgrep-level entries too; for simplicity we treat `pids.len()`
+        // as the "we tried to signal" count and `errors.len()` as the
+        // "things that went wrong" count. The GUI surfaces both.
+        signaled_count: pids.len().saturating_sub(
+            errors
+                .iter()
+                .filter(|e| e.starts_with("kill -HUP "))
+                .count(),
+        ),
+        pids,
+        errors,
+        posix_only_skipped: false,
+    }
+}
+
+/// Tauri command: signal all running orchestrator MCP processes to
+/// pick up new env from `.claude/settings.json`.
+///
+/// Idempotent: zero matching PIDs is a soft-success (just reports
+/// `signaled_count: 0`). The watcher and the GUI button both call this.
+///
+/// On Windows native, returns a no-op report with
+/// `posix_only_skipped: true` — the GUI surfaces a "restart your
+/// Claude Code session" hint instead.
+#[command]
+pub async fn reload_mcps_sighup(db: State<'_, Db>) -> Result<ReloadReport, String> {
+    let report = if cfg!(windows) {
+        ReloadReport {
+            signaled_count: 0,
+            pids: Vec::new(),
+            errors: vec![
+                "SIGHUP is POSIX-only; restart your Claude Code session to apply env changes"
+                    .to_string(),
+            ],
+            posix_only_skipped: true,
+        }
+    } else {
+        let runner = ShellMaintRunner;
+        reload_mcps_with(&runner, MCP_PROCESS_PATTERNS)
+    };
+
+    let _ = db.audit(
+        "maintenance_reload_mcps_sighup",
+        None,
+        None,
+        &serde_json::json!({
+            "signaled_count": report.signaled_count,
+            "pids": report.pids.clone(),
+            "errors": report.errors.clone(),
+            "posix_only_skipped": report.posix_only_skipped,
+        }),
+    );
+
+    Ok(report)
+}
+
+/// PR-42: launcher-internal entry point for the
+/// `services::settings_json_watcher` task. Same semantics as the
+/// `reload_mcps_sighup` Tauri command but without a `State<Db>`
+/// dependency (the watcher task doesn't have one in scope). The
+/// watcher does its own audit logging; we just run the pgrep+kill core.
+pub fn reload_mcps_via_shell_for_watcher() -> ReloadReport {
+    if cfg!(windows) {
+        return ReloadReport {
+            signaled_count: 0,
+            pids: Vec::new(),
+            errors: vec!["SIGHUP is POSIX-only".to_string()],
+            posix_only_skipped: true,
+        };
+    }
+    let runner = ShellMaintRunner;
+    reload_mcps_with(&runner, MCP_PROCESS_PATTERNS)
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Tests — focus on the schema-probe parsing + stale-entry detector.
 // Rust-side; mocks the Weaviate /v1/schema JSON shape.
 // ═══════════════════════════════════════════════════════════════════════
@@ -1229,5 +1472,215 @@ mod tests {
         });
         let path = entry_resource_path(&entry);
         assert_eq!(path, "/srv/foobar/server.js");
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // PR-42 reload_mcps_sighup tests
+    // ───────────────────────────────────────────────────────────────────
+
+    use std::cell::RefCell;
+
+    /// Test fixture: records calls + replays canned pgrep output. NOT
+    /// thread-safe — each test gets its own instance.
+    struct StubRunner {
+        /// pattern → canned stdout
+        pgrep_responses: HashMap<String, Result<String, String>>,
+        /// Records every PID we asked to signal.
+        kill_calls: RefCell<Vec<u32>>,
+        /// PIDs whose kill call should fail (simulates dead-PID race).
+        kill_failures: HashMap<u32, String>,
+    }
+
+    impl StubRunner {
+        fn new() -> Self {
+            Self {
+                pgrep_responses: HashMap::new(),
+                kill_calls: RefCell::new(Vec::new()),
+                kill_failures: HashMap::new(),
+            }
+        }
+    }
+
+    impl MaintCommandRunner for StubRunner {
+        fn pgrep(&self, pattern: &str) -> Result<String, String> {
+            self.pgrep_responses
+                .get(pattern)
+                .cloned()
+                .unwrap_or_else(|| Ok(String::new()))
+        }
+        fn kill_sighup(&self, pid: u32) -> Result<(), String> {
+            self.kill_calls.borrow_mut().push(pid);
+            match self.kill_failures.get(&pid) {
+                Some(e) => Err(e.clone()),
+                None => Ok(()),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_pgrep_pids_handles_one_per_line() {
+        let pids = parse_pgrep_pids("1234\n5678\n9012\n");
+        assert_eq!(pids, vec![1234, 5678, 9012]);
+    }
+
+    #[test]
+    fn parse_pgrep_pids_ignores_garbage_lines() {
+        // Defensive: pgrep -f variants might prepend a header. Treat
+        // any non-numeric line as a soft-skip.
+        let pids = parse_pgrep_pids("\n  4242 \nnot-a-pid\n0\n1337\n");
+        assert_eq!(pids, vec![4242, 1337]); // 0 filtered (not a real PID), garbage line skipped
+    }
+
+    #[test]
+    fn parse_pgrep_pids_empty_when_no_matches() {
+        assert!(parse_pgrep_pids("").is_empty());
+        assert!(parse_pgrep_pids("\n\n  \n").is_empty());
+    }
+
+    #[test]
+    fn reload_mcps_signals_all_matching_pids() {
+        // Two patterns, each returning a different PID set. Expected:
+        // we send SIGHUP to all 3 distinct PIDs, no errors.
+        let mut runner = StubRunner::new();
+        runner
+            .pgrep_responses
+            .insert("weaviate_mcp/server.py".to_string(), Ok("1111\n2222\n".into()));
+        runner
+            .pgrep_responses
+            .insert("search_mcp/server.py".to_string(), Ok("3333\n".into()));
+
+        let report = reload_mcps_with(&runner, MCP_PROCESS_PATTERNS);
+
+        assert_eq!(report.signaled_count, 3);
+        assert_eq!(report.pids, vec![1111, 2222, 3333]);
+        assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+        assert!(!report.posix_only_skipped);
+
+        // Verify the kill stub recorded exactly the expected PIDs in
+        // discovery order.
+        let kills = runner.kill_calls.borrow().clone();
+        assert_eq!(kills, vec![1111, 2222, 3333]);
+    }
+
+    #[test]
+    fn reload_mcps_dedups_pids_across_patterns() {
+        // A single MCP process could (hypothetically) match multiple
+        // substrings. We must not send SIGHUP twice to the same PID.
+        let mut runner = StubRunner::new();
+        runner
+            .pgrep_responses
+            .insert("weaviate_mcp/server.py".to_string(), Ok("9999\n".into()));
+        runner
+            .pgrep_responses
+            .insert("search_mcp/server.py".to_string(), Ok("9999\n".into()));
+
+        let report = reload_mcps_with(&runner, MCP_PROCESS_PATTERNS);
+
+        assert_eq!(report.pids, vec![9999]);
+        assert_eq!(report.signaled_count, 1);
+        assert_eq!(runner.kill_calls.borrow().clone(), vec![9999]);
+    }
+
+    #[test]
+    fn reload_mcps_zero_pids_is_soft_success() {
+        // No MCPs running yet. We report zero — NOT an error. This is
+        // the common case during launcher boot before any Claude Code
+        // session is open.
+        let runner = StubRunner::new(); // no responses → all patterns return Ok("")
+        let report = reload_mcps_with(&runner, MCP_PROCESS_PATTERNS);
+        assert_eq!(report.signaled_count, 0);
+        assert!(report.pids.is_empty());
+        assert!(report.errors.is_empty());
+    }
+
+    #[test]
+    fn reload_mcps_soft_fails_per_dead_pid() {
+        // PID disappeared between pgrep and kill (race). One kill
+        // failure does NOT abort the batch.
+        let mut runner = StubRunner::new();
+        runner
+            .pgrep_responses
+            .insert("weaviate_mcp/server.py".to_string(), Ok("4444\n5555\n".into()));
+        runner
+            .kill_failures
+            .insert(4444, "No such process".to_string());
+
+        let report = reload_mcps_with(&runner, MCP_PROCESS_PATTERNS);
+        // Both PIDs were attempted; one failed (4444).
+        assert_eq!(report.pids.len(), 2);
+        assert_eq!(report.signaled_count, 1, "4444 failed, only 5555 succeeded");
+        assert_eq!(report.errors.len(), 1);
+        assert!(
+            report.errors[0].contains("4444"),
+            "error message must reference dead PID: {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn reload_mcps_records_pgrep_failure_without_aborting() {
+        // One pattern's pgrep crashes; the other still works. We want
+        // a partial-success report (not a fatal Err) so the watcher /
+        // GUI can show "some MCPs signaled" rather than total failure.
+        let mut runner = StubRunner::new();
+        runner.pgrep_responses.insert(
+            "weaviate_mcp/server.py".to_string(),
+            Err("pgrep: command not found".into()),
+        );
+        runner
+            .pgrep_responses
+            .insert("search_mcp/server.py".to_string(), Ok("7777\n".into()));
+
+        let report = reload_mcps_with(&runner, MCP_PROCESS_PATTERNS);
+        assert_eq!(report.pids, vec![7777]);
+        assert_eq!(report.signaled_count, 1);
+        assert_eq!(report.errors.len(), 1);
+        assert!(report.errors[0].contains("pgrep"));
+    }
+
+    #[test]
+    fn reload_mcps_skips_own_pid() {
+        // Defensive: if a pattern ever matches the launcher binary
+        // itself, we MUST NOT send SIGHUP to our own process. The
+        // launcher's default SIGHUP action is terminate.
+        let own_pid = std::process::id();
+        let mut runner = StubRunner::new();
+        runner.pgrep_responses.insert(
+            "weaviate_mcp/server.py".to_string(),
+            Ok(format!("{}\n1234\n", own_pid)),
+        );
+
+        let report = reload_mcps_with(&runner, MCP_PROCESS_PATTERNS);
+        // Own PID filtered out.
+        assert_eq!(report.pids, vec![1234]);
+        assert!(
+            !runner.kill_calls.borrow().contains(&own_pid),
+            "must not send SIGHUP to own PID {}",
+            own_pid
+        );
+    }
+
+    #[test]
+    fn mcp_process_patterns_cover_shipped_servers() {
+        // Regression guard: if a future PR adds a third MCP (or
+        // renames an existing one), this assertion will remind us to
+        // update MCP_PROCESS_PATTERNS or the watcher loses coverage.
+        assert!(
+            MCP_PROCESS_PATTERNS.iter().any(|p| p.contains("weaviate_mcp")),
+            "weaviate_mcp pattern missing"
+        );
+        assert!(
+            MCP_PROCESS_PATTERNS.iter().any(|p| p.contains("search_mcp")),
+            "search_mcp pattern missing"
+        );
+        // Each pattern must be specific enough to NOT match unrelated
+        // python scripts. `_mcp/server.py` is the discipline.
+        for p in MCP_PROCESS_PATTERNS {
+            assert!(
+                p.ends_with("/server.py"),
+                "pattern {:?} must end with /server.py for narrow matching",
+                p
+            );
+        }
     }
 }

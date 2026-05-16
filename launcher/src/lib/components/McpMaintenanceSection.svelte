@@ -45,6 +45,13 @@
     current_path: string;
     suggested_path: string;
   }
+  // PR-42 (v0.2.12): SIGHUP-driven env reload report shape.
+  interface ReloadReport {
+    signaled_count: number;
+    pids: number[];
+    errors: string[];
+    posix_only_skipped: boolean;
+  }
 
   let regStatus = $state<McpRegistrationStatusReport | null>(null);
   let regLoading = $state(true);
@@ -53,6 +60,9 @@
   let stale = $state<StaleMcpEntry[]>([]);
   let staleLoading = $state(true);
   let showStaleModal = $state(false);
+
+  // PR-42: in-flight flag for the "Reload MCPs" button.
+  let reloading = $state(false);
 
   async function refreshRegistration() {
     regLoading = true;
@@ -105,6 +115,45 @@
     await Promise.all([refreshRegistration(), refreshStale()]);
   }
 
+  // PR-42 (v0.2.12 / 2026-05-16): manual SIGHUP-driven env reload.
+  // Complements the auto-watcher (services/settings_json_watcher.rs):
+  // the watcher fires automatically on .claude/settings.json edits, but
+  // when the watcher is disabled OR the user just wants to force a
+  // reload they can click this button. The MCPs exit cleanly with
+  // sys.exit(0); Claude Code respawns them on the next request with
+  // fresh env from settings.json.
+  async function reloadMcps() {
+    reloading = true;
+    try {
+      const res = await invoke<ReloadReport>('reload_mcps_sighup');
+      if (res.posix_only_skipped) {
+        toast.error(
+          'SIGHUP reload is POSIX-only. To pick up env changes on Windows, ' +
+            'restart your Claude Code chat session.',
+        );
+      } else if (res.signaled_count > 0) {
+        toast.success(
+          `Signaled ${res.signaled_count} MCP process(es) to reload. ` +
+            `Claude Code will respawn them with fresh env on the next request.`,
+        );
+      } else if (res.errors.length === 0) {
+        toast.success(
+          'No running MCP processes to signal. New env will apply when ' +
+            'Claude Code spawns the MCPs on the next request.',
+        );
+      }
+      for (const err of res.errors) {
+        if (!res.posix_only_skipped) {
+          toast.error(`Reload warning: ${err}`);
+        }
+      }
+    } catch (e) {
+      toast.error(e);
+    } finally {
+      reloading = false;
+    }
+  }
+
   onMount(async () => {
     await Promise.all([refreshRegistration(), refreshStale()]);
   });
@@ -147,6 +196,18 @@
         disabled={regRunning || !regStatus}
       >
         {regRunning ? 'Re-registering…' : 'Re-register MCPs'}
+      </button>
+      <!-- PR-42: SIGHUP-driven env reload. Complementary to
+           Re-register: Re-register updates ~/.claude.json paths,
+           Reload signals running MCPs to pick up updated
+           .claude/settings.json env. -->
+      <button
+        class="mm-btn"
+        onclick={reloadMcps}
+        disabled={reloading}
+        title="Send SIGHUP to running MCPs so they exit cleanly and Claude Code respawns them with fresh env from .claude/settings.json"
+      >
+        {reloading ? 'Reloading…' : 'Reload MCPs (apply env changes)'}
       </button>
     </header>
 
