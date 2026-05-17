@@ -64,15 +64,86 @@ logger = logging.getLogger(__name__)
 CODE_GRAPH_BASES = ["CodeModule", "CodeClass", "CodeFunction", "CodeAPI", "CodeInteraction"]
 
 
+# Import the canonical sanitizer (single source of truth shared with the
+# launcher's Rust port at launcher/src-tauri/src/project_naming.rs).
+# Falls back to a same-behaviour inline implementation when vco_lib is
+# not importable — e.g. when the analyze script is shelled out from a
+# venv that doesn't include the orchestrator repo on sys.path. The
+# fallback path MUST stay byte-for-byte identical to the canonical
+# implementation in vco_lib.project_naming; the parity test guards both.
+#
+# We attempt three sys.path candidates so the import works regardless
+# of which venv the wrapper bash script activated:
+#   1. Current sys.path (most setups will have vco_lib already
+#      reachable because the orchestrator-clone parent dir is on PATH).
+#   2. $VCT_INSTALL_ROOT (launcher always sets this to the orchestrator
+#      install root — see launcher/src-tauri/src/commands/codegraph.rs
+#      `looks_like_install_root`).
+#   3. Walk up from this script: <root>/.claude/scripts/foo.py →
+#      <root> contains vco_lib/.
+_vct_install_root = os.environ.get("VCT_INSTALL_ROOT", "").strip()
+for _candidate in [
+    _vct_install_root,
+    str(Path(__file__).resolve().parent.parent.parent),  # script_dir/../..
+]:
+    if _candidate and _candidate not in sys.path and (Path(_candidate) / "vco_lib").is_dir():
+        sys.path.insert(0, _candidate)
+        break
+
+try:
+    from vco_lib.project_naming import canonical_class_prefix as _canonical_class_prefix
+except ImportError:
+    # Inline fallback — keep in sync with vco_lib/project_naming.py.
+    # The launcher always passes --project, and VCT_INSTALL_ROOT/.venv
+    # always has vco_lib importable, so this path is exercised only by
+    # external direct invocations (e.g. user calling the script
+    # standalone from a different venv).
+    _NON_ALNUM_OR_UNDERSCORE_FALLBACK = re.compile(r"[^A-Za-z0-9_]")
+
+    def _canonical_class_prefix(project_name: str) -> str:
+        if not isinstance(project_name, str):
+            raise ValueError(
+                f"project_name must be str, got {type(project_name).__name__}"
+            )
+        stripped = project_name.strip()
+        if not stripped:
+            raise ValueError("project_name is empty (or whitespace-only)")
+        parts = stripped.split()
+        if not parts:
+            raise ValueError(f"project_name {project_name!r} has no word parts")
+        pascal_parts = [p[:1].upper() + p[1:] for p in parts]
+        pascal = "".join(pascal_parts)
+        cleaned = _NON_ALNUM_OR_UNDERSCORE_FALLBACK.sub("_", pascal)
+        if not cleaned:
+            raise ValueError(f"project_name {project_name!r} sanitizes to empty string")
+        first = cleaned[0]
+        if not first.isalpha():
+            raise ValueError(
+                f"project_name {project_name!r} sanitizes to {cleaned!r}, "
+                "which starts with a non-letter character — Weaviate class "
+                "names must begin with a letter [A-Z]"
+            )
+        return cleaned
+
+
 def _sanitize_collection_prefix(name: str) -> str:
     """Sanitize project name for use as Weaviate collection prefix.
 
-    Weaviate collection names must be alphanumeric + underscore, starting with uppercase.
+    Single source of truth: ``vco_lib.project_naming.canonical_class_prefix``.
+    Kept as a thin wrapper so existing call sites in this module don't
+    need to change. See vco_lib/project_naming.py for the rules-and-
+    rationale write-up.
+
+    Pre-v0.2.15 this used to be a local implementation that diverged
+    from the launcher's Rust ``sanitize_kg_collection``:
+        - this script replaced any non-``[A-Za-z0-9_]`` with ``_``;
+        - the launcher PascalCased + stripped separators.
+    For ``"VibeCoded Orchestrator"`` this produced
+    ``"VibeCoded_Orchestrator"`` here but ``"VibeCodedOrchestrator"`` in
+    the launcher wizard — and Weaviate's case-insensitive class-name
+    collision then wedged the analyzer indefinitely (bug 0.7 / v0.2.15).
     """
-    sanitized = re.sub(r'[^a-zA-Z0-9_]', '_', name)
-    if sanitized and not sanitized[0].isupper():
-        sanitized = sanitized[0].upper() + sanitized[1:]
-    return sanitized
+    return _canonical_class_prefix(name)
 
 
 def _collection_name(base: str, project_name: str) -> str:

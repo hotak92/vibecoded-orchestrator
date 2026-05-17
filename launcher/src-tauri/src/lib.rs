@@ -6,6 +6,7 @@ mod installer_engine;
 mod manifest;
 mod mcp_registration;
 mod paths;
+pub mod project_naming;
 mod quit_dialog;
 mod registry;
 mod secrets;
