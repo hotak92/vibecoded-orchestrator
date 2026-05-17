@@ -67,7 +67,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import NamedTuple, Optional
+from typing import Any, NamedTuple, Optional
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -1549,24 +1549,154 @@ def _run_lightweight(args: argparse.Namespace) -> int:
 # install time we don't necessarily have a runtime up yet AND the user may
 # have data sitting in a bind-mount directory that no current container
 # references.
-_LEGACY_VOLUME_PROBES: dict[str, tuple[str, ...]] = {
-    # Most common: shared with a sibling-project co-install pattern where
-    # both orchestrators point Ollama at a single host-side directory to
-    # avoid duplicating multi-GB model caches.
-    "ollama": (
-        "~/podman_volumes/ollama/models",
-        "~/.local/share/containers/storage/volumes/ollama_claude/_data",
-        "~/.local/share/containers/storage/volumes/ollama_data/_data",
-    ),
-    "code_embed": (
-        "~/podman_volumes/code_embed_cache",
-        "~/.local/share/containers/storage/volumes/code_embed_cache/_data",
-    ),
-    "weaviate": (
-        "~/podman_volumes/weaviate_claude",
-        "~/.local/share/containers/storage/volumes/weaviate_data/_data",
-    ),
-}
+#
+# The per-service-suffix probes are derived from
+# `vco_lib.containers.HISTORICAL_ALIASES` so the maintainer-machine leak
+# (the literal `weaviate_claude` / `ollama_claude` paths that lived here
+# pre-v0.2.15) cannot reappear — see vco_lib/containers.py for the
+# centralised registry + the rationale.
+def _build_legacy_volume_probes() -> dict[str, tuple[str, ...]]:
+    """Build the per-service probe list from the central container-name
+    registry. Replaces the v0.2.14-and-earlier hardcoded
+    ``weaviate_claude`` / ``ollama_claude`` paths (maintainer-machine
+    leak — see vco_lib/containers.py).
+
+    Probe path forms (all routed through ``Path.expanduser()`` /
+    ``%LOCALAPPDATA%`` / ``%USERPROFILE%`` expansion so they work on
+    Linux + macOS + Windows):
+      * ``~/podman_volumes/<full-container-name>`` (POSIX) /
+        ``%USERPROFILE%\\podman_volumes\\<full-container-name>``
+        (Windows) — recovers bind-mount layouts using the literal
+        container name as the directory. Only generated for full
+        container names that would naturally form a bind-mount root
+        (i.e. the ``_claude``-suffixed legacy and the
+        ``vct_code_embed`` transitional name); NOT for bare
+        service-token aliases like ``weaviate`` / ``ollama`` /
+        ``code_embed`` because those conventionally bind-mount one
+        level deeper (e.g. ``~/podman_volumes/ollama/models``).
+      * ``~/.local/share/containers/storage/volumes/<alias>/_data`` —
+        rootless POSIX named-volume mountpoint pattern. Generated for
+        every alias.
+      * ``%LOCALAPPDATA%\\containers\\storage\\volumes\\<alias>\\_data`` —
+        rootful Windows Podman Desktop / Podman-on-Windows volume
+        mountpoint pattern. Generated for every alias.
+      * ``%USERPROFILE%\\AppData\\Roaming\\Docker\\volumes\\<alias>\\_data`` —
+        Docker Desktop volume root on Windows.
+      * Service-specific shared bind paths kept explicit per service
+        (most-used layouts).
+
+    Returns tuples of path strings with shell-style ``~/``-relative
+    POSIX heads OR Windows ``%VAR%``-style heads. Callers are expected
+    to pass them through ``_expand_path_token()`` (defined below) which
+    handles both forms transparently.
+    """
+    from vco_lib.containers import HISTORICAL_ALIASES, canonical_name
+
+    # Service-specific "well-known shared paths" the user may have set
+    # up out-of-band (NOT derived from container names). Kept explicit
+    # so they're easy to audit / extend. POSIX paths first, then
+    # Windows analogues — both forms are tried by the probe loop.
+    shared_paths: dict[str, tuple[str, ...]] = {
+        "ollama": (
+            "~/podman_volumes/ollama/models",
+            "%USERPROFILE%\\podman_volumes\\ollama\\models",
+            "%USERPROFILE%\\.ollama\\models",  # Ollama-on-Windows default
+        ),
+        "code_embed": (
+            "~/podman_volumes/code_embed_cache",
+            "%USERPROFILE%\\podman_volumes\\code_embed_cache",
+        ),
+        "weaviate": (
+            # No bare host shared path historically — only named volumes.
+        ),
+    }
+
+    # Aliases that look like distinct container names (vs. bare service
+    # tokens that conventionally bind-mount one level deeper).
+    def _alias_is_container_shape(alias: str) -> bool:
+        return alias.endswith("_claude") or alias.startswith(("vct_", "vco_"))
+
+    # Mountpoint root templates per OS family. Use a single `{alias}`
+    # placeholder; the loop below substitutes.
+    posix_named_volume_root = "~/.local/share/containers/storage/volumes/{alias}/_data"
+    windows_podman_volume_root = (
+        "%LOCALAPPDATA%\\containers\\storage\\volumes\\{alias}\\_data"
+    )
+    # Docker Desktop on Windows materialises named volumes inside its
+    # Hyper-V VHD; the bind-mountable path under the user profile is
+    # available only when "Use the WSL 2 based engine" is on AND
+    # "Use containerd for pulling and storing images" is OFF. Probing
+    # is cheap: missing dirs just fall through.
+    windows_docker_volume_root = (
+        "%USERPROFILE%\\AppData\\Local\\Docker\\wsl\\data\\volumes\\{alias}\\_data"
+    )
+
+    out: dict[str, tuple[str, ...]] = {}
+    for service in ("ollama", "code_embed", "weaviate"):
+        paths: list[str] = list(shared_paths.get(service, ()))
+        for alias in HISTORICAL_ALIASES[service]:
+            if _alias_is_container_shape(alias):
+                # Bind-mount-root forms — POSIX + Windows.
+                paths.append(f"~/podman_volumes/{alias}")
+                paths.append(f"%USERPROFILE%\\podman_volumes\\{alias}")
+            # Named-volume mountpoints for every alias on every OS.
+            paths.append(posix_named_volume_root.format(alias=alias))
+            paths.append(windows_podman_volume_root.format(alias=alias))
+            paths.append(windows_docker_volume_root.format(alias=alias))
+        # Always probe the canonical compose volume mountpoint last
+        # (named volumes the current compose creates).
+        canon_volume = {
+            "ollama": "ollama_data",
+            "code_embed": "code_embed_cache",
+            "weaviate": "weaviate_data",
+        }[service]
+        paths.append(posix_named_volume_root.format(alias=canon_volume))
+        paths.append(windows_podman_volume_root.format(alias=canon_volume))
+        paths.append(windows_docker_volume_root.format(alias=canon_volume))
+        # canonical_name() imported above only to surface a hard error
+        # if the registry is malformed at import time.
+        _ = canonical_name(service)
+        # Deduplicate preserving order.
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for p in paths:
+            if p in seen:
+                continue
+            seen.add(p)
+            deduped.append(p)
+        out[service] = tuple(deduped)
+    return out
+
+
+def _expand_path_token(raw: str) -> Optional[Path]:
+    """Expand a probe-path token to an absolute ``Path``, handling both
+    POSIX ``~/...`` heads and Windows ``%VAR%`` heads.
+
+    Returns ``None`` if expansion can't produce a usable path
+    (e.g. a Windows-style token on POSIX with no matching env var, or
+    vice versa). The caller treats ``None`` as "not applicable on this
+    host", same as a missing directory.
+    """
+    if not raw:
+        return None
+    # Windows-style %VAR% expansion first — os.path.expandvars is a
+    # no-op on POSIX for unknown vars (it leaves the literal in place),
+    # which would then fail Path.is_dir() naturally.
+    expanded = os.path.expandvars(raw)
+    if "%" in expanded:
+        # Unresolved %VAR% means this token is Windows-specific and we're
+        # not on Windows (or the variable simply isn't set). Skip.
+        return None
+    # POSIX tilde expansion. Path.expanduser handles "~/..." but NOT
+    # mid-string "~user/..." with raw backslashes; we only generate the
+    # leading-tilde form so we're safe.
+    try:
+        return Path(expanded).expanduser()
+    except (RuntimeError, OSError):
+        return None
+
+
+_LEGACY_VOLUME_PROBES: dict[str, tuple[str, ...]] = _build_legacy_volume_probes()
 
 
 def _detect_legacy_volume_paths() -> dict[str, str]:
@@ -1575,19 +1705,20 @@ def _detect_legacy_volume_paths() -> dict[str, str]:
     Returns a `{service: absolute_path}` map for every probe that resolves
     to an existing non-empty directory. Empty map when nothing is found.
 
-    Windows hosts typically have nothing under `~/podman_volumes/` (Docker
-    Desktop / Podman Desktop manage volumes via Hyper-V VHDs), so this
-    function naturally returns `{}` on Windows and the install proceeds
-    with the silent default. macOS hosts that ran a previous orchestrator
-    via Podman Desktop may have entries under `~/.local/share/containers/`.
+    Cross-OS: probes include both POSIX (``~/...``,
+    ``~/.local/share/containers/...``) and Windows
+    (``%LOCALAPPDATA%\\containers\\...``,
+    ``%USERPROFILE%\\AppData\\Local\\Docker\\wsl\\data\\volumes\\...``)
+    forms. `_expand_path_token` skips Windows-style tokens on POSIX (and
+    vice versa) so non-applicable probes silently fall through.
     """
     detected: dict[str, str] = {}
     for service, candidates in _LEGACY_VOLUME_PROBES.items():
         for raw in candidates:
-            try:
-                resolved = Path(raw).expanduser()
-            except (RuntimeError, OSError):
-                # `Path.expanduser()` raises on a hostile $HOME — skip.
+            resolved = _expand_path_token(raw)
+            if resolved is None:
+                # Token not applicable on this OS (Windows-style on POSIX
+                # or vice versa) — skip silently.
                 continue
             if not resolved.is_dir():
                 continue
@@ -2418,9 +2549,28 @@ def main() -> int:
             # via podman before emitting a deferral.
             _weaviate_down_msg = str(_weaviate_err)
             _restarted = False
+            # Discover the actual Weaviate container name + runtime on
+            # this host. v0.2.15: stopped hardcoding `weaviate_claude`
+            # (maintainer-machine leak) AND stopped hardcoding `podman`
+            # in the recovery hints (docker-only users got useless
+            # advice). Runtime honors VCT_CONTAINER_RUNTIME with
+            # podman→docker fallback per the install.py contract.
+            from vco_lib.containers import (
+                all_known_names as _all_known_names,
+                find_existing_container as _find_existing_container,
+            )
+            _self_heal_runtime = (
+                _detect_container_runtime()
+                or _runtime_preference_from_env()
+                or "podman"  # last-resort label when neither is on PATH
+            )
+            _weaviate_container = (
+                _find_existing_container("weaviate", runtime=_self_heal_runtime)
+                or "vco_weaviate"  # nothing on host yet — name the canonical
+            )
             try:
                 subprocess.run(
-                    ["podman", "start", "weaviate_claude"],
+                    [_self_heal_runtime, "start", _weaviate_container],
                     capture_output=True, timeout=30,
                 )
                 import time as _time
@@ -2432,6 +2582,14 @@ def main() -> int:
             except Exception:
                 pass
             if not _restarted:
+                # Build a user-facing "which name to use" hint. If we
+                # found one on the host, name it. Otherwise list all the
+                # candidates so the user can try whichever they have.
+                _candidates_hint = (
+                    _weaviate_container
+                    if _find_existing_container("weaviate", runtime=_self_heal_runtime)
+                    else " | ".join(_all_known_names("weaviate"))
+                )
                 print(
                     f"WARNING: Weaviate unreachable after restart attempt "
                     f"({_weaviate_down_msg}). Collections not bootstrapped. "
@@ -2444,14 +2602,14 @@ def main() -> int:
                         detected=(
                             f"Weaviate refused connection during --update "
                             f"({_weaviate_down_msg}). Auto-restart via "
-                            "`podman start weaviate_claude` also failed."
+                            f"`{_self_heal_runtime} start {_weaviate_container}` also failed."
                         ),
                         why_deferred=(
                             "Collection bootstrap and schema migration require "
                             "a live Weaviate. Cannot proceed without it."
                         ),
                         command_to_apply=(
-                            "podman start weaviate_claude && "
+                            f"{_self_heal_runtime} start {_candidates_hint} && "
                             "python install.py --update --skip-rebuild-prompt"
                         ),
                         severity="critical",
@@ -2483,7 +2641,7 @@ def main() -> int:
                                 "the next install.py --update run."
                             ),
                             command_to_apply=(
-                                "podman start weaviate_claude && "
+                                f"{_self_heal_runtime} start {_candidates_hint} && "
                                 "python install.py --update "
                                 "--skip-rebuild-prompt"
                             ),
@@ -2704,6 +2862,7 @@ def main() -> int:
                 PROJECT_ROOT,
                 no_swap=bool(getattr(args, "no_binary_swap", False)),
                 install_start_ts=globals().get("_INSTALL_START_TS"),
+                deferral_report=_deferral_report,
             )
         except Exception as exc:  # noqa: BLE001 — soft-fail by design
             _log_install_event(
@@ -2913,8 +3072,11 @@ def _apply_deferred_entries(
         ``--rebuild-collections`` flag to be present.  We skip to preserve
         the conservative "no silent data churn" contract.  If the user passed
         ``--rebuild-collections`` the drift is already resolved before we arrive.
-      - ``weaviate_unreachable_at_update``: try ``podman start weaviate_claude``
-        then check reachability; mark resolved if now reachable.
+      - ``weaviate_unreachable_at_update``: try ``podman start <name>``
+        (name discovered via ``vco_lib.containers.find_existing_container``;
+        falls back to the canonical ``vco_weaviate`` if no container is
+        on the host yet) then check reachability; mark resolved if now
+        reachable.
       - ``compose_overlay_ambiguous``: cannot auto-resolve (requires human
         decision); emit informational note.
     """
@@ -2934,10 +3096,31 @@ def _apply_deferred_entries(
             current_run_report.add_entry(entry)
 
         elif cid == "weaviate_unreachable_at_update":
-            print(f"  [try]  {cid}: attempting podman start weaviate_claude ...")
+            # v0.2.15: discover the actual container name + runtime on
+            # this host instead of hardcoding `weaviate_claude` +
+            # `podman` (both maintainer-machine assumptions). See
+            # vco_lib/containers.py for the rename rationale + the
+            # _detect_container_runtime / _runtime_preference_from_env
+            # helpers above for the runtime contract.
+            from vco_lib.containers import (
+                find_existing_container as _find_existing_container,
+            )
+            _apply_runtime = (
+                _detect_container_runtime()
+                or _runtime_preference_from_env()
+                or "podman"
+            )
+            _weav_container = (
+                _find_existing_container("weaviate", runtime=_apply_runtime)
+                or "vco_weaviate"
+            )
+            print(
+                f"  [try]  {cid}: attempting {_apply_runtime} start "
+                f"{_weav_container} ..."
+            )
             try:
                 subprocess.run(
-                    ["podman", "start", "weaviate_claude"],
+                    [_apply_runtime, "start", _weav_container],
                     capture_output=True, timeout=30,
                 )
                 import time as _t
@@ -4005,7 +4188,7 @@ def _print_system_info(sysinfo: SystemInfo) -> None:
 
 
 def _find_lean_ctx_binary() -> str | None:
-    """Locate lean-ctx beyond PATH.
+    """Locate lean-ctx beyond PATH (cross-OS).
 
     `shutil.which` only checks PATH, so users who installed lean-ctx via
     `cargo install lean-ctx` (lands at ~/.cargo/bin) but whose shell PATH
@@ -4014,22 +4197,54 @@ def _find_lean_ctx_binary() -> str | None:
     it yet) saw 'not installed' even though the binary is right there.
     Mirrors the known-binary-path probe pattern in
     post-install-launcher.sh's _ensure_path_for_tool helper.
+
+    Cross-OS:
+      * Linux/macOS: probes the cargo + brew + standard system paths.
+      * Windows: probes the cargo install dir + scoop/chocolatey shims.
+        Tries both ``lean-ctx`` and ``lean-ctx.exe`` since Windows
+        cargo-installed binaries get the ``.exe`` suffix.
     """
     on_path = shutil.which("lean-ctx")
     if on_path:
         return on_path
-    candidates = [
-        Path.home() / ".cargo" / "bin" / "lean-ctx",
-        Path.home() / ".local" / "bin" / "lean-ctx",
-        Path("/usr/local/bin/lean-ctx"),
-        Path("/usr/bin/lean-ctx"),
-        # Homebrew on Apple Silicon vs Intel macOS:
-        Path("/opt/homebrew/bin/lean-ctx"),
-        Path("/home/linuxbrew/.linuxbrew/bin/lean-ctx"),
-    ]
+
+    is_windows = sys.platform == "win32"
+    home = Path.home()
+
+    # Per-OS candidate list. Both forms are tried so a Linux user with a
+    # weird WSL2 setup or a Windows user running this script under WSL2
+    # still gets found.
+    if is_windows:
+        candidates: list[Path] = [
+            home / ".cargo" / "bin" / "lean-ctx.exe",
+            home / "scoop" / "shims" / "lean-ctx.exe",
+            home / "scoop" / "apps" / "lean-ctx" / "current" / "lean-ctx.exe",
+            Path(os.environ.get("ProgramData", r"C:\ProgramData"))
+            / "chocolatey" / "bin" / "lean-ctx.exe",
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+            / "lean-ctx" / "lean-ctx.exe",
+        ]
+    else:
+        candidates = [
+            home / ".cargo" / "bin" / "lean-ctx",
+            home / ".local" / "bin" / "lean-ctx",
+            Path("/usr/local/bin/lean-ctx"),
+            Path("/usr/bin/lean-ctx"),
+            # Homebrew on Apple Silicon vs Intel macOS:
+            Path("/opt/homebrew/bin/lean-ctx"),
+            Path("/home/linuxbrew/.linuxbrew/bin/lean-ctx"),
+        ]
+
     for cand in candidates:
-        if cand.is_file() and os.access(cand, os.X_OK):
-            return str(cand)
+        try:
+            # os.access(..., X_OK) is meaningful on POSIX. On Windows
+            # there is no executable bit; is_file() is the relevant check.
+            if cand.is_file() and (is_windows or os.access(cand, os.X_OK)):
+                return str(cand)
+        except OSError:
+            # Hostile path (mount unavailable, permission denied at stat
+            # time) — keep probing the rest.
+            continue
     return None
 
 
@@ -5390,18 +5605,40 @@ def _write_compose_override(alt_ports: dict) -> None:
     print(f"  [override] wrote {override_path}")
 
 
-_ORCHESTRATOR_VOLUME_NAMES = (
-    # Canonical (current compose)
-    "weaviate_data",
-    "ollama_data",
-    "code_embed_cache",
-    # Historical project-suffixed names
-    "weaviate_claude",
-    "weaviate_ARTup",
-    "ollama_claude",
-    "ollama_ARTup",
-    "vct_code_embed",
-)
+def _build_orchestrator_volume_names() -> tuple[str, ...]:
+    """Volume names this install knows about — canonical first, then the
+    historical container-name aliases from vco_lib.containers (which now
+    centralises the maintainer-machine-leak fix from v0.2.15).
+
+    The maintainer's `_ARTup` per-project-suffix names are kept inline
+    here (they were never canonical VCO names — they were specific to a
+    co-installed sibling project on the maintainer's machine — but
+    detecting them on existing installs is still useful to surface in
+    the storage-config picker).
+    """
+    from vco_lib.containers import HISTORICAL_ALIASES
+
+    canonical = ("weaviate_data", "ollama_data", "code_embed_cache")
+    historical: list[str] = []
+    for service in ("weaviate", "ollama", "code_embed"):
+        historical.extend(HISTORICAL_ALIASES[service])
+    # Sibling-project maintainer-era names. Not in vco_lib.containers
+    # because they're not container names this project ever shipped —
+    # they were per-workspace named volumes from a co-installed sibling
+    # repo. Kept here for storage-config detection only.
+    sibling_legacy = ("weaviate_ARTup", "ollama_ARTup")
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for name in (*canonical, *historical, *sibling_legacy):
+        if name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return tuple(out)
+
+
+_ORCHESTRATOR_VOLUME_NAMES = _build_orchestrator_volume_names()
 
 
 def _detect_existing_volume_paths() -> dict:
@@ -8378,11 +8615,171 @@ def _read_tauri_conf_version(install_root: Path) -> Optional[str]:
     return None
 
 
+def _query_launcher_version(binary_path: Path) -> Optional[str]:
+    """Run ``<binary_path> --version`` and parse the version string.
+
+    Returns the first whitespace-separated token that looks like a semver
+    (``\\d+\\.\\d+(\\.\\d+)?``), or None on any failure (binary doesn't
+    exist, exit non-zero, timed out, output unparseable). 5-second timeout
+    hard-caps the wait so a hung binary can't block the install.
+
+    Used by :func:`_refresh_dist_binary_after_rebuild` to populate the
+    ``launcher_restart_required`` deferral message — falls back to
+    :func:`_read_install_version` when the new binary can't self-report
+    (e.g. binary swap landed but the file isn't executable on this OS yet).
+    """
+    if not binary_path.is_file():
+        return None
+    try:
+        proc = subprocess.run(
+            [str(binary_path), "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        _log_install_event(
+            "query_launcher_version", "warn",
+            f"could not invoke {binary_path} --version: {exc}",
+        )
+        return None
+    if proc.returncode != 0:
+        return None
+    output = (proc.stdout or proc.stderr or "").strip()
+    # Find the first semver-looking token.
+    for token in output.split():
+        if re.match(r"^v?\d+\.\d+", token):
+            return token.lstrip("v").rstrip(",.;")
+    return None
+
+
+def _is_windows_sharing_violation(exc: OSError) -> bool:
+    """Detect ``ERROR_SHARING_VIOLATION`` (Windows code 32).
+
+    On Windows, attempting to overwrite a running .exe yields a WinError
+    with code 32 (ERROR_SHARING_VIOLATION). Cross-OS guard: this returns
+    False on every non-Windows host even if the OSError's ``winerror``
+    attribute is set (it shouldn't be).
+    """
+    if not platform.system().lower().startswith("win"):
+        return False
+    return getattr(exc, "winerror", None) == 32
+
+
+def _emit_launcher_restart_deferral(
+    deferral_report: Any,
+    *,
+    install_root: Path,
+    new_binary_path: Path,
+    new_version: Optional[str],
+    old_pid: Optional[int],
+) -> None:
+    """Add a ``launcher_restart_required`` entry to the run's deferral report.
+
+    Emitted after a successful binary swap so the launcher GUI knows to
+    surface a "Restart now" banner. Self-clears: when the user clicks
+    "Restart now", the new launcher writes ``.claude/context/launcher-restart-marker``
+    on startup which the next install.py run treats as "deferral was
+    consumed; drop it" — see :func:`_apply_deferred_entries`.
+
+    Safe to call with ``deferral_report=None`` (no-op) so callers without a
+    report in scope don't need to wire one through just for the side effect.
+    """
+    if deferral_report is None:
+        return
+
+    version_label = new_version or _read_install_version(install_root) or "(version unknown)"
+    pid_suffix = f" (running launcher PID: {old_pid})" if old_pid else ""
+
+    try:
+        entry = DeferralEntry(
+            condition_id="launcher_restart_required",
+            title=f"Launcher binary updated to {version_label}",
+            detected=(
+                f"A freshly-built launcher binary was swapped into "
+                f"`{new_binary_path}`{pid_suffix}. The currently-running "
+                f"launcher process is still executing the old code in memory."
+            ),
+            why_deferred=(
+                "install.py cannot safely restart a GUI process it didn't "
+                "spawn. The launcher reads this entry on startup and renders "
+                "a green sticky banner with a `Restart now` button that "
+                "detach-spawns the new binary and exits the current process."
+            ),
+            command_to_apply=(
+                "# Manually: fully quit the launcher (tray → Quit), then\n"
+                f"# relaunch via your usual entrypoint (the new binary at\n"
+                f"# {new_binary_path} will execute on next start)."
+            ),
+            severity="info",
+            kg_node_refs=[],
+        )
+        deferral_report.add_entry(entry)
+    except Exception as exc:  # noqa: BLE001 — soft-fail by design
+        _log_install_event(
+            "refresh_dist_binary", "warn",
+            f"could not emit launcher_restart_required deferral: {exc}",
+        )
+
+
+def _emit_binary_swap_locked_deferral(
+    deferral_report: Any,
+    *,
+    new_binary_path: Path,
+    error_detail: str,
+) -> None:
+    """Add a ``launcher_binary_swap_failed_locked`` entry (Windows path).
+
+    Fired when both the direct overwrite AND the rename-fallback fail
+    because the running launcher .exe is held open by Windows
+    (ERROR_SHARING_VIOLATION). The launcher GUI renders a RED sticky
+    banner with explicit recovery steps. Severity is ``warning`` not
+    ``critical`` because the install otherwise completed (only the
+    binary-refresh step failed); MCP registration and bundle propagation
+    still landed.
+    """
+    if deferral_report is None:
+        return
+    try:
+        entry = DeferralEntry(
+            condition_id="launcher_binary_swap_failed_locked",
+            title="Launcher binary update blocked (file locked)",
+            detected=(
+                f"Windows refused to overwrite the launcher binary at "
+                f"`{new_binary_path}` because it is held open by the "
+                f"running launcher process (ERROR_SHARING_VIOLATION). "
+                f"Detail: {error_detail}"
+            ),
+            why_deferred=(
+                "Windows holds an exclusive lock on running .exe files. "
+                "Neither direct overwrite nor rename-then-write succeeded. "
+                "Manual intervention required: fully quit the launcher "
+                "first."
+            ),
+            command_to_apply=(
+                "# 1. Fully quit the launcher (tray → Quit, NOT just close window)\n"
+                "# 2. From a terminal, re-run the orchestrator update:\n"
+                "python install.py --update\n"
+                "# 3. Relaunch the launcher via its usual entrypoint."
+            ),
+            severity="warning",
+            kg_node_refs=[],
+        )
+        deferral_report.add_entry(entry)
+    except Exception as exc:  # noqa: BLE001 — soft-fail by design
+        _log_install_event(
+            "refresh_dist_binary", "warn",
+            f"could not emit launcher_binary_swap_failed_locked deferral: {exc}",
+        )
+
+
 def _refresh_dist_binary_after_rebuild(
     install_root: Path,
     *,
     no_swap: bool = False,
     install_start_ts: Optional[float] = None,
+    deferral_report: Any = None,
 ) -> Optional[Path]:
     """Fix 1 (v0.2.13): copy a freshly-built ``target/release/vct-launcher-temp``
     into ``launcher/dist/<os>-<arch>/vct-launcher`` when it's genuinely newer.
@@ -8407,12 +8804,25 @@ def _refresh_dist_binary_after_rebuild(
          dist artifact is stale w.r.t. the current source).
       4. ``no_swap`` is False.
 
+    v0.2.15 (Agent D): on successful swap, emit a ``launcher_restart_required``
+    deferral so the launcher GUI surfaces a "Restart now" banner. On Windows,
+    if direct overwrite fails with ERROR_SHARING_VIOLATION (the launcher
+    binary is held open), try rename-then-write before giving up; on total
+    failure emit ``launcher_binary_swap_failed_locked``. The launcher's
+    "old PID" is read from the ``VCT_LAUNCHER_PID`` env var when present
+    (set by the Tauri ``update_orchestrator`` command before spawning
+    install.py).
+
     Args:
         install_root: Repository root.
         no_swap: When True, this helper is a no-op (mirrors ``--no-binary-swap``).
         install_start_ts: Optional unix timestamp marking the start of this
             install run. When provided, source files older than this are
             considered "stale from a prior run" and ignored (extra safety).
+        deferral_report: Optional DeferralReport. When provided, success/
+            failure paths emit the appropriate entries documented above.
+            None is supported so external callers (tests, CLI scripts) don't
+            need to thread one through.
 
     Returns:
         The dist path that was refreshed, or None when nothing was done.
@@ -8492,6 +8902,8 @@ def _refresh_dist_binary_after_rebuild(
         return None
 
     # Gate 1+4 already enforced above. Perform the swap.
+    swap_succeeded = False
+    swap_renamed_old_to: Optional[Path] = None
     try:
         dist_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dist_path)
@@ -8501,18 +8913,97 @@ def _refresh_dist_binary_after_rebuild(
             except OSError:
                 # Best-effort: fall through; the copy itself succeeded.
                 pass
+        swap_succeeded = True
     except OSError as exc:
-        _log_install_event(
-            "refresh_dist_binary", "warn",
-            f"copy {src} → {dist_path} failed: {exc}",
-        )
+        # Windows-specific fallback: when ERROR_SHARING_VIOLATION fires
+        # (the running launcher .exe is locked by the OS), try
+        # rename-then-write. Windows often allows rename-while-open even
+        # when overwrite-while-open fails — the old .exe gets a sibling
+        # ``.old-<version>`` name and the new binary lands at the canonical
+        # path. The renamed file stays on disk until the next reboot or
+        # manual cleanup; harmless (a few MB) and serves as a recovery
+        # checkpoint.
+        if _is_windows_sharing_violation(exc) and dist_path.is_file():
+            old_version_tag = (
+                _read_install_version(install_root) or "prior"
+            ).replace(" ", "_").replace("/", "_")
+            backup_name = f"{fname}.old-{old_version_tag}"
+            backup_path = dist_dir / backup_name
+            # Drop any stale backup from a prior failed swap so the rename
+            # doesn't trip its own SHARING_VIOLATION.
+            if backup_path.exists():
+                try:
+                    backup_path.unlink()
+                except OSError as cleanup_exc:
+                    _log_install_event(
+                        "refresh_dist_binary", "warn",
+                        f"stale backup {backup_path} could not be removed: "
+                        f"{cleanup_exc}; rename-fallback may fail",
+                    )
+            try:
+                dist_path.rename(backup_path)
+                shutil.copy2(src, dist_path)
+                swap_succeeded = True
+                swap_renamed_old_to = backup_path
+                _log_install_event(
+                    "refresh_dist_binary", "ok",
+                    f"Windows rename-fallback succeeded: old binary moved "
+                    f"to {backup_path}, new binary written to {dist_path}",
+                )
+            except OSError as rename_exc:
+                # Both direct overwrite AND rename failed. Emit the
+                # binary-swap-locked deferral so the GUI tells the user
+                # to fully quit + retry from terminal.
+                _log_install_event(
+                    "refresh_dist_binary", "error",
+                    f"Windows binary-swap failed; both overwrite ({exc}) "
+                    f"and rename ({rename_exc}) hit ERROR_SHARING_VIOLATION. "
+                    f"Emitting launcher_binary_swap_failed_locked deferral.",
+                )
+                _emit_binary_swap_locked_deferral(
+                    deferral_report,
+                    new_binary_path=dist_path,
+                    error_detail=(
+                        f"overwrite={exc!r}; rename={rename_exc!r}"
+                    ),
+                )
+                return None
+        else:
+            _log_install_event(
+                "refresh_dist_binary", "warn",
+                f"copy {src} → {dist_path} failed: {exc}",
+            )
+            return None
+
+    if not swap_succeeded:
         return None
 
     _log_install_event(
         "refresh_dist_binary", "ok",
         f"refreshed {dist_path} from {src} "
-        f"(produced_in_run={produced_in_run}, version_stale={version_stale})",
+        f"(produced_in_run={produced_in_run}, version_stale={version_stale}, "
+        f"renamed_old_to={swap_renamed_old_to})",
     )
+
+    # v0.2.15 (Agent D): emit launcher_restart_required so the GUI surfaces
+    # a "Restart now" banner. The running launcher process is still in old
+    # code; the new binary is on disk but not executing yet.
+    new_version = _query_launcher_version(dist_path)
+    old_pid_str = os.environ.get("VCT_LAUNCHER_PID", "").strip()
+    old_pid: Optional[int] = None
+    if old_pid_str:
+        try:
+            old_pid = int(old_pid_str)
+        except ValueError:
+            old_pid = None
+    _emit_launcher_restart_deferral(
+        deferral_report,
+        install_root=install_root,
+        new_binary_path=dist_path,
+        new_version=new_version,
+        old_pid=old_pid,
+    )
+
     return dist_path
 
 

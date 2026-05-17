@@ -7,6 +7,165 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.15] — 2026-05-17
+
+Codegraph-wedge release. v0.2.14's testing on the maintainer machine
+surfaced a chain of bugs that combined to deadlock the launcher's
+"Re-build code graph" path for the orchestrator-root project: two
+project-name → class-prefix sanitizers in the codebase produced
+different prefixes for the same project, multiple naming-generations
+of code-graph classes co-existed in Weaviate from prior VCO releases,
+case-insensitive collisions caused Weaviate to reject schema creates,
+and the analyze script retried the rejected creates indefinitely.
+This release fixes all four links in the chain.
+
+It also ships the user-anticipated launcher-restart UX after Update
+Orchestrator swaps the on-disk binary, finishes the
+`weaviate_claude` → `vco_weaviate` container-naming cleanup the
+maintainer-machine leak had been hiding, and adds Windows path
+support to the install-time legacy-volume probes.
+
+### Major themes
+
+- **Codegraph wedge eliminated**: orphan-collection detection in the
+  wizard, fail-fast on case-collision in the analyze script,
+  single canonical sanitize function shared between Python + Rust.
+- **Update-orchestrator UX**: green sticky "Restart now" banner after
+  binary swap; Windows ERROR_SHARING_VIOLATION rename-fallback.
+- **Container-naming cleanup**: install.py / hooks / MCP / tests stop
+  hardcoding `weaviate_claude`. Single registry at
+  `vco_lib/containers.py`. `vct_code_embed` → `vco_code_embed` for
+  naming consistency.
+- **Cross-OS path support**: install.py path probes now generate
+  Windows `%USERPROFILE%\...` + `%LOCALAPPDATA%\...` variants
+  alongside POSIX `~/...`. `_find_lean_ctx_binary` adds Windows
+  candidates (cargo / scoop / chocolatey / Program Files).
+
+### Added
+
+- `vco_lib/containers.py`: central canonical-name + historical-alias
+  registry for the three orchestrator containers (Weaviate, Ollama,
+  code-embed). New helpers `canonical_name()`, `all_known_names()`,
+  `find_existing_container()` (honors `VCT_CONTAINER_RUNTIME`).
+- `vco_lib/project_naming.py`: canonical project-name →
+  Weaviate-class-prefix sanitizer. Single source of truth shared
+  with `launcher/src-tauri/src/project_naming.rs` (Rust port pinned
+  by `tests/fixtures/project_naming.json` parity tests in both
+  languages).
+- Launcher: `restart_launcher` + `get_launcher_restart_status` Tauri
+  commands. `LauncherRestartBanner.svelte` polls every 5s + on
+  mount; renders green sticky banner with "Restart now" for
+  `launcher_restart_required` deferrals OR red banner with recovery
+  steps for `launcher_binary_swap_failed_locked` (Windows lock).
+- Launcher wizard: orphan code-graph detection (cross-references
+  Weaviate prefixes against known projects via case-insensitive
+  normalised-name match) + `cleanup_orphan_codegraph_collections`
+  Tauri command (per-group consent, no auto-delete).
+- Wizard extension UI: per-group checkboxes + dedicated delete
+  button for orphan groups; double-confirmation contract preserved.
+- `install.py`: emits `launcher_restart_required` deferral after
+  binary swap. Windows rename-fallback for ERROR_SHARING_VIOLATION
+  produces `vct-launcher.exe.old-<version>`.
+- Tests: `test_container_naming.py`, `test_project_naming.py`,
+  `test_project_naming_parity.py`,
+  `test_analyze_code_graph_retry_cap.py`,
+  `test_binary_swap_deferral.py`. +13 cargo tests for orphan
+  helpers + cleanup-verification path.
+- Early CI visibility for unset `DIST_COMMIT_TOKEN` — the release
+  workflow now emits a clear `::warning::` annotation BEFORE the
+  build matrix runs (saves ~25 min of wasted CI on a missing-secret
+  release).
+- CLAUDE.md: parallel-agent worktree-hygiene + spawn-from-right-repo
+  guidance (lessons from this release cycle).
+
+### Changed
+
+- `analyze_code_graph.py`: imports `canonical_class_prefix` from
+  `vco_lib.project_naming` (with inline fallback for standalone runs).
+  Schema-create retry loop now caps at 3 attempts with exponential
+  backoff for transient errors; **fails fast IMMEDIATELY on
+  case-collision errors** with an actionable message directing the
+  user to the launcher's wizard. Exits with code 2 on collision so
+  the launcher IPC surfaces a failure toast instead of hanging.
+- `install.py::_refresh_dist_binary_after_rebuild` now takes a
+  `deferral_report=` parameter and emits the restart-required
+  deferral after a successful swap. Windows path detects
+  ERROR_SHARING_VIOLATION and attempts rename-fallback.
+- `install.py` self-heal for `weaviate_unreachable_at_update`: uses
+  `find_existing_container()` to discover the actual Weaviate
+  container name on the host, AND `_detect_container_runtime()` to
+  use the right runtime (`podman` vs `docker` vs whatever
+  `VCT_CONTAINER_RUNTIME` says). User-facing recovery hints quote
+  the resolved runtime + name instead of literal
+  `podman start weaviate_claude`.
+- `install.py::_build_legacy_volume_probes` generates Windows path
+  forms in addition to POSIX. New helper `_expand_path_token()`
+  expands both `~/...` and `%VAR%\...` heads transparently.
+- `install.py::_find_lean_ctx_binary`: Windows branch with cargo /
+  scoop / chocolatey / Program Files candidates. `os.access(X_OK)`
+  skipped on Windows (no executable bit).
+- `infrastructure/docker-compose.yml`: `vct_code_embed` →
+  `vco_code_embed` for naming consistency. Legacy name kept in
+  `HISTORICAL_ALIASES` so existing installs migrate cleanly.
+- Cleanup paths (both legacy + new orphan): post-delete schema
+  re-query verifies each "deleted" class is actually gone; survivors
+  move from `deleted` to `failed` with cache-lag explanation. Stops
+  the wizard from claiming "4 deleted" when only 2 went through.
+- Launcher wizard's `current prefix` display now uses
+  `canonical_class_prefix` (shared with the Python side) instead of
+  the legacy `sanitize_kg_collection` that produced different output
+  for the same project name.
+
+### Fixed
+
+- `storage_ux::cli_helper_tests` intra-process race: switched from
+  `process::id()` to `uuid::Uuid::new_v4()` for tempdir naming AND
+  added a process-wide `Mutex` around `with_state_dir`
+  to serialise env-var mutation. (The UUID swap alone wasn't
+  enough — the actual race was on the shared `VCT_STATE_DIR` env
+  var.) Verified flake-free across 5 consecutive runs.
+- 12+ leak sites where `weaviate_claude` was hardcoded as the
+  container fallback (install.py self-heal commands, deferral
+  messages, the MCP server's user-facing error hint, both bash +
+  ps1 verify-container-ports hooks, two test files). Now sourced
+  from `vco_lib/containers.py`.
+- 4 leak sites discovered during the audit:
+  `vco_lib/project_init.py::_DEFAULT_RESTART_CONTAINER` (flipped to
+  lazy lookup), `templates/hooks/_lib/container-names.{sh,ps1}` env
+  var (renamed to `vco_code_embed`), `templates/hooks/verify-
+  container-ports.{sh,ps1}` compose-service derivation (handles
+  both `vco_` and `vct_` prefixes), `test_pr2_templates_portability`
+  tokenization bug (substring-match `'weaviate' in 'vco_weaviate'`
+  was True; now uses shell-delimiter tokenisation).
+- `test_install_storage_prompt::test_detect_uses_user_relative_paths_not_hardcoded`
+  broadened to accept Windows `%VAR%` heads (was POSIX-only).
+
+### Known issues
+
+- macOS-arm64 binary lookup (v0.2.14 Bug 1 fix) still not exercised
+  on a real macOS host — code-path-correct + unit-tested but no end-
+  to-end validation. Will be covered by v0.2.16 candidate 1.1.
+- Windows PS1 wrapper (v0.2.14 Bug 2 fix, 756 lines from Agent E)
+  still not exercised on a real Windows host. v0.2.16 candidate 1.2.
+- `DIST_COMMIT_TOKEN` is now visible in workflow logs but still
+  requires a manual `gh secret set` to actually fix. The doc lives
+  at `docs/MAINTAINER_GUIDE.md` Option B; until set, every release
+  tag-push needs the manual ruleset-disable trick.
+
+### Migration
+
+- Maintainers who installed VCO from a fork pre-v0.2.x and still have
+  `weaviate_claude` / `ollama_claude` containers on disk: the new
+  `find_existing_container()` recognises them as legacy aliases, so
+  no manual rename needed. The shipped compose creates `vco_*`
+  containers; both can co-exist if you have ancient data to migrate.
+- Project authors whose project name is "Foo Bar" (with a space): the
+  new canonical sanitizer produces `FooBar` (drops space). If you
+  already have `Foo_Bar_*` collections from the old sanitizer, the
+  launcher wizard will flag them as orphans and offer cleanup OR
+  re-analyze. No data loss without explicit user consent.
+- `SimRacing_AI` and `SD15` project class names are unchanged.
+
 ## [0.2.14] — 2026-05-17
 
 Cross-OS hardening release on top of v0.2.13. Surfaces fixed: a Windows

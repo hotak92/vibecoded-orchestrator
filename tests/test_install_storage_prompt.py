@@ -214,17 +214,34 @@ def test_prompt_keyboard_interrupt_returns_deferred():
 
 
 def test_detect_uses_user_relative_paths_not_hardcoded():
-    """The probe table MUST use `~` paths, never hardcoded absolute paths.
+    """The probe table MUST use either `~/...` (POSIX) or `%VAR%\\...`
+    (Windows) heads, never hardcoded absolute paths.
 
     This is a regression guard: an earlier draft hardcoded /home/martino.
     Any contributor adding a new probe must use Path.expanduser()-style
-    paths so the detection works for every user.
+    paths (POSIX) or environment-variable-anchored paths (Windows) so
+    the detection works for every user across every OS.
+
+    v0.2.15: extended to accept Windows `%USERPROFILE%`, `%LOCALAPPDATA%`,
+    `%ProgramData%`, `%ProgramFiles%` heads — install.py expands these
+    via `_expand_path_token()` (`os.path.expandvars` + `Path.expanduser`).
     """
+    allowed_windows_heads = (
+        "%USERPROFILE%",
+        "%LOCALAPPDATA%",
+        "%ProgramData%",
+        "%ProgramFiles%",
+    )
     for service, candidates in _LEGACY_VOLUME_PROBES.items():
         for raw in candidates:
-            assert raw.startswith("~/"), (
+            is_posix_user_relative = raw.startswith("~/")
+            is_windows_var_relative = any(
+                raw.startswith(head) for head in allowed_windows_heads
+            )
+            assert is_posix_user_relative or is_windows_var_relative, (
                 f"probe {service}={raw!r} is not user-relative; "
-                "use ~/... so the install works on every host"
+                "use ~/... (POSIX) or %USERPROFILE%\\... (Windows) so "
+                "the install works on every host"
             )
 
 

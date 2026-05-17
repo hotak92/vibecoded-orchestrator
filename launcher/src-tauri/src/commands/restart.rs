@@ -1,0 +1,549 @@
+// v0.2.15 (Agent D, 2026-05-17): launcher self-restart after binary swap.
+//
+// Background
+// ----------
+// When `install.py --update` succeeds AND the dist binary at
+// `launcher/dist/<arch>/vct-launcher[.exe]` gets refreshed by
+// `_refresh_dist_binary_after_rebuild`, the launcher binary on disk is
+// new but the *running* launcher process keeps executing the OLD code
+// in memory until it restarts.
+//
+// On Linux/macOS the file swap actually succeeds (the open inode is held
+// by the running process; the unlink+rewrite produces a new inode at the
+// same path) but the user sees no signal that they need to restart. They
+// click "Update", a toast says "success", and they keep using the old
+// version indefinitely. On Windows the swap usually fails up-front with
+// ERROR_SHARING_VIOLATION; install.py has a rename-then-write fallback
+// that succeeds in most cases.
+//
+// install.py emits a `launcher_restart_required` deferral entry on
+// successful swap. The GUI surfaces a green sticky banner with a
+// "Restart now" button which invokes this command.
+//
+// What this does
+// --------------
+// 1. Read+rewrite `<install_root>/.claude/context/UPDATE_DEFERRED.md` to
+//    drop the `launcher_restart_required` entry. Skipping this step means
+//    the next launcher start would render the banner again — perpetual
+//    nag loop. Best-effort: a write failure is logged but does NOT block
+//    the restart itself.
+//
+// 2. Locate the launcher binary. The dist path
+//    (`launcher/dist/<arch>/vct-launcher[.exe]`) is the freshly-swapped
+//    binary. `std::env::current_exe()` returns the path the OS used to
+//    launch us — on Linux/macOS this equals the dist path after the
+//    inode swap; on Windows the rename-fallback may have moved us aside
+//    so we re-resolve from the dist path explicitly.
+//
+// 3. Spawn the new binary FULLY DETACHED. Critical: a child process that
+//    inherits stdin/stdout/stderr from the about-to-exit parent will
+//    have its handles closed when we call `app.exit(0)`. The new
+//    launcher must be its own process group leader (Unix) /
+//    detached-process (Windows) so the kernel doesn't tear it down with
+//    us.
+//
+// 4. Call `app.exit(0)` to terminate the current process. The new
+//    process is already running.
+//
+// Cross-OS notes
+// --------------
+// Unix (Linux + macOS): `pre_exec` runs `setsid(2)` in the forked child
+// before exec. This makes the child a new session leader, detaching it
+// from our controlling terminal and process group. `nix` crate is NOT
+// in our dep tree (we use libc directly for the few syscalls we need
+// elsewhere); we call libc::setsid here too.
+//
+// Windows: creation flags `CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS`
+// achieve the same thing. CREATE_NEW_PROCESS_GROUP prevents the child
+// from being signalled when we receive Ctrl+C; DETACHED_PROCESS detaches
+// it from our console (the launcher is a GUI app so we shouldn't have
+// one, but defense in depth).
+//
+// State loss across restart
+// -------------------------
+// The new launcher is a fresh process. State that does NOT survive:
+//   - WebView's localStorage scoped to the prior process. We moved most
+//     state into launcher.db (`app_state` table) for exactly this
+//     reason (Bug 14, v0.2.5). Anything still relying on localStorage
+//     resets to its default.
+//   - In-progress background tasks (kg-sync runs, codegraph rebuilds).
+//     The next launcher start re-spawns them per project; users see a
+//     ~5-30s pause before the "Updating KG" badge clears.
+//   - The Tauri event subscribers (tray-pill probes, settings.json
+//     watcher) — re-attached on fresh start.
+//
+// State that DOES survive:
+//   - launcher.db (`~/.vct/launcher.db`) is on disk; SQLite handles
+//     reopen.
+//   - Per-project `.claude/CONTEXT_STATE.md`, projects.json — on disk.
+//   - VCO_dev-style secrets in `~/.vct-secrets/` and OS keychain —
+//     untouched.
+
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+use tauri::{command, AppHandle, Runtime};
+
+/// Result of `get_launcher_restart_status`: presence + details of a
+/// `launcher_restart_required` or `launcher_binary_swap_failed_locked`
+/// deferral entry in the orchestrator's UPDATE_DEFERRED.md.
+///
+/// Empty struct (None for every field) when no such entries exist — the
+/// FE renders nothing in that case.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LauncherRestartStatus {
+    /// True iff a `launcher_restart_required` entry is present.
+    pub restart_required: bool,
+    /// True iff a `launcher_binary_swap_failed_locked` entry is present
+    /// (Windows-only path).
+    pub swap_failed_locked: bool,
+    /// New launcher version parsed from the entry title (best-effort —
+    /// None when the entry's title doesn't match the expected pattern).
+    pub new_version: Option<String>,
+    /// Path of the newly-swapped binary, parsed from the entry's
+    /// "Detected" field. None when unparseable.
+    pub new_binary_path: Option<String>,
+    /// Full "Detected" prose for the swap-failed case — surfaced verbatim
+    /// in the red recovery banner.
+    pub failure_detail: Option<String>,
+}
+
+/// Tauri command: read `<install_root>/.claude/context/UPDATE_DEFERRED.md`
+/// and return whether a launcher-restart or binary-swap-locked entry is
+/// present. Polled by the FE banner on mount + every ~5s to stay in sync
+/// with install.py runs that may write the entry mid-session.
+///
+/// Returns an all-false struct when the file doesn't exist or contains
+/// no relevant entries — never errors on a missing file.
+#[command]
+pub async fn get_launcher_restart_status(
+    install_root: String,
+) -> Result<LauncherRestartStatus, String> {
+    let install_root_path = PathBuf::from(&install_root);
+    let target = install_root_path
+        .join(".claude")
+        .join("context")
+        .join("UPDATE_DEFERRED.md");
+    if !target.is_file() {
+        return Ok(LauncherRestartStatus::default());
+    }
+
+    let content = std::fs::read_to_string(&target)
+        .map_err(|e| format!("read {}: {}", target.display(), e))?;
+
+    let restart_section = extract_section(&content, "launcher_restart_required");
+    let locked_section = extract_section(&content, "launcher_binary_swap_failed_locked");
+
+    let mut status = LauncherRestartStatus {
+        restart_required: restart_section.is_some(),
+        swap_failed_locked: locked_section.is_some(),
+        ..Default::default()
+    };
+
+    if let Some(section) = restart_section.as_deref() {
+        // Title format: "Launcher binary updated to <version>"
+        status.new_version = section
+            .lines()
+            .find(|l| l.starts_with("**Title**:"))
+            .and_then(|l| l.split("updated to").nth(1))
+            .map(|s| s.trim().to_string());
+        // Detected: "...swapped into `<path>`..."
+        status.new_binary_path = section
+            .lines()
+            .find(|l| l.contains("swapped into `"))
+            .and_then(|l| {
+                let after = l.split("swapped into `").nth(1)?;
+                after.split('`').next().map(|s| s.to_string())
+            });
+    }
+
+    if let Some(section) = locked_section.as_deref() {
+        status.failure_detail = section
+            .lines()
+            .find(|l| l.starts_with("**Detected**:"))
+            .map(|l| l.trim_start_matches("**Detected**:").trim().to_string());
+        if status.new_binary_path.is_none() {
+            status.new_binary_path = section
+                .lines()
+                .find(|l| l.contains("launcher binary at `"))
+                .and_then(|l| {
+                    let after = l.split("launcher binary at `").nth(1)?;
+                    after.split('`').next().map(|s| s.to_string())
+                });
+        }
+    }
+
+    Ok(status)
+}
+
+/// Return the body text of a single `## <condition_id> (sev)` section,
+/// from the header line through the section terminator `---`. None when
+/// the section is absent. Used by `get_launcher_restart_status` to pull
+/// title/detected fields per-entry without re-parsing the whole file.
+fn extract_section(content: &str, condition_id: &str) -> Option<String> {
+    let header_prefix = format!("## {} (", condition_id);
+    let start = content.find(&header_prefix)?;
+    let rest = &content[start..];
+    let end = rest
+        .find("\n## ")
+        .or_else(|| rest.find("\n---\n").map(|i| i + 5))
+        .unwrap_or(rest.len());
+    Some(rest[..end].to_string())
+}
+
+/// Tauri command: restart the launcher process to load a freshly-swapped
+/// binary. Invoked by the green "Restart now" banner the GUI renders for
+/// `launcher_restart_required` deferral entries.
+///
+/// `install_root` is the path of the orchestrator clone whose update
+/// just landed (passed by the frontend; it comes from the same store
+/// the "Update orchestrator" button uses). Used to locate UPDATE_DEFERRED.md
+/// and the dist binary.
+#[command]
+pub async fn restart_launcher<R: Runtime>(
+    app: AppHandle<R>,
+    install_root: String,
+) -> Result<(), String> {
+    let install_root_path = PathBuf::from(&install_root);
+
+    // Step 1: clear the launcher_restart_required entry from
+    // UPDATE_DEFERRED.md so the next launcher start doesn't re-render
+    // the banner. Best-effort: failures here are logged but don't block
+    // the restart.
+    if let Err(e) = clear_restart_deferral(&install_root_path) {
+        eprintln!(
+            "[restart_launcher] failed to clear deferral (non-fatal): {}",
+            e
+        );
+    }
+
+    // Step 2: pick the binary path to spawn. Prefer the dist path under
+    // install_root (this is what install.py just refreshed). Fall back
+    // to current_exe() if dist is missing — exotic case (someone
+    // deleted the dist tree between install + restart click).
+    let exe = resolve_target_binary(&install_root_path)
+        .or_else(|_| std::env::current_exe().map_err(|e| e.to_string()))?;
+
+    if !exe.is_file() {
+        return Err(format!("launcher binary not found at {}", exe.display()));
+    }
+
+    // Step 3: spawn the new launcher detached.
+    spawn_detached_launcher(&exe)?;
+
+    // Step 4: programmatic quit. Bypass the Quit-confirmation dialog
+    // (the user already clicked Restart; a second confirmation would
+    // be confusing and could orphan the new launcher if dismissed).
+    crate::quit_dialog::force_quit();
+    app.exit(0);
+    Ok(())
+}
+
+/// Read `<install_root>/.claude/context/UPDATE_DEFERRED.md`, strip the
+/// `## launcher_restart_required (...)` section, and write back. If the
+/// file ends up with zero entries, delete it (matches the
+/// `DeferralReport.write` contract on the Python side).
+///
+/// This is intentionally a simple text-level edit rather than a full
+/// re-implementation of the deferral parser — we only need to remove
+/// one well-formed section. The Python writer always emits sections
+/// terminated by a literal `---\n` line per `_render_entry`, so the
+/// regex below is safe.
+///
+/// Returns Ok(()) on success OR when the file doesn't exist (nothing
+/// to clear). Returns Err(String) on I/O failure mid-write.
+fn clear_restart_deferral(install_root: &Path) -> Result<(), String> {
+    let target = install_root
+        .join(".claude")
+        .join("context")
+        .join("UPDATE_DEFERRED.md");
+    if !target.is_file() {
+        return Ok(());
+    }
+
+    let content =
+        std::fs::read_to_string(&target).map_err(|e| format!("read {}: {}", target.display(), e))?;
+
+    // Find and strip the launcher_restart_required section. The section
+    // header pattern matches `## launcher_restart_required (<severity>)`
+    // anchored at the start of a line; the section runs until the next
+    // `## ` header OR end-of-file. The `---` separator after each entry
+    // (`_SECTION_SEP` in Python) is part of the section's tail.
+    let updated = strip_section(&content, "launcher_restart_required");
+
+    // If no sections remain (only frontmatter + header), delete the file
+    // entirely to match the Python `DeferralReport.write` contract
+    // (empty entries → unlink). Detection heuristic: the body after the
+    // YAML frontmatter contains no `## <cid>` header.
+    let has_any_entry = updated
+        .lines()
+        .any(|line| line.starts_with("## ") && !line.starts_with("## VCO Update"));
+
+    if !has_any_entry {
+        // Sweep the file. Strip the CLAUDE.md reminder block too — keep
+        // parity with the Python writer. We do not modify CLAUDE.md
+        // from Rust here; the next install.py run will strip the block
+        // via _strip_claude_md_reminder. Acceptable lag: the reminder
+        // says "go read UPDATE_DEFERRED.md" but the file is gone — the
+        // user sees the stale block at most once.
+        std::fs::remove_file(&target)
+            .map_err(|e| format!("unlink {}: {}", target.display(), e))?;
+        return Ok(());
+    }
+
+    std::fs::write(&target, updated).map_err(|e| format!("write {}: {}", target.display(), e))?;
+    Ok(())
+}
+
+/// Strip the `## <condition_id> (<severity>) ... ---\n` section from the
+/// deferral markdown body. The Python writer's `_render_entry` always
+/// terminates each entry with `\n---\n` (`_SECTION_SEP`). We anchor on
+/// the next `\n## ` header OR end-of-file to handle the last-entry case.
+fn strip_section(content: &str, condition_id: &str) -> String {
+    let header_prefix = format!("## {} (", condition_id);
+    let Some(start) = content.find(&header_prefix) else {
+        return content.to_string();
+    };
+
+    // Find the end: either the next `## ` header (start of another
+    // section) or end of file. We search from `start + 1` to skip the
+    // current header.
+    let search_from = start + 1;
+    let rest = &content[search_from..];
+    let end = rest
+        .find("\n## ")
+        .map(|idx| search_from + idx + 1) // +1 to include the newline before `##`
+        .unwrap_or_else(|| content.len());
+
+    // Trim a trailing blank line so we don't leave double-blank gaps.
+    let mut prefix = content[..start].to_string();
+    let suffix = &content[end..];
+    if prefix.ends_with("\n\n") {
+        prefix.pop();
+    }
+    prefix.push_str(suffix);
+    prefix
+}
+
+/// Resolve the dist binary path under `install_root` for the current OS.
+/// Mirrors `install.py::_launcher_binary_relative_path`.
+fn resolve_target_binary(install_root: &Path) -> Result<PathBuf, String> {
+    let (subdir, fname) = launcher_binary_relative_path();
+    Ok(install_root
+        .join("launcher")
+        .join("dist")
+        .join(subdir)
+        .join(fname))
+}
+
+/// Mirror of `install.py::_launcher_binary_relative_path`. Keep in sync.
+fn launcher_binary_relative_path() -> (&'static str, &'static str) {
+    #[cfg(target_os = "windows")]
+    {
+        ("windows-x64", "vct-launcher.exe")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        ("macos-arm64", "vct-launcher")
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        ("linux-x64", "vct-launcher")
+    }
+}
+
+/// Spawn the new launcher fully detached. The current process exits
+/// immediately afterward; the child must be in its own session/process
+/// group so the kernel doesn't tear it down with us.
+fn spawn_detached_launcher(exe: &Path) -> Result<(), String> {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: setsid(2) is signal-safe and async-signal-safe on every
+        // POSIX system. The pre_exec closure runs in the forked child
+        // after fork() but before exec() — at that point the child has a
+        // single thread (the forking one) so no synchronization primitives
+        // are at risk. Returning Ok keeps the exec path; returning an
+        // io::Error would abort the spawn.
+        unsafe {
+            cmd.pre_exec(|| {
+                // setsid() makes the child a new session leader, which
+                // also detaches it from the controlling terminal of the
+                // parent. Failing here would still leave the child
+                // alive (just not detached) — choose to log+continue
+                // by returning Ok regardless. The detach is belt-and-
+                // braces with stdin/stdout/stderr null.
+                let _ = libc::setsid();
+                Ok(())
+            });
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+        const DETACHED_PROCESS: u32 = 0x00000008;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+    }
+
+    cmd.spawn()
+        .map(|_child| ())
+        .map_err(|e| format!("failed to spawn new launcher at {}: {}", exe.display(), e))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_section_removes_named_block_and_keeps_others() {
+        let body = "\
+---
+title: VCO Update Deferred
+condition_ids: [launcher_restart_required, schema_drift_rebuild_required]
+---
+
+# VCO Update Deferred
+
+## launcher_restart_required (info)
+
+**Title**: Launcher binary updated to 0.2.15
+
+**Detected**: blah.
+
+**To apply**:
+```bash
+echo restart
+```
+
+**Detected at**: 2026-05-17T12:00:00Z
+
+---
+
+## schema_drift_rebuild_required (warning)
+
+**Title**: Schema rebuild required
+
+**Detected**: drift detected.
+
+---
+";
+        let out = strip_section(body, "launcher_restart_required");
+        // The `## launcher_restart_required (info)` section + body must be
+        // gone, but the frontmatter still mentions the condition_id in
+        // its `condition_ids:` list (we don't regenerate frontmatter — the
+        // next install.py run will rewrite the whole file fresh).
+        assert!(!out.contains("## launcher_restart_required"),
+                "section header still present: {}", out);
+        assert!(!out.contains("Launcher binary updated to 0.2.15"),
+                "section body still present: {}", out);
+        assert!(out.contains("schema_drift_rebuild_required"),
+                "other entry must be preserved: {}", out);
+        assert!(out.contains("## schema_drift_rebuild_required"),
+                "other section header must remain: {}", out);
+    }
+
+    #[test]
+    fn strip_section_handles_only_entry_case() {
+        let body = "\
+---
+condition_ids: [launcher_restart_required]
+---
+
+# VCO Update Deferred
+
+## launcher_restart_required (info)
+
+**Title**: foo
+
+---
+";
+        let out = strip_section(body, "launcher_restart_required");
+        // After stripping, only frontmatter + header should remain.
+        assert!(!out.contains("## launcher_restart_required"));
+        assert!(out.contains("VCO Update Deferred"));
+    }
+
+    #[test]
+    fn strip_section_unknown_condition_is_noop() {
+        let body = "## something_else (warning)\n\n---\n";
+        let out = strip_section(body, "launcher_restart_required");
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn clear_restart_deferral_unlinks_when_only_entry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dot_claude = tmp.path().join(".claude").join("context");
+        std::fs::create_dir_all(&dot_claude).expect("mkdir");
+        let target = dot_claude.join("UPDATE_DEFERRED.md");
+        std::fs::write(
+            &target,
+            "---\ncondition_ids: [launcher_restart_required]\n---\n\n# VCO Update Deferred\n\n## launcher_restart_required (info)\n\n**Title**: foo\n\n---\n",
+        )
+        .expect("write");
+
+        clear_restart_deferral(tmp.path()).expect("clear");
+        assert!(!target.exists(), "file should be removed when no entries remain");
+    }
+
+    #[test]
+    fn clear_restart_deferral_rewrites_when_other_entries_present() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dot_claude = tmp.path().join(".claude").join("context");
+        std::fs::create_dir_all(&dot_claude).expect("mkdir");
+        let target = dot_claude.join("UPDATE_DEFERRED.md");
+        let original = "---\ncondition_ids: [launcher_restart_required, other_thing]\n---\n\n# VCO Update Deferred\n\n## launcher_restart_required (info)\n\n**Title**: foo\n\n---\n\n## other_thing (warning)\n\n**Title**: bar\n\n---\n";
+        std::fs::write(&target, original).expect("write");
+
+        clear_restart_deferral(tmp.path()).expect("clear");
+        assert!(target.exists(), "file should remain when other entries exist");
+        let new_content = std::fs::read_to_string(&target).expect("read");
+        // The launcher_restart_required SECTION must be gone (header + body);
+        // the frontmatter still lists the condition_id but that's regenerated
+        // on the next install.py run.
+        assert!(!new_content.contains("## launcher_restart_required"));
+        assert!(new_content.contains("other_thing"));
+        assert!(new_content.contains("## other_thing"));
+    }
+
+    #[test]
+    fn clear_restart_deferral_missing_file_is_ok() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // No file created — must not error.
+        clear_restart_deferral(tmp.path()).expect("missing-file must be Ok");
+    }
+
+    #[test]
+    fn launcher_binary_relative_path_matches_python_helper() {
+        // Sanity: the (subdir, fname) tuple must match
+        // install.py::_launcher_binary_relative_path or downstream paths
+        // diverge silently.
+        let (subdir, fname) = launcher_binary_relative_path();
+        #[cfg(target_os = "windows")]
+        {
+            assert_eq!(subdir, "windows-x64");
+            assert_eq!(fname, "vct-launcher.exe");
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(subdir, "macos-arm64");
+            assert_eq!(fname, "vct-launcher");
+        }
+        #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+        {
+            assert_eq!(subdir, "linux-x64");
+            assert_eq!(fname, "vct-launcher");
+        }
+    }
+}

@@ -479,8 +479,16 @@ function Test-OverlayExists {
 # ---------------------------------------------------------------------------
 function Get-ComposeInvocation {
     param(
-        [Parameter(Mandatory=$true)][string] $Runtime,
-        [Parameter(Mandatory=$true)][string] $GpuMode,
+        # AllowEmptyString lets the soft-fail branch (`'' -> ErrorCode=1`)
+        # below execute when callers pass "" explicitly. Without this
+        # attribute, PowerShell's mandatory-param validation rejects the
+        # empty string BEFORE the function body runs — non-interactive
+        # invocations then receive $null back and `exit $null` collapses
+        # to exit 0, masking the soft-fail. The bash sibling has no such
+        # quirk because bash treats "" as a present-but-empty positional
+        # parameter naturally. v0.2.15 fix.
+        [Parameter(Mandatory=$true)][AllowEmptyString()][string] $Runtime,
+        [Parameter(Mandatory=$true)][AllowEmptyString()][string] $GpuMode,
         [Parameter(Mandatory=$false)][string] $WorkingDir = ''
     )
     if ([string]::IsNullOrEmpty($WorkingDir)) { $WorkingDir = (Get-Location).Path }

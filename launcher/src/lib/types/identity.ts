@@ -50,8 +50,27 @@ export interface AffectedProject {
 export interface LegacyCodegraphReport {
   collections: LegacyCodegraphCollection[];
   affected_projects: AffectedProject[];
+  /** v0.2.15 (0.4): orphan code-graph classes whose prefix
+   *  case-insensitively matches a known project but differs from that
+   *  project's current canonical prefix. Each group represents one
+   *  obsolete sanitizer-generation's leftover classes. */
+  orphan_groups: OrphanCollectionGroup[];
   /** True when the launcher should surface the one-time notification. */
   action_recommended: boolean;
+}
+
+export interface OrphanCollectionGroup {
+  /** Non-canonical prefix (e.g. 'VCO_dev'). */
+  prefix: string;
+  /** Project this group most likely belongs to (case-insensitive match). */
+  matched_project_id: string;
+  matched_project_name: string;
+  /** Project's CURRENT canonical prefix; what new analyses will use. */
+  current_prefix: string;
+  /** Per-suffix code-graph classes under `prefix`. */
+  collections: LegacyCodegraphCollection[];
+  /** Sum of object_count across collections. Pre-computed by the backend. */
+  total_objects: number;
 }
 
 export interface CleanupLegacyFailure {

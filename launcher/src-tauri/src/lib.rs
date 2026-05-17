@@ -6,6 +6,7 @@ mod installer_engine;
 mod manifest;
 mod mcp_registration;
 mod paths;
+pub mod project_naming;
 mod quit_dialog;
 mod registry;
 mod secrets;
@@ -911,6 +912,7 @@ pub fn run() {
             commands::project_identity::redetect_project_identity,
             commands::project_identity::list_legacy_codegraph_collections,
             commands::project_identity::cleanup_legacy_codegraph_collections,
+            commands::project_identity::cleanup_orphan_codegraph_collections,
             commands::project_identity::get_legacy_codegraph_notice_dismissed,
             commands::project_identity::set_legacy_codegraph_notice_dismissed,
             // PR-26 / Group E (v0.2.12 / 2026-05-16): shared KG canonical-name
@@ -966,6 +968,12 @@ pub fn run() {
             commands::self_update::get_cached_update_status,
             commands::self_update::set_auto_check_enabled,
             commands::self_update::get_auto_check_enabled,
+            // v0.2.15 (Agent D): launcher self-restart after binary swap.
+            // Invoked by the green "Restart now" banner the FE renders for
+            // `launcher_restart_required` deferral entries emitted by
+            // install.py's _refresh_dist_binary_after_rebuild.
+            commands::restart::restart_launcher,
+            commands::restart::get_launcher_restart_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

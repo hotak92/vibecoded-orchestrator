@@ -79,10 +79,18 @@ services:
     build:
       context: ${VCT_CODE_EMBED_BUILD_CONTEXT:-../claude_mcp_servers/code_embedding_service}
       dockerfile: Dockerfile
-    # Kept as `vct_code_embed` (historical) — the launcher's
-    # types.rs::command and volumes.rs::volume_role still reference this
-    # exact name. Don't rename without updating both.
-    container_name: vct_code_embed
+    # Renamed `vct_code_embed` → `vco_code_embed` in v0.2.15 for naming
+    # consistency with the rest of the vco_* stack. `vct_code_embed` is
+    # kept in `vco_lib.containers.HISTORICAL_ALIASES["code_embed"]` so
+    # existing installs migrate cleanly (find_existing_container probes
+    # the legacy name as a fallback). When renaming this field again,
+    # update in lockstep:
+    #   - vco_lib/containers.py (CANONICAL_CONTAINERS + HISTORICAL_ALIASES)
+    #   - templates/hooks/_lib/container-names.{sh,ps1}
+    #   - templates/hooks/ensure-containers.{sh,ps1} fallback list
+    #   - launcher/src-tauri/src/types.rs (ServiceConfig::command)
+    #   - launcher/src-tauri/src/commands/volumes.rs (volume_role)
+    container_name: vco_code_embed
     restart: unless-stopped
     ports:
       - "${CODE_EMBED_PORT:-11440}:11440"

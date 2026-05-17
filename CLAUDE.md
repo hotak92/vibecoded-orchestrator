@@ -531,6 +531,10 @@ When 2+ agents work on the same git repo concurrently, they trip over each other
 
 **Verification before finalizing**: when reviewing parallel agent work, check `git worktree list` — every agent's branch should show its own worktree path under `/tmp/` or similar. If any agent committed from the main repo path while others were also active, treat its work as suspect (the other agents may have shifted its working tree mid-task).
 
+**Spawn from the right repo**: with `isolation: worktree`, the auto-created worktree comes from the **spawner's current working directory's git repo**. If your cwd is VCO_dev but you want the agent to work on `vibecoded-orchestrator/`, the agent will land in the wrong tree. Either `cd` into the target repo before spawning, or tell the agent in its prompt to `git worktree add` from the explicit target repo path. Verify in the agent's first tool call (`git rev-parse --show-toplevel`) that it's where you expected.
+
+**Hygiene after merge**: when an agent's work has been merged (or intentionally abandoned), delete the worktree and branch so they don't pile up: `git worktree remove <path>` then `git branch -D <branch>`. A long list of stale `worktree-agent-*` / `feat/pr*` entries is a smell that prior cleanup was skipped — it makes it harder to spot which work is actually in-flight, and (worst case) someone could mistake stale-but-unmerged content for live work. Audit periodically with `git worktree list && git branch --merged main && git branch --no-merged main`. If you have an open instruction to NOT merge a branch back yet (intentional WIP, paused work, abandoned-but-need-to-keep-for-reference), leave it in place — the cleanup discipline is "remove when truly done", not "remove on schedule".
+
 **Skill Frontmatter** (in `.claude/skills/NAME/SKILL.md`):
 - VS Code validates: `name`, `description`, `argument-hint`, `disable-model-invocation`, `user-invocable`, `compatibility`, `license`, `metadata`.
 - CLI/runtime also accepts (VS Code warns but they work): `model`, `effort`, `allowed-tools`, `context: fork`, `agent`, `hooks`.
