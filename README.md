@@ -64,7 +64,7 @@ If you don't use Claude Code: the KG, code graph, MCP servers, and launcher GUI 
 - **Knowledge Graph** — Obsidian-style markdown nodes with typed WikiLinks, indexed in Weaviate via qwen3 embeddings (1024-dim, local). Optional OpenAI embeddings.
 - **Code Graph** — Tree-sitter AST analysis across 10+ languages, populating `CodeModule`, `CodeClass`, `CodeFunction`, `CodeAPI`, `CodeInteraction` collections. Optional Joern integration for CFG/PDG metrics.
 - **23 automation hooks** — context injection on prompt submit, KG/code-graph auto-sync on file edit, credential scans, compaction-preserving context replay, security checks. Linux/macOS use `.sh`; Windows ships native `.ps1`.
-- **5 MCP servers** — Weaviate (semantic + graph search), Ollama (local LLM, embeddings, vision via qwen3.5:9b, document summarization), search (web + GitHub code + arXiv), code-embedding (CodeSage-Large-v2 via FastAPI), and Playwright (browser automation, screenshots, GUI testing). All local; no per-tool API keys for the default tier.
+- **3 MCP servers (default install)** — Weaviate (semantic + graph search), search (academic-paper search via OpenAlex + arXiv), code-embedding (CodeSage-Large-v2 via FastAPI). All local; no per-tool API keys for the default tier. Two more MCP servers (Ollama local LLM + Playwright browser automation) are available as opt-in modules via the launcher Modules page. Ollama as backend infrastructure (Weaviate vectorizer + code-embed CPU fallback) is always present even without the Ollama MCP wrapper.
 - **29 agents + 28 skills** — shipped via `install.py` templates. Agents handle planning, coding, testing, doc maintenance, KG navigation, code-graph health. Skills cover security review, debugging, architecture, RAG advisory, accessibility, etc.
 - **Workflow plumbing** — session state tracking (`CONTEXT_STATE.md`), plan files, memory management, pre-/post-compact context replay so a `/compact` doesn't lose your thread.
 
@@ -215,10 +215,10 @@ vibecoded-orchestrator/
 │   ├── scripts/               # CLI tools for KG and code graph
 │   └── settings.json          # Claude Code configuration
 ├── claude_mcp_servers/
-│   ├── weaviate_mcp/          # Semantic + graph search
-│   ├── ollama_mcp/            # Local LLM, embeddings, vision
-│   ├── search_mcp/            # Web + GitHub + arXiv
-│   └── code_embedding_service/ # CodeSage-Large-v2 via FastAPI
+│   ├── weaviate_mcp/          # Semantic + graph search (default)
+│   ├── search_mcp/            # Academic-paper search via OpenAlex + arXiv (default)
+│   └── code_embedding_service/ # CodeSage-Large-v2 via FastAPI (default)
+│   # Opt-in MCPs (launcher → Modules): vct-ollama (local LLM/embeddings/vision)
 ├── templates/
 │   ├── agents/free/           # 29 bundled agents
 │   └── skills/                # 28 bundled skills

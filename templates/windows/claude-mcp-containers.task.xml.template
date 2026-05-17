@@ -8,13 +8,24 @@
   template and imports it via `schtasks /Create /XML <file> /F`. Runs
   per-user without admin elevation.
 
+  v0.2.14 (Bug #2 — Windows PowerShell wrapper): the previous version of
+  this template invoked `bash scripts/launch-claude-mcp-stack.sh` via
+  cmd.exe, which required Git Bash or WSL on PATH. install.py logged a
+  soft warning when neither was present, but the Scheduled Task itself
+  then failed silently on every logon. Since v0.2.14 the sibling PS1
+  wrapper `scripts/launch-claude-mcp-stack.ps1` ships alongside the
+  bash one, and this template invokes it via powershell.exe — which is
+  guaranteed to be present on every Windows 10+ install (Windows
+  PowerShell 5.1) without any third-party dependency.
+
   Why this exists:
-    - The wrapper script scripts/launch-claude-mcp-stack.sh is bash; it
-      doesn't run natively on cmd.exe / PowerShell. The Actions/Exec
-      below invokes `bash` (Git Bash, WSL bash, or any bash on PATH),
-      passing the wrapper script as the argument. Git Bash + WSL are
-      already prerequisites in the orchestrator's general install path
-      (Windows users without bash should install Git for Windows).
+    - The wrapper script scripts/launch-claude-mcp-stack.ps1 is a
+      PowerShell 5.1+ port of the bash sibling. It carries the same
+      runtime detection (VCT_CONTAINER_RUNTIME env preference -> runtime.txt
+      -> auto-probe), daemon-access validation (`docker info` Server
+      section / `podman info` exit 0), compose override resolution
+      (compose.override.yaml + VCT_STACK_COMPOSE_OVERRIDE), and soft-fail
+      discipline as the .sh wrapper.
     - StartWhenAvailable + per-user logon trigger matches the Linux
       `systemctl user enable` + `loginctl enable-linger` pair: the
       task runs whenever the user logs in, no admin scope required.
@@ -27,30 +38,30 @@
     Docker Desktop on Windows uses the WSL2 backend; GPU passthrough
     requires the NVIDIA-WSL2 driver (host-side, separate install) AND
     Docker Desktop ≥ 4.16. podman on Windows runs via podman-machine
-    (also WSL2-backed); same WSL2 GPU semantics apply. The wrapper's
-    NVIDIA / CDI detection is Linux-only (it shells out to nvidia-smi
-    and reads /var/run/cdi/nvidia.yaml — neither exists on Windows host).
-    On Windows the wrapper currently falls through to CPU-only compose;
-    a future revision could shell into the WSL2 distro to probe. Out of
-    scope for v0.2.10.
+    (also WSL2-backed); same WSL2 GPU semantics apply. The PS1 wrapper's
+    Test-HasNvidia probes the Windows host's nvidia-smi if present, but
+    CDI files (/var/run/cdi/nvidia.yaml) live inside the WSL2 distro
+    and are not pollable from the host without `wsl.exe -d` indirection.
+    The current Windows policy: if nvidia-smi is on the host PATH and
+    reports a GPU, gpu_mode=gpu; otherwise CPU-only. The container
+    runtime (Docker Desktop / podman-machine) handles WSL CDI internally.
 
   Template substitutions (filled in by install.py):
     {{LABEL}}              — task name (no path separators)
     {{WORKING_DIR}}        — directory containing compose.yaml
-    {{WRAPPER_SCRIPT}}     — absolute path to launch-claude-mcp-stack.sh
-                             (use forward slashes; bash translates them)
+    {{WRAPPER_SCRIPT}}     — absolute path to launch-claude-mcp-stack.ps1
+                             (v0.2.14: was .sh; powershell.exe accepts
+                             both forward and backslash separators)
     {{LOG_FILE}}           — absolute path to the unit's log file
-                             (use forward slashes; bash translates them)
     {{CREATED_AT}}         — ISO8601 timestamp at materialization time
     {{USER_ID}}            — Windows user ID (e.g. DOMAIN\\user) for the
                              logon trigger context
 
-  Environment propagation (PR-32, 2026-05-16):
-    The wrapper script `launch-claude-mcp-stack.sh` reads three env vars
-    set by the systemd unit on Linux:
+  Environment propagation (PR-32, 2026-05-16; revised v0.2.14):
+    The PS1 wrapper reads three env vars set by the Scheduled Task:
 
         VCT_STACK_WORKING_DIR    — directory containing compose.yaml
-        VCT_STACK_LOG_FILE       — absolute path to the unit's log file
+        VCT_STACK_LOG_FILE       — absolute path to the wrapper's log file
         VCT_STACK_COMPOSE_OVERRIDE — overlay compose file (defaults to
                                      `compose.override.yaml`)
 
@@ -60,18 +71,22 @@
     current user, breaking compose-up). Mirrors the systemd template's
     `Environment=VCT_STACK_*=...` lines.
 
-    Mechanism: we replace the bare `<Command>bash</Command>` with
-    `cmd.exe /c "set VAR=val && set VAR2=val2 && set VAR3=val3 && bash
-    <script>"`. `cmd.exe` is always on PATH on Windows; the `set` builtin
-    is per-process scope (it does not leak into the user's interactive
-    environment); the `&&` chain ensures bash inherits the variables.
-    Forward slashes in WRAPPER_SCRIPT survive cmd.exe → bash translation.
+    v0.2.14 mechanism: we wrap powershell.exe in `cmd.exe /c "set
+    VAR=val && set VAR2=val2 && set VAR3=val3 && powershell.exe
+    -ExecutionPolicy Bypass -File <script>"`. cmd.exe is always on PATH
+    on Windows; the `set` builtin is per-process scope (it does not leak
+    into the user's interactive environment); the `&&` chain ensures
+    powershell.exe inherits the variables. -ExecutionPolicy Bypass keeps
+    the script runnable even on machines that ship with the default
+    Restricted policy (no need to elevate or modify the policy
+    permanently). -NoProfile skips the user's PowerShell profile
+    (faster boot, no profile-script side effects).
 -->
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
     <Date>{{CREATED_AT}}</Date>
     <Author>{{USER_ID}}</Author>
-    <Description>Claude MCP container stack (weaviate, ollama, code_embed, model_router) — brings up at user logon via launch-claude-mcp-stack.sh.</Description>
+    <Description>Claude MCP container stack (weaviate, ollama, code_embed, model_router) — brings up at user logon via launch-claude-mcp-stack.ps1.</Description>
     <URI>\{{LABEL}}</URI>
   </RegistrationInfo>
   <Triggers>
@@ -107,20 +122,27 @@
     <Priority>7</Priority>
   </Settings>
   <!--
-    Action invocation note (PR-22 + PR-32, 2026-05-16, unified at v0.2.12
-    integration merge):
+    Action invocation note (PR-22 + PR-32, 2026-05-16; revised v0.2.14
+    Bug #2 to invoke the PS1 sibling):
 
     Task Scheduler XML has no native env-var declarations in <Actions>.
-    We propagate the three VCT_STACK_* env vars by wrapping the wrapper
-    script in `cmd.exe /c "set ...&& set ...&& bash WRAPPER"`. cmd.exe is
-    chosen over bash because it is always present on Windows PATH (bash
-    requires WSL or git-bash, neither guaranteed on an end-user machine).
+    We propagate the three VCT_STACK_* env vars by wrapping powershell.exe
+    in `cmd.exe /c "set ...&& set ...&& powershell.exe -File WRAPPER"`.
+    cmd.exe is chosen because it is always present on Windows PATH and
+    is the simplest way to chain `set` commands before the final exec.
+
+    powershell.exe (the in-box Windows PowerShell 5.1 host at
+    %SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe) is also
+    always present — every Windows 10+ install ships with it. No Git
+    Bash / WSL dependency. The PS1 wrapper is compatible with both
+    powershell.exe (5.1) and pwsh.exe (Core 7+); we pick powershell.exe
+    for maximum out-of-box reach.
 
     Env vars set:
       * VCT_STACK_WORKING_DIR={{WORKING_DIR}}        — wrapper working dir
       * VCT_STACK_LOG_FILE={{LOG_FILE}}              — wrapper log target
       * VCT_STACK_COMPOSE_OVERRIDE=compose.override.yaml — user-machine
-        override (see scripts/launch-claude-mcp-stack.sh) that lets the
+        override (see scripts/launch-claude-mcp-stack.ps1) that lets the
         launcher's Storage UX override (PR-10A) take effect at boot.
         Default value matches podman-compose's auto-load convention;
         without it the wrapper's explicit `-f compose.yaml` bypasses
@@ -129,15 +151,26 @@
     Mirrors the systemd unit's three `Environment=` lines (see
     templates/systemd/claude-mcp-containers.service.template).
 
+    Argument breakdown for powershell.exe:
+      -NoProfile          Skip the user's PowerShell profile (faster
+                          boot, no profile-script side effects).
+      -ExecutionPolicy Bypass
+                          Per-invocation policy override; does NOT
+                          modify the user's persistent policy. Allows
+                          unsigned scripts (our PS1 is not signed).
+      -File "WRAPPER"     Execute the script file (vs -Command).
+                          Quoting survives the cmd.exe -> powershell.exe
+                          boundary via `&quot;`.
+
     The `&amp;&amp;` chain XML-escapes `&&` so cmd.exe inherits the env
     var across the chained `set` commands. `&quot;` escapes the inner
     double-quote around {{WRAPPER_SCRIPT}} so the wrapper path is
-    correctly quoted when bash receives it.
+    correctly quoted when powershell.exe receives it.
   -->
   <Actions Context="Author">
     <Exec>
       <Command>cmd.exe</Command>
-      <Arguments>/c "set VCT_STACK_WORKING_DIR={{WORKING_DIR}}&amp;&amp; set VCT_STACK_LOG_FILE={{LOG_FILE}}&amp;&amp; set VCT_STACK_COMPOSE_OVERRIDE=compose.override.yaml&amp;&amp; bash &quot;{{WRAPPER_SCRIPT}}&quot;"</Arguments>
+      <Arguments>/c "set VCT_STACK_WORKING_DIR={{WORKING_DIR}}&amp;&amp; set VCT_STACK_LOG_FILE={{LOG_FILE}}&amp;&amp; set VCT_STACK_COMPOSE_OVERRIDE=compose.override.yaml&amp;&amp; powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;{{WRAPPER_SCRIPT}}&quot;"</Arguments>
       <WorkingDirectory>{{WORKING_DIR}}</WorkingDirectory>
     </Exec>
   </Actions>

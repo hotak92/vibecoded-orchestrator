@@ -7,6 +7,173 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.14] — 2026-05-17
+
+Cross-OS hardening release on top of v0.2.13. Surfaces fixed: a Windows
+boot-service regression that's been latent since the v0.2.x launcher
+shipped, a macOS bundled-binary dir mismatch (tier-1 always missed),
+4 long-standing cargo-test flakes that gave false CI signal under
+parallel test load, and a `VCT_CONTAINER_RUNTIME` env-var contract
+that was honored in 4 of 8 surfaces (split-brain risk for users with
+both runtimes installed).
+
+Also: a generic paid-module installer framework lands publicly. The
+launcher can now install Pro-tier modules via signed-URL container
+pulls (first concrete consumer: the RL Reranker module, distributed
+separately from the AGPL public repo).
+
+**Major theme — Windows actually works**: the launcher's `find_stack_wrapper`
+was probing for `scripts/launch-claude-mcp-stack.ps1` on Windows since
+v0.2.x, but the file never existed — launcher silently fell back to
+direct compose calls, losing CDI-wait, runtime validation, and override-
+file logic. Boot Task XML required Git Bash / WSL on PATH because it
+invoked the `.sh` via bash. Fix: shipped a 756-line PowerShell sibling
+of the bash wrapper (full functional parity) + 19 PS1 tests + updated
+Task XML to invoke PowerShell directly. No Git Bash / WSL dependency
+on Windows anymore.
+
+**Major theme — env-var contract consolidation**: `VCT_CONTAINER_RUNTIME`
+was honored in hooks + launcher's `services::runtime.rs::resolve_runtime`
+(PR-43 v0.2.12) but ignored in `install.py::_detect_container_runtime`,
+`install.py::_detect_installed_runtime`, the boot wrapper's
+`detect_runtime`, and `project_env_settings.rs::detect_runtime_sync`.
+On a host with both podman + docker installed, hooks would pick one,
+install + boot would pick the other — split-brain. Now consolidated:
+all 8 surfaces consult the env var first (accepted values:
+`podman|docker|auto`, case-insensitive, trimmed; unknown values log
+to stderr + fall through to auto-detect — lenient).
+
+**Major theme — cargo-test flakes fixed at root cause**: the 4 documented
+flakes in `commands::kg_sync::tests` + `commands::installer::tests::
+github_pat_keychain_tests` shipped through v0.2.12 + v0.2.13 as
+"pass on retry, pass with `--test-threads=1`". Real fixes landed (no
+`#[ignore]` markers):
+- kg_sync: new `spawn_sh_with_retry` helper uses absolute `/bin/sh`
+  (skips `execvp`'s `$PATH` traversal — the actual race source) + 3-attempt
+  retry-with-backoff on transient `ErrorKind::NotFound`.
+- keychain: `keychain_serialize_lock` upgraded to a `KeychainGuard` that
+  bundles the in-process mutex with a cross-process `flock(LOCK_EX)` on
+  `/tmp/vct-keychain-test.lock` (Unix) / `LockFileEx` (Windows inline FFI).
+  Concurrent `cargo test --lib` invocations from different terminals now
+  serialise on the OS keychain slot.
+  9-batch parallel reproduction (3 batches × 3 concurrent runs each) post-fix:
+  zero flakes.
+
+### Added
+
+- **`scripts/launch-claude-mcp-stack.ps1`** (756 lines, audit Bug #2):
+  PowerShell 5.1+ port of the bash wrapper. Full functional parity for
+  runtime detection, daemon-access validation, GPU/CDI handling
+  (Windows: GPU passthrough is WSL2-mediated; no Linux-host CDI probes),
+  compose-override resolution, and soft-fail discipline. Honors
+  `VCT_CONTAINER_RUNTIME` env var first per the v0.2.14 contract.
+- **`tests/test_launch_claude_mcp_stack_ps1.py`** (343 lines, 19 tests):
+  mirrors the bash sibling's test matrix; auto-skips when no
+  `pwsh` / `powershell.exe` on PATH.
+- **`scripts/launch-claude-mcp-stack.sh::detect_runtime`** step 0:
+  `VCT_CONTAINER_RUNTIME` consulted BEFORE runtime.txt + auto-detect.
+  Unknown values log to stderr and fall through (lenient).
+- **`install.py::_runtime_preference_from_env()`** helper: parses
+  `VCT_CONTAINER_RUNTIME`; threaded into both
+  `_detect_container_runtime` (probes the explicit runtime first;
+  falls through to auto if not reachable) and `_detect_installed_runtime`
+  (returns the explicit runtime if installed, else auto-detect).
+- **`vco_lib/project_init.py::_hook_globs_for_os()`**: returns BOTH
+  `*.sh` and `*.ps1` instead of host-OS only. Bundle installer now
+  ships both flavours so cross-OS workflows (dual-boot, WSL crossover,
+  network-mounted projects) don't leave stale orphan hooks from the
+  unexpected flavour. Hooks are text files (~few KB each); shipping
+  both is cheap + correct.
+- **`docs/MAINTAINER_GUIDE.md`** (new): DIST_COMMIT_TOKEN setup runbook
+  (Option A bypass_actors for org repos; Option B PAT secret for
+  user repos), ruleset-disable trick for one-off pushes, full
+  release-workflow flow + auto-commit failure recovery.
+
+### Changed
+
+- **`install.py::_launcher_binary_relative_path()`** (audit Bug #1):
+  Darwin branch returns `("macos-arm64", "vct-launcher")` (was
+  `("experimental_macOS", ...)` which pointed at an empty placeholder
+  dir). Tier-1 bundled lookup now finds the macOS binary; tier-2
+  download lands in the right dir; release-artifact name mapping
+  pass-through.
+- **`templates/windows/claude-mcp-containers.task.xml.template`**: invokes
+  `powershell.exe -NoProfile -ExecutionPolicy Bypass -File` against the
+  new `.ps1` wrapper (no longer requires Git Bash / WSL). Falls back
+  to the `.sh` via bash if the `.ps1` isn't shipped (e.g. early v0.2.14
+  partial installs).
+- **`install.py::_materialize_boot_service_windows`**: prefers `.ps1`
+  when shipped; falls back to `.sh` if absent (defense in depth).
+- **`launcher/src-tauri/src/commands/lifecycle.rs::run_stack_wrapper`**:
+  adds `-NoProfile` to the PowerShell invocation for parity with the
+  Task XML.
+- **`launcher/src-tauri/src/commands/project_env_settings.rs::detect_runtime_sync`**:
+  honors `VCT_CONTAINER_RUNTIME` env var (audit Bug #3).
+- **README.md**: "5 MCP servers" → "3 default + 2 opt-in"; directory
+  tree drops `ollama_mcp/` (opt-in via launcher Modules → `vct-ollama`);
+  narrows search description to "academic-paper search" only. Closes
+  the stale v0.2.11-removed surface that was misleading users on the
+  public landing page.
+- **`templates/agents/free/prompt-engineer.md`** + **`knowledge-curator.md`**:
+  stale Ollama MCP refs cleaned. Tool-card sections for `chat` /
+  `read_document` now note opt-in-only status via `vct-ollama`; decision
+  trees route quick-analysis tasks to Claude's native reasoning rather
+  than to a removed MCP tool.
+- **`templates/scripts/claude_token_counter.py`** `WEB_TOOL_NAMES`:
+  removed names of v0.2.11-dropped Search MCP tools
+  (`mcp__search__web_search`, `mcp__search__fetch_page`,
+  `mcp__search__search_code`). Kept `mcp__search__search_papers` (the
+  only surviving search tool).
+
+### Fixed
+
+- **Windows boot-service silently failed on logon** (audit Bug #2):
+  Task XML invoked `bash <wrapper.sh>` which required Git Bash / WSL
+  on PATH. Install-time logged a soft warning; the Scheduled Task
+  itself surfaced no diagnostic per failed logon. Now uses PowerShell
+  natively; bash on Windows is optional.
+- **macOS tier-1 launcher-binary lookup always returned None** (audit
+  Bug #1): `_launcher_binary_relative_path()` returned
+  `("experimental_macOS", ...)` but binaries shipped in
+  `launcher/dist/macos-arm64/`. Fresh macOS installs fell through to
+  GitHub download (tier 2) which then landed in the wrong dir too,
+  leaving the desktop shortcut + the rest of the codebase
+  inconsistent across two dist subdirs.
+- **`VCT_CONTAINER_RUNTIME` split-brain on hosts with both runtimes
+  installed** (audit Bug #3): see Major theme above.
+- **Cross-OS workflows lost stale orphan hooks** (audit Concern #2):
+  the bundle installer copied only host-OS hook flavours. A user
+  with a project folder opened from both POSIX and Windows shells
+  got stale orphan `.sh` files on Windows + stale orphan `.ps1`
+  files on Linux/macOS that the unexpected shell could still invoke.
+  Now both flavours ship always; the runtime picks which to invoke.
+- **4 cargo-test flakes from v0.2.12** (`kg_sync::concurrent_drain`,
+  `kg_sync::stall_watchdog`, `installer::pat_file_to_keychain_migration`,
+  `installer::register_github_pat_preserves_existing_user_file`): see
+  Major theme above. Both pairs fixed at root cause; no `#[ignore]`
+  markers.
+
+### Security
+
+No new security advisories in v0.2.14. v0.2.13's Svelte XSS bump
+(5.55.7 + Kit 2.60.1 + devalue 5.8.1) carries forward; `npm audit`
+remains clean.
+
+### Known issues / deferred to v0.2.15
+
+- **`DIST_COMMIT_TOKEN` repo secret not yet set**: until configured per
+  `docs/MAINTAINER_GUIDE.md`, the release-workflow `commit-dist-binaries`
+  job 403s on push to protected `main`. Workaround: the ruleset-disable
+  trick (also documented). Auto-commit code path verified manually on
+  the v0.2.13 release tag.
+- **`commands::storage_ux::cli_helper_tests::cli_helper_*`** (bonus
+  finding from Agent B's flake audit): intra-process race in
+  `with_state_dir` (uses `process::id()` as tempdir suffix → multiple
+  parallel tests in one binary race on the same path). Reproducible
+  via `cargo test --lib commands::storage_ux::cli_helper_tests`. One-
+  line fix (`uuid::Uuid::new_v4()` instead of `process::id()`) deferred
+  to v0.2.15.
+
 ## [0.2.13] — 2026-05-16
 
 Same-day patch release on top of v0.2.12. Discovered during a real

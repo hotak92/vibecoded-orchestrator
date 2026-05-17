@@ -3619,9 +3619,43 @@ def _print_gpu_hint(os_name: str) -> None:
         print("         https://developer.nvidia.com/cuda-downloads")
 
 
+def _runtime_preference_from_env() -> Optional[str]:
+    """Return the user's explicit `VCT_CONTAINER_RUNTIME` preference, or
+    None if unset / set to "auto".
+
+    Canonical contract (v0.2.14, consolidated across install.py,
+    launcher Rust, hooks, and the boot wrapper): values are
+    case-insensitive, trimmed, and "auto" is treated as "no preference".
+    Unknown values log to stderr and are ignored (fall through to
+    auto-detect).
+
+    Callers should check this BEFORE running auto-detection so the
+    user's choice wins over PATH order. Audit Bug #3 (cross-OS audit,
+    2026-05-17).
+    """
+    raw = os.environ.get("VCT_CONTAINER_RUNTIME", "").strip().lower()
+    if not raw or raw == "auto":
+        return None
+    if raw in ("podman", "docker"):
+        return raw
+    print(
+        f"  VCT_CONTAINER_RUNTIME={raw!r} unrecognized (expected "
+        "'podman' / 'docker' / 'auto'); falling through to auto-detect.",
+        file=sys.stderr,
+    )
+    return None
+
+
 def _detect_container_runtime() -> str:
     """Detect Docker or Podman. Prefer Podman everywhere — no commercial
     license required, increasingly native on macOS/Windows.
+
+    Honors `VCT_CONTAINER_RUNTIME=podman|docker|auto` env var as the
+    user's explicit preference (v0.2.14 Bug #3 fix). If set to a
+    recognized value, returns that runtime IF it's reachable; else
+    falls through to auto-detect (we don't want a misconfigured env
+    var to silently leave the user with no runtime — auto-detect
+    finds whatever IS working).
 
     Returns:
       - "podman" or "docker" if a runtime is present AND its daemon
@@ -3629,6 +3663,26 @@ def _detect_container_runtime() -> str:
       - "" if neither runtime is on PATH OR the daemon isn't responding.
         Caller distinguishes the two cases via `_detect_installed_runtime()`.
     """
+    pref = _runtime_preference_from_env()
+    if pref is not None:
+        # User explicitly chose. Try ONLY that one; if it works, honor.
+        # If not, fall through to auto-detect (lenient: don't strand the
+        # user on a misconfigured env var). Stderr explains the fallthrough.
+        if shutil.which(pref):
+            try:
+                result = subprocess.run(
+                    [pref, "version"], capture_output=True, text=True, timeout=15,
+                )
+                if result.returncode == 0:
+                    return pref
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+        print(
+            f"  VCT_CONTAINER_RUNTIME={pref!r} not reachable; falling "
+            "through to auto-detect.",
+            file=sys.stderr,
+        )
+
     candidates = ["podman", "docker"]
 
     for cmd in candidates:
@@ -3678,6 +3732,10 @@ def _detect_installed_runtime() -> str:
     """Lightweight presence check — returns the FIRST container-runtime
     binary on PATH regardless of whether its daemon is running.
 
+    Honors `VCT_CONTAINER_RUNTIME=podman|docker|auto` env var (v0.2.14
+    Bug #3 fix). If the explicit preference is installed (even if the
+    daemon isn't responsive), it wins over the auto-detect order.
+
     Use case: `_detect_container_runtime()` returned "" (no working
     runtime) but we want to give a better message than "install Podman/
     Docker" if one IS installed, just stopped. On Windows specifically,
@@ -3686,6 +3744,9 @@ def _detect_installed_runtime() -> str:
 
     Returns "" when neither binary is on PATH.
     """
+    pref = _runtime_preference_from_env()
+    if pref is not None and shutil.which(pref):
+        return pref
     for cmd in ("podman", "docker"):
         if shutil.which(cmd):
             return cmd
@@ -7213,8 +7274,12 @@ def _persist_runtime_txt(container_runtime: str | None) -> None:
 #              (legacy fallback).
 #   - Windows: Task Scheduler logon trigger registered via
 #              `schtasks /Create /XML <file> /F` (template at
-#              templates/windows/*.task.xml.template). Runs the bash
-#              wrapper through Git Bash / WSL bash on PATH.
+#              templates/windows/*.task.xml.template). v0.2.14 Bug #2:
+#              runs the PowerShell sibling wrapper
+#              (scripts/launch-claude-mcp-stack.ps1) via powershell.exe
+#              (always present on Win10+) — no Git Bash / WSL bash
+#              dependency. Falls back to the .sh wrapper only when the
+#              .ps1 isn't shipped.
 #
 # Soft-fail throughout: if the OS-specific tool isn't on PATH (e.g.
 # WSL minimal, container hosts, macOS without launchctl, locked-down
@@ -7626,10 +7691,24 @@ def _materialize_boot_service_windows(
     # registered).
     state_dir = install_path / "state"
     task_xml_path = state_dir / "installed_boot_task.xml"
-    wrapper = install_path / "scripts" / "launch-claude-mcp-stack.sh"
-    # Use forward-slash style for the bash arg — Git Bash / WSL bash
-    # accept both, but forward slashes avoid quoting nightmares in the
-    # XML body.
+    # v0.2.14 Bug #2: prefer the PowerShell sibling on Windows. It uses
+    # powershell.exe (always present on Win10+) so the Scheduled Task no
+    # longer requires Git Bash / WSL bash on PATH. Fall back to the .sh
+    # wrapper only when the .ps1 isn't shipped (older orchestrator
+    # snapshot, custom install). The Task XML template's <Arguments>
+    # block invokes powershell.exe -File <WRAPPER_SCRIPT> when the
+    # template is at v0.2.14+; if a user has an older template still
+    # invoking bash, they'd point WRAPPER_SCRIPT at the .sh — but
+    # the manifest-driven update flow propagates both together so this
+    # mismatch should not occur in practice.
+    wrapper_ps1 = install_path / "scripts" / "launch-claude-mcp-stack.ps1"
+    wrapper_sh = install_path / "scripts" / "launch-claude-mcp-stack.sh"
+    if wrapper_ps1.exists():
+        wrapper = wrapper_ps1
+    else:
+        wrapper = wrapper_sh
+    # Forward-slash form avoids XML quoting issues. PowerShell accepts
+    # both forward and backslash path separators uniformly.
     wrapper_forward = str(wrapper).replace("\\", "/")
     working_dir_forward = str(working_dir).replace("\\", "/")
     user_id = (
@@ -8048,14 +8127,25 @@ def _launcher_binary_relative_path() -> tuple[str, str]:
     """Return (subdir, filename) for the bundled launcher binary on this OS.
 
     Linux: ('linux-x64', 'vct-launcher')
-    macOS: ('experimental_macOS', 'vct-launcher')   ← matches launcher/dist/ layout
+    macOS: ('macos-arm64', 'vct-launcher')          ← post-v0.2.13 canonical slot
     Windows: ('windows-x64', 'vct-launcher.exe')
+
+    History (v0.2.14 fix): the Darwin branch previously returned
+    'experimental_macOS' but the actual binary always shipped in
+    launcher/dist/macos-arm64/ (matches the release-artifact name +
+    scripts/build-bundled-launcher.sh). The 'experimental_macOS'
+    directory was an empty placeholder. The mismatch caused tier-1
+    (bundled) lookup to return None on macOS even when the binary was
+    present, falling through to GitHub download (which landed in the
+    same wrong dir). Audit Bug #1 (cross-OS audit, 2026-05-17).
+    Intel Macs (x86_64) are intentionally not shipped — release.yml
+    line 31 only builds arm64.
     """
     system = platform.system().lower()
     if system.startswith("win"):
         return ("windows-x64", "vct-launcher.exe")
     if system == "darwin":
-        return ("experimental_macOS", "vct-launcher")
+        return ("macos-arm64", "vct-launcher")
     # Linux + everything else
     return ("linux-x64", "vct-launcher")
 
@@ -8114,10 +8204,15 @@ def _try_download_launcher_binary(install_root: Path) -> Optional[Path]:
     # Intel Macs (x86_64) are intentionally NOT shipped (see
     # .github/workflows/release.yml line 31). macos-x64 download will
     # 404 — those users fall through to tier 3 (cargo rebuild).
+    # Release artifact name token. Since v0.2.14 the dist subdir
+    # matches the release-artifact token directly (post-Bug-1 fix —
+    # `experimental_macOS → macos-arm64` rename); this mapping is now
+    # a pass-through and could be removed entirely, kept as a hook for
+    # future os-arch additions that might need a name-shift.
     os_arch_token = {
         "linux-x64": "linux-x64",
         "windows-x64": "windows-x64",
-        "experimental_macOS": "macos-arm64",
+        "macos-arm64": "macos-arm64",
     }.get(subdir, subdir)
     artifact = f"vibecoded-orchestrator-{version}-{os_arch_token}.zip"
     inner_root = f"vibecoded-orchestrator-{version}-{os_arch_token}"
@@ -10272,11 +10367,13 @@ def _materialize_boot_service(
       Linux   + docker → systemd user unit, no CDI wait (docker hook)
       macOS   + docker → LaunchAgent; no GPU passthrough on Apple Silicon
       macOS   + podman → LaunchAgent; podman-machine has no GPU passthrough
-      Windows + docker → Task Scheduler + bash wrapper via Git Bash/WSL
-      Windows + podman → Task Scheduler + bash wrapper via Git Bash/WSL
+      Windows + docker → Task Scheduler + powershell.exe + .ps1 wrapper
+                         (v0.2.14: no Git Bash / WSL dependency)
+      Windows + podman → Task Scheduler + powershell.exe + .ps1 wrapper
                          (podman-machine WSL2 backend; GPU via NVIDIA-WSL2)
 
-    The wrapper script (scripts/launch-claude-mcp-stack.sh) handles
+    The wrapper script (scripts/launch-claude-mcp-stack.sh or
+    scripts/launch-claude-mcp-stack.ps1 on Windows) handles
     runtime detection + GPU-mode detection internally, so this function
     is runtime-agnostic — it only needs to know the OS.
 

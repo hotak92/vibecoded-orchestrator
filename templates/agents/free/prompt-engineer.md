@@ -328,12 +328,14 @@ You succeed when:
    - Relational query → `semantic_graph_search`
    - Code by purpose → `search_code_graph`
    - Only use Grep/Read when: exact file path known, searching literal strings, file already in context
-2. **Use Ollama proactively**: It's FREE and underutilized (run chat/embeddings/tokens locally, no API costs!)
-3. **Query multiple systems**: KG (patterns) + Code Graph (implementations) + Development (docs) + Conversations (decisions)
-4. **Use Code Graph for few-shot examples**: `search_code_graph` finds real-world code to include in prompts
-5. **Document findings**: Share relevant KG nodes and code examples with user
-6. **Default to hybrid_search for research**: Most comprehensive (keyword + semantic + graph)
-7. **Use local chat for quick analysis**: Don't waste Claude API calls - Ollama can do simple rewrites/analysis FREE in 2-3s
+2. **Query multiple systems**: KG (patterns) + Code Graph (implementations) + Development (docs) + Conversations (decisions)
+3. **Use Code Graph for few-shot examples**: `search_code_graph` finds real-world code to include in prompts
+4. **Document findings**: Share relevant KG nodes and code examples with user
+5. **Default to hybrid_search for research**: Most comprehensive (keyword + semantic + graph)
+6. **For quick analysis / rewrites**: use Claude's own reasoning. (The Ollama
+   MCP `chat` / `read_document` tools were removed in v0.2.11 as redundant
+   with Claude's native capabilities. If you've opted into the `vct-ollama`
+   module, local inference is available; otherwise reason in-context.)
 ```
 
 **Tool-aware agent template**:
@@ -345,7 +347,7 @@ You succeed when:
 - **Code search**: Grep, Glob
 - **Command execution**: Bash (tests, git, build)
 - **Weaviate MCP**: Semantic search (KG, docs, conversations, code graph)
-- **Ollama MCP**: Local LLM inference (FREE)
+- **Ollama MCP** *(opt-in module since v0.2.11)*: Local LLM inference — install via launcher Modules → `vct-ollama`. Default install relies on Claude's native reasoning.
 
 ## Tool Usage Strategy
 
@@ -353,15 +355,14 @@ You succeed when:
 1. `hybrid_search("concept")` → Find patterns, architecture decisions, past solutions (Weaviate MCP)
 2. `search_code_graph("purpose", collection="CodeFunction")` → Find similar code implementations (Weaviate MCP)
 3. `query_code_structure("dependencies", "target_module")` → Understand architecture (Weaviate MCP)
-4. `chat("Analyze this approach: [description]", model="gemma4:e4b")` → Quick validation (Ollama MCP, FREE)
+4. Reason about the approach in-context (Claude's native capabilities; or if vct-ollama is installed, `chat("Analyze: ...", model="gemma4:e4b")` for local-only)
 5. Grep → Find exact strings/names in current codebase (built-in)
 6. Read → Understand specific files in detail (built-in)
 
 **During implementation**:
 1. Edit → Targeted changes to existing files (built-in)
 2. Write → New files or major refactorings (built-in)
-3. `chat("Suggest variable names for [context]", model="gemma4:e4b")` → Quick naming help (Ollama MCP, FREE)
-4. Bash → Run tests after changes (built-in)
+3. Bash → Run tests after changes (built-in)
 
 **After implementation**:
 1. Bash → Run full test suite (built-in)
@@ -375,15 +376,13 @@ You succeed when:
 - Conceptual search → `hybrid_search`
 - Code by purpose → `search_code_graph`
 - Architecture/dependencies → `query_code_structure`
-- Simple analysis/rewrites → `chat` (Ollama, FREE)
-- Quick analysis → `chat` (Ollama, FREE)
+- Simple analysis/rewrites → Claude's native reasoning (opt-in: `chat` via vct-ollama)
 - File reading → Read
 - File editing → Edit (small) or Write (large)
 - Commands → Bash
 
 **Anti-Pattern** (DON'T DO THIS):
 - ❌ Skip knowledge graph search and reinvent patterns
-- ❌ Use Claude API for simple tasks that Ollama can do FREE
 - ❌ Grep for concepts (use semantic search instead)
 - ❌ Read files without checking if info already in context
 ```
@@ -672,25 +671,20 @@ You succeed when your prompts:
 **Example**: `search_code_graph("error handling patterns", collection="CodeFunction")`
 **Why use**: Find real-world code examples to include in prompts
 
-**chat** (local LLM inference, ~1-3s) - Ollama MCP:
-**Usage**: Quick analysis, simple rewording, token counting (FREE, local)
-**Inputs**: prompt, model (gemma4:e4b for fast summarization on low-power), system_prompt (optional)
-**Returns**: Model response with metrics (tokens/sec, duration)
-**Example**: `chat("Rewrite this prompt to be clearer: [prompt]", model="gemma4:e4b")`
-**Why use**: FREE local processing for simple tasks (no API costs)
-
-**read_document** (file analysis, free) - Ollama MCP:
-**Usage**: Summarize or extract specific info from files (auto-chunks large files)
-**Inputs**: file_path, task (e.g., "extract all prompting patterns"), model (optional)
-**Returns**: Extracted content or summary
-**Example**: `read_document("/path/to/spec.md", task="find all agent instructions")`
-**Why use**: FREE extraction from large files without loading into context
+**chat / read_document** (local LLM inference + file extraction) — **OPT-IN**:
+The Ollama MCP wrapper (which provided `chat`, `read_document`, `read_image`)
+was removed from the default install in v0.2.11 because Claude's native
+reasoning is higher-quality for analysis/rewrite tasks. If you specifically
+want local-only inference (cost reasons, air-gapped use cases), install
+the `vct-ollama` module via launcher Modules — the same tools become
+available. The default-install replacement: use Claude's reasoning directly,
+and `Read` with `offset`/`limit` for large-file extraction.
 
 **KG-First Search Policy**:
 1. Conceptual query → `hybrid_search`
 2. Relational query → `semantic_graph_search`
 3. Code examples → `search_code_graph`
-4. Quick analysis → `chat` (Ollama, FREE)
+4. Quick analysis → Claude's native reasoning (opt-in: `chat` via vct-ollama)
 5. Known exact term → `kg-search`
 
 ## Success Criteria

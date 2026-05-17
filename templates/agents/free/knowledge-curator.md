@@ -47,7 +47,9 @@ You are a specialized agent that maintains knowledge graph quality by extracting
    - Don't auto-merge (requires human review)
 
 4. **Infer missing relationships**:
-   - Use Ollama (granite4:7b-a1b-h) for simple inference
+   - Use Claude's reasoning directly (Ollama MCP was removed in v0.2.11 as
+     redundant). If you've opted into the `vct-ollama` module, you can
+     route to local inference for cost reasons; otherwise, reason in-context.
    - Example: "Node A uses Redis for caching" → Create `[[uses::Redis]]` link
    - Only suggest, don't auto-add (preserve manual control)
 
@@ -80,7 +82,9 @@ You will receive:
   - Create cross-references via `data.reference_add()`
   - Use GraphQL for relationship traversal
 
-- **Ollama**: Free LLM for relationship inference
+- **Ollama (opt-in)**: Free LLM for relationship inference. The Ollama
+  MCP wrapper was removed in v0.2.11 as redundant; available via opt-in
+  `vct-ollama` module if you want local inference instead of Claude.
   - Model: granite4:7b-a1b-h (fast, good for extraction)
   - Use for: Extracting implicit relationships from text
 

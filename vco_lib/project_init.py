@@ -2090,8 +2090,26 @@ def _agent_subs(
     }
 
 
+def _hook_globs_for_os() -> tuple[str, ...]:
+    """Return ALL hook flavours to ship — both `.sh` and `.ps1` flavours,
+    on every OS.
+
+    History (v0.2.14 fix, audit Concern #2 2026-05-17): we used to ship only
+    the host-OS flavour (`.sh` on Linux/macOS; `.ps1` on Windows). That
+    broke cross-OS workflows where the same project folder is opened from
+    both POSIX and Windows shells (dual-boot, WSL crossover, network-
+    mounted projects): orphan stale hooks of the OTHER flavour lingered
+    and could be invoked by the unexpected shell. They're text files
+    (~few KB each); the runtime picks which extension matches its shell,
+    so shipping both is cheap + correct.
+    """
+    return ("*.sh", "*.ps1")
+
+
 def _hook_glob_for_os() -> str:
-    """`*.sh` on Linux/macOS, `*.ps1` on Windows. Mirrors install.py:5641."""
+    """Legacy single-glob accessor kept for backward-compat in other
+    callsites. Prefer `_hook_globs_for_os()`. Mirrors install.py:5641.
+    """
     import platform
     return "*.ps1" if platform.system() == "Windows" else "*.sh"
 
@@ -2237,33 +2255,37 @@ def _enumerate_bundle_files(
     """
     ops: list[_BundleFileOp] = []
     templates = orchestrator_root / "templates"
-    hook_glob = _hook_glob_for_os()
+    hook_globs = _hook_globs_for_os()
 
-    # Hooks (top-level only — _lib handled below).
+    # Hooks (top-level only — _lib handled below). Ship BOTH .sh + .ps1
+    # flavours so the same .claude/ tree works regardless of which shell
+    # the user invokes hooks from (v0.2.14 Concern #2 fix).
     hooks_src = templates / "hooks"
     if hooks_src.exists():
-        for hook_file in sorted(hooks_src.glob(hook_glob)):
-            if hook_file.parent.name == "_lib":
-                continue
-            ops.append(_BundleFileOp(
-                dest_rel=str(Path(".claude") / "hooks" / hook_file.name),
-                source_abs=hook_file,
-                source_rel=str(hook_file.relative_to(orchestrator_root)),
-                transform=None,
-                always_overwrite=False,
-            ))
+        for glob in hook_globs:
+            for hook_file in sorted(hooks_src.glob(glob)):
+                if hook_file.parent.name == "_lib":
+                    continue
+                ops.append(_BundleFileOp(
+                    dest_rel=str(Path(".claude") / "hooks" / hook_file.name),
+                    source_abs=hook_file,
+                    source_rel=str(hook_file.relative_to(orchestrator_root)),
+                    transform=None,
+                    always_overwrite=False,
+                ))
 
-    # Hooks _lib (always overwrite — not user-customisable).
+    # Hooks _lib (always overwrite — not user-customisable). Both flavours.
     lib_src = hooks_src / "_lib"
     if lib_src.exists():
-        for lib_file in sorted(lib_src.glob(hook_glob)):
-            ops.append(_BundleFileOp(
-                dest_rel=str(Path(".claude") / "hooks" / "_lib" / lib_file.name),
-                source_abs=lib_file,
-                source_rel=str(lib_file.relative_to(orchestrator_root)),
-                transform=None,
-                always_overwrite=True,
-            ))
+        for glob in hook_globs:
+            for lib_file in sorted(lib_src.glob(glob)):
+                ops.append(_BundleFileOp(
+                    dest_rel=str(Path(".claude") / "hooks" / "_lib" / lib_file.name),
+                    source_abs=lib_file,
+                    source_rel=str(lib_file.relative_to(orchestrator_root)),
+                    transform=None,
+                    always_overwrite=True,
+                ))
 
     # Scripts: copy ALL recognized flavours (mirrors install.py:5729).
     scripts_src = templates / "scripts"

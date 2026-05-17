@@ -1219,10 +1219,12 @@ mod tests {
     // race where parallel keychain writes to the same slot would
     // overwrite each other's canaries.
 
-    /// Acquire the process-wide keychain mutex. See
-    /// `crate::secrets::test_serialize::keychain_serialize_lock` for
-    /// the rationale.
-    fn h1_lock() -> std::sync::MutexGuard<'static, ()> {
+    /// Acquire the process-wide keychain mutex + cross-process file
+    /// lock. See `crate::secrets::test_serialize::keychain_serialize_lock`
+    /// for the rationale. Return type opaque since v0.2.14 (2026-05-17)
+    /// — was `MutexGuard<'static, ()>`, now also includes a flock guard
+    /// to serialise across concurrent `cargo test` processes.
+    fn h1_lock() -> crate::secrets::test_serialize::KeychainGuard {
         crate::secrets::test_serialize::keychain_serialize_lock()
     }
 

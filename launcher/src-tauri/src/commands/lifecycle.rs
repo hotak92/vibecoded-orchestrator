@@ -282,8 +282,16 @@ async fn run_stack_wrapper(subcommand: &str) -> Result<(), String> {
         "launch-claude-mcp-stack wrapper not found at <install>/scripts/".to_string()
     })?;
     let mut cmd = if cfg!(target_os = "windows") {
+        // v0.2.14 Bug #2: the PowerShell wrapper now ships as
+        // scripts/launch-claude-mcp-stack.ps1. We pass -NoProfile (skip
+        // user's PowerShell profile — faster, no side effects) and
+        // -ExecutionPolicy Bypass (allow unsigned script execution
+        // per-invocation; does not modify the user's persistent
+        // policy). These flags match the Scheduled Task XML template
+        // at templates/windows/claude-mcp-containers.task.xml.template.
         let mut c = tokio::process::Command::new("powershell");
         c.args([
+            "-NoProfile",
             "-ExecutionPolicy",
             "Bypass",
             "-File",

@@ -598,7 +598,12 @@ mod tests {
     struct EnvGuard {
         prev_state: Option<std::ffi::OsString>,
         prev_home: Option<std::ffi::OsString>,
-        _lock: std::sync::MutexGuard<'static, ()>,
+        // v0.2.14 (2026-05-17): `_lock` is now a `KeychainGuard` (was
+        // `MutexGuard<'static, ()>`) — the new guard bundles the
+        // in-process mutex with a cross-process file lock so concurrent
+        // `cargo test --lib` invocations from different terminals
+        // serialise on the OS-shared keychain slot.
+        _lock: crate::secrets::test_serialize::KeychainGuard,
     }
 
     impl Drop for EnvGuard {

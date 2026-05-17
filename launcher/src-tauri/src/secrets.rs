@@ -417,12 +417,50 @@ pub fn mask_preview(value: &str) -> String {
 // API call each), and adding a runtime mutex would needlessly serialise
 // independent secret reads in production. The race is purely a
 // test-isolation problem.
+//
+// v0.2.14 (2026-05-17): cross-process file-lock layer added on top of
+// the in-process mutex. Reproducer: running `cargo test --lib` three
+// times in parallel (e.g. from three terminals during release validation,
+// or from a developer's worktree-per-agent workflow) spawns three
+// separate test binaries. Each binary has its own copy of
+// KEYCHAIN_SERIALIZE — so the in-process mutex serialises within one
+// binary but does nothing across binaries. The OS keychain itself is
+// shared per-OS-user (libsecret on Linux, Keychain on macOS, Credential
+// Manager on Windows), so the three binaries trample each other's
+// canaries on the `vct._user_shared_.shared.user/github_pat` slot.
+//
+// The fix layers an `flock(LOCK_EX)` on `/tmp/vct-keychain-test.lock`
+// (Unix) / `%TEMP%\vct-keychain-test.lock` (Windows) on top of the
+// in-process mutex. Two binaries running concurrently now serialise at
+// the kernel level: only the holder of the file lock can run keychain
+// tests; the others block on `flock` until released.
+//
+// Failure handling: if `flock` itself fails (extremely rare — would
+// require `/tmp` to be unwritable), we degrade to in-process-only
+// serialisation and log a one-line warning to stderr. Tests still run;
+// they just MAY flake under cross-process parallelism on that broken
+// host. We chose this over a hard panic so a misconfigured developer
+// laptop doesn't break every test in the binary.
 
 #[cfg(test)]
 pub(crate) mod test_serialize {
     use std::sync::{Mutex, MutexGuard};
 
     static KEYCHAIN_SERIALIZE: Mutex<()> = Mutex::new(());
+
+    /// Combined guard holding BOTH the in-process mutex (drops first)
+    /// and the cross-process file lock (drops second when its Drop
+    /// runs after the field-ordering rule).
+    ///
+    /// Drop order in Rust is field-declaration order — `_proc_lock`
+    /// drops first (releases the in-process mutex), then `_file_lock`
+    /// (releases the kernel-level file lock). This is the correct
+    /// order: we want other in-process readers to proceed BEFORE we
+    /// hand the cross-process baton to a sibling test binary.
+    pub struct KeychainGuard {
+        _proc_lock: MutexGuard<'static, ()>,
+        _file_lock: Option<file_lock::FileLock>,
+    }
 
     /// Acquire the process-wide keychain-test mutex. Recovers from
     /// poisoning (a prior test panic mid-keychain-write leaves the
@@ -434,8 +472,202 @@ pub(crate) mod test_serialize {
     /// is `vct._user_shared_.shared.user/github_pat`, post-2026-05-10
     /// module_id unification — pre-fix this was the `installer/` slot).
     /// Release happens automatically on drop.
-    pub fn keychain_serialize_lock() -> MutexGuard<'static, ()> {
-        KEYCHAIN_SERIALIZE.lock().unwrap_or_else(|p| p.into_inner())
+    ///
+    /// Returns a [`KeychainGuard`] (not a raw `MutexGuard`) since
+    /// v0.2.14 (2026-05-17) — the guard also holds a cross-process
+    /// file lock so concurrent `cargo test` invocations from different
+    /// terminals don't race on the OS-shared keychain slot.
+    ///
+    /// The return type is opaque (`KeychainGuard` only exposes Drop),
+    /// so callers that previously held a `MutexGuard<'static, ()>`
+    /// continue to work as long as they only relied on the Drop
+    /// behaviour. The struct deliberately does NOT impl `Deref<Target=()>`
+    /// because the value `()` is uninteresting; if a caller needs to
+    /// pattern-match on the guard type, the field is also called `_lock`
+    /// in the test modules' EnvGuard structs which take this by value.
+    pub fn keychain_serialize_lock() -> KeychainGuard {
+        // Acquire the cross-process file lock FIRST. If we acquired
+        // the in-process mutex first and then blocked on flock(), we'd
+        // hold the in-process mutex across the blocking-syscall wait,
+        // pinning every other sibling-test thread in the same binary
+        // for no reason. flock-first inverts that: only the thread
+        // that's about to run gets the in-process mutex.
+        let file_lock = file_lock::acquire();
+        let proc_lock = KEYCHAIN_SERIALIZE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        KeychainGuard {
+            _proc_lock: proc_lock,
+            _file_lock: file_lock,
+        }
+    }
+
+    // ── Cross-process file lock (v0.2.14, 2026-05-17) ──────────────────
+    //
+    // Minimal flock-on-/tmp implementation. Why not pull in `fs2` or
+    // `file-lock` from crates.io: both are single-purpose ~200-line
+    // crates that wrap `flock(2)`/`LockFileEx`, and our launcher already
+    // has `libc` as a Unix dep. The 40-line direct-libc wrapper here
+    // costs less than an added crate and stays test-only.
+    pub(super) mod file_lock {
+        /// RAII guard for an exclusive cross-process lock on a well-known
+        /// path. Dropping the guard releases the lock.
+        pub struct FileLock {
+            #[cfg(unix)]
+            _file: std::fs::File,
+            #[cfg(unix)]
+            fd: std::os::unix::io::RawFd,
+            #[cfg(windows)]
+            _file: std::fs::File,
+        }
+
+        #[cfg(unix)]
+        impl Drop for FileLock {
+            fn drop(&mut self) {
+                // LOCK_UN explicitly releases; the kernel also releases
+                // on fd close, but explicit unlock makes the release
+                // happen before the file handle's drop reordering.
+                unsafe {
+                    libc::flock(self.fd, libc::LOCK_UN);
+                }
+            }
+        }
+
+        /// Acquire the cross-process lock. Returns None on platforms
+        /// or hosts where flock fails — tests then fall back to
+        /// in-process-only serialisation with a logged warning.
+        #[cfg(unix)]
+        pub fn acquire() -> Option<FileLock> {
+            use std::os::unix::io::AsRawFd;
+            use std::path::PathBuf;
+
+            let lock_path: PathBuf = std::env::temp_dir().join("vct-keychain-test.lock");
+            // OpenOptions::create(true).write(true) lets every test
+            // binary on this host share the same lockfile regardless
+            // of who created it first. World-writable mode would be
+            // a security concern on multi-user hosts, but `/tmp` is
+            // already sticky+world-writable; we don't relax that.
+            let file = match std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&lock_path)
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!(
+                        "[vct-tests] WARN: cannot open keychain lockfile {:?}: {} \
+                         (falling back to in-process-only serialisation; \
+                         cross-process tests may flake)",
+                        lock_path, e,
+                    );
+                    return None;
+                }
+            };
+            let fd = file.as_raw_fd();
+            // LOCK_EX = exclusive lock; blocks until acquired. Cargo
+            // tests have no inherent wall-clock budget per test, so
+            // blocking is acceptable — the alternative (LOCK_NB +
+            // busy-poll) would just burn CPU.
+            let rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                eprintln!(
+                    "[vct-tests] WARN: flock(LOCK_EX) failed on {:?}: {} \
+                     (falling back to in-process-only serialisation; \
+                     cross-process tests may flake)",
+                    lock_path, err,
+                );
+                return None;
+            }
+            Some(FileLock { _file: file, fd })
+        }
+
+        #[cfg(windows)]
+        impl Drop for FileLock {
+            fn drop(&mut self) {
+                // Closing the file handle releases the Windows lock.
+                // Explicit no-op here; relying on `_file`'s Drop.
+            }
+        }
+
+        /// Windows variant — uses `LockFileEx`. NOTE: keychain tests
+        /// are primarily run on Linux CI; on Windows the launcher
+        /// uses Credential Manager which has different concurrency
+        /// semantics. We still implement cross-process locking on
+        /// Windows for parity, since developers running `cargo test`
+        /// on Windows from multiple terminals would hit the same
+        /// class of race.
+        #[cfg(windows)]
+        pub fn acquire() -> Option<FileLock> {
+            use std::os::windows::io::AsRawHandle;
+            use std::path::PathBuf;
+
+            let lock_path: PathBuf = std::env::temp_dir().join("vct-keychain-test.lock");
+            let file = match std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&lock_path)
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!(
+                        "[vct-tests] WARN: cannot open keychain lockfile {:?}: {} \
+                         (falling back to in-process-only serialisation)",
+                        lock_path, e,
+                    );
+                    return None;
+                }
+            };
+            let handle = file.as_raw_handle();
+            // LockFileEx LOCKFILE_EXCLUSIVE_LOCK = 0x2.
+            // Locking range: 0 to u32::MAX bytes (covers entire file).
+            #[repr(C)]
+            #[derive(Default)]
+            struct Overlapped {
+                internal: usize,
+                internal_high: usize,
+                offset: u32,
+                offset_high: u32,
+                event: *mut std::ffi::c_void,
+            }
+            extern "system" {
+                fn LockFileEx(
+                    h: *mut std::ffi::c_void,
+                    flags: u32,
+                    reserved: u32,
+                    n_bytes_low: u32,
+                    n_bytes_high: u32,
+                    overlapped: *mut Overlapped,
+                ) -> i32;
+            }
+            const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x2;
+            let mut ov = Overlapped {
+                event: std::ptr::null_mut(),
+                ..Default::default()
+            };
+            let ok = unsafe {
+                LockFileEx(
+                    handle as *mut _,
+                    LOCKFILE_EXCLUSIVE_LOCK,
+                    0,
+                    u32::MAX,
+                    0,
+                    &mut ov,
+                )
+            };
+            if ok == 0 {
+                let err = std::io::Error::last_os_error();
+                eprintln!(
+                    "[vct-tests] WARN: LockFileEx failed on {:?}: {} \
+                     (falling back to in-process-only serialisation)",
+                    lock_path, err,
+                );
+                return None;
+            }
+            Some(FileLock { _file: file })
+        }
     }
 }
 

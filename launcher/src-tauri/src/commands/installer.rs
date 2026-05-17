@@ -7203,7 +7203,16 @@ MemAvailable:   23456789 kB
 
         struct EnvGuard {
             prev_secrets_dir: Option<std::ffi::OsString>,
-            _lock: std::sync::MutexGuard<'static, ()>,
+            // v0.2.14 (2026-05-17): `_lock` upgraded from
+            // `MutexGuard<'static, ()>` to `KeychainGuard` — the new
+            // guard bundles the in-process mutex with a cross-process
+            // `flock` on `/tmp/vct-keychain-test.lock`. Concurrent
+            // `cargo test --lib` invocations from different terminals
+            // would otherwise race on the OS-shared keychain slot
+            // (`vct._user_shared_.shared.user/github_pat`) — each
+            // binary holds its own copy of the in-process mutex, so
+            // pre-v0.2.14 nothing serialised between binaries.
+            _lock: crate::secrets::test_serialize::KeychainGuard,
         }
 
         impl Drop for EnvGuard {

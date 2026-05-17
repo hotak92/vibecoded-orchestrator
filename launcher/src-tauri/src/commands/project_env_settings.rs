@@ -357,7 +357,26 @@ fn parse_port_from_url(url: &str) -> Option<u16> {
 /// Synchronous because populate runs from non-async callers
 /// (`write_project_env_files`); a runtime probe via `which` is sufficient
 /// — a full-fledged version check happens later via `detect_system`.
+///
+/// Honors `VCT_CONTAINER_RUNTIME=podman|docker|auto` env var as the
+/// user's explicit preference (v0.2.14 Bug #3 fix). If set to a
+/// recognized value AND that runtime is on PATH, returns it directly;
+/// else falls through to auto-detect (podman first, docker second).
+/// This matches the contract honored by `services/runtime.rs::resolve_runtime`,
+/// `install.py::_runtime_preference_from_env`, the hook scripts, and
+/// the boot wrapper.
 fn detect_runtime_sync() -> Option<String> {
+    if let Ok(raw) = std::env::var("VCT_CONTAINER_RUNTIME") {
+        let pref = raw.trim().to_ascii_lowercase();
+        if pref == "podman" || pref == "docker" {
+            if which_cmd(&pref).is_some() {
+                return Some(pref);
+            }
+            // Preference set but not installed — fall through to auto-detect.
+            // (Lenient: don't strand the user on a misconfigured env var.)
+        }
+        // "auto" / "" / unknown → fall through.
+    }
     if which_cmd("podman").is_some() {
         return Some("podman".to_string());
     }

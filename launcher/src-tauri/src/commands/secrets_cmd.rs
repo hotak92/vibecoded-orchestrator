@@ -1088,7 +1088,7 @@ mod tests {
     /// "unused variable" warning — the value's lifetime IS the lock
     /// scope. Hold it until end of test by binding to a `_`-prefixed
     /// local; do NOT bind to `_` alone or RAII drops the lock immediately.
-    fn keychain_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    fn keychain_test_lock() -> crate::secrets::test_serialize::KeychainGuard {
         crate::secrets::test_serialize::keychain_serialize_lock()
     }
 

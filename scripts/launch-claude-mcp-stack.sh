@@ -197,7 +197,14 @@ _runtime_usable() {
 # ---------------------------------------------------------------------------
 # detect_runtime :: prints one of "docker", "podman-compose", "podman compose", or ""
 #
-# Order (PR-12 Bug A — every candidate validated via _runtime_usable):
+# Order (PR-12 Bug A + v0.2.14 Bug #3 — every candidate validated via
+# _runtime_usable):
+#   0. VCT_CONTAINER_RUNTIME env var — if set to "podman" or "docker" and
+#      that runtime is usable, return it. "auto" / unset / unknown → fall
+#      through to step 1. Honoring this env var here matches the contract
+#      shipped in PR-43 (launcher Rust) + the install.py + the hook scripts;
+#      previously detect_runtime ignored it, causing split-brain between
+#      the env-honoring surfaces and the boot-wrapper.
 #   1. resolve_runtime_file → token from runtime.txt → expand to compose
 #      invocation IFF the runtime is usable. Otherwise log + fall through.
 #   2. Probe podman first (preferred default — it's the VCO-recommended
@@ -211,6 +218,40 @@ _runtime_usable() {
 # but the user is not in the `docker` group.
 # ---------------------------------------------------------------------------
 detect_runtime() {
+    # 0. VCT_CONTAINER_RUNTIME explicit preference (v0.2.14 Bug #3 fix).
+    local pref
+    pref="$(printf '%s' "${VCT_CONTAINER_RUNTIME:-}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+    case "$pref" in
+        podman)
+            if _runtime_usable podman; then
+                if command -v podman-compose >/dev/null 2>&1; then
+                    printf 'podman-compose\n'
+                    return 0
+                fi
+                if podman compose --help >/dev/null 2>&1; then
+                    printf 'podman compose\n'
+                    return 0
+                fi
+                log "VCT_CONTAINER_RUNTIME=podman but no compose front-end available — falling through to runtime.txt / auto-detect"
+            else
+                log "VCT_CONTAINER_RUNTIME=podman but podman not usable — falling through to runtime.txt / auto-detect"
+            fi
+            ;;
+        docker)
+            if _runtime_usable docker; then
+                printf 'docker\n'
+                return 0
+            fi
+            log "VCT_CONTAINER_RUNTIME=docker but docker not usable — falling through to runtime.txt / auto-detect"
+            ;;
+        ''|auto)
+            : # no preference; auto-detect path below
+            ;;
+        *)
+            log "VCT_CONTAINER_RUNTIME=${pref} unrecognized (expected 'podman'/'docker'/'auto') — ignoring"
+            ;;
+    esac
+
     # 1. runtime.txt — only honored if its named runtime is actually usable.
     local runtime_file
     runtime_file="$(resolve_runtime_file)"

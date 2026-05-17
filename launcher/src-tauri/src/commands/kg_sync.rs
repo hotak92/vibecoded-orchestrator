@@ -1556,6 +1556,64 @@ mod tests {
     // platforms (Tokio normalizes `AsyncBufReadExt` across them and
     // `tokio::process::Child::start_kill` works on both — see Tokio
     // docs on `Child::start_kill`).
+    //
+    // v0.2.14 (2026-05-17): fork+exec ENOENT hardening. Under high
+    // parallel test load (e.g. 3 concurrent `cargo test --lib`
+    // processes × ~12 internal threads each ≈ 36 simultaneous
+    // `fork()`+`execvp()` calls), the kernel/glibc PATH lookup can
+    // transiently surface `Os { code: 2, kind: NotFound }` even for
+    // a binary that exists. Two mitigations:
+    //   1. Use an absolute path (`/bin/sh`) so `posix_spawn` skips the
+    //      `$PATH` traversal entirely — eliminates the most common
+    //      race source.
+    //   2. Retry once with a short sleep if spawn STILL ENOENTs. A
+    //      single retry is sufficient empirically; if it still fails
+    //      the host is so under-resourced that the test would have
+    //      panicked elsewhere anyway.
+    //
+    // See `services::runtime::tests::daemon_usable_probe_*` for the
+    // sibling pattern (those tests use tempdir-relative scripts that
+    // can't migrate to absolute paths, so they're `#[ignore]`d and
+    // gated behind `--ignored`; we have no such constraint here).
+
+    #[cfg(unix)]
+    async fn spawn_sh_with_retry(
+        script: &str,
+    ) -> tokio::process::Child {
+        // POSIX guarantees `/bin/sh` exists on every Unix host. Using
+        // an absolute path bypasses `$PATH` traversal in `execvp`,
+        // which is the most common source of the ENOENT flake under
+        // heavy parallel fork load.
+        const SH_PATH: &str = "/bin/sh";
+        let mut last_err: Option<std::io::Error> = None;
+        for attempt in 0..3 {
+            match tokio::process::Command::new(SH_PATH)
+                .arg("-c")
+                .arg(script)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+            {
+                Ok(child) => return child,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Transient ENOENT under fork-storm. Brief sleep
+                    // gives the kernel a chance to drain any in-flight
+                    // exec-related state, then retry.
+                    last_err = Some(e);
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        50 * (attempt + 1) as u64,
+                    ))
+                    .await;
+                }
+                Err(e) => panic!("spawn {}: {}", SH_PATH, e),
+            }
+        }
+        panic!(
+            "spawn {} repeatedly failed with ENOENT under parallel test \
+             load (last error: {:?}); host is likely heavily oversubscribed",
+            SH_PATH, last_err,
+        );
+    }
 
     #[cfg(unix)]
     #[tokio::test]
@@ -1588,13 +1646,7 @@ mod tests {
             echo "STDOUT-LINE-3"
         "#;
 
-        let mut child = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(script)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .expect("spawn sh");
+        let mut child = spawn_sh_with_retry(script).await;
 
         let stdout = child.stdout.take().expect("stdout pipe");
         let stderr = child.stderr.take().expect("stderr pipe");
@@ -1656,13 +1708,7 @@ mod tests {
         // `sleep 30` emits nothing on either pipe; the watchdog must
         // detect the stall and kill it. We use a 1-second watchdog to
         // keep the test fast.
-        let mut child = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg("sleep 30")
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .expect("spawn sh");
+        let mut child = spawn_sh_with_retry("sleep 30").await;
 
         let stdout = child.stdout.take().expect("stdout pipe");
         let stderr = child.stderr.take().expect("stderr pipe");
