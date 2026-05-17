@@ -67,7 +67,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import NamedTuple, Optional
+from typing import Any, NamedTuple, Optional
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -2791,6 +2791,7 @@ def main() -> int:
                 PROJECT_ROOT,
                 no_swap=bool(getattr(args, "no_binary_swap", False)),
                 install_start_ts=globals().get("_INSTALL_START_TS"),
+                deferral_report=_deferral_report,
             )
         except Exception as exc:  # noqa: BLE001 — soft-fail by design
             _log_install_event(
@@ -8502,11 +8503,171 @@ def _read_tauri_conf_version(install_root: Path) -> Optional[str]:
     return None
 
 
+def _query_launcher_version(binary_path: Path) -> Optional[str]:
+    """Run ``<binary_path> --version`` and parse the version string.
+
+    Returns the first whitespace-separated token that looks like a semver
+    (``\\d+\\.\\d+(\\.\\d+)?``), or None on any failure (binary doesn't
+    exist, exit non-zero, timed out, output unparseable). 5-second timeout
+    hard-caps the wait so a hung binary can't block the install.
+
+    Used by :func:`_refresh_dist_binary_after_rebuild` to populate the
+    ``launcher_restart_required`` deferral message — falls back to
+    :func:`_read_install_version` when the new binary can't self-report
+    (e.g. binary swap landed but the file isn't executable on this OS yet).
+    """
+    if not binary_path.is_file():
+        return None
+    try:
+        proc = subprocess.run(
+            [str(binary_path), "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        _log_install_event(
+            "query_launcher_version", "warn",
+            f"could not invoke {binary_path} --version: {exc}",
+        )
+        return None
+    if proc.returncode != 0:
+        return None
+    output = (proc.stdout or proc.stderr or "").strip()
+    # Find the first semver-looking token.
+    for token in output.split():
+        if re.match(r"^v?\d+\.\d+", token):
+            return token.lstrip("v").rstrip(",.;")
+    return None
+
+
+def _is_windows_sharing_violation(exc: OSError) -> bool:
+    """Detect ``ERROR_SHARING_VIOLATION`` (Windows code 32).
+
+    On Windows, attempting to overwrite a running .exe yields a WinError
+    with code 32 (ERROR_SHARING_VIOLATION). Cross-OS guard: this returns
+    False on every non-Windows host even if the OSError's ``winerror``
+    attribute is set (it shouldn't be).
+    """
+    if not platform.system().lower().startswith("win"):
+        return False
+    return getattr(exc, "winerror", None) == 32
+
+
+def _emit_launcher_restart_deferral(
+    deferral_report: Any,
+    *,
+    install_root: Path,
+    new_binary_path: Path,
+    new_version: Optional[str],
+    old_pid: Optional[int],
+) -> None:
+    """Add a ``launcher_restart_required`` entry to the run's deferral report.
+
+    Emitted after a successful binary swap so the launcher GUI knows to
+    surface a "Restart now" banner. Self-clears: when the user clicks
+    "Restart now", the new launcher writes ``.claude/context/launcher-restart-marker``
+    on startup which the next install.py run treats as "deferral was
+    consumed; drop it" — see :func:`_apply_deferred_entries`.
+
+    Safe to call with ``deferral_report=None`` (no-op) so callers without a
+    report in scope don't need to wire one through just for the side effect.
+    """
+    if deferral_report is None:
+        return
+
+    version_label = new_version or _read_install_version(install_root) or "(version unknown)"
+    pid_suffix = f" (running launcher PID: {old_pid})" if old_pid else ""
+
+    try:
+        entry = DeferralEntry(
+            condition_id="launcher_restart_required",
+            title=f"Launcher binary updated to {version_label}",
+            detected=(
+                f"A freshly-built launcher binary was swapped into "
+                f"`{new_binary_path}`{pid_suffix}. The currently-running "
+                f"launcher process is still executing the old code in memory."
+            ),
+            why_deferred=(
+                "install.py cannot safely restart a GUI process it didn't "
+                "spawn. The launcher reads this entry on startup and renders "
+                "a green sticky banner with a `Restart now` button that "
+                "detach-spawns the new binary and exits the current process."
+            ),
+            command_to_apply=(
+                "# Manually: fully quit the launcher (tray → Quit), then\n"
+                f"# relaunch via your usual entrypoint (the new binary at\n"
+                f"# {new_binary_path} will execute on next start)."
+            ),
+            severity="info",
+            kg_node_refs=[],
+        )
+        deferral_report.add_entry(entry)
+    except Exception as exc:  # noqa: BLE001 — soft-fail by design
+        _log_install_event(
+            "refresh_dist_binary", "warn",
+            f"could not emit launcher_restart_required deferral: {exc}",
+        )
+
+
+def _emit_binary_swap_locked_deferral(
+    deferral_report: Any,
+    *,
+    new_binary_path: Path,
+    error_detail: str,
+) -> None:
+    """Add a ``launcher_binary_swap_failed_locked`` entry (Windows path).
+
+    Fired when both the direct overwrite AND the rename-fallback fail
+    because the running launcher .exe is held open by Windows
+    (ERROR_SHARING_VIOLATION). The launcher GUI renders a RED sticky
+    banner with explicit recovery steps. Severity is ``warning`` not
+    ``critical`` because the install otherwise completed (only the
+    binary-refresh step failed); MCP registration and bundle propagation
+    still landed.
+    """
+    if deferral_report is None:
+        return
+    try:
+        entry = DeferralEntry(
+            condition_id="launcher_binary_swap_failed_locked",
+            title="Launcher binary update blocked (file locked)",
+            detected=(
+                f"Windows refused to overwrite the launcher binary at "
+                f"`{new_binary_path}` because it is held open by the "
+                f"running launcher process (ERROR_SHARING_VIOLATION). "
+                f"Detail: {error_detail}"
+            ),
+            why_deferred=(
+                "Windows holds an exclusive lock on running .exe files. "
+                "Neither direct overwrite nor rename-then-write succeeded. "
+                "Manual intervention required: fully quit the launcher "
+                "first."
+            ),
+            command_to_apply=(
+                "# 1. Fully quit the launcher (tray → Quit, NOT just close window)\n"
+                "# 2. From a terminal, re-run the orchestrator update:\n"
+                "python install.py --update\n"
+                "# 3. Relaunch the launcher via its usual entrypoint."
+            ),
+            severity="warning",
+            kg_node_refs=[],
+        )
+        deferral_report.add_entry(entry)
+    except Exception as exc:  # noqa: BLE001 — soft-fail by design
+        _log_install_event(
+            "refresh_dist_binary", "warn",
+            f"could not emit launcher_binary_swap_failed_locked deferral: {exc}",
+        )
+
+
 def _refresh_dist_binary_after_rebuild(
     install_root: Path,
     *,
     no_swap: bool = False,
     install_start_ts: Optional[float] = None,
+    deferral_report: Any = None,
 ) -> Optional[Path]:
     """Fix 1 (v0.2.13): copy a freshly-built ``target/release/vct-launcher-temp``
     into ``launcher/dist/<os>-<arch>/vct-launcher`` when it's genuinely newer.
@@ -8531,12 +8692,25 @@ def _refresh_dist_binary_after_rebuild(
          dist artifact is stale w.r.t. the current source).
       4. ``no_swap`` is False.
 
+    v0.2.15 (Agent D): on successful swap, emit a ``launcher_restart_required``
+    deferral so the launcher GUI surfaces a "Restart now" banner. On Windows,
+    if direct overwrite fails with ERROR_SHARING_VIOLATION (the launcher
+    binary is held open), try rename-then-write before giving up; on total
+    failure emit ``launcher_binary_swap_failed_locked``. The launcher's
+    "old PID" is read from the ``VCT_LAUNCHER_PID`` env var when present
+    (set by the Tauri ``update_orchestrator`` command before spawning
+    install.py).
+
     Args:
         install_root: Repository root.
         no_swap: When True, this helper is a no-op (mirrors ``--no-binary-swap``).
         install_start_ts: Optional unix timestamp marking the start of this
             install run. When provided, source files older than this are
             considered "stale from a prior run" and ignored (extra safety).
+        deferral_report: Optional DeferralReport. When provided, success/
+            failure paths emit the appropriate entries documented above.
+            None is supported so external callers (tests, CLI scripts) don't
+            need to thread one through.
 
     Returns:
         The dist path that was refreshed, or None when nothing was done.
@@ -8616,6 +8790,8 @@ def _refresh_dist_binary_after_rebuild(
         return None
 
     # Gate 1+4 already enforced above. Perform the swap.
+    swap_succeeded = False
+    swap_renamed_old_to: Optional[Path] = None
     try:
         dist_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dist_path)
@@ -8625,18 +8801,97 @@ def _refresh_dist_binary_after_rebuild(
             except OSError:
                 # Best-effort: fall through; the copy itself succeeded.
                 pass
+        swap_succeeded = True
     except OSError as exc:
-        _log_install_event(
-            "refresh_dist_binary", "warn",
-            f"copy {src} → {dist_path} failed: {exc}",
-        )
+        # Windows-specific fallback: when ERROR_SHARING_VIOLATION fires
+        # (the running launcher .exe is locked by the OS), try
+        # rename-then-write. Windows often allows rename-while-open even
+        # when overwrite-while-open fails — the old .exe gets a sibling
+        # ``.old-<version>`` name and the new binary lands at the canonical
+        # path. The renamed file stays on disk until the next reboot or
+        # manual cleanup; harmless (a few MB) and serves as a recovery
+        # checkpoint.
+        if _is_windows_sharing_violation(exc) and dist_path.is_file():
+            old_version_tag = (
+                _read_install_version(install_root) or "prior"
+            ).replace(" ", "_").replace("/", "_")
+            backup_name = f"{fname}.old-{old_version_tag}"
+            backup_path = dist_dir / backup_name
+            # Drop any stale backup from a prior failed swap so the rename
+            # doesn't trip its own SHARING_VIOLATION.
+            if backup_path.exists():
+                try:
+                    backup_path.unlink()
+                except OSError as cleanup_exc:
+                    _log_install_event(
+                        "refresh_dist_binary", "warn",
+                        f"stale backup {backup_path} could not be removed: "
+                        f"{cleanup_exc}; rename-fallback may fail",
+                    )
+            try:
+                dist_path.rename(backup_path)
+                shutil.copy2(src, dist_path)
+                swap_succeeded = True
+                swap_renamed_old_to = backup_path
+                _log_install_event(
+                    "refresh_dist_binary", "ok",
+                    f"Windows rename-fallback succeeded: old binary moved "
+                    f"to {backup_path}, new binary written to {dist_path}",
+                )
+            except OSError as rename_exc:
+                # Both direct overwrite AND rename failed. Emit the
+                # binary-swap-locked deferral so the GUI tells the user
+                # to fully quit + retry from terminal.
+                _log_install_event(
+                    "refresh_dist_binary", "error",
+                    f"Windows binary-swap failed; both overwrite ({exc}) "
+                    f"and rename ({rename_exc}) hit ERROR_SHARING_VIOLATION. "
+                    f"Emitting launcher_binary_swap_failed_locked deferral.",
+                )
+                _emit_binary_swap_locked_deferral(
+                    deferral_report,
+                    new_binary_path=dist_path,
+                    error_detail=(
+                        f"overwrite={exc!r}; rename={rename_exc!r}"
+                    ),
+                )
+                return None
+        else:
+            _log_install_event(
+                "refresh_dist_binary", "warn",
+                f"copy {src} → {dist_path} failed: {exc}",
+            )
+            return None
+
+    if not swap_succeeded:
         return None
 
     _log_install_event(
         "refresh_dist_binary", "ok",
         f"refreshed {dist_path} from {src} "
-        f"(produced_in_run={produced_in_run}, version_stale={version_stale})",
+        f"(produced_in_run={produced_in_run}, version_stale={version_stale}, "
+        f"renamed_old_to={swap_renamed_old_to})",
     )
+
+    # v0.2.15 (Agent D): emit launcher_restart_required so the GUI surfaces
+    # a "Restart now" banner. The running launcher process is still in old
+    # code; the new binary is on disk but not executing yet.
+    new_version = _query_launcher_version(dist_path)
+    old_pid_str = os.environ.get("VCT_LAUNCHER_PID", "").strip()
+    old_pid: Optional[int] = None
+    if old_pid_str:
+        try:
+            old_pid = int(old_pid_str)
+        except ValueError:
+            old_pid = None
+    _emit_launcher_restart_deferral(
+        deferral_report,
+        install_root=install_root,
+        new_binary_path=dist_path,
+        new_version=new_version,
+        old_pid=old_pid,
+    )
+
     return dist_path
 
 

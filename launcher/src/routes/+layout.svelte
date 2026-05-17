@@ -23,6 +23,11 @@
   import ExternalServicesDialog from '$lib/components/ExternalServicesDialog.svelte';
   import NoContainerRuntimeDialog from '$lib/components/NoContainerRuntimeDialog.svelte';
   import InstallHealthGate from '$lib/components/InstallHealthGate.svelte';
+  // v0.2.15 (Agent D, 2026-05-17): launcher self-restart banner. Renders
+  // when install.py wrote a `launcher_restart_required` or
+  // `launcher_binary_swap_failed_locked` entry to UPDATE_DEFERRED.md.
+  // Polls every 5s so it picks up entries from background install runs.
+  import LauncherRestartBanner from '$lib/components/LauncherRestartBanner.svelte';
   // PR-8 (v0.2.11 / 2026-05-15): one-time legacy-collection notice. Auto-
   // shown when (a) Weaviate has at least one ClaudeOrchestrator_<Suffix>
   // class with objects AND (b) at least one user project has a different
@@ -196,6 +201,10 @@
 {:else}
   <div class="app-shell">
     <BrowserModeBanner />
+    <!-- v0.2.15 (Agent D): post-update launcher-restart prompt. Mounted
+         above MenuBar so it's the first thing the user sees regardless
+         of which page they're on when install.py finishes. -->
+    <LauncherRestartBanner />
     <MenuBar />
     <div class="app-body">
       <Sidebar />

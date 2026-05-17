@@ -966,6 +966,12 @@ pub fn run() {
             commands::self_update::get_cached_update_status,
             commands::self_update::set_auto_check_enabled,
             commands::self_update::get_auto_check_enabled,
+            // v0.2.15 (Agent D): launcher self-restart after binary swap.
+            // Invoked by the green "Restart now" banner the FE renders for
+            // `launcher_restart_required` deferral entries emitted by
+            // install.py's _refresh_dist_binary_after_rebuild.
+            commands::restart::restart_launcher,
+            commands::restart::get_launcher_restart_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
