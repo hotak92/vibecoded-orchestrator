@@ -755,8 +755,25 @@ class TestHighFixesIntegration(unittest.TestCase):
         We exercise the install.py logic by replicating the same condition_id
         wiring directly in the test (no need to spawn a subprocess) — the
         production code path is the call-site loop in main().
+
+        v0.2.15: the container name in the restart command is sourced from
+        `vco_lib.containers.all_known_names("weaviate")` rather than the
+        hardcoded `weaviate_claude`. The test asserts the recovery command
+        names one of the recognised aliases instead of pinning a specific
+        string — that way the install.py change (which picks the actual
+        host container at runtime) cannot drift from the test.
         """
         import tempfile as _tf
+        # Import here rather than at module top to keep this fix
+        # localised to the test that needs it (audit-friendly).
+        from vco_lib.containers import all_known_names as _all_known_names
+        weaviate_names = _all_known_names("weaviate")
+        # Pick a representative name for the simulated install.py output.
+        # In real life, install.py uses find_existing_container() and
+        # falls back to the canonical name. The test mirrors the canonical
+        # path (no live podman) so we get the canonical name.
+        sim_container = weaviate_names[0]  # "vco_weaviate"
+
         folder = Path(_tf.mkdtemp(prefix="vct-rebuild-"))
         try:
             report = DeferralReport()
@@ -775,7 +792,7 @@ class TestHighFixesIntegration(unittest.TestCase):
                     "a live Weaviate."
                 ),
                 command_to_apply=(
-                    "podman start weaviate_claude && "
+                    f"podman start {sim_container} && "
                     "python install.py --update --skip-rebuild-prompt"
                 ),
                 severity="critical",
@@ -792,7 +809,7 @@ class TestHighFixesIntegration(unittest.TestCase):
                         "Cannot recreate + re-ingest without a live Weaviate."
                     ),
                     command_to_apply=(
-                        "podman start weaviate_claude && "
+                        f"podman start {sim_container} && "
                         "python install.py --update --skip-rebuild-prompt"
                     ),
                     severity="critical",
@@ -807,6 +824,14 @@ class TestHighFixesIntegration(unittest.TestCase):
             content = (folder / _DEFERRED_REL).read_text(encoding="utf-8")
             self.assertIn("weaviate_unreachable_at_update", content)
             self.assertIn("rebuild_pending_seed", content)
+            # Container-name resilience: the deferral file must name a
+            # container in the canonical+aliases registry — drift would
+            # mean we're back to a maintainer-machine leak.
+            self.assertTrue(
+                any(name in content for name in weaviate_names),
+                f"deferral file does not name any of the recognised "
+                f"weaviate aliases {weaviate_names}; content was: {content!r}",
+            )
         finally:
             import shutil
             shutil.rmtree(folder, ignore_errors=True)

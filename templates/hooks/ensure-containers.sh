@@ -45,7 +45,7 @@ else
         # shellcheck disable=SC2206
         read -ra VCO_REQUIRED_CONTAINERS <<<"$VCT_REQUIRED_CONTAINERS"
     else
-        VCO_REQUIRED_CONTAINERS=(vco_weaviate vco_ollama vct_code_embed)
+        VCO_REQUIRED_CONTAINERS=(vco_weaviate vco_ollama vco_code_embed)
     fi
 fi
 

@@ -1272,6 +1272,13 @@ def _weaviate_auth_error_response(exc: "WeaviateAuthError", query: str = "") -> 
 
 def _build_unreachable_hint(exc: Exception) -> str:
     """Build the actionable user_msg shown to the agent on loud-fail."""
+    # Canonical container name is `vco_weaviate` (v0.2.x+). Older installs
+    # may have `weaviate` (v0.1.x unprefixed) or `weaviate_claude`
+    # (pre-VCO maintainer-machine name). The authoritative registry is
+    # in vco_lib/containers.py — see CANONICAL_CONTAINERS["weaviate"] and
+    # HISTORICAL_ALIASES["weaviate"]. We don't import vco_lib here to
+    # keep the MCP server free of repo-root sys.path coupling; this
+    # string is intentionally a copy of the canonical value.
     return (
         f"Weaviate unreachable at {WEAVIATE_URL} (gRPC :{GRPC_PORT}). "
         "This is the loud-fail behaviour added 2026-05-08 — earlier the MCP "
@@ -1281,7 +1288,9 @@ def _build_unreachable_hint(exc: Exception) -> str:
         "  1. Container down: `podman ps | grep weaviate` and check status.\n"
         "  2. Host port unbound while container reports 'running' (Podman state-DB "
         "desync): `curl -sf http://localhost:8081/v1/meta` from host. If it fails, "
-        "force-recreate: `podman rm -f weaviate_claude && podman-compose up -d weaviate`.\n"
+        "force-recreate: `podman rm -f vco_weaviate && podman-compose up -d weaviate` "
+        "(legacy installs may use `weaviate` or `weaviate_claude` in place of "
+        "`vco_weaviate` — check `podman ps -a --format '{{.Names}}'`).\n"
         "  3. Stuck healthcheck restart-loop (pre-2026-05-08 compose used the "
         "strict `/v1/.well-known/ready` endpoint that 503s during legitimate "
         "operations): verify compose.yaml's healthcheck uses `/v1/meta` + "

@@ -46,10 +46,35 @@ if ($runtime -eq "podman") {
 }
 
 # Container | host_port | probe_kind | probe_endpoint
+#
+# v0.2.15 maintainer-leak fix: stopped hardcoding weaviate_claude /
+# ollama_claude / code_embed_claude — those names only ever existed
+# on the maintainer's own pre-VCO machine. Real VCO installs use
+# vco_*. We row-expand each service across every known historical name
+# (canonical → v0.1.x unprefixed → maintainer-era), and the
+# Test-ContainerRunning check below skips rows whose container doesn't
+# exist. This makes the hook portable across all generations of VCO
+# install without removing recovery support for users on legacy names.
+#
+# Authoritative registry lives in vco_lib/containers.py (Python) and
+# templates/hooks/_lib/container-names.{sh,ps1} (shell). Sync this list
+# when those change — the test_pr2_templates_portability tests pin
+# them together.
 $watch = @(
+    # Weaviate — canonical first
+    @{ Name = "vco_weaviate";        Port = 8081;  Kind = "http"; Endpoint = "/v1/meta" }
+    @{ Name = "weaviate";            Port = 8081;  Kind = "http"; Endpoint = "/v1/meta" }
     @{ Name = "weaviate_claude";     Port = 8081;  Kind = "http"; Endpoint = "/v1/meta" }
+    # Ollama
+    @{ Name = "vco_ollama";          Port = 11435; Kind = "http"; Endpoint = "/api/tags" }
+    @{ Name = "ollama";              Port = 11435; Kind = "http"; Endpoint = "/api/tags" }
     @{ Name = "ollama_claude";       Port = 11435; Kind = "http"; Endpoint = "/api/tags" }
+    # Code-embedding service
+    @{ Name = "vco_code_embed";      Port = 11440; Kind = "tcp";  Endpoint = "" }
+    @{ Name = "vct_code_embed";      Port = 11440; Kind = "tcp";  Endpoint = "" }
+    @{ Name = "code_embed";          Port = 11440; Kind = "tcp";  Endpoint = "" }
     @{ Name = "code_embed_claude";   Port = 11440; Kind = "tcp";  Endpoint = "" }
+    # Model router (sibling service; not in containers registry — single name)
     @{ Name = "model_router_claude"; Port = 11436; Kind = "tcp";  Endpoint = "" }
 )
 
@@ -154,7 +179,11 @@ foreach ($candidate in @("claude_mcp_servers", "infrastructure", ".")) {
 foreach ($z in $zombies) {
     $name = $z.Name
     $port = $z.Port
-    $service = $name -replace "_claude$", ""
+    # Derive compose service name from container name. Compose service
+    # keys are unprefixed (weaviate / ollama / code_embed); the actual
+    # container ships under vco_ / vct_ / unprefixed / _claude variants
+    # depending on install era. Strip every known prefix/suffix.
+    $service = $name -replace "^vco_", "" -replace "^vct_", "" -replace "_claude$", ""
     Write-Output "   → recovering $name (port :$port) via $runtime"
     if ($runtime -eq "podman") {
         # Podman state-DB desync: force-rm + recreate. `podman restart`

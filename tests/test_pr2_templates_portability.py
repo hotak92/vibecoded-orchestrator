@@ -453,10 +453,17 @@ class EnsureContainersHookTests(unittest.TestCase):
             m = re.match(r'^\s*VCO_(\w+)_CONTAINER\s*=\s*"([^"]+)"', line)
             if m:
                 lib_names.add(m.group(2))
+        # v0.2.15 rename: vct_code_embed -> vco_code_embed for naming
+        # consistency. Source the canonical set from
+        # vco_lib.containers.CANONICAL_CONTAINERS so this test cannot
+        # drift from the registry.
+        from vco_lib.containers import CANONICAL_CONTAINERS
+        expected_canonical = set(CANONICAL_CONTAINERS.values())
         self.assertEqual(
             lib_names,
-            {"vco_weaviate", "vco_ollama", "vct_code_embed"},
-            "container-names.sh drifted from the canonical 3-name set",
+            expected_canonical,
+            f"container-names.sh drifted from CANONICAL_CONTAINERS "
+            f"({expected_canonical})",
         )
 
         # Pull container_name fields from the compose file.
@@ -473,23 +480,55 @@ class EnsureContainersHookTests(unittest.TestCase):
 
     def test_hook_no_longer_hardcodes_legacy_names(self):
         """Pre-PR-2 the hook defaulted to weaviate_claude / ollama_claude
-        (the orchestrator's own historical container names). The bundled
-        compose declares vco_weaviate / vco_ollama, so the legacy defaults
-        guaranteed the hook would fail in user projects. Guard regression.
+        (the maintainer's own pre-VCO container names — NOT names VCO
+        ever shipped). The bundled compose declares vco_weaviate /
+        vco_ollama, so the legacy defaults guaranteed the hook would
+        fail in user projects. v0.2.15 widened this regression guard:
+        the legacy names come from
+        `vco_lib.containers.HISTORICAL_ALIASES` (sans the canonical
+        names themselves) so any future addition there is automatically
+        regression-guarded in active hook code without code changes here.
+
+        The test tokenises hook code (whitespace + a few shell
+        delimiters) so a legacy name like `weaviate` cannot
+        false-match the canonical `vco_weaviate` (substring containment
+        would: `'weaviate' in 'vco_weaviate'`). Token equality is the
+        right semantic check — we're asserting "no bare reference to
+        the legacy container name", not "the legacy substring does
+        not appear in any longer identifier".
         """
+        from vco_lib.containers import (
+            CANONICAL_CONTAINERS,
+            HISTORICAL_ALIASES,
+        )
+        canonical_set = set(CANONICAL_CONTAINERS.values())
+        legacy_names: list[str] = []
+        for aliases in HISTORICAL_ALIASES.values():
+            for name in aliases:
+                if name not in canonical_set:
+                    legacy_names.append(name)
+
+        # Shell delimiters that separate identifiers from each other.
+        # `=` for `VAR=value`, `:` for env defaults `${VAR:-...}`, `;`
+        # for command separators, `(`/`)` for arrays/subshells, `"`
+        # for quotes, `'` for single quotes, `,` is rare in shell but
+        # harmless to include.
+        _DELIMS = " \t\n=:;()'\","
+        _TRANS = str.maketrans({c: " " for c in _DELIMS})
+
         text = self.HOOK_SH.read_text(encoding="utf-8")
-        # The legacy names may appear in audit-trail comments, but must
-        # NOT appear in any active VCT_REQUIRED_CONTAINERS default.
-        for legacy in ("weaviate_claude", "ollama_claude", "code_embed_claude"):
-            # Allow the names to exist nowhere except inside comments.
+        for legacy in legacy_names:
             for line in text.splitlines():
                 stripped = line.strip()
                 if stripped.startswith("#"):
                     continue
+                tokens = stripped.translate(_TRANS).split()
                 self.assertNotIn(
-                    legacy, stripped,
-                    f"legacy container name {legacy!r} survives in active "
-                    f"hook code (pre-PR-2 regression)",
+                    legacy, tokens,
+                    f"legacy container name {legacy!r} survives as a "
+                    f"bare identifier in active hook code "
+                    f"(pre-PR-2 / v0.2.15 regression). Offending line: "
+                    f"{stripped!r}",
                 )
 
     def test_hook_compose_dir_prefers_infrastructure_over_legacy(self):
