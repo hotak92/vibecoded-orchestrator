@@ -64,15 +64,86 @@ logger = logging.getLogger(__name__)
 CODE_GRAPH_BASES = ["CodeModule", "CodeClass", "CodeFunction", "CodeAPI", "CodeInteraction"]
 
 
+# Import the canonical sanitizer (single source of truth shared with the
+# launcher's Rust port at launcher/src-tauri/src/project_naming.rs).
+# Falls back to a same-behaviour inline implementation when vco_lib is
+# not importable — e.g. when the analyze script is shelled out from a
+# venv that doesn't include the orchestrator repo on sys.path. The
+# fallback path MUST stay byte-for-byte identical to the canonical
+# implementation in vco_lib.project_naming; the parity test guards both.
+#
+# We attempt three sys.path candidates so the import works regardless
+# of which venv the wrapper bash script activated:
+#   1. Current sys.path (most setups will have vco_lib already
+#      reachable because the orchestrator-clone parent dir is on PATH).
+#   2. $VCT_INSTALL_ROOT (launcher always sets this to the orchestrator
+#      install root — see launcher/src-tauri/src/commands/codegraph.rs
+#      `looks_like_install_root`).
+#   3. Walk up from this script: <root>/.claude/scripts/foo.py →
+#      <root> contains vco_lib/.
+_vct_install_root = os.environ.get("VCT_INSTALL_ROOT", "").strip()
+for _candidate in [
+    _vct_install_root,
+    str(Path(__file__).resolve().parent.parent.parent),  # script_dir/../..
+]:
+    if _candidate and _candidate not in sys.path and (Path(_candidate) / "vco_lib").is_dir():
+        sys.path.insert(0, _candidate)
+        break
+
+try:
+    from vco_lib.project_naming import canonical_class_prefix as _canonical_class_prefix
+except ImportError:
+    # Inline fallback — keep in sync with vco_lib/project_naming.py.
+    # The launcher always passes --project, and VCT_INSTALL_ROOT/.venv
+    # always has vco_lib importable, so this path is exercised only by
+    # external direct invocations (e.g. user calling the script
+    # standalone from a different venv).
+    _NON_ALNUM_OR_UNDERSCORE_FALLBACK = re.compile(r"[^A-Za-z0-9_]")
+
+    def _canonical_class_prefix(project_name: str) -> str:
+        if not isinstance(project_name, str):
+            raise ValueError(
+                f"project_name must be str, got {type(project_name).__name__}"
+            )
+        stripped = project_name.strip()
+        if not stripped:
+            raise ValueError("project_name is empty (or whitespace-only)")
+        parts = stripped.split()
+        if not parts:
+            raise ValueError(f"project_name {project_name!r} has no word parts")
+        pascal_parts = [p[:1].upper() + p[1:] for p in parts]
+        pascal = "".join(pascal_parts)
+        cleaned = _NON_ALNUM_OR_UNDERSCORE_FALLBACK.sub("_", pascal)
+        if not cleaned:
+            raise ValueError(f"project_name {project_name!r} sanitizes to empty string")
+        first = cleaned[0]
+        if not first.isalpha():
+            raise ValueError(
+                f"project_name {project_name!r} sanitizes to {cleaned!r}, "
+                "which starts with a non-letter character — Weaviate class "
+                "names must begin with a letter [A-Z]"
+            )
+        return cleaned
+
+
 def _sanitize_collection_prefix(name: str) -> str:
     """Sanitize project name for use as Weaviate collection prefix.
 
-    Weaviate collection names must be alphanumeric + underscore, starting with uppercase.
+    Single source of truth: ``vco_lib.project_naming.canonical_class_prefix``.
+    Kept as a thin wrapper so existing call sites in this module don't
+    need to change. See vco_lib/project_naming.py for the rules-and-
+    rationale write-up.
+
+    Pre-v0.2.15 this used to be a local implementation that diverged
+    from the launcher's Rust ``sanitize_kg_collection``:
+        - this script replaced any non-``[A-Za-z0-9_]`` with ``_``;
+        - the launcher PascalCased + stripped separators.
+    For ``"VibeCoded Orchestrator"`` this produced
+    ``"VibeCoded_Orchestrator"`` here but ``"VibeCodedOrchestrator"`` in
+    the launcher wizard — and Weaviate's case-insensitive class-name
+    collision then wedged the analyzer indefinitely (bug 0.7 / v0.2.15).
     """
-    sanitized = re.sub(r'[^a-zA-Z0-9_]', '_', name)
-    if sanitized and not sanitized[0].isupper():
-        sanitized = sanitized[0].upper() + sanitized[1:]
-    return sanitized
+    return _canonical_class_prefix(name)
 
 
 def _collection_name(base: str, project_name: str) -> str:
@@ -545,6 +616,117 @@ class CodeGraphAnalyzer:
         """
         return Configure.inverted_index(index_null_state=True)
 
+    def _create_class_with_retry(self, name: str, **create_kwargs) -> bool:
+        """Create a Weaviate class with a bounded retry budget + fail-fast
+        on case-insensitive name collisions (bug 0.6, 2026-05-17).
+
+        Behaviour:
+          - Up to 3 attempts with exponential backoff (0.5s, 1s, 2s) for
+            transient errors (network blips, Weaviate restart, etc.).
+          - If the error message contains the Weaviate case-insensitive
+            collision marker ``"class already exists: found similar
+            class"`` — fail FAST (no retry). Print an actionable error
+            to stderr and re-raise. The collision is permanent: Weaviate
+            will reject every subsequent attempt the same way, so
+            retrying just wastes time and confuses the operator with
+            a multi-minute wedge.
+          - Other errors are retried up to the budget. If all attempts
+            fail, the last exception propagates — caller wraps and logs.
+
+        Returns:
+          - True if creation succeeded on this call.
+          - False if the class already exists with the EXACT same name
+            (Weaviate returns "class already exists" without the
+            "found similar class" suffix — that's the harmless "we
+            already have it under the right name" case, not the
+            case-collision case).
+
+        Raises:
+          - The original exception, on case-collision or budget
+            exhaustion. The exception message is preserved verbatim so
+            log scrapers can match on it.
+
+        Why not let Weaviate's own client retry? The v4 Python client
+        has no opinion about case-collisions — it surfaces the server's
+        rejection as a plain WeaviateUnexpectedStatusCodeError. The
+        wedge observed 2026-05-17 (26 minutes, 0.5% CPU, sleeping on
+        `poll_schedule_timeout`) came from the script's calling code,
+        not the client itself, but the lack of fail-fast meant the
+        operator had to ^C to escape. This helper makes the bad case
+        terminate in <5s with a clear error.
+        """
+        import time as _time
+
+        # Backoff schedule for transient errors. The fixed 3-attempt
+        # cap deliberately stays small so a permanent error surfaces
+        # within ~3.5s of wall-clock total — fast enough that a
+        # launcher IPC caller can show a failure toast before the user
+        # gets impatient and refreshes.
+        backoff_schedule = [0.5, 1.0, 2.0]
+        last_exc: Optional[Exception] = None
+
+        for attempt_idx, sleep_after in enumerate(backoff_schedule):
+            try:
+                self.client.collections.create(name=name, **create_kwargs)
+                return True
+            except Exception as exc:
+                last_exc = exc
+                msg = str(exc)
+                msg_lower = msg.lower()
+
+                # Case-insensitive collision marker. Weaviate's error
+                # text on this is stable as of 1.24+ (verified against
+                # Weaviate source, schema/handler.go). The exact phrase:
+                #   "invalid object: class already exists: found similar
+                #    class \"X\""
+                # If Weaviate ever rewords this, we'll still catch the
+                # "class already exists" prefix below and retry — which
+                # is wrong for collisions, but no worse than the
+                # pre-fix forever-loop behaviour.
+                if "found similar class" in msg_lower:
+                    # Try to extract the colliding class name from the
+                    # error message for the operator's benefit.
+                    collider = "<unknown>"
+                    # Pattern: ...found similar class "X"...
+                    import re as _re
+                    m = _re.search(r'found similar class\s+["\']([^"\']+)["\']', msg)
+                    if m:
+                        collider = m.group(1)
+                    print(
+                        f"ERROR: Weaviate class '{name}' case-insensitively "
+                        f"collides with existing class '{collider}'.\n"
+                        f"This usually means a previous VCO version wrote "
+                        f"codegraph data under a differently-cased prefix.\n"
+                        f"To resolve:\n"
+                        f"  1. Open the launcher and run the 'Legacy code-graph "
+                        f"collections' wizard.\n"
+                        f"  2. Or manually delete the colliding class: "
+                        f"curl -X DELETE http://localhost:8081/v1/schema/{collider}",
+                        file=sys.stderr,
+                    )
+                    # Re-raise so the caller (which wraps in try/except)
+                    # records the failure and exits non-zero rather
+                    # than silently continuing past the broken class.
+                    raise
+
+                # "already exists" WITHOUT the "found similar class"
+                # suffix → the class is there under the EXACT requested
+                # name. That's the harmless idempotent-create case; the
+                # caller doesn't need to retry.
+                if "already exists" in msg_lower and "found similar" not in msg_lower:
+                    return False
+
+                # Transient error: sleep and retry, unless this was
+                # the final attempt.
+                if attempt_idx < len(backoff_schedule) - 1:
+                    _time.sleep(sleep_after)
+                    continue
+                # Fall through to raise after the loop.
+
+        # All retries exhausted — propagate the last error.
+        assert last_exc is not None, "loop must have set last_exc"
+        raise last_exc
+
     def create_collections(self, force: bool = False):
         """Create Weaviate collections for code graph (per-project names)."""
 
@@ -560,7 +742,7 @@ class CodeGraphAnalyzer:
                 print(f"🗑️  Deleted existing {self.coll_module} collection")
 
             if not self.client.collections.exists(self.coll_module):
-                self.client.collections.create(
+                created = self._create_class_with_retry(
                     name=self.coll_module,
                     description="Code modules/files with imports and metrics",
                     vectorizer_config=self._vectorizer_config(),
@@ -580,9 +762,15 @@ class CodeGraphAnalyzer:
                         ReferenceProperty(name="imports", target_collection=self.coll_module, description="Imported modules"),
                     ]
                 )
-                collections_created.append(self.coll_module)
-                print(f"✅ Created {self.coll_module} collection")
+                if created:
+                    collections_created.append(self.coll_module)
+                    print(f"✅ Created {self.coll_module} collection")
         except Exception as e:
+            # Case-collision was already announced to stderr by the
+            # helper. Re-raise to abort the whole create_collections
+            # call — continuing would write inconsistent schemas.
+            if "found similar class" in str(e).lower():
+                raise
             print(f"⚠️  CodeModule: {e}")
 
         # CodeClass collection
@@ -592,7 +780,7 @@ class CodeGraphAnalyzer:
                 print(f"🗑️  Deleted existing {self.coll_class} collection")
 
             if not self.client.collections.exists(self.coll_class):
-                self.client.collections.create(
+                created = self._create_class_with_retry(
                     name=self.coll_class,
                     description="Classes with inheritance and methods",
                     vectorizer_config=self._vectorizer_config(),
@@ -617,9 +805,12 @@ class CodeGraphAnalyzer:
                         ReferenceProperty(name="extends", target_collection=self.coll_class, description="Base classes"),
                     ]
                 )
-                collections_created.append(self.coll_class)
-                print(f"✅ Created {self.coll_class} collection")
+                if created:
+                    collections_created.append(self.coll_class)
+                    print(f"✅ Created {self.coll_class} collection")
         except Exception as e:
+            if "found similar class" in str(e).lower():
+                raise
             print(f"⚠️  CodeClass: {e}")
 
         # CodeFunction collection
@@ -629,7 +820,7 @@ class CodeGraphAnalyzer:
                 print(f"🗑️  Deleted existing {self.coll_function} collection")
 
             if not self.client.collections.exists(self.coll_function):
-                self.client.collections.create(
+                created = self._create_class_with_retry(
                     name=self.coll_function,
                     description="Functions with call graphs",
                     vectorizer_config=self._vectorizer_config(),
@@ -655,9 +846,12 @@ class CodeGraphAnalyzer:
                         ReferenceProperty(name="calls", target_collection=self.coll_function, description="Called functions"),
                     ]
                 )
-                collections_created.append(self.coll_function)
-                print(f"✅ Created {self.coll_function} collection")
+                if created:
+                    collections_created.append(self.coll_function)
+                    print(f"✅ Created {self.coll_function} collection")
         except Exception as e:
+            if "found similar class" in str(e).lower():
+                raise
             print(f"⚠️  CodeFunction: {e}")
 
         # CodeAPI collection
@@ -667,7 +861,7 @@ class CodeGraphAnalyzer:
                 print(f"🗑️  Deleted existing {self.coll_api} collection")
 
             if not self.client.collections.exists(self.coll_api):
-                self.client.collections.create(
+                created = self._create_class_with_retry(
                     name=self.coll_api,
                     description="API endpoints with handlers",
                     vectorizer_config=self._vectorizer_config(),
@@ -685,9 +879,12 @@ class CodeGraphAnalyzer:
                         ReferenceProperty(name="handler", target_collection=self.coll_function, description="Handler function"),
                     ]
                 )
-                collections_created.append(self.coll_api)
-                print(f"✅ Created {self.coll_api} collection")
+                if created:
+                    collections_created.append(self.coll_api)
+                    print(f"✅ Created {self.coll_api} collection")
         except Exception as e:
+            if "found similar class" in str(e).lower():
+                raise
             print(f"⚠️  CodeAPI: {e}")
 
         # CodeInteraction collection — cross-language / cross-service calls
@@ -697,7 +894,7 @@ class CodeGraphAnalyzer:
                 print(f"🗑️  Deleted existing {self.coll_interaction} collection")
 
             if not self.client.collections.exists(self.coll_interaction):
-                self.client.collections.create(
+                created = self._create_class_with_retry(
                     name=self.coll_interaction,
                     description="Cross-language and cross-service communication calls",
                     vectorizer_config=self._vectorizer_config(),
@@ -717,9 +914,12 @@ class CodeGraphAnalyzer:
                         ReferenceProperty(name="source_module", target_collection=self.coll_module, description="Module containing the call"),
                     ]
                 )
-                collections_created.append(self.coll_interaction)
-                print(f"✅ Created {self.coll_interaction} collection")
+                if created:
+                    collections_created.append(self.coll_interaction)
+                    print(f"✅ Created {self.coll_interaction} collection")
         except Exception as e:
+            if "found similar class" in str(e).lower():
+                raise
             print(f"⚠️  CodeInteraction: {e}")
 
         if collections_created:
@@ -3460,7 +3660,26 @@ def main():
         # Always ensure collections exist with correct schema (named vectors)
         # before getting references — Weaviate v4 client auto-creates flat-vector
         # collections on .get() if they don't exist, which breaks named vector inserts.
-        analyzer.create_collections(force=args.force_recreate)
+        #
+        # Wrap separately from the analyze phase so the launcher IPC
+        # sees a precise non-zero exit when create_collections hits the
+        # case-collision fail-fast path (bug 0.6). Without this wrap a
+        # raise from `_create_class_with_retry` would still exit
+        # non-zero (good), but the print order would be confusing
+        # (analyzer's "Analyzing codebase..." appears before the
+        # actual error if we didn't bail explicitly here).
+        try:
+            analyzer.create_collections(force=args.force_recreate)
+        except Exception as e:
+            msg = str(e)
+            if "found similar class" in msg.lower():
+                # Stderr message was already emitted by
+                # _create_class_with_retry. Just exit non-zero so the
+                # launcher's IPC surfaces a failure toast.
+                return 2  # Distinct from generic-failure 1 so callers
+                          # can special-case schema collisions.
+            print(f"❌ Failed to create collections: {e}", file=sys.stderr)
+            return 1
 
         # Analyze repository
         print("🔍 Analyzing codebase...")

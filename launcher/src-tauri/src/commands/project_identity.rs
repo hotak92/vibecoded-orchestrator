@@ -28,6 +28,7 @@ use crate::commands::projects_v2::{
 };
 use crate::config::LocalConfig;
 use crate::db::Db;
+use crate::project_naming::canonical_class_prefix;
 
 // ─── Constants ───────────────────────────────────────────────────────────
 
@@ -137,13 +138,28 @@ pub fn get_project_identity_with_db(
         })
         .unwrap_or_else(|| format!("{}_KnowledgeGraph", sanitize_kg_collection(&row.name)));
 
-    // Resolve code-graph prefix similarly.
+    // Resolve code-graph prefix similarly. The FALLBACK (no binding row
+    // yet) uses `canonical_class_prefix` — the same single-source-of-
+    // truth sanitizer the Python analyze script uses (bug 0.7, v0.2.15).
+    // The previous `sanitize_kg_collection` fallback produced a
+    // different prefix for `SimRacing_AI` (→ `SimRacingAI`) than the
+    // analyze script (→ `SimRacing_AI`), wedging the codegraph build
+    // on Weaviate's case-insensitive class-name collision.
+    //
+    // If `canonical_class_prefix` rejects the name (empty / leading
+    // digit / etc.) we fall back to the legacy `sanitize_kg_collection`
+    // which never rejects — losing parity is better than crashing the
+    // identity-fetch endpoint, and the legacy path's "Project" fallback
+    // keeps the UI usable.
     let code_graph_project = db
         .get_project_codegraph_binding(project_id)
         .ok()
         .flatten()
         .map(|b| b.collection_prefix)
-        .unwrap_or_else(|| sanitize_kg_collection(&row.name));
+        .unwrap_or_else(|| {
+            canonical_class_prefix(&row.name)
+                .unwrap_or_else(|_| sanitize_kg_collection(&row.name))
+        });
 
     // Source-of-truth file:
     //   - orchestrator root: `.claude/settings.json` (the clone is the
@@ -566,6 +582,11 @@ pub async fn list_legacy_codegraph_collections(
     // Find user projects whose code-graph prefix is NOT the legacy one.
     // (Project rows that intentionally use the legacy prefix get ignored —
     // they're the consumers of the data, not victims of the bug.)
+    //
+    // FALLBACK sanitizer is `canonical_class_prefix` (single source of
+    // truth with the Python analyze script, bug 0.7). See the note in
+    // `get_project_identity` above for why we fall back further to
+    // `sanitize_kg_collection` on canonical-side rejection.
     let affected_projects = match db.list_projects() {
         Ok(rows) => {
             let mut out = Vec::new();
@@ -576,7 +597,10 @@ pub async fn list_legacy_codegraph_collections(
                     .flatten();
                 let prefix = binding
                     .map(|b| b.collection_prefix)
-                    .unwrap_or_else(|| sanitize_kg_collection(&row.name));
+                    .unwrap_or_else(|| {
+                        canonical_class_prefix(&row.name)
+                            .unwrap_or_else(|_| sanitize_kg_collection(&row.name))
+                    });
                 if prefix != LEGACY_CODEGRAPH_PREFIX {
                     out.push(AffectedProject {
                         project_id: row.id,

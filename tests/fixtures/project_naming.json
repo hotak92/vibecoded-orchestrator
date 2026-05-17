@@ -1,0 +1,41 @@
+{
+  "_comment": "Parity fixture for canonical_class_prefix — consumed by both tests/test_project_naming_parity.py and launcher/src-tauri/tests/project_naming_parity.rs. Each entry is [input, expected_output]. Adding a row here pins behaviour for BOTH implementations; if either diverges, the parity test fails. See vco_lib/project_naming.py for the rules behind each case.",
+  "_format_version": 1,
+  "cases": [
+    ["SD15", "SD15"],
+    ["SimRacing_AI", "SimRacing_AI"],
+    ["VibeCoded Orchestrator", "VibeCodedOrchestrator"],
+    ["VCO_dev", "VCO_dev"],
+    ["VibeCoded_Tools", "VibeCoded_Tools"],
+    ["foo bar", "FooBar"],
+    ["Foo-Bar", "Foo_Bar"],
+    ["  spaced  out  ", "SpacedOut"],
+    ["vibecoded-orchestrator", "Vibecoded_orchestrator"],
+    ["vibecoded_orchestrator", "Vibecoded_orchestrator"],
+    ["My Project", "MyProject"],
+    ["snake_case_name", "Snake_case_name"],
+    ["Already CamelCase", "AlreadyCamelCase"],
+    ["Foo.Bar", "Foo_Bar"],
+    ["Foo/Bar", "Foo_Bar"],
+    ["Foo--Bar", "Foo__Bar"],
+    ["A", "A"],
+    ["a", "A"],
+    ["AB", "AB"],
+    ["ab", "Ab"],
+    ["a b c", "ABC"],
+    ["MOE_tasks", "MOE_tasks"],
+    ["BaliHospitality", "BaliHospitality"],
+    ["Bali Hospitality", "BaliHospitality"],
+    ["Bali_Hospitality", "Bali_Hospitality"]
+  ],
+  "errors": [
+    "",
+    "   ",
+    "\t\n",
+    "!!!",
+    "123abc",
+    "...!!!",
+    "_only_underscores_",
+    "9"
+  ]
+}
