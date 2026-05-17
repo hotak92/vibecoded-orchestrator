@@ -1549,24 +1549,89 @@ def _run_lightweight(args: argparse.Namespace) -> int:
 # install time we don't necessarily have a runtime up yet AND the user may
 # have data sitting in a bind-mount directory that no current container
 # references.
-_LEGACY_VOLUME_PROBES: dict[str, tuple[str, ...]] = {
-    # Most common: shared with a sibling-project co-install pattern where
-    # both orchestrators point Ollama at a single host-side directory to
-    # avoid duplicating multi-GB model caches.
-    "ollama": (
-        "~/podman_volumes/ollama/models",
-        "~/.local/share/containers/storage/volumes/ollama_claude/_data",
-        "~/.local/share/containers/storage/volumes/ollama_data/_data",
-    ),
-    "code_embed": (
-        "~/podman_volumes/code_embed_cache",
-        "~/.local/share/containers/storage/volumes/code_embed_cache/_data",
-    ),
-    "weaviate": (
-        "~/podman_volumes/weaviate_claude",
-        "~/.local/share/containers/storage/volumes/weaviate_data/_data",
-    ),
-}
+#
+# The per-service-suffix probes are derived from
+# `vco_lib.containers.HISTORICAL_ALIASES` so the maintainer-machine leak
+# (the literal `weaviate_claude` / `ollama_claude` paths that lived here
+# pre-v0.2.15) cannot reappear — see vco_lib/containers.py for the
+# centralised registry + the rationale.
+def _build_legacy_volume_probes() -> dict[str, tuple[str, ...]]:
+    """Build the per-service probe list from the central container-name
+    registry. Replaces the v0.2.14-and-earlier hardcoded
+    ``weaviate_claude`` / ``ollama_claude`` paths (maintainer-machine
+    leak — see vco_lib/containers.py).
+
+    Probe path forms:
+      * ``~/podman_volumes/<full-container-name>`` — recovers
+        bind-mount layouts using the literal container name as the
+        directory. Only generated for full container names that
+        would naturally form a bind-mount root (i.e. the
+        ``_claude``-suffixed legacy and the ``vct_code_embed``
+        transitional name); NOT for bare service-token aliases like
+        ``weaviate`` / ``ollama`` / ``code_embed`` because those
+        conventionally bind-mount one level deeper (e.g.
+        ``~/podman_volumes/ollama/models``) and would create
+        false positives at the parent level.
+      * ``~/.local/share/containers/storage/volumes/<alias>/_data`` —
+        rootless named-volume mountpoint pattern. Generated for every
+        alias, since named volumes do use the alias literally.
+      * Service-specific shared bind paths kept explicit per service
+        (most-used layouts).
+    """
+    from vco_lib.containers import HISTORICAL_ALIASES, canonical_name
+
+    # Service-specific "well-known shared paths" the user may have set
+    # up out-of-band (NOT derived from container names). Kept explicit
+    # so they're easy to audit / extend.
+    shared_paths: dict[str, tuple[str, ...]] = {
+        "ollama": ("~/podman_volumes/ollama/models",),
+        "code_embed": ("~/podman_volumes/code_embed_cache",),
+        "weaviate": (),
+    }
+
+    # Aliases that look like distinct container names (vs. bare service
+    # tokens that conventionally bind-mount one level deeper). These
+    # are the names where `~/podman_volumes/<name>` is the natural
+    # bind-mount root.
+    def _alias_is_container_shape(alias: str) -> bool:
+        return alias.endswith("_claude") or alias.startswith(("vct_", "vco_"))
+
+    out: dict[str, tuple[str, ...]] = {}
+    for service in ("ollama", "code_embed", "weaviate"):
+        paths: list[str] = list(shared_paths.get(service, ()))
+        for alias in HISTORICAL_ALIASES[service]:
+            if _alias_is_container_shape(alias):
+                paths.append(f"~/podman_volumes/{alias}")
+            paths.append(
+                f"~/.local/share/containers/storage/volumes/{alias}/_data"
+            )
+        # Always probe the canonical compose volume mountpoint last
+        # (named volumes the current compose creates).
+        canon_volume = {
+            "ollama": "ollama_data",
+            "code_embed": "code_embed_cache",
+            "weaviate": "weaviate_data",
+        }[service]
+        paths.append(
+            f"~/.local/share/containers/storage/volumes/{canon_volume}/_data"
+        )
+        # canonical_name() imported above only to surface a hard error
+        # if the registry is malformed at import time (fail fast vs at
+        # first probe).
+        _ = canonical_name(service)
+        # Deduplicate preserving order.
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for p in paths:
+            if p in seen:
+                continue
+            seen.add(p)
+            deduped.append(p)
+        out[service] = tuple(deduped)
+    return out
+
+
+_LEGACY_VOLUME_PROBES: dict[str, tuple[str, ...]] = _build_legacy_volume_probes()
 
 
 def _detect_legacy_volume_paths() -> dict[str, str]:
@@ -2418,9 +2483,23 @@ def main() -> int:
             # via podman before emitting a deferral.
             _weaviate_down_msg = str(_weaviate_err)
             _restarted = False
+            # Discover the actual Weaviate container name on this host.
+            # v0.2.15: stopped hardcoding `weaviate_claude` — that name
+            # was a maintainer-machine leak; real VCO installs use
+            # `vco_weaviate`, with `weaviate` (v0.1.x) and `weaviate_claude`
+            # (pre-VCO maintainer era) as deeper fallbacks. See
+            # vco_lib/containers.py.
+            from vco_lib.containers import (
+                all_known_names as _all_known_names,
+                find_existing_container as _find_existing_container,
+            )
+            _weaviate_container = (
+                _find_existing_container("weaviate")
+                or "vco_weaviate"  # nothing on host yet — name the canonical
+            )
             try:
                 subprocess.run(
-                    ["podman", "start", "weaviate_claude"],
+                    ["podman", "start", _weaviate_container],
                     capture_output=True, timeout=30,
                 )
                 import time as _time
@@ -2432,6 +2511,14 @@ def main() -> int:
             except Exception:
                 pass
             if not _restarted:
+                # Build a user-facing "which name to use" hint. If we
+                # found one on the host, name it. Otherwise list all the
+                # candidates so the user can try whichever they have.
+                _candidates_hint = (
+                    _weaviate_container
+                    if _find_existing_container("weaviate")
+                    else " | ".join(_all_known_names("weaviate"))
+                )
                 print(
                     f"WARNING: Weaviate unreachable after restart attempt "
                     f"({_weaviate_down_msg}). Collections not bootstrapped. "
@@ -2444,14 +2531,14 @@ def main() -> int:
                         detected=(
                             f"Weaviate refused connection during --update "
                             f"({_weaviate_down_msg}). Auto-restart via "
-                            "`podman start weaviate_claude` also failed."
+                            f"`podman start {_weaviate_container}` also failed."
                         ),
                         why_deferred=(
                             "Collection bootstrap and schema migration require "
                             "a live Weaviate. Cannot proceed without it."
                         ),
                         command_to_apply=(
-                            "podman start weaviate_claude && "
+                            f"podman start {_candidates_hint} && "
                             "python install.py --update --skip-rebuild-prompt"
                         ),
                         severity="critical",
@@ -2483,7 +2570,7 @@ def main() -> int:
                                 "the next install.py --update run."
                             ),
                             command_to_apply=(
-                                "podman start weaviate_claude && "
+                                f"podman start {_candidates_hint} && "
                                 "python install.py --update "
                                 "--skip-rebuild-prompt"
                             ),
@@ -2913,8 +3000,11 @@ def _apply_deferred_entries(
         ``--rebuild-collections`` flag to be present.  We skip to preserve
         the conservative "no silent data churn" contract.  If the user passed
         ``--rebuild-collections`` the drift is already resolved before we arrive.
-      - ``weaviate_unreachable_at_update``: try ``podman start weaviate_claude``
-        then check reachability; mark resolved if now reachable.
+      - ``weaviate_unreachable_at_update``: try ``podman start <name>``
+        (name discovered via ``vco_lib.containers.find_existing_container``;
+        falls back to the canonical ``vco_weaviate`` if no container is
+        on the host yet) then check reachability; mark resolved if now
+        reachable.
       - ``compose_overlay_ambiguous``: cannot auto-resolve (requires human
         decision); emit informational note.
     """
@@ -2934,10 +3024,22 @@ def _apply_deferred_entries(
             current_run_report.add_entry(entry)
 
         elif cid == "weaviate_unreachable_at_update":
-            print(f"  [try]  {cid}: attempting podman start weaviate_claude ...")
+            # v0.2.15: discover the actual container name on this host
+            # instead of hardcoding `weaviate_claude` (maintainer-machine
+            # leak — see vco_lib/containers.py).
+            from vco_lib.containers import (
+                find_existing_container as _find_existing_container,
+            )
+            _weav_container = (
+                _find_existing_container("weaviate") or "vco_weaviate"
+            )
+            print(
+                f"  [try]  {cid}: attempting podman start "
+                f"{_weav_container} ..."
+            )
             try:
                 subprocess.run(
-                    ["podman", "start", "weaviate_claude"],
+                    ["podman", "start", _weav_container],
                     capture_output=True, timeout=30,
                 )
                 import time as _t
@@ -5390,18 +5492,40 @@ def _write_compose_override(alt_ports: dict) -> None:
     print(f"  [override] wrote {override_path}")
 
 
-_ORCHESTRATOR_VOLUME_NAMES = (
-    # Canonical (current compose)
-    "weaviate_data",
-    "ollama_data",
-    "code_embed_cache",
-    # Historical project-suffixed names
-    "weaviate_claude",
-    "weaviate_ARTup",
-    "ollama_claude",
-    "ollama_ARTup",
-    "vct_code_embed",
-)
+def _build_orchestrator_volume_names() -> tuple[str, ...]:
+    """Volume names this install knows about — canonical first, then the
+    historical container-name aliases from vco_lib.containers (which now
+    centralises the maintainer-machine-leak fix from v0.2.15).
+
+    The maintainer's `_ARTup` per-project-suffix names are kept inline
+    here (they were never canonical VCO names — they were specific to a
+    co-installed sibling project on the maintainer's machine — but
+    detecting them on existing installs is still useful to surface in
+    the storage-config picker).
+    """
+    from vco_lib.containers import HISTORICAL_ALIASES
+
+    canonical = ("weaviate_data", "ollama_data", "code_embed_cache")
+    historical: list[str] = []
+    for service in ("weaviate", "ollama", "code_embed"):
+        historical.extend(HISTORICAL_ALIASES[service])
+    # Sibling-project maintainer-era names. Not in vco_lib.containers
+    # because they're not container names this project ever shipped —
+    # they were per-workspace named volumes from a co-installed sibling
+    # repo. Kept here for storage-config detection only.
+    sibling_legacy = ("weaviate_ARTup", "ollama_ARTup")
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for name in (*canonical, *historical, *sibling_legacy):
+        if name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return tuple(out)
+
+
+_ORCHESTRATOR_VOLUME_NAMES = _build_orchestrator_volume_names()
 
 
 def _detect_existing_volume_paths() -> dict:

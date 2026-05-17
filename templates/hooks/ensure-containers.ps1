@@ -43,7 +43,7 @@ if (Test-Path $LibFile) {
     if ($env:VCT_REQUIRED_CONTAINERS) {
         $VcoRequiredContainers = $env:VCT_REQUIRED_CONTAINERS -split '\s+' | Where-Object { $_ }
     } else {
-        $VcoRequiredContainers = @("vco_weaviate", "vco_ollama", "vct_code_embed")
+        $VcoRequiredContainers = @("vco_weaviate", "vco_ollama", "vco_code_embed")
     }
 }
 

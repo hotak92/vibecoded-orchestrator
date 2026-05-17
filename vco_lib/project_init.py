@@ -1318,8 +1318,12 @@ _migrate_collections = migrate_collections
 # project whose collections already exist is a no-op (no errors).
 #
 # Soft-fail policy (per PR 4 spec):
-#   1. If Weaviate unreachable, attempt `podman start weaviate_claude` (or
+#   1. If Weaviate unreachable, attempt `podman start <name>` (or
 #      `docker start` fallback) once and wait up to 10s for healthy.
+#      Container name is discovered via
+#      `vco_lib.containers.find_existing_container("weaviate")`;
+#      falls back to the canonical `vco_weaviate` if none of the
+#      historical aliases are present on the host.
 #   2. If still unreachable, write a `weaviate_unreachable_at_bootstrap`
 #      deferral entry to `<project_folder>/.claude/context/UPDATE_DEFERRED.md`
 #      and return success — NEVER block project creation. The hook
@@ -1357,7 +1361,33 @@ _SHARED_KG_NAME = "VibecodedOrchestrator_KnowledgeGraph"
 # auto-renames or auto-drops.
 _LEGACY_SHARED_KG_NAME = "VibeCodedTools_KnowledgeGraph"
 
-_DEFAULT_RESTART_CONTAINER = "weaviate_claude"
+def _default_restart_container() -> str:
+    """Resolve the Weaviate container name to attempt restarting.
+
+    v0.2.15: replaced the hardcoded literal `weaviate_claude` (which was
+    a maintainer-machine leak — see vco_lib/containers.py) with a
+    lazy lookup that probes for the actual container on the host. Falls
+    back to the canonical `vco_weaviate` when nothing matches, so callers
+    always get a usable name (`podman start vco_weaviate` will fail
+    gracefully with "no such container" if the user has truly nothing).
+
+    Called lazily by `_attempt_container_restart` rather than evaluated at
+    module import — `podman container exists` shells out and we don't
+    want to pay that on every `import vco_lib.project_init` in test code.
+    """
+    from vco_lib.containers import canonical_name, find_existing_container
+
+    found = find_existing_container("weaviate")
+    if found is not None:
+        return found
+    return canonical_name("weaviate")
+
+
+# Sentinel that callers can pass instead of a literal container name to
+# request lazy lookup. Resolves to the actual name at call time via
+# `_default_restart_container()`. The old import-time constant pattern
+# was a snapshot of the maintainer's machine — see vco_lib/containers.py.
+_DEFAULT_RESTART_CONTAINER: str = "__resolve_lazily__"
 
 
 # ---------------------------------------------------------------------------
@@ -1554,9 +1584,17 @@ def _attempt_container_restart(
     Returns True if the start command succeeded (which doesn't guarantee
     the service is HEALTHY yet — caller should follow up with a readiness
     probe). Returns False if both runtimes are missing or the start fails.
+
+    ``container_name`` defaults to the lazy-lookup sentinel
+    `_DEFAULT_RESTART_CONTAINER`; when passed (or unset), the actual
+    name is resolved via `_default_restart_container()` which probes
+    `vco_lib.containers` for any matching container on the host.
     """
     import shutil
     import subprocess as _sp
+
+    if container_name == _DEFAULT_RESTART_CONTAINER:
+        container_name = _default_restart_container()
 
     def _log(step: str, phase: str, detail: str = "", *, data=None) -> None:
         if log_event is None:
@@ -1949,9 +1987,31 @@ def _write_bootstrap_deferral(
     """
     from vco_lib.deferral_report import DeferralEntry, DeferralReport
 
+    # v0.2.15: drive the restart command off the actual host container
+    # name (canonical `vco_weaviate`, but `weaviate` or `weaviate_claude`
+    # on legacy installs). See vco_lib/containers.py.
+    from vco_lib.containers import (
+        all_known_names as _all_known_names,
+        find_existing_container as _find_existing_container,
+    )
+    _restart_target = (
+        _find_existing_container("weaviate")
+        or _all_known_names("weaviate")[0]  # canonical (vco_weaviate)
+    )
+    _cmd_hint = (
+        f"podman start {_restart_target}  # or: docker start {_restart_target}"
+    )
+    if _find_existing_container("weaviate") is None:
+        # No container yet on host. Show the full candidate list so the
+        # user can pick whichever one matches their install era.
+        _cmd_hint += (
+            "  # legacy installs may use one of: "
+            + " | ".join(_all_known_names("weaviate")[1:])
+        )
+
     cmd_lines = [
         "# 1. Bring Weaviate up.",
-        "podman start weaviate_claude  # or: docker start weaviate_claude",
+        _cmd_hint,
         "",
         "# 2. Re-run bootstrap (idempotent).",
         f"python -m vco_lib.project_init bootstrap-collections "

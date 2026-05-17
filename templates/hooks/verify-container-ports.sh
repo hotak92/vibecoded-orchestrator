@@ -71,10 +71,34 @@ esac
 # Container | host_port | probe_kind | probe_endpoint
 # probe_kind: "http" → curl with --max-time 3
 #             "tcp"  → bash /dev/tcp socket open
+#
+# v0.2.15 maintainer-leak fix: stopped hardcoding `weaviate_claude` /
+# `ollama_claude` / `code_embed_claude` — those names only ever existed
+# on the maintainer's own pre-VCO machine. Real VCO installs use
+# `vco_*`. We now ROW-EXPAND each service across every known historical
+# name (canonical → v0.1.x unprefixed → maintainer-era), and the
+# container_running check below skips the rows whose container doesn't
+# exist. This makes the hook portable across all generations of VCO
+# install without removing recovery support for users on legacy names.
+#
+# Authoritative registry lives in vco_lib/containers.py
+# (CANONICAL_CONTAINERS + HISTORICAL_ALIASES). Sync this list when those
+# change — the test_pr2_templates_portability tests pin them together.
 WATCH=(
+    # Weaviate — canonical first
+    "vco_weaviate|8081|http|/v1/meta"
+    "weaviate|8081|http|/v1/meta"
     "weaviate_claude|8081|http|/v1/meta"
+    # Ollama
+    "vco_ollama|11435|http|/api/tags"
+    "ollama|11435|http|/api/tags"
     "ollama_claude|11435|http|/api/tags"
+    # Code-embedding service
+    "vco_code_embed|11440|tcp|"
+    "vct_code_embed|11440|tcp|"
+    "code_embed|11440|tcp|"
     "code_embed_claude|11440|tcp|"
+    # Model router (sibling service; not in containers registry — single name)
     "model_router_claude|11436|tcp|"
 )
 
@@ -158,7 +182,15 @@ done
 
 for entry in "${zombies[@]}"; do
     IFS='|' read -r name port <<< "$entry"
-    service="${name%_claude}"
+    # Derive compose service name from the container name. Compose
+    # files use unprefixed service keys (weaviate / ollama / code_embed),
+    # but the actual containers ship under various names — strip every
+    # known prefix and suffix VCO has ever used. Order matters: longest
+    # discriminators first so "vco_code_embed" doesn't collapse to "embed".
+    service="$name"
+    service="${service#vco_}"
+    service="${service#vct_}"
+    service="${service%_claude}"
     echo "   → recovering $name (port :$port) via $RUNTIME"
     if [ "$RUNTIME" = "podman" ]; then
         # Podman state-DB desync: force-rm + recreate. `podman restart`
