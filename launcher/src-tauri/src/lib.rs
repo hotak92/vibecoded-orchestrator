@@ -912,6 +912,7 @@ pub fn run() {
             commands::project_identity::redetect_project_identity,
             commands::project_identity::list_legacy_codegraph_collections,
             commands::project_identity::cleanup_legacy_codegraph_collections,
+            commands::project_identity::cleanup_orphan_codegraph_collections,
             commands::project_identity::get_legacy_codegraph_notice_dismissed,
             commands::project_identity::set_legacy_codegraph_notice_dismissed,
             // PR-26 / Group E (v0.2.12 / 2026-05-16): shared KG canonical-name

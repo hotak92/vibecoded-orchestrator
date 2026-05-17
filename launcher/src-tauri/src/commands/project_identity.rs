@@ -484,9 +484,17 @@ pub struct LegacyCodegraphReport {
     /// `LEGACY_CODEGRAPH_PREFIX` — these are candidates for re-analysis if
     /// the user accepts the offer.
     pub affected_projects: Vec<AffectedProject>,
+    /// v0.2.15 (0.4) addition: orphan code-graph classes that match a
+    /// known project's name case-insensitively but use a different
+    /// prefix than the project's current canonical prefix. Empty when
+    /// no orphans exist OR no projects exist. See `OrphanCollectionGroup`
+    /// for the rationale (multi-generation cruft from VCO's prefix
+    /// algorithm changing across releases).
+    pub orphan_groups: Vec<OrphanCollectionGroup>,
     /// True when at least one legacy collection has > 0 objects AND at
     /// least one affected project exists. Drives the launcher first-startup
-    /// banner.
+    /// banner. v0.2.15: also true when at least one orphan group has
+    /// > 0 objects.
     pub action_recommended: bool,
 }
 
@@ -495,6 +503,46 @@ pub struct AffectedProject {
     pub project_id: String,
     pub name: String,
     pub current_prefix: String,
+}
+
+/// v0.2.15 (0.4): one orphan-prefix generation detected for a known
+/// project. Background: VCO's project-name → class-prefix sanitizer has
+/// changed across releases (folder-name pre-v0.2.0, lowercase-collapse
+/// in mid-v0.2.x, the `canonical_class_prefix` of v0.2.15). Long-lived
+/// projects (especially `orchestrator_root` projects that maintainers
+/// track across versions) accumulate one set of code-graph classes per
+/// sanitizer-generation, all case-insensitively colliding with each
+/// other under Weaviate's class-name uniqueness rules.
+///
+/// Each orphan group represents ONE non-canonical prefix found in
+/// Weaviate that:
+///   * matches a project case-insensitively when both are lowercased
+///     and stripped of non-alphanumerics, AND
+///   * differs from that project's CURRENT canonical prefix.
+///
+/// The user is offered a per-group delete with an explicit object count
+/// + name. NEVER auto-deleted: some orphans may be intentional
+/// multi-version comparison data the user wants to keep.
+#[derive(Debug, Clone, Serialize)]
+pub struct OrphanCollectionGroup {
+    /// The non-canonical prefix (e.g. "VCO_dev", "Vibecoded_orchestrator").
+    pub prefix: String,
+    /// The project the orphan most likely belongs to. May be heuristic
+    /// (case-insensitive normalised-name match).
+    pub matched_project_id: String,
+    /// The project's name as the user sees it in the launcher.
+    pub matched_project_name: String,
+    /// The project's CURRENT canonical prefix (what new analyses will
+    /// write to). Useful in the UI to render "VCO_dev (orphan) →
+    /// VibeCodedOrchestrator (current)".
+    pub current_prefix: String,
+    /// Per-suffix collection list. Same shape as the legacy
+    /// `LegacyCodegraphCollection` entries so the UI can render them
+    /// uniformly.
+    pub collections: Vec<LegacyCodegraphCollection>,
+    /// Sum of `object_count` across `collections`. Pre-computed so the
+    /// UI doesn't have to.
+    pub total_objects: u32,
 }
 
 /// Scan Weaviate for `ClaudeOrchestrator_*` code-graph collections.
@@ -526,6 +574,7 @@ pub async fn list_legacy_codegraph_collections(
             return Ok(LegacyCodegraphReport {
                 collections: Vec::new(),
                 affected_projects: Vec::new(),
+                orphan_groups: Vec::new(),
                 action_recommended: false,
             });
         }
@@ -535,6 +584,7 @@ pub async fn list_legacy_codegraph_collections(
         return Ok(LegacyCodegraphReport {
             collections: Vec::new(),
             affected_projects: Vec::new(),
+            orphan_groups: Vec::new(),
             action_recommended: false,
         });
     }
@@ -550,6 +600,14 @@ pub async fn list_legacy_codegraph_collections(
         .unwrap_or_default();
 
     let mut collections = Vec::new();
+    // v0.2.15 (0.4): also bucket every NON-legacy code-graph class by
+    // prefix so we can later cross-reference against project names. The
+    // BTreeMap keeps prefix order deterministic in the report (helpful
+    // for stable Svelte rendering + test assertions).
+    let mut code_graph_by_prefix: std::collections::BTreeMap<
+        String,
+        Vec<LegacyCodegraphCollection>,
+    > = std::collections::BTreeMap::new();
     for cls in &classes {
         let name = cls
             .get("class")
@@ -559,23 +617,35 @@ pub async fn list_legacy_codegraph_collections(
         if name.is_empty() {
             continue;
         }
-        // Looking for `<LEGACY_CODEGRAPH_PREFIX>_<Suffix>` where Suffix is
-        // one of the five code-graph entity suffixes.
-        let suffix = match name.strip_prefix(&format!("{}_", LEGACY_CODEGRAPH_PREFIX)) {
-            Some(s) => s,
+        // First: classify by suffix. Any class whose suffix isn't one
+        // of the five code-graph entity types is irrelevant to this
+        // wizard (it might be a KG class, a `_Development` class, etc).
+        let (prefix, suffix) = match split_codegraph_class_name(&name) {
+            Some(parts) => parts,
             None => continue,
         };
-        if !CODE_GRAPH_SUFFIXES.iter().any(|s| *s == suffix) {
-            continue;
-        }
         // Best-effort object count via Aggregate. Failures → 0.
         let count = fetch_class_count(&client, &base, &name).await.unwrap_or(0);
-        if count > 0 {
-            collections.push(LegacyCodegraphCollection {
-                class: name.clone(),
-                suffix: suffix.to_string(),
-                object_count: count,
-            });
+        if count == 0 {
+            // Skip empty classes either way — they're noise that lingers
+            // because Weaviate doesn't auto-delete on object drain.
+            continue;
+        }
+        let entry = LegacyCodegraphCollection {
+            class: name.clone(),
+            suffix: suffix.to_string(),
+            object_count: count,
+        };
+        if prefix == LEGACY_CODEGRAPH_PREFIX {
+            // Goes into the legacy list (unchanged from v0.2.14 behaviour).
+            collections.push(entry);
+        } else {
+            // Candidate orphan: bucket by prefix for matching against
+            // project rows below.
+            code_graph_by_prefix
+                .entry(prefix.to_string())
+                .or_default()
+                .push(entry);
         }
     }
 
@@ -587,39 +657,113 @@ pub async fn list_legacy_codegraph_collections(
     // truth with the Python analyze script, bug 0.7). See the note in
     // `get_project_identity` above for why we fall back further to
     // `sanitize_kg_collection` on canonical-side rejection.
-    let affected_projects = match db.list_projects() {
-        Ok(rows) => {
-            let mut out = Vec::new();
-            for row in rows {
-                let binding = db
-                    .get_project_codegraph_binding(&row.id)
-                    .ok()
-                    .flatten();
+    //
+    // v0.2.15 (0.4): also collect every project's identity (id, name,
+    // canonical_prefix) so we can match orphan code-graph prefixes
+    // against them. `project_identities` is the unfiltered list;
+    // `affected_projects` is the legacy-cleanup subset.
+    let project_identities: Vec<(String, String, String)> = match db.list_projects() {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|row| {
+                let binding = db.get_project_codegraph_binding(&row.id).ok().flatten();
                 let prefix = binding
                     .map(|b| b.collection_prefix)
                     .unwrap_or_else(|| {
                         canonical_class_prefix(&row.name)
                             .unwrap_or_else(|_| sanitize_kg_collection(&row.name))
                     });
-                if prefix != LEGACY_CODEGRAPH_PREFIX {
-                    out.push(AffectedProject {
-                        project_id: row.id,
-                        name: row.name,
-                        current_prefix: prefix,
-                    });
-                }
-            }
-            out
-        }
+                (row.id, row.name, prefix)
+            })
+            .collect(),
         Err(_) => Vec::new(),
     };
 
-    let action_recommended = !collections.is_empty() && !affected_projects.is_empty();
+    let affected_projects: Vec<AffectedProject> = project_identities
+        .iter()
+        .filter(|(_id, _name, prefix)| prefix != LEGACY_CODEGRAPH_PREFIX)
+        .map(|(id, name, prefix)| AffectedProject {
+            project_id: id.clone(),
+            name: name.clone(),
+            current_prefix: prefix.clone(),
+        })
+        .collect();
+
+    // v0.2.15 (0.4): build orphan groups. For each orphan prefix found
+    // in Weaviate, attempt to attribute it to a known project via the
+    // case-insensitive normalised-name match. Prefixes that don't match
+    // any project are skipped (they may belong to a since-removed
+    // project or be unrelated — never auto-delete those without explicit
+    // user input via a different surface).
+    let mut orphan_groups: Vec<OrphanCollectionGroup> = Vec::new();
+    for (prefix, entries) in code_graph_by_prefix {
+        // Skip prefixes that exactly match SOME project's current
+        // canonical — those are the ACTIVE class set, not orphans.
+        if project_identities
+            .iter()
+            .any(|(_, _, current)| *current == prefix)
+        {
+            continue;
+        }
+        // Try to attribute by case-insensitive normalised-name match.
+        let normalised_prefix = normalise_prefix_for_match(&prefix);
+        let matched = project_identities.iter().find(|(_, name, _)| {
+            normalise_prefix_for_match(&canonical_class_prefix(name).unwrap_or_default())
+                == normalised_prefix
+                || normalise_prefix_for_match(&sanitize_kg_collection(name)) == normalised_prefix
+                || normalise_prefix_for_match(name) == normalised_prefix
+        });
+        let (matched_id, matched_name, current_prefix) = match matched {
+            Some((id, name, current)) => (id.clone(), name.clone(), current.clone()),
+            None => continue,  // no project owns this prefix → don't surface
+        };
+        let total: u32 = entries.iter().map(|e| e.object_count).sum();
+        orphan_groups.push(OrphanCollectionGroup {
+            prefix,
+            matched_project_id: matched_id,
+            matched_project_name: matched_name,
+            current_prefix,
+            collections: entries,
+            total_objects: total,
+        });
+    }
+
+    let action_recommended = (!collections.is_empty() && !affected_projects.is_empty())
+        || orphan_groups.iter().any(|g| g.total_objects > 0);
     Ok(LegacyCodegraphReport {
         collections,
         affected_projects,
+        orphan_groups,
         action_recommended,
     })
+}
+
+/// Split a Weaviate class name into `(prefix, suffix)` where suffix is
+/// one of the five canonical code-graph suffixes. Returns `None` for
+/// any name that isn't a code-graph class (KG / Development / other
+/// shapes fall through).
+fn split_codegraph_class_name(class_name: &str) -> Option<(&str, &str)> {
+    // Iterate suffixes longest-first to handle the `CodeAPI` ⊂ `CodeAPIWhatever`
+    // case if it ever arises (it doesn't today, but cheap insurance).
+    for suffix in CODE_GRAPH_SUFFIXES {
+        let needle = format!("_{}", suffix);
+        if let Some(stripped) = class_name.strip_suffix(&needle) {
+            return Some((stripped, suffix));
+        }
+    }
+    None
+}
+
+/// Normalise a prefix / project name for case-insensitive structural
+/// matching. Strips every non-alphanumeric and lowercases the result.
+/// `"VibeCoded Orchestrator"`, `"VibeCodedOrchestrator"`,
+/// `"vibecoded_orchestrator"`, `"VibeCoded_Orchestrator"`, and
+/// `"Vibecodedorchestrator"` all normalise to the same thing.
+fn normalise_prefix_for_match(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -725,8 +869,183 @@ pub async fn cleanup_legacy_codegraph_collections(
         }
     }
 
+    // v0.2.15 (0.4): post-delete verification. The Weaviate REST DELETE
+    // returns 200 even when the class persists due to internal
+    // schema-cache lag or a transient bug. Without verification the
+    // wizard's "N class(es) deleted" toast lies. Re-query the schema
+    // and move silently-surviving classes from `deleted` to `failed`.
+    if !deleted.is_empty() {
+        if let Ok(resp) = client.get(format!("{}/v1/schema", &base)).send().await {
+            if let Ok(schema) = resp.json::<serde_json::Value>().await {
+                let still_present: std::collections::HashSet<String> = schema
+                    .get("classes")
+                    .and_then(|c| c.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|c| {
+                                c.get("class").and_then(|v| v.as_str()).map(String::from)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let (still_deleted, survivors): (Vec<_>, Vec<_>) = deleted
+                    .into_iter()
+                    .partition(|cls| !still_present.contains(cls));
+                deleted = still_deleted;
+                for cls in survivors {
+                    failed.push(CleanupFailure {
+                        class: cls,
+                        error: "delete returned 200 but class still in schema \
+                                (possible Weaviate cache lag — retry the cleanup)"
+                            .to_string(),
+                    });
+                }
+            }
+        }
+    }
+
     let _ = db.audit(
         "codegraph_legacy_cleanup",
+        None,
+        None,
+        &serde_json::json!({
+            "deleted": deleted,
+            "failed_count": failed.len(),
+        }),
+    );
+
+    Ok(CleanupLegacyReport { deleted, failed })
+}
+
+// ─── v0.2.15 (0.4): orphan code-graph cleanup ────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct CleanupOrphanReq {
+    /// Caller MUST echo every class name back from
+    /// `list_legacy_codegraph_collections().orphan_groups[*].collections`
+    /// to prevent accidental deletion of unrelated classes. The wizard
+    /// presents per-group checkboxes; only the user-selected groups'
+    /// class lists end up here.
+    pub classes: Vec<String>,
+}
+
+/// Delete user-selected orphan code-graph classes. Same safety contract
+/// as `cleanup_legacy_codegraph_collections`: caller passes every class
+/// name explicitly, this command refuses to scan the schema itself.
+/// Validation differs: accepts ANY prefix (since orphans by definition
+/// have non-legacy prefixes), but still requires the suffix to be one
+/// of the five canonical code-graph suffixes — guards against
+/// accidentally deleting a KG or `_Development` class via this surface.
+///
+/// Post-delete verification mirrors the legacy cleanup (re-query schema
+/// to catch silent-partial-fails).
+#[command]
+pub async fn cleanup_orphan_codegraph_collections(
+    req: CleanupOrphanReq,
+    db: State<'_, Db>,
+    cfg: State<'_, LocalConfig>,
+) -> Result<CleanupLegacyReport, String> {
+    let base = resolve_weaviate_url(&cfg);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("http client: {}", e))?;
+
+    let mut deleted: Vec<String> = Vec::new();
+    let mut failed: Vec<CleanupFailure> = Vec::new();
+
+    for class in req.classes.iter() {
+        // Must end with a canonical code-graph suffix. Prefix is
+        // user-chosen (any valid Weaviate class name except the legacy
+        // one we already have a separate path for).
+        let (_, _) = match split_codegraph_class_name(class) {
+            Some(parts) => parts,
+            None => {
+                failed.push(CleanupFailure {
+                    class: class.clone(),
+                    error: format!(
+                        "refuses to delete '{}': not a code-graph class \
+                         (must end with _CodeModule/_CodeClass/_CodeFunction/\
+                         _CodeAPI/_CodeInteraction)",
+                        class
+                    ),
+                });
+                continue;
+            }
+        };
+        // Explicitly forbid the legacy prefix here — the user must use
+        // the legacy-cleanup surface for that, which audits separately.
+        if class.starts_with(&format!("{}_", LEGACY_CODEGRAPH_PREFIX)) {
+            failed.push(CleanupFailure {
+                class: class.clone(),
+                error: format!(
+                    "use cleanup_legacy_codegraph_collections for '{}_*' classes",
+                    LEGACY_CODEGRAPH_PREFIX
+                ),
+            });
+            continue;
+        }
+
+        let url = format!("{}/v1/schema/{}", &base, class);
+        match client.delete(&url).send().await {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    deleted.push(class.clone());
+                } else {
+                    let status = resp.status().as_u16();
+                    let body = resp.text().await.unwrap_or_default();
+                    failed.push(CleanupFailure {
+                        class: class.clone(),
+                        error: format!(
+                            "weaviate returned {}: {}",
+                            status,
+                            body.chars().take(200).collect::<String>()
+                        ),
+                    });
+                }
+            }
+            Err(e) => {
+                failed.push(CleanupFailure {
+                    class: class.clone(),
+                    error: format!("http: {}", e),
+                });
+            }
+        }
+    }
+
+    // Post-delete verification (same as legacy cleanup).
+    if !deleted.is_empty() {
+        if let Ok(resp) = client.get(format!("{}/v1/schema", &base)).send().await {
+            if let Ok(schema) = resp.json::<serde_json::Value>().await {
+                let still_present: std::collections::HashSet<String> = schema
+                    .get("classes")
+                    .and_then(|c| c.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|c| {
+                                c.get("class").and_then(|v| v.as_str()).map(String::from)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let (still_deleted, survivors): (Vec<_>, Vec<_>) = deleted
+                    .into_iter()
+                    .partition(|cls| !still_present.contains(cls));
+                deleted = still_deleted;
+                for cls in survivors {
+                    failed.push(CleanupFailure {
+                        class: cls,
+                        error: "delete returned 200 but class still in schema \
+                                (possible Weaviate cache lag — retry the cleanup)"
+                            .to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    let _ = db.audit(
+        "codegraph_orphan_cleanup",
         None,
         None,
         &serde_json::json!({
@@ -1417,5 +1736,83 @@ mod tests {
         assert!(validate_shared_kg_name("has-dash_KnowledgeGraph").is_err());
         let too_long = format!("{}_KnowledgeGraph", "F".repeat(95));
         assert!(validate_shared_kg_name(&too_long).is_err());
+    }
+
+    // ─── v0.2.15 (0.4): orphan-detection helpers ─────────────────────────
+
+    #[test]
+    fn split_codegraph_class_name_handles_each_suffix() {
+        for suffix in &["CodeModule", "CodeClass", "CodeFunction", "CodeAPI", "CodeInteraction"] {
+            let class = format!("MyProj_{}", suffix);
+            let (prefix, got_suffix) = split_codegraph_class_name(&class)
+                .unwrap_or_else(|| panic!("expected Some for {}", class));
+            assert_eq!(prefix, "MyProj");
+            assert_eq!(got_suffix, *suffix);
+        }
+    }
+
+    #[test]
+    fn split_codegraph_class_name_rejects_non_codegraph() {
+        // KG class — not a code-graph suffix.
+        assert!(split_codegraph_class_name("MyProj_KnowledgeGraph").is_none());
+        // Development class.
+        assert!(split_codegraph_class_name("MyProj_Development").is_none());
+        // Bare name.
+        assert!(split_codegraph_class_name("Foo").is_none());
+        // Empty.
+        assert!(split_codegraph_class_name("").is_none());
+    }
+
+    #[test]
+    fn split_codegraph_class_name_preserves_underscored_prefix() {
+        // SimRacing_AI's class name is SimRacing_AI_CodeFunction. The
+        // splitter must return the FULL underscored prefix, not just
+        // "AI" (which would be the wrong split if we used find('_')).
+        let (prefix, suffix) = split_codegraph_class_name("SimRacing_AI_CodeFunction")
+            .expect("must split correctly");
+        assert_eq!(prefix, "SimRacing_AI");
+        assert_eq!(suffix, "CodeFunction");
+    }
+
+    #[test]
+    fn normalise_prefix_for_match_collapses_case_and_separators() {
+        // All five forms a single project might have accumulated across
+        // VCO releases must normalise to the same string.
+        let canonical = normalise_prefix_for_match("VibeCodedOrchestrator");
+        assert_eq!(canonical, "vibecodedorchestrator");
+        assert_eq!(normalise_prefix_for_match("VibeCoded Orchestrator"), canonical);
+        assert_eq!(normalise_prefix_for_match("vibecoded_orchestrator"), canonical);
+        assert_eq!(normalise_prefix_for_match("VibeCoded_Orchestrator"), canonical);
+        assert_eq!(normalise_prefix_for_match("Vibecodedorchestrator"), canonical);
+        assert_eq!(normalise_prefix_for_match("vibecoded-orchestrator"), canonical);
+    }
+
+    #[test]
+    fn normalise_prefix_for_match_distinguishes_genuinely_different_names() {
+        // Ensure normalisation doesn't collapse different projects together.
+        assert_ne!(
+            normalise_prefix_for_match("SimRacing_AI"),
+            normalise_prefix_for_match("SD15")
+        );
+        assert_ne!(
+            normalise_prefix_for_match("VibeCodedOrchestrator"),
+            normalise_prefix_for_match("ClaudeOrchestrator")
+        );
+        // SimRacing_AI and SimRacingAI normalise the same (the
+        // underscore is informational only) — that's the intended
+        // tolerance for project-rename matching.
+        assert_eq!(
+            normalise_prefix_for_match("SimRacing_AI"),
+            normalise_prefix_for_match("SimRacingAI")
+        );
+    }
+
+    #[test]
+    fn normalise_prefix_for_match_handles_empty_and_unicode() {
+        assert_eq!(normalise_prefix_for_match(""), "");
+        // Non-ASCII chars get filtered out (no panics).
+        assert_eq!(normalise_prefix_for_match("étude"), "tude");
+        assert_eq!(normalise_prefix_for_match("___"), "");
+        assert_eq!(normalise_prefix_for_match("123abc"), "123abc");
     }
 }

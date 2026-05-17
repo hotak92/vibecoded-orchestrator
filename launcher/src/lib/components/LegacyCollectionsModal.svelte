@@ -28,6 +28,7 @@
     LegacyCodegraphReport,
     CleanupLegacyReport,
     AffectedProject,
+    OrphanCollectionGroup,
   } from '$lib/types/identity';
 
   let { onClose }: { onClose: () => void } = $props();
@@ -39,6 +40,13 @@
   let cleaningUp = $state(false);
   let cleanupReport = $state<CleanupLegacyReport | null>(null);
   let reanalyzeProgress = $state<{ done: number; total: number; failed: string[] } | null>(null);
+  // v0.2.15 (0.4): orphan-group cleanup state. Each entry in
+  // `selectedOrphanPrefixes` toggles inclusion of one group's classes
+  // in the next orphan-delete call.
+  let selectedOrphanPrefixes = $state<Set<string>>(new Set());
+  let orphanCleanupConfirmed = $state(false);
+  let orphanCleanupReport = $state<CleanupLegacyReport | null>(null);
+  let orphanCleaningUp = $state(false);
 
   async function load() {
     loading = true;
@@ -124,6 +132,63 @@
     return `${p.name}  —  current prefix: ${p.current_prefix}`;
   }
 
+  // v0.2.15 (0.4): orphan-group selection + cleanup. The user picks
+  // groups via checkboxes; the cleanup call collects every class from
+  // every selected group and sends it as one batched delete.
+  function toggleOrphanGroup(prefix: string) {
+    const next = new Set(selectedOrphanPrefixes);
+    if (next.has(prefix)) {
+      next.delete(prefix);
+    } else {
+      next.add(prefix);
+    }
+    selectedOrphanPrefixes = next;
+  }
+
+  function selectedOrphanClasses(): string[] {
+    if (!report) return [];
+    const out: string[] = [];
+    for (const group of report.orphan_groups) {
+      if (selectedOrphanPrefixes.has(group.prefix)) {
+        for (const c of group.collections) out.push(c.class);
+      }
+    }
+    return out;
+  }
+
+  async function cleanupOrphans() {
+    if (!report || !orphanCleanupConfirmed) return;
+    const classes = selectedOrphanClasses();
+    if (classes.length === 0) {
+      toast.error('Select at least one orphan group before deleting.');
+      return;
+    }
+    orphanCleaningUp = true;
+    try {
+      orphanCleanupReport = await invoke<CleanupLegacyReport>(
+        'cleanup_orphan_codegraph_collections',
+        { req: { classes } },
+      );
+      if (orphanCleanupReport.failed.length === 0) {
+        toast.success(
+          `Deleted ${orphanCleanupReport.deleted.length} orphan class(es).`,
+        );
+      } else {
+        toast.error(
+          `Orphan cleanup partial: ${orphanCleanupReport.deleted.length} deleted, ${orphanCleanupReport.failed.length} failed.`,
+        );
+      }
+      selectedOrphanPrefixes = new Set();
+      orphanCleanupConfirmed = false;
+      // Re-detect so the user sees fresh state.
+      await load();
+    } catch (e) {
+      toast.error(e);
+    } finally {
+      orphanCleaningUp = false;
+    }
+  }
+
   onMount(load);
 </script>
 
@@ -191,6 +256,74 @@
           </p>
         {/if}
       </section>
+
+      <!-- v0.2.15 (0.4): orphan code-graph groups -->
+      {#if report.orphan_groups.length > 0}
+        <section class="legacy-section">
+          <h4>Orphan code-graph collections (other naming generations)</h4>
+          <p class="legacy-hint">
+            Older VCO releases used different project-name → prefix sanitizers,
+            so long-lived projects (especially the orchestrator root) may have
+            multiple sets of code-graph classes case-insensitively colliding
+            with each other. Below is one group per non-canonical prefix
+            attributed to a known project. Pick the groups you want to
+            delete; <strong>nothing is auto-deleted</strong>.
+          </p>
+          <ul class="legacy-list">
+            {#each report.orphan_groups as group (group.prefix)}
+              <li class="legacy-orphan">
+                <label class="legacy-orphan-label">
+                  <input
+                    type="checkbox"
+                    checked={selectedOrphanPrefixes.has(group.prefix)}
+                    onchange={() => toggleOrphanGroup(group.prefix)}
+                  />
+                  <div class="legacy-orphan-info">
+                    <div class="legacy-orphan-head">
+                      <code>{group.prefix}_*</code>
+                      <span class="legacy-orphan-arrow">→</span>
+                      <code class="legacy-orphan-current">{group.current_prefix}</code>
+                      <span class="legacy-orphan-project">({group.matched_project_name})</span>
+                    </div>
+                    <div class="legacy-orphan-meta">
+                      {group.collections.length} class{group.collections.length === 1 ? '' : 'es'},
+                      {group.total_objects} object{group.total_objects === 1 ? '' : 's'} total
+                    </div>
+                  </div>
+                </label>
+              </li>
+            {/each}
+          </ul>
+          {#if selectedOrphanPrefixes.size > 0}
+            <p class="legacy-cleanup-warn">
+              <strong>Destructive.</strong> Will delete
+              {selectedOrphanClasses().length} class(es) across
+              {selectedOrphanPrefixes.size} group(s). Backend restricts the
+              delete to the five code-graph suffixes only — KG, Development,
+              and other class shapes are NEVER touched.
+            </p>
+            <label class="legacy-confirm">
+              <input type="checkbox" bind:checked={orphanCleanupConfirmed} />
+              <span>I understand the selected orphan code-graph data will be permanently deleted.</span>
+            </label>
+          {/if}
+        </section>
+      {/if}
+
+      <!-- Orphan cleanup report -->
+      {#if orphanCleanupReport}
+        <section class="legacy-section">
+          <h4>Orphan cleanup result</h4>
+          <p>{orphanCleanupReport.deleted.length} class(es) deleted.</p>
+          {#if orphanCleanupReport.failed.length > 0}
+            <ul class="legacy-list legacy-failed">
+              {#each orphanCleanupReport.failed as f (f.class)}
+                <li><code>{f.class}</code>: {f.error}</li>
+              {/each}
+            </ul>
+          {/if}
+        </section>
+      {/if}
 
       <!-- Re-analyze progress -->
       {#if reanalyzeProgress}
@@ -263,6 +396,15 @@
           onclick={cleanupLegacy}
         >
           {cleaningUp ? 'Deleting…' : `Delete ${report.collections.length} stale class${report.collections.length === 1 ? '' : 'es'}`}
+        </button>
+      {/if}
+      {#if report && selectedOrphanPrefixes.size > 0}
+        <button
+          class="legacy-btn legacy-btn-danger"
+          disabled={!orphanCleanupConfirmed || orphanCleaningUp || cleaningUp || reanalyzing}
+          onclick={cleanupOrphans}
+        >
+          {orphanCleaningUp ? 'Deleting…' : `Delete ${selectedOrphanClasses().length} selected orphan class${selectedOrphanClasses().length === 1 ? '' : 'es'}`}
         </button>
       {/if}
     </div>
@@ -419,5 +561,50 @@
   }
   .legacy-btn-danger:hover:not(:disabled) {
     background: rgba(245,80,80,0.28);
+  }
+  /* v0.2.15 (0.4): orphan group rows. Layout: checkbox + two-line info. */
+  .legacy-orphan {
+    align-items: flex-start;
+    padding: 8px 10px;
+  }
+  .legacy-orphan-label {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    cursor: pointer;
+    width: 100%;
+  }
+  .legacy-orphan-label input {
+    margin-top: 3px;
+    width: auto;
+    flex-shrink: 0;
+  }
+  .legacy-orphan-info {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    min-width: 0;
+    flex: 1;
+  }
+  .legacy-orphan-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+    font-size: 12px;
+    color: #ddd;
+  }
+  .legacy-orphan-arrow { color: #777; }
+  .legacy-orphan-current {
+    color: #aaffaa;
+    background: rgba(120,255,140,0.08);
+  }
+  .legacy-orphan-project {
+    color: #888;
+    font-size: 11px;
+  }
+  .legacy-orphan-meta {
+    color: #888;
+    font-size: 11px;
   }
 </style>
