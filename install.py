@@ -1561,50 +1561,88 @@ def _build_legacy_volume_probes() -> dict[str, tuple[str, ...]]:
     ``weaviate_claude`` / ``ollama_claude`` paths (maintainer-machine
     leak — see vco_lib/containers.py).
 
-    Probe path forms:
-      * ``~/podman_volumes/<full-container-name>`` — recovers
-        bind-mount layouts using the literal container name as the
-        directory. Only generated for full container names that
-        would naturally form a bind-mount root (i.e. the
-        ``_claude``-suffixed legacy and the ``vct_code_embed``
-        transitional name); NOT for bare service-token aliases like
-        ``weaviate`` / ``ollama`` / ``code_embed`` because those
-        conventionally bind-mount one level deeper (e.g.
-        ``~/podman_volumes/ollama/models``) and would create
-        false positives at the parent level.
+    Probe path forms (all routed through ``Path.expanduser()`` /
+    ``%LOCALAPPDATA%`` / ``%USERPROFILE%`` expansion so they work on
+    Linux + macOS + Windows):
+      * ``~/podman_volumes/<full-container-name>`` (POSIX) /
+        ``%USERPROFILE%\\podman_volumes\\<full-container-name>``
+        (Windows) — recovers bind-mount layouts using the literal
+        container name as the directory. Only generated for full
+        container names that would naturally form a bind-mount root
+        (i.e. the ``_claude``-suffixed legacy and the
+        ``vct_code_embed`` transitional name); NOT for bare
+        service-token aliases like ``weaviate`` / ``ollama`` /
+        ``code_embed`` because those conventionally bind-mount one
+        level deeper (e.g. ``~/podman_volumes/ollama/models``).
       * ``~/.local/share/containers/storage/volumes/<alias>/_data`` —
-        rootless named-volume mountpoint pattern. Generated for every
-        alias, since named volumes do use the alias literally.
+        rootless POSIX named-volume mountpoint pattern. Generated for
+        every alias.
+      * ``%LOCALAPPDATA%\\containers\\storage\\volumes\\<alias>\\_data`` —
+        rootful Windows Podman Desktop / Podman-on-Windows volume
+        mountpoint pattern. Generated for every alias.
+      * ``%USERPROFILE%\\AppData\\Roaming\\Docker\\volumes\\<alias>\\_data`` —
+        Docker Desktop volume root on Windows.
       * Service-specific shared bind paths kept explicit per service
         (most-used layouts).
+
+    Returns tuples of path strings with shell-style ``~/``-relative
+    POSIX heads OR Windows ``%VAR%``-style heads. Callers are expected
+    to pass them through ``_expand_path_token()`` (defined below) which
+    handles both forms transparently.
     """
     from vco_lib.containers import HISTORICAL_ALIASES, canonical_name
 
     # Service-specific "well-known shared paths" the user may have set
     # up out-of-band (NOT derived from container names). Kept explicit
-    # so they're easy to audit / extend.
+    # so they're easy to audit / extend. POSIX paths first, then
+    # Windows analogues — both forms are tried by the probe loop.
     shared_paths: dict[str, tuple[str, ...]] = {
-        "ollama": ("~/podman_volumes/ollama/models",),
-        "code_embed": ("~/podman_volumes/code_embed_cache",),
-        "weaviate": (),
+        "ollama": (
+            "~/podman_volumes/ollama/models",
+            "%USERPROFILE%\\podman_volumes\\ollama\\models",
+            "%USERPROFILE%\\.ollama\\models",  # Ollama-on-Windows default
+        ),
+        "code_embed": (
+            "~/podman_volumes/code_embed_cache",
+            "%USERPROFILE%\\podman_volumes\\code_embed_cache",
+        ),
+        "weaviate": (
+            # No bare host shared path historically — only named volumes.
+        ),
     }
 
     # Aliases that look like distinct container names (vs. bare service
-    # tokens that conventionally bind-mount one level deeper). These
-    # are the names where `~/podman_volumes/<name>` is the natural
-    # bind-mount root.
+    # tokens that conventionally bind-mount one level deeper).
     def _alias_is_container_shape(alias: str) -> bool:
         return alias.endswith("_claude") or alias.startswith(("vct_", "vco_"))
+
+    # Mountpoint root templates per OS family. Use a single `{alias}`
+    # placeholder; the loop below substitutes.
+    posix_named_volume_root = "~/.local/share/containers/storage/volumes/{alias}/_data"
+    windows_podman_volume_root = (
+        "%LOCALAPPDATA%\\containers\\storage\\volumes\\{alias}\\_data"
+    )
+    # Docker Desktop on Windows materialises named volumes inside its
+    # Hyper-V VHD; the bind-mountable path under the user profile is
+    # available only when "Use the WSL 2 based engine" is on AND
+    # "Use containerd for pulling and storing images" is OFF. Probing
+    # is cheap: missing dirs just fall through.
+    windows_docker_volume_root = (
+        "%USERPROFILE%\\AppData\\Local\\Docker\\wsl\\data\\volumes\\{alias}\\_data"
+    )
 
     out: dict[str, tuple[str, ...]] = {}
     for service in ("ollama", "code_embed", "weaviate"):
         paths: list[str] = list(shared_paths.get(service, ()))
         for alias in HISTORICAL_ALIASES[service]:
             if _alias_is_container_shape(alias):
+                # Bind-mount-root forms — POSIX + Windows.
                 paths.append(f"~/podman_volumes/{alias}")
-            paths.append(
-                f"~/.local/share/containers/storage/volumes/{alias}/_data"
-            )
+                paths.append(f"%USERPROFILE%\\podman_volumes\\{alias}")
+            # Named-volume mountpoints for every alias on every OS.
+            paths.append(posix_named_volume_root.format(alias=alias))
+            paths.append(windows_podman_volume_root.format(alias=alias))
+            paths.append(windows_docker_volume_root.format(alias=alias))
         # Always probe the canonical compose volume mountpoint last
         # (named volumes the current compose creates).
         canon_volume = {
@@ -1612,12 +1650,11 @@ def _build_legacy_volume_probes() -> dict[str, tuple[str, ...]]:
             "code_embed": "code_embed_cache",
             "weaviate": "weaviate_data",
         }[service]
-        paths.append(
-            f"~/.local/share/containers/storage/volumes/{canon_volume}/_data"
-        )
+        paths.append(posix_named_volume_root.format(alias=canon_volume))
+        paths.append(windows_podman_volume_root.format(alias=canon_volume))
+        paths.append(windows_docker_volume_root.format(alias=canon_volume))
         # canonical_name() imported above only to surface a hard error
-        # if the registry is malformed at import time (fail fast vs at
-        # first probe).
+        # if the registry is malformed at import time.
         _ = canonical_name(service)
         # Deduplicate preserving order.
         seen: set[str] = set()
@@ -1631,6 +1668,34 @@ def _build_legacy_volume_probes() -> dict[str, tuple[str, ...]]:
     return out
 
 
+def _expand_path_token(raw: str) -> Optional[Path]:
+    """Expand a probe-path token to an absolute ``Path``, handling both
+    POSIX ``~/...`` heads and Windows ``%VAR%`` heads.
+
+    Returns ``None`` if expansion can't produce a usable path
+    (e.g. a Windows-style token on POSIX with no matching env var, or
+    vice versa). The caller treats ``None`` as "not applicable on this
+    host", same as a missing directory.
+    """
+    if not raw:
+        return None
+    # Windows-style %VAR% expansion first — os.path.expandvars is a
+    # no-op on POSIX for unknown vars (it leaves the literal in place),
+    # which would then fail Path.is_dir() naturally.
+    expanded = os.path.expandvars(raw)
+    if "%" in expanded:
+        # Unresolved %VAR% means this token is Windows-specific and we're
+        # not on Windows (or the variable simply isn't set). Skip.
+        return None
+    # POSIX tilde expansion. Path.expanduser handles "~/..." but NOT
+    # mid-string "~user/..." with raw backslashes; we only generate the
+    # leading-tilde form so we're safe.
+    try:
+        return Path(expanded).expanduser()
+    except (RuntimeError, OSError):
+        return None
+
+
 _LEGACY_VOLUME_PROBES: dict[str, tuple[str, ...]] = _build_legacy_volume_probes()
 
 
@@ -1640,19 +1705,20 @@ def _detect_legacy_volume_paths() -> dict[str, str]:
     Returns a `{service: absolute_path}` map for every probe that resolves
     to an existing non-empty directory. Empty map when nothing is found.
 
-    Windows hosts typically have nothing under `~/podman_volumes/` (Docker
-    Desktop / Podman Desktop manage volumes via Hyper-V VHDs), so this
-    function naturally returns `{}` on Windows and the install proceeds
-    with the silent default. macOS hosts that ran a previous orchestrator
-    via Podman Desktop may have entries under `~/.local/share/containers/`.
+    Cross-OS: probes include both POSIX (``~/...``,
+    ``~/.local/share/containers/...``) and Windows
+    (``%LOCALAPPDATA%\\containers\\...``,
+    ``%USERPROFILE%\\AppData\\Local\\Docker\\wsl\\data\\volumes\\...``)
+    forms. `_expand_path_token` skips Windows-style tokens on POSIX (and
+    vice versa) so non-applicable probes silently fall through.
     """
     detected: dict[str, str] = {}
     for service, candidates in _LEGACY_VOLUME_PROBES.items():
         for raw in candidates:
-            try:
-                resolved = Path(raw).expanduser()
-            except (RuntimeError, OSError):
-                # `Path.expanduser()` raises on a hostile $HOME — skip.
+            resolved = _expand_path_token(raw)
+            if resolved is None:
+                # Token not applicable on this OS (Windows-style on POSIX
+                # or vice versa) — skip silently.
                 continue
             if not resolved.is_dir():
                 continue
@@ -2483,23 +2549,28 @@ def main() -> int:
             # via podman before emitting a deferral.
             _weaviate_down_msg = str(_weaviate_err)
             _restarted = False
-            # Discover the actual Weaviate container name on this host.
-            # v0.2.15: stopped hardcoding `weaviate_claude` — that name
-            # was a maintainer-machine leak; real VCO installs use
-            # `vco_weaviate`, with `weaviate` (v0.1.x) and `weaviate_claude`
-            # (pre-VCO maintainer era) as deeper fallbacks. See
-            # vco_lib/containers.py.
+            # Discover the actual Weaviate container name + runtime on
+            # this host. v0.2.15: stopped hardcoding `weaviate_claude`
+            # (maintainer-machine leak) AND stopped hardcoding `podman`
+            # in the recovery hints (docker-only users got useless
+            # advice). Runtime honors VCT_CONTAINER_RUNTIME with
+            # podman→docker fallback per the install.py contract.
             from vco_lib.containers import (
                 all_known_names as _all_known_names,
                 find_existing_container as _find_existing_container,
             )
+            _self_heal_runtime = (
+                _detect_container_runtime()
+                or _runtime_preference_from_env()
+                or "podman"  # last-resort label when neither is on PATH
+            )
             _weaviate_container = (
-                _find_existing_container("weaviate")
+                _find_existing_container("weaviate", runtime=_self_heal_runtime)
                 or "vco_weaviate"  # nothing on host yet — name the canonical
             )
             try:
                 subprocess.run(
-                    ["podman", "start", _weaviate_container],
+                    [_self_heal_runtime, "start", _weaviate_container],
                     capture_output=True, timeout=30,
                 )
                 import time as _time
@@ -2516,7 +2587,7 @@ def main() -> int:
                 # candidates so the user can try whichever they have.
                 _candidates_hint = (
                     _weaviate_container
-                    if _find_existing_container("weaviate")
+                    if _find_existing_container("weaviate", runtime=_self_heal_runtime)
                     else " | ".join(_all_known_names("weaviate"))
                 )
                 print(
@@ -2531,14 +2602,14 @@ def main() -> int:
                         detected=(
                             f"Weaviate refused connection during --update "
                             f"({_weaviate_down_msg}). Auto-restart via "
-                            f"`podman start {_weaviate_container}` also failed."
+                            f"`{_self_heal_runtime} start {_weaviate_container}` also failed."
                         ),
                         why_deferred=(
                             "Collection bootstrap and schema migration require "
                             "a live Weaviate. Cannot proceed without it."
                         ),
                         command_to_apply=(
-                            f"podman start {_candidates_hint} && "
+                            f"{_self_heal_runtime} start {_candidates_hint} && "
                             "python install.py --update --skip-rebuild-prompt"
                         ),
                         severity="critical",
@@ -2570,7 +2641,7 @@ def main() -> int:
                                 "the next install.py --update run."
                             ),
                             command_to_apply=(
-                                f"podman start {_candidates_hint} && "
+                                f"{_self_heal_runtime} start {_candidates_hint} && "
                                 "python install.py --update "
                                 "--skip-rebuild-prompt"
                             ),
@@ -3025,22 +3096,31 @@ def _apply_deferred_entries(
             current_run_report.add_entry(entry)
 
         elif cid == "weaviate_unreachable_at_update":
-            # v0.2.15: discover the actual container name on this host
-            # instead of hardcoding `weaviate_claude` (maintainer-machine
-            # leak — see vco_lib/containers.py).
+            # v0.2.15: discover the actual container name + runtime on
+            # this host instead of hardcoding `weaviate_claude` +
+            # `podman` (both maintainer-machine assumptions). See
+            # vco_lib/containers.py for the rename rationale + the
+            # _detect_container_runtime / _runtime_preference_from_env
+            # helpers above for the runtime contract.
             from vco_lib.containers import (
                 find_existing_container as _find_existing_container,
             )
+            _apply_runtime = (
+                _detect_container_runtime()
+                or _runtime_preference_from_env()
+                or "podman"
+            )
             _weav_container = (
-                _find_existing_container("weaviate") or "vco_weaviate"
+                _find_existing_container("weaviate", runtime=_apply_runtime)
+                or "vco_weaviate"
             )
             print(
-                f"  [try]  {cid}: attempting podman start "
+                f"  [try]  {cid}: attempting {_apply_runtime} start "
                 f"{_weav_container} ..."
             )
             try:
                 subprocess.run(
-                    ["podman", "start", _weav_container],
+                    [_apply_runtime, "start", _weav_container],
                     capture_output=True, timeout=30,
                 )
                 import time as _t
@@ -4108,7 +4188,7 @@ def _print_system_info(sysinfo: SystemInfo) -> None:
 
 
 def _find_lean_ctx_binary() -> str | None:
-    """Locate lean-ctx beyond PATH.
+    """Locate lean-ctx beyond PATH (cross-OS).
 
     `shutil.which` only checks PATH, so users who installed lean-ctx via
     `cargo install lean-ctx` (lands at ~/.cargo/bin) but whose shell PATH
@@ -4117,22 +4197,54 @@ def _find_lean_ctx_binary() -> str | None:
     it yet) saw 'not installed' even though the binary is right there.
     Mirrors the known-binary-path probe pattern in
     post-install-launcher.sh's _ensure_path_for_tool helper.
+
+    Cross-OS:
+      * Linux/macOS: probes the cargo + brew + standard system paths.
+      * Windows: probes the cargo install dir + scoop/chocolatey shims.
+        Tries both ``lean-ctx`` and ``lean-ctx.exe`` since Windows
+        cargo-installed binaries get the ``.exe`` suffix.
     """
     on_path = shutil.which("lean-ctx")
     if on_path:
         return on_path
-    candidates = [
-        Path.home() / ".cargo" / "bin" / "lean-ctx",
-        Path.home() / ".local" / "bin" / "lean-ctx",
-        Path("/usr/local/bin/lean-ctx"),
-        Path("/usr/bin/lean-ctx"),
-        # Homebrew on Apple Silicon vs Intel macOS:
-        Path("/opt/homebrew/bin/lean-ctx"),
-        Path("/home/linuxbrew/.linuxbrew/bin/lean-ctx"),
-    ]
+
+    is_windows = sys.platform == "win32"
+    home = Path.home()
+
+    # Per-OS candidate list. Both forms are tried so a Linux user with a
+    # weird WSL2 setup or a Windows user running this script under WSL2
+    # still gets found.
+    if is_windows:
+        candidates: list[Path] = [
+            home / ".cargo" / "bin" / "lean-ctx.exe",
+            home / "scoop" / "shims" / "lean-ctx.exe",
+            home / "scoop" / "apps" / "lean-ctx" / "current" / "lean-ctx.exe",
+            Path(os.environ.get("ProgramData", r"C:\ProgramData"))
+            / "chocolatey" / "bin" / "lean-ctx.exe",
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+            / "lean-ctx" / "lean-ctx.exe",
+        ]
+    else:
+        candidates = [
+            home / ".cargo" / "bin" / "lean-ctx",
+            home / ".local" / "bin" / "lean-ctx",
+            Path("/usr/local/bin/lean-ctx"),
+            Path("/usr/bin/lean-ctx"),
+            # Homebrew on Apple Silicon vs Intel macOS:
+            Path("/opt/homebrew/bin/lean-ctx"),
+            Path("/home/linuxbrew/.linuxbrew/bin/lean-ctx"),
+        ]
+
     for cand in candidates:
-        if cand.is_file() and os.access(cand, os.X_OK):
-            return str(cand)
+        try:
+            # os.access(..., X_OK) is meaningful on POSIX. On Windows
+            # there is no executable bit; is_file() is the relevant check.
+            if cand.is_file() and (is_windows or os.access(cand, os.X_OK)):
+                return str(cand)
+        except OSError:
+            # Hostile path (mount unavailable, permission denied at stat
+            # time) — keep probing the rest.
+            continue
     return None
 
 
