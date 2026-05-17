@@ -2341,6 +2341,14 @@ pub async fn update_orchestrator(
     cmd.args(["install.py", "--update"])
         .stdin(std::process::Stdio::null())
         .current_dir(&install_path);
+    // v0.2.15 (Agent D): expose the running launcher's PID to install.py
+    // so _refresh_dist_binary_after_rebuild can include it in the
+    // launcher_restart_required deferral message ("running launcher
+    // PID: 12345"). install.py reads from VCT_LAUNCHER_PID; absence is
+    // a soft fallback (the deferral still works, just without the PID
+    // hint). Set even when we don't yet know we'll trigger a binary
+    // swap because the swap detection happens inside install.py.
+    cmd.env("VCT_LAUNCHER_PID", std::process::id().to_string());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
