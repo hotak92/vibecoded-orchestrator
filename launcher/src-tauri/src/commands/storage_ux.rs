@@ -968,11 +968,27 @@ pub fn set_storage_config_from_cli(
 mod cli_helper_tests {
     use super::*;
 
+    // v0.2.15 (0.2): the helper uses the PROCESS-GLOBAL env var
+    // VCT_STATE_DIR to redirect writes. Cargo runs each test in its
+    // own thread within the SAME process, so concurrent calls would
+    // stomp on each other's env var even with per-thread tempdirs.
+    // A process-wide Mutex serialises test entry — the test bodies
+    // themselves still run quickly so this doesn't slow the suite
+    // meaningfully. The Uuid-based tempdir name is kept for defence
+    // in depth + clearer test-debug paths in panic messages (each
+    // run prints a distinct path).
+    use std::sync::Mutex;
+    static STATE_DIR_LOCK: Mutex<()> = Mutex::new(());
+
     fn with_state_dir<F: FnOnce(&Path)>(f: F) {
-        // Isolate ~/.vct/ writes per test.
+        // Take the lock for the WHOLE function so no other test can
+        // observe the env var mid-setup or mid-teardown. Poisoning is
+        // benign here (another test panicked while holding the lock):
+        // tear down the env regardless and continue.
+        let _guard = STATE_DIR_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "vct-pr28-{}",
-            std::process::id(),
+            uuid::Uuid::new_v4(),
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

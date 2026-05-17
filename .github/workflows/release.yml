@@ -637,6 +637,28 @@ jobs:
       && github.event.inputs.skip_dist_commit != 'true'
 
     steps:
+      # v0.2.15 (0.3): early visibility on missing DIST_COMMIT_TOKEN.
+      # The auto-commit step would otherwise run all the way through
+      # build + artifact download + diff and only fail at the final
+      # `git push` with a 403. By probing the secret presence FIRST we
+      # save ~5 minutes of CI work + leave a clear marker for
+      # maintainers in the job log.
+      - name: Check DIST_COMMIT_TOKEN presence
+        run: |
+          if [ -z "${{ secrets.DIST_COMMIT_TOKEN }}" ]; then
+            echo "::warning::DIST_COMMIT_TOKEN secret is not set on this repo."
+            echo "::warning::The auto-commit step will fall back to GITHUB_TOKEN and 403"
+            echo "::warning::against branch protection. Either:"
+            echo "::warning::  (a) Set the secret per docs/MAINTAINER_GUIDE.md Option B, OR"
+            echo "::warning::  (b) Manually commit binaries post-release via the recipe in"
+            echo "::warning::      docs/MAINTAINER_GUIDE.md 'Manual binary commit recipe'."
+            echo "missing=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "DIST_COMMIT_TOKEN is set — auto-commit will use it."
+            echo "missing=false" >> "$GITHUB_OUTPUT"
+          fi
+        id: token_check
+
       - uses: actions/checkout@v6
         with:
           # Fetch full history so we can check byte-equality before committing.
@@ -646,7 +668,9 @@ jobs:
           # branch-protection on user-owned repos where Integration-type
           # bypass_actors do not apply. Falls back to GITHUB_TOKEN if the
           # secret is not set — that path will 403 against a protected
-          # branch but works against unprotected ones.
+          # branch but works against unprotected ones. See the
+          # `token_check` step above for visibility on which token is
+          # being used.
           token: ${{ secrets.DIST_COMMIT_TOKEN || secrets.GITHUB_TOKEN }}
 
       # Download all three OS launcher binaries produced by the build matrix.
