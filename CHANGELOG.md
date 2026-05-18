@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`fix(release)` commit-dist-binaries race-tolerant push**: the
+  job now checks out `main` (not the tag's pre-squash commit) and
+  refetches + rebases before pushing. Resolves the non-fast-forward
+  push rejection seen on v0.2.16 release run 26045579108, where PR
+  #245's squash-merge left the tag's commit on a divergent ancestry
+  even though its tree was identical to the merge commit on main.
+  Also handles the rare race where main advances during the
+  15-20 min build matrix. Anchors expected for v0.2.17 to land
+  auto-binary-commit end-to-end without manual fallback.
+
 ## [0.2.16] — 2026-05-18
 
 ### Fixed
