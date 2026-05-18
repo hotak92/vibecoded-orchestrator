@@ -8997,18 +8997,29 @@ def _refresh_dist_binary_after_rebuild(
         / "release"
         / "vct-launcher-temp"
     )
-    # A3: mutually-exclusive routing. If the cargo-output path is
-    # going to run (src exists), it will emit the deferral itself
-    # after the swap. Skip the git-pull-case helper here. If src
-    # doesn't exist, the cargo path returns None below — the git-
-    # pull helper is the ONLY emit source.
+    # v0.2.18 (plan 0.0): run the git-pull-case helper unconditionally.
+    # Earlier v0.2.17 logic used `if not src.is_file()` as a routing
+    # gate, on the assumption that "src exists ⇒ cargo path will emit
+    # the deferral itself". That assumption is false — the cargo path
+    # silently returns None when `src_mtime <= dist_mtime` (Gate 2 a
+    # few lines below), so a stale `target/release/vct-launcher-temp`
+    # from a prior local build deflected the routing AND the cargo
+    # path then bailed without emitting. Net effect: end-users with
+    # any cargo artifact on disk lost the launcher_restart_required
+    # deferral after a git-pull update — the W4 banner stayed silent
+    # and the running PID continued to execute the old binary.
+    #
+    # Safe to run unconditionally: the helper short-circuits on
+    # `source_version == last_installed_version` (line 8862), so once
+    # the cargo path has actually swapped + bumped the manifest, a
+    # subsequent helper call is a no-op.
+    if not auto_restart_handled_externally:
+        _maybe_emit_running_stale_deferral(
+            install_root,
+            dist_path=dist_path,
+            deferral_report=deferral_report,
+        )
     if not src.is_file():
-        if not auto_restart_handled_externally:
-            _maybe_emit_running_stale_deferral(
-                install_root,
-                dist_path=dist_path,
-                deferral_report=deferral_report,
-            )
         return None
 
     # subdir/fname/dist_path already resolved at the top of this
