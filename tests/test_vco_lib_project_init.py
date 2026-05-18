@@ -241,13 +241,40 @@ class CliEntryPointTests(unittest.TestCase):
 class SchemaDefinitionTests(unittest.TestCase):
     """Schema invariants required by detect_kg_schema_drift."""
 
-    def test_kg_class_has_three_named_vectors(self):
+    def test_kg_class_has_legacy_v0217_named_vectors(self):
+        """Legacy v0.2.17 trio must remain present in the KG definition.
+
+        v0.2.18 adds 2 more slots on top (arctic2_embed +
+        openai_text_embed) but the legacy trio stays — that's the
+        data-preservation invariant. Tested separately at
+        `test_kg_class_has_v0218_named_vectors` below.
+        """
         schema = project_init.kg_class_definition("Foo")
         vec_config = schema["vectorConfig"]
         self.assertIn("qwen3_embed", vec_config)
         self.assertIn("ollama_embed", vec_config)
         self.assertIn("openai_embed", vec_config)
         for slot in ("qwen3_embed", "ollama_embed", "openai_embed"):
+            self.assertEqual(vec_config[slot]["vectorIndexType"], "hnsw")
+
+    def test_kg_class_has_v0218_named_vectors(self):
+        """v0.2.18: KG class adds arctic2_embed + openai_text_embed to
+        the legacy v0.2.17 trio. See `vco_lib.weaviate_schema` for the
+        full catalog + rationale.
+        """
+        schema = project_init.kg_class_definition("Foo")
+        vec_config = schema["vectorConfig"]
+        self.assertEqual(
+            set(vec_config.keys()),
+            {
+                "qwen3_embed",
+                "ollama_embed",
+                "openai_embed",
+                "arctic2_embed",
+                "openai_text_embed",
+            },
+        )
+        for slot in vec_config:
             self.assertEqual(vec_config[slot]["vectorIndexType"], "hnsw")
 
     def test_kg_class_has_index_null_state(self):
@@ -260,12 +287,26 @@ class SchemaDefinitionTests(unittest.TestCase):
             {"indexNullState": True},
         )
 
-    def test_development_class_has_three_named_vectors(self):
+    def test_development_class_has_v0218_named_vectors(self):
+        """v0.2.18: Dev (and KG) class definitions ship with the 5-slot
+        catalog from `vco_lib.weaviate_schema.KG_NAMED_VECTORS`.
+
+        Pre-v0.2.18 this was 3 slots (qwen3 + ollama + openai). v0.2.18
+        retains the 3 legacy slots for data-preservation and adds
+        arctic2_embed + openai_text_embed for the new EmbeddingService
+        targets.
+        """
         schema = project_init.development_class_definition("FooDev")
         vec_config = schema["vectorConfig"]
         self.assertEqual(
             set(vec_config.keys()),
-            {"qwen3_embed", "ollama_embed", "openai_embed"},
+            {
+                "qwen3_embed",
+                "ollama_embed",
+                "openai_embed",
+                "arctic2_embed",
+                "openai_text_embed",
+            },
         )
 
     def test_development_class_has_index_null_state(self):
@@ -388,9 +429,18 @@ class SchemaIncompatibleTests(unittest.TestCase):
         self.assertIn("named-vector mismatch", reason)
         self.assertIn("openai_embed", reason)
 
-    def test_extra_named_vector_slot_is_incompatible(self):
-        # User added a slot we don't know about — still incompatible
-        # because sync_knowledge_graph.py only knows the canonical 3.
+    def test_extra_named_vector_slot_is_tolerated_v0218(self):
+        """v0.2.18: extra slots in `actual` no longer flag as incompatible.
+
+        Pre-v0.2.18 the rule was "any slot-set mismatch (missing OR
+        extra) -> REGEN". v0.2.18 narrows this to "missing CORE
+        legacy-v0.2.17 slots -> REGEN; extras are tolerated".
+
+        Rationale: data preservation > schema strictness. A future
+        catalog rev that drops legacy slots from the target shouldn't
+        retroactively flag every existing collection as needing a
+        destructive rebuild.
+        """
         actual = self._at_target()
         actual["vectorConfig"]["snowflake_legacy"] = {
             "vectorizer": {"none": {}}, "vectorIndexType": "hnsw",
@@ -398,8 +448,8 @@ class SchemaIncompatibleTests(unittest.TestCase):
         incompatible, reason = project_init._schema_incompatible(
             actual, project_init.kg_class_definition, "ClaudeKnowledgeGraph",
         )
-        self.assertTrue(incompatible)
-        self.assertIn("extra slots", reason)
+        # No longer flagged: extra slots are benign in v0.2.18.
+        self.assertFalse(incompatible, msg=f"unexpected REGEN: {reason}")
 
     def test_missing_index_null_state_is_incompatible(self):
         actual = self._at_target()

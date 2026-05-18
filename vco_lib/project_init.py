@@ -189,9 +189,17 @@ def _derive_project_dev_name(project_root: Path) -> str:
 
 
 def named_vector_config() -> dict:
-    """Three named-vector slots: qwen3_embed (active default, 1024-dim),
-    ollama_embed (legacy snowflake-arctic-embed2, 1024-dim, kept for back-
-    compat), and openai_embed (1536-dim, for users who set OPENAI_API_KEY).
+    """KG-shaped multi-slot named-vector config (v0.2.18 catalog).
+
+    Sources the slot catalog from `vco_lib.weaviate_schema.KG_NAMED_VECTORS`
+    — see that module for the LOCKED slot list + rationale.
+
+    Pre-v0.2.18 this function returned a hard-coded 3-slot config
+    (`qwen3_embed`, `ollama_embed`, `openai_embed`). v0.2.18 extends to
+    5 slots — the legacy 3 are RETAINED so v0.2.17 -> v0.2.18 upgrades
+    preserve data, plus 2 new slots (`arctic2_embed`, `openai_text_embed`)
+    that the EmbeddingService (Commit 2) and GUI dropdowns (Commit 8)
+    use as additional embedding-provider targets.
 
     Each slot has `vectorizer: none` so we feed pre-computed embeddings
     from the MCP server. Index type stays HNSW (Weaviate default for ANN).
@@ -202,10 +210,47 @@ def named_vector_config() -> dict:
     seeding fails with HTTP 422 ("collection configured without multiple
     named vectors, but received named vectors").
     """
+    # Late import to avoid a circular dep — weaviate_schema imports
+    # project_init lazily inside `_default_collection_rebuilder`.
+    from vco_lib.weaviate_schema import KG_NAMED_VECTORS
+    return {slot.name: slot.to_weaviate_config() for slot in KG_NAMED_VECTORS}
+
+
+def code_class_definitions(project_prefix: str = "") -> dict[str, dict]:
+    """Return Weaviate class definitions for the 5 code-graph collections.
+
+    Args:
+        project_prefix: Optional prefix added before each canonical name
+            (e.g. `project_prefix="MyProj_"` -> `"MyProj_CodeFunction"`).
+            Empty string returns bare-name definitions; callers using
+            per-project prefixing prepend it.
+
+    Used by analyzers + the v0.2.18 schema migration. The actual
+    code-graph create site is `templates/scripts/analyze_code_graph.py`
+    which has its own per-collection property list (richer than the KG
+    schema). This function provides the MINIMAL VECTOR-CONFIG-ONLY shape
+    that the v0.2.18 migrate-collections helper uses for new-class
+    creation (when a code collection doesn't yet exist and the helper
+    needs to bootstrap it with the multi-slot config). Property-rich
+    creation still flows through analyze_code_graph.py's
+    `create_collections` so the bare definitions returned here only
+    carry the vector slots + the inverted-index invariant.
+
+    The returned dict is keyed by basename (no prefix); composition with
+    `project_prefix` is the caller's responsibility for canonical naming.
+    """
+    from vco_lib.weaviate_schema import CODE_NAMED_VECTORS, _CODE_COLLECTION_SUFFIXES
+
+    vc = {slot.name: slot.to_weaviate_config() for slot in CODE_NAMED_VECTORS}
     return {
-        "qwen3_embed":  {"vectorizer": {"none": {}}, "vectorIndexType": "hnsw"},
-        "ollama_embed": {"vectorizer": {"none": {}}, "vectorIndexType": "hnsw"},
-        "openai_embed": {"vectorizer": {"none": {}}, "vectorIndexType": "hnsw"},
+        basename: {
+            "class": f"{project_prefix}{basename}",
+            "description": f"Code-graph {basename} collection (v0.2.18 multi-slot)",
+            "vectorConfig": vc,
+            "invertedIndexConfig": {"indexNullState": True},
+            "properties": [],  # analyze_code_graph.py adds the rich shape
+        }
+        for basename in sorted(_CODE_COLLECTION_SUFFIXES)
     }
 
 
@@ -310,7 +355,16 @@ def detect_kg_schema_drift(weaviate_url: str, kg_collection: str) -> tuple[bool,
     current code requires.
 
     Invariants checked (today's set; grow this list when new ones land):
-      - 3 named-vector slots (qwen3_embed, ollama_embed, openai_embed)
+      - The CORE named-vector slot subset is present (the legacy v0.2.17
+        triple qwen3_embed + ollama_embed + openai_embed). v0.2.18 added
+        two more slots (`arctic2_embed`, `openai_text_embed`) but their
+        absence is NOT classified as drift — they're idempotently added
+        by `python -m vco_lib.project_init migrate-collections` and the
+        running MCP / sync scripts gracefully handle their absence
+        (falling back to qwen3_embed). The v0.2.18 plan's deferral
+        mechanism (Commit 9 enrichment migration) is the proper surface
+        for "missing optional slots"; drift-detection still triggers
+        only on absent core slots that would break basic search.
       - inverted_index_config.index_null_state == True
 
     Both invariants CANNOT be retro-added on Weaviate ≤1.30 — the only
@@ -335,12 +389,18 @@ def detect_kg_schema_drift(weaviate_url: str, kg_collection: str) -> tuple[bool,
 
     missing: list[str] = []
 
-    # Check named-vector slots
+    # Check named-vector slots. v0.2.18: the catalog now lists 5 slots
+    # but drift only fires on the CORE legacy-v0.2.17 subset — the new
+    # v0.2.18 slots (`arctic2_embed`, `openai_text_embed`) are optional
+    # extras handled by the migrate-collections idempotent helper and
+    # are not blockers for basic KG operation. This keeps drift-
+    # triggered destructive rebuilds rare; the explicit migrate path
+    # adds the new slots additively via copy-with-vectors.
     vec_config = schema.get("vectorConfig") or {}
-    expected_slots = {"qwen3_embed", "ollama_embed", "openai_embed"}
+    core_expected_slots = {"qwen3_embed", "ollama_embed", "openai_embed"}
     actual_slots = set(vec_config.keys())
-    if not expected_slots.issubset(actual_slots):
-        gap = sorted(expected_slots - actual_slots)
+    if not core_expected_slots.issubset(actual_slots):
+        gap = sorted(core_expected_slots - actual_slots)
         missing.append(f"named-vector slots (missing: {', '.join(gap)})")
 
     # Check index_null_state
@@ -1481,7 +1541,18 @@ def _schema_incompatible(
 
     Detection rules (intentionally NARROWER than `_schema_delta`):
       * legacy single-vector (no vectorConfig) → REGEN
-      * named-vector slot set differs from target → REGEN
+      * CORE legacy-v0.2.17 named-vector slot(s) missing → REGEN
+        (`qwen3_embed` + `ollama_embed` + `openai_embed` — the triple
+        that v0.2.17 MCP writes depend on). Optional newer slots
+        (`arctic2_embed`, `openai_text_embed` from v0.2.18) being
+        absent is NOT REGEN — they're added idempotently by
+        `migrate-collections`.
+      * Extra slots (slots in actual but not in target) → NOT REGEN.
+        Pre-v0.2.18 the rule was "any set mismatch triggers regen";
+        v0.2.18 retains LEGACY slots in the catalog precisely so that
+        v0.2.17 collections don't trip this, but if a future cleanup
+        narrows the catalog, we still want extra slots to be benign
+        (data preservation > schema strictness).
       * indexNullState invariant missing → REGEN
       * properties missing/extra → NOT REGEN (sync re-ingests; smart
         migrate's patch_props handles the additive case; the destructive
@@ -1500,17 +1571,20 @@ def _schema_incompatible(
     if not actual_vec:
         return (True, "legacy single-vector schema (no vectorConfig)")
 
-    expected_slots = set(target_vec.keys())
+    # v0.2.18: only flag REGEN when CORE legacy-v0.2.17 slots are
+    # missing. The catalog's new v0.2.18 slots (e.g. `arctic2_embed`)
+    # missing is fine — they're added later via migrate-collections.
+    # Extra slots are always tolerated (data preservation principle).
     actual_slots = set(actual_vec.keys())
-    if expected_slots != actual_slots:
-        missing = sorted(expected_slots - actual_slots)
-        extra = sorted(actual_slots - expected_slots)
-        bits: list[str] = []
-        if missing:
-            bits.append(f"missing slots: {','.join(missing)}")
-        if extra:
-            bits.append(f"extra slots: {','.join(extra)}")
-        return (True, f"named-vector mismatch ({'; '.join(bits)})")
+    core_slots = {"qwen3_embed", "ollama_embed", "openai_embed"}
+    # The target's slot set must be a superset of core_slots (else the
+    # catalog itself is broken). If a downstream config narrowed it,
+    # fall back to the target slots directly.
+    target_slots = set(target_vec.keys())
+    effective_required = core_slots & target_slots if core_slots & target_slots else target_slots
+    missing_core = sorted(effective_required - actual_slots)
+    if missing_core:
+        return (True, f"named-vector mismatch (missing core slots: {','.join(missing_core)})")
 
     target_inv = target.get("invertedIndexConfig") or {}
     actual_inv = actual.get("invertedIndexConfig") or {}
@@ -5086,16 +5160,34 @@ def _cmd_derive(args: argparse.Namespace) -> int:
 
 def _cmd_migrate_collections(args: argparse.Namespace) -> int:
     """`migrate-collections --name <name> [--dry-run] [--force-rebuild]
-    [--weaviate-url <url>] [--project-folder <path>] --json`
+    [--weaviate-url <url>] [--project-folder <path>] [--include-code]
+    [--all-projects] --json`
 
     Sets KG_COLLECTION + DEVELOPMENT_COLLECTION env vars from --name
     (using canonical derivation), then runs the dispatcher.
+
+    v0.2.18 (Commit 4) — additional behavior:
+      * KG + Dev collections continue through the existing
+        `migrate_collections` smart-dispatch (noop/patch_props/copy/
+        rebuild). The target schema now has the v0.2.18 5-slot vector
+        config; existing v0.2.17 collections gain the 2 new slots
+        (`arctic2_embed`, `openai_text_embed`) via the `copy` action.
+      * NEW: code-graph collections (`<Project>_CodeFunction` etc.) are
+        walked via the additive helper from `vco_lib.weaviate_schema`
+        (`migrate_collections_to_v0218_schema`). Each missing v0.2.18
+        slot is added idempotently. Code-graph results are surfaced in
+        the JSON envelope under `v0218_schema_reports`.
+      * `--all-projects` skips the `--name`-scoped path entirely and
+        walks every KG-shaped and Code-shaped collection on the server.
+        Useful for orchestrator-wide post-update migrations.
 
     JSON stdout schema:
       {"plan": [{"collection", "action", "objects_copied", "elapsed_ms"}],
        "dry_run": bool,
        "deferral_emitted": bool,
-       "errors": [{"collection", "action", "error"}]}
+       "errors": [{"collection", "action", "error"}],
+       "v0218_schema_reports": [{"collection", "added_slots", "skipped_slots",
+                                  "errors", "objects_copied"}]}
 
     PR 5 (2026-05-01): when --dry-run AND --project-folder are both set
     AND the plan contains any `copy` or `rebuild` action, a
@@ -5107,26 +5199,156 @@ def _cmd_migrate_collections(args: argparse.Namespace) -> int:
 
     Exit 0 on success; 1 if any errors[] entry exists.
     """
-    derived = derive_project_collection_names(args.name)
-    # Inject env so migrate_collections picks them up. We don't mutate
-    # the caller's environment beyond this process — argparse callers
-    # are typically the Rust subprocess or a CLI invocation, not a long-
-    # lived shell.
-    os.environ["KG_COLLECTION"] = derived["kg_collection"]
-    os.environ["DEVELOPMENT_COLLECTION"] = derived["development_collection"]
+    all_projects = bool(getattr(args, "all_projects", False))
 
-    # Build a minimal Namespace-like for migrate_collections dispatch.
-    ns = argparse.Namespace(force_rebuild=bool(args.force_rebuild))
-    result = migrate_collections(
-        ns,
-        dry_run=bool(args.dry_run),
-        weaviate_url=args.weaviate_url,
-    )
+    # Validation: --name is required unless --all-projects is set. argparse
+    # can't express "X required unless Y" cleanly so we hand-roll it here.
+    if not all_projects and not getattr(args, "name", None):
+        print(
+            "error: --name is required (or pass --all-projects to walk "
+            "every collection)",
+            file=sys.stderr,
+        )
+        return 2
+
+    if not all_projects:
+        derived = derive_project_collection_names(args.name)
+        # Inject env so migrate_collections picks them up. We don't mutate
+        # the caller's environment beyond this process — argparse callers
+        # are typically the Rust subprocess or a CLI invocation, not a long-
+        # lived shell.
+        os.environ["KG_COLLECTION"] = derived["kg_collection"]
+        os.environ["DEVELOPMENT_COLLECTION"] = derived["development_collection"]
+
+        # Build a minimal Namespace-like for migrate_collections dispatch.
+        ns = argparse.Namespace(force_rebuild=bool(args.force_rebuild))
+        result = migrate_collections(
+            ns,
+            dry_run=bool(args.dry_run),
+            weaviate_url=args.weaviate_url,
+        )
+    else:
+        # --all-projects path: skip the per-project KG/Dev env-driven
+        # dispatch; the v0.2.18 helper below walks every KG-shaped
+        # collection on the server directly.
+        result = {"plan": [], "dry_run": bool(args.dry_run), "errors": []}
+
     result.setdefault("deferral_emitted", False)
+    result.setdefault("v0218_schema_reports", [])
+
+    # v0.2.18: additive migration to the new 5-slot KG + 6-slot Code
+    # catalog. This handles three things:
+    #   1. KG/Dev: the existing migrate_collections smart-dispatch
+    #      already handles named-vector slot additions via the `copy`
+    #      action. For dry-run we don't re-walk these (they're in
+    #      `result["plan"]`). For wet-run we still re-run the additive
+    #      helper to handle the shared KG (which the existing path
+    #      doesn't visit) and to surface a unified report.
+    #   2. Code-graph: the existing path never touched these. v0.2.18
+    #      adds them via the additive helper.
+    #   3. --all-projects: walks every collection.
+    #
+    # Always-on by default (matches the v0.2.18 acceptance criteria);
+    # `--no-include-code` opts out for callers who want pre-v0.2.18
+    # KG-only behavior (kept for bisectability).
+    include_code = getattr(args, "include_code", True)
+    if include_code:
+        try:
+            from vco_lib.weaviate_schema import (
+                CODE_NAMED_VECTORS,
+                KG_NAMED_VECTORS,
+                enumerate_code_collections,
+                enumerate_kg_collections,
+                migrate_collection_to_target,
+            )
+
+            project_name_arg = None if all_projects else args.name
+            weaviate_url = args.weaviate_url
+            dry_run = bool(args.dry_run)
+
+            # KG-shaped collections (per-project + shared KG when relevant).
+            for coll in enumerate_kg_collections(
+                project_name=project_name_arg, weaviate_url=weaviate_url,
+            ):
+                if dry_run:
+                    # Dry-run: planned-only entry; no Weaviate writes.
+                    result["v0218_schema_reports"].append({
+                        "collection": coll,
+                        "action": "v0218_schema_check",
+                        "added_slots": [],
+                        "skipped_slots": [],
+                        "errors": [],
+                        "objects_copied": 0,
+                        "dry_run": True,
+                    })
+                else:
+                    report = migrate_collection_to_target(
+                        coll, KG_NAMED_VECTORS,
+                        weaviate_url=weaviate_url,
+                    )
+                    result["v0218_schema_reports"].append({
+                        "collection": report.collection,
+                        "added_slots": report.added_slots,
+                        "skipped_slots": report.skipped_slots,
+                        "errors": report.errors,
+                        "objects_copied": report.objects_copied,
+                    })
+                    if report.errors:
+                        for e in report.errors:
+                            result["errors"].append({
+                                "collection": report.collection,
+                                "action": "v0218_schema",
+                                "error": f"slot {e['slot']}: {e['reason']}",
+                            })
+
+            # Code-graph collections (per-project Code* OR all server-wide).
+            for coll in enumerate_code_collections(
+                project_name=project_name_arg, weaviate_url=weaviate_url,
+            ):
+                if dry_run:
+                    result["v0218_schema_reports"].append({
+                        "collection": coll,
+                        "action": "v0218_schema_check",
+                        "added_slots": [],
+                        "skipped_slots": [],
+                        "errors": [],
+                        "objects_copied": 0,
+                        "dry_run": True,
+                    })
+                else:
+                    report = migrate_collection_to_target(
+                        coll, CODE_NAMED_VECTORS,
+                        weaviate_url=weaviate_url,
+                    )
+                    result["v0218_schema_reports"].append({
+                        "collection": report.collection,
+                        "added_slots": report.added_slots,
+                        "skipped_slots": report.skipped_slots,
+                        "errors": report.errors,
+                        "objects_copied": report.objects_copied,
+                    })
+                    if report.errors:
+                        for e in report.errors:
+                            result["errors"].append({
+                                "collection": report.collection,
+                                "action": "v0218_schema",
+                                "error": f"slot {e['slot']}: {e['reason']}",
+                            })
+        except Exception as e:
+            # v0.2.18 helper should not break the existing migrate flow.
+            # If the helper fails (Weaviate down, import-time issue, etc.),
+            # report it in errors[] and continue. The legacy KG/Dev path
+            # has already run and its result["plan"] is intact.
+            result["errors"].append({
+                "collection": None,
+                "action": "v0218_schema",
+                "error": f"v0.2.18 schema helper failed: "
+                         f"{type(e).__name__}: {e}",
+            })
 
     # PR 5: drift-detection deferral (pre-update path).
     project_folder = getattr(args, "project_folder", None)
-    if project_folder and bool(args.dry_run) and not result["errors"]:
+    if project_folder and bool(args.dry_run) and not result["errors"] and not all_projects:
         destructive = [
             e for e in result.get("plan", [])
             if e.get("action") in ("copy", "rebuild")
@@ -5161,8 +5383,26 @@ def _cmd_migrate_collections(args: argparse.Namespace) -> int:
                 f"objects_copied={entry['objects_copied']}  "
                 f"elapsed_ms={entry['elapsed_ms']}"
             )
+        if result["v0218_schema_reports"]:
+            print()
+            print("v0.2.18 multi-slot schema migration:")
+            print(f"  {'COLLECTION':45s}  ADDED  SKIPPED  ERRORS  COPIED")
+            for r in result["v0218_schema_reports"]:
+                added = len(r.get("added_slots") or [])
+                skipped = len(r.get("skipped_slots") or [])
+                errors = len(r.get("errors") or [])
+                copied = r.get("objects_copied", 0)
+                print(
+                    f"  {r['collection']:45s}  "
+                    f"{added:5d}  {skipped:7d}  {errors:6d}  {copied:6d}"
+                )
+                if r.get("added_slots"):
+                    print(f"      + added: {', '.join(r['added_slots'])}")
+                if r.get("errors"):
+                    for e in r["errors"]:
+                        print(f"      ! {e['slot']}: {e['reason']}")
         for err in result["errors"]:
-            print(f"  ERROR {err['collection']}: {err['error']}")
+            print(f"  ERROR {err.get('collection') or '(global)'}: {err['error']}")
     return 1 if result["errors"] else 0
 
 
@@ -5362,13 +5602,37 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "migrate-collections",
         help=(
             "Smart per-collection schema migration: noop / patch_props / "
-            "copy-with-vectors / rebuild. Replaces drop-and-re-embed."
+            "copy-with-vectors / rebuild. Replaces drop-and-re-embed. "
+            "v0.2.18: also adds new named-vector slots (arctic2_embed, "
+            "openai_text_embed, jina_embed, etc.) to existing KG + code "
+            "collections via additive copy-with-vectors."
         ),
     )
     p_migrate.add_argument(
-        "--name", required=True,
+        "--name", default=None,
         help="Project name (raw, e.g. 'VideoFrames'). KG/Dev collection "
-             "names are derived via the canonical sanitizer.",
+             "names are derived via the canonical sanitizer. Required "
+             "unless --all-projects is set.",
+    )
+    p_migrate.add_argument(
+        "--all-projects", action="store_true",
+        help="(v0.2.18) Walk every KG-shaped and Code-shaped collection "
+             "on the server. Skips the per-project KG/Dev env-driven "
+             "smart-dispatch — uses only the additive v0.2.18 multi-slot "
+             "migration. Useful for orchestrator-wide post-upgrade runs.",
+    )
+    p_migrate.add_argument(
+        "--include-code", dest="include_code", action="store_true",
+        default=True,
+        help="(v0.2.18, DEFAULT) Also migrate code-graph collections "
+             "(CodeModule / CodeClass / CodeFunction / CodeAPI / "
+             "CodeInteraction) to the v0.2.18 multi-slot schema.",
+    )
+    p_migrate.add_argument(
+        "--no-include-code", dest="include_code", action="store_false",
+        help="(v0.2.18 escape hatch) Skip the code-graph multi-slot "
+             "migration step. KG/Dev still run through the existing "
+             "smart-dispatch. Use only for bisecting v0.2.18 regressions.",
     )
     p_migrate.add_argument(
         "--dry-run", action="store_true",
