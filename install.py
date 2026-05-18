@@ -8797,6 +8797,106 @@ def _emit_binary_swap_locked_deferral(
         )
 
 
+def _maybe_emit_running_stale_deferral(
+    install_root: Path,
+    *,
+    dist_path: Path,
+    deferral_report: Any,
+) -> None:
+    """v0.2.17 (plan 0.0): emit ``launcher_restart_required`` when the
+    running launcher's version differs from the on-disk dist binary.
+
+    The git-pull case for end-user updates: a freshly-pulled
+    ``launcher/dist/<arch>/vct-launcher`` lands at the canonical path
+    while the launcher PID still has the OLD binary mapped (via
+    `/proc/<pid>/exe` on Linux, equivalent on macOS/Windows). Without
+    this emit, the launcher's W4 banner stays silent and the user
+    has no signal that a restart is needed.
+
+    Detection signal: ``vct-module.json::version`` (the new on-disk
+    source version, just pulled) vs ``state/install-manifest.json::version``
+    (the version recorded on the LAST install — which reflects what
+    the running launcher boots with). If they differ AND
+    ``VCT_LAUNCHER_PID`` is set (caller confirms a launcher is
+    running), emit the deferral.
+
+    Skipped on `deferral_report is None` (caller didn't thread one
+    through) so this helper is safe to call from contexts where the
+    deferral channel isn't available.
+    """
+    if deferral_report is None:
+        return
+    if not dist_path.is_file():
+        return
+
+    # Source version (just pulled, in the working tree).
+    # `_read_install_version` reads vct-module.json first → that file
+    # IS the post-pull source-of-truth version.
+    source_version = _read_install_version(install_root)
+    # Last-installed version: read state/install-manifest.json
+    # directly. This is the version install.py wrote on the LAST run —
+    # which is what the running launcher booted with. (We can't reuse
+    # _read_install_version here because its priority order is
+    # source-tree first, manifest never.)
+    manifest_path = install_root / "state" / "install-manifest.json"
+    last_installed_version: Optional[str] = None
+    if manifest_path.is_file():
+        try:
+            with manifest_path.open("r", encoding="utf-8") as f:
+                manifest_data = json.load(f)
+            v = manifest_data.get("version")
+            if v:
+                last_installed_version = str(v)
+        except (OSError, json.JSONDecodeError):
+            last_installed_version = None
+
+    if not source_version or not last_installed_version:
+        # Can't compare — bail silently. Manifest absence is also a
+        # legitimate "fresh install" case where no restart applies.
+        # EXCEPTION: VCT_FORCE_RESTART_DEFERRAL=1 (set by the Rust
+        # auto-restart fallback path, v0.2.17 Reviewer A finding A2)
+        # bypasses this guard so the deferral lands even when the
+        # manifest is unreadable.
+        if os.environ.get("VCT_FORCE_RESTART_DEFERRAL", "").strip() != "1":
+            return
+    if source_version == last_installed_version:
+        # No version change — nothing to defer.
+        # EXCEPTION: VCT_FORCE_RESTART_DEFERRAL=1 forces the emit so
+        # the auto-restart-failed fallback can land the deferral even
+        # though the FIRST install.py pass already bumped the
+        # manifest to match the source (making the version-equality
+        # check skip otherwise).
+        if os.environ.get("VCT_FORCE_RESTART_DEFERRAL", "").strip() != "1":
+            return
+
+    old_pid_str = os.environ.get("VCT_LAUNCHER_PID", "").strip()
+    if not old_pid_str:
+        # No launcher running (or caller didn't tell us) — emit
+        # anyway so a future launcher-start picks it up. Pass
+        # old_pid=None for the deferral message.
+        old_pid: Optional[int] = None
+    else:
+        try:
+            old_pid = int(old_pid_str)
+        except ValueError:
+            old_pid = None
+
+    new_version = _query_launcher_version(dist_path) or source_version
+    _emit_launcher_restart_deferral(
+        deferral_report,
+        install_root=install_root,
+        new_binary_path=dist_path,
+        new_version=new_version,
+        old_pid=old_pid,
+    )
+    _log_install_event(
+        "refresh_dist_binary", "info",
+        f"emitted launcher_restart_required deferral "
+        f"(source={source_version}, last_installed={last_installed_version}, "
+        f"running_pid={old_pid_str or 'none'})",
+    )
+
+
 def _refresh_dist_binary_after_rebuild(
     install_root: Path,
     *,
@@ -8860,6 +8960,35 @@ def _refresh_dist_binary_after_rebuild(
         )
         return None
 
+    # v0.2.17 (plan 0.0): the git-pull case detection path.
+    #
+    # Pre-v0.2.17 this helper ONLY handled the "cargo just produced a
+    # fresh binary in target/release/" scenario (Bug 5 in
+    # `knowledge/concepts/install-py-collection-bootstrap-bugs.md`).
+    # The COMMON end-user case — `git pull` lands a pre-built binary
+    # directly at `launcher/dist/<arch>/vct-launcher` — was never
+    # detected here, so the `launcher_restart_required` deferral
+    # was never emitted, and the launcher's banner stayed silent
+    # while the on-disk binary diverged from the running PID's binary.
+    #
+    # Fix: detect dist-vs-running divergence and emit the deferral
+    # if needed. Runs ONLY when the cargo-output secondary path is
+    # NOT going to fire (Reviewer A finding A3: avoid double-emit
+    # and the wasted `_query_launcher_version` subprocess call
+    # against an about-to-be-overwritten binary).
+    subdir, fname = _launcher_binary_relative_path()
+    dist_dir = install_root / "launcher" / "dist" / subdir
+    dist_path = dist_dir / fname
+
+    # Skip the running-vs-disk emit entirely when the Rust caller has
+    # opted into auto-restart (VCT_AUTO_RESTART_LAUNCHER=1 set by
+    # `update_orchestrator` v0.2.17). The deferral is redundant in
+    # that path — the Rust handler spawns the new binary detached and
+    # exits the current process.
+    auto_restart_handled_externally = (
+        os.environ.get("VCT_AUTO_RESTART_LAUNCHER", "").strip() == "1"
+    )
+
     src = (
         install_root
         / "launcher"
@@ -8868,12 +8997,22 @@ def _refresh_dist_binary_after_rebuild(
         / "release"
         / "vct-launcher-temp"
     )
+    # A3: mutually-exclusive routing. If the cargo-output path is
+    # going to run (src exists), it will emit the deferral itself
+    # after the swap. Skip the git-pull-case helper here. If src
+    # doesn't exist, the cargo path returns None below — the git-
+    # pull helper is the ONLY emit source.
     if not src.is_file():
+        if not auto_restart_handled_externally:
+            _maybe_emit_running_stale_deferral(
+                install_root,
+                dist_path=dist_path,
+                deferral_report=deferral_report,
+            )
         return None
 
-    subdir, fname = _launcher_binary_relative_path()
-    dist_dir = install_root / "launcher" / "dist" / subdir
-    dist_path = dist_dir / fname
+    # subdir/fname/dist_path already resolved at the top of this
+    # function (see the v0.2.17 git-pull-case detection block above).
 
     try:
         src_mtime = src.stat().st_mtime
@@ -9011,21 +9150,31 @@ def _refresh_dist_binary_after_rebuild(
     # v0.2.15 (Agent D): emit launcher_restart_required so the GUI surfaces
     # a "Restart now" banner. The running launcher process is still in old
     # code; the new binary is on disk but not executing yet.
-    new_version = _query_launcher_version(dist_path)
-    old_pid_str = os.environ.get("VCT_LAUNCHER_PID", "").strip()
-    old_pid: Optional[int] = None
-    if old_pid_str:
-        try:
-            old_pid = int(old_pid_str)
-        except ValueError:
-            old_pid = None
-    _emit_launcher_restart_deferral(
-        deferral_report,
-        install_root=install_root,
-        new_binary_path=dist_path,
-        new_version=new_version,
-        old_pid=old_pid,
-    )
+    #
+    # v0.2.17 (plan 0.0): skip emit when VCT_AUTO_RESTART_LAUNCHER=1 is
+    # set by the Rust caller — auto-restart makes the deferral redundant.
+    if not auto_restart_handled_externally:
+        new_version = _query_launcher_version(dist_path)
+        old_pid_str = os.environ.get("VCT_LAUNCHER_PID", "").strip()
+        old_pid: Optional[int] = None
+        if old_pid_str:
+            try:
+                old_pid = int(old_pid_str)
+            except ValueError:
+                old_pid = None
+        _emit_launcher_restart_deferral(
+            deferral_report,
+            install_root=install_root,
+            new_binary_path=dist_path,
+            new_version=new_version,
+            old_pid=old_pid,
+        )
+    else:
+        _log_install_event(
+            "refresh_dist_binary", "info",
+            "VCT_AUTO_RESTART_LAUNCHER=1 set — skipping launcher_restart_required "
+            "deferral emit (Rust caller handles auto-restart)",
+        )
 
     return dist_path
 

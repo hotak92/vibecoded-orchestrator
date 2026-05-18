@@ -3,7 +3,7 @@
   "schema_version": "1",
   "id": "orchestrator",
   "name": "VibeCoded Orchestrator",
-  "version": "0.2.16",
+  "version": "0.2.17",
   "description": "The core: 20 hooks, 29 bundled agents, 28 skills, KG + Code Graph, 4 MCP servers (3 containerized + Playwright via npx). Runs locally in Podman/Docker.",
   "license": {
     "spdx": "AGPL-3.0-or-later",

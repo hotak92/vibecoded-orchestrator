@@ -242,6 +242,16 @@ def kg_class_definition(name: str) -> dict:
                 ],
             },
             {"name": "status", "dataType": ["text"]},
+            # v0.2.17 (Reviewer B v0.2.18 nit, folded into v0.2.17):
+            # SHA-256 over (frontmatter-minus-updated + body), used by
+            # `templates/scripts/sync_knowledge_graph.py`'s embed-skip
+            # fast path. Including it at create-time means fresh
+            # per-project KGs ship with the property from day 0 — no
+            # warm-up sync that re-embeds everything just to populate
+            # this field. The orchestrator-self template also has it
+            # via the `temporal_props` migration loop for upgrades; this
+            # entry covers create-from-scratch on per-project init.
+            {"name": "content_hash", "dataType": ["text"]},
         ],
     }
 

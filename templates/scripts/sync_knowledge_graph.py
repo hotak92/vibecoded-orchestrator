@@ -571,7 +571,12 @@ def ensure_collection_exists(server: WeaviateMCPServer) -> bool:
                     'updated': DataType.DATE,
                     'valid_from': DataType.DATE,
                     'valid_until': DataType.DATE,
-                    'status': DataType.TEXT
+                    'status': DataType.TEXT,
+                    # v0.2.17 (plan 0.2): content-hash for embed-skip on
+                    # re-sync. SHA-256 over (frontmatter-minus-updated +
+                    # body). Empty string until migrated; sync_node only
+                    # uses it to skip re-embed when stored AND non-empty.
+                    'content_hash': DataType.TEXT,
                 }
 
                 # Add missing properties
@@ -656,7 +661,20 @@ def ensure_collection_exists(server: WeaviateMCPServer) -> bool:
                 # Chunking support
                 Property(name="chunk_num", data_type=DataType.INT),
                 Property(name="total_chunks", data_type=DataType.INT),
-                Property(name="source_node_id", data_type=DataType.TEXT)
+                Property(name="source_node_id", data_type=DataType.TEXT),
+                # v0.2.17 (plan 0.2): SHA-256 over the source file
+                # (frontmatter-minus-updated + body, via
+                # `_content_signature_excluding_updated`). Compared
+                # against the stored value in `sync_node` to skip the
+                # delete-then-re-embed pipeline when content is
+                # unchanged. Saves ~5/sec Ollama embed calls + the
+                # delete+insert Weaviate roundtrips for every re-sync
+                # pass. Empty string on objects predating this property
+                # (existing-collection migration adds the property but
+                # doesn't backfill values) — those re-embed on next
+                # touch and then get a non-empty hash, which the run
+                # AFTER that one will then skip.
+                Property(name="content_hash", data_type=DataType.TEXT),
             ],
             # Named vectors must match `VECTOR_SCHEMES["kg"]` in
             # weaviate_mcp/server.py:130. Without this the collection accepts
@@ -1222,12 +1240,83 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
         typed_count = len(node_data['typed_links'])
         print(f"   Links: {total_links} connections ({typed_count} typed)")
 
+        # v0.2.17 (plan 0.2): compute content-hash for embed-skip.
+        # Uses the same signature function as the file-write skip
+        # (_content_signature_excluding_updated), so a file whose only
+        # delta is the `updated:` timestamp hashes identically to its
+        # pre-sync state — exactly what we want for the no-op fast
+        # path on every install.py --update.
+        current_content_hash = _content_signature_excluding_updated(content)
+
         # Delete old version (by file_path)
         collection = server.client.collections.get(COLLECTION_NAME)
 
         # Query for existing nodes with same file_path
         where_filter = Filter.by_property("file_path").equal(node_data["file_path"])
-        existing = collection.query.fetch_objects(filters=where_filter, limit=100)
+        existing = collection.query.fetch_objects(
+            filters=where_filter,
+            limit=100,
+            return_properties=["content_hash", "chunk_num", "total_chunks"],
+        )
+
+        # v0.2.17 (plan 0.2): EMBED-SKIP fast path. If every existing
+        # object for this file_path has content_hash matching the
+        # current source hash AND the count of objects matches what
+        # we'd reproduce (single-chunk → 1, multi-chunk → N), skip
+        # the delete-and-re-embed pipeline entirely. Saves hundreds
+        # of Ollama embed calls + Weaviate roundtrips per re-sync
+        # pass when content is unchanged.
+        #
+        # Conservative gating (Reviewer A finding E2 + original
+        # design): skip ONLY when ALL existing objects' content_hash
+        # matches AND at least one is non-empty AND the count of
+        # existing objects matches the `total_chunks` recorded on
+        # each (so a previous crash mid-chunk-write — leaving e.g.
+        # 3/4 chunks with the new hash — does NOT cause a permanent
+        # skip with missing chunk 4). If anything looks off, fall
+        # through to the delete-and-re-embed path. Soft-fail: any
+        # exception here also falls through.
+        try:
+            existing_hashes: List[str] = []
+            existing_total_chunks: List[int] = []
+            for obj in existing.objects:
+                props = obj.properties or {}
+                existing_hashes.append(props.get("content_hash", "") or "")
+                # total_chunks may be int OR (legacy) missing/None.
+                # Treat missing as 0 → forces fall-through.
+                tc = props.get("total_chunks", 0)
+                try:
+                    existing_total_chunks.append(int(tc) if tc is not None else 0)
+                except (TypeError, ValueError):
+                    existing_total_chunks.append(0)
+
+            chunk_count_ok = (
+                len(existing_total_chunks) > 0
+                and all(tc == len(existing_total_chunks) for tc in existing_total_chunks)
+            )
+            all_match = (
+                len(existing_hashes) > 0
+                and all(h == current_content_hash for h in existing_hashes)
+                and all(h for h in existing_hashes)  # no empty strings
+                and chunk_count_ok
+            )
+            if all_match:
+                elapsed = time.time() - start_time
+                print(
+                    f"   ⏭️  Embed-skip: content_hash matches "
+                    f"({current_content_hash[:12]}…); "
+                    f"{len(existing_hashes)} chunk(s) preserved "
+                    f"({elapsed*1000:.0f} ms)"
+                )
+                # Return success without delete/embed/insert. The
+                # caller's success_count/fail_count tally still
+                # counts this as a successful sync — the data is
+                # already in Weaviate.
+                return True
+        except Exception as skip_err:  # noqa: BLE001 — soft-fail by design
+            # Fall through to delete-and-re-embed. Log so future
+            # debugging knows the fast path tried but didn't apply.
+            print(f"   (embed-skip check failed: {skip_err}; re-embedding)")
 
         deleted_count = 0
         for obj in existing.objects:
@@ -1262,7 +1351,10 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
                 "updated_at": node_data["updated_at"],
                 "chunk_num": 1,
                 "total_chunks": 1,
-                "source_node_id": str(uuid.uuid4())
+                "source_node_id": str(uuid.uuid4()),
+                # v0.2.17 (plan 0.2): persist content_hash so the next
+                # re-sync can skip the embed pipeline when unchanged.
+                "content_hash": current_content_hash,
             }
 
             # Add temporal metadata if present
@@ -1359,7 +1451,14 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
                     "updated_at": node_data["updated_at"],
                     "chunk_num": chunk.chunk_number + 1,  # 1-indexed
                     "total_chunks": chunk.total_chunks,
-                    "source_node_id": source_node_id
+                    "source_node_id": source_node_id,
+                    # v0.2.17 (plan 0.2): every chunk of the same file
+                    # shares the same content_hash (computed over the
+                    # whole file). The embed-skip check in sync_node
+                    # requires ALL chunks for a file_path to carry an
+                    # identical, non-empty hash before it skips —
+                    # writing the same value here keeps that invariant.
+                    "content_hash": current_content_hash,
                 }
 
                 # Add temporal metadata if present
