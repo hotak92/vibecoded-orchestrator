@@ -9,34 +9,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `fix(release)`: `commit-dist-binaries` Stage step now reads the flat
-  artifact layout `actions/upload-artifact@v7` actually produces
-  (`<artifact_dir>/<binary>`), not the nested
+- **Code-graph analyzer integrity** (W1 / plan 0.1 + 0.2 + 0.7 + 0.8
+  + addendum D + 1.4/H). Five silent-correctness bugs in
+  `templates/scripts/analyze_code_graph.py` that combined to make
+  the analyzer report success while producing incomplete or empty
+  per-project code-graph collections. Edit target is the canonical
+  `templates/scripts/` (the installer renders into each project's
+  `.claude/scripts/` on `install.py --update`).
+    - **0.1 `_dedup_insert` is now actually idempotent**: switched the
+      internal call from `collection.data.insert(uuid=...)` (POST-only —
+      raises 422 on the second run with the same UUID) to
+      `collection.data.replace()` (PUT-upsert — idempotent by contract).
+      The previous behaviour swallowed every re-run collision in the
+      outer per-file try/except, silently flagging files as "skipped"
+      and exiting 0; the wizard then rendered green-toast success while
+      most objects never landed. All 25 call sites benefit from the
+      single internal change.
+    - **0.7 UUID identity-key includes file path**: `_deterministic_uuid`
+      signature is now `(project, file_path_rel, full_name)`. Two
+      genuinely-different files defining the same `module-stem.symbol`
+      (e.g. `server.handler` in `claude_mcp_servers/weaviate_mcp/server.py`
+      AND `docs/research/probes/server.py`) no longer collide on the same
+      UUID. Cross-OS contract: callers pass `Path(...).as_posix()` so
+      Windows backslashes don't produce different UUIDs from the same
+      file. All 11 per-language `_analyze_*_file` methods normalise
+      `relative_path` via `.as_posix()` before threading it through.
+    - **0.8 NameError on `class_uuid` in `_extract_class`**: the
+      `self._dedup_insert(...)` call's return value was discarded and
+      the next line referenced an unbound `class_uuid`. Every Python
+      file containing a class hit a `NameError` that the outer
+      try/except swallowed into `files_skipped`. Fixed by capturing the
+      return: `class_uuid = self._dedup_insert(...)`.
+    - **0.2 non-zero exit code on insert failures**: `stats['insert_errors']`
+      now tracks per-file write-to-Weaviate failures separately from
+      generic parse/IO errors via the new `_DedupInsertError` wrapper.
+      `main()` returns exit code `3` (`E_NO_FILES_INDEXED`) when no
+      files succeeded, `4` (`E_PARTIAL_INSERT_FAILURES`) when at least
+      one insert failed. Launcher's `rebuild_code_graph` IPC can now
+      surface warning toasts instead of silent success.
+    - **Addendum D worktree-skip + ignore_dirs refactor**: module-level
+      `_COMMON_IGNORE_DIRS` frozenset + `_ignore_dirs_for(language)`
+      helper replaces 11 near-duplicate inline sets. Adds `"worktrees"`
+      — skips `.claude/worktrees/agent-<hex>/` git-worktree clones that
+      would otherwise be re-analyzed alongside the main repo.
+    - Tests added: `tests/test_analyze_code_graph_v0_2_16.py` (9 tests,
+      all pure-Python unit tests against the analyzer module — no
+      Weaviate required). Existing `tests/test_analyze_code_graph_retry_cap.py`
+      still passes against a live Weaviate.
+- **`fix(release)`** (W2 / plan 0.4): `commit-dist-binaries` Stage step
+  now reads the flat artifact layout `actions/upload-artifact@v7`
+  actually produces (`<artifact_dir>/<binary>`), not the nested
   `<artifact_dir>/launcher/dist/<target>/<binary>` the pre-v0.2.16 code
   assumed. Root cause of the v0.2.15 auto-commit failure
   (`Expected artifact not found: _dist-artifacts/linux-x64/launcher/dist/linux-x64/vct-launcher`)
   — the build matrix succeeded and the Release page got all three OS
   zips; only the auto-binary-commit step failed, which the maintainer
   worked around via the manual binary-commit recipe (commit 0d24812).
-  Verified by inspection against `actions/upload-artifact@v7`'s flat-file
-  layout for individual-file `path:` entries. Will be exercised
+  Verified by inspection against `actions/upload-artifact@v7`'s flat-
+  file layout for individual-file `path:` entries. Will be exercised
   end-to-end on the v0.2.16 release run.
 
 ### Added
 
-- `feat(install)`: `state/install-manifest.json` now writes
-  `uuid_scheme = "v2"` on every install/update/lightweight path.
-  Pairs with the v0.2.16 analyzer changes that key code-graph UUIDs
-  on `(project, file_path, full_name)` rather than the pre-v0.2.16
-  `(project, full_name)` tuple. Pre-v0.2.16 manifests have no
-  `uuid_scheme` field — readers MUST treat the absence as the
-  implicit `"v1"` scheme. Future migration tooling consults this
-  marker to decide whether existing code-graph collections need a
-  `--force-recreate` rebuild.
-- `feat(install)`: stub `--migrate-uuid-scheme` flag on `install.py`
-  for the upcoming code-graph UUID-key migrator. Currently a no-op
-  beyond the manifest marker above; real migration tool ships
-  post-v0.2.16.
+- **`feat(install)` uuid_scheme manifest marker** (W2 / addendum F):
+  `state/install-manifest.json` now writes `uuid_scheme = "v2"` on
+  every install/update/lightweight path. Pairs with W1's analyzer
+  changes that key code-graph UUIDs on `(project, file_path, full_name)`
+  rather than the pre-v0.2.16 `(project, full_name)` tuple. Pre-v0.2.16
+  manifests have no `uuid_scheme` field — readers MUST treat the
+  absence as the implicit `"v1"` scheme. Future migration tooling
+  consults this marker to decide whether existing code-graph
+  collections need a `--force-recreate` rebuild.
+- **`feat(install)` migrate-uuid-scheme stub flag** (W2): stub
+  `--migrate-uuid-scheme` flag on `install.py` for the upcoming
+  code-graph UUID-key migrator. Currently a no-op beyond the manifest
+  marker above; real migration tool ships post-v0.2.16.
+- **`feat(analyzer)` `--prune-stale` flag** (W1 + W3 wire-up / plan 1.4
+  + addendum H): opt-in tracking of every UUID visited during the
+  analyze run; at end, every per-project collection's unvisited UUIDs
+  are deleted. Closes the "shrunken codebase leaves orphan rows" gap
+  that switching to `replace()` upsert semantics would otherwise
+  create. Wizard's Re-analyze button passes `--prune-stale` by default
+  (checkbox "Clean stale entries during re-analysis"); first-time
+  builds (`create_project_v2`) and boot-resume sweeps pass `false` to
+  preserve conservative semantics. Skips with a stderr warning when
+  combined with `--language` (would falsely delete other-language
+  objects).
 
 ## [0.2.15] — 2026-05-17
 
