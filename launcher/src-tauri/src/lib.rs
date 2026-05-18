@@ -931,6 +931,18 @@ pub fn run() {
             commands::openai_cmd::register_openai_api_key,
             commands::openai_cmd::validate_openai_api_key,
             commands::openai_cmd::recheck_openai_validity,
+            // Embedding catalog (v0.2.18, Commit 8). Shells out to
+            // `python -m vco_lib.embedding_service discover` to enumerate
+            // reachable models, then surfaces those + the project's
+            // current slot bindings to the Svelte side so KG/Codegraph +
+            // Preferences dropdowns can replace the legacy free-text
+            // model input. Cached in-process for ~30s so rapid catalog
+            // re-renders during a route change don't queue subprocess
+            // spawns. See commands/embedding_catalog.rs.
+            commands::embedding_catalog::get_embedding_catalog,
+            commands::embedding_catalog::set_default_embedding_models,
+            commands::embedding_catalog::get_default_embedding_models,
+            commands::embedding_catalog::validate_model_against_catalog,
             // KG dashboard — extended (v1.1)
             commands::kg::kg_set_collection_access_mode,
             commands::kg::kg_set_node_access,

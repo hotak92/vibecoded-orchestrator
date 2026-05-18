@@ -53,12 +53,31 @@ pub struct KgCollectionAccess {
     pub is_shared: bool,
 }
 
-/// Heuristic: returns true for the codegraph entity classes
-/// (`<Prefix>_CodeModule|CodeClass|CodeFunction|CodeAPI|CodeInteraction`).
+/// Heuristic: returns true for the codegraph entity classes —
+/// both per-project prefixed (`<Prefix>_CodeModule` etc.) AND bare
+/// (`CodeModule` etc., legacy pre-multi-project orchestrator schema).
+///
 /// Used by the KG dashboard to filter codegraph classes OUT (they
 /// belong on the dedicated /codegraph route), and by the codegraph
 /// dashboard to filter them IN.
+///
+/// v0.2.18 (Commit 8, locked 2026-05-19): bare-name classes are
+/// hidden from BOTH dashboards in the GUI — they hold legitimate
+/// pre-multi-project data but don't correspond to any current
+/// project, so surfacing them as standalone "projects" would be
+/// misleading. The underlying data stays in Weaviate; only the GUI
+/// representation is filtered. Mirrors
+/// `vco_lib.weaviate_schema.is_code_collection`'s Python predicate
+/// (which considers both bare and prefixed names code-shaped).
 fn is_codegraph_class(name: &str) -> bool {
+    // Bare-name match (CodeFunction, CodeClass, …).
+    if matches!(
+        name,
+        "CodeModule" | "CodeClass" | "CodeFunction" | "CodeAPI" | "CodeInteraction"
+    ) {
+        return true;
+    }
+    // Prefixed-name match (<Prefix>_CodeFunction, …).
     matches!(
         name.rsplit_once('_').map(|(_, suffix)| suffix),
         Some("CodeModule")
@@ -1098,4 +1117,53 @@ pub async fn kg_ensure_node_access_schema(
         ));
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_codegraph_class;
+
+    #[test]
+    fn is_codegraph_class_matches_prefixed_names() {
+        // Per-project prefixed names — the v0.2.11+ shape.
+        assert!(is_codegraph_class("MyProject_CodeFunction"));
+        assert!(is_codegraph_class("MyProject_CodeClass"));
+        assert!(is_codegraph_class("MyProject_CodeModule"));
+        assert!(is_codegraph_class("MyProject_CodeAPI"));
+        assert!(is_codegraph_class("MyProject_CodeInteraction"));
+        // Underscored project names still split correctly.
+        assert!(is_codegraph_class("Sim_Racing_AI_CodeFunction"));
+    }
+
+    #[test]
+    fn is_codegraph_class_matches_bare_names() {
+        // v0.2.18 Commit 8 (locked 2026-05-19): bare-name classes
+        // (CodeFunction etc., legacy pre-multi-project orchestrator
+        // schema) must also be recognised so the KG card grid filters
+        // them out. The underlying data stays in Weaviate; only the
+        // GUI representation is hidden.
+        assert!(is_codegraph_class("CodeFunction"));
+        assert!(is_codegraph_class("CodeClass"));
+        assert!(is_codegraph_class("CodeModule"));
+        assert!(is_codegraph_class("CodeAPI"));
+        assert!(is_codegraph_class("CodeInteraction"));
+    }
+
+    #[test]
+    fn is_codegraph_class_rejects_non_code_names() {
+        // KG / Development / unrelated shapes must NOT match.
+        assert!(!is_codegraph_class("MyProject_KnowledgeGraph"));
+        assert!(!is_codegraph_class("MyProject_Development"));
+        assert!(!is_codegraph_class("VibecodedOrchestrator_KnowledgeGraph"));
+        assert!(!is_codegraph_class("CodeBase"));
+        assert!(!is_codegraph_class("CodeReview"));
+        // Empty / odd shapes.
+        assert!(!is_codegraph_class(""));
+        assert!(!is_codegraph_class("Code"));
+        // `_CodeFunction` (leading underscore, empty prefix) IS treated
+        // as a code class — `rsplit_once('_')` yields ("", "CodeFunction").
+        // The hide-from-KG-dashboard outcome is the same as for bare
+        // names, so this is the desired behavior.
+        assert!(is_codegraph_class("_CodeFunction"));
+    }
 }

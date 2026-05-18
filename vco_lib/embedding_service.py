@@ -1157,7 +1157,7 @@ class EmbeddingService:
 # ---------------------------------------------------------------------------
 
 
-def _cli_discover() -> int:
+def _cli_discover(project_root: Path | None = None) -> int:
     """Implement ``python -m vco_lib.embedding_service discover``.
 
     Prints a JSON document with shape::
@@ -1171,7 +1171,14 @@ def _cli_discover() -> int:
         }
 
     Stdout is JSON-only; logs go to stderr. This is the contract the
-    future Tauri ``get_embedding_catalog`` command (Commit 8) consumes.
+    Tauri ``get_embedding_catalog`` command (Commit 8) consumes.
+
+    Args:
+        project_root: optional project-root override for
+            ``EmbeddingService.for_project()`` — forwards the GUI's
+            "which project are we asking about" context. When ``None``,
+            ``EmbeddingService.for_project()`` falls back to its
+            normal env/cwd-based discovery.
 
     Returns exit code 0 on success, 1 if discovery itself raised
     (Ollama URL malformed, etc.).
@@ -1193,7 +1200,7 @@ def _cli_discover() -> int:
     current_text_slot: str | None = None
     current_code_slot: str | None = None
     try:
-        svc = EmbeddingService.for_project()
+        svc = EmbeddingService.for_project(project_root=project_root)
         try:
             current_text_slot = svc.text_vector_slot
             current_code_slot = svc.code_vector_slot
@@ -1223,9 +1230,32 @@ def _build_argparser() -> argparse.ArgumentParser:
         ),
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
-    sub.add_parser(
+    discover = sub.add_parser(
         "discover",
         help="Print a JSON catalog of reachable embedding models",
+    )
+    # --project-root: forwarded into ``EmbeddingService.for_project()`` so
+    # the GUI can ask "for this project, what slots are active?". When
+    # the Tauri ``get_embedding_catalog`` is called with a project_id, the
+    # Rust side resolves it to a folder path and passes it through here.
+    discover.add_argument(
+        "--project-root",
+        type=str,
+        default=None,
+        help=(
+            "Project root path used to resolve current_text_slot / "
+            "current_code_slot. Defaults to env-based discovery."
+        ),
+    )
+    # --json: accept-and-ignore for spec parity. Output is JSON-only
+    # regardless. Kept as an explicit no-op so future callers that
+    # forget the implicit-JSON contract don't trip the argparse error
+    # path.
+    discover.add_argument(
+        "--json",
+        action="store_true",
+        default=False,
+        help="No-op: output is always JSON. Kept for caller-side clarity.",
     )
     return parser
 
@@ -1234,7 +1264,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_argparser()
     args = parser.parse_args(argv)
     if args.cmd == "discover":
-        return _cli_discover()
+        project_root = Path(args.project_root) if args.project_root else None
+        return _cli_discover(project_root=project_root)
     parser.error(f"Unknown command: {args.cmd}")
     return 2  # unreachable; parser.error exits
 

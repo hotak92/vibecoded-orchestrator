@@ -565,6 +565,25 @@ pub async fn set_project_kg_binding(
     req: SetKgBindingReq,
     db: State<'_, Db>,
 ) -> Result<ProjectKgBinding, String> {
+    // v0.2.18 Commit 8: when an embedding_model is supplied, verify it
+    // against the live catalog so a typo doesn't silently break the
+    // seed pipeline. Empty/None passes through unchanged (caller is
+    // explicitly clearing or leaving the existing binding alone).
+    if let Some(model_id) = req.embedding_model.as_deref().filter(|s| !s.trim().is_empty()) {
+        let result = crate::commands::embedding_catalog::validate_model_against_catalog(
+            model_id.trim().to_string(),
+            crate::commands::embedding_catalog::ModelKind::Text,
+            db.clone(),
+        )
+        .await?;
+        if let crate::commands::embedding_catalog::ValidationResult::Invalid { reason } = result {
+            return Err(format!(
+                "embedding_model '{}' not valid for KG binding: {}",
+                model_id, reason
+            ));
+        }
+    }
+
     let row = db.set_project_kg_binding(
         &project_id,
         &req.role,
@@ -742,6 +761,25 @@ pub async fn set_project_codegraph_binding(
     req: SetCodegraphBindingReq,
     db: State<'_, Db>,
 ) -> Result<ProjectCodegraphBinding, String> {
+    // v0.2.18 Commit 8: same catalog-validation pattern as
+    // `set_project_kg_binding` above, but kind=Code. Rejects unknown
+    // names so the GUI dropdown's "available" set is also the only set
+    // that can be persisted.
+    if let Some(model_id) = req.embedding_model.as_deref().filter(|s| !s.trim().is_empty()) {
+        let result = crate::commands::embedding_catalog::validate_model_against_catalog(
+            model_id.trim().to_string(),
+            crate::commands::embedding_catalog::ModelKind::Code,
+            db.clone(),
+        )
+        .await?;
+        if let crate::commands::embedding_catalog::ValidationResult::Invalid { reason } = result {
+            return Err(format!(
+                "embedding_model '{}' not valid for codegraph binding: {}",
+                model_id, reason
+            ));
+        }
+    }
+
     let row = db.set_project_codegraph_binding(
         &project_id,
         &req.collection_prefix,

@@ -1295,6 +1295,58 @@ class CLITests(unittest.TestCase):
             # for_project failed inside CLI → captured into "errors"
             self.assertTrue(any("for_project" in e for e in output["errors"]))
 
+    def test_discover_json_flag_is_accepted_and_ignored(self):
+        """--json is a no-op for caller-side clarity; output is JSON regardless."""
+        with patch.object(
+            EmbeddingService, "discover_text_models", return_value=[]
+        ), patch.object(
+            EmbeddingService, "discover_code_models", return_value=[]
+        ), patch.object(
+            EmbeddingService, "for_project",
+            side_effect=NoEmbeddingBackendError(
+                "no project", attempted_backends=[], capture=False
+            ),
+        ):
+            buf = StringIO()
+            with patch("sys.stdout", buf):
+                rc = embedding_service_main(["discover", "--json"])
+            self.assertEqual(rc, 0)
+            # Still emits JSON (default behavior, --json flag was a no-op).
+            output = json.loads(buf.getvalue())
+            self.assertIn("text_models", output)
+            self.assertIn("code_models", output)
+            self.assertIn("errors", output)
+
+    def test_discover_project_root_is_forwarded(self):
+        """--project-root is passed verbatim into ``for_project``."""
+        captured_kwargs: dict = {}
+
+        def fake_for_project(*, project_root=None):
+            captured_kwargs["project_root"] = project_root
+            raise NoEmbeddingBackendError(
+                "no project", attempted_backends=[], capture=False
+            )
+
+        with patch.object(
+            EmbeddingService, "discover_text_models", return_value=[]
+        ), patch.object(
+            EmbeddingService, "discover_code_models", return_value=[]
+        ), patch.object(
+            EmbeddingService, "for_project",
+            side_effect=fake_for_project,
+        ):
+            buf = StringIO()
+            with patch("sys.stdout", buf):
+                rc = embedding_service_main(
+                    ["discover", "--project-root", "/tmp/some/project"]
+                )
+            self.assertEqual(rc, 0)
+            # The flag must be parsed into a Path and forwarded as-is.
+            self.assertEqual(
+                captured_kwargs.get("project_root"),
+                Path("/tmp/some/project"),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

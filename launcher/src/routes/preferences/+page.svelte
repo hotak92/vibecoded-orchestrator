@@ -7,6 +7,11 @@
   import { ui } from '$lib/stores/ui';
   import Toast from '$lib/components/Toast.svelte';
   import Dropdown from '$lib/components/Dropdown.svelte';
+  import type {
+    EmbeddingCatalog,
+    ModelChoice,
+    DefaultEmbeddingModels,
+  } from '$lib/types/embedding-catalog';
 
   // Setting key → default value
   const KEYS = [
@@ -255,6 +260,122 @@
     }
   }
 
+  // ── Default embedding models for new projects (v0.2.18 Commit 8) ──
+  // Two dropdowns symmetric to install.py's preset-derived defaults.
+  // Source of truth lives in `app_state.default_text_embedding` and
+  // `default_code_embedding`. Values are model ids (e.g.
+  // "qwen3-embedding:0.6b", "openai-text-embedding-3-small") — the
+  // same strings consumed by `vco_lib.embedding_service` for slot
+  // resolution. The dropdowns are populated from the live catalog
+  // (`get_embedding_catalog`) so users can only pick what their
+  // machine can actually serve.
+  let embCatalog = $state<EmbeddingCatalog | null>(null);
+  let embCatalogError = $state<string | null>(null);
+  let defaultTextModel = $state<string>('');
+  let defaultCodeModel = $state<string>('');
+
+  function buildEmbOptions(models: ModelChoice[]) {
+    return models.map((m) => ({
+      value: m.id,
+      label: m.available_now ? m.label : `${m.label} (unavailable)`,
+      disabled: !m.available_now,
+    }));
+  }
+
+  async function loadEmbeddingCatalog() {
+    embCatalogError = null;
+    try {
+      embCatalog = await invoke<EmbeddingCatalog>('get_embedding_catalog', {
+        projectId: null,
+      });
+      if (embCatalog.errors && embCatalog.errors.length > 0) {
+        embCatalogError = embCatalog.errors.join('; ');
+      }
+    } catch (e) {
+      embCatalog = null;
+      embCatalogError = String(e);
+    }
+    try {
+      const cur = await invoke<DefaultEmbeddingModels>(
+        'get_default_embedding_models',
+      );
+      defaultTextModel = cur.text_model ?? '';
+      defaultCodeModel = cur.code_model ?? '';
+    } catch (e) {
+      // Soft-fail: row absent (never set) is the common case on first
+      // boot — leave fields empty so the dropdown shows the placeholder.
+      console.warn('[vct] get_default_embedding_models:', e);
+    }
+  }
+
+  /** Save the user's pick for the text-embedding default. Per the
+   *  v0.2.18 locked rule, this is the EXPLICIT consent surface — no
+   *  auto-switch fires elsewhere when an OpenAI key validates. */
+  async function saveDefaultTextEmbedding(value: string) {
+    try {
+      await invoke('set_default_embedding_models', {
+        textModel: value || null,
+        codeModel: null,
+      });
+      defaultTextModel = value;
+      toast.success('Default text embedding saved');
+    } catch (e) {
+      toast.error(e);
+    }
+  }
+
+  async function saveDefaultCodeEmbedding(value: string) {
+    try {
+      await invoke('set_default_embedding_models', {
+        textModel: null,
+        codeModel: value || null,
+      });
+      defaultCodeModel = value;
+      toast.success('Default code embedding saved');
+    } catch (e) {
+      toast.error(e);
+    }
+  }
+
+  /**
+   * v0.2.18 Commit 8 (locked 2026-05-19): no-auto-switch confirmation.
+   *
+   * Called by the OpenAI key Apply flow (Commit 7 — AGENT-PREFS-UI)
+   * AFTER a successful key validation. Prompts the user for explicit
+   * consent before flipping `default_text_embedding` /
+   * `default_code_embedding` to openai-*. Returns true iff the user
+   * said Yes — caller is responsible for the actual write.
+   *
+   * This helper lives here so it can be shared between the Preferences
+   * page's OpenAI Apply path and any other surface that validates a
+   * key (the wizard has its own checkbox; only the Preferences re-
+   * apply path needs this prompt).
+   */
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  function confirmSetOpenAiAsDefault(textModelId: string, codeModelId: string): boolean {
+    return confirm(
+      `Key valid.
+
+Would you like to set OpenAI as default for new projects?
+This will set:
+  - Default text embedding → ${textModelId}
+  - Default code embedding → ${codeModelId}
+
+You can change these any time from this page.`,
+    );
+  }
+
+  // Expose the helper to other Preferences-page surfaces (Commit 7
+  // wires it into the OpenAI Apply success path). Marking it as a
+  // window-level utility keeps the rule centralised: any place in the
+  // GUI that wants to flip defaults to openai-* MUST go through this
+  // prompt. Off-spec for now (no caller yet); Commit 7 hooks it.
+  // Type-cast through unknown to avoid the noImplicitAny on window.
+  if (typeof window !== 'undefined') {
+    (window as unknown as Record<string, unknown>).__vct_confirm_set_openai_default =
+      confirmSetOpenAiAsDefault;
+  }
+
   const project = $derived($selectedProject);
 
   async function load() {
@@ -300,6 +421,7 @@
     void load();
     void loadPat();
     void loadInitialHardwareSnapshot();
+    void loadEmbeddingCatalog();
   });
   $effect(() => { if (project) void load(); });
 </script>
@@ -348,6 +470,67 @@
         {/each}
       </ul>
     {/if}
+
+    <!--
+      Default embedding models for new projects (v0.2.18 Commit 8).
+      App-level — applies to projects created from now on. Existing
+      projects keep their per-binding model. Populated from the live
+      catalog so users can only pick what their machine can serve;
+      unavailable models render greyed-out with a tooltip explaining
+      why. Per the v0.2.18 locked rule (no-auto-switch), this is the
+      EXPLICIT consent surface for any change to defaults.
+    -->
+    <section class="pr-section">
+      <h2 class="pr-section-title">Default embedding models</h2>
+      {#if embCatalogError}
+        <p class="pr-emb-warn">
+          Catalog warning: {embCatalogError}
+          <button
+            class="pr-link-btn"
+            onclick={() => void loadEmbeddingCatalog()}
+          >
+            retry
+          </button>
+        </p>
+      {/if}
+      <div class="pr-onboarding-row">
+        <div class="pr-onboarding-text">
+          <strong>Default text embedding for new projects</strong>
+          <span class="pr-onboarding-hint">
+            Applied to the KG binding when you create a new project. Existing
+            projects are not affected. Greyed-out options are unreachable
+            from this machine.
+          </span>
+        </div>
+        <div class="pr-dd">
+          <Dropdown
+            options={embCatalog ? buildEmbOptions(embCatalog.text_models) : []}
+            value={defaultTextModel}
+            placeholder={embCatalog ? 'Select model…' : 'Loading…'}
+            ariaLabel="Default text embedding"
+            onChange={(v: string) => void saveDefaultTextEmbedding(v)}
+          />
+        </div>
+      </div>
+      <div class="pr-onboarding-row">
+        <div class="pr-onboarding-text">
+          <strong>Default code embedding for new projects</strong>
+          <span class="pr-onboarding-hint">
+            Applied to the codegraph binding when you create a new project.
+            Existing projects are not affected.
+          </span>
+        </div>
+        <div class="pr-dd">
+          <Dropdown
+            options={embCatalog ? buildEmbOptions(embCatalog.code_models) : []}
+            value={defaultCodeModel}
+            placeholder={embCatalog ? 'Select model…' : 'Loading…'}
+            ariaLabel="Default code embedding"
+            onChange={(v: string) => void saveDefaultCodeEmbedding(v)}
+          />
+        </div>
+      </div>
+    </section>
 
     <!-- Onboarding + Updates: app-level, available regardless of project state. -->
     <section class="pr-section">
@@ -694,7 +877,17 @@
   .pr-row:last-child { border-bottom: none; }
   .pr-row strong { color: #ccc; font-weight: 500; }
   /* Bug 12 systemic: native <select> replaced with <Dropdown>. */
-  .pr-dd { width: 180px; }
+  .pr-dd { width: 260px; }
+  /* v0.2.18 Commit 8: default-embedding-models section. */
+  .pr-emb-warn {
+    margin: 0 0 10px; padding: 8px 12px;
+    background: rgba(255,200,80,0.08); border: 1px solid rgba(255,200,80,0.2);
+    border-radius: 4px; color: rgb(255,200,120); font-size: 11px;
+  }
+  .pr-link-btn {
+    background: none; border: none; color: rgb(0,191,166); cursor: pointer;
+    padding: 0; margin-left: 8px; text-decoration: underline; font-size: 11px;
+  }
 
   .pr-section { margin-top: 20px; }
   .pr-section-title { font-size: 11px; font-weight: 600; color: #888; text-transform: uppercase; letter-spacing: 0.07em; margin: 0 0 8px; }
