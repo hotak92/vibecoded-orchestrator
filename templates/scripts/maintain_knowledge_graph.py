@@ -54,15 +54,38 @@ def _resolve_mcp_servers_dir() -> Path:
 
 _MCP_DIR = _resolve_mcp_servers_dir()
 sys.path.insert(0, str(_MCP_DIR / "weaviate_mcp"))
+# v0.2.18: make vco_lib (EmbeddingService) importable.
+_VCO_LIB_PARENT = _MCP_DIR.parent
+if str(_VCO_LIB_PARENT) not in sys.path:
+    sys.path.insert(0, str(_VCO_LIB_PARENT))
+# Also expose templates/scripts/ so the local sync_knowledge_graph wrapper
+# class is importable. PROJECT_ROOT/.claude/scripts is where these files
+# live in a project install; the orchestrator clone has templates/scripts.
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
 # VCO-REWIRE-END: orchestrator-root-resolution
 
-from server import WeaviateMCPServer
+# v0.2.18: pre-v0.2.18 imported `WeaviateMCPServer` from
+# `claude_mcp_servers/weaviate_mcp/server.py` — that symbol never existed
+# in server.py, so this script was broken at import-time on any path that
+# actually exercised it. Switch to the WeaviateWrapper defined in
+# `sync_knowledge_graph` (the only working WeaviateMCPServer-alike), and
+# the central EmbeddingService that owns embed/slot decisions now.
+from sync_knowledge_graph import WeaviateWrapper as WeaviateMCPServer
+from vco_lib.embedding_service import (
+    EmbeddingService,
+    NoEmbeddingBackendError,
+)
 from weaviate.classes.query import Filter
 
 # Configuration
+# v0.2.18: EMBEDDING_MODEL is no longer read here. This script delegates
+# embed calls to sync_knowledge_graph.sync_node, which constructs its own
+# EmbeddingService. Keeping WEAVIATE_URL / OLLAMA_URL / GRPC_PORT for the
+# Weaviate client only.
 WEAVIATE_URL = os.getenv("WEAVIATE_URL", "http://localhost:8081")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11435")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "qwen3-embedding:0.6b")
 GRPC_PORT = int(os.getenv("GRPC_PORT", "50052"))
 
 KNOWLEDGE_ROOT = PROJECT_ROOT / "knowledge"
@@ -211,28 +234,30 @@ def delete_orphaned_weaviate_entries(
     return deleted_count
 
 
-def sync_orphaned_files(orphaned_titles: List[str], file_nodes: Dict[str, Path]) -> int:
-    """Sync orphaned files to Weaviate"""
+def sync_orphaned_files(
+    orphaned_titles: List[str],
+    file_nodes: Dict[str, Path],
+    server: WeaviateMCPServer,
+) -> int:
+    """Sync orphaned files to Weaviate.
+
+    v0.2.18: takes the WeaviateMCPServer (sync_knowledge_graph's
+    WeaviateWrapper) from the caller instead of constructing its own —
+    the wrapper requires an EmbeddingService at construction time, which
+    main() already owns. Avoids a second-EmbeddingService-instance
+    footgun (each instance probes backends afresh).
+    """
     from sync_knowledge_graph import sync_node
 
     synced_count = 0
 
     try:
-        server = WeaviateMCPServer(
-            weaviate_url=WEAVIATE_URL,
-            ollama_url=OLLAMA_URL,
-            embedding_model=EMBEDDING_MODEL,
-            grpc_port=GRPC_PORT
-        )
-
         for title in orphaned_titles:
             if title in file_nodes:
                 file_path = file_nodes[title]
                 if sync_node(server, file_path):
                     synced_count += 1
                     print(f"  ✓ Synced orphaned file: {title}")
-
-        server.close()
 
     except Exception as e:
         print(f"  ❌ Error syncing orphaned files: {e}")
@@ -304,7 +329,7 @@ def check_consistency(server: WeaviateMCPServer, fix: bool = False) -> Dict[str,
 
         if fix:
             print(f"\n  Fixing orphaned files...")
-            synced = sync_orphaned_files(orphaned_files, file_nodes)
+            synced = sync_orphaned_files(orphaned_files, file_nodes, server)
             stats["fixed"] += synced
     else:
         print(f"  ✓ No orphaned files")
@@ -384,12 +409,34 @@ def main():
         print("Use --check, --fix, or --rebuild")
         sys.exit(1)
 
+    embedding_service = None
+    server = None
     try:
-        # Initialize server
+        # v0.2.18: construct EmbeddingService at script entry. Even
+        # --check (read-only) needs it because the WeaviateWrapper now
+        # takes it at construction time (the wrapper's `text_vector_slot`
+        # property reads from it).
+        try:
+            embedding_service = EmbeddingService.for_project(PROJECT_ROOT)
+        except NoEmbeddingBackendError as e:
+            # --check is read-only and doesn't actually need to embed
+            # anything, but the WeaviateWrapper requires an
+            # EmbeddingService at construction. Without a backend, we
+            # can still query Weaviate (no embed needed for the
+            # consistency check itself) — but --fix and --rebuild WILL
+            # need to embed via sync_node, so they have to abort.
+            print(f"❌ No embedding backend reachable: {e}", file=sys.stderr)
+            print(
+                "   See .claude/context/EMBEDDING_FAILURES.md + "
+                "~/.claude/metrics/embedding_failures.jsonl",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        # Initialize Weaviate client + bind to the embedding service
         server = WeaviateMCPServer(
             weaviate_url=WEAVIATE_URL,
-            ollama_url=OLLAMA_URL,
-            embedding_model=EMBEDDING_MODEL,
+            embedding_service=embedding_service,
             grpc_port=GRPC_PORT
         )
 
@@ -410,6 +457,11 @@ def main():
             print(f"Orphaned Weaviate entries: {stats['orphaned_weaviate']}")
             print(f"Orphaned files: {stats['orphaned_files']}")
             print(f"Broken links: {stats['broken_links']}")
+            # v0.2.18: surface the active named-vector slot so operators
+            # can sanity-check which model maintain is using for write
+            # paths (--fix / --rebuild). Read-only check doesn't depend
+            # on it, but logging it is cheap and useful.
+            print(f"Active text slot: {embedding_service.text_vector_slot}")
 
             if fix:
                 print(f"Fixed: {stats['fixed']}")
@@ -420,13 +472,22 @@ def main():
                 else:
                     print("\n✅ All checks passed")
 
-        server.close()
-
     except Exception as e:
         print(f"❌ Fatal error: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
+    finally:
+        if server is not None:
+            try:
+                server.close()
+            except Exception:
+                pass
+        if embedding_service is not None:
+            try:
+                embedding_service.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

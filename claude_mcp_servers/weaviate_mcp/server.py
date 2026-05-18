@@ -90,6 +90,38 @@ except ImportError:
             return False
 register_sighup_exit_handler(logger)
 
+# v0.2.18: EmbeddingService (vco_lib) — centralised dispatcher for
+# embed calls and slot resolution. Replaces the per-helper Ollama /
+# CodeEmbed / OpenAI HTTP calls that used to live as
+# `get_ollama_embedding` / `get_code_embedding` / `_get_all_kg_embeddings`
+# / `_get_search_vector` here. Those helpers still exist as thin
+# adapters that call EmbeddingService — keeping the function names
+# preserves every callsite in this module unchanged.
+#
+# Import is graceful: if vco_lib isn't on sys.path (rare; partial
+# install), the helpers fall through to their pre-v0.2.18 inline
+# HTTP-call bodies. This lets the MCP boot on a half-migrated install
+# instead of crashing at import time.
+try:
+    _vco_lib_parent = Path(__file__).resolve().parent.parent.parent
+    if str(_vco_lib_parent) not in sys.path:
+        sys.path.insert(0, str(_vco_lib_parent))
+    from vco_lib.embedding_service import (
+        EmbeddingService,
+        NoEmbeddingBackendError,
+    )
+    HAS_EMBEDDING_SERVICE = True
+except Exception as _embed_import_err:  # pragma: no cover (rare half-install)
+    logger.warning(
+        "EmbeddingService import failed (%s) — falling back to legacy "
+        "inline embed helpers. Run install.py --update to refresh vco_lib.",
+        _embed_import_err,
+    )
+    HAS_EMBEDDING_SERVICE = False
+    EmbeddingService = None  # type: ignore[assignment]
+    NoEmbeddingBackendError = Exception  # type: ignore[assignment]
+
+
 # Default truncation limit in Claude Code is ~25K chars.
 # v2.1.91+ supports _meta["anthropic/maxResultSizeChars"] override (up to 500K).
 _MAX_RESULT_SIZE = 200_000  # 200K — generous but not wasteful
@@ -1486,12 +1518,101 @@ def _reset_weaviate_client_cache() -> None:
         weaviate_client = None
 
 
-async def get_ollama_embedding(text: str) -> list[float] | None:
-    """Get embedding from Ollama using the active text model (qwen3-embedding by default, 1024-dim).
+# v0.2.18: Lazy + cached EmbeddingService accessor.
+#
+# Why lazy: the MCP server is long-running (one process per Claude Code
+# session). Constructing at import time would probe backends before the
+# Weaviate/Ollama containers have settled, producing a stale
+# NoEmbeddingBackendError that survives until the next session restart.
+#
+# Why cached: the service owns an HTTP connection pool; one instance
+# amortises TLS+keep-alive across every embed call this MCP makes for
+# the rest of the session.
+#
+# Why not module-level singleton: per the v0.2.18 locked design
+# decision, EmbeddingService is per-project — but this MCP server IS
+# pinned to one project for its lifetime (KG_COLLECTION env is set per-
+# project by the launcher), so "per-MCP-instance" satisfies the
+# per-project constraint.
+#
+# Concurrency: the cached service is initialised under the asyncio
+# event loop's natural serialisation. Two near-simultaneous tool calls
+# may both try to construct the service; the second's `for_project()`
+# is a few-ms re-probe of already-running backends, and the cache write
+# is idempotent. No lock needed.
+_cached_embed_service: "EmbeddingService | None" = None
+_embed_service_construction_failed_at: float = 0.0  # epoch seconds
+_EMBED_SERVICE_RETRY_WINDOW = 10.0  # don't re-probe failed construction more than once per 10s
 
-    Passes num_ctx=8192 to override Ollama's default 4096-token context window,
-    which is too small for qwen3-embedding's actual 32k capacity.
+
+def _get_embedding_service():
+    """Return a cached EmbeddingService instance for this MCP session.
+
+    Returns None when:
+      * vco_lib isn't importable (HAS_EMBEDDING_SERVICE=False), OR
+      * Construction raised NoEmbeddingBackendError recently (within the
+        10-second retry window — avoids hammering already-down services).
+
+    On None, the legacy inline helpers below fall through to their
+    original HTTP-call bodies, which preserves backward compatibility
+    for half-migrated installs and lets each helper produce its own
+    "service unreachable" error rather than masking it with a generic
+    one.
     """
+    global _cached_embed_service, _embed_service_construction_failed_at
+    if not HAS_EMBEDDING_SERVICE:
+        return None
+    if _cached_embed_service is not None:
+        return _cached_embed_service
+
+    import time as _time
+    if (_time.monotonic() - _embed_service_construction_failed_at) < _EMBED_SERVICE_RETRY_WINDOW:
+        return None  # in the retry window — don't probe again yet
+
+    try:
+        _cached_embed_service = EmbeddingService.for_project()
+        return _cached_embed_service
+    except NoEmbeddingBackendError as e:
+        logger.warning(
+            "EmbeddingService construction failed (NoEmbeddingBackendError): %s. "
+            "Falling back to legacy inline helpers for the next %.0fs.",
+            e,
+            _EMBED_SERVICE_RETRY_WINDOW,
+        )
+        _embed_service_construction_failed_at = _time.monotonic()
+        return None
+    except Exception as e:
+        logger.warning(
+            "EmbeddingService construction failed (%s) — falling back to "
+            "legacy inline helpers.",
+            e,
+        )
+        _embed_service_construction_failed_at = _time.monotonic()
+        return None
+
+
+async def get_ollama_embedding(text: str) -> list[float] | None:
+    """Get embedding from Ollama using the active text model.
+
+    v0.2.18: prefers EmbeddingService (which picks ollama or openai
+    based on env). Falls through to the inline Ollama call when the
+    service isn't available — preserves the pre-v0.2.18 contract that
+    THIS helper specifically hits Ollama (used by `backfill_embeddings`
+    when the user explicitly asked for `provider="qwen3"` or
+    `"legacy_ollama"`, where falling through to OpenAI would be wrong).
+    """
+    svc = _get_embedding_service()
+    if svc is not None and "openai" not in svc.text_vector_slot:
+        # Active text backend IS Ollama — safe to dispatch through the
+        # service. Run sync embed in a thread so we don't block the
+        # event loop.
+        try:
+            return await asyncio.to_thread(svc.embed_text, text)
+        except Exception as e:
+            logger.warning("EmbeddingService.embed_text failed (%s); falling back to inline Ollama", e)
+    # Inline fallback: direct Ollama call (preserves pre-v0.2.18 path).
+    # num_ctx=8192 overrides Ollama's 4096 default, matching qwen3-
+    # embedding's actual capacity.
     async with aiohttp.ClientSession() as session:
         async with session.post(
             f"{OLLAMA_URL}/api/embeddings",
@@ -1532,12 +1653,35 @@ async def get_legacy_text_embedding(text: str) -> list[float] | None:
 
 
 async def get_openai_embedding(text: str) -> list[float] | None:
-    """Get embedding from OpenAI API (1536-dim for text-embedding-3-small).
+    """Get embedding from OpenAI API.
 
-    Returns None if OPENAI_API_KEY is not set or if the request fails.
+    v0.2.18: prefers EmbeddingService when the active text OR code slot
+    points at OpenAI. Falls through to inline OpenAI HTTP call so
+    `backfill_embeddings(provider="openai")` still works on projects
+    whose ACTIVE_EMBEDDING is not openai.
+
+    Returns None if no key configured or all paths fail.
     """
     if not OPENAI_API_KEY:
         return None
+    svc = _get_embedding_service()
+    if svc is not None and (
+        "openai" in svc.text_vector_slot or "openai" in svc.code_vector_slot
+    ):
+        try:
+            # OpenAI slot resolution — text first, then code. Both paths
+            # use the same OpenAI adapter inside the service, so the
+            # choice only affects which model id we pass.
+            if "openai" in svc.text_vector_slot:
+                return await asyncio.to_thread(svc.embed_text, text)
+            return await asyncio.to_thread(svc.embed_code, text)
+        except Exception as e:
+            logger.warning(
+                "EmbeddingService OpenAI dispatch failed (%s); falling back to inline OpenAI call",
+                e,
+            )
+
+    # Inline fallback (pre-v0.2.18 path): direct OpenAI HTTP call.
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -1593,11 +1737,37 @@ async def _get_both_embeddings(text: str) -> tuple[list[float] | None, list[floa
 
 
 async def _get_all_kg_embeddings(text: str) -> dict[str, list[float]]:
-    """Get all KG embedding variants concurrently.
+    """Get all KG embedding variants — every reachable text backend.
 
-    Returns dict mapping named-vector names to their embeddings.
-    Generates: qwen3_embed (new primary), ollama_embed (legacy), openai_embed.
+    v0.2.18: routes through EmbeddingService.embed_text_all_configured()
+    which fans out to qwen3 + openai + legacy-arctic (any reachable
+    backend) and returns a ``{slot_name: vector}`` dict. The legacy
+    inline path (3-way asyncio.gather) is preserved as fallback for
+    half-migrated installs.
+
+    Used by `store_knowledge_node` to populate every configured slot on
+    every write — so search-after-model-switch keeps working.
     """
+    svc = _get_embedding_service()
+    if svc is not None:
+        try:
+            slots = await asyncio.to_thread(svc.embed_text_all_configured, text)
+            if slots:
+                return slots
+            # Empty dict → every backend failed. Fall through to the
+            # legacy path so the inline `gather` can surface its own
+            # per-backend errors via the caller's logger.
+            logger.warning(
+                "_get_all_kg_embeddings: EmbeddingService returned no slots; "
+                "falling back to inline gather"
+            )
+        except Exception as e:
+            logger.warning(
+                "_get_all_kg_embeddings via EmbeddingService failed (%s); "
+                "falling back to inline gather", e
+            )
+
+    # Inline fallback (pre-v0.2.18 path): direct 3-way gather.
     qwen3_vec, legacy_vec, openai_vec = await asyncio.gather(
         get_ollama_embedding(text),         # qwen3-embedding (new primary)
         get_legacy_text_embedding(text),     # snowflake-arctic-embed2 (legacy)
@@ -1614,11 +1784,29 @@ async def _get_all_kg_embeddings(text: str) -> dict[str, list[float]]:
 
 
 async def _get_all_code_embeddings(text: str) -> dict[str, list[float]]:
-    """Get all code embedding variants concurrently.
+    """Get all code embedding variants — every reachable code backend.
 
-    Returns dict mapping named-vector names to their embeddings.
-    Generates: codesage_embed (new primary), ollama_code_embed (legacy), openai_embed.
+    v0.2.18: routes through EmbeddingService.embed_code_all_configured()
+    which fans out to codesage + openai + legacy-jina (any reachable
+    backend). Legacy inline gather preserved as fallback.
     """
+    svc = _get_embedding_service()
+    if svc is not None:
+        try:
+            slots = await asyncio.to_thread(svc.embed_code_all_configured, text)
+            if slots:
+                return slots
+            logger.warning(
+                "_get_all_code_embeddings: EmbeddingService returned no slots; "
+                "falling back to inline gather"
+            )
+        except Exception as e:
+            logger.warning(
+                "_get_all_code_embeddings via EmbeddingService failed (%s); "
+                "falling back to inline gather", e
+            )
+
+    # Inline fallback (pre-v0.2.18 path).
     codesage_vec, legacy_vec, openai_vec = await asyncio.gather(
         get_code_embedding(text),            # CodeSage-Large-v2 (new primary)
         get_legacy_code_embedding(text),     # jina-v2-base-code (legacy)
@@ -1661,19 +1849,36 @@ def _primary_named_vector(scheme: str) -> str:
 async def _get_search_vector(text: str, scheme: str = "kg") -> tuple[list[float] | None, str]:
     """Get embedding for search, returns (vector, target_vector_name).
 
-    Every collection on disk is named-vector — the DUAL-off branch was
-    dead code (audit fix 2026-04-30). target_vector_name is always the
-    slot name matching the model that produced the vector; never the
-    empty string.
+    v0.2.18: routes through EmbeddingService which resolves BOTH the
+    embedding backend AND the named-vector slot from env in one place.
+    Pre-v0.2.18 this branched on ACTIVE_EMBEDDING here, which duplicated
+    the slot-resolution logic already living in the Wave-A
+    EmbeddingService TEXT_SLOT_MAP / CODE_SLOT_MAP.
 
-    ACTIVE_EMBEDDING controls which model is used for search:
-      KG scheme:   "qwen3" (default) | "ollama" (legacy arctic) | "openai"
-      Code scheme:  "codesage" (default) | "ollama" (legacy jina) | "openai"
+    Falls through to the legacy ACTIVE_EMBEDDING-branching path when
+    the service is unavailable.
 
     Args:
         text: Text to embed.
-        scheme: 'kg' or 'code' — determines which model and target vector name.
+        scheme: 'kg' or 'code' — determines text vs code backend.
     """
+    svc = _get_embedding_service()
+    if svc is not None:
+        try:
+            if scheme == "code":
+                vec = await asyncio.to_thread(svc.embed_code, text)
+                target = svc.code_vector_slot
+            else:
+                vec = await asyncio.to_thread(svc.embed_text, text)
+                target = svc.text_vector_slot
+            return vec, target
+        except Exception as e:
+            logger.warning(
+                "_get_search_vector via EmbeddingService failed (%s); "
+                "falling back to legacy ACTIVE_EMBEDDING branching", e
+            )
+
+    # Legacy fallback path (pre-v0.2.18): branches on ACTIVE_EMBEDDING.
     if ACTIVE_EMBEDDING == "openai" and OPENAI_API_KEY:
         vec = await get_openai_embedding(text)
         if vec:
@@ -1708,10 +1913,6 @@ async def _get_search_vector(text: str, scheme: str = "kg") -> tuple[list[float]
             # Legacy: Arctic via Ollama
             vec = await get_legacy_text_embedding(text)
             target = "ollama_embed"
-    # NOTE: previously this returned (vec, "" if not DUAL_EMBEDDING_ENABLED).
-    # The DUAL-off branch was dead code — every collection on disk is
-    # named-vector — and `target_vector=""` would query an unnamed slot
-    # that doesn't exist on dual-vector collections (audit fix, 2026-04-30).
     return vec, target
 
 
@@ -1737,11 +1938,24 @@ async def count_tokens_async(text: str) -> int:
 
 
 async def get_code_embedding(text: str) -> list[float] | None:
-    """Get code embedding from the code embedding service (CodeSage-Large-v2, 2048-dim).
+    """Get code embedding from the CodeSage service.
 
-    Calls the FastAPI code embedding service which supports both GPU (sentence-transformers)
-    and Ollama backends. Falls back to Ollama-compatible endpoint at CODE_EMBED_SERVICE_URL.
+    v0.2.18: prefers EmbeddingService when the active code slot is
+    `codesage_embed` (same backend the inline call targets). Falls
+    through to the inline CodeEmbed HTTP call otherwise — so a project
+    with active=openai-code can still ask for a codesage embedding via
+    this helper (used by `backfill_embeddings(provider="codesage")`).
     """
+    svc = _get_embedding_service()
+    if svc is not None and svc.code_vector_slot == "codesage_embed":
+        try:
+            return await asyncio.to_thread(svc.embed_code, text)
+        except Exception as e:
+            logger.warning(
+                "EmbeddingService.embed_code failed (%s); falling back to inline CodeEmbed call",
+                e,
+            )
+    # Inline fallback (pre-v0.2.18 path): direct CodeEmbed HTTP call.
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -3473,9 +3687,16 @@ async def search_code_graph(
                     limit=limit,
                     return_metadata=MetadataQuery(distance=True, score=True),
                 )
-                # Use named vector target if dual embedding is enabled
+                # v0.2.18: target the slot matching the active code
+                # backend (codesage_embed / ollama_code_embed /
+                # openai_code_embed / jina_embed). Falls back to the
+                # pre-v0.2.18 ACTIVE_EMBEDDING branching when the
+                # service isn't available.
                 if DUAL_EMBEDDING_ENABLED:
-                    if ACTIVE_EMBEDDING in ("qwen3", "codesage"):
+                    svc = _get_embedding_service()
+                    if svc is not None:
+                        kwargs["target_vector"] = svc.code_vector_slot
+                    elif ACTIVE_EMBEDDING in ("qwen3", "codesage"):
                         kwargs["target_vector"] = "codesage_embed"
                     else:
                         kwargs["target_vector"] = "ollama_code_embed"

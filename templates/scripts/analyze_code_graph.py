@@ -41,7 +41,7 @@ import uuid
 import requests
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Any, Optional, Set, Tuple
+from typing import Dict, List, Any, Optional, Set, Tuple, Mapping
 import subprocess
 
 
@@ -286,22 +286,18 @@ except ImportError:
     print("Error: weaviate-client not installed. Install with: pip install weaviate-client", file=sys.stderr)
     sys.exit(1)
 
-# Code embedding configuration — supports two backends:
-#   "service": FastAPI code embedding service (CodeSage-Large-v2 on GPU, default)
-#   "ollama":  Ollama API (any model — legacy jina, qwen3, etc.)
-CODE_EMBED_BACKEND = os.getenv("CODE_EMBED_BACKEND", "service")
-CODE_EMBED_SERVICE_URL = os.getenv("CODE_EMBED_SERVICE_URL", "http://localhost:11440")
-OLLAMA_CONFIG = {
-    "url": os.getenv("OLLAMA_URL", "http://localhost:11435"),
-    "model": os.getenv("CODE_EMBED_MODEL", "unclemusclez/jina-embeddings-v2-base-code:latest"),
-}
-
-# Named vector key matches the active backend — used for all insert_params["vector"] dicts.
-# Must match the collection's named vector configuration in Weaviate.
-_ACTIVE_CODE_VECTOR = "codesage_embed" if CODE_EMBED_BACKEND == "service" else "ollama_code_embed"
-
-# Named vector support: when enabled, vectors are stored as {_ACTIVE_CODE_VECTOR: vec}
-# instead of flat vectors. Must match the collection's named vector configuration.
+# Code embedding configuration — v0.2.18 centralised via EmbeddingService.
+# Pre-v0.2.18, this script read CODE_EMBED_BACKEND / CODE_EMBED_SERVICE_URL /
+# CODE_EMBED_MODEL directly and hardcoded the active slot to either
+# `codesage_embed` (service) or `ollama_code_embed` (ollama). The hardcode
+# silently broke OpenAI-as-code-embed installs and made the slot decision
+# duplicate the same logic in 5+ places. v0.2.18: a single
+# EmbeddingService instance (constructed in main()) owns the choice; this
+# module's embed_* helpers route through it.
+#
+# Kept-but-unused env reads (CODE_EMBED_BACKEND/SERVICE_URL/MODEL) live on
+# vco_lib/embedding_service.py:for_project() now. Searching this file for
+# those names will turn up only the historical comment above.
 DUAL_EMBEDDING_ENABLED = os.getenv("DUAL_EMBEDDING_ENABLED", "true").lower() == "true"
 
 # Note: We use manual vectorization (vectorizer=None) and generate embeddings via the configured backend.
@@ -325,6 +321,11 @@ else:
     _mcp_dir = Path(__file__).resolve().parent.parent.parent / "claude_mcp_servers"
 if str(_mcp_dir) not in sys.path:
     sys.path.insert(0, str(_mcp_dir))
+# v0.2.18: vco_lib (EmbeddingService) lives next to claude_mcp_servers in
+# the orchestrator clone. Put its parent on sys.path too.
+_vco_lib_parent = _mcp_dir.parent
+if str(_vco_lib_parent) not in sys.path:
+    sys.path.insert(0, str(_vco_lib_parent))
 # VCO-REWIRE-END: orchestrator-root-resolution
 try:
     from weaviate_mcp.code_truncation import (
@@ -344,58 +345,151 @@ except ImportError:
     def truncate_module_for_embedding(module_summary, model=None):
         return module_summary[:2000]
 
-# Resolve which code embedding model is active (for token budget in truncation)
-_CODE_MODEL = (
-    os.getenv("CODE_EMBED_MODEL", "codesage/codesage-large-v2")
-    if CODE_EMBED_BACKEND == "service"
-    else OLLAMA_CONFIG["model"]
+
+# v0.2.18: central embedding dispatcher. Replaces the inline
+# CODE_EMBED_BACKEND / CODE_EMBED_SERVICE_URL HTTP calls that previously
+# duplicated the same logic across `generate_embedding`,
+# `embed_function`, `embed_class`, `embed_module` plus 5+ inline insert
+# sites. EmbeddingService.for_project() picks the right backend
+# (CodeEmbed service / Ollama / OpenAI) AND the right named-vector slot
+# (codesage_embed / jina_embed / openai_code_embed / qwen3_embed
+# fallback) from env, so this module no longer hardcodes any of it.
+from vco_lib.embedding_service import (
+    EmbeddingService,
+    NoEmbeddingBackendError,
 )
 
+# Module-global EmbeddingService — initialised by main() before any
+# code-graph work happens, and closed in main()'s finally block. The
+# embed_* helpers below resolve it lazily on first use so unit tests that
+# import the module without calling main() don't pay the cost of probing
+# backends at import-time.
+_embedding_service: Optional["EmbeddingService"] = None
 
-def generate_embedding(text: str) -> Optional[List[float]]:
-    """Generate code embedding using the configured backend (service or Ollama)."""
+
+def _set_embedding_service(svc: "EmbeddingService") -> None:
+    """Inject the active EmbeddingService for this run.
+
+    Called by main() before any embed call. Tests can also call this to
+    inject a mocked service.
+    """
+    global _embedding_service
+    _embedding_service = svc
+
+
+def _get_embedding_service() -> Optional["EmbeddingService"]:
+    """Return the active EmbeddingService, or None if not initialised.
+
+    None means the embed call is happening outside the normal entrypoint
+    (e.g. a unit test imported the module without setting up the service).
+    In that case the embed helpers below return None — same behaviour as
+    pre-v0.2.18's `generate_embedding` did on backend failure.
+    """
+    return _embedding_service
+
+
+def _active_code_vector_slot() -> str:
+    """Return the active named-vector slot for code writes.
+
+    Resolved at-call-time so re-init doesn't strand callers on an old
+    slot. Falls back to the pre-v0.2.18 default (`codesage_embed`) when
+    the service isn't initialised — preserves existing behaviour for
+    tests that exercise the schema-creation path without first booting
+    the embedding service.
+    """
+    svc = _get_embedding_service()
+    if svc is not None:
+        return svc.code_vector_slot
+    return "codesage_embed"
+
+
+# Resolve which code embedding model is active (for token budget in truncation)
+def _resolve_code_model_id() -> str:
+    """Return the active code-embedding model id, e.g. 'codesage-large-v2'.
+
+    Read via the EmbeddingService when available, with a CodeSage default
+    so the smart-truncation token budget still applies in test contexts
+    where the service isn't booted.
+    """
+    svc = _get_embedding_service()
+    if svc is not None:
+        return svc.code_model_id
+    return "codesage/codesage-large-v2"
+
+
+def generate_embedding(text: str) -> Optional[Any]:
+    """Embed *text* via the EmbeddingService.
+
+    Return shape:
+      * ``DUAL_EMBEDDING_ENABLED=true`` (default) → ``dict[str, list[float]]``
+        with one slot per reachable code backend (multi-slot enrichment).
+      * ``DUAL_EMBEDDING_ENABLED=false`` (legacy) → ``list[float]``,
+        single flat vector from the active backend.
+      * No backend produced anything → ``None``.
+
+    The ``if embedding:`` guard at every inline insert site works for
+    every shape (truthy non-empty dict OR non-empty list OR None).
+
+    Pre-v0.2.18 this read ``CODE_EMBED_BACKEND`` env directly and
+    returned only a ``list[float]``. v0.2.18 centralises both decisions
+    on EmbeddingService and adds multi-slot fan-out — see
+    ``vco_lib.embedding_service.EmbeddingService.embed_code_all_configured``.
+    """
+    svc = _get_embedding_service()
+    if svc is None:
+        print("⚠️  Embedding requested but EmbeddingService not initialised", file=sys.stderr)
+        return None
     try:
-        if CODE_EMBED_BACKEND == "service":
-            response = requests.post(
-                f"{CODE_EMBED_SERVICE_URL}/api/embeddings",
-                json={"model": "", "prompt": text},
-                timeout=60,
-            )
-        else:
-            response = requests.post(
-                f"{OLLAMA_CONFIG['url']}/api/embeddings",
-                json={"model": OLLAMA_CONFIG["model"], "prompt": text},
-                timeout=30,
-            )
-
-        if response.status_code == 200:
-            data = response.json()
-            return data.get("embedding")
-        else:
-            print(f"⚠️  Embedding generation failed: HTTP {response.status_code}")
-            return None
+        if DUAL_EMBEDDING_ENABLED:
+            slots = svc.embed_code_all_configured(text)
+            return slots if slots else None
+        return svc.embed_code(text)
     except Exception as e:
-        print(f"⚠️  Embedding generation error: {e}")
+        print(f"⚠️  Embedding generation error: {e}", file=sys.stderr)
         return None
 
 
-def embed_function(signature: str, body: str, language: str = "python") -> Optional[List[float]]:
-    """Truncate function smartly, then generate embedding."""
-    text = truncate_function_for_embedding(signature, body, language=language, model=_CODE_MODEL)
+def _shape_for_insert(embedding: Optional[Any]) -> Optional[Any]:
+    """Shape ``embedding`` for ``collection.data.insert(vector=)``.
+
+    Logic:
+      * None → None (caller's ``if embedding:`` skips the vector= kwarg).
+      * ``dict`` (multi-slot) → return as-is.
+      * ``list`` AND ``DUAL_EMBEDDING_ENABLED`` → wrap as
+        ``{active_slot: list}`` so Weaviate routes it to the right named
+        vector.
+      * ``list`` AND legacy mode → pass through (flat vector).
+    """
+    if not embedding:
+        return None
+    if isinstance(embedding, dict):
+        return embedding
+    if DUAL_EMBEDDING_ENABLED:
+        return {_active_code_vector_slot(): embedding}
+    return embedding
+
+
+def embed_function(signature: str, body: str, language: str = "python") -> Optional[Any]:
+    """Truncate function smartly, then generate embedding.
+
+    Returns a slot dict (multi-slot mode), a flat vector (legacy mode),
+    or None on backend failure.
+    """
+    text = truncate_function_for_embedding(signature, body, language=language, model=_resolve_code_model_id())
     return generate_embedding(text)
 
 
 def embed_class(signature: str, class_body: str, methods: Optional[List[str]] = None,
-                language: str = "python") -> Optional[List[float]]:
+                language: str = "python") -> Optional[Any]:
     """Truncate class smartly, then generate embedding."""
     text = truncate_class_for_embedding(signature, class_body, methods=methods,
-                                        language=language, model=_CODE_MODEL)
+                                        language=language, model=_resolve_code_model_id())
     return generate_embedding(text)
 
 
-def embed_module(module_summary: str) -> Optional[List[float]]:
+def embed_module(module_summary: str) -> Optional[Any]:
     """Truncate module summary, then generate embedding."""
-    text = truncate_module_for_embedding(module_summary, model=_CODE_MODEL)
+    text = truncate_module_for_embedding(module_summary, model=_resolve_code_model_id())
     return generate_embedding(text)
 
 
@@ -721,17 +815,27 @@ class CodeGraphAnalyzer:
     def _vectorizer_config(self):
         """Return appropriate vectorizer config based on named_vectors flag.
 
-        Three slots, matching `VECTOR_SCHEMES["code"]` in
-        weaviate_mcp/server.py. Pre-2026-04-30 only declared two
-        (active + legacy), which broke `_get_all_code_embeddings` writes
-        and `backfill_embeddings(provider="openai")` on freshly-analyzed
-        collections (audit finding Code-M1, 2026-04-30). De-dup against
-        `_ACTIVE_CODE_VECTOR` for the case where the active slot is
-        `ollama_code_embed` (legacy backend).
+        v0.2.18: slot set is the active code slot (from EmbeddingService)
+        UNION the legacy/forward-compat slots so post-create switches
+        between models don't require recreating the collection.
+
+        Pre-v0.2.18 hardcoded three slots based on `_ACTIVE_CODE_VECTOR`
+        env-time resolution; that broke OpenAI-as-code and arctic-text-
+        as-code-fallback installs. The Wave-A schema helper
+        (vco_lib/weaviate_schema.py) carries the full slot map.
         """
         if not self.named_vectors:
             return Configure.Vectorizer.none()
-        slot_names = {_ACTIVE_CODE_VECTOR, "ollama_code_embed", "openai_embed"}
+        # Active slot (whichever backend EmbeddingService picked) + the
+        # legacy / forward-compat slots so we can later switch models
+        # via `migrate-collections` without dropping data.
+        active_slot = _active_code_vector_slot()
+        slot_names = {
+            active_slot,
+            "ollama_code_embed",   # legacy jina-v2-base-code
+            "codesage_embed",      # CodeSage primary (preserved through model switches)
+            "openai_code_embed",   # OpenAI text-embedding-3 reused for code
+        }
         return [Configure.NamedVectors.none(name=n) for n in sorted(slot_names)]
 
     def _inverted_index_config(self):
@@ -1607,7 +1711,7 @@ class CodeGraphAnalyzer:
                 "references": {"module": module_uuid},
             }
             if embedding:
-                insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+                insert_params["vector"] = _shape_for_insert(embedding)
             self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['classes'] += 1
 
@@ -1637,7 +1741,7 @@ class CodeGraphAnalyzer:
                 "references": {"module": module_uuid},
             }
             if embedding:
-                insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+                insert_params["vector"] = _shape_for_insert(embedding)
             func_uuid = self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['functions'] += 1
 
@@ -1669,7 +1773,7 @@ class CodeGraphAnalyzer:
                     "references": {"handler": func_uuid},
                 }
                 if api_embedding:
-                    api_params["vector"] = {_ACTIVE_CODE_VECTOR: api_embedding} if DUAL_EMBEDDING_ENABLED else api_embedding
+                    api_params["vector"] = _shape_for_insert(api_embedding)
                 self._dedup_insert(self.apis_collection, api_params, api_params["properties"].get("endpoint", "") + ":" + api_params["properties"].get("method", ""), file_path_rel=relative_path)
                 stats.setdefault('apis', 0)
                 stats['apis'] += 1
@@ -1797,7 +1901,7 @@ class CodeGraphAnalyzer:
                 "references": {"module": module_uuid},
             }
             if embedding:
-                insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+                insert_params["vector"] = _shape_for_insert(embedding)
             self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['classes'] += 1
 
@@ -1818,7 +1922,7 @@ class CodeGraphAnalyzer:
                 },
             }
             if embedding:
-                api_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+                api_params["vector"] = _shape_for_insert(embedding)
             self._dedup_insert(self.apis_collection, api_params, api_params["properties"].get("endpoint", "") + ":" + api_params["properties"].get("method", ""), file_path_rel=relative_path)
             stats['apis'] += 1
 
@@ -2022,7 +2126,7 @@ class CodeGraphAnalyzer:
                 "references": {"module": module_uuid},
             }
             if embedding:
-                insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+                insert_params["vector"] = _shape_for_insert(embedding)
             self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['classes'] += 1
 
@@ -2049,7 +2153,7 @@ class CodeGraphAnalyzer:
                 "references": {"module": module_uuid},
             }
             if embedding:
-                insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+                insert_params["vector"] = _shape_for_insert(embedding)
             self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['functions'] += 1
 
@@ -2089,7 +2193,7 @@ class CodeGraphAnalyzer:
                 },
             }
             if embedding:
-                insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+                insert_params["vector"] = _shape_for_insert(embedding)
             self._dedup_insert(self.apis_collection, insert_params, insert_params["properties"].get("endpoint", "") + ":" + insert_params["properties"].get("method", ""), file_path_rel=relative_path)
             stats['apis'] += 1
 
@@ -2212,7 +2316,7 @@ class CodeGraphAnalyzer:
                 "references": {"module": module_uuid},
             }
             if embedding:
-                insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+                insert_params["vector"] = _shape_for_insert(embedding)
             self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['classes'] += 1
 
@@ -2246,7 +2350,7 @@ class CodeGraphAnalyzer:
                 "references": {"module": module_uuid},
             }
             if embedding:
-                insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+                insert_params["vector"] = _shape_for_insert(embedding)
             self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['functions'] += 1
 
@@ -2347,7 +2451,7 @@ class CodeGraphAnalyzer:
                 "references": {"module": module_uuid},
             }
             if embedding:
-                insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+                insert_params["vector"] = _shape_for_insert(embedding)
             self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['classes'] += 1
 
@@ -2370,7 +2474,7 @@ class CodeGraphAnalyzer:
                 "references": {"module": module_uuid},
             }
             if embedding:
-                insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+                insert_params["vector"] = _shape_for_insert(embedding)
             self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['functions'] += 1
 
@@ -2462,7 +2566,7 @@ class CodeGraphAnalyzer:
                 "references": {"module": module_uuid},
             }
             if embedding:
-                insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+                insert_params["vector"] = _shape_for_insert(embedding)
             self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['classes'] += 1
 
@@ -2487,7 +2591,7 @@ class CodeGraphAnalyzer:
                 "references": {"module": module_uuid},
             }
             if embedding:
-                insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+                insert_params["vector"] = _shape_for_insert(embedding)
             self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['functions'] += 1
 
@@ -2575,7 +2679,7 @@ class CodeGraphAnalyzer:
                 "references": {"module": module_uuid},
             }
             if embedding:
-                insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+                insert_params["vector"] = _shape_for_insert(embedding)
             self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['classes'] += 1
 
@@ -2598,7 +2702,7 @@ class CodeGraphAnalyzer:
                 "references": {"module": module_uuid},
             }
             if embedding:
-                insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+                insert_params["vector"] = _shape_for_insert(embedding)
             self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['functions'] += 1
 
@@ -2691,7 +2795,7 @@ class CodeGraphAnalyzer:
                 "references": {"module": module_uuid},
             }
             if embedding:
-                insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+                insert_params["vector"] = _shape_for_insert(embedding)
             self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['classes'] += 1
 
@@ -2720,7 +2824,7 @@ class CodeGraphAnalyzer:
                 "references": {"module": module_uuid},
             }
             if embedding:
-                insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+                insert_params["vector"] = _shape_for_insert(embedding)
             self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['functions'] += 1
 
@@ -2811,7 +2915,7 @@ class CodeGraphAnalyzer:
                 "references": {"module": module_uuid},
             }
             if embedding:
-                insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+                insert_params["vector"] = _shape_for_insert(embedding)
             self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['classes'] += 1
 
@@ -2838,7 +2942,7 @@ class CodeGraphAnalyzer:
                 "references": {"module": module_uuid},
             }
             if embedding:
-                insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+                insert_params["vector"] = _shape_for_insert(embedding)
             self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['functions'] += 1
 
@@ -2916,7 +3020,7 @@ class CodeGraphAnalyzer:
                 "references": {"module": module_uuid},
             }
             if embedding:
-                insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+                insert_params["vector"] = _shape_for_insert(embedding)
             self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['functions'] += 1
 
@@ -3056,7 +3160,7 @@ class CodeGraphAnalyzer:
             if func_uuid:
                 insert_params["references"]["source_function"] = func_uuid
             if embedding:
-                insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+                insert_params["vector"] = _shape_for_insert(embedding)
             try:
                 self._dedup_insert(
                     self.interactions_collection, insert_params,
@@ -3194,7 +3298,7 @@ class CodeGraphAnalyzer:
 
         # Add vector if embedding generation succeeded
         if embedding:
-            insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+            insert_params["vector"] = _shape_for_insert(embedding)
 
         uuid = self._dedup_insert(
             self.modules_collection, insert_params, f"module::{path}",
@@ -3642,7 +3746,7 @@ class CodeGraphAnalyzer:
 
         # Add vector if embedding generation succeeded
         if embedding:
-            insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+            insert_params["vector"] = _shape_for_insert(embedding)
 
         # v0.2.16 (bug 0.8): capture the return value into class_uuid.
         # Pre-v0.2.16 the return was discarded and the next line referenced
@@ -3741,7 +3845,7 @@ class CodeGraphAnalyzer:
 
         # Add vector if embedding generation succeeded
         if embedding:
-            insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+            insert_params["vector"] = _shape_for_insert(embedding)
 
         func_uuid = self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
 
@@ -4018,11 +4122,64 @@ def main():
     if args.migrate_from_shared:
         return _migrate_from_shared(project_name, args.named_vectors)
 
+    # v0.2.18: initialise the EmbeddingService BEFORE creating collections.
+    # The vectorizer config + slot resolution both depend on it.
+    #
+    # Behaviour matrix:
+    #   * code backend reachable (codeembed / ollama / openai) → proceed
+    #   * NO embedding backend reachable → NoEmbeddingBackendError,
+    #     write deferral + JSONL diagnostic, exit 0 (soft-fail per the
+    #     KG-summary-no-backend pattern). The launcher / install.py
+    #     surfaces UPDATE_DEFERRED.md to the user.
+    #   * embedding service constructed, but code_backend_ready() is False
+    #     (e.g. CodeEmbed container down, machine has only an ollama text
+    #     model that can't serve code) → same soft-fail. Don't proceed:
+    #     the embed_* helpers would just emit `None` per call and produce
+    #     a code graph with no vectors at all.
+    install_root = Path(os.environ.get("VCT_ORCHESTRATOR_ROOT", "")).resolve() if os.environ.get("VCT_ORCHESTRATOR_ROOT", "").strip() else repo_path
+    embedding_service: Optional[EmbeddingService] = None
+    try:
+        embedding_service = EmbeddingService.for_project(install_root)
+    except NoEmbeddingBackendError as e:
+        _emit_code_graph_deferral_no_backend(install_root, e)
+        print(f"⚠️  Code-graph analysis skipped: {e}", file=sys.stderr)
+        print(
+            "   See .claude/context/EMBEDDING_FAILURES.md + "
+            "~/.claude/metrics/embedding_failures.jsonl",
+            file=sys.stderr,
+        )
+        return 0
+
+    if not embedding_service.code_backend_ready():
+        _emit_code_graph_deferral_code_backend_down(install_root, embedding_service)
+        print(
+            f"⚠️  Code-graph analysis skipped: active code backend "
+            f"(slot={embedding_service.code_vector_slot}, "
+            f"model={embedding_service.code_model_id}) is not reachable.",
+            file=sys.stderr,
+        )
+        print(
+            "   Start CodeEmbed (`podman start vco_code_embed`) or Ollama "
+            "with a code-capable model before re-running.",
+            file=sys.stderr,
+        )
+        try:
+            embedding_service.close()
+        except Exception:
+            pass
+        return 0
+
+    _set_embedding_service(embedding_service)
+
     # Create analyzer
     analyzer = CodeGraphAnalyzer(project_name, named_vectors=args.named_vectors)
 
     # Connect to Weaviate
     if not analyzer.connect():
+        try:
+            embedding_service.close()
+        except Exception:
+            pass
         return 1
 
     try:
@@ -4117,6 +4274,112 @@ def main():
 
     finally:
         analyzer.close()
+        if embedding_service is not None:
+            try:
+                embedding_service.close()
+            except Exception:
+                pass
+
+
+def _emit_code_graph_deferral_no_backend(install_root: Path, exc: Exception) -> None:
+    """Soft-fail deferral when NO embedding backend is reachable.
+
+    Same pattern as the KG-sync deferral helper in sync_knowledge_graph.py
+    — writes ``<install_root>/.claude/context/UPDATE_DEFERRED.md`` so the
+    launcher / install.py surfaces the issue. Idempotent. Soft-fail on
+    any IO / import error.
+    """
+    try:
+        from vco_lib.deferral_report import DeferralEntry, DeferralReport
+        entry = DeferralEntry(
+            condition_id="code_graph_no_embedding_backend",
+            title="Code-graph analysis skipped: no embedding backend reachable",
+            detected=(
+                "analyze_code_graph.py could not reach any configured "
+                "embedding backend (CodeEmbed / Ollama / OpenAI). Error: "
+                f"{exc}"
+            ),
+            why_deferred=(
+                "Soft-fail policy: install must never block on transient "
+                "service unavailability. The code graph for this project "
+                "will be empty until the next analysis run succeeds. See "
+                "~/.claude/metrics/embedding_failures.jsonl for the "
+                "per-backend diagnostic written by EmbeddingService."
+            ),
+            command_to_apply=(
+                "# Restart embedding services then re-run analysis:\n"
+                "podman start vco_code_embed vco_ollama   # or: docker start ...\n"
+                ".claude/scripts/code-graph-analyze . --project <name>"
+            ),
+            severity="warning",
+            kg_node_refs=[
+                "knowledge/concepts/embedding-service-v0218.md",
+            ],
+        )
+        report = DeferralReport.read(install_root)
+        report.add_entry(entry)
+        report.write(install_root)
+    except Exception as inner:
+        print(f"   (deferral emit failed: {inner})", file=sys.stderr)
+
+
+def _emit_code_graph_deferral_code_backend_down(
+    install_root: Path,
+    svc: "EmbeddingService",
+) -> None:
+    """Soft-fail deferral when the active CODE backend specifically is down.
+
+    Distinguishes from the no-backend-at-all case because a CodeEmbed
+    container can be down while Ollama is up (or vice-versa). The
+    deferral entry points at the right service to restart.
+    """
+    try:
+        from vco_lib.deferral_report import DeferralEntry, DeferralReport
+        slot = svc.code_vector_slot
+        model = svc.code_model_id
+        if "codesage" in slot:
+            service_hint = (
+                "CodeEmbed service (vco_code_embed container on port 11440)"
+            )
+            restart_cmd = "podman start vco_code_embed"
+        elif "openai" in slot:
+            service_hint = "OpenAI API"
+            restart_cmd = (
+                "# Check OPENAI_API_KEY is set and the key is valid:\n"
+                "# Preferences → Special Secrets → OpenAI → Re-check"
+            )
+        else:
+            service_hint = "Ollama (vco_ollama container on port 11435)"
+            restart_cmd = "podman start vco_ollama"
+
+        entry = DeferralEntry(
+            condition_id="code_graph_code_backend_unreachable",
+            title=f"Code-graph analysis skipped: {service_hint} not reachable",
+            detected=(
+                f"analyze_code_graph.py would write to slot '{slot}' "
+                f"(model: {model}), but the backend serving that slot is "
+                "currently unreachable. Refusing to proceed — a code graph "
+                "with empty vectors is worse than no code graph (search "
+                "would return all-zero scores)."
+            ),
+            why_deferred=(
+                "Soft-fail policy: never produce a degraded code graph. "
+                "Restart the service and re-run analysis."
+            ),
+            command_to_apply=(
+                f"{restart_cmd}\n"
+                ".claude/scripts/code-graph-analyze . --project <name>"
+            ),
+            severity="warning",
+            kg_node_refs=[
+                "knowledge/concepts/embedding-service-v0218.md",
+            ],
+        )
+        report = DeferralReport.read(install_root)
+        report.add_entry(entry)
+        report.write(install_root)
+    except Exception as inner:
+        print(f"   (deferral emit failed: {inner})", file=sys.stderr)
 
 
 if __name__ == '__main__':

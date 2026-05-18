@@ -40,6 +40,7 @@ import json
 import logging
 import os
 import sys
+from pathlib import Path
 
 import requests
 import weaviate
@@ -51,15 +52,101 @@ logger = logging.getLogger("migrate_embeddings")
 WEAVIATE_URL = os.getenv("WEAVIATE_URL", "http://localhost:8081")
 GRPC_PORT = int(os.getenv("GRPC_PORT", "50052"))
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11435")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "qwen3-embedding:0.6b")
 CODE_EMBED_SERVICE_URL = os.getenv("CODE_EMBED_SERVICE_URL", "http://localhost:11440")
+
+# v0.2.18: prefer EmbeddingService for catalog discovery + per-active-
+# backend dispatch. Import is graceful so this script still works on a
+# half-installed venv (the inline fallbacks below preserve the
+# pre-v0.2.18 hardcoded behaviour).
+try:
+    _vco_lib_parent = Path(__file__).resolve().parent.parent.parent
+    if str(_vco_lib_parent) not in sys.path:
+        sys.path.insert(0, str(_vco_lib_parent))
+    from vco_lib.embedding_service import (
+        EmbeddingService,
+        NoEmbeddingBackendError,
+    )
+    HAS_EMBEDDING_SERVICE = True
+except Exception as _exc:  # pragma: no cover (half-install case)
+    logger.warning(
+        "vco_lib.embedding_service not importable (%s); falling back to "
+        "hardcoded slot/model names. Re-run install.py --update.", _exc
+    )
+    HAS_EMBEDDING_SERVICE = False
+    EmbeddingService = None  # type: ignore[assignment]
+    NoEmbeddingBackendError = Exception  # type: ignore[assignment]
+
 
 # Collections that use the "code" vector scheme
 CODE_COLLECTIONS = {"CodeModule", "CodeClass", "CodeFunction", "CodeAPI", "CodeInteraction"}
 
-# New named vectors to add
+# v0.2.18: legacy hardcoded slot names — only used when EmbeddingService
+# isn't importable. With EmbeddingService present we read the active
+# slot from the catalog at run-time (via `_active_kg_slot()` /
+# `_active_code_slot()`), so a user with ACTIVE_EMBEDDING=openai migrates
+# their collections to `openai_text_embed` / `openai_code_embed`.
 NEW_KG_VECTOR = "qwen3_embed"
 NEW_CODE_VECTOR = "codesage_embed"
+
+
+def _active_kg_slot() -> str:
+    """Return the slot name to migrate KG collections TO.
+
+    With EmbeddingService: the active text slot (resolved from env). So
+    `ACTIVE_EMBEDDING=openai` migrates to `openai_text_embed`,
+    `ACTIVE_EMBEDDING=arctic` to `arctic2_embed`, default `qwen3` to
+    `qwen3_embed`.
+    Without EmbeddingService: hardcoded `qwen3_embed` (pre-v0.2.18).
+    """
+    if not HAS_EMBEDDING_SERVICE:
+        return NEW_KG_VECTOR
+    try:
+        svc = EmbeddingService.for_project()
+        return svc.text_vector_slot
+    except NoEmbeddingBackendError:
+        return NEW_KG_VECTOR
+
+
+def _active_code_slot() -> str:
+    """Return the slot name to migrate code collections TO.
+
+    With EmbeddingService: the active code slot. Without: hardcoded
+    `codesage_embed`.
+    """
+    if not HAS_EMBEDDING_SERVICE:
+        return NEW_CODE_VECTOR
+    try:
+        svc = EmbeddingService.for_project()
+        return svc.code_vector_slot
+    except NoEmbeddingBackendError:
+        return NEW_CODE_VECTOR
+
+
+def _discover_text_catalog() -> list:
+    """Return reachable text-embedding models, or empty list on no service.
+
+    Used by `--list` to surface what models are actually available on
+    this machine — replaces the pre-v0.2.18 assumption that only
+    qwen3-embedding existed.
+    """
+    if not HAS_EMBEDDING_SERVICE:
+        return []
+    try:
+        return EmbeddingService.discover_text_models()
+    except Exception as e:
+        logger.warning("Text model discovery failed: %s", e)
+        return []
+
+
+def _discover_code_catalog() -> list:
+    """Return reachable code-embedding models, or empty list on no service."""
+    if not HAS_EMBEDDING_SERVICE:
+        return []
+    try:
+        return EmbeddingService.discover_code_models()
+    except Exception as e:
+        logger.warning("Code model discovery failed: %s", e)
+        return []
 
 
 def get_client() -> weaviate.WeaviateClient:
@@ -80,11 +167,29 @@ def is_code_collection(name: str) -> bool:
 
 
 def get_text_embedding(text: str) -> list[float] | None:
-    """Get embedding from qwen3-embedding via Ollama."""
+    """Get embedding from the active text backend.
+
+    v0.2.18: routes through EmbeddingService.embed_text() — picks
+    Ollama / OpenAI / etc. based on env. Falls back to direct Ollama
+    call (pre-v0.2.18 hardcode) when service unavailable.
+    """
+    if HAS_EMBEDDING_SERVICE:
+        try:
+            svc = EmbeddingService.for_project()
+            return svc.embed_text(text)
+        except NoEmbeddingBackendError as e:
+            logger.warning("EmbeddingService unavailable for text embed: %s", e)
+        except Exception as e:
+            logger.warning("EmbeddingService text embed failed (%s); falling back to inline Ollama", e)
+    # Legacy fallback: direct Ollama call.
     try:
         resp = requests.post(
             f"{OLLAMA_URL}/api/embeddings",
-            json={"model": EMBEDDING_MODEL, "prompt": text, "options": {"num_ctx": 8192}},
+            json={
+                "model": os.getenv("EMBEDDING_MODEL", "qwen3-embedding:0.6b"),
+                "prompt": text,
+                "options": {"num_ctx": 8192},
+            },
             timeout=60,
         )
         if resp.status_code == 200:
@@ -97,7 +202,20 @@ def get_text_embedding(text: str) -> list[float] | None:
 
 
 def get_code_embedding(text: str) -> list[float] | None:
-    """Get embedding from CodeSage via code embedding service."""
+    """Get embedding from the active code backend.
+
+    v0.2.18: routes through EmbeddingService.embed_code(). Falls back
+    to direct CodeEmbed HTTP call when service unavailable.
+    """
+    if HAS_EMBEDDING_SERVICE:
+        try:
+            svc = EmbeddingService.for_project()
+            return svc.embed_code(text)
+        except NoEmbeddingBackendError as e:
+            logger.warning("EmbeddingService unavailable for code embed: %s", e)
+        except Exception as e:
+            logger.warning("EmbeddingService code embed failed (%s); falling back to inline CodeEmbed", e)
+    # Legacy fallback: direct CodeEmbed call.
     try:
         resp = requests.post(
             f"{CODE_EMBED_SERVICE_URL}/api/embeddings",
@@ -237,11 +355,13 @@ def backfill_new_embeddings(
 ) -> dict:
     """Generate new embeddings for all objects in a collection.
 
-    For KG collections: generates qwen3_embed
-    For Code collections: generates codesage_embed
+    v0.2.18: target slot is resolved dynamically from EmbeddingService —
+    so a project running ACTIVE_EMBEDDING=openai migrates to
+    `openai_text_embed`/`openai_code_embed` instead of the hardcoded
+    qwen3/codesage names.
     """
     is_code = is_code_collection(coll_name)
-    target_vec = NEW_CODE_VECTOR if is_code else NEW_KG_VECTOR
+    target_vec = _active_code_slot() if is_code else _active_kg_slot()
     embed_fn = get_code_embedding if is_code else get_text_embedding
 
     if dry_run:
@@ -311,10 +431,23 @@ def migrate_collection(
     dry_run: bool = False,
     backfill_only: bool = False,
 ) -> dict:
-    """Full migration for a single collection: add named vector + backfill."""
+    """Full migration for a single collection: add named vector + backfill.
+
+    v0.2.18: slot name + dim are resolved from EmbeddingService for the
+    project's currently-active model. Pre-v0.2.18 hardcoded
+    qwen3_embed(1024) / codesage_embed(2048).
+    """
     is_code = is_code_collection(coll_name)
-    new_vec = NEW_CODE_VECTOR if is_code else NEW_KG_VECTOR
+    new_vec = _active_code_slot() if is_code else _active_kg_slot()
+    # Dim is resolved from EmbeddingService when possible — otherwise
+    # fall back to the legacy defaults that match the legacy slot names.
     new_dim = 2048 if is_code else 1024
+    if HAS_EMBEDDING_SERVICE:
+        try:
+            svc = EmbeddingService.for_project()
+            new_dim = svc.code_dim if is_code else svc.text_dim
+        except Exception:
+            pass  # fall back to legacy default
 
     # Step 1: Add named vector if not present
     if not backfill_only:
@@ -340,6 +473,22 @@ def main():
     client = get_client()
 
     if args.list:
+        # v0.2.18: surface the dynamic catalog so operators can see what
+        # they could migrate TO, in addition to current collection state.
+        text_models = _discover_text_catalog()
+        code_models = _discover_code_catalog()
+        if text_models or code_models:
+            print("=== Reachable Embedding Models (v0.2.18 catalog) ===")
+            for m in text_models:
+                marker = "✓" if m.available_now else "✗"
+                print(f"  TEXT  {marker} {m.id:40s} slot={m.slot:20s} dim={m.dim} backend={m.backend}")
+            for m in code_models:
+                marker = "✓" if m.available_now else "✗"
+                print(f"  CODE  {marker} {m.id:40s} slot={m.slot:20s} dim={m.dim} backend={m.backend}")
+            print(f"\n  Active text slot (migration target): {_active_kg_slot()}")
+            print(f"  Active code slot (migration target): {_active_code_slot()}")
+            print()
+        print("=== Existing Collections ===")
         for name in sorted(client.collections.list_all()):
             coll = client.collections.get(name)
             config = coll.config.get()
@@ -354,27 +503,43 @@ def main():
     if not args.all and not args.collection:
         parser.error("Specify --all or --collection NAME")
 
-    # Check services are reachable
-    try:
-        resp = requests.post(
-            f"{OLLAMA_URL}/api/embeddings",
-            json={"model": EMBEDDING_MODEL, "prompt": "test", "options": {"num_ctx": 8192}},
-            timeout=10,
-        )
-        assert resp.status_code == 200, f"Ollama embedding failed: {resp.status_code}"
-        logger.info("Ollama (%s) reachable", EMBEDDING_MODEL)
-    except Exception as e:
-        logger.error("Ollama not reachable: %s", e)
-        sys.exit(1)
+    # Check services are reachable. v0.2.18: prefer EmbeddingService's
+    # construction probe (which checks every configured backend in one
+    # call) over the legacy per-backend probes below.
+    if HAS_EMBEDDING_SERVICE:
+        try:
+            svc = EmbeddingService.for_project()
+            logger.info(
+                "EmbeddingService ready (text=%s slot=%s, code=%s slot=%s)",
+                svc.text_model_id, svc.text_vector_slot,
+                svc.code_model_id, svc.code_vector_slot,
+            )
+        except NoEmbeddingBackendError as e:
+            logger.error("No embedding backend reachable: %s", e)
+            sys.exit(1)
+    else:
+        # Legacy fallback (pre-v0.2.18 path).
+        embedding_model_for_probe = os.getenv("EMBEDDING_MODEL", "qwen3-embedding:0.6b")
+        try:
+            resp = requests.post(
+                f"{OLLAMA_URL}/api/embeddings",
+                json={"model": embedding_model_for_probe, "prompt": "test", "options": {"num_ctx": 8192}},
+                timeout=10,
+            )
+            assert resp.status_code == 200, f"Ollama embedding failed: {resp.status_code}"
+            logger.info("Ollama (%s) reachable", embedding_model_for_probe)
+        except Exception as e:
+            logger.error("Ollama not reachable: %s", e)
+            sys.exit(1)
 
-    try:
-        resp = requests.get(f"{CODE_EMBED_SERVICE_URL}/health", timeout=10)
-        if resp.status_code == 200:
-            logger.info("Code embedding service reachable: %s", resp.json())
-        else:
-            logger.warning("Code embedding service returned %s — code collections will be skipped", resp.status_code)
-    except Exception:
-        logger.warning("Code embedding service not reachable at %s — code collections will be skipped", CODE_EMBED_SERVICE_URL)
+        try:
+            resp = requests.get(f"{CODE_EMBED_SERVICE_URL}/health", timeout=10)
+            if resp.status_code == 200:
+                logger.info("Code embedding service reachable: %s", resp.json())
+            else:
+                logger.warning("Code embedding service returned %s — code collections will be skipped", resp.status_code)
+        except Exception:
+            logger.warning("Code embedding service not reachable at %s — code collections will be skipped", CODE_EMBED_SERVICE_URL)
 
     results = []
 

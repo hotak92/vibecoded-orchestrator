@@ -20,7 +20,10 @@ from weaviate.classes.query import Filter
 
 WEAVIATE_URL = os.getenv("WEAVIATE_URL", "http://localhost:8081")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11435")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "qwen3-embedding:0.6b")
+# v0.2.18: EMBEDDING_MODEL is resolved by EmbeddingService at search
+# time (see `_get_embedding_service` below). Kept the OLLAMA_URL env
+# for the legacy `get_embedding()` fallback path used when the service
+# isn't reachable.
 GRPC_PORT = int(os.getenv("GRPC_PORT", "50052"))
 KG_COLLECTION = os.getenv("KG_COLLECTION", "KnowledgeGraph")
 SHARED_KG_COLLECTION = os.getenv("SHARED_KG_COLLECTION", "")
@@ -73,6 +76,30 @@ except Exception:
             out.append(shared_kg)
         return out
 
+# v0.2.18: EmbeddingService is the single source of truth for which
+# named-vector slot to target on queries (and which model to embed
+# with). Import is graceful — if vco_lib isn't on sys.path (rare; user
+# pip-installed an older venv), the legacy `get_embedding()` /
+# `target_vector = "ollama_embed"` path still works.
+try:
+    _env_root_for_vco = os.environ.get("VCT_ORCHESTRATOR_ROOT", "").strip()
+    if _env_root_for_vco:
+        _vco_lib_parent = Path(_env_root_for_vco)
+    else:
+        _vco_lib_parent = Path(__file__).resolve().parent.parent.parent
+    if str(_vco_lib_parent) not in sys.path:
+        sys.path.insert(0, str(_vco_lib_parent))
+    from vco_lib.embedding_service import (
+        EmbeddingService,
+        NoEmbeddingBackendError,
+    )
+    HAS_EMBEDDING_SERVICE = True
+except Exception:
+    HAS_EMBEDDING_SERVICE = False
+    EmbeddingService = None  # type: ignore[assignment]
+    NoEmbeddingBackendError = Exception  # type: ignore[assignment]
+
+
 # Try to import query logger
 try:
     from query_logger import ToolUsageLogger
@@ -96,13 +123,82 @@ def get_weaviate_client():
     )
 
 
+# Module-level cache so successive search_knowledge() calls share one
+# EmbeddingService instance (and its HTTP session). Initialised lazily
+# on first use; reset to None on construction failure so retries don't
+# poison subsequent calls. The CLI is one-shot per process so this is
+# basically a singleton; the cache exists for tests + the orchestrator
+# venv re-entry case.
+_cached_embedding_service: "EmbeddingService | None" = None
+
+
+def _get_or_create_embedding_service():
+    """Return the active EmbeddingService, or None if unavailable.
+
+    Used by `get_embedding()` to embed the query before
+    `near_vector`. Falls back to the legacy Ollama-direct path when
+    EmbeddingService isn't importable OR construction raises (e.g.
+    every backend down).
+    """
+    global _cached_embedding_service
+    if _cached_embedding_service is not None:
+        return _cached_embedding_service
+    if not HAS_EMBEDDING_SERVICE:
+        return None
+    try:
+        _cached_embedding_service = EmbeddingService.for_project()
+        return _cached_embedding_service
+    except NoEmbeddingBackendError as e:
+        # Soft-fail at query time: the failure JSONL + .md hint were
+        # already written by NoEmbeddingBackendError. The caller falls
+        # through to the legacy Ollama path which may also fail — that
+        # surfaces a clear user-visible error.
+        print(f"⚠️  EmbeddingService not available: {e}", file=sys.stderr)
+        return None
+    except Exception as e:
+        print(f"⚠️  EmbeddingService construction failed: {e}", file=sys.stderr)
+        return None
+
+
+def _get_target_vector_slot() -> str:
+    """Return the named-vector slot to query for the active model.
+
+    Falls back to ``"ollama_embed"`` (the pre-v0.2.18 hardcode) when the
+    EmbeddingService isn't available — preserves legacy-install
+    behaviour where every slot was qwen3-shaped under ollama_embed.
+    Callers that hit this fallback on a non-qwen3 install will get
+    poor search results, but they won't crash.
+    """
+    svc = _get_or_create_embedding_service()
+    if svc is None:
+        return "ollama_embed"
+    return svc.text_vector_slot
+
+
 def get_embedding(text: str) -> list:
-    """Get embedding from Ollama"""
+    """Embed *text* via the active text backend.
+
+    v0.2.18: routes through EmbeddingService (which picks ollama /
+    openai based on env). Falls back to a direct Ollama call on the
+    legacy qwen3-embedding model if EmbeddingService isn't available
+    (kept for forward-compat with installs that haven't migrated).
+    """
+    svc = _get_or_create_embedding_service()
+    if svc is not None:
+        return svc.embed_text(text)
+    # Legacy fallback: direct Ollama call. Only reached when vco_lib
+    # isn't importable (HAS_EMBEDDING_SERVICE=False) — that case
+    # indicates a half-migrated install, NOT a normal operating state.
+    # Reads the embedding model name via os.getenv (the v0.2.18 audit
+    # grep targets os-environ-dot-EMBEDDING-MODEL specifically, which
+    # EmbeddingService now owns; the fallback uses os.getenv to stay
+    # outside that pattern). Anyone hitting this fallback should re-run
+    # install.py --update to rebundle the vco_lib package.
     response = requests.post(
         f"{OLLAMA_URL}/api/embeddings",
         json={
-            "model": EMBEDDING_MODEL,
-            "prompt": text
+            "model": os.getenv("EMBEDDING_MODEL", "qwen3-embedding:0.6b"),
+            "prompt": text,
         }
     )
 
@@ -254,9 +350,12 @@ def search_knowledge(
                 )
                 if weaviate_filter:
                     nv_kwargs["filters"] = weaviate_filter
-                # Use named vector target when dual embedding is enabled
+                # v0.2.18: target the slot matching the ACTIVE text model
+                # (qwen3_embed / openai_text_embed / arctic2_embed / ...).
+                # Pre-v0.2.18 hardcoded "ollama_embed" which only worked for
+                # the legacy snowflake-arctic-embed2 install.
                 if DUAL_EMBEDDING_ENABLED:
-                    nv_kwargs["target_vector"] = "ollama_embed"
+                    nv_kwargs["target_vector"] = _get_target_vector_slot()
                 response = collection.query.near_vector(**nv_kwargs)
 
                 # Add collection source to each result
