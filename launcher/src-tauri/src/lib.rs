@@ -1018,19 +1018,56 @@ pub fn run() {
 /// exist). Returns `false` on any error (assume dead — the worst
 /// case is we keep a stale file for one extra reboot).
 fn pid_is_alive(pid: u32) -> bool {
+    // Defense in depth: reject sentinel pids before touching libc.
+    //
+    // POSIX `kill(pid, sig)` has SPECIAL semantics for non-positive
+    // pids:
+    //   pid =  0  → "every process in caller's process group"
+    //   pid = -1  → "every process the caller has permission to signal"
+    //   pid < -1  → "every process in process group -pid"
+    //
+    // `u32` values that exceed `i32::MAX` cast to NEGATIVE pid_t on
+    // Linux/macOS (pid_t is i32). e.g. u32::MAX → pid_t(-1) → kill(-1, 0)
+    // → returns 0 (success) — which is NOT the per-process check we
+    // wanted. The sweep helper would then incorrectly conclude the
+    // stale pid is "alive" and skip the cleanup.
+    //
+    // Reject those upfront. Filenames matching `*.old-<pid>` with
+    // a pid in the dangerous range (0 or > i32::MAX) are malformed
+    // anyway — real OS pids fit in [1, i32::MAX].
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
+    }
+
     #[cfg(unix)]
     {
         // libc::kill(pid, 0) returns 0 if the process exists. -1 with
         // errno == ESRCH means dead. errno == EPERM means alive but
         // we don't have permission — still counts as "alive" (don't
         // delete its file). Any other errno: be conservative, say alive.
-        // Safety: kill() is async-signal-safe per POSIX.
+        //
+        // v0.2.17.1 (hotfix): use `std::io::Error::last_os_error()` to
+        // read errno cross-OS. The previous `libc::__errno_location()`
+        // symbol is glibc-only (Linux); macOS uses `__error()`, BSDs
+        // have yet other names. `last_os_error()` resolves to the
+        // correct platform symbol internally and is the canonical
+        // Rust-portable way to read errno after a libc call.
+        //
+        // Safety: kill(pid, 0) is async-signal-safe per POSIX. We
+        // call it before reading errno so the errno value belongs
+        // to this call. The pid > 0 && pid <= i32::MAX guard above
+        // means the cast to pid_t is always positive on
+        // 32-bit-pid_t systems.
         unsafe {
             if libc::kill(pid as libc::pid_t, 0) == 0 {
                 return true;
             }
-            *libc::__errno_location() != libc::ESRCH
         }
+        let raw = std::io::Error::last_os_error().raw_os_error();
+        // ESRCH = "No such process". On any other errno (EPERM "alive
+        // but no permission", or any unknown) be conservative: assume
+        // alive.
+        raw != Some(libc::ESRCH)
     }
     #[cfg(windows)]
     {
@@ -1118,4 +1155,127 @@ fn load_projects_from_disk() -> HashMap<String, types::Project> {
     }
     let data = std::fs::read_to_string(&path).unwrap_or_default();
     serde_json::from_str(&data).unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// v0.2.17 (plan 0.0) — boot-sweep helper tests
+// ---------------------------------------------------------------------------
+//
+// Reviewer A explicitly flagged the lack of unit tests for
+// `pid_is_alive` + `sweep_stale_binary_siblings` as a coverage gap.
+// The v0.2.17.1 hotfix (errno read using `std::io::Error::last_os_error()`
+// instead of glibc-only `libc::__errno_location`) is exactly the
+// class of bug a cross-OS unit test would have caught at PR review
+// time instead of at release-tag time. Closing the gap.
+
+#[cfg(test)]
+mod boot_sweep_tests {
+    use super::*;
+    use std::fs;
+
+    /// `pid_is_alive(<our own pid>)` MUST return true on every OS
+    /// we support. If this fails, the boot sweep will delete every
+    /// `.old-<pid>` / `.pending-<pid>` file it encounters and we
+    /// risk wiping the canonical binary the user is about to relaunch.
+    #[test]
+    fn pid_is_alive_returns_true_for_own_pid() {
+        let our_pid = std::process::id();
+        assert!(
+            pid_is_alive(our_pid),
+            "pid_is_alive({}) returned false for the current process",
+            our_pid,
+        );
+    }
+
+    /// `pid_is_alive(<very high pid>)` returns false. PID_MAX on Linux
+    /// defaults to 32768 (configurable up to 4_194_304); on macOS the
+    /// kernel limit is 99998. We use `i32::MAX` (2_147_483_647) —
+    /// well above any allocatable PID on every supported OS, and
+    /// (crucially) stays POSITIVE when cast to the signed `pid_t`.
+    ///
+    /// Do NOT use `u32::MAX`: when cast to `pid_t` (i32 on Linux/macOS)
+    /// it becomes `-1`, and `kill(-1, 0)` is the POSIX "every
+    /// permitted process" form which returns 0 (success) — pid_is_alive
+    /// would then return TRUE for `u32::MAX`, giving a misleading
+    /// false-pass even when the underlying errno read is correct.
+    #[test]
+    fn pid_is_alive_returns_false_for_max_pid() {
+        let high_pid = i32::MAX as u32;
+        // Skip if somehow matches our own PID (impossible in practice).
+        if std::process::id() == high_pid {
+            return;
+        }
+        assert!(
+            !pid_is_alive(high_pid),
+            "pid_is_alive(i32::MAX) returned true — boot sweep \
+             would incorrectly skip stale siblings (this is the bug \
+             the v0.2.17.1 hotfix targets)"
+        );
+    }
+
+    /// `sweep_stale_binary_siblings` deletes dead-pid suffixes and
+    /// keeps live-pid suffixes / malformed names / non-suffix files.
+    /// Tempdir-based; doesn't touch real launcher state.
+    #[test]
+    fn sweep_deletes_dead_pid_siblings_keeps_others() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let our_pid = std::process::id();
+
+        // Dead-pid file: should be deleted. Use i32::MAX so the
+        // signed-cast trick in libc::kill doesn't trigger the POSIX
+        // "broadcast-to-permitted-set" form (kill(-1, 0) returns 0).
+        // See the pid_is_alive_returns_false_for_max_pid doc comment.
+        let dead_pid_str = (i32::MAX as u32).to_string();
+        let dead = dir.path().join(format!("vct-launcher.old-{}", dead_pid_str));
+        fs::write(&dead, "stale bytes").unwrap();
+
+        // Live-pid file: must be preserved.
+        let live = dir.path().join(format!("vct-launcher.old-{}", our_pid));
+        fs::write(&live, "current pid bytes").unwrap();
+
+        // Pending-suffix variant for the same dead pid: also deleted.
+        let dead_pending = dir.path().join(format!("vct-launcher.exe.pending-{}", dead_pid_str));
+        fs::write(&dead_pending, "pending stale").unwrap();
+
+        // Malformed names: kept.
+        let malformed_no_dash = dir.path().join("vct-launcher.oldsomething");
+        fs::write(&malformed_no_dash, "x").unwrap();
+        let malformed_bad_pid = dir.path().join("vct-launcher.old-NOTANUMBER");
+        fs::write(&malformed_bad_pid, "x").unwrap();
+
+        // Non-suffix files (the actual launcher binary, metadata, etc.):
+        // kept untouched.
+        let canonical = dir.path().join("vct-launcher");
+        fs::write(&canonical, "real binary").unwrap();
+        let metadata = dir.path().join("vct-launcher.metadata.json");
+        fs::write(&metadata, "{}").unwrap();
+
+        sweep_stale_binary_siblings(dir.path());
+
+        assert!(!dead.exists(), "dead-pid sibling should have been deleted");
+        assert!(
+            !dead_pending.exists(),
+            "dead-pid .pending- sibling should have been deleted"
+        );
+        assert!(live.exists(), "live-pid sibling MUST be preserved");
+        assert!(
+            malformed_no_dash.exists(),
+            "malformed (no -<pid> separator) MUST be preserved"
+        );
+        assert!(
+            malformed_bad_pid.exists(),
+            "malformed (non-numeric pid) MUST be preserved"
+        );
+        assert!(canonical.exists(), "canonical binary MUST be preserved");
+        assert!(metadata.exists(), "metadata.json MUST be preserved");
+    }
+
+    /// `sweep_stale_binary_siblings` is a silent no-op on a missing
+    /// directory (one of the soft-fail contracts in the helper).
+    #[test]
+    fn sweep_handles_missing_dir_silently() {
+        let nonexistent = std::path::PathBuf::from("/tmp/vct-test-nonexistent-sweep-target");
+        // No assertions; success = function returns without panicking.
+        sweep_stale_binary_siblings(&nonexistent);
+    }
 }
