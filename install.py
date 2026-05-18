@@ -2538,6 +2538,32 @@ def main() -> int:
                             )
                         )
 
+        # v0.2.18 Commit 10: seed the launcher's app_state with the
+        # default text/code embedding-model IDs derived from this
+        # install's preset. Idempotent (INSERT OR IGNORE-style ON
+        # CONFLICT DO NOTHING) — preserves any user selections from
+        # prior launcher sessions. Soft-fails when launcher.db is
+        # absent (fresh first-install, launcher never booted) or the
+        # app_state table hasn't been migrated yet. Runs BEFORE
+        # _seed_weaviate so a Weaviate-down condition does not also
+        # block the GUI dropdowns from being pre-populated; runs
+        # OUTSIDE the seed try/except for the same reason.
+        try:
+            _write_preset_defaults_to_app_state(
+                PROJECT_ROOT,
+                embed_config,
+                openai_set_as_default=bool(embed_config.get("openai_key")),
+            )
+        except Exception as _preset_err:  # noqa: BLE001 — never block install
+            # Defense-in-depth: the helper already soft-fails on every
+            # known sqlite error, but if something else explodes
+            # (network filesystem flake, ENOSPC, etc.) we still must
+            # not crash the install.
+            _log_install_event(
+                "preset_defaults", "warn",
+                f"unexpected error writing preset defaults: {_preset_err}",
+            )
+
         # PR 6 + MEDIUM-9 + HIGH-4 fix (2026-05-01): wrap _ensure_collections
         # AND _seed_weaviate in the same try/except so Weaviate-down conditions
         # emit a deferral entry instead of crashing the install. Includes a
@@ -4769,6 +4795,276 @@ def _choose_embedding_config(sysinfo: SystemInfo, args: argparse.Namespace) -> d
     _record_install_choice("embedding_mode", "cpu",
                            {"reason": "auto-detected no GPU"})
     return dict(EMBEDDING_CONFIGS["cpu"])
+
+
+# ---------------------------------------------------------------------------
+# v0.2.18 Commit 10 — Preset defaults → launcher's app_state
+#
+# Goal: a brand-new project, on first launch after install, should see the
+# KG/Codegraph dropdowns pre-populated with the embedding-model IDs that
+# install.py actually configured. Without this, every new project starts
+# blank and the user has to manually pick the same model `install.py`
+# already pulled.
+#
+# The launcher's `app_state` is a generic key/value table (key TEXT,
+# value TEXT, updated_at INTEGER) defined in
+# `launcher/src-tauri/src/db/migrations/008_app_state.sql`. The keys we
+# write are the same ones Wave A's `openai_cmd.rs` reads/writes:
+#   - default_text_embedding
+#   - default_code_embedding
+# Canonical IDs are aligned with the Rust catalog
+# (`launcher/src-tauri/src/commands/embedding_catalog.rs`) and Wave A's
+# constants — OpenAI IDs use the `openai-` prefix; local Ollama IDs use
+# the raw Ollama tag; CodeEmbed uses `codesage-large-v2`.
+#
+# DB path resolution mirrors the Rust resolver
+# (`launcher/src-tauri/src/paths.rs::vct_root_dir`):
+#   - `$VCT_STATE_DIR/launcher.db` if VCT_STATE_DIR is set (non-empty)
+#   - `~/.vct/launcher.db` otherwise
+# Cross-OS: same shape on Linux, macOS, Windows — `Path.home()` resolves
+# correctly on all three. The launcher does NOT use Tauri's
+# `app_data_dir()`; it pins to `~/.vct/` so dev/prod isolation (via
+# VCT_STATE_DIR) works the same way on every platform.
+#
+# Ordering: install.py runs BEFORE the launcher may have ever been
+# started (fresh install). When that's true, launcher.db does not exist
+# on disk yet → we soft-fail with a skip log. The launcher creates the
+# table on first boot via the schema migration, and the user's first
+# manual selection in the GUI lands the rows (no defaults pre-populated
+# in that case — acceptable: the user is configuring it themselves
+# anyway). On --update runs (launcher.db exists), the rows are
+# pre-populated.
+#
+# Idempotency: `INSERT OR IGNORE` only sets rows that are absent.
+# Existing rows (= user's manual selections from a prior launcher
+# session) are preserved.
+# ---------------------------------------------------------------------------
+
+# Canonical app_state keys. MUST stay in sync with:
+#   launcher/src-tauri/src/commands/openai_cmd.rs::APP_STATE_DEFAULT_TEXT_EMBED
+#   launcher/src-tauri/src/commands/openai_cmd.rs::APP_STATE_DEFAULT_CODE_EMBED
+_APP_STATE_KEY_DEFAULT_TEXT_EMBED = "default_text_embedding"
+_APP_STATE_KEY_DEFAULT_CODE_EMBED = "default_code_embedding"
+
+# Canonical OpenAI ID used by Wave A (with `openai-` prefix). MUST match:
+#   launcher/src-tauri/src/commands/openai_cmd.rs::OPENAI_DEFAULT_TEXT_MODEL_ID
+#   launcher/src-tauri/src/commands/embedding_catalog.rs (`id` field)
+# The Python catalog discovery (`EmbeddingService.discover_text_models`)
+# emits the raw `text-embedding-3-small` without the prefix; the GUI
+# layer maps between the two. We write the prefixed form here because
+# that's what `openai_cmd.rs::register_openai_api_key` also writes for
+# consistency in the column.
+_OPENAI_PREFIXED_TEXT_MODEL_ID = "openai-text-embedding-3-small"
+
+
+def _preset_to_default_models(
+    embed_config: dict,
+    openai_set_as_default: bool,
+) -> tuple[str, str]:
+    """Map an install-time embedding config dict to the (text, code) model
+    IDs that the launcher's `app_state` should be seeded with.
+
+    The source of truth is the chosen `EMBEDDING_CONFIGS` entry's
+    `text_model` / `code_model` fields — i.e. exactly the models
+    install.py just pulled into Ollama / configured for the GPU
+    code-embed service. This guarantees the GUI's pre-populated default
+    matches what the user's machine can actually serve.
+
+    Special case: when the user passed `--openai-key` AND chose to set
+    OpenAI as default (`openai_set_as_default=True`), the stored IDs
+    use the `openai-` prefix to align with Wave A's
+    `openai_cmd.rs::register_openai_api_key`, which writes the same
+    prefixed form when the wizard's "set as default" checkbox is ticked.
+
+    Args:
+        embed_config: The dict returned by `_choose_embedding_config`.
+            Keyed by `text_model`, `code_model`, `active_embedding`,
+            optionally `openai_key` (presence indicates --openai-key).
+        openai_set_as_default: True if the user explicitly opted to
+            make OpenAI the default for this install (currently inferred
+            from `embed_config["active_embedding"] == "openai"` —
+            wizard-side this would flip per a checkbox, but install.py's
+            `--openai-key` flag is an unambiguous opt-in).
+
+    Returns:
+        (text_model_id, code_model_id) — the strings to write into
+        `app_state.default_text_embedding` and
+        `app_state.default_code_embedding` respectively.
+    """
+    active = embed_config.get("active_embedding", "")
+
+    if active == "openai" and openai_set_as_default:
+        # Mirrors openai_cmd.rs constants. Both slots use the same model
+        # today; the split exists for forward-compat when OpenAI ships
+        # a code-specific embedder.
+        return (_OPENAI_PREFIXED_TEXT_MODEL_ID, _OPENAI_PREFIXED_TEXT_MODEL_ID)
+
+    # All non-OpenAI presets: use the IDs install.py pulled, verbatim.
+    # These IDs match what `EmbeddingService.discover_*` surfaces in
+    # the GUI catalog (Ollama tags / `codesage-large-v2`).
+    text_model = str(embed_config.get("text_model") or "qwen3-embedding:0.6b")
+    code_model = str(embed_config.get("code_model") or "qwen3-embedding:0.6b")
+    return (text_model, code_model)
+
+
+def _discover_app_state_db_path() -> Path:
+    """Resolve the path to the launcher's SQLite state DB.
+
+    Mirrors `launcher/src-tauri/src/db/mod.rs::db_path`, which itself
+    delegates to `crate::paths::vct_root_dir`. Cross-OS:
+      - Linux:   `~/.vct/launcher.db` (or `$VCT_STATE_DIR/launcher.db`)
+      - macOS:   `~/.vct/launcher.db` (or `$VCT_STATE_DIR/launcher.db`)
+      - Windows: `<USERPROFILE>\\.vct\\launcher.db`
+                 (or `%VCT_STATE_DIR%\\launcher.db`)
+
+    `Path.home()` resolves correctly on all three platforms; `os.environ`
+    + `Path` join is portable. The launcher does NOT use Tauri's
+    `app_data_dir()` here — it pins to `~/.vct/` so the same path works
+    whether the launcher was installed via Tauri bundle, run from a
+    cargo build, or hadn't started yet (path is predictable before any
+    Tauri code has executed). VCT_STATE_DIR override is honoured for
+    dev/prod isolation, same as the Rust side.
+
+    Returns a `Path` whether or not the file exists on disk — caller is
+    responsible for the `.is_file()` check and the soft-fail.
+    """
+    from vco_lib.paths import vct_root_dir
+    return vct_root_dir() / "launcher.db"
+
+
+def _write_preset_defaults_to_app_state(
+    install_root: Path,  # noqa: ARG001 — reserved for future test-only DB override
+    embed_config: dict,
+    openai_set_as_default: bool,
+) -> None:
+    """Seed the launcher's `app_state` table with the install-time
+    embedding-model defaults so the GUI dropdowns pre-populate for
+    brand-new projects.
+
+    Ordering constraint: if install.py runs BEFORE the launcher has
+    ever been started (fresh first-install), the launcher.db file does
+    not exist yet. The launcher creates it (with the `app_state` table)
+    on first boot via `db::Db::open` → `migrations::apply`. In that
+    case, we cannot pre-populate defaults — the user's first GUI action
+    will land their explicit choice, which is functionally equivalent
+    for the "what shows up in the dropdown" goal. We soft-fail with a
+    `skip` log event.
+
+    On --update runs (where launcher.db exists), the rows ARE
+    pre-populated. Idempotency comes from `INSERT OR IGNORE`: rows the
+    user explicitly set in a prior session are preserved.
+
+    Soft-fail cases (all log a `skip`/`warn` and return without raising):
+      - launcher.db file does not exist (fresh install, never booted)
+      - `app_state` table does not exist (schema migration not applied
+        — should not happen if file exists, but defense-in-depth)
+      - Any `sqlite3.Error` (locked DB, permission denied, corruption)
+
+    Never raises: install.py should not fail just because the GUI
+    dropdowns won't pre-populate.
+
+    Args:
+        install_root: Project root (unused in v0.2.18; kept for the
+            potential test/integration use case of pointing at a
+            non-default DB location). DB path is resolved via
+            `_discover_app_state_db_path` from `vct_root_dir()` env.
+        embed_config: As returned by `_choose_embedding_config`.
+        openai_set_as_default: True when `--openai-key` was passed (or,
+            via the wizard, when the user ticked "set OpenAI as
+            default").
+    """
+    db_path = _discover_app_state_db_path()
+    if not db_path.is_file():
+        _log_install_event(
+            "preset_defaults", "skip",
+            f"launcher.db not found at {db_path}; defaults will be set "
+            f"by the launcher on first GUI use (no-op until then)",
+            data={"db_path": str(db_path)},
+        )
+        return
+
+    text_model, code_model = _preset_to_default_models(
+        embed_config, openai_set_as_default,
+    )
+
+    # stdlib only — sqlite3 ships with every CPython >=3.11. No new
+    # deps. Connection is opened with the default isolation level
+    # (deferred) so the INSERT OR IGNOREs run inside an auto-managed
+    # transaction.
+    import sqlite3
+    try:
+        conn = sqlite3.connect(str(db_path))
+    except sqlite3.Error as e:
+        _log_install_event(
+            "preset_defaults", "warn",
+            f"sqlite3.connect failed for {db_path}: {e}",
+            data={"db_path": str(db_path), "error": str(e)},
+        )
+        return
+
+    try:
+        # `updated_at` is a NOT NULL column — provide unix-millis now.
+        # ON CONFLICT(key) DO NOTHING preserves any prior value (user's
+        # manual selection from an earlier launcher session). This is
+        # the same idempotency semantic as `INSERT OR IGNORE`, written
+        # explicitly so the intent is obvious to a future reader.
+        import time as _time
+        now_ms = int(_time.time() * 1000)
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "INSERT INTO app_state (key, value, updated_at) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO NOTHING",
+                (_APP_STATE_KEY_DEFAULT_TEXT_EMBED, text_model, now_ms),
+            )
+            text_inserted = cur.rowcount > 0
+            cur.execute(
+                "INSERT INTO app_state (key, value, updated_at) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO NOTHING",
+                (_APP_STATE_KEY_DEFAULT_CODE_EMBED, code_model, now_ms),
+            )
+            code_inserted = cur.rowcount > 0
+            conn.commit()
+        except sqlite3.OperationalError as e:
+            # Most common: "no such table: app_state". The launcher
+            # owns the schema — we should not auto-create it from here
+            # (separation of concerns). Soft-fail with a clear log.
+            _log_install_event(
+                "preset_defaults", "skip",
+                f"app_state table not present yet ({e}); the launcher "
+                f"will create it on first boot",
+                data={"db_path": str(db_path), "error": str(e)},
+            )
+            return
+
+        active = embed_config.get("active_embedding", "unknown")
+        _log_install_event(
+            "preset_defaults", "ok",
+            f"app_state defaults seeded "
+            f"(active={active}, text={text_model}, code={code_model}, "
+            f"text_inserted={text_inserted}, code_inserted={code_inserted})",
+            data={
+                "active_embedding": active,
+                "default_text_embedding": text_model,
+                "default_code_embedding": code_model,
+                "text_inserted": text_inserted,
+                "code_inserted": code_inserted,
+                "db_path": str(db_path),
+            },
+        )
+    except sqlite3.Error as e:
+        _log_install_event(
+            "preset_defaults", "warn",
+            f"sqlite error writing preset defaults to {db_path}: {e}",
+            data={"db_path": str(db_path), "error": str(e)},
+        )
+    finally:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
 
 
 # ---------------------------------------------------------------------------
