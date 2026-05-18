@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `fix(release)`: `commit-dist-binaries` Stage step now reads the flat
+  artifact layout `actions/upload-artifact@v7` actually produces
+  (`<artifact_dir>/<binary>`), not the nested
+  `<artifact_dir>/launcher/dist/<target>/<binary>` the pre-v0.2.16 code
+  assumed. Root cause of the v0.2.15 auto-commit failure
+  (`Expected artifact not found: _dist-artifacts/linux-x64/launcher/dist/linux-x64/vct-launcher`)
+  — the build matrix succeeded and the Release page got all three OS
+  zips; only the auto-binary-commit step failed, which the maintainer
+  worked around via the manual binary-commit recipe (commit 0d24812).
+  Verified by inspection against `actions/upload-artifact@v7`'s flat-file
+  layout for individual-file `path:` entries. Will be exercised
+  end-to-end on the v0.2.16 release run.
+
+### Added
+
+- `feat(install)`: `state/install-manifest.json` now writes
+  `uuid_scheme = "v2"` on every install/update/lightweight path.
+  Pairs with the v0.2.16 analyzer changes that key code-graph UUIDs
+  on `(project, file_path, full_name)` rather than the pre-v0.2.16
+  `(project, full_name)` tuple. Pre-v0.2.16 manifests have no
+  `uuid_scheme` field — readers MUST treat the absence as the
+  implicit `"v1"` scheme. Future migration tooling consults this
+  marker to decide whether existing code-graph collections need a
+  `--force-recreate` rebuild.
+- `feat(install)`: stub `--migrate-uuid-scheme` flag on `install.py`
+  for the upcoming code-graph UUID-key migrator. Currently a no-op
+  beyond the manifest marker above; real migration tool ships
+  post-v0.2.16.
+
 ## [0.2.15] — 2026-05-17
 
 Codegraph-wedge release. v0.2.14's testing on the maintainer machine
