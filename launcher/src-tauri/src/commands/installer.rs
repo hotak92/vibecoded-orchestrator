@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
-use tauri::{command, Emitter, Manager, State, Window};
+use tauri::{command, AppHandle, Emitter, Manager, Runtime, State, Window};
 
 use crate::db::Db;
 use crate::secrets::{self, SecretScope};
@@ -2470,9 +2470,141 @@ async fn run_install_orchestrator_lightweight(
     })
 }
 
+/// v0.2.17 (plan 0.0.B): pre-pull rename helper for Windows.
+///
+/// On Windows, `git pull` fails with ERROR_SHARING_VIOLATION when it
+/// tries to overwrite the running launcher's binary
+/// (`launcher/dist/<arch>/vct-launcher.exe`). Git's error is atomic:
+/// the entire pull is reverted, so neither source nor binary lands.
+/// The fix is to rename our own .exe to a sibling path BEFORE
+/// invoking git pull. Windows allows this — the running process's
+/// .exe can be renamed even though it can't be overwritten (Chrome,
+/// VS Code, npm-on-Windows all rely on this pattern). Once renamed,
+/// the canonical path is free for git to write the new binary there.
+///
+/// Linux / macOS skip this step — both kernels handle running-binary
+/// overwrite via inode/vnode ref-counting (old binary stays mapped;
+/// new bits land at the same path on a new inode).
+///
+/// Returns the renamed path on Windows when rename happened, or None
+/// on Linux/macOS / when rename was unnecessary / when rename failed
+/// soft. Caller uses the return to revert on git-pull failure
+/// (best-effort).
+#[cfg(windows)]
+fn pre_pull_rename_running_binary(install_path: &Path) -> Option<PathBuf> {
+    // Resolve the running launcher's binary path. If anything in this
+    // chain fails (no current_exe, can't canonicalize, not under
+    // install_path), fall through — Linux-style overwrite path
+    // probably won't work on Windows but the user gets a clear git
+    // error rather than a misleading "rename failed" one.
+    let exe = std::env::current_exe().ok()?;
+    let exe_canon = dunce::canonicalize(&exe).unwrap_or(exe);
+    let install_canon = dunce::canonicalize(install_path).unwrap_or_else(|_| install_path.to_path_buf());
+    if !exe_canon.starts_with(&install_canon) {
+        // Running from outside the install tree (e.g. development
+        // build from cargo) — git pull won't try to overwrite us.
+        return None;
+    }
+
+    let pid = std::process::id();
+    let backup_name = format!(
+        "{}.old-{}",
+        exe_canon.file_name()?.to_string_lossy(),
+        pid,
+    );
+    let backup_path = exe_canon.parent()?.join(backup_name);
+
+    match std::fs::rename(&exe_canon, &backup_path) {
+        Ok(()) => {
+            eprintln!(
+                "[vct] update_orchestrator: pre-pull renamed running launcher \
+                 binary to {} (Windows). New binary will be written to {} by \
+                 git pull.",
+                backup_path.display(),
+                exe_canon.display(),
+            );
+            Some(backup_path)
+        }
+        Err(e) => {
+            eprintln!(
+                "[vct] update_orchestrator: pre-pull rename FAILED ({}). git pull \
+                 will likely fail with ERROR_SHARING_VIOLATION. Continuing — \
+                 the user will see the git error.",
+                e,
+            );
+            None
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn pre_pull_rename_running_binary(_install_path: &Path) -> Option<PathBuf> {
+    // POSIX kernels handle running-binary overwrite cleanly via inode
+    // ref-counting. No rename needed.
+    None
+}
+
+/// v0.2.17 (plan 0.0.B): revert the pre-pull rename on git-pull failure.
+///
+/// Best-effort: log + continue on any error. The user can manually
+/// rename `<binary>.old-<pid>` back to canonical if needed; failing
+/// to revert leaves the launcher unable to relaunch but the running
+/// instance still works fine.
+fn revert_pre_pull_rename(backup_path: &Path) {
+    let parent = match backup_path.parent() {
+        Some(p) => p,
+        None => return,
+    };
+    // Strip the `.old-<pid>` suffix to recover the canonical name.
+    let fname = match backup_path.file_name().and_then(|s| s.to_str()) {
+        Some(s) => s,
+        None => return,
+    };
+    let canonical_name = match fname.rsplit_once(".old-") {
+        Some((stem, _pid)) => stem.to_string(),
+        None => return,
+    };
+    let canonical_path = parent.join(canonical_name);
+    if let Err(e) = std::fs::rename(backup_path, &canonical_path) {
+        eprintln!(
+            "[vct] update_orchestrator: could not revert pre-pull rename \
+             ({} → {}): {}. The renamed file is left in place; the running \
+             launcher continues to work but a future launcher start may \
+             pick up the renamed binary as a stale .old-<pid> sibling \
+             (cleaned by the boot sweep).",
+            backup_path.display(),
+            canonical_path.display(),
+            e,
+        );
+    } else {
+        eprintln!(
+            "[vct] update_orchestrator: reverted pre-pull rename ({} → {})",
+            backup_path.display(),
+            canonical_path.display(),
+        );
+    }
+}
+
 /// Update an existing orchestrator installation.
+///
+/// v0.2.17 (plan 0.0 + 0.0.B): the flow auto-restarts the launcher on
+/// success. The launcher is a process manager / dashboard, not an
+/// editor — no in-flight user work lives in this process — so the
+/// "banner + user-clicks-Restart" ceremony from v0.2.16 W4 is
+/// replaced by an automatic relaunch. Sequence:
+///
+///   1. (Windows only) Rename the running launcher's binary aside
+///      so `git pull` can overwrite the canonical path.
+///   2. `git pull --ff-only`.
+///   3. `install.py --update`.
+///   4. Spawn the new launcher detached + exit current process.
+///
+/// On any error before step 4, return the error to the GUI (and
+/// revert the pre-pull rename if applicable). The current launcher
+/// keeps running, so the user can retry.
 #[command]
-pub async fn update_orchestrator(
+pub async fn update_orchestrator<R: Runtime>(
+    app: AppHandle<R>,
     path: String,
     window: Window,
 ) -> Result<InstallResult, String> {
@@ -2482,6 +2614,11 @@ pub async fn update_orchestrator(
     if !install_path.join(".git").exists() {
         return Err("Not a git repository — cannot update".to_string());
     }
+
+    // v0.2.17 (plan 0.0.B): Stage 0 — Windows-only pre-pull rename.
+    // No-op on Linux/macOS (returns None).
+    emit_progress(&window, "update", "Preparing for update...", 5.0);
+    let pre_pull_renamed = pre_pull_rename_running_binary(&install_path);
 
     // Stage 1: Pull latest
     emit_progress(&window, "update", "Pulling latest changes...", 10.0);
@@ -2495,12 +2632,24 @@ pub async fn update_orchestrator(
 
     if !pull.status.success() {
         let stderr = String::from_utf8_lossy(&pull.stderr);
+        // v0.2.17 (plan 0.0.B): on pull failure, revert the pre-pull
+        // rename so the running launcher can still be re-launched if
+        // the user kills the GUI. Best-effort.
+        if let Some(backup) = pre_pull_renamed.as_deref() {
+            revert_pre_pull_rename(backup);
+        }
         return Err(format!("git pull failed: {}", stderr));
     }
 
     let pull_output = String::from_utf8_lossy(&pull.stdout);
     if pull_output.contains("Already up to date") {
         emit_progress(&window, "done", "Already up to date!", 100.0);
+        // v0.2.17: nothing was pulled — revert the rename so the
+        // canonical path holds the (still-current) binary. The user
+        // doesn't expect a restart in this case.
+        if let Some(backup) = pre_pull_renamed.as_deref() {
+            revert_pre_pull_rename(backup);
+        }
         return Ok(InstallResult {
             success: true,
             install_path: path,
@@ -2527,6 +2676,14 @@ pub async fn update_orchestrator(
     // hint). Set even when we don't yet know we'll trigger a binary
     // swap because the swap detection happens inside install.py.
     cmd.env("VCT_LAUNCHER_PID", std::process::id().to_string());
+    // v0.2.17 (plan 0.0): tell install.py "the Rust side is handling
+    // the restart". install.py's `_refresh_dist_binary_after_rebuild`
+    // sees this and skips emitting the `launcher_restart_required`
+    // deferral — the auto-restart below makes the deferral redundant.
+    // When install.py runs WITHOUT this env (manual `python
+    // install.py --update` from terminal), it still emits the
+    // deferral so the running launcher's W4 banner picks it up.
+    cmd.env("VCT_AUTO_RESTART_LAUNCHER", "1");
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -2539,7 +2696,38 @@ pub async fn update_orchestrator(
 
     if !install_output.status.success() {
         let stderr = String::from_utf8_lossy(&install_output.stderr);
+        // v0.2.17: install.py failed — don't restart. Revert the
+        // pre-pull rename so the canonical path is usable again.
+        if let Some(backup) = pre_pull_renamed.as_deref() {
+            revert_pre_pull_rename(backup);
+        }
         return Err(format!("Update failed: {}", stderr));
+    }
+
+    emit_progress(
+        &window,
+        "restart",
+        "Update applied — restarting launcher...",
+        95.0,
+    );
+
+    // v0.2.17 (plan 0.0): auto-restart. The launcher has no in-flight
+    // user state to lose, so spawn the new binary detached + exit.
+    // Reuse the v0.2.15-shipped restart_launcher command to keep the
+    // restart codepath identical to the W4 user-click flow.
+    if let Err(e) = crate::commands::restart::restart_launcher(app, path.clone()).await {
+        // Auto-restart failed — emit a fallback deferral so the
+        // banner fires anyway when the user next interacts with the
+        // launcher. Don't return Err here: the update DID succeed,
+        // only the restart hop fell over. Worst case: user restarts
+        // manually.
+        eprintln!(
+            "[vct] update_orchestrator: auto-restart failed ({}); the new \
+             binary is on disk and install.py emitted the restart-required \
+             deferral as a fallback. The user can restart manually from the \
+             GUI banner.",
+            e,
+        );
     }
 
     emit_progress(&window, "done", "Orchestrator updated successfully!", 100.0);
