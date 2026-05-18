@@ -61,6 +61,15 @@
   // setInterval handle. Tracked so we can clearInterval on unmount or
   // when the user re-loads the modal mid-poll.
   let statusPollHandle: ReturnType<typeof setInterval> | null = null;
+  // W1+W3 wire-up / v0.2.16 (plan 1.4 — addendum H): tracks the
+  // wizard checkbox "Clean stale entries during re-analysis".
+  // Default true matches the plan ("recommended"). When the user
+  // clicks Re-analyze, this value is passed as `pruneStale` to
+  // `rebuild_code_graph`, which threads it through to the analyzer
+  // subprocess as `--prune-stale`. The analyzer then deletes any
+  // per-project code-graph object it did NOT visit this run (cleans
+  // up rows for source files deleted since the previous analyze).
+  let pruneStale = $state(true);
   // v0.2.15 (0.4): orphan-group cleanup state. Each entry in
   // `selectedOrphanPrefixes` toggles inclusion of one group's classes
   // in the next orphan-delete call.
@@ -122,7 +131,7 @@
 
     for (const p of report.affected_projects) {
       try {
-        await invoke('rebuild_code_graph', { projectId: p.project_id });
+        await invoke('rebuild_code_graph', { projectId: p.project_id, pruneStale });
       } catch (e) {
         reanalyzeProgress = {
           done: reanalyzeProgress.done,
@@ -592,6 +601,22 @@
            re-arms the wizard for the next launcher start. -->
       <button class="legacy-btn" onclick={dismiss}>Dismiss for now</button>
       {#if report && report.affected_projects.length > 0}
+        <!-- W1+W3 wire-up / v0.2.16 (plan 1.4 — addendum H): when
+             checked, Re-analyze passes --prune-stale to the
+             analyzer so any code-graph rows for source files
+             deleted since the previous analyze get cleaned up.
+             Default checked because the failure mode it prevents
+             (stale rows accumulating forever) is more harmful
+             than the (rare) case where the user wants to keep
+             pre-existing rows untouched. -->
+        <label class="legacy-prune-toggle" title="Recommended. Removes code-graph entries for files that have been deleted from the project since the previous analyze.">
+          <input
+            type="checkbox"
+            bind:checked={pruneStale}
+            disabled={reanalyzing || cleaningUp}
+          />
+          Clean stale entries during re-analysis
+        </label>
         <button
           class="legacy-btn legacy-btn-primary"
           disabled={reanalyzing || cleaningUp}
@@ -744,6 +769,25 @@
     justify-content: flex-end;
     gap: 8px;
     flex-wrap: wrap;
+    align-items: center;
+  }
+  .legacy-prune-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    opacity: 0.85;
+    cursor: pointer;
+    margin-right: auto;
+  }
+  .legacy-prune-toggle input[type="checkbox"] {
+    width: auto;
+    margin: 0;
+    cursor: pointer;
+  }
+  .legacy-prune-toggle:has(input:disabled) {
+    cursor: not-allowed;
+    opacity: 0.5;
   }
   .legacy-btn {
     background: rgba(255,255,255,0.06);
