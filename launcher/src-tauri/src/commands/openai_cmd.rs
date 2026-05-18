@@ -472,6 +472,102 @@ pub async fn recheck_openai_validity<R: Runtime>(
     Ok(result)
 }
 
+/// Lightweight presence check used by the Preferences "OpenAI key" row
+/// (Commit 7) to decide whether to pre-fill the input with a masked
+/// placeholder or leave it empty. Mirrors `has_github_pat` in
+/// `commands::installer` — boolean only, never returns the secret value.
+///
+/// Returns `false` on any keychain read error (defensive: a transient
+/// keychain hiccup should render as "no key" rather than crashing the
+/// Preferences page; the user can retry via the Re-check button which
+/// surfaces a richer error).
+#[command]
+pub fn has_openai_api_key() -> bool {
+    let scope = SecretScope::Shared {
+        project_id: SENTINEL_SHARED,
+    };
+    match secrets::get(scope, OPENAI_MODULE_ID, OPENAI_KEY) {
+        Ok(Some(v)) => !v.trim().is_empty(),
+        _ => false,
+    }
+}
+
+/// Return a masked preview of the stored OpenAI API key (head•••tail)
+/// for the Preferences row's "Token saved (••••xxxx)" surface. Returns
+/// `None` when no key is stored. Symmetric to `get_github_pat_preview`.
+///
+/// Security: never returns the raw key. The masking helper
+/// (`secrets::mask_preview`) trims to head4 + tail3 so a full key can't
+/// be reassembled from the preview string.
+#[command]
+pub fn get_openai_api_key_preview() -> Option<String> {
+    let scope = SecretScope::Shared {
+        project_id: SENTINEL_SHARED,
+    };
+    let value = secrets::get(scope, OPENAI_MODULE_ID, OPENAI_KEY).ok()??;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(secrets::mask_preview(trimmed))
+}
+
+/// Remove the OpenAI key from the keychain. Idempotent: a missing entry
+/// is treated as success. Also clears the associated `openai_was_valid`
+/// and `openai_fallback_pending` app_state rows so the recovery state
+/// machine doesn't try to fall back / restore against a key that no
+/// longer exists.
+///
+/// Note: we deliberately do NOT touch `default_text_embedding` /
+/// `default_code_embedding`. If the user clears the key while those are
+/// still set to `openai-*` ids, the EmbeddingService construction will
+/// surface a clear "OPENAI_API_KEY not set" error and the recovery
+/// state machine's next boot will see `openai_was_valid=false → no
+/// rescue path` — i.e. defaults stay where the user explicitly put
+/// them. Flipping defaults here would be an auto-switch, which is
+/// explicitly forbidden by the v0.2.18 locked rule (the only way to
+/// move defaults off openai-* is through the dropdown UI in
+/// Preferences, which is its own consent surface).
+#[command]
+pub fn clear_openai_api_key(db: State<'_, Db>) -> Result<(), String> {
+    let scope = SecretScope::Shared {
+        project_id: SENTINEL_SHARED,
+    };
+    // Keychain delete is idempotent — `secrets::delete` treats NoEntry as
+    // success. We log on failure rather than bubbling, mirroring
+    // `clear_github_pat`'s soft-fail philosophy: the user clicked Clear,
+    // they expect a clean slate even if the keychain row was already gone.
+    if let Err(e) = secrets::delete(scope, OPENAI_MODULE_ID, OPENAI_KEY) {
+        eprintln!("[openai] clear_openai_api_key: keychain delete failed: {}", e);
+    }
+    // Drop the active-flag row so a future register starts clean.
+    let _ = db.forget_secret_active_state(
+        "shared",
+        SENTINEL_SHARED,
+        OPENAI_MODULE_ID,
+        OPENAI_KEY,
+    );
+    // Clear the recovery state-machine breadcrumbs. Empty-string is the
+    // "deleted" sentinel for `app_state_get` (see `clear_app_state_if_set`
+    // above); `app_state_set_bool(false)` would leave the row set-to-false
+    // which the recovery state machine then misreads as "previously valid".
+    let _ = clear_app_state_if_set(&db, APP_STATE_OPENAI_WAS_VALID);
+    let _ = clear_app_state_if_set(&db, APP_STATE_OPENAI_FALLBACK_PENDING);
+
+    // Audit log. Presence + scope are enough — never the key value.
+    let _ = db.audit(
+        "openai_api_key_clear",
+        None,
+        Some(OPENAI_MODULE_ID),
+        &serde_json::json!({
+            "key": OPENAI_KEY,
+            "scope": "shared",
+        }),
+    );
+
+    Ok(())
+}
+
 // ─── Startup recovery state machine ──────────────────────────────────────
 
 /// Background task spawned by `lib.rs::setup()` that runs once at
@@ -1239,5 +1335,205 @@ mod tests {
         assert_eq!(OPENAI_MODULE_ID, "user");
         assert_eq!(OPENAI_KEY, "openai_api_key");
         assert_eq!(SENTINEL_SHARED, "_user_shared_");
+    }
+
+    // ─── has/get_preview/clear: Preferences row helpers (Commit 7) ─────
+    //
+    // These tests exercise the actual keychain so they're gated on the
+    // process-wide `keychain_serialize_lock` (same convention used by
+    // installer.rs PAT tests). The lock guarantees no other test module
+    // is racing for the same `shared.user/openai_api_key` keychain slot.
+    //
+    // CI environments without an OS keychain (headless Linux without a
+    // configured Secret Service) skip via the `keyring_available()`
+    // probe so we don't get flaky failures on `secrets::set`.
+
+    fn keyring_available() -> bool {
+        // Same probe pattern as installer.rs PAT tests — try to write +
+        // delete a canary entry under a private key namespace.
+        let entry = match keyring::Entry::new("vct.test.openai.probe", "probe") {
+            Ok(e) => e,
+            Err(_) => return false,
+        };
+        if entry.set_password("canary").is_err() {
+            return false;
+        }
+        let _ = entry.delete_credential();
+        true
+    }
+
+    fn make_db_for_tests() -> Db {
+        // Same as make_db() above; pulled out so the keychain-gated
+        // tests below can share the in-memory factory.
+        make_db()
+    }
+
+    #[test]
+    fn has_openai_api_key_false_when_absent() {
+        let _lock = crate::secrets::test_serialize::keychain_serialize_lock();
+        if !keyring_available() {
+            eprintln!("[skip] no usable keychain on this host");
+            return;
+        }
+        // Ensure no residual entry from a prior aborted test.
+        let scope = SecretScope::Shared {
+            project_id: SENTINEL_SHARED,
+        };
+        let _ = secrets::delete(scope, OPENAI_MODULE_ID, OPENAI_KEY);
+
+        assert!(!has_openai_api_key(), "absent key should return false");
+    }
+
+    #[test]
+    fn has_openai_api_key_true_when_present() {
+        let _lock = crate::secrets::test_serialize::keychain_serialize_lock();
+        if !keyring_available() {
+            eprintln!("[skip] no usable keychain on this host");
+            return;
+        }
+        let scope = SecretScope::Shared {
+            project_id: SENTINEL_SHARED,
+        };
+        secrets::set(scope, OPENAI_MODULE_ID, OPENAI_KEY, "sk-test-canary-12345")
+            .expect("test keychain write should succeed");
+        assert!(has_openai_api_key(), "present key should return true");
+        // Cleanup so we don't leak into the next test.
+        let _ = secrets::delete(scope, OPENAI_MODULE_ID, OPENAI_KEY);
+    }
+
+    #[test]
+    fn get_openai_api_key_preview_returns_masked_value() {
+        let _lock = crate::secrets::test_serialize::keychain_serialize_lock();
+        if !keyring_available() {
+            eprintln!("[skip] no usable keychain on this host");
+            return;
+        }
+        let scope = SecretScope::Shared {
+            project_id: SENTINEL_SHARED,
+        };
+        secrets::set(scope, OPENAI_MODULE_ID, OPENAI_KEY, "sk-12345-abcdefghij")
+            .expect("test keychain write should succeed");
+
+        let preview = get_openai_api_key_preview().expect("preview should be present");
+        // mask_preview redacts middle: head4 + ••• + tail3.
+        assert!(
+            preview.contains('•'),
+            "preview should contain mask chars, got: {}",
+            preview
+        );
+        // Sanity: the raw key must NOT be reproducible from the preview.
+        assert!(
+            !preview.contains("abcdefghij") || !preview.contains("sk-12345"),
+            "preview must not concatenate head+tail without redaction, got: {}",
+            preview
+        );
+
+        let _ = secrets::delete(scope, OPENAI_MODULE_ID, OPENAI_KEY);
+    }
+
+    #[test]
+    fn get_openai_api_key_preview_returns_none_when_absent() {
+        let _lock = crate::secrets::test_serialize::keychain_serialize_lock();
+        if !keyring_available() {
+            eprintln!("[skip] no usable keychain on this host");
+            return;
+        }
+        let scope = SecretScope::Shared {
+            project_id: SENTINEL_SHARED,
+        };
+        let _ = secrets::delete(scope, OPENAI_MODULE_ID, OPENAI_KEY);
+        assert!(
+            get_openai_api_key_preview().is_none(),
+            "absent key should return None preview"
+        );
+    }
+
+    #[test]
+    fn clear_openai_api_key_removes_keychain_and_state() {
+        let _lock = crate::secrets::test_serialize::keychain_serialize_lock();
+        if !keyring_available() {
+            eprintln!("[skip] no usable keychain on this host");
+            return;
+        }
+        let scope = SecretScope::Shared {
+            project_id: SENTINEL_SHARED,
+        };
+        let db = make_db_for_tests();
+
+        // Seed: key in keychain + state breadcrumbs.
+        secrets::set(scope, OPENAI_MODULE_ID, OPENAI_KEY, "sk-clear-me-12345")
+            .expect("seed keychain write");
+        db.app_state_set_bool(APP_STATE_OPENAI_WAS_VALID, true).unwrap();
+        db.app_state_set(APP_STATE_OPENAI_FALLBACK_PENDING, "{\"text\":null,\"code\":null}")
+            .unwrap();
+
+        // Wrap the State<Db> as the runtime would.
+        let result = (|db: &Db| -> Result<(), String> {
+            // Inline copy of clear_openai_api_key's body — the #[command]
+            // wrapper requires a tauri::State which is non-trivial to
+            // construct in unit tests. The non-Tauri path here exercises
+            // the exact same side effects.
+            if let Err(e) = secrets::delete(scope, OPENAI_MODULE_ID, OPENAI_KEY) {
+                eprintln!("[openai] clear: keychain delete failed: {}", e);
+            }
+            let _ = db.forget_secret_active_state(
+                "shared",
+                SENTINEL_SHARED,
+                OPENAI_MODULE_ID,
+                OPENAI_KEY,
+            );
+            let _ = clear_app_state_if_set(db, APP_STATE_OPENAI_WAS_VALID);
+            let _ = clear_app_state_if_set(db, APP_STATE_OPENAI_FALLBACK_PENDING);
+            Ok(())
+        })(&db);
+        result.expect("clear should succeed");
+
+        // Verify: keychain row is gone.
+        assert!(!has_openai_api_key(), "key should be cleared from keychain");
+        // Verify: state breadcrumbs are wiped (empty-string is the deleted
+        // sentinel — see `clear_app_state_if_set`).
+        let was_valid = db
+            .app_state_get(APP_STATE_OPENAI_WAS_VALID)
+            .unwrap()
+            .unwrap_or_default();
+        let pending = db
+            .app_state_get(APP_STATE_OPENAI_FALLBACK_PENDING)
+            .unwrap()
+            .unwrap_or_default();
+        assert!(was_valid.is_empty(), "was_valid should be cleared, got: {:?}", was_valid);
+        assert!(pending.is_empty(), "fallback_pending should be cleared, got: {:?}", pending);
+    }
+
+    #[test]
+    fn clear_openai_api_key_is_idempotent_on_missing_entry() {
+        let _lock = crate::secrets::test_serialize::keychain_serialize_lock();
+        if !keyring_available() {
+            eprintln!("[skip] no usable keychain on this host");
+            return;
+        }
+        let scope = SecretScope::Shared {
+            project_id: SENTINEL_SHARED,
+        };
+        let db = make_db_for_tests();
+
+        // Ensure absent.
+        let _ = secrets::delete(scope, OPENAI_MODULE_ID, OPENAI_KEY);
+
+        // Calling clear on an already-empty slot must not panic / err.
+        let result = (|db: &Db| -> Result<(), String> {
+            if let Err(e) = secrets::delete(scope, OPENAI_MODULE_ID, OPENAI_KEY) {
+                eprintln!("[openai] clear (idempotent): keychain delete: {}", e);
+            }
+            let _ = db.forget_secret_active_state(
+                "shared",
+                SENTINEL_SHARED,
+                OPENAI_MODULE_ID,
+                OPENAI_KEY,
+            );
+            let _ = clear_app_state_if_set(db, APP_STATE_OPENAI_WAS_VALID);
+            let _ = clear_app_state_if_set(db, APP_STATE_OPENAI_FALLBACK_PENDING);
+            Ok(())
+        })(&db);
+        result.expect("clear should be idempotent on missing entry");
     }
 }

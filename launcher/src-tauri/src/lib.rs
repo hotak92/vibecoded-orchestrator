@@ -931,6 +931,15 @@ pub fn run() {
             commands::openai_cmd::register_openai_api_key,
             commands::openai_cmd::validate_openai_api_key,
             commands::openai_cmd::recheck_openai_validity,
+            // Preferences-row helpers (v0.2.18, Commit 7). Mirror the
+            // github_pat trio in `commands::installer`: presence check +
+            // masked preview + idempotent clear. The Preferences page
+            // uses these to pre-fill the OpenAI key row with a masked
+            // placeholder so the user can re-check or clear without
+            // re-typing.
+            commands::openai_cmd::has_openai_api_key,
+            commands::openai_cmd::get_openai_api_key_preview,
+            commands::openai_cmd::clear_openai_api_key,
             // Embedding catalog (v0.2.18, Commit 8). Shells out to
             // `python -m vco_lib.embedding_service discover` to enumerate
             // reachable models, then surfaces those + the project's
