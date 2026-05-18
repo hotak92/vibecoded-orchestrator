@@ -78,7 +78,7 @@ transformers>=4.40.0,<4.50.0
 #   pip install torch --index-url https://download.pytorch.org/whl/cpu
 #   pip install torch --index-url https://download.pytorch.org/whl/cu126
 # before running `pip install -r requirements.txt`. See KNOWN_ISSUES.md.
-torch>=2.11.0
+torch>=2.12.0
 
 # ─── FastAPI (code embedding service HTTP server) ───
 # FastAPI (MIT) + uvicorn (BSD-3-Clause)
