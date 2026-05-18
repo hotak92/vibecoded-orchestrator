@@ -915,6 +915,14 @@ pub fn run() {
             commands::project_identity::cleanup_orphan_codegraph_collections,
             commands::project_identity::get_legacy_codegraph_notice_dismissed,
             commands::project_identity::set_legacy_codegraph_notice_dismissed,
+            // W3 / v0.2.16 (2026-05-18): wizard UX hardening (plan 0.3 + 0.9).
+            // The status batched-read feeds the wizard's poll loop so it
+            // shows real per-project progress instead of being stuck at
+            // "Started for N/N project(s)". The force-recheck command
+            // backs the Preferences "Re-check for legacy collections"
+            // button.
+            commands::project_identity::get_code_graph_build_status_for_projects,
+            commands::project_identity::force_recheck_legacy_codegraph,
             // PR-26 / Group E (v0.2.12 / 2026-05-16): shared KG canonical-name
             // picker — surfaces orchestrator-shaped classes on Weaviate so the
             // IdentityTab can let users pick which class is canonical.

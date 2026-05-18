@@ -697,6 +697,24 @@ pub async fn rebuild_code_graph(
         &serde_json::json!({ "name": project.name }),
     )?;
 
+    // W3 / v0.2.16 (plan 0.9): re-analyzing a project is the most common
+    // cause of new orphan generations appearing in Weaviate (the analyzer
+    // may write to a different prefix after a project rename or
+    // sanitizer-version bump). Reset the legacy-collections wizard's
+    // dismissal flag so the next launcher boot can re-detect cleanly —
+    // otherwise a user who dismissed the wizard once is stuck never
+    // seeing it again even when fresh orphans appear. Soft-fail: a
+    // hiccup writing to app_state must NOT block the rebuild.
+    if let Err(e) = db.app_state_set_bool("legacy_codegraph_notice_dismissed", false) {
+        eprintln!(
+            "[vct] warning: failed to reset legacy_codegraph_notice_dismissed \
+             after rebuild_code_graph for {}: {}. Wizard re-detection on the \
+             next launcher boot may be suppressed until the user clicks \
+             'Re-check for legacy collections' in Preferences.",
+            project.id, e
+        );
+    }
+
     spawn_initial_build(app, project.id, project.name, project.folder_path);
     Ok(())
 }

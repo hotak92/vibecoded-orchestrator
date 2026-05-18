@@ -20,7 +20,7 @@
   //     restricts deletion to the five code-graph suffixes only.
   //   - Dismissal is persistent via `set_legacy_codegraph_notice_dismissed`.
 
-  import { onMount } from 'svelte';
+  import { onMount, onDestroy } from 'svelte';
   import { invoke } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
   import DialogRoot from '$lib/components/DialogRoot.svelte';
@@ -39,7 +39,28 @@
   let cleanupConfirmed = $state(false);
   let cleaningUp = $state(false);
   let cleanupReport = $state<CleanupLegacyReport | null>(null);
-  let reanalyzeProgress = $state<{ done: number; total: number; failed: string[] } | null>(null);
+  // W3 / v0.2.16 (plan 0.3): kickoff counters were misleading because
+  // `rebuild_code_graph` returns as soon as the subprocess is spawned —
+  // the wizard used to report "Started 3/3" indefinitely while the
+  // analyzers were still running. We now keep the kickoff counters for
+  // the dispatch phase only, and replace the per-project display with
+  // live status read from `code_graph_builds` via a poll loop.
+  let reanalyzeProgress = $state<{ done: number; total: number; failed: string[]; complete: boolean } | null>(null);
+  // Per-project status map keyed by project_id. Refreshed every 2 s by
+  // the poll loop after kickoff dispatch. Status vocabulary mirrors
+  // `db::code_graph_builds::status` + a synthetic 'missing' for
+  // projects whose row hasn't been written yet.
+  interface PerProjectBuildStatus {
+    project_id: string;
+    status: string;
+    files_analyzed: number | null;
+    error_message: string | null;
+    terminal: boolean;
+  }
+  let perProjectStatuses = $state<Record<string, PerProjectBuildStatus>>({});
+  // setInterval handle. Tracked so we can clearInterval on unmount or
+  // when the user re-loads the modal mid-poll.
+  let statusPollHandle: ReturnType<typeof setInterval> | null = null;
   // v0.2.15 (0.4): orphan-group cleanup state. Each entry in
   // `selectedOrphanPrefixes` toggles inclusion of one group's classes
   // in the next orphan-delete call.
@@ -59,15 +80,46 @@
     }
   }
 
-  // Iterate `rebuild_code_graph` over every affected project. The Tauri
-  // command spawns the analyzer in the background and returns immediately
-  // (the build banner watches per-project progress), so this loop just
-  // dispatches kickoffs sequentially. Per-project failures are surfaced
-  // in the progress block but don't abort the loop.
+  // W3 / v0.2.16 (plan 0.3): iterate `rebuild_code_graph` over every
+  // affected project to dispatch the analyzer subprocess, THEN start a
+  // 2-second poll against `get_code_graph_build_status_for_projects` so
+  // we can show real per-project progress instead of being stuck at
+  // "Started N/N". The Tauri command spawns the analyzer in the
+  // background and returns immediately, so dispatch finishes in
+  // milliseconds — the slow part is the analyzer subprocesses, which
+  // the poll loop watches via the `code_graph_builds` table.
+  //
+  // The wizard is NOT auto-closed when polling completes — the user
+  // should review the final per-project status (files analyzed, any
+  // errors) before dismissing.
   async function reanalyzeAffected() {
     if (!report) return;
+    // Defensive: if the user clicks Re-analyze twice in quick
+    // succession, stop the previous poll loop before starting a fresh
+    // one so we don't end up with two intervals overlapping.
+    stopStatusPoll();
     reanalyzing = true;
-    reanalyzeProgress = { done: 0, total: report.affected_projects.length, failed: [] };
+    reanalyzeProgress = {
+      done: 0,
+      total: report.affected_projects.length,
+      failed: [],
+      complete: false,
+    };
+    // Pre-seed perProjectStatuses with 'pending' so the UI immediately
+    // renders one row per project (instead of showing nothing until
+    // the first poll tick at t+2s).
+    const seedStatuses: Record<string, PerProjectBuildStatus> = {};
+    for (const p of report.affected_projects) {
+      seedStatuses[p.project_id] = {
+        project_id: p.project_id,
+        status: 'pending',
+        files_analyzed: null,
+        error_message: null,
+        terminal: false,
+      };
+    }
+    perProjectStatuses = seedStatuses;
+
     for (const p of report.affected_projects) {
       try {
         await invoke('rebuild_code_graph', { projectId: p.project_id });
@@ -76,23 +128,140 @@
           done: reanalyzeProgress.done,
           total: reanalyzeProgress.total,
           failed: [...reanalyzeProgress.failed, `${p.name}: ${e}`],
+          complete: false,
+        };
+        // Kickoff itself failed — mark this project terminal so the
+        // poll loop's "everyone done?" check still resolves.
+        perProjectStatuses = {
+          ...perProjectStatuses,
+          [p.project_id]: {
+            project_id: p.project_id,
+            status: 'failed',
+            files_analyzed: null,
+            error_message: `kickoff failed: ${e}`,
+            terminal: true,
+          },
         };
       }
       reanalyzeProgress = {
         done: reanalyzeProgress.done + 1,
         total: reanalyzeProgress.total,
         failed: reanalyzeProgress.failed,
+        complete: false,
       };
     }
     reanalyzing = false;
-    if (reanalyzeProgress.failed.length === 0) {
-      toast.success(
-        `Started re-analysis for ${reanalyzeProgress.total} project${reanalyzeProgress.total === 1 ? '' : 's'}. Watch each project's build banner for progress.`,
-      );
-    } else {
+    if (reanalyzeProgress.failed.length > 0) {
       toast.error(
         `${reanalyzeProgress.failed.length} of ${reanalyzeProgress.total} kickoffs failed. See modal for details.`,
       );
+    }
+    // Start polling regardless — kickoffs that succeeded still need
+    // per-project status updates.
+    startStatusPoll();
+  }
+
+  // Poll `get_code_graph_build_status_for_projects` every 2 seconds.
+  // Stops as soon as every per-project status is terminal (success /
+  // failed / skipped / missing). Defensive against unmount: the
+  // onDestroy hook also clears the handle.
+  function startStatusPoll() {
+    if (!report) return;
+    const projectIds = report.affected_projects.map((p) => p.project_id);
+    if (projectIds.length === 0) {
+      if (reanalyzeProgress) {
+        reanalyzeProgress = { ...reanalyzeProgress, complete: true };
+      }
+      return;
+    }
+    // Immediate first poll so the user sees a fresh state right after
+    // kickoff dispatch finishes (no 2-second blank-screen window).
+    void pollOnce(projectIds);
+    statusPollHandle = setInterval(() => {
+      void pollOnce(projectIds);
+    }, 2000);
+  }
+
+  async function pollOnce(projectIds: string[]) {
+    try {
+      const statuses = await invoke<PerProjectBuildStatus[]>(
+        'get_code_graph_build_status_for_projects',
+        { projectIds },
+      );
+      // Replace the whole map in one assignment so Svelte's reactivity
+      // picks it up as a single update.
+      const next: Record<string, PerProjectBuildStatus> = {};
+      for (const s of statuses) {
+        next[s.project_id] = s;
+      }
+      perProjectStatuses = next;
+
+      if (statuses.length > 0 && statuses.every((s) => s.terminal)) {
+        stopStatusPoll();
+        if (reanalyzeProgress) {
+          reanalyzeProgress = { ...reanalyzeProgress, complete: true };
+        }
+        const failed = statuses.filter((s) => s.status === 'failed');
+        if (failed.length === 0) {
+          toast.success(
+            `Re-analysis finished for ${statuses.length} project${statuses.length === 1 ? '' : 's'}.`,
+          );
+        } else {
+          toast.error(
+            `Re-analysis finished with ${failed.length} of ${statuses.length} project${statuses.length === 1 ? '' : 's'} failing. See modal for per-project errors.`,
+          );
+        }
+      }
+    } catch (e) {
+      // Soft-fail: a single failed poll shouldn't stop the loop. The
+      // user can dismiss the modal if the polling stays broken.
+      console.warn('[legacy] poll get_code_graph_build_status_for_projects failed', e);
+    }
+  }
+
+  function stopStatusPoll() {
+    if (statusPollHandle !== null) {
+      clearInterval(statusPollHandle);
+      statusPollHandle = null;
+    }
+  }
+
+  // Icon vocabulary mirrors the rest of the launcher's lifecycle
+  // affordances. Kept here as a single function so future status
+  // additions only need to be wired in one place.
+  function statusIcon(status: string): string {
+    switch (status) {
+      case 'success':
+        return '✓';
+      case 'failed':
+        return '✗';
+      case 'skipped':
+        return '∅';
+      case 'missing':
+        return '?';
+      case 'pending':
+      case 'running':
+      default:
+        return '⏳';
+    }
+  }
+
+  function statusLabel(status: string): string {
+    switch (status) {
+      case 'pending':
+        return 'queued';
+      case 'running':
+        return 'analyzing';
+      case 'success':
+        return 'done';
+      case 'failed':
+        return 'failed';
+      case 'skipped':
+        return 'no source files';
+      case 'missing':
+        return 'no build recorded';
+      default:
+        return status;
     }
   }
 
@@ -120,6 +289,14 @@
   }
 
   async function dismiss() {
+    // W3 / v0.2.16 (plan 0.9): the backend still flips the flag to
+    // `true`, but the button label ("Dismiss for now") + the
+    // companion auto-reset in `rebuild_code_graph` + the
+    // "Re-check for legacy collections" button in Preferences make
+    // this a session-scoped affordance in practice — re-analyzing OR
+    // visiting Preferences re-arms the wizard for the next launcher
+    // start.
+    stopStatusPoll();
     try {
       await invoke('set_legacy_codegraph_notice_dismissed', { dismissed: true });
     } catch (e) {
@@ -127,6 +304,10 @@
     }
     onClose();
   }
+
+  // Defensive cleanup: clear the poll handle if the user navigates
+  // away (modal unmount) before the analyzers finish.
+  onDestroy(stopStatusPoll);
 
   function affectedLine(p: AffectedProject): string {
     return `${p.name}  —  current prefix: ${p.current_prefix}`;
@@ -325,13 +506,39 @@
         </section>
       {/if}
 
-      <!-- Re-analyze progress -->
+      <!-- W3 / v0.2.16 (plan 0.3): live re-analysis progress.
+           Polls `get_code_graph_build_status_for_projects` every 2 s
+           and renders a per-project row with icon + status label +
+           files-analyzed count. Replaces the old static "Started N/N"
+           line that never advanced past kickoff. -->
       {#if reanalyzeProgress}
         <section class="legacy-section legacy-progress">
-          <h4>Re-analysis kickoff status</h4>
+          <h4>Re-analysis progress</h4>
           <p>
-            Started for {reanalyzeProgress.done} / {reanalyzeProgress.total} project(s).
+            {#if reanalyzing}
+              Dispatching kickoffs: {reanalyzeProgress.done} / {reanalyzeProgress.total} project(s)…
+            {:else if reanalyzeProgress.complete}
+              All {reanalyzeProgress.total} project(s) finished. Review per-project status below, then dismiss.
+            {:else}
+              Analyzers running. Status refreshes every 2 seconds.
+            {/if}
           </p>
+          <ul class="legacy-list legacy-build-rows">
+            {#each report.affected_projects as p (p.project_id)}
+              {@const st = perProjectStatuses[p.project_id]}
+              <li class="legacy-build-row legacy-build-status-{st?.status ?? 'pending'}">
+                <span class="legacy-build-icon" aria-hidden="true">{statusIcon(st?.status ?? 'pending')}</span>
+                <span class="legacy-build-name">{p.name}</span>
+                <span class="legacy-build-status">{statusLabel(st?.status ?? 'pending')}</span>
+                {#if st && st.files_analyzed !== null}
+                  <span class="legacy-build-files">{st.files_analyzed} file{st.files_analyzed === 1 ? '' : 's'}</span>
+                {/if}
+                {#if st && st.error_message}
+                  <span class="legacy-build-error">{st.error_message}</span>
+                {/if}
+              </li>
+            {/each}
+          </ul>
           {#if reanalyzeProgress.failed.length > 0}
             <ul class="legacy-list legacy-failed">
               {#each reanalyzeProgress.failed as f}
@@ -379,7 +586,11 @@
   {/snippet}
   {#snippet footer()}
     <div class="legacy-footer">
-      <button class="legacy-btn" onclick={dismiss}>Dismiss</button>
+      <!-- W3 / v0.2.16 (plan 0.9): label communicates that dismissal
+           is session-scoped — re-analyzing OR clicking the
+           Preferences "Re-check for legacy collections" button
+           re-arms the wizard for the next launcher start. -->
+      <button class="legacy-btn" onclick={dismiss}>Dismiss for now</button>
       {#if report && report.affected_projects.length > 0}
         <button
           class="legacy-btn legacy-btn-primary"
@@ -606,5 +817,57 @@
   .legacy-orphan-meta {
     color: #888;
     font-size: 11px;
+  }
+  /* W3 / v0.2.16 (plan 0.3): per-project build rows in the
+     progress section. Each row: icon | name | status label | files
+     count | optional error. Icons mirror the rest of the launcher's
+     lifecycle affordances (⏳ pending/running, ✓ success, ✗ failed). */
+  .legacy-build-rows {
+    margin-top: 8px;
+  }
+  .legacy-build-row {
+    display: grid;
+    grid-template-columns: 20px 1fr auto auto;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 10px;
+    font-size: 12px;
+  }
+  .legacy-build-icon {
+    font-size: 14px;
+    text-align: center;
+  }
+  .legacy-build-name {
+    color: #ddd;
+  }
+  .legacy-build-status {
+    color: #888;
+    font-size: 11px;
+  }
+  .legacy-build-files {
+    color: #aaa;
+    font-size: 11px;
+    font-family: ui-monospace, monospace;
+  }
+  .legacy-build-error {
+    grid-column: 2 / -1;
+    color: #f99;
+    font-size: 11px;
+    margin-top: 2px;
+  }
+  .legacy-build-status-success .legacy-build-icon { color: rgb(0,210,180); }
+  .legacy-build-status-failed .legacy-build-icon { color: #f88; }
+  .legacy-build-status-skipped .legacy-build-icon { color: #888; }
+  .legacy-build-status-missing .legacy-build-icon { color: #ccaa55; }
+  .legacy-build-status-pending .legacy-build-icon,
+  .legacy-build-status-running .legacy-build-icon {
+    /* Subtle pulse so the user sees activity even when files_analyzed
+       hasn't ticked yet (the analyzer's startup phase can take a few
+       seconds before any file is counted). */
+    animation: legacy-pulse 1.6s ease-in-out infinite;
+  }
+  @keyframes legacy-pulse {
+    0%, 100% { opacity: 0.55; }
+    50% { opacity: 1; }
   }
 </style>
