@@ -48,13 +48,41 @@ export interface InstallResult {
   system: SystemDetection;
 }
 
+/**
+ * v0.2.16 (W4 / 0.5): three-state update status surfaced by the
+ * `UpdateBadge` banner. Mirror of Rust `commands::installer::UpdateStatus`.
+ *
+ * The banner renders the highest-priority state when more than one
+ * flag is true (priority: binary_stale > install_stale > remote_ahead).
+ *
+ * Each flag has a distinct resolver:
+ * - remote_ahead   → invoke('update_orchestrator')  // git pull + install
+ * - install_stale  → invoke('apply_pending_install') // install.py only
+ * - binary_stale   → invoke('restart_launcher')      // re-exec dist binary
+ */
+export interface UpdateStatus {
+  remote_ahead: boolean;
+  install_stale: boolean;
+  binary_stale: boolean;
+  source_version: string;
+  installed_version: string;
+  running_version: string;
+  on_disk_binary_version: string;
+}
+
 type OrchestratorStatus = 'unknown' | 'not_installed' | 'installed' | 'installing' | 'updating' | 'error';
 
 interface OrchestratorState {
   status: OrchestratorStatus;
   installPath: string;
   version: string;
+  /** Derived: any of the three update signals is true. Kept for backward
+   *  compat with consumers that just want a bool. New code should read
+   *  `updateStatus` directly to get the per-signal breakdown. */
   updateAvailable: boolean;
+  /** v0.2.16 (W4 / 0.5): full three-state update status. Null until
+   *  the first `checkStatus()` resolves. */
+  updateStatus: UpdateStatus | null;
   system: SystemDetection | null;
   progress: InstallProgress | null;
   error: string | null;
@@ -70,6 +98,7 @@ function createOrchestratorStore() {
     installPath: '',
     version: '',
     updateAvailable: false,
+    updateStatus: null,
     system: null,
     progress: null,
     error: null,
@@ -138,16 +167,24 @@ function createOrchestratorStore() {
 
       if (installed) {
         const version = await safeInvoke<string>('get_installed_version', { path: currentPath });
-        const updateAvailable = await safeInvoke<boolean>('check_for_updates', { path: currentPath });
+        // v0.2.16 (W4 / 0.5): check_for_updates now returns the full
+        // UpdateStatus struct. Keep the legacy boolean as a derived
+        // any-of-three signal for old consumers that only care about
+        // "is there something to do?".
+        const updateStatus = await safeInvoke<UpdateStatus>('check_for_updates', { path: currentPath });
+        const updateAvailable = updateStatus
+          ? (updateStatus.remote_ahead || updateStatus.install_stale || updateStatus.binary_stale)
+          : false;
         update((s) => ({
           ...s,
           status: 'installed',
           version: version ?? s.version,
-          updateAvailable: updateAvailable ?? false,
+          updateAvailable,
+          updateStatus: updateStatus ?? null,
           installPath: currentPath,
         }));
       } else {
-        update((s) => ({ ...s, status: 'not_installed', installPath: currentPath }));
+        update((s) => ({ ...s, status: 'not_installed', installPath: currentPath, updateStatus: null }));
       }
     },
 
@@ -191,6 +228,39 @@ function createOrchestratorStore() {
           ...s,
           status: 'installed',
           updateAvailable: false,
+          error: null,
+        }));
+        return result;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        update((s) => ({ ...s, status: 'installed', error: message }));
+        throw err;
+      }
+    },
+
+    /**
+     * v0.2.16 (W4 / 0.5): apply a pending install (install.py --update)
+     * WITHOUT a preceding git pull. Resolves the install_stale banner
+     * state. The source tree is already current — this just refreshes
+     * `.claude/`, MCP registrations, and bumps
+     * `state/install-manifest.json::version`.
+     *
+     * Distinct from `update_orchestrator` to avoid wasting ~30s pulling
+     * an already-current tree (and to avoid noising the launcher's
+     * git output for no value).
+     */
+    async apply_pending_install(): Promise<InstallResult> {
+      let currentPath = '';
+      const unsub = subscribe((s) => { currentPath = s.installPath; });
+      unsub();
+
+      update((s) => ({ ...s, status: 'updating', error: null, progress: null }));
+
+      try {
+        const result = await tauriInvoke<InstallResult>('apply_pending_install', { path: currentPath });
+        update((s) => ({
+          ...s,
+          status: 'installed',
           error: null,
         }));
         return result;

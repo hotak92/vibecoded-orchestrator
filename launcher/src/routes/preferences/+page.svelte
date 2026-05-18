@@ -233,6 +233,28 @@
     goto('/');
   }
 
+  // W3 / v0.2.16 (plan 0.9): manual re-arm of the legacy-collections
+  // wizard. Resets the `legacy_codegraph_notice_dismissed` app_state
+  // flag so the wizard re-detects on the next launcher start. The
+  // companion auto-reset in `rebuild_code_graph` covers the
+  // re-analyze pathway; this button is for users who want to force a
+  // re-check WITHOUT triggering a fresh analyze.
+  let legacyRechecking = $state(false);
+
+  async function forceRecheckLegacy() {
+    legacyRechecking = true;
+    try {
+      await invoke('force_recheck_legacy_codegraph');
+      toast.success(
+        'Wizard re-armed. Restart the launcher to re-detect legacy collections.',
+      );
+    } catch (e) {
+      toast.error(e);
+    } finally {
+      legacyRechecking = false;
+    }
+  }
+
   const project = $derived($selectedProject);
 
   async function load() {
@@ -360,6 +382,33 @@
       </div>
     </section>
 
+    <!-- W3 / v0.2.16 (plan 0.9): re-check for legacy code-graph
+         collections. The wizard's "Dismiss for now" button sets a
+         persistent flag that suppresses re-detection on subsequent
+         launcher boots — that flag auto-resets when the user
+         re-analyzes a project, but if the user wants to force a
+         re-check WITHOUT re-running an analyzer they can flip the
+         flag back here. The wizard re-fires on the next launcher
+         start. -->
+    <section class="pr-section">
+      <h2 class="pr-section-title">Code-graph collections</h2>
+      <div class="pr-onboarding-row">
+        <div class="pr-onboarding-text">
+          <strong>Re-check for legacy collections</strong>
+          <span class="pr-onboarding-hint">
+            Resets the dismissed-wizard flag so the legacy-collections
+            wizard re-fires on the next launcher start. Useful if you
+            dismissed the wizard once and want to verify there are no
+            new orphans from a subsequent project rename or analyzer
+            re-run.
+          </span>
+        </div>
+        <button class="pr-btn" disabled={legacyRechecking} onclick={() => void forceRecheckLegacy()}>
+          {legacyRechecking ? 'Resetting…' : 'Re-check'}
+        </button>
+      </div>
+    </section>
+
     <!-- PR-10A storage UX (v0.2.11): deep link to the per-service
          storage picker. Adjacent to Updates because both are about
          runtime infrastructure (container data location vs. orchestrator
@@ -376,6 +425,25 @@
           </span>
         </div>
         <button class="pr-btn" onclick={() => goto('/preferences/storage')}>
+          Open
+        </button>
+      </div>
+      <!-- v0.2.16 (W4 / 0.11): advanced view of Weaviate code-graph
+           inventory, including prefixes whose project is no longer
+           registered. GUI defaults hide these; surfaced here for
+           clean-up + diagnostics. -->
+      <div class="pr-onboarding-row">
+        <div class="pr-onboarding-text">
+          <strong>Show untracked Weaviate collections</strong>
+          <span class="pr-onboarding-hint">
+            Full inventory of code-graph data including dead-project
+            leftovers (collections whose prefix no longer matches a
+            registered project). Day-to-day surfaces hide these for
+            clarity — open this view to clean them up or reference them
+            before re-importing the project.
+          </span>
+        </div>
+        <button class="pr-btn" onclick={() => goto('/preferences/weaviate-untracked')}>
           Open
         </button>
       </div>

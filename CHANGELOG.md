@@ -7,6 +7,178 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.16] — 2026-05-18
+
+### Fixed
+
+- **`fix(hook)` post-tool-security smoke-test marker rename**: the
+  prior smoke-test sentinel in
+  `templates/hooks/post-tool-security.{sh,ps1}` was a common-English-
+  looking bare-word token that matched a legitimate CHANGELOG
+  release-note entry documenting the marker itself, so every CHANGELOG
+  edit triggered a false-positive "Possible credential" alert. The
+  sentinel is now a VCT-prefixed, `_PROBE`-suffixed identifier with a
+  6-char random hex tail — unique enough that it cannot accidentally
+  appear in docs or prose. See the hook source for the actual literal
+  (intentionally not quoted here to prevent the same release-note
+  collision recurring). The simple bare-pattern check is preserved (no
+  regex loosening). No external test fixtures referenced the old name.
+- **Code-graph analyzer integrity** (W1 / plan 0.1 + 0.2 + 0.7 + 0.8
+  + addendum D + 1.4/H). Five silent-correctness bugs in
+  `templates/scripts/analyze_code_graph.py` that combined to make
+  the analyzer report success while producing incomplete or empty
+  per-project code-graph collections. Edit target is the canonical
+  `templates/scripts/` (the installer renders into each project's
+  `.claude/scripts/` on `install.py --update`).
+    - **0.1 `_dedup_insert` is now actually idempotent**: switched the
+      internal call from `collection.data.insert(uuid=...)` (POST-only —
+      raises 422 on the second run with the same UUID) to
+      `collection.data.replace()` (PUT-upsert — idempotent by contract).
+      The previous behaviour swallowed every re-run collision in the
+      outer per-file try/except, silently flagging files as "skipped"
+      and exiting 0; the wizard then rendered green-toast success while
+      most objects never landed. All 25 call sites benefit from the
+      single internal change.
+    - **0.7 UUID identity-key includes file path**: `_deterministic_uuid`
+      signature is now `(project, file_path_rel, full_name)`. Two
+      genuinely-different files defining the same `module-stem.symbol`
+      (e.g. `server.handler` in `claude_mcp_servers/weaviate_mcp/server.py`
+      AND `docs/research/probes/server.py`) no longer collide on the same
+      UUID. Cross-OS contract: callers pass `Path(...).as_posix()` so
+      Windows backslashes don't produce different UUIDs from the same
+      file. All 11 per-language `_analyze_*_file` methods normalise
+      `relative_path` via `.as_posix()` before threading it through.
+    - **0.8 NameError on `class_uuid` in `_extract_class`**: the
+      `self._dedup_insert(...)` call's return value was discarded and
+      the next line referenced an unbound `class_uuid`. Every Python
+      file containing a class hit a `NameError` that the outer
+      try/except swallowed into `files_skipped`. Fixed by capturing the
+      return: `class_uuid = self._dedup_insert(...)`.
+    - **0.2 non-zero exit code on insert failures**: `stats['insert_errors']`
+      now tracks per-file write-to-Weaviate failures separately from
+      generic parse/IO errors via the new `_DedupInsertError` wrapper.
+      `main()` returns exit code `3` (`E_NO_FILES_INDEXED`) when no
+      files succeeded, `4` (`E_PARTIAL_INSERT_FAILURES`) when at least
+      one insert failed. Launcher's `rebuild_code_graph` IPC can now
+      surface warning toasts instead of silent success.
+    - **Addendum D worktree-skip + ignore_dirs refactor**: module-level
+      `_COMMON_IGNORE_DIRS` frozenset + `_ignore_dirs_for(language)`
+      helper replaces 11 near-duplicate inline sets. Adds `"worktrees"`
+      — skips `.claude/worktrees/agent-<hex>/` git-worktree clones that
+      would otherwise be re-analyzed alongside the main repo.
+    - Tests added: `tests/test_analyze_code_graph_v0_2_16.py` (9 tests,
+      all pure-Python unit tests against the analyzer module — no
+      Weaviate required). Existing `tests/test_analyze_code_graph_retry_cap.py`
+      still passes against a live Weaviate.
+- **`fix(release)`** (W2 / plan 0.4): `commit-dist-binaries` Stage step
+  now reads the flat artifact layout `actions/upload-artifact@v7`
+  actually produces (`<artifact_dir>/<binary>`), not the nested
+  `<artifact_dir>/launcher/dist/<target>/<binary>` the pre-v0.2.16 code
+  assumed. Root cause of the v0.2.15 auto-commit failure
+  (`Expected artifact not found: _dist-artifacts/linux-x64/launcher/dist/linux-x64/vct-launcher`)
+  — the build matrix succeeded and the Release page got all three OS
+  zips; only the auto-binary-commit step failed, which the maintainer
+  worked around via the manual binary-commit recipe (commit 0d24812).
+  Verified by inspection against `actions/upload-artifact@v7`'s flat-
+  file layout for individual-file `path:` entries. Will be exercised
+  end-to-end on the v0.2.16 release run.
+
+### Added
+
+- **`feat(install)` uuid_scheme manifest marker** (W2 / addendum F):
+  `state/install-manifest.json` now writes `uuid_scheme = "v2"` on
+  every install/update/lightweight path. Pairs with W1's analyzer
+  changes that key code-graph UUIDs on `(project, file_path, full_name)`
+  rather than the pre-v0.2.16 `(project, full_name)` tuple. Pre-v0.2.16
+  manifests have no `uuid_scheme` field — readers MUST treat the
+  absence as the implicit `"v1"` scheme. Future migration tooling
+  consults this marker to decide whether existing code-graph
+  collections need a `--force-recreate` rebuild.
+- **`feat(install)` migrate-uuid-scheme stub flag** (W2): stub
+  `--migrate-uuid-scheme` flag on `install.py` for the upcoming
+  code-graph UUID-key migrator. Currently a no-op beyond the manifest
+  marker above; real migration tool ships post-v0.2.16.
+- **`feat(analyzer)` `--prune-stale` flag** (W1 + W3 wire-up / plan 1.4
+  + addendum H): opt-in tracking of every UUID visited during the
+  analyze run; at end, every per-project collection's unvisited UUIDs
+  are deleted. Closes the "shrunken codebase leaves orphan rows" gap
+  that switching to `replace()` upsert semantics would otherwise
+  create. Wizard's Re-analyze button passes `--prune-stale` by default
+  (checkbox "Clean stale entries during re-analysis"); first-time
+  builds (`create_project_v2`) and boot-resume sweeps pass `false` to
+  preserve conservative semantics. Skips with a stderr warning when
+  combined with `--language` (would falsely delete other-language
+  objects).
+- **`feat(wizard)` per-project poll status** (W3 / plan 0.3):
+  legacy-collections wizard now polls per-project rebuild status
+  until terminal. The kickoff counter used to read "Started 3 / 3
+  project(s)" forever because the Rust handler returns immediately
+  after spawning the analyzer subprocess; we now invoke a new
+  `get_code_graph_build_status_for_projects` Tauri command every
+  2 seconds and render a per-project row with icon + status label +
+  files-analyzed count + any error message. The wizard does NOT
+  auto-close on completion — the user can review the final
+  per-project status before dismissing.
+- **`feat(wizard)` session-scoped dismissal + Re-check button** (W3 /
+  plan 0.9): "Dismiss" button renamed to "Dismiss for now" + companion
+  auto-reset of `legacy_codegraph_notice_dismissed` on every
+  `rebuild_code_graph` invocation + new "Re-check for legacy
+  collections" button in Preferences. Together these change the
+  dismissal from "permanently suppress until manually flipped" to
+  session-scoped with multiple re-arm paths (re-analyze a project, or
+  click Preferences → Code-graph collections → Re-check). New Tauri
+  command `force_recheck_legacy_codegraph` backs the Preferences
+  button.
+
+### Changed
+
+- `commands::codegraph::rebuild_code_graph` now resets
+  `app_state[legacy_codegraph_notice_dismissed]` to `false` after
+  inserting the pending row (W3 / plan 0.9). Re-analyzing a project
+  is the most common cause of new orphan generations appearing, so
+  the wizard should re-detect on the next launcher start. Soft-fail
+  — a hiccup writing the flag is logged but does not block the
+  rebuild.
+- `check_for_updates` now returns a full `UpdateStatus` struct (W4 /
+  plan 0.5) replacing the legacy `bool` with three independent flags:
+  - `remote_ahead` — local git branch behind `origin/main` (resolves
+    via `update_orchestrator`: git pull + install.py --update).
+  - `install_stale` — `vct-module.json::version` ahead of
+    `state/install-manifest.json::version` (resolves via
+    `apply_pending_install`).
+  - `binary_stale` — running launcher version differs from
+    `launcher/dist/<arch>/vct-launcher.metadata.json::launcher_version`
+    on disk (resolves via `restart_launcher`).
+- `UpdateBadge.svelte` renders one state at a time in priority order
+  (W4 / plan 0.5): `binary_stale` > `install_stale` > `remote_ahead`,
+  each wired to the correct resolver. v0.2.15 shipped the
+  binary-restart half via `LauncherRestartBanner` but the
+  install-stale path was missing — visible install-was-out-of-sync
+  for 24+ hours after a manual `git pull` with no UI signal.
+- `list_legacy_codegraph_collections` and `codegraph_list_projects`
+  accept a new `include_untracked_projects: Option<bool>` parameter
+  (default `false`) (W4 / plan 0.11). The GUI legacy-collections
+  wizard + Code Graph dashboard now filter Weaviate collections by
+  currently-tracked projects, hiding dead-project leftovers
+  (`MediaLibrary_*`, `ARTup_*`, `Agape_*`, etc.). Data stays in
+  Weaviate for potential re-import; the advanced
+  `/preferences/weaviate-untracked` route surfaces the full
+  inventory.
+
+### Added (continued)
+
+- **`feat(launcher)` apply_pending_install Tauri command** (W4 / plan
+  0.5): resolves the "Pulled-but-not-installed" banner state by
+  running `install.py --update` against the existing install root
+  WITHOUT a preceding `git pull`. Distinct from `update_orchestrator`
+  (which does both) so manual `git pull` workflows don't waste ~30s
+  pulling an already-current source tree.
+- **`feat(launcher)` /preferences/weaviate-untracked advanced route**
+  (W4 / plan 0.11): surfaces the full Weaviate code-graph collection
+  inventory, including prefixes whose project is no longer registered
+  with the launcher. Each row exposes a per-prefix delete affordance.
+  Reachable from Preferences → "Show untracked Weaviate collections".
+
 ## [0.2.15] — 2026-05-17
 
 Codegraph-wedge release. v0.2.14's testing on the maintainer machine

@@ -551,11 +551,23 @@ pub struct OrphanCollectionGroup {
 /// report that drives the one-time "VCO 0.2.11 fixed a code-graph naming
 /// bug" notification. The notification only fires when `action_recommended`
 /// is true; the report itself is safe to call any time.
+///
+/// v0.2.16 (W4 / 0.11): `include_untracked_projects` controls whether
+/// collections whose prefix doesn't map to a currently-tracked project
+/// appear in the report. The GUI default is `Some(false)` — clean
+/// view, only orphans of currently-tracked projects surface in the
+/// wizard. The advanced /preferences/weaviate-untracked route passes
+/// `Some(true)` to see the full inventory (data from since-deleted
+/// projects, ad-hoc analyses, etc). Defaulting to `Some(false)` keeps
+/// pre-v0.2.16 callers (frontend code that doesn't pass the param)
+/// on the clean view automatically.
 #[command]
 pub async fn list_legacy_codegraph_collections(
     db: State<'_, Db>,
     cfg: State<'_, LocalConfig>,
+    include_untracked_projects: Option<bool>,
 ) -> Result<LegacyCodegraphReport, String> {
+    let include_untracked = include_untracked_projects.unwrap_or(false);
     let base = resolve_weaviate_url(&cfg);
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -691,10 +703,12 @@ pub async fn list_legacy_codegraph_collections(
 
     // v0.2.15 (0.4): build orphan groups. For each orphan prefix found
     // in Weaviate, attempt to attribute it to a known project via the
-    // case-insensitive normalised-name match. Prefixes that don't match
-    // any project are skipped (they may belong to a since-removed
-    // project or be unrelated — never auto-delete those without explicit
-    // user input via a different surface).
+    // case-insensitive normalised-name match.
+    //
+    // v0.2.16 (W4 / 0.11): unmatched prefixes (no current project owns
+    // them) are surfaced as "untracked" groups ONLY when
+    // `include_untracked == true`. Default (false) keeps the wizard's
+    // visual clutter down by hiding data from since-deleted projects.
     let mut orphan_groups: Vec<OrphanCollectionGroup> = Vec::new();
     for (prefix, entries) in code_graph_by_prefix {
         // Skip prefixes that exactly match SOME project's current
@@ -715,7 +729,22 @@ pub async fn list_legacy_codegraph_collections(
         });
         let (matched_id, matched_name, current_prefix) = match matched {
             Some((id, name, current)) => (id.clone(), name.clone(), current.clone()),
-            None => continue,  // no project owns this prefix → don't surface
+            None => {
+                if include_untracked {
+                    // Untracked-projects view: surface the prefix with
+                    // empty matched_* / current_prefix fields. The
+                    // advanced page displays these as "no project
+                    // currently linked".
+                    (
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                    )
+                } else {
+                    // Default GUI behaviour: hide untracked prefixes.
+                    continue;
+                }
+            }
         };
         let total: u32 = entries.iter().map(|e| e.object_count).sum();
         orphan_groups.push(OrphanCollectionGroup {
@@ -1082,6 +1111,141 @@ pub async fn set_legacy_codegraph_notice_dismissed(
     db: State<'_, Db>,
 ) -> Result<(), String> {
     db.app_state_set_bool(APP_STATE_KEY_LEGACY_NOTICE_DISMISSED, dismissed)?;
+    Ok(())
+}
+
+// ─── W3 / v0.2.16 (2026-05-18): wizard UX hardening ──────────────────────
+//
+// Two complementary commands plus a shared status struct so the wizard
+// can poll per-project rebuild progress and the user can force a
+// re-detection from the Preferences page:
+//
+//   * `get_code_graph_build_status_for_projects` — batched read of
+//     `code_graph_builds` for the wizard's poll loop. Replaces the
+//     misleading "Started for N/N project(s)" UX that never advanced
+//     after kickoff (plan 0.3).
+//   * `force_recheck_legacy_codegraph` — flips the dismissed flag back
+//     to `false`. Used by the new "Re-check for legacy collections"
+//     button in Preferences (plan 0.9). The companion change in
+//     `commands::codegraph::rebuild_code_graph` resets the same flag
+//     automatically whenever the user re-analyzes a project (the most
+//     common cause of new orphan generations appearing).
+
+/// Per-project rebuild status surfaced to the wizard's poll loop.
+///
+/// `terminal` is a computed convenience flag — frontend just checks
+/// `statuses.every(s => s.terminal)` to know when the loop can stop.
+/// We compute it server-side so the lifecycle vocabulary stays
+/// authoritative here even if the frontend gets ahead of a new status
+/// value in a future release.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeGraphBuildStatusForProject {
+    pub project_id: String,
+    /// "pending" | "running" | "success" | "failed" | "skipped" | "missing".
+    /// "missing" is synthesised when no `code_graph_builds` row exists
+    /// for the project — the wizard handles this gracefully (the row
+    /// is inserted by `rebuild_code_graph` so a missing row usually
+    /// means the kickoff itself failed).
+    pub status: String,
+    /// Number of files analyzed so far. None when the row is missing.
+    pub files_analyzed: Option<u32>,
+    /// Last error message (only populated for `failed`).
+    pub error_message: Option<String>,
+    /// True when the lifecycle is no longer changing (success / failed /
+    /// skipped / missing). The wizard stops polling once every row in
+    /// the batch is terminal.
+    pub terminal: bool,
+}
+
+/// True when the given lifecycle string is one the wizard treats as
+/// "no further progress will come". Centralised here so the contract
+/// stays in lock-step with `db::code_graph_builds::status`.
+fn is_terminal_build_status(status: &str) -> bool {
+    use crate::db::code_graph_builds::status as s;
+    matches!(status, s::SUCCESS | s::FAILED | s::SKIPPED)
+}
+
+/// Batched read of `code_graph_builds` for the wizard's poll loop.
+///
+/// Always returns one entry per requested project_id, in the same
+/// order. If a row is missing for a given project, the entry's
+/// `status` is `"missing"` and `terminal` is `true` (so the wizard's
+/// "all done?" check still works even when a kickoff failed before
+/// inserting the row).
+///
+/// Soft-fail per project: a DB hiccup on one project doesn't block
+/// the others — the affected entry gets `status="failed"` with the
+/// SQL error in `error_message`.
+#[command]
+pub async fn get_code_graph_build_status_for_projects(
+    project_ids: Vec<String>,
+    db: State<'_, Db>,
+) -> Result<Vec<CodeGraphBuildStatusForProject>, String> {
+    let mut out = Vec::with_capacity(project_ids.len());
+    for pid in &project_ids {
+        match db.get_code_graph_build(pid) {
+            Ok(Some(row)) => {
+                let terminal = is_terminal_build_status(&row.status);
+                out.push(CodeGraphBuildStatusForProject {
+                    project_id: row.project_id,
+                    status: row.status,
+                    files_analyzed: Some(row.files_analyzed),
+                    error_message: row.error_message,
+                    terminal,
+                });
+            }
+            Ok(None) => {
+                // No row at all. Treat as terminal so the poll loop
+                // doesn't spin forever; the UI will render "no build
+                // recorded" for this entry.
+                out.push(CodeGraphBuildStatusForProject {
+                    project_id: pid.clone(),
+                    status: "missing".to_string(),
+                    files_analyzed: None,
+                    error_message: None,
+                    terminal: true,
+                });
+            }
+            Err(e) => {
+                // Per-project soft-fail: log + surface as failed so
+                // the wizard shows the error to the user instead of
+                // hanging.
+                eprintln!(
+                    "[vct] get_code_graph_build_status_for_projects: \
+                     db lookup failed for {}: {}",
+                    pid, e
+                );
+                out.push(CodeGraphBuildStatusForProject {
+                    project_id: pid.clone(),
+                    status: "failed".to_string(),
+                    files_analyzed: None,
+                    error_message: Some(e),
+                    terminal: true,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Reset the legacy-collections-wizard dismissal flag so the next
+/// launcher start re-fires the wizard. Backs the "Re-check for legacy
+/// collections" button in Preferences (plan 0.9).
+///
+/// Distinct from `set_legacy_codegraph_notice_dismissed(false)` only
+/// in intent — keeping the dedicated command name surfaces the
+/// re-check semantics in the audit log so we can tell user-initiated
+/// re-checks apart from the automatic reset triggered by
+/// `rebuild_code_graph`.
+#[command]
+pub async fn force_recheck_legacy_codegraph(db: State<'_, Db>) -> Result<(), String> {
+    db.app_state_set_bool(APP_STATE_KEY_LEGACY_NOTICE_DISMISSED, false)?;
+    let _ = db.audit(
+        "legacy_codegraph_wizard_force_recheck",
+        None,
+        None,
+        &serde_json::json!({ "source": "preferences_button" }),
+    );
     Ok(())
 }
 
@@ -1814,5 +1978,325 @@ mod tests {
         assert_eq!(normalise_prefix_for_match("étude"), "tude");
         assert_eq!(normalise_prefix_for_match("___"), "");
         assert_eq!(normalise_prefix_for_match("123abc"), "123abc");
+    }
+
+    // ─── W3 / v0.2.16 (2026-05-18): wizard UX hardening ──────────────────
+    //
+    // Two surfaces:
+    //   * `get_code_graph_build_status_for_projects` — batched lookup
+    //     that maps `code_graph_builds` rows into the wizard's polling
+    //     contract, synthesises a `missing` entry when no row exists,
+    //     and computes `terminal` so the frontend stop-condition stays
+    //     authoritative on the server.
+    //   * `force_recheck_legacy_codegraph` — resets the dismissal flag
+    //     so the next launcher start fires the wizard. Backs the
+    //     Preferences "Re-check for legacy collections" button.
+
+    use crate::db::code_graph_builds::status as build_status;
+    use crate::db::models::ProjectHost;
+
+    /// Platform-aware fake folder path. Tests only store this in the
+    /// `folder_path` column for round-trip / uniqueness — they never
+    /// touch disk — but `/tmp/x`-style paths are parsed ambiguously on
+    /// Windows, so pick a host-appropriate fake. Mirrors the fixture
+    /// in `db::code_graph_builds::tests`.
+    fn w3_fixture_path(suffix: &str) -> String {
+        if cfg!(windows) {
+            format!(r"C:\tmp\{}", suffix)
+        } else {
+            format!("/tmp/{}", suffix)
+        }
+    }
+
+    fn w3_fresh_db_with_project(label: &str) -> (Db, String) {
+        let db = Db::open_in_memory().expect("in-memory db");
+        let id = uuid::Uuid::new_v4().to_string();
+        let slug = db.generate_unique_slug(label).unwrap();
+        let folder = w3_fixture_path(label);
+        db.insert_project(&id, label, &folder, ProjectHost::Base, &slug)
+            .unwrap();
+        (db, id)
+    }
+
+    #[test]
+    fn is_terminal_build_status_recognises_terminal_states() {
+        assert!(is_terminal_build_status(build_status::SUCCESS));
+        assert!(is_terminal_build_status(build_status::FAILED));
+        assert!(is_terminal_build_status(build_status::SKIPPED));
+    }
+
+    #[test]
+    fn is_terminal_build_status_treats_pending_and_running_as_non_terminal() {
+        assert!(!is_terminal_build_status(build_status::PENDING));
+        assert!(!is_terminal_build_status(build_status::RUNNING));
+        // Unknown statuses must NOT be treated as terminal — better the
+        // wizard polls one extra tick than gets stuck because a future
+        // status string was added without updating this match.
+        assert!(!is_terminal_build_status("queued"));
+        assert!(!is_terminal_build_status(""));
+    }
+
+    /// Build the per-project status mapping the Tauri command exposes,
+    /// without going through the `State<'_, Db>` wrapper. Mirrors what
+    /// the command body does so the unit test stays focused on the
+    /// mapping logic (Tauri's State wrapper has its own integration
+    /// tests elsewhere). The shape returned MUST match
+    /// `get_code_graph_build_status_for_projects` byte-for-byte.
+    fn build_statuses_for_test(
+        db: &Db,
+        project_ids: &[String],
+    ) -> Vec<CodeGraphBuildStatusForProject> {
+        let mut out = Vec::with_capacity(project_ids.len());
+        for pid in project_ids {
+            match db.get_code_graph_build(pid) {
+                Ok(Some(row)) => {
+                    let terminal = is_terminal_build_status(&row.status);
+                    out.push(CodeGraphBuildStatusForProject {
+                        project_id: row.project_id,
+                        status: row.status,
+                        files_analyzed: Some(row.files_analyzed),
+                        error_message: row.error_message,
+                        terminal,
+                    });
+                }
+                Ok(None) => out.push(CodeGraphBuildStatusForProject {
+                    project_id: pid.clone(),
+                    status: "missing".to_string(),
+                    files_analyzed: None,
+                    error_message: None,
+                    terminal: true,
+                }),
+                Err(e) => out.push(CodeGraphBuildStatusForProject {
+                    project_id: pid.clone(),
+                    status: "failed".to_string(),
+                    files_analyzed: None,
+                    error_message: Some(e),
+                    terminal: true,
+                }),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn build_status_maps_success_row_with_files_analyzed() {
+        let (db, pid) = w3_fresh_db_with_project("ProjA");
+        db.upsert_code_graph_build(
+            &pid,
+            build_status::SUCCESS,
+            Some(1000),
+            Some(2500),
+            Some(1500),
+            42,
+            None,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let got = build_statuses_for_test(&db, &[pid.clone()]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].project_id, pid);
+        assert_eq!(got[0].status, "success");
+        assert_eq!(got[0].files_analyzed, Some(42));
+        assert_eq!(got[0].error_message, None);
+        assert!(got[0].terminal, "success must be terminal");
+    }
+
+    #[test]
+    fn build_status_maps_running_row_as_non_terminal() {
+        let (db, pid) = w3_fresh_db_with_project("ProjRun");
+        db.upsert_code_graph_build(
+            &pid,
+            build_status::RUNNING,
+            Some(1000),
+            None,
+            None,
+            17,
+            None,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let got = build_statuses_for_test(&db, &[pid.clone()]);
+        assert_eq!(got[0].status, "running");
+        assert_eq!(got[0].files_analyzed, Some(17));
+        assert!(!got[0].terminal, "running must NOT be terminal");
+    }
+
+    #[test]
+    fn build_status_synthesises_missing_for_unknown_project_id() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        let got = build_statuses_for_test(&db, &["nonexistent".to_string()]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].project_id, "nonexistent");
+        assert_eq!(got[0].status, "missing");
+        assert_eq!(got[0].files_analyzed, None);
+        assert!(
+            got[0].terminal,
+            "missing rows must be terminal so the wizard's poll loop can stop"
+        );
+    }
+
+    #[test]
+    fn build_status_failed_row_carries_error_message() {
+        let (db, pid) = w3_fresh_db_with_project("ProjErr");
+        db.upsert_code_graph_build(
+            &pid,
+            build_status::FAILED,
+            Some(1),
+            Some(5),
+            Some(4),
+            3,
+            None,
+            false,
+            Some("analyzer exit 4"),
+            None,
+        )
+        .unwrap();
+
+        let got = build_statuses_for_test(&db, &[pid.clone()]);
+        assert_eq!(got[0].status, "failed");
+        assert_eq!(got[0].files_analyzed, Some(3));
+        assert_eq!(got[0].error_message.as_deref(), Some("analyzer exit 4"));
+        assert!(got[0].terminal);
+    }
+
+    #[test]
+    fn build_status_preserves_order_of_requested_ids() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        // Seed three projects; assert the returned vec matches the
+        // requested order even though the DB doesn't guarantee any
+        // particular ordering.
+        let mut ids = Vec::new();
+        for (i, name) in ["Alpha", "Beta", "Gamma"].iter().enumerate() {
+            let id = uuid::Uuid::new_v4().to_string();
+            let slug = db.generate_unique_slug(name).unwrap();
+            db.insert_project(
+                &id,
+                name,
+                &w3_fixture_path(&format!("order-{}", i)),
+                ProjectHost::Base,
+                &slug,
+            )
+            .unwrap();
+            db.upsert_code_graph_build(
+                &id,
+                build_status::PENDING,
+                Some(0),
+                None,
+                None,
+                0,
+                None,
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+            ids.push(id);
+        }
+
+        // Request reversed order — output must follow input order.
+        let reversed: Vec<String> = ids.iter().rev().cloned().collect();
+        let got = build_statuses_for_test(&db, &reversed);
+        assert_eq!(got.len(), 3);
+        for (i, expected_id) in reversed.iter().enumerate() {
+            assert_eq!(&got[i].project_id, expected_id);
+            assert_eq!(got[i].status, "pending");
+        }
+    }
+
+    #[test]
+    fn build_status_mixed_existing_and_missing_ids() {
+        let (db, real_pid) = w3_fresh_db_with_project("Real");
+        db.upsert_code_graph_build(
+            &real_pid,
+            build_status::SUCCESS,
+            Some(1),
+            Some(2),
+            Some(1),
+            5,
+            None,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let ids = vec![real_pid.clone(), "ghost".to_string()];
+        let got = build_statuses_for_test(&db, &ids);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].status, "success");
+        assert_eq!(got[0].files_analyzed, Some(5));
+        assert_eq!(got[1].status, "missing");
+        assert!(got[1].terminal);
+    }
+
+    // ─── force_recheck_legacy_codegraph ─────────────────────────────────
+
+    #[test]
+    fn force_recheck_resets_dismissed_flag() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        // Pre-condition: set dismissed=true the way the wizard does.
+        db.app_state_set_bool(APP_STATE_KEY_LEGACY_NOTICE_DISMISSED, true)
+            .unwrap();
+        assert_eq!(
+            db.app_state_get_bool(APP_STATE_KEY_LEGACY_NOTICE_DISMISSED)
+                .unwrap(),
+            Some(true)
+        );
+
+        // Mirrors what `force_recheck_legacy_codegraph` does
+        // server-side (without the Tauri State wrapper).
+        db.app_state_set_bool(APP_STATE_KEY_LEGACY_NOTICE_DISMISSED, false)
+            .unwrap();
+
+        assert_eq!(
+            db.app_state_get_bool(APP_STATE_KEY_LEGACY_NOTICE_DISMISSED)
+                .unwrap(),
+            Some(false),
+            "Re-check must reset the dismissal flag so the next launcher start \
+             re-fires the wizard"
+        );
+    }
+
+    #[test]
+    fn force_recheck_idempotent_when_already_false() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        db.app_state_set_bool(APP_STATE_KEY_LEGACY_NOTICE_DISMISSED, false)
+            .unwrap();
+        db.app_state_set_bool(APP_STATE_KEY_LEGACY_NOTICE_DISMISSED, false)
+            .unwrap();
+        assert_eq!(
+            db.app_state_get_bool(APP_STATE_KEY_LEGACY_NOTICE_DISMISSED)
+                .unwrap(),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn force_recheck_works_when_flag_was_never_set() {
+        // If the wizard has never been dismissed, the row simply doesn't
+        // exist — `app_state_get_bool` returns None. `force_recheck`
+        // should still succeed and explicitly write `false` (so future
+        // reads see a deliberate Some(false) rather than None).
+        let db = Db::open_in_memory().expect("in-memory db");
+        assert_eq!(
+            db.app_state_get_bool(APP_STATE_KEY_LEGACY_NOTICE_DISMISSED)
+                .unwrap(),
+            None
+        );
+
+        db.app_state_set_bool(APP_STATE_KEY_LEGACY_NOTICE_DISMISSED, false)
+            .unwrap();
+
+        assert_eq!(
+            db.app_state_get_bool(APP_STATE_KEY_LEGACY_NOTICE_DISMISSED)
+                .unwrap(),
+            Some(false)
+        );
     }
 }

@@ -716,23 +716,27 @@ jobs:
             local target="$2"        # e.g. linux-x64
             local binary="$3"        # e.g. vct-launcher or vct-launcher.exe
 
-            # actions/upload-artifact@v7 with a multi-line `path:` preserves
-            # the workspace-relative directory layout inside the artifact.
-            # The build job uploads with path `launcher/dist/<target>/<binary>`,
-            # so the artifact unpacks to `<artifact_dir>/launcher/dist/<target>/<binary>`
-            # — NOT a flat `<artifact_dir>/<binary>` as a v0.2.13 typo
-            # assumed. Fixed post-v0.2.13 (failure on the v0.2.13 release-tag
-            # run was the first time this code path executed end-to-end).
-            local nested="${artifact_dir}/launcher/dist/${target}"
-            local src="${nested}/${binary}"
+            # actions/upload-artifact@v7 FLATTENS files into the artifact root
+            # when uploaded with a multi-line `path:` of individual files.
+            # The build job (see lines 581-588) uploads:
+            #   launcher/dist/<target>/<binary>
+            #   launcher/dist/<target>/<binary>.metadata.json
+            # but the resulting artifact unpacks to:
+            #   <artifact_dir>/<binary>
+            #   <artifact_dir>/<binary>.metadata.json
+            # NOT the nested `<artifact_dir>/launcher/dist/<target>/<binary>`
+            # the pre-v0.2.16 code assumed. The v0.2.15 release auto-commit
+            # failed at this step with exactly this path mismatch (the manual
+            # binary-commit recipe was used to ship 0d24812 to main).
+            # Fixed in v0.2.16: use the flat layout actions/upload-artifact@v7
+            # actually produces.
+            local src="${artifact_dir}/${binary}"
             local dst="launcher/dist/${target}/${binary}"
 
             if [ ! -f "$src" ]; then
               echo "::error::Expected artifact not found: $src"
               echo "  artifact_dir contents:"
               ls -la "$artifact_dir" || true
-              echo "  nested expected dir contents:"
-              ls -la "$nested" || true
               exit 1
             fi
 
@@ -751,7 +755,7 @@ jobs:
 
             # Always update the metadata.json sidecar (it contains built_at
             # timestamp so it's always different, but it's tiny — no concern).
-            local meta_src="${nested}/${binary}.metadata.json"
+            local meta_src="${artifact_dir}/${binary}.metadata.json"
             local meta_dst="launcher/dist/${target}/${binary}.metadata.json"
             if [ -f "$meta_src" ]; then
               cp "$meta_src" "$meta_dst"

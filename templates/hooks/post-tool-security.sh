@@ -62,9 +62,15 @@ check_pattern "PEM private key"          'BEGIN (RSA |EC |OPENSSH |)PRIVATE KEY'
 check_pattern "Generic secret"           '(SECRET|API_KEY|ACCESS_TOKEN|PRIVATE_KEY)\s*[:=]\s*["'"'"'][a-zA-Z0-9+/=_\-]{32,}'
 # Smoke-test marker — used by hook tests to verify the scanner +
 # alert-routing flow without leaving real-looking credentials in
-# example fixtures. Tests use the literal string LEAK_TEST_KEY.
-# Users seeing this alert know it's a test marker, not a real leak.
-check_pattern "Hook leak-test marker"    'LEAK_TEST_KEY'
+# example fixtures. Tests use the literal string
+# VCT_HOOK_LEAK_PROBE_a3f7c2 — VCT-prefixed so it's recognizable as
+# ours, _PROBE suffix to signal testing intent, plus a 6-char random
+# hex tail to make the token unique enough that it cannot
+# accidentally appear in CHANGELOG prose or external docs.
+# Previously this was LEAK_TEST_KEY; renamed 2026-05-18 because the
+# bare-word pattern matched a legitimate CHANGELOG release-note
+# entry describing the smoke-test infrastructure itself.
+check_pattern "Hook leak-test marker"    'VCT_HOOK_LEAK_PROBE_a3f7c2'
 
 if [ ${#ALERTS[@]} -gt 0 ]; then
     MSG="Possible credential in $(basename "$EDITED_FILE"): ${ALERTS[*]}"

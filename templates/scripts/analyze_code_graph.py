@@ -45,13 +45,61 @@ from typing import Dict, List, Any, Optional, Set, Tuple
 import subprocess
 
 
-def _deterministic_uuid(project: str, full_name: str) -> str:
-    """Generate a deterministic UUID from project + full_name.
+class _DedupInsertError(RuntimeError):
+    """Exception raised by ``_dedup_insert`` to mark write failures.
 
-    This ensures that re-indexing the same entity produces the same UUID,
-    turning inserts into upserts and preventing duplicates in Weaviate.
+    v0.2.16 (bug 0.2): the outer per-file try/except in
+    ``analyze_repository`` distinguishes "this file failed to write
+    to Weaviate" (counts as ``insert_errors``, triggers exit code 4)
+    from "this file failed for some other reason — e.g. file read
+    error, regex bug, ast parse error not caught downstream" (counts
+    only as ``files_skipped``, doesn't change the exit code).
     """
-    key = f"{project}::{full_name}"
+
+    def __init__(self, original: BaseException, collection_name: str, uuid: str) -> None:
+        super().__init__(
+            f"_dedup_insert failed for {collection_name} (uuid={uuid}): {original}"
+        )
+        self.original = original
+        self.collection_name = collection_name
+        self.uuid = uuid
+
+
+def _deterministic_uuid(project: str, file_path_rel: str = "", full_name: str = "") -> str:
+    """Generate a deterministic UUID from project + file_path_rel + full_name.
+
+    Args:
+        project: Project name (used as the outermost UUID namespace).
+        file_path_rel: Repo-relative POSIX path of the file containing the
+            entity. Default ``""`` is preserved for call sites where the
+            file is not in scope (e.g. cross-reference creation). Callers
+            with a Path object MUST pass ``path.as_posix()`` so Windows
+            backslashes don't produce different UUIDs than the POSIX form
+            on Linux/macOS (cross-machine consistency).
+        full_name: Fully-qualified entity name (e.g. ``module.Class.method``).
+            Also used as the only-non-empty arg when callers pass through
+            the legacy two-arg form ``_deterministic_uuid(project, name)``;
+            handled below.
+
+    Why file_path_rel is part of the key (v0.2.16):
+        Pre-v0.2.16 the key was just ``project::full_name``. Two files
+        with the same module-stem + symbol name (e.g.
+        ``server.handler`` defined in both
+        ``docs/research/eval/probes/server.py`` and
+        ``claude_mcp_servers/weaviate_mcp/server.py``) collided on the
+        same UUID and the second one's insert was rejected. Including
+        the file path eliminates this entire collision surface.
+
+    Re-indexing the same entity (same project, same file, same symbol)
+    still produces the same UUID, so re-runs continue to upsert cleanly.
+
+    NOTE on back-compat: this helper is also called from contexts where
+    only ``project`` + ``full_name`` are meaningful (cross-reference
+    creation paths). When ``file_path_rel`` is the empty string the
+    UUID degrades to the v0.2.15-and-earlier shape so those paths
+    continue to resolve to the same UUIDs they did before.
+    """
+    key = f"{project}::{file_path_rel}::{full_name}"
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, key))
 
 logger = logging.getLogger(__name__)
@@ -155,6 +203,79 @@ def _collection_name(base: str, project_name: str) -> str:
         return base
     prefix = _sanitize_collection_prefix(project_name)
     return f"{prefix}_{base}"
+
+
+# ---------------------------------------------------------------------------
+# File-walk ignore directories (v0.2.16 — addendum D)
+# ---------------------------------------------------------------------------
+# Centralised set of directory names that the file-walk should always
+# skip. Previously each `_find_*_files` method had its own near-duplicate
+# inline set; new entries (notably ``"worktrees"``) had to be added in
+# 11 places. Factoring to a module-level frozenset means there's one
+# place to add a new entry. Language-specific extras are still
+# permitted via `_ignore_dirs_for(language)` below.
+#
+# The ``"worktrees"`` entry is the v0.2.16 reason for this refactor:
+# `.claude/worktrees/agent-<hex>/` directories are git worktree clones
+# of the main repo and are exact byte copies of main-repo source. The
+# analyzer would walk them, attempt to re-analyze the same symbols,
+# and trip the (now-fixed by replace()) 422 collision storm — even
+# with replace(), walking worktrees is wasted work and produces
+# duplicate-effort metrics. Skipping them upfront is the cleanest fix.
+_COMMON_IGNORE_DIRS: frozenset = frozenset({
+    # Version-control internals
+    '.git', '.svn', '.hg',
+    # Python virtualenv variants
+    '.venv', 'venv', 'env', '.env',
+    'virtualenv', '.tox', 'site-packages',
+    # Python build / cache artefacts
+    '__pycache__', '.pytest_cache',
+    # Generic build outputs
+    'build', 'dist',
+    # JS/TS dependency cache
+    'node_modules',
+    # v0.2.16 — git-worktree clones under .claude/worktrees/agent-*/
+    'worktrees',
+})
+
+
+# Language-specific extensions of `_COMMON_IGNORE_DIRS`. Anything in the
+# language extras is merged with the common set when `_find_*_files`
+# calls `_ignore_dirs_for(language)`. Keep entries minimal and
+# justify each one (most languages just inherit the common set).
+_LANGUAGE_IGNORE_DIRS_EXTRAS: Dict[str, frozenset] = {
+    # Go modules vendored into ./vendor/
+    'go':     frozenset({'vendor'}),
+    # Rust build output
+    'rust':   frozenset({'target'}),
+    # Gradle + Maven outputs
+    'java':   frozenset({'.gradle', 'target'}),
+    # Ruby vendored gems + bundler cache
+    'ruby':   frozenset({'vendor', '.bundle'}),
+    # .NET / VS workspace artefacts
+    'csharp': frozenset({'obj', 'bin', '.vs'}),
+    # JS / TS test-coverage reports
+    'js':     frozenset({'coverage'}),
+    'ts':     frozenset({'coverage'}),
+    # Languages with no extras (placeholder — explicit is better than
+    # implicit when the analyzer learns a new language family later)
+    'shell':  frozenset(),
+    'lua':    frozenset(),
+    'cpp':    frozenset(),
+    'python': frozenset(),
+    'proto':  frozenset(),
+}
+
+
+def _ignore_dirs_for(language: str) -> frozenset:
+    """Return the directory-skip set for a given language.
+
+    The set merges :data:`_COMMON_IGNORE_DIRS` with any
+    language-specific extras. Unknown languages get the common set
+    only (no error — analyzer should never crash on a new language
+    being added without first updating the table).
+    """
+    return _COMMON_IGNORE_DIRS | _LANGUAGE_IGNORE_DIRS_EXTRAS.get(language, frozenset())
 
 
 try:
@@ -572,6 +693,14 @@ class CodeGraphAnalyzer:
         self.function_cache: Dict[str, str] = {}  # full_name -> UUID
         self.module_imports: Dict[str, List[str]] = {}  # path -> [import names]
 
+        # v0.2.16 — visited-UUID tracking for --prune-stale (bug 1.4 / addendum H).
+        # Populated only when self._track_visited is True (set by analyze_repository
+        # when called with prune_stale=True). Each entry is
+        # (collection_name, uuid) so we can prune per-collection without crossing
+        # the collection boundary. Empty by default — does NOT affect normal runs.
+        self.visited_uuids: Set[Tuple[str, str]] = set()
+        self._track_visited: bool = False
+
     def connect(self):
         """Connect to Weaviate."""
         try:
@@ -937,19 +1066,63 @@ class CodeGraphAnalyzer:
         # Schema migration: ensure import_names property exists on CodeModule
         self._ensure_import_names_property()
 
-    def _dedup_insert(self, collection, insert_params: dict, identity_key: str) -> str:
-        """Insert with deterministic UUID to prevent duplicates.
+    def _dedup_insert(self, collection, insert_params: dict, identity_key: str,
+                      file_path_rel: str = "") -> str:
+        """Upsert with a deterministic UUID derived from
+        ``(project, file_path_rel, identity_key)``.
+
+        v0.2.16 change (bug 0.1): switched from ``collection.data.insert()``
+        to ``collection.data.replace()``. The previous ``insert()`` call
+        returned a 422 ``id 'X' already exists`` from Weaviate the second
+        time we tried to re-index a previously-seen entity, which the
+        outer ``analyze_*_file`` try/except then swallowed as a
+        ``files_skipped += 1`` print — exiting 0 even when most objects
+        never landed. ``replace()`` is idempotent (upsert semantics) and
+        eliminates the failure mode entirely.
+
+        v0.2.16 change (bug 0.7): UUID identity-key now also includes
+        the repo-relative file path. Two genuinely-different files
+        that happen to define the same module-stem+symbol no longer
+        collide. Callers MUST pass ``file_path_rel`` as a POSIX-style
+        string (``Path(...).relative_to(repo_root).as_posix()``) — the
+        analyzer's per-language methods construct this once per file
+        and thread it through every ``_dedup_insert`` call site.
+
+        v0.2.16 change (1.4 / addendum H): visited UUIDs are tracked in
+        ``self.visited_uuids`` so a later ``--prune-stale`` pass can
+        delete entries the analyzer didn't visit this run (stale code
+        that was deleted from the project since the previous analyze).
 
         Args:
-            collection: Weaviate collection reference
-            insert_params: dict with 'properties', 'vector', 'references' keys
-            identity_key: unique key for this entity (e.g. full_name, path)
+            collection: Weaviate collection reference.
+            insert_params: dict with 'properties', 'vector', 'references' keys.
+            identity_key: unique key for this entity (e.g. full_name, path).
+            file_path_rel: repo-relative POSIX path of the source file the
+                entity was extracted from. Default ``""`` is allowed only
+                for call sites where the file is genuinely not in scope
+                (none today; kept for forward-compat).
 
         Returns:
-            UUID string of the inserted/updated object
+            UUID string of the inserted/replaced object. Note that
+            ``collection.data.replace()`` in weaviate-client v4 returns
+            ``None``, so we synthesize and return ``det_uuid`` ourselves
+            — every call site that captures the return value (``func_uuid``,
+            ``class_uuid``, ``module_uuid`` etc.) continues to work.
         """
-        det_uuid = _deterministic_uuid(self.project_name, identity_key)
-        return collection.data.insert(uuid=det_uuid, **insert_params)
+        det_uuid = _deterministic_uuid(self.project_name, file_path_rel, identity_key)
+        try:
+            collection.data.replace(uuid=det_uuid, **insert_params)
+        except BaseException as exc:
+            # Wrap into a distinctive exception type so the outer
+            # per-file try/except can attribute the failure to a
+            # write-to-Weaviate problem (vs. a parse / read / regex
+            # issue elsewhere in the analyze_*_file path). bug 0.2.
+            raise _DedupInsertError(exc, collection.name, det_uuid) from exc
+        # Track for --prune-stale (only populated when caller opted in;
+        # see main()'s argparse + analyze_repository's prune logic).
+        if self._track_visited:
+            self.visited_uuids.add((collection.name, det_uuid))
+        return det_uuid
 
     def _ensure_import_names_property(self):
         """Add import_names property to CodeModule if missing (schema migration)."""
@@ -969,7 +1142,8 @@ class CodeGraphAnalyzer:
     def analyze_repository(self, repo_path: Path, language: Optional[str] = None,
                           incremental: bool = False,
                           extract_cfg: bool = False,
-                          extract_pdg: bool = False) -> Dict[str, Any]:
+                          extract_pdg: bool = False,
+                          prune_stale: bool = False) -> Dict[str, Any]:
         """Analyze repository and extract code entities.
 
         Args:
@@ -978,9 +1152,22 @@ class CodeGraphAnalyzer:
             incremental: Only analyze changed files (requires git)
             extract_cfg: Run Joern CFG extraction (requires joern in PATH)
             extract_pdg: Run Joern PDG extraction (requires joern in PATH)
+            prune_stale: When True, track every UUID visited this run
+                and DELETE any UUIDs in the per-project code-graph
+                collections that we DIDN'T visit. Useful for projects
+                whose codebase has shrunk since the previous analyze
+                (deleted files leave orphan rows otherwise). Default
+                False — opt-in via ``--prune-stale``. Bug 1.4 /
+                addendum H. Adds ``stats['stale_pruned']``.
 
         Returns:
-            Dictionary with analysis statistics
+            Dictionary with analysis statistics. v0.2.16 adds:
+              - ``insert_errors``: count of files whose per-file
+                exception came specifically from a ``_dedup_insert``
+                call (bug 0.2). Distinct from ``files_skipped`` which
+                covers any per-file exception.
+              - ``stale_pruned``: count of orphan UUIDs deleted by the
+                ``--prune-stale`` pass (always 0 when prune_stale=False).
         """
 
         if not repo_path.exists():
@@ -1000,6 +1187,13 @@ class CodeGraphAnalyzer:
         else:
             self._cfg_pdg_data = {}
 
+        # Enable visited-UUID tracking when caller wants prune-stale.
+        # See _dedup_insert + _create_or_update_module — both record
+        # to self.visited_uuids when self._track_visited is True.
+        if prune_stale:
+            self._track_visited = True
+            self.visited_uuids = set()  # fresh state per run
+
         stats = {
             'modules': 0,
             'classes': 0,
@@ -1007,6 +1201,12 @@ class CodeGraphAnalyzer:
             'apis': 0,
             'files_analyzed': 0,
             'files_skipped': 0,
+            # v0.2.16 (bug 0.2): granular error tracking so main() can
+            # surface a non-zero exit code when most files fail to
+            # write (was: exit 0 = silent success).
+            'insert_errors': 0,
+            # v0.2.16 (1.4 / H): count of stale orphans pruned at end.
+            'stale_pruned': 0,
         }
 
         # Language dispatch: auto-detect from extensions, or filter by --language
@@ -1051,36 +1251,146 @@ class CodeGraphAnalyzer:
                     stats['functions'] += result.get('functions', 0)
                     stats['apis']     += result.get('apis', 0)
                     stats['files_analyzed'] += 1
+                except _DedupInsertError as e:
+                    # v0.2.16 (bug 0.2): write-to-Weaviate failure.
+                    # Distinct from generic parse/IO errors so main()
+                    # can return exit code 4 (vs. silent success).
+                    print(f"⚠️  Insert error in {f.relative_to(repo_path)}: {e}")
+                    stats['files_skipped'] += 1
+                    stats['insert_errors'] += 1
                 except Exception as e:
+                    # Non-insert failure (parse error not caught
+                    # downstream, regex bug, file IO, etc.). Skip the
+                    # file but DON'T flag the run as broken — the
+                    # exit code stays 0 unless files_analyzed == 0.
                     print(f"⚠️  Error analyzing {f.relative_to(repo_path)}: {e}")
                     stats['files_skipped'] += 1
+                    # Fallback: still classify as insert_error if a
+                    # _DedupInsertError got chained through some
+                    # unexpected re-raise (defense-in-depth so the
+                    # counter never under-reports).
+                    cause = e
+                    seen_dedup = False
+                    for _ in range(8):  # cap loop to avoid pathological cycles
+                        if isinstance(cause, _DedupInsertError):
+                            seen_dedup = True
+                            break
+                        cause = getattr(cause, "__cause__", None) or getattr(cause, "__context__", None)
+                        if cause is None:
+                            break
+                    if seen_dedup:
+                        stats['insert_errors'] += 1
+
+        # v0.2.16 (1.4 / addendum H): --prune-stale pass.
+        # Walk every per-project code-graph collection and delete any
+        # object whose UUID was NOT visited during this analyze run.
+        # The visited-UUID set was populated as a side-effect of
+        # _dedup_insert + _create_or_update_module calls when
+        # self._track_visited was True.
+        if prune_stale:
+            stats['stale_pruned'] = self._prune_stale_objects()
 
         return stats
 
+    def _prune_stale_objects(self) -> int:
+        """Delete code-graph objects that were not visited this run.
+
+        v0.2.16 (1.4 / addendum H): companion to the _dedup_insert
+        replace() switch. With replace() upserts, deleted files leave
+        orphan UUIDs because nothing tells Weaviate "this used to
+        exist, please remove it". This pass closes that gap.
+
+        Algorithm:
+          For each per-project collection:
+            - Enumerate every UUID where ``project == self.project_name``.
+            - Subtract the set of UUIDs we visited this run.
+            - Delete the difference (the stale ones).
+
+        Returns:
+            Total number of stale objects deleted across all
+            collections. Printed per-collection on stdout so the
+            launcher's log shows what happened.
+        """
+        if not self._track_visited:
+            # Defensive: should never happen (caller gates on
+            # prune_stale=True which sets _track_visited=True), but
+            # guard against a future code path that forgets.
+            print("⚠️  _prune_stale_objects called without _track_visited — skipping")
+            return 0
+
+        total_pruned = 0
+        per_collection_visited: Dict[str, Set[str]] = {}
+        for coll_name, uid in self.visited_uuids:
+            per_collection_visited.setdefault(coll_name, set()).add(uid)
+
+        collections = [
+            self.modules_collection,
+            self.classes_collection,
+            self.functions_collection,
+            self.apis_collection,
+            self.interactions_collection,
+        ]
+
+        for coll in collections:
+            if coll is None:
+                continue
+            visited = per_collection_visited.get(coll.name, set())
+            pruned = self._prune_collection(coll, visited)
+            if pruned:
+                print(f"🧹 Pruned {pruned} stale objects from {coll.name}")
+                total_pruned += pruned
+
+        return total_pruned
+
+    def _prune_collection(self, collection, visited_uuids: Set[str]) -> int:
+        """Delete every object in ``collection`` whose project matches
+        ``self.project_name`` AND whose UUID is not in ``visited_uuids``.
+
+        Why filter on the ``project`` property as well as the
+        collection name: a per-project collection like
+        ``MyProject_CodeFunction`` should always belong to a single
+        project, but defensive in case the schema ever permits
+        cross-project sharing. The double-filter is essentially free
+        (no extra query roundtrip beyond the initial enumerate).
+        """
+        pruned = 0
+        try:
+            for obj in collection.iterator(
+                return_properties=["project"],
+            ):
+                obj_project = obj.properties.get("project") if obj.properties else None
+                # Only consider objects belonging to this project. Foreign-
+                # project rows (shouldn't exist in per-project collections,
+                # but defensive) are left alone.
+                if obj_project not in (None, "", self.project_name):
+                    continue
+                if str(obj.uuid) in visited_uuids:
+                    continue
+                try:
+                    collection.data.delete_by_id(uuid=str(obj.uuid))
+                    pruned += 1
+                except Exception as exc:
+                    logger.warning(
+                        f"Failed to prune {obj.uuid} from {collection.name}: {exc}"
+                    )
+        except Exception as exc:
+            # Iterating a freshly-created collection can fail if it
+            # has no data yet; treat as zero-prune.
+            logger.debug(f"Prune enumeration on {collection.name} failed: {exc}")
+
+        return pruned
+
     def _find_python_files(self, repo_path: Path) -> List[Path]:
         """Find all Python files in repository."""
-        python_files = []
-
-        # Directories to ignore
-        ignore_dirs = {
-            'venv', '.venv', 'env', '.env',
-            'node_modules', '__pycache__',
-            '.git', '.svn', '.hg',
-            'build', 'dist', '.tox', '.pytest_cache',
-            'site-packages', 'virtualenv',
-        }
-
-        for py_file in repo_path.rglob('*.py'):
-            # Skip if in ignored directory
-            if any(ignored in py_file.parts for ignored in ignore_dirs):
-                continue
-            python_files.append(py_file)
-
-        return sorted(python_files)
+        ignore_dirs = _ignore_dirs_for('python')
+        return sorted([
+            f for f in repo_path.rglob('*.py')
+            if not any(d in f.parts for d in ignore_dirs)
+        ])
 
     def _find_lua_files(self, repo_path: Path) -> List[Path]:
         """Find all Lua files in repository."""
-        ignore_dirs = {'.git', '.svn', 'build', 'dist', '__pycache__', 'node_modules'}
+        ignore_dirs = _ignore_dirs_for('lua')
         return sorted([
             f for f in repo_path.rglob('*.lua')
             if not any(d in f.parts for d in ignore_dirs)
@@ -1088,7 +1398,7 @@ class CodeGraphAnalyzer:
 
     def _find_cpp_files(self, repo_path: Path) -> List[Path]:
         """Find all C++/header files in repository."""
-        ignore_dirs = {'.git', '.svn', 'build', 'dist', '__pycache__', 'node_modules', '.venv', 'venv'}
+        ignore_dirs = _ignore_dirs_for('cpp')
         files = []
         for ext in ('*.cpp', '*.cc', '*.cxx', '*.c', '*.h', '*.hpp'):
             files.extend([
@@ -1099,10 +1409,7 @@ class CodeGraphAnalyzer:
 
     def _find_js_files(self, repo_path: Path) -> List[Path]:
         """Find all JavaScript files in repository."""
-        ignore_dirs = {
-            '.git', '.svn', 'node_modules', 'dist', 'build',
-            '__pycache__', '.venv', 'venv', 'coverage',
-        }
+        ignore_dirs = _ignore_dirs_for('js')
         skip_suffixes = {'.min.js', '.config.js', '.config.mjs'}
         files = []
         for ext in ('*.js', '*.mjs', '*.jsx'):
@@ -1118,10 +1425,7 @@ class CodeGraphAnalyzer:
 
     def _find_ts_files(self, repo_path: Path) -> List[Path]:
         """Find all TypeScript files in repository."""
-        ignore_dirs = {
-            '.git', '.svn', 'node_modules', 'dist', 'build',
-            '__pycache__', '.venv', 'venv', 'coverage',
-        }
+        ignore_dirs = _ignore_dirs_for('ts')
         skip_suffixes = {'.config.ts', '.config.mts'}
         files = []
         for ext in ('*.ts', '*.tsx'):
@@ -1140,7 +1444,7 @@ class CodeGraphAnalyzer:
 
     def _find_go_files(self, repo_path: Path) -> List[Path]:
         """Find all Go files in repository."""
-        ignore_dirs = {'.git', '.svn', 'vendor', 'build', 'dist', '__pycache__', 'node_modules'}
+        ignore_dirs = _ignore_dirs_for('go')
         return sorted([
             f for f in repo_path.rglob('*.go')
             if not any(d in f.parts for d in ignore_dirs)
@@ -1148,7 +1452,7 @@ class CodeGraphAnalyzer:
 
     def _find_rust_files(self, repo_path: Path) -> List[Path]:
         """Find all Rust files in repository."""
-        ignore_dirs = {'.git', '.svn', 'target', 'build', 'dist', '__pycache__', 'node_modules'}
+        ignore_dirs = _ignore_dirs_for('rust')
         return sorted([
             f for f in repo_path.rglob('*.rs')
             if not any(d in f.parts for d in ignore_dirs)
@@ -1156,7 +1460,7 @@ class CodeGraphAnalyzer:
 
     def _find_java_files(self, repo_path: Path) -> List[Path]:
         """Find all Java files in repository."""
-        ignore_dirs = {'.git', '.svn', 'build', 'dist', 'target', '__pycache__', 'node_modules', '.gradle'}
+        ignore_dirs = _ignore_dirs_for('java')
         return sorted([
             f for f in repo_path.rglob('*.java')
             if not any(d in f.parts for d in ignore_dirs)
@@ -1164,7 +1468,7 @@ class CodeGraphAnalyzer:
 
     def _find_ruby_files(self, repo_path: Path) -> List[Path]:
         """Find all Ruby files in repository."""
-        ignore_dirs = {'.git', '.svn', 'vendor', 'build', 'dist', '__pycache__', 'node_modules', '.bundle'}
+        ignore_dirs = _ignore_dirs_for('ruby')
         return sorted([
             f for f in repo_path.rglob('*.rb')
             if not any(d in f.parts for d in ignore_dirs)
@@ -1172,7 +1476,7 @@ class CodeGraphAnalyzer:
 
     def _find_shell_files(self, repo_path: Path) -> List[Path]:
         """Find all Shell script files in repository."""
-        ignore_dirs = {'.git', '.svn', 'build', 'dist', '__pycache__', 'node_modules', '.venv', 'venv'}
+        ignore_dirs = _ignore_dirs_for('shell')
         files = []
         for ext in ('*.sh', '*.bash'):
             files.extend([
@@ -1183,7 +1487,7 @@ class CodeGraphAnalyzer:
 
     def _find_csharp_files(self, repo_path: Path) -> List[Path]:
         """Find all C# files in repository."""
-        ignore_dirs = {'.git', '.svn', 'obj', 'bin', '.vs', 'build', 'dist', '__pycache__', 'node_modules'}
+        ignore_dirs = _ignore_dirs_for('csharp')
         return sorted([
             f for f in repo_path.rglob('*.cs')
             if not any(d in f.parts for d in ignore_dirs)
@@ -1191,7 +1495,7 @@ class CodeGraphAnalyzer:
 
     def _find_proto_files(self, repo_path: Path) -> List[Path]:
         """Find all Protocol Buffer definition files."""
-        ignore_dirs = {'.git', '.svn', 'build', 'dist', '__pycache__', 'node_modules'}
+        ignore_dirs = _ignore_dirs_for('proto')
         return sorted([
             f for f in repo_path.rglob('*.proto')
             if not any(d in f.parts for d in ignore_dirs)
@@ -1211,7 +1515,7 @@ class CodeGraphAnalyzer:
                    if l.strip() and not l.strip().startswith('//')
                    and not l.strip().startswith('*')])
         file_hash = hashlib.sha256(content.encode()).hexdigest()
-        relative_path = str(file_path.relative_to(repo_root))
+        relative_path = file_path.relative_to(repo_root).as_posix()
 
         if self._get_existing_module(relative_path, file_hash):
             print(f"⏭️  Skipping {relative_path} (unchanged)")
@@ -1304,7 +1608,7 @@ class CodeGraphAnalyzer:
             }
             if embedding:
                 insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
-            self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]))
+            self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['classes'] += 1
 
         # Methods
@@ -1334,7 +1638,7 @@ class CodeGraphAnalyzer:
             }
             if embedding:
                 insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
-            func_uuid = self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]))
+            func_uuid = self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['functions'] += 1
 
             # ASP.NET route entries for HTTP-attributed methods
@@ -1366,14 +1670,14 @@ class CodeGraphAnalyzer:
                 }
                 if api_embedding:
                     api_params["vector"] = {_ACTIVE_CODE_VECTOR: api_embedding} if DUAL_EMBEDDING_ENABLED else api_embedding
-                self._dedup_insert(self.apis_collection, api_params, api_params["properties"].get("endpoint", "") + ":" + api_params["properties"].get("method", ""))
+                self._dedup_insert(self.apis_collection, api_params, api_params["properties"].get("endpoint", "") + ":" + api_params["properties"].get("method", ""), file_path_rel=relative_path)
                 stats.setdefault('apis', 0)
                 stats['apis'] += 1
 
         # Cross-language interactions
         ix = _extract_external_calls(content_clean, imports, "csharp", relative_path)
         if ix:
-            stats['interactions'] = self._store_interactions(ix, "C#", module_uuid)
+            stats['interactions'] = self._store_interactions(ix, "C#", module_uuid, file_path_rel=relative_path)
 
         return stats
 
@@ -1389,7 +1693,7 @@ class CodeGraphAnalyzer:
         source_lines = content.split('\n')
         loc = len([l for l in source_lines if l.strip() and not l.strip().startswith('//')])
         file_hash = hashlib.sha256(content.encode()).hexdigest()
-        relative_path = str(file_path.relative_to(repo_root))
+        relative_path = file_path.relative_to(repo_root).as_posix()
 
         if self._get_existing_module(relative_path, file_hash):
             print(f"⏭️  Skipping {relative_path} (unchanged)")
@@ -1494,7 +1798,7 @@ class CodeGraphAnalyzer:
             }
             if embedding:
                 insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
-            self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]))
+            self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['classes'] += 1
 
         # Insert RPC methods as CodeAPI entries (inbound service contract)
@@ -1515,7 +1819,7 @@ class CodeGraphAnalyzer:
             }
             if embedding:
                 api_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
-            self._dedup_insert(self.apis_collection, api_params, api_params["properties"].get("endpoint", "") + ":" + api_params["properties"].get("method", ""))
+            self._dedup_insert(self.apis_collection, api_params, api_params["properties"].get("endpoint", "") + ":" + api_params["properties"].get("method", ""), file_path_rel=relative_path)
             stats['apis'] += 1
 
         return stats
@@ -1533,7 +1837,7 @@ class CodeGraphAnalyzer:
         loc = len([l for l in source_lines
                    if l.strip() and not l.strip().startswith('//') and not l.strip().startswith('*')])
         file_hash = hashlib.sha256(content.encode()).hexdigest()
-        relative_path = str(file_path.relative_to(repo_root))
+        relative_path = file_path.relative_to(repo_root).as_posix()
 
         if self._get_existing_module(relative_path, file_hash):
             print(f"⏭️  Skipping {relative_path} (unchanged)")
@@ -1719,7 +2023,7 @@ class CodeGraphAnalyzer:
             }
             if embedding:
                 insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
-            self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]))
+            self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['classes'] += 1
 
         # --- Store functions ---
@@ -1746,7 +2050,7 @@ class CodeGraphAnalyzer:
             }
             if embedding:
                 insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
-            self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]))
+            self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['functions'] += 1
 
         # --- Store Fastify routes as CodeAPI ---
@@ -1786,13 +2090,13 @@ class CodeGraphAnalyzer:
             }
             if embedding:
                 insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
-            self._dedup_insert(self.apis_collection, insert_params, insert_params["properties"].get("endpoint", "") + ":" + insert_params["properties"].get("method", ""))
+            self._dedup_insert(self.apis_collection, insert_params, insert_params["properties"].get("endpoint", "") + ":" + insert_params["properties"].get("method", ""), file_path_rel=relative_path)
             stats['apis'] += 1
 
         # Cross-language interactions
         ix = _extract_external_calls(content_clean, imports, language, relative_path)
         if ix:
-            stats['interactions'] = self._store_interactions(ix, language, module_uuid)
+            stats['interactions'] = self._store_interactions(ix, language, module_uuid, file_path_rel=relative_path)
 
         return stats
 
@@ -1825,7 +2129,7 @@ class CodeGraphAnalyzer:
         source_lines = content.split('\n')
         loc = len([l for l in source_lines if l.strip() and not l.strip().startswith('--')])
         file_hash = hashlib.sha256(content.encode()).hexdigest()
-        relative_path = str(file_path.relative_to(repo_root))
+        relative_path = file_path.relative_to(repo_root).as_posix()
 
         if self._get_existing_module(relative_path, file_hash):
             print(f"⏭️  Skipping {relative_path} (unchanged)")
@@ -1909,7 +2213,7 @@ class CodeGraphAnalyzer:
             }
             if embedding:
                 insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
-            self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]))
+            self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['classes'] += 1
 
         # Extract standalone functions (skip class methods already indexed)
@@ -1943,13 +2247,13 @@ class CodeGraphAnalyzer:
             }
             if embedding:
                 insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
-            self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]))
+            self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['functions'] += 1
 
         # Cross-language interactions
         ix = _extract_external_calls(content, imports, "Lua", relative_path)
         if ix:
-            stats['interactions'] = self._store_interactions(ix, "Lua", module_uuid)
+            stats['interactions'] = self._store_interactions(ix, "Lua", module_uuid, file_path_rel=relative_path)
 
         return stats
 
@@ -1962,7 +2266,7 @@ class CodeGraphAnalyzer:
         loc = len([l for l in source_lines
                    if l.strip() and not l.strip().startswith('//') and not l.strip().startswith('*')])
         file_hash = hashlib.sha256(content.encode()).hexdigest()
-        relative_path = str(file_path.relative_to(repo_root))
+        relative_path = file_path.relative_to(repo_root).as_posix()
 
         if self._get_existing_module(relative_path, file_hash):
             print(f"⏭️  Skipping {relative_path} (unchanged)")
@@ -2044,7 +2348,7 @@ class CodeGraphAnalyzer:
             }
             if embedding:
                 insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
-            self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]))
+            self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['classes'] += 1
 
         # Extract method implementations
@@ -2067,13 +2371,13 @@ class CodeGraphAnalyzer:
             }
             if embedding:
                 insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
-            self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]))
+            self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['functions'] += 1
 
         # Cross-language interactions (C++ uses #include as import gate)
         ix = _extract_external_calls(content_clean, includes, "C++", relative_path)
         if ix:
-            stats['interactions'] = self._store_interactions(ix, "C++", module_uuid)
+            stats['interactions'] = self._store_interactions(ix, "C++", module_uuid, file_path_rel=relative_path)
 
         return stats
 
@@ -2085,7 +2389,7 @@ class CodeGraphAnalyzer:
         source_lines = content.split('\n')
         loc = len([l for l in source_lines if l.strip() and not l.strip().startswith('//')])
         file_hash = hashlib.sha256(content.encode()).hexdigest()
-        relative_path = str(file_path.relative_to(repo_root))
+        relative_path = file_path.relative_to(repo_root).as_posix()
 
         if self._get_existing_module(relative_path, file_hash):
             print(f"⏭️  Skipping {relative_path} (unchanged)")
@@ -2159,7 +2463,7 @@ class CodeGraphAnalyzer:
             }
             if embedding:
                 insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
-            self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]))
+            self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['classes'] += 1
 
         # Function entries
@@ -2184,13 +2488,13 @@ class CodeGraphAnalyzer:
             }
             if embedding:
                 insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
-            self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]))
+            self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['functions'] += 1
 
         # Cross-language interactions
         ix = _extract_external_calls(content_clean, imports, "Go", relative_path)
         if ix:
-            stats['interactions'] = self._store_interactions(ix, "Go", module_uuid)
+            stats['interactions'] = self._store_interactions(ix, "Go", module_uuid, file_path_rel=relative_path)
 
         return stats
 
@@ -2202,7 +2506,7 @@ class CodeGraphAnalyzer:
         source_lines = content.split('\n')
         loc = len([l for l in source_lines if l.strip() and not l.strip().startswith('//')])
         file_hash = hashlib.sha256(content.encode()).hexdigest()
-        relative_path = str(file_path.relative_to(repo_root))
+        relative_path = file_path.relative_to(repo_root).as_posix()
 
         if self._get_existing_module(relative_path, file_hash):
             print(f"⏭️  Skipping {relative_path} (unchanged)")
@@ -2272,7 +2576,7 @@ class CodeGraphAnalyzer:
             }
             if embedding:
                 insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
-            self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]))
+            self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['classes'] += 1
 
         for m in func_pattern.finditer(content_clean):
@@ -2295,13 +2599,13 @@ class CodeGraphAnalyzer:
             }
             if embedding:
                 insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
-            self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]))
+            self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['functions'] += 1
 
         # Cross-language interactions
         ix = _extract_external_calls(content_clean, imports, "Rust", relative_path)
         if ix:
-            stats['interactions'] = self._store_interactions(ix, "Rust", module_uuid)
+            stats['interactions'] = self._store_interactions(ix, "Rust", module_uuid, file_path_rel=relative_path)
 
         return stats
 
@@ -2315,7 +2619,7 @@ class CodeGraphAnalyzer:
                    if l.strip() and not l.strip().startswith('//')
                    and not l.strip().startswith('*')])
         file_hash = hashlib.sha256(content.encode()).hexdigest()
-        relative_path = str(file_path.relative_to(repo_root))
+        relative_path = file_path.relative_to(repo_root).as_posix()
 
         if self._get_existing_module(relative_path, file_hash):
             print(f"⏭️  Skipping {relative_path} (unchanged)")
@@ -2388,7 +2692,7 @@ class CodeGraphAnalyzer:
             }
             if embedding:
                 insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
-            self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]))
+            self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['classes'] += 1
 
         for m in method_pattern.finditer(content_clean):
@@ -2417,13 +2721,13 @@ class CodeGraphAnalyzer:
             }
             if embedding:
                 insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
-            self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]))
+            self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['functions'] += 1
 
         # Cross-language interactions
         ix = _extract_external_calls(content_clean, imports, "Java", relative_path)
         if ix:
-            stats['interactions'] = self._store_interactions(ix, "Java", module_uuid)
+            stats['interactions'] = self._store_interactions(ix, "Java", module_uuid, file_path_rel=relative_path)
 
         return stats
 
@@ -2435,7 +2739,7 @@ class CodeGraphAnalyzer:
         source_lines = content.split('\n')
         loc = len([l for l in source_lines if l.strip() and not l.strip().startswith('#')])
         file_hash = hashlib.sha256(content.encode()).hexdigest()
-        relative_path = str(file_path.relative_to(repo_root))
+        relative_path = file_path.relative_to(repo_root).as_posix()
 
         if self._get_existing_module(relative_path, file_hash):
             print(f"⏭️  Skipping {relative_path} (unchanged)")
@@ -2508,7 +2812,7 @@ class CodeGraphAnalyzer:
             }
             if embedding:
                 insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
-            self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]))
+            self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['classes'] += 1
 
         for m in func_pattern.finditer(content_clean):
@@ -2535,13 +2839,13 @@ class CodeGraphAnalyzer:
             }
             if embedding:
                 insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
-            self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]))
+            self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['functions'] += 1
 
         # Cross-language interactions
         ix = _extract_external_calls(content_clean, imports, "Ruby", relative_path)
         if ix:
-            stats['interactions'] = self._store_interactions(ix, "Ruby", module_uuid)
+            stats['interactions'] = self._store_interactions(ix, "Ruby", module_uuid, file_path_rel=relative_path)
 
         return stats
 
@@ -2553,7 +2857,7 @@ class CodeGraphAnalyzer:
         source_lines = content.split('\n')
         loc = len([l for l in source_lines if l.strip() and not l.strip().startswith('#')])
         file_hash = hashlib.sha256(content.encode()).hexdigest()
-        relative_path = str(file_path.relative_to(repo_root))
+        relative_path = file_path.relative_to(repo_root).as_posix()
 
         if self._get_existing_module(relative_path, file_hash):
             print(f"⏭️  Skipping {relative_path} (unchanged)")
@@ -2613,13 +2917,13 @@ class CodeGraphAnalyzer:
             }
             if embedding:
                 insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
-            self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]))
+            self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['functions'] += 1
 
         # Cross-language interactions (shell: gate on curl/wget presence in content)
         ix = _extract_external_calls(content_clean, imports + ["curl", "wget"], "shell", relative_path)
         if ix:
-            stats['interactions'] = self._store_interactions(ix, "Shell", module_uuid)
+            stats['interactions'] = self._store_interactions(ix, "Shell", module_uuid, file_path_rel=relative_path)
 
         return stats
 
@@ -2644,7 +2948,7 @@ class CodeGraphAnalyzer:
         file_hash = hashlib.sha256(content.encode()).hexdigest()
 
         # Check if file already analyzed (by hash)
-        relative_path = str(file_path.relative_to(repo_root))
+        relative_path = file_path.relative_to(repo_root).as_posix()
         existing_module = self._get_existing_module(relative_path, file_hash)
 
         if existing_module:
@@ -2697,7 +3001,7 @@ class CodeGraphAnalyzer:
         # Cross-language interactions (Python: use raw content; _strip_triple_quoted handles docstrings)
         ix = _extract_external_calls(content, imports, "Python", relative_path)
         if ix:
-            stats['interactions'] = self._store_interactions(ix, "Python", module_uuid)
+            stats['interactions'] = self._store_interactions(ix, "Python", module_uuid, file_path_rel=relative_path)
 
         return stats
 
@@ -2711,6 +3015,7 @@ class CodeGraphAnalyzer:
         language: str,
         module_uuid: str,
         func_uuid: Optional[str] = None,
+        file_path_rel: str = "",
     ) -> int:
         """Store a list of extracted interactions into CodeInteraction collection.
 
@@ -2719,6 +3024,10 @@ class CodeGraphAnalyzer:
             language:     Source language label (Python, Go, etc.)
             module_uuid:  UUID of the CodeModule containing the calls.
             func_uuid:    UUID of the specific CodeFunction (optional).
+            file_path_rel: Repo-relative POSIX path of the source file
+                the interactions were extracted from. Threaded through
+                to ``_dedup_insert`` so the v0.2.16 path-aware UUID
+                scheme produces stable IDs across re-runs.
 
         Returns:
             Number of interactions stored.
@@ -2749,7 +3058,11 @@ class CodeGraphAnalyzer:
             if embedding:
                 insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
             try:
-                self._dedup_insert(self.interactions_collection, insert_params, f"ix::{ix.get('source','')}::{ix.get('endpoint','')}")
+                self._dedup_insert(
+                    self.interactions_collection, insert_params,
+                    f"ix::{ix.get('source','')}::{ix.get('endpoint','')}",
+                    file_path_rel=file_path_rel,
+                )
                 count += 1
             except Exception as exc:
                 # Non-fatal — log and continue
@@ -2831,7 +3144,17 @@ class CodeGraphAnalyzer:
     def _create_or_update_module(self, path: str, language: str, loc: int,
                                  complexity: float, last_modified: datetime,
                                  file_hash: str, imports: List[str], module_summary: str) -> str:
-        """Create or update module in Weaviate."""
+        """Create or update module in Weaviate.
+
+        Note: ``path`` is the repo-relative POSIX path of the source file
+        and IS the same value we pass to ``_dedup_insert`` as
+        ``file_path_rel``. The module UUID is therefore keyed on
+        ``(project, path, "module::"+path)``; the redundant ``path`` in
+        both positions is intentional — the file_path_rel slot
+        disambiguates files, the identity_key slot disambiguates
+        entity-types within the same file (module vs class vs function
+        with the same module-stem name).
+        """
 
         # Check if exists
         if path in self.module_cache:
@@ -2847,6 +3170,9 @@ class CodeGraphAnalyzer:
                     "import_names": imports,
                 }
             )
+            # Still record as visited so --prune-stale doesn't delete it.
+            if self._track_visited:
+                self.visited_uuids.add((self.modules_collection.name, self.module_cache[path]))
             return self.module_cache[path]
 
         # Create new - generate embedding from module_summary
@@ -2870,7 +3196,10 @@ class CodeGraphAnalyzer:
         if embedding:
             insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
 
-        uuid = self._dedup_insert(self.modules_collection, insert_params, f"module::{path}")
+        uuid = self._dedup_insert(
+            self.modules_collection, insert_params, f"module::{path}",
+            file_path_rel=path,
+        )
 
         self.module_cache[path] = uuid
         return uuid
@@ -3254,6 +3583,12 @@ class CodeGraphAnalyzer:
                       file_path: Path, repo_root: Path, source_lines: List[str]):
         """Extract class definition."""
 
+        # Cross-OS UUID stability (v0.2.16 — bug 0.7): POSIX-normalize
+        # the repo-relative path before threading it to _dedup_insert.
+        # Windows backslashes would otherwise produce different UUIDs
+        # than the same file analyzed on Linux/macOS.
+        relative_path = file_path.relative_to(repo_root).as_posix()
+
         # Get methods
         methods = [m.name for m in node.body if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))]
 
@@ -3309,7 +3644,15 @@ class CodeGraphAnalyzer:
         if embedding:
             insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
 
-        self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]))
+        # v0.2.16 (bug 0.8): capture the return value into class_uuid.
+        # Pre-v0.2.16 the return was discarded and the next line referenced
+        # `class_uuid` from nowhere — NameError on every Python file
+        # containing a class. The outer try/except in analyze_repository
+        # was swallowing the exception and counting it as files_skipped,
+        # so the bug was invisible to the exit-code path. Mirrors the
+        # `func_uuid = self._dedup_insert(...)` pattern used in
+        # `_extract_function` below.
+        class_uuid = self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
 
         self.class_cache[f"{file_path.stem}.{node.name}"] = class_uuid
 
@@ -3323,6 +3666,10 @@ class CodeGraphAnalyzer:
                          file_path: Path, repo_root: Path, source_lines: List[str],
                          parent_class: Optional[str] = None):
         """Extract function definition."""
+
+        # Cross-OS UUID stability (v0.2.16 — bug 0.7): POSIX-normalize.
+        # See _extract_class for the same rationale.
+        relative_path = file_path.relative_to(repo_root).as_posix()
 
         # Get signature
         args = [arg.arg for arg in node.args.args]
@@ -3396,7 +3743,7 @@ class CodeGraphAnalyzer:
         if embedding:
             insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
 
-        func_uuid = self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]))
+        func_uuid = self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
 
         self.function_cache[full_name] = func_uuid
 
@@ -3624,8 +3971,30 @@ def main():
                        help='Create collections with named vector support (default: True)')
     parser.add_argument('--migrate-from-shared', action='store_true',
                        help='Migrate objects from shared collections to per-project collections')
+    # v0.2.16 (1.4 / addendum H): visited-UUID tracking + post-run pruning of
+    # orphan entries. Recommended for the launcher's "Re-analyze" path
+    # (wizard checkbox: "Clean stale entries during re-analysis"). Default
+    # off — opt-in to avoid surprising deletes on partial-language runs
+    # (e.g. `--language python` would otherwise prune all non-Python objects).
+    parser.add_argument('--prune-stale', action='store_true',
+                       help='After analysis, delete code-graph objects this run '
+                            'did not visit (cleans up entries for deleted files). '
+                            'Tracks UUIDs as they are upserted and removes the '
+                            'rest from each per-project collection.')
 
     args = parser.parse_args()
+
+    # Defensive: warn if --prune-stale is combined with --language, since
+    # the prune pass deletes EVERY non-visited UUID across all collections
+    # — including objects produced by a previous full-language run.
+    if args.prune_stale and args.language:
+        print(
+            f"⚠️  --prune-stale + --language={args.language} would delete "
+            "code-graph entries from OTHER languages that this run did "
+            "not visit. Re-run without --language to analyze the full repo, "
+            "or drop --prune-stale.",
+            file=sys.stderr,
+        )
 
     # Validate repo path
     repo_path = args.repo_path.resolve()
@@ -3689,6 +4058,7 @@ def main():
             incremental=args.incremental,
             extract_cfg=args.cfg,
             extract_pdg=args.pdg,
+            prune_stale=args.prune_stale,
         )
 
         # Post-processing: create cross-references
@@ -3696,7 +4066,12 @@ def main():
 
         # Report results
         print("\n" + "="*60)
-        print("✅ Code Graph Analysis Complete")
+        if stats.get('insert_errors', 0) > 0:
+            print("⚠️  Code Graph Analysis Complete (with errors)")
+        elif stats.get('files_analyzed', 0) == 0:
+            print("⚠️  Code Graph Analysis: NO FILES INDEXED")
+        else:
+            print("✅ Code Graph Analysis Complete")
         print("="*60)
         print(f"📊 Statistics:")
         print(f"   Modules: {stats['modules']}")
@@ -3705,8 +4080,38 @@ def main():
         print(f"   APIs: {stats['apis']}")
         print(f"   Files analyzed: {stats['files_analyzed']}")
         print(f"   Files skipped: {stats['files_skipped']}")
+        # v0.2.16: surface granular error + prune stats so operators
+        # can see at a glance whether the run was clean (and the
+        # launcher's wizard polling can read the same numbers via
+        # the database row's `files_analyzed` / new error_count cols).
+        print(f"   Insert errors: {stats.get('insert_errors', 0)}")
+        if args.prune_stale:
+            print(f"   Stale entries pruned: {stats.get('stale_pruned', 0)}")
         print(f"   Cross-references: {ref_stats['calls']} calls, {ref_stats['extends']} extends, {ref_stats['imports']} imports")
         print()
+
+        # v0.2.16 (bug 0.2): non-zero exit code on bad outcomes.
+        # The launcher's `rebuild_code_graph` Tauri command should
+        # map these to user-visible warning toasts:
+        #   3 → "No files indexed — check repo path / filters"
+        #   4 → "Partial insert failures — check logs"
+        # Pre-v0.2.16 the script always returned 0 even when most
+        # files failed to write, masking serious data-loss bugs.
+        files_total = stats['files_analyzed'] + stats['files_skipped']
+        if stats['files_analyzed'] == 0 and files_total > 0:
+            print(
+                "❌ No files were successfully analyzed — every file in scope "
+                "failed. Check the warnings above for the root cause.",
+                file=sys.stderr,
+            )
+            return 3
+        if stats.get('insert_errors', 0) > 0:
+            print(
+                f"❌ {stats['insert_errors']} insert errors — analysis incomplete. "
+                "The code graph for this project is missing data.",
+                file=sys.stderr,
+            )
+            return 4
 
         return 0
 

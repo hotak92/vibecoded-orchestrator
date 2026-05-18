@@ -192,12 +192,21 @@ pub struct CodegraphProjectSummary {
 /// dashboard's card grid. The acting project sees its own codegraph
 /// (always "write") plus any others it's been granted read access to
 /// via the codegraph access table.
+///
+/// v0.2.16 (W4 / 0.11): `include_untracked_projects` (default `false`)
+/// filters out classes whose prefix doesn't map to any currently-tracked
+/// project. The GUI's /codegraph route uses `Some(false)` for a clean
+/// view; the advanced /preferences/weaviate-untracked page passes
+/// `Some(true)` to surface data from since-deleted projects. The
+/// default keeps pre-v0.2.16 callers on the clean view automatically.
 #[command]
 pub async fn codegraph_list_projects(
     project_id: String,
     db: State<'_, Db>,
     cfg: State<'_, LocalConfig>,
+    include_untracked_projects: Option<bool>,
 ) -> Result<Vec<CodegraphProjectSummary>, String> {
+    let include_untracked = include_untracked_projects.unwrap_or(false);
     let base = weaviate_url(Some(&cfg));
     let client = weaviate_client()?;
     let schema_resp = client
@@ -244,8 +253,46 @@ pub async fn codegraph_list_projects(
     // granted). Resolve project name from the prefix by looking up
     // project_codegraph_bindings — if no row, fall back to the prefix.
     let acting = db.get_project(&project_id)?;
+
+    // v0.2.16 (W4 / 0.11): build the set of currently-tracked prefixes
+    // when filtering is requested. Includes the canonical_class_prefix
+    // for every tracked project — that's the prefix the analyzer writes
+    // to. Anything not in this set is "untracked" and only surfaces when
+    // include_untracked_projects=true. Note: this filter is keyed on
+    // EXACT prefix match. Renamed projects keep their old data under
+    // the old prefix as untracked (matches plan 0.10 edge case — no
+    // automatic rename, user re-analyses to migrate).
+    let tracked_prefixes: std::collections::HashSet<String> = if include_untracked {
+        std::collections::HashSet::new()
+    } else {
+        match db.list_projects() {
+            Ok(rows) => rows
+                .into_iter()
+                .flat_map(|row| {
+                    let mut prefixes = Vec::new();
+                    // Primary signal: the project's codegraph binding row
+                    // (what new analyses write to).
+                    if let Ok(Some(b)) = db.get_project_codegraph_binding(&row.id) {
+                        prefixes.push(b.collection_prefix);
+                    }
+                    // Fallback: canonical from name (matches what
+                    // analyze_code_graph.py uses when no binding exists).
+                    if let Ok(p) = crate::project_naming::canonical_class_prefix(&row.name) {
+                        prefixes.push(p);
+                    }
+                    prefixes
+                })
+                .collect(),
+            Err(_) => std::collections::HashSet::new(),
+        }
+    };
+
     let mut out: Vec<CodegraphProjectSummary> = Vec::new();
     for (prefix, counts) in by_prefix {
+        // v0.2.16 (W4 / 0.11): filter out untracked-project prefixes.
+        if !include_untracked && !tracked_prefixes.contains(&prefix) {
+            continue;
+        }
         // Find which project owns this prefix (best effort).
         let owner_project_id = db
             .find_project_by_codegraph_prefix(&prefix)

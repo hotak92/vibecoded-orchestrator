@@ -662,47 +662,225 @@ pub async fn get_installed_version(path: String) -> Result<String, String> {
     Err("Could not determine version".to_string())
 }
 
-/// Check if updates are available (local behind remote).
+/// v0.2.16 (W4 / 0.5): three-state update status surfaced by the
+/// `UpdateBadge` banner.
+///
+/// Each boolean is independent — the banner renders the
+/// highest-priority state (binary_stale > install_stale > remote_ahead).
+///
+/// - `remote_ahead`: existing v0.2.x behaviour — git index is behind
+///   `origin/main`. Resolved by `update_orchestrator` (git pull +
+///   install.py --update).
+/// - `install_stale`: source tree on disk (vct-module.json::version) is
+///   AHEAD of the last successful install (state/install-manifest.json::version).
+///   Happens when the user `git pull`-s manually instead of clicking
+///   "Update orchestrator". Resolved by `apply_pending_install`
+///   (install.py --update, no git pull — source is already current).
+/// - `binary_stale`: the running launcher's compiled version differs
+///   from `launcher/dist/<arch>/vct-launcher.metadata.json::launcher_version`
+///   on disk. Happens when a newer binary lands via `git pull` without
+///   install.py running its binary-swap path. Resolved by
+///   `restart_launcher` (re-exec the on-disk binary).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateStatus {
+    /// Existing v0.2.x semantics: local branch is behind `origin/main`.
+    pub remote_ahead: bool,
+    /// NEW v0.2.16: source version > installed manifest version.
+    pub install_stale: bool,
+    /// NEW v0.2.16: running binary version != on-disk binary version.
+    pub binary_stale: bool,
+    /// `vct-module.json::version` (or canonical-files fallback chain).
+    /// Empty string when neither file is present.
+    pub source_version: String,
+    /// `state/install-manifest.json::version`. Empty string when no
+    /// manifest exists (fresh install never ran).
+    pub installed_version: String,
+    /// `env!("CARGO_PKG_VERSION")` — the version the currently-running
+    /// launcher was compiled with.
+    pub running_version: String,
+    /// `launcher/dist/<arch>/vct-launcher.metadata.json::launcher_version`.
+    /// Empty string when the sidecar metadata is absent (e.g. dev build
+    /// running from `cargo run` with no dist artifacts staged).
+    pub on_disk_binary_version: String,
+}
+
+/// Check for updates across all three signals (git, manifest, binary).
+///
+/// Returns the full `UpdateStatus` struct so the frontend banner can
+/// render the highest-priority state. The previous boolean-returning
+/// signature shipped through v0.2.15; v0.2.16 (W4) widens it.
 #[command]
-pub async fn check_for_updates(path: String) -> Result<bool, String> {
+pub async fn check_for_updates(path: String) -> Result<UpdateStatus, String> {
     let p = PathBuf::from(&path);
-    if !p.join(".git").exists() {
-        return Err("Not a git repository".to_string());
-    }
 
-    // Fetch without merging
-    let fetch = tokio::process::Command::new("git")
-        .args(["fetch", "--quiet"])
-        .current_dir(&p)
-        .output()
-        .await
-        .map_err(|e| format!("git fetch failed: {}", e))?;
+    // Defaults — populated below when sources are available.
+    let mut remote_ahead = false;
+    let mut source_version = String::new();
+    let mut installed_version = String::new();
+    let running_version = env!("CARGO_PKG_VERSION").to_string();
 
-    if !fetch.status.success() {
-        return Err("git fetch failed".to_string());
-    }
+    // 1. git fetch + ahead/behind check (only when `.git/` present).
+    //    Pre-v0.2.16 errored when not a git repo; v0.2.16 (W4) treats
+    //    that as "no git signal available" so the install_stale/
+    //    binary_stale signals still work on non-checkout installs
+    //    (file-mirror, release-zip, etc.).
+    if p.join(".git").exists() {
+        let fetch = tokio::process::Command::new("git")
+            .args(["fetch", "--quiet"])
+            .current_dir(&p)
+            .output()
+            .await
+            .map_err(|e| format!("git fetch failed: {}", e))?;
 
-    // Check if local is behind remote
-    let status = tokio::process::Command::new("git")
-        .args(["status", "-uno", "--porcelain=v2", "--branch"])
-        .current_dir(&p)
-        .output()
-        .await
-        .map_err(|e| e.to_string())?;
+        if !fetch.status.success() {
+            // git fetch failed — likely offline or no remote. Don't
+            // hard-fail the whole status check; just leave remote_ahead
+            // at its default (false). The other signals still work.
+            eprintln!(
+                "[vct] check_for_updates: git fetch failed at {}, skipping remote check",
+                p.display()
+            );
+        } else {
+            let status = tokio::process::Command::new("git")
+                .args(["status", "-uno", "--porcelain=v2", "--branch"])
+                .current_dir(&p)
+                .output()
+                .await
+                .map_err(|e| e.to_string())?;
 
-    let output = String::from_utf8_lossy(&status.stdout);
-    // Look for "# branch.ab +N -M" where M > 0 means behind
-    for line in output.lines() {
-        if line.starts_with("# branch.ab") {
-            if let Some(behind) = line.split_whitespace().last() {
-                if let Ok(n) = behind.trim_start_matches('-').parse::<i32>() {
-                    return Ok(n > 0);
+            let output = String::from_utf8_lossy(&status.stdout);
+            // Look for "# branch.ab +N -M" where M > 0 means behind.
+            for line in output.lines() {
+                if line.starts_with("# branch.ab") {
+                    if let Some(behind) = line.split_whitespace().last() {
+                        if let Ok(n) = behind.trim_start_matches('-').parse::<i32>() {
+                            remote_ahead = n > 0;
+                        }
+                    }
                 }
             }
         }
     }
 
-    Ok(false)
+    // 2. source_version: read vct-module.json (priority 2 of the
+    //    canonical chain — we DO want to read the on-disk source file
+    //    here, not the manifest, because we're comparing source vs
+    //    manifest to detect install_stale).
+    if let Some(v) = read_source_version(&p) {
+        source_version = v;
+    }
+
+    // 3. installed_version: read state/install-manifest.json::version.
+    //    A missing manifest means install.py never completed against
+    //    this tree — install_stale is then trivially false (we don't
+    //    have a "last install" to compare against).
+    if let Some(v) = read_manifest_version(&p) {
+        installed_version = v;
+    }
+
+    // 4. on_disk_binary_version: read the dist sidecar metadata for
+    //    the current target. Falls back to empty when the sidecar
+    //    isn't present (dev builds running from `cargo run`).
+    let on_disk_binary_version = read_on_disk_binary_version(&p).unwrap_or_default();
+
+    // Compute the two new flags. Strict equality keeps the logic
+    // simple (no SemVer comparison) — the only producers of these
+    // fields are install.py / the upload-artifact step, both of which
+    // write the same canonical string. Mismatch == stale.
+    let install_stale = !source_version.is_empty()
+        && !installed_version.is_empty()
+        && source_version != installed_version;
+    let binary_stale = !on_disk_binary_version.is_empty()
+        && on_disk_binary_version != running_version;
+
+    Ok(UpdateStatus {
+        remote_ahead,
+        install_stale,
+        binary_stale,
+        source_version,
+        installed_version,
+        running_version,
+        on_disk_binary_version,
+    })
+}
+
+/// Read source version from `<install_path>/vct-module.json::version`.
+/// Used by `check_for_updates` to compute `install_stale`. Returns
+/// `None` if the file is missing or doesn't have a usable version field.
+fn read_source_version(install_path: &Path) -> Option<String> {
+    let vct_module = install_path.join("vct-module.json");
+    if let Ok(txt) = std::fs::read_to_string(&vct_module) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&txt) {
+            if let Some(s) = val.get("version").and_then(|v| v.as_str()) {
+                if !s.is_empty() {
+                    return Some(s.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Read `state/install-manifest.json::version`. Returns `None` if the
+/// manifest doesn't exist (fresh install never completed) or doesn't
+/// contain a non-empty version string.
+fn read_manifest_version(install_path: &Path) -> Option<String> {
+    let manifest = install_path
+        .join("state")
+        .join("install-manifest.json");
+    if let Ok(txt) = std::fs::read_to_string(&manifest) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&txt) {
+            if let Some(s) = val.get("version").and_then(|v| v.as_str()) {
+                if !s.is_empty() {
+                    return Some(s.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Read the on-disk binary version from
+/// `launcher/dist/<arch>/vct-launcher.metadata.json::launcher_version`.
+/// The arch subdir is selected via the same helper the restart_launcher
+/// path uses (`launcher_binary_relative_path` in commands::restart) —
+/// keep both functions in sync.
+fn read_on_disk_binary_version(install_path: &Path) -> Option<String> {
+    let subdir = launcher_dist_subdir();
+    let meta_path = install_path
+        .join("launcher")
+        .join("dist")
+        .join(subdir)
+        .join("vct-launcher.metadata.json");
+    if let Ok(txt) = std::fs::read_to_string(&meta_path) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&txt) {
+            if let Some(s) = val.get("launcher_version").and_then(|v| v.as_str()) {
+                if !s.is_empty() {
+                    return Some(s.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Compile-time per-OS launcher dist subdirectory. Mirror of
+/// `install.py::_launcher_binary_relative_path` and the analogous
+/// helper in `commands::restart` — kept here to avoid a cross-module
+/// dependency from installer.rs into restart.rs.
+fn launcher_dist_subdir() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        "windows-x64"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "macos-arm64"
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        "linux-x64"
+    }
 }
 
 /// Classify what an install target looks like:
@@ -2370,6 +2548,119 @@ pub async fn update_orchestrator(
         success: true,
         install_path: path,
         message: "Orchestrator updated successfully".to_string(),
+        system,
+    })
+}
+
+/// v0.2.16 (W4 / 0.5): "Pulled-but-not-installed" resolver. Runs
+/// `install.py --update` against an existing install_path WITHOUT a
+/// preceding `git pull`. Distinct from `update_orchestrator` (which
+/// does both): users who `git pull` manually still need an install.py
+/// pass to refresh `.claude/` hooks/scripts/agents, register MCP
+/// servers, and bump `state/install-manifest.json::version`.
+///
+/// **CRITICAL**: this MUST NOT call `update_orchestrator` (which
+/// `git pull --ff-only`s first). Source is already current by
+/// definition of the install_stale state. Pulling again would waste
+/// ~30s and noise the launcher's git output for no value. If you
+/// catch yourself adding a git step here, route through the existing
+/// `update_orchestrator` command instead.
+///
+/// Cross-OS contract: shells out to `system.python_cmd` (resolved by
+/// `detect_system()` — already handles `python3` vs `python`, Windows
+/// `python.exe`, etc.). Never hardcode `/usr/bin/python3`.
+#[command]
+pub async fn apply_pending_install(
+    path: String,
+    window: Window,
+) -> Result<InstallResult, String> {
+    let install_path = PathBuf::from(&path);
+    let system = detect_system().await?;
+
+    if !install_path.is_dir() {
+        return Err(format!(
+            "install path does not exist or isn't a directory: {}",
+            install_path.display()
+        ));
+    }
+
+    // Sanity: a fully-fresh path with no orchestrator artifacts is
+    // ambiguous (could be a misclick by the user passing the wrong
+    // path). Refuse rather than running install.py on something that
+    // might not be an orchestrator clone.
+    if !install_path.join("vct-module.json").is_file() {
+        return Err(format!(
+            "no vct-module.json at {} — not an orchestrator install root",
+            install_path.display()
+        ));
+    }
+
+    emit_progress(&window, "install", "Applying pending install...", 10.0);
+
+    let python_cmd = &system.python_cmd;
+    let mut cmd = tokio::process::Command::new(python_cmd);
+    cmd.args(["install.py", "--update"])
+        .stdin(std::process::Stdio::null())
+        .current_dir(&install_path);
+    // Mirror update_orchestrator: expose running launcher PID so
+    // install.py can include it in any launcher_restart_required
+    // deferral message it emits (binary swap path).
+    cmd.env("VCT_LAUNCHER_PID", std::process::id().to_string());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+
+    emit_progress(&window, "install", "Running install.py --update...", 30.0);
+
+    let install_output = cmd
+        .output()
+        .await
+        .map_err(|e| format!("install.py --update failed: {}", e))?;
+
+    if !install_output.status.success() {
+        let stderr = String::from_utf8_lossy(&install_output.stderr);
+        let stdout = String::from_utf8_lossy(&install_output.stdout);
+        // Surface the tail of both streams — install.py errors usually
+        // land in stderr but some Python tracebacks slip into stdout.
+        let stderr_tail: String = stderr
+            .lines()
+            .rev()
+            .take(20)
+            .collect::<Vec<&str>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<&str>>()
+            .join("\n");
+        let stdout_tail: String = stdout
+            .lines()
+            .rev()
+            .take(20)
+            .collect::<Vec<&str>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<&str>>()
+            .join("\n");
+        return Err(format!(
+            "install.py --update failed (exit {}):\nstderr:\n{}\n\nstdout:\n{}",
+            install_output.status.code().unwrap_or(-1),
+            stderr_tail,
+            stdout_tail
+        ));
+    }
+
+    emit_progress(
+        &window,
+        "done",
+        "Pending install applied successfully!",
+        100.0,
+    );
+
+    Ok(InstallResult {
+        success: true,
+        install_path: path,
+        message: "Pending install applied successfully".to_string(),
         system,
     })
 }
@@ -8288,6 +8579,112 @@ MemAvailable:   23456789 kB
         fn lightweight_argv_empty_container_runtime_omits_flag() {
             let argv = build_lightweight_install_argv(false, false, Some(""), false, None);
             assert!(!argv.contains(&"--container".to_string()));
+        }
+
+        // ---- v0.2.16 (W4 / 0.5): check_for_updates helpers ----
+
+        #[test]
+        fn test_read_source_version_present() {
+            let dir = tmp();
+            fs::write(
+                dir.join("vct-module.json"),
+                r#"{"version": "0.2.16", "name": "VCO"}"#,
+            )
+            .unwrap();
+            assert_eq!(read_source_version(&dir), Some("0.2.16".to_string()));
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn test_read_source_version_absent() {
+            let dir = tmp();
+            assert_eq!(read_source_version(&dir), None);
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn test_read_source_version_empty_string_returns_none() {
+            let dir = tmp();
+            fs::write(
+                dir.join("vct-module.json"),
+                r#"{"version": "", "name": "VCO"}"#,
+            )
+            .unwrap();
+            // Empty string treated as "no usable version" — matches
+            // `read_json_string_field` in commands::manifest.
+            assert_eq!(read_source_version(&dir), None);
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn test_read_manifest_version_present() {
+            let dir = tmp();
+            fs::create_dir_all(dir.join("state")).unwrap();
+            fs::write(
+                dir.join("state").join("install-manifest.json"),
+                r#"{"version": "0.2.13", "installed": true}"#,
+            )
+            .unwrap();
+            assert_eq!(read_manifest_version(&dir), Some("0.2.13".to_string()));
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn test_read_manifest_version_no_manifest_dir() {
+            let dir = tmp();
+            // No `state/` dir at all — must not panic.
+            assert_eq!(read_manifest_version(&dir), None);
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn test_read_manifest_version_malformed_json_returns_none() {
+            let dir = tmp();
+            fs::create_dir_all(dir.join("state")).unwrap();
+            fs::write(
+                dir.join("state").join("install-manifest.json"),
+                "{ not json",
+            )
+            .unwrap();
+            assert_eq!(read_manifest_version(&dir), None);
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn test_read_on_disk_binary_version_present() {
+            // Cross-OS: build the path the same way the helper does
+            // (`launcher_dist_subdir()` is compile-time per-target). Use
+            // PathBuf operations throughout — no string `/` literals.
+            let dir = tmp();
+            let subdir = launcher_dist_subdir();
+            let bin_dir = dir.join("launcher").join("dist").join(subdir);
+            fs::create_dir_all(&bin_dir).unwrap();
+            fs::write(
+                bin_dir.join("vct-launcher.metadata.json"),
+                r#"{"launcher_version": "0.2.15", "host_target": "any"}"#,
+            )
+            .unwrap();
+            assert_eq!(
+                read_on_disk_binary_version(&dir),
+                Some("0.2.15".to_string())
+            );
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn test_read_on_disk_binary_version_absent_path() {
+            let dir = tmp();
+            // No launcher/dist/<arch>/ at all.
+            assert_eq!(read_on_disk_binary_version(&dir), None);
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn test_launcher_dist_subdir_matches_one_of_three_targets() {
+            // Compile-time per-target. Just sanity-check that it's one of
+            // the canonical strings the install.py side knows about.
+            let s = launcher_dist_subdir();
+            assert!(matches!(s, "linux-x64" | "macos-arm64" | "windows-x64"));
         }
 
         #[test]

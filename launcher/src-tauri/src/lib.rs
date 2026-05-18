@@ -860,6 +860,14 @@ pub fn run() {
             commands::storage_ux::migrate_to_named_volume,
             commands::storage_ux::migrate_to_bind_path,
             commands::installer::update_orchestrator,
+            // v0.2.16 (W4 / 0.5): apply_pending_install resolves the
+            // "Pulled-but-not-installed" banner state (source updated
+            // via `git pull` outside the launcher; install-manifest
+            // still records the previous version). Runs install.py
+            // --update WITHOUT a preceding git pull. Distinct from
+            // update_orchestrator (git pull + install) so we don't
+            // waste ~30s pulling an already-current source tree.
+            commands::installer::apply_pending_install,
             commands::installer::get_local_repo_source,
             commands::installer::inspect_orchestrator_at,
             commands::installer::inspect_project_leftovers,
@@ -915,6 +923,14 @@ pub fn run() {
             commands::project_identity::cleanup_orphan_codegraph_collections,
             commands::project_identity::get_legacy_codegraph_notice_dismissed,
             commands::project_identity::set_legacy_codegraph_notice_dismissed,
+            // W3 / v0.2.16 (2026-05-18): wizard UX hardening (plan 0.3 + 0.9).
+            // The status batched-read feeds the wizard's poll loop so it
+            // shows real per-project progress instead of being stuck at
+            // "Started for N/N project(s)". The force-recheck command
+            // backs the Preferences "Re-check for legacy collections"
+            // button.
+            commands::project_identity::get_code_graph_build_status_for_projects,
+            commands::project_identity::force_recheck_legacy_codegraph,
             // PR-26 / Group E (v0.2.12 / 2026-05-16): shared KG canonical-name
             // picker — surfaces orchestrator-shaped classes on Weaviate so the
             // IdentityTab can let users pick which class is canonical.
