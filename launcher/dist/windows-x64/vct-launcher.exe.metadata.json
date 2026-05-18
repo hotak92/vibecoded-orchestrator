@@ -1,10 +1,11 @@
 {
-  "source_sha": "b716fbc8c89e4d6e0e1f29ad7e94a1c79f44d3a8",
-  "source_short_sha": "b716fbc",
-  "built_at": "2026-05-17T04:34:20Z",
-  "launcher_version": "0.2.15",
+  "source_sha": "3b246cf096a1b0e2fa5f557b73044e41a59bb865",
+  "source_short_sha": "3b246cf",
+  "source_hash": "a2da236859d8f3b6b1295ba45a659afcf3e41894",
+  "built_at": "2026-05-18T16:27:46Z",
+  "launcher_version": "0.2.16",
   "host_target": "windows-x64",
   "binary_name": "vct-launcher.exe",
-  "binary_size_bytes": 26739200,
-  "_provenance": "Manually placed from GitHub Release v0.2.15 zip artifacts because the release.yml commit-dist-binaries job had a path-mismatch (Stage binaries expected nested launcher/dist/<arch>/vct-launcher inside the artifact, build job uploaded flat <arch>/vct-launcher). v0.2.16 fix candidate."
+  "binary_size_bytes": 26873344,
+  "tier": "stable"
 }
