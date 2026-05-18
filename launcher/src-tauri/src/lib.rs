@@ -541,6 +541,32 @@ pub fn run() {
             // Emits `vct-launcher-update-available` event when remote HEAD
             // has new commits — never auto-applies.
             commands::self_update::spawn_daily_check(app.handle().clone());
+
+            // v0.2.18 Commit 3: OpenAI key startup recovery state machine.
+            // Reads the keychain row at
+            //   (Shared { project_id = SENTINEL_SHARED }, module_id = "user",
+            //    key = "openai_api_key")
+            // and validates it via the free `GET /v1/models/...` probe.
+            // Drives the previously-valid-now-invalid → fallback-to-local
+            // transition AND the previously-invalid-now-valid → restore
+            // transition. Emits `vct-openai-key-invalidated` /
+            // `vct-openai-key-restored` for the Preferences toast UI
+            // (Commit 7). Soft-fails throughout — boot continues even on
+            // keychain hiccups or network outages.
+            //
+            // Free-tier users (no key in keychain) hit the early-return at
+            // the top of `run_openai_startup_recheck` — zero network cost,
+            // zero state mutation.
+            let openai_recheck_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = commands::openai_cmd::run_openai_startup_recheck(
+                    openai_recheck_handle,
+                )
+                .await
+                {
+                    eprintln!("[vct] openai startup recheck warning (non-fatal): {}", e);
+                }
+            });
             // Auto-start the shared compose stack (Weaviate / Ollama /
             // code_embed). Runs in the background — must NOT block the
             // tray or main window from rendering. Surfaces progress via
@@ -896,6 +922,15 @@ pub fn run() {
             commands::installer::get_github_pat_preview,
             commands::installer::register_github_pat,
             commands::installer::clear_github_pat,
+            // OpenAI key lifecycle (v0.2.18, Commit 3). Symmetric to the
+            // github_pat trio above: register / validate / recheck. Wired
+            // into OnboardingWizard's OpenAI step (Commit 6) AND the
+            // /preferences "OpenAI API key" section (Commit 7). The
+            // startup background task in setup() below runs the recovery
+            // state machine at every launcher boot.
+            commands::openai_cmd::register_openai_api_key,
+            commands::openai_cmd::validate_openai_api_key,
+            commands::openai_cmd::recheck_openai_validity,
             // KG dashboard — extended (v1.1)
             commands::kg::kg_set_collection_access_mode,
             commands::kg::kg_set_node_access,

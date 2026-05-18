@@ -18,6 +18,7 @@ pub mod licensing;
 pub mod maintenance;
 pub mod manifest;
 pub mod modules;
+pub mod openai_cmd;
 pub mod orchestrator_root;
 pub mod project_identity;
 pub mod projects_v2;

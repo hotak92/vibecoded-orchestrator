@@ -26,13 +26,19 @@
       "description": "AST analysis via Tree-sitter for 10+ languages. Optional Joern integration for CFG/PDG."
     }
   ],
-  "_bundled_secrets_doc": "0.2.0 fork-readiness sweep (item H1, 2026-05-08): the orchestrator core declares the secrets the launcher itself manages (PAT for GitHub auth, etc.) so the hub's `/api/v1/projects/{id}/env` resolver can serve them to bundled wrappers without the user having to install a separate module first. Each entry maps a single keychain slot — the hub uses the SENTINEL_SHARED project_id for shared scope (so all base-host projects see the same value) and the OnboardingWizard's `register_github_pat` writes to the matching slot. 2026-05-10 (post-0.2.0 backlog #6): module_id changed from 'installer' to 'user' so the wizard's writer matches the SecretsPanel 'Shared (this user)' tab's UI_MODULE_BUCKET — registering via either path now lands at the same keychain row instead of two divergent ones.",
+  "_bundled_secrets_doc": "0.2.0 fork-readiness sweep (item H1, 2026-05-08): the orchestrator core declares the secrets the launcher itself manages (PAT for GitHub auth, etc.) so the hub's `/api/v1/projects/{id}/env` resolver can serve them to bundled wrappers without the user having to install a separate module first. Each entry maps a single keychain slot — the hub uses the SENTINEL_SHARED project_id for shared scope (so all base-host projects see the same value) and the OnboardingWizard's `register_github_pat` writes to the matching slot. 2026-05-10 (post-0.2.0 backlog #6): module_id changed from 'installer' to 'user' so the wizard's writer matches the SecretsPanel 'Shared (this user)' tab's UI_MODULE_BUCKET — registering via either path now lands at the same keychain row instead of two divergent ones. v0.2.18 (Commit 3, 2026-05-18): added `openai_api_key` (scope=shared, module_id=user) so the EmbeddingService can resolve it via the hub for every project. Registration happens via `register_openai_api_key` (OnboardingWizard's OpenAI step + Preferences → Special Secrets). Validation uses the free `GET /v1/models/text-embedding-3-small` endpoint — no token consumption, no billing entry.",
   "bundled_secrets": [
     {
       "key": "github_pat",
       "scope": "shared",
       "module_id": "user",
       "description": "GitHub personal access token written by the launcher's OnboardingWizard via `register_github_pat` AND by the SecretsPanel 'Shared (this user)' tab. Resolved by the hub for every base-host project; consumed by `claude_mcp_servers/search_mcp/wrapper.sh` (renamed to GITHUB_TOKEN) and bundled hooks that need to talk to GitHub."
+    },
+    {
+      "key": "openai_api_key",
+      "scope": "shared",
+      "module_id": "user",
+      "description": "OpenAI API key for the EmbeddingService. Set via OnboardingWizard OR Preferences → Special Secrets. Resolved by hub for every project; consumed by vco_lib/embedding_service.py when ACTIVE_EMBEDDING=openai or as multi-slot fallback."
     }
   ]
 }
