@@ -23,6 +23,19 @@ flagging for early adopters and the next iteration.
       validated; the macOS path beyond `first-install.command` reaching `install.sh` is
       not. Linux is the recommended platform for v0.2.x; macOS Tier-2.
 
+- [ ] **v0.2.17 Update Orchestrator auto-restart path is verified-by-CI-only on macOS** —
+      the Rust `pid_is_alive` (using `kill(pid, 0)` + `std::io::Error::last_os_error()`),
+      `pre_pull_rename_running_binary` (Windows no-op on macOS), `sweep_stale_binary_siblings`,
+      and `restart_launcher` spawn-detached paths all compile cleanly on macOS-arm64 in CI
+      and pass cargo's link step. The cargo test suite that exercises these paths runs on
+      Linux only (CI matrix), so the macOS-specific runtime behavior of v0.2.17's
+      auto-restart flow has not been hand-verified. Risk surface: `kill(pid, 0)` semantics
+      + errno-via-`last_os_error()` are POSIX-portable and well-documented, but
+      `std::process::Command::pre_exec(setsid)` behavior across XNU + Tauri's GUI lifecycle
+      hasn't been exercised end-to-end on macOS. Expected to work; flag to retest before
+      promoting macOS off Tier-2. Windows verification is being handled separately by a
+      tester with a Windows-x64 machine.
+
 - [ ] **Launcher binary not yet code-signed (Windows + macOS)** — Windows shows SmartScreen "Windows
       protected your PC"; macOS Gatekeeper shows "damaged and can't be opened". Both are expected for
       v0.2.x. Workarounds documented in [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#first-install-issues).
