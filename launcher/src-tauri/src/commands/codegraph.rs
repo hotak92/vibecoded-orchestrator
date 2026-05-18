@@ -671,9 +671,24 @@ pub async fn get_code_graph_build_status(
 #[command]
 pub async fn rebuild_code_graph(
     project_id: String,
+    // W1+W3 wire-up / v0.2.16 (plan 1.4 — addendum H): track which
+    // UUIDs the analyzer visits this run, then delete any per-project
+    // code-graph object the analyzer DIDN'T visit. Handles the case
+    // where source files have been deleted since the previous
+    // analyze — without this, stale rows accumulate forever because
+    // _dedup_insert's replace() only upserts visited UUIDs.
+    //
+    // Default: `true` when omitted (matches plan: "wizard checkbox
+    // checked by default"). The frontend's Re-analyze button passes
+    // the wizard checkbox value; legacy frontends that don't yet
+    // pass the field still get the cleaning behaviour by default.
+    // Pass `Some(false)` explicitly to opt out (advanced users only).
+    prune_stale: Option<bool>,
     db: State<'_, Db>,
     app: AppHandle,
 ) -> Result<(), String> {
+    let prune_stale = prune_stale.unwrap_or(true);
+
     let project = db
         .get_project(&project_id)?
         .ok_or_else(|| format!("project {} not found", project_id))?;
@@ -694,10 +709,28 @@ pub async fn rebuild_code_graph(
         "code_graph_rebuild",
         Some(&project.id),
         None,
-        &serde_json::json!({ "name": project.name }),
+        &serde_json::json!({ "name": project.name, "prune_stale": prune_stale }),
     )?;
 
-    spawn_initial_build(app, project.id, project.name, project.folder_path);
+    // W3 / v0.2.16 (plan 0.9): re-analyzing a project is the most common
+    // cause of new orphan generations appearing in Weaviate (the analyzer
+    // may write to a different prefix after a project rename or
+    // sanitizer-version bump). Reset the legacy-collections wizard's
+    // dismissal flag so the next launcher boot can re-detect cleanly —
+    // otherwise a user who dismissed the wizard once is stuck never
+    // seeing it again even when fresh orphans appear. Soft-fail: a
+    // hiccup writing to app_state must NOT block the rebuild.
+    if let Err(e) = db.app_state_set_bool("legacy_codegraph_notice_dismissed", false) {
+        eprintln!(
+            "[vct] warning: failed to reset legacy_codegraph_notice_dismissed \
+             after rebuild_code_graph for {}: {}. Wizard re-detection on the \
+             next launcher boot may be suppressed until the user clicks \
+             'Re-check for legacy collections' in Preferences.",
+            project.id, e
+        );
+    }
+
+    spawn_initial_build(app, project.id, project.name, project.folder_path, prune_stale);
     Ok(())
 }
 
@@ -709,9 +742,14 @@ pub fn spawn_initial_build(
     project_id: String,
     project_name: String,
     folder_path: String,
+    // W1+W3 wire-up / v0.2.16 (plan 1.4): see `rebuild_code_graph`
+    // doc. `false` is the right default for genuinely-first builds
+    // (no pre-existing rows to prune). Re-builds set this to `true`
+    // by default; the wizard's checkbox is the user-controlled path.
+    prune_stale: bool,
 ) {
     tokio::spawn(async move {
-        run_build_task(app, project_id, project_name, folder_path).await;
+        run_build_task(app, project_id, project_name, folder_path, prune_stale).await;
     });
 }
 
@@ -788,11 +826,17 @@ pub fn resume_pending_builds(app: &AppHandle) -> (usize, usize) {
                 continue;
             }
         };
+        // Boot-resume of a pending row: we don't know whether the
+        // original rebuild_code_graph asked for prune_stale, and a
+        // resumed build is more conservative than an explicit user
+        // re-analyze action. Default to `false` so we don't prune
+        // rows the previous (interrupted) build would have visited.
         spawn_initial_build(
             app.clone(),
             project.id,
             project.name,
             project.folder_path,
+            false,
         );
         respawned += 1;
     }
@@ -830,6 +874,12 @@ async fn run_build_task(
     project_id: String,
     project_name: String,
     folder_path: String,
+    // W1+W3 wire-up / v0.2.16 (plan 1.4): when true, the analyzer
+    // subprocess is invoked with --prune-stale and will delete any
+    // per-project code-graph object it did NOT visit this run.
+    // Required for re-analyses to clean up rows for deleted source
+    // files; default false for first-time builds.
+    prune_stale: bool,
 ) {
     let started_at = chrono::Utc::now().timestamp_millis();
 
@@ -966,6 +1016,16 @@ async fn run_build_task(
     if joern_available {
         args.push("--cfg".to_string());
         args.push("--pdg".to_string());
+    }
+    // W1+W3 wire-up / v0.2.16 (plan 1.4 — addendum H): pass through
+    // the --prune-stale flag. The analyzer tracks UUIDs it visits and
+    // deletes any per-project code-graph object it did NOT visit
+    // (cleans up stale rows for source files deleted since the
+    // previous analyze). Default is `true` for rebuild_code_graph
+    // (user-driven re-analyses); false for first-time create and
+    // boot-resume to preserve conservative semantics on those paths.
+    if prune_stale {
+        args.push("--prune-stale".to_string());
     }
 
     // Resolve VCT_INSTALL_ROOT: the directory of the orchestrator

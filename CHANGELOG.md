@@ -95,6 +95,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   preserve conservative semantics. Skips with a stderr warning when
   combined with `--language` (would falsely delete other-language
   objects).
+- **`feat(wizard)` per-project poll status** (W3 / plan 0.3):
+  legacy-collections wizard now polls per-project rebuild status
+  until terminal. The kickoff counter used to read "Started 3 / 3
+  project(s)" forever because the Rust handler returns immediately
+  after spawning the analyzer subprocess; we now invoke a new
+  `get_code_graph_build_status_for_projects` Tauri command every
+  2 seconds and render a per-project row with icon + status label +
+  files-analyzed count + any error message. The wizard does NOT
+  auto-close on completion — the user can review the final
+  per-project status before dismissing.
+- **`feat(wizard)` session-scoped dismissal + Re-check button** (W3 /
+  plan 0.9): "Dismiss" button renamed to "Dismiss for now" + companion
+  auto-reset of `legacy_codegraph_notice_dismissed` on every
+  `rebuild_code_graph` invocation + new "Re-check for legacy
+  collections" button in Preferences. Together these change the
+  dismissal from "permanently suppress until manually flipped" to
+  session-scoped with multiple re-arm paths (re-analyze a project, or
+  click Preferences → Code-graph collections → Re-check). New Tauri
+  command `force_recheck_legacy_codegraph` backs the Preferences
+  button.
+
+### Changed
+
+- `commands::codegraph::rebuild_code_graph` now resets
+  `app_state[legacy_codegraph_notice_dismissed]` to `false` after
+  inserting the pending row (W3 / plan 0.9). Re-analyzing a project
+  is the most common cause of new orphan generations appearing, so
+  the wizard should re-detect on the next launcher start. Soft-fail
+  — a hiccup writing the flag is logged but does not block the
+  rebuild.
 
 ## [0.2.15] — 2026-05-17
 

@@ -533,6 +533,11 @@ pub async fn create_project_v2(
             row.id.clone(),
             row.name.clone(),
             row.folder_path.clone(),
+            // First-time builds for a freshly-created project: no
+            // pre-existing per-project code-graph rows can possibly
+            // be stale, so --prune-stale is a no-op here. Pass false
+            // explicitly to avoid the iterator-then-delete pass.
+            false,
         );
     }
 
