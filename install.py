@@ -2005,6 +2005,15 @@ def main() -> int:
                              "re-embed (the OLD behaviour, escape hatch). "
                              "Use when the source has legacy single-vector "
                              "format or you suspect vector corruption.")
+    parser.add_argument("--migrate-uuid-scheme", action="store_true", default=False,
+                        help="Stub placeholder (v0.2.16): mark the install "
+                             "manifest's code-graph uuid_scheme key for migration "
+                             "tooling. The actual migration runs as a follow-up in "
+                             "a later release. Currently a no-op beyond the "
+                             "manifest marker that --update already writes "
+                             "(uuid_scheme=\"v2\"); installs predating v0.2.16 "
+                             "have no marker, which a future migrator will read "
+                             "as \"v1\" and suggest code-graph --force-recreate.")
     parser.add_argument("--apply-deferred", action="store_true", default=False,
                         help="During --update, attempt to apply each pending entry "
                              "in .claude/context/UPDATE_DEFERRED.md. Resolved entries "
@@ -7416,6 +7425,20 @@ def _write_install_manifest(sysinfo, args, install_method: str = "install.py") -
         "gpu_mode":         gpu_mode,
         "vram_gb":          vram_gb,
         "gpu_vram_threshold_gb": vram_threshold,
+        # v0.2.16 (addendum F) — code-graph UUID-key scheme marker.
+        # "v2" indicates the analyzer (templates/scripts/analyze_code_graph.py)
+        # generates UUID5 from (project_name, file_path_relative, full_name)
+        # rather than the pre-v0.2.16 (project_name, full_name) key. Future
+        # migration tooling reads this field to decide whether existing
+        # code-graph collections need a --force-recreate rebuild.
+        #
+        # Absent on pre-v0.2.16 installs — readers MUST treat the missing
+        # field as the implicit "v1" scheme and offer the appropriate
+        # migration path (do NOT force-write "v1" here; the absence is
+        # informative). Written unconditionally on every install/update
+        # path that exercises this writer (fresh install, --update,
+        # --lightweight, --bootstrap, wizard).
+        "uuid_scheme":      "v2",
     }
 
     try:
