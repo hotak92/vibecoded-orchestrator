@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`fix(hook)` post-tool-security smoke-test marker rename**: the
+  prior smoke-test sentinel in
+  `templates/hooks/post-tool-security.{sh,ps1}` was a common-English-
+  looking bare-word token that matched a legitimate CHANGELOG
+  release-note entry documenting the marker itself, so every CHANGELOG
+  edit triggered a false-positive "Possible credential" alert. The
+  sentinel is now a VCT-prefixed, `_PROBE`-suffixed identifier with a
+  6-char random hex tail — unique enough that it cannot accidentally
+  appear in docs or prose. See the hook source for the actual literal
+  (intentionally not quoted here to prevent the same release-note
+  collision recurring). The simple bare-pattern check is preserved (no
+  regex loosening). No external test fixtures referenced the old name.
 - **Code-graph analyzer integrity** (W1 / plan 0.1 + 0.2 + 0.7 + 0.8
   + addendum D + 1.4/H). Five silent-correctness bugs in
   `templates/scripts/analyze_code_graph.py` that combined to make

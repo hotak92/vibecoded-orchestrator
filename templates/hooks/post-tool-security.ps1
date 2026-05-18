@@ -44,16 +44,20 @@ if (-not (Test-Path $AlertDir)) {
 if (-not $EditedFile -or -not (Test-Path -LiteralPath $EditedFile -PathType Leaf)) { exit 0 }
 
 # Credential patterns mirrored from post-tool-security.sh.
-# `Hook leak-test marker` (LEAK_TEST_KEY) is a smoke-test marker — keeps
-# fixture credentials non-real-looking; users seeing this alert know
-# it's a test, not a real leak.
+# `Hook leak-test marker` (VCT_HOOK_LEAK_PROBE_a3f7c2) is a smoke-test
+# marker — keeps fixture credentials non-real-looking; users seeing
+# this alert know it's a test, not a real leak. Previously the marker
+# was the bare word LEAK_TEST_KEY; renamed 2026-05-18 because the
+# common-English-looking token tripped on a legitimate CHANGELOG
+# release-note entry. The new sentinel ends in a 6-char random hex
+# (a3f7c2) so it cannot accidentally appear in docs or prose.
 $patterns = @(
     @{ Label = "Anthropic/OpenAI API key"; Re = 'sk-(ant-api03|[a-zA-Z0-9]{30,})-[a-zA-Z0-9]' },
     @{ Label = "AWS access key";          Re = 'AKIA[A-Z0-9]{16}' },
     @{ Label = "GitHub token";            Re = 'gh[pousr]_[a-zA-Z0-9]{36}' },
     @{ Label = "PEM private key";         Re = 'BEGIN (RSA |EC |OPENSSH |)PRIVATE KEY' },
     @{ Label = "Generic secret";          Re = '(SECRET|API_KEY|ACCESS_TOKEN|PRIVATE_KEY)\s*[:=]\s*["''][a-zA-Z0-9+/=_\-]{32,}' },
-    @{ Label = "Hook leak-test marker";   Re = 'LEAK_TEST_KEY' }
+    @{ Label = "Hook leak-test marker";   Re = 'VCT_HOOK_LEAK_PROBE_a3f7c2' }
 )
 
 $content = $null
@@ -66,15 +70,16 @@ foreach ($p in $patterns) {
 
 if ($alerts.Count -gt 0) {
     $base = Split-Path $EditedFile -Leaf
-    # Test-mode: smoke tests set $env:LEAK_TEST_KEY OR include the
-    # literal string "LEAK_TEST_KEY" in the test fixture. Suppress the
-    # desktop notify, JSONL log, and model envelope; tests harvest
-    # stdout directly. Real production alerts are unaffected.
+    # Test-mode: smoke tests set $env:VCT_HOOK_LEAK_PROBE OR include
+    # the literal sentinel "VCT_HOOK_LEAK_PROBE_a3f7c2" in the test
+    # fixture. Suppress the desktop notify, JSONL log, and model
+    # envelope; tests harvest stdout directly. Real production alerts
+    # are unaffected. (Sentinel renamed 2026-05-18; see pattern table.)
     $isLeakTest = $false
-    if ($env:LEAK_TEST_KEY) { $isLeakTest = $true }
+    if ($env:VCT_HOOK_LEAK_PROBE) { $isLeakTest = $true }
     if (-not $isLeakTest) {
         try {
-            if ($content -match 'LEAK_TEST_KEY') { $isLeakTest = $true }
+            if ($content -match 'VCT_HOOK_LEAK_PROBE_a3f7c2') { $isLeakTest = $true }
         } catch { }
     }
     if ($isLeakTest) {
