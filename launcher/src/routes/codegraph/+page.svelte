@@ -44,8 +44,15 @@
     }
     loading = true;
     try {
+      // v0.2.16 (W4 / 0.11): pass include_untracked_projects=false so
+      // the dashboard hides collections whose prefix doesn't map to a
+      // currently-tracked project (data from since-deleted projects
+      // stays in Weaviate but isn't visually cluttering this view).
+      // The advanced /preferences/weaviate-untracked route surfaces
+      // the full inventory.
       summaries = await invoke<CodegraphProjectSummary[]>('codegraph_list_projects', {
         projectId: acting.id,
+        includeUntrackedProjects: false,
       });
     } catch (e) {
       toast.error(e);
