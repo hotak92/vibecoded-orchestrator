@@ -125,6 +125,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the wizard should re-detect on the next launcher start. Soft-fail
   — a hiccup writing the flag is logged but does not block the
   rebuild.
+- `check_for_updates` now returns a full `UpdateStatus` struct (W4 /
+  plan 0.5) replacing the legacy `bool` with three independent flags:
+  - `remote_ahead` — local git branch behind `origin/main` (resolves
+    via `update_orchestrator`: git pull + install.py --update).
+  - `install_stale` — `vct-module.json::version` ahead of
+    `state/install-manifest.json::version` (resolves via
+    `apply_pending_install`).
+  - `binary_stale` — running launcher version differs from
+    `launcher/dist/<arch>/vct-launcher.metadata.json::launcher_version`
+    on disk (resolves via `restart_launcher`).
+- `UpdateBadge.svelte` renders one state at a time in priority order
+  (W4 / plan 0.5): `binary_stale` > `install_stale` > `remote_ahead`,
+  each wired to the correct resolver. v0.2.15 shipped the
+  binary-restart half via `LauncherRestartBanner` but the
+  install-stale path was missing — visible install-was-out-of-sync
+  for 24+ hours after a manual `git pull` with no UI signal.
+- `list_legacy_codegraph_collections` and `codegraph_list_projects`
+  accept a new `include_untracked_projects: Option<bool>` parameter
+  (default `false`) (W4 / plan 0.11). The GUI legacy-collections
+  wizard + Code Graph dashboard now filter Weaviate collections by
+  currently-tracked projects, hiding dead-project leftovers
+  (`MediaLibrary_*`, `ARTup_*`, `Agape_*`, etc.). Data stays in
+  Weaviate for potential re-import; the advanced
+  `/preferences/weaviate-untracked` route surfaces the full
+  inventory.
+
+### Added (continued)
+
+- **`feat(launcher)` apply_pending_install Tauri command** (W4 / plan
+  0.5): resolves the "Pulled-but-not-installed" banner state by
+  running `install.py --update` against the existing install root
+  WITHOUT a preceding `git pull`. Distinct from `update_orchestrator`
+  (which does both) so manual `git pull` workflows don't waste ~30s
+  pulling an already-current source tree.
+- **`feat(launcher)` /preferences/weaviate-untracked advanced route**
+  (W4 / plan 0.11): surfaces the full Weaviate code-graph collection
+  inventory, including prefixes whose project is no longer registered
+  with the launcher. Each row exposes a per-prefix delete affordance.
+  Reachable from Preferences → "Show untracked Weaviate collections".
 
 ## [0.2.15] — 2026-05-17
 

@@ -81,7 +81,13 @@
   async function load() {
     loading = true;
     try {
-      report = await invoke<LegacyCodegraphReport>('list_legacy_codegraph_collections');
+      // v0.2.16 (W4 / 0.11): pass include_untracked_projects=false
+      // explicitly. The wizard's clean view should only surface orphans
+      // for currently-tracked projects; data from since-deleted projects
+      // is only visible via /preferences/weaviate-untracked.
+      report = await invoke<LegacyCodegraphReport>('list_legacy_codegraph_collections', {
+        includeUntrackedProjects: false,
+      });
     } catch (e) {
       toast.error(e);
     } finally {

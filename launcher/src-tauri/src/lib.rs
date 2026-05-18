@@ -860,6 +860,14 @@ pub fn run() {
             commands::storage_ux::migrate_to_named_volume,
             commands::storage_ux::migrate_to_bind_path,
             commands::installer::update_orchestrator,
+            // v0.2.16 (W4 / 0.5): apply_pending_install resolves the
+            // "Pulled-but-not-installed" banner state (source updated
+            // via `git pull` outside the launcher; install-manifest
+            // still records the previous version). Runs install.py
+            // --update WITHOUT a preceding git pull. Distinct from
+            // update_orchestrator (git pull + install) so we don't
+            // waste ~30s pulling an already-current source tree.
+            commands::installer::apply_pending_install,
             commands::installer::get_local_repo_source,
             commands::installer::inspect_orchestrator_at,
             commands::installer::inspect_project_leftovers,

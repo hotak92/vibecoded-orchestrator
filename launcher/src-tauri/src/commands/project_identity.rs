@@ -551,11 +551,23 @@ pub struct OrphanCollectionGroup {
 /// report that drives the one-time "VCO 0.2.11 fixed a code-graph naming
 /// bug" notification. The notification only fires when `action_recommended`
 /// is true; the report itself is safe to call any time.
+///
+/// v0.2.16 (W4 / 0.11): `include_untracked_projects` controls whether
+/// collections whose prefix doesn't map to a currently-tracked project
+/// appear in the report. The GUI default is `Some(false)` — clean
+/// view, only orphans of currently-tracked projects surface in the
+/// wizard. The advanced /preferences/weaviate-untracked route passes
+/// `Some(true)` to see the full inventory (data from since-deleted
+/// projects, ad-hoc analyses, etc). Defaulting to `Some(false)` keeps
+/// pre-v0.2.16 callers (frontend code that doesn't pass the param)
+/// on the clean view automatically.
 #[command]
 pub async fn list_legacy_codegraph_collections(
     db: State<'_, Db>,
     cfg: State<'_, LocalConfig>,
+    include_untracked_projects: Option<bool>,
 ) -> Result<LegacyCodegraphReport, String> {
+    let include_untracked = include_untracked_projects.unwrap_or(false);
     let base = resolve_weaviate_url(&cfg);
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -691,10 +703,12 @@ pub async fn list_legacy_codegraph_collections(
 
     // v0.2.15 (0.4): build orphan groups. For each orphan prefix found
     // in Weaviate, attempt to attribute it to a known project via the
-    // case-insensitive normalised-name match. Prefixes that don't match
-    // any project are skipped (they may belong to a since-removed
-    // project or be unrelated — never auto-delete those without explicit
-    // user input via a different surface).
+    // case-insensitive normalised-name match.
+    //
+    // v0.2.16 (W4 / 0.11): unmatched prefixes (no current project owns
+    // them) are surfaced as "untracked" groups ONLY when
+    // `include_untracked == true`. Default (false) keeps the wizard's
+    // visual clutter down by hiding data from since-deleted projects.
     let mut orphan_groups: Vec<OrphanCollectionGroup> = Vec::new();
     for (prefix, entries) in code_graph_by_prefix {
         // Skip prefixes that exactly match SOME project's current
@@ -715,7 +729,22 @@ pub async fn list_legacy_codegraph_collections(
         });
         let (matched_id, matched_name, current_prefix) = match matched {
             Some((id, name, current)) => (id.clone(), name.clone(), current.clone()),
-            None => continue,  // no project owns this prefix → don't surface
+            None => {
+                if include_untracked {
+                    // Untracked-projects view: surface the prefix with
+                    // empty matched_* / current_prefix fields. The
+                    // advanced page displays these as "no project
+                    // currently linked".
+                    (
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                    )
+                } else {
+                    // Default GUI behaviour: hide untracked prefixes.
+                    continue;
+                }
+            }
         };
         let total: u32 = entries.iter().map(|e| e.object_count).sum();
         orphan_groups.push(OrphanCollectionGroup {

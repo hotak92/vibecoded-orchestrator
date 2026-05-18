@@ -428,6 +428,25 @@
           Open
         </button>
       </div>
+      <!-- v0.2.16 (W4 / 0.11): advanced view of Weaviate code-graph
+           inventory, including prefixes whose project is no longer
+           registered. GUI defaults hide these; surfaced here for
+           clean-up + diagnostics. -->
+      <div class="pr-onboarding-row">
+        <div class="pr-onboarding-text">
+          <strong>Show untracked Weaviate collections</strong>
+          <span class="pr-onboarding-hint">
+            Full inventory of code-graph data including dead-project
+            leftovers (collections whose prefix no longer matches a
+            registered project). Day-to-day surfaces hide these for
+            clarity — open this view to clean them up or reference them
+            before re-importing the project.
+          </span>
+        </div>
+        <button class="pr-btn" onclick={() => goto('/preferences/weaviate-untracked')}>
+          Open
+        </button>
+      </div>
     </section>
 
     <!-- Secrets (PR-4, v0.2.11). Cross-cutting OS-keychain manager;
