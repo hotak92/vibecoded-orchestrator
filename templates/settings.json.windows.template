@@ -76,6 +76,11 @@
           },
           {
             "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\embedding-failures-surface.ps1",
+            "timeout": 3
+          },
+          {
+            "type": "command",
             "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\context-size-check.ps1",
             "timeout": 2
           }

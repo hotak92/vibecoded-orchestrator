@@ -254,6 +254,7 @@ class NoEmbeddingBackendError(RuntimeError):
         if capture:
             _write_failure_jsonl(self)
             _write_failure_markdown(self)
+            _write_failure_deferral(self)
 
 
 # ---------------------------------------------------------------------------
@@ -409,6 +410,112 @@ def _clear_failure_markdown(install_root: Path | None) -> None:
         path.unlink()
     except OSError as e:
         logger.debug("Failed to clear embedding failure markdown: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Deferral integration (v0.2.18 Commit 11 / observability)
+#
+# Reuses the existing DeferralReport / UPDATE_DEFERRED.md mechanism so the
+# failure shows up on the launcher's GUI deferral banner alongside any
+# other unresolved install actions. The launcher reads UPDATE_DEFERRED.md
+# and surfaces the same condition_id; CLAUDE.md gets a wrapped reminder
+# block injected automatically via DeferralReport.write().
+#
+# Soft-fail throughout — deferral_report is part of vco_lib but the import
+# is local to the function so a circular-import or partial-install state
+# can't break the embedding failure path (we're already in a failure
+# branch; don't compound it).
+# ---------------------------------------------------------------------------
+
+_DEFERRAL_CONDITION_ID = "kg_summary_no_backend"
+
+
+def _write_failure_deferral(exc: "NoEmbeddingBackendError") -> None:
+    """Write/refresh a ``kg_summary_no_backend`` entry in UPDATE_DEFERRED.md.
+
+    The entry points at the JSONL log + the .md hint and lists the exact
+    backends probed. This is the third surface (alongside the JSONL log
+    + the EMBEDDING_FAILURES.md hint) so the GUI deferral banner can pick
+    up the failure without reading our private files.
+
+    Skips when ``install_root`` is None (no project to write into).
+    Soft-fail on any error — never propagates.
+    """
+    if exc.install_root is None:
+        return
+    try:
+        # Local import: avoid circular-import risk if deferral_report ever
+        # imports from embedding_service (it doesn't today, but the import
+        # is cheap and the safety margin is worth it on the error path).
+        from vco_lib.deferral_report import DeferralEntry, DeferralReport
+
+        report = DeferralReport.read(exc.install_root)
+        backends = ", ".join(exc.attempted_backends) or "(none)"
+        per_backend_lines: list[str] = []
+        for backend, msg in sorted(exc.error_per_backend.items()):
+            per_backend_lines.append(f"- {backend}: {msg}")
+        per_backend_block = "\n".join(per_backend_lines) or "(no per-backend errors recorded)"
+
+        detected = (
+            f"EmbeddingService.for_project() found no reachable backend. "
+            f"Backends probed: {backends}. "
+            f"Per-backend errors: {per_backend_block}"
+        )
+        why_deferred = (
+            "Cannot auto-fix: the user must bring up a local backend "
+            "(Ollama / CodeEmbed) or configure OPENAI_API_KEY. KG syncs "
+            "and code-graph indexing that require fresh vectors are "
+            "blocked until at least one backend comes back online."
+        )
+        command_to_apply = (
+            "bash claude_mcp_servers/start-all.sh   "
+            "# OR: launch Ollama via podman/docker, OR: set OPENAI_API_KEY"
+        )
+        hint_md = _failure_markdown_path(exc.install_root)
+        kg_refs: list[str] = []
+        if hint_md is not None:
+            try:
+                kg_refs.append(str(hint_md.relative_to(exc.install_root)))
+            except ValueError:
+                kg_refs.append(str(hint_md))
+        kg_refs.append(str(_failure_jsonl_path()))
+
+        report.add_entry(
+            DeferralEntry(
+                condition_id=_DEFERRAL_CONDITION_ID,
+                title="Embedding backend unreachable; KG seed deferred",
+                detected=detected,
+                why_deferred=why_deferred,
+                command_to_apply=command_to_apply,
+                severity="warning",
+                kg_node_refs=kg_refs,
+            )
+        )
+        report.write(exc.install_root)
+    except Exception as e:  # noqa: BLE001 — soft-fail on the error path
+        logger.warning("Failed to write embedding failure deferral entry: %s", e)
+
+
+def _clear_failure_deferral(install_root: Path | None) -> None:
+    """Mark the ``kg_summary_no_backend`` entry resolved (paired with success).
+
+    No-op if there's no deferral file or no matching entry. Soft-fail.
+    """
+    if install_root is None:
+        return
+    try:
+        from vco_lib.deferral_report import DeferralReport
+
+        report = DeferralReport.read(install_root)
+        # mark_resolved is a no-op when the entry isn't present, so this
+        # is safe to call unconditionally.
+        existing_ids = {e.condition_id for e in report.entries}
+        if _DEFERRAL_CONDITION_ID not in existing_ids:
+            return
+        report.mark_resolved(_DEFERRAL_CONDITION_ID)
+        report.write(install_root)
+    except Exception as e:  # noqa: BLE001 — soft-fail; success path must not fail
+        logger.debug("Failed to clear embedding failure deferral entry: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -609,8 +716,9 @@ class EmbeddingService:
                 env_snapshot=_redacted_env_snapshot(),
             )
 
-        # Success — clear any stale failure markdown.
+        # Success — clear any stale failure markdown + deferral entry.
         _clear_failure_markdown(resolved_root)
+        _clear_failure_deferral(resolved_root)
         return svc
 
     def _collect_backend_errors(self) -> dict[str, str]:

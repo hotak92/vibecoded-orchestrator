@@ -76,6 +76,11 @@
           },
           {
             "type": "command",
+            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/embedding-failures-surface.sh",
+            "timeout": 3
+          },
+          {
+            "type": "command",
             "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/context-size-check.sh",
             "timeout": 2
           }

@@ -925,6 +925,140 @@ class FailureCaptureTests(unittest.TestCase):
                     finally:
                         svc.close()
 
+    # ------------------------------------------------------------------
+    # v0.2.18 Commit 11 (observability): UPDATE_DEFERRED.md integration
+    # ------------------------------------------------------------------
+
+    def test_failure_writes_deferral_entry(self):
+        """The failure-capture path writes a kg_summary_no_backend entry to
+        UPDATE_DEFERRED.md alongside the JSONL + MD hint, so the launcher's
+        GUI banner picks up the failure."""
+        with _EnvIsolation():
+            import tempfile
+            with tempfile.TemporaryDirectory() as proj_dir:
+                proj_root = Path(proj_dir)
+                with tempfile.TemporaryDirectory() as home_dir:
+                    fake_home = Path(home_dir)
+                    with patch("vco_lib.embedding_service.Path.home", return_value=fake_home):
+                        NoEmbeddingBackendError(
+                            "no backends",
+                            attempted_backends=["ollama", "codeembed"],
+                            error_per_backend={
+                                "ollama": "connection refused",
+                                "codeembed": "service not running",
+                            },
+                            install_root=proj_root,
+                        )
+                        deferral = proj_root / ".claude" / "context" / "UPDATE_DEFERRED.md"
+                        self.assertTrue(deferral.exists(), f"missing: {deferral}")
+                        content = deferral.read_text(encoding="utf-8")
+                        self.assertIn("kg_summary_no_backend", content)
+                        self.assertIn("ollama", content)
+                        self.assertIn("codeembed", content)
+                        # The frontmatter must list the condition_id so
+                        # downstream parsers (launcher GUI) can pick it up.
+                        self.assertIn("condition_ids:", content)
+
+    def test_failure_deferral_skipped_without_install_root(self):
+        """Module-level discovery failures (install_root=None) must not try
+        to write a deferral — there's no project root to write into."""
+        with _EnvIsolation():
+            import tempfile
+            with tempfile.TemporaryDirectory() as home_dir:
+                fake_home = Path(home_dir)
+                with patch("vco_lib.embedding_service.Path.home", return_value=fake_home):
+                    # Should not raise even without install_root.
+                    exc = NoEmbeddingBackendError(
+                        "discovery failure",
+                        attempted_backends=["ollama"],
+                        error_per_backend={"ollama": "down"},
+                        install_root=None,
+                    )
+                    self.assertIsNone(exc.install_root)
+
+    def test_success_clears_deferral_entry(self):
+        """A successful EmbeddingService.for_project() must clear a stale
+        kg_summary_no_backend entry from UPDATE_DEFERRED.md so the launcher
+        banner doesn't stay red after the user fixes the backend."""
+        with _EnvIsolation(), patch.dict(os.environ, {}, clear=False):
+            import tempfile
+            with tempfile.TemporaryDirectory() as proj_dir:
+                proj_root = Path(proj_dir)
+                with tempfile.TemporaryDirectory() as home_dir:
+                    fake_home = Path(home_dir)
+                    with patch("vco_lib.embedding_service.Path.home", return_value=fake_home):
+                        # Plant a stale deferral via the failure-capture path.
+                        NoEmbeddingBackendError(
+                            "test failure",
+                            attempted_backends=["ollama"],
+                            error_per_backend={"ollama": "stale"},
+                            install_root=proj_root,
+                        )
+                        deferral = proj_root / ".claude" / "context" / "UPDATE_DEFERRED.md"
+                        self.assertTrue(deferral.exists())
+
+                        # Now simulate a successful construction.
+                        ollama_m = MagicMock(spec=OllamaAdapter)
+                        ollama_m.is_reachable.return_value = True
+                        ollama_m.list_embedding_models.return_value = []
+                        code_m = MagicMock(spec=CodeEmbedAdapter)
+                        code_m.is_reachable.return_value = True
+                        oa_m = MagicMock(spec=OpenAIAdapter)
+                        oa_m.validate.return_value = ValidationResult(valid=True)
+                        with patch("vco_lib.embedding_service.OllamaAdapter", return_value=ollama_m), \
+                             patch("vco_lib.embedding_service.CodeEmbedAdapter", return_value=code_m), \
+                             patch("vco_lib.embedding_service.OpenAIAdapter", return_value=oa_m):
+                            svc = EmbeddingService.for_project(project_root=proj_root)
+                            try:
+                                # The deferral entry must be cleared. The file
+                                # itself may be deleted (entries empty) OR
+                                # rewritten without our condition_id.
+                                if deferral.exists():
+                                    content = deferral.read_text(encoding="utf-8")
+                                    self.assertNotIn(
+                                        "kg_summary_no_backend",
+                                        content,
+                                        "deferral entry must be removed on success",
+                                    )
+                            finally:
+                                svc.close()
+
+    def test_failure_deferral_soft_fail_on_import_error(self):
+        """If deferral_report can't be imported (partial install), the
+        failure-capture path must still complete — JSONL + MD must still
+        be written."""
+        with _EnvIsolation():
+            import tempfile
+            with tempfile.TemporaryDirectory() as proj_dir:
+                proj_root = Path(proj_dir)
+                with tempfile.TemporaryDirectory() as home_dir:
+                    fake_home = Path(home_dir)
+                    with patch("vco_lib.embedding_service.Path.home", return_value=fake_home), \
+                         patch(
+                             "vco_lib.embedding_service._write_failure_deferral",
+                             side_effect=RuntimeError("simulated deferral failure"),
+                         ):
+                        # Even if _write_failure_deferral raises, the JSONL
+                        # + MD writes must succeed (those happen first).
+                        try:
+                            NoEmbeddingBackendError(
+                                "test",
+                                attempted_backends=["ollama"],
+                                error_per_backend={"ollama": "down"},
+                                install_root=proj_root,
+                            )
+                        except RuntimeError:
+                            # The current contract is "soft-fail inside
+                            # _write_failure_deferral"; if a caller decides
+                            # to patch it to raise, that's their choice.
+                            # We assert JSONL + MD were written before the
+                            # deferral attempt.
+                            pass
+                        jsonl = fake_home / ".claude" / "metrics" / "embedding_failures.jsonl"
+                        md = proj_root / ".claude" / "context" / "EMBEDDING_FAILURES.md"
+                        self.assertTrue(jsonl.exists(), "JSONL must be written first")
+                        self.assertTrue(md.exists(), "MD hint must be written second")
+
 
 # ---------------------------------------------------------------------------
 # EmbeddingService — methods (single, batch, multi-slot, context manager)
