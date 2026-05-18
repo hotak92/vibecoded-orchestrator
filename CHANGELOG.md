@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (v0.2.16 — Worktree W1: analyzer integrity)
+
+Five silent-correctness bugs in `templates/scripts/analyze_code_graph.py`
+that combined to make the analyzer report success while producing
+incomplete or empty per-project code-graph collections. Edit target is
+the canonical `templates/scripts/` (the installer renders into each
+project's `.claude/scripts/` on `install.py --update`).
+
+- **0.1 `_dedup_insert` now actually idempotent**: switched the internal
+  call from `collection.data.insert(uuid=...)` (POST-only — raises 422
+  on the second run with the same UUID) to `collection.data.replace()`
+  (PUT-upsert — idempotent by contract). The previous behaviour
+  swallowed every re-run collision in the outer per-file try/except,
+  silently flagging files as "skipped" and exiting 0; the wizard then
+  rendered green-toast success while most objects never landed. All 25
+  call sites benefit from the single internal change.
+- **0.7 UUID identity-key includes file path**: `_deterministic_uuid`
+  signature is now `(project, file_path_rel, full_name)`. Two
+  genuinely-different files defining the same `module-stem.symbol`
+  (e.g. `server.handler` in `claude_mcp_servers/weaviate_mcp/server.py`
+  AND `docs/research/probes/server.py`) no longer collide on the same
+  UUID. Cross-OS contract: callers pass `Path(...).as_posix()` so
+  Windows backslashes don't produce different UUIDs from the same file.
+  All 11 per-language `_analyze_*_file` methods normalise
+  `relative_path` via `.as_posix()` before threading it through.
+- **0.8 NameError on `class_uuid` in `_extract_class`**: the
+  `self._dedup_insert(...)` call's return value was discarded and the
+  next line referenced an unbound `class_uuid`. Every Python file
+  containing a class hit a `NameError` that the outer try/except
+  swallowed into `files_skipped`. Fixed by capturing the return:
+  `class_uuid = self._dedup_insert(...)`.
+- **0.2 non-zero exit code on insert failures**: `stats['insert_errors']`
+  now tracks per-file write-to-Weaviate failures separately from
+  generic parse/IO errors via the new `_DedupInsertError` wrapper.
+  `main()` returns exit code `3` (`E_NO_FILES_INDEXED`) when no files
+  succeeded, `4` (`E_PARTIAL_INSERT_FAILURES`) when at least one insert
+  failed. Launcher's `rebuild_code_graph` IPC can now surface warning
+  toasts instead of silent success.
+- **Addendum D worktree-skip + ignore_dirs refactor**: module-level
+  `_COMMON_IGNORE_DIRS` frozenset + `_ignore_dirs_for(language)` helper
+  replaces 11 near-duplicate inline sets. Adds `"worktrees"` — skips
+  `.claude/worktrees/agent-<hex>/` git-worktree clones that would
+  otherwise be re-analyzed alongside the main repo.
+- **1.4 / addendum H `--prune-stale` flag**: opt-in tracking of every
+  UUID visited during the analyze run; at end, every per-project
+  collection's foreign UUIDs are deleted. Closes the "shrunken codebase
+  leaves orphan rows" gap that switching to `replace()` upsert
+  semantics would otherwise create. Skips with a stderr warning when
+  combined with `--language` (would falsely delete other-language
+  objects).
+
+Tests added: `tests/test_analyze_code_graph_v0_2_16.py` (9 tests, all
+pure-Python unit tests against the analyzer module — no Weaviate
+required). Existing `tests/test_analyze_code_graph_retry_cap.py` still
+passes against a live Weaviate.
+
 ## [0.2.15] — 2026-05-17
 
 Codegraph-wedge release. v0.2.14's testing on the maintainer machine
