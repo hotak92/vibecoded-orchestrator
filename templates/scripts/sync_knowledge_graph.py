@@ -1256,7 +1256,7 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
         existing = collection.query.fetch_objects(
             filters=where_filter,
             limit=100,
-            return_properties=["content_hash", "chunk_num"],
+            return_properties=["content_hash", "chunk_num", "total_chunks"],
         )
 
         # v0.2.17 (plan 0.2): EMBED-SKIP fast path. If every existing
@@ -1267,25 +1267,38 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
         # of Ollama embed calls + Weaviate roundtrips per re-sync
         # pass when content is unchanged.
         #
-        # Conservative gating: skip ONLY when ALL existing objects'
-        # content_hash matches AND at least one is non-empty (empty
-        # hash = pre-v0.2.17 object that was never tagged; re-embed
-        # to populate the field). If anything looks off, fall
+        # Conservative gating (Reviewer A finding E2 + original
+        # design): skip ONLY when ALL existing objects' content_hash
+        # matches AND at least one is non-empty AND the count of
+        # existing objects matches the `total_chunks` recorded on
+        # each (so a previous crash mid-chunk-write — leaving e.g.
+        # 3/4 chunks with the new hash — does NOT cause a permanent
+        # skip with missing chunk 4). If anything looks off, fall
         # through to the delete-and-re-embed path. Soft-fail: any
         # exception here also falls through.
         try:
-            existing_hashes = [
-                getattr(obj.properties, "get", lambda _k, _d=None: _d)(
-                    "content_hash", ""
-                )
-                if hasattr(obj.properties, "get")
-                else obj.properties.get("content_hash", "")
-                for obj in existing.objects
-            ]
+            existing_hashes: List[str] = []
+            existing_total_chunks: List[int] = []
+            for obj in existing.objects:
+                props = obj.properties or {}
+                existing_hashes.append(props.get("content_hash", "") or "")
+                # total_chunks may be int OR (legacy) missing/None.
+                # Treat missing as 0 → forces fall-through.
+                tc = props.get("total_chunks", 0)
+                try:
+                    existing_total_chunks.append(int(tc) if tc is not None else 0)
+                except (TypeError, ValueError):
+                    existing_total_chunks.append(0)
+
+            chunk_count_ok = (
+                len(existing_total_chunks) > 0
+                and all(tc == len(existing_total_chunks) for tc in existing_total_chunks)
+            )
             all_match = (
                 len(existing_hashes) > 0
                 and all(h == current_content_hash for h in existing_hashes)
                 and all(h for h in existing_hashes)  # no empty strings
+                and chunk_count_ok
             )
             if all_match:
                 elapsed = time.time() - start_time

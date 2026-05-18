@@ -8853,10 +8853,21 @@ def _maybe_emit_running_stale_deferral(
     if not source_version or not last_installed_version:
         # Can't compare — bail silently. Manifest absence is also a
         # legitimate "fresh install" case where no restart applies.
-        return
+        # EXCEPTION: VCT_FORCE_RESTART_DEFERRAL=1 (set by the Rust
+        # auto-restart fallback path, v0.2.17 Reviewer A finding A2)
+        # bypasses this guard so the deferral lands even when the
+        # manifest is unreadable.
+        if os.environ.get("VCT_FORCE_RESTART_DEFERRAL", "").strip() != "1":
+            return
     if source_version == last_installed_version:
-        # No version change — nothing to defer
-        return
+        # No version change — nothing to defer.
+        # EXCEPTION: VCT_FORCE_RESTART_DEFERRAL=1 forces the emit so
+        # the auto-restart-failed fallback can land the deferral even
+        # though the FIRST install.py pass already bumped the
+        # manifest to match the source (making the version-equality
+        # check skip otherwise).
+        if os.environ.get("VCT_FORCE_RESTART_DEFERRAL", "").strip() != "1":
+            return
 
     old_pid_str = os.environ.get("VCT_LAUNCHER_PID", "").strip()
     if not old_pid_str:
@@ -8960,10 +8971,11 @@ def _refresh_dist_binary_after_rebuild(
     # was never emitted, and the launcher's banner stayed silent
     # while the on-disk binary diverged from the running PID's binary.
     #
-    # Fix: before the cargo-output check, detect dist-vs-running
-    # divergence and emit the deferral if needed. The cargo-output
-    # check below still runs as the secondary path (maintainer
-    # local-build scenario).
+    # Fix: detect dist-vs-running divergence and emit the deferral
+    # if needed. Runs ONLY when the cargo-output secondary path is
+    # NOT going to fire (Reviewer A finding A3: avoid double-emit
+    # and the wasted `_query_launcher_version` subprocess call
+    # against an about-to-be-overwritten binary).
     subdir, fname = _launcher_binary_relative_path()
     dist_dir = install_root / "launcher" / "dist" / subdir
     dist_path = dist_dir / fname
@@ -8977,13 +8989,6 @@ def _refresh_dist_binary_after_rebuild(
         os.environ.get("VCT_AUTO_RESTART_LAUNCHER", "").strip() == "1"
     )
 
-    if not auto_restart_handled_externally:
-        _maybe_emit_running_stale_deferral(
-            install_root,
-            dist_path=dist_path,
-            deferral_report=deferral_report,
-        )
-
     src = (
         install_root
         / "launcher"
@@ -8992,7 +8997,18 @@ def _refresh_dist_binary_after_rebuild(
         / "release"
         / "vct-launcher-temp"
     )
+    # A3: mutually-exclusive routing. If the cargo-output path is
+    # going to run (src exists), it will emit the deferral itself
+    # after the swap. Skip the git-pull-case helper here. If src
+    # doesn't exist, the cargo path returns None below — the git-
+    # pull helper is the ONLY emit source.
     if not src.is_file():
+        if not auto_restart_handled_externally:
+            _maybe_emit_running_stale_deferral(
+                install_root,
+                dist_path=dist_path,
+                deferral_report=deferral_report,
+            )
         return None
 
     # subdir/fname/dist_path already resolved at the top of this

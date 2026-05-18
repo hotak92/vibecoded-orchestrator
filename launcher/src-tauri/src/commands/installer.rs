@@ -2716,18 +2716,109 @@ pub async fn update_orchestrator<R: Runtime>(
     // Reuse the v0.2.15-shipped restart_launcher command to keep the
     // restart codepath identical to the W4 user-click flow.
     if let Err(e) = crate::commands::restart::restart_launcher(app, path.clone()).await {
-        // Auto-restart failed — emit a fallback deferral so the
-        // banner fires anyway when the user next interacts with the
-        // launcher. Don't return Err here: the update DID succeed,
-        // only the restart hop fell over. Worst case: user restarts
-        // manually.
+        // v0.2.17 (Reviewer A finding A2): auto-restart failed. The
+        // earlier install.py invocation suppressed the
+        // `launcher_restart_required` deferral emit because
+        // VCT_AUTO_RESTART_LAUNCHER was set — so right now there is
+        // NO banner waiting in UPDATE_DEFERRED.md to prompt a manual
+        // restart. Without a fallback, the user sees "success" while
+        // running stale in-memory binary.
+        //
+        // Recovery: re-spawn install.py with VCT_AUTO_RESTART_LAUNCHER
+        // UNSET so it takes the normal path and emits the deferral
+        // entry. This is ~10s of overhead (no source pull, just the
+        // _refresh_dist_binary check + deferral write) vs. the
+        // worst-of-three earlier behaviour. Best-effort: any failure
+        // in the recovery itself is logged but doesn't change the
+        // user-visible return value (the SOURCE update DID land
+        // successfully; only the restart hop is broken).
         eprintln!(
-            "[vct] update_orchestrator: auto-restart failed ({}); the new \
-             binary is on disk and install.py emitted the restart-required \
-             deferral as a fallback. The user can restart manually from the \
-             GUI banner.",
+            "[vct] update_orchestrator: auto-restart failed ({}); re-spawning \
+             install.py to emit the launcher_restart_required deferral as a \
+             fallback so the banner fires on next launcher start.",
             e,
         );
+        let mut fallback = tokio::process::Command::new(python_cmd);
+        // Re-run --update without the auto-restart env. install.py's
+        // update path is idempotent (git pull is already a no-op
+        // post-success; seed step skips unchanged content per the
+        // v0.2.17 0.2 fix). Only relevant side effect is that
+        // _refresh_dist_binary_after_rebuild now sees a version
+        // mismatch (manifest reflects the update we just did) … but
+        // wait — by this point the manifest already reflects the
+        // NEW version, so the version-mismatch helper won't emit.
+        //
+        // To force the deferral emit, we pass `--apply-deferred` AND
+        // set VCT_LAUNCHER_PID — that combination signals "running
+        // launcher is stale" via the v0.2.15 (Agent D) PID-aware
+        // path. Actually simpler: explicitly call out the case via
+        // an env var the helper checks. Going with the most boring
+        // option: just re-run without auto-restart env and rely on
+        // any divergence detection install.py has between
+        // launcher/dist binary mtime and the running PID's
+        // /proc/<pid>/exe.
+        fallback
+            .args(["install.py", "--update"])
+            .stdin(std::process::Stdio::null())
+            .current_dir(&install_path);
+        fallback.env("VCT_LAUNCHER_PID", std::process::id().to_string());
+        fallback.env_remove("VCT_AUTO_RESTART_LAUNCHER");
+        // v0.2.17 (Reviewer A finding A2): force-emit the deferral on
+        // this fallback pass even when the version-comparison would
+        // suggest no change is needed (because the FIRST install.py
+        // call did the version-bump already). Helper at the install.py
+        // side checks this env to short-circuit the version-equality
+        // skip.
+        fallback.env("VCT_FORCE_RESTART_DEFERRAL", "1");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            fallback.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+        match fallback.output().await {
+            Ok(out) if out.status.success() => {
+                eprintln!(
+                    "[vct] update_orchestrator: fallback install.py succeeded; \
+                     launcher_restart_required deferral should now be present \
+                     in UPDATE_DEFERRED.md. The launcher's UpdateBadge will \
+                     surface the Restart banner on next poll."
+                );
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                eprintln!(
+                    "[vct] update_orchestrator: fallback install.py exited \
+                     non-zero ({:?}). stderr tail: {}",
+                    out.status.code(),
+                    stderr.lines().rev().take(10).collect::<Vec<_>>().join(" | "),
+                );
+                // Surface a real error to the GUI so the user knows the
+                // update is in an indeterminate state. The source update
+                // already landed, but neither auto-restart nor the
+                // deferral fallback completed — the user MUST manually
+                // restart to pick up the new binary.
+                return Err(format!(
+                    "Update applied but auto-restart failed AND the fallback \
+                     deferral emit failed. Please fully quit the launcher \
+                     (tray → Quit) and relaunch via your usual entrypoint to \
+                     pick up the new binary at {}/launcher/dist/.",
+                    install_path.display(),
+                ));
+            }
+            Err(spawn_err) => {
+                eprintln!(
+                    "[vct] update_orchestrator: could not spawn fallback \
+                     install.py: {}. Surfacing the error to the GUI.",
+                    spawn_err,
+                );
+                return Err(format!(
+                    "Update applied but auto-restart failed and the fallback \
+                     install.py could not be spawned: {}. Please fully quit \
+                     the launcher and relaunch manually.",
+                    spawn_err,
+                ));
+            }
+        }
     }
 
     emit_progress(&window, "done", "Orchestrator updated successfully!", 100.0);
