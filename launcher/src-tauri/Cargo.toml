@@ -100,10 +100,32 @@ notify = "8"
 # System info (RAM, CPU). MIT-licensed, lightweight. Used by detect_system.
 sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 
+# v0.2.17 (hotfix): path canonicalization that avoids `\\?\` UNC
+# prefixes on Windows. `std::fs::canonicalize` on Windows always
+# returns the verbatim/UNC form (`\\?\C:\...`), which breaks
+# downstream string comparisons (`.starts_with(install_path)` would
+# fail because install_path is `C:\...`). `dunce::canonicalize` is
+# the canonical Rust workaround — same behaviour as
+# std::fs::canonicalize on POSIX, returns the conventional form on
+# Windows. Already transitively in the lockfile via Tauri but
+# promoting to a direct dep so the `update_orchestrator` pre-pull
+# rename path resolves correctly on Windows.
+dunce = "1"
+
 # Bug 31: libc statvfs for free-space probe (Unix only — Windows path
 # returns None, see free_bytes_at in commands/volumes.rs).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# v0.2.17 (hotfix): direct windows-sys dep for `pid_is_alive`'s
+# Windows branch (OpenProcess + CloseHandle from
+# Win32::System::Threading + Win32::Foundation). Already in the
+# lockfile transitively (Tauri pulls it) but Cargo doesn't expose
+# transitive deps to crates that don't declare them. Adding it
+# directly with a `cfg(windows)` gate keeps Linux/macOS builds
+# lean (no compilation cost).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 # Release-profile privacy + size hardening (PR-4, 2026-05-06).
 #
