@@ -77,26 +77,4 @@ flagging for early adopters and the next iteration.
 
 ## Recently fixed
 
-All previously-listed "Recently fixed" entries have shipped in tagged
-releases (v0.1.x → v0.2.15) and are documented in [CHANGELOG.md](CHANGELOG.md)
-under their respective version sections. Removed from this file 2026-05-18
-to keep KNOWN_ISSUES.md focused on items early adopters might still hit
-in the current shipping version.
-
-Examples of work archived (see CHANGELOG for full detail):
-
-- v0.2.11+: `register_github_pat` ↔ SecretsPanel `module_id` unification,
-  `cookie@0.6.0` CVE override, lightweight `--lightweight` re-install
-  Rust wiring, Custom MCP tab population on project register.
-- v0.2.0: Project tabs empty after wizard, Browse button dialog import,
-  wizard install-path lockdown to source repo, conflict modal +
-  4 strategies, `_development` collection scoping, Joern installer
-  hang + `--dir` probe, macOS Gatekeeper quarantine strip, Bash 3.2
-  empty-array guard.
-- Pre-0.2.0 / P5-P7: per-project URL-addressable routes, `vct`/`vco`
-  CLI escape hatch + hub `/cli/*` API, audit log SQL filters,
-  `change_log` table for multi-tab concurrency invalidation.
-
-Refer to the CHANGELOG for the canonical record of what shipped in
-each version. This section is intentionally kept as a forward-looking
-"what's still rough" surface, not a release-history mirror.
+See [CHANGELOG.md](CHANGELOG.md).
