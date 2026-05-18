@@ -51,6 +51,13 @@ _FULL_PROPS = [
     {"name": "links", "dataType": ["text[]"]},
     {"name": "typed_links", "dataType": ["object[]"]},
     {"name": "status", "dataType": ["text"]},
+    # v0.2.17 (Reviewer B nit, folded into v0.2.17 + this test
+    # fixture mirrors `kg_class_definition`'s post-v0.2.17 shape):
+    # content_hash holds the SHA-256 of the source markdown
+    # (frontmatter-minus-updated + body) and powers the embed-skip
+    # fast path in sync_node. Adding it to the fixture keeps the
+    # schema-delta + patch-props tests aligned with the live shape.
+    {"name": "content_hash", "dataType": ["text"]},
 ]
 
 
@@ -313,8 +320,9 @@ class MigrateDispatchUnitTests(unittest.TestCase):
             result = project_init.migrate_collections(
                 self.args, dry_run=False, schema_fetcher=fetcher,
             )
-        # _missing_props_only drops the last 2 from FULL_PROPS = 8, target
-        # has all 8 → 2 missing.
+        # _missing_props_only drops the last 2 from FULL_PROPS (currently 9
+        # entries after v0.2.17's content_hash add), target has the full
+        # set → 2 missing.
         self.assertEqual(pmock.call_count, 2)
         copmock.assert_not_called()
         kg_plan = next(p for p in result["plan"]
