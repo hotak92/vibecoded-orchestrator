@@ -13,6 +13,11 @@
   } from '$lib/types/embedding-catalog';
   import Dropdown from '$lib/components/Dropdown.svelte';
   import EnrichmentProgressModal from '$lib/components/EnrichmentProgressModal.svelte';
+  // v0.2.18 (Plan C): Re-analyze code-graph modal. Forks the enrichment
+  // modal's streaming pattern against analyze_code_graph.py --json-progress.
+  // Always passes --prune-stale (authoritative refresh); --language is
+  // optional and scopes the re-walk to one language at a time.
+  import CodeGraphReanalysisModal from '$lib/components/CodeGraphReanalysisModal.svelte';
 
   const ROLE_OPTIONS = [
     { value: 'primary', label: 'primary' },
@@ -76,6 +81,30 @@
     'CodeAPI',
     'CodeInteraction',
   ] as const;
+
+  // v0.2.18 (Plan C): Re-analyze code-graph modal driver state. Populated
+  // when the user clicks "Re-analyze code graph"; the modal mounts on
+  // `reanalysisTarget` population, invokes `reanalyze_code_graph`, streams
+  // progress, and closes itself when the user clicks Close in the
+  // done-state. The button passes `language: null` for a full
+  // multi-language re-walk (Plan C: this prunes globally, the safe
+  // primitive for explicit "authoritative refresh" clicks).
+  type ReanalysisTarget = { projectName: string; language: string | null };
+  let reanalysisTarget = $state<ReanalysisTarget | null>(null);
+
+  function openReanalysisModal() {
+    // ProjectStateSnapshot doesn't carry the project's display name; the
+    // codegraph_binding's collection_prefix is the closest proxy (used for
+    // the modal title only — the Tauri command resolves the canonical
+    // project name itself via the DB lookup from projectId).
+    const displayName =
+      snapshot?.codegraph_binding?.collection_prefix ?? projectId;
+    // Full multi-language re-walk by default. Per-language scoping is
+    // exposed via the hook path (every file save passes --language for
+    // the language-scoped prune); the button is the explicit-refresh
+    // path that benefits most from a global walk + global prune.
+    reanalysisTarget = { projectName: displayName, language: null };
+  }
 
   function buildOptions(models: ModelChoice[]) {
     // Each option carries its label + an optional disabled flag mapped
@@ -351,7 +380,24 @@ Continue?`;
           </div>
         {/if}
       </div>
-      <button class="ps-btn-primary" onclick={saveCg}>Save codegraph binding</button>
+      <div class="ps-btn-row">
+        <button class="ps-btn-primary" onclick={saveCg}>Save codegraph binding</button>
+        <!-- v0.2.18 (Plan C): Re-analyze button. Forces a full multi-
+             language re-walk + global prune via analyze_code_graph.py.
+             The hook does language-scoped incremental updates on every
+             file save; this button is the explicit "authoritative
+             refresh" path. -->
+        <button
+          class="ps-btn-secondary"
+          onclick={openReanalysisModal}
+          disabled={!cgEnabled}
+          title={cgEnabled
+            ? 'Force a full re-analysis: walks every supported language and prunes orphan rows.'
+            : 'Enable the code graph above before re-analyzing.'}
+        >
+          Re-analyze code graph
+        </button>
+      </div>
     </div>
 
     <div class="ps-section">
@@ -375,6 +421,18 @@ Continue?`;
   />
 {/if}
 
+<!-- v0.2.18 (Plan C): Re-analyze modal mount. Same lifecycle pattern as
+     EnrichmentProgressModal — mounts when reanalysisTarget is non-null,
+     unmounts on close. -->
+{#if reanalysisTarget}
+  <CodeGraphReanalysisModal
+    projectId={projectId}
+    projectName={reanalysisTarget.projectName}
+    language={reanalysisTarget.language}
+    onClose={() => (reanalysisTarget = null)}
+  />
+{/if}
+
 <style>
   .ps-tab { padding: 16px; }
   .ps-tab-header { margin-bottom: 12px; }
@@ -395,6 +453,20 @@ Continue?`;
   .ps-snapshot { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; font-size: 13px; }
   .ps-snapshot div { padding: 8px 12px; background: rgba(255,255,255,0.04); border-radius: 4px; }
   .ps-btn-primary { background: rgb(0,191,166); border: none; color: #000; padding: 6px 14px; border-radius: 4px; cursor: pointer; font-size: 13px; font-weight: 600; }
+  /* v0.2.18 (Plan C): row container for the codegraph save + re-analyze
+     buttons so they sit on one line with a small gap. */
+  .ps-btn-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .ps-btn-secondary {
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.14);
+    color: inherit;
+    padding: 6px 14px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 13px;
+  }
+  .ps-btn-secondary:hover:not(:disabled) { background: rgba(255,255,255,0.10); }
+  .ps-btn-secondary:disabled { opacity: 0.5; cursor: not-allowed; }
   .ps-catalog-warn {
     margin: 0 0 12px; padding: 8px 12px;
     background: rgba(255,200,80,0.08); border: 1px solid rgba(255,200,80,0.2);

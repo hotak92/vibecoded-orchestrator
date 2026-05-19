@@ -82,6 +82,31 @@ if [[ ! "$EDITED_FILE" =~ \.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|j
     exit 0
 fi
 
+# v0.2.18 (Plan C): map the edited file's extension to the analyzer's
+# canonical language ID. Same set as analyze_code_graph.py's argparse
+# `--language` choices. When the extension matches, we pass --language
+# AND --prune-stale to the analyzer so the language-scoped prune runs
+# (only deletes rows tagged with this language that were not visited).
+# Pre-Plan-C the hook ran with neither flag, leaving deleted source-
+# files' code-graph entries behind forever.
+LANG=""
+case "$EDITED_FILE" in
+    *.py)                                LANG="python"     ;;
+    *.js|*.mjs|*.jsx)                    LANG="javascript" ;;
+    *.ts|*.tsx)                          LANG="typescript" ;;
+    *.go)                                LANG="go"         ;;
+    *.rs)                                LANG="rust"       ;;
+    *.lua)                               LANG="lua"        ;;
+    *.cpp|*.cc|*.cxx|*.h|*.hpp)          LANG="cpp"        ;;
+    *.c)                                 LANG="c"          ;;
+    *.cs)                                LANG="csharp"     ;;
+    *.java)                              LANG="java"       ;;
+    *.rb)                                LANG="ruby"       ;;
+    *.proto)                             LANG="proto"      ;;
+    *.sh|*.bash)                         LANG="shell"      ;;
+    *)                                   LANG=""           ;;
+esac
+
 # Resolve python: prefer venv, fall back to system python (cross-OS).
 # Bare `python3` is missing on Windows (only python.exe / py exist).
 # Try POSIX venv layout first, then Windows venv layout, then system PATH
@@ -108,13 +133,29 @@ fi
 # Run incremental analysis in background (no debounce — keep code graph fresh).
 # --cfg/--pdg default to ON inside analyze_code_graph.py when joern is present;
 # silent fallback when absent. To disable, set VCT_JOERN_AVAILABLE=0.
+#
+# v0.2.18 (Plan C): --language=$LANG + --prune-stale together make the
+# language-scoped prune correct + cheap — only entries tagged with this
+# language that the analyzer didn't visit this run are deleted; other
+# languages are preserved. Empty LANG (unrecognised extension) falls back
+# to incremental-without-prune (legacy behaviour).
 (
     cd "$REPO_PATH"
-    "$PYTHON" "$ANALYZER" \
-        "$REPO_PATH" \
-        --project "$PROJECT_NAME" \
-        --incremental \
-        2>&1 | tail -5
+    if [ -n "$LANG" ]; then
+        "$PYTHON" "$ANALYZER" \
+            "$REPO_PATH" \
+            --project "$PROJECT_NAME" \
+            --incremental \
+            --language "$LANG" \
+            --prune-stale \
+            2>&1 | tail -5
+    else
+        "$PYTHON" "$ANALYZER" \
+            "$REPO_PATH" \
+            --project "$PROJECT_NAME" \
+            --incremental \
+            2>&1 | tail -5
+    fi
 ) &
 
 echo "📊 Code graph incremental update queued for $PROJECT_NAME"

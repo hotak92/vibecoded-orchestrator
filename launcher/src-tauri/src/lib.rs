@@ -971,6 +971,13 @@ pub fn run() {
             // Codegraph — Gap 2: initial build status + manual rebuild
             commands::codegraph::get_code_graph_build_status,
             commands::codegraph::rebuild_code_graph,
+            // Codegraph — v0.2.18 Plan C: Re-analyze command. Spawns
+            // analyze_code_graph.py with --prune-stale + --json-progress
+            // and streams per-file events on `vct-reanalysis-progress`
+            // for the Svelte CodeGraphReanalysisModal. Always passes
+            // --prune-stale (authoritative refresh); --language is
+            // optional and scopes the re-walk to one language.
+            commands::codegraph_reanalyze::reanalyze_code_graph,
             // KG auto-sync (2026-05-12): initial knowledge/ + docs/ sync
             // status + manual retry. Mirrors the codegraph Gap-2 pattern —
             // spawned from `create_project_v2` after bundle install so

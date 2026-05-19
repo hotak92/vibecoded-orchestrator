@@ -5,6 +5,12 @@ pub mod claude_env;
 pub mod gpu;
 pub mod gpu_policy;
 pub mod codegraph;
+// v0.2.18 (Plan C): Re-analyze runner. Forks the Tauri-streaming pattern
+// from `embedding_enrichment` against `analyze_code_graph.py
+// --json-progress`. Re-analyze always passes `--prune-stale` (it's the
+// "authoritative refresh" path); `--language` is optional and scopes the
+// re-walk + prune to one language.
+pub mod codegraph_reanalyze;
 pub mod coordination;
 pub mod dashboard;
 pub mod desktop_shortcut;

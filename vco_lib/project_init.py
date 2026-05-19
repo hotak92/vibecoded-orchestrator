@@ -236,19 +236,48 @@ def code_class_definitions(project_prefix: str = "") -> dict[str, dict]:
     `create_collections` so the bare definitions returned here only
     carry the vector slots + the inverted-index invariant.
 
+    v0.2.18 (Plan C): the minimal property surface now declares the
+    `language` property (canonical lowercase ID per analyzed file). This
+    enables the smart-dispatch's patch_props action to add the missing
+    property on existing v0.2.17 code collections when the migrate path
+    routes them through. analyze_code_graph.py's `_ensure_language_property`
+    is the primary path; the patch_props branch is a defense-in-depth
+    redundancy for callers that exercise migrate-collections directly
+    without re-running analyze.
+
     The returned dict is keyed by basename (no prefix); composition with
     `project_prefix` is the caller's responsibility for canonical naming.
     """
     from vco_lib.weaviate_schema import CODE_NAMED_VECTORS, _CODE_COLLECTION_SUFFIXES
 
     vc = {slot.name: slot.to_weaviate_config() for slot in CODE_NAMED_VECTORS}
+
+    # v0.2.18 (Plan C) — minimal property declaration. Same shape used by
+    # analyze_code_graph.py's `create_collections` so the smart-dispatch
+    # patch_props action recognises it as "already there" on freshly-
+    # created collections.
+    _language_prop = {
+        "name": "language",
+        "dataType": ["text"],
+        "description": (
+            "Canonical-lowercase language ID (python, javascript, ...) — "
+            "Plan C scoped prune"
+        ),
+    }
+
     return {
         basename: {
             "class": f"{project_prefix}{basename}",
             "description": f"Code-graph {basename} collection (v0.2.18 multi-slot)",
             "vectorConfig": vc,
             "invertedIndexConfig": {"indexNullState": True},
-            "properties": [],  # analyze_code_graph.py adds the rich shape
+            # Plan C: `language` is the only minimal property declared
+            # here; analyze_code_graph.py owns the full property surface
+            # for each collection. Both classes (Module/Class/Function/
+            # API/Interaction) carry the same `language` prop — for
+            # CodeInteraction it represents the SOURCE-SIDE language
+            # (caller's), not the target's.
+            "properties": [_language_prop],
         }
         for basename in sorted(_CODE_COLLECTION_SUFFIXES)
     }

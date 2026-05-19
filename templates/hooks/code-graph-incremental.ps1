@@ -65,6 +65,31 @@ if ($EditedFile -notmatch '\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|
     exit 0
 }
 
+# v0.2.18 (Plan C): map the edited file's extension to the analyzer's
+# canonical language ID. Mirror of the .sh sibling's case statement.
+# When the extension is recognised, the hook invokes the analyzer with
+# --language=$LANG + --prune-stale so the language-scoped prune runs
+# (deletes only the matching-language rows the analyzer didn't visit
+# this run). Empty $Lang (unrecognised extension) falls back to plain
+# --incremental for backward compat.
+$Lang = ""
+switch -Regex ($EditedFile) {
+    '\.py$'                          { $Lang = "python";     break }
+    '\.(js|mjs|jsx)$'                { $Lang = "javascript"; break }
+    '\.(ts|tsx)$'                    { $Lang = "typescript"; break }
+    '\.go$'                          { $Lang = "go";         break }
+    '\.rs$'                          { $Lang = "rust";       break }
+    '\.lua$'                         { $Lang = "lua";        break }
+    '\.(cpp|cc|cxx|h|hpp)$'          { $Lang = "cpp";        break }
+    '\.c$'                           { $Lang = "c";          break }
+    '\.cs$'                          { $Lang = "csharp";     break }
+    '\.java$'                        { $Lang = "java";       break }
+    '\.rb$'                          { $Lang = "ruby";       break }
+    '\.proto$'                       { $Lang = "proto";      break }
+    '\.(sh|bash)$'                   { $Lang = "shell";      break }
+    default                          { $Lang = "" }
+}
+
 # Resolve Python: prefer venv, fallback system.
 $Python = $env:VCT_PYTHON
 if (-not $Python) {
@@ -85,7 +110,16 @@ if (-not $Python) {
 if (-not $Python -or -not (Test-Path $Analyzer)) { exit 0 }
 
 # Run incremental analysis in background.
-Start-Process -FilePath $Python -ArgumentList @($Analyzer, $RepoPath, '--project', $ProjectName, '--incremental') `
+# v0.2.18 (Plan C): when extension is recognised, pass --language + --prune-stale
+# so the language-scoped prune runs and stale rows for deleted files are cleaned
+# up. Empty $Lang (unknown extension) falls back to plain --incremental for
+# backward compat with legacy file types.
+if ($Lang) {
+    $args = @($Analyzer, $RepoPath, '--project', $ProjectName, '--incremental', '--language', $Lang, '--prune-stale')
+} else {
+    $args = @($Analyzer, $RepoPath, '--project', $ProjectName, '--incremental')
+}
+Start-Process -FilePath $Python -ArgumentList $args `
     -WorkingDirectory $RepoPath -WindowStyle Hidden | Out-Null
 
 Write-Output "Code graph incremental update queued for $ProjectName"

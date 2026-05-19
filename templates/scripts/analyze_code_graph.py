@@ -278,6 +278,70 @@ def _ignore_dirs_for(language: str) -> frozenset:
     return _COMMON_IGNORE_DIRS | _LANGUAGE_IGNORE_DIRS_EXTRAS.get(language, frozenset())
 
 
+# ---------------------------------------------------------------------------
+# v0.2.18 (Plan C): canonical language identifier helpers.
+#
+# Pre-Plan-C the analyzer used display strings ("Python", "C++", "C#", ...) for
+# the `language` property on CodeModule rows and lowercase canonical IDs
+# ("python", "cpp", "csharp", ...) for the `--language` CLI flag + dispatcher.
+# The two diverged, so a `--prune-stale --language=python` pass couldn't
+# reliably filter rows: stored values were `"Python"`, the flag was `python`.
+#
+# Plan C unifies both onto the canonical lowercase ID (matches `--language`'s
+# argparse `choices=[...]` set). All new inserts write the canonical form; the
+# prune filter normalises the stored value on read so existing v0.2.17 rows
+# (mixed-case display strings) also get matched correctly. The migration is
+# additive — old data is not rewritten; the normaliser closes the gap on read.
+#
+# Single source of truth for both the display→canonical map and the canonical
+# set is kept here so the analyzer's per-language paths and the hook's
+# extension-to-language detection agree.
+# ---------------------------------------------------------------------------
+_LANGUAGE_DISPLAY_TO_CANONICAL: Dict[str, str] = {
+    # Display label (as historically passed to _create_or_update_module /
+    # _store_interactions / _extract_external_calls) → canonical ID.
+    "python":     "python",
+    "lua":        "lua",
+    "javascript": "javascript",
+    "js":         "javascript",
+    "typescript": "typescript",
+    "ts":         "typescript",
+    "go":         "go",
+    "rust":       "rust",
+    "java":       "java",
+    "ruby":       "ruby",
+    "shell":      "shell",
+    "csharp":     "csharp",
+    "c#":         "csharp",
+    "proto":      "proto",
+    "cpp":        "cpp",
+    "c++":        "cpp",
+    "c":          "c",
+}
+
+
+def _canonical_lang_id(label: Optional[str]) -> str:
+    """Map a language string to its canonical lowercase ID.
+
+    Accepts display labels (`"Python"`, `"C#"`, `"C++"`, ...) and canonical
+    IDs (`"python"`, `"csharp"`, `"cpp"`, ...) interchangeably. Unknown
+    strings pass through lowercased + stripped — analyzer never crashes on
+    a new language being added without first updating the table; the prune
+    filter just won't recognise the row until the table is updated, which
+    is the conservative behaviour.
+
+    Returns an empty string when the input is falsy. Empty strings never
+    match the `args.language` filter (argparse rejects empty), so unknown
+    rows stay safe.
+    """
+    if not label:
+        return ""
+    key = str(label).strip().lower()
+    if not key:
+        return ""
+    return _LANGUAGE_DISPLAY_TO_CANONICAL.get(key, key)
+
+
 try:
     import weaviate
     from weaviate.classes.config import Configure, Property, DataType, ReferenceProperty
@@ -795,6 +859,26 @@ class CodeGraphAnalyzer:
         self.visited_uuids: Set[Tuple[str, str]] = set()
         self._track_visited: bool = False
 
+        # v0.2.18 (Plan C) — canonical language ID for the language currently
+        # being analyzed. Set by the dispatcher in `analyze_repository` from the
+        # `lang_dispatch` table entry, then read by `_create_or_update_module`,
+        # the per-method insert paths, and `_store_interactions` so every row
+        # carries a canonical-lowercase `language` property. Empty string when
+        # no analyze is in progress (creates use `_canonical_lang_id()` of the
+        # display label as the fallback for direct-call sites).
+        self._current_language: str = ""
+
+        # v0.2.18 (Plan C) — per-file progress emitter for the Re-analyze
+        # Tauri command. main() installs a JSON-line-emitter when invoked
+        # with `--json-progress`; otherwise this stays None and analyze
+        # proceeds with the existing human-readable prints. The signature
+        # is `(fraction: float, message: str, file: str, lang: str) -> None`.
+        self._progress_emitter: Optional[Any] = None
+        # Scoping for the prune pass. Set by analyze_repository from its
+        # `language=` parameter (see _prune_stale_objects). Empty string =
+        # legacy/global prune across every project row.
+        self._prune_language: str = ""
+
     def connect(self):
         """Connect to Weaviate."""
         try:
@@ -1028,6 +1112,10 @@ class CodeGraphAnalyzer:
                         Property(name="start_line", data_type=DataType.INT, description="Start line number", skip_vectorization=True),
                         Property(name="end_line", data_type=DataType.INT, description="End line number", skip_vectorization=True),
                         Property(name="project", data_type=DataType.TEXT, description="Project name", skip_vectorization=True),
+                        # v0.2.18 (Plan C): canonical-lowercase language ID so a
+                        # later `--prune-stale --language=<lang>` run can scope
+                        # the per-row delete to only that language's entries.
+                        Property(name="language", data_type=DataType.TEXT, description="Canonical language ID (python, javascript, ...) — Plan C scoped prune", skip_vectorization=True),
                         Property(name="field_types", data_type=DataType.TEXT_ARRAY, description="field_name:TypeName pairs from annotated fields", skip_vectorization=True),
                         Property(name="composes", data_type=DataType.TEXT_ARRAY, description="Class names used as field types (composition)", skip_vectorization=True),
                         Property(name="primary_layer", data_type=DataType.TEXT, description="Primary architectural layer (API, Service, Data, UI, Utility, etc.)", skip_vectorization=True),
@@ -1068,6 +1156,8 @@ class CodeGraphAnalyzer:
                         Property(name="end_line", data_type=DataType.INT, description="End line number", skip_vectorization=True),
                         Property(name="is_async", data_type=DataType.BOOL, description="Is async function", skip_vectorization=True),
                         Property(name="project", data_type=DataType.TEXT, description="Project name", skip_vectorization=True),
+                        # v0.2.18 (Plan C): canonical-lowercase language ID for scoped prune.
+                        Property(name="language", data_type=DataType.TEXT, description="Canonical language ID (python, javascript, ...) — Plan C scoped prune", skip_vectorization=True),
                         Property(name="type_uses", data_type=DataType.TEXT_ARRAY, description="Type names referenced in function annotations", skip_vectorization=True),
                         Property(name="cfg_summary", data_type=DataType.TEXT, description="CFG summary: branches/loops/max_depth counts (from Joern)", skip_vectorization=True),
                         Property(name="data_flow_vars", data_type=DataType.TEXT_ARRAY, description="Variable names that flow through the function (from Joern PDG)", skip_vectorization=True),
@@ -1106,6 +1196,8 @@ class CodeGraphAnalyzer:
                         Property(name="parameters", data_type=DataType.TEXT_ARRAY, description="Parameter names", skip_vectorization=True),
                         Property(name="returns", data_type=DataType.TEXT, description="Return type/description"),
                         Property(name="project", data_type=DataType.TEXT, description="Project name", skip_vectorization=True),
+                        # v0.2.18 (Plan C): canonical-lowercase language ID for scoped prune.
+                        Property(name="language", data_type=DataType.TEXT, description="Canonical language ID (python, javascript, ...) — Plan C scoped prune", skip_vectorization=True),
                         Property(name="proxy_target", data_type=DataType.TEXT, description="Target endpoint for proxy/forwarding routes (cross-language linking)", skip_vectorization=True),
                     ],
                     references=[
@@ -1140,6 +1232,13 @@ class CodeGraphAnalyzer:
                         Property(name="endpoint", data_type=DataType.TEXT, description="Extracted target: /path, grpc:Service.Method, topic:name", skip_vectorization=True),
                         Property(name="raw_target", data_type=DataType.TEXT, description="Full literal string as seen in source code", skip_vectorization=True),
                         Property(name="confidence", data_type=DataType.TEXT, description="high | medium", skip_vectorization=True),
+                        # v0.2.18 (Plan C): SOURCE-SIDE language. A Python file calling a
+                        # Go gRPC endpoint creates an interaction row with language="python"
+                        # (the caller's language). The target language might be different,
+                        # but a re-analysis of Python source re-extracts all Python→X
+                        # interactions, so language-scoped prune by source-language is
+                        # the correct + safe primitive.
+                        Property(name="language", data_type=DataType.TEXT, description="Source-side canonical language ID (caller's language) — Plan C scoped prune", skip_vectorization=True),
                         Property(name="description", data_type=DataType.TEXT, description="Human-readable summary for embedding (Python→HTTP POST /api/users via requests)"),
                     ],
                     references=[
@@ -1169,6 +1268,14 @@ class CodeGraphAnalyzer:
 
         # Schema migration: ensure import_names property exists on CodeModule
         self._ensure_import_names_property()
+
+        # v0.2.18 (Plan C) schema migration: ensure `language` property exists
+        # on CodeClass / CodeFunction / CodeAPI / CodeInteraction. CodeModule
+        # already has it (since v0.2.16). The property enables language-scoped
+        # pruning so `--prune-stale --language=<lang>` is safe on polyglot
+        # repos. Idempotent — does nothing when the prop is already present.
+        # Soft-fail per-collection so a single 422 doesn't wedge the whole run.
+        self._ensure_language_property()
 
     def _dedup_insert(self, collection, insert_params: dict, identity_key: str,
                       file_path_rel: str = "") -> str:
@@ -1214,6 +1321,26 @@ class CodeGraphAnalyzer:
             ``class_uuid``, ``module_uuid`` etc.) continues to work.
         """
         det_uuid = _deterministic_uuid(self.project_name, file_path_rel, identity_key)
+
+        # v0.2.18 (Plan C): stamp the canonical language ID on every insert
+        # so the language-scoped prune filter can match each row. The
+        # dispatcher sets `self._current_language` for the duration of one
+        # language's analyze loop; insert sites need not pass it explicitly.
+        # Skips when `language` is already present (caller pre-set it, or
+        # the prop doesn't belong on this collection — defensive). Empty
+        # `_current_language` is also a no-op so unit tests that bypass the
+        # dispatcher don't get spurious empty-string writes that would
+        # confuse the prune filter's "unknown language" branch.
+        #
+        # `getattr` with default keeps the path safe for older test
+        # fixtures that construct an analyzer without going through
+        # __init__ — they may not have `_current_language` set.
+        current_lang = getattr(self, "_current_language", "")
+        if current_lang:
+            props = insert_params.get("properties")
+            if isinstance(props, dict) and not props.get("language"):
+                props["language"] = current_lang
+
         try:
             collection.data.replace(uuid=det_uuid, **insert_params)
         except BaseException as exc:
@@ -1242,6 +1369,57 @@ class CodeGraphAnalyzer:
                 print("   Added import_names property to CodeModule schema")
         except Exception as e:
             logger.debug(f"Schema migration check failed: {e}")
+
+    def _ensure_language_property(self):
+        """Add `language` property to the 4 code collections that lack it
+        on pre-v0.2.18 installs (CodeClass, CodeFunction, CodeAPI,
+        CodeInteraction). CodeModule already has the property since v0.2.16.
+
+        Plan C / v0.2.18 schema migration. The property enables language-
+        scoped pruning so `--prune-stale --language=<lang>` deletes only
+        rows tagged with that canonical language ID. Without this property,
+        pre-Plan-C rows are invisible to the filter — they survive a
+        language-scoped prune (conservative) but the next full re-analyze
+        will rewrite them with the new field populated.
+
+        Idempotent: a property that already exists is skipped silently.
+        Soft-fail per collection: an HTTP error on one shouldn't wedge the
+        others. The `_ensure_import_names_property` pattern is the template.
+        """
+        collections = [
+            ("CodeClass",      self.classes_collection,
+             "Canonical language ID (python, javascript, ...) — Plan C scoped prune"),
+            ("CodeFunction",   self.functions_collection,
+             "Canonical language ID (python, javascript, ...) — Plan C scoped prune"),
+            ("CodeAPI",        self.apis_collection,
+             "Canonical language ID (python, javascript, ...) — Plan C scoped prune"),
+            ("CodeInteraction", self.interactions_collection,
+             "Source-side canonical language ID (caller's language) — Plan C scoped prune"),
+        ]
+        for label, coll, desc in collections:
+            if coll is None:
+                continue
+            try:
+                config = coll.config.get()
+                existing_props = {p.name for p in config.properties}
+                if "language" in existing_props:
+                    continue
+                coll.config.add_property(
+                    Property(
+                        name="language",
+                        data_type=DataType.TEXT,
+                        description=desc,
+                        skip_vectorization=True,
+                    )
+                )
+                print(f"   Added language property to {label} schema (Plan C)")
+            except Exception as e:
+                # Soft-fail. A 422 here doesn't break analysis — language-
+                # scoped prune just won't recognise rows in this collection
+                # until the next successful migration pass.
+                logger.debug(
+                    f"Plan C language-property migration on {label} skipped: {e}"
+                )
 
     def analyze_repository(self, repo_path: Path, language: Optional[str] = None,
                           incremental: bool = False,
@@ -1331,23 +1509,55 @@ class CodeGraphAnalyzer:
             ('proto',      self._find_proto_files,  self._analyze_proto_file),
         ]
 
+        # v0.2.18 (Plan C): two-phase loop so we know the grand-total file
+        # count for the progress emitter BEFORE we start analyzing. Without
+        # this, the fraction shown in the Re-analyze modal would drift up
+        # per-language. The find + incremental-filter pass is cheap (no
+        # Weaviate calls) so doing it twice is fine; we cache the result.
+        per_lang_files: List[Tuple[str, Any, List[Path]]] = []
         for lang_name, find_fn, analyze_fn in lang_dispatch:
             if lang and lang != lang_name:
                 continue
-
             files = find_fn(repo_path)
             if not files:
                 continue
-
             if incremental:
                 files = self._filter_changed_files(repo_path, files)
                 if not files:
                     print(f"ℹ️  No changed {lang_name} files to analyze")
                     continue
+            per_lang_files.append((lang_name, analyze_fn, list(files)))
 
+        total_files = sum(len(fs) for _, _, fs in per_lang_files)
+        seen_files = 0
+
+        for lang_name, analyze_fn, files in per_lang_files:
             print(f"📂 Found {len(files)} {lang_name} files to analyze")
 
+            # v0.2.18 (Plan C): every analyze_*_file path threads its canonical
+            # language ID through `_current_language` so insert sites can stamp
+            # the `language` property without changing each method's signature.
+            # The dispatcher restores the prior value (in practice always "") on
+            # exit so back-to-back lang_dispatch iterations don't leak state.
+            self._current_language = lang_name
+
             for f in files:
+                if self._progress_emitter is not None and total_files > 0:
+                    try:
+                        rel = str(f.relative_to(repo_path).as_posix())
+                    except Exception:
+                        rel = str(f)
+                    try:
+                        self._progress_emitter(
+                            float(seen_files) / float(total_files),
+                            f"Analyzing {rel}",
+                            rel,
+                            lang_name,
+                        )
+                    except Exception:
+                        # Progress emission must never block analysis.
+                        pass
+                seen_files += 1
                 try:
                     result = analyze_fn(f, repo_path)
                     stats['modules']  += result.get('modules', 0)
@@ -1385,13 +1595,25 @@ class CodeGraphAnalyzer:
                     if seen_dedup:
                         stats['insert_errors'] += 1
 
+        # Clear the per-language context now that the dispatch loop is
+        # done (Plan C). The prune pass below doesn't depend on it.
+        self._current_language = ""
+
         # v0.2.16 (1.4 / addendum H): --prune-stale pass.
         # Walk every per-project code-graph collection and delete any
         # object whose UUID was NOT visited during this analyze run.
         # The visited-UUID set was populated as a side-effect of
         # _dedup_insert + _create_or_update_module calls when
         # self._track_visited was True.
+        #
+        # v0.2.18 (Plan C): when `language` was passed to analyze_repository,
+        # the prune is SCOPED to that language so cross-language data in
+        # other Code* rows is preserved. The dispatcher only walked files of
+        # `language`, so any per-row delete must filter `language ==
+        # canonical(language)` before deleting. See `_prune_stale_objects`
+        # for the implementation.
         if prune_stale:
+            self._prune_language = _canonical_lang_id(language) if language else ""
             stats['stale_pruned'] = self._prune_stale_objects()
 
         return stats
@@ -1404,9 +1626,16 @@ class CodeGraphAnalyzer:
         orphan UUIDs because nothing tells Weaviate "this used to
         exist, please remove it". This pass closes that gap.
 
+        v0.2.18 (Plan C): when `self._prune_language` is non-empty, the
+        prune is SCOPED — only rows whose `language` property matches the
+        canonical ID are candidates for deletion. Rows from other
+        languages are preserved (their UUIDs aren't in `visited_uuids`
+        either, but they're correctly out-of-scope for this run).
+
         Algorithm:
           For each per-project collection:
             - Enumerate every UUID where ``project == self.project_name``.
+              (And, when language-scoped: ``language == self._prune_language``.)
             - Subtract the set of UUIDs we visited this run.
             - Delete the difference (the stale ones).
 
@@ -1435,20 +1664,43 @@ class CodeGraphAnalyzer:
             self.interactions_collection,
         ]
 
+        scope_lang = getattr(self, "_prune_language", "") or ""
+        if scope_lang:
+            print(
+                f"🧹 Language-scoped prune active: deleting only "
+                f"language={scope_lang!r} entries not visited this run"
+            )
+
         for coll in collections:
             if coll is None:
                 continue
             visited = per_collection_visited.get(coll.name, set())
-            pruned = self._prune_collection(coll, visited)
+            pruned = self._prune_collection(
+                coll, visited, language_scope=scope_lang,
+            )
             if pruned:
                 print(f"🧹 Pruned {pruned} stale objects from {coll.name}")
                 total_pruned += pruned
 
         return total_pruned
 
-    def _prune_collection(self, collection, visited_uuids: Set[str]) -> int:
+    def _prune_collection(
+        self,
+        collection,
+        visited_uuids: Set[str],
+        language_scope: str = "",
+    ) -> int:
         """Delete every object in ``collection`` whose project matches
         ``self.project_name`` AND whose UUID is not in ``visited_uuids``.
+
+        v0.2.18 (Plan C): when ``language_scope`` is a non-empty canonical
+        language ID, additionally filter by ``language == language_scope``
+        (case-insensitive, after `_canonical_lang_id` normalisation so
+        legacy mixed-case rows like `"Python"` are recognised as matching
+        `"python"`). Rows with no `language` property are treated as
+        unknown-language and PRESERVED — they predate the v0.2.18 schema
+        migration and the next full re-analyze (no `--language`) will
+        repopulate them.
 
         Why filter on the ``project`` property as well as the
         collection name: a per-project collection like
@@ -1458,16 +1710,39 @@ class CodeGraphAnalyzer:
         (no extra query roundtrip beyond the initial enumerate).
         """
         pruned = 0
+        # Read `language` only when needed so a missing-property collection
+        # (pre-migration) doesn't 422 the enumerate. Weaviate returns None
+        # for missing-on-row props which we treat as "unknown language".
+        return_props = ["project"]
+        if language_scope:
+            return_props.append("language")
+
         try:
             for obj in collection.iterator(
-                return_properties=["project"],
+                return_properties=return_props,
             ):
-                obj_project = obj.properties.get("project") if obj.properties else None
+                props = obj.properties or {}
+                obj_project = props.get("project")
                 # Only consider objects belonging to this project. Foreign-
                 # project rows (shouldn't exist in per-project collections,
                 # but defensive) are left alone.
                 if obj_project not in (None, "", self.project_name):
                     continue
+
+                # Plan C: language-scoped filter. Rows without a language
+                # property (pre-v0.2.18 data) are PRESERVED — they need a
+                # full re-analyze to repopulate the field. Rows with a
+                # language other than the scope are out-of-scope this run.
+                if language_scope:
+                    row_lang = _canonical_lang_id(props.get("language"))
+                    if not row_lang:
+                        # Unknown / pre-migration row → preserve.
+                        continue
+                    if row_lang != language_scope:
+                        # Different-language row → preserve (this is the
+                        # entire point of language-scoped prune).
+                        continue
+
                 if str(obj.uuid) in visited_uuids:
                     continue
                 try:
@@ -3260,6 +3535,14 @@ class CodeGraphAnalyzer:
         with the same module-stem name).
         """
 
+        # v0.2.18 (Plan C): normalise the language label to the canonical
+        # lowercase ID so the prune filter can match it deterministically.
+        # The caller-supplied `language` may be a display string ("Python",
+        # "C++", "C#", etc.); `_canonical_lang_id` collapses both forms.
+        # Fall back to `self._current_language` (dispatcher-set) so direct
+        # callers without a `language=` argument still get the right value.
+        canonical_lang = _canonical_lang_id(language) or self._current_language or ""
+
         # Check if exists
         if path in self.module_cache:
             # Update existing
@@ -3272,6 +3555,10 @@ class CodeGraphAnalyzer:
                     "last_modified": last_modified.isoformat(),
                     "file_hash": file_hash,
                     "import_names": imports,
+                    # Plan C: backfill `language` on update so pre-migration
+                    # rows get the canonical value the next time we touch
+                    # them, without needing a separate batch backfill pass.
+                    "language": canonical_lang,
                 }
             )
             # Still record as visited so --prune-stale doesn't delete it.
@@ -3285,7 +3572,7 @@ class CodeGraphAnalyzer:
         insert_params = {
             "properties": {
                 "path": path,
-                "language": language,
+                "language": canonical_lang,
                 "module_summary": module_summary,
                 "loc": loc,
                 "complexity": complexity,
@@ -4084,21 +4371,27 @@ def main():
                        help='After analysis, delete code-graph objects this run '
                             'did not visit (cleans up entries for deleted files). '
                             'Tracks UUIDs as they are upserted and removes the '
-                            'rest from each per-project collection.')
+                            'rest from each per-project collection. Plan C / '
+                            'v0.2.18: when combined with --language=<lang>, the '
+                            'prune is SCOPED to that language only — entries '
+                            'from other languages are preserved.')
+    # v0.2.18 (Plan C): structured per-file progress for the Re-analyze
+    # button's Tauri modal. Emits one JSON object per analyzed file on
+    # stdout: {"progress": 0.42, "message": "Analyzing foo.py", "file":
+    # "foo.py", "lang": "python"}. The final report line is also JSON:
+    # {"final": true, "files_analyzed": N, ...}. Off by default to keep
+    # the human-readable output for direct CLI users; the hook + Tauri
+    # command opt in explicitly.
+    parser.add_argument('--json-progress', action='store_true',
+                       help='Emit per-file progress + final report as JSON '
+                            'lines on stdout (Tauri Re-analyze modal).')
 
     args = parser.parse_args()
 
-    # Defensive: warn if --prune-stale is combined with --language, since
-    # the prune pass deletes EVERY non-visited UUID across all collections
-    # — including objects produced by a previous full-language run.
-    if args.prune_stale and args.language:
-        print(
-            f"⚠️  --prune-stale + --language={args.language} would delete "
-            "code-graph entries from OTHER languages that this run did "
-            "not visit. Re-run without --language to analyze the full repo, "
-            "or drop --prune-stale.",
-            file=sys.stderr,
-        )
+    # v0.2.18 (Plan C) — --prune-stale + --language is now the CORRECT
+    # combination, not a footgun. The prune pass filters by stored
+    # `language` property so only rows from the analyzed language are
+    # candidates for deletion. The pre-Plan-C warning has been removed.
 
     # Validate repo path
     repo_path = args.repo_path.resolve()
@@ -4207,8 +4500,35 @@ def main():
             print(f"❌ Failed to create collections: {e}", file=sys.stderr)
             return 1
 
+        # v0.2.18 (Plan C): wire JSON-progress emitter for the Tauri
+        # Re-analyze modal. Each emit prints one JSON line on stdout that
+        # the parent process reads via BufReader::lines() and forwards to
+        # the front-end as a `vct-reanalysis-progress` Tauri event.
+        if args.json_progress:
+            def _emit_progress(frac: float, msg: str, fpath: str, lang: str) -> None:
+                # Bounded fraction so float drift doesn't push the bar past 1.
+                try:
+                    frac_f = float(frac)
+                except Exception:
+                    frac_f = 0.0
+                if frac_f < 0.0:
+                    frac_f = 0.0
+                elif frac_f > 1.0:
+                    frac_f = 1.0
+                payload = {
+                    "progress": frac_f,
+                    "message": msg,
+                    "file": fpath,
+                    "lang": lang,
+                }
+                # `flush=True` so the parent's line reader doesn't wait
+                # for the analyzer to finish before seeing per-file ticks.
+                print(json.dumps(payload), flush=True)
+            analyzer._progress_emitter = _emit_progress
+
         # Analyze repository
-        print("🔍 Analyzing codebase...")
+        if not args.json_progress:
+            print("🔍 Analyzing codebase...")
         stats = analyzer.analyze_repository(
             repo_path,
             language=args.language,
@@ -4220,6 +4540,35 @@ def main():
 
         # Post-processing: create cross-references
         ref_stats = analyzer.create_cross_references()
+
+        # v0.2.18 (Plan C): final progress emit so the modal's progress bar
+        # snaps to 100% before the report is rendered.
+        if args.json_progress and analyzer._progress_emitter is not None:
+            try:
+                analyzer._progress_emitter(
+                    1.0,
+                    f"Analyzed {stats.get('files_analyzed', 0)} files",
+                    "",
+                    args.language or "",
+                )
+            except Exception:
+                pass
+            # Final report JSON line — the Tauri command's stdout reader
+            # looks for `{"final": true, ...}` and returns it to the modal.
+            final_payload = {
+                "final": True,
+                "files_analyzed": stats.get("files_analyzed", 0),
+                "files_skipped": stats.get("files_skipped", 0),
+                "modules": stats.get("modules", 0),
+                "classes": stats.get("classes", 0),
+                "functions": stats.get("functions", 0),
+                "apis": stats.get("apis", 0),
+                "insert_errors": stats.get("insert_errors", 0),
+                "stale_pruned": stats.get("stale_pruned", 0),
+                "language": args.language or "",
+                "prune_stale": bool(args.prune_stale),
+            }
+            print(json.dumps(final_payload), flush=True)
 
         # Report results
         print("\n" + "="*60)
