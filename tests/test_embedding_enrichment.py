@@ -1029,6 +1029,276 @@ class CliTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# v0.2.18 Commit 10 — multi-class sibling enrichment (GUI Save sweep).
+#
+# The codegraph Save flow in the launcher (KgCodegraphTab.svelte) enriches
+# all five sibling Code* classes (CodeModule / CodeClass / CodeFunction /
+# CodeAPI / CodeInteraction) sequentially by calling the existing single-
+# collection `enrich_collection_vectors` once per class. The Python side
+# stays single-collection — the multi-class loop is the Svelte modal's
+# responsibility. These tests verify the underlying assumption: the
+# single-collection enrichment IS independently invocable on every code-
+# class suffix variant (including project-prefixed forms), with the
+# expected content-property routing per class.
+# ---------------------------------------------------------------------------
+
+
+CODE_COLLECTION_SUFFIXES_ORDERED = (
+    "CodeModule",
+    "CodeClass",
+    "CodeFunction",
+    "CodeAPI",
+    "CodeInteraction",
+)
+
+
+class MultiClassInvocationTests(_BaseEnrichmentTest):
+    """Each of the 5 code-class suffix variants is independently enrichable.
+
+    The Svelte sweep in v0.2.18 Commit 10 expands a project prefix
+    (e.g. ``"MyProj_"``) into the 5 sibling Code* class names and invokes
+    ``enrich_collection_vectors`` per class. The Python primitive doesn't
+    know about the sweep — it just handles one class at a time. These
+    tests pin the per-class behaviour the sweep depends on:
+
+      * ``is_code_collection`` returns True for every suffixed form.
+      * Enrichment runs end-to-end on each variant with the correct
+        content property → code-batch embed call.
+      * Sequential invocations don't leave shared mutable state behind
+        (running enrichment on Class A doesn't mis-route Class B).
+    """
+
+    # The launcher's Svelte sweep order. Mirrors `CODE_COLLECTION_SUFFIXES`
+    # in `launcher/src/lib/project-state/KgCodegraphTab.svelte`. Matches
+    # the canonical Module/Class/Function/API/Interaction order used in
+    # `vco_lib/weaviate_schema.py` docstrings (the underlying frozenset
+    # is unordered; we pick a deterministic ordering).
+    EXPECTED_ORDER = CODE_COLLECTION_SUFFIXES_ORDERED
+
+    # The content property each class flows into for embed input.
+    # Mirror of `vco_lib.embedding_enrichment.CODE_CONTENT_PROPERTY_BY_SUFFIX`.
+    PROPERTY_BY_SUFFIX = {
+        "CodeModule": "module_summary",
+        "CodeClass": "class_body",
+        "CodeFunction": "function_body",
+        "CodeAPI": "api_description",
+        "CodeInteraction": "endpoint",
+    }
+
+    def test_is_code_collection_recognises_all_five_suffixes(self):
+        """Each project-prefixed sibling form is classified as a code
+        collection (which controls slot-catalog selection inside
+        enrichment)."""
+        from vco_lib.weaviate_schema import (
+            is_code_collection,
+            _CODE_COLLECTION_SUFFIXES,
+        )
+
+        for suffix in self.EXPECTED_ORDER:
+            # Bare name.
+            self.assertTrue(
+                is_code_collection(suffix),
+                f"bare {suffix} should be code-shaped",
+            )
+            # Per-project prefixed.
+            for prefix in ("MyProj_", "ARTup_", "VCODev_"):
+                name = f"{prefix}{suffix}"
+                self.assertTrue(
+                    is_code_collection(name),
+                    f"prefixed {name} should be code-shaped",
+                )
+            # And in the schema-level frozenset.
+            self.assertIn(suffix, _CODE_COLLECTION_SUFFIXES)
+
+        # Sanity: a non-code name doesn't accidentally match.
+        self.assertFalse(is_code_collection("MyProj_KnowledgeGraph"))
+
+    def test_enrich_collection_vectors_invocable_per_class(self):
+        """Run `enrich_collection_vectors` once per suffix and verify each
+        routes through the code path (code-batch embed call, correct
+        property)."""
+        for suffix in self.EXPECTED_ORDER:
+            with self.subTest(suffix=suffix):
+                coll_name = f"MyProj_{suffix}"
+                content_prop = self.PROPERTY_BY_SUFFIX[suffix]
+
+                # Schema for THIS class — code slots.
+                self._schema_mock.side_effect = (
+                    lambda c, base_url: _fake_schema(
+                        self.CODE_SLOTS, class_name=c,
+                    )
+                )
+
+                obj = _FakeObject(
+                    uuid="u-only",
+                    properties={content_prop: f"snippet for {suffix}"},
+                    vector={"codesage_embed": [0.1] * 4},
+                )
+                collection = _FakeCollection([obj])
+                client = _FakeClient({coll_name: collection})
+                svc = _FakeEmbeddingService()
+
+                report = ee.enrich_collection_vectors(
+                    collection_name=coll_name,
+                    new_slot="jina_embed",
+                    embedding_service=svc,
+                    weaviate_client_factory=lambda: client,
+                )
+
+                # Outcome.
+                self.assertEqual(
+                    report.total, 1,
+                    f"{coll_name}: expected one object",
+                )
+                self.assertEqual(
+                    report.enriched, 1,
+                    f"{coll_name}: expected single enrichment write",
+                )
+                self.assertEqual(
+                    report.skipped, 0,
+                    f"{coll_name}: nothing should be skipped",
+                )
+                self.assertEqual(
+                    report.failed, 0,
+                    f"{coll_name}: no failures expected",
+                )
+
+                # Routing: code-batch, not text-batch.
+                self.assertEqual(
+                    len(svc.code_batch_calls), 1,
+                    f"{coll_name}: should call embed_code_batch once",
+                )
+                self.assertEqual(
+                    svc.text_batch_calls, [],
+                    f"{coll_name}: should NOT touch embed_text_batch",
+                )
+                # And the content from the right property was fed in.
+                self.assertEqual(
+                    svc.code_batch_calls[0], [f"snippet for {suffix}"],
+                    f"{coll_name}: embed input should come from {content_prop}",
+                )
+
+                # Write targets the new slot only (codesage preserved).
+                self.assertEqual(len(collection.updates), 1)
+                self.assertEqual(
+                    list(collection.updates[0]["vector"].keys()),
+                    ["jina_embed"],
+                    f"{coll_name}: write should touch ONLY jina_embed",
+                )
+
+    def test_sequential_sweep_each_class_independently(self):
+        """Simulate the Svelte modal's sequential loop: 5 successive
+        ``enrich_collection_vectors`` calls, one per sibling class, each
+        with its own client/collection/service. Verifies state from one
+        call doesn't bleed into the next."""
+        results: dict[str, ee.EnrichmentReport] = {}
+
+        # Single shared schema patch — code slots for ALL classes.
+        self._schema_mock.side_effect = lambda c, base_url: _fake_schema(
+            self.CODE_SLOTS, class_name=c,
+        )
+
+        for suffix in self.EXPECTED_ORDER:
+            coll_name = f"SweepProj_{suffix}"
+            content_prop = self.PROPERTY_BY_SUFFIX[suffix]
+            objs = [
+                _FakeObject(
+                    uuid=f"{suffix}-u{i}",
+                    properties={content_prop: f"{suffix}/{i}"},
+                    vector={"codesage_embed": [0.1] * 4},
+                )
+                for i in range(3)
+            ]
+            client = _FakeClient({coll_name: _FakeCollection(objs)})
+            svc = _FakeEmbeddingService()
+
+            report = ee.enrich_collection_vectors(
+                collection_name=coll_name,
+                new_slot="jina_embed",
+                embedding_service=svc,
+                weaviate_client_factory=lambda c=client: c,
+            )
+            results[suffix] = report
+
+        # Every class should have enriched all 3 of its objects.
+        for suffix in self.EXPECTED_ORDER:
+            r = results[suffix]
+            self.assertEqual(
+                r.total, 3, f"{suffix}: expected total=3",
+            )
+            self.assertEqual(
+                r.enriched, 3, f"{suffix}: expected enriched=3",
+            )
+            self.assertEqual(
+                r.failed, 0, f"{suffix}: expected no failures",
+            )
+
+    def test_per_class_failure_does_not_taint_other_classes(self):
+        """Simulate the Svelte modal's soft-fail-per-class contract: one
+        sibling raises a pre-flight error, the others still succeed.
+
+        The Python side raises (CollectionNotFoundError); it's the Svelte
+        loop that catches + continues. Here we just verify that an error
+        on one class doesn't corrupt internal module state such that the
+        next call also fails."""
+
+        # Schema lookup returns 404 ONLY for CodeAPI (simulating a class
+        # that was never seeded). Other classes return a real schema.
+        def selective_schema(c: str, base_url: str):
+            if c.endswith("CodeAPI"):
+                return None  # → CollectionNotFoundError pre-flight
+            return _fake_schema(self.CODE_SLOTS, class_name=c)
+
+        self._schema_mock.side_effect = selective_schema
+
+        # CodeModule should work (run before CodeAPI in EXPECTED_ORDER).
+        client_mod = _FakeClient(
+            {"SoftFail_CodeModule": _FakeCollection([
+                _FakeObject(
+                    uuid="mod-0",
+                    properties={"module_summary": "mod body"},
+                    vector={"codesage_embed": [0.1] * 4},
+                ),
+            ])},
+        )
+        r_mod = ee.enrich_collection_vectors(
+            collection_name="SoftFail_CodeModule",
+            new_slot="jina_embed",
+            embedding_service=_FakeEmbeddingService(),
+            weaviate_client_factory=lambda: client_mod,
+        )
+        self.assertEqual(r_mod.enriched, 1)
+
+        # CodeAPI should pre-flight-fail.
+        with self.assertRaises(ee.CollectionNotFoundError):
+            ee.enrich_collection_vectors(
+                collection_name="SoftFail_CodeAPI",
+                new_slot="jina_embed",
+                embedding_service=_FakeEmbeddingService(),
+                weaviate_client_factory=lambda: _FakeClient({}),
+            )
+
+        # CodeFunction should STILL work after the CodeAPI failure — no
+        # module-level state was poisoned.
+        client_fn = _FakeClient(
+            {"SoftFail_CodeFunction": _FakeCollection([
+                _FakeObject(
+                    uuid="fn-0",
+                    properties={"function_body": "def f(): pass"},
+                    vector={"codesage_embed": [0.1] * 4},
+                ),
+            ])},
+        )
+        r_fn = ee.enrich_collection_vectors(
+            collection_name="SoftFail_CodeFunction",
+            new_slot="jina_embed",
+            embedding_service=_FakeEmbeddingService(),
+            weaviate_client_factory=lambda: client_fn,
+        )
+        self.assertEqual(r_fn.enriched, 1)
+
+
+# ---------------------------------------------------------------------------
 # Live integration — skipped when Weaviate is unreachable
 # ---------------------------------------------------------------------------
 

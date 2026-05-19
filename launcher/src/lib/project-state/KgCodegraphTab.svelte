@@ -48,12 +48,34 @@
   let kgEmbeddingInitial = '';
   let cgEmbeddingInitial = '';
 
-  // v0.2.18 Commit 9: enrichment-modal driver state. Populated when a
-  // user changes the KG or codegraph model + clicks Save; the
-  // EnrichmentProgressModal mounts, runs the Tauri command, listens
-  // for vct-enrichment-progress events, and closes on completion.
-  type EnrichmentTarget = { collection: string; newSlot: string };
+  // v0.2.18 Commit 9 (+ Commit 10 multi-class fix): enrichment-modal
+  // driver state. Populated when a user changes the KG or codegraph
+  // model + clicks Save; the EnrichmentProgressModal mounts, runs the
+  // single-collection Tauri command sequentially across the list,
+  // streams vct-enrichment-progress events, and closes on completion.
+  //
+  // The shape is multi-collection because the codegraph Save path
+  // enrich-migrates 5 sibling Code* classes (CodeModule/CodeClass/
+  // CodeFunction/CodeAPI/CodeInteraction) — see CODE_COLLECTION_SUFFIXES
+  // below. The KG Save path wraps its single collection in a 1-element
+  // list to keep the modal contract uniform.
+  type CollectionTarget = { name: string; new_slot: string };
+  type EnrichmentTarget = { collections: CollectionTarget[] };
   let enrichmentTarget = $state<EnrichmentTarget | null>(null);
+
+  // Canonical code-class suffixes, ORDER-PRESERVING (Python's
+  // `_CODE_COLLECTION_SUFFIXES` is a frozenset which has no canonical
+  // order; we mirror the order used throughout vco_lib/weaviate_schema.py
+  // docstrings + log messages: Module, Class, Function, API, Interaction.
+  // The exact order affects only the UX (which class runs first); the
+  // correctness guarantee — enriching all 5 — is order-independent.
+  const CODE_COLLECTION_SUFFIXES = [
+    'CodeModule',
+    'CodeClass',
+    'CodeFunction',
+    'CodeAPI',
+    'CodeInteraction',
+  ] as const;
 
   function buildOptions(models: ModelChoice[]) {
     // Each option carries its label + an optional disabled flag mapped
@@ -172,9 +194,12 @@ Continue?`;
       if (kgEmbedding && kgEmbeddingInitial && kgEmbedding !== kgEmbeddingInitial) {
         const slot = resolveSlot('kg', kgEmbedding);
         if (slot && kgCollection.trim()) {
+          // KG enrichment is single-collection; wrap in a 1-element
+          // list to keep the modal's multi-collection contract uniform.
           enrichmentTarget = {
-            collection: kgCollection.trim(),
-            newSlot: slot,
+            collections: [
+              { name: kgCollection.trim(), new_slot: slot },
+            ],
           };
         } else {
           // No slot resolvable (catalog miss). Skip enrichment — the
@@ -213,16 +238,22 @@ Continue?`;
       toast.success('Codegraph binding saved');
       if (cgEmbedding && cgEmbeddingInitial && cgEmbedding !== cgEmbeddingInitial) {
         // Codegraph enrichment targets the per-class collections that
-        // the user's prefix expands to (e.g. `MyProj_CodeFunction`).
-        // We launch the modal with the prefix + CodeFunction as the
-        // representative class — the user can run enrichment on the
-        // other Code* classes via a follow-up Save if needed. (The
-        // multi-collection sweep is a P2 item in the v0.2.18 plan.)
+        // the user's prefix expands to. v0.2.18 (Commit 9 + Commit 10):
+        // expand to ALL 5 sibling Code* classes (CodeModule, CodeClass,
+        // CodeFunction, CodeAPI, CodeInteraction). Pre-Commit-10 we
+        // only enriched CodeFunction, which silently left the 4 other
+        // classes on the old slot and made search return empty against
+        // them (because search_code_graph queries the active slot per
+        // EmbeddingService.code_vector_slot). Enriching all 5 is a
+        // correctness requirement, not a perf optimisation.
         const slot = resolveSlot('codegraph', cgEmbedding);
-        if (slot && cgPrefix.trim()) {
+        const prefix = cgPrefix.trim();
+        if (slot && prefix) {
           enrichmentTarget = {
-            collection: `${cgPrefix.trim()}CodeFunction`,
-            newSlot: slot,
+            collections: CODE_COLLECTION_SUFFIXES.map((suffix) => ({
+              name: `${prefix}${suffix}`,
+              new_slot: slot,
+            })),
           };
         } else {
           toast.error(
@@ -338,8 +369,7 @@ Continue?`;
 
 {#if enrichmentTarget}
   <EnrichmentProgressModal
-    collection={enrichmentTarget.collection}
-    newSlot={enrichmentTarget.newSlot}
+    collections={enrichmentTarget.collections}
     projectId={projectId}
     onClose={() => (enrichmentTarget = null)}
   />
