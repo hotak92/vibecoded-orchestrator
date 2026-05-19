@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.20] — 2026-05-19
+
+This release lands the client-side support for the first paid module
+(vct-rl-reranker) + a module-extensible GUI tab framework + AMD/ROCm
+GPU support across the orchestrator's container stack. The paid module
+itself ships from `hotak92/vct-rl-reranker` (private); the orchestrator
+core (this repo) only knows how to talk to it.
+
+### Added
+
+- **`feat(rl_client)` AGPL-side adapter for the vct-rl-reranker paid module** (`467f681`). New `claude_mcp_servers/rl_client/` package with: `RLClient` async HTTP client (httpx) with disabled-mode + per-call fallback semantics; `schemas.py` Pydantic wire contract pinning `/cache_nodes`, `/rl_update`, `/health` shapes; `RLTelemetryWriter` fanning events to local JSONL AND the existing telemetry queue when upload consent is granted (query text OMITTED from queue payload — replaced by `query_length` summary; node titles + embeddings + scores preserved); `rl_logger.py` slim copy of the canonical AGPL logger. `claude_mcp_servers/weaviate_mcp/server.py::_rl_cache_and_rerank` now routes through `RLClient` instead of inline aiohttp POSTs. Free-tier users get "disabled mode" (returns inputs unchanged); Pro/MAO with container running gets real reranking. Cross-OS templates at `templates/scripts/rl_client_setup.{sh,ps1}` for per-project install.
+
+- **`feat(launcher)` module-contributed GUI tabs framework** (`c17765c`). Modules can now declare a `gui.config_tab` block in their `vct-module.json` that the launcher renders into the sidebar without bundling Svelte. Five widget kinds (checkbox / multi_select / button / select / info), each carrying `tooltip: Option<String>` so authors can always provide mouseover help. Schema lives in `manifest.rs::GuiBlock`; renderer in `ModuleConfigTab.svelte`; merge logic in `Sidebar.svelte`; generic settings persistence via `get_module_setting` / `set_module_setting` Tauri commands. RL Reranker is the first consumer (its manifest ships from the private repo); orchestrator-core demonstrates the framework with its own KG + Code Graph + Diagnostics controls.
+
+- **`feat(v0.2.20)` orchestrator-core gui.config_tab demo** (`4c2df3f`). Proves the framework generalizes beyond paid modules. New `commands/orchestrator_core.rs` exposes 6 Tauri commands: `kg_rebuild_current_project`, `kg_check_duplicates`, `code_graph_reanalyze_current`, `code_graph_prune_stale`, `orchestrator_health_check`, `orchestrator_open_logs`. Thin tokio-subprocess wrappers around `.claude/scripts/{kg-sync,kg-duplicates,code-graph-analyze}` + reqwest probes for Weaviate / Ollama / code-embed health. `templates/scripts/detect_duplicates.py` gained a `--json` flag for machine-readable consumption.
+
+- **`feat(v0.2.20)` AMD/ROCm support + per-module VRAM threshold + ROCm overlay** (`75317eb`). Closes the AMD-vendor gap inherited from v0.2.9's Bug-K work. `gpu_policy::decide_gpu_mode` now takes `has_amd: bool` between `has_nvidia` and `has_apple_silicon`. `GpuMode::Gpu` renamed to `GpuMode::Cuda`; new `GpuMode::Rocm` variant. Precedence: user_override (explicit) → Apple Silicon → NVIDIA+VRAM → AMD+VRAM → CPU. NVIDIA wins when both NVIDIA + AMD present. `gpu.rs::query_amd_gpu_present()` probes `rocminfo` (canonical) + `/sys/class/drm/card*/device/vendor=0x1002` (fallback). `HardwareSnapshot.has_amd_gpu` added. `manifest::RuntimeBlock` extended with `min_gpu_vram_gb: Option<f64>` (per-module override, None → global 8 GB default), `gpu_optional: bool`, `gpu_image_variants: Option<GpuImageVariants>` (cpu / cuda / rocm tags). `install.py::_decide_gpu_mode` mirror updated; overlay picker prefers `docker-compose.rocm.yml` then falls back to legacy `amd-rocm.yml`. New `infrastructure/docker-compose.rocm.yml` overlay for orchestrator-core's `ollama` + `code_embed` services: `/dev/kfd` + `/dev/dri` device passthrough, `group_add: ["video", "render"]`, `cap_add: ["SYS_PTRACE"]`, `HSA_OVERRIDE_GFX_VERSION="10.3.0"` (conservative RX 6000-class default). 86 new/updated tests across `gpu_policy` + `gpu` + `manifest` + pytest.
+
+- **`feat(v0.2.20)` gpu_image_variants → image tag dispatch** (`6d11024`). Final piece of the GPU plumbing. `installer_engine::run_install` now consults the host's `GpuMode` at container_pull time and picks the right variant tag (cpu / cuda / rocm) when the manifest declares `gpu_image_variants`. `install_module_for_project` reads the persisted `HardwareSnapshot` from app_state; falls back to `Cpu` when no snapshot exists. New helper `resolve_variant_tag(manifest, base_tag, gpu_mode)` returns the right suffix. Module-side: paid modules ship 3 OCI image tags per release (`:0.1.0-{cpu,cuda,rocm}`); the launcher picks the correct one. Legacy modules without `gpu_image_variants` continue using the single-tag flow unchanged. 5 new tests covering Cuda / Rocm / Cpu / Metal / no-variants paths.
+
+### Migration notes
+
+- Existing module manifests without `gpu_image_variants` are unaffected — the legacy single-tag image pull path remains the default. Only modules that opt into per-variant builds (today: vct-rl-reranker) trigger the dispatch.
+- Modules that need a per-module VRAM threshold can declare `runtime.min_gpu_vram_gb` (e.g. `4.0`). Unset → global 8 GB default (calibrated for the Ollama + CodeSage + qwen3.5:9b stack).
+- AMD users with sufficient VRAM who previously got "CPU-only" mode will now get ROCm-accelerated containers on next `redetect_hardware` + reinstall.
+- The `RL_LOCAL_LOGGING_DISABLED` env var lets users opt out of local rl_events.jsonl collection via the new Preferences → "Local data collection" section.
+- The orchestrator-core's own `gui.config_tab` adds a "Module configuration" sidebar group with the launcher's own surface. The group is hidden when no modules expose tabs (i.e. on a fresh free-tier install before any paid module is registered locally).
+
 ## [0.2.19] — 2026-05-19
 
 ### Added
