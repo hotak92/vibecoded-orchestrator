@@ -779,16 +779,36 @@ def ensure_collection_exists(server: WeaviateMCPServer) -> bool:
 def ensure_dev_collection_exists(server: WeaviateMCPServer) -> bool:
     """Create the development docs collection if missing.
 
-    Schema is a **subset** of the KG schema:
-      - same chunker (Chunker / TokenCounter from weaviate_mcp.chunking)
-      - same three named-vector slots (qwen3_embed, ollama_embed, openai_embed)
-      - same `index_null_state=True` so post-sync stale-filtering works
-        (currently no docs use `valid_until`, but cheap insurance for the
-        future)
-      - drops KG-specific fields: tags, links, typed_links, external_links,
-        node_type, status (docs don't have those)
-      - keeps: title, content, file_path, created_at, updated_at, chunk_num,
-        total_chunks, source_node_id
+    Schema is a **near-subset** of the KG schema. Matches
+    `vco_lib.project_init.development_class_definition` exactly — this is
+    the runtime-fallback path used when `project_init` didn't get there
+    first (one-off `python -m sync_knowledge_graph --all-docs` runs from a
+    project that hasn't been re-installed since the v0.2.18 schema bump).
+    Both write sites MUST stay in lockstep so the migrate dispatcher's
+    additive patch_props diff doesn't trip a phantom missing-prop loop.
+
+    Properties:
+      - title, content, file_path (the load-bearing trio)
+      - created_at, updated_at (legacy filesystem timestamps; back-compat)
+      - created, updated, valid_from, valid_until (canonical temporal,
+        PR-24 2026-05-16) — required by MCP `_stale_filter` (valid_until
+        is_none(True) | valid_until > now)
+      - status (v0.2.18 2026-05-19) — KG parity for archived-doc filter
+      - content_hash (v0.2.18 2026-05-19) — KG parity, powers the
+        embed-skip fast-path in `sync_doc`
+      - chunk_num, total_chunks, source_node_id (chunking support)
+
+    Explicitly NOT mirrored from KG (user direction 2026-05-19):
+      - tags / links / typed_links — KG-only graph metadata
+      - external_links — KG-only RDF metadata
+      - node_type — redundant (every row in a Dev collection is unambiguously
+        a "doc" by class name)
+
+    Named-vector slots (v0.2.18): sourced from
+    `vco_lib.weaviate_schema.KG_NAMED_VECTORS` for parity with the
+    `project_init.development_class_definition` canonical path. With
+    fallback to the legacy 3-slot config if the import fails (one-off
+    script runs outside the orchestrator clone).
 
     Returns True if the collection exists or was created.
     """
@@ -801,6 +821,29 @@ def ensure_dev_collection_exists(server: WeaviateMCPServer) -> bool:
         if server.client.collections.exists(DEV_COLLECTION_NAME):
             print(f"✓ Dev collection '{DEV_COLLECTION_NAME}' exists")
             return True
+
+        # v0.2.18: pull the 5-slot named-vector catalog from the canonical
+        # source (`vco_lib.weaviate_schema.KG_NAMED_VECTORS`) so this
+        # runtime fallback creates collections at the same shape as the
+        # `project_init.development_class_definition` path. Fall back to
+        # the legacy 3-slot config when the import fails (one-off script
+        # runs outside an orchestrator clone where vco_lib isn't on the
+        # path). The migrate dispatcher's additive `copy` action picks up
+        # any missing slot later when the user does run install/update.
+        try:
+            from vco_lib.weaviate_schema import KG_NAMED_VECTORS
+            named_vectors = [
+                Configure.NamedVectors.none(name=slot.name)
+                for slot in KG_NAMED_VECTORS
+            ]
+        except Exception as import_err:  # noqa: BLE001 — best-effort fallback
+            print(f"  ⚠️  Could not import KG_NAMED_VECTORS ({import_err}); "
+                  "falling back to legacy 3-slot config")
+            named_vectors = [
+                Configure.NamedVectors.none(name="qwen3_embed"),
+                Configure.NamedVectors.none(name="ollama_embed"),
+                Configure.NamedVectors.none(name="openai_embed"),
+            ]
 
         print(f"Creating dev collection '{DEV_COLLECTION_NAME}'...")
         server.client.collections.create(
@@ -825,20 +868,24 @@ def ensure_dev_collection_exists(server: WeaviateMCPServer) -> bool:
                 Property(name="updated", data_type=DataType.DATE),
                 Property(name="valid_from", data_type=DataType.DATE),
                 Property(name="valid_until", data_type=DataType.DATE),
+                # v0.2.18 (2026-05-19): KG parity. `status` lets archived
+                # docs be filtered out by `hybrid_search`; `content_hash`
+                # powers the embed-skip fast-path in `sync_doc`. Must
+                # match `project_init.development_class_definition`
+                # exactly so the migrate dispatcher's additive patch_props
+                # diff doesn't loop.
+                Property(name="status", data_type=DataType.TEXT),
+                Property(name="content_hash", data_type=DataType.TEXT),
                 # Chunking support
                 Property(name="chunk_num", data_type=DataType.INT),
                 Property(name="total_chunks", data_type=DataType.INT),
                 Property(name="source_node_id", data_type=DataType.TEXT),
             ],
-            vectorizer_config=[
-                Configure.NamedVectors.none(name="qwen3_embed"),
-                Configure.NamedVectors.none(name="ollama_embed"),
-                Configure.NamedVectors.none(name="openai_embed"),
-            ],
+            vectorizer_config=named_vectors,
             inverted_index_config=Configure.inverted_index(index_null_state=True),
         )
         print(f"✓ Created dev collection '{DEV_COLLECTION_NAME}' "
-              f"(named vectors + index_null_state=True)")
+              f"({len(named_vectors)} named vectors + index_null_state=True)")
         return True
     except Exception as e:
         print(f"❌ Error ensuring dev collection: {e}")
@@ -910,10 +957,29 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> bool:
     Mirrors `sync_node` minus the KG-specific concerns (no frontmatter
     parsing, no WikiLink resolution, no tag-from-typed-links inference, no
     cross-references). Same chunker, same active-vector-slot logic.
+
+    v0.2.18 (2026-05-19): mirrors the v0.2.17 KG content_hash embed-skip
+    fast-path. Before re-embedding, query existing objects for this
+    `file_path` and check (a) every existing chunk has a non-empty
+    `content_hash` equal to the current file's hash, (b) chunk-count
+    matches what we'd reproduce, and (c) the active named-vector slot
+    (`server.text_vector_slot`) is populated on every chunk. When all
+    three hold → skip the delete-and-re-embed entirely. Saves the entire
+    Ollama embed roundtrip + Weaviate delete/insert per unchanged file.
+
+    Conservative gating: any missing chunk-vector, any empty hash, any
+    mismatched chunk-count, or any exception in the fast-path check falls
+    through to the existing delete-and-re-embed path (and that path
+    writes `content_hash` so the NEXT re-sync will hit the fast path).
+    This handles the warm-up case where an existing v0.2.17 Dev collection
+    just gained the `content_hash` property via additive patch_props but
+    none of its rows have a value yet.
     """
     if not DEV_COLLECTION_NAME:
         print(f"⊘ DEVELOPMENT_COLLECTION not set — skipping {file_path}")
         return True
+
+    start_time = time.time()
 
     try:
         if not file_path.exists():
@@ -940,13 +1006,127 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> bool:
 
         coll = server.client.collections.get(DEV_COLLECTION_NAME)
 
-        # Delete old version (by file_path)
-        existing = coll.query.fetch_objects(
-            filters=Filter.by_property("file_path").equal(doc_data["file_path"]),
-            limit=100,
-        )
-        for obj in existing.objects:
-            coll.data.delete_by_id(obj.uuid)
+        # v0.2.18: compute content_hash BEFORE the delete-and-re-embed
+        # pipeline so we can short-circuit on the unchanged-file case.
+        # The hash function is the same one used by the KG path
+        # (`_content_signature_excluding_updated`); for a docs/ file with
+        # no frontmatter it degenerates to plain SHA-256 of the body —
+        # exactly what we want.
+        current_content_hash = _content_signature_excluding_updated(content)
+
+        # Active named-vector slot for the running backend (e.g.
+        # 'qwen3_embed' for Ollama qwen3, 'openai_text_embed' for OpenAI).
+        # The fast-path requires this slot to be populated on every
+        # existing chunk; otherwise we're in the v0.2.17 -> v0.2.18 warm-up
+        # case where the user just switched backends and the new slot is
+        # empty, and we MUST re-embed to populate it.
+        try:
+            active_slot = server.text_vector_slot
+        except Exception:  # noqa: BLE001 — soft-fail on degenerate wrapper
+            active_slot = ""
+
+        # Pull existing objects WITH vectors so we can verify the active
+        # slot is populated. `include_vector=True` returns `obj.vector` as
+        # a dict keyed by slot name for named-vector collections.
+        try:
+            existing = coll.query.fetch_objects(
+                filters=Filter.by_property("file_path").equal(
+                    doc_data["file_path"]
+                ),
+                limit=100,
+                return_properties=[
+                    "content_hash", "chunk_num", "total_chunks",
+                ],
+                include_vector=True,
+            )
+        except Exception as fetch_err:  # noqa: BLE001
+            # Older Weaviate clients / mocked clients that don't accept
+            # `include_vector` keyword → fall back to the basic fetch and
+            # skip the active-slot check (defer to content_hash + chunk
+            # count). Any real client supports this kw since Weaviate v4.
+            print(f"   (fetch_objects(include_vector=True) failed: "
+                  f"{fetch_err}; falling back to hash-only check)")
+            try:
+                existing = coll.query.fetch_objects(
+                    filters=Filter.by_property("file_path").equal(
+                        doc_data["file_path"]
+                    ),
+                    limit=100,
+                    return_properties=[
+                        "content_hash", "chunk_num", "total_chunks",
+                    ],
+                )
+            except Exception:
+                existing = None  # forces fall-through to re-embed
+
+        # EMBED-SKIP fast path. Mirrors sync_node's v0.2.17 implementation
+        # with the added active-slot check (which sync_node's fast-path
+        # also relies on implicitly via the chunk_count gate, but Dev gets
+        # it explicit because Dev rows are more likely to have a chunk
+        # written under one slot and not yet enriched under another).
+        if existing is not None and existing.objects:
+            try:
+                existing_hashes: List[str] = []
+                existing_total_chunks: List[int] = []
+                active_slot_populated: List[bool] = []
+                for obj in existing.objects:
+                    props = obj.properties or {}
+                    existing_hashes.append(props.get("content_hash", "") or "")
+                    tc = props.get("total_chunks", 0)
+                    try:
+                        existing_total_chunks.append(int(tc) if tc is not None else 0)
+                    except (TypeError, ValueError):
+                        existing_total_chunks.append(0)
+                    # `obj.vector` is a dict {slot: list[float]} for
+                    # named-vector collections; missing/None when the
+                    # fetch didn't include vectors (older client).
+                    vec_field = getattr(obj, "vector", None)
+                    if isinstance(vec_field, dict) and active_slot:
+                        slot_vec = vec_field.get(active_slot)
+                        active_slot_populated.append(
+                            bool(slot_vec) and len(slot_vec) > 0
+                        )
+                    else:
+                        # Couldn't inspect → be conservative, treat as
+                        # NOT populated so we re-embed. Exception: if
+                        # active_slot is empty (no wrapper info), skip
+                        # the active-slot gate altogether (back to
+                        # content_hash + chunk_count).
+                        active_slot_populated.append(not active_slot)
+
+                chunk_count_ok = (
+                    len(existing_total_chunks) > 0
+                    and all(
+                        tc == len(existing_total_chunks)
+                        for tc in existing_total_chunks
+                    )
+                )
+                hashes_ok = (
+                    len(existing_hashes) > 0
+                    and all(h == current_content_hash for h in existing_hashes)
+                    and all(h for h in existing_hashes)  # no empty strings
+                )
+                slots_ok = all(active_slot_populated)
+                if chunk_count_ok and hashes_ok and slots_ok:
+                    elapsed = time.time() - start_time
+                    print(
+                        f"   ⏭️  Embed-skip: content_hash matches "
+                        f"({current_content_hash[:12]}…); "
+                        f"{len(existing_hashes)} chunk(s) preserved "
+                        f"in {active_slot or '<no-slot>'} "
+                        f"({elapsed*1000:.0f} ms)"
+                    )
+                    return True
+            except Exception as skip_err:  # noqa: BLE001
+                # Soft-fail: fall through to the delete-and-re-embed path.
+                print(f"   (embed-skip check failed: {skip_err}; re-embedding)")
+
+        # Fast path didn't apply (or no existing objects). Delete old
+        # versions and re-embed. The `content_hash` written below means
+        # the NEXT re-sync will hit the fast path.
+        if existing is not None:
+            for obj in existing.objects:
+                coll.data.delete_by_id(obj.uuid)
 
         token_count = TokenCounter.count_tokens(content)
         source_id = str(uuid.uuid4())
@@ -962,6 +1142,11 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> bool:
                 "chunk_num": 1,
                 "total_chunks": 1,
                 "source_node_id": source_id,
+                # v0.2.18 (2026-05-19): persist content_hash so the next
+                # re-sync can take the embed-skip fast-path above. Same
+                # value for all chunks of the same file (computed once
+                # over the whole file content above).
+                "content_hash": current_content_hash,
             }
             coll.data.insert(properties=data_obj, vector=vec_arg)
             print(f"   ✓ Stored doc as single chunk (vectors={sorted(slots_written)})")
@@ -994,6 +1179,13 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> bool:
                 "chunk_num": i + 1,
                 "total_chunks": len(chunks),
                 "source_node_id": source_id,
+                # v0.2.18 (2026-05-19): every chunk of the same file
+                # shares the same content_hash (computed over the whole
+                # file). The embed-skip fast-path above requires ALL
+                # chunks for a file_path to carry an identical, non-empty
+                # hash before it skips — writing the same value here
+                # keeps that invariant.
+                "content_hash": current_content_hash,
             }
             coll.data.insert(properties=data_obj, vector=vec_arg)
         print(f"   ✓ Stored {len(chunks)} chunks (vectors={sorted(last_slots)})")

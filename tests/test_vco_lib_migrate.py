@@ -78,14 +78,17 @@ def _at_target() -> dict:
 
 
 def _at_target_dev() -> dict:
-    """A Development collection schema at the post-PR-24 target shape.
+    """A Development collection schema at the post-v0.2.18 target shape.
 
     PR-24 (2026-05-16) added 4 canonical temporal properties to the
     Development class definition (created, updated, valid_from,
     valid_until — see vco_lib.project_init.development_class_definition).
-    Tests that supply a Dev fetcher result must use THIS shape, not
-    `_at_target()` (which carries the KG-shape properties), or the
-    migrate dispatch will see spurious missing properties.
+
+    v0.2.18 (2026-05-19) added two more for KG parity: `status` (archived
+    doc filter) and `content_hash` (embed-skip fast-path). Tests that
+    supply a Dev fetcher result must use THIS shape, not `_at_target()`
+    (which carries the KG-shape properties), or the migrate dispatch will
+    see spurious missing properties.
     """
     return {
         "class": "ClaudeDevelopment",
@@ -99,6 +102,12 @@ def _at_target_dev() -> dict:
             {"name": "updated", "dataType": ["date"]},
             {"name": "valid_from", "dataType": ["date"]},
             {"name": "valid_until", "dataType": ["date"]},
+            # v0.2.18 (2026-05-19): KG parity — `status` + `content_hash`.
+            # Must mirror `vco_lib.project_init.development_class_definition`
+            # exactly so the schema-delta dispatcher returns noop on
+            # at-target Dev collections.
+            {"name": "status", "dataType": ["text"]},
+            {"name": "content_hash", "dataType": ["text"]},
         ],
     }
 

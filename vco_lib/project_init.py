@@ -314,6 +314,33 @@ def development_class_definition(name: str) -> dict:
     fail at the GraphQL layer with "no such prop with name 'valid_until'
     found in class '<X>_Development'". Date dataType matches the KG
     definition (see ``kg_class_definition`` properties).
+
+    v0.2.18 (2026-05-19): adds two properties for KG parity:
+
+    * ``content_hash`` (text) — SHA-256 over the source file body, used by
+      ``templates/scripts/sync_knowledge_graph.py::sync_doc``'s embed-skip
+      fast-path. Mirrors the v0.2.17 KG addition (see
+      `kg_class_definition`) so re-syncing an unchanged docs/ tree drops
+      from "re-embed every file" to "compare hashes; skip everything in
+      milliseconds." Existing v0.2.17 Dev collections gain the property
+      via `migrate_collections`' additive patch_props action — additive,
+      non-destructive. The first re-sync after the upgrade backfills
+      values; subsequent re-syncs hit the fast path.
+
+    * ``status`` (text) — lets docs that get superseded by newer versions
+      be marked `archived` so `hybrid_search`'s stale-filter skips them.
+      Same shape as the KG `status` field.
+
+    EXPLICITLY NOT MIRRORED from the KG schema (user direction 2026-05-19):
+
+    * ``tags`` / ``links`` / ``typed_links`` — KG-only graph metadata;
+      Dev rows have no WikiLink resolution, no typed relationships, no
+      tag-from-typed-link inference. The corresponding fields in
+      ``parse_doc_file`` synthesize empty values for symmetry, but they
+      are never written into the Dev collection.
+    * ``node_type`` — redundant: every row in a Development collection is
+      unambiguously a "doc" by virtue of the collection name itself
+      (``<Project>_Development``). No need for a per-row constant column.
     """
     return {
         "class": name,
@@ -332,6 +359,14 @@ def development_class_definition(name: str) -> dict:
             {"name": "updated", "dataType": ["date"]},
             {"name": "valid_from", "dataType": ["date"]},
             {"name": "valid_until", "dataType": ["date"]},
+            # v0.2.18 (2026-05-19): KG parity for archived-doc filtering
+            # (`status`) and the embed-skip fast-path (`content_hash`).
+            # Migration into existing v0.2.17 Dev collections is handled
+            # by `migrate_collections`' additive patch_props action —
+            # the diff between `_fetch_schema()` and this target picks up
+            # any missing prop automatically (see `_schema_delta`).
+            {"name": "status", "dataType": ["text"]},
+            {"name": "content_hash", "dataType": ["text"]},
         ],
     }
 
