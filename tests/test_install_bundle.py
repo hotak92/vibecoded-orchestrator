@@ -20,6 +20,7 @@ fully offline by stubbing out network paths.
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import platform
@@ -1837,6 +1838,12 @@ class MigrateRequiredDeferralTests(unittest.TestCase):
 
         Stubs the migrate dispatcher (we don't have a live Weaviate);
         verifies the CLI integration writes the right deferral.
+
+        v0.2.18: uses argparse.Namespace (not Mock) because the new
+        `--all-projects` flag is read via `getattr(args, "all_projects",
+        False)` and a Mock() auto-creates that attribute as a truthy
+        sub-mock, which would skip the per-project dispatch. Namespace
+        with explicit False mirrors what argparse produces.
         """
         with mock.patch.object(project_init, "migrate_collections") as mc:
             mc.return_value = {
@@ -1849,16 +1856,22 @@ class MigrateRequiredDeferralTests(unittest.TestCase):
                 "dry_run": True,
                 "errors": [],
             }
-            ns = mock.Mock(
+            ns = argparse.Namespace(
                 name="VideoFrames",
                 dry_run=True,
                 force_rebuild=False,
                 weaviate_url="http://localhost:8081",
                 project_folder=str(self.proj),
                 json=False,
+                # v0.2.18 additions — explicit False so they don't
+                # short-circuit the per-project KG/Dev path.
+                all_projects=False,
+                # Disable the v0.2.18 helper for THIS test because it
+                # would try to walk live collections via the real
+                # `enumerate_kg_collections` (no easy stub); the test's
+                # focus is the deferral write, not the helper.
+                include_code=False,
             )
-            # Mock auto-creates `name` as a Mock attr — re-attach the real string.
-            ns.name = "VideoFrames"
             rc = project_init._cmd_migrate_collections(ns)
             self.assertEqual(rc, 0)
         deferral_path = self.proj / ".claude" / "context" / "UPDATE_DEFERRED.md"
@@ -1882,14 +1895,17 @@ class MigrateRequiredDeferralTests(unittest.TestCase):
                 "dry_run": True,
                 "errors": [],
             }
-            ns = mock.Mock(
+            ns = argparse.Namespace(
+                name="Foo",
                 dry_run=True,
                 force_rebuild=False,
                 weaviate_url="http://localhost:8081",
                 project_folder=str(self.proj),
                 json=False,
+                # v0.2.18 additions — see sibling test rationale.
+                all_projects=False,
+                include_code=False,
             )
-            ns.name = "Foo"
             rc = project_init._cmd_migrate_collections(ns)
             self.assertEqual(rc, 0)
         deferral_path = self.proj / ".claude" / "context" / "UPDATE_DEFERRED.md"

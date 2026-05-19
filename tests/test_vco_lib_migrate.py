@@ -36,10 +36,17 @@ from vco_lib import project_init  # noqa: E402
 # Fixtures: synthetic schema dicts mirroring the 7 sampled real-world cases.
 # ---------------------------------------------------------------------------
 
+# v0.2.18 — 5-slot KG target catalog (was 3 in v0.2.17). The 3 legacy
+# slots (qwen3_embed, ollama_embed, openai_embed) are RETAINED for
+# back-compat data preservation; arctic2_embed + openai_text_embed are
+# the new v0.2.18 additions. See vco_lib/weaviate_schema.py for the
+# canonical slot catalog.
 _TARGET_VEC_CONFIG = {
-    "qwen3_embed":  {"vectorizer": {"none": {}}, "vectorIndexType": "hnsw"},
-    "ollama_embed": {"vectorizer": {"none": {}}, "vectorIndexType": "hnsw"},
-    "openai_embed": {"vectorizer": {"none": {}}, "vectorIndexType": "hnsw"},
+    "qwen3_embed":        {"vectorizer": {"none": {}}, "vectorIndexType": "hnsw"},
+    "ollama_embed":       {"vectorizer": {"none": {}}, "vectorIndexType": "hnsw"},
+    "openai_embed":       {"vectorizer": {"none": {}}, "vectorIndexType": "hnsw"},
+    "arctic2_embed":      {"vectorizer": {"none": {}}, "vectorIndexType": "hnsw"},
+    "openai_text_embed":  {"vectorizer": {"none": {}}, "vectorIndexType": "hnsw"},
 }
 
 _FULL_PROPS = [
@@ -71,14 +78,17 @@ def _at_target() -> dict:
 
 
 def _at_target_dev() -> dict:
-    """A Development collection schema at the post-PR-24 target shape.
+    """A Development collection schema at the post-v0.2.18 target shape.
 
     PR-24 (2026-05-16) added 4 canonical temporal properties to the
     Development class definition (created, updated, valid_from,
     valid_until — see vco_lib.project_init.development_class_definition).
-    Tests that supply a Dev fetcher result must use THIS shape, not
-    `_at_target()` (which carries the KG-shape properties), or the
-    migrate dispatch will see spurious missing properties.
+
+    v0.2.18 (2026-05-19) added two more for KG parity: `status` (archived
+    doc filter) and `content_hash` (embed-skip fast-path). Tests that
+    supply a Dev fetcher result must use THIS shape, not `_at_target()`
+    (which carries the KG-shape properties), or the migrate dispatch will
+    see spurious missing properties.
     """
     return {
         "class": "ClaudeDevelopment",
@@ -92,6 +102,12 @@ def _at_target_dev() -> dict:
             {"name": "updated", "dataType": ["date"]},
             {"name": "valid_from", "dataType": ["date"]},
             {"name": "valid_until", "dataType": ["date"]},
+            # v0.2.18 (2026-05-19): KG parity — `status` + `content_hash`.
+            # Must mirror `vco_lib.project_init.development_class_definition`
+            # exactly so the schema-delta dispatcher returns noop on
+            # at-target Dev collections.
+            {"name": "status", "dataType": ["text"]},
+            {"name": "content_hash", "dataType": ["text"]},
         ],
     }
 
@@ -617,12 +633,20 @@ class LiveMigrateIntegrationTest(unittest.TestCase):
         kg_plan = next(p for p in result["plan"] if p["collection"] == self.KG_NAME)
         self.assertEqual(kg_plan["action"], "copy")
         self.assertEqual(kg_plan["objects_copied"], 5)
-        # (c) target schema present (3 slots + indexNullState)
+        # (c) target schema present (v0.2.18: 5 slots + indexNullState).
+        # Legacy v0.2.17 trio kept for data preservation + new v0.2.18
+        # slots added by the additive migration.
         new_schema = project_init._fetch_schema(self.KG_NAME, weaviate_url=self.url)
         self.assertIsNotNone(new_schema)
         self.assertEqual(
             set(new_schema["vectorConfig"].keys()),
-            {"qwen3_embed", "ollama_embed", "openai_embed"},
+            {
+                "qwen3_embed",
+                "ollama_embed",
+                "openai_embed",
+                "arctic2_embed",
+                "openai_text_embed",
+            },
         )
         self.assertTrue(
             new_schema["invertedIndexConfig"]["indexNullState"],
@@ -760,13 +784,20 @@ class LiveMigrateIntegrationTest(unittest.TestCase):
         # 4. Assertions.
         # (a) no errors — recovery succeeded.
         self.assertEqual(result["errors"], [], msg=f"plan: {result}")
-        # (b) `<name>` now exists with the target schema (3 named-vector
-        #     slots + indexNullState=true).
+        # (b) `<name>` now exists with the v0.2.18 target schema (5 named-
+        #     vector slots: legacy v0.2.17 trio + arctic2_embed +
+        #     openai_text_embed) + indexNullState=true.
         new_schema = project_init._fetch_schema(self.KG_NAME, weaviate_url=self.url)
         self.assertIsNotNone(new_schema, msg="recovery did not create <name>")
         self.assertEqual(
             set(new_schema["vectorConfig"].keys()),
-            {"qwen3_embed", "ollama_embed", "openai_embed"},
+            {
+                "qwen3_embed",
+                "ollama_embed",
+                "openai_embed",
+                "arctic2_embed",
+                "openai_text_embed",
+            },
         )
         self.assertTrue(new_schema["invertedIndexConfig"]["indexNullState"])
         # (c) all 5 original UUIDs are in `<name>` post-recovery.

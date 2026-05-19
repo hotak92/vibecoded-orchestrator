@@ -458,6 +458,32 @@ def test_main_exits_4_on_insert_errors(analyzer_mod, tmp_path: Path, monkeypatch
         mod.embed_function = lambda sig, body, language="python": None
         mod.embed_class = lambda sig, body, methods=None, language="python": None
 
+        # v0.2.18 (Wave B Commit 5): main() now constructs an
+        # EmbeddingService BEFORE the analyzer runs and bails with exit 0
+        # if no backend is reachable. On CI (no Ollama / CodeEmbed
+        # running) this gate fires first, short-circuiting the insert-
+        # error path this test is supposed to exercise. Mock both
+        # ``for_project`` and ``code_backend_ready`` so main() proceeds
+        # to the analyzer + reaches the insert-call simulation.
+        class _FakeSvc:
+            code_vector_slot = "codesage_embed"
+            code_model_id = "codesage-large-v2"
+            code_dim = 2048
+            text_vector_slot = "qwen3_embed"
+            text_model_id = "qwen3-embedding:0.6b"
+            text_dim = 1024
+            def code_backend_ready(self):
+                return True
+            def text_backend_ready(self):
+                return True
+            def close(self):
+                return None
+            def __enter__(self):
+                return self
+            def __exit__(self, *exc):
+                return None
+        mod.EmbeddingService.for_project = classmethod(lambda cls, *a, **kw: _FakeSvc())
+
         sys.argv = ["analyze_code_graph.py", r"{repo}",
                     "--project", "FakeProject", "--no-cfg", "--no-pdg"]
         sys.exit(mod.main())

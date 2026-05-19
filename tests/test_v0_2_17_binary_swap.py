@@ -202,8 +202,146 @@ class TestRunningStaleDeferral:
 # NB: VCT_AUTO_RESTART_LAUNCHER env-gate semantics live inside
 # `_refresh_dist_binary_after_rebuild`, not inside the
 # `_maybe_emit_running_stale_deferral` helper. The wrapper checks
-# the env, and only invokes the helper when the env is unset. Testing
-# the wrapper requires more fixture setup (target/release artifact
-# checks, swap simulation) — covered by the launcher-side integration
-# test in `tests/test_binary_swap_deferral.py` and by manual
-# verification of the v0.2.16 → v0.2.17 upgrade path.
+# the env, and only invokes the helper when the env is unset.
+#
+# v0.2.18 0.0: a regression test for the wrapper's routing logic
+# DOES live here now — the v0.2.17 routing assumed `src.is_file()`
+# implied the cargo path would emit, but the cargo path also bails
+# silently on the mtime gate. See TestWrapperRoutingStaleSrc below.
+
+
+class TestWrapperRoutingStaleSrc:
+    """v0.2.18 0.0 regression — the git-pull-case helper must run
+    even when a stale ``target/release/vct-launcher-temp`` exists,
+    because the cargo path bails silently on the mtime gate and
+    will not emit the deferral itself."""
+
+    def _write_stale_cargo_src(self, install_root: Path) -> Path:
+        """Drop a `vct-launcher-temp` file at the cargo-output path
+        with an mtime far in the past, simulating a stale local
+        build artifact from a prior `cargo build` run.
+        """
+        src = (
+            install_root
+            / "launcher"
+            / "src-tauri"
+            / "target"
+            / "release"
+            / "vct-launcher-temp"
+        )
+        src.parent.mkdir(parents=True, exist_ok=True)
+        src.write_text("stale cargo artifact from May 16")
+        # mtime way in the past so any dist file we create after this
+        # will be newer (defeats Gate 2 in the cargo path).
+        old_ts = 1_700_000_000.0  # 2023-11-14
+        os.utime(src, (old_ts, old_ts))
+        return src
+
+    def test_stale_cargo_src_does_not_swallow_deferral(
+        self, install_mod, fake_install: Path, monkeypatch
+    ):
+        """End-user upgrade path: ``git pull`` lands a fresh binary
+        at ``launcher/dist/<arch>/vct-launcher`` AND there's a stale
+        ``target/release/vct-launcher-temp`` on disk from a prior
+        local build.
+
+        Pre-v0.2.18 0.0: the wrapper's ``if not src.is_file()`` gate
+        routed to "cargo path will emit" — but the cargo path's
+        Gate 2 (``src_mtime <= dist_mtime``) bails silently, leaving
+        the deferral unemitted. Result: the launcher's W4 restart
+        banner never fired and the user kept executing the old
+        binary.
+
+        Post-fix: the helper runs unconditionally, so the deferral
+        emits regardless of whether the stale cargo src exists.
+        """
+        _write_vct_module(fake_install, "0.2.17.1")
+        _write_manifest(fake_install, "0.2.17")
+        dist_path = _write_fake_dist_binary(fake_install)
+        # The stale cargo artifact that used to deflect the routing.
+        stale_src = self._write_stale_cargo_src(fake_install)
+        assert stale_src.is_file()  # sanity
+        # Pretend we're invoked from the launcher's update_orchestrator
+        monkeypatch.setenv("VCT_LAUNCHER_PID", "12345")
+        monkeypatch.delenv("VCT_AUTO_RESTART_LAUNCHER", raising=False)
+        monkeypatch.delenv("VCT_FORCE_RESTART_DEFERRAL", raising=False)
+
+        report = _FakeDeferralReport()
+        install_mod._refresh_dist_binary_after_rebuild(
+            fake_install,
+            no_swap=False,
+            install_start_ts=None,
+            deferral_report=report,
+        )
+
+        assert "launcher_restart_required" in report.condition_ids(), (
+            "Regression: stale src deflected the routing and the "
+            "git-pull-case deferral was lost. "
+            f"Got: {report.condition_ids()}"
+        )
+
+    def test_auto_restart_env_still_suppresses_emit_with_stale_src(
+        self, install_mod, fake_install: Path, monkeypatch
+    ):
+        """With ``VCT_AUTO_RESTART_LAUNCHER=1`` (Rust caller does the
+        restart), the deferral should be suppressed even if the
+        running-stale conditions are otherwise true — including when
+        a stale cargo src exists. Verifies the v0.2.18 0.0 routing
+        change didn't break the auto-restart suppression."""
+        _write_vct_module(fake_install, "0.2.17.1")
+        _write_manifest(fake_install, "0.2.17")
+        _write_fake_dist_binary(fake_install)
+        self._write_stale_cargo_src(fake_install)
+        monkeypatch.setenv("VCT_LAUNCHER_PID", "12345")
+        monkeypatch.setenv("VCT_AUTO_RESTART_LAUNCHER", "1")
+
+        report = _FakeDeferralReport()
+        install_mod._refresh_dist_binary_after_rebuild(
+            fake_install,
+            no_swap=False,
+            install_start_ts=None,
+            deferral_report=report,
+        )
+
+        assert "launcher_restart_required" not in report.condition_ids(), (
+            "VCT_AUTO_RESTART_LAUNCHER=1 should suppress the deferral; "
+            f"got: {report.condition_ids()}"
+        )
+
+    def test_no_double_emit_when_cargo_path_also_swaps(
+        self, install_mod, fake_install: Path, monkeypatch
+    ):
+        """When BOTH paths would emit (fresh cargo build AND
+        running-stale conditions met), only one ``launcher_restart_required``
+        entry should land in the report — the helper short-circuits
+        on ``source_version == last_installed_version`` once the
+        cargo path has bumped the manifest.
+
+        For this test we don't actually invoke the cargo path (no real
+        swap happens) — instead we verify the helper itself is
+        idempotent: calling it twice in a row produces only one entry,
+        which is the same property that protects against double-emit
+        in the wrapper.
+        """
+        _write_vct_module(fake_install, "0.2.17.1")
+        _write_manifest(fake_install, "0.2.17")
+        dist_path = _write_fake_dist_binary(fake_install)
+        monkeypatch.setenv("VCT_LAUNCHER_PID", "12345")
+        monkeypatch.delenv("VCT_AUTO_RESTART_LAUNCHER", raising=False)
+
+        report = _FakeDeferralReport()
+        # First call: emits.
+        install_mod._maybe_emit_running_stale_deferral(
+            fake_install, dist_path=dist_path, deferral_report=report,
+        )
+        # Simulate the cargo path having bumped the manifest to match
+        # source (which is what a successful swap+install does).
+        _write_manifest(fake_install, "0.2.17.1")
+        # Second call: should be a no-op (source==installed now).
+        install_mod._maybe_emit_running_stale_deferral(
+            fake_install, dist_path=dist_path, deferral_report=report,
+        )
+        assert report.condition_ids().count("launcher_restart_required") == 1, (
+            "Helper should be idempotent once manifest matches source; "
+            f"got: {report.condition_ids()}"
+        )

@@ -125,34 +125,78 @@ def _collection_name(base: str, project: str = None) -> str:
     return f"{_sanitize_collection_prefix(project)}_{base}"
 
 
-# Code embedding configuration
-CODE_EMBED_BACKEND = os.getenv("CODE_EMBED_BACKEND", "service")
+# Code embedding configuration — v0.2.18: centralised via
+# EmbeddingService. Pre-v0.2.18 read CODE_EMBED_BACKEND / CODE_EMBED_-
+# SERVICE_URL / CODE_EMBED_MODEL directly and hardcoded the slot.
 CODE_EMBED_SERVICE_URL = os.getenv("CODE_EMBED_SERVICE_URL", "http://localhost:11440")
-_OLLAMA_CODE_MODEL = os.getenv("CODE_EMBED_MODEL", "unclemusclez/jina-embeddings-v2-base-code:latest")
 
-_ACTIVE_CODE_VECTOR = "codesage_embed" if CODE_EMBED_BACKEND == "service" else "ollama_code_embed"
+# Import EmbeddingService — graceful fallback for half-installed venvs.
+try:
+    _vco_lib_parent = _PROJECT_ROOT
+    if str(_vco_lib_parent) not in sys.path:
+        sys.path.insert(0, str(_vco_lib_parent))
+    from vco_lib.embedding_service import (
+        EmbeddingService,
+        NoEmbeddingBackendError,
+    )
+    HAS_EMBEDDING_SERVICE = True
+except Exception:
+    HAS_EMBEDDING_SERVICE = False
+    EmbeddingService = None  # type: ignore[assignment]
+    NoEmbeddingBackendError = Exception  # type: ignore[assignment]
+
+
+_cached_embedding_service: "EmbeddingService | None" = None
+
+
+def _get_or_create_embedding_service():
+    """Lazy-construct EmbeddingService, cached for the CLI's lifetime."""
+    global _cached_embedding_service
+    if _cached_embedding_service is not None:
+        return _cached_embedding_service
+    if not HAS_EMBEDDING_SERVICE:
+        return None
+    try:
+        _cached_embedding_service = EmbeddingService.for_project()
+        return _cached_embedding_service
+    except Exception as e:
+        print(f"⚠️  EmbeddingService construction failed: {e}", file=sys.stderr)
+        return None
+
+
+def _active_code_vector_slot() -> str:
+    """Return the active code-vector slot. Falls back to codesage_embed
+    when EmbeddingService isn't available (pre-v0.2.18 default)."""
+    svc = _get_or_create_embedding_service()
+    if svc is None:
+        return "codesage_embed"
+    return svc.code_vector_slot
 
 
 def generate_code_embedding(text: str) -> Optional[List[float]]:
-    """Generate code embedding using configured backend."""
+    """Generate code embedding via EmbeddingService.
+
+    v0.2.18: routes through EmbeddingService.embed_code (which picks
+    CodeEmbed / Ollama / OpenAI from env). Falls back to direct
+    CodeEmbed-service HTTP call when the service isn't available.
+    """
+    svc = _get_or_create_embedding_service()
+    if svc is not None:
+        try:
+            return svc.embed_code(text)
+        except Exception as e:
+            print(f"⚠️  EmbeddingService.embed_code failed: {e}", file=sys.stderr)
+    # Legacy fallback: direct CodeEmbed HTTP call.
     try:
-        if CODE_EMBED_BACKEND == "service":
-            response = requests.post(
-                f"{CODE_EMBED_SERVICE_URL}/api/embeddings",
-                json={"model": "", "prompt": text},
-                timeout=60,
-            )
-        else:
-            response = requests.post(
-                f"{OLLAMA_URL}/api/embeddings",
-                json={"model": _OLLAMA_CODE_MODEL, "prompt": text},
-                timeout=30,
-            )
+        response = requests.post(
+            f"{CODE_EMBED_SERVICE_URL}/api/embeddings",
+            json={"model": "", "prompt": text},
+            timeout=60,
+        )
         if response.status_code == 200:
             return response.json()["embedding"]
-        else:
-            print(f"❌ Embedding generation failed: HTTP {response.status_code}")
-            return None
+        print(f"❌ Embedding generation failed: HTTP {response.status_code}")
+        return None
     except Exception as e:
         print(f"❌ Embedding error: {e}")
         return None
@@ -262,7 +306,7 @@ class CodeGraphQuery:
                     near_vector=query_embedding,
                     limit=limit,
                     return_metadata=MetadataQuery(distance=True),
-                    target_vector=_ACTIVE_CODE_VECTOR,
+                    target_vector=_active_code_vector_slot(),
                 )
                 if project_filter:
                     nv_kwargs["filters"] = Filter.by_property("project").equal(project_filter)

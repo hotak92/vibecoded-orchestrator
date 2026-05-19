@@ -7,6 +7,10 @@
   import { isTauriRuntime } from '$lib/tauri';
   import { isOnboardingComplete, markOnboardingComplete } from '$lib/onboarding';
   import DialogRoot from '$lib/components/DialogRoot.svelte';
+  import type {
+    OpenAiValidationResult,
+    RegisterOpenAiResponse,
+  } from '$lib/types/openai-validation';
 
   let {
     force = false,
@@ -49,7 +53,12 @@
   // key `vct.onboarding_complete` is migrated on first DB read; see
   // $lib/onboarding for the upgrade logic.
 
-  let step = $state<1 | 2 | 3 | 4>(1);
+  // v0.2.18 (Commit 6): step 5 added for optional OpenAI API key. Step
+  // 4 stays the project-create + GitHub PAT step; the new step is the
+  // wizard's final action — clicking Continue at step 5 also fires
+  // finish() (project creation + close), keeping the existing
+  // "Finish creates the project" contract.
+  let step = $state<1 | 2 | 3 | 4 | 5>(1);
 
   // Step 2: detection
   let detection = $state<any>(null);
@@ -131,6 +140,44 @@
   let savingPat = $state(false);
   let patError = $state<string | null>(null);
   let patSaved = $state(false);
+
+  // v0.2.18 (Commit 6): optional OpenAI API key step (step 5).
+  //
+  // Validation lifecycle:
+  //   - `openaiKey` is what the user typed.
+  //   - `openaiValidation` holds the last `validate_openai_api_key`
+  //     result. null = "not yet validated this value". The current
+  //     key field value is compared via `openaiValidatedFor` so that
+  //     editing the input field after a Valid result clears the
+  //     validated state (re-typing must re-validate).
+  //   - `openaiValidating` gates the Validate / Continue buttons during
+  //     an in-flight probe.
+  //   - `useOpenAiAsDefault` is the checkbox state; gated behind a
+  //     successful validation per locked design rule (no-auto-switch
+  //     outside this explicit opt-in).
+  //
+  // Reveal-eye pattern mirrors common password-input UX: a small toggle
+  // button flips `<input type>` between "password" (masked default) and
+  // "text" (visible) so the user can paste-and-verify without leaving
+  // the field. Mask-by-default keeps shoulder-surfers and screen-share
+  // demos safe.
+  let openaiKey = $state('');
+  let openaiKeyVisible = $state(false);
+  let useOpenAiAsDefault = $state(false);
+  let openaiValidating = $state(false);
+  let openaiValidation = $state<OpenAiValidationResult | null>(null);
+  // The key value `openaiValidation` was produced for. When the user
+  // edits the field after a Valid result, this no longer matches
+  // `openaiKey.trim()` and we treat the validation as stale — the
+  // "use as default" checkbox locks again, and Continue re-runs
+  // validation before saving.
+  let openaiValidatedFor = $state<string>('');
+  let openaiRegistering = $state(false);
+  // Generic error string for the register path (keychain failure,
+  // validation propagation error). Inline-rendered above the action
+  // row; separate from `openaiValidation` which carries the *probe*
+  // outcome.
+  let openaiRegisterError = $state<string | null>(null);
 
   // Bug 28: step 3 → step 4 advance confirmation when install hasn't run.
   // Shows {install_now | skip | cancel} so the user makes an explicit
@@ -220,6 +267,186 @@
     } finally {
       savingPat = false;
     }
+  }
+
+  // v0.2.18 (Commit 6): OpenAI key step helpers.
+  //
+  // ─── Derived state ─────────────────────────────────────────────────
+  //
+  // The current input value (post-trim) — recomputed on every keystroke
+  // via Svelte 5's `$derived`. Drives:
+  //   - `openaiValidationStale` (was the last probe for THIS value?)
+  //   - `openaiCheckboxEnabled` (only after a Valid probe for THIS value)
+  //   - the Validate / Continue button `disabled` states (empty key
+  //     deactivates both)
+  const openaiKeyTrimmed = $derived(openaiKey.trim());
+  // Validation is "fresh" only if the last probe ran for the current
+  // (trimmed) key value AND returned `valid`. Editing the field after
+  // a valid result clears the freshness — the checkbox de-activates
+  // and Continue will re-run validation before saving.
+  const openaiValidationFresh = $derived(
+    openaiValidation?.status === 'valid' &&
+      openaiValidatedFor === openaiKeyTrimmed &&
+      openaiKeyTrimmed !== '',
+  );
+  const openaiCheckboxEnabled = $derived(openaiValidationFresh);
+  // Reset the checkbox when validation becomes stale (e.g. user edits
+  // the field after validating). Belt-and-braces — the disabled
+  // attribute already blocks UI interaction, but if the user previously
+  // checked the box and then changes the key, we don't want a stale
+  // `true` to leak into the register call.
+  $effect(() => {
+    if (!openaiCheckboxEnabled && useOpenAiAsDefault) {
+      useOpenAiAsDefault = false;
+    }
+  });
+
+  async function validateOpenAiKey(): Promise<OpenAiValidationResult | null> {
+    if (!openaiKeyTrimmed) {
+      // Defensive — Validate button is disabled in this state, but if
+      // a programmatic caller (Continue path) reaches here with an
+      // empty value we surface "no probe attempted" rather than
+      // recording a misleading Invalid.
+      openaiValidation = null;
+      openaiValidatedFor = '';
+      return null;
+    }
+    openaiValidating = true;
+    openaiRegisterError = null;
+    try {
+      // The Rust command returns `Result<OpenAiValidationResult, String>`.
+      // String Err is reserved for unrecoverable Rust-side bugs; the
+      // probe's outcomes (auth failures, model not accessible, network
+      // errors) all flow into `OpenAiValidationResult::{Invalid, Error}`.
+      // We forward `Err` into the inline `error` state so users get a
+      // single feedback surface regardless of the failure mode.
+      const result = await invoke<OpenAiValidationResult>('validate_openai_api_key', {
+        value: openaiKeyTrimmed,
+        model: null,
+      });
+      openaiValidation = result;
+      openaiValidatedFor = openaiKeyTrimmed;
+      return result;
+    } catch (e) {
+      // Unrecoverable Rust-side error (e.g. tauri-side serde failure).
+      // Surface as `error` for the feedback element rather than a
+      // separate exception path the user has to interpret.
+      const detail = e instanceof Error ? e.message : String(e);
+      openaiValidation = { status: 'error', detail };
+      openaiValidatedFor = openaiKeyTrimmed;
+      return openaiValidation;
+    } finally {
+      openaiValidating = false;
+    }
+  }
+
+  /**
+   * Triggered by the in-step "Validate" button. Calls the Tauri probe
+   * and updates inline state; no side effects beyond `openaiValidation`
+   * + `openaiValidatedFor`.
+   */
+  async function onValidateOpenAi() {
+    await validateOpenAiKey();
+  }
+
+  /**
+   * Pressing Enter inside the API-key input runs Validate (same
+   * affordance as web forms with implicit submit). Skipped when the
+   * field is empty or a probe is already in flight.
+   */
+  function onOpenAiKeyKeydown(e: KeyboardEvent) {
+    if (e.key === 'Enter' && openaiKeyTrimmed && !openaiValidating) {
+      e.preventDefault();
+      void onValidateOpenAi();
+    }
+  }
+
+  /**
+   * "Skip" — abandon any typed value, advance to wizard close (which
+   * also runs project creation via `finish()`). We explicitly clear
+   * the input so a paranoid screen-recording demo doesn't leak the
+   * typed-but-discarded key after the wizard hands off control.
+   */
+  async function skipOpenAiStep() {
+    openaiKey = '';
+    openaiValidation = null;
+    openaiValidatedFor = '';
+    useOpenAiAsDefault = false;
+    openaiRegisterError = null;
+    await finish();
+  }
+
+  /**
+   * "Continue" — save the key (if validated + non-empty) and advance.
+   *
+   * Decision tree:
+   *   - Empty key → behaves like Skip (advance, nothing saved).
+   *   - Non-empty but unvalidated → run Validate first; abort on
+   *     non-Valid result so the user sees the inline error.
+   *   - Valid + checkbox unchecked → `register_openai_api_key(value, false)`.
+   *   - Valid + checkbox checked   → `register_openai_api_key(value, true)`.
+   *
+   * After a successful register the wizard advances via `finish()`,
+   * which is the same exit point Skip uses (project creation +
+   * onboarding-complete flag + onClose/onComplete callbacks).
+   */
+  async function continueOpenAiStep() {
+    openaiRegisterError = null;
+
+    // Empty key → equivalent to Skip. The user implicitly opted out of
+    // OpenAI without engaging with the form. The locked design rule
+    // ("no auto-switch outside the checkbox") means we don't write any
+    // defaults — `app_state` stays at whatever install.py wrote.
+    if (!openaiKeyTrimmed) {
+      await finish();
+      return;
+    }
+
+    // Non-empty but stale validation → run Validate first. We can't
+    // trust an old `valid` result for a different value; the user may
+    // have pasted a new key over the old one.
+    if (!openaiValidationFresh) {
+      const result = await validateOpenAiKey();
+      if (!result || result.status !== 'valid') {
+        // Validation failed — the inline feedback already explains
+        // why. Stay on this step so the user can fix the key.
+        return;
+      }
+    }
+
+    // At this point `openaiValidation` is `valid` for `openaiKeyTrimmed`.
+    // Register + (optionally) apply defaults, then advance.
+    openaiRegistering = true;
+    try {
+      // The Rust register command re-validates internally for defense
+      // in depth, but we already paid for that round-trip above — the
+      // duplicate hit is negligible (a free /v1/models GET) and keeps
+      // the contract simple. If the second validation fails (network
+      // hiccup between our two calls) the Err is surfaced inline below.
+      await invoke<RegisterOpenAiResponse>('register_openai_api_key', {
+        value: openaiKeyTrimmed,
+        setAsDefault: useOpenAiAsDefault,
+      });
+      toast.success(
+        useOpenAiAsDefault
+          ? 'OpenAI key saved and set as default'
+          : 'OpenAI key saved',
+      );
+    } catch (e) {
+      // register_openai_api_key Err means either:
+      //   - Keychain write failed (rare; keychain locked / permission)
+      //   - Internal re-validation now returns Invalid/Error
+      // Either way the keychain stays untouched (Rust register path
+      // validates BEFORE writing). Surface the message and let the
+      // user fix the key or retry.
+      openaiRegisterError = e instanceof Error ? e.message : String(e);
+      openaiRegistering = false;
+      return;
+    } finally {
+      openaiRegistering = false;
+    }
+
+    await finish();
   }
 
   // Bug 8: adopt-confirm modal. Populated by `previewInstall` before
@@ -739,7 +966,11 @@
   }
 
   function advance() {
-    if (step < 4) step = (step + 1) as any;
+    // v0.2.18 (Commit 6): step bound bumped to 5 for the new OpenAI
+    // step. Step 4's load-hook still fires when we land on it
+    // (project-create state); step 5 has no preload work — its only
+    // I/O is the user-driven validate / register path.
+    if (step < 5) step = (step + 1) as any;
     if (step === 2 && !detection) void loadStep2();
     if (step === 4) void loadStep4();
   }
@@ -882,6 +1113,7 @@
           <li class:active={step >= 2} class:current={step === 2}>2. System</li>
           <li class:active={step >= 3} class:current={step === 3}>3. Containers</li>
           <li class:active={step >= 4} class:current={step === 4}>4. First project</li>
+          <li class:active={step >= 5} class:current={step === 5}>5. OpenAI</li>
         </ol>
       </header>
   {/snippet}
@@ -1231,6 +1463,173 @@
               {#if patError}<p class="ow-error">{patError}</p>{/if}
             {/if}
           </div>
+        {:else if step === 5}
+          <!-- v0.2.18 (Commit 6): OpenAI API key step. Optional —
+               local embedding models are the recommended default and
+               work out of the box. Locked design rule: this checkbox
+               is the ONLY surface that auto-sets `default_text_embedding` /
+               `default_code_embedding` to `openai-*` at wizard time.
+               If unchecked, the key is saved but the new-projects
+               defaults stay at whatever install.py wrote. Mirrors the
+               Preferences page's no-auto-switch contract. -->
+          <h3 class="ow-step-title">OpenAI API key (optional)</h3>
+          <p class="ow-secondary">
+            Use OpenAI for embeddings (KG + code graph) if you prefer
+            cloud-quality vectors over local. Keys are stored in your OS
+            keychain — never written to plain files. Skip to use local
+            models (recommended unless you have specific needs).
+          </p>
+
+          <label class="ow-label" for="openai-key-input">
+            <span>OpenAI API key</span>
+            <div class="ow-openai-key-row">
+              <!-- Mask-by-default; reveal toggle below mirrors the
+                   common password-input pattern. `aria-describedby`
+                   ties the input to the feedback element so screen
+                   readers announce status changes. -->
+              <input
+                id="openai-key-input"
+                type={openaiKeyVisible ? 'text' : 'password'}
+                bind:value={openaiKey}
+                onkeydown={onOpenAiKeyKeydown}
+                placeholder="sk-…"
+                autocomplete="off"
+                spellcheck="false"
+                class="ow-openai-key-input"
+                aria-label="OpenAI API key"
+                aria-describedby="openai-key-feedback"
+                disabled={openaiValidating || openaiRegistering}
+              />
+              <button
+                type="button"
+                class="ow-btn ow-openai-eye"
+                onclick={() => (openaiKeyVisible = !openaiKeyVisible)}
+                aria-label={openaiKeyVisible ? 'Hide API key' : 'Show API key'}
+                title={openaiKeyVisible ? 'Hide' : 'Show'}
+                disabled={openaiValidating || openaiRegistering}
+              >
+                {openaiKeyVisible ? 'Hide' : 'Show'}
+              </button>
+            </div>
+          </label>
+
+          <!-- Inline validation feedback. `aria-live="polite"` so screen
+               readers announce status updates without interrupting; the
+               id matches the input's `aria-describedby`. We render the
+               element unconditionally (with an empty body when there's
+               nothing to say) so the live-region wiring is stable
+               across state transitions — toggling the element in and
+               out of the DOM would break some AT implementations. -->
+          <p
+            id="openai-key-feedback"
+            class="ow-openai-feedback"
+            class:ow-openai-feedback-valid={openaiValidationFresh && openaiValidation?.status === 'valid' && !openaiValidation.rate_limited}
+            class:ow-openai-feedback-rate-limited={openaiValidationFresh && openaiValidation?.status === 'valid' && openaiValidation.rate_limited}
+            class:ow-openai-feedback-invalid={openaiValidation?.status === 'invalid' && openaiValidatedFor === openaiKeyTrimmed}
+            class:ow-openai-feedback-error={openaiValidation?.status === 'error' && openaiValidatedFor === openaiKeyTrimmed}
+            class:ow-openai-feedback-validating={openaiValidating}
+            aria-live="polite"
+          >
+            {#if openaiValidating}
+              <span class="ow-openai-spinner" aria-hidden="true">⏳</span>
+              Validating…
+            {:else if openaiValidation && openaiValidatedFor === openaiKeyTrimmed && openaiKeyTrimmed !== ''}
+              {#if openaiValidation.status === 'valid' && !openaiValidation.rate_limited}
+                <span aria-hidden="true">✓</span>
+                Valid — {openaiValidation.model} accessible
+              {:else if openaiValidation.status === 'valid' && openaiValidation.rate_limited}
+                <span aria-hidden="true">⚠</span>
+                Rate-limited; treat as valid
+              {:else if openaiValidation.status === 'invalid'}
+                <span aria-hidden="true">✗</span>
+                Invalid: {openaiValidation.reason}
+              {:else if openaiValidation.status === 'error'}
+                <span aria-hidden="true">⚠</span>
+                Couldn't reach OpenAI: {openaiValidation.detail}
+              {/if}
+            {:else}
+              <!-- Empty placeholder — keeps the element in the DOM so
+                   aria-live wiring stays stable. The zero-width space
+                   guards against some browser/AT quirks that suppress
+                   announcements of fully-empty live regions. -->
+              <span aria-hidden="true">&#8203;</span>
+            {/if}
+          </p>
+
+          <!-- "Use as default" gates behind a successful validation:
+               we don't want users committing to a default for new
+               projects with an untested key. `aria-disabled` mirrors
+               the `disabled` attribute for AT users — some screen
+               readers handle the two attributes asymmetrically. -->
+          <label
+            class="ow-checkbox ow-openai-default-checkbox"
+            class:ow-openai-default-disabled={!openaiCheckboxEnabled}
+            title={openaiCheckboxEnabled
+              ? 'Sets the new-projects default to OpenAI text-embedding-3-small'
+              : 'Validate the API key first to enable this option'}
+          >
+            <input
+              type="checkbox"
+              bind:checked={useOpenAiAsDefault}
+              disabled={!openaiCheckboxEnabled}
+              aria-disabled={!openaiCheckboxEnabled}
+            />
+            <span>Use OpenAI as the default embedding provider for new projects</span>
+          </label>
+
+          {#if openaiRegisterError}
+            <p class="ow-error">{openaiRegisterError}</p>
+          {/if}
+
+          <!-- Action row: Validate / Skip / Continue. Tab order is
+               natural-document-order (input → eye toggle → Validate →
+               checkbox → Skip → Continue) which matches the wizard
+               header → footer reading order screen readers follow. -->
+          <div class="ow-openai-actions">
+            <button
+              type="button"
+              class="ow-btn"
+              onclick={onValidateOpenAi}
+              disabled={!openaiKeyTrimmed || openaiValidating || openaiRegistering}
+              aria-label="Validate OpenAI API key"
+            >
+              {openaiValidating ? 'Validating…' : 'Validate'}
+            </button>
+            <div class="ow-openai-actions-right">
+              <button
+                type="button"
+                class="ow-btn"
+                onclick={skipOpenAiStep}
+                disabled={openaiValidating || openaiRegistering || creatingProject}
+                aria-label="Skip OpenAI key step"
+              >
+                Skip
+              </button>
+              <button
+                type="button"
+                class="ow-btn-primary"
+                onclick={continueOpenAiStep}
+                disabled={openaiValidating || openaiRegistering || creatingProject}
+                aria-label="Continue with the wizard"
+              >
+                {#if openaiRegistering}
+                  Saving…
+                {:else if creatingProject}
+                  Creating…
+                {:else}
+                  Continue
+                {/if}
+              </button>
+            </div>
+          </div>
+
+          {#if projectError}
+            <!-- Project-creation can surface its error here when the
+                 user clicks Continue or Skip and `finish()` fires; we
+                 don't want to bury it in step 4's branch since step 5
+                 is where the click happened. -->
+            <p class="ow-error">{projectError}</p>
+          {/if}
         {/if}
   {/snippet}
   {#snippet footer()}
@@ -1244,11 +1643,23 @@
               onclick={next}
               disabled={!!showSkipInstallConfirm || !!showInstallConfirm || !!pendingConflict || !!duplicateProjectPrompt}
             >Next →</button>
-          {:else}
-            <button class="ow-btn-primary" onclick={finish} disabled={creatingProject}>
-              {creatingProject ? 'Creating…' : 'Finish'}
-            </button>
+          {:else if step === 4}
+            <!-- v0.2.18 (Commit 6): step 4 used to be the last step
+                 (rendered "Finish"). With step 5 (OpenAI) inserted
+                 after it, step 4 now advances to step 5; the project
+                 is created via `finish()` when the user exits step 5
+                 (Skip or Continue), keeping the existing
+                 "Finish creates the project" contract intact. -->
+            <button
+              class="ow-btn-primary"
+              onclick={next}
+              disabled={!!showSkipInstallConfirm || !!showInstallConfirm || !!pendingConflict || !!duplicateProjectPrompt || creatingProject}
+            >Next →</button>
           {/if}
+          <!-- Step 5: no footer primary button — the body owns its
+               Skip / Continue affordances so Validate fits naturally
+               beside them. The footer keeps Back + the global
+               "Skip onboarding" link only. -->
         </div>
       </div>
   {/snippet}
@@ -1709,4 +2120,43 @@
     background: rgba(0,0,0,0.3); color: #eee; border: 1px solid rgba(255,255,255,0.08);
     border-radius: 4px; resize: vertical; box-sizing: border-box;
   }
+
+  /* v0.2.18 (Commit 6): OpenAI API key step (step 5).
+     Styling intentionally mirrors the GitHub PAT subsection (.ow-pat)
+     and the broader wizard palette — no new design tokens. */
+  .ow-step-title { font-size: 14px; margin: 0 0 8px; color: #eee; font-weight: 600; }
+  .ow-openai-key-row { display: flex; gap: 6px; align-items: stretch; }
+  .ow-openai-key-input {
+    flex: 1;
+    background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.12); color: inherit;
+    padding: 5px 10px; border-radius: 4px; font-size: 13px;
+    font-family: ui-monospace, monospace;
+  }
+  .ow-openai-key-input:disabled { opacity: 0.55; cursor: not-allowed; }
+  .ow-openai-eye { flex-shrink: 0; min-width: 56px; }
+  .ow-openai-feedback {
+    font-size: 12px; min-height: 18px; margin: 6px 0 4px; color: #888;
+    display: flex; align-items: center; gap: 6px;
+  }
+  .ow-openai-feedback-validating { color: #ccc; }
+  .ow-openai-feedback-valid { color: #0fc; }
+  .ow-openai-feedback-rate-limited { color: #ffb84a; }
+  .ow-openai-feedback-invalid { color: #f99; }
+  .ow-openai-feedback-error { color: #ffb84a; }
+  .ow-openai-spinner {
+    display: inline-block;
+    animation: ow-spin 1.2s linear infinite;
+  }
+  @keyframes ow-spin {
+    from { transform: rotate(0deg); }
+    to   { transform: rotate(360deg); }
+  }
+  .ow-openai-default-checkbox { margin-top: 10px; }
+  .ow-openai-default-disabled { opacity: 0.5; cursor: not-allowed; }
+  .ow-openai-default-disabled input { cursor: not-allowed; }
+  .ow-openai-actions {
+    display: flex; justify-content: space-between; gap: 8px;
+    align-items: center; margin-top: 14px;
+  }
+  .ow-openai-actions-right { display: flex; gap: 6px; }
 </style>

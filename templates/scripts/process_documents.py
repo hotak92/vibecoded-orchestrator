@@ -54,17 +54,41 @@ def _resolve_mcp_servers_dir() -> Path:
 
 _MCP_DIR = _resolve_mcp_servers_dir()
 sys.path.insert(0, str(_MCP_DIR / "weaviate_mcp"))
+# v0.2.18: make vco_lib (EmbeddingService) importable.
+_VCO_LIB_PARENT = _MCP_DIR.parent
+if str(_VCO_LIB_PARENT) not in sys.path:
+    sys.path.insert(0, str(_VCO_LIB_PARENT))
+# Expose templates/scripts/ so the local sync_knowledge_graph wrapper is
+# importable (same as maintain_knowledge_graph.py).
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
 # VCO-REWIRE-END: orchestrator-root-resolution
 
-from server import WeaviateMCPServer
+# v0.2.18: pre-v0.2.18 imported `WeaviateMCPServer` from
+# `claude_mcp_servers/weaviate_mcp/server.py` — that symbol never existed,
+# so this script was broken at import-time. Switch to the WeaviateWrapper
+# defined in `sync_knowledge_graph` + the central EmbeddingService that
+# owns embed/slot decisions.
+from sync_knowledge_graph import WeaviateWrapper as WeaviateMCPServer
+from vco_lib.embedding_service import (
+    EmbeddingService,
+    NoEmbeddingBackendError,
+)
 from chunking import chunk_text, TokenCounter
 from weaviate.classes.query import Filter
 from weaviate.classes.config import Configure, Property, DataType
 
 # Configuration
+# v0.2.18: EMBEDDING_MODEL no longer read directly here. The
+# EmbeddingService resolves both the active text model and its slot
+# from env. Documents go to the DocumentChunks collection (flat single
+# vector, no named-vector slots), so this script always writes a flat
+# vector regardless of DUAL_EMBEDDING_ENABLED — the DocumentChunks
+# schema uses `Configure.Vectorizer.none()` (see
+# `ensure_document_chunks_collection`).
 WEAVIATE_URL = os.getenv("WEAVIATE_URL", "http://localhost:8081")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11435")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "qwen3-embedding:0.6b")
 GRPC_PORT = int(os.getenv("GRPC_PORT", "50052"))
 
 DOCUMENTS_ROOT = PROJECT_ROOT / "documents"
@@ -539,12 +563,27 @@ def main():
         print("       process_documents.py --all")
         sys.exit(1)
 
+    embedding_service = None
+    server = None
     try:
-        # Initialize server
+        # v0.2.18: construct EmbeddingService at script entry. Soft-fail
+        # on no-backend (write deferral + exit 0) mirrors the
+        # sync_knowledge_graph.py seed path.
+        try:
+            embedding_service = EmbeddingService.for_project(PROJECT_ROOT)
+        except NoEmbeddingBackendError as e:
+            print(f"⚠️  Document processing skipped: {e}", file=sys.stderr)
+            print(
+                "   See .claude/context/EMBEDDING_FAILURES.md + "
+                "~/.claude/metrics/embedding_failures.jsonl",
+                file=sys.stderr,
+            )
+            sys.exit(0)
+
+        # Initialize Weaviate client + bind to the embedding service
         server = WeaviateMCPServer(
             weaviate_url=WEAVIATE_URL,
-            ollama_url=OLLAMA_URL,
-            embedding_model=EMBEDDING_MODEL,
+            embedding_service=embedding_service,
             grpc_port=GRPC_PORT
         )
 
@@ -582,10 +621,16 @@ def main():
         traceback.print_exc()
         sys.exit(1)
     finally:
-        try:
-            server.close()
-        except:
-            pass
+        if server is not None:
+            try:
+                server.close()
+            except Exception:
+                pass
+        if embedding_service is not None:
+            try:
+                embedding_service.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

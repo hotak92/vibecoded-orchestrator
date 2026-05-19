@@ -19,7 +19,7 @@ import time
 import yaml
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Mapping
 import uuid
 
 # VCO-REWIRE-BEGIN: orchestrator-root-resolution
@@ -59,11 +59,29 @@ def _resolve_mcp_servers_dir() -> Path:
 
 _MCP_DIR = _resolve_mcp_servers_dir()
 sys.path.insert(0, str(_MCP_DIR))
+# Also make vco_lib importable (it lives next to claude_mcp_servers in the
+# orchestrator clone). EmbeddingService is the v0.2.18 central dispatcher
+# for embedding calls — see vco_lib/embedding_service.py.
+_VCO_LIB_PARENT = _MCP_DIR.parent
+if str(_VCO_LIB_PARENT) not in sys.path:
+    sys.path.insert(0, str(_VCO_LIB_PARENT))
 # VCO-REWIRE-END: orchestrator-root-resolution
 
 import weaviate
 from weaviate.classes.query import Filter
 from weaviate_mcp.chunking import TokenCounter, Chunker
+
+# v0.2.18: central embedding dispatcher. Replaces the inline Ollama call
+# that was hardcoded to qwen3-embedding (and threw RuntimeError when
+# ACTIVE_EMBEDDING was anything else — audit finding KG-W1, 2026-04-30).
+# EmbeddingService.for_project() picks the right backend (ollama / openai)
+# AND the right named-vector slot (qwen3_embed / openai_text_embed /
+# arctic2_embed / ...) from the environment, so this script no longer
+# cares about ACTIVE_EMBEDDING or EMBEDDING_MODEL directly.
+from vco_lib.embedding_service import (
+    EmbeddingService,
+    NoEmbeddingBackendError,
+)
 
 # Try to import query logger
 try:
@@ -74,9 +92,13 @@ except Exception as e:
     HAS_LOGGER = False
 
 # Configuration - Read from environment variables (set by MCP servers or project settings)
+# Note (v0.2.18): EMBEDDING_MODEL / ACTIVE_EMBEDDING are NOT read here any
+# more. The EmbeddingService instance (set up in main() and passed via the
+# WeaviateWrapper) resolves both from env and exposes the active named-
+# vector slot via `svc.text_vector_slot`. Keeping the env name in the
+# `_redacted_env_snapshot()` failure log is enough for diagnostics.
 WEAVIATE_URL = os.getenv("WEAVIATE_URL", "http://localhost:8081")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11435")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "qwen3-embedding:0.6b")
 GRPC_PORT = int(os.getenv("GRPC_PORT", "50052"))
 COLLECTION_NAME = os.getenv("KG_COLLECTION", "KnowledgeGraph")
 DUAL_EMBEDDING_ENABLED = os.getenv("DUAL_EMBEDDING_ENABLED", "true").lower() == "true"
@@ -99,43 +121,29 @@ KNOWLEDGE_ROOT = PROJECT_ROOT / "knowledge"
 DEV_COLLECTION_NAME = os.getenv("DEVELOPMENT_COLLECTION", "")
 DOCS_ROOT = PROJECT_ROOT / "docs"
 
-# Named-vector slots in the KG/dev schema. The schema declares all three at
-# create time so each can be populated later without recreating the collection
-# (Weaviate 1.28 doesn't support post-create named-vector additions —
-# Reconfigure.NamedVectors.update only mutates index settings on existing
-# slots, not adds. Weaviate 1.31+ supports add via the Python client; if/when
-# we upgrade, this map can grow at runtime.).
-_KG_NAMED_VECTOR_SLOTS = ("qwen3_embed", "ollama_embed", "openai_embed")
-_ACTIVE_EMBEDDING = os.getenv("ACTIVE_EMBEDDING", "qwen3")
+# v0.2.18: named-vector slot is resolved per-instance from
+# `EmbeddingService.text_vector_slot` (see WeaviateWrapper below). The
+# old `_KG_NAMED_VECTOR_SLOTS` tuple + `_active_named_vector_for_kg()`
+# qwen3-only assertion were removed — they predated the central
+# dispatcher and silently broke arctic/openai installs (audit finding
+# KG-W1, 2026-04-30, fixed in v0.2.18).
 
 
-def _active_named_vector_for_kg() -> str:
-    """Return the named-vector slot for KG writes from this script.
-
-    **This script is qwen3-only.** The `WeaviateWrapper._get_embedding`
-    helper hardcodes qwen3-embedding:0.6b — it does NOT dispatch on
-    `ACTIVE_EMBEDDING`. So we must assert here that the env says qwen3,
-    otherwise we'd produce qwen3 vectors and stuff them into a slot
-    labelled for arctic/openai (audit finding KG-W1, 2026-04-30).
-
-    For multi-model writes (e.g. `ACTIVE_EMBEDDING=openai`), use the
-    `store_knowledge_node` MCP tool — it calls `_get_all_kg_embeddings`
-    which produces all three vectors from their proper models.
-    """
-    if _ACTIVE_EMBEDDING not in ("qwen3", "codesage"):
-        raise RuntimeError(
-            f"sync_knowledge_graph.py is qwen3-only but ACTIVE_EMBEDDING="
-            f"{_ACTIVE_EMBEDDING!r}. Use the `store_knowledge_node` MCP "
-            f"tool for arctic/openai writes (it dispatches to the right "
-            f"model per slot). To force qwen3 sync, set ACTIVE_EMBEDDING=qwen3."
-        )
-    return "qwen3_embed"
-
-
-# Simple wrapper to replace WeaviateMCPServer
 class WeaviateWrapper:
-    """Wrapper to provide simple Weaviate client access"""
-    def __init__(self, weaviate_url, ollama_url=None, embedding_model=None, grpc_port=None):
+    """Weaviate client + EmbeddingService bundle.
+
+    Replaces the v0.2.17 ``WeaviateWrapper`` which hardcoded
+    ``qwen3-embedding:0.6b`` for every embed call. v0.2.18: the embed
+    backend + active named-vector slot are resolved from environment by
+    ``EmbeddingService.for_project()`` — supports ollama (qwen3 / arctic /
+    mxbai / nomic), openai (text-embedding-3-small / -large), and any
+    future model registered in the embedding-service slot maps.
+
+    Lifecycle: instantiate once at script entry, call ``close()`` (or use
+    as context manager) to release HTTP sessions on both the Weaviate
+    client and the embedding service.
+    """
+    def __init__(self, weaviate_url, embedding_service, grpc_port=None):
         http_host = weaviate_url.replace("http://", "").replace("https://", "").split(":")[0]
         http_port = int(weaviate_url.split(":")[-1]) if ":" in weaviate_url else 8080
 
@@ -147,25 +155,44 @@ class WeaviateWrapper:
             grpc_port=grpc_port or 50051,
             grpc_secure=False
         )
-        self.ollama_url = ollama_url or "http://localhost:11435"
-        self.embedding_model = embedding_model or "qwen3-embedding:0.6b"
+        # The EmbeddingService is the single source of truth for: which
+        # model to call, which named-vector slot to write, whether the
+        # backend is currently reachable, and whether to fan out to
+        # multiple slots (multi-slot enrichment writes).
+        self.embedding_service = embedding_service
+
+    @property
+    def text_vector_slot(self) -> str:
+        """Active named-vector slot for KG writes (e.g. 'qwen3_embed')."""
+        return self.embedding_service.text_vector_slot
 
     def close(self) -> None:
-        """Close the Weaviate connection to prevent resource leaks."""
+        """Close the Weaviate connection (and embedding HTTP session)
+        to prevent resource leaks."""
         try:
             self.client.close()
         except Exception:
             pass
+        # The EmbeddingService is closed by main() — it may be shared
+        # across multiple wrappers in future, so we don't auto-close it
+        # here.
 
     def _get_embedding(self, text: str) -> List[float]:
-        """Get embedding from Ollama"""
-        import requests
-        response = requests.post(
-            f"{self.ollama_url}/api/embeddings",
-            json={"model": self.embedding_model, "prompt": text}
-        )
-        response.raise_for_status()
-        return response.json()["embedding"]
+        """Embed via the active text backend (ollama / openai / ...)."""
+        return self.embedding_service.embed_text(text)
+
+    def _get_all_kg_embeddings(self, text: str) -> Dict[str, List[float]]:
+        """Embed into every CONFIGURED + REACHABLE text backend.
+
+        Returns ``{slot_name: vector}``. Used for the enrichment-migration
+        write path: when the user switches text model (e.g. qwen3 →
+        openai), this populates BOTH slots on every new node so search
+        continues to work with either model active.
+
+        Empty dict on total backend failure (caller decides whether to
+        skip or fail).
+        """
+        return self.embedding_service.embed_text_all_configured(text)
 
 
 # For backward compatibility
@@ -195,6 +222,44 @@ def _content_signature_excluding_updated(content: str) -> str:
 def _sha256_text(s: str) -> str:
     import hashlib
     return hashlib.sha256(s.encode('utf-8')).hexdigest()
+
+
+def _build_vector_arg(
+    server: "WeaviateMCPServer",
+    text: str,
+) -> Tuple[object, Mapping[str, List[float]]]:
+    """Embed *text* and shape it for `Weaviate.collection.data.insert(vector=)`.
+
+    Returns ``(vector_arg, slots_map)``.
+
+    Behaviour:
+      * ``DUAL_EMBEDDING_ENABLED=true`` (default) → multi-slot write.
+        Calls ``server._get_all_kg_embeddings()`` which fans out to every
+        reachable backend (qwen3 always tried; openai if the key is
+        valid). The returned ``vector_arg`` is a ``{slot: vec}`` dict,
+        and ``slots_map`` is the same dict (so the caller can log which
+        slots got populated).
+        Failure modes:
+          - All backends fail → empty dict → raises RuntimeError so the
+            caller's exception handler kicks in and counts a failure.
+          - Active backend fails but a fallback succeeds → dict only has
+            the fallback's slot. Search will still work with the
+            fallback's model. The caller logs which slots landed.
+      * ``DUAL_EMBEDDING_ENABLED=false`` (legacy) → single flat vector
+        from the active backend. ``vector_arg`` is a ``list[float]``,
+        ``slots_map`` is ``{slot_name: vec}`` so logging stays uniform.
+    """
+    if DUAL_EMBEDDING_ENABLED:
+        slots = server._get_all_kg_embeddings(text)
+        if not slots:
+            raise RuntimeError(
+                "No embedding backend produced a vector. "
+                "See ~/.claude/metrics/embedding_failures.jsonl for details."
+            )
+        return slots, slots
+    # Legacy flat-vector path (DUAL_EMBEDDING_ENABLED=false).
+    vec = server._get_embedding(text)
+    return vec, {server.text_vector_slot: vec}
 
 
 def _update_frontmatter_timestamp(file_path: Path, content: str) -> str:
@@ -544,7 +609,13 @@ def parse_markdown_node(content: str, file_path: Path) -> Dict:
 def ensure_collection_exists(server: WeaviateMCPServer) -> bool:
     """
     Ensure the project's KG_COLLECTION (env-resolved, fallback "KnowledgeGraph")
-    exists with proper schema
+    exists with proper schema.
+
+    Named-vector slots (v0.2.18): sourced from
+    `vco_lib.weaviate_schema.KG_NAMED_VECTORS` for parity with the
+    `project_init.kg_class_definition` canonical path. Falls back to the
+    legacy 3-slot config if the import fails (one-off script runs outside
+    the orchestrator clone). Mirrors `ensure_dev_collection_exists`.
 
     Args:
         server: Weaviate MCP server instance
@@ -627,6 +698,35 @@ def ensure_collection_exists(server: WeaviateMCPServer) -> bool:
 
         print(f"Creating collection '{COLLECTION_NAME}'...")
 
+        # v0.2.18: pull the 5-slot named-vector catalog from the canonical
+        # source (`vco_lib.weaviate_schema.KG_NAMED_VECTORS`) so this
+        # runtime fallback creates the KG collection at the same shape as
+        # `vco_lib.project_init.kg_class_definition`. Fall back to the
+        # legacy 3-slot config when the import fails (one-off script runs
+        # outside an orchestrator clone where vco_lib isn't on the path).
+        # The migrate dispatcher's additive `copy` action picks up any
+        # missing slot later when the user does run install/update.
+        #
+        # Mirrors the Dev-collection variant at `ensure_dev_collection_exists`
+        # (landed bcacfc0). Both sites stay in lockstep with the canonical
+        # `project_init.{kg,development}_class_definition` so the migrate
+        # dispatcher's additive patch_props diff doesn't trip phantom
+        # missing-slot loops.
+        try:
+            from vco_lib.weaviate_schema import KG_NAMED_VECTORS
+            named_vectors = [
+                Configure.NamedVectors.none(name=slot.name)
+                for slot in KG_NAMED_VECTORS
+            ]
+        except Exception as import_err:  # noqa: BLE001 — best-effort fallback
+            print(f"  ⚠️  Could not import KG_NAMED_VECTORS ({import_err}); "
+                  "falling back to legacy 3-slot config")
+            named_vectors = [
+                Configure.NamedVectors.none(name="qwen3_embed"),     # active
+                Configure.NamedVectors.none(name="ollama_embed"),    # legacy
+                Configure.NamedVectors.none(name="openai_embed"),    # optional
+            ]
+
         # Create collection with proper schema (supports chunking + temporal + typed links)
         server.client.collections.create(
             name=COLLECTION_NAME,
@@ -676,17 +776,14 @@ def ensure_collection_exists(server: WeaviateMCPServer) -> bool:
                 # AFTER that one will then skip.
                 Property(name="content_hash", data_type=DataType.TEXT),
             ],
-            # Named vectors must match `VECTOR_SCHEMES["kg"]` in
-            # weaviate_mcp/server.py:130. Without this the collection accepts
-            # only the unnamed default vector, and per-named-vector inserts
-            # fail at runtime ("collection configured without multiple named
-            # vectors but received named vectors: map[ollama_embed:...]").
-            # Vectors are still computed manually (Configure.NamedVectors.none).
-            vectorizer_config=[
-                Configure.NamedVectors.none(name="qwen3_embed"),     # active
-                Configure.NamedVectors.none(name="ollama_embed"),    # legacy
-                Configure.NamedVectors.none(name="openai_embed"),    # optional
-            ],
+            # Named vectors must match `vco_lib.weaviate_schema.KG_NAMED_VECTORS`
+            # (the canonical v0.2.18 catalog). Without these the collection
+            # accepts only the unnamed default vector, and per-named-vector
+            # inserts fail at runtime ("collection configured without
+            # multiple named vectors but received named vectors:
+            # map[ollama_embed:...]"). Vectors are still computed manually
+            # (Configure.NamedVectors.none).
+            vectorizer_config=named_vectors,
             # `index_null_state=True` enables `is_none(True)` filters on date
             # properties (notably `valid_until`). Required for the MCP
             # `_stale_filter` to filter out expired/archived nodes at query
@@ -696,7 +793,8 @@ def ensure_collection_exists(server: WeaviateMCPServer) -> bool:
             inverted_index_config=Configure.inverted_index(index_null_state=True),
         )
 
-        print(f"✓ Created collection '{COLLECTION_NAME}' (named vectors + index_null_state=True)")
+        print(f"✓ Created collection '{COLLECTION_NAME}' "
+              f"({len(named_vectors)} named vectors + index_null_state=True)")
         return True
 
         if result["success"]:
@@ -714,16 +812,36 @@ def ensure_collection_exists(server: WeaviateMCPServer) -> bool:
 def ensure_dev_collection_exists(server: WeaviateMCPServer) -> bool:
     """Create the development docs collection if missing.
 
-    Schema is a **subset** of the KG schema:
-      - same chunker (Chunker / TokenCounter from weaviate_mcp.chunking)
-      - same three named-vector slots (qwen3_embed, ollama_embed, openai_embed)
-      - same `index_null_state=True` so post-sync stale-filtering works
-        (currently no docs use `valid_until`, but cheap insurance for the
-        future)
-      - drops KG-specific fields: tags, links, typed_links, external_links,
-        node_type, status (docs don't have those)
-      - keeps: title, content, file_path, created_at, updated_at, chunk_num,
-        total_chunks, source_node_id
+    Schema is a **near-subset** of the KG schema. Matches
+    `vco_lib.project_init.development_class_definition` exactly — this is
+    the runtime-fallback path used when `project_init` didn't get there
+    first (one-off `python -m sync_knowledge_graph --all-docs` runs from a
+    project that hasn't been re-installed since the v0.2.18 schema bump).
+    Both write sites MUST stay in lockstep so the migrate dispatcher's
+    additive patch_props diff doesn't trip a phantom missing-prop loop.
+
+    Properties:
+      - title, content, file_path (the load-bearing trio)
+      - created_at, updated_at (legacy filesystem timestamps; back-compat)
+      - created, updated, valid_from, valid_until (canonical temporal,
+        PR-24 2026-05-16) — required by MCP `_stale_filter` (valid_until
+        is_none(True) | valid_until > now)
+      - status (v0.2.18 2026-05-19) — KG parity for archived-doc filter
+      - content_hash (v0.2.18 2026-05-19) — KG parity, powers the
+        embed-skip fast-path in `sync_doc`
+      - chunk_num, total_chunks, source_node_id (chunking support)
+
+    Explicitly NOT mirrored from KG (user direction 2026-05-19):
+      - tags / links / typed_links — KG-only graph metadata
+      - external_links — KG-only RDF metadata
+      - node_type — redundant (every row in a Dev collection is unambiguously
+        a "doc" by class name)
+
+    Named-vector slots (v0.2.18): sourced from
+    `vco_lib.weaviate_schema.KG_NAMED_VECTORS` for parity with the
+    `project_init.development_class_definition` canonical path. With
+    fallback to the legacy 3-slot config if the import fails (one-off
+    script runs outside the orchestrator clone).
 
     Returns True if the collection exists or was created.
     """
@@ -736,6 +854,29 @@ def ensure_dev_collection_exists(server: WeaviateMCPServer) -> bool:
         if server.client.collections.exists(DEV_COLLECTION_NAME):
             print(f"✓ Dev collection '{DEV_COLLECTION_NAME}' exists")
             return True
+
+        # v0.2.18: pull the 5-slot named-vector catalog from the canonical
+        # source (`vco_lib.weaviate_schema.KG_NAMED_VECTORS`) so this
+        # runtime fallback creates collections at the same shape as the
+        # `project_init.development_class_definition` path. Fall back to
+        # the legacy 3-slot config when the import fails (one-off script
+        # runs outside an orchestrator clone where vco_lib isn't on the
+        # path). The migrate dispatcher's additive `copy` action picks up
+        # any missing slot later when the user does run install/update.
+        try:
+            from vco_lib.weaviate_schema import KG_NAMED_VECTORS
+            named_vectors = [
+                Configure.NamedVectors.none(name=slot.name)
+                for slot in KG_NAMED_VECTORS
+            ]
+        except Exception as import_err:  # noqa: BLE001 — best-effort fallback
+            print(f"  ⚠️  Could not import KG_NAMED_VECTORS ({import_err}); "
+                  "falling back to legacy 3-slot config")
+            named_vectors = [
+                Configure.NamedVectors.none(name="qwen3_embed"),
+                Configure.NamedVectors.none(name="ollama_embed"),
+                Configure.NamedVectors.none(name="openai_embed"),
+            ]
 
         print(f"Creating dev collection '{DEV_COLLECTION_NAME}'...")
         server.client.collections.create(
@@ -760,20 +901,24 @@ def ensure_dev_collection_exists(server: WeaviateMCPServer) -> bool:
                 Property(name="updated", data_type=DataType.DATE),
                 Property(name="valid_from", data_type=DataType.DATE),
                 Property(name="valid_until", data_type=DataType.DATE),
+                # v0.2.18 (2026-05-19): KG parity. `status` lets archived
+                # docs be filtered out by `hybrid_search`; `content_hash`
+                # powers the embed-skip fast-path in `sync_doc`. Must
+                # match `project_init.development_class_definition`
+                # exactly so the migrate dispatcher's additive patch_props
+                # diff doesn't loop.
+                Property(name="status", data_type=DataType.TEXT),
+                Property(name="content_hash", data_type=DataType.TEXT),
                 # Chunking support
                 Property(name="chunk_num", data_type=DataType.INT),
                 Property(name="total_chunks", data_type=DataType.INT),
                 Property(name="source_node_id", data_type=DataType.TEXT),
             ],
-            vectorizer_config=[
-                Configure.NamedVectors.none(name="qwen3_embed"),
-                Configure.NamedVectors.none(name="ollama_embed"),
-                Configure.NamedVectors.none(name="openai_embed"),
-            ],
+            vectorizer_config=named_vectors,
             inverted_index_config=Configure.inverted_index(index_null_state=True),
         )
         print(f"✓ Created dev collection '{DEV_COLLECTION_NAME}' "
-              f"(named vectors + index_null_state=True)")
+              f"({len(named_vectors)} named vectors + index_null_state=True)")
         return True
     except Exception as e:
         print(f"❌ Error ensuring dev collection: {e}")
@@ -845,10 +990,29 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> bool:
     Mirrors `sync_node` minus the KG-specific concerns (no frontmatter
     parsing, no WikiLink resolution, no tag-from-typed-links inference, no
     cross-references). Same chunker, same active-vector-slot logic.
+
+    v0.2.18 (2026-05-19): mirrors the v0.2.17 KG content_hash embed-skip
+    fast-path. Before re-embedding, query existing objects for this
+    `file_path` and check (a) every existing chunk has a non-empty
+    `content_hash` equal to the current file's hash, (b) chunk-count
+    matches what we'd reproduce, and (c) the active named-vector slot
+    (`server.text_vector_slot`) is populated on every chunk. When all
+    three hold → skip the delete-and-re-embed entirely. Saves the entire
+    Ollama embed roundtrip + Weaviate delete/insert per unchanged file.
+
+    Conservative gating: any missing chunk-vector, any empty hash, any
+    mismatched chunk-count, or any exception in the fast-path check falls
+    through to the existing delete-and-re-embed path (and that path
+    writes `content_hash` so the NEXT re-sync will hit the fast path).
+    This handles the warm-up case where an existing v0.2.17 Dev collection
+    just gained the `content_hash` property via additive patch_props but
+    none of its rows have a value yet.
     """
     if not DEV_COLLECTION_NAME:
         print(f"⊘ DEVELOPMENT_COLLECTION not set — skipping {file_path}")
         return True
+
+    start_time = time.time()
 
     try:
         if not file_path.exists():
@@ -875,20 +1039,133 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> bool:
 
         coll = server.client.collections.get(DEV_COLLECTION_NAME)
 
-        # Delete old version (by file_path)
-        existing = coll.query.fetch_objects(
-            filters=Filter.by_property("file_path").equal(doc_data["file_path"]),
-            limit=100,
-        )
-        for obj in existing.objects:
-            coll.data.delete_by_id(obj.uuid)
+        # v0.2.18: compute content_hash BEFORE the delete-and-re-embed
+        # pipeline so we can short-circuit on the unchanged-file case.
+        # The hash function is the same one used by the KG path
+        # (`_content_signature_excluding_updated`); for a docs/ file with
+        # no frontmatter it degenerates to plain SHA-256 of the body —
+        # exactly what we want.
+        current_content_hash = _content_signature_excluding_updated(content)
+
+        # Active named-vector slot for the running backend (e.g.
+        # 'qwen3_embed' for Ollama qwen3, 'openai_text_embed' for OpenAI).
+        # The fast-path requires this slot to be populated on every
+        # existing chunk; otherwise we're in the v0.2.17 -> v0.2.18 warm-up
+        # case where the user just switched backends and the new slot is
+        # empty, and we MUST re-embed to populate it.
+        try:
+            active_slot = server.text_vector_slot
+        except Exception:  # noqa: BLE001 — soft-fail on degenerate wrapper
+            active_slot = ""
+
+        # Pull existing objects WITH vectors so we can verify the active
+        # slot is populated. `include_vector=True` returns `obj.vector` as
+        # a dict keyed by slot name for named-vector collections.
+        try:
+            existing = coll.query.fetch_objects(
+                filters=Filter.by_property("file_path").equal(
+                    doc_data["file_path"]
+                ),
+                limit=100,
+                return_properties=[
+                    "content_hash", "chunk_num", "total_chunks",
+                ],
+                include_vector=True,
+            )
+        except Exception as fetch_err:  # noqa: BLE001
+            # Older Weaviate clients / mocked clients that don't accept
+            # `include_vector` keyword → fall back to the basic fetch and
+            # skip the active-slot check (defer to content_hash + chunk
+            # count). Any real client supports this kw since Weaviate v4.
+            print(f"   (fetch_objects(include_vector=True) failed: "
+                  f"{fetch_err}; falling back to hash-only check)")
+            try:
+                existing = coll.query.fetch_objects(
+                    filters=Filter.by_property("file_path").equal(
+                        doc_data["file_path"]
+                    ),
+                    limit=100,
+                    return_properties=[
+                        "content_hash", "chunk_num", "total_chunks",
+                    ],
+                )
+            except Exception:
+                existing = None  # forces fall-through to re-embed
+
+        # EMBED-SKIP fast path. Mirrors sync_node's v0.2.17 implementation
+        # with the added active-slot check (which sync_node's fast-path
+        # also relies on implicitly via the chunk_count gate, but Dev gets
+        # it explicit because Dev rows are more likely to have a chunk
+        # written under one slot and not yet enriched under another).
+        if existing is not None and existing.objects:
+            try:
+                existing_hashes: List[str] = []
+                existing_total_chunks: List[int] = []
+                active_slot_populated: List[bool] = []
+                for obj in existing.objects:
+                    props = obj.properties or {}
+                    existing_hashes.append(props.get("content_hash", "") or "")
+                    tc = props.get("total_chunks", 0)
+                    try:
+                        existing_total_chunks.append(int(tc) if tc is not None else 0)
+                    except (TypeError, ValueError):
+                        existing_total_chunks.append(0)
+                    # `obj.vector` is a dict {slot: list[float]} for
+                    # named-vector collections; missing/None when the
+                    # fetch didn't include vectors (older client).
+                    vec_field = getattr(obj, "vector", None)
+                    if isinstance(vec_field, dict) and active_slot:
+                        slot_vec = vec_field.get(active_slot)
+                        active_slot_populated.append(
+                            bool(slot_vec) and len(slot_vec) > 0
+                        )
+                    else:
+                        # Couldn't inspect → be conservative, treat as
+                        # NOT populated so we re-embed. Exception: if
+                        # active_slot is empty (no wrapper info), skip
+                        # the active-slot gate altogether (back to
+                        # content_hash + chunk_count).
+                        active_slot_populated.append(not active_slot)
+
+                chunk_count_ok = (
+                    len(existing_total_chunks) > 0
+                    and all(
+                        tc == len(existing_total_chunks)
+                        for tc in existing_total_chunks
+                    )
+                )
+                hashes_ok = (
+                    len(existing_hashes) > 0
+                    and all(h == current_content_hash for h in existing_hashes)
+                    and all(h for h in existing_hashes)  # no empty strings
+                )
+                slots_ok = all(active_slot_populated)
+                if chunk_count_ok and hashes_ok and slots_ok:
+                    elapsed = time.time() - start_time
+                    print(
+                        f"   ⏭️  Embed-skip: content_hash matches "
+                        f"({current_content_hash[:12]}…); "
+                        f"{len(existing_hashes)} chunk(s) preserved "
+                        f"in {active_slot or '<no-slot>'} "
+                        f"({elapsed*1000:.0f} ms)"
+                    )
+                    return True
+            except Exception as skip_err:  # noqa: BLE001
+                # Soft-fail: fall through to the delete-and-re-embed path.
+                print(f"   (embed-skip check failed: {skip_err}; re-embedding)")
+
+        # Fast path didn't apply (or no existing objects). Delete old
+        # versions and re-embed. The `content_hash` written below means
+        # the NEXT re-sync will hit the fast path.
+        if existing is not None:
+            for obj in existing.objects:
+                coll.data.delete_by_id(obj.uuid)
 
         token_count = TokenCounter.count_tokens(content)
-        target_vec_name = _active_named_vector_for_kg()
         source_id = str(uuid.uuid4())
 
         if token_count <= MAX_EMBEDDING_TOKENS:
-            embedding = server._get_embedding(content)
+            vec_arg, slots_written = _build_vector_arg(server, content)
             data_obj = {
                 "title": doc_data["title"],
                 "content": doc_data["content"],
@@ -898,10 +1175,14 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> bool:
                 "chunk_num": 1,
                 "total_chunks": 1,
                 "source_node_id": source_id,
+                # v0.2.18 (2026-05-19): persist content_hash so the next
+                # re-sync can take the embed-skip fast-path above. Same
+                # value for all chunks of the same file (computed once
+                # over the whole file content above).
+                "content_hash": current_content_hash,
             }
-            vec_arg = {target_vec_name: embedding} if DUAL_EMBEDDING_ENABLED else embedding
             coll.data.insert(properties=data_obj, vector=vec_arg)
-            print(f"   ✓ Stored doc as single chunk (vector={target_vec_name})")
+            print(f"   ✓ Stored doc as single chunk (vectors={sorted(slots_written)})")
             return True
 
         # Chunked path — mirrors `sync_node` chunked branch.
@@ -919,8 +1200,9 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> bool:
             },
         )
         print(f"   Split into {len(chunks)} chunks")
+        last_slots: Mapping[str, List[float]] = {}
         for i, chunk in enumerate(chunks):
-            embedding = server._get_embedding(chunk.content)
+            vec_arg, last_slots = _build_vector_arg(server, chunk.content)
             data_obj = {
                 "title": doc_data["title"],
                 "content": chunk.content,
@@ -930,10 +1212,16 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> bool:
                 "chunk_num": i + 1,
                 "total_chunks": len(chunks),
                 "source_node_id": source_id,
+                # v0.2.18 (2026-05-19): every chunk of the same file
+                # shares the same content_hash (computed over the whole
+                # file). The embed-skip fast-path above requires ALL
+                # chunks for a file_path to carry an identical, non-empty
+                # hash before it skips — writing the same value here
+                # keeps that invariant.
+                "content_hash": current_content_hash,
             }
-            vec_arg = {target_vec_name: embedding} if DUAL_EMBEDDING_ENABLED else embedding
             coll.data.insert(properties=data_obj, vector=vec_arg)
-        print(f"   ✓ Stored {len(chunks)} chunks (vector={target_vec_name})")
+        print(f"   ✓ Stored {len(chunks)} chunks (vectors={sorted(last_slots)})")
         return True
     except Exception as e:
         import traceback
@@ -1334,8 +1622,10 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
             # Single chunk - store as-is
             print(f"   Storing as single object")
 
-            # Get embedding for content
-            embedding = server._get_embedding(content)
+            # v0.2.18: build vector arg via EmbeddingService. With
+            # DUAL_EMBEDDING_ENABLED=true (default) this fans out to every
+            # reachable text backend so multiple slots get populated.
+            vec_arg, slots_written = _build_vector_arg(server, content)
 
             # Prepare data object
             data_obj = {
@@ -1362,33 +1652,32 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
                 if field in node_data:
                     data_obj[field] = node_data[field]
 
-            # Insert into the named vector matching the active embedding
-            # model. The collection schema may also carry slots for other
-            # models the user might switch to (legacy arctic, openai, etc.) —
-            # those stay empty until/unless the user runs a re-embed pass.
-            # NEVER cross-write a vector under a name that implies a different
-            # model: e.g. don't put qwen3 vectors in `ollama_embed`. They
-            # have different output spaces and a future search against
-            # `ollama_embed` would treat them as if produced by arctic.
+            # Insert into the configured named-vector slots. With multi-
+            # slot writes (DUAL_EMBEDDING_ENABLED=true, the default since
+            # v0.2.18) every reachable backend's vector lands in its own
+            # slot — so a project switched from qwen3 → openai still has
+            # qwen3_embed populated and search-with-qwen3 keeps working
+            # during the transition.
             #
-            # Note for Weaviate 1.31+: `Reconfigure.NamedVectors.add()` lets
-            # us add new named vectors after creation without recreating the
-            # collection. Until that lands here, the schema-creation block
-            # in `ensure_collection_exists` lists every slot we expect to
-            # use, and switching models means dropping + re-ingesting (or
-            # running the migrate_embeddings MCP tool).
-            target_vec_name = _active_named_vector_for_kg()
-            if DUAL_EMBEDDING_ENABLED:
-                vector_arg = {target_vec_name: embedding}
-            else:
-                vector_arg = embedding
+            # NEVER cross-write a vector under a name that implies a
+            # different model: each backend's vectors go ONLY into the
+            # slot whose embedding-space matches. The EmbeddingService
+            # multi-slot fan-out enforces this — same model → same slot.
+            #
+            # Note for Weaviate 1.31+: `Reconfigure.NamedVectors.add()`
+            # lets us add new named vectors after creation. The Wave A
+            # `vco_lib.weaviate_schema.add_named_vector_slot` helper uses
+            # this when available; the schema-creation block in
+            # `ensure_collection_exists` declares every slot up-front for
+            # older Weaviate versions where post-create adds aren't
+            # supported.
             obj_uuid = collection.data.insert(
                 properties=data_obj,
-                vector=vector_arg
+                vector=vec_arg
             )
 
             chunks_created = 1
-            print(f"   ✓ Stored node with UUID: {str(obj_uuid)[:8]}... (vector={target_vec_name})")
+            print(f"   ✓ Stored node with UUID: {str(obj_uuid)[:8]}... (vectors={sorted(slots_written)})")
 
             # Create cross-references for WikiLinks
             if node_data["links"]:
@@ -1433,9 +1722,11 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
             print(f"   Split into {len(chunks)} chunks")
 
             # Store each chunk
+            last_slots: Mapping[str, List[float]] = {}
             for i, chunk in enumerate(chunks):
-                # Get embedding for chunk content
-                embedding = server._get_embedding(chunk.content)
+                # v0.2.18: embed via EmbeddingService (multi-slot when
+                # DUAL_EMBEDDING_ENABLED — see _build_vector_arg).
+                vec_arg, last_slots = _build_vector_arg(server, chunk.content)
 
                 # Prepare data object (tags, links, typed_links, external_links shared across all chunks)
                 data_obj = {
@@ -1466,17 +1757,12 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
                     if field in node_data:
                         data_obj[field] = node_data[field]
 
-                # Insert into only the named vector slot matching the active
-                # embedding model. See single-chunk path comment for why we
-                # don't cross-write.
-                target_vec_name = _active_named_vector_for_kg()
-                if DUAL_EMBEDDING_ENABLED:
-                    vector_arg = {target_vec_name: embedding}
-                else:
-                    vector_arg = embedding
+                # Insert with the v0.2.18 multi-slot vector arg from
+                # _build_vector_arg. See single-chunk path comment for
+                # the rationale.
                 obj_uuid = collection.data.insert(
                     properties=data_obj,
-                    vector=vector_arg
+                    vector=vec_arg
                 )
 
                 # Create cross-references only from first chunk (represents the main node)
@@ -1496,6 +1782,9 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
 
                 chunks_created += 1
                 print(f"   ✓ Stored chunk {chunk.chunk_number + 1}/{chunk.total_chunks} ({chunk.token_count} tokens)")
+
+            if last_slots:
+                print(f"   ✓ All chunks written to vectors={sorted(last_slots)}")
 
         print(f"✅ Successfully synced {node_data['title']}")
         return True
@@ -1568,12 +1857,29 @@ def main():
         print("       sync_knowledge_graph.py --all-docs  (docs/ only)")
         sys.exit(1)
 
+    embedding_service = None
     try:
-        # Initialize server
+        # v0.2.18: construct EmbeddingService at script entry. Probes all
+        # configured backends once; raises NoEmbeddingBackendError when
+        # zero are reachable (auto-writes ~/.claude/metrics/embedding_failures.jsonl
+        # + .claude/context/EMBEDDING_FAILURES.md for Claude diagnostic).
+        try:
+            embedding_service = EmbeddingService.for_project(PROJECT_ROOT)
+        except NoEmbeddingBackendError as e:
+            # Soft-fail at the install seed boundary (same pattern as the
+            # KG-summary "no backend available" deferral). Emit a deferral
+            # entry so install.py can surface it via UPDATE_DEFERRED.md and
+            # exit 0 — KG sync simply won't happen this run.
+            _emit_sync_deferral_no_backend(PROJECT_ROOT, e)
+            print(f"⚠️  KG sync skipped: {e}", file=sys.stderr)
+            print("   See .claude/context/EMBEDDING_FAILURES.md + ~/.claude/metrics/embedding_failures.jsonl",
+                  file=sys.stderr)
+            sys.exit(0)
+
+        # Initialize Weaviate client + bind to the embedding service
         server = WeaviateMCPServer(
             weaviate_url=WEAVIATE_URL,
-            ollama_url=OLLAMA_URL,
-            embedding_model=EMBEDDING_MODEL,
+            embedding_service=embedding_service,
             grpc_port=GRPC_PORT
         )
 
@@ -1630,8 +1936,60 @@ def main():
     finally:
         try:
             server.close()
-        except:
+        except Exception:
             pass
+        if embedding_service is not None:
+            try:
+                embedding_service.close()
+            except Exception:
+                pass
+
+
+def _emit_sync_deferral_no_backend(install_root: Path, exc: Exception) -> None:
+    """Soft-fail deferral when no embedding backend is reachable at seed time.
+
+    Adds an entry to ``<install_root>/.claude/context/UPDATE_DEFERRED.md``
+    so install.py / the launcher can surface the issue. Idempotent (the
+    DeferralReport uses last-write-wins per ``condition_id``). Soft-fail
+    on any IO / import error — we're already in an error path.
+    """
+    try:
+        # Import locally because vco_lib is on sys.path now (added at top
+        # of file), but the deferral_report module isn't strictly needed
+        # in the happy path — keep it lazy.
+        from vco_lib.deferral_report import DeferralEntry, DeferralReport
+        entry = DeferralEntry(
+            condition_id="kg_sync_no_embedding_backend",
+            title="KG sync skipped: no embedding backend reachable",
+            detected=(
+                "sync_knowledge_graph.py at install/seed time could not "
+                "reach any configured embedding backend (Ollama / CodeEmbed / "
+                f"OpenAI). Error: {exc}"
+            ),
+            why_deferred=(
+                "Soft-fail policy: install must never block on transient "
+                "service unavailability. Knowledge-graph search will be "
+                "empty until the next sync run succeeds. See "
+                "~/.claude/metrics/embedding_failures.jsonl for the "
+                "per-backend diagnostic written by EmbeddingService."
+            ),
+            command_to_apply=(
+                "# Restart embedding services then re-run the seed:\n"
+                "podman start vco_ollama vco_code_embed   # or: docker start ...\n"
+                "python templates/scripts/sync_knowledge_graph.py --all"
+            ),
+            severity="warning",
+            kg_node_refs=[
+                "knowledge/concepts/embedding-service-v0218.md",
+            ],
+        )
+        report = DeferralReport.read(install_root)
+        report.add_entry(entry)
+        report.write(install_root)
+    except Exception as inner:
+        # Soft-fail — don't escalate. The failure JSONL written by
+        # NoEmbeddingBackendError already captures the diagnostic.
+        print(f"   (deferral emit failed: {inner})", file=sys.stderr)
 
 
 if __name__ == "__main__":

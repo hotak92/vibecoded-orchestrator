@@ -41,7 +41,7 @@ import uuid
 import requests
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Any, Optional, Set, Tuple
+from typing import Dict, List, Any, Optional, Set, Tuple, Mapping
 import subprocess
 
 
@@ -278,6 +278,70 @@ def _ignore_dirs_for(language: str) -> frozenset:
     return _COMMON_IGNORE_DIRS | _LANGUAGE_IGNORE_DIRS_EXTRAS.get(language, frozenset())
 
 
+# ---------------------------------------------------------------------------
+# v0.2.18 (Plan C): canonical language identifier helpers.
+#
+# Pre-Plan-C the analyzer used display strings ("Python", "C++", "C#", ...) for
+# the `language` property on CodeModule rows and lowercase canonical IDs
+# ("python", "cpp", "csharp", ...) for the `--language` CLI flag + dispatcher.
+# The two diverged, so a `--prune-stale --language=python` pass couldn't
+# reliably filter rows: stored values were `"Python"`, the flag was `python`.
+#
+# Plan C unifies both onto the canonical lowercase ID (matches `--language`'s
+# argparse `choices=[...]` set). All new inserts write the canonical form; the
+# prune filter normalises the stored value on read so existing v0.2.17 rows
+# (mixed-case display strings) also get matched correctly. The migration is
+# additive — old data is not rewritten; the normaliser closes the gap on read.
+#
+# Single source of truth for both the display→canonical map and the canonical
+# set is kept here so the analyzer's per-language paths and the hook's
+# extension-to-language detection agree.
+# ---------------------------------------------------------------------------
+_LANGUAGE_DISPLAY_TO_CANONICAL: Dict[str, str] = {
+    # Display label (as historically passed to _create_or_update_module /
+    # _store_interactions / _extract_external_calls) → canonical ID.
+    "python":     "python",
+    "lua":        "lua",
+    "javascript": "javascript",
+    "js":         "javascript",
+    "typescript": "typescript",
+    "ts":         "typescript",
+    "go":         "go",
+    "rust":       "rust",
+    "java":       "java",
+    "ruby":       "ruby",
+    "shell":      "shell",
+    "csharp":     "csharp",
+    "c#":         "csharp",
+    "proto":      "proto",
+    "cpp":        "cpp",
+    "c++":        "cpp",
+    "c":          "c",
+}
+
+
+def _canonical_lang_id(label: Optional[str]) -> str:
+    """Map a language string to its canonical lowercase ID.
+
+    Accepts display labels (`"Python"`, `"C#"`, `"C++"`, ...) and canonical
+    IDs (`"python"`, `"csharp"`, `"cpp"`, ...) interchangeably. Unknown
+    strings pass through lowercased + stripped — analyzer never crashes on
+    a new language being added without first updating the table; the prune
+    filter just won't recognise the row until the table is updated, which
+    is the conservative behaviour.
+
+    Returns an empty string when the input is falsy. Empty strings never
+    match the `args.language` filter (argparse rejects empty), so unknown
+    rows stay safe.
+    """
+    if not label:
+        return ""
+    key = str(label).strip().lower()
+    if not key:
+        return ""
+    return _LANGUAGE_DISPLAY_TO_CANONICAL.get(key, key)
+
+
 try:
     import weaviate
     from weaviate.classes.config import Configure, Property, DataType, ReferenceProperty
@@ -286,22 +350,18 @@ except ImportError:
     print("Error: weaviate-client not installed. Install with: pip install weaviate-client", file=sys.stderr)
     sys.exit(1)
 
-# Code embedding configuration — supports two backends:
-#   "service": FastAPI code embedding service (CodeSage-Large-v2 on GPU, default)
-#   "ollama":  Ollama API (any model — legacy jina, qwen3, etc.)
-CODE_EMBED_BACKEND = os.getenv("CODE_EMBED_BACKEND", "service")
-CODE_EMBED_SERVICE_URL = os.getenv("CODE_EMBED_SERVICE_URL", "http://localhost:11440")
-OLLAMA_CONFIG = {
-    "url": os.getenv("OLLAMA_URL", "http://localhost:11435"),
-    "model": os.getenv("CODE_EMBED_MODEL", "unclemusclez/jina-embeddings-v2-base-code:latest"),
-}
-
-# Named vector key matches the active backend — used for all insert_params["vector"] dicts.
-# Must match the collection's named vector configuration in Weaviate.
-_ACTIVE_CODE_VECTOR = "codesage_embed" if CODE_EMBED_BACKEND == "service" else "ollama_code_embed"
-
-# Named vector support: when enabled, vectors are stored as {_ACTIVE_CODE_VECTOR: vec}
-# instead of flat vectors. Must match the collection's named vector configuration.
+# Code embedding configuration — v0.2.18 centralised via EmbeddingService.
+# Pre-v0.2.18, this script read CODE_EMBED_BACKEND / CODE_EMBED_SERVICE_URL /
+# CODE_EMBED_MODEL directly and hardcoded the active slot to either
+# `codesage_embed` (service) or `ollama_code_embed` (ollama). The hardcode
+# silently broke OpenAI-as-code-embed installs and made the slot decision
+# duplicate the same logic in 5+ places. v0.2.18: a single
+# EmbeddingService instance (constructed in main()) owns the choice; this
+# module's embed_* helpers route through it.
+#
+# Kept-but-unused env reads (CODE_EMBED_BACKEND/SERVICE_URL/MODEL) live on
+# vco_lib/embedding_service.py:for_project() now. Searching this file for
+# those names will turn up only the historical comment above.
 DUAL_EMBEDDING_ENABLED = os.getenv("DUAL_EMBEDDING_ENABLED", "true").lower() == "true"
 
 # Note: We use manual vectorization (vectorizer=None) and generate embeddings via the configured backend.
@@ -325,6 +385,11 @@ else:
     _mcp_dir = Path(__file__).resolve().parent.parent.parent / "claude_mcp_servers"
 if str(_mcp_dir) not in sys.path:
     sys.path.insert(0, str(_mcp_dir))
+# v0.2.18: vco_lib (EmbeddingService) lives next to claude_mcp_servers in
+# the orchestrator clone. Put its parent on sys.path too.
+_vco_lib_parent = _mcp_dir.parent
+if str(_vco_lib_parent) not in sys.path:
+    sys.path.insert(0, str(_vco_lib_parent))
 # VCO-REWIRE-END: orchestrator-root-resolution
 try:
     from weaviate_mcp.code_truncation import (
@@ -344,58 +409,151 @@ except ImportError:
     def truncate_module_for_embedding(module_summary, model=None):
         return module_summary[:2000]
 
-# Resolve which code embedding model is active (for token budget in truncation)
-_CODE_MODEL = (
-    os.getenv("CODE_EMBED_MODEL", "codesage/codesage-large-v2")
-    if CODE_EMBED_BACKEND == "service"
-    else OLLAMA_CONFIG["model"]
+
+# v0.2.18: central embedding dispatcher. Replaces the inline
+# CODE_EMBED_BACKEND / CODE_EMBED_SERVICE_URL HTTP calls that previously
+# duplicated the same logic across `generate_embedding`,
+# `embed_function`, `embed_class`, `embed_module` plus 5+ inline insert
+# sites. EmbeddingService.for_project() picks the right backend
+# (CodeEmbed service / Ollama / OpenAI) AND the right named-vector slot
+# (codesage_embed / jina_embed / openai_code_embed / qwen3_embed
+# fallback) from env, so this module no longer hardcodes any of it.
+from vco_lib.embedding_service import (
+    EmbeddingService,
+    NoEmbeddingBackendError,
 )
 
+# Module-global EmbeddingService — initialised by main() before any
+# code-graph work happens, and closed in main()'s finally block. The
+# embed_* helpers below resolve it lazily on first use so unit tests that
+# import the module without calling main() don't pay the cost of probing
+# backends at import-time.
+_embedding_service: Optional["EmbeddingService"] = None
 
-def generate_embedding(text: str) -> Optional[List[float]]:
-    """Generate code embedding using the configured backend (service or Ollama)."""
+
+def _set_embedding_service(svc: "EmbeddingService") -> None:
+    """Inject the active EmbeddingService for this run.
+
+    Called by main() before any embed call. Tests can also call this to
+    inject a mocked service.
+    """
+    global _embedding_service
+    _embedding_service = svc
+
+
+def _get_embedding_service() -> Optional["EmbeddingService"]:
+    """Return the active EmbeddingService, or None if not initialised.
+
+    None means the embed call is happening outside the normal entrypoint
+    (e.g. a unit test imported the module without setting up the service).
+    In that case the embed helpers below return None — same behaviour as
+    pre-v0.2.18's `generate_embedding` did on backend failure.
+    """
+    return _embedding_service
+
+
+def _active_code_vector_slot() -> str:
+    """Return the active named-vector slot for code writes.
+
+    Resolved at-call-time so re-init doesn't strand callers on an old
+    slot. Falls back to the pre-v0.2.18 default (`codesage_embed`) when
+    the service isn't initialised — preserves existing behaviour for
+    tests that exercise the schema-creation path without first booting
+    the embedding service.
+    """
+    svc = _get_embedding_service()
+    if svc is not None:
+        return svc.code_vector_slot
+    return "codesage_embed"
+
+
+# Resolve which code embedding model is active (for token budget in truncation)
+def _resolve_code_model_id() -> str:
+    """Return the active code-embedding model id, e.g. 'codesage-large-v2'.
+
+    Read via the EmbeddingService when available, with a CodeSage default
+    so the smart-truncation token budget still applies in test contexts
+    where the service isn't booted.
+    """
+    svc = _get_embedding_service()
+    if svc is not None:
+        return svc.code_model_id
+    return "codesage/codesage-large-v2"
+
+
+def generate_embedding(text: str) -> Optional[Any]:
+    """Embed *text* via the EmbeddingService.
+
+    Return shape:
+      * ``DUAL_EMBEDDING_ENABLED=true`` (default) → ``dict[str, list[float]]``
+        with one slot per reachable code backend (multi-slot enrichment).
+      * ``DUAL_EMBEDDING_ENABLED=false`` (legacy) → ``list[float]``,
+        single flat vector from the active backend.
+      * No backend produced anything → ``None``.
+
+    The ``if embedding:`` guard at every inline insert site works for
+    every shape (truthy non-empty dict OR non-empty list OR None).
+
+    Pre-v0.2.18 this read ``CODE_EMBED_BACKEND`` env directly and
+    returned only a ``list[float]``. v0.2.18 centralises both decisions
+    on EmbeddingService and adds multi-slot fan-out — see
+    ``vco_lib.embedding_service.EmbeddingService.embed_code_all_configured``.
+    """
+    svc = _get_embedding_service()
+    if svc is None:
+        print("⚠️  Embedding requested but EmbeddingService not initialised", file=sys.stderr)
+        return None
     try:
-        if CODE_EMBED_BACKEND == "service":
-            response = requests.post(
-                f"{CODE_EMBED_SERVICE_URL}/api/embeddings",
-                json={"model": "", "prompt": text},
-                timeout=60,
-            )
-        else:
-            response = requests.post(
-                f"{OLLAMA_CONFIG['url']}/api/embeddings",
-                json={"model": OLLAMA_CONFIG["model"], "prompt": text},
-                timeout=30,
-            )
-
-        if response.status_code == 200:
-            data = response.json()
-            return data.get("embedding")
-        else:
-            print(f"⚠️  Embedding generation failed: HTTP {response.status_code}")
-            return None
+        if DUAL_EMBEDDING_ENABLED:
+            slots = svc.embed_code_all_configured(text)
+            return slots if slots else None
+        return svc.embed_code(text)
     except Exception as e:
-        print(f"⚠️  Embedding generation error: {e}")
+        print(f"⚠️  Embedding generation error: {e}", file=sys.stderr)
         return None
 
 
-def embed_function(signature: str, body: str, language: str = "python") -> Optional[List[float]]:
-    """Truncate function smartly, then generate embedding."""
-    text = truncate_function_for_embedding(signature, body, language=language, model=_CODE_MODEL)
+def _shape_for_insert(embedding: Optional[Any]) -> Optional[Any]:
+    """Shape ``embedding`` for ``collection.data.insert(vector=)``.
+
+    Logic:
+      * None → None (caller's ``if embedding:`` skips the vector= kwarg).
+      * ``dict`` (multi-slot) → return as-is.
+      * ``list`` AND ``DUAL_EMBEDDING_ENABLED`` → wrap as
+        ``{active_slot: list}`` so Weaviate routes it to the right named
+        vector.
+      * ``list`` AND legacy mode → pass through (flat vector).
+    """
+    if not embedding:
+        return None
+    if isinstance(embedding, dict):
+        return embedding
+    if DUAL_EMBEDDING_ENABLED:
+        return {_active_code_vector_slot(): embedding}
+    return embedding
+
+
+def embed_function(signature: str, body: str, language: str = "python") -> Optional[Any]:
+    """Truncate function smartly, then generate embedding.
+
+    Returns a slot dict (multi-slot mode), a flat vector (legacy mode),
+    or None on backend failure.
+    """
+    text = truncate_function_for_embedding(signature, body, language=language, model=_resolve_code_model_id())
     return generate_embedding(text)
 
 
 def embed_class(signature: str, class_body: str, methods: Optional[List[str]] = None,
-                language: str = "python") -> Optional[List[float]]:
+                language: str = "python") -> Optional[Any]:
     """Truncate class smartly, then generate embedding."""
     text = truncate_class_for_embedding(signature, class_body, methods=methods,
-                                        language=language, model=_CODE_MODEL)
+                                        language=language, model=_resolve_code_model_id())
     return generate_embedding(text)
 
 
-def embed_module(module_summary: str) -> Optional[List[float]]:
+def embed_module(module_summary: str) -> Optional[Any]:
     """Truncate module summary, then generate embedding."""
-    text = truncate_module_for_embedding(module_summary, model=_CODE_MODEL)
+    text = truncate_module_for_embedding(module_summary, model=_resolve_code_model_id())
     return generate_embedding(text)
 
 
@@ -701,6 +859,26 @@ class CodeGraphAnalyzer:
         self.visited_uuids: Set[Tuple[str, str]] = set()
         self._track_visited: bool = False
 
+        # v0.2.18 (Plan C) — canonical language ID for the language currently
+        # being analyzed. Set by the dispatcher in `analyze_repository` from the
+        # `lang_dispatch` table entry, then read by `_create_or_update_module`,
+        # the per-method insert paths, and `_store_interactions` so every row
+        # carries a canonical-lowercase `language` property. Empty string when
+        # no analyze is in progress (creates use `_canonical_lang_id()` of the
+        # display label as the fallback for direct-call sites).
+        self._current_language: str = ""
+
+        # v0.2.18 (Plan C) — per-file progress emitter for the Re-analyze
+        # Tauri command. main() installs a JSON-line-emitter when invoked
+        # with `--json-progress`; otherwise this stays None and analyze
+        # proceeds with the existing human-readable prints. The signature
+        # is `(fraction: float, message: str, file: str, lang: str) -> None`.
+        self._progress_emitter: Optional[Any] = None
+        # Scoping for the prune pass. Set by analyze_repository from its
+        # `language=` parameter (see _prune_stale_objects). Empty string =
+        # legacy/global prune across every project row.
+        self._prune_language: str = ""
+
     def connect(self):
         """Connect to Weaviate."""
         try:
@@ -721,17 +899,27 @@ class CodeGraphAnalyzer:
     def _vectorizer_config(self):
         """Return appropriate vectorizer config based on named_vectors flag.
 
-        Three slots, matching `VECTOR_SCHEMES["code"]` in
-        weaviate_mcp/server.py. Pre-2026-04-30 only declared two
-        (active + legacy), which broke `_get_all_code_embeddings` writes
-        and `backfill_embeddings(provider="openai")` on freshly-analyzed
-        collections (audit finding Code-M1, 2026-04-30). De-dup against
-        `_ACTIVE_CODE_VECTOR` for the case where the active slot is
-        `ollama_code_embed` (legacy backend).
+        v0.2.18: slot set is the active code slot (from EmbeddingService)
+        UNION the legacy/forward-compat slots so post-create switches
+        between models don't require recreating the collection.
+
+        Pre-v0.2.18 hardcoded three slots based on `_ACTIVE_CODE_VECTOR`
+        env-time resolution; that broke OpenAI-as-code and arctic-text-
+        as-code-fallback installs. The Wave-A schema helper
+        (vco_lib/weaviate_schema.py) carries the full slot map.
         """
         if not self.named_vectors:
             return Configure.Vectorizer.none()
-        slot_names = {_ACTIVE_CODE_VECTOR, "ollama_code_embed", "openai_embed"}
+        # Active slot (whichever backend EmbeddingService picked) + the
+        # legacy / forward-compat slots so we can later switch models
+        # via `migrate-collections` without dropping data.
+        active_slot = _active_code_vector_slot()
+        slot_names = {
+            active_slot,
+            "ollama_code_embed",   # legacy jina-v2-base-code
+            "codesage_embed",      # CodeSage primary (preserved through model switches)
+            "openai_code_embed",   # OpenAI text-embedding-3 reused for code
+        }
         return [Configure.NamedVectors.none(name=n) for n in sorted(slot_names)]
 
     def _inverted_index_config(self):
@@ -924,6 +1112,10 @@ class CodeGraphAnalyzer:
                         Property(name="start_line", data_type=DataType.INT, description="Start line number", skip_vectorization=True),
                         Property(name="end_line", data_type=DataType.INT, description="End line number", skip_vectorization=True),
                         Property(name="project", data_type=DataType.TEXT, description="Project name", skip_vectorization=True),
+                        # v0.2.18 (Plan C): canonical-lowercase language ID so a
+                        # later `--prune-stale --language=<lang>` run can scope
+                        # the per-row delete to only that language's entries.
+                        Property(name="language", data_type=DataType.TEXT, description="Canonical language ID (python, javascript, ...) — Plan C scoped prune", skip_vectorization=True),
                         Property(name="field_types", data_type=DataType.TEXT_ARRAY, description="field_name:TypeName pairs from annotated fields", skip_vectorization=True),
                         Property(name="composes", data_type=DataType.TEXT_ARRAY, description="Class names used as field types (composition)", skip_vectorization=True),
                         Property(name="primary_layer", data_type=DataType.TEXT, description="Primary architectural layer (API, Service, Data, UI, Utility, etc.)", skip_vectorization=True),
@@ -964,6 +1156,8 @@ class CodeGraphAnalyzer:
                         Property(name="end_line", data_type=DataType.INT, description="End line number", skip_vectorization=True),
                         Property(name="is_async", data_type=DataType.BOOL, description="Is async function", skip_vectorization=True),
                         Property(name="project", data_type=DataType.TEXT, description="Project name", skip_vectorization=True),
+                        # v0.2.18 (Plan C): canonical-lowercase language ID for scoped prune.
+                        Property(name="language", data_type=DataType.TEXT, description="Canonical language ID (python, javascript, ...) — Plan C scoped prune", skip_vectorization=True),
                         Property(name="type_uses", data_type=DataType.TEXT_ARRAY, description="Type names referenced in function annotations", skip_vectorization=True),
                         Property(name="cfg_summary", data_type=DataType.TEXT, description="CFG summary: branches/loops/max_depth counts (from Joern)", skip_vectorization=True),
                         Property(name="data_flow_vars", data_type=DataType.TEXT_ARRAY, description="Variable names that flow through the function (from Joern PDG)", skip_vectorization=True),
@@ -1002,6 +1196,8 @@ class CodeGraphAnalyzer:
                         Property(name="parameters", data_type=DataType.TEXT_ARRAY, description="Parameter names", skip_vectorization=True),
                         Property(name="returns", data_type=DataType.TEXT, description="Return type/description"),
                         Property(name="project", data_type=DataType.TEXT, description="Project name", skip_vectorization=True),
+                        # v0.2.18 (Plan C): canonical-lowercase language ID for scoped prune.
+                        Property(name="language", data_type=DataType.TEXT, description="Canonical language ID (python, javascript, ...) — Plan C scoped prune", skip_vectorization=True),
                         Property(name="proxy_target", data_type=DataType.TEXT, description="Target endpoint for proxy/forwarding routes (cross-language linking)", skip_vectorization=True),
                     ],
                     references=[
@@ -1036,6 +1232,13 @@ class CodeGraphAnalyzer:
                         Property(name="endpoint", data_type=DataType.TEXT, description="Extracted target: /path, grpc:Service.Method, topic:name", skip_vectorization=True),
                         Property(name="raw_target", data_type=DataType.TEXT, description="Full literal string as seen in source code", skip_vectorization=True),
                         Property(name="confidence", data_type=DataType.TEXT, description="high | medium", skip_vectorization=True),
+                        # v0.2.18 (Plan C): SOURCE-SIDE language. A Python file calling a
+                        # Go gRPC endpoint creates an interaction row with language="python"
+                        # (the caller's language). The target language might be different,
+                        # but a re-analysis of Python source re-extracts all Python→X
+                        # interactions, so language-scoped prune by source-language is
+                        # the correct + safe primitive.
+                        Property(name="language", data_type=DataType.TEXT, description="Source-side canonical language ID (caller's language) — Plan C scoped prune", skip_vectorization=True),
                         Property(name="description", data_type=DataType.TEXT, description="Human-readable summary for embedding (Python→HTTP POST /api/users via requests)"),
                     ],
                     references=[
@@ -1065,6 +1268,14 @@ class CodeGraphAnalyzer:
 
         # Schema migration: ensure import_names property exists on CodeModule
         self._ensure_import_names_property()
+
+        # v0.2.18 (Plan C) schema migration: ensure `language` property exists
+        # on CodeClass / CodeFunction / CodeAPI / CodeInteraction. CodeModule
+        # already has it (since v0.2.16). The property enables language-scoped
+        # pruning so `--prune-stale --language=<lang>` is safe on polyglot
+        # repos. Idempotent — does nothing when the prop is already present.
+        # Soft-fail per-collection so a single 422 doesn't wedge the whole run.
+        self._ensure_language_property()
 
     def _dedup_insert(self, collection, insert_params: dict, identity_key: str,
                       file_path_rel: str = "") -> str:
@@ -1110,6 +1321,26 @@ class CodeGraphAnalyzer:
             ``class_uuid``, ``module_uuid`` etc.) continues to work.
         """
         det_uuid = _deterministic_uuid(self.project_name, file_path_rel, identity_key)
+
+        # v0.2.18 (Plan C): stamp the canonical language ID on every insert
+        # so the language-scoped prune filter can match each row. The
+        # dispatcher sets `self._current_language` for the duration of one
+        # language's analyze loop; insert sites need not pass it explicitly.
+        # Skips when `language` is already present (caller pre-set it, or
+        # the prop doesn't belong on this collection — defensive). Empty
+        # `_current_language` is also a no-op so unit tests that bypass the
+        # dispatcher don't get spurious empty-string writes that would
+        # confuse the prune filter's "unknown language" branch.
+        #
+        # `getattr` with default keeps the path safe for older test
+        # fixtures that construct an analyzer without going through
+        # __init__ — they may not have `_current_language` set.
+        current_lang = getattr(self, "_current_language", "")
+        if current_lang:
+            props = insert_params.get("properties")
+            if isinstance(props, dict) and not props.get("language"):
+                props["language"] = current_lang
+
         try:
             collection.data.replace(uuid=det_uuid, **insert_params)
         except BaseException as exc:
@@ -1138,6 +1369,57 @@ class CodeGraphAnalyzer:
                 print("   Added import_names property to CodeModule schema")
         except Exception as e:
             logger.debug(f"Schema migration check failed: {e}")
+
+    def _ensure_language_property(self):
+        """Add `language` property to the 4 code collections that lack it
+        on pre-v0.2.18 installs (CodeClass, CodeFunction, CodeAPI,
+        CodeInteraction). CodeModule already has the property since v0.2.16.
+
+        Plan C / v0.2.18 schema migration. The property enables language-
+        scoped pruning so `--prune-stale --language=<lang>` deletes only
+        rows tagged with that canonical language ID. Without this property,
+        pre-Plan-C rows are invisible to the filter — they survive a
+        language-scoped prune (conservative) but the next full re-analyze
+        will rewrite them with the new field populated.
+
+        Idempotent: a property that already exists is skipped silently.
+        Soft-fail per collection: an HTTP error on one shouldn't wedge the
+        others. The `_ensure_import_names_property` pattern is the template.
+        """
+        collections = [
+            ("CodeClass",      self.classes_collection,
+             "Canonical language ID (python, javascript, ...) — Plan C scoped prune"),
+            ("CodeFunction",   self.functions_collection,
+             "Canonical language ID (python, javascript, ...) — Plan C scoped prune"),
+            ("CodeAPI",        self.apis_collection,
+             "Canonical language ID (python, javascript, ...) — Plan C scoped prune"),
+            ("CodeInteraction", self.interactions_collection,
+             "Source-side canonical language ID (caller's language) — Plan C scoped prune"),
+        ]
+        for label, coll, desc in collections:
+            if coll is None:
+                continue
+            try:
+                config = coll.config.get()
+                existing_props = {p.name for p in config.properties}
+                if "language" in existing_props:
+                    continue
+                coll.config.add_property(
+                    Property(
+                        name="language",
+                        data_type=DataType.TEXT,
+                        description=desc,
+                        skip_vectorization=True,
+                    )
+                )
+                print(f"   Added language property to {label} schema (Plan C)")
+            except Exception as e:
+                # Soft-fail. A 422 here doesn't break analysis — language-
+                # scoped prune just won't recognise rows in this collection
+                # until the next successful migration pass.
+                logger.debug(
+                    f"Plan C language-property migration on {label} skipped: {e}"
+                )
 
     def analyze_repository(self, repo_path: Path, language: Optional[str] = None,
                           incremental: bool = False,
@@ -1227,23 +1509,55 @@ class CodeGraphAnalyzer:
             ('proto',      self._find_proto_files,  self._analyze_proto_file),
         ]
 
+        # v0.2.18 (Plan C): two-phase loop so we know the grand-total file
+        # count for the progress emitter BEFORE we start analyzing. Without
+        # this, the fraction shown in the Re-analyze modal would drift up
+        # per-language. The find + incremental-filter pass is cheap (no
+        # Weaviate calls) so doing it twice is fine; we cache the result.
+        per_lang_files: List[Tuple[str, Any, List[Path]]] = []
         for lang_name, find_fn, analyze_fn in lang_dispatch:
             if lang and lang != lang_name:
                 continue
-
             files = find_fn(repo_path)
             if not files:
                 continue
-
             if incremental:
                 files = self._filter_changed_files(repo_path, files)
                 if not files:
                     print(f"ℹ️  No changed {lang_name} files to analyze")
                     continue
+            per_lang_files.append((lang_name, analyze_fn, list(files)))
 
+        total_files = sum(len(fs) for _, _, fs in per_lang_files)
+        seen_files = 0
+
+        for lang_name, analyze_fn, files in per_lang_files:
             print(f"📂 Found {len(files)} {lang_name} files to analyze")
 
+            # v0.2.18 (Plan C): every analyze_*_file path threads its canonical
+            # language ID through `_current_language` so insert sites can stamp
+            # the `language` property without changing each method's signature.
+            # The dispatcher restores the prior value (in practice always "") on
+            # exit so back-to-back lang_dispatch iterations don't leak state.
+            self._current_language = lang_name
+
             for f in files:
+                if self._progress_emitter is not None and total_files > 0:
+                    try:
+                        rel = str(f.relative_to(repo_path).as_posix())
+                    except Exception:
+                        rel = str(f)
+                    try:
+                        self._progress_emitter(
+                            float(seen_files) / float(total_files),
+                            f"Analyzing {rel}",
+                            rel,
+                            lang_name,
+                        )
+                    except Exception:
+                        # Progress emission must never block analysis.
+                        pass
+                seen_files += 1
                 try:
                     result = analyze_fn(f, repo_path)
                     stats['modules']  += result.get('modules', 0)
@@ -1281,13 +1595,25 @@ class CodeGraphAnalyzer:
                     if seen_dedup:
                         stats['insert_errors'] += 1
 
+        # Clear the per-language context now that the dispatch loop is
+        # done (Plan C). The prune pass below doesn't depend on it.
+        self._current_language = ""
+
         # v0.2.16 (1.4 / addendum H): --prune-stale pass.
         # Walk every per-project code-graph collection and delete any
         # object whose UUID was NOT visited during this analyze run.
         # The visited-UUID set was populated as a side-effect of
         # _dedup_insert + _create_or_update_module calls when
         # self._track_visited was True.
+        #
+        # v0.2.18 (Plan C): when `language` was passed to analyze_repository,
+        # the prune is SCOPED to that language so cross-language data in
+        # other Code* rows is preserved. The dispatcher only walked files of
+        # `language`, so any per-row delete must filter `language ==
+        # canonical(language)` before deleting. See `_prune_stale_objects`
+        # for the implementation.
         if prune_stale:
+            self._prune_language = _canonical_lang_id(language) if language else ""
             stats['stale_pruned'] = self._prune_stale_objects()
 
         return stats
@@ -1300,9 +1626,16 @@ class CodeGraphAnalyzer:
         orphan UUIDs because nothing tells Weaviate "this used to
         exist, please remove it". This pass closes that gap.
 
+        v0.2.18 (Plan C): when `self._prune_language` is non-empty, the
+        prune is SCOPED — only rows whose `language` property matches the
+        canonical ID are candidates for deletion. Rows from other
+        languages are preserved (their UUIDs aren't in `visited_uuids`
+        either, but they're correctly out-of-scope for this run).
+
         Algorithm:
           For each per-project collection:
             - Enumerate every UUID where ``project == self.project_name``.
+              (And, when language-scoped: ``language == self._prune_language``.)
             - Subtract the set of UUIDs we visited this run.
             - Delete the difference (the stale ones).
 
@@ -1331,20 +1664,43 @@ class CodeGraphAnalyzer:
             self.interactions_collection,
         ]
 
+        scope_lang = getattr(self, "_prune_language", "") or ""
+        if scope_lang:
+            print(
+                f"🧹 Language-scoped prune active: deleting only "
+                f"language={scope_lang!r} entries not visited this run"
+            )
+
         for coll in collections:
             if coll is None:
                 continue
             visited = per_collection_visited.get(coll.name, set())
-            pruned = self._prune_collection(coll, visited)
+            pruned = self._prune_collection(
+                coll, visited, language_scope=scope_lang,
+            )
             if pruned:
                 print(f"🧹 Pruned {pruned} stale objects from {coll.name}")
                 total_pruned += pruned
 
         return total_pruned
 
-    def _prune_collection(self, collection, visited_uuids: Set[str]) -> int:
+    def _prune_collection(
+        self,
+        collection,
+        visited_uuids: Set[str],
+        language_scope: str = "",
+    ) -> int:
         """Delete every object in ``collection`` whose project matches
         ``self.project_name`` AND whose UUID is not in ``visited_uuids``.
+
+        v0.2.18 (Plan C): when ``language_scope`` is a non-empty canonical
+        language ID, additionally filter by ``language == language_scope``
+        (case-insensitive, after `_canonical_lang_id` normalisation so
+        legacy mixed-case rows like `"Python"` are recognised as matching
+        `"python"`). Rows with no `language` property are treated as
+        unknown-language and PRESERVED — they predate the v0.2.18 schema
+        migration and the next full re-analyze (no `--language`) will
+        repopulate them.
 
         Why filter on the ``project`` property as well as the
         collection name: a per-project collection like
@@ -1354,16 +1710,39 @@ class CodeGraphAnalyzer:
         (no extra query roundtrip beyond the initial enumerate).
         """
         pruned = 0
+        # Read `language` only when needed so a missing-property collection
+        # (pre-migration) doesn't 422 the enumerate. Weaviate returns None
+        # for missing-on-row props which we treat as "unknown language".
+        return_props = ["project"]
+        if language_scope:
+            return_props.append("language")
+
         try:
             for obj in collection.iterator(
-                return_properties=["project"],
+                return_properties=return_props,
             ):
-                obj_project = obj.properties.get("project") if obj.properties else None
+                props = obj.properties or {}
+                obj_project = props.get("project")
                 # Only consider objects belonging to this project. Foreign-
                 # project rows (shouldn't exist in per-project collections,
                 # but defensive) are left alone.
                 if obj_project not in (None, "", self.project_name):
                     continue
+
+                # Plan C: language-scoped filter. Rows without a language
+                # property (pre-v0.2.18 data) are PRESERVED — they need a
+                # full re-analyze to repopulate the field. Rows with a
+                # language other than the scope are out-of-scope this run.
+                if language_scope:
+                    row_lang = _canonical_lang_id(props.get("language"))
+                    if not row_lang:
+                        # Unknown / pre-migration row → preserve.
+                        continue
+                    if row_lang != language_scope:
+                        # Different-language row → preserve (this is the
+                        # entire point of language-scoped prune).
+                        continue
+
                 if str(obj.uuid) in visited_uuids:
                     continue
                 try:
@@ -1607,7 +1986,7 @@ class CodeGraphAnalyzer:
                 "references": {"module": module_uuid},
             }
             if embedding:
-                insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+                insert_params["vector"] = _shape_for_insert(embedding)
             self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['classes'] += 1
 
@@ -1637,7 +2016,7 @@ class CodeGraphAnalyzer:
                 "references": {"module": module_uuid},
             }
             if embedding:
-                insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+                insert_params["vector"] = _shape_for_insert(embedding)
             func_uuid = self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['functions'] += 1
 
@@ -1669,7 +2048,7 @@ class CodeGraphAnalyzer:
                     "references": {"handler": func_uuid},
                 }
                 if api_embedding:
-                    api_params["vector"] = {_ACTIVE_CODE_VECTOR: api_embedding} if DUAL_EMBEDDING_ENABLED else api_embedding
+                    api_params["vector"] = _shape_for_insert(api_embedding)
                 self._dedup_insert(self.apis_collection, api_params, api_params["properties"].get("endpoint", "") + ":" + api_params["properties"].get("method", ""), file_path_rel=relative_path)
                 stats.setdefault('apis', 0)
                 stats['apis'] += 1
@@ -1797,7 +2176,7 @@ class CodeGraphAnalyzer:
                 "references": {"module": module_uuid},
             }
             if embedding:
-                insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+                insert_params["vector"] = _shape_for_insert(embedding)
             self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['classes'] += 1
 
@@ -1818,7 +2197,7 @@ class CodeGraphAnalyzer:
                 },
             }
             if embedding:
-                api_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+                api_params["vector"] = _shape_for_insert(embedding)
             self._dedup_insert(self.apis_collection, api_params, api_params["properties"].get("endpoint", "") + ":" + api_params["properties"].get("method", ""), file_path_rel=relative_path)
             stats['apis'] += 1
 
@@ -2022,7 +2401,7 @@ class CodeGraphAnalyzer:
                 "references": {"module": module_uuid},
             }
             if embedding:
-                insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+                insert_params["vector"] = _shape_for_insert(embedding)
             self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['classes'] += 1
 
@@ -2049,7 +2428,7 @@ class CodeGraphAnalyzer:
                 "references": {"module": module_uuid},
             }
             if embedding:
-                insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+                insert_params["vector"] = _shape_for_insert(embedding)
             self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['functions'] += 1
 
@@ -2089,7 +2468,7 @@ class CodeGraphAnalyzer:
                 },
             }
             if embedding:
-                insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+                insert_params["vector"] = _shape_for_insert(embedding)
             self._dedup_insert(self.apis_collection, insert_params, insert_params["properties"].get("endpoint", "") + ":" + insert_params["properties"].get("method", ""), file_path_rel=relative_path)
             stats['apis'] += 1
 
@@ -2212,7 +2591,7 @@ class CodeGraphAnalyzer:
                 "references": {"module": module_uuid},
             }
             if embedding:
-                insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+                insert_params["vector"] = _shape_for_insert(embedding)
             self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['classes'] += 1
 
@@ -2246,7 +2625,7 @@ class CodeGraphAnalyzer:
                 "references": {"module": module_uuid},
             }
             if embedding:
-                insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+                insert_params["vector"] = _shape_for_insert(embedding)
             self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['functions'] += 1
 
@@ -2347,7 +2726,7 @@ class CodeGraphAnalyzer:
                 "references": {"module": module_uuid},
             }
             if embedding:
-                insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+                insert_params["vector"] = _shape_for_insert(embedding)
             self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['classes'] += 1
 
@@ -2370,7 +2749,7 @@ class CodeGraphAnalyzer:
                 "references": {"module": module_uuid},
             }
             if embedding:
-                insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+                insert_params["vector"] = _shape_for_insert(embedding)
             self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['functions'] += 1
 
@@ -2462,7 +2841,7 @@ class CodeGraphAnalyzer:
                 "references": {"module": module_uuid},
             }
             if embedding:
-                insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+                insert_params["vector"] = _shape_for_insert(embedding)
             self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['classes'] += 1
 
@@ -2487,7 +2866,7 @@ class CodeGraphAnalyzer:
                 "references": {"module": module_uuid},
             }
             if embedding:
-                insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+                insert_params["vector"] = _shape_for_insert(embedding)
             self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['functions'] += 1
 
@@ -2575,7 +2954,7 @@ class CodeGraphAnalyzer:
                 "references": {"module": module_uuid},
             }
             if embedding:
-                insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+                insert_params["vector"] = _shape_for_insert(embedding)
             self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['classes'] += 1
 
@@ -2598,7 +2977,7 @@ class CodeGraphAnalyzer:
                 "references": {"module": module_uuid},
             }
             if embedding:
-                insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+                insert_params["vector"] = _shape_for_insert(embedding)
             self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['functions'] += 1
 
@@ -2691,7 +3070,7 @@ class CodeGraphAnalyzer:
                 "references": {"module": module_uuid},
             }
             if embedding:
-                insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+                insert_params["vector"] = _shape_for_insert(embedding)
             self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['classes'] += 1
 
@@ -2720,7 +3099,7 @@ class CodeGraphAnalyzer:
                 "references": {"module": module_uuid},
             }
             if embedding:
-                insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+                insert_params["vector"] = _shape_for_insert(embedding)
             self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['functions'] += 1
 
@@ -2811,7 +3190,7 @@ class CodeGraphAnalyzer:
                 "references": {"module": module_uuid},
             }
             if embedding:
-                insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+                insert_params["vector"] = _shape_for_insert(embedding)
             self._dedup_insert(self.classes_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['classes'] += 1
 
@@ -2838,7 +3217,7 @@ class CodeGraphAnalyzer:
                 "references": {"module": module_uuid},
             }
             if embedding:
-                insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+                insert_params["vector"] = _shape_for_insert(embedding)
             self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['functions'] += 1
 
@@ -2916,7 +3295,7 @@ class CodeGraphAnalyzer:
                 "references": {"module": module_uuid},
             }
             if embedding:
-                insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+                insert_params["vector"] = _shape_for_insert(embedding)
             self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
             stats['functions'] += 1
 
@@ -3056,7 +3435,7 @@ class CodeGraphAnalyzer:
             if func_uuid:
                 insert_params["references"]["source_function"] = func_uuid
             if embedding:
-                insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+                insert_params["vector"] = _shape_for_insert(embedding)
             try:
                 self._dedup_insert(
                     self.interactions_collection, insert_params,
@@ -3156,6 +3535,14 @@ class CodeGraphAnalyzer:
         with the same module-stem name).
         """
 
+        # v0.2.18 (Plan C): normalise the language label to the canonical
+        # lowercase ID so the prune filter can match it deterministically.
+        # The caller-supplied `language` may be a display string ("Python",
+        # "C++", "C#", etc.); `_canonical_lang_id` collapses both forms.
+        # Fall back to `self._current_language` (dispatcher-set) so direct
+        # callers without a `language=` argument still get the right value.
+        canonical_lang = _canonical_lang_id(language) or self._current_language or ""
+
         # Check if exists
         if path in self.module_cache:
             # Update existing
@@ -3168,6 +3555,10 @@ class CodeGraphAnalyzer:
                     "last_modified": last_modified.isoformat(),
                     "file_hash": file_hash,
                     "import_names": imports,
+                    # Plan C: backfill `language` on update so pre-migration
+                    # rows get the canonical value the next time we touch
+                    # them, without needing a separate batch backfill pass.
+                    "language": canonical_lang,
                 }
             )
             # Still record as visited so --prune-stale doesn't delete it.
@@ -3181,7 +3572,7 @@ class CodeGraphAnalyzer:
         insert_params = {
             "properties": {
                 "path": path,
-                "language": language,
+                "language": canonical_lang,
                 "module_summary": module_summary,
                 "loc": loc,
                 "complexity": complexity,
@@ -3194,7 +3585,7 @@ class CodeGraphAnalyzer:
 
         # Add vector if embedding generation succeeded
         if embedding:
-            insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+            insert_params["vector"] = _shape_for_insert(embedding)
 
         uuid = self._dedup_insert(
             self.modules_collection, insert_params, f"module::{path}",
@@ -3642,7 +4033,7 @@ class CodeGraphAnalyzer:
 
         # Add vector if embedding generation succeeded
         if embedding:
-            insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+            insert_params["vector"] = _shape_for_insert(embedding)
 
         # v0.2.16 (bug 0.8): capture the return value into class_uuid.
         # Pre-v0.2.16 the return was discarded and the next line referenced
@@ -3741,7 +4132,7 @@ class CodeGraphAnalyzer:
 
         # Add vector if embedding generation succeeded
         if embedding:
-            insert_params["vector"] = {_ACTIVE_CODE_VECTOR: embedding} if DUAL_EMBEDDING_ENABLED else embedding
+            insert_params["vector"] = _shape_for_insert(embedding)
 
         func_uuid = self._dedup_insert(self.functions_collection, insert_params, insert_params["properties"].get("full_name", insert_params["properties"]["name"]), file_path_rel=relative_path)
 
@@ -3980,21 +4371,27 @@ def main():
                        help='After analysis, delete code-graph objects this run '
                             'did not visit (cleans up entries for deleted files). '
                             'Tracks UUIDs as they are upserted and removes the '
-                            'rest from each per-project collection.')
+                            'rest from each per-project collection. Plan C / '
+                            'v0.2.18: when combined with --language=<lang>, the '
+                            'prune is SCOPED to that language only — entries '
+                            'from other languages are preserved.')
+    # v0.2.18 (Plan C): structured per-file progress for the Re-analyze
+    # button's Tauri modal. Emits one JSON object per analyzed file on
+    # stdout: {"progress": 0.42, "message": "Analyzing foo.py", "file":
+    # "foo.py", "lang": "python"}. The final report line is also JSON:
+    # {"final": true, "files_analyzed": N, ...}. Off by default to keep
+    # the human-readable output for direct CLI users; the hook + Tauri
+    # command opt in explicitly.
+    parser.add_argument('--json-progress', action='store_true',
+                       help='Emit per-file progress + final report as JSON '
+                            'lines on stdout (Tauri Re-analyze modal).')
 
     args = parser.parse_args()
 
-    # Defensive: warn if --prune-stale is combined with --language, since
-    # the prune pass deletes EVERY non-visited UUID across all collections
-    # — including objects produced by a previous full-language run.
-    if args.prune_stale and args.language:
-        print(
-            f"⚠️  --prune-stale + --language={args.language} would delete "
-            "code-graph entries from OTHER languages that this run did "
-            "not visit. Re-run without --language to analyze the full repo, "
-            "or drop --prune-stale.",
-            file=sys.stderr,
-        )
+    # v0.2.18 (Plan C) — --prune-stale + --language is now the CORRECT
+    # combination, not a footgun. The prune pass filters by stored
+    # `language` property so only rows from the analyzed language are
+    # candidates for deletion. The pre-Plan-C warning has been removed.
 
     # Validate repo path
     repo_path = args.repo_path.resolve()
@@ -4018,11 +4415,64 @@ def main():
     if args.migrate_from_shared:
         return _migrate_from_shared(project_name, args.named_vectors)
 
+    # v0.2.18: initialise the EmbeddingService BEFORE creating collections.
+    # The vectorizer config + slot resolution both depend on it.
+    #
+    # Behaviour matrix:
+    #   * code backend reachable (codeembed / ollama / openai) → proceed
+    #   * NO embedding backend reachable → NoEmbeddingBackendError,
+    #     write deferral + JSONL diagnostic, exit 0 (soft-fail per the
+    #     KG-summary-no-backend pattern). The launcher / install.py
+    #     surfaces UPDATE_DEFERRED.md to the user.
+    #   * embedding service constructed, but code_backend_ready() is False
+    #     (e.g. CodeEmbed container down, machine has only an ollama text
+    #     model that can't serve code) → same soft-fail. Don't proceed:
+    #     the embed_* helpers would just emit `None` per call and produce
+    #     a code graph with no vectors at all.
+    install_root = Path(os.environ.get("VCT_ORCHESTRATOR_ROOT", "")).resolve() if os.environ.get("VCT_ORCHESTRATOR_ROOT", "").strip() else repo_path
+    embedding_service: Optional[EmbeddingService] = None
+    try:
+        embedding_service = EmbeddingService.for_project(install_root)
+    except NoEmbeddingBackendError as e:
+        _emit_code_graph_deferral_no_backend(install_root, e)
+        print(f"⚠️  Code-graph analysis skipped: {e}", file=sys.stderr)
+        print(
+            "   See .claude/context/EMBEDDING_FAILURES.md + "
+            "~/.claude/metrics/embedding_failures.jsonl",
+            file=sys.stderr,
+        )
+        return 0
+
+    if not embedding_service.code_backend_ready():
+        _emit_code_graph_deferral_code_backend_down(install_root, embedding_service)
+        print(
+            f"⚠️  Code-graph analysis skipped: active code backend "
+            f"(slot={embedding_service.code_vector_slot}, "
+            f"model={embedding_service.code_model_id}) is not reachable.",
+            file=sys.stderr,
+        )
+        print(
+            "   Start CodeEmbed (`podman start vco_code_embed`) or Ollama "
+            "with a code-capable model before re-running.",
+            file=sys.stderr,
+        )
+        try:
+            embedding_service.close()
+        except Exception:
+            pass
+        return 0
+
+    _set_embedding_service(embedding_service)
+
     # Create analyzer
     analyzer = CodeGraphAnalyzer(project_name, named_vectors=args.named_vectors)
 
     # Connect to Weaviate
     if not analyzer.connect():
+        try:
+            embedding_service.close()
+        except Exception:
+            pass
         return 1
 
     try:
@@ -4050,8 +4500,35 @@ def main():
             print(f"❌ Failed to create collections: {e}", file=sys.stderr)
             return 1
 
+        # v0.2.18 (Plan C): wire JSON-progress emitter for the Tauri
+        # Re-analyze modal. Each emit prints one JSON line on stdout that
+        # the parent process reads via BufReader::lines() and forwards to
+        # the front-end as a `vct-reanalysis-progress` Tauri event.
+        if args.json_progress:
+            def _emit_progress(frac: float, msg: str, fpath: str, lang: str) -> None:
+                # Bounded fraction so float drift doesn't push the bar past 1.
+                try:
+                    frac_f = float(frac)
+                except Exception:
+                    frac_f = 0.0
+                if frac_f < 0.0:
+                    frac_f = 0.0
+                elif frac_f > 1.0:
+                    frac_f = 1.0
+                payload = {
+                    "progress": frac_f,
+                    "message": msg,
+                    "file": fpath,
+                    "lang": lang,
+                }
+                # `flush=True` so the parent's line reader doesn't wait
+                # for the analyzer to finish before seeing per-file ticks.
+                print(json.dumps(payload), flush=True)
+            analyzer._progress_emitter = _emit_progress
+
         # Analyze repository
-        print("🔍 Analyzing codebase...")
+        if not args.json_progress:
+            print("🔍 Analyzing codebase...")
         stats = analyzer.analyze_repository(
             repo_path,
             language=args.language,
@@ -4063,6 +4540,35 @@ def main():
 
         # Post-processing: create cross-references
         ref_stats = analyzer.create_cross_references()
+
+        # v0.2.18 (Plan C): final progress emit so the modal's progress bar
+        # snaps to 100% before the report is rendered.
+        if args.json_progress and analyzer._progress_emitter is not None:
+            try:
+                analyzer._progress_emitter(
+                    1.0,
+                    f"Analyzed {stats.get('files_analyzed', 0)} files",
+                    "",
+                    args.language or "",
+                )
+            except Exception:
+                pass
+            # Final report JSON line — the Tauri command's stdout reader
+            # looks for `{"final": true, ...}` and returns it to the modal.
+            final_payload = {
+                "final": True,
+                "files_analyzed": stats.get("files_analyzed", 0),
+                "files_skipped": stats.get("files_skipped", 0),
+                "modules": stats.get("modules", 0),
+                "classes": stats.get("classes", 0),
+                "functions": stats.get("functions", 0),
+                "apis": stats.get("apis", 0),
+                "insert_errors": stats.get("insert_errors", 0),
+                "stale_pruned": stats.get("stale_pruned", 0),
+                "language": args.language or "",
+                "prune_stale": bool(args.prune_stale),
+            }
+            print(json.dumps(final_payload), flush=True)
 
         # Report results
         print("\n" + "="*60)
@@ -4117,6 +4623,112 @@ def main():
 
     finally:
         analyzer.close()
+        if embedding_service is not None:
+            try:
+                embedding_service.close()
+            except Exception:
+                pass
+
+
+def _emit_code_graph_deferral_no_backend(install_root: Path, exc: Exception) -> None:
+    """Soft-fail deferral when NO embedding backend is reachable.
+
+    Same pattern as the KG-sync deferral helper in sync_knowledge_graph.py
+    — writes ``<install_root>/.claude/context/UPDATE_DEFERRED.md`` so the
+    launcher / install.py surfaces the issue. Idempotent. Soft-fail on
+    any IO / import error.
+    """
+    try:
+        from vco_lib.deferral_report import DeferralEntry, DeferralReport
+        entry = DeferralEntry(
+            condition_id="code_graph_no_embedding_backend",
+            title="Code-graph analysis skipped: no embedding backend reachable",
+            detected=(
+                "analyze_code_graph.py could not reach any configured "
+                "embedding backend (CodeEmbed / Ollama / OpenAI). Error: "
+                f"{exc}"
+            ),
+            why_deferred=(
+                "Soft-fail policy: install must never block on transient "
+                "service unavailability. The code graph for this project "
+                "will be empty until the next analysis run succeeds. See "
+                "~/.claude/metrics/embedding_failures.jsonl for the "
+                "per-backend diagnostic written by EmbeddingService."
+            ),
+            command_to_apply=(
+                "# Restart embedding services then re-run analysis:\n"
+                "podman start vco_code_embed vco_ollama   # or: docker start ...\n"
+                ".claude/scripts/code-graph-analyze . --project <name>"
+            ),
+            severity="warning",
+            kg_node_refs=[
+                "knowledge/concepts/embedding-service-v0218.md",
+            ],
+        )
+        report = DeferralReport.read(install_root)
+        report.add_entry(entry)
+        report.write(install_root)
+    except Exception as inner:
+        print(f"   (deferral emit failed: {inner})", file=sys.stderr)
+
+
+def _emit_code_graph_deferral_code_backend_down(
+    install_root: Path,
+    svc: "EmbeddingService",
+) -> None:
+    """Soft-fail deferral when the active CODE backend specifically is down.
+
+    Distinguishes from the no-backend-at-all case because a CodeEmbed
+    container can be down while Ollama is up (or vice-versa). The
+    deferral entry points at the right service to restart.
+    """
+    try:
+        from vco_lib.deferral_report import DeferralEntry, DeferralReport
+        slot = svc.code_vector_slot
+        model = svc.code_model_id
+        if "codesage" in slot:
+            service_hint = (
+                "CodeEmbed service (vco_code_embed container on port 11440)"
+            )
+            restart_cmd = "podman start vco_code_embed"
+        elif "openai" in slot:
+            service_hint = "OpenAI API"
+            restart_cmd = (
+                "# Check OPENAI_API_KEY is set and the key is valid:\n"
+                "# Preferences → Special Secrets → OpenAI → Re-check"
+            )
+        else:
+            service_hint = "Ollama (vco_ollama container on port 11435)"
+            restart_cmd = "podman start vco_ollama"
+
+        entry = DeferralEntry(
+            condition_id="code_graph_code_backend_unreachable",
+            title=f"Code-graph analysis skipped: {service_hint} not reachable",
+            detected=(
+                f"analyze_code_graph.py would write to slot '{slot}' "
+                f"(model: {model}), but the backend serving that slot is "
+                "currently unreachable. Refusing to proceed — a code graph "
+                "with empty vectors is worse than no code graph (search "
+                "would return all-zero scores)."
+            ),
+            why_deferred=(
+                "Soft-fail policy: never produce a degraded code graph. "
+                "Restart the service and re-run analysis."
+            ),
+            command_to_apply=(
+                f"{restart_cmd}\n"
+                ".claude/scripts/code-graph-analyze . --project <name>"
+            ),
+            severity="warning",
+            kg_node_refs=[
+                "knowledge/concepts/embedding-service-v0218.md",
+            ],
+        )
+        report = DeferralReport.read(install_root)
+        report.add_entry(entry)
+        report.write(install_root)
+    except Exception as inner:
+        print(f"   (deferral emit failed: {inner})", file=sys.stderr)
 
 
 if __name__ == '__main__':
