@@ -21,6 +21,20 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
+
+# v0.2.21: per-user single-instance enforcement. On 2nd launch attempt,
+# the plugin fires a callback in the FIRST launcher process and exits
+# the SECOND process before the Tauri runtime initialises. Our callback
+# focuses the existing window so the user sees their already-running
+# launcher come to front instead of "nothing happened" + a half-spawned
+# duplicate. This removes the dual-launcher hazard (hub.token rotation,
+# port-bind chaos, parallel DB writers) entirely.
+#
+# The plugin uses an OS-level mutex/lock under the hood:
+#   - Linux/macOS: AF_UNIX socket at $XDG_RUNTIME_DIR/<identifier>.sock
+#   - Windows: Named mutex via OpenMutexW / CreateMutexW
+# Both are user-scoped (different users can run their own launcher).
+tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }

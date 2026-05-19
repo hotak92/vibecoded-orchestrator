@@ -379,6 +379,34 @@ pub fn run() {
     let local_config = config::LocalConfig::load();
 
     tauri::Builder::default()
+        // v0.2.21: per-user single-instance enforcement. Register BEFORE
+        // any other plugins so the OS-level lock acquire happens before
+        // we start tearing into state-dir setup. If this is the second
+        // launcher process on the same user, the callback below fires in
+        // the FIRST launcher and the second process exits cleanly without
+        // ever creating a window or touching launcher.db.
+        //
+        // Callback semantics: invoked in the FIRST launcher's runtime when
+        // another launch is attempted. Args are the second process's argv;
+        // cwd is the second process's working directory. We don't use them
+        // today — just focus our existing window so the user sees their
+        // already-running launcher come to front. Future: route command-
+        // line deep-links (vct://...) through here.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            // Bring the existing main window to front. If no window exists
+            // (rare — possible if user closed the window but tray-icon
+            // kept the process alive), show + focus the first available.
+            use tauri::Manager;
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            } else if let Some((_, window)) = app.webview_windows().into_iter().next() {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(app_manager)
