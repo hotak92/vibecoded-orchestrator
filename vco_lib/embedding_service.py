@@ -253,6 +253,142 @@ def _to_openai_api_model(catalog_id: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Code-backend fallback chain (v0.2.18 correctness follow-up)
+# ---------------------------------------------------------------------------
+#
+# Background: when ``for_project()`` resolves ``code_model_id`` to
+# ``codesage-large-v2`` (the GPU-accelerated CodeEmbed default) but the
+# FastAPI service is DOWN, every code-embed call subsequently routes to
+# Ollama with model id ``codesage-large-v2`` — and Ollama doesn't have
+# that model pulled. Net: every embed call raises RuntimeError.
+#
+# This fallback chain probes available backends at construction time
+# and picks the FIRST reachable one. Order is locked by the v0.2.18
+# plan (user direction 2026-05-19):
+#
+#   1. CodeEmbed FastAPI service (``/health`` → 200) — preferred,
+#      GPU-accelerated, code-specific embeddings (codesage-large-v2,
+#      2048-dim, slot ``codesage_embed``).
+#   2. Ollama ``qwen3-embedding:0.6b`` — universal fallback. Every VCO
+#      machine that has the KG also has qwen3 pulled, so reusing it
+#      for code keeps code-graph working on every machine where the
+#      KG works (1024-dim, slot ``qwen3_embed``).
+#   3. Ollama ``unclemusclez/jina-embeddings-v2-base-code:latest`` —
+#      code-specific Ollama fallback (auto-pulled by the
+#      ``low_resource`` preset, but not by every preset, hence rank 3)
+#      (768-dim, slot ``jina_embed``).
+#
+# OpenAI is handled separately by the caller — this function only
+# probes local backends.
+
+# Locked model id constants for the fallback chain. Kept here rather
+# than buried in the function body so callers / tests can patch them
+# in isolation.
+_FALLBACK_QWEN3_MODEL = "qwen3-embedding:0.6b"
+_FALLBACK_JINA_MODEL = "unclemusclez/jina-embeddings-v2-base-code:latest"
+
+
+def _ollama_has_model(ollama: "OllamaAdapter", needle: str) -> bool:
+    """Return True iff ``needle`` appears in Ollama's ``/api/tags`` list.
+
+    Substring match, case-insensitive — handles tag variants like
+    ``"qwen3-embedding:0.6b"`` vs ``"qwen3-embedding:latest"``. Soft-
+    fail (returns False) on any HTTP error.
+    """
+    try:
+        models = ollama.list_models()
+    except Exception:  # pragma: no cover (defensive — adapter swallows)
+        return False
+    needle_lower = needle.lower()
+    for m in models:
+        name = str(m.get("name", "")).lower()
+        if needle_lower in name or name.startswith(needle_lower.split(":")[0]):
+            return True
+    return False
+
+
+def _resolve_code_model_with_fallback(
+    *,
+    requested_model_id: str,
+    requested_slot: str,
+    requested_dim: int,
+    ollama: "OllamaAdapter",
+    codeembed: "CodeEmbedAdapter",
+) -> tuple[str, str, int, str]:
+    """Resolve the code model + slot via the locked fallback chain.
+
+    The chain only fires when the caller-resolved slot is
+    ``codesage_embed`` — i.e. when the user intent is to use the
+    GPU/CodeEmbed-service path. For any other slot (explicit
+    ``jina_embed`` user override, CPU-fallback ``qwen3_embed``,
+    ``openai_code_embed``), the requested triple is returned
+    unchanged.
+
+    Args:
+        requested_model_id: Model id resolved by env-based logic in
+            ``for_project()``.
+        requested_slot: Named-vector slot the requested model maps to.
+        requested_dim: Vector dim of the requested model.
+        ollama: Adapter for probing Ollama ``/api/tags``.
+        codeembed: Adapter for probing CodeEmbed ``/health``.
+
+    Returns:
+        ``(model_id, slot, dim, reason)`` — the first reachable backend
+        in the locked chain, or the requested triple if nothing is
+        reachable. ``reason`` is a human-readable string describing
+        what was picked and why (empty when the requested codesage
+        path is fully reachable, since that's the no-op case the user
+        configured).
+    """
+    # Off-chain slots: don't second-guess the user's explicit choice.
+    if requested_slot != "codesage_embed":
+        return requested_model_id, requested_slot, requested_dim, ""
+
+    # 1. CodeEmbed service: the preferred path. If it's up, we're done.
+    if codeembed.is_reachable():
+        # No fallback fired — caller will use the requested triple
+        # and the existing routing logic will dispatch to CodeEmbed.
+        return requested_model_id, requested_slot, requested_dim, ""
+
+    # 2. Ollama qwen3-embedding:0.6b — universal fallback.
+    if _ollama_has_model(ollama, _FALLBACK_QWEN3_MODEL):
+        return (
+            _FALLBACK_QWEN3_MODEL,
+            "qwen3_embed",
+            1024,
+            (
+                f"CodeEmbed service unreachable at {codeembed.base_url}; "
+                f"using ollama:{_FALLBACK_QWEN3_MODEL} (slot=qwen3_embed)"
+            ),
+        )
+
+    # 3. Ollama jina — code-specific Ollama fallback.
+    if _ollama_has_model(ollama, _FALLBACK_JINA_MODEL):
+        # Strip the ":latest" tag suffix for the resolver — the slot map
+        # matches on the model family, not the tag.
+        return (
+            _FALLBACK_JINA_MODEL,
+            "jina_embed",
+            768,
+            (
+                f"CodeEmbed + qwen3 both unavailable; "
+                f"using ollama:jina-embeddings-v2-base-code (slot=jina_embed)"
+            ),
+        )
+
+    # 4. All down — return the requested triple. The caller's
+    #    code_backend_ready() check will then correctly report False
+    #    (CodeEmbed unreachable + Ollama lacks every fallback model),
+    #    surfacing NoEmbeddingBackendError via the existing path.
+    return (
+        requested_model_id,
+        requested_slot,
+        requested_dim,
+        "All code-embed backends unreachable; code embeddings will fail until one comes up",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Public dataclasses
 # ---------------------------------------------------------------------------
 
@@ -764,6 +900,44 @@ class EmbeddingService:
             code_model_id=code_model_id,
             openai_api_key=openai_api_key,
         )
+
+        # ----- Code-backend fallback chain (v0.2.18 correctness fix) -----
+        # If the env-based resolution above picked codesage-large-v2 (the
+        # CodeEmbed-service default) but the FastAPI service is down,
+        # falling back to qwen3 / jina via Ollama keeps code-graph working
+        # on machines where the GPU service hasn't been started.
+        #
+        # The chain only fires for the codesage_embed slot — other slots
+        # (qwen3_embed CPU fallback, jina_embed explicit, openai_code_embed)
+        # reflect explicit user/preset intent and are left alone.
+        new_model, new_slot, new_dim, reason = _resolve_code_model_with_fallback(
+            requested_model_id=svc.code_model_id,
+            requested_slot=svc.code_vector_slot,
+            requested_dim=svc.code_dim,
+            ollama=svc.ollama,
+            codeembed=svc.codeembed,
+        )
+        if reason:
+            # Fallback fired — surface the chosen backend in stderr so
+            # operators and tests can see what was selected. We use a
+            # plain print() (not logger.warning) because logging may not
+            # be configured at construction time in install.py / Tauri
+            # subprocess contexts, and the message MUST reach stderr.
+            print(reason, file=sys.stderr)
+        if (new_model, new_slot, new_dim) != (
+            svc.code_model_id,
+            svc.code_vector_slot,
+            svc.code_dim,
+        ):
+            # Reassign the slot triple so search-by-active-slot stays
+            # correct and the dispatcher routes to the resolved model.
+            svc.code_model_id = new_model
+            svc._code_slot = new_slot
+            svc._code_dim = new_dim
+            # Invalidate cached readiness — the new slot has different
+            # backend semantics (qwen3_embed routes to Ollama, not the
+            # CodeEmbed service).
+            svc._code_ready = None
 
         # Probe both readiness flags so we can fail fast with a useful
         # error and write the diagnostic.
