@@ -496,6 +496,65 @@ pub struct RuntimeBlock {
     pub auto_restart: bool,
     #[serde(default)]
     pub log_file: Option<String>,
+
+    // ─── v0.2.20: per-module GPU mode hints ───────────────────────────
+    //
+    // These three fields drive the launcher's per-module GPU policy
+    // decision (gpu_policy::decide_gpu_mode + image-variant dispatch).
+    // All optional — modules that don't care about GPU mode (CLI tools,
+    // pure-Python MCPs) simply omit them and fall through to the legacy
+    // "no GPU detection" path.
+    //
+    // See knowledge/concepts/gpu-mode-decision-policy.md for the full
+    // design rationale.
+
+    /// Per-module VRAM threshold (GB). When set, the launcher passes
+    /// this value to `decide_gpu_mode` for this module's install/start
+    /// flow instead of the 8 GB default. Lets smaller modules (e.g. the
+    /// RL reranker, ~4 GB) opt into GPU mode on hardware that
+    /// orchestrator-core would degrade to CPU.
+    #[serde(default)]
+    pub min_gpu_vram_gb: Option<f64>,
+
+    /// When true, the module RUNS on CPU with degraded performance
+    /// (RL reranker fits — its model loads on CPU, just slower).
+    /// `gpu_optional=false` modules refuse to install without a
+    /// qualifying GPU and surface a clear error pointing at the user's
+    /// options (upgrade hardware, or `--cpu-only` if they accept the
+    /// perf hit). Default `false` (GPU treated as required when the
+    /// module declares any GPU hint).
+    #[serde(default)]
+    pub gpu_optional: bool,
+
+    /// Optional per-mode image-variant tags. When present, the
+    /// launcher's `start_container_for_module` reads `decide_gpu_mode`'s
+    /// answer and picks the matching tag (Cuda → `cuda`, Rocm → `rocm`,
+    /// Cpu/Metal → `cpu`). When absent, the legacy single-tag flow
+    /// (from `install.container.tag_from_version`) is used unchanged.
+    #[serde(default)]
+    pub gpu_image_variants: Option<GpuImageVariants>,
+}
+
+/// Per-GPU-mode image tag variants. Each variant ships as a separate
+/// OCI image tag (e.g. `:0.1.0-cpu`, `:0.1.0-cuda`, `:0.1.0-rocm`)
+/// because PyTorch's CUDA/ROCm/CPU wheels are mutually exclusive at
+/// pip-install time. See `knowledge/concepts/gpu-mode-decision-policy.md`
+/// > "Why CUDA wheels vs ROCm wheels need different containers" for
+/// the full rationale.
+///
+/// All three variants are REQUIRED when the block is present — the
+/// launcher would have no fallback if one were missing. Modules that
+/// only ship a CPU build should simply omit `gpu_image_variants` and
+/// rely on the legacy single-tag path.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GpuImageVariants {
+    /// CPU-only variant tag (e.g. `"0.1.0-cpu"`). Used for `GpuMode::Cpu`
+    /// AND `GpuMode::Metal` (no Metal-specific torch wheels today).
+    pub cpu: String,
+    /// CUDA variant tag (e.g. `"0.1.0-cuda"`). Used for `GpuMode::Cuda`.
+    pub cuda: String,
+    /// ROCm variant tag (e.g. `"0.1.0-rocm"`). Used for `GpuMode::Rocm`.
+    pub rocm: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1056,6 +1115,134 @@ mod tests {
         assert!(has_button, "manifest must declare at least one button");
         assert!(has_multi_select, "manifest must declare a multi_select");
         assert!(has_info, "section 1 must include at least one info banner");
+    }
+
+    // ─── v0.2.20: per-module GPU mode hints (RuntimeBlock additions) ───
+    //
+    // Three new RuntimeBlock fields land in v0.2.20:
+    //   - min_gpu_vram_gb       Option<f64>
+    //   - gpu_optional          bool
+    //   - gpu_image_variants    Option<GpuImageVariants>
+    //
+    // Pinned via JSON fixtures so a future refactor (e.g. renaming
+    // gpu_image_variants → image_variants) breaks loudly at CI time
+    // rather than at install time on a customer's machine.
+
+    /// Manifest with the full v0.2.20 GPU hint block populated.
+    #[test]
+    fn runtime_block_v0_2_20_gpu_hints_deserialize() {
+        let raw = r#"{
+            "id": "gpu-hints-mod",
+            "name": "GPU Hints Module",
+            "version": "0.1.0",
+            "category": "paid-orchestrator",
+            "license": { "min_orchestrator_tier": "pro" },
+            "install": { "method": "container_pull",
+                "container": {
+                    "image": "ghcr.io/example/gpu-mod",
+                    "pull_token_endpoint": "https://example.com/token"
+                }
+            },
+            "runtime": {
+                "type": "service",
+                "command": "echo",
+                "min_gpu_vram_gb": 4.0,
+                "gpu_optional": true,
+                "gpu_image_variants": {
+                    "cpu":  "0.1.0-cpu",
+                    "cuda": "0.1.0-cuda",
+                    "rocm": "0.1.0-rocm"
+                }
+            }
+        }"#;
+        let m = ModuleManifest::from_json(raw).expect("v0.2.20 GPU hints parse");
+        assert_eq!(m.runtime.min_gpu_vram_gb, Some(4.0));
+        assert!(m.runtime.gpu_optional);
+        let variants = m
+            .runtime
+            .gpu_image_variants
+            .as_ref()
+            .expect("variants present");
+        assert_eq!(variants.cpu, "0.1.0-cpu");
+        assert_eq!(variants.cuda, "0.1.0-cuda");
+        assert_eq!(variants.rocm, "0.1.0-rocm");
+    }
+
+    /// Pre-v0.2.20 manifests (no GPU hint fields) must still deserialize.
+    /// Verifies serde defaults: `None` for the two `Option` fields and
+    /// `false` for `gpu_optional`.
+    #[test]
+    fn runtime_block_backward_compat_without_gpu_hints() {
+        let raw = r#"{
+            "id": "legacy-mod",
+            "name": "Legacy Module",
+            "version": "0.1.0",
+            "category": "community",
+            "license": { "min_orchestrator_tier": "free" },
+            "install": { "method": "git_clone", "source": "https://example.com/x.git" },
+            "runtime": { "type": "cli", "command": "echo" }
+        }"#;
+        let m = ModuleManifest::from_json(raw).expect("legacy manifest parse");
+        assert_eq!(m.runtime.min_gpu_vram_gb, None);
+        assert!(!m.runtime.gpu_optional);
+        assert!(m.runtime.gpu_image_variants.is_none());
+    }
+
+    /// Confirms the on-disk vct-rl-reranker manifest carries the v0.2.20
+    /// GPU hints. Skipped when the paid-modules staging dir is absent
+    /// (some dev clones don't have it). Pins the three values so a
+    /// later manifest edit can't silently drop them.
+    #[test]
+    fn vct_rl_reranker_manifest_carries_v0_2_20_gpu_hints() {
+        let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("walk to repo root")
+            .to_path_buf();
+        let path = repo_root.join("paid-modules/vct-rl-reranker/vct-module.json");
+        if !path.exists() {
+            eprintln!(
+                "[test skip] paid-modules/vct-rl-reranker/vct-module.json not present \
+                 (path: {}) — skipping v0.2.20 GPU-hints check",
+                path.display()
+            );
+            return;
+        }
+        let body = std::fs::read_to_string(&path).expect("read manifest");
+        let m: ModuleManifest = ModuleManifest::from_json(&body).expect("parse manifest");
+
+        // RL reranker is the canonical small-VRAM module — 4 GB threshold.
+        assert_eq!(
+            m.runtime.min_gpu_vram_gb,
+            Some(4.0),
+            "RL reranker pins its per-module threshold to 4 GB (model is ~5 MB)"
+        );
+        // RL reranker is gpu_optional=true (it runs on CPU, just slower).
+        assert!(m.runtime.gpu_optional, "RL reranker must declare gpu_optional=true");
+
+        let variants = m
+            .runtime
+            .gpu_image_variants
+            .as_ref()
+            .expect("RL reranker must declare gpu_image_variants");
+        // Tags pinned to the version (v0.2.20 ships 0.1.0-{cpu,cuda,rocm}).
+        // Allow either the explicit version-prefixed form OR a future
+        // floating-tag form by asserting the suffix.
+        assert!(
+            variants.cpu.ends_with("cpu"),
+            "cpu variant tag should end in -cpu (got '{}')",
+            variants.cpu
+        );
+        assert!(
+            variants.cuda.ends_with("cuda"),
+            "cuda variant tag should end in -cuda (got '{}')",
+            variants.cuda
+        );
+        assert!(
+            variants.rocm.ends_with("rocm"),
+            "rocm variant tag should end in -rocm (got '{}')",
+            variants.rocm
+        );
     }
 
     /// Stream 2 follow-up (v0.2.20, 2026-05-19): the orchestrator-core

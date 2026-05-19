@@ -124,8 +124,8 @@ pub struct HardwareSnapshot {
     pub gpu_name: String,
     pub has_apple_silicon: bool,
     pub ram_gb: u32,
-    /// Derived: NVIDIA OR Apple Silicon. Determines whether install.py
-    /// gets `--gpu` or `--cpu-only` on a reconfig run.
+    /// Derived: NVIDIA / AMD / Apple Silicon present. Determines whether
+    /// install.py gets `--gpu` or `--cpu-only` on a reconfig run.
     pub use_gpu: bool,
     /// Derived: ram_gb < 8. Triggers install.py's `--low-resource` path
     /// (smaller models, narrower service stack).
@@ -137,11 +137,17 @@ pub struct HardwareSnapshot {
     /// backward-compat with v0.2.8 snapshots persisted in app_state.
     #[serde(default)]
     pub vram_gb: f64,
+    /// v0.2.20: AMD GPU detected (rocminfo or /sys/class/drm vendor=0x1002).
+    /// `serde(default)` for backward-compat with v0.2.19- snapshots that
+    /// predate the AMD path. A subsequent redetect populates the real value.
+    #[serde(default)]
+    pub has_amd_gpu: bool,
     /// v0.2.9 (Bug K): derived GPU mode based on the VRAM threshold.
-    /// `Gpu` | `Cpu` | `Metal`. Drives whether the reconfig run uses
-    /// `--gpu` or `--cpu-only`. `serde(default)` falls back to `Cpu` for
-    /// pre-v0.2.9 snapshots — a subsequent redetect-hardware run will
-    /// populate it correctly.
+    /// `Cuda` | `Rocm` | `Cpu` | `Metal`. Drives whether the reconfig run
+    /// uses `--gpu` or `--cpu-only`. v0.2.20 renamed `Gpu` → `Cuda` and
+    /// added `Rocm`. `serde(default)` falls back to `Cpu` for pre-v0.2.9
+    /// snapshots — a subsequent redetect-hardware run will populate it
+    /// correctly.
     #[serde(default = "default_gpu_mode")]
     pub gpu_mode_decided: crate::commands::gpu_policy::GpuMode,
 }
@@ -1137,12 +1143,21 @@ pub async fn get_known_install_path(db: State<'_, Db>) -> Result<Option<String>,
 pub(crate) fn snapshot_from_system(s: &SystemDetection) -> HardwareSnapshot {
     let ram_gb_u32 = u32::try_from(s.ram_gb).unwrap_or(u32::MAX);
     let vram_gb = s.vram_gb as f64;
-    // v0.2.9 (Bug K): map raw detection → GpuMode via the VRAM threshold.
-    // No user override at the snapshot layer — the override only applies
-    // at the install.py CLI surface (--gpu / --cpu-only).
+    // v0.2.20: AMD presence is derived from SystemDetection.gpu_vendor.
+    // detect_system() preserves the field as "AMD" when the AMD probe
+    // succeeded and NVIDIA did not. We OR with the canonical
+    // query_amd_gpu_present() so a host with BOTH NVIDIA + AMD detected
+    // still records the AMD presence (decide_gpu_mode picks the right
+    // mode via the precedence rules).
+    let has_amd_gpu = s.gpu_vendor.as_deref() == Some("AMD")
+        || crate::commands::gpu::query_amd_gpu_present();
+    // v0.2.9 (Bug K) + v0.2.20: map raw detection → GpuMode via the VRAM
+    // threshold. No user override at the snapshot layer — the override
+    // only applies at the install.py CLI surface (--gpu / --cpu-only).
     let gpu_mode_decided = crate::commands::gpu_policy::decide_gpu_mode(
         vram_gb,
         s.has_nvidia_gpu,
+        has_amd_gpu,
         s.has_apple_silicon,
         None,
         crate::commands::gpu_policy::DEFAULT_GPU_VRAM_THRESHOLD_GB,
@@ -1150,10 +1165,13 @@ pub(crate) fn snapshot_from_system(s: &SystemDetection) -> HardwareSnapshot {
     // use_gpu retains its pre-v0.2.9 semantics for backward compat with
     // any external consumer that reads the persisted field — but the
     // reconfig flow now consults `gpu_mode_decided` for the actual flag
-    // pick. See `apply_hardware_reconfig`.
+    // pick. See `apply_hardware_reconfig`. v0.2.20 added Rocm to the
+    // GPU-active set alongside Cuda + Metal.
     let use_gpu = matches!(
         gpu_mode_decided,
-        crate::commands::gpu_policy::GpuMode::Gpu | crate::commands::gpu_policy::GpuMode::Metal
+        crate::commands::gpu_policy::GpuMode::Cuda
+            | crate::commands::gpu_policy::GpuMode::Rocm
+            | crate::commands::gpu_policy::GpuMode::Metal
     );
     let low_resource = ram_gb_u32 > 0 && ram_gb_u32 < 8;
     HardwareSnapshot {
@@ -1164,6 +1182,7 @@ pub(crate) fn snapshot_from_system(s: &SystemDetection) -> HardwareSnapshot {
         use_gpu,
         low_resource,
         vram_gb,
+        has_amd_gpu,
         gpu_mode_decided,
     }
 }
@@ -1195,6 +1214,11 @@ fn snapshot_changed_fields(a: &HardwareSnapshot, b: &HardwareSnapshot) -> Vec<St
     }
     if a.gpu_mode_decided != b.gpu_mode_decided {
         out.push("gpu_mode_decided".to_string());
+    }
+    // v0.2.20: AMD presence drift — added a card, removed a card, or
+    // a userspace ROCm install became available (rocminfo on PATH now).
+    if a.has_amd_gpu != b.has_amd_gpu {
+        out.push("has_amd_gpu".to_string());
     }
     out
 }
@@ -1304,9 +1328,13 @@ pub async fn apply_hardware_reconfig(
         "install.py".to_string(),
         "--update".to_string(),
     ];
+    // v0.2.20: Cuda, Rocm, and Metal all map to `--gpu` at the install.py
+    // surface — install.py reads the vendor separately and writes the
+    // correct compose overlay (NVIDIA gpu.yml vs ROCm rocm.yml vs no
+    // overlay for Metal). Only `Cpu` routes to `--cpu-only`.
     use crate::commands::gpu_policy::GpuMode;
     match snap.gpu_mode_decided {
-        GpuMode::Gpu | GpuMode::Metal => argv.push("--gpu".to_string()),
+        GpuMode::Cuda | GpuMode::Rocm | GpuMode::Metal => argv.push("--gpu".to_string()),
         GpuMode::Cpu => argv.push("--cpu-only".to_string()),
     }
     if snap.low_resource {

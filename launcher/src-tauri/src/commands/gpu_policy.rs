@@ -1,14 +1,16 @@
-//! GPU mode decision policy (v0.2.9 Bug K).
+//! GPU mode decision policy (v0.2.9 Bug K; AMD/ROCm + per-module
+//! threshold split out in v0.2.20).
 //!
-//! Pure decision function that maps (vram, vendor, user_override) onto a
-//! `GpuMode` enum. The same logic lives in `install.py::_decide_gpu_mode`
-//! (Python side); the two implementations are kept in lock-step so the
-//! launcher's `apply_hardware_reconfig` flow and the install-time decision
-//! arrive at the same answer for the same inputs.
+//! Pure decision function that maps (vram, vendor flags, user_override)
+//! onto a `GpuMode` enum. The same logic lives in
+//! `install.py::_decide_gpu_mode` (Python side); the two implementations
+//! are kept in lock-step so the launcher's `apply_hardware_reconfig`
+//! flow and the install-time decision arrive at the same answer for the
+//! same inputs.
 //!
 //! ## Why a threshold?
 //!
-//! The default model stack is:
+//! The orchestrator-core model stack is:
 //!
 //! | model                       | VRAM (rough) |
 //! |-----------------------------|--------------|
@@ -19,32 +21,55 @@
 //! On a card with <8 GB VRAM, the inference model thrashes against the
 //! embedders or fails to load — degrading to CPU is faster than partial
 //! offload. 8 GB is the smallest VRAM that gives breathing room for the
-//! whole stack. The threshold is configurable (`--gpu-vram-threshold-gb`
-//! on install.py) for users with non-default model picks; the Rust side
-//! reads the same threshold from the install-manifest when present.
+//! whole stack. The threshold is configurable per-module via
+//! `manifest.runtime.min_gpu_vram_gb` (v0.2.20) so smaller modules (e.g.
+//! the RL reranker, which needs ~4 GB) can opt into GPU mode on hardware
+//! that orchestrator-core would degrade to CPU.
+//!
+//! ## v0.2.20 — AMD/ROCm support
+//!
+//! Pre-v0.2.20 the enum had only `Gpu | Cpu | Metal` and `decide_gpu_mode`
+//! accepted only `has_nvidia: bool` — AMD owners with sufficient VRAM
+//! were silently routed to CPU. v0.2.20 splits the legacy `Gpu` into
+//! `Cuda | Rocm` and adds a `has_amd: bool` argument. Precedence when
+//! both NVIDIA and AMD are present: NVIDIA wins (rare workstation case;
+//! CUDA tooling is more mature than ROCm tooling).
 //!
 //! ## Cross-platform
 //!
 //! Apple Silicon has unified memory, so a VRAM number doesn't apply
 //! directly — `GpuMode::Metal` is its own arm. `has_apple_silicon: true`
-//! always wins over the VRAM threshold (i.e. an Apple Silicon machine
-//! always gets Metal regardless of the threshold).
+//! always wins over the VRAM threshold AND over NVIDIA/AMD detection
+//! (only relevant on dual-GPU Mac Pros).
 
 use serde::{Deserialize, Serialize};
 
 /// Default VRAM threshold (GiB) below which we degrade to CPU-only mode.
 ///
-/// Tuned for the default model stack — see module docstring. Keep this
-/// in sync with `install.py::_DEFAULT_GPU_VRAM_THRESHOLD_GB`.
+/// Tuned for the orchestrator-core model stack — see module docstring.
+/// Per-module overrides via `manifest.runtime.min_gpu_vram_gb` (v0.2.20).
+/// Keep this in sync with `install.py::_DEFAULT_GPU_VRAM_THRESHOLD_GB`.
 pub const DEFAULT_GPU_VRAM_THRESHOLD_GB: f64 = 8.0;
 
-/// The mode the GPU-using services (Ollama, code_embed) will run in.
+/// The mode the GPU-using services (Ollama, code_embed, paid modules)
+/// will run in.
+///
+/// **Wire shape**: serialized as lowercase string (`"cuda"`, `"rocm"`,
+/// `"cpu"`, `"metal"`). The frontend consumes this via Tauri commands
+/// + the persisted hardware snapshot. Renaming a variant is a wire-
+/// breaking change — bump the snapshot version if it ever happens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum GpuMode {
-    /// Discrete NVIDIA/AMD GPU with sufficient VRAM. Services use the
-    /// `gpu` compose overlay (CDI or `--gpus all`).
-    Gpu,
+    /// Discrete NVIDIA GPU with sufficient VRAM. Services use the
+    /// NVIDIA compose overlay (`docker-compose.gpu.yml` — CDI or
+    /// `--gpus all`).
+    Cuda,
+    /// Discrete AMD GPU with sufficient VRAM (v0.2.20). Services use
+    /// the ROCm compose overlay (`docker-compose.rocm.yml` —
+    /// `/dev/kfd` + `/dev/dri` device passthrough). Paid modules with
+    /// `gpu_image_variants` map this to a `-rocm` image tag.
+    Rocm,
     /// CPU-only. Either no discrete GPU, insufficient VRAM, or user
     /// override. Services fall back to CPU kernels (Ollama: CPU mode;
     /// code_embed: ONNX CPU runtime).
@@ -60,9 +85,15 @@ pub enum GpuMode {
 ///
 /// Precedence:
 ///   1. `user_override` (when explicit) wins over everything.
+///      - `user_override=true`:  Apple Silicon → Metal; else NVIDIA → Cuda;
+///        else AMD → Rocm; else fallback Cuda (user accepted the tradeoff).
+///      - `user_override=false`: Cpu (even with a 24 GB card).
 ///   2. Apple Silicon → `Metal`. No threshold check — unified memory.
-///   3. Discrete GPU vendor present AND VRAM ≥ threshold → `Gpu`.
-///   4. Else → `Cpu`.
+///   3. NVIDIA present AND VRAM ≥ threshold → `Cuda`. NVIDIA wins over
+///      AMD when both are detected (rare workstation case; CUDA tooling
+///      is more mature).
+///   4. AMD present AND VRAM ≥ threshold → `Rocm`.
+///   5. Else → `Cpu`.
 ///
 /// `vram_gb` of 0.0 with no vendor signals "no GPU detected" → `Cpu`.
 /// `vram_gb` of 0.0 with a vendor signals "GPU detected but probe failed"
@@ -71,6 +102,7 @@ pub enum GpuMode {
 pub fn decide_gpu_mode(
     vram_gb: f64,
     has_nvidia: bool,
+    has_amd: bool,
     has_apple_silicon: bool,
     user_override: Option<bool>,
     threshold_gb: f64,
@@ -83,10 +115,17 @@ pub fn decide_gpu_mode(
             if has_apple_silicon {
                 return GpuMode::Metal;
             }
-            // user_override=true + no Apple Silicon → trust them, return Gpu
-            // even when VRAM is below threshold. The user has accepted the
-            // tradeoff.
-            return GpuMode::Gpu;
+            if has_nvidia {
+                return GpuMode::Cuda;
+            }
+            if has_amd {
+                return GpuMode::Rocm;
+            }
+            // user_override=true with NO vendor detected — trust the
+            // user (e.g. fresh driver install the probe missed) and
+            // default to CUDA. Wrong-vendor-on-no-detection is rare;
+            // the conservative fallback is the more common NVIDIA path.
+            return GpuMode::Cuda;
         }
         return GpuMode::Cpu;
     }
@@ -96,7 +135,11 @@ pub fn decide_gpu_mode(
     }
 
     if has_nvidia && vram_gb >= threshold_gb {
-        return GpuMode::Gpu;
+        return GpuMode::Cuda;
+    }
+
+    if has_amd && vram_gb >= threshold_gb {
+        return GpuMode::Rocm;
     }
 
     GpuMode::Cpu
@@ -110,11 +153,11 @@ mod tests {
     #[test]
     fn vram_below_threshold_degrades_to_cpu() {
         assert_eq!(
-            decide_gpu_mode(4.0, true, false, None, DEFAULT_GPU_VRAM_THRESHOLD_GB),
+            decide_gpu_mode(4.0, true, false, false, None, DEFAULT_GPU_VRAM_THRESHOLD_GB),
             GpuMode::Cpu
         );
         assert_eq!(
-            decide_gpu_mode(7.99, true, false, None, DEFAULT_GPU_VRAM_THRESHOLD_GB),
+            decide_gpu_mode(7.99, true, false, false, None, DEFAULT_GPU_VRAM_THRESHOLD_GB),
             GpuMode::Cpu
         );
     }
@@ -123,8 +166,8 @@ mod tests {
     #[test]
     fn vram_at_threshold_inclusive_enables_gpu() {
         assert_eq!(
-            decide_gpu_mode(8.0, true, false, None, DEFAULT_GPU_VRAM_THRESHOLD_GB),
-            GpuMode::Gpu
+            decide_gpu_mode(8.0, true, false, false, None, DEFAULT_GPU_VRAM_THRESHOLD_GB),
+            GpuMode::Cuda
         );
     }
 
@@ -132,26 +175,26 @@ mod tests {
     #[test]
     fn vram_well_above_threshold_enables_gpu() {
         assert_eq!(
-            decide_gpu_mode(12.0, true, false, None, DEFAULT_GPU_VRAM_THRESHOLD_GB),
-            GpuMode::Gpu
+            decide_gpu_mode(12.0, true, false, false, None, DEFAULT_GPU_VRAM_THRESHOLD_GB),
+            GpuMode::Cuda
         );
         assert_eq!(
-            decide_gpu_mode(24.0, true, false, None, DEFAULT_GPU_VRAM_THRESHOLD_GB),
-            GpuMode::Gpu
+            decide_gpu_mode(24.0, true, false, false, None, DEFAULT_GPU_VRAM_THRESHOLD_GB),
+            GpuMode::Cuda
         );
     }
 
-    /// No NVIDIA + no Apple Silicon → CPU no matter the VRAM number.
+    /// No NVIDIA + no AMD + no Apple Silicon → CPU no matter the VRAM.
     #[test]
     fn no_gpu_vendor_is_cpu() {
         assert_eq!(
-            decide_gpu_mode(0.0, false, false, None, DEFAULT_GPU_VRAM_THRESHOLD_GB),
+            decide_gpu_mode(0.0, false, false, false, None, DEFAULT_GPU_VRAM_THRESHOLD_GB),
             GpuMode::Cpu
         );
         // Bizarre but defensive: vram_gb set with no vendor (probe ambiguity)
         // — still CPU.
         assert_eq!(
-            decide_gpu_mode(16.0, false, false, None, DEFAULT_GPU_VRAM_THRESHOLD_GB),
+            decide_gpu_mode(16.0, false, false, false, None, DEFAULT_GPU_VRAM_THRESHOLD_GB),
             GpuMode::Cpu
         );
     }
@@ -161,30 +204,31 @@ mod tests {
     #[test]
     fn apple_silicon_returns_metal() {
         assert_eq!(
-            decide_gpu_mode(0.0, false, true, None, DEFAULT_GPU_VRAM_THRESHOLD_GB),
+            decide_gpu_mode(0.0, false, false, true, None, DEFAULT_GPU_VRAM_THRESHOLD_GB),
             GpuMode::Metal
         );
         // Even with a phantom NVIDIA flag (shouldn't happen in practice
         // but defensively: Apple Silicon precedes vendor-discrete logic).
         assert_eq!(
-            decide_gpu_mode(8.0, true, true, None, DEFAULT_GPU_VRAM_THRESHOLD_GB),
+            decide_gpu_mode(8.0, true, false, true, None, DEFAULT_GPU_VRAM_THRESHOLD_GB),
             GpuMode::Metal
         );
     }
 
-    /// Explicit `--gpu` override forces Gpu mode regardless of VRAM, on
+    /// Explicit `--gpu` override forces GPU mode regardless of VRAM, on
     /// non-Apple machines.
     #[test]
     fn override_true_forces_gpu_below_threshold() {
         assert_eq!(
-            decide_gpu_mode(2.0, true, false, Some(true), DEFAULT_GPU_VRAM_THRESHOLD_GB),
-            GpuMode::Gpu
+            decide_gpu_mode(2.0, true, false, false, Some(true), DEFAULT_GPU_VRAM_THRESHOLD_GB),
+            GpuMode::Cuda
         );
         // Override is trusted even when no vendor detected (user knows
-        // better — e.g. a fresh driver install the probe missed).
+        // better — e.g. a fresh driver install the probe missed). Default
+        // fallback when no vendor is CUDA (the more common path).
         assert_eq!(
-            decide_gpu_mode(0.0, false, false, Some(true), DEFAULT_GPU_VRAM_THRESHOLD_GB),
-            GpuMode::Gpu
+            decide_gpu_mode(0.0, false, false, false, Some(true), DEFAULT_GPU_VRAM_THRESHOLD_GB),
+            GpuMode::Cuda
         );
     }
 
@@ -192,7 +236,7 @@ mod tests {
     #[test]
     fn override_false_forces_cpu_with_huge_vram() {
         assert_eq!(
-            decide_gpu_mode(24.0, true, false, Some(false), DEFAULT_GPU_VRAM_THRESHOLD_GB),
+            decide_gpu_mode(24.0, true, false, false, Some(false), DEFAULT_GPU_VRAM_THRESHOLD_GB),
             GpuMode::Cpu
         );
     }
@@ -202,7 +246,7 @@ mod tests {
     #[test]
     fn override_true_on_apple_silicon_still_metal() {
         assert_eq!(
-            decide_gpu_mode(0.0, false, true, Some(true), DEFAULT_GPU_VRAM_THRESHOLD_GB),
+            decide_gpu_mode(0.0, false, false, true, Some(true), DEFAULT_GPU_VRAM_THRESHOLD_GB),
             GpuMode::Metal
         );
     }
@@ -213,7 +257,7 @@ mod tests {
     #[test]
     fn override_false_on_apple_silicon_yields_cpu() {
         assert_eq!(
-            decide_gpu_mode(0.0, false, true, Some(false), DEFAULT_GPU_VRAM_THRESHOLD_GB),
+            decide_gpu_mode(0.0, false, false, true, Some(false), DEFAULT_GPU_VRAM_THRESHOLD_GB),
             GpuMode::Cpu
         );
     }
@@ -223,11 +267,11 @@ mod tests {
     #[test]
     fn custom_threshold_lower_qualifies_smaller_cards() {
         assert_eq!(
-            decide_gpu_mode(4.0, true, false, None, 4.0),
-            GpuMode::Gpu
+            decide_gpu_mode(4.0, true, false, false, None, 4.0),
+            GpuMode::Cuda
         );
         assert_eq!(
-            decide_gpu_mode(3.9, true, false, None, 4.0),
+            decide_gpu_mode(3.9, true, false, false, None, 4.0),
             GpuMode::Cpu
         );
     }
@@ -237,12 +281,12 @@ mod tests {
     #[test]
     fn custom_threshold_higher_rejects_8gb_card() {
         assert_eq!(
-            decide_gpu_mode(8.0, true, false, None, 16.0),
+            decide_gpu_mode(8.0, true, false, false, None, 16.0),
             GpuMode::Cpu
         );
         assert_eq!(
-            decide_gpu_mode(16.0, true, false, None, 16.0),
-            GpuMode::Gpu
+            decide_gpu_mode(16.0, true, false, false, None, 16.0),
+            GpuMode::Cuda
         );
     }
 
@@ -252,21 +296,127 @@ mod tests {
     #[test]
     fn vendor_known_but_vram_probe_failed_is_cpu() {
         assert_eq!(
-            decide_gpu_mode(0.0, true, false, None, DEFAULT_GPU_VRAM_THRESHOLD_GB),
+            decide_gpu_mode(0.0, true, false, false, None, DEFAULT_GPU_VRAM_THRESHOLD_GB),
             GpuMode::Cpu
         );
     }
 
     /// Serde round-trip — the FE consumes this enum via Tauri commands.
     /// Pin the wire shape so a future refactor of variant names is a
-    /// review-able change.
+    /// review-able change. Includes v0.2.20 `Rocm` variant.
     #[test]
     fn gpu_mode_serializes_lowercase() {
-        assert_eq!(serde_json::to_string(&GpuMode::Gpu).unwrap(), r#""gpu""#);
+        assert_eq!(serde_json::to_string(&GpuMode::Cuda).unwrap(), r#""cuda""#);
+        assert_eq!(serde_json::to_string(&GpuMode::Rocm).unwrap(), r#""rocm""#);
         assert_eq!(serde_json::to_string(&GpuMode::Cpu).unwrap(), r#""cpu""#);
         assert_eq!(
             serde_json::to_string(&GpuMode::Metal).unwrap(),
             r#""metal""#
+        );
+    }
+
+    // ─── v0.2.20: AMD / ROCm — NEW TESTS ──────────────────────────────
+
+    /// AMD with sufficient VRAM, no override → ROCm.
+    #[test]
+    fn amd_with_8gb_returns_rocm() {
+        assert_eq!(
+            decide_gpu_mode(8.0, false, true, false, None, DEFAULT_GPU_VRAM_THRESHOLD_GB),
+            GpuMode::Rocm
+        );
+        assert_eq!(
+            decide_gpu_mode(16.0, false, true, false, None, DEFAULT_GPU_VRAM_THRESHOLD_GB),
+            GpuMode::Rocm
+        );
+    }
+
+    /// AMD below threshold → CPU (same rule as NVIDIA path).
+    #[test]
+    fn amd_with_3gb_returns_cpu() {
+        assert_eq!(
+            decide_gpu_mode(3.0, false, true, false, None, DEFAULT_GPU_VRAM_THRESHOLD_GB),
+            GpuMode::Cpu
+        );
+    }
+
+    /// AMD with a low per-module threshold (v0.2.20 per-module threshold) →
+    /// ROCm even when orchestrator-core's 8 GB default would degrade to CPU.
+    /// Mirrors the RL reranker case (manifest declares 4 GB).
+    #[test]
+    fn amd_with_low_threshold_qualifies_for_small_module() {
+        // 5 GB card, RL-style 4 GB threshold → ROCm.
+        assert_eq!(
+            decide_gpu_mode(5.0, false, true, false, None, 4.0),
+            GpuMode::Rocm
+        );
+        // Same card, orchestrator-core's 8 GB threshold → CPU.
+        assert_eq!(
+            decide_gpu_mode(5.0, false, true, false, None, DEFAULT_GPU_VRAM_THRESHOLD_GB),
+            GpuMode::Cpu
+        );
+    }
+
+    /// User `--gpu` on an AMD-only machine → ROCm (not CUDA fallback).
+    /// Verifies the override path prefers the detected vendor.
+    #[test]
+    fn amd_user_override_true_returns_rocm() {
+        assert_eq!(
+            decide_gpu_mode(2.0, false, true, false, Some(true), DEFAULT_GPU_VRAM_THRESHOLD_GB),
+            GpuMode::Rocm
+        );
+    }
+
+    /// User `--cpu-only` wins over AMD detection (same rule as NVIDIA).
+    #[test]
+    fn amd_user_override_false_returns_cpu() {
+        assert_eq!(
+            decide_gpu_mode(16.0, false, true, false, Some(false), DEFAULT_GPU_VRAM_THRESHOLD_GB),
+            GpuMode::Cpu
+        );
+    }
+
+    /// NVIDIA + AMD both present (rare workstation case): NVIDIA wins.
+    /// CUDA tooling is more mature than ROCm, so the conservative default
+    /// is the better-supported stack.
+    #[test]
+    fn nvidia_preferred_when_both_present() {
+        // Auto mode.
+        assert_eq!(
+            decide_gpu_mode(16.0, true, true, false, None, DEFAULT_GPU_VRAM_THRESHOLD_GB),
+            GpuMode::Cuda
+        );
+        // User-override=true path also picks NVIDIA when both detected.
+        assert_eq!(
+            decide_gpu_mode(16.0, true, true, false, Some(true), DEFAULT_GPU_VRAM_THRESHOLD_GB),
+            GpuMode::Cuda
+        );
+    }
+
+    /// User `--gpu` on Apple Silicon: Metal still wins (NOT ROCm/CUDA).
+    /// Apple has neither, so the override must route to Metal — anything
+    /// else would mis-classify the machine.
+    #[test]
+    fn apple_silicon_user_override_true_returns_metal_not_rocm() {
+        // Plain Apple Silicon — no NVIDIA/AMD.
+        assert_eq!(
+            decide_gpu_mode(0.0, false, false, true, Some(true), DEFAULT_GPU_VRAM_THRESHOLD_GB),
+            GpuMode::Metal
+        );
+        // Defensive: phantom AMD flag (shouldn't happen — Apple Silicon
+        // can't drive AMD discrete cards). Apple Silicon still wins.
+        assert_eq!(
+            decide_gpu_mode(0.0, false, true, true, Some(true), DEFAULT_GPU_VRAM_THRESHOLD_GB),
+            GpuMode::Metal
+        );
+    }
+
+    /// AMD below threshold but user_override=true still forces ROCm.
+    /// Mirrors the NVIDIA `override_true_forces_gpu_below_threshold` test.
+    #[test]
+    fn amd_user_override_true_below_threshold_still_rocm() {
+        assert_eq!(
+            decide_gpu_mode(2.0, false, true, false, Some(true), DEFAULT_GPU_VRAM_THRESHOLD_GB),
+            GpuMode::Rocm
         );
     }
 }

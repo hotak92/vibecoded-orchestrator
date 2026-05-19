@@ -116,6 +116,12 @@
   //   2. If changed_fields is non-empty, surface "Apply reconfiguration"
   //      which spawns `install.py --update <flags>` from the known
   //      install path and streams progress events into a log panel.
+  // Mirror of the Rust `HardwareSnapshot` (launcher/src-tauri/src/commands/
+  // installer.rs). Extra fields beyond the original v0.2.8 shape are
+  // optional in the TS interface because pre-v0.2.9 snapshots persisted
+  // before these fields existed and serde defaults them on read.
+  // - vram_gb / gpu_mode_decided: v0.2.9 (Bug K, VRAM threshold)
+  // - has_amd_gpu:                v0.2.20 (AMD/ROCm support)
   interface HardwareSnapshot {
     has_nvidia_gpu: boolean;
     gpu_name: string;
@@ -123,6 +129,9 @@
     ram_gb: number;
     use_gpu: boolean;
     low_resource: boolean;
+    vram_gb?: number;
+    has_amd_gpu?: boolean;
+    gpu_mode_decided?: 'cuda' | 'rocm' | 'cpu' | 'metal';
   }
   interface HardwareDetectionDiff {
     before: HardwareSnapshot | null;
@@ -217,9 +226,23 @@
     if (!snap) return '—';
     switch (name) {
       case 'has_nvidia_gpu': return snap.has_nvidia_gpu ? 'yes' : 'no';
+      case 'has_amd_gpu': return snap.has_amd_gpu ? 'yes' : 'no';
       case 'gpu_name': return snap.gpu_name || '(none)';
       case 'has_apple_silicon': return snap.has_apple_silicon ? 'yes' : 'no';
       case 'ram_gb': return `${snap.ram_gb} GB`;
+      case 'vram_gb':
+        if (snap.vram_gb === undefined || snap.vram_gb === null) return '—';
+        return snap.vram_gb > 0 ? `${snap.vram_gb.toFixed(1)} GB` : '(none)';
+      case 'gpu_mode_decided':
+        // 'cuda' / 'rocm' / 'cpu' / 'metal' — the wire string from the
+        // Rust GpuMode enum (lowercase serde). v0.2.20 added rocm.
+        switch (snap.gpu_mode_decided) {
+          case 'cuda': return 'CUDA (NVIDIA)';
+          case 'rocm': return 'ROCm (AMD)';
+          case 'metal': return 'Metal (Apple Silicon)';
+          case 'cpu': return 'CPU-only';
+          default: return '—';
+        }
       case 'use_gpu': return snap.use_gpu ? 'GPU' : 'CPU-only';
       case 'low_resource': return snap.low_resource ? 'low-resource mode' : 'standard';
       default: return '—';

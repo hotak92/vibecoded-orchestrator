@@ -3560,19 +3560,23 @@ def _decide_gpu_mode(
     user_override: "bool | None" = None,
     threshold_gb: float = _DEFAULT_GPU_VRAM_THRESHOLD_GB,
 ) -> str:
-    """Pure decision function: pick `"gpu"`, `"cpu"`, or `"metal"`.
+    """Pure decision function: pick `"cuda"`, `"rocm"`, `"metal"`, or `"cpu"`.
 
     Precedence:
-      1. `user_override` (when not None) wins. Apple Silicon owners
-         passing override=True still get `"metal"` (no CUDA on M-series);
-         everyone else passing override=True gets `"gpu"`.
-      2. vendor=="metal" → `"metal"` (no threshold — unified memory).
-      3. vendor in ("nvidia","amd") AND vram_gb >= threshold → `"gpu"`.
-      4. Else → `"cpu"`.
+      1. `user_override` (when not None) wins.
+         - override=True:  vendor=="metal" → "metal"; vendor=="amd" → "rocm";
+           everyone else → "cuda" (default fallback — user accepted the tradeoff).
+         - override=False: "cpu".
+      2. vendor=="metal" → "metal" (no threshold — unified memory).
+      3. vendor=="nvidia" AND vram_gb >= threshold → "cuda".
+      4. vendor=="amd" AND vram_gb >= threshold → "rocm".
+      5. Else → "cpu".
 
     Mirrors the Rust `decide_gpu_mode` in
-    `launcher::commands::gpu_policy`. Pure (no side effects); test from
-    `tests/test_install_gpu_mode_decision.py`.
+    `launcher::commands::gpu_policy`. v0.2.20 split the legacy "gpu"
+    return value into "cuda" + "rocm" so the install-time overlay
+    picker can route correctly per vendor. Pure (no side effects);
+    tested from `tests/test_install_gpu_mode_decision.py`.
 
     Args:
       vram_gb:        Probed VRAM in GB. 0.0 means "no GPU" OR "probe
@@ -3584,21 +3588,32 @@ def _decide_gpu_mode(
       threshold_gb:   VRAM threshold in GB (inclusive). Default 8.0.
 
     Returns:
-      One of: `"gpu"`, `"cpu"`, `"metal"`.
+      One of: `"cuda"`, `"rocm"`, `"metal"`, `"cpu"`. Matches the
+      lowercase serde of Rust's `GpuMode` enum.
     """
     if user_override is not None:
         if user_override:
-            # User-forced GPU mode. Apple Silicon still gets metal
-            # (their hardware can't do CUDA); everyone else gets gpu
-            # even below the threshold — user has accepted the tradeoff.
-            return "metal" if vendor == "metal" else "gpu"
+            # User-forced GPU mode. Route to the matching vendor:
+            # - Apple Silicon → metal (no CUDA/ROCm on M-series).
+            # - AMD          → rocm.
+            # - Everyone else (NVIDIA, or empty vendor when the probe
+            #   missed a card the user knows is there) → cuda. CUDA is
+            #   the safer default fallback (more mature tooling).
+            if vendor == "metal":
+                return "metal"
+            if vendor == "amd":
+                return "rocm"
+            return "cuda"
         return "cpu"
 
     if vendor == "metal":
         return "metal"
 
-    if vendor in ("nvidia", "amd") and vram_gb >= threshold_gb:
-        return "gpu"
+    if vendor == "nvidia" and vram_gb >= threshold_gb:
+        return "cuda"
+
+    if vendor == "amd" and vram_gb >= threshold_gb:
+        return "rocm"
 
     return "cpu"
 
@@ -6168,8 +6183,14 @@ def _start_services(
     # user can resolve explicitly (e.g. by passing --gpu or --cpu-only).
     if sysinfo.has_gpu and deferral_report is not None:
         _nvidia_file = infra_dir / ("podman-compose.gpu.yml" if is_podman else "docker-compose.gpu.yml")
-        _amd_file = infra_dir / ("podman-compose.amd-rocm.yml" if is_podman else "docker-compose.amd-rocm.yml")
-        if _nvidia_file.exists() and _amd_file.exists():
+        # v0.2.20: probe BOTH the canonical short name AND the legacy
+        # `amd-rocm.yml` name. Either being on disk counts as "AMD
+        # overlay available" for the purpose of the ambiguity check.
+        _amd_short = infra_dir / ("podman-compose.rocm.yml" if is_podman else "docker-compose.rocm.yml")
+        _amd_legacy = infra_dir / ("podman-compose.amd-rocm.yml" if is_podman else "docker-compose.amd-rocm.yml")
+        _amd_file_exists = _amd_short.exists() or _amd_legacy.exists()
+        _amd_file = _amd_short if _amd_short.exists() else _amd_legacy
+        if _nvidia_file.exists() and _amd_file_exists:
             # Both overlay files present. Probe GPU tools to see if both are live.
             _nvidia_live = subprocess.run(
                 ["nvidia-smi", "-L"], capture_output=True, timeout=10,
@@ -6204,14 +6225,38 @@ def _start_services(
 
     if sysinfo.has_gpu:
         if sysinfo.gpu_vendor == "amd":
-            rocm_file_name = "podman-compose.amd-rocm.yml" if is_podman else "docker-compose.amd-rocm.yml"
-            rocm_file = infra_dir / rocm_file_name
-            if rocm_file.exists():
+            # v0.2.20: prefer `docker-compose.rocm.yml` (canonical short
+            # name) over the legacy `docker-compose.amd-rocm.yml`. Both
+            # are valid; the short name is what new docs reference.
+            # Podman uses its own variant filename because the device-
+            # passthrough syntax can differ. Probe both.
+            rocm_candidates = []
+            if is_podman:
+                rocm_candidates.extend([
+                    "podman-compose.rocm.yml",
+                    "podman-compose.amd-rocm.yml",
+                ])
+            else:
+                rocm_candidates.extend([
+                    "docker-compose.rocm.yml",
+                    "docker-compose.amd-rocm.yml",
+                ])
+            rocm_file_name = None
+            rocm_file = None
+            for candidate in rocm_candidates:
+                p = infra_dir / candidate
+                if p.exists():
+                    rocm_file_name = candidate
+                    rocm_file = p
+                    break
+            if rocm_file is not None:
                 cmd.extend(["-f", str(rocm_file), "--profile", "gpu"])
                 engine = "Podman" if is_podman else "Docker"
-                print(f"  GPU overlay: AMD ROCm ({engine}: Ollama ROCm image, /dev/kfd + /dev/dri)")
+                print(f"  GPU overlay: AMD ROCm ({engine}: {rocm_file_name})")
             else:
-                print(f"  WARNING: AMD ROCm overlay {rocm_file_name} not found, running CPU-only")
+                # Neither overlay file present — fall back to CPU.
+                tried = ", ".join(rocm_candidates)
+                print(f"  WARNING: AMD ROCm overlay not found (tried: {tried}), running CPU-only")
         else:
             # Default to NVIDIA overlay for has_gpu=True with vendor
             # unset or "nvidia" (back-compat with --gpu flag).

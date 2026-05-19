@@ -1,4 +1,4 @@
-"""Tests for `install._decide_gpu_mode` (v0.2.9 Bug K).
+"""Tests for `install._decide_gpu_mode` (v0.2.9 Bug K; v0.2.20 AMD/ROCm split).
 
 The Python decision function MUST stay in lockstep with the Rust side
 (`launcher::commands::gpu_policy::decide_gpu_mode`). The two are tested
@@ -8,9 +8,13 @@ user gets a flag mismatch on `--update`.
 
 Precedence (must hold in BOTH implementations):
   1. user_override (when not None) wins.
-  2. vendor=="metal" → "metal" (Apple Silicon — unified memory).
-  3. vendor in ("nvidia","amd") AND vram >= threshold → "gpu".
-  4. Else → "cpu".
+     - True:  vendor==metal → "metal"; vendor==amd → "rocm";
+       everyone else (nvidia or empty) → "cuda".
+     - False: "cpu".
+  2. vendor==metal → "metal" (Apple Silicon — unified memory).
+  3. vendor==nvidia AND vram >= threshold → "cuda".
+  4. vendor==amd AND vram >= threshold → "rocm".
+  5. Else → "cpu".
 
 The 8 GB threshold is the default but is configurable per call. See
 `install._DEFAULT_GPU_VRAM_THRESHOLD_GB` for the rationale.
@@ -41,10 +45,10 @@ def test_default_threshold_matches_rust_side():
         (2.0, "cpu"),     # tiny card
         (4.0, "cpu"),     # below threshold
         (7.99, "cpu"),    # just under
-        (8.0, "gpu"),     # inclusive threshold
-        (8.01, "gpu"),    # just over
-        (12.0, "gpu"),    # comfortable
-        (24.0, "gpu"),    # plenty
+        (8.0, "cuda"),    # inclusive threshold
+        (8.01, "cuda"),   # just over
+        (12.0, "cuda"),   # comfortable
+        (24.0, "cuda"),   # plenty
     ],
 )
 def test_nvidia_vram_threshold_auto(vram, expected):
@@ -56,12 +60,13 @@ def test_nvidia_vram_threshold_auto(vram, expected):
     [
         (0.0, "cpu"),
         (4.0, "cpu"),
-        (8.0, "gpu"),
-        (16.0, "gpu"),
+        (8.0, "rocm"),
+        (16.0, "rocm"),
     ],
 )
 def test_amd_vram_threshold_auto(vram, expected):
-    """AMD ROCm follows the same threshold as NVIDIA."""
+    """AMD follows the same VRAM threshold as NVIDIA but routes to the
+    ROCm overlay instead of CUDA. v0.2.20 split the return value."""
     assert _decide_gpu_mode(vram_gb=vram, vendor="amd") == expected
 
 
@@ -94,19 +99,27 @@ def test_apple_silicon_always_metal(vram):
 # ---------------------------------------------------------------------------
 
 
-def test_override_true_forces_gpu_below_threshold():
-    """--gpu trusts the user — even on a 2 GB card."""
+def test_override_true_forces_cuda_below_threshold_nvidia():
+    """--gpu trusts the user — even on a 2 GB card. NVIDIA → cuda."""
     assert _decide_gpu_mode(
         vram_gb=2.0, vendor="nvidia", user_override=True
-    ) == "gpu"
+    ) == "cuda"
 
 
-def test_override_true_with_no_vendor_still_gpu():
+def test_override_true_forces_rocm_below_threshold_amd():
+    """--gpu trusts the user — even on a 2 GB AMD card → rocm."""
+    assert _decide_gpu_mode(
+        vram_gb=2.0, vendor="amd", user_override=True
+    ) == "rocm"
+
+
+def test_override_true_with_no_vendor_falls_back_to_cuda():
     """User explicitly opted in — driver probe missed it, but we trust
-    them. Better to fail loudly at runtime than silently degrade."""
+    them. No vendor info → default to CUDA (the more common path; CUDA
+    tooling is more mature than ROCm)."""
     assert _decide_gpu_mode(
         vram_gb=0.0, vendor="", user_override=True
-    ) == "gpu"
+    ) == "cuda"
 
 
 def test_override_false_forces_cpu_with_24gb_card():
@@ -114,6 +127,13 @@ def test_override_false_forces_cpu_with_24gb_card():
     avoiding a flaky GPU on shared dev hosts."""
     assert _decide_gpu_mode(
         vram_gb=24.0, vendor="nvidia", user_override=False
+    ) == "cpu"
+
+
+def test_override_false_forces_cpu_amd():
+    """--cpu-only beats AMD detection too."""
+    assert _decide_gpu_mode(
+        vram_gb=16.0, vendor="amd", user_override=False
     ) == "cpu"
 
 
@@ -135,17 +155,28 @@ def test_override_false_on_apple_silicon_yields_cpu():
 
 
 # ---------------------------------------------------------------------------
-# Custom threshold
+# Custom threshold (per-module VRAM threshold, v0.2.20)
 # ---------------------------------------------------------------------------
 
 
-def test_custom_threshold_lower_qualifies_smaller_cards():
+def test_custom_threshold_lower_qualifies_smaller_cards_nvidia():
     """User running a smaller model stack can lower the threshold."""
     assert _decide_gpu_mode(
         vram_gb=4.0, vendor="nvidia", threshold_gb=4.0
-    ) == "gpu"
+    ) == "cuda"
     assert _decide_gpu_mode(
         vram_gb=3.9, vendor="nvidia", threshold_gb=4.0
+    ) == "cpu"
+
+
+def test_custom_threshold_lower_qualifies_smaller_cards_amd():
+    """AMD with a per-module 4 GB threshold (RL reranker case) qualifies
+    on a 4 GB card."""
+    assert _decide_gpu_mode(
+        vram_gb=4.0, vendor="amd", threshold_gb=4.0
+    ) == "rocm"
+    assert _decide_gpu_mode(
+        vram_gb=3.9, vendor="amd", threshold_gb=4.0
     ) == "cpu"
 
 
@@ -157,7 +188,7 @@ def test_custom_threshold_higher_rejects_8gb_card():
     ) == "cpu"
     assert _decide_gpu_mode(
         vram_gb=16.0, vendor="nvidia", threshold_gb=16.0
-    ) == "gpu"
+    ) == "cuda"
 
 
 # ---------------------------------------------------------------------------
@@ -177,3 +208,20 @@ def test_unknown_vendor_string_is_cpu():
     """Defensive against future vendor strings — if the probe layer
     starts reporting something unexpected, fall back to CPU."""
     assert _decide_gpu_mode(vram_gb=16.0, vendor="intel-arc") == "cpu"
+
+
+# ---------------------------------------------------------------------------
+# Wire-string sync with Rust GpuMode (v0.2.20)
+# ---------------------------------------------------------------------------
+
+
+def test_return_values_match_rust_gpumode_serde():
+    """Pin the four possible return values to the lowercase serde of
+    Rust's `GpuMode` enum (cuda | rocm | metal | cpu). Renaming any
+    of these breaks cross-process sync with the launcher."""
+    valid = {"cuda", "rocm", "metal", "cpu"}
+    # Sample one representative call per branch.
+    assert _decide_gpu_mode(16.0, "nvidia") in valid
+    assert _decide_gpu_mode(16.0, "amd") in valid
+    assert _decide_gpu_mode(0.0, "metal") in valid
+    assert _decide_gpu_mode(0.0, "") in valid

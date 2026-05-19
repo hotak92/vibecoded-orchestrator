@@ -1,0 +1,79 @@
+# AMD ROCm overlay (v0.2.20 canonical name). Apply with:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.rocm.yml --profile gpu up -d
+#   podman-compose -f docker-compose.yml -f docker-compose.rocm.yml --profile gpu up -d
+#
+# Requires (any container engine):
+#   - ROCm 6.0+ on host (rocm-smi returns 0)
+#   - amdgpu kernel driver loaded
+#   - User in the `render` and `video` groups (or use podman's
+#     `--group-add keep-groups` to preserve host supplementary groups)
+#   - /dev/kfd and /dev/dri exist on the host
+#
+# AMD users with newer cards (RX 7000+, MI300+) may need to UNSET
+# HSA_OVERRIDE_GFX_VERSION; it's set conservatively here for broader
+# RX 6000-class compatibility. If Ollama logs "rocBLAS error: Could not
+# find symbol" or "no kernel image for device", remove the env line and
+# rebuild.
+#
+# This file supersedes the legacy `docker-compose.amd-rocm.yml`
+# (still present for back-compat — install.py picks docker-compose.rocm.yml
+# first, falls back to amd-rocm.yml). Renamed to drop the redundant
+# `amd-` prefix (ROCm is AMD's runtime; no other vendor uses it).
+#
+# References:
+#   - Ollama Docker docs: https://hub.docker.com/r/ollama/ollama
+#   - AMD ROCm container guide: https://rocm.docs.amd.com/projects/install-on-linux/en/latest/how-to/docker.html
+#   - Podman GPU access: https://podman-desktop.io/docs/podman/gpu
+#
+# Conflict notes:
+#   We deliberately drop the NVIDIA `deploy.resources.reservations.devices`
+#   block from the GPU overlay — the two are mutually exclusive. If a host
+#   has both NVIDIA and AMD silicon, install.py picks NVIDIA first.
+
+services:
+  ollama:
+    # Pinned to the ROCm-tagged Ollama image. Bump deliberately when the
+    # base compose.yaml's CPU/CUDA image family is bumped.
+    image: docker.io/ollama/ollama:0.20.2-rocm
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    # Group access for the GPU device files. Names are resolved by the
+    # container runtime against the host's /etc/group at start time.
+    # Numeric GIDs would be more portable but vary by distribution
+    # (Ubuntu video=44, Fedora video=39, etc.) — group names are what
+    # the upstream Ollama docs use.
+    group_add:
+      - video
+      - render
+    # CAP_SYS_PTRACE is needed by some ROCm internals (clinfo / rocBLAS
+    # introspection paths) to walk other processes' /proc. Without it
+    # the container starts but rocBLAS may fail to detect the device.
+    cap_add:
+      - SYS_PTRACE
+    environment:
+      # Conservative override for broader RX 6000-class compatibility.
+      # Newer hardware (RX 7000+) may need this unset — see header comment.
+      HSA_OVERRIDE_GFX_VERSION: "10.3.0"
+    # No `deploy.resources.reservations.devices` here — that block is
+    # NVIDIA-only and would conflict with the device passthrough above.
+
+  code_embed:
+    # ROCm passthrough for code_embed too. CodeSage-Large-v2 via
+    # sentence-transformers can run on ROCm-built torch if the upstream
+    # image is built with the rocm wheel. Today the orchestrator's
+    # code_embed image is CUDA-only; ROCm users will get the Ollama-based
+    # code embedding fallback automatically until a -rocm tag exists.
+    # The block below stages the device passthrough so a future image
+    # bump lights up without further changes.
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+      - render
+    cap_add:
+      - SYS_PTRACE
+    environment:
+      HSA_OVERRIDE_GFX_VERSION: "10.3.0"
