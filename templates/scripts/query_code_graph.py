@@ -276,20 +276,15 @@ class CodeGraphQuery:
                 bases=(collection,),
             )
 
-            # Header: show the fan-out scope so the user sees what was
-            # actually queried (especially useful when the access list
-            # is set in env and the user has forgotten what's granted).
-            # Suppressed under --hook-format (the pre-edit hook only wants
-            # parser-friendly per-result lines).
-            if not hook_format:
-                print(f"\n🔍 Semantic search in {collection}: '{query}'  (detail={detail})")
-                if self.project:
-                    peer_count = len(pairs) - 1
-                    if peer_count > 0:
-                        peer_names = ", ".join(p_filter for _, p_filter in pairs[1:] if p_filter)
-                        print(f"   Project filter: {self.project} (+ {peer_count} peer(s): {peer_names})")
-                    else:
-                        print(f"   Project filter: {self.project}")
+            # Header emit MOVED to AFTER `top` is built — see below.
+            # v0.2.21 (audit fix, 2026-05-20): emitting the banner BEFORE
+            # the query means a zero-result run still prints the
+            # "🔍 Semantic search... Project filter: X" header, which the
+            # pre-edit hook captures into $CODE_RESULT and treats as a
+            # non-empty result (HAS_CODE=1), bypassing its own 0-result
+            # short-circuit and injecting useless context every Edit.
+            # See docs/HOOK_TOKEN_AUDIT_2026-05-20.md §3 and the
+            # query_code_graph.py side of the fix.
 
             # Fan-out: query each (collection, filter) pair, merge by
             # ascending distance. We over-fetch by `limit` per
@@ -386,7 +381,20 @@ class CodeGraphQuery:
                     siblings.append(ref)
                 return siblings
 
-            if not hook_format:
+            # v0.2.21 audit fix: emit banner + count ONLY when there's at
+            # least one result. Zero-result runs print nothing on stdout,
+            # so the pre-edit hook's HAS_CODE=0 guard correctly short-
+            # circuits instead of capturing a useless "Found 0 results"
+            # block and injecting it into the model's context every Edit.
+            if top and not hook_format:
+                print(f"\n🔍 Semantic search in {collection}: '{query}'  (detail={detail})")
+                if self.project:
+                    peer_count = len(pairs) - 1
+                    if peer_count > 0:
+                        peer_names = ", ".join(p_filter for _, p_filter in pairs[1:] if p_filter)
+                        print(f"   Project filter: {self.project} (+ {peer_count} peer(s): {peer_names})")
+                    else:
+                        print(f"   Project filter: {self.project}")
                 print(f"   Found {len(top)} results:\n")
 
             # Render through shared helper. i is 0-based for the helper;
