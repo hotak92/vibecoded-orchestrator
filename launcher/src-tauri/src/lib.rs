@@ -876,6 +876,7 @@ pub fn run() {
             commands::telemetry_cmd::telemetry_set_consent,
             commands::telemetry_cmd::telemetry_recent_events,
             commands::telemetry_cmd::telemetry_clear_queue,
+            commands::telemetry_cmd::telemetry_clear_rl_local_cache,
             // Orchestrator installer (existing, unchanged)
             commands::installer::detect_system,
             commands::installer::detect_existing_services,

@@ -13,6 +13,7 @@
     ModelChoice,
     DefaultEmbeddingModels,
   } from '$lib/types/embedding-catalog';
+  import type { TelemetryStatus, ConsentFlags } from '$lib/types/project-state';
 
   // Setting key → default value
   const KEYS = [
@@ -792,6 +793,144 @@
     }
   }
 
+  // ── Local data collection (Stream 1, v0.2.20) ────────────────────
+  // Three controls for the RL retrieval data pipeline:
+  //   1. "Collect retrieval data locally" toggle → writes
+  //      RL_LOCAL_LOGGING_DISABLED=true to <project>/.claude/env when
+  //      OFF. Default ON (telemetry-on-by-default for free tier).
+  //   2. "Upload anonymized data" toggle → telemetry_set_consent
+  //      flips ConsentFlags.rl_data.
+  //   3. "Clear local cache" button → telemetry_clear_rl_local_cache.
+  // All three carry mouseover tooltips explaining the data flow.
+  const RL_LOCAL_OFF_KEY = 'RL_LOCAL_LOGGING_DISABLED';
+  // Per-project: whether the local logger is currently disabled by
+  // the .claude/env override. Default = enabled.
+  let rlLocalLoggingDisabled = $state(false);
+  let rlLocalLoggingSaving = $state(false);
+  // Cross-project: upload consent (lives in ~/.vibecoded/config.json).
+  let rlUploadConsent = $state(false);
+  let rlUploadSaving = $state(false);
+  let rlConsentFlags = $state<ConsentFlags | null>(null);
+  // Clear-cache button state.
+  let rlCacheClearing = $state(false);
+
+  async function loadRlLocalState() {
+    const projectId = $selectedProject?.id;
+    if (!projectId) return;
+    try {
+      const v = await invoke<string | null>('get_claude_env_value', {
+        projectId,
+        key: RL_LOCAL_OFF_KEY,
+      });
+      // Truthy → disabled. Anything else → enabled (the default).
+      rlLocalLoggingDisabled =
+        v !== null && v !== undefined &&
+        ['true', '1', 'yes', 'on'].includes((v || '').toLowerCase());
+    } catch (e) {
+      // Soft-fail: leave the toggle in its default rendered state.
+      console.debug('loadRlLocalState failed', e);
+    }
+  }
+
+  async function loadRlUploadConsent() {
+    try {
+      const status = await safeInvoke<TelemetryStatus>('telemetry_status');
+      if (status) {
+        rlConsentFlags = status.consent;
+        rlUploadConsent = !!status.consent.rl_data;
+      }
+    } catch (e) {
+      console.debug('loadRlUploadConsent failed', e);
+    }
+  }
+
+  async function toggleRlLocalLogging() {
+    const projectId = $selectedProject?.id;
+    if (!projectId) {
+      toast.error('Pick a project first');
+      return;
+    }
+    rlLocalLoggingSaving = true;
+    const next = !rlLocalLoggingDisabled;
+    try {
+      // OFF in UI = disabled flag SET (write "true"); ON = remove the key.
+      const value = next ? 'true' : null;
+      await invoke('set_claude_env_value', {
+        projectId,
+        key: RL_LOCAL_OFF_KEY,
+        value,
+      });
+      rlLocalLoggingDisabled = next;
+      toast.success(
+        next
+          ? 'Local retrieval data collection paused for this project'
+          : 'Local retrieval data collection enabled for this project',
+      );
+    } catch (e) {
+      toast.error(e);
+    } finally {
+      rlLocalLoggingSaving = false;
+    }
+  }
+
+  async function toggleRlUploadConsent() {
+    if (!rlConsentFlags) {
+      // Build a default; telemetry_set_consent fills missing fields.
+      rlConsentFlags = {
+        consent_version: '1.0',
+        granted_at: null,
+        always_on: true,
+        rl_data: false,
+        routing_data: false,
+        instinct_data: false,
+        hardware: false,
+      };
+    }
+    rlUploadSaving = true;
+    const next = !rlUploadConsent;
+    const flags = { ...rlConsentFlags, rl_data: next } as ConsentFlags;
+    try {
+      const updated = await invoke<ConsentFlags>('telemetry_set_consent', { flags });
+      rlConsentFlags = updated;
+      rlUploadConsent = !!updated.rl_data;
+      toast.success(
+        next
+          ? 'Upload consent granted — anonymized retrieval data will be uploaded'
+          : 'Upload consent withdrawn — uploads stopped, local data unchanged',
+      );
+    } catch (e) {
+      toast.error(e);
+    } finally {
+      rlUploadSaving = false;
+    }
+  }
+
+  async function clearRlLocalCache() {
+    if (!confirm(
+      'Delete ALL local retrieval data logs in ~/.claude/retrieval_rl_data/?\n\n' +
+      'This wipes the machine-wide training corpus (rl_events*.jsonl files).\n' +
+      'The .v1.bak archives are preserved. This action cannot be undone.',
+    )) {
+      return;
+    }
+    rlCacheClearing = true;
+    try {
+      const res = await invoke<{ deleted_files: number; bytes_freed: number }>(
+        'telemetry_clear_rl_local_cache',
+      );
+      const mb = (res.bytes_freed / 1024 / 1024).toFixed(1);
+      toast.success(
+        res.deleted_files === 0
+          ? 'No local cache files to clear'
+          : `Cleared ${res.deleted_files} file(s), freed ${mb} MB`,
+      );
+    } catch (e) {
+      toast.error(e);
+    } finally {
+      rlCacheClearing = false;
+    }
+  }
+
   onMount(() => {
     void load();
     void loadPat();
@@ -800,8 +939,12 @@
     void loadOpenAi();
     // Subscribe to the openai recovery events (no-op in browser mode).
     void subscribeOpenAiEvents();
+    // Stream 1: local data collection controls.
+    void loadRlLocalState();
+    void loadRlUploadConsent();
   });
   $effect(() => { if (project) void load(); });
+  $effect(() => { if ($selectedProject) void loadRlLocalState(); });
 
   onDestroy(() => {
     // Existing hwprogress cleanup is in the earlier onDestroy; both
@@ -1267,6 +1410,75 @@
       </div>
     </section>
 
+    <!-- Local data collection (Stream 1, v0.2.20).
+         Three controls for the RL retrieval data pipeline:
+           1. Toggle per-project local logging (default ON).
+           2. Toggle upload consent (default OFF, opt-in).
+           3. Clear local cache button (irreversible).
+         All controls carry mouseover tooltips explaining the data flow. -->
+    <section class="pr-section" aria-labelledby="pr-rl-data-title">
+      <h2 class="pr-section-title" id="pr-rl-data-title">Local data collection</h2>
+      <p class="pr-onboarding-hint">
+        The orchestrator collects retrieval-time embedding data for the optional
+        RL reranker (a paid module that learns to surface the nodes you actually
+        cite). On the free tier this data is collected <strong>locally only</strong>,
+        so if you later upgrade to Pro the model can be trained on your history.
+        Nothing leaves your machine unless you also opt in to uploads (separate toggle).
+      </p>
+      <p class="pr-onboarding-hint">
+        <strong>What is collected</strong>: KG search queries, the embeddings used
+        to rank them, the per-node scores, and (after Claude responds) which titles
+        appear in Claude's reply.
+        <strong>What is NOT collected</strong>: the full text of Claude's answers,
+        code snippets, file paths, or any token / secret values.
+      </p>
+
+      <div class="pr-rl-row">
+        <label class="pr-rl-toggle"
+               title="When ON, the orchestrator appends every KG retrieval event to ~/.claude/retrieval_rl_data/rl_events.jsonl on this machine. Nothing is uploaded. When OFF, sets RL_LOCAL_LOGGING_DISABLED=true in this project's .claude/env and the writer becomes a no-op.">
+          <input type="checkbox" checked={!rlLocalLoggingDisabled}
+            disabled={rlLocalLoggingSaving || !$selectedProject}
+            onchange={() => void toggleRlLocalLogging()} />
+          <strong>Collect retrieval data locally</strong>
+          <small>
+            ON (default): events appended to <code>~/.claude/retrieval_rl_data/</code>.
+            OFF: writes <code>RL_LOCAL_LOGGING_DISABLED=true</code> to
+            <code>.claude/env</code> for this project.
+          </small>
+        </label>
+      </div>
+
+      <div class="pr-rl-row">
+        <label class="pr-rl-toggle"
+               title="When ON, locally-collected events are also published (anonymized) to the central training queue and uploaded under the upload-consent telemetry flag (consent.rl_data). When OFF (default), nothing leaves your machine.">
+          <input type="checkbox" checked={rlUploadConsent}
+            disabled={rlUploadSaving}
+            onchange={() => void toggleRlUploadConsent()} />
+          <strong>Upload anonymized retrieval data to improve the global model</strong>
+          <small>
+            OFF (default): no upload. ON: events also publish to
+            <code>~/.vibecoded/telemetry.db</code> and ship to the hub under
+            <code>consent.rl_data</code>. Query text is omitted from the upload payload.
+          </small>
+        </label>
+      </div>
+
+      <div class="pr-rl-row">
+        <button
+          class="pr-btn pr-btn-danger"
+          title="Deletes every rl_events*.jsonl file under ~/.claude/retrieval_rl_data/. The .v1.bak archives are preserved. This action cannot be undone."
+          onclick={() => void clearRlLocalCache()}
+          disabled={rlCacheClearing}
+        >
+          {rlCacheClearing ? 'Clearing…' : 'Clear local cache'}
+        </button>
+        <span class="pr-rl-hint">
+          Wipes the machine-wide <code>rl_events*.jsonl</code> training corpus.
+          Per-project <code>.claude/rl-data/</code> directories are untouched.
+        </span>
+      </div>
+    </section>
+
     <!-- Hardware re-detection (Bug B, v0.2.5).
          Two-stage UX: Re-detect → optional Apply reconfig. The persisted
          snapshot is seeded at first launcher boot so the "currently
@@ -1549,6 +1761,33 @@
     color: rgb(255,140,140);
   }
   .pr-btn-danger:hover { background: rgba(229,77,77,0.2); }
+  /* Local data collection (Stream 1, v0.2.20) */
+  .pr-rl-row {
+    display: flex; flex-direction: column; gap: 4px;
+    padding: 8px 0; border-bottom: 1px solid rgba(255,255,255,0.04);
+  }
+  .pr-rl-row:last-child { border-bottom: none; flex-direction: row; align-items: center; gap: 12px; }
+  .pr-rl-toggle {
+    display: grid; grid-template-columns: 20px max-content 1fr;
+    gap: 6px 10px; align-items: baseline; cursor: pointer;
+  }
+  .pr-rl-toggle input { grid-row: 1; }
+  .pr-rl-toggle strong { grid-row: 1; color: #ddd; font-size: 12px; }
+  .pr-rl-toggle small {
+    grid-column: 2 / 4; grid-row: 2;
+    font-size: 11px; color: #888; line-height: 1.4;
+  }
+  .pr-rl-toggle code {
+    background: rgba(255,255,255,0.06); padding: 1px 4px; border-radius: 3px;
+    font-size: 10.5px;
+  }
+  .pr-rl-hint {
+    font-size: 11px; color: #888; line-height: 1.4;
+  }
+  .pr-rl-hint code {
+    background: rgba(255,255,255,0.06); padding: 1px 4px; border-radius: 3px;
+    font-size: 10.5px;
+  }
   .pr-pat-edit {
     margin-top: 8px; padding: 12px 14px; background: rgba(255,255,255,0.03);
     border: 1px solid rgba(255,255,255,0.06); border-radius: 6px;

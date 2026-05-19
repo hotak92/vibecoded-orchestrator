@@ -175,6 +175,70 @@ pub async fn telemetry_clear_queue(db: State<'_, Db>) -> Result<(), String> {
     Ok(())
 }
 
+/// Result of a "clear local RL cache" call.
+#[derive(Debug, Serialize)]
+pub struct RlLocalCacheClearResult {
+    pub deleted_files: u32,
+    pub bytes_freed: u64,
+}
+
+/// Delete machine-wide local RL retrieval-data JSONL logs.
+///
+/// Scope: every file matching ``~/.claude/retrieval_rl_data/rl_events*.jsonl``
+/// (and rotated archives like ``rl_events.<timestamp>.jsonl``).
+///
+/// Excluded:
+///   * ``.v1.bak`` backups (the user explicitly keeps those — see
+///     "never-delete-RL-data" rule in the orchestrator KG).
+///   * Per-project ``<project>/.claude/rl-data/`` directories — those
+///     are per-project caches; clear them via the project-level
+///     "Reset bundle" flow.
+///
+/// Soft-fail: per-file delete errors are skipped (not counted in
+/// ``deleted_files``). Total bytes freed is reported so the UI can
+/// render a "Freed N MB" toast.
+#[command]
+pub async fn telemetry_clear_rl_local_cache(db: State<'_, Db>) -> Result<RlLocalCacheClearResult, String> {
+    let dir = directories::UserDirs::new()
+        .map(|d| d.home_dir().join(".claude").join("retrieval_rl_data"))
+        .ok_or_else(|| "could not resolve home dir".to_string())?;
+
+    if !dir.exists() {
+        return Ok(RlLocalCacheClearResult { deleted_files: 0, bytes_freed: 0 });
+    }
+
+    let mut deleted: u32 = 0;
+    let mut bytes_freed: u64 = 0;
+
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) => return Err(format!("read_dir({:?}): {}", dir, e)),
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else { continue; };
+        let is_log = name.starts_with("rl_events") && name.contains(".jsonl");
+        let is_v1_bak = name.ends_with(".v1.bak");
+        if !is_log || is_v1_bak {
+            continue;
+        }
+        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        if std::fs::remove_file(&path).is_ok() {
+            deleted += 1;
+            bytes_freed = bytes_freed.saturating_add(size);
+        }
+    }
+
+    db.audit(
+        "telemetry_clear_rl_local_cache",
+        None,
+        None,
+        &serde_json::json!({"deleted_files": deleted, "bytes_freed": bytes_freed}),
+    )?;
+    Ok(RlLocalCacheClearResult { deleted_files: deleted, bytes_freed })
+}
+
 // ─── Internals ──────────────────────────────────────────────────────────
 
 fn read_consent() -> Result<ConsentFlags, String> {
