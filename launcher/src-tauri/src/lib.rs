@@ -952,6 +952,14 @@ pub fn run() {
             commands::embedding_catalog::set_default_embedding_models,
             commands::embedding_catalog::get_default_embedding_models,
             commands::embedding_catalog::validate_model_against_catalog,
+            // Embedding enrichment migration (v0.2.18, Commit 9). Spawns
+            // `python -m vco_lib.embedding_enrichment enrich` with
+            // --stream-progress and re-emits per-batch progress as
+            // `vct-enrichment-progress` Tauri events for the
+            // KgCodegraphTab progress modal. Idempotent: re-running on
+            // an already-enriched collection produces 0 enriched + the
+            // full skipped count. Never deletes existing slot data.
+            commands::embedding_enrichment::enrich_collection_vectors,
             // KG dashboard — extended (v1.1)
             commands::kg::kg_set_collection_access_mode,
             commands::kg::kg_set_node_access,

@@ -12,6 +12,7 @@
     ModelChoice,
   } from '$lib/types/embedding-catalog';
   import Dropdown from '$lib/components/Dropdown.svelte';
+  import EnrichmentProgressModal from '$lib/components/EnrichmentProgressModal.svelte';
 
   const ROLE_OPTIONS = [
     { value: 'primary', label: 'primary' },
@@ -46,6 +47,13 @@
   // event only fires on actual changes (not on the initial population).
   let kgEmbeddingInitial = '';
   let cgEmbeddingInitial = '';
+
+  // v0.2.18 Commit 9: enrichment-modal driver state. Populated when a
+  // user changes the KG or codegraph model + clicks Save; the
+  // EnrichmentProgressModal mounts, runs the Tauri command, listens
+  // for vct-enrichment-progress events, and closes on completion.
+  type EnrichmentTarget = { collection: string; newSlot: string };
+  let enrichmentTarget = $state<EnrichmentTarget | null>(null);
 
   function buildOptions(models: ModelChoice[]) {
     // Each option carries its label + an optional disabled flag mapped
@@ -105,8 +113,9 @@
   }
 
   /** Detect whether the user changed the model and warn them about the
-   *  enrichment migration (Commit 9). For v0.2.18 we only emit a Tauri
-   *  event the UI logs — the enrichment runner itself is the next commit.
+   *  enrichment migration. v0.2.18 Commit 9 wires the actual runner: a
+   *  positive confirm here causes saveKg/saveCg to populate
+   *  `enrichmentTarget`, which mounts <EnrichmentProgressModal>.
    *  Returns true if the user confirms (or no change was detected). */
   function confirmModelChange(
     kind: 'kg' | 'codegraph',
@@ -123,6 +132,17 @@ preserved (you can revert without data loss).
 
 Continue?`;
     return confirm(msg);
+  }
+
+  /** Resolve the slot a given model id writes to, via the catalog. */
+  function resolveSlot(
+    kind: 'kg' | 'codegraph',
+    modelId: string,
+  ): string | null {
+    if (!catalog) return null;
+    const pool = kind === 'kg' ? catalog.text_models : catalog.code_models;
+    const found = pool.find((m) => m.id === modelId);
+    return found ? found.slot : null;
   }
 
   async function saveKg() {
@@ -145,13 +165,26 @@ Continue?`;
         },
       });
       toast.success('KG binding saved');
-      // Placeholder for Commit 9 (enrichment migration): emit a hint
-      // the UI can later subscribe to. Today this is logged only.
+      // v0.2.18 Commit 9: when the model genuinely changed, kick the
+      // enrichment migration. The modal mounts on `enrichmentTarget`
+      // population, invokes the Tauri command, streams progress, and
+      // closes itself when the user clicks Close in the done-state.
       if (kgEmbedding && kgEmbeddingInitial && kgEmbedding !== kgEmbeddingInitial) {
-        console.log(
-          '[vct] KG embedding model changed — enrichment migration pending (Commit 9)',
-          { projectId, from: kgEmbeddingInitial, to: kgEmbedding },
-        );
+        const slot = resolveSlot('kg', kgEmbedding);
+        if (slot && kgCollection.trim()) {
+          enrichmentTarget = {
+            collection: kgCollection.trim(),
+            newSlot: slot,
+          };
+        } else {
+          // No slot resolvable (catalog miss). Skip enrichment — the
+          // binding write still succeeded, the seed pipeline will pick
+          // up the new model on next sync.
+          toast.error(
+            `Saved binding but couldn't resolve a slot for ${kgEmbedding}; `
+            + 'manual enrichment may be needed.',
+          );
+        }
       }
       await load();
     } catch (e) {
@@ -179,10 +212,24 @@ Continue?`;
       });
       toast.success('Codegraph binding saved');
       if (cgEmbedding && cgEmbeddingInitial && cgEmbedding !== cgEmbeddingInitial) {
-        console.log(
-          '[vct] Codegraph embedding model changed — enrichment migration pending (Commit 9)',
-          { projectId, from: cgEmbeddingInitial, to: cgEmbedding },
-        );
+        // Codegraph enrichment targets the per-class collections that
+        // the user's prefix expands to (e.g. `MyProj_CodeFunction`).
+        // We launch the modal with the prefix + CodeFunction as the
+        // representative class — the user can run enrichment on the
+        // other Code* classes via a follow-up Save if needed. (The
+        // multi-collection sweep is a P2 item in the v0.2.18 plan.)
+        const slot = resolveSlot('codegraph', cgEmbedding);
+        if (slot && cgPrefix.trim()) {
+          enrichmentTarget = {
+            collection: `${cgPrefix.trim()}CodeFunction`,
+            newSlot: slot,
+          };
+        } else {
+          toast.error(
+            `Saved binding but couldn't resolve a slot for ${cgEmbedding}; `
+            + 'manual enrichment may be needed.',
+          );
+        }
       }
       await load();
     } catch (e) {
@@ -288,6 +335,15 @@ Continue?`;
     </div>
   {/if}
 </section>
+
+{#if enrichmentTarget}
+  <EnrichmentProgressModal
+    collection={enrichmentTarget.collection}
+    newSlot={enrichmentTarget.newSlot}
+    projectId={projectId}
+    onClose={() => (enrichmentTarget = null)}
+  />
+{/if}
 
 <style>
   .ps-tab { padding: 16px; }

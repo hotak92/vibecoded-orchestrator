@@ -9,6 +9,7 @@ pub mod coordination;
 pub mod dashboard;
 pub mod desktop_shortcut;
 pub mod embedding_catalog;
+pub mod embedding_enrichment;
 pub mod hub_proxy;
 pub mod installer;
 pub mod kg;
