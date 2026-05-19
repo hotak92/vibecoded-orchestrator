@@ -381,21 +381,50 @@ class CodeGraphQuery:
                     siblings.append(ref)
                 return siblings
 
-            # v0.2.21 audit fix: emit banner + count ONLY when there's at
-            # least one result. Zero-result runs print nothing on stdout,
-            # so the pre-edit hook's HAS_CODE=0 guard correctly short-
-            # circuits instead of capturing a useless "Found 0 results"
-            # block and injecting it into the model's context every Edit.
-            if top and not hook_format:
-                print(f"\n🔍 Semantic search in {collection}: '{query}'  (detail={detail})")
-                if self.project:
-                    peer_count = len(pairs) - 1
-                    if peer_count > 0:
-                        peer_names = ", ".join(p_filter for _, p_filter in pairs[1:] if p_filter)
-                        print(f"   Project filter: {self.project} (+ {peer_count} peer(s): {peer_names})")
-                    else:
-                        print(f"   Project filter: {self.project}")
-                print(f"   Found {len(top)} results:\n")
+            # v0.2.21 audit fix: emit the per-result banner ONLY when there
+            # is at least one result. The pre-fix code emitted the
+            # "🔍 Semantic search... Project filter: X / Found 0 results:"
+            # block BEFORE the query ran, so even zero-result runs produced
+            # non-empty stdout — the pre-edit hook's HAS_CODE=0 guard then
+            # never fired and every Edit injected ~300 bytes of useless
+            # "Found 0 results" context.
+            #
+            # For zero-result runs we now emit a SHORT identifying line
+            # (one for hook-format, one human-readable). This is deliberate
+            # over emitting nothing: per user direction 2026-05-20,
+            # "multiple empty might be worse than multiple short texts to
+            # let [the model] understand where it's coming from". The
+            # model sees the hook fired AND knows the search scope, so it
+            # can judge whether the absence of results is meaningful for
+            # the task at hand. Cost: ~50-80 bytes per Edit vs ~300 bytes
+            # for the pre-fix banner-on-empty, vs 0 bytes for full
+            # suppression that would leave the model wondering.
+            if not hook_format:
+                if top:
+                    print(f"\n🔍 Semantic search in {collection}: '{query}'  (detail={detail})")
+                    if self.project:
+                        peer_count = len(pairs) - 1
+                        if peer_count > 0:
+                            peer_names = ", ".join(p_filter for _, p_filter in pairs[1:] if p_filter)
+                            print(f"   Project filter: {self.project} (+ {peer_count} peer(s): {peer_names})")
+                        else:
+                            print(f"   Project filter: {self.project}")
+                    print(f"   Found {len(top)} results:\n")
+                else:
+                    # One short line, no banner block, so caller (human or
+                    # hook) sees the search WAS attempted and its scope.
+                    proj_part = f" project={self.project}" if self.project else ""
+                    print(f"   No matches in {collection} for '{query}'{proj_part}")
+            else:
+                # --hook-format path. On empty, emit a single stable-format
+                # line the pre-edit hook can capture; its in-session dedup
+                # keyed by "title" treats this as a normal entry and so
+                # rate-limits identical (collection, project, query) tuples.
+                # Distinct (collection, project, query) → distinct dedup
+                # keys → unique short lines reach the model.
+                if not top:
+                    proj_part = f" | project={self.project}" if self.project else ""
+                    print(f"CODE: no-results | collection={collection}{proj_part} | query='{query}'")
 
             # Render through shared helper. i is 0-based for the helper;
             # human output uses 1-based numbering.

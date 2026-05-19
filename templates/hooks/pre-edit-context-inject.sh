@@ -234,7 +234,11 @@ fi
 # KG search with RL reranking — same pipeline as weaviate MCP (Weaviate → RL server → top-k)
 # Falls back to raw Weaviate order if RL server is unreachable.
 # Returns score field; if score >= 0.6 we provide full node content below.
-("$VENV" "$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py" "$QUERY" --limit 1 2>/dev/null \
+# v0.2.21 audit fix: pass --hook-format so each result is prefixed with
+# "KG: <title>" and the dedup logic below (_filter_seen) recognises it.
+# Pre-fix the hook captured untagged human output, so _filter_seen could
+# never dedup KG injections across Edits within a session.
+("$VENV" "$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py" "$QUERY" --limit 1 --hook-format 2>/dev/null \
     | head -40 > "$KG_TMP") &
 KG_PID=$!
 
@@ -243,7 +247,11 @@ KG_PID=$!
 IS_CODE=0
 if [[ "$FILE_PATH" =~ \.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$ ]]; then
     IS_CODE=1
-    ("$PROJECT_ROOT/.claude/scripts/code-graph-query" search "$QUERY" $CODE_GRAPH_PROJECT_ARG --limit 2 2>/dev/null \
+    # v0.2.21 audit fix: pass --hook-format so results are prefixed with
+    # "CODE: <full_name>" and _filter_seen below recognises them for
+    # dedup. Empty result → emits one short "CODE: no-results | ..." line
+    # so the model sees the hook fired AND knows the search scope.
+    ("$PROJECT_ROOT/.claude/scripts/code-graph-query" search "$QUERY" $CODE_GRAPH_PROJECT_ARG --limit 2 --hook-format 2>/dev/null \
         | grep -v "$FILE_PATH" | head -20 > "$CODE_TMP") &
     CODE_PID=$!
 fi

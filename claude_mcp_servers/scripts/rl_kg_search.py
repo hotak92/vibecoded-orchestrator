@@ -110,6 +110,16 @@ async def main():
             all_formatted.extend(coll_formatted)
 
         if not all_formatted:
+            # v0.2.21 audit fix: under --hook-format, emit a single short
+            # identifying line so the pre-edit hook (which captures our
+            # stdout) and the model both see WHAT was searched. Per user
+            # direction 2026-05-20: empty stdout is fine when it doesn't
+            # reach the model at all (hook's HAS_KG=0 short-circuit), but
+            # if it WILL be captured into context it's better to give it a
+            # name. Non-hook callers (CLI) get nothing on empty — they're
+            # interactive and the silence is informative on its own.
+            if args.hook_format:
+                print(f"KG: no-results | query='{args.query}' | limit={args.limit}")
             return
 
         # Use the primary KG collection handle for the tier helper's
@@ -141,6 +151,7 @@ async def main():
         # Render per-result tier through the shared helper. Output format mirrors
         # the legacy "title | type | score=X.XX | <body>" contract that the
         # pre-edit hook expects so the hook stays compatible after the refactor.
+        printed_count = 0
         for r in results:
             score = float(r.get("score") or 0.0)
             tier = _get_result_verbosity_by_score(score)
@@ -182,6 +193,15 @@ async def main():
                 body = entry.get("content", "")
                 print(f"{header_prefix}{title} | {node_type} | score={score:.2f} | {label}:")
                 print(body)
+            printed_count += 1
+
+        # v0.2.21 audit fix: if EVERY result was filtered out (tier=discard
+        # because score below KG_TIER_MIN, OR _format_result_by_tier returned
+        # None for all of them), the loop above produced no stdout. Mirror
+        # the all_formatted=[] branch: under --hook-format, emit one short
+        # identifying line so the model sees what was searched.
+        if printed_count == 0 and args.hook_format:
+            print(f"KG: no-results | query='{args.query}' | limit={args.limit}")
     finally:
         client.close()
 
