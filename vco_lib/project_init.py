@@ -3184,26 +3184,41 @@ def _emit_migrate_required_deferral(
                 f"  - `{coll}` → **copy-with-vectors** (atomic swap; ~30s per collection)"
             )
 
-    # Build the suggested command. `--force-rebuild` is only mentioned when
-    # the plan actually has a rebuild entry — otherwise the smart copy path
-    # handles it without the escape hatch.
+    # Build the suggested command. `vco_lib` lives in the ORCHESTRATOR
+    # clone's venv (NOT this project's venv) — running `python -m
+    # vco_lib.project_init ...` from the project directory fails with
+    # ModuleNotFoundError. The command below uses an explicit
+    # `cd $VCT_ORCHESTRATOR_ROOT && .venv/bin/python -m ...` invocation
+    # so the user (or an LLM agent reading this) doesn't have to figure
+    # out the venv plumbing. `--name '<project>'` scopes the migration
+    # to THIS project's collections regardless of where the orchestrator
+    # clone lives. (v0.2.18 doc fix 2026-05-19: prior wording assumed
+    # the user knew to run from VCT_ORCHESTRATOR_ROOT.)
+    #
+    # `--force-rebuild` is only mentioned when the plan actually has a
+    # rebuild entry — otherwise the smart copy path handles it without
+    # the escape hatch.
     if has_rebuild:
         cmd = (
-            f"# Run the migration explicitly (preserves vectors via copy where possible,\n"
-            f"# falls back to drop+re-embed for legacy single-vector collections):\n"
-            f"python -m vco_lib.project_init migrate-collections "
+            f"# Run the migration from the orchestrator clone (vco_lib lives there,\n"
+            f"# NOT in this project's venv). The --name flag scopes the work to\n"
+            f"# THIS project's collections. Preserves vectors via copy where possible,\n"
+            f"# falls back to drop+re-embed for legacy single-vector collections.\n"
+            f"cd \"$VCT_ORCHESTRATOR_ROOT\" && .venv/bin/python -m vco_lib.project_init migrate-collections "
             f"--name {project_name!r} --weaviate-url {weaviate_url!r} --json\n"
             f"# OR force the destructive drop+re-embed for ALL collections (slower,\n"
             f"# requires Ollama embedding service to be healthy; ~3-5 min):\n"
-            f"python -m vco_lib.project_init migrate-collections "
+            f"cd \"$VCT_ORCHESTRATOR_ROOT\" && .venv/bin/python -m vco_lib.project_init migrate-collections "
             f"--name {project_name!r} --weaviate-url {weaviate_url!r} "
             f"--force-rebuild --json"
         )
     else:
         cmd = (
-            f"# Run the migration explicitly (atomic copy-with-vectors swap;\n"
-            f"# preserves all UUIDs + vectors + WikiLink cross-references):\n"
-            f"python -m vco_lib.project_init migrate-collections "
+            f"# Run the migration from the orchestrator clone (vco_lib lives there,\n"
+            f"# NOT in this project's venv). The --name flag scopes the work to\n"
+            f"# THIS project's collections. Atomic copy-with-vectors swap;\n"
+            f"# preserves all UUIDs + vectors + WikiLink cross-references.\n"
+            f"cd \"$VCT_ORCHESTRATOR_ROOT\" && .venv/bin/python -m vco_lib.project_init migrate-collections "
             f"--name {project_name!r} --weaviate-url {weaviate_url!r} --json"
         )
 

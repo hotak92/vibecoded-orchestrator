@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.19] — 2026-05-19
+
+### Added
+
+- **`feat(templates)` 7 role-specialist agent/skill packs + KG nodes** (`0c1d285`). 83 new files across `templates/agents/free/` + `templates/skills/` covering 7 senior professional roles built via 7 parallel Opus subagent runs: Consulting CTO (portfolio, SOW, due-diligence, employee-impersonator); Senior Designer/UX (brand identity, enterprise UX, design tokens, AI imagery, Photoshop scripting); Vendor/Sales+Marketing (inbox triage, outbound sequences, SEO, content calendar, sales-call prep); Senior Scientist (paper triage, experiment design, stats consultation, equation check, HPC, repro audit); Automation/AI Engineer (workflow design, API scaffolding, idempotency, webhook security, cost estimation); Solo SaaS Founder (pricing strategy, metrics health-check, landing critique, launch orchestration, build-vs-buy); Senior DevOps/SRE (incident response, post-mortem, IaC review, k8s review, SLO design, observability). Each template uses `opus + effort:high` (or `xhigh` for the few deep-reasoning agents: experiment-designer, equation-check, consulting-sow-drafter). Also adds `knowledge/tools/terraform-opentofu.md` as a foundation node for the existing terraform-plan-reviewer skill.
+
+- **`feat(kg)` 42 new KG nodes + 1 expanded merge** (`32df8aa`). Crystallizes the substantive knowledge that previously lived only in the role-pack skill/agent template bodies into KG nodes, so it surfaces via `hybrid_search` regardless of whether the user invokes the specific skill/agent. Built-in agents (general-purpose, coder, Explore) rarely auto-load custom skills, so knowledge stuck in a skill body is invisible by default — KG nodes are not. Built via 7 parallel Opus extractors (one per role), each in its own isolated worktree. Two merges performed to avoid near-duplicates: `equation-verification-methodology` merged INTO existing `dimensional-analysis-as-debugging` (now covers all 4 sanity checks); `role-impersonation-archetypes` + `wear-the-hat-discipline-specialist` merged into single `wear-the-hat-pattern`. Cross-link added between `sre-incident-response-playbook` and `incident-communication-tempo`.
+
+### Fixed
+
+- **`docs(deferral)` schema_migration_required: explicit VCT_ORCHESTRATOR_ROOT cd** (`195fe9a`). The v0.2.18 `update_project_v2` flow emitted a `schema_migration_required` deferral with a "To apply" command that read `python -m vco_lib.project_init migrate-collections --name 'X' ...`. LLM agents in per-project workspaces (and humans copying-pasting) ran this from the project directory + project venv, triggering `ModuleNotFoundError: No module named 'vco_lib'` because `vco_lib` lives in the orchestrator clone's venv only. Fix: corrected deferral text to `cd "$VCT_ORCHESTRATOR_ROOT" && .venv/bin/python -m vco_lib.project_init migrate-collections --name 'X' ...`. The `--name` flag still scopes the migration to the project's collections; running from the orchestrator clone does NOT migrate the orchestrator's own.
+
+### Migration notes
+
+- v0.2.19 is a templates + KG + doc-fix release. No binary code changes (the launcher binary functionally matches v0.2.18). The 3-OS rebuild fires only because the release workflow rebuilds on every tag — the produced binaries are byte-equivalent in behaviour to v0.2.18's. Users who don't need the new templates/agents/skills/KG nodes can stay on v0.2.18 indefinitely.
+- The new templates auto-propagate to per-project installs via Update Bundle (per-project Settings → "Update bundle"). The new KG nodes seed at next `install.py --update` step 7c, OR via per-project `kg-sync` for projects that bind the shared KG.
+- The deferral-doc fix only affects FUTURE deferrals (existing v0.2.18 deferrals on user machines have the stale text; they can hand-edit or wait for `install.py --update` to re-emit on the next schema-drift detection).
+
 ## [0.2.18] — 2026-05-19
 
 ### Added
