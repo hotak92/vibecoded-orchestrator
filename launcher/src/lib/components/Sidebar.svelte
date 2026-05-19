@@ -7,9 +7,11 @@
   // /project/<id>, otherwise it falls back to /project (which renders an
   // "no project selected" state).
 
+  import { onMount } from 'svelte';
   import { page } from '$app/stores';
   import { selectedProject } from '$lib/stores/projects';
   import { license } from '$lib/stores/license';
+  import { invoke, tauriAvailable } from '$lib/tauri';
 
   type NavItem = {
     href: string;
@@ -29,6 +31,40 @@
     label: string;
     items: NavItem[];
   };
+
+  // Stream 2 (2026-05-19): module-contributed nav items. Loaded once on
+  // mount via the `get_module_nav_items` Tauri command. Each entry
+  // carries the full ConfigTab schema; the renderer at
+  // /modules/[id]/config/+page.svelte looks up the schema from this
+  // list rather than refetching. Soft-fail: command failure leaves the
+  // list empty (and the user sees only the static nav groups).
+  interface ModuleConfigTab {
+    title: string;
+    icon: string | null;
+    route: string | null;
+    description: string | null;
+    sections: unknown[];
+  }
+  interface ModuleNavItem {
+    module_id: string;
+    title: string;
+    icon: string | null;
+    route: string;
+    config_tab: ModuleConfigTab;
+  }
+
+  let moduleNavItems = $state<ModuleNavItem[]>([]);
+
+  onMount(async () => {
+    if (!tauriAvailable()) return;
+    try {
+      moduleNavItems = await invoke<ModuleNavItem[]>('get_module_nav_items');
+    } catch (e) {
+      // Logged but not surfaced — a failed nav-items fetch is far less
+      // bad than blocking the rest of the sidebar from rendering.
+      console.warn('[sidebar] get_module_nav_items failed:', e);
+    }
+  });
 
   const projectId = $derived($selectedProject?.id ?? null);
   // PR-5 (v0.2.11): show an [ORCHESTRATOR] chip in the sidebar header
@@ -179,6 +215,25 @@
         },
       ],
     },
+    // Stream 2 (2026-05-19): module-contributed nav items. Renders as
+    // its own "Module configuration" group sandwiched between System
+    // and Admin. Each entry's tooltip = the manifest's
+    // `gui.config_tab.description` (falls back to the title). Hidden
+    // entirely when no modules contribute a config_tab (avoids a stray
+    // empty group label).
+    ...(moduleNavItems.length > 0
+      ? [
+          {
+            label: 'Module configuration',
+            items: moduleNavItems.map<NavItem>((mod) => ({
+              href: mod.route,
+              label: mod.title,
+              sub: mod.config_tab.description ?? mod.title,
+              match: (p) => p === mod.route || p.startsWith(`${mod.route}/`),
+            })),
+          } satisfies NavGroup,
+        ]
+      : []),
     // Bug 33: Admin group — visible only when the cached tier is "admin".
     // Dev-only affordances. Routes also re-check tier server-side via
     // the standard validate-tier flow before exposing data, so a forged

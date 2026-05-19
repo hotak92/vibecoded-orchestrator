@@ -76,6 +76,176 @@ pub struct ModuleManifest {
     pub provides: Vec<serde_json::Value>,
     #[serde(default)]
     pub consumes: Vec<serde_json::Value>,
+
+    /// Stream 2 (2026-05-19): module-contributed GUI surfaces. When
+    /// populated, the launcher's Sidebar merges a nav entry for this
+    /// module and renders `gui.config_tab` via
+    /// `launcher/src/lib/components/ModuleConfigTab.svelte`. See the
+    /// `GuiBlock` rustdoc for the full schema rationale (load-bearing —
+    /// once a module ships with `gui.config_tab`, the schema becomes
+    /// part of the public manifest contract).
+    #[serde(default)]
+    pub gui: Option<GuiBlock>,
+}
+
+// ─── GUI (Stream 2 / 2026-05-19) ────────────────────────────────────────
+//
+// `GuiBlock` declares optional GUI surfaces a module wants the launcher
+// to render. Today there's exactly one slot — `config_tab` — but the
+// block is a struct (not a single `Option<ConfigTab>` on the manifest)
+// so future surfaces (status_widget, settings_panel, modal_dialog…)
+// land additively without breaking older manifests.
+//
+// Schema-rendered design (Option A from the resume plan): the manifest
+// describes WHAT to show, the launcher decides HOW. Module authors
+// don't ship Svelte components; the launcher's `ModuleConfigTab.svelte`
+// renders a fixed widget palette (Checkbox, MultiSelect, Button, Select,
+// Info). This avoids a plugin sandbox AND keeps the UI consistent.
+//
+// **Load-bearing**: once a paid module ships with a `gui.config_tab`
+// block, breaking changes to this schema break that module's users.
+// All control variants accept `tooltip: Option<String>` so every
+// control can carry mouseover help — non-tech users rely on it.
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GuiBlock {
+    /// Optional per-module config tab. When `Some(...)`, the launcher
+    /// merges a sidebar entry routed to `/modules/<id>/config` (or to
+    /// `config_tab.route` if set) and renders the schema there.
+    #[serde(default)]
+    pub config_tab: Option<ConfigTab>,
+}
+
+/// A module's "config tab" — single full-page surface composed of
+/// collapsible sections, each containing a list of controls. Rendered
+/// by `ModuleConfigTab.svelte`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigTab {
+    /// Title shown at the top of the tab AND as the sidebar nav label.
+    pub title: String,
+    /// Optional lucide icon name (e.g. `"sliders"`). Falls back to the
+    /// first letter of `title` in a generic chip when None.
+    #[serde(default)]
+    pub icon: Option<String>,
+    /// Optional sidebar route override. Defaults to
+    /// `"/modules/<module_id>/config"` when None. Must start with `/`.
+    #[serde(default)]
+    pub route: Option<String>,
+    /// Optional 1-line description rendered under the title at the top
+    /// of the tab.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Sections rendered in order. Empty sections render as a header
+    /// with no body — caller's choice.
+    pub sections: Vec<ConfigSection>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigSection {
+    pub title: String,
+    /// Optional 1-line description rendered under the section header.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// When true, the section gains a chevron toggle. When false, the
+    /// section is always expanded.
+    #[serde(default)]
+    pub collapsible: bool,
+    /// When `collapsible=true`, the section starts collapsed when this
+    /// is true. Has no effect when `collapsible=false`.
+    #[serde(default)]
+    pub initially_collapsed: bool,
+    pub controls: Vec<ConfigControl>,
+}
+
+/// Discriminated union of the renderer's widget palette. Adding a new
+/// kind requires extending `ModuleConfigTab.svelte`'s render dispatch
+/// AND documenting the new control here. Every variant carries
+/// `tooltip: Option<String>` so authors can always provide hover help.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum ConfigControl {
+    /// Boolean toggle. On change, the launcher invokes `on_change` (a
+    /// Tauri command name) with `{ moduleId, value }` if set, AND
+    /// writes the new value into `module_settings` via the generic
+    /// `set_module_setting` command (the renderer always persists,
+    /// regardless of `on_change`).
+    #[serde(rename = "checkbox")]
+    Checkbox {
+        id: String,
+        label: String,
+        #[serde(default)]
+        tooltip: Option<String>,
+        #[serde(default)]
+        default: bool,
+        #[serde(default)]
+        on_change: Option<String>,
+    },
+    /// Multi-pick from a dynamic options list. The renderer calls
+    /// `options_source` (a Tauri command returning `Vec<SelectOption>`)
+    /// on mount, then renders checkboxes for each option. Selected
+    /// ids are persisted as a JSON array via the generic setting
+    /// store, and pushed to `on_change` when set.
+    #[serde(rename = "multi_select")]
+    MultiSelect {
+        id: String,
+        label: String,
+        #[serde(default)]
+        tooltip: Option<String>,
+        /// Tauri command name returning `Vec<{value, label}>`.
+        options_source: String,
+        #[serde(default)]
+        on_change: Option<String>,
+    },
+    /// Action button. When clicked, the renderer invokes `action` (a
+    /// Tauri command). If `confirm` is set, a confirmation dialog is
+    /// shown first. `variant` accepts `"primary"|"secondary"|"danger"`
+    /// for styling.
+    #[serde(rename = "button")]
+    Button {
+        id: String,
+        label: String,
+        #[serde(default)]
+        tooltip: Option<String>,
+        /// Tauri command name invoked on click.
+        action: String,
+        #[serde(default)]
+        variant: Option<String>,
+        /// Optional confirmation prompt. When set, the renderer shows
+        /// a Confirm dialog with this text before invoking `action`.
+        #[serde(default)]
+        confirm: Option<String>,
+    },
+    /// Single-pick dropdown. Static options declared inline. On
+    /// change, `on_change` is invoked with `{ moduleId, value }`.
+    #[serde(rename = "select")]
+    Select {
+        id: String,
+        label: String,
+        #[serde(default)]
+        tooltip: Option<String>,
+        options: Vec<SelectOption>,
+        #[serde(default)]
+        default: Option<String>,
+        #[serde(default)]
+        on_change: Option<String>,
+    },
+    /// Informational banner. Read-only — no state, no persistence.
+    /// `variant` accepts `"info"|"warning"`. Render-only — module
+    /// authors who need dynamic info text should use a Button +
+    /// future status widget instead.
+    #[serde(rename = "info")]
+    Info {
+        id: String,
+        text: String,
+        #[serde(default)]
+        variant: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectOption {
+    pub value: String,
+    pub label: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -652,5 +822,239 @@ mod tests {
         assert!(container.tag_from_version);
         assert!(container.pull_token_endpoint.starts_with("https://"));
         assert!(container.rotate_weights);
+    }
+
+    // ─── Stream 2 (2026-05-19): GuiBlock / ConfigTab / ConfigControl ────
+    //
+    // The schema in `manifest.rs` is load-bearing: a paid module that
+    // ships with a `gui.config_tab` becomes incompatible if a required
+    // field is added without a default. These tests pin the wire shape
+    // for each of the five control kinds + the umbrella block, so any
+    // future refactor either keeps backward-compat OR breaks loudly
+    // at CI time (not at install time on a customer's machine).
+
+    /// Minimal canonical manifest with a complete `gui.config_tab`
+    /// covering all five control kinds. Used as the fixture for every
+    /// gui_block_*_deserializes test below. Keeps the variants in one
+    /// place so reviewers see the full shape at a glance.
+    fn gui_block_fixture_manifest() -> &'static str {
+        r#"{
+            "id": "test-mod",
+            "name": "Test Module",
+            "version": "0.1.0",
+            "category": "paid-orchestrator",
+            "license": { "min_orchestrator_tier": "free" },
+            "install": { "method": "git_clone", "source": "https://example.com/x.git" },
+            "runtime": { "type": "service", "command": "echo" },
+            "gui": {
+                "config_tab": {
+                    "title": "Test Tab",
+                    "icon": "sliders",
+                    "description": "test description",
+                    "sections": [
+                        {
+                            "title": "Section A",
+                            "description": "first section",
+                            "collapsible": false,
+                            "controls": [
+                                { "kind": "info", "id": "info1", "text": "hello", "variant": "info" }
+                            ]
+                        },
+                        {
+                            "title": "Section B",
+                            "collapsible": true,
+                            "initially_collapsed": false,
+                            "controls": [
+                                { "kind": "checkbox", "id": "c1", "label": "Use feature",
+                                  "tooltip": "Hover help", "default": true,
+                                  "on_change": "set_feature" },
+                                { "kind": "multi_select", "id": "ms1", "label": "Pick many",
+                                  "tooltip": "Choose any",
+                                  "options_source": "list_options", "on_change": "set_picks" },
+                                { "kind": "button", "id": "btn1", "label": "Reset",
+                                  "tooltip": "Reset all", "action": "do_reset",
+                                  "variant": "danger", "confirm": "Are you sure?" },
+                                { "kind": "select", "id": "sel1", "label": "Mode",
+                                  "tooltip": "Pick one",
+                                  "options": [
+                                    { "value": "a", "label": "Mode A" },
+                                    { "value": "b", "label": "Mode B" }
+                                  ],
+                                  "default": "a", "on_change": "set_mode" }
+                            ]
+                        }
+                    ]
+                }
+            }
+        }"#
+    }
+
+    #[test]
+    fn gui_block_full_fixture_deserializes() {
+        let manifest = ModuleManifest::from_json(gui_block_fixture_manifest())
+            .expect("fixture must parse");
+        let gui = manifest.gui.expect("gui block present");
+        let tab = gui.config_tab.expect("config_tab present");
+        assert_eq!(tab.title, "Test Tab");
+        assert_eq!(tab.icon.as_deref(), Some("sliders"));
+        assert_eq!(tab.description.as_deref(), Some("test description"));
+        assert_eq!(tab.route, None, "default route resolution happens at command layer");
+        assert_eq!(tab.sections.len(), 2);
+        assert_eq!(tab.sections[0].title, "Section A");
+        assert!(!tab.sections[0].collapsible);
+        assert!(tab.sections[1].collapsible);
+        assert!(!tab.sections[1].initially_collapsed);
+        // Section B carries one of every interactive control kind.
+        assert_eq!(tab.sections[1].controls.len(), 4);
+    }
+
+    #[test]
+    fn gui_block_checkbox_variant_round_trips_tooltip() {
+        let manifest = ModuleManifest::from_json(gui_block_fixture_manifest()).unwrap();
+        let controls = &manifest.gui.unwrap().config_tab.unwrap().sections[1].controls;
+        match &controls[0] {
+            ConfigControl::Checkbox { id, label, tooltip, default, on_change } => {
+                assert_eq!(id, "c1");
+                assert_eq!(label, "Use feature");
+                assert_eq!(tooltip.as_deref(), Some("Hover help"));
+                assert!(*default);
+                assert_eq!(on_change.as_deref(), Some("set_feature"));
+            }
+            other => panic!("expected Checkbox, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn gui_block_multi_select_variant_has_options_source() {
+        let manifest = ModuleManifest::from_json(gui_block_fixture_manifest()).unwrap();
+        let controls = &manifest.gui.unwrap().config_tab.unwrap().sections[1].controls;
+        match &controls[1] {
+            ConfigControl::MultiSelect { id, options_source, tooltip, .. } => {
+                assert_eq!(id, "ms1");
+                assert_eq!(options_source, "list_options");
+                assert!(tooltip.is_some(), "tooltip declared in fixture");
+            }
+            other => panic!("expected MultiSelect, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn gui_block_button_variant_has_confirm_and_variant() {
+        let manifest = ModuleManifest::from_json(gui_block_fixture_manifest()).unwrap();
+        let controls = &manifest.gui.unwrap().config_tab.unwrap().sections[1].controls;
+        match &controls[2] {
+            ConfigControl::Button { id, action, confirm, variant, .. } => {
+                assert_eq!(id, "btn1");
+                assert_eq!(action, "do_reset");
+                assert_eq!(confirm.as_deref(), Some("Are you sure?"));
+                assert_eq!(variant.as_deref(), Some("danger"));
+            }
+            other => panic!("expected Button, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn gui_block_select_variant_options_round_trip() {
+        let manifest = ModuleManifest::from_json(gui_block_fixture_manifest()).unwrap();
+        let controls = &manifest.gui.unwrap().config_tab.unwrap().sections[1].controls;
+        match &controls[3] {
+            ConfigControl::Select { id, options, default, .. } => {
+                assert_eq!(id, "sel1");
+                assert_eq!(options.len(), 2);
+                assert_eq!(options[0].value, "a");
+                assert_eq!(options[1].label, "Mode B");
+                assert_eq!(default.as_deref(), Some("a"));
+            }
+            other => panic!("expected Select, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn gui_block_info_variant_has_text_and_variant() {
+        let manifest = ModuleManifest::from_json(gui_block_fixture_manifest()).unwrap();
+        let controls = &manifest.gui.unwrap().config_tab.unwrap().sections[0].controls;
+        match &controls[0] {
+            ConfigControl::Info { id, text, variant } => {
+                assert_eq!(id, "info1");
+                assert_eq!(text, "hello");
+                assert_eq!(variant.as_deref(), Some("info"));
+            }
+            other => panic!("expected Info, got {:?}", other),
+        }
+    }
+
+    /// Manifests without a `gui` block are still valid (back-compat).
+    /// All existing v0.x manifests fall in this category.
+    #[test]
+    fn manifest_without_gui_block_remains_valid() {
+        let raw = r#"{
+            "id": "no-gui-mod",
+            "name": "Module No GUI",
+            "version": "0.1.0",
+            "category": "core",
+            "license": { "min_orchestrator_tier": "free" },
+            "install": { "method": "git_clone", "source": "https://example.com/x.git" },
+            "runtime": { "type": "cli", "command": "echo" }
+        }"#;
+        let m = ModuleManifest::from_json(raw).expect("valid without gui");
+        assert!(m.gui.is_none());
+    }
+
+    /// Confirms the vct-rl-reranker manifest carries a fully-populated
+    /// `gui.config_tab` after Stream 2 (Part D). Skipped when the file
+    /// is absent (paid-modules dir not present on this dev clone).
+    /// Pins the section count, title, and presence of at least one
+    /// control of each kind so manifest drift breaks loudly.
+    #[test]
+    fn vct_rl_reranker_manifest_with_gui_tab_deserializes() {
+        let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("walk to repo root")
+            .to_path_buf();
+        let path = repo_root.join("paid-modules/vct-rl-reranker/vct-module.json");
+        if !path.exists() {
+            eprintln!(
+                "[test skip] paid-modules/vct-rl-reranker/vct-module.json not present \
+                 (path: {}) — skipping gui_tab check",
+                path.display()
+            );
+            return;
+        }
+        let body = std::fs::read_to_string(&path).expect("read manifest");
+        let manifest: ModuleManifest =
+            serde_json::from_str(&body).expect("deserialize manifest");
+
+        let gui = manifest.gui.expect("vct-rl-reranker must declare gui block");
+        let tab = gui.config_tab.expect("gui.config_tab must be populated");
+
+        assert_eq!(tab.title, "RL Reranker", "title pinned");
+        assert_eq!(
+            tab.sections.len(),
+            3,
+            "expected three sections (status / per-project / global)"
+        );
+
+        // Flatten controls + verify at least one of each interactive
+        // kind exists. Info is required (section 1 is status-only).
+        let mut has_checkbox = false;
+        let mut has_button = false;
+        let mut has_multi_select = false;
+        let mut has_info = false;
+        for section in &tab.sections {
+            for control in &section.controls {
+                match control {
+                    ConfigControl::Checkbox { .. } => has_checkbox = true,
+                    ConfigControl::Button { .. } => has_button = true,
+                    ConfigControl::MultiSelect { .. } => has_multi_select = true,
+                    ConfigControl::Info { .. } => has_info = true,
+                    ConfigControl::Select { .. } => {}
+                }
+            }
+        }
+        assert!(has_checkbox, "manifest must declare at least one checkbox");
+        assert!(has_button, "manifest must declare at least one button");
+        assert!(has_multi_select, "manifest must declare a multi_select");
+        assert!(has_info, "section 1 must include at least one info banner");
     }
 }

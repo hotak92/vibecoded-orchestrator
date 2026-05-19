@@ -739,6 +739,26 @@ pub fn run() {
             commands::modules::set_module_enabled_v2,
             commands::modules::module_start_v2,
             commands::modules::module_stop_v2,
+            // Stream 2 (2026-05-19): module-contributed GUI tabs +
+            // generic per-control state. `get_module_nav_items` feeds the
+            // Sidebar's module nav group; the get/set setting pair is the
+            // schema renderer's default backing store.
+            commands::module_gui::get_module_nav_items,
+            commands::module_gui::get_module_setting,
+            commands::module_gui::set_module_setting,
+            // RL Reranker per-project settings (Stream 2 / 2026-05-19).
+            // Backs the schema-rendered controls declared in
+            // paid-modules/vct-rl-reranker/vct-module.json's
+            // gui.config_tab. Reset / retrain commands stub for now;
+            // Stream 3 will wire them to the rl_server container.
+            commands::rl_settings::set_rl_use_global,
+            commands::rl_settings::set_rl_online_training_disabled,
+            commands::rl_settings::set_rl_global_training_source_flag,
+            commands::rl_settings::rl_reset_to_global,
+            commands::rl_settings::rl_reset_and_specialize,
+            commands::rl_settings::list_rl_global_training_source_projects,
+            commands::rl_settings::retrain_global_online,
+            commands::rl_settings::retrain_global_offline,
             // Per-project orchestrator state (agents/skills/hooks/permissions/secrets/KG/codegraph)
             commands::project_state_cmd::list_project_agents,
             commands::project_state_cmd::list_project_skills,
