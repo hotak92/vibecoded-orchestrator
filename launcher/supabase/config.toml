@@ -21,3 +21,6 @@ verify_jwt = false
 
 [functions.lemon-squeezy-webhook]
 verify_jwt = false
+
+[functions.rl-latest-version]
+verify_jwt = false
