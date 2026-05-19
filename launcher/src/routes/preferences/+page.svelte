@@ -7,6 +7,7 @@
   import { ui } from '$lib/stores/ui';
   import Toast from '$lib/components/Toast.svelte';
   import Dropdown from '$lib/components/Dropdown.svelte';
+  import { focusOnMount, focusTrap } from '$lib/actions/focusManagement';
   import type {
     EmbeddingCatalog,
     ModelChoice,
@@ -399,43 +400,12 @@
     }
   }
 
-  /** Focus the primary action when the modal opens. Focus trap is
-   *  handled by the dialog's `aria-modal` + the action() below that
-   *  cycles Tab through the modal's two buttons only. */
-  function focusOnMount(node: HTMLButtonElement) {
-    // Defer to next tick so Svelte has wired up the rest of the modal.
-    queueMicrotask(() => node.focus());
-  }
-
-  /** Minimal focus trap: cycle Tab/Shift+Tab between the two buttons.
-   *  Svelte 5 actions take a node + return { destroy }. We attach to
-   *  the modal root so any focus leaving via Tab from the last button
-   *  loops to the first, and vice versa. */
-  function focusTrap(node: HTMLElement) {
-    function onKey(e: KeyboardEvent) {
-      if (e.key !== 'Tab') return;
-      const focusable = node.querySelectorAll<HTMLElement>(
-        'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
-      );
-      if (focusable.length === 0) return;
-      const first = focusable[0];
-      const last = focusable[focusable.length - 1];
-      const active = document.activeElement as HTMLElement | null;
-      if (e.shiftKey && active === first) {
-        e.preventDefault();
-        last.focus();
-      } else if (!e.shiftKey && active === last) {
-        e.preventDefault();
-        first.focus();
-      }
-    }
-    node.addEventListener('keydown', onKey);
-    return {
-      destroy() {
-        node.removeEventListener('keydown', onKey);
-      },
-    };
-  }
+  // Focus management for the "Set OpenAI as default?" confirm modal —
+  // `focusOnMount` (primary-action autofocus) + `focusTrap` (Tab/Shift+Tab
+  // cycling) are imported from `$lib/actions/focusManagement` so other
+  // modals in the launcher can share the same a11y semantics. Lifted out
+  // in v0.2.18 cleanup commit; original implementation landed inline
+  // here with Commit 7.
 
   // ── OpenAI API key (v0.2.18 Commit 7) ──────────────────────────────────
   // Symmetric to the GitHub PAT section above. Key lives in the OS

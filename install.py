@@ -2550,7 +2550,6 @@ def main() -> int:
         # OUTSIDE the seed try/except for the same reason.
         try:
             _write_preset_defaults_to_app_state(
-                PROJECT_ROOT,
                 embed_config,
                 openai_set_as_default=bool(embed_config.get("openai_key")),
             )
@@ -4937,7 +4936,6 @@ def _discover_app_state_db_path() -> Path:
 
 
 def _write_preset_defaults_to_app_state(
-    install_root: Path,  # noqa: ARG001 — reserved for future test-only DB override
     embed_config: dict,
     openai_set_as_default: bool,
 ) -> None:
@@ -4967,11 +4965,15 @@ def _write_preset_defaults_to_app_state(
     Never raises: install.py should not fail just because the GUI
     dropdowns won't pre-populate.
 
+    DB-path resolution: `_discover_app_state_db_path` honours the
+    `VCT_STATE_DIR` env override (the canonical pattern used by
+    `vco_lib.paths.vct_root_dir`) — tests that need a custom DB
+    location set `VCT_STATE_DIR` rather than threading a path
+    parameter through this helper. The legacy `install_root`
+    parameter (kept through v0.2.18 release prep as `noqa: ARG001`)
+    was dropped here in the v0.2.18 cleanup commit.
+
     Args:
-        install_root: Project root (unused in v0.2.18; kept for the
-            potential test/integration use case of pointing at a
-            non-default DB location). DB path is resolved via
-            `_discover_app_state_db_path` from `vct_root_dir()` env.
         embed_config: As returned by `_choose_embedding_config`.
         openai_set_as_default: True when `--openai-key` was passed (or,
             via the wizard, when the user ticked "set OpenAI as

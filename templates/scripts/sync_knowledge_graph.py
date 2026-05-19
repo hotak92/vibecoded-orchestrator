@@ -609,7 +609,13 @@ def parse_markdown_node(content: str, file_path: Path) -> Dict:
 def ensure_collection_exists(server: WeaviateMCPServer) -> bool:
     """
     Ensure the project's KG_COLLECTION (env-resolved, fallback "KnowledgeGraph")
-    exists with proper schema
+    exists with proper schema.
+
+    Named-vector slots (v0.2.18): sourced from
+    `vco_lib.weaviate_schema.KG_NAMED_VECTORS` for parity with the
+    `project_init.kg_class_definition` canonical path. Falls back to the
+    legacy 3-slot config if the import fails (one-off script runs outside
+    the orchestrator clone). Mirrors `ensure_dev_collection_exists`.
 
     Args:
         server: Weaviate MCP server instance
@@ -692,6 +698,35 @@ def ensure_collection_exists(server: WeaviateMCPServer) -> bool:
 
         print(f"Creating collection '{COLLECTION_NAME}'...")
 
+        # v0.2.18: pull the 5-slot named-vector catalog from the canonical
+        # source (`vco_lib.weaviate_schema.KG_NAMED_VECTORS`) so this
+        # runtime fallback creates the KG collection at the same shape as
+        # `vco_lib.project_init.kg_class_definition`. Fall back to the
+        # legacy 3-slot config when the import fails (one-off script runs
+        # outside an orchestrator clone where vco_lib isn't on the path).
+        # The migrate dispatcher's additive `copy` action picks up any
+        # missing slot later when the user does run install/update.
+        #
+        # Mirrors the Dev-collection variant at `ensure_dev_collection_exists`
+        # (landed bcacfc0). Both sites stay in lockstep with the canonical
+        # `project_init.{kg,development}_class_definition` so the migrate
+        # dispatcher's additive patch_props diff doesn't trip phantom
+        # missing-slot loops.
+        try:
+            from vco_lib.weaviate_schema import KG_NAMED_VECTORS
+            named_vectors = [
+                Configure.NamedVectors.none(name=slot.name)
+                for slot in KG_NAMED_VECTORS
+            ]
+        except Exception as import_err:  # noqa: BLE001 — best-effort fallback
+            print(f"  ⚠️  Could not import KG_NAMED_VECTORS ({import_err}); "
+                  "falling back to legacy 3-slot config")
+            named_vectors = [
+                Configure.NamedVectors.none(name="qwen3_embed"),     # active
+                Configure.NamedVectors.none(name="ollama_embed"),    # legacy
+                Configure.NamedVectors.none(name="openai_embed"),    # optional
+            ]
+
         # Create collection with proper schema (supports chunking + temporal + typed links)
         server.client.collections.create(
             name=COLLECTION_NAME,
@@ -741,17 +776,14 @@ def ensure_collection_exists(server: WeaviateMCPServer) -> bool:
                 # AFTER that one will then skip.
                 Property(name="content_hash", data_type=DataType.TEXT),
             ],
-            # Named vectors must match `VECTOR_SCHEMES["kg"]` in
-            # weaviate_mcp/server.py:130. Without this the collection accepts
-            # only the unnamed default vector, and per-named-vector inserts
-            # fail at runtime ("collection configured without multiple named
-            # vectors but received named vectors: map[ollama_embed:...]").
-            # Vectors are still computed manually (Configure.NamedVectors.none).
-            vectorizer_config=[
-                Configure.NamedVectors.none(name="qwen3_embed"),     # active
-                Configure.NamedVectors.none(name="ollama_embed"),    # legacy
-                Configure.NamedVectors.none(name="openai_embed"),    # optional
-            ],
+            # Named vectors must match `vco_lib.weaviate_schema.KG_NAMED_VECTORS`
+            # (the canonical v0.2.18 catalog). Without these the collection
+            # accepts only the unnamed default vector, and per-named-vector
+            # inserts fail at runtime ("collection configured without
+            # multiple named vectors but received named vectors:
+            # map[ollama_embed:...]"). Vectors are still computed manually
+            # (Configure.NamedVectors.none).
+            vectorizer_config=named_vectors,
             # `index_null_state=True` enables `is_none(True)` filters on date
             # properties (notably `valid_until`). Required for the MCP
             # `_stale_filter` to filter out expired/archived nodes at query
@@ -761,7 +793,8 @@ def ensure_collection_exists(server: WeaviateMCPServer) -> bool:
             inverted_index_config=Configure.inverted_index(index_null_state=True),
         )
 
-        print(f"✓ Created collection '{COLLECTION_NAME}' (named vectors + index_null_state=True)")
+        print(f"✓ Created collection '{COLLECTION_NAME}' "
+              f"({len(named_vectors)} named vectors + index_null_state=True)")
         return True
 
         if result["success"]:

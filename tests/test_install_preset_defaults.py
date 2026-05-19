@@ -294,7 +294,6 @@ class WritePresetDefaultsTests(unittest.TestCase):
         with _LogFixture() as log_fix, _DbFixture() as db_fix:
             self.assertFalse(db_fix.db_path.exists())
             install._write_preset_defaults_to_app_state(
-                db_fix.root,
                 dict(install.EMBEDDING_CONFIGS["gpu"]),
                 openai_set_as_default=False,
             )
@@ -311,7 +310,6 @@ class WritePresetDefaultsTests(unittest.TestCase):
         with _LogFixture() as log_fix, _DbFixture() as db_fix:
             _create_db_without_app_state(db_fix.db_path)
             install._write_preset_defaults_to_app_state(
-                db_fix.root,
                 dict(install.EMBEDDING_CONFIGS["gpu"]),
                 openai_set_as_default=False,
             )
@@ -324,7 +322,6 @@ class WritePresetDefaultsTests(unittest.TestCase):
         with _LogFixture() as log_fix, _DbFixture() as db_fix:
             _create_db_with_app_state(db_fix.db_path)
             install._write_preset_defaults_to_app_state(
-                db_fix.root,
                 dict(install.EMBEDDING_CONFIGS["gpu"]),
                 openai_set_as_default=False,
             )
@@ -367,7 +364,6 @@ class WritePresetDefaultsTests(unittest.TestCase):
                 conn.close()
 
             install._write_preset_defaults_to_app_state(
-                db_fix.root,
                 dict(install.EMBEDDING_CONFIGS["gpu"]),
                 openai_set_as_default=False,
             )
@@ -395,7 +391,6 @@ class WritePresetDefaultsTests(unittest.TestCase):
             config = dict(install.EMBEDDING_CONFIGS["openai"])
             config["openai_key"] = "sk-fake"
             install._write_preset_defaults_to_app_state(
-                db_fix.root,
                 config,
                 openai_set_as_default=True,
             )
@@ -430,7 +425,6 @@ class WritePresetDefaultsTests(unittest.TestCase):
                 conn.close()
 
             install._write_preset_defaults_to_app_state(
-                db_fix.root,
                 dict(install.EMBEDDING_CONFIGS["gpu"]),
                 openai_set_as_default=False,
             )
@@ -461,7 +455,6 @@ class WritePresetDefaultsTests(unittest.TestCase):
             db_fix.db_path.write_bytes(b"not a sqlite file" * 100)
             # Must not raise.
             install._write_preset_defaults_to_app_state(
-                db_fix.root,
                 {"active_embedding": "gpu",
                  "text_model": "qwen3-embedding:0.6b",
                  "code_model": "codesage-large-v2"},
@@ -472,6 +465,32 @@ class WritePresetDefaultsTests(unittest.TestCase):
             events = log_fix.events_for_step("preset_defaults")
             self.assertEqual(len(events), 1)
             self.assertIn(events[0]["phase"], ("warn", "skip"))
+
+    def test_uses_vct_state_dir_env_for_db_path_injection(self):
+        # v0.2.18 cleanup: confirms the canonical path-injection pattern.
+        # Tests that need a custom DB location set `VCT_STATE_DIR`
+        # (matching `vco_lib.paths.vct_root_dir`); they do NOT thread a
+        # path parameter through the helper. The `_DbFixture` already
+        # patches `VCT_STATE_DIR` to its tempdir, so this test simply
+        # asserts the helper picks up that env-resolved path.
+        with _LogFixture() as log_fix, _DbFixture() as db_fix:
+            _create_db_with_app_state(db_fix.db_path)
+            install._write_preset_defaults_to_app_state(
+                dict(install.EMBEDDING_CONFIGS["gpu"]),
+                openai_set_as_default=False,
+            )
+            # The helper wrote into the env-resolved path, NOT some
+            # parameter-threaded one. Read it back from the same path.
+            state = _read_app_state(db_fix.db_path)
+            self.assertIn("default_text_embedding", state)
+            self.assertIn("default_code_embedding", state)
+            events = log_fix.events_for_step("preset_defaults")
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0]["phase"], "ok")
+            # Log's data block carries the resolved db_path — must point
+            # at the env-override location, proving env-override worked.
+            data = events[0].get("data", {})
+            self.assertEqual(data.get("db_path"), str(db_fix.db_path))
 
 
 if __name__ == "__main__":
