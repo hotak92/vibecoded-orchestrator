@@ -154,10 +154,23 @@ weaviate_client = None
 WEAVIATE_URL = os.getenv("WEAVIATE_URL", "http://localhost:8081")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11435")
 
-# RL training integration (transparent, best-effort)
-# RL_SERVER_URL: HTTP endpoint of rl_server.py (MultiagentOrchestrator).
-#   When reachable: nodes are reranked and cached; online training fires after each KG search.
-#   When unreachable: MCP returns Weaviate-order top-k; no training.
+# RL training integration (transparent, best-effort).
+#
+# As of Stream 1 (2026-05-19), the direct HTTP wiring to ``rl_server.py``
+# has moved into the ``rl_client`` package. The legacy ``rl_server/``
+# sub-package was relocated to the private ``paid-modules/vct-rl-reranker``
+# repo and ships as a paid container; this MCP talks to it via
+# ``RLClient`` instead of importing the server code directly.
+#
+# Free tier: ``RL_SERVER_URL`` / ``RL_SERVER_PORT`` unset → ``RLClient``
+# runs in "disabled mode" and ``cache_nodes`` returns inputs unchanged.
+# Pro/MAO tier with container running → real reranking + online training.
+#
+# ``RL_SERVER_URL`` retained as a back-compat env var read by
+# ``rl_client.client._resolve_base_url``. Default kept at the legacy
+# 11439 only for back-compat with installs that explicitly set this
+# variable; the canonical channel today is ``RL_SERVER_PORT`` (set
+# by the launcher's ``allocate_rl_port`` flow).
 RL_SERVER_URL = os.getenv("RL_SERVER_URL", "http://localhost:11439")
 # Over-fetch multiplier: fetch this many × limit from Weaviate, pass all to RL server for reranking.
 _RL_OVERFETCH = 2
@@ -2365,26 +2378,119 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
             # Right transcript — check if answer is complete
             answer, complete = _rl_extract_answer_window(messages, start_msg_idx, start_blk_idx)
             if complete and answer.strip():
-                # POST to rl_server
-                try:
-                    payload = {"task_ids": [task_id], "agent_output": answer}
-                    timeout = aiohttp.ClientTimeout(total=5.0)
-                    async with aiohttp.ClientSession(timeout=timeout) as sess:
-                        async with sess.post(f"{RL_SERVER_URL}/rl_update", json=payload) as resp:
-                            if resp.status == 200:
-                                logger.debug(
-                                    "RL monitor %s: trained on %d chars (transcript %s)",
-                                    task_id[:8], len(answer), candidate.name[:8],
-                                )
-                            else:
-                                logger.debug("RL monitor %s: rl_update returned %d", task_id[:8], resp.status)
-                except Exception as exc:
-                    logger.debug("RL monitor %s: rl_update failed (%s)", task_id[:8], exc)
+                # Submit to the RL server via the client adapter. The
+                # client handles "disabled mode" and unreachable-server
+                # cases internally (returns RLUpdateResponse(ok=False))
+                # — we never raise out of this background task.
+                client = _get_rl_client()
+                if client is not None:
+                    resp = await client.rl_update(
+                        task_ids=[task_id],
+                        agent_output=answer,
+                        task_type="mcp_interactive",
+                    )
+                    if resp.ok:
+                        logger.debug(
+                            "RL monitor %s: trained on %d chars (transcript %s)",
+                            task_id[:8], len(answer), candidate.name[:8],
+                        )
+                    else:
+                        logger.debug(
+                            "RL monitor %s: rl_update not ok (%s)",
+                            task_id[:8], resp.error or resp.skipped or "unknown",
+                        )
                 return
             # Found the right transcript but answer not complete yet — stop scanning candidates
             break
 
     logger.debug("RL monitor %s: timed out after %.0fs", task_id[:8], _RL_MONITOR_TIMEOUT)
+
+
+# ----------------------------------------------------------------------
+# RLClient + telemetry-writer lazy singletons (Stream 1 / v0.2.20)
+#
+# These replace the inline ``aiohttp`` POSTs that used to live in
+# ``_rl_cache_and_rerank`` and ``_rl_answer_monitor``. Constructing the
+# client is cheap (no HTTP until first call); we still lazily build a
+# per-process instance so the env vars (set by the launcher's
+# allocate_rl_port flow) are read at first use, not at import time.
+# ----------------------------------------------------------------------
+
+_rl_client_instance = None  # type: ignore[var-annotated]
+_rl_telemetry_writer_instance = None  # type: ignore[var-annotated]
+
+
+def _get_rl_client():
+    """Lazy-build one ``RLClient`` per process.
+
+    Reads ``RL_SERVER_URL`` / ``RL_SERVER_PORT`` at first call via
+    ``rl_client.client._resolve_base_url``. When neither is set,
+    the client lives in "disabled mode" and every call returns the
+    no-rerank fallback without touching the network.
+    """
+    global _rl_client_instance
+    if _rl_client_instance is not None:
+        return _rl_client_instance
+    try:
+        from claude_mcp_servers.rl_client import RLClient
+    except Exception as exc:
+        logger.debug("RLClient import failed (%s); RL features disabled", exc)
+        return None
+    # text_dim comes from the MCP's notion of the active embedding —
+    # we pull it from the EmbeddingService when available, falling back
+    # to a sensible default (1024 for qwen3/arctic; legacy alias).
+    text_dim = 1024
+    try:
+        from vco_lib.embedding_service import EmbeddingService
+        svc = EmbeddingService.for_project()
+        try:
+            text_dim = svc.text_dim
+        finally:
+            svc.close()
+    except Exception as exc:
+        logger.debug("EmbeddingService probe failed (%s); using default text_dim=%d", exc, text_dim)
+    _rl_client_instance = RLClient(
+        text_dim=text_dim,
+        active_embedding=ACTIVE_EMBEDDING,
+    )
+    return _rl_client_instance
+
+
+def _get_rl_telemetry_writer():
+    """Lazy-build one ``RLTelemetryWriter`` per process."""
+    global _rl_telemetry_writer_instance
+    if _rl_telemetry_writer_instance is not None:
+        return _rl_telemetry_writer_instance
+    try:
+        from claude_mcp_servers.rl_client import RLTelemetryWriter
+    except Exception as exc:
+        logger.debug("RLTelemetryWriter import failed (%s); telemetry disabled", exc)
+        return None
+
+    # Derive the embedding source short id from EmbeddingService when
+    # available. Falls back to ACTIVE_EMBEDDING env (qwen3 default).
+    emb_source = ACTIVE_EMBEDDING
+    emb_dim = 1024
+    emb_model = EMBEDDING_MODEL
+    try:
+        from vco_lib.embedding_service import EmbeddingService
+        svc = EmbeddingService.for_project()
+        try:
+            emb_source = svc.text_model_short_id()
+            emb_dim = svc.text_dim
+            emb_model = svc.text_model_id
+        finally:
+            svc.close()
+    except Exception as exc:
+        logger.debug("EmbeddingService probe for telemetry failed (%s); using env defaults", exc)
+    project = os.getenv("PROJECT_NAME", "") or os.getenv("KG_COLLECTION", "")
+    _rl_telemetry_writer_instance = RLTelemetryWriter(
+        project=project,
+        embedding_source=emb_source,
+        embedding_dim=emb_dim,
+        embedding_model=emb_model,
+    )
+    return _rl_telemetry_writer_instance
 
 
 async def _rl_cache_and_rerank(
@@ -2423,34 +2529,52 @@ async def _rl_cache_and_rerank(
     # Spawn answer monitor (fire-and-forget, doesn't block Claude's response)
     asyncio.create_task(_rl_answer_monitor(task_id, seq, query))
 
-    # Try rl_server for reranking.
-    try:
-        # Forward ACTIVE_EMBEDDING so the RL server can verify or override
-        # its startup-time tag if the two processes ever drift (e.g. user
-        # flipped ACTIVE_EMBEDDING in one shell but the RL server is still
-        # running with the previous value). The RL server uses this for
-        # logging/tagging; it does not switch networks per-request.
-        payload = {
-            "task_id": task_id,
-            "query": query,
-            "nodes": all_nodes,
-            "limit": limit,
-            "embedding_source": ACTIVE_EMBEDDING,
-        }
-        timeout = aiohttp.ClientTimeout(total=3.0)   # tight timeout — don't block Claude
-        async with aiohttp.ClientSession(timeout=timeout) as sess:
-            async with sess.post(f"{RL_SERVER_URL}/cache_nodes", json=payload) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    top_k = data.get("top_k", [])
-                    if top_k:
-                        logger.debug("RL reranked %d→%d nodes for task %s", len(all_nodes), len(top_k), task_id[:8])
-                        return top_k
-    except Exception as exc:
-        logger.debug("RL server unreachable (%s) — using Weaviate order", exc)
+    # Rerank via RLClient. The client handles "disabled mode" (no env
+    # configured) and per-call fallback (connection refused / 5xx)
+    # internally — it ALWAYS returns a list and never raises here, so
+    # we don't need a defensive try/except around the await.
+    client = _get_rl_client()
+    if client is None:
+        # rl_client package unavailable — return Weaviate order.
+        ranked = list(all_nodes[:limit])
+    else:
+        ranked = await client.cache_nodes(
+            query=query,
+            nodes=all_nodes,
+            top_k=limit,
+            task_id=task_id,
+        )
 
-    # Fallback: Weaviate-distance order, sliced to limit.
-    return all_nodes[:limit]
+    # Telemetry: log the retrieval event regardless of whether reranking
+    # happened. Free-tier installs collect locally (subject to the
+    # RL_LOCAL_LOGGING_DISABLED opt-out); only consented data is
+    # forwarded to the queue for upload. Soft-fail throughout.
+    try:
+        writer = _get_rl_telemetry_writer()
+        if writer is not None:
+            # Build the log payload from the ranked list. Score-aware
+            # tier tagging: first ``limit`` go to top_k, rest extra_ref.
+            log_nodes: list[dict] = []
+            for idx, n in enumerate(all_nodes):
+                if not isinstance(n, dict):
+                    continue
+                log_nodes.append({
+                    "title": n.get("title", ""),
+                    "score": n.get("score", 0.0),
+                    "tier": "top_k" if idx < limit else "extra_reference",
+                    **({"emb": n["emb"]} if n.get("emb") else {}),
+                })
+            writer.log_retrieval(
+                task_id=task_id,
+                task_type="mcp_interactive",
+                query=query,
+                nodes=log_nodes,
+                session_id=os.getenv("CLAUDE_SESSION_ID", ""),
+            )
+    except Exception as exc:
+        logger.debug("RL telemetry log_retrieval failed (%s); continuing", exc)
+
+    return ranked
 
 
 async def search_single_collection(collection_name: str, query: str, limit: int, filters=None) -> list:

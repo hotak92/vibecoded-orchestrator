@@ -1026,6 +1026,58 @@ class EmbeddingService:
         """Vector dim of the configured text model."""
         return self._text_dim
 
+    def text_model_short_id(self) -> str:
+        """Return the short source tag for the configured text model.
+
+        Maps the resolved ``text_model_id`` (which may be a full Ollama
+        tag like ``qwen3-embedding:0.6b`` or an OpenAI catalog id like
+        ``openai-text-embedding-3-small``) to the canonical short tag
+        that ``rl_logger.RLDataLogger.embedding_source`` expects:
+
+          ``qwen3`` / ``arctic`` / ``openai`` / ``codesage`` / ``legacy``
+
+        The mapping is deliberately coarse — these tags partition the
+        RL training corpus into mutually-incompatible embedding spaces
+        (different dims, different model families). Cross-mapping
+        would corrupt training data.
+
+        Resolution order:
+          1. Slot-name based (``qwen3_embed`` → ``qwen3``). This is
+             the canonical mapping because the slot itself is what
+             the KG named-vector lives in.
+          2. Substring scan on the raw model id for edge cases the
+             slot doesn't disambiguate (e.g. legacy arctic in
+             ``ollama_embed``).
+          3. Fallback: ``"legacy"`` (matches rl_server.py's default
+             for un-tagged events).
+        """
+        # 1. Slot-driven dispatch (the common case).
+        slot = self._text_slot
+        if slot == "qwen3_embed":
+            return "qwen3"
+        if slot == "arctic2_embed":
+            return "arctic"
+        if slot == "openai_text_embed":
+            return "openai"
+        if slot == "codesage_embed":
+            return "codesage"
+
+        # 2. Model-id substring scan for slot-ambiguous cases.
+        # ``ollama_embed`` is the legacy bucket and contains BOTH old
+        # arctic and exotic Ollama models; disambiguate here.
+        lowered = (self.text_model_id or "").lower()
+        if "arctic" in lowered:
+            return "arctic"
+        if "qwen3" in lowered or "qwen3-embedding" in lowered:
+            return "qwen3"
+        if "text-embedding-3" in lowered or "openai" in lowered:
+            return "openai"
+        if "codesage" in lowered:
+            return "codesage"
+
+        # 3. Fallback — matches rl_server.py's "legacy_1024" partition.
+        return "legacy"
+
     @property
     def code_vector_slot(self) -> str:
         """Named-vector slot the configured code model writes to."""

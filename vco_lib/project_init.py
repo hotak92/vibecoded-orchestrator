@@ -3137,6 +3137,63 @@ def _install_project_level_templates(
     return out
 
 
+def _run_rl_client_setup(folder: Path) -> dict:
+    """Run the per-project ``rl_client_setup`` script for the platform.
+
+    Picks ``rl_client_setup.sh`` on POSIX, ``rl_client_setup.ps1`` on
+    Windows. The script lives in ``<folder>/.claude/scripts/`` (copied
+    earlier in the bundle install via the script-glob loop). When the
+    script is missing or the platform shell isn't available, this is a
+    no-op and returns ``{}``.
+
+    Soft-fail: any subprocess failure is captured into the returned
+    dict (``{"ok": false, "stderr": ...}``); we never raise out so the
+    rest of the install completes.
+
+    Returns:
+        Empty dict when no script was run.
+        ``{"ok": True, "script": <abs>, "stdout": <str>, "stderr": <str>}``
+        on success. ``ok: False`` on failure (still soft).
+    """
+    import subprocess
+    import sys as _sys
+
+    scripts_dir = folder / ".claude" / "scripts"
+    if not scripts_dir.exists():
+        return {}
+
+    is_windows = _sys.platform.startswith("win") or _sys.platform == "cygwin"
+    if is_windows:
+        candidate = scripts_dir / "rl_client_setup.ps1"
+        if not candidate.exists():
+            return {}
+        cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(candidate)]
+    else:
+        candidate = scripts_dir / "rl_client_setup.sh"
+        if not candidate.exists():
+            return {}
+        cmd = ["bash", str(candidate)]
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(folder),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+        return {"ok": False, "script": str(candidate), "error": str(exc)}
+
+    return {
+        "ok": proc.returncode == 0,
+        "script": str(candidate),
+        "returncode": proc.returncode,
+        "stdout": (proc.stdout or "").strip()[:500],
+        "stderr": (proc.stderr or "").strip()[:500],
+    }
+
+
 def _emit_migrate_required_deferral(
     folder: Path,
     *,
@@ -4530,6 +4587,26 @@ def install_project_bundle(
              f"project-level templates failed: {err}",
              data={"error": err})
         result["warnings"].append(f"project-level templates failed: {err}")
+
+    # RL client per-project setup (Stream 1, v0.2.20). Creates the local
+    # data directories used by the rl_client logger so the free-tier
+    # retrieval data collection has somewhere to write. Soft-fail: the
+    # rest of install must succeed even if this script is missing or
+    # errors out (it's a convenience step, not a hard install gate).
+    if not dry_run:
+        try:
+            _rl_setup_result = _run_rl_client_setup(folder)
+            if _rl_setup_result:
+                result.setdefault("rl_client_setup", _rl_setup_result)
+                _log("4.bundle.rl_client_setup", "ok",
+                     f"rl_client_setup ran: {_rl_setup_result.get('script', '?')}",
+                     data=_rl_setup_result)
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            _log("4.bundle.rl_client_setup", "warn",
+                 f"rl_client_setup failed (non-fatal): {err}",
+                 data={"error": err})
+            result["warnings"].append(f"rl_client_setup failed: {err}")
 
     # Manifest write (always after a successful pass — even dry-run skips).
     if not dry_run:
