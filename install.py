@@ -4849,11 +4849,15 @@ _APP_STATE_KEY_DEFAULT_CODE_EMBED = "default_code_embedding"
 # Canonical OpenAI ID used by Wave A (with `openai-` prefix). MUST match:
 #   launcher/src-tauri/src/commands/openai_cmd.rs::OPENAI_DEFAULT_TEXT_MODEL_ID
 #   launcher/src-tauri/src/commands/embedding_catalog.rs (`id` field)
-# The Python catalog discovery (`EmbeddingService.discover_text_models`)
-# emits the raw `text-embedding-3-small` without the prefix; the GUI
-# layer maps between the two. We write the prefixed form here because
-# that's what `openai_cmd.rs::register_openai_api_key` also writes for
-# consistency in the column.
+# As of the Commit 12 prefix-unification fix (v0.2.18),
+# `EmbeddingService.discover_text_models` / `discover_code_models` ALSO
+# emit the prefixed form for OpenAI models (via
+# `vco_lib.embedding_service._to_openai_catalog_id`), so the catalog
+# entry's `id` field round-trips byte-for-byte with what we write here
+# and what `openai_cmd.rs::register_openai_api_key` writes. The HTTP
+# call boundary (OpenAIAdapter.embed) strips the prefix back off via
+# `_to_openai_api_model` because OpenAI's `/v1/embeddings` rejects the
+# prefixed form with HTTP 400.
 _OPENAI_PREFIXED_TEXT_MODEL_ID = "openai-text-embedding-3-small"
 
 

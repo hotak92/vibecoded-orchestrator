@@ -54,11 +54,14 @@ from vco_lib.embedding_service import (
     DEFAULT_CODE_MODEL,
     DEFAULT_TEXT_MODEL,
     DEFAULT_TEXT_SLOT,
+    OPENAI_MODEL_ID_PREFIX,
     EmbeddingService,
     ModelChoice,
     NoEmbeddingBackendError,
     _resolve_code_slot,
     _resolve_text_slot,
+    _to_openai_api_model,
+    _to_openai_catalog_id,
     main as embedding_service_main,
 )
 
@@ -1393,6 +1396,339 @@ class DiscoveryTests(unittest.TestCase):
             )
         backends_with_avail = {c.backend for c in choices if c.available_now}
         self.assertEqual(backends_with_avail, {"codeembed", "ollama", "openai"})
+
+
+# ---------------------------------------------------------------------------
+# OpenAI catalog-id ↔ API-model-name prefix translation
+#
+# Regression coverage for the v0.2.18 Commit-12 fix: the GUI dropdown's
+# source of truth for an OpenAI model id is the PREFIXED form
+# (`"openai-text-embedding-3-small"`) so it round-trips with what
+# `openai_cmd.rs::register_openai_api_key` and
+# `install.py::_preset_to_default_models` write to
+# `app_state.default_text_embedding`. The OpenAI HTTP API rejects that
+# prefixed form with HTTP 400, so every HTTP-call boundary inside
+# EmbeddingService strips the prefix back off before sending.
+# ---------------------------------------------------------------------------
+
+
+class OpenAICatalogIdPrefixTests(unittest.TestCase):
+    """The prefix-translation helpers must be idempotent and total."""
+
+    def test_to_catalog_id_adds_prefix_when_missing(self):
+        self.assertEqual(
+            _to_openai_catalog_id("text-embedding-3-small"),
+            "openai-text-embedding-3-small",
+        )
+
+    def test_to_catalog_id_is_idempotent_when_prefix_present(self):
+        self.assertEqual(
+            _to_openai_catalog_id("openai-text-embedding-3-small"),
+            "openai-text-embedding-3-small",
+        )
+
+    def test_to_api_model_strips_prefix(self):
+        self.assertEqual(
+            _to_openai_api_model("openai-text-embedding-3-small"),
+            "text-embedding-3-small",
+        )
+
+    def test_to_api_model_is_idempotent_when_prefix_absent(self):
+        # Back-compat: existing env-driven installs carrying the raw form
+        # in EMBEDDING_MODEL / OPENAI_EMBEDDING_MODEL must continue to
+        # work — passing the raw form through must be a no-op.
+        self.assertEqual(
+            _to_openai_api_model("text-embedding-3-small"),
+            "text-embedding-3-small",
+        )
+
+    def test_round_trip_catalog_id_to_api_model(self):
+        for raw in KNOWN_OPENAI_EMBEDDING_MODELS:
+            catalog = _to_openai_catalog_id(raw)
+            self.assertTrue(catalog.startswith(OPENAI_MODEL_ID_PREFIX))
+            self.assertEqual(_to_openai_api_model(catalog), raw)
+
+
+class DiscoverEmitsPrefixedOpenAIIdTests(unittest.TestCase):
+    """discover_text_models / discover_code_models must emit the prefixed
+    form for OpenAI entries so `app_state.default_text_embedding` and the
+    catalog choice's ``id`` field compare equal byte-for-byte (the GUI
+    dropdown's pre-select logic uses exact string equality).
+    """
+
+    def _ollama_unreachable_session(self) -> "FakeSession":
+        # Default 404 for everything → Ollama unreachable placeholder.
+        # We don't script the OpenAI validation endpoint; the absent
+        # script makes validate() return ``valid=False`` which is fine
+        # for the "is the id prefixed?" check (we don't assert on
+        # available_now here).
+        return FakeSession()
+
+    def test_discover_text_emits_prefixed_id_when_key_set(self):
+        session = self._ollama_unreachable_session()
+        # Validate succeeds for all known OpenAI models so we exercise
+        # the available_now=True branch too.
+        for raw_id in KNOWN_OPENAI_EMBEDDING_MODELS:
+            session.script(
+                "GET", f"https://api.openai.com/v1/models/{raw_id}",
+                FakeResponse(200, {"id": raw_id}),
+            )
+        with _EnvIsolation():
+            choices = EmbeddingService.discover_text_models(
+                ollama_url="http://localhost:11435",
+                openai_api_key="sk-test",
+                session=session,
+            )
+        openai_choices = [c for c in choices if c.backend == "openai"]
+        self.assertEqual(len(openai_choices), len(KNOWN_OPENAI_EMBEDDING_MODELS))
+        for c in openai_choices:
+            self.assertTrue(
+                c.id.startswith(OPENAI_MODEL_ID_PREFIX),
+                f"OpenAI text catalog id missing prefix: {c.id!r}",
+            )
+            # The stripped form must be one of the raw OpenAI model names
+            # we know about — sanity-check the round-trip.
+            self.assertIn(_to_openai_api_model(c.id), KNOWN_OPENAI_EMBEDDING_MODELS)
+            # Slot wiring still uses the canonical openai_text_embed slot.
+            self.assertEqual(c.slot, "openai_text_embed")
+
+    def test_discover_text_emits_prefixed_id_when_key_unset(self):
+        # No key → entries are still emitted but available_now=False.
+        # The prefix MUST be applied either way so the GUI dropdown
+        # shows the right id even for greyed-out rows.
+        session = self._ollama_unreachable_session()
+        with _EnvIsolation():
+            choices = EmbeddingService.discover_text_models(
+                ollama_url="http://localhost:11435",
+                openai_api_key="",
+                session=session,
+            )
+        openai_choices = [c for c in choices if c.backend == "openai"]
+        self.assertEqual(len(openai_choices), len(KNOWN_OPENAI_EMBEDDING_MODELS))
+        for c in openai_choices:
+            self.assertFalse(c.available_now)
+            self.assertTrue(
+                c.id.startswith(OPENAI_MODEL_ID_PREFIX),
+                f"OpenAI text catalog id missing prefix: {c.id!r}",
+            )
+
+    def test_discover_code_emits_prefixed_openai_id(self):
+        session = self._ollama_unreachable_session()
+        for raw_id in KNOWN_OPENAI_EMBEDDING_MODELS:
+            session.script(
+                "GET", f"https://api.openai.com/v1/models/{raw_id}",
+                FakeResponse(200, {"id": raw_id}),
+            )
+        with _EnvIsolation():
+            choices = EmbeddingService.discover_code_models(
+                ollama_url="http://localhost:11435",
+                code_embed_url="http://localhost:11440",
+                openai_api_key="sk-test",
+                session=session,
+            )
+        openai_choices = [c for c in choices if c.backend == "openai"]
+        self.assertEqual(len(openai_choices), len(KNOWN_OPENAI_EMBEDDING_MODELS))
+        for c in openai_choices:
+            self.assertTrue(
+                c.id.startswith(OPENAI_MODEL_ID_PREFIX),
+                f"OpenAI code catalog id missing prefix: {c.id!r}",
+            )
+        # The two text-embedding-3 variants ARE wired through to the
+        # canonical openai_code_embed slot; ada-002 isn't in the CODE
+        # slot map (forward-compat-only, OpenAI has no code-specific
+        # model today) so it falls through to ollama_code_embed and the
+        # GUI labels it accordingly. Both behaviours are intentional.
+        modern_openai = [
+            c for c in openai_choices
+            if _to_openai_api_model(c.id) in {
+                "text-embedding-3-small", "text-embedding-3-large",
+            }
+        ]
+        self.assertEqual(len(modern_openai), 2)
+        for c in modern_openai:
+            self.assertEqual(c.slot, "openai_code_embed")
+
+    def test_validate_probe_uses_raw_api_name(self):
+        """When discovery probes OpenAI, the HTTP URL must use the raw
+        model name (no prefix) — OpenAI's API doesn't know about our
+        catalog-id naming convention.
+        """
+        session = self._ollama_unreachable_session()
+        for raw_id in KNOWN_OPENAI_EMBEDDING_MODELS:
+            session.script(
+                "GET", f"https://api.openai.com/v1/models/{raw_id}",
+                FakeResponse(200, {"id": raw_id}),
+            )
+        with _EnvIsolation():
+            EmbeddingService.discover_text_models(
+                ollama_url="http://localhost:11435",
+                openai_api_key="sk-test",
+                session=session,
+            )
+        # FakeSession records every GET it answered as (method, url, kwargs).
+        # The OpenAI URLs in the recorded calls must use the RAW form,
+        # never the prefixed.
+        openai_calls = [
+            call for call in session.calls
+            if call[1].startswith("https://api.openai.com/v1/models/")
+        ]
+        self.assertGreater(len(openai_calls), 0, "no OpenAI validation probe was issued")
+        for method, url, _kwargs in openai_calls:
+            model_in_url = url.rsplit("/", 1)[-1]
+            self.assertFalse(
+                model_in_url.startswith(OPENAI_MODEL_ID_PREFIX),
+                f"OpenAI HTTP probe used the prefixed form: {url!r}",
+            )
+            self.assertIn(model_in_url, KNOWN_OPENAI_EMBEDDING_MODELS)
+
+
+class OpenAIHttpBoundaryStripsPrefixTests(unittest.TestCase):
+    """If the active text/code model id was loaded from env / app_state
+    in its catalog-id form (``"openai-text-embedding-3-small"``), the
+    HTTP-call boundary inside EmbeddingService MUST strip the prefix
+    before invoking ``OpenAIAdapter.embed`` — otherwise the OpenAI API
+    returns HTTP 400 (the prefixed name is not a real OpenAI model id).
+    """
+
+    def _build_openai_service(
+        self,
+        text_model_id: str,
+        code_model_id: str = "openai-text-embedding-3-small",
+    ) -> tuple[EmbeddingService, FakeSession]:
+        session = FakeSession()
+        # Validation probe for both model variants (raw form only —
+        # because the strip MUST happen before the HTTP call).
+        for raw in ("text-embedding-3-small", "text-embedding-3-large"):
+            session.script(
+                "GET", f"https://api.openai.com/v1/models/{raw}",
+                FakeResponse(200, {"id": raw}),
+            )
+            # Embed endpoint returns a stub vector for either model.
+            session.script(
+                "POST", "https://api.openai.com/v1/embeddings",
+                FakeResponse(200, {
+                    "data": [{"index": 0, "embedding": [0.0] * 8}],
+                    "model": raw,
+                    "usage": {"prompt_tokens": 1, "total_tokens": 1},
+                }),
+            )
+        svc = EmbeddingService(
+            project_root=None,
+            ollama_url="http://localhost:11435",
+            code_embed_url="http://localhost:11440",
+            text_model_id=text_model_id,
+            code_model_id=code_model_id,
+            openai_api_key="sk-test",
+            session=session,
+        )
+        return svc, session
+
+    def test_active_text_path_strips_prefix(self):
+        """``_embed_text_via_active`` must call OpenAI with the raw name
+        even when ``text_model_id`` carries the catalog-id prefix.
+        """
+        svc, session = self._build_openai_service(
+            text_model_id="openai-text-embedding-3-small",
+        )
+        try:
+            self.assertEqual(svc.text_vector_slot, "openai_text_embed")
+            _ = svc.embed_text("hello")
+        finally:
+            svc.close()
+        # The POST to /v1/embeddings must carry the raw model name.
+        # FakeSession stores calls as (method, url, kwargs); body lives
+        # in kwargs["json"].
+        embed_calls = [
+            call for call in session.calls
+            if call[0] == "POST" and call[1] == "https://api.openai.com/v1/embeddings"
+        ]
+        self.assertEqual(len(embed_calls), 1)
+        body = embed_calls[0][2]["json"]
+        self.assertEqual(body["model"], "text-embedding-3-small")
+
+    def test_active_code_path_strips_prefix(self):
+        """``_embed_code_via_active`` must apply the same strip when the
+        ACTIVE code backend is OpenAI.
+        """
+        svc, session = self._build_openai_service(
+            text_model_id="openai-text-embedding-3-small",
+            code_model_id="openai-text-embedding-3-large",
+        )
+        try:
+            self.assertEqual(svc.code_vector_slot, "openai_code_embed")
+            _ = svc.embed_code("def f(): pass")
+        finally:
+            svc.close()
+        embed_calls = [
+            call for call in session.calls
+            if call[0] == "POST" and call[1] == "https://api.openai.com/v1/embeddings"
+        ]
+        # One call for the code embed; the model in the body must be raw.
+        # FakeSession stores call body in kwargs["json"].
+        code_call = next(
+            (c for c in embed_calls
+             if c[2]["json"].get("input") == ["def f(): pass"]),
+            None,
+        )
+        self.assertIsNotNone(code_call, "code embed POST was not issued")
+        self.assertEqual(code_call[2]["json"]["model"], "text-embedding-3-large")
+
+    def test_embed_text_all_configured_strips_prefix_for_openai_fallback(self):
+        """When the active backend is Ollama (not OpenAI) but the user
+        has set ``OPENAI_EMBEDDING_MODEL`` to the prefixed catalog id by
+        mistake (or copy-pasted from the GUI), the OpenAI-fallback path
+        in ``embed_text_all_configured`` must still strip before calling.
+        """
+        # Build an Ollama-active service so embed_text_all_configured
+        # exercises the OpenAI fallback branch.
+        session = FakeSession()
+        # Ollama active text backend
+        session.script(
+            "GET", "http://localhost:11435/api/tags",
+            _ollama_tags_response(["qwen3-embedding:0.6b"]),
+        )
+        session.script(
+            "POST", "http://localhost:11435/api/embed",
+            FakeResponse(200, {"embeddings": [[0.0] * 1024]}),
+        )
+        # OpenAI fallback
+        session.script(
+            "GET", "https://api.openai.com/v1/models/text-embedding-3-small",
+            FakeResponse(200, {"id": "text-embedding-3-small"}),
+        )
+        session.script(
+            "POST", "https://api.openai.com/v1/embeddings",
+            FakeResponse(200, {
+                "data": [{"index": 0, "embedding": [0.0] * 1536}],
+                "model": "text-embedding-3-small",
+                "usage": {"prompt_tokens": 1, "total_tokens": 1},
+            }),
+        )
+        with _EnvIsolation():
+            # Simulate user error: put the prefixed catalog id in env.
+            os.environ["OPENAI_EMBEDDING_MODEL"] = "openai-text-embedding-3-small"
+            svc = EmbeddingService(
+                project_root=None,
+                ollama_url="http://localhost:11435",
+                code_embed_url="http://localhost:11440",
+                text_model_id="qwen3-embedding:0.6b",
+                code_model_id="codesage-large-v2",
+                openai_api_key="sk-test",
+                session=session,
+            )
+            try:
+                result = svc.embed_text_all_configured("hello")
+            finally:
+                svc.close()
+        self.assertIn("openai_text_embed", result)
+        # The OpenAI HTTP call must have used the raw form despite the
+        # prefixed env value.
+        post_calls = [
+            c for c in session.calls
+            if c[0] == "POST" and c[1] == "https://api.openai.com/v1/embeddings"
+        ]
+        self.assertEqual(len(post_calls), 1)
+        self.assertEqual(post_calls[0][2]["json"]["model"], "text-embedding-3-small")
 
 
 # ---------------------------------------------------------------------------

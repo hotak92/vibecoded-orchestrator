@@ -186,6 +186,73 @@ def _resolve_code_slot(model_id: str) -> tuple[str, int]:
 
 
 # ---------------------------------------------------------------------------
+# OpenAI catalog-id ↔ API-model-name translation
+# ---------------------------------------------------------------------------
+#
+# The GUI dropdown's source-of-truth identifier for an OpenAI model is the
+# *prefixed* form (``"openai-text-embedding-3-small"``) — matches what
+# `openai_cmd.rs::register_openai_api_key` writes to
+# ``app_state.default_text_embedding`` and what install.py's
+# ``_preset_to_default_models`` writes for the OpenAI preset. The pre-select
+# logic in `KgCodegraphTab.svelte` compares ``app_state`` values to the
+# catalog entry's ``id`` field by exact string equality; emitting the raw
+# (un-prefixed) form here breaks that comparison silently.
+#
+# The OpenAI HTTP API, on the other hand, requires the RAW model name
+# (``"text-embedding-3-small"``); passing the prefixed form to
+# ``POST /v1/embeddings`` returns HTTP 400. So we translate at exactly two
+# boundaries:
+#
+#   1. *Emission* — discover_text_models / discover_code_models pass the
+#      raw model name from KNOWN_OPENAI_EMBEDDING_MODELS through
+#      ``_to_openai_catalog_id`` before writing it to ``ModelChoice.id``.
+#   2. *API call* — when something carrying a catalog id reaches the HTTP
+#      layer (only happens in app_state-driven paths today, but the helper
+#      is here for future call sites), ``_to_openai_api_model`` strips the
+#      prefix back off.
+#
+# The raw form is also accepted as input to both helpers (idempotent) so
+# legacy env-driven configs (``EMBEDDING_MODEL=text-embedding-3-small``)
+# continue to round-trip cleanly without back-compat breaks.
+OPENAI_MODEL_ID_PREFIX = "openai-"
+
+
+def _to_openai_catalog_id(raw_model_name: str) -> str:
+    """Convert an OpenAI raw model name to the GUI catalog id.
+
+    Adds the ``openai-`` prefix unless one is already present. Idempotent.
+
+    >>> _to_openai_catalog_id("text-embedding-3-small")
+    'openai-text-embedding-3-small'
+    >>> _to_openai_catalog_id("openai-text-embedding-3-small")
+    'openai-text-embedding-3-small'
+    """
+    if raw_model_name.startswith(OPENAI_MODEL_ID_PREFIX):
+        return raw_model_name
+    return f"{OPENAI_MODEL_ID_PREFIX}{raw_model_name}"
+
+
+def _to_openai_api_model(catalog_id: str) -> str:
+    """Convert a GUI catalog id to the raw OpenAI API model name.
+
+    Strips the ``openai-`` prefix if present. Idempotent for already-raw
+    input — passes ``"text-embedding-3-small"`` through unchanged.
+
+    Use this at any HTTP-call boundary where the input might be a
+    catalog id (e.g. read from ``app_state.default_text_embedding``)
+    rather than a raw env-driven model name.
+
+    >>> _to_openai_api_model("openai-text-embedding-3-small")
+    'text-embedding-3-small'
+    >>> _to_openai_api_model("text-embedding-3-small")
+    'text-embedding-3-small'
+    """
+    if catalog_id.startswith(OPENAI_MODEL_ID_PREFIX):
+        return catalog_id[len(OPENAI_MODEL_ID_PREFIX):]
+    return catalog_id
+
+
+# ---------------------------------------------------------------------------
 # Public dataclasses
 # ---------------------------------------------------------------------------
 
@@ -925,8 +992,17 @@ class EmbeddingService:
         if "openai" not in self._text_slot and self.openai_api_key:
             if self.openai.validate().valid:
                 try:
-                    openai_model = os.environ.get(
-                        "OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"
+                    # OPENAI_EMBEDDING_MODEL canonically holds the raw API
+                    # name (back-compat with env-driven installs), but a
+                    # user copy-pasting a catalog id from the GUI will land
+                    # the prefixed form here — strip defensively so the
+                    # HTTP call always sees the raw name OpenAI's API
+                    # expects (passing "openai-text-embedding-3-small" to
+                    # /v1/embeddings returns HTTP 400).
+                    openai_model = _to_openai_api_model(
+                        os.environ.get(
+                            "OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"
+                        )
                     )
                     result["openai_text_embed"] = self.openai.embed(
                         openai_model, text
@@ -952,12 +1028,14 @@ class EmbeddingService:
                 result["codesage_embed"] = self.codeembed.embed(code)
             except Exception as exc:
                 logger.warning("CodeEmbed fallback embedding failed: %s", exc)
-        # OpenAI
+        # OpenAI — same prefix-strip defense as embed_text_all_configured
         if "openai" not in self._code_slot and self.openai_api_key:
             if self.openai.validate().valid:
                 try:
-                    openai_model = os.environ.get(
-                        "OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"
+                    openai_model = _to_openai_api_model(
+                        os.environ.get(
+                            "OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"
+                        )
                     )
                     result["openai_code_embed"] = self.openai.embed(
                         openai_model, code
@@ -969,19 +1047,31 @@ class EmbeddingService:
     # ---- internal dispatch -------------------------------------------
 
     def _embed_text_via_active(self, text: str) -> list[float]:
-        """Route a single text embed to the configured backend."""
+        """Route a single text embed to the configured backend.
+
+        For the OpenAI backend, ``text_model_id`` may have been populated
+        from a launcher-managed env file that carries the catalog id form
+        (``"openai-text-embedding-3-small"``); strip the prefix at the
+        HTTP-call boundary because OpenAI's API rejects the prefixed form
+        with HTTP 400.
+        """
         if "openai" in self._text_slot:
-            return self.openai.embed(self.text_model_id, text)
+            return self.openai.embed(
+                _to_openai_api_model(self.text_model_id), text
+            )
         return self.ollama.embed(self.text_model_id, text)
 
     def _embed_code_via_active(self, code: str) -> list[float]:
         """Route a single code embed to the configured backend.
 
         For codesage_embed / jina_embed slots, prefer the FastAPI service
-        when reachable; fall back to Ollama otherwise.
+        when reachable; fall back to Ollama otherwise. OpenAI path applies
+        the same catalog-id-prefix strip as ``_embed_text_via_active``.
         """
         if "openai" in self._code_slot:
-            return self.openai.embed(self.code_model_id, code)
+            return self.openai.embed(
+                _to_openai_api_model(self.code_model_id), code
+            )
         if self._code_slot in ("codesage_embed", "jina_embed"):
             if self.codeembed.is_reachable():
                 return self.codeembed.embed(code)
@@ -1122,18 +1212,28 @@ class EmbeddingService:
             )
 
         # OpenAI side.
+        #
+        # Catalog id translation: the dict keys in KNOWN_OPENAI_EMBEDDING_MODELS
+        # are the RAW OpenAI API model names (the form the HTTP API expects).
+        # We probe the API with the raw form but emit the catalog id in the
+        # PREFIXED form so it matches what `openai_cmd.rs`,
+        # `install.py::_preset_to_default_models`, and the GUI dropdown all
+        # write/expect for `app_state.default_text_embedding`. See
+        # `_to_openai_catalog_id` for the boundary rationale.
         if openai_api_key:
             oa = OpenAIAdapter(openai_api_key, session=session)
             valid_for_small = oa.validate("text-embedding-3-small")
-            for model_id, dim in KNOWN_OPENAI_EMBEDDING_MODELS.items():
-                slot, _ = _resolve_text_slot(model_id)
+            for raw_model_id, dim in KNOWN_OPENAI_EMBEDDING_MODELS.items():
+                catalog_id = _to_openai_catalog_id(raw_model_id)
+                slot, _ = _resolve_text_slot(raw_model_id)
                 # Probe each known model individually so the user can
-                # see which ones their key can access.
-                v = oa.validate(model_id)
+                # see which ones their key can access. Probe uses the RAW
+                # name (the only form the HTTP API understands).
+                v = oa.validate(raw_model_id)
                 choices.append(
                     ModelChoice(
-                        id=model_id,
-                        label=f"{model_id} ({dim}d, OpenAI)",
+                        id=catalog_id,
+                        label=f"{raw_model_id} ({dim}d, OpenAI)",
                         dim=dim,
                         slot=slot,
                         backend="openai",
@@ -1142,12 +1242,13 @@ class EmbeddingService:
                     )
                 )
         else:
-            for model_id, dim in KNOWN_OPENAI_EMBEDDING_MODELS.items():
-                slot, _ = _resolve_text_slot(model_id)
+            for raw_model_id, dim in KNOWN_OPENAI_EMBEDDING_MODELS.items():
+                catalog_id = _to_openai_catalog_id(raw_model_id)
+                slot, _ = _resolve_text_slot(raw_model_id)
                 choices.append(
                     ModelChoice(
-                        id=model_id,
-                        label=f"{model_id} ({dim}d, OpenAI)",
+                        id=catalog_id,
+                        label=f"{raw_model_id} ({dim}d, OpenAI)",
                         dim=dim,
                         slot=slot,
                         backend="openai",
@@ -1225,16 +1326,21 @@ class EmbeddingService:
                     )
                 )
 
-        # OpenAI (text-embedding-3-small / -large as code embed too)
+        # OpenAI (text-embedding-3-small / -large as code embed too).
+        # Catalog id translation: see the equivalent block in
+        # `_discover_text_choices` for the rationale — the dict keys are
+        # raw API names, the catalog id emits the prefixed form so it
+        # round-trips with `app_state.default_code_embedding`.
         if openai_api_key:
             oa = OpenAIAdapter(openai_api_key, session=session)
-            for model_id, dim in KNOWN_OPENAI_EMBEDDING_MODELS.items():
-                slot, _ = _resolve_code_slot(model_id)
-                v = oa.validate(model_id)
+            for raw_model_id, dim in KNOWN_OPENAI_EMBEDDING_MODELS.items():
+                catalog_id = _to_openai_catalog_id(raw_model_id)
+                slot, _ = _resolve_code_slot(raw_model_id)
+                v = oa.validate(raw_model_id)
                 choices.append(
                     ModelChoice(
-                        id=model_id,
-                        label=f"{model_id} ({dim}d, OpenAI as code)",
+                        id=catalog_id,
+                        label=f"{raw_model_id} ({dim}d, OpenAI as code)",
                         dim=dim,
                         slot=slot,
                         backend="openai",
@@ -1243,12 +1349,13 @@ class EmbeddingService:
                     )
                 )
         else:
-            for model_id, dim in KNOWN_OPENAI_EMBEDDING_MODELS.items():
-                slot, _ = _resolve_code_slot(model_id)
+            for raw_model_id, dim in KNOWN_OPENAI_EMBEDDING_MODELS.items():
+                catalog_id = _to_openai_catalog_id(raw_model_id)
+                slot, _ = _resolve_code_slot(raw_model_id)
                 choices.append(
                     ModelChoice(
-                        id=model_id,
-                        label=f"{model_id} ({dim}d, OpenAI as code)",
+                        id=catalog_id,
+                        label=f"{raw_model_id} ({dim}d, OpenAI as code)",
                         dim=dim,
                         slot=slot,
                         backend="openai",
