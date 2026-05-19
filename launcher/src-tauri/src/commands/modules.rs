@@ -578,8 +578,20 @@ pub async fn install_module_for_project(
         }),
     )?;
 
-    // 6. Run install engine
-    match installer_engine::run_install(&app, &manifest, &ctx, &project_id).await {
+    // 6. Run install engine.
+    //
+    // v0.2.20: probe the persisted hardware snapshot for the current
+    // GpuMode so container_pull can pick a per-variant image tag (when
+    // the manifest declares `runtime.gpu_image_variants`). Falls back
+    // to `Cpu` when no snapshot exists yet — safe default; user can
+    // redetect-hardware later and reinstall to switch variants.
+    let gpu_mode = crate::commands::installer::read_persisted_hardware_snapshot(db.inner())
+        .ok()
+        .flatten()
+        .map(|snap| snap.gpu_mode_decided)
+        .unwrap_or(crate::commands::gpu_policy::GpuMode::Cpu);
+
+    match installer_engine::run_install(&app, &manifest, &ctx, &project_id, gpu_mode).await {
         Ok(resolved_dir) => {
             db.set_module_status(&project_id, &module_id, ModuleStatus::Installed, None)?;
             db.audit(

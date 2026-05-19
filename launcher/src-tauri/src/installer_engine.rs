@@ -48,11 +48,20 @@ pub struct InstallProgress {
 /// Returns the resolved install directory path on success. On failure,
 /// leaves the partially-installed directory in place (caller can inspect
 /// or delete it) and returns the error.
+///
+/// `gpu_mode` is consulted ONLY when `manifest.install.method ==
+/// ContainerPull` AND `manifest.runtime.gpu_image_variants` is `Some`.
+/// In that case the resolved image tag is `{version}-{cpu|cuda|rocm}`
+/// (or whatever the manifest declares) instead of the bare `{version}`
+/// the legacy single-tag path produces. Pass `GpuMode::Cpu` when the
+/// caller hasn't probed hardware yet — the dispatch will fall back to
+/// the cpu variant, which is always safe to pull.
 pub async fn run_install(
     app: &AppHandle,
     manifest: &ModuleManifest,
     ctx: &PlaceholderCtx,
     project_id: &str,
+    gpu_mode: crate::commands::gpu_policy::GpuMode,
 ) -> Result<PathBuf, String> {
     let install_dir = ctx.resolve_install_dir(&manifest.install.install_dir);
     let allowed_root = ctx.vct_modules.clone();
@@ -102,7 +111,8 @@ pub async fn run_install(
                 .as_ref()
                 .ok_or("install.method=container_pull requires install.container block")?;
 
-            let tag = if container.tag_from_version {
+            // Base tag from manifest (version or explicit ref).
+            let base_tag = if container.tag_from_version {
                 manifest.version.clone()
             } else {
                 manifest
@@ -111,6 +121,13 @@ pub async fn run_install(
                     .clone()
                     .unwrap_or_else(|| "latest".to_string())
             };
+
+            // v0.2.20: per-GPU-mode image variant dispatch. When the
+            // manifest's `runtime.gpu_image_variants` block is present,
+            // the host's `decide_gpu_mode` answer picks the variant tag
+            // (e.g. "0.1.0-cuda"). Otherwise we fall back to the legacy
+            // single-tag flow (just the version, no suffix).
+            let tag = resolve_variant_tag(manifest, &base_tag, gpu_mode);
 
             container_pull(container, &tag, &manifest.id).await?;
 
@@ -527,4 +544,119 @@ fn emit_progress(
     };
     // Emit via Tauri's event system; swallow errors (UI-only signal).
     let _ = app.emit("module://install-progress", payload);
+}
+
+/// v0.2.20: pick the OCI image tag based on the host's GPU mode.
+///
+/// When the manifest declares `runtime.gpu_image_variants`, each
+/// `GpuMode` maps to a tag suffix:
+///
+/// | GpuMode | Variant tag used |
+/// |---------|------------------|
+/// | Cuda    | `gpu_image_variants.cuda` |
+/// | Rocm    | `gpu_image_variants.rocm` |
+/// | Cpu     | `gpu_image_variants.cpu`  |
+/// | Metal   | `gpu_image_variants.cpu` (no Metal torch wheels today) |
+///
+/// When `gpu_image_variants` is absent (legacy modules + non-container
+/// runtimes), returns `base_tag` unchanged — preserves single-tag
+/// behavior for modules that only ship one image.
+pub(crate) fn resolve_variant_tag(
+    manifest: &ModuleManifest,
+    base_tag: &str,
+    gpu_mode: crate::commands::gpu_policy::GpuMode,
+) -> String {
+    use crate::commands::gpu_policy::GpuMode;
+    let variants = match manifest.runtime.gpu_image_variants.as_ref() {
+        Some(v) => v,
+        None => return base_tag.to_string(),
+    };
+    match gpu_mode {
+        GpuMode::Cuda => variants.cuda.clone(),
+        GpuMode::Rocm => variants.rocm.clone(),
+        GpuMode::Cpu | GpuMode::Metal => variants.cpu.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::gpu_policy::GpuMode;
+    use crate::manifest::GpuImageVariants;
+
+    fn manifest_with_variants(variants: Option<GpuImageVariants>) -> ModuleManifest {
+        let mut m: ModuleManifest = serde_json::from_str(
+            r#"{
+              "schema_version": "1",
+              "id": "vct-test",
+              "name": "Test",
+              "version": "0.1.0",
+              "description": "Test module",
+              "category": "paid-independent",
+              "license": { "required": true, "min_orchestrator_tier": "pro" },
+              "compatibility": { "hosts": ["base"] },
+              "install": { "method": "container_pull",
+                "container": {
+                  "image": "ghcr.io/test/img",
+                  "tag_from_version": true,
+                  "pull_token_endpoint": "https://example.test/token"
+                } },
+              "runtime": { "type": "container", "command": "python" }
+            }"#,
+        )
+        .expect("test fixture parses");
+        m.runtime.gpu_image_variants = variants;
+        m
+    }
+
+    #[test]
+    fn variant_tag_picks_cuda_when_mode_is_cuda() {
+        let m = manifest_with_variants(Some(GpuImageVariants {
+            cpu: "0.1.0-cpu".into(),
+            cuda: "0.1.0-cuda".into(),
+            rocm: "0.1.0-rocm".into(),
+        }));
+        assert_eq!(resolve_variant_tag(&m, "0.1.0", GpuMode::Cuda), "0.1.0-cuda");
+    }
+
+    #[test]
+    fn variant_tag_picks_rocm_when_mode_is_rocm() {
+        let m = manifest_with_variants(Some(GpuImageVariants {
+            cpu: "0.1.0-cpu".into(),
+            cuda: "0.1.0-cuda".into(),
+            rocm: "0.1.0-rocm".into(),
+        }));
+        assert_eq!(resolve_variant_tag(&m, "0.1.0", GpuMode::Rocm), "0.1.0-rocm");
+    }
+
+    #[test]
+    fn variant_tag_picks_cpu_when_mode_is_cpu() {
+        let m = manifest_with_variants(Some(GpuImageVariants {
+            cpu: "0.1.0-cpu".into(),
+            cuda: "0.1.0-cuda".into(),
+            rocm: "0.1.0-rocm".into(),
+        }));
+        assert_eq!(resolve_variant_tag(&m, "0.1.0", GpuMode::Cpu), "0.1.0-cpu");
+    }
+
+    /// Metal falls through to CPU — no Metal-specific torch wheels today
+    /// (apple-silicon owners get CPU inference; the torch CPU wheel
+    /// actually uses Accelerate framework under the hood).
+    #[test]
+    fn variant_tag_picks_cpu_when_mode_is_metal() {
+        let m = manifest_with_variants(Some(GpuImageVariants {
+            cpu: "0.1.0-cpu".into(),
+            cuda: "0.1.0-cuda".into(),
+            rocm: "0.1.0-rocm".into(),
+        }));
+        assert_eq!(resolve_variant_tag(&m, "0.1.0", GpuMode::Metal), "0.1.0-cpu");
+    }
+
+    /// Manifests without gpu_image_variants — legacy single-tag flow.
+    #[test]
+    fn variant_tag_falls_through_when_no_variants_declared() {
+        let m = manifest_with_variants(None);
+        assert_eq!(resolve_variant_tag(&m, "0.1.0", GpuMode::Cuda), "0.1.0");
+        assert_eq!(resolve_variant_tag(&m, "0.1.0", GpuMode::Cpu), "0.1.0");
+    }
 }
