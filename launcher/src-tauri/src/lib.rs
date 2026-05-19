@@ -746,6 +746,15 @@ pub fn run() {
             commands::module_gui::get_module_nav_items,
             commands::module_gui::get_module_setting,
             commands::module_gui::set_module_setting,
+            // Stream 2 follow-up (v0.2.20, 2026-05-19): orchestrator-core
+            // config-tab actions. Backs the controls declared in the
+            // repo-root `vct-module.json::gui.config_tab` block.
+            commands::orchestrator_core::kg_rebuild_current_project,
+            commands::orchestrator_core::kg_check_duplicates,
+            commands::orchestrator_core::code_graph_reanalyze_current,
+            commands::orchestrator_core::code_graph_prune_stale,
+            commands::orchestrator_core::orchestrator_health_check,
+            commands::orchestrator_core::orchestrator_open_logs,
             // RL Reranker per-project settings (Stream 2 / 2026-05-19).
             // Backs the schema-rendered controls declared in
             // paid-modules/vct-rl-reranker/vct-module.json's

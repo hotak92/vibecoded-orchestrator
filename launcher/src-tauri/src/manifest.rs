@@ -1057,4 +1057,98 @@ mod tests {
         assert!(has_multi_select, "manifest must declare a multi_select");
         assert!(has_info, "section 1 must include at least one info banner");
     }
+
+    /// Stream 2 follow-up (v0.2.20, 2026-05-19): the orchestrator-core
+    /// `vct-module.json` (repo root) is itself a `gui.config_tab`-bearing
+    /// manifest. This test confirms it deserializes through the SAME
+    /// `ModuleManifest::from_json` path that `commands::module_gui::
+    /// get_module_nav_items` uses — proving the schema generalizes to
+    /// the always-installed core, not just paid modules.
+    ///
+    /// Pinned assertions:
+    ///   * title == "Orchestrator core" (load-bearing — the Sidebar
+    ///     surfaces this as the nav label)
+    ///   * 3 sections (KG / Code Graph / Diagnostics)
+    ///   * at least one button declares a `confirm` prompt (rebuild
+    ///     and reanalyze both prompt — losing those would let a single
+    ///     misclick run a 30s job)
+    ///   * the orchestrator's slim historical fields (components,
+    ///     bundled_secrets) coexist with the full ModuleManifest fields
+    ///     without conflict (serde is permissive on unknown fields)
+    #[test]
+    fn orchestrator_core_manifest_with_gui_tab_deserializes() {
+        // Walk up from src-tauri/ to repo root, same pattern as the
+        // vct_rl_reranker test above. The orchestrator's manifest is
+        // load-bearing on every install so an unconditional
+        // `panic!("missing")` is safe — it can't go missing in CI
+        // without a much bigger problem.
+        let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("walk to repo root")
+            .to_path_buf();
+        let path = repo_root.join("vct-module.json");
+        assert!(
+            path.exists(),
+            "orchestrator-core manifest must exist at {} \
+             (repo invariant — every install ships it)",
+            path.display()
+        );
+
+        let body = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
+        let manifest: ModuleManifest = ModuleManifest::from_json(&body)
+            .unwrap_or_else(|e| panic!("deserialize {}: {}", path.display(), e));
+
+        assert_eq!(manifest.id, "orchestrator", "id pinned");
+        assert_eq!(
+            manifest.category,
+            ModuleCategory::Core,
+            "orchestrator core must declare category=core"
+        );
+
+        let gui = manifest.gui.expect(
+            "orchestrator-core manifest must have a gui block — Stream 2 follow-up \
+             added it to validate schema generalization beyond paid modules",
+        );
+        let tab = gui.config_tab.expect("must have config_tab");
+
+        assert_eq!(tab.title, "Orchestrator core", "title pinned (Sidebar nav label)");
+        assert_eq!(tab.icon.as_deref(), Some("box"), "icon pinned");
+        assert_eq!(tab.sections.len(), 3, "expected 3 sections (KG / Code Graph / Diagnostics)");
+
+        // Spot-check that at least one button has a confirm prompt.
+        let mut confirm_button_count = 0;
+        let mut total_button_count = 0;
+        let mut total_info_count = 0;
+        for section in &tab.sections {
+            for control in &section.controls {
+                match control {
+                    ConfigControl::Button { confirm: Some(_), .. } => {
+                        confirm_button_count += 1;
+                        total_button_count += 1;
+                    }
+                    ConfigControl::Button { confirm: None, .. } => {
+                        total_button_count += 1;
+                    }
+                    ConfigControl::Info { .. } => {
+                        total_info_count += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(
+            confirm_button_count >= 1,
+            "at least one button must carry a confirm prompt (rebuild/reanalyze are 30s ops)"
+        );
+        assert_eq!(
+            total_button_count, 6,
+            "expected 6 buttons across the tab (2 KG + 2 Code Graph + 2 Diagnostics)"
+        );
+        assert!(
+            total_info_count >= 3,
+            "expected at least 3 info banners (one per section header)"
+        );
+    }
 }

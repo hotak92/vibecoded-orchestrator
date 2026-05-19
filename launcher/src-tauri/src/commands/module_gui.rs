@@ -110,6 +110,17 @@ fn manifest_scan_paths() -> Vec<PathBuf> {
                 }
             }
         }
+        // Stream 2 follow-up (v0.2.20, 2026-05-19): the orchestrator core
+        // ships its own `gui.config_tab` in the repo-root manifest. The
+        // launcher binary is shipped INSIDE this clone, so the manifest
+        // lives at `<clone>/vct-module.json`. Discovery is the same
+        // walk-up that `commands::modules::find_orchestrator_manifest`
+        // does, but cached here as a single PathBuf push rather than a
+        // current_exe walk — `orchestrator_clone` was just resolved above.
+        let root_manifest = clone.join("vct-module.json");
+        if root_manifest.is_file() {
+            paths.push(root_manifest);
+        }
     }
 
     paths

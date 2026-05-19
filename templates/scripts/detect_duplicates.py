@@ -278,12 +278,21 @@ class DuplicateDetector:
 def main():
     """Main entry point"""
     import argparse
+    import json
+    import sys
 
     parser = argparse.ArgumentParser(description="Detect duplicate knowledge graph nodes")
     parser.add_argument("--threshold", type=float, default=DEFAULT_SIMILARITY_THRESHOLD,
                        help="Similarity threshold (0.0-1.0)")
     parser.add_argument("--output", type=str, default=".claude/logs/duplicates_report.md",
                        help="Output report file")
+    # v0.2.20 (Stream 2 follow-up, 2026-05-19): --json emits the duplicate
+    # pairs as a single JSON document on stdout INSTEAD of the markdown
+    # report. Used by the launcher's orchestrator_core::kg_check_duplicates
+    # Tauri command (parses pairs into a modal). Stays mutually-exclusive
+    # with the human-readable summary print to keep stdout machine-parsable.
+    parser.add_argument("--json", action="store_true",
+                       help="Emit duplicate pairs as JSON on stdout (machine-readable)")
 
     args = parser.parse_args()
 
@@ -291,6 +300,20 @@ def main():
 
     try:
         duplicates = detector.find_duplicates()
+
+        if args.json:
+            # Machine-readable mode: ONLY the JSON document on stdout.
+            # Threshold is echoed back so the caller can verify the run
+            # used the requested value (defense-in-depth for argument
+            # passing through bash wrappers).
+            payload = {
+                "threshold": args.threshold,
+                "count": len(duplicates),
+                "pairs": duplicates,
+            }
+            json.dump(payload, sys.stdout)
+            sys.stdout.write("\n")
+            return
 
         if duplicates:
             output_path = PROJECT_ROOT / args.output

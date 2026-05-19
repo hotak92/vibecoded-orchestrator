@@ -28,6 +28,11 @@ pub mod manifest;
 pub mod module_gui;
 pub mod modules;
 pub mod openai_cmd;
+// Stream 2 follow-up (v0.2.20 / 2026-05-19): Tauri-command backings for
+// the orchestrator-core `gui.config_tab` declared in `vct-module.json`.
+// Wraps `.claude/scripts/kg-sync`, `kg-duplicates`, and
+// `code-graph-analyze` plus a health-check / open-logs pair.
+pub mod orchestrator_core;
 pub mod orchestrator_root;
 pub mod project_identity;
 pub mod projects_v2;

@@ -1,16 +1,26 @@
 {
-  "_canonical_counts_2026_05_16": "Ground truth verified on 2026-05-16 against main HEAD post-v0.2.11 PR-14 + v0.2.12 PR-39. Bundled agents: 29 (templates/agents/free/*.md, all free). Skills: 28 (templates/skills/*/, each with SKILL.md). Hooks: 20 (templates/hooks/*.sh \u2014 rendered into .claude/hooks/ at install time per PR-39 v0.2.12; source-of-truth lives in templates/). MCP servers: 4 \u2014 3 Python-stack containerized (claude_mcp_servers/{weaviate_mcp,search_mcp,code_embedding_service}) plus 1 system-managed Playwright MCP (npx -y @playwright/mcp@latest, registered by install.py during first-install; opt out with VCT_SKIP_PLAYWRIGHT=1). v0.2.11 MCP simplification: dropped claude_mcp_servers/ollama_mcp/ entirely (chat/read_document/read_image redundant with Claude's native capabilities); narrowed search_mcp to only search_papers (web_search, search_code, fetch_page also redundant with native WebSearch/WebFetch). Ollama remains as embedding INFRASTRUCTURE (qwen3-embedding via container) consumed by weaviate_mcp + code_embedding_service. README + CHANGELOG + this file MUST stay in sync with these. Version tracking: this `version` field must be bumped alongside Cargo.toml + tauri.conf.json + package.json on every release (the release-bump checklist in CLAUDE.md lists all four).",
+  "_canonical_counts_2026_05_16": "Ground truth verified on 2026-05-16 against main HEAD post-v0.2.11 PR-14 + v0.2.12 PR-39. Bundled agents: 29 (templates/agents/free/*.md, all free). Skills: 28 (templates/skills/*/, each with SKILL.md). Hooks: 20 (templates/hooks/*.sh — rendered into .claude/hooks/ at install time per PR-39 v0.2.12; source-of-truth lives in templates/). MCP servers: 4 — 3 Python-stack containerized (claude_mcp_servers/{weaviate_mcp,search_mcp,code_embedding_service}) plus 1 system-managed Playwright MCP (npx -y @playwright/mcp@latest, registered by install.py during first-install; opt out with VCT_SKIP_PLAYWRIGHT=1). v0.2.11 MCP simplification: dropped claude_mcp_servers/ollama_mcp/ entirely (chat/read_document/read_image redundant with Claude's native capabilities); narrowed search_mcp to only search_papers (web_search, search_code, fetch_page also redundant with native WebSearch/WebFetch). Ollama remains as embedding INFRASTRUCTURE (qwen3-embedding via container) consumed by weaviate_mcp + code_embedding_service. README + CHANGELOG + this file MUST stay in sync with these. Version tracking: this `version` field must be bumped alongside Cargo.toml + tauri.conf.json + package.json on every release (the release-bump checklist in CLAUDE.md lists all four).",
   "schema_version": "1",
   "id": "orchestrator",
   "name": "VibeCoded Orchestrator",
   "version": "0.2.19",
   "description": "The core: 20 hooks, 29 bundled agents, 28 skills, KG + Code Graph, 4 MCP servers (3 containerized + Playwright via npx). Runs locally in Podman/Docker.",
+  "category": "core",
   "license": {
     "spdx": "AGPL-3.0-or-later",
     "tier": "free",
     "required": false,
     "variant_ids": [],
     "min_orchestrator_tier": "free"
+  },
+  "_install_runtime_doc": "v0.2.20 (Stream 2 follow-up, 2026-05-19): the orchestrator core is the install ROOT, not a module installed BY the launcher — the launcher is shipped INSIDE this clone. The install.method=local + runtime.type=cli entries below are technically correct but largely cosmetic: the launcher binary IS the runtime, and the install path IS the clone directory. They exist so this manifest validates against the same `ModuleManifest::from_json` parser that the schema-rendered Sidebar uses for `get_module_nav_items`, allowing the orchestrator core's `gui.config_tab` to be discovered through the same code path as any paid module. The slim `OrchestratorManifest` deserializer in `commands/modules.rs::read_orchestrator_manifest` continues to ignore these fields (serde is permissive by default; no `deny_unknown_fields`).",
+  "install": {
+    "method": "local",
+    "install_dir": "{VCT_ROOT}"
+  },
+  "runtime": {
+    "type": "cli",
+    "command": "vct-launcher"
   },
   "components": [
     {
@@ -26,7 +36,7 @@
       "description": "AST analysis via Tree-sitter for 10+ languages. Optional Joern integration for CFG/PDG."
     }
   ],
-  "_bundled_secrets_doc": "0.2.0 fork-readiness sweep (item H1, 2026-05-08): the orchestrator core declares the secrets the launcher itself manages (PAT for GitHub auth, etc.) so the hub's `/api/v1/projects/{id}/env` resolver can serve them to bundled wrappers without the user having to install a separate module first. Each entry maps a single keychain slot \u2014 the hub uses the SENTINEL_SHARED project_id for shared scope (so all base-host projects see the same value) and the OnboardingWizard's `register_github_pat` writes to the matching slot. 2026-05-10 (post-0.2.0 backlog #6): module_id changed from 'installer' to 'user' so the wizard's writer matches the SecretsPanel 'Shared (this user)' tab's UI_MODULE_BUCKET \u2014 registering via either path now lands at the same keychain row instead of two divergent ones. v0.2.18 (Commit 3, 2026-05-18): added `openai_api_key` (scope=shared, module_id=user) so the EmbeddingService can resolve it via the hub for every project. Registration happens via `register_openai_api_key` (OnboardingWizard's OpenAI step + Preferences \u2192 Special Secrets). Validation uses the free `GET /v1/models/text-embedding-3-small` endpoint \u2014 no token consumption, no billing entry.",
+  "_bundled_secrets_doc": "0.2.0 fork-readiness sweep (item H1, 2026-05-08): the orchestrator core declares the secrets the launcher itself manages (PAT for GitHub auth, etc.) so the hub's `/api/v1/projects/{id}/env` resolver can serve them to bundled wrappers without the user having to install a separate module first. Each entry maps a single keychain slot — the hub uses the SENTINEL_SHARED project_id for shared scope (so all base-host projects see the same value) and the OnboardingWizard's `register_github_pat` writes to the matching slot. 2026-05-10 (post-0.2.0 backlog #6): module_id changed from 'installer' to 'user' so the wizard's writer matches the SecretsPanel 'Shared (this user)' tab's UI_MODULE_BUCKET — registering via either path now lands at the same keychain row instead of two divergent ones. v0.2.18 (Commit 3, 2026-05-18): added `openai_api_key` (scope=shared, module_id=user) so the EmbeddingService can resolve it via the hub for every project. Registration happens via `register_openai_api_key` (OnboardingWizard's OpenAI step + Preferences → Special Secrets). Validation uses the free `GET /v1/models/text-embedding-3-small` endpoint — no token consumption, no billing entry.",
   "bundled_secrets": [
     {
       "key": "github_pat",
@@ -38,7 +48,107 @@
       "key": "openai_api_key",
       "scope": "shared",
       "module_id": "user",
-      "description": "OpenAI API key for the EmbeddingService. Set via OnboardingWizard OR Preferences \u2192 Special Secrets. Resolved by hub for every project; consumed by vco_lib/embedding_service.py when ACTIVE_EMBEDDING=openai or as multi-slot fallback."
+      "description": "OpenAI API key for the EmbeddingService. Set via OnboardingWizard OR Preferences → Special Secrets. Resolved by hub for every project; consumed by vco_lib/embedding_service.py when ACTIVE_EMBEDDING=openai or as multi-slot fallback."
     }
-  ]
+  ],
+  "_gui_doc": "v0.2.20 (Stream 2 follow-up, 2026-05-19): the orchestrator core uses the same `gui.config_tab` schema as paid modules — validates that the schema generalizes beyond paid surfaces. The Tauri commands referenced in `action`/`on_change` fields live in `launcher/src-tauri/src/commands/orchestrator_core.rs`. Tooltip strings are user-facing (non-tech audience); keep them mouseover-actionable, not vague.",
+  "gui": {
+    "config_tab": {
+      "title": "Orchestrator core",
+      "icon": "box",
+      "description": "Manage the always-installed KG + Code Graph services. For project-specific assignments use the Identity tab.",
+      "sections": [
+        {
+          "title": "Knowledge Graph",
+          "collapsible": false,
+          "controls": [
+            {
+              "kind": "info",
+              "id": "kg_intro",
+              "text": "Per-project KG and shared KG. Stored in Weaviate. Auto-synced on file edits via hooks.",
+              "variant": "info"
+            },
+            {
+              "kind": "button",
+              "id": "kg_rebuild_current_project",
+              "label": "Rebuild this project's KG",
+              "tooltip": "Re-syncs all `knowledge/*.md` files in the currently-selected project into Weaviate. Use when KG search results look stale or files were edited outside Claude Code. ~10s per 100 nodes.",
+              "action": "kg_rebuild_current_project",
+              "confirm": "Rebuild the KG for the currently-selected project? Existing nodes are upserted (not destructive)."
+            },
+            {
+              "kind": "button",
+              "id": "kg_check_duplicates",
+              "label": "Check for duplicate KG nodes",
+              "tooltip": "Runs a near-duplicate scan across the current project's KG (cosine ≥0.95). Surfaces them in a modal so you can merge/delete by hand.",
+              "action": "kg_check_duplicates"
+            },
+            {
+              "kind": "info",
+              "id": "kg_tier_note",
+              "text": "Tip: KG search results carry a `score` (0..1) and a `tier` (`summary`/`single_chunk`/`three_chunks`/`full`) based on relevance. Tunable via `KG_TIER_*` env vars in Preferences.",
+              "variant": "info"
+            }
+          ]
+        },
+        {
+          "title": "Code Graph",
+          "collapsible": true,
+          "initially_collapsed": false,
+          "controls": [
+            {
+              "kind": "info",
+              "id": "codegraph_intro",
+              "text": "AST-based code entity index (modules, classes, functions, APIs, cross-service interactions). Powers `search_code_graph` MCP.",
+              "variant": "info"
+            },
+            {
+              "kind": "button",
+              "id": "code_graph_reanalyze_current",
+              "label": "Re-analyze this project's code",
+              "tooltip": "Walks the project's source tree and rebuilds the code graph. Use when files were renamed/deleted outside Claude Code, or when adding a new language analyzer. ~30s per 1k LOC. Incremental: only re-analyzes changed files.",
+              "action": "code_graph_reanalyze_current",
+              "confirm": "Re-analyze the currently-selected project's code? Stale entities for deleted files are pruned."
+            },
+            {
+              "kind": "button",
+              "id": "code_graph_prune_stale",
+              "label": "Prune stale code-graph entries",
+              "tooltip": "Deletes code-graph nodes for files that no longer exist on disk. Useful after large refactors. Non-destructive: re-running `--analyze` recreates them if the files come back.",
+              "action": "code_graph_prune_stale",
+              "variant": "secondary"
+            }
+          ]
+        },
+        {
+          "title": "Diagnostics",
+          "collapsible": true,
+          "initially_collapsed": true,
+          "controls": [
+            {
+              "kind": "info",
+              "id": "diag_intro",
+              "text": "Service health, KG/CodeGraph collection sizes, embedding-backend status.",
+              "variant": "info"
+            },
+            {
+              "kind": "button",
+              "id": "orchestrator_health_check",
+              "label": "Run health check",
+              "tooltip": "Probes Weaviate, Ollama, the code-embedding service, and verifies every project's KG/CodeGraph collections exist. Outputs a per-service status modal. ~3s.",
+              "action": "orchestrator_health_check"
+            },
+            {
+              "kind": "button",
+              "id": "orchestrator_open_logs",
+              "label": "Open log directory",
+              "tooltip": "Reveals `~/.claude/logs/` in your file manager. Useful for grepping recent hook activity or KG-sync runs.",
+              "action": "orchestrator_open_logs",
+              "variant": "secondary"
+            }
+          ]
+        }
+      ]
+    }
+  }
 }
