@@ -730,38 +730,95 @@ pub async fn check_for_updates(path: String) -> Result<UpdateStatus, String> {
     //    that as "no git signal available" so the install_stale/
     //    binary_stale signals still work on non-checkout installs
     //    (file-mirror, release-zip, etc.).
+    //
+    //    v0.2.21 (Stream A Design B extension): fetch from the canonical
+    //    public AGPL upstream via the `vco_upstream` remote, NOT from
+    //    `origin`. Private forks (VCO_dev, customer mirrors) have
+    //    `origin` pointing at the fork; pre-fix the GUI's "Update
+    //    orchestrator" banner silently never lit up because `origin`
+    //    didn't advance. `ensure_upstream_remote` is idempotent — it
+    //    auto-creates / corrects the remote on every call.
     if p.join(".git").exists() {
-        let fetch = tokio::process::Command::new("git")
-            .args(["fetch", "--quiet"])
-            .current_dir(&p)
-            .output()
-            .await
-            .map_err(|e| format!("git fetch failed: {}", e))?;
-
-        if !fetch.status.success() {
-            // git fetch failed — likely offline or no remote. Don't
-            // hard-fail the whole status check; just leave remote_ahead
-            // at its default (false). The other signals still work.
+        // Pin the upstream remote BEFORE any network ops. Soft-fail: on
+        // error (e.g. corrupt .git/config) leave remote_ahead at false
+        // and let the install_stale / binary_stale signals carry the
+        // banner, matching the pre-existing soft-fail posture for the
+        // fetch step below.
+        if let Err(e) = crate::commands::self_update::ensure_upstream_remote(&p).await {
             eprintln!(
-                "[vct] check_for_updates: git fetch failed at {}, skipping remote check",
-                p.display()
+                "[vct] check_for_updates: ensure_upstream_remote failed at {} ({}), skipping remote check",
+                p.display(),
+                e
             );
         } else {
-            let status = tokio::process::Command::new("git")
-                .args(["status", "-uno", "--porcelain=v2", "--branch"])
+            let fetch = tokio::process::Command::new("git")
+                .args([
+                    "fetch",
+                    "--quiet",
+                    crate::commands::self_update::VCO_UPSTREAM_REMOTE,
+                ])
                 .current_dir(&p)
                 .output()
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| format!("git fetch failed: {}", e))?;
 
-            let output = String::from_utf8_lossy(&status.stdout);
-            // Look for "# branch.ab +N -M" where M > 0 means behind.
-            for line in output.lines() {
-                if line.starts_with("# branch.ab") {
-                    if let Some(behind) = line.split_whitespace().last() {
-                        if let Ok(n) = behind.trim_start_matches('-').parse::<i32>() {
-                            remote_ahead = n > 0;
-                        }
+            if !fetch.status.success() {
+                // git fetch failed — likely offline or no network. Don't
+                // hard-fail the whole status check; just leave remote_ahead
+                // at its default (false). The other signals still work.
+                eprintln!(
+                    "[vct] check_for_updates: git fetch failed at {}, skipping remote check",
+                    p.display()
+                );
+            } else {
+                // Detect the current branch so we know which upstream ref
+                // to compare against. Default to `main` on any error —
+                // matches the convention everywhere else in self_update.rs.
+                let branch_output = tokio::process::Command::new("git")
+                    .args(["rev-parse", "--abbrev-ref", "HEAD"])
+                    .current_dir(&p)
+                    .output()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let branch = if branch_output.status.success() {
+                    let b = String::from_utf8_lossy(&branch_output.stdout)
+                        .trim()
+                        .to_string();
+                    if b.is_empty() || b == "HEAD" {
+                        "main".to_string()
+                    } else {
+                        b
+                    }
+                } else {
+                    "main".to_string()
+                };
+
+                // Count commits we're behind the upstream branch. Replaces
+                // the pre-v0.2.21 `git status --branch.ab` parse which
+                // only worked when tracking was configured against
+                // `origin/<branch>` — that conventional tracking config
+                // is exactly the foot-gun Design B is removing.
+                let revlist = tokio::process::Command::new("git")
+                    .args([
+                        "rev-list",
+                        "--count",
+                        &format!(
+                            "HEAD..{}/{}",
+                            crate::commands::self_update::VCO_UPSTREAM_REMOTE,
+                            branch
+                        ),
+                    ])
+                    .current_dir(&p)
+                    .output()
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                if revlist.status.success() {
+                    let raw = String::from_utf8_lossy(&revlist.stdout)
+                        .trim()
+                        .to_string();
+                    if let Ok(n) = raw.parse::<u32>() {
+                        remote_ahead = n > 0;
                     }
                 }
             }
@@ -2643,6 +2700,16 @@ pub async fn update_orchestrator<R: Runtime>(
         return Err("Not a git repository — cannot update".to_string());
     }
 
+    // v0.2.21 (Stream A Design B extension): pin the canonical public
+    // AGPL upstream BEFORE any network ops. Same posture as the launcher
+    // self-update (see commands/self_update.rs): we never trust `origin`
+    // for upstream tracking because forks reset it to the fork URL.
+    // Hard-fail here — if we can't even configure the remote, the pull
+    // below would silently fall back to `origin` and pull the wrong
+    // commits. Better to surface the error to the GUI and let the user
+    // retry (or override via `VCO_UPSTREAM_URL` for self-hosters).
+    crate::commands::self_update::ensure_upstream_remote(&install_path).await?;
+
     // v0.2.17 (plan 0.0.B): Stage 0 — Windows-only pre-pull rename.
     // No-op on Linux/macOS (returns None).
     emit_progress(&window, "update", "Preparing for update...", 5.0);
@@ -2651,8 +2718,36 @@ pub async fn update_orchestrator<R: Runtime>(
     // Stage 1: Pull latest
     emit_progress(&window, "update", "Pulling latest changes...", 10.0);
 
+    // Detect the current branch so the explicit `git pull <remote>
+    // <branch>` invocation below doesn't depend on upstream tracking
+    // config (which would point at `origin/<branch>` on a fork). Default
+    // to `main` on any error — matches the convention in self_update.rs.
+    let pull_branch_output = tokio::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(&install_path)
+        .output()
+        .await
+        .map_err(|e| format!("git rev-parse failed: {}", e))?;
+    let pull_branch = if pull_branch_output.status.success() {
+        let b = String::from_utf8_lossy(&pull_branch_output.stdout)
+            .trim()
+            .to_string();
+        if b.is_empty() || b == "HEAD" {
+            "main".to_string()
+        } else {
+            b
+        }
+    } else {
+        "main".to_string()
+    };
+
     let pull = tokio::process::Command::new("git")
-        .args(["pull", "--ff-only"])
+        .args([
+            "pull",
+            "--ff-only",
+            crate::commands::self_update::VCO_UPSTREAM_REMOTE,
+            &pull_branch,
+        ])
         .current_dir(&install_path)
         .output()
         .await

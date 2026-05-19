@@ -46,6 +46,111 @@ pub const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 /// so the daily task doesn't pile up.
 const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 
+// ---------------------------------------------------------------------------
+// Canonical upstream remote (Design B, 2026-05-19)
+// ---------------------------------------------------------------------------
+//
+// The launcher self-updates from the PUBLIC AGPL upstream regardless of which
+// fork the local `origin` remote points at. This matters because the
+// orchestrator ships into private forks (VCO_dev, customer mirrors, etc.)
+// where `origin` is the private fork — without this pinning, self-update
+// would either fail (private fork lacks the public release tags) or worse,
+// pull private commits into a public install.
+//
+// Implementation: maintain a dedicated remote called `vco_upstream` whose
+// URL is always resolved from `default_upstream_url()`. The hardcoded
+// default points at the canonical public repo; users with enterprise
+// self-hosted mirrors can set `VCO_UPSTREAM_URL` to override it.
+//
+// `ensure_upstream_remote` runs at the START of every update flow (check,
+// apply, force-resync). It's idempotent and cheap — three git invocations
+// in the steady-state case (get-url → match → done).
+
+/// Canonical public AGPL upstream. The launcher self-updates from this URL
+/// regardless of what `origin` points at on the local machine.
+const VCO_UPSTREAM_URL: &str = "https://github.com/hotak92/vibecoded-orchestrator.git";
+
+/// The internal name the launcher uses for the canonical upstream remote.
+/// Kept distinct from `origin` so user-managed remotes are never disturbed.
+///
+/// `pub(crate)` because `commands::installer` reuses the same remote name
+/// for its `check_for_updates` / `update_orchestrator` flows (Design B
+/// also covers the orchestrator self-update path, not just the launcher).
+pub(crate) const VCO_UPSTREAM_REMOTE: &str = "vco_upstream";
+
+/// Environment variable that, if set, overrides `VCO_UPSTREAM_URL` at
+/// runtime. Intended for enterprise self-hosters who mirror the public
+/// repo to an internal git server (e.g. `https://git.example.com/mirrors/vco.git`).
+/// Must look like a URL (`http://`, `https://`, or `git@`); otherwise we
+/// fall back to the hardcoded default to avoid configuring a broken remote.
+const VCO_UPSTREAM_URL_ENV: &str = "VCO_UPSTREAM_URL";
+
+/// Resolve the upstream URL the launcher should pull from. Priority:
+/// 1. `$VCO_UPSTREAM_URL` if set, non-empty, and looks like a URL.
+/// 2. Hardcoded `VCO_UPSTREAM_URL` (the public AGPL repo).
+fn default_upstream_url() -> String {
+    if let Ok(val) = std::env::var(VCO_UPSTREAM_URL_ENV) {
+        let trimmed = val.trim();
+        if !trimmed.is_empty() && looks_like_remote_url(trimmed) {
+            return trimmed.to_string();
+        }
+    }
+    VCO_UPSTREAM_URL.to_string()
+}
+
+/// Cheap shape check: a remote URL git can fetch from starts with
+/// `http://`, `https://`, or `git@` (SSH form). We don't try to parse the
+/// full URL — that's git's job, and false positives here just mean the
+/// remote add fails loudly later instead of silently pointing somewhere
+/// useless.
+fn looks_like_remote_url(s: &str) -> bool {
+    s.starts_with("https://") || s.starts_with("http://") || s.starts_with("git@")
+}
+
+/// Ensure the canonical upstream remote exists and points at the right URL.
+/// Idempotent: re-running is cheap (one `git remote get-url`) when the
+/// remote is already correct.
+///
+/// Behaviour:
+/// - Remote absent → `git remote add vco_upstream <url>`.
+/// - Remote present with the right URL → no-op.
+/// - Remote present with the wrong URL → `git remote set-url vco_upstream <url>`.
+///
+/// We deliberately do NOT touch `origin`. Users may have legitimate reasons
+/// for `origin` to point at a fork (their own contributions, a private
+/// mirror, etc.). The canonical upstream lives at `vco_upstream` so the two
+/// don't collide.
+///
+/// `pub(crate)` because `commands::installer` reuses this for the
+/// orchestrator self-update path (`check_for_updates` /
+/// `update_orchestrator`). Both surfaces share the same architectural
+/// invariant: the launcher pulls from the canonical public AGPL repo
+/// regardless of what `origin` points at locally.
+pub(crate) async fn ensure_upstream_remote(repo: &Path) -> Result<(), String> {
+    let want = default_upstream_url();
+
+    match run_git(repo, &["remote", "get-url", VCO_UPSTREAM_REMOTE]).await {
+        Ok(current) => {
+            if current.trim() == want {
+                return Ok(());
+            }
+            // Wrong URL — correct it. Force-set rather than remove+add so
+            // we don't briefly leave the remote in a missing state.
+            run_git(repo, &["remote", "set-url", VCO_UPSTREAM_REMOTE, &want])
+                .await
+                .map(|_| ())
+        }
+        Err(_) => {
+            // `get-url` fails when the remote doesn't exist. Treat any
+            // error as "absent" and try to add it — if there's a real
+            // problem (e.g. corrupt config) the add will surface it.
+            run_git(repo, &["remote", "add", VCO_UPSTREAM_REMOTE, &want])
+                .await
+                .map(|_| ())
+        }
+    }
+}
+
 /// Default-protected paths inside the launcher repo. NEVER overwritten by
 /// `apply_launcher_update`. The list is conservative: anything that
 /// represents *user state* (notes, logs, runtime DB, env files) goes here.
@@ -244,22 +349,31 @@ async fn current_sha(repo: &Path) -> Result<String, String> {
 }
 
 async fn ls_remote_sha(repo: &Path, branch: &str) -> Result<String, String> {
-    // `git ls-remote origin <branch>` returns `<sha>\trefs/heads/<branch>`.
-    let raw = run_git(repo, &["ls-remote", "origin", branch]).await?;
+    // `git ls-remote vco_upstream <branch>` returns `<sha>\trefs/heads/<branch>`.
+    // Caller MUST have run `ensure_upstream_remote` first.
+    let raw = run_git(repo, &["ls-remote", VCO_UPSTREAM_REMOTE, branch]).await?;
     raw.split_whitespace()
         .next()
         .map(|s| s.to_string())
         .ok_or_else(|| format!("ls-remote returned empty output for {}", branch))
 }
 
-async fn fetch_origin(repo: &Path) -> Result<(), String> {
-    run_git(repo, &["fetch", "--quiet", "origin"]).await.map(|_| ())
+/// Fetch the canonical upstream (NOT `origin`). Caller MUST have run
+/// `ensure_upstream_remote` first.
+async fn fetch_upstream(repo: &Path) -> Result<(), String> {
+    run_git(repo, &["fetch", "--quiet", VCO_UPSTREAM_REMOTE])
+        .await
+        .map(|_| ())
 }
 
 async fn count_commits_ahead(repo: &Path, branch: &str) -> Result<u32, String> {
     let raw = run_git(
         repo,
-        &["rev-list", "--count", &format!("HEAD..origin/{}", branch)],
+        &[
+            "rev-list",
+            "--count",
+            &format!("HEAD..{}/{}", VCO_UPSTREAM_REMOTE, branch),
+        ],
     )
     .await?;
     raw.parse::<u32>()
@@ -300,9 +414,17 @@ pub async fn check_for_launcher_update<R: Runtime>(
         Err(e) => return Ok(UpdateStatus::unavailable(&e, last_checked)),
     };
 
+    // Pin the canonical public AGPL upstream before any network ops. This
+    // is the crux of the Design B fix (2026-05-19): private forks have
+    // `origin` pointing at the fork, so we maintain a dedicated remote
+    // named `vco_upstream` that always points at the public repo.
+    if let Err(e) = ensure_upstream_remote(&repo).await {
+        return Ok(UpdateStatus::unavailable(&e, last_checked));
+    }
+
     // Fetch + ls-remote both bring back the remote SHA. Fetch is required
     // so `rev-list --count` works without doing a second network round-trip.
-    if let Err(e) = fetch_origin(&repo).await {
+    if let Err(e) = fetch_upstream(&repo).await {
         // Network unreachable / auth failure / etc. Surface as a soft
         // error — the UI still shows current SHA and last-known status.
         return Ok(UpdateStatus::unavailable(&e, last_checked));
@@ -366,6 +488,11 @@ pub async fn apply_launcher_update<R: Runtime>(app: AppHandle<R>) -> Result<(), 
 
     let repo = find_launcher_repo_root()?;
 
+    // Step 0: pin the canonical public upstream (Design B). Must happen
+    // BEFORE any fetch/diff/pull so we never accidentally pull from a
+    // private fork's `origin`.
+    ensure_upstream_remote(&repo).await?;
+
     // Step 1: clean-tree assertion. `git status --porcelain` lists every
     // path with an unstaged or staged change; we filter out untracked-in-
     // user-owned-dirs and only block on actual conflicts.
@@ -379,16 +506,22 @@ pub async fn apply_launcher_update<R: Runtime>(app: AppHandle<R>) -> Result<(), 
     }
 
     // Step 2: detect what changed BEFORE pulling so we can decide what
-    // to rebuild. We diff the current HEAD against origin/<branch>.
+    // to rebuild. We diff the current HEAD against vco_upstream/<branch>.
     let branch = current_branch(&repo)
         .await
         .unwrap_or_else(|_| "main".to_string());
+
+    // Fetch upstream so the local refs (vco_upstream/<branch>) are current
+    // for the diff and the subsequent pull. Without this, a fresh `vco_upstream`
+    // remote has no tracking refs yet and the diff returns empty.
+    fetch_upstream(&repo).await?;
+
     let pre_diff = run_git(
         &repo,
         &[
             "diff",
             "--name-only",
-            &format!("HEAD..origin/{}", branch),
+            &format!("HEAD..{}/{}", VCO_UPSTREAM_REMOTE, branch),
         ],
     )
     .await
@@ -396,11 +529,12 @@ pub async fn apply_launcher_update<R: Runtime>(app: AppHandle<R>) -> Result<(), 
     let needs_cargo = changed_paths_need_cargo(&pre_diff);
     let needs_npm = changed_paths_need_npm(&pre_diff);
 
-    // Step 3: ff-only pull. Conservative — never rewrites history, never
-    // creates merge commits. If we're on a diverged branch we surface a
-    // structured error the frontend recognizes as a non-FF event so it
-    // can render the resync modal instead of a raw error string.
-    if let Err(e) = run_git(&repo, &["pull", "--ff-only", "origin", &branch]).await {
+    // Step 3: ff-only pull from the canonical upstream. Conservative —
+    // never rewrites history, never creates merge commits. If we're on a
+    // diverged branch we surface a structured error the frontend recognizes
+    // as a non-FF event so it can render the resync modal instead of a raw
+    // error string.
+    if let Err(e) = run_git(&repo, &["pull", "--ff-only", VCO_UPSTREAM_REMOTE, &branch]).await {
         if is_non_fast_forward(&e) {
             // Best-effort: capture local + remote SHAs so the modal can
             // show users what their clone has vs. what upstream has.
@@ -445,17 +579,20 @@ pub async fn force_resync_launcher<R: Runtime>(app: AppHandle<R>) -> Result<(), 
         .await
         .unwrap_or_else(|_| "main".to_string());
 
-    // Fetch first so origin/<branch> is fresh.
-    fetch_origin(&repo).await?;
+    // Pin the canonical public upstream (Design B). Must precede the fetch.
+    ensure_upstream_remote(&repo).await?;
+
+    // Fetch first so vco_upstream/<branch> is fresh.
+    fetch_upstream(&repo).await?;
 
     // Diff BEFORE reset so we know which builds to run. After the reset
-    // HEAD == origin/<branch> and the diff would be empty.
+    // HEAD == vco_upstream/<branch> and the diff would be empty.
     let pre_diff = run_git(
         &repo,
         &[
             "diff",
             "--name-only",
-            &format!("HEAD..origin/{}", branch),
+            &format!("HEAD..{}/{}", VCO_UPSTREAM_REMOTE, branch),
         ],
     )
     .await
@@ -464,7 +601,15 @@ pub async fn force_resync_launcher<R: Runtime>(app: AppHandle<R>) -> Result<(), 
     let needs_npm = changed_paths_need_npm(&pre_diff);
 
     // Destructive step. After this point local divergent commits are gone.
-    run_git(&repo, &["reset", "--hard", &format!("origin/{}", branch)]).await?;
+    run_git(
+        &repo,
+        &[
+            "reset",
+            "--hard",
+            &format!("{}/{}", VCO_UPSTREAM_REMOTE, branch),
+        ],
+    )
+    .await?;
 
     finish_apply_after_pull(app, &repo, needs_cargo, needs_npm).await
 }
@@ -982,5 +1127,209 @@ mod tests {
         let back = load_state();
         assert_eq!(back.last_known_commit_count, Some(7));
         assert_eq!(back.auto_check_enabled, Some(false));
+    }
+
+    // ---------------------------------------------------------------------
+    // Design B (2026-05-19): canonical upstream remote pinning.
+    // ---------------------------------------------------------------------
+    //
+    // These tests use a real `git` binary against tempfile-backed repos.
+    // They're skipped (via `skip_if_no_git!`) when `git` isn't on PATH so
+    // CI environments without git don't false-fail. On dev machines and
+    // standard CI runners (Ubuntu/macOS/Windows GitHub Actions all ship
+    // git) they run for real.
+
+    use std::process::Command as StdCommand;
+    use std::sync::Mutex;
+
+    /// Tests that mutate `VCO_UPSTREAM_URL` must hold this mutex — `cargo
+    /// test` runs in-binary tests in parallel and the env var is process-
+    /// global. Without serialization the override tests race.
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    /// Skip a test if `git --version` doesn't succeed.
+    macro_rules! skip_if_no_git {
+        () => {
+            if StdCommand::new("git")
+                .arg("--version")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| !s.success())
+                .unwrap_or(true)
+            {
+                eprintln!("skipping: git not on PATH");
+                return;
+            }
+        };
+    }
+
+    /// Create an empty git repo in a fresh temp dir. Returns the TempDir
+    /// (held by the caller to keep it alive) plus the repo path.
+    fn init_repo() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().to_path_buf();
+        let status = StdCommand::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&repo)
+            .status()
+            .expect("git init");
+        assert!(status.success(), "git init failed");
+        (tmp, repo)
+    }
+
+    /// Helper to read a remote's URL synchronously (the production helper
+    /// is async; tests run inside a tokio runtime when they need that).
+    fn get_remote_url_sync(repo: &Path, name: &str) -> Option<String> {
+        let output = StdCommand::new("git")
+            .args(["remote", "get-url", name])
+            .current_dir(repo)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    #[tokio::test]
+    async fn ensure_upstream_remote_creates_when_absent() {
+        skip_if_no_git!();
+        // Hold the env mutex: these tests read `default_upstream_url()`
+        // which inspects VCO_UPSTREAM_URL. Without serialization an
+        // env-override test could mutate it mid-read.
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+
+        let (_tmp, repo) = init_repo();
+        assert!(get_remote_url_sync(&repo, VCO_UPSTREAM_REMOTE).is_none());
+
+        ensure_upstream_remote(&repo).await.expect("ensure ok");
+
+        let url = get_remote_url_sync(&repo, VCO_UPSTREAM_REMOTE).expect("remote exists");
+        assert_eq!(url, default_upstream_url());
+    }
+
+    #[tokio::test]
+    async fn ensure_upstream_remote_updates_when_url_mismatched() {
+        skip_if_no_git!();
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+
+        let (_tmp, repo) = init_repo();
+
+        // Pre-seed with a wrong URL.
+        let status = StdCommand::new("git")
+            .args([
+                "remote",
+                "add",
+                VCO_UPSTREAM_REMOTE,
+                "https://example.com/wrong.git",
+            ])
+            .current_dir(&repo)
+            .status()
+            .expect("git remote add");
+        assert!(status.success());
+
+        ensure_upstream_remote(&repo).await.expect("ensure ok");
+
+        let url = get_remote_url_sync(&repo, VCO_UPSTREAM_REMOTE).expect("remote exists");
+        assert_eq!(
+            url,
+            default_upstream_url(),
+            "wrong URL should be corrected"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_upstream_remote_noop_when_already_correct() {
+        skip_if_no_git!();
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+
+        let (_tmp, repo) = init_repo();
+
+        // Pre-seed with the correct URL.
+        let want = default_upstream_url();
+        let status = StdCommand::new("git")
+            .args(["remote", "add", VCO_UPSTREAM_REMOTE, &want])
+            .current_dir(&repo)
+            .status()
+            .expect("git remote add");
+        assert!(status.success());
+
+        // Capture config-file mtime BEFORE the ensure call. A true no-op
+        // path doesn't run `set-url` or `add`, so the .git/config file
+        // shouldn't be rewritten.
+        let cfg = repo.join(".git").join("config");
+        let mtime_before = std::fs::metadata(&cfg).unwrap().modified().unwrap();
+        // Sleep just enough that mtime granularity (1s on some FS) can
+        // detect a change if one happens.
+        std::thread::sleep(Duration::from_millis(1100));
+
+        ensure_upstream_remote(&repo).await.expect("ensure ok");
+
+        let mtime_after = std::fs::metadata(&cfg).unwrap().modified().unwrap();
+        assert_eq!(
+            mtime_before, mtime_after,
+            ".git/config mtime should not change on no-op"
+        );
+
+        let url = get_remote_url_sync(&repo, VCO_UPSTREAM_REMOTE).expect("remote exists");
+        assert_eq!(url, want);
+    }
+
+    #[test]
+    fn env_override_url_is_honored_when_set() {
+        // Hold the env mutex for the duration so sibling env-tests don't race.
+        // .unwrap_or_else handles a poisoned mutex from a prior panicked test.
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+
+        let prev = std::env::var(VCO_UPSTREAM_URL_ENV).ok();
+        std::env::set_var(VCO_UPSTREAM_URL_ENV, "https://git.example.com/mirror.git");
+
+        let url = default_upstream_url();
+        assert_eq!(url, "https://git.example.com/mirror.git");
+
+        // Restore.
+        match prev {
+            Some(v) => std::env::set_var(VCO_UPSTREAM_URL_ENV, v),
+            None => std::env::remove_var(VCO_UPSTREAM_URL_ENV),
+        }
+    }
+
+    #[test]
+    fn env_override_invalid_falls_back_to_default() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+
+        let prev = std::env::var(VCO_UPSTREAM_URL_ENV).ok();
+        std::env::set_var(VCO_UPSTREAM_URL_ENV, "garbage");
+
+        let url = default_upstream_url();
+        assert_eq!(
+            url, VCO_UPSTREAM_URL,
+            "bare 'garbage' should fall back to default"
+        );
+
+        // Also verify empty string falls back.
+        std::env::set_var(VCO_UPSTREAM_URL_ENV, "");
+        assert_eq!(default_upstream_url(), VCO_UPSTREAM_URL);
+
+        // And whitespace-only.
+        std::env::set_var(VCO_UPSTREAM_URL_ENV, "   ");
+        assert_eq!(default_upstream_url(), VCO_UPSTREAM_URL);
+
+        // Restore.
+        match prev {
+            Some(v) => std::env::set_var(VCO_UPSTREAM_URL_ENV, v),
+            None => std::env::remove_var(VCO_UPSTREAM_URL_ENV),
+        }
+    }
+
+    #[test]
+    fn looks_like_remote_url_accepts_common_forms() {
+        assert!(looks_like_remote_url("https://github.com/foo/bar.git"));
+        assert!(looks_like_remote_url("http://internal.example/mirror.git"));
+        assert!(looks_like_remote_url("git@github.com:foo/bar.git"));
+        assert!(!looks_like_remote_url("garbage"));
+        assert!(!looks_like_remote_url(""));
+        assert!(!looks_like_remote_url("ftp://old.example.com/repo"));
     }
 }
