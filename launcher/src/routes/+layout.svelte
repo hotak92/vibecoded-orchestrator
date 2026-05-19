@@ -34,6 +34,7 @@
   // code-graph prefix (= victim of the PR-7 hardcoded-name bug) AND
   // (c) the user hasn't dismissed it before. Hidden silently otherwise.
   import LegacyCollectionsModal from '$lib/components/LegacyCollectionsModal.svelte';
+  import WeightsUpdatePrompt from '$lib/components/WeightsUpdatePrompt.svelte';
   import Toast from '$lib/components/Toast.svelte';
   import { invoke } from '$lib/tauri';
   import { selectedProject, projects } from '$lib/stores/projects';
@@ -252,6 +253,7 @@
        (Linux + NVIDIA + stale CDI spec). Silent on macOS, Windows, or
        hosts without nvidia-smi. See gpu.rs for forensics. -->
   <CdiDriftModal />
+  <WeightsUpdatePrompt />
   <!-- Highest-priority gate: blocks the UI when the launcher binary is
        running from inside an install root that never had first-install
        executed. Self-bypasses in developer mode and once the user has
