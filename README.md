@@ -25,8 +25,8 @@ Three concrete pains everyone using Claude Code hits, and what VCO does about ea
 | Pain | What VCO does |
 |------|---------------|
 | Claude has no memory between sessions — you re-explain the project every time | A persistent **Knowledge Graph** (markdown nodes + Weaviate vector index) that hooks read on session start and inject into the context window |
-| Claude can't see your codebase structure — it greps blind, misses callers, re-reads the same files | A **Code Graph** built from Tree-sitter AST: modules, classes, functions, APIs, and cross-service calls, queryable by purpose ("find auth middleware") not just name |
-| You set up the same `.claude/` config and hooks in every new project | An installer that drops 23 automation hooks + 28 skills + 29 agents into `.claude/`, wires the MCP servers, and stays out of your way |
+| Claude can't see your codebase structure — it greps blind, misses callers, re-reads the same files | A **Code Graph** built from Tree-sitter AST across 10+ languages: modules, classes, functions, APIs, and cross-service calls, queryable by purpose ("find auth middleware") not just name |
+| You set up the same `.claude/` config and hooks in every new project | An installer that drops 20 automation hooks + 28 skills + 29 agents into `.claude/`, wires the 4 default MCP servers, and stays out of your way |
 
 You don't change how you use Claude Code. The orchestrator runs in the background through hooks. Open VS Code, talk to Claude, ship code.
 
@@ -61,11 +61,12 @@ If you don't use Claude Code: the KG, code graph, MCP servers, and launcher GUI 
 
 ## Features
 
-- **Knowledge Graph** — Obsidian-style markdown nodes with typed WikiLinks, indexed in Weaviate via qwen3 embeddings (1024-dim, local). Optional OpenAI embeddings.
-- **Code Graph** — Tree-sitter AST analysis across 10+ languages, populating `CodeModule`, `CodeClass`, `CodeFunction`, `CodeAPI`, `CodeInteraction` collections. Optional Joern integration for CFG/PDG metrics.
-- **23 automation hooks** — context injection on prompt submit, KG/code-graph auto-sync on file edit, credential scans, compaction-preserving context replay, security checks. Linux/macOS use `.sh`; Windows ships native `.ps1`.
-- **3 MCP servers (default install)** — Weaviate (semantic + graph search), search (academic-paper search via OpenAlex + arXiv), code-embedding (CodeSage-Large-v2 via FastAPI). All local; no per-tool API keys for the default tier. Two more MCP servers (Ollama local LLM + Playwright browser automation) are available as opt-in modules via the launcher Modules page. Ollama as backend infrastructure (Weaviate vectorizer + code-embed CPU fallback) is always present even without the Ollama MCP wrapper.
-- **29 agents + 28 skills** — shipped via `install.py` templates. Agents handle planning, coding, testing, doc maintenance, KG navigation, code-graph health. Skills cover security review, debugging, architecture, RAG advisory, accessibility, etc.
+- **Knowledge Graph** — Obsidian-style markdown nodes with typed WikiLinks, indexed in Weaviate via qwen3 embeddings (1024-dim, local) by default. Optional OpenAI `text-embedding-3-small` (1536-dim) — wire it via the OnboardingWizard's OpenAI step or Preferences → Special Secrets (v0.2.18+). Validation hits the free `/v1/models` endpoint, no billing entry.
+- **Code Graph** — Tree-sitter AST analysis across 10+ languages, populating `CodeModule`, `CodeClass`, `CodeFunction`, `CodeAPI`, `CodeInteraction` collections. Multi-language incremental prune since v0.2.18. Optional Joern integration for CFG/PDG metrics.
+- **20 automation hooks** — context injection on prompt submit, KG/code-graph auto-sync on file edit, credential scans, compaction-preserving context replay, hub-keepalive on session start (v0.2.21), security checks. Linux/macOS use `.sh`; Windows ships native `.ps1` (both shipped on every install since v0.2.14 — cross-OS workflows don't leave stale orphans).
+- **4 MCP servers (default install)** — Weaviate (semantic + graph search, code graph), search (academic-paper search via OpenAlex + arXiv — narrowed to `search_papers` only since v0.2.11), code-embedding (CodeSage-Large-v2 via FastAPI, with qwen3 / Jina fallback chain since v0.2.18), and Playwright (browser automation, registered via `npx @playwright/mcp@latest`; opt out with `VCT_SKIP_PLAYWRIGHT=1`). All local; no per-tool API keys for the default tier. The Ollama local-LLM MCP wrapper is **opt-in** via launcher → Modules → `vct-ollama` since v0.2.11 (Claude's native reasoning / `Read` / vision cover the same use cases at higher quality). Ollama itself still runs as backend infrastructure (Weaviate text vectorizer + code-embed CPU fallback) on every install.
+- **29 agents + 28 skills** — shipped via `install.py` templates (v0.2.19 added 7 role-specialist packs: Consulting CTO, Senior Designer/UX, Vendor/Sales+Marketing, Senior Scientist, Automation/AI Engineer, Solo SaaS Founder, Senior DevOps/SRE). Skills cover security review, debugging, architecture, RAG advisory, accessibility, etc.
+- **vct-hub (v0.2.21+)** — a detached `axum`-based HTTP coordinator on `localhost:7700`, auth via fresh-per-startup bearer token at `<vct_root>/hub.token` (mode `0o600`). Provides `/api/v1/projects/{id}/config` (KG collection / codegraph prefix / embedding model resolver) and `/api/v1/projects/{id}/env` (secrets resolver, e.g. shared `github_pat`, `openai_api_key`). Started on first install, by the `session-start-ensure-hub.sh` hook, and by the launcher; outlives the launcher GUI. CLI: `vct-hub --start-if-not-running` / `--status` / `--stop` / `--register-boot`.
 - **Workflow plumbing** — session state tracking (`CONTEXT_STATE.md`), plan files, memory management, pre-/post-compact context replay so a `/compact` doesn't lose your thread.
 
 ## How it works
@@ -191,12 +192,14 @@ No GUI yet? The CLI install path (above) covers all three OSes.
 
 ### Hardware
 
-| Setup                  | Text embeddings              | Code embeddings                   | Notes                              |
-|------------------------|------------------------------|-----------------------------------|------------------------------------|
-| NVIDIA GPU (4 GB+ VRAM) | qwen3-embedding via Ollama   | CodeSage-Large-v2 (GPU)           | Best quality                       |
-| CPU only               | qwen3-embedding via Ollama   | qwen3-embedding (fallback)        | Slower, still good quality         |
-| OpenAI API key         | text-embedding-3-small       | text-embedding-3-small            | Fast, requires API key             |
-| Apple Silicon          | qwen3-embedding (Metal)      | qwen3-embedding                   | Ollama uses Metal natively         |
+| Setup                   | Text embeddings              | Code embeddings                                | Notes                                                |
+|-------------------------|------------------------------|------------------------------------------------|------------------------------------------------------|
+| NVIDIA GPU (4 GB+ VRAM) | qwen3-embedding via Ollama   | CodeSage-Large-v2 (CUDA)                       | Minimum to enable the GPU embedders. With less than 8 GB on the default stack (embedders + 9B inference) install.py degrades to CPU; override via `--gpu-vram-threshold-gb`. |
+| NVIDIA GPU (8 GB+ VRAM) | qwen3-embedding via Ollama   | CodeSage-Large-v2 (CUDA)                       | Recommended for the full default stack. 16 GB+ unlocks the larger `qwen3.5:9b` KG-summary model. |
+| AMD GPU (ROCm)          | qwen3-embedding via Ollama   | CodeSage-Large-v2 (ROCm overlay)               | Same 8 GB recommendation. Added in v0.2.20 (`docker-compose.rocm.yml`); RX 6000-class default. |
+| CPU only                | qwen3-embedding via Ollama   | qwen3 → Jina fallback chain (v0.2.18+)         | Slower, still good quality. Embedding-failure surfaces on the SessionStart hook. |
+| OpenAI API key          | `text-embedding-3-small`     | `text-embedding-3-small`                       | Fast, requires API key. Set via OnboardingWizard or Preferences → Special Secrets (v0.2.18+). |
+| Apple Silicon           | qwen3-embedding (Metal)      | qwen3-embedding (Metal)                        | Ollama uses Metal natively                           |
 
 ## Install options & troubleshooting
 
@@ -211,20 +214,27 @@ Non-interactive / CI: `python install.py --quiet --no-joern --no-containers`
 ```
 vibecoded-orchestrator/
 ├── .claude/
-│   ├── hooks/                 # 23 automation hooks (.sh + .ps1 per hook)
+│   ├── hooks/                 # 20 automation hooks (.sh + .ps1 per hook, both shipped on every install)
 │   ├── scripts/               # CLI tools for KG and code graph
-│   └── settings.json          # Claude Code configuration
+│   └── settings.json          # Canonical Claude Code configuration (env propagates to MCP subprocesses)
 ├── claude_mcp_servers/
-│   ├── weaviate_mcp/          # Semantic + graph search (default)
-│   ├── search_mcp/            # Academic-paper search via OpenAlex + arXiv (default)
-│   └── code_embedding_service/ # CodeSage-Large-v2 via FastAPI (default)
+│   ├── weaviate_mcp/          # Semantic + graph search, code graph (default)
+│   ├── search_mcp/            # Academic-paper search via OpenAlex + arXiv (default; search_papers only since v0.2.11)
+│   ├── code_embedding_service/ # CodeSage-Large-v2 via FastAPI (default; qwen3 / Jina fallback chain v0.2.18+)
+│   └── rl_client/             # AGPL adapter for the vct-rl-reranker paid module (disabled mode when no key)
+│   # Default MCP also: Playwright via `npx -y @playwright/mcp@latest` (registered by install.py; opt-out VCT_SKIP_PLAYWRIGHT=1)
 │   # Opt-in MCPs (launcher → Modules): vct-ollama (local LLM/embeddings/vision)
 ├── templates/
 │   ├── agents/free/           # 29 bundled agents
-│   └── skills/                # 28 bundled skills
+│   ├── skills/                # 28 bundled skills
+│   └── hooks/                 # source-of-truth for hooks; rendered into .claude/hooks/ at install time
+├── launcher/
+│   ├── dist/<arch>/           # prebuilt vct-launcher (and vct-hub binary, v0.2.21+)
+│   └── src-tauri/             # Tauri 2 + Svelte 5 (runes) GUI source; Cargo workspace
 ├── infrastructure/
 │   ├── docker-compose.yml     # Weaviate + Ollama
-│   └── docker-compose.gpu.yml # NVIDIA overlay
+│   ├── docker-compose.gpu.yml # NVIDIA / CUDA overlay
+│   └── docker-compose.rocm.yml # AMD / ROCm overlay (v0.2.20+)
 ├── knowledge/                 # Knowledge graph nodes (your persistent memory)
 ├── docs/                      # Documentation
 └── CLAUDE.md                  # Instructions for Claude when opening this repo
@@ -236,8 +246,8 @@ The whole repository is AGPL-3.0. The codebase you see here is the Free tier —
 
 | Tier            | Price                | What you get                                                                                  |
 |-----------------|----------------------|-----------------------------------------------------------------------------------------------|
-| **Free**        | €0                   | Full orchestrator: KG, code graph, 23 hooks, 5 MCP servers, 29 agents, 28 skills. AGPL-3.0.   |
-| **Pro**         | €19/month            | Free + RL-scored retrieval reranking module + coordination layer (Telegram groups + shared decision/task channels). Modules ship as separate signed binaries via the launcher. Self-host the coordination DB at no extra cost, or use our hosted instance for a small additional fee. |
+| **Free**        | €0                   | Full orchestrator: KG, code graph, 20 hooks, 4 default MCP servers, 29 agents, 28 skills, vct-hub coordinator. AGPL-3.0. |
+| **Pro**         | €19/month            | Free + RL-scored retrieval reranking module (`vct-rl-reranker`, free-tier falls back to plain cosine ordering — nothing breaks) + coordination layer (Telegram groups + shared decision/task channels). Modules ship as separate signed binaries via the launcher with per-GPU-variant tags (CPU / CUDA / ROCm) since v0.2.20. Self-host the coordination DB at no extra cost, or use our hosted instance for a small additional fee. |
 | **Enterprise**  | Contact us           | Free + commercial AGPL exemption, priority support, custom SLAs. [team@vibecodedtools.com](mailto:team@vibecodedtools.com) |
 
 Pricing finalized at module launch. The Free tier is the whole repository — no source-level dual licensing, no feature gating in the OSS code. RL retrieval falls back to cosine ordering when the Pro module isn't installed.
@@ -258,7 +268,7 @@ These are used **exclusively** to refine the RL reranker. The training pipeline 
 
 Embeddings are aggregated, irreversible representations — we can't reconstruct the source text from the vectors we receive.
 
-**Toggle off anytime**: Settings → Telemetry → Disable, or `VCT_TELEMETRY=0` in `.env`. Disabling stops collection immediately; previously-collected data isn't deleted retroactively unless you email `privacy@vibecodedtools.it`.
+**Toggle off anytime**: Preferences → "Local data collection" (v0.2.20+) → Disable, or set `VCT_TELEMETRY=0` in `.env`. The same Preferences pane also exposes `RL_LOCAL_LOGGING_DISABLED` to opt out of the local-only `rl_events.jsonl` even when remote telemetry is off. Disabling stops collection immediately; previously-collected data isn't deleted retroactively unless you email `privacy@vibecodedtools.it`.
 
 ## Licensing
 

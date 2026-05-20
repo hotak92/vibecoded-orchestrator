@@ -7,8 +7,8 @@ Config layout follows one rule: **minimal global, maximum per-project**.
 - **Global `~/.claude/settings.json`**: user preferences only — effort level, output tokens, universal permission denies. No project paths, no MCP server URLs, no environment variables that any specific project depends on.
 - **Per-project `.claude/settings.json`**: per-project permissions and hook registrations, plus an `env` block read by Claude Code (CLI, Desktop app, AND the VS Code extension) and propagated to MCP subprocesses. This is the **canonical per-project MCP env channel** as of v0.2.12 (PR-27, 2026-05-16): empirical sentinel testing on Linux Claude Code 2.1.143 confirmed that `.vscode/settings.json` `claude-code.env` does NOT propagate to MCP subprocesses, so the launcher no longer writes that key. See PR-27 commit message + `docs/CLAUDE_CODE_COMPATIBILITY.md` → "Per-project env files" for the full empirical trace.
 - **Per-project `.claude/env`**: POSIX shell-sourceable env file with the same values, for CLI users who source it from their shell rc via the `tools/claude` wrapper.
-- **Per-project `.vscode/settings.json`**: VS Code editor preferences only (Pylance excludes, file-watcher excludes, formatter settings). The launcher's Python-side `_backfill_vscode_excludes_in_project` manages the Pylance/watcher exclude block; the launcher does NOT touch any `claude-code.env` block here.
-- **Per-project secrets**: stored in the OS keychain via the VCT Launcher GUI — not in env files, not in JSON configs. The launcher knows about per-project scoping, so an OpenAI key for one project doesn't leak into another.
+- **Per-project `.vscode/settings.json`**: VS Code editor preferences only (Pylance excludes, file-watcher excludes, formatter settings). The launcher's Python-side `_backfill_vscode_excludes_in_project` manages the Pylance/watcher exclude block; the launcher does NOT touch any `claude-code.env` block here. Since v0.2.21 the launcher also writes `.vscode/tasks.json` with a `folderOpen` task that ensures `vct-hub` is running for VS Code users (Step 8).
+- **Per-project secrets**: stored in the OS keychain via the VCT Launcher GUI — not in env files, not in JSON configs. The launcher knows about per-project scoping, so an OpenAI key for one project doesn't leak into another. A small set of shared secrets (`github_pat`, `openai_api_key`) lives under SENTINEL_SHARED / `module_id=user` and is resolved by the hub for every project — see "Secrets" below.
 
 ## Why
 
@@ -16,10 +16,10 @@ It prevents cross-contamination. Global settings apply to every project you open
 
 ## Setup for new users
 
-1. Copy `.vscode/settings.json.example` to `.vscode/settings.json` and adjust as needed for editor preferences (Pylance excludes, formatter settings). The example file no longer ships a `claude-code.env` block — per-project MCP env now lives in `.claude/settings.json` `env` instead (see the v0.2.12 PR-27 note in the bullet list above).
+1. Copy `.vscode/settings.json.example` to `.vscode/settings.json` and adjust as needed for editor preferences (Pylance excludes, formatter settings). The example file no longer ships a `claude-code.env` block — per-project MCP env now lives in `.claude/settings.json` `env` instead (see the v0.2.12 PR-27 note above).
 2. The VCT Launcher creates a per-project `.env` from a canonical template when you register a project (see "`.env` template management" below). For non-launcher CLI users, copy `.env.example` manually.
-3. Let `install.py` wire the rest (venv, containers, KG collection creation).
-4. Launch via the VCT Launcher GUI (manages secrets, tier gating, module installs).
+3. Let `install.py` wire the rest (venv, containers, KG collection creation, `vct-hub` binary placement + boot sentinel).
+4. Launch via the VCT Launcher GUI (manages secrets, tier gating, module installs). Secrets entered via the GUI (or via the OnboardingWizard at first run) are immediately resolvable by the hub for every registered project.
 
 ## `.env` template management
 
@@ -43,7 +43,7 @@ KG_COLLECTION, SHARED_KG_COLLECTION, DEVELOPMENT_COLLECTION, PROJECT_NAME
 # LLM API keys (commented)
 ANTHROPIC_API_KEY, OPENAI_API_KEY
 
-# GitHub access for code-search MCP (commented)
+# GitHub access for search-mcp wrapper (commented)
 GITHUB_TOKEN
 
 # RL retrieval module — Pro tier (commented)
@@ -61,9 +61,10 @@ VCT_TELEMETRY
 | MCP env (URLs, collection names, paths) — every Claude Code surface (CLI / Desktop / VS Code extension) AND MCP subprocesses | `.claude/settings.json` → `env` | per-project | launcher's `write_project_env_files` |
 | MCP env, POSIX shell-sourceable copy (for the `tools/claude` wrapper) | `.claude/env` | per-project | launcher's `write_project_env_files` |
 | VS Code editor preferences (Pylance excludes, formatOnSave, etc.) | `.vscode/settings.json` | per-project | launcher's Python `_backfill_vscode_excludes_in_project` + you |
+| VS Code `folderOpen` task that ensures `vct-hub` is running (v0.2.21+) | `.vscode/tasks.json` | per-project | install.py Step 8 / `update_project_v2` bundle update |
 | Shell/script env | `.env` | per-project | you, `.env.example` template |
 | Project permissions + hooks | `.claude/settings.json` | per-project | install.py + launcher |
-| Secrets (license keys, API tokens) | OS keychain | per-project | launcher GUI only |
+| Secrets (license keys, API tokens) | OS keychain | per-project (with shared bucket for `github_pat` / `openai_api_key`) | launcher GUI / OnboardingWizard only |
 | Hooks scripts | `.claude/hooks/` | per-project | install.py |
 | Bundled agents | `.claude/agents/` | per-project | installed by default (from `templates/agents/free/`) |
 | Project skills | `.claude/skills/` | per-project | install.py (from `templates/skills/`) |
@@ -74,7 +75,7 @@ VCT_TELEMETRY
 
 - MCP server definitions (they point at this project's venv + source paths)
 - Plugin enable flags (`enabledPlugins`) — plugins are project-specific
-- Project paths (`MCP_PYTHON`, `MCP_WEAVIATE_SERVER`, etc.)
+- Project paths (collection names, code-graph prefixes, etc.)
 - Collection names (`KG_COLLECTION`, etc.)
 - Embedding model defaults (differ per project tier)
 
@@ -98,9 +99,161 @@ The MCP server (`claude_mcp_servers/weaviate_mcp/server.py`) reads these on star
 
 **Power-user override**: point `SHARED_KG_COLLECTION` at a private team-shared collection (e.g. `AcmeTeam_SharedKG`) to share knowledge across an internal team without exposing it via the public bundled name.
 
+## Embedding configuration (v0.2.18+)
+
+The `EmbeddingService` (in `vco_lib/embedding_service.py`) is the unified entry point for KG + code-graph embeddings. It replaces the older code paths that read `ACTIVE_EMBEDDING` directly and hardcoded slot selection (KG-W1 audit). Configuration is purely env-driven; the launcher writes the resolved values into `.claude/settings.json::env`.
+
+| Var | Values | What it does |
+|---|---|---|
+| `ACTIVE_EMBEDDING` | `qwen3` (default) | `openai` | Selects the active text-embedding slot for KG + development collections. `qwen3` → `qwen3_embed` named vector; `openai` → `openai_embed`. |
+| `EMBEDDING_MODEL` | `qwen3-embedding:0.6b` (default) | model id | Explicit text model override. When `ACTIVE_EMBEDDING=openai` and this is unset, defaults to `text-embedding-3-small`. |
+| `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` (default) | OpenAI model id | Used only when `ACTIVE_EMBEDDING=openai` and `EMBEDDING_MODEL` is unset. |
+| `OPENAI_API_KEY` | (unset) | API key | Required when `ACTIVE_EMBEDDING=openai`. Resolved per-process from env; the launcher injects it from the shared keychain slot (see Secrets below). |
+| `OLLAMA_URL` | `http://localhost:11435` | URL | Ollama base URL used by the qwen3 slot. |
+| `CODE_EMBED_SERVICE_URL` | `http://localhost:11440` | URL | Code-embedding FastAPI service URL. |
+| `CODE_EMBED_BACKEND` | `service` (default) | `ollama` | `service` → CodeSage-Large-v2 via the FastAPI service; `ollama` → CPU fallback via `qwen3-embedding:0.6b`. |
+| `CODE_EMBED_MODEL` | `codesage-large-v2` (default) | model id | Explicit code model override. |
+| `DUAL_EMBEDDING_ENABLED` | `false` (default) | `true` | When true, both `qwen3_embed` and `openai_embed` slots are populated on every write so the active slot can be switched without re-indexing. |
+
+**Multi-slot fallback chain**: when `EmbeddingService.for_project()` resolves to a slot whose backend is unreachable (e.g. `codesage_embed` selected but the FastAPI service is down), it walks a fallback chain in order: codesage → qwen3 (via Ollama) → openai (when key set). The chain only fires for the code slot; the text slot resolution is strict. Diagnostic logging lands at `WARNING` level — check the MCP stderr if you suspect a fallback fired silently.
+
+## Secrets
+
+Secrets never live in env files or JSON configs. They live in the OS keychain (macOS Keychain, Linux Secret Service, Windows Credential Manager) and are written by the launcher's GUI or the OnboardingWizard.
+
+**Shared bucket** (visible to every base-host project on this user account): declared in `vct-module.json::bundled_secrets[]`. The hub's `/api/v1/projects/{id}/env` resolver finds these via SENTINEL_SHARED + `module_id=user` (formerly `installer` pre-2026-05-10; both writer paths now land at the same row).
+
+| Slot | Written by | Consumed by |
+|---|---|---|
+| `github_pat` | OnboardingWizard `register_github_pat` step OR Preferences → Special Secrets → SecretsPanel "Shared (this user)" tab | `claude_mcp_servers/search_mcp/wrapper.sh` (exported as `GITHUB_TOKEN`), bundled hooks that need to talk to GitHub |
+| `openai_api_key` (v0.2.18+) | OnboardingWizard OpenAI step OR Preferences → Special Secrets | `vco_lib/embedding_service.py` when `ACTIVE_EMBEDDING=openai` or as multi-slot fallback. Validated via `GET /v1/models/text-embedding-3-small` — no token consumption, no billing entry. |
+
+**Per-module / per-project secrets**: paid modules declare their own `bundled_secrets[]` in their manifest; the launcher's SecretsPanel surfaces a tab per scope. Per-project license keys, API tokens, and module-specific secrets are scoped by `project_id` and never leak across projects.
+
+**Resolver flow** (subprocess perspective):
+
+1. Wrapper script (`search_mcp/wrapper.sh` or equivalent) runs.
+2. Wrapper checks `$GITHUB_TOKEN` — if already exported (launcher's `write_project_env_files` populates it from the keychain on project registration), use it directly.
+3. Otherwise call `vct_secrets_resolve.sh <project_path> github_pat` → hub HTTP API at `GET /api/v1/projects/{id}/env?key=github_pat`.
+4. Hub resolves via SENTINEL_SHARED + `module_id=user`, applies the cross-launcher active-flag gate, returns the secret.
+5. Wrapper exports the value and `exec`s the real MCP server binary.
+
+Don't put PATs or API keys in `~/.claude.json` `env:` blocks — Claude Code's env loader does not expand `${VAR}` (anthropics/claude-code#2065, #4276), so embedded secrets would land in argv and become visible to `ps`.
+
+## vct-hub (since v0.2.21)
+
+A detached local HTTP server (port 7700 default) that serves as the single source of truth for project config + secrets resolution. Lives in `launcher/dist/<arch>/vct-hub`. Outlives the launcher GUI: close the GUI, the hub keeps running so hooks / MCPs / shell scripts still resolve config.
+
+| Var / path | Default | What it does |
+|---|---|---|
+| `VCT_HUB_PORT` env | `7700` | Hub port override. Falls back to `<vct_root_dir>/hub.port` (written on startup), then `7700`. |
+| `VCT_HUB_TOKEN` env | (unset) | Hub auth token override (tests / dev). Production reads from `<vct_root_dir>/hub.token`. |
+| `VCT_STATE_DIR` env | `$HOME/.vct` | Root directory for `hub.port`, `hub.token`, `hub.pid`, `cache/`, etc. Resolution: `VCT_STATE_DIR` → `~/.vct/` → relative `./.vct/` last-resort fallback. Setting this lets dev launchers run side-by-side with production without contaminating state. |
+| `<vct_root_dir>/hub.token` | — | Bearer token (32 bytes hex, OS CSPRNG). Regenerated on every hub startup, mode `0o600` on Unix. Required on every `/api/v1/*` route except `/health`. Never appears in argv — clients read the file and pass via `Authorization: Bearer ...` header. |
+| `<vct_root_dir>/hub.port` | — | Plain integer, the port the hub bound to. Written before `hub.token` so a racing client either sees neither file or both. |
+| `<vct_root_dir>/hub.pid` | — | Single-instance lockfile. Contains the running hub's PID. CLI checks it via OS-specific liveness probe (`kill(pid, 0)` on Unix, `OpenProcess` on Windows) + a `TcpListener::bind` probe on the hub port. |
+
+**CLI**:
+
+```bash
+vct-hub --start-if-not-running   # idempotent boot; returns 0 even if already running
+vct-hub --stop                   # graceful shutdown via lockfile PID
+vct-hub --status                 # JSON status (running, port, pid, token-file mode)
+vct-hub --foreground             # run in foreground (for dev / supervisor)
+vct-hub --register-boot          # install boot autostart (systemd-user / launchd / Win Task)
+vct-hub --unregister-boot        # remove boot autostart
+vct-hub --boot-status            # check whether boot autostart is registered
+```
+
+**Boot autostart** is OS-specific and DEFAULT-OFF in v0.2.21. Users opt in via launcher GUI Preferences (Step 13 follow-up). Backends:
+
+- Linux: systemd-user unit (`~/.config/systemd/user/vct-hub.service`).
+- macOS: `launchd` plist (`~/Library/LaunchAgents/com.vibecodedtools.vct-hub.plist`).
+- Windows: Scheduled Task at logon (`VCTHub` task, invoked via a thin `.cmd` shim that points at the binary).
+
+When `VCT_STATE_DIR` is non-default, boot registration prints a warning — the autostart will inherit the user's login env, where a custom `VCT_STATE_DIR` typically isn't set, so the booted hub will write to `~/.vct/` instead of the dev path. This is intentional (dev state shouldn't be auto-launched at login).
+
+**Key endpoints**:
+
+| Endpoint | Purpose | Notes |
+|---|---|---|
+| `GET /health` | Liveness probe | No auth required. |
+| `GET /api/v1/projects/{id-or-slug}/config` | Resolver: KG collection, codegraph prefix, embedding selections, access-matrix lists, service URLs | Accepts UUID or slug as the `{id}` path arg (try-UUID-then-slug fallback). Replaces per-process `os.getenv("KG_COLLECTION")` etc. drift. Returns 503 when primary KG binding is missing (caller-actionable). |
+| `GET /api/v1/projects/{id}/env?key=<slot>` | Secrets resolver | Resolves via per-project keychain row first; falls back to SENTINEL_SHARED + `module_id=user` for shared slots declared in `vct-module.json::bundled_secrets[]`. |
+| `GET /api/v1/services/status` | Services snapshot | v0.2.21: returns a degraded skeleton. Supervisor relocation to hub (Step 24 Stream B) brought the full snapshot back. |
+| `GET /api/v1/projects/by-path?path=<abs-path>` | Path → project UUID | Used by resolver clients before fetching `/config`. Returns 404 with `project_not_found` when the path isn't registered. |
+
+**Resolver clients** discover the hub via the same chain:
+
+- `templates/scripts/vct_project_config.sh` (bash, hooks + shell scripts)
+- `templates/scripts/vct_project_config.ps1` (PowerShell 7+, Windows hooks)
+- `vco_lib/project_config.py` (`from vco_lib.project_config import resolve, ProjectConfig` — used by `install.py`, MCPs, and any Python tooling)
+
+Discovery: `VCT_HUB_PORT` env → `<vct_root_dir>/hub.port` → `7700` default; token: `VCT_HUB_TOKEN` env → `<vct_root_dir>/hub.token`. All clients enforce the same exit-code shape (0 success / 1 hub unreachable / 2 project not registered / 3 service misconfigured / 4 field not found / 64 usage error). Stderr emissions are rate-limited per `(pid, error_kind)` to one line per 5 minutes — `VCO_HOOK_DEBUG=1` bypasses the limit.
+
+**v0.2.20 → v0.2.21 cutover sentinel**: when `install.py` deploys `vct-hub` for the first time, it writes `<vct_root_dir>/v0.2.21-cutover.flag` BEFORE starting the hub. The v0.2.21 launcher reads this flag on startup and skips its own in-process services watcher (knowing the hub will take it over). `install.py` deletes the flag after `vct-hub` responds to `/health`. Leftover sentinels are harmless — the hub's first successful `/health` clears the contention.
+
+## Paid-module license framework (v0.2.14+)
+
+This repo is fully functional standalone. Optional paid modules (RL retrieval reranking, MAO multi-agent runtime, specialist agent packs) activate only when a license key is present. Without a key, retrieval falls back to plain Weaviate cosine ordering — nothing breaks.
+
+License resolution priority (first match wins; see `VCThelpers/license/validator.py`):
+
+1. `VIBECODED_TIER` env var — `free` | `pro` | `mao` | `enterprise`. **Only `free` is trusted**; any other value is ignored. We never accept an env-var-claimed paid tier without a validated key.
+2. `VIBECODED_LICENSE_KEY` env var — 36-char UUID. Set by the launcher after activation.
+3. `~/.vct-secrets/shared/license_key` file (chmod 600, plain UUID, no trailing whitespace). Used by headless installs where the launcher hasn't run. Legacy flat layout `~/.vct-secrets/license_key` is still honored as a fallback.
+4. `VIBECODED_LICENSE_URL` env var — Supabase `/validate-tier` edge function URL. Defaults to the production deployment.
+
+**Grace period**: if the last successful remote validation was >3 days ago and the validation endpoint is unreachable, the tier degrades to `free`. A human-readable message lands in `~/.vibecoded/license_status.txt`. Nothing breaks.
+
+**Network policy**: fail-OPEN to free tier on any transport failure. Never block startup, never raise.
+
+**Free-tier RL gate** (in `claude_mcp_servers/weaviate_mcp/server.py`): `_rl_cache_and_rerank` skips RL reranking when `feature_enabled("rl_retrieval") == False`. Pro/MAO licenses unlock RL. Free-tier users get plain Weaviate cosine ordering.
+
+**RL module env vars** (only meaningful with Pro+ license):
+
+| Var | Default | What it does |
+|---|---|---|
+| `RL_SERVER_URL` | `http://localhost:11439` | RL retrieval service URL. Read by `RLClient` in `weaviate_mcp/server.py`. |
+| `RL_SERVER_PORT` | `11439` | Back-compat port override. |
+| `RL_PROJECT_ROOT` | project root | Override for the RL service's project-anchored state directory. |
+
+## Container runtime
+
+`vco_lib/containers.py` resolves the runtime via:
+
+1. `VCT_CONTAINER_RUNTIME` env var — explicit `podman` or `docker`. Wins over everything when set.
+2. Caller-passed `runtime` arg.
+3. `auto` (or unset) → probe `podman` first, then `docker`. Podman-first is intentional: podman's rootless mode is the orchestrator's default deployment.
+
+The chosen executable is returned as a string (`podman` or `docker`) and used uniformly through the rest of the codebase. Compose files live in `infrastructure/docker-compose.yml` (canonical) and `claude_mcp_servers/compose.yaml` (legacy path, same shared volumes).
+
+## MCP Servers
+
+MCP servers are registered in the user's `~/.claude.json`. Each launches via the project venv (`claude_mcp_servers/.venv`).
+
+**weaviate-kg** — semantic search + code graph.
+- Command: `claude_mcp_servers/.venv/bin/python claude_mcp_servers/weaviate_mcp/server.py`
+- Env: `WEAVIATE_URL`, `OLLAMA_URL`, `EMBEDDING_MODEL`, `KG_COLLECTION`, `SHARED_KG_COLLECTION`, `DEVELOPMENT_COLLECTION`, `GRPC_PORT`, `SHARED_KG_WRITE_DISABLED` (write gate; legacy alias `SHARED_KG_OPT_OUT` kept for ~3 releases), plus the EmbeddingService vars (`ACTIVE_EMBEDDING`, `OPENAI_API_KEY`, `CODE_EMBED_SERVICE_URL`, etc.).
+
+**search** — academic paper search via OpenAlex and arXiv (narrowed to `search_papers` only in v0.2.11; `web_search`, `search_code`, and `fetch_page` removed as redundant with Claude's built-in WebFetch and web capabilities).
+- Command (Unix): `claude_mcp_servers/search_mcp/wrapper.sh` — exports `GITHUB_TOKEN` from the keychain (env-first then resolver), then `exec`s the real server.
+- Command (Windows): `claude_mcp_servers/.venv/Scripts/python.exe claude_mcp_servers/search_mcp/server.py` (no wrapper; PowerShell resolver client handles the secret).
+- Env: `OPENALEX_EMAIL` (optional, gives polite-pool priority on OpenAlex API); `GITHUB_TOKEN` (resolved at wrapper startup from the `github_pat` shared keychain slot).
+- Tools: `search_papers` only.
+
+**coordination** — local KG-backed coordination notes (decisions, tasks, patterns).
+- Command: `claude_mcp_servers/.venv/bin/python claude_mcp_servers/coordination_mcp/server.py`
+- Env: `KG_BASE_DIR` (optional, defaults to project root).
+- Tools: `post_coordination_note`, `read_coordination_notes`.
+
+**Removed in v0.2.11**: the **ollama** MCP (`chat`, `read_document`, `read_image`) was removed as redundant. Claude's native reasoning, `Read` tool, and built-in vision handle the same use cases at higher quality. Ollama continues running as infrastructure for Weaviate text embeddings and the code-embedding service CPU fallback. The **SearXNG** container was also removed from the default stack — `search_papers` calls OpenAlex and arXiv directly without a local search proxy. See `knowledge/concepts/mcp-simplification-v0211.md` for the full rationale.
+
+**Stale MCP cleanup**: `install.py --rewrite-stale-mcps` (added in v0.2.12 / PR-33) detects deprecated MCP entries left over from older versions in `~/.claude.json` and offers consent-prompted auto-rewrite. Run after upgrading from pre-v0.2.11 installs.
+
 ## Agents and skills
 
-See [templates/README.md](../templates/README.md) for the bundled agents and skills (29 + 28) and install-flag reference.
+See [templates/README.md](../templates/README.md) for the bundled agents and skills and install-flag reference.
 
 ## Parallel agents (3-5x speedup)
 
@@ -128,6 +281,8 @@ Set these before running `bash first-install.sh` (or export them for the duratio
 | `VCT_NO_AUTO_LAUNCH=1` | Skip auto-spawning the launcher GUI at end of `first-install.sh` / `first-install.command`. Equivalent to passing `--no-auto-launch`. Useful for CI, agent-driven installs, or when the GUI will be controlled out-of-band (Xvfb, Playwright). |
 | `VCT_NO_DESKTOP_ICON=1` | Skip creating the desktop shortcut after a successful install. Equivalent to passing `--no-desktop-icon`. Linux: `~/.local/share/applications/vct-launcher.desktop` + `~/Desktop/vct-launcher.desktop` skipped. macOS: `~/Applications/VCT Launcher` symlink skipped. Windows: `%USERPROFILE%\Desktop\VCT Launcher.lnk` + Start Menu entry skipped. Useful for CI / unattended installs, or when running multiple VCO installs on the same user account. |
 | `VCT_NON_INTERACTIVE=1` | Treat the run as non-interactive. The Python auto-installer wrappers (`install.sh` / `install.ps1`) will fail loudly on missing Python rather than prompting — fix it in your CI image. Implied by `--quiet`. |
+| `VCT_CONTAINER_RUNTIME=podman|docker` | Pin the container runtime instead of auto-probing. Useful in CI where both runtimes might be present but only one is configured. |
+| `VCT_STATE_DIR=/path` | Override `~/.vct/` as the launcher state-root. Lets dev launchers run alongside production without contaminating state. Hub binaries pick this up automatically; resolver clients honour it too. |
 | `VCT_DISABLE_HOOKS=1` | See section below. |
 
 ## Disabling hooks for debugging or CI
@@ -200,4 +355,3 @@ installations:
   Normally produced incrementally by the kg-summary-generator hook on edit;
   use this script when you want to rebuild the cache from scratch (for
   example after a bulk import or a node-format schema change).
-

@@ -2,6 +2,8 @@
 
 This guide walks you through installing the orchestrator, configuring your first project, and understanding what runs during a normal Claude Code session.
 
+> **What's new since v0.2.12** (the prior version of this doc): the `vct-hub` HTTP coordinator (v0.2.21), OpenAI embeddings as a wired-in backend (v0.2.18), AMD/ROCm support and per-module VRAM thresholds (v0.2.20), multi-language Tree-sitter codegraph and language-scoped incremental prune (v0.2.18), the `commit-dist-binaries` release flow self-healing (v0.2.13–v0.2.17), and removal of the Ollama MCP wrapper from the default install (Ollama remains as embedding infrastructure; the wrapper is opt-in via the launcher Modules page as `vct-ollama`). See `CHANGELOG.md` for the full per-version list.
+
 ## Prerequisites
 
 - **Python 3.11 or newer** (3.12 recommended; 3.13 supported). Older versions fail at the install.py sentinel — we use stdlib `tomllib`, which is 3.11+.
@@ -59,11 +61,13 @@ python3 install.py
 `install.py` does the following:
 
 1. Creates a Python venv at `.venv/` (project root)
-2. Detects your hardware (NVIDIA GPU / CPU / Apple Silicon) and sets the embedding backend
+2. Detects your hardware (NVIDIA / AMD / CPU / Apple Silicon) and chooses the embedding backend. AMD/ROCm support (v0.2.20) layers `infrastructure/docker-compose.rocm.yml` on top; the precedence order is user override → Apple Silicon → NVIDIA+VRAM → AMD+VRAM → CPU
 3. Starts Weaviate and Ollama in containers and waits for them to be ready
-4. Pulls embedding models (`qwen3-embedding:0.6b` by default; CodeSage-Large-v2 on GPU installs)
-5. Writes `.env`, `.claude/settings.json` (the canonical MCP-env channel), and `.claude/env` (POSIX shell-sourceable copy). `.vscode/settings.json` is only touched for VS Code editor preferences (Pylance/watcher excludes) — `claude-code.env` is no longer written there as of v0.2.12 (PR-27)
-6. Copies 19 agent templates into `.claude/agents/` and 28 skill templates into `.claude/skills/`
+4. Pulls embedding models (`qwen3-embedding:0.6b` by default; CodeSage-Large-v2 on GPU installs; the code backend's fallback chain since v0.2.18 is CodeSage → qwen3 → Jina, picked at construction time)
+5. Writes `.env`, `.claude/settings.json` (the canonical MCP-env channel — propagates to MCP subprocesses on every Claude Code surface), and `.claude/env` (POSIX shell-sourceable copy). `.vscode/settings.json` is only touched for VS Code editor preferences (Pylance/watcher excludes) — `claude-code.env` is no longer written there as of v0.2.12 (PR-27), because empirical sentinel testing showed it didn't propagate to MCP subprocesses on Linux Claude Code 2.1.143. v0.2.21 also writes `.vscode/tasks.json` (auto-starts `vct-hub` on `folderOpen` for VS Code users)
+6. Copies 29 agent templates into `.claude/agents/` and 28 skill templates into `.claude/skills/`; renders 20 hooks (both `.sh` and `.ps1` per hook on every OS — cross-OS workflows don't get stale orphans) into `.claude/hooks/`
+7. Registers MCP servers in `~/.claude.json`: `weaviate-kg`, `search` (search_papers only), `code_embedding_service`, and `playwright` (the latter via `npx -y @playwright/mcp@latest`; opt out with `VCT_SKIP_PLAYWRIGHT=1`). The `vct-ollama` MCP is **not** registered by default — install via launcher → Modules if you want local LLM tool surfaces
+8. (v0.2.21+) Deploys the detached `vct-hub` binary alongside the launcher, writes a `<vct_root>/v0.2.21-cutover.flag` sentinel before starting it (so a still-running v0.2.20 launcher's embedded supervisor steps aside cleanly), invokes `vct-hub --start-if-not-running`, probes `/health`, then deletes the sentinel. The hub listens on `127.0.0.1:7700` by default (`VCT_HUB_PORT` to override); auth via fresh-per-startup bearer token at `<vct_root>/hub.token` (mode `0o600`)
 
 ### Common install flags
 
@@ -163,17 +167,29 @@ After install, open the `vibecoded-orchestrator` directory in one of the three s
 - **VS Code extension**: open the folder as a workspace; the extension reads `.claude/settings.json` for MCP env vars (the canonical channel that also propagates to MCP subprocesses). `.vscode/settings.json` is only used for editor preferences
 - **Claude Desktop app**: point it at the install directory
 
-On session start, three things happen automatically (via `SessionStart` hooks):
+On session start, the following hooks fire automatically (`SessionStart` matcher: `startup`):
 
-1. `ensure-containers.sh` — checks that Weaviate and Ollama are running; starts them if not
-2. `context-size-check.sh` — warns if `.claude/CONTEXT_STATE.md` is over 200 lines
-3. `compact-context-reinject.sh` (on resume after compaction) — reinjects `CONTEXT_STATE.md`, recent commits, and any active plan
+1. `ensure-containers.sh` — checks that Weaviate, Ollama, and the code-embedding service are running; starts them if not
+2. `session-start-ensure-hub.sh` (v0.2.21+) — probes `vct-hub /health`, runs `vct-hub --start-if-not-running` if not. The hub outlives the launcher GUI, so projects opened directly via the CLI or VS Code still get the resolver
+3. `session-start-kg-loader.sh` — displays KG resource paths
+4. `context-size-check.sh` — warns if `.claude/CONTEXT_STATE.md` is over 200 lines
+5. `embedding-failures-surface.sh` (v0.2.18+) — if `.claude/context/EMBEDDING_FAILURES.md` exists (written by `vco_lib.embedding_service` when a backend was unreachable), surfaces a Claude-readable hint on the next chat start. Auto-clears on the next successful embed
+6. `compact-context-reinject.sh` (on resume after compaction) — reinjects `CONTEXT_STATE.md`, recent commits, and any active plan
 
 Verify MCP servers connected:
 
 ```bash
 claude mcp list
-# Expected: weaviate-kg ✓ Connected, ollama ✓ Connected
+# Expected: weaviate-kg ✓ Connected, search ✓ Connected, playwright ✓ Connected
+# (`ollama` MCP is opt-in via launcher → Modules → vct-ollama since v0.2.11; Ollama itself still runs as
+#  embedding infrastructure — visible in `podman ps` / `docker ps`, just no MCP wrapper by default.)
+```
+
+Verify the hub is up (v0.2.21+):
+
+```bash
+vct-hub --status                                # CLI helper
+curl -s http://127.0.0.1:7700/health            # raw probe (no auth required on /health)
 ```
 
 ## Set up a project
@@ -234,10 +250,10 @@ Once a project is configured, here is what fires on normal use:
 - Injects matches into the context window before Claude generates a response
 
 **On every file edit** (`PostToolUse` hook on `Edit`/`Write`):
-- Files under `knowledge/` sync to Weaviate (`ClaudeKnowledgeGraph` collection)
-- Files under `docs/` sync to the development collection
-- Code files are queued for code graph re-analysis
-- A credential scan runs on the written file
+- Files under `knowledge/` sync to Weaviate (per-project `<KG_COLLECTION>`; content-hash skip on unchanged nodes since v0.2.17)
+- Files under `docs/` sync to the development collection (per-project `<DEVELOPMENT_COLLECTION>`; gained content-hash + status parity with KG in v0.2.18 — ~820x faster on unchanged content)
+- Code files are queued for code graph re-analysis (`code-graph-incremental.{sh,ps1}` — invokes `analyze --incremental --language <lang> --prune-stale` since v0.2.18, scoped per-language so deleted files in one language never wipe rows from another)
+- A credential scan runs on the written file (`post-tool-security.sh` — sentinel renamed in v0.2.16 to avoid false positives on docs that quote the marker)
 
 **On session end** (`Stop` hook):
 - Cost data appended to `~/.claude/metrics/costs.jsonl`
@@ -299,7 +315,18 @@ Tools the installer detects and integrates with when present, but doesn't requir
 - lower token costs per session
 - faster response time on commands that produce verbose output
 
-The orchestrator's installer detects lean-ctx automatically and wires it into Claude Code's non-interactive Bash subprocesses via `BASH_ENV`. If you install it after the orchestrator, re-run `install.py` to activate.
+The orchestrator's installer detects lean-ctx automatically. As of v0.2.11 the wiring is via a PreToolUse hook (`.claude/hooks/lean-ctx-rewrite.{sh,ps1}`) that rewrites each `Bash(<cmd>)` tool call to `lean-ctx -c '<cmd>'`. The hook is a no-op if lean-ctx isn't on `PATH`. The earlier `BASH_ENV` shim approach (which sourced a per-project script into every non-interactive Bash subprocess) was disabled in v0.2.11 after a fork-bomb incident on lean-ctx 3.x — the stub file lives on disk as a `return 0` no-op for defense-in-depth.
+
+Bypass / override matrix:
+
+| Scope | Mechanism |
+|---|---|
+| Per-call raw output (one command) | `lean-ctx bypass "<cmd>"` |
+| Force-compress one command when project default is off | `lean-ctx -c "<cmd>"` |
+| Per-project default = off | Add `VCO_LEAN_CTX_DEFAULT=off` to `.claude/env` |
+| Disable all VCO hooks (debug only) | `export VCT_DISABLE_HOOKS=1` |
+
+Footgun: lean-ctx in default mode can swallow stderr from `git commit` to zero output when a pre-commit hook fails. If a `git commit` exits non-zero with no message, retry under `lean-ctx bypass "..."`.
 
 Install:
 ```bash
@@ -314,9 +341,29 @@ Skip with `--no-lean-ctx` if you don't want the auto-detection prompt.
 
 [Joern](https://docs.joern.io/installation/) is a ~600 MB JVM-based code property graph tool. When installed, the orchestrator's code-graph analyzer can populate CFG (control-flow graph) and PDG (program-dependence graph) metrics on indexed functions. Skip with `--no-joern` if you don't need those metrics.
 
+## vct-hub: project + secrets resolver (v0.2.21+)
+
+`vct-hub` is a small detached `axum` HTTP service that the launcher, the MCP servers, and the bundled scripts all hit instead of reading process-scoped env vars directly. It exists because `os.getenv("KG_COLLECTION")` (and the like) tended to drift between surfaces — different Claude Code surfaces, different shells, different subagent contexts could each end up with a slightly different snapshot of the per-project config.
+
+| Surface | URL / file | Notes |
+|---|---|---|
+| HTTP listener | `http://127.0.0.1:7700` (default; `VCT_HUB_PORT` to override; falls back to `<vct_root>/hub.port`) | All `/api/v1/*` routes require `Authorization: Bearer <token>`, except `/health` |
+| Token | `<vct_root>/hub.token` (mode `0o600`) | Regenerated on every hub startup. Read by every resolver client |
+| Lockfile | `<vct_root>/hub.pid` | Single-instance per user |
+| CLI | `vct-hub --start-if-not-running` / `--status` / `--stop` / `--foreground` | Also `--register-boot` / `--unregister-boot` / `--boot-status` for the OS auto-start (systemd-user / launchd / Windows Scheduled Task; **default off in v0.2.21**, user opts in via launcher Preferences) |
+
+Key endpoints (auth required):
+
+- `GET /api/v1/projects/{id-or-slug}/config` — resolves KG collection, codegraph prefix, embedding model id, and access-matrix lists for the named project. Use this instead of trusting an inherited env var.
+- `GET /api/v1/projects/{id}/env` — resolves secrets from the OS keychain (e.g. shared `github_pat`, `openai_api_key`).
+- `GET /api/v1/services/status` — services snapshot (v0.2.21 returns a degraded skeleton; full supervisor relocation lands later).
+
+Resolver client libraries ship in the install bundle: `templates/scripts/vct_project_config.sh` (bash), `templates/scripts/vct_project_config.ps1` (PowerShell 7+), and `vco_lib/project_config.py` (Python). They each discover the hub via `$VCT_HUB_PORT` → `<vct_root>/hub.port` → `7700`, and the token via `$VCT_HUB_TOKEN` → `<vct_root>/hub.token`. The Python client retries on `401` with cache invalidation (so a token rotation mid-session doesn't strand a long-running script).
+
 ## Common next steps
 
 - Read [docs/CONFIGURATION.md](CONFIGURATION.md) to understand where each config file lives and why
 - Run `/context` inside a Claude session to verify the active workspace path and KG collection name
 - Add `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` to `~/.claude/settings.json` to enable parallel agents (3–5x speedup on multi-file tasks)
-- Check [docs/TROUBLESHOOTING.md](TROUBLESHOOTING.md) for container, MCP, and hook issues
+- If you have an OpenAI key and want it as the default embedding provider, run the OnboardingWizard (Identity → Onboarding) or set it via Preferences → Special Secrets. The orchestrator validates via the free `GET /v1/models/text-embedding-3-small` endpoint — no billing entry created
+- Check [docs/TROUBLESHOOTING.md](TROUBLESHOOTING.md) for container, MCP, hub, and hook issues
