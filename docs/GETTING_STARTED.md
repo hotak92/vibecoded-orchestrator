@@ -2,8 +2,6 @@
 
 This guide walks you through installing the orchestrator, configuring your first project, and understanding what runs during a normal Claude Code session.
 
-> **What's new since v0.2.12** (the prior version of this doc): the `vct-hub` HTTP coordinator (v0.2.21), OpenAI embeddings as a wired-in backend (v0.2.18), AMD/ROCm support and per-module VRAM thresholds (v0.2.20), multi-language Tree-sitter codegraph and language-scoped incremental prune (v0.2.18), the `commit-dist-binaries` release flow self-healing (v0.2.13–v0.2.17), and removal of the Ollama MCP wrapper from the default install (Ollama remains as embedding infrastructure; the wrapper is opt-in via the launcher Modules page as `vct-ollama`). See `CHANGELOG.md` for the full per-version list.
-
 ## Prerequisites
 
 - **Python 3.11 or newer** (3.12 recommended; 3.13 supported). Older versions fail at the install.py sentinel — we use stdlib `tomllib`, which is 3.11+.
@@ -61,13 +59,13 @@ python3 install.py
 `install.py` does the following:
 
 1. Creates a Python venv at `.venv/` (project root)
-2. Detects your hardware (NVIDIA / AMD / CPU / Apple Silicon) and chooses the embedding backend. AMD/ROCm support (v0.2.20) layers `infrastructure/docker-compose.rocm.yml` on top; the precedence order is user override → Apple Silicon → NVIDIA+VRAM → AMD+VRAM → CPU
+2. Detects your hardware (NVIDIA / AMD / CPU / Apple Silicon) and chooses the embedding backend. AMD/ROCm layers `infrastructure/docker-compose.rocm.yml` on top; the precedence order is user override → Apple Silicon → NVIDIA+VRAM → AMD+VRAM → CPU
 3. Starts Weaviate and Ollama in containers and waits for them to be ready
-4. Pulls embedding models (`qwen3-embedding:0.6b` by default; CodeSage-Large-v2 on GPU installs; the code backend's fallback chain since v0.2.18 is CodeSage → qwen3 → Jina, picked at construction time)
-5. Writes `.env`, `.claude/settings.json` (the canonical MCP-env channel — propagates to MCP subprocesses on every Claude Code surface), and `.claude/env` (POSIX shell-sourceable copy). `.vscode/settings.json` is only touched for VS Code editor preferences (Pylance/watcher excludes) — `claude-code.env` is no longer written there as of v0.2.12 (PR-27), because empirical sentinel testing showed it didn't propagate to MCP subprocesses on Linux Claude Code 2.1.143. v0.2.21 also writes `.vscode/tasks.json` (auto-starts `vct-hub` on `folderOpen` for VS Code users)
-6. Copies 29 agent templates into `.claude/agents/` and 28 skill templates into `.claude/skills/`; renders 20 hooks (both `.sh` and `.ps1` per hook on every OS — cross-OS workflows don't get stale orphans) into `.claude/hooks/`
+4. Pulls embedding models (`qwen3-embedding:0.6b` by default; CodeSage-Large-v2 on GPU installs; the code backend's fallback chain is CodeSage → qwen3 → Jina, picked at construction time)
+5. Writes `.env`, `.claude/settings.json` (canonical MCP-env channel — propagates to MCP subprocesses on every Claude Code surface), and `.claude/env` (POSIX shell-sourceable copy). `.vscode/settings.json` is touched only for VS Code editor preferences (Pylance/watcher excludes); `.vscode/tasks.json` is written so VS Code auto-starts `vct-hub` on `folderOpen`
+6. Copies 45 agent templates into `.claude/agents/` and 52 skill templates into `.claude/skills/`; renders 27 hooks (both `.sh` and `.ps1` per hook on every OS — cross-OS workflows don't get stale orphans) into `.claude/hooks/`
 7. Registers MCP servers in `~/.claude.json`: `weaviate-kg`, `search` (search_papers only), `code_embedding_service`, and `playwright` (the latter via `npx -y @playwright/mcp@latest`; opt out with `VCT_SKIP_PLAYWRIGHT=1`). The `vct-ollama` MCP is **not** registered by default — install via launcher → Modules if you want local LLM tool surfaces
-8. (v0.2.21+) Deploys the detached `vct-hub` binary alongside the launcher, writes a `<vct_root>/v0.2.21-cutover.flag` sentinel before starting it (so a still-running v0.2.20 launcher's embedded supervisor steps aside cleanly), invokes `vct-hub --start-if-not-running`, probes `/health`, then deletes the sentinel. The hub listens on `127.0.0.1:7700` by default (`VCT_HUB_PORT` to override); auth via fresh-per-startup bearer token at `<vct_root>/hub.token` (mode `0o600`)
+8. Deploys the detached `vct-hub` binary alongside the launcher, invokes `vct-hub --start-if-not-running`, probes `/health`. The hub listens on `127.0.0.1:7700` by default (`VCT_HUB_PORT` to override); auth via fresh-per-startup bearer token at `<vct_root>/hub.token` (mode `0o600`)
 
 ### Common install flags
 
