@@ -14,6 +14,7 @@
 
 use std::process;
 
+use vct_hub::boot;
 use vct_hub::cli::{self, Command};
 use vct_hub::lifecycle::{self, LifecycleResult};
 use vct_hub::lockfile;
@@ -35,17 +36,9 @@ async fn main() {
         Command::Status => exit_with(lifecycle::status()),
         Command::Stop => exit_with(lifecycle::stop()),
         Command::StartIfNotRunning => exit_with(lifecycle::start_if_not_running()),
-        Command::RegisterBoot | Command::UnregisterBoot | Command::BootStatus => {
-            // Step 11 placeholders. install.py probes these via exit
-            // code 64 (EX_USAGE) to decide whether the installed
-            // vct-hub binary supports boot integration — until Step 11
-            // lands they all 64.
-            eprintln!(
-                "[vct-hub] boot-time auto-start commands not implemented yet \
-                 (Step 11 of v0.2.21)"
-            );
-            process::exit(64);
-        }
+        Command::RegisterBoot => exit_with(boot::run_register_boot()),
+        Command::UnregisterBoot => exit_with(boot::run_unregister_boot()),
+        Command::BootStatus => exit_with(boot::run_boot_status()),
         Command::Foreground => run_foreground().await,
     }
 }

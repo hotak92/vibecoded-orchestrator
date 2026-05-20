@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.vibecodedtools.vct-hub</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__VCT_HUB_BIN__</string>
+        <string>--foreground</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Keep alive only on abnormal exit; SuccessfulExit=false means
+         "restart if the process exits with a non-zero status OR is signalled."
+         We do NOT use a bare KeepAlive=true because that would restart even
+         on clean `vct-hub --stop`. -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- Throttle restart attempts to avoid restart storms. macOS default is 10s. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- Pin state dir so dev installs don't contaminate prod state on boot. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>VCT_STATE_DIR</key>
+        <string>__VCT_STATE_DIR__</string>
+        <!-- Provide a baseline PATH; LaunchAgents do not inherit the user's
+             shell PATH, so podman/docker invocations from the supervisor
+             would otherwise fail with "command not found". -->
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/opt/podman/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <!-- Log streams. Without these the user has no record of crashes. -->
+    <key>StandardOutPath</key>
+    <string>__VCT_STATE_DIR__/logs/vct-hub.launchd.out</string>
+    <key>StandardErrorPath</key>
+    <string>__VCT_STATE_DIR__/logs/vct-hub.launchd.err</string>
+
+    <!-- Run as the logged-in user (not root). LaunchAgent by definition. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>

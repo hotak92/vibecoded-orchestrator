@@ -48,6 +48,11 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # Random for hub auth tokens (will reuse the same posture as the in-launcher hub)
 rand = { version = "0.9", default-features = false, features = ["std", "std_rng", "os_rng"] }
 
+# Step 11: boot.rs canonicalises current_exe() via dunce so the
+# rendered unit/plist/task always embeds a stable, UNC-free path.
+# Same crate is already used by the main launcher (vct-launcher-core).
+dunce = "1"
+
 # Step 5: lifecycle.rs uses libc::kill / libc::setsid on Unix, and
 # windows-sys::TerminateProcess / OpenProcess on Windows. pid_is_alive
 # lives in vct-launcher-core::process and already brings those, but
