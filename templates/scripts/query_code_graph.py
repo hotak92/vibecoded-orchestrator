@@ -324,7 +324,40 @@ class CodeGraphQuery:
             merged.sort(key=lambda t: t[0])
             seen_keys: set[str] = set()
             top: list[tuple[float, str, object]] = []
+            # v0.2.21 (mid-session audit fix, 2026-05-20): drop very-low-
+            # similarity results before tier formatting. Codegraph
+            # embedding space is denser than the KG side (CodeSage-Large
+            # tends to place any code-shaped query within ~0.7-0.9
+            # distance of countless unrelated functions), so the KG
+            # tiers (0.42/0.55/0.65/0.75 from
+            # knowledge/concepts/score-driven-retrieval-tiers.md) tuned
+            # for qwen3-embedding don't map cleanly here.
+            #
+            # Default floor: score >= 0.35 (distance <= 0.65). Calibrated
+            # against observed in-session injection quality:
+            #   * < 0.30: structurally unrelated functions (noise; the
+            #     user gains nothing from seeing them).
+            #   * 0.30-0.50: weak but occasionally on-topic (e.g.
+            #     `require_kg_read` at 0.38 on an edit to query_code_graph.py
+            #     is a contextually-related access-matrix helper).
+            #   * 0.50+: usually directly relevant.
+            # 0.35 is the empirical knee that drops the bottom-third
+            # noise without trimming the genuinely-related mid-tier
+            # hits. Tunable per-user via $VCO_CODE_GRAPH_SCORE_FLOOR
+            # (Step 13 followup will surface a GUI control in the
+            # retrieval-tuning panel; for now, env-only).
+            try:
+                score_floor = float(os.environ.get("VCO_CODE_GRAPH_SCORE_FLOOR", "0.35"))
+            except (TypeError, ValueError):
+                score_floor = 0.35
             for distance, source, obj in merged:
+                # score = 1 - distance, clamped to [0, 1].
+                score = max(0.0, min(1.0, 1.0 - distance)) if distance >= 0 else 0.0
+                if score < score_floor:
+                    # Stop iterating: results are sorted by distance asc
+                    # (score desc), so once we drop below the floor
+                    # there can be no more candidates above it.
+                    break
                 key = obj.properties.get("full_name") or obj.properties.get("name") or str(obj.uuid)
                 if key in seen_keys:
                     continue
