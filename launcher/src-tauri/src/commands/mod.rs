@@ -53,6 +53,7 @@ pub mod project_env_settings;
 pub mod project_state_cmd;
 pub mod project_state_populate;
 pub mod restart;
+pub mod retrieval_tuning;
 pub mod rl_settings;
 pub mod runtime_install;
 pub mod secrets_cmd;

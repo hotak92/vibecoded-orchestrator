@@ -1002,6 +1002,15 @@ pub fn run() {
             commands::rl_settings::list_rl_global_training_source_projects,
             commands::rl_settings::retrain_global_online,
             commands::rl_settings::retrain_global_offline,
+            // Retrieval tuning (v0.2.22 Item #13 — 2026-05-20).
+            // Global thresholds for score-driven retrieval verbosity
+            // (KG tier cutoffs) + codegraph injection floor. Backed by
+            // <vct_root_dir>/retrieval-tuning.toml. The hub's config_api
+            // reads the same file so headless / script clients see the
+            // values the GUI shows.
+            commands::retrieval_tuning::retrieval_tuning_get,
+            commands::retrieval_tuning::retrieval_tuning_set,
+            commands::retrieval_tuning::retrieval_tuning_reset,
             // Per-project orchestrator state (agents/skills/hooks/permissions/secrets/KG/codegraph)
             commands::project_state_cmd::list_project_agents,
             commands::project_state_cmd::list_project_skills,
