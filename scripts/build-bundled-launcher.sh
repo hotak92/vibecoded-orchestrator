@@ -326,6 +326,75 @@ echo "[build-bundled] Metadata: ${DEST}.metadata.json"
 echo "[build-bundled] Source SHA: $SOURCE_SHA"
 echo "[build-bundled] Source hash (launcher subtree): $SOURCE_HASH"
 echo "[build-bundled] Binary size: $(du -h "$DEST" | cut -f1)"
+
+# v0.2.21+: stage the vct-hub binary alongside vct-launcher.
+#
+# vct-hub is a sibling Cargo workspace member (launcher/src-tauri/vct-hub/)
+# introduced in v0.2.21. Tauri's `tauri build --no-bundle` above builds
+# the launcher binary but does NOT necessarily build every workspace
+# member — its scope is the binary referenced by tauri.conf.json. We
+# therefore call cargo explicitly here for vct-hub. Cargo treats this
+# as a no-op if vct-hub was already built (e.g. by a future Tauri CLI
+# that walks the full workspace). Belt-and-braces.
+#
+# The embedded SvelteKit asset-ref probe above (lines ~189-261) does NOT
+# apply to vct-hub: vct-hub is an axum HTTP server with no frontend.
+# Running that check against it would correctly return 0 refs and
+# false-fail. We intentionally skip the asset-ref probe for vct-hub.
+echo "[build-bundled] cargo build --release --bin vct-hub"
+( cd "$SRC_TAURI" && cargo build --release --bin vct-hub )
+
+# Pick the hub binary name for the host platform. Cargo package name is
+# `vct-hub` (no `-temp` suffix); on Windows the artifact gets `.exe`.
+case "$HOST_TARGET" in
+    windows-x64) HUB_BIN="vct-hub.exe" ;;
+    *)           HUB_BIN="vct-hub" ;;
+esac
+
+# Find what cargo actually built for vct-hub. Simpler candidate list
+# than the launcher's because there is no `-temp` legacy name.
+HUB_SRC=""
+for cand in vct-hub vct-hub.exe; do
+    if [ -x "$RELEASE_DIR/$cand" ]; then
+        HUB_SRC="$RELEASE_DIR/$cand"
+        break
+    fi
+done
+if [ -z "$HUB_SRC" ]; then
+    echo "[build-bundled] No vct-hub binary found in $RELEASE_DIR" >&2
+    echo "                Workspace may not have built it. Try:" >&2
+    echo "                  cd $SRC_TAURI && cargo build --release --bin vct-hub" >&2
+    exit 1
+fi
+
+# Stage vct-hub into launcher/dist/<arch>/
+HUB_DEST="$DIST_DIR/$HOST_TARGET/$HUB_BIN"
+cp "$HUB_SRC" "$HUB_DEST"
+chmod +x "$HUB_DEST"
+
+# Emit vct-hub.metadata.json sidecar (mirrors the launcher sidecar shape).
+# Fields are mostly identical between the two siblings — same source SHA,
+# same release version, same target, same tier. Differs only in
+# binary_name and binary_size_bytes. Consumers should NOT use source_hash
+# to differentiate vct-hub's source from vct-launcher's — they're built
+# from the same workspace at the same commit, so the hash is identical.
+cat > "${HUB_DEST}.metadata.json" <<HUB_METADATA_EOF
+{
+  "source_sha": "$SOURCE_SHA",
+  "source_short_sha": "$SOURCE_SHORT_SHA",
+  "source_hash": "$SOURCE_HASH",
+  "built_at": "$BUILT_AT",
+  "launcher_version": "$TAURI_VERSION",
+  "host_target": "$HOST_TARGET",
+  "binary_name": "$HUB_BIN",
+  "binary_size_bytes": $(stat -c%s "$HUB_DEST" 2>/dev/null || stat -f%z "$HUB_DEST" 2>/dev/null || echo 0),
+  "tier": "$TIER"
+}
+HUB_METADATA_EOF
+echo "[build-bundled] Staged hub: $HUB_DEST"
+echo "[build-bundled] Hub metadata: ${HUB_DEST}.metadata.json"
+echo "[build-bundled] Hub binary size: $(du -h "$HUB_DEST" | cut -f1)"
+
 echo
 echo "[build-bundled] Reminder: if THIRD_PARTY_LICENSES.txt is stale, regenerate it:"
 echo "    cd $SRC_TAURI"
