@@ -393,6 +393,18 @@ Two paths:
 
 See `docs/CONFIGURATION.md` → "Shared KG collection" for the full migration matrix.
 
+## Update Bundle deferrals: `UPDATE_DEFERRED.md`
+
+When you click "Update bundle" in the per-project Settings page (or run `python -m vco_lib.project_init install-bundle --update`), the orchestrator writes `<project>/.claude/context/UPDATE_DEFERRED.md` whenever an update step needs explicit user consent before continuing. The launcher toast surfaces the count ("5 files updated, 2 deferrals"); the file lists each deferral entry with the exact command to clear it.
+
+The two deferral types you'll encounter most often:
+
+**`bundle_user_modified_preserved`** — Update Bundle detected that one of your project files differs from the orchestrator's prior-shipped hash recorded in `.claude/.vco-manifest.json`. The orchestrator interpreted this as "user edits present" and preserved your version on disk rather than overwriting. Each preserved file appears in the deferral with the explicit force command (typically `python -m vco_lib.project_init install-bundle --update --force --file <path>`) that accepts the orchestrator's default for that file. Inspect your edits first; run the force command only if you want to discard them.
+
+**`schema_migration_required`** — Update Bundle detected drift between the Weaviate target schema and the schema currently on disk for one of your project's collections. Because schema migration is destructive (it can re-embed or recreate collection objects), the bundle path never auto-applies it. The deferral entry shows the explicit consent command: `cd "$VCT_ORCHESTRATOR_ROOT" && .venv/bin/python -m vco_lib.project_init migrate-collections --name '<project>'` (the v0.2.19 fix made this work correctly from project venvs — previously it produced `ModuleNotFoundError`). Run it once you have a Weaviate backup or are comfortable with the migration's destructive scope.
+
+The file lives at `<project>/.claude/context/UPDATE_DEFERRED.md` and is regenerated on each Update Bundle / `install.py --update` run. Cleared entries disappear automatically when the underlying condition resolves on the next run; you don't need to delete the file manually.
+
 ## Scripts in `.claude/scripts/` don't run
 
 **Not executable**:
