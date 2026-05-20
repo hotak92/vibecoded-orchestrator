@@ -1,0 +1,27 @@
+[Unit]
+Description=VCT Hub (vibecoded-orchestrator) — supervisor + project-config resolver
+Documentation=https://github.com/vibecoded-tools/vibecoded-orchestrator
+# Don't try to start before the user session is ready; otherwise loopback bind can race.
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=__VCT_HUB_BIN__ --foreground
+Restart=on-failure
+RestartSec=10s
+# Don't kill descendants when we restart — containers are owned by the runtime daemon,
+# not by us. Killing them would defeat the point of being a supervisor.
+KillMode=mixed
+TimeoutStopSec=15s
+# Allow the supervisor's polling timer to use up to 4096 fds (containers + log files).
+LimitNOFILE=4096
+
+# Pin the state dir so a dev install does NOT contaminate prod state on boot.
+Environment=VCT_STATE_DIR=__VCT_STATE_DIR__
+# Optional: explicit log file. Hub will write to a logfile under VCT_STATE_DIR anyway,
+# but journalctl --user -u vct-hub also captures stderr.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

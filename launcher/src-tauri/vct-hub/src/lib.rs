@@ -22,6 +22,7 @@
 
 pub mod api;
 pub mod auth;
+pub mod boot;
 pub mod cli;
 pub mod cli_api;
 pub mod db;
