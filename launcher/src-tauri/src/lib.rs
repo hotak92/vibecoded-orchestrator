@@ -9,14 +9,7 @@
 // `Window`, `Emitter`) or on this crate's `commands::` Tauri-command
 // surface.
 mod commands;
-// `hub` module retired in v0.2.21 Step 4: the hub now lives in the
-// separate `vct-hub` binary (`launcher/src-tauri/vct-hub/`). The
-// launcher's setup no longer starts an in-process hub; install.py
-// (or `vct-hub --start-if-not-running` invoked manually) brings the
-// detached hub up. Step 6 wires the launcher to invoke that on
-// startup. Until then, on a fresh v0.2.21 install the hub is started
-// by install.py's post-install step; on an upgrade-from-0.2.20 the
-// migration choreography in Step 12 (`update_orchestrator`) handles it.
+mod hub_launcher;
 mod installer_engine;
 mod mcp_registration;
 pub mod project_naming;
@@ -595,14 +588,20 @@ pub fn run() {
                 }
             }
 
-            // Hub HTTP server runs in the separate `vct-hub` binary as
-            // of v0.2.21 (Step 4 ported the module tree out; this call
-            // site is the last remaining hook). Step 6 reintroduces an
-            // explicit `vct-hub --start-if-not-running` invocation
-            // here so the launcher continues to bring the hub up on
-            // its own startup. Step 4 leaves it intentionally inert
-            // so the v0.2.21 in-progress branch can be verified bit-
-            // by-bit (port → CLI → launcher integration).
+            // v0.2.21 Step 6: bring up the detached vct-hub binary if
+            // it isn't already running. `ensure_hub_running` is best-
+            // effort — a missing binary or failed spawn drops the
+            // launcher into "hub-unavailable degraded mode" (resolver
+            // falls back to env vars; supervisor doesn't run) but
+            // never blocks the GUI from coming up. Run in a blocking
+            // task so its synchronous Command::status() doesn't stall
+            // the Tauri runtime; `--start-if-not-running` itself
+            // returns within ~100 ms (it spawns a detached child and
+            // does NOT wait for the hub to bind), so this is a small
+            // budget either way.
+            tauri::async_runtime::spawn_blocking(|| {
+                let _ = hub_launcher::ensure_hub_running();
+            });
             // System tray (v1.1)
             if let Err(e) = tray::setup(&app.handle()) {
                 eprintln!("[vct] tray setup failed: {}", e);
