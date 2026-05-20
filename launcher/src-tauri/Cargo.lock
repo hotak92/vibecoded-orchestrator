@@ -5324,6 +5324,45 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
+name = "vct-hub"
+version = "0.2.21"
+dependencies = [
+ "axum",
+ "rand 0.9.4",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower-http",
+ "vct-launcher-core",
+]
+
+[[package]]
+name = "vct-launcher-core"
+version = "0.2.21"
+dependencies = [
+ "chrono",
+ "directories",
+ "dunce",
+ "gethostname",
+ "hex",
+ "keyring",
+ "libc",
+ "mac_address",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "shlex",
+ "sysinfo",
+ "tempfile",
+ "tokio",
+ "toml 0.9.12+spec-1.1.0",
+ "uuid",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "vct-launcher-temp"
 version = "0.2.20"
 dependencies = [
@@ -5358,6 +5397,7 @@ dependencies = [
  "toml 0.9.12+spec-1.1.0",
  "tower-http",
  "uuid",
+ "vct-launcher-core",
  "windows-sys 0.59.0",
 ]
 

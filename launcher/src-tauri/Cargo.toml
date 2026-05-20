@@ -1,3 +1,12 @@
+[workspace]
+# v0.2.21 in-place workspace conversion. The launcher package (this file)
+# remains both the workspace root manifest AND a workspace member. New
+# crates live in subdirectories. Tauri build artifacts (tauri.conf.json,
+# build.rs, capabilities/, icons/, gen/) stay at this level — they belong
+# to the launcher member. See `knowledge/concepts/launcher-binary-metadata-schema.md`
+# §"Workspace structure (v0.2.21)" + the v0.2.21 plan §3.
+members = ["vct-launcher-core", "vct-hub"]
+
 [package]
 name = "vct-launcher-temp"
 version = "0.2.20"
@@ -18,6 +27,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+# v0.2.21: shared types live in the workspace's `vct-launcher-core` member.
+# Both this binary and the new `vct-hub` binary depend on it. See plan §3d.
+vct-launcher-core = { path = "vct-launcher-core" }
+
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"

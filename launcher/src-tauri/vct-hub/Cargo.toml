@@ -1,0 +1,30 @@
+[package]
+name = "vct-hub"
+version = "0.2.21"
+edition = "2021"
+description = "Detached HTTP server for VCT — supervisor + resolver, survives launcher GUI close."
+authors = ["VibeCoded Tools"]
+license = "AGPL-3.0"
+
+[[bin]]
+name = "vct-hub"
+path = "src/main.rs"
+
+[dependencies]
+vct-launcher-core = { path = "../vct-launcher-core" }
+
+# HTTP server
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serde
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging (println for v0.2.21 minimal stub; structured logging is a v0.2.22 followup)
+
+# Random for hub auth tokens (will reuse the same posture as the in-launcher hub)
+rand = { version = "0.9", default-features = false, features = ["std", "std_rng", "os_rng"] }
