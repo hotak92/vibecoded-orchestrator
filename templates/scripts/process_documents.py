@@ -96,12 +96,23 @@ KNOWLEDGE_ROOT = PROJECT_ROOT / "knowledge"
 
 # Collections
 DOCUMENT_CHUNKS_COLLECTION = "DocumentChunks"
-# PR-7 (v0.2.11): respect per-project KG_COLLECTION env. Pre-v0.2.11 this was
-# hardcoded "ClaudeKnowledgeGraph", which routed writes from every install
-# into the legacy collection regardless of the active project. Fallback is
-# project-neutral "KnowledgeGraph" (matches install.py's _configure_claude_settings
-# default).
-KNOWLEDGE_GRAPH_COLLECTION = os.getenv("KG_COLLECTION", "KnowledgeGraph")
+
+
+# v0.2.21 Step 18 (caller migration): resolve KG collection via the
+# launcher's vct-hub. Falls back to env (PR-7 / v0.2.11 behaviour) when
+# the hub is unreachable. Pre-v0.2.11 this was hardcoded
+# "ClaudeKnowledgeGraph", which routed writes from every install into
+# the legacy collection regardless of the active project.
+def _resolve_kg_collection() -> str:
+    try:
+        from vco_lib.project_config import resolve  # type: ignore[import-not-found]
+        cfg = resolve(PROJECT_ROOT)
+        return cfg.kg_collection or os.getenv("KG_COLLECTION", "KnowledgeGraph")
+    except Exception:
+        return os.getenv("KG_COLLECTION", "KnowledgeGraph")
+
+
+KNOWLEDGE_GRAPH_COLLECTION = _resolve_kg_collection()
 
 
 def ensure_document_chunks_collection(server: WeaviateMCPServer) -> bool:

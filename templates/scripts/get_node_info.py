@@ -16,14 +16,29 @@ from weaviate.classes.query import Filter
 
 WEAVIATE_URL = os.getenv("WEAVIATE_URL", "http://localhost:8081")
 GRPC_PORT = int(os.getenv("GRPC_PORT", "50052"))
-# P1-D (2026-05-08): respect KG_COLLECTION env, not the
-# pre-2026-05-08 hardcoded "ClaudeKnowledgeGraph". The hardcoded value
-# only worked on the orchestrator-self path; user projects ship with a
-# different KG_COLLECTION. The hardcoded fallback kept it from breaking
-# the orchestrator outright but silently broke every other project's
-# kg-info CLI.
-KG_COLLECTION = os.getenv("KG_COLLECTION", "KnowledgeGraph")
-SHARED_KG_COLLECTION = os.getenv("SHARED_KG_COLLECTION", "")
+
+
+# v0.2.21 Step 18 (caller migration): resolve KG collection names via the
+# launcher's vct-hub. Falls back to env vars when the hub is unreachable.
+# Pre-v0.2.21 the hardcoded "ClaudeKnowledgeGraph" only worked on the
+# orchestrator-self path; user projects ship with a different
+# KG_COLLECTION. The hub is now the single source of truth.
+def _resolve_kg_collections() -> tuple[str, str]:
+    try:
+        from vco_lib.project_config import resolve  # type: ignore[import-not-found]
+        cfg = resolve(Path(__file__).resolve().parent.parent.parent)
+        return (
+            cfg.kg_collection or os.getenv("KG_COLLECTION", "KnowledgeGraph"),
+            cfg.shared_kg_collection or os.getenv("SHARED_KG_COLLECTION", ""),
+        )
+    except Exception:
+        return (
+            os.getenv("KG_COLLECTION", "KnowledgeGraph"),
+            os.getenv("SHARED_KG_COLLECTION", ""),
+        )
+
+
+KG_COLLECTION, SHARED_KG_COLLECTION = _resolve_kg_collections()
 
 # P1-D (2026-05-08): centralized access-matrix helper. Resolved via
 # $VCT_ORCHESTRATOR_ROOT (the orchestrator clone is where

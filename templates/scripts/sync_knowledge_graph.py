@@ -100,7 +100,30 @@ except Exception as e:
 WEAVIATE_URL = os.getenv("WEAVIATE_URL", "http://localhost:8081")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11435")
 GRPC_PORT = int(os.getenv("GRPC_PORT", "50052"))
-COLLECTION_NAME = os.getenv("KG_COLLECTION", "KnowledgeGraph")
+
+
+# v0.2.21 Step 18 (caller migration): resolve project-scoped collection
+# names via the launcher's vct-hub. Falls back to env vars when the hub
+# is unreachable (launcher not running, project not registered). The
+# resolver emits its own rate-limited warning so callers don't need to
+# log anything extra. See `.claude/context/plans/v0.2.21-resolver-design.md`.
+def _resolve_collections() -> tuple[str, str]:
+    """Return (kg_collection, development_collection) via hub, env-fallback."""
+    try:
+        from vco_lib.project_config import resolve  # type: ignore[import-not-found]
+        cfg = resolve(Path(__file__).resolve().parent.parent.parent)
+        return (
+            cfg.kg_collection or os.getenv("KG_COLLECTION", "KnowledgeGraph"),
+            cfg.development_collection or os.getenv("DEVELOPMENT_COLLECTION", ""),
+        )
+    except Exception:
+        return (
+            os.getenv("KG_COLLECTION", "KnowledgeGraph"),
+            os.getenv("DEVELOPMENT_COLLECTION", ""),
+        )
+
+
+COLLECTION_NAME, _RESOLVED_DEV_COLLECTION = _resolve_collections()
 DUAL_EMBEDDING_ENABLED = os.getenv("DUAL_EMBEDDING_ENABLED", "true").lower() == "true"
 
 # Chunking configuration for embedding limits
@@ -118,7 +141,9 @@ KNOWLEDGE_ROOT = PROJECT_ROOT / "knowledge"
 # vectors, and `index_null_state=True` schema as the KG collection — the only
 # differences are: docs may have no frontmatter, no typed WikiLinks, no
 # tags/status (we synthesize a small set from the filesystem).
-DEV_COLLECTION_NAME = os.getenv("DEVELOPMENT_COLLECTION", "")
+# v0.2.21 Step 18: name resolved alongside COLLECTION_NAME via the hub
+# (_resolve_collections above); env-fallback preserved.
+DEV_COLLECTION_NAME = _RESOLVED_DEV_COLLECTION
 DOCS_ROOT = PROJECT_ROOT / "docs"
 
 # v0.2.18: named-vector slot is resolved per-instance from

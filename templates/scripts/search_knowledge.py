@@ -25,8 +25,38 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11435")
 # for the legacy `get_embedding()` fallback path used when the service
 # isn't reachable.
 GRPC_PORT = int(os.getenv("GRPC_PORT", "50052"))
-KG_COLLECTION = os.getenv("KG_COLLECTION", "KnowledgeGraph")
-SHARED_KG_COLLECTION = os.getenv("SHARED_KG_COLLECTION", "")
+
+# v0.2.21 Step 18 (caller migration): resolve KG collection names via the
+# launcher's vct-hub. Falls back to env vars when the hub is unreachable
+# (launcher not running, stale token, project not registered). The
+# resolver emits its own rate-limited warning on the fall-through path
+# (Step 17), so this caller doesn't need to log anything extra.
+def _resolve_kg_collections() -> tuple[str, str]:
+    """Return (kg_collection, shared_kg_collection) via hub, env-fallback."""
+    try:
+        # Local import keeps the module importable in contexts where
+        # vco_lib isn't on the path (e.g. minimal CI installs); the
+        # except below still degrades to env.
+        from vco_lib.project_config import (
+            ProjectNotFound,
+            ResolverError,
+            resolve,
+        )
+        cfg = resolve(Path(__file__).resolve().parent.parent.parent)
+        return (
+            cfg.kg_collection or os.getenv("KG_COLLECTION", "KnowledgeGraph"),
+            cfg.shared_kg_collection or os.getenv("SHARED_KG_COLLECTION", ""),
+        )
+    except Exception:
+        # Resolver unavailable, unreachable, or project not registered →
+        # env-fallback preserves pre-v0.2.21 behaviour.
+        return (
+            os.getenv("KG_COLLECTION", "KnowledgeGraph"),
+            os.getenv("SHARED_KG_COLLECTION", ""),
+        )
+
+
+KG_COLLECTION, SHARED_KG_COLLECTION = _resolve_kg_collections()
 DUAL_EMBEDDING_ENABLED = os.getenv("DUAL_EMBEDDING_ENABLED", "true").lower() == "true"
 
 # Query token limit (same as embedding limit)

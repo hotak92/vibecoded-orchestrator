@@ -915,14 +915,25 @@ def main():
         parser.print_help()
         return 1
 
-    # Resolve project: explicit --project wins; otherwise fall back to
-    # CODE_GRAPH_PROJECT or PROJECT_NAME env vars (same priority as the
-    # MCP server's CODE_GRAPH_PROJECT resolution). Without this, the CLI
-    # always queries unprefixed `CodeFunction` etc., which never exist in
-    # multi-project Weaviate setups — every project ships its own
-    # `<Project>_CodeFunction` collection. Pre-2026-05-08 the CLI was
-    # effectively dead unless the user remembered to pass --project.
-    effective_project = getattr(args, 'project', None) or os.getenv("CODE_GRAPH_PROJECT") or os.getenv("PROJECT_NAME") or None
+    # Resolve project: explicit --project wins; otherwise route through
+    # the launcher's vct-hub for the canonical per-project value, falling
+    # back to CODE_GRAPH_PROJECT / PROJECT_NAME env vars when the hub is
+    # unreachable (v0.2.21 Step 18 caller migration). Without this, the
+    # CLI always queries unprefixed `CodeFunction` etc., which never
+    # exist in multi-project Weaviate setups — every project ships its
+    # own `<Project>_CodeFunction` collection. Pre-2026-05-08 the CLI
+    # was effectively dead unless the user remembered to pass --project.
+    effective_project = getattr(args, 'project', None)
+    if not effective_project:
+        try:
+            from vco_lib.project_config import resolve as _vco_resolve  # type: ignore[import-not-found]
+            from pathlib import Path as _Path
+            _cfg = _vco_resolve(_Path.cwd())
+            effective_project = _cfg.code_graph_project or None
+        except Exception:
+            effective_project = None
+    if not effective_project:
+        effective_project = os.getenv("CODE_GRAPH_PROJECT") or os.getenv("PROJECT_NAME") or None
 
     # Create query interface
     querier = CodeGraphQuery(project=effective_project)

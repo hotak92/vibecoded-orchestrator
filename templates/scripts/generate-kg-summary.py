@@ -390,7 +390,17 @@ def get_chunks_from_weaviate(title: str) -> list[tuple[int, str]]:
         from weaviate.classes.query import Filter
         from urllib.parse import urlparse
 
-        kg_collection = os.getenv("KG_COLLECTION", "KnowledgeGraph")
+        # v0.2.21 Step 18: resolve KG collection via the launcher's vct-hub.
+        # Falls back to env when the hub is unreachable (matches the
+        # pre-v0.2.21 path). CLAUDE_PROJECT is the project being summarised.
+        try:
+            from vco_lib.project_config import resolve as _vco_resolve  # type: ignore[import-not-found]
+            _cfg = _vco_resolve(CLAUDE_PROJECT)
+            kg_collection = _cfg.kg_collection or os.getenv(
+                "KG_COLLECTION", "KnowledgeGraph"
+            )
+        except Exception:
+            kg_collection = os.getenv("KG_COLLECTION", "KnowledgeGraph")
         # Honor WEAVIATE_URL when the launcher (or env) sets it to a non-default
         # endpoint; otherwise default to localhost:8081 to match historical behavior.
         weaviate_url = urlparse(os.getenv("WEAVIATE_URL", "http://localhost:8081"))

@@ -101,15 +101,26 @@ if [[ "$EDITED_FILE" == "$DOCS_DIR"* ]] && [[ "$EDITED_FILE" == *.md ]]; then
 fi
 
 # 3. Code file changes: incremental code graph update + LLM nudge.
-# Resolve project name from env (PR-7 / v0.2.11): CODE_GRAPH_PROJECT is the
-# canonical key set by the launcher's settings.json env block;
-# PROJECT_NAME is the historical fallback; basename of the repo root is
-# the last resort (same pattern as code-graph-incremental.sh:42). The
-# pre-v0.2.11 behaviour hardcoded "ClaudeOrchestrator" here, which
+# v0.2.21 Step 18 (caller migration): resolve the code-graph project name
+# via the launcher's vct-hub first (`vct_project_config.sh --field
+# code_graph_project`), fall back to the legacy env chain when the hub
+# is unreachable (launcher not running, project not registered, stale
+# token). The hub is the authoritative source post-v0.2.21.
+#
+# Pre-v0.2.11 behaviour hardcoded "ClaudeOrchestrator" here, which
 # polluted the legacy collection from every project install. Do NOT
 # re-introduce a hardcoded literal in this position.
 if [[ "$EDITED_FILE" =~ \.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$ ]]; then
-    CODE_GRAPH_PROJECT_RESOLVED="${CODE_GRAPH_PROJECT:-${PROJECT_NAME:-$(basename "$PROJECT_ROOT")}}"
+    CODE_GRAPH_PROJECT_RESOLVED=""
+    _RESOLVER="$PROJECT_ROOT/.claude/scripts/vct_project_config.sh"
+    if [ -x "$_RESOLVER" ]; then
+        CODE_GRAPH_PROJECT_RESOLVED=$(
+            "$_RESOLVER" "$PROJECT_ROOT" --field code_graph_project 2>/dev/null
+        ) || CODE_GRAPH_PROJECT_RESOLVED=""
+    fi
+    if [ -z "$CODE_GRAPH_PROJECT_RESOLVED" ]; then
+        CODE_GRAPH_PROJECT_RESOLVED="${CODE_GRAPH_PROJECT:-${PROJECT_NAME:-$(basename "$PROJECT_ROOT")}}"
+    fi
     bash "$SCRIPT_DIR/code-graph-incremental.sh" \
         "$EDITED_FILE" \
         "$PROJECT_ROOT" \

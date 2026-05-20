@@ -122,6 +122,87 @@ except Exception as _embed_import_err:  # pragma: no cover (rare half-install)
     NoEmbeddingBackendError = Exception  # type: ignore[assignment]
 
 
+# ─── v0.2.21 Step 18: per-project config resolver ───────────────────────
+#
+# Module-level config constants used to be read directly from os.getenv
+# at import time. v0.2.21 routes them through the launcher's vct-hub via
+# vco_lib.project_config.resolve(), with env-var fallback when the hub
+# is unreachable (launcher not running, project not registered, stale
+# token after a launcher restart). The resolved values populate the
+# module-level KG_COLLECTION / SHARED_KG_COLLECTION / DEVELOPMENT_COLLECTION
+# / ACTIVE_EMBEDDING / CODE_GRAPH_PROJECT constants below.
+#
+# The MCP is long-running (hours to days). We resolve ONCE at import
+# time — the hub's TTL semantics keep callers fresh-enough (cf. parent
+# plan §8.3). A SIGHUP triggers process exit + relaunch (sighup_handler
+# above), so a launcher GUI edit propagates within the next request.
+try:
+    _vco_lib_parent_for_pc = Path(__file__).resolve().parent.parent.parent
+    if str(_vco_lib_parent_for_pc) not in sys.path:
+        sys.path.insert(0, str(_vco_lib_parent_for_pc))
+    from vco_lib.project_config import resolve as _resolve_project_config  # type: ignore[import-not-found]
+    from vco_lib.project_config import ResolverError as _ResolverError  # type: ignore[import-not-found]
+    _HAS_PROJECT_CONFIG = True
+except Exception as _pc_import_err:  # pragma: no cover (rare half-install)
+    logger.warning(
+        "vco_lib.project_config import failed (%s) — falling back to env "
+        "vars for KG_COLLECTION / SHARED_KG_COLLECTION / DEVELOPMENT_COLLECTION "
+        "/ ACTIVE_EMBEDDING / CODE_GRAPH_PROJECT. Run install.py --update.",
+        _pc_import_err,
+    )
+    _HAS_PROJECT_CONFIG = False
+    _resolve_project_config = None  # type: ignore[assignment]
+    _ResolverError = Exception  # type: ignore[assignment]
+
+
+_resolved_project_config = None  # cached resolve() result (or None if unreachable)
+
+
+def _try_resolve_project_config():
+    """Best-effort: resolve the project config via vct-hub once.
+
+    Returns the ProjectConfig dataclass or None. On None, every consumer
+    falls back to its existing os.getenv() default. The resolver client
+    emits its own rate-limited warning on the fall-through path
+    (Step 17); this MCP doesn't need to log anything extra.
+    """
+    global _resolved_project_config
+    if _resolved_project_config is not None:
+        return _resolved_project_config
+    if not _HAS_PROJECT_CONFIG or _resolve_project_config is None:
+        return None
+    # Project root: the directory containing claude_mcp_servers/. The
+    # MCP is always launched from inside a project's tree; this matches
+    # the existing CLAUDE_PROJECT_DIR / cwd assumptions throughout the
+    # module.
+    try:
+        _project_root = Path(__file__).resolve().parent.parent.parent
+        _resolved_project_config = _resolve_project_config(_project_root)
+        return _resolved_project_config
+    except Exception:
+        # Hub unreachable, project not registered, etc. — silent fall-
+        # through to env. The resolver client already logged the cause
+        # at its rate-limited warning level.
+        return None
+
+
+def _config_field(field_name: str, env_name: str, default: str) -> str:
+    """Resolve a single config field via the hub; fall back to env.
+
+    Used at module load to populate the KG_COLLECTION etc. constants.
+    Cheap on the cached path — _try_resolve_project_config() memoises.
+    """
+    cfg = _try_resolve_project_config()
+    if cfg is not None:
+        try:
+            value = getattr(cfg, field_name, "")
+            if value:
+                return str(value)
+        except Exception:
+            pass
+    return os.getenv(env_name, default)
+
+
 # Default truncation limit in Claude Code is ~25K chars.
 # v2.1.91+ supports _meta["anthropic/maxResultSizeChars"] override (up to 500K).
 _MAX_RESULT_SIZE = 200_000  # 200K — generous but not wasteful
@@ -200,7 +281,9 @@ DUAL_EMBEDDING_ENABLED = os.getenv("DUAL_EMBEDDING_ENABLED", "true").lower() == 
 # Active embedding for search queries:
 #   KG: "qwen3" (default), "ollama" (legacy arctic), "openai"
 #   Code: "codesage" (default), "ollama" (legacy jina), "openai"
-ACTIVE_EMBEDDING = os.getenv("ACTIVE_EMBEDDING", "qwen3")
+# v0.2.21 Step 18: resolved via vct-hub with env-fallback (see _config_field
+# above). Hub failure degrades silently to os.getenv.
+ACTIVE_EMBEDDING = _config_field("active_embedding", "ACTIVE_EMBEDDING", "qwen3")
 # OpenAI embedding config (only used when ACTIVE_EMBEDDING=openai or DUAL_EMBEDDING_ENABLED=true)
 OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -950,7 +1033,10 @@ def _format_result_by_tier(
     return base
 
 
-KG_COLLECTION = os.getenv("KG_COLLECTION", "ClaudeKnowledgeGraph")
+# v0.2.21 Step 18: resolved via vct-hub (with env-fallback). Hub failure
+# degrades to os.getenv("KG_COLLECTION", "ClaudeKnowledgeGraph") which
+# preserves pre-v0.2.21 behaviour.
+KG_COLLECTION = _config_field("kg_collection", "KG_COLLECTION", "ClaudeKnowledgeGraph")
 # Cross-project shared collection. Defaults to
 # "VibecodedOrchestrator_KnowledgeGraph" (renamed from
 # "VibeCodedTools_KnowledgeGraph" in v0.2.12 PR-26 / Group E — see
@@ -963,7 +1049,17 @@ KG_COLLECTION = os.getenv("KG_COLLECTION", "ClaudeKnowledgeGraph")
 # always reads the shared KG. The per-project gate below restricts WRITES
 # only.
 _SHARED_KG_DEFAULT = "VibecodedOrchestrator_KnowledgeGraph"
-_SHARED_KG_RAW = os.getenv("SHARED_KG_COLLECTION", _SHARED_KG_DEFAULT)
+# v0.2.21 Step 18: resolved via vct-hub when reachable; env-fallback
+# otherwise. When the hub is reachable, an explicit empty value means
+# "no shared KG binding for this project" and we honour it AS-IS — the
+# asymmetric-access design (module docstring) says a project that's
+# been explicitly unbound stays unbound. The default only applies on
+# env-fallback (hub unreachable), matching pre-v0.2.21 behaviour.
+_cfg_for_shared_kg = _try_resolve_project_config()
+if _cfg_for_shared_kg is not None:
+    _SHARED_KG_RAW = _cfg_for_shared_kg.shared_kg_collection
+else:
+    _SHARED_KG_RAW = os.getenv("SHARED_KG_COLLECTION", _SHARED_KG_DEFAULT)
 SHARED_KG_COLLECTION = _SHARED_KG_RAW
 
 # Per-project WRITE gate. When true, store_knowledge_node refuses writes
@@ -1013,7 +1109,10 @@ SHARED_KG_OPT_OUT = SHARED_KG_WRITE_DISABLED
 # are the canonical writers; the server just reads. semantic_graph_search
 # uses KG_COLLECTION only — docs have no WikiLinks so graph traversal can't
 # find useful neighbors there.
-DEVELOPMENT_COLLECTION = os.getenv("DEVELOPMENT_COLLECTION", "")
+# v0.2.21 Step 18: resolved via vct-hub (with env-fallback to "").
+DEVELOPMENT_COLLECTION = _config_field(
+    "development_collection", "DEVELOPMENT_COLLECTION", ""
+)
 
 
 # ─── Multi-source access matrix (P1-D, 2026-05-08) ─────────────────────────
@@ -1050,15 +1149,40 @@ def _parse_csv_env(name: str) -> list[str]:
 
 def _kg_peer_collections() -> list[str]:
     """Return the list of peer-project KG collection names this process
-    should search, derived from VCT_KG_ACCESS_LIST. Each peer name is
-    sanitized + suffixed with `_KnowledgeGraph` to recover the canonical
-    Weaviate collection name. Sorted, deduped, never includes
-    KG_COLLECTION or SHARED_KG_COLLECTION (the caller of
-    `_kg_collections_to_search` adds those separately).
+    should search.
+
+    v0.2.21 Step 18 (caller migration): prefer the launcher's
+    hub-resolved ``kg_access_list`` (already-canonical collection names,
+    no sanitization needed) over the legacy ``VCT_KG_ACCESS_LIST`` CSV
+    env var. Falls back to the env CSV when the hub is unreachable
+    (parent plan §8.11 — VCT_KG_ACCESS_LIST is the env-fallback path).
+
+    The hub returns the FULL access list (self + shared + peers, all
+    canonical Weaviate class names); we filter to peers only so the
+    caller of ``_kg_collections_to_search`` can prepend self/shared in
+    their canonical positions. Pre-v0.2.21 env-fallback path keeps the
+    sanitize-then-suffix logic for the legacy CSV format.
     """
+    # Hub-first path: kg_access_list is canonical class names.
+    _cfg_for_peers = _try_resolve_project_config()
+    if _cfg_for_peers is not None:
+        out: list[str] = []
+        seen: set[str] = set()
+        for coll in _cfg_for_peers.kg_access_list:
+            # Skip self / shared — caller of _kg_collections_to_search
+            # prepends those in their canonical order.
+            if coll == KG_COLLECTION or coll == SHARED_KG_COLLECTION:
+                continue
+            if coll in seen or not coll:
+                continue
+            seen.add(coll)
+            out.append(coll)
+        return out
+
+    # Env-fallback path (pre-v0.2.21 / hub unreachable).
     peers = _parse_csv_env("VCT_KG_ACCESS_LIST")
-    out: list[str] = []
-    seen: set[str] = set()
+    out = []
+    seen = set()
     for p in peers:
         # `_sanitize_collection_prefix` is idempotent for already-sanitized
         # input; this lets the launcher pass either form (it always passes
@@ -1166,10 +1290,16 @@ def _normalize_kg_file_path(file_path: str, node_type: str, title: str) -> tuple
 
 
 # Default project for code graph queries.
-# Set PROJECT_NAME (or CODE_GRAPH_PROJECT) in .vscode/settings.json for each project.
-# Priority: CODE_GRAPH_PROJECT env > PROJECT_NAME env.
-# Must always be set — every project's .vscode/settings.json must include PROJECT_NAME.
-CODE_GRAPH_PROJECT = os.getenv("CODE_GRAPH_PROJECT") or os.getenv("PROJECT_NAME", "")
+# v0.2.21 Step 18: resolved via vct-hub (cfg.code_graph_project); on
+# fall-through, honours the historical env precedence CODE_GRAPH_PROJECT
+# > PROJECT_NAME. Every project's `.claude/settings.json` env block
+# should set CODE_GRAPH_PROJECT — the hub's value is the authoritative
+# source post-v0.2.21.
+_cfg_for_cgp = _try_resolve_project_config()
+if _cfg_for_cgp is not None and _cfg_for_cgp.code_graph_project:
+    CODE_GRAPH_PROJECT = _cfg_for_cgp.code_graph_project
+else:
+    CODE_GRAPH_PROJECT = os.getenv("CODE_GRAPH_PROJECT") or os.getenv("PROJECT_NAME", "")
 
 
 def _sanitize_collection_prefix(name: str) -> str:
@@ -2483,7 +2613,21 @@ def _get_rl_telemetry_writer():
             svc.close()
     except Exception as exc:
         logger.debug("EmbeddingService probe for telemetry failed (%s); using env defaults", exc)
-    project = os.getenv("PROJECT_NAME", "") or os.getenv("KG_COLLECTION", "")
+    # v0.2.21 Step 18: prefer the hub-resolved project slug/display name,
+    # falling back to PROJECT_NAME / KG_COLLECTION env (historical
+    # precedence) when the hub is unreachable. The telemetry only needs
+    # a stable per-project identifier; either source produces one.
+    project = ""
+    _cfg_for_telemetry = _try_resolve_project_config()
+    if _cfg_for_telemetry is not None:
+        project = (
+            _cfg_for_telemetry.project_display_name
+            or _cfg_for_telemetry.project_slug
+            or _cfg_for_telemetry.code_graph_project
+            or ""
+        )
+    if not project:
+        project = os.getenv("PROJECT_NAME", "") or os.getenv("KG_COLLECTION", "")
     _rl_telemetry_writer_instance = RLTelemetryWriter(
         project=project,
         embedding_source=emb_source,
