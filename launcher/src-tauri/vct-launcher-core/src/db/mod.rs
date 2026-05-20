@@ -37,6 +37,7 @@ pub mod secret_grants;
 pub mod app_state;
 pub mod audit_types;
 pub mod orchestrator_root_helpers;
+pub mod module_weights_state;
 
 /// Resolve the launcher DB path: `<VCT_STATE_DIR or ~/.vct>/launcher.db`.
 pub fn db_path() -> PathBuf {

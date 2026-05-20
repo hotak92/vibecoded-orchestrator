@@ -1,0 +1,33 @@
+-- launcher.db — module_installs.container_name (migration 015, Phase 1E)
+--
+-- Adds a nullable `container_name TEXT` column to `module_installs`.
+--
+-- WHY: phase 1E of the Pro-tier RL Reranker release. The launcher manages
+-- the lifecycle of the per-project RL container itself (rather than a
+-- systemd unit per project). When a container_pull module installs we
+-- resolve `runtime.container_name_template` (e.g.
+-- `"vct-rl-reranker-{project_slug}"`) into a concrete container name
+-- (`"vct-rl-reranker-acme-corp"`) and persist it here. The launcher's
+-- startup hook reads this column to enumerate the containers that
+-- need to be re-checked / restarted after a launcher quit-relaunch
+-- cycle, and the uninstall path reads it to know which container to
+-- `podman rm -f` before deleting the install row.
+--
+-- NULLABLE: existing module_installs rows from non-container modules
+-- (git_clone, local) have NULL here forever. The Phase 1E start path
+-- only writes a value when `install.method == container_pull`. A NULL
+-- value is the "this isn't a container module" signal — the launcher's
+-- uninstall + startup-resume paths skip such rows.
+--
+-- No UNIQUE constraint: two installs CAN end up with the same
+-- container_name if (a) the user re-installs the same module for the
+-- same project without uninstalling first (today's idempotent
+-- start_container_for_module force-removes the stale row before re-
+-- creating), or (b) two projects share a slug (the slug helper enforces
+-- uniqueness in `projects.slug`, so the per-project template always
+-- yields a unique name — the constraint isn't needed at the DB layer).
+--
+-- Forward-only, idempotent (the migrations runner gates by version in
+-- `_schema_migrations`; this file is only ever executed once per DB).
+
+ALTER TABLE module_installs ADD COLUMN container_name TEXT;

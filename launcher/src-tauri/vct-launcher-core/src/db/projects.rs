@@ -53,6 +53,7 @@ impl Db {
             slug: slug.to_string(),
             created_at: now,
             updated_at: now,
+            rl_port: None,
         })
     }
 
@@ -60,7 +61,7 @@ impl Db {
         let guard = self.lock();
         guard
             .query_row(
-                "SELECT id, name, folder_path, host, slug, created_at, updated_at
+                "SELECT id, name, folder_path, host, slug, created_at, updated_at, rl_port
                  FROM projects WHERE id = ?1",
                 params![id],
                 row_to_project,
@@ -76,7 +77,7 @@ impl Db {
         let guard = self.lock();
         guard
             .query_row(
-                "SELECT id, name, folder_path, host, slug, created_at, updated_at
+                "SELECT id, name, folder_path, host, slug, created_at, updated_at, rl_port
                  FROM projects WHERE slug = ?1",
                 params![slug],
                 row_to_project,
@@ -89,7 +90,7 @@ impl Db {
         let guard = self.lock();
         let mut stmt = guard
             .prepare(
-                "SELECT id, name, folder_path, host, slug, created_at, updated_at
+                "SELECT id, name, folder_path, host, slug, created_at, updated_at, rl_port
                  FROM projects ORDER BY name ASC",
             )
             .map_err(|e| format!("prepare list: {}", e))?;
@@ -98,6 +99,51 @@ impl Db {
             .map_err(|e| format!("query list: {}", e))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("collect list: {}", e))
+    }
+
+    // ─── rl_port (migration 014) ─────────────────────────────────────────
+    //
+    // B2 / single-writer principle: `projects.rl_port` is a HUB-writable
+    // system-observed column (v0.2.21 Step 3 decision tightening). The
+    // launcher GUI does NOT write to this column; only the supervisor in
+    // `vct-hub::module_supervisor` allocates and persists values. The
+    // `set_project_rl_port` helper stays in this file because callers from
+    // the hub crate (which depends on vct-launcher-core) need it, and
+    // because tests in vct-launcher-core seed the column directly.
+
+    /// Read the per-project RL reranker server port. Returns `Ok(None)`
+    /// when the column is NULL (project predates allocation) OR the
+    /// project doesn't exist.
+    pub fn get_project_rl_port(&self, project_id: &str) -> Result<Option<u16>, String> {
+        let guard = self.lock();
+        let raw: Option<i64> = guard
+            .query_row(
+                "SELECT rl_port FROM projects WHERE id = ?1",
+                params![project_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("get rl_port: {}", e))?
+            .flatten();
+        Ok(raw.and_then(|v| u16::try_from(v).ok()))
+    }
+
+    /// Persist the per-project RL reranker server port. HUB-only call site
+    /// (see B2 single-writer note above). Caller is responsible for
+    /// choosing a value (11442 for orchestrator-root, 11500..=11900 random
+    /// otherwise) and ensuring no collision.
+    pub fn set_project_rl_port(&self, project_id: &str, port: u16) -> Result<(), String> {
+        let guard = self.lock();
+        let n = guard
+            .execute(
+                "UPDATE projects SET rl_port = ?1, updated_at = ?2 WHERE id = ?3",
+                params![port as i64, Utc::now().timestamp_millis(), project_id],
+            )
+            .map_err(|e| format!("set rl_port: {}", e))?;
+        if n == 0 {
+            return Err(format!("project {} not found", project_id));
+        }
+        Ok(())
     }
 
     /// Rename + regenerate slug if requested. The slug parameter, when
@@ -166,5 +212,6 @@ fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectRow> {
         slug: row.get(4)?,
         created_at: row.get(5)?,
         updated_at: row.get(6)?,
+        rl_port: row.get::<_, Option<i64>>(7).unwrap_or(None),
     })
 }

@@ -415,6 +415,13 @@ fn find_manifest(module_id: &str) -> Result<(ModuleManifest, PathBuf), String> {
     Err(format!("module {} not in catalog", module_id))
 }
 
+/// Public manifest-lookup for the rl_service restart path. Same logic as
+/// `find_manifest` (catalog scan + first matching id wins) but discards
+/// the source path since callers only need the parsed manifest.
+pub fn find_manifest_for_resume(module_id: &str) -> Option<ModuleManifest> {
+    find_manifest(module_id).ok().map(|(m, _)| m)
+}
+
 // ─── Install / Uninstall ────────────────────────────────────────────────
 
 #[command]
@@ -492,16 +499,66 @@ pub async fn install_module_for_project(
                 Some(&module_id),
                 &serde_json::json!({ "install_dir": resolved_dir.display().to_string() }),
             )?;
+
+            // Phase 1E: per-project container lifecycle. For
+            // container_pull modules we resolve `runtime.container_name_
+            // template`, allocate an `rl_port` if not yet set, and
+            // spawn the container via `rl_service`. Soft-fail throughout:
+            // the install row stays at status=installed even when the
+            // container start fails — the user can hit Restart from the
+            // dashboard. Surfaces the error via audit + a non-blocking
+            // toast event so the failure mode is visible without
+            // rolling back the install.
+            let resolved_container_name = if manifest.install.method
+                == crate::manifest::InstallMethod::ContainerPull
+                && manifest.runtime.r#type == "container"
+            {
+                match crate::commands::rl_service::start_container_after_install(
+                    &manifest,
+                    &project,
+                    &db,
+                )
+                .await
+                {
+                    Ok(name) => Some(name),
+                    Err(e) => {
+                        eprintln!(
+                            "[rl_service] start_container_after_install failed (install row stays installed): {}",
+                            e
+                        );
+                        let _ = app.emit(
+                            "module://container-start-failed",
+                            serde_json::json!({
+                                "project_id": project_id,
+                                "module_id": module_id,
+                                "error": e,
+                            }),
+                        );
+                        let _ = db.audit(
+                            "module_container_start_failed",
+                            Some(&project_id),
+                            Some(&module_id),
+                            &serde_json::json!({ "error": e }),
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
             let _ = app.emit(
                 "module://install-complete",
                 serde_json::json!({
                     "project_id": project_id,
                     "module_id": module_id,
                     "success": true,
+                    "container_name": resolved_container_name,
                 }),
             );
             Ok(ModuleInstallRow {
                 status: ModuleStatus::Installed,
+                container_name: resolved_container_name,
                 ..row
             })
         }
@@ -536,6 +593,26 @@ pub async fn uninstall_module_v2(
     let row = db
         .get_module_install(&project_id, &module_id)?
         .ok_or_else(|| format!("module {} not installed for project {}", module_id, project_id))?;
+
+    // Phase 1E: stop + remove the per-project container (when present)
+    // BEFORE deleting the install row, so we don't orphan a podman
+    // container. Idempotent — stop_container_for_project soft-fails
+    // when the container doesn't exist. We don't propagate the result:
+    // a stuck container shouldn't block the uninstall DB write.
+    if let Some(container_name) = row.container_name.as_deref() {
+        if !container_name.is_empty() {
+            if let Err(e) = crate::commands::rl_service::stop_container_for_project(
+                container_name,
+            )
+            .await
+            {
+                eprintln!(
+                    "[uninstall] stop_container_for_project({}) failed: {}",
+                    container_name, e
+                );
+            }
+        }
+    }
 
     // Best-effort filesystem cleanup. Failures here don't fail the command —
     // the DB row removal is the source of truth for "installed or not".

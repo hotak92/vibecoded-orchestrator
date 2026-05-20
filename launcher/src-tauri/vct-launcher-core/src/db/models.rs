@@ -51,6 +51,21 @@ pub struct ProjectRow {
     pub slug: String,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Per-project RL reranker server port (Pro-tier vct-rl-reranker module,
+    /// v0.2.21 / migration 014). `None` for projects created before the
+    /// migration ran AND for projects where `set_project_rl_port` has not
+    /// run yet. Allocated in 11500..=11900 on first RL install for the
+    /// project (fixed 11442 for `host='orchestrator_root'`). Persisted via
+    /// `Db::set_project_rl_port`.
+    ///
+    /// B2 / single-writer principle (v0.2.21 Step 3 decision): this column
+    /// is HUB-WRITABLE / launcher-readable. The Phase 1E supervisor
+    /// (relocated to vct-hub::module_supervisor in Step 24 commit b)
+    /// allocates and writes; the launcher GUI only reads to render port
+    /// in the dashboard. Direct writes from launcher commands are
+    /// intentionally not exposed.
+    #[serde(default)]
+    pub rl_port: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -97,6 +112,42 @@ pub struct ModuleInstallRow {
     pub installed_at: i64,
     pub last_started_at: Option<i64>,
     pub last_error: Option<String>,
+    /// Resolved container name for container-runtime modules (migration 015,
+    /// Phase 1E). `None` for non-container modules (git_clone / local) and
+    /// for container modules whose start path hasn't run yet. Populated by
+    /// the Phase 1E supervisor (now in `vct-hub::module_supervisor`)
+    /// immediately after `podman run -d --name <resolved>` succeeds; read
+    /// by the launcher's startup hook + the uninstall path to enumerate
+    /// containers.
+    ///
+    /// B2 / single-writer principle (v0.2.21 Step 3 decision): this column
+    /// is HUB-WRITABLE / launcher-readable. The launcher GUI never writes
+    /// it — only the hub-side `module_supervisor` does, via the proxy path
+    /// added in Step 24 commit b.
+    #[serde(default)]
+    pub container_name: Option<String>,
+}
+
+/// Single row of `module_weights_state` (migration 016).
+///
+/// Tracks the per-(project × module × embedding_source) state for the RL
+/// reranker's downloadable model weights:
+///   * `version` — the locally-active weights version string (server-issued)
+///   * `last_checked_at` — unix-ms of the last `/rl-latest-version` poll
+///     attempt (success OR failure — observers want to know we tried)
+///   * `last_finetuned_at` — unix-ms of the last successful local fine-tune
+///
+/// Embedding source is stored as a free-form string (qwen3, arctic, openai,
+/// future…) — the launcher never enum-constrains it; the container picks
+/// the matching `.pt` based on the `ACTIVE_EMBEDDING` env var.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WeightsStateRow {
+    pub project_id: String,
+    pub module_id: String,
+    pub embedding_source: String,
+    pub version: String,
+    pub last_checked_at: i64,
+    pub last_finetuned_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
