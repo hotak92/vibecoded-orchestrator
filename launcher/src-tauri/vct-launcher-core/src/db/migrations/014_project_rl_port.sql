@@ -1,0 +1,34 @@
+-- launcher.db — per-project RL reranker server port (migration 014, v0.2.21)
+--
+-- Adds a nullable `rl_port INTEGER` column to the `projects` table.
+--
+-- WHY: phase 1D of the Pro-tier RL Reranker release. The bundled
+-- `vct-rl-reranker` module (paid-modules/vct-rl-reranker/) ships one
+-- container per project so RL reranker state stays per-project (rather
+-- than every project sharing one model server with collision-prone
+-- global state). Each container needs a unique host port; the launcher
+-- allocates one randomly in 11500..=11900 the first time the module is
+-- installed on a project (with a fixed 11442 for the orchestrator-root
+-- project so the orchestrator clone's RL surface is always discoverable
+-- at the same address).
+--
+-- DUAL-WRITE contract: this column is the source of truth. The
+-- launcher's `write_project_env_files` mirrors the value into each
+-- project's env surfaces as `RL_SERVER_PORT` / `RL_SERVER_URL`. The
+-- MCP server + bundled scripts read from those env surfaces — they
+-- never read launcher.db directly.
+--
+-- NULLABLE: existing projects start NULL. Projects created before this
+-- migration get a NULL value; the env writer treats NULL as "module not
+-- installed for this project" and emits commented placeholder lines.
+--
+-- Forward-only, idempotent (the migrations runner gates by version in
+-- `_schema_migrations`; this file is only ever executed once per DB).
+--
+-- No CHECK constraint on rl_port: SQLite stores INTEGER as i64 and u16
+-- maps cleanly into that range. The launcher enforces the 11500..=11900
+-- window (or fixed 11442 for orchestrator-root) at `allocate_rl_port`
+-- write time; a bypass that wrote an out-of-range port would only
+-- pollute the launcher's own state, not break the schema.
+
+ALTER TABLE projects ADD COLUMN rl_port INTEGER;

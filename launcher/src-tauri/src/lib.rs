@@ -674,6 +674,37 @@ pub fn run() {
                 commands::lifecycle::auto_start_on_boot(app_handle_for_services).await;
             });
 
+            // v0.2.21 Stream B: per-project container resume + daily
+            // weights-update poll. Resume sweeps every install row with
+            // a non-null container_name and restarts any whose
+            // `is_container_running` probe returns false. The daily
+            // poller hits /rl-latest-version every 24h per installed
+            // RL reranker project; on `has_update=true` it emits
+            // `module://weights-update-available` for Stream D's
+            // WeightsUpdatePrompt component. Soft-fail throughout —
+            // never blocks setup, never crashes the launcher.
+            //
+            // Step 24 Phase 2 (commit b) relocates the resume + poller
+            // implementations into `vct-hub::module_supervisor`; the
+            // launcher kicks the hub instead of running the supervisor
+            // logic directly. See `commands::rl_service` for the proxy
+            // shape.
+            let rl_resume_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                use tauri::Manager;
+                let db = rl_resume_handle.state::<crate::db::Db>();
+                crate::commands::rl_service::resume_containers_on_startup(&db).await;
+            });
+            // Daily weights-update poll. license_reader closure returns
+            // None when the user is free-tier (no licensing-cache present)
+            // — the poller's inner loop short-circuits early in that case.
+            // Step 24 Phase 2 wires the real license-reader from the
+            // licensing module (was `|| None` stub in Phase 1).
+            crate::commands::rl_service::spawn_daily_weights_poll(
+                app.handle().clone(),
+                || None,
+            );
+
             // v0.2.6 (Bug D3): background watcher that polls services
             // every 30s and auto-restarts on running→stopped transitions.
             // Logs to <install>/state/logs/services-watcher.jsonl. User
@@ -861,6 +892,24 @@ pub fn run() {
             commands::modules::set_module_enabled_v2,
             commands::modules::module_start_v2,
             commands::modules::module_stop_v2,
+            // v0.2.21 Stream B (2026-05-19): per-project RL container
+            // lifecycle (Phase 1E) + weights-update polling (Phase 3C)
+            // + fine-tune-after-download (Phase 4A) + dashboard widget
+            // (Phase 4B scaffolding). Wired commands:
+            commands::rl_service::rl_is_container_running,
+            commands::rl_service::restart_rl_container,
+            commands::rl_service::check_for_weights_update_now,
+            commands::rl_service::apply_weights_update,
+            commands::rl_service::get_rl_dashboard_state,
+            // module_weights_state DB plumbing (migration 016). Read /
+            // upsert paths exposed for Stream D's WeightsUpdatePrompt +
+            // future dashboard widgets.
+            commands::module_weights_state::get_weights_state,
+            commands::module_weights_state::upsert_weights_state,
+            commands::module_weights_state::set_weights_state_last_checked_at,
+            commands::module_weights_state::set_weights_state_last_finetuned_at,
+            commands::module_weights_state::set_weights_state_version,
+            commands::module_weights_state::list_weights_state_for_project,
             // Stream 2 (2026-05-19): module-contributed GUI tabs +
             // generic per-control state. `get_module_nav_items` feeds the
             // Sidebar's module nav group; the get/set setting pair is the

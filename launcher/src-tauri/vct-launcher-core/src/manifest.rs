@@ -476,7 +476,7 @@ fn default_setting_type() -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeBlock {
-    pub r#type: String, // "mcp_stdio" | "mcp_http" | "service" | "cli"
+    pub r#type: String, // "mcp_stdio" | "mcp_http" | "service" | "cli" | "container"
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
@@ -496,6 +496,38 @@ pub struct RuntimeBlock {
     pub auto_restart: bool,
     #[serde(default)]
     pub log_file: Option<String>,
+
+    // ─── Phase 1E: per-project container runtime fields ───────────────
+    //
+    // These fields are only meaningful when `r#type == "container"`. Modules
+    // with other runtime types (mcp_stdio / mcp_http / service / cli) leave
+    // them empty / None and the supervisor (vct-hub::module_supervisor)
+    // never reads them.
+
+    /// Container-name template (e.g. `"vct-rl-reranker-{project_slug}"`).
+    /// `{project_slug}` is the only placeholder honoured.
+    #[serde(default)]
+    pub container_name_template: Option<String>,
+
+    /// Image reference template (e.g. `"{install.container.image}:{install.container.tag}"`).
+    /// Resolved by `module_supervisor::resolve_image_ref` against the
+    /// manifest's `install.container` block at start time.
+    #[serde(default)]
+    pub image_ref: Option<String>,
+
+    /// Port mappings host → container.
+    #[serde(default)]
+    pub ports: Vec<PortMapping>,
+
+    /// Volume mounts host → container.
+    #[serde(default)]
+    pub volumes: Vec<VolumeMount>,
+
+    /// Env vars that need placeholder substitution at start time
+    /// (`{RL_SERVER_PORT}`, `{project_slug}`, `{ollama_port}`).
+    /// Distinct from `env_fixed` (literal values).
+    #[serde(default)]
+    pub env_derived: HashMap<String, String>,
 
     // ─── v0.2.20: per-module GPU mode hints ───────────────────────────
     //
@@ -555,6 +587,39 @@ pub struct GpuImageVariants {
     pub cuda: String,
     /// ROCm variant tag (e.g. `"0.1.0-rocm"`). Used for `GpuMode::Rocm`.
     pub rocm: String,
+}
+
+/// A single port mapping for a container module.
+///
+/// Wire shape: `[bind:]<host>:<container>`. `host` is a placeholder string
+/// (typically `"{RL_SERVER_PORT}"`) resolved at start time against the
+/// project's allocated rl_port. `container` is the in-container port
+/// number (literal u16). `bind` defaults to `"127.0.0.1"` when None, so
+/// the supervisor never accidentally exposes per-project containers to
+/// the LAN.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PortMapping {
+    /// Host-side port (string so it can be a `{PLACEHOLDER}`).
+    pub host: String,
+    /// In-container port (literal u16).
+    pub container: u16,
+    /// Bind address. Defaults to `"127.0.0.1"` when None.
+    #[serde(default)]
+    pub bind: Option<String>,
+}
+
+/// A single volume mount for a container module.
+///
+/// Wire shape: `<host>:<container>[:<mode>]`. Both `host` and `container`
+/// undergo placeholder substitution against `PlaceholderCtx` +
+/// `{project_slug}`. Mode is optional; common values are `"rw"` (default
+/// when omitted), `"ro"`, or `"z"`/`"Z"` (SELinux relabel on RHEL hosts).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VolumeMount {
+    pub host: String,
+    pub container: String,
+    #[serde(default)]
+    pub mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -687,7 +752,7 @@ impl ModuleManifest {
 
         if !matches!(
             m.runtime.r#type.as_str(),
-            "mcp_stdio" | "mcp_http" | "service" | "cli"
+            "mcp_stdio" | "mcp_http" | "service" | "cli" | "container"
         ) {
             return Err(format!("runtime.type '{}' not recognized", m.runtime.r#type));
         }

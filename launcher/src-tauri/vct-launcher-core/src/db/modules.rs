@@ -37,7 +37,65 @@ impl Db {
             installed_at: now,
             last_started_at: None,
             last_error: None,
+            container_name: None,
         })
+    }
+
+    /// Persist a resolved container name on a module_install row
+    /// (migration 015, Phase 1E). HUB-only writer (see B2 single-writer
+    /// principle in models.rs::ModuleInstallRow::container_name doc).
+    /// Called by `vct-hub::module_supervisor::start_container_for_module`
+    /// immediately after `podman run` succeeds, so the launcher's startup
+    /// hook + uninstall path can enumerate per-project containers.
+    pub fn set_module_container_name(
+        &self,
+        project_id: &str,
+        module_id: &str,
+        container_name: &str,
+    ) -> Result<(), String> {
+        let guard = self.lock();
+        let n = guard
+            .execute(
+                "UPDATE module_installs SET container_name = ?1
+                  WHERE project_id = ?2 AND module_id = ?3",
+                params![container_name, project_id, module_id],
+            )
+            .map_err(|e| format!("set container_name: {}", e))?;
+        if n == 0 {
+            return Err(format!(
+                "module_install not found for project={} module={}",
+                project_id, module_id
+            ));
+        }
+        Ok(())
+    }
+
+    /// List every (project_id, module_id, container_name) triple where
+    /// container_name is non-null. Used by the launcher's startup hook
+    /// to enumerate per-project containers that need re-checking after
+    /// a quit-relaunch cycle.
+    pub fn list_module_installs_with_containers(
+        &self,
+    ) -> Result<Vec<(String, String, String)>, String> {
+        let guard = self.lock();
+        let mut stmt = guard
+            .prepare(
+                "SELECT project_id, module_id, container_name
+                   FROM module_installs
+                  WHERE container_name IS NOT NULL AND container_name != ''",
+            )
+            .map_err(|e| format!("prepare list_containers: {}", e))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| format!("query list_containers: {}", e))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("collect list_containers: {}", e))
     }
 
     pub fn set_module_status(
@@ -92,7 +150,8 @@ impl Db {
         guard
             .query_row(
                 "SELECT id, project_id, module_id, module_version, install_path,
-                        status, enabled, installed_at, last_started_at, last_error
+                        status, enabled, installed_at, last_started_at, last_error,
+                        container_name
                  FROM module_installs
                  WHERE project_id = ?1 AND module_id = ?2",
                 params![project_id, module_id],
@@ -110,6 +169,7 @@ impl Db {
                         installed_at: row.get(7)?,
                         last_started_at: row.get(8)?,
                         last_error: row.get(9)?,
+                        container_name: row.get(10).ok().flatten(),
                     })
                 },
             )
@@ -125,7 +185,8 @@ impl Db {
         let mut stmt = guard
             .prepare(
                 "SELECT id, project_id, module_id, module_version, install_path,
-                        status, enabled, installed_at, last_started_at, last_error
+                        status, enabled, installed_at, last_started_at, last_error,
+                        container_name
                  FROM module_installs WHERE project_id = ?1 ORDER BY installed_at DESC",
             )
             .map_err(|e| format!("prepare: {}", e))?;
@@ -144,6 +205,7 @@ impl Db {
                     installed_at: row.get(7)?,
                     last_started_at: row.get(8)?,
                     last_error: row.get(9)?,
+                    container_name: row.get(10).ok().flatten(),
                 })
             })
             .map_err(|e| format!("query: {}", e))?;

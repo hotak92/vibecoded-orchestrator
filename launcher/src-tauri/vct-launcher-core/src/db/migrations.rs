@@ -83,6 +83,21 @@ const MIGRATIONS: &[Migration] = &[
         description: "projects.host CHECK extended to allow 'orchestrator_root' (auto-registered at launcher startup, v0.2.11 / 2026-05-15)",
         sql: include_str!("migrations/013_orchestrator_root.sql"),
     },
+    Migration {
+        version: 14,
+        description: "projects.rl_port: per-project RL reranker server port (v0.2.21, Phase 1D)",
+        sql: include_str!("migrations/014_project_rl_port.sql"),
+    },
+    Migration {
+        version: 15,
+        description: "module_installs.container_name: resolved container name for container_pull modules (v0.2.21, Phase 1E)",
+        sql: include_str!("migrations/015_module_install_container_name.sql"),
+    },
+    Migration {
+        version: 16,
+        description: "module_weights_state: per-(project × module × embedding_source) weights version / poll / finetune state (v0.2.21, Phase 3C)",
+        sql: include_str!("migrations/016_module_weights_state.sql"),
+    },
 ];
 
 /// Apply every migration whose version is greater than the current max applied.

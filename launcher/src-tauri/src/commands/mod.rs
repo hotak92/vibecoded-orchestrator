@@ -26,7 +26,20 @@ pub mod licensing;
 pub mod maintenance;
 pub mod manifest;
 pub mod module_gui;
+// v0.2.21 Stream B: per-(project × module × embedding_source) weights state.
+// Tauri-commands wrapper around the `module_weights_state` table
+// (migration 016). The DB plumbing lives in
+// `vct-launcher-core/src/db/module_weights_state.rs`.
+pub mod module_weights_state;
 pub mod modules;
+// v0.2.21 Stream B: per-project container lifecycle for `runtime.type ==
+// "container"` modules (Phase 1E) + weights update poller (Phase 3C) +
+// fine-tune-after-download flow (Phase 4A) + dashboard widget commands
+// (Phase 4B scaffolding). Phase 1 of Step 24 keeps the supervisor logic
+// in this file; Phase 2 (commit b) relocates the supervisor into
+// `vct-hub::module_supervisor` and converts the Tauri commands into HTTP
+// proxies to the hub's lifecycle endpoints.
+pub mod rl_service;
 pub mod openai_cmd;
 // Stream 2 follow-up (v0.2.20 / 2026-05-19): Tauri-command backings for
 // the orchestrator-core `gui.config_tab` declared in `vct-module.json`.
