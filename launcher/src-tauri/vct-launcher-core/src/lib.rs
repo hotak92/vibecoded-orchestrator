@@ -13,6 +13,7 @@ pub mod db;
 pub mod manifest;
 pub mod orchestrator_manifest;
 pub mod paths;
+pub mod process;
 pub mod registry;
 pub mod secrets;
 pub mod services;

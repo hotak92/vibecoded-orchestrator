@@ -5331,6 +5331,7 @@ dependencies = [
  "chrono",
  "hex",
  "keyring",
+ "libc",
  "rand 0.9.4",
  "reqwest 0.12.28",
  "rusqlite",
@@ -5341,6 +5342,7 @@ dependencies = [
  "tower-http",
  "uuid",
  "vct-launcher-core",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

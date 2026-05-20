@@ -1182,88 +1182,12 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
-/// v0.2.17 (plan 0.0): check whether a given PID is still alive.
-///
-/// Cross-OS: `kill(pid, 0)` on POSIX (signal 0 means "validate the
-/// target without sending a signal"; ESRCH = dead, success = alive),
-/// `OpenProcess` on Windows (returns NULL when the PID doesn't
-/// exist). Returns `false` on any error (assume dead — the worst
-/// case is we keep a stale file for one extra reboot).
-fn pid_is_alive(pid: u32) -> bool {
-    // Defense in depth: reject sentinel pids before touching libc.
-    //
-    // POSIX `kill(pid, sig)` has SPECIAL semantics for non-positive
-    // pids:
-    //   pid =  0  → "every process in caller's process group"
-    //   pid = -1  → "every process the caller has permission to signal"
-    //   pid < -1  → "every process in process group -pid"
-    //
-    // `u32` values that exceed `i32::MAX` cast to NEGATIVE pid_t on
-    // Linux/macOS (pid_t is i32). e.g. u32::MAX → pid_t(-1) → kill(-1, 0)
-    // → returns 0 (success) — which is NOT the per-process check we
-    // wanted. The sweep helper would then incorrectly conclude the
-    // stale pid is "alive" and skip the cleanup.
-    //
-    // Reject those upfront. Filenames matching `*.old-<pid>` with
-    // a pid in the dangerous range (0 or > i32::MAX) are malformed
-    // anyway — real OS pids fit in [1, i32::MAX].
-    if pid == 0 || pid > i32::MAX as u32 {
-        return false;
-    }
-
-    #[cfg(unix)]
-    {
-        // libc::kill(pid, 0) returns 0 if the process exists. -1 with
-        // errno == ESRCH means dead. errno == EPERM means alive but
-        // we don't have permission — still counts as "alive" (don't
-        // delete its file). Any other errno: be conservative, say alive.
-        //
-        // v0.2.17.1 (hotfix): use `std::io::Error::last_os_error()` to
-        // read errno cross-OS. The previous `libc::__errno_location()`
-        // symbol is glibc-only (Linux); macOS uses `__error()`, BSDs
-        // have yet other names. `last_os_error()` resolves to the
-        // correct platform symbol internally and is the canonical
-        // Rust-portable way to read errno after a libc call.
-        //
-        // Safety: kill(pid, 0) is async-signal-safe per POSIX. We
-        // call it before reading errno so the errno value belongs
-        // to this call. The pid > 0 && pid <= i32::MAX guard above
-        // means the cast to pid_t is always positive on
-        // 32-bit-pid_t systems.
-        unsafe {
-            if libc::kill(pid as libc::pid_t, 0) == 0 {
-                return true;
-            }
-        }
-        let raw = std::io::Error::last_os_error().raw_os_error();
-        // ESRCH = "No such process". On any other errno (EPERM "alive
-        // but no permission", or any unknown) be conservative: assume
-        // alive.
-        raw != Some(libc::ESRCH)
-    }
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::Foundation::CloseHandle;
-        use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
-        // SAFETY: OpenProcess is a thin FFI call. On failure we get
-        // NULL; on success we close the returned handle immediately.
-        unsafe {
-            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-            if handle.is_null() {
-                false
-            } else {
-                CloseHandle(handle);
-                true
-            }
-        }
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = pid;
-        // Unknown platform: assume alive (don't delete).
-        true
-    }
-}
+// v0.2.21 Step 5: `pid_is_alive` moved to `vct-launcher-core::process`
+// so the detached vct-hub binary can reuse it for its own lockfile
+// state machine. Re-exported here so launcher call sites (the binary-
+// sibling sweep at line ~1300, plus the test module below) continue
+// to resolve via the same `pid_is_alive` symbol.
+pub(crate) use vct_launcher_core::process::pid_is_alive;
 
 /// v0.2.17 (plan 0.0): sweep stale `<binary>.old-<pid>` and
 /// `<binary>.pending-<pid>` siblings from the launcher dist
