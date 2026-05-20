@@ -211,8 +211,10 @@ curl -I https://ollama.com     # check network
 If stuck, manually pull inside the container:
 
 ```bash
-podman exec ollama_claude ollama pull qwen3-embedding:0.6b
+podman exec vco_ollama ollama pull qwen3-embedding:0.6b
 ```
+
+> The canonical container name is `vco_ollama` (per `vco_lib/containers.py::CANONICAL_CONTAINERS`, since v0.2.15). The legacy name `ollama_claude` is preserved as an alias in `HISTORICAL_ALIASES` for backward compatibility — both work, but new docs and tooling use the canonical form.
 
 ## MCP connection failures in Claude Code
 
@@ -232,7 +234,7 @@ claude mcp list
 
 1. **Editor opened before containers started**: restart your Claude Code session (VS Code window reload, restart the CLI, or reopen Claude Desktop) once `docker ps` / `podman ps` shows Weaviate + Ollama running.
 2. **Wrong Python in MCP config**: `MCP_PYTHON` must point at the `install.py`-created venv, not system Python — check `.claude/settings.json` → `env` (the canonical channel since v0.2.12; CLI / Desktop app / VS Code extension all read it, and MCP subprocesses inherit from it). The historical `.vscode/settings.json` `claude-code.env` surface was removed in v0.2.12 (PR-27) because that block didn't propagate to MCP subprocesses on Linux Claude Code 2.1.143 (empirical sentinel testing confirmed; that's why the surface was dropped). If you're migrating from a pre-v0.2.12 install and your project relied on `claude-code.env`, copy the keys into `.claude/settings.json` `env` — same shape, different file.
-3. **Embedding model mismatch**: `ACTIVE_EMBEDDING` must match a model actually loaded by Ollama. Default is `qwen3` with model `qwen3-embedding:0.6b`. Verify with `podman exec ollama_claude ollama list`.
+3. **Embedding model mismatch**: `ACTIVE_EMBEDDING` must match a model actually loaded by Ollama. Default is `qwen3` with model `qwen3-embedding:0.6b`. Verify with `podman exec vco_ollama ollama list` (the canonical container name since v0.2.15; legacy `ollama_claude` still works as an alias).
 
 ## vct-hub troubleshooting (v0.2.21+)
 
