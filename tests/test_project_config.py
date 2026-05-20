@@ -313,12 +313,61 @@ class ResolveErrorMappingTest(_ResolverTestBase):
             resolve(FULL_BODY["project_id"])
 
     def test_401_maps_to_hub_unreachable(self) -> None:
+        # Both attempts (initial + retry) 401 → final HubUnreachable.
         self.session.get.return_value = _make_response(
             401,
             {"error": {"code": "unauthorized", "message": "bad token"}},
         )
         with self.assertRaises(HubUnreachable):
             resolve(FULL_BODY["project_id"])
+        # The retry path SHOULD have called twice (initial + retry after
+        # cache invalidation). Both 401, so the user-visible error is
+        # HubUnreachable. Asserts the cache-invalidation+retry path
+        # actually fired (regression guard for v0.2.21 mid-session-25
+        # Reviewer-A MEDIUM finding).
+        self.assertGreaterEqual(self.session.get.call_count, 2)
+
+    def test_401_then_200_recovers_via_retry(self) -> None:
+        # v0.2.21 Step 25 Reviewer-A MEDIUM finding fix: when the in-
+        # process discovery cache holds a stale token from a hub
+        # restart, the first GET 401s. The resolver invalidates the
+        # cache, re-reads hub.port + hub.token from disk, and re-issues
+        # the request. On the retry it gets 200 → returns a ProjectConfig
+        # rather than raising HubUnreachable.
+        self.session.get.side_effect = [
+            _make_response(
+                401,
+                {"error": {"code": "unauthorized", "message": "stale token"}},
+            ),
+            _make_response(200, FULL_BODY),
+        ]
+        cfg = resolve(FULL_BODY["project_id"])
+        self.assertIsInstance(cfg, ProjectConfig)
+        self.assertEqual(cfg.project_slug, "myproject")
+        # Both calls should have fired (initial 401 + retry 200).
+        self.assertEqual(self.session.get.call_count, 2)
+
+    def test_401_retry_invalidates_discovery_cache(self) -> None:
+        # The retry path MUST call _invalidate_discovery_cache() between
+        # the first 401 and the retry attempt. Spy on the function to
+        # confirm — proves the cache-invalidation step actually fires
+        # rather than the retry silently re-using the stale cache (which
+        # would just 401 again for the same reason).
+        with mock.patch.object(
+            project_config,
+            "_invalidate_discovery_cache",
+            wraps=project_config._invalidate_discovery_cache,
+        ) as spy:
+            self.session.get.return_value = _make_response(
+                401,
+                {"error": {"code": "unauthorized", "message": "bad"}},
+            )
+            with self.assertRaises(HubUnreachable):
+                resolve(FULL_BODY["project_id"])
+            self.assertEqual(
+                spy.call_count, 1,
+                "expected exactly one cache-invalidation between initial 401 + retry",
+            )
 
     def test_500_maps_to_hub_unreachable(self) -> None:
         self.session.get.return_value = _make_response(

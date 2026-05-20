@@ -75,7 +75,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import requests
 
@@ -294,6 +294,85 @@ def _test_clear_cache() -> None:
         _discovery_cache = None
 
 
+def _invalidate_discovery_cache() -> None:
+    """Drop the cached (port, token) so the next ``_discover_hub`` call
+    re-reads ``hub.port`` + ``hub.token`` from disk.
+
+    v0.2.21 mid-session-25-review (Reviewer A MEDIUM finding): the hub
+    rotates its auth token on every restart (`auth.rs::generate_token`
+    runs in `server.rs::start_hub_server`). After a Step 12 update
+    choreography hub-stop → hub-start sequence, the in-process 5-second
+    discovery cache holds the OLD token for up to 5 seconds. Calls
+    during that window 401, get mapped to ``HubUnreachable``, and
+    callers degrade to env vars even though the hub is up and the new
+    token is sitting on disk.
+
+    The retry-wrapper below catches a 401, invalidates the cache, and
+    re-discovers + re-issues the request once. Subsequent 401s map to
+    HubUnreachable unchanged.
+    """
+    global _discovery_cache
+    with _discovery_lock:
+        _discovery_cache = None
+
+
+def _get_with_401_retry(
+    url_builder: Callable[[int, str], str],
+    *,
+    params: dict | None = None,
+) -> requests.Response:
+    """GET a hub URL with one-shot 401 retry-with-cache-invalidation.
+
+    ``url_builder`` is a closure that takes ``(port, token)`` and returns
+    the full URL. The closure pattern is needed because the URL itself
+    embeds the port (e.g. ``http://127.0.0.1:7700/api/v1/...``); a token
+    rotation that also moved the port would invalidate the cached URL.
+    The closure is invoked twice on retry — once with the (possibly-
+    stale) cached discovery, once with the freshly re-read discovery.
+
+    Returns the underlying ``requests.Response`` — the caller handles
+    status-code dispatch. Wraps ``requests.RequestException`` into
+    ``HubUnreachable`` as the existing call sites do.
+
+    Subsequent 401s (after the retry) are returned as-is so the caller
+    can map them to ``HubUnreachable`` with the appropriate error
+    message context.
+    """
+    port, token = _discover_hub()
+    url = url_builder(port, token)
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        resp = _http_session().get(
+            url,
+            params=params,
+            headers=headers,
+            timeout=(_CONNECT_TIMEOUT_SECONDS, _READ_TIMEOUT_SECONDS),
+        )
+    except requests.RequestException as exc:
+        raise HubUnreachable(f"hub GET failed: {exc}") from exc
+
+    if resp.status_code != 401:
+        return resp
+
+    # 401 → likely a stale token from the in-process 5s discovery cache
+    # after a hub restart. Invalidate + re-discover + retry once. If
+    # the second attempt also 401s, the caller maps it to HubUnreachable.
+    _invalidate_discovery_cache()
+    port, token = _discover_hub()
+    url = url_builder(port, token)
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        resp = _http_session().get(
+            url,
+            params=params,
+            headers=headers,
+            timeout=(_CONNECT_TIMEOUT_SECONDS, _READ_TIMEOUT_SECONDS),
+        )
+    except requests.RequestException as exc:
+        raise HubUnreachable(f"hub GET failed on retry: {exc}") from exc
+    return resp
+
+
 # ─── Internal: HTTP session ─────────────────────────────────────────────
 
 
@@ -356,29 +435,22 @@ def _looks_like_path(value: str) -> bool:
     return False
 
 
-def _resolve_project_id(
-    project_arg: str, port: int, token: str
-) -> str:
+def _resolve_project_id(project_arg: str) -> str:
     """Resolve the project's id for the resolver argument.
 
     If ``project_arg`` looks like a UUID/id, return it verbatim. If it
     looks like a path, GET ``/api/v1/projects/by-path?path=<arg>`` and
-    return the resulting ``id``.
+    return the resulting ``id``. Discovery (port + token) is performed
+    inside :func:`_get_with_401_retry` so a hub restart between calls
+    doesn't strand a stale token in the in-process cache.
     """
     if not _looks_like_path(project_arg):
         return project_arg
 
-    url = f"http://127.0.0.1:{port}/api/v1/projects/by-path"
-    headers = {"Authorization": f"Bearer {token}"}
-    try:
-        resp = _http_session().get(
-            url,
-            params={"path": project_arg},
-            headers=headers,
-            timeout=(_CONNECT_TIMEOUT_SECONDS, _READ_TIMEOUT_SECONDS),
-        )
-    except requests.RequestException as exc:
-        raise HubUnreachable(f"by-path lookup failed: {exc}") from exc
+    resp = _get_with_401_retry(
+        lambda port, _token: f"http://127.0.0.1:{port}/api/v1/projects/by-path",
+        params={"path": project_arg},
+    )
 
     if resp.status_code == 200:
         try:
@@ -488,19 +560,11 @@ def resolve(project_root: Path | str) -> ProjectConfig:
             # Path doesn't exist on disk — let the hub answer with 404.
             pass
 
-    port, token = _discover_hub()
-    pid = _resolve_project_id(arg, port, token)
+    pid = _resolve_project_id(arg)
 
-    url = f"http://127.0.0.1:{port}/api/v1/projects/{pid}/config"
-    headers = {"Authorization": f"Bearer {token}"}
-    try:
-        resp = _http_session().get(
-            url,
-            headers=headers,
-            timeout=(_CONNECT_TIMEOUT_SECONDS, _READ_TIMEOUT_SECONDS),
-        )
-    except requests.RequestException as exc:
-        raise HubUnreachable(f"config GET failed: {exc}") from exc
+    resp = _get_with_401_retry(
+        lambda port, _token: f"http://127.0.0.1:{port}/api/v1/projects/{pid}/config",
+    )
 
     if resp.status_code == 200:
         try:
@@ -581,20 +645,12 @@ def resolve_field(
         except OSError:
             pass
 
-    port, token = _discover_hub()
-    pid = _resolve_project_id(arg, port, token)
+    pid = _resolve_project_id(arg)
 
-    url = f"http://127.0.0.1:{port}/api/v1/projects/{pid}/config"
-    headers = {"Authorization": f"Bearer {token}"}
-    try:
-        resp = _http_session().get(
-            url,
-            params={"key": key},
-            headers=headers,
-            timeout=(_CONNECT_TIMEOUT_SECONDS, _READ_TIMEOUT_SECONDS),
-        )
-    except requests.RequestException as exc:
-        raise HubUnreachable(f"config?key= GET failed: {exc}") from exc
+    resp = _get_with_401_retry(
+        lambda port, _token: f"http://127.0.0.1:{port}/api/v1/projects/{pid}/config",
+        params={"key": key},
+    )
 
     if resp.status_code == 200:
         try:
