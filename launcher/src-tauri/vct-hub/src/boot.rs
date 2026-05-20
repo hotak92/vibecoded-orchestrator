@@ -326,6 +326,15 @@ fn shell_single_quote(path: &Path) -> String {
 /// XML-escape a path string for inclusion in a plist `<string>` or a
 /// Windows Task XML `<Command>` field. Only the five XML metacharacters
 /// matter; UTF-8 byte sequences are passed through.
+///
+/// `dead_code` allowed on Linux: this function is only reached from
+/// `render_launchd_plist` (macOS) + `render_win_task_xml` (Windows)
+/// + tests. The Linux build doesn't compile the per-OS modules that
+/// call it, so the compiler can't see those use sites. The function
+/// itself is unconditionally compiled because the tests below
+/// exercise it from any host — that's by design (the rendering is
+/// pure-string, easy to unit-test cross-OS).
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 fn xml_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
@@ -352,7 +361,11 @@ fn render_systemd_unit(bin: &Path, state_dir: &Path) -> String {
         .replace("__VCT_STATE_DIR__", &state_dir.display().to_string())
 }
 
-/// macOS launchd plist body. Pure render.
+/// macOS launchd plist body. Pure render. Defined at top level (not
+/// inside the macos sub-module) so unit tests can exercise the
+/// rendering from any host. `dead_code` allowed on non-macOS to
+/// silence the cross-OS lint — real call site is in the macos module.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn render_launchd_plist(bin: &Path, state_dir: &Path) -> String {
     const TEMPLATE: &str = include_str!("../templates/com.vibecodedtools.vct-hub.plist.template");
     TEMPLATE
@@ -363,7 +376,10 @@ fn render_launchd_plist(bin: &Path, state_dir: &Path) -> String {
         )
 }
 
-/// Windows Scheduled Task XML body. Pure render.
+/// Windows Scheduled Task XML body. Pure render. Same cross-OS-lint
+/// dance as `render_launchd_plist` — top-level so unit tests work
+/// anywhere; allow(dead_code) on non-Windows.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn render_win_task_xml(sid: &str, shim_path: &Path, bin_dir: &Path) -> String {
     const TEMPLATE: &str = include_str!("../templates/vct-hub-task.xml.template");
     TEMPLATE
@@ -378,7 +394,8 @@ fn render_win_task_xml(sid: &str, shim_path: &Path, bin_dir: &Path) -> String {
         )
 }
 
-/// Windows .cmd shim body. Pure render.
+/// Windows .cmd shim body. Pure render. Same cross-OS-lint dance.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn render_win_shim(state_dir: &Path) -> String {
     const TEMPLATE: &str = include_str!("../templates/vct-hub-boot.cmd.template");
     TEMPLATE.replace("__VCT_STATE_DIR__", &state_dir.display().to_string())
@@ -390,6 +407,10 @@ fn render_win_shim(state_dir: &Path) -> String {
 /// on the VALUE only — `Enabled` / `Disabled` happen to be English
 /// even on localised Windows because schtasks reports the literal task
 /// state name from the underlying API.
+///
+/// `dead_code` allowed on non-Windows: top-level for unit-test
+/// accessibility from any host; only invoked from the windows module.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn parse_win_status_output(text: &str) -> BootStatus {
     for line in text.lines() {
         let trimmed = line.trim();
