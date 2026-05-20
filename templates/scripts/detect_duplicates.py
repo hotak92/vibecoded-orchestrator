@@ -45,9 +45,22 @@ from weaviate.classes.query import Filter, MetadataQuery
 # Configuration
 WEAVIATE_URL = os.getenv("WEAVIATE_URL", "http://localhost:8081")
 GRPC_PORT = int(os.getenv("GRPC_PORT", "50052"))
-COLLECTION_NAME = os.getenv("KG_COLLECTION", "KnowledgeGraph")
 DEFAULT_SIMILARITY_THRESHOLD = 0.95
 PROJECT_ROOT = Path(__file__).parent.parent.parent
+
+
+# v0.2.21 Step 18 (caller migration): resolve KG collection via the
+# launcher's vct-hub. Falls back to env when the hub is unreachable.
+def _resolve_kg_collection() -> str:
+    try:
+        from vco_lib.project_config import resolve  # type: ignore[import-not-found]
+        cfg = resolve(PROJECT_ROOT)
+        return cfg.kg_collection or os.getenv("KG_COLLECTION", "KnowledgeGraph")
+    except Exception:
+        return os.getenv("KG_COLLECTION", "KnowledgeGraph")
+
+
+COLLECTION_NAME = _resolve_kg_collection()
 
 
 def levenshtein_distance(s1: str, s2: str) -> int:

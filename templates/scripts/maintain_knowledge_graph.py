@@ -89,11 +89,23 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11435")
 GRPC_PORT = int(os.getenv("GRPC_PORT", "50052"))
 
 KNOWLEDGE_ROOT = PROJECT_ROOT / "knowledge"
-# PR-7 (v0.2.11): respect per-project KG_COLLECTION env. Pre-v0.2.11 this was
-# hardcoded "ClaudeKnowledgeGraph", which made every project's maintain run
-# query the legacy cross-project collection. Fallback is project-neutral
-# "KnowledgeGraph" (matches install.py's _configure_claude_settings default).
-KNOWLEDGE_COLLECTION = os.getenv("KG_COLLECTION", "KnowledgeGraph")
+
+
+# v0.2.21 Step 18 (caller migration): resolve KG collection via the
+# launcher's vct-hub. Falls back to env (PR-7 / v0.2.11 behaviour) when
+# the hub is unreachable. Pre-v0.2.11 this was hardcoded
+# "ClaudeKnowledgeGraph", which made every project's maintain run query
+# the legacy cross-project collection.
+def _resolve_kg_collection() -> str:
+    try:
+        from vco_lib.project_config import resolve  # type: ignore[import-not-found]
+        cfg = resolve(PROJECT_ROOT)
+        return cfg.kg_collection or os.getenv("KG_COLLECTION", "KnowledgeGraph")
+    except Exception:
+        return os.getenv("KG_COLLECTION", "KnowledgeGraph")
+
+
+KNOWLEDGE_COLLECTION = _resolve_kg_collection()
 DOCUMENTS_COLLECTION = "DocumentChunks"
 
 
