@@ -1131,6 +1131,38 @@
       </div>
     </section>
 
+    <!-- v0.2.22 Item #13 (2026-05-20): global retrieval tuning. Five
+         env-tunable thresholds (codegraph injection floor + four KG
+         tier cutoffs). Stored in <vct_root_dir>/retrieval-tuning.toml
+         and read by the hub's /config resolver so headless consumers
+         (hooks, MCPs, scripts) see the same values shown here. -->
+    <section class="pr-section">
+      <h2 class="pr-section-title">Retrieval tuning</h2>
+      <div class="pr-onboarding-row">
+        <div class="pr-onboarding-text">
+          <strong>Codegraph + KG score thresholds</strong>
+          <span class="pr-onboarding-hint">
+            Tune the score-driven retrieval tiers used by the pre-edit
+            context hook and the <code>hybrid_search</code> /
+            <code>semantic_graph_search</code> MCPs. Five sliders:
+            codegraph injection floor + four KG verbosity tier cutoffs.
+            Defaults are calibrated — change only if you have evidence
+            the floor is too tight or too loose for your corpus.
+            <br /><br />
+            Reference:
+            <code>knowledge/concepts/score-driven-retrieval-tiers.md</code>.
+          </span>
+        </div>
+        <button
+          class="pr-btn"
+          title="Open the score-threshold sliders for KG verbosity tiers and the codegraph injection floor"
+          onclick={() => goto('/preferences/retrieval')}
+        >
+          Open
+        </button>
+      </div>
+    </section>
+
     <!-- PR-10A storage UX (v0.2.11): deep link to the per-service
          storage picker. Adjacent to Updates because both are about
          runtime infrastructure (container data location vs. orchestrator
