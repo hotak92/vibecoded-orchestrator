@@ -222,25 +222,174 @@ Symptom: Claude says "MCP server weaviate-kg is not connected" or tool calls lik
 
 ```bash
 claude mcp list
-# Expected: weaviate-kg ✓ Connected, ollama ✓ Connected
+# Expected: weaviate-kg ✓ Connected, search ✓ Connected
+# (coordination is optional; lean-ctx / vct-coordination may also appear if installed.)
 ```
+
+> **"Where is the `ollama` MCP / `chat` / `read_image` tool?"** Removed in v0.2.11. Claude's native reasoning and the built-in `Read` tool (which handles images via vision) cover those use cases at higher quality. Ollama still runs as infrastructure on `:11435` — it powers Weaviate's text embeddings and the code-embedding service CPU fallback — but it is no longer exposed as an MCP tool. See `knowledge/concepts/mcp-simplification-v0211.md` if you need the full rationale.
 
 **Common causes**:
 
 1. **Editor opened before containers started**: restart your Claude Code session (VS Code window reload, restart the CLI, or reopen Claude Desktop) once `docker ps` / `podman ps` shows Weaviate + Ollama running.
-2. **Wrong Python in MCP config**: `MCP_PYTHON` must point at the `install.py`-created venv, not system Python — check `.claude/settings.json` → `env` (the canonical channel since v0.2.12; CLI / Desktop app / VS Code extension all read it, and MCP subprocesses inherit from it). The historical `.vscode/settings.json` `claude-code.env` surface was removed in v0.2.12 (PR-27) because that block didn't propagate to MCP subprocesses on Linux.
+2. **Wrong Python in MCP config**: `MCP_PYTHON` must point at the `install.py`-created venv, not system Python — check `.claude/settings.json` → `env` (the canonical channel since v0.2.12; CLI / Desktop app / VS Code extension all read it, and MCP subprocesses inherit from it). The historical `.vscode/settings.json` `claude-code.env` surface was removed in v0.2.12 (PR-27) because that block didn't propagate to MCP subprocesses on Linux Claude Code 2.1.143 (empirical sentinel testing confirmed; that's why the surface was dropped). If you're migrating from a pre-v0.2.12 install and your project relied on `claude-code.env`, copy the keys into `.claude/settings.json` `env` — same shape, different file.
 3. **Embedding model mismatch**: `ACTIVE_EMBEDDING` must match a model actually loaded by Ollama. Default is `qwen3` with model `qwen3-embedding:0.6b`. Verify with `podman exec ollama_claude ollama list`.
 
-## Launcher hub returns 401 Unauthorized
+## vct-hub troubleshooting (v0.2.21+)
 
-Symptom: a script or wrapper calling `http://127.0.0.1:7700/api/v1/...` directly gets `401 Unauthorized` with `{"error":{"code":"unauthorized",...}}`.
+Since v0.2.21 the launcher's HTTP hub is a detached binary (`vct-hub`) shipped alongside `vct-launcher` in `launcher/dist/<arch>/`. It outlives the launcher GUI: close the GUI and hooks, MCP servers, and resolver clients can still reach the hub on `http://127.0.0.1:7700`. It is started by `install.py`'s post-install step, by the `session-start-ensure-hub.sh` Claude Code hook, by `.vscode/tasks.json` on `folderOpen`, and by the launcher itself on GUI start. See `launcher/src-tauri/vct-hub/src/{lifecycle,lockfile,auth,boot}.rs` for the implementation.
 
-Since 0.2.0 the launcher's hub gates every `/api/v1/*` route (except `/api/v1/health`) with `Authorization: Bearer <token>`. The token is regenerated on every launcher startup and persisted to `~/.vct/hub.token` (mode `0o600` on Unix).
+### Quick health check
 
-- **In-tree wrappers** (`claude_mcp_servers/search_mcp/wrapper.sh`, `vco` CLI, the `vct_secrets_resolve.{sh,ps1}` helpers) read the token automatically and don't need any extra config — make sure the launcher is running.
-- **Custom scripts** that talk to the hub directly need to read the token and send the header. See [docs/MIGRATION-0.2.0.md → Hub authentication](MIGRATION-0.2.0.md#hub-authentication) for the recipe.
-- **Token stale after launcher restart**: long-lived scripts that cache the token will fail with 401 after the launcher restarts. Re-read `~/.vct/hub.token` per call (or per failure-and-retry).
-- **`hub.token` missing**: the launcher hasn't started, or your `VCT_STATE_DIR` overrides the default. `cat ~/.vct/hub.token` to confirm; if empty, restart the launcher.
+```bash
+vct-hub --status
+# Possible outputs (exit codes in parentheses):
+#   running pid=12345   (exit 0) — hub is up
+#   not-running         (exit 1) — no hub started
+#   stale pid=12345     (exit 2) — pid file present but owner is dead
+
+curl -s http://127.0.0.1:7700/health
+# Expected: HTTP 200 with a JSON body. /health is the ONLY route that
+# doesn't require the bearer token.
+```
+
+If `--status` says `stale`, run `vct-hub --start-if-not-running` — it cleans up the dead lockfile and spawns a fresh detached instance (idempotent; safe to run any time).
+
+### `vct-hub` won't start
+
+State files live under `<vct_root_dir>` (defaults to `~/.vct/`; override with `VCT_STATE_DIR`):
+
+| File | Purpose | Expected mode (Unix) |
+|---|---|---|
+| `hub.pid` | Lockfile; first line is the running PID | `0o600` |
+| `hub.port` | Bound TCP port (default 7700) | `0o644` |
+| `hub.token` | Bearer token for `/api/v1/*` routes; regenerated on every startup | `0o600` |
+
+**Lockfile won't release after a hard kill**:
+
+```bash
+cat ~/.vct/hub.pid          # see which PID it thinks owns the lock
+ps -p $(cat ~/.vct/hub.pid) # verify the owner is actually alive
+rm ~/.vct/hub.pid           # only if the PID is dead — vct-hub does this for you on next --start-if-not-running
+vct-hub --start-if-not-running
+```
+
+The implementation (see `lockfile.rs`) reclaims a stale lockfile automatically when the recorded PID is no longer alive — manual `rm` is the workaround only if the file is corrupt (zero-byte, unparseable content).
+
+**Port 7700 already in use**: the lockfile lookup succeeded but `TcpListener::bind` fails. Find the conflict and either stop it or move the hub:
+
+```bash
+# Linux / macOS
+sudo lsof -i :7700
+# Windows
+netstat -ano | findstr :7700
+
+# Move the hub to a different port (writes <vct_root_dir>/hub.port):
+VCT_HUB_PORT=7701 vct-hub --start-if-not-running
+```
+
+Resolver clients (`vco_lib/project_config.py`, the bash/PowerShell helpers under `templates/scripts/vct_project_config.*`) auto-discover via `$VCT_HUB_PORT` → `<vct_root_dir>/hub.port` → `7700` default, so a moved port is picked up without further config.
+
+**Token file permissions wrong**: vct-hub creates `hub.token` with mode `0o600` on Unix in a single open call (no chmod-after-create TOCTOU). If you see `Permission denied` reading it from a script, you likely launched the hub as a different user (e.g. root via sudo) than the script's caller. Fix: stop the hub, delete the file, restart as the right user — `vct-hub --stop && rm ~/.vct/hub.token && vct-hub --start-if-not-running`.
+
+### Resolver returns 401 Unauthorized
+
+Symptom: a script or wrapper calling `http://127.0.0.1:7700/api/v1/...` gets `401 Unauthorized` with `{"error":{"code":"unauthorized",...}}`.
+
+Every `/api/v1/*` route (except `/health`) requires `Authorization: Bearer <token>` where the token lives in `<vct_root_dir>/hub.token`. The token is **regenerated on every hub startup** — so any client that cached an old token will 401 after a `vct-hub --stop` + restart.
+
+- **Python clients** (`vco_lib.project_config`): auto-recover. The internal `_get_with_401_retry` wrapper catches a single 401, invalidates the 5-second discovery cache, re-reads `hub.token` + `hub.port` from disk, and re-issues the request. Subsequent 401s after the retry are surfaced as `HubUnreachable`. You don't need to do anything in calling code.
+- **In-tree wrappers** (`claude_mcp_servers/search_mcp/wrapper.sh`, `vco` CLI, the `vct_secrets_resolve.{sh,ps1}` helpers): read the token per-call automatically — no extra config — but they don't auto-retry. If they 401, re-source / re-invoke them.
+- **Custom bash / PowerShell scripts**: re-read `<vct_root_dir>/hub.token` per call (or per failure-and-retry). Don't cache the token across hub restarts. See `templates/scripts/vct_project_config.sh` and `templates/scripts/vct_project_config.ps1` for reference implementations of the discover-and-call pattern.
+- **`hub.token` missing**: the hub hasn't started, or `VCT_STATE_DIR` differs between the hub and your client. `vct-hub --status` first; if `not-running`, start it with `vct-hub --start-if-not-running`.
+
+### Boot autostart not firing
+
+`vct-hub --register-boot` installs a per-user autostart unit. Default-OFF in v0.2.21 — users opt in via the launcher Preferences tab (or by running the CLI directly).
+
+| OS | Mechanism | Location | Status check |
+|---|---|---|---|
+| Linux | systemd user unit | `$XDG_CONFIG_HOME/systemd/user/vct-hub.service` | `systemctl --user status vct-hub.service` |
+| macOS | launchd LaunchAgent | `~/Library/LaunchAgents/com.vibecodedtools.vct-hub.plist` | `launchctl list \| grep vct-hub` |
+| Windows | Scheduled Task `VCT-Hub` | (Task Scheduler library) | `Get-ScheduledTask -TaskName "VCT-Hub"` (PowerShell) or `schtasks /Query /TN "VCT-Hub" /V /FO LIST` |
+
+```bash
+vct-hub --register-boot     # idempotent; safe to re-run
+vct-hub --boot-status       # 0=enabled, 1=disabled, 2=not-installed, 3=inspection error
+vct-hub --unregister-boot   # removes the unit; idempotent
+```
+
+**Linux**: requires `systemctl` on PATH. On non-systemd distros (some musl-based, some container images) registration fails with `ToolNotFound`. Workaround: schedule via your init system manually with the binary path printed by `which vct-hub`.
+
+**macOS — Gatekeeper rejects the boot agent**: `vct-hub` ships **UNSIGNED in v0.2.21** (code-signing + notarization is on the post-0.2.x backlog). launchd will load the plist, but Gatekeeper rejects the binary, leaving the agent in a permanent restart loop. The fix is the same as for any unsigned binary downloaded from the internet:
+
+```bash
+xattr -d com.apple.quarantine "$(which vct-hub)"
+# or
+xattr -dr com.apple.quarantine launcher/dist/macos-arm64/vct-hub
+```
+
+Then re-run `vct-hub --register-boot`. The `--register-boot` path emits a stderr warning when it detects an unsigned binary (`warn_if_unsigned`) — it does not refuse to register, because you may have signed it locally.
+
+**Windows — Scheduled Task created but never fires**: check the task's last-run state:
+
+```powershell
+Get-ScheduledTask -TaskName "VCT-Hub" | Get-ScheduledTaskInfo
+```
+
+If `LastTaskResult` is non-zero, the boot shim (`vct-hub-boot.cmd` next to the binary) couldn't locate `vct-hub.exe`. Common cause: you moved the launcher install tree after registration. Re-register from the new location: `vct-hub --unregister-boot && vct-hub --register-boot`.
+
+### Cutover sentinel stuck after a failed install
+
+When `install.py` upgrades a v0.2.20 install to v0.2.21, it writes a sentinel at `<vct_root_dir>/v0.2.21-cutover.flag` **before** starting `vct-hub`. The v0.2.21 launcher reads this sentinel on startup and **skips** spawning its embedded `services::watcher` — the assumption is that `vct-hub` will take over supervision. `install.py` deletes the sentinel after `vct-hub` responds to `/health`.
+
+If `install.py` is killed mid-cutover (Ctrl-C, OOM, power loss), the sentinel persists and the v0.2.21 launcher refuses to start its services watcher indefinitely — symptom: Weaviate/Ollama not auto-restarting when they crash.
+
+**Auto-recovery (since v0.2.21 launcher startup)**: when the sentinel is older than **60 seconds AND** `vct-hub` is already reachable, the launcher deletes the sentinel itself and starts the embedded watcher (see `launcher/src-tauri/src/lib.rs` around the `cutover_sentinel_present` check). So in most cases, restarting the launcher fixes it.
+
+**Manual recovery** (if auto-delete doesn't kick in — sentinel is fresh, or `vct-hub` is also down):
+
+```bash
+ls -la ~/.vct/v0.2.21-cutover.flag       # confirm presence
+rm ~/.vct/v0.2.21-cutover.flag
+vct-hub --start-if-not-running           # bring the hub back up
+# Now restart the launcher GUI — the embedded watcher will spawn.
+```
+
+### Contributor: `cargo build --release --bin vct-hub` fails
+
+Symptom: `error: no bin target named vct-hub in default-run packages` when building from the launcher workspace root.
+
+The workspace root (`launcher/src-tauri/`) defines the `vct-launcher` binary; `vct-hub` is a workspace **member** at `launcher/src-tauri/vct-hub/`. Add `-p vct-hub` to select the right package:
+
+```bash
+cd launcher/src-tauri
+cargo build --release -p vct-hub --bin vct-hub
+```
+
+Fixed in `scripts/build-bundled-launcher.sh` at commit `fe345a0` — pull/rebase if you're on an older clone.
+
+## Embedding service / OpenAI key validation failures
+
+Since v0.2.18 (`refactor(EmbeddingService) + OpenAI integration`, see `CHANGELOG.md`), the orchestrator can route text embeddings through either Ollama (local, default) or OpenAI (paid). The provider abstraction lives under `vco_lib/embedding_providers/`.
+
+**"OpenAI key validation failed"** in the launcher Settings tab: validation hits `GET https://api.openai.com/v1/models/text-embedding-3-small` — a **free** endpoint per OpenAI's docs (no token billing for `GET /v1/models/<model>`). The probe accepts HTTP 200 (key works) and HTTP 429 (rate-limited but key is valid). Anything else — 401, 403, 404, network error — means the key really is bad.
+
+- **401 / 403**: check the key prefix (`sk-…`) and project scope. Project-scoped keys (`sk-proj-…`) need the `text-embedding-3-small` model enabled in the project's model permissions.
+- **404 on the model**: your account hasn't been granted access to `text-embedding-3-small`. Pick a different model in the launcher's Embeddings panel (e.g. `text-embedding-3-large`).
+- **No billing involved in validation**: the call is `GET /v1/models/<model>`, not an embedding call. If your bank flags activity at activation time it's the launcher's separate seed embed-call against your first project — that one is billable (~1 cent).
+
+The free Ollama path (`qwen3-embedding:0.6b`) is unaffected; switch back in the Embeddings panel if you want to disable the OpenAI route entirely.
+
+## Shared KG looks empty after upgrading from <v0.2.12
+
+In v0.2.12 the bundled shared collection was renamed from `VibeCodedTools_KnowledgeGraph` to `VibecodedOrchestrator_KnowledgeGraph` (PR-26 / Group E). Fresh installs land on the new name; pre-v0.2.12 installs already have data under the old name and `hybrid_search` queries the new (empty) one.
+
+Two paths:
+
+1. **Designate the legacy class as canonical (recommended)**: launcher → Identity tab → "Manage shared KG collection" picker. It scans Weaviate for orchestrator-shaped classes and lets you point `SHARED_KG_COLLECTION` at the old one without renaming the underlying Weaviate class.
+2. **Override the env directly**: edit `.claude/settings.json` `env` and set `SHARED_KG_COLLECTION=VibeCodedTools_KnowledgeGraph`. Restart Claude Code so MCP subprocesses see the new value.
+
+See `docs/CONFIGURATION.md` → "Shared KG collection" for the full migration matrix.
 
 ## Scripts in `.claude/scripts/` don't run
 
@@ -288,6 +437,21 @@ test -w "${TMPDIR:-/tmp}" && echo "writable" || echo "NOT writable"
 ```
 
 **syntax-check on edit**: if you've edited a hook locally, run `bash -n .claude/hooks/<name>.sh` to syntax-check before saving. CI does this on every PR.
+
+## Contributor: `cargo test` flakes on shared-state tests
+
+Since v0.2.21 (Step 23), `launcher/src-tauri/.cargo/config.toml` pins `RUST_TEST_THREADS = "1"` workspace-wide. Background: a subset of tests across `auth`, `lockfile`, `boot`, `hub_status`, `hub_launcher`, `commands::installer::hub_stop_tests`, and `commands::self_update::state_roundtrip` mutate process-wide env vars (`VCT_STATE_DIR`, `HOME`, `VCT_HUB_PORT`). Even with the workspace-wide serialisation `Mutex` in `vct_launcher_core::test_env`, parallel runs can recycle PIDs under load and break "definitely-dead PID" assumptions.
+
+**Cost**: ~2× wall time on `cargo test` (~80 s single-threaded vs ~40 s multi-threaded on a mid-tier laptop).
+
+**Override for local parallel runs** (accepting the flake risk):
+
+```bash
+cd launcher/src-tauri
+cargo test -- --test-threads=4
+```
+
+CI overrides explicitly via the `--test-threads` flag — see `.github/workflows/`. If you see a fresh flake on a test that doesn't touch global state, it's likely a real bug; file an issue.
 
 ## Getting more help
 
