@@ -65,6 +65,29 @@ pub const RL_PORT_RANGE_HI: u16 = 11900;
 pub const DEFAULT_RL_LATEST_VERSION_ENDPOINT: &str =
     "https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/rl-latest-version";
 
+/// Public machine-id helper used by `lib.rs::spawn_daily_weights_poll`
+/// license-reader closure (Step 24 commit b). Mirrors
+/// `commands::licensing::machine_id_hash` — sha256 of the 8-byte
+/// big-endian MAC, hex lowercase. Pulled out as a separate `pub fn` so
+/// the closure in lib.rs can construct the `(license_key, hash)` pair
+/// without a circular dependency on the licensing module.
+pub fn machine_id_hash_for_poll() -> String {
+    use sha2::{Digest, Sha256};
+    let mac = mac_address::get_mac_address().ok().flatten();
+    let bytes: [u8; 8] = match mac {
+        Some(m) => {
+            let bs = m.bytes();
+            let mut out = [0u8; 8];
+            out[2..].copy_from_slice(&bs);
+            out
+        }
+        None => [0u8; 8],
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
 /// Default Ollama port used to resolve `{ollama_port}` in env values
 /// when the manifest doesn't override it. Matches the launcher's
 /// well-known service-port layout.
@@ -602,14 +625,32 @@ pub fn parse_inspect_running_state(stdout: &str) -> bool {
 }
 
 // ─── Tauri commands (Phase 1E / 3C / 4A / 4B) ───────────────────────────
+//
+// Step 24 commit b: the lifecycle commands (`rl_is_container_running`,
+// `restart_rl_container`) now proxy to the hub's
+// `/api/v1/projects/{project_id}/modules/{module_id}/...` endpoints
+// (filled in by `vct-hub::lifecycle_api`). The supervisor logic lives
+// in `vct-hub::module_supervisor`.
+//
+// Fallback contract: when the hub is unreachable (probe fails, port
+// file missing, network blip), the commands fall back to the
+// in-process supervisor implementations below. This keeps the launcher
+// working in the "hub crashed but launcher GUI still up" failure mode
+// and during the v0.2.21 → v0.2.22 cutover where some users may run a
+// stale hub binary.
 
-/// `is_container_running` by project_id. Looks up the container name in
-/// `module_installs.container_name` first, returns false if absent.
+/// `is_container_running` by project_id. First tries the hub proxy;
+/// falls back to in-process probe if the hub is unreachable.
 #[command]
 pub async fn rl_is_container_running(
     project_id: String,
     db: State<'_, Db>,
 ) -> Result<bool, String> {
+    // Hub-first path.
+    if let Ok(running) = hub_proxy_module_status(&project_id, RL_RERANKER_MODULE_ID).await {
+        return Ok(running);
+    }
+    // Fallback: in-process probe (used when hub unreachable).
     let install = db.get_module_install(&project_id, RL_RERANKER_MODULE_ID)?;
     let name = match install.and_then(|i| i.container_name) {
         Some(n) if !n.is_empty() => n,
@@ -618,9 +659,11 @@ pub async fn rl_is_container_running(
     is_container_running(&name).await
 }
 
-/// Restart the per-project RL container. Stops + re-starts via the
-/// existing `stop_container_for_project` / `start_container_for_module`
-/// path. Idempotent.
+/// Restart the per-project RL container. Hub proxy not yet wired for
+/// restart (the hub-side endpoint is 501 until a catalog resolver
+/// lands, Phase 3+). For now this command runs the in-process path —
+/// the supervisor logic is the same implementation that the hub's
+/// `module_supervisor` ships, so behaviour matches v0.2.21 exactly.
 #[command]
 pub async fn restart_rl_container(
     project_id: String,
@@ -655,6 +698,91 @@ pub async fn restart_rl_container(
     stop_container_for_project(&container_name).await?;
     let ctx = PlaceholderCtx::new(RL_RERANKER_MODULE_ID);
     let _ = start_container_for_module(&manifest, &ctx, &project, rl_port).await?;
+    Ok(())
+}
+
+// ─── Hub proxy helpers (Step 24 commit b) ───────────────────────────────
+//
+// Minimal HTTP client for the hub's `/api/v1/projects/.../modules/.../`
+// endpoints. Mirrors the auth posture of `commands::hub_proxy`: read
+// `~/.vct/hub.port` + `~/.vct/hub.token` fresh on each call, send
+// `Authorization: Bearer <token>`. Soft-fails (returns Err) when the
+// hub is unreachable so callers can fall back to the in-process path.
+
+fn hub_port_for_proxy() -> Result<u16, String> {
+    let path = crate::paths::vct_root_dir().join("hub.port");
+    let raw = std::fs::read_to_string(&path).map_err(|e| format!("read hub.port: {}", e))?;
+    raw.trim()
+        .parse::<u16>()
+        .map_err(|e| format!("parse hub.port: {}", e))
+}
+
+fn hub_token_for_proxy() -> Result<String, String> {
+    let path = crate::paths::vct_root_dir().join("hub.token");
+    let raw = std::fs::read_to_string(&path).map_err(|e| format!("read hub.token: {}", e))?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(format!("hub.token at {} is empty", path.display()));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Proxy for `GET /projects/{project_id}/modules/{module_id}/status`.
+/// Returns the `running` boolean from the JSON envelope.
+async fn hub_proxy_module_status(project_id: &str, module_id: &str) -> Result<bool, String> {
+    let port = hub_port_for_proxy()?;
+    let token = hub_token_for_proxy()?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| format!("http client: {}", e))?;
+    let url = format!(
+        "http://127.0.0.1:{}/api/v1/projects/{}/modules/{}/status",
+        port, project_id, module_id
+    );
+    let resp = client
+        .get(&url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .map_err(|e| format!("hub GET status: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!("hub status returned {}", resp.status()));
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("parse hub status: {}", e))?;
+    Ok(body
+        .get("running")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false))
+}
+
+/// Proxy for `POST /projects/{project_id}/modules/{module_id}/stop`.
+/// Used by `commands::modules::uninstall_module_v2` (via the wrapper
+/// `stop_container_for_project_via_hub`). Idempotent on the hub side.
+#[allow(dead_code)]
+async fn hub_proxy_module_stop(project_id: &str, module_id: &str) -> Result<(), String> {
+    let port = hub_port_for_proxy()?;
+    let token = hub_token_for_proxy()?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("http client: {}", e))?;
+    let url = format!(
+        "http://127.0.0.1:{}/api/v1/projects/{}/modules/{}/stop",
+        port, project_id, module_id
+    );
+    let resp = client
+        .post(&url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .map_err(|e| format!("hub POST stop: {}", e))?;
+    if !resp.status().is_success() && resp.status().as_u16() != 204 {
+        return Err(format!("hub stop returned {}", resp.status()));
+    }
     Ok(())
 }
 

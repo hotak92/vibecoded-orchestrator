@@ -32,6 +32,7 @@ pub mod db;
 pub mod lifecycle;
 pub mod lifecycle_api;
 pub mod lockfile;
+pub mod module_supervisor;
 pub mod modules_api;
 pub mod project_state_api;
 pub mod server;

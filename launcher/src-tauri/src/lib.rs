@@ -696,13 +696,26 @@ pub fn run() {
                 crate::commands::rl_service::resume_containers_on_startup(&db).await;
             });
             // Daily weights-update poll. license_reader closure returns
-            // None when the user is free-tier (no licensing-cache present)
-            // — the poller's inner loop short-circuits early in that case.
-            // Step 24 Phase 2 wires the real license-reader from the
-            // licensing module (was `|| None` stub in Phase 1).
+            // None when the user is free-tier (no key in keychain) —
+            // the poller's inner loop short-circuits early in that
+            // case. Step 24 commit b wired this to the real licensing
+            // primitives (was `|| None` stub in commit a). The closure
+            // is invoked once per daily sweep (24h cadence), so the
+            // keychain read + MAC-hash compute is amortised to ~zero.
             crate::commands::rl_service::spawn_daily_weights_poll(
                 app.handle().clone(),
-                || None,
+                || {
+                    let key = match crate::secrets::get(
+                        crate::secrets::SecretScope::Global,
+                        "licensing",
+                        "VIBECODED_LICENSE_KEY",
+                    ) {
+                        Ok(Some(k)) if !k.trim().is_empty() => k,
+                        _ => return None,
+                    };
+                    let hash = crate::commands::rl_service::machine_id_hash_for_poll();
+                    Some((key, hash))
+                },
             );
 
             // v0.2.6 (Bug D3): background watcher that polls services

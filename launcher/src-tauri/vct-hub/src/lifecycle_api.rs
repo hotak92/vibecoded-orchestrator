@@ -332,36 +332,126 @@ async fn service_restart(
     not_implemented_v0_2_21()
 }
 
+// ─── Module-lifecycle handlers (Step 24 commit b) ─────────────────
+//
+// Filled in by Step 24's Stream B port. The launcher's Tauri-side
+// commands (`commands::rl_service::rl_is_container_running`,
+// `restart_rl_container`) proxy here via the `hub_proxy_module_*` helpers
+// in `launcher/src-tauri/src/commands/rl_service.rs`. The supervisor
+// logic lives in `module_supervisor.rs`.
+
+/// `GET /projects/{project_id}/modules/{module_id}/status` — returns
+/// `{"running": bool, "container_name": String?}`.
 async fn module_status(
-    State(_h): State<LauncherDbHandle>,
+    State(h): State<LauncherDbHandle>,
     Path(p): Path<ProjectModulePath>,
 ) -> impl IntoResponse {
-    let _ = (p.project_id, p.module_id);
-    not_implemented_v0_2_21()
+    let install = match h.0.get_module_install(&p.project_id, &p.module_id) {
+        Ok(Some(i)) => i,
+        Ok(None) => {
+            return Json(serde_json::json!({
+                "running": false,
+                "container_name": null,
+            }))
+            .into_response();
+        }
+        Err(e) => return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            format!("get_module_install: {}", e),
+        ),
+    };
+    let container_name = install.container_name.unwrap_or_default();
+    if container_name.is_empty() {
+        return Json(serde_json::json!({
+            "running": false,
+            "container_name": null,
+        }))
+        .into_response();
+    }
+    let running = super::module_supervisor::is_container_running(&container_name)
+        .await
+        .unwrap_or(false);
+    Json(serde_json::json!({
+        "running": running,
+        "container_name": container_name,
+    }))
+    .into_response()
 }
 
+/// `POST /projects/{project_id}/modules/{module_id}/start` — proxy for
+/// `start_container_after_install`. Body: empty (manifest is resolved
+/// from the launcher catalog on the hub side via the resolver injected
+/// at hub startup). Returns `{"container_name": String}`.
+///
+/// Today's hub catalog resolver isn't wired (Step 24 ships supervisor +
+/// status/stop wiring only) — calls here return 501 with
+/// `not_implemented_supervisor_install` so the launcher's install path
+/// falls through to its in-process `start_container_after_install`
+/// invocation. Phase 3+ wires the catalog resolver.
 async fn module_start(
     State(_h): State<LauncherDbHandle>,
     Path(p): Path<ProjectModulePath>,
 ) -> impl IntoResponse {
     let _ = (p.project_id, p.module_id);
-    not_implemented_v0_2_21()
+    error_response(
+        StatusCode::NOT_IMPLEMENTED,
+        "not_implemented_supervisor_install",
+        "Hub-side module install start path needs a catalog resolver \
+         (manifest lookup by module_id) — landed in a Phase 3+ step. \
+         Launcher continues to call module_supervisor::start_container_\
+         after_install in-process from commands/modules.rs.",
+    )
 }
 
+/// `POST /projects/{project_id}/modules/{module_id}/stop` — stop +
+/// remove the per-project container. Idempotent: nonexistent container
+/// → 204. Reads `container_name` from the module_installs row before
+/// invoking the supervisor.
 async fn module_stop(
-    State(_h): State<LauncherDbHandle>,
+    State(h): State<LauncherDbHandle>,
     Path(p): Path<ProjectModulePath>,
 ) -> impl IntoResponse {
-    let _ = (p.project_id, p.module_id);
-    not_implemented_v0_2_21()
+    let install = match h.0.get_module_install(&p.project_id, &p.module_id) {
+        Ok(Some(i)) => i,
+        Ok(None) => {
+            return (StatusCode::NO_CONTENT, Json(serde_json::json!({}))).into_response();
+        }
+        Err(e) => return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            format!("get_module_install: {}", e),
+        ),
+    };
+    let container_name = install.container_name.unwrap_or_default();
+    if container_name.is_empty() {
+        return (StatusCode::NO_CONTENT, Json(serde_json::json!({}))).into_response();
+    }
+    match super::module_supervisor::stop_container_for_project(&container_name).await {
+        Ok(()) => Json(serde_json::json!({"stopped": container_name})).into_response(),
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            format!("stop_container_for_project: {}", e),
+        ),
+    }
 }
 
+/// `POST /projects/{project_id}/modules/{module_id}/restart` — stop +
+/// start the per-project container. Requires manifest resolver (not
+/// wired yet — see `module_start`). Phase 3+ activates.
 async fn module_restart(
     State(_h): State<LauncherDbHandle>,
     Path(p): Path<ProjectModulePath>,
 ) -> impl IntoResponse {
     let _ = (p.project_id, p.module_id);
-    not_implemented_v0_2_21()
+    error_response(
+        StatusCode::NOT_IMPLEMENTED,
+        "not_implemented_supervisor_restart",
+        "Hub-side restart needs a manifest catalog resolver — landed in a \
+         Phase 3+ step. Launcher's restart_rl_container command continues \
+         to call module_supervisor in-process via commands/rl_service.rs.",
+    )
 }
 
 // ─── Tests ───────────────────────────────────────────────────────
@@ -566,20 +656,28 @@ mod tests {
         assert_501_envelope(resp).await;
     }
 
+    /// Step 24 commit b: module_status/stop are now wired. Unknown
+    /// project_id → `{"running": false, "container_name": null}` (200).
+    /// The wire-shape pins what the launcher proxy expects.
     #[tokio::test]
-    async fn module_status_returns_501() {
+    async fn module_status_returns_running_false_for_unknown_project() {
         let (base, _h) = spawn_lifecycle_api_hub().await;
         let resp = reqwest::get(format!(
-            "{}/projects/proj-123/modules/rl-reranker/status",
+            "{}/projects/proj-unknown/modules/vct-rl-reranker/status",
             base
         ))
         .await
         .expect("hub reachable");
-        assert_501_envelope(resp).await;
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json");
+        assert_eq!(body.get("running").and_then(|v| v.as_bool()), Some(false));
+        assert!(body.get("container_name").map(|v| v.is_null()).unwrap_or(false));
     }
 
+    /// Step 24 commit b: module_start still returns 501 — needs a
+    /// catalog resolver (Phase 3+).
     #[tokio::test]
-    async fn module_start_returns_501() {
+    async fn module_start_returns_501_supervisor_install() {
         let (base, _h) = spawn_lifecycle_api_hub().await;
         let client = reqwest::Client::new();
         let resp = client
@@ -590,26 +688,35 @@ mod tests {
             .send()
             .await
             .expect("hub reachable");
-        assert_501_envelope(resp).await;
+        assert_eq!(resp.status(), 501);
+        let body: serde_json::Value = resp.json().await.expect("json");
+        assert_eq!(
+            body.get("error").and_then(|e| e.get("code")).and_then(|v| v.as_str()),
+            Some("not_implemented_supervisor_install"),
+        );
     }
 
+    /// Step 24 commit b: module_stop is idempotent — unknown project
+    /// returns 204 No Content (not 501).
     #[tokio::test]
-    async fn module_stop_returns_501() {
+    async fn module_stop_returns_204_for_unknown_project() {
         let (base, _h) = spawn_lifecycle_api_hub().await;
         let client = reqwest::Client::new();
         let resp = client
             .post(format!(
-                "{}/projects/proj-123/modules/rl-reranker/stop",
+                "{}/projects/proj-unknown/modules/vct-rl-reranker/stop",
                 base
             ))
             .send()
             .await
             .expect("hub reachable");
-        assert_501_envelope(resp).await;
+        assert_eq!(resp.status(), 204);
     }
 
+    /// Step 24 commit b: module_restart still returns 501 — same
+    /// catalog-resolver gap as module_start.
     #[tokio::test]
-    async fn module_restart_returns_501() {
+    async fn module_restart_returns_501_supervisor_restart() {
         let (base, _h) = spawn_lifecycle_api_hub().await;
         let client = reqwest::Client::new();
         let resp = client
@@ -620,7 +727,12 @@ mod tests {
             .send()
             .await
             .expect("hub reachable");
-        assert_501_envelope(resp).await;
+        assert_eq!(resp.status(), 501);
+        let body: serde_json::Value = resp.json().await.expect("json");
+        assert_eq!(
+            body.get("error").and_then(|e| e.get("code")).and_then(|v| v.as_str()),
+            Some("not_implemented_supervisor_restart"),
+        );
     }
 
     /// Pin the wire-contract symmetry: the hub-side
