@@ -281,7 +281,6 @@ pub struct McpRegisterOutcome {
 #[derive(Debug, Clone, Default)]
 pub struct RegistrationReport {
     pub claude_json_path: PathBuf,
-    pub venv_python: Option<PathBuf>,
     pub outcomes: Vec<McpRegisterOutcome>,
     /// Soft-failures from the optional launcher.db sync step. Never fatal.
     pub db_warnings: Vec<String>,
@@ -465,7 +464,6 @@ pub fn register_default_orchestrator_mcps(
     let venv_python = resolve_venv_python(install_root);
     let mut report = RegistrationReport {
         claude_json_path: claude_json.clone(),
-        venv_python: venv_python.clone(),
         outcomes: Vec::new(),
         db_warnings: Vec::new(),
     };
@@ -572,7 +570,6 @@ pub struct StaleMcpEntry {
 /// Aggregate report from `rewrite_stale_orchestrator_mcps`.
 #[derive(Debug, Clone, Default)]
 pub struct RewriteReport {
-    pub claude_json_path: PathBuf,
     pub stale_entries_found: Vec<StaleMcpEntry>,
     pub rewritten: Vec<String>,
     pub skipped_non_bundled: Vec<String>,
@@ -697,7 +694,6 @@ pub fn rewrite_stale_orchestrator_mcps(
         .unwrap_or_else(user_claude_json);
     let stale = scan_stale_mcp_entries(install_root, Some(&claude_json));
     let mut report = RewriteReport {
-        claude_json_path: claude_json.clone(),
         stale_entries_found: stale.clone(),
         rewritten: Vec::new(),
         skipped_non_bundled: Vec::new(),
