@@ -58,7 +58,7 @@ Before searching OR reasoning about project topics, choose the right tool:
 3. Code by purpose → `search_code_graph`.
 4. Architecture / callers / deps → `query_code_structure`.
 5. Known exact term/tag/title → `kg-search` CLI (~100 ms).
-6. Quick analysis or rewrite → use Claude directly (Ollama MCP removed in v0.2.11).
+6. Quick analysis or rewrite → use Claude directly.
 
 **This applies to reasoning too** — do NOT explain what the codebase does, what patterns exist, or what was previously decided from memory alone.
 

@@ -79,7 +79,7 @@ These four persistence layers exist for a reason — future-you, future-agents, 
 3. Code by purpose → `search_code_graph` (Weaviate MCP)
 4. Architecture / callers / deps → `query_code_structure` (Weaviate MCP)
 5. Known exact term/tag/title → `kg-search` CLI (~100 ms)
-6. Quick analysis or rewrite → use Claude directly (Ollama MCP removed v0.2.11)
+6. Quick analysis or rewrite → use Claude directly
 7. Still unsure → `hybrid_search` (most comprehensive)
 
 **This applies to reasoning too** — do NOT explain what the codebase does, what patterns exist, or what was previously decided from memory alone. Look it up first.
@@ -150,7 +150,7 @@ These four persistence layers exist for a reason — future-you, future-agents, 
 - Relationships/graph → `semantic_graph_search`
 - Code by purpose → `search_code_graph`
 - Architecture queries → `query_code_structure`
-- Quick analysis → use Claude directly (Ollama MCP removed v0.2.11)
+- Quick analysis → use Claude directly
 - Summarize/extract from file → `Read` tool with `offset`/`limit`, or native reasoning
 - Read an image / vision task → `Read` tool on image path (Claude's built-in vision)
 - Academic research → `search_papers` (Search MCP)
@@ -286,6 +286,18 @@ PowerShell variants (`*.ps1`) ship for Windows users.
 - **Start**: `python -m claude_mcp_servers.code_embedding_service.server`
 - **Env**: `CODE_EMBED_BACKEND` (`gpu`/`ollama`), `CODE_EMBED_MODEL`, `CODE_EMBED_DEVICE`, `CODE_EMBED_PORT`.
 - **Fallback**: set `CODE_EMBED_BACKEND=ollama` to skip the GPU path entirely (useful on CPU-only machines).
+
+### vct-hub (since v0.2.21)
+- **URL**: `http://127.0.0.1:7700` (default; configurable via `VCT_HUB_PORT`)
+- **Binary**: ships alongside `vct-launcher` in `launcher/dist/<arch>/vct-hub`. Detached from the launcher GUI — started by `install.py`'s post-install step, by the `session-start-ensure-hub.sh` Claude Code hook on every session, by `.vscode/tasks.json` on `folderOpen`, and by the launcher itself on GUI start. Outlives the launcher GUI (close the GUI; hooks/MCPs/scripts still reach the hub).
+- **Lockfile**: `<vct_root_dir>/hub.pid` — single-instance per user. CLI: `vct-hub --start-if-not-running` / `--stop` / `--status` / `--register-boot` / `--unregister-boot` / `--boot-status` / `--foreground`.
+- **Auth**: bearer token at `<vct_root_dir>/hub.token` (regenerated every startup, mode 0o600). Required on every `/api/v1/*` route except `/health`.
+- **Key endpoints**:
+  - `GET /api/v1/projects/{id-or-slug}/config` — resolver for KG collection / codegraph prefix / embedding model / access-matrix lists. Replaces per-process `os.getenv("KG_COLLECTION")` etc. drift.
+  - `GET /api/v1/projects/{id}/env` — secrets resolver (existed pre-v0.2.21, ported into hub binary).
+  - `GET /api/v1/services/status` — services snapshot. (v0.2.21 returns a degraded skeleton; supervisor relocation to hub lands with Stream B / Step 24.)
+- **Resolver clients**: `templates/scripts/vct_project_config.sh` (bash), `templates/scripts/vct_project_config.ps1` (PowerShell 7+), `vco_lib/project_config.py` (Python). All three discover hub via `$VCT_HUB_PORT` → `<vct_root_dir>/hub.port` → `7700` default; token via `$VCT_HUB_TOKEN` → `<vct_root_dir>/hub.token`.
+- **Boot auto-start**: cross-OS (systemd-user / launchd / Windows Scheduled Task). Default OFF in v0.2.21; user opts in via launcher GUI Preferences (Step 13 follow-up).
 
 ### MCP Servers
 Located in the user's `~/.claude.json`. Each launches via the project venv (`claude_mcp_servers/.venv`):
@@ -425,7 +437,7 @@ Located in `.claude/hooks/` — automated workflow actions. On Windows the bash 
 - Project-specific pattern → per-project KG.
 - Code entities → code graph.
 - Verbose docs → development collection.
-- Quick local analysis → use Claude directly (Ollama MCP removed v0.2.11).
+- Quick local analysis → use Claude directly.
 
 ---
 
@@ -626,12 +638,11 @@ hybrid_search("code graph collections schema")      # What does KG say about thi
 **Example 3: Quick analysis task**
 
 ```python
-# As of v0.2.11, the Ollama MCP has been removed — Claude handles analysis directly.
 # CORRECT: use Claude's native capabilities
 # Read a file section: Read(file_path, offset=N, limit=50)
 # Analyze an image: Read(image_path)  — Claude's built-in vision
 # Summarize a file: Read the relevant section, then reason over it
-# No separate MCP tool needed; Claude's own reasoning is higher quality.
+# No separate MCP tool needed.
 ```
 
 ---
@@ -640,8 +651,8 @@ hybrid_search("code graph collections schema")      # What does KG say about thi
 
 Two distinct "update" actions live in the launcher:
 
-- **Update orchestrator** (Settings → Updates) — `git pull` + `install.py --update` against the orchestrator clone itself. Refreshes the global venv, the orchestrator's own hooks/MCP servers, the templates folder.
-- **Update bundle** (per-project Settings page → "Update bundle" button) — propagates newly-shipped orchestrator files to ONE existing user project without overwriting user customizations. Backed by `update_project_v2` Tauri command → `python -m vco_lib.project_init install-bundle --update`. PR 5 (2026-05-01).
+- **Update orchestrator** (Settings → Updates) — `git pull` + `install.py --update` against the orchestrator clone itself. Refreshes the global venv, the orchestrator's own hooks/MCP servers, the templates folder. Since v0.2.21, also stops the detached `vct-hub` binary BEFORE `git pull` (so Windows kernel binary-locks don't block the pull), swaps both `vct-launcher` and `vct-hub`, then restarts the hub via `--start-if-not-running` + `/health` probe before the launcher restart.
+- **Update bundle** (per-project Settings page → "Update bundle" button) — propagates newly-shipped orchestrator files to ONE existing user project without overwriting user customizations. Backed by `update_project_v2` Tauri command → `python -m vco_lib.project_init install-bundle --update`. PR 5 (2026-05-01). v0.2.21 also bundles `.vscode/tasks.json` for VS Code users.
 
 The "Update bundle" path is manifest-driven via `<project>/.claude/.vco-manifest.json`:
 - New shipped file → created in the project.
@@ -650,6 +661,8 @@ The "Update bundle" path is manifest-driven via `<project>/.claude/.vco-manifest
 - Schema drift detected (Weaviate target schema differs from on-disk) → `schema_migration_required` deferral entry; the destructive migration is NOT auto-applied. Requires explicit consent via `python -m vco_lib.project_init migrate-collections --name <project>`.
 
 The toast summarises the result ("5 files updated, 2 user-modifications preserved"). Soft-fail throughout: subprocess errors flow through warnings, never block.
+
+**v0.2.20 → v0.2.21 cutover sentinel**: when install.py deploys vct-hub for the first time, it writes `<vct_root_dir>/v0.2.21-cutover.flag` before starting the hub. The v0.2.21 launcher reads this flag on startup and skips its own in-process services watcher (knowing the hub will take it over once supervisor relocation lands in Stream B / Step 24). install.py deletes the flag after vct-hub responds to `/health`.
 
 ---
 
@@ -661,7 +674,7 @@ The toast summarises the result ("5 files updated, 2 user-modifications preserve
 - Analyze code: `.claude/scripts/code-graph-analyze . --project "MyProject"`.
 - Search code: `.claude/scripts/code-graph-query search "pattern"`.
 - Search knowledge: `hybrid_search("concept")` (Weaviate MCP).
-- Quick analysis: use Claude directly — Ollama MCP removed in v0.2.11.
+- Quick analysis: use Claude directly.
 - Academic research: `search_papers("topic")` (Search MCP).
 - MCP venv: `source claude_mcp_servers/.venv/bin/activate`.
 - Active plans: `.claude/context/plans/`.
