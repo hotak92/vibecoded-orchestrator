@@ -43,6 +43,12 @@ chrono = { version = "0.4", features = ["serde"] }
 # Inter-binary HTTP calls (cli_api proxies licensing/telemetry to in-process helpers; future hub→launcher callbacks)
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
+# TOML reader for <vct_root_dir>/retrieval-tuning.toml (v0.2.22 Item #13).
+# Hub-side reader is the resolver-client surface; the launcher's Tauri
+# command (commands/retrieval_tuning.rs) owns the writer. Both read the
+# SAME file via the SAME vct_root_dir() lookup so headless and GUI agree.
+toml = "0.9"
+
 # Symlink + UNC path normalization. Two consumers:
 #  - config_api.rs canonicalises `project_path` in the resolver
 #    response (Step 14).

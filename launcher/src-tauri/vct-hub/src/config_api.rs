@@ -66,6 +66,7 @@ use rusqlite::params;
 use vct_launcher_core::config::LocalConfig;
 
 use super::modules_api::LauncherDbHandle;
+use super::retrieval_tuning_io::{read_tuning, RetrievalTuning};
 
 // ─── Defaults shared with the launcher / docker-compose stack ────
 //
@@ -151,6 +152,15 @@ struct ProjectConfigResponse {
     ollama_url: String,
     grpc_port: u16,
     shared_kg_write_disabled: bool,
+    /// v0.2.22 Item #13 — global retrieval thresholds. Sourced from
+    /// `<vct_root_dir>/retrieval-tuning.toml` (written by the launcher
+    /// GUI's Retrieval Tuning panel). The nested object keeps the
+    /// top-level surface flat-friendly for the existing `?key=` filter
+    /// (callers needing the whole block use `?key=retrieval_tuning`).
+    /// The `schema_version` of the parent envelope stays 1 — these
+    /// fields are additive (new readers see them; old readers ignore
+    /// them).
+    retrieval_tuning: RetrievalTuning,
 }
 
 // ─── Handler ─────────────────────────────────────────────────────
@@ -369,6 +379,11 @@ async fn project_config(
         .and_then(|p| p.to_str().map(String::from))
         .unwrap_or_else(|| project.folder_path.clone());
 
+    // 10. Retrieval tuning — soft-read of the global TOML written by
+    // the launcher's Retrieval Tuning panel. Missing / malformed file
+    // → calibrated defaults; never errors the resolver out.
+    let retrieval_tuning = read_tuning();
+
     let response = ProjectConfigResponse {
         project_id: project.id.clone(),
         project_path,
@@ -390,6 +405,7 @@ async fn project_config(
         ollama_url,
         grpc_port,
         shared_kg_write_disabled,
+        retrieval_tuning,
     };
 
     // 9. ?key= filter — pull a single top-level field by name.
@@ -918,6 +934,147 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("field_not_found")
         );
+    }
+
+    #[tokio::test]
+    async fn config_emits_retrieval_tuning_defaults_when_file_missing() {
+        // v0.2.22 Item #13. When <vct_root_dir>/retrieval-tuning.toml
+        // is absent, the resolver returns the calibrated defaults from
+        // knowledge/concepts/score-driven-retrieval-tiers.md.
+        //
+        // VCT_STATE_DIR is process-wide; the parent test harness in
+        // vct-launcher-core::paths::tests already serialises mutation,
+        // but here we set it to a fresh tempdir (with no .toml in it)
+        // BEFORE spawning the hub so the global resolver path lands
+        // in a guaranteed-empty directory.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prev_state = std::env::var_os("VCT_STATE_DIR");
+        std::env::set_var("VCT_STATE_DIR", tmp.path());
+
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-tuning-default", "myproject");
+
+        let resp = reqwest::get(format!(
+            "{}/projects/p-tuning-default/config",
+            base
+        ))
+        .await
+        .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        let rt = body
+            .get("retrieval_tuning")
+            .expect("retrieval_tuning present");
+
+        // Defaults from score-driven-retrieval-tiers.md.
+        assert!(
+            (rt.get("code_graph_score_floor").and_then(|v| v.as_f64()).unwrap() - 0.35).abs()
+                < 1e-9
+        );
+        assert!(
+            (rt.get("kg_tier_min").and_then(|v| v.as_f64()).unwrap() - 0.42).abs() < 1e-9
+        );
+        assert!(
+            (rt.get("kg_tier_single_chunk").and_then(|v| v.as_f64()).unwrap() - 0.55).abs()
+                < 1e-9
+        );
+        assert!(
+            (rt.get("kg_tier_three_chunks").and_then(|v| v.as_f64()).unwrap() - 0.65).abs()
+                < 1e-9
+        );
+        assert!(
+            (rt.get("kg_tier_full").and_then(|v| v.as_f64()).unwrap() - 0.75).abs() < 1e-9
+        );
+
+        match prev_state {
+            Some(v) => std::env::set_var("VCT_STATE_DIR", v),
+            None => std::env::remove_var("VCT_STATE_DIR"),
+        }
+    }
+
+    #[tokio::test]
+    async fn config_emits_retrieval_tuning_from_disk() {
+        // v0.2.22 Item #13. When <vct_root_dir>/retrieval-tuning.toml
+        // exists with valid values, the resolver returns those values
+        // verbatim (no defaulting / no clamping).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prev_state = std::env::var_os("VCT_STATE_DIR");
+        std::env::set_var("VCT_STATE_DIR", tmp.path());
+        std::fs::write(
+            tmp.path().join("retrieval-tuning.toml"),
+            "\
+code_graph_score_floor = 0.4
+kg_tier_min = 0.5
+kg_tier_single_chunk = 0.6
+kg_tier_three_chunks = 0.7
+kg_tier_full = 0.8
+",
+        )
+        .unwrap();
+
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-tuning-custom", "myproject");
+
+        let resp = reqwest::get(format!(
+            "{}/projects/p-tuning-custom/config",
+            base
+        ))
+        .await
+        .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        let rt = body
+            .get("retrieval_tuning")
+            .expect("retrieval_tuning present");
+
+        assert!(
+            (rt.get("code_graph_score_floor").and_then(|v| v.as_f64()).unwrap() - 0.4).abs()
+                < 1e-9
+        );
+        assert!(
+            (rt.get("kg_tier_min").and_then(|v| v.as_f64()).unwrap() - 0.5).abs() < 1e-9
+        );
+        assert!(
+            (rt.get("kg_tier_full").and_then(|v| v.as_f64()).unwrap() - 0.8).abs() < 1e-9
+        );
+
+        match prev_state {
+            Some(v) => std::env::set_var("VCT_STATE_DIR", v),
+            None => std::env::remove_var("VCT_STATE_DIR"),
+        }
+    }
+
+    #[tokio::test]
+    async fn config_key_filter_returns_retrieval_tuning() {
+        // Single-field filter on the new nested object must return the
+        // whole RetrievalTuning struct (the resolver's ?key= filter
+        // operates on top-level fields and returns nested objects as-is).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prev_state = std::env::var_os("VCT_STATE_DIR");
+        std::env::set_var("VCT_STATE_DIR", tmp.path());
+
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-key-tuning", "myproject");
+
+        let resp = reqwest::get(format!(
+            "{}/projects/p-key-tuning/config?key=retrieval_tuning",
+            base
+        ))
+        .await
+        .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        let obj = body.as_object().expect("object");
+        assert_eq!(obj.len(), 1);
+        let nested = obj.get("retrieval_tuning").expect("nested");
+        assert!(
+            (nested.get("kg_tier_min").and_then(|v| v.as_f64()).unwrap() - 0.42).abs() < 1e-9
+        );
+
+        match prev_state {
+            Some(v) => std::env::set_var("VCT_STATE_DIR", v),
+            None => std::env::remove_var("VCT_STATE_DIR"),
+        }
     }
 
     #[tokio::test]

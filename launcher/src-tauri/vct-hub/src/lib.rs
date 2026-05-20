@@ -35,5 +35,6 @@ pub mod lockfile;
 pub mod module_supervisor;
 pub mod modules_api;
 pub mod project_state_api;
+pub mod retrieval_tuning_io;
 pub mod server;
 pub mod weaviate_probe;
