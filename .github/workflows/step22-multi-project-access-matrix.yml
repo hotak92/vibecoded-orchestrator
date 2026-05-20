@@ -1,0 +1,151 @@
+# Step 22 — multi-project access-matrix regression test.
+#
+# Asserts v0.2.21's acceptance criterion properties (1–9) across 3
+# projects with distinct access-matrix configurations:
+#
+#   * Project A reads B's KG; B does NOT read A's KG.
+#   * Project A grants B codegraph read; no other grants.
+#   * Project C is the negative control — own collections only.
+#
+# Runs on Linux / macOS / Windows because the resolver client is
+# bash on Unix and PowerShell on Windows; we want both surfaces
+# under regression. The fixture itself (launcher.db seeding) is
+# pure Python and runs identically on all three OSes.
+#
+# Distinct from .github/workflows/release.yml (Step 7's release
+# pipeline) — that ships binaries on tag; this asserts correctness
+# on every PR. The two never share a job.
+#
+# Sandbox-isolation contract: see tests/common/sandbox.py docstring.
+# Briefly:
+#   * VCT_STATE_DIR scoped to $RUNNER_TEMP/.vct-step22-<run_id>/
+#   * Weaviate collection names prefixed STEP22_<run_id>_*
+#   * Keychain prefixed step22-<run_id>-
+#   * Refuses to run without VCO_CI_FIXTURE=1.
+# Real ~/.vct/ is never touched.
+
+name: Step 22 — Multi-Project Access Matrix
+
+on:
+  pull_request:
+    paths:
+      - "launcher/src-tauri/vct-hub/**"
+      - "launcher/src-tauri/vct-launcher-core/src/db/**"
+      - "templates/scripts/vct_project_config.*"
+      - "templates/scripts/vct_secrets_resolve.*"
+      - "tests/common/sandbox.py"
+      - "tests/integration/step22_multi_project/**"
+      - ".github/workflows/step22-multi-project-access-matrix.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  multi-project-access-matrix:
+    name: ${{ matrix.os }} access-matrix
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: launcher/src-tauri
+          # The hub binary alone doesn't need full Tauri caching, but
+          # sharing the cache key with the main CI job means we re-use
+          # warm artifacts when the same commit ran the rust job first.
+          shared-key: vct-hub-step22
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Python deps
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      # vct-hub is a pure-axum binary — no GTK/webkit deps. The
+      # Tauri-Linux apt step from .github/workflows/ci.yml is NOT
+      # required for this job.
+      - name: Build vct-hub (release)
+        shell: bash
+        working-directory: launcher/src-tauri
+        run: cargo build --release -p vct-hub
+
+      - name: Resolve hub binary path
+        shell: bash
+        id: hub-bin
+        run: |
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            bin="launcher/src-tauri/target/release/vct-hub.exe"
+          else
+            bin="launcher/src-tauri/target/release/vct-hub"
+          fi
+          full="$(pwd)/$bin"
+          ls -l "$full"
+          echo "path=$full" >> "$GITHUB_OUTPUT"
+
+      # Build-time fixture-only smoke test (validates the Python
+      # fixture builds cleanly + the access-matrix rows go into the
+      # DB correctly). Cheap defense against accidentally landing a
+      # broken fixture even if the pytest step is gated on a binary
+      # that ends up missing on one OS.
+      - name: Fixture build smoke
+        shell: bash
+        env:
+          VCO_CI_FIXTURE: "1"
+          # Use a deterministic per-OS RUN_ID so the build-smoke + the
+          # pytest run land in separate scratch dirs and can't collide.
+          VCO_TEST_RUN_ID: smokebuild${{ matrix.os }}-${{ github.run_id }}
+        run: |
+          python -m tests.integration.step22_multi_project.fixture build > "$RUNNER_TEMP/fixture-output.json"
+          python -m tests.integration.step22_multi_project.fixture info --run-id "$VCO_TEST_RUN_ID"
+          python -m tests.integration.step22_multi_project.fixture teardown --run-id "$VCO_TEST_RUN_ID"
+
+      - name: Run Step 22 pytest
+        shell: bash
+        env:
+          VCO_CI_FIXTURE: "1"
+          VCT_HUB_BINARY: ${{ steps.hub-bin.outputs.path }}
+        run: |
+          python -m pytest tests/integration/step22_multi_project/ -v --tb=short
+
+      # Always-run teardown sweep. The pytest fixture's teardown
+      # callback handles the common path; this is a belt-and-braces
+      # cleanup for the case where pytest crashed before its yield
+      # finalizer ran.
+      - name: Teardown (always)
+        if: always()
+        shell: bash
+        env:
+          VCO_CI_FIXTURE: "1"
+        run: |
+          # Best-effort: list every step22 sandbox dir under
+          # $RUNNER_TEMP and tear each one down. We're not interested
+          # in surface-level errors here — pytest already passed/
+          # failed, this is hygiene.
+          if [ -n "${RUNNER_TEMP:-}" ] && [ -d "${RUNNER_TEMP}" ]; then
+            for d in "${RUNNER_TEMP}"/.vct-step22-*; do
+              [ -d "$d" ] || continue
+              rid="$(basename "$d" | sed 's/^.vct-step22-//')"
+              echo "[step22-teardown] cleaning $d (run_id=$rid)"
+              python -m tests.integration.step22_multi_project.fixture teardown --run-id "$rid" || true
+            done
+          fi
