@@ -43,20 +43,20 @@ chrono = { version = "0.4", features = ["serde"] }
 # Inter-binary HTTP calls (cli_api proxies licensing/telemetry to in-process helpers; future hub→launcher callbacks)
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
-# Symlink + UNC path normalization for the resolver's `project_path`
-# (config_api.rs). Already a vct-launcher-core dep; declared here so
-# the hub doesn't rely on re-export through core's public API.
+# Symlink + UNC path normalization. Two consumers:
+#  - config_api.rs canonicalises `project_path` in the resolver
+#    response (Step 14).
+#  - boot.rs canonicalises std::env::current_exe() before embedding
+#    it in the rendered systemd unit / launchd plist / Win-task XML
+#    (Step 11) so the path is stable and UNC-free.
+# Already a vct-launcher-core dep; declared here so the hub doesn't
+# rely on re-export through core's public API.
 dunce = "1"
 
 # Logging (println for v0.2.21 minimal stub; structured logging is a v0.2.22 followup)
 
 # Random for hub auth tokens (will reuse the same posture as the in-launcher hub)
 rand = { version = "0.9", default-features = false, features = ["std", "std_rng", "os_rng"] }
-
-# Step 11: boot.rs canonicalises current_exe() via dunce so the
-# rendered unit/plist/task always embeds a stable, UNC-free path.
-# Same crate is already used by the main launcher (vct-launcher-core).
-dunce = "1"
 
 # Step 5: lifecycle.rs uses libc::kill / libc::setsid on Unix, and
 # windows-sys::TerminateProcess / OpenProcess on Windows. pid_is_alive
