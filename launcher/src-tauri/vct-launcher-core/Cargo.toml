@@ -10,6 +10,19 @@ license = "AGPL-3.0"
 name = "vct_launcher_core"
 crate-type = ["rlib"]
 
+# v0.2.21 Step 3d note: an earlier attempt used a `test-support` Cargo
+# feature on this crate (enabled by launcher's [dev-dependencies]) to
+# expose `Db::open_in_memory`, `secrets::test_serialize`, and
+# `secrets::TestSpacingGuard` to the launcher's test code. That
+# triggered a tauri-build panic ("missing cargo:dev instruction") in
+# the launcher's build script — Cargo's feature unification with a
+# workspace-path dependency declared in BOTH [dependencies] and
+# [dev-dependencies] breaks tauri-build's environment-variable
+# propagation. The simpler resolution: gate the test helpers on
+# `cfg(any(test, debug_assertions))`. They're visible to all dev /
+# test builds across both crates, excluded from `--release`. Same
+# end state, no Cargo gotcha.
+
 [dependencies]
 # DB
 rusqlite = { version = "0.39", features = ["bundled"] }
@@ -36,6 +49,10 @@ tokio = { version = "1", features = ["fs", "macros", "process", "rt", "sync", "t
 
 # UUID for IDs
 uuid = { version = "1", features = ["v4"] }
+
+# HTTP client (used by services/picker.rs for container service-fullness probes
+# and by future cross-binary hub HTTP calls)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Regex (used by manifest validation patterns + PII scrub)
 regex = "1"

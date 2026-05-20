@@ -31,6 +31,13 @@ tauri-build = { version = "2", features = [] }
 # Both this binary and the new `vct-hub` binary depend on it. See plan §3d.
 vct-launcher-core = { path = "vct-launcher-core" }
 
+# NOTE: tried adding [dev-dependencies] vct-launcher-core with the
+# test-support feature here, but it triggered a tauri-build panic
+# ("missing cargo:dev instruction"). Workspace-aware feature
+# unification interacts oddly with that re-declaration. The fix is
+# different — TBD. For now the launcher tests will fail to compile
+# until resolved.
+
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"

@@ -2,16 +2,30 @@
 //!
 //! Submodules:
 //!   - [`runtime`]: detect Podman/Docker + compose form (subcommand vs
-//!     standalone), cached per launcher session.
+//!     standalone), cached per launcher session. *Lives in
+//!     `vct-launcher-core::services::runtime` as of v0.2.21 (Step 3d).*
+//!   - [`picker`]: container picker for the
+//!     `com.docker.compose.service=<name>` label-collision case. *Also
+//!     in `vct-launcher-core::services::picker` as of v0.2.21.*
 //!   - [`adoption`]: persist the user's adopt-vs-parallel choice for
-//!     externally-managed services in `~/.vct/services.toml`.
+//!     externally-managed services in `~/.vct/services.toml`. Stays in
+//!     the launcher (Tauri-dependent).
+//!   - [`settings_json_watcher`]: launcher-side reactive watcher for
+//!     `.claude/settings.json` edits. Stays in the launcher.
+//!   - [`watcher`]: 30s polling supervisor that auto-restarts crashed
+//!     services. Stays in the launcher for v0.2.21 Step 3 (relocates to
+//!     `vct-hub::supervisor` in Step 4).
 //!
 //! Tauri commands that wire these into the UI live in
 //! `commands::lifecycle` (services_status, services_start_all, etc.).
 
+// Re-export the core halves so `crate::services::runtime::*` and
+// `crate::services::picker::*` continue to resolve from anywhere in
+// the launcher without per-file import rewrites.
+pub use vct_launcher_core::services::picker;
+pub use vct_launcher_core::services::runtime;
+
 pub mod adoption;
-pub mod picker;
-pub mod runtime;
 pub mod settings_json_watcher;
 pub mod watcher;
 

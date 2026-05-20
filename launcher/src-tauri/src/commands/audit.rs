@@ -13,25 +13,16 @@
 //! flatten or interpret detail here — operations write whatever shape
 //! makes sense for them and the table just shows what's there.
 
-use serde::Serialize;
 use tauri::{command, State};
 
 use crate::db::Db;
 
-#[derive(Debug, Serialize)]
-pub struct AuditEvent {
-    pub id: i64,
-    pub operation: String,
-    pub project_id: Option<String>,
-    pub module_id: Option<String>,
-    /// JSON string. Frontend may parse it for display.
-    pub detail: String,
-    /// OS user who performed the operation. "system" for pre-migration
-    /// rows, "unknown" if the launcher could not resolve $USER.
-    pub actor: String,
-    /// Unix epoch milliseconds.
-    pub created_at: i64,
-}
+// v0.2.21 (Step 3d): AuditEvent moved to vct-launcher-core so
+// `Db::audit_list` can return it without a reverse-dependency on the
+// launcher's commands module. Re-export keeps the original import path
+// (`crate::commands::audit::AuditEvent`) valid for any caller — the
+// frontend bindings + lib.rs registration both continue to compile.
+pub use vct_launcher_core::db::audit_types::AuditEvent;
 
 /// List audit events, newest first.
 ///

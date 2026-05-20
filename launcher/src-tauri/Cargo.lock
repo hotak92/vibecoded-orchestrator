@@ -5349,6 +5349,7 @@ dependencies = [
  "libc",
  "mac_address",
  "regex",
+ "reqwest 0.12.28",
  "rusqlite",
  "serde",
  "serde_json",

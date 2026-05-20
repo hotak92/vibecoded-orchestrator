@@ -77,22 +77,13 @@ pub const ORCHESTRATOR_ROOT_SLUG: &str = "orchestrator-root";
 /// builtin catalog uses the same string in `commands::modules`).
 pub const ORCHESTRATOR_ROOT_NAME: &str = "VibeCoded Orchestrator";
 
-impl Db {
-    /// True iff a row with `host='orchestrator_root'` exists. Cheap
-    /// existence check used by `ensure_orchestrator_root` to short-
-    /// circuit before any disk I/O.
-    pub fn has_orchestrator_root_project(&self) -> Result<bool, String> {
-        let guard = self.lock();
-        let count: i64 = guard
-            .query_row(
-                "SELECT COUNT(*) FROM projects WHERE host = 'orchestrator_root'",
-                [],
-                |r| r.get(0),
-            )
-            .map_err(|e| format!("count orchestrator_root rows: {}", e))?;
-        Ok(count > 0)
-    }
-}
+// v0.2.21 (Step 3d): the `impl Db { has_orchestrator_root_project }`
+// method block moved to `vct_launcher_core::db::orchestrator_root_helpers`
+// because Rust's orphan rule prohibits the launcher crate from adding
+// inherent methods to a type defined in the core crate. The method is
+// still reachable from this file as `db.has_orchestrator_root_project()`
+// — it's an inherent method on Db now imported via the core re-export
+// at the top of lib.rs.
 
 /// Strip Windows' `\\?\` verbatim prefix (and the `\\?\UNC\` UNC
 /// variant) from a path-string, leaving the conventional `C:\...` /

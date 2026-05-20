@@ -257,11 +257,11 @@ fn paced_call<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 static TEST_SPACING_OVERRIDE: std::sync::Mutex<Option<std::time::Duration>> =
     std::sync::Mutex::new(None);
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 fn current_spacing() -> std::time::Duration {
     TEST_SPACING_OVERRIDE
         .lock()
@@ -269,7 +269,7 @@ fn current_spacing() -> std::time::Duration {
         .unwrap_or(MIN_CALL_SPACING)
 }
 
-#[cfg(not(test))]
+#[cfg(not(any(test, debug_assertions)))]
 fn current_spacing() -> std::time::Duration {
     MIN_CALL_SPACING
 }
@@ -278,14 +278,14 @@ fn current_spacing() -> std::time::Duration {
 /// of the guard. Restores the previous value (usually `None` → production
 /// 150ms) on drop. Tests that exercise the rate-limit semantics use this
 /// to keep wall-clock cost low while still proving the contract.
-#[cfg(test)]
-pub(crate) struct TestSpacingGuard {
+#[cfg(any(test, debug_assertions))]
+pub struct TestSpacingGuard {
     prev: Option<std::time::Duration>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 impl TestSpacingGuard {
-    pub(crate) fn new(spacing: std::time::Duration) -> Self {
+    pub fn new(spacing: std::time::Duration) -> Self {
         let mut slot = TEST_SPACING_OVERRIDE.lock().unwrap_or_else(|p| p.into_inner());
         let prev = *slot;
         *slot = Some(spacing);
@@ -293,7 +293,7 @@ impl TestSpacingGuard {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 impl Drop for TestSpacingGuard {
     fn drop(&mut self) {
         let mut slot = TEST_SPACING_OVERRIDE.lock().unwrap_or_else(|p| p.into_inner());
@@ -442,8 +442,13 @@ pub fn mask_preview(value: &str) -> String {
 // host. We chose this over a hard panic so a misconfigured developer
 // laptop doesn't break every test in the binary.
 
-#[cfg(test)]
-pub(crate) mod test_serialize {
+// v0.2.21 Step 3d: gated on `cfg(test)` OR `cfg(feature = "test-support")`
+// so launcher's test crate (a separate compilation unit) can still
+// access this module via the `test-support` feature flag declared in
+// its dev-dependencies. Production builds (no features, not test
+// profile) still exclude this entirely.
+#[cfg(any(test, debug_assertions))]
+pub mod test_serialize {
     use std::sync::{Mutex, MutexGuard};
 
     static KEYCHAIN_SERIALIZE: Mutex<()> = Mutex::new(());

@@ -263,7 +263,7 @@ impl Db {
         until_ms: Option<i64>,
         search: Option<&str>,
         limit: u32,
-    ) -> Result<Vec<crate::commands::audit::AuditEvent>, String> {
+    ) -> Result<Vec<crate::db::audit_types::AuditEvent>, String> {
         let guard = self.lock();
         let limit = std::cmp::min(limit, 10000);
 
@@ -320,8 +320,8 @@ impl Db {
 
         let mut stmt = guard.prepare(&sql).map_err(|e| format!("audit_list prepare: {}", e))?;
 
-        let map_row = |row: &rusqlite::Row| -> rusqlite::Result<crate::commands::audit::AuditEvent> {
-            Ok(crate::commands::audit::AuditEvent {
+        let map_row = |row: &rusqlite::Row| -> rusqlite::Result<crate::db::audit_types::AuditEvent> {
+            Ok(crate::db::audit_types::AuditEvent {
                 id: row.get(0)?,
                 operation: row.get(1)?,
                 project_id: row.get(2)?,

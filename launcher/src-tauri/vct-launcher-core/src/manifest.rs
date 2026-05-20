@@ -845,8 +845,14 @@ mod tests {
     #[test]
     fn vct_rl_reranker_manifest_deserializes() {
         // Walk up from src-tauri/ to repo root.
+        // v0.2.21 Step 3d: this module moved from `launcher/src-tauri/src/`
+        // to `launcher/src-tauri/vct-launcher-core/src/`, so the parent
+        // walk needs ONE MORE step. CARGO_MANIFEST_DIR is now
+        // `launcher/src-tauri/vct-launcher-core/`; three .parent() calls
+        // reach the repo root where `vct-module.json` lives.
         let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
+            .and_then(|p| p.parent())
             .and_then(|p| p.parent())
             .expect("walk to repo root")
             .to_path_buf();
@@ -1066,8 +1072,14 @@ mod tests {
     /// control of each kind so manifest drift breaks loudly.
     #[test]
     fn vct_rl_reranker_manifest_with_gui_tab_deserializes() {
+        // v0.2.21 Step 3d: this module moved from `launcher/src-tauri/src/`
+        // to `launcher/src-tauri/vct-launcher-core/src/`, so the parent
+        // walk needs ONE MORE step. CARGO_MANIFEST_DIR is now
+        // `launcher/src-tauri/vct-launcher-core/`; three .parent() calls
+        // reach the repo root where `vct-module.json` lives.
         let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
+            .and_then(|p| p.parent())
             .and_then(|p| p.parent())
             .expect("walk to repo root")
             .to_path_buf();
@@ -1194,8 +1206,14 @@ mod tests {
     /// later manifest edit can't silently drop them.
     #[test]
     fn vct_rl_reranker_manifest_carries_v0_2_20_gpu_hints() {
+        // v0.2.21 Step 3d: this module moved from `launcher/src-tauri/src/`
+        // to `launcher/src-tauri/vct-launcher-core/src/`, so the parent
+        // walk needs ONE MORE step. CARGO_MANIFEST_DIR is now
+        // `launcher/src-tauri/vct-launcher-core/`; three .parent() calls
+        // reach the repo root where `vct-module.json` lives.
         let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
+            .and_then(|p| p.parent())
             .and_then(|p| p.parent())
             .expect("walk to repo root")
             .to_path_buf();
@@ -1269,8 +1287,14 @@ mod tests {
         // load-bearing on every install so an unconditional
         // `panic!("missing")` is safe — it can't go missing in CI
         // without a much bigger problem.
+        // v0.2.21 Step 3d: this module moved from `launcher/src-tauri/src/`
+        // to `launcher/src-tauri/vct-launcher-core/src/`, so the parent
+        // walk needs ONE MORE step. CARGO_MANIFEST_DIR is now
+        // `launcher/src-tauri/vct-launcher-core/`; three .parent() calls
+        // reach the repo root where `vct-module.json` lives.
         let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
+            .and_then(|p| p.parent())
             .and_then(|p| p.parent())
             .expect("walk to repo root")
             .to_path_buf();

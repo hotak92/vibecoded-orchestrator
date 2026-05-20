@@ -1,19 +1,41 @@
+// v0.2.21 Step 3e: shared modules moved to vct-launcher-core. The
+// launcher continues to reference them via the original module paths
+// (e.g. `crate::db::Db`) by means of `use ... as` re-exports below,
+// so the rest of the launcher (1300+ LOC of lib.rs + every command
+// module under commands/) compiles without per-file import rewrites.
+//
+// Launcher-only modules — these stay in this crate because they
+// depend on Tauri runtime types (`AppHandle`, `Manager`, `State`,
+// `Window`, `Emitter`) or on this crate's `commands::` Tauri-command
+// surface.
 mod commands;
-mod config;
-mod db;
 mod hub;
 mod installer_engine;
-mod manifest;
 mod mcp_registration;
-mod paths;
 pub mod project_naming;
 mod quit_dialog;
-mod registry;
-mod secrets;
-mod services;
-mod state;
 mod tray;
-mod types;
+
+// Shared modules — live in vct-launcher-core. Re-exported here so the
+// existing `crate::db::Db` / `crate::manifest::*` / etc. usage across
+// the launcher continues to resolve. Only the DEFINITION moved; the
+// public surface is unchanged.
+pub use vct_launcher_core::config;
+pub use vct_launcher_core::db;
+pub use vct_launcher_core::manifest;
+pub use vct_launcher_core::paths;
+pub use vct_launcher_core::registry;
+pub use vct_launcher_core::secrets;
+pub use vct_launcher_core::state;
+pub use vct_launcher_core::types;
+
+// `services::` is a HYBRID: `runtime` and `picker` live in core, while
+// `adoption`, `settings_json_watcher`, and `watcher` stay in the
+// launcher. The local `mod services;` declares this crate's submodule,
+// which itself re-exports the core halves so `crate::services::runtime`
+// + `crate::services::picker` still resolve from anywhere in the
+// launcher.
+mod services;
 
 use state::{AppManager, ProjectState, ProjectStore};
 use std::collections::HashMap;
@@ -370,6 +392,19 @@ pub fn run() {
         eprintln!("[vct] FATAL: cannot open launcher.db: {}", e);
         std::process::exit(1);
     });
+
+    // v0.2.21 Step 3d: orchestrator-root auto-register moved out of
+    // `Db::open()` because its implementation reaches into launcher-only
+    // modules (commands::modules + commands::projects_v2) that cannot
+    // move to vct-launcher-core without dragging Tauri deps along. It
+    // runs here instead, in the launcher's setup path, where those
+    // modules are freely accessible. Idempotent: no-op when the row
+    // already exists OR no clone is detectable from disk. Soft-fail:
+    // logs and continues — the row is a convenience, the rest of the
+    // launcher works fine without it. The hub binary does NOT call this.
+    if let Err(e) = commands::orchestrator_root::ensure_orchestrator_root(&db_handle) {
+        eprintln!("[vct] warning: ensure_orchestrator_root failed: {}", e);
+    }
 
     // Load per-machine local config (env > vct-config.toml > compiled
     // defaults). Never fails — malformed/missing file falls through to

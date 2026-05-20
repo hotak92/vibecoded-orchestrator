@@ -35,6 +35,8 @@ pub mod kg_summaries;
 pub mod secret_active;
 pub mod secret_grants;
 pub mod app_state;
+pub mod audit_types;
+pub mod orchestrator_root_helpers;
 
 /// Resolve the launcher DB path: `<VCT_STATE_DIR or ~/.vct>/launcher.db`.
 pub fn db_path() -> PathBuf {
@@ -77,20 +79,16 @@ impl Db {
         let cutoff = chrono::Utc::now().timestamp_millis() - 24 * 60 * 60 * 1000;
         let _ = db.prune_change_log(cutoff);
 
-        // Auto-register the orchestrator clone as a project row (migration
-        // 013 prerequisite). Idempotent: a no-op when the row already
-        // exists OR when no clone is detectable from disk (standalone
-        // binary install). Soft-fail: any error here logs and does NOT
-        // block launcher startup — the row is a convenience, the rest of
-        // the launcher continues to work without it.
-        //
-        // Only invoked from the production open() path. `open_in_memory`
-        // (used by tests) deliberately skips this so it doesn't pollute
-        // unrelated tests with a row whose folder_path depends on the
-        // test runner's binary location.
-        if let Err(e) = crate::commands::orchestrator_root::ensure_orchestrator_root(&db) {
-            eprintln!("[vct] warning: ensure_orchestrator_root failed: {}", e);
-        }
+        // NOTE (v0.2.21 Step 3d): the orchestrator-root auto-register
+        // call previously ran from inside `Db::open()`, but its
+        // implementation depends on launcher-only modules
+        // (`commands::modules::find_orchestrator_manifest`,
+        // `commands::projects_v2::sanitize_kg_collection`) that cannot
+        // move into `vct-launcher-core` without dragging in Tauri-runtime
+        // dependencies. Hoisted to launcher's `lib.rs::run` setup() block
+        // (callers: launcher GUI on startup). The hub binary does not
+        // need this call — orchestrator-root registration is a launcher
+        // convenience surface, not a hub responsibility.
 
         Ok(db)
     }
@@ -107,7 +105,7 @@ impl Db {
     /// Open an in-memory DB for tests. Runs all migrations + ensures the
     /// change_log table is present, mirroring the production `open()`
     /// path. Each call returns a fresh isolated DB.
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     pub fn open_in_memory() -> Result<Self, String> {
         let conn = Connection::open_in_memory()
             .map_err(|e| format!("open in-memory: {}", e))?;
