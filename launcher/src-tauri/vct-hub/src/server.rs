@@ -33,7 +33,7 @@ pub async fn start_hub_server() -> Result<u16, String> {
 
     // Open a second connection to launcher.db for the module/project routes.
     // WAL mode lets this coexist with the Tauri-side Db handle.
-    let launcher_db = crate::db::Db::open()
+    let launcher_db = vct_launcher_core::db::Db::open()
         .map_err(|e| format!("Failed to open launcher.db: {}", e))?;
     let launcher_state = modules_api::LauncherDbHandle(Arc::new(launcher_db));
 
@@ -125,7 +125,7 @@ async fn try_bind(base_addr: SocketAddr, retries: u16) -> Result<tokio::net::Tcp
 
 /// Write port to `<VCT_STATE_DIR or ~/.vct>/hub.port` so apps can discover the hub.
 async fn write_port_file(port: u16) {
-    let path = crate::paths::vct_root_dir().join("hub.port");
+    let path = vct_launcher_core::paths::vct_root_dir().join("hub.port");
 
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await.ok();

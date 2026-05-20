@@ -81,121 +81,13 @@ impl ModuleCatalogEntry {
     }
 }
 
-/// Bug 16: minimal manifest the launcher reads from `vct-module.json` at the
-/// repo root. The full ModuleManifest schema is for installable modules; the
-/// orchestrator core is not installable as a module — it IS the orchestrator —
-/// so it ships its own slim shape.
-///
-/// 0.1.7 fork-readiness sweep (2026-05-08, item H1): the orchestrator's
-/// manifest now carries an OPTIONAL `bundled_secrets` block. When present,
-/// the hub's `/api/v1/projects/{id}/env` resolver treats those secret
-/// declarations as if they were declared by an always-installed module
-/// owned by the orchestrator core. This is what makes the resolver path
-/// for `github_pat` work end-to-end without the user having to install
-/// the `vct-search` module first — the OnboardingWizard's keychain entry
-/// is reachable via `vct_secrets_resolve.sh <path> github_pat` for every
-/// `host=base` project the moment the launcher starts.
-///
-/// Schema mirrors the `secrets[]` block of a regular module manifest
-/// (see `manifest::SecretDecl`) so a reader can convert between the two
-/// without a translation layer. The hub's resolver consumes this list
-/// alongside per-module installs to build the project's env dict.
-///
-/// `OrchestratorBundledSecret` deliberately deserializes a SUPERSET of
-/// the fields the hub actually reads — anything extra in the JSON is
-/// ignored (forward compat with future manifest versions). Only `key` +
-/// `scope` are load-bearing for resolution; the rest are documentation.
-#[derive(Debug, Deserialize)]
-pub(crate) struct OrchestratorManifest {
-    // `id` and `name` were parsed with defaults but never read. Removed
-    // 2026-05-04. If a future caller needs them, re-add with #[serde(default)]
-    // — vct-module.json always has them, but we only display version +
-    // description + components in the catalog UI.
-    pub(crate) version: String,
-    pub(crate) description: String,
-    #[serde(default)]
-    pub(crate) components: Vec<OrchestratorComponent>,
-    /// Orchestrator-level secrets surfaced by the launcher core. Read by
-    /// the hub's `/api/v1/projects/{id}/env` resolver for every `host=base`
-    /// project. See module-level rustdoc for the rationale.
-    #[serde(default)]
-    pub(crate) bundled_secrets: Vec<OrchestratorBundledSecret>,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct OrchestratorComponent {
-    pub(crate) id: String,
-    pub(crate) name: String,
-    pub(crate) description: String,
-}
-
-/// Single entry in `OrchestratorManifest::bundled_secrets`. Declares a
-/// secret the orchestrator core knows about and the hub should resolve
-/// against the launcher's keychain for every base-host project.
-///
-/// Fields:
-///   * `key`        — env-var name AND keychain key. Lower-case canonical
-///                    form (e.g. `github_pat`); the wrapper renames it
-///                    if needed.
-///   * `scope`      — `"shared"` | `"global"` | `"per-project"`. The
-///                    hub maps this onto the same scope-string the
-///                    `secret_active_state` table uses
-///                    (`shared`/`global`/`per_project`).
-///   * `module_id`  — keychain `module_id` segment. Defaults to
-///                    `"user"` for parity with what the
-///                    OnboardingWizard's `register_github_pat` flow
-///                    AND the SecretsPanel "Shared (this user)" tab
-///                    write (see commands/installer.rs::GITHUB_PAT_MODULE_ID
-///                    and commands/secrets_cmd.rs::is_user_emit_bucket).
-///                    Pre-2026-05-10 the default was `"installer"`;
-///                    post-0.2.0 backlog #6 unified the two writers
-///                    on the canonical user-bucket path.
-///   * `description` — informational; not load-bearing for the hub.
-#[derive(Debug, Deserialize)]
-pub(crate) struct OrchestratorBundledSecret {
-    pub(crate) key: String,
-    pub(crate) scope: String,
-    #[serde(default = "default_orchestrator_secret_module_id")]
-    pub(crate) module_id: String,
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub(crate) description: String,
-}
-
-fn default_orchestrator_secret_module_id() -> String {
-    "user".to_string()
-}
-
-/// Find `vct-module.json` at the repo root by walking up from the
-/// running binary. Privacy note (2026-05-06): an earlier version used
-/// `env!("CARGO_MANIFEST_DIR")` which embeds the build-host absolute
-/// path as a static string in the release binary (leaking the
-/// developer's username/layout to anyone running `strings`). We use
-/// `std::env::current_exe()` instead — only a runtime path read, no
-/// build-time string baked in. The walk handles both shipped binaries
-/// (`<clone>/launcher/dist/<arch>/vct-launcher`, walks up 4 levels) and
-/// `cargo run` builds (`<clone>/launcher/src-tauri/target/<profile>/`,
-/// walks up 4-5 levels — both find the clone root).
-pub(crate) fn find_orchestrator_manifest() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let mut p = exe.parent()?;
-    loop {
-        let candidate = p.join("vct-module.json");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        match p.parent() {
-            Some(parent) => p = parent,
-            None => return None,
-        }
-    }
-}
-
-pub(crate) fn read_orchestrator_manifest() -> Option<OrchestratorManifest> {
-    let path = find_orchestrator_manifest()?;
-    let raw = std::fs::read_to_string(&path).ok()?;
-    serde_json::from_str(&raw).ok()
-}
+// Bug 16 minimal-manifest types + `vct-module.json` walker moved to
+// `vct-launcher-core::orchestrator_manifest` in v0.2.21 Step 4a so the
+// detached vct-hub binary can consume them too. The launcher still
+// reaches them through the same crate-local paths via these re-exports.
+pub(crate) use vct_launcher_core::orchestrator_manifest::{
+    find_orchestrator_manifest, read_orchestrator_manifest, OrchestratorComponent,
+};
 
 /// Bug 16: launcher's own version, sourced from CARGO_PKG_VERSION at compile
 /// time. Always reflects the running binary, not whatever package.json

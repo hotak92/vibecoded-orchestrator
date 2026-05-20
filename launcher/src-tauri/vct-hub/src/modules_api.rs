@@ -19,8 +19,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::db::models::{ModuleInstallRow, ProjectHost, ProjectRow};
-use crate::db::Db;
+use vct_launcher_core::db::models::{ModuleInstallRow, ProjectHost, ProjectRow};
+use vct_launcher_core::db::Db;
 
 /// Sentinel project_id used by the launcher when scope is `shared`.
 /// Mirrors `commands::secrets_cmd::SENTINEL_SHARED` (which is private to
@@ -532,7 +532,7 @@ async fn project_env(
             // as the legacy gate (literal-requester row → `*` sentinel
             // fallback → default-active when no row exists), so secrets
             // that pre-date migration 009 still resolve normally.
-            let active = crate::db::secret_active::is_secret_active_cross_launcher_for_requester(
+            let active = vct_launcher_core::db::secret_active::is_secret_active_cross_launcher_for_requester(
                 &h.0,
                 scope_str,
                 lookup_project_id,
@@ -544,11 +544,11 @@ async fn project_env(
                 continue;
             }
             let scope = match s.scope.as_str() {
-                "global" => crate::secrets::SecretScope::Global,
-                "shared" => crate::secrets::SecretScope::Shared { project_id: SENTINEL_SHARED },
-                _ => crate::secrets::SecretScope::PerProject { project_id: &project.id },
+                "global" => vct_launcher_core::secrets::SecretScope::Global,
+                "shared" => vct_launcher_core::secrets::SecretScope::Shared { project_id: SENTINEL_SHARED },
+                _ => vct_launcher_core::secrets::SecretScope::PerProject { project_id: &project.id },
             };
-            if let Ok(Some(val)) = crate::secrets::get(scope, &manifest.id, &s.key) {
+            if let Ok(Some(val)) = vct_launcher_core::secrets::get(scope, &manifest.id, &s.key) {
                 env.insert(s.key.clone(), serde_json::Value::String(val));
             }
         }
@@ -569,7 +569,7 @@ async fn project_env(
     // The deduplication step prevents an orchestrator-bundled key from
     // overwriting an installed module's value (an installed module's
     // declaration takes precedence — the user explicitly opted into it).
-    if let Some(orch_manifest) = crate::commands::modules::read_orchestrator_manifest() {
+    if let Some(orch_manifest) = vct_launcher_core::orchestrator_manifest::read_orchestrator_manifest() {
         for bs in &orch_manifest.bundled_secrets {
             // Skip if an installed module already populated this key. Pins
             // installed-module-wins so the orchestrator's bundled
@@ -587,7 +587,7 @@ async fn project_env(
                 "shared" => SENTINEL_SHARED,
                 _ => &project.id,
             };
-            let active = crate::db::secret_active::is_secret_active_cross_launcher_for_requester(
+            let active = vct_launcher_core::db::secret_active::is_secret_active_cross_launcher_for_requester(
                 &h.0,
                 scope_str,
                 lookup_project_id,
@@ -596,12 +596,12 @@ async fn project_env(
                 &project.id,
             );
             let scope = match bs.scope.as_str() {
-                "global" => crate::secrets::SecretScope::Global,
-                "shared" => crate::secrets::SecretScope::Shared { project_id: SENTINEL_SHARED },
-                _ => crate::secrets::SecretScope::PerProject { project_id: &project.id },
+                "global" => vct_launcher_core::secrets::SecretScope::Global,
+                "shared" => vct_launcher_core::secrets::SecretScope::Shared { project_id: SENTINEL_SHARED },
+                _ => vct_launcher_core::secrets::SecretScope::PerProject { project_id: &project.id },
             };
             if active {
-                if let Ok(Some(val)) = crate::secrets::get(scope, &bs.module_id, &bs.key) {
+                if let Ok(Some(val)) = vct_launcher_core::secrets::get(scope, &bs.module_id, &bs.key) {
                     if !val.trim().is_empty() {
                         env.insert(bs.key.clone(), serde_json::Value::String(val));
                         continue;
@@ -621,7 +621,7 @@ async fn project_env(
             // legacy slot is empty and this branch is a no-op.
             if bs.scope == "shared" && bs.key == "github_pat" && bs.module_id == "user" {
                 let legacy_module_id = "installer";
-                let legacy_active = crate::db::secret_active::is_secret_active_cross_launcher_for_requester(
+                let legacy_active = vct_launcher_core::db::secret_active::is_secret_active_cross_launcher_for_requester(
                     &h.0,
                     scope_str,
                     lookup_project_id,
@@ -630,7 +630,7 @@ async fn project_env(
                     &project.id,
                 );
                 if legacy_active {
-                    if let Ok(Some(val)) = crate::secrets::get(scope, legacy_module_id, &bs.key) {
+                    if let Ok(Some(val)) = vct_launcher_core::secrets::get(scope, legacy_module_id, &bs.key) {
                         if !val.trim().is_empty() {
                             env.insert(bs.key.clone(), serde_json::Value::String(val));
                         }
@@ -665,7 +665,7 @@ async fn project_env(
             if env.contains_key(&g.key) {
                 continue;
             }
-            let active = crate::db::secret_active::is_secret_active_cross_launcher_for_requester(
+            let active = vct_launcher_core::db::secret_active::is_secret_active_cross_launcher_for_requester(
                 &h.0,
                 "per_project",
                 &g.owner_project_id,
@@ -676,10 +676,10 @@ async fn project_env(
             if !active {
                 continue;
             }
-            let scope = crate::secrets::SecretScope::PerProject {
+            let scope = vct_launcher_core::secrets::SecretScope::PerProject {
                 project_id: &g.owner_project_id,
             };
-            if let Ok(Some(val)) = crate::secrets::get(scope, &g.module_id, &g.key) {
+            if let Ok(Some(val)) = vct_launcher_core::secrets::get(scope, &g.module_id, &g.key) {
                 env.insert(g.key.clone(), serde_json::Value::String(val));
             }
         }
@@ -731,7 +731,7 @@ async fn project_env(
 /// pin behaviour without standing up axum + a hub server.
 #[cfg(test)]
 pub(crate) fn resolve_secret_for_subprocess_env(
-    db: &crate::db::Db,
+    db: &vct_launcher_core::db::Db,
     scope_str: &str,
     project_id: &str,
     module_id: &str,
@@ -739,25 +739,25 @@ pub(crate) fn resolve_secret_for_subprocess_env(
 ) -> Option<String> {
     // PR-3 Commit 4: cross-launcher pause check (Option γ). A secret
     // paused in any launcher's DB blocks the read here.
-    let active = crate::db::secret_active::is_secret_active_cross_launcher(
+    let active = vct_launcher_core::db::secret_active::is_secret_active_cross_launcher(
         db, scope_str, project_id, module_id, key,
     );
     if !active {
         return None;
     }
     let scope = match scope_str {
-        "global" => crate::secrets::SecretScope::Global,
-        "shared" => crate::secrets::SecretScope::Shared { project_id },
-        _ => crate::secrets::SecretScope::PerProject { project_id },
+        "global" => vct_launcher_core::secrets::SecretScope::Global,
+        "shared" => vct_launcher_core::secrets::SecretScope::Shared { project_id },
+        _ => vct_launcher_core::secrets::SecretScope::PerProject { project_id },
     };
-    crate::secrets::get(scope, module_id, key).ok().flatten()
+    vct_launcher_core::secrets::get(scope, module_id, key).ok().flatten()
 }
 
 // ─── Manifest scanning (shared with commands::modules) ──────────────────
 
-fn scan_manifests() -> Vec<(std::path::PathBuf, crate::manifest::ModuleManifest)> {
+fn scan_manifests() -> Vec<(std::path::PathBuf, vct_launcher_core::manifest::ModuleManifest)> {
     let mut out = Vec::new();
-    let vct_root = crate::paths::vct_root_dir();
+    let vct_root = vct_launcher_core::paths::vct_root_dir();
     for subdir in [
         vct_root.join("modules"),
         vct_root.join("bundled_manifests"),
@@ -779,7 +779,7 @@ fn scan_manifests() -> Vec<(std::path::PathBuf, crate::manifest::ModuleManifest)
                 continue;
             }
             if let Ok(raw) = std::fs::read_to_string(&candidate) {
-                if let Ok(m) = crate::manifest::ModuleManifest::from_json(&raw) {
+                if let Ok(m) = vct_launcher_core::manifest::ModuleManifest::from_json(&raw) {
                     out.push((candidate, m));
                 }
             }
@@ -795,7 +795,7 @@ fn scan_manifests() -> Vec<(std::path::PathBuf, crate::manifest::ModuleManifest)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::Db;
+    use vct_launcher_core::db::Db;
 
     /// Probe whether the OS keychain backend is available in this test
     /// environment. CI containers and headless build hosts typically
@@ -845,8 +845,8 @@ mod tests {
         );
 
         // Set + activate.
-        crate::secrets::set(
-            crate::secrets::SecretScope::Global,
+        vct_launcher_core::secrets::set(
+            vct_launcher_core::secrets::SecretScope::Global,
             module_id,
             &key,
             &canary,
@@ -866,8 +866,8 @@ mod tests {
             .unwrap();
 
         // The keychain still has the value (proves Lifecycle B):
-        let kc = crate::secrets::get(
-            crate::secrets::SecretScope::Global,
+        let kc = vct_launcher_core::secrets::get(
+            vct_launcher_core::secrets::SecretScope::Global,
             module_id,
             &key,
         )
@@ -892,8 +892,8 @@ mod tests {
         assert_eq!(resolved_reactivated.as_deref(), Some(canary.as_str()));
 
         // Cleanup keychain (best-effort).
-        let _ = crate::secrets::delete(
-            crate::secrets::SecretScope::Global,
+        let _ = vct_launcher_core::secrets::delete(
+            vct_launcher_core::secrets::SecretScope::Global,
             module_id,
             &key,
         );
@@ -1213,26 +1213,26 @@ mod tests {
     // `vct-module.json::bundled_secrets` declares, and we can't use a
     // different slot without forking the JSON for tests. Tests
     // serialise via the process-wide
-    // `crate::secrets::test_serialize::keychain_serialize_lock`, which
+    // `vct_launcher_core::secrets::test_serialize::keychain_serialize_lock`, which
     // is the SAME mutex used by `commands::installer::github_pat_keychain_tests`
     // and `commands::dashboard::tests`. That closes the cross-module
     // race where parallel keychain writes to the same slot would
     // overwrite each other's canaries.
 
     /// Acquire the process-wide keychain mutex + cross-process file
-    /// lock. See `crate::secrets::test_serialize::keychain_serialize_lock`
+    /// lock. See `vct_launcher_core::secrets::test_serialize::keychain_serialize_lock`
     /// for the rationale. Return type opaque since v0.2.14 (2026-05-17)
     /// — was `MutexGuard<'static, ()>`, now also includes a flock guard
     /// to serialise across concurrent `cargo test` processes.
-    fn h1_lock() -> crate::secrets::test_serialize::KeychainGuard {
-        crate::secrets::test_serialize::keychain_serialize_lock()
+    fn h1_lock() -> vct_launcher_core::secrets::test_serialize::KeychainGuard {
+        vct_launcher_core::secrets::test_serialize::keychain_serialize_lock()
     }
 
     /// Helper: write a value into the OS keychain at the SENTINEL_SHARED
     /// slot the H1 fix uses. Only call from keyring-available test paths.
     fn write_shared_keychain_canary(module_id: &str, key: &str, value: &str) {
-        crate::secrets::set(
-            crate::secrets::SecretScope::Shared {
+        vct_launcher_core::secrets::set(
+            vct_launcher_core::secrets::SecretScope::Shared {
                 project_id: "_user_shared_",
             },
             module_id,
@@ -1244,8 +1244,8 @@ mod tests {
 
     /// Helper: clean up a keychain entry written by `write_shared_keychain_canary`.
     fn delete_shared_keychain_canary(module_id: &str, key: &str) {
-        let _ = crate::secrets::delete(
-            crate::secrets::SecretScope::Shared {
+        let _ = vct_launcher_core::secrets::delete(
+            vct_launcher_core::secrets::SecretScope::Shared {
                 project_id: "_user_shared_",
             },
             module_id,
@@ -1341,7 +1341,7 @@ mod tests {
         // Sanity: the on-disk manifest has a github_pat declaration. If
         // someone strips this, every fork user's resolver path silently
         // returns key_not_active again. Fail loudly.
-        let m = crate::commands::modules::read_orchestrator_manifest()
+        let m = vct_launcher_core::orchestrator_manifest::read_orchestrator_manifest()
             .expect("vct-module.json must be discoverable from current_exe()");
         let pat_decl = m
             .bundled_secrets

@@ -113,7 +113,7 @@ pub fn generate_token() -> Result<String, String> {
 
 /// Path to the token file under the launcher's state-root.
 fn token_path() -> PathBuf {
-    crate::paths::vct_root_dir().join(TOKEN_FILE)
+    vct_launcher_core::paths::vct_root_dir().join(TOKEN_FILE)
 }
 
 /// Persist the token to disk with mode 0o600 on Unix.

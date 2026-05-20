@@ -11,6 +11,7 @@
 pub mod config;
 pub mod db;
 pub mod manifest;
+pub mod orchestrator_manifest;
 pub mod paths;
 pub mod registry;
 pub mod secrets;

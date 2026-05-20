@@ -5328,11 +5328,18 @@ name = "vct-hub"
 version = "0.2.21"
 dependencies = [
  "axum",
+ "chrono",
+ "hex",
+ "keyring",
  "rand 0.9.4",
+ "reqwest 0.12.28",
+ "rusqlite",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tower-http",
+ "uuid",
  "vct-launcher-core",
 ]
 

@@ -9,7 +9,14 @@
 // `Window`, `Emitter`) or on this crate's `commands::` Tauri-command
 // surface.
 mod commands;
-mod hub;
+// `hub` module retired in v0.2.21 Step 4: the hub now lives in the
+// separate `vct-hub` binary (`launcher/src-tauri/vct-hub/`). The
+// launcher's setup no longer starts an in-process hub; install.py
+// (or `vct-hub --start-if-not-running` invoked manually) brings the
+// detached hub up. Step 6 wires the launcher to invoke that on
+// startup. Until then, on a fresh v0.2.21 install the hub is started
+// by install.py's post-install step; on an upgrade-from-0.2.20 the
+// migration choreography in Step 12 (`update_orchestrator`) handles it.
 mod installer_engine;
 mod mcp_registration;
 pub mod project_naming;
@@ -588,13 +595,14 @@ pub fn run() {
                 }
             }
 
-            // Start the Hub API server in the background
-            tauri::async_runtime::spawn(async {
-                match hub::server::start_hub_server().await {
-                    Ok(port) => println!("[vct] Hub server started on port {}", port),
-                    Err(e) => eprintln!("[vct] Hub server failed to start: {}", e),
-                }
-            });
+            // Hub HTTP server runs in the separate `vct-hub` binary as
+            // of v0.2.21 (Step 4 ported the module tree out; this call
+            // site is the last remaining hook). Step 6 reintroduces an
+            // explicit `vct-hub --start-if-not-running` invocation
+            // here so the launcher continues to bring the hub up on
+            // its own startup. Step 4 leaves it intentionally inert
+            // so the v0.2.21 in-progress branch can be verified bit-
+            // by-bit (port → CLI → launcher integration).
             // System tray (v1.1)
             if let Err(e) = tray::setup(&app.handle()) {
                 eprintln!("[vct] tray setup failed: {}", e);

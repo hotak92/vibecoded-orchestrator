@@ -37,8 +37,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::modules_api::LauncherDbHandle;
-use crate::db::models::ProjectHost;
-use crate::db::Db;
+use vct_launcher_core::db::models::ProjectHost;
+use vct_launcher_core::db::Db;
 
 pub fn router() -> Router<LauncherDbHandle> {
     Router::new()
@@ -69,7 +69,7 @@ pub fn router() -> Router<LauncherDbHandle> {
 
 fn resolve_project<F>(h: &LauncherDbHandle, id_or_slug: &str, then: F) -> axum::response::Response
 where
-    F: FnOnce(crate::db::models::ProjectRow) -> axum::response::Response,
+    F: FnOnce(vct_launcher_core::db::models::ProjectRow) -> axum::response::Response,
 {
     let resolved = h
         .0
@@ -307,7 +307,7 @@ async fn activate_license(
     // VCT_STATE_DIR (Bug 14): production launcher uses ~/.vct/, dev
     // launcher uses ~/.vct-dev/, etc. Without this, a dev launcher's
     // Hub server would clobber the production license file.
-    let key_path = crate::paths::vct_root_dir().join("license.key");
+    let key_path = vct_launcher_core::paths::vct_root_dir().join("license.key");
     if let Some(parent) = key_path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
@@ -324,7 +324,7 @@ async fn activate_license(
 }
 
 async fn deactivate_license(State(h): State<LauncherDbHandle>) -> impl IntoResponse {
-    let key_path = crate::paths::vct_root_dir().join("license.key");
+    let key_path = vct_launcher_core::paths::vct_root_dir().join("license.key");
     let _ = std::fs::remove_file(&key_path);
     let _ = h.0.audit("license_deactivate", None, None, &serde_json::json!({ "via": "cli" }));
     Json(serde_json::json!({ "ok": true })).into_response()
@@ -378,7 +378,7 @@ async fn telemetry_status(_state: State<LauncherDbHandle>) -> impl IntoResponse 
     // Read consent from <VCT_STATE_DIR>/telemetry.json — cheap, no DB call.
     // Path resolves through Bug 14's vct_root_dir() so dev/prod don't share
     // a single consent file.
-    let path = crate::paths::vct_root_dir().join("telemetry.json");
+    let path = vct_launcher_core::paths::vct_root_dir().join("telemetry.json");
     let consent = std::fs::read_to_string(&path)
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
@@ -398,7 +398,7 @@ async fn set_telemetry_consent(
 ) -> impl IntoResponse {
     // Path resolves through Bug 14's vct_root_dir() — dev launcher writes
     // to ~/.vct-dev/, prod writes to ~/.vct/.
-    let path = crate::paths::vct_root_dir().join("telemetry.json");
+    let path = vct_launcher_core::paths::vct_root_dir().join("telemetry.json");
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
@@ -469,7 +469,7 @@ fn weaviate_url() -> String {
     std::env::var("WEAVIATE_URL")
         .ok()
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| crate::config::DEFAULT_WEAVIATE_URL.to_string())
+        .unwrap_or_else(|| vct_launcher_core::config::DEFAULT_WEAVIATE_URL.to_string())
 }
 
 fn weaviate_client() -> Result<reqwest::Client, String> {
@@ -1258,7 +1258,7 @@ mod cli_kg_integration_tests {
                 &pid,
                 "test-cli-kg",
                 ".",
-                crate::db::models::ProjectHost::Base,
+                vct_launcher_core::db::models::ProjectHost::Base,
                 "test-cli-kg",
             )
             .expect("insert project");
@@ -1350,7 +1350,7 @@ mod cli_kg_integration_tests {
             &pid,
             "test-bad-cls",
             ".",
-            crate::db::models::ProjectHost::Base,
+            vct_launcher_core::db::models::ProjectHost::Base,
             "test-bad-cls",
         )
         .unwrap();
@@ -1389,7 +1389,7 @@ mod cli_kg_integration_tests {
             &pid,
             "test-no-grant",
             ".",
-            crate::db::models::ProjectHost::Base,
+            vct_launcher_core::db::models::ProjectHost::Base,
             "test-no-grant",
         )
         .unwrap();
@@ -1782,7 +1782,7 @@ mod cli_kg_integration_tests {
             &pid,
             "test-cg-scope",
             ".",
-            crate::db::models::ProjectHost::Base,
+            vct_launcher_core::db::models::ProjectHost::Base,
             "test-cg-scope",
         )
         .unwrap();
@@ -1835,7 +1835,7 @@ mod cli_kg_integration_tests {
             &pid,
             "test-cg-i",
             ".",
-            crate::db::models::ProjectHost::Base,
+            vct_launcher_core::db::models::ProjectHost::Base,
             "test-cg-i",
         )
         .unwrap();
@@ -1903,7 +1903,7 @@ mod cli_kg_integration_tests {
             &pid,
             "test-cg-audit",
             ".",
-            crate::db::models::ProjectHost::Base,
+            vct_launcher_core::db::models::ProjectHost::Base,
             "test-cg-audit",
         )
         .unwrap();

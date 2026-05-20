@@ -6,6 +6,10 @@ description = "Detached HTTP server for VCT — supervisor + resolver, survives 
 authors = ["VibeCoded Tools"]
 license = "AGPL-3.0"
 
+[lib]
+name = "vct_hub"
+path = "src/lib.rs"
+
 [[bin]]
 name = "vct-hub"
 path = "src/main.rs"
@@ -24,7 +28,30 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# Hex-encoded auth tokens
+hex = "0.4"
+
+# DB (hub.db state for the message-bus / app-registry sub-API)
+rusqlite = { version = "0.39", features = ["bundled"] }
+
+# UUID for message + interaction IDs
+uuid = { version = "1", features = ["v4"] }
+
+# Time stamps in event log
+chrono = { version = "0.4", features = ["serde"] }
+
+# Inter-binary HTTP calls (cli_api proxies licensing/telemetry to in-process helpers; future hub→launcher callbacks)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
 # Logging (println for v0.2.21 minimal stub; structured logging is a v0.2.22 followup)
 
 # Random for hub auth tokens (will reuse the same posture as the in-launcher hub)
 rand = { version = "0.9", default-features = false, features = ["std", "std_rng", "os_rng"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+# `modules_api.rs` has a keyring-probe gate that conditionally skips
+# keychain-touching tests on CI where libsecret is absent. The probe
+# itself needs the `keyring` crate.
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }

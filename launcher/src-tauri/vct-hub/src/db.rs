@@ -14,7 +14,7 @@ pub type Db = Arc<Mutex<Connection>>;
 
 /// Database path: `<VCT_STATE_DIR or ~/.vct>/hub.db`.
 pub fn db_path() -> PathBuf {
-    crate::paths::vct_root_dir().join("hub.db")
+    vct_launcher_core::paths::vct_root_dir().join("hub.db")
 }
 
 /// Open (or create) the hub database and run migrations.
