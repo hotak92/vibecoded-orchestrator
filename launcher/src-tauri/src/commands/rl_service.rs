@@ -613,7 +613,7 @@ pub async fn is_container_running(container_name: &str) -> Result<bool, String> 
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(stdout.trim() == "running")
+    Ok(parse_inspect_running_state(&stdout))
 }
 
 /// Pure helper for unit tests: parse the `--format '{{.State.Status}}'`
