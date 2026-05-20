@@ -341,8 +341,14 @@ echo "[build-bundled] Binary size: $(du -h "$DEST" | cut -f1)"
 # apply to vct-hub: vct-hub is an axum HTTP server with no frontend.
 # Running that check against it would correctly return 0 refs and
 # false-fail. We intentionally skip the asset-ref probe for vct-hub.
-echo "[build-bundled] cargo build --release --bin vct-hub"
-( cd "$SRC_TAURI" && cargo build --release --bin vct-hub )
+echo "[build-bundled] cargo build -p vct-hub --release --bin vct-hub"
+# The `-p vct-hub` package selector is required because the launcher's
+# workspace root (the vct-launcher-temp package at $SRC_TAURI) has no
+# `vct-hub` bin target — that target lives in the vct-hub workspace
+# member. Pre-fix this command failed with "no bin target named
+# `vct-hub` in default-run packages" because cargo defaulted to the
+# workspace root rather than the vct-hub member.
+( cd "$SRC_TAURI" && cargo build -p vct-hub --release --bin vct-hub )
 
 # Pick the hub binary name for the host platform. Cargo package name is
 # `vct-hub` (no `-temp` suffix); on Windows the artifact gets `.exe`.
