@@ -11,6 +11,7 @@
 //!   * `api`                — message-bus + app-registry routes
 //!   * `cli_api`            — generic CLI proxies (license/telemetry/etc)
 //!   * `config_api`         — project-config resolver (v0.2.21 Step 14)
+//!   * `lifecycle_api`      — services + per-module lifecycle routes (v0.2.21 Step 15)
 //!   * `modules_api`        — module install + secrets resolver routes
 //!   * `project_state_api`  — project state mirror of Tauri commands
 //!   * `server`             — wiring: bind, layer order, port discovery
@@ -29,6 +30,7 @@ pub mod cli_api;
 pub mod config_api;
 pub mod db;
 pub mod lifecycle;
+pub mod lifecycle_api;
 pub mod lockfile;
 pub mod modules_api;
 pub mod project_state_api;
