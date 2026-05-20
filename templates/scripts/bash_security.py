@@ -117,11 +117,26 @@ _rule(
     r"chown\s+(-[a-zA-Z]+\s+)*root\b",
     "Changing ownership to root",
 )
-_rule(
-    "sudo_su",
-    r"\b(sudo|su\s+-)\b",
-    "Privilege escalation via sudo/su",
-)
+# The `sudo_su` rule was REMOVED in v0.2.21 (2026-05-20). Rationale:
+# the orchestrator runs on developer machines where `sudo apt install`,
+# `sudo systemctl restart`, `sudo mount`, etc. are routine. Blocking
+# every command that mentions `sudo` or `su -` caused 100% false-positive
+# spam on dev workflows (e.g., systemd unit edits, mounting external
+# drives, package installs) AND surfaced as a confusing "hook error:
+# No stderr output" diagnostic because the block message was emitted to
+# stdout that Claude Code's PreToolUse hook runner discards.
+#
+# Real privilege-escalation vectors stay covered by sibling rules:
+#   - `chmod_world_writable` (777 on anything)
+#   - `chown_root` (transferring ownership to root)
+#   - `curl_pipe_shell`, `eval_curl`, `base64_pipe_shell` (RCE patterns)
+#   - the SSRF/network-fetch-to-shell rules upstream in pre-tool-use.sh
+#
+# `sudo` itself is not a security vulnerability; it's the standard
+# privilege-escalation mechanism that should be visible in a code
+# review. If a future incident motivates blocking sudo for SPECIFIC
+# subcommands (e.g. `sudo curl <url> | sh`), add a targeted rule that
+# matches the dangerous combination — not the bare `sudo` keyword.
 
 # === 5. Package supply chain ===
 _rule(

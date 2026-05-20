@@ -139,9 +139,14 @@ if [[ "$TOOL_NAME" == "WebFetch" ]]; then
         if echo "$URL" | grep -qE "(localhost:(8081|8082|11435|11440|7860)|127\.0\.0\.1:(8081|8082|11435|11440|7860))" 2>/dev/null; then
             : # whitelisted — fall through
         elif echo "$URL" | grep -qE "(localhost|127\.|10\.[0-9]+\.[0-9]+\.[0-9]+|172\.(1[6-9]|2[0-9]|3[01])\.[0-9]+\.|192\.168\.[0-9]+\.|169\.254\.[0-9]+\.|0\.0\.0\.0|::1)" 2>/dev/null; then
-            echo "🔒 SSRF guard: '$URL' targets a private/internal network address."
-            echo "   Whitelisted localhost services: Weaviate (:8081), Ollama (:11435), code-embed (:11440), Gradio (:7860)"
-            echo "   To allow additional services, add to whitelist in .claude/hooks/pre-tool-use.sh"
+            # Block messages route to stderr — see comment in bash-
+            # security branch below for why (Claude Code drops plain
+            # stdout from PreToolUse hooks).
+            {
+                echo "🔒 SSRF guard: '$URL' targets a private/internal network address."
+                echo "   Whitelisted localhost services: Weaviate (:8081), Ollama (:11435), code-embed (:11440), Gradio (:7860)"
+                echo "   To allow additional services, add to whitelist in .claude/hooks/pre-tool-use.sh"
+            } >&2
             echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"ssrf_blocked\",\"url\":\"$URL\"}" >> "$SECURITY_LOG" 2>/dev/null || true
             exit 2
         fi
@@ -169,9 +174,12 @@ if [[ "$TOOL_NAME" == "Bash" ]]; then
     fi
 
     if [[ -n "$INJECTION_FOUND" ]]; then
-        echo "🚨 Shell injection guard: detected '$INJECTION_FOUND' in Bash command."
-        echo "   Blocked command preview: ${CMD:0:120}"
-        echo "   If this is intentional, run the command manually in a terminal."
+        # Block messages route to stderr — see bash-security branch.
+        {
+            echo "🚨 Shell injection guard: detected '$INJECTION_FOUND' in Bash command."
+            echo "   Blocked command preview: ${CMD:0:120}"
+            echo "   If this is intentional, run the command manually in a terminal."
+        } >&2
         echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"shell_injection_blocked\",\"pattern\":\"$INJECTION_FOUND\",\"cmd_preview\":\"${CMD:0:80}\"}" >> "$SECURITY_LOG" 2>/dev/null || true
         exit 2
     fi
@@ -182,8 +190,19 @@ if [[ "$TOOL_NAME" == "Bash" ]]; then
         SECURITY_RESULT=$(echo "$CMD" | "$PY" "$SECURITY_SCRIPT" 2>&1)
         SECURITY_EXIT=$?
         if [[ "$SECURITY_EXIT" -eq 2 ]]; then
-            echo "🚨 Bash security scanner blocked this command:"
-            echo "   $SECURITY_RESULT"
+            # Emit the block message to STDERR (not stdout). Claude
+            # Code's PreToolUse hook runner discards plain stdout —
+            # only JSON-shaped stdout under `hookSpecificOutput.
+            # additionalContext` is surfaced (see PR #168, the same
+            # fix class applied to the KG-suggestion branch below).
+            # An exit-2 hook with no stderr renders as "hook error:
+            # No stderr output" on the user side, which is what the
+            # 2026-05-20 hook-spam report described. Route the human-
+            # readable message to stderr so the harness displays it.
+            {
+                echo "🚨 Bash security scanner blocked this command:"
+                echo "   $SECURITY_RESULT"
+            } >&2
             echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"bash_security_blocked\",\"detail\":\"${SECURITY_RESULT:0:200}\",\"cmd_preview\":\"${CMD:0:80}\"}" >> "$SECURITY_LOG" 2>/dev/null || true
             exit 2
         fi
@@ -213,8 +232,12 @@ if [[ "$TOOL_NAME" == "Write" ]] || [[ "$TOOL_NAME" == "Edit" ]]; then
 
             if [[ "$ALREADY_READ" -eq 0 ]]; then
                 BASENAME=$(basename "$FILE_PATH")
-                echo "⚠️  Build Anchor Protocol: '$BASENAME' has not been Read this session."
-                echo "    Use the Read tool on this file before modifying it."
+                # Block messages route to stderr — see bash-security
+                # branch comment.
+                {
+                    echo "⚠️  Build Anchor Protocol: '$BASENAME' has not been Read this session."
+                    echo "    Use the Read tool on this file before modifying it."
+                } >&2
                 echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"anchor_blocked\",\"file\":\"$FILE_PATH\"}" >> "$SECURITY_LOG" 2>/dev/null || true
                 exit 2
             fi
