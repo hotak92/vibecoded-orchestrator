@@ -151,6 +151,19 @@ pub fn ensure_orchestrator_root(db: &Db) -> Result<(), String> {
         // (the binding upsert is a no-op when present).
         if let Ok(Some(row)) = db.get_project_by_slug(ORCHESTRATOR_ROOT_SLUG) {
             ensure_orchestrator_root_kg_binding(db, &row.id);
+            // v0.2.22 item #17: re-populate the per-project agents/skills/
+            // hooks/MCP tables from the orchestrator clone's `.claude/`.
+            // Pre-v0.2.22 the orchestrator-root row was created but
+            // `populate_project_state_from_filesystem` was never invoked,
+            // leaving the launcher GUI's per-project tabs empty even
+            // though the clone has 65 agents / 52 skills / 28 hooks on
+            // disk. The startup MCP backfill at lib.rs guarded on
+            // `count_project_mcp_servers == 0` and so skipped re-populate
+            // once any MCP rows existed, never recovering the agents/
+            // skills/hooks state. Populate here is idempotent (UPSERT
+            // preserves enabled toggles) and runs every startup so the
+            // orchestrator-root tabs stay in sync with the clone.
+            ensure_orchestrator_root_state_populated(db, &row.id, &row.folder_path, &row.name);
         }
         return Ok(());
     }
@@ -226,6 +239,16 @@ pub fn ensure_orchestrator_root(db: &Db) -> Result<(), String> {
             // by writing to `app_state[shared_kg.collection_name]` (the
             // existing Priority-1 path in project_env_settings.rs).
             ensure_orchestrator_root_kg_binding(db, &id);
+            // v0.2.22 item #17: populate agents/skills/hooks tables
+            // from the freshly-detected clone's `.claude/`. See the
+            // already-exists branch above for the full rationale —
+            // this is the first-time-register path's mirror.
+            ensure_orchestrator_root_state_populated(
+                db,
+                &id,
+                &folder_path,
+                ORCHESTRATOR_ROOT_NAME,
+            );
             Ok(())
         }
         Err(e) => {
@@ -242,12 +265,74 @@ pub fn ensure_orchestrator_root(db: &Db) -> Result<(), String> {
                 );
                 if let Ok(Some(row)) = db.get_project_by_slug(ORCHESTRATOR_ROOT_SLUG) {
                     ensure_orchestrator_root_kg_binding(db, &row.id);
+                    // Race path also wants populate so the agents/skills/
+                    // hooks tables don't stay empty on the loser side.
+                    ensure_orchestrator_root_state_populated(
+                        db,
+                        &row.id,
+                        &row.folder_path,
+                        &row.name,
+                    );
                 }
                 Ok(())
             } else {
                 Err(format!("auto-register orchestrator_root: {}", e))
             }
         }
+    }
+}
+
+/// v0.2.22 item #17: idempotent populate of the orchestrator-root
+/// project's agents/skills/hooks/MCP rows from disk.
+///
+/// Soft-fails for two reasons:
+///   1. A scan hiccup MUST NOT block launcher boot — the row already
+///      exists, the KG binding is seeded, the rest of the launcher
+///      runs fine even if the GUI's Agents tab stays empty.
+///   2. `populate_project_state_from_filesystem` returns a report with
+///      `warnings: Vec<String>` but no fatal error path; we just log
+///      to stderr.
+///
+/// Pre-v0.2.22 this was missing. `ensure_orchestrator_root` registered
+/// the row + KG binding but never invoked the FS scanner, leaving
+/// `project_agents` / `project_skills` / `project_hooks` empty for the
+/// VibeCoded Orchestrator project. The startup MCP-backfill at
+/// `lib.rs::setup` ran the scanner ONLY when `count_project_mcp_servers
+/// == 0`, so once any MCP rows landed (the migration-010 sweep adds
+/// a couple by default), the gate closed and the agents/skills/hooks
+/// tables stayed empty forever — visible in the launcher GUI as
+/// "No agents registered." despite 65 .md files on disk.
+fn ensure_orchestrator_root_state_populated(
+    db: &Db,
+    project_id: &str,
+    folder_path: &str,
+    project_name: &str,
+) {
+    let folder = std::path::Path::new(folder_path);
+    if !folder.is_dir() {
+        eprintln!(
+            "[vct] WARN: orchestrator-root folder missing on disk: {} (skipping populate)",
+            folder_path
+        );
+        return;
+    }
+    let report = crate::commands::project_state_populate::
+        populate_project_state_from_filesystem(project_id, project_name, folder, db);
+    let total = report.agents_inserted
+        + report.skills_inserted
+        + report.hooks_inserted
+        + report.mcp_servers_inserted;
+    if total > 0 {
+        eprintln!(
+            "[vct] orchestrator-root populate: {} agents, {} skills, {} hooks, {} MCP servers",
+            report.agents_inserted,
+            report.skills_inserted,
+            report.hooks_inserted,
+            report.mcp_servers_inserted,
+        );
+    }
+    for w in &report.warnings {
+        eprintln!("[vct] orchestrator-root populate warning: {}", w);
     }
 }
 
@@ -546,5 +631,168 @@ mod tests {
             ORCHESTRATOR_ROOT_SLUG,
         );
         assert!(second.is_err(), "second insert must fail on UNIQUE slug");
+    }
+
+    // ─── v0.2.22 item #17: ensure_orchestrator_root_state_populated ──────
+
+    /// When `ensure_orchestrator_root` runs and the row exists with a
+    /// real folder_path on disk containing `.claude/agents/*.md`, the
+    /// `project_agents` table must be populated. This is the core
+    /// regression guard for v0.2.22 item #17 — pre-fix the row existed
+    /// but `populate_project_state_from_filesystem` was never invoked,
+    /// leaving the GUI Agents tab empty despite files on disk.
+    #[test]
+    fn ensure_orchestrator_root_populates_agents_from_disk() {
+        use std::fs;
+
+        let db = Db::open_in_memory().expect("in-memory db");
+
+        // Stage a fake orchestrator-root folder with .claude/agents.
+        let tmp = std::env::temp_dir().join(format!(
+            "orchroot-populate-{}",
+            Uuid::new_v4().simple()
+        ));
+        let agents_dir = tmp.join(".claude/agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        fs::write(
+            agents_dir.join("planner.md"),
+            "---\nname: planner\nmodel: sonnet\n---\n# Planner\n",
+        )
+        .unwrap();
+        fs::write(
+            agents_dir.join("coder.md"),
+            "---\nname: coder\nmodel: haiku\n---\n# Coder\n",
+        )
+        .unwrap();
+        // README.md must be filtered out by the v0.2.22 fix.
+        fs::write(agents_dir.join("README.md"), "# docs").unwrap();
+
+        // Pre-seed the orchestrator-root row pointing at our tmp folder.
+        let root_id = Uuid::new_v4().to_string();
+        db.insert_project(
+            &root_id,
+            ORCHESTRATOR_ROOT_NAME,
+            tmp.to_string_lossy().as_ref(),
+            ProjectHost::OrchestratorRoot,
+            ORCHESTRATOR_ROOT_SLUG,
+        )
+        .unwrap();
+
+        // No agents yet.
+        assert_eq!(
+            db.list_project_agents(&root_id).unwrap().len(),
+            0,
+            "pre-condition: no agents registered"
+        );
+
+        // Run ensure — it should populate the agents table.
+        ensure_orchestrator_root(&db).expect("ensure_orchestrator_root");
+
+        let rows = db.list_project_agents(&root_id).unwrap();
+        let names: Vec<&str> = rows.iter().map(|a| a.agent_name.as_str()).collect();
+        assert!(
+            names.contains(&"planner"),
+            "planner must be populated, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"coder"),
+            "coder must be populated, got: {:?}",
+            names
+        );
+        assert!(
+            !names.iter().any(|n| n.eq_ignore_ascii_case("readme")),
+            "README must be filtered out by the v0.2.22 fix, got: {:?}",
+            names
+        );
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Idempotency: running ensure twice with the same on-disk state
+    /// does not duplicate rows AND preserves user-disabled toggles.
+    /// This is the contract that lets us safely call ensure on EVERY
+    /// launcher boot rather than gating on "is populate needed?".
+    #[test]
+    fn ensure_orchestrator_root_populate_is_idempotent_and_preserves_toggles() {
+        use std::fs;
+
+        let db = Db::open_in_memory().expect("in-memory db");
+
+        let tmp = std::env::temp_dir().join(format!(
+            "orchroot-idem-{}",
+            Uuid::new_v4().simple()
+        ));
+        let agents_dir = tmp.join(".claude/agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        fs::write(
+            agents_dir.join("planner.md"),
+            "---\nname: planner\nmodel: sonnet\n---\n",
+        )
+        .unwrap();
+
+        let root_id = Uuid::new_v4().to_string();
+        db.insert_project(
+            &root_id,
+            ORCHESTRATOR_ROOT_NAME,
+            tmp.to_string_lossy().as_ref(),
+            ProjectHost::OrchestratorRoot,
+            ORCHESTRATOR_ROOT_SLUG,
+        )
+        .unwrap();
+
+        // First ensure populates.
+        ensure_orchestrator_root(&db).expect("first ensure");
+        assert_eq!(db.list_project_agents(&root_id).unwrap().len(), 1);
+
+        // User disables the agent via the GUI.
+        db.set_project_agent_enabled(&root_id, "planner", false)
+            .unwrap();
+        assert!(!db.list_project_agents(&root_id).unwrap()[0].enabled);
+
+        // Second ensure — must NOT duplicate the row AND must NOT
+        // re-enable it.
+        ensure_orchestrator_root(&db).expect("second ensure");
+        let rows = db.list_project_agents(&root_id).unwrap();
+        assert_eq!(rows.len(), 1, "ensure must not duplicate rows");
+        assert!(
+            !rows[0].enabled,
+            "ensure must preserve user-disabled toggle"
+        );
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// When the orchestrator-root folder_path stored in DB no longer
+    /// exists on disk (user deleted the clone but the DB row survives),
+    /// the populate helper must not panic; it should soft-fail with a
+    /// stderr warning and leave the row alone.
+    #[test]
+    fn ensure_orchestrator_root_populate_soft_fails_when_folder_missing() {
+        let db = Db::open_in_memory().expect("in-memory db");
+
+        let root_id = Uuid::new_v4().to_string();
+        // Path that intentionally does not exist on disk.
+        let missing = std::env::temp_dir().join(format!(
+            "orchroot-MISSING-{}",
+            Uuid::new_v4().simple()
+        ));
+        db.insert_project(
+            &root_id,
+            ORCHESTRATOR_ROOT_NAME,
+            missing.to_string_lossy().as_ref(),
+            ProjectHost::OrchestratorRoot,
+            ORCHESTRATOR_ROOT_SLUG,
+        )
+        .unwrap();
+
+        // Should not panic or error.
+        ensure_orchestrator_root(&db).expect("ensure must not error on missing folder");
+
+        // Row stays.
+        let row = db.get_project_by_slug(ORCHESTRATOR_ROOT_SLUG).unwrap();
+        assert!(row.is_some(), "row must not be deleted");
+        // No agents registered (because folder doesn't exist).
+        assert_eq!(db.list_project_agents(&root_id).unwrap().len(), 0);
     }
 }

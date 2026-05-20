@@ -64,6 +64,87 @@ pub async fn get_project_state_snapshot(
     db.get_project_state_snapshot(&project_id)
 }
 
+// ─── v0.2.22 item #17: manual re-scan from disk ──────────────────────────
+//
+// The launcher GUI's Agents/Skills/Hooks tabs are backed by SQL queries
+// against the per-project DB tables. If a project's tables get out of
+// sync with the on-disk `.claude/` (orchestrator-root projects pre-v0.2.22
+// never populated their tables; user-deleted DB rows; user-added files
+// to `.claude/` between launcher boots), the tabs show "No agents
+// registered." despite files being present on disk.
+//
+// The empty-state of each tab surfaces a "Re-scan from disk" button
+// that invokes this command. It runs `populate_project_state_from_filesystem`
+// (idempotent UPSERT — preserves user toggles), then returns the
+// inserted-row counts so the GUI can show a toast like
+// "Re-scanned: 65 agents, 52 skills, 28 hooks".
+
+/// Summary of what `rescan_project_from_filesystem` did. The shapes
+/// mirror `PopulateReport` (defined in commands/project_state_populate.rs)
+/// but with a serializable representation suitable for IPC.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RescanReport {
+    pub agents_inserted: usize,
+    pub skills_inserted: usize,
+    pub hooks_inserted: usize,
+    pub mcp_servers_inserted: usize,
+    pub kg_access_rows_inserted: usize,
+    pub warnings: Vec<String>,
+}
+
+#[command]
+pub async fn rescan_project_from_filesystem(
+    project_id: String,
+    db: State<'_, Db>,
+) -> Result<RescanReport, String> {
+    // Resolve the project's folder_path from the DB. Caller must own a
+    // valid project_id; if the row is gone, we surface a clear error
+    // instead of silently no-oping.
+    let project = db
+        .get_project(&project_id)
+        .map_err(|e| format!("get_project: {}", e))?
+        .ok_or_else(|| format!("project '{}' not found", project_id))?;
+
+    let folder = std::path::Path::new(&project.folder_path);
+    if !folder.is_dir() {
+        return Err(format!(
+            "project folder no longer exists on disk: {} \
+             (was the project moved/deleted? edit the path via Settings or remove the project)",
+            project.folder_path
+        ));
+    }
+
+    let report = crate::commands::project_state_populate::populate_project_state_from_filesystem(
+        &project_id,
+        &project.name,
+        folder,
+        db.inner(),
+    );
+
+    // Audit so the change-log shows the manual action.
+    db.audit(
+        "project_rescan_from_filesystem",
+        Some(&project_id),
+        None,
+        &serde_json::json!({
+            "agents_inserted": report.agents_inserted,
+            "skills_inserted": report.skills_inserted,
+            "hooks_inserted": report.hooks_inserted,
+            "mcp_servers_inserted": report.mcp_servers_inserted,
+            "warning_count": report.warnings.len(),
+        }),
+    )?;
+
+    Ok(RescanReport {
+        agents_inserted: report.agents_inserted,
+        skills_inserted: report.skills_inserted,
+        hooks_inserted: report.hooks_inserted,
+        mcp_servers_inserted: report.mcp_servers_inserted,
+        kg_access_rows_inserted: report.kg_access_rows_inserted,
+        warnings: report.warnings,
+    })
+}
+
 // ─── MCP servers (migration 010, 2026-05-10) ─────────────────────────────
 //
 // Resolves the KNOWN_ISSUES.md "Custom MCP tab is not populated by initial
@@ -1021,5 +1102,150 @@ mod tests {
             .filter(|r| r.kind == "mcp_server" && r.value == "playwright")
             .collect();
         assert_eq!(mcp_rows.len(), 1, "UPSERT must collapse to a single row");
+    }
+
+    // ─── v0.2.22 item #17: rescan_project_from_filesystem ──────────────
+
+    /// Replicate the rescan command's DB-only logic (the #[command]
+    /// requires Tauri State). Asserts the populate-from-disk produces
+    /// the same result as if the command itself were invoked.
+    ///
+    /// Pattern mirrors `list_mcp_perms` above (same constraint: Tauri
+    /// State is not constructible in unit tests; replicate the logic
+    /// directly against the Db.)
+    fn rescan_logic(db: &Db, project_id: &str) -> Result<RescanReport, String> {
+        let project = db
+            .get_project(project_id)
+            .map_err(|e| format!("get_project: {}", e))?
+            .ok_or_else(|| format!("project '{}' not found", project_id))?;
+        let folder = std::path::Path::new(&project.folder_path);
+        if !folder.is_dir() {
+            return Err(format!(
+                "project folder no longer exists on disk: {}",
+                project.folder_path
+            ));
+        }
+        let report = crate::commands::project_state_populate::
+            populate_project_state_from_filesystem(project_id, &project.name, folder, db);
+        Ok(RescanReport {
+            agents_inserted: report.agents_inserted,
+            skills_inserted: report.skills_inserted,
+            hooks_inserted: report.hooks_inserted,
+            mcp_servers_inserted: report.mcp_servers_inserted,
+            kg_access_rows_inserted: report.kg_access_rows_inserted,
+            warnings: report.warnings,
+        })
+    }
+
+    /// Successful rescan against a real folder populates the per-project
+    /// tables and returns the inserted-row counts in the report.
+    #[test]
+    fn rescan_populates_agents_and_skills_from_disk() {
+        use std::fs;
+        use uuid::Uuid;
+
+        let db = make_db();
+
+        // Stage a folder with .claude/agents + .claude/skills.
+        let tmp = std::env::temp_dir().join(format!(
+            "rescan-test-{}",
+            Uuid::new_v4().simple()
+        ));
+        let agents_dir = tmp.join(".claude/agents");
+        let skills_dir = tmp.join(".claude/skills");
+        fs::create_dir_all(&agents_dir).unwrap();
+        fs::create_dir_all(&skills_dir).unwrap();
+        fs::write(
+            agents_dir.join("planner.md"),
+            "---\nname: planner\nmodel: sonnet\n---\n",
+        )
+        .unwrap();
+        fs::write(
+            agents_dir.join("README.md"),
+            "# docs (must be skipped)",
+        )
+        .unwrap();
+        // Skill: directory with SKILL.md.
+        let sk = skills_dir.join("architect");
+        fs::create_dir_all(&sk).unwrap();
+        fs::write(
+            sk.join("SKILL.md"),
+            "---\nname: architect\nmodel: opus\n---\n",
+        )
+        .unwrap();
+
+        // Seed a project pointing at our folder.
+        let pid = Uuid::new_v4().to_string();
+        db.insert_project(
+            &pid,
+            "Acme",
+            tmp.to_string_lossy().as_ref(),
+            ProjectHost::Base,
+            &db.generate_unique_slug("Acme").unwrap(),
+        )
+        .unwrap();
+
+        // Pre-condition: empty tables.
+        assert_eq!(db.list_project_agents(&pid).unwrap().len(), 0);
+        assert_eq!(db.list_project_skills(&pid).unwrap().len(), 0);
+
+        // Rescan.
+        let report = rescan_logic(&db, &pid).expect("rescan must succeed");
+
+        assert_eq!(report.agents_inserted, 1, "planner counted, README skipped");
+        assert_eq!(report.skills_inserted, 1);
+
+        // Verify the rows are actually in the DB.
+        let agents = db.list_project_agents(&pid).unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].agent_name, "planner");
+        assert_eq!(agents[0].model.as_deref(), Some("sonnet"));
+
+        let skills = db.list_project_skills(&pid).unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].skill_name, "architect");
+        assert_eq!(skills[0].model.as_deref(), Some("opus"));
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Unknown project_id surfaces a clear error rather than panicking.
+    #[test]
+    fn rescan_returns_error_for_unknown_project_id() {
+        let db = make_db();
+        let err = rescan_logic(&db, "ghost-id").unwrap_err();
+        assert!(
+            err.contains("not found"),
+            "expected 'not found' error, got: {}",
+            err
+        );
+    }
+
+    /// Project row exists but folder_path points at a missing directory
+    /// (user moved/deleted the project on disk). The command surfaces
+    /// a clear, actionable error.
+    #[test]
+    fn rescan_returns_error_when_folder_missing() {
+        use uuid::Uuid;
+        let db = make_db();
+        let pid = Uuid::new_v4().to_string();
+        let missing = std::env::temp_dir().join(format!(
+            "rescan-MISSING-{}",
+            Uuid::new_v4().simple()
+        ));
+        db.insert_project(
+            &pid,
+            "GhostProject",
+            missing.to_string_lossy().as_ref(),
+            ProjectHost::Base,
+            &db.generate_unique_slug("GhostProject").unwrap(),
+        )
+        .unwrap();
+        let err = rescan_logic(&db, &pid).unwrap_err();
+        assert!(
+            err.contains("no longer exists on disk"),
+            "expected folder-missing error, got: {}",
+            err
+        );
     }
 }

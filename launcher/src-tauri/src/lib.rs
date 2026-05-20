@@ -1009,6 +1009,7 @@ pub fn run() {
             commands::project_state_cmd::list_project_permissions,
             commands::project_state_cmd::list_project_secret_refs,
             commands::project_state_cmd::get_project_state_snapshot,
+            commands::project_state_cmd::rescan_project_from_filesystem,
             commands::project_state_cmd::register_project_agent,
             commands::project_state_cmd::set_project_agent_enabled,
             commands::project_state_cmd::unregister_project_agent,

@@ -35,6 +35,54 @@
     }
   }
 
+  // v0.2.22 item #17: manual "Re-scan from disk" button surfaced in
+  // the empty state. Calls `rescan_project_from_filesystem` which
+  // walks `.claude/agents/` and UPSERTs each `.md` into project_agents
+  // (the same path `populate_project_state_from_filesystem` runs on
+  // project creation). Idempotent — preserves user toggles.
+  // Use case: orchestrator-root projects pre-v0.2.22 had empty tables
+  // despite files on disk; new user-added agent .md files won't show
+  // up until the next populate either.
+  let rescanning = $state(false);
+
+  type RescanReport = {
+    agents_inserted: number;
+    skills_inserted: number;
+    hooks_inserted: number;
+    mcp_servers_inserted: number;
+    kg_access_rows_inserted: number;
+    warnings: string[];
+  };
+
+  async function rescan() {
+    rescanning = true;
+    try {
+      const r = await invoke<RescanReport>('rescan_project_from_filesystem', {
+        projectId,
+      });
+      const parts: string[] = [];
+      if (r.agents_inserted > 0) parts.push(`${r.agents_inserted} agents`);
+      if (r.skills_inserted > 0) parts.push(`${r.skills_inserted} skills`);
+      if (r.hooks_inserted > 0) parts.push(`${r.hooks_inserted} hooks`);
+      if (r.mcp_servers_inserted > 0) parts.push(`${r.mcp_servers_inserted} MCP servers`);
+      toast.success(
+        parts.length > 0
+          ? `Re-scanned from disk: ${parts.join(', ')}`
+          : 'Re-scan complete (nothing new to register)'
+      );
+      if (r.warnings.length > 0) {
+        // Show warnings in console so power users can investigate
+        // (e.g. stale-bundle agents missing the `model:` field).
+        console.warn('[rescan] warnings:', r.warnings);
+      }
+      await load();
+    } catch (e) {
+      toast.error(e);
+    } finally {
+      rescanning = false;
+    }
+  }
+
   async function toggle(name: string, enabled: boolean) {
     try {
       await invoke('set_project_agent_enabled', { projectId, agentName: name, enabled });
@@ -111,7 +159,16 @@
   {#if loading}
     <p class="ps-loading">Loading…</p>
   {:else if agents.length === 0}
-    <p class="ps-empty">No agents registered.</p>
+    <div class="ps-empty-state">
+      <p class="ps-empty">No agents registered.</p>
+      <p class="ps-empty-hint">
+        Has the project's <code>.claude/agents/</code> already? Click
+        Re-scan to populate from disk (idempotent — preserves toggles).
+      </p>
+      <button class="ps-btn-primary" disabled={rescanning} onclick={rescan}>
+        {rescanning ? 'Re-scanning…' : 'Re-scan from disk'}
+      </button>
+    </div>
   {:else}
     <table class="ps-table">
       <thead><tr><th>Name</th><th>Source</th><th>Model</th><th>Enabled</th><th></th></tr></thead>
@@ -150,6 +207,11 @@
     padding: 5px 8px; border-radius: 4px; font-size: 12px;
   }
   .ps-loading, .ps-empty { color: #888; padding: 24px; text-align: center; }
+  .ps-empty-state { text-align: center; padding: 24px; }
+  .ps-empty-state .ps-empty { padding: 0 0 8px; }
+  .ps-empty-hint { color: #aaa; font-size: 12px; padding: 0 0 16px; max-width: 480px; margin: 0 auto; }
+  .ps-empty-hint code { background: rgba(255,255,255,0.08); padding: 1px 4px; border-radius: 3px; font-family: ui-monospace, monospace; }
+  .ps-btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
   .ps-table { width: 100%; border-collapse: collapse; font-size: 12px; }
   .ps-table th { text-align: left; padding: 6px 8px; color: #888; font-weight: 500; border-bottom: 1px solid rgba(255,255,255,0.08); }
   .ps-table td { padding: 6px 8px; border-bottom: 1px solid rgba(255,255,255,0.04); }

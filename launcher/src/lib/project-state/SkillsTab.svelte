@@ -30,6 +30,46 @@
     finally { loading = false; }
   }
 
+  // v0.2.22 item #17: "Re-scan from disk" button — see AgentsTab.svelte
+  // for the full rationale. Same command, idempotent, preserves toggles.
+  let rescanning = $state(false);
+
+  type RescanReport = {
+    agents_inserted: number;
+    skills_inserted: number;
+    hooks_inserted: number;
+    mcp_servers_inserted: number;
+    kg_access_rows_inserted: number;
+    warnings: string[];
+  };
+
+  async function rescan() {
+    rescanning = true;
+    try {
+      const r = await invoke<RescanReport>('rescan_project_from_filesystem', {
+        projectId,
+      });
+      const parts: string[] = [];
+      if (r.agents_inserted > 0) parts.push(`${r.agents_inserted} agents`);
+      if (r.skills_inserted > 0) parts.push(`${r.skills_inserted} skills`);
+      if (r.hooks_inserted > 0) parts.push(`${r.hooks_inserted} hooks`);
+      if (r.mcp_servers_inserted > 0) parts.push(`${r.mcp_servers_inserted} MCP servers`);
+      toast.success(
+        parts.length > 0
+          ? `Re-scanned from disk: ${parts.join(', ')}`
+          : 'Re-scan complete (nothing new to register)'
+      );
+      if (r.warnings.length > 0) {
+        console.warn('[rescan] warnings:', r.warnings);
+      }
+      await load();
+    } catch (e) {
+      toast.error(e);
+    } finally {
+      rescanning = false;
+    }
+  }
+
   async function toggle(name: string, enabled: boolean) {
     try {
       await invoke('set_project_skill_enabled', { projectId, skillName: name, enabled });
@@ -92,7 +132,16 @@
   {#if loading}
     <p class="ps-empty">Loading…</p>
   {:else if skills.length === 0}
-    <p class="ps-empty">No skills registered.</p>
+    <div class="ps-empty-state">
+      <p class="ps-empty">No skills registered.</p>
+      <p class="ps-empty-hint">
+        Has the project's <code>.claude/skills/</code> already? Click
+        Re-scan to populate from disk (idempotent — preserves toggles).
+      </p>
+      <button class="ps-btn-primary" disabled={rescanning} onclick={rescan}>
+        {rescanning ? 'Re-scanning…' : 'Re-scan from disk'}
+      </button>
+    </div>
   {:else}
     <table class="ps-table">
       <thead><tr><th>Name</th><th>Source</th><th>Model</th><th>Enabled</th><th></th></tr></thead>
@@ -127,6 +176,11 @@
     color: inherit; padding: 5px 8px; border-radius: 4px; font-size: 12px;
   }
   .ps-empty { color: #888; padding: 24px; text-align: center; }
+  .ps-empty-state { text-align: center; padding: 24px; }
+  .ps-empty-state .ps-empty { padding: 0 0 8px; }
+  .ps-empty-hint { color: #aaa; font-size: 12px; padding: 0 0 16px; max-width: 480px; margin: 0 auto; }
+  .ps-empty-hint code { background: rgba(255,255,255,0.08); padding: 1px 4px; border-radius: 3px; font-family: ui-monospace, monospace; }
+  .ps-btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
   .ps-table { width: 100%; border-collapse: collapse; font-size: 12px; }
   .ps-table th { text-align: left; padding: 6px 8px; color: #888; font-weight: 500; border-bottom: 1px solid rgba(255,255,255,0.08); }
   .ps-table td { padding: 6px 8px; border-bottom: 1px solid rgba(255,255,255,0.04); }
