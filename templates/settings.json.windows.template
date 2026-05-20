@@ -71,6 +71,12 @@
           },
           {
             "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\session-start-ensure-hub.ps1",
+            "timeout": 5,
+            "async": true
+          },
+          {
+            "type": "command",
             "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\session-start-kg-loader.ps1",
             "timeout": 10
           },
