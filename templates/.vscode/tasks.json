@@ -1,0 +1,46 @@
+{
+  "version": "2.0.0",
+  "_comment": "VibeCoded Orchestrator — VS Code tasks template. Belt-and-braces companion to the Claude Code SessionStart hook: starts vct-hub when the project folder is opened in VS Code, even when no Claude Code session has been launched yet. Both invocations are idempotent (vct-hub --start-if-not-running exits 0 whether the hub just started, was already running, or could not start). Bypass with VCT_DISABLE_HOOKS=1 in your environment.",
+  "tasks": [
+    {
+      "label": "Start VCT Hub",
+      "type": "shell",
+      "detail": "Idempotently start vct-hub on folder open (v0.2.21+).",
+      "presentation": {
+        "reveal": "silent",
+        "panel": "shared",
+        "echo": false,
+        "focus": false,
+        "showReuseMessage": false,
+        "clear": false,
+        "close": true
+      },
+      "problemMatcher": [],
+      "runOptions": {
+        "runOn": "folderOpen"
+      },
+      "windows": {
+        "command": "powershell",
+        "args": [
+          "-NoProfile",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          "${workspaceFolder}\\.claude\\hooks\\session-start-ensure-hub.ps1"
+        ]
+      },
+      "linux": {
+        "command": "bash",
+        "args": [
+          "${workspaceFolder}/.claude/hooks/session-start-ensure-hub.sh"
+        ]
+      },
+      "osx": {
+        "command": "bash",
+        "args": [
+          "${workspaceFolder}/.claude/hooks/session-start-ensure-hub.sh"
+        ]
+      }
+    }
+  ]
+}

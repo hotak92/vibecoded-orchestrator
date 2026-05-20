@@ -71,6 +71,12 @@
           },
           {
             "type": "command",
+            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/session-start-ensure-hub.sh",
+            "timeout": 5,
+            "async": true
+          },
+          {
+            "type": "command",
             "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/session-start-kg-loader.sh",
             "timeout": 10
           },
