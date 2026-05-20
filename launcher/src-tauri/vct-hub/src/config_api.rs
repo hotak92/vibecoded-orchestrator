@@ -173,16 +173,28 @@ async fn project_config(
         }
     }
 
-    // 1. Identity row.
+    // 1. Identity row. Accept either a UUID or a slug as path-arg;
+    // resolver clients (Step 16) pass through whatever the consumer
+    // gave them and don't always know which form they have. Try
+    // ID-lookup first (the common case from a /projects/by-path round-
+    // trip), fall back to slug if absent. Per plan §"Acceptance
+    // criterion" property (1), the launcher-root project is reachable
+    // via the well-known slug `orchestrator-root` even on a fresh
+    // install where the caller has no UUID yet — that's also why the
+    // slug fallback exists here rather than as a separate endpoint.
     let project = match h.0.get_project(&project_id) {
         Ok(Some(p)) => p,
-        Ok(None) => {
-            return error_response(
-                StatusCode::NOT_FOUND,
-                "project_not_found",
-                format!("project {} not found", project_id),
-            );
-        }
+        Ok(None) => match h.0.get_project_by_slug(&project_id) {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                return error_response(
+                    StatusCode::NOT_FOUND,
+                    "project_not_found",
+                    format!("project {} not found (tried both id and slug)", project_id),
+                );
+            }
+            Err(e) => return db_error_response("get project by slug (config)", e),
+        },
         Err(e) => return db_error_response("get project (config)", e),
     };
 
