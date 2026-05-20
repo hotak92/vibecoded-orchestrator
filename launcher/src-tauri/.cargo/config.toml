@@ -57,3 +57,28 @@ rustflags = [
     # rustc expects to match.
     "--remap-path-prefix=C:\\Users=<home>",
 ]
+
+# v0.2.21 Step 23: serialise `cargo test` by default.
+#
+# A subset of our tests across multiple modules (auth, lockfile, boot,
+# hub_status, hub_launcher, commands::installer::hub_stop_tests,
+# commands::self_update::state_roundtrip, etc.) mutate process-wide
+# environment variables (VCT_STATE_DIR, HOME, VCT_HUB_PORT). The
+# vct_launcher_core::test_env helper serialises env mutations via a
+# workspace-wide Mutex, but a residual class of flake remains in tests
+# that spawn-and-reap subprocesses to obtain "definitely dead" PIDs:
+# the kernel can recycle the PID under heavy parallel test load before
+# the test reads it, breaking the test's assumption.
+#
+# Defaulting to serial threading here eliminates the residual flake
+# without per-test gymnastics. The cost is ~2x wall time on `cargo
+# test` (single-threaded ~80s, multi-threaded ~40s on this laptop);
+# acceptable for a workspace whose test suite is already structured
+# around shared global state (libsecret keychain, ~/.vct/ paths,
+# launcher.db in WAL mode).
+#
+# Developers who genuinely want parallel runs can override with
+# `cargo test -- --test-threads=N`. CI also overrides explicitly via
+# the `--test-threads` flag in the test-runner step.
+[env]
+RUST_TEST_THREADS = "1"

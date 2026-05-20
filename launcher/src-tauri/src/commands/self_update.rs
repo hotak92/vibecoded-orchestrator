@@ -1114,19 +1114,27 @@ mod tests {
 
     #[test]
     fn state_roundtrip() {
-        // Use a temp dir to avoid clobbering the real ~/.vct file.
+        // v0.2.21 Step 23: $HOME mutation routes through the shared
+        // workspace mutex so we don't race with other env-mutating
+        // tests (auth, lockfile, boot, hub_status, hub_launcher,
+        // installer hub_stop, etc.) running concurrently under
+        // default `cargo test` parallelism.
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var("HOME", tmp.path());
+        let tmp_path = tmp.path().to_path_buf();
+        vct_launcher_core::test_env::with_env_vars(
+            &[("HOME", Some(tmp_path.to_str().unwrap()))],
+            || {
+                let mut s = UpdateState::default();
+                s.last_checked_at = Some(Utc::now());
+                s.last_known_commit_count = Some(7);
+                s.auto_check_enabled = Some(false);
+                save_state(&s).unwrap();
 
-        let mut s = UpdateState::default();
-        s.last_checked_at = Some(Utc::now());
-        s.last_known_commit_count = Some(7);
-        s.auto_check_enabled = Some(false);
-        save_state(&s).unwrap();
-
-        let back = load_state();
-        assert_eq!(back.last_known_commit_count, Some(7));
-        assert_eq!(back.auto_check_enabled, Some(false));
+                let back = load_state();
+                assert_eq!(back.last_known_commit_count, Some(7));
+                assert_eq!(back.auto_check_enabled, Some(false));
+            },
+        );
     }
 
     // ---------------------------------------------------------------------

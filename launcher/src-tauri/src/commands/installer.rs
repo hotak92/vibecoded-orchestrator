@@ -9664,27 +9664,14 @@ MemAvailable:   23456789 kB
     // ------------------------------------------------------------------
     mod hub_stop_tests {
         use super::super::*;
-        use std::sync::Mutex;
 
-        static SERIALIZE: Mutex<()> = Mutex::new(());
-
-        /// Set VCT_STATE_DIR to a tempdir for the duration of `f`,
-        /// restoring whatever was there before. Locks SERIALIZE so
-        /// tests can't race on the env var.
+        /// v0.2.21 Step 23: env-mutating tests across the workspace
+        /// (auth::tests, lockfile::tests, boot::tests, hub_status,
+        /// hub_launcher, this module, etc.) now serialize on a SHARED
+        /// `vct_launcher_core::test_env::GLOBAL_ENV_MUTEX` rather than
+        /// per-module mutexes that only serialized within-module.
         fn with_vct_state_dir<F: FnOnce(&Path)>(f: F) {
-            let _g = SERIALIZE.lock().unwrap_or_else(|p| p.into_inner());
-            let tmp = tempfile::tempdir().expect("tempdir");
-            let prev = std::env::var_os("VCT_STATE_DIR");
-            unsafe {
-                std::env::set_var("VCT_STATE_DIR", tmp.path());
-            }
-            f(tmp.path());
-            unsafe {
-                match prev {
-                    Some(v) => std::env::set_var("VCT_STATE_DIR", v),
-                    None => std::env::remove_var("VCT_STATE_DIR"),
-                }
-            }
+            vct_launcher_core::test_env::with_state_dir(f);
         }
 
         #[test]
