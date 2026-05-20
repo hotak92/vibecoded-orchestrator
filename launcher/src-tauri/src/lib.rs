@@ -12,6 +12,7 @@ mod commands;
 mod hub_launcher;
 mod hub_status;
 mod installer_engine;
+mod project_backfill;
 mod mcp_registration;
 pub mod project_naming;
 mod quit_dialog;
@@ -405,6 +406,28 @@ pub fn run() {
     // launcher works fine without it. The hub binary does NOT call this.
     if let Err(e) = commands::orchestrator_root::ensure_orchestrator_root(&db_handle) {
         eprintln!("[vct] warning: ensure_orchestrator_root failed: {}", e);
+    }
+
+    // v0.2.21 Step 19: launcher-startup project-row backfill. Sweep
+    // every registered project and ensure the v0.2.21 resolver
+    // endpoint's expected binding rows + module_settings exist.
+    // Read-then-fill: NEVER overwrites user-set values. Backfill
+    // also NEVER touches the access matrix (kg_collection_access /
+    // codegraph_access) — those reflect user choices, default
+    // "no access" via absence of a row. See plan §"Acceptance
+    // criterion" property (2)/(3)/(4) for what we backfill and
+    // §"Launcher startup backfill" for the discipline.
+    {
+        let report = project_backfill::backfill_all_projects(&db_handle);
+        if report.touched_projects > 0 {
+            eprintln!(
+                "[vct] project-backfill: seeded missing binding/settings rows for {} project(s)",
+                report.touched_projects
+            );
+        }
+        for err in &report.errors {
+            eprintln!("[vct] project-backfill warning: {}", err);
+        }
     }
 
     // Load per-machine local config (env > vct-config.toml > compiled
