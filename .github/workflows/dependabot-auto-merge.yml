@@ -1,0 +1,35 @@
+name: Dependabot auto-merge
+
+# Auto-merges Dependabot PRs that pass CI:
+#   - patch & minor → auto-merge (squash)
+#   - major         → leave open for human review
+#
+# SAFETY: triggers only on PRs authored by github-actions' dependabot[bot].
+# PRs from human authors (hotak92, pb992, etc.) are never touched — the
+# `if: github.actor == 'dependabot[bot]'` guard short-circuits before any
+# step runs. Branch names alone aren't trusted; the actor check is what
+# enforces the boundary.
+
+on: pull_request_target
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch Dependabot metadata
+        id: meta
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Enable auto-merge for patch & minor
+        if: steps.meta.outputs.update-type == 'version-update:semver-patch' || steps.meta.outputs.update-type == 'version-update:semver-minor'
+        run: gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
