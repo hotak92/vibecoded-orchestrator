@@ -18,6 +18,13 @@
   // + shared KG indexNullState). Soft-fails to a "Weaviate not
   // reachable" hint when /v1/schema is unreachable.
   import ServicesSchemaSection from '$lib/components/ServicesSchemaSection.svelte';
+  // v0.2.22 — Item #12: first-class banner when neither Podman nor
+  // Docker is detected. Renders nothing when at least one runtime is
+  // present. Mounted here in addition to the home page so users who
+  // navigate straight to Services (e.g. troubleshooting why nothing
+  // starts) still see the install affordance front-and-centre.
+  import RuntimeMissingBanner from '$lib/components/RuntimeMissingBanner.svelte';
+  import { orchestrator } from '$lib/stores/orchestrator';
 
   interface ServiceRuntimeState {
     name: string;
@@ -293,6 +300,12 @@
   }
 
   onMount(async () => {
+    // v0.2.22 Item #12: kick a system detect so RuntimeMissingBanner has
+    // fresh has_podman / has_docker data when the user lands on Services.
+    // Fire-and-forget — the banner self-triggers detection as a fallback
+    // and won't render before the probe completes (visible derives on
+    // system !== null).
+    void orchestrator.detectSystem();
     await refresh();
     // Mirror the on-disk adoption config for diagnostics. Failures are
     // non-fatal — the snapshot already drives the UI.
@@ -327,6 +340,12 @@
 </script>
 
 <section class="services-page">
+  <!-- v0.2.22 Item #12: runtime-missing banner. Self-mounts/unmounts
+       based on `system.has_podman` / `system.has_docker` in the
+       orchestrator store. No-op when at least one runtime exists, so
+       the existing `!snapshot.runtime` warn-banner below covers the
+       complementary case (runtime present but no container running). -->
+  <RuntimeMissingBanner />
   <header>
     <h1>Services</h1>
     <p class="muted">

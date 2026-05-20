@@ -12,6 +12,10 @@
 
   import { onMount } from 'svelte';
   import RightSidebar from '$lib/components/RightSidebar.svelte';
+  // v0.2.22 — Item #12: first-class banner when neither Podman nor
+  // Docker is detected. Renders nothing when at least one runtime is
+  // present, so the home page is unchanged in the happy-path case.
+  import RuntimeMissingBanner from '$lib/components/RuntimeMissingBanner.svelte';
   import { auth } from '$lib/stores/auth';
   import { orchestrator } from '$lib/stores/orchestrator';
   import { modules } from '$lib/stores/modules';
@@ -20,6 +24,11 @@
 
   onMount(() => {
     orchestrator.checkStatus();
+    // Populate `system` (has_podman / has_docker) so RuntimeMissingBanner
+    // can decide whether to render. The banner self-triggers detection
+    // too as a fallback, but the home page is the first surface a user
+    // sees so triggering here avoids the brief "no banner yet" window.
+    void orchestrator.detectSystem();
     modules.loadCatalog();
     const handleFocus = () => auth.refreshProfile();
     window.addEventListener('focus', handleFocus);
@@ -125,6 +134,11 @@
     </div>
 
     <div class="main-inner">
+      <!-- v0.2.22 Item #12: runtime-missing banner. Self-mounts/unmounts
+           based on `system.has_podman` / `system.has_docker` in the
+           orchestrator store. No-op when at least one runtime exists. -->
+      <RuntimeMissingBanner />
+
       <div class="content-header">
         <div>
           <h1 class="content-title">Your Library</h1>

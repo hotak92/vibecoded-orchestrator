@@ -20,6 +20,12 @@
   // were previously only editable by hand-patching settings.json.
   import IdentityTab from '$lib/project-state/IdentityTab.svelte';
   import CrossProjectAccessTab from '$lib/project-state/CrossProjectAccessTab.svelte';
+  // v0.2.22 — Item #14: Settings is now an inline tab body (extracted
+  // from /project/[id]/settings into a reusable component). One click
+  // from the tab strip to the settings form, no intermediate link page.
+  // The /project/[id]/settings route still exists for direct URLs and
+  // delegates to the same component.
+  import SettingsTab from '$lib/project-state/SettingsTab.svelte';
   import CodeGraphBuildBanner from '$lib/components/CodeGraphBuildBanner.svelte';
   import KgSyncBanner from '$lib/components/KgSyncBanner.svelte';
   import KgSummaryBanner from '$lib/components/KgSummaryBanner.svelte';
@@ -292,7 +298,11 @@
     {:else if activeTab === 'kg'}
       <KgCodegraphTab projectId={project.id} />
     {:else if activeTab === 'settings'}
-      <a href="/project/{project.id}/settings" class="settings-link">Open project settings →</a>
+      <!-- v0.2.22 Item #14: inlined. SettingsTab is the extracted body of
+           the /project/[id]/settings route, mounted directly so users
+           reach the form on a single click. The standalone route is
+           still valid and delegates to the same component. -->
+      <SettingsTab projectId={project.id} />
     {/if}
   </main>
 </div>
@@ -370,5 +380,4 @@
   }
   .tab-content { max-width: 1200px; margin: 0 auto; }
   .loading { padding: 40px; text-align: center; color: #888; }
-  .settings-link { color: #0fc; padding: 24px; display: block; text-decoration: none; }
 </style>
