@@ -235,21 +235,50 @@ fn builtin_catalog_entries(db: &Db) -> Vec<ModuleCatalogEntry> {
     //    behind coming_soon is now real". See
     //    builtin_catalog_lists_zero_coming_soon_entries below.
     out.push(ModuleCatalogEntry {
-        id: "rl-reranker".into(),
+        // G1 (v0.2.22): aligned with on-disk manifest `id: "vct-rl-reranker"`.
+        // Pre-v0.2.22 this was bare `"rl-reranker"`, which caused
+        // `find_manifest(module_id)` to return Err on install because no
+        // on-disk manifest reports that id. Every other reference in the
+        // codebase (rl_settings.rs::MODULE_ID, module_supervisor.rs,
+        // module_weights_state.rs, module_gui.rs route resolver, etc.)
+        // already used the prefixed form — the catalog was the lone outlier.
+        // G3 (v0.2.22): version pinned to 0.1.1 — the released image tag on
+        // GHCR (`ghcr.io/hotak92/vct-rl-reranker:0.1.1-{cpu,cuda,rocm}`)
+        // and the version `runtime.args` + `gpu_image_variants` already
+        // reference. Pre-v0.2.22 catalog said 0.1.0 (stale) while the
+        // on-disk manifest said 0.1.2 (unreleased bump).
+        id: "vct-rl-reranker".into(),
         name: "RL Reranker".into(),
-        version: "0.1.0".into(),
+        version: "0.1.1".into(),
+        // R1 (v0.2.22): description text mirrors the on-disk manifest's
+        // `description` field. The new
+        // `catalog_matches_on_disk_manifest_when_present` round-trip test
+        // asserts the two match — drift either way will fail CI.
         description:
-            "Reinforcement-learning reranker for KG + Code Graph retrieval. \
-             Per-embedding-source neural networks personalize on your local \
-             citation patterns. Ships pre-trained; auto-fine-tunes on your \
-             data after each weekly model refresh. Pro tier required."
+            "Reinforcement-learning reranker for Knowledge Graph retrieval. \
+             Per-text-embedding-source neural networks (qwen3 / arctic / \
+             openai) personalize on your local citation patterns. Ships \
+             pre-trained; auto-fine-tunes on your data after each weekly \
+             model refresh. Supports hot-swap, reset, finetune, and \
+             global-retrain endpoints so the launcher can drive model \
+             lifecycle without restarting the container. Code-graph \
+             reranking will ship as a separate future module \
+             (vct-code-reranker)."
                 .into(),
         category: "paid-independent".into(),
         tags: vec!["pro".into(), "reranking".into(), "reinforcement-learning".into()],
         license_required: true,
         license_variant_ids: vec![],
         min_orchestrator_tier: "pro".into(),
-        compatibility_hosts: vec!["base".into(), "orchestrator_root".into()],
+        // R1 (v0.2.22): order + content mirrors the on-disk manifest's
+        // `compatibility.hosts` field exactly (`["base", "mao",
+        // "orchestrator_root"]`). The new round-trip test asserts
+        // Vec equality, not subset — drift either way will fail CI.
+        compatibility_hosts: vec![
+            "base".into(),
+            "mao".into(),
+            "orchestrator_root".into(),
+        ],
         is_licensed: false,
         manifest_source: "paid-modules/vct-rl-reranker/vct-module.json".into(),
         kind: "available".into(),
@@ -867,19 +896,23 @@ mod tests {
 
     #[test]
     fn builtin_catalog_lists_rl_reranker_as_available_paid_module() {
-        // Phase 1C: confirm rl-reranker is now `available` with the right
-        // tier, host compatibility, and version. This is the inverse of
-        // the old `lists_exactly_one_coming_soon` test — it pins the
+        // Phase 1C: confirm vct-rl-reranker is now `available` with the
+        // right tier, host compatibility, and version. This is the inverse
+        // of the old `lists_exactly_one_coming_soon` test — it pins the
         // post-flip state instead.
+        //
+        // G1 (v0.2.22): catalog id was renamed from bare `"rl-reranker"`
+        // to `"vct-rl-reranker"` so `find_manifest(module_id)` matches the
+        // on-disk manifest (vct-module.json `"id": "vct-rl-reranker"`).
         let db = open_db();
         let entries = builtin_catalog_entries(&db);
         let rl = entries
             .iter()
-            .find(|e| e.id == "rl-reranker")
-            .expect("rl-reranker entry must be present");
+            .find(|e| e.id == "vct-rl-reranker")
+            .expect("vct-rl-reranker entry must be present");
 
-        assert_eq!(rl.kind, "available", "rl-reranker should be installable");
-        assert_eq!(rl.version, "0.1.0", "matches manifest.version");
+        assert_eq!(rl.kind, "available", "vct-rl-reranker should be installable");
+        assert_eq!(rl.version, "0.1.1", "matches manifest.version");
         assert_eq!(rl.min_orchestrator_tier, "pro");
         assert!(rl.license_required);
         assert_eq!(rl.category, "paid-independent");
@@ -894,6 +927,115 @@ mod tests {
         assert!(
             rl.manifest_source.contains("vct-rl-reranker"),
             "manifest_source should reference the paid-modules path"
+        );
+    }
+
+    /// R1 (v0.2.22): round-trip the on-disk `vct-rl-reranker` manifest
+    /// against the hardcoded builtin catalog entry.
+    ///
+    /// The validation report at `.claude/context/plans/v0.2.22-rl-e2e-
+    /// validation-report.md` identified three install-blocking config
+    /// drifts between the two sources of truth (G1: id mismatch, G2: host
+    /// list mismatch, G3: version pin drift). The existing pinning test
+    /// at `builtin_catalog_lists_rl_reranker_as_available_paid_module`
+    /// only validates the builtin entry against itself — it could not
+    /// catch any of the three because it never parses the on-disk JSON.
+    ///
+    /// This test closes that gap by:
+    ///   1. Loading `paid-modules/vct-rl-reranker/vct-module.json` from
+    ///      disk via the same `ModuleManifest::from_json` path that
+    ///      `find_manifest` uses at install time.
+    ///   2. Locating the matching builtin catalog entry by id.
+    ///   3. Asserting every field that drives install behaviour (id,
+    ///      version, min_orchestrator_tier, license_required, hosts)
+    ///      matches between the two sources.
+    ///
+    /// Skipped when the manifest file isn't present (e.g. CI environments
+    /// that build against the public AGPL repo without the paid-modules
+    /// staging dir). Production user installs are unaffected — paid
+    /// modules ship via the signed-URL gateway, not the AGPL release.
+    ///
+    /// If this test fails, a future commit drifted one of the two sources
+    /// from the other. Fix BOTH to agree before merging.
+    #[test]
+    fn catalog_matches_on_disk_manifest_when_present() {
+        // CARGO_MANIFEST_DIR at compile time is `launcher/src-tauri/`.
+        // Repo root is two .parent() hops up.
+        let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("walk to repo root from launcher/src-tauri/")
+            .to_path_buf();
+        let manifest_path =
+            repo_root.join("paid-modules/vct-rl-reranker/vct-module.json");
+
+        if !manifest_path.exists() {
+            eprintln!(
+                "[test skip] paid-modules/vct-rl-reranker/vct-module.json not \
+                 present (path: {}) — skipping catalog↔manifest round-trip. \
+                 This is expected on public-AGPL-repo CI runs; paid modules \
+                 ship via the signed-URL gateway, not the AGPL release.",
+                manifest_path.display()
+            );
+            return;
+        }
+
+        // Parse the on-disk manifest via the EXACT path that
+        // `find_manifest` uses at install time (same `from_json` call,
+        // same validation, same error surface).
+        let raw = std::fs::read_to_string(&manifest_path)
+            .unwrap_or_else(|e| panic!("read {}: {}", manifest_path.display(), e));
+        let manifest = ModuleManifest::from_json(&raw)
+            .unwrap_or_else(|e| panic!("parse {}: {}", manifest_path.display(), e));
+
+        // Look up the builtin catalog entry the way the launcher does.
+        let db = open_db();
+        let entries = builtin_catalog_entries(&db);
+        let catalog_entry = entries
+            .iter()
+            .find(|e| e.id == manifest.id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no builtin catalog entry matches on-disk manifest id '{}' \
+                     — G1 mismatch (see v0.2.22 validation report). \
+                     Catalog ids present: {:?}",
+                    manifest.id,
+                    entries.iter().map(|e| &e.id).collect::<Vec<_>>()
+                )
+            });
+
+        // ─── Field-by-field round-trip assertions ─────────────────────
+        assert_eq!(
+            catalog_entry.id, manifest.id,
+            "G1: catalog.id must equal manifest.id"
+        );
+        assert_eq!(
+            catalog_entry.version, manifest.version,
+            "G3: catalog.version must equal manifest.version"
+        );
+        assert_eq!(
+            catalog_entry.min_orchestrator_tier, manifest.license.min_orchestrator_tier,
+            "catalog.min_orchestrator_tier must equal manifest.license.min_orchestrator_tier"
+        );
+        assert_eq!(
+            catalog_entry.license_required, manifest.license.required,
+            "catalog.license_required must equal manifest.license.required"
+        );
+        assert_eq!(
+            catalog_entry.name, manifest.name,
+            "catalog.name (display) must equal manifest.name"
+        );
+        assert_eq!(
+            catalog_entry.description, manifest.description,
+            "catalog.description must equal manifest.description (the catalog \
+             string is shown in the launcher GUI; the manifest string is shown \
+             when the module is queried programmatically — drift here means the \
+             GUI and CLI disagree on what the module does)"
+        );
+        assert_eq!(
+            catalog_entry.compatibility_hosts, manifest.compatibility.hosts,
+            "G2: catalog.compatibility_hosts must equal manifest.compatibility.hosts \
+             (otherwise install fails at the is_compatible_with_host gate)"
         );
     }
 

@@ -725,7 +725,18 @@ impl ModuleManifest {
             m.compatibility.hosts = default_hosts();
         }
         for h in &m.compatibility.hosts {
-            if !matches!(h.as_str(), "base" | "mao" | "standalone") {
+            // G2 (v0.2.22): accept `orchestrator_root` — it's the actual host
+            // string emitted by `ProjectHost::as_str()` for VCO_dev itself
+            // (the orchestrator clone registered as a project). Pre-v0.2.22
+            // this token was rejected, blocking install of any module that
+            // declared `hosts: [..., "orchestrator_root"]`. The legacy
+            // `"standalone"` token was an unused placeholder — kept here for
+            // backward compatibility with any third-party manifests that may
+            // have adopted it, but no in-tree code actually emits it.
+            if !matches!(
+                h.as_str(),
+                "base" | "mao" | "orchestrator_root" | "standalone"
+            ) {
                 return Err(format!("manifest.compatibility.hosts contains invalid value '{}'", h));
             }
         }
@@ -938,7 +949,12 @@ mod tests {
             .unwrap_or_else(|e| panic!("deserialize {}: {}", path.display(), e));
 
         assert_eq!(manifest.id, "vct-rl-reranker");
-        assert_eq!(manifest.version, "0.1.0");
+        // G3 (v0.2.22): bumped to 0.1.1 — the version actually released on
+        // GHCR (`ghcr.io/hotak92/vct-rl-reranker:0.1.1-{cpu,cuda,rocm}`) and
+        // the version that `runtime.args` + `gpu_image_variants` already
+        // pin. Pre-v0.2.22 the manifest top-level was 0.1.2 (an unreleased
+        // bump), while this test still asserted 0.1.0 — both stale.
+        assert_eq!(manifest.version, "0.1.1");
         assert_eq!(manifest.install.method, InstallMethod::ContainerPull);
         assert!(manifest.license.required);
         assert_eq!(manifest.license.min_orchestrator_tier, "pro");
