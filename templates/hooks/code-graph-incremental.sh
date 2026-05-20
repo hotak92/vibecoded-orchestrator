@@ -39,7 +39,23 @@ set -euo pipefail
 
 EDITED_FILE="$1"
 REPO_PATH="${2:-${CLAUDE_PROJECT_DIR:-$(pwd)}}"
-PROJECT_NAME="${3:-$(basename "$REPO_PATH")}"
+
+# v0.2.21 Step 18 (caller migration): when the project name arg is not
+# supplied, prefer the launcher's vct-hub over the basename fallback.
+# post-file-edit.sh already resolves+passes $3; this branch only fires
+# for direct invocations of this hook (rare, but the project_init test
+# suite + ad-hoc CLI use exercise it). Falls back to basename when the
+# resolver is unavailable, preserving the pre-v0.2.21 default.
+PROJECT_NAME="${3:-}"
+if [ -z "$PROJECT_NAME" ]; then
+    _RESOLVER="$REPO_PATH/.claude/scripts/vct_project_config.sh"
+    if [ -x "$_RESOLVER" ]; then
+        PROJECT_NAME=$(
+            "$_RESOLVER" "$REPO_PATH" --field code_graph_project 2>/dev/null
+        ) || PROJECT_NAME=""
+    fi
+fi
+[ -z "$PROJECT_NAME" ] && PROJECT_NAME="$(basename "$REPO_PATH")"
 
 # Resolve analyzer script + python from project layout (no hardcoded paths).
 # Hook lives at <repo>/.claude/hooks/, so repo root is two parents up.
