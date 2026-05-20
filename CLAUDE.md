@@ -307,8 +307,7 @@ PowerShell variants (`*.ps1`) ship for Windows users.
 - **Purpose**: Local embeddings for Weaviate; code-embedding service CPU fallback. Not exposed as an MCP tool to Claude (the Ollama MCP was removed because Claude's native reasoning, `Read` tool, and built-in vision handle the same use cases at higher quality).
 - **Models**:
   - `qwen3-embedding:0.6b` — text embeddings (1024 dim, primary; needs `num_ctx=8192`)
-  - `gemma4:e4b` — fast inference for KG-summary generation (invoked by the `generate-kg-summary.py` script, not via MCP)
-  - `qwen3.5:9b` — larger inference model for KG-summary generation on capable hardware
+  - KG-summary generation models (fallback only — see below): `gemma4:e4b` (low-VRAM/CPU), `qwen3.5:9b` (16 GB+ VRAM). Used by `generate-kg-summary.py` only when the `claude` CLI is not on PATH.
 
 ### Code Embedding Service
 - **URL**: `http://localhost:11440` (default; configurable via `CODE_EMBED_PORT`)
@@ -388,12 +387,6 @@ Located in `.claude/hooks/` — automated workflow actions. On Windows the bash 
 **StopFailure**:
 - `stop-failure-notify.sh` — urgent notification + failure logging to `~/.claude/metrics/failures.jsonl`.
 
-**TaskCompleted** (Agent Teams only):
-- `task-completed-validate.sh` — quality gates for agent output.
-
-**TeammateIdle** (Agent Teams only):
-- `teammate-idle-redirect.sh` — redirect idle agents to pending plan items.
-
 **SessionEnd**:
 - `session-end.sh` — cleanup, final sync.
 
@@ -417,8 +410,6 @@ Located in `.claude/hooks/` — automated workflow actions. On Windows the bash 
 | `PostCompact` | No | |
 | `SessionEnd` | No | |
 | `ConfigChange` | Yes | Except policy_settings |
-| `TeammateIdle` | Yes | Exit 2 → feedback to teammate, keeps working. Requires Agent Teams. |
-| `TaskCompleted` | Yes | Exit 2 → task not marked done, stderr fed to model. Requires Agent Teams. |
 | `WorktreeCreate` | Yes | Must print absolute worktree path on stdout |
 | `WorktreeRemove` | No | Cleanup only |
 | `Elicitation` | Yes | MCP server input forms |
@@ -684,7 +675,7 @@ The toast summarises the result ("5 files updated, 2 user-modifications preserve
 - Fix from PR: `claude --from-pr <PR-URL>`.
 
 **Default ports**: Weaviate `8081` (HTTP) / `50052` (gRPC), Ollama `11435` (embeddings + KG-summary generation), code-embed service `11440` (optional GPU), vct-hub `7700`.
-**Default models**: text embeddings `qwen3-embedding:0.6b` (1024-dim), code embeddings CodeSage-Large-v2 (2048-dim, GPU) / `qwen3-embedding:0.6b` (CPU fallback). KG-summary generation uses `gemma4:e4b` (low-power) / `qwen3.5:9b` (capable hardware) via the `generate-kg-summary.py` script — not via MCP.
+**Default models**: text embeddings `qwen3-embedding:0.6b` (1024-dim), code embeddings CodeSage-Large-v2 (2048-dim, GPU) / `qwen3-embedding:0.6b` (CPU fallback). KG-summary generation uses a three-tier fallback in `generate-kg-summary.py`: (1) `claude` CLI on PATH (best quality, uses your Claude subscription / API key), (2) local Ollama models (`qwen3.5:9b` for 16 GB+ VRAM / `gemma4:e4b` for low-VRAM/CPU), (3) Anthropic API direct (if `ANTHROPIC_API_KEY` is set). Force a tier via `KG_SUMMARY_BACKEND=cli|ollama|api|skip`.
 
 ---
 
