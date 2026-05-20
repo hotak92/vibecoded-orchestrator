@@ -10,6 +10,7 @@
 //!   * `db`                 — hub.db SQLite store (app-registry/messages)
 //!   * `api`                — message-bus + app-registry routes
 //!   * `cli_api`            — generic CLI proxies (license/telemetry/etc)
+//!   * `config_api`         — project-config resolver (v0.2.21 Step 14)
 //!   * `modules_api`        — module install + secrets resolver routes
 //!   * `project_state_api`  — project state mirror of Tauri commands
 //!   * `server`             — wiring: bind, layer order, port discovery
@@ -24,6 +25,7 @@ pub mod api;
 pub mod auth;
 pub mod cli;
 pub mod cli_api;
+pub mod config_api;
 pub mod db;
 pub mod lifecycle;
 pub mod lockfile;
