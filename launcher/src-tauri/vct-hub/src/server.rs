@@ -17,7 +17,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 
-use super::{api, auth, cli_api, config_api, db, modules_api, project_state_api};
+use super::{api, auth, cli_api, config_api, db, modules_api, project_state_api, weaviate_probe};
 
 const DEFAULT_PORT: u16 = 7700;
 
@@ -36,6 +36,30 @@ pub async fn start_hub_server() -> Result<u16, String> {
     let launcher_db = vct_launcher_core::db::Db::open()
         .map_err(|e| format!("Failed to open launcher.db: {}", e))?;
     let launcher_state = modules_api::LauncherDbHandle(Arc::new(launcher_db));
+
+    // v0.2.21 Step 21: hub-startup Weaviate class existence check.
+    // Spawn detached — the probe issues per-class HTTP HEADs and we
+    // don't want server startup blocked on Weaviate's response time
+    // (a slow probe could push us past the 30s install.py /health
+    // deadline). The probe writes a sidecar JSONL on completion;
+    // future surfaces (resolver 503 emission, install.py post-install
+    // check, GUI status banner) read it. We re-open Db here because
+    // the launcher_state handle wraps it in Arc<Mutex>; the probe
+    // module wants an owned Db (its own connection, WAL-safe).
+    // Soft-fail: if Db::open fails here, log and skip — the server
+    // still boots and the rest of the routes serve normally.
+    match vct_launcher_core::db::Db::open() {
+        Ok(probe_db) => {
+            let local_config = vct_launcher_core::config::LocalConfig::load();
+            weaviate_probe::spawn_startup_probe(probe_db, &local_config);
+        }
+        Err(e) => {
+            eprintln!(
+                "[vct-hub] weaviate_probe: cannot open launcher.db for class check ({}); skipping",
+                e
+            );
+        }
+    }
 
     // ── Auth token (H5) ──────────────────────────────────────────
     // Generate a fresh token on every startup and persist before we

@@ -33,3 +33,4 @@ pub mod lockfile;
 pub mod modules_api;
 pub mod project_state_api;
 pub mod server;
+pub mod weaviate_probe;
