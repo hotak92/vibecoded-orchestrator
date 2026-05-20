@@ -2868,6 +2868,35 @@ fn pre_pull_rename_vct_hub_binary(_install_path: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Cutover sentinel filename — written by install.py BEFORE it
+/// starts vct-hub, deleted AFTER /health returns 200. Mirrored from
+/// `_VCT_HUB_CUTOVER_SENTINEL_NAME` in install.py and the launcher's
+/// own startup-time read in `lib.rs::setup`. Kept as a private const
+/// here so the v0.2.22 Item #3 skip-poll precheck and its unit test
+/// can both reach for it without re-typing the literal (which would
+/// silently drift if install.py ever renames the sentinel).
+const V0_2_21_CUTOVER_SENTINEL_NAME: &str = "v0.2.21-cutover.flag";
+
+/// Decide whether the redundant 30 s /health poll in
+/// `ensure_hub_started_after_update` should be skipped.
+///
+/// Contract (v0.2.22 Item #3): install.py is the authoritative health
+/// check on the update happy path — it writes the cutover sentinel
+/// BEFORE starting vct-hub and DELETES it AFTER /health returns 200.
+/// So when we land in the launcher's post-install hub-recovery path:
+///
+/// * Sentinel ABSENT → install.py confirmed health already → skip
+///   the 30 s poll (pure wall-clock cost, no signal value).
+/// * Sentinel PRESENT → install.py timed out, was killed, OR is
+///   still running (shouldn't be possible from our call site, but
+///   the precheck doesn't have to reason about that) → run the
+///   full poll as a second-chance probe.
+///
+/// Returns `true` when the poll should be SKIPPED.
+fn should_skip_redundant_health_poll(root: &Path) -> bool {
+    !root.join(V0_2_21_CUTOVER_SENTINEL_NAME).exists()
+}
+
 /// v0.2.21 Step 12 (B1 fix): bring the detached vct-hub back up after
 /// install.py finishes.
 ///
@@ -2931,10 +2960,36 @@ fn ensure_hub_started_after_update(_install_path: &Path) -> Result<(), String> {
         }
     }
 
+    // v0.2.22 Item #3 — skip the redundant /health poll on the common-
+    // success path. install.py's own post-cutover probe (see
+    // `_VCT_HUB_CUTOVER_SENTINEL_NAME` in install.py, written BEFORE
+    // hub-start and deleted AFTER /health returns 200) is the
+    // authoritative health check during update. If we land here and
+    // the sentinel is ABSENT, install.py already validated /health —
+    // re-probing for 30 s is pure wall-clock cost with no signal
+    // value. If the sentinel is PRESENT (rare slow-path: install.py
+    // timed out, or was killed mid-cutover), we still run the full
+    // poll as a second-chance probe — this is the only codepath
+    // that gives the user a recovery story when install.py's own
+    // probe didn't see /health come up.
+    let root = vct_launcher_core::paths::vct_root_dir();
+    if should_skip_redundant_health_poll(&root) {
+        eprintln!(
+            "[vct] update_orchestrator: cutover sentinel absent — install.py \
+             already validated /health; skipping redundant 30 s poll"
+        );
+        return Ok(());
+    }
+
+    eprintln!(
+        "[vct] update_orchestrator: cutover sentinel still present at {} — \
+         install.py did not confirm /health; running full 30 s poll",
+        root.join(V0_2_21_CUTOVER_SENTINEL_NAME).display()
+    );
+
     // Poll up to 30 s for hub.port + hub.token to appear and /health
     // to answer 200. The hub spawns a detached child and returns
     // quickly; the child does the actual bind + DB migration.
-    let root = vct_launcher_core::paths::vct_root_dir();
     let port_path = root.join("hub.port");
     let token_path = root.join("hub.token");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -9774,6 +9829,48 @@ MemAvailable:   23456789 kB
                     "empty pid file → Ok(false), got {:?}", result);
                 assert!(!pid_file.exists(),
                     "empty hub.pid should be cleaned up as malformed");
+            });
+        }
+
+        #[test]
+        fn should_skip_redundant_health_poll_when_cutover_sentinel_absent() {
+            // v0.2.22 Item #3 happy path: install.py finished, deleted
+            // the cutover sentinel after its own /health check passed.
+            // The launcher's post-install hub-recovery code asks the
+            // predicate "should we skip the redundant poll?" — answer
+            // is YES, because the sentinel's absence IS the signal
+            // that install.py validated /health already.
+            with_vct_state_dir(|root| {
+                // No sentinel file present. (with_vct_state_dir gives
+                // us a fresh tempdir, so nothing is in it by default.)
+                let sentinel = root.join(V0_2_21_CUTOVER_SENTINEL_NAME);
+                assert!(!sentinel.exists(),
+                    "precondition: sentinel should be absent in fresh state dir");
+                assert!(
+                    should_skip_redundant_health_poll(root),
+                    "absent sentinel → poll must be skipped (install.py confirmed /health)"
+                );
+            });
+        }
+
+        #[test]
+        fn should_run_full_poll_when_cutover_sentinel_present() {
+            // v0.2.22 Item #3 rare slow-path: install.py never deleted
+            // the sentinel (timed out, killed, or crashed mid-cutover).
+            // The launcher's post-install hub-recovery code asks the
+            // predicate "should we skip the redundant poll?" — answer
+            // is NO, because install.py's /health check did NOT confirm
+            // and the launcher's 30 s poll is the only remaining
+            // safety net before the launcher restart.
+            with_vct_state_dir(|root| {
+                let sentinel = root.join(V0_2_21_CUTOVER_SENTINEL_NAME);
+                std::fs::write(&sentinel, b"in-progress").unwrap();
+                assert!(sentinel.exists(),
+                    "precondition: sentinel must exist after write");
+                assert!(
+                    !should_skip_redundant_health_poll(root),
+                    "present sentinel → poll MUST run (second-chance probe)"
+                );
             });
         }
 
