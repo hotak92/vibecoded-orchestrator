@@ -39,11 +39,14 @@
 #
 # Dependencies: curl (always), jq (preferred) OR python3 (fallback).
 #
-# Stderr policy: on hub unreachable / project missing / misconfigured,
-# this script emits ONE diagnostic line to stderr before exiting
-# non-zero. Step 17 will add JSONL-based rate-limiting; for now every
-# call writes a single line (callers that want quiet failures use
-# `2>/dev/null` per design doc §3.6).
+# Stderr policy: on hub unreachable / project missing / misconfigured /
+# field missing, this script emits ONE rate-limited diagnostic line to
+# stderr via _emit_warning() before exiting non-zero. Suppression key is
+# (pid, error_kind); max one emission per 5-min window; VCO_HOOK_DEBUG=1
+# bypasses the limit. State persisted at
+#   ${VCT_STATE_DIR:-$HOME/.vct}/cache/resolver_warn.jsonl
+# Hard usage errors / "neither jq nor python3" remain ALWAYS-emit via
+# err() — those are programmer-fix-required, not env-fallback paths.
 
 set -euo pipefail
 
@@ -56,6 +59,158 @@ set -euo pipefail
 # VCO-REWIRE-END: orchestrator-root-resolution
 
 err() { printf '[vct-project-config] %s\n' "$*" >&2; }
+
+# ── Rate-limited fall-through warning emission ─────────────────────────
+#
+# When the script falls through to its env-fallback path (hub
+# unreachable, project not registered, field missing, hub
+# misconfigured), the consumer wants ONE stderr line — not a flood when
+# the same hook fires hundreds of times per session.
+#
+# Policy (mirrors vco_lib/resolver_warn.py):
+#   - Key:    "<pid>:<error_kind>"  (per-PID; parallel hooks each get one).
+#   - Window: 5 minutes per key.
+#   - Bypass: VCO_HOOK_DEBUG=1 → emit every occurrence.
+#   - State:  $VCT_STATE_DIR/cache/resolver_warn.jsonl
+#             (atomic append via flock on a sidecar lockfile).
+#   - Rotation: when JSONL exceeds 1 MiB, truncate to most-recent 100 rows.
+#
+# Usage:  _emit_warning <error_kind> [<detail>]
+_RW_CACHE_DIR_INIT=0
+_rw_cache_dir() {
+    local state_dir="${VCT_STATE_DIR:-$HOME/.vct}"
+    printf '%s\n' "$state_dir/cache"
+}
+
+_rw_jsonl_path() { printf '%s/resolver_warn.jsonl\n' "$(_rw_cache_dir)"; }
+_rw_lockfile_path() { printf '%s/resolver_warn.jsonl.lock\n' "$(_rw_cache_dir)"; }
+
+_rw_ensure_dir() {
+    if (( _RW_CACHE_DIR_INIT == 0 )); then
+        mkdir -p "$(_rw_cache_dir)" 2>/dev/null || return 1
+        _RW_CACHE_DIR_INIT=1
+    fi
+    return 0
+}
+
+# Return 0 if a matching row exists within the suppression window, 1 otherwise.
+_rw_should_suppress() {
+    local key="$1" now="$2" jsonl
+    jsonl=$(_rw_jsonl_path)
+    [[ -f "$jsonl" ]] || return 1
+    # awk: find the most-recent ts for the matching "key":"...". Bail
+    # if last_ts is non-empty AND within window.
+    local last_ts
+    last_ts=$(awk -v k="\"key\":\"$key\"" '
+        index($0, k) { last = $0 }
+        END {
+            if (last == "") exit 0
+            n = match(last, /"ts":[0-9]+/)
+            if (n == 0) exit 0
+            ts = substr(last, RSTART + 5, RLENGTH - 5)
+            print ts
+        }
+    ' "$jsonl" 2>/dev/null) || return 1
+    [[ -n "$last_ts" ]] || return 1
+    local delta=$(( now - last_ts ))
+    if (( delta >= 0 && delta < 300 )); then
+        return 0  # suppress
+    fi
+    return 1
+}
+
+# Opportunistic rotation: when JSONL > 1MiB, keep only the last 100 lines.
+_rw_maybe_rotate() {
+    local jsonl="$1"
+    [[ -f "$jsonl" ]] || return 0
+    local size
+    # stat -c on Linux, -f on BSD/macOS. Fall back gracefully.
+    if size=$(stat -c '%s' "$jsonl" 2>/dev/null); then
+        :
+    elif size=$(stat -f '%z' "$jsonl" 2>/dev/null); then
+        :
+    else
+        return 0
+    fi
+    if (( size > 1048576 )); then
+        local tmp="$jsonl.rot.tmp"
+        if tail -n 100 "$jsonl" > "$tmp" 2>/dev/null; then
+            mv -f "$tmp" "$jsonl" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+        else
+            rm -f "$tmp" 2>/dev/null || true
+        fi
+    fi
+}
+
+# JSON-escape a string for embedding in a JSON value. Handles backslash,
+# double-quote, newline, tab, carriage return; drops other control bytes.
+_rw_json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/ }"
+    s="${s//$'\r'/ }"
+    s="${s//$'\t'/ }"
+    printf '%s' "$s"
+}
+
+_emit_warning() {
+    local error_kind="$1"
+    local detail="${2:-}"
+    local pid=$$
+    local consumer="${BASH_SOURCE[0]##*/}"
+    local key="${pid}:${error_kind}"
+    local now
+    now=$(date +%s 2>/dev/null) || now=0
+
+    _rw_ensure_dir || true
+    local jsonl lockfile
+    jsonl=$(_rw_jsonl_path)
+    lockfile=$(_rw_lockfile_path)
+
+    # Rate-limit check (skipped when VCO_HOOK_DEBUG=1).
+    if [[ "${VCO_HOOK_DEBUG:-}" != "1" ]]; then
+        if _rw_should_suppress "$key" "$now"; then
+            return 0
+        fi
+    fi
+
+    # Stderr line: fixed shape; mirrors ps1 + python siblings.
+    printf '[vct] project_config: %s: %s. Falling back to env. (rate-limited; set VCO_HOOK_DEBUG=1 to see every occurrence)\n' \
+        "$error_kind" "$detail" >&2
+
+    # Cap detail at 200 bytes (parameter expansion is byte-oriented for
+    # ASCII; for multibyte it may split a codepoint, acceptable for a
+    # diagnostic JSONL row).
+    local detail_clipped="${detail:0:200}"
+    local user_name="${USER:-${USERNAME:-unknown}}"
+
+    local row
+    row=$(printf '{"ts":%d,"pid":%d,"consumer":"%s","consumer_pid":%d,"error_kind":"%s","key":"%s","detail":"%s","user":"%s"}' \
+          "$now" "$pid" \
+          "$(_rw_json_escape "$consumer")" \
+          "$pid" \
+          "$(_rw_json_escape "$error_kind")" \
+          "$(_rw_json_escape "$key")" \
+          "$(_rw_json_escape "$detail_clipped")" \
+          "$(_rw_json_escape "$user_name")")
+
+    # Atomic append via flock on a sidecar lockfile (so the awk scan
+    # above doesn't race against the writer). flock missing → fall back
+    # to plain append; POSIX O_APPEND is atomic for short writes.
+    if command -v flock >/dev/null 2>&1; then
+        (
+            flock -x 200
+            printf '%s\n' "$row" >> "$jsonl"
+        ) 200>"$lockfile" 2>/dev/null || \
+            printf '%s\n' "$row" >> "$jsonl" 2>/dev/null || true
+    else
+        printf '%s\n' "$row" >> "$jsonl" 2>/dev/null || true
+    fi
+
+    _rw_maybe_rotate "$jsonl"
+    return 0
+}
 
 # ── Hub port discovery ──────────────────────────────────────────────────
 hub_port() {
@@ -208,11 +363,11 @@ resolve_project_id() {
     rc=$?
     set -e
     if [[ $rc -eq 2 ]]; then
-        err "hub.token missing; is the launcher running?"
+        _emit_warning "hub_unreachable" "hub.token missing; is the launcher running?"
         return 1
     fi
     if [[ $rc -ne 0 ]]; then
-        err "hub unreachable; is the launcher running?"
+        _emit_warning "hub_unreachable" "hub unreachable; is the launcher running?"
         return 1
     fi
     status="${result%%$'\t'*}"
@@ -222,25 +377,25 @@ resolve_project_id() {
             local id
             id=$(json_extract "$body" '.id')
             if [[ -z "$id" ]]; then
-                err "hub returned 200 but no .id field; body=$body"
+                _emit_warning "hub_unreachable" "by-path 200 but no .id field; body=$body"
                 return 2
             fi
             printf '%s' "$id"
             ;;
         401)
-            err "hub returned 401 unauthorized; the launcher may have restarted (token rotated). Try again."
+            _emit_warning "hub_unauthorized" "401 unauthorized on by-path; launcher may have restarted (token rotated)"
             return 1
             ;;
         404)
-            err "no project registered at path: $arg"
+            _emit_warning "project_not_registered" "no project registered at path: $arg"
             return 2
             ;;
         400)
-            err "hub rejected path query: $body"
+            _emit_warning "project_not_registered" "hub rejected path query: $body"
             return 2
             ;;
         *)
-            err "hub returned status $status for by-path lookup; body=$body"
+            _emit_warning "hub_unreachable" "hub returned status $status for by-path lookup; body=$body"
             return 1
             ;;
     esac
@@ -260,11 +415,11 @@ fetch_config() {
     rc=$?
     set -e
     if [[ $rc -eq 2 ]]; then
-        err "hub.token missing; is the launcher running?"
+        _emit_warning "hub_unreachable" "hub.token missing; is the launcher running?"
         return 1
     fi
     if [[ $rc -ne 0 ]]; then
-        err "hub unreachable; is the launcher running?"
+        _emit_warning "hub_unreachable" "hub unreachable; is the launcher running?"
         return 1
     fi
 
@@ -278,7 +433,7 @@ fetch_config() {
                 local val
                 val=$(json_extract "$body" ".\"$field\"")
                 if [[ -z "$val" ]]; then
-                    err "field $field decoded empty from hub response"
+                    _emit_warning "field_decode_failed" "field $field decoded empty from hub response"
                     return 4
                 fi
                 printf '%s' "$val"
@@ -287,7 +442,7 @@ fetch_config() {
             fi
             ;;
         401)
-            err "hub returned 401 unauthorized; the launcher may have restarted (token rotated). Try again."
+            _emit_warning "hub_unauthorized" "401 unauthorized; launcher may have restarted (token rotated)"
             return 1
             ;;
         404)
@@ -295,29 +450,29 @@ fetch_config() {
             code=$(json_extract "$body" '.error.code')
             case "$code" in
                 project_not_found)
-                    err "project $pid not registered in launcher.db"
+                    _emit_warning "project_not_registered" "project $pid not registered in launcher.db"
                     return 2
                     ;;
                 field_not_found)
-                    err "field $field not in config for project $pid"
+                    _emit_warning "field_not_found" "field $field not in config for project $pid"
                     return 4
                     ;;
                 *)
-                    err "hub 404 with unknown code $code; body=$body"
+                    _emit_warning "field_not_found" "hub 404 with unknown code $code; body=$body"
                     return 4
                     ;;
             esac
             ;;
         503)
-            err "hub returned 503 service_misconfigured for project $pid (primary KG binding missing — fix in launcher GUI)"
+            _emit_warning "service_misconfigured" "503 for project $pid (primary KG binding missing — fix in launcher GUI)"
             return 3
             ;;
         400)
-            err "hub rejected request: $body"
+            _emit_warning "field_not_found" "hub rejected request: $body"
             return 4
             ;;
         *)
-            err "hub returned status $status; body=$body"
+            _emit_warning "hub_unreachable" "hub returned status $status; body=$body"
             return 1
             ;;
     esac

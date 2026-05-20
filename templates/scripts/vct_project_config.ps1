@@ -50,6 +50,159 @@ function Write-Err {
     [Console]::Error.WriteLine("[vct-project-config] $Message")
 }
 
+# ── Rate-limited fall-through warning emission ─────────────────────────
+#
+# Mirrors templates/scripts/vct_project_config.sh _emit_warning() and
+# vco_lib/resolver_warn.py emit_warning_if_allowed(). When the script
+# falls through to its env-fallback path, ONE diagnostic line is
+# emitted to stderr per (pid, error_kind) per 5-min window. The
+# suppression state is persisted at
+#     $env:VCT_STATE_DIR\cache\resolver_warn.jsonl
+# (or $HOME\.vct\cache\resolver_warn.jsonl). VCO_HOOK_DEBUG=1 bypasses.
+#
+# Concurrency: writes go through System.IO.FileStream with FileShare.Read
+# in a tight scope as a coarse mutex; concurrent writers serialize on
+# the open. We don't use [System.Threading.Mutex] because Mutex on
+# Linux pwsh is process-local (not OS-wide); a file-based lock matches
+# the bash flock semantics.
+#
+# Rotation: when the JSONL exceeds 1 MiB, truncate to most-recent 100
+# rows.
+
+function Get-RWStateDir {
+    if ($Env:VCT_STATE_DIR) { return $Env:VCT_STATE_DIR }
+    return (Join-Path $HOME ".vct")
+}
+
+function Get-RWCacheDir { return (Join-Path (Get-RWStateDir) "cache") }
+function Get-RWJsonlPath { return (Join-Path (Get-RWCacheDir) "resolver_warn.jsonl") }
+function Get-RWLockPath { return (Join-Path (Get-RWCacheDir) "resolver_warn.jsonl.lock") }
+
+function Initialize-RWCacheDir {
+    $dir = Get-RWCacheDir
+    if (-not (Test-Path $dir)) {
+        try { New-Item -ItemType Directory -Path $dir -Force | Out-Null } catch { }
+    }
+}
+
+function Test-RWShouldSuppress {
+    param([string]$Key, [long]$Now)
+    $jsonl = Get-RWJsonlPath
+    if (-not (Test-Path $jsonl)) { return $false }
+    $marker = "`"key`":`"$Key`""
+    $lastTs = $null
+    try {
+        $lines = Get-Content -LiteralPath $jsonl -ErrorAction Stop
+    } catch { return $false }
+    foreach ($line in $lines) {
+        if ($line -and $line.Contains($marker)) {
+            if ($line -match '"ts":(\d+)') {
+                $lastTs = [long]$Matches[1]
+            }
+        }
+    }
+    if ($null -eq $lastTs) { return $false }
+    $delta = $Now - $lastTs
+    return ($delta -ge 0 -and $delta -lt 300)
+}
+
+function Invoke-RWMaybeRotate {
+    param([string]$Path)
+    if (-not (Test-Path $Path)) { return }
+    try {
+        $size = (Get-Item -LiteralPath $Path).Length
+    } catch { return }
+    if ($size -le 1048576) { return }
+    try {
+        $tail = Get-Content -LiteralPath $Path -Tail 100 -ErrorAction Stop
+        $tmp = "$Path.rot.tmp"
+        Set-Content -LiteralPath $tmp -Value $tail -Encoding utf8 -NoNewline:$false
+        Move-Item -LiteralPath $tmp -Destination $Path -Force
+    } catch {
+        try { Remove-Item -LiteralPath "$Path.rot.tmp" -ErrorAction SilentlyContinue } catch { }
+    }
+}
+
+function ConvertTo-RWJsonString {
+    param([string]$Value)
+    if ($null -eq $Value) { return "" }
+    $s = $Value
+    $s = $s -replace '\\', '\\'
+    $s = $s -replace '"', '\"'
+    $s = $s -replace "`r", ' '
+    $s = $s -replace "`n", ' '
+    $s = $s -replace "`t", ' '
+    return $s
+}
+
+function Emit-Warning {
+    param(
+        [Parameter(Mandatory = $true)][string]$ErrorKind,
+        [string]$Detail = ''
+    )
+    $pid_ = $PID
+    $consumer = Split-Path -Leaf $PSCommandPath
+    if (-not $consumer) { $consumer = 'vct_project_config.ps1' }
+    $key = "${pid_}:${ErrorKind}"
+    $now = [long][Math]::Floor(([DateTimeOffset]::UtcNow.ToUnixTimeSeconds()))
+
+    Initialize-RWCacheDir
+
+    if ($Env:VCO_HOOK_DEBUG -ne '1') {
+        if (Test-RWShouldSuppress -Key $key -Now $now) { return }
+    }
+
+    # Stderr line: same fixed shape across all three resolver clients.
+    [Console]::Error.WriteLine(
+        "[vct] project_config: ${ErrorKind}: ${Detail}. Falling back to env. (rate-limited; set VCO_HOOK_DEBUG=1 to see every occurrence)"
+    )
+
+    # Cap detail at 200 chars (approximation of 200 bytes for ASCII-heavy text).
+    $clipped = if ($Detail.Length -gt 200) { $Detail.Substring(0, 200) } else { $Detail }
+    $user = if ($Env:USER) { $Env:USER } elseif ($Env:USERNAME) { $Env:USERNAME } else { 'unknown' }
+
+    $row = '{{"ts":{0},"pid":{1},"consumer":"{2}","consumer_pid":{1},"error_kind":"{3}","key":"{4}","detail":"{5}","user":"{6}"}}' -f `
+        $now, $pid_, `
+        (ConvertTo-RWJsonString $consumer), `
+        (ConvertTo-RWJsonString $ErrorKind), `
+        (ConvertTo-RWJsonString $key), `
+        (ConvertTo-RWJsonString $clipped), `
+        (ConvertTo-RWJsonString $user)
+
+    $jsonl = Get-RWJsonlPath
+    $lockPath = Get-RWLockPath
+    # Coarse mutex: open the lockfile with FileShare.None so concurrent
+    # writers queue. Then append to the JSONL with FileShare.Read. Wrap
+    # in retry-loop (50 ms × 20) for race robustness.
+    $lockStream = $null
+    $attempts = 0
+    while ($null -eq $lockStream -and $attempts -lt 20) {
+        try {
+            $lockStream = [System.IO.File]::Open(
+                $lockPath,
+                [System.IO.FileMode]::OpenOrCreate,
+                [System.IO.FileAccess]::ReadWrite,
+                [System.IO.FileShare]::None
+            )
+        } catch {
+            Start-Sleep -Milliseconds 50
+            $attempts++
+        }
+    }
+    try {
+        Add-Content -LiteralPath $jsonl -Value $row -Encoding utf8 -ErrorAction Stop
+    } catch {
+        # Append failed (disk full etc.) — warning was already emitted.
+    } finally {
+        if ($null -ne $lockStream) {
+            try { $lockStream.Close() } catch { }
+            try { $lockStream.Dispose() } catch { }
+        }
+    }
+
+    Invoke-RWMaybeRotate -Path $jsonl
+}
+
 # ── Hub port discovery ──────────────────────────────────────────────────
 function Get-HubPort {
     if ($Env:VCT_HUB_PORT) {
@@ -124,41 +277,41 @@ function Resolve-ProjectId {
     $encoded = [System.Uri]::EscapeDataString($ArgValue)
     $result = Invoke-Hub "projects/by-path?path=$encoded"
     if ($null -eq $result) {
-        Write-Err "hub unreachable; is the launcher running?"
+        Emit-Warning -ErrorKind "hub_unreachable" -Detail "hub unreachable; is the launcher running?"
         return @{ ExitCode = 1 }
     }
     switch ($result.Status) {
         0 {
-            Write-Err "hub.token missing; is the launcher running?"
+            Emit-Warning -ErrorKind "hub_unreachable" -Detail "hub.token missing; is the launcher running?"
             return @{ ExitCode = 1 }
         }
         401 {
-            Write-Err "hub returned 401 unauthorized; the launcher may have restarted (token rotated). Try again."
+            Emit-Warning -ErrorKind "hub_unauthorized" -Detail "401 unauthorized on by-path; launcher may have restarted (token rotated)"
             return @{ ExitCode = 1 }
         }
         200 {
             try {
                 $obj = $result.Body | ConvertFrom-Json
             } catch {
-                Write-Err "hub returned 200 but body is not JSON; body=$($result.Body)"
+                Emit-Warning -ErrorKind "hub_unreachable" -Detail "by-path 200 but body is not JSON; body=$($result.Body)"
                 return @{ ExitCode = 2 }
             }
             if (-not $obj.id) {
-                Write-Err "hub returned 200 but no .id field; body=$($result.Body)"
+                Emit-Warning -ErrorKind "hub_unreachable" -Detail "by-path 200 but no .id field; body=$($result.Body)"
                 return @{ ExitCode = 2 }
             }
             return @{ ExitCode = 0; Value = $obj.id }
         }
         404 {
-            Write-Err "no project registered at path: $ArgValue"
+            Emit-Warning -ErrorKind "project_not_registered" -Detail "no project registered at path: $ArgValue"
             return @{ ExitCode = 2 }
         }
         400 {
-            Write-Err "hub rejected path query: $($result.Body)"
+            Emit-Warning -ErrorKind "project_not_registered" -Detail "hub rejected path query: $($result.Body)"
             return @{ ExitCode = 2 }
         }
         Default {
-            Write-Err "hub returned status $($result.Status) for by-path lookup; body=$($result.Body)"
+            Emit-Warning -ErrorKind "hub_unreachable" -Detail "hub returned status $($result.Status) for by-path lookup; body=$($result.Body)"
             return @{ ExitCode = 1 }
         }
     }
@@ -175,16 +328,16 @@ function Get-Config {
     }
     $result = Invoke-Hub $pathAndQuery
     if ($null -eq $result) {
-        Write-Err "hub unreachable; is the launcher running?"
+        Emit-Warning -ErrorKind "hub_unreachable" -Detail "hub unreachable; is the launcher running?"
         return 1
     }
     switch ($result.Status) {
         0 {
-            Write-Err "hub.token missing; is the launcher running?"
+            Emit-Warning -ErrorKind "hub_unreachable" -Detail "hub.token missing; is the launcher running?"
             return 1
         }
         401 {
-            Write-Err "hub returned 401 unauthorized; the launcher may have restarted (token rotated). Try again."
+            Emit-Warning -ErrorKind "hub_unauthorized" -Detail "401 unauthorized; launcher may have restarted (token rotated)"
             return 1
         }
         200 {
@@ -193,17 +346,17 @@ function Get-Config {
                 try {
                     $obj = $result.Body | ConvertFrom-Json
                 } catch {
-                    Write-Err "hub returned 200 but body is not JSON; body=$($result.Body)"
+                    Emit-Warning -ErrorKind "field_decode_failed" -Detail "200 but body is not JSON; body=$($result.Body)"
                     return 4
                 }
                 $prop = $obj.PSObject.Properties[$FieldName]
                 if ($null -eq $prop) {
-                    Write-Err "field $FieldName not present in hub response; body=$($result.Body)"
+                    Emit-Warning -ErrorKind "field_not_found" -Detail "field $FieldName not present in hub response; body=$($result.Body)"
                     return 4
                 }
                 $val = $prop.Value
                 if ($null -eq $val) {
-                    Write-Err "field $FieldName decoded null from hub response"
+                    Emit-Warning -ErrorKind "field_decode_failed" -Detail "field $FieldName decoded null from hub response"
                     return 4
                 }
                 # Arrays / nested objects → emit compact JSON; scalars → raw.
@@ -227,29 +380,29 @@ function Get-Config {
             } catch { $code = "unknown" }
             switch ($code) {
                 "project_not_found" {
-                    Write-Err "project $ProjectId not registered in launcher.db"
+                    Emit-Warning -ErrorKind "project_not_registered" -Detail "project $ProjectId not registered in launcher.db"
                     return 2
                 }
                 "field_not_found" {
-                    Write-Err "field $FieldName not in config for project $ProjectId"
+                    Emit-Warning -ErrorKind "field_not_found" -Detail "field $FieldName not in config for project $ProjectId"
                     return 4
                 }
                 Default {
-                    Write-Err "hub 404 with unknown code $code; body=$($result.Body)"
+                    Emit-Warning -ErrorKind "field_not_found" -Detail "hub 404 with unknown code $code; body=$($result.Body)"
                     return 4
                 }
             }
         }
         503 {
-            Write-Err "hub returned 503 service_misconfigured for project $ProjectId (primary KG binding missing — fix in launcher GUI)"
+            Emit-Warning -ErrorKind "service_misconfigured" -Detail "503 for project $ProjectId (primary KG binding missing — fix in launcher GUI)"
             return 3
         }
         400 {
-            Write-Err "hub rejected request: $($result.Body)"
+            Emit-Warning -ErrorKind "field_not_found" -Detail "hub rejected request: $($result.Body)"
             return 4
         }
         Default {
-            Write-Err "hub returned status $($result.Status); body=$($result.Body)"
+            Emit-Warning -ErrorKind "hub_unreachable" -Detail "hub returned status $($result.Status); body=$($result.Body)"
             return 1
         }
     }
