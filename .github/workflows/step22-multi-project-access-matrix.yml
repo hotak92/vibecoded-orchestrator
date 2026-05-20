@@ -12,6 +12,14 @@
 # under regression. The fixture itself (launcher.db seeding) is
 # pure Python and runs identically on all three OSes.
 #
+# v0.2.22 Item #8 — 2 × 3 matrix (Podman/Docker × OS, 6 cells).
+# Each cell exports VCT_CONTAINER_RUNTIME so any incidental runtime
+# code path in the hub or resolver is exercised against the pinned
+# runtime. The access-matrix contract is HTTP/DB-only today, so a
+# missing container binary on the runner does NOT fail the test —
+# the env var still pins downstream code paths (e.g. for the
+# acceptance Property-12 follow-up in plan Item #10).
+#
 # Distinct from .github/workflows/release.yml (Step 7's release
 # pipeline) — that ships binaries on tag; this asserts correctness
 # on every PR. The two never share a job.
@@ -47,13 +55,34 @@ concurrency:
 
 jobs:
   multi-project-access-matrix:
-    name: ${{ matrix.os }} access-matrix
+    name: ${{ matrix.os }} / ${{ matrix.runtime }} access-matrix
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
     strategy:
+      # fail-fast: false ensures one matrix-cell failure doesn't cancel
+      # the other 5. Property (12) of v0.2.21's acceptance criterion
+      # (Podman/Docker runtime parity) is asserted by running the SAME
+      # access-matrix correctness contract under each container runtime
+      # via VCT_CONTAINER_RUNTIME — see "Runtime parity" comment below.
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        runtime: [podman, docker]
+    env:
+      # Runtime parity (v0.2.22 Item #8): VCT_CONTAINER_RUNTIME is
+      # honoured by install.py, every templates/hooks/*.{sh,ps1}, and
+      # the launcher's services/runtime.rs::resolve_runtime() (PR-43,
+      # v0.2.12). Setting it per matrix axis pins both the hub binary's
+      # incidental runtime probes AND any future runtime-aware code path
+      # in the resolver/fixture to the axis under test. Today the Step
+      # 22 fixture invokes the hub binary directly without spinning up
+      # containers (the access-matrix contract is HTTP/DB-only), so a
+      # missing container binary on the runner does NOT fail the test —
+      # it just means no runtime-dependent path is exercised. Future
+      # Property (12) field-coverage work (deferred plan Item #10) will
+      # add end-to-end assertions that turn the runtime axis from
+      # smoke-only into a hard requirement.
+      VCT_CONTAINER_RUNTIME: ${{ matrix.runtime }}
     steps:
       - uses: actions/checkout@v6
 
@@ -111,9 +140,10 @@ jobs:
         shell: bash
         env:
           VCO_CI_FIXTURE: "1"
-          # Use a deterministic per-OS RUN_ID so the build-smoke + the
-          # pytest run land in separate scratch dirs and can't collide.
-          VCO_TEST_RUN_ID: smokebuild${{ matrix.os }}-${{ github.run_id }}
+          # Use a deterministic per-(os, runtime) RUN_ID so the build-
+          # smoke + the pytest run + the two runtime-axis cells on the
+          # same OS land in separate scratch dirs and can't collide.
+          VCO_TEST_RUN_ID: smokebuild${{ matrix.os }}-${{ matrix.runtime }}-${{ github.run_id }}
         run: |
           python -m tests.integration.step22_multi_project.fixture build > "$RUNNER_TEMP/fixture-output.json"
           python -m tests.integration.step22_multi_project.fixture info --run-id "$VCO_TEST_RUN_ID"
