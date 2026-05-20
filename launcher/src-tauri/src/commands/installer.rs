@@ -5100,6 +5100,44 @@ pub(crate) fn migrate_github_pat_file_to_keychain(
     db.app_state_set_bool(APP_STATE_KEY_GITHUB_PAT_MIGRATED, true)?;
     report.flag_set = true;
     report.migrated = true;
+
+    // v0.2.22 Item #5 — audit-log the migration outcome including
+    // `file_removed`. The field is `false` by contract since the
+    // 2026-05-09 non-destructive fix (`migrate_github_pat_file_to_keychain`
+    // never deletes user-owned data), but writing it through to the
+    // audit row turns "always-false" from a cosmetic dead-code
+    // warning into a queryable historical contract: any future
+    // operator wondering "did the launcher ever delete my PAT file?"
+    // can `vct audit list --operation github_pat_file_migration`
+    // and see the explicit `file_removed: false` per migration.
+    //
+    // Sibling migration `migrate_github_pat_installer_to_user_module_id`
+    // already follows this `db.audit(...)` pattern (4933:audit row
+    // warning push), keeping the two PAT-related migrations
+    // symmetric in their audit-log surface.
+    let detail = serde_json::json!({
+        "source_file": path.display().to_string(),
+        "scope": "shared",
+        "module_id": GITHUB_PAT_MODULE_ID,
+        "key": GITHUB_PAT_KEY,
+        "already_done": report.already_done,
+        "migrated": report.migrated,
+        "file_removed": report.file_removed,
+        "flag_set": report.flag_set,
+        "warnings": report.warnings,
+    });
+    if let Err(e) = db.audit(
+        "github_pat_file_migration",
+        None,
+        Some(GITHUB_PAT_MODULE_ID),
+        &detail,
+    ) {
+        // Audit-log failure is recoverable: the migration itself
+        // succeeded and the flag is set, so we don't unwind. The
+        // operator just won't see this migration in `audit list`.
+        report.warnings.push(format!("audit row: {}", e));
+    }
+
     Ok(report)
 }
 
@@ -8807,6 +8845,88 @@ MemAvailable:   23456789 kB
                 "legacy flat file content must remain intact",
             );
 
+            delete_keychain();
+            std::fs::remove_dir_all(&home).ok();
+        }
+
+        /// v0.2.22 Item #5 — the migration writes an audit_log row
+        /// whose detail JSON carries `file_removed: false` per the
+        /// non-destructive contract. This is the live consumer that
+        /// turns the previously-dead `GithubPatMigrationReport.file_removed`
+        /// field into a queryable historical record: an operator
+        /// running `vct audit list --operation github_pat_file_migration`
+        /// sees explicit evidence that the launcher did NOT delete
+        /// user-owned PAT files in any migration run.
+        #[test]
+        fn migrate_github_pat_audit_log_records_file_removed_false() {
+            if !keyring_available() {
+                eprintln!("[skip] no OS keychain backend in this test env");
+                return;
+            }
+            let (home, _guard) = setup_temp_env();
+            let db = make_db();
+            delete_keychain();
+
+            // Pre-place a file at the shared/ path with a canary so
+            // the Case-3 codepath (file present, keychain empty) is
+            // exercised — that's the path that lands on the new
+            // audit-log write.
+            let canary = format!("ghp_audit_{}", uuid::Uuid::new_v4().simple());
+            let shared_dir = vct_secrets_shared_dir().unwrap();
+            std::fs::create_dir_all(&shared_dir).unwrap();
+            let path = shared_dir.join("github_pat");
+            std::fs::write(&path, &canary).unwrap();
+
+            let report = migrate_github_pat_file_to_keychain(&db).unwrap();
+            assert!(report.migrated);
+            assert!(
+                !report.file_removed,
+                "non-destructive contract: file_removed must be false: {:?}",
+                report,
+            );
+
+            // Query audit_log for the new row.
+            let events = db
+                .audit_list(
+                    None, // project_id filter
+                    None, // actor filter
+                    None, // since
+                    None, // until
+                    Some("github_pat_file_migration"), // search
+                    50,
+                )
+                .expect("audit_list");
+            let row = events
+                .iter()
+                .find(|e| e.operation == "github_pat_file_migration")
+                .unwrap_or_else(|| panic!(
+                    "expected an audit_log row with operation='github_pat_file_migration', \
+                     got: {:?}",
+                    events.iter().map(|e| &e.operation).collect::<Vec<_>>(),
+                ));
+
+            // Detail is stored as a JSON string; round-trip and assert
+            // the `file_removed` key is explicitly the JSON bool `false`.
+            let detail: serde_json::Value = serde_json::from_str(&row.detail)
+                .expect("audit detail is valid json");
+            assert_eq!(
+                detail.get("file_removed").and_then(|v| v.as_bool()),
+                Some(false),
+                "audit detail must record file_removed=false; got: {}",
+                row.detail,
+            );
+            assert_eq!(
+                detail.get("migrated").and_then(|v| v.as_bool()),
+                Some(true),
+                "audit detail must record migrated=true on this Case-3 run; got: {}",
+                row.detail,
+            );
+            // module_id column carries the canonical module id so the
+            // row is findable via the same indexing key used by the
+            // installer→user consolidation migration's audit row.
+            assert_eq!(row.module_id.as_deref(), Some(GITHUB_PAT_MODULE_ID));
+
+            // Cleanup.
             delete_keychain();
             std::fs::remove_dir_all(&home).ok();
         }
