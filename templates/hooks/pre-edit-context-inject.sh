@@ -13,6 +13,25 @@
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
 
+# v0.2.21 Step 25b (in-session dedup investigation): opt-in `set -x`
+# trace mode. When VCO_HOOK_TRACE=1, write the full execution trace
+# to .claude/logs/preedit-trace-<session>-<ts>.log so the dedup
+# codepath can be inspected post-mortem. Off by default (the trace
+# is verbose and would clutter normal hook runs). Enable per-shell
+# via `export VCO_HOOK_TRACE=1` in the Claude Code shell that's
+# experiencing the dedup miss.
+if [ "${VCO_HOOK_TRACE:-0}" = "1" ]; then
+    _TRACE_FILE="${TMPDIR:-/tmp}/preedit-trace-$(date +%s%N)-$$.log"
+    exec 2>>"$_TRACE_FILE"
+    set -x
+    echo "==== preedit hook trace start: $(date -u +%Y-%m-%dT%H:%M:%SZ) pwd=$(pwd) ====" >&2
+    # Print the trace path on stdout so the operator can find it. Note:
+    # PreToolUse hook stdout is discarded by the harness unless JSON-
+    # shaped under `hookSpecificOutput.additionalContext`. The trace
+    # path goes to stderr instead via the redirected fd 2.
+    echo "[vct] preedit trace: $_TRACE_FILE" >&2
+fi
+
 # VCO-CENTRALIZED-KG: read-side delegator (PR #171 / 0.1.7).
 #   Delegates KG search to claude_mcp_servers/scripts/rl_kg_search.py and
 #   code-graph search to .claude/scripts/code-graph-query — both call the
