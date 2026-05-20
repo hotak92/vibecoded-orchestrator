@@ -2550,6 +2550,24 @@ def _enumerate_bundle_files(
                     always_overwrite=False,
                 ))
 
+    # v0.2.21 Step 8f: `.vscode/tasks.json` — VS Code folderOpen task
+    # that starts vct-hub when the project is opened. Belt-and-braces
+    # companion to the Claude Code SessionStart hook (which runs on
+    # `claude` invocation). Both invocations are idempotent
+    # (`vct-hub --start-if-not-running` exits 0 either way). The
+    # manifest-driven hash compare preserves user-customised
+    # tasks.json on `--update` so users who maintain their own VS
+    # Code tasks won't lose them; new installs get the template.
+    vscode_tasks_src = templates / ".vscode" / "tasks.json"
+    if vscode_tasks_src.is_file():
+        ops.append(_BundleFileOp(
+            dest_rel=str(Path(".vscode") / "tasks.json"),
+            source_abs=vscode_tasks_src,
+            source_rel=str(vscode_tasks_src.relative_to(orchestrator_root)),
+            transform=None,
+            always_overwrite=False,
+        ))
+
     # Infrastructure compose files. Copy all docker-* / podman-* yml at
     # the top level of `infrastructure/`. The hook `ensure-containers.sh`
     # picks the right overlay at runtime; we just need the files present.

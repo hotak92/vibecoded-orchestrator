@@ -2974,6 +2974,36 @@ def main() -> int:
                     f"unexpected exception: {exc}",
                 )
 
+    # v0.2.21 Step 8: deploy vct-hub binary alongside vct-launcher and
+    # start it idempotently. The launcher binary has already been
+    # placed by _refresh_dist_binary_after_rebuild / _register_mcps
+    # above; vct-hub ships in the same `launcher/dist/<arch>/` slot
+    # and shares the same release ZIP. Soft-fail throughout: a missing
+    # binary or non-responsive /health degrades to "hub-unavailable
+    # mode" which the v0.2.21 launcher handles gracefully (resolver
+    # falls back to env vars; GUI still comes up).
+    #
+    # Cutover sentinel (W2 fix): written BEFORE the hub starts so the
+    # v0.2.21 launcher's lib.rs setup() can skip its embedded
+    # services::watcher::spawn during the overlap with a still-
+    # running v0.2.20 launcher's old watcher. Deleted after /health
+    # responds.
+    #
+    # Boot auto-start (8d): NOT registered here — user opts in via
+    # launcher GUI Preferences (Step 13). install-time default is
+    # conservative.
+    if not getattr(args, "skip_mcp_registration", False):
+        try:
+            _deploy_and_start_vct_hub(
+                PROJECT_ROOT,
+                deferral_report=_deferral_report,
+            )
+        except Exception as exc:  # noqa: BLE001 — soft-fail by design
+            _log_install_event(
+                "deploy_vct_hub", "error",
+                f"unexpected exception: {exc}",
+            )
+
     # v0.2.10 (Bug L2): auto-materialize the boot service so containers
     # come back up after a reboot without manual intervention. Cross-OS:
     # systemd user unit on Linux, LaunchAgent on macOS, Task Scheduler
@@ -9601,6 +9631,565 @@ def _ensure_launcher_binary(
         "Falling back to pure-Python MCP registration."
     )
     return None
+
+
+# ---------------------------------------------------------------------------
+# v0.2.21 Step 8: vct-hub binary deployment + idempotent start.
+#
+# The detached `vct-hub` binary ships alongside `vct-launcher` in
+# `launcher/dist/<os>-<arch>/`. install.py is responsible for:
+#   8a. Placing the binary (bundled / download / cargo rebuild — same
+#       tier ladder as the launcher binary).
+#   8b. Writing a `<vct_root_dir()>/v0.2.21-cutover.flag` sentinel BEFORE
+#       starting vct-hub so a v0.2.20 launcher's still-running embedded
+#       supervisor (and the freshly-spawned v0.2.21 launcher's own
+#       `services::watcher::spawn`) skips its 30s polling loop during
+#       the overlap. install.py deletes the sentinel after vct-hub
+#       responds to /health.
+#   8c. Invoking `vct-hub --start-if-not-running` (idempotent: returns
+#       exit 0 whether starting fresh or attaching to a running hub).
+#   8d. Boot auto-start is NOT registered during install. The user opts
+#       in via the launcher GUI Preferences page (Step 13) which then
+#       calls `vct-hub --register-boot`. install time keeps the default
+#       behaviour conservative — most users don't want a background
+#       service auto-starting on boot without explicit consent.
+#   8g. Stopping vct-hub before --update is owned by the launcher's
+#       Rust `update_orchestrator` (Step 12). By the time install.py
+#       runs under --update, the hub is already stopped; install.py
+#       just deploys and re-starts it.
+# ---------------------------------------------------------------------------
+
+# Sentinel filename written under `vct_root_dir()` during the v0.2.20 →
+# v0.2.21 cutover. Read by:
+#   - the v0.2.21 launcher's `lib.rs` setup() to skip
+#     `services::watcher::spawn` (W2 fix).
+#   - a v0.2.20 launcher's old watcher does NOT read the sentinel (no
+#     forward-port), but its 30s polls are harmless (podman/docker
+#     `start` is idempotent) and its process exits during the binary
+#     swap, so the duplicate supervisor window closes naturally.
+# The sentinel is short-lived: install.py writes it just before
+# starting vct-hub and deletes it after the /health probe succeeds
+# (typically <5 s end-to-end).
+_VCT_HUB_CUTOVER_SENTINEL_NAME = "v0.2.21-cutover.flag"
+
+
+def _vct_hub_binary_relative_path() -> tuple[str, str]:
+    """Return (subdir, filename) for the bundled vct-hub binary.
+
+    Mirrors :func:`_launcher_binary_relative_path` exactly — vct-hub
+    ships in the same per-arch dir as vct-launcher.
+
+    Linux: ('linux-x64', 'vct-hub')
+    macOS: ('macos-arm64', 'vct-hub')
+    Windows: ('windows-x64', 'vct-hub.exe')
+    """
+    system = platform.system().lower()
+    if system.startswith("win"):
+        return ("windows-x64", "vct-hub.exe")
+    if system == "darwin":
+        return ("macos-arm64", "vct-hub")
+    return ("linux-x64", "vct-hub")
+
+
+def _try_bundled_vct_hub_binary(install_root: Path) -> Optional[Path]:
+    """Tier 1: bundled binary at launcher/dist/<os>-<arch>/vct-hub[.exe]."""
+    subdir, fname = _vct_hub_binary_relative_path()
+    p = install_root / "launcher" / "dist" / subdir / fname
+    if p.is_file() and os.access(
+        p,
+        os.X_OK if not platform.system().lower().startswith("win") else os.F_OK,
+    ):
+        return p
+    return None
+
+
+def _try_download_vct_hub_binary(install_root: Path) -> Optional[Path]:
+    """Tier 2: download matching release artifact from GitHub Releases.
+
+    Since v0.2.21 the release ZIP carries BOTH `vct-launcher[.exe]`
+    AND `vct-hub[.exe]` per arch (see `.github/workflows/release.yml`).
+    Reuses the launcher's download tooling preferences (gh first,
+    curl fallback) and the same naming convention
+    (`vibecoded-orchestrator-<version>-<os>-<arch>.zip`).
+
+    Soft-fail on every error (network down, release missing, auth
+    refused, vct-hub not yet bundled in the release ZIP) — returns
+    None and lets the caller move to Tier 3.
+
+    Tier-1/2 share the same artifact (one ZIP per arch contains both
+    binaries); if the launcher binary was already downloaded earlier
+    this run, the ZIP is on disk-cache-miss territory — we
+    re-download deliberately rather than carry a side-channel into
+    `_try_download_launcher_binary`. The redundancy is bounded (one
+    re-download per install) and keeps the function self-contained.
+    """
+    version = _read_launcher_version(install_root)
+    if not version:
+        return None
+    subdir, fname = _vct_hub_binary_relative_path()
+    target_dir = install_root / "launcher" / "dist" / subdir
+    target_path = target_dir / fname
+    os_arch_token = {
+        "linux-x64": "linux-x64",
+        "windows-x64": "windows-x64",
+        "macos-arm64": "macos-arm64",
+    }.get(subdir, subdir)
+    artifact = f"vibecoded-orchestrator-{version}-{os_arch_token}.zip"
+    inner_root = f"vibecoded-orchestrator-{version}-{os_arch_token}"
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="vct-hub-dl-"))
+    try:
+        zip_path = tmpdir / artifact
+        if shutil.which("gh"):
+            cmd = [
+                "gh", "release", "download", f"v{version}",
+                "--repo", "hotak92/vibecoded-orchestrator",
+                "--pattern", artifact,
+                "--dir", str(tmpdir),
+            ]
+            try:
+                result = subprocess.run(
+                    cmd, capture_output=True, timeout=60, text=True
+                )
+                if result.returncode != 0:
+                    return None
+            except (subprocess.SubprocessError, OSError):
+                return None
+        elif shutil.which("curl"):
+            url = (
+                f"https://github.com/hotak92/vibecoded-orchestrator/"
+                f"releases/download/v{version}/{artifact}"
+            )
+            try:
+                result = subprocess.run(
+                    ["curl", "-fsSL", "-o", str(zip_path), url],
+                    capture_output=True, timeout=60, text=True,
+                )
+                if result.returncode != 0:
+                    return None
+            except (subprocess.SubprocessError, OSError):
+                return None
+        else:
+            return None
+        if not zip_path.is_file():
+            return None
+        import zipfile  # stdlib — defer import to avoid startup cost.
+        try:
+            with zipfile.ZipFile(zip_path) as z:
+                inner = f"{inner_root}/vct-hub" + (
+                    ".exe" if platform.system().lower().startswith("win") else ""
+                )
+                # The ZIP may not yet contain vct-hub (e.g. user pulled
+                # v0.2.21 source but their network resolved the v0.2.20
+                # release). Be tolerant: any zip member ending in
+                # `vct-hub` / `vct-hub.exe` is acceptable.
+                candidates = [
+                    n for n in z.namelist()
+                    if n.endswith("vct-hub") or n.endswith("vct-hub.exe")
+                ]
+                if not candidates:
+                    return None
+                member = inner if inner in z.namelist() else candidates[0]
+                with z.open(member) as src:
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    with open(target_path, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+        except (zipfile.BadZipFile, OSError, KeyError):
+            return None
+        if not platform.system().lower().startswith("win"):
+            try:
+                target_path.chmod(0o755)
+            except OSError:
+                pass
+        if target_path.is_file():
+            return target_path
+        return None
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _try_cargo_build_vct_hub(install_root: Path) -> Optional[Path]:
+    """Tier 3 (LAST RESORT): rebuild vct-hub via plain `cargo build`.
+
+    The hub is a regular axum binary crate at
+    ``launcher/src-tauri/vct-hub/`` — no Tauri tooling needed (unlike
+    the launcher's `cargo tauri build`). 2-5 min cold; ~30 s warm.
+    Soft-fail on every error.
+
+    Note: like :func:`_try_cargo_tauri_build` for the launcher, this
+    function is reserved for source-checkout installs on a machine
+    without bundled binaries (CI builders, contributor workflows).
+    Normal --update / fresh-install paths resolve via tier 1 (bundled
+    in the orchestrator clone after `git pull`) or tier 2 (GitHub
+    download).
+    """
+    if not shutil.which("cargo") or not shutil.which("rustc"):
+        return None
+    print(
+        "  vct-hub binary not bundled and download failed.\n"
+        "  Falling back to `cargo build -p vct-hub --release` — "
+        "this takes 2-5 minutes cold.\n"
+        "  Press Ctrl-C to abort.",
+        flush=True,
+    )
+    src_tauri = install_root / "launcher" / "src-tauri"
+    if not (src_tauri / "vct-hub" / "Cargo.toml").is_file():
+        return None
+    try:
+        result = subprocess.run(
+            ["cargo", "build", "-p", "vct-hub", "--release"],
+            cwd=str(src_tauri),
+            capture_output=True,
+            timeout=600,  # 10 min cap
+            text=True,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        print(f"  `cargo build -p vct-hub` failed: {exc}", file=sys.stderr)
+        return None
+    if result.returncode != 0:
+        print(
+            f"  `cargo build -p vct-hub` exited {result.returncode}; "
+            f"falling back.",
+            file=sys.stderr,
+        )
+        return None
+    subdir, fname = _vct_hub_binary_relative_path()
+    target_dir = install_root / "launcher" / "dist" / subdir
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_path = target_dir / fname
+    # cargo --release output lives at <workspace>/target/release/vct-hub[.exe].
+    # The workspace root for vct-hub is launcher/src-tauri/ (see Cargo.toml
+    # [workspace] members locked in the plan §3c).
+    release_dir = src_tauri / "target" / "release"
+    src = release_dir / fname
+    if not src.is_file():
+        # Tolerate alternative names (`.exe` vs no-ext) defensively.
+        candidates = list(release_dir.glob("vct-hub*"))
+        src = next(
+            (c for c in candidates
+             if c.is_file()
+             and c.suffix in ("", ".exe")
+             and not c.name.endswith((".d", ".pdb"))),
+            None,
+        )
+    if src is None or not src.is_file():
+        return None
+    try:
+        shutil.copy2(src, target_path)
+        if not platform.system().lower().startswith("win"):
+            target_path.chmod(0o755)
+    except OSError:
+        return None
+    return target_path if target_path.is_file() else None
+
+
+def _ensure_vct_hub_binary(
+    install_root: Path,
+    *,
+    prefer_only_bundled: bool = False,
+) -> Optional[Path]:
+    """Resolve vct-hub binary path via 4-tier priority (mirrors
+    :func:`_ensure_launcher_binary`).
+
+    1. Bundled at launcher/dist/<os>-<arch>/vct-hub[.exe] — normal user.
+    2. Download from GitHub Releases — fresh source clone w/o bundle.
+    3. Rebuild via `cargo build -p vct-hub --release` — last resort.
+    4. Return None — caller falls back to "hub-unavailable degraded
+       mode" (the launcher already handles this in
+       `hub_launcher::ensure_hub_running`: resolver falls back to env
+       vars; supervisor doesn't run; GUI still comes up).
+
+    Soft-fail at every step. Prints progress messages so the user
+    sees what's happening without reading this code.
+
+    Args:
+        install_root: repo root containing `launcher/dist/...`.
+        prefer_only_bundled: when True, perform only Tier 1.
+    """
+    p = _try_bundled_vct_hub_binary(install_root)
+    if p is not None:
+        return p
+    if prefer_only_bundled:
+        return None
+    print(
+        f"  vct-hub binary not found at "
+        f"launcher/dist/{_vct_hub_binary_relative_path()[0]}/."
+    )
+    print("  Trying to download from the matching GitHub release...")
+    p = _try_download_vct_hub_binary(install_root)
+    if p is not None:
+        print(f"  Downloaded vct-hub binary to {p}.")
+        return p
+    print(
+        "  Release download not available (no gh/curl, no network, "
+        "or vct-hub not in the release ZIP yet)."
+    )
+    p = _try_cargo_build_vct_hub(install_root)
+    if p is not None:
+        print(f"  Rebuilt vct-hub binary at {p}.")
+        return p
+    print(
+        "  Cannot rebuild vct-hub: cargo/rustc not on PATH or build "
+        "failed. The launcher will start in hub-unavailable degraded "
+        "mode; resolver falls back to env vars and supervisor "
+        "doesn't run. Re-run `python install.py --update` once the "
+        "build environment is fixed."
+    )
+    return None
+
+
+def _vct_hub_cutover_sentinel_path() -> Path:
+    """Absolute path of the v0.2.21 cutover sentinel file.
+
+    Lives under ``vct_root_dir()`` (canonical launcher state-dir, also
+    where ``hub.pid`` / ``hub.port`` / ``hub.token`` land). The
+    v0.2.21 launcher's setup() reads this path to decide whether to
+    skip its embedded `services::watcher::spawn` startup.
+    """
+    from vco_lib.paths import vct_root_dir
+    return vct_root_dir() / _VCT_HUB_CUTOVER_SENTINEL_NAME
+
+
+def _write_vct_hub_cutover_sentinel() -> Optional[Path]:
+    """Write the v0.2.21-cutover.flag sentinel just before starting
+    vct-hub. Returns the absolute path on success, None on any failure.
+
+    Soft-fail: when the sentinel can't be written (read-only home,
+    permission denied), the cutover proceeds without it. The 30 s
+    overlap with a still-running v0.2.20 watcher is harmless (podman
+    `start` is idempotent) — the sentinel is a belt-and-braces
+    safeguard, not a correctness gate.
+    """
+    try:
+        path = _vct_hub_cutover_sentinel_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        from datetime import datetime, timezone
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        path.write_text(
+            f"v0.2.20-to-v0.2.21 in progress; sentinel placed at {ts}\n",
+            encoding="utf-8",
+        )
+        return path
+    except OSError as exc:
+        _log_install_event(
+            "vct_hub_cutover", "warn",
+            f"could not write cutover sentinel: {exc}",
+        )
+        return None
+
+
+def _delete_vct_hub_cutover_sentinel() -> None:
+    """Delete the cutover sentinel. Idempotent (no-op when absent).
+
+    Called after vct-hub responds to /health. Soft-fail: any OSError
+    is logged but not propagated — a leftover sentinel is harmless
+    on the next launcher boot if vct-hub is genuinely up (the
+    launcher's hub_launcher::ensure_hub_running will detect it
+    running and skip the start; the watcher-skip is wasted but not
+    harmful in steady state). Future install runs overwrite the
+    sentinel atomically.
+    """
+    try:
+        path = _vct_hub_cutover_sentinel_path()
+        if path.is_file():
+            path.unlink()
+    except OSError as exc:
+        _log_install_event(
+            "vct_hub_cutover", "warn",
+            f"could not delete cutover sentinel: {exc}",
+        )
+
+
+def _probe_vct_hub_health(timeout: float = 0.5) -> bool:
+    """Probe ``http://localhost:<hub.port>/health``. Returns True when
+    the hub responds with status<400, False otherwise.
+
+    Reads the hub port from ``vct_root_dir()/hub.port`` (written by
+    vct-hub on startup). Soft-fail on every error (file missing, port
+    unparseable, connection refused, timeout).
+    """
+    try:
+        from vco_lib.paths import vct_root_dir
+        port_file = vct_root_dir() / "hub.port"
+        if not port_file.is_file():
+            return False
+        port_raw = port_file.read_text(encoding="utf-8").strip()
+        if not port_raw.isdigit():
+            return False
+        url = f"http://127.0.0.1:{port_raw}/health"
+        resp = urllib.request.urlopen(url, timeout=timeout)
+        return resp.status < 400
+    except Exception:
+        return False
+
+
+def _wait_for_vct_hub_health(deadline_seconds: float = 10.0) -> bool:
+    """Poll :func:`_probe_vct_hub_health` until it returns True or
+    ``deadline_seconds`` elapses. Returns True on success, False on
+    timeout.
+
+    Tuned generously (10 s default) because the hub's first start
+    might collide with podman socket warmup on a freshly-rebooted
+    machine. Steady-state response is sub-second.
+    """
+    end = time.time() + deadline_seconds
+    while time.time() < end:
+        if _probe_vct_hub_health():
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def _deploy_and_start_vct_hub(
+    install_root: Path,
+    *,
+    deferral_report: Optional["DeferralReport"] = None,
+) -> None:
+    """v0.2.21 Step 8 entry point: deploy vct-hub, then start it
+    idempotently with the cutover sentinel in place.
+
+    Sequence:
+      8a. Resolve binary via :func:`_ensure_vct_hub_binary` (tier 1/2/3).
+      8b. Write the cutover sentinel BEFORE starting the hub.
+      8c. Invoke ``vct-hub --start-if-not-running`` (idempotent).
+      8c'. Poll /health for up to 10 s.
+      8b'. Delete the sentinel after /health responds.
+
+    Soft-fail throughout: a missing/broken binary, a failed start, or
+    a non-responsive /health endpoint all degrade gracefully — the
+    launcher's `hub_launcher::ensure_hub_running` retries on next GUI
+    launch, and the launcher's degraded-mode fallback keeps the GUI
+    usable.
+
+    Step 8d (boot auto-start): explicitly NOT called. The user opts
+    in via launcher GUI Preferences → "Start vct-hub on login"
+    (Step 13). Install-time auto-registration would conflict with
+    distros that have their own service-management opinions and
+    contradicts our consent-first philosophy for background
+    services.
+
+    Step 8g (stop-before-update): the launcher's
+    `update_orchestrator` (Step 12) stops vct-hub BEFORE invoking
+    install.py. By the time we run, the hub is already down and we
+    can deploy the new binary without ERROR_SHARING_VIOLATION on
+    Windows. install.py then re-starts it via 8c above.
+    """
+    print(
+        "[8/10] Deploying vct-hub binary (v0.2.21 hub detachment) ... ",
+        end="", flush=True,
+    )
+    _log_install_event("8/10", "start", "deploying vct-hub binary")
+
+    binary = _ensure_vct_hub_binary(install_root, prefer_only_bundled=False)
+    if binary is None:
+        print("SKIPPED (no binary)")
+        _log_install_event(
+            "8/10", "warn",
+            "vct-hub binary unavailable; launcher will start in "
+            "hub-unavailable degraded mode",
+        )
+        if deferral_report is not None:
+            try:
+                deferral_report.add_entry(
+                    DeferralEntry(
+                        condition_id="vct_hub_binary_unavailable",
+                        title="vct-hub binary unavailable",
+                        detected=(
+                            "install.py could not resolve a vct-hub binary "
+                            "via bundled (launcher/dist/<arch>/), GitHub "
+                            "release download, or `cargo build -p vct-hub "
+                            "--release`. The launcher will start in "
+                            "hub-unavailable degraded mode: the resolver "
+                            "falls back to env vars and the supervisor "
+                            "does not run, but the GUI still comes up."
+                        ),
+                        why_deferred=(
+                            "Auto-recovery requires either a network path "
+                            "to GitHub Releases or a working cargo + rustc "
+                            "toolchain — neither was available this run. "
+                            "install.py never blocks completion on hub "
+                            "binary failure."
+                        ),
+                        command_to_apply="python install.py --update",
+                        severity="warning",
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 — soft-fail
+                _log_install_event(
+                    "8/10", "warn",
+                    f"deferral emit failed: {exc}",
+                )
+        return
+
+    print(f"OK ({binary.relative_to(install_root)})")
+    _log_install_event(
+        "8/10", "ok",
+        f"vct-hub binary at {binary}",
+        data={"binary_path": str(binary)},
+    )
+
+    # 8b. Write the cutover sentinel BEFORE starting the hub.
+    sentinel_path = _write_vct_hub_cutover_sentinel()
+    if sentinel_path is not None:
+        _log_install_event(
+            "8/10", "info",
+            f"cutover sentinel written at {sentinel_path}",
+            data={"sentinel": str(sentinel_path)},
+        )
+
+    # 8c. Idempotent start. `--start-if-not-running` exits 0 when the
+    # hub is already up; it spawns a detached child and returns
+    # quickly (~100 ms), so a short subprocess timeout is fine here.
+    print(
+        "[8/10] Starting vct-hub (--start-if-not-running) ... ",
+        end="", flush=True,
+    )
+    try:
+        proc = subprocess.run(
+            [str(binary), "--start-if-not-running"],
+            capture_output=True,
+            timeout=15,
+            text=True,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        print(f"FAILED ({exc})")
+        _log_install_event(
+            "8/10", "error",
+            f"vct-hub --start-if-not-running raised: {exc}",
+        )
+        # Leave the sentinel in place — the v0.2.21 launcher's
+        # setup() will read it on next start and skip the watcher,
+        # giving the user a chance to recover (the
+        # `hub_launcher::ensure_hub_running` retry will then start
+        # the hub from the GUI side). Sentinel is cleared on next
+        # successful install run.
+        return
+
+    if proc.returncode != 0:
+        print(f"FAILED (exit {proc.returncode})")
+        _log_install_event(
+            "8/10", "error",
+            f"vct-hub --start-if-not-running exited {proc.returncode}",
+            data={
+                "stdout": (proc.stdout or "")[-500:],
+                "stderr": (proc.stderr or "")[-500:],
+            },
+        )
+        return
+
+    print("OK")
+
+    # 8c'. Confirm /health before clearing the sentinel.
+    healthy = _wait_for_vct_hub_health(deadline_seconds=10.0)
+    if healthy:
+        _log_install_event("8/10", "ok", "vct-hub /health responded")
+        _delete_vct_hub_cutover_sentinel()
+    else:
+        _log_install_event(
+            "8/10", "warn",
+            "vct-hub started but /health did not respond within 10 s; "
+            "leaving cutover sentinel in place for next-boot recovery",
+        )
 
 
 def _build_python_mcp_entries(
