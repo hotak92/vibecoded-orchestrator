@@ -10,6 +10,7 @@
 // surface.
 mod commands;
 mod hub_launcher;
+mod hub_status;
 mod installer_engine;
 mod mcp_registration;
 pub mod project_naming;

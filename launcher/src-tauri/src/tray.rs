@@ -20,7 +20,7 @@ use std::time::Duration;
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem, Submenu},
     tray::{TrayIconBuilder, TrayIconEvent},
-    AppHandle, Listener, Manager, Runtime,
+    AppHandle, Emitter, Listener, Manager, Runtime,
 };
 
 use crate::commands::self_update::{self, UpdateStatus};
@@ -55,6 +55,30 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         None::<&str>,
     )?;
 
+    // v0.2.21 Step 13: vct-hub status + Stop control. Mirrors the
+    // services pill above — initial probe label is a placeholder
+    // overwritten by the same background poller on first tick.
+    let hub_label = MenuItem::with_id(
+        app,
+        "hub_status",
+        "Hub: probing…",
+        false,
+        None::<&str>,
+    )?;
+    // "Stop background hub" item is initially DISABLED. The hub-status
+    // poller flips it enabled when the hub is detected running, and
+    // back to disabled when not-running/stale. We don't render the
+    // item conditionally because Tauri's tray-menu rebuild path is
+    // heavier than a set_enabled flip; matches the pattern used by
+    // `services_label`'s in-place updates.
+    let hub_stop = MenuItem::with_id(
+        app,
+        "hub_stop",
+        "Stop background hub",
+        false, // disabled until poller detects running hub
+        None::<&str>,
+    )?;
+
     // Recent projects sub-menu (populated on each open via menu rebuild).
     let recent = recent_projects_submenu(app)?;
 
@@ -80,6 +104,8 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         &[
             &open_item,
             &services_label,
+            &hub_label,
+            &hub_stop,
             &recent,
             &sep,
             &updates,
@@ -121,6 +147,38 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
                         );
                     }
                 }
+            }
+            "hub_stop" => {
+                // v0.2.21 Step 13: ask the detached vct-hub to stop.
+                // Spawn on a blocking task because `hub_status::stop()`
+                // synchronously waits up to 10 s for the hub's
+                // graceful-shutdown path. The next tray-poller tick
+                // (≤ 5 s after this returns) will flip the label
+                // back to "not running" and disable this menu item.
+                let app_handle = app.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    match crate::hub_status::stop() {
+                        crate::hub_status::StopOutcome::Stopped
+                        | crate::hub_status::StopOutcome::AlreadyStopped => {
+                            // Best-effort UI nudge: emit an event so
+                            // any open GUI page that watches hub
+                            // status can refresh immediately rather
+                            // than wait for its own next poll.
+                            let _ = app_handle.emit(
+                                "vct-hub-stopped",
+                                serde_json::json!({}),
+                            );
+                        }
+                        crate::hub_status::StopOutcome::BinaryNotFound => {
+                            eprintln!(
+                                "[vct] tray: cannot stop hub — vct-hub binary not found"
+                            );
+                        }
+                        crate::hub_status::StopOutcome::Failed(msg) => {
+                            eprintln!("[vct] tray: hub stop failed: {}", msg);
+                        }
+                    }
+                });
             }
             "about" => {
                 if let Some(w) = app.get_webview_window("main") {
@@ -165,6 +223,40 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     app.listen("vct-launcher-update-available", move |evt| {
         if let Ok(status) = serde_json::from_str::<UpdateStatus>(evt.payload()) {
             let _ = updates_for_listener.set_text(format_update_label(&status));
+        }
+    });
+
+    // v0.2.21 Step 13: hub-status background poller. Same 5 s cadence
+    // as the services poller below; runs in its own task so a slow
+    // services probe never starves the hub label. Probe is cheap
+    // (read lockfile + kill(pid, 0)) — no HTTP call — so the poll
+    // budget is well below the interval.
+    let hub_label_for_task = hub_label.clone();
+    let hub_stop_for_task = hub_stop.clone();
+    tauri::async_runtime::spawn(async move {
+        // First tick fires immediately so the user sees real state
+        // shortly after the tray appears (no "probing…" stickiness).
+        let s = tokio::task::spawn_blocking(crate::hub_status::probe)
+            .await
+            .unwrap_or(crate::hub_status::HubStatus::NotRunning);
+        let _ = hub_label_for_task.set_text(crate::hub_status::label(s));
+        let _ = hub_stop_for_task.set_enabled(matches!(
+            s,
+            crate::hub_status::HubStatus::Running { .. }
+        ));
+
+        let mut ticker = tokio::time::interval(REFRESH_INTERVAL);
+        ticker.tick().await; // burn the immediate-fire tick
+        loop {
+            ticker.tick().await;
+            let s = tokio::task::spawn_blocking(crate::hub_status::probe)
+                .await
+                .unwrap_or(crate::hub_status::HubStatus::NotRunning);
+            let _ = hub_label_for_task.set_text(crate::hub_status::label(s));
+            let _ = hub_stop_for_task.set_enabled(matches!(
+                s,
+                crate::hub_status::HubStatus::Running { .. }
+            ));
         }
     });
 
