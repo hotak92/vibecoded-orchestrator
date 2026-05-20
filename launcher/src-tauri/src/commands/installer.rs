@@ -5,6 +5,11 @@ use tauri::{command, AppHandle, Emitter, Manager, Runtime, State, Window};
 
 use crate::db::Db;
 use crate::secrets::{self, SecretScope};
+// v0.2.21 Step 12: liveness check for the detached vct-hub during the
+// update flow's stop-before-pull sequence. Same symbol the boot sweep
+// uses, sourced from the core crate so the re-export visibility in
+// `lib.rs` (`pub(crate) use`) doesn't matter here.
+use vct_launcher_core::process::pid_is_alive;
 
 /// Upstream GitHub repo. Auto-update isn't fully wired yet — initial
 /// install is a local file copy from the launcher's bundled repo source
@@ -2555,6 +2560,461 @@ async fn run_install_orchestrator_lightweight(
     })
 }
 
+/// v0.2.21 Step 12 (B1 fix): stop the detached vct-hub BEFORE the
+/// orchestrator self-update touches disk.
+///
+/// Why: v0.2.21 introduces `vct-hub` as a sibling binary that may be
+/// running independently of the launcher (and outlives launcher GUI
+/// sessions). On Windows, `git pull` would hit `ERROR_SHARING_VIOLATION`
+/// trying to overwrite a running `vct-hub.exe` exactly the same way it
+/// would for the launcher itself (already handled by
+/// `pre_pull_rename_running_binary`). Renaming the hub's exe is only
+/// half the story — we ALSO want it stopped so install.py's post-
+/// update deploy can write fresh state files without racing the old
+/// hub's open handles.
+///
+/// Contract (per plan §"`update_orchestrator` extensions"):
+///   - Read `<vct_root_dir()>/hub.pid`. If absent → no hub → Ok(false).
+///   - If pid alive: invoke `vct-hub --stop` and poll the pid for up
+///     to 10 s waiting for it to die (the `--stop` CLI itself blocks
+///     up to 10 s but we don't trust the subprocess to honour that
+///     deadline; we re-poll defensively).
+///   - If the polite stop fails: emit a warning, force-kill the pid
+///     (SIGKILL on POSIX, TerminateProcess on Windows), clean up the
+///     stale hub.pid manually. Hard-fail if even the kill fails — we
+///     refuse to git pull when the binary is provably locked.
+///   - Returns `Ok(true)` on successful stop, `Ok(false)` if no hub
+///     was running, `Err(_)` on any unrecoverable failure.
+///
+/// Soft-fail philosophy: this is best-effort. If `vct-hub --stop`
+/// can't be spawned (binary not on disk, exec failed), we fall
+/// through to the direct signal path — the hub IPC is just a polite
+/// hint; the OS-level signal is the real mechanism.
+fn ensure_hub_stopped_for_update(_install_path: &Path) -> Result<bool, String> {
+    let pid_file = vct_launcher_core::paths::vct_root_dir().join("hub.pid");
+    let pid_raw = match std::fs::read_to_string(&pid_file) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "[vct] update_orchestrator: no {} — vct-hub is not running, skipping stop",
+                pid_file.display(),
+            );
+            return Ok(false);
+        }
+        Err(e) => {
+            return Err(format!(
+                "could not read {} to detect running vct-hub: {}",
+                pid_file.display(),
+                e
+            ));
+        }
+    };
+    let pid: u32 = match pid_raw.trim().parse() {
+        Ok(p) => p,
+        Err(_) => {
+            // Malformed lockfile — treat as "no hub running" and clean
+            // up so install.py doesn't choke on it later.
+            eprintln!(
+                "[vct] update_orchestrator: {} contains malformed PID {:?}; removing stale lockfile",
+                pid_file.display(),
+                pid_raw.trim(),
+            );
+            let _ = std::fs::remove_file(&pid_file);
+            return Ok(false);
+        }
+    };
+
+    if !pid_is_alive(pid) {
+        // Stale lockfile from a previous hub crash. Clean it up so the
+        // post-update `--start-if-not-running` path doesn't think a
+        // hub is already running.
+        eprintln!(
+            "[vct] update_orchestrator: hub.pid claims pid {} but it's dead; removing stale lockfile",
+            pid
+        );
+        let _ = std::fs::remove_file(&pid_file);
+        return Ok(false);
+    }
+
+    eprintln!(
+        "[vct] update_orchestrator: vct-hub running (pid {}); requesting graceful stop",
+        pid
+    );
+
+    // First attempt: polite `vct-hub --stop`. Soft-fail on any error
+    // (missing binary, exec failure, non-zero exit) — we fall through
+    // to the OS-signal path.
+    let polite_attempted = if let Some(hub_bin) = crate::hub_launcher::find_hub_binary() {
+        let mut cmd = std::process::Command::new(&hub_bin);
+        cmd.arg("--stop")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+        match cmd.status() {
+            Ok(status) => {
+                if !status.success() {
+                    eprintln!(
+                        "[vct] update_orchestrator: vct-hub --stop exited {:?}; will fall through to direct signal",
+                        status.code()
+                    );
+                }
+                true
+            }
+            Err(e) => {
+                eprintln!(
+                    "[vct] update_orchestrator: could not spawn vct-hub --stop ({}); falling through to direct signal",
+                    e
+                );
+                false
+            }
+        }
+    } else {
+        eprintln!(
+            "[vct] update_orchestrator: vct-hub binary not found on disk; \
+             skipping polite --stop and going straight to direct signal"
+        );
+        false
+    };
+
+    // Poll up to 10 s for the pid to die. The `--stop` CLI itself
+    // already polls up to 10 s before returning, so by this point the
+    // hub almost certainly is dead — but defensively re-check.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if !pid_is_alive(pid) {
+            // Process is gone. Lockfile MAY still exist (the
+            // graceful-shutdown path normally removes it; if it
+            // didn't, do it now).
+            let _ = std::fs::remove_file(&pid_file);
+            eprintln!(
+                "[vct] update_orchestrator: vct-hub pid {} stopped gracefully",
+                pid
+            );
+            return Ok(true);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    // Polite stop didn't work (or wasn't attempted). Escalate: force
+    // the kernel to kill the process. Refuse the update entirely if
+    // even this fails — letting git pull continue with a live hub
+    // would lock vct-hub.exe on Windows and corrupt the update.
+    eprintln!(
+        "[vct] update_orchestrator: vct-hub pid {} did not exit within 10s (polite_attempted={}); escalating to force-kill",
+        pid, polite_attempted
+    );
+
+    #[cfg(unix)]
+    {
+        // SIGKILL. Safe even if the process is in the middle of
+        // exiting (no-op then). i32 cast guarded by pid_is_alive.
+        let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        if rc != 0 {
+            let e = std::io::Error::last_os_error();
+            // ESRCH = process already gone between the alive check and
+            // the kill — that's actually the success path.
+            if e.raw_os_error() != Some(libc::ESRCH) {
+                return Err(format!(
+                    "could not SIGKILL vct-hub pid {}: {} — refusing to proceed with git pull while the hub is alive",
+                    pid, e
+                ));
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, TerminateProcess, PROCESS_TERMINATE,
+        };
+        // SAFETY: thin FFI calls. We close every handle we open.
+        unsafe {
+            let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            if handle.is_null() {
+                // Could be "already dead" (preferred) or "access
+                // denied". Re-check via pid_is_alive to disambiguate.
+                if pid_is_alive(pid) {
+                    return Err(format!(
+                        "OpenProcess(pid={}, TERMINATE) returned NULL and pid still alive: {} — refusing to proceed with git pull",
+                        pid,
+                        std::io::Error::last_os_error()
+                    ));
+                }
+                // else: dead, fall through to lockfile cleanup
+            } else {
+                let ok = TerminateProcess(handle, 1) != 0;
+                let kill_err = if !ok {
+                    Some(std::io::Error::last_os_error())
+                } else {
+                    None
+                };
+                CloseHandle(handle);
+                if let Some(e) = kill_err {
+                    return Err(format!(
+                        "TerminateProcess(pid={}): {} — refusing to proceed with git pull while the hub is alive",
+                        pid, e
+                    ));
+                }
+            }
+        }
+    }
+
+    // Force-killed: clean up the lockfile manually (the hub's normal
+    // graceful-shutdown path didn't get to run).
+    let _ = std::fs::remove_file(&pid_file);
+
+    // Re-confirm the pid is actually gone before declaring success.
+    // Short grace window for the kernel to reap.
+    let deadline2 = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < deadline2 {
+        if !pid_is_alive(pid) {
+            eprintln!(
+                "[vct] update_orchestrator: vct-hub pid {} force-killed; cleared stale {}",
+                pid,
+                pid_file.display()
+            );
+            return Ok(true);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    Err(format!(
+        "vct-hub pid {} is still alive after SIGKILL/TerminateProcess; refusing to proceed with git pull (would lock vct-hub.exe on Windows)",
+        pid
+    ))
+}
+
+/// v0.2.21 Step 12 (B1 fix): rename the running `vct-hub.exe` BEFORE
+/// `git pull` overwrites it.
+///
+/// Windows-only. Mirrors `pre_pull_rename_running_binary` (the
+/// launcher's own self-rename) but targets the sibling `vct-hub.exe`
+/// instead of the launcher's `current_exe()`. We just stopped the hub
+/// in `ensure_hub_stopped_for_update`, so its file handles are gone
+/// from the OS perspective — but on Windows the file is still treated
+/// as in-use briefly after process exit (antivirus, indexers, etc.),
+/// and `git pull`'s atomic-rename semantics will revert the entire
+/// pull on any single sharing violation. Pre-renaming is cheap
+/// insurance.
+///
+/// We look up the hub binary via the same discovery chain
+/// (`hub_launcher::find_hub_binary`) and only rename if the resolved
+/// path lives under `install_path` — externally-installed hubs
+/// (`$HOME/.vct/bin/vct-hub.exe`) are NOT touched by `git pull` so
+/// renaming them would be both pointless and risky.
+///
+/// The renamed file (`vct-hub.exe.old-<pid>`) is cleaned up by the
+/// existing boot sweep in `lib.rs::sweep_stale_binary_siblings` on
+/// next launcher startup — the pid we suffix with is no longer alive,
+/// so the sweep will delete it next boot. Returns the backup path
+/// for the (no-op today, future-proofing) revert path.
+///
+/// Linux / macOS: no-op (inode-ref-count semantics make this
+/// unnecessary).
+#[cfg(windows)]
+fn pre_pull_rename_vct_hub_binary(install_path: &Path) -> Option<PathBuf> {
+    let hub = crate::hub_launcher::find_hub_binary()?;
+    let hub_canon = dunce::canonicalize(&hub).unwrap_or(hub);
+    let install_canon =
+        dunce::canonicalize(install_path).unwrap_or_else(|_| install_path.to_path_buf());
+    if !hub_canon.starts_with(&install_canon) {
+        // External install (e.g. $HOME/.vct/bin/vct-hub.exe). git pull
+        // can't touch it; no need to rename.
+        return None;
+    }
+
+    // Suffix with the LAUNCHER's pid (not the hub's — the hub is
+    // already stopped by now). The boot sweep cleans up `.old-<pid>`
+    // files whose pid is no longer alive; the launcher's own pid will
+    // be dead by next boot since we restart at the end of
+    // update_orchestrator.
+    let pid = std::process::id();
+    let backup_name = format!(
+        "{}.old-{}",
+        hub_canon.file_name()?.to_string_lossy(),
+        pid,
+    );
+    let backup_path = hub_canon.parent()?.join(backup_name);
+
+    match std::fs::rename(&hub_canon, &backup_path) {
+        Ok(()) => {
+            eprintln!(
+                "[vct] update_orchestrator: pre-pull renamed vct-hub binary to {} (Windows). New binary will be written to {} by git pull.",
+                backup_path.display(),
+                hub_canon.display(),
+            );
+            Some(backup_path)
+        }
+        Err(e) => {
+            eprintln!(
+                "[vct] update_orchestrator: pre-pull rename of vct-hub FAILED ({}). git pull may fail with ERROR_SHARING_VIOLATION if the hub binary is still locked. Continuing — the user will see any git error.",
+                e,
+            );
+            None
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn pre_pull_rename_vct_hub_binary(_install_path: &Path) -> Option<PathBuf> {
+    // POSIX kernels: running-binary overwrite is safe; no rename
+    // needed. The hub is already stopped at this point anyway, so
+    // even on Windows the rename is belt-and-braces.
+    None
+}
+
+/// v0.2.21 Step 12 (B1 fix): bring the detached vct-hub back up after
+/// install.py finishes.
+///
+/// Runs `vct-hub --start-if-not-running` and then verifies that the
+/// hub has actually become reachable by reading `<vct_root_dir()>/
+/// hub.port` + `hub.token` and probing `/health`. Poll budget: 30 s
+/// (the hub's cold-start including SQLite migrations + module-scan
+/// can take a few seconds on cold-cache disk).
+///
+/// Soft-fail by design: if the hub can't be brought back up, we DON'T
+/// return Err — that would block the launcher restart path. The user
+/// can manually restart the hub from the GUI's Stop menu (Step 13).
+/// We log a clear warning so the failure surfaces in the launcher log.
+///
+/// The plan calls this contract "best-effort post-update health
+/// check"; the launcher's startup path (`lib.rs::setup` →
+/// `hub_launcher::ensure_hub_running`) will also try to start the
+/// hub when the new launcher process boots, so this function is
+/// primarily an early-warning system.
+fn ensure_hub_started_after_update(_install_path: &Path) -> Result<(), String> {
+    let Some(hub_bin) = crate::hub_launcher::find_hub_binary() else {
+        eprintln!(
+            "[vct] update_orchestrator: vct-hub binary not found on disk after install.py — \
+             leaving hub stopped. Launcher restart will retry the discovery."
+        );
+        return Ok(());
+    };
+
+    eprintln!(
+        "[vct] update_orchestrator: starting vct-hub from {}",
+        hub_bin.display()
+    );
+
+    let mut cmd = std::process::Command::new(&hub_bin);
+    cmd.arg("--start-if-not-running")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    match cmd.status() {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            eprintln!(
+                "[vct] update_orchestrator: vct-hub --start-if-not-running exited {:?}; \
+                 launcher will retry on next startup",
+                status.code()
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            eprintln!(
+                "[vct] update_orchestrator: could not spawn vct-hub --start-if-not-running: {}; \
+                 launcher will retry on next startup",
+                e
+            );
+            return Ok(());
+        }
+    }
+
+    // Poll up to 30 s for hub.port + hub.token to appear and /health
+    // to answer 200. The hub spawns a detached child and returns
+    // quickly; the child does the actual bind + DB migration.
+    let root = vct_launcher_core::paths::vct_root_dir();
+    let port_path = root.join("hub.port");
+    let token_path = root.join("hub.token");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        if port_path.exists() && token_path.exists() {
+            // Both files there — try the /health probe.
+            let port = std::fs::read_to_string(&port_path)
+                .ok()
+                .and_then(|s| s.trim().parse::<u16>().ok());
+            let token = std::fs::read_to_string(&token_path)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            if let (Some(port), Some(token)) = (port, token) {
+                if probe_hub_health(port, &token) {
+                    eprintln!(
+                        "[vct] update_orchestrator: vct-hub /health OK on 127.0.0.1:{}",
+                        port
+                    );
+                    return Ok(());
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+
+    eprintln!(
+        "[vct] update_orchestrator: vct-hub did not become healthy within 30 s; \
+         launcher will start in hub-unavailable degraded mode. \
+         User can retry via Stop menu → 'Start vct-hub'."
+    );
+    Ok(())
+}
+
+/// Best-effort blocking `GET http://127.0.0.1:<port>/health` probe.
+/// Returns true on HTTP 200. Used only by
+/// `ensure_hub_started_after_update`.
+///
+/// Why a hand-rolled TCP+HTTP write rather than `reqwest`: this
+/// function runs from inside a Tauri `#[command]` (so we're on the
+/// async runtime), but we want a tight, dependency-free probe that
+/// doesn't pull blocking-reqwest features. A raw socket read of the
+/// HTTP status line is < 30 lines and has no failure modes worth
+/// surfacing.
+fn probe_hub_health(port: u16, token: &str) -> bool {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    let addr = format!("127.0.0.1:{}", port);
+    let mut stream = match TcpStream::connect_timeout(
+        &match addr.parse() {
+            Ok(a) => a,
+            Err(_) => return false,
+        },
+        std::time::Duration::from_secs(2),
+    ) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
+
+    let request = format!(
+        "GET /health HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+        port, token
+    );
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+
+    // Read the status line. 64 bytes is enough for "HTTP/1.1 200 OK\r\n".
+    let mut buf = [0u8; 64];
+    let n = match stream.read(&mut buf) {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    let head = String::from_utf8_lossy(&buf[..n]);
+    head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.0 200")
+}
+
 /// v0.2.17 (plan 0.0.B): pre-pull rename helper for Windows.
 ///
 /// On Windows, `git pull` fails with ERROR_SHARING_VIOLATION when it
@@ -2710,9 +3170,34 @@ pub async fn update_orchestrator<R: Runtime>(
     // retry (or override via `VCO_UPSTREAM_URL` for self-hosters).
     crate::commands::self_update::ensure_upstream_remote(&install_path).await?;
 
-    // v0.2.17 (plan 0.0.B): Stage 0 — Windows-only pre-pull rename.
-    // No-op on Linux/macOS (returns None).
+    // v0.2.21 Step 12 (B1 fix): Stage 0a — stop the detached vct-hub
+    // BEFORE we even think about renaming binaries or pulling source.
+    // Two reasons:
+    //   1. Windows file-locking: `git pull` reverts the entire pull
+    //      atomically if any file (incl. vct-hub.exe) is in-use.
+    //   2. install.py's post-update deploy writes fresh state files
+    //      and shouldn't race the old hub's open handles.
+    // Hard-fail here if we can't stop the hub — proceeding would
+    // leave the system in a half-updated state.
+    emit_progress(&window, "update", "Stopping vct-hub for update...", 2.0);
+    if let Err(e) = ensure_hub_stopped_for_update(&install_path) {
+        return Err(format!(
+            "Update aborted: could not stop vct-hub before git pull: {}. \
+             Try again, or run `vct-hub --stop` manually.",
+            e
+        ));
+    }
+
+    // v0.2.17 (plan 0.0.B): Stage 0c — Windows-only pre-pull rename
+    // of the running launcher binary. No-op on Linux/macOS.
     emit_progress(&window, "update", "Preparing for update...", 5.0);
+    // v0.2.21 Step 12: Stage 0b — Windows-only pre-pull rename of the
+    // vct-hub binary (sibling of the launcher in the install tree).
+    // Belt-and-braces: we already stopped the hub above, but Windows
+    // can briefly retain a sharing-violation flag after process exit
+    // (antivirus, indexers). Renaming aside makes git pull's atomic
+    // rename succeed unconditionally. No-op on POSIX.
+    let pre_pull_renamed_hub = pre_pull_rename_vct_hub_binary(&install_path);
     let pre_pull_renamed = pre_pull_rename_running_binary(&install_path);
 
     // Stage 1: Pull latest
@@ -2761,6 +3246,13 @@ pub async fn update_orchestrator<R: Runtime>(
         if let Some(backup) = pre_pull_renamed.as_deref() {
             revert_pre_pull_rename(backup);
         }
+        // v0.2.21 Step 12: also revert the hub-binary rename so the
+        // canonical path holds the working hub binary. Then attempt
+        // to restart the hub since we stopped it pre-pull.
+        if let Some(backup) = pre_pull_renamed_hub.as_deref() {
+            revert_pre_pull_rename(backup);
+        }
+        let _ = ensure_hub_started_after_update(&install_path);
         return Err(format!("git pull failed: {}", stderr));
     }
 
@@ -2773,6 +3265,13 @@ pub async fn update_orchestrator<R: Runtime>(
         if let Some(backup) = pre_pull_renamed.as_deref() {
             revert_pre_pull_rename(backup);
         }
+        // v0.2.21 Step 12: same for the hub binary, then bring it
+        // back up — we stopped it pre-pull but nothing has changed
+        // on disk, so the existing binary will start cleanly.
+        if let Some(backup) = pre_pull_renamed_hub.as_deref() {
+            revert_pre_pull_rename(backup);
+        }
+        let _ = ensure_hub_started_after_update(&install_path);
         return Ok(InstallResult {
             success: true,
             install_path: path,
@@ -2824,7 +3323,31 @@ pub async fn update_orchestrator<R: Runtime>(
         if let Some(backup) = pre_pull_renamed.as_deref() {
             revert_pre_pull_rename(backup);
         }
+        // v0.2.21 Step 12: same for the hub binary, then attempt to
+        // bring the hub back up so the user isn't left without it.
+        // install.py failed AFTER git pull succeeded, so the on-disk
+        // vct-hub may be the new version — the launcher's discovery
+        // chain will still find it via find_hub_binary().
+        if let Some(backup) = pre_pull_renamed_hub.as_deref() {
+            revert_pre_pull_rename(backup);
+        }
+        let _ = ensure_hub_started_after_update(&install_path);
         return Err(format!("Update failed: {}", stderr));
+    }
+
+    // v0.2.21 Step 12 (B1 fix): Stage 3 — bring the detached vct-hub
+    // back up BEFORE we restart the launcher. Soft-fail: the launcher
+    // restart path itself also calls `hub_launcher::ensure_hub_running`
+    // on boot, so this is mainly an early-warning probe + a way to
+    // surface "hub started, /health passed" in the GUI progress
+    // banner before the restart blackout.
+    emit_progress(&window, "update", "Starting vct-hub...", 90.0);
+    if let Err(e) = ensure_hub_started_after_update(&install_path) {
+        eprintln!(
+            "[vct] update_orchestrator: ensure_hub_started_after_update returned Err({}); \
+             continuing with launcher restart (hub will retry on next boot)",
+            e
+        );
     }
 
     emit_progress(
@@ -9120,6 +9643,192 @@ MemAvailable:   23456789 kB
             let cfg: InstallConfig = serde_json::from_value(json_full).unwrap();
             assert!(cfg.lightweight);
             assert_eq!(cfg.lightweight_old_path.as_deref(), Some("/old/path"));
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // v0.2.21 Step 12: ensure_hub_stopped_for_update — pure-logic tests
+    //
+    // These exercise the early-exit branches that DON'T require an
+    // actual running vct-hub binary:
+    //   1. No hub.pid file present → Ok(false).
+    //   2. Malformed pid contents → cleanup + Ok(false).
+    //   3. Pid present but already dead → cleanup + Ok(false).
+    //
+    // The "live hub gets gracefully stopped" path needs a real
+    // vct-hub binary running and is covered by Step 23 integration
+    // tests, not here.
+    //
+    // VCT_STATE_DIR is process-wide; serialise with a Mutex so
+    // parallel `cargo test` runs don't observe each other.
+    // ------------------------------------------------------------------
+    mod hub_stop_tests {
+        use super::super::*;
+        use std::sync::Mutex;
+
+        static SERIALIZE: Mutex<()> = Mutex::new(());
+
+        /// Set VCT_STATE_DIR to a tempdir for the duration of `f`,
+        /// restoring whatever was there before. Locks SERIALIZE so
+        /// tests can't race on the env var.
+        fn with_vct_state_dir<F: FnOnce(&Path)>(f: F) {
+            let _g = SERIALIZE.lock().unwrap_or_else(|p| p.into_inner());
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let prev = std::env::var_os("VCT_STATE_DIR");
+            unsafe {
+                std::env::set_var("VCT_STATE_DIR", tmp.path());
+            }
+            f(tmp.path());
+            unsafe {
+                match prev {
+                    Some(v) => std::env::set_var("VCT_STATE_DIR", v),
+                    None => std::env::remove_var("VCT_STATE_DIR"),
+                }
+            }
+        }
+
+        #[test]
+        fn ensure_hub_stopped_returns_false_when_no_pid_file() {
+            with_vct_state_dir(|root| {
+                // No hub.pid in the state dir at all.
+                let install_path = root.join("install");
+                std::fs::create_dir_all(&install_path).unwrap();
+                let result = ensure_hub_stopped_for_update(&install_path);
+                assert!(matches!(result, Ok(false)),
+                    "no hub.pid → Ok(false), got {:?}", result);
+            });
+        }
+
+        #[test]
+        fn ensure_hub_stopped_cleans_up_malformed_pid_file() {
+            with_vct_state_dir(|root| {
+                let pid_file = root.join("hub.pid");
+                std::fs::write(&pid_file, "not-a-number\n").unwrap();
+                assert!(pid_file.exists());
+
+                let install_path = root.join("install");
+                std::fs::create_dir_all(&install_path).unwrap();
+
+                let result = ensure_hub_stopped_for_update(&install_path);
+                assert!(matches!(result, Ok(false)),
+                    "malformed pid → Ok(false), got {:?}", result);
+                assert!(!pid_file.exists(),
+                    "malformed hub.pid should be removed");
+            });
+        }
+
+        #[test]
+        fn ensure_hub_stopped_cleans_up_stale_dead_pid() {
+            with_vct_state_dir(|root| {
+                // Spawn + reap a process so we have a pid that's
+                // provably dead. Same pattern as
+                // vct_launcher_core::process::tests.
+                #[cfg(unix)]
+                let mut child = std::process::Command::new("true")
+                    .spawn()
+                    .expect("spawn true");
+                #[cfg(windows)]
+                let mut child = std::process::Command::new("cmd")
+                    .args(["/c", "exit"])
+                    .spawn()
+                    .expect("spawn cmd /c exit");
+                let dead_pid = child.id();
+                let _ = child.wait();
+                // Brief grace window for the kernel to actually reap
+                // the zombie — same heuristic as the core tests.
+                std::thread::sleep(std::time::Duration::from_millis(50));
+
+                let pid_file = root.join("hub.pid");
+                std::fs::write(&pid_file, format!("{}\n", dead_pid)).unwrap();
+                assert!(pid_file.exists());
+
+                let install_path = root.join("install");
+                std::fs::create_dir_all(&install_path).unwrap();
+
+                let result = ensure_hub_stopped_for_update(&install_path);
+                assert!(matches!(result, Ok(false)),
+                    "stale dead pid → Ok(false), got {:?}", result);
+                assert!(!pid_file.exists(),
+                    "stale hub.pid for dead pid should be cleaned up");
+            });
+        }
+
+        #[test]
+        fn ensure_hub_stopped_handles_pid_zero_as_dead() {
+            // pid 0 is a POSIX sentinel that pid_is_alive() rejects
+            // up-front. The helper should treat it as "stale lockfile"
+            // and remove the file rather than blocking forever.
+            with_vct_state_dir(|root| {
+                let pid_file = root.join("hub.pid");
+                std::fs::write(&pid_file, "0\n").unwrap();
+
+                let install_path = root.join("install");
+                std::fs::create_dir_all(&install_path).unwrap();
+
+                let result = ensure_hub_stopped_for_update(&install_path);
+                assert!(matches!(result, Ok(false)),
+                    "pid 0 → Ok(false), got {:?}", result);
+                assert!(!pid_file.exists(),
+                    "hub.pid with sentinel pid 0 should be cleaned up");
+            });
+        }
+
+        #[test]
+        fn ensure_hub_stopped_handles_empty_pid_file() {
+            with_vct_state_dir(|root| {
+                let pid_file = root.join("hub.pid");
+                std::fs::write(&pid_file, "").unwrap();
+
+                let install_path = root.join("install");
+                std::fs::create_dir_all(&install_path).unwrap();
+
+                let result = ensure_hub_stopped_for_update(&install_path);
+                assert!(matches!(result, Ok(false)),
+                    "empty pid file → Ok(false), got {:?}", result);
+                assert!(!pid_file.exists(),
+                    "empty hub.pid should be cleaned up as malformed");
+            });
+        }
+
+        #[test]
+        fn ensure_hub_started_after_update_is_soft_fail_when_no_binary() {
+            // No vct-hub binary anywhere → returns Ok(()), prints a
+            // warning. The launcher's own boot path will retry.
+            with_vct_state_dir(|_root| {
+                let prev_bin = std::env::var_os("VCT_HUB_BIN");
+                let prev_path = std::env::var_os("PATH");
+                let prev_home = std::env::var_os("HOME");
+                let prev_profile = std::env::var_os("USERPROFILE");
+                unsafe {
+                    std::env::set_var("VCT_HUB_BIN", "/nonexistent/vct-hub");
+                    std::env::set_var("PATH", "/nonexistent-dir");
+                    std::env::set_var("HOME", "/nonexistent-home");
+                    std::env::set_var("USERPROFILE", "/nonexistent-profile");
+                }
+                let install_path = std::env::temp_dir();
+                let result = ensure_hub_started_after_update(&install_path);
+                assert!(result.is_ok(),
+                    "missing binary should soft-fail to Ok(()), got {:?}",
+                    result);
+                unsafe {
+                    match prev_bin {
+                        Some(v) => std::env::set_var("VCT_HUB_BIN", v),
+                        None => std::env::remove_var("VCT_HUB_BIN"),
+                    }
+                    match prev_path {
+                        Some(v) => std::env::set_var("PATH", v),
+                        None => std::env::remove_var("PATH"),
+                    }
+                    match prev_home {
+                        Some(v) => std::env::set_var("HOME", v),
+                        None => std::env::remove_var("HOME"),
+                    }
+                    match prev_profile {
+                        Some(v) => std::env::set_var("USERPROFILE", v),
+                        None => std::env::remove_var("USERPROFILE"),
+                    }
+                }
+            });
         }
     }
 }
