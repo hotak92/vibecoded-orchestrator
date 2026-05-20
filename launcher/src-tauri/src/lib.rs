@@ -728,21 +728,71 @@ pub fn run() {
             //
             // v0.2.21 W2 cutover guard: when install.py is mid-cutover
             // (writing `<vct_root_dir>/v0.2.21-cutover.flag` BEFORE it
-            // starts vct-hub), skip the embedded watcher startup —
-            // vct-hub's supervisor will take over service-health
-            // polling. install.py deletes the sentinel after vct-hub
-            // responds to /health (typically <5 s). A leftover
-            // sentinel on a steady-state boot (vct-hub already running
-            // and healthy via hub_launcher::ensure_hub_running above)
-            // is harmless: the launcher-side watcher stays disabled
-            // and the hub-side supervisor handles auto-restart. If
-            // the sentinel is present AND the hub is missing, the
-            // launcher comes up in degraded mode (resolver falls back
-            // to env vars; no auto-restart) which matches the
-            // "hub-unavailable" path's existing contract.
-            let cutover_sentinel_present = paths::vct_root_dir()
-                .join("v0.2.21-cutover.flag")
-                .is_file();
+            // starts vct-hub), skip the embedded watcher startup so
+            // the old in-launcher watcher doesn't race the about-to-
+            // run new install for the same containers. install.py
+            // deletes the sentinel after vct-hub responds to /health
+            // (typically <5 s).
+            //
+            // Step 25 (Reviewer B HIGH-doc fix, 2026-05-20): IMPORTANT
+            // CORRECTION to the prior version of this comment. v0.2.21
+            // does NOT relocate the SERVICES supervisor to vct-hub —
+            // only Stream B's MODULE supervisor moved (Step 24, see
+            // vct-hub/src/module_supervisor.rs). The services-watcher
+            // logic still lives in `crate::services::watcher` here in
+            // the launcher; vct-hub/src/lifecycle_api.rs:1-30 says so
+            // explicitly. Therefore:
+            //
+            //   * Steady-state (sentinel deleted within ~1 s of /health
+            //     response): no issue. Launcher's watcher runs as before.
+            //   * install.py /health timeout (10 s) leaves the sentinel
+            //     in place: the launcher skips watcher startup AND no
+            //     hub-side services supervisor runs (it's a 501 stub
+            //     until v0.2.22+). Services WILL NOT AUTO-RESTART until
+            //     the user intervenes (delete the sentinel manually, or
+            //     re-run install.py which overwrites it idempotently
+            //     and deletes after success).
+            //   * To bound that failure mode, we auto-delete the
+            //     sentinel below if it's older than 60 seconds AND
+            //     vct-hub is reachable (probed via the hub_launcher
+            //     discovery chain) — at that point we know install.py
+            //     long finished and the cutover is in steady state, so
+            //     the sentinel is stale.
+            //
+            // The 60 s threshold is a compromise: long enough for a
+            // genuine cutover (even a slow install.py /health probe
+            // budget is 10 s; doubling to 60 s gives headroom for slow
+            // disks / slow Weaviate boot under contention), short
+            // enough that a user who manually killed install.py mid-
+            // run doesn't lose services-watcher for hours.
+            let sentinel_path = paths::vct_root_dir().join("v0.2.21-cutover.flag");
+            let mut cutover_sentinel_present = sentinel_path.is_file();
+            if cutover_sentinel_present {
+                // Stale-sentinel auto-delete: if the sentinel is older
+                // than 60 s AND vct-hub already running, install.py
+                // either timed out or was killed mid-cutover. Delete
+                // the sentinel and unset the flag so the watcher takes
+                // over instead of leaving services unsupervised.
+                let stale = std::fs::metadata(&sentinel_path)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|m| m.elapsed().ok())
+                    .map(|d| d.as_secs() >= 60)
+                    .unwrap_or(false);
+                let hub_reachable = matches!(
+                    hub_status::probe(),
+                    hub_status::HubStatus::Running { .. }
+                );
+                if stale && hub_reachable {
+                    eprintln!(
+                        "[vct] v0.2.21 stale cutover sentinel (older than 60s + \
+                         hub already running); auto-deleting and starting \
+                         embedded services-watcher"
+                    );
+                    let _ = std::fs::remove_file(&sentinel_path);
+                    cutover_sentinel_present = false;
+                }
+            }
             if cutover_sentinel_present {
                 eprintln!(
                     "[vct] v0.2.21 cutover sentinel detected at \
