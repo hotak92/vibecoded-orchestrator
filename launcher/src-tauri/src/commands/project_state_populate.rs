@@ -1588,6 +1588,221 @@ mod tests {
         std::fs::remove_dir_all(&folder).ok();
     }
 
+    // ─── CLAUDE.md Dev Constraint #8(a) regression pin ──────────────
+    //
+    // Multi-row breadth test: when a user disables MULTIPLE rows across
+    // ALL THREE shapes (agents, skills, hooks) and the populate helper
+    // runs a second time (the install-bundle --update launcher flow
+    // re-hits this code path on the next launcher boot for un-seeded
+    // projects + the orchestrator-root ensure_orchestrator_root path
+    // calls it on every boot), every disabled row must remain disabled,
+    // AND no other row may have been incidentally flipped from enabled
+    // to disabled (or vice-versa).
+    //
+    // The pre-existing single-row tests
+    // (`re_run_preserves_user_disabled_flag_for_{agents,skills,hooks}`)
+    // each cover one shape with one disabled row. This test pins the
+    // contract for the realistic multi-row case the user runs into
+    // (disable several agents they don't use + a couple skills + one
+    // hook they don't want firing) and confirms the populate pass is
+    // surgical, not bulk-resetting.
+    //
+    // Why this is the right pin for #8(a): the constraint says
+    // "user-editable settings survive every update path". The
+    // population path uses SQL `ON CONFLICT DO UPDATE SET` clauses
+    // that intentionally omit the `enabled` column (agents/skills/hooks
+    // share that pattern via `register_project_*` in
+    // `db/project_state.rs`). If a future refactor adds `enabled =
+    // excluded.enabled` to any of those upserts, this test catches it.
+    #[test]
+    fn re_run_preserves_3_agents_2_skills_1_hook_disabled_together() {
+        let folder = scratch_dir("preserve-multi");
+        let claude = folder.join(".claude");
+        let agents_dir = claude.join("agents");
+        let skills_dir = claude.join("skills");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::create_dir_all(&skills_dir).unwrap();
+
+        // 5 agents — we'll disable 3, leave 2 enabled. Names mirror real
+        // bundled agent files (coder.md, planner.md, tester.md, reviewer.md,
+        // architect.md ship in templates/agents/).
+        for n in &["coder", "planner", "tester", "reviewer", "architect"] {
+            write_agent_file(
+                &agents_dir,
+                &format!("{}.md", n),
+                &format!("name: {}\nmodel: sonnet", n),
+                "# body",
+            );
+        }
+        // 4 skills — we'll disable 2, leave 2 enabled. Names mirror real
+        // bundled skills (tdd, architect, fix-issue, context).
+        for n in &["tdd", "architect", "fix-issue", "context"] {
+            write_skill_dir(&skills_dir, n, &format!("name: {}\nmodel: sonnet", n));
+        }
+        // 3 hooks — we'll disable 1, leave 2 enabled. The matcher+command
+        // combo uniquely identifies the row (UNIQUE on
+        // project_id/event/matcher/command).
+        std::fs::write(
+            claude.join("settings.json"),
+            serde_json::json!({
+                "hooks": {
+                    "PostToolUse": [
+                        {"matcher": "Edit(*)",  "hooks": [{"type": "command", "command": "hook-edit"}]},
+                        {"matcher": "Write(*)", "hooks": [{"type": "command", "command": "hook-write"}]}
+                    ],
+                    "PreToolUse": [
+                        {"matcher": "*", "hooks": [{"type": "command", "command": "hook-pre"}]}
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let db = make_db_with_project("p1", "MultiPreserve");
+
+        // First populate — establish baseline.
+        let r1 = populate_project_state_from_filesystem(
+            "p1",
+            "MultiPreserve",
+            &folder,
+            &db,
+        );
+        assert_eq!(r1.agents_inserted, 5, "baseline: 5 agents seeded");
+        assert_eq!(r1.skills_inserted, 4, "baseline: 4 skills seeded");
+        assert_eq!(r1.hooks_inserted, 3, "baseline: 3 hooks seeded");
+
+        // User disables 3 agents, 2 skills, 1 hook via the GUI / DB.
+        const DISABLED_AGENTS: [&str; 3] = ["coder", "tester", "architect"];
+        const DISABLED_SKILLS: [&str; 2] = ["tdd", "context"];
+        for a in &DISABLED_AGENTS {
+            db.set_project_agent_enabled("p1", a, false).unwrap();
+        }
+        for s in &DISABLED_SKILLS {
+            db.set_project_skill_enabled("p1", s, false).unwrap();
+        }
+        // For hooks the API takes the id, not the name — look it up.
+        let pre_hooks = db.list_project_hooks("p1").unwrap();
+        let disabled_hook = pre_hooks
+            .iter()
+            .find(|h| h.command == "hook-pre")
+            .expect("hook-pre seeded");
+        db.set_project_hook_enabled(disabled_hook.id, false).unwrap();
+        let disabled_hook_id = disabled_hook.id;
+
+        // Sanity snapshot pre-second-populate.
+        let pre_agents = db.list_project_agents("p1").unwrap();
+        let pre_skills = db.list_project_skills("p1").unwrap();
+        let pre_hooks = db.list_project_hooks("p1").unwrap();
+        assert_eq!(
+            pre_agents.iter().filter(|a| !a.enabled).count(),
+            3,
+            "pre: exactly 3 agents disabled"
+        );
+        assert_eq!(
+            pre_skills.iter().filter(|s| !s.enabled).count(),
+            2,
+            "pre: exactly 2 skills disabled"
+        );
+        assert_eq!(
+            pre_hooks.iter().filter(|h| !h.enabled).count(),
+            1,
+            "pre: exactly 1 hook disabled"
+        );
+
+        // Second populate — same on-disk filesystem, simulating the next
+        // launcher boot's populate sweep OR the orchestrator-root
+        // ensure_orchestrator_root call.
+        let r2 = populate_project_state_from_filesystem(
+            "p1",
+            "MultiPreserve",
+            &folder,
+            &db,
+        );
+        // Re-run reports hits because the upsert touches every row, but
+        // the disabled flag must not have been clobbered. The exact
+        // *_inserted counts include re-upsert hits in the underlying
+        // helpers; we don't pin them here — the contract under test is
+        // toggle preservation, not insert tallies.
+        let _ = r2; // warnings are non-fatal; we don't assert on them.
+
+        // ─── Contract pins ────────────────────────────────────────────
+        // a) The 3 disabled agents are STILL disabled.
+        let post_agents = db.list_project_agents("p1").unwrap();
+        assert_eq!(post_agents.len(), 5, "agent row count unchanged");
+        for name in &DISABLED_AGENTS {
+            let row = post_agents
+                .iter()
+                .find(|a| a.agent_name == *name)
+                .unwrap_or_else(|| panic!("agent {} must still exist", name));
+            assert!(
+                !row.enabled,
+                "agent {} must remain disabled after re-populate, got enabled={}",
+                name, row.enabled
+            );
+        }
+        // b) The 2 OTHER agents stayed enabled (no incidental flip).
+        for row in &post_agents {
+            if !DISABLED_AGENTS.contains(&row.agent_name.as_str()) {
+                assert!(
+                    row.enabled,
+                    "agent {} must remain enabled (was not in disabled set)",
+                    row.agent_name
+                );
+            }
+        }
+
+        // c) The 2 disabled skills are STILL disabled.
+        let post_skills = db.list_project_skills("p1").unwrap();
+        assert_eq!(post_skills.len(), 4, "skill row count unchanged");
+        for name in &DISABLED_SKILLS {
+            let row = post_skills
+                .iter()
+                .find(|s| s.skill_name == *name)
+                .unwrap_or_else(|| panic!("skill {} must still exist", name));
+            assert!(
+                !row.enabled,
+                "skill {} must remain disabled after re-populate, got enabled={}",
+                name, row.enabled
+            );
+        }
+        // d) The 2 OTHER skills stayed enabled.
+        for row in &post_skills {
+            if !DISABLED_SKILLS.contains(&row.skill_name.as_str()) {
+                assert!(
+                    row.enabled,
+                    "skill {} must remain enabled (was not in disabled set)",
+                    row.skill_name
+                );
+            }
+        }
+
+        // e) The 1 disabled hook is STILL disabled.
+        let post_hooks = db.list_project_hooks("p1").unwrap();
+        assert_eq!(post_hooks.len(), 3, "hook row count unchanged");
+        let post_disabled_hook = post_hooks
+            .iter()
+            .find(|h| h.id == disabled_hook_id)
+            .expect("originally-disabled hook id must still exist");
+        assert!(
+            !post_disabled_hook.enabled,
+            "hook id {} must remain disabled (command=hook-pre)",
+            disabled_hook_id
+        );
+        // f) The 2 OTHER hooks stayed enabled.
+        for row in &post_hooks {
+            if row.id != disabled_hook_id {
+                assert!(
+                    row.enabled,
+                    "hook id {} (command={}) must remain enabled",
+                    row.id, row.command
+                );
+            }
+        }
+
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
     #[test]
     fn re_run_preserves_codegraph_enabled_flag() {
         // The codegraph binding's UPSERT-on-conflict would clobber the

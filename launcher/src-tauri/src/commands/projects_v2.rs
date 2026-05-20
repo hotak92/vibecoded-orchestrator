@@ -6400,6 +6400,281 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
+    // ─── CLAUDE.md Dev Constraint #8(a) regression pin (integration) ──
+    //
+    // End-to-end pin: a user disables 3 agents + 2 skills + 1 hook on a
+    // project, then `python -m vco_lib.project_init install-bundle
+    // --update` runs against that project (the launcher's "Update
+    // bundle" button path — Tauri command `update_project_v2` ->
+    // `run_install_bundle_update`), then `populate_project_state_from_
+    // filesystem` is invoked again (mirrors the next launcher boot's
+    // re-populate sweep). The 6 disabled toggles must STILL be set to 0.
+    //
+    // Why both subprocess + populate steps: the Python install-bundle
+    // path is purely filesystem work — it never touches launcher.db. The
+    // DB toggles survive trivially across an install-bundle run because
+    // install-bundle doesn't know they exist. The risk vector for
+    // toggle loss is the populate sweep AFTER an install-bundle: if
+    // install-bundle adds/changes a file (a new agent, a new hook in
+    // settings.json), the subsequent populate re-upserts every row.
+    // Constraint #8(a) demands the populate upserts omit the `enabled`
+    // column, so toggles survive. This test exercises both halves:
+    // populate writes baseline → user disables → install-bundle copies
+    // (possibly mutated) files → populate re-upserts → toggles intact.
+    //
+    // Counterpart pure-populate test:
+    // `project_state_populate.rs::re_run_preserves_3_agents_2_skills_1_hook_disabled_together`
+    // (faster, no subprocess). This file's test pins the full launcher
+    // flow with Python in the loop.
+    #[test]
+    fn install_bundle_update_then_populate_preserves_multiple_toggles() {
+        let Some(py) = pick_python() else {
+            eprintln!("[skip] no python on PATH");
+            return;
+        };
+        let real_root = real_repo_root();
+        let tmp = std::env::temp_dir().join(format!(
+            "vct-preserve-toggles-{}", uuid::Uuid::new_v4().simple()
+        ));
+        let fake_orch = tmp.join("orch");
+        let proj = tmp.join("proj");
+        std::fs::create_dir_all(&fake_orch).unwrap();
+        std::fs::create_dir_all(&proj).unwrap();
+        make_fake_orchestrator(&fake_orch);
+
+        // Beef up the fake orchestrator's templates so populate has
+        // enough rows to disable across (the default fake ships 1 agent
+        // + 1 skill; we need 5 agents + 4 skills + 3 hooks).
+        let agents_free = fake_orch
+            .join("templates").join("agents").join("free");
+        for n in &["coder", "planner", "tester", "reviewer", "architect"] {
+            std::fs::write(
+                agents_free.join(format!("{}.md", n)),
+                format!("---\nname: {}\nmodel: sonnet\n---\n# body\n", n),
+            )
+            .unwrap();
+        }
+        let skills = fake_orch.join("templates").join("skills");
+        for n in &["tdd", "fix-issue", "context", "architect"] {
+            let d = skills.join(n);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(
+                d.join("SKILL.md"),
+                format!("---\nname: {}\nmodel: sonnet\n---\n# {}\n", n, n),
+            )
+            .unwrap();
+        }
+        // Settings template with 3 hooks across 2 events.
+        let settings = serde_json::json!({
+            "$schema": "test",
+            "permissions": {"allow": ["Bash"]},
+            "hooks": {
+                "PostToolUse": [
+                    {"matcher": "Edit(*)",  "hooks": [{"type": "command", "command": "hook-edit"}]},
+                    {"matcher": "Write(*)", "hooks": [{"type": "command", "command": "hook-write"}]}
+                ],
+                "PreToolUse": [
+                    {"matcher": "*", "hooks": [{"type": "command", "command": "hook-pre"}]}
+                ]
+            }
+        });
+        let settings_str = serde_json::to_string_pretty(&settings).unwrap();
+        std::fs::write(
+            fake_orch.join("templates").join("settings.json.linux.template"),
+            &settings_str,
+        ).unwrap();
+        std::fs::write(
+            fake_orch.join("templates").join("settings.json.windows.template"),
+            &settings_str,
+        ).unwrap();
+
+        // Step 1: seed the project via install-bundle (first install).
+        let out_seed = std::process::Command::new(&py)
+            .args([
+                "-m", "vco_lib.project_init", "install-bundle",
+                "--folder", &proj.to_string_lossy(),
+                "--orchestrator-root", &fake_orch.to_string_lossy(),
+                "--json",
+            ])
+            .current_dir(&real_root)
+            .output()
+            .expect("seed subprocess failed to start");
+        assert!(
+            out_seed.status.success(),
+            "seed install-bundle must succeed: stderr={}",
+            String::from_utf8_lossy(&out_seed.stderr)
+        );
+        // Confirm the bundle files landed.
+        assert!(proj.join(".claude").join("agents").join("free").join("coder.md").exists()
+                || proj.join(".claude").join("agents").join("coder.md").exists(),
+                "coder.md must land in project's .claude/agents tree");
+
+        // Step 2: open an in-memory DB, seed the project row, populate baseline.
+        let db = crate::db::Db::open_in_memory().expect("in-memory db");
+        let slug = db.generate_unique_slug("MultiPreserve").unwrap();
+        let project_id = uuid::Uuid::new_v4().to_string();
+        db.insert_project(
+            &project_id,
+            "MultiPreserve",
+            proj.to_string_lossy().as_ref(),
+            ProjectHost::Base,
+            &slug,
+        ).unwrap();
+
+        let r1 = crate::commands::project_state_populate::
+            populate_project_state_from_filesystem(
+                &project_id, "MultiPreserve", &proj, &db,
+            );
+        // We need ≥5 agents, ≥4 skills, ≥3 hooks for the multi-disable
+        // breadth to be exercisable. Allow >= because the
+        // install-bundle path can ship more than what we wrote (free
+        // tier may include _lib/, etc.).
+        assert!(
+            r1.agents_inserted >= 5,
+            "baseline: ≥5 agents seeded by populate; got {}",
+            r1.agents_inserted
+        );
+        assert!(
+            r1.skills_inserted >= 4,
+            "baseline: ≥4 skills seeded by populate; got {}",
+            r1.skills_inserted
+        );
+        assert!(
+            r1.hooks_inserted >= 3,
+            "baseline: ≥3 hooks seeded by populate; got {}",
+            r1.hooks_inserted
+        );
+
+        // Step 3: user disables 3 agents + 2 skills + 1 hook.
+        const DISABLED_AGENTS: [&str; 3] = ["coder", "tester", "architect"];
+        const DISABLED_SKILLS: [&str; 2] = ["tdd", "context"];
+        for a in &DISABLED_AGENTS {
+            db.set_project_agent_enabled(&project_id, a, false).unwrap();
+        }
+        for s in &DISABLED_SKILLS {
+            db.set_project_skill_enabled(&project_id, s, false).unwrap();
+        }
+        let pre_hooks = db.list_project_hooks(&project_id).unwrap();
+        let target_hook = pre_hooks
+            .iter()
+            .find(|h| h.command == "hook-pre")
+            .expect("hook-pre must be seeded");
+        let disabled_hook_id = target_hook.id;
+        db.set_project_hook_enabled(disabled_hook_id, false).unwrap();
+
+        // Step 4: bump a template (forces install-bundle --update into
+        // a non-noop classification on at least one file). Plus add a
+        // brand-new shipped file so `--update` has visible work to do.
+        let coder_path = fake_orch.join("templates").join("agents")
+            .join("free").join("coder.md");
+        std::fs::write(
+            &coder_path,
+            "---\nname: coder\nmodel: sonnet\ndescription: v2-coder\n---\n# v2\n",
+        ).unwrap();
+
+        // Step 5: run install-bundle --update against the project. This
+        // is the exact subprocess the launcher's update_project_v2
+        // command spawns via run_install_bundle_update. We pass --force
+        // so user-modified detection doesn't matter — the test cares
+        // about toggle preservation, not user-modified semantics.
+        let out_upd = std::process::Command::new(&py)
+            .args([
+                "-m", "vco_lib.project_init", "install-bundle",
+                "--folder", &proj.to_string_lossy(),
+                "--orchestrator-root", &fake_orch.to_string_lossy(),
+                "--update", "--force", "--json",
+            ])
+            .current_dir(&real_root)
+            .output()
+            .expect("update subprocess failed to start");
+        assert!(
+            out_upd.status.success(),
+            "install-bundle --update must succeed: stderr={}",
+            String::from_utf8_lossy(&out_upd.stderr)
+        );
+
+        // Step 6: re-run populate. Mirrors the next launcher boot's
+        // re-populate sweep (lib.rs lines ~553-610) — which is when
+        // toggle preservation actually has to hold under a real flow.
+        let _r2 = crate::commands::project_state_populate::
+            populate_project_state_from_filesystem(
+                &project_id, "MultiPreserve", &proj, &db,
+            );
+
+        // ─── Contract pins: every disabled toggle survives ────────────
+        let post_agents = db.list_project_agents(&project_id).unwrap();
+        for name in &DISABLED_AGENTS {
+            let row = post_agents
+                .iter()
+                .find(|a| a.agent_name == *name)
+                .unwrap_or_else(|| panic!(
+                    "agent {} must still exist after install-bundle+populate; \
+                     present: {:?}",
+                    name,
+                    post_agents.iter().map(|a| &a.agent_name).collect::<Vec<_>>()
+                ));
+            assert!(
+                !row.enabled,
+                "agent {} must remain disabled across install-bundle --update + re-populate",
+                name
+            );
+        }
+        // Other agents stay enabled.
+        for row in &post_agents {
+            if !DISABLED_AGENTS.contains(&row.agent_name.as_str()) {
+                assert!(
+                    row.enabled,
+                    "agent {} must remain enabled (was not disabled by user)",
+                    row.agent_name
+                );
+            }
+        }
+
+        let post_skills = db.list_project_skills(&project_id).unwrap();
+        for name in &DISABLED_SKILLS {
+            let row = post_skills
+                .iter()
+                .find(|s| s.skill_name == *name)
+                .unwrap_or_else(|| panic!("skill {} must still exist", name));
+            assert!(
+                !row.enabled,
+                "skill {} must remain disabled across install-bundle --update + re-populate",
+                name
+            );
+        }
+        for row in &post_skills {
+            if !DISABLED_SKILLS.contains(&row.skill_name.as_str()) {
+                assert!(
+                    row.enabled,
+                    "skill {} must remain enabled (was not disabled by user)",
+                    row.skill_name
+                );
+            }
+        }
+
+        let post_hooks = db.list_project_hooks(&project_id).unwrap();
+        let post_disabled_hook = post_hooks
+            .iter()
+            .find(|h| h.id == disabled_hook_id)
+            .expect("originally-disabled hook id must still exist");
+        assert!(
+            !post_disabled_hook.enabled,
+            "hook id {} (command={}) must remain disabled across install-bundle --update + re-populate",
+            disabled_hook_id, post_disabled_hook.command
+        );
+        for row in &post_hooks {
+            if row.id != disabled_hook_id {
+                assert!(
+                    row.enabled,
+                    "hook id {} (command={}) must remain enabled",
+                    row.id, row.command
+                );
+            }
+        }
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
     // ─── PR-3 Commit 8: deep-merge + .claude/env BEGIN/END marker tests ─
 
     #[test]
