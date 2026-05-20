@@ -4331,6 +4331,25 @@ def main():
 
     parser.add_argument('repo_path', type=Path, help='Path to repository to analyze')
     parser.add_argument('--project', '-p', type=str, help='Project name (default: repo directory name)')
+    # v0.2.21 Step 20: read the collection prefix from the running hub
+    # rather than deriving it locally from --project or the CWD. When
+    # this flag is set, the analyzer queries the resolver for
+    # `code_graph_project` / `code_graph_collection_prefix` so its
+    # output collections match exactly what consumers see via the
+    # resolver. Soft-fail: if the resolver is unreachable, we fall
+    # back to the existing --project / repo-dir-name logic with a
+    # stderr warning. Mutually exclusive with --project: pass one or
+    # the other, never both.
+    parser.add_argument(
+        '--from-resolver',
+        action='store_true',
+        help=(
+            'Query the vct-hub resolver for code_graph_project / '
+            'collection_prefix (uses the project at repo_path). Mutually '
+            'exclusive with --project. Falls back to repo-dir-name if '
+            'hub unreachable.'
+        ),
+    )
     parser.add_argument('--language', '-l', type=str,
                        choices=['python', 'lua', 'cpp', 'javascript', 'typescript',
                                 'go', 'rust', 'java', 'ruby', 'shell', 'csharp', 'proto'],
@@ -4399,8 +4418,60 @@ def main():
         print(f"❌ Repository path does not exist: {repo_path}", file=sys.stderr)
         return 1
 
-    # Determine project name
-    project_name = args.project or repo_path.name
+    # v0.2.21 Step 20 — analyzer harmonization. The collection prefix
+    # the analyzer writes to MUST match what consumers see via the
+    # resolver, otherwise hooks query the wrong collection on every
+    # Edit. Three sources of truth, in priority order:
+    #   1. --from-resolver: ask the hub for code_graph_project. The
+    #      resolver consults the project's project_codegraph_bindings
+    #      row (Step 19's startup backfill seeds it) and returns the
+    #      canonical prefix.
+    #   2. --project: explicit override (the launcher's existing call
+    #      sites pass this).
+    #   3. Repo dir name: legacy fallback, kept for direct CLI users.
+    if args.from_resolver and args.project:
+        print(
+            "❌ --from-resolver and --project are mutually exclusive; pass one or the other",
+            file=sys.stderr,
+        )
+        return 1
+
+    project_name: Optional[str] = None
+    if args.from_resolver:
+        try:
+            # Lazy import — vco_lib.project_config requires `requests`
+            # which is a runtime-only dep for the analyzer venv. If the
+            # import fails, fall through to the dir-name path.
+            from vco_lib.project_config import (
+                resolve, HubUnreachable, ResolverError,
+            )
+            cfg = resolve(repo_path)
+            # `code_graph_project` is the resolver's legacy alias for
+            # the slug; it equals project_codegraph_bindings.collection_prefix
+            # when the binding row exists, or the slug when it doesn't.
+            project_name = cfg.code_graph_project
+            if not project_name:
+                # Resolver returned an empty prefix; fall back.
+                print(
+                    f"⚠️  resolver returned empty code_graph_project for {repo_path}; "
+                    f"falling back to repo dir name",
+                    file=sys.stderr,
+                )
+        except (HubUnreachable, ResolverError) as e:
+            print(
+                f"⚠️  resolver unreachable ({type(e).__name__}: {e}); "
+                f"falling back to repo dir name",
+                file=sys.stderr,
+            )
+        except ImportError:
+            print(
+                "⚠️  vco_lib.project_config not importable; "
+                "falling back to repo dir name (install resolver clients to use --from-resolver)",
+                file=sys.stderr,
+            )
+
+    if not project_name:
+        project_name = args.project or repo_path.name
 
     if args.verbose:
         print(f"📂 Repository: {repo_path}")
