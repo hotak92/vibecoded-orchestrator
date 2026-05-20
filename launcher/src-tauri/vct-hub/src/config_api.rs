@@ -79,6 +79,37 @@ use super::retrieval_tuning_io::{read_tuning, RetrievalTuning};
 const DEFAULT_OLLAMA_URL: &str = "http://localhost:11435";
 const DEFAULT_GRPC_PORT: u16 = 50052;
 
+// ─── Resolver protocol version (v0.2.22 Item #2) ─────────────────
+//
+// The schema_version field on `ProjectConfigResponse` is a
+// forward-compat anchor: a future hub release that adds a new
+// REQUIRED field (one that old clients can't gracefully default)
+// bumps this constant; clients log a one-line stderr warning when
+// they see a version higher than they know about so the user has
+// a diagnostic for "I upgraded the launcher but my hooks behave
+// oddly". Adding OPTIONAL fields (defaultable client-side) does
+// NOT bump the version — that's been the contract from v0.2.21
+// onward (retrieval_tuning was an additive field at version 1).
+//
+// MUST stay in lock-step with `RESOLVER_PROTOCOL_VERSION` in
+// `vco_lib/project_config.py`. When bumping here, bump there in the
+// same commit.
+const RESOLVER_PROTOCOL_VERSION: u8 = 1;
+
+/// Default helper for `#[serde(default = ...)]` on
+/// `ProjectConfigResponse::schema_version`. Returns the current
+/// protocol version. `#[allow(dead_code)]` because the struct
+/// derives `Serialize` only today (no Deserialize call path);
+/// the helper is wired through the serde attribute and would
+/// become live the moment a future codepath needs to round-trip
+/// a response back into the struct (cross-launcher integration
+/// tests, replay tooling, etc.). Kept for that forward-compat
+/// hook — same rationale as `schema_version` itself.
+#[allow(dead_code)]
+fn default_schema_version() -> u8 {
+    RESOLVER_PROTOCOL_VERSION
+}
+
 // ─── Router ──────────────────────────────────────────────────────
 
 pub fn router() -> Router<LauncherDbHandle> {
@@ -131,6 +162,23 @@ struct EmbeddingModels {
 
 #[derive(Debug, Serialize)]
 struct ProjectConfigResponse {
+    /// Resolver protocol version (v0.2.22 Item #2). Starts at 1.
+    /// Clients that see a value higher than their compiled-in
+    /// `RESOLVER_PROTOCOL_VERSION` emit a one-line stderr warning;
+    /// they still parse the response (additive fields default
+    /// client-side). The Python/bash/ps1 clients all treat
+    /// unknown top-level fields as ignorable so future hubs that
+    /// add fields under the SAME version stay wire-compatible.
+    ///
+    /// The `#[serde(default = ...)]` attribute is a no-op on the
+    /// current Serialize-only struct but stays in place so that if
+    /// a future codepath ever needs to Deserialize a response (e.g.
+    /// cross-launcher round-trip in an integration test), the
+    /// missing-field case lands on the compiled default rather
+    /// than failing to parse. The helper returns
+    /// `RESOLVER_PROTOCOL_VERSION` so the default tracks bumps.
+    #[serde(default = "default_schema_version")]
+    schema_version: u8,
     project_id: String,
     project_path: String,
     project_slug: String,
@@ -385,6 +433,7 @@ async fn project_config(
     let retrieval_tuning = read_tuning();
 
     let response = ProjectConfigResponse {
+        schema_version: RESOLVER_PROTOCOL_VERSION,
         project_id: project.id.clone(),
         project_path,
         project_slug: project.slug.clone(),
@@ -1075,6 +1124,60 @@ kg_tier_full = 0.8
             Some(v) => std::env::set_var("VCT_STATE_DIR", v),
             None => std::env::remove_var("VCT_STATE_DIR"),
         }
+    }
+
+    #[tokio::test]
+    async fn config_response_carries_schema_version_field() {
+        // v0.2.22 Item #2 — forward-compat anchor. Every successful
+        // resolver response MUST carry `schema_version` so a future
+        // client paired with an older hub (or a hub paired with an
+        // older client) can degrade with a one-line warning rather
+        // than silently mis-parsing. Pinned to 1 at v0.2.21/v0.2.22;
+        // bumps go through the comment block at the top of this
+        // file AND `RESOLVER_PROTOCOL_VERSION` in
+        // `vco_lib/project_config.py`.
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-schema", "myproject");
+
+        let resp = reqwest::get(format!("{}/projects/p-schema/config", base))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+
+        assert_eq!(
+            body.get("schema_version").and_then(|v| v.as_u64()),
+            Some(RESOLVER_PROTOCOL_VERSION as u64),
+            "schema_version must be present and equal to RESOLVER_PROTOCOL_VERSION; \
+             body={}",
+            body,
+        );
+    }
+
+    #[tokio::test]
+    async fn config_key_filter_returns_schema_version() {
+        // `?key=schema_version` is a single-field filter on the new
+        // top-level field — must work the same as any other top-
+        // level field. Useful for a future client that wants to
+        // probe just the version before deciding which fields to
+        // ask for.
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-schema-key", "myproject");
+
+        let resp = reqwest::get(format!(
+            "{}/projects/p-schema-key/config?key=schema_version",
+            base
+        ))
+        .await
+        .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        let obj = body.as_object().expect("object");
+        assert_eq!(obj.len(), 1);
+        assert_eq!(
+            obj.get("schema_version").and_then(|v| v.as_u64()),
+            Some(RESOLVER_PROTOCOL_VERSION as u64),
+        );
     }
 
     #[tokio::test]

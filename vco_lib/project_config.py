@@ -71,6 +71,7 @@ Caching
 from __future__ import annotations
 
 import os
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -80,6 +81,22 @@ from typing import Any, Callable
 import requests
 
 from vco_lib.paths import vct_root_dir
+
+
+# ─── Resolver protocol version (v0.2.22 Item #2) ──────────────────────
+#
+# Forward-compat anchor. The hub's response carries a `schema_version`
+# field; this constant pins the version this client knows how to
+# interpret. When the client sees a response with a HIGHER value, it
+# emits a one-line stderr warning so the user has a diagnostic for
+# "I upgraded the launcher but my hooks behave oddly" — the client
+# still parses the body (additive fields default client-side), and
+# raises only when the value is non-numeric / malformed.
+#
+# MUST stay in lock-step with `RESOLVER_PROTOCOL_VERSION` in
+# `launcher/src-tauri/vct-hub/src/config_api.rs`. When bumping there,
+# bump here in the same commit.
+RESOLVER_PROTOCOL_VERSION: int = 1
 
 
 # ─── Constants ──────────────────────────────────────────────────────────
@@ -226,6 +243,14 @@ class ProjectConfig:
     #: pre-v0.2.22 hub responses; defaults to calibrated values when
     #: missing so old hubs paired with new clients don't crash.
     retrieval_tuning: RetrievalTuning
+    #: Resolver protocol version reported by the hub (v0.2.22 Item #2).
+    #: Pinned at 1 since v0.2.21 — see :data:`RESOLVER_PROTOCOL_VERSION`.
+    #: Pre-v0.2.22 hubs omit the field; in that case the client back-
+    #: fills with `RESOLVER_PROTOCOL_VERSION` so callers see a stable
+    #: type. When the hub reports a value HIGHER than the client knows
+    #: about, the client emits a one-line stderr warning and still
+    #: returns the parsed body (additive fields default client-side).
+    schema_version: int = RESOLVER_PROTOCOL_VERSION
 
 
 # ─── Internal: hub discovery ────────────────────────────────────────────
@@ -318,10 +343,18 @@ def _discover_hub() -> tuple[int, str]:
 
 
 def _test_clear_cache() -> None:
-    """Reset the hub-discovery cache. For test use only."""
+    """Reset the hub-discovery cache + schema-warning dedup set.
+
+    For test use only — tests that exercise the schema_version warning
+    path need a fresh dedup state to confirm the warning DOES fire when
+    expected. Resetting the discovery cache and the warning set in the
+    same helper keeps test setup symmetric.
+    """
     global _discovery_cache
     with _discovery_lock:
         _discovery_cache = None
+    with _schema_warned_lock:
+        _schema_warned_versions.clear()
 
 
 def _invalidate_discovery_cache() -> None:
@@ -408,6 +441,42 @@ def _get_with_401_retry(
 
 _session_lock = threading.Lock()
 _session: requests.Session | None = None
+
+# Warn-once gate for the schema-version-too-new diagnostic. Threaded
+# callers (hooks, MCP servers) should see exactly ONE warning per
+# process when paired with a newer hub, not one per resolve() call.
+# Reset by `_test_clear_cache` for deterministic tests.
+_schema_warned_lock = threading.Lock()
+_schema_warned_versions: set[int] = set()
+
+
+def _maybe_warn_schema_version(hub_version: int) -> None:
+    """Emit one-line stderr warning if hub schema_version is higher
+    than what this client knows about (RESOLVER_PROTOCOL_VERSION).
+
+    Idempotent per (process, hub_version) pair: we de-dup on the
+    integer value so a hub bounce between two versions in the same
+    process emits one warning per distinct version, not one per
+    request. Stderr write is best-effort — never raises.
+    """
+    if hub_version <= RESOLVER_PROTOCOL_VERSION:
+        return
+    with _schema_warned_lock:
+        if hub_version in _schema_warned_versions:
+            return
+        _schema_warned_versions.add(hub_version)
+    try:
+        sys.stderr.write(
+            f"[vco_lib.project_config] hub reports schema_version="
+            f"{hub_version} but this client only knows version "
+            f"{RESOLVER_PROTOCOL_VERSION}; some fields may be unrecognised. "
+            f"Update vco_lib (pip install --upgrade) to silence this warning.\n"
+        )
+        sys.stderr.flush()
+    except OSError:
+        # stderr unavailable (closed in a daemon context, etc.) —
+        # silently swallow. The diagnostic is best-effort.
+        pass
 
 
 def _http_session() -> requests.Session:
@@ -520,6 +589,18 @@ def _from_hub_body(body: dict[str, Any]) -> ProjectConfig:
     """
     try:
         em = body["embedding_models"]
+        # schema_version (v0.2.22 Item #2). Optional — pre-v0.2.22
+        # hubs don't emit it, in which case we back-fill with
+        # RESOLVER_PROTOCOL_VERSION (the value this client knows
+        # about) so callers see a stable int. Non-numeric values are
+        # treated as malformed and bubble up via the outer except
+        # below. A NEWER version than the client supports triggers
+        # the warn-once stderr line — we still parse the body
+        # (additive fields default client-side; the warning is the
+        # only user-visible signal that something is off).
+        schema_version_raw = body.get("schema_version", RESOLVER_PROTOCOL_VERSION)
+        schema_version = int(schema_version_raw)
+        _maybe_warn_schema_version(schema_version)
         # retrieval_tuning is OPTIONAL — pre-v0.2.22 hubs don't emit
         # it, in which case we synthesize the calibrated defaults so
         # old hubs paired with new clients don't crash. Defaults
@@ -575,6 +656,7 @@ def _from_hub_body(body: dict[str, Any]) -> ProjectConfig:
             grpc_port=int(body["grpc_port"]),
             shared_kg_write_disabled=bool(body["shared_kg_write_disabled"]),
             retrieval_tuning=retrieval_tuning,
+            schema_version=schema_version,
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise HubUnreachable(
@@ -762,6 +844,7 @@ __all__ = [
     "HubUnreachable",
     "ProjectConfig",
     "ProjectNotFound",
+    "RESOLVER_PROTOCOL_VERSION",
     "ResolverError",
     "RetrievalTuning",
     "ServiceMisconfigured",

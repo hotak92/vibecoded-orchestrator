@@ -33,6 +33,7 @@ from vco_lib.project_config import (
     HubUnreachable,
     ProjectConfig,
     ProjectNotFound,
+    RESOLVER_PROTOCOL_VERSION,
     ResolverError,
     ServiceMisconfigured,
     resolve,
@@ -44,6 +45,7 @@ from vco_lib.project_config import (
 
 
 FULL_BODY: dict[str, Any] = {
+    "schema_version": 1,
     "project_id": "550e8400-e29b-41d4-a716-446655440000",
     "project_path": "/home/u/projects/myproject",
     "project_slug": "myproject",
@@ -467,6 +469,122 @@ class ResolveFieldTest(_ResolverTestBase):
             resolve_field(FULL_BODY["project_id"], "")
         # No HTTP call should have been made.
         self.session.get.assert_not_called()
+
+
+# ─── schema_version (v0.2.22 Item #2) ───────────────────────────────────
+
+
+class SchemaVersionTest(_ResolverTestBase):
+    """Hub `schema_version` is parsed; higher-than-known emits one warning.
+
+    Forward-compat hardening (v0.2.22 Item #2). The client pins its
+    own knowledge at ``RESOLVER_PROTOCOL_VERSION = 1``; when the hub
+    reports a higher value the client emits ONE stderr line per
+    distinct hub version per process and still returns the parsed
+    body. Pre-v0.2.22 hubs omit the field entirely; the client back-
+    fills with its own constant so callers see a stable int.
+    """
+
+    def test_matching_version_yields_no_warning(self) -> None:
+        # Body says schema_version=1 (== client's constant). No warning.
+        captured = []
+        self.session.get.return_value = _make_response(200, FULL_BODY)
+        with mock.patch.object(
+            project_config.sys.stderr, "write",
+            side_effect=lambda s: captured.append(s),
+        ):
+            cfg = resolve(FULL_BODY["project_id"])
+        self.assertEqual(cfg.schema_version, 1)
+        self.assertEqual(captured, [],
+            f"unexpected stderr write for matching version: {captured!r}")
+
+    def test_higher_version_emits_warning_once_per_process(self) -> None:
+        # Body says schema_version=2 (> RESOLVER_PROTOCOL_VERSION=1).
+        # First resolve() must warn; second resolve() must NOT warn
+        # again (dedup is per-process per-version).
+        body_v2 = {**FULL_BODY, "schema_version": 2}
+        self.session.get.return_value = _make_response(200, body_v2)
+
+        captured = []
+        with mock.patch.object(
+            project_config.sys.stderr, "write",
+            side_effect=lambda s: captured.append(s),
+        ):
+            cfg1 = resolve(FULL_BODY["project_id"])
+            cfg2 = resolve(FULL_BODY["project_id"])
+
+        self.assertEqual(cfg1.schema_version, 2)
+        self.assertEqual(cfg2.schema_version, 2)
+        # Exactly one stderr line, mentioning both versions.
+        self.assertEqual(len(captured), 1,
+            f"expected exactly one warning, got {len(captured)}: {captured!r}")
+        self.assertIn("schema_version=2", captured[0])
+        self.assertIn(f"version {RESOLVER_PROTOCOL_VERSION}", captured[0])
+
+    def test_higher_version_warns_again_for_distinct_value(self) -> None:
+        # Two different higher versions = two distinct warnings (per
+        # the dedup-on-int contract; a "version 2" warning shouldn't
+        # mask a later "version 3" warning).
+        body_v2 = {**FULL_BODY, "schema_version": 2}
+        body_v3 = {**FULL_BODY, "schema_version": 3}
+        self.session.get.side_effect = [
+            _make_response(200, body_v2),
+            _make_response(200, body_v3),
+        ]
+
+        captured = []
+        with mock.patch.object(
+            project_config.sys.stderr, "write",
+            side_effect=lambda s: captured.append(s),
+        ):
+            resolve(FULL_BODY["project_id"])
+            resolve(FULL_BODY["project_id"])
+        self.assertEqual(len(captured), 2)
+        self.assertIn("schema_version=2", captured[0])
+        self.assertIn("schema_version=3", captured[1])
+
+    def test_missing_schema_version_back_fills_with_client_default(self) -> None:
+        # Pre-v0.2.22 hub: the field is absent. Client back-fills with
+        # RESOLVER_PROTOCOL_VERSION rather than raising.
+        body_no_sv = {k: v for k, v in FULL_BODY.items() if k != "schema_version"}
+        self.session.get.return_value = _make_response(200, body_no_sv)
+
+        captured = []
+        with mock.patch.object(
+            project_config.sys.stderr, "write",
+            side_effect=lambda s: captured.append(s),
+        ):
+            cfg = resolve(FULL_BODY["project_id"])
+        self.assertEqual(cfg.schema_version, RESOLVER_PROTOCOL_VERSION)
+        # Back-fill is silent — only a HIGHER hub version warns.
+        self.assertEqual(captured, [])
+
+    def test_lower_version_does_not_warn(self) -> None:
+        # A hub reporting an OLDER version than the client knows about
+        # is unusual but valid (client upgraded ahead of hub). No
+        # warning — the client is the source of truth for "what should
+        # we know about", a lower hub version just means a smaller
+        # field set which we already handle via .get(...) defaults.
+        body_v0 = {**FULL_BODY, "schema_version": 0}
+        self.session.get.return_value = _make_response(200, body_v0)
+
+        captured = []
+        with mock.patch.object(
+            project_config.sys.stderr, "write",
+            side_effect=lambda s: captured.append(s),
+        ):
+            cfg = resolve(FULL_BODY["project_id"])
+        self.assertEqual(cfg.schema_version, 0)
+        self.assertEqual(captured, [])
+
+    def test_non_integer_schema_version_maps_to_hub_unreachable(self) -> None:
+        # Garbled wire body: schema_version is a string that doesn't
+        # parse as int → defensive HubUnreachable rather than silent
+        # back-fill (a malformed envelope hints the hub is broken).
+        body_bad = {**FULL_BODY, "schema_version": "not-a-number"}
+        self.session.get.return_value = _make_response(200, body_bad)
+        with self.assertRaises(HubUnreachable):
+            resolve(FULL_BODY["project_id"])
 
 
 # ─── Auth header propagation ────────────────────────────────────────────
