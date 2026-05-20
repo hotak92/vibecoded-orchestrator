@@ -17,7 +17,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 
-use super::{api, auth, cli_api, config_api, db, modules_api, project_state_api};
+use super::{api, auth, cli_api, config_api, db, lifecycle_api, modules_api, project_state_api};
 
 const DEFAULT_PORT: u16 = 7700;
 
@@ -85,6 +85,10 @@ pub async fn start_hub_server() -> Result<u16, String> {
         .nest(
             "/api/v1",
             config_api::router().with_state(launcher_state.clone()),
+        )
+        .nest(
+            "/api/v1",
+            lifecycle_api::router().with_state(launcher_state.clone()),
         )
         .nest("/api/v1", cli_api::router().with_state(launcher_state))
         .layer(axum::middleware::from_fn(auth::require_auth))
