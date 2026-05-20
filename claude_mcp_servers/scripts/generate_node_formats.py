@@ -212,7 +212,17 @@ def get_chunks_from_weaviate(title: str) -> list[tuple[int, str]]:
         import weaviate
         from weaviate.classes.query import Filter
 
-        kg_collection = os.getenv("KG_COLLECTION", "ClaudeKnowledgeGraph")
+        # v0.2.21 Step 18: resolve KG collection via the launcher's
+        # vct-hub; fall back to env (ClaudeKnowledgeGraph default kept
+        # for pre-v0.2.21 callers).
+        try:
+            from vco_lib.project_config import resolve as _vco_resolve  # type: ignore[import-not-found]
+            _cfg = _vco_resolve(PROJECT_ROOT)
+            kg_collection = _cfg.kg_collection or os.getenv(
+                "KG_COLLECTION", "ClaudeKnowledgeGraph"
+            )
+        except Exception:
+            kg_collection = os.getenv("KG_COLLECTION", "ClaudeKnowledgeGraph")
         client = weaviate.connect_to_local(host="localhost", port=8081, grpc_port=50052)
         try:
             coll = client.collections.get(kg_collection)
