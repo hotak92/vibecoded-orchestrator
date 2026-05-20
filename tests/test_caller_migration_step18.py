@@ -41,7 +41,14 @@ def _fake_project_config(
     project_slug: str = "hubproject",
     kg_access_list: tuple[str, ...] = (),
 ):
-    """Build a fake ProjectConfig dataclass for resolver-stub return."""
+    """Build a fake ProjectConfig dataclass for resolver-stub return.
+
+    ``retrieval_tuning`` and ``schema_version`` are intentionally OMITTED:
+    they have calibrated defaults on ``ProjectConfig`` (see the field-
+    declaration docstrings in ``vco_lib/project_config.py``), so direct
+    callers don't need to know about them. Tests that DO need to override
+    them should pass an explicit ``retrieval_tuning=RetrievalTuning(...)``.
+    """
     from vco_lib.project_config import EmbeddingModels, ProjectConfig
     return ProjectConfig(
         project_id="11111111-2222-3333-4444-555555555555",

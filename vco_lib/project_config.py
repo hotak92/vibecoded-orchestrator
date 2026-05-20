@@ -74,7 +74,7 @@ import os
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -210,6 +210,38 @@ class RetrievalTuning:
     kg_tier_full: float
 
 
+#: Single source of truth for the calibrated RetrievalTuning defaults
+#: on the Python side. MUST stay in lockstep with the Rust constants in
+#: ``launcher/src-tauri/vct-hub/src/retrieval_tuning_io.rs`` and the
+#: launcher's ``commands::retrieval_tuning`` module. Drift either way
+#: is caught by ``tests/test_retrieval_tuning_roundtrip.py`` (drift
+#: guard). Pinned in ``knowledge/concepts/score-driven-retrieval-tiers.md``.
+_RETRIEVAL_TUNING_DEFAULTS: tuple[float, float, float, float, float] = (
+    0.35,  # code_graph_score_floor
+    0.42,  # kg_tier_min
+    0.55,  # kg_tier_single_chunk
+    0.65,  # kg_tier_three_chunks
+    0.75,  # kg_tier_full
+)
+
+
+def _default_retrieval_tuning() -> RetrievalTuning:
+    """Factory for the calibrated default RetrievalTuning.
+
+    Used by (1) the ProjectConfig dataclass default, (2) the
+    ``_from_hub_body`` parser when the hub omits ``retrieval_tuning``
+    entirely (pre-v0.2.22 hubs paired with new clients), (3) any caller
+    that builds a ``ProjectConfig`` by hand and doesn't care about
+    overriding the thresholds.
+
+    Returns a freshly-constructed value each call so callers can safely
+    treat it as owned; the dataclass is ``frozen=True`` so sharing one
+    instance would also be safe, but the factory keeps the contract
+    explicit.
+    """
+    return RetrievalTuning(*_RETRIEVAL_TUNING_DEFAULTS)
+
+
 @dataclass(frozen=True, slots=True)
 class ProjectConfig:
     """Resolved per-project config.
@@ -241,8 +273,14 @@ class ProjectConfig:
     shared_kg_write_disabled: bool
     #: Global retrieval tuning thresholds (v0.2.22 Item #13). Absent in
     #: pre-v0.2.22 hub responses; defaults to calibrated values when
-    #: missing so old hubs paired with new clients don't crash.
-    retrieval_tuning: RetrievalTuning
+    #: missing so old hubs paired with new clients don't crash. The
+    #: default is also surfaced via ``default_factory`` here so direct
+    #: callers (test fixtures, future helpers) can omit the field
+    #: entirely — the factory mirrors the same constants used by the
+    #: parser-side fallback at :func:`_from_hub_body`.
+    retrieval_tuning: RetrievalTuning = field(
+        default_factory=_default_retrieval_tuning,
+    )
     #: Resolver protocol version reported by the hub (v0.2.22 Item #2).
     #: Pinned at 1 since v0.2.21 — see :data:`RESOLVER_PROTOCOL_VERSION`.
     #: Pre-v0.2.22 hubs omit the field; in that case the client back-
@@ -603,33 +641,28 @@ def _from_hub_body(body: dict[str, Any]) -> ProjectConfig:
         _maybe_warn_schema_version(schema_version)
         # retrieval_tuning is OPTIONAL — pre-v0.2.22 hubs don't emit
         # it, in which case we synthesize the calibrated defaults so
-        # old hubs paired with new clients don't crash. Defaults
-        # match the Rust constants in
-        # vct-hub/src/retrieval_tuning_io.rs and the launcher's
-        # commands::retrieval_tuning module.
+        # old hubs paired with new clients don't crash. Per-field
+        # defaults are sourced from `_RETRIEVAL_TUNING_DEFAULTS` (single
+        # source of truth — see module-level constant above; mirrors the
+        # Rust constants in vct-hub/src/retrieval_tuning_io.rs).
         rt_raw = body.get("retrieval_tuning") if isinstance(body, dict) else None
         if isinstance(rt_raw, dict):
+            d = _RETRIEVAL_TUNING_DEFAULTS
             retrieval_tuning = RetrievalTuning(
                 code_graph_score_floor=float(rt_raw.get(
-                    "code_graph_score_floor", 0.35,
+                    "code_graph_score_floor", d[0],
                 )),
-                kg_tier_min=float(rt_raw.get("kg_tier_min", 0.42)),
+                kg_tier_min=float(rt_raw.get("kg_tier_min", d[1])),
                 kg_tier_single_chunk=float(rt_raw.get(
-                    "kg_tier_single_chunk", 0.55,
+                    "kg_tier_single_chunk", d[2],
                 )),
                 kg_tier_three_chunks=float(rt_raw.get(
-                    "kg_tier_three_chunks", 0.65,
+                    "kg_tier_three_chunks", d[3],
                 )),
-                kg_tier_full=float(rt_raw.get("kg_tier_full", 0.75)),
+                kg_tier_full=float(rt_raw.get("kg_tier_full", d[4])),
             )
         else:
-            retrieval_tuning = RetrievalTuning(
-                code_graph_score_floor=0.35,
-                kg_tier_min=0.42,
-                kg_tier_single_chunk=0.55,
-                kg_tier_three_chunks=0.65,
-                kg_tier_full=0.75,
-            )
+            retrieval_tuning = _default_retrieval_tuning()
         return ProjectConfig(
             project_id=str(body["project_id"]),
             project_path=str(body["project_path"]),
