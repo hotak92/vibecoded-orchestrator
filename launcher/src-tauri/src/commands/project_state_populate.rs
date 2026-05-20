@@ -196,6 +196,30 @@ fn grant_default_access(
 
 // ─── Agents ────────────────────────────────────────────────────────────
 
+/// File-stem names (lowercased, no extension) that are NEVER agents and
+/// must be skipped by the disk-walker. README.md is the prime offender:
+/// it lives in `.claude/agents/` to document the directory itself, has
+/// no frontmatter, and was being registered as a phantom agent named
+/// "README" with model=None — visible in the launcher GUI as an
+/// Unregister-able row that the user never created (v0.2.22 item #18).
+///
+/// The list is intentionally short. Anything else with a `.md` extension
+/// in `.claude/agents/` is treated as an agent. If a project adds a real
+/// agent called `readme-bot.md` the file stem is `readme-bot`, which is
+/// NOT in this set — it would still be registered correctly.
+const AGENT_FILE_STEM_BLOCKLIST: &[&str] = &["readme", "index", "template"];
+
+/// True iff this `.md` file should be skipped by `populate_agents`. The
+/// check is case-insensitive on the stem (Windows / case-insensitive
+/// filesystems may produce `README.MD`, `Readme.md`, etc.).
+fn is_blocklisted_agent_file(path: &Path) -> bool {
+    let stem = match path.file_stem().and_then(|s| s.to_str()) {
+        Some(s) => s.to_lowercase(),
+        None => return false,
+    };
+    AGENT_FILE_STEM_BLOCKLIST.iter().any(|b| *b == stem)
+}
+
 fn populate_agents(
     project_id: &str,
     claude_dir: &Path,
@@ -214,6 +238,28 @@ fn populate_agents(
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) != Some("md") {
+            continue;
+        }
+        // Skip documentation files that live in `.claude/agents/` but
+        // are not agents themselves (README.md, index.md, template.md).
+        // ALSO defensively delete any pre-existing DB row for them so
+        // the GUI's phantom "README" row clears on the next populate
+        // run without requiring the user to click Unregister.
+        // v0.2.22 item #18.
+        if is_blocklisted_agent_file(&path) {
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            // Try both original case and the canonical lowercase name
+            // — the populate scanner historically registered the agent
+            // under the EXACT file-stem case (e.g. "README" for README.md),
+            // so we must delete using the same casing it was inserted with.
+            // Unregister is idempotent: missing row = 0 rows affected.
+            let _ = db.unregister_project_agent(project_id, &stem);
+            let _ = db.unregister_project_agent(project_id, &stem.to_lowercase());
+            let _ = db.unregister_project_agent(project_id, &stem.to_uppercase());
             continue;
         }
         let raw = match std::fs::read_to_string(&path) {
@@ -239,6 +285,28 @@ fn populate_agents(
         let model = fm.get("model").cloned();
         let description = fm.get("description").cloned().unwrap_or_default();
         let config = serde_json::json!({ "description": description });
+
+        // v0.2.22 item #19 defensive surface: bundled-source agents whose
+        // frontmatter lacks a `model:` line render as `—` in the GUI's
+        // Model column. The bundled .md files SHOULD always carry a
+        // model: line — its absence usually indicates the user's project
+        // bundle is stale relative to the orchestrator template. Emit a
+        // warning so the user (and future-debuggers) can correlate the
+        // GUI's `—` with "your bundle is stale; re-propagate from
+        // launcher Settings → Update bundle". We do NOT block the
+        // registration — `—` is a valid render and the agent still works
+        // (Claude Code reads model from the frontmatter directly, so
+        // missing model just means Claude Code falls back to its own
+        // session default).
+        if model.is_none() {
+            report.warnings.push(format!(
+                "bundled agent {} has no `model:` frontmatter at {} \
+                 — GUI will render Model column as `—`. If unexpected, \
+                 re-propagate the bundle via launcher Settings → Update bundle.",
+                agent_name,
+                path.display()
+            ));
+        }
 
         let path_str = path.to_string_lossy().to_string();
         if let Err(e) = db.register_project_agent(
@@ -304,6 +372,20 @@ fn populate_skills(
         let model = fm.get("model").cloned();
         let description = fm.get("description").cloned().unwrap_or_default();
         let config = serde_json::json!({ "description": description });
+
+        // v0.2.22 item #19 defensive surface — mirror of the agent path:
+        // bundled SKILL.md files without a `model:` frontmatter render as
+        // `—` in the GUI. Emit a warning so the user can correlate to a
+        // stale bundle. Registration proceeds; missing model is valid.
+        if model.is_none() {
+            report.warnings.push(format!(
+                "bundled skill {} has no `model:` frontmatter at {} \
+                 — GUI will render Model column as `—`. If unexpected, \
+                 re-propagate the bundle via launcher Settings → Update bundle.",
+                skill_name,
+                skill_md.display()
+            ));
+        }
 
         let path_str = skill_md.to_string_lossy().to_string();
         if let Err(e) = db.register_project_skill(
@@ -851,6 +933,311 @@ mod tests {
         assert_eq!(report.agents_inserted, 1);
         let rows = db.list_project_agents("p1").unwrap();
         assert_eq!(rows[0].agent_name, "planner");
+
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    // ─── v0.2.22 item #18: README/index/template .md files must not register as agents ──
+
+    /// `populate_agents` must skip `.claude/agents/README.md` — the file
+    /// documents the directory, has no frontmatter, and was historically
+    /// registered as a phantom agent named "README" with model=None.
+    /// Regression guard: confirms the scanner walks past README and
+    /// returns the same row count as if README didn't exist.
+    #[test]
+    fn populate_agents_skips_readme_md() {
+        let folder = scratch_dir("agents-readme-skip");
+        let agents_dir = folder.join(".claude/agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        write_agent_file(
+            &agents_dir,
+            "coder.md",
+            "name: coder\nmodel: sonnet",
+            "# Coder",
+        );
+        // README.md sibling — documents the directory, NOT an agent.
+        std::fs::write(
+            agents_dir.join("README.md"),
+            "# Agents\n\nThis directory contains agent definitions.\n",
+        )
+        .unwrap();
+
+        let db = make_db_with_project("p1", "P");
+        let report = populate_project_state_from_filesystem("p1", "P", &folder, &db);
+
+        // Only `coder` is registered, NOT README.
+        assert_eq!(
+            report.agents_inserted, 1,
+            "README.md must not count as an inserted agent"
+        );
+        let rows = db.list_project_agents("p1").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].agent_name, "coder");
+        assert!(
+            !rows.iter().any(|a| a.agent_name.eq_ignore_ascii_case("readme")),
+            "README must not appear in the agents list"
+        );
+
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    /// Case-insensitive skip — `Readme.md`, `README.MD`, `readme.md` all
+    /// land at the same documentation file on case-insensitive filesystems
+    /// (Windows / default macOS HFS+ / APFS). The blocklist matches on the
+    /// lowercased stem so every variant is skipped.
+    #[test]
+    fn populate_agents_skips_readme_case_insensitive() {
+        let folder = scratch_dir("agents-readme-case");
+        let agents_dir = folder.join(".claude/agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        write_agent_file(
+            &agents_dir,
+            "coder.md",
+            "name: coder\nmodel: sonnet",
+            "# Coder",
+        );
+        // Some Linux filesystems will keep BOTH if the OS is
+        // case-sensitive — write a single file with mixed case that
+        // demonstrates the blocklist matches lowercase.
+        std::fs::write(agents_dir.join("Readme.md"), "# Docs").unwrap();
+
+        let db = make_db_with_project("p1", "P");
+        let report = populate_project_state_from_filesystem("p1", "P", &folder, &db);
+
+        assert_eq!(report.agents_inserted, 1);
+        let rows = db.list_project_agents("p1").unwrap();
+        assert!(!rows.iter().any(|a| a.agent_name.eq_ignore_ascii_case("readme")));
+
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    /// Index.md / template.md are also skipped — these are placeholder
+    /// files some bundles ship to seed the directory structure but
+    /// they're not agents.
+    #[test]
+    fn populate_agents_skips_index_and_template_md() {
+        let folder = scratch_dir("agents-index-skip");
+        let agents_dir = folder.join(".claude/agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        write_agent_file(&agents_dir, "coder.md", "name: coder\nmodel: sonnet", "");
+        std::fs::write(agents_dir.join("index.md"), "# index").unwrap();
+        std::fs::write(agents_dir.join("TEMPLATE.md"), "# template").unwrap();
+
+        let db = make_db_with_project("p1", "P");
+        let report = populate_project_state_from_filesystem("p1", "P", &folder, &db);
+
+        assert_eq!(report.agents_inserted, 1);
+        let rows = db.list_project_agents("p1").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].agent_name, "coder");
+
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    /// Real agents whose name contains "readme" as a substring must NOT
+    /// be skipped — the blocklist matches the FULL stem, not a substring.
+    /// e.g. `readme-bot.md` is a hypothetical real agent and should still
+    /// land in the DB.
+    #[test]
+    fn populate_agents_only_skips_exact_stems_not_substrings() {
+        let folder = scratch_dir("agents-readme-substring");
+        let agents_dir = folder.join(".claude/agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        write_agent_file(
+            &agents_dir,
+            "readme-bot.md",
+            "name: readme-bot\nmodel: haiku",
+            "# RB",
+        );
+
+        let db = make_db_with_project("p1", "P");
+        let report = populate_project_state_from_filesystem("p1", "P", &folder, &db);
+        assert_eq!(report.agents_inserted, 1);
+        let rows = db.list_project_agents("p1").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].agent_name, "readme-bot");
+
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    /// Legacy state cleanup: if a previous populate run registered a
+    /// phantom "README" agent (before the v0.2.22 fix), the NEXT run
+    /// must DELETE that row, not just skip re-registering it. Otherwise
+    /// existing user databases never clear the phantom row. The fix
+    /// proactively calls `unregister_project_agent` on the blocklisted
+    /// stem variants whenever it encounters a blocklisted file.
+    #[test]
+    fn populate_agents_cleans_up_legacy_readme_row() {
+        let folder = scratch_dir("agents-readme-cleanup");
+        let agents_dir = folder.join(".claude/agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        write_agent_file(&agents_dir, "coder.md", "name: coder\nmodel: sonnet", "");
+        std::fs::write(agents_dir.join("README.md"), "# Docs").unwrap();
+
+        let db = make_db_with_project("p1", "P");
+
+        // Simulate a legacy "README" row inserted by a pre-fix populate
+        // (file_path points at README.md, model=None, source=bundled).
+        let readme_path = agents_dir.join("README.md").to_string_lossy().to_string();
+        db.register_project_agent(
+            "p1",
+            "README",
+            "bundled",
+            None,
+            None,
+            Some(&readme_path),
+            &serde_json::json!({"description": ""}),
+        )
+        .unwrap();
+        // Confirm the phantom row exists pre-cleanup.
+        assert!(db
+            .list_project_agents("p1")
+            .unwrap()
+            .iter()
+            .any(|a| a.agent_name == "README"));
+
+        // Run populate — it should DELETE the phantom row AND register coder.
+        let _ = populate_project_state_from_filesystem("p1", "P", &folder, &db);
+        let rows = db.list_project_agents("p1").unwrap();
+        assert!(
+            !rows.iter().any(|a| a.agent_name.eq_ignore_ascii_case("readme")),
+            "legacy README row must be cleaned up after populate"
+        );
+        assert!(rows.iter().any(|a| a.agent_name == "coder"));
+
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    // ─── v0.2.22 item #19: warn when bundled agent .md has no model field ──
+
+    /// When a bundled agent's frontmatter omits the `model:` line, the
+    /// scanner writes `model=None` to the DB which the GUI renders as
+    /// `—`. That's a valid render (model is genuinely missing) but
+    /// almost always indicates a stale user bundle. The scanner emits
+    /// a warning in `report.warnings` so the user can correlate.
+    #[test]
+    fn populate_agents_warns_when_model_missing_from_frontmatter() {
+        let folder = scratch_dir("agents-no-model");
+        let agents_dir = folder.join(".claude/agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        write_agent_file(
+            &agents_dir,
+            "stale-bundle.md",
+            "name: stale-bundle\ndescription: bundle without model",
+            "# body",
+        );
+
+        let db = make_db_with_project("p1", "P");
+        let report = populate_project_state_from_filesystem("p1", "P", &folder, &db);
+
+        // Registration still succeeds — missing model is non-fatal.
+        assert_eq!(report.agents_inserted, 1);
+        let rows = db.list_project_agents("p1").unwrap();
+        assert_eq!(rows[0].agent_name, "stale-bundle");
+        assert!(rows[0].model.is_none());
+
+        // BUT a warning is emitted naming the agent and pointing at
+        // the stale-bundle remedy.
+        let has_warning = report.warnings.iter().any(|w| {
+            w.contains("stale-bundle")
+                && w.contains("no `model:` frontmatter")
+                && w.contains("Update bundle")
+        });
+        assert!(
+            has_warning,
+            "expected warning about missing model: line, got: {:?}",
+            report.warnings
+        );
+
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    /// Mirror of the agent test for skills — when SKILL.md omits the
+    /// `model:` line, populate emits a warning AND registers with
+    /// `model=None`.
+    #[test]
+    fn populate_skills_warns_when_model_missing_from_frontmatter() {
+        let folder = scratch_dir("skills-no-model");
+        let skills_dir = folder.join(".claude/skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        write_skill_dir(
+            &skills_dir,
+            "stale-skill",
+            "name: stale-skill\ndescription: no model field",
+        );
+
+        let db = make_db_with_project("p1", "P");
+        let report = populate_project_state_from_filesystem("p1", "P", &folder, &db);
+
+        assert_eq!(report.skills_inserted, 1);
+        let rows = db.list_project_skills("p1").unwrap();
+        assert!(rows[0].model.is_none());
+
+        let has_warning = report.warnings.iter().any(|w| {
+            w.contains("stale-skill")
+                && w.contains("no `model:` frontmatter")
+                && w.contains("Update bundle")
+        });
+        assert!(
+            has_warning,
+            "expected warning about missing skill model: line, got: {:?}",
+            report.warnings
+        );
+
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    /// Conversely: an agent with `model: haiku` in frontmatter must NOT
+    /// produce the missing-model warning AND the registered row must
+    /// have `model = Some("haiku")` — pinning the IPC-layer contract
+    /// the GUI's `{a.model ?? '—'}` template relies on.
+    /// Regression guard for v0.2.22 item #19's IPC contract.
+    #[test]
+    fn populate_agents_with_model_serializes_through_to_list() {
+        let folder = scratch_dir("agents-with-model");
+        let agents_dir = folder.join(".claude/agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        // The exact shape from production: model + effort + tools (the
+        // last two MUST not interfere with the model extraction).
+        write_agent_file(
+            &agents_dir,
+            "code-graph-updater.md",
+            "name: code-graph-updater\ndescription: graph updates\ntools: Read, Bash, Grep, Glob\nmodel: haiku\neffort: high",
+            "# CGU",
+        );
+
+        let db = make_db_with_project("p1", "P");
+        let report = populate_project_state_from_filesystem("p1", "P", &folder, &db);
+
+        assert_eq!(report.agents_inserted, 1);
+        // No missing-model warning.
+        assert!(
+            !report.warnings.iter().any(|w| w.contains("no `model:` frontmatter")),
+            "model is present; no warning expected, got: {:?}",
+            report.warnings
+        );
+
+        // The row's model is Some("haiku") — survives the upsert.
+        let rows = db.list_project_agents("p1").unwrap();
+        assert_eq!(rows[0].agent_name, "code-graph-updater");
+        assert_eq!(rows[0].model.as_deref(), Some("haiku"));
+
+        // Pin the IPC contract — serialize the row exactly as the Tauri
+        // command does and verify the JSON carries `"model":"haiku"`.
+        // This is the regression guard for the screenshot bug ("model
+        // is correct in DB but `—` in GUI").
+        let json = serde_json::to_string(&rows[0]).unwrap();
+        assert!(
+            json.contains("\"model\":\"haiku\""),
+            "IPC JSON must carry model=\"haiku\", got: {}",
+            json
+        );
+        // And ensure no null sneaks in.
+        assert!(
+            !json.contains("\"model\":null"),
+            "IPC JSON must not carry model=null for an agent with model: haiku, got: {}",
+            json
+        );
 
         std::fs::remove_dir_all(&folder).ok();
     }
@@ -1534,7 +1921,7 @@ mod tests {
             );
         }
         for n in &["architect", "tdd", "context", "fix-issue"] {
-            write_skill_dir(&skills_dir, n, &format!("name: {}", n));
+            write_skill_dir(&skills_dir, n, &format!("name: {}\nmodel: sonnet", n));
         }
         std::fs::write(
             claude.join("settings.json"),
