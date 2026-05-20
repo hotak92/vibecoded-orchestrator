@@ -61,9 +61,24 @@ PY
 # invoking the cargo test that prints the resolved list. The test
 # (added in this commit) is gated by an env var so normal cargo test
 # runs don't print to stdout.
+#
+# NOTE (v0.2.22 D12 fix): we explicitly DO NOT use --release here.
+# After the Cargo workspace migration (commit d3c5e6e, 2026-05-20 01:09),
+# the dep crate `vct-launcher-core` gates its test-only helpers
+# (Db::open_in_memory, secrets::test_serialize) on
+# `#[cfg(any(test, debug_assertions))]`. Cross-crate `cfg(test)` does
+# NOT propagate from consumer to dep, AND `--release` turns
+# `debug_assertions` off — together they configure-out those helpers,
+# which the consumer's `#[cfg(test)] mod tests` block then can't
+# resolve (77 compile errors). The fully-correct fix is to add a
+# Cargo `test-helpers` feature on vct-launcher-core and have consumers
+# declare it in dev-dependencies; until that lands, debug-profile
+# tests cover the parser correctly (ORCHESTRATOR_MANAGED_PATHS is a
+# const slice — release vs debug profile produces identical parser
+# behaviour). See knowledge/concepts/v0.2.22-release-2026-05-20.md
+# Lesson 2 + plan §D12 in .claude/context/plans/v0.2.22-deferred-followups.md.
 echo "::group::Rust parse via cargo test"
 cargo test --lib --manifest-path launcher/src-tauri/Cargo.toml \
-    --release \
     print_managed_paths_for_ci \
     -- --nocapture --ignored \
     2>&1 \
