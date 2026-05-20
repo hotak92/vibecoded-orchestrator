@@ -168,6 +168,32 @@ class EmbeddingModels:
 
 
 @dataclass(frozen=True, slots=True)
+class RetrievalTuning:
+    """Global retrieval tuning thresholds.
+
+    v0.2.22 Item #13 (2026-05-20). Sourced from the launcher GUI's
+    Preferences → Retrieval tuning panel which writes
+    ``<vct_root_dir>/retrieval-tuning.toml``; the hub re-reads the
+    file on every ``/config`` response. Five env-tunable knobs:
+
+    * ``code_graph_score_floor`` — pre-edit codegraph injection cutoff
+    * ``kg_tier_min`` — KG result discard threshold (below = noise)
+    * ``kg_tier_single_chunk`` — render single matched chunk above this
+    * ``kg_tier_three_chunks`` — render matched + 2 neighbours above
+    * ``kg_tier_full`` — render whole node above this
+
+    Defaults pinned in ``score-driven-retrieval-tiers.md``:
+    0.35 / 0.42 / 0.55 / 0.65 / 0.75.
+    """
+
+    code_graph_score_floor: float
+    kg_tier_min: float
+    kg_tier_single_chunk: float
+    kg_tier_three_chunks: float
+    kg_tier_full: float
+
+
+@dataclass(frozen=True, slots=True)
 class ProjectConfig:
     """Resolved per-project config.
 
@@ -196,6 +222,10 @@ class ProjectConfig:
     ollama_url: str
     grpc_port: int
     shared_kg_write_disabled: bool
+    #: Global retrieval tuning thresholds (v0.2.22 Item #13). Absent in
+    #: pre-v0.2.22 hub responses; defaults to calibrated values when
+    #: missing so old hubs paired with new clients don't crash.
+    retrieval_tuning: RetrievalTuning
 
 
 # ─── Internal: hub discovery ────────────────────────────────────────────
@@ -490,6 +520,35 @@ def _from_hub_body(body: dict[str, Any]) -> ProjectConfig:
     """
     try:
         em = body["embedding_models"]
+        # retrieval_tuning is OPTIONAL — pre-v0.2.22 hubs don't emit
+        # it, in which case we synthesize the calibrated defaults so
+        # old hubs paired with new clients don't crash. Defaults
+        # match the Rust constants in
+        # vct-hub/src/retrieval_tuning_io.rs and the launcher's
+        # commands::retrieval_tuning module.
+        rt_raw = body.get("retrieval_tuning") if isinstance(body, dict) else None
+        if isinstance(rt_raw, dict):
+            retrieval_tuning = RetrievalTuning(
+                code_graph_score_floor=float(rt_raw.get(
+                    "code_graph_score_floor", 0.35,
+                )),
+                kg_tier_min=float(rt_raw.get("kg_tier_min", 0.42)),
+                kg_tier_single_chunk=float(rt_raw.get(
+                    "kg_tier_single_chunk", 0.55,
+                )),
+                kg_tier_three_chunks=float(rt_raw.get(
+                    "kg_tier_three_chunks", 0.65,
+                )),
+                kg_tier_full=float(rt_raw.get("kg_tier_full", 0.75)),
+            )
+        else:
+            retrieval_tuning = RetrievalTuning(
+                code_graph_score_floor=0.35,
+                kg_tier_min=0.42,
+                kg_tier_single_chunk=0.55,
+                kg_tier_three_chunks=0.65,
+                kg_tier_full=0.75,
+            )
         return ProjectConfig(
             project_id=str(body["project_id"]),
             project_path=str(body["project_path"]),
@@ -515,6 +574,7 @@ def _from_hub_body(body: dict[str, Any]) -> ProjectConfig:
             ollama_url=str(body["ollama_url"]),
             grpc_port=int(body["grpc_port"]),
             shared_kg_write_disabled=bool(body["shared_kg_write_disabled"]),
+            retrieval_tuning=retrieval_tuning,
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise HubUnreachable(
@@ -703,6 +763,7 @@ __all__ = [
     "ProjectConfig",
     "ProjectNotFound",
     "ResolverError",
+    "RetrievalTuning",
     "ServiceMisconfigured",
     "Unauthorized",
     "resolve",

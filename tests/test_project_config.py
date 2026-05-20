@@ -67,6 +67,13 @@ FULL_BODY: dict[str, Any] = {
     "ollama_url": "http://localhost:11435",
     "grpc_port": 50052,
     "shared_kg_write_disabled": False,
+    "retrieval_tuning": {
+        "code_graph_score_floor": 0.35,
+        "kg_tier_min": 0.42,
+        "kg_tier_single_chunk": 0.55,
+        "kg_tier_three_chunks": 0.65,
+        "kg_tier_full": 0.75,
+    },
 }
 
 
