@@ -155,6 +155,22 @@ jobs:
           BUILD_TARGET: ${{ matrix.target }}
         run: bash scripts/build-bundled-launcher.sh
 
+      # v0.2.21+: vct-hub is a sibling binary built from the same Cargo
+      # workspace and staged into the same launcher/dist/<arch>/ directory
+      # by scripts/build-bundled-launcher.sh. Expose its platform-specific
+      # filename (vct-hub vs vct-hub.exe) as a step output so downstream
+      # steps don't duplicate the ".exe on Windows" branching logic.
+      - name: Compute vct-hub binary name
+        id: hub_meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            echo "binary=vct-hub.exe" >> "$GITHUB_OUTPUT"
+          else
+            echo "binary=vct-hub" >> "$GITHUB_OUTPUT"
+          fi
+
       # Sanity-check that the staged artifacts exist before upload, so a
       # silent build-script change can't produce a release with empty
       # assets. Listing also surfaces sizes in the run log.
@@ -170,6 +186,21 @@ jobs:
           fi
           if [ ! -f "$dist/${{ matrix.binary }}.metadata.json" ]; then
             echo "::error::Expected $dist/${{ matrix.binary }}.metadata.json not found"
+            ls -la "$dist" || true
+            exit 1
+          fi
+          # v0.2.21+: vct-hub assertions. Same hard-fail contract as the
+          # launcher checks above — if the build script regresses and
+          # forgets to stage vct-hub on a particular arch, fail here
+          # rather than silently shipping a launcher-only release.
+          hub_bin="${{ steps.hub_meta.outputs.binary }}"
+          if [ ! -f "$dist/$hub_bin" ]; then
+            echo "::error::Expected $dist/$hub_bin not found"
+            ls -la "$dist" || true
+            exit 1
+          fi
+          if [ ! -f "$dist/$hub_bin.metadata.json" ]; then
+            echo "::error::Expected $dist/$hub_bin.metadata.json not found"
             ls -la "$dist" || true
             exit 1
           fi
@@ -190,14 +221,25 @@ jobs:
           dist="launcher/dist/${{ matrix.target }}"
           stage="$dist/_release"
           mkdir -p "$stage"
+          hub_bin="${{ steps.hub_meta.outputs.binary }}"
           case "${{ matrix.target }}" in
             macos-arm64|macos-x64)
               cp "$dist/${{ matrix.binary }}" "$stage/vct-launcher-${{ matrix.target }}-experimental"
               cp "$dist/${{ matrix.binary }}.metadata.json" "$stage/vct-launcher-${{ matrix.target }}-experimental.metadata.json"
+              # v0.2.21+: vct-hub gets the same -experimental suffix on
+              # macOS so the Release sidebar surfaces the unsigned-tier
+              # marker consistently across both binaries. vct-hub ships
+              # UNSIGNED on macOS in v0.2.21 — same posture as vct-launcher.
+              cp "$dist/$hub_bin" "$stage/vct-hub-${{ matrix.target }}-experimental"
+              cp "$dist/$hub_bin.metadata.json" "$stage/vct-hub-${{ matrix.target }}-experimental.metadata.json"
               ;;
             *)
               cp "$dist/${{ matrix.binary }}" "$stage/${{ matrix.binary }}"
               cp "$dist/${{ matrix.binary }}.metadata.json" "$stage/${{ matrix.binary }}.metadata.json"
+              # v0.2.21+: vct-hub staged for Linux/Windows under its
+              # canonical filename (vct-hub or vct-hub.exe).
+              cp "$dist/$hub_bin" "$stage/$hub_bin"
+              cp "$dist/$hub_bin.metadata.json" "$stage/$hub_bin.metadata.json"
               ;;
           esac
           ls -lh "$stage"
@@ -299,6 +341,7 @@ jobs:
           ARCHIVE_BASE: ${{ steps.archive_meta.outputs.archive_base }}
           MATRIX_TARGET: ${{ matrix.target }}
           MATRIX_BINARY: ${{ matrix.binary }}
+          HUB_BINARY: ${{ steps.hub_meta.outputs.binary }}
         run: |
           set -euo pipefail
           stage_root="dist/${ARCHIVE_BASE}"
@@ -315,6 +358,19 @@ jobs:
             exit 1
           fi
           cp "$src_launcher" "$stage_root/${MATRIX_BINARY}"
+
+          # 1b. vct-hub binary (v0.2.21+). Same staging pattern; lives
+          # next to vct-launcher inside the archive so end users get
+          # both with one extract.
+          src_hub="launcher/dist/${MATRIX_TARGET}/${HUB_BINARY}"
+          if [ ! -f "$src_hub" ]; then
+            echo "::error::Expected vct-hub binary at $src_hub"
+            exit 1
+          fi
+          cp "$src_hub" "$stage_root/${HUB_BINARY}"
+          if [ "${MATRIX_TARGET}" != "windows-x64" ]; then
+            chmod +x "$stage_root/${HUB_BINARY}"
+          fi
 
           # 2. vct-cli (vco) binary
           if [ "${MATRIX_TARGET}" = "windows-x64" ]; then
@@ -549,7 +605,14 @@ jobs:
         # but for an existing release pipeline v4 is the minimal upgrade.
         uses: actions/attest-build-provenance@v4
         with:
-          subject-path: launcher/dist/${{ matrix.target }}/_release/${{ (startsWith(matrix.target, 'macos-')) && format('vct-launcher-{0}-experimental', matrix.target) || matrix.binary }}
+          # v0.2.21+: multi-line subject-path attests BOTH binaries in a
+          # single provenance predicate, so `gh attestation verify` works
+          # for vct-launcher AND vct-hub from the same workflow run. If a
+          # future @v5 release tightens multi-subject semantics, fall back
+          # to two separate `actions/attest-build-provenance` steps.
+          subject-path: |
+            launcher/dist/${{ matrix.target }}/_release/${{ (startsWith(matrix.target, 'macos-')) && format('vct-launcher-{0}-experimental', matrix.target) || matrix.binary }}
+            launcher/dist/${{ matrix.target }}/_release/${{ (startsWith(matrix.target, 'macos-')) && format('vct-hub-{0}-experimental', matrix.target) || steps.hub_meta.outputs.binary }}
 
       # Upload the binary + metadata + full release archive as Release
       # assets. softprops/action-gh-release@v3 auto-creates the release
@@ -582,9 +645,22 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: vct-launcher-${{ matrix.target }}
+          # v0.2.21+: artifact now bundles BOTH binaries + sidecars under
+          # the same artifact name (vct-launcher-<target>). actions/upload-
+          # artifact@v7 flattens multi-line `path:` of individual files
+          # into the artifact root, so download-artifact will produce:
+          #   _dist-artifacts/<target>/vct-launcher[.exe]
+          #   _dist-artifacts/<target>/vct-launcher[.exe].metadata.json
+          #   _dist-artifacts/<target>/vct-hub[.exe]
+          #   _dist-artifacts/<target>/vct-hub[.exe].metadata.json
+          # The commit-dist-binaries job downstream consumes this flat
+          # layout — its stage_binary function is already generic over
+          # binary name (see lines below).
           path: |
             launcher/dist/${{ matrix.target }}/${{ matrix.binary }}
             launcher/dist/${{ matrix.target }}/${{ matrix.binary }}.metadata.json
+            launcher/dist/${{ matrix.target }}/${{ steps.hub_meta.outputs.binary }}
+            launcher/dist/${{ matrix.target }}/${{ steps.hub_meta.outputs.binary }}.metadata.json
           if-no-files-found: error
 
       - name: Upload release archive as workflow artifact
@@ -778,6 +854,14 @@ jobs:
           stage_binary "_dist-artifacts/windows-x64" "windows-x64" "vct-launcher.exe"
           stage_binary "_dist-artifacts/macos-arm64" "macos-arm64" "vct-launcher"
 
+          # v0.2.21+: vct-hub rides along inside the same per-arch
+          # artifact (see Upload launcher binary as workflow artifact
+          # above), so no extra download steps are needed — just three
+          # additional stage_binary calls reusing the generic function.
+          stage_binary "_dist-artifacts/linux-x64"   "linux-x64"   "vct-hub"
+          stage_binary "_dist-artifacts/windows-x64" "windows-x64" "vct-hub.exe"
+          stage_binary "_dist-artifacts/macos-arm64" "macos-arm64" "vct-hub"
+
           echo "changed=${changed}" >> "$GITHUB_OUTPUT"
           echo "Summary: ${changed} binary/binaries updated."
 
@@ -793,13 +877,22 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           # Stage ONLY the dist binary files — nothing else.
+          # v0.2.21+: six new entries cover vct-hub (binary + sidecar) for
+          # each of the three arches. The grep-whitelist below
+          # (`grep -v '^launcher/dist/'`) already accepts these paths.
           git add \
             launcher/dist/linux-x64/vct-launcher \
             launcher/dist/linux-x64/vct-launcher.metadata.json \
             launcher/dist/windows-x64/vct-launcher.exe \
             launcher/dist/windows-x64/vct-launcher.exe.metadata.json \
             launcher/dist/macos-arm64/vct-launcher \
-            launcher/dist/macos-arm64/vct-launcher.metadata.json
+            launcher/dist/macos-arm64/vct-launcher.metadata.json \
+            launcher/dist/linux-x64/vct-hub \
+            launcher/dist/linux-x64/vct-hub.metadata.json \
+            launcher/dist/windows-x64/vct-hub.exe \
+            launcher/dist/windows-x64/vct-hub.exe.metadata.json \
+            launcher/dist/macos-arm64/vct-hub \
+            launcher/dist/macos-arm64/vct-hub.metadata.json
 
           # Verify only the expected files are staged — no collateral.
           staged="$(git diff --cached --name-only)"
@@ -811,10 +904,10 @@ jobs:
             exit 1
           fi
 
-          git commit -m "chore(binary): refresh vct-launcher dist binaries for v${VERSION}
+          git commit -m "chore(binary): refresh vct-launcher + vct-hub dist binaries for v${VERSION}
 
           Auto-committed by release workflow after successful tag build.
-          Binaries: linux-x64, windows-x64, macos-arm64.
+          Binaries: vct-launcher, vct-hub on linux-x64, windows-x64, macos-arm64.
           Source tag: v${VERSION}  Run: ${{ github.run_id }}"
 
           # v0.2.17 fix: race-tolerant push. The build matrix took
