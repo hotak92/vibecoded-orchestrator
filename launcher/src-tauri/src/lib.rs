@@ -681,7 +681,35 @@ pub fn run() {
             // `launcher.services_watcher_enabled` app_state row to
             // `false`); default is ENABLED. Soft-fail throughout: never
             // takes the launcher down.
-            services::watcher::spawn(app.handle().clone());
+            //
+            // v0.2.21 W2 cutover guard: when install.py is mid-cutover
+            // (writing `<vct_root_dir>/v0.2.21-cutover.flag` BEFORE it
+            // starts vct-hub), skip the embedded watcher startup —
+            // vct-hub's supervisor will take over service-health
+            // polling. install.py deletes the sentinel after vct-hub
+            // responds to /health (typically <5 s). A leftover
+            // sentinel on a steady-state boot (vct-hub already running
+            // and healthy via hub_launcher::ensure_hub_running above)
+            // is harmless: the launcher-side watcher stays disabled
+            // and the hub-side supervisor handles auto-restart. If
+            // the sentinel is present AND the hub is missing, the
+            // launcher comes up in degraded mode (resolver falls back
+            // to env vars; no auto-restart) which matches the
+            // "hub-unavailable" path's existing contract.
+            let cutover_sentinel_present = paths::vct_root_dir()
+                .join("v0.2.21-cutover.flag")
+                .is_file();
+            if cutover_sentinel_present {
+                eprintln!(
+                    "[vct] v0.2.21 cutover sentinel detected at \
+                     {}/v0.2.21-cutover.flag; skipping embedded \
+                     services::watcher::spawn (vct-hub supervisor \
+                     takes over).",
+                    paths::vct_root_dir().display(),
+                );
+            } else {
+                services::watcher::spawn(app.handle().clone());
+            }
 
             // PR-42 (v0.2.12 / 2026-05-16): `.claude/settings.json`
             // watcher. When the user edits env in settings.json, this
