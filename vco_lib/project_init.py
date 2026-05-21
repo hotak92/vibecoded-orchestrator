@@ -2908,6 +2908,73 @@ def _emit_user_modified_deferral(
     report.write(folder)
 
 
+def _emit_orphan_preserved_deferral(
+    folder: Path, orphan_files: list[str], orchestrator_root: Path,
+) -> None:
+    """v0.2.24 §A0 audit (2026-05-22): emit
+    `bundle_user_modified_deletion_preserved` when files the orchestrator
+    PREVIOUSLY shipped (recorded in manifest["files"]) are now absent
+    from the new shipped enumeration AND the user has customized them
+    vs the prior shipped hash.
+
+    Behavior contract:
+    - Files NOT user-modified (hash matches prior shipped) are deleted
+      silently — they were always the orchestrator's content, and the
+      orchestrator no longer ships them. No deferral.
+    - Files user-modified are PRESERVED on disk (we don't destroy
+      user content), the manifest entry is kept so a future re-ship
+      would recognize the baseline, and a deferral is emitted so a
+      Claude session sees that VCO no longer ships these files.
+
+    Severity is `info` — the project is functional; this is purely
+    "FYI, you have files VCO no longer manages".
+    """
+    if not orphan_files:
+        return
+    from vco_lib.deferral_report import DeferralEntry, DeferralReport
+
+    files_md = _format_file_list_md(sorted(orphan_files))
+    cmd = (
+        f"# These files are no longer shipped by the orchestrator but you\n"
+        f"# customized them, so VCO preserved them on disk. Options:\n"
+        f"#\n"
+        f"# (1) Keep them as-is — they're yours now (most common choice):\n"
+        f"python -m vco_lib.project_init dismiss-deferral "
+        f"--folder {str(folder)!r} "
+        f"--condition-id bundle_user_modified_deletion_preserved\n"
+        f"#\n"
+        f"# (2) Delete them if you no longer need them:\n"
+        f"#   rm <path>     # POSIX\n"
+        f"#   del <path>    # Windows cmd.exe\n"
+        f"# Then run --update again so VCO drops the manifest entry."
+    )
+    entry = DeferralEntry(
+        condition_id="bundle_user_modified_deletion_preserved",
+        title="User-modified bundle files preserved after upstream deletion",
+        detected=(
+            f"During an `install-bundle --update` run, "
+            f"{len(orphan_files)} file(s) that VCO previously shipped were "
+            f"NOT re-shipped (upstream removed them) AND your local copy "
+            f"differs from what VCO originally shipped. They were "
+            f"preserved on disk rather than auto-deleted:\n"
+            f"{files_md}"
+        ),
+        why_deferred=(
+            "Default-to-safety: VCO does not auto-delete files the user "
+            "has modified, even when upstream no longer ships them. You "
+            "may have customized these for project-specific use. Use the "
+            "options below to either keep them indefinitely or remove "
+            "them manually."
+        ),
+        command_to_apply=cmd,
+        severity="info",
+        kg_node_refs=[],
+    )
+    report = DeferralReport.read(folder)
+    report.add_entry(entry)
+    report.write(folder)
+
+
 def _emit_skipped_existing_deferral(
     folder: Path, skipped_files: list[str], orchestrator_root: Path,
 ) -> None:
@@ -4337,6 +4404,8 @@ def install_project_bundle(
             "noop": [<rel>...],
             "preserve": [<rel>...],
             "skip-existing": [<rel>...],
+            "orphan-deleted": [<rel>...],       # v0.2.24 §A0
+            "orphan-preserved": [<rel>...],     # v0.2.24 §A0
         },
         "settings_action": "created"|"merged"|"unchanged"|"unchanged (user file unparseable)"|"" ,
         "manifest_written": bool,
@@ -4367,7 +4436,8 @@ def install_project_bundle(
             "dry_run": bool(dry_run),
             "actions": {k: [] for k in
                         ("create", "overwrite", "always-overwrite",
-                         "noop", "preserve", "skip-existing")},
+                         "noop", "preserve", "skip-existing",
+                         "orphan-deleted", "orphan-preserved")},
             "settings_action": "",
             "manifest_written": False,
             "vco_version": "unknown",
@@ -4387,9 +4457,17 @@ def install_project_bundle(
         "update_mode": bool(update_mode),
         "force": bool(force),
         "dry_run": bool(dry_run),
+        # v0.2.24 §A0 audit (2026-05-22): added `orphan-deleted` /
+        # `orphan-preserved` to the action buckets. Orphans are files
+        # in manifest["files"] that this run did NOT re-ship (e.g.
+        # upstream deleted them). `orphan-deleted` = removed on disk
+        # because hash matched what we previously shipped (user
+        # untouched); `orphan-preserved` = kept on disk because user
+        # modified vs the prior shipped hash.
         "actions": {k: [] for k in
                     ("create", "overwrite", "always-overwrite",
-                     "noop", "preserve", "skip-existing")},
+                     "noop", "preserve", "skip-existing",
+                     "orphan-deleted", "orphan-preserved")},
         "settings_action": "",
         "manifest_written": False,
         "vco_version": _resolve_vco_version(orchestrator_root),
@@ -4515,6 +4593,79 @@ def install_project_bundle(
             }
 
         result["actions"][action].append(op.dest_rel)
+
+    # v0.2.24 §A0 audit item #1 (2026-05-22): detect orphans — files
+    # the orchestrator previously shipped (recorded in manifest["files"])
+    # but DID NOT ship this run (not in `ops`). Three sub-cases:
+    #
+    #   (a) Orphan no longer on disk → silently drop from manifest.
+    #       Already deleted (likely by a previous --force or the user).
+    #   (b) Orphan present, matches prior_shipped_hash → user never
+    #       touched it. Safe to delete; record under
+    #       `bundle_orphan_deleted` for visibility (info severity).
+    #   (c) Orphan present, hash DIFFERS from prior_shipped_hash → user
+    #       customized it. PRESERVE on disk + emit
+    #       `bundle_user_modified_deletion_preserved` deferral so the
+    #       user knows VCO no longer ships this file but they may
+    #       still want their copy. They can delete it manually after.
+    #
+    # We populate result["actions"]["orphan-deleted"] /
+    # ["orphan-preserved"] for caller introspection. The orphan deletion
+    # in case (b) is a SAFE delete — file matches what VCO shipped
+    # exactly, so the user can never have meaningful customizations on
+    # it.
+    orphan_deleted: list[str] = []
+    orphan_preserved: list[str] = []
+    prior_files: dict = manifest.get("files", {}) or {}
+    new_files_keys = set(new_files.keys())
+    # Compute orphans BEFORE we also include user-modified preserves —
+    # the preserved files write their prior entry into new_files (line
+    # ~4456), so subtracting new_files_keys from prior_files gives the
+    # paths the new run truly did NOT see.
+    seen_in_ops = {op.dest_rel for op in ops}
+    for prior_rel, prior_entry in prior_files.items():
+        if prior_rel in seen_in_ops:
+            # Re-shipped this run; not an orphan.
+            continue
+        prior_hash = (prior_entry or {}).get("sha256", "")
+        target_path = folder / prior_rel
+        if not target_path.exists():
+            # Case (a) — already gone; just don't carry forward.
+            continue
+        try:
+            installed_hash = _file_sha256(target_path)
+        except Exception:
+            # Read error → treat as preserved (default to safety).
+            orphan_preserved.append(prior_rel)
+            new_files[prior_rel] = prior_entry  # Keep manifest entry.
+            continue
+        if prior_hash and installed_hash == prior_hash:
+            # Case (b) — safe delete. Hash matches what we shipped,
+            # so the user never edited it. Delete from disk; drop
+            # from manifest (already not in new_files).
+            if not dry_run:
+                try:
+                    target_path.unlink()
+                    orphan_deleted.append(prior_rel)
+                except OSError as e:
+                    _log("4.bundle.orphan", "warn",
+                         f"could not delete orphan {prior_rel}: {e}",
+                         data={"path": prior_rel, "error": str(e)})
+                    # Couldn't delete → treat as preserved + warn.
+                    orphan_preserved.append(prior_rel)
+                    new_files[prior_rel] = prior_entry
+            else:
+                # Dry-run: still report the would-be deletion.
+                orphan_deleted.append(prior_rel)
+        else:
+            # Case (c) — user-modified. Preserve on disk; keep manifest
+            # entry so a FUTURE shipped version of this file (should it
+            # come back) can recognize the prior baseline.
+            orphan_preserved.append(prior_rel)
+            new_files[prior_rel] = prior_entry
+
+    result["actions"]["orphan-deleted"] = orphan_deleted
+    result["actions"]["orphan-preserved"] = orphan_preserved
 
     # Smart-merge settings.json template separately. The template carries
     # the orchestrator's hooks block + permissions defaults. The merge
@@ -4746,6 +4897,25 @@ def install_project_bundle(
                     f"skipped-existing deferral write failed: {err}"
                 )
 
+        # v0.2.24 §A0 audit (2026-05-22): user-modified files the
+        # orchestrator no longer ships (upstream deletion) → emit
+        # `bundle_user_modified_deletion_preserved`. Files that
+        # matched the prior shipped hash were already SAFE-deleted in
+        # the orphan loop and don't need a deferral.
+        if update_mode and orphan_preserved:
+            try:
+                _emit_orphan_preserved_deferral(
+                    folder, orphan_preserved, orchestrator_root,
+                )
+            except Exception as e:
+                err = f"{type(e).__name__}: {e}"
+                _log("4.bundle.deferral", "error",
+                     f"orphan-preserved deferral write failed: {err}",
+                     data={"error": err})
+                result["warnings"].append(
+                    f"orphan-preserved deferral write failed: {err}"
+                )
+
         # Item 7 (2026-05-13): emit `template_review_pending` when any of
         # the three project-level templates meaningfully differ from the
         # current shipping reference. Severity is info — purely a nudge.
@@ -4851,6 +5021,11 @@ def install_project_bundle(
                 still_template_review_pending=bool(template_review_diverged),
                 still_legacy_kg=bool(legacy_kg_candidates),
                 still_legacy_codegraph=bool(legacy_codegraph_candidates),
+                # v0.2.24 §A0 (2026-05-22): include the new orphan-
+                # preserved condition so a future run that has no
+                # remaining orphans (user deleted them, or upstream
+                # re-added) clears the stale deferral.
+                still_orphan_preserved=bool(orphan_preserved),
             )
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
@@ -4872,6 +5047,7 @@ def _reconcile_bundle_deferrals(
     still_template_review_pending: bool = False,
     still_legacy_kg: bool = False,
     still_legacy_codegraph: bool = False,
+    still_orphan_preserved: bool = False,
 ) -> None:
     """Trim bundle-specific deferral entries that this install resolved.
 
@@ -4901,6 +5077,11 @@ def _reconcile_bundle_deferrals(
         # the stale entry.
         "kg_collection_legacy_candidates": still_legacy_kg,
         "codegraph_collection_legacy_candidates": still_legacy_codegraph,
+        # v0.2.24 §A0 (2026-05-22): orphan-preserved bookkeeping. When
+        # the user deletes the orphan file manually (or upstream
+        # re-adds it), `still_orphan_preserved` becomes False and the
+        # next install clears the stale deferral entry.
+        "bundle_user_modified_deletion_preserved": still_orphan_preserved,
     }
 
     report = DeferralReport.read(folder)
