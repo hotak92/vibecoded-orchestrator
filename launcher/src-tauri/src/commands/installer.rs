@@ -3371,6 +3371,17 @@ pub async fn update_orchestrator<R: Runtime>(
     }
     let pre_merge_outcomes = run_pre_merge_user_editable(&install_path, &pull_branch).await;
 
+    // v0.2.24 §A0 (Q1 fix): emit deferral entries BEFORE the bare
+    // git pull. Rationale: when pre-merge produces sidecars (true
+    // 3-way conflict), the local file is still divergent and the
+    // --ff-only pull WILL fail with non-FF. The user then sees the
+    // B4 divergence modal — without the deferral entries on disk,
+    // they lose the audit trail of which files pre-merge sidecar'd
+    // vs auto-merged. Emit unconditionally so the deferral lands
+    // regardless of which branch the pull takes. Best-effort: a
+    // deferral-write failure must NOT block the update flow.
+    maybe_emit_pre_merge_deferrals(&install_path, &pre_merge_outcomes, &pull_branch);
+
     let pull = tokio::process::Command::new("git")
         .args([
             "pull",
@@ -3451,12 +3462,8 @@ pub async fn update_orchestrator<R: Runtime>(
 
     emit_progress(&window, "update", "Changes pulled", 30.0);
 
-    // v0.2.24 §A0: emit deferral entries for the pre-merged
-    // user-editable files now that the pull succeeded. Done before
-    // install.py runs so the launcher's UPDATE_DEFERRED.md viewer can
-    // surface the entries on the next session start. Best-effort: a
-    // deferral-write failure mustn't block the update.
-    maybe_emit_pre_merge_deferrals(&install_path, &pre_merge_outcomes, &pull_branch);
+    // v0.2.24 §A0 (Q1 fix): deferrals were already emitted BEFORE the
+    // pull (see above) — no second call needed here.
 
     // Stage 2: Re-run install.py with --update flag
     emit_progress(&window, "install", "Applying updates...", 40.0);
@@ -4219,6 +4226,17 @@ pub async fn merge_orchestrator_with_upstream<R: Runtime>(
     }
     let pre_merge_outcomes = run_pre_merge_user_editable(&install_path, &pull_branch).await;
 
+    // v0.2.24 §A0 (Q1 fix): emit deferral entries BEFORE the git pull
+    // merge. Rationale: when pre-merge produces sidecars (true 3-way
+    // conflict), the bare `git pull --no-rebase` may STILL fail (the
+    // sidecar leaves the working tree dirty, plus other tracked files
+    // may have committed-divergence conflicts that git's own merge
+    // can't reconcile). User then sees the B4 conflict modal — without
+    // the deferral entries on disk, they lose the audit trail of which
+    // files pre-merge sidecar'd vs auto-merged. Emit unconditionally
+    // so the deferral lands regardless of pull outcome. Best-effort.
+    maybe_emit_pre_merge_deferrals(&install_path, &pre_merge_outcomes, &pull_branch);
+
     // Pull WITHOUT --ff-only, explicitly as a merge (--no-rebase). The
     // explicit reconcile flag is REQUIRED on git 2.34+: without it git
     // refuses a divergent pull with "Need to specify how to reconcile
@@ -4295,12 +4313,8 @@ pub async fn merge_orchestrator_with_upstream<R: Runtime>(
             revert_pre_pull_rename(backup);
         }
         let _ = ensure_hub_started_after_update(&install_path);
-        // v0.2.24 §A0: even on "already up to date" pull, the pre-merge
-        // may have produced outcomes (e.g. the user had local edits but
-        // upstream had no new commits — pre-merge is a no-op then, but
-        // defensive emit here so the path stays consistent with the
-        // non-"up to date" branch).
-        maybe_emit_pre_merge_deferrals(&install_path, &pre_merge_outcomes, &pull_branch);
+        // v0.2.24 §A0 (Q1 fix): deferrals were already emitted BEFORE
+        // the pull (see above) — no second call needed here.
         return Ok(InstallResult {
             success: true,
             install_path: path,
@@ -4309,12 +4323,8 @@ pub async fn merge_orchestrator_with_upstream<R: Runtime>(
         });
     }
 
-    // v0.2.24 §A0: emit deferral entries for the pre-merged user-
-    // editable files now that the merge succeeded. Done before
-    // install.py runs (inside run_post_pull_install_and_restart) so
-    // the launcher's UPDATE_DEFERRED.md viewer can surface entries on
-    // the next session start. Best-effort.
-    maybe_emit_pre_merge_deferrals(&install_path, &pre_merge_outcomes, &pull_branch);
+    // v0.2.24 §A0 (Q1 fix): deferrals were already emitted BEFORE the
+    // pull (see above) — no second call needed here.
 
     run_post_pull_install_and_restart(
         app,
