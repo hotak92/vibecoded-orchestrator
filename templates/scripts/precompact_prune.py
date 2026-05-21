@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 VibeCoded Tools
 """
 Gentle pre-compact context pruning — generates a compact summary of large tool
 results that were in context, so the reinject hook can include it instead of

@@ -1259,9 +1259,11 @@
   let editName = $state($currentUser?.name ?? '');
   let profileSaved = $state(false);
   // Keep `editName` in sync if Supabase pushes a new profile name
-  // (e.g. another session updated it). Same pattern the popover used.
-  currentUser.subscribe((u) => {
-    if (u) editName = u.name;
+  // (e.g. another session updated it). $effect auto-unsubscribes on
+  // component destroy — replaces the popover-era .subscribe() pattern
+  // which leaked one subscription per /preferences mount.
+  $effect(() => {
+    if ($currentUser) editName = $currentUser.name;
   });
 
   async function saveProfile() {
@@ -1280,10 +1282,13 @@
   let autoUpdate = $state(true);
   let launchOnStartup = $state(false);
 
-  settings.subscribe((s) => {
-    installPath = s.installPath;
-    autoUpdate = s.autoUpdate;
-    launchOnStartup = s.launchOnStartup;
+  // $effect auto-unsubscribes on component destroy. Replaces the
+  // popover-era .subscribe() pattern that leaked one subscription per
+  // /preferences mount.
+  $effect(() => {
+    installPath = $settings.installPath;
+    autoUpdate = $settings.autoUpdate;
+    launchOnStartup = $settings.launchOnStartup;
   });
 
   // ── Shared services live status (v0.2.23 F2 wave 2b, relocated) ───────

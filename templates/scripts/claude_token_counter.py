@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 VibeCoded Tools
 """Shared work-units counter for Claude Code transcript JSONL.
 
 # v10.1 (2026-05-01) — work-units counter for KG-update nudge

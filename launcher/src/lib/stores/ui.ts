@@ -15,16 +15,14 @@ import { writable } from 'svelte/store';
 import { goto } from '$app/navigation';
 import { clearOnboardingComplete } from '$lib/onboarding';
 
-// Sections recognised by the compatibility shim. The popover used to
-// render five tabs (profile/downloads/secrets/preferences/about); now
-// only 'secrets' has a distinct route target. The rest route to
-// /preferences and rely on the user scrolling to the relevant section.
-export type SettingsSection =
-  | 'profile'
-  | 'downloads'
-  | 'secrets'
-  | 'preferences'
-  | 'about';
+// v0.2.24: narrowed from the popover-era 5-value union (profile /
+// downloads / secrets / preferences / about) to just 'secrets'.
+// The other 4 all collapsed to goto('/preferences'), so the only
+// remaining discriminator is whether the caller wants the secrets
+// sub-route. New code should call goto('/preferences') /
+// goto('/preferences/secrets') directly; this type only exists to
+// keep the compatibility shim's signature precise.
+export type SettingsSection = 'secrets';
 
 interface UIState {
   showActivation: boolean;
@@ -67,11 +65,6 @@ function createUIStore() {
       const target = section === 'secrets' ? '/preferences/secrets' : '/preferences';
       void goto(target);
     },
-    // closeSettings is a no-op now (no popover state to clear). Kept
-    // so any leftover callers that pair open/close don't break at
-    // runtime — they'll just navigate to /preferences and then this
-    // becomes a harmless tail call.
-    closeSettings: () => {},
     openActivation: () => update((s) => ({ ...s, showActivation: true })),
     closeActivation: () => update((s) => ({ ...s, showActivation: false })),
     openInstallWizard: () => update((s) => ({ ...s, showInstallWizard: true })),
