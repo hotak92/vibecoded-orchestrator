@@ -27,6 +27,48 @@ const ORCHESTRATOR_REPO: &str = "https://github.com/hotak92/vibecoded-orchestrat
 /// installed somewhere else, e.g. `/home/x/Desktop/PROGETTI/VCO_dev`).
 pub(crate) const APP_STATE_KEY_INSTALL_PATH: &str = "launcher.install_path";
 
+/// v0.2.23.1 helper (2026-05-21): synchronous resolver for the install
+/// root, used by non-Tauri-command code paths (e.g. `manifest_scan_paths`
+/// in module_gui.rs) that need to discover the orchestrator clone root
+/// without going through the async `get_known_install_path` command.
+///
+/// Same two-strategy resolution as the async sibling:
+///   1. Read `launcher.install_path` from `app_state`. Validate the
+///      cached path still passes `check_install_status`; fall through
+///      if stale.
+///   2. Walk up from `current_exe()` looking for `install.py + CLAUDE.md`
+///      markers (`walk_for_install_markers`). On a hit, write back to
+///      app_state so future calls take the cached path.
+///
+/// Returns `None` when no install is discoverable. Callers should treat
+/// `None` as "scan the empty set" — never panic or return a phantom path.
+///
+/// **No hardcoded paths in the binary**: the resolution is fully
+/// runtime-derived (DB OR exe location). No `env!("CARGO_MANIFEST_DIR")`
+/// fallback — that macro leaks the build-host's absolute path and is
+/// wrong on shipped binaries (build-time != runtime). Discipline shared
+/// with `self_update.rs:280` + `find_local_repo_root` (privacy notes
+/// from 2026-05-06).
+pub(crate) fn resolve_install_root_sync(db: &Db) -> Option<PathBuf> {
+    // Strategy 1: cached path from app_state.
+    if let Ok(Some(cached)) = db.app_state_get(APP_STATE_KEY_INSTALL_PATH) {
+        if !cached.is_empty() && check_install_status(cached.clone()) {
+            return Some(PathBuf::from(cached));
+        }
+    }
+    // Strategy 2: walk up from current_exe() looking for install markers.
+    let found = walk_for_install_markers()?;
+    // Sticky cache — future calls take the cached path.
+    let s = found.to_string_lossy().to_string();
+    if let Err(e) = db.app_state_set(APP_STATE_KEY_INSTALL_PATH, &s) {
+        eprintln!(
+            "[vct] resolve_install_root_sync: failed to cache install_path: {}",
+            e
+        );
+    }
+    Some(found)
+}
+
 /// app_state key for the last-detected hardware snapshot. Populated on
 /// first launcher boot and refreshed by the "Re-detect hardware" button
 /// in Preferences. Comparing the persisted snapshot against a fresh
@@ -1141,7 +1183,7 @@ pub fn detect_existing_install_root() -> Option<String> {
 /// without requiring per-platform branching. Sanity-only check (the two
 /// files), no manifest gating — a dev clone with no `state/install-manifest.json`
 /// is still a valid install root for launcher-discovery purposes.
-fn walk_for_install_markers() -> Option<PathBuf> {
+pub(crate) fn walk_for_install_markers() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let mut current = exe.parent()?.to_path_buf();
     for _ in 0..8 {

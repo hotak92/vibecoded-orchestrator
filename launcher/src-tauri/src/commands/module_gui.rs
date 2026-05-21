@@ -57,7 +57,13 @@ pub struct ModuleNavItem {
 // keep that module's surface small. If a third caller needs scanning,
 // promote `catalog_scan_paths` to a shared util.
 
-fn manifest_scan_paths() -> Vec<PathBuf> {
+/// v0.2.23.1 refactor (2026-05-21): now takes `&Db` so the orchestrator
+/// clone root can be resolved via `app_state['launcher.install_path']`
+/// (sticky DB cache) instead of a baked-in heuristic. See
+/// `installer::resolve_install_root_sync` for the rationale — short
+/// version: `env!("CARGO_MANIFEST_DIR")` leaks the build-host path and
+/// is wrong on shipped binaries.
+fn manifest_scan_paths(db: &Db) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     let vct_root = crate::paths::vct_root_dir();
     {
@@ -85,19 +91,14 @@ fn manifest_scan_paths() -> Vec<PathBuf> {
         }
     }
 
-    // Dev-only: <orchestrator_clone>/paid-modules/*/vct-module.json so
-    // the RL reranker tab appears even before the production discovery
-    // path lands. Mirrors `modules::catalog_scan_paths`.
-    let orchestrator_clone = std::env::var_os("VCT_INSTALL_ROOT")
-        .map(PathBuf::from)
-        .or_else(|| {
-            Some(
-                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .parent()? // launcher/
-                    .parent()? // repo root
-                    .to_path_buf(),
-            )
-        });
+    // Resolve the orchestrator clone root via the shared sync helper.
+    // No hardcoded paths in this binary — resolution is DB-cached
+    // (`launcher.install_path` app_state key, written at first install
+    // and validated on every read) with a `current_exe()` walk-up as
+    // the fall-through. See `installer::resolve_install_root_sync` for
+    // the full rationale incl. the CARGO_MANIFEST_DIR privacy leak we
+    // deliberately removed. v0.2.23.1 fix (2026-05-21).
+    let orchestrator_clone = crate::commands::installer::resolve_install_root_sync(db);
     if let Some(clone) = orchestrator_clone {
         let paid = clone.join("paid-modules");
         if paid.is_dir() {
@@ -143,12 +144,12 @@ fn resolve_route(module_id: &str, route: Option<&str>) -> String {
 /// single bad file can't break the sidebar for every other module.
 #[command]
 pub async fn get_module_nav_items(
-    _db: State<'_, Db>,
+    db: State<'_, Db>,
 ) -> Result<Vec<ModuleNavItem>, String> {
     let mut items: Vec<ModuleNavItem> = Vec::new();
     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    for path in manifest_scan_paths() {
+    for path in manifest_scan_paths(&db) {
         let raw = match std::fs::read_to_string(&path) {
             Ok(s) => s,
             Err(e) => {
@@ -331,5 +332,167 @@ mod tests {
             .get_setting(&project_id, "vct-rl-reranker", "global_train_projects")
             .expect("get");
         assert_eq!(got, Some(val));
+    }
+
+    /// v0.2.23.1 regression (2026-05-21): pin the contract that the
+    /// two manifest-scanning helpers (`manifest_scan_paths` in this
+    /// file + `catalog_scan_paths` in `modules.rs`) resolve the
+    /// orchestrator clone root via `installer::resolve_install_root_sync`
+    /// — NOT via `env!("CARGO_MANIFEST_DIR")`. That macro embeds the
+    /// build-host's absolute path as a static string in the binary
+    /// (PRIVACY LEAK, `--remap-path-prefix` does NOT rewrite it) AND is
+    /// wrong on shipped binaries (build-time path != runtime path).
+    /// The canonical resolver reads `app_state['launcher.install_path']`
+    /// (sticky cache written at first install) with a `current_exe()`
+    /// walk-up fall-through. See installer.rs:31-49 + self_update.rs:275-288
+    /// for the 2026-05-06 privacy notes that established this
+    /// discipline.
+    ///
+    /// Source-level positive-contract check: both helpers MUST reference
+    /// `resolve_install_root_sync` AND MUST NOT contain a bare
+    /// `env!("CARGO_MANIFEST_DIR")` outside doc comments.
+    #[test]
+    fn production_code_does_not_use_cargo_manifest_dir_for_path_resolution() {
+        // Two surfaces under audit. Each must:
+        //   (a) Contain the canonical helper-call expression, AND
+        //   (b) NOT contain a bare CARGO_MANIFEST_DIR use in code
+        //       (doc comments at `///` are fine — they document the
+        //       privacy rationale).
+        struct ProductionSite {
+            file: &'static str,
+            fn_name: &'static str,
+        }
+        let sites = [
+            ProductionSite {
+                file: "src/commands/module_gui.rs",
+                fn_name: "manifest_scan_paths",
+            },
+            ProductionSite {
+                file: "src/commands/modules.rs",
+                fn_name: "catalog_scan_paths",
+            },
+        ];
+        let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        // NOTE: the env!("CARGO_MANIFEST_DIR") use right above is the
+        // only such use in this test file. It's compile-time-only path
+        // resolution to FIND the source files under audit. It does
+        // not bake into a production code path.
+
+        let mut violations: Vec<String> = Vec::new();
+        for site in &sites {
+            let path = repo_root.join(site.file);
+            let body = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
+
+            // Find the function body: from `fn <name>(...)` to the
+            // matching `}` of the immediately-following opening `{`.
+            let fn_marker = format!("fn {}(", site.fn_name);
+            let fn_pos = match body.find(&fn_marker) {
+                Some(p) => p,
+                None => {
+                    violations.push(format!(
+                        "{}: {} not found — the regression test is stale, update it.",
+                        site.file, site.fn_name,
+                    ));
+                    continue;
+                }
+            };
+            // Find the opening `{` of the body.
+            let body_open = match body[fn_pos..].find('{') {
+                Some(off) => fn_pos + off,
+                None => {
+                    violations.push(format!(
+                        "{}: {} has no body opening brace.",
+                        site.file, site.fn_name
+                    ));
+                    continue;
+                }
+            };
+            // Balanced-brace scan to find the matching `}`. Skips
+            // strings + comments to handle Rust source faithfully.
+            let bytes = body.as_bytes();
+            let mut depth = 1i32;
+            let mut i = body_open + 1;
+            let mut in_string = false;
+            let mut in_line_comment = false;
+            let mut in_block_comment = false;
+            let mut escape = false;
+            while i < bytes.len() && depth > 0 {
+                let c = bytes[i];
+                if in_line_comment {
+                    if c == b'\n' {
+                        in_line_comment = false;
+                    }
+                } else if in_block_comment {
+                    if c == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                        in_block_comment = false;
+                        i += 1;
+                    }
+                } else if in_string {
+                    if escape {
+                        escape = false;
+                    } else if c == b'\\' {
+                        escape = true;
+                    } else if c == b'"' {
+                        in_string = false;
+                    }
+                } else if c == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                    in_line_comment = true;
+                    i += 1;
+                } else if c == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                    in_block_comment = true;
+                    i += 1;
+                } else if c == b'"' {
+                    in_string = true;
+                } else if c == b'{' {
+                    depth += 1;
+                } else if c == b'}' {
+                    depth -= 1;
+                }
+                i += 1;
+            }
+            let body_end = i;
+            let fn_body = &body[body_open..body_end];
+
+            // (a) Canonical call must appear.
+            if !fn_body.contains("resolve_install_root_sync") {
+                violations.push(format!(
+                    "{}::{}: body does not reference \
+                     `installer::resolve_install_root_sync` — the canonical \
+                     install-root resolver was bypassed.",
+                    site.file, site.fn_name,
+                ));
+            }
+            // (b) No CARGO_MANIFEST_DIR in the function body.
+            // Filter out `///` doc comments that may be ABOVE the
+            // function (we scanned only the body, so this is just a
+            // belt-and-braces check on `//` line comments inside it).
+            for (idx, line) in fn_body.lines().enumerate() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                if line.contains("env!(\"CARGO_MANIFEST_DIR\")")
+                    || line.contains("option_env!(\"CARGO_MANIFEST_DIR\")")
+                {
+                    violations.push(format!(
+                        "{}::{} body line {}: uses CARGO_MANIFEST_DIR — \
+                         use installer::resolve_install_root_sync(db) instead. \
+                         Line: {}",
+                        site.file,
+                        site.fn_name,
+                        idx + 1,
+                        trimmed,
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "v0.2.23.1 regression — install-root resolution discipline \
+             violated:\n{}",
+            violations.join("\n")
+        );
     }
 }

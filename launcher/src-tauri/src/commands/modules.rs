@@ -307,7 +307,7 @@ fn builtin_catalog_entries(db: &Db) -> Vec<ModuleCatalogEntry> {
 /// In a real user install the orchestrator clone is read-only and the
 /// paid-modules dir doesn't exist there, so this path is a no-op for
 /// non-dev users.
-fn catalog_scan_paths() -> Vec<PathBuf> {
+fn catalog_scan_paths(db: &Db) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     let vct_root = crate::paths::vct_root_dir();
     {
@@ -336,21 +336,16 @@ fn catalog_scan_paths() -> Vec<PathBuf> {
         }
     }
 
-    // Dev-only: scan <orchestrator_clone>/paid-modules/*/vct-module.json.
-    // Resolved from VCT_INSTALL_ROOT (set by the launcher at startup to the
-    // active orchestrator clone) OR from $CARGO_MANIFEST_DIR's grandparent
-    // (works at `cargo test` time). Never panics — missing dir is silent.
-    let orchestrator_clone = std::env::var_os("VCT_INSTALL_ROOT")
-        .map(PathBuf::from)
-        .or_else(|| {
-            // Fallback for dev: walk up from cargo manifest dir to repo root.
-            Some(
-                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .parent()? // launcher/
-                    .parent()? // repo root
-                    .to_path_buf(),
-            )
-        });
+    // Scan <orchestrator_clone>/paid-modules/*/vct-module.json.
+    //
+    // v0.2.23.1 fix (2026-05-21): resolve via the shared sync helper
+    // that reads `launcher.install_path` from app_state (DB-cached at
+    // first install) with a current_exe() walk-up fallback. NO
+    // CARGO_MANIFEST_DIR fallback — that macro embeds the build-host's
+    // absolute path as a static string (PRIVACY LEAK + WRONG PATH on
+    // shipped binaries; see self_update.rs:280 + installer.rs:4399 for
+    // the 2026-05-06 privacy notes).
+    let orchestrator_clone = crate::commands::installer::resolve_install_root_sync(db);
     if let Some(clone) = orchestrator_clone {
         let paid = clone.join("paid-modules");
         if paid.is_dir() {
@@ -424,7 +419,7 @@ pub async fn list_module_catalog(db: State<'_, Db>) -> Result<Vec<ModuleCatalogE
     // Bug 16: built-in entries (launcher + orchestrator + KG + code graph)
     // come first — they're always present and reflect real repo state.
     let mut out = builtin_catalog_entries(&db);
-    for path in catalog_scan_paths() {
+    for path in catalog_scan_paths(&db) {
         let raw = match std::fs::read_to_string(&path) {
             Ok(s) => s,
             Err(_) => continue,
@@ -452,8 +447,8 @@ pub async fn list_module_catalog(db: State<'_, Db>) -> Result<Vec<ModuleCatalogE
     Ok(out)
 }
 
-fn find_manifest(module_id: &str) -> Result<(ModuleManifest, PathBuf), String> {
-    for path in catalog_scan_paths() {
+fn find_manifest(db: &Db, module_id: &str) -> Result<(ModuleManifest, PathBuf), String> {
+    for path in catalog_scan_paths(db) {
         let raw = std::fs::read_to_string(&path).unwrap_or_default();
         if let Ok(m) = ModuleManifest::from_json(&raw) {
             if m.id == module_id {
@@ -467,8 +462,8 @@ fn find_manifest(module_id: &str) -> Result<(ModuleManifest, PathBuf), String> {
 /// Public manifest-lookup for the rl_service restart path. Same logic as
 /// `find_manifest` (catalog scan + first matching id wins) but discards
 /// the source path since callers only need the parsed manifest.
-pub fn find_manifest_for_resume(module_id: &str) -> Option<ModuleManifest> {
-    find_manifest(module_id).ok().map(|(m, _)| m)
+pub fn find_manifest_for_resume(db: &Db, module_id: &str) -> Option<ModuleManifest> {
+    find_manifest(db, module_id).ok().map(|(m, _)| m)
 }
 
 // ─── Install / Uninstall ────────────────────────────────────────────────
@@ -486,7 +481,7 @@ pub async fn install_module_for_project(
         .ok_or_else(|| format!("project {} not found", project_id))?;
 
     // 2. Manifest lookup
-    let (manifest, manifest_path) = find_manifest(&module_id)?;
+    let (manifest, manifest_path) = find_manifest(&db, &module_id)?;
 
     // 3. Host compatibility
     let host_str = project.host.as_str();

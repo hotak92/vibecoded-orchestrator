@@ -685,7 +685,7 @@ pub async fn restart_rl_container(
         .get_project(&project_id)?
         .ok_or_else(|| format!("project {} not found", project_id))?;
 
-    let manifest = crate::commands::modules::find_manifest_for_resume(RL_RERANKER_MODULE_ID)
+    let manifest = crate::commands::modules::find_manifest_for_resume(&db, RL_RERANKER_MODULE_ID)
         .ok_or_else(|| {
             format!(
                 "manifest for {} not in catalog (cannot restart container)",
@@ -1314,7 +1314,7 @@ pub async fn get_rl_dashboard_state(
     // install.module_version. Falls back to "" if we can't read the
     // manifest (e.g. catalog is gone) — frontend renders no tag in
     // that case.
-    let image_tag = crate::commands::modules::find_manifest_for_resume(RL_RERANKER_MODULE_ID)
+    let image_tag = crate::commands::modules::find_manifest_for_resume(&db, RL_RERANKER_MODULE_ID)
         .and_then(|m| {
             m.install
                 .container
@@ -1451,7 +1451,7 @@ pub async fn resume_containers_on_startup(db: &Db) {
                 continue;
             }
         };
-        let manifest = match crate::commands::modules::find_manifest_for_resume(&module_id) {
+        let manifest = match crate::commands::modules::find_manifest_for_resume(db, &module_id) {
             Some(m) => m,
             None => {
                 eprintln!(
