@@ -1,11 +1,11 @@
 {
-  "source_sha": "67f048165bc99a6371dfd298252773cffa5ccfd1",
-  "source_short_sha": "67f0481+v0.2.23",
-  "source_hash": "v0.2.23-pre-tag-local-build",
-  "built_at": "2026-05-21T18:56:57Z",
+  "source_sha": "d57cfc38e03dc858d79203d11fbf6e1b6ed16dc6",
+  "source_short_sha": "d57cfc3",
+  "source_hash": "34900b398815f0f60239df262ef0bf8f4f78def2",
+  "built_at": "2026-05-21T19:09:01Z",
   "launcher_version": "0.2.23",
   "host_target": "linux-x64",
   "binary_name": "vct-launcher",
-  "binary_size_bytes": 24326456,
+  "binary_size_bytes": 24254776,
   "tier": "stable"
 }
