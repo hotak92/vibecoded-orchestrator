@@ -1,11 +1,10 @@
-# parity-confirmation 2026-05-21 (v0.2.23 W1): .sh sibling switched its
-# resolver field from `code_graph_project` (slug alias) to
-# `code_graph_collection_prefix` (binding-row truth — the canonical
-# Weaviate prefix from `project_codegraph_bindings.collection_prefix`).
-# This .ps1 does NOT call the resolver (it uses `detect-project.ps1` for
-# project-name resolution and `Split-Path -Leaf` as the fallback), so
-# there's no resolver-field-name to update on this side. True parity, no
-# asymmetric fix needed. See knowledge/concepts/multi-codebase-code-graph-detection.md.
+# OS-EXEMPT-PARITY: .sh sibling uses the hub resolver
+#   (vct_project_config.sh --field code_graph_collection_prefix); this
+#   .ps1 uses a different design path (`detect-project.ps1` helper +
+#   `Split-Path -Leaf` fallback), so the v0.2.23 W1 slug-vs-prefix
+#   resolver-field switch in the .sh has no corresponding change here.
+#   Marking the exemption explicitly so the OS-parity CI gate accepts
+#   the asymmetric modification. See knowledge/concepts/multi-codebase-code-graph-detection.md.
 # parity-confirmation 2026-05-10: .sh sibling now uses _lib/find-python.sh; this .ps1 already used _lib/find-python.ps1 — true parity, no asymmetric fix.
 # Parity-touch 2026-05-08: bash shebang of sibling .sh switched from #!/bin/bash to #!/usr/bin/env bash for macOS portability. PS1 has no shebang to change; this comment is the parity-required modification.
 # Scrub sensitive env vars before any subprocess spawning
