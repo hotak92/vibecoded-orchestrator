@@ -51,12 +51,13 @@ $ErrorActionPreference = 'Stop'
 # one best-effort stderr warning (forward-compat safety net) and
 # continue — the hub's response shape is additive across versions.
 $Script:RESOLVER_PROTOCOL_VERSION = 1
-# Process-local one-shot guard mirroring the bash sibling.
-$Script:SchemaWarned = $false
 
+# v0.2.24-A4: schema_version drift now routes through Emit-Warning's
+# cross-invocation rate-limit (suppression key keyed on hub_version, not
+# on PID). The process-local one-shot guard was removed — Emit-Warning's
+# JSONL-backed suppression handles dedup across the entire 5-min window.
 function Test-SchemaVersionWarning {
     param([string]$Body)
-    if ($Script:SchemaWarned) { return }
     if (-not $Body) { return }
     try {
         $obj = $Body | ConvertFrom-Json -ErrorAction Stop
@@ -74,11 +75,16 @@ function Test-SchemaVersionWarning {
         return
     }
     if ($hubVersion -gt $Script:RESOLVER_PROTOCOL_VERSION) {
-        [Console]::Error.WriteLine(
-            ("[vct_project_config] WARNING: hub schema_version={0} > client RESOLVER_PROTOCOL_VERSION={1}; some fields may be unknown. Update the orchestrator clone or downgrade the hub." -f `
-                $hubVersion, $Script:RESOLVER_PROTOCOL_VERSION)
-        )
-        $Script:SchemaWarned = $true
+        $line = ("[vct_project_config] WARNING: hub schema_version={0} > client RESOLVER_PROTOCOL_VERSION={1}; some fields may be unknown. Update the orchestrator clone or downgrade the hub." -f `
+            $hubVersion, $Script:RESOLVER_PROTOCOL_VERSION)
+        # Suppression key keyed on the OBSERVED hub version (not on PID)
+        # so every hook invocation against the same drifted hub shares
+        # one 5-min window.
+        Emit-Warning `
+            -ErrorKind "schema_version_drift" `
+            -Detail ("hub_version={0} client_version={1}" -f $hubVersion, $Script:RESOLVER_PROTOCOL_VERSION) `
+            -SuppressKey ("schema_version_drift_{0}" -f $hubVersion) `
+            -StderrLine $line
     }
 }
 
@@ -173,14 +179,26 @@ function ConvertTo-RWJsonString {
 }
 
 function Emit-Warning {
+    # Optional overrides (v0.2.24-A4):
+    #   -SuppressKey  → replaces the default "<pid>:<ErrorKind>" key.
+    #                   Use when the same warning should be suppressed
+    #                   ACROSS PIDs (e.g. schema_version_drift_<v>).
+    #   -StderrLine   → replaces the default
+    #                   "[vct] project_config: ..." line verbatim.
     param(
         [Parameter(Mandatory = $true)][string]$ErrorKind,
-        [string]$Detail = ''
+        [string]$Detail = '',
+        [string]$SuppressKey = '',
+        [string]$StderrLine = ''
     )
     $pid_ = $PID
     $consumer = Split-Path -Leaf $PSCommandPath
     if (-not $consumer) { $consumer = 'vct_project_config.ps1' }
-    $key = "${pid_}:${ErrorKind}"
+    if ($SuppressKey) {
+        $key = $SuppressKey
+    } else {
+        $key = "${pid_}:${ErrorKind}"
+    }
     $now = [long][Math]::Floor(([DateTimeOffset]::UtcNow.ToUnixTimeSeconds()))
 
     Initialize-RWCacheDir
@@ -189,10 +207,17 @@ function Emit-Warning {
         if (Test-RWShouldSuppress -Key $key -Now $now) { return }
     }
 
-    # Stderr line: same fixed shape across all three resolver clients.
-    [Console]::Error.WriteLine(
-        "[vct] project_config: ${ErrorKind}: ${Detail}. Falling back to env. (rate-limited; set VCO_HOOK_DEBUG=1 to see every occurrence)"
-    )
+    # Stderr line: default fixed shape matches bash + python siblings.
+    # Caller may pass -StderrLine to override (used by schema-version
+    # drift so the legacy "[vct_project_config] WARNING: ..." format
+    # stays stable across the rate-limit refactor).
+    if ($StderrLine) {
+        [Console]::Error.WriteLine($StderrLine)
+    } else {
+        [Console]::Error.WriteLine(
+            "[vct] project_config: ${ErrorKind}: ${Detail}. Falling back to env. (rate-limited; set VCO_HOOK_DEBUG=1 to see every occurrence)"
+        )
+    }
 
     # Cap detail at 200 chars (approximation of 200 bytes for ASCII-heavy text).
     $clipped = if ($Detail.Length -gt 200) { $Detail.Substring(0, 200) } else { $Detail }

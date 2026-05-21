@@ -41,9 +41,12 @@
 #
 # Stderr policy: on hub unreachable / project missing / misconfigured /
 # field missing, this script emits ONE rate-limited diagnostic line to
-# stderr via _emit_warning() before exiting non-zero. Suppression key is
-# (pid, error_kind); max one emission per 5-min window; VCO_HOOK_DEBUG=1
-# bypasses the limit. State persisted at
+# stderr via _emit_warning() before exiting non-zero. Default suppression
+# key is (pid, error_kind); callers may pass an explicit override (e.g.
+# the schema-version drift warning keys on the hub-reported version so
+# that ALL hooks across ALL PIDs share a single 5-min window). Max one
+# emission per key per 5-min window; VCO_HOOK_DEBUG=1 bypasses the limit.
+# State persisted at
 #   ${VCT_STATE_DIR:-$HOME/.vct}/cache/resolver_warn.jsonl
 # Hard usage errors / "neither jq nor python3" remain ALWAYS-emit via
 # err() — those are programmer-fix-required, not env-fallback paths.
@@ -56,10 +59,6 @@ set -euo pipefail
 # best-effort stderr warning (forward-compat safety net) and continue —
 # the hub's response shape is additive across versions.
 readonly RESOLVER_PROTOCOL_VERSION=1
-# Process-local one-shot guard so the warning fires AT MOST ONCE per
-# script invocation (a single script run only ever issues one config
-# fetch, but the guard mirrors the python sibling's warn-once contract).
-_VCT_SCHEMA_WARNED=0
 
 # VCO-REWIRE-BEGIN: orchestrator-root-resolution
 # This file is byte-identical between `templates/scripts/` (shipped to
@@ -80,13 +79,21 @@ err() { printf '[vct-project-config] %s\n' "$*" >&2; }
 #
 # Policy (mirrors vco_lib/resolver_warn.py):
 #   - Key:    "<pid>:<error_kind>"  (per-PID; parallel hooks each get one).
+#             Callers MAY override via the optional 3rd arg, in which
+#             case the override becomes the suppression key verbatim
+#             (used e.g. by schema-version drift, which keys on the
+#             hub-reported version so ALL hooks across ALL PIDs share
+#             a single 5-min window).
 #   - Window: 5 minutes per key.
 #   - Bypass: VCO_HOOK_DEBUG=1 → emit every occurrence.
 #   - State:  $VCT_STATE_DIR/cache/resolver_warn.jsonl
 #             (atomic append via flock on a sidecar lockfile).
 #   - Rotation: when JSONL exceeds 1 MiB, truncate to most-recent 100 rows.
 #
-# Usage:  _emit_warning <error_kind> [<detail>]
+# Usage:  _emit_warning <error_kind> [<detail>] [<suppress_key_override>] [<stderr_line_override>]
+#   The 4th arg, when non-empty, replaces the default
+#   "[vct] project_config: ..." stderr line entirely. The JSONL row
+#   shape is unchanged.
 _RW_CACHE_DIR_INIT=0
 _rw_cache_dir() {
     local state_dir="${VCT_STATE_DIR:-$HOME/.vct}"
@@ -168,9 +175,16 @@ _rw_json_escape() {
 _emit_warning() {
     local error_kind="$1"
     local detail="${2:-}"
+    local key_override="${3:-}"
+    local stderr_override="${4:-}"
     local pid=$$
     local consumer="${BASH_SOURCE[0]##*/}"
-    local key="${pid}:${error_kind}"
+    local key
+    if [[ -n "$key_override" ]]; then
+        key="$key_override"
+    else
+        key="${pid}:${error_kind}"
+    fi
     local now
     now=$(date +%s 2>/dev/null) || now=0
 
@@ -186,9 +200,16 @@ _emit_warning() {
         fi
     fi
 
-    # Stderr line: fixed shape; mirrors ps1 + python siblings.
-    printf '[vct] project_config: %s: %s. Falling back to env. (rate-limited; set VCO_HOOK_DEBUG=1 to see every occurrence)\n' \
-        "$error_kind" "$detail" >&2
+    # Stderr line: default fixed shape mirrors ps1 + python siblings.
+    # Callers may pass a custom line (4th arg) to override — used by
+    # schema-version drift so the legacy "[vct_project_config] WARNING: ..."
+    # format stays stable across the rate-limit refactor.
+    if [[ -n "$stderr_override" ]]; then
+        printf '%s\n' "$stderr_override" >&2
+    else
+        printf '[vct] project_config: %s: %s. Falling back to env. (rate-limited; set VCO_HOOK_DEBUG=1 to see every occurrence)\n' \
+            "$error_kind" "$detail" >&2
+    fi
 
     # Cap detail at 200 bytes (parameter expansion is byte-oriented for
     # ASCII; for multibyte it may split a codepoint, acceptable for a
@@ -360,11 +381,14 @@ else:
 # may include fields this client doesn't recognise, but the existing
 # fields still parse). Missing `schema_version` is treated as version 1
 # (pre-v0.2.22 hub) — no warning.
+#
+# v0.2.24-A4: the warning now routes through `_emit_warning` with a
+# stable cross-PID suppression key (`schema_version_drift_<hub_version>`)
+# so 100+ hook invocations in one Claude Code session don't spam stderr
+# 100+ times. Window is the standard 5 minutes; VCO_HOOK_DEBUG=1
+# bypasses.
 _maybe_warn_schema_version() {
     local body="$1"
-    if (( _VCT_SCHEMA_WARNED != 0 )); then
-        return 0
-    fi
     local raw
     raw=$(json_extract "$body" '.schema_version' 2>/dev/null) || raw=""
     # Strip non-digits defensively (json_extract emits the bare value
@@ -381,9 +405,18 @@ _maybe_warn_schema_version() {
     fi
     local hub_version=$((10#$raw))
     if (( hub_version > RESOLVER_PROTOCOL_VERSION )); then
-        printf '[vct_project_config] WARNING: hub schema_version=%d > client RESOLVER_PROTOCOL_VERSION=%d; some fields may be unknown. Update the orchestrator clone or downgrade the hub.\n' \
-            "$hub_version" "$RESOLVER_PROTOCOL_VERSION" >&2
-        _VCT_SCHEMA_WARNED=1
+        local line
+        line=$(printf '[vct_project_config] WARNING: hub schema_version=%d > client RESOLVER_PROTOCOL_VERSION=%d; some fields may be unknown. Update the orchestrator clone or downgrade the hub.' \
+            "$hub_version" "$RESOLVER_PROTOCOL_VERSION")
+        # Suppression key keyed on the OBSERVED hub version (not on PID)
+        # so every hook invocation against the same drifted hub shares
+        # one 5-min window. The error_kind/detail still feed into the
+        # JSONL telemetry row for diagnostics.
+        _emit_warning \
+            "schema_version_drift" \
+            "hub_version=$hub_version client_version=$RESOLVER_PROTOCOL_VERSION" \
+            "schema_version_drift_${hub_version}" \
+            "$line" || true
     fi
     return 0
 }
