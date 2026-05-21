@@ -635,5 +635,214 @@ class SelfHealAccessMatrixTests(unittest.TestCase):
         self.assertIn("kg_binding_self_healed", ids)
 
 
+# ─── Helper-level tests (v0.2.24 B3 refactor) ────────────────────────────
+
+
+class RebindCollectionNamesHelperTests(unittest.TestCase):
+    """v0.2.24 B3 (2026-05-22) — direct coverage of the extracted
+    ``_rebind_collection_names_to_on_disk_casing`` helper using a
+    synthetic table.
+
+    These tests document the helper contract independently of
+    ``_self_heal_kg_bindings_on_update`` so a future caller (third
+    heal-target table) can rely on the same semantics.
+    """
+
+    def setUp(self):
+        # In-memory SQLite is enough for the helper — it's
+        # cursor-shape-agnostic. No filesystem, no Weaviate stub needed.
+        self._conn = sqlite3.connect(":memory:")
+        self._cur = self._conn.cursor()
+
+    def tearDown(self):
+        self._conn.close()
+
+    def test_helper_rebinds_case_mismatched_rows_in_synthetic_table(self):
+        """Direct rebind via ``do_rebind`` when no collisions exist."""
+        self._cur.execute(
+            "CREATE TABLE synth ("
+            "  project_id      TEXT NOT NULL,"
+            "  collection_name TEXT NOT NULL,"
+            "  PRIMARY KEY (project_id, collection_name)"
+            ")"
+        )
+        self._cur.executemany(
+            "INSERT INTO synth (project_id, collection_name) VALUES (?, ?)",
+            [
+                ("p1", "ExampleClass"),  # exact match — skip
+                ("p2", "otherclass"),    # case-mismatch — rebind
+                ("p3", "missing"),       # not in Weaviate — skip
+            ],
+        )
+        existing_classes = {"ExampleClass", "OtherClass"}
+        existing_by_lower = {n.lower(): n for n in existing_classes}
+
+        def _do_rebind(cur, *, project_id, old_name, new_name, row, rebinds):
+            cur.execute(
+                "UPDATE synth SET collection_name = ? "
+                "WHERE project_id = ? AND collection_name = ?",
+                (new_name, project_id, old_name),
+            )
+            rebinds.append((project_id, old_name, new_name))
+
+        result = install._rebind_collection_names_to_on_disk_casing(
+            self._cur,
+            table="synth",
+            project_id_col="project_id",
+            collection_name_col="collection_name",
+            existing_classes=existing_classes,
+            existing_by_lower=existing_by_lower,
+            do_rebind=_do_rebind,
+        )
+
+        self.assertEqual(result, [("p2", "otherclass", "OtherClass")])
+        self._cur.execute(
+            "SELECT project_id, collection_name FROM synth "
+            "ORDER BY project_id"
+        )
+        self.assertEqual(
+            list(self._cur.fetchall()),
+            [
+                ("p1", "ExampleClass"),
+                ("p2", "OtherClass"),
+                ("p3", "missing"),
+            ],
+        )
+
+    def test_helper_invokes_conflict_resolver_on_collision(self):
+        """When two rows map to the same canonical name after the
+        case-rebind, ``resolve_conflict`` is invoked instead of
+        ``do_rebind``."""
+        self._cur.execute(
+            "CREATE TABLE synth ("
+            "  project_id      TEXT NOT NULL,"
+            "  collection_name TEXT NOT NULL,"
+            "  weight          INTEGER NOT NULL,"
+            "  PRIMARY KEY (project_id, collection_name)"
+            ")"
+        )
+        # Both rows for p1 will map to canonical "Foo" via lowercase
+        # match. The lower-case row has higher weight (2 > 1) so the
+        # resolver should keep it.
+        self._cur.executemany(
+            "INSERT INTO synth VALUES (?, ?, ?)",
+            [
+                ("p1", "foo", 2),  # case-mismatch, weight 2
+                ("p1", "Foo", 1),  # canonical, weight 1 (collision)
+            ],
+        )
+        existing_classes = {"Foo"}
+        existing_by_lower = {"foo": "Foo"}
+
+        do_rebind_calls: list = []
+
+        def _do_rebind(cur, *, project_id, old_name, new_name, row, rebinds):
+            do_rebind_calls.append((project_id, old_name, new_name))
+            rebinds.append(("direct", project_id, old_name, new_name))
+
+        def _resolve_conflict(
+            cur, *, project_id, old_name, new_name,
+            current_row, conflict_row, rebinds,
+        ):
+            # current_row = the lowercase-mismatched row
+            # conflict_row = the row already at canonical casing
+            current_weight = current_row[2]
+            conflict_weight = conflict_row[2]
+            if current_weight > conflict_weight:
+                # Keep lowercase row's data; drop canonical, then rebind.
+                cur.execute(
+                    "DELETE FROM synth WHERE project_id = ? "
+                    "AND collection_name = ?",
+                    (project_id, new_name),
+                )
+                cur.execute(
+                    "UPDATE synth SET collection_name = ? "
+                    "WHERE project_id = ? AND collection_name = ?",
+                    (new_name, project_id, old_name),
+                )
+                rebinds.append(("resolved-keep-current",
+                                project_id, old_name, new_name))
+            else:
+                cur.execute(
+                    "DELETE FROM synth WHERE project_id = ? "
+                    "AND collection_name = ?",
+                    (project_id, old_name),
+                )
+                rebinds.append(("resolved-keep-conflict",
+                                project_id, old_name, new_name))
+
+        result = install._rebind_collection_names_to_on_disk_casing(
+            self._cur,
+            table="synth",
+            project_id_col="project_id",
+            collection_name_col="collection_name",
+            existing_classes=existing_classes,
+            existing_by_lower=existing_by_lower,
+            extra_select_cols=("weight",),
+            do_rebind=_do_rebind,
+            resolve_conflict=_resolve_conflict,
+        )
+
+        # do_rebind must NOT have been called — the conflict was
+        # detected and routed to resolve_conflict.
+        self.assertEqual(do_rebind_calls, [])
+        # The resolver kept the higher-weight row (the lowercase one).
+        self.assertEqual(
+            result,
+            [("resolved-keep-current", "p1", "foo", "Foo")],
+        )
+        self._cur.execute(
+            "SELECT project_id, collection_name, weight FROM synth"
+        )
+        self.assertEqual(
+            list(self._cur.fetchall()),
+            [("p1", "Foo", 2)],
+        )
+
+    def test_helper_skips_exact_match_and_genuine_missing(self):
+        """No rebind when the row already matches OR when no
+        case-insensitive sibling exists in ``existing_classes``."""
+        # Note: collection_name NOT NOT-NULL here so we can test the
+        # helper's defensive "skip empty/NULL row" path. Production
+        # tables (project_kg_bindings, kg_collection_access) declare
+        # NOT NULL — the helper's guard is purely defensive.
+        self._cur.execute(
+            "CREATE TABLE synth ("
+            "  project_id      TEXT NOT NULL,"
+            "  collection_name TEXT"
+            ")"
+        )
+        self._cur.executemany(
+            "INSERT INTO synth VALUES (?, ?)",
+            [
+                ("p1", "Canonical"),     # exact match
+                ("p2", "GhostClass"),    # genuinely missing
+                ("p3", ""),              # empty — skip
+                ("p4", None),            # NULL — skip
+            ],
+        )
+        existing_classes = {"Canonical", "OtherClass"}
+        existing_by_lower = {n.lower(): n for n in existing_classes}
+
+        calls: list = []
+
+        def _do_rebind(cur, *, project_id, old_name, new_name, row, rebinds):
+            calls.append((project_id, old_name, new_name))
+            rebinds.append((project_id, old_name, new_name))
+
+        result = install._rebind_collection_names_to_on_disk_casing(
+            self._cur,
+            table="synth",
+            project_id_col="project_id",
+            collection_name_col="collection_name",
+            existing_classes=existing_classes,
+            existing_by_lower=existing_by_lower,
+            do_rebind=_do_rebind,
+        )
+
+        self.assertEqual(result, [])
+        self.assertEqual(calls, [])
+
+
 if __name__ == "__main__":
     unittest.main()

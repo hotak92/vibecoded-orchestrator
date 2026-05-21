@@ -7883,6 +7883,109 @@ def _detect_legacy_shared_kg_class(deferral_report: "DeferralReport") -> None:
     )
 
 
+# Privilege rank for `kg_collection_access.access_level`. Higher wins when
+# resolving a case-rebind collision (two rows for the same (project_id,
+# collection_name) after the rebind — keep the row with stronger access).
+_KG_ACCESS_RANK: dict[str, int] = {"none": 0, "read": 1, "write": 2}
+
+
+def _rebind_collection_names_to_on_disk_casing(
+    cur: "sqlite3.Cursor",
+    *,
+    table: str,
+    project_id_col: str,
+    collection_name_col: str,
+    existing_classes: set[str],
+    existing_by_lower: dict[str, str],
+    extra_select_cols: tuple[str, ...] = (),
+    do_rebind: "Callable[..., None]",
+    resolve_conflict: "Optional[Callable[..., None]]" = None,
+) -> list[tuple]:
+    """Generic helper: rebind a SQLite table's ``collection_name`` column to
+    the on-disk Weaviate casing when a case-different sibling exists in
+    ``existing_classes``.
+
+    Algorithm (per row):
+      1. ``SELECT project_id, collection_name, *extra_select_cols FROM <table>``.
+      2. If ``collection_name`` is exact-match in ``existing_classes`` → skip.
+      3. If no case-insensitive sibling in ``existing_by_lower`` → skip
+         (genuine missing class; orphan-prune sync recreates lazily).
+      4. Otherwise the row needs rebinding. When ``resolve_conflict`` is
+         provided, the helper probes the SELECT-time row set for a
+         ``(project_id, target_name)`` collision; on hit, delegates to
+         ``resolve_conflict`` (which mutates the DB and appends to
+         ``rebinds`` via the closure). Otherwise — and always for tables
+         where the rebind can't violate a unique constraint — calls
+         ``do_rebind`` for a straight UPDATE.
+
+    The helper is SQL-shape-agnostic: callers own the exact ``UPDATE`` /
+    ``DELETE`` statements via ``do_rebind`` / ``resolve_conflict`` so
+    table-specific concerns (extra ``SET`` columns, natural-key shape,
+    privilege rules) stay with the caller.
+
+    Returns the audit list — caller-supplied via the closures — so the
+    parent function can pull a final summary into the deferral entry.
+    """
+    rebinds: list[tuple] = []
+    select_cols = (project_id_col, collection_name_col) + extra_select_cols
+    cur.execute(
+        f"SELECT {', '.join(select_cols)} FROM {table}"
+    )
+    rows = cur.fetchall()
+
+    # Build conflict lookup once if conflict-resolution is enabled —
+    # keyed by (project_id, name) with the FULL row tuple as the value so
+    # resolve_conflict can read extras (e.g. access_level for the
+    # privilege-rank decision).
+    conflict_lookup: dict[tuple, tuple] = {}
+    if resolve_conflict is not None:
+        for row in rows:
+            proj_id = row[0]
+            coll = row[1]
+            if proj_id and coll:
+                conflict_lookup[(proj_id, coll)] = row
+
+    for row in rows:
+        proj_id = row[0]
+        coll_name = row[1]
+        if not coll_name:
+            continue
+        if coll_name in existing_classes:
+            # Exact match — nothing to do.
+            continue
+        actual = existing_by_lower.get(coll_name.lower())
+        if actual is None or actual == coll_name:
+            # Genuinely missing OR already canonical (defensive — filtered
+            # above for missing-from-existing_classes).
+            continue
+
+        conflict_row: "Optional[tuple]" = None
+        if resolve_conflict is not None:
+            conflict_row = conflict_lookup.get((proj_id, actual))
+
+        if conflict_row is not None and resolve_conflict is not None:
+            resolve_conflict(
+                cur,
+                project_id=proj_id,
+                old_name=coll_name,
+                new_name=actual,
+                current_row=row,
+                conflict_row=conflict_row,
+                rebinds=rebinds,
+            )
+        else:
+            do_rebind(
+                cur,
+                project_id=proj_id,
+                old_name=coll_name,
+                new_name=actual,
+                row=row,
+                rebinds=rebinds,
+            )
+
+    return rebinds
+
+
 def _self_heal_kg_bindings_on_update(
     deferral_report: "DeferralReport",
 ) -> None:
@@ -7984,12 +8087,30 @@ def _self_heal_kg_bindings_on_update(
         conn = sqlite3.connect(str(db_path), timeout=5.0)
         try:
             cur = conn.cursor()
-            # Tolerate launcher.db schemas that haven't migrated yet — if
-            # `project_kg_bindings` doesn't exist, we're done.
-            try:
+
+            # ── 1. project_kg_bindings ────────────────────────────────
+            # Natural key (project_id, role) is unaffected by a
+            # collection_name rebind, so no conflict-resolver is needed.
+            def _bind_rebind(cur, *, project_id, old_name, new_name, row, rebinds):
+                role = row[2]
                 cur.execute(
-                    "SELECT project_id, role, collection_name "
-                    "FROM project_kg_bindings"
+                    "UPDATE project_kg_bindings "
+                    "SET collection_name = ?, updated_at = ? "
+                    "WHERE project_id = ? AND role = ?",
+                    (new_name, int(time.time() * 1000), project_id, role),
+                )
+                rebinds.append((project_id, role, old_name, new_name))
+
+            try:
+                binding_rebinds = _rebind_collection_names_to_on_disk_casing(
+                    cur,
+                    table="project_kg_bindings",
+                    project_id_col="project_id",
+                    collection_name_col="collection_name",
+                    existing_classes=existing_classes,
+                    existing_by_lower=existing_by_lower,
+                    extra_select_cols=("role",),
+                    do_rebind=_bind_rebind,
                 )
             except sqlite3.OperationalError as oe:
                 if "no such table" in str(oe).lower():
@@ -7999,125 +8120,93 @@ def _self_heal_kg_bindings_on_update(
                     )
                     return
                 raise
+            rebinds.extend(binding_rebinds)
 
-            rows = cur.fetchall()
-            for project_id, role, collection_name in rows:
-                if not collection_name:
-                    continue
-                if collection_name in existing_classes:
-                    # Exact match — nothing to do.
-                    continue
-                actual = existing_by_lower.get(collection_name.lower())
-                if actual is None:
-                    # Genuinely missing class — leave the binding alone.
-                    # The orphan-prune sync / lazy-create path handles
-                    # recreation on next write.
-                    continue
-                if actual == collection_name:
-                    # Shouldn't reach here (filtered above) — defensive.
-                    continue
-                # Case-different sibling exists in Weaviate. Rebind.
-                cur.execute(
-                    "UPDATE project_kg_bindings "
-                    "SET collection_name = ?, updated_at = ? "
-                    "WHERE project_id = ? AND role = ?",
-                    (actual, int(time.time() * 1000), project_id, role),
-                )
-                rebinds.append((project_id, role, collection_name, actual))
-
+            # ── 2. kg_collection_access ───────────────────────────────
             # v0.2.23 review-B HIGH-1 (2026-05-21): also rebind
             # `kg_collection_access` rows whose `collection_name` differs
-            # only in case from an on-disk class. Without this, the launcher
-            # GUI's Identity tab access matrix would render rows pointing at
-            # a class that doesn't exist post-rename (and dangle), and the
-            # hub's `kg_access_list` construction in config_api would see
-            # both the lowercase-c grant AND the (implicit-fallback) capital-C
-            # grant — confusing, and a silently-missed `access_level='none'`
-            # signal if the user had explicitly downgraded the lowercase-c
-            # entry.
+            # only in case from an on-disk class. Without this, the
+            # launcher GUI's Identity tab access matrix would render rows
+            # pointing at a class that doesn't exist post-rename (and
+            # dangle), and the hub's `kg_access_list` construction in
+            # config_api would see both the lowercase-c grant AND the
+            # (implicit-fallback) capital-C grant — confusing, and a
+            # silently-missed `access_level='none'` signal if the user
+            # had explicitly downgraded the lowercase-c entry.
             #
             # PK collision handling: kg_collection_access PK is
             # (project_id, collection_name). If (p1, "Foo", "read") exists
             # AND (p1, "foo", "write") also exists, a naive rebind would
-            # violate the UNIQUE constraint. We probe for the collision
-            # before the UPDATE; on collision, we KEEP the higher-privilege
-            # row (write > read > none) at the canonical casing and DELETE
-            # the lower-privilege duplicate. Matches the user's "single
-            # source of truth for access" intent.
-            try:
+            # violate the UNIQUE constraint. The helper detects the
+            # collision before the UPDATE; on collision we KEEP the
+            # higher-privilege row (write > read > none) at the canonical
+            # casing and DELETE the lower-privilege duplicate. Matches
+            # the user's "single source of truth for access" intent.
+            def _access_rebind(cur, *, project_id, old_name, new_name, row, rebinds):
                 cur.execute(
-                    "SELECT project_id, collection_name, access_level "
-                    "FROM kg_collection_access"
+                    "UPDATE kg_collection_access "
+                    "SET collection_name = ? "
+                    "WHERE project_id = ? AND collection_name = ?",
+                    (new_name, project_id, old_name),
                 )
-                access_rows = cur.fetchall()
-            except sqlite3.OperationalError as oe:
-                # Table absent → skip the access-matrix part but keep the
-                # binding rebinds (already committed in the next step).
-                if "no such table" in str(oe).lower():
-                    access_rows = []
-                else:
-                    raise
+                rebinds.append((project_id, old_name, new_name))
 
-            # Build a per-project lookup of (existing canonical-name → row)
-            # so collision-resolution can find the duplicate when present.
-            access_by_proj_name: dict[tuple[str, str], str] = {}
-            for proj_id, coll_name, access in access_rows:
-                if proj_id and coll_name:
-                    access_by_proj_name[(proj_id, coll_name)] = access
-
-            _ACCESS_RANK = {"none": 0, "read": 1, "write": 2}
-
-            for proj_id, coll_name, access in access_rows:
-                if not coll_name:
-                    continue
-                if coll_name in existing_classes:
-                    continue  # exact match — nothing to do
-                actual = existing_by_lower.get(coll_name.lower())
-                if actual is None or actual == coll_name:
-                    continue  # truly missing or already-canonical
-
-                # Collision detection: does (proj_id, actual) ALREADY exist?
-                collision_access = access_by_proj_name.get((proj_id, actual))
-                if collision_access is not None:
-                    # Pick the higher-privilege row to keep at the canonical
-                    # casing; delete the lower-privilege duplicate.
-                    current_rank = _ACCESS_RANK.get(access, 0)
-                    collision_rank = _ACCESS_RANK.get(collision_access, 0)
-                    if current_rank > collision_rank:
-                        # Our (lowercase-c) row is higher-privilege.
-                        # Drop the colliding canonical row, then rebind.
-                        cur.execute(
-                            "DELETE FROM kg_collection_access "
-                            "WHERE project_id = ? AND collection_name = ?",
-                            (proj_id, actual),
-                        )
-                        cur.execute(
-                            "UPDATE kg_collection_access "
-                            "SET collection_name = ? "
-                            "WHERE project_id = ? AND collection_name = ?",
-                            (actual, proj_id, coll_name),
-                        )
-                        access_rebinds.append((proj_id, coll_name, actual))
-                    else:
-                        # Canonical row already has equal-or-higher
-                        # privilege. Drop our lowercase-c row.
-                        cur.execute(
-                            "DELETE FROM kg_collection_access "
-                            "WHERE project_id = ? AND collection_name = ?",
-                            (proj_id, coll_name),
-                        )
-                        access_rebinds.append(
-                            (proj_id, coll_name, f"{actual} (deduped)")
-                        )
-                else:
-                    # No collision — safe straight rebind.
+            def _access_resolve_conflict(
+                cur, *, project_id, old_name, new_name,
+                current_row, conflict_row, rebinds,
+            ):
+                # current_row has access_level at index 2 (extra_select_cols).
+                # conflict_row likewise.
+                current_access = current_row[2]
+                conflict_access = conflict_row[2]
+                current_rank = _KG_ACCESS_RANK.get(current_access, 0)
+                conflict_rank = _KG_ACCESS_RANK.get(conflict_access, 0)
+                if current_rank > conflict_rank:
+                    # Lowercase-c row is higher-privilege — drop the
+                    # canonical-casing duplicate, then rebind.
+                    cur.execute(
+                        "DELETE FROM kg_collection_access "
+                        "WHERE project_id = ? AND collection_name = ?",
+                        (project_id, new_name),
+                    )
                     cur.execute(
                         "UPDATE kg_collection_access "
                         "SET collection_name = ? "
                         "WHERE project_id = ? AND collection_name = ?",
-                        (actual, proj_id, coll_name),
+                        (new_name, project_id, old_name),
                     )
-                    access_rebinds.append((proj_id, coll_name, actual))
+                    rebinds.append((project_id, old_name, new_name))
+                else:
+                    # Canonical row has equal-or-higher privilege. Drop
+                    # the lowercase-c row.
+                    cur.execute(
+                        "DELETE FROM kg_collection_access "
+                        "WHERE project_id = ? AND collection_name = ?",
+                        (project_id, old_name),
+                    )
+                    rebinds.append(
+                        (project_id, old_name, f"{new_name} (deduped)")
+                    )
+
+            try:
+                acc_rebinds = _rebind_collection_names_to_on_disk_casing(
+                    cur,
+                    table="kg_collection_access",
+                    project_id_col="project_id",
+                    collection_name_col="collection_name",
+                    existing_classes=existing_classes,
+                    existing_by_lower=existing_by_lower,
+                    extra_select_cols=("access_level",),
+                    do_rebind=_access_rebind,
+                    resolve_conflict=_access_resolve_conflict,
+                )
+                access_rebinds.extend(acc_rebinds)
+            except sqlite3.OperationalError as oe:
+                # Older launcher.db schemas may not have kg_collection_access.
+                # Don't fail the binding heal — just skip the access part.
+                if "no such table" not in str(oe).lower():
+                    raise
+
             conn.commit()
         finally:
             conn.close()
