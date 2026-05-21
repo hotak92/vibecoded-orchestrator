@@ -473,14 +473,16 @@ fn parse_schema_response(
         // strict `name == shared_kg_class` check reported "not yet created"
         // for users on v0.2.12–v0.2.22 lowercase-c installs even when their
         // shared KG class existed — the launcher's Services panel then
-        // misleadingly suggested running migrations. Mirrors the
-        // `is_shared` recognition pattern in
-        // `commands/kg.rs::list_kg_collections` (v0.2.12 PR-26 / Group E
-        // pre-rename `VibeCodedTools_KnowledgeGraph` is also accepted).
-        let matches_shared = name.eq_ignore_ascii_case(shared_kg_class)
-            || name == crate::commands::project_env_settings::LEGACY_SHARED_KG_COLLECTION_LOWERCASE_C
-            || name == crate::commands::project_env_settings::LEGACY_SHARED_KG_COLLECTION;
-        if matches_shared {
+        // misleadingly suggested running migrations.
+        //
+        // v0.2.24 B4 (2026-05-22): consolidated into the shared helper
+        // `commands::project_env_settings::is_shared_kg_class_name`. Same
+        // recognition contract; one source of truth shared with
+        // `commands/kg.rs::kg_list_collections`.
+        if crate::commands::project_env_settings::is_shared_kg_class_name(
+            name,
+            shared_kg_class,
+        ) {
             shared_kg_exists = Some(true);
             shared_kg_index_null = Some(
                 cls.get("invertedIndexConfig")

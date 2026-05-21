@@ -105,6 +105,34 @@ pub const LEGACY_SHARED_KG_COLLECTION: &str = "VibeCodedTools_KnowledgeGraph";
 pub const LEGACY_SHARED_KG_COLLECTION_LOWERCASE_C: &str =
     "VibecodedOrchestrator_KnowledgeGraph";
 
+/// Returns `true` iff `name` is recognised as a shared-KG class name,
+/// accounting for legacy casing variants.
+///
+/// Recognises:
+/// * `canonical` (case-insensitive) — the active canonical shared-KG name
+///   for this install. Production call sites pass
+///   [`DEFAULT_SHARED_KG_COLLECTION`]; tests and white-label forks may pass
+///   a different value (e.g. `"AcmeOrchestrator_KnowledgeGraph"`).
+/// * [`LEGACY_SHARED_KG_COLLECTION_LOWERCASE_C`] — the v0.2.12–v0.2.22
+///   lowercase-c default. Always recognised so pre-v0.2.23-B1 installs are
+///   still detected even when the user has flipped to a custom canonical.
+/// * [`LEGACY_SHARED_KG_COLLECTION`] (`VibeCodedTools_KnowledgeGraph`) —
+///   the pre-v0.2.12-PR-26 default. Recognised for back-compat with
+///   installs that never ran the PR-26 rename.
+///
+/// v0.2.24 B4 (2026-05-22): extracted from inline match logic that lived
+/// in `commands/kg.rs::kg_list_collections` (strict `==`, MISSED case-
+/// folded canonical) and `commands/maintenance.rs::parse_schema_response`
+/// (case-insensitive on canonical, strict `==` on legacy). The unified
+/// helper applies case-insensitive matching to ALL three names — strictly
+/// a widening of recognition, never narrowing. See peer-review-B HIGH-2
+/// (v0.2.23) for the original maintenance.rs fix this consolidates.
+pub fn is_shared_kg_class_name(name: &str, canonical: &str) -> bool {
+    name.eq_ignore_ascii_case(canonical)
+        || name.eq_ignore_ascii_case(LEGACY_SHARED_KG_COLLECTION_LOWERCASE_C)
+        || name.eq_ignore_ascii_case(LEGACY_SHARED_KG_COLLECTION)
+}
+
 /// Populated once per project-env write call. Plumbed through
 /// `write_project_env_files` and `ensure_project_env_template` so future
 /// launcher-state values can be added here without re-threading every
@@ -1191,5 +1219,97 @@ mod tests {
         .unwrap();
         let s = populate(&db, "Acme", None);
         assert_eq!(s.shared_kg_collection, DEFAULT_SHARED_KG_COLLECTION);
+    }
+
+    // ─── is_shared_kg_class_name unit tests (B4) ────────────────────────
+    //
+    // Pin the helper's recognition contract: the canonical name is
+    // matched case-insensitively, both legacy aliases are matched
+    // case-insensitively, and unrelated KG / Development collection
+    // names return false. Mirrors the test list in the v0.2.24 B4
+    // refactor task spec.
+
+    #[test]
+    fn is_shared_kg_class_name_recognises_canonical_casing() {
+        assert!(is_shared_kg_class_name(
+            "VibeCodedOrchestrator_KnowledgeGraph",
+            DEFAULT_SHARED_KG_COLLECTION,
+        ));
+    }
+
+    #[test]
+    fn is_shared_kg_class_name_recognises_case_folded_canonical() {
+        // Fully lowercased canonical → still a match (the v0.2.23 HIGH-2
+        // fix in maintenance.rs that this helper consolidates).
+        assert!(is_shared_kg_class_name(
+            "vibecodedorchestrator_knowledgegraph",
+            DEFAULT_SHARED_KG_COLLECTION,
+        ));
+    }
+
+    #[test]
+    fn is_shared_kg_class_name_recognises_lowercase_c_legacy_alias() {
+        // The v0.2.12–v0.2.22 lowercase-c default. Detected regardless
+        // of which canonical the caller passes — pre-flip installs must
+        // be picked up even on a white-label fork.
+        assert!(is_shared_kg_class_name(
+            LEGACY_SHARED_KG_COLLECTION_LOWERCASE_C,
+            DEFAULT_SHARED_KG_COLLECTION,
+        ));
+        // Custom canonical → legacy still recognised.
+        assert!(is_shared_kg_class_name(
+            LEGACY_SHARED_KG_COLLECTION_LOWERCASE_C,
+            "AcmeOrchestrator_KnowledgeGraph",
+        ));
+    }
+
+    #[test]
+    fn is_shared_kg_class_name_recognises_pre_pr26_legacy_alias() {
+        // `VibeCodedTools_KnowledgeGraph` — pre-v0.2.12 PR-26 default.
+        assert!(is_shared_kg_class_name(
+            LEGACY_SHARED_KG_COLLECTION,
+            DEFAULT_SHARED_KG_COLLECTION,
+        ));
+        // Case-folded legacy → still detected.
+        assert!(is_shared_kg_class_name(
+            "vibecodedtools_knowledgegraph",
+            DEFAULT_SHARED_KG_COLLECTION,
+        ));
+    }
+
+    #[test]
+    fn is_shared_kg_class_name_rejects_random_kg_collection() {
+        assert!(!is_shared_kg_class_name(
+            "RandomProject_KnowledgeGraph",
+            DEFAULT_SHARED_KG_COLLECTION,
+        ));
+    }
+
+    #[test]
+    fn is_shared_kg_class_name_rejects_development_collection() {
+        assert!(!is_shared_kg_class_name(
+            "MyProject_Development",
+            DEFAULT_SHARED_KG_COLLECTION,
+        ));
+    }
+
+    #[test]
+    fn is_shared_kg_class_name_accepts_custom_canonical_for_white_label() {
+        // White-label forks set their own canonical. Match is
+        // case-insensitive against whatever canonical the caller passes.
+        assert!(is_shared_kg_class_name(
+            "AcmeOrchestrator_KnowledgeGraph",
+            "AcmeOrchestrator_KnowledgeGraph",
+        ));
+        assert!(is_shared_kg_class_name(
+            "acmeorchestrator_knowledgegraph",
+            "AcmeOrchestrator_KnowledgeGraph",
+        ));
+        // ... but a name that's neither the custom canonical NOR a
+        // documented legacy alias is rejected.
+        assert!(!is_shared_kg_class_name(
+            "OtherTool_KnowledgeGraph",
+            "AcmeOrchestrator_KnowledgeGraph",
+        ));
     }
 }
