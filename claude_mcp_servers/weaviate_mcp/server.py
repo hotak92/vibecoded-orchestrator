@@ -2651,6 +2651,9 @@ async def _rl_cache_and_rerank(
     query: str,
     all_nodes: list[dict],
     limit: int,
+    *,
+    failure_mode: str | None = None,
+    failed_collections: list[str] | None = None,
 ) -> list[dict]:
     """
     Rerank nodes via rl_server and spawn a background monitor for online training.
@@ -2664,44 +2667,77 @@ async def _rl_cache_and_rerank(
     Tier gating: free tier skips the RL server entirely and returns Weaviate's cosine
     ordering. Pro/MAO tiers use RL reranking (requires rl_server running on port 11439
     from the separate orchestrator-rl repo, started by the launcher after activation).
+
+    v0.2.24 (RL-defect-2026-05-22): added optional ``failure_mode`` /
+    ``failed_collections`` kwargs. Callers may invoke with ``all_nodes=[]``
+    AND a non-None ``failure_mode`` to log a degraded-mode retrieval event
+    so offline training has visibility into queries that schema-failed.
+    Free-tier early-return ALSO logs (so failure-rate telemetry survives
+    the tier gate). Reranking is skipped when nodes is empty (nothing to
+    rerank).
     """
-    # Feature gate: free tier → skip RL, return Weaviate order.
+    # Feature gate: free tier → skip RL reranking, return Weaviate order.
+    # v0.2.24 (RL-defect-2026-05-22): the telemetry log_retrieval call
+    # below now runs UNCONDITIONALLY, regardless of tier. The free tier
+    # still benefits from local JSONL accumulation so when the user
+    # upgrades to Pro the historical training corpus is already there
+    # — and so retrieval-defect investigations have audit data for
+    # free-tier installs too.
+    _rl_enabled = True
     try:
         from VCThelpers.license import feature_enabled
         if not feature_enabled("rl_retrieval"):
             logger.debug("RL retrieval gated off for current tier — using Weaviate order")
-            return all_nodes[:limit]
+            _rl_enabled = False
     except ImportError:
         # VCThelpers not available (pure free install) → free tier behavior.
-        return all_nodes[:limit]
+        _rl_enabled = False
 
-    global _rl_call_seq
-    _rl_call_seq += 1
-    seq = _rl_call_seq
+    # Rerank gate: Pro/MAO tier with at least one node → spawn monitor
+    # + call RL server. Free tier OR empty all_nodes → skip rerank but
+    # STILL fall through to the telemetry block below so the offline
+    # corpus and failure-mode telemetry continue accumulating.
+    if _rl_enabled and all_nodes:
+        global _rl_call_seq
+        _rl_call_seq += 1
+        seq = _rl_call_seq
 
-    # Spawn answer monitor (fire-and-forget, doesn't block Claude's response)
-    asyncio.create_task(_rl_answer_monitor(task_id, seq, query))
+        # Spawn answer monitor (fire-and-forget, doesn't block Claude's response)
+        asyncio.create_task(_rl_answer_monitor(task_id, seq, query))
 
-    # Rerank via RLClient. The client handles "disabled mode" (no env
-    # configured) and per-call fallback (connection refused / 5xx)
-    # internally — it ALWAYS returns a list and never raises here, so
-    # we don't need a defensive try/except around the await.
-    client = _get_rl_client()
-    if client is None:
-        # rl_client package unavailable — return Weaviate order.
-        ranked = list(all_nodes[:limit])
+        # Rerank via RLClient. The client handles "disabled mode" (no env
+        # configured) and per-call fallback (connection refused / 5xx)
+        # internally — it ALWAYS returns a list and never raises here, so
+        # we don't need a defensive try/except around the await.
+        client = _get_rl_client()
+        if client is None:
+            # rl_client package unavailable — return Weaviate order.
+            ranked = list(all_nodes[:limit])
+        else:
+            ranked = await client.cache_nodes(
+                query=query,
+                nodes=all_nodes,
+                top_k=limit,
+                task_id=task_id,
+            )
     else:
-        ranked = await client.cache_nodes(
-            query=query,
-            nodes=all_nodes,
-            top_k=limit,
-            task_id=task_id,
-        )
+        # Free tier OR empty nodes → return Weaviate order (which is also
+        # empty if all_nodes is empty). Free tier doesn't get reranked but
+        # the local-JSONL accumulation below is still useful for upgrade
+        # path + failure diagnostics.
+        ranked = list(all_nodes[:limit])
 
     # Telemetry: log the retrieval event regardless of whether reranking
-    # happened. Free-tier installs collect locally (subject to the
-    # RL_LOCAL_LOGGING_DISABLED opt-out); only consented data is
+    # happened OR tier. Free-tier installs collect locally (subject to
+    # the RL_LOCAL_LOGGING_DISABLED opt-out); only consented data is
     # forwarded to the queue for upload. Soft-fail throughout.
+    #
+    # v0.2.24 (RL-defect-2026-05-22): also logs degraded-mode events
+    # (failure_mode set, all_nodes typically empty) so offline training
+    # has visibility into queries that schema-failed. The offline
+    # trainer filters non-None failure_mode out of training-pair
+    # construction at load time, but uses them as a query-distribution
+    # and failure-rate signal.
     try:
         writer = _get_rl_telemetry_writer()
         if writer is not None:
@@ -2723,6 +2759,8 @@ async def _rl_cache_and_rerank(
                 query=query,
                 nodes=log_nodes,
                 session_id=os.getenv("CLAUDE_SESSION_ID", ""),
+                failure_mode=failure_mode,
+                failed_collections=failed_collections,
             )
     except Exception as exc:
         logger.debug("RL telemetry log_retrieval failed (%s); continuing", exc)
@@ -2941,8 +2979,17 @@ async def _semantic_graph_search_body(
     # Run the semantic search across each collection and collect raw
     # ``(obj, collection_name)`` pairs so we can later rebuild WikiLinks from
     # the actual hit objects (regardless of source collection).
+    #
+    # v0.2.24 (RL-defect-2026-05-22): error handling mirrors
+    # hybrid_search_body — classify per-collection failures so:
+    #   - schema-missing → skip + record (don't kill fan-out)
+    #   - unreachable / auth → bubble (instance-level)
+    # When EVERY collection schema-failed, log a degraded-mode telemetry
+    # event before re-raising.
     all_formatted: list[dict] = []
     raw_primary: list[tuple[object, str]] = []
+    failed_collections_schema: list[str] = []
+    successful_collections: list[str] = []
     for coll_name in collections_to_search:
         handle = _coll_for(coll_name)
         if handle is None:
@@ -2964,6 +3011,19 @@ async def _semantic_graph_search_body(
                     nv_kwargs["filters"] = stale
                 primary = handle.query.near_vector(**nv_kwargs)
         except Exception as exc:
+            classified = _classify_weaviate_failure(exc)
+            if isinstance(classified, WeaviateUnreachable):
+                _reset_weaviate_client_cache()
+                raise classified from exc
+            if isinstance(classified, WeaviateAuthError):
+                raise classified from exc
+            if isinstance(classified, WeaviateSchemaError):
+                logger.warning(
+                    "semantic_graph_search: skipping collection '%s' (schema error: %s)",
+                    coll_name, classified,
+                )
+                failed_collections_schema.append(coll_name)
+                continue
             logger.warning(f"semantic_graph_search: error searching {coll_name}: {exc}")
             continue
 
@@ -2976,6 +3036,30 @@ async def _semantic_graph_search_body(
         all_formatted.extend(coll_formatted)
         for obj in primary.objects:
             raw_primary.append((obj, coll_name))
+        successful_collections.append(coll_name)
+
+    # If EVERY collection in the fan-out schema-failed → instance-level
+    # problem; bubble after logging a degraded-mode telemetry event.
+    if not successful_collections and failed_collections_schema:
+        _reset_weaviate_client_cache()
+        try:
+            failure_task_id = str(uuid.uuid4())
+            await _rl_cache_and_rerank(
+                failure_task_id, query, [], limit,
+                failure_mode="all_collections_schema_missing",
+                failed_collections=failed_collections_schema,
+            )
+        except Exception as exc:
+            logger.debug(
+                "semantic_graph_search: failure telemetry log_retrieval failed (%s); continuing",
+                exc,
+            )
+        raise WeaviateSchemaError(
+            "semantic_graph_search: every configured collection schema-failed "
+            f"({len(failed_collections_schema)} attempted: "
+            f"{', '.join(failed_collections_schema[:6])}"
+            f"{'…' if len(failed_collections_schema) > 6 else ''})"
+        )
 
     # Preserve a normalised score (1 - distance) so per-result tiering works.
     for r in all_formatted:
@@ -2992,8 +3076,17 @@ async def _semantic_graph_search_body(
     all_formatted = _collapse_to_one_per_node(all_formatted, score_field="score")
 
     # RL: rerank + cache using all over-fetched nodes; return top-k primary results.
+    # v0.2.24: propagate partial-fan-out schema failures so telemetry
+    # records which collections were unavailable.
     task_id = str(uuid.uuid4())
-    primary_results = await _rl_cache_and_rerank(task_id, query, all_formatted, limit)
+    _partial_failure_mode = (
+        "partial_fan_out_schema_missing" if failed_collections_schema else None
+    )
+    primary_results = await _rl_cache_and_rerank(
+        task_id, query, all_formatted, limit,
+        failure_mode=_partial_failure_mode,
+        failed_collections=failed_collections_schema or None,
+    )
     for r in primary_results:
         if "score" not in r:
             d = r.get("distance")
@@ -3391,8 +3484,21 @@ async def _hybrid_search_body(
     # configured. Single source of truth: `_kg_collections_to_search`.
     collections_to_search: list[str] = _kg_collections_to_search(include_dev=True)
 
-    # Search all collections and merge by (title, chunk) key, keeping best score per key
+    # Search all collections and merge by (title, chunk) key, keeping best score per key.
+    #
+    # v0.2.24 (RL-defect-2026-05-22): missing-class errors are now
+    # per-collection skips rather than fan-out-killing bubbles. A
+    # hardcoded shared-KG default that doesn't exist on the user's
+    # Weaviate must NOT kill the whole fan-out — other collections
+    # (the user's project KG, peers, dev docs) may still resolve. Only
+    # bubble the schema error when EVERY collection schema-failed
+    # (Weaviate up but the schema is empty / instance-level issue).
+    #
+    # Unreachable / auth errors STILL bubble immediately — those apply
+    # to the Weaviate instance as a whole, not one collection.
     merged: dict = {}
+    failed_collections_schema: list[str] = []
+    successful_collections: list[str] = []
     for coll_name in collections_to_search:
         try:
             coll_combined = await _hybrid_search_single_collection(
@@ -3401,25 +3507,57 @@ async def _hybrid_search_body(
             for key, item in coll_combined.items():
                 if key not in merged or item["combined_score"] > merged[key]["combined_score"]:
                     merged[key] = item
+            successful_collections.append(coll_name)
         except Exception as e:
             # Loud-fail v2: don't swallow Weaviate-unreachable. Connection-time
             # failures fire from get_weaviate_client(); query-time failures
             # (cached client + Weaviate stopped mid-session) fire here.
-            # PR-41: also surface schema/auth errors with their distinct
-            # classes so the outer wrapper emits the right hint.
             classified = _classify_weaviate_failure(e)
             if isinstance(classified, WeaviateUnreachable):
-                _reset_weaviate_client_cache()
-                raise classified from e
-            if isinstance(classified, WeaviateSchemaError):
-                # Schema migrations invalidate the cached client's schema
-                # view → reset so the next call re-fetches.
                 _reset_weaviate_client_cache()
                 raise classified from e
             if isinstance(classified, WeaviateAuthError):
                 # Auth errors persist; don't churn the connection.
                 raise classified from e
+            if isinstance(classified, WeaviateSchemaError):
+                # v0.2.24: per-collection schema error → skip + record,
+                # don't bubble. The shared-KG class may be missing on
+                # this machine while the project KG resolves fine.
+                logger.warning(
+                    "hybrid_search: skipping collection '%s' (schema error: %s)",
+                    coll_name, classified,
+                )
+                failed_collections_schema.append(coll_name)
+                continue
             logger.warning(f"hybrid_search: error searching {coll_name}: {e}")
+
+    # If EVERY collection in the fan-out schema-failed → instance-level
+    # problem; bubble. But first log a degraded-mode retrieval event so
+    # offline training sees the query distribution + failure rate even
+    # when no nodes were retrieved.
+    if not successful_collections and failed_collections_schema:
+        _reset_weaviate_client_cache()
+        # Best-effort failure telemetry. _rl_cache_and_rerank handles
+        # empty-nodes + failure_mode and ALWAYS calls log_retrieval, so
+        # we get the audit trail before the exception bubbles.
+        try:
+            failure_task_id = str(uuid.uuid4())
+            await _rl_cache_and_rerank(
+                failure_task_id, query, [], limit,
+                failure_mode="all_collections_schema_missing",
+                failed_collections=failed_collections_schema,
+            )
+        except Exception as exc:
+            logger.debug(
+                "hybrid_search: failure telemetry log_retrieval failed (%s); continuing",
+                exc,
+            )
+        raise WeaviateSchemaError(
+            "hybrid_search: every configured collection schema-failed "
+            f"({len(failed_collections_schema)} attempted: "
+            f"{', '.join(failed_collections_schema[:6])}"
+            f"{'…' if len(failed_collections_schema) > 6 else ''})"
+        )
 
     # Sort all over-fetched candidates by combined score
     all_results = sorted(merged.values(), key=lambda x: x["combined_score"], reverse=True)
@@ -3440,8 +3578,18 @@ async def _hybrid_search_body(
             r["score"] = r["combined_score"]
 
     # RL: rerank + cache using all candidates; return top-k.
+    # v0.2.24: propagate any per-collection schema failures from the
+    # fan-out so the telemetry event records WHICH collections failed
+    # (helps diagnose hardcoded-default-vs-actual-Weaviate drift).
     task_id = str(uuid.uuid4())
-    results = await _rl_cache_and_rerank(task_id, query, all_results, limit)
+    _partial_failure_mode = (
+        "partial_fan_out_schema_missing" if failed_collections_schema else None
+    )
+    results = await _rl_cache_and_rerank(
+        task_id, query, all_results, limit,
+        failure_mode=_partial_failure_mode,
+        failed_collections=failed_collections_schema or None,
+    )
 
     # Ensure score survives the RL hop too (RL server returns its own dicts; if
     # it dropped the score field, fall back to combined_score from the input).

@@ -149,11 +149,20 @@ class RLTelemetryWriter:
         nodes: List[Dict[str, Any]],
         session_id: str = "",
         query_emb: Optional[List[float]] = None,
+        failure_mode: Optional[str] = None,
+        failed_collections: Optional[List[str]] = None,
     ) -> None:
         """Log a retrieval event to local JSONL + (if consented) upload queue.
 
         Signature matches ``RLDataLogger.log_retrieval`` exactly so
         callers can swap the two transparently.
+
+        ``failure_mode`` and ``failed_collections`` are v0.2.24 additions
+        (RL-defect-2026-05-22): when the fan-out hits a degraded mode
+        (e.g. all collections schema-failed), callers pass nodes=[] +
+        failure_mode so the offline trainer can filter the event out
+        of training-pair construction while still using it as a
+        query-distribution signal.
         """
         # Local write (gated on user opt-out env)
         if not _local_logging_disabled():
@@ -165,6 +174,8 @@ class RLTelemetryWriter:
                     nodes=nodes,
                     session_id=session_id,
                     query_emb=query_emb,
+                    failure_mode=failure_mode,
+                    failed_collections=failed_collections,
                 )
             except Exception as exc:
                 logger.debug("RLTelemetryWriter: local log_retrieval failed (%s)", exc)
@@ -178,6 +189,8 @@ class RLTelemetryWriter:
                 nodes=nodes,
                 session_id=session_id,
                 query_emb=query_emb,
+                failure_mode=failure_mode,
+                failed_collections=failed_collections,
             )
             _enqueue(self._etype_retrieval, payload)
 
@@ -220,12 +233,21 @@ class RLTelemetryWriter:
         nodes: List[Dict[str, Any]],
         session_id: str,
         query_emb: Optional[List[float]],
+        failure_mode: Optional[str] = None,
+        failed_collections: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Build the queue-bound payload for a retrieval event.
 
         Mirrors the local JSONL shape but **omits the raw query text**
         — the hub-side schema treats query as PII. Embeddings + scores
         are kept; titles are kept (KG titles are non-secret).
+
+        ``failure_mode`` and ``failed_collections`` are v0.2.24 additions
+        (RL-defect-2026-05-22): failure tags surface in hub-side
+        telemetry so we can monitor retrieval-defect rates across
+        installs. The fields are emitted in both the local JSONL and
+        the consented queue payload (no PII in either — failure_mode
+        is a fixed tag string and failed_collections are class names).
         """
         node_records: List[Dict[str, Any]] = []
         for n in nodes:
@@ -257,6 +279,12 @@ class RLTelemetryWriter:
         }
         if query_emb is not None:
             payload["query_emb"] = list(query_emb)
+        if failure_mode:
+            payload["failure_mode"] = str(failure_mode)
+        if failed_collections:
+            payload["failed_collections"] = [
+                str(c) for c in list(failed_collections)[:32]
+            ]
         return payload
 
     def _build_citation_payload(

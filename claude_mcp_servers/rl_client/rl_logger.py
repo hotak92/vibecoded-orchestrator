@@ -160,6 +160,8 @@ class RLDataLogger:
         nodes: "list[dict[str, Any]]",
         session_id: str = "",
         query_emb: "list[float] | None" = None,
+        failure_mode: "str | None" = None,
+        failed_collections: "list[str] | None" = None,
     ) -> None:
         """
         Log a retrieval event: query + nodes presented to the agent.
@@ -178,6 +180,17 @@ class RLDataLogger:
                         snowflake-arctic-embed2).  Frozen at scoring time so the
                         offline trainer uses the same vector even if the query
                         text has been truncated or the model updated.
+            failure_mode: Optional tag identifying a degraded-mode retrieval
+                        (e.g. ``"all_collections_schema_missing"``,
+                        ``"weaviate_unreachable"``). When set, the offline
+                        trainer filters the event out of training-pair
+                        construction but still uses it as a query-distribution
+                        / failure-rate signal. None = normal successful
+                        retrieval. v0.2.24 (RL-defect-2026-05-22).
+            failed_collections: Optional list of collection names that
+                        failed in the fan-out. Useful for diagnosing
+                        per-machine config drift (e.g. a hardcoded shared-KG
+                        default that doesn't exist on the user's Weaviate).
         """
         node_records = []
         for n in nodes:
@@ -215,6 +228,13 @@ class RLDataLogger:
         }
         if query_emb is not None:
             record["query_emb"] = _round_emb(query_emb)
+        if failure_mode:
+            record["failure_mode"] = str(failure_mode)
+        if failed_collections:
+            # Cap at 32 entries to avoid pathological payloads.
+            record["failed_collections"] = [
+                str(c) for c in list(failed_collections)[:32]
+            ]
 
         self._append(record)
 
