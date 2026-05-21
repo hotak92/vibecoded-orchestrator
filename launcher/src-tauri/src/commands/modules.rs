@@ -377,11 +377,31 @@ fn is_module_licensed(manifest: &ModuleManifest, db: &Db) -> bool {
         Err(_) => return false,
     };
     // 1. Orchestrator-tier satisfies?
+    //
+    // `admin` is server-classified (Path A Vault token or Path B LS
+    // variant) and the docs declare it a "strict superset of enterprise"
+    // by feature gates (docs/features/06-license-and-commercial.md §"Tier
+    // ordering"; db/tier.rs:40 reaffirms the contract). The pre-v0.2.22
+    // tier_rank match omitted `admin` and fell through to the wildcard
+    // (rank=0, free-equivalent), so an admin-tier user with NO matching
+    // module-specific entry in `module_licenses` was rejected client-side
+    // — visible to admin users as the Install button never enabling on a
+    // paid module they should have universal access to. Discovered
+    // 2026-05-21 during v0.2.22 post-push audit (see KG node
+    // "v0.2.22 Release — 2026-05-20" §"Lesson — admin tier_rank gap").
+    //
+    // The fix maps admin to a rank STRICTLY ABOVE enterprise so any
+    // future module declaring `min_orchestrator_tier: "enterprise"` is
+    // also satisfied by admin without further code changes. The wire
+    // contract from validate-tier remains the source of truth; this
+    // gate is advisory UI only (server-side artifact gateway re-validates
+    // a JWT at download time — docs/features/07-architecture.md:73).
     let tier_rank = |t: &str| match t {
         "free" => 0,
         "pro" => 1,
         "mao" => 2,
         "enterprise" => 3,
+        "admin" => 4,
         _ => 0,
     };
     if tier_rank(&cache.orchestrator_tier) >= tier_rank(&manifest.license.min_orchestrator_tier)
@@ -1166,6 +1186,128 @@ mod tests {
                 env_key,
                 declared,
             );
+        }
+    }
+
+    // ─── admin-tier gate regression (v0.2.22 post-push audit, 2026-05-21) ──
+    //
+    // Pre-fix: `is_module_licensed`'s `tier_rank` closure had no arm for
+    // `admin`, so the wildcard `_ => 0` collapsed admin tier to the same
+    // rank as `free`. An admin user (Path A Vault token or Path B LS
+    // variant) saw the Install button gated on any paid module unless
+    // their `module_licenses` entry happened to be populated for that
+    // specific module — contradicting the documented "admin is strict
+    // superset of enterprise by feature gates" contract
+    // (db/tier.rs:40, docs/features/06-license-and-commercial.md §"Tier
+    // ordering"). The post-fix rank maps admin to 4 (above enterprise=3).
+    //
+    // These tests pin BOTH halves of the contract:
+    //   1. admin tier unlocks the RL Reranker (a real Pro-tier module).
+    //   2. admin tier unlocks any hypothetical future enterprise-min module.
+    //   3. free tier still rejects pro-tier modules (no regression).
+    //   4. unknown-tier strings continue to fall through to rank=0 (no
+    //      silent privilege escalation via typo).
+    //
+    // Mutation-verified at authoring time: reverting the new `"admin" => 4`
+    // arm to fall through to `_ => 0` makes test #1 and #2 fail with the
+    // exact symptom the original bug produced.
+
+    /// Build a minimal valid `ModuleManifest` parameterized on the
+    /// `min_orchestrator_tier`. Parsing exercises the same validator the
+    /// launcher uses at install time (so test fixtures can't drift away
+    /// from real manifests' shape).
+    fn fake_manifest_with_min_tier(id: &str, min_tier: &str) -> ModuleManifest {
+        let raw = serde_json::json!({
+            "manifest_version": 1,
+            "id": id,
+            "name": "Fake Module",
+            "version": "0.0.1",
+            "description": "Test fixture for admin-tier gate regression.",
+            "category": "paid-independent",
+            "license": {
+                "required": true,
+                "variant_ids": ["fake-variant"],
+                "min_orchestrator_tier": min_tier
+            },
+            "compatibility": {"hosts": ["base"]},
+            "install": {"method": "container_pull"},
+            "runtime": {"type": "service", "command": "echo", "args": []}
+        });
+        ModuleManifest::from_json(&raw.to_string())
+            .unwrap_or_else(|e| panic!("parse fake manifest (min_tier={}): {}", min_tier, e))
+    }
+
+    fn fake_pro_manifest() -> ModuleManifest {
+        fake_manifest_with_min_tier("fake-pro-module", "pro")
+    }
+
+    fn fake_enterprise_manifest() -> ModuleManifest {
+        fake_manifest_with_min_tier("fake-enterprise-module", "enterprise")
+    }
+
+    #[test]
+    fn admin_tier_unlocks_pro_module() {
+        let db = open_db();
+        db.set_tier_cache("admin", &serde_json::json!({}), None)
+            .expect("set admin tier");
+        let manifest = fake_pro_manifest();
+        assert!(
+            is_module_licensed(&manifest, &db),
+            "admin tier MUST satisfy min_orchestrator_tier=pro \
+             (admin is documented as strict superset of enterprise; \
+             pre-fix the tier_rank fell through to 0 and rejected this)"
+        );
+    }
+
+    #[test]
+    fn admin_tier_unlocks_enterprise_module() {
+        let db = open_db();
+        db.set_tier_cache("admin", &serde_json::json!({}), None)
+            .expect("set admin tier");
+        let manifest = fake_enterprise_manifest();
+        assert!(
+            is_module_licensed(&manifest, &db),
+            "admin tier MUST satisfy min_orchestrator_tier=enterprise \
+             (any future enterprise-min module should auto-unlock for admin \
+             without further code changes)"
+        );
+    }
+
+    #[test]
+    fn free_tier_still_rejects_pro_module() {
+        // Regression guard against accidentally widening the gate.
+        let db = open_db();
+        db.set_tier_cache("free", &serde_json::json!({}), None)
+            .expect("set free tier");
+        let manifest = fake_pro_manifest();
+        assert!(
+            !is_module_licensed(&manifest, &db),
+            "free tier MUST NOT satisfy min_orchestrator_tier=pro"
+        );
+    }
+
+    #[test]
+    fn unknown_tier_string_does_not_silently_escalate() {
+        // Defense-in-depth: a typo'd or attacker-supplied tier string
+        // (e.g. "Admin" with capital A, or "godmode") MUST fall through
+        // to rank=0 and be rejected. Pre-fix this was already the case
+        // for `_` wildcards including `admin` lowercase (the bug); the
+        // fix is to add `admin` explicitly without enabling escalation
+        // via other unknown strings.
+        let db = open_db();
+        for typo in &["Admin", "ADMIN", "godmode", "root", "superuser"] {
+            db.set_tier_cache(typo, &serde_json::json!({}), None)
+                .ok(); // db CHECK constraint may reject — that's also fine.
+            if let Ok(cache) = db.get_tier_cache() {
+                if cache.orchestrator_tier == *typo {
+                    let manifest = fake_pro_manifest();
+                    assert!(
+                        !is_module_licensed(&manifest, &db),
+                        "unknown tier {:?} must NOT unlock pro-tier modules",
+                        typo,
+                    );
+                }
+            }
         }
     }
 }
