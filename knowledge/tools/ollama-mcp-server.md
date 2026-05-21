@@ -10,13 +10,16 @@ tags:
 - AI
 - python
 created: 2026-01-28 19:00:00+00:00
-updated: 2026-04-05T14:34:54Z
-status: active
+updated: 2026-05-20T00:00:00Z
+valid_until: 2026-05-18T00:00:00Z
+status: deprecated
 ---
 
-# Ollama MCP Server
+# Ollama MCP Server (Deprecated — Removed in v0.2.11)
 
-FastMCP-based server providing local LLM inference through Ollama, with specialized tools for document processing without consuming Claude API tokens.
+**Status**: Removed from the orchestrator's MCP server suite as of v0.2.11 (2026-05-11). Claude's native reasoning and the `Read` tool (with built-in vision) provide higher quality alternatives for the same use cases.
+
+FastMCP-based server that provided local LLM inference through Ollama, with specialized tools for document processing without consuming Claude API tokens.
 
 ## Overview
 
