@@ -120,6 +120,16 @@ tempfile = "3"
 # Drop-in for our previous blind directory walker.
 ignore = "0.4"
 
+# v0.2.24 A0 (2026-05-22): glob-pattern matcher for the user-editable
+# path allowlist (`CLAUDE.md`, `knowledge/**/*.md`, etc.) used by
+# `commands/git_user_editable_merge`. Same burntsushi family as the
+# `ignore` crate (which transitively depends on globset), so no net
+# new dependency tree — just promoting to a direct dep so the module
+# can build `GlobSet`s explicitly. Cross-OS via `case_insensitive(true)`
+# matching (needed for HFS+/APFS/NTFS where `CLAUDE.MD` vs `CLAUDE.md`
+# can both appear on disk).
+globset = "0.4"
+
 # PR-42 (v0.2.12 / 2026-05-16): file watcher for `.claude/settings.json`.
 # When the user edits env in settings.json, the watcher debounces a few
 # hundred ms of "settling" events then fires SIGHUP to all running MCPs

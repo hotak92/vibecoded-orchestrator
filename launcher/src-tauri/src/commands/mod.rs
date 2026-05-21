@@ -16,6 +16,11 @@ pub mod dashboard;
 pub mod desktop_shortcut;
 pub mod embedding_catalog;
 pub mod embedding_enrichment;
+// v0.2.24 §A0 (2026-05-22): per-path 3-way merge for known
+// user-editable files during orchestrator-root updates. Sits between
+// `installer::{update_orchestrator, merge_orchestrator_with_upstream}`
+// and their `git pull` invocations.
+pub mod git_user_editable_merge;
 pub mod hub_proxy;
 pub mod installer;
 pub mod kg;

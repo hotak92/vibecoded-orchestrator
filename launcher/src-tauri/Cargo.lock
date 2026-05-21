@@ -5384,6 +5384,7 @@ dependencies = [
  "dunce",
  "futures",
  "gethostname",
+ "globset",
  "hex",
  "ignore",
  "keyring",
