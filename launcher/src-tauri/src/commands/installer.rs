@@ -3323,6 +3323,54 @@ pub async fn update_orchestrator<R: Runtime>(
         "main".to_string()
     };
 
+    // v0.2.24 §A0 (2026-05-22): pre-merge user-editable files BEFORE
+    // `git pull --ff-only`. Without this step, ANY local uncommitted
+    // edit to an allowlisted file (CLAUDE.md, .claude/CONTEXT_STATE.md,
+    // knowledge/**/*.md, etc.) that ALSO has upstream changes would
+    // make git pull refuse with "Your local changes would be
+    // overwritten by merge" — every 3rd-party user hits this the first
+    // time upstream touches those files.
+    //
+    // The pre-merge:
+    //   1. Resolves base = merge-base(HEAD, vco_upstream/<branch>).
+    //   2. Resolves theirs = vco_upstream/<branch> tip.
+    //   3. Walks the diff base..theirs ∩ git status --porcelain
+    //      ∩ USER_EDITABLE_PATTERNS allowlist.
+    //   4. Per file: clean merge → write merged content + stage.
+    //                conflict → write sidecar `<path>.from-upstream-<sha>`
+    //                          leave local in place.
+    //
+    // Best-effort: any failure (no upstream ref yet, malformed diff,
+    // git merge-file errors) is logged and skipped — the bare `git
+    // pull --ff-only` below still runs and surfaces the original
+    // error if pre-merge couldn't help.
+    //
+    // We MUST `git fetch` first: pre_merge_user_editable resolves
+    // refs via `rev-parse vco_upstream/<branch>` and reads blobs via
+    // `git show <sha>:<path>`; without a recent fetch the local refs
+    // are stale and pre-merge sees no upstream changes.
+    emit_progress(&window, "update", "Fetching upstream for pre-merge...", 7.0);
+    let fetch_for_premerge = tokio::process::Command::new("git")
+        .args([
+            "fetch",
+            crate::commands::self_update::VCO_UPSTREAM_REMOTE,
+            &pull_branch,
+        ])
+        .current_dir(&install_path)
+        .output()
+        .await;
+    // Soft-fail: if fetch fails the bare pull below will surface the
+    // real error. We still attempt pre-merge with whatever refs exist.
+    if let Ok(out) = &fetch_for_premerge {
+        if !out.status.success() {
+            eprintln!(
+                "[vct] update_orchestrator: pre-merge fetch returned non-zero: {} — continuing",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+    }
+    let pre_merge_outcomes = run_pre_merge_user_editable(&install_path, &pull_branch).await;
+
     let pull = tokio::process::Command::new("git")
         .args([
             "pull",
@@ -3402,6 +3450,13 @@ pub async fn update_orchestrator<R: Runtime>(
     }
 
     emit_progress(&window, "update", "Changes pulled", 30.0);
+
+    // v0.2.24 §A0: emit deferral entries for the pre-merged
+    // user-editable files now that the pull succeeded. Done before
+    // install.py runs so the launcher's UPDATE_DEFERRED.md viewer can
+    // surface the entries on the next session start. Best-effort: a
+    // deferral-write failure mustn't block the update.
+    maybe_emit_pre_merge_deferrals(&install_path, &pre_merge_outcomes, &pull_branch);
 
     // Stage 2: Re-run install.py with --update flag
     emit_progress(&window, "install", "Applying updates...", 40.0);
@@ -3824,6 +3879,124 @@ async fn resolve_pull_branch(install_path: &Path) -> String {
     }
 }
 
+/// v0.2.24 §A0 (2026-05-22): orchestrate the pre-merge user-editable
+/// step for both `update_orchestrator` and `merge_orchestrator_with_upstream`.
+///
+/// Resolves the base / theirs SHAs, calls
+/// `git_user_editable_merge::pre_merge_user_editable`, stages every
+/// successfully-merged file via `git add`. Returns the outcomes list
+/// for later deferral emission (NoChange entries are kept in the list
+/// so the caller knows the pre-merge ran).
+///
+/// Best-effort throughout: any failure logs to stderr and returns an
+/// empty list — the bare `git pull` that follows will surface the
+/// original error. Pre-merge MUST NOT block the update path.
+async fn run_pre_merge_user_editable(
+    install_path: &Path,
+    pull_branch: &str,
+) -> Vec<crate::commands::git_user_editable_merge::MergeOutcome> {
+    use crate::commands::git_user_editable_merge::{
+        compute_base_sha, compute_theirs_sha, pre_merge_user_editable, MergeOutcomeKind,
+    };
+
+    let base = match compute_base_sha(install_path, pull_branch).await {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            // Upstream ref absent / no fetch yet — nothing to pre-merge.
+            return Vec::new();
+        }
+        Err(e) => {
+            eprintln!(
+                "[vct] pre_merge: compute_base_sha failed: {} — skipping pre-merge",
+                e
+            );
+            return Vec::new();
+        }
+    };
+    let theirs = match compute_theirs_sha(install_path, pull_branch).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return Vec::new(),
+        Err(e) => {
+            eprintln!(
+                "[vct] pre_merge: compute_theirs_sha failed: {} — skipping pre-merge",
+                e
+            );
+            return Vec::new();
+        }
+    };
+    // No-op when base == theirs (upstream is at the merge base — nothing
+    // to merge). Cheap explicit guard.
+    if base == theirs {
+        return Vec::new();
+    }
+
+    let outcomes = match pre_merge_user_editable(install_path, &base, &theirs).await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "[vct] pre_merge: pre_merge_user_editable failed: {} — skipping pre-merge",
+                e
+            );
+            return Vec::new();
+        }
+    };
+
+    // Stage every successfully-merged file via `git add`. Sidecar-
+    // preserved files DON'T get staged on purpose — they leave the
+    // working tree with their original local content; the bare
+    // `git pull --ff-only` will still fail on them (because the
+    // local commit set diverges) and the existing B4 non-FF / conflict
+    // modal will surface the deferral entry the caller emits later.
+    for outcome in &outcomes {
+        if matches!(outcome.kind, MergeOutcomeKind::Merged { .. }) {
+            let status = tokio::process::Command::new("git")
+                .args(["add", "--"])
+                .arg(&outcome.path)
+                .current_dir(install_path)
+                .status()
+                .await;
+            if let Ok(s) = status {
+                if !s.success() {
+                    eprintln!(
+                        "[vct] pre_merge: git add failed for {}",
+                        outcome.path.display()
+                    );
+                }
+            }
+        }
+    }
+    outcomes
+}
+
+/// v0.2.24 §A0 (2026-05-22): convenience wrapper around the deferral
+/// emitter. Filters out NoChange outcomes — only Merged and
+/// PreservedWithUpstreamSidecar produce user-visible deferrals.
+fn maybe_emit_pre_merge_deferrals(
+    install_path: &Path,
+    outcomes: &[crate::commands::git_user_editable_merge::MergeOutcome],
+    pull_branch: &str,
+) {
+    use crate::commands::git_user_editable_merge::emit_orchestrator_user_modified_deferrals;
+    if outcomes.is_empty() {
+        return;
+    }
+    let actionable_count = outcomes
+        .iter()
+        .filter(|o| o.is_actionable_for_deferral())
+        .count();
+    if actionable_count == 0 {
+        return;
+    }
+    if let Err(e) =
+        emit_orchestrator_user_modified_deferrals(install_path, outcomes, pull_branch)
+    {
+        eprintln!(
+            "[vct] pre_merge: deferral emission failed: {} — continuing (update succeeded)",
+            e
+        );
+    }
+}
+
 /// Run the post-pull install.py + hub-start + restart sequence. This is
 /// the tail shared by `update_orchestrator` (after `git pull --ff-only`)
 /// and the new merge/rebase commands. Extracted as a free function so
@@ -4014,6 +4187,38 @@ pub async fn merge_orchestrator_with_upstream<R: Runtime>(
 
     let pull_branch = resolve_pull_branch(&install_path).await;
 
+    // v0.2.24 §A0 (2026-05-22): pre-merge user-editable files BEFORE
+    // the merge pull. Same rationale as the `update_orchestrator`
+    // pre-merge: when the user has local uncommitted edits to
+    // CLAUDE.md / knowledge/**/*.md / .claude/CONTEXT_STATE.md /
+    // .claude/MEMORY.md / HANDOFF-*.md, the bare `git pull --no-rebase`
+    // refuses with "Your local changes would be overwritten by merge".
+    // The pre-merge auto-resolves non-overlapping edits and sidecars
+    // conflicting ones so the merge can proceed.
+    //
+    // Best-effort: failures fall through to the bare pull which will
+    // surface the original error via the existing B4 modal flow.
+    emit_progress(&window, "update", "Fetching upstream for pre-merge...", 7.0);
+    let fetch_for_premerge = tokio::process::Command::new("git")
+        .args([
+            "fetch",
+            crate::commands::self_update::VCO_UPSTREAM_REMOTE,
+            &pull_branch,
+        ])
+        .current_dir(&install_path)
+        .output()
+        .await;
+    if let Ok(out) = &fetch_for_premerge {
+        if !out.status.success() {
+            eprintln!(
+                "[vct] merge_orchestrator_with_upstream: pre-merge fetch returned non-zero: {} \
+                 — continuing",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+    }
+    let pre_merge_outcomes = run_pre_merge_user_editable(&install_path, &pull_branch).await;
+
     // Pull WITHOUT --ff-only, explicitly as a merge (--no-rebase). The
     // explicit reconcile flag is REQUIRED on git 2.34+: without it git
     // refuses a divergent pull with "Need to specify how to reconcile
@@ -4090,6 +4295,12 @@ pub async fn merge_orchestrator_with_upstream<R: Runtime>(
             revert_pre_pull_rename(backup);
         }
         let _ = ensure_hub_started_after_update(&install_path);
+        // v0.2.24 §A0: even on "already up to date" pull, the pre-merge
+        // may have produced outcomes (e.g. the user had local edits but
+        // upstream had no new commits — pre-merge is a no-op then, but
+        // defensive emit here so the path stays consistent with the
+        // non-"up to date" branch).
+        maybe_emit_pre_merge_deferrals(&install_path, &pre_merge_outcomes, &pull_branch);
         return Ok(InstallResult {
             success: true,
             install_path: path,
@@ -4097,6 +4308,13 @@ pub async fn merge_orchestrator_with_upstream<R: Runtime>(
             system,
         });
     }
+
+    // v0.2.24 §A0: emit deferral entries for the pre-merged user-
+    // editable files now that the merge succeeded. Done before
+    // install.py runs (inside run_post_pull_install_and_restart) so
+    // the launcher's UPDATE_DEFERRED.md viewer can surface entries on
+    // the next session start. Best-effort.
+    maybe_emit_pre_merge_deferrals(&install_path, &pre_merge_outcomes, &pull_branch);
 
     run_post_pull_install_and_restart(
         app,
