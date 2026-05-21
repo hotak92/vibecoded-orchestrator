@@ -128,6 +128,14 @@ CLAUDE.local.md
 # surfaced 12 such files tracked at HEAD on 2026-05-16.
 .claude/context/
 
+# Per-machine secrets stash. Non-sensitive shared-with-Claude convention
+# (the values inside ARE sensitive — bearer tokens, license keys — but
+# the directory itself is a known location for Claude to read/write
+# during a session). `*.token`/`*.pat` rules above already catch the
+# obvious files; this is the directory-level belt-and-braces against an
+# accidentally-committed README in the same dir.
+.claude/secrets/
+
 # pnpm artefacts — launcher uses npm; pnpm-lock.yaml accidentally created by
 # contributors with pnpm on PATH must NOT enter the repo (would fight package-lock.json)
 launcher/pnpm-lock.yaml

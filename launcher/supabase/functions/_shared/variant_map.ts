@@ -87,11 +87,18 @@ export const VARIANT_MAP: Record<string, VariantMapping> = {
  * unit tests still work.
  */
 export function assertNoPlaceholderKeysInProduction(
-  env: { NODE_ENV?: string; DENO_DEPLOYMENT_ID?: string } = {
+  env: {
+    NODE_ENV?: string;
+    DENO_DEPLOYMENT_ID?: string;
+    VCT_LS_VARIANTS_NOT_YET_SET?: string;
+  } = {
     // deno-lint-ignore no-explicit-any
     NODE_ENV: (globalThis as any).Deno?.env?.get?.("NODE_ENV"),
     // deno-lint-ignore no-explicit-any
     DENO_DEPLOYMENT_ID: (globalThis as any).Deno?.env?.get?.("DENO_DEPLOYMENT_ID"),
+    VCT_LS_VARIANTS_NOT_YET_SET:
+      // deno-lint-ignore no-explicit-any
+      (globalThis as any).Deno?.env?.get?.("VCT_LS_VARIANTS_NOT_YET_SET"),
   },
 ): void {
   // Production = explicit NODE_ENV=production OR running on Supabase
@@ -101,6 +108,37 @@ export function assertNoPlaceholderKeysInProduction(
     env.NODE_ENV === "production" || !!env.DENO_DEPLOYMENT_ID;
   if (!isProduction) return;
 
+  // ─── Pre-LS-products opt-out (2026-05-21) ────────────────────────────
+  //
+  // Operators running Path A (Vault-token admin) only — i.e. NO Lemon
+  // Squeezy products provisioned yet — can set VCT_LS_VARIANTS_NOT_YET_SET=true
+  // to acknowledge that the placeholder VARIANT_MAP entries are
+  // intentional and bypass this assertion.
+  //
+  // Why this is safe: VARIANT_MAP is only consulted by `lookupVariant`
+  // (called AFTER a successful LS validate+activate round-trip in
+  // Path B). With no LS products live, Path B is unreachable for legit
+  // requests — only Path A (vct_admin_* tokens via Vault lookup) and
+  // the "unknown variant ID" log+drop catch-all path can fire. Both
+  // are safe with placeholder VARIANT_MAP entries because:
+  //   * Path A never touches VARIANT_MAP.
+  //   * The catch-all returns `unknown variant` (400 / log) regardless
+  //     of whether the unknown-to-VARIANT_MAP value is the literal
+  //     "ORCHESTRATOR_PRO_MONTHLY_PLACEHOLDER" sentinel or a real but
+  //     unrecognized variant_id — the SAFE behavior is identical.
+  //
+  // The opt-out flips OFF automatically once real LS variants are
+  // added to the map (the operator removes the env var; the assertion
+  // again hard-fails if any `_PLACEHOLDER` keys remain — protecting
+  // against half-finished LS setups).
+  //
+  // SECURITY NOTE: replacing the placeholder string values with dummy
+  // non-placeholder values (e.g. "00000000") to silence this assertion
+  // would have been WORSE — those dummies look identical to real
+  // variant_ids, masking legitimate misconfiguration. The flag is
+  // explicit, auditable, and self-documenting in Supabase secrets.
+  if (env.VCT_LS_VARIANTS_NOT_YET_SET === "true") return;
+
   const offenders = Object.keys(VARIANT_MAP).filter((k) =>
     k.includes("_PLACEHOLDER")
   );
@@ -109,7 +147,9 @@ export function assertNoPlaceholderKeysInProduction(
       `VARIANT_MAP contains ${offenders.length} placeholder key(s) that ` +
         `must NOT ship to production: ${offenders.join(", ")}. Replace them ` +
         `with real Lemon Squeezy variant_ids from the LS dashboard before ` +
-        `deploying.`,
+        `deploying — OR set VCT_LS_VARIANTS_NOT_YET_SET=true via ` +
+        `'supabase secrets set' if Path B (LS-variant) admin is not yet ` +
+        `configured (Path A / Vault-token admin works without LS products).`,
     );
   }
 }

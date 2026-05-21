@@ -260,3 +260,69 @@ Deno.test("assertNoPlaceholderKeysInProduction: error message names offending ke
     }
   }
 });
+
+// ─── Pre-LS-products opt-out (Path A-only deployments, 2026-05-21) ─────
+
+Deno.test("assertNoPlaceholderKeysInProduction: bypassed by VCT_LS_VARIANTS_NOT_YET_SET=true", () => {
+  // Path A (Vault-token admin) doesn't touch VARIANT_MAP. Until LS
+  // products are provisioned, the placeholder keys are intentional
+  // pre-launch state. The opt-out flag acknowledges this explicitly
+  // and lets the function come up under Supabase runtime
+  // (DENO_DEPLOYMENT_ID set) without crashing at module init.
+  assertNoPlaceholderKeysInProduction({
+    DENO_DEPLOYMENT_ID: "supabase-prod-deploy-abc",
+    VCT_LS_VARIANTS_NOT_YET_SET: "true",
+  });
+});
+
+Deno.test("assertNoPlaceholderKeysInProduction: opt-out does NOT accept truthy non-'true'", () => {
+  // Strict-string match: "true" only. "1" / "yes" / "TRUE" should not
+  // bypass — typos must fail loudly, not silently degrade to the
+  // legacy production-deploy-with-placeholders bug. Tighter than a
+  // generic truthy check on purpose.
+  for (const sloppy of ["1", "yes", "TRUE", "True", "y", " true "]) {
+    assertThrows(
+      () =>
+        assertNoPlaceholderKeysInProduction({
+          NODE_ENV: "production",
+          VCT_LS_VARIANTS_NOT_YET_SET: sloppy,
+        }),
+      Error,
+      "placeholder",
+    );
+  }
+});
+
+Deno.test("assertNoPlaceholderKeysInProduction: opt-out absent → still throws", () => {
+  // Without the flag (or with it set to anything else), production
+  // deployment with placeholder keys must still crash at init —
+  // protecting against silent production-with-placeholders regression
+  // if someone removes the flag after real LS variants land.
+  assertThrows(
+    () =>
+      assertNoPlaceholderKeysInProduction({
+        DENO_DEPLOYMENT_ID: "supabase-prod-deploy-xyz",
+        VCT_LS_VARIANTS_NOT_YET_SET: "false",
+      }),
+    Error,
+    "placeholder",
+  );
+});
+
+Deno.test("assertNoPlaceholderKeysInProduction: error message points to the opt-out flag", () => {
+  // On-call diagnosability: a future maintainer hitting the assertion
+  // should see in the error message that the opt-out flag exists, so
+  // they can decide whether to set it (Path A only) or replace the
+  // placeholders (real LS products launching).
+  try {
+    assertNoPlaceholderKeysInProduction({ NODE_ENV: "production" });
+    throw new Error("expected throw");
+  } catch (e) {
+    const msg = (e as Error).message;
+    if (!msg.includes("VCT_LS_VARIANTS_NOT_YET_SET")) {
+      throw new Error(
+        `error message must mention the opt-out flag: ${msg}`,
+      );
+    }
+  }
+});
