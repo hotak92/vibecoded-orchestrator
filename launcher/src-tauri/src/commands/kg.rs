@@ -158,14 +158,17 @@ pub async fn kg_list_collections(
             .unwrap_or_else(|| "none".to_string());
         let node_count = fetch_class_count(&client, &base, &name).await.unwrap_or(0);
         // Recognize the canonical cross-project KG name shipped by the
-        // orchestrator (VibecodedOrchestrator_KnowledgeGraph since v0.2.12
-        // PR-26 / Group E; legacy VibeCodedTools_KnowledgeGraph kept here
-        // explicitly as a legacy-detection path so pre-rename installs
-        // still light up the picker's "Manage shared KG collection" UI).
-        // Falls back to the historical "shared" substring heuristic + legacy
-        // "sharedVCT" name for back-compat with older installs / custom setups.
+        // orchestrator (VibeCodedOrchestrator_KnowledgeGraph since v0.2.23 B1
+        // — was VibecodedOrchestrator_KnowledgeGraph v0.2.12–v0.2.22, itself
+        // renamed from VibeCodedTools_KnowledgeGraph in v0.2.12 PR-26 /
+        // Group E; both prior names kept here explicitly as legacy-detection
+        // paths so pre-flip / pre-rename installs still light up the picker's
+        // "Manage shared KG collection" UI). Falls back to the historical
+        // "shared" substring heuristic + legacy "sharedVCT" name for
+        // back-compat with older installs / custom setups.
         let is_shared = name == crate::commands::project_env_settings::DEFAULT_SHARED_KG_COLLECTION
             || name == crate::commands::project_env_settings::LEGACY_SHARED_KG_COLLECTION
+            || name == crate::commands::project_env_settings::LEGACY_SHARED_KG_COLLECTION_LOWERCASE_C
             || name == "sharedVCT"
             || name.to_lowercase().contains("shared");
         out.push(KgCollectionAccess {
@@ -1154,6 +1157,9 @@ mod tests {
         // KG / Development / unrelated shapes must NOT match.
         assert!(!is_codegraph_class("MyProject_KnowledgeGraph"));
         assert!(!is_codegraph_class("MyProject_Development"));
+        // Canonical v0.2.23 B1 capital-C casing.
+        assert!(!is_codegraph_class("VibeCodedOrchestrator_KnowledgeGraph"));
+        // Legacy v0.2.12–v0.2.22 lowercase-c casing.
         assert!(!is_codegraph_class("VibecodedOrchestrator_KnowledgeGraph"));
         assert!(!is_codegraph_class("CodeBase"));
         assert!(!is_codegraph_class("CodeReview"));

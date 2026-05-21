@@ -880,7 +880,7 @@ class ResolveContentPropertyTests(unittest.TestCase):
 
     def test_bare_kg_returns_content(self):
         self.assertEqual(
-            ee._resolve_content_property("VibecodedOrchestrator_KnowledgeGraph"),
+            ee._resolve_content_property("VibeCodedOrchestrator_KnowledgeGraph"),
             "content",
         )
 

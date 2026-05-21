@@ -182,7 +182,7 @@ class EnsureCollectionsTests(unittest.TestCase):
             # Pre-seed all three collections (project + dev + shared) so
             # _ensure_collections has nothing to POST. The shared collection
             # name comes from SHARED_KG_COLLECTION (default
-            # VibecodedOrchestrator_KnowledgeGraph) — pin it explicitly here to
+            # VibeCodedOrchestrator_KnowledgeGraph) — pin it explicitly here to
             # decouple the test from the default value.
             _Handler.schema = {"classes": [
                 {"class": "TestKG"},
@@ -225,7 +225,7 @@ class EnsureCollectionsTests(unittest.TestCase):
 
     def test_creates_shared_kg_collection(self):
         """Step 7b also bootstraps the cross-project shared KG collection so
-        every install on this machine sees the same VibecodedOrchestrator_KnowledgeGraph."""
+        every install on this machine sees the same VibeCodedOrchestrator_KnowledgeGraph."""
         server, port, _ = _start_server()
         try:
             _Handler.schema = {"classes": []}
@@ -233,16 +233,16 @@ class EnsureCollectionsTests(unittest.TestCase):
                 "os.environ",
                 {"WEAVIATE_PORT": str(port), "KG_COLLECTION": "TestKG",
                  "DEVELOPMENT_COLLECTION": "TestDev",
-                 "SHARED_KG_COLLECTION": "VibecodedOrchestrator_KnowledgeGraph"},
+                 "SHARED_KG_COLLECTION": "VibeCodedOrchestrator_KnowledgeGraph"},
             ):
                 install._ensure_collections({})
             posted_classes = [p.get("class") for p in _Handler.posted]
             self.assertIn("TestKG", posted_classes)
             self.assertIn("TestDev", posted_classes)
-            self.assertIn("VibecodedOrchestrator_KnowledgeGraph", posted_classes)
+            self.assertIn("VibeCodedOrchestrator_KnowledgeGraph", posted_classes)
             # Shared collection schema mirrors the project KG (same builder).
             shared = next(p for p in _Handler.posted
-                          if p.get("class") == "VibecodedOrchestrator_KnowledgeGraph")
+                          if p.get("class") == "VibeCodedOrchestrator_KnowledgeGraph")
             prop_names = {p["name"] for p in shared["properties"]}
             self.assertIn("title", prop_names)
             self.assertIn("content", prop_names)
@@ -326,13 +326,18 @@ class EnsureCollectionsAdoptModeTests(unittest.TestCase):
             # sane *_KnowledgeGraph or *_Development.
             #
             # Edge case (post-PR-26/34): when PROJECT_ROOT.basename is
-            # "vibecoded-orchestrator" → sanitized → "VibecodedOrchestrator",
-            # the project-scoped KG name HAPPENS to equal the canonical
-            # shared KG name (VibecodedOrchestrator_KnowledgeGraph). That's
-            # legitimate — the orchestrator-self IS a managed project
-            # whose own KG aliases the shared name. Accept this case by
-            # checking that SOMETHING project-scoped (KG OR Development)
-            # got created, not strictly excluding the shared name.
+            # "vibecoded-orchestrator" → sanitized → "VibecodedOrchestrator"
+            # (lowercase c — sanitize only uppercases the first char of
+            # each split part). v0.2.23 B1 (2026-05-21) flipped the
+            # canonical SHARED KG casing to capital-C "VibeCodedOrchestrator",
+            # so the per-project KG (`VibecodedOrchestrator_KnowledgeGraph`,
+            # lowercase c) no longer aliases the shared KG
+            # (`VibeCodedOrchestrator_KnowledgeGraph`, capital C). They
+            # are case-different siblings on the same Weaviate, which is
+            # supported by the case-insensitive adoption logic in
+            # `_ensure_collections`. Accept whichever shape lands; the
+            # test only asserts SOMETHING project-scoped (KG OR Dev) was
+            # created.
             project_scoped = [c for c in posted_classes
                               if (c.endswith("_KnowledgeGraph")
                                   or c.endswith("_Development"))
@@ -485,6 +490,15 @@ class DeriveProjectKgNameTests(unittest.TestCase):
         )
 
     def test_basename_with_hyphens(self):
+        # The sanitize function splits on `-` and uppercases the first char of
+        # each part, so "vibecoded-orchestrator" → "Vibecoded" + "Orchestrator"
+        # = "VibecodedOrchestrator" (lowercase c in the middle — sanitize only
+        # touches the leading char per part). This is INTENTIONALLY different
+        # from the canonical shared-KG casing "VibeCodedOrchestrator" (capital
+        # C, the brand spelling) since v0.2.23 B1; the per-project derive
+        # function has no special-case for "vibecoded-orchestrator".
+        # Case-insensitive adoption in `_ensure_collections` handles the
+        # resulting case-different sibling without recreating the class.
         self.assertEqual(
             install._derive_project_kg_name(Path("/x/y/vibecoded-orchestrator")),
             "VibecodedOrchestrator_KnowledgeGraph",

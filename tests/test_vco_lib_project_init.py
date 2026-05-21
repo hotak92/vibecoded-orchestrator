@@ -92,11 +92,14 @@ class DeriveProjectCollectionNamesTests(unittest.TestCase):
                 "kg_collection": "VideoFrames_KnowledgeGraph",
                 "development_collection": "VideoFrames_Development",
                 "project_name": "VideoFrames",
-                # Canonical shared-KG name (renamed from
-                # "VibeCodedTools_KnowledgeGraph" in v0.2.12 PR-26 / Group E).
-                # Cross-language invariant pinned by
+                # Canonical shared-KG name. v0.2.23 B1 (2026-05-21):
+                # casing flipped to capital-C "VibeCoded" to match the
+                # brand spelling (was lowercase-c "Vibecoded" v0.2.12–
+                # v0.2.22, itself renamed from "VibeCodedTools_
+                # KnowledgeGraph" in v0.2.12 PR-26 / Group E). Cross-
+                # language invariant pinned by
                 # tests/test_shared_kg_constant_consistency.py.
-                "shared_kg_collection": "VibecodedOrchestrator_KnowledgeGraph",
+                "shared_kg_collection": "VibeCodedOrchestrator_KnowledgeGraph",
                 "shared_kg_write_disabled": "false",
                 "kg_basename": "VideoFrames",
             },
@@ -136,7 +139,7 @@ class DeriveProjectCollectionNamesTests(unittest.TestCase):
                 project_init.derive_project_collection_names(name)[
                     "shared_kg_collection"
                 ],
-                "VibecodedOrchestrator_KnowledgeGraph",
+                "VibeCodedOrchestrator_KnowledgeGraph",
             )
 
 
@@ -160,6 +163,13 @@ class BackCompatWithInstallPyTests(unittest.TestCase):
         )
 
     def test_kg_name_back_compat_hyphens(self):
+        # The sanitize function splits on `-` and uppercases the first char of
+        # each part, so "vibecoded-orchestrator" → "Vibecoded" + "Orchestrator"
+        # = "VibecodedOrchestrator" (lowercase c in the middle — sanitize only
+        # touches the leading char per part). This is INTENTIONALLY different
+        # from the canonical shared-KG casing "VibeCodedOrchestrator" (capital
+        # C, brand spelling) since v0.2.23 B1; the per-project derive function
+        # has no special-case for "vibecoded-orchestrator".
         self.assertEqual(
             install._derive_project_kg_name(Path("/x/y/vibecoded-orchestrator")),
             "VibecodedOrchestrator_KnowledgeGraph",
@@ -208,7 +218,7 @@ class CliEntryPointTests(unittest.TestCase):
         self.assertEqual(payload["kg_collection"], "VideoFrames_KnowledgeGraph")
         self.assertEqual(payload["development_collection"], "VideoFrames_Development")
         self.assertEqual(payload["project_name"], "VideoFrames")
-        self.assertEqual(payload["shared_kg_collection"], "VibecodedOrchestrator_KnowledgeGraph")
+        self.assertEqual(payload["shared_kg_collection"], "VibeCodedOrchestrator_KnowledgeGraph")
         self.assertEqual(payload["shared_kg_write_disabled"], "false")
         self.assertEqual(payload["kg_basename"], "VideoFrames")
 

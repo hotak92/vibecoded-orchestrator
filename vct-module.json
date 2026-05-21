@@ -51,12 +51,13 @@
       "description": "OpenAI API key for the EmbeddingService. Set via OnboardingWizard OR Preferences → Special Secrets. Resolved by hub for every project; consumed by vco_lib/embedding_service.py when ACTIVE_EMBEDDING=openai or as multi-slot fallback."
     }
   ],
-  "_gui_doc": "v0.2.20 (Stream 2 follow-up, 2026-05-19): the orchestrator core uses the same `gui.config_tab` schema as paid modules — validates that the schema generalizes beyond paid surfaces. The Tauri commands referenced in `action`/`on_change` fields live in `launcher/src-tauri/src/commands/orchestrator_core.rs`. Tooltip strings are user-facing (non-tech audience); keep them mouseover-actionable, not vague.",
+  "_gui_doc": "v0.2.20 (Stream 2 follow-up, 2026-05-19): the orchestrator core uses the same `gui.config_tab` schema as paid modules — validates that the schema generalizes beyond paid surfaces. The Tauri commands referenced in `action`/`on_change` fields live in `launcher/src-tauri/src/commands/orchestrator_core.rs`. Tooltip strings are user-facing (non-tech audience); keep them mouseover-actionable, not vague. v0.2.23 F2 (2026-05-21): `show_in_sidebar: false` — the orchestrator-core controls are now folded into the per-project Settings page (rendered when the active project is the orchestrator-root row). Keeping the standalone /modules/orchestrator/config sidebar entry would duplicate the surface — the user explicitly asked for one consolidated place. The route itself is left intact for any deep links that may exist; the page renders the same ModuleConfigTab so direct navigation still works.",
   "gui": {
     "config_tab": {
       "title": "Orchestrator core",
       "icon": "box",
       "description": "Manage the always-installed KG + Code Graph services. For project-specific assignments use the Identity tab.",
+      "show_in_sidebar": false,
       "sections": [
         {
           "title": "Knowledge Graph",

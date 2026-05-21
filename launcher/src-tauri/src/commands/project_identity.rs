@@ -1883,6 +1883,9 @@ mod tests {
 
     #[test]
     fn shared_kg_name_accepts_canonical_shapes() {
+        // Canonical v0.2.23 B1 capital-C casing.
+        assert!(validate_shared_kg_name("VibeCodedOrchestrator_KnowledgeGraph").is_ok());
+        // Legacy v0.2.12–v0.2.22 lowercase-c casing.
         assert!(validate_shared_kg_name("VibecodedOrchestrator_KnowledgeGraph").is_ok());
         assert!(validate_shared_kg_name("FooBar_KnowledgeGraph").is_ok());
         assert!(validate_shared_kg_name("Acme_KnowledgeGraph").is_ok());

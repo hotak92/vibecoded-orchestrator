@@ -25,6 +25,23 @@ const SEEN_KEY = 'vct.update.seen_version';
  *  `null` when no signal is true. */
 export type UpdateKind = 'binary_stale' | 'install_stale' | 'remote_ahead' | null;
 
+/**
+ * v0.2.23 (B4 / D19): structured payload returned by `update_orchestrator`
+ * when `git pull --ff-only` fails because the local clone has diverged
+ * from upstream. Mirrors Rust `serialize_orchestrator_non_ff_error`.
+ *
+ * When set, `UpdateBadge.svelte` renders `OrchestratorUpdateDivergenceModal`
+ * instead of a raw error toast — the user picks Merge / Rebase / Cancel.
+ */
+export type OrchestratorNonFfPayload = {
+  event: 'orchestrator_update_non_ff';
+  branch: string;
+  local_sha: string | null;
+  remote_sha: string | null;
+  diverged_files: string[];
+  git_stderr: string;
+};
+
 interface UpdaterState {
   available: boolean;
   /** v0.2.16: which signal is currently being rendered. Drives copy +
@@ -37,6 +54,9 @@ interface UpdaterState {
   updating: boolean;
   error: string | null;
   dismissed: boolean;
+  /** v0.2.23 (B4 / D19): when non-null, render the divergence modal
+   *  instead of the popover error. Cleared by the modal's onClose. */
+  nonFf: OrchestratorNonFfPayload | null;
 }
 
 function loadSeen(): string | null {
@@ -63,6 +83,24 @@ function pickKind(status: { remote_ahead: boolean; install_stale: boolean; binar
   return null;
 }
 
+/**
+ * v0.2.23 (B4 / D19): try to parse a Tauri error as a non-FF divergence
+ * payload from `update_orchestrator`. Returns null on any other shape.
+ */
+function parseNonFfError(raw: unknown): OrchestratorNonFfPayload | null {
+  if (typeof raw !== 'string') return null;
+  if (!raw.startsWith('{')) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && parsed.event === 'orchestrator_update_non_ff') {
+      return parsed as OrchestratorNonFfPayload;
+    }
+  } catch {
+    // not JSON
+  }
+  return null;
+}
+
 function createUpdaterStore() {
   const { subscribe, update } = writable<UpdaterState>({
     available: false,
@@ -71,6 +109,7 @@ function createUpdaterStore() {
     updating: false,
     error: null,
     dismissed: false,
+    nonFf: null,
   });
 
   return {
@@ -128,7 +167,7 @@ function createUpdaterStore() {
     /** Resolve `remote_ahead` — git pull + install.py --update. */
     async runUpdate(): Promise<void> {
       if (!tauriAvailable()) return;
-      update((s) => ({ ...s, updating: true, error: null }));
+      update((s) => ({ ...s, updating: true, error: null, nonFf: null }));
       try {
         await orchestrator.update_orchestrator();
         update((s) => ({
@@ -137,16 +176,44 @@ function createUpdaterStore() {
           available: false,
           kind: null,
           dismissed: false,
+          nonFf: null,
         }));
         // Re-check to refresh the new install/binary state.
         await orchestrator.checkStatus();
       } catch (e) {
-        update((s) => ({
-          ...s,
-          updating: false,
-          error: e instanceof Error ? e.message : String(e),
-        }));
+        // v0.2.23 (B4 / D19): detect divergence. The error string is
+        // the raw Tauri Err payload; the orchestrator store wraps it as
+        // an Error so we unwrap before parsing.
+        const raw = e instanceof Error ? e.message : String(e);
+        const nff = parseNonFfError(raw);
+        if (nff) {
+          // Surface the modal instead of a toast — the user has a real
+          // choice to make (merge vs rebase vs cancel) and the raw
+          // git stderr is unactionable.
+          update((s) => ({
+            ...s,
+            updating: false,
+            error: null,
+            nonFf: nff,
+          }));
+        } else {
+          update((s) => ({
+            ...s,
+            updating: false,
+            error: raw,
+            nonFf: null,
+          }));
+        }
       }
+    },
+
+    /**
+     * v0.2.23 (B4 / D19): dismiss the divergence modal. Called by the
+     * modal component's onClose after the user picks an action (or
+     * cancels). Clearing `nonFf` removes the modal from the DOM.
+     */
+    dismissNonFf() {
+      update((s) => ({ ...s, nonFf: null }));
     },
 
     /**

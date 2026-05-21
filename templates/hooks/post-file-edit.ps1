@@ -109,10 +109,20 @@ if ($EditedFile.StartsWith($DocsDir, [StringComparison]::OrdinalIgnoreCase) -and
 }
 
 # 3. Code file changes: code graph incremental update + LLM nudge.
-# v0.2.21 Step 18 (caller migration): resolve project name via the
-# launcher's vct-hub first (`vct_project_config.ps1 -Field
-# code_graph_project`); fall back to the legacy env chain when the hub
-# is unreachable. Mirrors the .sh sibling at the same line.
+# v0.2.21 Step 18 (caller migration): resolve the code-graph collection
+# prefix via the launcher's vct-hub first (`vct_project_config.ps1 -Field
+# code_graph_collection_prefix`); fall back to the legacy env chain when
+# the hub is unreachable. Mirrors the .sh sibling at the same line.
+#
+# v0.2.23 field switch: previously this read `code_graph_project`, which
+# the hub returns as a legacy alias for `project_slug` — NOT the canonical
+# Weaviate prefix. The analyzer's `_sanitize_collection_prefix` then
+# re-canonicalised the slug, producing a prefix that diverged from the
+# launcher's `project_codegraph_bindings.collection_prefix`. Incremental
+# writes landed in zombie collections (e.g. `Orchestrator_root_Code*`)
+# while consumers queried the canonical prefix and saw 0 results.
+# `code_graph_collection_prefix` is the binding-row truth and the only
+# correct source for the write target.
 #
 # Pre-v0.2.11 behaviour hardcoded "ClaudeOrchestrator" here, which
 # polluted the legacy collection from every project install. Do NOT
@@ -121,22 +131,22 @@ if ($EditedFile -match '\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|jav
     $bn = Split-Path $EditedFile -Leaf
     $cgIncPs1 = Join-Path $ScriptDir "code-graph-incremental.ps1"
     if (Test-Path $cgIncPs1) {
-        $codeGraphProject = ""
+        $codeGraphPrefix = ""
         $resolverPs1 = Join-Path $ProjectRoot ".claude/scripts/vct_project_config.ps1"
         if (Test-Path $resolverPs1) {
             try {
-                $codeGraphProject = (& pwsh -NoProfile -File $resolverPs1 `
-                    -Project $ProjectRoot -Field code_graph_project 2>$null) -as [string]
-                if ($null -eq $codeGraphProject) { $codeGraphProject = "" }
-                $codeGraphProject = $codeGraphProject.Trim()
-            } catch { $codeGraphProject = "" }
+                $codeGraphPrefix = (& pwsh -NoProfile -File $resolverPs1 `
+                    -Project $ProjectRoot -Field code_graph_collection_prefix 2>$null) -as [string]
+                if ($null -eq $codeGraphPrefix) { $codeGraphPrefix = "" }
+                $codeGraphPrefix = $codeGraphPrefix.Trim()
+            } catch { $codeGraphPrefix = "" }
         }
-        if (-not $codeGraphProject) {
-            $codeGraphProject = if ($env:CODE_GRAPH_PROJECT) { $env:CODE_GRAPH_PROJECT } `
+        if (-not $codeGraphPrefix) {
+            $codeGraphPrefix = if ($env:CODE_GRAPH_PROJECT) { $env:CODE_GRAPH_PROJECT } `
                 elseif ($env:PROJECT_NAME) { $env:PROJECT_NAME } `
                 else { Split-Path $ProjectRoot -Leaf }
         }
-        & pwsh -NoProfile -File $cgIncPs1 $EditedFile $ProjectRoot $codeGraphProject
+        & pwsh -NoProfile -File $cgIncPs1 $EditedFile $ProjectRoot $codeGraphPrefix
     }
     Add-Nudge "[Code edit reminder] $bn was just edited.`nWhen you're done with this work item:`n- Update CONTEXT_STATE.md with what changed and what's next.`n- Capture any non-obvious learnings as a KG node under knowledge/concepts/."
 }

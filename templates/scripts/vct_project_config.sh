@@ -50,6 +50,17 @@
 
 set -euo pipefail
 
+# Resolver protocol version this client understands. MUST stay in
+# lock-step with `RESOLVER_PROTOCOL_VERSION` in vco_lib/project_config.py
+# and the ps1 sibling. When the hub reports a HIGHER value, we emit one
+# best-effort stderr warning (forward-compat safety net) and continue —
+# the hub's response shape is additive across versions.
+readonly RESOLVER_PROTOCOL_VERSION=1
+# Process-local one-shot guard so the warning fires AT MOST ONCE per
+# script invocation (a single script run only ever issues one config
+# fetch, but the guard mirrors the python sibling's warn-once contract).
+_VCT_SCHEMA_WARNED=0
+
 # VCO-REWIRE-BEGIN: orchestrator-root-resolution
 # This file is byte-identical between `templates/scripts/` (shipped to
 # user projects) and `.claude/scripts/` (orchestrator's own copy). The
@@ -342,6 +353,41 @@ else:
     return 1
 }
 
+# ── schema_version forward-compat check ───────────────────────────────
+# Reads `schema_version` from a full-config JSON body. If the hub
+# reports a value HIGHER than RESOLVER_PROTOCOL_VERSION, emit a single
+# stderr warning and continue (the protocol is additive — newer hubs
+# may include fields this client doesn't recognise, but the existing
+# fields still parse). Missing `schema_version` is treated as version 1
+# (pre-v0.2.22 hub) — no warning.
+_maybe_warn_schema_version() {
+    local body="$1"
+    if (( _VCT_SCHEMA_WARNED != 0 )); then
+        return 0
+    fi
+    local raw
+    raw=$(json_extract "$body" '.schema_version' 2>/dev/null) || raw=""
+    # Strip non-digits defensively (json_extract emits the bare value
+    # for ints via jq -r; python3 fallback wraps non-strings via
+    # json.dumps which preserves the integer form).
+    if [[ -z "$raw" ]]; then
+        return 0
+    fi
+    if [[ ! "$raw" =~ ^[0-9]+$ ]]; then
+        # Malformed schema_version — don't crash, don't warn (the
+        # python sibling would raise, but the bash client treats this
+        # as defensive degradation).
+        return 0
+    fi
+    local hub_version=$((10#$raw))
+    if (( hub_version > RESOLVER_PROTOCOL_VERSION )); then
+        printf '[vct_project_config] WARNING: hub schema_version=%d > client RESOLVER_PROTOCOL_VERSION=%d; some fields may be unknown. Update the orchestrator clone or downgrade the hub.\n' \
+            "$hub_version" "$RESOLVER_PROTOCOL_VERSION" >&2
+        _VCT_SCHEMA_WARNED=1
+    fi
+    return 0
+}
+
 # ── Project ID resolution ───────────────────────────────────────────────
 looks_like_path() {
     case "$1" in
@@ -428,6 +474,11 @@ fetch_config() {
 
     case "$status" in
         200)
+            # Forward-compat check: warn (once, best-effort) if the
+            # hub reports a higher schema_version than we understand.
+            # Single-field envelopes omit `schema_version`; the helper
+            # treats that as "no warning" (defensive degradation).
+            _maybe_warn_schema_version "$body" || true
             if [[ -n "$field" ]]; then
                 # Single-field envelope: {"<field>": <value>}. Unwrap.
                 local val

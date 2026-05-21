@@ -1104,6 +1104,10 @@ mod cli_kg_tests {
     fn class_name_validation_accepts_canonical_and_namespaced() {
         assert!(is_valid_class_name("CodeFunction"));
         assert!(is_valid_class_name("ARTup_CodeFunction"));
+        // Canonical v0.2.23 B1 capital-C casing.
+        assert!(is_valid_class_name("VibeCodedOrchestrator_KnowledgeGraph"));
+        // v0.2.12–v0.2.22 lowercase-c casing — still a valid class name
+        // shape; the name validator doesn't care about casing semantics.
         assert!(is_valid_class_name("VibecodedOrchestrator_KnowledgeGraph"));
     }
 

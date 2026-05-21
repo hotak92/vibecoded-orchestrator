@@ -11,9 +11,14 @@
   import MenuBar from '$lib/components/MenuBar.svelte';
   import Sidebar from '$lib/components/Sidebar.svelte';
   import StatusBar from '$lib/components/StatusBar.svelte';
-  import AdminBadge from '$lib/components/AdminBadge.svelte';
   import BrowserModeBanner from '$lib/components/BrowserModeBanner.svelte';
-  import SettingsPanel from '$lib/components/SettingsPanel.svelte';
+  // v0.2.23 F2 wave 2b (2026-05-21): SettingsPanel popover deleted.
+  // The user-icon Settings popover was merged into /preferences (which
+  // already hosted ~8 sections; the popover's unique sections — Profile,
+  // Downloads, Shared services, Embedding profile, Volume location,
+  // About — were appended as new sections). All callers now navigate
+  // to /preferences via goto(). The Secrets sub-tab dropped entirely
+  // because it duplicated /preferences/secrets.
   import ActivationModal from '$lib/components/ActivationModal.svelte';
   import InstallWizard from '$lib/components/InstallWizard.svelte';
   import McpDashboard from '$lib/components/McpDashboard.svelte';
@@ -48,16 +53,15 @@
   // Local mirrors so the modals can keep their `bind:open` ergonomics. We
   // reflect ui-store state into these and propagate user-driven closes
   // back into the store.
-  let showSettings = $state(false);
+  // v0.2.23 F2 wave 2b: showSettings + back-sync removed — the popover
+  // was deleted in favour of the /preferences page. The `ui.openSettings`
+  // store action is kept as a thin compatibility shim that routes to
+  // /preferences (see $lib/stores/ui.ts) so any leftover callers in
+  // off-limits files (e.g. modules/+page.svelte, owned by the F2a
+  // Orchestrator Core agent) keep working without coordination churn.
   let showActivation = $state(false);
   $effect(() => {
-    showSettings = uiState.showSettings;
-  });
-  $effect(() => {
     showActivation = uiState.showActivation;
-  });
-  $effect(() => {
-    if (!showSettings && uiState.showSettings) ui.closeSettings();
   });
   $effect(() => {
     if (!showActivation && uiState.showActivation) ui.closeActivation();
@@ -216,8 +220,9 @@
     <StatusBar />
   </div>
 
-  <!-- Global modals — any route can open them via the `ui` store. -->
-  <SettingsPanel bind:open={showSettings} />
+  <!-- Global modals — any route can open them via the `ui` store.
+       (v0.2.23 F2 wave 2b: SettingsPanel removed; ui.openSettings()
+       now routes to /preferences.) -->
   <ActivationModal bind:open={showActivation} />
 
   {#if uiState.showInstallWizard}
@@ -260,7 +265,6 @@
        acknowledged it. Mounted last so it stacks above every other modal. -->
   <InstallHealthGate />
   <Toast />
-  <AdminBadge />
 {/if}
 
 <style>

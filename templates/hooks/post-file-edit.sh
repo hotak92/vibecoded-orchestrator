@@ -101,30 +101,41 @@ if [[ "$EDITED_FILE" == "$DOCS_DIR"* ]] && [[ "$EDITED_FILE" == *.md ]]; then
 fi
 
 # 3. Code file changes: incremental code graph update + LLM nudge.
-# v0.2.21 Step 18 (caller migration): resolve the code-graph project name
-# via the launcher's vct-hub first (`vct_project_config.sh --field
-# code_graph_project`), fall back to the legacy env chain when the hub
-# is unreachable (launcher not running, project not registered, stale
-# token). The hub is the authoritative source post-v0.2.21.
+# v0.2.21 Step 18 (caller migration): resolve the code-graph collection
+# prefix via the launcher's vct-hub first (`vct_project_config.sh --field
+# code_graph_collection_prefix`), fall back to the legacy env chain when
+# the hub is unreachable (launcher not running, project not registered,
+# stale token). The hub is the authoritative source post-v0.2.21.
+#
+# v0.2.23 field switch: previously this read `code_graph_project`, which
+# the hub returns as a legacy alias for `project_slug` — NOT the canonical
+# Weaviate prefix. The analyzer's own `_sanitize_collection_prefix` then
+# re-canonicalised the slug, producing a prefix that diverged from the
+# launcher's `project_codegraph_bindings.collection_prefix`. Symptom:
+# every incremental write since the project rename landed in zombie
+# collections (e.g. `Orchestrator_root_Code*`) while consumers queried
+# the canonical prefix (e.g. `VibeCodedOrchestrator_Code*`) and saw 0
+# results. `code_graph_collection_prefix` is the binding-row truth and
+# the only correct source for the write target.
 #
 # Pre-v0.2.11 behaviour hardcoded "ClaudeOrchestrator" here, which
 # polluted the legacy collection from every project install. Do NOT
 # re-introduce a hardcoded literal in this position.
 if [[ "$EDITED_FILE" =~ \.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$ ]]; then
-    CODE_GRAPH_PROJECT_RESOLVED=""
+    CODE_GRAPH_PREFIX_RESOLVED=""
     _RESOLVER="$PROJECT_ROOT/.claude/scripts/vct_project_config.sh"
     if [ -x "$_RESOLVER" ]; then
-        CODE_GRAPH_PROJECT_RESOLVED=$(
-            "$_RESOLVER" "$PROJECT_ROOT" --field code_graph_project 2>/dev/null
-        ) || CODE_GRAPH_PROJECT_RESOLVED=""
+        CODE_GRAPH_PREFIX_RESOLVED=$(
+            "$_RESOLVER" "$PROJECT_ROOT" --field code_graph_collection_prefix 2>/dev/null
+        ) || CODE_GRAPH_PREFIX_RESOLVED=""
     fi
-    if [ -z "$CODE_GRAPH_PROJECT_RESOLVED" ]; then
-        CODE_GRAPH_PROJECT_RESOLVED="${CODE_GRAPH_PROJECT:-${PROJECT_NAME:-$(basename "$PROJECT_ROOT")}}"
+    if [ -z "$CODE_GRAPH_PREFIX_RESOLVED" ]; then
+        CODE_GRAPH_PREFIX_RESOLVED="${CODE_GRAPH_PROJECT:-${PROJECT_NAME:-$(basename "$PROJECT_ROOT")}}"
     fi
     bash "$SCRIPT_DIR/code-graph-incremental.sh" \
         "$EDITED_FILE" \
         "$PROJECT_ROOT" \
-        "$CODE_GRAPH_PROJECT_RESOLVED"
+        "$CODE_GRAPH_PREFIX_RESOLVED"
 
     _add_nudge "[Code edit reminder] $(basename "$EDITED_FILE") was just edited.
 When you're done with this work item:

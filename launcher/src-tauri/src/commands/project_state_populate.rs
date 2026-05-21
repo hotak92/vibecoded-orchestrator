@@ -1377,7 +1377,7 @@ mod tests {
             Some("http://localhost:8081")
         );
         let shared = bindings.iter().find(|b| b.role == "shared").unwrap();
-        assert_eq!(shared.collection_name, "VibecodedOrchestrator_KnowledgeGraph");
+        assert_eq!(shared.collection_name, "VibeCodedOrchestrator_KnowledgeGraph");
 
         std::fs::remove_dir_all(&folder).ok();
     }
@@ -1402,7 +1402,7 @@ mod tests {
         assert_eq!(by_collection.get("Acme_KnowledgeGraph"), Some(&"write"));
         assert_eq!(by_collection.get("Acme_Development"), Some(&"write"));
         assert_eq!(
-            by_collection.get("VibecodedOrchestrator_KnowledgeGraph"),
+            by_collection.get("VibeCodedOrchestrator_KnowledgeGraph"),
             Some(&"read")
         );
 
@@ -1419,7 +1419,7 @@ mod tests {
         populate_project_state_from_filesystem("p1", "Acme", &folder, &db);
 
         // User downgrades shared collection.
-        db.kg_set_access("p1", "VibecodedOrchestrator_KnowledgeGraph", "none")
+        db.kg_set_access("p1", "VibeCodedOrchestrator_KnowledgeGraph", "none")
             .unwrap();
         // User upgrades own dev to write (was already write — confirm
         // it stays write after re-run).
@@ -1438,7 +1438,7 @@ mod tests {
             .collect();
         // User's downgrade survived re-populate.
         assert_eq!(
-            by_collection.get("VibecodedOrchestrator_KnowledgeGraph"),
+            by_collection.get("VibeCodedOrchestrator_KnowledgeGraph"),
             Some(&"none"),
             "user-set 'none' must NOT be reset to default 'read'"
         );

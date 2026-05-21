@@ -368,7 +368,7 @@ pub struct SchemaMigrationStatusReport {
     /// props are present. Empty when Weaviate is unreachable.
     pub development_collections: Vec<DevelopmentCollectionSchema>,
     /// Shared KG class name probed (canonical default
-    /// `VibecodedOrchestrator_KnowledgeGraph` if not overridden).
+    /// `VibeCodedOrchestrator_KnowledgeGraph` if not overridden — v0.2.23 B1).
     pub shared_kg_class: String,
     /// True when the shared KG class exists. None when Weaviate
     /// unreachable.
@@ -406,7 +406,12 @@ const TEMPORAL_PROPS: &[&str] = &["created", "updated", "valid_from", "valid_unt
 /// value. Kept as a constant rather than reading from app_state so a
 /// stale persisted value doesn't trigger spurious "yellow" badges; the
 /// migration scripts use the same canonical default.
-const DEFAULT_SHARED_KG_CLASS: &str = "VibecodedOrchestrator_KnowledgeGraph";
+///
+/// v0.2.23 B1 (2026-05-21): flipped from lowercase-c "Vibecoded" to
+/// capital-C "VibeCoded" to match the brand spelling. See
+/// `commands/project_env_settings.rs::DEFAULT_SHARED_KG_COLLECTION` for
+/// the source-of-truth constant.
+const DEFAULT_SHARED_KG_CLASS: &str = "VibeCodedOrchestrator_KnowledgeGraph";
 
 fn resolve_weaviate_url(cfg: &LocalConfig) -> String {
     if let Ok(v) = std::env::var("VCT_WEAVIATE_URL") {
@@ -463,7 +468,19 @@ fn parse_schema_response(
                 temporal_props_missing: missing,
             });
         }
-        if name == shared_kg_class {
+        // v0.2.23 review-B HIGH-2 (2026-05-21): case-insensitive match
+        // against the canonical name AND both legacy aliases. Pre-fix the
+        // strict `name == shared_kg_class` check reported "not yet created"
+        // for users on v0.2.12–v0.2.22 lowercase-c installs even when their
+        // shared KG class existed — the launcher's Services panel then
+        // misleadingly suggested running migrations. Mirrors the
+        // `is_shared` recognition pattern in
+        // `commands/kg.rs::list_kg_collections` (v0.2.12 PR-26 / Group E
+        // pre-rename `VibeCodedTools_KnowledgeGraph` is also accepted).
+        let matches_shared = name.eq_ignore_ascii_case(shared_kg_class)
+            || name == crate::commands::project_env_settings::LEGACY_SHARED_KG_COLLECTION_LOWERCASE_C
+            || name == crate::commands::project_env_settings::LEGACY_SHARED_KG_COLLECTION;
+        if matches_shared {
             shared_kg_exists = Some(true);
             shared_kg_index_null = Some(
                 cls.get("invertedIndexConfig")
@@ -1251,7 +1268,7 @@ mod tests {
             }),
         ]);
         let (dev, kg_exists, kg_index_null) =
-            parse_schema_response(&schema, "VibecodedOrchestrator_KnowledgeGraph");
+            parse_schema_response(&schema, "VibeCodedOrchestrator_KnowledgeGraph");
 
         assert_eq!(dev.len(), 2);
         let foo = dev.iter().find(|c| c.class_name == "Foo_Development").unwrap();

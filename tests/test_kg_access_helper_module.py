@@ -148,9 +148,9 @@ class KgCollectionsToSearchTests(unittest.TestCase):
         self.assertEqual(
             helper.kg_collections_to_search(
                 "Alpha_KnowledgeGraph",
-                shared_kg="VibecodedOrchestrator_KnowledgeGraph",
+                shared_kg="VibeCodedOrchestrator_KnowledgeGraph",
             ),
-            ["Alpha_KnowledgeGraph", "VibecodedOrchestrator_KnowledgeGraph"],
+            ["Alpha_KnowledgeGraph", "VibeCodedOrchestrator_KnowledgeGraph"],
         )
 
     def test_self_shared_peers_in_order(self) -> None:
@@ -158,11 +158,11 @@ class KgCollectionsToSearchTests(unittest.TestCase):
         self.assertEqual(
             helper.kg_collections_to_search(
                 "Alpha_KnowledgeGraph",
-                shared_kg="VibecodedOrchestrator_KnowledgeGraph",
+                shared_kg="VibeCodedOrchestrator_KnowledgeGraph",
             ),
             [
                 "Alpha_KnowledgeGraph",
-                "VibecodedOrchestrator_KnowledgeGraph",
+                "VibeCodedOrchestrator_KnowledgeGraph",
                 "Beta_KnowledgeGraph",
                 "Gamma_KnowledgeGraph",
             ],
@@ -173,13 +173,13 @@ class KgCollectionsToSearchTests(unittest.TestCase):
         self.assertEqual(
             helper.kg_collections_to_search(
                 "Alpha_KnowledgeGraph",
-                shared_kg="VibecodedOrchestrator_KnowledgeGraph",
+                shared_kg="VibeCodedOrchestrator_KnowledgeGraph",
                 development="Alpha_Development",
                 include_dev=True,
             ),
             [
                 "Alpha_KnowledgeGraph",
-                "VibecodedOrchestrator_KnowledgeGraph",
+                "VibeCodedOrchestrator_KnowledgeGraph",
                 "Beta_KnowledgeGraph",
                 "Alpha_Development",
             ],
@@ -193,13 +193,13 @@ class KgCollectionsToSearchTests(unittest.TestCase):
         self.assertEqual(
             helper.kg_collections_to_search(
                 "Alpha_KnowledgeGraph",
-                shared_kg="VibecodedOrchestrator_KnowledgeGraph",
+                shared_kg="VibeCodedOrchestrator_KnowledgeGraph",
                 development="Alpha_Development",
                 include_dev=False,
             ),
             [
                 "Alpha_KnowledgeGraph",
-                "VibecodedOrchestrator_KnowledgeGraph",
+                "VibeCodedOrchestrator_KnowledgeGraph",
                 "Beta_KnowledgeGraph",
             ],
         )
@@ -210,10 +210,10 @@ class KgCollectionsToSearchTests(unittest.TestCase):
         helper = _fresh_helper()
         self.assertEqual(
             helper.kg_collections_to_search(
-                "VibecodedOrchestrator_KnowledgeGraph",
-                shared_kg="VibecodedOrchestrator_KnowledgeGraph",
+                "VibeCodedOrchestrator_KnowledgeGraph",
+                shared_kg="VibeCodedOrchestrator_KnowledgeGraph",
             ),
-            ["VibecodedOrchestrator_KnowledgeGraph"],
+            ["VibeCodedOrchestrator_KnowledgeGraph"],
         )
 
     def test_peer_matching_self_is_filtered(self) -> None:
@@ -223,11 +223,11 @@ class KgCollectionsToSearchTests(unittest.TestCase):
         self.assertEqual(
             helper.kg_collections_to_search(
                 "Alpha_KnowledgeGraph",
-                shared_kg="VibecodedOrchestrator_KnowledgeGraph",
+                shared_kg="VibeCodedOrchestrator_KnowledgeGraph",
             ),
             [
                 "Alpha_KnowledgeGraph",
-                "VibecodedOrchestrator_KnowledgeGraph",
+                "VibeCodedOrchestrator_KnowledgeGraph",
                 "Beta_KnowledgeGraph",
             ],
         )
@@ -236,21 +236,25 @@ class KgCollectionsToSearchTests(unittest.TestCase):
         """Same defensive guard, applied to the shared collection.
 
         PR-34 (v0.2.12) renamed the canonical shared KG from
-        VibeCodedTools_KnowledgeGraph to VibecodedOrchestrator_KnowledgeGraph,
-        so the peer that matches "shared" is now "VibecodedOrchestrator"
-        (not the legacy "VibeCodedTools").
+        VibeCodedTools_KnowledgeGraph to VibecodedOrchestrator_KnowledgeGraph.
+        v0.2.23 B1 (2026-05-21) flipped the casing back to capital-C
+        VibeCodedOrchestrator_KnowledgeGraph to match the brand spelling.
+        The peer that matches "shared" is therefore "VibeCodedOrchestrator"
+        (capital-C, matching the canonical) — pass a peer that maps to
+        the same collection as `shared_kg` and verify the dedup guard
+        kicks in.
         """
         helper = _fresh_helper(
-            {"VCT_KG_ACCESS_LIST": "VibecodedOrchestrator,Beta"}
+            {"VCT_KG_ACCESS_LIST": "VibeCodedOrchestrator,Beta"}
         )
         self.assertEqual(
             helper.kg_collections_to_search(
                 "Alpha_KnowledgeGraph",
-                shared_kg="VibecodedOrchestrator_KnowledgeGraph",
+                shared_kg="VibeCodedOrchestrator_KnowledgeGraph",
             ),
             [
                 "Alpha_KnowledgeGraph",
-                "VibecodedOrchestrator_KnowledgeGraph",
+                "VibeCodedOrchestrator_KnowledgeGraph",
                 "Beta_KnowledgeGraph",
             ],
         )
@@ -407,7 +411,7 @@ class HelperParityWithMcpServerTests(unittest.TestCase):
         ``server._kg_collections_to_search`` produce the same list."""
         env = {
             "KG_COLLECTION": "Alpha_KnowledgeGraph",
-            "SHARED_KG_COLLECTION": "VibecodedOrchestrator_KnowledgeGraph",
+            "SHARED_KG_COLLECTION": "VibeCodedOrchestrator_KnowledgeGraph",
             "DEVELOPMENT_COLLECTION": "Alpha_Development",
             "VCT_KG_ACCESS_LIST": "Beta,Gamma",
         }

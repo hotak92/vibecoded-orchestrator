@@ -1,15 +1,3 @@
-<!-- vco-deferral-reminder-begin -->
-**Pending VCO action**: `.claude/context/UPDATE_DEFERRED.md` exists.
-Read it at session start — it contains commands to resolve
-unresolved VCO install actions.
-
-To remove THIS reminder block: once the deferral is resolved (e.g.
-via `--update --force`), VCO's next install run will delete
-UPDATE_DEFERRED.md AND strip this block. Manual cleanup if needed:
-delete everything between the HTML-comment markers wrapping this
-block.
-<!-- vco-deferral-reminder-end -->
-
 <!-- BEGIN: SETUP-ONLY (project-scoping nudge — remove after the user has either declined or completed the scoping pass) -->
 ## FIRST SESSION — wait for the user to define the project, then offer to scope agents/skills
 

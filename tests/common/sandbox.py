@@ -16,7 +16,7 @@ This module owns the four defenses:
 2. **Per-run Weaviate collection prefix** — collections the fixture
    creates are namespaced with ``STEP22_<run_id>_…`` so teardown can
    drop them as a group via prefix-match without risking a real
-   ``ClaudeKnowledgeGraph`` / ``VibecodedOrchestrator_KnowledgeGraph``.
+   ``ClaudeKnowledgeGraph`` / ``VibeCodedOrchestrator_KnowledgeGraph``.
 3. **Per-run keychain prefix** — any secrets the fixture writes use
    module-id prefix ``step22-<run_id>-`` so teardown can delete the
    set as a group.

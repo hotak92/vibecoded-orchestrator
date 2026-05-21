@@ -21,10 +21,13 @@
 #
 # Env vars:
 #   WEAVIATE_URL          — defaults to http://localhost:8081
-#   SHARED_KG_COLLECTION  — defaults to VibecodedOrchestrator_KnowledgeGraph
-#                           (renamed from VibeCodedTools_KnowledgeGraph in
-#                           v0.2.12 PR-26 / Group E). Must stay in lockstep
-#                           with vco_lib/project_init.py::_SHARED_KG_NAME.
+#   SHARED_KG_COLLECTION  — defaults to VibeCodedOrchestrator_KnowledgeGraph
+#                           (capital-C casing since v0.2.23 B1; was
+#                           lowercase-c "VibecodedOrchestrator_KnowledgeGraph"
+#                           v0.2.12–v0.2.22, itself renamed from
+#                           VibeCodedTools_KnowledgeGraph pre-v0.2.12).
+#                           Must stay in lockstep with
+#                           vco_lib/project_init.py::_SHARED_KG_NAME.
 #
 # Requires: bash, curl, jq. Optionally invokes
 # `.claude/scripts/kg-sync --all` after the drop to repopulate; if that
@@ -34,7 +37,7 @@
 set -uo pipefail
 
 WEAVIATE_URL="${WEAVIATE_URL:-http://localhost:8081}"
-SHARED_KG="${SHARED_KG_COLLECTION:-VibecodedOrchestrator_KnowledgeGraph}"
+SHARED_KG="${SHARED_KG_COLLECTION:-VibeCodedOrchestrator_KnowledgeGraph}"
 
 if ! command -v curl >/dev/null 2>&1; then
     echo "[migrate-shared-kg] curl not found; skipping migration." >&2

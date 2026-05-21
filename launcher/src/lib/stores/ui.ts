@@ -1,13 +1,24 @@
 // Global UI flags. Lives in the layout shell so any route can open the
-// settings panel / activation modal / install wizard / mcp dashboard.
+// activation modal / install wizard / mcp dashboard / onboarding wizard.
+//
+// v0.2.23 F2 wave 2b (2026-05-21): the user-icon Settings popover was
+// merged into /preferences. The SettingsPanel component is deleted; the
+// `showSettings` flag + `settingsInitialSection` field were removed. The
+// `openSettings(section)` action is kept as a thin compatibility shim
+// that navigates to /preferences (or /preferences/secrets when the
+// caller requests the 'secrets' section) so off-limits files
+// (modules/+page.svelte — owned by the F2a Orchestrator Core agent)
+// keep working without coordination churn. New code should call
+// goto('/preferences') / goto('/preferences/secrets') directly.
 
 import { writable } from 'svelte/store';
+import { goto } from '$app/navigation';
 import { clearOnboardingComplete } from '$lib/onboarding';
 
-// Sections rendered by SettingsPanel.svelte's left nav. Exported so
-// callers (e.g. SecretsTab "Open secrets panel") can request a specific
-// initial section when opening Settings without going through a
-// window-event bus.
+// Sections recognised by the compatibility shim. The popover used to
+// render five tabs (profile/downloads/secrets/preferences/about); now
+// only 'secrets' has a distinct route target. The rest route to
+// /preferences and rely on the user scrolling to the relevant section.
 export type SettingsSection =
   | 'profile'
   | 'downloads'
@@ -16,12 +27,6 @@ export type SettingsSection =
   | 'about';
 
 interface UIState {
-  showSettings: boolean;
-  // When non-null, SettingsPanel jumps to this section on open instead
-  // of defaulting to 'profile'. Consumed once and cleared by
-  // closeSettings(). Replaces an earlier 'vct-open-secrets' window
-  // event that SecretsTab used to dispatch.
-  settingsInitialSection: SettingsSection | null;
   showActivation: boolean;
   showInstallWizard: boolean;
   showMcpDashboard: boolean;
@@ -43,8 +48,6 @@ interface UIState {
 
 function createUIStore() {
   const { subscribe, update, set } = writable<UIState>({
-    showSettings: false,
-    settingsInitialSection: null,
     showActivation: false,
     showInstallWizard: false,
     showMcpDashboard: false,
@@ -56,23 +59,19 @@ function createUIStore() {
   return {
     subscribe,
     set,
-    // Open the Settings dialog. Pass `section` to jump straight to a
-    // specific tab (e.g. 'secrets' from the per-project SecretsTab
-    // "Open secrets panel" button). Defaults to null, which lets
-    // SettingsPanel keep its previous activeSection (typically
-    // 'profile' on first open).
-    openSettings: (section: SettingsSection | null = null) =>
-      update((s) => ({
-        ...s,
-        showSettings: true,
-        settingsInitialSection: section,
-      })),
-    closeSettings: () =>
-      update((s) => ({
-        ...s,
-        showSettings: false,
-        settingsInitialSection: null,
-      })),
+    // v0.2.23 F2 wave 2b: compatibility shim. The popover is gone; this
+    // now routes to /preferences (or /preferences/secrets when the
+    // caller requested the secrets tab). New callers should use
+    // `goto('/preferences')` directly.
+    openSettings: (section: SettingsSection | null = null) => {
+      const target = section === 'secrets' ? '/preferences/secrets' : '/preferences';
+      void goto(target);
+    },
+    // closeSettings is a no-op now (no popover state to clear). Kept
+    // so any leftover callers that pair open/close don't break at
+    // runtime — they'll just navigate to /preferences and then this
+    // becomes a harmless tail call.
+    closeSettings: () => {},
     openActivation: () => update((s) => ({ ...s, showActivation: true })),
     closeActivation: () => update((s) => ({ ...s, showActivation: false })),
     openInstallWizard: () => update((s) => ({ ...s, showInstallWizard: true })),

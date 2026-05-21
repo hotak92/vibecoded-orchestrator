@@ -1,10 +1,18 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
+  import { getVersion } from '@tauri-apps/api/app';
   import { goto } from '$app/navigation';
   import { invoke, safeInvoke, listen as tauriListen } from '$lib/tauri';
   import { selectedProject } from '$lib/stores/projects';
   import { toast } from '$lib/stores/toast';
   import { ui } from '$lib/stores/ui';
+  // v0.2.23 F2 wave 2b (2026-05-21): Profile + Downloads sections
+  // relocated from the now-deleted user-icon Settings popover. The
+  // `auth` store handles the Supabase profile write; the `settings`
+  // store handles the per-machine launcher prefs (install path,
+  // auto-update, launch-on-startup) via localStorage.
+  import { auth, currentUser } from '$lib/stores/auth';
+  import { settings } from '$lib/stores/settings';
   import Toast from '$lib/components/Toast.svelte';
   import Dropdown from '$lib/components/Dropdown.svelte';
   import { focusOnMount, focusTrap } from '$lib/actions/focusManagement';
@@ -931,6 +939,591 @@
     }
   }
 
+  // ── KG Summaries (v0.2.23 F2, relocated from SettingsPanel) ──────────
+  // Three app_state keys drive `templates/scripts/generate-kg-summary.py`:
+  //   - `kg_summary_openai_consent` (bool) — gate for the OpenAI tier
+  //   - `kg_summary_openai_model` (string) — which OpenAI model to use
+  //   - `kg_summary_backend_override` (string, optional) — pin a tier
+  //
+  // v0.2.23 F3: also `kg_summary_ollama_model` (string) — when the
+  // override is `ollama` (or auto-detect picks Ollama), this names the
+  // local model. Populated from `http://localhost:11435/api/tags`.
+  //
+  // The OpenAI consent gate is shared with the F4 Code Graph Embeddings
+  // section below — one consent decision unlocks both surfaces.
+  const APP_STATE_KEY_KG_SUMMARY_CONSENT = 'kg_summary_openai_consent';
+  const APP_STATE_KEY_KG_SUMMARY_MODEL = 'kg_summary_openai_model';
+  const APP_STATE_KEY_KG_SUMMARY_OVERRIDE = 'kg_summary_backend_override';
+  const APP_STATE_KEY_KG_SUMMARY_OLLAMA_MODEL = 'kg_summary_ollama_model';
+  // Hardcoded allowlist of OpenAI chat models known to work as summary
+  // backends. Ordered cheapest → most expensive so the default lands
+  // first. Future work: fetch from /v1/models when the launcher has an
+  // OpenAI client; for now this stays deterministic.
+  const KG_SUMMARY_OPENAI_MODELS = [
+    { id: 'gpt-4o-mini', label: 'gpt-4o-mini (cheapest, default)' },
+    { id: 'gpt-4.1-mini', label: 'gpt-4.1-mini' },
+    { id: 'gpt-4o', label: 'gpt-4o (more capable, higher cost)' },
+  ];
+  const KG_SUMMARY_DEFAULT_MODEL = 'gpt-4o-mini';
+
+  type KgSummaryOverride = '' | 'cli' | 'ollama' | 'openai' | 'skip';
+  let kgSummaryConsent = $state(false);
+  let kgSummaryModel = $state<string>(KG_SUMMARY_DEFAULT_MODEL);
+  let kgSummaryOverride = $state<KgSummaryOverride>('');
+  let kgSummaryOllamaModel = $state<string>('');
+  let kgSummaryLoading = $state(false);
+  let kgSummarySaving = $state(false);
+  let kgSummaryError = $state<string | null>(null);
+  let kgSummarySaved = $state(false);
+
+  // Locally-installed Ollama models, fetched once per page load from
+  // http://localhost:11435/api/tags. Soft-fail: an empty list means
+  // Ollama isn't running or has no models pulled; the dropdown then
+  // shows a hint instead of options.
+  let ollamaModels = $state<string[]>([]);
+  let ollamaModelsLoading = $state(false);
+  let ollamaModelsError = $state<string | null>(null);
+
+  // Default Ollama URL. The launcher pins this to 11435 (not 11434) to
+  // avoid collisions with users' pre-existing Ollama installs — see
+  // CLAUDE.md "Default ports".
+  const OLLAMA_URL = 'http://localhost:11435';
+
+  /**
+   * Fetch the list of locally-installed Ollama models. Returns just
+   * the model names (e.g. `["qwen3.5:9b", "gemma4:e4b", "qwen3-embedding:0.6b"]`).
+   * Shared between F3 (KG Summaries) and F4 (Code Graph Embeddings) so
+   * we only fetch once per page render.
+   */
+  async function fetchOllamaModels() {
+    if (ollamaModelsLoading) return;
+    ollamaModelsLoading = true;
+    ollamaModelsError = null;
+    try {
+      const resp = await fetch(`${OLLAMA_URL}/api/tags`);
+      if (!resp.ok) {
+        throw new Error(`HTTP ${resp.status}`);
+      }
+      const data: { models?: Array<{ name: string }> } = await resp.json();
+      ollamaModels = (data.models ?? []).map((m) => m.name).sort();
+    } catch (e) {
+      // Soft-fail — Ollama not running or unreachable. The UI shows a
+      // hint and the dropdowns become disabled.
+      ollamaModelsError = String(e);
+      ollamaModels = [];
+    } finally {
+      ollamaModelsLoading = false;
+    }
+  }
+
+  async function loadKgSummarySettings() {
+    kgSummaryLoading = true;
+    kgSummaryError = null;
+    try {
+      const [consentRes, modelRes, overrideRes, ollamaRes] = await Promise.all([
+        invoke<boolean | null>('app_state_get_bool', {
+          key: APP_STATE_KEY_KG_SUMMARY_CONSENT,
+        }),
+        invoke<{ key: string; is_set: boolean; value: string | null }>(
+          'app_state_get',
+          { key: APP_STATE_KEY_KG_SUMMARY_MODEL },
+        ),
+        invoke<{ key: string; is_set: boolean; value: string | null }>(
+          'app_state_get',
+          { key: APP_STATE_KEY_KG_SUMMARY_OVERRIDE },
+        ),
+        invoke<{ key: string; is_set: boolean; value: string | null }>(
+          'app_state_get',
+          { key: APP_STATE_KEY_KG_SUMMARY_OLLAMA_MODEL },
+        ),
+      ]);
+      kgSummaryConsent = consentRes === true;
+      kgSummaryModel = (modelRes.is_set && modelRes.value)
+        ? modelRes.value
+        : KG_SUMMARY_DEFAULT_MODEL;
+      const ov = (overrideRes.is_set ? (overrideRes.value ?? '') : '') as KgSummaryOverride;
+      kgSummaryOverride = (['', 'cli', 'ollama', 'openai', 'skip'].includes(ov) ? ov : '') as KgSummaryOverride;
+      kgSummaryOllamaModel = (ollamaRes.is_set && ollamaRes.value) ? ollamaRes.value : '';
+    } catch (e) {
+      kgSummaryError = String(e);
+    } finally {
+      kgSummaryLoading = false;
+    }
+  }
+
+  async function saveKgSummaryConsent(next: boolean) {
+    kgSummarySaving = true;
+    kgSummaryError = null;
+    kgSummarySaved = false;
+    try {
+      await invoke<void>('app_state_set_bool', {
+        key: APP_STATE_KEY_KG_SUMMARY_CONSENT,
+        value: next,
+      });
+      kgSummaryConsent = next;
+      kgSummarySaved = true;
+      setTimeout(() => { kgSummarySaved = false; }, 2000);
+    } catch (e) {
+      kgSummaryError = String(e);
+    } finally {
+      kgSummarySaving = false;
+    }
+  }
+
+  async function saveKgSummaryModel(next: string) {
+    kgSummarySaving = true;
+    kgSummaryError = null;
+    kgSummarySaved = false;
+    try {
+      await invoke<void>('app_state_set', {
+        key: APP_STATE_KEY_KG_SUMMARY_MODEL,
+        value: next,
+      });
+      kgSummaryModel = next;
+      kgSummarySaved = true;
+      setTimeout(() => { kgSummarySaved = false; }, 2000);
+    } catch (e) {
+      kgSummaryError = String(e);
+    } finally {
+      kgSummarySaving = false;
+    }
+  }
+
+  async function saveKgSummaryOverride(next: KgSummaryOverride) {
+    kgSummarySaving = true;
+    kgSummaryError = null;
+    kgSummarySaved = false;
+    try {
+      // Empty string clears the override (script treats "" as "auto").
+      await invoke<void>('app_state_set', {
+        key: APP_STATE_KEY_KG_SUMMARY_OVERRIDE,
+        value: next,
+      });
+      kgSummaryOverride = next;
+      kgSummarySaved = true;
+      setTimeout(() => { kgSummarySaved = false; }, 2000);
+    } catch (e) {
+      kgSummaryError = String(e);
+    } finally {
+      kgSummarySaving = false;
+    }
+  }
+
+  async function saveKgSummaryOllamaModel(next: string) {
+    kgSummarySaving = true;
+    kgSummaryError = null;
+    kgSummarySaved = false;
+    try {
+      await invoke<void>('app_state_set', {
+        key: APP_STATE_KEY_KG_SUMMARY_OLLAMA_MODEL,
+        value: next,
+      });
+      kgSummaryOllamaModel = next;
+      kgSummarySaved = true;
+      setTimeout(() => { kgSummarySaved = false; }, 2000);
+    } catch (e) {
+      kgSummaryError = String(e);
+    } finally {
+      kgSummarySaving = false;
+    }
+  }
+
+  // ── Code Graph Embeddings (v0.2.23 F4) ───────────────────────────────
+  // Mirror of the KG Summaries pattern. Three new app_state keys:
+  //   - `code_embed_backend_override` (string, optional) —
+  //     "" | "auto" | "codesage" | "qwen3" | "jina" | "openai" | "ollama"
+  //   - `code_embed_openai_model` (string) — OpenAI embedding model id
+  //     when the override is `openai`. Defaults to text-embedding-3-small.
+  //   - `code_embed_ollama_model` (string) — Ollama model name when the
+  //     override is `ollama`. Default empty (no auto-pick — user picks
+  //     from the dropdown).
+  //
+  // The "detected backend" is read-only and reflects the install-time
+  // `default_code_embedding` row that `install.py` writes during
+  // hardware selection. We pull it from the existing
+  // `get_default_embedding_models` Tauri command (no new backend code).
+  const APP_STATE_KEY_CODE_EMBED_OVERRIDE = 'code_embed_backend_override';
+  const APP_STATE_KEY_CODE_EMBED_OPENAI_MODEL = 'code_embed_openai_model';
+  const APP_STATE_KEY_CODE_EMBED_OLLAMA_MODEL = 'code_embed_ollama_model';
+  // OpenAI embedding models that have been validated against the
+  // EmbeddingService (vco_lib/embedding_service.py). Same ordering
+  // logic as the KG Summary list — cheapest first.
+  const CODE_EMBED_OPENAI_MODELS = [
+    { id: 'text-embedding-3-small', label: 'text-embedding-3-small (1536-dim, cheapest, default)' },
+    { id: 'text-embedding-3-large', label: 'text-embedding-3-large (3072-dim, higher quality)' },
+  ];
+  const CODE_EMBED_OPENAI_DEFAULT_MODEL = 'text-embedding-3-small';
+
+  type CodeEmbedOverride = '' | 'auto' | 'codesage' | 'qwen3' | 'jina' | 'openai' | 'ollama';
+  let codeEmbedOverride = $state<CodeEmbedOverride>('');
+  let codeEmbedOpenaiModel = $state<string>(CODE_EMBED_OPENAI_DEFAULT_MODEL);
+  let codeEmbedOllamaModel = $state<string>('');
+  let codeEmbedLoading = $state(false);
+  let codeEmbedSaving = $state(false);
+  let codeEmbedError = $state<string | null>(null);
+  let codeEmbedSaved = $state(false);
+
+  async function loadCodeEmbedSettings() {
+    codeEmbedLoading = true;
+    codeEmbedError = null;
+    try {
+      const [overrideRes, openaiModelRes, ollamaModelRes] = await Promise.all([
+        invoke<{ key: string; is_set: boolean; value: string | null }>(
+          'app_state_get',
+          { key: APP_STATE_KEY_CODE_EMBED_OVERRIDE },
+        ),
+        invoke<{ key: string; is_set: boolean; value: string | null }>(
+          'app_state_get',
+          { key: APP_STATE_KEY_CODE_EMBED_OPENAI_MODEL },
+        ),
+        invoke<{ key: string; is_set: boolean; value: string | null }>(
+          'app_state_get',
+          { key: APP_STATE_KEY_CODE_EMBED_OLLAMA_MODEL },
+        ),
+      ]);
+      const ov = (overrideRes.is_set ? (overrideRes.value ?? '') : '') as CodeEmbedOverride;
+      const allowed: CodeEmbedOverride[] = ['', 'auto', 'codesage', 'qwen3', 'jina', 'openai', 'ollama'];
+      codeEmbedOverride = (allowed.includes(ov) ? ov : '') as CodeEmbedOverride;
+      codeEmbedOpenaiModel = (openaiModelRes.is_set && openaiModelRes.value)
+        ? openaiModelRes.value
+        : CODE_EMBED_OPENAI_DEFAULT_MODEL;
+      codeEmbedOllamaModel = (ollamaModelRes.is_set && ollamaModelRes.value) ? ollamaModelRes.value : '';
+    } catch (e) {
+      codeEmbedError = String(e);
+    } finally {
+      codeEmbedLoading = false;
+    }
+  }
+
+  async function saveCodeEmbedOverride(next: CodeEmbedOverride) {
+    codeEmbedSaving = true;
+    codeEmbedError = null;
+    codeEmbedSaved = false;
+    try {
+      await invoke<void>('app_state_set', {
+        key: APP_STATE_KEY_CODE_EMBED_OVERRIDE,
+        value: next,
+      });
+      codeEmbedOverride = next;
+      codeEmbedSaved = true;
+      setTimeout(() => { codeEmbedSaved = false; }, 2000);
+    } catch (e) {
+      codeEmbedError = String(e);
+    } finally {
+      codeEmbedSaving = false;
+    }
+  }
+
+  async function saveCodeEmbedOpenaiModel(next: string) {
+    codeEmbedSaving = true;
+    codeEmbedError = null;
+    codeEmbedSaved = false;
+    try {
+      await invoke<void>('app_state_set', {
+        key: APP_STATE_KEY_CODE_EMBED_OPENAI_MODEL,
+        value: next,
+      });
+      codeEmbedOpenaiModel = next;
+      codeEmbedSaved = true;
+      setTimeout(() => { codeEmbedSaved = false; }, 2000);
+    } catch (e) {
+      codeEmbedError = String(e);
+    } finally {
+      codeEmbedSaving = false;
+    }
+  }
+
+  async function saveCodeEmbedOllamaModel(next: string) {
+    codeEmbedSaving = true;
+    codeEmbedError = null;
+    codeEmbedSaved = false;
+    try {
+      await invoke<void>('app_state_set', {
+        key: APP_STATE_KEY_CODE_EMBED_OLLAMA_MODEL,
+        value: next,
+      });
+      codeEmbedOllamaModel = next;
+      codeEmbedSaved = true;
+      setTimeout(() => { codeEmbedSaved = false; }, 2000);
+    } catch (e) {
+      codeEmbedError = String(e);
+    } finally {
+      codeEmbedSaving = false;
+    }
+  }
+
+  // ── Profile (v0.2.23 F2 wave 2b, relocated from SettingsPanel) ────────
+  // Display name lives in Supabase `profiles.name`; email is read-only
+  // here (Supabase requires its own confirmation flow to change). The
+  // `auth.updateProfile()` action is the only mutation surface.
+  let editName = $state($currentUser?.name ?? '');
+  let profileSaved = $state(false);
+  // Keep `editName` in sync if Supabase pushes a new profile name
+  // (e.g. another session updated it). Same pattern the popover used.
+  currentUser.subscribe((u) => {
+    if (u) editName = u.name;
+  });
+
+  async function saveProfile() {
+    if (!editName.trim()) return;
+    await auth.updateProfile(editName.trim());
+    profileSaved = true;
+    setTimeout(() => { profileSaved = false; }, 2000);
+  }
+
+  // ── Downloads / Install (v0.2.23 F2 wave 2b, relocated) ───────────────
+  // Three per-machine knobs that the `settings` store persists to
+  // localStorage (see $lib/stores/settings.ts). Local mirrors are kept
+  // in sync with the store via subscribe so updates from anywhere flow
+  // back into the inputs.
+  let installPath = $state('');
+  let autoUpdate = $state(true);
+  let launchOnStartup = $state(false);
+
+  settings.subscribe((s) => {
+    installPath = s.installPath;
+    autoUpdate = s.autoUpdate;
+    launchOnStartup = s.launchOnStartup;
+  });
+
+  // ── Shared services live status (v0.2.23 F2 wave 2b, relocated) ───────
+  // Read-only probe of the per-machine Weaviate / Ollama / code_embed
+  // instances every orchestrator install reuses (per-install isolation
+  // happens via KG_COLLECTION namespacing, not separate containers).
+  interface ServicesStatus {
+    weaviate_url: string | null;
+    ollama_url: string | null;
+    code_embed_url: string | null;
+    all_detected: boolean;
+    none_detected: boolean;
+  }
+  let services = $state<ServicesStatus | null>(null);
+  let servicesLoading = $state(false);
+  let servicesError = $state<string | null>(null);
+
+  async function refreshServices() {
+    servicesLoading = true;
+    servicesError = null;
+    try {
+      services = await invoke<ServicesStatus>('detect_existing_services');
+    } catch (e) {
+      servicesError = String(e);
+    } finally {
+      servicesLoading = false;
+    }
+  }
+
+  // ── Embedding profile / ACTIVE_EMBEDDING (v0.2.23 F2 wave 2b) ─────────
+  // GLOBAL knob, distinct from the per-new-project `default_text_embedding`
+  // / `default_code_embedding` rows further up the page. Backed by
+  // `app_state` key `embedding.active_profile`; flows into per-project
+  // envs via `ProjectEnvSettings::populate` (see
+  // commands/project_env_settings.rs).
+  type EmbeddingProfile = 'qwen3' | 'arctic' | 'codesage' | 'openai';
+  const APP_STATE_KEY_ACTIVE_EMBEDDING = 'embedding.active_profile';
+  const EMBEDDING_DEFAULT: EmbeddingProfile = 'qwen3';
+  let activeEmbedding = $state<EmbeddingProfile>(EMBEDDING_DEFAULT);
+  let activeEmbeddingLoading = $state(false);
+  let activeEmbeddingSaving = $state(false);
+  let activeEmbeddingError = $state<string | null>(null);
+  let activeEmbeddingSaved = $state(false);
+
+  async function loadActiveEmbedding() {
+    activeEmbeddingLoading = true;
+    activeEmbeddingError = null;
+    try {
+      const res = await invoke<{ key: string; is_set: boolean; value: string | null }>(
+        'app_state_get',
+        { key: APP_STATE_KEY_ACTIVE_EMBEDDING },
+      );
+      if (res.is_set && res.value) {
+        const known: EmbeddingProfile[] = ['qwen3', 'arctic', 'codesage', 'openai'];
+        if ((known as string[]).includes(res.value)) {
+          activeEmbedding = res.value as EmbeddingProfile;
+        } else {
+          // Defensive: a future profile name the UI doesn't know about
+          // falls back to default rather than rendering a broken
+          // `<select>` value.
+          console.warn('Unknown active_embedding value, falling back to default:', res.value);
+          activeEmbedding = EMBEDDING_DEFAULT;
+        }
+      } else {
+        activeEmbedding = EMBEDDING_DEFAULT;
+      }
+    } catch (e) {
+      activeEmbeddingError = String(e);
+    } finally {
+      activeEmbeddingLoading = false;
+    }
+  }
+
+  async function saveActiveEmbedding(value: EmbeddingProfile) {
+    activeEmbeddingSaving = true;
+    activeEmbeddingError = null;
+    activeEmbeddingSaved = false;
+    try {
+      await invoke<void>('app_state_set', {
+        key: APP_STATE_KEY_ACTIVE_EMBEDDING,
+        value,
+      });
+      activeEmbedding = value;
+      activeEmbeddingSaved = true;
+      setTimeout(() => { activeEmbeddingSaved = false; }, 2000);
+    } catch (e) {
+      activeEmbeddingError = String(e);
+    } finally {
+      activeEmbeddingSaving = false;
+    }
+  }
+
+  // ── Volume location (v0.2.23 F2 wave 2b, relocated) ───────────────────
+  // Container data location for Weaviate / Ollama / code-embed. Migration
+  // is a two-step flow: dry-run plan → user confirms → backend copies,
+  // verifies health, removes legacy volumes. Phase progress streams via
+  // `volumes://migrate-progress` events from the Rust side (see
+  // commands/volumes.rs::MigratePhase).
+  interface VolumeWithSize {
+    name: string;
+    mountpoint: string;
+    size_bytes: number | null;
+    size_human: string | null;
+    role: string;
+  }
+  interface VolumesConfig {
+    volumes_path: string;
+    mode: string;
+    legacy_mapping: { volume_name: string; mountpoint: string; role: string }[];
+    total_size_human: string | null;
+    volumes: VolumeWithSize[];
+  }
+  interface MigrationPlan {
+    from_mode: string;
+    to_path: string;
+    volumes_to_copy: VolumeWithSize[];
+    total_bytes: number;
+    total_human: string;
+    estimated_seconds: number;
+    free_bytes_at_target: number | null;
+    insufficient_free_space: boolean;
+    warnings: string[];
+  }
+  interface MigratePhaseEvent {
+    phase:
+      | 'stopping_containers'
+      | { copying_volume: { volume_role: string; index: number; total: number } }
+      | 'writing_override'
+      | 'starting_containers'
+      | 'waiting_for_health'
+      | 'removing_legacy_volumes'
+      | 'done'
+      | { rolling_back: { reason: string } };
+    message: string;
+  }
+  let volumesConfig = $state<VolumesConfig | null>(null);
+  let volumesLoading = $state(false);
+  let volumesError = $state<string | null>(null);
+  let migratingVolumes = $state(false);
+  let migratePath = $state('');
+  let migrationPlan = $state<MigrationPlan | null>(null);
+  let migrationError = $state<string | null>(null);
+  let migrationPhaseLabel = $state<string | null>(null);
+  let migrationCopyProgress = $state<{ index: number; total: number } | null>(null);
+
+  async function refreshVolumes() {
+    volumesLoading = true;
+    volumesError = null;
+    try {
+      volumesConfig = await invoke<VolumesConfig>('get_volumes_config');
+    } catch (e) {
+      volumesError = String(e);
+    } finally {
+      volumesLoading = false;
+    }
+  }
+
+  async function startMigrationDryRun() {
+    if (!migratePath.trim()) {
+      migrationError = 'Pick a target path first.';
+      return;
+    }
+    migrationError = null;
+    try {
+      migrationPlan = await invoke<MigrationPlan>('set_volumes_config_dry_run', {
+        path: migratePath.trim(),
+      });
+    } catch (e) {
+      migrationError = String(e);
+    }
+  }
+
+  async function confirmMigration() {
+    if (!migrationPlan) return;
+    if (migrationPlan.insufficient_free_space) {
+      migrationError = 'Insufficient free space at target — pick a larger volume.';
+      return;
+    }
+    migratingVolumes = true;
+    migrationError = null;
+    migrationPhaseLabel = 'Starting…';
+    migrationCopyProgress = null;
+
+    // Subscribe to phase events for the duration of this call. listen()
+    // is dynamically imported so the import doesn't pollute the top-
+    // level namespace if Tauri's event API is unavailable in tests.
+    const { listen } = await import('@tauri-apps/api/event');
+    const unlisten = await listen<MigratePhaseEvent>(
+      'volumes://migrate-progress',
+      (ev) => {
+        const { phase, message } = ev.payload;
+        migrationPhaseLabel = message;
+        if (typeof phase === 'object' && 'copying_volume' in phase) {
+          migrationCopyProgress = {
+            index: phase.copying_volume.index,
+            total: phase.copying_volume.total,
+          };
+        } else {
+          migrationCopyProgress = null;
+        }
+      }
+    );
+
+    try {
+      await invoke('migrate_volumes', {
+        path: migrationPlan.to_path,
+        confirmed: true,
+      });
+      migrationPlan = null;
+      migratePath = '';
+      await refreshVolumes();
+    } catch (e) {
+      migrationError = String(e);
+    } finally {
+      unlisten();
+      migratingVolumes = false;
+      migrationPhaseLabel = null;
+      migrationCopyProgress = null;
+    }
+  }
+
+  function cancelMigration() {
+    migrationPlan = null;
+    migratePath = '';
+    migrationError = null;
+  }
+
+  // ── About (v0.2.23 F2 wave 2b, relocated) ─────────────────────────────
+  // Read-only application info. `getVersion()` returns the version baked
+  // into Cargo.toml at build time. Soft-fail if Tauri's API is unavailable
+  // (e.g. running the launcher in browser mode for dev).
+  let appVersion = $state('');
+  async function loadAppVersion() {
+    try {
+      appVersion = await getVersion();
+    } catch {
+      appVersion = '';
+    }
+  }
+
   onMount(() => {
     void load();
     void loadPat();
@@ -942,6 +1535,16 @@
     // Stream 1: local data collection controls.
     void loadRlLocalState();
     void loadRlUploadConsent();
+    // F2/F3/F4: KG summaries + code-embed override settings, plus the
+    // Ollama tags probe shared between the two sections.
+    void loadKgSummarySettings();
+    void loadCodeEmbedSettings();
+    void fetchOllamaModels();
+    // F2 wave 2b: sections relocated from the user-icon Settings popover.
+    void refreshServices();
+    void loadActiveEmbedding();
+    void refreshVolumes();
+    void loadAppVersion();
   });
   $effect(() => { if (project) void load(); });
   $effect(() => { if ($selectedProject) void loadRlLocalState(); });
@@ -1161,6 +1764,366 @@
           Open
         </button>
       </div>
+    </section>
+
+    <!-- v0.2.23 F2 (2026-05-21): KG Summaries — relocated from the
+         user-icon Settings popover. Controls the consent gate + model
+         selection for `templates/scripts/generate-kg-summary.py`. The
+         script reads these app_state keys directly via stdlib sqlite3
+         so changes take effect on the next summary generation without
+         restarting anything. F3 adds the local Ollama dropdown next
+         to the existing OpenAI model picker. -->
+    <section class="pr-section" aria-labelledby="pr-kgsum-title">
+      <h2 class="pr-section-title" id="pr-kgsum-title">KG Summaries</h2>
+      <p class="pr-hint" style="margin-bottom: 10px;">
+        LLM-written descriptions and per-chunk summaries used by
+        <code>hybrid_search</code>'s <code>detail="summary"</code> tier.
+        Search still works without these — the raw KG content is always
+        embedded — but summaries improve the score-driven retrieval
+        tiers significantly.
+      </p>
+
+      {#if kgSummaryLoading}
+        <p class="pr-hint">Loading…</p>
+      {:else}
+        <!-- Force-override radio. Lets the user pin a specific backend
+             when auto-detect picks the wrong one (e.g. prefer Ollama
+             even when the claude CLI is on PATH). -->
+        <div class="pr-kgsum-block">
+          <p class="pr-kgsum-block-label">Backend</p>
+          <label class="pr-kgsum-radio">
+            <input
+              type="radio"
+              name="kg-summary-override"
+              value=""
+              checked={kgSummaryOverride === ''}
+              onchange={() => void saveKgSummaryOverride('')}
+              disabled={kgSummarySaving}
+            />
+            <span>Auto (claude CLI &gt; local Ollama &gt; OpenAI w/ consent)</span>
+          </label>
+          <label class="pr-kgsum-radio">
+            <input
+              type="radio"
+              name="kg-summary-override"
+              value="cli"
+              checked={kgSummaryOverride === 'cli'}
+              onchange={() => void saveKgSummaryOverride('cli')}
+              disabled={kgSummarySaving}
+            />
+            <span>Claude CLI (best quality; uses your subscription)</span>
+          </label>
+          <label class="pr-kgsum-radio">
+            <input
+              type="radio"
+              name="kg-summary-override"
+              value="ollama"
+              checked={kgSummaryOverride === 'ollama'}
+              onchange={() => void saveKgSummaryOverride('ollama')}
+              disabled={kgSummarySaving}
+            />
+            <span>Local Ollama (no cost)</span>
+          </label>
+          <label class="pr-kgsum-radio">
+            <input
+              type="radio"
+              name="kg-summary-override"
+              value="openai"
+              checked={kgSummaryOverride === 'openai'}
+              onchange={() => void saveKgSummaryOverride('openai')}
+              disabled={kgSummarySaving || !kgSummaryConsent}
+            />
+            <span>OpenAI API (requires consent below; cost per summary)</span>
+          </label>
+          <label class="pr-kgsum-radio">
+            <input
+              type="radio"
+              name="kg-summary-override"
+              value="skip"
+              checked={kgSummaryOverride === 'skip'}
+              onchange={() => void saveKgSummaryOverride('skip')}
+              disabled={kgSummarySaving}
+            />
+            <span>Skip (no summaries; saves cost / compute)</span>
+          </label>
+        </div>
+
+        <!-- OpenAI consent gate. Shared with the F4 Code Graph
+             Embeddings section below — flipping this enables BOTH the
+             KG summary OpenAI radio AND the F4 OpenAI override. -->
+        <div class="pr-kgsum-block">
+          <label class="pr-kgsum-checkbox">
+            <input
+              type="checkbox"
+              checked={kgSummaryConsent}
+              onchange={(e) => {
+                const t = e.currentTarget as HTMLInputElement;
+                void saveKgSummaryConsent(t.checked);
+              }}
+              disabled={kgSummarySaving || !openaiPresent}
+            />
+            <span>Allow OpenAI for summaries &amp; embeddings (incurs cost)</span>
+          </label>
+          {#if !openaiPresent}
+            <p class="pr-hint pr-kgsum-warn">
+              No OpenAI API key configured — set one in the
+              <strong>OpenAI API key</strong> section below to enable
+              this option.
+            </p>
+          {:else if kgSummaryConsent}
+            <p class="pr-hint pr-kgsum-warn">
+              Heads-up: each summary or embedding triggers an API call
+              against the model picked below. Cost is small per call
+              (≈$0.0001 with gpt-4o-mini, ≈$0.005 with gpt-4o) but adds
+              up across a large KG. Switch to Claude CLI or Local
+              Ollama any time to stop the spend.
+            </p>
+          {/if}
+        </div>
+
+        <!-- OpenAI model picker. Only meaningful when consent is
+             granted. -->
+        {#if kgSummaryConsent}
+          <div class="pr-kgsum-block">
+            <label for="pr-kgsum-openai-model" class="pr-kgsum-label">
+              OpenAI model
+            </label>
+            <select
+              id="pr-kgsum-openai-model"
+              class="pr-kgsum-select"
+              value={kgSummaryModel}
+              onchange={(e) => {
+                const t = e.currentTarget as HTMLSelectElement;
+                void saveKgSummaryModel(t.value);
+              }}
+              disabled={kgSummarySaving}
+            >
+              {#each KG_SUMMARY_OPENAI_MODELS as m}
+                <option value={m.id}>{m.label}</option>
+              {/each}
+            </select>
+          </div>
+        {/if}
+
+        <!-- F3: local Ollama model picker. Reads ollamaModels populated
+             on mount via `fetchOllamaModels`. Stays visible (even when
+             the override isn't "ollama") so the user can pre-select a
+             model before switching the override — same UX shape as the
+             OpenAI model picker. -->
+        <div class="pr-kgsum-block">
+          <label for="pr-kgsum-ollama-model" class="pr-kgsum-label">
+            Local Ollama model
+          </label>
+          {#if ollamaModelsLoading}
+            <p class="pr-hint">Probing Ollama at {OLLAMA_URL}…</p>
+          {:else if ollamaModelsError}
+            <p class="pr-hint pr-kgsum-warn">
+              Couldn't reach Ollama at <code>{OLLAMA_URL}</code> ({ollamaModelsError}).
+              Start the Ollama container from the Services page, then
+              <button class="pr-link-btn" onclick={() => void fetchOllamaModels()}>retry</button>.
+            </p>
+          {:else if ollamaModels.length === 0}
+            <p class="pr-hint pr-kgsum-warn">
+              No Ollama models installed. Run
+              <code>ollama pull qwen3.5:9b</code> (16 GB+ VRAM) or
+              <code>ollama pull gemma4:e4b</code> (low-VRAM / CPU) then
+              <button class="pr-link-btn" onclick={() => void fetchOllamaModels()}>retry</button>.
+            </p>
+          {:else}
+            <select
+              id="pr-kgsum-ollama-model"
+              class="pr-kgsum-select"
+              value={kgSummaryOllamaModel}
+              onchange={(e) => {
+                const t = e.currentTarget as HTMLSelectElement;
+                void saveKgSummaryOllamaModel(t.value);
+              }}
+              disabled={kgSummarySaving}
+            >
+              <option value="">— Auto-select —</option>
+              {#each ollamaModels as name}
+                <option value={name}>{name}</option>
+              {/each}
+            </select>
+          {/if}
+        </div>
+
+        {#if kgSummarySaving}
+          <p class="pr-hint">Saving…</p>
+        {:else if kgSummarySaved}
+          <p class="pr-hint pr-kgsum-saved">Saved!</p>
+        {/if}
+        {#if kgSummaryError}
+          <p class="pr-error">Couldn't save: {kgSummaryError}</p>
+        {/if}
+      {/if}
+    </section>
+
+    <!-- v0.2.23 F4 (2026-05-21): Code Graph Embeddings. Mirrors the
+         KG-Summaries pattern above — same radio + consent + Ollama
+         dropdown layout, different app_state keys. Read-only "detected"
+         row reflects `default_code_embedding` (set by install.py during
+         hardware selection). -->
+    <section class="pr-section" aria-labelledby="pr-codeembed-title">
+      <h2 class="pr-section-title" id="pr-codeembed-title">Code Graph Embeddings</h2>
+      <p class="pr-hint" style="margin-bottom: 10px;">
+        Override the backend the code-graph indexer uses for code-entity
+        embeddings (functions, classes, modules, APIs). Defaults to the
+        install-time detected backend; pin a specific one when you want
+        to evaluate alternatives or fall back from a paid model.
+      </p>
+
+      {#if codeEmbedLoading}
+        <p class="pr-hint">Loading…</p>
+      {:else}
+        <!-- Read-only detected backend. We reuse the same
+             defaultCodeModel state populated by loadEmbeddingCatalog()
+             above — single source of truth. -->
+        <div class="pr-kgsum-block">
+          <p class="pr-kgsum-block-label">Detected backend</p>
+          <p class="pr-hint">
+            <code>{defaultCodeModel || '(unset — install hasn\'t run hardware selection)'}</code>
+          </p>
+        </div>
+
+        <div class="pr-kgsum-block">
+          <p class="pr-kgsum-block-label">Override</p>
+          <label class="pr-kgsum-radio">
+            <input
+              type="radio"
+              name="code-embed-override"
+              value=""
+              checked={codeEmbedOverride === '' || codeEmbedOverride === 'auto'}
+              onchange={() => void saveCodeEmbedOverride('')}
+              disabled={codeEmbedSaving}
+            />
+            <span>Auto (use the detected backend)</span>
+          </label>
+          <label class="pr-kgsum-radio">
+            <input
+              type="radio"
+              name="code-embed-override"
+              value="codesage"
+              checked={codeEmbedOverride === 'codesage'}
+              onchange={() => void saveCodeEmbedOverride('codesage')}
+              disabled={codeEmbedSaving}
+            />
+            <span>CodeSage-Large-v2 (2048-dim, GPU)</span>
+          </label>
+          <label class="pr-kgsum-radio">
+            <input
+              type="radio"
+              name="code-embed-override"
+              value="qwen3"
+              checked={codeEmbedOverride === 'qwen3'}
+              onchange={() => void saveCodeEmbedOverride('qwen3')}
+              disabled={codeEmbedSaving}
+            />
+            <span>qwen3-embedding (1024-dim, CPU-friendly fallback)</span>
+          </label>
+          <label class="pr-kgsum-radio">
+            <input
+              type="radio"
+              name="code-embed-override"
+              value="jina"
+              checked={codeEmbedOverride === 'jina'}
+              onchange={() => void saveCodeEmbedOverride('jina')}
+              disabled={codeEmbedSaving}
+            />
+            <span>Jina code-embeddings (768-dim, lightweight)</span>
+          </label>
+          <label class="pr-kgsum-radio">
+            <input
+              type="radio"
+              name="code-embed-override"
+              value="openai"
+              checked={codeEmbedOverride === 'openai'}
+              onchange={() => void saveCodeEmbedOverride('openai')}
+              disabled={codeEmbedSaving || !kgSummaryConsent}
+            />
+            <span>OpenAI embeddings (requires the consent above; cost per call)</span>
+          </label>
+          <label class="pr-kgsum-radio">
+            <input
+              type="radio"
+              name="code-embed-override"
+              value="ollama"
+              checked={codeEmbedOverride === 'ollama'}
+              onchange={() => void saveCodeEmbedOverride('ollama')}
+              disabled={codeEmbedSaving}
+            />
+            <span>Other Ollama model (pick below)</span>
+          </label>
+        </div>
+
+        {#if codeEmbedOverride === 'openai'}
+          <div class="pr-kgsum-block">
+            <label for="pr-codeembed-openai-model" class="pr-kgsum-label">
+              OpenAI embedding model
+            </label>
+            <select
+              id="pr-codeembed-openai-model"
+              class="pr-kgsum-select"
+              value={codeEmbedOpenaiModel}
+              onchange={(e) => {
+                const t = e.currentTarget as HTMLSelectElement;
+                void saveCodeEmbedOpenaiModel(t.value);
+              }}
+              disabled={codeEmbedSaving}
+            >
+              {#each CODE_EMBED_OPENAI_MODELS as m}
+                <option value={m.id}>{m.label}</option>
+              {/each}
+            </select>
+          </div>
+        {/if}
+
+        {#if codeEmbedOverride === 'ollama'}
+          <div class="pr-kgsum-block">
+            <label for="pr-codeembed-ollama-model" class="pr-kgsum-label">
+              Ollama model
+            </label>
+            {#if ollamaModelsLoading}
+              <p class="pr-hint">Probing Ollama at {OLLAMA_URL}…</p>
+            {:else if ollamaModelsError}
+              <p class="pr-hint pr-kgsum-warn">
+                Couldn't reach Ollama at <code>{OLLAMA_URL}</code> ({ollamaModelsError}).
+                <button class="pr-link-btn" onclick={() => void fetchOllamaModels()}>retry</button>.
+              </p>
+            {:else if ollamaModels.length === 0}
+              <p class="pr-hint pr-kgsum-warn">
+                No Ollama models installed.
+                <button class="pr-link-btn" onclick={() => void fetchOllamaModels()}>retry</button>.
+              </p>
+            {:else}
+              <select
+                id="pr-codeembed-ollama-model"
+                class="pr-kgsum-select"
+                value={codeEmbedOllamaModel}
+                onchange={(e) => {
+                  const t = e.currentTarget as HTMLSelectElement;
+                  void saveCodeEmbedOllamaModel(t.value);
+                }}
+                disabled={codeEmbedSaving}
+              >
+                <option value="">— Select model —</option>
+                {#each ollamaModels as name}
+                  <option value={name}>{name}</option>
+                {/each}
+              </select>
+            {/if}
+          </div>
+        {/if}
+
+        {#if codeEmbedSaving}
+          <p class="pr-hint">Saving…</p>
+        {:else if codeEmbedSaved}
+          <p class="pr-hint pr-kgsum-saved">Saved!</p>
+        {/if}
+        {#if codeEmbedError}
+          <p class="pr-error">Couldn't save: {codeEmbedError}</p>
+        {/if}
+      {/if}
     </section>
 
     <!-- PR-10A storage UX (v0.2.11): deep link to the per-service
@@ -1603,6 +2566,303 @@
         {#if hwError}<p class="pr-error">{hwError}</p>{/if}
       </div>
     </section>
+
+    <!-- v0.2.23 F2 wave 2b (2026-05-21): Profile. Relocated from the
+         user-icon Settings popover. Display name lives in Supabase
+         `profiles.name`; email is read-only here (Supabase requires its
+         own confirmation flow to change). -->
+    <section class="pr-section" aria-labelledby="pr-profile-title">
+      <h2 class="pr-section-title" id="pr-profile-title">Profile</h2>
+      <div class="pr-profile-block">
+        <div class="pr-profile-field">
+          <label class="pr-profile-label" for="pr-profile-name">Display name</label>
+          <input
+            id="pr-profile-name"
+            class="pr-pat-input"
+            type="text"
+            bind:value={editName}
+          />
+        </div>
+        <div class="pr-profile-field">
+          <label class="pr-profile-label" for="pr-profile-email">Email</label>
+          <input
+            id="pr-profile-email"
+            class="pr-pat-input"
+            type="email"
+            value={$currentUser?.email ?? ''}
+            disabled
+          />
+          <p class="pr-pat-hint">Email cannot be changed here.</p>
+        </div>
+        <div class="pr-profile-actions">
+          <button class="pr-btn-primary" onclick={saveProfile}>
+            Save changes
+          </button>
+          {#if profileSaved}
+            <span class="pr-profile-saved">Saved!</span>
+          {/if}
+        </div>
+      </div>
+    </section>
+
+    <!-- v0.2.23 F2 wave 2b: Downloads. Per-machine launcher prefs
+         persisted to localStorage by `$lib/stores/settings.ts`. -->
+    <section class="pr-section" aria-labelledby="pr-downloads-title">
+      <h2 class="pr-section-title" id="pr-downloads-title">Downloads</h2>
+      <div class="pr-onboarding-row">
+        <div class="pr-onboarding-text">
+          <strong>Install location</strong>
+          <span class="pr-onboarding-hint">
+            Where apps will be downloaded and installed.
+          </span>
+        </div>
+        <input
+          class="pr-pat-input pr-downloads-input"
+          type="text"
+          bind:value={installPath}
+          onchange={() => settings.updateSetting('installPath', installPath)}
+        />
+      </div>
+      <div class="pr-onboarding-row">
+        <div class="pr-onboarding-text">
+          <strong>Auto-update apps</strong>
+          <span class="pr-onboarding-hint">
+            Automatically download and install app updates.
+          </span>
+        </div>
+        <input
+          type="checkbox"
+          bind:checked={autoUpdate}
+          onchange={() => settings.updateSetting('autoUpdate', autoUpdate)}
+        />
+      </div>
+      <div class="pr-onboarding-row">
+        <div class="pr-onboarding-text">
+          <strong>Launch on system startup</strong>
+          <span class="pr-onboarding-hint">
+            Start the launcher automatically when you log in to your machine.
+          </span>
+        </div>
+        <input
+          type="checkbox"
+          bind:checked={launchOnStartup}
+          onchange={() => settings.updateSetting('launchOnStartup', launchOnStartup)}
+        />
+      </div>
+    </section>
+
+    <!-- v0.2.23 F2 wave 2b: Shared services live status. Relocated from
+         the popover. Read-only display of the per-machine Weaviate /
+         Ollama / code-embed instances every orchestrator install reuses.
+         Per-install isolation comes from KG_COLLECTION namespacing, not
+         separate containers. -->
+    <section class="pr-section" aria-labelledby="pr-services-title">
+      <h2 class="pr-section-title" id="pr-services-title">Shared services</h2>
+      <div class="pr-onboarding-row pr-services-row">
+        <div class="pr-onboarding-text">
+          <strong>Live status</strong>
+          <span class="pr-onboarding-hint">
+            Used by every orchestrator install on this machine. Per-install
+            isolation comes from separate Knowledge Graph collections
+            inside the shared Weaviate, not from separate containers.
+          </span>
+        </div>
+        <button class="pr-btn" onclick={() => void refreshServices()} disabled={servicesLoading}>
+          {servicesLoading ? 'Probing…' : 'Refresh'}
+        </button>
+      </div>
+      {#if servicesError}
+        <p class="pr-error">Couldn't probe: {servicesError}</p>
+      {:else if services}
+        <ul class="pr-services-list">
+          <li class:on={services.weaviate_url}>
+            <span class="pr-services-dot"></span>
+            <span class="pr-services-lbl">Weaviate</span>
+            <code class="pr-services-url">
+              {services.weaviate_url ?? 'http://localhost:8081 (not running)'}
+            </code>
+          </li>
+          <li class:on={services.ollama_url}>
+            <span class="pr-services-dot"></span>
+            <span class="pr-services-lbl">Ollama</span>
+            <code class="pr-services-url">
+              {services.ollama_url ?? 'http://localhost:11435 (not running)'}
+            </code>
+          </li>
+          <li class:on={services.code_embed_url}>
+            <span class="pr-services-dot"></span>
+            <span class="pr-services-lbl">code_embed</span>
+            <code class="pr-services-url">
+              {services.code_embed_url ?? 'http://localhost:11440 (not running)'}
+            </code>
+          </li>
+        </ul>
+      {:else if servicesLoading}
+        <p class="pr-hint">Probing…</p>
+      {/if}
+    </section>
+
+    <!-- v0.2.23 F2 wave 2b: Embedding profile (global). Relocated from
+         the popover. GLOBAL ACTIVE_EMBEDDING knob, distinct from the
+         per-new-project "Default embedding models" rows further up the
+         page. Backed by app_state key `embedding.active_profile`; flows
+         into per-project envs via ProjectEnvSettings::populate. -->
+    <section class="pr-section" aria-labelledby="pr-active-emb-title">
+      <h2 class="pr-section-title" id="pr-active-emb-title">Embedding profile (global)</h2>
+      <div class="pr-onboarding-row">
+        <div class="pr-onboarding-text">
+          <strong>Active profile</strong>
+          <span class="pr-onboarding-hint">
+            Which model the launcher uses for KG / Codegraph embeddings.
+            Changing this affects every project created or refreshed from
+            now on; existing collections keep their stored embeddings
+            until re-synced.
+            <br /><br />
+            Note: this is distinct from the per-new-project
+            <strong>Default embedding models</strong> section above. That
+            section controls the model that goes into a brand-new
+            project's binding; this section controls the
+            <code>ACTIVE_EMBEDDING</code> env var that propagates to
+            every refreshed project's env.
+          </span>
+        </div>
+        <select
+          class="pr-kgsum-select pr-active-emb-select"
+          value={activeEmbedding}
+          onchange={(e) => {
+            const target = e.currentTarget as HTMLSelectElement;
+            void saveActiveEmbedding(target.value as EmbeddingProfile);
+          }}
+          disabled={activeEmbeddingLoading || activeEmbeddingSaving}
+          aria-label="Active embedding profile"
+        >
+          <option value="qwen3">qwen3 (1024-dim, default)</option>
+          <option value="arctic">arctic (1024-dim, legacy)</option>
+          <option value="codesage">codesage (2048-dim, code-only)</option>
+          <option value="openai">openai (3072-dim, paid)</option>
+        </select>
+      </div>
+      {#if activeEmbeddingSaving}
+        <p class="pr-hint">Saving…</p>
+      {:else if activeEmbeddingSaved}
+        <p class="pr-hint pr-kgsum-saved">Saved!</p>
+      {/if}
+      {#if activeEmbeddingError}
+        <p class="pr-error">Couldn't save: {activeEmbeddingError}</p>
+      {/if}
+    </section>
+
+    <!-- v0.2.23 F2 wave 2b: Volume location. Relocated from the popover.
+         Container data location for Weaviate / Ollama / code-embed.
+         Migration is a two-step flow: dry-run plan → user confirms →
+         backend copies, verifies new bind-mounts come up healthy, then
+         removes the old volumes. On any failure the migration rolls back
+         without touching your data. -->
+    <section class="pr-section" aria-labelledby="pr-volumes-title">
+      <h2 class="pr-section-title" id="pr-volumes-title">Volume location</h2>
+      <p class="pr-hint">
+        Where Weaviate's vector index, Ollama's models, and the
+        code-embed cache live. Changing this safely copies all data,
+        verifies new bind-mounts come up healthy, then removes the old
+        volumes. On any failure the migration rolls back without
+        touching your data.
+      </p>
+      {#if volumesLoading}
+        <p class="pr-hint">Probing…</p>
+      {:else if volumesError}
+        <p class="pr-error">Couldn't probe: {volumesError}</p>
+      {:else if volumesConfig}
+        <ul class="pr-volumes-list">
+          {#each volumesConfig.volumes as v}
+            <li>
+              <span class="pr-volumes-role">{v.role}</span>
+              <code class="pr-volumes-mount">{v.mountpoint}</code>
+              {#if v.size_human}
+                <span class="pr-volumes-size">{v.size_human}</span>
+              {/if}
+            </li>
+          {/each}
+        </ul>
+        <p class="pr-hint">
+          Mode: <strong>{volumesConfig.mode}</strong>
+          {#if volumesConfig.total_size_human}
+            · {volumesConfig.total_size_human} total
+          {/if}
+        </p>
+
+        {#if migrationPlan}
+          <div class="pr-volumes-confirm">
+            <p>
+              Move <strong>{migrationPlan.total_human}</strong>
+              from {migrationPlan.from_mode} to
+              <code>{migrationPlan.to_path}</code>
+              (~{Math.ceil(migrationPlan.estimated_seconds / 60)} min on local SSD)?
+            </p>
+            {#each migrationPlan.warnings as w}
+              <p class="pr-hint pr-kgsum-warn">{w}</p>
+            {/each}
+            <div class="pr-volumes-actions">
+              <button class="pr-btn" onclick={cancelMigration} disabled={migratingVolumes}>
+                Cancel
+              </button>
+              <button
+                class="pr-btn-primary"
+                onclick={() => void confirmMigration()}
+                disabled={migratingVolumes || migrationPlan.insufficient_free_space}
+              >
+                {migratingVolumes ? 'Migrating…' : 'Confirm migration'}
+              </button>
+            </div>
+            {#if migratingVolumes && migrationPhaseLabel}
+              <p class="pr-hint pr-volumes-phase">
+                {migrationPhaseLabel}{#if migrationCopyProgress} ({migrationCopyProgress.index}/{migrationCopyProgress.total}){/if}
+              </p>
+            {/if}
+            {#if migrationError}<p class="pr-error">{migrationError}</p>{/if}
+          </div>
+        {:else}
+          <div class="pr-volumes-input-row">
+            <input
+              type="text"
+              class="pr-pat-input pr-volumes-input"
+              bind:value={migratePath}
+              placeholder="/mnt/big-disk/vct-volumes"
+            />
+            <button class="pr-btn" onclick={() => void startMigrationDryRun()}>Change…</button>
+            <button class="pr-btn" onclick={() => void refreshVolumes()}>Refresh</button>
+          </div>
+          {#if migrationError}<p class="pr-error">{migrationError}</p>{/if}
+        {/if}
+      {/if}
+    </section>
+
+    <!-- v0.2.23 F2 wave 2b: About. Bottom of page (universal pattern). -->
+    <section class="pr-section" aria-labelledby="pr-about-title">
+      <h2 class="pr-section-title" id="pr-about-title">About</h2>
+      <div class="pr-about-card">
+        <div class="pr-about-logo">
+          <div class="pr-about-logo-icon"><span>V</span></div>
+          <div>
+            <p class="pr-about-name">VCT Launcher</p>
+            <p class="pr-about-version">{appVersion ? `v${appVersion}` : ''}</p>
+          </div>
+        </div>
+        <div class="pr-about-rows">
+          <div class="pr-about-row">
+            <span class="pr-about-label">Framework</span>
+            <span class="pr-about-value">Tauri 2 + SvelteKit</span>
+          </div>
+          <div class="pr-about-row">
+            <span class="pr-about-label">Website</span>
+            <span class="pr-about-value pr-about-link">vibecodedtools.com</span>
+          </div>
+          <div class="pr-about-row">
+            <span class="pr-about-label">License</span>
+            <span class="pr-about-value">AGPL-3.0</span>
+          </div>
+        </div>
+      </div>
+    </section>
   </main>
 </div>
 
@@ -1752,6 +3012,46 @@
     background: none; border: none; color: rgb(0,191,166); cursor: pointer;
     padding: 0; margin-left: 8px; text-decoration: underline; font-size: 11px;
   }
+
+  /* v0.2.23 F2/F3/F4: KG Summaries + Code Graph Embeddings sections.
+     Boxy block layout that mirrors the rest of the page (.pr-onboarding-row
+     style: subtle border + tinted background) so the new sections don't
+     feel like a foreign body. */
+  .pr-kgsum-block {
+    padding: 10px 14px; background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.06); border-radius: 6px;
+    margin-top: 8px;
+  }
+  .pr-kgsum-block-label {
+    font-size: 11px; font-weight: 600; color: #aaa;
+    margin: 0 0 6px;
+  }
+  .pr-kgsum-radio,
+  .pr-kgsum-checkbox {
+    display: flex; align-items: center; gap: 8px;
+    padding: 3px 0; font-size: 12px; color: #ccc;
+    cursor: pointer;
+  }
+  .pr-kgsum-radio input,
+  .pr-kgsum-checkbox input {
+    accent-color: rgb(0,191,166);
+    cursor: pointer;
+  }
+  .pr-kgsum-radio input:disabled,
+  .pr-kgsum-checkbox input:disabled { cursor: not-allowed; }
+  .pr-kgsum-radio input:disabled + span,
+  .pr-kgsum-checkbox input:disabled + span { opacity: 0.55; }
+  .pr-kgsum-label {
+    display: block; font-size: 11px; color: #aaa;
+    margin-bottom: 6px;
+  }
+  .pr-kgsum-select {
+    width: 100%; max-width: 360px;
+    background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.1);
+    color: #e8e8ee; padding: 5px 10px; border-radius: 4px; font-size: 12px;
+  }
+  .pr-kgsum-warn { color: rgb(255,184,74); margin-top: 4px; }
+  .pr-kgsum-saved { color: rgb(0,191,166); font-weight: 500; }
 
   .pr-section { margin-top: 20px; }
   .pr-section-title { font-size: 11px; font-weight: 600; color: #888; text-transform: uppercase; letter-spacing: 0.07em; margin: 0 0 8px; }
@@ -1957,4 +3257,112 @@
     border-radius: 4px; font-family: ui-monospace, monospace; font-size: 10.5px;
     color: #ccc; max-height: 240px; overflow: auto; white-space: pre-wrap; word-break: break-word;
   }
+
+  /* v0.2.23 F2 wave 2b: Profile / Downloads / Shared services / Embedding
+     profile / Volume location / About — sections relocated from the now-
+     deleted user-icon Settings popover. Styling mirrors the rest of the
+     page (subtle border + tinted background) so the new sections sit
+     naturally next to the existing ones. */
+  .pr-profile-block {
+    padding: 12px 14px; background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.06); border-radius: 6px;
+    display: flex; flex-direction: column; gap: 12px;
+  }
+  .pr-profile-field { display: flex; flex-direction: column; gap: 4px; }
+  .pr-profile-label { font-size: 11px; color: #888; }
+  .pr-profile-actions { display: flex; align-items: center; gap: 12px; margin-top: 4px; }
+  .pr-profile-saved { font-size: 11.5px; color: rgb(0,191,166); font-weight: 500; }
+  .pr-downloads-input { max-width: 320px; flex-shrink: 0; }
+
+  /* Shared services list — port of .services-list from SettingsPanel. */
+  .pr-services-row { align-items: flex-start; }
+  .pr-services-list {
+    list-style: none; padding: 10px 14px; margin: 8px 0 0;
+    background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 6px; font-size: 12px;
+  }
+  .pr-services-list li {
+    display: flex; gap: 8px; align-items: center;
+    padding: 4px 0; color: #888;
+  }
+  .pr-services-list li.on { color: #ccc; }
+  .pr-services-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: #555; display: inline-block; flex-shrink: 0;
+  }
+  .pr-services-list li.on .pr-services-dot { background: rgb(0,191,166); }
+  .pr-services-lbl { min-width: 80px; font-size: 11.5px; }
+  .pr-services-url {
+    font-family: ui-monospace, monospace; font-size: 11px;
+    color: #c4b3ff; background: rgba(255,255,255,0.04);
+    padding: 1px 6px; border-radius: 3px; word-break: break-all;
+  }
+
+  /* Embedding profile select — sized to fit the row's right column. */
+  .pr-active-emb-select { max-width: 320px; }
+
+  /* Volume location — port of .volumes-list / .migrate-* from SettingsPanel. */
+  .pr-volumes-list {
+    list-style: none; padding: 10px 14px; margin: 8px 0;
+    background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 6px;
+  }
+  .pr-volumes-list li {
+    padding: 3px 0; color: #ccc; display: flex; gap: 8px;
+    align-items: baseline; flex-wrap: wrap; font-size: 12px;
+  }
+  .pr-volumes-role {
+    display: inline-block; min-width: 80px; color: #c4b3ff;
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em;
+  }
+  .pr-volumes-mount {
+    font-family: ui-monospace, monospace; font-size: 11px;
+    background: rgba(255,255,255,0.04); padding: 1px 6px; border-radius: 3px;
+  }
+  .pr-volumes-size { color: #888; font-size: 11px; }
+  .pr-volumes-input-row {
+    display: flex; gap: 6px; align-items: center; margin-top: 6px;
+  }
+  .pr-volumes-input { flex: 1; min-width: 0; }
+  .pr-volumes-confirm {
+    margin-top: 8px; padding: 10px 12px;
+    border: 1px solid rgba(255,184,74,0.3); border-radius: 6px;
+    background: rgba(255,184,74,0.04);
+  }
+  .pr-volumes-confirm p { margin: 4px 0; font-size: 12px; color: #ddd; }
+  .pr-volumes-confirm code {
+    font-family: ui-monospace, monospace; background: rgba(255,255,255,0.06);
+    padding: 1px 5px; border-radius: 3px; font-size: 11px;
+  }
+  .pr-volumes-actions { display: flex; gap: 8px; margin-top: 8px; }
+  .pr-volumes-phase { color: rgb(160,200,255); }
+
+  /* About — port of .about-* from SettingsPanel. */
+  .pr-about-card {
+    padding: 14px 16px; background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.06); border-radius: 6px;
+    display: flex; flex-direction: column; gap: 16px;
+  }
+  .pr-about-logo { display: flex; align-items: center; gap: 12px; }
+  .pr-about-logo-icon {
+    width: 40px; height: 40px; border-radius: 12px;
+    display: flex; align-items: center; justify-content: center;
+    background: linear-gradient(135deg, rgb(0,191,166), rgb(123,95,255));
+    box-shadow: 0 3px 12px rgba(0,191,166,0.2);
+  }
+  .pr-about-logo-icon span { color: #0e0e16; font-weight: 900; font-size: 18px; }
+  .pr-about-name { font-size: 14px; font-weight: 700; color: #e8e8ee; margin: 0; }
+  .pr-about-version {
+    font-size: 11px; color: #888; margin: 0;
+    font-family: ui-monospace, monospace;
+  }
+  .pr-about-rows { display: flex; flex-direction: column; gap: 6px; }
+  .pr-about-row {
+    display: flex; justify-content: space-between;
+    padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,0.04);
+    font-size: 12px;
+  }
+  .pr-about-label { color: #888; }
+  .pr-about-value { color: #ccc; font-weight: 500; }
+  .pr-about-link { color: rgb(0,191,166); }
 </style>

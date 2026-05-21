@@ -22,6 +22,7 @@
   import { onMount } from 'svelte';
   import { orchestrator } from '$lib/stores/orchestrator';
   import { updater } from '$lib/stores/updater';
+  import OrchestratorUpdateDivergenceModal from './OrchestratorUpdateDivergenceModal.svelte';
 
   let popoverOpen = $state(false);
   let wrapperEl = $state<HTMLDivElement | null>(null);
@@ -120,6 +121,18 @@
 </script>
 
 <svelte:window onclick={handleClickOutside} />
+
+<!-- v0.2.23 (B4 / D19): when update_orchestrator fails with a non-FF
+     divergence error, surface the merge/rebase/cancel modal. This runs
+     OUTSIDE the {#if visible} block so the modal stays usable even when
+     the user has dismissed the badge. -->
+{#if upd.nonFf}
+  <OrchestratorUpdateDivergenceModal
+    payload={upd.nonFf}
+    installPath={orchState.installPath}
+    onClose={() => updater.dismissNonFf()}
+  />
+{/if}
 
 {#if visible}
   <div class="update-wrapper" bind:this={wrapperEl}>

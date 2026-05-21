@@ -2,22 +2,41 @@
 # Copyright (c) 2026 VibeCoded Tools
 """PR-34 (v0.2.12, Group M) — cross-language shared-KG constant invariant.
 
-Pins the canonical shared-KG class name + its legacy alias in lockstep
-across the four surfaces that carry the literal:
+Pins the canonical shared-KG class name + its TWO legacy aliases in
+lockstep across the four surfaces that carry the literal:
 
   * Python  — ``vco_lib/project_init.py::_SHARED_KG_NAME``
-              ``vco_lib/project_init.py::_LEGACY_SHARED_KG_NAME``
+              ``vco_lib/project_init.py::_LEGACY_SHARED_KG_NAME`` (pre-v0.2.12)
+              ``vco_lib/project_init.py::_LEGACY_SHARED_KG_NAME_LOWERCASE_C``
+                  (v0.2.12–v0.2.22)
   * Rust    — ``launcher/src-tauri/src/commands/project_env_settings.rs``
-              ``DEFAULT_SHARED_KG_COLLECTION`` / ``LEGACY_SHARED_KG_COLLECTION``
+              ``DEFAULT_SHARED_KG_COLLECTION``
+              ``LEGACY_SHARED_KG_COLLECTION`` (pre-v0.2.12)
+              ``LEGACY_SHARED_KG_COLLECTION_LOWERCASE_C`` (v0.2.12–v0.2.22)
 
-Background: PR-26 (Group E) renamed the canonical from
-``VibeCodedTools_KnowledgeGraph`` to ``VibecodedOrchestrator_KnowledgeGraph``
-but stayed inside its allowlist, leaving five other surfaces still
-hardcoding the OLD name. PR-34 sweeps them. This test pins the resulting
-constants in lockstep so any future drift fails CI loudly — the picker's
-per-project app_state override mechanism papers over default mismatches
-at runtime, but a divergent set of DEFAULTS across surfaces is a footgun
-for fresh installs and fresh-project flows.
+Background:
+
+  * PR-26 (v0.2.12, Group E) renamed the canonical from
+    ``VibeCodedTools_KnowledgeGraph`` to
+    ``VibecodedOrchestrator_KnowledgeGraph`` (lowercase c, matching the
+    actual on-disk casing in production).
+  * PR-34 (v0.2.12, Group M) swept the remaining surfaces still
+    hardcoding the OLD name and pinned them via this lockstep test.
+  * v0.2.23 B1 (2026-05-21) flipped the canonical casing again from
+    lowercase-c ``Vibecoded`` back to capital-C ``VibeCoded`` to match
+    the brand spelling. The case-flip is supported by case-insensitive
+    adoption in ``install.py::_ensure_collections`` plus the binding-row
+    self-heal in ``install.py::_self_heal_kg_bindings_on_update`` —
+    existing installs with the lowercase-c class on disk are adopted in
+    place rather than recreated. The lowercase-c name lives on as
+    ``_LEGACY_SHARED_KG_NAME_LOWERCASE_C`` so case-mismatch detection
+    code can recognise it without scattering the literal.
+
+This test pins both the canonical and BOTH legacy aliases so any future
+drift fails CI loudly — the picker's per-project app_state override
+mechanism papers over default mismatches at runtime, but a divergent set
+of DEFAULTS across surfaces is a footgun for fresh installs and
+fresh-project flows.
 
 Why a regex parse of the Rust file instead of a generated binding: the
 Rust crate (``launcher/``) is a separate Cargo workspace that's not part
@@ -40,8 +59,13 @@ if str(REPO_ROOT) not in sys.path:
 from vco_lib import project_init  # noqa: E402
 
 
-CANONICAL_SHARED_KG_NAME = "VibecodedOrchestrator_KnowledgeGraph"
+# v0.2.23 B1 (2026-05-21): canonical casing flipped from lowercase-c to
+# capital-C to match the brand spelling.
+CANONICAL_SHARED_KG_NAME = "VibeCodedOrchestrator_KnowledgeGraph"
+# Pre-v0.2.12 PR-26 name (still a recognised legacy alias).
 LEGACY_SHARED_KG_NAME = "VibeCodedTools_KnowledgeGraph"
+# v0.2.12–v0.2.22 lowercase-c canonical (now a legacy alias).
+LEGACY_SHARED_KG_NAME_LOWERCASE_C = "VibecodedOrchestrator_KnowledgeGraph"
 
 RUST_CONSTS_FILE = (
     REPO_ROOT
@@ -76,7 +100,7 @@ def _parse_rust_constants() -> dict[str, str]:
 
 
 class PythonConstantsTests(unittest.TestCase):
-    """Python source of truth for the canonical + legacy names."""
+    """Python source of truth for the canonical + BOTH legacy names."""
 
     def test_canonical_matches_expected(self):
         self.assertEqual(
@@ -98,15 +122,51 @@ class PythonConstantsTests(unittest.TestCase):
             "detection code to recognize pre-rename installs.",
         )
 
+    def test_legacy_alias_lowercase_c_matches_expected(self):
+        # v0.2.23 B1: pin the second legacy alias (v0.2.12–v0.2.22
+        # canonical, now used by case-mismatch detection paths).
+        self.assertEqual(
+            project_init._LEGACY_SHARED_KG_NAME_LOWERCASE_C,
+            LEGACY_SHARED_KG_NAME_LOWERCASE_C,
+            "vco_lib/project_init.py::_LEGACY_SHARED_KG_NAME_LOWERCASE_C "
+            f"drifted from {LEGACY_SHARED_KG_NAME_LOWERCASE_C!r} — the "
+            "lowercase-c alias must keep pointing at the v0.2.12–v0.2.22 "
+            "canonical class name for case-mismatch detection code (in "
+            "install.py::_self_heal_kg_bindings_on_update + "
+            "install.py::_ensure_collections case-insensitive adoption) "
+            "to recognise pre-flip installs.",
+        )
+
     def test_canonical_and_legacy_are_distinct(self):
-        # Sanity: if these collide, every migration-detection path that
-        # branches on (legacy ⇒ deferral, canonical ⇒ no-op) collapses.
+        # Sanity: if any pair collides, every migration-detection path
+        # that branches on (legacy ⇒ deferral, canonical ⇒ no-op)
+        # collapses.
         self.assertNotEqual(
             project_init._SHARED_KG_NAME,
             project_init._LEGACY_SHARED_KG_NAME,
-            "canonical and legacy shared-KG names must differ; "
-            "otherwise legacy-detection short-circuits to no-op",
+            "canonical and pre-v0.2.12 legacy shared-KG names must "
+            "differ; otherwise legacy-detection short-circuits to no-op",
         )
+        self.assertNotEqual(
+            project_init._SHARED_KG_NAME,
+            project_init._LEGACY_SHARED_KG_NAME_LOWERCASE_C,
+            "canonical and v0.2.12–v0.2.22 lowercase-c legacy shared-KG "
+            "names must differ; the v0.2.23 B1 case-flip is the whole "
+            "point of the lowercase-c alias",
+        )
+        self.assertNotEqual(
+            project_init._LEGACY_SHARED_KG_NAME,
+            project_init._LEGACY_SHARED_KG_NAME_LOWERCASE_C,
+            "the two legacy aliases must differ; one tracks pre-v0.2.12 "
+            "PR-26 class names, the other tracks v0.2.12–v0.2.22 names",
+        )
+
+    def test_canonical_has_capital_c_vibecoded(self):
+        # v0.2.23 B1: explicit casing pin — the canonical is "VibeCoded"
+        # (capital C+D) for brand consistency. The lowercase-c
+        # "Vibecoded" is the v0.2.12–v0.2.22 legacy alias.
+        self.assertIn("VibeCoded", CANONICAL_SHARED_KG_NAME)
+        self.assertNotIn("Vibecoded", CANONICAL_SHARED_KG_NAME.replace("VibeCoded", "X"))
 
 
 class RustConstantsTests(unittest.TestCase):
@@ -134,6 +194,17 @@ class RustConstantsTests(unittest.TestCase):
             "removed; migration-detection code in commands::kg relies on it.",
         )
 
+    def test_legacy_shared_kg_collection_lowercase_c_present(self):
+        # v0.2.23 B1: second legacy alias for the v0.2.12–v0.2.22 default.
+        self.assertIn(
+            "LEGACY_SHARED_KG_COLLECTION_LOWERCASE_C",
+            self.constants,
+            f"Expected `pub const LEGACY_SHARED_KG_COLLECTION_LOWERCASE_C: "
+            f"&str = ...` in {RUST_CONSTS_FILE.relative_to(REPO_ROOT)} — "
+            "the alias was removed; case-mismatch detection in "
+            "commands::kg + the binding-row self-heal rely on it.",
+        )
+
     def test_rust_default_matches_canonical(self):
         self.assertEqual(
             self.constants.get("DEFAULT_SHARED_KG_COLLECTION"),
@@ -148,6 +219,16 @@ class RustConstantsTests(unittest.TestCase):
             LEGACY_SHARED_KG_NAME,
             "Rust LEGACY_SHARED_KG_COLLECTION drifted from "
             f"{LEGACY_SHARED_KG_NAME!r}",
+        )
+
+    def test_rust_legacy_lowercase_c_matches_expected(self):
+        # v0.2.23 B1: pin the v0.2.12–v0.2.22 legacy alias on the Rust
+        # side too.
+        self.assertEqual(
+            self.constants.get("LEGACY_SHARED_KG_COLLECTION_LOWERCASE_C"),
+            LEGACY_SHARED_KG_NAME_LOWERCASE_C,
+            "Rust LEGACY_SHARED_KG_COLLECTION_LOWERCASE_C drifted from "
+            f"{LEGACY_SHARED_KG_NAME_LOWERCASE_C!r}",
         )
 
 
@@ -173,6 +254,20 @@ class CrossLanguageInvariantTests(unittest.TestCase):
             "Python `_LEGACY_SHARED_KG_NAME` and Rust "
             "`LEGACY_SHARED_KG_COLLECTION` diverged — migration-detection "
             "across surfaces will recognize different sets of legacy "
+            "installs. Sync them and re-run the test.",
+        )
+
+    def test_python_and_rust_legacy_lowercase_c_match(self):
+        # v0.2.23 B1: cross-language pin for the v0.2.12–v0.2.22 legacy.
+        rust = _parse_rust_constants()
+        self.assertEqual(
+            project_init._LEGACY_SHARED_KG_NAME_LOWERCASE_C,
+            rust.get("LEGACY_SHARED_KG_COLLECTION_LOWERCASE_C"),
+            "Python `_LEGACY_SHARED_KG_NAME_LOWERCASE_C` and Rust "
+            "`LEGACY_SHARED_KG_COLLECTION_LOWERCASE_C` diverged — case-"
+            "mismatch detection (install.py case-insensitive adoption + "
+            "the binding-row self-heal + the launcher's kg.rs is_shared "
+            "probe) will recognise different sets of v0.2.12–v0.2.22 "
             "installs. Sync them and re-run the test.",
         )
 

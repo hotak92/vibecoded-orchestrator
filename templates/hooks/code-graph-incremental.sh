@@ -46,12 +46,20 @@ REPO_PATH="${2:-${CLAUDE_PROJECT_DIR:-$(pwd)}}"
 # for direct invocations of this hook (rare, but the project_init test
 # suite + ad-hoc CLI use exercise it). Falls back to basename when the
 # resolver is unavailable, preserving the pre-v0.2.21 default.
+#
+# v0.2.23 field switch: ask the resolver for the canonical Weaviate
+# collection prefix (`code_graph_collection_prefix`), NOT the legacy
+# slug-alias `code_graph_project`. The slug routes writes to a derived
+# zombie prefix (slug → canonical_class_prefix → e.g. `Orchestrator_root`)
+# while consumers + the launcher binding row point at the canonical
+# prefix (e.g. `VibeCodedOrchestrator`). See knowledge/concepts/
+# multi-codebase-code-graph-detection.md for the full diagnosis.
 PROJECT_NAME="${3:-}"
 if [ -z "$PROJECT_NAME" ]; then
     _RESOLVER="$REPO_PATH/.claude/scripts/vct_project_config.sh"
     if [ -x "$_RESOLVER" ]; then
         PROJECT_NAME=$(
-            "$_RESOLVER" "$REPO_PATH" --field code_graph_project 2>/dev/null
+            "$_RESOLVER" "$REPO_PATH" --field code_graph_collection_prefix 2>/dev/null
         ) || PROJECT_NAME=""
     fi
 fi

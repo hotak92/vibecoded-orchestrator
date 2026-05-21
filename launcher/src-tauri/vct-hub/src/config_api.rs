@@ -187,7 +187,24 @@ struct ProjectConfigResponse {
     /// `code-graph-query --project ...` callers (and several hooks
     /// that grep their env) expect this exact field name. Same value
     /// as `project_slug`; eases migration. See design doc §1.3.
+    ///
+    /// ⚠️ DO NOT use this as the Weaviate write-target prefix. The
+    /// slug is sanitised independently by the analyzer's
+    /// `_sanitize_collection_prefix`, producing a prefix that may
+    /// DIVERGE from the launcher's `project_codegraph_bindings.collection_prefix`
+    /// (e.g. slug `orchestrator-root` → `Orchestrator_root`, but the
+    /// binding row says `VibeCodedOrchestrator`). v0.2.23 split: use
+    /// `code_graph_collection_prefix` for the write target, keep
+    /// `code_graph_project` for codegraph-access matrix joins where
+    /// the slug is the actual key. See knowledge/concepts/
+    /// multi-codebase-code-graph-detection.md for the v0.2.22→v0.2.23
+    /// post-rename codegraph reconciliation story.
     code_graph_project: String,
+    /// Canonical Weaviate write-target prefix sourced from
+    /// `project_codegraph_bindings.collection_prefix`. This is the
+    /// single source of truth for hooks + the analyzer. Falls back to
+    /// the slug-sanitised version when no binding row exists (i.e.
+    /// before the project has been analysed for the first time).
     code_graph_collection_prefix: String,
     kg_collection: String,
     shared_kg_collection: String,
@@ -654,7 +671,7 @@ mod tests {
             .set_project_kg_binding(
                 id,
                 "shared",
-                "VibecodedOrchestrator_KnowledgeGraph",
+                "VibeCodedOrchestrator_KnowledgeGraph",
                 Some("qwen3-embedding:0.6b"),
                 Some(1024),
                 None,
@@ -775,7 +792,7 @@ mod tests {
         );
         assert_eq!(
             body.get("shared_kg_collection").and_then(|v| v.as_str()),
-            Some("VibecodedOrchestrator_KnowledgeGraph")
+            Some("VibeCodedOrchestrator_KnowledgeGraph")
         );
         assert_eq!(
             body.get("development_collection").and_then(|v| v.as_str()),

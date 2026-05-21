@@ -1175,6 +1175,17 @@ pub fn run() {
             commands::storage_ux::migrate_to_named_volume,
             commands::storage_ux::migrate_to_bind_path,
             commands::installer::update_orchestrator,
+            // v0.2.23 (B4 / D19): divergence-recovery commands for
+            // update_orchestrator. When the user's local clone has
+            // diverged from upstream (typical: local edits to
+            // CLAUDE.md, CONTEXT_STATE.md, KG nodes), `git pull
+            // --ff-only` fails. update_orchestrator surfaces a
+            // structured "orchestrator_update_non_ff" error; the
+            // frontend then offers Merge / Rebase / Cancel. These
+            // three commands are the resolvers.
+            commands::installer::merge_orchestrator_with_upstream,
+            commands::installer::rebase_orchestrator_onto_upstream,
+            commands::installer::abort_orchestrator_merge_or_rebase,
             // v0.2.16 (W4 / 0.5): apply_pending_install resolves the
             // "Pulled-but-not-installed" banner state (source updated
             // via `git pull` outside the launcher; install-manifest

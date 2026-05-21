@@ -53,7 +53,7 @@ FULL_BODY: dict[str, Any] = {
     "code_graph_project": "myproject",
     "code_graph_collection_prefix": "Myproject",
     "kg_collection": "Myproject_KnowledgeGraph",
-    "shared_kg_collection": "VibecodedOrchestrator_KnowledgeGraph",
+    "shared_kg_collection": "VibeCodedOrchestrator_KnowledgeGraph",
     "development_collection": "Myproject_Development",
     "active_embedding": "qwen3",
     "embedding_models": {
@@ -62,7 +62,7 @@ FULL_BODY: dict[str, Any] = {
     },
     "kg_access_list": [
         "Myproject_KnowledgeGraph",
-        "VibecodedOrchestrator_KnowledgeGraph",
+        "VibeCodedOrchestrator_KnowledgeGraph",
     ],
     "codegraph_access_list": ["myproject"],
     "weaviate_url": "http://localhost:8081",
@@ -261,7 +261,7 @@ class ResolveHappyPathTest(_ResolverTestBase):
         self.assertEqual(cfg.code_graph_project, "myproject")
         self.assertEqual(cfg.kg_access_list, (
             "Myproject_KnowledgeGraph",
-            "VibecodedOrchestrator_KnowledgeGraph",
+            "VibeCodedOrchestrator_KnowledgeGraph",
         ))
         self.assertEqual(cfg.codegraph_access_list, ("myproject",))
         self.assertIsInstance(cfg.embedding_models, EmbeddingModels)

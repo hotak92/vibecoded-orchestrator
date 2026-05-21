@@ -4,19 +4,32 @@ Generate LLM summaries for a KG node and store in .node_formats.json.
 
 Called by PostToolUse hook on knowledge/**/*.md edits.
 
-Three-tier model selection (in order):
+Four-tier model selection (in order):
   1. `claude` CLI on PATH      → best quality, requires CLI install (Max sub or API key)
+                                 v0.2.23 C10: gated by a smoke-test, not just --version,
+                                 so an installed-but-unauthenticated CLI doesn't get picked.
   2. Ollama (local, FREE)      → http://localhost:11435, no extra dep beyond what
-                                  the orchestrator already requires for embeddings
-  3. ANTHROPIC_API_KEY direct  → opt-in fallback, cost warning logged
-  4. Silent skip               → friendly log line, exits 0
+                                 the orchestrator already requires for embeddings
+  3. OpenAI API (opt-in)       → gated by `kg_summary_openai_consent` app_state key
+                                 (default false). Set via launcher Preferences → KG
+                                 Summaries. Bypass via `--force-api`. Costs apply.
+  4. ANTHROPIC_API_KEY direct  → legacy opt-in fallback. Cost warning logged.
+  5. Silent skip               → friendly log line, exits 0
 
 Env overrides:
-  KG_SUMMARY_BACKEND        → force "cli" | "ollama" | "api" | "skip" (auto-detect default)
+  KG_SUMMARY_BACKEND        → force "cli" | "ollama" | "api" | "openai" | "skip"
+                              (auto-detect default; "api" = Anthropic, "openai" = OpenAI)
   KG_SUMMARY_OLLAMA_MODEL   → Ollama model tag (default: qwen3.5:9b for 16GB+ VRAM,
                                                           gemma4:e4b for low-VRAM/CPU)
   KG_SUMMARY_OLLAMA_URL     → Ollama base URL (default: http://localhost:11435)
+  KG_SUMMARY_OPENAI_MODEL   → OpenAI model name (default: gpt-4o-mini — cheapest
+                              summary-capable model as of 2026-05-21)
   KG_SUMMARY_TIMEOUT        → per-call timeout seconds (default: 180)
+
+Flags:
+  --force-api               → bypass the openai-consent gate (operator override; use
+                              when scripting from CI / a one-shot terminal where the
+                              launcher app_state is not yet seeded).
 
 For multi-chunk nodes: generates both a whole-node summary and per-chunk summaries.
 For single-chunk nodes: generates description + summary only.
@@ -37,6 +50,20 @@ ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
 OLLAMA_DEFAULT_MODEL = os.getenv("KG_SUMMARY_OLLAMA_MODEL", "qwen3.5:9b")
 OLLAMA_URL = os.getenv("KG_SUMMARY_OLLAMA_URL", "http://localhost:11435").rstrip("/")
 TIMEOUT = int(os.getenv("KG_SUMMARY_TIMEOUT", "180"))
+
+# v0.2.23 C10 — OpenAI summary backend. Default model is the cheapest
+# summary-capable OpenAI model as of 2026-05-21. Users can override via
+# the launcher Preferences dropdown (writes app_state) or via env.
+OPENAI_DEFAULT_MODEL = os.getenv("KG_SUMMARY_OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
+
+# v0.2.23 C10 — app_state keys consumed by the consent gate. Resolved
+# at backend-selection time; the actual gate logic lives in
+# `select_backend`. The script reads launcher.db directly (stdlib
+# sqlite3, no Tauri dependency); a missing DB or table is treated as
+# "consent never granted" → consent=False (the safe default).
+APP_STATE_KEY_OPENAI_CONSENT = "kg_summary_openai_consent"
+APP_STATE_KEY_OPENAI_MODEL = "kg_summary_openai_model"
 
 # Project root (where knowledge/ + .claude/ live): defaults to the script's
 # parent.parent.parent (Claude orchestrator), but overridable via
@@ -135,7 +162,47 @@ def read_node(file_path: Path) -> tuple[str, str, str]:
 # Backend: Claude CLI
 # ──────────────────────────────────────────────────────────────────────
 def cli_available() -> bool:
-    return shutil.which("claude") is not None
+    """Return True if `claude` is on PATH AND a smoke-test query succeeds.
+
+    v0.2.23 C10: an installed-but-unauthenticated CLI (the `claude`
+    binary exists but the user hasn't logged in / set ANTHROPIC_API_KEY)
+    used to be picked as the backend, then every summary call would
+    fail with an auth error and the script would not retry against
+    Ollama. The smoke-test catches this case at backend-selection
+    time.
+
+    The smoke-test is cheap (~1-2 s with `--max-turns 1` against
+    haiku). Result is cached in `_BACKEND_CACHE["cli_probe_ok"]` so
+    repeated `select_backend()` calls don't re-probe.
+    """
+    if "cli_probe_ok" in _BACKEND_CACHE:
+        return _BACKEND_CACHE["cli_probe_ok"] == "yes"
+    if shutil.which("claude") is None:
+        _BACKEND_CACHE["cli_probe_ok"] = "no"
+        return False
+    # Smoke-test: short prompt, tight timeout. We don't care about the
+    # output content — just that the CLI returns non-empty stdout and
+    # exit 0 (i.e. authenticated and reachable). Failure modes we want
+    # to catch: auth error (returns stderr, exit non-zero), network
+    # offline, model not available for the account, expired token.
+    import subprocess as _sub
+    claude_path = shutil.which("claude")
+    try:
+        result = _sub.run(
+            [claude_path, "-p", "say ok", "--model", "haiku", "--max-turns", "1"],
+            capture_output=True,
+            text=True,
+            timeout=20,  # Generous — first-call cold-start can be slow.
+            env={**os.environ, "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"},
+        )
+        ok = (result.returncode == 0 and bool(result.stdout.strip()))
+    except (_sub.TimeoutExpired, FileNotFoundError, OSError):
+        ok = False
+    _BACKEND_CACHE["cli_probe_ok"] = "yes" if ok else "no"
+    if not ok:
+        log("  KG-summary: claude CLI present but smoke-test failed "
+            "(unauthenticated or unreachable) — falling through")
+    return ok
 
 
 def call_cli(prompt: str) -> str:
@@ -296,30 +363,206 @@ def call_api(prompt: str) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Backend: OpenAI API (v0.2.23 C10 — gated by `kg_summary_openai_consent`)
+# ──────────────────────────────────────────────────────────────────────
+def openai_available() -> bool:
+    """Return True if an `OPENAI_API_KEY` env var is set.
+
+    The actual gating (consent + key) is composed by `select_backend`
+    — this just answers "is a key present at all". The consent check
+    is intentionally a separate step so the log message can distinguish
+    "no key" from "key present but consent withheld" (the latter is
+    actionable; the former just means OpenAI isn't an option).
+    """
+    return bool(os.getenv("OPENAI_API_KEY", "").strip())
+
+
+def _read_app_state_value(key: str) -> "str | None":
+    """Read an app_state row from the launcher SQLite DB.
+
+    Returns the row value as a string, or None when the DB / table /
+    row is absent. Soft-fail on any sqlite error → returns None.
+
+    Path resolution mirrors `vco_lib.paths.vct_root_dir`:
+      1. `$VCT_STATE_DIR/launcher.db` if VCT_STATE_DIR is set
+      2. `~/.vct/launcher.db` otherwise
+
+    We don't pull in vco_lib here so this script stays usable from
+    `templates/scripts/` (i.e. inside per-project installs that don't
+    necessarily have the orchestrator's vco_lib on PYTHONPATH). The
+    path-resolution logic is small enough to inline.
+    """
+    custom = os.environ.get("VCT_STATE_DIR", "").strip()
+    if custom:
+        db_path = Path(custom) / "launcher.db"
+    else:
+        db_path = Path.home() / ".vct" / "launcher.db"
+    if not db_path.is_file():
+        return None
+    try:
+        import sqlite3
+        conn = sqlite3.connect(str(db_path))
+        try:
+            cur = conn.execute(
+                "SELECT value FROM app_state WHERE key = ?", (key,),
+            )
+            row = cur.fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return None
+        return str(row[0]) if row[0] is not None else None
+    except Exception:
+        # Locked DB, missing table, permission denied, corruption —
+        # all treated the same way: row absent → caller picks the
+        # default. This script never breaks the user's workflow.
+        return None
+
+
+def openai_consent_granted() -> bool:
+    """Return True if the user has explicitly opted in to OpenAI summaries.
+
+    Reads `app_state` key `kg_summary_openai_consent`. Truthy values:
+    "true", "1", "yes" (case-insensitive). Anything else (including
+    missing row) means "consent NOT granted".
+    """
+    raw = _read_app_state_value(APP_STATE_KEY_OPENAI_CONSENT)
+    if raw is None:
+        return False
+    return raw.strip().lower() in {"true", "1", "yes"}
+
+
+def _openai_model() -> str:
+    """Resolve the OpenAI model to use.
+
+    Priority: env var (operator override) → app_state row (Preferences
+    GUI selection) → built-in default (`gpt-4o-mini`).
+    """
+    env_override = os.getenv("KG_SUMMARY_OPENAI_MODEL", "").strip()
+    if env_override:
+        return env_override
+    stored = _read_app_state_value(APP_STATE_KEY_OPENAI_MODEL)
+    if stored:
+        return stored
+    return OPENAI_DEFAULT_MODEL
+
+
+def call_openai(prompt: str) -> str:
+    """Call OpenAI chat/completions with the configured summary model.
+
+    Uses the chat-completions endpoint (not the legacy completions
+    one) because every summary-capable OpenAI model (gpt-4o-mini,
+    gpt-4o, gpt-4.1-mini, …) is a chat model. System + user messages
+    are sent in the standard two-turn shape.
+    """
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set")
+    model = _openai_model()
+    payload = json.dumps(
+        {
+            "model": model,
+            "max_tokens": 350,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        OPENAI_API_URL,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    choices = data.get("choices", [])
+    if not choices:
+        raise RuntimeError(f"OpenAI returned no choices: {data}")
+    msg = choices[0].get("message", {})
+    return str(msg.get("content", "")).strip()
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Tier dispatch
 # ──────────────────────────────────────────────────────────────────────
 _BACKEND_CACHE: dict[str, str] = {}
+# Operator override: when --force-api is passed on the CLI we bypass
+# the consent gate for OpenAI. Module-level state because select_backend
+# is called from multiple entry points (generate_description /
+# generate_summary / generate_chunk_summary) per run; threading it
+# through every call would be noisy.
+_FORCE_API = False
 
 
 def select_backend() -> str:
-    """Pick the best backend on first call, cache for subsequent prompts."""
+    """Pick the best backend on first call, cache for subsequent prompts.
+
+    Selection order (v0.2.23 C10):
+      1. `KG_SUMMARY_BACKEND` env override (if valid).
+      2. claude CLI on PATH + smoke-test passes.
+      3. Ollama reachable at OLLAMA_URL.
+      4. OpenAI (requires OPENAI_API_KEY AND consent — either via the
+         launcher Preferences app_state key, or via the `--force-api`
+         operator flag).
+      5. Anthropic API direct (legacy fallback, uses ANTHROPIC_API_KEY).
+      6. Skip — log a friendly line and exit 0 at the call site.
+
+    When the OpenAI path is reachable in principle (key present) but
+    consent has not been granted, the script returns "skip" AND logs
+    a clear "set kg_summary_openai_consent=true in Preferences or use
+    --force-api" message — so the user knows there IS a backend
+    available, it's just gated.
+    """
     if "choice" in _BACKEND_CACHE:
         return _BACKEND_CACHE["choice"]
 
     forced = os.getenv("KG_SUMMARY_BACKEND", "").lower().strip()
-    if forced in {"cli", "ollama", "api", "skip"}:
+    if forced in {"cli", "ollama", "api", "openai", "skip"}:
+        # Consent gate still applies to forced=openai (defense-in-depth:
+        # an env var alone shouldn't bypass user consent; --force-api
+        # is the explicit operator override).
+        if forced == "openai" and not _FORCE_API and not openai_consent_granted():
+            log(
+                "  KG-summary: KG_SUMMARY_BACKEND=openai but consent not "
+                "granted. Set kg_summary_openai_consent=true in launcher "
+                "Preferences → KG Summaries, or pass --force-api. "
+                "Skipping for this run."
+            )
+            _BACKEND_CACHE["choice"] = "skip"
+            return "skip"
         _BACKEND_CACHE["choice"] = forced
         log(f"  KG-summary backend: {forced} (forced via env)")
         return forced
 
     if cli_available():
         _BACKEND_CACHE["choice"] = "cli"
-        log("  KG-summary backend: cli (claude on PATH)")
+        log("  KG-summary backend: cli (claude on PATH, smoke-test OK)")
         return "cli"
     if ollama_available():
         _BACKEND_CACHE["choice"] = "ollama"
         log(f"  KG-summary backend: ollama ({OLLAMA_DEFAULT_MODEL})")
         return "ollama"
+    # OpenAI tier: key present AND (consent granted OR --force-api).
+    if openai_available():
+        if _FORCE_API or openai_consent_granted():
+            _BACKEND_CACHE["choice"] = "openai"
+            log(
+                f"  KG-summary backend: openai ({_openai_model()}) — "
+                f"costs apply per summary"
+            )
+            return "openai"
+        else:
+            log(
+                "  KG-summary: OPENAI_API_KEY is set but consent not "
+                "granted. Set kg_summary_openai_consent=true in launcher "
+                "Preferences → KG Summaries to enable, or pass "
+                "--force-api. Falling through to anthropic / skip."
+            )
     if api_available():
         _BACKEND_CACHE["choice"] = "api"
         log("  KG-summary backend: api (ANTHROPIC_API_KEY) — costs apply")
@@ -328,7 +571,7 @@ def select_backend() -> str:
     _BACKEND_CACHE["choice"] = "skip"
     log(
         "  KG-summary: no backend available (no claude CLI, no Ollama at "
-        f"{OLLAMA_URL}, no ANTHROPIC_API_KEY). Skipping."
+        f"{OLLAMA_URL}, no OPENAI_API_KEY, no ANTHROPIC_API_KEY). Skipping."
     )
     return "skip"
 
@@ -339,6 +582,8 @@ def call_llm(prompt: str) -> str:
         return call_cli(prompt)
     if backend == "ollama":
         return call_ollama(prompt)
+    if backend == "openai":
+        return call_openai(prompt)
     if backend == "api":
         return call_api(prompt)
     raise RuntimeError("no backend available")
@@ -430,7 +675,21 @@ def main():
     parser = argparse.ArgumentParser(description="Generate KG node summaries")
     parser.add_argument("file", help="Path to knowledge .md file")
     parser.add_argument("--force", action="store_true", help="Regenerate even if content unchanged")
+    parser.add_argument(
+        "--force-api", action="store_true",
+        help=(
+            "Bypass the kg_summary_openai_consent gate (operator override). "
+            "Use when scripting from CI or when the launcher Preferences "
+            "GUI is not available."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.force_api:
+        # Module-level flag picked up by select_backend(). The CLI flag
+        # ONLY affects this single run; it doesn't write to app_state.
+        global _FORCE_API
+        _FORCE_API = True
 
     file_path = Path(args.file).resolve()
     if not file_path.exists():

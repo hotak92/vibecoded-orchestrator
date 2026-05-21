@@ -253,12 +253,14 @@ class PowerShellScriptTests(unittest.TestCase):
         body = SCRIPT_PS1.read_text(encoding="utf-8")
         # PR-34 (v0.2.12, Group M): canonical name unified across all
         # surfaces (renamed from VibeCodedTools_KnowledgeGraph in PR-26).
-        # The literal must match vco_lib/project_init.py::_SHARED_KG_NAME
-        # and the cross-language invariant in
-        # tests/test_shared_kg_constant_consistency.py.
-        self.assertIn("VibecodedOrchestrator_KnowledgeGraph", body,
+        # v0.2.23 B1 (2026-05-21) flipped the canonical casing from
+        # lowercase-c back to capital-C "VibeCoded" to match the brand
+        # spelling. The literal must match
+        # vco_lib/project_init.py::_SHARED_KG_NAME and the cross-language
+        # invariant in tests/test_shared_kg_constant_consistency.py.
+        self.assertIn("VibeCodedOrchestrator_KnowledgeGraph", body,
                       "PS script must default SHARED_KG_COLLECTION to "
-                      "VibecodedOrchestrator_KnowledgeGraph (matches "
+                      "VibeCodedOrchestrator_KnowledgeGraph (matches "
                       "project_init derive_project_collection_names)")
 
 

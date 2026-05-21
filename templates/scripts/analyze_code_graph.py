@@ -1341,14 +1341,45 @@ class CodeGraphAnalyzer:
             if isinstance(props, dict) and not props.get("language"):
                 props["language"] = current_lang
 
+        # v0.2.16 docstring (above) claimed ``replace()`` is upsert.
+        # weaviate-client v4.21 actually requires the object to PRE-EXIST
+        # — when called against a UUID that has never been written
+        # (e.g. brand-new collections after a rename / first analysis /
+        # post-cleanup), the call returns 500 "no object with id X"
+        # and `_DedupInsertError` propagates up to mark the file as a
+        # skip. Symptom: a full re-analyze against an empty collection
+        # writes 0 objects with `insert_errors == files_analyzed`.
+        #
+        # v0.2.23 fix: try `replace()` first (canonical upsert path
+        # when the object exists, e.g. incremental re-write of an
+        # already-indexed file). On the "no object with id X" branch,
+        # transparently fall through to `insert()`. Any other error
+        # bubbles up as before. This makes the analyzer correct for
+        # the cold-start / post-rename / post-cleanup repopulate path
+        # WITHOUT changing the behaviour for genuine incremental
+        # re-writes.
         try:
             collection.data.replace(uuid=det_uuid, **insert_params)
         except BaseException as exc:
-            # Wrap into a distinctive exception type so the outer
-            # per-file try/except can attribute the failure to a
-            # write-to-Weaviate problem (vs. a parse / read / regex
-            # issue elsewhere in the analyze_*_file path). bug 0.2.
-            raise _DedupInsertError(exc, collection.name, det_uuid) from exc
+            # Detect Weaviate's "object does not exist" signal. The error
+            # text is stable across v4.x ("no object with id 'X'"); we
+            # match conservatively on substring so a future error-prefix
+            # change (e.g. "no object with uuid") still trips the branch.
+            err_text = str(exc)
+            is_not_found = "no object with id" in err_text or "no object with uuid" in err_text
+            if is_not_found:
+                try:
+                    collection.data.insert(uuid=det_uuid, **insert_params)
+                except BaseException as insert_exc:
+                    raise _DedupInsertError(
+                        insert_exc, collection.name, det_uuid
+                    ) from insert_exc
+            else:
+                # Wrap into a distinctive exception type so the outer
+                # per-file try/except can attribute the failure to a
+                # write-to-Weaviate problem (vs. a parse / read / regex
+                # issue elsewhere in the analyze_*_file path). bug 0.2.
+                raise _DedupInsertError(exc, collection.name, det_uuid) from exc
         # Track for --prune-stale (only populated when caller opted in;
         # see main()'s argparse + analyze_repository's prune logic).
         if self._track_visited:
@@ -4446,15 +4477,22 @@ def main():
                 resolve, HubUnreachable, ResolverError,
             )
             cfg = resolve(repo_path)
-            # `code_graph_project` is the resolver's legacy alias for
-            # the slug; it equals project_codegraph_bindings.collection_prefix
-            # when the binding row exists, or the slug when it doesn't.
-            project_name = cfg.code_graph_project
+            # v0.2.23 field switch: `code_graph_collection_prefix` is the
+            # canonical Weaviate prefix sourced from the launcher's
+            # `project_codegraph_bindings.collection_prefix` row — the
+            # single source of truth for the write target. The previously
+            # used `code_graph_project` is a legacy alias for the slug;
+            # the analyzer's `_sanitize_collection_prefix` re-canonicalised
+            # it and produced a prefix that diverged from the binding row,
+            # silently writing to zombie collections. Always prefer the
+            # explicit prefix field here. See knowledge/concepts/
+            # multi-codebase-code-graph-detection.md for the diagnosis.
+            project_name = cfg.code_graph_collection_prefix
             if not project_name:
                 # Resolver returned an empty prefix; fall back.
                 print(
-                    f"⚠️  resolver returned empty code_graph_project for {repo_path}; "
-                    f"falling back to repo dir name",
+                    f"⚠️  resolver returned empty code_graph_collection_prefix "
+                    f"for {repo_path}; falling back to repo dir name",
                     file=sys.stderr,
                 )
         except (HubUnreachable, ResolverError) as e:

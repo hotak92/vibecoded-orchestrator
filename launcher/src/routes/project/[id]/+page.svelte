@@ -26,6 +26,14 @@
   // The /project/[id]/settings route still exists for direct URLs and
   // delegates to the same component.
   import SettingsTab from '$lib/project-state/SettingsTab.svelte';
+  // v0.2.23 F2 (2026-05-21): when the active project is the
+  // orchestrator-root row, the per-project tab strip surfaces an extra
+  // "Orchestrator core" tab that renders the schema declared in the
+  // repo-root vct-module.json. This consolidates the previously
+  // duplicated "Orchestrator Core" sidebar entry — orchestrator-root
+  // is treated as a special project rather than a separate sidebar
+  // surface. See OrchestratorCoreTab.svelte for the rationale.
+  import OrchestratorCoreTab from '$lib/project-state/OrchestratorCoreTab.svelte';
   import CodeGraphBuildBanner from '$lib/components/CodeGraphBuildBanner.svelte';
   import KgSyncBanner from '$lib/components/KgSyncBanner.svelte';
   import KgSummaryBanner from '$lib/components/KgSummaryBanner.svelte';
@@ -39,7 +47,18 @@
   // thing users see after agent listings; 'access' sits right after
   // 'permissions' (which handles intra-project permissions) so the two
   // permission models live next to each other in the tab strip.
-  let activeTab = $state<'identity' | 'agents' | 'skills' | 'hooks' | 'permissions' | 'access' | 'secrets' | 'kg' | 'settings'>('agents');
+  // v0.2.23 F2 (2026-05-21): added 'orchestrator_core' — visible only
+  // when the active project's host is `orchestrator_root`. Pinned to
+  // the end of the tab strip so it doesn't shift existing tab indices
+  // for muscle-memory users on normal projects.
+  let activeTab = $state<'identity' | 'agents' | 'skills' | 'hooks' | 'permissions' | 'access' | 'secrets' | 'kg' | 'settings' | 'orchestrator_core'>('agents');
+
+  // v0.2.23 F2: the orchestrator-root project is treated as a special
+  // project — same tab template, plus one extra "Orchestrator core"
+  // tab. Normal projects don't see this tab. Derive from `project`
+  // (not the global selectedProject store) so the comparison is
+  // stable while a different project is loading.
+  const isOrchestratorProject = $derived(project?.host === 'orchestrator_root');
 
   // Orchestrator update banner. Loads inspect_orchestrator_at on
   // mount; if version_status === 'outdated' a "Update this project"
@@ -148,7 +167,14 @@
     if (projectId) void loadProject();
   });
 
-  const tabs = [
+  // v0.2.23 F2 (2026-05-21): converted from a static `const tabs` to a
+  // `$derived` so the orchestrator-only "Orchestrator core" tab can be
+  // conditionally appended for the orchestrator-root project. Normal
+  // projects see the original 9 tabs in the same order — the new tab
+  // is pinned to the END so existing muscle-memory tab indices are
+  // preserved.
+  type TabDef = { id: typeof activeTab; label: string };
+  const tabs = $derived<TabDef[]>([
     // PR-8 (v0.2.11): Identity first — it's the project's
     // KG_COLLECTION / CODE_GRAPH_PROJECT identity (the "who am I?" before
     // anything else). Access is the cross-project counterpart to the
@@ -162,7 +188,14 @@
     { id: 'secrets', label: 'Secret refs' },
     { id: 'kg', label: 'KG / Codegraph' },
     { id: 'settings', label: 'Settings' },
-  ] as const;
+    // Orchestrator-root-only tab — pinned to the end. Hosts the
+    // schema-rendered controls from the repo-root vct-module.json
+    // (previously surfaced as a duplicate "Orchestrator Core" sidebar
+    // entry). Suppressed for normal projects.
+    ...(isOrchestratorProject
+      ? [{ id: 'orchestrator_core' as const, label: 'Orchestrator core' }]
+      : []),
+  ]);
 </script>
 
 <div class="project-page">
@@ -303,6 +336,17 @@
            reach the form on a single click. The standalone route is
            still valid and delegates to the same component. -->
       <SettingsTab projectId={project.id} />
+    {:else if activeTab === 'orchestrator_core' && isOrchestratorProject}
+      <!-- v0.2.23 F2 (2026-05-21): the previously-separate "Orchestrator
+           Core" sidebar surface now lives here, as a tab on the
+           orchestrator-root project. Reuses ModuleConfigTab.svelte —
+           the same renderer paid modules go through — so the controls,
+           tooltips, confirm prompts, and Tauri-command wiring stay
+           single-sourced from vct-module.json. The `isOrchestratorProject`
+           guard prevents a stale activeTab=`orchestrator_core` from
+           rendering for a non-orchestrator project (defensive — the
+           tab only ever appears in `tabs` for orchestrator-root). -->
+      <OrchestratorCoreTab />
     {/if}
   </main>
 </div>

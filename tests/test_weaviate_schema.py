@@ -177,7 +177,7 @@ class IsCodeCollectionTests(unittest.TestCase):
     def test_non_code_class_names_do_not_match(self):
         for n in ("MyProject_KnowledgeGraph", "MyProject_Development",
                   "CodeBase",  # substring but doesn't match suffix
-                  "VibecodedOrchestrator_KnowledgeGraph"):
+                  "VibeCodedOrchestrator_KnowledgeGraph"):
             self.assertFalse(ws.is_code_collection(n))
 
 
@@ -444,7 +444,7 @@ class EnumerateTests(unittest.TestCase):
             "SD15_CodeClass",
             "CodeFunction",  # bare name (legacy)
             "Vibecoded_orchestrator_CodeInteraction",
-            "VibecodedOrchestrator_KnowledgeGraph",  # shared KG (canonical)
+            "VibeCodedOrchestrator_KnowledgeGraph",  # shared KG (canonical)
             "Random_OtherCollection",  # unrelated
         ]
         self._patch = mock.patch.object(
@@ -459,7 +459,7 @@ class EnumerateTests(unittest.TestCase):
         self.assertIn("ClaudeOrchestrator_KnowledgeGraph", found)
         self.assertIn("ClaudeOrchestrator_Development", found)
         self.assertIn("SD15_KnowledgeGraph", found)
-        self.assertIn("VibecodedOrchestrator_KnowledgeGraph", found)
+        self.assertIn("VibeCodedOrchestrator_KnowledgeGraph", found)
         # Must NOT include code collections or unrelated names.
         self.assertNotIn("SD15_CodeFunction", found)
         self.assertNotIn("Random_OtherCollection", found)
@@ -471,7 +471,7 @@ class EnumerateTests(unittest.TestCase):
         # Dev is absent in our fixture, so it must NOT appear (filtered out).
         self.assertNotIn("SD15_Development", found)
         # Shared KG always part of per-project triple (if listed).
-        self.assertIn("VibecodedOrchestrator_KnowledgeGraph", found)
+        self.assertIn("VibeCodedOrchestrator_KnowledgeGraph", found)
 
     def test_enumerate_code_all_projects(self):
         found = ws.enumerate_code_collections(project_name=None)

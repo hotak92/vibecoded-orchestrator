@@ -2701,6 +2701,12 @@ def main() -> int:
         # is the consent mechanism).
         if mode == "update":
             _detect_legacy_shared_kg_class(_deferral_report)
+            # v0.2.23 B1 (2026-05-21): case-mismatch self-heal for
+            # `project_kg_bindings` rows. Auto-applied (safe — only
+            # rewrites a binding row whose target class ALREADY EXISTS
+            # in Weaviate by a different casing). Emits an informational
+            # deferral entry per heal so the user sees what we changed.
+            _self_heal_kg_bindings_on_update(_deferral_report)
     else:
         print("\n[skip] Container services (--no-containers)")
         print("[skip] Weaviate seeding (--no-containers)")
@@ -3774,47 +3780,336 @@ def _probe_system_ram_gb() -> float:
     return 0.0
 
 
-# Inference model tier ladder for install-time pulls.
+# Inference model pull list for install-time.
 #
-# This MIRRORS the runtime selector ladder in
-#   claude_mcp_servers/ollama_mcp/server.py:TEXT_MODEL_TIERS
-# Do not let them drift — the runtime selector picks from what we pull
-# here, so a thresholds mismatch leads to "auto" picking a model that
-# isn't installed and falling back unexpectedly.
+# v0.2.23 C10 consolidation (2026-05-21): this function now DERIVES its
+# pull list from `select_summary_backend()` rather than maintaining its
+# own VRAM/RAM ladder. Pre-consolidation, two separate ladders drifted
+# (this one used `vram >= 7.5/5.0/1.0` and `ram >= 24/12`; the runtime
+# summary selector used `vram >= 16/6` and `ram >= 12 AND cores >= 6`)
+# meaning some hosts pulled qwen3.5:9b at 8 GB VRAM but the runtime
+# selector picked gemma — wasted bandwidth + disk.
 #
-# Ladder (matches runtime exactly as of 2026-04-29):
-#   GPU + VRAM >= 7.5 GB         → qwen3.5:9b + gemma4:e4b + qwen3.5:0.8b
-#   GPU + VRAM >= 5.0 GB         → gemma4:e4b + qwen3.5:0.8b
-#   GPU + VRAM >= 1.0 GB         → qwen3.5:0.8b
-#   no GPU + RAM >= 24 GB        → qwen3.5:9b + gemma4:e4b + qwen3.5:0.8b
-#   no GPU + RAM >= 12 GB        → gemma4:e4b + qwen3.5:0.8b
-#   else (incl. probe failures)  → qwen3.5:0.8b  (always-fits floor)
+# Now the pull list ALWAYS matches what `select_summary_backend()` would
+# pick locally, with `qwen3.5:0.8b` as the universal floor for any
+# inference need. The legacy ollama_mcp/server.py was removed in v0.2.11;
+# the runtime selector now lives in `templates/scripts/generate-kg-summary.py`
+# (which also calls `select_summary_backend` via the consolidated path).
 def _inference_models_for_capability(sysinfo: SystemInfo) -> list[str]:
     """Return inference models to pull given detected capability.
 
-    Returns at minimum ["qwen3.5:0.8b"] — the floor that fits down to 4 GB
-    RAM. Larger tiers are added only when the host can actually run them.
-    """
-    floor = ["qwen3.5:0.8b"]
-    has_gpu = bool(sysinfo.has_gpu)
-    vram = float(sysinfo.vram_gb or 0.0)
-    ram = float(sysinfo.ram_gb or 0.0)
+    v0.2.23 C10 consolidation: this function used to maintain its OWN
+    VRAM/RAM thresholds (vram >= 7.5 / 5.0 / 1.0; ram >= 24.0 / 12.0)
+    that DIVERGED from `select_summary_backend`'s thresholds (vram >=
+    16.0 / 6.0; ram >= 12.0 AND cores >= 6). The drift meant some hosts
+    pulled models they'd never use (qwen3.5:9b pulled at 8 GB VRAM but
+    runtime selector picks gemma) — wasted bandwidth + disk. The pull
+    list now derives from the SAME selector that runtime uses, so the
+    set of pulled models always matches the set runtime can pick.
 
-    if has_gpu and vram >= 7.5:
-        return ["qwen3.5:9b", "gemma4:e4b", "qwen3.5:0.8b"]
-    if has_gpu and vram >= 5.0:
-        return ["gemma4:e4b", "qwen3.5:0.8b"]
-    if has_gpu and vram >= 1.0:
-        # Tiny GPU (<5 GB VRAM, e.g. older laptop dGPU) — trust GPU
-        # presence but only pull the floor model. Anything larger
-        # would OOM at runtime.
-        return floor
-    # CPU-only paths — RAM-driven.
-    if ram >= 24.0:
-        return ["qwen3.5:9b", "gemma4:e4b", "qwen3.5:0.8b"]
-    if ram >= 12.0:
-        return ["gemma4:e4b", "qwen3.5:0.8b"]
-    return floor
+    Returns at minimum ["qwen3.5:0.8b"] — the floor model that fits down
+    to 4 GB RAM and is the universal fallback for any inference need.
+    The summary-backend's pick is added when it's a local Ollama model
+    (qwen3.5:9b / gemma4:e4b). For "cli" / "openai" / None picks, only
+    the floor is pulled — no local-summary model needed.
+    """
+    floor = "qwen3.5:0.8b"
+    cores = _probe_cpu_cores()
+    summary_pick = select_summary_backend(
+        gpu_vram_gb=float(sysinfo.vram_gb or 0.0),
+        ram_gb=float(sysinfo.ram_gb or 0.0),
+        cores=cores,
+        # `claude_cli_available=False` for the pull-list derivation:
+        # even when the CLI is available, the runtime falls back to
+        # local models if the CLI fails mid-summary, so we still want
+        # the highest-tier local model available on disk as a safety
+        # net. Passing False here gives us the local-model pick that
+        # runtime WOULD use if CLI fell through.
+        claude_cli_available=False,
+        # `openai_consent=False` / `openai_key_available=False`: the
+        # same reasoning — when local hardware is the fallback, we
+        # need it pulled regardless of OpenAI availability.
+        openai_consent=False,
+        openai_key_available=False,
+    )
+    # Map the summary-backend ID back to its Ollama tag. CLI / OpenAI /
+    # None don't add to the pull list.
+    if summary_pick == _SUMMARY_BACKEND_QWEN35_9B:
+        return ["qwen3.5:9b", "gemma4:e4b", floor]
+    if summary_pick == _SUMMARY_BACKEND_GEMMA:
+        return ["gemma4:e4b", floor]
+    # summary_pick is None (no local viable) OR "cli" / "openai" (no
+    # local needed for the primary path; floor still pulled as the
+    # safety net for any other inference need).
+    return [floor]
+
+
+# ---------------------------------------------------------------------------
+# v0.2.23 C10 — hardware-aware backend selectors
+#
+# Three pure decision functions that map detected hardware (VRAM, RAM,
+# CPU cores) + capability flags (OpenAI key available, Claude CLI
+# present, user consent) onto a concrete backend choice. These are the
+# canonical selectors invoked by `_choose_embedding_config` and by the
+# KG-summary generator. They MUST be pure — no side effects, no probes —
+# so the tier-boundary regression tests (tests/test_hardware_auto_selection.py)
+# can sweep the parameter space without needing to mock subprocess /
+# psutil / nvidia-smi calls.
+#
+# Tier boundaries are INCLUSIVE on the lower bound (`vram >= 12` means
+# "12 GB exactly qualifies for the 12+ GB tier"). The spec uses "12+",
+# "8+", "6+", "24+" phrasing → ">=" semantics are the natural reading.
+#
+# Spec source: 2026-05-21 user spec (v0.2.23 C10). See
+# `knowledge/concepts/hardware-tiered-backend-selection.md` for the
+# rationale on why each model lands on each tier.
+# ---------------------------------------------------------------------------
+
+# Backend ID constants. These are the strings persisted into the
+# launcher's `app_state` defaults + .env writes, so they must match what
+# the rest of the codebase already understands (see EMBEDDING_CONFIGS
+# entries above — the IDs here are the union of `code_model` and
+# `text_model` fields across the GPU / CPU / OpenAI / low_resource
+# profiles).
+_CODE_BACKEND_CODESAGE = "codesage-large-v2"
+_CODE_BACKEND_QWEN3 = "qwen3-embedding:0.6b"
+_CODE_BACKEND_JINA = "unclemusclez/jina-embeddings-v2-base-code:latest"
+_CODE_BACKEND_OPENAI = "openai-text-embedding-3-small"
+
+_KG_BACKEND_QWEN3 = "qwen3-embedding:0.6b"
+_KG_BACKEND_ARCTIC = "snowflake-arctic-embed2:latest"
+_KG_BACKEND_OPENAI = "openai-text-embedding-3-small"
+
+_SUMMARY_BACKEND_CLI = "cli"           # claude CLI (Max subscription / API key)
+_SUMMARY_BACKEND_QWEN35_9B = "qwen3.5:9b"
+_SUMMARY_BACKEND_GEMMA = "gemma4:e4b"
+_SUMMARY_BACKEND_OPENAI = "openai"     # routes via API tier with consent gate
+
+
+def select_code_embedding_backend(
+    gpu_vram_gb: float,
+    ram_gb: float,
+    cores: int,
+    openai_key_available: bool,
+    prefer_openai: bool = False,
+) -> str:
+    """Pick a code-embedding backend ID for the detected hardware.
+
+    Spec (2026-05-21):
+      GPU:
+        - VRAM >= 12 GB → CodeSage-Large-v2
+        - VRAM >=  6 GB → qwen3-embedding (1024-dim, generalist)
+        - VRAM >   2 GB → Jina v2 base-code (768-dim, code-specialised)
+        - else / no GPU → CPU path
+      CPU (only reached when GPU path lands below "Jina via Ollama"):
+        - RAM >= 24 GB AND cores >= 8 → qwen3-embedding
+        - else → Jina
+      OpenAI: optional override (caller passes prefer_openai=True), not
+              auto-selected — it costs money per embedding.
+
+    The ">" (strict) on the 2 GB GPU boundary is deliberate: a 2 GB card
+    is below CodeSage's working set AND below Jina's comfortable RAM
+    target, so it falls into the CPU bucket. >2 GB means "anything
+    above 2 GB", e.g. a 4 GB card.
+
+    Args:
+        gpu_vram_gb: Detected VRAM (GB). 0.0 means "no usable GPU".
+        ram_gb:      System RAM (GB).
+        cores:       Logical CPU cores (psutil.cpu_count(logical=True)).
+        openai_key_available: True if an OpenAI API key is configured
+            (either via `--openai-key` or via the secrets system). Does
+            NOT auto-pick OpenAI — only enables it as an explicit choice.
+        prefer_openai: True when the caller (`--openai-key` flag, or
+            the GUI's "use OpenAI for code embeddings" toggle) wants
+            OpenAI even on capable hardware.
+
+    Returns:
+        One of the `_CODE_BACKEND_*` constants. Always returns
+        something — there is no "None" path for code embeddings (every
+        host can run Jina via Ollama as a floor).
+    """
+    if prefer_openai and openai_key_available:
+        return _CODE_BACKEND_OPENAI
+
+    vram = float(gpu_vram_gb or 0.0)
+    ram = float(ram_gb or 0.0)
+    cpu_cores = int(cores or 0)
+
+    if vram >= 12.0:
+        return _CODE_BACKEND_CODESAGE
+    if vram >= 6.0:
+        return _CODE_BACKEND_QWEN3
+    if vram > 2.0:
+        return _CODE_BACKEND_JINA
+
+    # CPU path: VRAM <= 2 GB OR no GPU at all.
+    if ram >= 24.0 and cpu_cores >= 8:
+        return _CODE_BACKEND_QWEN3
+    return _CODE_BACKEND_JINA
+
+
+def select_kg_embedding_backend(
+    gpu_vram_gb: float,
+    ram_gb: float,
+    cores: int,
+    openai_key_available: bool,
+    prefer_openai: bool = False,
+) -> str:
+    """Pick a KG / text-embedding backend ID for the detected hardware.
+
+    Spec (2026-05-21):
+      GPU:
+        - VRAM >= 8 GB → qwen3-embedding (1024-dim, our default)
+        - VRAM <  8 GB → snowflake-arctic-embed2 (1024-dim, smaller
+          working set — still 1024-dim so the schema slot is identical)
+        - VRAM <  4 GB OR unsupported → CPU path
+      CPU:
+        - RAM >= 24 GB AND cores >= 8 → qwen3-embedding
+        - else → arctic2
+      OpenAI: optional, not auto-selected.
+
+    The 4 GB lower bound is implicit: any GPU with <4 GB VRAM is below
+    qwen3-embedding's safe working set, so we drop to the CPU path
+    (where arctic2 is the small-footprint default). Cards in the 4-8 GB
+    band still benefit from GPU acceleration when running arctic2.
+
+    Args:
+        gpu_vram_gb: Detected VRAM (GB). 0.0 means "no usable GPU".
+        ram_gb:      System RAM (GB).
+        cores:       Logical CPU cores.
+        openai_key_available: True if an OpenAI API key is configured.
+        prefer_openai: True when the caller wants OpenAI explicitly.
+
+    Returns:
+        One of the `_KG_BACKEND_*` constants.
+    """
+    if prefer_openai and openai_key_available:
+        return _KG_BACKEND_OPENAI
+
+    vram = float(gpu_vram_gb or 0.0)
+    ram = float(ram_gb or 0.0)
+    cpu_cores = int(cores or 0)
+
+    if vram >= 8.0:
+        return _KG_BACKEND_QWEN3
+    if vram >= 4.0:
+        # Mid-range GPU: arctic2 runs comfortably without crowding the
+        # GPU when other models also need to load (code embedder,
+        # summary inference). Same 1024-dim slot as qwen3 → no schema
+        # change needed.
+        return _KG_BACKEND_ARCTIC
+
+    # CPU path (or sub-4-GB GPU treated as CPU here).
+    if ram >= 24.0 and cpu_cores >= 8:
+        return _KG_BACKEND_QWEN3
+    return _KG_BACKEND_ARCTIC
+
+
+def select_summary_backend(
+    gpu_vram_gb: float,
+    ram_gb: float,
+    cores: int,
+    claude_cli_available: bool,
+    openai_consent: bool,
+    openai_key_available: bool = False,
+) -> "str | None":
+    """Pick a KG-summary generation backend, or None if no path is viable.
+
+    Spec (2026-05-21):
+      claude CLI present (AND authenticated) → ALWAYS use it (highest
+        quality, costs come out of the user's Max subscription).
+      GPU:
+        - VRAM >= 16 GB → qwen3.5:9b
+        - VRAM >=  6 GB → gemma4:e4b
+        - else → CPU path
+      CPU:
+        - RAM >= 12 GB AND cores >= 6 → gemma4:e4b
+        - else → no local model viable
+      OpenAI: gated on `openai_consent` (default OFF — the user has
+        to explicitly opt in via Preferences). When opted in AND a key
+        is configured, returns "openai" so the caller can route to the
+        cheapest summary-capable model.
+
+    Returns None when:
+      - no claude CLI, AND
+      - hardware can't run gemma4:e4b (sub-12 GB RAM or <6 cores AND
+        no GPU >= 6 GB VRAM), AND
+      - either no OpenAI consent OR no OpenAI key.
+
+    The None case is NOT an error — install.py should record a
+    `kg_summary_no_backend` deferral entry and continue. The KG
+    summariser script silently no-ops on None, leaving raw KG content
+    in place (search still works, just without LLM-polished
+    descriptions / chunk summaries).
+
+    Args:
+        gpu_vram_gb: Detected VRAM (GB).
+        ram_gb:      System RAM (GB).
+        cores:       Logical CPU cores.
+        claude_cli_available: True if `claude` is on PATH and
+            authenticated (caller is responsible for verifying with a
+            cheap smoke test; this selector takes the boolean at face
+            value).
+        openai_consent: True when the user has explicitly opted in
+            (`app_state` key `kg_summary_openai_consent=true`).
+        openai_key_available: True if an OpenAI key is configured in
+            secrets. Combined with `openai_consent` to gate the OpenAI
+            path.
+
+    Returns:
+        Backend ID string, or None when nothing viable is available.
+        Possible strings: "cli", "qwen3.5:9b", "gemma4:e4b", "openai".
+    """
+    # CLI always wins when available — best quality, no local resource
+    # cost, paid out of the user's subscription.
+    if claude_cli_available:
+        return _SUMMARY_BACKEND_CLI
+
+    vram = float(gpu_vram_gb or 0.0)
+    ram = float(ram_gb or 0.0)
+    cpu_cores = int(cores or 0)
+
+    # GPU tiers.
+    if vram >= 16.0:
+        return _SUMMARY_BACKEND_QWEN35_9B
+    if vram >= 6.0:
+        return _SUMMARY_BACKEND_GEMMA
+
+    # CPU tier (only when GPU is sub-6 GB or absent).
+    if ram >= 12.0 and cpu_cores >= 6:
+        return _SUMMARY_BACKEND_GEMMA
+
+    # No local path viable. Last resort: OpenAI, only if the user
+    # explicitly consented AND a key is available.
+    if openai_consent and openai_key_available:
+        return _SUMMARY_BACKEND_OPENAI
+
+    return None
+
+
+def _probe_cpu_cores() -> int:
+    """Best-effort logical CPU-core count, cross-OS.
+
+    Prefers `psutil.cpu_count(logical=True)` (most portable, handles
+    cgroup limits on Linux containers). Falls back to `os.cpu_count()`.
+    Returns 0 on any probe failure — the selectors treat 0 as "low-end
+    CPU" (drops to the smaller-model tier), which is the conservative
+    direction (better to under-spec than over-promise).
+    """
+    try:
+        import psutil  # type: ignore
+        n = psutil.cpu_count(logical=True)
+        if n and n > 0:
+            return int(n)
+    except ImportError:
+        pass
+    except Exception:
+        return 0
+    try:
+        n = os.cpu_count()
+        return int(n) if n and n > 0 else 0
+    except Exception:
+        return 0
 
 
 def _lspci_has_vendor(vendor_substr: str) -> bool:
@@ -4802,6 +5097,15 @@ def _choose_embedding_config(sysinfo: SystemInfo, args: argparse.Namespace) -> d
     # re-detecting GPU. Detection is normally fine but on machines
     # where nvidia-smi flapped or Ollama was unreachable at first
     # install, the user already picked a mode they want to stick.
+    #
+    # v0.2.23 C10 (2026-05-21): the auto-detection branch now consults
+    # the three hardware-aware selectors (select_code_embedding_backend
+    # / select_kg_embedding_backend / select_summary_backend) to pick
+    # the right *profile* AND, when the profile's stock model isn't
+    # the per-tier optimum, augment the returned dict with `text_model`
+    # / `code_model` overrides. The explicit-opt-in branches (--openai,
+    # --low-resource, --cpu-only) bypass the selectors entirely — the
+    # user has stated a preference and we honour it byte-for-byte.
     if args.openai_key:
         config = dict(EMBEDDING_CONFIGS["openai"])
         config["openai_key"] = args.openai_key
@@ -4831,14 +5135,63 @@ def _choose_embedding_config(sysinfo: SystemInfo, args: argparse.Namespace) -> d
             )
             return config
 
-    # Auto-detection: GPU → gpu config, otherwise cpu (qwen3 for both).
-    if sysinfo.has_gpu:
-        _record_install_choice("embedding_mode", "gpu",
-                               {"reason": "auto-detected GPU"})
-        return dict(EMBEDDING_CONFIGS["gpu"])
-    _record_install_choice("embedding_mode", "cpu",
-                           {"reason": "auto-detected no GPU"})
-    return dict(EMBEDDING_CONFIGS["cpu"])
+    # Auto-detection — v0.2.23 C10 tier-aware path.
+    cores = _probe_cpu_cores()
+    vram = float(sysinfo.vram_gb or 0.0)
+    ram = float(sysinfo.ram_gb or 0.0)
+    has_gpu = bool(sysinfo.has_gpu)
+
+    code_pick = select_code_embedding_backend(
+        gpu_vram_gb=vram,
+        ram_gb=ram,
+        cores=cores,
+        openai_key_available=False,  # auto-detect never picks OpenAI
+        prefer_openai=False,
+    )
+    kg_pick = select_kg_embedding_backend(
+        gpu_vram_gb=vram,
+        ram_gb=ram,
+        cores=cores,
+        openai_key_available=False,
+        prefer_openai=False,
+    )
+
+    # Map the per-tier picks back to a profile + overrides. The profile
+    # determines the shape (active_embedding slot + which Ollama models
+    # land in the pull list); the overrides surgically swap in the
+    # tier-correct model when the profile's stock pick doesn't match.
+    if has_gpu and code_pick == _CODE_BACKEND_CODESAGE:
+        # Workstation-class GPU — gpu profile is the natural fit.
+        profile_key = "gpu"
+        reason = (f"auto-detected GPU (VRAM={vram:.1f} GB, RAM={ram:.1f} GB, "
+                  f"cores={cores})")
+    elif kg_pick == _KG_BACKEND_ARCTIC:
+        # Mid- / low-resource path: arctic2 was selected for KG. The
+        # low_resource profile already pairs arctic + Jina, which
+        # matches the spec for this tier exactly.
+        profile_key = "low_resource"
+        reason = (f"auto-selected low_resource tier (VRAM={vram:.1f} GB, "
+                  f"RAM={ram:.1f} GB, cores={cores})")
+    else:
+        # Capable CPU-only or sub-12 GB GPU: cpu profile (qwen3 + Jina).
+        profile_key = "cpu"
+        reason = (f"auto-selected cpu profile (VRAM={vram:.1f} GB, "
+                  f"RAM={ram:.1f} GB, cores={cores})")
+
+    config = dict(EMBEDDING_CONFIGS[profile_key])
+
+    # Surgical overrides when the selector disagrees with the stock
+    # profile model. Today this only happens on the GPU profile's
+    # text-embedding tier (sub-8-GB GPU can hit gpu code path via
+    # CodeSage but should still use arctic for KG) — but expressing it
+    # as a general override keeps future tier additions cheap.
+    if config.get("code_model") != code_pick:
+        config["code_model"] = code_pick
+    if config.get("text_model") != kg_pick:
+        config["text_model"] = kg_pick
+
+    _record_install_choice("embedding_mode", profile_key, {"reason": reason})
+    return config
 
 
 # ---------------------------------------------------------------------------
@@ -5573,10 +5926,12 @@ def _probe_service_identity(name: str, port: int) -> tuple[str, str]:
     Heuristic per service:
       - weaviate: GET /v1/.well-known/ready; if 200, GET /v1/schema and
         look for our canonical collections (KnowledgeGraph,
-        VibecodedOrchestrator_KnowledgeGraph — and the legacy
-        VibeCodedTools_KnowledgeGraph for pre-v0.2.12 PR-26 installs).
-        Either present ⇒ vct-managed. Empty schema + no services.toml
-        record ⇒ foreign (we don't claim bare instances).
+        VibeCodedOrchestrator_KnowledgeGraph — the v0.2.23 B1 capital-C
+        casing, plus the lowercase-c v0.2.12–v0.2.22 variant
+        VibecodedOrchestrator_KnowledgeGraph, plus the pre-v0.2.12 PR-26
+        legacy VibeCodedTools_KnowledgeGraph). Any present ⇒ vct-managed.
+        Empty schema + no services.toml record ⇒ foreign (we don't claim
+        bare instances).
       - ollama: GET /api/tags; if 200, look for our pinned embedding model
         (qwen3-embedding:0.6b OR snowflake-arctic-embed2:latest) AS WELL AS
         the services.toml record. Either signal present ⇒ vct-managed.
@@ -5632,14 +5987,20 @@ def _probe_service_identity(name: str, port: int) -> tuple[str, str]:
             #    `_CodeFunction` / `_CodeClass` / `_CodeModule` suffixes
             #    are ours by construction and don't appear in foreign
             #    Weaviates.
-            # Legacy-detection: both the canonical post-v0.2.12 PR-26 name
-            # AND the pre-rename "VibeCodedTools_KnowledgeGraph" are
-            # markers of a vct-managed Weaviate (the rename was metadata-only —
-            # pre-rename installs still have the old class on disk until the
-            # user runs the launcher's shared-KG picker).
+            # Legacy-detection: the canonical post-v0.2.23-B1 capital-C name,
+            # the lowercase-c v0.2.12–v0.2.22 variant, AND the pre-v0.2.12
+            # "VibeCodedTools_KnowledgeGraph" are markers of a vct-managed
+            # Weaviate (the v0.2.23 B1 case-flip is the canonical-name change
+            # only — install.py's case-insensitive adoption keeps the on-disk
+            # class unchanged so pre-flip installs still have the lowercase-c
+            # class on disk; same applies to pre-v0.2.12 installs with the
+            # VibeCodedTools name).
             exact_markers = {"KnowledgeGraph",
+                             "VibeCodedOrchestrator_KnowledgeGraph",
+                             # v0.2.12–v0.2.22 lowercase-c variant.
                              "VibecodedOrchestrator_KnowledgeGraph",
-                             "VibeCodedTools_KnowledgeGraph",  # legacy-detection
+                             # Pre-v0.2.12 name (PR-26 rename predecessor).
+                             "VibeCodedTools_KnowledgeGraph",
                              "Development", "CodeFunction", "CodeClass",
                              "CodeModule", "CodeAPI", "CodeInteraction"}
             # `_conversations` is a legacy marker (collection deprecated
@@ -6743,13 +7104,16 @@ def _ensure_collections(embed_config: dict,
         dev_name = _derive_project_dev_name(PROJECT_ROOT)
 
     # Cross-project shared KG. All vibecoded installs read from the same shared
-    # collection name (default "VibecodedOrchestrator_KnowledgeGraph" since
-    # v0.2.12 PR-26 / Group E — was "VibeCodedTools_KnowledgeGraph" pre-rename);
-    # the projects only differ in their per-project KG. Bootstrapped once per
-    # Weaviate instance — re-runs are no-ops thanks to the existing-class
-    # detection.
+    # collection name (default "VibeCodedOrchestrator_KnowledgeGraph" since
+    # v0.2.23 B1 — was lowercase-c "VibecodedOrchestrator_KnowledgeGraph"
+    # v0.2.12–v0.2.22, itself renamed from "VibeCodedTools_KnowledgeGraph"
+    # pre-v0.2.12); the projects only differ in their per-project KG.
+    # Bootstrapped once per Weaviate instance — re-runs are no-ops thanks
+    # to the existing-class detection (which is case-insensitive since
+    # v0.2.23 B1, so the lowercase-c class on existing installs is adopted
+    # in place without recreate).
     shared_name = os.environ.get(
-        "SHARED_KG_COLLECTION", "VibecodedOrchestrator_KnowledgeGraph"
+        "SHARED_KG_COLLECTION", "VibeCodedOrchestrator_KnowledgeGraph"
     ) or ""
 
     print(f"[7b/10] Checking Weaviate collections at {weaviate_url} "
@@ -6780,6 +7144,60 @@ def _ensure_collections(embed_config: dict,
         if isinstance(c, dict) and c.get("class")
     }
 
+    # v0.2.23 B1 (2026-05-21): case-insensitive adoption.
+    #
+    # Weaviate class names are case-SENSITIVE at the storage layer, so a
+    # naive strict-equality check would treat the v0.2.12–v0.2.22
+    # lowercase-c "VibecodedOrchestrator_KnowledgeGraph" class as MISSING
+    # when the new canonical default is capital-C
+    # "VibeCodedOrchestrator_KnowledgeGraph" — and would attempt to CREATE
+    # the capital-C variant alongside it, leaving the user with two
+    # divergent shared-KG classes (a regression of the same shape the
+    # PR-26 rename introduced when it landed without case-insensitive
+    # lookup).
+    #
+    # Strategy: build a `lower(name) -> actual_name` map of every
+    # existing class, then look up each required collection by its
+    # lowercased name. When a case-different sibling is found, rebind
+    # the required name to the live class so:
+    #   (a) we DON'T POST a new schema (idempotent w.r.t. casing),
+    #   (b) downstream env-write paths see the on-disk casing (so the
+    #       per-project binding row in launcher.db points at what
+    #       actually exists, not what _we_ thought we'd create),
+    #   (c) the `--update` self-heal step (`_self_heal_kg_bindings_on_update`
+    #       below) auto-resolves any pre-flip binding rows.
+    #
+    # The lowercase-c → capital-C transition is the one this fix targets,
+    # but the logic is generic: any future case-mismatch on any of the
+    # three required collections (per-project KG, per-project Dev, shared
+    # KG) will adopt the on-disk casing rather than recreate.
+    existing_by_lower: dict[str, str] = {
+        name.lower(): name for name in existing if name
+    }
+
+    def _find_existing_case_insensitive(name: str) -> str | None:
+        """Return the actual-case existing class name when *name* matches
+        case-insensitively, or None when no class exists by that lowered key.
+        """
+        return existing_by_lower.get(name.lower())
+
+    # Resolve each required name to its on-disk casing (when present).
+    # `case_rebinds` tracks names that changed casing during resolution so
+    # we can announce them differently in adopt-mode (D21 prompt-phrasing).
+    case_rebinds: list[tuple[str, str]] = []  # (requested, adopted)
+
+    def _resolve_existing_casing(name: str) -> str:
+        actual = _find_existing_case_insensitive(name)
+        if actual is not None and actual != name:
+            case_rebinds.append((name, actual))
+            return actual
+        return name
+
+    kg_name = _resolve_existing_casing(kg_name)
+    dev_name = _resolve_existing_casing(dev_name)
+    if shared_name:
+        shared_name = _resolve_existing_casing(shared_name)
+
     # Note: we deliberately do NOT auto-adopt existing cross-project KGs
     # (e.g. `ClaudeKnowledgeGraph` from another install). The orchestrator
     # runs an orphan-prune sync cycle that would delete entries whose
@@ -6789,6 +7207,8 @@ def _ensure_collections(embed_config: dict,
 
     # Propagate resolved names back to env so .env / settings.json pick
     # them up. This is the tri-write source of truth for downstream steps.
+    # CRUCIAL: after case-rebind above, these env values carry the on-disk
+    # casing so .env writes and binding rows match what Weaviate actually has.
     os.environ["KG_COLLECTION"] = kg_name
     os.environ["DEVELOPMENT_COLLECTION"] = dev_name
     if shared_name:
@@ -6816,15 +7236,26 @@ def _ensure_collections(embed_config: dict,
     # the false assumption that one Development class served all
     # projects, which left vco's docs unseeded (Step 7c then exited 1).
 
+    # `existing` is the schema-snapshot set; after case-rebind every
+    # `required` name uses the on-disk casing so strict equality below
+    # still works (the rebind happens BEFORE this comparison).
     missing = [(n, b) for (n, b) in required if n not in existing]
     skipped_existing = [n for (n, _) in required if n in existing]
     if not missing:
-        print(f"  All collections present (reusing {len(required)} shared classes).")
+        if case_rebinds:
+            print(f"  All collections present (case-adopted "
+                  f"{len(case_rebinds)} class(es): "
+                  f"{', '.join(f'{r}→{a}' for r, a in case_rebinds)}).")
+        else:
+            print(f"  All collections present (reusing {len(required)} shared classes).")
         _log_install_event(
             "7b/10", "ok",
             "all required collections already present",
             data={"existing": skipped_existing,
-                  "kg": kg_name, "dev": dev_name, "shared": shared_name},
+                  "kg": kg_name, "dev": dev_name, "shared": shared_name,
+                  "case_rebinds": [
+                      {"requested": r, "adopted": a} for r, a in case_rebinds
+                  ]},
         )
         return
 
@@ -6836,10 +7267,36 @@ def _ensure_collections(embed_config: dict,
               f"{', '.join(sorted(list(existing))[:6])}"
               + (" ..." if len(existing) > 6 else ""))
         if skipped_existing:
-            print(f"  Will SKIP (already present): "
-                  f"{', '.join(skipped_existing)}")
-        print(f"  Will CREATE in adopted Weaviate: "
-              f"{', '.join(n for (n, _) in missing)}")
+            # Split skipped into pure-case-adopted (case-rebind sibling
+            # was found) and exact-match (already present, unchanged).
+            # The case-adopted ones get the more informative "ADOPT
+            # (case-different)" phrasing.
+            rebind_targets = {a for _, a in case_rebinds}
+            adopted_case_different = [
+                n for n in skipped_existing if n in rebind_targets
+            ]
+            adopted_exact = [
+                n for n in skipped_existing if n not in rebind_targets
+            ]
+            if adopted_exact:
+                print(f"  Will SKIP (already present): "
+                      f"{', '.join(adopted_exact)}")
+            if adopted_case_different:
+                # For each case-rebind, find the original requested name
+                # so the user sees what casing we asked for vs what's
+                # on disk.
+                pairs = [(req, adp) for req, adp in case_rebinds
+                         if adp in adopted_case_different]
+                pair_strs = [
+                    f"`{adp}` (requested `{req}`)" for req, adp in pairs
+                ]
+                print(f"  Will ADOPT (existing case-different class): "
+                      f"{', '.join(pair_strs)}")
+        if missing:
+            print(f"  Will CREATE: "
+                  f"{', '.join(n for (n, _) in missing)}"
+                  + (" (no case-variant found)"
+                     if not case_rebinds and not skipped_existing else ""))
         interactive = (
             args is not None
             and not getattr(args, "yes", False)
@@ -7118,10 +7575,12 @@ def _seed_weaviate(args: argparse.Namespace) -> None:
     #
     # Re-runs sync_knowledge_graph.py against the SHARED collection so
     # vibecoded-orchestrator/knowledge/ is also persisted into
-    # VibecodedOrchestrator_KnowledgeGraph (renamed from
-    # VibeCodedTools_KnowledgeGraph in v0.2.12 PR-26 / Group E). All projects
-    # on this machine then read from this shared collection in addition to
-    # their per-project KG (see weaviate_mcp/server.py: SHARED_KG_COLLECTION).
+    # VibeCodedOrchestrator_KnowledgeGraph (since v0.2.23 B1; was lowercase-c
+    # VibecodedOrchestrator_KnowledgeGraph v0.2.12–v0.2.22, itself renamed
+    # from VibeCodedTools_KnowledgeGraph in v0.2.12 PR-26 / Group E). All
+    # projects on this machine then read from this shared collection in
+    # addition to their per-project KG (see weaviate_mcp/server.py:
+    # SHARED_KG_COLLECTION).
     #
     # Idempotency: sync_knowledge_graph.py upserts per file (delete+insert
     # by file_path), so re-running on unchanged content yields the same
@@ -7137,7 +7596,7 @@ def _seed_weaviate(args: argparse.Namespace) -> None:
         or os.environ.get("SHARED_KG_OPT_OUT", "")
     ).lower() in ("1", "true", "yes")
     shared_collection = os.environ.get(
-        "SHARED_KG_COLLECTION", "VibecodedOrchestrator_KnowledgeGraph"
+        "SHARED_KG_COLLECTION", "VibeCodedOrchestrator_KnowledgeGraph"
     )
     if shared_write_disabled:
         print("  → shared KG seed: skipped (SHARED_KG_WRITE_DISABLED=true)")
@@ -7369,12 +7828,19 @@ def _detect_legacy_shared_kg_class(deferral_report: "DeferralReport") -> None:
 
     classes = {c.get("class", "") for c in schema.get("classes", [])}
     legacy_name = "VibeCodedTools_KnowledgeGraph"
-    canonical_name = "VibecodedOrchestrator_KnowledgeGraph"
+    canonical_name = "VibeCodedOrchestrator_KnowledgeGraph"
+    # v0.2.23 B1: also recognise the lowercase-c v0.2.12–v0.2.22 default
+    # as "canonical-present" (case-insensitive) so a user upgrading from
+    # that range doesn't get a spurious "canonical not yet created"
+    # message when their on-disk class is the lowercase-c variant.
+    legacy_lowercase_c = "VibecodedOrchestrator_KnowledgeGraph"
 
     if legacy_name not in classes:
         return  # No legacy class — nothing to migrate.
 
-    canonical_present = canonical_name in classes
+    canonical_present = (
+        canonical_name in classes or legacy_lowercase_c in classes
+    )
     detected_msg = (
         f"Weaviate at {weaviate_url} still carries the pre-v0.2.12 "
         f"shared-KG class `{legacy_name}`. The post-rename canonical "
@@ -7414,6 +7880,380 @@ def _detect_legacy_shared_kg_class(deferral_report: "DeferralReport") -> None:
         "legacy shared-KG class detected; deferral emitted",
         data={"legacy_class": legacy_name,
               "canonical_present": canonical_present},
+    )
+
+
+def _self_heal_kg_bindings_on_update(
+    deferral_report: "DeferralReport",
+) -> None:
+    """v0.2.23 B1 (2026-05-21) — case-mismatch self-heal for launcher.db.
+
+    Fixes Finding 4 of the post-v0.2.22 handoff: a `project_kg_bindings`
+    row whose `collection_name` differs only in casing from a class that
+    actually exists in Weaviate. Symptom in production: VCO_dev's shared
+    binding pointed at `VibecodedOrchestrator_KnowledgeGraph` (lowercase
+    c) but Weaviate had `VibeCodedOrchestrator_KnowledgeGraph` (capital
+    C, 892 objects live).
+
+    Behaviour:
+      1. Resolve launcher.db path via `_discover_app_state_db_path` (the
+         same helper used by `_write_preset_defaults_to_app_state`).
+         Cross-OS: `~/.vct/launcher.db` by default, `$VCT_STATE_DIR/launcher.db`
+         when set.
+      2. Read every row from `project_kg_bindings`.
+      3. Read every class from Weaviate `/v1/schema`.
+      4. For each binding row where `collection_name not in existing` BUT
+         a case-insensitive match against existing finds a live sibling Y,
+         UPDATE the row to point at Y. Append a `kg_binding_self_healed`
+         deferral entry (severity=info) per row rebound, naming each
+         (project_id, role, old_name → new_name) so the user has an audit
+         trail.
+      5. For each binding row where `collection_name not in existing` AND
+         no case-different sibling exists, LEAVE ALONE. That's a true
+         missing-class state — the orphan-prune sync recreates the class
+         lazily on next write, or the user picks one via the launcher's
+         Shared KG picker.
+
+    NO DATA TOUCHED. Only launcher.db binding-row updates. No re-embedding
+    cost. The function never raises; soft-fails to a deferral entry on
+    every error path (launcher.db missing, Weaviate unreachable, sqlite
+    error). install.py --update must always exit cleanly even when this
+    helper hits an edge case.
+
+    Why this is safe to auto-apply (unlike the legacy-class deferral):
+    rebinding a launcher.db row to point at a class that ALREADY EXISTS
+    in Weaviate is a metadata fix, not a destructive operation — the on-
+    disk class and its embeddings are untouched. The deferral entry is
+    purely informational so the user sees what we changed.
+
+    Called from the install.py --update flow alongside
+    `_detect_legacy_shared_kg_class` (see Step 7d at the top of
+    `install_or_update` where this is wired in).
+    """
+    import sqlite3
+
+    db_path = _discover_app_state_db_path()
+    if not db_path.is_file():
+        # No launcher.db ⇒ launcher has never started OR the user purged
+        # `~/.vct/`. Either way, there are no binding rows to heal.
+        _log_install_event(
+            "7e/10", "skip",
+            f"launcher.db not found at {db_path}; nothing to self-heal",
+            data={"db_path": str(db_path)},
+        )
+        return
+
+    # Read Weaviate schema first; if Weaviate is unreachable we can't
+    # build the case-insensitive lookup, so defer with a deferral entry
+    # rather than touching the DB blindly.
+    weaviate_url = (
+        os.environ.get("WEAVIATE_URL")
+        or f"http://localhost:{os.environ.get('WEAVIATE_PORT', '8081')}"
+    )
+    try:
+        resp = urllib.request.urlopen(  # noqa: S310 (localhost only)
+            f"{weaviate_url}/v1/schema", timeout=5,
+        )
+        schema = json.loads(resp.read())
+    except Exception as e:
+        # Weaviate unreachable: another deferral path upstream already
+        # mentions this, but we add a binding-specific note so the user
+        # knows the self-heal step was skipped.
+        _log_install_event(
+            "7e/10", "skip",
+            f"weaviate unreachable; binding self-heal skipped: {type(e).__name__}",
+            data={"weaviate_url": weaviate_url, "error": str(e)[:200]},
+        )
+        return
+
+    existing_classes = {
+        c.get("class") for c in schema.get("classes", [])
+        if isinstance(c, dict) and c.get("class")
+    }
+    existing_by_lower = {
+        name.lower(): name for name in existing_classes if name
+    }
+
+    # Open launcher.db read-write, BUT in a try/except: any sqlite error
+    # (locked, corrupted, schema-drift, permission) soft-fails to a
+    # deferral entry. The launcher's own boot will heal the schema; this
+    # helper exists to fix data, not schema.
+    rebinds: list[tuple[str, str, str, str]] = []  # (proj_id, role, old, new)
+    access_rebinds: list[tuple[str, str, str]] = []  # (proj_id, old, new)
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=5.0)
+        try:
+            cur = conn.cursor()
+            # Tolerate launcher.db schemas that haven't migrated yet — if
+            # `project_kg_bindings` doesn't exist, we're done.
+            try:
+                cur.execute(
+                    "SELECT project_id, role, collection_name "
+                    "FROM project_kg_bindings"
+                )
+            except sqlite3.OperationalError as oe:
+                if "no such table" in str(oe).lower():
+                    _log_install_event(
+                        "7e/10", "skip",
+                        "project_kg_bindings table absent; nothing to self-heal",
+                    )
+                    return
+                raise
+
+            rows = cur.fetchall()
+            for project_id, role, collection_name in rows:
+                if not collection_name:
+                    continue
+                if collection_name in existing_classes:
+                    # Exact match — nothing to do.
+                    continue
+                actual = existing_by_lower.get(collection_name.lower())
+                if actual is None:
+                    # Genuinely missing class — leave the binding alone.
+                    # The orphan-prune sync / lazy-create path handles
+                    # recreation on next write.
+                    continue
+                if actual == collection_name:
+                    # Shouldn't reach here (filtered above) — defensive.
+                    continue
+                # Case-different sibling exists in Weaviate. Rebind.
+                cur.execute(
+                    "UPDATE project_kg_bindings "
+                    "SET collection_name = ?, updated_at = ? "
+                    "WHERE project_id = ? AND role = ?",
+                    (actual, int(time.time() * 1000), project_id, role),
+                )
+                rebinds.append((project_id, role, collection_name, actual))
+
+            # v0.2.23 review-B HIGH-1 (2026-05-21): also rebind
+            # `kg_collection_access` rows whose `collection_name` differs
+            # only in case from an on-disk class. Without this, the launcher
+            # GUI's Identity tab access matrix would render rows pointing at
+            # a class that doesn't exist post-rename (and dangle), and the
+            # hub's `kg_access_list` construction in config_api would see
+            # both the lowercase-c grant AND the (implicit-fallback) capital-C
+            # grant — confusing, and a silently-missed `access_level='none'`
+            # signal if the user had explicitly downgraded the lowercase-c
+            # entry.
+            #
+            # PK collision handling: kg_collection_access PK is
+            # (project_id, collection_name). If (p1, "Foo", "read") exists
+            # AND (p1, "foo", "write") also exists, a naive rebind would
+            # violate the UNIQUE constraint. We probe for the collision
+            # before the UPDATE; on collision, we KEEP the higher-privilege
+            # row (write > read > none) at the canonical casing and DELETE
+            # the lower-privilege duplicate. Matches the user's "single
+            # source of truth for access" intent.
+            try:
+                cur.execute(
+                    "SELECT project_id, collection_name, access_level "
+                    "FROM kg_collection_access"
+                )
+                access_rows = cur.fetchall()
+            except sqlite3.OperationalError as oe:
+                # Table absent → skip the access-matrix part but keep the
+                # binding rebinds (already committed in the next step).
+                if "no such table" in str(oe).lower():
+                    access_rows = []
+                else:
+                    raise
+
+            # Build a per-project lookup of (existing canonical-name → row)
+            # so collision-resolution can find the duplicate when present.
+            access_by_proj_name: dict[tuple[str, str], str] = {}
+            for proj_id, coll_name, access in access_rows:
+                if proj_id and coll_name:
+                    access_by_proj_name[(proj_id, coll_name)] = access
+
+            _ACCESS_RANK = {"none": 0, "read": 1, "write": 2}
+
+            for proj_id, coll_name, access in access_rows:
+                if not coll_name:
+                    continue
+                if coll_name in existing_classes:
+                    continue  # exact match — nothing to do
+                actual = existing_by_lower.get(coll_name.lower())
+                if actual is None or actual == coll_name:
+                    continue  # truly missing or already-canonical
+
+                # Collision detection: does (proj_id, actual) ALREADY exist?
+                collision_access = access_by_proj_name.get((proj_id, actual))
+                if collision_access is not None:
+                    # Pick the higher-privilege row to keep at the canonical
+                    # casing; delete the lower-privilege duplicate.
+                    current_rank = _ACCESS_RANK.get(access, 0)
+                    collision_rank = _ACCESS_RANK.get(collision_access, 0)
+                    if current_rank > collision_rank:
+                        # Our (lowercase-c) row is higher-privilege.
+                        # Drop the colliding canonical row, then rebind.
+                        cur.execute(
+                            "DELETE FROM kg_collection_access "
+                            "WHERE project_id = ? AND collection_name = ?",
+                            (proj_id, actual),
+                        )
+                        cur.execute(
+                            "UPDATE kg_collection_access "
+                            "SET collection_name = ? "
+                            "WHERE project_id = ? AND collection_name = ?",
+                            (actual, proj_id, coll_name),
+                        )
+                        access_rebinds.append((proj_id, coll_name, actual))
+                    else:
+                        # Canonical row already has equal-or-higher
+                        # privilege. Drop our lowercase-c row.
+                        cur.execute(
+                            "DELETE FROM kg_collection_access "
+                            "WHERE project_id = ? AND collection_name = ?",
+                            (proj_id, coll_name),
+                        )
+                        access_rebinds.append(
+                            (proj_id, coll_name, f"{actual} (deduped)")
+                        )
+                else:
+                    # No collision — safe straight rebind.
+                    cur.execute(
+                        "UPDATE kg_collection_access "
+                        "SET collection_name = ? "
+                        "WHERE project_id = ? AND collection_name = ?",
+                        (actual, proj_id, coll_name),
+                    )
+                    access_rebinds.append((proj_id, coll_name, actual))
+            conn.commit()
+        finally:
+            conn.close()
+    except sqlite3.Error as se:
+        _log_install_event(
+            "7e/10", "warn",
+            f"launcher.db sqlite error during self-heal: {type(se).__name__}",
+            data={"db_path": str(db_path), "error": str(se)[:200]},
+        )
+        deferral_report.add_entry(
+            DeferralEntry(
+                condition_id="kg_binding_self_heal_db_error",
+                title="Could not self-heal launcher.db KG bindings (sqlite error)",
+                detected=(
+                    f"Tried to open launcher.db at {db_path} to detect "
+                    f"case-mismatched `project_kg_bindings` rows, but the "
+                    f"sqlite library raised {type(se).__name__}. The binding "
+                    f"rows (if any) were NOT modified."
+                ),
+                why_deferred=(
+                    "The launcher.db file is locked, corrupted, or "
+                    "schema-mismatched. Skipping self-heal preserves user "
+                    "state; the launcher's own boot path will re-validate "
+                    "the schema on next start."
+                ),
+                command_to_apply=(
+                    "Close the launcher if running, then re-run "
+                    "`python install.py --update`. If the error persists, "
+                    "open the launcher and let it migrate the schema first, "
+                    "then re-run the update."
+                ),
+                severity="warning",
+                kg_node_refs=[],
+            )
+        )
+        return
+
+    if not rebinds and not access_rebinds:
+        _log_install_event(
+            "7e/10", "ok",
+            "no case-mismatched KG bindings or access rows; self-heal no-op",
+        )
+        return
+
+    # Emit ONE deferral entry summarising every rebind so the user has
+    # an audit trail. severity=info because nothing is broken — we just
+    # corrected a misalignment that would otherwise route writes to a
+    # nonexistent class.
+    rebind_lines = "\n".join(
+        f"  * project_id={pid} role={role}: `{old}` → `{new}`"
+        for (pid, role, old, new) in rebinds
+    )
+    access_rebind_lines = "\n".join(
+        f"  * project_id={pid}: `{old}` → `{new}`"
+        for (pid, old, new) in access_rebinds
+    )
+    binding_count = len(rebinds)
+    access_count = len(access_rebinds)
+    title_parts = []
+    if binding_count:
+        title_parts.append(f"{binding_count} binding(s)")
+    if access_count:
+        title_parts.append(f"{access_count} access row(s)")
+    title = (
+        f"Self-healed {' + '.join(title_parts)} of case-mismatched KG "
+        "metadata in launcher.db"
+    )
+    detected_parts = []
+    if binding_count:
+        detected_parts.append(
+            f"Found {binding_count} `project_kg_bindings` row(s) whose "
+            f"`collection_name` differed only in casing from a class that "
+            f"exists in Weaviate at {weaviate_url}.\n\n"
+            f"Rebound binding rows:\n{rebind_lines}"
+        )
+    if access_count:
+        detected_parts.append(
+            f"Found {access_count} `kg_collection_access` row(s) whose "
+            f"`collection_name` differed only in casing from a class that "
+            f"exists in Weaviate (sibling rows to the binding rebinds). "
+            f"These were updated in place to keep the launcher GUI's "
+            f"per-project Identity tab access matrix pointing at the live "
+            f"class. Rows annotated `(deduped)` were merged with a pre-"
+            f"existing canonical-casing row at equal-or-higher privilege.\n\n"
+            f"Rebound access rows:\n{access_rebind_lines}"
+        )
+    detected = "\n\n".join(detected_parts) + "\n\nNo data was touched."
+
+    deferral_report.add_entry(
+        DeferralEntry(
+            condition_id="kg_binding_self_healed",
+            title=title,
+            detected=detected,
+            why_deferred=(
+                "This is an informational entry — the heal was applied "
+                "automatically (it's a metadata fix, not a destructive "
+                "operation, since the target class already exists in "
+                "Weaviate). The launcher.db row(s) now match the actual "
+                "Weaviate class casing, so writes/reads route to the live "
+                "class instead of a nonexistent case-variant.\n\n"
+                "Background: install.py v0.2.23 B1 (2026-05-21) flipped the "
+                "canonical shared-KG class name from `VibecodedOrchestrator_"
+                "KnowledgeGraph` (lowercase c) to `VibeCodedOrchestrator_"
+                "KnowledgeGraph` (capital C, matching the brand spelling). "
+                "Case-insensitive adoption in `_ensure_collections` keeps "
+                "the on-disk casing unchanged; this helper aligns the "
+                "launcher.db `project_kg_bindings` AND `kg_collection_access` "
+                "rows with that on-disk casing."
+            ),
+            command_to_apply=(
+                "No action required — the heal already ran. If you want to "
+                "verify the rebound rows, open the launcher and check the "
+                "Shared KG collection name on each affected project's "
+                "Settings → Identity tab."
+            ),
+            severity="info",
+            kg_node_refs=[],
+        )
+    )
+    _log_install_event(
+        "7e/10", "ok",
+        f"self-healed {binding_count} binding(s) + {access_count} access row(s)",
+        data={
+            "rebinds": [
+                {"project_id": pid, "role": role,
+                 "old_collection_name": old,
+                 "new_collection_name": new}
+                for (pid, role, old, new) in rebinds
+            ],
+            "access_rebinds": [
+                {"project_id": pid,
+                 "old_collection_name": old,
+                 "new_collection_name": new}
+                for (pid, old, new) in access_rebinds
+            ],
+        },
     )
 
 
@@ -12131,9 +12971,11 @@ def _env_canonical_template(project_name: str = "<project>",
         ("", None, "# Resolved by the launcher when the project is registered. Don't"),
         ("", None, "# edit unless you know what you're doing."),
         ("KG_COLLECTION", f"{project_name}_KnowledgeGraph", None),
-        # Default value (renamed from "VibeCodedTools_KnowledgeGraph" in
-        # v0.2.12 PR-26 / Group E). Picker overrides this per-project.
-        ("SHARED_KG_COLLECTION", "VibecodedOrchestrator_KnowledgeGraph", None),
+        # Default value: capital-C "VibeCoded" since v0.2.23 B1 (was
+        # lowercase-c v0.2.12–v0.2.22, itself renamed from
+        # "VibeCodedTools_KnowledgeGraph" in v0.2.12 PR-26 / Group E).
+        # Picker overrides this per-project.
+        ("SHARED_KG_COLLECTION", "VibeCodedOrchestrator_KnowledgeGraph", None),
         ("DEVELOPMENT_COLLECTION", f"{project_name}_Development", None),
         ("PROJECT_NAME", project_name, None),
         # CONVERSATION_COLLECTION removed 2026-04-30 — capture flow deprecated
@@ -12389,7 +13231,7 @@ def _write_env_config(embed_config: dict, args: argparse.Namespace, joern_availa
         "# Set SHARED_KG_WRITE_DISABLED=true to gate WRITES from this project",
         "# only (reads stay on). SHARED_KG_OPT_OUT is the legacy alias kept",
         "# for ~3 releases (target removal: 2026-08).",
-        f"SHARED_KG_COLLECTION={os.environ.get('SHARED_KG_COLLECTION', 'VibecodedOrchestrator_KnowledgeGraph')}",
+        f"SHARED_KG_COLLECTION={os.environ.get('SHARED_KG_COLLECTION', 'VibeCodedOrchestrator_KnowledgeGraph')}",
         "SHARED_KG_WRITE_DISABLED=false",
         "SHARED_KG_OPT_OUT=false",
         "",
@@ -12493,9 +13335,11 @@ def _configure_claude_settings(embed_config: dict) -> None:
         "ACTIVE_EMBEDDING": embed_config.get("active_embedding", "qwen3"),
         "KG_COLLECTION": "KnowledgeGraph",
         "DEVELOPMENT_COLLECTION": "Development",
-        # Default value (renamed from "VibeCodedTools_KnowledgeGraph" in
-        # v0.2.12 PR-26 / Group E). Picker overrides this per-project.
-        "SHARED_KG_COLLECTION": "VibecodedOrchestrator_KnowledgeGraph",
+        # Default value: capital-C "VibeCoded" since v0.2.23 B1 (was
+        # lowercase-c v0.2.12–v0.2.22, itself renamed from
+        # "VibeCodedTools_KnowledgeGraph" in v0.2.12 PR-26 / Group E).
+        # Picker overrides this per-project.
+        "SHARED_KG_COLLECTION": "VibeCodedOrchestrator_KnowledgeGraph",
         # Asymmetric shared-KG access (since 2026-05-01): reads always-on,
         # writes gated by SHARED_KG_WRITE_DISABLED. SHARED_KG_OPT_OUT kept
         # as a legacy alias for ~3 releases (target removal: 2026-08).

@@ -6,7 +6,7 @@
 <div class="page">
   <ModuleCatalog
     onOpenActivation={() => ui.openActivation()}
-    onOpenSettings={() => ui.openSettings()}
+    onOpenSettings={() => ui.openSettings('secrets')}
   />
 </div>
 

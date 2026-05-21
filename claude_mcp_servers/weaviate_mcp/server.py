@@ -1038,17 +1038,19 @@ def _format_result_by_tier(
 # preserves pre-v0.2.21 behaviour.
 KG_COLLECTION = _config_field("kg_collection", "KG_COLLECTION", "ClaudeKnowledgeGraph")
 # Cross-project shared collection. Defaults to
-# "VibecodedOrchestrator_KnowledgeGraph" (renamed from
-# "VibeCodedTools_KnowledgeGraph" in v0.2.12 PR-26 / Group E — see
-# `vco_lib/project_init.py::_LEGACY_SHARED_KG_NAME` for the legacy alias
-# preserved by migration-detection paths). The bundled cross-project KG
-# is seeded at install time from vibecoded-orchestrator/knowledge/.
+# "VibeCodedOrchestrator_KnowledgeGraph" (since v0.2.23 B1; was
+# "VibecodedOrchestrator_KnowledgeGraph" v0.2.12–v0.2.22, itself renamed
+# from "VibeCodedTools_KnowledgeGraph" in v0.2.12 PR-26 / Group E — see
+# `vco_lib/project_init.py::_LEGACY_SHARED_KG_NAME` for the pre-v0.2.12
+# legacy alias and `_LEGACY_SHARED_KG_NAME_LOWERCASE_C` for the v0.2.12–
+# v0.2.22 alias). The bundled cross-project KG is seeded at install time
+# from vibecoded-orchestrator/knowledge/.
 #
 # Asymmetric access (2026-05-01): SHARED_KG_COLLECTION is ALWAYS exposed to
 # read paths when set. There is no per-project read opt-out — every project
 # always reads the shared KG. The per-project gate below restricts WRITES
 # only.
-_SHARED_KG_DEFAULT = "VibecodedOrchestrator_KnowledgeGraph"
+_SHARED_KG_DEFAULT = "VibeCodedOrchestrator_KnowledgeGraph"
 # v0.2.21 Step 18: resolved via vct-hub when reachable; env-fallback
 # otherwise. When the hub is reachable, an explicit empty value means
 # "no shared KG binding for this project" and we honour it AS-IS — the
@@ -1289,15 +1291,22 @@ def _normalize_kg_file_path(file_path: str, node_type: str, title: str) -> tuple
     return fp, adjustments
 
 
-# Default project for code graph queries.
-# v0.2.21 Step 18: resolved via vct-hub (cfg.code_graph_project); on
-# fall-through, honours the historical env precedence CODE_GRAPH_PROJECT
-# > PROJECT_NAME. Every project's `.claude/settings.json` env block
-# should set CODE_GRAPH_PROJECT — the hub's value is the authoritative
-# source post-v0.2.21.
+# Default project / collection prefix for code graph queries.
+# v0.2.23 W3 (2026-05-21) — slug-vs-prefix fix: source the resolved value
+# from `cfg.code_graph_collection_prefix` (the canonical Weaviate prefix
+# from `project_codegraph_bindings.collection_prefix`), NOT
+# `cfg.code_graph_project` (a slug alias that diverges from the binding
+# row when the project's slug isn't already a valid Weaviate class
+# prefix — e.g. `orchestrator-root` would re-sanitise to
+# `Orchestrator_root` ≠ `VibeCodedOrchestrator` binding-row truth).
+# Symptom of the pre-fix bug: silent 0-result MCP searches +
+# writes-to-zombie-collections after any project rename.
+#
+# Fall-through honours the historical env precedence CODE_GRAPH_PROJECT
+# > PROJECT_NAME (for environments without a hub-resolvable config).
 _cfg_for_cgp = _try_resolve_project_config()
-if _cfg_for_cgp is not None and _cfg_for_cgp.code_graph_project:
-    CODE_GRAPH_PROJECT = _cfg_for_cgp.code_graph_project
+if _cfg_for_cgp is not None and _cfg_for_cgp.code_graph_collection_prefix:
+    CODE_GRAPH_PROJECT = _cfg_for_cgp.code_graph_collection_prefix
 else:
     CODE_GRAPH_PROJECT = os.getenv("CODE_GRAPH_PROJECT") or os.getenv("PROJECT_NAME", "")
 

@@ -1,0 +1,639 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 VibeCoded Tools
+"""v0.2.23 B1 (2026-05-21) — case-mismatch self-heal for launcher.db
+``project_kg_bindings`` rows.
+
+The helper under test is ``install.py::_self_heal_kg_bindings_on_update``.
+It runs from the ``install.py --update`` flow alongside
+``_detect_legacy_shared_kg_class`` and:
+
+  1. Reads ``~/.vct/launcher.db`` (or ``$VCT_STATE_DIR/launcher.db``).
+  2. Reads the Weaviate schema (``GET /v1/schema``).
+  3. For every ``project_kg_bindings`` row whose ``collection_name``
+     differs only in casing from a class actually in Weaviate, UPDATEs
+     the row to point at the on-disk casing.
+  4. Emits an informational deferral entry summarising every rebind.
+
+Test coverage:
+
+  * Rewrite happens when a case-different sibling exists in Weaviate.
+  * No-op when the canonical class already matches (exact equality).
+  * No-op when no case-different sibling exists (genuine missing class —
+    leave the row alone; orphan-prune sync recreates lazily).
+  * Soft-fail when launcher.db is absent (fresh first-install) — no
+    crash, no deferral entry beyond the skip log.
+
+The tests stub out Weaviate via a small in-process HTTP server
+(``http.server.BaseHTTPRequestHandler``) so the helper's
+``urllib.request.urlopen`` call lands in the test's fixture instead of
+hitting a real Weaviate. The launcher.db is built via ``sqlite3``
+directly because the launcher's own migrations live in Rust and aren't
+callable from Python tests — we hand-roll just enough schema for the
+helper to see.
+"""
+
+from __future__ import annotations
+
+import http.server
+import json
+import os
+import socket
+import sqlite3
+import sys
+import threading
+import time
+import unittest
+from pathlib import Path
+from unittest import mock
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+import install  # noqa: E402
+from vco_lib.deferral_report import DeferralReport  # noqa: E402
+
+
+# ─── Stub Weaviate HTTP server ────────────────────────────────────────────
+
+
+class _StubSchemaHandler(http.server.BaseHTTPRequestHandler):
+    """Returns a fixed schema payload on GET /v1/schema."""
+
+    schema: dict = {"classes": []}
+
+    def do_GET(self):  # noqa: N802 — BaseHTTPRequestHandler API
+        if self.path == "/v1/schema":
+            body = json.dumps(self.__class__.schema).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, *args, **kwargs):
+        # Silence per-request stderr noise.
+        pass
+
+
+def _start_stub_weaviate(classes: list[str]) -> tuple[http.server.HTTPServer, int]:
+    """Start a stub Weaviate that serves the given class list on
+    ``/v1/schema``. Returns ``(server, port)``.
+
+    Random-port binding (port=0) so parallel test runs don't collide.
+    """
+    _StubSchemaHandler.schema = {
+        "classes": [{"class": name} for name in classes]
+    }
+    # Bind to localhost ephemeral port — random so concurrent tests
+    # don't collide.
+    server = http.server.HTTPServer(("127.0.0.1", 0), _StubSchemaHandler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    # Sanity-poll: open a socket to confirm the listener is up before
+    # the test issues its first request.
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                break
+        except OSError:
+            time.sleep(0.05)
+    return server, port
+
+
+# ─── launcher.db helpers ──────────────────────────────────────────────────
+
+
+_PROJECT_KG_BINDINGS_DDL = """
+CREATE TABLE project_kg_bindings (
+    project_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    collection_name TEXT NOT NULL,
+    embedding_model TEXT,
+    embedding_dim INTEGER,
+    kg_dir_path TEXT,
+    weaviate_url TEXT,
+    config_json TEXT,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (project_id, role)
+)
+"""
+
+
+def _build_launcher_db(db_path: Path, rows: list[tuple[str, str, str]]) -> None:
+    """Create launcher.db with a project_kg_bindings table seeded with rows.
+
+    Each row is ``(project_id, role, collection_name)``. Other columns
+    get sane defaults (None / '{}' / current millis).
+    """
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(_PROJECT_KG_BINDINGS_DDL)
+        now = int(time.time() * 1000)
+        for project_id, role, collection_name in rows:
+            conn.execute(
+                "INSERT INTO project_kg_bindings "
+                "(project_id, role, collection_name, embedding_model, "
+                "embedding_dim, kg_dir_path, weaviate_url, config_json, "
+                "updated_at) VALUES (?, ?, ?, NULL, NULL, NULL, NULL, '{}', ?)",
+                (project_id, role, collection_name, now),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _read_bindings(db_path: Path) -> list[tuple[str, str, str]]:
+    """Read ``(project_id, role, collection_name)`` triples from launcher.db."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cur = conn.execute(
+            "SELECT project_id, role, collection_name FROM project_kg_bindings "
+            "ORDER BY project_id, role"
+        )
+        return list(cur.fetchall())
+    finally:
+        conn.close()
+
+
+# ─── Tests ───────────────────────────────────────────────────────────────
+
+
+class SelfHealCaseMismatchTests(unittest.TestCase):
+    """Headline contract: rebind binding rows whose collection_name only
+    differs in casing from a live class in Weaviate."""
+
+    def setUp(self):
+        # Per-test temp dir — VCT_STATE_DIR points at it so launcher.db
+        # resolves there. Cleanup in tearDown.
+        self._tmp = Path(__file__).resolve().parent / f"_tmp_self_heal_{os.getpid()}_{id(self)}"
+        self._tmp.mkdir(parents=True, exist_ok=True)
+        self._db_path = self._tmp / "launcher.db"
+        # Patch VCT_STATE_DIR via env so `_discover_app_state_db_path`
+        # resolves here instead of `~/.vct`.
+        self._env_patch = mock.patch.dict(
+            os.environ, {"VCT_STATE_DIR": str(self._tmp)}, clear=False
+        )
+        self._env_patch.start()
+        self._server = None
+        self._port = None
+
+    def tearDown(self):
+        self._env_patch.stop()
+        if self._server is not None:
+            self._server.shutdown()
+            self._server = None
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+        # Also pop WEAVIATE_URL/PORT we may have set.
+        for k in ("WEAVIATE_URL", "WEAVIATE_PORT"):
+            os.environ.pop(k, None)
+
+    def _set_weaviate_url(self, port: int) -> None:
+        os.environ["WEAVIATE_URL"] = f"http://127.0.0.1:{port}"
+
+    def test_self_heal_rewrites_binding_when_case_variant_exists(self):
+        # Pre-seed launcher.db with a lowercase-c binding row.
+        _build_launcher_db(
+            self._db_path,
+            rows=[("p1", "shared", "VibecodedOrchestrator_KnowledgeGraph")],
+        )
+        # Pre-seed Weaviate with the capital-C canonical class.
+        self._server, self._port = _start_stub_weaviate(
+            classes=["VibeCodedOrchestrator_KnowledgeGraph"]
+        )
+        self._set_weaviate_url(self._port)
+
+        report = DeferralReport()
+        install._self_heal_kg_bindings_on_update(report)
+
+        # Binding row was rebound to the on-disk capital-C casing.
+        bindings = _read_bindings(self._db_path)
+        self.assertEqual(
+            bindings,
+            [("p1", "shared", "VibeCodedOrchestrator_KnowledgeGraph")],
+            "expected binding to be rebound to the live class casing",
+        )
+
+        # An informational deferral entry was emitted.
+        entries = report.entries
+        ids = [e.condition_id for e in entries]
+        self.assertIn("kg_binding_self_healed", ids)
+        healed = next(e for e in entries
+                      if e.condition_id == "kg_binding_self_healed")
+        self.assertEqual(healed.severity, "info")
+        # The detected message must mention the rebind direction so the
+        # user has an audit trail.
+        self.assertIn("VibecodedOrchestrator_KnowledgeGraph", healed.detected)
+        self.assertIn("VibeCodedOrchestrator_KnowledgeGraph", healed.detected)
+        self.assertIn("p1", healed.detected)
+        self.assertIn("shared", healed.detected)
+
+    def test_self_heal_no_op_when_canonical_exists(self):
+        # Pre-seed launcher.db AND Weaviate with the canonical capital-C
+        # — exact match, no rebind expected.
+        _build_launcher_db(
+            self._db_path,
+            rows=[("p1", "shared", "VibeCodedOrchestrator_KnowledgeGraph")],
+        )
+        self._server, self._port = _start_stub_weaviate(
+            classes=["VibeCodedOrchestrator_KnowledgeGraph"]
+        )
+        self._set_weaviate_url(self._port)
+
+        report = DeferralReport()
+        install._self_heal_kg_bindings_on_update(report)
+
+        # Binding row unchanged.
+        bindings = _read_bindings(self._db_path)
+        self.assertEqual(
+            bindings,
+            [("p1", "shared", "VibeCodedOrchestrator_KnowledgeGraph")],
+            "exact-match binding must not be rewritten",
+        )
+
+        # No deferral entry — there was nothing to heal.
+        ids = [e.condition_id for e in report.entries]
+        self.assertNotIn("kg_binding_self_healed", ids)
+
+    def test_self_heal_no_op_when_no_case_sibling(self):
+        # Pre-seed launcher.db with capital-C binding, but Weaviate is
+        # empty — true missing-class state. Leave the row alone (the
+        # orphan-prune sync will handle lazy recreation).
+        _build_launcher_db(
+            self._db_path,
+            rows=[("p1", "shared", "VibeCodedOrchestrator_KnowledgeGraph")],
+        )
+        self._server, self._port = _start_stub_weaviate(classes=[])
+        self._set_weaviate_url(self._port)
+
+        report = DeferralReport()
+        install._self_heal_kg_bindings_on_update(report)
+
+        # Binding row unchanged.
+        bindings = _read_bindings(self._db_path)
+        self.assertEqual(
+            bindings,
+            [("p1", "shared", "VibeCodedOrchestrator_KnowledgeGraph")],
+            "missing-class binding must not be rewritten",
+        )
+        ids = [e.condition_id for e in report.entries]
+        self.assertNotIn("kg_binding_self_healed", ids)
+
+    def test_self_heal_handles_launcher_db_missing(self):
+        # launcher.db doesn't exist (fresh first-install, launcher never
+        # started). Helper soft-fails to a skip log, no crash, no
+        # deferral entry beyond the skip itself.
+        self.assertFalse(self._db_path.exists())
+
+        # Weaviate up but irrelevant — the helper short-circuits before
+        # reaching the schema call.
+        self._server, self._port = _start_stub_weaviate(
+            classes=["VibeCodedOrchestrator_KnowledgeGraph"]
+        )
+        self._set_weaviate_url(self._port)
+
+        report = DeferralReport()
+        # The helper must never raise.
+        install._self_heal_kg_bindings_on_update(report)
+
+        # No deferral entry — this is a benign skip, not a problem.
+        ids = [e.condition_id for e in report.entries]
+        self.assertNotIn("kg_binding_self_healed", ids)
+        self.assertNotIn("kg_binding_self_heal_db_error", ids)
+
+    def test_self_heal_rebinds_multiple_rows(self):
+        # Defensive: when multiple binding rows need rebinding, all of
+        # them get fixed in one pass and the deferral entry mentions
+        # each.
+        _build_launcher_db(
+            self._db_path,
+            rows=[
+                # Two case-mismatched rows for different projects.
+                ("p1", "shared", "VibecodedOrchestrator_KnowledgeGraph"),
+                ("p2", "shared", "vibecodedorchestrator_knowledgegraph"),
+                # Plus one exact match (must not be touched).
+                ("p3", "primary", "Acme_KnowledgeGraph"),
+            ],
+        )
+        self._server, self._port = _start_stub_weaviate(
+            classes=[
+                "VibeCodedOrchestrator_KnowledgeGraph",
+                "Acme_KnowledgeGraph",
+            ]
+        )
+        self._set_weaviate_url(self._port)
+
+        report = DeferralReport()
+        install._self_heal_kg_bindings_on_update(report)
+
+        bindings = dict(
+            ((pid, role), coll)
+            for (pid, role, coll) in _read_bindings(self._db_path)
+        )
+        self.assertEqual(
+            bindings[("p1", "shared")],
+            "VibeCodedOrchestrator_KnowledgeGraph",
+        )
+        self.assertEqual(
+            bindings[("p2", "shared")],
+            "VibeCodedOrchestrator_KnowledgeGraph",
+        )
+        self.assertEqual(
+            bindings[("p3", "primary")],
+            "Acme_KnowledgeGraph",
+        )
+
+        healed = next(e for e in report.entries
+                      if e.condition_id == "kg_binding_self_healed")
+        # Title summarises the count.
+        self.assertIn("2", healed.title)
+        # Detected message mentions both rebound rows.
+        self.assertIn("p1", healed.detected)
+        self.assertIn("p2", healed.detected)
+        # And does NOT mention the exact-match row.
+        self.assertNotIn("p3", healed.detected)
+
+    def test_self_heal_skips_when_weaviate_unreachable(self):
+        # launcher.db exists with a case-mismatch row, but Weaviate is
+        # unreachable. Helper must not crash — it skips with a log
+        # event but does NOT touch launcher.db (we can't build the
+        # case-insensitive map without the schema).
+        _build_launcher_db(
+            self._db_path,
+            rows=[("p1", "shared", "VibecodedOrchestrator_KnowledgeGraph")],
+        )
+        # Point WEAVIATE_URL at a port no one is listening on.
+        # Pick a random ephemeral port and immediately close the socket
+        # so the connect attempt definitely fails (no race).
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("127.0.0.1", 0))
+        dead_port = s.getsockname()[1]
+        s.close()
+        self._set_weaviate_url(dead_port)
+
+        report = DeferralReport()
+        # Must not raise.
+        install._self_heal_kg_bindings_on_update(report)
+
+        # Binding row unchanged because we couldn't read the schema.
+        bindings = _read_bindings(self._db_path)
+        self.assertEqual(
+            bindings,
+            [("p1", "shared", "VibecodedOrchestrator_KnowledgeGraph")],
+        )
+        # No heal-completed entry (we didn't heal anything).
+        ids = [e.condition_id for e in report.entries]
+        self.assertNotIn("kg_binding_self_healed", ids)
+
+
+_KG_COLLECTION_ACCESS_DDL = """
+CREATE TABLE kg_collection_access (
+    project_id      TEXT NOT NULL,
+    collection_name TEXT NOT NULL,
+    access_level    TEXT NOT NULL,
+    PRIMARY KEY (project_id, collection_name)
+)
+"""
+
+
+def _build_launcher_db_with_access(
+    db_path: Path,
+    binding_rows: list[tuple[str, str, str]],
+    access_rows: list[tuple[str, str, str]],
+) -> None:
+    """Create launcher.db with both project_kg_bindings AND
+    kg_collection_access tables seeded.
+
+    binding_rows: [(project_id, role, collection_name)]
+    access_rows:  [(project_id, collection_name, access_level)]
+    """
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(_PROJECT_KG_BINDINGS_DDL)
+        conn.execute(_KG_COLLECTION_ACCESS_DDL)
+        now = int(time.time() * 1000)
+        for project_id, role, collection_name in binding_rows:
+            conn.execute(
+                "INSERT INTO project_kg_bindings "
+                "(project_id, role, collection_name, embedding_model, "
+                "embedding_dim, kg_dir_path, weaviate_url, config_json, "
+                "updated_at) VALUES (?, ?, ?, NULL, NULL, NULL, NULL, '{}', ?)",
+                (project_id, role, collection_name, now),
+            )
+        for project_id, collection_name, access_level in access_rows:
+            conn.execute(
+                "INSERT INTO kg_collection_access "
+                "(project_id, collection_name, access_level) "
+                "VALUES (?, ?, ?)",
+                (project_id, collection_name, access_level),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _read_access(db_path: Path) -> list[tuple[str, str, str]]:
+    """Read (project_id, collection_name, access_level) triples."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cur = conn.execute(
+            "SELECT project_id, collection_name, access_level "
+            "FROM kg_collection_access ORDER BY project_id, collection_name"
+        )
+        return list(cur.fetchall())
+    finally:
+        conn.close()
+
+
+class SelfHealAccessMatrixTests(unittest.TestCase):
+    """v0.2.23 review-B HIGH-1 (2026-05-21) — pin the contract that the
+    self-heal ALSO rebinds case-mismatched rows in `kg_collection_access`
+    (sibling table to `project_kg_bindings`). Without these tests, a
+    future regression could revert HIGH-1 silently — the binding side
+    keeps healing, the access matrix drifts, and the launcher's Identity
+    tab shows ghost rows.
+    """
+
+    def setUp(self):
+        self._tmp = (
+            Path(__file__).resolve().parent
+            / f"_tmp_self_heal_acc_{os.getpid()}_{id(self)}"
+        )
+        self._tmp.mkdir(parents=True, exist_ok=True)
+        self._db_path = self._tmp / "launcher.db"
+        self._env_patch = mock.patch.dict(
+            os.environ, {"VCT_STATE_DIR": str(self._tmp)}, clear=False
+        )
+        self._env_patch.start()
+        self._server = None
+        self._port = None
+
+    def tearDown(self):
+        self._env_patch.stop()
+        if self._server is not None:
+            self._server.shutdown()
+            self._server = None
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+        for k in ("WEAVIATE_URL", "WEAVIATE_PORT"):
+            os.environ.pop(k, None)
+
+    def _set_weaviate_url(self, port: int) -> None:
+        os.environ["WEAVIATE_URL"] = f"http://127.0.0.1:{port}"
+
+    def test_access_matrix_rebinds_when_case_variant_exists(self):
+        """A lowercase-c access row gets rebound to the on-disk casing."""
+        _build_launcher_db_with_access(
+            self._db_path,
+            binding_rows=[
+                ("p1", "shared", "VibecodedOrchestrator_KnowledgeGraph"),
+            ],
+            access_rows=[
+                ("p1", "VibecodedOrchestrator_KnowledgeGraph", "read"),
+            ],
+        )
+        self._server, self._port = _start_stub_weaviate(
+            classes=["VibeCodedOrchestrator_KnowledgeGraph"]
+        )
+        self._set_weaviate_url(self._port)
+
+        report = DeferralReport()
+        install._self_heal_kg_bindings_on_update(report)
+
+        access = _read_access(self._db_path)
+        self.assertEqual(
+            access,
+            [("p1", "VibeCodedOrchestrator_KnowledgeGraph", "read")],
+            "expected access row to be rebound to the live class casing",
+        )
+
+        # Deferral mentions BOTH binding and access rebinds.
+        healed = next(e for e in report.entries
+                      if e.condition_id == "kg_binding_self_healed")
+        self.assertIn("kg_collection_access", healed.detected)
+        self.assertIn("access row", healed.title)
+
+    def test_access_matrix_no_op_when_canonical_match(self):
+        """Capital-C access row + capital-C class — no rebind needed."""
+        _build_launcher_db_with_access(
+            self._db_path,
+            binding_rows=[
+                ("p1", "shared", "VibeCodedOrchestrator_KnowledgeGraph"),
+            ],
+            access_rows=[
+                ("p1", "VibeCodedOrchestrator_KnowledgeGraph", "write"),
+            ],
+        )
+        self._server, self._port = _start_stub_weaviate(
+            classes=["VibeCodedOrchestrator_KnowledgeGraph"]
+        )
+        self._set_weaviate_url(self._port)
+
+        report = DeferralReport()
+        install._self_heal_kg_bindings_on_update(report)
+
+        access = _read_access(self._db_path)
+        self.assertEqual(
+            access,
+            [("p1", "VibeCodedOrchestrator_KnowledgeGraph", "write")],
+        )
+        ids = [e.condition_id for e in report.entries]
+        self.assertNotIn("kg_binding_self_healed", ids)
+
+    def test_access_matrix_collision_keeps_higher_privilege(self):
+        """If BOTH a lowercase-c row (`write`) AND a capital-C row (`read`)
+        exist for the same project, the higher-privilege row wins at the
+        canonical casing. The lower-privilege duplicate is deleted.
+        """
+        _build_launcher_db_with_access(
+            self._db_path,
+            binding_rows=[
+                ("p1", "shared", "VibecodedOrchestrator_KnowledgeGraph"),
+            ],
+            access_rows=[
+                ("p1", "VibecodedOrchestrator_KnowledgeGraph", "write"),
+                ("p1", "VibeCodedOrchestrator_KnowledgeGraph", "read"),
+            ],
+        )
+        self._server, self._port = _start_stub_weaviate(
+            classes=["VibeCodedOrchestrator_KnowledgeGraph"]
+        )
+        self._set_weaviate_url(self._port)
+
+        report = DeferralReport()
+        install._self_heal_kg_bindings_on_update(report)
+
+        access = _read_access(self._db_path)
+        # Lowercase-c was `write` (rank 2), capital-C was `read` (rank 1).
+        # Lowercase-c wins → capital-C deleted, lowercase-c rebound to
+        # capital-C with its `write` privilege preserved.
+        self.assertEqual(
+            access,
+            [("p1", "VibeCodedOrchestrator_KnowledgeGraph", "write")],
+        )
+
+    def test_access_matrix_collision_keeps_canonical_when_equal_privilege(self):
+        """If BOTH rows have equal privilege, the canonical row wins
+        (the lowercase-c duplicate is dropped)."""
+        _build_launcher_db_with_access(
+            self._db_path,
+            binding_rows=[
+                ("p1", "shared", "VibecodedOrchestrator_KnowledgeGraph"),
+            ],
+            access_rows=[
+                ("p1", "VibecodedOrchestrator_KnowledgeGraph", "read"),
+                ("p1", "VibeCodedOrchestrator_KnowledgeGraph", "read"),
+            ],
+        )
+        self._server, self._port = _start_stub_weaviate(
+            classes=["VibeCodedOrchestrator_KnowledgeGraph"]
+        )
+        self._set_weaviate_url(self._port)
+
+        report = DeferralReport()
+        install._self_heal_kg_bindings_on_update(report)
+
+        access = _read_access(self._db_path)
+        self.assertEqual(
+            access,
+            [("p1", "VibeCodedOrchestrator_KnowledgeGraph", "read")],
+            "equal privilege: canonical row kept, lowercase-c dropped",
+        )
+
+    def test_access_matrix_absent_table_does_not_block_binding_heal(self):
+        """Older launcher.db schemas may not have `kg_collection_access`.
+        The binding heal should still complete normally."""
+        # Build launcher.db with bindings ONLY (no access table).
+        _build_launcher_db(
+            self._db_path,
+            rows=[("p1", "shared", "VibecodedOrchestrator_KnowledgeGraph")],
+        )
+        self._server, self._port = _start_stub_weaviate(
+            classes=["VibeCodedOrchestrator_KnowledgeGraph"]
+        )
+        self._set_weaviate_url(self._port)
+
+        report = DeferralReport()
+        install._self_heal_kg_bindings_on_update(report)
+
+        # Binding heal worked.
+        bindings = _read_bindings(self._db_path)
+        self.assertEqual(
+            bindings,
+            [("p1", "shared", "VibeCodedOrchestrator_KnowledgeGraph")],
+        )
+        # Deferral emitted (binding rebind).
+        ids = [e.condition_id for e in report.entries]
+        self.assertIn("kg_binding_self_healed", ids)
+
+
+if __name__ == "__main__":
+    unittest.main()

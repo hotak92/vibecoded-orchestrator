@@ -132,7 +132,7 @@ def derive_project_collection_names(project_name: str) -> dict:
           "kg_collection":              "<sanitized>_KnowledgeGraph",
           "development_collection":     "<sanitized>_Development",   # uppercase D
           "project_name":               <raw, not sanitized>,
-          "shared_kg_collection":       "VibecodedOrchestrator_KnowledgeGraph",
+          "shared_kg_collection":       "VibeCodedOrchestrator_KnowledgeGraph",
           "shared_kg_write_disabled":   "false",
           "kg_basename":                "<sanitized>",
         }
@@ -147,17 +147,20 @@ def derive_project_collection_names(project_name: str) -> dict:
     #   - this file (vco_lib/project_init.py)
     #   - launcher/src/lib/project-state/IdentityTab.svelte fallback
     #   - all migration scripts (scripts/migrate-shared-kg-schema.{sh,ps1})
-    # Renamed from VibeCodedTools_KnowledgeGraph in v0.2.12 (PR-26 / Group E)
-    # to match the orchestrator branding + the convention seen on existing
-    # developer installs (the class on disk uses this exact spelling).
-    # Note casing: lowercase-d "Vibecoded" preserved per existing-installs.
-    # Users with data under the old name can migrate via the launcher's
-    # Shared KG picker (Settings -> Identity -> "Manage shared KG collection").
+    # Renamed from VibeCodedTools_KnowledgeGraph in v0.2.12 (PR-26 / Group E).
+    # v0.2.23 B1 (2026-05-21) flipped the casing from lowercase-c "Vibecoded"
+    # back to capital-C "VibeCoded" to match the brand spelling. Existing
+    # installs with the lowercase-c class are adopted in place via the
+    # case-insensitive lookup in `install.py::_ensure_collections` and the
+    # binding-row self-heal step in `install.py::_self_heal_kg_bindings_on_update`.
+    # Users with data under the legacy `VibeCodedTools_KnowledgeGraph` name
+    # can still migrate via the launcher's Shared KG picker
+    # (Settings -> Identity -> "Manage shared KG collection").
     return {
         "kg_collection": f"{basename}_KnowledgeGraph",
         "development_collection": f"{basename}_Development",
         "project_name": project_name,
-        "shared_kg_collection": "VibecodedOrchestrator_KnowledgeGraph",
+        "shared_kg_collection": "VibeCodedOrchestrator_KnowledgeGraph",
         "shared_kg_write_disabled": "false",
         "kg_basename": basename,
     }
@@ -1464,14 +1467,15 @@ _migrate_collections = migrate_collections
 #      `ensure-containers.sh` is the second-line backstop for the next
 #      Claude Code session.
 #
-# Shared KG (`VibecodedOrchestrator_KnowledgeGraph`, renamed from
-# `VibeCodedTools_KnowledgeGraph` in v0.2.12 PR-26 — see
-# `_LEGACY_SHARED_KG_NAME` below for the legacy alias still used by
-# migration-detection paths): created when missing regardless of any
-# per-project SHARED_KG_WRITE_DISABLED toggle (or its legacy
-# SHARED_KG_OPT_OUT alias). Per the coordinator's 2026-05-01 directive:
-# every project ALWAYS reads the shared KG; the toggle is purely a
-# runtime write-gate. Creation is not gated on it.
+# Shared KG (`VibeCodedOrchestrator_KnowledgeGraph` since v0.2.23 B1,
+# previously `VibecodedOrchestrator_KnowledgeGraph` since v0.2.12 PR-26
+# which renamed from the pre-v0.2.12 `VibeCodedTools_KnowledgeGraph` — see
+# `_LEGACY_SHARED_KG_NAME` and `_LEGACY_SHARED_KG_NAME_LOWERCASE_C` below
+# for the legacy aliases still used by migration-detection paths):
+# created when missing regardless of any per-project SHARED_KG_WRITE_DISABLED
+# toggle (or its legacy SHARED_KG_OPT_OUT alias). Per the coordinator's
+# 2026-05-01 directive: every project ALWAYS reads the shared KG; the toggle
+# is purely a runtime write-gate. Creation is not gated on it.
 # ---------------------------------------------------------------------------
 
 
@@ -1483,7 +1487,14 @@ _migrate_collections = migrate_collections
 #   * `scripts/migrate-shared-kg-schema.{sh,ps1}` defaults.
 # The cross-language invariant test `tests/test_shared_kg_constant_consistency.py`
 # pins these in lockstep so any drift fails CI loudly.
-_SHARED_KG_NAME = "VibecodedOrchestrator_KnowledgeGraph"
+#
+# v0.2.23 B1 (2026-05-21): canonical casing flipped from "Vibecoded" (lowercase
+# c) to "VibeCoded" (capital C) to match the brand spelling. New installs
+# create classes with capital C; case-insensitive adoption in install.py
+# means an existing lowercase-c class is adopted in-place (no rename, no
+# data loss). The lowercase-c name is kept as a legacy alias for
+# detection-only purposes (see _LEGACY_SHARED_KG_NAME_LOWERCASE_C).
+_SHARED_KG_NAME = "VibeCodedOrchestrator_KnowledgeGraph"
 
 # Legacy shared-KG class name (pre-v0.2.12 PR-26 rename). Migration-detection
 # code that recognizes user installs still carrying the old class uses THIS
@@ -1494,6 +1505,18 @@ _SHARED_KG_NAME = "VibecodedOrchestrator_KnowledgeGraph"
 # consent mechanism for renaming the on-disk class; this code never
 # auto-renames or auto-drops.
 _LEGACY_SHARED_KG_NAME = "VibeCodedTools_KnowledgeGraph"
+
+# Lowercase-c variant of the canonical name (PR-34 / v0.2.12 default
+# through v0.2.22). v0.2.23 B1 flipped the canonical to capital-C to
+# match the brand spelling; this constant pins the prior default as a
+# legacy alias so case-insensitive-adoption code recognises a user
+# Weaviate that still carries the lowercase-c class.
+#
+# Same DO-NOT-USE-FOR-WRITES contract as _LEGACY_SHARED_KG_NAME: detection
+# only. Install.py's case-insensitive adoption logic rebinds the resolved
+# `SHARED_KG_COLLECTION` env value to whatever the live class actually is,
+# so downstream writes always target the on-disk casing.
+_LEGACY_SHARED_KG_NAME_LOWERCASE_C = "VibecodedOrchestrator_KnowledgeGraph"
 
 def _default_restart_container() -> str:
     """Resolve the Weaviate container name to attempt restarting.
@@ -2819,12 +2842,38 @@ def _emit_user_modified_deferral(
     # `.claude/env` (sourced by every VCO-installed project's tooling); if
     # the user runs from a shell without it, the prose tells them how to
     # set it manually.
+    # v0.2.23 B5 (D18 short-term): when a preserved file is likely
+    # CLAUDE.md (the common case — the user adds project-specific Dev
+    # Constraints / KG conventions to it), the highest-leverage action is
+    # NOT "diff manually" but "ask Claude to merge in this project session".
+    # Claude has the orchestrator's intent (this CLAUDE.md text) AND the
+    # user's project context loaded — it can produce a merged file in
+    # seconds that preserves both. We surface that as the FIRST option
+    # because it's the only one that scales when CLAUDE.md grows past the
+    # 100-line mark and per-file `diff -u` becomes impractical.
+    has_claude_md = any(
+        Path(p).name.lower() in ("claude.md", "claude.local.md")
+        for p in modified_files
+    )
+    claude_merge_hint = (
+        f"# RECOMMENDED for CLAUDE.md / CLAUDE.local.md (the common case):\n"
+        f"# open this folder in Claude Code and ask:\n"
+        f"#   \"Merge the orchestrator's shipped CLAUDE.md against my local\n"
+        f"#    one. Preserve project-specific Dev Constraints / KG conventions\n"
+        f"#    but adopt new orchestrator-shipped guidance. Show me the diff\n"
+        f"#    before writing.\"\n"
+        f"# Claude reads $VCT_ORCHESTRATOR_ROOT/CLAUDE.md and your local one,\n"
+        f"# proposes a 3-way merge, and writes the result with your approval.\n"
+        f"#\n"
+        if has_claude_md else ""
+    )
     cmd = (
-        f"# Inspect the differences (per file):\n"
+        f"{claude_merge_hint}"
+        f"# Inspect the differences (per file, if you prefer the manual path):\n"
         f"#   diff -u <orchestrator>/<source-rel> {folder}/<dest-rel>\n"
         f"# Run from a shell where `.claude/env` has been sourced (or\n"
         f"# prepend VCT_ORCHESTRATOR_ROOT=/path/to/VCO_dev). Then either\n"
-        f"# accept shipped versions (forces overwrite):\n"
+        f"# accept shipped versions (forces overwrite — destroys local edits):\n"
         f"python -m vco_lib.project_init install-bundle "
         f"--folder {str(folder)!r} --orchestrator-root "
         f"\"$VCT_ORCHESTRATOR_ROOT\" --update --force --json\n"
@@ -5622,7 +5671,8 @@ def _cmd_drop_collections(args: argparse.Namespace) -> int:
     """`drop-collections --name <project_name> [--weaviate-url <url>] --json`
 
     Drop the project's OWN Weaviate collections (`<sanitized>_KnowledgeGraph`,
-    `<sanitized>_Development`). The shared KG (`VibecodedOrchestrator_KnowledgeGraph`,
+    `<sanitized>_Development`). The shared KG (`VibeCodedOrchestrator_KnowledgeGraph`
+    since v0.2.23 B1, was `VibecodedOrchestrator_KnowledgeGraph` v0.2.12–v0.2.22,
     or whatever `_SHARED_KG_NAME` resolves to — was `VibeCodedTools_KnowledgeGraph`
     pre-v0.2.12 PR-26) is NEVER touched — every project depends on read
     access to it, and it's owned by the orchestrator install, not by any
@@ -5635,7 +5685,7 @@ def _cmd_drop_collections(args: argparse.Namespace) -> int:
 
     JSON stdout schema:
       {"dropped": ["<Project>_KnowledgeGraph", "<Project>_Development"],
-       "skipped_shared": "VibecodedOrchestrator_KnowledgeGraph",
+       "skipped_shared": "VibeCodedOrchestrator_KnowledgeGraph",
        "errors": [{"collection": <name>, "error": <str>}]}
 
     Exit 0 on clean drop (incl. 404). Exit 1 when at least one drop

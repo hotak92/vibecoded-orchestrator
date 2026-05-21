@@ -45,6 +45,43 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Resolver protocol version this client understands. MUST stay in
+# lock-step with `RESOLVER_PROTOCOL_VERSION` in vco_lib/project_config.py
+# and the bash sibling. When the hub reports a HIGHER value, we emit
+# one best-effort stderr warning (forward-compat safety net) and
+# continue — the hub's response shape is additive across versions.
+$Script:RESOLVER_PROTOCOL_VERSION = 1
+# Process-local one-shot guard mirroring the bash sibling.
+$Script:SchemaWarned = $false
+
+function Test-SchemaVersionWarning {
+    param([string]$Body)
+    if ($Script:SchemaWarned) { return }
+    if (-not $Body) { return }
+    try {
+        $obj = $Body | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        return
+    }
+    # Missing field → pre-v0.2.22 hub. No warning.
+    $prop = $obj.PSObject.Properties['schema_version']
+    if ($null -eq $prop) { return }
+    $raw = $prop.Value
+    if ($null -eq $raw) { return }
+    $hubVersion = 0
+    if (-not [int]::TryParse([string]$raw, [ref]$hubVersion)) {
+        # Malformed value — defensive degradation, no warning, no crash.
+        return
+    }
+    if ($hubVersion -gt $Script:RESOLVER_PROTOCOL_VERSION) {
+        [Console]::Error.WriteLine(
+            ("[vct_project_config] WARNING: hub schema_version={0} > client RESOLVER_PROTOCOL_VERSION={1}; some fields may be unknown. Update the orchestrator clone or downgrade the hub." -f `
+                $hubVersion, $Script:RESOLVER_PROTOCOL_VERSION)
+        )
+        $Script:SchemaWarned = $true
+    }
+}
+
 function Write-Err {
     param([string]$Message)
     [Console]::Error.WriteLine("[vct-project-config] $Message")
@@ -341,6 +378,11 @@ function Get-Config {
             return 1
         }
         200 {
+            # Forward-compat check: warn (once, best-effort) if the
+            # hub reports a higher schema_version than we understand.
+            # Single-field envelopes omit `schema_version`; the helper
+            # treats that as "no warning" (defensive degradation).
+            try { Test-SchemaVersionWarning -Body $result.Body } catch { }
             if ($FieldName) {
                 # Single-field envelope: {"<field>": <value>}. Unwrap.
                 try {

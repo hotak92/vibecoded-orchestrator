@@ -81,17 +81,20 @@
 
   // Derived: the shared KG collection name. When the orchestratorRootView
   // is available, compute it from the root's name. Otherwise falls back
-  // to the canonical default ("VibecodedOrchestrator_KnowledgeGraph").
+  // to the canonical default ("VibeCodedOrchestrator_KnowledgeGraph").
   //
-  // PR-26 / Group E (v0.2.12 / 2026-05-16): aligned with the canonical
-  // name used by `vco_lib/project_init.py::derive_project_collection_names`
-  // and the existing-installs convention (lowercase-d "Vibecoded"). Was
-  // "VibeCodedOrchestrator_KnowledgeGraph" pre-v0.2.12 — that spelling
-  // never matched the actual class users had on disk.
+  // v0.2.23 B1 (2026-05-21): casing flipped from lowercase-c "Vibecoded"
+  // (the v0.2.12–v0.2.22 default) back to capital-C "VibeCoded" to match
+  // the brand spelling. Existing installs with the lowercase-c class are
+  // adopted in place via case-insensitive lookup in
+  // `install.py::_ensure_collections`; the launcher's Shared KG picker
+  // surfaces the live class name regardless of casing. The "VibeCodedTools"
+  // pre-v0.2.12 alias remains a legacy-detection path; users migrate via
+  // the picker.
   const sharedKgName = $derived(
     orchestratorRootView
       ? `${sanitizeKgCollection(orchestratorRootView.name)}_KnowledgeGraph`
-      : 'VibecodedOrchestrator_KnowledgeGraph'
+      : 'VibeCodedOrchestrator_KnowledgeGraph'
   );
 
   // PR-8: manual entry point for the legacy-collections cleanup, gated to
@@ -110,10 +113,12 @@
   // exist on the user's Weaviate and the derived canonical name doesn't
   // match exactly one of them — e.g. a user with an old
   // `VibeCodedTools_KnowledgeGraph` class alongside the new canonical
-  // `VibecodedOrchestrator_KnowledgeGraph` can choose which one is
-  // authoritative without hand-editing env files. Soft-fail: if the
-  // detect call fails (Weaviate unreachable, GUI offline, etc.) the
-  // picker just doesn't show — `sharedKgName` continues to render.
+  // `VibeCodedOrchestrator_KnowledgeGraph` (or the v0.2.12–v0.2.22
+  // lowercase-c variant `VibecodedOrchestrator_KnowledgeGraph`) can
+  // choose which one is authoritative without hand-editing env files.
+  // Soft-fail: if the detect call fails (Weaviate unreachable, GUI
+  // offline, etc.) the picker just doesn't show — `sharedKgName`
+  // continues to render.
   let detectedKgClasses = $state<string[]>([]);
   let showKgPicker = $state(false);
   let savingSharedKgPick = $state(false);

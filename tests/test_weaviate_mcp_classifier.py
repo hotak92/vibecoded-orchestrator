@@ -153,7 +153,7 @@ class SchemaErrorTests(unittest.TestCase):
         except ImportError:
             self.skipTest("weaviate-client not installed")
         exc = WeaviateQueryError(
-            "could not find class VibecodedOrchestrator_KnowledgeGraph "
+            "could not find class VibeCodedOrchestrator_KnowledgeGraph "
             "in schema",
             "GRPC search",
         )

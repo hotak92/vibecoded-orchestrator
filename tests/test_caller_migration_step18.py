@@ -122,7 +122,7 @@ class WeaviateMcpServerResolverTests(unittest.TestCase):
             shared_kg_collection="HubShared",
             development_collection="HubDev",
             active_embedding="qwen3",
-            code_graph_project="hubproj",
+            code_graph_project="hubproj",  # slug alias (kept for cfg shape)
         )
 
         # Stub resolve() BEFORE reimporting the server.
@@ -136,7 +136,11 @@ class WeaviateMcpServerResolverTests(unittest.TestCase):
         self.assertEqual(server.SHARED_KG_COLLECTION, "HubShared")
         self.assertEqual(server.DEVELOPMENT_COLLECTION, "HubDev")
         self.assertEqual(server.ACTIVE_EMBEDDING, "qwen3")
-        self.assertEqual(server.CODE_GRAPH_PROJECT, "hubproj")
+        # v0.2.23 W3 (2026-05-21): server.CODE_GRAPH_PROJECT now sources
+        # from cfg.code_graph_collection_prefix (the binding-row truth),
+        # NOT cfg.code_graph_project (the slug alias). The fixture's
+        # `code_graph_collection_prefix="Hubproject"` is what propagates.
+        self.assertEqual(server.CODE_GRAPH_PROJECT, "Hubproject")
 
     def test_hub_unreachable_falls_back_to_env(self):
         """Hub raises → KG_COLLECTION/etc reflect os.getenv."""
@@ -170,10 +174,13 @@ class WeaviateMcpServerResolverTests(unittest.TestCase):
 
         self.assertEqual(server.KG_COLLECTION, "ClaudeKnowledgeGraph")
         # SHARED_KG_COLLECTION default in v0.2.12+ is the orchestrator
-        # collection — preserved across the migration.
+        # collection — preserved across the migration. v0.2.23 B1 flipped
+        # the canonical casing to capital-C "VibeCoded" to match the
+        # brand spelling; case-insensitive adoption in install.py keeps
+        # existing on-disk lowercase-c classes untouched.
         self.assertEqual(
             server.SHARED_KG_COLLECTION,
-            "VibecodedOrchestrator_KnowledgeGraph",
+            "VibeCodedOrchestrator_KnowledgeGraph",
         )
         self.assertEqual(server.DEVELOPMENT_COLLECTION, "")
         self.assertEqual(server.ACTIVE_EMBEDDING, "qwen3")

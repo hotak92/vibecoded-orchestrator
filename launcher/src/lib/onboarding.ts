@@ -128,8 +128,10 @@ export async function markOnboardingComplete(): Promise<void> {
 }
 
 /**
- * Mark onboarding as NOT complete. Called by the SettingsPanel "Run setup
- * wizard" button so the wizard re-fires on the next layout mount.
+ * Mark onboarding as NOT complete. Called by the /preferences page's
+ * "Re-run wizard" button (which was the SettingsPanel "Run setup wizard"
+ * button until v0.2.23 F2 wave 2b deleted that popover) so the wizard
+ * re-fires on the next layout mount.
  *
  * Also cleans up the legacy localStorage key if it lingers — so a forced
  * re-run actually re-runs and isn't immediately satisfied by the legacy

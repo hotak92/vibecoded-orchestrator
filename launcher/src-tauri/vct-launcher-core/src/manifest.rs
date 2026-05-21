@@ -138,6 +138,27 @@ pub struct ConfigTab {
     /// Sections rendered in order. Empty sections render as a header
     /// with no body — caller's choice.
     pub sections: Vec<ConfigSection>,
+    /// v0.2.23 F2 (2026-05-21): when false, the Sidebar's "Module
+    /// configuration" group SUPPRESSES the nav entry for this module —
+    /// the manifest is still discovered by `get_module_nav_items` (so
+    /// callers like the per-project Settings page can render the tab in
+    /// an embedded surface), but the standalone sidebar route is hidden.
+    ///
+    /// Default `true` keeps backwards compat for paid modules whose
+    /// only surface is `/modules/<id>/config`. The orchestrator-core
+    /// manifest sets this to `false` because v0.2.23 F2 folds its
+    /// controls into the per-project Settings page (rendered there when
+    /// the orchestrator-root project is the active project), so the
+    /// duplicate sidebar entry is no longer wanted.
+    #[serde(default = "default_show_in_sidebar")]
+    pub show_in_sidebar: bool,
+}
+
+/// Serde default for `ConfigTab::show_in_sidebar` — `true`. Implemented
+/// as a free fn rather than a closure so the `#[serde(default = "...")]`
+/// attribute can reference it by name.
+fn default_show_in_sidebar() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1442,5 +1463,63 @@ mod tests {
             total_info_count >= 3,
             "expected at least 3 info banners (one per section header)"
         );
+
+        // v0.2.23 F2 (2026-05-21): orchestrator-core opts out of the
+        // Sidebar's "Module configuration" group. Its controls are
+        // folded into the per-project Settings page when the active
+        // project is the orchestrator-root row. Keeping the standalone
+        // sidebar entry AND the per-project Settings rendering would
+        // duplicate the surface — the user explicitly asked to
+        // consolidate to one place.
+        assert!(
+            !tab.show_in_sidebar,
+            "orchestrator-core manifest must declare show_in_sidebar=false \
+             (its controls now live in per-project Settings when the \
+              orchestrator-root project is selected)"
+        );
+    }
+
+    /// v0.2.23 F2 (2026-05-21): the `show_in_sidebar` field defaults
+    /// to `true` when the manifest omits it. Pins backwards compat for
+    /// paid modules whose only GUI surface is `/modules/<id>/config`
+    /// — they keep their sidebar entry without having to bump the
+    /// manifest schema.
+    #[test]
+    fn config_tab_show_in_sidebar_defaults_to_true_when_unset() {
+        let manifest = ModuleManifest::from_json(gui_block_fixture_manifest())
+            .expect("fixture must parse");
+        let tab = manifest.gui.unwrap().config_tab.unwrap();
+        assert!(
+            tab.show_in_sidebar,
+            "show_in_sidebar must default to true so legacy paid-module \
+             manifests (no such field) keep their sidebar entry"
+        );
+    }
+
+    /// v0.2.23 F2 (2026-05-21): explicit `show_in_sidebar: false` in a
+    /// manifest deserializes faithfully. The fixture inlines the field
+    /// rather than going through the orchestrator manifest's full
+    /// shape, so this test exercises the serde plumbing in isolation.
+    #[test]
+    fn config_tab_show_in_sidebar_false_round_trips() {
+        let raw = r#"{
+            "id": "hidden-mod",
+            "name": "Hidden Module",
+            "version": "0.1.0",
+            "category": "paid-orchestrator",
+            "license": { "min_orchestrator_tier": "free" },
+            "install": { "method": "git_clone", "source": "https://example.com/x.git" },
+            "runtime": { "type": "service", "command": "echo" },
+            "gui": {
+                "config_tab": {
+                    "title": "Hidden Tab",
+                    "show_in_sidebar": false,
+                    "sections": []
+                }
+            }
+        }"#;
+        let manifest = ModuleManifest::from_json(raw).expect("must parse");
+        let tab = manifest.gui.unwrap().config_tab.unwrap();
+        assert!(!tab.show_in_sidebar);
     }
 }

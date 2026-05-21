@@ -153,10 +153,13 @@ def _make_args(
     )
 
 
-def _make_sysinfo(*, has_gpu: bool) -> install.SystemInfo:
-    """Build a minimal SystemInfo. Only ``has_gpu`` is read by
-    _choose_embedding_config; the rest are filled to satisfy the
-    NamedTuple contract.
+def _make_sysinfo(*, has_gpu: bool, ram_gb: float = 64.0) -> install.SystemInfo:
+    """Build a minimal SystemInfo. ``has_gpu`` toggles GPU presence;
+    ``ram_gb`` overrides system RAM (default 64.0 to match historical
+    test-fixture behaviour). Other fields are filled to satisfy the
+    NamedTuple contract — v0.2.23 C10 made the CPU selector RAM- AND
+    cores-aware, so tests that exercise the no-GPU path now must
+    either tune ram_gb here OR mock `install._probe_cpu_cores`.
     """
     return install.SystemInfo(
         os_name="Linux",
@@ -165,7 +168,7 @@ def _make_sysinfo(*, has_gpu: bool) -> install.SystemInfo:
         container_cmd="podman",
         gpu_name="NVIDIA RTX 4090" if has_gpu else "",
         vram_gb=24.0 if has_gpu else 0.0,
-        ram_gb=64.0,
+        ram_gb=ram_gb,
         gpu_vendor="nvidia" if has_gpu else "",
     )
 
@@ -351,13 +354,33 @@ class ChooseEmbeddingConfigDispatchTests(unittest.TestCase):
         )
 
     def test_mid_power_no_gpu_autodetect_picks_cpu_preset(self):
-        """No GPU, no CLI overrides → mid/low-power class → cpu preset.
-        (v0.2.21 collapses mid + low into cpu — see
-        test_low_power_collapses_with_mid_today.)"""
-        self._assert_class_picks_preset(
-            "mid_power",
-            sysinfo=_make_sysinfo(has_gpu=False),
-            args=_make_args(),
+        """v0.2.23 C10 made the no-GPU path tier-aware. With 64GB RAM +
+        8 cores, the new selectors surgically OVERRIDE the legacy
+        `cpu` preset's code_model from Jina to qwen3 (per user spec:
+        24+GB RAM AND 8+ cores → qwen3 on CPU). Assert explicit models
+        rather than preset-mapping to stay accurate post-C10."""
+        with patch.object(install, "_probe_cpu_cores", return_value=8):
+            cfg = install._choose_embedding_config(
+                _make_sysinfo(has_gpu=False, ram_gb=64.0),
+                _make_args(),
+            )
+        # Tier-bumped surgical overrides (C10):
+        self.assertEqual(cfg["text_model"], "qwen3-embedding:0.6b")
+        self.assertEqual(cfg["code_model"], "qwen3-embedding:0.6b")
+
+    def test_low_spec_cpu_autodetect_picks_arctic_and_jina(self):
+        """v0.2.23 C10 — added: low-spec CPU (no GPU, <24GB OR <8 cores)
+        now auto-picks arctic2 (text) + Jina (code). Was only reachable
+        via explicit --low-resource pre-C10."""
+        with patch.object(install, "_probe_cpu_cores", return_value=4):
+            cfg = install._choose_embedding_config(
+                _make_sysinfo(has_gpu=False, ram_gb=16.0),
+                _make_args(),
+            )
+        self.assertEqual(cfg["text_model"], "snowflake-arctic-embed2:latest")
+        self.assertEqual(
+            cfg["code_model"],
+            "unclemusclez/jina-embeddings-v2-base-code:latest",
         )
 
     def test_cpu_only_flag_forces_cpu_preset_even_with_gpu(self):

@@ -190,7 +190,7 @@ class RetrievalTuningRoundTrip(unittest.TestCase):
             "code_graph_project": "test",
             "code_graph_collection_prefix": "Test",
             "kg_collection": "Test_KG",
-            "shared_kg_collection": "VibecodedOrchestrator_KnowledgeGraph",
+            "shared_kg_collection": "VibeCodedOrchestrator_KnowledgeGraph",
             "development_collection": "",
             "active_embedding": "qwen3",
             "embedding_models": {
@@ -285,7 +285,7 @@ class RetrievalTuningDefaultsDriftGuard(unittest.TestCase):
             "project_display_name": "P", "code_graph_project": "p",
             "code_graph_collection_prefix": "P",
             "kg_collection": "P_KG",
-            "shared_kg_collection": "VibecodedOrchestrator_KnowledgeGraph",
+            "shared_kg_collection": "VibeCodedOrchestrator_KnowledgeGraph",
             "development_collection": "",
             "active_embedding": "qwen3",
             "embedding_models": {"text": "t", "code": "c"},

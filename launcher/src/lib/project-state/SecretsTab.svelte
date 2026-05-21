@@ -1,8 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { goto } from '$app/navigation';
   import { invoke } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
-  import { ui } from '$lib/stores/ui';
   import type { ProjectSecretRef } from '$lib/types/project-state';
 
   let { projectId }: { projectId: string } = $props();
@@ -19,11 +19,11 @@
   }
 
   function deepLinkSet(_key: string) {
-    // 2026-04-29: previously dispatched a 'vct-open-secrets' window event
-    // that no listener consumed (dead code — confirmed by repo-wide grep).
-    // Open Settings → Secrets directly via the ui store, which
-    // SettingsPanel reads on mount via $ui.settingsInitialSection.
-    ui.openSettings('secrets');
+    // v0.2.23 F2 wave 2b (2026-05-21): the SettingsPanel popover (which
+    // had a Secrets sub-tab) was merged into /preferences. The Secrets
+    // sub-tab was a duplicate of the dedicated /preferences/secrets
+    // route, so it was dropped and we navigate directly here.
+    void goto('/preferences/secrets');
   }
 
   async function del(key: string) {

@@ -1585,7 +1585,7 @@ class BootstrapCollectionsTests(unittest.TestCase):
         # Three classes: per-project KG, per-project Dev, shared KG.
         self.assertIn("VideoFrames_KnowledgeGraph", created)
         self.assertIn("VideoFrames_Development", created)
-        self.assertIn("VibecodedOrchestrator_KnowledgeGraph", created)
+        self.assertIn("VibeCodedOrchestrator_KnowledgeGraph", created)
 
     def test_idempotent_when_collections_exist(self):
         # Bug-1 v0.2.4 (2026-05-12): the existence check now also probes
@@ -1631,7 +1631,7 @@ class BootstrapCollectionsTests(unittest.TestCase):
                 "VideoFrames", project_folder=self.proj, kg_only=True,
             )
         self.assertIn("VideoFrames_KnowledgeGraph", created)
-        self.assertIn("VibecodedOrchestrator_KnowledgeGraph", created)
+        self.assertIn("VibeCodedOrchestrator_KnowledgeGraph", created)
         self.assertNotIn("VideoFrames_Development", created)
 
     def test_restart_succeeds_then_bootstrap_continues(self):

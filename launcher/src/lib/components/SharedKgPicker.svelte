@@ -8,10 +8,16 @@
   // install.
   //
   // Use case: a v0.2.11 user who already has a populated
-  // `VibeCodedTools_KnowledgeGraph` class (the pre-rename canonical name)
-  // sees the new v0.2.12 default `VibecodedOrchestrator_KnowledgeGraph`
+  // `VibeCodedTools_KnowledgeGraph` class (the pre-rename canonical name),
+  // or a v0.2.12–v0.2.22 user with the lowercase-c
+  // `VibecodedOrchestrator_KnowledgeGraph` class, sees the new v0.2.23 B1
+  // default `VibeCodedOrchestrator_KnowledgeGraph` (capital-C brand casing)
   // doesn't match anything on disk. Picker lets them keep the existing
   // data without manual env-file editing or running the migration script.
+  // (Note: case-insensitive adoption in install.py + the binding-row
+  // self-heal mean fresh `--update` runs auto-resolve the lowercase-c
+  // case without picker interaction; the picker remains as the consent
+  // mechanism for the pre-v0.2.12 `VibeCodedTools` legacy.)
   //
   // Behaviour rules:
   //   - READ-ONLY: picking a name only updates the persisted canonical

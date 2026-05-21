@@ -18,7 +18,9 @@
 //! Key invariants:
 //!   * Defaults match the canonical hardcoded values (`localhost:8081`,
 //!     `localhost:11435`, `localhost:11440`, "qwen3",
-//!     "VibecodedOrchestrator_KnowledgeGraph" — renamed from
+//!     "VibeCodedOrchestrator_KnowledgeGraph" — flipped to capital-C in
+//!     v0.2.23 B1 from the v0.2.12–v0.2.22 lowercase-c casing
+//!     "VibecodedOrchestrator_KnowledgeGraph", itself renamed from
 //!     "VibeCodedTools_KnowledgeGraph" in v0.2.12 PR-26 — etc.) so a
 //!     launcher with no custom settings produces identical output to the
 //!     pre-refactor code modulo the shared-KG rename.
@@ -40,8 +42,9 @@ use crate::services::adoption::{self, AdoptionMode};
 pub const APP_STATE_KEY_ACTIVE_EMBEDDING: &str = "embedding.active_profile";
 
 /// `app_state` key for an override of the cross-project shared KG class name.
-/// Default: `"VibecodedOrchestrator_KnowledgeGraph"` (renamed from
-/// `"VibeCodedTools_KnowledgeGraph"` in v0.2.12 PR-26 / Group E).
+/// Default: `"VibeCodedOrchestrator_KnowledgeGraph"` (since v0.2.23 B1; was
+/// `"VibecodedOrchestrator_KnowledgeGraph"` v0.2.12–v0.2.22, itself renamed
+/// from `"VibeCodedTools_KnowledgeGraph"` in v0.2.12 PR-26 / Group E).
 /// White-label / fork installs can swap this without recompiling.
 pub const APP_STATE_KEY_SHARED_KG_NAME: &str = "shared_kg.collection_name";
 
@@ -71,7 +74,15 @@ pub const DEFAULT_ACTIVE_EMBEDDING: &str = "qwen3";
 /// Cross-language invariant test
 /// `tests/test_shared_kg_constant_consistency.py` pins these together so any
 /// drift fails CI loudly.
-pub const DEFAULT_SHARED_KG_COLLECTION: &str = "VibecodedOrchestrator_KnowledgeGraph";
+///
+/// v0.2.23 B1 (2026-05-21): casing flipped from lowercase-c "Vibecoded"
+/// (the v0.2.12–v0.2.22 default) back to capital-C "VibeCoded" to match
+/// the brand spelling. Case-insensitive adoption in
+/// `install.py::_ensure_collections` plus the binding-row self-heal step
+/// in `install.py::_self_heal_kg_bindings_on_update` ensure existing
+/// installs with the lowercase-c class are adopted in place — no rename,
+/// no data loss, no re-embedding.
+pub const DEFAULT_SHARED_KG_COLLECTION: &str = "VibeCodedOrchestrator_KnowledgeGraph";
 
 /// Legacy shared-KG class name (pre-v0.2.12 PR-26 rename). Used ONLY by
 /// migration-detection paths (e.g., `commands::kg::list_kg_collections`
@@ -79,6 +90,20 @@ pub const DEFAULT_SHARED_KG_COLLECTION: &str = "VibecodedOrchestrator_KnowledgeG
 /// default for new writes — picker-driven migration is the consent
 /// mechanism for renaming the on-disk class.
 pub const LEGACY_SHARED_KG_COLLECTION: &str = "VibeCodedTools_KnowledgeGraph";
+
+/// Lowercase-c variant of the canonical name (PR-34 / v0.2.12 default
+/// through v0.2.22). v0.2.23 B1 flipped the canonical to capital-C to
+/// match the brand spelling; this constant pins the prior default as a
+/// legacy alias so case-insensitive-adoption code recognises a user
+/// Weaviate that still carries the lowercase-c class.
+///
+/// Same DO-NOT-USE-FOR-WRITES contract as `LEGACY_SHARED_KG_COLLECTION`:
+/// detection only. Install.py's case-insensitive adoption logic rebinds
+/// the resolved `SHARED_KG_COLLECTION` env value to whatever the live
+/// class actually is, so downstream writes always target the on-disk
+/// casing.
+pub const LEGACY_SHARED_KG_COLLECTION_LOWERCASE_C: &str =
+    "VibecodedOrchestrator_KnowledgeGraph";
 
 /// Populated once per project-env write call. Plumbed through
 /// `write_project_env_files` and `ensure_project_env_template` so future
@@ -118,9 +143,10 @@ pub struct ProjectEnvSettings {
     pub dev_collection: String,
 
     /// Cross-project shared KG class name. Default
-    /// `"VibecodedOrchestrator_KnowledgeGraph"` (renamed from
-    /// `"VibeCodedTools_KnowledgeGraph"` in v0.2.12 PR-26); overridable
-    /// via app_state.
+    /// `"VibeCodedOrchestrator_KnowledgeGraph"` (since v0.2.23 B1; was
+    /// `"VibecodedOrchestrator_KnowledgeGraph"` v0.2.12–v0.2.22, itself
+    /// renamed from `"VibeCodedTools_KnowledgeGraph"` in v0.2.12 PR-26);
+    /// overridable via app_state.
     pub shared_kg_collection: String,
 
     /// Asymmetric write-gate (read of shared KG is unconditional).
@@ -896,7 +922,7 @@ mod tests {
         let s = ProjectEnvSettings::with_defaults("My Project");
         assert_eq!(s.kg_collection, "MyProject_KnowledgeGraph");
         assert_eq!(s.dev_collection, "MyProject_Development");
-        assert_eq!(s.shared_kg_collection, "VibecodedOrchestrator_KnowledgeGraph");
+        assert_eq!(s.shared_kg_collection, "VibeCodedOrchestrator_KnowledgeGraph");
         assert_eq!(s.weaviate_url, "http://localhost:8081");
         assert_eq!(s.ollama_url, "http://localhost:11435");
         assert_eq!(s.code_embed_url, "http://localhost:11440");
@@ -1003,7 +1029,7 @@ mod tests {
         assert_eq!(s.ollama_port, DEFAULT_OLLAMA_PORT);
         assert_eq!(s.code_embed_port, DEFAULT_CODE_EMBED_PORT);
         assert_eq!(s.kg_collection, "Acme_KnowledgeGraph");
-        assert_eq!(s.shared_kg_collection, "VibecodedOrchestrator_KnowledgeGraph");
+        assert_eq!(s.shared_kg_collection, "VibeCodedOrchestrator_KnowledgeGraph");
         assert!(!s.shared_kg_write_disabled);
     }
 

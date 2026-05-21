@@ -780,14 +780,17 @@ def enumerate_kg_collections(
         Shared KG triple for that project (from
         `vco_lib.project_init.derive_project_collection_names`). The
         shared KG name is the LOCKED constant
-        `VibecodedOrchestrator_KnowledgeGraph` (since v0.2.12 / PR-26).
+        `VibeCodedOrchestrator_KnowledgeGraph` (since v0.2.23 B1 / brand
+        casing flip; was `VibecodedOrchestrator_KnowledgeGraph` v0.2.12–
+        v0.2.22 — kept as a legacy alias below).
       * If `project_name` is None, list every class on the server and
         return those that end in `_KnowledgeGraph` or `_Development`
         (per-project) PLUS the shared KG class
-        (`VibecodedOrchestrator_KnowledgeGraph` if present). Per-project
-        prefix discovery is approximate — we err on the side of
-        including matching classes so an "all projects" migrate covers
-        the dev install.
+        (`VibeCodedOrchestrator_KnowledgeGraph` if present, plus its
+        v0.2.12–v0.2.22 lowercase-c variant and the pre-v0.2.12
+        `VibeCodedTools_KnowledgeGraph`). Per-project prefix discovery is
+        approximate — we err on the side of including matching classes
+        so an "all projects" migrate covers the dev install.
 
     Filters out collections that don't actually exist on the server
     (the per-project triple includes Dev which is sometimes absent).
@@ -809,14 +812,20 @@ def enumerate_kg_collections(
 
     # All projects path.
     kg_suffixes = ("_KnowledgeGraph", "_Development")
-    shared_kg_default = "VibecodedOrchestrator_KnowledgeGraph"
+    shared_kg_default = "VibeCodedOrchestrator_KnowledgeGraph"
+    # v0.2.23 B1: lowercase-c variant kept as a legacy alias (was the
+    # default v0.2.12–v0.2.22 — see _LEGACY_SHARED_KG_NAME_LOWERCASE_C
+    # in project_init.py for the rationale).
+    legacy_shared_kg_lowercase_c = "VibecodedOrchestrator_KnowledgeGraph"
     legacy_shared_kg = "VibeCodedTools_KnowledgeGraph"  # pre-v0.2.12 alias
 
     found: list[str] = []
     for cls in listed:
         if any(cls.endswith(suffix) for suffix in kg_suffixes):
             found.append(cls)
-        elif cls in (shared_kg_default, legacy_shared_kg):
+        elif cls in (shared_kg_default,
+                     legacy_shared_kg_lowercase_c,
+                     legacy_shared_kg):
             found.append(cls)
     return sorted(set(found))
 

@@ -44,6 +44,15 @@
     route: string | null;
     description: string | null;
     sections: unknown[];
+    /** v0.2.23 F2 (2026-05-21): when `false`, the manifest opts the
+     *  module out of the "Module configuration" group below — the
+     *  config tab is still discoverable via `get_module_nav_items`
+     *  (e.g. for embedding inside the per-project Settings page), but
+     *  the standalone sidebar entry is suppressed. Optional in the
+     *  wire shape; Rust's serde default fills `true` when omitted,
+     *  but we tolerate `undefined` here too in case an older host
+     *  ever returns the field stripped. */
+    show_in_sidebar?: boolean;
   }
   interface ModuleNavItem {
     module_id: string;
@@ -221,19 +230,33 @@
     // `gui.config_tab.description` (falls back to the title). Hidden
     // entirely when no modules contribute a config_tab (avoids a stray
     // empty group label).
-    ...(moduleNavItems.length > 0
-      ? [
-          {
-            label: 'Module configuration',
-            items: moduleNavItems.map<NavItem>((mod) => ({
-              href: mod.route,
-              label: mod.title,
-              sub: mod.config_tab.description ?? mod.title,
-              match: (p) => p === mod.route || p.startsWith(`${mod.route}/`),
-            })),
-          } satisfies NavGroup,
-        ]
-      : []),
+    //
+    // v0.2.23 F2 (2026-05-21): manifests can opt out of this group by
+    // declaring `gui.config_tab.show_in_sidebar: false`. We still keep
+    // them in `moduleNavItems` (consumers like the per-project Settings
+    // page need to look up the orchestrator-core schema by id), but
+    // filter them OUT of the sidebar nav. Rust's serde default
+    // populates `true` when the field is absent in the manifest, so
+    // the strict equality below matches both legacy (undefined) and
+    // explicit-true cases.
+    ...((() => {
+      const visibleItems = moduleNavItems.filter(
+        (mod) => mod.config_tab.show_in_sidebar !== false,
+      );
+      return visibleItems.length > 0
+        ? [
+            {
+              label: 'Module configuration',
+              items: visibleItems.map<NavItem>((mod) => ({
+                href: mod.route,
+                label: mod.title,
+                sub: mod.config_tab.description ?? mod.title,
+                match: (p) => p === mod.route || p.startsWith(`${mod.route}/`),
+              })),
+            } satisfies NavGroup,
+          ]
+        : [];
+    })()),
     // Bug 33: Admin group — visible only when the cached tier is "admin".
     // Dev-only affordances. Routes also re-check tier server-side via
     // the standard validate-tier flow before exposing data, so a forged

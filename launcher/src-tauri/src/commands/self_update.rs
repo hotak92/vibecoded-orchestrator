@@ -705,7 +705,11 @@ pub fn get_user_owned_paths() -> Vec<String> {
 ///
 /// We err on the side of including 'diverged' since the post-rewrite case
 /// is exactly that.
-fn is_non_fast_forward(err: &str) -> bool {
+///
+/// `pub(crate)` so the orchestrator-update path
+/// (`commands::installer::update_orchestrator`) can share the same
+/// detection logic for its own divergence modal (B4 / D19, v0.2.23).
+pub(crate) fn is_non_fast_forward(err: &str) -> bool {
     let lower = err.to_lowercase();
     lower.contains("not possible to fast-forward")
         || lower.contains("non-fast-forward")
@@ -755,7 +759,10 @@ fn serialize_non_ff_error(
 /// Minimal JSON string escape — covers the characters git stderr can
 /// realistically contain. Doesn't handle every Unicode edge case (we
 /// don't need to: stderr is mostly ASCII English error messages).
-fn json_escape(s: &str) -> String {
+///
+/// `pub(crate)` so `commands::installer` can reuse the same escape rules
+/// when serializing its own non-FF / conflict payloads (B4 / D19, v0.2.23).
+pub(crate) fn json_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {

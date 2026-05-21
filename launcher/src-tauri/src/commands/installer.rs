@@ -3308,6 +3308,30 @@ pub async fn update_orchestrator<R: Runtime>(
             revert_pre_pull_rename(backup);
         }
         let _ = ensure_hub_started_after_update(&install_path);
+
+        // v0.2.23 (B4 / D19): non-fast-forward branch. The user's local
+        // clone has diverged from upstream (typical when they've edited
+        // CLAUDE.md / CONTEXT_STATE.md / KG nodes locally, or when we
+        // rewrote upstream history). Surface a structured payload so
+        // the frontend can render a "Merge / Rebase / Cancel" modal
+        // instead of dumping a raw git error to a toast.
+        //
+        // Best-effort: collect SHAs + a list of diverged files so the
+        // user can see what's about to be merged. Any failure here
+        // falls back to the legacy raw-error path — never block.
+        if crate::commands::self_update::is_non_fast_forward(&stderr) {
+            let local_sha = read_head_sha(&install_path).await;
+            let remote_sha = read_remote_sha(&install_path, &pull_branch).await;
+            let diverged_files =
+                collect_diverged_files(&install_path, &pull_branch).await;
+            return Err(serialize_orchestrator_non_ff_error(
+                &pull_branch,
+                local_sha.as_deref(),
+                remote_sha.as_deref(),
+                &diverged_files,
+                stderr.trim(),
+            ));
+        }
         return Err(format!("git pull failed: {}", stderr));
     }
 
@@ -3530,6 +3554,718 @@ pub async fn update_orchestrator<R: Runtime>(
         message: "Orchestrator updated successfully".to_string(),
         system,
     })
+}
+
+// ---------------------------------------------------------------------------
+// v0.2.23 (B4 / D19): divergence-recovery commands.
+//
+// When `update_orchestrator`'s ff-only pull fails because the local clone
+// has diverged from upstream (the user has local commits to CLAUDE.md,
+// CONTEXT_STATE.md, KG nodes, etc.), the frontend renders a modal asking
+// the user to choose merge / rebase / cancel. These commands are the
+// resolvers behind the merge/rebase buttons; abort is the safety net when
+// the merge/rebase produces conflicts.
+//
+// Design notes:
+//   - We re-use the same pre-pull-rename + hub-stop choreography as
+//     `update_orchestrator` so binary swaps and Windows file locks are
+//     handled the same way regardless of which pull variant the user
+//     chose.
+//   - On merge/rebase conflict we LEAVE the working tree in the
+//     conflicted state. The user might want to edit files manually in
+//     their editor. The "Abort" frontend button calls
+//     `abort_orchestrator_merge_or_rebase` to bail cleanly.
+//   - Discriminators on the error payloads:
+//       update_orchestrator non-FF             → "orchestrator_update_non_ff"
+//       merge/rebase conflict                  → "orchestrator_update_conflict"
+//     The frontend uses these to pick the right modal.
+// ---------------------------------------------------------------------------
+
+/// Best-effort: read HEAD's full SHA. Returns None on any failure (offline,
+/// detached HEAD, corrupted repo). The frontend renders "—" in that slot.
+async fn read_head_sha(repo: &Path) -> Option<String> {
+    let out = tokio::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo)
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if sha.is_empty() {
+        None
+    } else {
+        Some(sha)
+    }
+}
+
+/// Best-effort: read the upstream branch tip via `git ls-remote`. We use
+/// `ls-remote` rather than `rev-parse vco_upstream/<branch>` because the
+/// caller may not have fetched recently — `ls-remote` always hits the
+/// network and reports the current upstream tip.
+async fn read_remote_sha(repo: &Path, branch: &str) -> Option<String> {
+    let out = tokio::process::Command::new("git")
+        .args([
+            "ls-remote",
+            crate::commands::self_update::VCO_UPSTREAM_REMOTE,
+            branch,
+        ])
+        .current_dir(repo)
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    raw.split_whitespace().next().map(|s| s.to_string())
+}
+
+/// Best-effort: collect the list of files that differ between HEAD and
+/// the upstream branch tip. Used to populate the divergence modal so the
+/// user sees what would be merged. Returns an empty Vec on any failure
+/// (the modal then renders without a file list — still useful).
+async fn collect_diverged_files(repo: &Path, branch: &str) -> Vec<String> {
+    let out = tokio::process::Command::new("git")
+        .args([
+            "diff",
+            "--name-only",
+            &format!(
+                "HEAD..{}/{}",
+                crate::commands::self_update::VCO_UPSTREAM_REMOTE,
+                branch
+            ),
+        ])
+        .current_dir(repo)
+        .output()
+        .await;
+    let out = match out {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Best-effort: collect the list of currently-conflicted files after a
+/// merge or rebase. `git diff --name-only --diff-filter=U` lists every
+/// path with unresolved merge markers.
+async fn collect_conflicted_files(repo: &Path) -> Vec<String> {
+    let out = tokio::process::Command::new("git")
+        .args(["diff", "--name-only", "--diff-filter=U"])
+        .current_dir(repo)
+        .output()
+        .await;
+    let out = match out {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Serialize the non-fast-forward divergence payload the frontend's
+/// `OrchestratorUpdateDivergenceModal` consumes. Hand-rolled JSON to
+/// match the style used by `self_update::serialize_non_ff_error` — both
+/// surfaces emit error strings from Tauri commands; the frontend tries
+/// `JSON.parse(err)` and falls back to a raw toast when parsing fails.
+///
+/// Schema:
+///   {
+///     "event": "orchestrator_update_non_ff",
+///     "branch": "main",
+///     "local_sha":  "abc..." | null,
+///     "remote_sha": "def..." | null,
+///     "diverged_files": ["path/a", "path/b", ...],
+///     "git_stderr": "<raw error>"
+///   }
+fn serialize_orchestrator_non_ff_error(
+    branch: &str,
+    local: Option<&str>,
+    remote: Option<&str>,
+    diverged_files: &[String],
+    git_stderr: &str,
+) -> String {
+    let stderr_esc = crate::commands::self_update::json_escape(git_stderr);
+    let local_field = match local {
+        Some(s) => format!("\"{}\"", s),
+        None => "null".to_string(),
+    };
+    let remote_field = match remote {
+        Some(s) => format!("\"{}\"", s),
+        None => "null".to_string(),
+    };
+    let files_field: String = {
+        let parts: Vec<String> = diverged_files
+            .iter()
+            .map(|p| format!("\"{}\"", crate::commands::self_update::json_escape(p)))
+            .collect();
+        format!("[{}]", parts.join(","))
+    };
+    format!(
+        "{{\"event\":\"orchestrator_update_non_ff\",\"branch\":\"{}\",\"local_sha\":{},\"remote_sha\":{},\"diverged_files\":{},\"git_stderr\":\"{}\"}}",
+        branch, local_field, remote_field, files_field, stderr_esc
+    )
+}
+
+/// Serialize the merge/rebase conflict payload the frontend's
+/// `OrchestratorUpdateConflictModal` consumes.
+///
+/// Schema:
+///   {
+///     "event": "orchestrator_update_conflict",
+///     "operation": "merge" | "rebase",
+///     "branch": "main",
+///     "conflicted_files": ["path/a", "path/b", ...],
+///     "git_stderr": "<raw error>"
+///   }
+fn serialize_orchestrator_conflict_error(
+    operation: &str,
+    branch: &str,
+    conflicted_files: &[String],
+    git_stderr: &str,
+) -> String {
+    let stderr_esc = crate::commands::self_update::json_escape(git_stderr);
+    let files_field: String = {
+        let parts: Vec<String> = conflicted_files
+            .iter()
+            .map(|p| format!("\"{}\"", crate::commands::self_update::json_escape(p)))
+            .collect();
+        format!("[{}]", parts.join(","))
+    };
+    format!(
+        "{{\"event\":\"orchestrator_update_conflict\",\"operation\":\"{}\",\"branch\":\"{}\",\"conflicted_files\":{},\"git_stderr\":\"{}\"}}",
+        operation, branch, files_field, stderr_esc
+    )
+}
+
+/// Detect whether git stderr indicates a merge or rebase produced
+/// conflicts. Phrases observed on git 2.34+:
+///   - "CONFLICT (content): ..."
+///   - "Automatic merge failed; fix conflicts and then commit the result."
+///   - "could not apply ... — When you have resolved this problem"
+///   - "Resolve all conflicts manually, mark them as resolved with"
+fn is_merge_or_rebase_conflict(err: &str) -> bool {
+    let lower = err.to_lowercase();
+    lower.contains("conflict")
+        || lower.contains("automatic merge failed")
+        || lower.contains("could not apply")
+        || lower.contains("resolve all conflicts")
+}
+
+/// Resolve the current pull branch. Defaults to "main" on any error.
+/// Mirrors the in-place logic in `update_orchestrator` so the two paths
+/// can't disagree.
+async fn resolve_pull_branch(install_path: &Path) -> String {
+    let out = tokio::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(install_path)
+        .output()
+        .await;
+    let out = match out {
+        Ok(o) if o.status.success() => o,
+        _ => return "main".to_string(),
+    };
+    let b = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if b.is_empty() || b == "HEAD" {
+        "main".to_string()
+    } else {
+        b
+    }
+}
+
+/// Run the post-pull install.py + hub-start + restart sequence. This is
+/// the tail shared by `update_orchestrator` (after `git pull --ff-only`)
+/// and the new merge/rebase commands. Extracted as a free function so
+/// the two callers can't drift apart.
+///
+/// On success: spawns the new launcher detached and exits the current
+/// process (never returns Ok in practice). On error before the restart
+/// hop, returns Err with the install.py stderr tail. On error AT the
+/// restart hop, attempts the install.py fallback to emit a
+/// `launcher_restart_required` deferral so the next session's banner
+/// picks it up.
+///
+/// Caller MUST have already:
+///   - stopped the hub (`ensure_hub_stopped_for_update`)
+///   - pre-pull-renamed binaries if Windows
+///   - confirmed the pull/merge/rebase succeeded
+async fn run_post_pull_install_and_restart<R: Runtime>(
+    app: AppHandle<R>,
+    install_path: &Path,
+    path_string: String,
+    window: &Window,
+    system: SystemDetection,
+    pre_pull_renamed: Option<PathBuf>,
+    pre_pull_renamed_hub: Option<PathBuf>,
+) -> Result<InstallResult, String> {
+    emit_progress(window, "update", "Changes applied", 30.0);
+    emit_progress(window, "install", "Applying updates...", 40.0);
+
+    let python_cmd = &system.python_cmd;
+    let mut cmd = tokio::process::Command::new(python_cmd);
+    cmd.args(["install.py", "--update"])
+        .stdin(std::process::Stdio::null())
+        .current_dir(install_path);
+    cmd.env("VCT_LAUNCHER_PID", std::process::id().to_string());
+    cmd.env("VCT_AUTO_RESTART_LAUNCHER", "1");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    let install_output = cmd
+        .output()
+        .await
+        .map_err(|e| format!("install.py --update failed: {}", e))?;
+
+    if !install_output.status.success() {
+        let stderr = String::from_utf8_lossy(&install_output.stderr);
+        if let Some(backup) = pre_pull_renamed.as_deref() {
+            revert_pre_pull_rename(backup);
+        }
+        if let Some(backup) = pre_pull_renamed_hub.as_deref() {
+            revert_pre_pull_rename(backup);
+        }
+        let _ = ensure_hub_started_after_update(install_path);
+        return Err(format!("Update failed: {}", stderr));
+    }
+
+    emit_progress(window, "update", "Starting vct-hub...", 90.0);
+    if let Err(e) = ensure_hub_started_after_update(install_path) {
+        eprintln!(
+            "[vct] orchestrator post-pull: ensure_hub_started_after_update returned Err({}); \
+             continuing with launcher restart (hub will retry on next boot)",
+            e
+        );
+    }
+
+    emit_progress(
+        window,
+        "restart",
+        "Update applied — restarting launcher...",
+        95.0,
+    );
+
+    if let Err(e) =
+        crate::commands::restart::restart_launcher(app, path_string.clone()).await
+    {
+        // Mirror the recovery path in update_orchestrator: re-spawn
+        // install.py without VCT_AUTO_RESTART_LAUNCHER so the
+        // launcher_restart_required deferral gets emitted as a fallback.
+        eprintln!(
+            "[vct] orchestrator post-pull: auto-restart failed ({}); re-spawning \
+             install.py to emit the launcher_restart_required deferral as a \
+             fallback so the banner fires on next launcher start.",
+            e,
+        );
+        let mut fallback = tokio::process::Command::new(python_cmd);
+        fallback
+            .args(["install.py", "--update"])
+            .stdin(std::process::Stdio::null())
+            .current_dir(install_path);
+        fallback.env("VCT_LAUNCHER_PID", std::process::id().to_string());
+        fallback.env_remove("VCT_AUTO_RESTART_LAUNCHER");
+        fallback.env("VCT_FORCE_RESTART_DEFERRAL", "1");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            fallback.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+        match fallback.output().await {
+            Ok(out) if out.status.success() => {
+                eprintln!(
+                    "[vct] orchestrator post-pull: fallback install.py succeeded; \
+                     launcher_restart_required deferral should now be present."
+                );
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                eprintln!(
+                    "[vct] orchestrator post-pull: fallback install.py exited \
+                     non-zero ({:?}). stderr tail: {}",
+                    out.status.code(),
+                    stderr.lines().rev().take(10).collect::<Vec<_>>().join(" | "),
+                );
+                return Err(format!(
+                    "Update applied but auto-restart failed AND the fallback \
+                     deferral emit failed. Please fully quit the launcher \
+                     (tray → Quit) and relaunch via your usual entrypoint to \
+                     pick up the new binary at {}/launcher/dist/.",
+                    install_path.display(),
+                ));
+            }
+            Err(spawn_err) => {
+                eprintln!(
+                    "[vct] orchestrator post-pull: could not spawn fallback \
+                     install.py: {}. Surfacing the error to the GUI.",
+                    spawn_err,
+                );
+                return Err(format!(
+                    "Update applied but auto-restart failed and the fallback \
+                     install.py could not be spawned: {}. Please fully quit \
+                     the launcher and relaunch manually.",
+                    spawn_err,
+                ));
+            }
+        }
+    }
+
+    emit_progress(window, "done", "Orchestrator updated successfully!", 100.0);
+
+    Ok(InstallResult {
+        success: true,
+        install_path: path_string,
+        message: "Orchestrator updated successfully".to_string(),
+        system,
+    })
+}
+
+/// Merge upstream into the local branch without --ff-only. Produces a
+/// merge commit when histories diverge cleanly; surfaces a structured
+/// conflict payload otherwise.
+///
+/// Wire-shape:
+///   - Same input as `update_orchestrator` (path, window).
+///   - Same prep choreography: stop hub, pre-pull-rename binaries.
+///   - Same post-success tail: install.py --update, restart launcher.
+///   - On merge conflict: leaves the working tree conflicted, returns
+///     a structured "orchestrator_update_conflict" error. The frontend
+///     renders the conflict modal; the user resolves manually OR clicks
+///     "Abort" which calls `abort_orchestrator_merge_or_rebase`.
+#[command]
+pub async fn merge_orchestrator_with_upstream<R: Runtime>(
+    app: AppHandle<R>,
+    path: String,
+    window: Window,
+) -> Result<InstallResult, String> {
+    let install_path = PathBuf::from(&path);
+    let system = detect_system().await?;
+
+    if !install_path.join(".git").exists() {
+        return Err("Not a git repository — cannot merge".to_string());
+    }
+
+    // Same upstream-pin choreography as update_orchestrator.
+    crate::commands::self_update::ensure_upstream_remote(&install_path).await?;
+
+    emit_progress(&window, "update", "Stopping vct-hub for merge...", 2.0);
+    if let Err(e) = ensure_hub_stopped_for_update(&install_path) {
+        return Err(format!(
+            "Merge aborted: could not stop vct-hub before git pull: {}. \
+             Try again, or run `vct-hub --stop` manually.",
+            e
+        ));
+    }
+
+    emit_progress(&window, "update", "Preparing for merge...", 5.0);
+    let pre_pull_renamed_hub = pre_pull_rename_vct_hub_binary(&install_path);
+    let pre_pull_renamed = pre_pull_rename_running_binary(&install_path);
+
+    let pull_branch = resolve_pull_branch(&install_path).await;
+
+    // Pull WITHOUT --ff-only, explicitly as a merge (--no-rebase). The
+    // explicit reconcile flag is REQUIRED on git 2.34+: without it git
+    // refuses a divergent pull with "Need to specify how to reconcile
+    // divergent branches" because the user's `pull.rebase` config could
+    // be anything.
+    //
+    // --no-edit suppresses the editor for the merge commit message — a
+    // Tauri subprocess has no controlling tty and would hang otherwise.
+    emit_progress(&window, "update", "Merging upstream into local...", 10.0);
+    let pull = tokio::process::Command::new("git")
+        .args([
+            "pull",
+            "--no-rebase",
+            "--no-edit",
+            crate::commands::self_update::VCO_UPSTREAM_REMOTE,
+            &pull_branch,
+        ])
+        .current_dir(&install_path)
+        .output()
+        .await
+        .map_err(|e| format!("git pull (merge) failed: {}", e))?;
+
+    if !pull.status.success() {
+        let stderr = String::from_utf8_lossy(&pull.stderr);
+        let stdout = String::from_utf8_lossy(&pull.stdout);
+        // Conflicts go to stdout on some git versions (the "CONFLICT
+        // (content): ..." lines). Check both streams.
+        let combined = format!("{}\n{}", stderr, stdout);
+
+        if is_merge_or_rebase_conflict(&combined) {
+            // Conflict: leave the working tree in the conflicted state
+            // so the user can edit files manually. Revert the pre-pull
+            // renames (the binaries are still the OLD versions on disk —
+            // git pull didn't get far enough to swap them) so the
+            // canonical paths point at the working binary again.
+            if let Some(backup) = pre_pull_renamed.as_deref() {
+                revert_pre_pull_rename(backup);
+            }
+            if let Some(backup) = pre_pull_renamed_hub.as_deref() {
+                revert_pre_pull_rename(backup);
+            }
+            // Bring the hub back up — the user is going to spend time
+            // resolving conflicts and shouldn't be without it.
+            let _ = ensure_hub_started_after_update(&install_path);
+
+            let conflicted = collect_conflicted_files(&install_path).await;
+            return Err(serialize_orchestrator_conflict_error(
+                "merge",
+                &pull_branch,
+                &conflicted,
+                combined.trim(),
+            ));
+        }
+
+        // Non-conflict failure (network, refusing unrelated histories
+        // for the very first merge, etc.). Revert + restart hub + bail.
+        if let Some(backup) = pre_pull_renamed.as_deref() {
+            revert_pre_pull_rename(backup);
+        }
+        if let Some(backup) = pre_pull_renamed_hub.as_deref() {
+            revert_pre_pull_rename(backup);
+        }
+        let _ = ensure_hub_started_after_update(&install_path);
+        return Err(format!("git pull (merge) failed: {}", stderr));
+    }
+
+    let pull_output = String::from_utf8_lossy(&pull.stdout);
+    if pull_output.contains("Already up to date") {
+        emit_progress(&window, "done", "Already up to date!", 100.0);
+        if let Some(backup) = pre_pull_renamed.as_deref() {
+            revert_pre_pull_rename(backup);
+        }
+        if let Some(backup) = pre_pull_renamed_hub.as_deref() {
+            revert_pre_pull_rename(backup);
+        }
+        let _ = ensure_hub_started_after_update(&install_path);
+        return Ok(InstallResult {
+            success: true,
+            install_path: path,
+            message: "Already up to date".to_string(),
+            system,
+        });
+    }
+
+    run_post_pull_install_and_restart(
+        app,
+        &install_path,
+        path,
+        &window,
+        system,
+        pre_pull_renamed,
+        pre_pull_renamed_hub,
+    )
+    .await
+}
+
+/// Rebase the local branch onto upstream. Replays the user's local
+/// commits on top of upstream rather than producing a merge commit;
+/// surfaces a structured conflict payload if any commit doesn't apply
+/// cleanly.
+///
+/// Same wire-shape as `merge_orchestrator_with_upstream`. The flow:
+///   1. Stop hub, pre-pull-rename binaries.
+///   2. `git fetch <upstream>` (rebase needs the upstream ref locally).
+///   3. `git rebase <upstream>/<branch>`.
+///   4. On conflict: surface "orchestrator_update_conflict" error.
+///   5. On success: install.py --update + restart.
+#[command]
+pub async fn rebase_orchestrator_onto_upstream<R: Runtime>(
+    app: AppHandle<R>,
+    path: String,
+    window: Window,
+) -> Result<InstallResult, String> {
+    let install_path = PathBuf::from(&path);
+    let system = detect_system().await?;
+
+    if !install_path.join(".git").exists() {
+        return Err("Not a git repository — cannot rebase".to_string());
+    }
+
+    crate::commands::self_update::ensure_upstream_remote(&install_path).await?;
+
+    emit_progress(&window, "update", "Stopping vct-hub for rebase...", 2.0);
+    if let Err(e) = ensure_hub_stopped_for_update(&install_path) {
+        return Err(format!(
+            "Rebase aborted: could not stop vct-hub before git rebase: {}. \
+             Try again, or run `vct-hub --stop` manually.",
+            e
+        ));
+    }
+
+    emit_progress(&window, "update", "Preparing for rebase...", 5.0);
+    let pre_pull_renamed_hub = pre_pull_rename_vct_hub_binary(&install_path);
+    let pre_pull_renamed = pre_pull_rename_running_binary(&install_path);
+
+    let pull_branch = resolve_pull_branch(&install_path).await;
+
+    // Rebase requires a fresh upstream ref. Without --ff-only we use
+    // `git fetch` + `git rebase <remote>/<branch>` rather than `git pull
+    // --rebase` so a partial network failure doesn't leave us with a
+    // half-applied rebase.
+    emit_progress(&window, "update", "Fetching upstream for rebase...", 10.0);
+    let fetch = tokio::process::Command::new("git")
+        .args([
+            "fetch",
+            crate::commands::self_update::VCO_UPSTREAM_REMOTE,
+            &pull_branch,
+        ])
+        .current_dir(&install_path)
+        .output()
+        .await
+        .map_err(|e| format!("git fetch failed: {}", e))?;
+
+    if !fetch.status.success() {
+        let stderr = String::from_utf8_lossy(&fetch.stderr);
+        if let Some(backup) = pre_pull_renamed.as_deref() {
+            revert_pre_pull_rename(backup);
+        }
+        if let Some(backup) = pre_pull_renamed_hub.as_deref() {
+            revert_pre_pull_rename(backup);
+        }
+        let _ = ensure_hub_started_after_update(&install_path);
+        return Err(format!("git fetch failed: {}", stderr));
+    }
+
+    emit_progress(&window, "update", "Rebasing local onto upstream...", 20.0);
+    let upstream_ref = format!(
+        "{}/{}",
+        crate::commands::self_update::VCO_UPSTREAM_REMOTE,
+        pull_branch
+    );
+    let rebase = tokio::process::Command::new("git")
+        .args(["rebase", &upstream_ref])
+        .current_dir(&install_path)
+        .output()
+        .await
+        .map_err(|e| format!("git rebase failed: {}", e))?;
+
+    if !rebase.status.success() {
+        let stderr = String::from_utf8_lossy(&rebase.stderr);
+        let stdout = String::from_utf8_lossy(&rebase.stdout);
+        let combined = format!("{}\n{}", stderr, stdout);
+
+        if is_merge_or_rebase_conflict(&combined) {
+            // Conflict — leave the rebase in progress so the user can
+            // resolve manually. Revert pre-pull renames (binaries are
+            // still old on disk) + restart hub for productivity.
+            if let Some(backup) = pre_pull_renamed.as_deref() {
+                revert_pre_pull_rename(backup);
+            }
+            if let Some(backup) = pre_pull_renamed_hub.as_deref() {
+                revert_pre_pull_rename(backup);
+            }
+            let _ = ensure_hub_started_after_update(&install_path);
+
+            let conflicted = collect_conflicted_files(&install_path).await;
+            return Err(serialize_orchestrator_conflict_error(
+                "rebase",
+                &pull_branch,
+                &conflicted,
+                combined.trim(),
+            ));
+        }
+
+        if let Some(backup) = pre_pull_renamed.as_deref() {
+            revert_pre_pull_rename(backup);
+        }
+        if let Some(backup) = pre_pull_renamed_hub.as_deref() {
+            revert_pre_pull_rename(backup);
+        }
+        let _ = ensure_hub_started_after_update(&install_path);
+        return Err(format!("git rebase failed: {}", stderr));
+    }
+
+    run_post_pull_install_and_restart(
+        app,
+        &install_path,
+        path,
+        &window,
+        system,
+        pre_pull_renamed,
+        pre_pull_renamed_hub,
+    )
+    .await
+}
+
+/// Abort an in-progress merge or rebase, restoring the working tree to
+/// the state it was in before the merge/rebase started. Best-effort:
+/// tries `git merge --abort` first (no-op if not in a merge), then
+/// `git rebase --abort` (no-op if not in a rebase). Returns Ok if at
+/// least one succeeded OR if neither operation was in progress.
+///
+/// Why both: the user may have clicked "Abort" from either the merge
+/// conflict modal or the rebase conflict modal, and we don't bother
+/// tracking which one is active. Probing `.git/MERGE_HEAD` vs
+/// `.git/rebase-merge/` would be racy if the user manually resolved
+/// half the conflicts in a terminal between modal-render and click.
+#[command]
+pub async fn abort_orchestrator_merge_or_rebase(path: String) -> Result<(), String> {
+    let install_path = PathBuf::from(&path);
+
+    if !install_path.join(".git").exists() {
+        return Err("Not a git repository — nothing to abort".to_string());
+    }
+
+    let merge_head = install_path.join(".git").join("MERGE_HEAD");
+    let rebase_merge = install_path.join(".git").join("rebase-merge");
+    let rebase_apply = install_path.join(".git").join("rebase-apply");
+
+    let in_merge = merge_head.exists();
+    let in_rebase = rebase_merge.exists() || rebase_apply.exists();
+
+    if !in_merge && !in_rebase {
+        // Nothing in progress — treat as no-op success. The modal might
+        // be slightly stale; user intent ("get back to a clean state")
+        // is already satisfied.
+        return Ok(());
+    }
+
+    let mut last_err: Option<String> = None;
+
+    if in_merge {
+        let out = tokio::process::Command::new("git")
+            .args(["merge", "--abort"])
+            .current_dir(&install_path)
+            .output()
+            .await
+            .map_err(|e| format!("git merge --abort failed to spawn: {}", e))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            last_err = Some(format!("git merge --abort: {}", stderr.trim()));
+        } else {
+            return Ok(());
+        }
+    }
+
+    if in_rebase {
+        let out = tokio::process::Command::new("git")
+            .args(["rebase", "--abort"])
+            .current_dir(&install_path)
+            .output()
+            .await
+            .map_err(|e| format!("git rebase --abort failed to spawn: {}", e))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            last_err = Some(format!("git rebase --abort: {}", stderr.trim()));
+        } else {
+            return Ok(());
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+        "No merge or rebase in progress, but abort was requested.".to_string()
+    }))
 }
 
 /// v0.2.16 (W4 / 0.5): "Pulled-but-not-installed" resolver. Runs
@@ -7331,30 +8067,32 @@ MemAvailable:   23456789 kB
         let install_py = repo_root.join("install.py");
         let content = std::fs::read_to_string(&install_py).expect("read install.py");
 
-        // Find the _ensure_collections function body (defined to next
-        // top-level def) and audit it specifically.
+        // Find the _ensure_collections function body (start of the def
+        // line to the start of the NEXT top-level def). v0.2.23 fix
+        // (2026-05-21): the prior `.scan`+`.last()` implementation was
+        // not short-circuiting on the first `def ` marker after the
+        // function body — `.last()` collected offsets past the boundary
+        // and the audit incorrectly inspected every later function too.
+        // Switch to a precise byte-offset search.
         let start = content
             .find("def _ensure_collections(")
             .expect("_ensure_collections defined");
         let after_start = &content[start..];
-        // End at the next top-level `def ` or end-of-file.
-        let body_end = after_start
-            .lines()
-            .skip(1)
-            .scan(0usize, |acc, line| {
-                let len = line.len() + 1;
-                let here = *acc;
-                *acc += len;
-                if line.starts_with("def ") || line.starts_with("# ----") {
-                    Some(None)
-                } else {
-                    Some(Some(here))
-                }
-            })
-            .filter_map(|x| x)
-            .last()
-            .unwrap_or(after_start.len());
-        let body = &after_start[..body_end.min(after_start.len())];
+        // Skip the first line (the `def ...` itself) then find the next
+        // line that starts with `def ` OR `# ----` (separator comment).
+        let first_newline = after_start.find('\n').unwrap_or(after_start.len());
+        let rest = &after_start[first_newline + 1..];
+        let mut next_boundary: Option<usize> = None;
+        let mut cursor = 0usize;
+        for line in rest.split_inclusive('\n') {
+            if line.starts_with("def ") || line.starts_with("# ----") {
+                next_boundary = Some(cursor);
+                break;
+            }
+            cursor += line.len();
+        }
+        let body_end = first_newline + 1 + next_boundary.unwrap_or(rest.len());
+        let body = &after_start[..body_end];
 
         // The function MUST call POST to /v1/schema and MUST NOT call
         // any destructive verb on schema.
@@ -7366,7 +8104,12 @@ MemAvailable:   23456789 kB
                 verb
             );
         }
-        // Belt-and-braces: never DELETE on /v1/schema.
+        // Belt-and-braces: never DELETE on /v1/schema. The test focuses
+        // on HTTP-level destructive verbs against the Weaviate schema
+        // endpoint; SQL DELETEs against launcher.db (such as the v0.2.23
+        // self-heal helper that lives in a SEPARATE function below)
+        // are out of scope and the body-extraction above stops at the
+        // function boundary so they don't leak into this assertion.
         assert!(
             !body.contains("DELETE") || body.contains("DELETE on /v1"),
             "DELETE keyword in _ensure_collections must not target schema endpoints"
@@ -10033,6 +10776,685 @@ MemAvailable:   23456789 kB
                     }
                 }
             });
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // v0.2.23 (B4 / D19): divergence-detection modal flow.
+    //
+    // Tests cover three layers:
+    //   1. Unit tests for the pure helpers (serializers, predicates).
+    //   2. End-to-end git-fixture tests for update_orchestrator's non-FF
+    //      detection branch. We can't drive the full Tauri command from
+    //      a unit test (it depends on a Tauri Runtime + Window), so we
+    //      cover the path by exercising the raw `git pull --ff-only`
+    //      sequence + the structured-error helper.
+    //   3. End-to-end git-fixture tests for merge / rebase conflict
+    //      detection. Same pattern: raw git invocation followed by the
+    //      `collect_conflicted_files` + serializer helpers.
+    //
+    // The git-fixture tests are skipped if `git` isn't on PATH.
+    // ------------------------------------------------------------------
+    mod divergence_modal_tests {
+        use super::super::*;
+        use std::process::{Command as StdCommand, Stdio};
+
+        /// Skip a test if `git --version` doesn't succeed.
+        macro_rules! skip_if_no_git {
+            () => {
+                if StdCommand::new("git")
+                    .arg("--version")
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .map(|s| !s.success())
+                    .unwrap_or(true)
+                {
+                    eprintln!("skipping: git not on PATH");
+                    return;
+                }
+            };
+        }
+
+        // ----------------------------------------------------------------
+        // Unit tests — pure helpers, no git.
+        // ----------------------------------------------------------------
+
+        #[test]
+        fn serialize_orchestrator_non_ff_produces_parseable_json() {
+            let s = serialize_orchestrator_non_ff_error(
+                "main",
+                Some("abc1234"),
+                Some("def5678"),
+                &["CLAUDE.md".to_string(), "knowledge/foo.md".to_string()],
+                "fatal: Not possible to fast-forward, aborting.",
+            );
+            // Must start with the canonical discriminator so the frontend's
+            // fast-path recognises it.
+            assert!(s.starts_with("{\"event\":\"orchestrator_update_non_ff\""));
+
+            let v: serde_json::Value = serde_json::from_str(&s).expect("valid JSON");
+            assert_eq!(v["event"], "orchestrator_update_non_ff");
+            assert_eq!(v["branch"], "main");
+            assert_eq!(v["local_sha"], "abc1234");
+            assert_eq!(v["remote_sha"], "def5678");
+            let files = v["diverged_files"].as_array().expect("array");
+            assert_eq!(files.len(), 2);
+            assert_eq!(files[0], "CLAUDE.md");
+            assert_eq!(files[1], "knowledge/foo.md");
+        }
+
+        #[test]
+        fn serialize_orchestrator_non_ff_handles_empty_file_list() {
+            let s = serialize_orchestrator_non_ff_error(
+                "main",
+                None,
+                None,
+                &[],
+                "boom",
+            );
+            let v: serde_json::Value = serde_json::from_str(&s).expect("valid JSON");
+            assert_eq!(v["diverged_files"].as_array().unwrap().len(), 0);
+            assert!(v["local_sha"].is_null());
+            assert!(v["remote_sha"].is_null());
+        }
+
+        #[test]
+        fn serialize_orchestrator_non_ff_escapes_special_chars_in_paths() {
+            // File paths can contain quotes on Windows (rare but legal).
+            // The path "weird\"name.md" tests both backslash and quote
+            // escaping.
+            let s = serialize_orchestrator_non_ff_error(
+                "main",
+                None,
+                None,
+                &["weird\"name.md".to_string()],
+                "boom",
+            );
+            let v: serde_json::Value = serde_json::from_str(&s).expect("valid JSON");
+            let files = v["diverged_files"].as_array().unwrap();
+            assert_eq!(files[0], "weird\"name.md");
+        }
+
+        #[test]
+        fn serialize_orchestrator_conflict_produces_parseable_json() {
+            let s = serialize_orchestrator_conflict_error(
+                "merge",
+                "main",
+                &["CLAUDE.md".to_string(), "CONTEXT_STATE.md".to_string()],
+                "CONFLICT (content): Merge conflict in CLAUDE.md",
+            );
+            assert!(s.starts_with("{\"event\":\"orchestrator_update_conflict\""));
+
+            let v: serde_json::Value = serde_json::from_str(&s).expect("valid JSON");
+            assert_eq!(v["event"], "orchestrator_update_conflict");
+            assert_eq!(v["operation"], "merge");
+            assert_eq!(v["branch"], "main");
+            let files = v["conflicted_files"].as_array().expect("array");
+            assert_eq!(files.len(), 2);
+        }
+
+        #[test]
+        fn serialize_orchestrator_conflict_handles_rebase_operation() {
+            let s = serialize_orchestrator_conflict_error(
+                "rebase",
+                "main",
+                &["a.md".to_string()],
+                "could not apply abc123",
+            );
+            let v: serde_json::Value = serde_json::from_str(&s).expect("valid JSON");
+            assert_eq!(v["operation"], "rebase");
+        }
+
+        #[test]
+        fn is_merge_or_rebase_conflict_detects_canonical_phrases() {
+            // Real stderr samples from git 2.34+.
+            assert!(is_merge_or_rebase_conflict(
+                "CONFLICT (content): Merge conflict in CLAUDE.md"
+            ));
+            assert!(is_merge_or_rebase_conflict(
+                "Automatic merge failed; fix conflicts and then commit the result."
+            ));
+            assert!(is_merge_or_rebase_conflict(
+                "error: could not apply abc123... Update README"
+            ));
+            assert!(is_merge_or_rebase_conflict(
+                "Resolve all conflicts manually, mark them as resolved with"
+            ));
+        }
+
+        #[test]
+        fn is_merge_or_rebase_conflict_ignores_unrelated_errors() {
+            assert!(!is_merge_or_rebase_conflict("fatal: not a git repository"));
+            assert!(!is_merge_or_rebase_conflict("Could not resolve host: github.com"));
+            assert!(!is_merge_or_rebase_conflict(""));
+        }
+
+        #[test]
+        fn is_merge_or_rebase_conflict_is_case_insensitive() {
+            assert!(is_merge_or_rebase_conflict("AUTOMATIC MERGE FAILED"));
+        }
+
+        // ----------------------------------------------------------------
+        // End-to-end git-fixture tests. Build a real local + "remote"
+        // repo (local file:// URL acts as the remote), introduce
+        // divergence, and observe the helper output.
+        // ----------------------------------------------------------------
+
+        /// Init a bare repo (acts as the "remote" upstream) and a working
+        /// clone of it. Returns (tempdir, remote_bare_path, local_clone_path).
+        /// The tempdir is held by the caller to keep it alive for the
+        /// duration of the test.
+        fn init_remote_and_clone() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let root = tmp.path();
+            let remote = root.join("remote.git");
+            let local = root.join("local");
+
+            // Init the bare remote.
+            let status = StdCommand::new("git")
+                .args(["init", "--bare", "--initial-branch=main"])
+                .arg(&remote)
+                .status()
+                .expect("git init bare");
+            assert!(status.success(), "git init --bare failed");
+
+            // Init a seeding workdir, commit a base file, push to remote.
+            let seed = root.join("seed");
+            std::fs::create_dir_all(&seed).unwrap();
+            assert!(StdCommand::new("git")
+                .args(["init", "--initial-branch=main"])
+                .current_dir(&seed)
+                .status()
+                .unwrap()
+                .success());
+            // Local config so commit succeeds even when global config is empty.
+            assert!(StdCommand::new("git")
+                .args(["config", "user.email", "test@example.com"])
+                .current_dir(&seed)
+                .status()
+                .unwrap()
+                .success());
+            assert!(StdCommand::new("git")
+                .args(["config", "user.name", "Test"])
+                .current_dir(&seed)
+                .status()
+                .unwrap()
+                .success());
+            std::fs::write(seed.join("README.md"), "base\n").unwrap();
+            assert!(StdCommand::new("git")
+                .args(["add", "README.md"])
+                .current_dir(&seed)
+                .status()
+                .unwrap()
+                .success());
+            assert!(StdCommand::new("git")
+                .args(["commit", "-m", "base"])
+                .current_dir(&seed)
+                .status()
+                .unwrap()
+                .success());
+            assert!(StdCommand::new("git")
+                .args(["remote", "add", "origin"])
+                .arg(remote.to_str().unwrap())
+                .current_dir(&seed)
+                .status()
+                .unwrap()
+                .success());
+            assert!(StdCommand::new("git")
+                .args(["push", "origin", "main"])
+                .current_dir(&seed)
+                .status()
+                .unwrap()
+                .success());
+
+            // Clone the bare remote into the "local" workdir.
+            assert!(StdCommand::new("git")
+                .args(["clone"])
+                .arg(remote.to_str().unwrap())
+                .arg(&local)
+                .status()
+                .unwrap()
+                .success());
+            // Local config in the clone.
+            assert!(StdCommand::new("git")
+                .args(["config", "user.email", "test@example.com"])
+                .current_dir(&local)
+                .status()
+                .unwrap()
+                .success());
+            assert!(StdCommand::new("git")
+                .args(["config", "user.name", "Test"])
+                .current_dir(&local)
+                .status()
+                .unwrap()
+                .success());
+
+            // Add the canonical vco_upstream remote pointing at the bare
+            // repo so the production code paths (which use vco_upstream,
+            // not origin) work.
+            assert!(StdCommand::new("git")
+                .args(["remote", "add", "vco_upstream"])
+                .arg(remote.to_str().unwrap())
+                .current_dir(&local)
+                .status()
+                .unwrap()
+                .success());
+            assert!(StdCommand::new("git")
+                .args(["fetch", "vco_upstream"])
+                .current_dir(&local)
+                .status()
+                .unwrap()
+                .success());
+
+            // Advance the remote by one commit so the local clone is
+            // "behind" (this gives the test a meaningful diff to detect).
+            // Push the new commit via the seed workdir.
+            std::fs::write(seed.join("UPSTREAM.md"), "upstream-only\n").unwrap();
+            assert!(StdCommand::new("git")
+                .args(["add", "UPSTREAM.md"])
+                .current_dir(&seed)
+                .status()
+                .unwrap()
+                .success());
+            assert!(StdCommand::new("git")
+                .args(["commit", "-m", "upstream commit"])
+                .current_dir(&seed)
+                .status()
+                .unwrap()
+                .success());
+            assert!(StdCommand::new("git")
+                .args(["push", "origin", "main"])
+                .current_dir(&seed)
+                .status()
+                .unwrap()
+                .success());
+
+            // Re-fetch so vco_upstream/main reflects the new tip.
+            assert!(StdCommand::new("git")
+                .args(["fetch", "vco_upstream"])
+                .current_dir(&local)
+                .status()
+                .unwrap()
+                .success());
+
+            (tmp, remote, local)
+        }
+
+        /// Add a local commit to the clone, so HEAD differs from vco_upstream/main.
+        fn add_local_divergent_commit(local: &Path, file: &str, body: &str) {
+            std::fs::write(local.join(file), body).unwrap();
+            assert!(StdCommand::new("git")
+                .args(["add", file])
+                .current_dir(local)
+                .status()
+                .unwrap()
+                .success());
+            assert!(StdCommand::new("git")
+                .args(["commit", "-m", "local divergent"])
+                .current_dir(local)
+                .status()
+                .unwrap()
+                .success());
+        }
+
+        #[tokio::test]
+        async fn update_orchestrator_non_ff_path_produces_structured_error() {
+            skip_if_no_git!();
+
+            let (_tmp, _remote, local) = init_remote_and_clone();
+            // Add a local commit so vco_upstream/main and HEAD have diverged.
+            // The "local file" name doesn't collide with UPSTREAM.md so the
+            // pull will be non-FF but NOT conflicting if attempted as merge.
+            add_local_divergent_commit(&local, "LOCAL.md", "local-only\n");
+
+            // Attempt the same `git pull --ff-only` invocation
+            // update_orchestrator runs. It must fail with a non-FF stderr
+            // pattern that `is_non_fast_forward` recognizes.
+            let pull = tokio::process::Command::new("git")
+                .args(["pull", "--ff-only", "vco_upstream", "main"])
+                .current_dir(&local)
+                .output()
+                .await
+                .expect("git pull spawn");
+            assert!(!pull.status.success(), "ff-only pull should fail on diverged history");
+            let stderr = String::from_utf8_lossy(&pull.stderr);
+            assert!(
+                crate::commands::self_update::is_non_fast_forward(&stderr),
+                "expected non-FF detection on stderr: {}",
+                stderr
+            );
+
+            // The diverged-files helper must return at least UPSTREAM.md
+            // (added on upstream but absent locally).
+            let diverged = collect_diverged_files(&local, "main").await;
+            assert!(
+                diverged.iter().any(|p| p == "UPSTREAM.md"),
+                "expected UPSTREAM.md in diverged list, got {:?}",
+                diverged
+            );
+
+            // The SHAs should both be readable.
+            let local_sha = read_head_sha(&local).await;
+            let remote_sha = read_remote_sha(&local, "main").await;
+            assert!(local_sha.is_some(), "local SHA should be readable");
+            assert!(remote_sha.is_some(), "remote SHA should be readable");
+            assert_ne!(local_sha, remote_sha, "SHAs should differ on divergence");
+
+            // Final: the serialized payload should parse as JSON with the
+            // right discriminator.
+            let payload = serialize_orchestrator_non_ff_error(
+                "main",
+                local_sha.as_deref(),
+                remote_sha.as_deref(),
+                &diverged,
+                stderr.trim(),
+            );
+            let v: serde_json::Value =
+                serde_json::from_str(&payload).expect("payload valid JSON");
+            assert_eq!(v["event"], "orchestrator_update_non_ff");
+            assert_eq!(v["branch"], "main");
+            assert!(!v["diverged_files"].as_array().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn merge_with_upstream_creates_merge_commit_on_clean_overlap() {
+            skip_if_no_git!();
+
+            let (_tmp, _remote, local) = init_remote_and_clone();
+            // Add a local commit that touches a DIFFERENT file from
+            // UPSTREAM.md so the merge is non-conflicting.
+            add_local_divergent_commit(&local, "LOCAL.md", "local-only\n");
+
+            // Run the same `git pull --no-rebase --no-edit vco_upstream main`
+            // invocation merge_orchestrator_with_upstream uses.
+            let pull = tokio::process::Command::new("git")
+                .args(["pull", "--no-rebase", "--no-edit", "vco_upstream", "main"])
+                .current_dir(&local)
+                .output()
+                .await
+                .expect("git pull merge");
+            assert!(
+                pull.status.success(),
+                "merge should succeed on non-overlapping files: stderr={} stdout={}",
+                String::from_utf8_lossy(&pull.stderr),
+                String::from_utf8_lossy(&pull.stdout),
+            );
+
+            // Verify HEAD is now a merge commit (has two parents).
+            let parents = StdCommand::new("git")
+                .args(["rev-list", "--parents", "-n", "1", "HEAD"])
+                .current_dir(&local)
+                .output()
+                .expect("rev-list");
+            let out = String::from_utf8_lossy(&parents.stdout);
+            let parent_count = out.trim().split_whitespace().count() - 1; // first token is HEAD itself
+            assert_eq!(
+                parent_count, 2,
+                "expected merge commit with 2 parents, got {}: {}",
+                parent_count, out
+            );
+
+            // Both files should be in the working tree.
+            assert!(local.join("LOCAL.md").exists(), "LOCAL.md must persist");
+            assert!(
+                local.join("UPSTREAM.md").exists(),
+                "UPSTREAM.md must be merged in"
+            );
+
+            // No conflicts.
+            let conflicted = collect_conflicted_files(&local).await;
+            assert!(
+                conflicted.is_empty(),
+                "no conflicts expected, got {:?}",
+                conflicted
+            );
+        }
+
+        #[tokio::test]
+        async fn merge_returns_conflict_list_on_overlapping_changes() {
+            skip_if_no_git!();
+
+            let (_tmp, _remote, local) = init_remote_and_clone();
+            // Make a local commit that modifies a file we also modify on
+            // upstream — but UPSTREAM.md was only added on upstream, so we
+            // need to use a file that exists on both sides. Use README.md
+            // (the base commit's file, present locally and remotely) and
+            // modify it differently on both sides.
+            //
+            // Step 1: modify locally + commit.
+            std::fs::write(local.join("README.md"), "LOCAL VERSION\n").unwrap();
+            assert!(StdCommand::new("git")
+                .args(["add", "README.md"])
+                .current_dir(&local)
+                .status()
+                .unwrap()
+                .success());
+            assert!(StdCommand::new("git")
+                .args(["commit", "-m", "local README change"])
+                .current_dir(&local)
+                .status()
+                .unwrap()
+                .success());
+
+            // Step 2: simulate an upstream change to README.md too. Reach
+            // through the bare-remote URL by cloning it again into a temp
+            // workdir, modifying, pushing.
+            let pusher = local.parent().unwrap().join("pusher");
+            std::fs::create_dir_all(&pusher).unwrap();
+            // Clone from the bare remote — same URL used in vco_upstream.
+            let remote_url = StdCommand::new("git")
+                .args(["remote", "get-url", "vco_upstream"])
+                .current_dir(&local)
+                .output()
+                .expect("get-url")
+                .stdout;
+            let remote_url = String::from_utf8_lossy(&remote_url).trim().to_string();
+            assert!(StdCommand::new("git")
+                .args(["clone", &remote_url])
+                .arg(&pusher)
+                .status()
+                .unwrap()
+                .success());
+            assert!(StdCommand::new("git")
+                .args(["config", "user.email", "test@example.com"])
+                .current_dir(&pusher)
+                .status()
+                .unwrap()
+                .success());
+            assert!(StdCommand::new("git")
+                .args(["config", "user.name", "Test"])
+                .current_dir(&pusher)
+                .status()
+                .unwrap()
+                .success());
+            std::fs::write(pusher.join("README.md"), "UPSTREAM VERSION\n").unwrap();
+            assert!(StdCommand::new("git")
+                .args(["add", "README.md"])
+                .current_dir(&pusher)
+                .status()
+                .unwrap()
+                .success());
+            assert!(StdCommand::new("git")
+                .args(["commit", "-m", "upstream README change"])
+                .current_dir(&pusher)
+                .status()
+                .unwrap()
+                .success());
+            assert!(StdCommand::new("git")
+                .args(["push", "origin", "main"])
+                .current_dir(&pusher)
+                .status()
+                .unwrap()
+                .success());
+
+            // Step 3: fetch vco_upstream in the local clone so it sees the
+            // upstream README change.
+            assert!(StdCommand::new("git")
+                .args(["fetch", "vco_upstream"])
+                .current_dir(&local)
+                .status()
+                .unwrap()
+                .success());
+
+            // Step 4: attempt the merge — should fail with conflict.
+            let pull = tokio::process::Command::new("git")
+                .args(["pull", "--no-rebase", "--no-edit", "vco_upstream", "main"])
+                .current_dir(&local)
+                .output()
+                .await
+                .expect("git pull merge");
+            assert!(!pull.status.success(), "merge should fail on overlap");
+
+            let combined = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&pull.stderr),
+                String::from_utf8_lossy(&pull.stdout)
+            );
+            assert!(
+                is_merge_or_rebase_conflict(&combined),
+                "expected conflict detection on output: {}",
+                combined
+            );
+
+            // The conflict-file collector must return README.md.
+            let conflicted = collect_conflicted_files(&local).await;
+            assert!(
+                conflicted.iter().any(|p| p == "README.md"),
+                "expected README.md in conflicted list, got {:?}",
+                conflicted
+            );
+
+            // Serializer round-trips.
+            let payload = serialize_orchestrator_conflict_error(
+                "merge",
+                "main",
+                &conflicted,
+                combined.trim(),
+            );
+            let v: serde_json::Value =
+                serde_json::from_str(&payload).expect("payload valid JSON");
+            assert_eq!(v["event"], "orchestrator_update_conflict");
+            assert_eq!(v["operation"], "merge");
+            let files = v["conflicted_files"].as_array().unwrap();
+            assert!(files.iter().any(|f| f.as_str() == Some("README.md")));
+
+            // Cleanup: abort the merge so the tempdir can be removed
+            // without lingering MERGE_HEAD state confusing the OS.
+            let _ = StdCommand::new("git")
+                .args(["merge", "--abort"])
+                .current_dir(&local)
+                .status();
+        }
+
+        #[tokio::test]
+        async fn abort_merge_or_rebase_noops_when_nothing_in_progress() {
+            skip_if_no_git!();
+            let (_tmp, _remote, local) = init_remote_and_clone();
+            // No merge or rebase in progress — abort should be a no-op.
+            let result = abort_orchestrator_merge_or_rebase(
+                local.to_str().unwrap().to_string(),
+            )
+            .await;
+            assert!(result.is_ok(), "expected no-op Ok, got {:?}", result);
+        }
+
+        #[tokio::test]
+        async fn abort_merge_or_rebase_aborts_in_progress_merge() {
+            skip_if_no_git!();
+
+            // Reproduce a conflict-state, then abort it.
+            let (_tmp, _remote, local) = init_remote_and_clone();
+            // Set up overlapping changes (same scaffolding as the conflict
+            // test).
+            std::fs::write(local.join("README.md"), "LOCAL VERSION\n").unwrap();
+            assert!(StdCommand::new("git")
+                .args(["add", "README.md"])
+                .current_dir(&local)
+                .status()
+                .unwrap()
+                .success());
+            assert!(StdCommand::new("git")
+                .args(["commit", "-m", "local README"])
+                .current_dir(&local)
+                .status()
+                .unwrap()
+                .success());
+
+            let pusher = local.parent().unwrap().join("pusher2");
+            let remote_url = StdCommand::new("git")
+                .args(["remote", "get-url", "vco_upstream"])
+                .current_dir(&local)
+                .output()
+                .expect("get-url")
+                .stdout;
+            let remote_url = String::from_utf8_lossy(&remote_url).trim().to_string();
+            assert!(StdCommand::new("git")
+                .args(["clone", &remote_url])
+                .arg(&pusher)
+                .status()
+                .unwrap()
+                .success());
+            assert!(StdCommand::new("git")
+                .args(["config", "user.email", "test@example.com"])
+                .current_dir(&pusher)
+                .status()
+                .unwrap()
+                .success());
+            assert!(StdCommand::new("git")
+                .args(["config", "user.name", "Test"])
+                .current_dir(&pusher)
+                .status()
+                .unwrap()
+                .success());
+            std::fs::write(pusher.join("README.md"), "UPSTREAM VERSION\n").unwrap();
+            assert!(StdCommand::new("git")
+                .args(["add", "README.md"])
+                .current_dir(&pusher)
+                .status()
+                .unwrap()
+                .success());
+            assert!(StdCommand::new("git")
+                .args(["commit", "-m", "upstream README"])
+                .current_dir(&pusher)
+                .status()
+                .unwrap()
+                .success());
+            assert!(StdCommand::new("git")
+                .args(["push", "origin", "main"])
+                .current_dir(&pusher)
+                .status()
+                .unwrap()
+                .success());
+            assert!(StdCommand::new("git")
+                .args(["fetch", "vco_upstream"])
+                .current_dir(&local)
+                .status()
+                .unwrap()
+                .success());
+
+            // Trigger the merge — expected to leave MERGE_HEAD.
+            let pull = StdCommand::new("git")
+                .args(["pull", "--no-rebase", "--no-edit", "vco_upstream", "main"])
+                .current_dir(&local)
+                .output()
+                .expect("pull");
+            assert!(!pull.status.success(), "merge should leave conflict state");
+            assert!(
+                local.join(".git").join("MERGE_HEAD").exists(),
+                "MERGE_HEAD must exist after conflicted merge"
+            );
+
+            // Abort.
+            let result = abort_orchestrator_merge_or_rebase(
+                local.to_str().unwrap().to_string(),
+            )
+            .await;
+            assert!(result.is_ok(), "abort should succeed, got {:?}", result);
+            assert!(
+                !local.join(".git").join("MERGE_HEAD").exists(),
+                "MERGE_HEAD must be cleared after abort"
+            );
         }
     }
 }
