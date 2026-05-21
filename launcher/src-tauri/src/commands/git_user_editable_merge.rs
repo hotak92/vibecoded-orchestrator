@@ -818,13 +818,12 @@ pub(crate) fn build_deferral_text(
     // via `cmd /c move`. We give POSIX form as the default and mention
     // the Windows alternative in prose, mirroring how UPDATE_DEFERRED.md
     // is read by the launcher (markdown viewer, not a shell).
-    let mut cmd_lines = Vec::new();
-    cmd_lines.push(
+    let mut cmd_lines: Vec<String> = vec![
         "# Inspect the upstream version side-by-side with your local:".to_string(),
-    );
-    cmd_lines.push("#   diff -u <path> <path>.from-upstream-<sha>".to_string());
-    cmd_lines.push("#".to_string());
-    cmd_lines.push("# Accept upstream (overwrite local with the upstream version):".to_string());
+        "#   diff -u <path> <path>.from-upstream-<sha>".to_string(),
+        "#".to_string(),
+        "# Accept upstream (overwrite local with the upstream version):".to_string(),
+    ];
     for outcome in actionable.iter().take(CAP) {
         if let MergeOutcomeKind::PreservedWithUpstreamSidecar {
             upstream_sidecar_path,
@@ -1174,8 +1173,9 @@ mod tests {
         let outcomes = pre_merge_user_editable(&local, &base, &theirs).await.unwrap();
 
         // vco_lib/foo.py is not in the allowlist → no outcome emitted.
+        let vco_lib_foo: &Path = Path::new("vco_lib/foo.py");
         assert!(
-            outcomes.iter().all(|o| o.path != PathBuf::from("vco_lib/foo.py")),
+            outcomes.iter().all(|o| o.path != vco_lib_foo),
             "expected vco_lib/foo.py to be filtered out, got {:?}",
             outcomes.iter().map(|o| &o.path).collect::<Vec<_>>(),
         );
@@ -1208,7 +1208,7 @@ mod tests {
         // Should produce one `Merged` outcome for CLAUDE.md.
         let claude = outcomes
             .iter()
-            .find(|o| o.path == PathBuf::from("CLAUDE.md"))
+            .find(|o| o.path.as_path() == Path::new("CLAUDE.md"))
             .expect("expected CLAUDE.md outcome");
         match &claude.kind {
             MergeOutcomeKind::Merged { .. } => {}
@@ -1251,7 +1251,7 @@ mod tests {
 
         let claude = outcomes
             .iter()
-            .find(|o| o.path == PathBuf::from("CLAUDE.md"))
+            .find(|o| o.path.as_path() == Path::new("CLAUDE.md"))
             .expect("expected CLAUDE.md outcome");
         match &claude.kind {
             MergeOutcomeKind::PreservedWithUpstreamSidecar {
