@@ -30,6 +30,7 @@ pub mod lifecycle;
 pub mod licensing;
 pub mod maintenance;
 pub mod manifest;
+pub mod module_dispatch;
 pub mod module_gui;
 // v0.2.21 Stream B: per-(project × module × embedding_source) weights state.
 // Tauri-commands wrapper around the `module_weights_state` table
