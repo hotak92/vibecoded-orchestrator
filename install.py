@@ -54,6 +54,31 @@ if _sys.version_info < (3, 11):
     )
     _sys.exit(1)
 
+# ---------------------------------------------------------------------------
+# Windows stdout/stderr encoding sentinel — runs BEFORE any print().
+#
+# Python on Windows defaults stdout to the legacy ANSI code page (cp1252 in
+# Western locales). Any print() containing characters outside that codepage
+# — arrows (U+2192), em-dash (U+2014), check/cross marks, etc. — crashes
+# the installer with UnicodeEncodeError. install.py contains ~660 such
+# characters in user-facing prints.
+#
+# Reconfiguring stdout/stderr to UTF-8 with errors='replace' makes those
+# prints survive on any locale. errors='replace' (not 'strict') ensures
+# we never hard-fail on an unexpected glyph — a substitute character is
+# preferable to crashing mid-install.
+#
+# No-op on POSIX systems (stdout is already UTF-8 there). The reconfigure()
+# method exists on Python 3.7+, so it's safe under our MIN_PYTHON=(3,11).
+# ---------------------------------------------------------------------------
+if _sys.platform == "win32":
+    try:
+        _sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        _sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):
+        # Detached / redirected streams may lack reconfigure(); ignore.
+        pass
+
 import argparse
 import json
 import os
