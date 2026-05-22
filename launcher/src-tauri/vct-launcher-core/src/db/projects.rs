@@ -101,49 +101,51 @@ impl Db {
             .map_err(|e| format!("collect list: {}", e))
     }
 
-    // ─── rl_port (migration 014) ─────────────────────────────────────────
+    // ─── rl_port (migration 014, generalised in 017 / v0.2.26) ───────────
     //
-    // B2 / single-writer principle: `projects.rl_port` is a HUB-writable
-    // system-observed column (v0.2.21 Step 3 decision tightening). The
-    // launcher GUI does NOT write to this column; only the supervisor in
-    // `vct-hub::module_supervisor` allocates and persists values. The
-    // `set_project_rl_port` helper stays in this file because callers from
-    // the hub crate (which depends on vct-launcher-core) need it, and
-    // because tests in vct-launcher-core seed the column directly.
+    // B2 / single-writer principle: the RL reranker port is a HUB-writable
+    // system-observed value (v0.2.21 Step 3 decision tightening). The
+    // launcher GUI does NOT write it; only the supervisor in
+    // `vct-hub::module_supervisor` allocates and persists.
+    //
+    // v0.2.26 generalisation: the source-of-truth moved from the RL-only
+    // `projects.rl_port` column (migration 014) to the generic
+    // `module_ports` table (migration 017). These wrappers preserve the
+    // existing public signature so callers from the hub crate
+    // (`module_supervisor::ensure_rl_port_persisted`, `rl_service.rs`
+    // commands) compile unchanged — they just dispatch into
+    // `get_module_port` / `set_module_port` with the canonical RL module
+    // id. The `projects.rl_port` column stays in place (migration 017
+    // backfills `module_ports` from it on apply); it will be retired in
+    // a later migration once every consumer is confirmed off it.
+
+    /// Module id used by the legacy `get_project_rl_port` /
+    /// `set_project_rl_port` wrappers — i.e. the canonical id for the
+    /// RL reranker container. Lives here (not in `vct-hub`) so the
+    /// `vct-launcher-core` tests can reference it.
+    pub const RL_RERANKER_MODULE_ID: &'static str = "vct-rl-reranker";
 
     /// Read the per-project RL reranker server port. Returns `Ok(None)`
-    /// when the column is NULL (project predates allocation) OR the
-    /// project doesn't exist.
+    /// when no row exists in `module_ports` for this project (project
+    /// predates allocation OR project doesn't exist).
+    ///
+    /// Thin wrapper around [`Db::get_module_port`] with
+    /// `module_id = "vct-rl-reranker"`. Kept for back-compat with the
+    /// existing hub callers.
     pub fn get_project_rl_port(&self, project_id: &str) -> Result<Option<u16>, String> {
-        let guard = self.lock();
-        let raw: Option<i64> = guard
-            .query_row(
-                "SELECT rl_port FROM projects WHERE id = ?1",
-                params![project_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| format!("get rl_port: {}", e))?
-            .flatten();
-        Ok(raw.and_then(|v| u16::try_from(v).ok()))
+        self.get_module_port(project_id, Self::RL_RERANKER_MODULE_ID)
     }
 
-    /// Persist the per-project RL reranker server port. HUB-only call site
-    /// (see B2 single-writer note above). Caller is responsible for
-    /// choosing a value (11442 for orchestrator-root, 11500..=11900 random
-    /// otherwise) and ensuring no collision.
+    /// Persist the per-project RL reranker server port. HUB-only call
+    /// site (see B2 single-writer note above). Caller is responsible for
+    /// choosing a value (11442 for orchestrator-root, 11500..=11900
+    /// random otherwise) and ensuring no collision.
+    ///
+    /// Thin wrapper around [`Db::set_module_port`] with
+    /// `module_id = "vct-rl-reranker"`. Kept for back-compat with the
+    /// existing hub callers.
     pub fn set_project_rl_port(&self, project_id: &str, port: u16) -> Result<(), String> {
-        let guard = self.lock();
-        let n = guard
-            .execute(
-                "UPDATE projects SET rl_port = ?1, updated_at = ?2 WHERE id = ?3",
-                params![port as i64, Utc::now().timestamp_millis(), project_id],
-            )
-            .map_err(|e| format!("set rl_port: {}", e))?;
-        if n == 0 {
-            return Err(format!("project {} not found", project_id));
-        }
-        Ok(())
+        self.set_module_port(project_id, Self::RL_RERANKER_MODULE_ID, port)
     }
 
     /// Rename + regenerate slug if requested. The slug parameter, when
