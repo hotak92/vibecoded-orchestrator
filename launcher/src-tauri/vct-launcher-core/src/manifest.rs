@@ -811,6 +811,30 @@ pub struct RuntimeBlock {
     #[serde(default)]
     pub env_derived: HashMap<String, String>,
 
+    /// v0.2.27: per-module event-log path convention. When the module
+    /// bind-mounts per-project event logs into its container, this
+    /// template tells the dispatcher how to compute the host-side path
+    /// from a project id. The dispatcher's `{{events_paths_for:<id>}}`
+    /// template token reads this field, walks the referenced control's
+    /// UUID array, and produces a JSON array of paths to inject into a
+    /// descriptor's `body` field.
+    ///
+    /// Closed-set placeholders inside the template:
+    /// - `{project_slug}` — the project's slug (DB column).
+    /// - `{project_id}` — the project's UUID.
+    ///
+    /// Single-brace deliberately, to distinguish from the OUTER
+    /// dispatcher tokens (`{{...}}` double-brace). Any other `{...}`
+    /// or `{{...}}` inside the template is a manifest validation error
+    /// — see `validate_log_path_template`.
+    ///
+    /// Example: `"/data/logs/rl_events_{project_slug}.jsonl"`.
+    ///
+    /// Optional. When omitted, `{{events_paths_for:<id>}}` returns a
+    /// clear dispatcher error rather than silently resolving to empty.
+    #[serde(default)]
+    pub log_path_template: Option<String>,
+
     // ─── v0.2.20: per-module GPU mode hints ───────────────────────────
     //
     // These three fields drive the launcher's per-module GPU policy
@@ -1050,6 +1074,15 @@ impl ModuleManifest {
             return Err(format!("runtime.type '{}' not recognized", m.runtime.r#type));
         }
 
+        // v0.2.27: validate `runtime.log_path_template` if present.
+        // Closed-set tokens (single-brace) — anything else is a
+        // structural error caught at manifest-load time so a typo
+        // doesn't surface mid-dispatch with a confusing message.
+        if let Some(ref tmpl) = m.runtime.log_path_template {
+            validate_log_path_template(tmpl)
+                .map_err(|e| format!("runtime.log_path_template invalid: {}", e))?;
+        }
+
         Ok(m)
     }
 
@@ -1057,6 +1090,83 @@ impl ModuleManifest {
     pub fn is_compatible_with_host(&self, host: &str) -> bool {
         self.compatibility.hosts.iter().any(|h| h == host)
     }
+}
+
+/// v0.2.27: validate a `runtime.log_path_template` string.
+///
+/// Closed-set rules:
+/// - Must contain at least one of `{project_slug}` or `{project_id}` (else
+///   the template would produce the same path for every project, which is
+///   never what the author wants).
+/// - May contain ZERO `{{...}}` double-brace tokens (those are dispatcher-
+///   level template tokens; mixing them with the single-brace per-project
+///   ones in the SAME template would be confusing and is forbidden).
+/// - Single-brace tokens other than `{project_slug}` / `{project_id}` are
+///   rejected (e.g. `{module_id}`, `{value}` — these have meaning in OTHER
+///   contexts but not here; allowing them would invite copy-paste errors).
+///
+/// Returns Ok(()) when the template is valid, Err with a clear message
+/// otherwise. Best-effort tokenizer — uses simple substring scanning, not
+/// a real grammar. Good enough for the closed-set rules.
+pub fn validate_log_path_template(template: &str) -> Result<(), String> {
+    if template.is_empty() {
+        return Err("template is empty".into());
+    }
+    if template.contains("{{") || template.contains("}}") {
+        return Err(
+            "double-brace tokens ({{...}}) are not allowed in log_path_template; \
+             use single-brace placeholders {project_slug} / {project_id} instead"
+                .into(),
+        );
+    }
+    // Find every `{...}` pair and check the inner token name.
+    let bytes = template.as_bytes();
+    let mut i = 0;
+    let mut saw_recognised_token = false;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            // Find matching '}'.
+            let rest = &template[i + 1..];
+            let close = rest
+                .find('}')
+                .ok_or_else(|| format!("unclosed '{{' at offset {}", i))?;
+            let token = &rest[..close];
+            match token {
+                "project_slug" | "project_id" => {
+                    saw_recognised_token = true;
+                }
+                _ => {
+                    return Err(format!(
+                        "unknown placeholder '{{{}}}' (only {{project_slug}} / {{project_id}} allowed)",
+                        token,
+                    ));
+                }
+            }
+            i += 1 + close + 1; // advance past the closing '}'
+        } else {
+            i += 1;
+        }
+    }
+    if !saw_recognised_token {
+        return Err(
+            "template must contain at least one {project_slug} or {project_id} placeholder"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// v0.2.27: apply a validated `log_path_template` to a single (project_id,
+/// project_slug) pair. Substitutes the two recognised tokens with the
+/// provided values; any unrecognised tokens are left untouched (which
+/// can't happen if the template was validated via `validate_log_path_template`).
+///
+/// The validation pre-guarantees the template is well-formed; this helper
+/// is a pure string transform.
+pub fn render_log_path_template(template: &str, project_id: &str, project_slug: &str) -> String {
+    template
+        .replace("{project_slug}", project_slug)
+        .replace("{project_id}", project_id)
 }
 
 // ─── Placeholder resolution ──────────────────────────────────────────────
@@ -2202,5 +2312,145 @@ mod tests {
         assert!(matches!(&controls[2],
             ConfigControl::MultiSelect { options_source: ActionRef::Legacy(s), .. } if s == "legacy_options_source_cmd"
         ));
+    }
+
+    // ─── v0.2.27: runtime.log_path_template validator ─────────────────
+
+    #[test]
+    fn log_path_template_accepts_canonical_rl_pattern() {
+        assert!(validate_log_path_template("/data/logs/rl_events_{project_slug}.jsonl").is_ok());
+    }
+
+    #[test]
+    fn log_path_template_accepts_uuid_form() {
+        assert!(validate_log_path_template("/data/logs/{project_id}/events.jsonl").is_ok());
+    }
+
+    #[test]
+    fn log_path_template_accepts_both_placeholders() {
+        assert!(
+            validate_log_path_template("/data/{project_slug}/{project_id}.jsonl").is_ok()
+        );
+    }
+
+    #[test]
+    fn log_path_template_rejects_empty() {
+        assert!(validate_log_path_template("").is_err());
+    }
+
+    #[test]
+    fn log_path_template_rejects_no_placeholder() {
+        // No `{...}` token at all → would produce the same path for every
+        // project → rejected at validation time.
+        let err = validate_log_path_template("/data/logs/events.jsonl")
+            .unwrap_err();
+        assert!(err.contains("at least one"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn log_path_template_rejects_double_brace() {
+        // Double-brace tokens are dispatcher-level — mixing them with the
+        // single-brace per-project ones in the same template is forbidden.
+        let err = validate_log_path_template("/data/logs/{{project_slug}}.jsonl")
+            .unwrap_err();
+        assert!(err.contains("double-brace"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn log_path_template_rejects_unknown_placeholder() {
+        let err = validate_log_path_template("/data/logs/{module_id}/events.jsonl")
+            .unwrap_err();
+        assert!(err.contains("unknown placeholder"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn log_path_template_rejects_unclosed_brace() {
+        let err = validate_log_path_template("/data/logs/{project_slug.jsonl")
+            .unwrap_err();
+        assert!(err.contains("unclosed"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn log_path_template_render_substitutes_slug() {
+        let out = render_log_path_template(
+            "/data/logs/rl_events_{project_slug}.jsonl",
+            "uuid-aaa",
+            "my-project",
+        );
+        assert_eq!(out, "/data/logs/rl_events_my-project.jsonl");
+    }
+
+    #[test]
+    fn log_path_template_render_substitutes_both_tokens() {
+        let out = render_log_path_template(
+            "/data/{project_slug}/{project_id}.jsonl",
+            "uuid-aaa",
+            "my-project",
+        );
+        assert_eq!(out, "/data/my-project/uuid-aaa.jsonl");
+    }
+
+    #[test]
+    fn module_manifest_rejects_invalid_log_path_template() {
+        // Mid-deserialisation rejection: an otherwise-valid manifest with
+        // a bad log_path_template fails at `from_json` time with a clear
+        // error including the inner validator message.
+        let raw = r#"{
+            "id": "broken-template-mod",
+            "name": "Broken Template",
+            "version": "0.1.0",
+            "category": "paid-orchestrator",
+            "license": { "min_orchestrator_tier": "pro" },
+            "install": { "method": "git_clone", "source": "https://example.com/x.git" },
+            "runtime": {
+                "type": "container",
+                "command": "echo",
+                "log_path_template": "/data/{not_a_real_token}/events.jsonl"
+            }
+        }"#;
+        let err = ModuleManifest::from_json(raw).unwrap_err();
+        assert!(err.contains("log_path_template"), "outer error: {}", err);
+        assert!(err.contains("unknown placeholder"), "inner error: {}", err);
+    }
+
+    #[test]
+    fn module_manifest_accepts_canonical_log_path_template() {
+        let raw = r#"{
+            "id": "rl-mod",
+            "name": "RL Module",
+            "version": "0.2.1",
+            "category": "paid-orchestrator",
+            "license": { "min_orchestrator_tier": "pro" },
+            "install": { "method": "container_pull",
+                "container": { "image": "ghcr.io/example/rl", "pull_token_endpoint": "https://example.com/t" }
+            },
+            "runtime": {
+                "type": "container",
+                "command": "echo",
+                "log_path_template": "/data/logs/rl_events_{project_slug}.jsonl"
+            }
+        }"#;
+        let m = ModuleManifest::from_json(raw).expect("must parse");
+        assert_eq!(
+            m.runtime.log_path_template.as_deref(),
+            Some("/data/logs/rl_events_{project_slug}.jsonl"),
+        );
+    }
+
+    #[test]
+    fn module_manifest_log_path_template_optional() {
+        // Manifests without log_path_template parse fine — every module
+        // pre-v0.2.27 (and post-v0.2.27 non-RL modules) omits this field.
+        let raw = r#"{
+            "id": "minimal-mod",
+            "name": "Minimal",
+            "version": "0.1.0",
+            "category": "community",
+            "license": { "min_orchestrator_tier": "free" },
+            "install": { "method": "git_clone", "source": "https://example.com/x.git" },
+            "runtime": { "type": "service", "command": "echo" }
+        }"#;
+        let m = ModuleManifest::from_json(raw).expect("must parse");
+        assert!(m.runtime.log_path_template.is_none());
     }
 }

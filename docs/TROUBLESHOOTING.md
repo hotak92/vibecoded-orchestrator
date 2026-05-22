@@ -44,6 +44,51 @@ The first run of an unsigned Windows executable shows SmartScreen's blue dialog.
 
 SmartScreen remembers the choice per binary hash; subsequent runs on the same machine open without the dialog. Code signing is on the post-0.2.0 backlog.
 
+### Windows: `first-install.bat` crashes with `UnicodeEncodeError` (v0.2.25 / v0.2.26)
+
+If you downloaded a v0.2.25 or v0.2.26 release zip and `first-install.bat` crashes at step `[5b/10]` with a message like:
+
+```
+UnicodeEncodeError: 'charmap' codec can't encode character '→' (U+2192)
+  File "install.py", line 6205, in _resolve_service_safety
+    print(f"  [{name}] not running ...")
+```
+
+…you've hit a Windows-only encoding bug in those releases. **Two fixes shipped in v0.2.27 (commits `97eceaf` + `a5b2971`)**: install.py now reconfigures its stdout/stderr to UTF-8 on Windows, and every `.ps1` script in the repo carries a UTF-8 BOM so PowerShell 5.1 (the OS default on Windows 10/11) can parse them. The release artifacts for v0.2.25 / v0.2.26 don't contain these fixes because they shipped post-tag.
+
+**Recovery on stock Windows 10/11** — pick one:
+
+1. **Recommended — upgrade to v0.2.27+ via git**. Open a terminal (any of PowerShell, cmd, Git Bash) in the directory where you extracted the zip:
+
+   ```cmd
+   git pull origin main
+   first-install.bat
+   ```
+
+   The `git pull` brings in the two fixes; the second `first-install.bat` run completes normally. This works even though the **on-disk** install.py from the zip is still the broken one — the `git pull` overwrites it with the fixed version before any installation step runs.
+
+2. **Run install.py with a forced UTF-8 environment** (no git needed). From cmd:
+
+   ```cmd
+   set PYTHONIOENCODING=utf-8
+   set PYTHONUTF8=1
+   python install.py --update
+   ```
+
+   Or from PowerShell:
+
+   ```powershell
+   $env:PYTHONIOENCODING = "utf-8"
+   $env:PYTHONUTF8 = "1"
+   python install.py --update
+   ```
+
+   This forces the legacy v0.2.25 / v0.2.26 install.py to use UTF-8 for stdout, sidestepping the `cp1252` codec entirely. Equivalent to the in-Python fix that landed in v0.2.27.
+
+3. **Download the v0.2.27+ release zip directly** (the simplest if you don't have git installed): delete your old install and re-extract the new zip. Both fixes are baked into v0.2.27's `install.py` + `.ps1` files.
+
+The fix is also belt-and-braces inside the launcher: when you click **Update orchestrator** from the launcher GUI (instead of running `install.py` from a terminal), the launcher binary itself sets `PYTHONIOENCODING=utf-8` + `PYTHONUTF8=1` on the Python subprocess — so the in-GUI update path works even on a v0.2.25 install where the on-disk install.py is still the broken version. This protection landed in launcher v0.2.27 commit `046e1dc`.
+
 ### Linux: `.desktop` file doesn't open on double-click
 
 Some file managers require enabling executable-text activation before `.desktop` files open as programs rather than text.

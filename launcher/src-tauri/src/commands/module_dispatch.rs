@@ -101,6 +101,18 @@ const HTTP_TIMEOUT_SECS: u64 = 30;
 /// give callers a single place to reference when constructing one.
 pub type ControlValueResolver<'a> = Box<dyn Fn(&str) -> Option<Value> + Send + Sync + 'a>;
 
+/// v0.2.27: resolver for `{{events_paths_for:<control_id>}}`. Looks up
+/// the referenced control's array-of-UUIDs value, walks each UUID via
+/// `db.get_project()`, applies the active module's `log_path_template`,
+/// and returns a JSON array of paths. Returns an `Err` with a clear
+/// message on any failure (control id unknown, value not an array of
+/// strings, UUID doesn't resolve to a project, module has no template).
+///
+/// Held by reference so the dispatcher can wire it once at the
+/// `dispatch_action_with_sink` boundary; tests can install a synthetic
+/// resolver that bypasses the DB.
+pub type EventsPathsResolver<'a> = Box<dyn Fn(&str) -> Result<Value, String> + Send + Sync + 'a>;
+
 /// Substitution context for `{{token}}` placeholders in the descriptor's
 /// `body`. Held by reference so the closure used for `{{control:<id>}}`
 /// lookups can borrow from the caller's settings cache without forcing
@@ -120,6 +132,12 @@ pub struct SubstitutionContext<'a> {
     /// Resolver for `{{control:<id>}}` tokens — reads other controls'
     /// persisted settings. Returns `None` when the id is unknown.
     pub get_control_value: ControlValueResolver<'a>,
+    /// v0.2.27: resolver for `{{events_paths_for:<control_id>}}`. When
+    /// None, the dispatcher rejects any use of that token with a clear
+    /// "events_paths_for unavailable — module declares no log_path_template
+    /// OR no DB context" error. The production dispatcher always wires
+    /// this when the module has `runtime.log_path_template` set.
+    pub get_events_paths_for: Option<EventsPathsResolver<'a>>,
 }
 
 impl<'a> SubstitutionContext<'a> {
@@ -136,6 +154,7 @@ impl<'a> SubstitutionContext<'a> {
             module_id,
             value,
             get_control_value: Box::new(|_| None),
+            get_events_paths_for: None,
         }
     }
 }
@@ -224,6 +243,23 @@ fn substitute_string(s: &str, ctx: &SubstitutionContext) -> Result<Value, String
                     format!("substitute: unclosed '{{{{' in template: {:?}", s)
                 })?;
                 let token = &s[token_start..token_start + close_relative];
+                // v0.2.27: `events_paths_for:<id>` resolves to a JSON
+                // array — embedding an array inside a longer string is
+                // ambiguous (JSON-stringify it? join with what
+                // separator?) and almost certainly an authoring
+                // mistake. Reject loudly at the embedded site so the
+                // module author gets a clear "use whole-string form"
+                // pointer instead of a silently-garbled body.
+                if token.trim().starts_with("events_paths_for:") {
+                    return Err(format!(
+                        "substitute: '{{{{{}}}}}' must be the WHOLE string value of a body \
+                         field (embedded form not supported because the token resolves to a \
+                         JSON array). Re-shape the body so the value is `\"{{{{{}}}}}\"` \
+                         with nothing before or after.",
+                        token.trim(),
+                        token.trim(),
+                    ));
+                }
                 let resolved = resolve_token(token, ctx)?;
                 // Stringify the resolved value for embedded use. Strings
                 // are taken verbatim (no extra quotes); everything else is
@@ -273,8 +309,26 @@ fn resolve_token(token: &str, ctx: &SubstitutionContext) -> Result<Value, String
                 )
             })
         }
+        // v0.2.27: events_paths_for resolves a control's array-of-UUIDs
+        // value into an array of host paths via the module's
+        // `runtime.log_path_template`. Returns a `JsonValue::Array`.
+        // This is the FIRST token that returns a non-scalar JSON value;
+        // the caller (`substitute_string`) enforces whole-string-only
+        // for this case (embedding an array into a longer string makes
+        // no sense and is rejected loudly).
+        other if other.starts_with("events_paths_for:") => {
+            let control_id = &other["events_paths_for:".len()..];
+            match ctx.get_events_paths_for.as_ref() {
+                Some(resolver) => resolver(control_id),
+                None => Err(format!(
+                    "substitute: '{{{{events_paths_for:{}}}}}' referenced but module declares no \
+                     runtime.log_path_template (or DB context unavailable)",
+                    control_id,
+                )),
+            }
+        }
         other => Err(format!(
-            "substitute: unknown placeholder '{{{{{}}}}}' (allowed: project_id, module_id, value, control:<id>)",
+            "substitute: unknown placeholder '{{{{{}}}}}' (allowed: project_id, module_id, value, control:<id>, events_paths_for:<id>)",
             other,
         )),
     }
@@ -325,6 +379,7 @@ pub async fn dispatch_action_inner(
     action: ActionDescriptor,
     value: Option<Value>,
     sibling_values: Option<HashMap<String, Value>>,
+    log_path_template: Option<String>,
     app: AppHandle,
     db: &Db,
     http_client: &reqwest::Client,
@@ -336,6 +391,7 @@ pub async fn dispatch_action_inner(
         action,
         value,
         sibling_values,
+        log_path_template,
         sink,
         db,
         http_client,
@@ -353,6 +409,7 @@ pub(crate) async fn dispatch_action_with_sink(
     action: ActionDescriptor,
     value: Option<Value>,
     sibling_values: Option<HashMap<String, Value>>,
+    log_path_template: Option<String>,
     sink: Arc<dyn EventSink>,
     db: &Db,
     http_client: &reqwest::Client,
@@ -391,11 +448,77 @@ pub(crate) async fn dispatch_action_with_sink(
                 .flatten()
         })
     };
+
+    // v0.2.27: `{{events_paths_for:<control_id>}}` resolver. Wired only
+    // when the module's manifest declared `runtime.log_path_template`.
+    // The resolver closure reads the sibling control's value (must be
+    // an array of UUID strings), walks each UUID via `db.get_project`,
+    // applies the template via `render_log_path_template`, and returns
+    // a JSON array.
+    let events_paths_resolver: Option<EventsPathsResolver> = log_path_template.map(|template| {
+        let project_id_owned = project_id.to_string();
+        let module_id_owned = module_id.to_string();
+        let sibling_snapshot = sibling_snapshot.clone();
+        let db_for_resolver = db;
+        let resolver: EventsPathsResolver = Box::new(move |control_id: &str| -> Result<Value, String> {
+            // Read the referenced control's value. Try the renderer
+            // snapshot first (matches the {{control:<id>}} resolver's
+            // ordering), then fall back to module_settings DB.
+            let raw_value = match sibling_snapshot.get(control_id) {
+                Some(v) => v.clone(),
+                None => db_for_resolver
+                    .get_setting(&project_id_owned, &module_id_owned, control_id)
+                    .map_err(|e| format!(
+                        "events_paths_for: DB read failed for control '{}': {}",
+                        control_id, e,
+                    ))?
+                    .ok_or_else(|| format!(
+                        "events_paths_for: control '{}' has no value (not in renderer snapshot AND no module_settings row)",
+                        control_id,
+                    ))?,
+            };
+
+            // Must be a JSON array.
+            let uuid_array = raw_value.as_array().ok_or_else(|| format!(
+                "events_paths_for: control '{}' value must be an array, got {:?}",
+                control_id,
+                raw_value,
+            ))?;
+
+            // Each element must be a string (project UUID).
+            let mut paths: Vec<Value> = Vec::with_capacity(uuid_array.len());
+            for (idx, elem) in uuid_array.iter().enumerate() {
+                let uuid = elem.as_str().ok_or_else(|| format!(
+                    "events_paths_for: control '{}' array element {} is not a string (expected project UUID)",
+                    control_id, idx,
+                ))?;
+                // Walk UUID → ProjectRow to get the slug.
+                let project = db_for_resolver
+                    .get_project(uuid)
+                    .map_err(|e| format!(
+                        "events_paths_for: DB lookup for project '{}' failed: {}",
+                        uuid, e,
+                    ))?
+                    .ok_or_else(|| format!(
+                        "events_paths_for: project UUID '{}' (from control '{}') not found in DB",
+                        uuid, control_id,
+                    ))?;
+                let path = vct_launcher_core::manifest::render_log_path_template(
+                    &template, uuid, &project.slug,
+                );
+                paths.push(Value::String(path));
+            }
+            Ok(Value::Array(paths))
+        });
+        resolver
+    });
+
     let ctx = SubstitutionContext {
         project_id,
         module_id,
         value: value_ref,
         get_control_value: resolver,
+        get_events_paths_for: events_paths_resolver,
     };
 
     // Resolve the module's port. The dispatcher refuses to fire when
@@ -748,17 +871,40 @@ pub async fn module_dispatch_action(
         .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
         .build()
         .map_err(|e| format!("module_dispatch_action: build HTTP client: {}", e))?;
+
+    // v0.2.27: load the module's manifest (best-effort) to extract
+    // `runtime.log_path_template`. Used by the dispatcher's
+    // `{{events_paths_for:<control_id>}}` resolver. Soft-fail: if the
+    // manifest can't be loaded, the resolver simply isn't wired and any
+    // use of the token returns a clear "events_paths_for unavailable"
+    // error rather than poisoning the dispatch entirely.
+    let log_path_template = load_module_log_path_template(db.inner(), &project_id, &module_id);
+
     dispatch_action_inner(
         &module_id,
         &project_id,
         action,
         value,
         sibling_values,
+        log_path_template,
         app,
         db.inner(),
         &http_client,
     )
     .await
+}
+
+/// v0.2.27: load a module's `runtime.log_path_template` from its
+/// installed `vct-module.json`. Returns None on any failure (module not
+/// installed, manifest missing, parse error, template not set) — the
+/// dispatcher handles None as "events_paths_for unavailable" and rejects
+/// the token cleanly at dispatch time.
+fn load_module_log_path_template(db: &Db, project_id: &str, module_id: &str) -> Option<String> {
+    let install_row = db.get_module_install(project_id, module_id).ok().flatten()?;
+    let manifest_path = std::path::Path::new(&install_row.install_path).join("vct-module.json");
+    let raw = std::fs::read_to_string(&manifest_path).ok()?;
+    let manifest = vct_launcher_core::manifest::ModuleManifest::from_json(&raw).ok()?;
+    manifest.runtime.log_path_template
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────
@@ -994,6 +1140,7 @@ mod tests {
                     None
                 }
             }),
+            get_events_paths_for: None,
         };
         let out = substitute(&v, &ctx).unwrap();
         assert_eq!(
@@ -1025,6 +1172,125 @@ mod tests {
         let ctx = SubstitutionContext::simple("proj-A", "mod-X", None);
         let err = substitute(&v, &ctx).unwrap_err();
         assert!(err.contains("value"), "got: {}", err);
+    }
+
+    // ─── v0.2.27: {{events_paths_for:<control_id>}} ──────────────────
+
+    /// Helper: build a SubstitutionContext with a synthetic
+    /// events_paths_for resolver that mimics the DB-backed production
+    /// resolver without needing a real Db. The closure parameter is
+    /// the resolver behaviour the test wants to exercise.
+    fn ctx_with_events_paths_resolver<'a, F>(resolver: F) -> SubstitutionContext<'a>
+    where
+        F: Fn(&str) -> Result<Value, String> + Send + Sync + 'a,
+    {
+        SubstitutionContext {
+            project_id: "proj-A",
+            module_id: "mod-X",
+            value: None,
+            get_control_value: Box::new(|_| None),
+            get_events_paths_for: Some(Box::new(resolver)),
+        }
+    }
+
+    /// Happy path: token resolves to an array of paths via the closure.
+    /// The dispatcher's production resolver does this by walking UUIDs
+    /// through `db.get_project()` and applying `render_log_path_template`;
+    /// here the closure just returns a pre-built array.
+    #[test]
+    fn substitute_events_paths_for_resolves_to_array() {
+        let v = json!("{{events_paths_for:src_projects}}");
+        let ctx = ctx_with_events_paths_resolver(|control_id| {
+            assert_eq!(control_id, "src_projects");
+            Ok(json!([
+                "/data/logs/rl_events_proj1.jsonl",
+                "/data/logs/rl_events_proj2.jsonl",
+            ]))
+        });
+        let out = substitute(&v, &ctx).unwrap();
+        assert_eq!(
+            out,
+            json!([
+                "/data/logs/rl_events_proj1.jsonl",
+                "/data/logs/rl_events_proj2.jsonl",
+            ]),
+        );
+    }
+
+    /// Error: module declares no log_path_template (resolver is None).
+    /// Token in body → clear "events_paths_for unavailable" error.
+    #[test]
+    fn substitute_events_paths_for_no_resolver_errors() {
+        let v = json!("{{events_paths_for:src_projects}}");
+        let ctx = SubstitutionContext {
+            project_id: "proj-A",
+            module_id: "mod-X",
+            value: None,
+            get_control_value: Box::new(|_| None),
+            get_events_paths_for: None,
+        };
+        let err = substitute(&v, &ctx).unwrap_err();
+        assert!(err.contains("events_paths_for"), "got: {}", err);
+        assert!(err.contains("log_path_template"), "got: {}", err);
+    }
+
+    /// Error: resolver returns Err with a clear message (control id
+    /// unknown, value not an array, UUID not in DB — these are all
+    /// inside-resolver decisions that bubble up unchanged).
+    #[test]
+    fn substitute_events_paths_for_resolver_error_propagates() {
+        let v = json!("{{events_paths_for:src_projects}}");
+        let ctx = ctx_with_events_paths_resolver(|_| {
+            Err("control 'src_projects' value is not an array".to_string())
+        });
+        let err = substitute(&v, &ctx).unwrap_err();
+        assert!(err.contains("not an array"), "got: {}", err);
+    }
+
+    /// Whole-string-only: embedding `{{events_paths_for:<id>}}` inside
+    /// a longer string is rejected at dispatch time because the token
+    /// resolves to a JSON array (can't be stringified into a longer
+    /// string meaningfully).
+    #[test]
+    fn substitute_events_paths_for_rejects_embedded_form() {
+        let v = json!("paths: {{events_paths_for:src_projects}} (count varies)");
+        let ctx = ctx_with_events_paths_resolver(|_| Ok(json!([])));
+        let err = substitute(&v, &ctx).unwrap_err();
+        // Should reject BEFORE calling the resolver — error message
+        // names the token and explains the whole-string requirement.
+        assert!(err.contains("events_paths_for"), "got: {}", err);
+        assert!(err.contains("WHOLE string"), "got: {}", err);
+    }
+
+    /// Recursion into nested objects: a body field that is exactly
+    /// the token resolves to the array, even when nested deeply.
+    #[test]
+    fn substitute_events_paths_for_inside_nested_object() {
+        let v = json!({
+            "mode": "offline",
+            "options": {
+                "project_ids": "{{events_paths_for:src_projects}}",
+                "max_epochs": 3,
+            },
+        });
+        let ctx = ctx_with_events_paths_resolver(|_| {
+            Ok(json!(["/data/a.jsonl", "/data/b.jsonl"]))
+        });
+        let out = substitute(&v, &ctx).unwrap();
+        assert_eq!(out["options"]["project_ids"], json!(["/data/a.jsonl", "/data/b.jsonl"]));
+        assert_eq!(out["mode"], json!("offline"));
+        assert_eq!(out["options"]["max_epochs"], json!(3));
+    }
+
+    /// Unknown token form starting with `events_` but not the canonical
+    /// `events_paths_for:` prefix falls through to the "unknown placeholder"
+    /// branch with a clear error.
+    #[test]
+    fn substitute_unknown_events_prefix_errors() {
+        let v = json!("{{events_for_paths:src_projects}}");
+        let ctx = ctx_with_events_paths_resolver(|_| Ok(json!([])));
+        let err = substitute(&v, &ctx).unwrap_err();
+        assert!(err.contains("unknown placeholder"), "got: {}", err);
     }
 
     // ─── jsonpath_top_level() ────────────────────────────────────────
@@ -1126,6 +1392,7 @@ mod tests {
             action,
             None,
             None,
+            None,
             sink,
             &db,
             &client,
@@ -1186,6 +1453,7 @@ mod tests {
             action,
             None,
             Some(siblings),
+            None,
             sink,
             &db,
             &client,
@@ -1244,7 +1512,7 @@ mod tests {
         // No sibling_values from the renderer → dispatcher MUST fall
         // back to the module_settings read.
         let resp = dispatch_action_with_sink(
-            module_id, project_id, action, None, None, sink, &db, &client,
+            module_id, project_id, action, None, None, None, sink, &db, &client,
         )
         .await
         .expect("dispatch ok");
@@ -1314,6 +1582,7 @@ mod tests {
             module_id,
             project_id,
             action,
+            None,
             None,
             None,
             sink_arc,
@@ -1399,7 +1668,7 @@ mod tests {
             next_action: None,
         };
 
-        dispatch_action_with_sink(module_id, project_id, action, None, None, sink_arc, &db, &client)
+        dispatch_action_with_sink(module_id, project_id, action, None, None, None, sink_arc, &db, &client)
             .await
             .expect("dispatch ok");
 
@@ -1480,7 +1749,7 @@ mod tests {
             next_action: None,
         };
 
-        dispatch_action_with_sink(module_id, project_id, action, None, None, sink_arc, &db, &client)
+        dispatch_action_with_sink(module_id, project_id, action, None, None, None, sink_arc, &db, &client)
             .await
             .expect("dispatch ok");
 
@@ -1558,7 +1827,7 @@ mod tests {
             next_action: None,
         };
 
-        dispatch_action_with_sink(module_id, project_id, action, None, None, sink_arc, &db, &client)
+        dispatch_action_with_sink(module_id, project_id, action, None, None, None, sink_arc, &db, &client)
             .await
             .expect("dispatch ok");
 
@@ -1644,6 +1913,7 @@ mod tests {
             first_action,
             None,
             None,
+            None,
             sink,
             &db,
             &client,
@@ -1695,7 +1965,7 @@ mod tests {
         }
         let head = *current.expect("chain non-empty");
 
-        let err = dispatch_action_with_sink(module_id, project_id, head, None, None, sink, &db, &client)
+        let err = dispatch_action_with_sink(module_id, project_id, head, None, None, None, sink, &db, &client)
             .await
             .expect_err("expected chain-depth error");
         assert!(
@@ -1729,7 +1999,7 @@ mod tests {
             polling: None,
             next_action: None,
         };
-        let err = dispatch_action_with_sink("ghost-module", "proj-X", action, None, None, sink, &db, &client)
+        let err = dispatch_action_with_sink("ghost-module", "proj-X", action, None, None, None, sink, &db, &client)
             .await
             .expect_err("missing port must error");
         assert!(
