@@ -52,7 +52,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Optional
 
 # Default Weaviate port (mirrors install.DEFAULT_WEAVIATE_PORT, kept here
@@ -2691,6 +2691,71 @@ def _stale_orchestrator_root_heal_match(
     return round_trip == installed
 
 
+def _agent_or_skill_already_present(
+    project_dir: Path, name: str, kind: str,
+) -> bool:
+    """Return True if the agent/skill is already installed at either the
+    enabled or disabled location, so install-bundle should skip copying.
+
+    Mirrors `resolve_kind_paths()` in the Rust launcher-core
+    (`vct-launcher-core::db::project_state`). `kind` is 'agent' or
+    'skill'. Used by `_file_action` to honour the FS-disable contract:
+    a user-disabled file (moved to `.claude/{agents,skills}.disabled/`
+    by the launcher GUI) must NOT be resurrected by a bundle update.
+
+    Path math is intentionally pure (no I/O beyond `.exists()`) so the
+    helper is cheap to call once per bundle op.
+    """
+    claude = project_dir / ".claude"
+    if kind == "agent":
+        # Agents are individual .md files.
+        leaf = f"{name}.md"
+        return (
+            (claude / "agents" / leaf).exists()
+            or (claude / "agents.disabled" / leaf).exists()
+        )
+    if kind == "skill":
+        # Skills are whole directories — the name IS the leaf.
+        return (
+            (claude / "skills" / name).exists()
+            or (claude / "skills.disabled" / name).exists()
+        )
+    return False
+
+
+def _classify_bundle_op_kind(dest_rel: str) -> Optional[tuple[str, str]]:
+    """If `dest_rel` is an agent .md or skill file/dir, return the
+    (kind, name) tuple suitable for `_agent_or_skill_already_present`.
+
+    Returns None for hooks, scripts, settings, infra — anything not
+    subject to the FS-disable rule.
+
+    Cross-OS: `_BundleFileOp.dest_rel` is built via `str(Path(...))`
+    whose separator depends on the host OS (`/` on POSIX, `\\` on
+    Windows). Normalise both flavours via `pathlib.PurePosixPath`
+    after a backslash-to-slash swap so the classifier works uniformly
+    regardless of where the bundle was enumerated.
+    """
+    # PurePosixPath alone treats `\\` as a literal character, so a
+    # Windows-shaped dest_rel ('.claude\\agents\\foo.md') would not split
+    # into the expected parts. Normalise to `/` first.
+    normalised = dest_rel.replace("\\", "/")
+    parts = PurePosixPath(normalised).parts
+    # All FS-disable-relevant ops live under .claude/<bucket>/...
+    if len(parts) < 3 or parts[0] != ".claude":
+        return None
+    bucket = parts[1]
+    if bucket == "agents" and len(parts) == 3 and parts[2].endswith(".md"):
+        # `.claude/agents/<name>.md` — name is the stem (sans `.md`).
+        return ("agent", parts[2][:-3])
+    if bucket == "skills" and len(parts) >= 3:
+        # Skills are recursive; every shipped file lives under
+        # `.claude/skills/<name>/...`. Skip the whole skill when its
+        # directory has a `.disabled/` counterpart.
+        return ("skill", parts[2])
+    return None
+
+
 def _file_action(
     op: _BundleFileOp,
     target_path: Path,
@@ -2698,6 +2763,7 @@ def _file_action(
     update_mode: bool,
     manifest: dict,
     orchestrator_root: Optional[Path] = None,
+    project_root: Optional[Path] = None,
 ) -> tuple[str, bytes]:
     """Decide the per-file action and return (action, source_bytes).
 
@@ -2710,6 +2776,11 @@ def _file_action(
       "noop"            — file exists, source identical to installed (no-op).
       "always-overwrite"— `op.always_overwrite=True` (e.g. hooks/_lib).
       "skip-existing"   — first-install (update_mode=False) and target exists.
+      "skip-disabled"   — FS-disable plan (Wave 2 D, 2026-05-22): the agent
+                          or skill exists at the user-disabled location
+                          (`.claude/{agents,skills}.disabled/<name>`). Skip
+                          copying so the user's disable choice survives
+                          bundle updates.
 
     PR-2 heal (2026-05-06): if `orchestrator_root` is supplied and the
     file was produced via `_apply_subs` (transform present), an installed
@@ -2727,6 +2798,32 @@ def _file_action(
 
     if op.always_overwrite:
         return ("always-overwrite", source_bytes)
+
+    # FS-disable guard (Wave 2 D contract). Before touching disk, check
+    # the `.disabled/` companion location for agents and skills. If the
+    # user has explicitly disabled this entry via the launcher GUI, the
+    # bundle install MUST NOT recreate the enabled-side file — that
+    # would silently undo the disable. The guard runs BEFORE the
+    # target-existence branches so it works in both first-install and
+    # update modes uniformly.
+    if project_root is not None:
+        kind_name = _classify_bundle_op_kind(op.dest_rel)
+        if kind_name is not None:
+            kind, name = kind_name
+            # The enabled-side check is implicit in "exists" elsewhere;
+            # only the disabled-side check is novel. Check it explicitly
+            # to surface the skip-disabled action in actions["skip-disabled"].
+            disabled_dir = (
+                "agents.disabled" if kind == "agent" else "skills.disabled"
+            )
+            disabled_leaf = (
+                f"{name}.md" if kind == "agent" else name
+            )
+            disabled_path = (
+                project_root / ".claude" / disabled_dir / disabled_leaf
+            )
+            if disabled_path.exists():
+                return ("skip-disabled", source_bytes)
 
     if not target_path.exists():
         return ("create", source_bytes)
@@ -4566,6 +4663,7 @@ def install_project_bundle(
             "noop": [<rel>...],
             "preserve": [<rel>...],
             "skip-existing": [<rel>...],
+            "skip-disabled": [<rel>...],        # Wave 2 D, 2026-05-22
             "orphan-deleted": [<rel>...],       # v0.2.24 §A0
             "orphan-preserved": [<rel>...],     # v0.2.24 §A0
         },
@@ -4599,6 +4697,7 @@ def install_project_bundle(
             "actions": {k: [] for k in
                         ("create", "overwrite", "always-overwrite",
                          "noop", "preserve", "skip-existing",
+                         "skip-disabled",
                          "orphan-deleted", "orphan-preserved")},
             "settings_action": "",
             "manifest_written": False,
@@ -4629,6 +4728,7 @@ def install_project_bundle(
         "actions": {k: [] for k in
                     ("create", "overwrite", "always-overwrite",
                      "noop", "preserve", "skip-existing",
+                     "skip-disabled",
                      "orphan-deleted", "orphan-preserved")},
         "settings_action": "",
         "manifest_written": False,
@@ -4665,6 +4765,7 @@ def install_project_bundle(
             action, source_bytes = _file_action(
                 op, target_path, update_mode=update_mode, manifest=manifest,
                 orchestrator_root=orchestrator_root,
+                project_root=folder,
             )
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
@@ -4717,6 +4818,20 @@ def install_project_bundle(
                 "shipped_source": op.source_rel,
                 "reason": "skip-existing",
             }
+
+        elif action == "skip-disabled":
+            # FS-disable contract (Wave 2 D, 2026-05-22): the agent or
+            # skill exists at the user-disabled location
+            # (`.claude/{agents,skills}.disabled/<name>`). The user
+            # explicitly disabled it via the launcher GUI; bundle
+            # updates MUST NOT undo that choice. We do NOT touch the
+            # filesystem, do NOT claim ownership in the manifest
+            # (the enabled-side file isn't ours — it doesn't exist),
+            # and do NOT record a preservation entry (the .disabled/
+            # location is the source-of-truth, not a divergent edit).
+            # Pure no-op other than the result["actions"]["skip-disabled"]
+            # append below for caller introspection.
+            pass
 
         elif action == "noop":
             # File matches what we'd write. Manifest entry should reflect

@@ -42,6 +42,7 @@ use serde_json::Value as JsonValue;
 use crate::commands::project_env_settings::DEFAULT_SHARED_KG_COLLECTION;
 use crate::commands::projects_v2::sanitize_kg_collection;
 use crate::db::project_mcp_servers::is_bundled_mcp;
+use crate::db::project_state::{resolve_kind_paths, AgentOrSkill};
 use crate::db::Db;
 
 /// Result summary for diagnostic logging. Not exposed to the frontend.
@@ -100,8 +101,8 @@ pub fn populate_project_state_from_filesystem(
         return report;
     }
 
-    populate_agents(project_id, &claude_dir, db, &mut report);
-    populate_skills(project_id, &claude_dir, db, &mut report);
+    populate_agents(project_id, folder_path, &claude_dir, db, &mut report);
+    populate_skills(project_id, folder_path, &claude_dir, db, &mut report);
     populate_hooks(project_id, &claude_dir, db, &mut report);
     populate_kg_bindings(project_id, project_name, db, &mut report);
     populate_codegraph_binding(project_id, project_name, db, &mut report);
@@ -222,6 +223,7 @@ fn is_blocklisted_agent_file(path: &Path) -> bool {
 
 fn populate_agents(
     project_id: &str,
+    folder_path: &Path,
     claude_dir: &Path,
     db: &Db,
     report: &mut PopulateReport,
@@ -239,6 +241,28 @@ fn populate_agents(
         let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) != Some("md") {
             continue;
+        }
+        // Don't-resurrect-a-disabled-file guard (FS-disable plan,
+        // Subagent D, Wave 2). If an agent file exists in BOTH
+        // `.claude/agents/<name>.md` AND `.claude/agents.disabled/<name>.md`
+        // simultaneously (a corrupt-state fluke or a partial migration),
+        // skip registration. The user's explicit disable choice
+        // (recorded by the presence of the `.disabled/` companion) wins.
+        // Path math is delegated to `resolve_kind_paths` so this stays
+        // consistent with `set_project_agent_enabled` and the
+        // one-time migration in `vct-launcher-core::db::project_state`.
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            let (_enabled, disabled) =
+                resolve_kind_paths(folder_path, stem, AgentOrSkill::Agent);
+            if disabled.exists() {
+                report.warnings.push(format!(
+                    "agent {} present in both agents/ and agents.disabled/ \
+                     — skipping registration. Run the launcher's FS-disable \
+                     migration or manually remove one copy.",
+                    stem
+                ));
+                continue;
+            }
         }
         // Skip documentation files that live in `.claude/agents/` but
         // are not agents themselves (README.md, index.md, template.md).
@@ -331,6 +355,7 @@ fn populate_agents(
 
 fn populate_skills(
     project_id: &str,
+    folder_path: &Path,
     claude_dir: &Path,
     db: &Db,
     report: &mut PopulateReport,
@@ -348,6 +373,26 @@ fn populate_skills(
         let skill_md = path.join("SKILL.md");
         if !skill_md.is_file() {
             continue;
+        }
+        // Don't-resurrect-a-disabled-file guard (FS-disable plan,
+        // Subagent D, Wave 2). Mirror of the agent guard above:
+        // if a skill directory exists in BOTH `.claude/skills/<name>/`
+        // AND `.claude/skills.disabled/<name>/`, skip registration.
+        // The `.disabled/` companion encodes the user's explicit
+        // disable choice and must not be silently undone by a
+        // re-populate sweep.
+        if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+            let (_enabled, disabled) =
+                resolve_kind_paths(folder_path, name, AgentOrSkill::Skill);
+            if disabled.exists() {
+                report.warnings.push(format!(
+                    "skill {} present in both skills/ and skills.disabled/ \
+                     — skipping registration. Run the launcher's FS-disable \
+                     migration or manually remove one copy.",
+                    name
+                ));
+                continue;
+            }
         }
         let raw = match std::fs::read_to_string(&skill_md) {
             Ok(s) => s,
@@ -1266,6 +1311,208 @@ mod tests {
         assert!(names.contains(&"tdd"));
 
         std::fs::remove_dir_all(&folder).ok();
+    }
+
+    // ─── populate_disabled_tests (Wave 2 D: don't-resurrect-disabled) ──
+    //
+    // Subagent D contract: `populate_project_state_from_filesystem`
+    // must NOT silently register an agent or skill that has a
+    // `.disabled/` companion on disk. The companion encodes the
+    // user's explicit disable choice (set by the launcher GUI via
+    // `set_project_agent_enabled` / `set_project_skill_enabled`,
+    // which moves the file into `.claude/{agents,skills}.disabled/`).
+    //
+    // Three scenarios per kind:
+    //   1. Fresh project: file in `agents/` (no `.disabled/` sibling)
+    //      → registered normally.
+    //   2. Disabled-only: file ONLY in `agents.disabled/`
+    //      → naturally skipped (populate iterates `agents/`).
+    //   3. Both: file in BOTH locations (corrupt state)
+    //      → registration SKIPPED + warning emitted. The `.disabled/`
+    //      copy is untouched (we never write to FS in this code path).
+
+    mod populate_disabled_tests {
+        use super::*;
+
+        // ─── Agents ────────────────────────────────────────────────
+
+        #[test]
+        fn fresh_project_registers_agent_normally() {
+            let folder = scratch_dir("disable-agent-fresh");
+            let agents_dir = folder.join(".claude/agents");
+            std::fs::create_dir_all(&agents_dir).unwrap();
+            write_agent_file(&agents_dir, "foo.md", "name: foo\nmodel: sonnet", "");
+
+            let db = make_db_with_project("p1", "P");
+            let report =
+                populate_project_state_from_filesystem("p1", "P", &folder, &db);
+
+            assert_eq!(report.agents_inserted, 1);
+            let rows = db.list_project_agents("p1").unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].agent_name, "foo");
+            assert!(rows[0].enabled);
+
+            std::fs::remove_dir_all(&folder).ok();
+        }
+
+        #[test]
+        fn disabled_only_agent_is_naturally_skipped() {
+            // Simulates the post-disable state: launcher moved
+            // `agents/foo.md` → `agents.disabled/foo.md`. Populate
+            // iterates `agents/`, which is now empty for that file,
+            // so no row is inserted. The `.disabled/` copy survives
+            // populate untouched.
+            let folder = scratch_dir("disable-agent-disabled-only");
+            let agents_dir = folder.join(".claude/agents");
+            let disabled_dir = folder.join(".claude/agents.disabled");
+            std::fs::create_dir_all(&agents_dir).unwrap();
+            std::fs::create_dir_all(&disabled_dir).unwrap();
+            // Put a file ONLY in the disabled directory.
+            write_agent_file(
+                &disabled_dir,
+                "foo.md",
+                "name: foo\nmodel: sonnet",
+                "",
+            );
+
+            let db = make_db_with_project("p1", "P");
+            let report =
+                populate_project_state_from_filesystem("p1", "P", &folder, &db);
+
+            // Zero agents registered — the file isn't in `agents/`.
+            assert_eq!(report.agents_inserted, 0);
+            assert_eq!(db.list_project_agents("p1").unwrap().len(), 0);
+            // The `.disabled/` file is still on disk.
+            assert!(
+                disabled_dir.join("foo.md").exists(),
+                "populate must not touch the .disabled/ copy"
+            );
+            // And the enabled-side file did NOT reappear.
+            assert!(
+                !agents_dir.join("foo.md").exists(),
+                "populate must never resurrect a file into agents/"
+            );
+
+            std::fs::remove_dir_all(&folder).ok();
+        }
+
+        #[test]
+        fn agent_present_in_both_locations_is_skipped_with_warning() {
+            // Corrupt state: file in BOTH `agents/foo.md` AND
+            // `agents.disabled/foo.md`. The don't-resurrect guard
+            // skips registration and emits a warning so the user
+            // can clean up (the FS-disable migration in
+            // `vct-launcher-core::db::project_state` handles this
+            // case automatically on launcher startup).
+            let folder = scratch_dir("disable-agent-both");
+            let agents_dir = folder.join(".claude/agents");
+            let disabled_dir = folder.join(".claude/agents.disabled");
+            std::fs::create_dir_all(&agents_dir).unwrap();
+            std::fs::create_dir_all(&disabled_dir).unwrap();
+            write_agent_file(&agents_dir, "foo.md", "name: foo\nmodel: sonnet", "");
+            write_agent_file(&disabled_dir, "foo.md", "name: foo\nmodel: sonnet", "");
+
+            let db = make_db_with_project("p1", "P");
+            let report =
+                populate_project_state_from_filesystem("p1", "P", &folder, &db);
+
+            // Skipped — the disabled companion wins.
+            assert_eq!(report.agents_inserted, 0);
+            assert!(db.list_project_agents("p1").unwrap().is_empty());
+            // Both files survive populate (no FS mutation in this code path).
+            assert!(agents_dir.join("foo.md").exists());
+            assert!(disabled_dir.join("foo.md").exists());
+            // Warning surfaced for user/operator visibility.
+            assert!(
+                report.warnings.iter().any(|w|
+                    w.contains("foo")
+                        && w.contains("agents.disabled/")
+                ),
+                "expected both-locations warning for agent foo, got: {:?}",
+                report.warnings
+            );
+
+            std::fs::remove_dir_all(&folder).ok();
+        }
+
+        // ─── Skills (whole directories) ────────────────────────────
+
+        #[test]
+        fn fresh_project_registers_skill_normally() {
+            let folder = scratch_dir("disable-skill-fresh");
+            let skills_dir = folder.join(".claude/skills");
+            std::fs::create_dir_all(&skills_dir).unwrap();
+            write_skill_dir(&skills_dir, "tdd", "name: tdd\nmodel: sonnet");
+
+            let db = make_db_with_project("p1", "P");
+            let report =
+                populate_project_state_from_filesystem("p1", "P", &folder, &db);
+
+            assert_eq!(report.skills_inserted, 1);
+            let rows = db.list_project_skills("p1").unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].skill_name, "tdd");
+
+            std::fs::remove_dir_all(&folder).ok();
+        }
+
+        #[test]
+        fn disabled_only_skill_is_naturally_skipped() {
+            let folder = scratch_dir("disable-skill-disabled-only");
+            let skills_dir = folder.join(".claude/skills");
+            let disabled_dir = folder.join(".claude/skills.disabled");
+            std::fs::create_dir_all(&skills_dir).unwrap();
+            std::fs::create_dir_all(&disabled_dir).unwrap();
+            write_skill_dir(&disabled_dir, "tdd", "name: tdd\nmodel: sonnet");
+
+            let db = make_db_with_project("p1", "P");
+            let report =
+                populate_project_state_from_filesystem("p1", "P", &folder, &db);
+
+            assert_eq!(report.skills_inserted, 0);
+            assert_eq!(db.list_project_skills("p1").unwrap().len(), 0);
+            assert!(
+                disabled_dir.join("tdd").join("SKILL.md").exists(),
+                "populate must not touch the .disabled/ skill dir"
+            );
+            assert!(
+                !skills_dir.join("tdd").exists(),
+                "populate must never resurrect a skill dir into skills/"
+            );
+
+            std::fs::remove_dir_all(&folder).ok();
+        }
+
+        #[test]
+        fn skill_present_in_both_locations_is_skipped_with_warning() {
+            let folder = scratch_dir("disable-skill-both");
+            let skills_dir = folder.join(".claude/skills");
+            let disabled_dir = folder.join(".claude/skills.disabled");
+            std::fs::create_dir_all(&skills_dir).unwrap();
+            std::fs::create_dir_all(&disabled_dir).unwrap();
+            write_skill_dir(&skills_dir, "tdd", "name: tdd\nmodel: sonnet");
+            write_skill_dir(&disabled_dir, "tdd", "name: tdd\nmodel: sonnet");
+
+            let db = make_db_with_project("p1", "P");
+            let report =
+                populate_project_state_from_filesystem("p1", "P", &folder, &db);
+
+            assert_eq!(report.skills_inserted, 0);
+            assert!(db.list_project_skills("p1").unwrap().is_empty());
+            assert!(skills_dir.join("tdd").join("SKILL.md").exists());
+            assert!(disabled_dir.join("tdd").join("SKILL.md").exists());
+            assert!(
+                report.warnings.iter().any(|w|
+                    w.contains("tdd")
+                        && w.contains("skills.disabled/")
+                ),
+                "expected both-locations warning for skill tdd, got: {:?}",
+                report.warnings
+            );
+
+            std::fs::remove_dir_all(&folder).ok();
+        }
     }
 
     // ─── populate_hooks ─────────────────────────────────────────────
