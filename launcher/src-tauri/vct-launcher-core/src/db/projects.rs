@@ -112,7 +112,7 @@ impl Db {
     // `projects.rl_port` column (migration 014) to the generic
     // `module_ports` table (migration 017). These wrappers preserve the
     // existing public signature so callers from the hub crate
-    // (`module_supervisor::ensure_rl_port_persisted`, `rl_service.rs`
+    // (`module_supervisor::ensure_rl_port_persisted`, `module_service.rs`
     // commands) compile unchanged — they just dispatch into
     // `get_module_port` / `set_module_port` with the canonical RL module
     // id. The `projects.rl_port` column stays in place (migration 017

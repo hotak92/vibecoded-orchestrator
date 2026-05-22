@@ -45,7 +45,7 @@ pub mod modules;
 // in this file; Phase 2 (commit b) relocates the supervisor into
 // `vct-hub::module_supervisor` and converts the Tauri commands into HTTP
 // proxies to the hub's lifecycle endpoints.
-pub mod rl_service;
+pub mod module_service;
 pub mod openai_cmd;
 // Stream 2 follow-up (v0.2.20 / 2026-05-19): Tauri-command backings for
 // the orchestrator-core `gui.config_tab` declared in `vct-module.json`.

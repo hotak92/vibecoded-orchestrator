@@ -695,13 +695,13 @@ pub fn run() {
             // Step 24 Phase 2 (commit b) relocates the resume + poller
             // implementations into `vct-hub::module_supervisor`; the
             // launcher kicks the hub instead of running the supervisor
-            // logic directly. See `commands::rl_service` for the proxy
+            // logic directly. See `commands::module_service` for the proxy
             // shape.
             let rl_resume_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 use tauri::Manager;
                 let db = rl_resume_handle.state::<crate::db::Db>();
-                crate::commands::rl_service::resume_containers_on_startup(&db).await;
+                crate::commands::module_service::resume_containers_on_startup(&db).await;
             });
             // Daily weights-update poll. license_reader closure returns
             // None when the user is free-tier (no key in keychain) —
@@ -710,7 +710,7 @@ pub fn run() {
             // primitives (was `|| None` stub in commit a). The closure
             // is invoked once per daily sweep (24h cadence), so the
             // keychain read + MAC-hash compute is amortised to ~zero.
-            crate::commands::rl_service::spawn_daily_weights_poll(
+            crate::commands::module_service::spawn_daily_weights_poll(
                 app.handle().clone(),
                 || {
                     let key = match crate::secrets::get(
@@ -721,7 +721,7 @@ pub fn run() {
                         Ok(Some(k)) if !k.trim().is_empty() => k,
                         _ => return None,
                     };
-                    let hash = crate::commands::rl_service::machine_id_hash_for_poll();
+                    let hash = crate::commands::module_service::machine_id_hash_for_poll();
                     Some((key, hash))
                 },
             );
@@ -967,11 +967,11 @@ pub fn run() {
             // lifecycle (Phase 1E) + weights-update polling (Phase 3C)
             // + fine-tune-after-download (Phase 4A) + dashboard widget
             // (Phase 4B scaffolding). Wired commands:
-            commands::rl_service::rl_is_container_running,
-            commands::rl_service::restart_rl_container,
-            commands::rl_service::check_for_weights_update_now,
-            commands::rl_service::apply_weights_update,
-            commands::rl_service::get_rl_dashboard_state,
+            commands::module_service::rl_is_container_running,
+            commands::module_service::restart_rl_container,
+            commands::module_service::check_for_weights_update_now,
+            commands::module_service::apply_weights_update,
+            commands::module_service::get_rl_dashboard_state,
             // module_weights_state DB plumbing (migration 016). Read /
             // upsert paths exposed for Stream D's WeightsUpdatePrompt +
             // future dashboard widgets.

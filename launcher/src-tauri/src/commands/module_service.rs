@@ -1,14 +1,14 @@
-//! Phase 1E + Phase 3C + Phase 4A scaffolding: per-project RL container
-//! lifecycle + weights update polling + (fine-tune-after-download flow).
+//! Per-project paid-module container lifecycle + weights-update polling
+//! + (fine-tune-after-download flow). Originally landed as `rl_service.rs`
+//! in v0.2.21 for the Pro-tier `vct-rl-reranker` container; renamed in
+//! v0.2.26 alongside the declarative dispatcher rollout to reflect that
+//! the helpers are written against `ModuleManifest` and apply to any
+//! paid module (`vct-coordination`, `vct-transcrypt`, future) whose
+//! manifest's `runtime` block carries the container-specific fields
+//! added in v0.2.21 (`container_name_template`, `image_ref`, `ports`,
+//! `volumes`, `env_derived`).
 //!
-//! Today this module supports exactly one consumer — the Pro-tier
-//! `vct-rl-reranker` paid module — but the helpers are written against
-//! `ModuleManifest` so future container modules drop in without a code
-//! change as long as their manifest's `runtime` block carries the
-//! container-specific fields added in v0.2.21 (`container_name_template`,
-//! `image_ref`, `ports`, `volumes`, `env_derived`).
-//!
-//! Why "rl_service" rather than "container_service": the launcher already
+//! Why "module_service" rather than "container_service": the launcher already
 //! manages a separate, lower-level container stack via `commands::lifecycle`
 //! (Weaviate / Ollama / code-embed — the shared infrastructure). This
 //! module is the per-PROJECT, per-MODULE container layer that sits on
@@ -470,7 +470,7 @@ pub async fn start_container_for_module(
         let path = PathBuf::from(&host_resolved);
         if let Err(e) = tokio::fs::create_dir_all(&path).await {
             eprintln!(
-                "[rl_service] mkdir -p {} failed (will let podman surface the error): {}",
+                "[module_service] mkdir -p {} failed (will let podman surface the error): {}",
                 path.display(),
                 e
             );
@@ -1075,7 +1075,7 @@ pub async fn apply_weights_update(
             let pid = project_id.clone();
             tauri::async_runtime::spawn(async move {
                 if let Err(e) = run_finetune_then_rotate_async(pid, response, app).await {
-                    eprintln!("[rl_service] background fine-tune failed: {}", e);
+                    eprintln!("[module_service] background fine-tune failed: {}", e);
                 }
             });
             Ok(())
@@ -1231,7 +1231,7 @@ async fn run_finetune_then_rotate_async(
                         break;
                     }
                     Err(e) => {
-                        eprintln!("[rl_service] finetune_status poll error: {}", e);
+                        eprintln!("[module_service] finetune_status poll error: {}", e);
                         // Keep trying — transient.
                     }
                 }
@@ -1422,7 +1422,7 @@ pub async fn resume_containers_on_startup(db: &Db) {
     let containers = match db.list_module_installs_with_containers() {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("[rl_service] resume_containers_on_startup list failed: {}", e);
+            eprintln!("[module_service] resume_containers_on_startup list failed: {}", e);
             return;
         }
     };
@@ -1441,13 +1441,13 @@ pub async fn resume_containers_on_startup(db: &Db) {
             Ok(Some(p)) => p,
             Ok(None) => {
                 eprintln!(
-                    "[rl_service] resume: project {} not found, skipping",
+                    "[module_service] resume: project {} not found, skipping",
                     project_id
                 );
                 continue;
             }
             Err(e) => {
-                eprintln!("[rl_service] resume: get_project({}): {}", project_id, e);
+                eprintln!("[module_service] resume: get_project({}): {}", project_id, e);
                 continue;
             }
         };
@@ -1455,7 +1455,7 @@ pub async fn resume_containers_on_startup(db: &Db) {
             Some(m) => m,
             None => {
                 eprintln!(
-                    "[rl_service] resume: manifest for {} not in catalog",
+                    "[module_service] resume: manifest for {} not in catalog",
                     module_id
                 );
                 continue;
@@ -1464,14 +1464,14 @@ pub async fn resume_containers_on_startup(db: &Db) {
         let rl_port = match ensure_project_rl_port(db, &project) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("[rl_service] resume: ensure_rl_port({}): {}", project_id, e);
+                eprintln!("[module_service] resume: ensure_rl_port({}): {}", project_id, e);
                 continue;
             }
         };
         let ctx = PlaceholderCtx::new(&module_id);
         if let Err(e) = start_container_for_module(&manifest, &ctx, &project, rl_port).await {
             eprintln!(
-                "[rl_service] resume: start_container_for_module({}): {}",
+                "[module_service] resume: start_container_for_module({}): {}",
                 project_id, e
             );
         }
@@ -1523,7 +1523,7 @@ where
     let conn = match rusqlite::Connection::open(crate::db::db_path()) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[rl_service] daily poll: open DB: {}", e);
+            eprintln!("[module_service] daily poll: open DB: {}", e);
             return;
         }
     };
@@ -1532,7 +1532,7 @@ where
     let projects = match db.list_projects() {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("[rl_service] daily poll: list_projects: {}", e);
+            eprintln!("[module_service] daily poll: list_projects: {}", e);
             return;
         }
     };
@@ -1586,7 +1586,7 @@ where
             }
             Err(e) => {
                 eprintln!(
-                    "[rl_service] daily poll: check_weights_update({}): {}",
+                    "[module_service] daily poll: check_weights_update({}): {}",
                     project.id, e
                 );
             }

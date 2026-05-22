@@ -459,7 +459,7 @@ fn find_manifest(db: &Db, module_id: &str) -> Result<(ModuleManifest, PathBuf), 
     Err(format!("module {} not in catalog", module_id))
 }
 
-/// Public manifest-lookup for the rl_service restart path. Same logic as
+/// Public manifest-lookup for the module_service restart path. Same logic as
 /// `find_manifest` (catalog scan + first matching id wins) but discards
 /// the source path since callers only need the parsed manifest.
 pub fn find_manifest_for_resume(db: &Db, module_id: &str) -> Option<ModuleManifest> {
@@ -547,7 +547,7 @@ pub async fn install_module_for_project(
             // Phase 1E: per-project container lifecycle. For
             // container_pull modules we resolve `runtime.container_name_
             // template`, allocate an `rl_port` if not yet set, and
-            // spawn the container via `rl_service`. Soft-fail throughout:
+            // spawn the container via `module_service`. Soft-fail throughout:
             // the install row stays at status=installed even when the
             // container start fails — the user can hit Restart from the
             // dashboard. Surfaces the error via audit + a non-blocking
@@ -557,7 +557,7 @@ pub async fn install_module_for_project(
                 == crate::manifest::InstallMethod::ContainerPull
                 && manifest.runtime.r#type == "container"
             {
-                match crate::commands::rl_service::start_container_after_install(
+                match crate::commands::module_service::start_container_after_install(
                     &manifest,
                     &project,
                     &db,
@@ -567,7 +567,7 @@ pub async fn install_module_for_project(
                     Ok(name) => Some(name),
                     Err(e) => {
                         eprintln!(
-                            "[rl_service] start_container_after_install failed (install row stays installed): {}",
+                            "[module_service] start_container_after_install failed (install row stays installed): {}",
                             e
                         );
                         let _ = app.emit(
@@ -645,7 +645,7 @@ pub async fn uninstall_module_v2(
     // a stuck container shouldn't block the uninstall DB write.
     if let Some(container_name) = row.container_name.as_deref() {
         if !container_name.is_empty() {
-            if let Err(e) = crate::commands::rl_service::stop_container_for_project(
+            if let Err(e) = crate::commands::module_service::stop_container_for_project(
                 container_name,
             )
             .await

@@ -19,7 +19,7 @@
 //! Supervisor logic (services-watcher + module-supervisor) does NOT
 //! land in this crate during Step 4. See plan §"Step 4 replan
 //! (2026-05-20)" — supervisor relocation consolidates into Step 24
-//! (Stream B) where it pairs with the rl_service supervisor that's
+//! (Stream B) where it pairs with the module_service supervisor that's
 //! already heading to `vct-hub/src/module_supervisor.rs`.
 
 pub mod api;

@@ -48,7 +48,7 @@
 //! The route layout intentionally mirrors the Tauri-side surface in
 //! `src/commands/lifecycle.rs` (services_status, services_start_all,
 //! services_stop_all, services_restart_all, service_{start,stop,restart})
-//! and `src/commands/rl_service.rs` (rl_is_container_running, the
+//! and `src/commands/module_service.rs` (rl_is_container_running, the
 //! per-project module surface that Step 24 / Stream B generalises).
 //! Step 24's body-fill will be mechanical — same input args, same
 //! output shapes — because the contracts were designed in lockstep
@@ -90,7 +90,7 @@ pub fn router() -> Router<LauncherDbHandle> {
         .route("/services/{name}/start", post(service_start))
         .route("/services/{name}/stop", post(service_stop))
         .route("/services/{name}/restart", post(service_restart))
-        // Per-project module lifecycle (generalises src/commands/rl_service.rs).
+        // Per-project module lifecycle (generalises src/commands/module_service.rs).
         .route(
             "/projects/{project_id}/modules/{module_id}/status",
             get(module_status),
@@ -335,9 +335,9 @@ async fn service_restart(
 // ─── Module-lifecycle handlers (Step 24 commit b) ─────────────────
 //
 // Filled in by Step 24's Stream B port. The launcher's Tauri-side
-// commands (`commands::rl_service::rl_is_container_running`,
+// commands (`commands::module_service::rl_is_container_running`,
 // `restart_rl_container`) proxy here via the `hub_proxy_module_*` helpers
-// in `launcher/src-tauri/src/commands/rl_service.rs`. The supervisor
+// in `launcher/src-tauri/src/commands/module_service.rs`. The supervisor
 // logic lives in `module_supervisor.rs`.
 
 /// `GET /projects/{project_id}/modules/{module_id}/status` — returns
@@ -450,7 +450,7 @@ async fn module_restart(
         "not_implemented_supervisor_restart",
         "Hub-side restart needs a manifest catalog resolver — landed in a \
          Phase 3+ step. Launcher's restart_rl_container command continues \
-         to call module_supervisor in-process via commands/rl_service.rs.",
+         to call module_supervisor in-process via commands/module_service.rs.",
     )
 }
 

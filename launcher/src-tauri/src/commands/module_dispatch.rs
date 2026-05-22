@@ -90,7 +90,7 @@ impl EventSink for AppHandleSink {
 pub const MAX_CHAIN_STEPS: u32 = 1024;
 
 /// HTTP timeout for both the kick request and each poll tick. Matches
-/// the rl_service.rs convention.
+/// the module_service.rs convention.
 const HTTP_TIMEOUT_SECS: u64 = 30;
 
 // ─── Substitution context ───────────────────────────────────────────────

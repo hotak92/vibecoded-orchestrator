@@ -144,7 +144,7 @@ pub async fn start_hub_server() -> Result<u16, String> {
     // `module_supervisor::start_container_for_module`. Manifest lookup
     // is stubbed (returns None for every id) for this step — the
     // launcher continues to own the resume sweep in parallel via its
-    // own Tauri startup hook in `commands::rl_service::resume_
+    // own Tauri startup hook in `commands::module_service::resume_
     // containers_on_startup`. Phase 3+ wires a hub-side catalog
     // resolver and cuts the launcher hook over to be a no-op.
     let resume_db = match vct_launcher_core::db::Db::open() {

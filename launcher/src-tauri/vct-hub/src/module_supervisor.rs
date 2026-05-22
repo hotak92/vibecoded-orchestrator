@@ -1,7 +1,7 @@
 //! Per-project paid-module container supervisor.
 //!
 //! Phase 1E (Step 24 commit b, 2026-05-20): the supervisor logic that
-//! used to live in `launcher/src-tauri/src/commands/rl_service.rs` has
+//! used to live in `launcher/src-tauri/src/commands/module_service.rs` has
 //! relocated here. The launcher's Tauri commands now proxy to the hub's
 //! `/projects/{project_id}/modules/{module_id}/...` lifecycle endpoints
 //! instead of probing podman/docker directly.
@@ -15,7 +15,7 @@
 //! launcher restart. With supervision in the hub, container lifecycle
 //! decouples from GUI lifecycle.
 //!
-//! What lives here (ported verbatim from rl_service.rs):
+//! What lives here (ported verbatim from module_service.rs):
 //!   * Pure helpers: `resolve_container_name`, `resolve_image_ref`,
 //!     `build_podman_run_args`, `parse_inspect_running_state`,
 //!     `sanitize_path_component`, `container_weights_path`.
@@ -36,7 +36,7 @@
 //! B2 / single-writer principle (v0.2.21 Step 3 decision):
 //! `projects.rl_port` and `module_installs.container_name` are
 //! HUB-WRITABLE / launcher-readable columns. This module is the ONLY
-//! writer of both. The launcher's `commands/rl_service.rs` calls these
+//! writer of both. The launcher's `commands/module_service.rs` calls these
 //! helpers via HTTP proxy (see `lifecycle_api.rs::module_*` handlers).
 
 use std::collections::HashMap;
