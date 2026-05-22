@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.27] — 2026-05-22
+
+Follow-up release the same day as v0.2.26, shipping: (a) two
+post-tag-discovered Windows install-path bugs from v0.2.25/v0.2.26
+(Fabio's BOM fix + Python cp1252 reconfigure), (b) the
+`events_paths_for` template token the RL module's v0.2.1 manifest
+requires, (c) a divergence-modal rewrite that correctly handles
+local-only files + retry state, (d) a KG env-propagation safety net
+in the Weaviate MCP server, (e) Wave 1 of agent/skill UX work
+(FS-disable on toggle + keyword-suggest hook on UserPromptSubmit),
+and (f) docs updates clarifying the canonical per-project env channel.
+
+### Added
+
+- **`feat(launcher-core)` New `runtime.log_path_template` manifest field.** Optional. Single-brace closed-set tokens `{project_slug}` / `{project_id}`. Validated at `ModuleManifest::from_json` time via `validate_log_path_template` (rejects empty, double-brace, unknown placeholders, unclosed braces, no-placeholder templates). Render helper `render_log_path_template` does the per-project substitution. 12 new unit tests.
+
+- **`feat(launcher)` New `{{events_paths_for:<control_id>}}` dispatcher template token.** Whole-string-only (embedded form rejected with a clear "must be the WHOLE string value" error because the resolution returns a JSON array). Resolution pipeline: read referenced control's array of UUIDs → walk each UUID through `db.get_project()` to get the slug → apply the module's `runtime.log_path_template` → return `JsonValue::Array`. 6 new dispatcher tests covering happy path + 5 error cases + nested-object recursion + unknown-token-prefix rejection. Implements the spec the RL chat shared in `rl-events-paths-for-template-spec-2026-05-22.md`; unblocks the 2 stubbed retrain buttons in RL module v0.2.1.
+
+- **`feat(launcher)` WebKit divergence-modal rewrite** (`OrchestratorUpdateDivergenceModal.svelte`, 325 → 788 lines). Sticky footer keeps action buttons visible when file lists expand; retry-aware state machine (after Merge fails once, Rebase becomes the primary suggestion + button labels swap to "Try X again"); separate sections for "Files where both sides have diverging history" vs "Files only on your clone" (the latter is collapsed by default since they can't merge-conflict); git stderr rendered in its own labelled `<details>` block, never concatenated into the file list; new "Open clone folder" link uses `@tauri-apps/plugin-opener::openPath` with clipboard fallback. Resolves 4 a11y warnings (backdrop click/keydown, modal role/aria, focus management). 0 svelte-check errors. (Frontend-specialist Opus agent, 2026-05-22.)
+
+- **`feat(launcher)` Generic per-(project × module) divergence-files split.** The `update_orchestrator` Tauri command's `collect_diverged_files` previously used `git diff HEAD..upstream/branch --name-only`, which lists every file different between the two tips. Forks tracking paths the public repo doesn't (e.g. VCO_dev's `other_projects_knowledge/`) saw all those paths flagged as "diverged" in the modal — confusing because they can't merge-conflict (no upstream version). Rewrite anchors on the merge-base: returns `(upstream_changed, local_only)` tuple where `upstream_changed` = files upstream touched since fork (real merge candidates) and `local_only` = files locally touched that upstream never had (pure-local content). New `local_only_files` JSON field on the `orchestrator_update_non_ff` payload; the rewritten modal renders the two categories as distinct collapsible sections.
+
+- **`feat(hooks)` Wave 1 agent/skill keyword-suggest hook** on `UserPromptSubmit`. Paired cross-OS scripts `templates/hooks/agent-skill-keyword-suggest.{sh,ps1}` shell out to `templates/scripts/agent-skill-keyword-match.py`, which scans every agent/skill's frontmatter `keywords:` list against the user's prompt (regex word-boundary, case-sensitive). When matches are found, the hook injects a one-line suggestion ("consider `@agent-foo` or `/skill-bar`") into the chat. Seeded discriminative keyword lists on 10 representative agents (brand-identity-architect, kg-navigator, landing-page-critic, etc.) and 10 representative skills (accessibility-checker, hpc-submit, k8s-manifest-reviewer, etc.) — Wave 1 C. 46 new tests (Python matcher + hook output shape + edge cases).
+
+- **`feat(launcher)` Agent/skill FS-disable migration.** When the user toggles an agent or skill OFF in the per-project panel, the underlying `.md` file moves to a sibling `.disabled/` directory (instead of just flipping a DB enabled bit). Cross-cut with Claude Code's own filesystem scan (which honours `.disabled/` as a hide convention), this gives a single source of truth for "enabled" state visible to both launcher GUI + Claude Code sessions. New migration + ~1k LOC changes in `db/project_state.rs`.
+
+### Fixed
+
+- **`fix(launcher)` Windows install.py crash at step `[5b/10]` after BOM fix** (commit `a5b2971`). `install.py` contained ~660 non-ASCII characters (arrows, em-dashes, check marks) in user-facing prints. Python on Windows defaults stdout to the locale's legacy ANSI code page (cp1252 on Western locales); printing `→` (U+2192) crashed the codec with `UnicodeEncodeError`. Reconfigures `sys.stdout` + `sys.stderr` to UTF-8 with `errors="replace"` immediately after the Python version sentinel, before any other import or print. POSIX no-op. (Originally Fabio's commit `12dd3e3`; cherry-picked as `a5b2971` with author preserved.)
+
+- **`fix(launcher)` Launcher belt-and-braces for the Windows install.py crash.** The launcher's `update_orchestrator` flow spawns Python via `tokio::process::Command`. To protect upgrades from v0.2.25 / v0.2.26 where the on-disk `install.py` pre-dates the in-Python UTF-8 reconfigure block, sets the Python I/O encoding env vars on the child env at all 6 Python spawn sites (`update_at`, `run_install_orchestrator_lightweight`, `run_hardware_reconfig`, `update_orchestrator`, both fallback re-spawns). POSIX no-op.
+
+- **`fix(weaviate-mcp)` Empty-env safety + resolution-source tracking for `KG_COLLECTION`.** When the user's workspace declared `KG_COLLECTION=""` (or whitespace-only), the MCP server's `os.getenv("KG_COLLECTION", default)` returned the literal empty string — NOT the default — and the empty class name propagated into Weaviate, causing schema-fail. `_config_field(empty_means_unset=True)` now coerces empty/whitespace values to the documented default for keys where empty doesn't have semantic meaning (`KG_COLLECTION`, `DEVELOPMENT_COLLECTION`); keeps `SHARED_KG_COLLECTION=""` semantically (means "shared search disabled"). New resolution-source tracking: every collection name now carries an annotation (`src=env` / `src=hub` / `src=default`) that surfaces in (a) a startup log line `weaviate-kg: resolved collections (kg='...' src=..., ...)` so operators know what the subprocess actually picked up, and (b) annotated error messages on schema-fail (`Tried 2 collections: 'X' [self/KG_COLLECTION src=hub], 'Y' [peer/VCT_KG_ACCESS_LIST] — ...`) so the failure points at the right config layer. 13 new unit tests.
+
+### Changed
+
+- **`docs(claude-md)` Clarified canonical per-project env channel.** Made it explicit that `.claude/settings.json env` is the canonical channel and that `.vscode/settings.json claude-code.env` does NOT propagate to MCP subprocesses on Linux (sentinel testing 2026-05-16 against Claude Code 2.1.143; pre-existing limitation, now surfaced in CLAUDE.md rather than only in PR-27's commit message). New precedence-order list (5 layers, highest-to-lowest) covering vct-hub → `.claude/settings.json env` → `.claude/env` → `~/.claude.json mcpServers.weaviate-kg.env` → bundled defaults. Also fixed 3 instances of `Vibecoded` → `VibeCoded` typo (drifted since v0.2.23).
+
+- **`docs(troubleshooting)` New Windows recovery section** for v0.2.25 / v0.2.26 users hit by the BOM / cp1252 install crash. Three recovery options: (1) `git pull origin main` + re-run `first-install.bat`; (2) manual env-var bootstrap before `python install.py --update`; (3) download the v0.2.27+ release zip directly. Cross-references the in-launcher belt-and-braces protection added this release.
+
+- **`docs(kg)` `module-contributed-gui-tabs.md` extended** with a v0.2.27 evolution subsection: `log_path_template` field + `events_paths_for` token semantics + closed-set token table (now 5 supported tokens) + RL manifest example showing how `control:src_projects` (raw UUID array) and `events_paths_for:src_projects` (per-project log-path array) compose cleanly + enumeration of the 5 dispatcher error cases.
+
+### Migration notes
+
+- **End users on Windows v0.2.25 / v0.2.26 stuck on `first-install.bat`**: see `docs/TROUBLESHOOTING.md` § "Windows: `first-install.bat` crashes with `UnicodeEncodeError`". Three recovery paths documented; recommended is `git pull origin main` + re-run.
+
+- **RL module authors**: `runtime.log_path_template` is the new place to declare your per-project log-path convention. Closed-set tokens `{project_slug}` / `{project_id}` only. Use `{{events_paths_for:<control_id>}}` (whole-string only) in any descriptor `body` field to inject the resolved array. See `module-contributed-gui-tabs.md` § "v0.2.27 evolution" + the RL spec in VCO_dev's `.claude/context/plans/`.
+
+- **Operators hitting "every configured collection schema-failed" on `hybrid_search`**: the MCP error message now points at the resolution-source for each tried collection. Look for the `weaviate-kg: resolved collections` log line at MCP startup (Claude Code's MCP log panel, or `~/.claude/logs/`) to see what the subprocess actually picked up + the source layer. Common cause: workspace env is in `.vscode/settings.json claude-code.env` (does not propagate); move to `.claude/settings.json env` via the launcher's Identity tab.
+
+- **No DB schema breakage**. The FS-disable migration is additive: existing toggled-off agents/skills with `enabled=0` are migrated to the `.disabled/` directory at first launch post-update; the DB column stays for back-compat with older launcher binaries.
+
 ## [0.2.26] — 2026-05-22
 
 Headline release: a **generic declarative HTTP-action dispatcher** that
