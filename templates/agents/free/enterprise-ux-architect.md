@@ -1,6 +1,7 @@
 ---
 name: enterprise-ux-architect
 description: Designs information architecture and interaction patterns for genuinely complex enterprise tools — dense dashboards (50+ metrics), multi-step compliance workflows, scientific instrument control panels, B2B admin consoles. Use when the brief is "this can't be dumbed down, but it has to be comprehensible."
+keywords: [enterprise UX, dense dashboard, information density, admin console, power user, B2B admin]
 tools: Read, Write, Edit, Glob, Grep, WebFetch
 model: opus
 effort: high

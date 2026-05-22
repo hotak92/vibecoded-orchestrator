@@ -1,6 +1,7 @@
 ---
 name: repro-audit
 description: Audits a scientific project for reproducibility — environment pinning, seed setting, data hashing, notebook discipline, workflow orchestration, and provenance capture. Use when the user asks "is this project reproducible", "what's missing for a reviewer to rerun this", "audit my repo before submission", "why do I get different results each run", or before submitting code with a manuscript.
+keywords: [reproducibility, reproducible, seed setting, environment pinning, manuscript submission, provenance capture]
 model: opus
 effort: high
 allowed-tools: Read, Write, Bash, Glob, Grep
