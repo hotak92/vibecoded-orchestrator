@@ -32,6 +32,14 @@ export type UpdateKind = 'binary_stale' | 'install_stale' | 'remote_ahead' | nul
  *
  * When set, `UpdateBadge.svelte` renders `OrchestratorUpdateDivergenceModal`
  * instead of a raw error toast — the user picks Merge / Rebase / Cancel.
+ *
+ * v0.2.27: the Rust side splits the file list into two categories so the
+ * UI can render them as separate sections. `local_only_files` are paths
+ * that exist on the local clone but NOT on upstream (e.g. user-added
+ * `other_projects_knowledge/*` — these are not merge blockers). The
+ * `diverged_files` list is reserved for paths where BOTH sides have
+ * changes that need to be reconciled. The Rust split lands in a separate
+ * commit; the modal degrades gracefully if `local_only_files` is absent.
  */
 export type OrchestratorNonFfPayload = {
   event: 'orchestrator_update_non_ff';
@@ -40,6 +48,10 @@ export type OrchestratorNonFfPayload = {
   remote_sha: string | null;
   diverged_files: string[];
   git_stderr: string;
+  /** v0.2.27: paths only present on the local clone (additive, no merge
+   *  required). Optional — pre-v0.2.27 Rust returns undefined; the modal
+   *  treats the whole `diverged_files` list as diverging in that case. */
+  local_only_files?: string[];
 };
 
 interface UpdaterState {
