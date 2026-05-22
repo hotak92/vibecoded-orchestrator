@@ -1,4 +1,4 @@
-# migrate-development-temporal-props.ps1
+﻿# migrate-development-temporal-props.ps1
 #
 # Windows equivalent of migrate-development-temporal-props.sh. Adds the
 # four canonical temporal properties (created, updated, valid_from,

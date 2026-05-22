@@ -1,4 +1,4 @@
-# vct_secrets_resolve.ps1 — bridge between bundled wrappers/hooks and the
+﻿# vct_secrets_resolve.ps1 — bridge between bundled wrappers/hooks and the
 # launcher's hub HTTP API. PowerShell counterpart of
 # `vct_secrets_resolve.sh`. See the .sh header for the architectural
 # context (post-Fix-#3 cleanup, hub is the source-of-truth, no file-side

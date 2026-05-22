@@ -1,4 +1,4 @@
-# OS-EXEMPT-PARITY: .sh sibling uses the hub resolver
+﻿# OS-EXEMPT-PARITY: .sh sibling uses the hub resolver
 #   (vct_project_config.sh --field code_graph_collection_prefix); this
 #   .ps1 uses a different design path (`detect-project.ps1` helper +
 #   `Split-Path -Leaf` fallback), so the v0.2.23 W1 slug-vs-prefix

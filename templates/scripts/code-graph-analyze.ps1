@@ -1,4 +1,4 @@
-# PowerShell wrapper for analyze_code_graph.py (Windows equivalent of code-graph-analyze)
+﻿# PowerShell wrapper for analyze_code_graph.py (Windows equivalent of code-graph-analyze)
 # Usage: .\code-graph-analyze.ps1 C:\path\to\repo [--project NAME] [--incremental]
 #
 # Probe candidate venvs in canonical-first order. install_root\.venv is

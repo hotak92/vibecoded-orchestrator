@@ -1,4 +1,4 @@
-#!/usr/bin/env pwsh
+﻿#!/usr/bin/env pwsh
 # launch-claude-mcp-stack.ps1 — boot-safe compose-up for the Claude MCP stack.
 #
 # Windows sibling of scripts/launch-claude-mcp-stack.sh (v0.2.9 Bug J +

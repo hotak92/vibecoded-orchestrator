@@ -1,4 +1,4 @@
-# PowerShell wrapper for get_node_info.py (Windows equivalent of kg-info)
+﻿# PowerShell wrapper for get_node_info.py (Windows equivalent of kg-info)
 # Usage: .\kg-info.ps1 info "Node Title"
 #        .\kg-info.ps1 connections "Node Title"
 

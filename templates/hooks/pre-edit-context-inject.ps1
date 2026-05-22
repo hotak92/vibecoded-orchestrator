@@ -1,4 +1,4 @@
-# OS-EXEMPT-PARITY: Windows-only fix 2026-05-08 — added hookSpecificOutput/additionalContext JSON envelope. The .sh sibling already emitted that envelope from earlier work; no .sh change needed in this commit.
+﻿# OS-EXEMPT-PARITY: Windows-only fix 2026-05-08 — added hookSpecificOutput/additionalContext JSON envelope. The .sh sibling already emitted that envelope from earlier work; no .sh change needed in this commit.
 # parity-confirmation 2026-05-16 (PR-32, Group K Phase B): full body parity
 # audit confirmed — every .sh-side dedup-correctness fix from PR #186 is
 # present in this .ps1 sibling:

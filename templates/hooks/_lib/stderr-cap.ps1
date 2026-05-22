@@ -1,4 +1,4 @@
-# stderr-cap.ps1 — structural defense against runaway hook stderr.
+﻿# stderr-cap.ps1 — structural defense against runaway hook stderr.
 #
 # Sibling to _lib/stderr-cap.sh. Same purpose: cap any single hook's
 # stderr at 1 MB so a buggy loop can never reproduce the 2026-05-07

@@ -1,4 +1,4 @@
-# _lib/find-python.ps1
+﻿# _lib/find-python.ps1
 # Shared helper dot-sourced by .ps1 hooks that need to invoke a Python interpreter.
 #
 # Sets $script:PY (and the parent scope's $PY when dot-sourced) to the first

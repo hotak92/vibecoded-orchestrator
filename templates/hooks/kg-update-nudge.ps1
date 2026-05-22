@@ -1,4 +1,4 @@
-# OS-EXEMPT-PARITY: PR-32 body-parity audit + parity-confirmation comments only — no .sh change required (every .sh-side incident fix is already present in this .ps1 sibling; see audit notes below).
+﻿# OS-EXEMPT-PARITY: PR-32 body-parity audit + parity-confirmation comments only — no .sh change required (every .sh-side incident fix is already present in this .ps1 sibling; see audit notes below).
 # parity-confirmation 2026-05-16 (PR-32, Group K Phase B): full v10.1 body parity
 # audit confirmed — every .sh-side incident fix is present in this .ps1 sibling:
 #   - stdout-vs-stderr fix (commit f4ebe3e2): nudge text is printed via `print()`

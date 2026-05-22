@@ -1,4 +1,4 @@
-# emit-context.ps1 — shared helper for hooks that inject LLM-visible context.
+﻿# emit-context.ps1 — shared helper for hooks that inject LLM-visible context.
 #
 # Plain stdout from PreToolUse hooks is silently discarded by Claude Code's
 # hook runner — only `hookSpecificOutput.additionalContext` reaches the LLM

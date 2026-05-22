@@ -1,4 +1,4 @@
-# migrate-shared-kg-schema.ps1
+﻿# migrate-shared-kg-schema.ps1
 #
 # Windows equivalent of migrate-shared-kg-schema.sh. Drops + recreates
 # the shared KG collection when its schema lacks

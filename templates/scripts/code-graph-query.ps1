@@ -1,4 +1,4 @@
-# PowerShell wrapper for query_code_graph.py (Windows equivalent of code-graph-query)
+﻿# PowerShell wrapper for query_code_graph.py (Windows equivalent of code-graph-query)
 # Usage: .\code-graph-query.ps1 search "query"
 #        .\code-graph-query.ps1 similar "module.function"
 #        .\code-graph-query.ps1 structure dependencies "target"

@@ -1,4 +1,4 @@
-# Per-project lean-ctx PreToolUse hook for Bash tool calls (Windows).
+﻿# Per-project lean-ctx PreToolUse hook for Bash tool calls (Windows).
 # Windows sibling of templates/hooks/lean-ctx-rewrite.sh — see that file for
 # the full rationale (fork-bomb avoidance, 0.2.11 redesign, three-tier
 # bypass hierarchy).

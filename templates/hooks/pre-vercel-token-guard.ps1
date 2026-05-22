@@ -1,4 +1,4 @@
-# parity-confirmation 2026-05-16 (PR-32, Group K Phase B): full body parity
+﻿# parity-confirmation 2026-05-16 (PR-32, Group K Phase B): full body parity
 # audit confirmed — every .sh-side guard check is present in this .ps1 sibling:
 #   - Sensitive env-var scrub (foreach loop below, lines 3-5) mirrors .sh
 #     `unset SUPABASE_KEY ...` (line 4 of sibling).

@@ -1,4 +1,4 @@
-# OS-EXEMPT-PARITY: PR-32 ports the .sh-side env-scrub (already present in .sh, missing here) — Windows-only fix to add defence-in-depth secret scrub before subprocess spawning; no .sh change required.
+﻿# OS-EXEMPT-PARITY: PR-32 ports the .sh-side env-scrub (already present in .sh, missing here) — Windows-only fix to add defence-in-depth secret scrub before subprocess spawning; no .sh change required.
 # check-no-fork-bomb.ps1 — Windows sibling of check-no-fork-bomb.sh.
 #
 # See check-no-fork-bomb.sh for the full incident background and
