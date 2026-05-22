@@ -3382,13 +3382,42 @@ pub async fn update_orchestrator<R: Runtime>(
     // deferral-write failure must NOT block the update flow.
     maybe_emit_pre_merge_deferrals(&install_path, &pre_merge_outcomes, &pull_branch);
 
-    let pull = tokio::process::Command::new("git")
-        .args([
+    // v0.2.24 §A0 (peer-review follow-up): when pre-merge produced a
+    // synthetic commit (Merged outcome), local HEAD now strictly
+    // advances upstream tip. A bare `git pull --ff-only` would fail
+    // with non-FF for the COMMON case of a user-editable diff,
+    // surfacing the B4 modal for what should be a seamless update.
+    // Route through `git pull --rebase` instead: this replays the
+    // synthetic pre-merge commit onto upstream tip, giving a clean
+    // linear history. If the rebase has conflicts (genuine user
+    // divergence beyond the allowlisted files), git falls back to
+    // the existing conflict-handling path.
+    //
+    // When pre-merge produced no synthetic commit (all outcomes were
+    // NoChange or PreservedWithUpstreamSidecar), keep the original
+    // --ff-only behaviour: any non-FF in that case IS a genuine
+    // divergence the user needs to confirm via the B4 modal.
+    let pre_merge_committed = crate::commands::git_user_editable_merge::any_outcome_produced_synthetic_commit(
+        &pre_merge_outcomes,
+    );
+    let pull_args: &[&str] = if pre_merge_committed {
+        &[
+            "pull",
+            "--rebase",
+            "--no-edit",
+            crate::commands::self_update::VCO_UPSTREAM_REMOTE,
+            &pull_branch,
+        ]
+    } else {
+        &[
             "pull",
             "--ff-only",
             crate::commands::self_update::VCO_UPSTREAM_REMOTE,
             &pull_branch,
-        ])
+        ]
+    };
+    let pull = tokio::process::Command::new("git")
+        .args(pull_args)
         .current_dir(&install_path)
         .output()
         .await

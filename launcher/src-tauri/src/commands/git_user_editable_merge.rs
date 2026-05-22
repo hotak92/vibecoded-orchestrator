@@ -147,6 +147,17 @@ impl MergeOutcome {
     }
 }
 
+/// True when any outcome in the list produced a synthetic pre-merge
+/// commit (i.e., at least one `Merged` variant). The caller of
+/// `run_pre_merge_user_editable` uses this to decide whether the
+/// follow-up `git pull --ff-only` will inevitably fail with non-FF
+/// (because the synthetic commit advances local HEAD past upstream)
+/// and should pre-emptively route to the rebase path instead of
+/// surfacing the B4 modal for the common user-editable-edit case.
+pub(crate) fn any_outcome_produced_synthetic_commit(outcomes: &[MergeOutcome]) -> bool {
+    outcomes.iter().any(|o| matches!(o.kind, MergeOutcomeKind::Merged { .. }))
+}
+
 /// Best-effort: compute the merge base (common ancestor SHA) between
 /// HEAD and `vco_upstream/<branch>`. Returns `Ok(None)` when the
 /// upstream ref isn't fetched yet (caller should treat as "nothing to
