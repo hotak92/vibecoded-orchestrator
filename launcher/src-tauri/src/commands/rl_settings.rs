@@ -1,13 +1,12 @@
-//! Stream 2 (2026-05-19): per-project RL Reranker settings + global
-//! retraining commands.
+//! Per-project RL Reranker settings — the small remaining surface of
+//! genuinely RL-specific Tauri commands that haven't (yet) been
+//! converted to declarative-action manifest entries.
 //!
-//! These commands back the controls declared in
-//! `paid-modules/vct-rl-reranker/vct-module.json`'s `gui.config_tab`
-//! block. Settings are stored in `module_settings` (the existing
-//! per-project, per-module KV blob table) under `module_id =
-//! "vct-rl-reranker"` so the same persistence path that backs ANY
-//! schema-rendered tab's generic state also drives the RL-specific
-//! flags.
+//! These commands back the boolean toggles + the global-training-source
+//! enumeration declared in `paid-modules/vct-rl-reranker/vct-module.json`'s
+//! `gui.config_tab` block (via `ActionRef::Legacy("set_rl_use_global")`
+//! etc.). Settings are stored in `module_settings` (the generic per-
+//! project, per-module KV blob table) under `module_id = "vct-rl-reranker"`.
 //!
 //! Three flags are persisted per-project (boolean, default false):
 //!
@@ -16,21 +15,23 @@
 //!   * `rl_online_training_disabled` — freezes the local model AND
 //!     marks new events as log-only. Independent of `rl_use_global`.
 //!   * `rl_global_training_source_flag` — opts this project's data
-//!     INTO the global model's retraining corpus. Independent of the
-//!     two flags above.
+//!     INTO the global model's retraining corpus.
 //!
-//! Reset / retrain commands STUB for Stream 2: the RL container isn't
-//! built yet (Stream 3). They record the intent in `module_settings`
-//! (so the GUI can show "last reset: 2026-05-19" after Stream 3 wires
-//! the real call) and return a `RetrainResult { ok: true, message:
-//! "stubbed" }`. Each stub carries a `// TODO(Stream 3)` marker.
+//! v0.2.26 (2026-05-22): the four reset/retrain stub commands that
+//! previously lived here (`rl_reset_to_global`, `rl_reset_and_specialize`,
+//! `retrain_global_online`, `retrain_global_offline`) were removed
+//! once the generic declarative dispatcher (`module_dispatch_action`)
+//! landed. Those operations are now expressed as `ActionDescriptor::Http`
+//! entries in the RL manifest — the launcher executes them generically
+//! without per-module Rust code. The remaining commands stay legacy-
+//! routed for now because they read/aggregate per-project DB state
+//! (the dispatcher's HTTP-only descriptor doesn't speak SQL); a future
+//! release MAY introduce a `ActionDescriptor::Db` variant or migrate
+//! them through an RL-side endpoint. No urgency.
 //!
 //! Side-effect contract: the `on_change` Tauri commands declared in
-//! the manifest must accept the standard `{ moduleId, value, projectId
-//! }` envelope the schema renderer sends. We add a `project_id` arg to
-//! every command because per-project flags are inherently per-project;
-//! the schema renderer will be extended (Part C) to forward the active
-//! project id from the Sidebar's selected-project store.
+//! the manifest accept the standard `{ moduleId, value, projectId }`
+//! envelope the schema renderer sends.
 
 use serde::Serialize;
 use tauri::{command, State};
@@ -59,14 +60,10 @@ impl From<ProjectOption> for SelectOption {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct RetrainResult {
-    pub ok: bool,
-    pub message: String,
-    /// Echo of the project ids that would be used as training source.
-    /// Useful for the toast confirmation message in the GUI.
-    pub project_ids: Vec<String>,
-}
+// (`RetrainResult` struct, previously the return type of the four
+// retrain/reset stubs, was removed alongside them in v0.2.26.
+// Descriptor-driven actions return raw JSON `serde_json::Value` from
+// the dispatcher.)
 
 // ─── Per-project flag setters ────────────────────────────────────────────
 //
@@ -152,65 +149,16 @@ pub async fn set_rl_global_training_source_flag(
 /// the current global checkpoint. STUB for Stream 2: returns ok with a
 /// note. Stream 3 wires this to the RL container's `/reset` endpoint.
 ///
-/// TODO(Stream 3): POST to `rl_server` container at
-/// `/projects/<project_id>/reset?strategy=fork`. Confirm container
-/// reachable; reflect failure in the toast.
-#[command]
-pub async fn rl_reset_to_global(
-    project_id: String,
-    db: State<'_, Db>,
-) -> Result<RetrainResult, String> {
-    if project_id.is_empty() {
-        return Err("rl_reset_to_global: project_id required".into());
-    }
-    // Persist an audit trail so the GUI can show "last reset: ..."
-    // after Stream 3 lands. Soft-fail: write failure doesn't break
-    // the command since the real reset hasn't happened yet anyway.
-    let _ = db.set_setting(
-        &project_id,
-        MODULE_ID,
-        "rl_last_reset_intent",
-        &serde_json::json!({
-            "kind": "reset_to_global",
-            "at": chrono::Utc::now().timestamp_millis(),
-        }),
-    );
-    Ok(RetrainResult {
-        ok: true,
-        message: "not yet wired to container (Stream 3 will connect to rl_server /reset)".into(),
-        project_ids: vec![project_id],
-    })
-}
-
-/// "Reset + offline-specialize" — reset to global, then run an offline
-/// training pass on this project's recent events. STUB for Stream 2.
-///
-/// TODO(Stream 3): orchestrate two-stage call to the RL container —
-/// `/projects/<id>/reset?strategy=fork` followed by
-/// `/projects/<id>/specialize?days=30`.
-#[command]
-pub async fn rl_reset_and_specialize(
-    project_id: String,
-    db: State<'_, Db>,
-) -> Result<RetrainResult, String> {
-    if project_id.is_empty() {
-        return Err("rl_reset_and_specialize: project_id required".into());
-    }
-    let _ = db.set_setting(
-        &project_id,
-        MODULE_ID,
-        "rl_last_reset_intent",
-        &serde_json::json!({
-            "kind": "reset_and_specialize",
-            "at": chrono::Utc::now().timestamp_millis(),
-        }),
-    );
-    Ok(RetrainResult {
-        ok: true,
-        message: "not yet wired to container (Stream 3 will run reset + offline specialize)".into(),
-        project_ids: vec![project_id],
-    })
-}
+// ─── Removed in v0.2.26 (2026-05-22): four stub Tauri commands ──────────
+//
+// `rl_reset_to_global`, `rl_reset_and_specialize`, `retrain_global_online`,
+// `retrain_global_offline` were stub bodies waiting for the now-shipped
+// generic declarative dispatcher (`module_dispatch_action`). The RL
+// module's `vct-module.json` migrates to ActionDescriptor::Http entries
+// that hit the RL container directly — no per-module Tauri commands
+// needed. See `knowledge/concepts/module-contributed-gui-tabs.md` for
+// the wire shape + `knowledge/concepts/generic-per-module-db-architecture.md`
+// for the port-resolution backstop the dispatcher uses.
 
 // ─── Global training source enumeration ─────────────────────────────────
 
@@ -238,56 +186,9 @@ pub async fn list_rl_global_training_source_projects(
     Ok(out)
 }
 
-// ─── Global retrain (STUBS for Stream 2) ────────────────────────────────
-
-/// "Retrain global (online, from current state)" — replays recent
-/// events from selected projects through the existing global model.
-/// STUB for Stream 2.
-///
-/// TODO(Stream 3): POST to the container's `/global/retrain?mode=online`
-/// with the selected project ids. Stream progress events back over a
-/// Tauri channel.
-#[command]
-pub async fn retrain_global_online(
-    project_ids: Vec<String>,
-    _db: State<'_, Db>,
-) -> Result<RetrainResult, String> {
-    if project_ids.is_empty() {
-        return Err("retrain_global_online: select at least one source project".into());
-    }
-    Ok(RetrainResult {
-        ok: true,
-        message: format!(
-            "not yet wired to container (Stream 3 will replay events from {} project(s) through the live global model)",
-            project_ids.len()
-        ),
-        project_ids,
-    })
-}
-
-/// "Retrain global (offline pass, from scratch)" — rebuilds the global
-/// model from all selected projects' historical events. STUB for
-/// Stream 2.
-///
-/// TODO(Stream 3): POST to `/global/retrain?mode=offline`. Streams
-/// progress; final result lands in the container's weights volume.
-#[command]
-pub async fn retrain_global_offline(
-    project_ids: Vec<String>,
-    _db: State<'_, Db>,
-) -> Result<RetrainResult, String> {
-    if project_ids.is_empty() {
-        return Err("retrain_global_offline: select at least one source project".into());
-    }
-    Ok(RetrainResult {
-        ok: true,
-        message: format!(
-            "not yet wired to container (Stream 3 will rebuild the global model offline from {} project(s)' full history)",
-            project_ids.len()
-        ),
-        project_ids,
-    })
-}
+// (The two `retrain_global_{online,offline}` stubs that previously
+// lived here were removed in v0.2.26 alongside the per-project reset
+// stubs above. See the deprecation note higher in this file.)
 
 // ─── Tests ──────────────────────────────────────────────────────────────
 

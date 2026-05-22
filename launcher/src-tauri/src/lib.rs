@@ -1006,16 +1006,16 @@ pub fn run() {
             // RL Reranker per-project settings (Stream 2 / 2026-05-19).
             // Backs the schema-rendered controls declared in
             // paid-modules/vct-rl-reranker/vct-module.json's
-            // gui.config_tab. Reset / retrain commands stub for now;
-            // Stream 3 will wire them to the rl_server container.
+            // gui.config_tab. The four reset/retrain stubs that
+            // previously lived here (rl_reset_to_global,
+            // rl_reset_and_specialize, retrain_global_online,
+            // retrain_global_offline) were removed in v0.2.26 —
+            // the RL manifest migrates to ActionDescriptor::Http
+            // entries dispatched via module_dispatch_action below.
             commands::rl_settings::set_rl_use_global,
             commands::rl_settings::set_rl_online_training_disabled,
             commands::rl_settings::set_rl_global_training_source_flag,
-            commands::rl_settings::rl_reset_to_global,
-            commands::rl_settings::rl_reset_and_specialize,
             commands::rl_settings::list_rl_global_training_source_projects,
-            commands::rl_settings::retrain_global_online,
-            commands::rl_settings::retrain_global_offline,
             // v0.2.26 (2026-05-22): generic declarative HTTP-action
             // dispatcher. Single Tauri command that executes any
             // `ActionDescriptor::Http` descriptor declared in a
