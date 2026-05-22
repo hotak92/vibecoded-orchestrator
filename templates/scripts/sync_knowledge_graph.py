@@ -1456,7 +1456,16 @@ def _is_archived_node(file_path: Path, frontmatter: dict | None = None) -> tuple
     Returns (is_archived, reason). A node is archived if either:
       - its filesystem path contains an `archive/` segment (knowledge/archive/...
         or any docs subtree), OR
-      - its frontmatter `status` is `"archived"` or `"deprecated"`.
+      - its frontmatter `status` is `"archived"`, `"deprecated"`, or
+        `"superseded"`.
+
+    `superseded` was added 2026-05-22: nodes marked `status: superseded` (in
+    favour of a canonical replacement) were silently still being synced to
+    Weaviate because this check only recognised `archived|deprecated`. The
+    cleanup pass that day discovered three such nodes still appearing in MCP
+    results: `weaviate-usage-patterns`, `VLM_Prompt_Engineering_Best_Practices_2026`,
+    `WD14_Tag_Rotation_Strategy`. Authors who write `status: superseded` mean
+    "should disappear from KG queries"; honour that.
 
     Archived nodes are kept on disk (so future-anyone can grep / read history)
     but skipped on Weaviate sync — they shouldn't return from KG queries.
@@ -1470,7 +1479,7 @@ def _is_archived_node(file_path: Path, frontmatter: dict | None = None) -> tuple
         return True, f"path contains 'archive/' segment ({file_path})"
     if frontmatter is not None:
         status = (frontmatter.get("status") or "").strip().lower()
-        if status in ("archived", "deprecated"):
+        if status in ("archived", "deprecated", "superseded"):
             return True, f"frontmatter status={status!r}"
     return False, ""
 
