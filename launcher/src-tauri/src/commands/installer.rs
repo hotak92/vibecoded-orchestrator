@@ -1477,6 +1477,23 @@ pub async fn apply_hardware_reconfig(
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
 
+    // v0.2.27: force Python to use UTF-8 for stdout/stderr. Without
+    // this, Python on Windows defaults stdout to the locale's legacy
+    // ANSI code page (cp1252 on Western European installs). install.py
+    // contains ~660 non-ASCII characters (arrows, em-dashes, check
+    // marks) in user-facing print() lines and crashes with
+    // `UnicodeEncodeError: 'charmap' codec can't encode character`
+    // mid-update. install.py's own `_sys.stdout.reconfigure(...)` block
+    // (commit a5b2971, v0.2.27) is the in-Python fix; this env-var
+    // belt-and-braces protects upgrades from v0.2.25 / v0.2.26 where
+    // that block isn't present in the installed install.py on disk.
+    // `PYTHONIOENCODING` is honored by Python 3.4+ on every platform;
+    // `PYTHONUTF8` (the UTF-8 Mode) is Python 3.7+ and switches more
+    // of stdlib's filesystem-encoding default to UTF-8 too. POSIX
+    // no-op (stdout was already UTF-8). Set on the child only.
+    cmd.env("PYTHONIOENCODING", "utf-8");
+    cmd.env("PYTHONUTF8", "1");
+
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -2190,6 +2207,12 @@ pub async fn install_orchestrator(
         .stdin(std::process::Stdio::null())
         .current_dir(&install_path);
 
+    // v0.2.27: force UTF-8 stdout/stderr for the Python child. See the
+    // identical block on the `update_at` spawn site for the full
+    // rationale (Windows cp1252 / `→` U+2192 / install.py crash).
+    cmd.env("PYTHONIOENCODING", "utf-8");
+    cmd.env("PYTHONUTF8", "1");
+
     // PR-3 (2026-05-06): forward the launcher's adopted service ports to
     // install.py. Pre-PR-3, install.py read `WEAVIATE_PORT` / `OLLAMA_PORT`
     // from `os.environ` (install.py:4243-4244) but the launcher never set
@@ -2453,6 +2476,12 @@ async fn run_install_orchestrator_lightweight(
     cmd.args(&argv)
         .stdin(std::process::Stdio::null())
         .current_dir(&install_path);
+
+    // v0.2.27: force UTF-8 stdout/stderr for the Python child. See the
+    // identical block on the `update_at` spawn site for the full
+    // rationale (Windows cp1252 / `→` U+2192 / install.py crash).
+    cmd.env("PYTHONIOENCODING", "utf-8");
+    cmd.env("PYTHONUTF8", "1");
 
     // Forward the same launcher-resolved service ports the full path
     // does. install.py's lightweight branch reads these so a port
@@ -3452,13 +3481,14 @@ pub async fn update_orchestrator<R: Runtime>(
         if crate::commands::self_update::is_non_fast_forward(&stderr) {
             let local_sha = read_head_sha(&install_path).await;
             let remote_sha = read_remote_sha(&install_path, &pull_branch).await;
-            let diverged_files =
+            let (upstream_changed, local_only) =
                 collect_diverged_files(&install_path, &pull_branch).await;
             return Err(serialize_orchestrator_non_ff_error(
                 &pull_branch,
                 local_sha.as_deref(),
                 remote_sha.as_deref(),
-                &diverged_files,
+                &upstream_changed,
+                &local_only,
                 stderr.trim(),
             ));
         }
@@ -3502,6 +3532,11 @@ pub async fn update_orchestrator<R: Runtime>(
     cmd.args(["install.py", "--update"])
         .stdin(std::process::Stdio::null())
         .current_dir(&install_path);
+    // v0.2.27: force UTF-8 stdout/stderr for the Python child. See the
+    // identical block on the `update_at` spawn site for the full
+    // rationale (Windows cp1252 / `→` U+2192 / install.py crash).
+    cmd.env("PYTHONIOENCODING", "utf-8");
+    cmd.env("PYTHONUTF8", "1");
     // v0.2.15 (Agent D): expose the running launcher's PID to install.py
     // so _refresh_dist_binary_after_rebuild can include it in the
     // launcher_restart_required deferral message ("running launcher
@@ -3619,6 +3654,11 @@ pub async fn update_orchestrator<R: Runtime>(
             .args(["install.py", "--update"])
             .stdin(std::process::Stdio::null())
             .current_dir(&install_path);
+        // v0.2.27: force UTF-8 stdout/stderr for the Python child. See
+        // the identical block on the `update_at` spawn site for the
+        // full rationale.
+        fallback.env("PYTHONIOENCODING", "utf-8");
+        fallback.env("PYTHONUTF8", "1");
         fallback.env("VCT_LAUNCHER_PID", std::process::id().to_string());
         fallback.env_remove("VCT_AUTO_RESTART_LAUNCHER");
         // v0.2.17 (Reviewer A finding A2): force-emit the deferral on
@@ -3756,11 +3796,100 @@ async fn read_remote_sha(repo: &Path, branch: &str) -> Option<String> {
     raw.split_whitespace().next().map(|s| s.to_string())
 }
 
-/// Best-effort: collect the list of files that differ between HEAD and
-/// the upstream branch tip. Used to populate the divergence modal so the
-/// user sees what would be merged. Returns an empty Vec on any failure
-/// (the modal then renders without a file list — still useful).
-async fn collect_diverged_files(repo: &Path, branch: &str) -> Vec<String> {
+/// Best-effort: collect the lists of (a) files upstream changed since
+/// the fork point and (b) files that exist only on the local side. Used
+/// to populate the divergence modal so the user sees BOTH "what would
+/// be merged in" and "what stays as-is".
+///
+/// v0.2.27 rewrite: prior to v0.2.27 this function used `git diff HEAD..
+/// upstream/branch --name-only`, which lists files different between
+/// the two tips regardless of whether the difference is genuine upstream
+/// change or just a local-only addition. Forks that track paths the
+/// public repo doesn't (e.g. VCO_dev's `other_projects_knowledge/`)
+/// would see ALL their local-only paths show up as "diverged files" in
+/// the modal — confusing because those files can't possibly merge-
+/// conflict (upstream has no version of them at all). The rewrite
+/// separates the two categories by anchoring on the merge-base.
+///
+/// Returns `(upstream_changed_files, local_only_files)`. Empty vectors
+/// on any git failure — the modal renders without a file list, still
+/// usable.
+async fn collect_diverged_files(
+    repo: &Path,
+    branch: &str,
+) -> (Vec<String>, Vec<String>) {
+    let upstream_ref = format!(
+        "{}/{}",
+        crate::commands::self_update::VCO_UPSTREAM_REMOTE,
+        branch,
+    );
+
+    // Find the merge-base. If this fails (e.g. unrelated histories,
+    // which shouldn't happen for any real VCO clone), fall back to the
+    // pre-v0.2.27 behaviour rather than blocking the modal.
+    let merge_base = match tokio::process::Command::new("git")
+        .args(["merge-base", "HEAD", &upstream_ref])
+        .current_dir(repo)
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => {
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        }
+        _ => {
+            // Fall through to the legacy single-list behaviour. Less
+            // accurate but still informative.
+            let legacy = legacy_collect_diverged_files(repo, branch).await;
+            return (legacy, Vec::new());
+        }
+    };
+
+    let run_diff = |spec: String| {
+        let repo = repo.to_path_buf();
+        async move {
+            let out = tokio::process::Command::new("git")
+                .args(["diff", "--name-only", &spec])
+                .current_dir(&repo)
+                .output()
+                .await;
+            match out {
+                Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect::<std::collections::BTreeSet<String>>(),
+                _ => std::collections::BTreeSet::new(),
+            }
+        }
+    };
+
+    // Set A: files upstream touched since the fork point.
+    let upstream_touched = run_diff(format!("{}..{}", merge_base, upstream_ref)).await;
+    // Set B: files local touched since the fork point.
+    let local_touched = run_diff(format!("{}..HEAD", merge_base)).await;
+
+    // upstream_changed_files = A (every upstream-touched file is
+    // relevant to the merge; A ∩ B are the real conflict candidates,
+    // A \ B will auto-merge — but both belong in the same "what's
+    // coming from upstream" bucket from the user's UI perspective).
+    let upstream_changed: Vec<String> = upstream_touched.iter().cloned().collect();
+
+    // local_only_files = B \ A (touched locally, untouched upstream —
+    // safe to leave alone, no merge attention needed).
+    let local_only: Vec<String> = local_touched
+        .iter()
+        .filter(|p| !upstream_touched.contains(*p))
+        .cloned()
+        .collect();
+
+    (upstream_changed, local_only)
+}
+
+/// Pre-v0.2.27 fallback: single list of files diff between HEAD and the
+/// upstream branch tip. Used when `git merge-base` itself fails (e.g.
+/// unrelated histories — shouldn't happen for any real VCO clone but
+/// guard against it anyway).
+async fn legacy_collect_diverged_files(repo: &Path, branch: &str) -> Vec<String> {
     let out = tokio::process::Command::new("git")
         .args([
             "diff",
@@ -3825,6 +3954,7 @@ fn serialize_orchestrator_non_ff_error(
     local: Option<&str>,
     remote: Option<&str>,
     diverged_files: &[String],
+    local_only_files: &[String],
     git_stderr: &str,
 ) -> String {
     let stderr_esc = crate::commands::self_update::json_escape(git_stderr);
@@ -3836,16 +3966,24 @@ fn serialize_orchestrator_non_ff_error(
         Some(s) => format!("\"{}\"", s),
         None => "null".to_string(),
     };
-    let files_field: String = {
-        let parts: Vec<String> = diverged_files
+    let to_json_array = |items: &[String]| -> String {
+        let parts: Vec<String> = items
             .iter()
             .map(|p| format!("\"{}\"", crate::commands::self_update::json_escape(p)))
             .collect();
         format!("[{}]", parts.join(","))
     };
+    let files_field = to_json_array(diverged_files);
+    let local_only_field = to_json_array(local_only_files);
+    // v0.2.27: added `local_only_files` so the modal can render
+    // "files only on your clone" as a separate (collapsible) section
+    // instead of mixing them into the merge-conflict-candidate list.
+    // Forks that track paths the public repo doesn't (e.g. VCO_dev's
+    // `other_projects_knowledge/`) no longer see those paths flagged
+    // as "diverged" in the modal.
     format!(
-        "{{\"event\":\"orchestrator_update_non_ff\",\"branch\":\"{}\",\"local_sha\":{},\"remote_sha\":{},\"diverged_files\":{},\"git_stderr\":\"{}\"}}",
-        branch, local_field, remote_field, files_field, stderr_esc
+        "{{\"event\":\"orchestrator_update_non_ff\",\"branch\":\"{}\",\"local_sha\":{},\"remote_sha\":{},\"diverged_files\":{},\"local_only_files\":{},\"git_stderr\":\"{}\"}}",
+        branch, local_field, remote_field, files_field, local_only_field, stderr_esc
     )
 }
 
@@ -4163,6 +4301,11 @@ async fn run_post_pull_install_and_restart<R: Runtime>(
     cmd.args(["install.py", "--update"])
         .stdin(std::process::Stdio::null())
         .current_dir(install_path);
+    // v0.2.27: force UTF-8 stdout/stderr for the Python child. See
+    // the identical block on the `update_at` spawn site for the
+    // full rationale.
+    cmd.env("PYTHONIOENCODING", "utf-8");
+    cmd.env("PYTHONUTF8", "1");
     cmd.env("VCT_LAUNCHER_PID", std::process::id().to_string());
     cmd.env("VCT_AUTO_RESTART_LAUNCHER", "1");
     #[cfg(windows)]
@@ -4220,6 +4363,9 @@ async fn run_post_pull_install_and_restart<R: Runtime>(
             .args(["install.py", "--update"])
             .stdin(std::process::Stdio::null())
             .current_dir(install_path);
+        // v0.2.27: force UTF-8 stdout/stderr for the Python child.
+        fallback.env("PYTHONIOENCODING", "utf-8");
+        fallback.env("PYTHONUTF8", "1");
         fallback.env("VCT_LAUNCHER_PID", std::process::id().to_string());
         fallback.env_remove("VCT_AUTO_RESTART_LAUNCHER");
         fallback.env("VCT_FORCE_RESTART_DEFERRAL", "1");
@@ -11223,6 +11369,7 @@ MemAvailable:   23456789 kB
                 Some("abc1234"),
                 Some("def5678"),
                 &["CLAUDE.md".to_string(), "knowledge/foo.md".to_string()],
+                &["other_projects_knowledge/local-only.md".to_string()],
                 "fatal: Not possible to fast-forward, aborting.",
             );
             // Must start with the canonical discriminator so the frontend's
@@ -11238,6 +11385,10 @@ MemAvailable:   23456789 kB
             assert_eq!(files.len(), 2);
             assert_eq!(files[0], "CLAUDE.md");
             assert_eq!(files[1], "knowledge/foo.md");
+            // v0.2.27: local_only_files is a separate category.
+            let local_only = v["local_only_files"].as_array().expect("array");
+            assert_eq!(local_only.len(), 1);
+            assert_eq!(local_only[0], "other_projects_knowledge/local-only.md");
         }
 
         #[test]
@@ -11247,10 +11398,12 @@ MemAvailable:   23456789 kB
                 None,
                 None,
                 &[],
+                &[],
                 "boom",
             );
             let v: serde_json::Value = serde_json::from_str(&s).expect("valid JSON");
             assert_eq!(v["diverged_files"].as_array().unwrap().len(), 0);
+            assert_eq!(v["local_only_files"].as_array().unwrap().len(), 0);
             assert!(v["local_sha"].is_null());
             assert!(v["remote_sha"].is_null());
         }
@@ -11265,6 +11418,7 @@ MemAvailable:   23456789 kB
                 None,
                 None,
                 &["weird\"name.md".to_string()],
+                &[],
                 "boom",
             );
             let v: serde_json::Value = serde_json::from_str(&s).expect("valid JSON");
@@ -11523,7 +11677,8 @@ MemAvailable:   23456789 kB
 
             // The diverged-files helper must return at least UPSTREAM.md
             // (added on upstream but absent locally).
-            let diverged = collect_diverged_files(&local, "main").await;
+            let (diverged, local_only) =
+                collect_diverged_files(&local, "main").await;
             assert!(
                 diverged.iter().any(|p| p == "UPSTREAM.md"),
                 "expected UPSTREAM.md in diverged list, got {:?}",
@@ -11544,6 +11699,7 @@ MemAvailable:   23456789 kB
                 local_sha.as_deref(),
                 remote_sha.as_deref(),
                 &diverged,
+                &local_only,
                 stderr.trim(),
             );
             let v: serde_json::Value =
@@ -11551,6 +11707,9 @@ MemAvailable:   23456789 kB
             assert_eq!(v["event"], "orchestrator_update_non_ff");
             assert_eq!(v["branch"], "main");
             assert!(!v["diverged_files"].as_array().unwrap().is_empty());
+            // local_only_files should be present (may be empty in this fixture,
+            // but the key must exist for the v0.2.27 shape contract).
+            assert!(v.get("local_only_files").is_some());
         }
 
         #[tokio::test]
