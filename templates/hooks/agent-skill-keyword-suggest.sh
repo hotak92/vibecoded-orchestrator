@@ -31,7 +31,14 @@ if [ -f "$SCRIPT_DIR/_lib/find-python.sh" ]; then
     # shellcheck source=_lib/find-python.sh disable=SC1091
     . "$SCRIPT_DIR/_lib/find-python.sh"
 fi
-[ -z "${PY:-}" ] && exit 0  # No Python → silent no-op.
+# Hardening (Wave-1 integration review): if _lib/find-python.sh is missing
+# (partial install, manual hook copy without the _lib/ siblings) $PY stays
+# unset and the hook would silently no-op even when `python3` is on PATH.
+# Fall back to a direct `command -v` probe so we degrade gracefully.
+if [ -z "${PY:-}" ]; then
+    PY="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || command -v py 2>/dev/null || true)"
+fi
+[ -z "${PY:-}" ] && exit 0  # No Python interpreter found anywhere → silent no-op.
 
 # emit-context.sh is preferred (handles 10 KB cap + whitespace gate +
 # JSON envelope shape). If missing, we still emit a bare JSON envelope

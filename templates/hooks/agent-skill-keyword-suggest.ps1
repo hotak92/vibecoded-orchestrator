@@ -26,7 +26,17 @@ if (Test-Path $StderrCap) { . $StderrCap }
 # Resolve a Python interpreter portably.
 $FindPy = Join-Path $ScriptDir "_lib/find-python.ps1"
 if (Test-Path $FindPy) { . $FindPy }
-if (-not $PY) { exit 0 }  # No Python → silent no-op.
+# Hardening (Wave-1 integration review): if _lib/find-python.ps1 is missing
+# (partial install, manual hook copy without the _lib/ siblings) $PY stays
+# unset and the hook would silently no-op even when `python` is on PATH.
+# Fall back to a direct Get-Command probe so we degrade gracefully.
+if (-not $PY) {
+    foreach ($candidate in @('python3', 'python', 'py')) {
+        $cmd = Get-Command $candidate -ErrorAction SilentlyContinue
+        if ($cmd) { $PY = $cmd.Source; break }
+    }
+}
+if (-not $PY) { exit 0 }  # No Python interpreter found anywhere → silent no-op.
 
 # Emit-AdditionalContext helper (preferred). If missing we still emit a
 # bare JSON envelope inline via ConvertTo-Json so the suggestion reaches
