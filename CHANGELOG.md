@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.26] — 2026-05-22
+
+Headline release: a **generic declarative HTTP-action dispatcher** that
+lets paid modules add new GUI controls without launcher rebuilds.
+Every future paid module (`vct-coordination`, `vct-transcrypt`,
+`mao`, …) now declares its config tab entirely in its
+`vct-module.json` manifest; the launcher renders + executes
+everything generically. The four reset/retrain Tauri command stubs
+that were placeholders for exactly this dispatcher are deleted.
+
+Also: a WebKitGTK + EGL pre-flight probe so a stale post-driver-upgrade
+NVIDIA driver state no longer aborts the launcher at startup. The
+probe is per-launch — once the user reboots and the driver state
+clears, the GPU/DMABUF fast path returns automatically with no
+persistent perf cost.
+
+### Added
+
+- **`feat(launcher)` Generic declarative HTTP-action dispatcher** (the v0.2.26 headline). One new Tauri command `module_dispatch_action(moduleId, projectId, action, value, siblingValues?)` executes any `ActionDescriptor::Http { method, path, body, polling?, next_action? }` declared in a paid module's `vct-module.json`. The launcher's renderer (`ModuleConfigTab.svelte`) routes legacy string-form actions to the existing `invoke(action, ...)` path and descriptor-form actions to the new generic command; back-compat is permanent for v0.2.20–v0.2.25 manifests. The descriptor supports `{{...}}` template substitution (closed set: `project_id` / `module_id` / `value` / `control:<id>`), polling with progress + failed Tauri events, and arbitrary-depth chained `next_action` bounded by `MAX_CHAIN_STEPS = 1024`. Implementation lives at `launcher/src-tauri/src/commands/module_dispatch.rs` (~1500 LOC + 31 tests including in-process axum mock servers). See [`knowledge/concepts/module-contributed-gui-tabs.md`](knowledge/concepts/module-contributed-gui-tabs.md) for the full wire shape + `docs/PAID_MODULE_DEV_CHECKLIST.md` for the module-author integration recipe.
+
+- **`feat(launcher-ui)` Five new schema-rendered control kinds**: `text_input` (with optional apply/validate action), `number_input` (min/max/step), `status_display` (polled GET source + `render_template`), `file_picker` (Tauri native dialog, optional extension filter, directory mode), `link` (external via tauri-plugin-opener / internal via SvelteKit goto). New components under `launcher/src/lib/components/module-controls/`. Each is documented in `docs/PAID_MODULE_DEV_CHECKLIST.md`.
+
+- **`feat(launcher-core)` Generic per-(project × module) port table** — migration 017 adds `module_ports(project_id, module_id, port, updated_at)` with `INSERT OR IGNORE` backfill from the existing `projects.rl_port` column. New helpers `db.get_module_port(...)` / `set_module_port(...)` / `ensure_module_port(...)`. The legacy `get_project_rl_port` / `set_project_rl_port` pair becomes thin wrappers — every v0.2.21+ hub call site compiles unchanged. Unblocks coordination + transcrypt without per-module schema changes. See [`knowledge/concepts/generic-per-module-db-architecture.md`](knowledge/concepts/generic-per-module-db-architecture.md).
+
+- **`feat(launcher)` WebKitGTK + EGL pre-flight probe** at `launcher/src-tauri/src/webkit_preflight.rs`. Linux-only (`#[cfg(target_os = "linux")]`); macOS/Windows no-op. Called from `main()` BEFORE Tauri init. Walks `/sys/class/drm/*` to find the primary GPU (`boot_vga=1`), maps to its `/dev/dri/renderD*` node, dlopens `libEGL.so.1` + `libgbm.so.1`, and calls `eglInitialize` against the GBM platform display. On the well-known `EGL_NOT_INITIALIZED` (0x3001) failure signature — most commonly: NVIDIA `apt`-upgraded its proprietary userspace without a kernel-module reload — sets `WEBKIT_DISABLE_DMABUF_RENDERER=1` (and `__NV_DISABLE_EXPLICIT_SYNC=1` on Wayland) so WebKit falls back to its legacy renderer instead of aborting the process. Kill-switch: `VCT_WEBKIT_PREFLIGHT_OFF=1`. User-set `WEBKIT_DISABLE_DMABUF_RENDERER` is respected (the probe is a no-op when the user already chose). Live-verified against the broken NVIDIA driver state on the dev box on 2026-05-22. See [`knowledge/concepts/webkit-egl-preflight-probe.md`](knowledge/concepts/webkit-egl-preflight-probe.md).
+
+- **`feat(launcher-core)` Manifest schema additions**: new `ActionRef` enum (untagged: `Legacy(String) | Descriptor(ActionDescriptor)`), new `ActionDescriptor::Http`, new `HttpMethod` / `PollingSpec` types, and the 5 new `ConfigControl` variants. The existing variants' `action` / `on_change` / `options_source` field types change from `String` to `ActionRef` — back-compat preserved by `#[serde(untagged)]`. 30 new unit tests covering each control kind, descriptor JSON deserialization, polling-spec defaults, chained-action depth, and legacy-form back-compat.
+
+### Changed
+
+- **`refactor(launcher)` Renamed `commands::rl_service` → `commands::module_service`** (~10 files, ~40 textual refs updated). The file's internals were already generic — v0.2.21's header noted "Today this module supports exactly one consumer — `vct-rl-reranker` — but the helpers are written against `ModuleManifest` so future container modules drop in without a code change". Now that v0.2.26 has dispatcher + module_ports for coordination + transcrypt, the file name matches the scope. Pure rename — no behavioural change.
+
+- **`docs(paid-modules)` Extended `docs/PAID_MODULE_DEV_CHECKLIST.md`** with two new sections: "GUI tab integration via the declarative dispatcher (v0.2.26+)" (declarative-vs-legacy decision matrix, minimum example, polling example, port registration contract, template grammar reference, what-still-requires-rebuild list) and updates to the "When you add a new paid module" procedure (now includes explicit steps for declaring the GUI tab in the manifest + wiring port registration via `ensure_module_port`).
+
+### Removed
+
+- **`refactor(launcher)` Removed four RL stub Tauri commands** (`rl_reset_to_global`, `rl_reset_and_specialize`, `retrain_global_online`, `retrain_global_offline`) from `launcher/src-tauri/src/commands/rl_settings.rs` along with their `invoke_handler!` registrations and the now-orphan `RetrainResult` struct. They were placeholders for the now-shipped declarative dispatcher; the RL chat migrates `paid-modules/vct-rl-reranker/vct-module.json` to `ActionDescriptor::Http` entries on its side. Preserved: `set_rl_use_global` / `set_rl_online_training_disabled` / `set_rl_global_training_source_flag` / `list_rl_global_training_source_projects` (these read launcher-side DB state the HTTP-only dispatcher can't express; legacy-routed permanently).
+
+### Fixed
+
+- **`fix(launcher)` Three pre-release review findings** (committed post-cross-agent merge as a single follow-up): (a) `substitute_string` previously cast each byte to `char`, mangling multi-byte UTF-8 sequences in embedded templates — switched to `&str` slicing between token boundaries; (b) `{{control:<id>}}` was documented but unreachable end-to-end because `SubstitutionContext::simple()` hard-wired a `|_| None` resolver — plumbed `sibling_values: Option<HashMap<String, Value>>` through the Tauri command + dispatcher and built a real resolver backed by the renderer snapshot with `module_settings` DB fallback; (c) `run_poller` terminated on a single non-2xx tick — added a consecutive-failure budget (`POLL_CONSECUTIVE_FAILURE_LIMIT = 5`) so transient 503s during container restarts no longer kill long-running polls. Five new regression tests covering all three.
+
+### Migration notes
+
+- **Module authors**: see `docs/PAID_MODULE_DEV_CHECKLIST.md`'s new "GUI tab integration via the declarative dispatcher" section + the dispatcher KG node for the wire shape. The default answer for "I want to add a setting to my module" is now **declare it in the manifest, not in launcher Rust**. Pre-existing modules using `ActionRef::Legacy(String)` keep working; migration is opt-in and per-control.
+
+- **End users**: no action required. The migration 017 backfill is idempotent (`INSERT OR IGNORE`) and the legacy `projects.rl_port` column stays in place for back-compat. NVIDIA users who experience a launcher startup abort after an `apt upgrade` of `nvidia-driver-*` (the `EGL_NOT_INITIALIZED` crash) will now see the launcher start automatically — the GPU/DMABUF path returns on the next reboot.
+
+- **No DB schema breakage**. Migration 017 only adds a new table; no existing tables modified.
+
 ## [0.2.25] — 2026-05-22
 
 Follow-up release for the v0.2.24 main feature drop. Originally
