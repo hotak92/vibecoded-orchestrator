@@ -89,9 +89,15 @@ def has_magic_comment(file_path: Path) -> bool:
 
     The marker must be ``# OS-EXEMPT-PARITY:`` followed by at least one
     non-whitespace character (the reason).
+
+    v0.2.26 follow-up: opens with ``utf-8-sig`` so a UTF-8 BOM on line 1
+    (added to every non-ASCII .ps1 in commit 97eceaf to unblock Windows
+    PowerShell 5.1) does not hide the marker. ``utf-8-sig`` strips the
+    BOM if present and behaves identically to ``utf-8`` otherwise — safe
+    for both .sh (no BOM) and .ps1 (with or without BOM) files.
     """
     try:
-        with file_path.open("r", encoding="utf-8", errors="replace") as f:
+        with file_path.open("r", encoding="utf-8-sig", errors="replace") as f:
             for i, line in enumerate(f):
                 if i >= MAGIC_COMMENT_LINE_LIMIT:
                     break

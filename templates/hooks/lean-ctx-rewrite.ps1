@@ -1,4 +1,5 @@
-﻿# Per-project lean-ctx PreToolUse hook for Bash tool calls (Windows).
+﻿# OS-EXEMPT-PARITY: 2026-05-22 BOM-only addition for Windows PS 5.1 (commit 97eceaf) — .sh sibling reads bytes not codepages, so no Bash-side change needed.
+# Per-project lean-ctx PreToolUse hook for Bash tool calls (Windows).
 # Windows sibling of templates/hooks/lean-ctx-rewrite.sh — see that file for
 # the full rationale (fork-bomb avoidance, 0.2.11 redesign, three-tier
 # bypass hierarchy).

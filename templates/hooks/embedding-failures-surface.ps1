@@ -1,4 +1,5 @@
-﻿# SPDX-License-Identifier: AGPL-3.0-or-later
+﻿# OS-EXEMPT-PARITY: 2026-05-22 BOM-only addition for Windows PS 5.1 (commit 97eceaf) — .sh sibling reads bytes not codepages, so no Bash-side change needed.
+# SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
 #
 # v0.2.18 (Commit 11): surface embedding-backend failure hints to Claude.
