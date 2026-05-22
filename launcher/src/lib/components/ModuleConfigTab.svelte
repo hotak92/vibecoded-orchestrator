@@ -164,17 +164,47 @@
    * dispatch calls in this file go through here so back-compat lives
    * in one place.
    */
+  /**
+   * Snapshot the renderer's current per-control values keyed by plain
+   * control-id (NOT the `<section>:<id>` composite key the renderer
+   * uses internally). The dispatcher feeds this map to its
+   * `{{control:<id>}}` substitution resolver so descriptor bodies can
+   * reference sibling controls without each one having to be re-read
+   * from `module_settings` on every dispatch.
+   *
+   * Conflict policy: if two sections define a control with the same
+   * id, the later section wins. This matches how `dispatchAction`'s
+   * `extraArgs` already handles sibling references in the legacy path.
+   */
+  function siblingValuesSnapshot(): Record<string, unknown> {
+    const out: Record<string, unknown> = {};
+    for (let i = 0; i < configTab.sections.length; i++) {
+      for (const control of configTab.sections[i].controls) {
+        if (control.kind === 'button' || control.kind === 'info') continue;
+        const v = values[ckey(i, control.id)];
+        if (v !== undefined) out[control.id] = v;
+      }
+    }
+    return out;
+  }
+
   async function dispatchAction<T = unknown>(
     action: ActionRef,
     value: unknown = null,
     extraArgs: Record<string, unknown> = {},
   ): Promise<T> {
     if (isActionDescriptor(action)) {
+      // v0.2.26 follow-up (reviewer finding 3.2): pass the sibling
+      // values snapshot so descriptor bodies can reference other
+      // controls via `{{control:<id>}}`. Without this, that token
+      // unconditionally failed at substitute time even though the
+      // dispatcher's resolver plumbing was correct.
       return invoke<T>('module_dispatch_action', {
         moduleId,
         projectId,
         action,
         value,
+        siblingValues: siblingValuesSnapshot(),
       });
     }
     return invoke<T>(action, {

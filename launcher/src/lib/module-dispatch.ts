@@ -25,7 +25,14 @@ export interface DispatchContext {
  *  - If `action` is a string → `invoke(action, { moduleId, projectId, value })`
  *    (legacy path; preserves the v0.2.20-v0.2.25 wire contract).
  *  - If `action` is an `ActionDescriptor` → `invoke('module_dispatch_action', {
- *    moduleId, projectId, action, value })` (v0.2.26 declarative path).
+ *    moduleId, projectId, action, value, siblingValues? })` (v0.2.26
+ *    declarative path).
+ *
+ * `siblingValues` is an optional snapshot of other controls' current
+ * values keyed by control id. The Rust dispatcher feeds it to its
+ * `{{control:<id>}}` substitution resolver. When omitted, the
+ * dispatcher falls back to reading from `module_settings` — fine for
+ * widgets that own a single control or for cross-tab references.
  *
  * For polling actions the dispatcher returns the *kick* response
  * immediately; the renderer or control component is responsible for
@@ -39,6 +46,7 @@ export async function dispatchAction<T = unknown>(
   ctx: DispatchContext,
   action: ActionRef,
   value: unknown = null,
+  siblingValues?: Record<string, unknown>,
 ): Promise<T> {
   if (isActionDescriptor(action)) {
     return invoke<T>('module_dispatch_action', {
@@ -46,6 +54,7 @@ export async function dispatchAction<T = unknown>(
       projectId: ctx.projectId,
       action,
       value,
+      siblingValues: siblingValues ?? null,
     });
   }
   // Legacy form — preserve the existing argument shape (moduleId +

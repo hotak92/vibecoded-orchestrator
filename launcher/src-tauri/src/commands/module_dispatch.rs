@@ -43,6 +43,7 @@
 //! error rather than fall through silently to avoid accidental data
 //! leaks from typos.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -122,9 +123,13 @@ pub struct SubstitutionContext<'a> {
 }
 
 impl<'a> SubstitutionContext<'a> {
-    /// Convenience constructor for the no-control-lookup case (most
-    /// dispatcher invocations don't need to chase {{control:...}}
-    /// references; the renderer will eventually pre-resolve them).
+    /// Convenience constructor for the no-control-lookup case (the
+    /// production dispatcher builds a real resolver via
+    /// `dispatch_action_with_sink`; this helper is mostly used by
+    /// tests + future callers that don't yet have a sibling-value
+    /// snapshot — e.g. a scheduler invoking a saved action with no
+    /// active renderer context).
+    #[allow(dead_code)]
     pub fn simple(project_id: &'a str, module_id: &'a str, value: Option<&'a Value>) -> Self {
         Self {
             project_id,
@@ -199,30 +204,38 @@ fn substitute_string(s: &str, ctx: &SubstitutionContext) -> Result<Value, String
     // tokens (e.g. `"hello {{project_id}} from {{module_id}}"`).
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
-    let bytes = s.as_bytes();
-    while i < bytes.len() {
-        if i + 1 < bytes.len() && bytes[i] == b'{' && bytes[i + 1] == b'{' {
-            // Find the matching `}}`. We don't support nested `{{ }}`.
-            let close_relative = s[i + 2..].find("}}").ok_or_else(|| {
-                format!("substitute: unclosed '{{{{' in template: {:?}", s)
-            })?;
-            let token = &s[i + 2..i + 2 + close_relative];
-            let resolved = resolve_token(token, ctx)?;
-            // Stringify the resolved value for embedded use. Strings
-            // are taken verbatim (no extra quotes); everything else is
-            // JSON-encoded so callers see a stable representation.
-            match resolved {
-                Value::String(s2) => out.push_str(&s2),
-                other => out.push_str(&serde_json::to_string(&other).map_err(|e| {
-                    format!("substitute: encode resolved token '{}': {}", token, e)
-                })?),
+    while i < s.len() {
+        // The `{{` opener is pure ASCII, so the only place a UTF-8
+        // boundary lands at a `{` byte is the start of one. Searching
+        // for the next `{{` lets us slice the literal prefix as a
+        // `&str` (UTF-8-safe by construction) and only invoke the
+        // token machinery when there's actually a token to expand.
+        match s[i..].find("{{") {
+            None => {
+                // No more tokens — push the remainder verbatim.
+                out.push_str(&s[i..]);
+                break;
             }
-            i += 2 + close_relative + 2;
-        } else {
-            // Push the byte verbatim. Safe because `s` is utf8 and we
-            // only branch on ASCII `{`; non-ASCII bytes pass through.
-            out.push(bytes[i] as char);
-            i += 1;
+            Some(rel) => {
+                // Literal prefix up to the token, UTF-8-safe.
+                out.push_str(&s[i..i + rel]);
+                let token_start = i + rel + 2;
+                let close_relative = s[token_start..].find("}}").ok_or_else(|| {
+                    format!("substitute: unclosed '{{{{' in template: {:?}", s)
+                })?;
+                let token = &s[token_start..token_start + close_relative];
+                let resolved = resolve_token(token, ctx)?;
+                // Stringify the resolved value for embedded use. Strings
+                // are taken verbatim (no extra quotes); everything else is
+                // JSON-encoded so callers see a stable representation.
+                match resolved {
+                    Value::String(s2) => out.push_str(&s2),
+                    other => out.push_str(&serde_json::to_string(&other).map_err(|e| {
+                        format!("substitute: encode resolved token '{}': {}", token, e)
+                    })?),
+                }
+                i = token_start + close_relative + 2;
+            }
         }
     }
     Ok(Value::String(out))
@@ -311,12 +324,23 @@ pub async fn dispatch_action_inner(
     project_id: &str,
     action: ActionDescriptor,
     value: Option<Value>,
+    sibling_values: Option<HashMap<String, Value>>,
     app: AppHandle,
     db: &Db,
     http_client: &reqwest::Client,
 ) -> Result<Value, String> {
     let sink: Arc<dyn EventSink> = Arc::new(AppHandleSink(app));
-    dispatch_action_with_sink(module_id, project_id, action, value, sink, db, http_client).await
+    dispatch_action_with_sink(
+        module_id,
+        project_id,
+        action,
+        value,
+        sibling_values,
+        sink,
+        db,
+        http_client,
+    )
+    .await
 }
 
 /// Test-injectable variant of `dispatch_action_inner`. Production code
@@ -328,6 +352,7 @@ pub(crate) async fn dispatch_action_with_sink(
     project_id: &str,
     action: ActionDescriptor,
     value: Option<Value>,
+    sibling_values: Option<HashMap<String, Value>>,
     sink: Arc<dyn EventSink>,
     db: &Db,
     http_client: &reqwest::Client,
@@ -335,8 +360,43 @@ pub(crate) async fn dispatch_action_with_sink(
     // Build the substitution context ONCE — passed by reference into
     // each chained step so all steps see the same project / module /
     // initial-value pair.
+    //
+    // v0.2.26 follow-up (reviewer finding 3.2): `{{control:<id>}}` now
+    // resolves end-to-end. The renderer snapshots its current control
+    // map (id → JSON value) and passes it as `sibling_values`. We
+    // fall back to `module_settings` reads when the renderer didn't
+    // provide a snapshot (e.g. for legacy callers or tests).
     let value_ref = value.as_ref();
-    let ctx = SubstitutionContext::simple(project_id, module_id, value_ref);
+    let project_id_owned = project_id.to_string();
+    let module_id_owned = module_id.to_string();
+    // Snapshot the renderer-provided sibling map into an Arc so the
+    // closure can outlive this scope without lifetime gymnastics.
+    let sibling_snapshot: Arc<HashMap<String, Value>> =
+        Arc::new(sibling_values.unwrap_or_default());
+    // Take a borrowed db handle the closure can use for DB fallback.
+    let db_for_resolver = db;
+    let resolver: ControlValueResolver = {
+        let sibling_snapshot = sibling_snapshot.clone();
+        Box::new(move |control_id: &str| -> Option<Value> {
+            if let Some(v) = sibling_snapshot.get(control_id) {
+                return Some(v.clone());
+            }
+            // Fallback: read from persistent module_settings. This
+            // path covers controls whose values aren't in the
+            // renderer's snapshot (cross-tab references, server-side
+            // dispatch via future schedulers, tests).
+            db_for_resolver
+                .get_setting(&project_id_owned, &module_id_owned, control_id)
+                .ok()
+                .flatten()
+        })
+    };
+    let ctx = SubstitutionContext {
+        project_id,
+        module_id,
+        value: value_ref,
+        get_control_value: resolver,
+    };
 
     // Resolve the module's port. The dispatcher refuses to fire when
     // the row is absent (clear error explaining the likely cause).
@@ -505,6 +565,13 @@ fn extract_job_id(kick_body: &Value, job_id_path: &str) -> Result<String, String
 ///
 /// Lives in this module (not a separate file) so the implementation
 /// stays alongside the dispatcher contract that drives it.
+/// Max consecutive transient errors (non-2xx OR network error OR body
+/// parse failure) before the poller gives up and emits `failed_event`.
+/// Transient errors are common in long-running polls — a backend
+/// restart, a brief 503, a stale connection — so a single bad tick
+/// should not terminate the loop. v0.2.26 reviewer finding 3.3.
+const POLL_CONSECUTIVE_FAILURE_LIMIT: u32 = 5;
+
 async fn run_poller(
     module_id: &str,
     project_id: &str,
@@ -515,6 +582,7 @@ async fn run_poller(
     client: reqwest::Client,
 ) -> Result<(), String> {
     let url = format!("http://127.0.0.1:{}{}", port, spec.endpoint);
+    let mut consecutive_failures: u32 = 0;
     for _attempt in 0..spec.max_attempts {
         tokio::time::sleep(Duration::from_secs(spec.interval_seconds)).await;
 
@@ -528,29 +596,80 @@ async fn run_poller(
             Ok(r) if r.status().is_success() => match r.text().await {
                 Ok(text) => serde_json::from_str(&text).unwrap_or(Value::String(text)),
                 Err(e) => {
-                    // Transient read error — keep polling.
+                    // Transient read error — count toward the
+                    // consecutive-failure budget but keep polling.
                     eprintln!("[module_dispatch] poll body read error: {}", e);
+                    consecutive_failures += 1;
+                    if consecutive_failures >= POLL_CONSECUTIVE_FAILURE_LIMIT {
+                        sink.emit(
+                            spec.failed_event.as_str(),
+                            &serde_json::json!({
+                                "module_id": module_id,
+                                "project_id": project_id,
+                                "error": format!(
+                                    "polling aborted after {} consecutive body-read errors",
+                                    consecutive_failures,
+                                ),
+                            }),
+                        );
+                        return Ok(());
+                    }
                     continue;
                 }
             },
             Ok(r) => {
-                // Non-2xx; emit failure event and stop.
+                // Non-2xx response. v0.2.26 reviewer finding 3.3:
+                // these are often transient (503 during a container
+                // restart, brief 502 on a proxy hiccup). Log + count
+                // toward the consecutive-failure budget instead of
+                // aborting on the first bad tick.
+                let status = r.status();
                 let body_text = r.text().await.unwrap_or_default();
-                sink.emit(
-                    spec.failed_event.as_str(),
-                    &serde_json::json!({
-                        "module_id": module_id,
-                        "project_id": project_id,
-                        "error": format!("polling endpoint returned non-success status: {}", body_text),
-                    }),
+                eprintln!(
+                    "[module_dispatch] poll non-success status {} from {}: {}",
+                    status, url, body_text,
                 );
-                return Ok(());
+                consecutive_failures += 1;
+                if consecutive_failures >= POLL_CONSECUTIVE_FAILURE_LIMIT {
+                    sink.emit(
+                        spec.failed_event.as_str(),
+                        &serde_json::json!({
+                            "module_id": module_id,
+                            "project_id": project_id,
+                            "error": format!(
+                                "polling endpoint returned non-success status \
+                                 {} consecutive times (last status: {}, last body: {})",
+                                consecutive_failures, status, body_text,
+                            ),
+                        }),
+                    );
+                    return Ok(());
+                }
+                continue;
             }
             Err(e) => {
                 eprintln!("[module_dispatch] poll request error: {}", e);
+                consecutive_failures += 1;
+                if consecutive_failures >= POLL_CONSECUTIVE_FAILURE_LIMIT {
+                    sink.emit(
+                        spec.failed_event.as_str(),
+                        &serde_json::json!({
+                            "module_id": module_id,
+                            "project_id": project_id,
+                            "error": format!(
+                                "polling aborted after {} consecutive request errors (last: {})",
+                                consecutive_failures, e,
+                            ),
+                        }),
+                    );
+                    return Ok(());
+                }
                 continue;
             }
         };
+
+        // Successful tick — reset the consecutive-failure counter.
+        consecutive_failures = 0;
 
         // Emit progress event with full response.
         sink.emit(spec.progress_event.as_str(), &body_json);
@@ -601,12 +720,21 @@ async fn run_poller(
 /// connection pooling, but the dispatcher's invocation pattern
 /// (sporadic button clicks + low-frequency status polls) makes a
 /// per-call client cheap enough that the simpler ownership story wins.
+/// Generic Tauri command exposed to the renderer.
+///
+/// `sibling_values` (v0.2.26 follow-up, reviewer finding 3.2):
+/// sibling-control values snapshot supplied by the renderer so
+/// `{{control:<id>}}` template tokens in the descriptor body resolve
+/// end-to-end. Optional — when `None`, the dispatcher falls back to
+/// `module_settings` DB reads, which covers cross-tab references +
+/// future scheduler callers that don't have a renderer context.
 #[command]
 pub async fn module_dispatch_action(
     module_id: String,
     project_id: String,
     action: ActionDescriptor,
     value: Option<Value>,
+    sibling_values: Option<HashMap<String, Value>>,
     app: AppHandle,
     db: State<'_, Db>,
 ) -> Result<Value, String> {
@@ -625,6 +753,7 @@ pub async fn module_dispatch_action(
         &project_id,
         action,
         value,
+        sibling_values,
         app,
         db.inner(),
         &http_client,
@@ -638,6 +767,7 @@ pub async fn module_dispatch_action(
 mod tests {
     use super::*;
     use crate::db::models::ProjectHost;
+    use axum::response::IntoResponse;
     use serde_json::json;
     use std::net::SocketAddr;
     use std::sync::Mutex as StdMutex;
@@ -763,6 +893,29 @@ mod tests {
         let ctx = SubstitutionContext::simple("proj-A", "mod-X", None);
         let out = substitute(&v, &ctx).unwrap();
         assert_eq!(out, Value::String("hello proj-A / mod-X".into()));
+    }
+
+    /// Regression for v0.2.26 reviewer finding 3.1: embedded
+    /// substitution previously cast each byte to `char`, which
+    /// mis-decoded multi-byte UTF-8 sequences (`é` = `0xC3 0xA9`
+    /// became `U+00C3 U+00A9` instead of `U+00E9`). Now we slice
+    /// `&str` segments between tokens, so any valid UTF-8 input
+    /// is preserved verbatim.
+    #[test]
+    fn substitute_embedded_preserves_utf8() {
+        let ctx = SubstitutionContext::simple("proj-1", "mod-Y", None);
+        // Western European: accented Latin.
+        let v = json!("héllo {{project_id}} — café");
+        let out = substitute(&v, &ctx).unwrap();
+        assert_eq!(out, Value::String("héllo proj-1 — café".into()));
+        // CJK + emoji surrounding the token.
+        let v = json!("こんにちは {{module_id}} 🚀");
+        let out = substitute(&v, &ctx).unwrap();
+        assert_eq!(out, Value::String("こんにちは mod-Y 🚀".into()));
+        // No tokens at all: pure UTF-8 passthrough.
+        let v = json!("Naïve façade — résumé");
+        let out = substitute(&v, &ctx).unwrap();
+        assert_eq!(out, Value::String("Naïve façade — résumé".into()));
     }
 
     /// Embedded bool stringifies to "true"/"false".
@@ -972,6 +1125,7 @@ mod tests {
             project_id,
             action,
             None,
+            None,
             sink,
             &db,
             &client,
@@ -982,6 +1136,119 @@ mod tests {
         assert_eq!(resp["ok"], json!(true));
         assert_eq!(resp["echo"]["project"], json!("proj-A"));
         assert_eq!(resp["echo"]["module"], json!("mod-X"));
+    }
+
+    /// Regression for v0.2.26 reviewer finding 3.2: a `{{control:<id>}}`
+    /// reference inside the descriptor body resolves end-to-end when the
+    /// renderer supplies a `sibling_values` map. Before this fix the
+    /// dispatcher always saw a `Box::new(|_| None)` resolver and the
+    /// substitution unconditionally failed with "unknown control".
+    #[tokio::test]
+    async fn dispatcher_resolves_control_token_from_sibling_values() {
+        let project_id = "proj-A";
+        let module_id = "mod-X";
+
+        let router = Router::new().route(
+            "/kick",
+            routing::post(|Json(body): Json<Value>| async move {
+                Json(json!({"echo": body}))
+            }),
+        );
+        let port = start_server(router).await;
+
+        let db = db_with_module(project_id, module_id, port);
+        let client = build_http_client();
+        let sink: Arc<dyn EventSink> = Arc::new(RecordingSink::new());
+
+        let action = ActionDescriptor::Http {
+            method: HttpMethod::Post,
+            path: "/kick".into(),
+            // Both whole-string (preserves typed array) and embedded
+            // (interpolates as string) forms of the control reference.
+            body: Some(json!({
+                "selected_projects": "{{control:source_projects}}",
+                "label": "running for {{control:run_label}} now"
+            })),
+            polling: None,
+            next_action: None,
+        };
+
+        let mut siblings: HashMap<String, Value> = HashMap::new();
+        siblings.insert(
+            "source_projects".into(),
+            json!(["proj-1", "proj-2", "proj-3"]),
+        );
+        siblings.insert("run_label".into(), json!("Q3 retrain"));
+
+        let resp = dispatch_action_with_sink(
+            module_id,
+            project_id,
+            action,
+            None,
+            Some(siblings),
+            sink,
+            &db,
+            &client,
+        )
+        .await
+        .expect("dispatch ok");
+
+        // Array survived as an array (whole-string fast path), not stringified.
+        assert_eq!(
+            resp["echo"]["selected_projects"],
+            json!(["proj-1", "proj-2", "proj-3"])
+        );
+        // Embedded form interpolated as string.
+        assert_eq!(
+            resp["echo"]["label"],
+            json!("running for Q3 retrain now")
+        );
+    }
+
+    /// Regression for v0.2.26 reviewer finding 3.2 (DB fallback path):
+    /// when the renderer doesn't supply a `sibling_values` entry for a
+    /// given control, the dispatcher reads from `module_settings`. This
+    /// path covers (a) cross-tab references where the renderer can't
+    /// snapshot every control, (b) future scheduler invocations with no
+    /// renderer context at all.
+    #[tokio::test]
+    async fn dispatcher_resolves_control_token_from_module_settings_fallback() {
+        let project_id = "proj-A";
+        let module_id = "mod-X";
+
+        let router = Router::new().route(
+            "/kick",
+            routing::post(|Json(body): Json<Value>| async move {
+                Json(json!({"echo": body}))
+            }),
+        );
+        let port = start_server(router).await;
+
+        let db = db_with_module(project_id, module_id, port);
+        // Persist a sibling-control value through the regular settings
+        // table (the same path the renderer uses on every checkbox/
+        // multi_select change).
+        db.set_setting(project_id, module_id, "persisted_flag", &json!(true))
+            .expect("persist setting");
+        let client = build_http_client();
+        let sink: Arc<dyn EventSink> = Arc::new(RecordingSink::new());
+
+        let action = ActionDescriptor::Http {
+            method: HttpMethod::Post,
+            path: "/kick".into(),
+            body: Some(json!({"flag": "{{control:persisted_flag}}"})),
+            polling: None,
+            next_action: None,
+        };
+
+        // No sibling_values from the renderer → dispatcher MUST fall
+        // back to the module_settings read.
+        let resp = dispatch_action_with_sink(
+            module_id, project_id, action, None, None, sink, &db, &client,
+        )
+        .await
+        .expect("dispatch ok");
+        assert_eq!(resp["echo"]["flag"], json!(true));
     }
 
     /// Polling loop emits progress events on each tick AND terminates
@@ -1047,6 +1314,7 @@ mod tests {
             module_id,
             project_id,
             action,
+            None,
             None,
             sink_arc,
             &db,
@@ -1131,7 +1399,7 @@ mod tests {
             next_action: None,
         };
 
-        dispatch_action_with_sink(module_id, project_id, action, None, sink_arc, &db, &client)
+        dispatch_action_with_sink(module_id, project_id, action, None, None, sink_arc, &db, &client)
             .await
             .expect("dispatch ok");
 
@@ -1150,6 +1418,170 @@ mod tests {
         );
         // Payload should include the terminal state.
         assert_eq!(failed[0].1["state"], json!("failed"));
+    }
+
+    /// Regression for v0.2.26 reviewer finding 3.3: transient non-2xx
+    /// responses (e.g. a 503 during a container restart) must NOT
+    /// terminate the polling loop. The container's first few replies
+    /// return 503, then 200 OK with state=done. Polling should ride
+    /// through and emit a single progress event at the end with no
+    /// `failed_event`.
+    #[tokio::test]
+    async fn dispatcher_polling_tolerates_transient_non_2xx() {
+        let project_id = "proj-A";
+        let module_id = "mod-X";
+
+        // Counter visible to the handler: first 3 calls return 503, rest 200.
+        let counter = Arc::new(StdMutex::new(0u32));
+        let counter_for_handler = counter.clone();
+        let router = Router::new()
+            .route(
+                "/kick",
+                routing::post(|| async { Json(json!({"job_id": "j1"})) }),
+            )
+            .route(
+                "/status",
+                routing::get(move |Query(_): Query<HashMap<String, String>>| {
+                    let c = counter_for_handler.clone();
+                    async move {
+                        let mut n = c.lock().unwrap();
+                        *n += 1;
+                        if *n <= 3 {
+                            (axum::http::StatusCode::SERVICE_UNAVAILABLE, "starting").into_response()
+                        } else {
+                            Json(json!({"state": "done"})).into_response()
+                        }
+                    }
+                }),
+            );
+        let port = start_server(router).await;
+
+        let db = db_with_module(project_id, module_id, port);
+        let client = build_http_client();
+        let sink = RecordingSink::new();
+        let sink_arc: Arc<dyn EventSink> = Arc::new(sink.clone());
+
+        let action = ActionDescriptor::Http {
+            method: HttpMethod::Post,
+            path: "/kick".into(),
+            body: None,
+            polling: Some(PollingSpec {
+                endpoint: "/status".into(),
+                job_id_path: "$.job_id".into(),
+                job_id_query_param: "job_id".into(),
+                interval_seconds: 0,
+                max_attempts: 20,
+                terminal_state_field: "$.state".into(),
+                terminal_success_values: vec!["done".into()],
+                terminal_failure_values: vec!["failed".into()],
+                progress_event: "test://progress".into(),
+                failed_event: "test://failed".into(),
+            }),
+            next_action: None,
+        };
+
+        dispatch_action_with_sink(module_id, project_id, action, None, None, sink_arc, &db, &client)
+            .await
+            .expect("dispatch ok");
+
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        let events = sink.snapshot();
+        let failed: Vec<_> = events
+            .iter()
+            .filter(|(e, _)| e == "test://failed")
+            .collect();
+        let progress: Vec<_> = events
+            .iter()
+            .filter(|(e, _)| e == "test://progress")
+            .collect();
+        assert!(
+            failed.is_empty(),
+            "transient 503s must not terminate the poll loop, got failed events: {:?}",
+            failed,
+        );
+        assert!(
+            !progress.is_empty(),
+            "expected ≥1 progress event after the 503 streak cleared, got events: {:?}",
+            events,
+        );
+        // The successful tick should carry state=done.
+        let last_progress = progress.last().expect("≥1 progress");
+        assert_eq!(last_progress.1["state"], json!("done"));
+    }
+
+    /// Regression for v0.2.26 reviewer finding 3.3 (the other side):
+    /// PERSISTENT non-2xx responses must still surface as failure once
+    /// the consecutive-failure budget is exhausted. Server always
+    /// returns 500; the poller should emit `failed_event` after
+    /// POLL_CONSECUTIVE_FAILURE_LIMIT ticks rather than running forever.
+    #[tokio::test]
+    async fn dispatcher_polling_persistent_non_2xx_eventually_fails() {
+        let project_id = "proj-A";
+        let module_id = "mod-X";
+
+        let router = Router::new()
+            .route(
+                "/kick",
+                routing::post(|| async { Json(json!({"job_id": "j1"})) }),
+            )
+            .route(
+                "/status",
+                routing::get(|Query(_): Query<HashMap<String, String>>| async {
+                    (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "always broken")
+                        .into_response()
+                }),
+            );
+        let port = start_server(router).await;
+
+        let db = db_with_module(project_id, module_id, port);
+        let client = build_http_client();
+        let sink = RecordingSink::new();
+        let sink_arc: Arc<dyn EventSink> = Arc::new(sink.clone());
+
+        let action = ActionDescriptor::Http {
+            method: HttpMethod::Post,
+            path: "/kick".into(),
+            body: None,
+            polling: Some(PollingSpec {
+                endpoint: "/status".into(),
+                job_id_path: "$.job_id".into(),
+                job_id_query_param: "job_id".into(),
+                interval_seconds: 0,
+                max_attempts: 100, // ensure budget triggers BEFORE max_attempts
+                terminal_state_field: "$.state".into(),
+                terminal_success_values: vec!["done".into()],
+                terminal_failure_values: vec!["failed".into()],
+                progress_event: "test://progress".into(),
+                failed_event: "test://failed".into(),
+            }),
+            next_action: None,
+        };
+
+        dispatch_action_with_sink(module_id, project_id, action, None, None, sink_arc, &db, &client)
+            .await
+            .expect("dispatch ok");
+
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        let events = sink.snapshot();
+        let failed: Vec<_> = events
+            .iter()
+            .filter(|(e, _)| e == "test://failed")
+            .collect();
+        assert_eq!(
+            failed.len(),
+            1,
+            "expected exactly one failed event after consecutive-failure budget exhausted, got events: {:?}",
+            events,
+        );
+        // The failure error message should mention the consecutive count.
+        let error_str = failed[0].1["error"].as_str().unwrap_or("");
+        assert!(
+            error_str.contains("consecutive"),
+            "expected error message to mention 'consecutive', got: {:?}",
+            error_str,
+        );
     }
 
     /// Chained `next_action` executes the second descriptor after the
@@ -1211,6 +1643,7 @@ mod tests {
             project_id,
             first_action,
             None,
+            None,
             sink,
             &db,
             &client,
@@ -1262,7 +1695,7 @@ mod tests {
         }
         let head = *current.expect("chain non-empty");
 
-        let err = dispatch_action_with_sink(module_id, project_id, head, None, sink, &db, &client)
+        let err = dispatch_action_with_sink(module_id, project_id, head, None, None, sink, &db, &client)
             .await
             .expect_err("expected chain-depth error");
         assert!(
@@ -1296,7 +1729,7 @@ mod tests {
             polling: None,
             next_action: None,
         };
-        let err = dispatch_action_with_sink("ghost-module", "proj-X", action, None, sink, &db, &client)
+        let err = dispatch_action_with_sink("ghost-module", "proj-X", action, None, None, sink, &db, &client)
             .await
             .expect_err("missing port must error");
         assert!(
