@@ -313,6 +313,127 @@ Mounts → fetches `/metrics` → re-fetches every 10s → renders the template 
 
 Module authors who genuinely need launcher-side state (e.g. a control that triggers a `cargo` invocation, or that reads a non-HTTP launcher signal) keep using `ActionRef::Legacy("my_tauri_command")` — the legacy path is preserved, not deprecated. Use it for the cases the declarative path cannot express.
 
+### v0.2.27 evolution — `events_paths_for` token + `log_path_template` manifest field (2026-05-22)
+
+v0.2.27 adds one new template token + one new optional manifest field, together giving paid modules a clean way to inject per-project log paths into a descriptor's request body. The RL module's two "Retrain global model" buttons were the first consumer; transcrypt and coordination will use the same pattern when they ship.
+
+#### The problem this solves
+
+A multi-select control persists an array of project UUIDs. A descriptor body wants to send an array of **paths** (one per selected project) to the container. The launcher knows the UUID → slug mapping (via the `projects` table); the container only knows its own log-path convention. Pre-v0.2.27 there was no template form that bridged the two — the only options were "container computes paths from UUIDs" (container doesn't have the slug map) or "duplicate the template in every action descriptor" (copy-paste hell across `online` + `offline` retrain buttons).
+
+#### New manifest field: `runtime.log_path_template`
+
+The module declares its host-side log-path convention in one place:
+
+```jsonc
+"runtime": {
+  // ...existing fields...
+  "log_path_template": "/data/logs/rl_events_{project_slug}.jsonl"
+}
+```
+
+**Closed-set tokens** inside the template:
+- `{project_slug}` — the project's slug (DB column).
+- `{project_id}` — the project's UUID.
+
+**Single-brace deliberately**, to distinguish from the outer dispatcher `{{...}}` tokens. Any other `{...}` placeholder is a manifest-validation error caught by `validate_log_path_template` at parse time, so manifest typos surface at load time with a clear "unknown placeholder '{module_id}' (only {project_slug} / {project_id} allowed)" error rather than mid-dispatch with a confusing schema mismatch.
+
+The field is **optional**. Modules that don't bind-mount per-project log paths simply omit it; if a manifest references `{{events_paths_for:<id>}}` without declaring `log_path_template`, the dispatcher refuses with a clear "module declares no log_path_template" error.
+
+#### New dispatcher token: `{{events_paths_for:<control_id>}}`
+
+Resolves to a `JsonValue::Array` of strings — one path per project the referenced control selected. Resolution pipeline:
+
+1. Read the control's persisted value (renderer snapshot first, `module_settings` DB fallback). Must be a JSON array of strings (UUIDs).
+2. For each UUID, look up the project via `db.get_project()` to get the slug.
+3. Apply the module's `runtime.log_path_template` via `render_log_path_template` (substituting `{project_slug}` / `{project_id}`).
+4. Return the resulting array.
+
+**Whole-string-only.** The token MUST be the entire value of a body field. Embedded form (`"prefix-{{events_paths_for:x}}-suffix"`) is rejected at dispatch time because the resolution returns an array — there's no sensible way to embed an array into a longer string. The error message explicitly points module authors at the "WHOLE string value" requirement.
+
+#### Example manifest (the RL pattern)
+
+```jsonc
+{
+  // ... module metadata ...
+  "runtime": {
+    "type": "container",
+    "log_path_template": "/data/logs/rl_events_{project_slug}.jsonl",
+    // ... rest of runtime block ...
+  },
+  "gui": {
+    "config_tab": {
+      "sections": [{
+        "controls": [
+          {
+            "kind": "multi_select",
+            "id": "src_projects",
+            "label": "Source projects",
+            "options_source": "list_rl_global_training_source_projects"
+          },
+          {
+            "kind": "button",
+            "id": "retrain_global_offline",
+            "label": "Retrain global model (offline)",
+            "action": {
+              "kind": "http",
+              "method": "POST",
+              "path": "/global/retrain",
+              "body": {
+                "mode": "offline",
+                "event_log_paths": "{{events_paths_for:src_projects}}",
+                "include_project_ids": "{{control:src_projects}}"
+              },
+              "polling": {
+                "endpoint": "/global/retrain_status",
+                "interval_seconds": 30,
+                "max_attempts": 240
+              }
+            }
+          }
+        ]
+      }]
+    }
+  }
+}
+```
+
+For 3 selected projects with slugs `claude` / `vco-dev` / `artup`, the rendered request body is:
+
+```json
+{
+  "mode": "offline",
+  "event_log_paths": [
+    "/data/logs/rl_events_claude.jsonl",
+    "/data/logs/rl_events_vco-dev.jsonl",
+    "/data/logs/rl_events_artup.jsonl"
+  ],
+  "include_project_ids": ["uuid-claude", "uuid-vco-dev", "uuid-artup"]
+}
+```
+
+Notice the two tokens compose cleanly: `{{control:src_projects}}` passes the raw UUID array; `{{events_paths_for:src_projects}}` passes the per-project log-path array. The container gets both representations and decides which it wants.
+
+#### Updated closed-set token table (v0.2.27)
+
+| Token | Resolves to | Whole-string only? |
+|---|---|---|
+| `{{project_id}}` | active project's UUID | No |
+| `{{module_id}}` | active module's id | No |
+| `{{value}}` | the control's incoming value | No |
+| `{{control:<id>}}` | another control's persisted value | No |
+| `{{events_paths_for:<id>}}` (v0.2.27) | array of per-project log paths | **Yes — embedded form rejected** |
+
+#### Error cases the dispatcher surfaces with clear messages
+
+- Token used but module has no `runtime.log_path_template` → `"events_paths_for: ... referenced but module declares no runtime.log_path_template"`.
+- Referenced control id not in the manifest or its value is missing → `"events_paths_for: control '<id>' has no value"`.
+- Control's value isn't an array → `"events_paths_for: control '<id>' value must be an array, got <type>"`.
+- An array element isn't a string → `"events_paths_for: control '<id>' array element <N> is not a string"`.
+- A UUID doesn't resolve to a project in the DB → `"events_paths_for: project UUID '<uuid>' not found in DB"`.
+
+All errors surface at dispatch time with the control_id / array index / UUID named — operators can copy-paste the message into a bug report and the cause is immediately legible.
+
 ## How to wire a NEW paid module's config tab (practical recipe)
 
 **Author POV: I want the launcher to show my module's settings without rebuilding the launcher.**
