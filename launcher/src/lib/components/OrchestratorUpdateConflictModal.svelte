@@ -189,50 +189,52 @@
 </div>
 
 <style>
+  /* v0.2.24.1 cosmetic pass: VCT color tokens (matches divergence modal). */
   .cfl-backdrop {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.7);
+    background: rgba(5, 11, 31, 0.82); /* --color-bg at 82% */
     display: flex;
     align-items: center;
     justify-content: center;
     z-index: 350;
   }
   .cfl-modal {
-    background: #1a1a24;
-    border: 1px solid rgba(255, 79, 160, 0.4);
-    border-radius: 8px;
+    background: var(--color-bg2);
+    border: 1px solid rgba(255, 79, 160, 0.4); /* keep pink accent for conflict severity */
+    border-radius: var(--radius-card, 12px);
     padding: 20px;
     max-width: 640px;
     width: 92%;
-    max-height: 80vh;
+    max-height: 90vh;
     overflow-y: auto;
-    color: #e8e8ee;
+    color: var(--color-text);
   }
   .cfl-modal h3 {
     margin: 0 0 12px;
     font-size: 14px;
-    color: #ff8fc0;
+    color: var(--color-pink);
   }
   .cfl-modal p, .cfl-modal ol, .cfl-modal li {
     font-size: 12px;
     line-height: 1.6;
-    color: #ccc;
+    color: var(--color-mid);
   }
   .cfl-modal p { margin: 0 0 10px; }
   .cfl-modal ol { margin: 0 0 14px; padding-left: 20px; }
   .cfl-modal ol li { margin-bottom: 6px; }
   .cfl-modal code {
-    background: rgba(255, 255, 255, 0.06);
+    background: var(--color-card);
     padding: 1px 4px;
     border-radius: 3px;
     font-size: 11px;
+    color: var(--color-text);
   }
-  .cfl-hint { color: #aaa; }
+  .cfl-hint { color: var(--color-mid); }
 
   .cfl-files {
     background: rgba(255, 79, 160, 0.06);
-    border: 1px solid rgba(255, 79, 160, 0.18);
+    border: 1px solid rgba(255, 79, 160, 0.2);
     border-radius: 4px;
     padding: 10px 12px;
     margin: 12px 0;
@@ -240,7 +242,7 @@
   .cfl-files-title {
     font-size: 11px;
     text-transform: uppercase;
-    color: #ff8fc0;
+    color: var(--color-pink);
     letter-spacing: 0.06em;
     margin-bottom: 6px;
   }
@@ -251,7 +253,7 @@
   }
   .cfl-files li {
     padding: 4px 0;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+    border-bottom: 1px solid var(--color-border);
     display: flex;
     justify-content: space-between;
     align-items: center;
@@ -260,13 +262,13 @@
   }
   .cfl-files li:last-child { border-bottom: none; }
   .cfl-files code {
-    color: #ddd;
+    color: var(--color-text);
     font-size: 11px;
   }
-  .cfl-empty { margin: 0; color: #888; font-size: 11px; }
+  .cfl-empty { margin: 0; color: var(--color-mid); font-size: 11px; }
   .cfl-guidance {
     font-size: 10px;
-    color: #888;
+    color: var(--color-mid);
     font-style: italic;
   }
 
@@ -275,16 +277,16 @@
     background: rgba(255, 79, 160, 0.12);
     border: 1px solid rgba(255, 79, 160, 0.3);
     border-radius: 4px;
-    color: #ff8fc0;
+    color: var(--color-pink);
     font-size: 11px;
     margin: 10px 0;
   }
   .cfl-ok {
     padding: 8px 10px;
-    background: rgba(60, 180, 100, 0.1);
-    border: 1px solid rgba(60, 180, 100, 0.3);
+    background: rgba(0, 191, 166, 0.1);  /* --color-teal at 10% */
+    border: 1px solid rgba(0, 191, 166, 0.3);
     border-radius: 4px;
-    color: #7fdca0;
+    color: var(--color-teal);
     font-size: 11px;
     margin: 10px 0;
   }
@@ -292,22 +294,24 @@
   .cfl-stderr {
     margin: 12px 0;
     font-size: 11px;
-    color: #888;
+    color: var(--color-mid);
   }
   .cfl-stderr summary {
     cursor: pointer;
-    color: #aaa;
+    color: var(--color-mid);
     padding: 4px 0;
   }
+  .cfl-stderr summary:hover { color: var(--color-text); }
   .cfl-stderr pre {
-    background: rgba(0, 0, 0, 0.3);
+    background: var(--color-bg);
     padding: 8px;
     border-radius: 4px;
     font-size: 10px;
-    color: #aaa;
+    color: var(--color-mid);
     overflow-x: auto;
     max-height: 140px;
     margin: 4px 0 0;
+    border: 1px solid var(--color-border);
   }
 
   .cfl-actions {
@@ -317,20 +321,24 @@
     margin-top: 14px;
   }
   .cfl-btn {
-    background: rgba(255, 255, 255, 0.06);
-    border: 1px solid rgba(255, 255, 255, 0.12);
-    color: inherit;
+    background: var(--color-card);
+    border: 1px solid var(--color-border);
+    color: var(--color-text);
     padding: 6px 14px;
     border-radius: 4px;
     cursor: pointer;
     font-size: 12px;
+    font-family: inherit;
   }
-  .cfl-btn:hover:not(:disabled) { background: rgba(255, 255, 255, 0.1); }
+  .cfl-btn:hover:not(:disabled) { background: rgba(255, 255, 255, 0.08); border-color: rgba(255, 255, 255, 0.18); }
   .cfl-btn:disabled { opacity: 0.4; cursor: not-allowed; }
   .cfl-btn-warn {
-    background: rgba(255, 79, 160, 0.15);
-    border-color: rgba(255, 79, 160, 0.4);
-    color: #ff8fc0;
+    background: rgba(255, 79, 160, 0.18);
+    border-color: rgba(255, 79, 160, 0.45);
+    color: var(--color-text);
   }
-  .cfl-btn-warn:hover:not(:disabled) { background: rgba(255, 79, 160, 0.25); }
+  .cfl-btn-warn:hover:not(:disabled) {
+    background: rgba(255, 79, 160, 0.3);
+    border-color: var(--color-pink);
+  }
 </style>

@@ -193,7 +193,7 @@
     // (previously surfaced as a duplicate "Orchestrator Core" sidebar
     // entry). Suppressed for normal projects.
     ...(isOrchestratorProject
-      ? [{ id: 'orchestrator_core' as const, label: 'Orchestrator core' }]
+      ? [{ id: 'orchestrator_core' as const, label: 'Clone integrity' }]
       : []),
   ]);
 </script>

@@ -233,8 +233,22 @@ fn resolve_python_for_vco_lib() -> Option<PathBuf> {
 /// Spawn `python -m vco_lib.embedding_service discover` and parse JSON.
 /// Errors flow into the catalog's `errors` field (where possible) or up
 /// to the caller as `Err(String)` when the subprocess itself can't start.
+///
+/// v0.2.24.1 (A0ter): `vco_lib` lives at the orchestrator CLONE root,
+/// not inside `.venv/lib/site-packages` (it's an in-tree namespace
+/// package, never `pip install`-ed). To make `python -m vco_lib.X`
+/// resolve, the subprocess must run with `cwd=<clone_root>` so
+/// Python's implicit-namespace-package lookup picks up `vco_lib/`
+/// from the cwd. Pre-v0.2.24.1 the subprocess inherited the
+/// launcher's cwd (typically `/` on Linux + `<launcher_dir>` on
+/// Windows) → `ModuleNotFoundError: No module named 'vco_lib'` ->
+/// the per-project KG/Codegraph tab showed a permanent warning
+/// banner + "Loading..." dropdowns. Resolves the clone root via
+/// `installer::resolve_install_root_sync(&db)` (the same DB-cached
+/// helper the manifest scanners use post-v0.2.23.1).
 async fn run_discover(
     project_root: Option<PathBuf>,
+    install_root: Option<PathBuf>,
 ) -> Result<EmbeddingCatalog, String> {
     let python = resolve_python_for_vco_lib()
         .ok_or_else(|| "no python interpreter found for vco_lib".to_string())?;
@@ -246,6 +260,17 @@ async fn run_discover(
         .arg("--json");
     if let Some(root) = project_root {
         cmd.arg("--project-root").arg(root.as_os_str());
+    }
+    // v0.2.24.1: cwd MUST be the orchestrator clone root so
+    // `python -m vco_lib.embedding_service` finds the in-tree
+    // namespace package. Best-effort: if no clone root is
+    // discoverable, fall through with no cwd set — the subprocess
+    // will still fail with ModuleNotFoundError but at least the
+    // launcher doesn't crash, and the failing-by-default state
+    // matches the pre-v0.2.24.1 behaviour rather than degrading
+    // further.
+    if let Some(root) = install_root {
+        cmd.current_dir(&root);
     }
     // The subprocess doesn't need a TTY or inherited stdin; null it so the
     // python side gets EOF immediately on read.
@@ -320,7 +345,14 @@ pub async fn get_embedding_catalog(
         return Ok(cached);
     }
 
-    let catalog = run_discover(project_root).await?;
+    // v0.2.24.1 (A0ter): resolve the orchestrator clone root via the
+    // same DB-cached helper the manifest scanners use post-v0.2.23.1.
+    // Passed to run_discover as the subprocess cwd so `python -m
+    // vco_lib.embedding_service` finds the in-tree namespace package
+    // (vco_lib/ lives at clone root, never pip-installed).
+    let install_root = crate::commands::installer::resolve_install_root_sync(&db);
+
+    let catalog = run_discover(project_root, install_root).await?;
     cache_put(cache_key, catalog.clone());
     Ok(catalog)
 }

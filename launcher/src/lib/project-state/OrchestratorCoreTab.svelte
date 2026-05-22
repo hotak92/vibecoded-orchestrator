@@ -62,7 +62,7 @@
 
   async function load() {
     if (!tauriAvailable()) {
-      loadError = 'The Orchestrator core tab requires the desktop launcher.';
+      loadError = 'The Clone integrity tab requires the desktop launcher.';
       loading = false;
       return;
     }
@@ -94,7 +94,7 @@
     <p class="loading">Loading…</p>
   {:else if loadError}
     <div class="error-card">
-      <h2>Unable to load the Orchestrator core controls</h2>
+      <h2>Unable to load the Clone integrity controls</h2>
       <p>{loadError}</p>
     </div>
   {:else if configTab}

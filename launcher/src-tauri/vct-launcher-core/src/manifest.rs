@@ -1372,13 +1372,13 @@ mod tests {
     /// get_module_nav_items` uses — proving the schema generalizes to
     /// the always-installed core, not just paid modules.
     ///
-    /// Pinned assertions:
-    ///   * title == "Orchestrator core" (load-bearing — the Sidebar
-    ///     surfaces this as the nav label)
-    ///   * 3 sections (KG / Code Graph / Diagnostics)
-    ///   * at least one button declares a `confirm` prompt (rebuild
-    ///     and reanalyze both prompt — losing those would let a single
-    ///     misclick run a 30s job)
+    /// Pinned assertions (post v0.2.24.1 A0bis rename):
+    ///   * title == "Clone integrity" (load-bearing — the Sidebar
+    ///     surfaces this as the nav label). Renamed from "Orchestrator
+    ///     core" in v0.2.24.1 per honest scope audit: per-project
+    ///     actions moved out (duplicates with KG/Codegraph tab);
+    ///     Diagnostics deferred to a Services-tab follow-up.
+    ///   * 2 sections (Clone discovery / Clone manifest)
     ///   * the orchestrator's slim historical fields (components,
     ///     bundled_secrets) coexist with the full ModuleManifest fields
     ///     without conflict (serde is permissive on unknown fields)
@@ -1426,22 +1426,18 @@ mod tests {
         );
         let tab = gui.config_tab.expect("must have config_tab");
 
-        assert_eq!(tab.title, "Orchestrator core", "title pinned (Sidebar nav label)");
+        assert_eq!(tab.title, "Clone integrity", "title pinned (Sidebar nav label, renamed in v0.2.24.1 A0bis)");
         assert_eq!(tab.icon.as_deref(), Some("box"), "icon pinned");
-        assert_eq!(tab.sections.len(), 3, "expected 3 sections (KG / Code Graph / Diagnostics)");
+        assert_eq!(tab.sections.len(), 2, "expected 2 sections (Clone discovery / Clone manifest)");
 
-        // Spot-check that at least one button has a confirm prompt.
-        let mut confirm_button_count = 0;
+        // Spot-check button + info structure post-A0bis (no confirm
+        // prompts needed — both buttons are read-only diagnostics).
         let mut total_button_count = 0;
         let mut total_info_count = 0;
         for section in &tab.sections {
             for control in &section.controls {
                 match control {
-                    ConfigControl::Button { confirm: Some(_), .. } => {
-                        confirm_button_count += 1;
-                        total_button_count += 1;
-                    }
-                    ConfigControl::Button { confirm: None, .. } => {
+                    ConfigControl::Button { .. } => {
                         total_button_count += 1;
                     }
                     ConfigControl::Info { .. } => {
@@ -1451,17 +1447,13 @@ mod tests {
                 }
             }
         }
-        assert!(
-            confirm_button_count >= 1,
-            "at least one button must carry a confirm prompt (rebuild/reanalyze are 30s ops)"
-        );
         assert_eq!(
-            total_button_count, 6,
-            "expected 6 buttons across the tab (2 KG + 2 Code Graph + 2 Diagnostics)"
+            total_button_count, 2,
+            "expected 2 buttons (Re-detect orchestrator root + Validate clone manifest)"
         );
         assert!(
-            total_info_count >= 3,
-            "expected at least 3 info banners (one per section header)"
+            total_info_count >= 2,
+            "expected at least 2 info banners (one per section header)"
         );
 
         // v0.2.23 F2 (2026-05-21): orchestrator-core opts out of the

@@ -555,6 +555,180 @@ pub async fn orchestrator_open_logs() -> Result<(), String> {
     Ok(())
 }
 
+// ─── v0.2.24.1: Clone integrity commands (A0bis) ─────────────────────────
+//
+// The "Clone integrity" tab (renamed from "Orchestrator core" in
+// v0.2.24.1 per A0bis design conclusion) hosts the 2 features that
+// are genuinely root-clone-only:
+//   - Re-detect orchestrator root: re-runs find_orchestrator_manifest
+//     when the cached install_path is stale (clone dir renamed, moved,
+//     or first-install detection picked the wrong candidate).
+//   - Validate clone manifest: parses vct-module.json at clone root +
+//     surfaces schema errors. When malformed, the launcher silently
+//     skips it and module-contributed tabs disappear — this command
+//     gives the user a single-click diagnostic.
+//
+// Both commands are safe to run repeatedly; neither mutates user
+// state.
+
+/// Result of `redetect_orchestrator_root`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RedetectOrchestratorRootResult {
+    /// True when a manifest was found (and the cached `launcher.install_path`
+    /// was refreshed to match).
+    pub success: bool,
+    /// Discovered clone-root path, when `success == true`.
+    pub clone_root: Option<String>,
+    /// User-facing message (success summary OR diagnostic when the walk
+    /// found nothing).
+    pub message: String,
+}
+
+/// Re-runs the `current_exe()` walk-up to find a clone-root with
+/// `vct-module.json + install.py + CLAUDE.md` markers and updates the
+/// `launcher.install_path` app_state entry on success. Use when the
+/// launcher's cached install_path is stale (e.g., user renamed the
+/// clone directory after first install, or copied the binary into a
+/// different clone).
+///
+/// Safe to run repeatedly — never destructive. Returns a diagnostic
+/// when no clone is reachable from the current binary's location.
+#[command]
+pub async fn redetect_orchestrator_root(
+    db: State<'_, crate::db::Db>,
+) -> Result<RedetectOrchestratorRootResult, String> {
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("current_exe failed: {}", e))?;
+    let exe_display = exe.display().to_string();
+
+    // walk_for_install_markers is the canonical exe-walk discovery.
+    // Re-exposed via the installer module for command-side reuse.
+    let found = crate::commands::installer::walk_for_install_markers();
+    match found {
+        Some(path) => {
+            let path_str = path.to_string_lossy().to_string();
+            // Update the sticky cache so future synchronous resolvers
+            // (e.g. manifest_scan_paths) pick up the new path.
+            if let Err(e) = db.app_state_set(
+                crate::commands::installer::APP_STATE_KEY_INSTALL_PATH,
+                &path_str,
+            ) {
+                return Err(format!(
+                    "discovered clone at {} but failed to cache the path \
+                     in app_state: {}. The discovery is correct; manually \
+                     persisting via `vct app-state set launcher.install_path \
+                     {}` is the workaround.",
+                    path_str, e, path_str,
+                ));
+            }
+            Ok(RedetectOrchestratorRootResult {
+                success: true,
+                clone_root: Some(path_str.clone()),
+                message: format!(
+                    "Discovered clone-root at {}. Cached as launcher.install_path.",
+                    path_str
+                ),
+            })
+        }
+        None => Ok(RedetectOrchestratorRootResult {
+            success: false,
+            clone_root: None,
+            message: format!(
+                "No orchestrator clone reachable from the launcher binary's location ({}). \
+                 The launcher walks up 8 directories looking for the marker pair \
+                 (install.py + CLAUDE.md). If your clone is elsewhere, move the launcher \
+                 binary into <clone>/launcher/dist/<target>/ — or set \
+                 launcher.install_path manually via `vct app-state set launcher.install_path <path>`.",
+                exe_display
+            ),
+        }),
+    }
+}
+
+/// Result of `validate_clone_manifest`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ValidateCloneManifestResult {
+    /// True iff the manifest at clone-root parsed AND the version +
+    /// description fields look sane.
+    pub valid: bool,
+    /// Resolved path of the vct-module.json that was inspected, when found.
+    pub manifest_path: Option<String>,
+    /// On invalid: human-readable diagnostic (parse error, missing field,
+    /// or "no manifest found"). On valid: short summary of the version +
+    /// component count.
+    pub message: String,
+}
+
+/// Parses the orchestrator-root `vct-module.json` and surfaces any
+/// schema errors. When malformed, the launcher's `read_orchestrator_manifest`
+/// silently treats the orchestrator as a non-module project, which is
+/// confusing because the sidebar loses any module-contributed tabs
+/// (including this one). This command makes the failure explicit so
+/// the user knows what to fix.
+#[command]
+pub async fn validate_clone_manifest(
+    db: State<'_, crate::db::Db>,
+) -> Result<ValidateCloneManifestResult, String> {
+    let install_root = crate::commands::installer::resolve_install_root_sync(&db);
+    let manifest_path = match install_root {
+        Some(root) => root.join("vct-module.json"),
+        None => {
+            return Ok(ValidateCloneManifestResult {
+                valid: false,
+                manifest_path: None,
+                message: "No orchestrator clone is registered. Run 'Re-detect orchestrator root' first.".to_string(),
+            });
+        }
+    };
+
+    if !manifest_path.exists() {
+        return Ok(ValidateCloneManifestResult {
+            valid: false,
+            manifest_path: Some(manifest_path.display().to_string()),
+            message: format!(
+                "vct-module.json not found at {}. The clone-root marker pair (install.py + CLAUDE.md) was found but the manifest is missing — this clone may be from before v0.2.20 (when the orchestrator-core manifest was introduced) or it was deleted by hand.",
+                manifest_path.display()
+            ),
+        });
+    }
+
+    let raw = match std::fs::read_to_string(&manifest_path) {
+        Ok(s) => s,
+        Err(e) => {
+            return Ok(ValidateCloneManifestResult {
+                valid: false,
+                manifest_path: Some(manifest_path.display().to_string()),
+                message: format!("Failed to read {}: {}", manifest_path.display(), e),
+            });
+        }
+    };
+
+    match serde_json::from_str::<
+        vct_launcher_core::orchestrator_manifest::OrchestratorManifest,
+    >(&raw)
+    {
+        Ok(m) => Ok(ValidateCloneManifestResult {
+            valid: true,
+            manifest_path: Some(manifest_path.display().to_string()),
+            message: format!(
+                "Valid: orchestrator core v{} ({}), {} component(s) declared.",
+                m.version,
+                m.description.chars().take(80).collect::<String>(),
+                m.components.len(),
+            ),
+        }),
+        Err(e) => Ok(ValidateCloneManifestResult {
+            valid: false,
+            manifest_path: Some(manifest_path.display().to_string()),
+            message: format!(
+                "Parse error in {}: {}. The launcher's catalog renderer will silently skip this clone until the JSON is fixed; module-contributed tabs (including this one) will be absent from the sidebar.",
+                manifest_path.display(),
+                e
+            ),
+        }),
+    }
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]

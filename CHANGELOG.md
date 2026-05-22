@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.24.1] — 2026-05-22
+
+Follow-up patch for v0.2.24. Same Cargo `version = "0.2.24"` pins
+(SemVer doesn't allow 4-segment versions); the `v0.2.24.1` tag denotes
+the point-release on top of v0.2.24, matching the v0.2.23.1 precedent.
+
+### Fixed
+
+- **`fix(launcher)` embedding-catalog Tauri command `ModuleNotFoundError: vco_lib`** (A0ter). The per-project Settings → KG/Codegraph tab previously showed a permanent warning banner ("discover exit 1: ... No module named 'vco_lib'") and "Loading…" dropdowns stuck indefinitely. Root cause: `commands::embedding_catalog::run_discover` spawned `python -m vco_lib.embedding_service discover` without setting `cwd` to the orchestrator clone root, so Python's implicit-namespace-package resolution couldn't find the in-tree `vco_lib/` directory. Fix: resolve the clone root via the existing DB-cached `installer::resolve_install_root_sync(&db)` helper (the same pattern the v0.2.23.1 manifest scanners use) and pass it as `cwd`. Best-effort: if no clone root is discoverable, falls through with no cwd set — matches the pre-v0.2.24.1 failure mode rather than degrading further.
+
+### Changed
+
+- **`feat(launcher)` Orchestrator Core tab → "Clone integrity"** (A0bis). The Orchestrator Core tab (shipped in v0.2.20, fixed in v0.2.23.1) previously hosted per-project actions (Rebuild KG / Check duplicates / Re-analyze code / Prune stale codegraph) that DUPLICATED controls already on the KG/Codegraph tab, plus a Diagnostics section (health-probe + open-logs). Honest scope audit found only 2 features that are genuinely root-clone-only:
+  - **Re-detect orchestrator root** — re-runs the launcher's `current_exe()`-walk discovery + refreshes the cached `launcher.install_path` app_state entry. Use when the launcher's cached install path is stale (clone dir renamed, moved, or copied to a different location).
+  - **Validate clone manifest** — parses `vct-module.json` at the active clone root and surfaces schema errors. The launcher's catalog renderer silently skips a malformed manifest (module-contributed tabs disappear); this command makes the failure explicit.
+
+  Tab renamed `"Orchestrator core"` → `"Clone integrity"` to reflect the new scope. Per-project actions removed from the manifest (duplicates with KG/Codegraph tab). Diagnostics deferred to a Services-tab follow-up; the underlying `orchestrator_health_check` + `orchestrator_open_logs` Tauri commands stay registered. Manifest test (`orchestrator_core_manifest_with_gui_tab_deserializes`) updated to pin the new 2-section / 2-button shape.
+
+- **`feat(launcher)` B4 modal cosmetic pass** — `OrchestratorUpdateDivergenceModal.svelte` + `OrchestratorUpdateConflictModal.svelte` now use VCT color tokens (`--color-bg2`, `--color-text`, `--color-mid`, `--color-teal`, `--color-pink`, `--color-card`, `--color-border`) instead of hardcoded hex values (`#1a1a24`, `#e8e8ee`, `#ccc`, etc.). Fix for the header-truncation symptom (modal could overflow viewport when the diverged-files `<details>` was expanded): added `max-height: 90vh` + `overflow-y: auto` to the modal containers. Primary action button switched from generic blue to `--color-teal`; pink accent retained for the conflict modal (conflict severity signalling).
+
+### Migration notes
+
+- Existing projects with the "Orchestrator Core" tab visible in per-project Settings will see it renamed to "Clone integrity" on next launcher restart. The tab's contents change from 6 buttons + 3 sections to 2 buttons + 2 sections — the per-project actions removed live in the KG/Codegraph tab (same `Re-build code graph` / `Re-sync KG` / `Re-build KG summaries` controls); the Diagnostics health-probe + log-dir actions are still available via the orchestrator-health-check + orchestrator-open-logs Tauri commands (a Services-tab UI for them is tracked as a follow-up for v0.2.25).
+
+- The embedding-catalog dropdowns ("Embedding model" in both Knowledge Graph + Code Graph sub-sections of the KG/Codegraph tab) will populate correctly on next launcher restart. No user action required — the fix is launcher-side only.
+
+- No DB schema changes. No template propagation needed (per-project install-bundle is unaffected).
+
 ## [0.2.24] — 2026-05-22
 
 > CHANGELOG drift note: 0.2.21, 0.2.22, 0.2.23 ship in git history but

@@ -51,101 +51,49 @@
       "description": "OpenAI API key for the EmbeddingService. Set via OnboardingWizard OR Preferences → Special Secrets. Resolved by hub for every project; consumed by vco_lib/embedding_service.py when ACTIVE_EMBEDDING=openai or as multi-slot fallback."
     }
   ],
-  "_gui_doc": "v0.2.20 (Stream 2 follow-up, 2026-05-19): the orchestrator core uses the same `gui.config_tab` schema as paid modules — validates that the schema generalizes beyond paid surfaces. The Tauri commands referenced in `action`/`on_change` fields live in `launcher/src-tauri/src/commands/orchestrator_core.rs`. Tooltip strings are user-facing (non-tech audience); keep them mouseover-actionable, not vague. v0.2.23 F2 (2026-05-21): `show_in_sidebar: false` — the orchestrator-core controls are now folded into the per-project Settings page (rendered when the active project is the orchestrator-root row). Keeping the standalone /modules/orchestrator/config sidebar entry would duplicate the surface — the user explicitly asked for one consolidated place. The route itself is left intact for any deep links that may exist; the page renders the same ModuleConfigTab so direct navigation still works.",
+  "_gui_doc": "v0.2.20 (Stream 2 follow-up, 2026-05-19): the orchestrator core uses the same `gui.config_tab` schema as paid modules — validates that the schema generalizes beyond paid surfaces. The Tauri commands referenced in `action`/`on_change` fields live in `launcher/src-tauri/src/commands/orchestrator_core.rs`. Tooltip strings are user-facing (non-tech audience); keep them mouseover-actionable, not vague. v0.2.23 F2 (2026-05-21): `show_in_sidebar: false` — the orchestrator-core controls are folded into the per-project Settings page (rendered when the active project is the orchestrator-root row). v0.2.24.1 A0bis (2026-05-22): tab renamed 'Orchestrator core' → 'Clone integrity'. Per-project actions (Rebuild KG / Check duplicates / Re-analyze code / Prune stale codegraph) were removed because they duplicated controls already on the KG/Codegraph tab. Diagnostics section (health-probe + open-logs) was deferred to a follow-up move to the Services left-column tab; the underlying Tauri commands stay registered. The tab now hosts ONLY root-clone-specific affordances: Re-detect orchestrator root + Validate clone manifest (the 2 features that don't naturally live anywhere else per the honest scope audit).",
   "gui": {
     "config_tab": {
-      "title": "Orchestrator core",
+      "title": "Clone integrity",
       "icon": "box",
-      "description": "Manage the always-installed KG + Code Graph services. For project-specific assignments use the Identity tab.",
+      "description": "Root-clone-only affordances. For per-project KG / Code Graph rebuilds use the KG/Codegraph tab; for service health use the Services tab.",
       "show_in_sidebar": false,
       "sections": [
         {
-          "title": "Knowledge Graph",
+          "title": "Clone discovery",
           "collapsible": false,
           "controls": [
             {
               "kind": "info",
-              "id": "kg_intro",
-              "text": "Per-project KG and shared KG. Stored in Weaviate. Auto-synced on file edits via hooks.",
+              "id": "clone_discovery_intro",
+              "text": "The launcher tracks the active orchestrator clone via `launcher.install_path` (cached in launcher.db's `app_state` table). If you moved the clone, renamed its directory, or copied the launcher into a different clone, the cached path can go stale — manifest scanners + the orchestrator-update flow then point at the wrong tree.",
               "variant": "info"
             },
             {
               "kind": "button",
-              "id": "kg_rebuild_current_project",
-              "label": "Rebuild this project's KG",
-              "tooltip": "Re-syncs all `knowledge/*.md` files in the currently-selected project into Weaviate. Use when KG search results look stale or files were edited outside Claude Code. ~10s per 100 nodes.",
-              "action": "kg_rebuild_current_project",
-              "confirm": "Rebuild the KG for the currently-selected project? Existing nodes are upserted (not destructive)."
-            },
-            {
-              "kind": "button",
-              "id": "kg_check_duplicates",
-              "label": "Check for duplicate KG nodes",
-              "tooltip": "Runs a near-duplicate scan across the current project's KG (cosine ≥0.95). Surfaces them in a modal so you can merge/delete by hand.",
-              "action": "kg_check_duplicates"
-            },
-            {
-              "kind": "info",
-              "id": "kg_tier_note",
-              "text": "Tip: KG search results carry a `score` (0..1) and a `tier` (`summary`/`single_chunk`/`three_chunks`/`full`) based on relevance. Tunable via `KG_TIER_*` env vars in Preferences.",
-              "variant": "info"
+              "id": "redetect_orchestrator_root",
+              "label": "Re-detect orchestrator root",
+              "tooltip": "Re-runs the launcher binary's exe-walk discovery (walks up 8 directories looking for install.py + CLAUDE.md markers). On success, refreshes the cached launcher.install_path. Safe to run repeatedly; never destructive.",
+              "action": "redetect_orchestrator_root"
             }
           ]
         },
         {
-          "title": "Code Graph",
-          "collapsible": true,
-          "initially_collapsed": false,
+          "title": "Clone manifest",
+          "collapsible": false,
           "controls": [
             {
               "kind": "info",
-              "id": "codegraph_intro",
-              "text": "AST-based code entity index (modules, classes, functions, APIs, cross-service interactions). Powers `search_code_graph` MCP.",
+              "id": "manifest_intro",
+              "text": "The orchestrator clone has its own `vct-module.json` at clone root that declares the schema for this tab + the orchestrator core's bundled secrets. When the JSON is malformed (e.g. hand-edited and broken), the launcher silently skips it and module-contributed tabs disappear from the sidebar.",
               "variant": "info"
             },
             {
               "kind": "button",
-              "id": "code_graph_reanalyze_current",
-              "label": "Re-analyze this project's code",
-              "tooltip": "Walks the project's source tree and rebuilds the code graph. Use when files were renamed/deleted outside Claude Code, or when adding a new language analyzer. ~30s per 1k LOC. Incremental: only re-analyzes changed files.",
-              "action": "code_graph_reanalyze_current",
-              "confirm": "Re-analyze the currently-selected project's code? Stale entities for deleted files are pruned."
-            },
-            {
-              "kind": "button",
-              "id": "code_graph_prune_stale",
-              "label": "Prune stale code-graph entries",
-              "tooltip": "Deletes code-graph nodes for files that no longer exist on disk. Useful after large refactors. Non-destructive: re-running `--analyze` recreates them if the files come back.",
-              "action": "code_graph_prune_stale",
-              "variant": "secondary"
-            }
-          ]
-        },
-        {
-          "title": "Diagnostics",
-          "collapsible": true,
-          "initially_collapsed": true,
-          "controls": [
-            {
-              "kind": "info",
-              "id": "diag_intro",
-              "text": "Service health, KG/CodeGraph collection sizes, embedding-backend status.",
-              "variant": "info"
-            },
-            {
-              "kind": "button",
-              "id": "orchestrator_health_check",
-              "label": "Run health check",
-              "tooltip": "Probes Weaviate, Ollama, the code-embedding service, and verifies every project's KG/CodeGraph collections exist. Outputs a per-service status modal. ~3s.",
-              "action": "orchestrator_health_check"
-            },
-            {
-              "kind": "button",
-              "id": "orchestrator_open_logs",
-              "label": "Open log directory",
-              "tooltip": "Reveals `~/.claude/logs/` in your file manager. Useful for grepping recent hook activity or KG-sync runs.",
-              "action": "orchestrator_open_logs",
-              "variant": "secondary"
+              "id": "validate_clone_manifest",
+              "label": "Validate clone manifest",
+              "tooltip": "Parses vct-module.json at the active clone root and surfaces any schema errors. Use when the sidebar is missing module-contributed tabs or when the launcher's bundled-secrets resolver returns empty unexpectedly.",
+              "action": "validate_clone_manifest"
             }
           ]
         }

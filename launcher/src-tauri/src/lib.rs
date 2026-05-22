@@ -989,6 +989,12 @@ pub fn run() {
             commands::orchestrator_core::code_graph_prune_stale,
             commands::orchestrator_core::orchestrator_health_check,
             commands::orchestrator_core::orchestrator_open_logs,
+            // v0.2.24.1 (A0bis): "Clone integrity" tab — root-clone-only
+            // affordances. Re-detect orchestrator root + Validate clone
+            // manifest are the 2 features that don't naturally live in
+            // per-project tabs or global preferences.
+            commands::orchestrator_core::redetect_orchestrator_root,
+            commands::orchestrator_core::validate_clone_manifest,
             // RL Reranker per-project settings (Stream 2 / 2026-05-19).
             // Backs the schema-rendered controls declared in
             // paid-modules/vct-rl-reranker/vct-module.json's

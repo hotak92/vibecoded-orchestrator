@@ -215,31 +215,41 @@
 {/if}
 
 <style>
+  /* v0.2.24.1 cosmetic pass: VCT color tokens + max-height to fix the
+   * header-truncation symptom (modal could overflow viewport when the
+   * <details> diverged-files list was expanded). All static colors now
+   * resolve to `--color-*` tokens defined in app.css. */
   .dvg-backdrop {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.6);
+    background: rgba(5, 11, 31, 0.72); /* var(--color-bg) at 72% */
     display: flex;
     align-items: center;
     justify-content: center;
     z-index: 300;
   }
   .dvg-modal {
-    background: #1a1a24;
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    border-radius: 8px;
+    background: var(--color-bg2);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-card, 12px);
     padding: 20px;
     max-width: 560px;
     width: 92%;
-    color: #e8e8ee;
+    /* Fix header-truncation: cap modal height + scroll inside the modal
+     * when the expanded diverged-files list pushes content past the
+     * viewport. */
+    max-height: 90vh;
+    overflow-y: auto;
+    color: var(--color-text);
   }
-  .dvg-modal h3 { margin: 0 0 12px; font-size: 14px; }
-  .dvg-modal p { font-size: 12px; line-height: 1.6; margin: 0 0 10px; color: #ccc; }
+  .dvg-modal h3 { margin: 0 0 12px; font-size: 14px; color: var(--color-teal); }
+  .dvg-modal p { font-size: 12px; line-height: 1.6; margin: 0 0 10px; color: var(--color-mid); }
   .dvg-modal code {
-    background: rgba(255, 255, 255, 0.06);
+    background: var(--color-card);
     padding: 1px 4px;
     border-radius: 3px;
     font-size: 11px;
+    color: var(--color-text);
   }
 
   .dvg-meta {
@@ -249,37 +259,37 @@
     font-size: 12px;
     margin: 12px 0;
   }
-  .dvg-meta dt { color: #888; }
-  .dvg-meta dd { margin: 0; color: #ccc; }
+  .dvg-meta dt { color: var(--color-mid); }
+  .dvg-meta dd { margin: 0; color: var(--color-text); }
 
   .dvg-files {
     margin: 12px 0;
     font-size: 12px;
-    color: #ccc;
+    color: var(--color-mid);
   }
   .dvg-files summary {
     cursor: pointer;
-    color: #aaa;
+    color: var(--color-mid);
     padding: 4px 0;
   }
-  .dvg-files summary:hover { color: #ccc; }
+  .dvg-files summary:hover { color: var(--color-text); }
   .dvg-files ul {
     list-style: none;
     padding: 4px 0 4px 12px;
     margin: 0;
     max-height: 160px;
     overflow-y: auto;
-    border-left: 1px solid rgba(255, 255, 255, 0.08);
+    border-left: 1px solid var(--color-border);
   }
-  .dvg-files li { padding: 2px 0; }
+  .dvg-files li { padding: 2px 0; color: var(--color-text); }
 
   .dvg-error {
     margin: 12px 0;
     padding: 8px 10px;
-    background: rgba(255, 79, 160, 0.1);
-    border: 1px solid rgba(255, 79, 160, 0.25);
+    background: rgba(255, 79, 160, 0.1);  /* --color-pink at 10% */
+    border: 1px solid rgba(255, 79, 160, 0.3);
     border-radius: 4px;
-    color: #ff8fc0;
+    color: var(--color-pink);
     font-size: 11px;
     line-height: 1.5;
   }
@@ -292,19 +302,24 @@
     flex-wrap: wrap;
   }
   .dvg-btn {
-    background: rgba(255, 255, 255, 0.06);
-    border: 1px solid rgba(255, 255, 255, 0.12);
-    color: inherit;
+    background: var(--color-card);
+    border: 1px solid var(--color-border);
+    color: var(--color-text);
     padding: 6px 14px;
     border-radius: 4px;
     cursor: pointer;
     font-size: 12px;
+    font-family: inherit;
   }
-  .dvg-btn:hover:not(:disabled) { background: rgba(255, 255, 255, 0.1); }
+  .dvg-btn:hover:not(:disabled) { background: rgba(255, 255, 255, 0.08); border-color: rgba(255, 255, 255, 0.18); }
   .dvg-btn:disabled { opacity: 0.4; cursor: not-allowed; }
   .dvg-btn-primary {
-    background: rgba(80, 140, 240, 0.2);
-    border-color: rgba(80, 140, 240, 0.5);
+    background: rgba(0, 191, 166, 0.2);  /* --color-teal at 20% */
+    border-color: rgba(0, 191, 166, 0.5);
+    color: var(--color-text);
   }
-  .dvg-btn-primary:hover:not(:disabled) { background: rgba(80, 140, 240, 0.3); }
+  .dvg-btn-primary:hover:not(:disabled) {
+    background: rgba(0, 191, 166, 0.32);
+    border-color: var(--color-teal);
+  }
 </style>
