@@ -27,14 +27,26 @@
 //!           (git's 3-way text merge primitive — ships with every
 //!           git install, no extra deps).
 //!         - Clean merge → writes merged bytes back to the working tree
-//!           and stages the file. The subsequent `git pull` sees the
-//!           file as "already correct" and proceeds.
+//!           and `git add`s the file. The CALLER then `git commit`s
+//!           all staged blobs as a single synthetic "vco: pre-merge
+//!           user-editable files via A0" commit (see
+//!           `installer::run_pre_merge_user_editable`). The commit is
+//!           load-bearing: git's pre-merge cleanliness check only
+//!           accepts a working tree as "ready for merge" when staged
+//!           changes are also COMMITTED — a bare `git add` leaves the
+//!           staged blob differing from BOTH HEAD's and upstream-tip's
+//!           blob, and `git pull --ff-only` / `git pull --no-rebase`
+//!           still aborts with "Your local changes would be overwritten
+//!           by merge". So the flow is: **pre-merge → stage → commit
+//!           → pull**.
 //!         - Conflict (exit 1 from `merge-file`) → leaves the LOCAL
 //!           content in place and writes the upstream version
 //!           side-by-side as `<path>.from-upstream-<short_sha>`. Emits
 //!           an `orchestrator_user_modified_preserved` deferral entry so
 //!           the launcher's UPDATE_DEFERRED.md viewer shows the user
 //!           where to find the upstream version + how to accept it.
+//!           The sidecar path is NOT auto-committed — the user's pull
+//!           will fail through the existing B4 conflict modal flow.
 //!
 //! Files NOT in the allowlist are passed through untouched — `git pull`
 //! handles them normally (and if they conflict, the existing B4 modal
@@ -60,7 +72,7 @@
 
 use std::path::{Path, PathBuf};
 
-use globset::{Glob, GlobSet, GlobSetBuilder};
+use globset::{GlobSet, GlobSetBuilder};
 
 /// Hardcoded allowlist of paths the orchestrator considers
 /// user-editable. Each entry is a `globset` pattern interpreted
@@ -235,6 +247,13 @@ async fn list_diff_files(
 ///   `XY <path>\0` where X = staged status, Y = unstaged status.
 /// We want Y in {`M`, `A`, `D`, `?`} OR X in {`M`, `A`, `D`} — any
 /// kind of local divergence from HEAD warrants consideration.
+///
+/// Rename entries are special: `git status --porcelain -z` emits them
+/// as `R  <new>\0<old>\0` (or `RM <new>\0<old>\0`, etc.) — TWO
+/// NUL-terminated records per rename. We accept the `<new>` record
+/// (the post-rename path is the one a 3-way merge cares about) and
+/// SKIP the immediately-following `<old>` record (it's metadata, not
+/// a standalone status line). The same logic applies to copies (`C`).
 async fn list_locally_modified(install_path: &Path) -> Result<Vec<String>, String> {
     let out = tokio::process::Command::new("git")
         .args(["status", "--porcelain", "-z"])
@@ -248,9 +267,17 @@ async fn list_locally_modified(install_path: &Path) -> Result<Vec<String>, Strin
     let raw = out.stdout;
     let mut paths = Vec::new();
     // Split on NUL: `git status -z` emits NUL-terminated records.
-    for record in raw.split(|b| *b == 0) {
+    // Collect records first so we can skip the trailing `<old>` record
+    // of a rename/copy in a single forward pass.
+    let records: Vec<&[u8]> = raw.split(|b| *b == 0).collect();
+    let mut i = 0;
+    while i < records.len() {
+        let record = records[i];
         if record.len() < 4 {
-            // Each record is at least "XY <path>" (3 bytes minimum).
+            // Each record is at least "XY <path>" (3 bytes minimum, +1
+            // for the path). Empty trailing record from the split is
+            // expected; just advance.
+            i += 1;
             continue;
         }
         // Bytes [0..2] are the two-char status code; [2] is space; [3..]
@@ -258,6 +285,7 @@ async fn list_locally_modified(install_path: &Path) -> Result<Vec<String>, Strin
         // --porcelain output, but be defensive).
         let xy = &record[..2];
         if xy == b"  " {
+            i += 1;
             continue;
         }
         let path = match std::str::from_utf8(&record[3..]) {
@@ -265,10 +293,25 @@ async fn list_locally_modified(install_path: &Path) -> Result<Vec<String>, Strin
             // Non-UTF8 paths are rare but possible; we skip them rather
             // than panic. They won't be in our allowlist anyway (the
             // allowlist is ASCII-only).
-            Err(_) => continue,
+            Err(_) => {
+                i += 1;
+                continue;
+            }
         };
         if !path.is_empty() {
             paths.push(path);
+        }
+        // Rename/copy: skip the immediately-following `<old>` record.
+        // Both `R` and `C` use the two-record format whether they appear
+        // in the staged (X) or unstaged (Y) position.
+        if record[0] == b'R'
+            || record[0] == b'C'
+            || record[1] == b'R'
+            || record[1] == b'C'
+        {
+            i += 2;
+        } else {
+            i += 1;
         }
     }
     Ok(paths)
@@ -305,21 +348,18 @@ async fn read_blob_at_rev(
 fn build_user_editable_globset() -> Result<GlobSet, String> {
     let mut builder = GlobSetBuilder::new();
     for pattern in USER_EDITABLE_PATTERNS {
-        let glob = Glob::new(pattern)
+        // Single-pass parse via `GlobBuilder`. Case-insensitive: HFS+/
+        // APFS/NTFS default to case-folding, so a file the user sees as
+        // "CLAUDE.md" might appear as "claude.md" or "CLAUDE.MD"
+        // depending on how it was created. `literal_separator(false)`
+        // is the default — set explicitly so `**` keeps its
+        // multi-segment-wildcard semantics.
+        let glob = globset::GlobBuilder::new(pattern)
+            .case_insensitive(true)
+            .literal_separator(false)
+            .build()
             .map_err(|e| format!("malformed allowlist pattern {:?}: {}", pattern, e))?;
-        // Case-insensitive: HFS+/APFS/NTFS default to case-folding, so
-        // a file the user sees as "CLAUDE.md" might appear as "claude.md"
-        // or "CLAUDE.MD" depending on how it was created.
-        builder.add(
-            Glob::new(glob.glob())
-                .and_then(|g| {
-                    globset::GlobBuilder::new(g.glob())
-                        .case_insensitive(true)
-                        .literal_separator(false)
-                        .build()
-                })
-                .map_err(|e| format!("malformed allowlist pattern {:?}: {}", pattern, e))?,
-        );
+        builder.add(glob);
     }
     builder
         .build()
@@ -1435,6 +1475,497 @@ mod tests {
             body.contains("CLAUDE.md.from-upstream-7b255dd"),
             "missing sidecar reference in {}",
             body,
+        );
+    }
+
+    // ----- Rename / copy parsing -----
+
+    #[test]
+    fn list_locally_modified_skips_rename_old_path_records() {
+        // White-box test of the record-walking logic: we don't shell out
+        // to `git status` here; instead we construct the raw -z payload
+        // that git would emit for a rename and verify the parser admits
+        // the new path and skips the trailing old-path record.
+        //
+        // Format reminder: `R  <new>\0<old>\0[next record...]`
+        //
+        // We can't drive `list_locally_modified` directly (it spawns
+        // git), so we replicate its inner parse here. If the parser ever
+        // moves to a private helper, swap this test to call it.
+        let raw: Vec<u8> = b"R  knowledge/concepts/new.md\0knowledge/concepts/old.md\0 M CLAUDE.md\0".to_vec();
+        let records: Vec<&[u8]> = raw.split(|b| *b == 0).collect();
+        let mut paths = Vec::new();
+        let mut i = 0;
+        while i < records.len() {
+            let record = records[i];
+            if record.len() < 4 {
+                i += 1;
+                continue;
+            }
+            let xy = &record[..2];
+            if xy == b"  " {
+                i += 1;
+                continue;
+            }
+            if let Ok(s) = std::str::from_utf8(&record[3..]) {
+                if !s.is_empty() {
+                    paths.push(s.to_string());
+                }
+            }
+            if record[0] == b'R'
+                || record[0] == b'C'
+                || record[1] == b'R'
+                || record[1] == b'C'
+            {
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        assert_eq!(
+            paths,
+            vec![
+                "knowledge/concepts/new.md".to_string(),
+                "CLAUDE.md".to_string(),
+            ],
+            "rename old-path record should be skipped, got: {:?}",
+            paths,
+        );
+    }
+
+    // ----- Full-flow integration tests (BLOCKER reproduction) -----
+    //
+    // These tests replicate what
+    // `installer::run_pre_merge_user_editable` does end-to-end:
+    //   1. pre_merge_user_editable(...) — write merged blob, etc.
+    //   2. `git add` every Merged outcome.
+    //   3. `git commit --no-verify -c user.name=... -c user.email=...`
+    //   4. `git pull` (--ff-only or --no-rebase, per scenario)
+    //
+    // The synthetic commit at step 3 is the BLOCKER fix: without it,
+    // `git pull` aborts because the staged blob differs from both
+    // HEAD's and upstream-tip's blob (pre-merge cleanliness check
+    // fails).
+    //
+    // We replicate the commit step inline here (rather than calling
+    // `installer::run_pre_merge_user_editable`) because that fn is
+    // not `pub` and is tightly coupled to installer-side state. The
+    // commit invocation MUST match the production fn — keep them in
+    // sync; if installer changes the author identity or commit flags,
+    // update this helper too.
+
+    /// Drive the pre-merge → stage → commit pipeline against a local
+    /// clone. Mirrors `installer::run_pre_merge_user_editable`'s post-
+    /// merge behaviour. Returns the outcomes for inspection.
+    async fn pre_merge_stage_and_commit(
+        local: &Path,
+        base: &str,
+        theirs: &str,
+    ) -> Vec<MergeOutcome> {
+        let outcomes = pre_merge_user_editable(local, base, theirs).await.unwrap();
+        let mut merged_any = false;
+        for outcome in &outcomes {
+            if matches!(outcome.kind, MergeOutcomeKind::Merged { .. }) {
+                let s = tokio::process::Command::new("git")
+                    .args(["add", "--"])
+                    .arg(&outcome.path)
+                    .current_dir(local)
+                    .status()
+                    .await
+                    .expect("git add");
+                assert!(s.success(), "git add failed for {}", outcome.path.display());
+                merged_any = true;
+            }
+        }
+        if merged_any {
+            // Match installer.rs' commit invocation: -c user.name, -c
+            // user.email, --no-verify, fixed message.
+            let s = tokio::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=VCO Orchestrator",
+                    "-c",
+                    "user.email=orchestrator@vibecoded.tools",
+                    "commit",
+                    "--no-verify",
+                    "-m",
+                    "vco: pre-merge user-editable files via A0 (test)",
+                ])
+                .current_dir(local)
+                .status()
+                .await
+                .expect("git commit");
+            assert!(s.success(), "git commit failed");
+        }
+        outcomes
+    }
+
+    #[tokio::test]
+    async fn pre_merge_then_ff_pull_lands_combined_content() {
+        // The BLOCKER this test guards against is the "dirty working
+        // tree" error: before the fix, `git pull --ff-only` aborted
+        // with "Your local changes to the following files would be
+        // overwritten by merge" because pre-merge staged the 3-way
+        // result but never committed it. After the fix, the staged
+        // content IS committed (synthetic VCO Orchestrator commit), so
+        // the working tree is clean.
+        //
+        // Note on FF vs non-FF after the synthetic commit:
+        //   - The synthetic commit makes local HEAD diverge from
+        //     upstream tip (local has a commit upstream doesn't, and
+        //     vice versa), so `--ff-only` ALWAYS fails post-pre-merge
+        //     with a NON-FAST-FORWARD error (a different, expected
+        //     failure mode, not the BLOCKER).
+        //   - The non-FF error is handled by `update_orchestrator`'s
+        //     existing B4 modal flow at installer.rs:3423, which
+        //     surfaces a "Merge / Rebase / Cancel" prompt. Choosing
+        //     "Merge" calls `merge_orchestrator_with_upstream` which
+        //     uses `git pull --no-rebase` and lands both edits.
+        //
+        // This test verifies:
+        //   1. The dirty-tree BLOCKER is GONE (pull's stderr no longer
+        //      mentions "would be overwritten by merge").
+        //   2. The merged content is on disk pre-pull (synthetic commit
+        //      embeds it).
+        //   3. The synthetic commit's metadata matches the spec.
+        //   4. The follow-up merge pull (the production fallback path)
+        //      lands cleanly with both edits.
+        skip_if_no_git!();
+        let (_tmp, _remote, local) = init_repo_pair();
+        let seed = _tmp.path().join("seed");
+
+        // Upstream: append a "section B" paragraph to CLAUDE.md.
+        push_upstream_change(
+            &seed,
+            &local,
+            "CLAUDE.md",
+            "# base\nLine A\nLine B\n\n## section B (from upstream)\nupstream paragraph\n",
+        );
+        // Local (uncommitted): prepend a "section A" paragraph.
+        write_local_mod(
+            &local,
+            "CLAUDE.md",
+            "## section A (from local)\nlocal paragraph\n# base\nLine A\nLine B\n",
+        );
+
+        // Run pre-merge → stage → commit pipeline.
+        let base = compute_base_sha(&local, "main").await.unwrap().unwrap();
+        let theirs = compute_theirs_sha(&local, "main").await.unwrap().unwrap();
+        let outcomes = pre_merge_stage_and_commit(&local, &base, &theirs).await;
+
+        // Must have produced a Merged outcome for CLAUDE.md.
+        let claude = outcomes
+            .iter()
+            .find(|o| o.path.as_path() == Path::new("CLAUDE.md"))
+            .expect("expected CLAUDE.md outcome");
+        assert!(
+            matches!(claude.kind, MergeOutcomeKind::Merged { .. }),
+            "expected Merged, got {:?}",
+            claude.kind,
+        );
+
+        // Working tree CLAUDE.md (after pre-merge + synthetic commit)
+        // must already contain BOTH edits.
+        let pre_pull = std::fs::read_to_string(local.join("CLAUDE.md")).unwrap();
+        assert!(
+            pre_pull.contains("section A (from local)"),
+            "pre-pull content missing local: {}",
+            pre_pull
+        );
+        assert!(
+            pre_pull.contains("section B (from upstream)"),
+            "pre-pull content missing upstream: {}",
+            pre_pull
+        );
+
+        // git status must be clean (BLOCKER assertion: staged content
+        // was committed, no pending dirty edits).
+        let status = StdCommand::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&local)
+            .output()
+            .expect("git status");
+        assert!(
+            String::from_utf8_lossy(&status.stdout).trim().is_empty(),
+            "git status not clean after synthetic commit: {}",
+            String::from_utf8_lossy(&status.stdout),
+        );
+
+        // The pre-merge commit must appear in the log with the
+        // synthetic author + subject.
+        let log = StdCommand::new("git")
+            .args(["log", "--format=%an <%ae>%n%s", "-n", "5"])
+            .current_dir(&local)
+            .output()
+            .expect("git log");
+        let log_text = String::from_utf8_lossy(&log.stdout);
+        assert!(
+            log_text.contains("VCO Orchestrator <orchestrator@vibecoded.tools>"),
+            "synthetic author missing from log: {}",
+            log_text,
+        );
+        assert!(
+            log_text.contains("vco: pre-merge user-editable files via A0"),
+            "synthetic commit subject missing from log: {}",
+            log_text,
+        );
+
+        // Now try `git pull --ff-only`. After the synthetic commit,
+        // local HEAD diverges from upstream tip, so FF can't succeed.
+        // What we MUST verify is that the failure is "non-FF", NOT
+        // "dirty working tree" (the original BLOCKER). The B4 modal
+        // in installer.rs:3423 catches the non-FF case and offers
+        // Merge/Rebase; that path is exercised below.
+        let ff_pull = StdCommand::new("git")
+            .args(["pull", "--ff-only", "vco_upstream", "main"])
+            .current_dir(&local)
+            .output()
+            .expect("git pull --ff-only");
+        let ff_stderr = String::from_utf8_lossy(&ff_pull.stderr).to_string();
+        let ff_stdout = String::from_utf8_lossy(&ff_pull.stdout).to_string();
+        let combined = format!("{}\n{}", ff_stderr, ff_stdout);
+        assert!(
+            !combined.contains("would be overwritten by merge"),
+            "BLOCKER REPRODUCED — pull aborted with dirty-tree error: {}",
+            combined,
+        );
+        // Optional: the failure (when it fails) should be a non-FF
+        // marker, not a fatal git error. If git happens to succeed
+        // here on a future git version (unlikely, kept for safety),
+        // we don't fail the test — the BLOCKER assertion above is
+        // what we care about.
+        if !ff_pull.status.success() {
+            assert!(
+                combined.contains("Not possible to fast-forward")
+                    || combined.contains("non-fast-forward")
+                    || combined.contains("Diverging branches"),
+                "FF pull failed but not for a non-FF reason: {}",
+                combined,
+            );
+        }
+
+        // Follow-up merge pull (the production fallback via the B4
+        // modal → merge_orchestrator_with_upstream) must succeed and
+        // land both edits.
+        let merge_pull = StdCommand::new("git")
+            .args([
+                "pull",
+                "--no-rebase",
+                "--no-edit",
+                "vco_upstream",
+                "main",
+            ])
+            .current_dir(&local)
+            .output()
+            .expect("git pull --no-rebase");
+        assert!(
+            merge_pull.status.success(),
+            "follow-up merge pull failed: stderr={} stdout={}",
+            String::from_utf8_lossy(&merge_pull.stderr),
+            String::from_utf8_lossy(&merge_pull.stdout),
+        );
+        let post_pull = std::fs::read_to_string(local.join("CLAUDE.md")).unwrap();
+        assert!(
+            post_pull.contains("section A (from local)"),
+            "post-pull content missing local: {}",
+            post_pull,
+        );
+        assert!(
+            post_pull.contains("section B (from upstream)"),
+            "post-pull content missing upstream: {}",
+            post_pull,
+        );
+
+        // Working tree clean after merge.
+        let status = StdCommand::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&local)
+            .output()
+            .expect("git status");
+        assert!(
+            String::from_utf8_lossy(&status.stdout).trim().is_empty(),
+            "git status not clean after merge pull: {}",
+            String::from_utf8_lossy(&status.stdout),
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_merge_then_merge_pull_lands_combined_content() {
+        skip_if_no_git!();
+        let (_tmp, _remote, local) = init_repo_pair();
+        let seed = _tmp.path().join("seed");
+
+        // Local: add an unrelated committed change to force a non-FF
+        // pull. We touch a non-allowlisted file so it doesn't interact
+        // with the pre-merge logic.
+        std::fs::create_dir_all(local.join("vco_lib")).unwrap();
+        std::fs::write(
+            local.join("vco_lib").join("foo.py"),
+            "def local_extra(): pass\n",
+        )
+        .unwrap();
+        run_git(&local, &["add", "vco_lib/foo.py"]);
+        run_git(
+            &local,
+            &["commit", "-m", "local: unrelated change forcing non-FF"],
+        );
+
+        // Upstream: change CLAUDE.md.
+        push_upstream_change(
+            &seed,
+            &local,
+            "CLAUDE.md",
+            "# base\nLine A\nLine B\n\n## section B (from upstream)\nupstream paragraph\n",
+        );
+        // Local (uncommitted): change CLAUDE.md non-overlappingly.
+        write_local_mod(
+            &local,
+            "CLAUDE.md",
+            "## section A (from local)\nlocal paragraph\n# base\nLine A\nLine B\n",
+        );
+
+        let base = compute_base_sha(&local, "main").await.unwrap().unwrap();
+        let theirs = compute_theirs_sha(&local, "main").await.unwrap().unwrap();
+        let outcomes = pre_merge_stage_and_commit(&local, &base, &theirs).await;
+
+        let claude = outcomes
+            .iter()
+            .find(|o| o.path.as_path() == Path::new("CLAUDE.md"))
+            .expect("expected CLAUDE.md outcome");
+        assert!(
+            matches!(claude.kind, MergeOutcomeKind::Merged { .. }),
+            "expected Merged, got {:?}",
+            claude.kind,
+        );
+
+        // Non-FF merge pull (matches merge_orchestrator_with_upstream
+        // invocation: --no-rebase --no-edit).
+        let pull = StdCommand::new("git")
+            .args([
+                "pull",
+                "--no-rebase",
+                "--no-edit",
+                "vco_upstream",
+                "main",
+            ])
+            .current_dir(&local)
+            .output()
+            .expect("git pull");
+        assert!(
+            pull.status.success(),
+            "git pull (merge) FAILED: stderr={} stdout={}",
+            String::from_utf8_lossy(&pull.stderr),
+            String::from_utf8_lossy(&pull.stdout),
+        );
+
+        // Working tree must contain BOTH edits.
+        let merged_text = std::fs::read_to_string(local.join("CLAUDE.md")).unwrap();
+        assert!(
+            merged_text.contains("section A (from local)"),
+            "post-pull content missing local: {}",
+            merged_text,
+        );
+        assert!(
+            merged_text.contains("section B (from upstream)"),
+            "post-pull content missing upstream: {}",
+            merged_text,
+        );
+
+        // git status must be clean.
+        let status = StdCommand::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&local)
+            .output()
+            .expect("git status");
+        let status_text = String::from_utf8_lossy(&status.stdout);
+        assert!(
+            status_text.trim().is_empty(),
+            "git status not clean after merge pull: {}",
+            status_text,
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_merge_conflict_then_pull_fails_as_expected_but_sidecar_exists() {
+        skip_if_no_git!();
+        let (_tmp, _remote, local) = init_repo_pair();
+        let seed = _tmp.path().join("seed");
+
+        // Upstream + local both edit the SAME LINE of CLAUDE.md →
+        // forced 3-way conflict.
+        push_upstream_change(
+            &seed,
+            &local,
+            "CLAUDE.md",
+            "# base\nLine A (upstream wins)\nLine B\n",
+        );
+        let local_body = "# base\nLine A (local wins)\nLine B\n";
+        write_local_mod(&local, "CLAUDE.md", local_body);
+
+        let base = compute_base_sha(&local, "main").await.unwrap().unwrap();
+        let theirs = compute_theirs_sha(&local, "main").await.unwrap().unwrap();
+        let outcomes = pre_merge_stage_and_commit(&local, &base, &theirs).await;
+
+        let claude = outcomes
+            .iter()
+            .find(|o| o.path.as_path() == Path::new("CLAUDE.md"))
+            .expect("expected CLAUDE.md outcome");
+        let sidecar_path = match &claude.kind {
+            MergeOutcomeKind::PreservedWithUpstreamSidecar {
+                upstream_sidecar_path,
+                ..
+            } => upstream_sidecar_path.clone(),
+            other => panic!("expected sidecar outcome, got {:?}", other),
+        };
+
+        // Sidecar must exist with the upstream content.
+        let sidecar = std::fs::read_to_string(&sidecar_path).unwrap();
+        assert!(
+            sidecar.contains("Line A (upstream wins)"),
+            "sidecar missing upstream content: {}",
+            sidecar,
+        );
+        // Local working-tree CLAUDE.md must be unchanged.
+        let local_now = std::fs::read_to_string(local.join("CLAUDE.md")).unwrap();
+        assert_eq!(local_now, local_body, "local content was modified");
+
+        // No synthetic commit should land — sidecar paths are not
+        // staged. The git log head must still be the original seed
+        // commit (only one commit; clone seed = HEAD).
+        let log_count = StdCommand::new("git")
+            .args(["rev-list", "--count", "HEAD"])
+            .current_dir(&local)
+            .output()
+            .expect("git rev-list");
+        assert_eq!(
+            String::from_utf8_lossy(&log_count.stdout).trim(),
+            "1",
+            "expected exactly 1 commit (no synthetic), got log: {}",
+            String::from_utf8_lossy(&log_count.stdout),
+        );
+
+        // Now attempt git pull — it MUST fail (the working tree is
+        // still dirty: local CLAUDE.md still diverges from HEAD).
+        // This is the expected behaviour; the B4 modal then surfaces
+        // the conflict + the deferral entry (already on disk) tells
+        // the user about the sidecar.
+        let pull = StdCommand::new("git")
+            .args(["pull", "--ff-only", "vco_upstream", "main"])
+            .current_dir(&local)
+            .output()
+            .expect("git pull");
+        assert!(
+            !pull.status.success(),
+            "git pull --ff-only unexpectedly succeeded with conflict on working tree: stdout={} stderr={}",
+            String::from_utf8_lossy(&pull.stdout),
+            String::from_utf8_lossy(&pull.stderr),
+        );
+
+        // Sidecar file must STILL exist after the failed pull.
+        assert!(
+            sidecar_path.exists(),
+            "sidecar disappeared after failed pull: {}",
+            sidecar_path.display(),
         );
     }
 }

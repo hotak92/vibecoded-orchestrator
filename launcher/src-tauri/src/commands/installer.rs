@@ -3954,6 +3954,7 @@ async fn run_pre_merge_user_editable(
     // `git pull --ff-only` will still fail on them (because the
     // local commit set diverges) and the existing B4 non-FF / conflict
     // modal will surface the deferral entry the caller emits later.
+    let mut merged_any = false;
     for outcome in &outcomes {
         if matches!(outcome.kind, MergeOutcomeKind::Merged { .. }) {
             let status = tokio::process::Command::new("git")
@@ -3962,16 +3963,112 @@ async fn run_pre_merge_user_editable(
                 .current_dir(install_path)
                 .status()
                 .await;
-            if let Ok(s) = status {
-                if !s.success() {
+            match status {
+                Ok(s) if s.success() => merged_any = true,
+                Ok(s) => {
                     eprintln!(
-                        "[vct] pre_merge: git add failed for {}",
-                        outcome.path.display()
+                        "[vct] pre_merge: git add failed for {} (exit {:?})",
+                        outcome.path.display(),
+                        s.code(),
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[vct] pre_merge: git add spawn failed for {}: {}",
+                        outcome.path.display(),
+                        e,
                     );
                 }
             }
         }
     }
+
+    // v0.2.24 §A0 (2026-05-22, peer-review BLOCKER fix): git only
+    // accepts the working tree as "ready for merge" when staged
+    // changes are also COMMITTED. Staging a 3-way merge result is
+    // not enough — the staged blob differs from BOTH HEAD's blob
+    // and upstream-tip's blob, so `git pull --ff-only` (and
+    // `git pull --no-rebase`) STILL aborts with "Your local changes
+    // to the following files would be overwritten by merge".
+    //
+    // Fix: after a successful `git add`, commit the staged blobs
+    // with a fixed mechanical author so:
+    //   1. The pull's pre-merge cleanliness check passes.
+    //   2. The commit is identifiable (so future tooling / audits
+    //      can recognise it as a VCO pre-merge synthetic commit
+    //      rather than a user commit).
+    //   3. `--no-verify` skips pre-commit hooks (those may require
+    //      dev tools / be slow / not apply to a mechanical write).
+    //
+    // The author/committer identity is passed via `-c` flags so we
+    // never touch the user's global or repo-level git config.
+    //
+    // Sidecar (`PreservedWithUpstreamSidecar`) outcomes are NOT
+    // committed — the sidecar file is intentionally untracked and
+    // the local file is unmodified. The user's pull will fail on
+    // that path via the existing B4 conflict modal flow, and the
+    // already-emitted deferral entry surfaces the sidecar.
+    if merged_any {
+        let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+        let msg = format!("vco: pre-merge user-editable files via A0 ({})", ts);
+        let commit_result = tokio::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=VCO Orchestrator",
+                "-c",
+                "user.email=orchestrator@vibecoded.tools",
+                "commit",
+                "--no-verify",
+                "-m",
+                &msg,
+            ])
+            .current_dir(install_path)
+            .output()
+            .await;
+        match commit_result {
+            Ok(out) if out.status.success() => {
+                // Commit landed — pre-merge cleanliness is satisfied,
+                // the subsequent `git pull` will fast-forward (or
+                // merge) cleanly.
+            }
+            Ok(out) => {
+                // Highly unusual after a successful `git add`. Best-
+                // effort revert: unstage everything we added + restore
+                // the working-tree files to HEAD. This leaves the
+                // clone in roughly the state it had before pre-merge,
+                // and the existing B4 modal will then surface the
+                // un-pre-merged conflict path.
+                eprintln!(
+                    "[vct] pre_merge: git commit failed (exit {:?}): {} — attempting revert",
+                    out.status.code(),
+                    String::from_utf8_lossy(&out.stderr).trim(),
+                );
+                for outcome in &outcomes {
+                    if matches!(outcome.kind, MergeOutcomeKind::Merged { .. }) {
+                        let _ = tokio::process::Command::new("git")
+                            .args(["restore", "--staged", "--"])
+                            .arg(&outcome.path)
+                            .current_dir(install_path)
+                            .status()
+                            .await;
+                        let _ = tokio::process::Command::new("git")
+                            .args(["checkout", "--"])
+                            .arg(&outcome.path)
+                            .current_dir(install_path)
+                            .status()
+                            .await;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "[vct] pre_merge: git commit spawn failed: {} — falling through",
+                    e,
+                );
+            }
+        }
+    }
+
     outcomes
 }
 
