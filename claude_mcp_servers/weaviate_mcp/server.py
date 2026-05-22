@@ -186,11 +186,33 @@ def _try_resolve_project_config():
         return None
 
 
-def _config_field(field_name: str, env_name: str, default: str) -> str:
+def _config_field(
+    field_name: str,
+    env_name: str,
+    default: str,
+    empty_means_unset: bool = False,
+) -> str:
     """Resolve a single config field via the hub; fall back to env.
 
     Used at module load to populate the KG_COLLECTION etc. constants.
     Cheap on the cached path — _try_resolve_project_config() memoises.
+
+    Args:
+        field_name: Attribute name on the ProjectConfig dataclass.
+        env_name: Env-var name to read on the env-fallback path.
+        default: Value to return if neither hub nor env resolves.
+        empty_means_unset: When True, an explicit empty-string env value
+            (e.g. ``KG_COLLECTION=""``) is treated the same as "unset" and
+            falls through to the default. When False (legacy), an empty
+            env value is returned literally — used for keys where empty
+            carries semantic meaning (e.g. DEVELOPMENT_COLLECTION's empty
+            default disables docs-fanout in hybrid_search).
+
+    v0.2.27: ``empty_means_unset=True`` added for KG_COLLECTION-shape
+    fields where an empty literal would propagate to Weaviate queries
+    and cause schema-fail with a confusing error. The bug surfaced when
+    ``.vscode/settings.json claude-code.env`` (an inert surface on
+    Linux per PR-27) wrote ``KG_COLLECTION=""`` and the MCP picked it up.
     """
     cfg = _try_resolve_project_config()
     if cfg is not None:
@@ -200,7 +222,10 @@ def _config_field(field_name: str, env_name: str, default: str) -> str:
                 return str(value)
         except Exception:
             pass
-    return os.getenv(env_name, default)
+    raw = os.getenv(env_name, default)
+    if empty_means_unset and isinstance(raw, str) and not raw.strip():
+        return default
+    return raw
 
 
 # Default truncation limit in Claude Code is ~25K chars.
@@ -1036,7 +1061,19 @@ def _format_result_by_tier(
 # v0.2.21 Step 18: resolved via vct-hub (with env-fallback). Hub failure
 # degrades to os.getenv("KG_COLLECTION", "ClaudeKnowledgeGraph") which
 # preserves pre-v0.2.21 behaviour.
-KG_COLLECTION = _config_field("kg_collection", "KG_COLLECTION", "ClaudeKnowledgeGraph")
+#
+# v0.2.27: ``empty_means_unset=True`` — an explicit empty string in the
+# env (e.g. from a stale ``.vscode/settings.json claude-code.env`` block)
+# falls through to the default rather than being used literally. An empty
+# collection name would propagate to Weaviate queries and cause
+# schema-fail with a confusing error message — see the "every configured
+# collection schema-failed" bug from 2026-05-22.
+KG_COLLECTION = _config_field(
+    "kg_collection",
+    "KG_COLLECTION",
+    "ClaudeKnowledgeGraph",
+    empty_means_unset=True,
+)
 # Cross-project shared collection. Defaults to
 # "VibeCodedOrchestrator_KnowledgeGraph" (since v0.2.23 B1; was
 # "VibecodedOrchestrator_KnowledgeGraph" v0.2.12–v0.2.22, itself renamed
@@ -1117,6 +1154,100 @@ DEVELOPMENT_COLLECTION = _config_field(
 )
 
 
+# ─── v0.2.27: Resolution-source tracking + startup logging ──────────────
+#
+# When users hit a "every configured collection schema-failed" error,
+# the surfaced collection names alone aren't enough to debug — they need
+# to know WHERE each name came from (hub-resolved? from env? from the
+# bundled default?). This tracker records the source per key at module
+# load, so error messages + log lines can reference it.
+#
+# The 2026-05-22 bug that motivated this: MCP attempted
+# ``VibeCodedOrchestrator_KnowledgeGraph`` (a default) even though the
+# user's ``.vscode/settings.json claude-code.env`` declared
+# ``VCODev_KnowledgeGraph``. Without source tracking, the user couldn't
+# tell that the VS Code surface wasn't propagating to MCP subprocesses
+# on Linux (a known limitation since PR-27 v0.2.12).
+def _resolve_source_for(field_name: str, env_name: str, resolved: str, default: str) -> str:
+    """Determine where the resolved value came from.
+
+    Returns one of: "hub" | "env" | "default" | "default(empty-env-coerced)".
+    Pure function; called once per config field at module load.
+    """
+    cfg = _try_resolve_project_config()
+    if cfg is not None:
+        try:
+            hub_value = getattr(cfg, field_name, "")
+            if hub_value and str(hub_value) == resolved:
+                return "hub"
+        except Exception:
+            pass
+    raw_env = os.environ.get(env_name)
+    if raw_env is None:
+        return "default"
+    if raw_env.strip() == "" and resolved == default:
+        # Empty-string env coerced to default by empty_means_unset semantic.
+        return "default(empty-env-coerced)"
+    if raw_env == resolved:
+        return "env"
+    # Fall-through: hub returned a different value than env, or empty env
+    # was honoured literally (SHARED_KG_COLLECTION semantic).
+    return "env" if raw_env == resolved else "default"
+
+
+_KG_COLLECTION_SOURCE = _resolve_source_for(
+    "kg_collection", "KG_COLLECTION", KG_COLLECTION, "ClaudeKnowledgeGraph"
+)
+_SHARED_KG_COLLECTION_SOURCE = _resolve_source_for(
+    "shared_kg_collection",
+    "SHARED_KG_COLLECTION",
+    SHARED_KG_COLLECTION,
+    _SHARED_KG_DEFAULT,
+)
+_DEVELOPMENT_COLLECTION_SOURCE = _resolve_source_for(
+    "development_collection", "DEVELOPMENT_COLLECTION", DEVELOPMENT_COLLECTION, ""
+)
+
+# Loud startup log so users debugging "wrong collection name" can grep
+# logs for "weaviate-kg: resolved" and see exactly which name + source.
+# Logged at INFO (the MCP's default level) — not WARNING, because the
+# common case is correctly-resolved values; warnings would be noise.
+# Only escalate to WARNING when we're falling back to the bundled
+# defaults (signals likely env-propagation problem).
+def _log_collection_resolution() -> None:
+    """One-shot startup log of the resolved collection names + sources."""
+    logger.info(
+        "weaviate-kg: resolved collections (kg=%r src=%s, shared=%r src=%s, dev=%r src=%s)",
+        KG_COLLECTION,
+        _KG_COLLECTION_SOURCE,
+        SHARED_KG_COLLECTION,
+        _SHARED_KG_COLLECTION_SOURCE,
+        DEVELOPMENT_COLLECTION,
+        _DEVELOPMENT_COLLECTION_SOURCE,
+    )
+    fallback_keys = []
+    if _KG_COLLECTION_SOURCE in ("default", "default(empty-env-coerced)"):
+        fallback_keys.append(
+            f"KG_COLLECTION→'{KG_COLLECTION}'"
+            f"{' (empty env coerced)' if _KG_COLLECTION_SOURCE == 'default(empty-env-coerced)' else ''}"
+        )
+    if _SHARED_KG_COLLECTION_SOURCE == "default":
+        fallback_keys.append(f"SHARED_KG_COLLECTION→'{SHARED_KG_COLLECTION}'")
+    if fallback_keys:
+        logger.warning(
+            "weaviate-kg: using bundled defaults for %s — set these env vars "
+            "in .claude/settings.json `env` to point at your project's "
+            "collections (NOT .vscode/settings.json claude-code.env, which "
+            "does not propagate to MCP subprocesses on Linux; see PR-27 / "
+            "v0.2.12). The launcher GUI's per-project Identity tab writes "
+            "the canonical file.",
+            ", ".join(fallback_keys),
+        )
+
+
+_log_collection_resolution()
+
+
 # ─── Multi-source access matrix (P1-D, 2026-05-08) ─────────────────────────
 #
 # The launcher's GUI access matrix is propagated into env vars that the MCP
@@ -1124,9 +1255,14 @@ DEVELOPMENT_COLLECTION = _config_field(
 # searches across peer projects. Without these vars, the matrix was a
 # launcher-internal feature with no runtime effect.
 #
-# Format (set by `write_project_env_files` in Rust, in
-# `.claude/env`, `.claude/settings.json env`, and
-# `.vscode/settings.json claude-code.env`):
+# Format (set by `write_project_env_files` in Rust, in `.claude/env`
+# AND `.claude/settings.json env` — PR-27 / v0.2.12 removed the historical
+# third surface `.vscode/settings.json claude-code.env` after sentinel
+# testing on `/proc/<mcp_pid>/environ` proved it does NOT propagate to
+# MCP subprocesses on Linux. Users editing the VS Code key for KG/code-
+# graph routing report "settings didn't take" — they need to use the
+# canonical `.claude/settings.json env` channel instead, or the launcher
+# GUI which writes both files):
 #
 #   VCT_KG_ACCESS_LIST=PeerA,PeerB,PeerC
 #       Comma-separated peer project NAMES (already sanitized to the
@@ -1208,18 +1344,74 @@ def _kg_collections_to_search(include_dev: bool = False) -> list[str]:
     Caller may pass `include_dev=True` to also include
     `DEVELOPMENT_COLLECTION` (only `hybrid_search` does — graph traversal
     skips dev docs, see existing comment at the call site).
+
+    Defensive filtering (v0.2.27): empty / whitespace-only collection
+    names are dropped. KG_COLLECTION should never be empty (the resolver
+    coerces empty env to the bundled default), but the access matrix is
+    user-controlled and could carry an empty entry; without this filter
+    that empty propagates to Weaviate as an unresolvable class name and
+    schema-fails.
     """
-    out: list[str] = [KG_COLLECTION]
-    if SHARED_KG_COLLECTION and SHARED_KG_COLLECTION != KG_COLLECTION:
+    out: list[str] = []
+    if KG_COLLECTION and KG_COLLECTION.strip():
+        out.append(KG_COLLECTION)
+    if (
+        SHARED_KG_COLLECTION
+        and SHARED_KG_COLLECTION.strip()
+        and SHARED_KG_COLLECTION != KG_COLLECTION
+    ):
         out.append(SHARED_KG_COLLECTION)
     for coll in _kg_peer_collections():
+        if not coll or not coll.strip():
+            continue
         if coll == KG_COLLECTION or coll == SHARED_KG_COLLECTION:
             continue
         if coll not in out:
             out.append(coll)
-    if include_dev and DEVELOPMENT_COLLECTION and DEVELOPMENT_COLLECTION not in out:
+    if (
+        include_dev
+        and DEVELOPMENT_COLLECTION
+        and DEVELOPMENT_COLLECTION.strip()
+        and DEVELOPMENT_COLLECTION not in out
+    ):
         out.append(DEVELOPMENT_COLLECTION)
     return out
+
+
+def _describe_collection_source(coll_name: str) -> str:
+    """Tag a collection name with its resolution source for error messages.
+
+    Used by ``_format_failed_collections_hint`` to surface WHERE the
+    failing collection name came from (self/shared/peer/dev + the env
+    or hub-resolved origin). Pure function; safe to call from hot
+    error paths.
+    """
+    if coll_name == KG_COLLECTION:
+        return f"self/KG_COLLECTION src={_KG_COLLECTION_SOURCE}"
+    if coll_name == SHARED_KG_COLLECTION:
+        return f"shared/SHARED_KG_COLLECTION src={_SHARED_KG_COLLECTION_SOURCE}"
+    if coll_name == DEVELOPMENT_COLLECTION:
+        return f"dev/DEVELOPMENT_COLLECTION src={_DEVELOPMENT_COLLECTION_SOURCE}"
+    return "peer/VCT_KG_ACCESS_LIST"
+
+
+def _format_failed_collections_hint(failed: list[str]) -> str:
+    """Format a debug-friendly listing of failed collections + sources.
+
+    Returns a string like::
+
+        VibeCodedOrchestrator_KnowledgeGraph [self/KG_COLLECTION src=default(empty-env-coerced)],
+        VibeCodedOrchestrator_Development [peer/VCT_KG_ACCESS_LIST]
+
+    Shown after the truncated raw list in WeaviateSchemaError messages
+    so users debugging a "no results" bug can see at a glance whether
+    the MCP picked up the right env vars.
+    """
+    if not failed:
+        return ""
+    annotated = [f"{c} [{_describe_collection_source(c)}]" for c in failed[:6]]
+    suffix = "…" if len(failed) > 6 else ""
+    return ", ".join(annotated) + suffix
 # Base directory for KG markdown files. When set, store_knowledge_node will
 # write the .md file if it doesn't already exist (file_path is relative to this dir).
 KG_BASE_DIR = os.getenv("KG_BASE_DIR", "")
@@ -3054,11 +3246,24 @@ async def _semantic_graph_search_body(
                 "semantic_graph_search: failure telemetry log_retrieval failed (%s); continuing",
                 exc,
             )
+        # v0.2.27: annotate each failed collection with its resolution
+        # source so users can tell at a glance whether the MCP picked up
+        # the right env vars or fell back to a bundled default. See
+        # _describe_collection_source + the resolution log line emitted at
+        # module load ("weaviate-kg: resolved collections").
+        annotated_failed = _format_failed_collections_hint(failed_collections_schema)
+        hint_suffix = (
+            " — if names look unexpected, the resolved KG_COLLECTION / "
+            "SHARED_KG_COLLECTION env vars likely don't match your project. "
+            "Canonical channel: .claude/settings.json `env`. Check the "
+            "'weaviate-kg: resolved collections' log line at server startup "
+            "for what this MCP subprocess actually sees."
+        )
         raise WeaviateSchemaError(
             "semantic_graph_search: every configured collection schema-failed "
             f"({len(failed_collections_schema)} attempted: "
-            f"{', '.join(failed_collections_schema[:6])}"
-            f"{'…' if len(failed_collections_schema) > 6 else ''})"
+            f"{annotated_failed})"
+            + hint_suffix
         )
 
     # Preserve a normalised score (1 - distance) so per-result tiering works.
@@ -3552,11 +3757,20 @@ async def _hybrid_search_body(
                 "hybrid_search: failure telemetry log_retrieval failed (%s); continuing",
                 exc,
             )
+        # v0.2.27: see semantic_graph_search counterpart for rationale.
+        annotated_failed = _format_failed_collections_hint(failed_collections_schema)
+        hint_suffix = (
+            " — if names look unexpected, the resolved KG_COLLECTION / "
+            "SHARED_KG_COLLECTION env vars likely don't match your project. "
+            "Canonical channel: .claude/settings.json `env`. Check the "
+            "'weaviate-kg: resolved collections' log line at server startup "
+            "for what this MCP subprocess actually sees."
+        )
         raise WeaviateSchemaError(
             "hybrid_search: every configured collection schema-failed "
             f"({len(failed_collections_schema)} attempted: "
-            f"{', '.join(failed_collections_schema[:6])}"
-            f"{'…' if len(failed_collections_schema) > 6 else ''})"
+            f"{annotated_failed})"
+            + hint_suffix
         )
 
     # Sort all over-fetched candidates by combined score
