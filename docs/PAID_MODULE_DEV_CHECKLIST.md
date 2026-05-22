@@ -93,6 +93,107 @@ Each paid module has a `vct-module.json` manifest that the launcher consumes to 
 
 ---
 
+## GUI tab integration via the declarative dispatcher (v0.2.26+)
+
+As of v0.2.26, any paid module can expose a configuration tab in the launcher's per-project Settings UI **without shipping its own Tauri/Svelte code and without forcing a launcher rebuild on every new control**. The launcher provides:
+
+- **10 schema-rendered control kinds** (`checkbox`, `multi_select`, `button`, `select`, `info` + v0.2.26 additions `text_input`, `number_input`, `status_display`, `file_picker`, `link`).
+- **One generic Tauri command** `module_dispatch_action(moduleId, projectId, action, value)` that executes declarative `ActionDescriptor::Http` entries straight off the manifest. No per-module Rust code.
+- **Polling + chained actions + template substitution** built into the dispatcher (see `knowledge/concepts/module-contributed-gui-tabs.md`).
+
+The default answer for "my module needs a new GUI control" is now: **declare it in the manifest**, not "add a Tauri command to the launcher".
+
+### When to use declarative vs legacy `ActionRef::Legacy(String)`
+
+| Use the descriptor form | Use the legacy form |
+|---|---|
+| Any HTTP call to the module's container | Reading or aggregating launcher-side DB state |
+| Long-running ops (use the `polling` block) | Operations that need launcher process resources |
+| Multi-step workflows (use `next_action` chaining) | Cross-module state queries the launcher already exposes |
+| All future paid modules should default here | Surviving legacy commands stay as-is — no urgency to migrate |
+
+### Minimum declarative-form example
+
+```jsonc
+// in <module>/vct-module.json, inside gui.config_tab.sections[].controls[]
+{
+  "kind": "button",
+  "id": "reset_project_model",
+  "label": "Reset to global",
+  "action": {
+    "kind": "http",
+    "method": "POST",
+    "path": "/projects/{{project_id}}/reset",
+    "body": { "strategy": "fork" }
+  }
+}
+```
+
+The launcher resolves `{{project_id}}` to the active project's UUID and POSTs `http://127.0.0.1:<container_port>/projects/<uuid>/reset` with body `{"strategy":"fork"}`. The container's HTTP response (JSON) flows back to the renderer as the resolved promise.
+
+### Polling example (long-running training)
+
+```jsonc
+{
+  "kind": "button",
+  "id": "retrain_global",
+  "label": "Retrain global model (offline)",
+  "action": {
+    "kind": "http",
+    "method": "POST",
+    "path": "/global/retrain",
+    "body": { "mode": "offline", "project_ids": "{{value}}" },
+    "polling": {
+      "endpoint": "/finetune_status",
+      "job_id_path": "$.job_id",
+      "interval_seconds": 5,
+      "max_attempts": 720,
+      "terminal_success_values": ["done"],
+      "terminal_failure_values": ["failed", "error"],
+      "progress_event": "vct-coordination://retrain-progress",
+      "failed_event":   "vct-coordination://retrain-failed"
+    }
+  }
+}
+```
+
+**`progress_event` + `failed_event` should be namespaced by module + control** (e.g. `<module-id>://<control-id>-progress`) to avoid cross-control collisions on a single project's UI. The dispatcher emits the raw poll response as the payload; controls listening to the same event name will all see it.
+
+### Port registration contract
+
+The dispatcher resolves `(project_id, module_id)` → port via the `module_ports` table. **Your module's install path MUST write a port row** before the dispatcher can hit your container:
+
+```rust
+// In your module's install hook (or wherever the launcher allocates ports):
+db.ensure_module_port(&project_id, "<your-module-id>", || allocate_port_in_range(11500, 11900))?;
+```
+
+See `knowledge/concepts/generic-per-module-db-architecture.md` for the table schema + `db/module_ports.rs` for the helper signatures. The supervisor in `vct-hub::module_supervisor` is the canonical writer; other call sites should go through it rather than writing directly.
+
+### Template substitution variables
+
+The dispatcher recognises a **closed set** of `{{variable}}` tokens (intentional security boundary — modules cannot smuggle arbitrary launcher state into request bodies):
+
+| Token | Value |
+|---|---|
+| `{{project_id}}` | Active project's UUID string |
+| `{{module_id}}` | Your module's id (same as the URL path resolution key) |
+| `{{value}}` | The value the user set/changed (typed: bool/number/string/array depending on the control kind) |
+| `{{control:<id>}}` | Another control's persisted value (reads `module_settings`) |
+
+A whole-string `"{{value}}"` substitutes with the typed JSON value (an array stays an array). An embedded `"prefix-{{value}}-suffix"` interpolates as a string. Unknown variables → dispatch fails before any HTTP call.
+
+Need a new substitution variable? **That requires a launcher rebuild** — by design. File an issue with the use case.
+
+### What still requires a launcher rebuild after v0.2.26
+
+- A new `ConfigControl` variant (e.g. a date-range picker). Each variant is a launcher API contract.
+- A new `ActionDescriptor` variant (e.g. `shell` for sandboxed subprocesses). Security boundary — we don't let modules execute arbitrary subprocesses.
+- A new template-substitution variable. Closed-set on purpose.
+- DB-state-reading commands (no `ActionDescriptor::Db` variant yet — open design question; not blocked on any module today).
+
+---
+
 ## CI guard
 
 The public repo's `.github/workflows/ci.yml` runs `launcher-leak-check`, which scans built launcher binaries for unexpected `/home/<user>/`, `/Users/<user>/`, and `C:\Users\<user>\` paths. The check is mirrored locally in `tests/test_launcher_leak_grep.py`.
@@ -116,8 +217,10 @@ Follow this procedure in order. Each step is independently verifiable; do not sk
 4. **Scaffold the public adapter**. Create `claude_mcp_servers/<id>_client/` with the whitelist files only (`__init__.py`, `client.py`, `schemas.py`, optionally `telemetry_writer.py`). The adapter must work in graceful-degraded mode when the paid container is absent.
 5. **Extend the CI leak-check**. Add the new module's forbidden filename patterns (e.g. `coordination_server.py`, `mao_engine.py`) to the `BAD_NAMES` regex in `.github/workflows/ci.yml`. Add an integration test under `tests/` that asserts the new adapter's no-server path returns the expected error.
 6. **Keep the manifest private**. The `vct-module.json` for the new module stays at `paid-modules/<id>/vct-module.json`. Do NOT add a copy to `launcher/bundled_manifests/`.
-7. **Write the public docs reference**. In CHANGELOG / README / feature docs, refer to the new module by its product name and GHCR image ref. Never reference internal Python filenames from the private repo.
-8. **Run the leak-audit locally** before opening the public PR. Run the 5-line GREEN check from the v0.2.22 leak-audit (extend it with the new module's filenames):
+7. **Declare the GUI tab in the manifest, not in launcher code** (v0.2.26+). Build the `gui.config_tab` block using the schema-rendered control kinds and the declarative `ActionDescriptor::Http` form for any HTTP-driven action. See the "GUI tab integration via the declarative dispatcher" section above for the wire shape. The launcher should not need any Rust changes to render your new tab.
+8. **Wire port registration** into your module's install path so the dispatcher can find your container. Call `db.ensure_module_port(&project_id, "<module-id>", || allocate_in_range(...))` once per (project × module). Without a `module_ports` row, every `ActionDescriptor::Http` dispatch against your module returns a clear "no port registered" error.
+9. **Write the public docs reference**. In CHANGELOG / README / feature docs, refer to the new module by its product name and GHCR image ref. Never reference internal Python filenames from the private repo.
+10. **Run the leak-audit locally** before opening the public PR. Run the 5-line GREEN check from the v0.2.22 leak-audit (extend it with the new module's filenames):
    ```bash
    set -e
    test ! -d <orchestrator-root>/paid-modules || { echo "RED: paid-modules/ exists in public"; exit 1; }
@@ -151,3 +254,5 @@ If any of the five fails, the commit does not ship until it's fixed.
 - **`docs/REPO_CLEANLINESS.md`** — adjacent policy doc on the tracked / machine-local split. The principles overlap with this checklist's section on `.gitignore` discipline.
 - **`docs/MAINTAINER_GUIDE.md`** — release-pipeline operations; the release workflow's free-tier-manifest assertion lives in scope of that doc.
 - **`knowledge/concepts/launcher-paid-modules-schema.md`** — KG node describing the manifest schema. Documentation-only (no leak surface), but worth reading when scaffolding a new module's manifest.
+- **`knowledge/concepts/module-contributed-gui-tabs.md`** — KG node covering the schema-rendered GUI tab framework + the v0.2.26 declarative dispatcher in depth (control kinds, ActionDescriptor JSON shape, template substitution grammar, polling spec). Read this before declaring your module's `gui.config_tab` block.
+- **`knowledge/concepts/generic-per-module-db-architecture.md`** — KG node on the `module_ports` / `module_settings` / `module_installs` / `module_weights_state` table contract. Read when scaffolding port allocation + persisted settings for a new module.
