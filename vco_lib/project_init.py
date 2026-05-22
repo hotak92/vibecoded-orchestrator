@@ -3534,6 +3534,168 @@ def _cleanup_legacy_bash_env_in_project(folder: Path) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# v0.2.24 RL-defect-2026-05-22 Fix 2 (cleanup hygiene):
+#
+# Pre-v0.2.12 the launcher's Rust `write_project_env_files` wrote a
+# `claude-code.env` sub-object inside `.vscode/settings.json` containing
+# MCP_WEAVIATE_SERVER / MCP_PYTHON / MCP_OLLAMA_SERVER / MCP_PYTHONPATH
+# absolute paths. PR-27 (v0.2.12, 2026-05-16) removed that write because
+# the `claude-code.env` channel did NOT propagate to MCP subprocesses on
+# Linux Claude Code 2.1.143 — the canonical channel since then is
+# `.claude/settings.json` `env`. But existing projects (SD15, VCO_dev,
+# any pre-v0.2.12 install) still have the legacy MCP_* keys in their
+# `.vscode/settings.json`. The keys are INERT (don't propagate), but
+# they:
+#   1. Confuse audits — anyone grepping for MCP path config finds a
+#      stale absolute path pointing at an orchestrator clone the user
+#      may have moved, renamed, or deleted.
+#   2. Have the user's username + on-disk layout baked in, which is a
+#      minor privacy / disclosure consideration if the `.vscode/`
+#      directory is shared via git or screenshot.
+#
+# Detection-only with deferral. Per user policy 2026-05-22: never
+# auto-overwrite user-edited files — emit a deferral entry recommending
+# cleanup, let the user decide. The legacy MCP_* keys are inert so
+# there's no urgency; deferral severity is `info`.
+# ---------------------------------------------------------------------------
+
+_LEGACY_VSCODE_MCP_ENV_KEY_PREFIXES: tuple[str, ...] = (
+    "MCP_WEAVIATE_SERVER",
+    "MCP_PYTHON",
+    "MCP_OLLAMA_SERVER",
+    "MCP_PYTHONPATH",
+)
+
+
+def _detect_legacy_vscode_mcp_env_keys(folder: Path) -> dict:
+    """Detect pre-v0.2.12 MCP_* keys lingering in a project's
+    `.vscode/settings.json` `claude-code.env` block.
+
+    Returns:
+        dict with:
+          - action: "none" (no .vscode dir / file / parseable JSON / no
+                   keys) | "detected" (≥1 legacy key found) | "unparseable"
+          - keys: list[str] of detected key names (empty when action != "detected")
+          - file: relative path string (for the deferral message)
+    """
+    settings_file = folder / ".vscode" / "settings.json"
+    if not settings_file.exists():
+        return {"action": "none", "keys": [], "file": ".vscode/settings.json"}
+
+    try:
+        raw = settings_file.read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except (OSError, json.JSONDecodeError):
+        # Don't surface a deferral on unparseable JSON — the file may
+        # have trailing-comma user edits, and our cleanup logic should
+        # never push the user toward fixing JSON syntax just so we can
+        # check for hygiene-only keys.
+        return {"action": "unparseable", "keys": [], "file": ".vscode/settings.json"}
+
+    if not isinstance(data, dict):
+        return {"action": "unparseable", "keys": [], "file": ".vscode/settings.json"}
+
+    env_block = data.get("claude-code.env")
+    if not isinstance(env_block, dict):
+        return {"action": "none", "keys": [], "file": ".vscode/settings.json"}
+
+    detected: list[str] = []
+    for key in env_block.keys():
+        if not isinstance(key, str):
+            continue
+        if key in _LEGACY_VSCODE_MCP_ENV_KEY_PREFIXES:
+            detected.append(key)
+
+    if not detected:
+        return {"action": "none", "keys": [], "file": ".vscode/settings.json"}
+
+    return {
+        "action": "detected",
+        "keys": sorted(detected),
+        "file": ".vscode/settings.json",
+    }
+
+
+def _emit_legacy_vscode_mcp_env_deferral(
+    folder: Path, detection: dict,
+) -> None:
+    """Emit `legacy_vscode_mcp_env_keys_present`: pre-v0.2.12
+    `.vscode/settings.json claude-code.env` block contains stale
+    absolute-path MCP_* keys that are inert (don't propagate to MCP
+    subprocesses on Linux Claude Code) but bake the user's on-disk
+    layout into the project tree.
+
+    Per user policy (2026-05-22): never auto-overwrite user-edited
+    files — emit a deferral, let the user decide.
+
+    Severity is `info`: the keys are functionally inert. Cleanup is
+    hygiene, not a correctness fix.
+    """
+    from vco_lib.deferral_report import DeferralEntry, DeferralReport
+
+    keys = detection.get("keys", [])
+    settings_rel = detection.get("file", ".vscode/settings.json")
+
+    detected_msg = (
+        f"`{settings_rel}` contains a pre-v0.2.12 `claude-code.env` block "
+        f"with {len(keys)} legacy MCP path key(s) "
+        f"({', '.join(keys)}). Since v0.2.12 (PR-27) this channel no "
+        "longer propagates to MCP subprocesses on Linux Claude Code; the "
+        "canonical per-project MCP env channel is `.claude/settings.json` "
+        "`env`. The legacy keys are functionally inert but bake the "
+        "user's on-disk layout into the project tree (potential "
+        "confusion for audits and a minor disclosure consideration if "
+        "the `.vscode/` directory is shared via git or screenshot)."
+    )
+
+    # Cleanup recipe — operator-driven, NOT auto. The recipe uses jq to
+    # surgically delete just the offending keys, preserving the rest of
+    # the file (in case the user customised it).
+    settings_path_str = f"{folder}/{settings_rel}"
+    jq_filter = (
+        '.["claude-code.env"] |= (with_entries(select('
+        + " and ".join(f'.key != "{k}"' for k in keys)
+        + ")))"
+    )
+    cmd = (
+        f"# Inspect first:\n"
+        f"cat {settings_path_str!r} | jq '.[\"claude-code.env\"]'\n"
+        f"# Then prune just the legacy MCP_* keys (preserves the rest):\n"
+        f"jq {jq_filter!r} {settings_path_str!r} > {settings_path_str!r}.tmp \\\n"
+        f"  && mv {settings_path_str!r}.tmp {settings_path_str!r}\n"
+        f"# Then dismiss this deferral via the launcher GUI OR:\n"
+        f"python -m vco_lib.project_init dismiss-deferral "
+        f"--folder {str(folder)!r} "
+        f"--condition-id legacy_vscode_mcp_env_keys_present"
+    )
+
+    entry = DeferralEntry(
+        condition_id="legacy_vscode_mcp_env_keys_present",
+        title="Legacy .vscode/settings.json MCP_* env keys (inert, cleanup recommended)",
+        detected=detected_msg,
+        why_deferred=(
+            "Per the v0.2.24 RL-defect investigation (2026-05-22), "
+            "these keys are confirmed INERT — Claude Code spawns MCPs "
+            "from ~/.claude.json registrations, which already point at "
+            "the active orchestrator clone. The legacy `claude-code.env` "
+            "channel was removed from the Rust launcher's writer in "
+            "PR-27 (v0.2.12, 2026-05-16) because empirical sentinel "
+            "testing confirmed it did NOT reach MCP subprocesses on "
+            "Linux. Cleanup is hygiene-only — never auto-applied to "
+            "respect the user-edited-files policy."
+        ),
+        command_to_apply=cmd,
+        severity="info",
+        kg_node_refs=[
+            "knowledge/concepts/rl-telemetry-silent-suppression-on-schema-failure.md",
+        ],
+    )
+    report = DeferralReport.read(folder)
+    report.add_entry(entry)
+    report.write(folder)
+
+
 def _emit_bash_env_cleanup_deferral(
     folder: Path, cleanup_result: dict,
 ) -> None:
@@ -4776,6 +4938,36 @@ def install_project_bundle(
                  data={"error": err})
             result["warnings"].append(f"vscode_excludes backfill failed: {err}")
 
+    # v0.2.24 RL-defect-2026-05-22 Fix 2 (cleanup hygiene): detect legacy
+    # MCP_* keys in `.vscode/settings.json claude-code.env` (pre-v0.2.12
+    # writes; inert post-PR-27 but bake the user's on-disk layout into
+    # the project tree). Detection-only — per user policy 2026-05-22
+    # we never auto-overwrite user-edited files; emit a deferral entry
+    # recommending cleanup and let the user decide.
+    legacy_vscode_mcp_detected = False
+    if not dry_run:
+        try:
+            vscode_mcp_detect = _detect_legacy_vscode_mcp_env_keys(folder)
+            result["legacy_vscode_mcp_env"] = vscode_mcp_detect
+            if vscode_mcp_detect["action"] == "detected":
+                legacy_vscode_mcp_detected = True
+                _emit_legacy_vscode_mcp_env_deferral(folder, vscode_mcp_detect)
+                _log("4.bundle.legacy_vscode_mcp", "ok",
+                     f"legacy_vscode_mcp_env: detected {len(vscode_mcp_detect['keys'])} key(s)",
+                     data=vscode_mcp_detect)
+            else:
+                _log("4.bundle.legacy_vscode_mcp", "ok",
+                     f"legacy_vscode_mcp_env: {vscode_mcp_detect['action']}",
+                     data=vscode_mcp_detect)
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            _log("4.bundle.legacy_vscode_mcp", "error",
+                 f"legacy MCP env detection failed: {err}",
+                 data={"error": err})
+            result["warnings"].append(
+                f"legacy_vscode_mcp_env detection failed: {err}"
+            )
+
     # Project-level templates (item 7 / Obs 7, 2026-05-13). Minimal stubs
     # for CLAUDE.md, CONTEXT_STATE.md, MEMORY.md. Missing → install stub
     # as the live file; present → refresh the `.reference.md` sidecar and
@@ -5026,6 +5218,10 @@ def install_project_bundle(
                 # remaining orphans (user deleted them, or upstream
                 # re-added) clears the stale deferral.
                 still_orphan_preserved=bool(orphan_preserved),
+                # v0.2.24 RL-defect Fix 2 (2026-05-22): include the
+                # legacy .vscode MCP_* env detection so a future run
+                # where the user has cleaned the keys clears the entry.
+                still_legacy_vscode_mcp=legacy_vscode_mcp_detected,
             )
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
@@ -5048,6 +5244,7 @@ def _reconcile_bundle_deferrals(
     still_legacy_kg: bool = False,
     still_legacy_codegraph: bool = False,
     still_orphan_preserved: bool = False,
+    still_legacy_vscode_mcp: bool = False,
 ) -> None:
     """Trim bundle-specific deferral entries that this install resolved.
 
@@ -5082,6 +5279,11 @@ def _reconcile_bundle_deferrals(
         # re-adds it), `still_orphan_preserved` becomes False and the
         # next install clears the stale deferral entry.
         "bundle_user_modified_deletion_preserved": still_orphan_preserved,
+        # v0.2.24 RL-defect Fix 2 (2026-05-22): legacy .vscode MCP_*
+        # detection is recomputed every install — when the user removes
+        # the inert keys (via the deferral's command) the next install
+        # sees `action=none` and clears the stale entry.
+        "legacy_vscode_mcp_env_keys_present": still_legacy_vscode_mcp,
     }
 
     report = DeferralReport.read(folder)
