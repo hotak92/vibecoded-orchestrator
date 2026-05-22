@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.24] — 2026-05-22
+
+> CHANGELOG drift note: 0.2.21, 0.2.22, 0.2.23 ship in git history but
+> aren't expanded in this file yet. The git tags (`v0.2.21`, `v0.2.22`,
+> `v0.2.23`) + GitHub Release notes are the interim source of truth.
+> Backfill tracked as a follow-up.
+
+This release lands two architectural fixes plus a handful of
+peer-review-deferred cleanups. The headline items: a per-path 3-way
+merge for user-editable orchestrator-root files (§A0 — solves the
+"git pull would overwrite your CLAUDE.md edits" wall every 3rd-party
+user hit) and a per-collection schema-skip + failure-mode telemetry
+fix in the Weaviate MCP (RL-defect-2026-05-22 — restores the
+`rl_events.jsonl` corpus that the RL module's qwen3 training run
+depends on).
+
+### Added
+
+- **`feat(launcher)` per-path 3-way merge during orchestrator-root updates (§A0)** (`0f751da`, `a6144c5`, `af423e8`, `2b3d757`, `97f8aa8`, `89f2410`, `348fef1`, `632c43e`). New `claude_mcp_servers/.../git_user_editable_merge` module + integration into `update_orchestrator` and `merge_orchestrator_with_upstream`. For each file in the diff between `HEAD` and `vco_upstream/<branch>` that matches a hardcoded allowlist of user-editable paths (`CLAUDE.md`, `CLAUDE.local.md`, `knowledge/**/*.md`, `.claude/CONTEXT_STATE.md`, `.claude/MEMORY.md`, `HANDOFF-*.md`), runs `git merge-file --stdout` with BASE/OURS/THEIRS. Clean merges land in the working tree and get staged + committed via a synthetic `vco: pre-merge user-editable files via A0 (<ts>)` commit (`VCO Orchestrator <orchestrator@vibecoded.tools>` author, `--no-verify`). Conflicts write the upstream content to `<path>.from-upstream-<sha>` sidecar files + emit `orchestrator_user_modified_preserved` deferral entries (via the existing `UPDATE_DEFERRED.md` surface) — local content is NEVER auto-overwritten. After pre-merge, `update_orchestrator` smart-routes through `git pull --rebase` (replays the synthetic commit onto upstream tip → linear history) when a synthetic commit exists, else `--ff-only` (preserves the original strict semantics). The B4 divergence modal still fires for genuine divergence beyond the allowlist. 14 Rust tests (10 unit + 4 integration covering FF / merge / sidecar / non-FF-then-merge paths).
+
+- **`feat(install-bundle)` orchestrator-orphan-deletion handling** (`af423e8`, `2b3d757`). Sibling to §A0: when an `install-bundle --update` finds a file in the project's `.vco-manifest.json` that no longer exists in the orchestrator's `templates/` set, the orphan-detection loop checks whether the installed file matches the manifest's prior-shipped hash. Identical → SAFE_DELETE. Divergent → PRESERVE + emit `bundle_user_modified_deletion_preserved` deferral. 7 new tests.
+
+- **`feat(weaviate-mcp)` per-collection schema-skip + failure-mode telemetry (RL-defect-2026-05-22)** (`bbbcab8`). `_hybrid_search_body` and `_semantic_graph_search_body` no longer bubble `WeaviateSchemaError` from a single missing collection; they classify per-target, skip the offending class, continue with the rest of the fan-out, and surface the partial failure via new `failure_mode: str | None` + `failed_collections: list[str] | None` fields. When EVERY collection schema-fails, a degraded-mode telemetry event lands BEFORE the bubble re-raises. `_rl_cache_and_rerank` now always calls `writer.log_retrieval()` — including on the free-tier early-return path and with empty all_nodes. Unblocks the `~/.claude/retrieval_rl_data/rl_events.jsonl` corpus that the RL module's qwen3 training run depends on. 5 new tests pinning the contract (`test_weaviate_mcp_telemetry_on_failure.py`).
+
+- **`feat(install-bundle)` detect + defer legacy `.vscode/settings.json` MCP_* keys (RL-defect Fix 2)** (`37d6c98`). Detection-only with deferral. Pre-v0.2.12 the launcher wrote MCP_WEAVIATE_SERVER / MCP_PYTHON / MCP_OLLAMA_SERVER / MCP_PYTHONPATH absolute paths into `.vscode/settings.json claude-code.env`. PR-27 (v0.2.12) removed that write because the `claude-code.env` channel didn't propagate to MCP subprocesses on Linux Claude Code, but the stale keys remain in pre-v0.2.12 projects, baking the user's on-disk layout into the project tree. `_detect_legacy_vscode_mcp_env_keys` + `_emit_legacy_vscode_mcp_env_deferral` surface the issue via a `legacy_vscode_mcp_env_keys_present` info-severity entry with an operator-driven `jq` cleanup recipe that preserves the rest of the file. Per user policy 2026-05-22: never auto-overwrite user-edited files. 8 new tests.
+
+- **`feat(claude)` ship `autonomous-orchestrator` output-style** (`5160294`). New `.claude/output-styles/autonomous-orchestrator.md` static asset. Activates via `claude --style autonomous-orchestrator` or by copy/customize.
+
+### Changed
+
+- **`feat(resolver)` rate-limit schema-version drift warning across invocations (§A4)** (`3ad8fd9`). Hooks call `vct_project_config.{sh,ps1}` dozens of times per Claude Code session; the previous one-shot guard reset per-invocation, producing a stderr flood when the hub reports a schema_version higher than the client's `RESOLVER_PROTOCOL_VERSION`. Now routed through the existing `_emit_warning` + JSONL-backed suppression infrastructure with a stable cross-PID suppression key (`schema_version_drift_<hub_version>`); 5-min window per key; `VCO_HOOK_DEBUG=1` bypasses. Sibling `.ps1` got the cross-invocation rate-limit (it had no equivalent infra pre-v0.2.24). 7 new tests.
+
+- **`refactor(install)` extract `_rebind_collection_names_to_on_disk_casing` helper (§B3)** (`288e0d9`). Deduplicates the two healing paths in `_self_heal_kg_bindings_on_update` (`project_kg_bindings` + `kg_collection_access`) into a generic `(db, table, project_id_col, collection_name_col, *, conflict_resolver=None)` helper. Privilege-rank collision resolution stays at the call site for `kg_collection_access` (write > read > none). 3 new helper-contract tests; existing 11 stay green.
+
+- **`refactor(launcher)` extract `is_shared_kg_class_name` helper for case-tolerant shared-KG matching (§B4)** (`8635d65`). New helper in `vct-launcher-core::project_env_settings` consolidates the case-insensitive matching of `DEFAULT_SHARED_KG_COLLECTION` + `LEGACY_SHARED_KG_COLLECTION_LOWERCASE_C` + `LEGACY_SHARED_KG_COLLECTION` (pre-v0.2.12 `VibeCodedTools_KnowledgeGraph`). Refactor of `commands/kg.rs::kg_list_collections` + `commands/maintenance.rs::parse_schema_response`. Closes a pre-existing strict-equality bug in `kg.rs` that demoted the shared KG from the "shared first" sort priority on case-different installs. 7 new unit tests.
+
+- **`chore(launcher)` cleanup batch — subscribe-leak fix + dead-shim removal + SPDX sweep (§A2/A3/A5)** (`7a54986`). `/preferences/+page.svelte`'s two popover-era `.subscribe()` calls switched to `$effect` (auto-unsubscribes on component destroy — eliminates the per-mount leak). `ui.ts::closeSettings` removed (no callers anywhere); `SettingsSection` narrowed from 5-value union to just `'secrets'`. SPDX-License-Identifier header added to 5 `templates/scripts/*.py` files.
+
+### Migration notes
+
+- After installing v0.2.24, the FIRST `Settings → Updates → Update orchestrator` click that runs over a working tree with user-modified allowlisted files will produce a synthetic `vco: pre-merge user-editable files via A0` commit on the local clone. Subsequent updates with no allowlisted-file diff produce no synthetic commit. Users running `git log` will see this commit — that's expected and documented in the orchestrator-install-flow KG node.
+
+- Free-tier installs now accumulate `rl_events.jsonl` events on every `hybrid_search` / `semantic_graph_search` call regardless of whether reranking happens (it doesn't on free tier) — the local-JSONL pipeline is gated only by the existing `RL_LOCAL_LOGGING_DISABLED` env-var opt-out (Preferences → "Collect retrieval data locally"). Users who opted out pre-v0.2.24 are unaffected.
+
+- The new `failure_mode` + `failed_collections` fields are additive in the `rl_events.jsonl` schema. Offline trainers should filter events where `failure_mode is not None` out of training-pair construction (no positive/negative target signal) but keep them as a failure-rate / query-distribution metric.
+
+- The legacy `.vscode/settings.json claude-code.env` MCP_* key detection emits an info-severity deferral on every `install-bundle --update` until the user removes the keys (or the whole `claude-code.env` block). The deferral provides an operator-driven `jq` recipe; the launcher does NOT auto-clean.
+
 ## [0.2.20] — 2026-05-19
 
 This release lands the client-side support for the first paid module

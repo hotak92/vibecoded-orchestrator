@@ -1,6 +1,6 @@
 [package]
 name = "vct-hub"
-version = "0.2.23"
+version = "0.2.24"
 edition = "2021"
 description = "Detached HTTP server for VCT — supervisor + resolver, survives launcher GUI close."
 authors = ["VibeCoded Tools"]
