@@ -1,6 +1,7 @@
 ---
 name: k8s-manifest-reviewer
 description: Reviews Kubernetes manifests (Deployment, StatefulSet, Service, Ingress, NetworkPolicy, etc.) for resource limits, probes, security context, PDBs, anti-affinity, image pinning, and network policies before they merge. Invoke when the user shares a manifest YAML, when a chart/kustomization PR appears, or before applying to prod.
+keywords: [Kubernetes, kubernetes, k8s, Deployment, StatefulSet, NetworkPolicy, Helm, kustomize, kubectl]
 model: opus
 effort: high
 ---

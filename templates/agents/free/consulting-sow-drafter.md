@@ -1,6 +1,7 @@
 ---
 name: consulting-sow-drafter
 description: Drafts a Statement of Work / proposal from discovery notes, applying the consulting framework appropriate to the contract type (T&M, fixed-price, retainer, outcome-based)
+keywords: [SOW, Statement of Work, fixed-price, T&M, retainer, outcome-based, consulting proposal]
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: opus
 effort: xhigh
