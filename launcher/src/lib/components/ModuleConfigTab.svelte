@@ -31,40 +31,31 @@
   import { onMount } from 'svelte';
   import { invoke, tauriAvailable } from '$lib/tauri';
   import { selectedProject } from '$lib/stores/projects';
+  import {
+    isActionDescriptor,
+    type ActionRef,
+    type ConfigControl,
+    type ConfigTab,
+  } from '$lib/types/manifest';
+  import TextInputControl from '$lib/components/module-controls/TextInputControl.svelte';
+  import NumberInputControl from '$lib/components/module-controls/NumberInputControl.svelte';
+  import StatusDisplayControl from '$lib/components/module-controls/StatusDisplayControl.svelte';
+  import FilePickerControl from '$lib/components/module-controls/FilePickerControl.svelte';
+  import LinkControl from '$lib/components/module-controls/LinkControl.svelte';
 
-  // ─── Schema types (mirror Rust manifest::ConfigControl) ───────────────
-  // Discriminated union keyed by `kind`. Adding a new kind requires:
+  // ─── Schema types ──────────────────────────────────────────────────────
+  //
+  // v0.2.26: the discriminated union + ActionRef types live in
+  // `$lib/types/manifest`. The 5 legacy kinds (checkbox / multi_select /
+  // button / select / info) are rendered inline below; the 5 new kinds
+  // (text_input / number_input / status_display / file_picker / link)
+  // each have a dedicated component under `module-controls/`.
+  //
+  // Adding a new kind requires:
   //   1. New variant in `manifest::ConfigControl` (Rust)
-  //   2. New case in renderControl() below
-  //   3. Doc update on both ends
-
-  type ConfigControl =
-    | { kind: 'checkbox'; id: string; label: string; tooltip?: string | null;
-        default?: boolean; on_change?: string | null }
-    | { kind: 'multi_select'; id: string; label: string; tooltip?: string | null;
-        options_source: string; on_change?: string | null }
-    | { kind: 'button'; id: string; label: string; tooltip?: string | null;
-        action: string; variant?: string | null; confirm?: string | null }
-    | { kind: 'select'; id: string; label: string; tooltip?: string | null;
-        options: { value: string; label: string }[];
-        default?: string | null; on_change?: string | null }
-    | { kind: 'info'; id: string; text: string; variant?: string | null };
-
-  interface ConfigSection {
-    title: string;
-    description?: string | null;
-    collapsible: boolean;
-    initially_collapsed?: boolean;
-    controls: ConfigControl[];
-  }
-
-  interface ConfigTab {
-    title: string;
-    icon?: string | null;
-    route?: string | null;
-    description?: string | null;
-    sections: ConfigSection[];
-  }
+  //   2. New variant in `$lib/types/manifest`
+  //   3. New case + component import below
+  //   4. Doc update on both sides.
 
   let { configTab, moduleId }: { configTab: ConfigTab; moduleId: string } =
     $props();
@@ -146,9 +137,9 @@
         if (control.kind !== 'multi_select') continue;
         const k = ckey(i, control.id);
         try {
-          const opts = await invoke<{ value: string; label: string }[]>(
+          const opts = await dispatchAction<{ value: string; label: string }[]>(
             control.options_source,
-            { moduleId, projectId },
+            null,
           );
           optionsByControl[k] = opts ?? [];
         } catch (e) {
@@ -157,6 +148,42 @@
       }
     }
   });
+
+  /**
+   * Route an ActionRef through the right Tauri command:
+   *   - string  → `invoke(action_string, { moduleId, projectId, value })`
+   *   - object  → `invoke('module_dispatch_action', { ... })`
+   *
+   * The string form preserves the v0.2.20-v0.2.25 wire contract for
+   * legacy in-tree commands that read `moduleId` / `projectId` directly.
+   * Some legacy callers also expect extra args (e.g. retrain commands
+   * want `project_ids`); the call sites that need those still pass them
+   * through `invoke()` directly so this helper stays uniform.
+   *
+   * Re-thrown errors let the caller toast or set inline state. All
+   * dispatch calls in this file go through here so back-compat lives
+   * in one place.
+   */
+  async function dispatchAction<T = unknown>(
+    action: ActionRef,
+    value: unknown = null,
+    extraArgs: Record<string, unknown> = {},
+  ): Promise<T> {
+    if (isActionDescriptor(action)) {
+      return invoke<T>('module_dispatch_action', {
+        moduleId,
+        projectId,
+        action,
+        value,
+      });
+    }
+    return invoke<T>(action, {
+      moduleId,
+      projectId,
+      value,
+      ...extraArgs,
+    });
+  }
 
   async function persistAndNotify(
     sectionIdx: number,
@@ -179,12 +206,10 @@
         projectId,
       });
       // 2. Optional `on_change` side-effect command. Manifest-declared.
+      //    v0.2.26: `on_change` is an ActionRef (legacy string OR
+      //    declarative descriptor). The dispatcher routes accordingly.
       if (control.on_change) {
-        await invoke(control.on_change, {
-          moduleId,
-          value: newValue,
-          projectId,
-        });
+        await dispatchAction(control.on_change, newValue);
       }
     } catch (e) {
       errors[k] = e instanceof Error ? e.message : String(e);
@@ -207,7 +232,11 @@
       // `global_train_projects` and pass its current selection. This
       // keeps the manifest's per-section UX flow ("pick projects, then
       // press retrain") working without a dedicated wire-up table.
-      const args: Record<string, unknown> = { moduleId, projectId };
+      //
+      // v0.2.26: this sniffing only applies to LEGACY string actions —
+      // declarative descriptors carry their own payload in `body` and
+      // ignore the sibling-multi_select convention entirely.
+      const extraArgs: Record<string, unknown> = {};
       // Forward known multi_select values as bonus args. The schema is
       // small enough that an O(controls) scan is fine.
       for (const section of configTab.sections) {
@@ -217,15 +246,15 @@
           const v = values[skey];
           if (Array.isArray(v)) {
             // Multi-select value comes out as Array<string> (option values).
-            args[sibling.id] = v;
+            extraArgs[sibling.id] = v;
             // Convenience alias for the RL commands which use `project_ids`.
             if (sibling.id === 'global_train_projects') {
-              args.projectIds = v;
+              extraArgs.projectIds = v;
             }
           }
         }
       }
-      await invoke(control.action, args);
+      await dispatchAction(control.action, null, extraArgs);
     } catch (e) {
       errors[k] = e instanceof Error ? e.message : String(e);
     } finally {
@@ -397,6 +426,36 @@
                     aria-label="More info"
                   >?</span>
                 </div>
+              {:else if control.kind === 'text_input'}
+                <TextInputControl
+                  {control}
+                  {moduleId}
+                  {projectId}
+                  disabled={!hasProject}
+                />
+              {:else if control.kind === 'number_input'}
+                <NumberInputControl
+                  {control}
+                  {moduleId}
+                  {projectId}
+                  disabled={!hasProject}
+                />
+              {:else if control.kind === 'status_display'}
+                <StatusDisplayControl
+                  {control}
+                  {moduleId}
+                  {projectId}
+                  disabled={!hasProject}
+                />
+              {:else if control.kind === 'file_picker'}
+                <FilePickerControl
+                  {control}
+                  {moduleId}
+                  {projectId}
+                  disabled={!hasProject}
+                />
+              {:else if control.kind === 'link'}
+                <LinkControl {control} disabled={!hasProject} />
               {/if}
 
               {#if err}
