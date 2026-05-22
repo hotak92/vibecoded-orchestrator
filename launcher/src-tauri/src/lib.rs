@@ -18,6 +18,14 @@ pub mod project_naming;
 mod quit_dialog;
 mod tray;
 
+// v0.2.26: WebKitGTK pre-flight probe — public so main.rs (which is a
+// separate compilation unit from this lib) can call it before Tauri
+// init. Linux-only at the use site; the module's own `#![cfg(...)]`
+// gate makes the whole file invisible on macOS / Windows so there's
+// nothing to expose there.
+#[cfg(target_os = "linux")]
+pub mod webkit_preflight;
+
 // Shared modules — live in vct-launcher-core. Re-exported here so the
 // existing `crate::db::Db` / `crate::manifest::*` / etc. usage across
 // the launcher continues to resolve. Only the DEFINITION moved; the

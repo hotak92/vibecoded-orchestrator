@@ -182,14 +182,22 @@ pub struct ConfigSection {
 /// kind requires extending `ModuleConfigTab.svelte`'s render dispatch
 /// AND documenting the new control here. Every variant carries
 /// `tooltip: Option<String>` so authors can always provide hover help.
+///
+/// v0.2.26 (2026-05-22): `action` / `on_change` / `options_source` fields
+/// changed from `String` (Tauri command name) to [`ActionRef`], which
+/// accepts EITHER a legacy command name (back-compat for v0.2.20-v0.2.25
+/// manifests) OR a structured [`ActionDescriptor`] that the generic
+/// `module_dispatch_action` Tauri command executes without per-module
+/// Rust code. Five new variants also landed: TextInput / NumberInput /
+/// StatusDisplay / FilePicker / Link.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum ConfigControl {
-    /// Boolean toggle. On change, the launcher invokes `on_change` (a
-    /// Tauri command name) with `{ moduleId, value }` if set, AND
-    /// writes the new value into `module_settings` via the generic
-    /// `set_module_setting` command (the renderer always persists,
-    /// regardless of `on_change`).
+    /// Boolean toggle. On change, the launcher invokes `on_change`
+    /// (either a Tauri command name or a structured action descriptor)
+    /// with `{ moduleId, value }` if set, AND writes the new value into
+    /// `module_settings` via the generic `set_module_setting` command
+    /// (the renderer always persists, regardless of `on_change`).
     #[serde(rename = "checkbox")]
     Checkbox {
         id: String,
@@ -199,36 +207,38 @@ pub enum ConfigControl {
         #[serde(default)]
         default: bool,
         #[serde(default)]
-        on_change: Option<String>,
+        on_change: Option<ActionRef>,
     },
     /// Multi-pick from a dynamic options list. The renderer calls
-    /// `options_source` (a Tauri command returning `Vec<SelectOption>`)
-    /// on mount, then renders checkboxes for each option. Selected
-    /// ids are persisted as a JSON array via the generic setting
-    /// store, and pushed to `on_change` when set.
+    /// `options_source` (legacy Tauri command name OR structured GET
+    /// descriptor returning `Vec<SelectOption>`) on mount, then renders
+    /// checkboxes for each option. Selected ids are persisted as a
+    /// JSON array via the generic setting store, and pushed to
+    /// `on_change` when set.
     #[serde(rename = "multi_select")]
     MultiSelect {
         id: String,
         label: String,
         #[serde(default)]
         tooltip: Option<String>,
-        /// Tauri command name returning `Vec<{value, label}>`.
-        options_source: String,
+        /// Tauri command name OR structured descriptor returning
+        /// `Vec<{value, label}>`.
+        options_source: ActionRef,
         #[serde(default)]
-        on_change: Option<String>,
+        on_change: Option<ActionRef>,
     },
-    /// Action button. When clicked, the renderer invokes `action` (a
-    /// Tauri command). If `confirm` is set, a confirmation dialog is
-    /// shown first. `variant` accepts `"primary"|"secondary"|"danger"`
-    /// for styling.
+    /// Action button. When clicked, the renderer invokes `action`
+    /// (legacy Tauri command name OR structured action descriptor). If
+    /// `confirm` is set, a confirmation dialog is shown first.
+    /// `variant` accepts `"primary"|"secondary"|"danger"` for styling.
     #[serde(rename = "button")]
     Button {
         id: String,
         label: String,
         #[serde(default)]
         tooltip: Option<String>,
-        /// Tauri command name invoked on click.
-        action: String,
+        /// Action invoked on click.
+        action: ActionRef,
         #[serde(default)]
         variant: Option<String>,
         /// Optional confirmation prompt. When set, the renderer shows
@@ -248,12 +258,12 @@ pub enum ConfigControl {
         #[serde(default)]
         default: Option<String>,
         #[serde(default)]
-        on_change: Option<String>,
+        on_change: Option<ActionRef>,
     },
     /// Informational banner. Read-only — no state, no persistence.
     /// `variant` accepts `"info"|"warning"`. Render-only — module
-    /// authors who need dynamic info text should use a Button +
-    /// future status widget instead.
+    /// authors who need dynamic info text should use a StatusDisplay
+    /// instead.
     #[serde(rename = "info")]
     Info {
         id: String,
@@ -261,12 +271,263 @@ pub enum ConfigControl {
         #[serde(default)]
         variant: Option<String>,
     },
+    /// v0.2.26: free-text string input with an Apply button. On apply,
+    /// `apply_action` fires; the container's response shape is
+    /// `{ valid: bool, message?: string }`. Persistence writes via
+    /// `set_module_setting` AFTER validation succeeds (or always, when
+    /// `apply_action` is None). Client-side regex validation can be
+    /// added later via a `pattern` field — server-side only in v1.
+    #[serde(rename = "text_input")]
+    TextInput {
+        id: String,
+        label: String,
+        #[serde(default)]
+        tooltip: Option<String>,
+        #[serde(default)]
+        default: String,
+        #[serde(default)]
+        placeholder: Option<String>,
+        /// Action invoked on Apply. None ⇒ value is persisted without
+        /// server-side validation.
+        #[serde(default)]
+        apply_action: Option<ActionRef>,
+    },
+    /// v0.2.26: numeric input. JSON value type is `number` (not
+    /// string). `step` controls granularity; `min`/`max` clamp the
+    /// allowed range.
+    #[serde(rename = "number_input")]
+    NumberInput {
+        id: String,
+        label: String,
+        #[serde(default)]
+        tooltip: Option<String>,
+        #[serde(default)]
+        default: Option<f64>,
+        #[serde(default)]
+        min: Option<f64>,
+        #[serde(default)]
+        max: Option<f64>,
+        #[serde(default)]
+        step: Option<f64>,
+        #[serde(default)]
+        on_change: Option<ActionRef>,
+    },
+    /// v0.2.26: polled status display. The renderer fetches `source`
+    /// on mount, then re-fetches on the interval declared in the
+    /// polling spec (or once if no polling). `render_template` is a
+    /// string with `{{field}}` placeholders substituted from the
+    /// response object.
+    #[serde(rename = "status_display")]
+    StatusDisplay {
+        id: String,
+        label: String,
+        #[serde(default)]
+        tooltip: Option<String>,
+        source: ActionRef,
+        /// Free-form template like `"{{status}} — model: {{model}}"`.
+        /// `{{field}}` tokens resolve from the response JSON's top-level
+        /// fields (dotted paths NOT supported in v1).
+        render_template: String,
+    },
+    /// v0.2.26: native file/directory picker. On selection, the
+    /// absolute path is persisted via `set_module_setting`. Tauri's
+    /// `@tauri-apps/plugin-dialog` provides the cross-OS native dialog.
+    #[serde(rename = "file_picker")]
+    FilePicker {
+        id: String,
+        label: String,
+        #[serde(default)]
+        tooltip: Option<String>,
+        /// Allowed file extensions (without leading dot). Empty ⇒ any.
+        /// Ignored when `directory: true`.
+        #[serde(default)]
+        extensions: Vec<String>,
+        /// When true, the dialog selects a directory instead of a file.
+        #[serde(default)]
+        directory: bool,
+        #[serde(default)]
+        on_change: Option<ActionRef>,
+    },
+    /// v0.2.26: clickable link. `target: "external"` opens in the
+    /// system browser (via `tauri_plugin_opener::open_url`); `target:
+    /// "internal"` calls SvelteKit's `goto(href)` to navigate inside
+    /// the launcher. Default target is `"external"`.
+    #[serde(rename = "link")]
+    Link {
+        id: String,
+        label: String,
+        #[serde(default)]
+        tooltip: Option<String>,
+        href: String,
+        #[serde(default = "default_link_target")]
+        target: String,
+    },
+}
+
+fn default_link_target() -> String {
+    "external".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SelectOption {
     pub value: String,
     pub label: String,
+}
+
+// ─── v0.2.26: ActionRef + ActionDescriptor ──────────────────────────────
+//
+// The schema-rendered GUI framework's biggest pre-v0.2.26 limitation:
+// every `action` / `on_change` / `options_source` field was a STRING
+// naming a Tauri command that had to be registered in the launcher's
+// `invoke_handler!`. Adding a paid module that needed a new command
+// required a launcher rebuild + signed release.
+//
+// v0.2.26 fixes this with a generic declarative dispatcher. The fields
+// gain a second form — a structured `ActionDescriptor` — that the
+// launcher executes via the single generic `module_dispatch_action`
+// Tauri command without per-module Rust code.
+//
+// Back-compat: the [`ActionRef`] enum is `#[serde(untagged)]`, so a JSON
+// string deserializes as `Legacy("cmd_name")` and a JSON object
+// deserializes as `Descriptor(...)`. v0.2.20-v0.2.25 manifests work
+// unchanged.
+
+/// Either a legacy Tauri command name OR a structured action descriptor.
+///
+/// Back-compat: a JSON string field deserializes as
+/// [`ActionRef::Legacy`]; a JSON object deserializes as
+/// [`ActionRef::Descriptor`]. The renderer dispatches accordingly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ActionRef {
+    /// Legacy form: name of a Tauri command registered in
+    /// `invoke_handler!`. Kept permanently for v0.2.20-v0.2.25 modules
+    /// and for in-tree controls that genuinely need Rust code.
+    Legacy(String),
+    /// Structured descriptor — the launcher's generic dispatcher
+    /// executes it. No per-module Tauri code required.
+    Descriptor(ActionDescriptor),
+}
+
+/// Declarative action that the generic `module_dispatch_action`
+/// command executes at dispatch time.
+///
+/// v1 ships ONE kind: `http`. Future kinds (e.g. `shell` for sandboxed
+/// subprocess actions) are intentionally NOT included — they would
+/// expand the trust surface significantly and need their own design
+/// pass.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum ActionDescriptor {
+    /// Issue an HTTP request to the module's container (resolved via
+    /// `db.get_project_module_port(project_id, module_id)`). The
+    /// optional `polling` block converts this from a fire-and-forget
+    /// call into a long-running pollable job. The optional
+    /// `next_action` chains another descriptor on success.
+    #[serde(rename = "http")]
+    Http {
+        method: HttpMethod,
+        path: String,
+        #[serde(default)]
+        body: Option<serde_json::Value>,
+        #[serde(default)]
+        polling: Option<PollingSpec>,
+        /// Chain a follow-up action on success. The chain is purely
+        /// lexical (nested JSON), so cycles are structurally impossible.
+        /// The dispatcher executes via an iterative loop guarded by
+        /// `max_chain_steps` (default 1024) to bound runaway depth.
+        #[serde(default)]
+        next_action: Option<Box<ActionDescriptor>>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum HttpMethod {
+    Get,
+    Post,
+    Put,
+    Delete,
+}
+
+/// Polling spec for long-running actions. When attached to an
+/// [`ActionDescriptor::Http`], the dispatcher:
+///   1. Issues the kick request (the parent descriptor's method+body).
+///   2. Reads the `job_id` from the kick response via `job_id_path`.
+///   3. Spawns a background poller that re-hits `endpoint` every
+///      `interval_seconds`, passing the job_id back as a query param.
+///   4. Emits a `progress_event` Tauri event on each tick.
+///   5. Stops when a terminal state is hit (success or failure) OR
+///      `max_attempts` is exceeded.
+///
+/// The renderer subscribes to `progress_event` + `failed_event` to
+/// update the UI without blocking the user's click handler.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PollingSpec {
+    /// Container-relative URL for the polling GET. e.g.
+    /// `/finetune_status`.
+    pub endpoint: String,
+    /// JSONPath into the kick response that locates the job id. e.g.
+    /// `$.job_id`. Currently supports only the top-level form
+    /// (`$.<key>`); deeper paths can be added in a later release.
+    #[serde(default = "default_job_id_path")]
+    pub job_id_path: String,
+    /// Query-parameter name the poller uses to pass the job id back.
+    /// Default `"job_id"`.
+    #[serde(default = "default_job_id_query_param")]
+    pub job_id_query_param: String,
+    #[serde(default = "default_polling_interval_seconds")]
+    pub interval_seconds: u64,
+    #[serde(default = "default_polling_max_attempts")]
+    pub max_attempts: u32,
+    /// JSONPath into the poll response locating the terminal-state
+    /// field. Default `$.state` (matches the RL container's
+    /// `/finetune_status` shape).
+    #[serde(default = "default_terminal_state_field")]
+    pub terminal_state_field: String,
+    /// State values that count as "done". Default `["done"]`.
+    #[serde(default = "default_terminal_success_values")]
+    pub terminal_success_values: Vec<String>,
+    /// State values that count as "failed". Default
+    /// `["failed", "error"]`.
+    #[serde(default = "default_terminal_failure_values")]
+    pub terminal_failure_values: Vec<String>,
+    /// Tauri event emitted on each poll tick. The payload is the full
+    /// poll response JSON. Default `"module://action-progress"`.
+    #[serde(default = "default_progress_event")]
+    pub progress_event: String,
+    /// Tauri event emitted on terminal failure. Default
+    /// `"module://action-failed"`.
+    #[serde(default = "default_failed_event")]
+    pub failed_event: String,
+}
+
+fn default_job_id_path() -> String {
+    "$.job_id".into()
+}
+fn default_job_id_query_param() -> String {
+    "job_id".into()
+}
+fn default_polling_interval_seconds() -> u64 {
+    5
+}
+fn default_polling_max_attempts() -> u32 {
+    60
+}
+fn default_terminal_state_field() -> String {
+    "$.state".into()
+}
+fn default_terminal_success_values() -> Vec<String> {
+    vec!["done".into()]
+}
+fn default_terminal_failure_values() -> Vec<String> {
+    vec!["failed".into(), "error".into()]
+}
+fn default_progress_event() -> String {
+    "module://action-progress".into()
+}
+fn default_failed_event() -> String {
+    "module://action-failed".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1075,6 +1336,20 @@ mod tests {
         assert_eq!(tab.sections[1].controls.len(), 4);
     }
 
+    /// Helper: unwrap an [`ActionRef`] to its legacy command name, or
+    /// panic. Used in legacy-form back-compat tests where the fixture
+    /// declares a plain string. v0.2.26+ tests that exercise structured
+    /// descriptors should pattern-match on `ActionRef::Descriptor`
+    /// directly.
+    fn action_ref_as_legacy(action: &ActionRef) -> &str {
+        match action {
+            ActionRef::Legacy(s) => s.as_str(),
+            ActionRef::Descriptor(d) => {
+                panic!("expected legacy ActionRef, got descriptor: {:?}", d)
+            }
+        }
+    }
+
     #[test]
     fn gui_block_checkbox_variant_round_trips_tooltip() {
         let manifest = ModuleManifest::from_json(gui_block_fixture_manifest()).unwrap();
@@ -1085,7 +1360,8 @@ mod tests {
                 assert_eq!(label, "Use feature");
                 assert_eq!(tooltip.as_deref(), Some("Hover help"));
                 assert!(*default);
-                assert_eq!(on_change.as_deref(), Some("set_feature"));
+                let on_change = on_change.as_ref().expect("on_change present");
+                assert_eq!(action_ref_as_legacy(on_change), "set_feature");
             }
             other => panic!("expected Checkbox, got {:?}", other),
         }
@@ -1098,7 +1374,7 @@ mod tests {
         match &controls[1] {
             ConfigControl::MultiSelect { id, options_source, tooltip, .. } => {
                 assert_eq!(id, "ms1");
-                assert_eq!(options_source, "list_options");
+                assert_eq!(action_ref_as_legacy(options_source), "list_options");
                 assert!(tooltip.is_some(), "tooltip declared in fixture");
             }
             other => panic!("expected MultiSelect, got {:?}", other),
@@ -1112,7 +1388,7 @@ mod tests {
         match &controls[2] {
             ConfigControl::Button { id, action, confirm, variant, .. } => {
                 assert_eq!(id, "btn1");
-                assert_eq!(action, "do_reset");
+                assert_eq!(action_ref_as_legacy(action), "do_reset");
                 assert_eq!(confirm.as_deref(), Some("Are you sure?"));
                 assert_eq!(variant.as_deref(), Some("danger"));
             }
@@ -1222,6 +1498,15 @@ mod tests {
                     ConfigControl::MultiSelect { .. } => has_multi_select = true,
                     ConfigControl::Info { .. } => has_info = true,
                     ConfigControl::Select { .. } => {}
+                    // v0.2.26+ kinds — not exercised by the current
+                    // vct-rl-reranker manifest, but acknowledged here
+                    // so a future RL manifest update that adds one of
+                    // them doesn't unexpectedly fail this test.
+                    ConfigControl::TextInput { .. }
+                    | ConfigControl::NumberInput { .. }
+                    | ConfigControl::StatusDisplay { .. }
+                    | ConfigControl::FilePicker { .. }
+                    | ConfigControl::Link { .. } => {}
                 }
             }
         }
@@ -1513,5 +1798,409 @@ mod tests {
         let manifest = ModuleManifest::from_json(raw).expect("must parse");
         let tab = manifest.gui.unwrap().config_tab.unwrap();
         assert!(!tab.show_in_sidebar);
+    }
+
+    // ─── v0.2.26 (2026-05-22): ActionRef / ActionDescriptor + 5 new control kinds ───
+    //
+    // The schema-rendered GUI gains a generic declarative HTTP-action
+    // dispatcher (`module_dispatch_action`), so paid modules can add
+    // new controls + endpoints WITHOUT shipping new Tauri commands.
+    //
+    // These tests pin:
+    //   (a) Back-compat — every v0.2.20–v0.2.25 manifest still parses
+    //       (the existing `gui_block_*` tests above cover this).
+    //   (b) ActionRef untagged-enum behaviour — strings map to Legacy,
+    //       objects map to Descriptor.
+    //   (c) Each of the 5 new control variants deserializes correctly
+    //       with realistic field values.
+    //   (d) PollingSpec defaults are applied when fields are omitted.
+    //   (e) Chained actions (`next_action`) deserialize at depth > 1.
+
+    /// String form of `action` → ActionRef::Legacy (back-compat).
+    #[test]
+    fn action_ref_string_deserializes_as_legacy() {
+        let json = r#""my_tauri_command""#;
+        let action: ActionRef = serde_json::from_str(json).expect("string parses");
+        match action {
+            ActionRef::Legacy(s) => assert_eq!(s, "my_tauri_command"),
+            ActionRef::Descriptor(_) => panic!("expected Legacy"),
+        }
+    }
+
+    /// Object form of `action` → ActionRef::Descriptor (the v0.2.26 path).
+    #[test]
+    fn action_ref_object_deserializes_as_descriptor() {
+        let json = r#"{ "kind": "http", "method": "POST", "path": "/reset", "body": {"strategy": "fork"} }"#;
+        let action: ActionRef = serde_json::from_str(json).expect("descriptor parses");
+        match action {
+            ActionRef::Legacy(s) => panic!("expected Descriptor, got Legacy({})", s),
+            ActionRef::Descriptor(ActionDescriptor::Http {
+                method,
+                path,
+                body,
+                polling,
+                next_action,
+            }) => {
+                assert_eq!(method, HttpMethod::Post);
+                assert_eq!(path, "/reset");
+                let body = body.expect("body present");
+                assert_eq!(body["strategy"], "fork");
+                assert!(polling.is_none(), "no polling declared");
+                assert!(next_action.is_none(), "no chained action");
+            }
+        }
+    }
+
+    /// HTTP methods round-trip in UPPERCASE (the wire convention).
+    #[test]
+    fn http_method_serializes_uppercase() {
+        let m = HttpMethod::Post;
+        let json = serde_json::to_string(&m).unwrap();
+        assert_eq!(json, "\"POST\"");
+        let back: HttpMethod = serde_json::from_str("\"DELETE\"").unwrap();
+        assert_eq!(back, HttpMethod::Delete);
+    }
+
+    /// Chained `next_action` nests at arbitrary depth (depth-3 fixture).
+    /// Pinned because the design doc allows arbitrary depth and the
+    /// dispatcher uses an iterative loop guarded by `max_chain_steps`
+    /// — the parser itself must not impose a depth limit.
+    #[test]
+    fn action_descriptor_next_action_nests_deeply() {
+        let json = r#"{
+            "kind": "http", "method": "POST", "path": "/step1",
+            "next_action": {
+                "kind": "http", "method": "POST", "path": "/step2",
+                "next_action": {
+                    "kind": "http", "method": "GET", "path": "/step3"
+                }
+            }
+        }"#;
+        let action: ActionDescriptor = serde_json::from_str(json).expect("depth-3 parses");
+        let ActionDescriptor::Http { next_action, .. } = action;
+        let inner = next_action.expect("level 2 present");
+        let ActionDescriptor::Http { next_action, path, .. } = *inner;
+        assert_eq!(path, "/step2");
+        let deepest = next_action.expect("level 3 present");
+        let ActionDescriptor::Http { method, path, next_action, .. } = *deepest;
+        assert_eq!(method, HttpMethod::Get);
+        assert_eq!(path, "/step3");
+        assert!(next_action.is_none(), "deepest leaf has no further chain");
+    }
+
+    /// PollingSpec applies serde defaults for every field except
+    /// `endpoint` (the only required one).
+    #[test]
+    fn polling_spec_defaults_apply_when_fields_omitted() {
+        let json = r#"{ "endpoint": "/finetune_status" }"#;
+        let p: PollingSpec = serde_json::from_str(json).expect("minimal polling parses");
+        assert_eq!(p.endpoint, "/finetune_status");
+        assert_eq!(p.job_id_path, "$.job_id");
+        assert_eq!(p.job_id_query_param, "job_id");
+        assert_eq!(p.interval_seconds, 5);
+        assert_eq!(p.max_attempts, 60);
+        assert_eq!(p.terminal_state_field, "$.state");
+        assert_eq!(p.terminal_success_values, vec!["done".to_string()]);
+        assert_eq!(
+            p.terminal_failure_values,
+            vec!["failed".to_string(), "error".to_string()]
+        );
+        assert_eq!(p.progress_event, "module://action-progress");
+        assert_eq!(p.failed_event, "module://action-failed");
+    }
+
+    /// PollingSpec round-trips a fully-specified body. Pins every
+    /// optional field's wire name so a future field-name refactor
+    /// breaks loudly at CI time rather than at manifest-load time.
+    #[test]
+    fn polling_spec_full_round_trips() {
+        let json = r#"{
+            "endpoint": "/finetune_status",
+            "job_id_path": "$.task_id",
+            "job_id_query_param": "task",
+            "interval_seconds": 10,
+            "max_attempts": 30,
+            "terminal_state_field": "$.status",
+            "terminal_success_values": ["ok", "complete"],
+            "terminal_failure_values": ["fail"],
+            "progress_event": "rl://progress",
+            "failed_event": "rl://failed"
+        }"#;
+        let p: PollingSpec = serde_json::from_str(json).expect("full polling parses");
+        assert_eq!(p.job_id_path, "$.task_id");
+        assert_eq!(p.job_id_query_param, "task");
+        assert_eq!(p.interval_seconds, 10);
+        assert_eq!(p.max_attempts, 30);
+        assert_eq!(p.terminal_success_values, vec!["ok".to_string(), "complete".to_string()]);
+        assert_eq!(p.progress_event, "rl://progress");
+    }
+
+    /// Canonical fixture exercising all five new v0.2.26 control kinds
+    /// PLUS a structured descriptor in the existing Button variant.
+    /// One place to read the full schema; every per-variant test below
+    /// pulls from here so reviewers see the wire shape at a glance.
+    fn v0_2_26_controls_fixture_manifest() -> &'static str {
+        r#"{
+            "id": "v0226-mod",
+            "name": "v0.2.26 Controls Module",
+            "version": "0.2.26",
+            "category": "paid-orchestrator",
+            "license": { "min_orchestrator_tier": "pro" },
+            "install": { "method": "git_clone", "source": "https://example.com/x.git" },
+            "runtime": { "type": "service", "command": "echo" },
+            "gui": {
+                "config_tab": {
+                    "title": "v0.2.26 Controls",
+                    "sections": [{
+                        "title": "All new kinds",
+                        "controls": [
+                            { "kind": "text_input", "id": "label", "label": "Display label",
+                              "tooltip": "Friendly name shown in dashboard.",
+                              "default": "Personal",
+                              "placeholder": "e.g. 'Work account'",
+                              "apply_action": {
+                                  "kind": "http", "method": "POST", "path": "/validate_label",
+                                  "body": {"label": "{{value}}"}
+                              }
+                            },
+                            { "kind": "number_input", "id": "learning_rate", "label": "Learning rate",
+                              "default": 0.001, "min": 0.0001, "max": 0.1, "step": 0.0001,
+                              "on_change": {
+                                  "kind": "http", "method": "POST", "path": "/set_lr",
+                                  "body": {"value": "{{value}}"}
+                              }
+                            },
+                            { "kind": "status_display", "id": "health", "label": "Container health",
+                              "source": {
+                                  "kind": "http", "method": "GET", "path": "/health",
+                                  "polling": {"endpoint": "/health", "interval_seconds": 30}
+                              },
+                              "render_template": "{{status}} — model: {{model}}"
+                            },
+                            { "kind": "file_picker", "id": "weights", "label": "Custom weights",
+                              "extensions": ["pt", "pth"], "directory": false
+                            },
+                            { "kind": "link", "id": "docs", "label": "Module docs",
+                              "href": "https://example.com/docs", "target": "external"
+                            },
+                            { "kind": "button", "id": "reset", "label": "Reset",
+                              "action": {
+                                  "kind": "http", "method": "POST", "path": "/reset",
+                                  "body": {"strategy": "fork"},
+                                  "next_action": {
+                                      "kind": "http", "method": "POST", "path": "/specialize",
+                                      "body": {"days": 30},
+                                      "polling": {
+                                          "endpoint": "/finetune_status",
+                                          "interval_seconds": 5,
+                                          "max_attempts": 60
+                                      }
+                                  }
+                              }
+                            }
+                        ]
+                    }]
+                }
+            }
+        }"#
+    }
+
+    /// All 6 controls in the fixture deserialize without error AND the
+    /// fixture as a whole is a valid `ModuleManifest`.
+    #[test]
+    fn v0_2_26_controls_fixture_deserializes() {
+        let m = ModuleManifest::from_json(v0_2_26_controls_fixture_manifest())
+            .expect("v0.2.26 fixture parses");
+        let controls = &m.gui.unwrap().config_tab.unwrap().sections[0].controls;
+        assert_eq!(controls.len(), 6, "all six new+repurposed controls present");
+    }
+
+    #[test]
+    fn text_input_variant_carries_apply_action() {
+        let m = ModuleManifest::from_json(v0_2_26_controls_fixture_manifest()).unwrap();
+        let controls = &m.gui.unwrap().config_tab.unwrap().sections[0].controls;
+        match &controls[0] {
+            ConfigControl::TextInput {
+                id,
+                label,
+                default,
+                placeholder,
+                apply_action,
+                ..
+            } => {
+                assert_eq!(id, "label");
+                assert_eq!(label, "Display label");
+                assert_eq!(default, "Personal");
+                assert_eq!(placeholder.as_deref(), Some("e.g. 'Work account'"));
+                let aa = apply_action.as_ref().expect("apply_action present");
+                match aa {
+                    ActionRef::Descriptor(ActionDescriptor::Http { path, method, .. }) => {
+                        assert_eq!(path, "/validate_label");
+                        assert_eq!(*method, HttpMethod::Post);
+                    }
+                    other => panic!("expected Http descriptor, got {:?}", other),
+                }
+            }
+            other => panic!("expected TextInput, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn number_input_variant_carries_range() {
+        let m = ModuleManifest::from_json(v0_2_26_controls_fixture_manifest()).unwrap();
+        let controls = &m.gui.unwrap().config_tab.unwrap().sections[0].controls;
+        match &controls[1] {
+            ConfigControl::NumberInput {
+                id, default, min, max, step, on_change, ..
+            } => {
+                assert_eq!(id, "learning_rate");
+                assert_eq!(*default, Some(0.001));
+                assert_eq!(*min, Some(0.0001));
+                assert_eq!(*max, Some(0.1));
+                assert_eq!(*step, Some(0.0001));
+                assert!(on_change.is_some(), "on_change present");
+            }
+            other => panic!("expected NumberInput, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn status_display_variant_carries_polling() {
+        let m = ModuleManifest::from_json(v0_2_26_controls_fixture_manifest()).unwrap();
+        let controls = &m.gui.unwrap().config_tab.unwrap().sections[0].controls;
+        match &controls[2] {
+            ConfigControl::StatusDisplay {
+                id, source, render_template, ..
+            } => {
+                assert_eq!(id, "health");
+                assert_eq!(render_template, "{{status}} — model: {{model}}");
+                match source {
+                    ActionRef::Descriptor(ActionDescriptor::Http { path, polling, method, .. }) => {
+                        assert_eq!(path, "/health");
+                        assert_eq!(*method, HttpMethod::Get);
+                        let p = polling.as_ref().expect("polling present");
+                        assert_eq!(p.interval_seconds, 30);
+                    }
+                    other => panic!("expected Http descriptor, got {:?}", other),
+                }
+            }
+            other => panic!("expected StatusDisplay, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn file_picker_variant_carries_extensions() {
+        let m = ModuleManifest::from_json(v0_2_26_controls_fixture_manifest()).unwrap();
+        let controls = &m.gui.unwrap().config_tab.unwrap().sections[0].controls;
+        match &controls[3] {
+            ConfigControl::FilePicker {
+                id, extensions, directory, ..
+            } => {
+                assert_eq!(id, "weights");
+                assert_eq!(extensions, &vec!["pt".to_string(), "pth".to_string()]);
+                assert!(!directory);
+            }
+            other => panic!("expected FilePicker, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn link_variant_carries_href_and_target() {
+        let m = ModuleManifest::from_json(v0_2_26_controls_fixture_manifest()).unwrap();
+        let controls = &m.gui.unwrap().config_tab.unwrap().sections[0].controls;
+        match &controls[4] {
+            ConfigControl::Link { id, href, target, .. } => {
+                assert_eq!(id, "docs");
+                assert_eq!(href, "https://example.com/docs");
+                assert_eq!(target, "external");
+            }
+            other => panic!("expected Link, got {:?}", other),
+        }
+    }
+
+    /// Link target defaults to `"external"` when omitted. Pins the
+    /// default so manifest authors don't have to spell it out.
+    #[test]
+    fn link_target_defaults_to_external() {
+        let json = r#"{
+            "kind": "link", "id": "L", "label": "Help",
+            "href": "https://example.com/help"
+        }"#;
+        let c: ConfigControl = serde_json::from_str(json).expect("Link without target parses");
+        match c {
+            ConfigControl::Link { target, .. } => assert_eq!(target, "external"),
+            other => panic!("expected Link, got {:?}", other),
+        }
+    }
+
+    /// Re-used button-with-chained-action assertion. Confirms a depth-2
+    /// chain ending in a polling spec deserializes correctly inside a
+    /// full manifest (not just the bare ActionDescriptor unit-test path).
+    #[test]
+    fn button_with_chained_polling_action_round_trips() {
+        let m = ModuleManifest::from_json(v0_2_26_controls_fixture_manifest()).unwrap();
+        let controls = &m.gui.unwrap().config_tab.unwrap().sections[0].controls;
+        match &controls[5] {
+            ConfigControl::Button { id, action, .. } => {
+                assert_eq!(id, "reset");
+                match action {
+                    ActionRef::Descriptor(ActionDescriptor::Http { path, next_action, .. }) => {
+                        assert_eq!(path, "/reset");
+                        let next = next_action.as_ref().expect("chain present");
+                        let ActionDescriptor::Http { path, polling, .. } = next.as_ref();
+                        assert_eq!(path, "/specialize");
+                        let p = polling.as_ref().expect("polling on inner action");
+                        assert_eq!(p.endpoint, "/finetune_status");
+                        assert_eq!(p.max_attempts, 60);
+                    }
+                    other => panic!("expected Http descriptor, got {:?}", other),
+                }
+            }
+            other => panic!("expected Button, got {:?}", other),
+        }
+    }
+
+    /// Back-compat: a manifest using the v0.2.20 plain-string `action`
+    /// form still deserializes after the v0.2.26 ActionRef change.
+    /// This is the load-bearing back-compat assertion — every
+    /// v0.2.20–v0.2.25 module manifest in the wild must keep working.
+    #[test]
+    fn legacy_string_action_form_remains_parseable() {
+        let raw = r#"{
+            "id": "legacy-button-mod",
+            "name": "Legacy Button Module",
+            "version": "0.1.0",
+            "category": "paid-orchestrator",
+            "license": { "min_orchestrator_tier": "free" },
+            "install": { "method": "git_clone", "source": "https://example.com/x.git" },
+            "runtime": { "type": "service", "command": "echo" },
+            "gui": {
+                "config_tab": {
+                    "title": "Legacy",
+                    "sections": [{
+                        "title": "Legacy controls",
+                        "controls": [
+                            { "kind": "button", "id": "b1", "label": "Do thing",
+                              "action": "legacy_tauri_command" },
+                            { "kind": "checkbox", "id": "c1", "label": "Toggle",
+                              "on_change": "legacy_on_change_cmd" },
+                            { "kind": "multi_select", "id": "ms1", "label": "Pick",
+                              "options_source": "legacy_options_source_cmd" }
+                        ]
+                    }]
+                }
+            }
+        }"#;
+        let m = ModuleManifest::from_json(raw).expect("legacy form parses");
+        let controls = &m.gui.unwrap().config_tab.unwrap().sections[0].controls;
+        assert!(matches!(&controls[0],
+            ConfigControl::Button { action: ActionRef::Legacy(s), .. } if s == "legacy_tauri_command"
+        ));
+        assert!(matches!(&controls[1],
+            ConfigControl::Checkbox { on_change: Some(ActionRef::Legacy(s)), .. } if s == "legacy_on_change_cmd"
+        ));
+        assert!(matches!(&controls[2],
+            ConfigControl::MultiSelect { options_source: ActionRef::Legacy(s), .. } if s == "legacy_options_source_cmd"
+        ));
     }
 }

@@ -161,6 +161,16 @@ dunce = "1"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# v0.2.26: WebKitGTK + EGL/GBM pre-flight probe. Used by
+# `src/webkit_preflight.rs` to dlopen libEGL.so.1 / libgbm.so.1 at
+# launcher startup and detect the NVIDIA-driver-mismatch crash signature
+# (EGL_NOT_INITIALIZED) BEFORE WebKit aborts the process. When the
+# probe fails, we set WEBKIT_DISABLE_DMABUF_RENDERER=1 so WebKit falls
+# back to its older renderer instead of aborting. Linux-only; no
+# functionality (and no dep) on macOS / Windows.
+[target.'cfg(target_os = "linux")'.dependencies]
+libloading = "0.8"
+
 # v0.2.17 (hotfix): direct windows-sys dep for `pid_is_alive`'s
 # Windows branch (OpenProcess + CloseHandle from
 # Win32::System::Threading + Win32::Foundation). Already in the

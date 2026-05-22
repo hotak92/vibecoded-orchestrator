@@ -98,6 +98,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "module_weights_state: per-(project × module × embedding_source) weights version / poll / finetune state (v0.2.21, Phase 3C)",
         sql: include_str!("migrations/016_module_weights_state.sql"),
     },
+    Migration {
+        version: 17,
+        description: "module_ports: generic per-(project × module) HTTP port (v0.2.26, declarative dispatcher generalization — replaces RL-only projects.rl_port as SoT)",
+        sql: include_str!("migrations/017_module_ports.sql"),
+    },
 ];
 
 /// Apply every migration whose version is greater than the current max applied.
