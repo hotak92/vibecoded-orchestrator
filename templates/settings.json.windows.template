@@ -149,6 +149,11 @@
             "type": "command",
             "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\kg-update-nudge.ps1",
             "timeout": 4
+          },
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\agent-skill-keyword-suggest.ps1",
+            "timeout": 2
           }
         ]
       }

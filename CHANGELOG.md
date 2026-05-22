@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`feat(launcher)` Launcher-GUI "disable agent/skill" toggle now physically moves files** into `.claude/agents.disabled/<name>.md` (or `.claude/skills.disabled/<name>/`), a sibling directory that falls outside Claude Code's `.claude/agents/*.md` + `.claude/skills/*/SKILL.md` discovery globs. Pre-v0.2.27 the toggle only flipped a DB column with no effect on Claude — disabled items kept appearing in autocomplete, autonomous invocation, and the `/agents` listing. The new layout takes them out of Claude's view without deleting user data; re-enable reverses the move. A one-time idempotent migration runs once per registered project on launcher startup (and on `install-bundle --update`) to bring existing `enabled=0` rows into the new layout.
+- **`feat(hooks)` New `agent-skill-keyword-suggest` UserPromptSubmit hook** surfaces relevant agents/skills based on case-sensitive whole-word matches against their `keywords:` frontmatter. Pure filesystem contract: globs `.claude/agents/*.md` and `.claude/skills/*/SKILL.md` — no DB lookup. Disabled items naturally fall outside the glob (see above). Seeded with discriminative keywords on a representative subset of agents and skills as a proof of concept; rolling out to the full catalog happens incrementally as owners pick keywords they actually want to be triggered on. Cross-OS pair: `templates/hooks/agent-skill-keyword-suggest.{sh,ps1}` + `templates/scripts/agent-skill-keyword-match.py`.
+- **`feat(install)` `install-bundle --update` no longer resurrects disabled agents/skills**. Pre-v0.2.27 a bundle update would re-copy any template file missing from `.claude/agents/` or `.claude/skills/`, silently undoing a user's disable choice. The new logic checks both the enabled location AND the `.disabled/` sibling before copying — a user's disable survives every future bundle update.
+
 ## [0.2.26] — 2026-05-22
 
 Headline release: a **generic declarative HTTP-action dispatcher** that

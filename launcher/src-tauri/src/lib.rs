@@ -620,6 +620,111 @@ pub fn run() {
                 }
             }
 
+            // v0.2.27 (Wave 2 / agent-skill-keyword-suggest-and-fs-disable
+            // plan): one-time migration sweep that moves any
+            // `enabled=0` agent/skill file from `.claude/agents/`
+            // (or `.claude/skills/`) into its sibling
+            // `.claude/agents.disabled/` (or `.claude/skills.disabled/`)
+            // directory. Pre-v0.2.27 the launcher's "disable" toggle
+            // only flipped a DB flag — Claude Code still discovered the
+            // file via its `.claude/agents/*.md` glob, so disabled
+            // entries kept appearing in autocomplete and autonomous
+            // invocation. The sibling-`.disabled/` layout takes them
+            // out of Claude's discovery globs without deleting user data.
+            //
+            // Idempotent: `migrate_disabled_files_to_disabled_dir` is a
+            // no-op for any row whose file is already in the right
+            // location (counted as `already_disabled`). Safe to run on
+            // every launcher boot; the steady-state cost is one bounded
+            // SQLite query per registered project + zero filesystem
+            // mutations.
+            //
+            // Soft-fail per project: one project's migration error
+            // (missing folder, permission denied, partial filesystem)
+            // MUST NOT block other projects' migrations or launcher
+            // boot. We log + continue. Per-file errors are bundled
+            // inside `MigrationReport.errors`; the sweep itself keeps
+            // going across files.
+            //
+            // Cost: O(disabled_rows) per project on the DB side; one
+            // `fs::rename` per file actually moved. After the first
+            // boot post-update the work is amortised to zero (no rows
+            // need moving). Bounded.
+            {
+                use tauri::Manager;
+                if let Some(db) = app.try_state::<db::Db>() {
+                    if let Ok(rows) = db.list_projects() {
+                        let mut total_moved = 0usize;
+                        for proj in &rows {
+                            let folder = std::path::PathBuf::from(&proj.folder_path);
+                            if !folder.is_dir() {
+                                // Project row points at a folder that
+                                // no longer exists on disk (deleted
+                                // externally). Skip silently — the
+                                // user will see the broken project in
+                                // the GUI; not our problem to surface
+                                // here.
+                                continue;
+                            }
+                            match db.migrate_disabled_files_to_disabled_dir(
+                                &proj.id, &folder,
+                            ) {
+                                Ok(report) => {
+                                    total_moved += report.moved;
+                                    // Only log when there's actually
+                                    // something interesting — a clean
+                                    // no-op (moved=0, no errors,
+                                    // nothing in both_locations) is
+                                    // the common steady state and
+                                    // doesn't deserve log noise.
+                                    if report.moved > 0
+                                        || !report.errors.is_empty()
+                                        || report.both_locations > 0
+                                    {
+                                        eprintln!(
+                                            "[vct] migrate-disabled: \
+                                             project={} moved={} \
+                                             already_disabled={} \
+                                             stale={} both={} errors={}",
+                                            proj.name,
+                                            report.moved,
+                                            report.already_disabled,
+                                            report.stale_rows,
+                                            report.both_locations,
+                                            report.errors.len(),
+                                        );
+                                        for err in &report.errors {
+                                            eprintln!(
+                                                "[vct]   migrate-disabled \
+                                                 warning ({}): {}",
+                                                proj.name, err,
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "[vct] migrate-disabled: \
+                                         project={} failed: {} \
+                                         (continuing with next project)",
+                                        proj.name, e,
+                                    );
+                                }
+                            }
+                        }
+                        if total_moved > 0 {
+                            eprintln!(
+                                "[vct] migrate-disabled: total {} \
+                                 agent/skill file(s) moved to \
+                                 .disabled/ siblings across {} project(s)",
+                                total_moved,
+                                rows.len(),
+                            );
+                        }
+                    }
+                }
+            }
+
             // v0.2.21 Step 6: bring up the detached vct-hub binary if
             // it isn't already running. `ensure_hub_running` is best-
             // effort — a missing binary or failed spawn drops the
