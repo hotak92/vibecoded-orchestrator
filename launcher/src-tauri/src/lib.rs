@@ -1016,6 +1016,13 @@ pub fn run() {
             commands::rl_settings::list_rl_global_training_source_projects,
             commands::rl_settings::retrain_global_online,
             commands::rl_settings::retrain_global_offline,
+            // v0.2.26 (2026-05-22): generic declarative HTTP-action
+            // dispatcher. Single Tauri command that executes any
+            // `ActionDescriptor::Http` descriptor declared in a
+            // manifest's `gui.config_tab` — no per-module Rust code
+            // required. See `commands/module_dispatch.rs` for the
+            // wire contract + trust surface notes.
+            commands::module_dispatch::module_dispatch_action,
             // Retrieval tuning (v0.2.22 Item #13 — 2026-05-20).
             // Global thresholds for score-driven retrieval verbosity
             // (KG tier cutoffs) + codegraph injection floor. Backed by

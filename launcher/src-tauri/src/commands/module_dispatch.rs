@@ -95,10 +95,21 @@ const HTTP_TIMEOUT_SECS: u64 = 30;
 
 // ─── Substitution context ───────────────────────────────────────────────
 
+/// Type alias for the `{{control:<id>}}` resolver closure. Lives in a
+/// type alias purely to silence clippy's "very complex type" lint and
+/// give callers a single place to reference when constructing one.
+pub type ControlValueResolver<'a> = Box<dyn Fn(&str) -> Option<Value> + Send + Sync + 'a>;
+
 /// Substitution context for `{{token}}` placeholders in the descriptor's
 /// `body`. Held by reference so the closure used for `{{control:<id>}}`
 /// lookups can borrow from the caller's settings cache without forcing
 /// a clone.
+///
+/// The closure carries `Send + Sync` bounds because the dispatcher
+/// holds a `&SubstitutionContext` across `.await` points and Tauri
+/// requires its command futures to be `Send`. Tests construct the
+/// closure via a regular `Box::new(|id| ...)` (closures are
+/// auto-`Send + Sync` when they don't capture non-`Send` state).
 pub struct SubstitutionContext<'a> {
     pub project_id: &'a str,
     pub module_id: &'a str,
@@ -107,7 +118,7 @@ pub struct SubstitutionContext<'a> {
     pub value: Option<&'a Value>,
     /// Resolver for `{{control:<id>}}` tokens — reads other controls'
     /// persisted settings. Returns `None` when the id is unknown.
-    pub get_control_value: Box<dyn Fn(&str) -> Option<Value> + 'a>,
+    pub get_control_value: ControlValueResolver<'a>,
 }
 
 impl<'a> SubstitutionContext<'a> {
@@ -546,9 +557,9 @@ async fn run_poller(
 
         // Read terminal_state_field via the same top-level mini-JSONPath.
         let state_value = jsonpath_top_level(&spec.terminal_state_field, &body_json).ok();
-        let state_str = state_value.as_ref().and_then(|v| match v {
-            Value::String(s) => Some(s.clone()),
-            other => Some(other.to_string()),
+        let state_str = state_value.as_ref().map(|v| match v {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
         });
         if let Some(s) = state_str {
             if spec.terminal_success_values.iter().any(|v| v == &s) {
