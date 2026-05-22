@@ -252,7 +252,13 @@ The dispatcher substitutes a **closed set** of `{{...}}` placeholders into the d
 
 **Why a closed set** — security boundary. Modules cannot smuggle arbitrary launcher state into request bodies. Adding new placeholders requires a launcher release (deliberate friction; each new variable is a forever-shipped contract).
 
-Renderer-side, `StatusDisplayControl` uses a sibling helper `renderTemplate()` for its `render_template` field — same `{{field}}` syntax, different resolution domain (response JSON's top-level keys instead of dispatch context). Missing fields render as `""` (empty), never `{{undefined}}`. Templates are inserted as text nodes — no XSS via response payloads.
+How `{{control:<id>}}` resolves at dispatch time (v0.2.26 implementation): the renderer snapshots its current per-control state map (id → JSON value) and sends it as `siblingValues` alongside every descriptor dispatch. The dispatcher's resolver closure reads the snapshot first; for any id not in the snapshot (cross-tab reference, future scheduler caller with no renderer context), it falls back to a `module_settings` DB read. Whole-string `"{{control:<id>}}"` substitution preserves the value's JSON type (an array stays an array, a number stays a number); embedded form stringifies via `serde_json::to_string`.
+
+Renderer-side, `StatusDisplayControl` uses a sibling helper `renderTemplate()` for its `render_template` field — same `{{field}}` syntax, different resolution domain (response JSON's top-level keys instead of dispatch context). **Flat keys only** — `{{response.user.name}}` is NOT supported in v1; dotted paths render as empty. This is symmetric with the dispatcher's `jsonpath_top_level` which restricts `polling.terminal_state_field` / `polling.job_id_path` to `$.<top-level-key>`. Both paths can be extended in a later release; for now, container authors flatten their response shape (e.g. emit `{"username": "alice"}` rather than `{"user": {"name": "alice"}}`).
+
+Missing fields render as `""` (empty), never `{{undefined}}`. Templates are inserted as text nodes — no XSS via response payloads.
+
+**Event-name discipline for polling actions.** The dispatcher emits `progress_event` / `failed_event` payloads as the raw poll-response body (no automatic `module_id` / `control_id` envelope in v0.2.26). If two `status_display` controls in the same module ever shared an event name they would both update on every tick. Recommended convention: namespace event names by `<module-id>://<control-id>-progress` (e.g. `"vct-rl-reranker://specialize-progress"`) so distinct controls have distinct streams. A future release may wrap the payload server-side with `{module_id, project_id, control_id, response}` and grandfather the flat form via a compatibility flag — until then, unique event names per control are the only collision boundary.
 
 #### What still requires a launcher rebuild
 
