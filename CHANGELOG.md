@@ -7,15 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.2.24.1] — 2026-05-22
+## [0.2.25] — 2026-05-22
 
-Follow-up patch for v0.2.24. Same Cargo `version = "0.2.24"` pins
-(SemVer doesn't allow 4-segment versions); the `v0.2.24.1` tag denotes
-the point-release on top of v0.2.24, matching the v0.2.23.1 precedent.
+Follow-up release for the v0.2.24 main feature drop. Originally
+attempted as `v0.2.24.1` (matching the v0.2.23.1 precedent of a
+point-release tag), but the release-CI's tag-vs-Cargo-version match
+check rejects 4-segment tags because SemVer (and therefore Cargo)
+doesn't allow them. Versions properly bumped to 0.2.25 across the
+6 standard pins.
 
 ### Fixed
 
-- **`fix(launcher)` embedding-catalog Tauri command `ModuleNotFoundError: vco_lib`** (A0ter). The per-project Settings → KG/Codegraph tab previously showed a permanent warning banner ("discover exit 1: ... No module named 'vco_lib'") and "Loading…" dropdowns stuck indefinitely. Root cause: `commands::embedding_catalog::run_discover` spawned `python -m vco_lib.embedding_service discover` without setting `cwd` to the orchestrator clone root, so Python's implicit-namespace-package resolution couldn't find the in-tree `vco_lib/` directory. Fix: resolve the clone root via the existing DB-cached `installer::resolve_install_root_sync(&db)` helper (the same pattern the v0.2.23.1 manifest scanners use) and pass it as `cwd`. Best-effort: if no clone root is discoverable, falls through with no cwd set — matches the pre-v0.2.24.1 failure mode rather than degrading further.
+- **`fix(launcher)` embedding-catalog Tauri command `ModuleNotFoundError: vco_lib`** (A0ter). The per-project Settings → KG/Codegraph tab previously showed a permanent warning banner ("discover exit 1: ... No module named 'vco_lib'") and "Loading…" dropdowns stuck indefinitely. Root cause: `commands::embedding_catalog::run_discover` spawned `python -m vco_lib.embedding_service discover` without setting `cwd` to the orchestrator clone root, so Python's implicit-namespace-package resolution couldn't find the in-tree `vco_lib/` directory. Fix: resolve the clone root via the existing DB-cached `installer::resolve_install_root_sync(&db)` helper (the same pattern the v0.2.23.1 manifest scanners use) and pass it as `cwd`. Best-effort: if no clone root is discoverable, falls through with no cwd set — matches the pre-fix failure mode rather than degrading further.
 
 ### Changed
 
