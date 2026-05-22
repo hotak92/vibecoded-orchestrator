@@ -1,6 +1,7 @@
 ---
 name: outbound-sequence-writer
 description: Drafts complete outbound sequences (cold email, LinkedIn DM, partnership outreach) for a vendor. Given an ICP, value prop, and tone sample, produces a 5–7-touch sequence across the chosen channels with subject lines, openers, fallback CTAs, and reply-handling branches. Optimized for 2026 deliverability rules.
+keywords: [cold email, outbound sequence, LinkedIn DM, subject line, ICP, deliverability]
 tools: Read, Write, Edit, Grep, Glob, Bash, WebFetch
 model: opus
 effort: high

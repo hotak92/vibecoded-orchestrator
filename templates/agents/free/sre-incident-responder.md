@@ -1,6 +1,7 @@
 ---
 name: sre-incident-responder
 description: Triages live production incidents - given a paged alert, dashboard URL, and recent change context, builds a hypothesis tree, proposes fast diagnostic commands, identifies which owners to ping, and drafts status-page + internal comms. Spawn during active incidents only.
+keywords: [paged, on-call, incident commander, status page, war room, hypothesis tree, SEV1, SEV2]
 tools: Read, Write, Edit, Glob, Grep, Bash, WebFetch
 model: opus
 effort: high

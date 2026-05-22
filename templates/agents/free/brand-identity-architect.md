@@ -1,6 +1,7 @@
 ---
 name: brand-identity-architect
 description: Develops complete visual brand identity systems (logo, typography, color, voice, applications) for products, companies, or design refreshes. Use when starting a brand from scratch, repositioning, or auditing an inconsistent identity.
+keywords: [brand identity, logomark, wordmark, typography system, brand guidelines, visual identity, rebrand]
 tools: Read, Write, Edit, Glob, Grep, WebFetch
 model: opus
 effort: high
