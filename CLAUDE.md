@@ -158,7 +158,7 @@ These four persistence layers exist for a reason — future-you, future-agents, 
     Explicit overrides (`titles`, `summary`, `single_chunk`, `three_chunks`, `full`) apply uniformly to every result. Tier thresholds are tunable via `KG_TIER_MIN` / `KG_TIER_SINGLE_CHUNK` / `KG_TIER_THREE_CHUNKS` / `KG_TIER_FULL` env vars.
   - Each result carries `score` (0..1) and `tier` (the verbosity actually applied).
 - `semantic_graph_search(query, depth, detail)` — GraphRAG with WikiLink traversal (~1–2 s). Same `detail="auto"` tiering on primary results; connected nodes always render at `summary` tier (graph topology, not score, drove their selection).
-- `store_knowledge_node(..., scope)` — Write node; `scope="project"` (default) or `scope="shared"` (writes into the shared `VibecodedOrchestrator_KnowledgeGraph` collection — visible to every other project).
+- `store_knowledge_node(..., scope)` — Write node; `scope="project"` (default) or `scope="shared"` (writes into the shared `VibeCodedOrchestrator_KnowledgeGraph` collection — visible to every other project).
 - Use when: conceptual queries, discovering patterns, comprehensive research.
 
 **3. Code Graph (Semantic Code Search)** — Weaviate MCP:
@@ -222,7 +222,16 @@ status: active  # active, archived, deprecated, idea
 - One node per tool/model/concept
 - Links unidirectional (projects → concepts)
 
-**Per-project isolation**: `KG_COLLECTION` (per-project KG) and `SHARED_KG_COLLECTION` (cross-project shared, default `VibecodedOrchestrator_KnowledgeGraph`) are set per-project via `.claude/settings.json` `env` — the canonical channel that propagates to MCP subprocesses on every Claude Code surface. The active workspace determines the active KG, not which project is being discussed. The launcher's Identity tab "Manage shared KG collection" picker lets you designate an existing orchestrator-shaped class as canonical (useful when migrating from an older install whose shared collection had a different name).
+**Per-project isolation**: `KG_COLLECTION` (per-project KG) and `SHARED_KG_COLLECTION` (cross-project shared, default `VibeCodedOrchestrator_KnowledgeGraph`) are set per-project via `.claude/settings.json` `env` — **the canonical channel** that propagates to MCP subprocesses on every Claude Code surface (CLI, Desktop app, VS Code extension). The active workspace determines the active KG, not which project is being discussed. The launcher's Identity tab "Manage shared KG collection" picker lets you designate an existing orchestrator-shaped class as canonical (useful when migrating from an older install whose shared collection had a different name).
+
+> ⚠️ **`.vscode/settings.json claude-code.env` does NOT propagate to MCP subprocesses on Linux** (sentinel testing 2026-05-16 against Claude Code 2.1.143; see PR-27 / v0.2.12 commit). Editing the VS Code key for KG / code-graph routing is a common footgun — values look correct in the workspace settings but the MCP subprocess sees nothing and falls back to bundled defaults. Always use `.claude/settings.json env` for KG / code-graph / embedding env vars; the launcher's per-project Identity tab writes this file. Verify with the MCP startup log line `weaviate-kg: resolved collections (...)` which shows what the subprocess actually picked up + the resolution source (env / hub / default). When a fallback to defaults happens, the MCP also emits a WARNING pointing at the same canonical channel.
+
+**Precedence order** (highest to lowest, where the resolved value reaches MCP subprocesses):
+1. vct-hub-resolved values (when the launcher is running; the MCP queries `vct-hub` on import and the hub returns the per-project ProjectConfig from `launcher.db`).
+2. Env vars from `.claude/settings.json env` (cross-editor canonical).
+3. Env vars from `.claude/env` (shell-sourced — CLI users who source it from their rc).
+4. Env vars from `~/.claude.json mcpServers.weaviate-kg.env` (the launcher intentionally restricts this to truly machine-invariant keys like `WEAVIATE_URL`; `KG_COLLECTION`-shape per-project keys are dropped from this surface, see `launcher/src-tauri/src/mcp_registration.rs::ALLOWED_ENV_KEYS`).
+5. Bundled defaults baked into `claude_mcp_servers/weaviate_mcp/server.py` (last-resort fallback; logged at WARNING when reached, and explicit empty-string env values for `KG_COLLECTION` are coerced to this default rather than used literally — see v0.2.27 fix).
 
 **Asymmetric shared-KG access**: every project ALWAYS reads the shared KG when `SHARED_KG_COLLECTION` is set — there is no per-project read opt-out (knowledge accumulates across all projects, by design). The per-project gate `SHARED_KG_WRITE_DISABLED=true` restricts only WRITES from this project to the shared collection (`store_knowledge_node(scope='shared')` returns an error rather than silently rerouting).
 
@@ -285,7 +294,7 @@ PowerShell variants (`*.ps1`) ship for Windows users.
 - **Active search vector**: controlled by `ACTIVE_EMBEDDING` env (`qwen3` default).
 - **Collections** (names depend on `PROJECT_NAME` / `KG_COLLECTION`):
   - `<KG_COLLECTION>` — per-project KG (`knowledge/`)
-  - `<SHARED_KG_COLLECTION>` — cross-project shared KG (default `VibecodedOrchestrator_KnowledgeGraph`)
+  - `<SHARED_KG_COLLECTION>` — cross-project shared KG (default `VibeCodedOrchestrator_KnowledgeGraph`)
   - `<DEVELOPMENT_COLLECTION>` — verbose project docs (`docs/`); auto-paired with KG by the launcher
   - `CodeModule`, `CodeClass`, `CodeFunction`, `CodeAPI`, `CodeInteraction` — code entities
 - **Access**: Weaviate MCP tools (`hybrid_search`, `semantic_graph_search`, `store_knowledge_node`, `search_code_graph`, `query_code_structure`).
@@ -414,7 +423,7 @@ Located in `.claude/hooks/` — automated workflow actions. On Windows the bash 
 - Format: Markdown with YAML frontmatter, typed WikiLinks.
 - Embedding: `qwen3-embedding:0.6b` (1024-dim) via Ollama.
 
-**2. Shared KG** (`VibecodedOrchestrator_KnowledgeGraph` by default):
+**2. Shared KG** (`VibeCodedOrchestrator_KnowledgeGraph` by default):
 - Cross-project patterns visible to every workspace.
 - Auto-merged into `hybrid_search` results — read access is unconditional.
 - Write to it explicitly with `store_knowledge_node(scope="shared", ...)`. Per-project gate `SHARED_KG_WRITE_DISABLED=true` refuses such writes with a clear error (no silent reroute to project KG).
