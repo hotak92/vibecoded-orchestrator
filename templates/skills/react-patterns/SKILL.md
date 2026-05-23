@@ -1,7 +1,7 @@
 ---
 name: react-patterns
 description: React best practices - component patterns, state management selection, performance optimization, testing strategies
-keywords: ["React hooks", useState, useEffect, "component state", useMemo, useCallback, Zustand]
+keywords: ["React hooks", useState, useEffect, "component state", useMemo, useCallback, Zustand, "React component", "React state", "React performance", "React testing", Redux, "React Context"]
 model: sonnet
 ---
 

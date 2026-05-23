@@ -1,7 +1,7 @@
 ---
 name: code-review-expert
 description: Deep code analysis identifying subtle bugs, security issues, performance problems, and architectural concerns requiring expert-level reasoning
-keywords: ["code review", "subtle bug", "production code", "security audit", "pre-release review", "edge case", "race condition", OWASP]
+keywords: ["code review", "subtle bug", "production code", "security audit", "pre-release review", "edge case", "race condition", OWASP, "review my code", "review this PR", "peer review", "pull request review", "PR review", "code quality"]
 model: opus
 ---
 

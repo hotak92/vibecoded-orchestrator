@@ -1,7 +1,7 @@
 ---
 name: code-migrator
 description: Migrate code between languages/frameworks with architecture review
-keywords: ["migrate", "framework upgrade", "breaking changes", "strangler pattern", "legacy code", codemod]
+keywords: ["migrate", "framework upgrade", "breaking changes", "strangler pattern", "legacy code", codemod, "port to", "upgrade framework", "migration from", "language migration", "framework migration", "port from"]
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
 effort: high
