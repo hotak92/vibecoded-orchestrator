@@ -1,6 +1,7 @@
 ---
 name: project-organizer
 description: Maintain overall project health - coordinate agents, prevent degradation, capture cross-project patterns
+short_desc: ongoing health hygiene, prevent degradation, patterns
 keywords: [project health, cross-project patterns, documentation hygiene, knowledge capture, prevent degradation, "project hygiene", "cleanup project", "organize project", "project cleanup", "clean up the project"]
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet

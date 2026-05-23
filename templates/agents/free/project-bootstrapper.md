@@ -1,6 +1,7 @@
 ---
 name: project-bootstrapper
 description: Creates new Claude Code project configuration from scratch with full Orchestrator workflow setup
+short_desc: creates new project from scratch with VCO setup
 keywords: [new project, bootstrap, from scratch, Claude Code setup, greenfield, "bootstrap project", "set up new project", "start a project", "init project", "create new project"]
 tools: Read, Write, Edit, Glob, Bash, Task, AskUserQuestion
 model: sonnet
