@@ -98,6 +98,30 @@ function createModulesStore() {
       }
     },
 
+    async update(projectId: string, moduleId: string): Promise<ModuleInstallRow> {
+      if (!tauriAvailable()) throw new Error('Tauri not available');
+      update((s) => ({ ...s, installingId: moduleId, error: null }));
+      try {
+        const row = await invoke<ModuleInstallRow>('update_module_for_project', {
+          projectId,
+          moduleId,
+        });
+        update((s) => ({
+          ...s,
+          installed: [...s.installed.filter((r) => r.module_id !== moduleId), row],
+          installingId: null,
+        }));
+        return row;
+      } catch (e) {
+        update((s) => ({
+          ...s,
+          installingId: null,
+          error: e instanceof Error ? e.message : String(e),
+        }));
+        throw e;
+      }
+    },
+
     async uninstall(projectId: string, moduleId: string, purgeData: boolean): Promise<void> {
       if (!tauriAvailable()) throw new Error('Tauri not available');
       try {

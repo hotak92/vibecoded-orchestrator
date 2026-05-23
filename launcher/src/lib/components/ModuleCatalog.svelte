@@ -16,7 +16,7 @@
   import { modules, installedIds } from '$lib/stores/modules';
   import { selectedProject, projects } from '$lib/stores/projects';
   import { license } from '$lib/stores/license';
-  import type { ModuleCatalogEntry } from '$lib/types/launcher';
+  import type { ModuleCatalogEntry, ModuleInstallRow } from '$lib/types/launcher';
   import DialogRoot from '$lib/components/DialogRoot.svelte';
 
   type Filter = 'all' | 'free' | 'pro' | 'installed';
@@ -145,6 +145,52 @@
     }
   }
 
+  async function handleUpdate(m: ModuleCatalogEntry) {
+    if (!project) {
+      alert('Select a project from the menu bar first.');
+      return;
+    }
+    try {
+      await modules.update(project.id, m.id);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      alert(`Update failed: ${msg}`);
+    }
+  }
+
+  /**
+   * Best-effort semver comparison. Splits on '.', parses the leading integer
+   * of each segment (so "0.2.4-dev" → 0.2.4), and compares lexicographically.
+   * Returns true iff `a` is strictly less than `b`.
+   */
+  function semverLess(a: string, b: string): boolean {
+    const parse = (v: string): number[] =>
+      v.split('.').map((s) => {
+        const match = s.match(/^(\d+)/);
+        return match ? parseInt(match[1], 10) : 0;
+      });
+    const aa = parse(a);
+    const bb = parse(b);
+    for (let i = 0; i < Math.max(aa.length, bb.length); i++) {
+      const x = aa[i] ?? 0;
+      const y = bb[i] ?? 0;
+      if (x < y) return true;
+      if (x > y) return false;
+    }
+    return false;
+  }
+
+  function hasUpdate(m: ModuleCatalogEntry, installRow: ModuleInstallRow | null): boolean {
+    if (!installRow?.module_version) return false;
+    return semverLess(installRow.module_version, m.version);
+  }
+
+  /** Centralized tier display label. Capitalizes "pro"/"mao"/"enterprise"/"admin". */
+  function tierLabel(min: string | null | undefined): string {
+    if (!min) return 'Free';
+    return min.charAt(0).toUpperCase() + min.slice(1);
+  }
+
   async function handleToggleEnabled(m: ModuleCatalogEntry, enabled: boolean) {
     if (!project) return;
     try {
@@ -227,7 +273,7 @@
                 <h3 class="card-name">{m.name}</h3>
                 {#if m.license_required}
                   <span class="tier-badge">
-                    {m.min_orchestrator_tier === 'free' ? 'Pro' : m.min_orchestrator_tier}
+                    {tierLabel(m.min_orchestrator_tier === 'free' ? 'pro' : m.min_orchestrator_tier)}
                   </span>
                 {:else}
                   <span class="tier-badge tier-free">Free</span>
@@ -267,30 +313,57 @@
                 </button>
               {/if}
             {:else if m.kind === 'installed' || isInstalled}
+              <!-- Installed: toggle + (optional Update) + Uninstall -->
               <label class="enabled-toggle">
                 <input
                   type="checkbox"
                   checked={installRow?.enabled ?? true}
                   onchange={(e) => handleToggleEnabled(m, (e.target as HTMLInputElement).checked)}
+                  aria-label="Enable or disable {m.name}"
                 />
                 <span>Enabled</span>
               </label>
               {#if installRow}
-                <button class="btn-3d btn-3d-ghost btn-3d-sm" onclick={() => handleUninstall(m)}>
+                {#if hasUpdate(m, installRow)}
+                  <button
+                    class="btn-3d btn-3d-primary btn-3d-sm"
+                    onclick={() => handleUpdate(m)}
+                    disabled={installing}
+                    aria-label="Update {m.name} from version {installRow.module_version} to version {m.version}"
+                  >
+                    {#if installing}
+                      <span class="spinner-sm"></span>
+                      Updating…
+                    {:else}
+                      Update v{installRow.module_version} → v{m.version}
+                    {/if}
+                  </button>
+                {/if}
+                <button
+                  class="btn-3d btn-3d-ghost btn-3d-sm"
+                  onclick={() => handleUninstall(m)}
+                  aria-label="Uninstall {m.name}"
+                >
                   Uninstall
                 </button>
               {:else}
                 <span class="status-badge status-badge-bundled">Installed</span>
               {/if}
             {:else if m.license_required && !m.is_licensed}
-              <button class="btn-3d btn-3d-secondary btn-3d-sm" onclick={onOpenActivation}>
-                Upgrade to Pro
+              <!-- Not installed + tier-required + unlicensed: activate, not "upgrade". -->
+              <button
+                class="btn-3d btn-3d-secondary btn-3d-sm"
+                onclick={onOpenActivation}
+                aria-label="Activate {tierLabel(m.min_orchestrator_tier)} license for {m.name}"
+              >
+                Activate license
               </button>
             {:else}
               <button
                 class="btn-3d btn-3d-primary btn-3d-sm"
                 onclick={() => handleInstall(m)}
                 disabled={installing || !project}
+                aria-label="Install {m.name}"
               >
                 {#if installing}
                   <span class="spinner-sm"></span>
