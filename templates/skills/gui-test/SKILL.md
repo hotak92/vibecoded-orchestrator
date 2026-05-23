@@ -1,7 +1,7 @@
 ---
 name: gui-test
 description: "Automated visual testing with Playwright MCP - test web apps, presentations, websites, and documents with scalable reviewer perspectives"
-keywords: [visual test, Playwright MCP, screenshot diff, web app test, UI test, Playwright, "visual regression"]
+keywords: [visual test, Playwright MCP, screenshot diff, web app test, UI test, Playwright, "visual regression", "automated GUI test", "test web app", "screenshot comparison", "visual diff", "presentation test", "document test"]
 model: sonnet
 ---
 
