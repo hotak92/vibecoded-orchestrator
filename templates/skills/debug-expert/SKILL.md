@@ -1,6 +1,7 @@
 ---
 name: debug-expert
 description: Investigate complex bugs, intermittent failures, performance degradations, and system-wide issues requiring deep reasoning across multiple components
+short_desc: investigate hard bugs: flaky, intermittent, races
 keywords: ["intermittent failure", "flaky test", "performance degradation", "race condition", "system-wide bug", "failure modes", RCA, bottleneck, "root cause", "bug report", debug, debugging, flaky, heisenbug, "hard to reproduce", "weird bug", intermittent]
 model: opus
 ---
