@@ -1,6 +1,7 @@
 ---
 name: expert-coder
 description: Opus-powered expert implementing complex features with deep architectural reasoning, security analysis, and multi-layer debugging capabilities
+keywords: ["complex refactor", "architectural reasoning", "multi-layer", "SOLID principles", "N+1 query"]
 tools: Read, Write, Edit, Grep, Glob, Bash
 model: opus
 effort: xhigh

@@ -1,6 +1,7 @@
 ---
 name: debug-expert
 description: Investigate complex bugs, intermittent failures, performance degradations, and system-wide issues requiring deep reasoning across multiple components
+keywords: ["intermittent failure", "flaky test", "performance degradation", "race condition", "system-wide bug"]
 model: opus
 ---
 
