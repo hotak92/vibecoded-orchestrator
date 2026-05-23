@@ -1,6 +1,7 @@
 ---
 name: workflow-maintain
 description: Analyzes project workflow setup and suggests/creates needed automation for hooks, scripts, skills, and agents
+keywords: [workflow automation, hooks, scripts, project setup, automation audit]
 tools: Read, Write, Edit, Grep, Glob, Bash, Task
 model: sonnet
 ---

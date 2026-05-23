@@ -1,6 +1,7 @@
 ---
 name: workflow-cost-estimator
 description: Calculates the realistic monthly cost envelope for a workflow design including LLM tokens, third-party API spend, compute/queue infrastructure, and per-vendor pricing tiers. Use before committing to an engine or before a workflow ships to production
+keywords: [cost envelope, monthly cost, token budget, vendor pricing, compute cost]
 model: opus
 effort: high
 ---
