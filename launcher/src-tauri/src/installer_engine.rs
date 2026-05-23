@@ -23,12 +23,19 @@ use crate::manifest::{CommandSpec, InstallMethod, ModuleManifest, PlaceholderCtx
 pub enum InstallStage {
     Clone,
     PostInstall,
+    /// v0.2.31 (#20-Fix-3): emitted by `run_upgrade` when a
+    /// `manifest.upgrade.migration_script` runs. Distinguishes
+    /// "post-pull data migration" from generic post_install steps in
+    /// the UI progress bar.
+    Migrate,
     Done,
-    // TODO: emit on install error (today errors propagate via Result and
-    // the progress channel never receives a Failed stage event — UI just
-    // sees the channel hang up). Wire a `report_error(stage, msg)` path
-    // through `installer_engine::run` to send Failed before propagating.
-    #[allow(dead_code)]
+    /// v0.2.31 (#27): emitted via `report_error` before an error return.
+    /// Pre-v0.2.31 errors propagated as `Result::Err` but the progress
+    /// channel never received a terminal event — the UI's progress bar
+    /// just saw the channel hang up. Now every error path in `run_install`
+    /// / `run_upgrade` calls `report_error(...)` first so the GUI sees
+    /// `stage=failed` + the error message before the Tauri command
+    /// returns Err.
     Failed,
 }
 
@@ -57,6 +64,26 @@ pub struct InstallProgress {
 /// caller hasn't probed hardware yet — the dispatch will fall back to
 /// the cpu variant, which is always safe to pull.
 pub async fn run_install(
+    app: &AppHandle,
+    manifest: &ModuleManifest,
+    ctx: &PlaceholderCtx,
+    project_id: &str,
+    gpu_mode: crate::commands::gpu_policy::GpuMode,
+) -> Result<PathBuf, String> {
+    // v0.2.31 (#27): wrap the body so every Err path emits InstallStage::Failed
+    // via the progress channel before propagating. The inner helper carries
+    // the same signature; this wrapper exists only to attach the terminal
+    // Failed event to error returns.
+    match run_install_inner(app, manifest, ctx, project_id, gpu_mode).await {
+        Ok(p) => Ok(p),
+        Err(e) => {
+            report_error(app, project_id, &manifest.id, InstallStage::Clone, &e);
+            Err(e)
+        }
+    }
+}
+
+async fn run_install_inner(
     app: &AppHandle,
     manifest: &ModuleManifest,
     ctx: &PlaceholderCtx,
@@ -601,6 +628,313 @@ pub(crate) fn resolve_variant_tag(
     }
 }
 
+/// v0.2.31 (#27): emit a terminal `InstallStage::Failed` event on the
+/// progress channel. Called by `run_install`'s outer wrapper and by
+/// `run_upgrade` on every error return path. The UI uses this event to
+/// flip the progress bar from "in flight" to "failed: <msg>" without
+/// waiting for the Tauri command's Result to deserialise.
+///
+/// `stage` is the LAST stage that was in flight when the error occurred
+/// (Clone / PostInstall / Migrate). It's advisory only — the UI keys off
+/// `InstallStage::Failed` to decide what to render.
+pub(crate) fn report_error(
+    app: &AppHandle,
+    project_id: &str,
+    module_id: &str,
+    _stage: InstallStage,
+    msg: &str,
+) {
+    let payload = InstallProgress {
+        project_id: project_id.to_string(),
+        module_id: module_id.to_string(),
+        stage: InstallStage::Failed,
+        step_index: 0,
+        step_total: 0,
+        percent: 0,
+        message: msg.to_string(),
+    };
+    let _ = app.emit("module://install-progress", payload);
+}
+
+/// v0.2.31 (#20-Fix-3): perform an in-place upgrade of an already-installed
+/// module to the catalog's current version. Parallel to `run_install` — does
+/// NOT modify it.
+///
+/// Behaviour:
+///   * Reads `manifest.upgrade` (`Option<UpgradeBlock>`).
+///   * If `Some(upgrade_block)`:
+///     1. Runs `upgrade_block.pre_upgrade` commands in declaration order
+///        (scrubbed env, same `run_post_install_command` mechanism as install).
+///     2. Re-fetches the artifact per `manifest.install.method`:
+///        - `GitClone`: `git pull` in `install_dir` if it's a git repo, else
+///          re-clones from `manifest.install.source` (cleans the dir first).
+///        - `ContainerPull`: `podman pull` (or `docker pull`) the resolved
+///          GPU-variant tag for `manifest.version` via the same token-gateway
+///          + `resolve_variant_tag` path the install uses.
+///        - `Local`: no-op (user has already updated the directory by hand).
+///     3. Runs `upgrade_block.post_upgrade` commands.
+///     4. If `upgrade_block.migration_script` is `Some(...)`, executes it
+///        as a single shell-tokenised command (same mechanism, scrubbed env).
+///   * If `None`: falls back to the legacy "uninstall + reinstall" sequence
+///     with a warning logged. The caller (`update_module_for_project`) is
+///     responsible for any DB cleanup that needs to happen between the
+///     uninstall + reinstall halves of the fallback; this function only
+///     handles the install-engine side (re-fetch the artifact).
+///
+/// Emits `module://install-progress` events with stage values
+/// `Clone` (fetch) / `PostInstall` (commands) / `Migrate` (migration script)
+/// / `Done` (success) / `Failed` (any error before Done).
+///
+/// `gpu_mode` is consulted in the same cases as `run_install` —
+/// `ContainerPull` + `manifest.runtime.gpu_image_variants.is_some()`.
+pub async fn run_upgrade(
+    app: &AppHandle,
+    manifest: &ModuleManifest,
+    previous_install: &crate::db::models::ModuleInstallRow,
+    ctx: &PlaceholderCtx,
+    project_id: &str,
+    gpu_mode: crate::commands::gpu_policy::GpuMode,
+) -> Result<PathBuf, String> {
+    // Outer wrapper: every Err path emits InstallStage::Failed before
+    // propagating (#27 contract — same as run_install).
+    match run_upgrade_inner(app, manifest, previous_install, ctx, project_id, gpu_mode).await {
+        Ok(p) => Ok(p),
+        Err(e) => {
+            report_error(app, project_id, &manifest.id, InstallStage::PostInstall, &e);
+            Err(e)
+        }
+    }
+}
+
+async fn run_upgrade_inner(
+    app: &AppHandle,
+    manifest: &ModuleManifest,
+    previous_install: &crate::db::models::ModuleInstallRow,
+    ctx: &PlaceholderCtx,
+    project_id: &str,
+    gpu_mode: crate::commands::gpu_policy::GpuMode,
+) -> Result<PathBuf, String> {
+    // v0.2.29 launcher-version gate: enforce min_launcher_version on
+    // updates the same way install does. A user could have installed
+    // module@0.1.0 on an old launcher; the new manifest@0.2.0 bumps
+    // min_launcher_version. Without this gate, the in-place upgrade
+    // would proceed and then fail mid-flight on missing APIs.
+    if let Some(required) = manifest.compatibility.min_launcher_version.as_deref() {
+        let required = required.trim();
+        if !required.is_empty() {
+            let current = env!("CARGO_PKG_VERSION");
+            if version_lt(current, required) {
+                return Err(format!(
+                    "module '{}' requires launcher >= {} but this launcher is {}. \
+                     Update the launcher first (Settings → Updates → Update orchestrator), \
+                     then retry the update.",
+                    manifest.id, required, current,
+                ));
+            }
+        }
+    }
+
+    let install_dir = ctx.resolve_install_dir(&manifest.install.install_dir);
+    let allowed_root = ctx.vct_modules.clone();
+    crate::manifest::validate_install_dir(&install_dir, &allowed_root)?;
+
+    let upgrade_block = match manifest.upgrade.as_ref() {
+        Some(b) => b.clone(),
+        None => {
+            // Legacy fallback: no upgrade block declared. Emit a warning
+            // log line and run a minimal "re-fetch artifact + skip
+            // post_install" sequence. The caller is responsible for any
+            // additional DB cleanup; here we just bring the on-disk
+            // artifact up to date.
+            eprintln!(
+                "[installer_engine] run_upgrade[{}]: manifest declares no `upgrade` block; \
+                 falling back to bare artifact re-fetch (no pre/post-upgrade hooks, no \
+                 migration script). For load-bearing upgrades the module author should \
+                 add an `upgrade` block with explicit pre_upgrade/post_upgrade commands.",
+                manifest.id,
+            );
+            // Re-fetch only. Treat as a single-step progress sequence.
+            emit_progress(
+                app, project_id, &manifest.id, InstallStage::Clone, 0, 1,
+                "Fetching updated source (legacy fallback)",
+            );
+            refetch_artifact(manifest, &install_dir, gpu_mode).await?;
+            emit_progress(
+                app, project_id, &manifest.id, InstallStage::Done, 1, 1,
+                "Update complete (legacy fallback)",
+            );
+            // previous_install kept for symmetry with the upgrade-block path;
+            // legacy fallback consults nothing on it.
+            let _ = previous_install;
+            return Ok(install_dir);
+        }
+    };
+
+    let migrate_steps = if upgrade_block.migration_script.is_some() { 1 } else { 0 };
+    let total_steps: u32 = (upgrade_block.pre_upgrade.len()
+        + 1 // re-fetch artifact
+        + upgrade_block.post_upgrade.len()
+        + migrate_steps) as u32;
+    let mut step_index: u32 = 0;
+
+    let ctx_with_dir = ctx.clone().with_install_dir(install_dir.clone());
+
+    // ─── pre_upgrade ─────────────────────────────────────────────────────
+    for (i, spec) in upgrade_block.pre_upgrade.iter().enumerate() {
+        let msg = format!(
+            "Running pre-upgrade step {}/{}",
+            i + 1, upgrade_block.pre_upgrade.len(),
+        );
+        emit_progress(
+            app, project_id, &manifest.id, InstallStage::PostInstall,
+            step_index, total_steps, &msg,
+        );
+        step_index += 1;
+        run_post_install_command(spec, &ctx_with_dir).await?;
+    }
+
+    // ─── re-fetch artifact ───────────────────────────────────────────────
+    emit_progress(
+        app, project_id, &manifest.id, InstallStage::Clone,
+        step_index, total_steps, "Fetching updated source",
+    );
+    step_index += 1;
+    refetch_artifact(manifest, &install_dir, gpu_mode).await?;
+
+    // ─── post_upgrade ────────────────────────────────────────────────────
+    for (i, spec) in upgrade_block.post_upgrade.iter().enumerate() {
+        let msg = format!(
+            "Running post-upgrade step {}/{}",
+            i + 1, upgrade_block.post_upgrade.len(),
+        );
+        emit_progress(
+            app, project_id, &manifest.id, InstallStage::PostInstall,
+            step_index, total_steps, &msg,
+        );
+        step_index += 1;
+        run_post_install_command(spec, &ctx_with_dir).await?;
+    }
+
+    // ─── migration_script (optional, one-shot) ───────────────────────────
+    if let Some(script_raw) = upgrade_block.migration_script.as_ref() {
+        emit_progress(
+            app, project_id, &manifest.id, InstallStage::Migrate,
+            step_index, total_steps, "Running migration script",
+        );
+        step_index += 1;
+        // Mirror CommandSpec's shape so the same scrubbed-env executor runs it.
+        let spec = CommandSpec {
+            cmd: script_raw.clone(),
+            cwd: None,
+            timeout_s: 600, // migrations may be slow; 10-min ceiling.
+            platform_cmd: std::collections::HashMap::new(),
+            note: None,
+        };
+        run_post_install_command(&spec, &ctx_with_dir).await?;
+    }
+
+    emit_progress(
+        app, project_id, &manifest.id, InstallStage::Done,
+        step_index, total_steps, "Update complete",
+    );
+
+    // previous_install is currently advisory (we report it back via the
+    // command's return value to the DB layer); future work may diff
+    // version strings here to short-circuit no-op upgrades.
+    let _ = previous_install;
+
+    Ok(install_dir)
+}
+
+/// v0.2.31 (#20-Fix-3): re-fetch the module's artifact for an in-place
+/// upgrade. Mirrors the fetch step of `run_install_inner` but is
+/// idempotent across "directory already exists" cases:
+///   - `GitClone`: `git pull` if `install_dir/.git` exists, else
+///     wipe + re-clone (handles user-corrupted dirs gracefully).
+///   - `ContainerPull`: `podman pull` the resolved variant tag.
+///   - `Local`: no-op (user has already updated by hand).
+async fn refetch_artifact(
+    manifest: &ModuleManifest,
+    install_dir: &Path,
+    gpu_mode: crate::commands::gpu_policy::GpuMode,
+) -> Result<(), String> {
+    match manifest.install.method {
+        InstallMethod::GitClone => {
+            let git_dir = install_dir.join(".git");
+            if git_dir.exists() {
+                // Existing checkout — git pull preserves any user-edited
+                // gitignored files (e.g. local config under the install
+                // dir).
+                let status = Command::new("git")
+                    .args(["-C"])
+                    .arg(install_dir)
+                    .args(["pull", "--ff-only"])
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .status()
+                    .await
+                    .map_err(|e| format!("spawn git pull: {}", e))?;
+                if !status.success() {
+                    return Err(format!(
+                        "git pull failed (exit {}) in {}: \
+                         install_dir may have diverged from upstream; \
+                         re-install the module to recover.",
+                        status.code().unwrap_or(-1),
+                        install_dir.display(),
+                    ));
+                }
+            } else {
+                // No .git dir — fall back to a fresh clone. Remove the
+                // existing dir first so `git clone` doesn't refuse.
+                if install_dir.exists() {
+                    tokio::fs::remove_dir_all(install_dir).await.map_err(|e| {
+                        format!(
+                            "remove pre-existing install_dir {} before re-clone: {}",
+                            install_dir.display(),
+                            e,
+                        )
+                    })?;
+                }
+                git_clone(
+                    manifest.install.source.as_deref().ok_or(
+                        "install.source required for git_clone upgrade fallback",
+                    )?,
+                    manifest.install.r#ref.as_deref().unwrap_or("main"),
+                    install_dir,
+                )
+                .await?;
+            }
+        }
+        InstallMethod::Local => {
+            // No-op: user updated the directory by hand. Sanity-check
+            // existence so we surface a clear error if the dir vanished.
+            if !install_dir.exists() {
+                return Err(format!(
+                    "install.method=local but install_dir is missing: {}",
+                    install_dir.display(),
+                ));
+            }
+        }
+        InstallMethod::ContainerPull => {
+            let container = manifest.install.container.as_ref().ok_or(
+                "install.method=container_pull requires install.container block",
+            )?;
+            let base_tag = if container.tag_from_version {
+                manifest.version.clone()
+            } else {
+                manifest
+                    .install
+                    .r#ref
+                    .clone()
+                    .unwrap_or_else(|| "latest".to_string())
+            };
+            let tag = resolve_variant_tag(manifest, &base_tag, gpu_mode);
+            container_pull(container, &tag, &manifest.id).await?;
+        }
+    }
+    Ok(())
+}
+
 /// v0.2.29: tiny semver comparison used by the `min_launcher_version`
 /// gate. Returns true iff `a < b` lexicographically over numeric
 /// components. Non-numeric prefixes of each dot-separated component are
@@ -755,5 +1089,138 @@ mod tests {
         // so suffixes are effectively ignored.
         assert!(version_lt("0.2.28-dev", "0.2.29"));
         assert!(!version_lt("0.2.29-rc1", "0.2.29"));
+    }
+
+    // ─── v0.2.31 #20-Fix-3: refetch_artifact (Local no-op) ──────────────
+    //
+    // The full `run_upgrade` path needs an AppHandle (for emit_progress)
+    // which isn't easily mockable in unit tests. We test the helper
+    // `refetch_artifact` directly for the Local install method — it
+    // should be a clean no-op when install_dir exists, and Err when it
+    // doesn't. The GitClone + ContainerPull paths touch network / git /
+    // podman and are out of scope for unit tests (they're covered by
+    // integration tests run against a real catalog at release time).
+
+    fn manifest_for_local_install(install_dir: &str) -> ModuleManifest {
+        // Note: `install.method=local` with an empty `install.install_dir`
+        // would default to `{VCT_MODULES}/{MODULE_ID}` which doesn't exist
+        // in the test sandbox. We override `install_dir` to a tempdir path.
+        let raw = serde_json::json!({
+            "manifest_version": 1,
+            "id": "vct-test-local-refetch",
+            "name": "Local Refetch Test",
+            "version": "0.2.0",
+            "description": "Test fixture for refetch_artifact Local no-op.",
+            "category": "community",
+            "license": {"required": false, "min_orchestrator_tier": "free"},
+            "compatibility": {"hosts": ["base"]},
+            "install": {
+                "method": "local",
+                "install_dir": install_dir,
+            },
+            "runtime": {"type": "service", "command": "echo", "args": []}
+        });
+        ModuleManifest::from_json(&raw.to_string())
+            .unwrap_or_else(|e| panic!("parse fixture: {}", e))
+    }
+
+    #[test]
+    fn refetch_artifact_local_method_is_noop_when_dir_exists() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+        rt.block_on(async {
+            let tmp = tempfile::tempdir().expect("create tempdir");
+            let install_dir = tmp.path().join("local-install");
+            tokio::fs::create_dir_all(&install_dir).await.unwrap();
+            // Drop a sentinel file so we can verify nothing was wiped.
+            let sentinel = install_dir.join("sentinel.txt");
+            tokio::fs::write(&sentinel, b"keep").await.unwrap();
+
+            let manifest =
+                manifest_for_local_install(&install_dir.display().to_string());
+            let res = refetch_artifact(&manifest, &install_dir, GpuMode::Cpu).await;
+            assert!(res.is_ok(), "local refetch must succeed when dir exists: {:?}", res);
+            assert!(sentinel.exists(), "Local refetch must not touch user files");
+            let body = tokio::fs::read(&sentinel).await.unwrap();
+            assert_eq!(&body, b"keep", "Local refetch must not modify files");
+        });
+    }
+
+    #[test]
+    fn refetch_artifact_local_method_errs_when_dir_missing() {
+        // If a user's `install.method=local` install_dir vanished between
+        // install + update, surface a clear error rather than silently
+        // succeeding. run_upgrade propagates this as a Failed event.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+        rt.block_on(async {
+            let tmp = tempfile::tempdir().expect("create tempdir");
+            let install_dir = tmp.path().join("never-existed");
+            let manifest =
+                manifest_for_local_install(&install_dir.display().to_string());
+            let res = refetch_artifact(&manifest, &install_dir, GpuMode::Cpu).await;
+            assert!(res.is_err(), "missing install_dir must Err");
+            let msg = res.unwrap_err();
+            assert!(
+                msg.contains("install_dir is missing")
+                    || msg.contains("missing"),
+                "error must mention missing dir; got: {}",
+                msg
+            );
+        });
+    }
+
+    // ─── v0.2.31 #27: report_error wiring ───────────────────────────────
+    //
+    // `report_error` constructs the InstallProgress payload that the UI
+    // consumes. We can't easily verify the Tauri event emission without
+    // an AppHandle (which can't be constructed in unit tests), but we CAN
+    // verify the payload shape via direct construction — the same shape
+    // report_error builds and emits. This pins the wire contract: stage
+    // == Failed, percent == 0, message carries the error verbatim.
+
+    #[test]
+    fn install_progress_payload_serializes_failed_stage_correctly() {
+        // Pin the JSON wire contract for the Failed stage so a future
+        // refactor of InstallStage doesn't accidentally rename the
+        // serde value the GUI's TypeScript types depend on.
+        let payload = InstallProgress {
+            project_id: "p1".to_string(),
+            module_id: "m1".to_string(),
+            stage: InstallStage::Failed,
+            step_index: 0,
+            step_total: 0,
+            percent: 0,
+            message: "test failure".to_string(),
+        };
+        let json = serde_json::to_value(&payload).expect("serialize InstallProgress");
+        assert_eq!(json["stage"], "failed", "stage must serialize as snake_case 'failed'");
+        assert_eq!(json["message"], "test failure");
+        assert_eq!(json["percent"], 0);
+        assert_eq!(json["project_id"], "p1");
+        assert_eq!(json["module_id"], "m1");
+    }
+
+    #[test]
+    fn install_progress_payload_serializes_migrate_stage() {
+        // Same wire-contract pin for the new Migrate stage (added in
+        // v0.2.31 #20-Fix-3 for upgrade migration_script execution).
+        let payload = InstallProgress {
+            project_id: "p1".to_string(),
+            module_id: "m1".to_string(),
+            stage: InstallStage::Migrate,
+            step_index: 3,
+            step_total: 5,
+            percent: 60,
+            message: "Running migration script".to_string(),
+        };
+        let json = serde_json::to_value(&payload).expect("serialize InstallProgress");
+        assert_eq!(json["stage"], "migrate", "stage must serialize as snake_case 'migrate'");
+        assert_eq!(json["step_index"], 3);
+        assert_eq!(json["step_total"], 5);
     }
 }

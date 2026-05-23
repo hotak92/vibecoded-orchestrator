@@ -1062,6 +1062,10 @@ pub fn run() {
             // Modules — catalog + install + lifecycle
             commands::modules::list_module_catalog,
             commands::modules::install_module_for_project,
+            // v0.2.31 #20-Fix-3: in-place update path (parallel to install).
+            // Reads manifest.upgrade UpgradeBlock — runs pre_upgrade, re-fetches
+            // the artifact, runs post_upgrade, optionally runs migration_script.
+            commands::modules::update_module_for_project,
             commands::modules::uninstall_module_v2,
             commands::modules::list_installed_modules,
             commands::modules::module_status_v2,

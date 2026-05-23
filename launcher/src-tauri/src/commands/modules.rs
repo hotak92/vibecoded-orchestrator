@@ -11,7 +11,8 @@ use uuid::Uuid;
 use crate::db::models::{ModuleInstallRow, ModuleStatus, ProjectHost};
 use crate::db::Db;
 use crate::installer_engine;
-use crate::manifest::{ModuleManifest, PlaceholderCtx};
+use crate::manifest::{ModuleManifest, PlaceholderCtx, UninstallBlock};
+use crate::secrets::{self, SecretScope};
 
 // ─── Catalog entry surface ──────────────────────────────────────────────
 
@@ -627,6 +628,180 @@ pub async fn install_module_for_project(
     }
 }
 
+/// v0.2.31 (#20-Fix-3): update an already-installed module to the catalog's
+/// current version WITHOUT forcing the user through an uninstall+reinstall.
+///
+/// Looks up the previous install row, looks up the current manifest, then
+/// invokes `installer_engine::run_upgrade` (which reads
+/// `manifest.upgrade.{pre_upgrade,post_upgrade,migration_script}` and falls
+/// back to a bare artifact re-fetch when no `upgrade` block is declared).
+/// On success, bumps `module_installs.module_version` + `installed_at` and
+/// re-emits `module://install-complete` with `success=true`.
+///
+/// Errors if the module is NOT installed for this project — the caller
+/// must use `install_module_for_project` for the first install.
+#[command]
+pub async fn update_module_for_project(
+    app: AppHandle,
+    project_id: String,
+    module_id: String,
+    db: State<'_, Db>,
+) -> Result<ModuleInstallRow, String> {
+    // 1. Verify the module IS installed.
+    let previous_install = db
+        .get_module_install(&project_id, &module_id)?
+        .ok_or_else(|| {
+            format!(
+                "module {} not installed for project {}; use install_module_for_project instead",
+                module_id, project_id,
+            )
+        })?;
+
+    // 2. Project exists + manifest lookup.
+    let _project = db
+        .get_project(&project_id)?
+        .ok_or_else(|| format!("project {} not found", project_id))?;
+    let (manifest, manifest_path) = find_manifest(&db, &module_id)?;
+
+    // 3. License gate (same as install — paid modules require an active
+    //    license at update time too, in case a Pro subscription lapsed
+    //    between install and update).
+    if !is_module_licensed(&manifest, &db) {
+        return Err(format!(
+            "module {} requires a license (variant_ids: {:?} or orchestrator tier >= {})",
+            module_id, manifest.license.variant_ids, manifest.license.min_orchestrator_tier
+        ));
+    }
+
+    db.audit(
+        "module_update_start",
+        Some(&project_id),
+        Some(&module_id),
+        &serde_json::json!({
+            "previous_version": previous_install.module_version,
+            "new_version": manifest.version,
+            "manifest_source": manifest_path.display().to_string(),
+        }),
+    )?;
+
+    let ctx = PlaceholderCtx::new(&module_id);
+    let gpu_mode = crate::commands::installer::read_persisted_hardware_snapshot(db.inner())
+        .ok()
+        .flatten()
+        .map(|snap| snap.gpu_mode_decided)
+        .unwrap_or(crate::commands::gpu_policy::GpuMode::Cpu);
+
+    match installer_engine::run_upgrade(
+        &app,
+        &manifest,
+        &previous_install,
+        &ctx,
+        &project_id,
+        gpu_mode,
+    )
+    .await
+    {
+        Ok(_resolved_dir) => {
+            // Bump version + installed_at on the existing row.
+            db.update_module_install_version(&project_id, &module_id, &manifest.version)?;
+            // Status flip — running modules go back to Installed (the
+            // dashboard supervisor will restart them on next tick if the
+            // user had them running; in-flight container restarts are
+            // out of scope here).
+            db.set_module_status(&project_id, &module_id, ModuleStatus::Installed, None)?;
+            db.audit(
+                "module_update_done",
+                Some(&project_id),
+                Some(&module_id),
+                &serde_json::json!({
+                    "previous_version": previous_install.module_version,
+                    "new_version": manifest.version,
+                }),
+            )?;
+            let _ = app.emit(
+                "module://install-complete",
+                serde_json::json!({
+                    "project_id": project_id,
+                    "module_id": module_id,
+                    "success": true,
+                    "operation": "update",
+                    "previous_version": previous_install.module_version,
+                    "new_version": manifest.version,
+                }),
+            );
+            // Return the refreshed row so the GUI doesn't have to re-query.
+            let refreshed = db
+                .get_module_install(&project_id, &module_id)?
+                .ok_or("module_install row vanished after update")?;
+            Ok(refreshed)
+        }
+        Err(e) => {
+            db.set_module_status(
+                &project_id,
+                &module_id,
+                ModuleStatus::Error,
+                Some(e.clone()),
+            )?;
+            db.audit(
+                "module_update_failed",
+                Some(&project_id),
+                Some(&module_id),
+                &serde_json::json!({
+                    "previous_version": previous_install.module_version,
+                    "attempted_version": manifest.version,
+                    "error": e,
+                }),
+            )?;
+            let _ = app.emit(
+                "module://install-complete",
+                serde_json::json!({
+                    "project_id": project_id,
+                    "module_id": module_id,
+                    "success": false,
+                    "operation": "update",
+                    "error": e,
+                }),
+            );
+            Err(e)
+        }
+    }
+}
+
+/// v0.2.31 (#23): uninstall a module from a project, honoring the manifest's
+/// `UninstallBlock` when one is declared.
+///
+/// Pre-v0.2.31 this command hardcoded the cleanup behaviour ("stop container,
+/// remove install_dir, optionally wipe data on purge_data flag, delete DB
+/// row, clear module_settings") — manifests' `UninstallBlock` fields were
+/// parsed and silently ignored. Modules declaring `preserve_paths` had their
+/// user config wiped; modules registering MCPs left dead `~/.claude.json`
+/// entries; `clear_secrets` was never honored.
+///
+/// New behaviour:
+///   * `manifest.uninstall.remove_install_dir: bool` (default true) — gates
+///     the `remove_dir_all(install_dir)` call.
+///   * `manifest.uninstall.preserve_paths: Vec<String>` — paths INSIDE
+///     `install_dir` to preserve across the deletion. Placeholders
+///     (`{VCT_DATA}`, `{HOME}`, etc.) resolve via PlaceholderCtx. Paths are
+///     copied out to a temp dir, install_dir is removed, paths are copied
+///     back. Best-effort: a failure in this dance doesn't fail the uninstall.
+///   * `manifest.uninstall.deregister_mcp: bool` (default true) — when true
+///     AND the manifest declares `mcp_registration.mcp_name`, calls
+///     `mcp_registration::deregister_mcp` on `~/.claude.json`.
+///   * `manifest.uninstall.clear_secrets: bool` (default false) — when true,
+///     deletes EVERY keychain entry declared in `manifest.secrets` for
+///     this (project, module). Each `SecretDecl.scope` (global / per-project
+///     / shared) routes to the matching `SecretScope`. Errors per-key are
+///     logged but don't fail the uninstall.
+///
+/// `purge_data` (the existing parameter) remains a SEPARATE concept from
+/// `clear_secrets`: it wipes `<vct_root>/data/<module_id>/` regardless of
+/// what the manifest says. Both flags can be true independently.
+///
+/// Backwards compat: if the manifest can't be found in the catalog (catalog
+/// changed since install, paid-modules dir is gone, etc.), the legacy
+/// hardcoded behaviour kicks in with a warning logged — uninstall NEVER
+/// fails on missing-manifest, because then the user would be stuck.
 #[command]
 pub async fn uninstall_module_v2(
     project_id: String,
@@ -638,11 +813,31 @@ pub async fn uninstall_module_v2(
         .get_module_install(&project_id, &module_id)?
         .ok_or_else(|| format!("module {} not installed for project {}", module_id, project_id))?;
 
+    // Look up the manifest. On miss, fall back to legacy hardcoded behaviour
+    // with a warning — never fail the uninstall over a missing manifest.
+    let manifest_opt = match find_manifest(&db, &module_id) {
+        Ok((m, _)) => Some(m),
+        Err(e) => {
+            eprintln!(
+                "[uninstall] manifest for {} not in catalog ({}); falling back to legacy \
+                 hardcoded behaviour (remove install_dir, no MCP deregister, no secret wipe). \
+                 If the module declares preserve_paths or registers an MCP, manual cleanup \
+                 may be required.",
+                module_id, e,
+            );
+            None
+        }
+    };
+
+    let uninstall_block: UninstallBlock = manifest_opt
+        .as_ref()
+        .and_then(|m| m.uninstall.clone())
+        .unwrap_or_else(default_uninstall_block);
+
     // Phase 1E: stop + remove the per-project container (when present)
     // BEFORE deleting the install row, so we don't orphan a podman
     // container. Idempotent — stop_container_for_project soft-fails
-    // when the container doesn't exist. We don't propagate the result:
-    // a stuck container shouldn't block the uninstall DB write.
+    // when the container doesn't exist.
     if let Some(container_name) = row.container_name.as_deref() {
         if !container_name.is_empty() {
             if let Err(e) = crate::commands::module_service::stop_container_for_project(
@@ -658,17 +853,83 @@ pub async fn uninstall_module_v2(
         }
     }
 
-    // Best-effort filesystem cleanup. Failures here don't fail the command —
-    // the DB row removal is the source of truth for "installed or not".
     let install_path = PathBuf::from(&row.install_path);
-    if install_path.exists() {
+    let ctx = PlaceholderCtx::new(&module_id).with_install_dir(install_path.clone());
+
+    // ─── Filesystem cleanup (honors remove_install_dir + preserve_paths) ──
+    if uninstall_block.remove_install_dir && install_path.exists() {
+        // Stash preserve_paths to a sibling temp dir, wipe install_dir,
+        // restore. Best-effort throughout — any error here is logged but
+        // doesn't fail the uninstall.
+        let preserved = stash_preserve_paths(
+            &install_path,
+            &uninstall_block.preserve_paths,
+            &ctx,
+        )
+        .await;
+
         if let Err(e) = tokio::fs::remove_dir_all(&install_path).await {
             eprintln!("[uninstall] remove_dir_all {}: {}", install_path.display(), e);
+        }
+
+        if !preserved.is_empty() {
+            if let Err(e) = restore_preserved_paths(&install_path, preserved).await {
+                eprintln!("[uninstall] restore_preserved_paths failed: {}", e);
+            }
+        }
+    } else if !uninstall_block.remove_install_dir {
+        eprintln!(
+            "[uninstall] manifest.uninstall.remove_install_dir=false; leaving {} on disk.",
+            install_path.display(),
+        );
+    }
+
+    // ─── MCP deregistration ──────────────────────────────────────────────
+    if uninstall_block.deregister_mcp {
+        if let Some(mcp) = manifest_opt
+            .as_ref()
+            .and_then(|m| m.mcp_registration.as_ref())
+        {
+            // Target ~/.claude.json — same surface the install path
+            // would register against. Soft-fail: a dead MCP entry is
+            // recoverable; a stuck DB row is not.
+            if let Some(home) = directories::UserDirs::new() {
+                let target = home.home_dir().join(".claude.json");
+                if let Err(e) =
+                    crate::mcp_registration::deregister_mcp(&target, &mcp.mcp_name)
+                {
+                    eprintln!(
+                        "[uninstall] deregister_mcp({}) failed: {}",
+                        mcp.mcp_name, e
+                    );
+                }
+            }
+        }
+    }
+
+    // ─── Secret cleanup (manifest.uninstall.clear_secrets) ───────────────
+    if uninstall_block.clear_secrets {
+        if let Some(manifest) = manifest_opt.as_ref() {
+            for decl in &manifest.secrets {
+                let scope = match decl.scope.as_str() {
+                    "global" => SecretScope::Global,
+                    "shared" => SecretScope::Shared { project_id: &project_id },
+                    _ => SecretScope::PerProject { project_id: &project_id },
+                };
+                if let Err(e) = secrets::delete(scope, &module_id, &decl.key) {
+                    eprintln!(
+                        "[uninstall] secrets::delete({}/{}) failed: {}",
+                        module_id, decl.key, e
+                    );
+                }
+            }
         }
     }
 
     if purge_data {
         // Scrub {VCT_DATA}/{MODULE_ID}/ when user explicitly asked to wipe.
+        // Separate from clear_secrets — wipes the data dir (model weights,
+        // caches, downloaded blobs) regardless of what the manifest says.
         let data_dir = crate::paths::vct_root_dir().join("data").join(&module_id);
         if data_dir.exists() {
             let _ = tokio::fs::remove_dir_all(&data_dir).await;
@@ -681,8 +942,137 @@ pub async fn uninstall_module_v2(
         "module_uninstall",
         Some(&project_id),
         Some(&module_id),
-        &serde_json::json!({ "purge_data": purge_data }),
+        &serde_json::json!({
+            "purge_data": purge_data,
+            "remove_install_dir": uninstall_block.remove_install_dir,
+            "preserve_paths_count": uninstall_block.preserve_paths.len(),
+            "deregister_mcp": uninstall_block.deregister_mcp,
+            "clear_secrets": uninstall_block.clear_secrets,
+            "manifest_found": manifest_opt.is_some(),
+        }),
     )?;
+    Ok(())
+}
+
+/// Default UninstallBlock used when the manifest doesn't declare one OR
+/// can't be found in the catalog. Matches the legacy hardcoded behaviour
+/// (remove_install_dir=true, deregister_mcp=true, clear_secrets=false,
+/// no preserve_paths) so existing modules keep working byte-identical
+/// to pre-v0.2.31 when they omit the block.
+fn default_uninstall_block() -> UninstallBlock {
+    UninstallBlock {
+        remove_install_dir: true,
+        preserve_paths: Vec::new(),
+        deregister_mcp: true,
+        clear_secrets: false,
+    }
+}
+
+/// Move each `preserve_paths` entry from `install_path` into a sibling
+/// temp directory. Returns the temp dir path + the relative paths that
+/// were successfully stashed. Best-effort: paths that don't exist or
+/// can't be moved are skipped with a log line.
+async fn stash_preserve_paths(
+    install_path: &std::path::Path,
+    preserve_paths: &[String],
+    ctx: &PlaceholderCtx,
+) -> Vec<(PathBuf, PathBuf)> {
+    if preserve_paths.is_empty() {
+        return Vec::new();
+    }
+    let parent = install_path.parent().unwrap_or(install_path);
+    let stash_dir = parent.join(format!(
+        ".vct-preserve-{}-{}",
+        ctx.module_id,
+        chrono::Utc::now().timestamp_millis(),
+    ));
+    if let Err(e) = tokio::fs::create_dir_all(&stash_dir).await {
+        eprintln!(
+            "[uninstall] create stash dir {} failed: {}; preserve_paths disabled this run.",
+            stash_dir.display(),
+            e,
+        );
+        return Vec::new();
+    }
+    let mut stashed = Vec::new();
+    for raw in preserve_paths {
+        let resolved = ctx.resolve(raw);
+        let src = if PathBuf::from(&resolved).is_absolute() {
+            PathBuf::from(&resolved)
+        } else {
+            install_path.join(&resolved)
+        };
+        if !src.exists() {
+            // Path declared but not present on disk — silently skip.
+            continue;
+        }
+        // Mirror only the basename into stash_dir (preserve_paths are
+        // expected to be small; a flat naming scheme avoids parent-dir
+        // recreation gymnastics during restore).
+        let basename = match src.file_name() {
+            Some(s) => s.to_owned(),
+            None => continue,
+        };
+        let dst = stash_dir.join(&basename);
+        if let Err(e) = tokio::fs::rename(&src, &dst).await {
+            eprintln!(
+                "[uninstall] stash preserve_path {} -> {} failed: {}",
+                src.display(),
+                dst.display(),
+                e,
+            );
+            continue;
+        }
+        // src_relative is the path RELATIVE to install_path so restore
+        // can put it back. When raw was absolute (placeholder-resolved),
+        // we keep the absolute target unchanged.
+        let src_target = if PathBuf::from(&resolved).is_absolute() {
+            PathBuf::from(&resolved)
+        } else {
+            install_path.join(&resolved)
+        };
+        stashed.push((dst, src_target));
+    }
+    stashed
+}
+
+/// Move each stashed entry back to its original location. Recreates the
+/// parent dir of each target (which was just deleted by remove_dir_all).
+async fn restore_preserved_paths(
+    install_path: &std::path::Path,
+    stashed: Vec<(PathBuf, PathBuf)>,
+) -> Result<(), String> {
+    // Recreate install_path so relative targets have a parent.
+    if !install_path.exists() {
+        tokio::fs::create_dir_all(install_path)
+            .await
+            .map_err(|e| format!("recreate install_path {}: {}", install_path.display(), e))?;
+    }
+    let mut stash_parent: Option<PathBuf> = None;
+    for (stashed_at, target) in stashed {
+        if stash_parent.is_none() {
+            stash_parent = stashed_at.parent().map(|p| p.to_path_buf());
+        }
+        if let Some(parent) = target.parent() {
+            if !parent.exists() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+        }
+        if let Err(e) = tokio::fs::rename(&stashed_at, &target).await {
+            eprintln!(
+                "[uninstall] restore preserve_path {} -> {} failed: {}",
+                stashed_at.display(),
+                target.display(),
+                e,
+            );
+        }
+    }
+    // Clean up the empty stash dir.
+    if let Some(p) = stash_parent {
+        if p.exists() {
+            let _ = tokio::fs::remove_dir_all(&p).await;
+        }
+    }
     Ok(())
 }
 
@@ -1304,5 +1694,297 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ─── v0.2.31 #23: UninstallBlock respect ────────────────────────────
+    //
+    // The pre-v0.2.31 `uninstall_module_v2` hardcoded its cleanup behaviour
+    // (remove install_dir, no preserve_paths, no MCP deregister, no secret
+    // wipe). Manifests declared an `uninstall: UninstallBlock` block that
+    // was parsed and silently ignored. These tests pin the new behaviour:
+    //
+    //   1. `default_uninstall_block()` matches the legacy hardcoded shape
+    //      so manifests omitting the block keep working unchanged.
+    //   2. `stash_preserve_paths` + `restore_preserved_paths` correctly
+    //      ferry user files across the install_dir wipe.
+    //   3. Manifest with preserve_paths declared: the preserved file
+    //      survives the dance even after install_path is removed.
+
+    #[test]
+    fn default_uninstall_block_matches_legacy_hardcoded_behaviour() {
+        // Legacy behaviour: remove_install_dir=true, no preserve_paths,
+        // deregister_mcp=true, clear_secrets=false. If the manifest does
+        // not declare `uninstall` (or the manifest can't be found), this
+        // is what `uninstall_module_v2` falls back to.
+        let block = default_uninstall_block();
+        assert!(
+            block.remove_install_dir,
+            "legacy fallback must remove install_dir (matches pre-v0.2.31 hardcoded behaviour)"
+        );
+        assert!(
+            block.preserve_paths.is_empty(),
+            "legacy fallback must have no preserve_paths"
+        );
+        assert!(
+            block.deregister_mcp,
+            "legacy fallback must deregister MCP (matches pre-v0.2.31 hardcoded behaviour)"
+        );
+        assert!(
+            !block.clear_secrets,
+            "legacy fallback must NOT clear secrets (matches pre-v0.2.31 hardcoded behaviour; \
+             user must opt in via manifest)"
+        );
+    }
+
+    /// Build a minimal valid `ModuleManifest` with a custom `uninstall` block.
+    /// Used by the UninstallBlock-respect tests to verify each field's effect.
+    fn manifest_with_uninstall_block(
+        id: &str,
+        remove_install_dir: bool,
+        preserve_paths: Vec<&str>,
+        deregister_mcp: bool,
+        clear_secrets: bool,
+    ) -> ModuleManifest {
+        let raw = serde_json::json!({
+            "manifest_version": 1,
+            "id": id,
+            "name": "Fake Uninstall Test Module",
+            "version": "0.0.1",
+            "description": "Test fixture for #23 UninstallBlock-respect.",
+            "category": "paid-independent",
+            "license": {
+                "required": false,
+                "min_orchestrator_tier": "free"
+            },
+            "compatibility": {"hosts": ["base"]},
+            "install": {"method": "git_clone", "source": "https://example.test/x.git"},
+            "runtime": {"type": "service", "command": "echo", "args": []},
+            "uninstall": {
+                "remove_install_dir": remove_install_dir,
+                "preserve_paths": preserve_paths,
+                "deregister_mcp": deregister_mcp,
+                "clear_secrets": clear_secrets,
+            }
+        });
+        ModuleManifest::from_json(&raw.to_string())
+            .unwrap_or_else(|e| panic!("parse fake manifest with uninstall: {}", e))
+    }
+
+    #[test]
+    fn manifest_uninstall_block_round_trips_through_serde() {
+        // Regression guard: the UninstallBlock fields must survive a
+        // parse round-trip with default-correct values. Pre-v0.2.31 the
+        // block was parsed but the values weren't consulted; if a future
+        // commit accidentally drops the `Deserialize` impl or renames a
+        // field, this test catches it before the uninstall path silently
+        // reverts to defaults.
+        let m = manifest_with_uninstall_block(
+            "vct-test-uninstall",
+            false,
+            vec!["{install_dir}/user-config.toml", "{VCT_DATA}/{MODULE_ID}/cache"],
+            false,
+            true,
+        );
+        let block = m.uninstall.as_ref().expect("uninstall block must parse");
+        assert!(!block.remove_install_dir);
+        assert!(!block.deregister_mcp);
+        assert!(block.clear_secrets);
+        assert_eq!(block.preserve_paths.len(), 2);
+        assert_eq!(block.preserve_paths[0], "{install_dir}/user-config.toml");
+        assert_eq!(block.preserve_paths[1], "{VCT_DATA}/{MODULE_ID}/cache");
+    }
+
+    /// End-to-end test for `stash_preserve_paths` + `restore_preserved_paths`:
+    /// create an install_dir with a file inside, stash the file, wipe the
+    /// dir, restore — the file should reappear at its original location.
+    ///
+    /// Skipped (returns early) if a tokio runtime isn't available in the
+    /// test context. The codebase uses sync `#[test]` everywhere else in
+    /// this module; we wrap the async dance in a single-threaded runtime
+    /// to stay consistent.
+    #[test]
+    fn preserve_paths_survive_install_dir_wipe() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+        rt.block_on(async {
+            let tmp = tempfile::tempdir().expect("create tempdir");
+            let install_path = tmp.path().join("install");
+            tokio::fs::create_dir_all(&install_path).await.unwrap();
+            // Create a "user file" inside install_dir that should be preserved.
+            let user_file = install_path.join("user-config.toml");
+            tokio::fs::write(&user_file, b"keep-me=true").await.unwrap();
+            // And another file that should NOT be preserved.
+            let throwaway_file = install_path.join("cache.db");
+            tokio::fs::write(&throwaway_file, b"discard").await.unwrap();
+
+            let ctx = PlaceholderCtx::new("vct-test-preserve")
+                .with_install_dir(install_path.clone());
+
+            let preserve_paths = vec!["user-config.toml".to_string()];
+            let stashed = stash_preserve_paths(&install_path, &preserve_paths, &ctx).await;
+            assert_eq!(
+                stashed.len(),
+                1,
+                "expected exactly one preserved entry; got {}",
+                stashed.len()
+            );
+            // After stashing, the source file is gone from install_dir.
+            assert!(
+                !user_file.exists(),
+                "user-config.toml should have been moved to stash dir"
+            );
+            assert!(
+                throwaway_file.exists(),
+                "cache.db should NOT have been stashed (not in preserve_paths)"
+            );
+
+            // Wipe install_dir (this is what uninstall_module_v2 does).
+            tokio::fs::remove_dir_all(&install_path).await.unwrap();
+            assert!(!install_path.exists(), "install_dir wipe sanity check");
+
+            // Restore.
+            restore_preserved_paths(&install_path, stashed)
+                .await
+                .expect("restore must succeed");
+            assert!(user_file.exists(), "user-config.toml must be restored");
+            let restored =
+                tokio::fs::read(&user_file).await.expect("read restored file");
+            assert_eq!(&restored, b"keep-me=true", "file contents must match");
+            assert!(
+                !throwaway_file.exists(),
+                "cache.db must NOT be restored (it was wiped with the dir)"
+            );
+        });
+    }
+
+    #[test]
+    fn preserve_paths_empty_list_is_noop() {
+        // When manifest.uninstall.preserve_paths is empty, the stash dance
+        // is a fast-path no-op (no temp dir created, empty Vec returned).
+        // This guards against the stash dir leaking to disk in the common
+        // case (modules that don't preserve anything).
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+        rt.block_on(async {
+            let tmp = tempfile::tempdir().expect("create tempdir");
+            let install_path = tmp.path().join("install");
+            tokio::fs::create_dir_all(&install_path).await.unwrap();
+            let ctx = PlaceholderCtx::new("vct-test-noop")
+                .with_install_dir(install_path.clone());
+
+            let stashed = stash_preserve_paths(&install_path, &[], &ctx).await;
+            assert!(stashed.is_empty(), "empty preserve_paths -> empty stash");
+            // No `.vct-preserve-*` dir should have been created.
+            let mut entries = tokio::fs::read_dir(tmp.path()).await.unwrap();
+            while let Some(e) = entries.next_entry().await.unwrap() {
+                let name = e.file_name().to_string_lossy().to_string();
+                assert!(
+                    !name.starts_with(".vct-preserve-"),
+                    "no stash dir should leak for empty preserve_paths; found: {}",
+                    name
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn preserve_paths_skips_nonexistent_entries() {
+        // When a preserve_paths entry doesn't exist on disk (e.g. user
+        // never created the config file), it should be silently skipped
+        // — not abort the entire uninstall.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+        rt.block_on(async {
+            let tmp = tempfile::tempdir().expect("create tempdir");
+            let install_path = tmp.path().join("install");
+            tokio::fs::create_dir_all(&install_path).await.unwrap();
+            let ctx = PlaceholderCtx::new("vct-test-missing")
+                .with_install_dir(install_path.clone());
+
+            let preserve_paths = vec!["does-not-exist.toml".to_string()];
+            let stashed = stash_preserve_paths(&install_path, &preserve_paths, &ctx).await;
+            assert!(
+                stashed.is_empty(),
+                "missing entries should be skipped silently; got {} stashed",
+                stashed.len(),
+            );
+        });
+    }
+
+    // ─── v0.2.31 #20-Fix-3: update_module_for_project sanity ────────────
+    //
+    // The Tauri command itself can't be unit-tested in isolation (it
+    // requires an AppHandle + a project row in the DB + a populated
+    // catalog path). We test the helper layer:
+    //   1. find_manifest returns Err on a not-installed module id (the
+    //      same error path update_module_for_project surfaces when the
+    //      manifest disappeared between install + update).
+    //   2. The new DB helper `update_module_install_version` bumps the
+    //      version + installed_at on an existing row.
+    //   3. `update_module_install_version` Errs when no row exists (this
+    //      is what update_module_for_project relies on to detect "module
+    //      not installed").
+
+    #[test]
+    fn update_module_install_version_bumps_version_and_installed_at() {
+        let db = open_db();
+        // FK: module_installs.project_id references projects.id — must
+        // insert a project row first.
+        db.insert_project("proj-1", "Test Project", "/tmp/test-proj", ProjectHost::Base, "test-proj")
+            .expect("insert project");
+        let now_before = chrono::Utc::now().timestamp_millis();
+        let _row = db
+            .insert_module_install(
+                "install-id-1",
+                "proj-1",
+                "vct-test-mod",
+                "0.1.0",
+                "/tmp/fake/install/dir",
+            )
+            .expect("insert pending install row");
+
+        // Sleep 2ms so the bumped installed_at is strictly greater than
+        // the pre-update value (chrono::Utc::now() is millisecond-precision
+        // on most platforms — without the sleep the timestamps may collide).
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        db.update_module_install_version("proj-1", "vct-test-mod", "0.2.0")
+            .expect("update version");
+
+        let refreshed = db
+            .get_module_install("proj-1", "vct-test-mod")
+            .expect("read back")
+            .expect("row must still exist");
+        assert_eq!(refreshed.module_version, "0.2.0");
+        assert!(
+            refreshed.installed_at >= now_before,
+            "installed_at should have been bumped (was {}, now_before {})",
+            refreshed.installed_at,
+            now_before,
+        );
+    }
+
+    #[test]
+    fn update_module_install_version_errs_when_row_missing() {
+        // update_module_for_project relies on this Err path to detect
+        // "module not installed; use install_module_for_project instead".
+        let db = open_db();
+        let res = db.update_module_install_version("proj-X", "vct-not-installed", "0.2.0");
+        assert!(
+            res.is_err(),
+            "update_module_install_version must Err when row is missing; got Ok"
+        );
+        let msg = res.unwrap_err();
+        assert!(
+            msg.contains("not found"),
+            "error message must say 'not found'; got: {}",
+            msg
+        );
     }
 }

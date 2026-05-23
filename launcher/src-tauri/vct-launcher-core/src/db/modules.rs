@@ -98,6 +98,41 @@ impl Db {
             .map_err(|e| format!("collect list_containers: {}", e))
     }
 
+    /// v0.2.31 (#20-Fix-3): update the `module_version` + bump `installed_at`
+    /// on an existing module_install row. Called by `update_module_for_project`
+    /// after a successful in-place upgrade so the catalog UI reflects the new
+    /// version without forcing the user through an uninstall+reinstall.
+    ///
+    /// Does NOT touch `status`, `enabled`, `last_started_at`, `last_error`,
+    /// or `container_name` — the row is being updated in place, those fields
+    /// stay as they were. Callers that want to flip status to Installed (e.g.
+    /// the update path) must call `set_module_status` explicitly afterward.
+    pub fn update_module_install_version(
+        &self,
+        project_id: &str,
+        module_id: &str,
+        new_version: &str,
+    ) -> Result<(), String> {
+        let now = Utc::now().timestamp_millis();
+        let guard = self.lock();
+        let n = guard
+            .execute(
+                "UPDATE module_installs
+                    SET module_version = ?1,
+                        installed_at = ?2
+                  WHERE project_id = ?3 AND module_id = ?4",
+                params![new_version, now, project_id, module_id],
+            )
+            .map_err(|e| format!("update module_install version: {}", e))?;
+        if n == 0 {
+            return Err(format!(
+                "module_install not found for project={} module={}",
+                project_id, module_id
+            ));
+        }
+        Ok(())
+    }
+
     pub fn set_module_status(
         &self,
         project_id: &str,
