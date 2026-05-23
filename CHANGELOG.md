@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.28] — 2026-05-23
+
+Same-day chained release after v0.2.27 (see
+[`knowledge/concepts/same-day-chained-release-pattern.md`](knowledge/concepts/same-day-chained-release-pattern.md)
+for why), shipping: (a) Wave 2 D — `install-bundle --update` no longer
+resurrects user-disabled agents/skills (the install-side companion to
+the Wave 1 FS-disable mechanism shipped in v0.2.27); (b) Wave 2 E —
+launcher-startup migration that converts any legacy `enabled=0` rows
+from older installs into the `.disabled/` filesystem layout + hook
+registration in both OS settings templates; (c) **launcher KG-binding
+seed-guard** that stops every launcher boot from clobbering a
+user-customized `project_kg_bindings(primary)` row with the
+orchestrator-root default (live-reproduced bug: two parallel chats
+seeing 0 KG-search results because the binding had been silently
+rewritten from `VCODev_KnowledgeGraph` to
+`VibeCodedOrchestrator_KnowledgeGraph` on every boot); (d) **`.claude/settings.json
+env` KG-keys backfill** — `install-bundle --update` and `install.py --update`
+now populate `KG_COLLECTION` / `SHARED_KG_COLLECTION` / `DEVELOPMENT_COLLECTION`
+into the canonical per-project env channel from launcher.db's
+`project_kg_bindings` table (source of truth); (e) two RL telemetry
+fixes from the `rl-logging-audit-report-2026-05-23` audit: project-name
+canonicalization via slug (was producing 4 distinct cohort labels for
+the same project) and asyncio strong-ref for the citation monitor task
+(was hitting 97.7% orphan-citation rate from GC dropping the
+unreferenced `create_task` handles); (f) per-model chunker preset in
+the KG sync script (was hardcoded to qwen3-specific `max_tokens=2500`
+regardless of the active embedding model); (g) Windows-side hardening:
+UTF-8 BOM added to `agent-skill-keyword-suggest.ps1` so PowerShell 5.1
+on Win10/11 can parse the non-ASCII characters in it.
+
+### Added
+
+- **`feat(install)` `install-bundle --update` no longer resurrects disabled agents/skills** (Wave 2 D). Pre-v0.2.28 a bundle update would re-copy any template file missing from `.claude/agents/` or `.claude/skills/`, silently undoing a user's disable choice. Both install paths (Rust launcher populate in `project_state_populate.rs`, Python `install-bundle` in `vco_lib/project_init.py`) now check both the enabled location AND the `.disabled/` sibling before copying. A new `skip-disabled` action bucket in the bundle-op schema explicitly documents the no-op. 20 new tests covering single-file (agent) and whole-directory (skill) cases, POSIX + Windows path separators, and the corrupt "both locations exist" defensive skip.
+
+- **`feat(launcher,install,docs)` Launcher-startup migration + hook registration for the FS-disable mechanism** (Wave 2 E). A one-time idempotent migration runs once per registered project on launcher startup to convert any existing `enabled=0` rows from older installs into the new `.disabled/` layout. The `agent-skill-keyword-suggest` hook is now wired into both `templates/settings.json.{linux,windows}.template` UserPromptSubmit blocks alongside its sibling hooks. Docs in the existing FS-disable section extended with the migration story + the keyword-suggest hook registration.
+
+### Fixed
+
+- **`fix(launcher-core)` KG-binding seed-guard: stop clobbering user-customized `project_kg_bindings(primary)` on every boot.** Pre-v0.2.28 `ensure_orchestrator_root_kg_binding` (in `commands/orchestrator_root.rs`) called `set_project_kg_binding` unconditionally; the underlying SQL is `INSERT ... ON CONFLICT(project_id, role) DO UPDATE SET collection_name = excluded.collection_name`, which clobbered any user-customized binding with the orchestrator-root literal default on every launcher boot. **Symptom**: KG searches silently returning 0 results across the board — the MCP would resolve `KG_COLLECTION` via the hub (or `.claude/settings.json env`), and the launcher kept pointing both at the wrong collection (`VibeCodedOrchestrator_KnowledgeGraph`) while the actual project nodes lived in `VCODev_KnowledgeGraph`. Violated Dev Constraint #8 ("User choices survive all updates"). The guard now reads the existing binding first via `list_project_kg_bindings`; only re-seeds when no binding exists OR the existing one still carries the auto-seed sentinel `auto_seeded_by: "ensure_orchestrator_root_kg_binding"`. Anything else (manual override, prior migration, future GUI picker) wins. 3 new regression tests (`kg_seed_guard_preserves_manual_override`, `kg_seed_guard_writes_when_absent`, `kg_seed_guard_idempotent_on_prior_auto_seed`).
+
+- **`fix(install)` `.claude/settings.json env` KG-keys backfill.** New idempotent helper `_backfill_kg_collection_env_in_project` in `vco_lib/project_init.py` reads the launcher.db's `project_kg_bindings` table (canonical source of truth) and writes any missing `KG_COLLECTION` / `SHARED_KG_COLLECTION` / `DEVELOPMENT_COLLECTION` keys into the per-project `.claude/settings.json env` block. Wired into both install routes (Dev Constraint #5): per-project `install-bundle --update` calls it alongside the v0.2.11 `_backfill_code_graph_project_env_in_project`; the orchestrator-root `install.py --update` path calls it after its own backfill. User-set values are never overwritten — pure additive idempotent fill. Resolution chain when DB unavailable: existing `env.KG_COLLECTION` suffix-swap → explicit `project_name` arg → `env.PROJECT_NAME` → `folder.name` sanitized. `SHARED_KG_COLLECTION=""` (empty-string user-disable) is respected and never auto-filled. 11 new pytests covering missing file, unparseable JSON, all-three-present noop, partial-fill, db-source-of-truth, db-absent fallback, explicit project_name override, empty-string preservation.
+
+- **`fix(weaviate-mcp)` RL telemetry project-name canonicalization via slug (audit finding #3).** Pre-v0.2.28 `_get_rl_telemetry_writer` preferred `project_display_name` from the hub, which produced 4 distinct cohort labels for the same project (`Claude`, `VibeCoded Orchestrator`, `VibeCodedOrchestrator`, `VCODev`) — depending on which workspace was opened when, plus migration history. Now prefers `project_slug` (stable lowercase-hyphen identifier, the same key `module_settings` uses for the global-training-source flag); env-fallback path sanitizes via `sanitize_for_weaviate_class` so multi-workspace setups still produce one cohort. Existing JSONL events with the old project labels need a separate one-shot migration (out of scope; tracked in `rl-logging-audit-report-2026-05-23.md`).
+
+- **`fix(weaviate-mcp)` RL citation monitor asyncio strong-ref (audit finding #1).** Pre-v0.2.28 `_rl_cache_and_rerank` did `asyncio.create_task(_rl_answer_monitor(...))` without keeping a reference. Python's asyncio runtime tracks tasks in a `WeakSet`, so GC could (and did) collect them mid-poll, producing the "Task was destroyed but it is pending!" warning and silently dropping the citation event. Symptom: 97.7% orphan-citation rate (897 / 918 retrievals had no matching citation event in the trailing 50 MB of `rl_events.jsonl`). Fix follows the [standard pattern](https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task): hold a module-level `set[asyncio.Task]` and `add_done_callback(set.discard)` so completed tasks are removed cleanly.
+
+- **`fix(scripts)` Per-model chunker preset in the KG sync script.** Pre-v0.2.28 `templates/scripts/sync_knowledge_graph.py` hardcoded `Chunker(min_tokens=1500, max_tokens=MAX_EMBEDDING_TOKENS=2500, target_tokens=2500)` for every node and doc. That was correct for qwen3-embedding:0.6b (8k context, 2500 working limit) but wrong for 512-token models (would over-chunk ~5x) and wasteful for 32k+ models (under-uses capacity). Now uses two new helpers `_chunker_for(server)` and `_max_chunk_tokens_for(server)` that delegate to `Chunker.for_model(server.embedding_service.text_model_id)` and `chunking_preset_for_model(...)` respectively. The "fits in one chunk?" gate and the actual chunk size now come from the SAME preset (cannot drift). Legacy hardcoded value preserved as a fallback when `embedding_service` is None (early-init paths only).
+
+- **`fix(hooks)` UTF-8 BOM added to `agent-skill-keyword-suggest.ps1`.** The file contains non-ASCII bytes; without a BOM, PowerShell 5.1 (the default on Win10/Win11) mis-decodes it as Windows-1252 and fails to parse. Pre-existing test `tests/test_ps1_utf8_bom.py` was already catching this — the file was committed without a BOM in v0.2.27. Re-saved with the BOM; test passes.
+
 ## [0.2.27] — 2026-05-22
 
 Follow-up release the same day as v0.2.26, shipping: (a) two
@@ -15,10 +65,12 @@ post-tag-discovered Windows install-path bugs from v0.2.25/v0.2.26
 `events_paths_for` template token the RL module's v0.2.1 manifest
 requires, (c) a divergence-modal rewrite that correctly handles
 local-only files + retry state, (d) a KG env-propagation safety net
-in the Weaviate MCP server, (e) two waves of agent/skill UX work
+in the Weaviate MCP server, (e) Wave 1 of the agent/skill UX work
 (FS-disable on toggle + keyword-suggest hook on UserPromptSubmit +
-install-bundle preservation of user disables), and (f) docs updates
-clarifying the canonical per-project env channel.
+10 seeded agents/skills), and (f) docs updates clarifying the
+canonical per-project env channel. (Wave 2 D + E — install-bundle
+preservation + launcher startup migration + hook registration —
+shipped in [0.2.28] same-day.)
 
 ### Added
 
@@ -30,11 +82,9 @@ clarifying the canonical per-project env channel.
 
 - **`feat(launcher)` Generic per-(project × module) divergence-files split.** The `update_orchestrator` Tauri command's `collect_diverged_files` previously used `git diff HEAD..upstream/branch --name-only`, which lists every file different between the two tips. Forks tracking paths the public repo doesn't (e.g. VCO_dev's `other_projects_knowledge/`) saw all those paths flagged as "diverged" in the modal — confusing because they can't merge-conflict (no upstream version). Rewrite anchors on the merge-base: returns `(upstream_changed, local_only)` tuple where `upstream_changed` = files upstream touched since fork (real merge candidates) and `local_only` = files locally touched that upstream never had (pure-local content). New `local_only_files` JSON field on the `orchestrator_update_non_ff` payload; the rewritten modal renders the two categories as distinct collapsible sections.
 
-- **`feat(launcher)` Launcher-GUI "disable agent/skill" toggle now physically moves files.** Pre-v0.2.27 the per-project disable toggle only flipped a DB column with no effect on Claude Code itself (which discovers agents/skills by globbing the filesystem; it had no awareness of the launcher DB). Disabled items kept appearing in autocomplete, autonomous invocation, and `/agents` listing. The toggle now physically moves the `.md` file to a sibling `.claude/agents.disabled/<name>.md` (or `.claude/skills.disabled/<name>/`) directory that falls outside Claude's discovery globs. Re-enable reverses the move. A one-time idempotent migration runs once per registered project on launcher startup (and on `install-bundle --update`) to convert any existing `enabled=0` rows into the new layout. ~1k LOC changes in `db/project_state.rs` + 14 new fs_disable_tests + 6 new populate_disabled_tests.
+- **`feat(launcher)` Launcher-GUI "disable agent/skill" toggle now physically moves files.** Pre-v0.2.27 the per-project disable toggle only flipped a DB column with no effect on Claude Code itself (which discovers agents/skills by globbing the filesystem; it had no awareness of the launcher DB). Disabled items kept appearing in autocomplete, autonomous invocation, and `/agents` listing. The toggle now physically moves the `.md` file to a sibling `.claude/agents.disabled/<name>.md` (or `.claude/skills.disabled/<name>/`) directory that falls outside Claude's discovery globs. Re-enable reverses the move. ~1k LOC changes in `db/project_state.rs` + 14 new fs_disable_tests + 6 new populate_disabled_tests. (Wave 2 — install-bundle preservation + launcher-startup migration of legacy `enabled=0` rows + hook registration in settings templates — shipped in [0.2.28] same-day.)
 
-- **`feat(hooks)` New `agent-skill-keyword-suggest` UserPromptSubmit hook** surfaces relevant agents/skills based on case-sensitive whole-word matches against their `keywords:` frontmatter. Pure filesystem contract: globs `.claude/agents/*.md` and `.claude/skills/*/SKILL.md` — no DB lookup. Disabled items naturally fall outside the glob (per the FS-disable change above). Paired cross-OS scripts `templates/hooks/agent-skill-keyword-suggest.{sh,ps1}` shell out to `templates/scripts/agent-skill-keyword-match.py` (stdlib-only Python matcher with explicit word-boundary regex). Registered in both `templates/settings.json.{linux,windows}.template` under `UserPromptSubmit` with the standard `VCT_DISABLE_HOOKS` gate (2s timeout, matches sibling hooks). Seeded discriminative keyword lists on 10 representative agents (brand-identity-architect, kg-navigator, landing-page-critic, etc.) and 10 representative skills (accessibility-checker, hpc-submit, k8s-manifest-reviewer, etc.) as proof of concept; rollout to the remaining ~35 agents and ~42 skills is incremental as owners pick keywords. 46 new tests (Python matcher + hook output shape + edge cases).
-
-- **`feat(install)` `install-bundle --update` no longer resurrects disabled agents/skills**. Pre-v0.2.27 a bundle update would re-copy any template file missing from `.claude/agents/` or `.claude/skills/`, silently undoing a user's disable choice. Both install paths (Rust launcher populate in `project_state_populate.rs`, Python `install-bundle` in `vco_lib/project_init.py`) now check both the enabled location AND the `.disabled/` sibling before copying. A new `skip-disabled` action bucket in the bundle-op schema explicitly documents the no-op. 20 new tests covering single-file (agent) and whole-directory (skill) cases, POSIX + Windows path separators, and the corrupt "both locations exist" defensive skip.
+- **`feat(hooks)` New `agent-skill-keyword-suggest` UserPromptSubmit hook** surfaces relevant agents/skills based on case-sensitive whole-word matches against their `keywords:` frontmatter. Pure filesystem contract: globs `.claude/agents/*.md` and `.claude/skills/*/SKILL.md` — no DB lookup. Disabled items naturally fall outside the glob (per the FS-disable change above). Paired cross-OS scripts `templates/hooks/agent-skill-keyword-suggest.{sh,ps1}` shell out to `templates/scripts/agent-skill-keyword-match.py` (stdlib-only Python matcher with explicit word-boundary regex). Seeded discriminative keyword lists on 10 representative agents (brand-identity-architect, kg-navigator, landing-page-critic, etc.) and 10 representative skills (accessibility-checker, hpc-submit, k8s-manifest-reviewer, etc.) as proof of concept; rollout to the remaining ~35 agents and ~42 skills is incremental as owners pick keywords. 46 new tests (Python matcher + hook output shape + edge cases). (Settings-template registration in both OS templates shipped in [0.2.28] same-day.)
 
 ### Fixed
 

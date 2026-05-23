@@ -128,9 +128,65 @@ def _resolve_collections() -> tuple[str, str]:
 COLLECTION_NAME, _RESOLVED_DEV_COLLECTION = _resolve_collections()
 DUAL_EMBEDDING_ENABLED = os.getenv("DUAL_EMBEDDING_ENABLED", "true").lower() == "true"
 
-# Chunking configuration for embedding limits
-# Note: Actual working limit is ~2500 tokens despite 8k model spec
-MAX_EMBEDDING_TOKENS = 2500  # Conservative limit based on testing
+# Chunking configuration for embedding limits.
+#
+# v0.2.28 (2026-05-23): legacy constant kept ONLY as a fallback when
+# the EmbeddingService instance isn't yet available (early-init code
+# paths, error logging). The actual chunker used in the sync paths is
+# now `_chunker_for(server)` below, which delegates to
+# `Chunker.for_model(server.embedding_service.text_model_id)` so that
+# every embedding model gets a chunk size tuned to its context window
+# (see `claude_mcp_servers/weaviate_mcp/chunking.py::chunking_preset_for_model`).
+#
+# Pre-v0.2.28 this script hardcoded `max_tokens=2500` everywhere, which
+# was correct for qwen3-embedding:0.6b (8k context, 2500 working limit)
+# but wrong for 512-token models (would over-chunk by ~5x) and wasteful
+# for 32k+ models (under-uses capacity). The hardcoded constant survives
+# for any code path that runs before the server / EmbeddingService is
+# constructed.
+MAX_EMBEDDING_TOKENS = 2500  # Legacy fallback; prefer _chunker_for(server).
+
+
+def _chunker_for(server) -> "Chunker":
+    """Return a Chunker pre-configured for the active embedding model.
+
+    Resolves the model id via `server.embedding_service.text_model_id`
+    (the canonical channel — set by EmbeddingService.for_project() from
+    env / hub). Falls back to the legacy hardcoded preset when the
+    server / embedding_service is None (e.g. test harnesses that
+    construct chunks directly).
+    """
+    try:
+        model_id = server.embedding_service.text_model_id  # type: ignore[attr-defined]
+    except Exception:
+        model_id = ""
+    if not model_id:
+        # Legacy preset — matches the pre-v0.2.28 hardcoded numbers.
+        return Chunker(
+            min_tokens=1500,
+            max_tokens=MAX_EMBEDDING_TOKENS,
+            target_tokens=2500,
+        )
+    return Chunker.for_model(model_id)
+
+
+def _max_chunk_tokens_for(server) -> int:
+    """Token threshold above which a node/doc must be chunked.
+
+    Mirrors `_chunker_for` so the "fits in one chunk?" branch decision
+    and the actual chunk size come from the SAME preset. Falls back to
+    the legacy `MAX_EMBEDDING_TOKENS` when the embedding service is
+    not yet available.
+    """
+    try:
+        model_id = server.embedding_service.text_model_id  # type: ignore[attr-defined]
+        if model_id:
+            from weaviate_mcp.chunking import chunking_preset_for_model
+            _min, max_t, _tgt = chunking_preset_for_model(model_id)
+            return max_t
+    except Exception:
+        pass
+    return MAX_EMBEDDING_TOKENS
 
 # Project root - use KG_BASE_DIR if set (multi-project support), else
 # infer from this script's location (.claude/scripts/X → project root).
@@ -1190,8 +1246,10 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> bool:
 
         token_count = TokenCounter.count_tokens(content)
         source_id = str(uuid.uuid4())
+        # v0.2.28: per-model chunk threshold instead of hardcoded 2500.
+        _max_tokens = _max_chunk_tokens_for(server)
 
-        if token_count <= MAX_EMBEDDING_TOKENS:
+        if token_count <= _max_tokens:
             vec_arg, slots_written = _build_vector_arg(server, content)
             data_obj = {
                 "title": doc_data["title"],
@@ -1213,11 +1271,10 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> bool:
             return True
 
         # Chunked path — mirrors `sync_node` chunked branch.
-        chunker = Chunker(
-            min_tokens=1500,
-            max_tokens=MAX_EMBEDDING_TOKENS,
-            target_tokens=2500,
-        )
+        # v0.2.28: per-model chunker preset (qwen3 → large_context;
+        # arctic / 512-token → small_context; etc.) instead of hardcoded
+        # 2500-token chunks regardless of model.
+        chunker = _chunker_for(server)
         chunks = chunker.chunk_text(
             text=content,
             source_id=source_id,
@@ -1653,8 +1710,10 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
         # Check if content needs chunking
         token_count = TokenCounter.count_tokens(content)
         print(f"   Content size: {token_count} tokens")
+        # v0.2.28: per-model chunk threshold instead of hardcoded 2500.
+        _max_tokens = _max_chunk_tokens_for(server)
 
-        if token_count <= MAX_EMBEDDING_TOKENS:
+        if token_count <= _max_tokens:
             # Single chunk - store as-is
             print(f"   Storing as single object")
 
@@ -1733,17 +1792,16 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
 
         else:
             # Multiple chunks needed
-            print(f"   ⚠️  Content exceeds {MAX_EMBEDDING_TOKENS} tokens - chunking required")
+            print(f"   ⚠️  Content exceeds {_max_tokens} tokens - chunking required")
 
             # Generate source_node_id for all chunks
             source_node_id = str(uuid.uuid4())
 
-            # Use chunker with max_tokens = MAX_EMBEDDING_TOKENS
-            chunker = Chunker(
-                min_tokens=1500,  # Half of max for better boundaries
-                max_tokens=MAX_EMBEDDING_TOKENS,
-                target_tokens=2500
-            )
+            # v0.2.28: per-model chunker preset instead of hardcoded
+            # max_tokens=2500 (which was qwen3-specific). The same
+            # `_max_tokens` value used in the gate above drives the
+            # chunker's max — they MUST stay in sync.
+            chunker = _chunker_for(server)
 
             chunks = chunker.chunk_text(
                 text=content,

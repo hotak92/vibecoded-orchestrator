@@ -282,6 +282,16 @@ RL_SERVER_URL = os.getenv("RL_SERVER_URL", "http://localhost:11439")
 _RL_OVERFETCH = 2
 # Per-process call counter — used to order calls within a session (maps seq → transcript position).
 _rl_call_seq: int = 0
+# v0.2.28: hold strong references to in-flight `_rl_answer_monitor` tasks
+# so Python's GC cannot drop them mid-poll. Without this, `asyncio.create_task`
+# returns a task whose only reference is the local variable in the caller —
+# which goes out of scope before the task awaits. The CPython asyncio
+# runtime tracks tasks in a WeakSet, so GC can (and does) collect them,
+# logging "Task was destroyed but it is pending!" before silently dropping
+# the citation event. The rl-logging-audit-report 2026-05-23 finding #1
+# (97.7% orphan-citation rate) is the symptom. Standard mitigation:
+# https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task
+_rl_monitor_tasks: "set[asyncio.Task]" = set()
 # KG search tool names as they appear in session transcripts (with and without mcp__ prefix).
 _KG_SEARCH_TOOLS: frozenset[str] = frozenset({
     "hybrid_search", "semantic_graph_search",
@@ -2816,19 +2826,40 @@ def _get_rl_telemetry_writer():
         logger.debug("EmbeddingService probe for telemetry failed (%s); using env defaults", exc)
     # v0.2.21 Step 18: prefer the hub-resolved project slug/display name,
     # falling back to PROJECT_NAME / KG_COLLECTION env (historical
-    # precedence) when the hub is unreachable. The telemetry only needs
-    # a stable per-project identifier; either source produces one.
+    # precedence) when the hub is unreachable.
+    #
+    # v0.2.28 (2026-05-23): canonicalize to the project SLUG when
+    # available — the stable, machine-derived identifier (e.g.
+    # "orchestrator-root", "vco-dev"). Pre-v0.2.28 the writer used
+    # `project_display_name` first, which produced 4 distinct values
+    # for the SAME project across the migration history (per the
+    # rl-logging-audit-report-2026-05-23 finding #3: "Claude",
+    # "VibeCoded Orchestrator", "VibeCodedOrchestrator", "VCODev" all
+    # ended up in the JSONL as separate cohorts despite being one
+    # project). Slugs are canonical, lowercase, hyphen-separated, and
+    # match what the launcher's `list_rl_global_training_source_projects`
+    # uses as the cohort key — so cohort analysis at training time can
+    # join cleanly.
     project = ""
     _cfg_for_telemetry = _try_resolve_project_config()
     if _cfg_for_telemetry is not None:
         project = (
-            _cfg_for_telemetry.project_display_name
-            or _cfg_for_telemetry.project_slug
+            _cfg_for_telemetry.project_slug
             or _cfg_for_telemetry.code_graph_project
+            or _cfg_for_telemetry.project_display_name
             or ""
         )
     if not project:
-        project = os.getenv("PROJECT_NAME", "") or os.getenv("KG_COLLECTION", "")
+        # Env-fallback path also canonicalizes via sanitize_for_weaviate_class
+        # so multi-workspace setups (same project opened with different env
+        # casing/spacing) still produce one cohort.
+        raw_name = os.getenv("PROJECT_NAME", "") or os.getenv("KG_COLLECTION", "")
+        if raw_name:
+            try:
+                from vco_lib.project_init import sanitize_for_weaviate_class
+                project = sanitize_for_weaviate_class(raw_name)
+            except Exception:
+                project = raw_name
     _rl_telemetry_writer_instance = RLTelemetryWriter(
         project=project,
         embedding_source=emb_source,
@@ -2894,8 +2925,13 @@ async def _rl_cache_and_rerank(
         _rl_call_seq += 1
         seq = _rl_call_seq
 
-        # Spawn answer monitor (fire-and-forget, doesn't block Claude's response)
-        asyncio.create_task(_rl_answer_monitor(task_id, seq, query))
+        # Spawn answer monitor (fire-and-forget, doesn't block Claude's response).
+        # v0.2.28: keep a strong reference in `_rl_monitor_tasks` so the GC
+        # cannot drop the task before it polls + writes the citation event.
+        # Discard on completion to avoid the set growing unboundedly.
+        _monitor = asyncio.create_task(_rl_answer_monitor(task_id, seq, query))
+        _rl_monitor_tasks.add(_monitor)
+        _monitor.add_done_callback(_rl_monitor_tasks.discard)
 
         # Rerank via RLClient. The client handles "disabled mode" (no env
         # configured) and per-call fallback (connection refused / 5xx)

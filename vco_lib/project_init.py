@@ -5033,6 +5033,29 @@ def install_project_bundle(
                  data={"error": err})
             result["warnings"].append(f"code_graph_project_env backfill failed: {err}")
 
+    # v0.2.28 (2026-05-23): backfill KG_COLLECTION / SHARED_KG_COLLECTION
+    # / DEVELOPMENT_COLLECTION into the project's
+    # `.claude/settings.json::env` block. Source of truth is the launcher
+    # DB's `project_kg_bindings` table (DB = canonical, per the v0.2.21
+    # hub architecture). User-set values are preserved. Idempotent.
+    # Diagnostic context: KG searches were silently returning 0 results
+    # for projects where these keys never made it into the canonical env
+    # channel — the MCP would resolve to the orchestrator-root default
+    # collection rather than the project's actual collection.
+    if not dry_run:
+        try:
+            kg_backfill = _backfill_kg_collection_env_in_project(folder)
+            result["backfill_kg_collection"] = kg_backfill
+            _log("4.bundle.backfill_kg", "ok",
+                 f"kg_collection_env: {kg_backfill['action']}",
+                 data=kg_backfill)
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            _log("4.bundle.backfill_kg", "error",
+                 f"kg_collection backfill failed: {err}",
+                 data={"error": err})
+            result["warnings"].append(f"kg_collection_env backfill failed: {err}")
+
     # PR-7 (v0.2.11, addendum-4): backfill VS Code watcher / search /
     # Pylance exclude blocks into the project's `.vscode/settings.json`.
     # Without these excludes, large workspaces (>10 GB / >50k files —
@@ -5606,6 +5629,290 @@ def _backfill_code_graph_project_env_in_project(
     result["action"] = "backfilled"
     result["added_keys"] = added
     result["resolved_name"] = resolved
+    return result
+
+
+# ---------------------------------------------------------------------------
+# v0.2.28 — KG_COLLECTION / SHARED_KG_COLLECTION / DEVELOPMENT_COLLECTION
+# backfill in `.claude/settings.json::env`
+# ---------------------------------------------------------------------------
+#
+# Forensic context (2026-05-23):
+#   The MCP weaviate-kg subprocess reads collection names from env vars
+#   `KG_COLLECTION`, `SHARED_KG_COLLECTION`, `DEVELOPMENT_COLLECTION`.
+#   The canonical per-project env channel that propagates to MCP
+#   subprocesses (since v0.2.12 / PR-27) is `.claude/settings.json::env`,
+#   not `.vscode/settings.json::claude-code.env`.
+#
+#   Pre-v0.2.28, only `PROJECT_NAME` + `CODE_GRAPH_PROJECT` were
+#   backfilled into that channel (see `_backfill_code_graph_project_env`).
+#   The three KG-collection keys were never propagated — projects that
+#   relied on the legacy `.vscode/settings.json` channel had their KG
+#   searches silently resolve via `~/.claude.json` defaults or via the
+#   v0.2.27 empty-env safety fallback (which lands on the
+#   orchestrator-root literal `VibeCodedOrchestrator_KnowledgeGraph`).
+#   The result: hybrid_search returned 0 results across the board
+#   because the MCP was searching a different collection than the one
+#   the project's nodes actually lived in.
+#
+#   v0.2.28 fix: extend the install-bundle backfill to also write the
+#   three missing KG-collection keys, sourced from the launcher.db's
+#   `project_kg_bindings` table (DB = source of truth, per the v0.2.21
+#   hub architecture). User-set values are NEVER overwritten — we only
+#   ADD missing keys, matching the discipline established by
+#   `_backfill_code_graph_project_env_in_project`.
+
+
+def _read_kg_collection_from_launcher_db(folder: Path) -> dict:
+    """Look up `(primary_kg_collection, shared_kg_collection)` for the
+    project at `folder` by reading the launcher.db `project_kg_bindings`
+    table directly. Returns an empty dict on any soft-fail path (DB not
+    found, project not registered, query error) — caller falls through
+    to the derivation chain in `_backfill_kg_collection_env_in_project`.
+
+    The shared-binding `role='shared'` collection name is returned as
+    `shared_kg_collection`; the `role='primary'` collection name as
+    `primary_kg_collection`. Either may be absent if only one role has
+    been seeded.
+
+    Path resolution rules: matches `_discover_app_state_db_path` in
+    install.py — `$VCT_STATE_DIR/launcher.db` if set, else
+    `~/.vct/launcher.db`. Cross-OS via `Path.home()`.
+
+    The folder match uses absolute-path equality after `resolve()` on
+    both sides, with a Windows-aware compare (case-insensitive on
+    Windows, case-sensitive elsewhere) to handle launcher.db rows
+    written from a different drive-letter casing on the same OS.
+    """
+    import os as _os
+    import platform as _platform
+    import sqlite3 as _sqlite3
+
+    out: dict = {}
+
+    # DB path resolution — mirror install.py._discover_app_state_db_path
+    # rather than calling it (avoid the install.py → project_init →
+    # install.py reverse-import which doesn't exist today but would
+    # bite the test fixtures).
+    state_dir_env = _os.environ.get("VCT_STATE_DIR", "").strip()
+    if state_dir_env:
+        db_path = Path(state_dir_env) / "launcher.db"
+    else:
+        db_path = Path.home() / ".vct" / "launcher.db"
+
+    if not db_path.is_file():
+        return out
+
+    try:
+        folder_canonical = folder.resolve()
+    except (OSError, RuntimeError):
+        return out
+
+    is_windows = _platform.system().lower().startswith("win")
+
+    def _path_eq(a: str, b: Path) -> bool:
+        try:
+            ap = Path(a).resolve()
+        except (OSError, RuntimeError):
+            return False
+        if is_windows:
+            return str(ap).lower() == str(b).lower()
+        return ap == b
+
+    try:
+        conn = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
+    except _sqlite3.Error:
+        return out
+
+    try:
+        cur = conn.cursor()
+        # Find the project row that matches our folder.
+        try:
+            cur.execute("SELECT id, folder_path FROM projects")
+            rows = cur.fetchall()
+        except _sqlite3.Error:
+            return out
+        project_id = None
+        for row_id, row_folder in rows:
+            if _path_eq(row_folder or "", folder_canonical):
+                project_id = row_id
+                break
+        if project_id is None:
+            return out
+        try:
+            cur.execute(
+                "SELECT role, collection_name FROM project_kg_bindings "
+                "WHERE project_id = ?",
+                (project_id,),
+            )
+            for role, name in cur.fetchall():
+                if not name:
+                    continue
+                if role == "primary":
+                    out["primary_kg_collection"] = name
+                elif role == "shared":
+                    out["shared_kg_collection"] = name
+        except _sqlite3.Error:
+            return out
+    finally:
+        try:
+            conn.close()
+        except _sqlite3.Error:
+            pass
+
+    return out
+
+
+def _backfill_kg_collection_env_in_project(
+    folder: Path,
+    project_name: Optional[str] = None,
+) -> dict:
+    """Idempotent: add `KG_COLLECTION` / `SHARED_KG_COLLECTION` /
+    `DEVELOPMENT_COLLECTION` to a per-project `.claude/settings.json::env`
+    block when missing. Source of truth = launcher.db's
+    `project_kg_bindings` table. Fall-back derivation when DB is
+    unavailable.
+
+    Discipline (matching `_backfill_code_graph_project_env_in_project`):
+      - Missing settings file → `action="missing"`, no-op.
+      - File unparseable JSON → `action="unparseable"`, no-op.
+      - Missing `env` block → create it with all 3 keys (when
+        derivable).
+      - All 3 keys present → `action="noop"`. User-set values are
+        preserved verbatim — this function only ADDS, never overwrites.
+      - One or two keys missing → fill the missing ones
+        (`action="backfilled"`).
+
+    Resolution chain (used only for keys that are missing):
+      1. launcher.db `project_kg_bindings` (primary + shared roles).
+         Read-only; soft-fails to step 2 on any DB error / not-registered.
+      2. Existing `env.KG_COLLECTION` minus `_KnowledgeGraph` (derive
+         development_collection by suffix swap to `_Development`).
+      3. Explicit `project_name` argument or existing `env.PROJECT_NAME`.
+      4. `folder.name` sanitized via `sanitize_for_weaviate_class`.
+
+    `SHARED_KG_COLLECTION` semantic: writing an empty string is
+    legitimate (it means "don't fan-out to shared KG"). We treat a
+    `role='shared'` binding with a non-empty collection_name as a
+    write-target, and write `""` when the DB has no shared binding.
+    This matches the v0.2.21 launcher behavior where the shared role
+    is optional.
+
+    Args:
+        folder: target user-project folder.
+        project_name: optional explicit project name override for
+            derivation chain step 3.
+
+    Returns:
+        Same shape as `_backfill_code_graph_project_env_in_project`:
+        `{"action": str, "added_keys": [str, ...], "path": str,
+          "resolved_values": {key: value, ...}}`.
+    """
+    settings_file = folder / ".claude" / "settings.json"
+    result: dict = {
+        "action": "missing",
+        "added_keys": [],
+        "path": str(settings_file),
+        "resolved_values": {},
+    }
+
+    if not settings_file.exists():
+        return result
+
+    try:
+        raw = settings_file.read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except (OSError, json.JSONDecodeError):
+        result["action"] = "unparseable"
+        return result
+
+    if not isinstance(data, dict):
+        result["action"] = "unparseable"
+        return result
+
+    env = data.get("env")
+    if not isinstance(env, dict):
+        env = {}
+        data["env"] = env
+        env_was_missing = True
+    else:
+        env_was_missing = False
+
+    # Cache DB lookup — we may read it twice during derivation.
+    _db_cache: dict = {}
+    _db_loaded = False
+
+    def _from_db() -> dict:
+        nonlocal _db_loaded
+        if not _db_loaded:
+            _db_cache.update(_read_kg_collection_from_launcher_db(folder))
+            _db_loaded = True
+        return _db_cache
+
+    def _derive_basename() -> str:
+        if project_name:
+            return sanitize_for_weaviate_class(str(project_name))
+        kg = env.get("KG_COLLECTION") if isinstance(env, dict) else None
+        if isinstance(kg, str) and kg.endswith("_KnowledgeGraph"):
+            return kg[: -len("_KnowledgeGraph")]
+        existing_pn = env.get("PROJECT_NAME") if isinstance(env, dict) else None
+        if isinstance(existing_pn, str) and existing_pn:
+            return sanitize_for_weaviate_class(existing_pn)
+        return sanitize_for_weaviate_class(folder.name or "")
+
+    added: list[str] = []
+    resolved: dict = {}
+
+    # KG_COLLECTION (primary) — derive only if missing.
+    if "KG_COLLECTION" not in env:
+        db = _from_db()
+        if "primary_kg_collection" in db:
+            env["KG_COLLECTION"] = db["primary_kg_collection"]
+        else:
+            env["KG_COLLECTION"] = f"{_derive_basename()}_KnowledgeGraph"
+        added.append("KG_COLLECTION")
+        resolved["KG_COLLECTION"] = env["KG_COLLECTION"]
+
+    # SHARED_KG_COLLECTION — empty-string is a legitimate user choice.
+    # Only add when the key is absent, not when it's "" (empty means
+    # "intentionally disabled cross-project fan-out").
+    if "SHARED_KG_COLLECTION" not in env:
+        db = _from_db()
+        if "shared_kg_collection" in db:
+            env["SHARED_KG_COLLECTION"] = db["shared_kg_collection"]
+        else:
+            # No shared binding seeded — leave the cross-project gate
+            # closed by default. The user can flip it via the launcher's
+            # Identity tab → Manage shared KG collection.
+            env["SHARED_KG_COLLECTION"] = ""
+        added.append("SHARED_KG_COLLECTION")
+        resolved["SHARED_KG_COLLECTION"] = env["SHARED_KG_COLLECTION"]
+
+    # DEVELOPMENT_COLLECTION — derived by suffix swap from the primary.
+    if "DEVELOPMENT_COLLECTION" not in env:
+        primary = env.get("KG_COLLECTION", "")
+        if isinstance(primary, str) and primary.endswith("_KnowledgeGraph"):
+            dev_name = primary[: -len("_KnowledgeGraph")] + "_Development"
+        else:
+            dev_name = f"{_derive_basename()}_Development"
+        env["DEVELOPMENT_COLLECTION"] = dev_name
+        added.append("DEVELOPMENT_COLLECTION")
+        resolved["DEVELOPMENT_COLLECTION"] = dev_name
+
+    if not added and not env_was_missing:
+        result["action"] = "noop"
+        return result
+
+    try:
+        payload = json.dumps(data, indent=2) + "\n"
+        _write_file_atomic(settings_file, payload.encode("utf-8"))
+    except OSError as e:
+        result["action"] = f"write_failed:{type(e).__name__}"
+        return result
+
+    result["action"] = "backfilled"
+    result["added_keys"] = added
+    result["resolved_values"] = resolved
     return result
 
 

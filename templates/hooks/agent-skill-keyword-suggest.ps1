@@ -1,4 +1,4 @@
-# agent-skill-keyword-suggest.ps1 — UserPromptSubmit hook sibling of
+﻿# agent-skill-keyword-suggest.ps1 — UserPromptSubmit hook sibling of
 # agent-skill-keyword-suggest.sh. Scans the user prompt for keywords
 # declared in agents'/skills' `keywords:` frontmatter and emits a short
 # additionalContext envelope when any keyword matches.

@@ -2775,6 +2775,41 @@ def main() -> int:
             data=_backfill_result,
         )
 
+        # v0.2.28 (2026-05-23): same idempotent-add discipline applied to
+        # KG_COLLECTION / SHARED_KG_COLLECTION / DEVELOPMENT_COLLECTION.
+        # Without these in `.claude/settings.json::env`, the MCP weaviate-kg
+        # subprocess falls back to the orchestrator-root literal default
+        # and KG searches silently hit the wrong collection. See
+        # `vco_lib.project_init._backfill_kg_collection_env_in_project`
+        # for full context. Source of truth: launcher.db project_kg_bindings.
+        try:
+            from vco_lib.project_init import (
+                _backfill_kg_collection_env_in_project,
+            )
+            _kg_backfill_result = _backfill_kg_collection_env_in_project(
+                PROJECT_ROOT
+            )
+            if _kg_backfill_result["action"] == "backfilled":
+                print(
+                    f"  Claude settings: backfilled "
+                    f"{len(_kg_backfill_result['added_keys'])} "
+                    f"missing KG env key(s): "
+                    f"{', '.join(_kg_backfill_result['added_keys'])}"
+                )
+            _log_install_event(
+                "9/10", "info",
+                f"_backfill_kg_collection_env action="
+                f"{_kg_backfill_result['action']}",
+                data=_kg_backfill_result,
+            )
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            _log_install_event(
+                "9/10", "warn",
+                f"_backfill_kg_collection_env failed (non-fatal): {err}",
+                data={"error": err},
+            )
+
         # PR-22 (v0.2.12, 2026-05-16): rename legacy
         # `docker-compose.override.yml` to `compose.override.yaml` so
         # podman-compose's auto-loader recognizes it. PR-10A (v0.2.11)

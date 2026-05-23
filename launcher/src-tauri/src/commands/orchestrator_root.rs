@@ -346,17 +346,78 @@ fn ensure_orchestrator_root_state_populated(
 /// `project_state_populate::populate_kg_collection_access` and the
 /// per-project bundle install.
 ///
+/// v0.2.28 (2026-05-23): seed-guard added. Pre-v0.2.28 this function
+/// did an unconditional `set_project_kg_binding`, whose underlying SQL
+/// is `INSERT ... ON CONFLICT(project_id, role) DO UPDATE SET
+/// collection_name = excluded.collection_name`. The "primary" binding
+/// got clobbered with the orchestrator-root literal on every launcher
+/// boot, even when the user had previously customized it (e.g. an
+/// install migrated from `VCODev_KnowledgeGraph` to host=orchestrator_root
+/// kept the old data on disk but lost the binding on the next launch).
+/// This violated Dev Constraint #8 ("User choices survive all updates").
+/// The guard: only seed when no primary binding exists, OR the existing
+/// one is still flagged with our auto-seed sentinel. Any other config
+/// (manual override, prior migration, future GUI picker) wins.
+///
 /// Soft-fail: any error here logs to stderr but does NOT propagate.
 /// The Orchestrator Project row insert succeeded; missing KG binding
 /// only means the shared KG falls back to `DEFAULT_SHARED_KG_COLLECTION`
-/// const for now. The function is called again on next launcher boot
-/// (idempotent via `ON CONFLICT(project_id, role)` upsert in
-/// `set_project_kg_binding`).
+/// const for now.
 fn ensure_orchestrator_root_kg_binding(db: &Db, root_id: &str) {
     let collection_name = format!(
         "{}_KnowledgeGraph",
         sanitize_kg_collection(ORCHESTRATOR_ROOT_NAME)
     );
+
+    // v0.2.28 seed-guard: refuse to clobber a binding the user (or a
+    // prior migration) put in place. We only write when:
+    //   (a) no primary binding exists yet, OR
+    //   (b) the existing primary binding still carries our auto-seed
+    //       sentinel (i.e. nothing user-driven has touched it since).
+    // `list_project_kg_bindings` is soft-fail too: if the read itself
+    // errors we log + return without writing, since clobbering on a
+    // failed read is exactly the regression we're fixing.
+    let existing = match db.list_project_kg_bindings(root_id) {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!(
+                "[vct] WARN: ensure_orchestrator_root_kg_binding read failed (non-fatal, skipping seed): {}",
+                e
+            );
+            return;
+        }
+    };
+    let primary = existing.iter().find(|b| b.role == "primary");
+    let should_seed = match primary {
+        None => true,
+        Some(b) => {
+            // Only re-seed when the existing row is still our auto-seeded
+            // default. Anything else — user override via GUI, manual SQL
+            // patch, prior migration — is left alone.
+            b.config
+                .get("auto_seeded_by")
+                .and_then(|v| v.as_str())
+                == Some("ensure_orchestrator_root_kg_binding")
+                && b.collection_name == collection_name
+        }
+    };
+    if !should_seed {
+        // Existing binding is user-customized (or already matches what
+        // we'd write — no-op). Log once at INFO-equivalent volume so
+        // operators can confirm the guard fired.
+        if let Some(b) = primary {
+            if b.collection_name != collection_name {
+                eprintln!(
+                    "[vct] orchestrator-root primary KG binding already set to '{}' (auto_seeded_by={:?}); skipping seed of '{}'",
+                    b.collection_name,
+                    b.config.get("auto_seeded_by").and_then(|v| v.as_str()),
+                    collection_name,
+                );
+            }
+        }
+        return;
+    }
+
     match db.set_project_kg_binding(
         root_id,
         "primary",
@@ -761,6 +822,144 @@ mod tests {
         );
 
         fs::remove_dir_all(&tmp).ok();
+    }
+
+    // ─── v0.2.28: KG seed-guard regression tests ────────────────────────
+
+    /// Pre-v0.2.28: every launcher boot would call set_project_kg_binding
+    /// unconditionally, whose ON CONFLICT DO UPDATE clobbered any
+    /// user-customized collection_name. v0.2.28 adds a guard that only
+    /// re-seeds when no binding exists OR the existing binding is still
+    /// flagged with our auto-seed sentinel. This test pre-seeds a manual
+    /// override and asserts the second ensure leaves it intact.
+    #[test]
+    fn kg_seed_guard_preserves_manual_override() {
+        let db = Db::open_in_memory().expect("in-memory db");
+
+        let root_id = Uuid::new_v4().to_string();
+        db.insert_project(
+            &root_id,
+            ORCHESTRATOR_ROOT_NAME,
+            "/tmp/orchroot-seed-guard-manual",
+            ProjectHost::OrchestratorRoot,
+            ORCHESTRATOR_ROOT_SLUG,
+        )
+        .unwrap();
+
+        // User has manually pointed primary at a legacy collection from
+        // a pre-v0.2.11 install. The seed function must respect this.
+        db.set_project_kg_binding(
+            &root_id,
+            "primary",
+            "VCODev_KnowledgeGraph",
+            None,
+            None,
+            None,
+            None,
+            &serde_json::json!({"manual_override": "v0.2.28-recovery"}),
+        )
+        .unwrap();
+
+        // Boot the seeder.
+        ensure_orchestrator_root_kg_binding(&db, &root_id);
+
+        // Binding must be untouched.
+        let bindings = db.list_project_kg_bindings(&root_id).unwrap();
+        let primary = bindings
+            .iter()
+            .find(|b| b.role == "primary")
+            .expect("primary binding present");
+        assert_eq!(
+            primary.collection_name, "VCODev_KnowledgeGraph",
+            "manual override must survive the seed call"
+        );
+        assert_eq!(
+            primary.config.get("manual_override").and_then(|v| v.as_str()),
+            Some("v0.2.28-recovery"),
+            "config_json must remain the user's sentinel, not the auto-seed one"
+        );
+    }
+
+    /// First-time seed (no prior binding) writes the auto-seed default.
+    /// This is the happy path the guard must NOT break.
+    #[test]
+    fn kg_seed_guard_writes_when_absent() {
+        let db = Db::open_in_memory().expect("in-memory db");
+
+        let root_id = Uuid::new_v4().to_string();
+        db.insert_project(
+            &root_id,
+            ORCHESTRATOR_ROOT_NAME,
+            "/tmp/orchroot-seed-guard-absent",
+            ProjectHost::OrchestratorRoot,
+            ORCHESTRATOR_ROOT_SLUG,
+        )
+        .unwrap();
+
+        assert!(
+            db.list_project_kg_bindings(&root_id).unwrap().is_empty(),
+            "pre-condition: no bindings yet"
+        );
+
+        ensure_orchestrator_root_kg_binding(&db, &root_id);
+
+        let bindings = db.list_project_kg_bindings(&root_id).unwrap();
+        let primary = bindings
+            .iter()
+            .find(|b| b.role == "primary")
+            .expect("primary binding seeded");
+        let expected = format!(
+            "{}_KnowledgeGraph",
+            sanitize_kg_collection(ORCHESTRATOR_ROOT_NAME)
+        );
+        assert_eq!(primary.collection_name, expected);
+        assert_eq!(
+            primary.config.get("auto_seeded_by").and_then(|v| v.as_str()),
+            Some("ensure_orchestrator_root_kg_binding"),
+            "fresh seed must carry the auto-seed sentinel so subsequent boots can re-seed"
+        );
+    }
+
+    /// A binding written by a previous boot of the same seed function
+    /// (carrying our auto-seed sentinel AND the literal default name) is
+    /// a no-op rather than a clobber — and crucially does not corrupt
+    /// the row if the literal name has not drifted.
+    #[test]
+    fn kg_seed_guard_idempotent_on_prior_auto_seed() {
+        let db = Db::open_in_memory().expect("in-memory db");
+
+        let root_id = Uuid::new_v4().to_string();
+        db.insert_project(
+            &root_id,
+            ORCHESTRATOR_ROOT_NAME,
+            "/tmp/orchroot-seed-guard-prior",
+            ProjectHost::OrchestratorRoot,
+            ORCHESTRATOR_ROOT_SLUG,
+        )
+        .unwrap();
+
+        // First boot.
+        ensure_orchestrator_root_kg_binding(&db, &root_id);
+        let first = db.list_project_kg_bindings(&root_id).unwrap();
+        let first_primary = first.iter().find(|b| b.role == "primary").unwrap().clone();
+
+        // Second boot — should leave the row exactly as-is (the guard
+        // matches the auto-seed sentinel and the literal name).
+        ensure_orchestrator_root_kg_binding(&db, &root_id);
+        let second = db.list_project_kg_bindings(&root_id).unwrap();
+        let second_primary = second.iter().find(|b| b.role == "primary").unwrap();
+
+        assert_eq!(
+            second_primary.collection_name, first_primary.collection_name,
+            "collection name must not change on second boot"
+        );
+        // updated_at MAY equal first if the no-op path skipped the write
+        // entirely (the v0.2.28 guard does skip). Either way must be
+        // monotonic non-decreasing.
+        assert!(
+            second_primary.updated_at >= first_primary.updated_at,
+            "updated_at must not regress"
+        );
     }
 
     /// When the orchestrator-root folder_path stored in DB no longer
