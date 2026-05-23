@@ -1,6 +1,7 @@
 ---
 name: ai-llm-expert
 description: LLM integration specialist - prompts, context, caching, routing, cost optimization
+short_desc: design production LLM pipelines and prompt engineering
 keywords: [prompt caching, context window, multi-model routing, LLM cost, Anthropic SDK, semantic caching, "prompt review", "token budget", LLM, "LLM integration", "Claude API", Sonnet, Opus, Haiku, "Anthropic API", "cost optimization"]
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
