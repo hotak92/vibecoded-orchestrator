@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.31] — 2026-05-23
+
+A general-purpose **paid-module lifecycle release**: every step from licensed-discovery through install → update → uninstall is now declarative-manifest-driven and works for any module, not just RL Reranker. Plus several silent-bug closures surfaced by the v0.2.27–v0.2.30 sprint (broken `dismiss-deferral` subcommand, license cache never written, Windows PS1 missing, hardcoded "Upgrade to Pro" copy).
+
+### Added
+
+- **`update_module_for_project` Tauri command** — the missing third leg of the install/uninstall/update tripod. Mirrors `install_module_for_project`. Reads the manifest's `UpgradeBlock` (declared in the schema since v0.2.0 but never invoked): runs `pre_upgrade` commands → re-fetches the artifact (git pull / podman pull / Local no-op) → runs `post_upgrade` → optionally runs `migration_script`. Falls back to a warning-emitting uninstall+reinstall when `manifest.upgrade` is absent. Wired into `lib.rs` handler list. Visible in the GUI as **"Update vX → vY"** button on a module card when the installed `module_version` is less than the catalog version.
+- **`dismiss-deferral` argparse subcommand** in `vco_lib.project_init`. The 4 deferral-emission paths in `vco_lib/project_init.py` had been printing `python -m vco_lib.project_init dismiss-deferral --folder ... --condition-id ...` for users to resolve preserved-file deferrals, but the subcommand was never registered in argparse (running it returned "invalid choice"). Now registered with `--folder` + `--condition-id` + `--json` flags. Reuses existing `DeferralReport.read()` / `mark_resolved()` / `write()` primitives. Idempotent (silent exit 0 on missing file or no match; exit 1 only on genuine YAML corruption).
+- **Module-deprecation warning surface** (3 layers, RL-chat spec). When a module's `runtime.update_endpoint` poller returns `deprecated: true`, the warning surfaces in three places: (1) **Launcher GUI** — amber `Deprecated` badge near the tier chip in the module catalog card, plus a `DeprecationBanner` rendered above the catalog grid for installed deprecated modules, plus one-shot desktop notification on first detection (gated by new `module_deprecation_seen` SQLite table). (2) **Claude-visible via RLClient** — new Tauri command `apply_deprecation_state` writes 4 `VCT_RL_MODULE_DEPRECATED*` env keys into the project's `.claude/settings.json env` block (canonical channel per CLAUDE.md). `RLClient._deprecation_warning()` reads them, and `hybrid_search` prepends a `[DEPRECATION WARNING] ...` line to the response on every turn (Claude sees it in context). (3) **Audit** — new `deprecation_events` SQLite table logs every state transition. Manual poller entry point only; cron wiring deferred to v0.2.32.
+- **Per-module entitlements via `tier_cache.module_licenses`** — `license_refresh` now parses `body.module_licenses` from the Supabase `validate-tier` response and persists to the cache row (`is_module_licensed` already reads from this map but it was always empty). Variant-id-based per-module unlocks declared in `manifest.license.variant_ids` are now enforceable when the wire contract is extended. Out-of-the-box behavior unchanged because the edge function doesn't yet emit `module_licenses`; the parse is defensive (missing / wrong-shape → empty map).
+- **`payment_alerts` Supabase table** + audit insert in `handlePaymentFailed`. The Lemon Squeezy `payment_failed` webhook was a silent 200 + `console.warn`; now durably records the event in a new RLS-protected table so downstream notifiers (email / Telegram) can poll for unhandled rows. Never throws; webhook still returns 200 with `audit_row_inserted: bool` in body.
+- **`scripts/post-install-launcher.ps1`** — Windows parity helper that mirrors the existing `.sh` sibling (refreshes Desktop + Start Menu .lnk shortcuts via `WScript.Shell` COM). Pre-v0.2.31 the Windows direct-install branch at `install.py:8662` printed a `(TODO)` message and skipped the icon refresh. Now invoked correctly.
+
+### Fixed
+
+- **`request_pull_token` reads `~/.vibecoded/license_cache.json` from a file the Rust launcher never wrote.** Cache file is now written by `license_refresh` on every success path + removed on `license_deactivate`. Without this, the moment any paid-module image flips from public to private GHCR, every install would 401 because the token-gateway path always fell through to anonymous pull. File mode 0o600 on Unix (NTFS ACL inheritance on Windows). Soft-fail discipline preserved — write errors are logged via `eprintln!` and never propagated.
+- **`uninstall_module_v2` now respects manifest's `UninstallBlock`** (declared in schema since v0.2.0 but never read). Honors `remove_install_dir` / `preserve_paths` / `deregister_mcp` / `clear_secrets` per manifest declaration. Falls back to legacy hardcoded behavior with warning when manifest is missing. `purge_data` parameter remains a separate concept (wipes `<vct_root>/data/<module_id>`; `clear_secrets` wipes keychain).
+- **Tier-blind "Upgrade to Pro" copy** in `dashboard.rs` (3 hardcoded sites). New `tier_required_message(min_tier, feature)` helper renders Pro / MAO / Enterprise / Admin labels correctly. Mao-tier users no longer see "Upgrade to Pro" when their existing license already qualifies. ModuleCatalog button copy also fixed: not-installed + tier-required + unlicensed now reads "Activate license" instead of "Upgrade to Pro". Regression test pins the literal phrase against re-introduction.
+- **`InstallStage::Failed` now emitted on error paths.** Previously declared `#[allow(dead_code)]` and never sent — UI progress bar saw the channel hang up instead of getting a terminal failure event. New `report_error` helper threads the Failed stage through `installer_engine::run`.
+- **RL telemetry: session_id population (was 0.1% → ~100% expected)** + **embedding_source / dim / model on writer construction (was 31% stragglers → ~0%)** + **emb + cos_qn / cos_ql / cos_nl on log_retrieval rows (was 7.4% missing → ~0%)**. Container-side half shipped in vct-rl-reranker v0.2.4 (`session_id` kwarg on `/cache_nodes`); orchestrator-side completes the pair. `RLClient.cache_nodes` gains `session_id` kwarg; `weaviate_mcp/server.py` call sites pass `os.getenv("CLAUDE_SESSION_ID")`. `RLTelemetryWriter` construction reads `ACTIVE_EMBEDDING` + `EMBEDDING_MODEL` env vars with sensible defaults. `near_vector` calls feeding `log_retrieval` now pass `include_vector=True`; cosines computed via new `_cosine` helper (pure-python, no numpy).
+
+### Changed
+
+- ModuleCatalog button-state replaced with a state×license matrix: `Activate license` instead of `Upgrade to Pro`; `Update vX → vY` when manifest version is newer than installed; enabled-toggle + uninstall otherwise. `tierLabel()` helper centralizes Pro / MAO / Enterprise / Admin display.
+- v0.2.31 prep commit `chore(v0.2.31-prep)` (830ad77) staged the `_installed_matches_template_history` heuristic + `_read_codegraph_binding_override` helper + codegraph correction logic in `vco_lib/project_init.py` ahead of agent parallelization. Heuristic walks `git log -50` on template path, sha256s historical blob contents, returns True iff any historical version matches the installed hash — heals manifest-untracked-but-VCO-shipped files (97-agent stale-on-disk symptom observed in VCO_dev pre-fix).
+
+### Versions
+
+- Bump 0.2.30 → 0.2.31 in 6 build files (`launcher/src-tauri/Cargo.toml`, `vct-launcher-core/Cargo.toml`, `vct-hub/Cargo.toml`, `tauri.conf.json`, `launcher/package.json`, `vct-module.json`).
+- Cargo.lock auto-synced.
+
+### Test results
+
+- 962 Rust lib tests pass (was 929 pre-v0.2.31 baseline; +12 from licensing, +11 from module lifecycle, +4 from tier-aware copy, +6 from module_deprecation).
+- 2064 Python tests pass (main suite) + 8 rl_client deprecation tests.
+- svelte-check: 0 errors (51 pre-existing warnings in unrelated files).
+
+### Known issues deferred to v0.2.32+
+
+- `runtime.update_endpoint` polling task is NOT cron-wired (`module_update_poll()` exists as manual entry point only). Daily/weekly poll cadence + UI refresh of "Update available" badges queued for v0.2.32.
+- Per-module license activation UI (the data-layer is now done — `tier_cache.module_licenses` populates from the Supabase response — but the launcher's License dialog doesn't yet show per-module activations or expose a "Activate per-module key" affordance).
+- The `payment_failed` Supabase audit table is in place but no downstream notifier (email / Telegram dispatch transport) is wired. v0.2.32 will wire either Resend/Postmark email or a Telegram webhook.
+- Deprecation-warning desktop notification path uses `console.warn` fallback when `@tauri-apps/plugin-notification` isn't installed. Adding the plugin + native notifications queued for v0.2.32.
+- Divergence-modal "Try Merge again" footgun (queued from v0.2.30 backlog) and modal-positioning crop bug — still open, queued for v0.2.32.
+- See `.claude/context/plans/v0.2.31-plan-2026-05-23.md` (in VCO_dev fork) for the full v0.2.32 backlog.
+
 ## [0.2.30] — 2026-05-23
 
 Critical fix for a silent KG-search misroute introduced by the install-flow plumbing. Pre-v0.2.30 every `install.py --update` run rewrote the orchestrator-root project's `.claude/settings.json` from the bundled template (which has no `env` block), wiping the user's `KG_COLLECTION` override. The downstream v0.2.29 backfill only added missing keys — never corrected an existing-but-stale value — so a user who had picked `<Project>_KnowledgeGraph` in the launcher Identity tab saw the binding silently revert to the orchestrator-root literal default on every update. `hybrid_search` returned 0 results because the MCP queried the wrong collection. **All users on v0.2.27–v0.2.29 with a customized `KG_COLLECTION` should update.**
