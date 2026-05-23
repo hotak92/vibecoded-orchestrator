@@ -2797,6 +2797,95 @@ def _get_rl_client():
     return _rl_client_instance
 
 
+def _embedding_dim_for(model: str) -> int:
+    """Best-effort embedding-dim resolution from a model id.
+
+    Used as a fallback when ``EmbeddingService.for_project()`` is
+    unavailable at writer-construction time. Keeps the mapping close
+    to the active set documented in CLAUDE.md (qwen3 / arctic / openai
+    / codesage). Returns 1024 for unknown models (the default text-emb
+    width across the orchestrator).
+    """
+    m = (model or "").lower()
+    if "qwen3" in m:
+        return 1024
+    if "arctic" in m:
+        return 1024
+    if "codesage" in m:
+        return 2048
+    if "openai" in m or "text-embedding" in m:
+        return 1536
+    return 1024
+
+
+def _extract_obj_vector(obj, target_name: str = "") -> list[float] | None:
+    """Extract a Weaviate v4 object's vector for the matched named slot.
+
+    ``obj.vector`` is a ``dict[str, list[float]]`` when the collection
+    uses named vectors (the orchestrator's default — see e.g.
+    `qwen3_embed`, `codesage_embed`) and an unwrapped list otherwise.
+    Returns None when no vector is attached (e.g. the caller forgot
+    ``include_vector=True``, or the slot doesn't exist).
+
+    Used by hybrid_search + semantic_graph_search to attach `emb`
+    to candidate dicts before they flow into log_retrieval (v0.2.31
+    telemetry audit fix — Item 2.4).
+    """
+    try:
+        vec = getattr(obj, "vector", None)
+        if vec is None:
+            return None
+        if isinstance(vec, dict):
+            if target_name and target_name in vec:
+                v = vec[target_name]
+            else:
+                # No target / target missing — pick the first non-empty
+                # slot. Multi-vector collections only have one populated
+                # slot at retrieval time anyway.
+                v = next((val for val in vec.values() if val), None)
+        else:
+            v = vec
+        if v is None:
+            return None
+        # Coerce to a plain list of floats so downstream JSON serialization
+        # doesn't choke on numpy-array-likes.
+        return [float(x) for x in v]
+    except Exception:
+        return None
+
+
+def _cosine(a, b) -> float:
+    """Cosine similarity between two vectors. Returns 0.0 if either is
+    zero-norm, mismatched-length, or non-iterable.
+
+    Pure-python — no numpy dep — so this stays usable in lean installs
+    where numpy isn't pulled in transitively. Telemetry callsites
+    should ALSO wrap calls in their own try/except so a bad shape
+    never propagates into the rerank path (defence-in-depth).
+    """
+    try:
+        if not a or not b:
+            return 0.0
+        n = min(len(a), len(b))
+        if n == 0:
+            return 0.0
+        dot = 0.0
+        na = 0.0
+        nb = 0.0
+        for i in range(n):
+            ai = float(a[i])
+            bi = float(b[i])
+            dot += ai * bi
+            na += ai * ai
+            nb += bi * bi
+        if na == 0.0 or nb == 0.0:
+            return 0.0
+        import math
+        return float(dot / (math.sqrt(na) * math.sqrt(nb)))
+    except Exception:
+        return 0.0
+
+
 def _get_rl_telemetry_writer():
     """Lazy-build one ``RLTelemetryWriter`` per process."""
     global _rl_telemetry_writer_instance
@@ -2810,16 +2899,29 @@ def _get_rl_telemetry_writer():
 
     # Derive the embedding source short id from EmbeddingService when
     # available. Falls back to ACTIVE_EMBEDDING env (qwen3 default).
-    emb_source = ACTIVE_EMBEDDING
-    emb_dim = 1024
-    emb_model = EMBEDDING_MODEL
+    #
+    # v0.2.31 telemetry audit fix (Item 2.2 — was 31% blank rows): when
+    # EmbeddingService probe fails AND module-level constants happen to
+    # be empty (env vars present but blank — observed on a small share
+    # of installs), we still want a non-empty triple so the offline
+    # trainer can join cohorts cleanly. Use os.getenv with defaults at
+    # the writer-construction site too, in addition to the module-level
+    # constants — defence-in-depth so the writer never ships blank
+    # embedding_{source,model} into the JSONL.
+    emb_source = ACTIVE_EMBEDDING or os.getenv("ACTIVE_EMBEDDING", "qwen3") or "qwen3"
+    emb_model = (
+        EMBEDDING_MODEL
+        or os.getenv("EMBEDDING_MODEL", "qwen3-embedding:0.6b")
+        or "qwen3-embedding:0.6b"
+    )
+    emb_dim = _embedding_dim_for(emb_model)
     try:
         from vco_lib.embedding_service import EmbeddingService
         svc = EmbeddingService.for_project()
         try:
-            emb_source = svc.text_model_short_id()
-            emb_dim = svc.text_dim
-            emb_model = svc.text_model_id
+            emb_source = svc.text_model_short_id() or emb_source
+            emb_dim = svc.text_dim or emb_dim
+            emb_model = svc.text_model_id or emb_model
         finally:
             svc.close()
     except Exception as exc:
@@ -2942,11 +3044,18 @@ async def _rl_cache_and_rerank(
             # rl_client package unavailable — return Weaviate order.
             ranked = list(all_nodes[:limit])
         else:
+            # v0.2.31 telemetry audit fix: forward CLAUDE_SESSION_ID so
+            # the container can persist session_id on /cache_nodes rows.
+            # Pre-v0.2.31 this field was empty in 99.9% of telemetry rows
+            # because no caller passed it through — the container shipped
+            # the kwarg in vct-rl-reranker v0.2.4 to receive it. Empty
+            # string is the documented backward-compat sentinel.
             ranked = await client.cache_nodes(
                 query=query,
                 nodes=all_nodes,
                 top_k=limit,
                 task_id=task_id,
+                session_id=os.getenv("CLAUDE_SESSION_ID", ""),
             )
     else:
         # Free tier OR empty nodes → return Weaviate order (which is also
@@ -2971,16 +3080,29 @@ async def _rl_cache_and_rerank(
         if writer is not None:
             # Build the log payload from the ranked list. Score-aware
             # tier tagging: first ``limit`` go to top_k, rest extra_ref.
+            #
+            # v0.2.31 telemetry audit fix (Item 2.4 — was 7.4% missing):
+            # propagate emb + cos_qn / cos_ql / cos_nl when the upstream
+            # search path enriched the candidate dict. cos_ql / cos_nl
+            # are typically absent (no label_embedding in scope at the
+            # MCP search-tool level — that lives in the offline trainer)
+            # and the writer's payload builder soft-omits None fields.
             log_nodes: list[dict] = []
             for idx, n in enumerate(all_nodes):
                 if not isinstance(n, dict):
                     continue
-                log_nodes.append({
+                rec = {
                     "title": n.get("title", ""),
                     "score": n.get("score", 0.0),
                     "tier": "top_k" if idx < limit else "extra_reference",
-                    **({"emb": n["emb"]} if n.get("emb") else {}),
-                })
+                }
+                if n.get("emb"):
+                    rec["emb"] = n["emb"]
+                for cos_field in ("cos_qn", "cos_ql", "cos_nl"):
+                    val = n.get(cos_field)
+                    if val is not None:
+                        rec[cos_field] = val
+                log_nodes.append(rec)
             writer.log_retrieval(
                 task_id=task_id,
                 task_type="mcp_interactive",
@@ -3222,6 +3344,14 @@ async def _semantic_graph_search_body(
         handle = _coll_for(coll_name)
         if handle is None:
             continue
+        # v0.2.31 telemetry audit fix (Item 2.4 — was 7.4% missing emb):
+        # capture the query vector (target_name) so we can attach node
+        # embeddings + cos_qn to the candidate dicts BEFORE they flow
+        # into _rl_cache_and_rerank → log_retrieval. ``query_vector``
+        # may be None on near_text path (Weaviate-vectoriser mode); in
+        # that case we skip emb enrichment.
+        query_vector: list[float] | None = None
+        query_target: str = ""
         try:
             if EMBEDDING_SOURCE == "weaviate":
                 nt_kwargs = dict(query=query, limit=fetch_limit, return_metadata=["distance"])
@@ -3230,8 +3360,13 @@ async def _semantic_graph_search_body(
                 primary = handle.query.near_text(**nt_kwargs)
             else:
                 vector, target_name = await _get_search_vector(query)
+                query_vector = vector
+                query_target = target_name or ""
                 nv_kwargs = dict(
-                    near_vector=vector, limit=fetch_limit, return_metadata=["distance"]
+                    near_vector=vector,
+                    limit=fetch_limit,
+                    return_metadata=["distance"],
+                    include_vector=True,
                 )
                 if target_name:
                     nv_kwargs["target_vector"] = target_name
@@ -3260,6 +3395,22 @@ async def _semantic_graph_search_body(
             _format_obj(obj, coll_name, obj.metadata.distance)
             for obj in primary.objects
         ]
+        # v0.2.31 telemetry audit fix: enrich formatted dicts with node
+        # embedding + cos_qn so log_retrieval gets non-empty fields.
+        # Soft-fail per-result: a malformed obj.vector must never
+        # crash the search path.
+        if query_vector is not None:
+            for r, obj in zip(coll_formatted, primary.objects):
+                try:
+                    node_emb = _extract_obj_vector(obj, query_target)
+                    if node_emb:
+                        r["emb"] = node_emb
+                        r["cos_qn"] = _cosine(query_vector, node_emb)
+                except Exception as enrich_exc:  # noqa: BLE001
+                    logger.debug(
+                        "semantic_graph_search: emb enrichment skipped for one node (%s)",
+                        enrich_exc,
+                    )
         coll_formatted = _enrich_with_adjacent_chunks(handle, coll_formatted, coll_name)
         all_formatted.extend(coll_formatted)
         for obj in primary.objects:
@@ -3466,6 +3617,16 @@ async def _hybrid_search_single_collection(
         effective_filter = (effective_filter & date_filter) if effective_filter else date_filter
 
     # Semantic search
+    # v0.2.31 telemetry audit fix (Item 2.4 — was 7.4% missing emb on
+    # log_retrieval): on the near_vector path, ask Weaviate to return
+    # the per-object vector AND capture the query vector so we can
+    # attach `emb` + `cos_qn` to formatted candidates before they
+    # flow into _rl_cache_and_rerank → log_retrieval. ``query_vector``
+    # is None on the Weaviate-vectoriser (near_text) path, in which
+    # case we skip emb enrichment — the path doesn't return raw
+    # vectors anyway.
+    query_vector: list[float] | None = None
+    query_target: str = ""
     if EMBEDDING_SOURCE == "weaviate":
         if effective_filter:
             semantic_results = coll.query.near_text(query=query, limit=fetch_limit, filters=effective_filter, return_metadata=["distance"])
@@ -3473,7 +3634,14 @@ async def _hybrid_search_single_collection(
             semantic_results = coll.query.near_text(query=query, limit=fetch_limit, return_metadata=["distance"])
     else:
         vector, target_name = await _get_search_vector(query)
-        nv_kwargs = dict(near_vector=vector, limit=fetch_limit, return_metadata=["distance"])
+        query_vector = vector
+        query_target = target_name or ""
+        nv_kwargs = dict(
+            near_vector=vector,
+            limit=fetch_limit,
+            return_metadata=["distance"],
+            include_vector=True,
+        )
         if effective_filter:
             nv_kwargs["filters"] = effective_filter
         if target_name:
@@ -3490,12 +3658,28 @@ async def _hybrid_search_single_collection(
         _format_obj(obj, coll_name, obj.metadata.distance)
         for obj in semantic_results.objects
     ]
+    # v0.2.31 telemetry audit fix: enrich semantic_formatted with node
+    # embeddings + cos_qn from the matched obj.vector. Skipped when on
+    # the near_text path (no raw vectors available). Per-result
+    # soft-fail so a malformed vector never breaks the search path.
+    if query_vector is not None:
+        for r, obj in zip(semantic_formatted, semantic_results.objects):
+            try:
+                node_emb = _extract_obj_vector(obj, query_target)
+                if node_emb:
+                    r["emb"] = node_emb
+                    r["cos_qn"] = _cosine(query_vector, node_emb)
+            except Exception as enrich_exc:  # noqa: BLE001
+                logger.debug(
+                    "hybrid_search: emb enrichment skipped for one node (%s)",
+                    enrich_exc,
+                )
     semantic_formatted = _enrich_with_adjacent_chunks(coll, semantic_formatted, coll_name)
 
     combined = {}
     for r in semantic_formatted:
         key = (r["title"], r.get("chunk_number"))
-        combined[key] = {
+        entry = {
             "title": r["title"],
             "node_type": r.get("node_type", "unknown"),
             "content": r.get("content", ""),
@@ -3509,6 +3693,14 @@ async def _hybrid_search_single_collection(
             "total_chunks": r.get("total_chunks"),
             "source_id": r.get("source_id"),
         }
+        # v0.2.31 telemetry audit fix: propagate emb + cos_qn from the
+        # near_vector path into the merged candidate dict so they
+        # survive into _rl_cache_and_rerank → log_retrieval.
+        if r.get("emb") is not None:
+            entry["emb"] = r["emb"]
+        if r.get("cos_qn") is not None:
+            entry["cos_qn"] = r["cos_qn"]
+        combined[key] = entry
 
     for obj in keyword_results.objects:
         formatted_kw = _format_obj(obj, coll_name)

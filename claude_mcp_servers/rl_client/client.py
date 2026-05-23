@@ -164,6 +164,7 @@ class RLClient:
         *,
         task_id: str,
         query_emb: Optional[List[float]] = None,
+        session_id: str = "",
     ) -> List[Any]:
         """Rerank ``nodes`` and return the top-k.
 
@@ -183,6 +184,13 @@ class RLClient:
                 later ``rl_update`` call. Required.
             query_emb: Optional query embedding (sanity-checked
                 against ``self.text_dim``).
+            session_id: Optional Claude Code session id; forwarded to
+                the container so server-side telemetry rows can be
+                grouped by chat (v0.2.31 telemetry audit fix —
+                container ships matching ``session_id`` kwarg in
+                ``vct-rl-reranker`` v0.2.4+). Defaults to empty string
+                for backward-compat with older containers (the field
+                is ignored when absent).
         """
         # Defensive: drop misshaped query_emb rather than raising.
         if query_emb is not None and len(query_emb) != self.text_dim:
@@ -206,6 +214,7 @@ class RLClient:
             "limit": int(top_k),
             "embedding_source": self.active_embedding,
             "active_embedding": self.active_embedding,
+            "session_id": str(session_id or ""),
         }
         if query_emb is not None:
             payload["query_emb"] = query_emb
