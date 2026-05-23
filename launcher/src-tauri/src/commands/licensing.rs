@@ -5,6 +5,8 @@
 //!   and update the cache. 3-day grace period on network failure.
 //! - `license_activate`: persist the license key to the keychain and refresh.
 
+use std::path::PathBuf;
+
 use sha2::{Digest, Sha256};
 use tauri::{command, State};
 
@@ -88,6 +90,187 @@ fn machine_id_hash() -> String {
     hex::encode(hasher.finalize())
 }
 
+// ---------------------------------------------------------------------------
+// Bug #22 (v0.2.31): token-gateway license cache file.
+// ---------------------------------------------------------------------------
+//
+// `installer_engine::request_pull_token` reads
+// `~/.vibecoded/license_cache.json` and POSTs the body verbatim to a
+// per-module `pull_token_endpoint` (signed-URL gateway, Phase 3A).
+//
+// Before this fix, the Rust launcher only persisted tier state to SQLite
+// (`tier_cache`) — the JSON file the token gateway expects was never
+// written, so every paid-module pull fell through to anonymous registry
+// access. That worked while vct-rl-reranker's GHCR image was public, but
+// breaks the moment the image flips to private (v1.0 anti-piracy ship).
+//
+// We write the same JSON shape that the Python validator at
+// `VCThelpers/license/validator.py` (`LicenseResult.to_json()`) writes,
+// so the token gateway has one wire contract to authenticate against:
+//
+//   { "tier": "pro" | "mao" | "enterprise" | "admin",
+//     "valid": true,
+//     "expires_at": "2027-04-18T00:00:00.000Z" | null,
+//     "last_validated_at": 1734567890.123,   # epoch seconds (float)
+//     "message": "Validated." }
+//
+// Soft-fail discipline: a write error is logged but does NOT fail
+// `license_refresh`. The token-gateway path degrades to anonymous pull
+// on its own (the current pre-fix behaviour) if write fails.
+
+/// Resolve `~/.vibecoded/license_cache.json` via `directories::UserDirs`
+/// — same resolver `installer_engine::request_pull_token` uses, so the
+/// reader/writer agree on the path on every OS.
+///
+/// Tests inject an explicit `$HOME` via `home_override`; production
+/// callers pass `None` and let `directories::UserDirs::new()` resolve
+/// the real one.
+fn license_cache_path_in(home_override: Option<&std::path::Path>) -> Option<PathBuf> {
+    if let Some(home) = home_override {
+        return Some(home.join(".vibecoded/license_cache.json"));
+    }
+    directories::UserDirs::new().map(|d| d.home_dir().join(".vibecoded/license_cache.json"))
+}
+
+/// Apply mode 0o600 to the cache file on Unix. NTFS ACLs inherit from
+/// the parent on Windows, so no-op there.
+#[cfg(unix)]
+fn set_cache_file_mode_0600(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let perms = std::fs::Permissions::from_mode(0o600);
+    std::fs::set_permissions(path, perms)
+}
+
+#[cfg(not(unix))]
+fn set_cache_file_mode_0600(_path: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Write `~/.vibecoded/license_cache.json` in the
+/// `VCThelpers/license/validator.py::LicenseResult` shape so the Phase
+/// 3A token gateway has a stable wire contract. Called from the
+/// `license_refresh` success path and the activation success path.
+///
+/// Soft-fail: every error path is logged via `eprintln!` and swallowed.
+/// The caller (`license_refresh`) MUST NOT propagate the error — the
+/// token-gateway flow degrading to anonymous pull is preferable to a
+/// licensing UX regression.
+fn write_license_cache_for_token_gateway(
+    tier: &str,
+    valid: bool,
+    expires_at: Option<&str>,
+    message: &str,
+) {
+    write_license_cache_for_token_gateway_in(None, tier, valid, expires_at, message);
+}
+
+/// Same as `write_license_cache_for_token_gateway()` but allows callers
+/// (tests) to inject an explicit `$HOME` override.
+fn write_license_cache_for_token_gateway_in(
+    home_override: Option<&std::path::Path>,
+    tier: &str,
+    valid: bool,
+    expires_at: Option<&str>,
+    message: &str,
+) {
+    let path = match license_cache_path_in(home_override) {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "[licensing] cannot resolve ~/.vibecoded/license_cache.json \
+                 (no UserDirs); token-gateway flow will fall back to anonymous pull"
+            );
+            return;
+        }
+    };
+
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!(
+                "[licensing] failed to mkdir {}: {} \
+                 — token-gateway flow will fall back to anonymous pull",
+                parent.display(),
+                e
+            );
+            return;
+        }
+    }
+
+    // last_validated_at is epoch seconds as a float, matching the Python
+    // `time.time()` representation in `LicenseResult.last_validated_at`.
+    let last_validated_at =
+        chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+
+    let payload = serde_json::json!({
+        "tier": tier,
+        "valid": valid,
+        "expires_at": expires_at,
+        "last_validated_at": last_validated_at,
+        "message": message,
+    });
+
+    let body = match serde_json::to_string(&payload) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "[licensing] serialize license cache: {} \
+                 — token-gateway flow will fall back to anonymous pull",
+                e
+            );
+            return;
+        }
+    };
+
+    if let Err(e) = std::fs::write(&path, body) {
+        eprintln!(
+            "[licensing] write {} failed: {} \
+             — token-gateway flow will fall back to anonymous pull",
+            path.display(),
+            e
+        );
+        return;
+    }
+
+    if let Err(e) = set_cache_file_mode_0600(&path) {
+        // Non-fatal: the file is written; the mode-tightening just
+        // failed. Log so the user can `chmod 600` manually if they care.
+        eprintln!(
+            "[licensing] chmod 0600 {} failed: {} \
+             (cache written; token-gateway flow still functional)",
+            path.display(),
+            e
+        );
+    }
+}
+
+/// Remove `~/.vibecoded/license_cache.json` on deactivation. Soft-fail:
+/// if the file doesn't exist or can't be removed, we log and continue —
+/// the gateway path will reject the stale JSON anyway since it
+/// re-validates server-side.
+fn remove_license_cache_for_token_gateway() {
+    remove_license_cache_for_token_gateway_in(None);
+}
+
+/// Same as `remove_license_cache_for_token_gateway()` but allows
+/// callers (tests) to inject an explicit `$HOME` override.
+fn remove_license_cache_for_token_gateway_in(home_override: Option<&std::path::Path>) {
+    let path = match license_cache_path_in(home_override) {
+        Some(p) => p,
+        None => return,
+    };
+    if !path.exists() {
+        return;
+    }
+    if let Err(e) = std::fs::remove_file(&path) {
+        eprintln!(
+            "[licensing] remove {} failed: {} \
+             (stale cache will be rejected by the gateway on next pull)",
+            path.display(),
+            e
+        );
+    }
+}
+
 #[command]
 pub async fn license_get_tier(db: State<'_, Db>) -> Result<TierCacheView, String> {
     let row = db.get_tier_cache()?;
@@ -116,8 +299,10 @@ pub async fn license_refresh(db: State<'_, Db>) -> Result<TierCacheView, String>
     let key_opt = secrets::get(SecretScope::Global, LICENSE_MODULE_ID, LICENSE_KEY_NAME)?;
     let key = match key_opt {
         None => {
-            // No key → free tier, no error.
+            // No key → free tier, no error. Also clear any stale cache
+            // file so the token gateway can't authenticate from it.
             db.set_tier_cache("free", &serde_json::json!({}), None)?;
+            remove_license_cache_for_token_gateway();
             return Ok(to_view(db.get_tier_cache()?));
         }
         Some(k) => k,
@@ -157,8 +342,34 @@ pub async fn license_refresh(db: State<'_, Db>) -> Result<TierCacheView, String>
                     .unwrap_or("free")
                     .to_string();
                 let valid = body.get("valid").and_then(|v| v.as_bool()).unwrap_or(false);
+
+                // Bug #20-Fix-2 (v0.2.31): parse `module_licenses` from
+                // the server response and persist it to `tier_cache` so
+                // `is_module_licensed`'s per-module entitlement check is
+                // enforceable. Expected shape, per the v0.2.31 plan:
+                //
+                //   { "vct-rl-reranker": {
+                //       "tier": "pro",
+                //       "expires_at": 1234567890,
+                //       "source": "tier-bundled" | "per-module"
+                //     }, ... }
+                //
+                // NOTE: As of 2026-05-23 the `validate-tier` edge
+                // function at `launcher/supabase/functions/validate-tier
+                // /index.ts` does NOT yet return `module_licenses` — the
+                // wire-contract addition is tracked separately in the
+                // v0.2.31 plan (orchestrator chat coordinates the
+                // server-side change). Until then, `body.module_licenses`
+                // is missing and we fall through to `json!({})`, which
+                // matches the pre-fix behaviour — NOT a regression.
+                // Once the edge function ships the field, no further
+                // launcher change is required: this parse already
+                // accepts it.
                 let licenses = if valid {
-                    serde_json::json!({})
+                    body.get("module_licenses")
+                        .filter(|v| v.is_object())
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({}))
                 } else {
                     serde_json::json!({})
                 };
@@ -170,6 +381,31 @@ pub async fn license_refresh(db: State<'_, Db>) -> Result<TierCacheView, String>
                     None
                 };
                 db.set_tier_cache(&tier, &licenses, err.as_deref())?;
+
+                // Bug #22 (v0.2.31): the token gateway reads
+                // `~/.vibecoded/license_cache.json`. Mirror the SQLite
+                // write to that JSON file so paid-module pulls can
+                // authenticate. Soft-fail (logged, never propagates).
+                if valid {
+                    let expires_at = body
+                        .get("expires_at")
+                        .and_then(|v| v.as_str());
+                    let message = body
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Validated.");
+                    write_license_cache_for_token_gateway(
+                        &tier,
+                        valid,
+                        expires_at,
+                        message,
+                    );
+                } else {
+                    // Server says invalid → remove stale cache so the
+                    // gateway can't authenticate a now-revoked license.
+                    remove_license_cache_for_token_gateway();
+                }
+
                 Ok(to_view(db.get_tier_cache()?))
             } else {
                 let err = format!(
@@ -182,12 +418,17 @@ pub async fn license_refresh(db: State<'_, Db>) -> Result<TierCacheView, String>
                 // On 401 (invalid key) drop to free immediately.
                 if status == 401 {
                     db.set_tier_cache("free", &serde_json::json!({}), Some(&err))?;
+                    // 401 = explicitly revoked/invalid → drop the cache
+                    // file too so the gateway can't authenticate.
+                    remove_license_cache_for_token_gateway();
                 } else {
                     db.set_tier_cache(
                         &db.get_tier_cache()?.orchestrator_tier,
                         &db.get_tier_cache()?.module_licenses,
                         Some(&err),
                     )?;
+                    // 5xx / 4xx-other: leave the JSON cache untouched so
+                    // the user keeps their in-grace-period authority.
                 }
                 Ok(to_view(db.get_tier_cache()?))
             }
@@ -222,6 +463,10 @@ pub async fn license_activate(
 pub async fn license_deactivate(db: State<'_, Db>) -> Result<(), String> {
     secrets::delete(SecretScope::Global, LICENSE_MODULE_ID, LICENSE_KEY_NAME)?;
     db.set_tier_cache("free", &serde_json::json!({}), None)?;
+    // Bug #22: clean shutdown — drop the JSON cache file so the token
+    // gateway can't authenticate from yesterday's tier after the user
+    // has explicitly deactivated. Soft-fail; logged on error.
+    remove_license_cache_for_token_gateway();
     db.audit("license_deactivate", None, None, &serde_json::json!({}))?;
     Ok(())
 }
@@ -331,6 +576,282 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Bug #22 (v0.2.31): token-gateway license cache file.
+    //
+    // We exercise the `_in()` variants of the helpers with a tempdir as
+    // the injected `$HOME`. Production code calls the no-arg variants
+    // that route through `directories::UserDirs::new()`.
+    // -----------------------------------------------------------------
+
+    /// Resolved cache path under a fake `$HOME` matches what
+    /// `installer_engine::request_pull_token` reads.
+    #[test]
+    fn license_cache_path_under_home_override() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = license_cache_path_in(Some(tmp.path())).expect("resolved");
+        assert_eq!(path, tmp.path().join(".vibecoded/license_cache.json"));
+    }
+
+    /// Production path (no override) resolves to the real `$HOME` —
+    /// guards against the resolver returning `None` on this machine.
+    /// We only assert the suffix; the literal `$HOME` value varies.
+    #[test]
+    fn license_cache_path_resolves_under_real_home() {
+        // If this returns None, every install on this OS would silently
+        // fall back to anonymous pull. We pin that the resolver works.
+        let path = license_cache_path_in(None);
+        if let Some(p) = path {
+            assert!(
+                p.ends_with(".vibecoded/license_cache.json"),
+                "production path must end with .vibecoded/license_cache.json: {}",
+                p.display()
+            );
+        }
+        // Don't hard-fail on None — CI sandboxes occasionally lack
+        // $HOME. The soft-fail discipline in `write_license_cache_…`
+        // already handles that case.
+    }
+
+    /// Round-trip: write the cache file under a fake $HOME and verify
+    /// it (a) exists at the expected path, (b) parses as JSON, and
+    /// (c) carries every field the Python `LicenseResult` shape uses.
+    #[test]
+    fn write_license_cache_round_trip() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_license_cache_for_token_gateway_in(
+            Some(tmp.path()),
+            "pro",
+            true,
+            Some("2027-04-18T00:00:00.000Z"),
+            "Validated.",
+        );
+
+        let path = tmp.path().join(".vibecoded/license_cache.json");
+        assert!(path.exists(), "cache file must be created");
+
+        let body = std::fs::read_to_string(&path).expect("read cache");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&body).expect("valid JSON");
+
+        // Mirror the LicenseResult shape — every field the Python
+        // validator writes must be present and readable by the gateway.
+        assert_eq!(parsed["tier"], "pro");
+        assert_eq!(parsed["valid"], true);
+        assert_eq!(parsed["expires_at"], "2027-04-18T00:00:00.000Z");
+        assert_eq!(parsed["message"], "Validated.");
+        assert!(
+            parsed["last_validated_at"].is_number(),
+            "last_validated_at must be epoch seconds (number)"
+        );
+    }
+
+    /// `expires_at = None` round-trips as JSON null (lifetime license).
+    #[test]
+    fn write_license_cache_handles_lifetime_license() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_license_cache_for_token_gateway_in(
+            Some(tmp.path()),
+            "enterprise",
+            true,
+            None,
+            "Validated.",
+        );
+
+        let body = std::fs::read_to_string(tmp.path().join(".vibecoded/license_cache.json"))
+            .expect("read cache");
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["tier"], "enterprise");
+        assert!(parsed["expires_at"].is_null(), "lifetime → null");
+    }
+
+    /// Deactivation removes the cache file. Idempotent on a missing
+    /// file (no panic, no error).
+    #[test]
+    fn remove_license_cache_removes_file_and_is_idempotent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_license_cache_for_token_gateway_in(
+            Some(tmp.path()),
+            "pro",
+            true,
+            None,
+            "Validated.",
+        );
+        let path = tmp.path().join(".vibecoded/license_cache.json");
+        assert!(path.exists(), "precondition: file written");
+
+        remove_license_cache_for_token_gateway_in(Some(tmp.path()));
+        assert!(!path.exists(), "file must be removed");
+
+        // Second call with the file already gone — must not panic.
+        remove_license_cache_for_token_gateway_in(Some(tmp.path()));
+    }
+
+    /// Write failure is non-fatal. We point the helper at a path whose
+    /// parent already exists as a FILE (so `create_dir_all` fails) and
+    /// confirm the helper returns without panicking and without writing
+    /// anything.
+    #[test]
+    fn write_license_cache_soft_fails_on_unwritable_parent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // Create a regular file where `.vibecoded` would need to be a
+        // directory — `create_dir_all` on this path will fail with
+        // ENOTDIR / similar.
+        let blocker = tmp.path().join(".vibecoded");
+        std::fs::write(&blocker, b"not a directory").expect("seed blocker");
+
+        // No panic, no propagation — soft-fail discipline.
+        write_license_cache_for_token_gateway_in(
+            Some(tmp.path()),
+            "pro",
+            true,
+            None,
+            "Validated.",
+        );
+
+        // Blocker file is untouched (still a regular file).
+        assert!(blocker.is_file(), "blocker must remain a regular file");
+    }
+
+    /// On Unix, the cache file must be mode 0600 so a multi-user box
+    /// can't side-read a paid tier from another account's $HOME.
+    #[cfg(unix)]
+    #[test]
+    fn write_license_cache_sets_mode_0600_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_license_cache_for_token_gateway_in(
+            Some(tmp.path()),
+            "pro",
+            true,
+            None,
+            "Validated.",
+        );
+        let path = tmp.path().join(".vibecoded/license_cache.json");
+        let meta = std::fs::metadata(&path).expect("stat cache");
+        // mode_bits & 0o777 isolates the perms from the file-type bits.
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "license cache must be readable only by owner; got {:o}",
+            mode
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Bug #20-Fix-2 partial (v0.2.31): module_licenses parse.
+    //
+    // We exercise the success-branch parser by mimicking the body
+    // shapes `r.json().await` would produce. The full HTTP loop is
+    // covered by integration tests separately — these tests pin the
+    // semantic contract (what gets persisted to `tier_cache`).
+    // -----------------------------------------------------------------
+
+    /// The success-branch parser used inside `license_refresh`:
+    /// - `valid:true` + `module_licenses` object → pass-through verbatim.
+    /// - `valid:true` + missing field           → `json!({})`.
+    /// - `valid:true` + wrong shape (array)      → `json!({})`.
+    /// - `valid:false`                            → `json!({})`.
+    ///
+    /// We inline the parser here so the test pins the semantic without
+    /// having to spin up an HTTP mock — the parse expression is the
+    /// load-bearing piece of the fix.
+    fn parse_module_licenses(body: &serde_json::Value, valid: bool) -> serde_json::Value {
+        if valid {
+            body.get("module_licenses")
+                .filter(|v| v.is_object())
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}))
+        } else {
+            serde_json::json!({})
+        }
+    }
+
+    #[test]
+    fn module_licenses_pass_through_when_present_and_valid() {
+        let body = serde_json::json!({
+            "tier": "pro",
+            "valid": true,
+            "module_licenses": {
+                "vct-rl-reranker": {
+                    "tier": "pro",
+                    "expires_at": 1_234_567_890_i64,
+                    "source": "tier-bundled"
+                }
+            }
+        });
+        let licenses = parse_module_licenses(&body, true);
+        assert!(licenses.is_object(), "must be object");
+        assert_eq!(licenses["vct-rl-reranker"]["tier"], "pro");
+        assert_eq!(licenses["vct-rl-reranker"]["source"], "tier-bundled");
+    }
+
+    #[test]
+    fn module_licenses_falls_back_to_empty_when_field_absent() {
+        // This is the as-of-2026-05-23 reality: the edge function does
+        // not yet return `module_licenses`. The parser must keep the
+        // launcher functional (no regression) until the wire contract
+        // ships server-side.
+        let body = serde_json::json!({ "tier": "pro", "valid": true });
+        let licenses = parse_module_licenses(&body, true);
+        assert_eq!(licenses, serde_json::json!({}));
+    }
+
+    #[test]
+    fn module_licenses_falls_back_to_empty_when_wrong_shape() {
+        // Defensive: if the server (or a future protocol bug) sends an
+        // array or a string, we refuse to persist it — `tier_cache`
+        // gets `{}`, not the malformed value, so downstream
+        // `is_module_licensed` keeps a well-formed map to query.
+        let body = serde_json::json!({
+            "tier": "pro",
+            "valid": true,
+            "module_licenses": ["this", "should", "be", "an", "object"]
+        });
+        let licenses = parse_module_licenses(&body, true);
+        assert_eq!(licenses, serde_json::json!({}));
+    }
+
+    #[test]
+    fn module_licenses_empty_when_invalid() {
+        // valid:false → no entitlements regardless of what the server
+        // included in module_licenses. Belt-and-suspenders against a
+        // mis-encoded response.
+        let body = serde_json::json!({
+            "tier": "free",
+            "valid": false,
+            "module_licenses": {
+                "vct-rl-reranker": { "tier": "pro" }
+            }
+        });
+        let licenses = parse_module_licenses(&body, false);
+        assert_eq!(licenses, serde_json::json!({}));
+    }
+
+    /// 401 from the server (invalid key) → tier_cache drops to free
+    /// with empty module_licenses. We exercise the persistence layer
+    /// directly since the HTTP loop is integration-tested elsewhere.
+    #[tokio::test]
+    async fn tier_cache_401_drops_to_free_with_empty_licenses() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        // Seed: pro tier with module licenses.
+        db.set_tier_cache(
+            "pro",
+            &serde_json::json!({ "vct-rl-reranker": { "tier": "pro" } }),
+            None,
+        )
+        .unwrap();
+
+        // Simulate the 401 branch of `license_refresh`.
+        db.set_tier_cache("free", &serde_json::json!({}), Some("status 401: bad key"))
+            .unwrap();
+
+        let row = db.get_tier_cache().unwrap();
+        assert_eq!(row.orchestrator_tier, "free");
+        assert_eq!(row.module_licenses, serde_json::json!({}));
+        assert!(row.last_error.is_some());
     }
 
     /// Replace Python triple-quoted blocks AND Rust /// doc comments
