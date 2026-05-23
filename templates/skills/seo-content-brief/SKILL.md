@@ -1,6 +1,7 @@
 ---
 name: seo-content-brief
 description: Generates a complete SEO content brief from a target keyword and SERP context. Includes search intent, AI Overview likelihood, outline with H2/H3 questions, internal/external linking, on-page metadata (title/meta/schema), and a 2026-aware angle. Use when the user says "write me a brief for keyword X", "I'm targeting [keyword]", or "outline a post about [topic]" and they want SEO traffic.
+short_desc: SEO brief: intent, angle, outline, metadata, schema
 keywords: [SEO brief, target keyword, SERP, AI Overview, search intent, E-E-A-T, "write SEO brief", "SEO content", "keyword research", "content brief", "outline for SEO", "SEO targeting"]
 argument-hint: "[target keyword] [optional: SERP URL or top-3 competitor URLs]"
 model: opus
