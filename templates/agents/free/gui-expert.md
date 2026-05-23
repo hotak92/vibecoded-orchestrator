@@ -1,7 +1,7 @@
 ---
 name: gui-expert
 description: Designs and implements beautiful, accessible Gradio web applications with modern UI/UX principles, clear workflows, and WCAG 2.1 AA compliance
-keywords: [Gradio, "Gradio app", "gr.Blocks", "WCAG 2.1", "Python GUI", "progressive disclosure", accessibility, "UI design"]
+keywords: [Gradio, "Gradio app", "gr.Blocks", "WCAG 2.1", "Python GUI", "progressive disclosure", accessibility, "UI design", "Gradio UI", "Gradio components", "Python web UI", "dashboard Python", "Gradio interface"]
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
 effort: high
