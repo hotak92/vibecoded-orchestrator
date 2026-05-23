@@ -1,6 +1,7 @@
 ---
 name: database-advisor
 description: Expert guidance on database design, schema optimization, query performance, and database technology selection
+short_desc: "DB choice, schema design, indexing, query perf"
 keywords: [database schema, query performance, index design, Postgres, MongoDB, NoSQL, "query optimization", "SQL injection", "pick a database", "database choice", "which database", "schema design", "slow query", "optimize query", PostgreSQL, SQLite, Redis]
 model: sonnet
 ---
