@@ -1,6 +1,7 @@
 ---
 name: postmortem-author
 description: Authors blameless post-mortem documents from incident timeline, chat log exports, dashboard screenshots, and Argo/git history. Produces a draft for the IC to refine, with named contributing factors (not single root cause), categorized action items (prevent/detect/mitigate), and explicit lessons. Spawn after an incident is resolved.
+short_desc: blameless post-mortem from incident artifacts
 keywords: [post-mortem, postmortem, blameless, contributing factors, incident timeline, RCA]
 tools: Read, Write, Edit, Glob, Grep, Bash, WebFetch
 model: opus
