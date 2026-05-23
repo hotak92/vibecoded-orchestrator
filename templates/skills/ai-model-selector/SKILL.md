@@ -1,6 +1,7 @@
 ---
 name: ai-model-selector
 description: Quick guidance on choosing AI models (LLM/VLM/Embedding) based on task, VRAM, cost, and quality requirements
+keywords: [model selection, embedding model, quantization, VRAM, LLM, VLM]
 model: sonnet
 ---
 

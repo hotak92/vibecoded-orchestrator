@@ -1,6 +1,7 @@
 ---
 name: hardware-calculator
 description: Quick VRAM/RAM calculations, hardware recommendations, feasibility checks for AI models
+keywords: [VRAM, GPU memory, RAM requirements, model footprint, quantization, GPU recommendation]
 model: haiku
 ---
 
