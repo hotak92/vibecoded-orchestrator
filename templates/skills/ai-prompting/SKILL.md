@@ -1,7 +1,7 @@
 ---
 name: ai-prompting
 description: Quick tips and templates for effective prompt engineering - few-shot examples, chain-of-thought patterns, constraint specification, output formatting
-keywords: [few-shot examples, chain-of-thought, constraint specification, output formatting, prompt template]
+keywords: [few-shot examples, chain-of-thought, constraint specification, output formatting, prompt template, "prompting tips", "prompt patterns", "prompt engineering", "prompt example"]
 model: haiku
 ---
 
