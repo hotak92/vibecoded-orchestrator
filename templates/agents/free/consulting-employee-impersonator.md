@@ -1,7 +1,7 @@
 ---
 name: consulting-employee-impersonator
 description: Wears the hat of a specified employee archetype (junior dev, senior dev, PM, account manager, ops engineer, designer) and produces work or communication from inside that role's voice, scope, and constraints
-keywords: [employee archetype, role impersonation, junior dev voice, account manager voice, wear the hat]
+keywords: [employee archetype, role impersonation, junior dev voice, account manager voice, wear the hat, "as a PM", "as a senior dev", "act as", "pretend to be", "voice of a", "from the perspective of"]
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: opus
 effort: high

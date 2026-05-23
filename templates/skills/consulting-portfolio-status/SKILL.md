@@ -1,7 +1,7 @@
 ---
 name: consulting-portfolio-status
 description: Turns a directory of per-client engagement files into a board-ready portfolio status report; use when preparing a weekly digest, a steering-committee briefing, or any multi-engagement roll-up
-keywords: [portfolio status, weekly digest, steering committee, board-ready report, multi-engagement roll-up]
+keywords: [portfolio status, weekly digest, steering committee, board-ready report, multi-engagement roll-up, "status report", "client status report", "portfolio update", "digest for clients", "weekly portfolio"]
 model: opus
 effort: high
 argument-hint: "[engagements-directory-or-rollup-file] [--audience internal|board|partner]"

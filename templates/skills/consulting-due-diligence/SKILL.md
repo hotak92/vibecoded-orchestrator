@@ -1,7 +1,7 @@
 ---
 name: consulting-due-diligence
 description: Runs structured technical due diligence on a vendor, acquisition target, or strategic partner; produces a risk-ranked report with findings, evidence, and a recommendation
-keywords: [technical due diligence, vendor DD, acquisition target, strategic partner, risk-ranked report, M&A evaluation]
+keywords: [technical due diligence, vendor DD, acquisition target, strategic partner, risk-ranked report, M&A evaluation, "due diligence", "vendor assessment", "evaluate vendor", "assess this company", "DD on", "tech audit of vendor"]
 model: opus
 effort: high
 argument-hint: "[target-name] [--scope vendor|acquisition|partnership] [--depth quick|standard|deep]"

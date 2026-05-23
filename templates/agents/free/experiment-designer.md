@@ -1,7 +1,7 @@
 ---
 name: experiment-designer
 description: Designs experiments from a hypothesis - proposes controls, power analysis, randomisation, blinding, preregistration checklist, and expected confounders - before any data is collected
-keywords: [experiment design, randomisation, blinding, preregistration, confounders, power analysis, reproducibility]
+keywords: [experiment design, randomisation, blinding, preregistration, confounders, power analysis, reproducibility, "design an experiment", "study design", "A/B test design", "before collecting data", "experimental controls", RCT]
 tools: Read, Write, Edit, WebSearch, Bash
 model: opus
 effort: xhigh
