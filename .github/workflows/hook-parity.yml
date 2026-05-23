@@ -11,11 +11,53 @@ name: Hook OS-Parity Gate
 #  - hook-parity: .sh ↔ .ps1 logical equivalence on the TEMPLATE side.
 #  - hook-set-discipline: `set -e` + `pipefail` pairing on template hooks.
 
+# v0.2.30: skip on PURE-DOCS changes only. The hook-parity +
+# set-discipline gates exercise hook source files (.sh + .ps1), so
+# template changes always trigger. See `.github/workflows/ci.yml` for
+# the canonical exclude list + the rationale on why `**.md` and
+# `templates/**` are NOT in the ignore list (agents/skills frontmatter
+# is functional, not docs).
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+    paths-ignore:
+      - 'knowledge/**'
+      - 'docs/**'
+      - '.claude/context/**'
+      - 'README.md'
+      - 'CHANGELOG.md'
+      - 'LICENSE'
+      - 'LICENSE.*'
+      - 'CODE_OF_CONDUCT.md'
+      - 'CONTRIBUTING.md'
+      - 'SECURITY.md'
+      - 'CLA.md'
+      - 'BOOTSTRAP.md'
+      - 'KNOWN_ISSUES.md'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE.md'
+      - '.github/FUNDING.yml'
+      - '.github/CODEOWNERS'
   push:
     branches: [main]
+    paths-ignore:
+      - 'knowledge/**'
+      - 'docs/**'
+      - '.claude/context/**'
+      - 'README.md'
+      - 'CHANGELOG.md'
+      - 'LICENSE'
+      - 'LICENSE.*'
+      - 'CODE_OF_CONDUCT.md'
+      - 'CONTRIBUTING.md'
+      - 'SECURITY.md'
+      - 'CLA.md'
+      - 'BOOTSTRAP.md'
+      - 'KNOWN_ISSUES.md'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE.md'
+      - '.github/FUNDING.yml'
+      - '.github/CODEOWNERS'
 
 permissions:
   contents: read

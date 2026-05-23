@@ -10,16 +10,94 @@
 #               graduate to a separate workflow when the launcher gets
 #               release tags.
 #
-# We intentionally do NOT skip CI on docs-only PRs; tests are fast and
-# the false-confidence risk of "I only changed README" outweighs the
-# minutes saved.
+# v0.2.30: skip CI on PURE-DOCS changes only (paths-ignore below).
+# Pre-v0.2.30 policy was "always run CI" with this comment: "tests are
+# fast and the false-confidence risk of 'I only changed README'
+# outweighs the minutes saved". That held when CI ran in ~3 min total.
+# Post-v0.2.21 the matrix grew (Rust + Python + Frontend + leak-check +
+# managed-paths) and a docs-only push now burns ~10-12 min of runner
+# time for zero signal value. paths-ignore restores the cost/benefit
+# for genuinely doc-only paths.
+#
+# CRITICAL — what's NOT in the ignore list (and why):
+#   - `**.md` globally → NO. Many .md files are functional, not docs:
+#     * `templates/agents/**/*.md` + `templates/skills/**/SKILL.md` —
+#       their YAML frontmatter is PARSED by the keyword-suggest hook
+#       and validated by `tests/test_keyword_match.py`. A keyword
+#       rollout (e.g. PR #259) must trigger CI.
+#     * `CLAUDE.md` — affects Claude Code behavior in every install.
+#     * `launcher/**/*.md` — sometimes contains subtree migration notes
+#       that touch the launcher binary path.
+#     * `internal/**/*.md` — release notes that may reference packaging
+#       details still under test.
+#   - `templates/**` globally → NO. Templates are SHIPPED CODE
+#     (hooks, scripts, settings.json, agents, skills). Every change
+#     needs CI.
+#   - `.claude/agents/` or `.claude/skills/` or `.claude/hooks/` → NO.
+#     Same as templates/.
+#
+# Pure-docs paths that ARE ignored:
+#   - `knowledge/**` — per-project KG nodes (orchestrator's own
+#     knowledge graph; not consumed by tests)
+#   - `docs/**` — user-facing markdown documentation
+#   - `.claude/context/**` — plans, handoffs, scratch notes
+#   - `README.md` — repo-level README only (top-level)
+#   - `CHANGELOG.md` — narrative release notes
+#   - `LICENSE`, `LICENSE.*`, `CODE_OF_CONDUCT.md`, `CONTRIBUTING.md`,
+#     `SECURITY.md`, `CLA.md`, `BOOTSTRAP.md`, `KNOWN_ISSUES.md` —
+#     governance / community docs at repo root
+#   - `.github/ISSUE_TEMPLATE/**`, `.github/PULL_REQUEST_TEMPLATE.md`,
+#     `.github/FUNDING.yml`, `.github/CODEOWNERS` — meta-config that
+#     never affects test outcomes
+#
+# CodeQL and Hook-Parity workflows mirror this exact ignore list. The
+# Release workflow runs on tag push — no paths optimization possible.
+#
+# If a future test exercises any path currently in the ignore list,
+# REMOVE that specific entry — don't remove paths-ignore wholesale.
 
 name: CI
 
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'knowledge/**'
+      - 'docs/**'
+      - '.claude/context/**'
+      - 'README.md'
+      - 'CHANGELOG.md'
+      - 'LICENSE'
+      - 'LICENSE.*'
+      - 'CODE_OF_CONDUCT.md'
+      - 'CONTRIBUTING.md'
+      - 'SECURITY.md'
+      - 'CLA.md'
+      - 'BOOTSTRAP.md'
+      - 'KNOWN_ISSUES.md'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE.md'
+      - '.github/FUNDING.yml'
+      - '.github/CODEOWNERS'
   pull_request:
+    paths-ignore:
+      - 'knowledge/**'
+      - 'docs/**'
+      - '.claude/context/**'
+      - 'README.md'
+      - 'CHANGELOG.md'
+      - 'LICENSE'
+      - 'LICENSE.*'
+      - 'CODE_OF_CONDUCT.md'
+      - 'CONTRIBUTING.md'
+      - 'SECURITY.md'
+      - 'CLA.md'
+      - 'BOOTSTRAP.md'
+      - 'KNOWN_ISSUES.md'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE.md'
+      - '.github/FUNDING.yml'
+      - '.github/CODEOWNERS'
 
 permissions:
   contents: read

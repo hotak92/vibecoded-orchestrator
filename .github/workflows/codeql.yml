@@ -1,10 +1,53 @@
 name: CodeQL
 
 on:
+  # v0.2.30: skip on PURE-DOCS changes only (paths-ignore). CodeQL
+  # analyzes source code; a knowledge/ or docs/ touch never changes
+  # the analysis result. The weekly schedule (below) still runs CodeQL
+  # on a clean cadence even if every push during the week happened to
+  # be docs-only. See `.github/workflows/ci.yml` for the canonical
+  # exclude list + the rationale on why `**.md` and `templates/**` are
+  # NOT in the ignore list.
   push:
     branches: [ "main" ]
+    paths-ignore:
+      - 'knowledge/**'
+      - 'docs/**'
+      - '.claude/context/**'
+      - 'README.md'
+      - 'CHANGELOG.md'
+      - 'LICENSE'
+      - 'LICENSE.*'
+      - 'CODE_OF_CONDUCT.md'
+      - 'CONTRIBUTING.md'
+      - 'SECURITY.md'
+      - 'CLA.md'
+      - 'BOOTSTRAP.md'
+      - 'KNOWN_ISSUES.md'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE.md'
+      - '.github/FUNDING.yml'
+      - '.github/CODEOWNERS'
   pull_request:
     branches: [ "main" ]
+    paths-ignore:
+      - 'knowledge/**'
+      - 'docs/**'
+      - '.claude/context/**'
+      - 'README.md'
+      - 'CHANGELOG.md'
+      - 'LICENSE'
+      - 'LICENSE.*'
+      - 'CODE_OF_CONDUCT.md'
+      - 'CONTRIBUTING.md'
+      - 'SECURITY.md'
+      - 'CLA.md'
+      - 'BOOTSTRAP.md'
+      - 'KNOWN_ISSUES.md'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE.md'
+      - '.github/FUNDING.yml'
+      - '.github/CODEOWNERS'
   schedule:
     # Weekly Monday 06:00 UTC, matches Dependabot's schedule.
     - cron: '0 6 * * 1'
