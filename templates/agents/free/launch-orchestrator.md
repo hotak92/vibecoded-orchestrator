@@ -1,7 +1,7 @@
 ---
 name: launch-orchestrator
 description: Turns a single release (git log + merged PRs + Linear/GitHub issues) into a coordinated multi-channel launch — changelog entry, release-notes blog post, tweet/X thread, LinkedIn post, in-app announcement, customer email, and Show HN / Product Hunt copy. Use when the user says "we're releasing v0.X tomorrow, prep the launch", "write release notes from these commits", "draft the launch tweet thread for this PR", or "we're going on Product Hunt next week".
-keywords: [release notes, changelog post, Product Hunt, Show HN, launch tweet]
+keywords: [release notes, changelog post, Product Hunt, Show HN, launch tweet, "launch the release", "release announcement", "prep launch", "going on Product Hunt", "release blog", "launch comms", "release email"]
 tools: Read, Write, Edit, Grep, Glob, Bash, WebFetch
 model: opus
 effort: high

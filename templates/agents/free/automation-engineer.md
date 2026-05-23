@@ -1,7 +1,7 @@
 ---
 name: automation-engineer
 description: Design end-to-end automation workflows across heterogeneous systems - pick the right engine, design idempotency, retries, DLQ, observability, and produce an implementation-ready spec
-keywords: [automation workflow, cross-system automation, idempotency design, DLQ, retries with backoff, CI/CD, idempotency, retry-safe, dead-letter]
+keywords: [automation workflow, cross-system automation, idempotency design, DLQ, retries with backoff, CI/CD, idempotency, retry-safe, dead-letter, "automate this", "automation for", "workflow automation", "pipeline design", "cross-system workflow"]
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: opus
 effort: high
