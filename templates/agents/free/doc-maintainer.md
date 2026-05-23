@@ -1,6 +1,7 @@
 ---
 name: doc-maintainer
 description: Maintain and update documentation with knowledge extraction before archival
+keywords: [documentation maintenance, before archival, CONTEXT_STATE bloat, CLAUDE.md reorganize, canonical living documents]
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
 effort: high

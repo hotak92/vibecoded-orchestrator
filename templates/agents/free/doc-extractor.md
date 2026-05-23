@@ -1,6 +1,7 @@
 ---
 name: doc-extractor
 description: Extract knowledge from scattered documentation - read-only, no modifications
+keywords: [scattered documentation, extraction report, status tags, knowledge extraction, consolidate documentation]
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
 effort: high

@@ -1,6 +1,7 @@
 ---
 name: doc-organizer
 description: Organize documentation - prevent duplicates, maintain folder structure, archive old docs, keep root clean
+keywords: [doc duplicates, folder structure, documentation hygiene, WikiLinks, archive old docs]
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
 effort: high
