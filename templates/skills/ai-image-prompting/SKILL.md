@@ -1,6 +1,7 @@
 ---
 name: ai-image-prompting
 description: Crafts production-grade prompts for AI image generation (Midjourney, Flux, SDXL, Firefly, Imagen, ComfyUI workflows) — subject, composition, lighting, style references, negative prompts, ControlNet hints. Use when the goal is on-brand, repeatable imagery rather than a one-off lucky generation.
+keywords: [Midjourney, Flux, SDXL, ComfyUI, negative prompt, ControlNet, LoRA]
 model: opus
 effort: high
 ---
