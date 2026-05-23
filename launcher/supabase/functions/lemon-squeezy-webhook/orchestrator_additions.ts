@@ -157,20 +157,60 @@ export async function handleSubscriptionExpired(
 }
 
 /**
- * subscription_payment_failed — log only. Email notification handled
- * elsewhere (e.g., LS dunning emails or a separate notification service).
- * We do NOT downgrade tier here — LS will retry, and if it ultimately
- * fails, subscription_expired fires.
+ * subscription_payment_failed — durable audit + log. We insert a row into
+ * `payment_alerts` so a downstream notifier (email/Telegram/webhook
+ * worker, wired in a later polish) can poll `WHERE notified_at IS NULL`
+ * and dispatch. Edge Function logs roll off after 7 days on free tier;
+ * the table is the contract.
+ *
+ * We do NOT downgrade tier here — LS retries on its own, and if retries
+ * ultimately fail, `subscription_expired` fires. This handler is purely
+ * a "heads-up the user's payment didn't go through" signal.
+ *
+ * Returns 200 even when the audit insert errors, because LS will retry
+ * the webhook on non-2xx and a retry storm on transient DB errors is
+ * worse than a missed log line. The `audit_row_inserted` boolean in the
+ * response body lets callers / tests assert insert success without
+ * affecting the webhook contract.
+ *
+ * (v0.2.31 #24: was previously a stub that returned 200 with only a
+ * console.warn. Pre-fix, payment failures only surfaced in 7-day-rolling
+ * function logs — a churn-risk signal nobody could action.)
  */
 export async function handlePaymentFailed(
-  _supabase: SupabaseClient,
+  supabase: SupabaseClient,
   payload: any,
 ): Promise<{ status: number; body: Record<string, unknown> }> {
   const email: string | undefined = payload.data?.attributes?.user_email;
   const subId: string | undefined = payload.data?.id;
   console.warn(`[payment_failed] subscription=${subId} email=${email ?? "?"}`);
-  // TODO(notifications): hand off to email/Telegram alert service
-  return { status: 200, body: { logged: true } };
+
+  let auditOk = false;
+  try {
+    const { error } = await supabase.from("payment_alerts").insert({
+      alert_kind: "payment_failed",
+      subscription_id: subId,
+      user_email: email,
+      payload: payload,
+    });
+    if (error) {
+      // DB-level error (constraint violation, schema drift, RLS surprise).
+      // Log but don't propagate — LS retries on non-2xx and we don't
+      // want to retry-storm a transient DB issue.
+      console.error(`[payment_failed] audit insert error: ${error.message}`);
+    } else {
+      auditOk = true;
+    }
+  } catch (e) {
+    // Network / client-construction-time throw (e.g. supabase mocked
+    // in a test). Treat the same as a DB error — log, return 200.
+    console.error(`[payment_failed] audit insert threw: ${e}`);
+  }
+
+  // TODO(notifications-transport): wire email/Telegram dispatch when
+  // transport is configured. Until then, the payment_alerts table is
+  // the durable record a downstream notifier polls.
+  return { status: 200, body: { logged: true, audit_row_inserted: auditOk } };
 }
 
 /**

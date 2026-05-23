@@ -54,6 +54,41 @@ async fn save_config(config: &OrchestratorConfig) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
+// Tier-aware error copy
+// ---------------------------------------------------------------------------
+//
+// The launcher used to hard-code "Upgrade to Pro" in three tier-gated error
+// messages. That copy lies if the feature actually requires a higher tier
+// (MAO, Enterprise) than Pro — and worse, it sends Pro users to an upsell
+// flow they've already completed. `tier_required_message` resolves the
+// label from the gate's `min_tier` so the same helper can produce
+// "requires a Pro or higher tier license." OR "requires a MAO or higher
+// tier license." without a copy-paste cluster.
+//
+// Forward-compatible: unknown tier strings flow through verbatim so a
+// new tier added in OrchestratorTier (say "Enterprise") yields a clean
+// "requires a Enterprise or higher tier license." message without
+// touching this helper. (#26 polish, v0.2.31.)
+
+/// Build a user-facing "this feature needs a higher tier" message.
+///
+/// `min_tier` is the lowercase tier slug from OrchestratorTier
+/// (free/pro/mao/enterprise/admin). `feature` is a short noun phrase
+/// describing what's gated — capitalised at start (e.g. "Disabling the
+/// watermark", "Auto-updates", "RL-scored retrieval").
+fn tier_required_message(min_tier: &str, feature: &str) -> String {
+    let tier_label = match min_tier {
+        "free" => "any",  // shouldn't happen, but defensive
+        "pro" => "Pro",
+        "mao" => "MAO",
+        "enterprise" => "Enterprise",
+        "admin" => "Admin",
+        other => other,  // forward-compat: unknown tier → use literal
+    };
+    format!("{feature} requires a {tier_label} or higher tier license.")
+}
+
+// ---------------------------------------------------------------------------
 // Tier & feature gating
 // ---------------------------------------------------------------------------
 
@@ -109,21 +144,21 @@ pub async fn update_orchestrator_setting(key: String, value: String, user_apps: 
             let val: bool = value.parse().map_err(|_| "Invalid bool")?;
             // Free tier cannot disable watermark
             if !val && !tier.can_disable_watermark() {
-                return Err("Upgrade to Pro to disable the watermark".to_string());
+                return Err(tier_required_message("pro", "Disabling the watermark"));
             }
             config.watermark_enabled = val;
         }
         "auto_update_enabled" => {
             let val: bool = value.parse().map_err(|_| "Invalid bool")?;
             if val && !tier.can_auto_update() {
-                return Err("Upgrade to Pro for auto-updates".to_string());
+                return Err(tier_required_message("pro", "Auto-updates"));
             }
             config.auto_update_enabled = val;
         }
         "rl_retrieval_enabled" => {
             let val: bool = value.parse().map_err(|_| "Invalid bool")?;
             if val && !tier.has_rl_retrieval() {
-                return Err("Upgrade to Pro for RL-scored retrieval".to_string());
+                return Err(tier_required_message("pro", "RL-scored retrieval"));
             }
             config.rl_retrieval_enabled = val;
         }
@@ -683,6 +718,64 @@ mod tests {
             .enable_all()
             .build()
             .unwrap()
+    }
+
+    // ─── #26 (v0.2.31): tier_required_message — tier-blind upsell copy ──
+    //
+    // These pin the helper that replaced three hardcoded "Upgrade to Pro"
+    // strings in `update_orchestrator_setting`. The launcher used to send
+    // MAO users to a Pro upsell flow they'd already completed; the helper
+    // now resolves the label from the gate's min_tier slug.
+
+    #[test]
+    fn tier_required_message_picks_pro_label() {
+        let msg = tier_required_message("pro", "Disabling the watermark");
+        assert_eq!(
+            msg,
+            "Disabling the watermark requires a Pro or higher tier license."
+        );
+    }
+
+    #[test]
+    fn tier_required_message_picks_mao_label() {
+        let msg = tier_required_message("mao", "Multi-agent orchestration");
+        assert_eq!(
+            msg,
+            "Multi-agent orchestration requires a MAO or higher tier license."
+        );
+        // Critical sanity: no Pro upsell language leaked into a MAO-gated copy.
+        assert!(!msg.contains("Pro"), "MAO-gated message must not mention Pro: {msg}");
+    }
+
+    /// Regression guard: the bug this helper fixes was MAO users seeing
+    /// "Upgrade to Pro" — a tier they already exceed. Ensure no message
+    /// produced with min_tier="mao" contains the legacy upsell phrase.
+    #[test]
+    fn tier_required_message_no_upgrade_to_pro_for_mao_tier() {
+        for feature in &[
+            "Auto-updates",
+            "RL-scored retrieval",
+            "Disabling the watermark",
+            "MAO orchestration",
+        ] {
+            let msg = tier_required_message("mao", feature);
+            assert!(
+                !msg.contains("Upgrade to Pro"),
+                "MAO-gated copy regressed to legacy 'Upgrade to Pro' for {feature}: {msg}"
+            );
+        }
+    }
+
+    /// Forward-compat: unknown tier slugs flow through verbatim so a new
+    /// OrchestratorTier variant (say "enterprise") works without code
+    /// changes here.
+    #[test]
+    fn tier_required_message_forward_compat_unknown_tier() {
+        let msg = tier_required_message("titanium", "Quantum dedupe");
+        assert_eq!(
+            msg,
+            "Quantum dedupe requires a titanium or higher tier license."
+        );
     }
 
     // ─── Fix #1: toggle_mcp_server mirrors to ~/.claude.json ─────────────

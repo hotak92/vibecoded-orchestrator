@@ -8648,6 +8648,10 @@ def _run_desktop_icon_step(args: argparse.Namespace) -> None:
 
     if sys.platform == "win32":
         if helper_ps1.exists():
+            # v0.2.31 #25: PS1 helper now ships alongside install.py.
+            # Direct `python install.py` runs on Windows refresh the
+            # Desktop + Start Menu .lnk; first-install.bat still has its
+            # own inline writer (L527) for the initial install path.
             cmd = [
                 "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
                 "-File", str(helper_ps1),
@@ -8655,13 +8659,11 @@ def _run_desktop_icon_step(args: argparse.Namespace) -> None:
                 "-NoAutoLaunch",
             ]
         else:
-            # Windows path: first-install.bat owns initial shortcut. Flag
-            # for follow-up so we don't silently skip on direct-run
-            # install.py invocations.
+            # Helper missing — install tree is incomplete (partial extract
+            # or someone deleted scripts/post-install-launcher.ps1). Log
+            # + return; first-install.bat's inline writer still works.
             print("  [desktop-icon] Skipping on Windows: scripts/post-install-launcher.ps1 "
-                  "not present. Initial shortcut is written by first-install.bat. "
-                  "Re-run from first-install.bat to refresh, or wait for the PS1 "
-                  "helper (TODO).")
+                  "not present. Re-run from first-install.bat to refresh the shortcut.")
             _log_install_event(
                 "desktop-icon", "skip",
                 "windows: post-install-launcher.ps1 missing",
