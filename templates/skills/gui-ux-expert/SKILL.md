@@ -1,6 +1,7 @@
 ---
 name: gui-ux-expert
 description: Quick GUI/UX/UI design consultations and recommendations
+keywords: [UX consultation, UI design, UX review, layout design, usability]
 model: sonnet
 ---
 

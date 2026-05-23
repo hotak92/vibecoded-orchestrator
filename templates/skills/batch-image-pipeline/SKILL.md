@@ -1,6 +1,7 @@
 ---
 name: batch-image-pipeline
 description: Writes batch image and video processing scripts (Pillow, ImageMagick, ffmpeg) for asset pipelines — generate size variants, format conversions, colorspace transforms, watermarks, optimization. Use when one design output needs to become 40 deliverables, or when an asset library needs cleanup.
+keywords: [Pillow, ImageMagick, ffmpeg, batch image processing, asset pipeline, image resize]
 model: opus
 effort: high
 ---

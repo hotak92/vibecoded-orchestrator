@@ -1,6 +1,7 @@
 ---
 name: design-system-auditor
 description: Audits a design system for token drift, contrast violations, type-scale inconsistency, and Figma-to-code parity gaps. Use when inheriting an existing design system, before a major redesign, or when developers and designers report "the colors don't match" or "spacing feels off."
+keywords: [design system audit, Figma to code, token drift, design tokens, spacing system]
 model: opus
 effort: high
 ---
