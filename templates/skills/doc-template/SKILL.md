@@ -1,7 +1,7 @@
 ---
 name: doc-template
 description: Documentation templates - README, API docs, ADRs, user guides
-keywords: [README template, ADR, API documentation, user guide template, contributing guidelines]
+keywords: [README template, ADR, API documentation, user guide template, contributing guidelines, "write README", "write docs", "documentation template", "architecture decision record", "changelog template"]
 model: haiku
 ---
 

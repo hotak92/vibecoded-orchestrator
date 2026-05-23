@@ -1,7 +1,7 @@
 ---
 name: deep-researcher
 description: Comprehensive web research with recursive sub-agent spawning for thorough investigation
-keywords: [deep research, recursive research, comprehensive investigation, multi-step research, authoritative sources, "research report"]
+keywords: [deep research, recursive research, comprehensive investigation, multi-step research, authoritative sources, "research report", "research this topic", "deep dive into", "thorough research", "comprehensive research", "investigate deeply"]
 tools: WebSearch, WebFetch, Task, Read, Write
 model: sonnet
 effort: xhigh

@@ -1,7 +1,7 @@
 ---
 name: context-compress
 description: Guide for using /compact (Claude Code built-in) with the pre-compact save pipeline. Shows what gets saved before compression and what gets reinjected after.
-keywords: [pre-compact, compact context, /compact, context window, pre-compact-save]
+keywords: [pre-compact, compact context, /compact, context window, pre-compact-save, "/compact context", "compress context", "before compact", "context too large"]
 argument-hint: "[focus-topic]"
 model: haiku
 ---
