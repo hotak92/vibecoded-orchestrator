@@ -1,6 +1,7 @@
 ---
 name: interview
 description: Interview the user using AskUserQuestion to discover requirements for a feature or task. Probe technical implementation, UX, edge cases, and constraints. Writes final spec to SPEC.md.
+short_desc: interview user to extract spec into SPEC.md
 keywords: [requirements interview, feature spec, discovery questions, SPEC.md, AskUserQuestion, "requirements analysis", "gather requirements", "interview me", "discovery questions for", "feature requirements", "spec out"]
 argument-hint: "[feature-or-task-description]"
 model: sonnet
