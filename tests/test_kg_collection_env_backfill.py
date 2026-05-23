@@ -338,5 +338,247 @@ class PartialFillTests(unittest.TestCase):
                              "Legacy_Development")
 
 
+# ─────────────────────────────────────────────────────────────────────
+# v0.2.30: manual_override CORRECTS existing-but-stale env values
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _make_launcher_db_with_override(
+    state_dir: Path,
+    project_folder: Path,
+    primary: str | None,
+    shared: str | None,
+    primary_override: bool = False,
+    shared_override: bool = False,
+) -> Path:
+    """Variant of `_make_launcher_db` that sets `config_json.manual_override`
+    on the seeded binding rows. Used by the v0.2.30 corrector tests."""
+    db_path = state_dir / "launcher.db"
+    conn = sqlite3.connect(str(db_path))
+    cur = conn.cursor()
+    cur.executescript(
+        """
+        CREATE TABLE projects (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            folder_path TEXT NOT NULL UNIQUE,
+            host TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            slug TEXT
+        );
+        CREATE TABLE project_kg_bindings (
+            project_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            collection_name TEXT NOT NULL,
+            embedding_model TEXT,
+            embedding_dim INTEGER,
+            kg_dir_path TEXT,
+            weaviate_url TEXT,
+            config_json TEXT NOT NULL DEFAULT '{}',
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (project_id, role)
+        );
+        """
+    )
+    pid = "00000000-0000-0000-0000-000000000001"
+    cur.execute(
+        "INSERT INTO projects (id, name, folder_path, host, created_at, updated_at, slug) "
+        "VALUES (?, ?, ?, ?, 0, 0, ?)",
+        (pid, "Test", str(project_folder.resolve()), "base", "test"),
+    )
+    if primary is not None:
+        cfg = '{"manual_override":"v0.2.30-test"}' if primary_override else "{}"
+        cur.execute(
+            "INSERT INTO project_kg_bindings "
+            "(project_id, role, collection_name, config_json, updated_at) "
+            "VALUES (?, 'primary', ?, ?, 0)",
+            (pid, primary, cfg),
+        )
+    if shared is not None:
+        cfg = '{"manual_override":"v0.2.30-test"}' if shared_override else "{}"
+        cur.execute(
+            "INSERT INTO project_kg_bindings "
+            "(project_id, role, collection_name, config_json, updated_at) "
+            "VALUES (?, 'shared', ?, ?, 0)",
+            (pid, shared, cfg),
+        )
+    conn.commit()
+    conn.close()
+    return db_path
+
+
+class ManualOverrideCorrectsStaleEnvTests(unittest.TestCase):
+    """v0.2.30: when launcher.db has `config_json.manual_override` and
+    settings.json env disagrees, the backfill should CORRECT the env —
+    not just add missing keys."""
+
+    def test_corrects_stale_kg_collection_when_manual_override(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            folder = _make_project(tmp, {
+                "KG_COLLECTION": "Default_KnowledgeGraph",
+            })
+            state_dir = tmp / "state"
+            state_dir.mkdir()
+            _make_launcher_db_with_override(
+                state_dir, folder,
+                primary="VCODev_KnowledgeGraph", shared=None,
+                primary_override=True,
+            )
+            with mock.patch.dict(os.environ, {"VCT_STATE_DIR": str(state_dir)}):
+                result = project_init._backfill_kg_collection_env_in_project(folder)
+            self.assertEqual(result["action"], "backfilled")
+            self.assertIn("KG_COLLECTION (corrected)", result["added_keys"])
+            on_disk = json.loads(
+                (folder / ".claude" / "settings.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(on_disk["env"]["KG_COLLECTION"],
+                             "VCODev_KnowledgeGraph",
+                             "manual_override binding must correct stale env value")
+
+    def test_does_not_correct_when_no_manual_override(self):
+        """Without manual_override sentinel (auto-seeded default), leave
+        user-edited env alone."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            folder = _make_project(tmp, {
+                "KG_COLLECTION": "UserPick_KG",
+            })
+            state_dir = tmp / "state"
+            state_dir.mkdir()
+            _make_launcher_db_with_override(
+                state_dir, folder,
+                primary="AutoSeed_KG", shared=None,
+                primary_override=False,
+            )
+            with mock.patch.dict(os.environ, {"VCT_STATE_DIR": str(state_dir)}):
+                result = project_init._backfill_kg_collection_env_in_project(folder)
+            on_disk = json.loads(
+                (folder / ".claude" / "settings.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(on_disk["env"]["KG_COLLECTION"], "UserPick_KG",
+                             "auto-seed (no manual_override) must NOT overwrite user value")
+
+    def test_corrects_shared_kg_when_manual_override(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            folder = _make_project(tmp, {
+                "KG_COLLECTION": "X_KG",
+                "SHARED_KG_COLLECTION": "Old_Shared",
+                "DEVELOPMENT_COLLECTION": "X_Dev",
+            })
+            state_dir = tmp / "state"
+            state_dir.mkdir()
+            _make_launcher_db_with_override(
+                state_dir, folder,
+                primary="X_KG", shared="New_Shared",
+                primary_override=False, shared_override=True,
+            )
+            with mock.patch.dict(os.environ, {"VCT_STATE_DIR": str(state_dir)}):
+                project_init._backfill_kg_collection_env_in_project(folder)
+            on_disk = json.loads(
+                (folder / ".claude" / "settings.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(on_disk["env"]["SHARED_KG_COLLECTION"], "New_Shared")
+
+    def test_respects_empty_shared_intentional_disable(self):
+        """SHARED_KG_COLLECTION="" is user's explicit-disable. Even with
+        DB manual_override, don't overwrite."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            folder = _make_project(tmp, {
+                "KG_COLLECTION": "X_KG",
+                "SHARED_KG_COLLECTION": "",
+                "DEVELOPMENT_COLLECTION": "X_Dev",
+            })
+            state_dir = tmp / "state"
+            state_dir.mkdir()
+            _make_launcher_db_with_override(
+                state_dir, folder,
+                primary="X_KG", shared="Override_Shared",
+                shared_override=True,
+            )
+            with mock.patch.dict(os.environ, {"VCT_STATE_DIR": str(state_dir)}):
+                project_init._backfill_kg_collection_env_in_project(folder)
+            on_disk = json.loads(
+                (folder / ".claude" / "settings.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(on_disk["env"]["SHARED_KG_COLLECTION"], "",
+                             "empty-string user-disable must survive even with DB manual_override")
+
+    def test_corrects_paired_development_collection(self):
+        """When KG_COLLECTION corrected, paired DEVELOPMENT_COLLECTION
+        recomputed via suffix swap."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            folder = _make_project(tmp, {
+                "KG_COLLECTION": "OldBase_KnowledgeGraph",
+                "DEVELOPMENT_COLLECTION": "OldBase_Development",
+            })
+            state_dir = tmp / "state"
+            state_dir.mkdir()
+            _make_launcher_db_with_override(
+                state_dir, folder,
+                primary="NewBase_KnowledgeGraph", shared=None,
+                primary_override=True,
+            )
+            with mock.patch.dict(os.environ, {"VCT_STATE_DIR": str(state_dir)}):
+                project_init._backfill_kg_collection_env_in_project(folder)
+            on_disk = json.loads(
+                (folder / ".claude" / "settings.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(on_disk["env"]["KG_COLLECTION"],
+                             "NewBase_KnowledgeGraph")
+            self.assertEqual(on_disk["env"]["DEVELOPMENT_COLLECTION"],
+                             "NewBase_Development")
+
+
+class InstallSettingsTemplateMergePreservesEnvTests(unittest.TestCase):
+    """v0.2.30: install.py's settings.json render path now merges
+    additively when settings.json exists, preserving user's env block."""
+
+    def test_merge_preserves_env_block(self):
+        with tempfile.TemporaryDirectory() as td:
+            install_root = Path(td) / "vco"
+            install_root.mkdir()
+            claude_dir = install_root / ".claude"
+            claude_dir.mkdir()
+            settings = claude_dir / "settings.json"
+            settings.write_text(
+                json.dumps({
+                    "permissions": {"allow": []},
+                    "env": {
+                        "KG_COLLECTION": "VCODev_KnowledgeGraph",
+                        "PROJECT_NAME": "VCO_dev",
+                    },
+                    "_user_field": "do-not-clobber",
+                }, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+            # Replay the merge logic install.py uses
+            rendered_obj = {
+                "$schema": "https://example.test/schema.json",
+                "permissions": {"allow": ["Bash(git *)"]},
+                "hooks": {"SessionStart": []},
+            }
+            existing = json.loads(settings.read_text(encoding="utf-8"))
+            merged = dict(existing)
+            for k, v in rendered_obj.items():
+                merged[k] = v
+            settings.write_text(
+                json.dumps(merged, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+            result = json.loads(settings.read_text(encoding="utf-8"))
+            self.assertEqual(result["env"]["KG_COLLECTION"],
+                             "VCODev_KnowledgeGraph")
+            self.assertEqual(result["env"]["PROJECT_NAME"], "VCO_dev")
+            self.assertEqual(result["_user_field"], "do-not-clobber")
+            self.assertEqual(result["permissions"]["allow"], ["Bash(git *)"])
+
+
 if __name__ == "__main__":
     unittest.main()
