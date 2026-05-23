@@ -254,6 +254,22 @@ export interface ModuleCatalogEntry {
   coming_soon_tier?: string;
   /** For `kind === 'coming_soon'`: optional public target window (e.g. 'Q3 2026'). */
   coming_soon_target?: string;
+  /**
+   * v0.2.31 module-deprecation surface (Layer 1, GUI). When `true`, the
+   * module card renders an amber `DEPRECATED` badge near the tier chip;
+   * a `<DeprecationBanner>` may render at the top of the module's
+   * dashboard (when one exists via `cta_route`). The module continues to
+   * work normally — this is a "plan ahead for migration" signal, not a
+   * hard block. Populated at catalog-build time once the v0.2.32 poller
+   * lands; v0.2.31 defaults to `false` so the surface is forward-compatible.
+   */
+  deprecated?: boolean;
+  /** Optional human-readable message rendered in badge tooltip + banner. */
+  deprecation_message?: string;
+  /** Optional ISO date (YYYY-MM-DD) for the module's end-of-life date. */
+  deprecation_eol_date?: string;
+  /** Optional URL pointing at the publisher's migration guide. */
+  deprecation_migration_url?: string;
 }
 
 export interface ModuleStatusView {

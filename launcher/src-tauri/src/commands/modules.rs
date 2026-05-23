@@ -56,6 +56,32 @@ pub struct ModuleCatalogEntry {
     /// (e.g. "Q3 2026"). Empty when no public commitment exists.
     #[serde(default)]
     pub coming_soon_target: String,
+    /// v0.2.31 module-deprecation surface (Layer 1: GUI). `true` when the
+    /// module's publisher has marked the running version deprecated via
+    /// the `runtime.update_endpoint` response. Renders the amber
+    /// `DEPRECATED` badge in the launcher's Modules card head; does NOT
+    /// block install/run (deprecated modules keep working until EOL).
+    ///
+    /// Populated at catalog-build time once the v0.2.32 poller wires the
+    /// Supabase response into `apply_deprecation_state`. v0.2.31 ships
+    /// the field with a `false` default so the UI is forward-compatible;
+    /// manual flips via the `apply_deprecation_state` Tauri command set
+    /// the env vars + audit row independently of this catalog field.
+    #[serde(default)]
+    pub deprecated: bool,
+    /// Optional human-readable deprecation message (rendered in the badge
+    /// tooltip + dashboard banner). Empty when the publisher hasn't
+    /// provided one or the module is not deprecated.
+    #[serde(default)]
+    pub deprecation_message: String,
+    /// Optional ISO date string (`YYYY-MM-DD`) for the module's
+    /// end-of-life date. Empty when unknown.
+    #[serde(default)]
+    pub deprecation_eol_date: String,
+    /// Optional URL pointing at the publisher's migration guide.
+    /// Empty when unknown.
+    #[serde(default)]
+    pub deprecation_migration_url: String,
 }
 
 impl ModuleCatalogEntry {
@@ -78,6 +104,12 @@ impl ModuleCatalogEntry {
             cta_route: String::new(),
             coming_soon_tier: String::new(),
             coming_soon_target: String::new(),
+            // v0.2.31: defaults — catalog-build time doesn't yet read
+            // `runtime.update_endpoint`. See struct doc comment.
+            deprecated: false,
+            deprecation_message: String::new(),
+            deprecation_eol_date: String::new(),
+            deprecation_migration_url: String::new(),
         }
     }
 }
@@ -136,6 +168,10 @@ fn builtin_catalog_entries(db: &Db) -> Vec<ModuleCatalogEntry> {
         cta_route: String::new(),
         coming_soon_tier: String::new(),
         coming_soon_target: String::new(),
+        deprecated: false,
+        deprecation_message: String::new(),
+        deprecation_eol_date: String::new(),
+        deprecation_migration_url: String::new(),
     });
 
     // 2. Orchestrator core + 3-4. its sub-components, sourced from
@@ -185,6 +221,10 @@ fn builtin_catalog_entries(db: &Db) -> Vec<ModuleCatalogEntry> {
         cta_route: String::new(),
         coming_soon_tier: String::new(),
         coming_soon_target: String::new(),
+        deprecated: false,
+        deprecation_message: String::new(),
+        deprecation_eol_date: String::new(),
+        deprecation_migration_url: String::new(),
     });
 
     for comp in components {
@@ -211,6 +251,10 @@ fn builtin_catalog_entries(db: &Db) -> Vec<ModuleCatalogEntry> {
             cta_route: route.into(),
             coming_soon_tier: String::new(),
             coming_soon_target: String::new(),
+            deprecated: false,
+            deprecation_message: String::new(),
+            deprecation_eol_date: String::new(),
+            deprecation_migration_url: String::new(),
         });
     }
 
@@ -287,6 +331,10 @@ fn builtin_catalog_entries(db: &Db) -> Vec<ModuleCatalogEntry> {
         cta_route: String::new(),
         coming_soon_tier: String::new(),
         coming_soon_target: String::new(),
+        deprecated: false,
+        deprecation_message: String::new(),
+        deprecation_eol_date: String::new(),
+        deprecation_migration_url: String::new(),
     });
 
     out

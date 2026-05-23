@@ -13,7 +13,12 @@ models): mirrors what ``paid-modules/vct-rl-reranker/rl_server.py``
 accepts. Any drift between the schemas here and the server's HTTP
 handlers will silently break the paid module.
 """
-from .client import RLClient, RLClientError, RLClientUnreachableError
+from .client import (
+    RLClient,
+    RLClientError,
+    RLClientUnreachableError,
+    _deprecation_warning,
+)
 from .schemas import (
     CacheNodesRequest,
     CacheNodesResponse,
@@ -30,6 +35,7 @@ __all__ = [
     "RLClientError",
     "RLClientUnreachableError",
     "RLTelemetryWriter",
+    "_deprecation_warning",
     "CacheNodesRequest",
     "CacheNodesResponse",
     "HealthResponse",

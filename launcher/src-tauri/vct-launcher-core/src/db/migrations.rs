@@ -103,6 +103,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "module_ports: generic per-(project × module) HTTP port (v0.2.26, declarative dispatcher generalization — replaces RL-only projects.rl_port as SoT)",
         sql: include_str!("migrations/017_module_ports.sql"),
     },
+    Migration {
+        version: 18,
+        description: "module deprecation surface: deprecation_events (append-only audit) + module_deprecation_seen (one-shot notification gate) (v0.2.31)",
+        sql: include_str!("migrations/018_module_deprecation.sql"),
+    },
 ];
 
 /// Apply every migration whose version is greater than the current max applied.

@@ -51,6 +51,47 @@ _DEFAULT_TIMEOUT = 3.0
 _DEFAULT_HEALTH_TIMEOUT = 1.0
 
 
+def _deprecation_warning() -> Optional[str]:
+    """Build a one-line deprecation banner for inclusion in rerank-adjacent
+    responses (v0.2.31 module-deprecation surface, Layer 2 — Claude-visible).
+
+    Reads the four ``VCT_RL_MODULE_*`` env vars the launcher writes into
+    ``.claude/settings.json env`` via
+    ``commands::module_deprecation::apply_deprecation_state``. The four
+    keys (set together; stripped together) are:
+
+      * ``VCT_RL_MODULE_DEPRECATED=1`` (or absent)
+      * ``VCT_RL_MODULE_DEPRECATION_MESSAGE=...`` (human-readable line)
+      * ``VCT_RL_MODULE_DEPRECATION_DATE=YYYY-MM-DD`` (optional ISO date)
+      * ``VCT_RL_MODULE_DEPRECATION_URL=https://...``  (optional URL)
+
+    Returns:
+        ``None`` when ``VCT_RL_MODULE_DEPRECATED`` is unset or not ``"1"``.
+        Otherwise a single-line banner string ready to prepend to the
+        retrieval response. The MCP server's hybrid_search formatter adds
+        the actual separator before the JSON body.
+
+    Throttling: NONE. Claude's context is per-turn, so the warning must
+    appear on EVERY rerank-related response while deprecation is active.
+    Suppressing repeats inside one process would silently drop the
+    warning on every subsequent turn of the same Claude session.
+    """
+    if os.getenv("VCT_RL_MODULE_DEPRECATED") != "1":
+        return None
+    msg = os.getenv(
+        "VCT_RL_MODULE_DEPRECATION_MESSAGE",
+        "RL Reranker module is deprecated.",
+    )
+    date = os.getenv("VCT_RL_MODULE_DEPRECATION_DATE", "")
+    url = os.getenv("VCT_RL_MODULE_DEPRECATION_URL", "")
+    parts = [f"[DEPRECATION WARNING] {msg}"]
+    if date:
+        parts.append(f"EOL: {date}.")
+    if url:
+        parts.append(f"Migration guide: {url}")
+    return " ".join(parts)
+
+
 class RLClientError(Exception):
     """Base class for RL client errors."""
 

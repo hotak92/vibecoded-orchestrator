@@ -4109,15 +4109,36 @@ async def _hybrid_search_body(
     _log_detail_choice(query, detail, len(results))
 
     logger.info(f"hybrid_search: {len(results)} results (detail={detail}) for '{query}' across {collections_to_search}")
-    return _large_result({
+    # v0.2.31 module-deprecation surface (Layer 2): when the launcher has
+    # injected the four `VCT_RL_MODULE_*` env vars into
+    # `.claude/settings.json env`, prepend a deprecation banner to the
+    # response so Claude sees it on every turn that hits hybrid_search.
+    # NOT throttled — Claude's context is per-turn (see spec § Throttling).
+    # NOT confined to RL reranker — the env vars are the canonical
+    # cross-module deprecation channel (single message at a time today;
+    # future paid modules write the SAME keys when their poller fires).
+    try:
+        from rl_client import _deprecation_warning as _rl_dep_warning
+        dep_banner = _rl_dep_warning()
+    except Exception:  # noqa: BLE001 — best-effort surface, never block
+        dep_banner = None
+
+    response: dict = {
         "success": True,
         "query": query,
         "count": len(results),
         "detail": detail,
         "results": results,
         "collections_searched": collections_to_search,
-        "methods_used": ["semantic", "keyword"]
-    })
+        "methods_used": ["semantic", "keyword"],
+    }
+    if dep_banner:
+        # Two-field carry: a structured field for programmatic consumers
+        # and a leading `notice` line for human-readable presentation
+        # when Claude renders the JSON inline. Both carry the SAME
+        # string so an aggressively-summarising consumer can't lose it.
+        response = {"deprecation_warning": dep_banner, "notice": dep_banner, **response}
+    return _large_result(response)
 
 
 def get_node_connections(

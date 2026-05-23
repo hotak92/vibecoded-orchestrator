@@ -1132,6 +1132,14 @@ pub fn run() {
             // required. See `commands/module_dispatch.rs` for the
             // wire contract + trust surface notes.
             commands::module_dispatch::module_dispatch_action,
+            // v0.2.31: module-deprecation warning surface. Three layers
+            // (GUI badge, env-var injection, audit table). The poller
+            // for `runtime.update_endpoint` itself is deferred to v0.2.32 —
+            // only the manual apply / seen / mark-seen Tauri entries are
+            // wired here. See `commands/module_deprecation.rs`.
+            commands::module_deprecation::apply_deprecation_state,
+            commands::module_deprecation::has_module_deprecation_been_seen,
+            commands::module_deprecation::mark_module_deprecation_seen,
             // Retrieval tuning (v0.2.22 Item #13 — 2026-05-20).
             // Global thresholds for score-driven retrieval verbosity
             // (KG tier cutoffs) + codegraph injection floor. Backed by

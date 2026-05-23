@@ -12,12 +12,14 @@
   //   currently render a busy spinner while waiting.
 
   import { onMount } from 'svelte';
+  import { invoke } from '@tauri-apps/api/core';
   import { goto } from '$app/navigation';
   import { modules, installedIds } from '$lib/stores/modules';
   import { selectedProject, projects } from '$lib/stores/projects';
   import { license } from '$lib/stores/license';
   import type { ModuleCatalogEntry, ModuleInstallRow } from '$lib/types/launcher';
   import DialogRoot from '$lib/components/DialogRoot.svelte';
+  import DeprecationBanner from '$lib/components/DeprecationBanner.svelte';
 
   type Filter = 'all' | 'free' | 'pro' | 'installed';
 
@@ -85,6 +87,17 @@
 
   const visible = $derived(
     mState.catalog.filter((m) => matchesVisibility(m) && matchesFilter(m) && matchesSearch(m))
+  );
+
+  // v0.2.31 Layer 1: surface a top-of-catalog banner for any INSTALLED
+  // module that has been marked deprecated. We don't show banners for
+  // available-but-uninstalled modules — the badge in the card is enough
+  // there; the banner is reserved for "you're actually using something
+  // that's going away" signal.
+  const deprecatedInstalled = $derived(
+    mState.catalog.filter(
+      (m) => m.deprecated && (installed.has(m.id) || m.kind === 'installed'),
+    ),
   );
 
   function initials(name: string): string {
@@ -203,6 +216,73 @@
   function getInstalledRow(m: ModuleCatalogEntry) {
     return mState.installed.find((r) => r.module_id === m.id) ?? null;
   }
+
+  // v0.2.31 — module-deprecation surface (Layer 1, GUI).
+  //
+  // Build a hover-tooltip string for the DEPRECATED badge. Mirrors the
+  // dashboard banner content but condensed to fit a `title=` attribute.
+  function deprecationTooltip(m: ModuleCatalogEntry): string {
+    if (!m.deprecated) return '';
+    const parts: string[] = [
+      m.deprecation_message || 'This module has been marked deprecated.',
+    ];
+    if (m.deprecation_eol_date) parts.push(`EOL: ${m.deprecation_eol_date}.`);
+    if (m.deprecation_migration_url) {
+      parts.push(`Migration guide: ${m.deprecation_migration_url}`);
+    }
+    return parts.join(' ');
+  }
+
+  // One-shot desktop notification. Fires the FIRST time we see a deprecated
+  // catalog entry for a given (project_id, module_id) pair; subsequent
+  // sessions skip via the launcher.db `module_deprecation_seen` row.
+  //
+  // v0.2.31 graceful degradation: `@tauri-apps/plugin-notification` is NOT
+  // in the launcher's deps yet (verified by reading package.json on
+  // 2026-05-23). Instead we surface a console.warn that the launcher's dev
+  // tools / GUI logs render; the row in `module_deprecation_seen` still
+  // gets inserted so re-sessions don't re-spam the console.
+  // TODO(v0.2.32): swap console.warn for the Tauri notification plugin
+  // once the dep is added (`pnpm add @tauri-apps/plugin-notification` +
+  // `cargo add tauri-plugin-notification`).
+  async function maybeFireDeprecationToast(m: ModuleCatalogEntry): Promise<void> {
+    if (!m.deprecated || !project) return;
+    try {
+      const seen = await invoke<boolean>('has_module_deprecation_been_seen', {
+        projectId: project.id,
+        moduleId: m.id,
+      });
+      if (seen) return;
+      // Mark BEFORE rendering so a concurrent mount in another window
+      // doesn't double-fire. INSERT OR IGNORE on the SQLite side
+      // serialises this.
+      const inserted = await invoke<boolean>('mark_module_deprecation_seen', {
+        projectId: project.id,
+        moduleId: m.id,
+      });
+      if (!inserted) return;
+      // Console-log degradation path — see TODO above.
+      console.warn(
+        `[vct] Module "${m.name}" is deprecated. ${deprecationTooltip(m)}`,
+      );
+    } catch (e) {
+      // Soft-fail — never block the catalog render on a notification path.
+      console.debug('[vct] deprecation-toast check failed:', e);
+    }
+  }
+
+  $effect(() => {
+    // Side-effect: when the catalog or project changes, look for
+    // newly-deprecated modules and fire the one-shot notification per
+    // (project, module) pair. Bounded by `module_deprecation_seen`.
+    if (!project) return;
+    for (const m of mState.catalog) {
+      if (m.deprecated) {
+        // Fire-and-forget; per-call errors land in console.debug above.
+        void maybeFireDeprecationToast(m);
+      }
+    }
+  });
 </script>
 
 <div class="catalog">
@@ -242,6 +322,10 @@
     {/each}
   </div>
 
+  {#each deprecatedInstalled as m (m.id)}
+    <DeprecationBanner module={m} />
+  {/each}
+
   {#if mState.loading && visible.length === 0}
     <div class="catalog-empty">Loading catalog…</div>
   {:else if visible.length === 0}
@@ -277,6 +361,13 @@
                   </span>
                 {:else}
                   <span class="tier-badge tier-free">Free</span>
+                {/if}
+                {#if m.deprecated}
+                  <!-- v0.2.31 Layer 1: deprecation badge. Hover tooltip
+                       carries the full message + EOL date + migration URL. -->
+                  <span class="tier-badge tier-deprecated" title={deprecationTooltip(m)}>
+                    Deprecated
+                  </span>
                 {/if}
               </div>
               <p class="card-meta">
@@ -583,6 +674,14 @@
   .tier-badge.tier-free {
     background: rgba(0, 191, 166, 0.12);
     color: var(--color-teal);
+  }
+
+  /* v0.2.31 Layer 1: deprecated badge. Amber to read as "warning, but
+     not error" — the module keeps working until EOL. */
+  .tier-badge.tier-deprecated {
+    background: rgba(255, 159, 28, 0.14);
+    color: rgb(255, 159, 28);
+    cursor: help;
   }
 
   /* Bug 16: kind-aware status badges. */
