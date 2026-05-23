@@ -33,16 +33,41 @@ A general-purpose **paid-module lifecycle release**: every step from licensed-di
 - ModuleCatalog button-state replaced with a state×license matrix: `Activate license` instead of `Upgrade to Pro`; `Update vX → vY` when manifest version is newer than installed; enabled-toggle + uninstall otherwise. `tierLabel()` helper centralizes Pro / MAO / Enterprise / Admin display.
 - v0.2.31 prep commit `chore(v0.2.31-prep)` (830ad77) staged the `_installed_matches_template_history` heuristic + `_read_codegraph_binding_override` helper + codegraph correction logic in `vco_lib/project_init.py` ahead of agent parallelization. Heuristic walks `git log -50` on template path, sha256s historical blob contents, returns True iff any historical version matches the installed hash — heals manifest-untracked-but-VCO-shipped files (97-agent stale-on-disk symptom observed in VCO_dev pre-fix).
 
+### Added (continued — post-tag-prep additions)
+
+- **Citation-monitor fix routed through vct-hub** (Agent H). `claude_mcp_servers/weaviate_mcp/server.py:2644` was computing the Claude session-jsonl directory slug as `str(workspace).replace('/', '-')`. Claude Code's actual slug rule ALSO converts `_` → `-` (and `.` → `-`), so any workspace path containing underscores (`VCO_dev`, `AI_hive`) looked at a non-existent directory and the monitor timed out without writing the citation event. 97.7% orphan-citation rate at `~/.claude/retrieval_rl_data/rl_events.jsonl` is fixed. New `claude_session_dir_for(workspace_path)` helper in `vco_lib/project_config.py` + `vct-hub/src/config_api.rs` implementing the FULL slug rule. vct-hub's `/api/v1/projects/{id}/config` response gains a `claude_session_dir` field. MCP server gets `_resolve_claude_session_dir()` helper preferring hub resolution + falling back to local slug (with COMPLETE rule). 7 new regression tests (4 Python slug, 2 Python resolver, 4 MCP-side, 4 Rust). v0.2.28's asyncio strong-ref discipline left untouched.
+- **Module-shipped DB migrations capability — Layer 1** (Agent I). Modules can now declare their own SQLite schema in `vct-module.json`:
+  ```jsonc
+  "db": { "migrations_dir": "db/", "namespace": "rl" }
+  ```
+  Launcher applies these at install + update via `installer_engine::run_install` + `run_upgrade`, idempotent via sha256-keyed `module_db_migrations` table (new launcher migration 019). Namespace enforcement: regex-based parser refuses `CREATE`/`ALTER`/`INDEX` on tables outside the manifest's namespace; FK references to launcher-owned tables (e.g. `projects.id`) are allowed; `DROP TABLE` refused unconditionally (forward-only migration discipline). Cross-module namespace-collision soft check: at apply time, the launcher queries `module_db_migrations` for any OTHER module claiming the same namespace and refuses with a structured error naming the offender. Modules access their tables via **5 new vct-hub REST endpoints** under `/api/v1/modules/{module_id}/db/projects/{project_id}/rows/...` with per-(module, project) bearer-token auth scoped via the new `module_access_tokens` table. Column projection via `?fields=col1,col2` on GET. Token refresh via `POST /api/v1/modules/{module_id}/token/refresh`. New `apply_module_db_migrations(module_id)` Tauri command for manual repair; new `issue_module_access_token(module_id, project_id)` for container startup. v0.2.31 ships with per-install shared secrets (32 random bytes, 1h TTL); JWT-signed tokens deferred to v0.2.32. 21 module_db lib tests + 27 hub-endpoint tests + namespace-collision regression tests.
+- **Dashboard live reads via hub** (Agent J). New `module_db_read_row(module_id, project_id, table, key, fields?)` Tauri command issues/refreshes the per-(module, project) token from `module_access_tokens`, then HTTP-GETs the hub's `/rows/{table}/{key}?fields=...` endpoint. Bounded 5s timeout; 200 → `Some(Value)`, 404 → `None`, other failures → `Err(String)`. New `RlRerankerDashboardWidget.svelte` component reads `weights_version` + `last_training` on mount + on user-clicked `↻` refresh button. Soft-fail with "Container not running" / "—" placeholders when hub unreachable. `global_weights_status` display deferred to v0.2.32 (depends on RL's `0005_*.sql` not in v0.2.6).
+
+### Removed (continued)
+
+- **`module_weights_state` table dropped** (Agent J). The replacement `rl_weights_state` ships in vct-rl-reranker v0.2.6 via its own `db/0002_rl_weights_state.sql` migration applied at module install. Migration 020 drops the legacy table outright — paid-module v0.2.5 had zero production users, so no backfill is needed. The launcher's `signal_finetune` + `apply_weights_update` Tauri commands stripped of dead writes (~30 LOC removed); now pure orchestration (download .pt → call container's `/rotate_weights` → container does the DB write via vct-hub). The whole `module_weights_state.rs` Rust module + `WeightsStateRow` model deleted.
+
+### Fixed (continued)
+
+- **Pre-existing `module_supervisor.rs:612` compile failure** (hotfix `4ba96f2`). A v0.2.27 manifest schema extension added `RuntimeBlock::log_path_template` (Option<String>) but a test fixture in vct-hub wasn't updated. `cargo test --package vct-hub --lib` failed to compile on the v0.2.30 base. Adds `log_path_template: None` to the fixture.
+- **Cherry-pick duplicate-field artifact** (hotfix `55d93b2`). Cherry-picking Agent I on top of hotfix `4ba96f2` caused git's auto-merge to accept BOTH additions of `log_path_template: None` instead of detecting the conflict → `E0062` field used more than once. Resolved by removing the duplicate.
+
 ### Versions
 
 - Bump 0.2.30 → 0.2.31 in 6 build files (`launcher/src-tauri/Cargo.toml`, `vct-launcher-core/Cargo.toml`, `vct-hub/Cargo.toml`, `tauri.conf.json`, `launcher/package.json`, `vct-module.json`).
 - Cargo.lock auto-synced.
 
-### Test results
+### Test results (final, post-J)
 
-- 962 Rust lib tests pass (was 929 pre-v0.2.31 baseline; +12 from licensing, +11 from module lifecycle, +4 from tier-aware copy, +6 from module_deprecation).
-- 2064 Python tests pass (main suite) + 8 rl_client deprecation tests.
-- svelte-check: 0 errors (51 pre-existing warnings in unrelated files).
+- **launcher cargo test --lib: 966 passed** (929 v0.2.30 baseline + 37 across new module surfaces).
+- **vct-launcher-core cargo test --lib: 267 passed** (+21 module_db_migrations tests + 3 migration 020 tests).
+- **vct-hub cargo test --lib: 178 passed** (151 baseline + 27 module_db_api endpoint tests).
+- **Python pytest: 2074 passed** (main suite + 8 rl_client deprecation + slug/resolver/citation tests).
+- **svelte-check: 0 errors** (51 pre-existing warnings in unrelated files).
+
+### Multi-repo ship coordination
+
+This release ships in coordination with vct-rl-reranker v0.2.6 (paid module, private repo). The launcher's manifest-DB-migrations capability is dormant until any module ships a `db/` directory. RL chat ships `db/0001_rl_state.sql` + `db/0002_rl_weights_state.sql` in their v0.2.6 image; container's write paths use the new hub endpoints. See `.claude/context/plans/FINAL-v0.2.31-shared-plan-2026-05-23.md` (in VCO_dev fork) for the 16-point smoke-test acceptance checklist + the T+0…T+2h30m ship sequence both chats agreed to.
 
 ### Known issues deferred to v0.2.32+
 
