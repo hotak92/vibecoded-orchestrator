@@ -37,7 +37,11 @@ pub mod secret_grants;
 pub mod app_state;
 pub mod audit_types;
 pub mod orchestrator_root_helpers;
-pub mod module_weights_state;
+// module_weights_state removed in v0.2.31 (Agent J): table dropped by
+// migration 020; weights state is now container-owned in rl_weights_state
+// (shipped by vct-rl-reranker v0.2.6 via its module-shipped migration
+// `db/0002_*.sql`). Launcher reads go through the hub's
+// `/api/v1/modules/.../rows/rl_weights_state/...` endpoint.
 pub mod module_ports;
 pub mod deprecation_events;
 pub mod module_db_migrations;

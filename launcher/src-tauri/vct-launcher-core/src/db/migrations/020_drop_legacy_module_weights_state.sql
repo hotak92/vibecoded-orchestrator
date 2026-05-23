@@ -1,0 +1,35 @@
+-- SPDX-License-Identifier: AGPL-3.0-or-later
+-- launcher.db — drop legacy module_weights_state (migration 020, v0.2.31)
+--
+-- WHY: paid-module `vct-rl-reranker` v0.2.5 had zero production users at
+-- v0.2.31 release time. The launcher-owned per-(project × module ×
+-- embedding_source) weights state table created by migration 016 is
+-- being retired. Nothing to backfill: there were no real users on the
+-- launcher side of the contract; the table on disk holds at most test
+-- fixtures and dev rows.
+--
+-- REPLACEMENT (Single-Writer Principle, restored):
+--   * vct-rl-reranker v0.2.6 ships its own `db/0002_rl_weights_state.sql`
+--     module-shipped migration (Agent I's mechanism, migration 019).
+--     The launcher applies it at install time via
+--     `apply_module_db_migrations`.
+--   * The CONTAINER writes to `rl_weights_state` whenever it rotates
+--     weights or completes a fine-tune; the launcher reads via the
+--     hub's `GET /api/v1/modules/vct-rl-reranker/db/projects/{pid}/
+--     rows/rl_weights_state/{embedding_source}` endpoint (Agent I).
+--
+-- This restores the Single-Writer Principle: the container is the sole
+-- writer of its own state; the launcher reads through the hub's typed
+-- REST surface. No more cross-process race conditions where the
+-- launcher and container both INSERT into the same SQLite table.
+--
+-- CASCADE NOTE: migration 016 declared `FOREIGN KEY (project_id)
+-- REFERENCES projects(id) ON DELETE CASCADE`. The DROP removes the
+-- referencing side; the projects table itself is untouched (the FK is
+-- unidirectional, from module_weights_state to projects). No projects
+-- rows or other tables affected.
+--
+-- Forward-only, idempotent — IF EXISTS guard so re-runs on a DB that
+-- already dropped the table are no-ops.
+
+DROP TABLE IF EXISTS module_weights_state;

@@ -128,27 +128,12 @@ pub struct ModuleInstallRow {
     pub container_name: Option<String>,
 }
 
-/// Single row of `module_weights_state` (migration 016).
-///
-/// Tracks the per-(project × module × embedding_source) state for the RL
-/// reranker's downloadable model weights:
-///   * `version` — the locally-active weights version string (server-issued)
-///   * `last_checked_at` — unix-ms of the last `/rl-latest-version` poll
-///     attempt (success OR failure — observers want to know we tried)
-///   * `last_finetuned_at` — unix-ms of the last successful local fine-tune
-///
-/// Embedding source is stored as a free-form string (qwen3, arctic, openai,
-/// future…) — the launcher never enum-constrains it; the container picks
-/// the matching `.pt` based on the `ACTIVE_EMBEDDING` env var.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct WeightsStateRow {
-    pub project_id: String,
-    pub module_id: String,
-    pub embedding_source: String,
-    pub version: String,
-    pub last_checked_at: i64,
-    pub last_finetuned_at: i64,
-}
+// `WeightsStateRow` removed in v0.2.31 (Agent J): launcher-side
+// `module_weights_state` table dropped by migration 020; weights state
+// is now container-owned in `rl_weights_state` (shipped by vct-rl-
+// reranker v0.2.6 via its module-shipped migration `db/0002_*.sql`).
+// Launcher reads go through the hub's
+// `/api/v1/modules/.../rows/rl_weights_state/...` typed REST surface.
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TierCacheRow {

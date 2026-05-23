@@ -113,6 +113,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "module-shipped DB migrations: module_db_migrations tracking + module_access_tokens for hub bearer auth (v0.2.31)",
         sql: include_str!("migrations/019_module_db_migrations.sql"),
     },
+    Migration {
+        version: 20,
+        description: "drop legacy module_weights_state: replaced by container-owned rl_weights_state shipped by vct-rl-reranker v0.2.6 (v0.2.31)",
+        sql: include_str!("migrations/020_drop_legacy_module_weights_state.sql"),
+    },
 ];
 
 /// Apply every migration whose version is greater than the current max applied.
@@ -519,5 +524,118 @@ mod tests {
             rusqlite::params![now],
         );
         assert!(dup.is_err(), "duplicate slug must be rejected by UNIQUE index");
+    }
+
+    // ─── Migration 020: drop legacy module_weights_state (v0.2.31 Agent J) ──
+
+    /// After a fresh `apply()`, `module_weights_state` MUST NOT exist on
+    /// the schema. Migration 020 drops it; weights state now lives in
+    /// `rl_weights_state` shipped by vct-rl-reranker v0.2.6 via its
+    /// module-shipped migration (Agent I's mechanism).
+    #[test]
+    fn migration_020_drops_module_weights_state_on_fresh_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply(&conn).expect("apply migrations");
+
+        // Table must NOT be in sqlite_master.
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'module_weights_state'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            exists, 0,
+            "module_weights_state must be dropped after migration 020"
+        );
+
+        // And recorded as applied.
+        let max_v: u32 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM _schema_migrations",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(max_v >= 20, "expected at least version 20, got {}", max_v);
+    }
+
+    /// Upgrade path: a DB stopped at version 19 (post-Agent-I state)
+    /// has the `module_weights_state` table. Running `apply()` to 20+
+    /// must drop it cleanly even if rows are present (since we're
+    /// dropping the entire table, not migrating data).
+    #[test]
+    fn migration_020_drops_module_weights_state_with_existing_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_up_to(&conn, 19).expect("apply up to v19");
+
+        // Sanity: the table exists at v19.
+        let exists_v19: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'module_weights_state'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists_v19, 1, "table must exist at v19");
+
+        // Seed a project + a weights-state row so we exercise the
+        // drop-with-data path. The FK on module_weights_state.project_id
+        // means we need a real project row to satisfy the constraint.
+        let now: i64 = 1_700_000_000_000;
+        conn.execute(
+            "INSERT INTO projects (id, name, folder_path, host, slug, created_at, updated_at)
+             VALUES ('p1', 'P1', '/tmp/p1', 'base', 'p1', ?1, ?1)",
+            rusqlite::params![now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO module_weights_state \
+                (project_id, module_id, embedding_source, version, last_checked_at, last_finetuned_at) \
+             VALUES ('p1', 'vct-rl-reranker', 'qwen3', 'v1', ?1, ?1)",
+            rusqlite::params![now],
+        )
+        .unwrap();
+
+        // Apply migration 020.
+        apply(&conn).expect("apply remaining migrations");
+
+        // Table is gone.
+        let exists_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'module_weights_state'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            exists_after, 0,
+            "module_weights_state must be dropped after 020 even with existing rows"
+        );
+
+        // Projects survive (FK was unidirectional: weights_state → projects).
+        let proj_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(proj_count, 1, "projects must be untouched by the DROP");
+    }
+
+    /// Migration 020 is idempotent. Re-running `apply()` on a DB that
+    /// already applied it is a no-op (the IF EXISTS guard).
+    #[test]
+    fn migration_020_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply(&conn).expect("first apply");
+        // Second apply must succeed without error (recorded migrations
+        // are skipped via version check; but the SQL itself is also
+        // IF EXISTS-guarded as a belt-and-braces measure).
+        apply(&conn).expect("second apply (idempotent)");
     }
 }

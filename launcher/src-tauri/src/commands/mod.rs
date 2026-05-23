@@ -34,11 +34,13 @@ pub mod module_db;
 pub mod module_deprecation;
 pub mod module_dispatch;
 pub mod module_gui;
-// v0.2.21 Stream B: per-(project × module × embedding_source) weights state.
-// Tauri-commands wrapper around the `module_weights_state` table
-// (migration 016). The DB plumbing lives in
-// `vct-launcher-core/src/db/module_weights_state.rs`.
-pub mod module_weights_state;
+// v0.2.31 Agent J: `module_weights_state` Tauri-command surface removed
+// alongside migration 020 (which DROPs the underlying table). Weights
+// state is now container-owned in `rl_weights_state` (shipped by
+// vct-rl-reranker v0.2.6 via its own module-shipped migration). The
+// launcher's dashboard reads go through the hub's typed REST surface
+// via `module_db_client`.
+pub mod module_db_client;
 pub mod modules;
 // v0.2.21 Stream B: per-project container lifecycle for `runtime.type ==
 // "container"` modules (Phase 1E) + weights update poller (Phase 3C) +

@@ -813,8 +813,20 @@ async fn hub_proxy_module_stop(project_id: &str, module_id: &str) -> Result<(), 
 // ─── Phase 3C: weights update check + download + rotate ─────────────────
 
 /// POST `/rl-latest-version` for the active embedding source of the
-/// given project + module, then write `last_checked_at` regardless of
-/// outcome.
+/// given project + module.
+///
+/// v0.2.31 Agent J: this function used to read `current_weights_version`
+/// from the launcher-owned `module_weights_state` table and stamp
+/// `last_checked_at` on every call. Both reads/writes are gone:
+///   * Weights state is now container-owned (`rl_weights_state`, shipped
+///     by vct-rl-reranker v0.2.6 via its module-shipped migration).
+///   * The launcher no longer owns the "last checked" timestamp —
+///     observers can read it through the hub's typed REST surface.
+///   * `current_weights_version` is left empty here; the server-side
+///     supabase function accepts the empty string and returns the
+///     latest available version (the only thing the caller actually
+///     does with the response). v0.2.32 may re-introduce the value via
+///     a hub read once we measure whether anyone needs it.
 pub async fn check_weights_update(
     db: &Db,
     project_id: &str,
@@ -828,17 +840,14 @@ pub async fn check_weights_update(
     let embedding_source = read_active_embedding_source(&project)
         .unwrap_or_else(|| DEFAULT_EMBEDDING_SOURCE.to_string());
 
-    let current_version = db
-        .get_weights_state(project_id, RL_RERANKER_MODULE_ID, &embedding_source)
-        .ok()
-        .flatten()
-        .map(|r| r.version)
-        .unwrap_or_default();
-
+    // v0.2.31 Agent J: `current_weights_version` previously came from a
+    // launcher read of the dropped `module_weights_state` table.
+    // Empty string is the documented "I don't know my current version,
+    // please tell me the latest" value on the supabase function side.
     let body = serde_json::json!({
         "license_key": license_key,
         "machine_id_hash": machine_id_hash,
-        "current_weights_version": current_version,
+        "current_weights_version": "",
         "embedding_source": embedding_source,
     });
 
@@ -857,10 +866,6 @@ pub async fn check_weights_update(
 
     let status = resp.status();
     let parsed: Result<LatestVersionResponse, _> = resp.json().await;
-
-    // Touch last_checked_at regardless of success — observers want to
-    // know we attempted the poll even when it failed.
-    let _ = db.set_last_checked_at(project_id, RL_RERANKER_MODULE_ID, &embedding_source);
 
     if !status.is_success() {
         return Err(format!(
@@ -1043,18 +1048,27 @@ pub async fn check_for_weights_update_now(
 
 /// Apply the user's response to the weights-update prompt.
 ///
-/// `Now`: store the new version in `module_weights_state`, then spawn
-/// the background fine-tune. The fine-tune job calls `/finetune` on the
-/// container, polls for completion, then `signal_rotate_weights` — or,
-/// on any failure, falls through to rotate with the unmodified
-/// downloaded weights.
+/// v0.2.31 Agent J — separation of concerns restored:
+///   - The launcher is PURE ORCHESTRATION: download the .pt file →
+///     call the container's `/rotate_weights` (or `/finetune` for
+///     `Now`) → done.
+///   - The CONTAINER (vct-rl-reranker v0.2.6) is the sole writer of
+///     `rl_weights_state` — it persists `local_version` /
+///     `last_finetuned_at` in response to its OWN handlers, via
+///     vct-hub's typed REST endpoints (Agent I, migration 019).
 ///
-/// `Skip`: store the new version, rotate immediately to the unmodified
-/// weights, no fine-tune. `last_finetuned_at` is NOT touched.
+/// `Now`: spawn the background fine-tune. The fine-tune job calls
+/// `/finetune` on the container, polls for completion, then
+/// `signal_rotate_weights` — or, on any failure, falls through to
+/// rotate with the unmodified downloaded weights. The container is
+/// responsible for stamping `last_finetuned_at` in `rl_weights_state`
+/// when its handler finishes.
 ///
-/// `Later`: do nothing — leave `module_weights_state` pointing at the
-/// OLD version so the next poll will detect the update again and the
-/// frontend re-surfaces the prompt. Soft-noop.
+/// `Skip`: rotate immediately to the unmodified weights, no fine-tune.
+/// The container's `/rotate_weights` handler updates `local_version`.
+///
+/// `Later`: do nothing — the next poll will re-detect the update and
+/// the frontend re-surfaces the prompt. Soft-noop.
 #[command]
 pub async fn apply_weights_update(
     project_id: String,
@@ -1074,12 +1088,12 @@ pub async fn apply_weights_update(
     let ctx_vct_data = PlaceholderCtx::new(RL_RERANKER_MODULE_ID).vct_data;
     let _active_path = download_weights(&response, &project.slug, &ctx_vct_data).await?;
 
-    db.set_weights_version(
-        &project_id,
-        RL_RERANKER_MODULE_ID,
-        &response.embedding_source,
-        &response.latest_version,
-    )?;
+    // v0.2.31 Agent J: the prior `db.set_weights_version(...)` write to
+    // the dropped `module_weights_state` table is gone. Version state
+    // is now the container's responsibility via `rl_weights_state`
+    // (writes happen inside the container's `/rotate_weights` and
+    // `/finetune` handlers, persisted through the hub's typed REST
+    // surface in module_db_api.rs).
 
     match choice {
         FinetuneChoice::Skip => {
@@ -1219,12 +1233,15 @@ async fn run_finetune_then_rotate_async(
                         );
                         // Terminal state is "done" per the server v0.1.1
                         // contract (NOT "complete" — pinned 2026-05-16).
+                        //
+                        // v0.2.31 Agent J: the launcher used to stamp
+                        // `last_finetuned_at` here on the now-dropped
+                        // `module_weights_state` table. The container
+                        // (vct-rl-reranker v0.2.6) is the sole writer
+                        // of `rl_weights_state.last_finetuned_at` — its
+                        // `/finetune` handler updates the row when its
+                        // own job completes.
                         if state == "done" {
-                            let _ = db.set_last_finetuned_at(
-                                &project_id,
-                                RL_RERANKER_MODULE_ID,
-                                &response.embedding_source,
-                            );
                             break;
                         }
                         if state == "failed" || state == "error" {
@@ -1326,13 +1343,19 @@ pub async fn get_rl_dashboard_state(
         .get_project_rl_port(&project_id)?
         .unwrap_or(0);
 
-    let embedding_source = read_active_embedding_source(&project)
+    let _embedding_source = read_active_embedding_source(&project)
         .unwrap_or_else(|| DEFAULT_EMBEDDING_SOURCE.to_string());
 
-    let weights = db
-        .get_weights_state(&project_id, RL_RERANKER_MODULE_ID, &embedding_source)
-        .ok()
-        .flatten();
+    // v0.2.31 Agent J: `current_weights_version` / `last_checked_at` /
+    // `last_finetuned_at` used to come from the launcher's own
+    // `module_weights_state` table (now dropped). The dashboard widget
+    // reads them live via the hub's
+    // `/api/v1/modules/vct-rl-reranker/db/projects/{pid}/rows/
+    // rl_weights_state/{embedding_source}?fields=local_version,
+    // last_finetuned_at,...` endpoint (Agent I) — see the Svelte
+    // dashboard widget in `launcher/src/lib/components/`. We return
+    // empty values here so the wire shape stays back-compat; the
+    // frontend layers the live reads on top.
 
     // image_tag reconstructed from manifest.install.container.image +
     // install.module_version. Falls back to "" if we can't read the
@@ -1367,12 +1390,13 @@ pub async fn get_rl_dashboard_state(
         container_running,
         port,
         image_tag,
-        current_weights_version: weights
-            .as_ref()
-            .map(|w| w.version.clone())
-            .unwrap_or_default(),
-        last_checked_at: weights.as_ref().map(|w| w.last_checked_at).unwrap_or(0),
-        last_finetuned_at: weights.as_ref().map(|w| w.last_finetuned_at).unwrap_or(0),
+        // v0.2.31 Agent J: these three fields are now back-compat
+        // placeholders. The frontend reads the live values via
+        // `module_db_read_row` against the container-owned
+        // `rl_weights_state`.
+        current_weights_version: String::new(),
+        last_checked_at: 0,
+        last_finetuned_at: 0,
         weights_sha256_prefix: String::new(),
         recent_events_count,
         recent_events_avg_latency_ms,

@@ -1081,15 +1081,12 @@ pub fn run() {
             commands::module_service::check_for_weights_update_now,
             commands::module_service::apply_weights_update,
             commands::module_service::get_rl_dashboard_state,
-            // module_weights_state DB plumbing (migration 016). Read /
-            // upsert paths exposed for Stream D's WeightsUpdatePrompt +
-            // future dashboard widgets.
-            commands::module_weights_state::get_weights_state,
-            commands::module_weights_state::upsert_weights_state,
-            commands::module_weights_state::set_weights_state_last_checked_at,
-            commands::module_weights_state::set_weights_state_last_finetuned_at,
-            commands::module_weights_state::set_weights_state_version,
-            commands::module_weights_state::list_weights_state_for_project,
+            // v0.2.31 Agent J: module_weights_state Tauri commands removed
+            // alongside migration 020. The dashboard's live reads now go
+            // through `module_db_client::module_db_read_row` against the
+            // container-owned `rl_weights_state` (shipped by vct-rl-
+            // reranker v0.2.6 via its module-shipped migration).
+            commands::module_db_client::module_db_read_row,
             // Stream 2 (2026-05-19): module-contributed GUI tabs +
             // generic per-control state. `get_module_nav_items` feeds the
             // Sidebar's module nav group; the get/set setting pair is the
