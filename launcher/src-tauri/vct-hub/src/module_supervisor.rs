@@ -659,7 +659,6 @@ mod tests {
                         mode: Some("rw".into()),
                     },
                 ],
-                log_path_template: None,
             },
             mcp_registration: None,
             setup_wizard: None,
