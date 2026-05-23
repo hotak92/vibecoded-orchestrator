@@ -108,6 +108,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "module deprecation surface: deprecation_events (append-only audit) + module_deprecation_seen (one-shot notification gate) (v0.2.31)",
         sql: include_str!("migrations/018_module_deprecation.sql"),
     },
+    Migration {
+        version: 19,
+        description: "module-shipped DB migrations: module_db_migrations tracking + module_access_tokens for hub bearer auth (v0.2.31)",
+        sql: include_str!("migrations/019_module_db_migrations.sql"),
+    },
 ];
 
 /// Apply every migration whose version is greater than the current max applied.

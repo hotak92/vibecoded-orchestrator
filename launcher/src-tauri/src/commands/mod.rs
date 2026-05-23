@@ -30,6 +30,7 @@ pub mod lifecycle;
 pub mod licensing;
 pub mod maintenance;
 pub mod manifest;
+pub mod module_db;
 pub mod module_deprecation;
 pub mod module_dispatch;
 pub mod module_gui;

@@ -1793,6 +1793,7 @@ mod tests {
             provides: vec![],
             consumes: vec![],
             gui: None,
+            db: None,
         }
     }
 

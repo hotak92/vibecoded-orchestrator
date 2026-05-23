@@ -69,12 +69,13 @@ pub async fn run_install(
     ctx: &PlaceholderCtx,
     project_id: &str,
     gpu_mode: crate::commands::gpu_policy::GpuMode,
+    db: &crate::db::Db,
 ) -> Result<PathBuf, String> {
     // v0.2.31 (#27): wrap the body so every Err path emits InstallStage::Failed
     // via the progress channel before propagating. The inner helper carries
     // the same signature; this wrapper exists only to attach the terminal
     // Failed event to error returns.
-    match run_install_inner(app, manifest, ctx, project_id, gpu_mode).await {
+    match run_install_inner(app, manifest, ctx, project_id, gpu_mode, db).await {
         Ok(p) => Ok(p),
         Err(e) => {
             report_error(app, project_id, &manifest.id, InstallStage::Clone, &e);
@@ -89,6 +90,7 @@ async fn run_install_inner(
     ctx: &PlaceholderCtx,
     project_id: &str,
     gpu_mode: crate::commands::gpu_policy::GpuMode,
+    db: &crate::db::Db,
 ) -> Result<PathBuf, String> {
     let install_dir = ctx.resolve_install_dir(&manifest.install.install_dir);
     let allowed_root = ctx.vct_modules.clone();
@@ -205,6 +207,81 @@ async fn run_install_inner(
         );
         step_index += 1;
         run_post_install_command(cmd_spec, &ctx_with_dir).await?;
+    }
+
+    // ─── v0.2.31: module-shipped DB migrations ───────────────────────────
+    //
+    // After all post_install commands have succeeded, apply any SQL
+    // migrations the module ships under `manifest.db.migrations_dir`.
+    // Soft-fail: an error here does NOT cause the install to fail
+    // (the on-disk artifact is already in place, the catalog rows
+    // already written). Instead we log + emit a non-blocking event so
+    // the GUI / install-deferred surface can show the actionable
+    // diagnostic. The user can retry via the
+    // `apply_module_db_migrations` Tauri command from the dashboard.
+    if manifest.db.is_some() {
+        emit_progress(
+            app,
+            project_id,
+            &manifest.id,
+            InstallStage::PostInstall,
+            step_index,
+            total_steps,
+            "Applying module DB migrations",
+        );
+        let module_id_for_log = manifest.id.clone();
+        let install_dir_for_log = install_dir.clone();
+        match crate::db::module_db_migrations::apply_module_db_migrations(
+            db,
+            &manifest.id,
+            &install_dir,
+            manifest,
+        ) {
+            Ok(report) => {
+                if !report.ok() {
+                    eprintln!(
+                        "[installer_engine] run_install[{}]: module DB migration(s) failed at {}: {:?}",
+                        module_id_for_log,
+                        install_dir_for_log.display(),
+                        report.errors,
+                    );
+                    let _ = app.emit(
+                        "module://db-migration-failed",
+                        serde_json::json!({
+                            "project_id": project_id,
+                            "module_id": manifest.id,
+                            "errors": report.errors,
+                            "applied": report.applied,
+                            "skipped": report.skipped,
+                        }),
+                    );
+                } else if !report.applied.is_empty() {
+                    eprintln!(
+                        "[installer_engine] run_install[{}]: applied {} DB migration(s)",
+                        module_id_for_log,
+                        report.applied.len(),
+                    );
+                }
+            }
+            Err(e) => {
+                // Hard failure resolving the apply itself (e.g. DB lock).
+                // Still soft-fail at the installer-engine level: the
+                // install row is `installed`, the migration is just
+                // pending. Surface via the same event.
+                eprintln!(
+                    "[installer_engine] run_install[{}]: apply_module_db_migrations errored: {}",
+                    module_id_for_log, e
+                );
+                let _ = app.emit(
+                    "module://db-migration-failed",
+                    serde_json::json!({
+                        "project_id": project_id,
+                        "module_id": manifest.id,
+                        "error": e,
+                    }),
+                );
+            }
+        }
     }
 
     emit_progress(
@@ -694,10 +771,11 @@ pub async fn run_upgrade(
     ctx: &PlaceholderCtx,
     project_id: &str,
     gpu_mode: crate::commands::gpu_policy::GpuMode,
+    db: &crate::db::Db,
 ) -> Result<PathBuf, String> {
     // Outer wrapper: every Err path emits InstallStage::Failed before
     // propagating (#27 contract — same as run_install).
-    match run_upgrade_inner(app, manifest, previous_install, ctx, project_id, gpu_mode).await {
+    match run_upgrade_inner(app, manifest, previous_install, ctx, project_id, gpu_mode, db).await {
         Ok(p) => Ok(p),
         Err(e) => {
             report_error(app, project_id, &manifest.id, InstallStage::PostInstall, &e);
@@ -713,6 +791,7 @@ async fn run_upgrade_inner(
     ctx: &PlaceholderCtx,
     project_id: &str,
     gpu_mode: crate::commands::gpu_policy::GpuMode,
+    db: &crate::db::Db,
 ) -> Result<PathBuf, String> {
     // v0.2.29 launcher-version gate: enforce min_launcher_version on
     // updates the same way install does. A user could have installed
@@ -831,6 +910,67 @@ async fn run_upgrade_inner(
             note: None,
         };
         run_post_install_command(&spec, &ctx_with_dir).await?;
+    }
+
+    // ─── v0.2.31: module-shipped DB migrations (upgrade path) ────────────
+    //
+    // Same soft-fail discipline as `run_install`. A new module version
+    // may ship additional SQL files; the apply mechanism is idempotent
+    // (SHA-keyed), so already-applied files are skipped silently.
+    // Errors are surfaced via the same `module://db-migration-failed`
+    // event the dashboard listens for.
+    if manifest.db.is_some() {
+        emit_progress(
+            app, project_id, &manifest.id, InstallStage::Migrate,
+            step_index, total_steps, "Applying module DB migrations",
+        );
+        let module_id_for_log = manifest.id.clone();
+        match crate::db::module_db_migrations::apply_module_db_migrations(
+            db,
+            &manifest.id,
+            &install_dir,
+            manifest,
+        ) {
+            Ok(report) => {
+                if !report.ok() {
+                    eprintln!(
+                        "[installer_engine] run_upgrade[{}]: module DB migration(s) failed: {:?}",
+                        module_id_for_log, report.errors,
+                    );
+                    let _ = app.emit(
+                        "module://db-migration-failed",
+                        serde_json::json!({
+                            "project_id": project_id,
+                            "module_id": manifest.id,
+                            "errors": report.errors,
+                            "applied": report.applied,
+                            "skipped": report.skipped,
+                            "operation": "upgrade",
+                        }),
+                    );
+                } else if !report.applied.is_empty() {
+                    eprintln!(
+                        "[installer_engine] run_upgrade[{}]: applied {} DB migration(s)",
+                        module_id_for_log, report.applied.len(),
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "[installer_engine] run_upgrade[{}]: apply_module_db_migrations errored: {}",
+                    module_id_for_log, e
+                );
+                let _ = app.emit(
+                    "module://db-migration-failed",
+                    serde_json::json!({
+                        "project_id": project_id,
+                        "module_id": manifest.id,
+                        "error": e,
+                        "operation": "upgrade",
+                    }),
+                );
+            }
+        }
     }
 
     emit_progress(

@@ -18,8 +18,8 @@ use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 
 use super::{
-    api, auth, cli_api, config_api, db, lifecycle_api, module_supervisor, modules_api,
-    project_state_api, weaviate_probe,
+    api, auth, cli_api, config_api, db, lifecycle_api, module_db_api, module_supervisor,
+    modules_api, project_state_api, weaviate_probe,
 };
 
 const DEFAULT_PORT: u16 = 7700;
@@ -117,7 +117,24 @@ pub async fn start_hub_server() -> Result<u16, String> {
             "/api/v1",
             lifecycle_api::router().with_state(launcher_state.clone()),
         )
-        .nest("/api/v1", cli_api::router().with_state(launcher_state))
+        .nest(
+            "/api/v1",
+            cli_api::router().with_state(launcher_state.clone()),
+        )
+        // v0.2.31: module-owned DB rows. Uses its OWN bearer-scope
+        // middleware (require_module_scope) — token is the per-(module,
+        // project) shared secret stored in launcher.db's
+        // `module_access_tokens` table, NOT the hub-wide hub.token.
+        // We mount it OUTSIDE the hub-wide auth::require_auth layer
+        // (see comment chain in module_db_api::require_module_scope).
+        .nest(
+            "/api/v1",
+            module_db_api::router().with_state(launcher_state.clone()),
+        )
+        // Inject the launcher_state as a request extension so the
+        // module_db_api middleware can pull it without going through
+        // axum's State<>-typed router.
+        .layer(axum::Extension(launcher_state))
         .layer(axum::middleware::from_fn(auth::require_auth))
         .layer(axum::Extension(auth_state))
         .layer(cors);

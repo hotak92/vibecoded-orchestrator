@@ -227,18 +227,43 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
     Some(token)
 }
 
-/// Whether a request path is exempt from auth.
+/// Whether a request path is exempt from the hub-wide bearer-token gate.
 ///
-/// Two carve-outs:
+/// Three carve-outs:
 ///   * `/api/v1/health` — liveness probe, returns no secrets. Existing
 ///     `hub_proxy::hub_info` uses it as a same-user reachability test.
+///   * `/api/v1/modules/{id}/db/...` — module-owned DB row endpoints.
+///     These have their OWN bearer-scope check in
+///     `module_db_api::require_module_scope` against the per-(module,
+///     project) shared secret in `module_access_tokens` — the hub-wide
+///     `hub.token` is the LAUNCHER's auth surface, not the container's.
+///   * `/api/v1/modules/{id}/token/refresh` — same posture, exempted
+///     for the same reason (the container has its scoped secret, not
+///     hub.token).
 ///   * Anything not under `/api/v1/` — there's nothing else mounted
 ///     today, but if someone adds a `/static/*` route later we don't
 ///     want an empty-Authorization 401 to leak through. Auth applies
 ///     to the API surface; non-API paths get whatever the routing
 ///     layer decides (usually 404).
 fn is_exempt_path(path: &str) -> bool {
-    path == "/api/v1/health"
+    if path == "/api/v1/health" {
+        return true;
+    }
+    // Module-owned DB endpoints: handled by module_db_api's own
+    // bearer-scope middleware. Match patterns:
+    //   /api/v1/modules/{module_id}/db/projects/{project_id}/rows/...
+    //   /api/v1/modules/{module_id}/token/refresh
+    if let Some(rest) = path.strip_prefix("/api/v1/modules/") {
+        // rest like "vct-rl-reranker/db/projects/.../rows/..." or
+        //          "vct-rl-reranker/token/refresh".
+        let parts: Vec<&str> = rest.splitn(3, '/').collect();
+        if parts.len() >= 2 {
+            if parts[1] == "db" || parts[1] == "token" {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Axum middleware: require `Authorization: Bearer <token>` on every

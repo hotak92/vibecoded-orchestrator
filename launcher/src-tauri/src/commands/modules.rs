@@ -583,7 +583,7 @@ pub async fn install_module_for_project(
         .map(|snap| snap.gpu_mode_decided)
         .unwrap_or(crate::commands::gpu_policy::GpuMode::Cpu);
 
-    match installer_engine::run_install(&app, &manifest, &ctx, &project_id, gpu_mode).await {
+    match installer_engine::run_install(&app, &manifest, &ctx, &project_id, gpu_mode, &db).await {
         Ok(resolved_dir) => {
             db.set_module_status(&project_id, &module_id, ModuleStatus::Installed, None)?;
             db.audit(
@@ -746,6 +746,7 @@ pub async fn update_module_for_project(
         &ctx,
         &project_id,
         gpu_mode,
+        &db,
     )
     .await
     {

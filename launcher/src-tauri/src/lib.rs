@@ -1140,6 +1140,14 @@ pub fn run() {
             commands::module_deprecation::apply_deprecation_state,
             commands::module_deprecation::has_module_deprecation_been_seen,
             commands::module_deprecation::mark_module_deprecation_seen,
+            // v0.2.31: module-shipped DB migrations. Manual-repair
+            // surface (re-apply on the dashboard's "Repair module DB"
+            // button) + per-(module, project) access-token issue for
+            // hub bearer auth. The install-time apply runs from
+            // installer_engine's run_install / run_upgrade — these
+            // commands are for the GUI / dashboard manual paths.
+            commands::module_db::apply_module_db_migrations,
+            commands::module_db::issue_module_access_token,
             // Retrieval tuning (v0.2.22 Item #13 — 2026-05-20).
             // Global thresholds for score-driven retrieval verbosity
             // (KG tier cutoffs) + codegraph injection floor. Backed by

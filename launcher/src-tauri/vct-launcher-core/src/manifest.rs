@@ -86,6 +86,55 @@ pub struct ModuleManifest {
     /// part of the public manifest contract).
     #[serde(default)]
     pub gui: Option<GuiBlock>,
+
+    /// v0.2.31: module-shipped DB migrations block. When `Some(...)`,
+    /// the launcher applies SQL files matching `[0-9]+_*.sql` from
+    /// `{module_install_dir}/{db.migrations_dir}/` at install + update
+    /// time, idempotent via SHA256 tracking in launcher's own
+    /// `module_db_migrations` table (migration 019). Every table the
+    /// module creates MUST be prefixed with `{db.namespace}_` —
+    /// the launcher refuses to apply SQL that creates / alters tables
+    /// outside the declared namespace. See
+    /// `vct_launcher_core::db::module_db_migrations` for the apply
+    /// mechanism + `.claude/context/plans/rl-module-launcher-db-tables-
+    /// spec-2026-05-23.md` for the full design rationale.
+    #[serde(default)]
+    pub db: Option<DbBlock>,
+}
+
+// ─── DB (v0.2.31 / 2026-05-23) ──────────────────────────────────────────
+//
+// `DbBlock` declares a module's SQLite-migration footprint. The launcher
+// owns the `launcher.db` file; modules ship CREATE TABLE / ALTER TABLE /
+// CREATE INDEX statements that operate on their own namespaced tables
+// inside that same file. This lets the dashboard widgets read module
+// state without waking a stopped container, and lets modules persist
+// state without each shipping its own SQLite filesystem-managed file.
+//
+// **Load-bearing**: once a paid module ships with a `db` block,
+// breaking changes to this schema break that module's users — the
+// launcher's apply-on-install code path runs against EVERY install /
+// update of that module. Keep the schema additive.
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbBlock {
+    /// Relative path (under the module's install_dir) where the
+    /// launcher looks for SQL migration files. Files matching
+    /// `[0-9]+_*.sql` are applied in lexicographic order. Convention:
+    /// zero-pad to 4 digits (`0001_*.sql`, `0002_*.sql`, ...) so the
+    /// natural string sort matches numeric sort.
+    pub migrations_dir: String,
+
+    /// Lowercase identifier prefix every module-owned table MUST
+    /// declare. The launcher's apply mechanism refuses to execute SQL
+    /// that creates / alters tables outside `{namespace}_*`. FOREIGN
+    /// KEY references to launcher-owned tables (e.g. `projects(id)`)
+    /// are allowed — namespace-enforcement only constrains DDL
+    /// subjects, not FK targets.
+    ///
+    /// Validation: must match `[a-z][a-z0-9_]*`. Empty / uppercase /
+    /// non-identifier-shaped values are rejected at manifest-load time.
+    pub namespace: String,
 }
 
 // ─── GUI (Stream 2 / 2026-05-19) ────────────────────────────────────────
@@ -1083,6 +1132,15 @@ impl ModuleManifest {
                 .map_err(|e| format!("runtime.log_path_template invalid: {}", e))?;
         }
 
+        // v0.2.31: validate `db` block if present. We refuse manifests
+        // with malformed namespaces at load time so a typo doesn't
+        // surface mid-install with an opaque "namespace violation"
+        // error against the first CREATE TABLE.
+        if let Some(ref db) = m.db {
+            validate_db_block(db)
+                .map_err(|e| format!("manifest.db invalid: {}", e))?;
+        }
+
         Ok(m)
     }
 
@@ -1090,6 +1148,64 @@ impl ModuleManifest {
     pub fn is_compatible_with_host(&self, host: &str) -> bool {
         self.compatibility.hosts.iter().any(|h| h == host)
     }
+}
+
+/// v0.2.31: validate a `DbBlock` from a parsed manifest.
+///
+/// Returns Ok(()) when:
+/// - `migrations_dir` is non-empty (no other shape checks — the
+///   apply code resolves it against `module_install_dir` and rejects
+///   non-existent dirs / non-file matches at apply time).
+/// - `namespace` matches `[a-z][a-z0-9_]*` (lowercase identifier shape).
+///   Refuses empty, leading-digit, uppercase, hyphen, dot, slash, or
+///   anything else.
+///
+/// The namespace constraint is the load-bearing one: at apply time
+/// the launcher's regex-based SQL parser asserts every CREATE TABLE /
+/// ALTER TABLE / CREATE INDEX targets a table starting with
+/// `{namespace}_`. A malformed namespace would either reject every
+/// SQL file (silently) or — worse — match no tables and let the module
+/// write outside its sandbox. Catching it here fails fast.
+pub fn validate_db_block(db: &DbBlock) -> Result<(), String> {
+    if db.migrations_dir.is_empty() {
+        return Err("db.migrations_dir is required (relative path to SQL files)".into());
+    }
+
+    if db.namespace.is_empty() {
+        return Err("db.namespace is required".into());
+    }
+
+    let bytes = db.namespace.as_bytes();
+    // First char: lowercase ASCII letter only. Digits / underscores
+    // forbidden as leading chars because `0_foo` would sort-collide
+    // with migration-file numeric prefixes if we ever conflated the
+    // two, and `_foo` is unconventional for SQLite identifiers.
+    let first_ok = bytes
+        .first()
+        .map(|c| c.is_ascii_lowercase())
+        .unwrap_or(false);
+    if !first_ok {
+        return Err(format!(
+            "db.namespace '{}' must start with a lowercase letter [a-z]",
+            db.namespace
+        ));
+    }
+
+    // Subsequent chars: [a-z], [0-9], or '_'. Anything else (hyphen,
+    // uppercase, dot, slash) is rejected.
+    let rest_ok = bytes
+        .iter()
+        .skip(1)
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'_');
+    if !rest_ok {
+        return Err(format!(
+            "db.namespace '{}' must match [a-z][a-z0-9_]* \
+             (lowercase letters, digits, and underscores only)",
+            db.namespace
+        ));
+    }
+
+    Ok(())
 }
 
 /// v0.2.27: validate a `runtime.log_path_template` string.
@@ -2452,5 +2568,144 @@ mod tests {
         }"#;
         let m = ModuleManifest::from_json(raw).expect("must parse");
         assert!(m.runtime.log_path_template.is_none());
+    }
+
+    // ─── v0.2.31: module-shipped DB migrations (`db` block) ─────────────
+
+    #[test]
+    fn module_manifest_db_block_optional_round_trip() {
+        // Manifest without `db` block parses fine (most modules don't
+        // need DB state).
+        let raw = r#"{
+            "id": "no-db-mod",
+            "name": "No DB",
+            "version": "0.1.0",
+            "category": "community",
+            "license": { "min_orchestrator_tier": "free" },
+            "install": { "method": "git_clone", "source": "https://example.com/x.git" },
+            "runtime": { "type": "cli", "command": "echo" }
+        }"#;
+        let m = ModuleManifest::from_json(raw).expect("must parse");
+        assert!(m.db.is_none());
+    }
+
+    #[test]
+    fn module_manifest_db_block_accepts_valid_namespace() {
+        let raw = r#"{
+            "id": "rl-mod",
+            "name": "RL",
+            "version": "0.1.0",
+            "category": "community",
+            "license": { "min_orchestrator_tier": "free" },
+            "install": { "method": "git_clone", "source": "https://example.com/x.git" },
+            "runtime": { "type": "service", "command": "echo" },
+            "db": { "migrations_dir": "db/", "namespace": "rl" }
+        }"#;
+        let m = ModuleManifest::from_json(raw).expect("must parse");
+        {
+            let db = m.db.as_ref().expect("db block present");
+            assert_eq!(db.migrations_dir, "db/");
+            assert_eq!(db.namespace, "rl");
+        }
+
+        // Round-trip serialization preserves the block shape.
+        let re_serialized = serde_json::to_string(&m).expect("serialize");
+        assert!(re_serialized.contains("\"namespace\":\"rl\""));
+    }
+
+    #[test]
+    fn module_manifest_db_block_rejects_uppercase_namespace() {
+        let raw = r#"{
+            "id": "rl-mod",
+            "name": "RL",
+            "version": "0.1.0",
+            "category": "community",
+            "license": { "min_orchestrator_tier": "free" },
+            "install": { "method": "git_clone", "source": "https://example.com/x.git" },
+            "runtime": { "type": "service", "command": "echo" },
+            "db": { "migrations_dir": "db/", "namespace": "RL" }
+        }"#;
+        let err = ModuleManifest::from_json(raw).expect_err("must reject uppercase");
+        assert!(err.contains("namespace"));
+    }
+
+    #[test]
+    fn module_manifest_db_block_rejects_leading_digit() {
+        let raw = r#"{
+            "id": "rl-mod",
+            "name": "RL",
+            "version": "0.1.0",
+            "category": "community",
+            "license": { "min_orchestrator_tier": "free" },
+            "install": { "method": "git_clone", "source": "https://example.com/x.git" },
+            "runtime": { "type": "service", "command": "echo" },
+            "db": { "migrations_dir": "db/", "namespace": "1rl" }
+        }"#;
+        let err = ModuleManifest::from_json(raw).expect_err("must reject leading digit");
+        assert!(err.contains("namespace"));
+    }
+
+    #[test]
+    fn module_manifest_db_block_rejects_hyphen() {
+        let raw = r#"{
+            "id": "rl-mod",
+            "name": "RL",
+            "version": "0.1.0",
+            "category": "community",
+            "license": { "min_orchestrator_tier": "free" },
+            "install": { "method": "git_clone", "source": "https://example.com/x.git" },
+            "runtime": { "type": "service", "command": "echo" },
+            "db": { "migrations_dir": "db/", "namespace": "rl-mod" }
+        }"#;
+        let err = ModuleManifest::from_json(raw).expect_err("must reject hyphen");
+        assert!(err.contains("namespace"));
+    }
+
+    #[test]
+    fn module_manifest_db_block_rejects_empty_namespace() {
+        let raw = r#"{
+            "id": "rl-mod",
+            "name": "RL",
+            "version": "0.1.0",
+            "category": "community",
+            "license": { "min_orchestrator_tier": "free" },
+            "install": { "method": "git_clone", "source": "https://example.com/x.git" },
+            "runtime": { "type": "service", "command": "echo" },
+            "db": { "migrations_dir": "db/", "namespace": "" }
+        }"#;
+        let err = ModuleManifest::from_json(raw).expect_err("must reject empty namespace");
+        assert!(err.to_lowercase().contains("namespace"));
+    }
+
+    #[test]
+    fn module_manifest_db_block_rejects_empty_migrations_dir() {
+        let raw = r#"{
+            "id": "rl-mod",
+            "name": "RL",
+            "version": "0.1.0",
+            "category": "community",
+            "license": { "min_orchestrator_tier": "free" },
+            "install": { "method": "git_clone", "source": "https://example.com/x.git" },
+            "runtime": { "type": "service", "command": "echo" },
+            "db": { "migrations_dir": "", "namespace": "rl" }
+        }"#;
+        let err = ModuleManifest::from_json(raw).expect_err("must reject empty migrations_dir");
+        assert!(err.contains("migrations_dir"));
+    }
+
+    #[test]
+    fn module_manifest_db_block_accepts_namespace_with_digits_and_underscores() {
+        let raw = r#"{
+            "id": "rl-mod",
+            "name": "RL",
+            "version": "0.1.0",
+            "category": "community",
+            "license": { "min_orchestrator_tier": "free" },
+            "install": { "method": "git_clone", "source": "https://example.com/x.git" },
+            "runtime": { "type": "service", "command": "echo" },
+            "db": { "migrations_dir": "db/", "namespace": "rl_v2_alpha9" }
+        }"#;
+        let m = ModuleManifest::from_json(raw).expect("must parse");
+        assert_eq!(m.db.unwrap().namespace, "rl_v2_alpha9");
     }
 }

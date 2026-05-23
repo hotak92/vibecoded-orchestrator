@@ -40,6 +40,7 @@ pub mod orchestrator_root_helpers;
 pub mod module_weights_state;
 pub mod module_ports;
 pub mod deprecation_events;
+pub mod module_db_migrations;
 
 /// Resolve the launcher DB path: `<VCT_STATE_DIR or ~/.vct>/launcher.db`.
 pub fn db_path() -> PathBuf {
