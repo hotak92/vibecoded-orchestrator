@@ -2756,6 +2756,88 @@ def _classify_bundle_op_kind(dest_rel: str) -> Optional[tuple[str, str]]:
     return None
 
 
+def _installed_matches_template_history(
+    template_source: Path,
+    installed_hash: str,
+    orchestrator_root: Path,
+    *,
+    max_commits: int = 50,
+) -> bool:
+    """v0.2.31 heal: did this file's installed sha match ANY historical
+    version of the template under `templates/`? If yes, the file was
+    shipped by VCO at some point — the user hasn't edited it, it's just
+    stale. Safe to overwrite.
+
+    Bounded git-log walk on the template path. Looks at `git log -p`
+    for the path, hashes each historical blob's content, and compares.
+
+    Returns False (= preserve as user-modified) on any error path:
+      - orchestrator_root isn't a git repo (tarball install)
+      - git isn't on PATH
+      - template path not under orchestrator_root
+      - git log returns no history (new file not yet committed)
+
+    `max_commits` caps the walk depth (~6 months at typical release
+    cadence for this repo). Adjust upward if false-preserves happen.
+
+    Note: this helper covers the `_file_action` "no prior_hash in
+    manifest but file exists on disk" case introduced by adding new
+    files to the bundle without retro-actively updating manifests on
+    existing installs. The discipline for genuinely user-modified
+    files (= file content never matched any shipped version) is
+    unchanged — those still take the preserve path.
+    """
+    import subprocess as _sp
+
+    if not orchestrator_root.is_dir():
+        return False
+    git_dir = orchestrator_root / ".git"
+    if not git_dir.exists():
+        # Tarball install or non-git source tree. Can't walk history.
+        return False
+    try:
+        rel = template_source.resolve().relative_to(orchestrator_root.resolve())
+    except (OSError, RuntimeError, ValueError):
+        return False
+    rel_str = str(rel).replace("\\", "/")
+    # `git log --format=%H` over the path → list of commits touching it.
+    # We then `git show <sha>:<path>` for each and sha-256 the bytes.
+    try:
+        result = _sp.run(
+            [
+                "git", "-C", str(orchestrator_root),
+                "log", f"-{max_commits}", "--pretty=format:%H", "--", rel_str,
+            ],
+            capture_output=True, text=True, timeout=5.0,
+        )
+    except (FileNotFoundError, _sp.SubprocessError):
+        return False
+    if result.returncode != 0:
+        return False
+    commits = [c.strip() for c in result.stdout.splitlines() if c.strip()]
+    if not commits:
+        # File never had a commit touching it under this path. Could be
+        # legitimately new (uncommitted) or moved/renamed; fall through
+        # to default-preserve.
+        return False
+    for sha in commits:
+        try:
+            blob = _sp.run(
+                [
+                    "git", "-C", str(orchestrator_root),
+                    "show", f"{sha}:{rel_str}",
+                ],
+                capture_output=True, timeout=2.0,
+            )
+        except (FileNotFoundError, _sp.SubprocessError):
+            continue
+        if blob.returncode != 0:
+            continue
+        if _bytes_sha256(blob.stdout) == installed_hash:
+            return True
+    return False
+
+
 def _file_action(
     op: _BundleFileOp,
     target_path: Path,
@@ -2858,6 +2940,37 @@ def _file_action(
         op.transform is not None
         and orchestrator_root is not None
         and _stale_orchestrator_root_heal_match(raw, target_path, orchestrator_root)
+    ):
+        return ("overwrite", source_bytes)
+
+    # v0.2.31 heal: manifest-untracked-but-shipped scenario. Pre-v0.2.31
+    # the install-bundle manifest only tracked a subset of bundled files
+    # (mostly hooks/_lib/* and scripts). Files NOT in the manifest had
+    # `prior_hash == ""`, and the default-to-preserve path treated them
+    # as user-modified — silently freezing stale shipped versions for
+    # release after release. This was THE bug behind v0.2.27→v0.2.29's
+    # invisible-keyword-suggest-failure on VCO_dev (PR #259's
+    # `keywords:` frontmatter on 97 agents/skills never reached
+    # orchestrator-root-style projects).
+    #
+    # Heuristic: when the manifest has no prior_hash for this path, walk
+    # the template file's git history. If the installed sha matches ANY
+    # historical shipped sha (current template, any prior commit on the
+    # template path), the file is "VCO-shipped, possibly stale" — safe
+    # to overwrite. If no match across history → genuinely user-edited
+    # → preserve as before.
+    #
+    # Bounded: walks at most the last 50 commits touching the template
+    # path (covers ~6 months of orchestrator history at typical release
+    # cadence). Cheap on cold cache (~10-50ms per file); warm git index
+    # is faster. Skips gracefully if orchestrator_root isn't a git repo
+    # (e.g. tarball install) — falls through to default-to-preserve.
+    if (
+        not prior_hash
+        and orchestrator_root is not None
+        and _installed_matches_template_history(
+            op.source_abs, installed_hash, orchestrator_root
+        )
     ):
         return ("overwrite", source_bytes)
 
@@ -5600,16 +5713,49 @@ def _backfill_code_graph_project_env_in_project(
             return existing_pn
         return sanitize_for_weaviate_class(folder.name or "")
 
+    # v0.2.31: same manual_override-correction pattern the KG-side
+    # backfill (`_backfill_kg_collection_env_in_project`) uses since
+    # v0.2.30. When launcher.db's `project_codegraph_bindings.config_json`
+    # carries a `manual_override` sentinel, treat the DB row's
+    # `collection_prefix` as the source of truth and correct
+    # `env.CODE_GRAPH_PROJECT` even if it's already set to a stale value.
+    # Without this, install.py --update + the legacy auto-seeded default
+    # could silently revert the user's customized code-graph collection
+    # prefix on every update — same shape of bug as the v0.2.28 KG-binding
+    # clobber. No correction without manual_override = respects user edits.
+    _cg_override = _read_codegraph_binding_override(folder)
+    cg_prefix = _cg_override.get("collection_prefix")
+    cg_has_manual_override = _cg_override.get("has_manual_override", False)
+
     added: list[str] = []
     resolved = ""
     if "PROJECT_NAME" not in env:
-        resolved = resolved or _resolve_name()
+        # v0.2.31: prefer manual-override binding when present.
+        if cg_has_manual_override and cg_prefix:
+            resolved = cg_prefix
+        else:
+            resolved = resolved or _resolve_name()
         env["PROJECT_NAME"] = resolved
         added.append("PROJECT_NAME")
+    elif cg_has_manual_override and cg_prefix and env["PROJECT_NAME"] != cg_prefix:
+        # Correct existing-but-stale value (matches v0.2.30 KG behaviour).
+        env["PROJECT_NAME"] = cg_prefix
+        added.append("PROJECT_NAME (corrected)")
+        resolved = cg_prefix
     if "CODE_GRAPH_PROJECT" not in env:
-        resolved = resolved or _resolve_name()
-        env["CODE_GRAPH_PROJECT"] = resolved
+        if cg_has_manual_override and cg_prefix:
+            env["CODE_GRAPH_PROJECT"] = cg_prefix
+        else:
+            resolved = resolved or _resolve_name()
+            env["CODE_GRAPH_PROJECT"] = resolved
         added.append("CODE_GRAPH_PROJECT")
+    elif (
+        cg_has_manual_override
+        and cg_prefix
+        and env["CODE_GRAPH_PROJECT"] != cg_prefix
+    ):
+        env["CODE_GRAPH_PROJECT"] = cg_prefix
+        added.append("CODE_GRAPH_PROJECT (corrected)")
 
     if not added and not env_was_missing:
         result["action"] = "noop"
@@ -5661,6 +5807,105 @@ def _backfill_code_graph_project_env_in_project(
 #   hub architecture). User-set values are NEVER overwritten — we only
 #   ADD missing keys, matching the discipline established by
 #   `_backfill_code_graph_project_env_in_project`.
+
+
+def _read_codegraph_binding_override(folder: Path) -> dict:
+    """v0.2.31 (staged for next substantial release): codegraph analogue
+    of `_read_kg_binding_override`. Returns the launcher.db
+    `project_codegraph_bindings` row's `collection_prefix` + whether the
+    row's `config_json.manual_override` sentinel is set, so the caller
+    can decide whether to CORRECT an existing-but-stale
+    `env.CODE_GRAPH_PROJECT` (manual_override = yes) or leave it alone
+    (manual_override = no, = auto-seeded default the user hasn't
+    customized).
+
+    Same path-resolution + Windows-aware comparison rules as
+    `_read_kg_binding_override`. Soft-fails to empty defaults on any
+    error path.
+
+    Returns:
+        {"collection_prefix": str | None, "has_manual_override": bool}
+    """
+    import json as _json
+    import os as _os
+    import platform as _platform
+    import sqlite3 as _sqlite3
+
+    out: dict = {"collection_prefix": None, "has_manual_override": False}
+
+    state_dir_env = _os.environ.get("VCT_STATE_DIR", "").strip()
+    if state_dir_env:
+        db_path = Path(state_dir_env) / "launcher.db"
+    else:
+        db_path = Path.home() / ".vct" / "launcher.db"
+
+    if not db_path.is_file():
+        return out
+
+    try:
+        folder_canonical = folder.resolve()
+    except (OSError, RuntimeError):
+        return out
+
+    is_windows = _platform.system().lower().startswith("win")
+
+    def _path_eq(a: str, b: Path) -> bool:
+        try:
+            ap = Path(a).resolve()
+        except (OSError, RuntimeError):
+            return False
+        if is_windows:
+            return str(ap).lower() == str(b).lower()
+        return ap == b
+
+    try:
+        conn = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
+    except _sqlite3.Error:
+        return out
+
+    try:
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT id, folder_path FROM projects")
+            rows = cur.fetchall()
+        except _sqlite3.Error:
+            return out
+        project_id = None
+        for row_id, row_folder in rows:
+            if _path_eq(row_folder or "", folder_canonical):
+                project_id = row_id
+                break
+        if project_id is None:
+            return out
+        try:
+            cur.execute(
+                "SELECT collection_prefix, config_json "
+                "FROM project_codegraph_bindings WHERE project_id = ?",
+                (project_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return out
+            prefix, config_json = row
+            try:
+                cfg = _json.loads(config_json or "{}")
+            except (_json.JSONDecodeError, TypeError):
+                cfg = {}
+            out["collection_prefix"] = prefix if prefix else None
+            out["has_manual_override"] = (
+                bool(cfg.get("manual_override"))
+                if isinstance(cfg, dict)
+                else False
+            )
+        except _sqlite3.Error:
+            return out
+    finally:
+        try:
+            conn.close()
+        except _sqlite3.Error:
+            pass
+
+    return out
 
 
 def _read_kg_binding_override(folder: Path) -> dict:
