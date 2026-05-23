@@ -1,6 +1,7 @@
 ---
 name: project-migrator
 description: Migrates existing Claude Code projects to VibeCoded Orchestrator workflow system
+keywords: [migrate project, existing project to Orchestrator, brownfield, preserve customizations, workflow migration]
 tools: Read, Write, Edit, Glob, Bash, Task, AskUserQuestion
 model: sonnet
 effort: high

@@ -1,6 +1,7 @@
 ---
 name: build-vs-buy-decision
 description: Helps a solo founder or small team decide whether to build a feature in-house, buy/integrate a SaaS, or defer it. Considers MRR stage, team capacity, vendor lock-in risk, ongoing maintenance cost, and the "default to building" indie bias. Invoked when the user asks "should we build or buy [feature]", "is it worth integrating [tool]", "should we replace [vendor] with our own implementation", or "what's the cheapest way to ship [capability]".
+keywords: [build vs buy, vendor lock-in, should we build, should we integrate, make or buy]
 model: opus
 effort: high
 ---
