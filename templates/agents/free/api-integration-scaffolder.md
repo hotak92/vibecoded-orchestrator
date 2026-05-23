@@ -1,6 +1,7 @@
 ---
 name: api-integration-scaffolder
 description: Turn an external API (OpenAPI spec, docs URL, or curl examples) into a production-ready typed client with auth, rate-limit handling, retries with backoff, structured errors, and tests
+keywords: [OpenAPI, API client, typed client, rate limit handling, retry with backoff, API integration]
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: opus
 effort: high

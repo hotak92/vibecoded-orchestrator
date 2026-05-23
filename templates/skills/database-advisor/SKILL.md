@@ -1,6 +1,7 @@
 ---
 name: database-advisor
 description: Expert guidance on database design, schema optimization, query performance, and database technology selection
+keywords: [database schema, query performance, index design, Postgres, MongoDB, NoSQL]
 model: sonnet
 ---
 

@@ -1,6 +1,7 @@
 ---
 name: deployment-advisor
 description: Deployment strategy guidance - platform selection, CI/CD pipeline design, environment configuration, monitoring
+keywords: [deployment platform, CI/CD, Vercel, Fly.io, Railway, monitoring setup]
 model: sonnet
 ---
 
