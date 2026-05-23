@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.30] — 2026-05-23
+
+Critical fix for a silent KG-search misroute introduced by the install-flow plumbing. Pre-v0.2.30 every `install.py --update` run rewrote the orchestrator-root project's `.claude/settings.json` from the bundled template (which has no `env` block), wiping the user's `KG_COLLECTION` override. The downstream v0.2.29 backfill only added missing keys — never corrected an existing-but-stale value — so a user who had picked `<Project>_KnowledgeGraph` in the launcher Identity tab saw the binding silently revert to the orchestrator-root literal default on every update. `hybrid_search` returned 0 results because the MCP queried the wrong collection. **All users on v0.2.27–v0.2.29 with a customized `KG_COLLECTION` should update.**
+
+### Fixed
+
+- **`fix(install.py)` Settings.json template render now merges additively when settings.json exists**, instead of unconditional overwrite. Pre-v0.2.30 the orchestrator-root materialization step at the bottom of `_install_hooks_and_settings` called `settings_dst.write_text(rendered, encoding="utf-8")` unconditionally — wiping the user's `env` block (which the template doesn't carry) every update. Now: on existing files, the template's top-level keys (`$schema`, `permissions`, `hooks`, `_template_origin`) override the on-disk version, but every other top-level key (including `env`, `_comment`, `_env_comment`, any user-added field) is preserved. Fresh installs still see the template as-is. Pinned by a new regression test (`InstallSettingsTemplateMergePreservesEnvTests`).
+- **`fix(vco_lib.project_init)` `_backfill_kg_collection_env_in_project` now CORRECTS existing-but-stale env values when launcher.db has a `manual_override` sentinel.** Pre-v0.2.30 the function only ADDED missing keys, never overwrote an existing-but-wrong value. The Rust seed-guard (v0.2.28) preserves user-customized `project_kg_bindings` rows on launcher boot, but if `install.py --update` had overwritten settings.json env BEFORE the seed-guard fired (which it did, see above), the env stayed wrong. Now the backfill reads each binding's `config_json.manual_override` sentinel and corrects env values that disagree with the DB. User-edited settings.json without DB override is left alone (no `manual_override` = no correction — respects the user's direct edit). 5 new regression tests in `ManualOverrideCorrectsStaleEnvTests`.
+
+### Versions
+
+- Bump 0.2.29 → 0.2.30 in 5 build files + `vct-module.json`.
+
+### Test results
+
+- 2042/2042 pytests pass (17/17 KG-backfill tests, 6 new)
+- All 3 CI gates pass (set-discipline, OS-parity, managed-paths)
+
+### Known issues deferred to v0.2.31+
+
+(Surfaced during v0.2.29 dogfooding; see `.github/workflows/README.md` for the running backlog.)
+
+- `merge_orchestrator_with_upstream` Tauri command (the divergence-modal "Merge" path) lacks `--autostash`. v0.2.29's autostash fix only patched `update_orchestrator`.
+- Divergence-modal's "Try Merge again" button is a footgun — re-running always re-fails with the same error.
+- Divergence modal positioning crops at viewport top (regression that survived v0.2.27's modal rewrite).
+- Pre-merge `.from-upstream-<sha>` sidecars accumulate without GC.
+
+## [0.2.29] — 2026-05-23
+
+Same-day follow-up to v0.2.28's hook-parity-gate failure + critical fixes surfaced during VCO_dev dogfooding. Bundles installer autostash, per-session dedup state moved to project-local `.claude/state/`, RL launcher contracts (`min_launcher_version` enforcement + `/state_summary` consumer), keywords rolled out to all 97 agents/skills (PR #259), and CLAUDE.md disambiguation for the `kg-update-nudge` hook silences.
+
+### Fixed
+
+- **`fix(launcher)` `git pull --rebase --autostash` on `update_orchestrator`.** Pre-v0.2.29 the "Update orchestrator" button aborted with "cannot pull with rebase: You have unstaged changes" whenever the user's working tree had non-allowlisted uncommitted changes. Now safely stashes + restores via `--autostash`. Note: `merge_orchestrator_with_upstream` (the divergence-modal merge path) still lacks this — deferred to v0.2.31+.
+- **`fix(hooks)` Per-session dedup state moved from `$TMPDIR` to project-local `.claude/state/`.** Pre-v0.2.29 dedup state for keyword-suggest, edit-cache, diff-context-inject, pre-tool-use lived under `$TMPDIR`. The OS may clear `$TMPDIR` on reboot, breaking dedup mid-session — but Claude Code persists `session_id` across restarts (resume feature), so dedup state MUST survive reboots. Project-local `.claude/state/` is gitignored, survives reboots, and is wiped only by the PostCompact hook (matching the canonical "context resets at compaction" semantic). Affected: `pre-tool-use.{sh,ps1}`, `pre-edit-context-inject.{sh,ps1}`, `diff-context-inject.{sh,ps1}`, `pre-compact-save.{sh,ps1}`, `post-compact.{sh,ps1}`, `agent-skill-keyword-match.py`. Added 14-day GC pruning to keep the dir bounded.
+- **`fix(hooks)` `PROJECT_ROOT` resolution now prefers canonical `$CLAUDE_PROJECT_DIR`** (the launcher's source of truth for the active workspace) with SCRIPT_DIR-relative fallback for ad-hoc invocations.
+- **`fix(hooks)` `agent-skill-keyword-suggest` matcher hardening**: case-INsensitive matching (was case-sensitive, crippled most realistic matches), README.md/README/ subdirs skipped in agent/skill discovery, per-session dedup with PostCompact reset + path-traversal-safe `session_id` validation.
+- **`fix(hooks)` `agent-skill-keyword-suggest.sh` set-discipline**: `set -eu` → `set -euo pipefail` (closes the Hook OS-Parity Gate failure that flagged v0.2.28).
+
+### Added
+
+- **`feat(launcher)` Enforce module manifest's `compatibility.min_launcher_version` at install time.** Pre-v0.2.29 this field was deserialized but never read. Now refuses install with a clear error pointing the user at Settings → Updates → Update orchestrator. 5 `version_lt` tests.
+- **`feat(launcher)` `GET /state_summary` consumer for vct-rl-reranker v0.2.3+.** New `dynamic_types_count` + `d1_marker_present` optional fields on `RlDashboardState`. Soft-fail to `None` on any probe failure path (timeout, 404, parse error). 3 wire-shape tests.
+
+### Changed
+
+- **`feat(templates)` Keywords frontmatter rolled out to all 97 agents/skills** (was 20 in v0.2.27). 1,107 (keyword, item) pairs, ~11.4 keywords per item, max-collision capped at 4. PR #259. Adds bullet-list output format with `short_desc:` scope hints.
+- **`docs(CLAUDE.md)` `kg-update-nudge` silence-mechanism disambiguation.** Now lists all 3 paths: (a) write a real KG node [default], (b) transcript escape marker `[No KG update needed: <reason>]` [user-facing escape], (c) `KG_NUDGE_OFF=1` env [nuclear]. Corrected threshold (150k tokens → 175k work units first / 50k after). Applied in public CLAUDE.md + VCO_dev CLAUDE.md + `templates/CLAUDE.md.template`.
+
+### CI / workflows
+
+- **`chore(workflows)` Skip CI / CodeQL / Hook-Parity on pure-docs changes via `paths-ignore`.** Narrow allowlist of genuinely doc-only paths (`knowledge/**`, `docs/**`, `.claude/context/**`, top-level README/CHANGELOG/LICENSE/CLA/etc., `.github/ISSUE_TEMPLATE`). Critically does NOT include `**.md` or `templates/**` because many `.md` files are functional code (agents/skills frontmatter, CLAUDE.md, internal release notes) — flagged in the new `.github/workflows/README.md` to prevent future broadening.
+
+### Versions
+
+- Bump 0.2.28 → 0.2.29 in 5 build files + `vct-module.json` 0.2.21 → 0.2.29 (stale since v0.2.21 ship — manifest version had been forgotten in every release commit since).
+
+### Test results
+
+- 2036/2036 pytests pass
+- 929/929 cargo tests pass
+
 ## [0.2.28] — 2026-05-23
 
 Same-day chained release after v0.2.27 (see

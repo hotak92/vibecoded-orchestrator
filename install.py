@@ -5766,18 +5766,72 @@ def _materialize_orchestrator_self_claude_dir(install_root: Path) -> None:
         warnings.append(f"settings template missing at {settings_template}")
     else:
         try:
+            settings_dst = claude_dir / "settings.json"
+            settings_dst.parent.mkdir(parents=True, exist_ok=True)
+
+            # v0.2.30 fix: preserve existing settings.json's `env` block on
+            # re-render. Pre-v0.2.30 this code unconditionally overwrote
+            # settings.json with the rendered template — which has NO env
+            # block. Result: any user-customized `env.KG_COLLECTION` (e.g.
+            # a per-project override pointing at the project's legacy
+            # collection name) was silently wiped on every
+            # `install.py --update` run, then the downstream
+            # `_backfill_kg_collection_env_in_project` step re-derived a
+            # default that didn't match what the user had set. Symptom:
+            # `hybrid_search` returns 0 results because the MCP queries
+            # the wrong collection. Now: when settings.json already
+            # exists, merge the template's hooks/permissions block in but
+            # PRESERVE the user's env, _comment, and any other top-level
+            # keys. Fresh installs see no change (template wins).
             rendered = settings_template.read_text(encoding="utf-8")
             # Placeholder substitution (no-op today: the OS templates are
             # fully concrete and ship without `{{PROJECT_NAME}}` markers).
-            # Kept as a hook for future placeholder rollout. If downstream
-            # user-project install (vco_lib.project_init) adds new
-            # placeholders, mirror them here so the orchestrator-self
-            # gets the same render contract.
             rendered = rendered.replace("{{PROJECT_NAME}}",
                                         "VibeCoded Orchestrator")
-            settings_dst = claude_dir / "settings.json"
-            settings_dst.parent.mkdir(parents=True, exist_ok=True)
-            settings_dst.write_text(rendered, encoding="utf-8")
+
+            if settings_dst.is_file():
+                # Existing settings.json — merge additively. Preserve
+                # any top-level key the template doesn't declare (in
+                # particular `env`, `_comment`, `_env_comment`), and
+                # take the template's version for keys it does declare
+                # (`hooks`, `permissions`, `$schema`, `_template_origin`).
+                try:
+                    existing = json.loads(
+                        settings_dst.read_text(encoding="utf-8")
+                    )
+                    rendered_obj = json.loads(rendered)
+                    if isinstance(existing, dict) and isinstance(
+                        rendered_obj, dict
+                    ):
+                        merged = dict(existing)  # start with user state
+                        for k, v in rendered_obj.items():
+                            # Template wins for hook/permission/schema
+                            # keys (those are the "shipped contract").
+                            # User wins for env-shaped keys (preserved
+                            # via NOT overwriting from template). The
+                            # rendered template has no `env` key, so
+                            # `existing.env` survives by construction —
+                            # this is the load-bearing invariant.
+                            merged[k] = v
+                        settings_dst.write_text(
+                            json.dumps(merged, indent=2) + "\n",
+                            encoding="utf-8",
+                        )
+                    else:
+                        # User had unparseable JSON — refuse to clobber.
+                        warnings.append(
+                            "settings.json present but unparseable; left untouched"
+                        )
+                except (OSError, json.JSONDecodeError) as e:
+                    warnings.append(
+                        f"settings.json merge failed ({e}); left untouched"
+                    )
+            else:
+                # Fresh install — write the template as-is. The
+                # downstream `_backfill_code_graph_project_env` +
+                # `_backfill_kg_collection_env_in_project` steps add
+                # the env block.
+                settings_dst.write_text(rendered, encoding="utf-8")
         except OSError as e:
             warnings.append(f"failed to render settings.json: {e}")
 

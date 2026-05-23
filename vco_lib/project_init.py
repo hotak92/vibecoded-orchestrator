@@ -5663,6 +5663,114 @@ def _backfill_code_graph_project_env_in_project(
 #   `_backfill_code_graph_project_env_in_project`.
 
 
+def _read_kg_binding_override(folder: Path) -> dict:
+    """v0.2.30: same launcher.db read as `_read_kg_collection_from_launcher_db`,
+    but ALSO returns whether each binding carries a `manual_override`
+    sentinel in its `config_json`. The caller uses this to decide
+    whether an existing-but-stale settings.json env value should be
+    corrected (manual_override = yes → correct) or preserved
+    (manual_override = no → leave alone, the user might have edited
+    settings.json directly).
+
+    Returns a dict with keys:
+        primary_kg_collection: str | None
+        primary_has_manual_override: bool
+        shared_kg_collection: str | None
+        shared_has_manual_override: bool
+
+    Soft-fails to an empty/defaults dict on any error path. Path
+    resolution + Windows-aware comparison match
+    `_read_kg_collection_from_launcher_db`.
+    """
+    import json as _json
+    import os as _os
+    import platform as _platform
+    import sqlite3 as _sqlite3
+
+    out: dict = {
+        "primary_kg_collection": None,
+        "primary_has_manual_override": False,
+        "shared_kg_collection": None,
+        "shared_has_manual_override": False,
+    }
+
+    state_dir_env = _os.environ.get("VCT_STATE_DIR", "").strip()
+    if state_dir_env:
+        db_path = Path(state_dir_env) / "launcher.db"
+    else:
+        db_path = Path.home() / ".vct" / "launcher.db"
+
+    if not db_path.is_file():
+        return out
+
+    try:
+        folder_canonical = folder.resolve()
+    except (OSError, RuntimeError):
+        return out
+
+    is_windows = _platform.system().lower().startswith("win")
+
+    def _path_eq(a: str, b: Path) -> bool:
+        try:
+            ap = Path(a).resolve()
+        except (OSError, RuntimeError):
+            return False
+        if is_windows:
+            return str(ap).lower() == str(b).lower()
+        return ap == b
+
+    try:
+        conn = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
+    except _sqlite3.Error:
+        return out
+
+    try:
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT id, folder_path FROM projects")
+            rows = cur.fetchall()
+        except _sqlite3.Error:
+            return out
+        project_id = None
+        for row_id, row_folder in rows:
+            if _path_eq(row_folder or "", folder_canonical):
+                project_id = row_id
+                break
+        if project_id is None:
+            return out
+        try:
+            cur.execute(
+                "SELECT role, collection_name, config_json FROM project_kg_bindings "
+                "WHERE project_id = ?",
+                (project_id,),
+            )
+            for role, name, config_json in cur.fetchall():
+                if not name:
+                    continue
+                try:
+                    cfg = _json.loads(config_json or "{}")
+                except (_json.JSONDecodeError, TypeError):
+                    cfg = {}
+                has_override = bool(
+                    cfg.get("manual_override")
+                ) if isinstance(cfg, dict) else False
+                if role == "primary":
+                    out["primary_kg_collection"] = name
+                    out["primary_has_manual_override"] = has_override
+                elif role == "shared":
+                    out["shared_kg_collection"] = name
+                    out["shared_has_manual_override"] = has_override
+        except _sqlite3.Error:
+            return out
+    finally:
+        try:
+            conn.close()
+        except _sqlite3.Error:
+            pass
+
+    return out
+
+
 def _read_kg_collection_from_launcher_db(folder: Path) -> dict:
     """Look up `(primary_kg_collection, shared_kg_collection)` for the
     project at `folder` by reading the launcher.db `project_kg_bindings`
@@ -5863,30 +5971,70 @@ def _backfill_kg_collection_env_in_project(
     added: list[str] = []
     resolved: dict = {}
 
-    # KG_COLLECTION (primary) — derive only if missing.
+    # v0.2.30 fix: launcher.db's `project_kg_bindings` row is the
+    # canonical source of truth for KG_COLLECTION. When the user (or a
+    # prior migration) put a `manual_override` sentinel in the binding's
+    # config_json, that's a signal that the launcher's auto-seed default
+    # was overridden deliberately. In that case, ALSO correct an
+    # existing-but-stale env value — not just add missing keys. Without
+    # this, `install.py --update` can leave `env.KG_COLLECTION` pinned
+    # to the orchestrator-root default literal even when launcher.db
+    # says "the user picked something else", causing silent KG-search
+    # misroute. The Rust seed-guard already preserves the binding on
+    # boot; this completes the loop on the Python install side.
+    _db_override = _read_kg_binding_override(folder)
+
+    # KG_COLLECTION (primary) — fill if missing OR correct if launcher.db
+    # has a manual_override that differs.
+    db_primary = _db_override.get("primary_kg_collection")
+    has_manual_override_primary = _db_override.get("primary_has_manual_override", False)
     if "KG_COLLECTION" not in env:
-        db = _from_db()
-        if "primary_kg_collection" in db:
-            env["KG_COLLECTION"] = db["primary_kg_collection"]
+        if db_primary:
+            env["KG_COLLECTION"] = db_primary
         else:
-            env["KG_COLLECTION"] = f"{_derive_basename()}_KnowledgeGraph"
+            db = _from_db()
+            if "primary_kg_collection" in db:
+                env["KG_COLLECTION"] = db["primary_kg_collection"]
+            else:
+                env["KG_COLLECTION"] = f"{_derive_basename()}_KnowledgeGraph"
         added.append("KG_COLLECTION")
         resolved["KG_COLLECTION"] = env["KG_COLLECTION"]
+    elif has_manual_override_primary and db_primary and env["KG_COLLECTION"] != db_primary:
+        # Correct an existing wrong value: launcher.db has an explicit
+        # manual_override, settings.json env disagrees. Trust the DB.
+        env["KG_COLLECTION"] = db_primary
+        added.append("KG_COLLECTION (corrected)")
+        resolved["KG_COLLECTION"] = db_primary
 
     # SHARED_KG_COLLECTION — empty-string is a legitimate user choice.
     # Only add when the key is absent, not when it's "" (empty means
-    # "intentionally disabled cross-project fan-out").
+    # "intentionally disabled cross-project fan-out"). Same
+    # manual-override correction logic as primary.
+    db_shared = _db_override.get("shared_kg_collection")
+    has_manual_override_shared = _db_override.get("shared_has_manual_override", False)
     if "SHARED_KG_COLLECTION" not in env:
-        db = _from_db()
-        if "shared_kg_collection" in db:
-            env["SHARED_KG_COLLECTION"] = db["shared_kg_collection"]
+        if db_shared:
+            env["SHARED_KG_COLLECTION"] = db_shared
         else:
-            # No shared binding seeded — leave the cross-project gate
-            # closed by default. The user can flip it via the launcher's
-            # Identity tab → Manage shared KG collection.
-            env["SHARED_KG_COLLECTION"] = ""
+            db = _from_db()
+            if "shared_kg_collection" in db:
+                env["SHARED_KG_COLLECTION"] = db["shared_kg_collection"]
+            else:
+                # No shared binding seeded — leave the cross-project gate
+                # closed by default. The user can flip it via the launcher's
+                # Identity tab → Manage shared KG collection.
+                env["SHARED_KG_COLLECTION"] = ""
         added.append("SHARED_KG_COLLECTION")
         resolved["SHARED_KG_COLLECTION"] = env["SHARED_KG_COLLECTION"]
+    elif (
+        has_manual_override_shared
+        and db_shared
+        and env["SHARED_KG_COLLECTION"] != db_shared
+        and env["SHARED_KG_COLLECTION"] != ""  # respect user's explicit-disable
+    ):
+        env["SHARED_KG_COLLECTION"] = db_shared
+        added.append("SHARED_KG_COLLECTION (corrected)")
+        resolved["SHARED_KG_COLLECTION"] = db_shared
 
     # DEVELOPMENT_COLLECTION — derived by suffix swap from the primary.
     if "DEVELOPMENT_COLLECTION" not in env:
@@ -5898,6 +6046,23 @@ def _backfill_kg_collection_env_in_project(
         env["DEVELOPMENT_COLLECTION"] = dev_name
         added.append("DEVELOPMENT_COLLECTION")
         resolved["DEVELOPMENT_COLLECTION"] = dev_name
+    elif (
+        has_manual_override_primary
+        and db_primary
+        and env.get("KG_COLLECTION") == db_primary
+    ):
+        # KG_COLLECTION just got corrected from override; recompute the
+        # paired DEVELOPMENT_COLLECTION via suffix swap if it doesn't
+        # match the new primary's basename.
+        expected_dev = (
+            db_primary[: -len("_KnowledgeGraph")] + "_Development"
+            if db_primary.endswith("_KnowledgeGraph")
+            else None
+        )
+        if expected_dev and env.get("DEVELOPMENT_COLLECTION") != expected_dev:
+            env["DEVELOPMENT_COLLECTION"] = expected_dev
+            added.append("DEVELOPMENT_COLLECTION (corrected)")
+            resolved["DEVELOPMENT_COLLECTION"] = expected_dev
 
     if not added and not env_was_missing:
         result["action"] = "noop"
