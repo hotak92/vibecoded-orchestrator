@@ -121,6 +121,18 @@ def test_parse_name(matcher):
     assert matcher.parse_name("description: bar\n", "fallback") == "fallback"
 
 
+def test_parse_short_desc(matcher):
+    assert matcher.parse_short_desc("short_desc: hand-crafted hint\n") == "hand-crafted hint"
+    assert matcher.parse_short_desc('short_desc: "quoted hint"\n') == "quoted hint"
+    assert matcher.parse_short_desc("name: foo\ndescription: bar\n") == ""
+
+
+def test_parse_short_desc_ignored_when_nested(matcher):
+    # Same column-0 enforcement as parse_keywords.
+    fm = "metadata:\n  short_desc: nested\n"
+    assert matcher.parse_short_desc(fm) == ""
+
+
 # ---------------------------------------------------------------------------
 # Matching: case sensitivity + whole-word boundary
 # ---------------------------------------------------------------------------
@@ -186,44 +198,83 @@ def test_any_match(matcher):
 # ---------------------------------------------------------------------------
 
 
-def test_format_single_agent(matcher):
-    out = matcher.format_suggestion(["foo"], [])
-    assert out == "You might want to use this agent: foo"
+def test_format_single_agent_with_hint(matcher):
+    out = matcher.format_suggestion([("foo", "scope hint")], [])
+    assert out == "You might want to use this agent:\n- foo — scope hint"
 
 
-def test_format_two_agents(matcher):
-    out = matcher.format_suggestion(["foo", "bar"], [])
-    assert out == "You might want to use these agents: foo, bar"
+def test_format_single_agent_without_hint(matcher):
+    # Empty short_desc → no em-dash, just the name.
+    out = matcher.format_suggestion([("foo", "")], [])
+    assert out == "You might want to use this agent:\n- foo"
+
+
+def test_format_two_agents_mixed_hints(matcher):
+    out = matcher.format_suggestion(
+        [("foo", "first hint"), ("bar", "")], []
+    )
+    assert out == (
+        "You might want to use these agents:\n"
+        "- foo — first hint\n"
+        "- bar"
+    )
 
 
 def test_format_three_agents(matcher):
-    out = matcher.format_suggestion(["foo", "bar", "baz"], [])
-    assert out == "You might want to use these agents: foo, bar, baz"
+    out = matcher.format_suggestion(
+        [("a", "A hint"), ("b", "B hint"), ("c", "C hint")], []
+    )
+    assert out == (
+        "You might want to use these agents:\n"
+        "- a — A hint\n"
+        "- b — B hint\n"
+        "- c — C hint"
+    )
 
 
 def test_format_single_skill(matcher):
-    out = matcher.format_suggestion([], ["foo"])
-    assert out == "You might want to use this skill: foo"
+    out = matcher.format_suggestion([], [("foo", "skill hint")])
+    assert out == "You might want to use this skill:\n- foo — skill hint"
 
 
 def test_format_two_skills(matcher):
-    out = matcher.format_suggestion([], ["foo", "bar"])
-    assert out == "You might want to use these skills: foo, bar"
+    out = matcher.format_suggestion(
+        [], [("foo", "foo hint"), ("bar", "bar hint")]
+    )
+    assert out == (
+        "You might want to use these skills:\n"
+        "- foo — foo hint\n"
+        "- bar — bar hint"
+    )
 
 
 def test_format_combined_one_each(matcher):
-    out = matcher.format_suggestion(["agentA"], ["skillB"])
-    lines = out.splitlines()
-    assert len(lines) == 2
-    assert lines[0] == "You might want to use this agent: agentA"
-    assert lines[1] == "You might want to use this skill: skillB"
+    out = matcher.format_suggestion(
+        [("agentA", "agent hint")], [("skillB", "skill hint")]
+    )
+    # Two blocks separated by blank line.
+    assert out == (
+        "You might want to use this agent:\n"
+        "- agentA — agent hint\n"
+        "\n"
+        "You might want to use this skill:\n"
+        "- skillB — skill hint"
+    )
 
 
 def test_format_combined_plural(matcher):
-    out = matcher.format_suggestion(["a1", "a2"], ["s1", "s2"])
-    lines = out.splitlines()
-    assert lines[0] == "You might want to use these agents: a1, a2"
-    assert lines[1] == "You might want to use these skills: s1, s2"
+    out = matcher.format_suggestion(
+        [("a1", "a1 hint"), ("a2", "a2 hint")],
+        [("s1", "s1 hint"), ("s2", "s2 hint")],
+    )
+    blocks = out.split("\n\n")
+    assert len(blocks) == 2
+    assert blocks[0].startswith("You might want to use these agents:")
+    assert "- a1 — a1 hint" in blocks[0]
+    assert "- a2 — a2 hint" in blocks[0]
+    assert blocks[1].startswith("You might want to use these skills:")
+    assert "- s1 — s1 hint" in blocks[1]
+    assert "- s2 — s2 hint" in blocks[1]
 
 
 def test_format_empty(matcher):
@@ -257,10 +308,30 @@ def test_collect_agents_and_skills(tmp_path, matcher):
     agents = matcher.collect_agents(tmp_path)
     skills = matcher.collect_skills(tmp_path)
 
-    agent_names = {n for n, _ in agents}
-    skill_names = {n for n, _ in skills}
+    # Tuples are now (name, keywords, short_desc).
+    agent_names = {n for n, _, _ in agents}
+    skill_names = {n for n, _, _ in skills}
     assert agent_names == {"kubernetes-agent", "accessibility-checker"}
     assert skill_names == {"tdd-skill"}
+    # No short_desc in the test fixtures → empty string fallback.
+    for _, _, sd in agents:
+        assert sd == ""
+    for _, _, sd in skills:
+        assert sd == ""
+
+
+def test_collect_propagates_short_desc(tmp_path, matcher):
+    _write_agent(
+        tmp_path,
+        "k",
+        "k-agent",
+        "short_desc: review k8s manifests for safety\nkeywords: [Kubernetes]\n",
+    )
+    agents = matcher.collect_agents(tmp_path)
+    assert len(agents) == 1
+    name, _, sd = agents[0]
+    assert name == "k-agent"
+    assert sd == "review k8s manifests for safety"
 
 
 def test_missing_agents_dir_is_silent(tmp_path, matcher):
@@ -286,7 +357,7 @@ def test_agent_without_keywords_is_excluded(tmp_path, matcher):
     _write_agent(tmp_path, "no-kw", "no-kw-agent", "")
     _write_agent(tmp_path, "yes-kw", "yes-kw-agent", "keywords: [Bar]\n")
     agents = matcher.collect_agents(tmp_path)
-    names = {n for n, _ in agents}
+    names = {n for n, _, _ in agents}
     assert names == {"yes-kw-agent"}
 
 
@@ -310,11 +381,29 @@ def test_cli_no_matches_is_silent(tmp_path):
     assert result.stdout == ""
 
 
-def test_cli_one_agent_match(tmp_path):
+def test_cli_one_agent_match_no_short_desc(tmp_path):
+    # No short_desc → bullet renders as just `- name`.
     _write_agent(tmp_path, "k", "kubernetes-agent", "keywords: [Kubernetes, Helm]\n")
     result = _run_matcher_subprocess("review my Kubernetes manifest", tmp_path)
     assert result.returncode == 0
-    assert result.stdout.strip() == "You might want to use this agent: kubernetes-agent"
+    assert result.stdout.strip() == (
+        "You might want to use this agent:\n- kubernetes-agent"
+    )
+
+
+def test_cli_one_agent_match_with_short_desc(tmp_path):
+    _write_agent(
+        tmp_path,
+        "k",
+        "kubernetes-agent",
+        "short_desc: review k8s manifests for safety\nkeywords: [Kubernetes, Helm]\n",
+    )
+    result = _run_matcher_subprocess("review my Kubernetes manifest", tmp_path)
+    assert result.returncode == 0
+    assert result.stdout.strip() == (
+        "You might want to use this agent:\n"
+        "- kubernetes-agent — review k8s manifests for safety"
+    )
 
 
 def test_cli_two_agents_match(tmp_path):
@@ -322,10 +411,11 @@ def test_cli_two_agents_match(tmp_path):
     _write_agent(tmp_path, "h", "h-agent", "keywords: [Helm]\n")
     result = _run_matcher_subprocess("review my Kubernetes and Helm setup", tmp_path)
     assert result.returncode == 0
-    line = result.stdout.strip()
-    # Order follows directory iteration (sorted) — both agents must appear.
-    assert line.startswith("You might want to use these agents: ")
-    assert "k-agent" in line and "h-agent" in line
+    text = result.stdout.strip()
+    # Plural header + one bullet per agent (sorted order from glob).
+    assert text.startswith("You might want to use these agents:")
+    assert "- k-agent" in text
+    assert "- h-agent" in text
 
 
 def test_cli_combined_agent_and_skill(tmp_path):
@@ -333,10 +423,14 @@ def test_cli_combined_agent_and_skill(tmp_path):
     _write_skill(tmp_path, "tdd", "tdd-skill", "keywords: [TDD]\n")
     result = _run_matcher_subprocess("apply TDD to my Kubernetes manifest", tmp_path)
     assert result.returncode == 0
-    lines = result.stdout.strip().splitlines()
-    assert len(lines) == 2
-    assert "k-agent" in lines[0] and "agent" in lines[0]
-    assert "tdd-skill" in lines[1] and "skill" in lines[1]
+    text = result.stdout.strip()
+    # Two blocks separated by a blank line.
+    blocks = text.split("\n\n")
+    assert len(blocks) == 2
+    assert blocks[0].startswith("You might want to use this agent:")
+    assert "- k-agent" in blocks[0]
+    assert blocks[1].startswith("You might want to use this skill:")
+    assert "- tdd-skill" in blocks[1]
 
 
 def test_cli_empty_prompt_is_silent(tmp_path):

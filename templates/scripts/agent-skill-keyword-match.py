@@ -8,16 +8,23 @@ and `.claude/skills/*/SKILL.md` files, parses their YAML frontmatter for a
 `keywords:` list, and prints a short sentence-cased suggestion when any
 keyword matches the prompt (case-sensitive whole-word).
 
-The suggestion shape is:
+The suggestion shape is a bullet list with one line per match, optionally
+followed by a short `short_desc:` hint after an em-dash separator:
 
-    You might want to use this agent: foo
-    You might want to use these agents: foo, bar
-    You might want to use this skill: baz
-    You might want to use these skills: baz, qux
+    You might want to use this agent:
+    - foo — short scope hint from foo's frontmatter
 
-Singular/plural agreement is exact. Agent matches and skill matches are
-emitted on separate lines (one line per category). When nothing matches
-the script is silent (empty stdout). It always exits 0.
+    You might want to use these skills:
+    - baz — short scope hint
+    - qux — another short scope hint
+
+Singular/plural agreement is exact ("this agent" vs "these agents"). Agent
+matches and skill matches are emitted as separate bullet groups, with a
+blank line between groups when both are present. When nothing matches the
+script is silent (empty stdout). It always exits 0.
+
+An item without a `short_desc:` field renders as just its name (no em-dash,
+no hint) — the hook degrades gracefully on older catalogs.
 
 Filesystem contract: the hook side knows NOTHING about the launcher DB
 or any `.disabled/` mechanism. A file's presence under `.claude/agents/`
@@ -179,6 +186,7 @@ def parse_keywords(frontmatter: str) -> list[str]:
 
 
 _NAME_LINE = re.compile(r"^name\s*:\s*(.*?)\s*$")
+_SHORT_DESC_LINE = re.compile(r"^short_desc\s*:\s*(.*?)\s*$")
 
 
 def parse_name(frontmatter: str, fallback: str) -> str:
@@ -191,6 +199,17 @@ def parse_name(frontmatter: str, fallback: str) -> str:
                 if value:
                     return value
     return fallback
+
+
+def parse_short_desc(frontmatter: str) -> str:
+    """Return the top-level `short_desc:` value, or "" if absent."""
+    for line in frontmatter.splitlines():
+        if line and line[0] not in (" ", "\t"):
+            m = _SHORT_DESC_LINE.match(line)
+            if m:
+                value = _strip_quotes(m.group(1))
+                return value
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -256,12 +275,12 @@ def _read_file(path: Path) -> str | None:
         return None
 
 
-def collect_agents(root: Path) -> list[tuple[str, list[str]]]:
-    """Return [(display_name, keywords), ...] for every agent file with keywords."""
+def collect_agents(root: Path) -> list[tuple[str, list[str], str]]:
+    """Return [(display_name, keywords, short_desc), ...] for every agent file with keywords."""
     agents_dir = root / ".claude" / "agents"
     if not agents_dir.is_dir():
         return []
-    out: list[tuple[str, list[str]]] = []
+    out: list[tuple[str, list[str], str]] = []
     try:
         candidates = sorted(p for p in agents_dir.glob("*.md") if p.is_file())
     except OSError:
@@ -280,16 +299,17 @@ def collect_agents(root: Path) -> list[tuple[str, list[str]]]:
         if not keywords:
             continue
         display = parse_name(fm, fallback=path.stem)
-        out.append((display, keywords))
+        short_desc = parse_short_desc(fm)
+        out.append((display, keywords, short_desc))
     return out
 
 
-def collect_skills(root: Path) -> list[tuple[str, list[str]]]:
-    """Return [(display_name, keywords), ...] for every SKILL.md with keywords."""
+def collect_skills(root: Path) -> list[tuple[str, list[str], str]]:
+    """Return [(display_name, keywords, short_desc), ...] for every SKILL.md with keywords."""
     skills_dir = root / ".claude" / "skills"
     if not skills_dir.is_dir():
         return []
-    out: list[tuple[str, list[str]]] = []
+    out: list[tuple[str, list[str], str]] = []
     try:
         subdirs = sorted(p for p in skills_dir.iterdir() if p.is_dir())
     except OSError:
@@ -311,7 +331,8 @@ def collect_skills(root: Path) -> list[tuple[str, list[str]]]:
         if not keywords:
             continue
         display = parse_name(fm, fallback=sub.name)
-        out.append((display, keywords))
+        short_desc = parse_short_desc(fm)
+        out.append((display, keywords, short_desc))
     return out
 
 
@@ -320,26 +341,39 @@ def collect_skills(root: Path) -> list[tuple[str, list[str]]]:
 # ---------------------------------------------------------------------------
 
 
-def format_suggestion(matched_agents: list[str], matched_skills: list[str]) -> str:
-    """Format the sentence-cased suggestion message.
+def _bullet(name: str, short_desc: str) -> str:
+    """Format one bullet line. `- name — hint` if hint present, else `- name`."""
+    if short_desc:
+        return f"- {name} — {short_desc}"
+    return f"- {name}"
 
-    Singular/plural agreement; no cap on match count. Returns "" when
-    both lists are empty.
+
+def format_suggestion(
+    matched_agents: list[tuple[str, str]],
+    matched_skills: list[tuple[str, str]],
+) -> str:
+    """Format the bullet-list suggestion message.
+
+    Inputs are lists of (display_name, short_desc) tuples. Singular/plural
+    agreement on the header line ("this agent" vs "these agents"). Each
+    match renders on its own line as `- name — short_desc` (or `- name`
+    if no short_desc). A blank line separates the agents and skills groups
+    when both are present. Returns "" when both lists are empty.
     """
-    lines: list[str] = []
+    blocks: list[str] = []
     if matched_agents:
-        if len(matched_agents) == 1:
-            lines.append(f"You might want to use this agent: {matched_agents[0]}")
-        else:
-            joined = ", ".join(matched_agents)
-            lines.append(f"You might want to use these agents: {joined}")
+        header = "this agent" if len(matched_agents) == 1 else "these agents"
+        lines = [f"You might want to use {header}:"]
+        for name, sd in matched_agents:
+            lines.append(_bullet(name, sd))
+        blocks.append("\n".join(lines))
     if matched_skills:
-        if len(matched_skills) == 1:
-            lines.append(f"You might want to use this skill: {matched_skills[0]}")
-        else:
-            joined = ", ".join(matched_skills)
-            lines.append(f"You might want to use these skills: {joined}")
-    return "\n".join(lines)
+        header = "this skill" if len(matched_skills) == 1 else "these skills"
+        lines = [f"You might want to use {header}:"]
+        for name, sd in matched_skills:
+            lines.append(_bullet(name, sd))
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
 
 
 # ---------------------------------------------------------------------------
@@ -361,14 +395,14 @@ def main() -> int:
     except Exception:
         return 0
 
-    matched_agents: list[str] = []
-    for name, keywords in agents:
+    matched_agents: list[tuple[str, str]] = []
+    for name, keywords, short_desc in agents:
         if any_match(keywords, prompt):
-            matched_agents.append(name)
-    matched_skills: list[str] = []
-    for name, keywords in skills:
+            matched_agents.append((name, short_desc))
+    matched_skills: list[tuple[str, str]] = []
+    for name, keywords, short_desc in skills:
         if any_match(keywords, prompt):
-            matched_skills.append(name)
+            matched_skills.append((name, short_desc))
 
     message = format_suggestion(matched_agents, matched_skills)
     if message:
