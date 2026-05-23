@@ -1,7 +1,7 @@
 ---
 name: backend-specialist
 description: Backend implementation - APIs, services, databases, business logic
-keywords: ["REST API", microservice, ORM, "SQL migration", "auth middleware", FastAPI, SQLAlchemy]
+keywords: ["REST API", microservice, ORM, "SQL migration", "auth middleware", FastAPI, SQLAlchemy, "API authentication", "API integration", "SQL injection"]
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
 effort: high

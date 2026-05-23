@@ -1,7 +1,7 @@
 ---
 name: extract-docs
 description: Systematically extract knowledge from scattered documentation to prevent catastrophic forgetting. Creates structured extraction reports with status tags.
-keywords: [documentation extraction, catastrophic forgetting, status tags, scattered docs, before archiving]
+keywords: [documentation extraction, catastrophic forgetting, status tags, scattered docs, before archiving, "scattered documentation", "knowledge extraction", "before archival"]
 argument-hint: "[source-path-or-pattern]"
 tools: Read, Write, Grep, Glob, Bash, Task
 model: sonnet

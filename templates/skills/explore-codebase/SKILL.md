@@ -1,7 +1,7 @@
 ---
 name: explore-codebase
 description: Systematic codebase onboarding. Builds a mental model of a new or unfamiliar project by exploring structure, architecture, key data models, entry points, and auth patterns.
-keywords: ["unfamiliar codebase", "codebase onboarding", "architectural overview", "entry point", "new project"]
+keywords: ["unfamiliar codebase", "codebase onboarding", "architectural overview", "entry point", "new project", "codebase audit"]
 argument-hint: "[project-path-or-question]"
 model: sonnet
 ---

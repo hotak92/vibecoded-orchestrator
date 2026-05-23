@@ -1,7 +1,7 @@
 ---
 name: ai-llm-expert
 description: LLM integration specialist - prompts, context, caching, routing, cost optimization
-keywords: [prompt caching, context window, multi-model routing, LLM cost, Anthropic SDK, semantic caching]
+keywords: [prompt caching, context window, multi-model routing, LLM cost, Anthropic SDK, semantic caching, "prompt review", "token budget"]
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
 effort: xhigh

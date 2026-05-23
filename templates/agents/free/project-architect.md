@@ -1,7 +1,7 @@
 ---
 name: project-architect
 description: End-to-end project design with requirements, architecture, and implementation plan
-keywords: [end-to-end design, tech stack selection, system architecture, implementation plan, multi-component]
+keywords: [end-to-end design, tech stack selection, system architecture, implementation plan, multi-component, "system design", "requirements analysis"]
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
 effort: xhigh

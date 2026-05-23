@@ -1,7 +1,7 @@
 ---
 name: architecture-consultant
 description: Expert guidance on cross-domain architecture decisions, technology selection, and infrastructure design requiring deep analysis of tradeoffs and long-term implications
-keywords: [technology selection, infrastructure design, cross-domain architecture, migration strategy, cloud vs on-prem]
+keywords: [technology selection, infrastructure design, cross-domain architecture, migration strategy, cloud vs on-prem, "system design", "tradeoff analysis", "architecture decisions"]
 model: opus
 ---
 

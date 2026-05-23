@@ -1,7 +1,7 @@
 ---
 name: security-reviewer
 description: Cross-layer security analysis (frontend XSS/CSRF, backend injection, AI prompt injection, infrastructure)
-keywords: [XSS, CSRF, SQL injection, prompt injection, security review, OWASP]
+keywords: [XSS, CSRF, SQL injection, prompt injection, security review, OWASP, "code review", "security audit", "pre-release review", "API authentication"]
 model: opus
 ---
 

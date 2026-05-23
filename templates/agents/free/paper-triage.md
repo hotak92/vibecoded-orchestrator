@@ -1,7 +1,7 @@
 ---
 name: paper-triage
 description: Triages a folder of PDFs into a structured table - extracts method, dataset, sample size, effect size, claim, and supporting figure - and flags claims that aren't supported by the paper's own data
-keywords: [paper triage, systematic review, PDF extraction, effect size, sample size, supporting figure]
+keywords: [paper triage, systematic review, PDF extraction, effect size, sample size, supporting figure, "LLM extraction"]
 tools: Read, Write, Edit, Glob, Grep, Bash, WebSearch
 model: opus
 effort: high

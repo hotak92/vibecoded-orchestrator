@@ -1,7 +1,7 @@
 ---
 name: tester
 description: Test creation, verification, bug investigation with quality review
-keywords: [pytest, "test coverage", "unit test", "integration test", "edge case", "regression test"]
+keywords: [pytest, "test coverage", "unit test", "integration test", "edge case", "regression test", "flaky test", "failing test first", test-driven]
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
 effort: high

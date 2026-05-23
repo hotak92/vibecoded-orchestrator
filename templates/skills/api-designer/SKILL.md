@@ -1,7 +1,7 @@
 ---
 name: api-designer
 description: Expert guidance on API design including REST vs GraphQL vs gRPC selection, endpoint patterns, authentication strategies, and versioning
-keywords: [REST vs GraphQL, gRPC, endpoint design, API versioning, API authentication]
+keywords: [REST vs GraphQL, gRPC, endpoint design, API versioning, API authentication, "REST API", OpenAPI]
 model: sonnet
 ---
 

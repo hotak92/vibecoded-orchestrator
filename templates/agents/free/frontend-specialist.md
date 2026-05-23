@@ -1,7 +1,7 @@
 ---
 name: frontend-specialist
 description: Frontend implementation - React, Vue, UI components, client-side logic
-keywords: [React, Vue, Svelte, JSX, "component library", "CSS-in-JS", Tailwind]
+keywords: [React, Vue, Svelte, JSX, "component library", "CSS-in-JS", Tailwind, XSS, "UI design"]
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
 effort: high

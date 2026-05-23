@@ -1,7 +1,7 @@
 ---
 name: ai-rag-advisor
 description: Expert guidance on RAG (Retrieval-Augmented Generation) system design including chunking strategies, embedding selection, retrieval methods, and vector database choices
-keywords: [RAG, chunking, vector database, retrieval, reranker, GraphRAG]
+keywords: [RAG, chunking, vector database, retrieval, reranker, GraphRAG, "embedding model"]
 model: sonnet
 ---
 

@@ -1,7 +1,7 @@
 ---
 name: performance-optimizer
 description: Cross-domain performance analysis and optimization guidance (frontend render, backend queries, AI model inference)
-keywords: [performance optimization, render performance, query optimization, inference latency, bottleneck]
+keywords: [performance optimization, render performance, query optimization, inference latency, bottleneck, "query performance"]
 model: sonnet
 ---
 

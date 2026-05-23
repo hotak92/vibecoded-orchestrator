@@ -1,7 +1,7 @@
 ---
 name: project-coordinator
 description: Coordinate multi-agent workflows and track progress
-keywords: [multi-agent coordination, dependency tracking, blocker resolution, parallel execution, progress tracking]
+keywords: [multi-agent coordination, dependency tracking, blocker resolution, parallel execution, progress tracking, multi-agent]
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
 effort: high
