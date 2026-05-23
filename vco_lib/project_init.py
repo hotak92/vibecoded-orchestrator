@@ -7015,6 +7015,133 @@ def _cmd_install_bundle(args: argparse.Namespace) -> int:
     return 1 if result["errors"] else 0
 
 
+def _cmd_dismiss_deferral(args: argparse.Namespace) -> int:
+    """`dismiss-deferral --folder <path> --condition-id <id> [--json]`
+
+    Remove the deferral entry whose `condition_id` matches `<id>` from
+    `<folder>/.claude/context/UPDATE_DEFERRED.md`. Idempotent: re-running
+    on an already-dismissed entry (or against a non-existent deferrals
+    file) silently succeeds with exit 0.
+
+    Used by the user (or a future launcher GUI button) to silence a
+    deferral whose condition cannot be auto-resolved by re-running
+    `install-bundle --update --force`. The four emission sites in this
+    module (`bundle_user_modified_preserved`, `bundle_skipped_existing_files`,
+    `template_review_pending`, plus any future ones) all reference this
+    subcommand in the `command_to_apply` text they print.
+
+    Exit codes:
+      0 — happy path (entry removed) OR idempotent no-op (no file / no
+          matching entry).
+      1 — file exists but is structurally malformed (cannot parse).
+      2 — argparse / invalid input (handled by argparse itself).
+
+    JSON stdout schema (when `--json` is set):
+      {"dismissed": true|false,
+       "condition_id": "<id>",
+       "remaining": <int — entries still on disk after the call>,
+       "reason": "<optional context: no_deferrals_file | no_match | dismissed>"}
+
+    Stderr is reserved for human-readable status lines:
+      "dismissed <condition_id>" — entry was present and removed.
+      "no matching deferral"     — entry not present (idempotent path).
+    """
+    folder = Path(args.folder).resolve()
+    condition_id = args.condition_id
+
+    from vco_lib.deferral_report import DeferralReport, _DEFERRED_REL
+
+    target = folder / _DEFERRED_REL
+
+    # Edge case: file doesn't exist. Idempotent no-op.
+    if not target.exists():
+        payload = {
+            "dismissed": False,
+            "condition_id": condition_id,
+            "remaining": 0,
+            "reason": "no_deferrals_file",
+        }
+        if args.json:
+            print(json.dumps(payload))
+        else:
+            print("no matching deferral", file=sys.stderr)
+        return 0
+
+    # Edge case: file exists but is unreadable (permissions, non-UTF-8,
+    # OS-level I/O error). Surface as exit 1 rather than swallowing.
+    try:
+        raw_text = target.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        print(
+            f"error: failed to read {target}: {type(e).__name__}: {e}",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Detect structural malformation: a non-empty file with frontmatter
+    # claiming condition_ids exist, yet the body parses to zero entries.
+    # `DeferralReport.read()` itself is defensive (returns an empty
+    # report on garbage input), so we hand-roll this drift check —
+    # otherwise a corrupted file would silently appear "already
+    # dismissed" and the user would lose data without warning.
+    try:
+        report = DeferralReport.read(folder)
+    except Exception as e:
+        # Belt-and-braces: defensive parser shouldn't raise, but catch
+        # anyway so a future regression doesn't bring down the caller.
+        print(
+            f"error: failed to parse {target}: {type(e).__name__}: {e}",
+            file=sys.stderr,
+        )
+        return 1
+
+    if raw_text.strip() and not report.entries:
+        from vco_lib.deferral_report import _parse_frontmatter
+
+        fm = _parse_frontmatter(raw_text)
+        fm_ids = fm.get("condition_ids") or []
+        if fm_ids:
+            print(
+                f"error: malformed deferral file {target}: frontmatter "
+                f"lists condition_ids={fm_ids!r} but no parseable entry "
+                f"sections were found",
+                file=sys.stderr,
+            )
+            return 1
+
+    # Happy path or no-match (both exit 0).
+    had_entry = report.has_condition(condition_id)
+    if not had_entry:
+        payload = {
+            "dismissed": False,
+            "condition_id": condition_id,
+            "remaining": len(report.entries),
+            "reason": "no_match",
+        }
+        if args.json:
+            print(json.dumps(payload))
+        else:
+            print("no matching deferral", file=sys.stderr)
+        return 0
+
+    report.mark_resolved(condition_id)
+    # `report.write` deletes the file when the entry list is empty and
+    # strips the CLAUDE.md reminder block — both desired here.
+    report.write(folder)
+
+    payload = {
+        "dismissed": True,
+        "condition_id": condition_id,
+        "remaining": len(report.entries),
+        "reason": "dismissed",
+    }
+    if args.json:
+        print(json.dumps(payload))
+    else:
+        print(f"dismissed {condition_id}", file=sys.stderr)
+    return 0
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m vco_lib.project_init",
@@ -7207,6 +7334,32 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Emit a single JSON object on stdout.",
     )
     p_bundle.set_defaults(func=_cmd_install_bundle)
+
+    # dismiss-deferral (v0.2.31 #21) -------------------------------------
+    p_dismiss = sub.add_parser(
+        "dismiss-deferral",
+        help=(
+            "Remove a single deferral entry from "
+            "<folder>/.claude/context/UPDATE_DEFERRED.md. Idempotent: "
+            "missing file or no-matching-entry exit 0. Referenced by the "
+            "four deferral-emission sites in this module."
+        ),
+    )
+    p_dismiss.add_argument(
+        "--folder", required=True,
+        help="Target user-project folder (must contain the .claude/ tree).",
+    )
+    p_dismiss.add_argument(
+        "--condition-id", required=True, dest="condition_id",
+        help="The deferral entry's condition_id field — e.g. "
+             "'bundle_user_modified_preserved', 'template_review_pending'.",
+    )
+    p_dismiss.add_argument(
+        "--json", action="store_true",
+        help="Emit a single JSON object on stdout (default: human prose "
+             "on stderr).",
+    )
+    p_dismiss.set_defaults(func=_cmd_dismiss_deferral)
 
     return parser
 
