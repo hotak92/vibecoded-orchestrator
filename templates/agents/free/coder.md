@@ -1,6 +1,7 @@
 ---
 name: coder
 description: Writes clean, explicit, production-ready code following specifications and leveraging proven patterns
+keywords: [implement, implement this, write the code, "production-ready", boilerplate]
 tools: Read, Write, Edit, Grep, Glob, Bash
 model: sonnet
 effort: high

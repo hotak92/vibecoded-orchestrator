@@ -1,6 +1,7 @@
 ---
 name: fix-issue
 description: Investigate and fix a GitHub issue or bug report. Reads the issue, reproduces it, identifies root cause, implements fix, adds regression test.
+keywords: ["GitHub issue", "bug report", "regression test", "root cause", "fix bug"]
 argument-hint: "[issue-url-or-description]"
 model: sonnet
 ---
