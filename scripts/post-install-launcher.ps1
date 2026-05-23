@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: AGPL-3.0-or-later
+﻿# SPDX-License-Identifier: AGPL-3.0-or-later
 #
 # post-install-launcher.ps1 — Windows parity helper for the desktop icon
 # step of install.py / first-install.bat.
