@@ -1,6 +1,7 @@
 ---
 name: orchestrator-installer
 description: Installs VibeCoded Orchestrator workflow system on new machines with all shared infrastructure
+short_desc: installs VCO workflow on new machines
 keywords: [fresh machine, new machine install, install Orchestrator, cross-platform setup, Weaviate Ollama, "install VCO", "install on new machine", "set up VCO", "VCO install", "install orchestrator"]
 tools: Read, Write, Edit, Bash, Glob
 model: opus
