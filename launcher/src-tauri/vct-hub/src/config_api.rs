@@ -53,6 +53,8 @@
 //! This is distinct from `500 internal_error` (unexpected DB
 //! failure, not user-fixable).
 
+use std::path::{Path as StdPath, PathBuf};
+
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -217,6 +219,22 @@ struct ProjectConfigResponse {
     ollama_url: String,
     grpc_port: u16,
     shared_kg_write_disabled: bool,
+    /// v0.2.31 — absolute path to Claude Code's per-workspace session-
+    /// transcript directory (``~/.claude/projects/<slug>/``). The
+    /// launcher computes this once from ``projects.folder_path`` using
+    /// :func:`claude_session_dir_for` (canonical slug rule). Consumers
+    /// that need to find Claude's session-jsonl files for a workspace
+    /// (e.g. the RL citation-monitor in ``claude_mcp_servers/
+    /// weaviate_mcp/server.py``) read this field rather than re-
+    /// implementing the slug rule inline.
+    ///
+    /// The directory may not exist on disk yet for a fresh workspace
+    /// that hasn't been opened in Claude Code — consumers must check
+    /// ``Path::exists`` themselves. Additive field — pre-v0.2.31
+    /// clients see an unknown field and ignore it. See
+    /// ``knowledge/concepts/launcher-as-router.md`` for the broader
+    /// "launcher-is-source-of-truth" pattern.
+    claude_session_dir: String,
     /// v0.2.22 Item #13 — global retrieval thresholds. Sourced from
     /// `<vct_root_dir>/retrieval-tuning.toml` (written by the launcher
     /// GUI's Retrieval Tuning panel). The nested object keeps the
@@ -449,6 +467,15 @@ async fn project_config(
     // → calibrated defaults; never errors the resolver out.
     let retrieval_tuning = read_tuning();
 
+    // 11. Claude session-transcript directory (v0.2.31). Computed from
+    // the canonical (post-dunce-canonicalisation) project_path. Pure
+    // function — the slug rule mirrors Anthropic's Claude Code rule:
+    // `/` + `_` + `.` → `-`. See `claude_session_dir_for` doc-comment
+    // for the rationale + open questions (space / unicode).
+    let claude_session_dir = claude_session_dir_for(StdPath::new(&project_path))
+        .to_string_lossy()
+        .into_owned();
+
     let response = ProjectConfigResponse {
         schema_version: RESOLVER_PROTOCOL_VERSION,
         project_id: project.id.clone(),
@@ -471,6 +498,7 @@ async fn project_config(
         ollama_url,
         grpc_port,
         shared_kg_write_disabled,
+        claude_session_dir,
         retrieval_tuning,
     };
 
@@ -557,6 +585,45 @@ fn list_codegraph_grantor_slugs_for_grantee(
         .map_err(|e| format!("query list_codegraph_grantor_slugs: {}", e))?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("collect list_codegraph_grantor_slugs: {}", e))
+}
+
+/// Compute Claude Code's session-jsonl directory for a workspace.
+///
+/// Rust counterpart of :func:`vco_lib.project_config.claude_session_dir_for`.
+/// Both implementations MUST stay in lock-step — drift would mean a
+/// hub-resolved value disagrees with the MCP fallback, defeating the
+/// purpose of routing the lookup through the hub in the first place.
+///
+/// Verified rule (against ``~/.claude/projects/`` on Linux, 2026-05-23,
+/// against Claude Code 2.1.143):
+///
+///   * ``/`` → ``-``  (path separator)
+///   * ``_`` → ``-``  (e.g. ``VCO_dev`` → ``VCO-dev``)
+///   * ``.`` → ``-``  (e.g. ``.claude/worktrees`` → ``-claude-worktrees``)
+///
+/// Returns ``~/.claude/projects/<slug>/`` as a ``PathBuf``. The returned
+/// path may not exist on disk yet for a fresh workspace; callers must
+/// check ``Path::exists`` themselves.
+///
+/// Uses the same ``directories::UserDirs`` HOME-resolution pattern as
+/// `vct_launcher_core::paths::vct_root_dir` (cross-OS). If that
+/// returns ``None`` (no home directory configured — extremely rare;
+/// only happens in stripped-down container envs), the helper returns
+/// a relative path under ``.claude/projects/`` so the resolver still
+/// emits a non-empty value rather than panicking.
+fn claude_session_dir_for(workspace_path: &StdPath) -> PathBuf {
+    let workspace_str = workspace_path.to_string_lossy();
+    let slug: String = workspace_str
+        .chars()
+        .map(|c| match c {
+            '/' | '_' | '.' => '-',
+            other => other,
+        })
+        .collect();
+    let home = directories::UserDirs::new()
+        .map(|d| d.home_dir().to_path_buf())
+        .unwrap_or_else(|| PathBuf::from(""));
+    home.join(".claude").join("projects").join(slug)
 }
 
 /// Inline ASCII-safe slug → class-prefix sanitiser.
@@ -713,6 +780,95 @@ mod tests {
             Some(first) => first.to_ascii_uppercase().to_string() + c.as_str(),
             None => String::new(),
         }
+    }
+
+    #[test]
+    fn claude_session_dir_handles_underscores() {
+        // v0.2.31 regression test: the citation-monitor bug was caused
+        // by an inline slug computation that only handled `/` → `-`.
+        // Claude Code's actual rule ALSO converts `_` (and `.`) → `-`.
+        // Underscored workspace paths (VCO_dev, AI_hive) were the
+        // root cause of the 97.7% orphan-citation rate.
+        let p = StdPath::new("/home/user/Desktop/PROGETTI/VCO_dev");
+        let dir = claude_session_dir_for(p);
+        assert_eq!(
+            dir.file_name().unwrap().to_str().unwrap(),
+            "-home-user-Desktop-PROGETTI-VCO-dev",
+            "slug must replace both '/' and '_' with '-'",
+        );
+
+        let p2 = StdPath::new("/home/user/Desktop/PROGETTI/AI_hive");
+        let dir2 = claude_session_dir_for(p2);
+        assert_eq!(
+            dir2.file_name().unwrap().to_str().unwrap(),
+            "-home-user-Desktop-PROGETTI-AI-hive",
+        );
+    }
+
+    #[test]
+    fn claude_session_dir_passthrough_without_underscores() {
+        // Workspaces without underscores already worked in the pre-fix
+        // implementation. Pin the non-regression to ensure the new
+        // helper's behaviour matches the old inline string-replace for
+        // the cases that were never broken.
+        let p = StdPath::new("/home/user/Desktop/PROGETTI/vibecoded-orchestrator");
+        let dir = claude_session_dir_for(p);
+        assert_eq!(
+            dir.file_name().unwrap().to_str().unwrap(),
+            "-home-user-Desktop-PROGETTI-vibecoded-orchestrator",
+        );
+    }
+
+    #[test]
+    fn claude_session_dir_handles_dots() {
+        // Verified against `~/.claude/projects/` on Linux: worktree
+        // paths under `.claude/` are stored with `.` → `-` substitution
+        // (e.g. `/home/u/VCO_dev/.claude/worktrees/foo` becomes
+        // `-home-u-VCO-dev--claude-worktrees-foo`). The double-dash is
+        // a natural consequence of the rule, not a separate special-case.
+        let p = StdPath::new("/home/u/VCO_dev/.claude/worktrees/foo");
+        let dir = claude_session_dir_for(p);
+        assert_eq!(
+            dir.file_name().unwrap().to_str().unwrap(),
+            "-home-u-VCO-dev--claude-worktrees-foo",
+        );
+    }
+
+    #[tokio::test]
+    async fn config_response_carries_claude_session_dir_field() {
+        // v0.2.31 — every successful resolver response MUST carry the
+        // `claude_session_dir` field so the RL citation-monitor (and
+        // future consumers) can look up Claude's session-transcript
+        // directory without re-implementing the slug rule.
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-session", "myproject");
+
+        let resp = reqwest::get(format!("{}/projects/p-session/config", base))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+
+        let csd = body
+            .get("claude_session_dir")
+            .and_then(|v| v.as_str())
+            .expect("claude_session_dir present and is string");
+
+        // The seed inserts folder_path = "/tmp/test-config-project-p-session".
+        // Verify the value contains the underscore-substituted slug
+        // (`p_session` doesn't appear because the seeded folder has a `-`,
+        // not `_`, but the trailing path component is exercised end-to-end).
+        assert!(
+            csd.ends_with("-tmp-test-config-project-p-session"),
+            "expected slug ending with '-tmp-test-config-project-p-session', got: {}",
+            csd,
+        );
+        // And it must be anchored under .claude/projects/.
+        assert!(
+            csd.contains(".claude") || csd.contains(".claude/projects"),
+            "expected path under .claude/projects/, got: {}",
+            csd,
+        );
     }
 
     #[test]

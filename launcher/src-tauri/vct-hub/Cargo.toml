@@ -59,6 +59,13 @@ toml = "0.9"
 # rely on re-export through core's public API.
 dunce = "1"
 
+# Cross-OS HOME directory resolution. config_api.rs uses this in
+# `claude_session_dir_for` (v0.2.31) to compute Claude Code's session-
+# transcript directory for each project. Same crate already used by
+# vct-launcher-core::paths::vct_root_dir; declared here so the hub
+# doesn't rely on re-export through core's public API.
+directories = "6"
+
 # Logging (println for v0.2.21 minimal stub; structured logging is a v0.2.22 followup)
 
 # Random for hub auth tokens (will reuse the same posture as the in-launcher hub)

@@ -271,6 +271,17 @@ class ProjectConfig:
     ollama_url: str
     grpc_port: int
     shared_kg_write_disabled: bool
+    #: Absolute path to Claude Code's per-workspace session-jsonl
+    #: directory (``~/.claude/projects/<slug>/``). New in v0.2.31. Used
+    #: by the RL citation-monitor in the weaviate MCP to find Claude's
+    #: session transcripts for the active workspace. The hub computes
+    #: this via :func:`claude_session_dir_for` so the slug rule lives
+    #: in exactly one place rather than drifting between inline copies.
+    #: Pre-v0.2.31 hubs paired with v0.2.31+ clients omit the field;
+    #: the parser back-fills with an empty string in that case so old
+    #: hubs don't crash new clients (the MCP fallback path covers the
+    #: empty-string sentinel by recomputing locally).
+    claude_session_dir: str = ""
     #: Global retrieval tuning thresholds (v0.2.22 Item #13). Absent in
     #: pre-v0.2.22 hub responses; defaults to calibrated values when
     #: missing so old hubs paired with new clients don't crash. The
@@ -688,6 +699,10 @@ def _from_hub_body(body: dict[str, Any]) -> ProjectConfig:
             ollama_url=str(body["ollama_url"]),
             grpc_port=int(body["grpc_port"]),
             shared_kg_write_disabled=bool(body["shared_kg_write_disabled"]),
+            # v0.2.31 additive field — pre-v0.2.31 hubs omit it. Empty
+            # string sentinel keeps the dataclass shape stable and
+            # signals "compute locally" to MCP consumers.
+            claude_session_dir=str(body.get("claude_session_dir", "")),
             retrieval_tuning=retrieval_tuning,
             schema_version=schema_version,
         )
@@ -869,6 +884,60 @@ def resolve_field(
     )
 
 
+# ─── Public: claude_session_dir_for() — slug rule (v0.2.31) ─────────────
+
+
+def claude_session_dir_for(workspace_path: Path) -> Path:
+    """Compute Claude Code's session-jsonl directory for a workspace.
+
+    Claude Code stores per-workspace session transcripts under
+    ``~/.claude/projects/<slug>/``, where ``<slug>`` is derived from the
+    workspace's absolute path by replacing certain characters with ``-``.
+
+    Verified rule (against ``~/.claude/projects/`` listings on Linux as
+    of 2026-05-23, against Claude Code 2.1.143):
+
+    * ``/`` → ``-``  (path separator)
+    * ``_`` → ``-``  (e.g. ``VCO_dev`` → ``VCO-dev``)
+    * ``.`` → ``-``  (e.g. ``.claude/worktrees`` → ``-claude-worktrees``)
+
+    This function is THE source of truth for the slug rule on the
+    Python side: MCPs and other consumers should call this helper (or
+    route through ``vct-hub`` which calls it internally) rather than
+    re-implementing the rule inline. Inline copies have drifted in the
+    past — most recently the RL citation-monitor at
+    ``claude_mcp_servers/weaviate_mcp/server.py`` only handled ``/`` →
+    ``-``, causing zero-citation telemetry on workspaces whose absolute
+    paths contained underscores (``VCO_dev``, ``AI_hive``, …). This
+    helper exists so the rule lives in exactly one place.
+
+    The spec requires AT MINIMUM ``/`` + ``_`` → ``-`` to fix the
+    observed v0.2.31 bug. We also include ``.`` because empirical
+    inspection of ``~/.claude/projects/`` shows Claude Code applies
+    that substitution too (worktree paths under ``.claude/`` would
+    otherwise look at ``-home-…-.claude-…`` which doesn't exist on
+    disk — Claude writes them under ``…--claude-…``).
+
+    Open questions for future verification (worth confirming when
+    Anthropic ever documents this contract):
+
+    * Space (`` `` → ``-``?) — almost certainly yes; user workspaces
+      with spaces would otherwise be broken.
+    * Unicode — likely passed through verbatim or NFKC-normalised,
+      not currently exercised by any test fixture.
+
+    :param workspace_path: Absolute path to the workspace root. Not
+        canonicalised here — callers that want symlink resolution
+        should pass ``workspace_path.resolve()``.
+    :return: ``~/.claude/projects/<slug>/`` as a :class:`Path`. The
+        returned path may not exist on disk (e.g. fresh workspace
+        that hasn't been opened in Claude Code yet); callers that
+        care must check ``.exists()`` themselves.
+    """
+    slug = str(workspace_path).replace("/", "-").replace("_", "-").replace(".", "-")
+    return Path.home() / ".claude" / "projects" / slug
+
+
 __all__ = [
     "DEFAULT_HUB_PORT",
     "EmbeddingModels",
@@ -882,6 +951,7 @@ __all__ = [
     "RetrievalTuning",
     "ServiceMisconfigured",
     "Unauthorized",
+    "claude_session_dir_for",
     "resolve",
     "resolve_field",
 ]

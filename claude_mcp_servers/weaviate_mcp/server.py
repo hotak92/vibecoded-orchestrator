@@ -2635,17 +2635,98 @@ def _rl_extract_answer_window(
     return "".join(parts), False
 
 
-def _rl_find_all_transcripts() -> "list[Path]":
-    """Return all .jsonl transcripts in the project slug dir, newest first."""
-    from pathlib import Path as _Path
-    projects_dir = _Path.home() / ".claude" / "projects"
-    if not projects_dir.exists():
-        return []
-    slug = str(_SERVER_INFERRED_BASE).replace("/", "-")
-    slug_dir = projects_dir / slug
+async def _resolve_claude_session_dir(workspace_path: Path) -> "Path | None":
+    """Resolve the Claude session-transcript directory for a workspace.
+
+    Source of truth: ``vct-hub`` (per the launcher-as-router pattern —
+    the hub knows ``projects.folder_path`` for every registered project
+    and computes the slug once at registration time using the canonical
+    ``vco_lib.project_config.claude_session_dir_for`` helper). Falls
+    back to a local slug heuristic when the hub is unreachable so MCPs
+    still function during:
+
+    * Hub-startup races (MCP subprocess imports before ``session-start-
+      ensure-hub.sh`` finishes spinning up vct-hub).
+    * Free-tier installs that don't run the launcher GUI at all.
+    * The brief window after a launcher restart when the in-process 5 s
+      discovery cache has expired but the new token hasn't been read.
+
+    The fallback path implements the FULL Claude Code slug rule (``/`` +
+    ``_`` + ``.`` → ``-``) rather than the half-rule that was inlined
+    here in v0.2.30 and earlier. That half-rule caused the 97.7%
+    orphan-citation rate documented in the v0.2.31 bug report
+    (``.claude/context/plans/rl-citation-monitor-bug-report-2026-05-23.md``)
+    for any workspace whose absolute path contained underscores
+    (``VCO_dev``, ``AI_hive``, …).
+
+    Returns the resolved :class:`Path` (which may or may not exist on
+    disk — caller checks ``.exists()``), or ``None`` if the resolved
+    candidate doesn't exist on disk (fresh workspace that hasn't been
+    opened in Claude Code yet → no session-jsonl dir → nothing to
+    poll). The ``None`` sentinel is preserved from the pre-v0.2.31
+    implementation so the calling code path stays the same.
+    """
+    # Primary path: ask vct-hub. Reuses the cached resolver result
+    # populated at module import time (`_try_resolve_project_config`)
+    # so we don't issue a fresh HTTP call on every poll iteration.
+    cfg = _try_resolve_project_config()
+    if cfg is not None:
+        # ProjectConfig has `claude_session_dir` from v0.2.31 onward;
+        # older hubs paired with new MCPs omit the field, in which case
+        # getattr returns "" and we fall through to the local rule.
+        # The empty-string check is defensive — the field is required
+        # in the v0.2.31+ contract, but a pre-v0.2.31 hub paired with
+        # a v0.2.31 MCP would emit a body without it and the resolver
+        # would error out at the dataclass level. The fallback covers
+        # that mismatch.
+        candidate_str = getattr(cfg, "claude_session_dir", "") or ""
+        if candidate_str:
+            candidate = Path(candidate_str)
+            return candidate if candidate.exists() else None
+
+    # Fallback: replicate Claude Code's slug rule locally. Mirrors the
+    # canonical helper in vco_lib.project_config.claude_session_dir_for
+    # (`/` + `_` + `.` → `-`). Inlined here rather than imported so
+    # this MCP keeps working even when vco_lib fails to import (the
+    # `_HAS_PROJECT_CONFIG=False` branch above).
+    slug = str(workspace_path).replace("/", "-").replace("_", "-").replace(".", "-")
+    candidate = Path.home() / ".claude" / "projects" / slug
+    return candidate if candidate.exists() else None
+
+
+def _rl_find_all_transcripts_in_dir(slug_dir: Path) -> "list[Path]":
+    """Return all .jsonl transcripts in a given slug dir, newest first.
+
+    Split out of :func:`_rl_find_all_transcripts` for testability —
+    the dir-resolution path is async (hub-aware), but the actual
+    file-glob is pure I/O and benefits from being a separate sync
+    helper.
+    """
     if not slug_dir.exists():
         return []
-    return sorted(slug_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return sorted(
+        slug_dir.glob("*.jsonl"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+
+
+async def _rl_find_all_transcripts() -> "list[Path]":
+    """Return all .jsonl transcripts in the project slug dir, newest first.
+
+    v0.2.31: resolves the slug dir via :func:`_resolve_claude_session_dir`
+    (hub-primary, local-slug fallback with the COMPLETE rule). Replaces
+    the broken inline ``str(_SERVER_INFERRED_BASE).replace("/", "-")``
+    that only handled the path-separator substitution and missed the
+    underscore rule.
+    """
+    projects_dir = Path.home() / ".claude" / "projects"
+    if not projects_dir.exists():
+        return []
+    slug_dir = await _resolve_claude_session_dir(_SERVER_INFERRED_BASE)
+    if slug_dir is None:
+        return []
+    return _rl_find_all_transcripts_in_dir(slug_dir)
 
 
 async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
@@ -2676,7 +2757,7 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
         await asyncio.sleep(_RL_MONITOR_POLL_INTERVAL)
 
         # Scan all transcripts for the one that contains our query at pos_idx
-        candidates = _rl_find_all_transcripts()
+        candidates = await _rl_find_all_transcripts()
         # Also try CLAUDE_SESSION_ID fallback (CLI mode)
         if not candidates:
             session_id = os.getenv("CLAUDE_SESSION_ID", "")

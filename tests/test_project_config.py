@@ -36,6 +36,7 @@ from vco_lib.project_config import (
     RESOLVER_PROTOCOL_VERSION,
     ResolverError,
     ServiceMisconfigured,
+    claude_session_dir_for,
     resolve,
     resolve_field,
 )
@@ -598,6 +599,93 @@ class AuthHeaderTest(_ResolverTestBase):
         resolve(FULL_BODY["project_id"])
         headers = self.session.get.call_args.kwargs.get("headers", {})
         self.assertEqual(headers.get("Authorization"), "Bearer test-token-abc")
+
+
+# ─── v0.2.31: claude_session_dir_for slug rule + resolver propagation ───
+
+
+class ClaudeSessionDirSlugTest(unittest.TestCase):
+    """Pin Claude Code's session-jsonl directory slug rule.
+
+    The citation-monitor bug at ``claude_mcp_servers/weaviate_mcp/
+    server.py`` was an incomplete copy of this rule (only ``/`` → ``-``,
+    missing ``_`` → ``-``). The canonical helper now lives in
+    ``vco_lib.project_config``; this test pins the rule so a future
+    refactor can't silently drop a substitution.
+    """
+
+    def test_handles_underscores(self) -> None:
+        # Primary bug-fix regression: workspace paths with underscores
+        # (VCO_dev, AI_hive) must produce slugs with `-` not `_`.
+        self.assertEqual(
+            claude_session_dir_for(Path("/home/user/VCO_dev")).name,
+            "-home-user-VCO-dev",
+        )
+        self.assertEqual(
+            claude_session_dir_for(Path("/home/user/AI_hive")).name,
+            "-home-user-AI-hive",
+        )
+
+    def test_passthrough_without_underscores(self) -> None:
+        # Non-regression: workspaces that the pre-fix code handled
+        # correctly must still produce identical slugs.
+        self.assertEqual(
+            claude_session_dir_for(
+                Path("/home/user/vibecoded-orchestrator")
+            ).name,
+            "-home-user-vibecoded-orchestrator",
+        )
+
+    def test_handles_dots(self) -> None:
+        # Verified empirically against ~/.claude/projects/: paths under
+        # `.claude/` are stored with `.` → `-` substitution (worktree
+        # paths like /home/u/VCO_dev/.claude/worktrees/foo become
+        # -home-u-VCO-dev--claude-worktrees-foo with a double-dash from
+        # the consecutive `_` → `-` and `/.` → `--` rules combined).
+        self.assertEqual(
+            claude_session_dir_for(
+                Path("/home/u/VCO_dev/.claude/worktrees/foo")
+            ).name,
+            "-home-u-VCO-dev--claude-worktrees-foo",
+        )
+
+    def test_returns_path_under_home_claude_projects(self) -> None:
+        # The helper must anchor under ~/.claude/projects/<slug>/ so
+        # consumers can do `(home / .claude / projects / slug).exists()`
+        # without re-implementing the parent path.
+        result = claude_session_dir_for(Path("/home/user/VCO_dev"))
+        # Path.home() is the user's actual home; the test asserts the
+        # structural anchor, not a literal HOME value.
+        self.assertEqual(result.parent.name, "projects")
+        self.assertEqual(result.parent.parent.name, ".claude")
+
+
+# Body fixture for the claude_session_dir-aware resolver tests below.
+# Mirrors FULL_BODY but adds the v0.2.31 field at a non-defaulting value
+# so we can prove the resolver round-trips the hub's authoritative answer.
+_HUB_CLAUDE_SESSION_DIR = "/home/user/.claude/projects/-home-user-VCO-dev"
+
+
+class ResolveClaudeSessionDirTest(_ResolverTestBase):
+    """v0.2.31 — verify the resolver propagates claude_session_dir."""
+
+    def test_resolve_returns_claude_session_dir_from_hub(self) -> None:
+        # Hub-primary path: the hub computed the slug, the resolver
+        # propagates it verbatim. This is the canonical-source-of-truth
+        # contract that the MCP citation-monitor relies on.
+        body = {**FULL_BODY, "claude_session_dir": _HUB_CLAUDE_SESSION_DIR}
+        self.session.get.return_value = _make_response(200, body)
+        cfg = resolve(FULL_BODY["project_id"])
+        self.assertEqual(cfg.claude_session_dir, _HUB_CLAUDE_SESSION_DIR)
+
+    def test_resolve_back_fills_when_hub_omits_field(self) -> None:
+        # Backward-compat: a pre-v0.2.31 hub paired with a v0.2.31+
+        # client omits the field. The parser must back-fill with the
+        # empty-string sentinel rather than crashing.
+        body_old = {k: v for k, v in FULL_BODY.items() if k != "claude_session_dir"}
+        self.session.get.return_value = _make_response(200, body_old)
+        cfg = resolve(FULL_BODY["project_id"])
+        self.assertEqual(cfg.claude_session_dir, "")
 
 
 if __name__ == "__main__":

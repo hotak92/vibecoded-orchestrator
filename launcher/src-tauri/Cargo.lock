@@ -5339,6 +5339,7 @@ version = "0.2.31"
 dependencies = [
  "axum",
  "chrono",
+ "directories",
  "dunce",
  "hex",
  "keyring",
