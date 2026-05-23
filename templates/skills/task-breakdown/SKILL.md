@@ -1,6 +1,8 @@
 ---
 name: task-breakdown
 description: Break complex features into implementable tasks with estimates, dependencies, and risk assessment
+short_desc: decompose feature into tasks, estimates, dependencies
+keywords: [task decomposition, effort estimation, dependency mapping, sprint planning, risk assessment, "implementation plan", "break into tasks", "task list for", "estimate this", "effort estimate", "decompose this"]
 model: sonnet
 ---
 

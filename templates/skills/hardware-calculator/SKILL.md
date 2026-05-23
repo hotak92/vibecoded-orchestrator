@@ -1,6 +1,8 @@
 ---
 name: hardware-calculator
 description: Quick VRAM/RAM calculations, hardware recommendations, feasibility checks for AI models
+short_desc: VRAM/RAM calc + GPU sizing for AI models
+keywords: [VRAM, GPU memory, RAM requirements, model footprint, quantization, GPU recommendation, "which GPU", "GPU sizing", "fit on GPU", "memory requirements", H100, A100, "RTX 4090", "consumer GPU"]
 model: haiku
 ---
 

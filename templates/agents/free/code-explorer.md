@@ -1,6 +1,8 @@
 ---
 name: code-explorer
 description: Read-heavy research agent that ALSO writes findings to disk. Use instead of Explore when the task requires saving a report to a file (.claude/context/, docs/, research notes, audit results).
+short_desc: audit codebases and write findings to reports
+keywords: ["audit report", "gap analysis", "codebase audit", "write findings", "save report", "audit codebase", "findings report", "codebase analysis", "read-heavy research", "research notes", "document findings"]
 tools: Read, Glob, Grep, Bash, Write, Edit
 model: haiku
 effort: high

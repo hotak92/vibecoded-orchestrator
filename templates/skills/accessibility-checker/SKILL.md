@@ -1,7 +1,8 @@
 ---
 name: accessibility-checker
 description: Quick A11y review - WCAG 2.1 checklist, screen reader compatibility, keyboard navigation, color contrast
-keywords: [WCAG, A11y, accessibility, screen reader, ARIA, color contrast]
+short_desc: WCAG-2.1 / a11y compliance checklist review
+keywords: [WCAG, A11y, accessibility, screen reader, ARIA, color contrast, usability]
 model: haiku
 ---
 

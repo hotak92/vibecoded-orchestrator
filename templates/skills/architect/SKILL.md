@@ -1,6 +1,8 @@
 ---
 name: architect
 description: Design complex system architectures, evaluate tradeoffs, and make critical technical decisions requiring deep reasoning
+short_desc: deep tradeoff analysis for one system architecture
+keywords: [system design, tradeoff analysis, architecture decisions, component design, failure modes, "design the system", "architectural tradeoff", "system architecture", "architecture for"]
 model: opus
 ---
 

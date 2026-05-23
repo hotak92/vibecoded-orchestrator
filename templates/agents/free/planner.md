@@ -1,6 +1,8 @@
 ---
 name: planner
 description: Requirements analysis, architectural design, task breakdown
+short_desc: requirements analysis, architecture, task breakdown
+keywords: [requirements analysis, task breakdown, implementation plan, constraints, prior art, "task decomposition", "plan this", "plan the work", "break this down", "figure out approach", "how should we", "what's the plan", "roadmap for"]
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
 effort: xhigh

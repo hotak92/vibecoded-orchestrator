@@ -1,6 +1,8 @@
 ---
 name: gui-tester
 description: Automated GUI testing agent. Takes screenshots, interacts with UI, produces structured reports on layout, functionality, and regressions. Use when you need to visually verify a web UI or debug frontend issues. Requires playwright MCP to be connected.
+short_desc: Playwright browser automation + screenshot E2E + regression tests
+keywords: [Playwright, GUI test, screenshot test, visual regression, browser automation, "screenshot diff", "test the GUI", "test the UI", "verify the layout", "screenshot the app", "e2e test", "end-to-end test"]
 model: claude-sonnet-4-6
 effort: high
 tools:

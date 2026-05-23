@@ -1,6 +1,7 @@
 ---
 name: terraform-plan-reviewer
 description: Reviews Terraform/OpenTofu plan output for destructive changes, drift, IAM expansions, hardcoded values, and unsafe resource recreations before apply. Invoke when the user shares plan output, when a CI plan job posts a diff to a PR, or before any non-trivial production apply.
+short_desc: review tfplan for destructive, IAM, and drift changes
 keywords: [Terraform, terraform, OpenTofu, tfplan, terraform plan, tofu plan, HCL]
 model: opus
 effort: high

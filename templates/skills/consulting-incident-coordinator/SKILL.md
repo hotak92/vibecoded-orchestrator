@@ -1,6 +1,8 @@
 ---
 name: consulting-incident-coordinator
 description: Coordinates multi-channel incident response for a consulting engagement - drafts war-room updates, status-page entries, client comms, and the post-incident review; use when a client production issue is active or just resolved
+short_desc: "client incident comms, war-room, and post-mortems"
+keywords: [client incident, war-room update, client comms, post-incident review, consulting incident, blameless post-mortem, post-mortem, blameless, "client outage", "coordinate client incident", "client incident response", "update the client about", "incident communication"]
 model: opus
 effort: high
 argument-hint: "[incident-slug-or-description] [--phase active|stabilising|review]"

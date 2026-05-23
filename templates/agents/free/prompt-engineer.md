@@ -1,6 +1,8 @@
 ---
 name: prompt-engineer
 description: Reviews and optimizes prompts for code agents using 2026 research. Creates agent prompts with critical thinking, tool usage, and Claude 4.x patterns.
+short_desc: deep prompt review, optimization, agent creation
+keywords: [prompt review, prompt optimization, chain-of-thought, few-shot, prompt template, agent prompt, "system prompt", "prompt tuning", "prompt design", "optimize my prompt", "improve this prompt", "prompt for an agent"]
 tools: Read, Write, Edit, Grep, Glob
 model: sonnet
 effort: xhigh

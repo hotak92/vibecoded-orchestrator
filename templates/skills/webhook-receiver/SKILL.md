@@ -1,7 +1,8 @@
 ---
 name: webhook-receiver
 description: Hardens an inbound webhook endpoint with HMAC signature verification, timestamp replay protection, idempotency, schema validation, async processing, and dead-letter handling. Use when designing a new webhook receiver or auditing an existing one
-keywords: [webhook, HMAC, signature verification, replay protection, dead-letter, X-Hub-Signature]
+short_desc: webhook receiver: HMAC, replay protection, idempotency
+keywords: [webhook, HMAC, signature verification, replay protection, dead-letter, X-Hub-Signature, idempotency, retry-safe, DLQ]
 model: opus
 effort: high
 ---
