@@ -66,10 +66,45 @@ param(
     [switch]$WithMaoAgents,
     [switch]$NoSkills,
     [switch]$NoCompile,
-    [switch]$NonInteractive
+    [switch]$NonInteractive,
+    [switch]$Yes,
+    [switch]$NoAutoLaunch,
+    [switch]$NoDesktopIcon
 )
 
 $ErrorActionPreference = "Stop"
+
+# ---------------------------------------------------------------------------
+# .bat-style args reconciliation: first-install.bat forwards `%*` (all user
+# args) directly to this script. PowerShell's -File parameter binds the ones
+# matching `param()` switches, but only in PS-style (`-Yes` not `--yes`).
+# Double-dash args (`--yes`, `--no-auto-launch`) fall through to `$args`
+# instead of binding to switches. Walk `$args` and lift them into the bound
+# switch variables so the rest of the script sees a consistent state
+# regardless of whether the user typed `-Yes` or `--yes`.
+# ---------------------------------------------------------------------------
+foreach ($a in $args) {
+    switch -Regex ($a) {
+        '^--yes$|^-y$'           { $Yes = $true }
+        '^--non-interactive$'    { $NonInteractive = $true }
+        '^--quiet$'              { $Quiet = $true }
+        '^--no-auto-launch$'     { $NoAutoLaunch = $true }
+        '^--no-desktop-icon$'    { $NoDesktopIcon = $true }
+        '^--no-containers$'      { $NoContainers = $true }
+        '^--gpu$'                { $Gpu = $true }
+        '^--cpu-only$'           { $CpuOnly = $true }
+        '^--low-resource$'       { $LowResource = $true }
+        '^--dev$'                { $Dev = $true }
+        '^--update$'             { $Update = $true }
+        '^--skip-models$'        { $SkipModels = $true }
+        '^--with-joern$'         { $WithJoern = $true }
+        '^--no-joern$'           { $NoJoern = $true }
+        '^--no-agents$'          { $NoAgents = $true }
+        '^--with-mao-agents$'    { $WithMaoAgents = $true }
+        '^--no-skills$'          { $NoSkills = $true }
+        '^--no-compile$'         { $NoCompile = $true }
+    }
+}
 
 Write-Host "=== VibeCoded Tools - Orchestrator Installer ===" -ForegroundColor Cyan
 Write-Host ""
@@ -248,6 +283,11 @@ if ($NoAgents)      { $installArgs += "--no-agents" }
 if ($WithMaoAgents) { $installArgs += "--with-mao-agents" }
 if ($NoSkills)      { $installArgs += "--no-skills" }
 if ($NoCompile)     { $installArgs += "--no-compile" }
+# --yes propagation: critical for first-install.bat --yes flow on Windows.
+# Without this, install.py drops to interactive prompts that hang silently
+# in the .bat-spawned PowerShell window. -NonInteractive implies -Yes too
+# (matches the .ps1's own non-interactive semantics on line ~95).
+if ($Yes -or $NonInteractive) { $installArgs += "--yes" }
 
 if ($pythonArgs.Count -gt 0) {
     & $pythonCmd @pythonArgs install.py @installArgs
