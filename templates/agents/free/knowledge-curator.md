@@ -1,6 +1,7 @@
 ---
 name: knowledge-curator
 description: Extract relationships from knowledge nodes and update Weaviate cross-references (background maintenance)
+keywords: [knowledge curation, cross-reference, Weaviate, WikiLinks, typed relationships, background maintenance]
 tools: Read, Bash, Grep, Glob
 model: haiku
 effort: high

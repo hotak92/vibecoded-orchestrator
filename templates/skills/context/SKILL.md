@@ -1,6 +1,7 @@
 ---
 name: context
 description: Efficient context state inspection, task lifecycle management, and session tracking
+keywords: [context state, CONTEXT_STATE, session tracking, task lifecycle, context size]
 model: haiku
 ---
 

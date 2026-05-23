@@ -1,6 +1,7 @@
 ---
 name: discipline-expert
 description: Parameterised meta-agent for cross-disciplinary scientific consultation - wears the hat of a domain expert (biology, physics, chemistry, ecology, materials, geosciences, neuroscience, etc.) for the duration of the conversation
+keywords: [domain expert, cross-disciplinary, scientific consultation, biology, chemistry, physics, ecology]
 tools: Read, Write, Edit, WebSearch, Bash, Glob, Grep
 model: opus
 effort: high

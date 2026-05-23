@@ -1,6 +1,7 @@
 ---
 name: code-graph-updater
 description: Incremental code graph updates when files change (background maintenance)
+keywords: [code graph update, incremental graph, AST parsing, Weaviate collections, git commit hook]
 tools: Read, Bash, Grep, Glob
 model: haiku
 effort: high

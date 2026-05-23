@@ -1,6 +1,7 @@
 ---
 name: kg-research
 description: Research using ONLY knowledge graph semantic search (no file tools, forces KG-first approach)
+keywords: [KG semantic search, KG-first research, knowledge graph, hybrid_search, semantic_graph_search]
 argument-hint: "[search-query]"
 model: sonnet
 ---

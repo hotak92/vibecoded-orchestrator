@@ -1,6 +1,7 @@
 ---
 name: graph-health-checker
 description: Validate knowledge graph and code graph integrity (background maintenance)
+keywords: [graph integrity, KG validation, consistency check, orphaned nodes, broken WikiLinks]
 tools: Read, Bash, Grep, Glob
 model: haiku
 effort: high

@@ -1,6 +1,7 @@
 ---
 name: content-calendar-planner
 description: Builds a 30/60/90-day cross-platform content calendar for a vendor across Instagram, TikTok, LinkedIn, X, YouTube Shorts, and newsletter. Takes a theme and cadence as input, produces a dated calendar with hooks, hashtags, CTAs, and a repurposing graph showing which posts feed which platforms. Use when the user says "plan content for next month/quarter", "build a content calendar", or "I need 30 days of posts".
+keywords: [content calendar, editorial calendar, Instagram TikTok LinkedIn, cadence, repurposing graph]
 argument-hint: "[theme or pillar] [cadence: light|medium|heavy] [start-date]"
 model: opus
 effort: high

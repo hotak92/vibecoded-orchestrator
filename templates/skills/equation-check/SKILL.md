@@ -1,6 +1,7 @@
 ---
 name: equation-check
 description: Audits a mathematical equation or derivation for dimensional consistency, limiting behaviour, sign sanity, and common-error patterns. Use when the user pastes an equation, asks "is this derivation right", "check the units", "what should this reduce to in the limit", "I'm getting an off-by-factor-of-2 error", or shares a snippet of LaTeX they want validated before publication.
+keywords: [equation, derivation, dimensional analysis, LaTeX, unit check, check the units]
 model: opus
 effort: xhigh
 allowed-tools: Read, Write, WebSearch, Bash
