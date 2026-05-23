@@ -35,11 +35,24 @@ fi
 [ -z "$SESSION_ID" ] && SESSION_ID="default"
 
 CONTEXT_FILE=".claude/CONTEXT_STATE.md"
-SNAPSHOT_DIR="${TMPDIR:-/tmp}/claude_ctx_snapshots"
-SNAPSHOT_FILE="$SNAPSHOT_DIR/snapshot_${SESSION_ID}"
-COMPACT_FLAG="$SNAPSHOT_DIR/compact_flag_${SESSION_ID}"
+# Snapshot state lives under the project (gitignored .claude/state/) so it
+# survives reboots and launcher restarts — Claude Code's `resume` feature
+# can reuse a session_id across these boundaries, and a $TMPDIR-based path
+# would lose the diff baseline mid-session when /tmp is wiped on boot.
+# The `ctx_` filename prefix namespaces these files within the shared
+# .claude/state/ dir (which also holds seen_kg_titles_*, reads_*, etc.).
+PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
+SNAPSHOT_DIR="$PROJECT_DIR/.claude/state"
+SNAPSHOT_FILE="$SNAPSHOT_DIR/ctx_snapshot_${SESSION_ID}"
+COMPACT_FLAG="$SNAPSHOT_DIR/ctx_compact_flag_${SESSION_ID}"
 
 mkdir -p "$SNAPSHOT_DIR"
+
+# 14-day GC for stale ctx_snapshot_* files — sessions that haven't fired
+# in two weeks are stale enough that their baseline is no longer useful.
+# Best-effort (no error if find misses files). Doesn't touch the compact
+# flags (those are short-lived sentinels, cleaned by post-compact.sh).
+find "$SNAPSHOT_DIR" -maxdepth 1 -type f -name "ctx_snapshot_*" -mtime +14 -delete 2>/dev/null || true
 
 # If compact flag exists, reset baseline
 if [ -f "$COMPACT_FLAG" ]; then

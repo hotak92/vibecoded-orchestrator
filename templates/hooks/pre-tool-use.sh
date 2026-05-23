@@ -39,7 +39,12 @@ fi
 [ -z "${PY:-}" ] && exit 0  # No Python — silent no-op (logging+guards skipped)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# v0.2.29: prefer Claude Code's canonical $CLAUDE_PROJECT_DIR (the active
+# workspace the launcher hands us — source of truth for per-project hooks).
+# Fall back to SCRIPT_DIR/../.. for ad-hoc invocations (manual runs, tests)
+# that don't set the env var. This matches the canonical hook contract
+# while staying robust for non-Claude-Code callers.
+PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 
 # Hook input arrives as JSON on stdin per Claude Code v2.1.x spec.
 # Positional args ($1/$2/$3) are EMPTY because $CLAUDE_TOOL_NAME etc.
@@ -81,11 +86,26 @@ except Exception:
 " 2>/dev/null || echo "")
 
 SESSION_ID="${SESSION_ID_FROM_STDIN:-${CLAUDE_SESSION_ID:-$(date +%Y%m%d_%H)}}"
-SESSION_READS_FILE="${TMPDIR:-${XDG_RUNTIME_DIR:-/tmp}}/.claude_reads_${SESSION_ID}"
-BACKUP_DIR="${TMPDIR:-${XDG_RUNTIME_DIR:-/tmp}}/.claude_backups"
+# Per-session dedup state lives under the project's .claude/state/ rather
+# than $TMPDIR so it survives reboots + launcher restarts (Claude Code
+# persists session_id across restarts via the resume feature). $TMPDIR may
+# be cleared on reboot, breaking dedup mid-session. .claude/state/ is
+# gitignored and wiped only by PostCompact (correct semantic — context
+# truly resets at compaction).
+SESSION_STATE_DIR="$PROJECT_ROOT/.claude/state"
+SESSION_READS_FILE="$SESSION_STATE_DIR/reads_${SESSION_ID}.txt"
+BACKUP_DIR="$SESSION_STATE_DIR/tool_backups"
 SECURITY_LOG="$PROJECT_ROOT/.claude/logs/security_events.jsonl"
 
 mkdir -p "$PROJECT_ROOT/.claude/logs"
+mkdir -p "$SESSION_STATE_DIR" 2>/dev/null || true
+mkdir -p "$BACKUP_DIR" 2>/dev/null || true
+
+# Best-effort 14-day GC of stale per-session reads files. Sessions that
+# haven't been touched in two weeks are almost certainly abandoned;
+# keeping them around just wastes inodes. Errors suppressed: this is a
+# housekeeping pass, not a correctness step.
+find "$SESSION_STATE_DIR" -maxdepth 1 -name 'reads_*.txt' -mtime +14 -delete 2>/dev/null || true
 
 # === HELPER: safe JSON field extraction ===
 _get_field() {

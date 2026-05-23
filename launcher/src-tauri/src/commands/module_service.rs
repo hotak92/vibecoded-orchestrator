@@ -129,6 +129,17 @@ pub enum FinetuneChoice {
 /// Wire shape returned by `get_rl_dashboard_state` (Phase 4B). The
 /// frontend renders 3 sections — container, weights, recent activity —
 /// and reads all values from this single struct (one IPC round-trip).
+///
+/// v0.2.29: optional fields from the running container's
+/// `GET /state_summary` endpoint (vct-rl-reranker v0.2.3+). All are
+/// `Option<_>` because the probe soft-fails to `None` when:
+///   - container isn't running
+///   - container is older than v0.2.3 (no /state_summary endpoint → 404)
+///   - probe times out
+///   - body fails to parse
+/// The dashboard widget renders these as "N dynamic types registered"
+/// only when `Some`. Pre-v0.2.3 modules keep working — the existing
+/// fields stay correct, the new ones just stay `None`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RlDashboardState {
     pub container_name: String,
@@ -143,6 +154,17 @@ pub struct RlDashboardState {
     pub weights_sha256_prefix: String,
     pub recent_events_count: u32,
     pub recent_events_avg_latency_ms: f32,
+    /// v0.2.29: from `GET /state_summary` — count of registry entries
+    /// with `idx >= N_ENTITY_TYPES` (i.e. user-trained types beyond the
+    /// builtin set). `None` when the probe failed.
+    #[serde(default)]
+    pub dynamic_types_count: Option<u32>,
+    /// v0.2.29: from `GET /state_summary` — whether `.types_layout_v2`
+    /// marker file exists in the state dir (signals the D1' migration
+    /// has run; sidecars are authoritative). `None` when the probe
+    /// failed.
+    #[serde(default)]
+    pub d1_marker_present: Option<bool>,
 }
 
 impl RlDashboardState {
@@ -160,6 +182,8 @@ impl RlDashboardState {
             weights_sha256_prefix: String::new(),
             recent_events_count: 0,
             recent_events_avg_latency_ms: 0.0,
+            dynamic_types_count: None,
+            d1_marker_present: None,
         }
     }
 }
@@ -1326,6 +1350,18 @@ pub async fn get_rl_dashboard_state(
     let (recent_events_count, recent_events_avg_latency_ms) =
         load_recent_event_stats(&project.slug).await;
 
+    // v0.2.29: probe `GET /state_summary` (vct-rl-reranker v0.2.3+).
+    // Soft-fail to `(None, None)` if the container isn't running, the
+    // endpoint 404s (pre-v0.2.3 module), or the body fails to parse.
+    // Bounded 2s timeout so a hung container never blocks the dashboard
+    // load. Pre-v0.2.3 modules keep working — the existing fields stay
+    // correct, the new ones just stay `None`.
+    let (dynamic_types_count, d1_marker_present) = if container_running && port > 0 {
+        probe_state_summary(port).await
+    } else {
+        (None, None)
+    };
+
     Ok(RlDashboardState {
         container_name,
         container_running,
@@ -1340,7 +1376,40 @@ pub async fn get_rl_dashboard_state(
         weights_sha256_prefix: String::new(),
         recent_events_count,
         recent_events_avg_latency_ms,
+        dynamic_types_count,
+        d1_marker_present,
     })
+}
+
+/// v0.2.29: probe `GET http://localhost:<port>/state_summary` (paid
+/// module vct-rl-reranker v0.2.3+). Returns `(dynamic_types_count,
+/// d1_marker_present)`. Soft-fails to `(None, None)` on any error path
+/// — the dashboard load never blocks or errors because of a probe
+/// failure. 2s timeout matches the existing per-call timeouts in this
+/// file (see `signal_rotate_weights`, `apply_weights_update`, etc.).
+async fn probe_state_summary(port: u16) -> (Option<u32>, Option<bool>) {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return (None, None),
+    };
+    let url = format!("http://127.0.0.1:{}/state_summary", port);
+    let resp = match client.get(&url).send().await {
+        Ok(r) if r.status().is_success() => r,
+        _ => return (None, None),
+    };
+    let body: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(_) => return (None, None),
+    };
+    let dyn_count = body
+        .get("dynamic_types")
+        .and_then(|v| v.as_u64())
+        .and_then(|n| u32::try_from(n).ok());
+    let marker = body.get("marker_present").and_then(|v| v.as_bool());
+    (dyn_count, marker)
 }
 
 /// Read the last <=10 events from `rl_events_<slug>.jsonl` and return
@@ -2001,6 +2070,42 @@ mod tests {
         assert_eq!(s.image_tag, "");
         assert_eq!(s.container_running, false);
         assert_eq!(s.port, 0);
+    }
+
+    /// v0.2.29: pin the new `/state_summary`-derived fields default
+    /// to `None` so the frontend knows "the probe didn't run / hasn't
+    /// fired yet" rather than mis-reading 0 as "zero dynamic types".
+    #[test]
+    fn rl_dashboard_state_empty_has_none_state_summary_fields() {
+        let s = RlDashboardState::empty();
+        assert_eq!(s.dynamic_types_count, None);
+        assert_eq!(s.d1_marker_present, None);
+    }
+
+    /// v0.2.29: wire-shape pin — the two new fields must round-trip
+    /// through serde with snake_case keys + `null` when `None`.
+    #[test]
+    fn rl_dashboard_state_state_summary_fields_wire_shape() {
+        let s = RlDashboardState::empty();
+        let v = serde_json::to_value(&s).expect("ser");
+        assert!(v.get("dynamic_types_count").is_some(),
+            "wire shape regression: missing dynamic_types_count");
+        assert!(v.get("d1_marker_present").is_some(),
+            "wire shape regression: missing d1_marker_present");
+        assert!(v["dynamic_types_count"].is_null());
+        assert!(v["d1_marker_present"].is_null());
+        // Reverse: a JSON missing these fields still deserializes
+        // (back-compat for older callers / saved snapshots).
+        let legacy = r#"{
+            "container_name":"","container_running":false,"port":0,
+            "image_tag":"","current_weights_version":"",
+            "last_checked_at":0,"last_finetuned_at":0,
+            "weights_sha256_prefix":"",
+            "recent_events_count":0,"recent_events_avg_latency_ms":0.0
+        }"#;
+        let d: RlDashboardState = serde_json::from_str(legacy).expect("legacy de");
+        assert_eq!(d.dynamic_types_count, None);
+        assert_eq!(d.d1_marker_present, None);
     }
 
     // ─── Embedding-source flexibility ─────────────────────────────────

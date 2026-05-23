@@ -72,6 +72,10 @@ else
     SESSION_ID=""
 fi
 [ -z "$SESSION_ID" ] && SESSION_ID="default"
-SNAPSHOT_DIR="${TMPDIR:-/tmp}/claude_ctx_snapshots"
+# Project-local .claude/state/ — see diff-context-inject.sh for the
+# rationale (resume-across-reboot, $TMPDIR wipe immunity). Filename is
+# `ctx_compact_flag_*` to namespace within the shared dir and to stay
+# in lockstep with diff-context-inject.sh's reader.
+SNAPSHOT_DIR="$PROJECT_DIR/.claude/state"
 mkdir -p "$SNAPSHOT_DIR"
-touch "$SNAPSHOT_DIR/compact_flag_${SESSION_ID}"
+touch "$SNAPSHOT_DIR/ctx_compact_flag_${SESSION_ID}"

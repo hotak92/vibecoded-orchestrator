@@ -66,7 +66,14 @@ try {
 if ($ToolName -ne "Edit") { exit 0 }
 
 $ScriptDir = $PSScriptRoot
-$ProjectRoot = (Resolve-Path (Join-Path $ScriptDir "..\..")).Path
+# v0.2.29: prefer canonical $CLAUDE_PROJECT_DIR (the active workspace
+# the launcher hands us). Fall back to SCRIPT_DIR/../.. for ad-hoc
+# invocations.
+$ProjectRoot = if ($env:CLAUDE_PROJECT_DIR) {
+    $env:CLAUDE_PROJECT_DIR
+} else {
+    (Resolve-Path (Join-Path $ScriptDir "..\..")).Path
+}
 
 $LibDir = Join-Path $ScriptDir "_lib"
 $FindPy = Join-Path $LibDir "find-python.ps1"
@@ -76,8 +83,13 @@ if (Test-Path $FindPy) { . $FindPy }
 # back to "default" only if the payload is malformed (which would mean the
 # hook contract itself is broken — see ConvertFrom-Json above).
 if (-not $SessionId) { $SessionId = "default" }
-$Tmp = if ($env:TMPDIR) { $env:TMPDIR } elseif ($env:TEMP) { $env:TEMP } else { "C:\Windows\Temp" }
-$CacheBase = Join-Path $Tmp "claude_edit_cache_$SessionId"
+$CacheBase = Join-Path $ProjectRoot ".claude/state/edit_cache_$SessionId"
+New-Item -ItemType Directory -Force -Path $CacheBase -ErrorAction SilentlyContinue | Out-Null
+# v0.2.29 GC: prune per-session edit_cache_* directories older than 14 days.
+# Keeps .claude/state/ bounded across heavy use. Best-effort — failures ignored.
+Get-ChildItem -Directory (Join-Path $ProjectRoot ".claude/state") -Filter "edit_cache_*" -ErrorAction SilentlyContinue |
+    Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-14) } |
+    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 $CacheTtl = 600
 
 # State lives in the project directory (not /tmp/) so it survives reboots and

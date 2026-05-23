@@ -41,6 +41,15 @@ def _write_agent(root: Path, slug: str, name: str, keywords_block: str) -> None:
 def _run_hook(payload: dict, project_root: Path) -> subprocess.CompletedProcess:
     env = os.environ.copy()
     env["CLAUDE_PROJECT_DIR"] = str(project_root)
+    # v0.2.29: scope the matcher's per-session dedup file to this test's
+    # tmp_path. Dedup state now lives in `<project_root>/.claude/state/`
+    # (via the matcher's `VCT_KEYWORD_DEDUP_DIR` override). The hook
+    # subprocess invokes the matcher with the same CLAUDE_PROJECT_DIR,
+    # so the matcher's project_root → .claude/state/ resolution already
+    # lands inside tmp_path without needing the override. We still set
+    # VCT_KEYWORD_DEDUP_DIR explicitly so a hand-run pytest from a
+    # broken cwd doesn't leak state outside the tmp_path.
+    env["VCT_KEYWORD_DEDUP_DIR"] = str(project_root / ".claude" / "state")
     # Make sure VCT_DISABLE_HOOKS is not lingering from the parent shell.
     env.pop("VCT_DISABLE_HOOKS", None)
     return subprocess.run(

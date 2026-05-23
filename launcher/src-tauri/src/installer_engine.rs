@@ -69,6 +69,29 @@ pub async fn run_install(
     // Security: refuse paths outside ~/.vct/modules/.
     crate::manifest::validate_install_dir(&install_dir, &allowed_root)?;
 
+    // v0.2.29: enforce `compatibility.min_launcher_version` if the
+    // manifest declares one. The field was already deserialized in
+    // `manifest::Compatibility` since the dispatcher work but never
+    // consulted — modules could declare a min version and the launcher
+    // would happily install them on older binaries that lack the
+    // required APIs. Refuse with a structured error so the GUI surfaces
+    // "launcher too old: bump first" rather than a cryptic later
+    // failure during post_install or first container boot.
+    if let Some(required) = manifest.compatibility.min_launcher_version.as_deref() {
+        let required = required.trim();
+        if !required.is_empty() {
+            let current = env!("CARGO_PKG_VERSION");
+            if version_lt(current, required) {
+                return Err(format!(
+                    "module '{}' requires launcher >= {} but this launcher is {}. \
+                     Update the launcher first (Settings → Updates → Update orchestrator), \
+                     then retry the install.",
+                    manifest.id, required, current,
+                ));
+            }
+        }
+    }
+
     let total_steps: u32 = 1 + manifest.install.post_install.len() as u32;
     let mut step_index: u32 = 0;
 
@@ -578,6 +601,41 @@ pub(crate) fn resolve_variant_tag(
     }
 }
 
+/// v0.2.29: tiny semver comparison used by the `min_launcher_version`
+/// gate. Returns true iff `a < b` lexicographically over numeric
+/// components. Non-numeric prefixes of each dot-separated component are
+/// parsed as 0 (so `0.2.28-dev` compares as `0.2.28`). Pre-release
+/// suffixes and build metadata are ignored — same approximation used by
+/// `commands::installer::version_is_outdated`. The check is "is this
+/// launcher OLDER than the required version?" — if true, the install
+/// is refused.
+fn version_lt(a: &str, b: &str) -> bool {
+    fn parse(v: &str) -> Vec<u64> {
+        v.split('.')
+            .map(|p| {
+                p.chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect::<String>()
+            })
+            .map(|s| s.parse::<u64>().unwrap_or(0))
+            .collect()
+    }
+    let ai = parse(a);
+    let bi = parse(b);
+    let len = ai.len().max(bi.len());
+    for idx in 0..len {
+        let aa = *ai.get(idx).unwrap_or(&0);
+        let bb = *bi.get(idx).unwrap_or(&0);
+        if aa < bb {
+            return true;
+        }
+        if aa > bb {
+            return false;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -658,5 +716,44 @@ mod tests {
         let m = manifest_with_variants(None);
         assert_eq!(resolve_variant_tag(&m, "0.1.0", GpuMode::Cuda), "0.1.0");
         assert_eq!(resolve_variant_tag(&m, "0.1.0", GpuMode::Cpu), "0.1.0");
+    }
+
+    // ─── v0.2.29: version_lt + min_launcher_version gate ────────────
+
+    #[test]
+    fn version_lt_basic() {
+        assert!(version_lt("0.2.28", "0.2.29"));
+        assert!(version_lt("0.2.0", "0.2.1"));
+        assert!(version_lt("0.1.0", "0.2.0"));
+        assert!(version_lt("0.0.1", "1.0.0"));
+    }
+
+    #[test]
+    fn version_lt_equal_is_not_less() {
+        assert!(!version_lt("0.2.29", "0.2.29"));
+        assert!(!version_lt("1.0.0", "1.0.0"));
+    }
+
+    #[test]
+    fn version_lt_greater_is_not_less() {
+        assert!(!version_lt("0.2.30", "0.2.29"));
+        assert!(!version_lt("1.0.0", "0.2.29"));
+    }
+
+    #[test]
+    fn version_lt_handles_unequal_segment_counts() {
+        // "0.2" vs "0.2.0" → equal (missing trailing segments parse as 0).
+        assert!(!version_lt("0.2", "0.2.0"));
+        assert!(!version_lt("0.2.0", "0.2"));
+        // "0.2" < "0.2.1" (missing trailing parses as 0).
+        assert!(version_lt("0.2", "0.2.1"));
+    }
+
+    #[test]
+    fn version_lt_tolerates_suffixes() {
+        // `-dev`, `-rc1`, etc. — the parser stops at the first non-digit
+        // so suffixes are effectively ignored.
+        assert!(version_lt("0.2.28-dev", "0.2.29"));
+        assert!(!version_lt("0.2.29-rc1", "0.2.29"));
     }
 }

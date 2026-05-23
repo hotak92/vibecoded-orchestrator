@@ -219,6 +219,16 @@ def _invoke_hook(env, session_id: str, file_path: str) -> subprocess.CompletedPr
             "new_string": "def f(): pass\n",
         },
     }
+    # v0.2.29: pre-create the TMPDIR override path explicitly. Pre-v0.2.29
+    # the hook's `CACHE_BASE="${TMPDIR:-/tmp}/claude_edit_cache_<sid>"` +
+    # subsequent `mkdir -p "$CACHE_DIR"` had the SIDE-EFFECT of creating
+    # this directory, which let later `mktemp` calls in the hook succeed.
+    # v0.2.29 moves CACHE_BASE to `$PROJECT_ROOT/.claude/state/edit_cache_*`,
+    # which no longer creates the legacy `install_root/tmp/` as a side
+    # effect — so we create it here instead. Functionally equivalent to
+    # the old behavior; just made explicit.
+    tmpdir = env["install_root"] / "tmp"
+    tmpdir.mkdir(parents=True, exist_ok=True)
     return subprocess.run(
         ["bash", str(env["hook_path"])],
         input=json.dumps(payload),
@@ -233,10 +243,9 @@ def _invoke_hook(env, session_id: str, file_path: str) -> subprocess.CompletedPr
             # Project root for emit-context.sh state — the hook computes
             # PROJECT_ROOT as $SCRIPT_DIR/../.. which from
             # templates/hooks/ resolves to the install_root. Same for
-            # `.claude/state/seen_kg_titles_<sid>.txt`.
-            "TMPDIR": str(env["install_root"] / "tmp"),
-            # The hook's mkdir -p covers tmp_path/tmp implicitly via the
-            # CACHE_BASE assignment, but be explicit.
+            # `.claude/state/seen_kg_titles_<sid>.txt` and
+            # `.claude/state/edit_cache_<sid>/`.
+            "TMPDIR": str(tmpdir),
         },
     )
 

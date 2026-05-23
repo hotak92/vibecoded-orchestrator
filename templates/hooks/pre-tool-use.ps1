@@ -53,22 +53,47 @@ try {
 }
 
 $ScriptDir = $PSScriptRoot
-$ProjectRoot = (Resolve-Path (Join-Path $ScriptDir "..\..")).Path
+# v0.2.29: prefer canonical $CLAUDE_PROJECT_DIR (the active workspace
+# the launcher hands us). Fall back to SCRIPT_DIR/../.. for ad-hoc
+# invocations.
+$ProjectRoot = if ($env:CLAUDE_PROJECT_DIR) {
+    $env:CLAUDE_PROJECT_DIR
+} else {
+    (Resolve-Path (Join-Path $ScriptDir "..\..")).Path
+}
 
 $LibDir = Join-Path $ScriptDir "_lib"
 $FindPy = Join-Path $LibDir "find-python.ps1"
 if (Test-Path $FindPy) { . $FindPy }
 
 $SessionId = if ($SessionIdFromStdin) { $SessionIdFromStdin } elseif ($env:CLAUDE_SESSION_ID) { $env:CLAUDE_SESSION_ID } else { (Get-Date).ToString("yyyyMMdd_HH") }
-$Tmp = if ($env:TMPDIR) { $env:TMPDIR } elseif ($env:TEMP) { $env:TEMP } else { "C:\Windows\Temp" }
-$SessionReadsFile = Join-Path $Tmp ".claude_reads_$SessionId"
-$BackupDir = Join-Path $Tmp ".claude_backups"
+# Per-session dedup state lives under the project's .claude/state/ rather
+# than $env:TMPDIR / $env:TEMP so it survives reboots + launcher restarts
+# (Claude Code persists session_id across restarts via the resume feature).
+# Windows TEMP may be cleared on reboot too. .claude/state/ is gitignored
+# and wiped only by PostCompact (correct semantic — context truly resets
+# at compaction).
+$SessionStateDir = Join-Path $ProjectRoot ".claude/state"
+$SessionReadsFile = Join-Path $SessionStateDir "reads_$SessionId.txt"
+$BackupDir = Join-Path $SessionStateDir "tool_backups"
 $SecurityLog = Join-Path $ProjectRoot ".claude/logs/security_events.jsonl"
 
 $LogsDir = Join-Path $ProjectRoot ".claude/logs"
 if (-not (Test-Path $LogsDir)) {
     New-Item -ItemType Directory -Path $LogsDir -Force | Out-Null
 }
+New-Item -ItemType Directory -Force -Path $SessionStateDir -ErrorAction SilentlyContinue | Out-Null
+New-Item -ItemType Directory -Force -Path $BackupDir -ErrorAction SilentlyContinue | Out-Null
+
+# Best-effort 14-day GC of stale per-session reads files. Sessions that
+# haven't been touched in two weeks are almost certainly abandoned;
+# keeping them around just wastes inodes. Errors suppressed: housekeeping
+# pass, not a correctness step.
+try {
+    Get-ChildItem -Path $SessionStateDir -Filter 'reads_*.txt' -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-14) } |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+} catch { }
 
 function Get-Field([string]$field) {
     if (-not $PY) { return "" }

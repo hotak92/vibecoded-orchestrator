@@ -46,6 +46,54 @@ if ($SessionId) {
     }
 }
 
+# Same reasoning for pre-tool-use.ps1's per-session reads file (Build Anchor
+# Protocol dedup). After compaction the LLM has lost its memory of which
+# files it Read pre-compaction, so the reads list is no longer meaningful
+# — Build Anchor should re-require a fresh Read before the next Write/Edit.
+# Note: we do NOT wipe $ProjectDir/.claude/state/tool_backups/ — those
+# have a different lifecycle (tool-call rollback, not dedup), and the
+# pre-tool-use hook runs its own 24h GC there.
+if ($SessionId) {
+    $ReadsFile = Join-Path $ProjectDir ".claude/state/reads_$SessionId.txt"
+    if (Test-Path $ReadsFile) {
+        Remove-Item $ReadsFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# v0.2.29: same reset for the agent-skill-keyword-suggest hook's
+# per-session dedup file. Without this, a "you might want to use skill X"
+# suggestion that was emitted before compaction would NEVER fire again
+# in the session — but post-compaction the user is plausibly starting a
+# fresh logical task and the suggestion may once again be relevant.
+# Path: $ProjectDir\.claude\state\keyword_suggest_<session_id>.txt.
+# Matches what `agent-skill-keyword-match.py::_dedup_file` writes to
+# (moved from $TMPDIR/claude_keyword_suggest/ to project-local state for
+# the same resume-across-reboot reasoning as the ctx_snapshot block below).
+if ($SessionId) {
+    $KwSeen = Join-Path $ProjectDir ".claude/state/keyword_suggest_$SessionId.txt"
+    if (Test-Path $KwSeen) {
+        Remove-Item $KwSeen -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Wipe diff-context-inject's per-session snapshot + compact flag. The
+# CONTEXT_STATE.md diff baseline should reset whenever the LLM's context
+# resets — PostCompact is the canonical reset point. Without this, the
+# first prompt after a /compact would emit a "changed sections" diff
+# anchored to the pre-compact baseline, which is incoherent (the LLM no
+# longer has the pre-compact view of CONTEXT_STATE.md). pre-compact-save.ps1
+# touches the compact flag as the cross-hook signal; this is the actual wipe.
+if ($SessionId) {
+    $CtxSnapshot = Join-Path $ProjectDir ".claude/state/ctx_snapshot_$SessionId"
+    $CtxCompactFlag = Join-Path $ProjectDir ".claude/state/ctx_compact_flag_$SessionId"
+    if (Test-Path $CtxSnapshot) {
+        Remove-Item $CtxSnapshot -Force -ErrorAction SilentlyContinue
+    }
+    if (Test-Path $CtxCompactFlag) {
+        Remove-Item $CtxCompactFlag -Force -ErrorAction SilentlyContinue
+    }
+}
+
 # Log compaction event under the user's home metrics dir.
 $UserHome = [System.Environment]::GetFolderPath('UserProfile')
 $LogDir = Join-Path $UserHome ".claude/metrics"

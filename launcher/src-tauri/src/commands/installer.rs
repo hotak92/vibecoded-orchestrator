@@ -3429,10 +3429,27 @@ pub async fn update_orchestrator<R: Runtime>(
     let pre_merge_committed = crate::commands::git_user_editable_merge::any_outcome_produced_synthetic_commit(
         &pre_merge_outcomes,
     );
+    // v0.2.29 (2026-05-23, post-v0.2.28 bugfix): add `--autostash` to the
+    // rebase path. Without it, ANY uncommitted change in the working tree
+    // outside the user-editable allowlist (typical for VCO_dev-style
+    // forks with WIP, or any user with in-progress local edits) causes
+    // `git pull --rebase` to abort with "cannot pull with rebase: You
+    // have unstaged changes". The pre-merge step only handles
+    // allowlisted paths; everything else needs autostash. Git stashes
+    // before the rebase, runs the rebase, then pops. On stash-pop
+    // conflict (rare — would require upstream to have touched the
+    // SAME lines the user has WIP changes on), git leaves the stash
+    // for manual recovery rather than silently dropping it.
+    //
+    // `--autostash` is a long-stable git feature (since 2.9, 2016-06)
+    // and is safe to pair with `--no-edit`. Adding it unconditionally
+    // is fine: if there are no uncommitted changes, the autostash is
+    // a no-op.
     let pull_args: &[&str] = if pre_merge_committed {
         &[
             "pull",
             "--rebase",
+            "--autostash",
             "--no-edit",
             crate::commands::self_update::VCO_UPSTREAM_REMOTE,
             &pull_branch,

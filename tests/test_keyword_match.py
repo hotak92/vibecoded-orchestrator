@@ -138,10 +138,21 @@ def test_parse_short_desc_ignored_when_nested(matcher):
 # ---------------------------------------------------------------------------
 
 
-def test_match_case_sensitive(matcher):
+def test_match_case_insensitive(matcher):
+    """v0.2.29: matching is now case-INsensitive.
+
+    Pre-v0.2.29 was case-sensitive (`UI` only matched `UI`). That choice
+    crippled most realistic matches — user prompts come in arbitrary
+    casing, so a keyword like `UI design` would never fire on "make me
+    a nice ui". The whole-word boundary check (separately tested below)
+    still keeps `UI` from matching inside `GUIDE` / `UIComponent`.
+    """
     assert matcher.matches_prompt("UI", "the UI is broken") is True
-    assert matcher.matches_prompt("UI", "the ui is broken") is False
-    assert matcher.matches_prompt("UI", "the Ui is broken") is False
+    assert matcher.matches_prompt("UI", "the ui is broken") is True
+    assert matcher.matches_prompt("UI", "the Ui is broken") is True
+    # Reverse: lowercase keyword matches mixed-case prompt.
+    assert matcher.matches_prompt("kubernetes", "review my Kubernetes manifest") is True
+    assert matcher.matches_prompt("kubernetes", "review my KUBERNETES manifest") is True
 
 
 def test_match_whole_word_negative(matcher):
@@ -361,11 +372,35 @@ def test_agent_without_keywords_is_excluded(tmp_path, matcher):
     assert names == {"yes-kw-agent"}
 
 
-def _run_matcher_subprocess(prompt: str, project_root: Path) -> subprocess.CompletedProcess:
+def _run_matcher_subprocess(
+    prompt: str,
+    project_root: Path,
+    session_id: str = "",
+    tmpdir: Path | None = None,
+) -> subprocess.CompletedProcess:
+    """Spawn the matcher as a subprocess (mirrors how the hook invokes it).
+
+    `session_id` (v0.2.29): pass through to `--session-id` so the dedup
+    state persists between calls in the same logical session. Empty
+    string disables dedup.
+    `tmpdir`: legacy parameter kept for API compatibility. v0.2.29 dedup
+    state lives in `<project_root>/.claude/state/` (not /tmp/), so the
+    `tmpdir` arg is now used as the `$VCT_KEYWORD_DEDUP_DIR` override
+    so tests can keep dedup state isolated per-test without colliding
+    on the project_root path that `_write_agent` already populates.
+    """
     env = os.environ.copy()
     env["CLAUDE_PROJECT_DIR"] = str(project_root)
+    if tmpdir is not None:
+        # v0.2.29: dedup state moved to .claude/state/, so $TMPDIR no
+        # longer scopes it. Use the matcher's test-override env var
+        # instead (see `_dedup_dir` in agent-skill-keyword-match.py).
+        env["VCT_KEYWORD_DEDUP_DIR"] = str(tmpdir)
+    args = [sys.executable, str(MATCHER_PATH)]
+    if session_id:
+        args += ["--session-id", session_id]
     return subprocess.run(
-        [sys.executable, str(MATCHER_PATH)],
+        args,
         input=prompt,
         capture_output=True,
         text=True,
@@ -460,12 +495,15 @@ def test_cli_block_form_frontmatter_end_to_end(tmp_path):
     assert "accessibility-checker" in result.stdout
 
 
-def test_cli_case_sensitive_no_match(tmp_path):
+def test_cli_case_insensitive_match(tmp_path):
+    """v0.2.29: lowercase prompt matches a capitalized keyword (and vice
+    versa). Pre-v0.2.29 this test asserted the opposite (case-sensitive
+    no-match); the new ergonomics fire on the casing the user actually
+    types."""
     _write_agent(tmp_path, "k", "k-agent", "keywords: [Kubernetes]\n")
-    # lowercase "kubernetes" must NOT match the keyword "Kubernetes".
     result = _run_matcher_subprocess("review my kubernetes manifest", tmp_path)
     assert result.returncode == 0
-    assert result.stdout == ""
+    assert "k-agent" in result.stdout
 
 
 def test_cli_word_boundary_no_match(tmp_path):
@@ -474,3 +512,127 @@ def test_cli_word_boundary_no_match(tmp_path):
     result = _run_matcher_subprocess("write me a GUIDE", tmp_path)
     assert result.returncode == 0
     assert result.stdout == ""
+
+
+# ---------------------------------------------------------------------------
+# v0.2.29: per-session dedup
+# ---------------------------------------------------------------------------
+
+
+def test_dedup_silent_on_second_match_same_session(tmp_path):
+    """First prompt with a matching keyword fires; second prompt with the
+    same keyword (or any other keyword for the same agent) is silent."""
+    _write_agent(tmp_path, "k", "k-agent", "keywords: [Kubernetes]\n")
+    tmpdir = tmp_path / "tmp"
+    tmpdir.mkdir()
+    sid = "session-aaa"
+
+    # First fire — emits the suggestion.
+    r1 = _run_matcher_subprocess(
+        "review my Kubernetes manifest", tmp_path, session_id=sid, tmpdir=tmpdir
+    )
+    assert r1.returncode == 0
+    assert "k-agent" in r1.stdout
+
+    # Second fire — same session, same match — should be silent.
+    r2 = _run_matcher_subprocess(
+        "fix my Kubernetes deployment", tmp_path, session_id=sid, tmpdir=tmpdir
+    )
+    assert r2.returncode == 0
+    assert r2.stdout == ""
+
+
+def test_dedup_isolated_across_sessions(tmp_path):
+    """Two different session_ids → dedup state is independent."""
+    _write_agent(tmp_path, "k", "k-agent", "keywords: [Kubernetes]\n")
+    tmpdir = tmp_path / "tmp"
+    tmpdir.mkdir()
+
+    r1 = _run_matcher_subprocess(
+        "Kubernetes", tmp_path, session_id="session-A", tmpdir=tmpdir
+    )
+    assert "k-agent" in r1.stdout
+
+    # Different session — should fire again.
+    r2 = _run_matcher_subprocess(
+        "Kubernetes", tmp_path, session_id="session-B", tmpdir=tmpdir
+    )
+    assert "k-agent" in r2.stdout
+
+
+def test_dedup_empty_session_disables_dedup(tmp_path):
+    """No --session-id supplied → dedup off, every fire emits."""
+    _write_agent(tmp_path, "k", "k-agent", "keywords: [Kubernetes]\n")
+    tmpdir = tmp_path / "tmp"
+    tmpdir.mkdir()
+
+    r1 = _run_matcher_subprocess("Kubernetes", tmp_path, tmpdir=tmpdir)
+    assert "k-agent" in r1.stdout
+    # Same call again — without dedup, still fires.
+    r2 = _run_matcher_subprocess("Kubernetes", tmp_path, tmpdir=tmpdir)
+    assert "k-agent" in r2.stdout
+
+
+def test_dedup_rejects_path_traversal_session_id(tmp_path):
+    """A malicious session_id with `/` or `..` MUST NOT cause the matcher
+    to write outside its tmpdir/claude_keyword_suggest/ namespace."""
+    _write_agent(tmp_path, "k", "k-agent", "keywords: [Kubernetes]\n")
+    tmpdir = tmp_path / "tmp"
+    tmpdir.mkdir()
+
+    bad_sids = ["../etc/passwd", "../../escape", "foo/bar", "absolute/path"]
+    for sid in bad_sids:
+        r = _run_matcher_subprocess(
+            "Kubernetes", tmp_path, session_id=sid, tmpdir=tmpdir
+        )
+        # Should still emit (dedup just disabled for invalid session_id).
+        assert r.returncode == 0
+        # And MUST NOT have created any file under tmpdir/claude_keyword_suggest
+        # whose path contains the unsafe components.
+        for path in (tmpdir / "claude_keyword_suggest").rglob("*") if (tmpdir / "claude_keyword_suggest").exists() else []:
+            rel = path.relative_to(tmpdir / "claude_keyword_suggest")
+            for part in rel.parts:
+                assert part != "..", f"path traversal: {path}"
+
+
+# ---------------------------------------------------------------------------
+# v0.2.29: skip README files
+# ---------------------------------------------------------------------------
+
+
+def test_readme_md_in_agents_dir_is_skipped(tmp_path):
+    """A user-added `.claude/agents/README.md` (even with bogus keywords
+    frontmatter) must NOT be parsed as an agent."""
+    agents_dir = tmp_path / ".claude" / "agents"
+    agents_dir.mkdir(parents=True)
+    (agents_dir / "README.md").write_text(
+        "---\nname: should-not-match\nkeywords: [pasta]\n---\n# README\n",
+        encoding="utf-8",
+    )
+    # Make a real agent that should match.
+    _write_agent(tmp_path, "real", "real-agent", "keywords: [pasta]\n")
+    result = _run_matcher_subprocess("show me pasta recipes", tmp_path)
+    assert result.returncode == 0
+    assert "real-agent" in result.stdout
+    assert "should-not-match" not in result.stdout
+
+
+def test_readme_subdir_in_skills_dir_is_skipped(tmp_path):
+    """A `.claude/skills/README/SKILL.md` directory layout is unusual but
+    legal on the filesystem; it MUST be skipped."""
+    skills_dir = tmp_path / ".claude" / "skills"
+    (skills_dir / "README").mkdir(parents=True)
+    (skills_dir / "README" / "SKILL.md").write_text(
+        "---\nname: bogus-readme-skill\nkeywords: [pasta]\n---\n",
+        encoding="utf-8",
+    )
+    # Real skill that should match.
+    (skills_dir / "real-skill").mkdir()
+    (skills_dir / "real-skill" / "SKILL.md").write_text(
+        "---\nname: real-skill\nkeywords: [pasta]\n---\n",
+        encoding="utf-8",
+    )
+    result = _run_matcher_subprocess("show me pasta", tmp_path)
+    assert result.returncode == 0
+    assert "real-skill" in result.stdout
+    assert "bogus-readme-skill" not in result.stdout

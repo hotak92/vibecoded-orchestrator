@@ -51,6 +51,46 @@ if [ -n "$SESSION_ID" ]; then
     [ -f "$SEEN_FILE" ] && rm -f "$SEEN_FILE"
 fi
 
+# Same reasoning for pre-tool-use.sh's per-session reads file (Build Anchor
+# Protocol dedup). After compaction the LLM has lost its memory of which
+# files it Read pre-compaction, so the reads list is no longer meaningful
+# — Build Anchor should re-require a fresh Read before the next Write/Edit.
+# Note: we do NOT wipe $PROJECT_DIR/.claude/state/tool_backups/ — those
+# have a different lifecycle (tool-call rollback, not dedup), and the
+# pre-tool-use hook runs its own 24h GC there.
+if [ -n "$SESSION_ID" ]; then
+    READS_FILE="$PROJECT_DIR/.claude/state/reads_${SESSION_ID}.txt"
+    [ -f "$READS_FILE" ] && rm -f "$READS_FILE" 2>/dev/null || true
+fi
+
+# v0.2.29: same reset for the agent-skill-keyword-suggest hook's
+# per-session dedup file. Without this, a "you might want to use skill X"
+# suggestion that was emitted before compaction would NEVER fire again
+# in the session — but post-compaction the user is plausibly starting a
+# fresh logical task and the suggestion may once again be relevant.
+# Path: $PROJECT_DIR/.claude/state/keyword_suggest_<session_id>.txt.
+# Matches what `agent-skill-keyword-match.py::_dedup_file` writes to
+# (moved from $TMPDIR/claude_keyword_suggest/ to project-local state for
+# the same resume-across-reboot reasoning as the ctx_snapshot block below).
+if [ -n "$SESSION_ID" ]; then
+    KW_SEEN="$PROJECT_DIR/.claude/state/keyword_suggest_${SESSION_ID}.txt"
+    [ -f "$KW_SEEN" ] && rm -f "$KW_SEEN"
+fi
+
+# Wipe diff-context-inject's per-session snapshot + compact flag. The
+# CONTEXT_STATE.md diff baseline should reset whenever the LLM's context
+# resets — PostCompact is the canonical reset point. Without this, the
+# first prompt after a /compact would emit a "changed sections" diff
+# anchored to the pre-compact baseline, which is incoherent (the LLM no
+# longer has the pre-compact view of CONTEXT_STATE.md). pre-compact-save.sh
+# touches the compact flag as the cross-hook signal; this is the actual wipe.
+if [ -n "$SESSION_ID" ]; then
+    CTX_SNAPSHOT="$PROJECT_DIR/.claude/state/ctx_snapshot_${SESSION_ID}"
+    CTX_COMPACT_FLAG="$PROJECT_DIR/.claude/state/ctx_compact_flag_${SESSION_ID}"
+    [ -f "$CTX_SNAPSHOT" ] && rm -f "$CTX_SNAPSHOT"
+    [ -f "$CTX_COMPACT_FLAG" ] && rm -f "$CTX_COMPACT_FLAG"
+fi
+
 # Log the compaction event
 LOG_DIR="$HOME/.claude/metrics"
 mkdir -p "$LOG_DIR"

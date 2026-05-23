@@ -33,15 +33,32 @@ try {
 }
 
 $ContextFile = ".claude/CONTEXT_STATE.md"
-$Tmp = if ($env:TMPDIR) { $env:TMPDIR } elseif ($env:TEMP) { $env:TEMP } else { "C:\Windows\Temp" }
-$SnapshotDir = Join-Path $Tmp "claude_ctx_snapshots"
+# Snapshot state lives under the project (gitignored .claude/state/) so it
+# survives reboots and launcher restarts — Claude Code's `resume` feature
+# can reuse a session_id across these boundaries, and a $TMPDIR-based path
+# would lose the diff baseline mid-session when /tmp is wiped on boot.
+# The `ctx_` filename prefix namespaces these files within the shared
+# .claude/state/ dir (which also holds seen_kg_titles_*, reads_*, etc.).
+if (-not $env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR = (Get-Location).Path }
+$SnapshotDir = Join-Path $env:CLAUDE_PROJECT_DIR ".claude/state"
 $SessionId = if ($SessionIdFromStdin) { $SessionIdFromStdin } else { "default" }
-$SnapshotFile = Join-Path $SnapshotDir "snapshot_$SessionId"
-$CompactFlag = Join-Path $SnapshotDir "compact_flag_$SessionId"
+$SnapshotFile = Join-Path $SnapshotDir "ctx_snapshot_$SessionId"
+$CompactFlag = Join-Path $SnapshotDir "ctx_compact_flag_$SessionId"
 
 if (-not (Test-Path $SnapshotDir)) {
     New-Item -ItemType Directory -Path $SnapshotDir -Force | Out-Null
 }
+
+# 14-day GC for stale ctx_snapshot_* files — sessions that haven't fired
+# in two weeks are stale enough that their baseline is no longer useful.
+# Best-effort. Doesn't touch the compact flags (short-lived sentinels,
+# cleaned by post-compact.ps1).
+try {
+    $GcCutoff = (Get-Date).AddDays(-14)
+    Get-ChildItem -Path $SnapshotDir -Filter "ctx_snapshot_*" -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -lt $GcCutoff } |
+        ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
+} catch { }
 
 # If compact flag exists, reset baseline.
 if (Test-Path $CompactFlag) {

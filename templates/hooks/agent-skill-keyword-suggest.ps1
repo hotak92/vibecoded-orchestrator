@@ -62,15 +62,18 @@ if (-not (Test-Path $Matcher)) {
 }
 
 # Hook input contract (v2.1.x): JSON payload on stdin. We need the `prompt`
-# field; session_id is not used by this hook (it's stateless).
+# field. v0.2.29: also extract `session_id` so the matcher can dedup
+# already-suggested items across prompts in the same session.
 $HookStdin = ""
 try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
 if (-not $HookStdin) { exit 0 }
 
 $Prompt = ""
+$SessionId = ""
 try {
     $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
     if ($payload -and $payload.prompt) { $Prompt = [string]$payload.prompt }
+    if ($payload -and $payload.session_id) { $SessionId = [string]$payload.session_id }
 } catch {
     # Malformed JSON → silent no-op.
 }
@@ -78,12 +81,13 @@ if (-not $Prompt) { exit 0 }
 
 # Run the matcher. Pipe the prompt to its stdin; capture stdout. The
 # matcher always exits 0 and prints either an empty string or 1-2 short
-# lines.
+# lines. v0.2.29: pass --session-id so the matcher can dedup. Empty
+# session_id → matcher's dedup just no-ops (back-compat).
 $prevProjectDir = $env:CLAUDE_PROJECT_DIR
 $env:CLAUDE_PROJECT_DIR = $ProjectRoot
 $Msg = ""
 try {
-    $Msg = ($Prompt | & $PY $Matcher 2>$null) -join "`n"
+    $Msg = ($Prompt | & $PY $Matcher --session-id $SessionId 2>$null) -join "`n"
 } catch {
     $Msg = ""
 } finally {

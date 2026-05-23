@@ -56,7 +56,11 @@ if [ -f "$(dirname "${BASH_SOURCE[0]}")/_lib/emit-context.sh" ]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# v0.2.29: prefer canonical $CLAUDE_PROJECT_DIR (the active workspace
+# the launcher hands us — source of truth for per-project hooks). Fall
+# back to SCRIPT_DIR/../.. for ad-hoc invocations (manual runs, tests)
+# that don't set the env var.
+PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 
 # Resolve a Python interpreter portably (python3 → python → py). Must run
 # BEFORE the stdin-parsing step below — bare `python3` is missing on
@@ -98,17 +102,28 @@ fi
 # back to "default" only if the payload is malformed (which would mean the
 # hook contract itself is broken — see _PARSED above).
 [ -z "$SESSION_ID" ] && SESSION_ID="default"
-CACHE_BASE="${TMPDIR:-/tmp}/claude_edit_cache_${SESSION_ID}"
+CACHE_BASE="$PROJECT_ROOT/.claude/state/edit_cache_${SESSION_ID}"
+mkdir -p "$CACHE_BASE" 2>/dev/null || true
+# v0.2.29 GC: prune per-session edit_cache_* directories older than 14 days.
+# `find -mtime +14` is portable across GNU/BSD find. Best-effort — failure
+# ignored. Keeps .claude/state/ bounded across heavy use.
+find "$PROJECT_ROOT/.claude/state" -maxdepth 1 -type d -name "edit_cache_*" -mtime +14 -exec rm -rf {} + 2>/dev/null || true
 CACHE_TTL=600  # 10 minutes in seconds
 
 # === Dedup tracking: skip KG/codegraph nodes already injected this session ===
 # State lives in the project directory (not /tmp/) so it survives reboots and
-# is co-located with the session's other ephemeral state. Wiped by the
-# PostCompact hook when the LLM's context is trimmed (so the dedup window
-# matches the actual context window the LLM sees).
+# is co-located with the session's other ephemeral state. The .claude/state/
+# directory is gitignored (line 104 of the orchestrator's .gitignore), so no
+# project-tree noise in git status / IDE file trees. Wiped by the PostCompact
+# hook when the LLM's context is trimmed (so the dedup window matches the
+# actual context window the LLM sees). v0.2.29 GC prunes ≥14d-old session
+# files so the directory stays bounded across heavy use.
 SEEN_DIR="$PROJECT_ROOT/.claude/state"
 mkdir -p "$SEEN_DIR" 2>/dev/null
 SEEN_NODES_FILE="$SEEN_DIR/seen_kg_titles_${SESSION_ID}.txt"
+# v0.2.29 GC: prune session files older than 14 days. `find -mtime +14`
+# is portable across GNU/BSD find. Best-effort — failure ignored.
+find "$SEEN_DIR" -maxdepth 1 -type f -name "seen_kg_titles_*.txt" -mtime +14 -delete 2>/dev/null || true
 
 # === Extract fields from TOOL_ARGS JSON ===
 _extract_field() {

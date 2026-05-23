@@ -44,9 +44,11 @@ Project root resolution:
 
 from __future__ import annotations
 
+import argparse
 import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 from typing import Iterable
 
@@ -213,7 +215,7 @@ def parse_short_desc(frontmatter: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Keyword matching (case-sensitive, whole-word)
+# Keyword matching (case-insensitive, whole-word)
 # ---------------------------------------------------------------------------
 
 
@@ -226,7 +228,11 @@ def matches_prompt(keyword: str, prompt: str) -> bool:
     """Return True if `keyword` appears in `prompt` with whole-word boundaries.
 
     Rules:
-    - Case-sensitive: `UI` matches `UI` but NOT `ui` or `Ui`.
+    - **Case-insensitive** (v0.2.29): `UI` matches `UI`, `ui`, and `Ui`.
+      Pre-v0.2.29 this was case-sensitive, but user prompts come in
+      arbitrary casing — case-sensitive matching crippled most realistic
+      matches (e.g. `keywords: [UI design]` not firing on "make me a nice
+      ui for this"). Lower-casing both sides recovers the common case.
     - Whole-word: the character immediately before the match (if any) and
       the character immediately after (if any) MUST NOT be `[A-Za-z0-9_]`.
       So `UI` matches `the UI is broken` but NOT `GUIDE`, `UIComponent`,
@@ -236,15 +242,20 @@ def matches_prompt(keyword: str, prompt: str) -> bool:
     """
     if not keyword:
         return False
-    klen = len(keyword)
+    # Case-insensitive: lowercase both sides. We still scan with .find()
+    # for O(n) performance vs regex compilation per keyword.
+    klow = keyword.lower()
+    plow = prompt.lower()
+    klen = len(klow)
     start = 0
     while True:
-        idx = prompt.find(keyword, start)
+        idx = plow.find(klow, start)
         if idx < 0:
             return False
-        # Left boundary check.
+        # Boundary check uses the ORIGINAL `prompt` so non-ASCII chars
+        # are still treated as non-word-chars by `_WORDCHAR` (ASCII-only
+        # regex). The lowercase comparison only changed the match search.
         left_ok = idx == 0 or not _WORDCHAR.match(prompt[idx - 1])
-        # Right boundary check.
         end_idx = idx + klen
         right_ok = end_idx == len(prompt) or not _WORDCHAR.match(prompt[end_idx])
         if left_ok and right_ok:
@@ -275,6 +286,13 @@ def _read_file(path: Path) -> str | None:
         return None
 
 
+# Filenames to skip when walking the agents/skills directories. v0.2.29:
+# defensive against users who drop a README.md alongside the .md agents
+# (matches the v0.2.22 fix that filtered README from the launcher's
+# populate path). Compared case-insensitively against the bare stem.
+_SKIP_STEMS = {"readme"}
+
+
 def collect_agents(root: Path) -> list[tuple[str, list[str], str]]:
     """Return [(display_name, keywords, short_desc), ...] for every agent file with keywords."""
     agents_dir = root / ".claude" / "agents"
@@ -282,7 +300,10 @@ def collect_agents(root: Path) -> list[tuple[str, list[str], str]]:
         return []
     out: list[tuple[str, list[str], str]] = []
     try:
-        candidates = sorted(p for p in agents_dir.glob("*.md") if p.is_file())
+        candidates = sorted(
+            p for p in agents_dir.glob("*.md")
+            if p.is_file() and p.stem.lower() not in _SKIP_STEMS
+        )
     except OSError:
         return []
     for path in candidates:
@@ -311,7 +332,15 @@ def collect_skills(root: Path) -> list[tuple[str, list[str], str]]:
         return []
     out: list[tuple[str, list[str], str]] = []
     try:
-        subdirs = sorted(p for p in skills_dir.iterdir() if p.is_dir())
+        # v0.2.29: skip a README-named subdirectory (defensive — matches
+        # the v0.2.22 launcher-populate convention). A skill is a directory
+        # containing SKILL.md, so a `skills/README.md` flat file is already
+        # filtered by the `is_dir()` check below; the case to guard against
+        # is `skills/readme/SKILL.md` (unusual but possible).
+        subdirs = sorted(
+            p for p in skills_dir.iterdir()
+            if p.is_dir() and p.name.lower() not in _SKIP_STEMS
+        )
     except OSError:
         return []
     for sub in subdirs:
@@ -377,11 +406,113 @@ def format_suggestion(
 
 
 # ---------------------------------------------------------------------------
+# Per-session dedup (v0.2.29)
+# ---------------------------------------------------------------------------
+#
+# Without dedup, every user prompt during a session that contains a
+# previously-matched keyword (or a keyword for an already-suggested item)
+# re-emits the same suggestion line. This wastes context tokens and
+# trains the user to ignore the additionalContext block. v0.2.29 adds
+# per-session dedup keyed on (agent|skill, display_name): once an item
+# has been suggested in this session, it won't be suggested again until
+# compaction resets the state.
+#
+# State location: `<project_root>/.claude/state/keyword_suggest_<session_id>.txt`
+# — same pattern as `pre-edit-context-inject.sh`'s `seen_kg_titles_*.txt`.
+# Project-local, gitignored (.claude/state/ is in the orchestrator's
+# .gitignore), survives reboot, bounded by the GC pass below. One line
+# per already-suggested item, prefixed with `a:` (agent) or `s:` (skill)
+# to avoid namespace collisions between an agent and a skill that share
+# a display name.
+#
+# Compaction reset: the PostCompact hook (`post-compact.sh`) deletes the
+# file so a new "what's available" surface fires after the user starts
+# a fresh logical task. Without `--session-id`, dedup is disabled and
+# the matcher emits every match every time (back-compat for direct
+# invocations e.g. from tests).
+
+
+def _dedup_dir() -> Path:
+    """Resolve the project-local `.claude/state/` directory.
+
+    Resolution chain mirrors the rest of this script (env-first, cwd
+    fallback). The directory is created lazily by `_persist_seen`.
+
+    TEST OVERRIDE: when `$VCT_KEYWORD_DEDUP_DIR` is set (any non-empty
+    value), it overrides the resolved path entirely. This lets tests
+    point dedup state at a tmp_path without having to fake
+    `CLAUDE_PROJECT_DIR` (which controls many other things).
+    """
+    override = os.environ.get("VCT_KEYWORD_DEDUP_DIR", "").strip()
+    if override:
+        return Path(override)
+    return _project_root() / ".claude" / "state"
+
+
+def _dedup_file(session_id: str) -> Path | None:
+    sid = session_id.strip()
+    if not sid:
+        return None
+    # Defensive: reject anything that isn't UUID-ish / safe slug to
+    # prevent path traversal. The session_id from Claude Code is always
+    # a UUID, so this allow-list is conservative.
+    if not re.match(r"^[A-Za-z0-9._-]+$", sid):
+        return None
+    return _dedup_dir() / f"keyword_suggest_{sid}.txt"
+
+
+def _load_seen(session_id: str) -> set[str]:
+    """Return the set of already-suggested entries for this session.
+
+    Each entry is a string of the form `a:<name>` or `s:<name>`. Returns
+    an empty set on any error path (file missing, unreadable, etc.).
+    """
+    f = _dedup_file(session_id)
+    if f is None or not f.is_file():
+        return set()
+    try:
+        return {line.strip() for line in f.read_text(encoding="utf-8").splitlines() if line.strip()}
+    except OSError:
+        return set()
+
+
+def _persist_seen(session_id: str, additions: Iterable[str]) -> None:
+    """Append the given entries to the per-session dedup file.
+
+    Best-effort. Any failure (permission denied, mkdir failure) is
+    silently swallowed — the hook MUST never raise. Worst case: a
+    suggestion fires twice in the same session.
+    """
+    additions_list = [a for a in additions if a]
+    if not additions_list:
+        return
+    f = _dedup_file(session_id)
+    if f is None:
+        return
+    try:
+        f.parent.mkdir(parents=True, exist_ok=True)
+        with f.open("a", encoding="utf-8") as fh:
+            for entry in additions_list:
+                fh.write(entry + "\n")
+    except OSError:
+        return
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 
-def main() -> int:
+def _parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("--session-id", default="", help="Per-session dedup key")
+    # Tolerate unknown args silently — the hook contract is "never block".
+    args, _unknown = p.parse_known_args(argv)
+    return args
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv if argv is not None else sys.argv[1:])
     try:
         prompt = sys.stdin.read()
     except Exception:
@@ -404,9 +535,26 @@ def main() -> int:
         if any_match(keywords, prompt):
             matched_skills.append((name, short_desc))
 
+    # Filter out already-suggested entries (per-session dedup). Key is
+    # the display NAME — PR #259's short_desc may change between turns
+    # (e.g. user re-edits the agent's frontmatter), but identity is the
+    # name. When no session_id is supplied, `seen` is empty → no
+    # filtering happens.
+    seen = _load_seen(args.session_id)
+    matched_agents = [(n, sd) for (n, sd) in matched_agents if f"a:{n}" not in seen]
+    matched_skills = [(n, sd) for (n, sd) in matched_skills if f"s:{n}" not in seen]
+
     message = format_suggestion(matched_agents, matched_skills)
     if message:
         sys.stdout.write(message + "\n")
+        # Persist BEFORE returning — if the user CTRL-Cs the next prompt,
+        # we still want the dedup state on disk so a future prompt in
+        # the same session doesn't re-suggest these.
+        _persist_seen(
+            args.session_id,
+            [f"a:{n}" for (n, _sd) in matched_agents]
+            + [f"s:{n}" for (n, _sd) in matched_skills],
+        )
     return 0
 
 

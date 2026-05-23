@@ -15,7 +15,7 @@
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
 
-set -eu
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -67,26 +67,36 @@ if [ ! -f "$MATCHER" ]; then
 fi
 
 # Hook input contract (v2.1.x): JSON payload on stdin. We need the `prompt`
-# field; session_id is not used by this hook (it's stateless).
+# field. v0.2.29: also extract `session_id` so the matcher can dedup
+# already-suggested items across prompts in the same session.
 HOOK_STDIN=$(cat 2>/dev/null || echo "")
 [ -z "$HOOK_STDIN" ] && exit 0
 
-PROMPT=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
+PROMPT_AND_SID=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
 import json, sys
 try:
     d = json.loads(sys.stdin.read())
     p = d.get('prompt', '')
+    s = d.get('session_id', '') or ''
+    # Emit two lines: session_id, then the prompt body. Empty session_id
+    # is fine (matcher dedup just no-ops in that case).
+    sys.stdout.write(str(s) + '\n')
     if p:
         sys.stdout.write(str(p))
 except Exception:
     pass
-" 2>/dev/null || printf '')
+" 2>/dev/null || printf '\n')
+
+SESSION_ID="$(printf '%s' "$PROMPT_AND_SID" | head -n 1)"
+PROMPT="$(printf '%s' "$PROMPT_AND_SID" | tail -n +2)"
 
 [ -z "$PROMPT" ] && exit 0
 
 # Run the matcher. It is pure-stdlib, always exits 0, prints either an
-# empty string (no matches) or 1-2 short lines.
-MSG=$(printf '%s' "$PROMPT" | CLAUDE_PROJECT_DIR="$PROJECT_ROOT" "$PY" "$MATCHER" 2>/dev/null || printf '')
+# empty string (no matches) or 1-2 short lines. v0.2.29: pass session_id
+# so the matcher can dedup already-suggested items across prompts in
+# the same session. Empty session_id → dedup disabled (back-compat).
+MSG=$(printf '%s' "$PROMPT" | CLAUDE_PROJECT_DIR="$PROJECT_ROOT" "$PY" "$MATCHER" --session-id "$SESSION_ID" 2>/dev/null || printf '')
 
 [ -z "$MSG" ] && exit 0
 

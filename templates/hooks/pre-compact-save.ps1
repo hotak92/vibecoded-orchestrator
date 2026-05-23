@@ -93,11 +93,14 @@ try {
 } catch { }
 
 # Set compact flag for diff-context-inject to reset its baseline.
-$Tmp = if ($env:TMPDIR) { $env:TMPDIR } elseif ($env:TEMP) { $env:TEMP } else { "C:\Windows\Temp" }
-$SnapshotDir2 = Join-Path $Tmp "claude_ctx_snapshots"
+# Project-local .claude/state/ — see diff-context-inject.ps1 for the
+# rationale (resume-across-reboot, $TMPDIR wipe immunity). Filename is
+# `ctx_compact_flag_*` to namespace within the shared dir and to stay
+# in lockstep with diff-context-inject.ps1's reader.
+$SnapshotDir2 = Join-Path $ProjectDir ".claude/state"
 if (-not (Test-Path $SnapshotDir2)) {
     New-Item -ItemType Directory -Path $SnapshotDir2 -Force | Out-Null
 }
-$flag = Join-Path $SnapshotDir2 "compact_flag_$SessionId"
+$flag = Join-Path $SnapshotDir2 "ctx_compact_flag_$SessionId"
 New-Item -ItemType File -Path $flag -Force | Out-Null
 exit 0
