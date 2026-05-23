@@ -4417,6 +4417,15 @@ def main() -> int:
 
     args = parser.parse_args()
 
+    # VCT_NON_INTERACTIVE env var: install.ps1 (line ~97) documents that
+    # this env var should trigger non-interactive mode, but install.py
+    # never honored it — only --yes / --quiet / non-TTY did. The .bat ->
+    # .ps1 -> .py chain sets the env var as a fallback when args don't
+    # propagate cleanly; lift it into args.yes here so all downstream
+    # gates (args.yes checks) see a consistent state.
+    if not args.yes and os.environ.get("VCT_NON_INTERACTIVE"):
+        args.yes = True
+
     # v0.2.6 Bug C1 — `--desktop-icon-only` short-circuits: run JUST the
     # icon step (post-install-launcher.sh) and exit. Skips Python version
     # checks, venv creation, etc. because the user already has a working
@@ -10232,21 +10241,34 @@ def _start_services(
         cmd.extend(services_to_start)
         print(f"  Starting only: {', '.join(services_to_start)}")
 
-    # 15 min cap: first-run pulls of weaviate + ollama images can take a while
-    # on slow links, but a hung daemon should not block us forever.
+    # 15 min default cap: first-run pulls of weaviate + ollama images can
+    # take a while on slow links, but a hung daemon should not block us
+    # forever. Configurable via VCT_INSTALL_DOCKER_TIMEOUT (seconds) — bump
+    # for slow domestic links + cold cache (2026-05-23 observed: weaviate
+    # 1.28.4 pull alone is ~250MB and can hit the 15min wall on residential
+    # DSL while the daemon is still healthy and pulling in the background).
+    docker_timeout = 900
+    timeout_env = os.environ.get("VCT_INSTALL_DOCKER_TIMEOUT", "").strip()
+    if timeout_env:
+        try:
+            docker_timeout = max(60, int(timeout_env))
+        except ValueError:
+            pass
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, cwd=str(infra_dir), timeout=900,
+            cmd, capture_output=True, text=True, cwd=str(infra_dir), timeout=docker_timeout,
         )
     except subprocess.TimeoutExpired:
-        print("  FAIL (timed out after 15 min)")
+        timeout_min = docker_timeout // 60
+        print(f"  FAIL (timed out after {timeout_min} min)")
         print(f"  Container daemon may be hung. Try manually:")
         print(f"    cd {infra_dir}")
         print(f"    {' '.join(compose_cmd)} up -d")
+        print(f"  Or bump the timeout: VCT_INSTALL_DOCKER_TIMEOUT=1800 python install.py ...")
         _log_install_event(
             "5/10", "error",
-            "compose up timed out after 15 min",
-            data={"runtime": sysinfo.container_cmd},
+            f"compose up timed out after {timeout_min} min",
+            data={"runtime": sysinfo.container_cmd, "timeout_sec": docker_timeout},
         )
         sys.exit(1)
     if result.returncode != 0:
