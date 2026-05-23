@@ -1,6 +1,7 @@
 ---
 name: idempotency-keys
 description: Designs the idempotency strategy for a state-changing operation - key derivation, storage choice, TTL, collision handling, and threading through downstream side effects. Use when adding a new endpoint with side effects, hardening an existing one, or designing a workflow that survives retries
+short_desc: idempotency strategy for state-changing endpoints
 keywords: [idempotency, idempotency key, dedup token, retry-safe, duplicate prevention, "idempotent endpoint", "retry safe operation", "prevent duplicates", "safe to retry", "idempotency design"]
 model: opus
 effort: high
