@@ -1,6 +1,7 @@
 ---
 name: structured-output-extraction
 description: Builds a reliable LLM-powered extraction pipeline for messy inputs (PDFs, emails, transcripts, HTML) into a strict JSON schema with validation, automated correction loop, and observability. Use when designing extraction from unstructured documents or hardening one that fails too often
+short_desc: LLM JSON extraction pipeline with validation + corrections
 keywords: [JSON extraction, schema validation, extraction pipeline, LLM extraction, Pydantic, unstructured data, "extract from PDF", "extract from email", "structured output", "JSON schema", "messy input", "extraction from documents"]
 model: opus
 effort: high

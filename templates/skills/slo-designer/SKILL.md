@@ -1,6 +1,7 @@
 ---
 name: slo-designer
 description: Designs SLIs, SLOs, and multi-window multi-burn-rate alerts from a service description, then emits the Prometheus recording rules and alerting rules. Invoke when a service needs its first SLO, when an existing threshold-alert is flapping or missing real incidents, or when an SRE team is operationalising error budgets.
+short_desc: SLI/SLO design + Prometheus burn-rate alert rules
 keywords: [SLI, SLO, error budget, burn rate, multi-window, Prometheus alerting, "monitoring setup"]
 model: opus
 effort: high

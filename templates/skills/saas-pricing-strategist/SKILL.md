@@ -1,6 +1,7 @@
 ---
 name: saas-pricing-strategist
 description: Analyses a SaaS product's pricing page (current and competitor) and produces a concrete redesign with tier structure, value metric, anchoring, annual-discount math, and a measurable rollout plan. Invoked when the user asks "is my pricing right", "review my pricing page", "compare my pricing to [competitor]", "how should I raise prices", "should I add a third tier", or shares a competitor pricing URL with intent to react.
+short_desc: pricing page redesign with tiers, value metric, rollout plan
 keywords: [SaaS pricing, pricing page, tier structure, value metric, pricing anchoring, annual discount, "SaaS metrics", "pricing strategy", "review pricing", "pricing tiers", "raise prices", "compare pricing", "competitor pricing", "pricing page redesign"]
 model: opus
 effort: high

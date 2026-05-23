@@ -1,6 +1,7 @@
 ---
 name: stats-consult
 description: Recommends the appropriate statistical test given a data description and research question, including assumption checks, alternatives if violated, sample-size guidance, and effect-size reporting. Use when the user asks "what test should I use", "is this t-test the right choice", "how many subjects do I need", "what's the right way to analyse this dataset", or describes a dataset + hypothesis without a chosen method.
+short_desc: choose statistical test + assumptions + power analysis
 keywords: [t-test, ANOVA, power analysis, Mann-Whitney, chi-squared, Wilcoxon, p-value]
 model: opus
 effort: high

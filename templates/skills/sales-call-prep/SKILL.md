@@ -1,6 +1,7 @@
 ---
 name: sales-call-prep
 description: Produces a one-pager prep doc for an upcoming sales call (discovery, demo, negotiation). Given a prospect's LinkedIn URL and company URL (plus optionally their last email/reply), generates company context, likely buying-committee map, expected pain points, discovery questions, objection-handling cheat sheet, and the first 60-second pitch. Use before any call where you have < 15 min to prep.
+short_desc: one-pager: prospect, pains, discovery Q's, objections
 keywords: [discovery call, sales prospect, buying committee, objection handling, MEDDIC, BANT, sales call]
 argument-hint: "[LinkedIn URL] [company URL] [optional: last email/context]"
 model: opus
