@@ -1,6 +1,7 @@
 ---
 name: consulting-cto-portfolio-coordinator
 description: Coordinates a multi-client consulting portfolio - synthesises status across active engagements, surfaces escalations, and produces stakeholder-ready summaries
+keywords: [consulting portfolio, multi-client, stakeholder summary, escalation triage, portfolio digest, engagement roll-up]
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: opus
 effort: high

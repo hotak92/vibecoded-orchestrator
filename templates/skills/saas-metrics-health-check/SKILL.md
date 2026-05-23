@@ -1,6 +1,7 @@
 ---
 name: saas-metrics-health-check
 description: Performs a diagnostic on a SaaS product's revenue and retention metrics from a CSV or spreadsheet of customers/subscriptions/events. Computes MRR, ARR, churn (gross/net), LTV, CAC, payback period, quick ratio, and cohort retention; flags anomalies; identifies the single highest-leverage fix. Invoked when the user asks "are my SaaS metrics healthy", "compute LTV for my data", "is my churn high", "review my MRR breakdown", or shares a billing/customer CSV.
+keywords: [MRR, ARR, churn, LTV, CAC, quick ratio, cohort retention, SaaS metrics]
 model: opus
 effort: high
 ---
