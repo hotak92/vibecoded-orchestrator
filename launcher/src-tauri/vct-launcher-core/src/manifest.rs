@@ -264,6 +264,16 @@ pub enum ConfigControl {
     /// checkboxes for each option. Selected ids are persisted as a
     /// JSON array via the generic setting store, and pushed to
     /// `on_change` when set.
+    ///
+    /// v0.2.32 (L6): `options_source` now accepts `Vec<SelectOption>`
+    /// with optional `badge` + `meta` fields per option (back-compat:
+    /// bare-string lists `["a", "b"]` still deserialise — see
+    /// [`SelectOption`]). The optional `filter` field hides options
+    /// whose metadata doesn't match a runtime value (e.g. only show
+    /// weight-bundle options whose `embedding_source` matches the
+    /// project's `container.active_embedding`). v1 supports
+    /// `kind = "match"` only; future kinds (regex, range, contains)
+    /// land additively.
     #[serde(rename = "multi_select")]
     MultiSelect {
         id: String,
@@ -271,8 +281,15 @@ pub enum ConfigControl {
         #[serde(default)]
         tooltip: Option<String>,
         /// Tauri command name OR structured descriptor returning
-        /// `Vec<{value, label}>`.
+        /// `Vec<SelectOption>` (back-compat: plain `["a", "b"]` also
+        /// accepted).
         options_source: ActionRef,
+        /// v0.2.32: optional runtime-driven option filter. When set,
+        /// the renderer hides options whose `meta.<meta_field>` ≠ the
+        /// resolved runtime value. Defer-friendly: omit ⇒ all options
+        /// visible (pre-v0.2.32 behaviour).
+        #[serde(default)]
+        filter: Option<MultiSelectFilter>,
         #[serde(default)]
         on_change: Option<ActionRef>,
     },
@@ -538,10 +555,114 @@ fn default_link_target() -> String {
     "external".into()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Option in a `select` or `multi_select` control.
+///
+/// v0.2.32 (L6): extended with optional `badge` + `meta` for richer
+/// rendering (e.g. "new" pill on freshly-released bundles, opaque
+/// per-option metadata the renderer's `filter` predicate can match
+/// against).
+///
+/// **Back-compat**: deserialises from EITHER a JSON object
+/// (`{"value":"a","label":"A"}` — possibly with optional badge/meta)
+/// OR a bare string (`"a"`, which becomes
+/// `SelectOption { value: "a", label: "a", badge: None, meta: None }`).
+/// This lets `options_source` callers return plain `Vec<String>`
+/// without breaking pre-v0.2.32 callers. The custom serde impl below
+/// implements this duality — keep it in sync with the doc comment.
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct SelectOption {
     pub value: String,
     pub label: String,
+    /// Optional pill / tag rendered next to the label (e.g. "new",
+    /// "deprecated"). Skipped during serialisation when `None` so the
+    /// over-the-wire payload stays minimal for back-compat clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub badge: Option<String>,
+    /// Free-form per-option metadata. Consumed by the renderer's
+    /// `MultiSelectFilter` evaluator (top-level keys are looked up by
+    /// `meta_field`). Opaque to Rust — Tauri commands can stuff
+    /// whatever shape they like in here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Value>,
+}
+
+impl<'de> Deserialize<'de> for SelectOption {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Untagged: accept either a JSON string OR a JSON object.
+        // The string form is the v0.2.32 back-compat for callers that
+        // return `["a", "b"]` (e.g. legacy multi_select options
+        // sources that pre-date the `{value, label}` contract).
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Bare(String),
+            Full {
+                value: String,
+                #[serde(default)]
+                label: Option<String>,
+                #[serde(default)]
+                badge: Option<String>,
+                #[serde(default)]
+                meta: Option<serde_json::Value>,
+            },
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        Ok(match raw {
+            Raw::Bare(s) => SelectOption {
+                value: s.clone(),
+                label: s,
+                badge: None,
+                meta: None,
+            },
+            Raw::Full { value, label, badge, meta } => SelectOption {
+                label: label.unwrap_or_else(|| value.clone()),
+                value,
+                badge,
+                meta,
+            },
+        })
+    }
+}
+
+/// Runtime-driven filter for [`ConfigControl::MultiSelect`] options.
+///
+/// v0.2.32 ships ONE kind: `match`. The renderer evaluates the filter
+/// when rendering options — entries whose `meta.<meta_field>` does
+/// not equal the runtime-resolved value referenced by
+/// `equals_runtime` are hidden (or rendered disabled with a tooltip,
+/// implementation choice owned by the renderer).
+///
+/// `equals_runtime` is a dotted identifier the renderer resolves
+/// against well-known runtime values. v0.2.32 supports exactly one:
+///   * `"container.active_embedding"` — the project's
+///     `ACTIVE_EMBEDDING` env var (typically `qwen3`, `arctic`,
+///     `openai`, or a future identifier). Resolved via a Tauri
+///     command in the renderer; default `"qwen3"` if the lookup
+///     fails (matches `module_service::DEFAULT_EMBEDDING_SOURCE`).
+///
+/// Future kinds (regex, range, contains) land additively as new
+/// variants on the enum — the `#[serde(tag = "kind")]` shape keeps
+/// the wire format extension-friendly.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind")]
+pub enum MultiSelectFilter {
+    /// Show only options whose `meta.<meta_field>` exactly equals the
+    /// runtime value resolved from `equals_runtime`. String equality
+    /// only — for numeric / regex comparison, future kinds.
+    #[serde(rename = "match")]
+    Match {
+        /// Top-level key on each option's `meta` JSON object to look
+        /// up. SQL-identifier shape recommended (no dots).
+        meta_field: String,
+        /// Runtime-value identifier. v0.2.32 supports
+        /// `"container.active_embedding"` only. Unknown identifiers
+        /// MUST NOT panic the renderer — they should fall back to
+        /// "no filtering" (show all options).
+        equals_runtime: String,
+    },
 }
 
 // ─── v0.2.26: ActionRef + ActionDescriptor ──────────────────────────────
@@ -1762,13 +1883,149 @@ mod tests {
         let manifest = ModuleManifest::from_json(gui_block_fixture_manifest()).unwrap();
         let controls = &manifest.gui.unwrap().config_tab.unwrap().sections[1].controls;
         match &controls[1] {
-            ConfigControl::MultiSelect { id, options_source, tooltip, .. } => {
+            ConfigControl::MultiSelect { id, options_source, tooltip, filter, .. } => {
                 assert_eq!(id, "ms1");
                 assert_eq!(action_ref_as_legacy(options_source), "list_options");
                 assert!(tooltip.is_some(), "tooltip declared in fixture");
+                // v0.2.32: pre-L6 fixture doesn't declare a filter — must
+                // deserialise as None (back-compat).
+                assert!(filter.is_none(), "fixture has no filter declared");
             }
             other => panic!("expected MultiSelect, got {:?}", other),
         }
+    }
+
+    // ─── v0.2.32 L6: SelectOption back-compat + MultiSelectFilter ─────
+
+    /// Bare-string list MUST deserialise — caller convenience for
+    /// `options_source` that returns plain `["a", "b"]`.
+    #[test]
+    fn select_option_back_compat_string_deserialization() {
+        let raw = r#"["a", "b", "qwen3"]"#;
+        let opts: Vec<SelectOption> =
+            serde_json::from_str(raw).expect("bare-string list must parse");
+        assert_eq!(opts.len(), 3);
+        assert_eq!(opts[0].value, "a");
+        assert_eq!(opts[0].label, "a", "label defaults to value for bare strings");
+        assert!(opts[0].badge.is_none());
+        assert!(opts[0].meta.is_none());
+        assert_eq!(opts[2].value, "qwen3");
+        assert_eq!(opts[2].label, "qwen3");
+    }
+
+    /// Full object form parses all four fields (value, label, badge, meta).
+    #[test]
+    fn select_option_full_object_deserialization() {
+        let raw = r#"[
+            {"value": "a", "label": "Option A", "badge": "new",
+             "meta": {"embedding_source": "qwen3", "size_mb": 12}},
+            {"value": "b", "label": "Option B"}
+        ]"#;
+        let opts: Vec<SelectOption> =
+            serde_json::from_str(raw).expect("rich object list must parse");
+        assert_eq!(opts.len(), 2);
+        assert_eq!(opts[0].value, "a");
+        assert_eq!(opts[0].label, "Option A");
+        assert_eq!(opts[0].badge.as_deref(), Some("new"));
+        let meta = opts[0].meta.as_ref().expect("meta declared");
+        assert_eq!(meta["embedding_source"], "qwen3");
+        assert_eq!(meta["size_mb"], 12);
+        // Second option: badge / meta absent ⇒ None
+        assert_eq!(opts[1].value, "b");
+        assert_eq!(opts[1].label, "Option B");
+        assert!(opts[1].badge.is_none());
+        assert!(opts[1].meta.is_none());
+    }
+
+    /// Mixed list — strings AND objects — also parses.
+    #[test]
+    fn select_option_mixed_list_deserialization() {
+        let raw = r#"["bare", {"value": "rich", "label": "Rich"}]"#;
+        let opts: Vec<SelectOption> = serde_json::from_str(raw).unwrap();
+        assert_eq!(opts.len(), 2);
+        assert_eq!(opts[0].value, "bare");
+        assert_eq!(opts[0].label, "bare");
+        assert_eq!(opts[1].value, "rich");
+        assert_eq!(opts[1].label, "Rich");
+    }
+
+    /// Object without `label` defaults to `value` as the label.
+    #[test]
+    fn select_option_missing_label_defaults_to_value() {
+        let raw = r#"[{"value": "alone"}]"#;
+        let opts: Vec<SelectOption> = serde_json::from_str(raw).unwrap();
+        assert_eq!(opts.len(), 1);
+        assert_eq!(opts[0].value, "alone");
+        assert_eq!(opts[0].label, "alone", "label falls back to value");
+    }
+
+    /// A manifest carrying `filter: {kind: "match", ...}` on a
+    /// multi_select control MUST deserialise. Pinning the wire shape:
+    /// future renderer / Tauri-command work depends on these field
+    /// names landing in the manifest JSON exactly as written here.
+    #[test]
+    fn multi_select_filter_match_deserialization() {
+        let raw = r#"{
+            "id": "test-mod",
+            "name": "Test Module",
+            "version": "0.1.0",
+            "category": "paid-orchestrator",
+            "license": { "min_orchestrator_tier": "free" },
+            "install": { "method": "git_clone", "source": "https://example.com/x.git" },
+            "runtime": { "type": "service", "command": "echo" },
+            "gui": {
+                "config_tab": {
+                    "title": "T",
+                    "sections": [{
+                        "title": "S",
+                        "collapsible": false,
+                        "controls": [{
+                            "kind": "multi_select",
+                            "id": "ms_with_filter",
+                            "label": "Pick weights",
+                            "options_source": "list_global_weights",
+                            "filter": {
+                                "kind": "match",
+                                "meta_field": "embedding_source",
+                                "equals_runtime": "container.active_embedding"
+                            }
+                        }]
+                    }]
+                }
+            }
+        }"#;
+        let manifest = ModuleManifest::from_json(raw).expect("manifest must parse");
+        let controls = &manifest.gui.unwrap().config_tab.unwrap().sections[0].controls;
+        match &controls[0] {
+            ConfigControl::MultiSelect { id, filter, .. } => {
+                assert_eq!(id, "ms_with_filter");
+                let f = filter.as_ref().expect("filter declared");
+                match f {
+                    MultiSelectFilter::Match { meta_field, equals_runtime } => {
+                        assert_eq!(meta_field, "embedding_source");
+                        assert_eq!(equals_runtime, "container.active_embedding");
+                    }
+                }
+            }
+            other => panic!("expected MultiSelect with filter, got {:?}", other),
+        }
+    }
+
+    /// Round-trip: serialise a MultiSelectFilter::Match then parse it
+    /// back. Catches accidental changes to the tag/field names.
+    #[test]
+    fn multi_select_filter_match_round_trip() {
+        let f = MultiSelectFilter::Match {
+            meta_field: "embedding_source".into(),
+            equals_runtime: "container.active_embedding".into(),
+        };
+        let json = serde_json::to_string(&f).unwrap();
+        // Tag-name pinning — the renderer's JS-side switch depends on this.
+        assert!(json.contains(r#""kind":"match""#), "tag must be 'match': {}", json);
+        assert!(json.contains(r#""meta_field":"embedding_source""#));
+        assert!(json.contains(r#""equals_runtime":"container.active_embedding""#));
+        let back: MultiSelectFilter = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, f);
     }
 
     #[test]

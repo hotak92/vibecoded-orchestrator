@@ -1093,6 +1093,14 @@ pub fn run() {
             // container-owned `rl_weights_state` (shipped by vct-rl-
             // reranker v0.2.6 via its module-shipped migration).
             commands::module_db_client::module_db_read_row,
+            // v0.2.32 #D: explicit "download default RL weights" command
+            // + L6 runtime-value resolver for MultiSelectFilter.
+            // Manifest buttons dispatch the first via `tauri_command`
+            // action kind; the renderer calls the second when applying
+            // `filter: {kind: "match", equals_runtime: "..."}` to a
+            // multi_select's options list.
+            commands::module_default_weights::module_download_default_weights,
+            commands::module_default_weights::module_get_runtime_value,
             // Stream 2 (2026-05-19): module-contributed GUI tabs +
             // generic per-control state. `get_module_nav_items` feeds the
             // Sidebar's module nav group; the get/set setting pair is the

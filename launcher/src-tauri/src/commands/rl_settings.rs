@@ -53,9 +53,14 @@ pub struct ProjectOption {
 
 impl From<ProjectOption> for SelectOption {
     fn from(p: ProjectOption) -> Self {
+        // v0.2.32 L6: SelectOption gained `badge` + `meta` (optional,
+        // serde-default to None). Project-options carry no per-option
+        // metadata so we leave both empty — back-compat preserved.
         SelectOption {
             value: p.value,
             label: p.label,
+            badge: None,
+            meta: None,
         }
     }
 }

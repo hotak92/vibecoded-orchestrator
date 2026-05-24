@@ -36,7 +36,12 @@
     type ActionRef,
     type ConfigControl,
     type ConfigTab,
+    type SelectOption,
   } from '$lib/types/manifest';
+  // v0.2.32 L6: filter logic extracted for testability — the Svelte
+  // component is now declarative-only and the predicate is a pure
+  // function over (options, filter, runtime values).
+  import { filterOptions as filterMultiSelectOptions } from '$lib/components/module-controls/multiSelectFilter';
   import TextInputControl from '$lib/components/module-controls/TextInputControl.svelte';
   import NumberInputControl from '$lib/components/module-controls/NumberInputControl.svelte';
   import StatusDisplayControl from '$lib/components/module-controls/StatusDisplayControl.svelte';
@@ -151,7 +156,19 @@
   // + writes on change). `optionsByControl` caches dynamic options
   // returned by a multi_select's `options_source` command.
   let values = $state<Record<string, unknown>>({});
-  let optionsByControl = $state<Record<string, { value: string; label: string }[]>>({});
+  // v0.2.32 L6: option rows now carry optional `badge` + `meta` per
+  // `SelectOption`. Pre-v0.2.32 callers that return bare strings or
+  // `{value,label}` still work — the Rust deserializer normalises
+  // both into the rich shape before the wire crosses to JS.
+  let optionsByControl = $state<Record<string, SelectOption[]>>({});
+
+  // v0.2.32 L6: cache of resolved runtime values for `MultiSelectFilter`.
+  // Keyed by the `equals_runtime` identifier (e.g.
+  // `"container.active_embedding"`). Populated on mount via the same
+  // lookup the filter evaluator uses, then read synchronously when
+  // rendering. Unknown identifiers stay absent ⇒ filter falls back
+  // to "show all options" (per L6 spec — never panic).
+  let runtimeValues = $state<Record<string, string>>({});
 
   // Section collapse state. Keyed by section_idx. Initialized lazily
   // (we don't want to overwrite user toggles on every reactive run).
@@ -243,7 +260,51 @@
         await loadSectionState(i);
       }
     }
+
+    // v0.2.32 L6: collect every `filter.equals_runtime` identifier
+    // referenced by a multi_select, then resolve them in parallel via
+    // `module_get_runtime_value`. The resolved strings live in
+    // `runtimeValues` so the filter-application code below can read
+    // synchronously at render time.
+    const runtimeKeysToResolve = new Set<string>();
+    for (let i = 0; i < configTab.sections.length; i++) {
+      for (const control of configTab.sections[i].controls) {
+        if (control.kind !== 'multi_select') continue;
+        if (control.filter && control.filter.kind === 'match') {
+          runtimeKeysToResolve.add(control.filter.equals_runtime);
+        }
+      }
+    }
+
+    // Resolve runtime values in parallel. Each lookup is independent
+    // (different identifier ⇒ different backing source) so we don't
+    // serialise. Errors fall back to empty string ⇒ filter treats
+    // the option as non-matching (per the L6 "fail-open" choice in
+    // `filterOptions` below).
+    await Promise.all(
+      Array.from(runtimeKeysToResolve).map(async (key) => {
+        try {
+          const v = await invoke<string>('module_get_runtime_value', {
+            projectId,
+            key,
+          });
+          runtimeValues[key] = v ?? '';
+        } catch (e) {
+          console.warn(
+            `[ModuleConfigTab] module_get_runtime_value failed for ${key}:`,
+            e,
+          );
+          runtimeValues[key] = '';
+        }
+      }),
+    );
   });
+
+  // v0.2.32 L6: the inline `filterOptions` previously lived here. It
+  // has been extracted to `$lib/components/module-controls/multiSelectFilter`
+  // as a pure function `(opts, filter, runtimeValues) → opts` so it
+  // can be exercised by a TS test runner without DOM. Import name
+  // aliased to `filterMultiSelectOptions` to avoid shadowing.
 
   /**
    * Load persisted control values + multi_select options for a single
@@ -297,7 +358,7 @@
       if (control.kind !== 'multi_select') continue;
       const k = ckey(sectionIdx, control.id);
       try {
-        const opts = await dispatchAction<{ value: string; label: string }[]>(
+        const opts = await dispatchAction<SelectOption[]>(
           control.options_source,
           null,
           {},
@@ -688,7 +749,8 @@
                 </div>
               {:else if control.kind === 'multi_select'}
                 {@const currentVal = (values[k] as string[] | undefined) ?? []}
-                {@const opts = optionsByControl[k] ?? []}
+                {@const rawOpts = optionsByControl[k] ?? []}
+                {@const opts = filterMultiSelectOptions(rawOpts, control.filter, runtimeValues)}
                 <div class="control-row vstack">
                   <span class="control-label-row">
                     <span class="control-label">{control.label}</span>
@@ -722,6 +784,9 @@
                             }}
                           />
                           <span>{opt.label}</span>
+                          {#if opt.badge}
+                            <span class="opt-badge">{opt.badge}</span>
+                          {/if}
                         </label>
                       {/each}
                     </div>
@@ -1044,6 +1109,23 @@
     align-items: center;
     gap: 8px;
     font-size: 13px;
+  }
+  /* v0.2.32 L6: optional pill rendered next to a multi_select option's
+     label when `SelectOption.badge` is populated (e.g. "new",
+     "deprecated"). Subtle by default — module manifests can override
+     via per-control styles in future. */
+  .opt-badge {
+    display: inline-block;
+    padding: 1px 6px;
+    margin-left: 4px;
+    font-size: 10px;
+    font-weight: 600;
+    line-height: 1.4;
+    color: var(--color-muted);
+    background: var(--color-bg-subtle, rgba(0, 0, 0, 0.06));
+    border-radius: 999px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
   }
   .empty-options {
     margin: 0;

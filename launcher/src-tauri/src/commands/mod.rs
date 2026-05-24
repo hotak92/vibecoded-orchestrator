@@ -31,6 +31,12 @@ pub mod licensing;
 pub mod maintenance;
 pub mod manifest;
 pub mod module_db;
+// v0.2.32 #D: explicit "download default RL weights" Tauri command +
+// runtime-value resolver for L6 MultiSelectFilter. Separate from
+// `module_service` because the upstream flow (daily poller + apply
+// + finetune) is distinct from this one-shot "give me the .pt now"
+// path the manifest button dispatches.
+pub mod module_default_weights;
 pub mod module_deprecation;
 pub mod module_dispatch;
 pub mod module_gui;

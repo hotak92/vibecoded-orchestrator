@@ -101,13 +101,52 @@ export interface CheckboxControl {
   on_change?: ActionRef | null;
 }
 
+/**
+ * v0.2.32 L6: runtime-driven filter for `multi_select` options.
+ *
+ * `kind: "match"` hides options whose `meta.<meta_field>` doesn't
+ * equal the runtime-resolved value of `equals_runtime`. v1 supports
+ * `equals_runtime: "container.active_embedding"` only; unknown
+ * identifiers MUST fall back to "no filtering" (show all options) —
+ * the renderer never panics on unrecognised runtime keys.
+ *
+ * Future filter kinds (regex, range, contains) land as new union
+ * variants on this type.
+ */
+export type MultiSelectFilter = {
+  kind: 'match';
+  meta_field: string;
+  equals_runtime: string;
+};
+
 export interface MultiSelectControl {
   kind: 'multi_select';
   id: string;
   label: string;
   tooltip?: string | null;
   options_source: ActionRef;
+  /** v0.2.32 L6: runtime-driven option filter. Omit ⇒ all options visible. */
+  filter?: MultiSelectFilter | null;
   on_change?: ActionRef | null;
+}
+
+/**
+ * v0.2.32 L6 mirror of Rust's `SelectOption`. Back-compat: callers
+ * that return bare strings get those mapped to
+ * `{ value, label: value, badge: undefined, meta: undefined }` on the
+ * Rust side BEFORE crossing the Tauri bridge — so by the time JS sees
+ * a `SelectOption`, the rich shape is normalised.
+ *
+ * `badge` is an optional pill rendered next to the label (e.g. "new").
+ * `meta` carries opaque per-option metadata that `MultiSelectFilter`
+ * predicates match against (e.g. `{embedding_source: "qwen3"}`).
+ */
+export interface SelectOption {
+  value: string;
+  label: string;
+  badge?: string | null;
+  /** Opaque per-option metadata. Top-level keys are looked up by `MultiSelectFilter`. */
+  meta?: Record<string, unknown> | null;
 }
 
 export interface ButtonControl {
