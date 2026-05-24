@@ -123,6 +123,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "module_installs: extend status CHECK with 'broken' (v0.2.33 Agent C — startup reconciler marks rows with missing on-disk manifest as 'broken' so the GUI funnels users to Reinstall instead of Restart)",
         sql: include_str!("migrations/021_module_installs_broken_status.sql"),
     },
+    Migration {
+        version: 22,
+        description: "diagrams registry: project_diagrams + diagram_snapshots + diagram_access + project_mcp_tool_grants + project_modules + diagram_index_retry (Excalidraw/Mermaid Phase 1.1 + 1.5.A retry-queue)",
+        sql: include_str!("migrations/022_diagrams.sql"),
+    },
 ];
 
 /// Apply every migration whose version is greater than the current max applied.

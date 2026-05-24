@@ -496,6 +496,32 @@ pub async fn create_project_v2(
         }
     }
 
+    // Phase 1.1 (diagrams): seed the project-modules row for `diagrams`
+    // so the (Phase 1.5.7) conditional CLAUDE.md template renderer sees
+    // the module as active by default. The plan is opt-out — the user
+    // disables per-project via DiagramsTab → `set_project_module_enabled`
+    // (which flips `enabled` to 0; the row stays).
+    //
+    // ORDER MATTERS (mirrors the install-flow-architectural-overhaul
+    // 2026-05-06 race-condition rule): this MUST run AFTER
+    // `run_install_bundle` completes. The bundle install is allowed to
+    // drop files the conditional-block primitive expects to find; if we
+    // seeded earlier the renderer could race ahead and miss them.
+    //
+    // Soft-fail: a DB error on this insert is logged (cosmetic — the
+    // conditional CLAUDE.md section just won't render until the user
+    // re-toggles the module). Never propagated.
+    if let Err(e) = db.set_project_module_enabled(&row.id, "diagrams", true) {
+        eprintln!(
+            "[vct] warning: could not seed project_modules('diagrams') for {}: {}",
+            row.id, e,
+        );
+        warnings.push(format!(
+            "seed project_modules('diagrams'): {} (CLAUDE.md diagrams section will not render until re-toggled)",
+            e
+        ));
+    }
+
     // Gap 2 (OSS launch 2026-05-12): kick off the initial code-graph
     // build in the background so `search_code_graph` returns useful
     // results out of the box. This must NOT block project creation —

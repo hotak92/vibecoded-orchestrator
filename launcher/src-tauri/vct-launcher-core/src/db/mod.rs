@@ -45,6 +45,11 @@ pub mod orchestrator_root_helpers;
 pub mod module_ports;
 pub mod deprecation_events;
 pub mod module_db_migrations;
+// Migration 021 — diagrams (Mermaid + Excalidraw) registry, snapshots,
+// access grants, per-tool MCP grants, per-project module-active flags.
+// Phase 1.1 of the diagrams integration plan
+// (.claude/context/plans/diagrams-integration-excalidraw-mermaid-2026-05-24.md).
+pub mod diagrams;
 
 /// Resolve the launcher DB path: `<VCT_STATE_DIR or ~/.vct>/launcher.db`.
 pub fn db_path() -> PathBuf {

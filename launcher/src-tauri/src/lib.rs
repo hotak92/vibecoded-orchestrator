@@ -1245,6 +1245,26 @@ pub fn run() {
             commands::project_state_cmd::list_user_added_project_mcp_servers,
             commands::project_state_cmd::set_project_mcp_server_enabled,
             commands::project_state_cmd::unregister_project_mcp_server,
+            // Phase 1.1 — Diagrams (Mermaid + Excalidraw) registry,
+            // snapshots, cross-project access grants, per-tool MCP
+            // allowlists, and per-project module-active flags. Schema:
+            // migration 021. Sibling agents (1.2 wrapper MCP, 1.3
+            // DiagramsTab, 1.5 indexer) consume these EXACT command
+            // names; renaming would break their stubs at merge time.
+            commands::diagrams_cmd::list_project_diagrams,
+            commands::diagrams_cmd::register_project_diagram,
+            commands::diagrams_cmd::unregister_project_diagram,
+            commands::diagrams_cmd::set_project_diagram_enabled,
+            commands::diagrams_cmd::list_diagram_snapshots,
+            commands::diagrams_cmd::create_diagram_snapshot,
+            commands::diagrams_cmd::restore_diagram_snapshot,
+            commands::diagrams_cmd::delete_diagram_snapshot,
+            commands::diagrams_cmd::diagram_grant_access,
+            commands::diagrams_cmd::list_diagram_access,
+            commands::diagrams_cmd::set_project_mcp_tool_enabled,
+            commands::diagrams_cmd::list_project_mcp_tools,
+            commands::diagrams_cmd::set_project_module_enabled,
+            commands::diagrams_cmd::list_project_modules,
             // PR-6 (v0.2.11): per-project .claude/env key reader+writer
             // (backs the HooksTab VCO_LEAN_CTX_DEFAULT toggle).
             commands::claude_env::get_claude_env_value,

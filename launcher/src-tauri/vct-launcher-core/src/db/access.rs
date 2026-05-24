@@ -176,6 +176,14 @@ fn infer_table_for_op(op: &str) -> Option<&'static str> {
         s if s.starts_with("skill_") => Some("project_skills"),
         s if s.starts_with("permission_") => Some("project_permissions"),
         s if s.starts_with("license_") => Some("tier_cache"),
+        // Migration 021 — diagrams (Mermaid + Excalidraw). Order matters:
+        // narrower prefixes are tested first so a `diagram_snapshot_*` op
+        // routes to diagram_snapshots and not project_diagrams.
+        s if s.starts_with("diagram_snapshot_") => Some("diagram_snapshots"),
+        s if s.starts_with("diagram_access_") => Some("diagram_access"),
+        s if s.starts_with("diagram_") => Some("project_diagrams"),
+        s if s.starts_with("mcp_tool_grant_") => Some("project_mcp_tool_grants"),
+        s if s.starts_with("project_module_") => Some("project_modules"),
         _ => None,
     }
 }
