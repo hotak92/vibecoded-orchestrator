@@ -51,7 +51,14 @@
     color: 'teal' | 'purple' | 'pink';
     icon: string;
     badge: string;
-    badgeKind: 'bundled' | 'installed' | 'available' | 'subcomponent' | 'coming_soon';
+    badgeKind:
+      | 'bundled'
+      | 'installed'
+      | 'available'
+      | 'update_available'
+      | 'broken'
+      | 'subcomponent'
+      | 'coming_soon';
   }
 
   function colorFor(e: ModuleCatalogEntry): 'teal' | 'purple' | 'pink' {
@@ -75,6 +82,8 @@
   function badgeFor(e: ModuleCatalogEntry): string {
     if (e.kind === 'bundled') return 'Bundled';
     if (e.kind === 'installed') return 'Installed';
+    if (e.kind === 'update_available') return 'Update available';
+    if (e.kind === 'broken') return 'Reinstall needed';
     if (e.kind === 'subcomponent') return 'Included';
     if (e.kind === 'coming_soon') {
       const tier = (e.coming_soon_tier ?? '').toUpperCase();

@@ -1105,6 +1105,13 @@ pub fn run() {
             // (parse failures don't overwrite a previously-good cached
             // value) is implemented inside `module_catalog_client`.
             commands::module_catalog_client::refresh_module_catalog,
+            // v0.2.33 Agent B (L0a, review §10.c): one-shot dismissal of
+            // the dev-affordance hint. The catalog response includes
+            // `dev_affordance_hint` exactly when (paid-modules/ exists)
+            // AND (VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH unset) AND
+            // (not dismissed). The renderer surfaces this as a toast;
+            // clicking "Got it" calls this command.
+            commands::modules::dismiss_dev_affordance_hint,
             commands::modules::install_module_for_project,
             // v0.2.31 #20-Fix-3: in-place update path (parallel to install).
             // Reads manifest.upgrade UpgradeBlock — runs pre_upgrade, re-fetches

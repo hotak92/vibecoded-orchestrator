@@ -49,13 +49,19 @@ pub struct ModuleNavItem {
 
 // ─── Manifest discovery ─────────────────────────────────────────────────
 //
-// We deliberately reuse the same scan paths as `commands::modules`
-// (`<VCT_ROOT>/modules/*/vct-module.json`,
-// `<VCT_ROOT>/bundled_manifests/*.json`, and the dev-only
-// `<orchestrator_clone>/paid-modules/*/vct-module.json`). Copy-pasted
-// here as a private helper rather than exporting from `modules.rs` to
-// keep that module's surface small. If a third caller needs scanning,
-// promote `catalog_scan_paths` to a shared util.
+// v0.2.33 (Agent B): manifest enumeration moved to the shared
+// `commands::installed_modules` helper. This file previously contained
+// a copy-pasted scan duplicating `modules.rs::catalog_scan_paths`.
+//
+// We compose two layers:
+//   1. `installed_module_manifest_paths(db)` — post-install + bundled
+//      (the shared helper).
+//   2. dev-affordance: `<install_root>/paid-modules/<id>/vct-module.json`
+//      (gated behind `VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH=1`).
+//   3. `<install_root>/vct-module.json` — orchestrator-core's own
+//      manifest, which ships `gui.config_tab` for the core dashboard
+//      surface (KG / code-graph controls). This is NOT a paid module;
+//      it's the launcher's own config-tab feed.
 
 /// v0.2.23.1 refactor (2026-05-21): now takes `&Db` so the orchestrator
 /// clone root can be resolved via `app_state['launcher.install_path']`
@@ -63,67 +69,24 @@ pub struct ModuleNavItem {
 /// `installer::resolve_install_root_sync` for the rationale — short
 /// version: `env!("CARGO_MANIFEST_DIR")` leaks the build-host path and
 /// is wrong on shipped binaries.
+///
+/// v0.2.33: composes the shared `installed_module_manifest_paths` +
+/// gated dev-affordance + orchestrator-root manifest. The 30+ lines
+/// of fs::read_dir gymnastics that used to live here are gone.
 fn manifest_scan_paths(db: &Db) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    let vct_root = crate::paths::vct_root_dir();
-    {
-        let modules = vct_root.join("modules");
-        if modules.is_dir() {
-            if let Ok(entries) = std::fs::read_dir(&modules) {
-                for e in entries.flatten() {
-                    let p = e.path().join("vct-module.json");
-                    if p.is_file() {
-                        paths.push(p);
-                    }
-                }
-            }
-        }
-        let bundled = vct_root.join("bundled_manifests");
-        if bundled.is_dir() {
-            if let Ok(entries) = std::fs::read_dir(&bundled) {
-                for e in entries.flatten() {
-                    let p = e.path();
-                    if p.extension().and_then(|s| s.to_str()) == Some("json") {
-                        paths.push(p);
-                    }
-                }
-            }
-        }
-    }
+    let mut paths = crate::commands::installed_modules::installed_module_manifest_paths(db);
+    paths.extend(crate::commands::installed_modules::dev_paid_modules_paths(db));
 
-    // Resolve the orchestrator clone root via the shared sync helper.
-    // No hardcoded paths in this binary — resolution is DB-cached
-    // (`launcher.install_path` app_state key, written at first install
-    // and validated on every read) with a `current_exe()` walk-up as
-    // the fall-through. See `installer::resolve_install_root_sync` for
-    // the full rationale incl. the CARGO_MANIFEST_DIR privacy leak we
-    // deliberately removed. v0.2.23.1 fix (2026-05-21).
-    let orchestrator_clone = crate::commands::installer::resolve_install_root_sync(db);
-    if let Some(clone) = orchestrator_clone {
-        let paid = clone.join("paid-modules");
-        if paid.is_dir() {
-            if let Ok(entries) = std::fs::read_dir(&paid) {
-                for module_dir in entries.flatten() {
-                    let p = module_dir.path().join("vct-module.json");
-                    if p.is_file() {
-                        paths.push(p);
-                    }
-                }
-            }
-        }
-        // Stream 2 follow-up (v0.2.20, 2026-05-19): the orchestrator core
-        // ships its own `gui.config_tab` in the repo-root manifest. The
-        // launcher binary is shipped INSIDE this clone, so the manifest
-        // lives at `<clone>/vct-module.json`. Discovery is the same
-        // walk-up that `commands::modules::find_orchestrator_manifest`
-        // does, but cached here as a single PathBuf push rather than a
-        // current_exe walk — `orchestrator_clone` was just resolved above.
+    // Orchestrator-core's own config-tab feed. Lives at
+    // `<install_root>/vct-module.json`. NOT a paid module — this is
+    // the launcher's own dashboard surface (KG / code-graph controls).
+    // No env-var gate because it's always relevant (it IS the launcher).
+    if let Some(clone) = crate::commands::installer::resolve_install_root_sync(db) {
         let root_manifest = clone.join("vct-module.json");
         if root_manifest.is_file() {
             paths.push(root_manifest);
         }
     }
-
     paths
 }
 
@@ -362,14 +325,17 @@ mod tests {
             file: &'static str,
             fn_name: &'static str,
         }
+        // v0.2.33 (Agent B): `catalog_scan_paths` in modules.rs was
+        // removed and the duplicated `manifest_scan_paths` in this file
+        // was shrunk to call the shared helper in `installed_modules`.
+        // The canonical production site now lives in
+        // `commands::installed_modules::dev_paid_modules_paths` — pin
+        // it here so the privacy discipline (no CARGO_MANIFEST_DIR
+        // baked into shipped binaries) survives the refactor.
         let sites = [
             ProductionSite {
-                file: "src/commands/module_gui.rs",
-                fn_name: "manifest_scan_paths",
-            },
-            ProductionSite {
-                file: "src/commands/modules.rs",
-                fn_name: "catalog_scan_paths",
+                file: "src/commands/installed_modules.rs",
+                fn_name: "dev_paid_modules_paths",
             },
         ];
         let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));

@@ -27,6 +27,7 @@ pub mod embedding_enrichment;
 // and their `git pull` invocations.
 pub mod git_user_editable_merge;
 pub mod hub_proxy;
+pub mod installed_modules;
 pub mod installer;
 pub mod kg;
 pub mod kg_sync;

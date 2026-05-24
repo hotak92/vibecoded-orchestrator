@@ -272,7 +272,14 @@ export interface ModuleCatalogEntry {
    *                      badge + Learn-more CTA, no Install. Reserved for items
    *                      with a public roadmap commitment; do NOT use for vapor.
    */
-  kind: 'bundled' | 'available' | 'installed' | 'subcomponent' | 'coming_soon';
+  kind:
+    | 'bundled'
+    | 'available'
+    | 'installed'
+    | 'update_available'
+    | 'broken'
+    | 'subcomponent'
+    | 'coming_soon';
   parent_id: string;
   cta_route: string;
   /** For `kind === 'coming_soon'`: which tier this will ship under (e.g. 'pro'). */
@@ -295,6 +302,60 @@ export interface ModuleCatalogEntry {
   deprecation_eol_date?: string;
   /** Optional URL pointing at the publisher's migration guide. */
   deprecation_migration_url?: string;
+  /**
+   * v0.2.33 (Agent B, L0a): set on installed module entries whose
+   * `module_id` is NOT advertised by the L0 catalog. The renderer
+   * shows a "No longer available in catalog" warning badge.
+   */
+  catalog_warning?: string;
+}
+
+/**
+ * v0.2.33 (Agent B, L0a): L0 fetch status. Maps to the Rust `L0Status`
+ * enum. Drives the catalog header banner (Agent E's scope).
+ */
+export type L0Status =
+  | { kind: 'ok'; fetched_at: string; modules_count: number }
+  | { kind: 'stale'; cached_fetched_at: string; last_error: string }
+  | { kind: 'unavailable'; error: string };
+
+/**
+ * v0.2.33 (Agent B, L0a): one parse failure surfaced to the renderer
+ * for the "1 module manifest couldn't be parsed" banner (Agent E).
+ * `source` is either a file path (on-disk manifest) or `L0:<endpoint>`
+ * (L0 envelope parse failure).
+ */
+export interface ManifestParseError {
+  module_id: string;
+  source: string;
+  error: string;
+}
+
+/**
+ * v0.2.33 (Agent B, L0a, review §10.c): emitted exactly when
+ * `<install_root>/paid-modules/` exists AND
+ * `VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH` is unset AND the user hasn't
+ * dismissed the toast. The renderer surfaces this as a one-shot
+ * "I see your dev paid-modules — opt in to render them" toast.
+ */
+export interface DevAffordanceHint {
+  paid_modules_path: string;
+  env_var_name: string;
+}
+
+/**
+ * v0.2.33 (Agent B, L0a): the new `list_module_catalog` Tauri command
+ * response shape. Replaces the v0.2.32-era bare `ModuleCatalogEntry[]`.
+ *
+ * The store unwraps `.modules` into the existing `catalog: ModuleCatalogEntry[]`
+ * slot. `l0_status` + `parse_errors` + `dev_affordance_hint` flow into
+ * Agent E's banner/toast surfaces.
+ */
+export interface CatalogResponse {
+  modules: ModuleCatalogEntry[];
+  l0_status: L0Status;
+  parse_errors: ManifestParseError[];
+  dev_affordance_hint: DevAffordanceHint | null;
 }
 
 export interface ModuleStatusView {

@@ -1,7 +1,11 @@
 // Module catalog + install state.
 //
-// Catalog comes from `list_module_catalog` which scans both
-// ~/.vct/modules (already installed) and ~/.vct/bundled_manifests.
+// v0.2.33 (Agent B, L0a): `list_module_catalog` now returns a
+// `CatalogResponse` envelope instead of the bare `ModuleCatalogEntry[]`.
+// We unwrap `.modules` into the existing `catalog` slot; the new
+// `l0_status`, `parse_errors`, and `dev_affordance_hint` fields land in
+// the store for Agent E's banner/toast surfaces.
+//
 // Install rows per project come from `list_installed_modules`.
 //
 // Install progress: the Rust side emits a single `module://install-complete`
@@ -11,6 +15,10 @@
 import { writable, derived } from 'svelte/store';
 import { invoke, listen, tauriAvailable } from '$lib/tauri';
 import type {
+  CatalogResponse,
+  DevAffordanceHint,
+  L0Status,
+  ManifestParseError,
   ModuleCatalogEntry,
   ModuleInstallRow,
   ModuleInstallCompleteEvent,
@@ -19,6 +27,12 @@ import type {
 
 interface ModulesState {
   catalog: ModuleCatalogEntry[];
+  /** v0.2.33: L0 fetch outcome; populated by the catalog load path. */
+  l0Status: L0Status | null;
+  /** v0.2.33: per-manifest parse errors surfaced by the catalog build. */
+  parseErrors: ManifestParseError[];
+  /** v0.2.33: dev-affordance hint (review §10.c). */
+  devAffordanceHint: DevAffordanceHint | null;
   installed: ModuleInstallRow[]; // for currently-selected project
   installingId: string | null;
   loading: boolean;
@@ -28,6 +42,9 @@ interface ModulesState {
 function createModulesStore() {
   const { subscribe, update } = writable<ModulesState>({
     catalog: [],
+    l0Status: null,
+    parseErrors: [],
+    devAffordanceHint: null,
     installed: [],
     installingId: null,
     loading: false,
@@ -48,12 +65,36 @@ function createModulesStore() {
       if (!tauriAvailable()) return;
       update((s) => ({ ...s, loading: true, error: null }));
       try {
-        const catalog = await invoke<ModuleCatalogEntry[]>('list_module_catalog');
-        update((s) => ({ ...s, catalog, loading: false }));
+        const response = await invoke<CatalogResponse>('list_module_catalog');
+        update((s) => ({
+          ...s,
+          catalog: response.modules,
+          l0Status: response.l0_status,
+          parseErrors: response.parse_errors,
+          devAffordanceHint: response.dev_affordance_hint,
+          loading: false,
+        }));
       } catch (e) {
         update((s) => ({
           ...s,
           loading: false,
+          error: e instanceof Error ? e.message : String(e),
+        }));
+      }
+    },
+
+    /**
+     * v0.2.33: dismiss the dev-affordance toast. Persisted to launcher.db
+     * so subsequent sessions don't re-surface it.
+     */
+    async dismissDevAffordance(): Promise<void> {
+      if (!tauriAvailable()) return;
+      try {
+        await invoke<void>('dismiss_dev_affordance_hint');
+        update((s) => ({ ...s, devAffordanceHint: null }));
+      } catch (e) {
+        update((s) => ({
+          ...s,
           error: e instanceof Error ? e.message : String(e),
         }));
       }

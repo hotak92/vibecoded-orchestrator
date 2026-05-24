@@ -2,21 +2,47 @@
 //!
 //! Orchestrates: catalog lookup, license gating, manifest parse, installer
 //! engine invocation, DB row writes, event emission.
+//!
+//! v0.2.33 (Agent B, L0a refactor): the catalog data flow was inverted.
+//! Pre-v0.2.33 `list_module_catalog_impl` scanned `paid-modules/*/` on
+//! disk for catalog metadata, which failed for real-user installs that
+//! never had the manifest. Now: catalog metadata comes from the public
+//! L0 endpoint (`module_catalog_client::cached_module_catalog`); on-disk
+//! manifests at `~/.vct/modules/<id>/vct-module.json` (written by
+//! Agent C's post-install extract) are read ONLY for installed
+//! modules' dispatcher data (config_tab, runtime, db). The dev
+//! affordance (scanning `<install_root>/paid-modules/`) remains
+//! available but gated behind `VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH=1`.
+//!
+//! `find_manifest` was split into `resolve_install_metadata` (L0-driven,
+//! used at install time before the image is pulled) and
+//! `find_installed_manifest` (on-disk, used at dispatch/update/uninstall
+//! time after the image has been pulled + manifest extracted).
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tauri::{command, AppHandle, Emitter, State};
 use uuid::Uuid;
 
+use crate::commands::installed_modules::{
+    dev_catalog_passthrough_enabled, dev_paid_modules_paths, paid_modules_dir_exists,
+};
+use crate::commands::module_catalog_client::{L0CatalogModule, L0CatalogResponse};
 use crate::db::models::{ModuleInstallRow, ModuleStatus, ProjectHost};
 use crate::db::Db;
 use crate::installer_engine;
 use crate::manifest::{ModuleManifest, PlaceholderCtx, UninstallBlock};
 use crate::secrets::{self, SecretScope};
 
+/// `app_state` key recording whether the user has dismissed the
+/// "Found dev paid-modules" hint. Set to `"true"` after dismissal;
+/// absent or `"false"` means the hint is still active.
+pub const APP_STATE_KEY_DEV_AFFORDANCE_DISMISSED: &str =
+    "module_catalog.dev_affordance_dismissed";
+
 // ─── Catalog entry surface ──────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModuleCatalogEntry {
     pub id: String,
     pub name: String,
@@ -31,16 +57,21 @@ pub struct ModuleCatalogEntry {
     pub is_licensed: bool,
     pub manifest_source: String, // path or URL the manifest was loaded from
     /// Bug 16: how the launcher should render this entry.
-    ///   - "bundled"      = bundled with the launcher itself, always installed,
-    ///                      cannot be uninstalled (e.g. the launcher).
-    ///   - "available"    = catalog-listed, not installed yet, has Install action.
-    ///   - "installed"    = installed, can be reconfigured / uninstalled.
-    ///   - "subcomponent" = ships with a parent module, no separate install,
-    ///                      offers a Dashboard CTA.
-    ///   - "coming_soon"  = announced, not yet shipped. Rendered with a
-    ///                      "Coming Soon" badge + Learn-more CTA, no Install.
-    ///                      Reserved for items with a public roadmap commitment;
-    ///                      do NOT use for vapor.
+    ///   - "bundled"          = bundled with the launcher itself, always installed,
+    ///                          cannot be uninstalled (e.g. the launcher).
+    ///   - "available"        = catalog-listed, not installed yet, has Install action.
+    ///   - "installed"        = installed, can be reconfigured / uninstalled.
+    ///   - "update_available" = installed AND L0 advertises a newer version.
+    ///                          Renders the "Update" action. v0.2.33+.
+    ///   - "broken"           = `module_installs.status='broken'` (reconciler
+    ///                          marked the on-disk manifest missing). Renders
+    ///                          a Reinstall CTA. v0.2.33+.
+    ///   - "subcomponent"     = ships with a parent module, no separate install,
+    ///                          offers a Dashboard CTA.
+    ///   - "coming_soon"      = announced, not yet shipped. Rendered with a
+    ///                          "Coming Soon" badge + Learn-more CTA, no Install.
+    ///                          Reserved for items with a public roadmap commitment;
+    ///                          do NOT use for vapor.
     pub kind: String,
     /// For subcomponents: which parent module they ship with. Empty otherwise.
     #[serde(default)]
@@ -82,6 +113,12 @@ pub struct ModuleCatalogEntry {
     /// Empty when unknown.
     #[serde(default)]
     pub deprecation_migration_url: String,
+    /// v0.2.33: when the underlying `module_installs` row is present but
+    /// no longer matches an L0 entry, the launcher renders an
+    /// "No longer available in catalog" warning badge. Empty string
+    /// for the common case (entry IS in L0, or entry is a builtin).
+    #[serde(default)]
+    pub catalog_warning: String,
 }
 
 impl ModuleCatalogEntry {
@@ -110,8 +147,120 @@ impl ModuleCatalogEntry {
             deprecation_message: String::new(),
             deprecation_eol_date: String::new(),
             deprecation_migration_url: String::new(),
+            catalog_warning: String::new(),
         }
     }
+
+    /// v0.2.33: build a catalog entry from an L0 record, the resolved
+    /// licensed-state, and the resolved `kind`. The L0 record is the
+    /// authoritative source for catalog-display fields; the caller
+    /// determines `kind` by looking at `module_installs`.
+    fn from_l0(
+        l0: &L0CatalogModule,
+        is_licensed: bool,
+        kind: &str,
+        version_override: Option<&str>,
+    ) -> Self {
+        Self {
+            id: l0.id.clone(),
+            name: l0.name.clone(),
+            // For an `installed` or `update_available` tile we want to
+            // report the version the user actually has; L0 reports the
+            // latest published version. The caller passes
+            // `version_override = Some(installed_version)` for those
+            // two kinds.
+            version: version_override.unwrap_or(&l0.version).to_string(),
+            description: l0.description.clone(),
+            category: l0.category.clone(),
+            tags: l0.tags.clone(),
+            license_required: l0.license_required,
+            license_variant_ids: l0.license_variant_ids.clone(),
+            min_orchestrator_tier: l0.min_orchestrator_tier.clone(),
+            compatibility_hosts: l0.compatibility.hosts.clone(),
+            is_licensed,
+            manifest_source: format!("L0:{}", l0.id),
+            kind: kind.into(),
+            parent_id: String::new(),
+            cta_route: String::new(),
+            coming_soon_tier: String::new(),
+            coming_soon_target: String::new(),
+            deprecated: l0.deprecated,
+            deprecation_message: l0.deprecation_message.clone(),
+            deprecation_eol_date: l0.deprecation_eol_date.clone(),
+            deprecation_migration_url: l0.deprecation_migration_url.clone(),
+            catalog_warning: String::new(),
+        }
+    }
+}
+
+// ─── L0-driven catalog response envelope ───────────────────────────────
+//
+// v0.2.33: the Tauri command shape changed from `Vec<ModuleCatalogEntry>`
+// to `CatalogResponse { modules, l0_status, parse_errors,
+// dev_affordance_hint }`. The front-end deconstructs `.modules` for the
+// existing render path and `.l0_status` / `.parse_errors` /
+// `.dev_affordance_hint` for the new banners/toasts (Agent E renders).
+
+/// What the launcher tells the renderer about the L0 catalog fetch.
+/// Agent E uses this to render the "Couldn't reach catalog" banner +
+/// the stale-cache "Cached X minutes ago" indicator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum L0Status {
+    /// Fresh (or recently-fetched-within-TTL) L0 envelope succeeded.
+    Ok {
+        fetched_at: String,
+        modules_count: usize,
+    },
+    /// L0 fetch failed but a cached value (possibly stale) is being
+    /// served. The renderer should display a quiet "Catalog cached X
+    /// ago" indicator + retry CTA.
+    Stale {
+        cached_fetched_at: String,
+        last_error: String,
+    },
+    /// L0 fetch failed AND there is no cached value to fall back on.
+    /// Catalog renders builtins only + a louder "Couldn't reach catalog
+    /// server" banner.
+    Unavailable { error: String },
+}
+
+/// A single failure in the catalog-build pipeline that the user should
+/// be told about. Two sources today:
+///   * `source: "L0:<endpoint>"` — the L0 envelope was malformed.
+///   * `source: "<file path>"` — an on-disk `vct-module.json` failed
+///     to parse via `ModuleManifest::from_json`.
+///
+/// Agent E surfaces these as the "1 module manifest couldn't be parsed"
+/// banner.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestParseError {
+    pub module_id: String,
+    pub source: String,
+    pub error: String,
+}
+
+/// One-shot hint to the dev who has a `<install_root>/paid-modules/`
+/// directory but hasn't opted into the dev passthrough. Surfaces as
+/// the toast: "Found dev paid-modules at <path>. Set
+/// VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH=1 to enable them."
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DevAffordanceHint {
+    pub paid_modules_path: String,
+    pub env_var_name: String,
+}
+
+/// The full v0.2.33 catalog response. Replaces the v0.2.32-era bare
+/// `Vec<ModuleCatalogEntry>` signature.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogResponse {
+    pub modules: Vec<ModuleCatalogEntry>,
+    pub l0_status: L0Status,
+    pub parse_errors: Vec<ManifestParseError>,
+    /// `Some(_)` exactly when `paid-modules/` exists at the install
+    /// root AND `VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH` is unset AND
+    /// the user hasn't dismissed the hint. Otherwise `None`.
+    pub dev_affordance_hint: Option<DevAffordanceHint>,
 }
 
 // Bug 16 minimal-manifest types + `vct-module.json` walker moved to
@@ -172,6 +321,7 @@ fn builtin_catalog_entries(db: &Db) -> Vec<ModuleCatalogEntry> {
         deprecation_message: String::new(),
         deprecation_eol_date: String::new(),
         deprecation_migration_url: String::new(),
+        catalog_warning: String::new(),
     });
 
     // 2. Orchestrator core + 3-4. its sub-components, sourced from
@@ -225,6 +375,7 @@ fn builtin_catalog_entries(db: &Db) -> Vec<ModuleCatalogEntry> {
         deprecation_message: String::new(),
         deprecation_eol_date: String::new(),
         deprecation_migration_url: String::new(),
+        catalog_warning: String::new(),
     });
 
     for comp in components {
@@ -255,165 +406,57 @@ fn builtin_catalog_entries(db: &Db) -> Vec<ModuleCatalogEntry> {
             deprecation_message: String::new(),
             deprecation_eol_date: String::new(),
             deprecation_migration_url: String::new(),
+            catalog_warning: String::new(),
         });
     }
 
-    // 5. RL Reranker — Pro-tier paid module (vct-rl-reranker, v0.1.0).
-    //    Flipped from `coming_soon` to `available` in Phase 1C (2026-05-16)
-    //    once the manifest + container-pull installer recipe landed. Real
-    //    manifest lives in the orchestrator clone at
-    //    `paid-modules/vct-rl-reranker/vct-module.json` during dev; in
-    //    production the launcher fetches it via Phase 3C's
-    //    /rl-latest-version Supabase edge function (catalog discovery
-    //    against an authenticated registry — never bundled in the AGPL
-    //    release because the manifest declares the private GHCR image
-    //    coords + token gateway URL).
-    //
-    //    `kind: "available"` makes the UI render an Install button.
-    //    `is_licensed` is computed dynamically from the tier cache in
-    //    list_module_catalog (this hardcoded placeholder ships as
-    //    is_licensed=false; reality is filled in at catalog-build time).
-    //
-    //    Pre-flip there was a unit test asserting "exactly one coming_soon
-    //    entry, must be rl-reranker". That test was updated in this PR to
-    //    assert "zero coming_soon entries — anything we previously gated
-    //    behind coming_soon is now real". See
-    //    builtin_catalog_lists_zero_coming_soon_entries below.
-    out.push(ModuleCatalogEntry {
-        // G1 (v0.2.22): aligned with on-disk manifest `id: "vct-rl-reranker"`.
-        // Pre-v0.2.22 this was bare `"rl-reranker"`, which caused
-        // `find_manifest(module_id)` to return Err on install because no
-        // on-disk manifest reports that id. Every other reference in the
-        // codebase (rl_settings.rs::MODULE_ID, module_supervisor.rs,
-        // module_weights_state.rs, module_gui.rs route resolver, etc.)
-        // already used the prefixed form — the catalog was the lone outlier.
-        // G3 (v0.2.22): version pinned to 0.1.1 — the released image tag on
-        // GHCR (`ghcr.io/hotak92/vct-rl-reranker:0.1.1-{cpu,cuda,rocm}`)
-        // and the version `runtime.args` + `gpu_image_variants` already
-        // reference. Pre-v0.2.22 catalog said 0.1.0 (stale) while the
-        // on-disk manifest said 0.1.2 (unreleased bump).
-        id: "vct-rl-reranker".into(),
-        name: "RL Reranker".into(),
-        version: "0.1.1".into(),
-        // R1 (v0.2.22): description text mirrors the on-disk manifest's
-        // `description` field. The new
-        // `catalog_matches_on_disk_manifest_when_present` round-trip test
-        // asserts the two match — drift either way will fail CI.
-        description:
-            "Reinforcement-learning reranker for Knowledge Graph retrieval. \
-             Per-text-embedding-source neural networks (qwen3 / arctic / \
-             openai) personalize on your local citation patterns. Ships \
-             pre-trained; auto-fine-tunes on your data after each weekly \
-             model refresh. Supports hot-swap, reset, finetune, and \
-             global-retrain endpoints so the launcher can drive model \
-             lifecycle without restarting the container. Code-graph \
-             reranking will ship as a separate future module \
-             (vct-code-reranker)."
-                .into(),
-        category: "paid-independent".into(),
-        tags: vec!["pro".into(), "reranking".into(), "reinforcement-learning".into()],
-        license_required: true,
-        license_variant_ids: vec![],
-        min_orchestrator_tier: "pro".into(),
-        // R1 (v0.2.22): order + content mirrors the on-disk manifest's
-        // `compatibility.hosts` field exactly (`["base", "mao",
-        // "orchestrator_root"]`). The new round-trip test asserts
-        // Vec equality, not subset — drift either way will fail CI.
-        compatibility_hosts: vec![
-            "base".into(),
-            "mao".into(),
-            "orchestrator_root".into(),
-        ],
-        is_licensed: false,
-        manifest_source: "paid-modules/vct-rl-reranker/vct-module.json".into(),
-        kind: "available".into(),
-        parent_id: String::new(),
-        cta_route: String::new(),
-        coming_soon_tier: String::new(),
-        coming_soon_target: String::new(),
-        deprecated: false,
-        deprecation_message: String::new(),
-        deprecation_eol_date: String::new(),
-        deprecation_migration_url: String::new(),
-    });
+    // v0.2.33 (Agent B, L0a): the hardcoded vct-rl-reranker placeholder
+    // entry was removed. The launcher no longer ships any paid-module
+    // catalog metadata baked into the binary — paid modules come from
+    // L0 (`module_catalog_client::cached_module_catalog`). The 4 real
+    // builtins above (launcher, orchestrator, knowledge-graph,
+    // code-graph) ARE the launcher (they don't live behind L0 because
+    // they aren't dynamically published; their version comes from
+    // CARGO_PKG_VERSION / repo-root `vct-module.json`).
 
     out
 }
 
-// ─── Catalog discovery ──────────────────────────────────────────────────
+// ─── License gate ───────────────────────────────────────────────────────
 
-/// Locations the launcher scans for vct-module.json files.
-///
-/// For v1 this is just the local modules directory (installed modules have
-/// their manifest at the root of their install dir). A future version adds
-/// `https://registry.vibecodedtools.it/modules.json` for discovering
-/// uninstalled modules too.
-///
-/// Phase 1C (2026-05-16): added a dev-only scan of `<orchestrator_clone>/
-/// paid-modules/*/vct-module.json` so the RL Reranker manifest is
-/// discoverable on a dev machine even before the production discovery
-/// path (Phase 3C: `/rl-latest-version` Supabase edge function) lands.
-/// In a real user install the orchestrator clone is read-only and the
-/// paid-modules dir doesn't exist there, so this path is a no-op for
-/// non-dev users.
-fn catalog_scan_paths(db: &Db) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    let vct_root = crate::paths::vct_root_dir();
-    {
-        let modules = vct_root.join("modules");
-        if modules.is_dir() {
-            if let Ok(entries) = std::fs::read_dir(&modules) {
-                for e in entries.flatten() {
-                    let p = e.path().join("vct-module.json");
-                    if p.is_file() {
-                        paths.push(p);
-                    }
-                }
-            }
-        }
-        // Also scan bundled-with-launcher manifests, if present.
-        let bundled = vct_root.join("bundled_manifests");
-        if bundled.is_dir() {
-            if let Ok(entries) = std::fs::read_dir(&bundled) {
-                for e in entries.flatten() {
-                    let p = e.path();
-                    if p.extension().and_then(|s| s.to_str()) == Some("json") {
-                        paths.push(p);
-                    }
-                }
-            }
-        }
-    }
-
-    // Scan <orchestrator_clone>/paid-modules/*/vct-module.json.
-    //
-    // v0.2.23.1 fix (2026-05-21): resolve via the shared sync helper
-    // that reads `launcher.install_path` from app_state (DB-cached at
-    // first install) with a current_exe() walk-up fallback. NO
-    // CARGO_MANIFEST_DIR fallback — that macro embeds the build-host's
-    // absolute path as a static string (PRIVACY LEAK + WRONG PATH on
-    // shipped binaries; see self_update.rs:280 + installer.rs:4399 for
-    // the 2026-05-06 privacy notes).
-    let orchestrator_clone = crate::commands::installer::resolve_install_root_sync(db);
-    if let Some(clone) = orchestrator_clone {
-        let paid = clone.join("paid-modules");
-        if paid.is_dir() {
-            if let Ok(entries) = std::fs::read_dir(&paid) {
-                for module_dir in entries.flatten() {
-                    let p = module_dir.path().join("vct-module.json");
-                    if p.is_file() {
-                        paths.push(p);
-                    }
-                }
-            }
-        }
-    }
-
-    paths
+/// v0.2.33 (Agent B, L0a): the license-relevant projection of a
+/// module's gate fields, shared by the legacy `is_module_licensed`
+/// (called with a full `ModuleManifest`) and the new L0-driven catalog
+/// builder (called with `L0CatalogModule` data). Keeping this in one
+/// struct prevents drift between the two paths.
+pub struct LicenseGateInput<'a> {
+    pub module_id: &'a str,
+    pub required: bool,
+    pub min_orchestrator_tier: &'a str,
+    pub variant_ids: &'a [String],
 }
 
-fn is_module_licensed(manifest: &ModuleManifest, db: &Db) -> bool {
-    if !manifest.license.required {
+/// Tier-ordering ladder. Admin maps to 4 (strict superset of enterprise)
+/// per docs/features/06-license-and-commercial.md §"Tier ordering" +
+/// db/tier.rs:40. Unknown strings fall through to rank=0 so attacker-
+/// supplied tier values can't silently escalate.
+fn tier_rank(t: &str) -> u32 {
+    match t {
+        "free" => 0,
+        "pro" => 1,
+        "mao" => 2,
+        "enterprise" => 3,
+        "admin" => 4,
+        _ => 0,
+    }
+}
+
+/// v0.2.33 license-gate that consumes the narrow `LicenseGateInput`
+/// shape. The legacy `is_module_licensed(&ModuleManifest, &Db)`
+/// shim below calls this with manifest-derived fields so existing
+/// callers keep working unchanged.
+pub fn is_module_licensed_v2(input: LicenseGateInput, db: &Db) -> bool {
+    if !input.required {
         return true;
     }
     let cache = match db.get_tier_cache() {
@@ -424,143 +467,606 @@ fn is_module_licensed(manifest: &ModuleManifest, db: &Db) -> bool {
     //
     // `admin` is server-classified (Path A Vault token or Path B LS
     // variant) and the docs declare it a "strict superset of enterprise"
-    // by feature gates (docs/features/06-license-and-commercial.md §"Tier
-    // ordering"; db/tier.rs:40 reaffirms the contract). The pre-v0.2.22
-    // tier_rank match omitted `admin` and fell through to the wildcard
-    // (rank=0, free-equivalent), so an admin-tier user with NO matching
-    // module-specific entry in `module_licenses` was rejected client-side
-    // — visible to admin users as the Install button never enabling on a
-    // paid module they should have universal access to. Discovered
-    // 2026-05-21 during v0.2.22 post-push audit (see KG node
-    // "v0.2.22 Release — 2026-05-20" §"Lesson — admin tier_rank gap").
-    //
-    // The fix maps admin to a rank STRICTLY ABOVE enterprise so any
-    // future module declaring `min_orchestrator_tier: "enterprise"` is
-    // also satisfied by admin without further code changes. The wire
-    // contract from validate-tier remains the source of truth; this
-    // gate is advisory UI only (server-side artifact gateway re-validates
-    // a JWT at download time — docs/features/07-architecture.md:73).
-    let tier_rank = |t: &str| match t {
-        "free" => 0,
-        "pro" => 1,
-        "mao" => 2,
-        "enterprise" => 3,
-        "admin" => 4,
-        _ => 0,
-    };
-    if tier_rank(&cache.orchestrator_tier) >= tier_rank(&manifest.license.min_orchestrator_tier)
-        && manifest.license.min_orchestrator_tier != "free"
+    // by feature gates. v0.2.22 fixed the admin-rank gap (was falling
+    // through to rank=0); v0.2.33 just refactored the input shape.
+    if tier_rank(&cache.orchestrator_tier) >= tier_rank(input.min_orchestrator_tier)
+        && input.min_orchestrator_tier != "free"
     {
         return true;
     }
     // 2. Module-specific license?
-    if let Some(entry) = cache.module_licenses.get(&manifest.id) {
+    if let Some(entry) = cache.module_licenses.get(input.module_id) {
         if entry.get("tier").is_some() {
             return true;
         }
     }
-    // 3. No gate matched.
-    manifest.license.variant_ids.is_empty() // if no variants declared, treat as free
+    // 3. No gate matched. Treat as free if no variants declared (older
+    //    manifests omit the field; we default to permissive there).
+    input.variant_ids.is_empty()
 }
 
+/// Legacy thin-shim — v0.2.22 callers that have a full `ModuleManifest`
+/// keep working unchanged. Internally delegates to
+/// `is_module_licensed_v2` with manifest-derived fields.
+pub(crate) fn is_module_licensed(manifest: &ModuleManifest, db: &Db) -> bool {
+    is_module_licensed_v2(
+        LicenseGateInput {
+            module_id: &manifest.id,
+            required: manifest.license.required,
+            min_orchestrator_tier: &manifest.license.min_orchestrator_tier,
+            variant_ids: &manifest.license.variant_ids,
+        },
+        db,
+    )
+}
+
+// ─── Catalog discovery (L0-driven, v0.2.33) ───────────────────────────
+
+/// The Tauri command surface. Reads the L0 catalog (cached 15min) via
+/// `cached_module_catalog` and merges with builtin entries + installed-
+/// state from `module_installs`. The renderer expects the new
+/// `CatalogResponse` shape — see the struct doc.
 #[command]
-pub async fn list_module_catalog(db: State<'_, Db>) -> Result<Vec<ModuleCatalogEntry>, String> {
-    Ok(list_module_catalog_impl(&db))
+pub async fn list_module_catalog(db: State<'_, Db>) -> Result<CatalogResponse, String> {
+    // The async L0 fetch can't run inside the sync `_impl` helper, so
+    // we drive it here and pass the result into the impl. Tests use
+    // `list_module_catalog_impl_with_l0` directly with a synthetic
+    // envelope; production uses `cached_module_catalog`.
+    let l0_outcome = crate::commands::module_catalog_client::cached_module_catalog(&db).await;
+    Ok(list_module_catalog_impl_with_l0(&db, l0_outcome))
 }
 
-/// Synchronous, State-free core of `list_module_catalog`. Lifted to a
-/// helper so unit tests can exercise the on-disk-manifest-overrides-builtin
-/// merge path without needing a Tauri `State<Db>`. The `#[command]` shell
-/// above is a thin async wrapper.
-pub(crate) fn list_module_catalog_impl(db: &Db) -> Vec<ModuleCatalogEntry> {
-    // Bug 16: built-in entries (launcher + orchestrator + KG + code graph)
-    // come first — they're always present and reflect real repo state.
-    let mut out = builtin_catalog_entries(db);
-    for path in catalog_scan_paths(db) {
-        let raw = match std::fs::read_to_string(&path) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        let manifest = match ModuleManifest::from_json(&raw) {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("[catalog] skip {}: {}", path.display(), e);
-                continue;
+/// Test-friendly synchronous variant. Takes an already-resolved L0
+/// outcome (Ok or Err) and produces the full `CatalogResponse`. The
+/// `#[command]` shell above resolves the outcome via the real
+/// `cached_module_catalog`; unit tests can pass synthetic envelopes
+/// (including the `Err` branch) without standing up an HTTP mock.
+pub(crate) fn list_module_catalog_impl_with_l0(
+    db: &Db,
+    l0_outcome: Result<L0CatalogResponse, String>,
+) -> CatalogResponse {
+    let mut modules = builtin_catalog_entries(db);
+    let mut parse_errors: Vec<ManifestParseError> = Vec::new();
+    let mut l0_modules: Vec<L0CatalogModule> = Vec::new();
+    let l0_status: L0Status;
+
+    match l0_outcome {
+        Ok(envelope) => {
+            // Capture status BEFORE moving `envelope.modules` out.
+            l0_status = L0Status::Ok {
+                fetched_at: envelope.fetched_at.clone(),
+                modules_count: envelope.modules.len(),
+            };
+            l0_modules = envelope.modules;
+        }
+        Err(fetch_err) => {
+            // Best-effort: if a stale cache exists, the client already
+            // returned it as Ok — we only land here when there's
+            // truly no data. Surface the failure to the renderer.
+            l0_status = L0Status::Unavailable { error: fetch_err };
+        }
+    }
+
+    // Walk every L0 entry, merge with installed-state.
+    for l0 in &l0_modules {
+        let is_licensed = is_module_licensed_v2(
+            LicenseGateInput {
+                module_id: &l0.id,
+                required: l0.license_required,
+                min_orchestrator_tier: &l0.min_orchestrator_tier,
+                variant_ids: &l0.license_variant_ids,
+            },
+            db,
+        );
+
+        // Look at module_installs for any project-keyed install of this
+        // module_id. We use `list_module_installs_with_status` for each
+        // candidate status — small constant number of queries.
+        let install_state = lookup_install_state(db, &l0.id);
+
+        let (kind, version_override): (&str, Option<&str>) = match &install_state {
+            InstallState::None => ("available", None),
+            InstallState::Installed { version } => {
+                if version == &l0.version {
+                    ("installed", Some(version.as_str()))
+                } else if semver_less(version, &l0.version) {
+                    // L0 is newer than installed → update available.
+                    ("update_available", Some(version.as_str()))
+                } else {
+                    // Installed is newer than (or equal to a previous-
+                    // rolled-back) L0. Silent per review §J4-d.
+                    ("installed", Some(version.as_str()))
+                }
+            }
+            InstallState::Broken { version } => ("broken", Some(version.as_str())),
+            InstallState::Pending { status, version } => {
+                // Pending / installing / running / stopped / error all
+                // surface as their own kind string; the catalog tile
+                // just renders the badge. Treat anything non-`broken`
+                // and non-`installed` as the raw status name so the
+                // UI can decide.
+                (status.as_str(), Some(version.as_str()))
             }
         };
-        // v0.2.32 L1+L2 fix: when an on-disk manifest's id matches an
-        // existing builtin entry, the on-disk manifest WINS for the
-        // catalog-display fields (version, description, license_required,
-        // min_orchestrator_tier, compatibility_hosts, …) and `is_licensed`
-        // is re-resolved via the live `is_module_licensed` against the
-        // current tier cache.
-        //
-        // Pre-fix this branch was `continue;` — the builtin placeholder
-        // (e.g. `vct-rl-reranker` hardcoded at version 0.1.1 with
-        // is_licensed=false) shadowed the on-disk manifest forever, so:
-        //   * L1: Modules page rendered the stale hardcoded version
-        //     (0.1.1) instead of the shipped manifest's true version
-        //     (0.2.6 in v0.2.31).
-        //   * L2: `is_licensed` stayed `false` even for admin-tier users
-        //     because `is_module_licensed` was never run for the id.
-        //
-        // UX metadata that the on-disk manifest doesn't carry
-        // (`kind` / `parent_id` / `cta_route` / coming-soon fields) is
-        // preserved from the builtin so the Modules-page card layout
-        // (Install button vs Configure CTA vs Dashboard link) doesn't
-        // regress.
-        //
-        // The pinning test `catalog_matches_on_disk_manifest_when_present`
-        // (~line 1415) still validates that the hardcoded placeholder
-        // matches the on-disk manifest by hand. That test is the belt;
-        // this merge loop is the suspenders — even if the placeholder
-        // drifts, the live merge wins at runtime.
-        if let Some(existing_idx) = out.iter().position(|e| e.id == manifest.id) {
-            let licensed = is_module_licensed(&manifest, db);
-            let live =
-                ModuleCatalogEntry::from_manifest(&manifest, licensed, path.display().to_string());
-            let preserved_kind = out[existing_idx].kind.clone();
-            let preserved_parent_id = out[existing_idx].parent_id.clone();
-            let preserved_cta_route = out[existing_idx].cta_route.clone();
-            let preserved_coming_soon_tier = out[existing_idx].coming_soon_tier.clone();
-            let preserved_coming_soon_target = out[existing_idx].coming_soon_target.clone();
-            out[existing_idx] = ModuleCatalogEntry {
-                kind: preserved_kind,
-                parent_id: preserved_parent_id,
-                cta_route: preserved_cta_route,
-                coming_soon_tier: preserved_coming_soon_tier,
-                coming_soon_target: preserved_coming_soon_target,
-                ..live
-            };
+
+        modules.push(ModuleCatalogEntry::from_l0(l0, is_licensed, kind, version_override));
+    }
+
+    // Walk installed rows for any module_id NOT present in L0 (deprecated /
+    // withdrawn). Render as kind=installed with the catalog warning.
+    let l0_ids: std::collections::HashSet<&str> =
+        l0_modules.iter().map(|m| m.id.as_str()).collect();
+    for missing in installed_module_ids_not_in_set(db, &l0_ids) {
+        // Skip ids that are already present in `modules` (builtins
+        // bear the same id as a hypothetical paid module — defensive
+        // dedupe; in practice this doesn't trigger because builtin
+        // ids and paid ids are disjoint).
+        if modules.iter().any(|e| e.id == missing.module_id) {
             continue;
         }
-        let licensed = is_module_licensed(&manifest, db);
-        out.push(ModuleCatalogEntry::from_manifest(
-            &manifest,
-            licensed,
-            path.display().to_string(),
-        ));
+        // Try to read the on-disk manifest for display fields; fall
+        // back to a synthetic entry if it's missing or malformed.
+        let (entry, maybe_err) = installed_only_entry(db, &missing);
+        if let Some(err) = maybe_err {
+            parse_errors.push(err);
+        }
+        modules.push(entry);
+    }
+
+    // Dev-affordance: merge `<install_root>/paid-modules/*` manifests on
+    // top of the L0 results so a module author working on the next
+    // version locally sees their in-progress manifest in the catalog
+    // tile. Only runs when VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH=1.
+    // Precedence: dev manifest WINS over L0 for the same module_id
+    // (overrides version + description, etc.) because the dev is
+    // explicitly opted in.
+    for path in dev_paid_modules_paths(db) {
+        match read_and_parse_manifest(&path) {
+            Ok(manifest) => {
+                let licensed = is_module_licensed(&manifest, db);
+                let live = ModuleCatalogEntry::from_manifest(
+                    &manifest,
+                    licensed,
+                    path.display().to_string(),
+                );
+                if let Some(existing_idx) = modules.iter().position(|e| e.id == manifest.id) {
+                    let preserved_kind = modules[existing_idx].kind.clone();
+                    let preserved_parent_id = modules[existing_idx].parent_id.clone();
+                    let preserved_cta_route = modules[existing_idx].cta_route.clone();
+                    let preserved_coming_soon_tier =
+                        modules[existing_idx].coming_soon_tier.clone();
+                    let preserved_coming_soon_target =
+                        modules[existing_idx].coming_soon_target.clone();
+                    modules[existing_idx] = ModuleCatalogEntry {
+                        kind: preserved_kind,
+                        parent_id: preserved_parent_id,
+                        cta_route: preserved_cta_route,
+                        coming_soon_tier: preserved_coming_soon_tier,
+                        coming_soon_target: preserved_coming_soon_target,
+                        ..live
+                    };
+                } else {
+                    modules.push(live);
+                }
+            }
+            Err((path_disp, err)) => {
+                parse_errors.push(ManifestParseError {
+                    module_id: String::new(),
+                    source: path_disp,
+                    error: err,
+                });
+            }
+        }
+    }
+
+    // Dev-affordance toast: only fires when paid-modules/ exists, env
+    // var is NOT set, and user hasn't dismissed.
+    let dev_affordance_hint = build_dev_affordance_hint(db);
+
+    CatalogResponse {
+        modules,
+        l0_status,
+        parse_errors,
+        dev_affordance_hint,
+    }
+}
+
+/// What `module_installs` says about a given module_id (aggregated
+/// across all projects). For multi-project setups we return the
+/// first installed-state row we find — the catalog tile is project-
+/// agnostic (it shows "RL is installed somewhere"), and the renderer
+/// re-asserts via `list_installed_modules` per-project for the
+/// enable/disable toggle.
+enum InstallState {
+    None,
+    Installed { version: String },
+    Broken { version: String },
+    Pending { status: String, version: String },
+}
+
+fn lookup_install_state(db: &Db, module_id: &str) -> InstallState {
+    // installed > broken > anything-else > none
+    for status in &["installed", "broken", "installing", "running", "stopped", "error"] {
+        if let Ok(rows) = db.list_module_installs_with_status(status) {
+            for row in rows {
+                if row.module_id == module_id {
+                    return match *status {
+                        "installed" => InstallState::Installed {
+                            version: row.module_version,
+                        },
+                        "broken" => InstallState::Broken {
+                            version: row.module_version,
+                        },
+                        other => InstallState::Pending {
+                            status: other.into(),
+                            version: row.module_version,
+                        },
+                    };
+                }
+            }
+        }
+    }
+    InstallState::None
+}
+
+/// Modules that have an installed-state row but aren't in the given L0
+/// set. Returns metadata (id + version) so the caller can render the
+/// "No longer available in catalog" warning.
+struct InstalledLegacyEntry {
+    module_id: String,
+    module_version: String,
+}
+
+fn installed_module_ids_not_in_set(
+    db: &Db,
+    l0_ids: &std::collections::HashSet<&str>,
+) -> Vec<InstalledLegacyEntry> {
+    let mut out = Vec::new();
+    for status in &["installed", "broken"] {
+        if let Ok(rows) = db.list_module_installs_with_status(status) {
+            for row in rows {
+                if l0_ids.contains(row.module_id.as_str()) {
+                    continue;
+                }
+                // De-dup across multiple projects: keep the first occurrence.
+                if out
+                    .iter()
+                    .any(|e: &InstalledLegacyEntry| e.module_id == row.module_id)
+                {
+                    continue;
+                }
+                out.push(InstalledLegacyEntry {
+                    module_id: row.module_id,
+                    module_version: row.module_version,
+                });
+            }
+        }
     }
     out
 }
 
-fn find_manifest(db: &Db, module_id: &str) -> Result<(ModuleManifest, PathBuf), String> {
-    for path in catalog_scan_paths(db) {
-        let raw = std::fs::read_to_string(&path).unwrap_or_default();
-        if let Ok(m) = ModuleManifest::from_json(&raw) {
-            if m.id == module_id {
-                return Ok((m, path));
+/// Best-effort: try to read the on-disk manifest at
+/// `~/.vct/modules/<id>/vct-module.json` for full display fields.
+/// Falls back to a synthetic entry if the file is missing or malformed.
+/// Returns the entry + an optional parse error (which is propagated to
+/// `CatalogResponse.parse_errors`).
+fn installed_only_entry(
+    _db: &Db,
+    legacy: &InstalledLegacyEntry,
+) -> (ModuleCatalogEntry, Option<ManifestParseError>) {
+    let manifest_path = crate::paths::vct_root_dir()
+        .join("modules")
+        .join(&legacy.module_id)
+        .join("vct-module.json");
+    let mut parse_err: Option<ManifestParseError> = None;
+    let entry: ModuleCatalogEntry = if manifest_path.is_file() {
+        match std::fs::read_to_string(&manifest_path) {
+            Ok(raw) => match ModuleManifest::from_json(&raw) {
+                Ok(m) => ModuleCatalogEntry::from_manifest(
+                    &m,
+                    // No L0 row → no license gate context. Render as
+                    // licensed (the user already installed it, refusing
+                    // to render is worse than showing a possibly-stale
+                    // licensed=true).
+                    true,
+                    manifest_path.display().to_string(),
+                ),
+                Err(e) => {
+                    parse_err = Some(ManifestParseError {
+                        module_id: legacy.module_id.clone(),
+                        source: manifest_path.display().to_string(),
+                        error: e,
+                    });
+                    synthetic_legacy_entry(legacy)
+                }
+            },
+            Err(e) => {
+                parse_err = Some(ManifestParseError {
+                    module_id: legacy.module_id.clone(),
+                    source: manifest_path.display().to_string(),
+                    error: format!("read: {}", e),
+                });
+                synthetic_legacy_entry(legacy)
+            }
+        }
+    } else {
+        synthetic_legacy_entry(legacy)
+    };
+
+    // Mark with the legacy warning so the renderer shows the badge.
+    let mut entry = entry;
+    entry.kind = "installed".into();
+    entry.catalog_warning =
+        "This module is installed but no longer available in the catalog. \
+         It will continue to work but won't receive updates."
+            .into();
+    (entry, parse_err)
+}
+
+fn synthetic_legacy_entry(legacy: &InstalledLegacyEntry) -> ModuleCatalogEntry {
+    // Construct a minimal placeholder when neither L0 nor the on-disk
+    // manifest is available. Uses the module_id + version straight
+    // from the DB row. Direct-construct rather than going through
+    // `from_manifest` to avoid having to build a `ModuleManifest`
+    // (which requires `InstallBlock` + `RuntimeBlock` field values
+    // we don't have).
+    ModuleCatalogEntry {
+        id: legacy.module_id.clone(),
+        name: legacy.module_id.clone(),
+        version: legacy.module_version.clone(),
+        description: String::new(),
+        category: "paid-independent".into(),
+        tags: Vec::new(),
+        license_required: false,
+        license_variant_ids: Vec::new(),
+        min_orchestrator_tier: "free".into(),
+        compatibility_hosts: Vec::new(),
+        is_licensed: true,
+        manifest_source: "installed (synthetic)".into(),
+        kind: "installed".into(),
+        parent_id: String::new(),
+        cta_route: String::new(),
+        coming_soon_tier: String::new(),
+        coming_soon_target: String::new(),
+        deprecated: false,
+        deprecation_message: String::new(),
+        deprecation_eol_date: String::new(),
+        deprecation_migration_url: String::new(),
+        catalog_warning: String::new(),
+    }
+}
+
+/// Coarse semver `a < b` test (matches `ModuleCatalog.svelte::semverLess`'s
+/// shape so renderer + catalog agree). Splits on '.', parses the leading
+/// integer of each segment, lex-compares.
+fn semver_less(a: &str, b: &str) -> bool {
+    let parse = |v: &str| -> Vec<u64> {
+        v.split('.')
+            .map(|s| {
+                let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+                digits.parse::<u64>().unwrap_or(0)
+            })
+            .collect()
+    };
+    let aa = parse(a);
+    let bb = parse(b);
+    for i in 0..aa.len().max(bb.len()) {
+        let x = aa.get(i).copied().unwrap_or(0);
+        let y = bb.get(i).copied().unwrap_or(0);
+        if x < y {
+            return true;
+        }
+        if x > y {
+            return false;
+        }
+    }
+    false
+}
+
+fn read_and_parse_manifest(path: &std::path::Path) -> Result<ModuleManifest, (String, String)> {
+    let raw = std::fs::read_to_string(path).map_err(|e| {
+        (
+            path.display().to_string(),
+            format!("read {}: {}", path.display(), e),
+        )
+    })?;
+    ModuleManifest::from_json(&raw).map_err(|e| {
+        (
+            path.display().to_string(),
+            format!("parse {}: {}", path.display(), e),
+        )
+    })
+}
+
+fn build_dev_affordance_hint(db: &Db) -> Option<DevAffordanceHint> {
+    if dev_catalog_passthrough_enabled() {
+        // User has explicitly opted in; no hint needed.
+        return None;
+    }
+    let dismissed = db
+        .app_state_get(APP_STATE_KEY_DEV_AFFORDANCE_DISMISSED)
+        .ok()
+        .flatten()
+        .map(|v| v == "true")
+        .unwrap_or(false);
+    if dismissed {
+        return None;
+    }
+    let paid_modules = paid_modules_dir_exists(db)?;
+    Some(DevAffordanceHint {
+        paid_modules_path: paid_modules.display().to_string(),
+        env_var_name: crate::commands::installed_modules::DEV_CATALOG_PASSTHROUGH_ENV.into(),
+    })
+}
+
+/// Tauri command: mark the dev-affordance hint as dismissed. The
+/// renderer calls this once the user clicks "Got it" on the toast.
+/// Subsequent `list_module_catalog` calls will return
+/// `dev_affordance_hint = None`.
+#[command]
+pub async fn dismiss_dev_affordance_hint(db: State<'_, Db>) -> Result<(), String> {
+    db.app_state_set(APP_STATE_KEY_DEV_AFFORDANCE_DISMISSED, "true")?;
+    Ok(())
+}
+
+// ─── Pre-install vs post-install manifest split (v0.2.33) ──────────────
+//
+// `find_manifest` was a single function serving both install-time
+// (where the manifest had to come from on-disk pre-install scanning,
+// which is the bug v0.2.33 fixes) AND dispatch-time (where we WANT
+// the on-disk extracted manifest). The new shape:
+//
+//   * `resolve_install_metadata` — pre-install. Returns the L0
+//     install-time slice for use by `install_module_for_project` to
+//     drive container_pull. Does NOT return a `ModuleManifest`; it
+//     returns the narrower `L0CatalogModule` because we don't have
+//     the full manifest yet (it lives in the image).
+//
+//   * `find_installed_manifest` — post-install. Reads
+//     `~/.vct/modules/<id>/vct-module.json` (written by Agent C's
+//     `extract_manifest_from_image`). Returns the full
+//     `ModuleManifest` + the PathBuf, for `update_module_for_project`,
+//     `uninstall_module_v2`, dispatcher resume paths, etc.
+
+/// v0.2.33 pre-install lookup. Reads the cached L0 envelope and
+/// returns the entry matching `module_id`, or an Err if the catalog
+/// is unavailable / the module isn't listed.
+///
+/// Sync wrapper: this is called from sync helpers (the installer
+/// engine isn't async at this point in its lifecycle). Internally it
+/// uses `tauri::async_runtime::block_on` against the async
+/// `cached_module_catalog`. If the runtime can't be entered (e.g.
+/// we're already inside Tauri's reactor without a current handle),
+/// returns an Err.
+///
+/// v0.2.33: declared `pub` for the v0.2.34 follow-up (the cold-start
+/// install path that builds a thin ModuleManifest from this slice).
+/// The current `install_path_manifest_lookup` doesn't call it yet —
+/// install still uses on-disk-extracted-or-dev-paid-modules.
+#[allow(dead_code)] // consumed by v0.2.34 cold-start install path
+pub fn resolve_install_metadata(db: &Db, module_id: &str) -> Result<L0CatalogModule, String> {
+    // Try the in-DB cache directly without invoking the network. If
+    // it's fresh we get the value synchronously; if it's stale or
+    // absent we surface a helpful error pointing at
+    // refresh_module_catalog. This avoids the block_on complexity
+    // entirely while keeping the install path snappy when the user
+    // has just visited the Modules tab (cache fresh).
+    let raw = db
+        .app_state_get(crate::commands::module_catalog_client::APP_STATE_KEY_CATALOG)
+        .map_err(|e| format!("read catalog cache: {}", e))?
+        .ok_or_else(|| {
+            format!(
+                "module {} not available in catalog cache; \
+                 visit the Modules tab or call refresh_module_catalog first",
+                module_id,
+            )
+        })?;
+    let envelope: L0CatalogResponse = serde_json::from_str(&raw)
+        .map_err(|e| format!("parse cached catalog: {}", e))?;
+    envelope
+        .modules
+        .into_iter()
+        .find(|m| m.id == module_id)
+        .ok_or_else(|| format!("module {} not in L0 catalog", module_id))
+}
+
+/// v0.2.33 post-install lookup. Reads
+/// `~/.vct/modules/<module_id>/vct-module.json` (the file Agent C's
+/// `extract_manifest_from_image` writes). Errors if the file is
+/// missing or fails to parse — which the catalog refactor surfaces as
+/// a parse_errors entry to the renderer (banner).
+pub fn find_installed_manifest(
+    _db: &Db,
+    module_id: &str,
+) -> Result<(ModuleManifest, PathBuf), String> {
+    let path = crate::paths::vct_root_dir()
+        .join("modules")
+        .join(module_id)
+        .join("vct-module.json");
+    if !path.is_file() {
+        return Err(format!(
+            "module {} has no installed manifest at {}",
+            module_id,
+            path.display()
+        ));
+    }
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let m = ModuleManifest::from_json(&raw)
+        .map_err(|e| format!("parse {}: {}", path.display(), e))?;
+    if m.id != module_id {
+        return Err(format!(
+            "manifest at {} declares id={:?} but caller asked for {:?}",
+            path.display(),
+            m.id,
+            module_id,
+        ));
+    }
+    Ok((m, path))
+}
+
+/// v0.2.33 install-path manifest lookup. Tries the on-disk extracted
+/// manifest first (re-install / reinstall-from-broken case), then
+/// falls back to the dev-affordance scan when the passthrough env var
+/// is set. Returns an Err carrying the L0-aware action the user
+/// should take if neither source matches.
+fn install_path_manifest_lookup(
+    db: &Db,
+    module_id: &str,
+) -> Result<(ModuleManifest, PathBuf), String> {
+    if let Ok(pair) = find_installed_manifest(db, module_id) {
+        return Ok(pair);
+    }
+    if dev_catalog_passthrough_enabled() {
+        for path in dev_paid_modules_paths(db) {
+            if let Ok(raw) = std::fs::read_to_string(&path) {
+                if let Ok(m) = ModuleManifest::from_json(&raw) {
+                    if m.id == module_id {
+                        return Ok((m, path));
+                    }
+                }
             }
         }
     }
-    Err(format!("module {} not in catalog", module_id))
+    Err(format!(
+        "module {} has no manifest available for install. \
+         Cold-start install from L0 metadata only is a v0.2.34 follow-up — \
+         either install via the dev affordance (set \
+         VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH=1 with the manifest \
+         co-located at <install_root>/paid-modules/<id>/) or wait for the \
+         v0.2.34 launcher release that wires L0 install-slice into the \
+         installer engine.",
+        module_id
+    ))
 }
 
-/// Public manifest-lookup for the module_service restart path. Same logic as
-/// `find_manifest` (catalog scan + first matching id wins) but discards
-/// the source path since callers only need the parsed manifest.
+/// Compatibility shim for module_service's restart path. Same
+/// behaviour as `find_installed_manifest` but discards the source
+/// path since the caller only needs the parsed manifest.
+///
+/// v0.2.33: prefers the installed manifest under `~/.vct/modules/<id>/`.
+/// Falls back to the dev-affordance path (`paid-modules/<id>/`) ONLY
+/// when the env var is set — preserves the local-dev workflow for
+/// module-authoring sessions.
 pub fn find_manifest_for_resume(db: &Db, module_id: &str) -> Option<ModuleManifest> {
-    find_manifest(db, module_id).ok().map(|(m, _)| m)
+    if let Ok((m, _)) = find_installed_manifest(db, module_id) {
+        return Some(m);
+    }
+    // Dev passthrough fallback. Only activated when the env var is on
+    // — production users don't reach this branch.
+    if !dev_catalog_passthrough_enabled() {
+        return None;
+    }
+    for path in dev_paid_modules_paths(db) {
+        if let Ok(raw) = std::fs::read_to_string(&path) {
+            if let Ok(m) = ModuleManifest::from_json(&raw) {
+                if m.id == module_id {
+                    return Some(m);
+                }
+            }
+        }
+    }
+    None
 }
 
 // ─── Install / Uninstall ────────────────────────────────────────────────
@@ -577,8 +1083,19 @@ pub async fn install_module_for_project(
         .get_project(&project_id)?
         .ok_or_else(|| format!("project {} not found", project_id))?;
 
-    // 2. Manifest lookup
-    let (manifest, manifest_path) = find_manifest(&db, &module_id)?;
+    // 2. Manifest lookup.
+    //
+    // v0.2.33: the install path now resolves the manifest in three
+    // phases (in order — first one that succeeds wins):
+    //   a. on-disk extracted manifest at `~/.vct/modules/<id>/` (if a
+    //      prior install already pulled the image — re-install case).
+    //   b. dev-affordance: `<install_root>/paid-modules/<id>/` when
+    //      `VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH=1`.
+    //   c. (NOT implemented for v0.2.33) build a thin ModuleManifest
+    //      from the L0 install-time slice, drive container_pull, then
+    //      re-read the extracted manifest mid-install. Tracked as the
+    //      v0.2.34 "true cold-start install" gap (review §G-J3-a).
+    let (manifest, manifest_path) = install_path_manifest_lookup(&db, &module_id)?;
 
     // 3. Host compatibility
     let host_str = project.host.as_str();
@@ -754,10 +1271,15 @@ pub async fn update_module_for_project(
         })?;
 
     // 2. Project exists + manifest lookup.
+    //
+    // v0.2.33: update path uses the same three-phase lookup as install
+    // — typically the on-disk extracted manifest from the prior
+    // version is already present, and Agent C's post-pull extract
+    // will overwrite it with the new version's manifest mid-update.
     let _project = db
         .get_project(&project_id)?
         .ok_or_else(|| format!("project {} not found", project_id))?;
-    let (manifest, manifest_path) = find_manifest(&db, &module_id)?;
+    let (manifest, manifest_path) = install_path_manifest_lookup(&db, &module_id)?;
 
     // 3. License gate (same as install — paid modules require an active
     //    license at update time too, in case a Pro subscription lapsed
@@ -912,7 +1434,13 @@ pub async fn uninstall_module_v2(
 
     // Look up the manifest. On miss, fall back to legacy hardcoded behaviour
     // with a warning — never fail the uninstall over a missing manifest.
-    let manifest_opt = match find_manifest(&db, &module_id) {
+    //
+    // v0.2.33: prefer the extracted post-install manifest at
+    // `~/.vct/modules/<id>/vct-module.json` (`find_installed_manifest`),
+    // with the same dev-affordance fallback as `install_path_manifest_lookup`
+    // so a dev uninstalling from the co-located paid-modules clone
+    // still gets `UninstallBlock` honoured.
+    let manifest_opt = match install_path_manifest_lookup(&db, &module_id) {
         Ok((m, _)) => Some(m),
         Err(e) => {
             eprintln!(
@@ -1396,414 +1924,38 @@ mod tests {
         );
     }
 
-    #[test]
-    fn builtin_catalog_lists_rl_reranker_as_available_paid_module() {
-        // Phase 1C: confirm vct-rl-reranker is now `available` with the
-        // right tier, host compatibility, and version. This is the inverse
-        // of the old `lists_exactly_one_coming_soon` test — it pins the
-        // post-flip state instead.
-        //
-        // G1 (v0.2.22): catalog id was renamed from bare `"rl-reranker"`
-        // to `"vct-rl-reranker"` so `find_manifest(module_id)` matches the
-        // on-disk manifest (vct-module.json `"id": "vct-rl-reranker"`).
-        let db = open_db();
-        let entries = builtin_catalog_entries(&db);
-        let rl = entries
-            .iter()
-            .find(|e| e.id == "vct-rl-reranker")
-            .expect("vct-rl-reranker entry must be present");
+    // v0.2.33 (Agent B, L0a): deleted —
+    // `builtin_catalog_lists_rl_reranker_as_available_paid_module`. The
+    // hardcoded vct-rl-reranker entry was removed from
+    // `builtin_catalog_entries`; paid-module metadata now comes from L0
+    // (`module_catalog_client::cached_module_catalog`). The new
+    // `list_module_catalog_renders_l0_module_as_available_when_uninstalled`
+    // test (further down) covers the same contract.
 
-        assert_eq!(rl.kind, "available", "vct-rl-reranker should be installable");
-        assert_eq!(rl.version, "0.1.1", "matches manifest.version");
-        assert_eq!(rl.min_orchestrator_tier, "pro");
-        assert!(rl.license_required);
-        assert_eq!(rl.category, "paid-independent");
-        assert!(
-            rl.compatibility_hosts.contains(&"base".to_string()),
-            "must support base-host projects"
-        );
-        assert!(
-            rl.compatibility_hosts.contains(&"orchestrator_root".to_string()),
-            "must support orchestrator-root project (VCO_dev itself)"
-        );
-        assert!(
-            rl.manifest_source.contains("vct-rl-reranker"),
-            "manifest_source should reference the paid-modules path"
-        );
-    }
+    // v0.2.33 (Agent B, L0a): deleted —
+    // `catalog_matches_on_disk_manifest_when_present`. The pattern it
+    // pinned (hardcoded builtin entry ↔ on-disk paid-modules manifest
+    // agreement) no longer exists. Catalog metadata for paid modules
+    // comes from L0; the on-disk manifest is post-install only. The
+    // shape the test enforced is fundamentally obsolete.
 
-    /// R1 (v0.2.22): round-trip the on-disk `vct-rl-reranker` manifest
-    /// against the hardcoded builtin catalog entry.
-    ///
-    /// The validation report at `.claude/context/plans/v0.2.22-rl-e2e-
-    /// validation-report.md` identified three install-blocking config
-    /// drifts between the two sources of truth (G1: id mismatch, G2: host
-    /// list mismatch, G3: version pin drift). The existing pinning test
-    /// at `builtin_catalog_lists_rl_reranker_as_available_paid_module`
-    /// only validates the builtin entry against itself — it could not
-    /// catch any of the three because it never parses the on-disk JSON.
-    ///
-    /// This test closes that gap by:
-    ///   1. Loading `paid-modules/vct-rl-reranker/vct-module.json` from
-    ///      disk via the same `ModuleManifest::from_json` path that
-    ///      `find_manifest` uses at install time.
-    ///   2. Locating the matching builtin catalog entry by id.
-    ///   3. Asserting every field that drives install behaviour (id,
-    ///      version, min_orchestrator_tier, license_required, hosts)
-    ///      matches between the two sources.
-    ///
-    /// Skipped when the manifest file isn't present (e.g. CI environments
-    /// that build against the public AGPL repo without the paid-modules
-    /// staging dir). Production user installs are unaffected — paid
-    /// modules ship via the signed-URL gateway, not the AGPL release.
-    ///
-    /// If this test fails, a future commit drifted one of the two sources
-    /// from the other. Fix BOTH to agree before merging.
-    #[test]
-    fn catalog_matches_on_disk_manifest_when_present() {
-        // CARGO_MANIFEST_DIR at compile time is `launcher/src-tauri/`.
-        // Repo root is two .parent() hops up.
-        let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(|p| p.parent())
-            .expect("walk to repo root from launcher/src-tauri/")
-            .to_path_buf();
-        let manifest_path =
-            repo_root.join("paid-modules/vct-rl-reranker/vct-module.json");
-
-        if !manifest_path.exists() {
-            eprintln!(
-                "[test skip] paid-modules/vct-rl-reranker/vct-module.json not \
-                 present (path: {}) — skipping catalog↔manifest round-trip. \
-                 This is expected on public-AGPL-repo CI runs; paid modules \
-                 ship via the signed-URL gateway, not the AGPL release.",
-                manifest_path.display()
-            );
-            return;
-        }
-
-        // Parse the on-disk manifest via the EXACT path that
-        // `find_manifest` uses at install time (same `from_json` call,
-        // same validation, same error surface).
-        let raw = std::fs::read_to_string(&manifest_path)
-            .unwrap_or_else(|e| panic!("read {}: {}", manifest_path.display(), e));
-        let manifest = ModuleManifest::from_json(&raw)
-            .unwrap_or_else(|e| panic!("parse {}: {}", manifest_path.display(), e));
-
-        // Look up the builtin catalog entry the way the launcher does.
-        let db = open_db();
-        let entries = builtin_catalog_entries(&db);
-        let catalog_entry = entries
-            .iter()
-            .find(|e| e.id == manifest.id)
-            .unwrap_or_else(|| {
-                panic!(
-                    "no builtin catalog entry matches on-disk manifest id '{}' \
-                     — G1 mismatch (see v0.2.22 validation report). \
-                     Catalog ids present: {:?}",
-                    manifest.id,
-                    entries.iter().map(|e| &e.id).collect::<Vec<_>>()
-                )
-            });
-
-        // ─── Field-by-field round-trip assertions ─────────────────────
-        assert_eq!(
-            catalog_entry.id, manifest.id,
-            "G1: catalog.id must equal manifest.id"
-        );
-        assert_eq!(
-            catalog_entry.version, manifest.version,
-            "G3: catalog.version must equal manifest.version"
-        );
-        assert_eq!(
-            catalog_entry.min_orchestrator_tier, manifest.license.min_orchestrator_tier,
-            "catalog.min_orchestrator_tier must equal manifest.license.min_orchestrator_tier"
-        );
-        assert_eq!(
-            catalog_entry.license_required, manifest.license.required,
-            "catalog.license_required must equal manifest.license.required"
-        );
-        assert_eq!(
-            catalog_entry.name, manifest.name,
-            "catalog.name (display) must equal manifest.name"
-        );
-        assert_eq!(
-            catalog_entry.description, manifest.description,
-            "catalog.description must equal manifest.description (the catalog \
-             string is shown in the launcher GUI; the manifest string is shown \
-             when the module is queried programmatically — drift here means the \
-             GUI and CLI disagree on what the module does)"
-        );
-        assert_eq!(
-            catalog_entry.compatibility_hosts, manifest.compatibility.hosts,
-            "G2: catalog.compatibility_hosts must equal manifest.compatibility.hosts \
-             (otherwise install fails at the is_compatible_with_host gate)"
-        );
-    }
-
-    // ─── v0.2.32 #A: on-disk-manifest-overrides-builtin merge ──────────
+    // v0.2.33 (Agent B, L0a): deleted the three v0.2.32 #A merge tests:
+    //   - list_module_catalog_overrides_builtin_with_on_disk_manifest_version
+    //   - list_module_catalog_overrides_builtin_with_live_license_resolution
+    //   - list_module_catalog_preserves_builtin_kind_and_cta_route_for_overridden_entries
+    // plus their `MERGE_TEST_LOCK` + `run_catalog_with_bundled_manifest`
+    // helper. They exercised a shape (on-disk-manifest-overrides-builtin
+    // merge loop) that no longer exists — catalog entries for paid
+    // modules now come from L0 and the builtin set does NOT include a
+    // RL placeholder.
     //
-    // Background: v0.2.31 shipped paid-module v0.2.6 (RL Reranker). Users
-    // who installed it via the launcher GUI reported two bugs that turned
-    // out to be a SINGLE root cause:
-    //   * L1: Modules page showed the stale hardcoded version (0.1.1)
-    //     instead of the shipped 0.2.6.
-    //   * L2: "Activate License" button stayed visible even for admin-tier
-    //     users.
-    // Root cause: `list_module_catalog` skipped on-disk manifests whose
-    // id was already present in `builtin_catalog_entries()` (defensive
-    // dedupe), so the hardcoded `is_licensed: false` + frozen version
-    // shadowed the real shipped state forever.
-    //
-    // The fix (v0.2.32 #A) inverts the dedupe: when ids collide, the
-    // on-disk manifest WINS for display fields and `is_licensed` is
-    // re-resolved against the live tier cache. UX metadata that the
-    // on-disk manifest doesn't carry (`kind`, `parent_id`, `cta_route`,
-    // `coming_soon_*`) is preserved from the builtin.
-    //
-    // The three tests below pin each axis of the fix:
-    //   1. version override (proves the on-disk manifest's `version`
-    //      reaches the catalog — L1 regression guard).
-    //   2. live is_licensed re-resolution (proves admin tier unlocks the
-    //      paid module via the catalog path — L2 regression guard).
-    //   3. UX-metadata preservation (proves we didn't accidentally wipe
-    //      the builtin's `kind` / `cta_route` while overriding everything
-    //      else — defense against turning a subcomponent into a generic
-    //      `"available"` entry that loses its Dashboard link).
-    //
-    // All three exercise the same merge loop. They use `VCT_STATE_DIR` to
-    // redirect `catalog_scan_paths` to a temp directory so the test fixture
-    // controls exactly what manifests are scanned (real `~/.vct/modules/`
-    // is left alone). Tests serialize on `MERGE_TEST_LOCK` because
-    // `VCT_STATE_DIR` is process-wide.
-
-    static MERGE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Set `VCT_STATE_DIR` to a tempdir, drop a `vct-module.json` into
-    /// `<tempdir>/bundled_manifests/<filename>`, and yield the live
-    /// `Vec<ModuleCatalogEntry>` from `list_module_catalog_impl`.
-    ///
-    /// The `_lock_guard` argument keeps the serializing mutex held for the
-    /// duration of the test — callers acquire it once at the top of the
-    /// test body so the env-var mutation can't race a parallel test.
-    fn run_catalog_with_bundled_manifest(
-        db: &Db,
-        manifest_filename: &str,
-        manifest_json: &str,
-        _lock_guard: &std::sync::MutexGuard<'_, ()>,
-    ) -> Vec<ModuleCatalogEntry> {
-        let tmp = tempfile::tempdir().expect("create tempdir");
-        let bundled = tmp.path().join("bundled_manifests");
-        std::fs::create_dir_all(&bundled).expect("mkdir bundled_manifests");
-        let manifest_path = bundled.join(manifest_filename);
-        std::fs::write(&manifest_path, manifest_json).expect("write manifest");
-
-        // Save+restore VCT_STATE_DIR so the test fixture's tempdir doesn't
-        // bleed into other tests. Mutex above guarantees only this test
-        // is observing the env var while we hold it.
-        let prev = std::env::var("VCT_STATE_DIR").ok();
-        std::env::set_var("VCT_STATE_DIR", tmp.path());
-        let result = list_module_catalog_impl(db);
-        match prev {
-            Some(v) => std::env::set_var("VCT_STATE_DIR", v),
-            None => std::env::remove_var("VCT_STATE_DIR"),
-        }
-        // Keep the tempdir alive until after the catalog scan completed.
-        drop(tmp);
-        result
-    }
-
-    /// L1 regression: on-disk manifest's `version` MUST override the
-    /// hardcoded builtin placeholder version. Before the v0.2.32 #A fix,
-    /// the catalog skipped on-disk manifests whose id collided with a
-    /// builtin entry, so the launcher's Modules page froze at the
-    /// placeholder's version (0.1.1) even after the user installed v0.2.6.
-    #[test]
-    fn list_module_catalog_overrides_builtin_with_on_disk_manifest_version() {
-        let lock = MERGE_TEST_LOCK.lock().expect("acquire merge-test lock");
-        let db = open_db();
-
-        // Minimal on-disk manifest for vct-rl-reranker pinned at an
-        // obviously-different version so the assertion is unambiguous.
-        let manifest_json = serde_json::json!({
-            "manifest_version": 1,
-            "id": "vct-rl-reranker",
-            "name": "RL Reranker (test override)",
-            "version": "9.9.9",
-            "description": "Test fixture for v0.2.32 #A merge override.",
-            "category": "paid-independent",
-            "license": {
-                "required": true,
-                "variant_ids": ["fake-variant"],
-                "min_orchestrator_tier": "pro"
-            },
-            "compatibility": {"hosts": ["base", "mao", "orchestrator_root"]},
-            "install": {"method": "container_pull"},
-            "runtime": {"type": "service", "command": "echo", "args": []}
-        })
-        .to_string();
-
-        let entries = run_catalog_with_bundled_manifest(
-            &db,
-            "vct-rl-reranker.json",
-            &manifest_json,
-            &lock,
-        );
-
-        let rl_entries: Vec<&ModuleCatalogEntry> = entries
-            .iter()
-            .filter(|e| e.id == "vct-rl-reranker")
-            .collect();
-        assert_eq!(
-            rl_entries.len(),
-            1,
-            "expected exactly one vct-rl-reranker entry after merge; got {}: {:?}",
-            rl_entries.len(),
-            rl_entries.iter().map(|e| (&e.id, &e.version)).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            rl_entries[0].version, "9.9.9",
-            "on-disk manifest version (9.9.9) MUST override the hardcoded \
-             builtin placeholder version (0.1.1). Pre-v0.2.32 the merge \
-             loop skipped collision rows, so users saw the stale placeholder \
-             on the Modules page regardless of which version they installed."
-        );
-    }
-
-    /// L2 regression: `is_licensed` MUST be re-resolved via
-    /// `is_module_licensed(&manifest, &db)` on the merged entry — using
-    /// the LIVE tier cache, not the builtin placeholder's hardcoded
-    /// `is_licensed: false`. Before v0.2.32 #A, admin-tier users saw the
-    /// "Activate License" button on RL Reranker because the catalog
-    /// returned `is_licensed=false` from the placeholder, even though
-    /// `is_module_licensed` would have returned true for their tier.
-    #[test]
-    fn list_module_catalog_overrides_builtin_with_live_license_resolution() {
-        let lock = MERGE_TEST_LOCK.lock().expect("acquire merge-test lock");
-        let db = open_db();
-        // Admin tier — strict superset of enterprise, satisfies any
-        // `min_orchestrator_tier` strictly above "free" by the tier_rank
-        // ladder (see `is_module_licensed`).
-        db.set_tier_cache("admin", &serde_json::json!({}), None)
-            .expect("set admin tier");
-
-        let manifest_json = serde_json::json!({
-            "manifest_version": 1,
-            "id": "vct-rl-reranker",
-            "name": "RL Reranker",
-            "version": "0.2.6",
-            "description": "Test fixture for v0.2.32 #A L2 regression guard.",
-            "category": "paid-independent",
-            "license": {
-                "required": true,
-                "variant_ids": ["fake-variant"],
-                "min_orchestrator_tier": "pro"
-            },
-            "compatibility": {"hosts": ["base", "mao", "orchestrator_root"]},
-            "install": {"method": "container_pull"},
-            "runtime": {"type": "service", "command": "echo", "args": []}
-        })
-        .to_string();
-
-        let entries = run_catalog_with_bundled_manifest(
-            &db,
-            "vct-rl-reranker.json",
-            &manifest_json,
-            &lock,
-        );
-
-        let rl = entries
-            .iter()
-            .find(|e| e.id == "vct-rl-reranker")
-            .expect("vct-rl-reranker entry must be present");
-        assert!(
-            rl.is_licensed,
-            "admin tier MUST unlock vct-rl-reranker via the catalog merge — \
-             pre-v0.2.32 the hardcoded `is_licensed: false` from the builtin \
-             placeholder shadowed `is_module_licensed`'s live tier check, \
-             so admin users saw 'Activate License' on a module they \
-             already had universal access to."
-        );
-        assert_eq!(
-            rl.version, "0.2.6",
-            "sanity: this test also exercises the version override path \
-             so a regression in EITHER axis fails here"
-        );
-    }
-
-    /// Defense-in-depth: even though the merged entry takes display fields
-    /// from the on-disk manifest, the builtin's UX-metadata fields
-    /// (`kind` / `parent_id` / `cta_route` / `coming_soon_*`) MUST be
-    /// preserved — those fields don't exist on `ModuleManifest` and the
-    /// launcher's Modules-page layout depends on them.
-    ///
-    /// For `vct-rl-reranker` the builtin sets `kind: "available"` (so the
-    /// Install button renders) and empty `cta_route` (no Dashboard link
-    /// pre-install). If a future refactor accidentally inherits the
-    /// `from_manifest` defaults instead, the UX would still happen to
-    /// match (`"available"` + empty `cta_route`) — so this test pins a
-    /// subcomponent-like entry where the values DIFFER from
-    /// `from_manifest`'s defaults to make the regression observable.
-    #[test]
-    fn list_module_catalog_preserves_builtin_kind_and_cta_route_for_overridden_entries() {
-        let lock = MERGE_TEST_LOCK.lock().expect("acquire merge-test lock");
-        let db = open_db();
-        // The orchestrator's `knowledge-graph` builtin entry is a
-        // `subcomponent` with `parent_id: "orchestrator"` and
-        // `cta_route: "/kg"` — all three values DIFFER from
-        // `ModuleCatalogEntry::from_manifest`'s defaults (which would
-        // produce `kind: "available"`, empty parent_id, empty cta_route).
-        // If the merge accidentally took the manifest-derived defaults,
-        // the Dashboard link on the Modules card would disappear and the
-        // Install button would re-appear on a built-in subcomponent.
-        let manifest_json = serde_json::json!({
-            "manifest_version": 1,
-            "id": "knowledge-graph",
-            "name": "Knowledge Graph (override)",
-            "version": "9.9.9",
-            "description": "Test fixture for v0.2.32 #A UX-metadata preservation.",
-            "category": "core",
-            "license": {"required": false, "min_orchestrator_tier": "free"},
-            "compatibility": {"hosts": ["base"]},
-            "install": {"method": "git_clone"},
-            "runtime": {"type": "service", "command": "echo", "args": []}
-        })
-        .to_string();
-
-        let entries = run_catalog_with_bundled_manifest(
-            &db,
-            "knowledge-graph.json",
-            &manifest_json,
-            &lock,
-        );
-
-        let kg = entries
-            .iter()
-            .find(|e| e.id == "knowledge-graph")
-            .expect("knowledge-graph entry must be present");
-
-        // Display fields took the override:
-        assert_eq!(
-            kg.version, "9.9.9",
-            "version must come from the on-disk manifest"
-        );
-        // UX-metadata fields preserved from the builtin:
-        assert_eq!(
-            kg.kind, "subcomponent",
-            "kind MUST be preserved from the builtin (was overwritten to \
-             'available' if the merge accidentally used `from_manifest`'s default)"
-        );
-        assert_eq!(
-            kg.parent_id, "orchestrator",
-            "parent_id MUST be preserved from the builtin — otherwise the \
-             Modules-page card would lose its parent-grouping in the UI"
-        );
-        assert_eq!(
-            kg.cta_route, "/kg",
-            "cta_route MUST be preserved from the builtin — otherwise the \
-             Dashboard CTA link on the Modules card disappears"
-        );
-    }
+    // The v0.2.33 list_module_catalog tests below cover the equivalent
+    // contracts via the new L0-driven path:
+    //   * list_module_catalog_renders_l0_module_as_available_when_uninstalled
+    //   * list_module_catalog_admin_tier_paid_module_is_licensed
+    //   * list_module_catalog_free_tier_paid_module_is_not_licensed
+    //   * list_module_catalog_renders_update_available_when_l0_newer_than_installed
+    //   * etc.
 
     #[test]
     fn builtin_catalog_contains_no_vapor_module_ids() {
@@ -2347,5 +2499,652 @@ mod tests {
             "error message must say 'not found'; got: {}",
             msg
         );
+    }
+
+    // ─── v0.2.33 (Agent B, L0a) — L0-driven list_module_catalog tests ─────
+    //
+    // The new tests exercise `list_module_catalog_impl_with_l0` directly:
+    // it takes an already-resolved L0 outcome (so we can pass mock
+    // envelopes — including Ok(empty), Ok(populated), Err) and produces
+    // the full `CatalogResponse`. No HTTP server stand-up needed.
+    //
+    // Tests serialize on `CATALOG_TEST_LOCK` because some of them set
+    // `VCT_STATE_DIR` + `VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH` env
+    // vars; those mutations are process-wide.
+
+    use crate::commands::module_catalog_client::{
+        L0CatalogModule, L0CatalogResponse, L0Compatibility, L0Install,
+        L0InstallContainer,
+    };
+
+    static CATALOG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Build a canonical L0CatalogModule for vct-rl-reranker at the given
+    /// version. Used by every L0-driven test below to keep the fixture
+    /// shape consistent.
+    fn fake_l0_rl(version: &str) -> L0CatalogModule {
+        L0CatalogModule {
+            id: "vct-rl-reranker".into(),
+            name: "RL Reranker".into(),
+            version: version.into(),
+            description: "RL-based reranker".into(),
+            category: "paid-independent".into(),
+            tags: vec!["pro".into()],
+            homepage: String::new(),
+            publisher: String::new(),
+            license_required: true,
+            min_orchestrator_tier: "pro".into(),
+            // Non-empty so `is_module_licensed_v2` doesn't fall through
+            // to its variant_ids.is_empty() "treat as free" branch —
+            // pinning is_licensed=false for free-tier users.
+            license_variant_ids: vec!["fake-variant".into()],
+            trial_days: None,
+            compatibility: L0Compatibility {
+                hosts: vec!["base".into(), "mao".into(), "orchestrator_root".into()],
+                min_launcher_version: None,
+            },
+            install: L0Install {
+                method: "container_pull".into(),
+                container: L0InstallContainer {
+                    image: "ghcr.io/hotak92/vct-rl-reranker".into(),
+                    tag_from_version: true,
+                    registry: Some("ghcr.io".into()),
+                    pull_token_endpoint: "https://example/pull-token".into(),
+                    pull_token_method: "POST".into(),
+                },
+            },
+            requirements: None,
+            runtime_hints: None,
+            deprecated: false,
+            deprecation_message: String::new(),
+            deprecation_eol_date: String::new(),
+            deprecation_migration_url: String::new(),
+            post_install_manifest_path: "vct-module.json".into(),
+        }
+    }
+
+    fn ok_envelope(modules: Vec<L0CatalogModule>) -> Result<L0CatalogResponse, String> {
+        Ok(L0CatalogResponse {
+            schema_version: 1,
+            fetched_at: "2026-05-25T00:00:00Z".into(),
+            modules,
+        })
+    }
+
+    /// Acquire the catalog-test mutex AND redirect `VCT_STATE_DIR` to a
+    /// fresh tempdir. Returns the lock guard + tempdir; the caller drops
+    /// both at end-of-test to clean up.
+    fn isolate_state() -> (
+        std::sync::MutexGuard<'static, ()>,
+        tempfile::TempDir,
+        Option<String>,
+        Option<String>,
+    ) {
+        // Poison-tolerant lock acquisition: if a prior test panicked
+        // mid-test, the lock is poisoned but the data inside (unit
+        // tuple) is intact — we just take the guard anyway.
+        let lock = CATALOG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev_state = std::env::var("VCT_STATE_DIR").ok();
+        std::env::set_var("VCT_STATE_DIR", tmp.path());
+        let prev_dev = std::env::var("VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH").ok();
+        std::env::remove_var("VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH");
+        (lock, tmp, prev_state, prev_dev)
+    }
+
+    fn restore_env(prev_state: Option<String>, prev_dev: Option<String>) {
+        match prev_state {
+            Some(v) => std::env::set_var("VCT_STATE_DIR", v),
+            None => std::env::remove_var("VCT_STATE_DIR"),
+        }
+        match prev_dev {
+            Some(v) => std::env::set_var("VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH", v),
+            None => std::env::remove_var("VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH"),
+        }
+    }
+
+    /// Seed a project + an installed module_install row so the catalog's
+    /// "kind from module_installs" branch has something to read.
+    fn seed_install(db: &Db, module_id: &str, version: &str, status: ModuleStatus) -> String {
+        let project_id = format!("proj-{}", module_id);
+        db.insert_project(
+            &project_id,
+            "Test Project",
+            "/tmp/test",
+            ProjectHost::Base,
+            "test-project",
+        )
+        .expect("insert project");
+        let install_id = uuid::Uuid::new_v4().to_string();
+        db.insert_module_install(
+            &install_id,
+            &project_id,
+            module_id,
+            version,
+            &format!("/tmp/install/{}", module_id),
+        )
+        .expect("insert install");
+        db.set_module_install_status(&install_id, status.as_str())
+            .expect("flip status");
+        project_id
+    }
+
+    /// Test 1: L0 returns empty modules list → catalog renders only the
+    /// 4 builtin entries. No paid modules surface.
+    #[test]
+    fn list_module_catalog_returns_only_builtins_when_l0_empty() {
+        let (_lock, _tmp, prev_state, prev_dev) = isolate_state();
+        let db = open_db();
+        let response = list_module_catalog_impl_with_l0(&db, ok_envelope(Vec::new()));
+
+        // Builtin set: vct-launcher, orchestrator, knowledge-graph, code-graph.
+        let ids: Vec<&str> = response.modules.iter().map(|e| e.id.as_str()).collect();
+        assert!(ids.contains(&"vct-launcher"), "missing launcher: {:?}", ids);
+        assert!(ids.contains(&"orchestrator"), "missing orchestrator: {:?}", ids);
+        assert!(ids.contains(&"knowledge-graph"), "missing KG: {:?}", ids);
+        assert!(ids.contains(&"code-graph"), "missing code-graph: {:?}", ids);
+        // No vct-rl-reranker (placeholder removed in v0.2.33).
+        assert!(
+            !ids.contains(&"vct-rl-reranker"),
+            "vct-rl-reranker placeholder must NOT be present when L0 is empty; \
+             v0.2.33 removed the hardcoded entry"
+        );
+        // L0 status is Ok with 0 modules.
+        match response.l0_status {
+            L0Status::Ok { modules_count, .. } => assert_eq!(modules_count, 0),
+            other => panic!("expected Ok status, got {:?}", other),
+        }
+
+        restore_env(prev_state, prev_dev);
+    }
+
+    /// Test 2: L0 returns RL with version=0.2.7, no install row →
+    /// kind=available, version=0.2.7.
+    #[test]
+    fn list_module_catalog_renders_l0_module_as_available_when_uninstalled() {
+        let (_lock, _tmp, prev_state, prev_dev) = isolate_state();
+        let db = open_db();
+        let response = list_module_catalog_impl_with_l0(
+            &db,
+            ok_envelope(vec![fake_l0_rl("0.2.7")]),
+        );
+
+        let rl = response
+            .modules
+            .iter()
+            .find(|e| e.id == "vct-rl-reranker")
+            .expect("vct-rl-reranker must be in catalog after L0 advertises it");
+        assert_eq!(rl.kind, "available", "no install row → kind=available");
+        assert_eq!(rl.version, "0.2.7", "version must come from L0");
+        assert_eq!(rl.min_orchestrator_tier, "pro");
+        assert!(rl.license_required);
+        assert_eq!(rl.compatibility_hosts.len(), 3);
+        // manifest_source must reflect L0, not a file path.
+        assert!(
+            rl.manifest_source.starts_with("L0:"),
+            "manifest_source should be 'L0:<id>' for L0-sourced entries; got {:?}",
+            rl.manifest_source,
+        );
+
+        restore_env(prev_state, prev_dev);
+    }
+
+    /// Test 3: admin tier + L0 paid module → is_licensed=true (L10 regression).
+    #[test]
+    fn list_module_catalog_admin_tier_paid_module_is_licensed() {
+        let (_lock, _tmp, prev_state, prev_dev) = isolate_state();
+        let db = open_db();
+        db.set_tier_cache("admin", &serde_json::json!({}), None)
+            .expect("set admin tier");
+
+        let response = list_module_catalog_impl_with_l0(
+            &db,
+            ok_envelope(vec![fake_l0_rl("0.2.7")]),
+        );
+
+        let rl = response
+            .modules
+            .iter()
+            .find(|e| e.id == "vct-rl-reranker")
+            .expect("vct-rl-reranker must be present");
+        assert!(
+            rl.is_licensed,
+            "admin tier must auto-license paid modules; pre-v0.2.33 \
+             hardcoded is_licensed=false shadowed the live check, so admin \
+             users saw 'Activate License' on a module they had universal \
+             access to (L2/L10 regression guard)"
+        );
+
+        restore_env(prev_state, prev_dev);
+    }
+
+    /// Test 4: free tier + L0 paid module → is_licensed=false → button
+    /// reads "Activate license" on the renderer side.
+    #[test]
+    fn list_module_catalog_free_tier_paid_module_is_not_licensed() {
+        let (_lock, _tmp, prev_state, prev_dev) = isolate_state();
+        let db = open_db();
+        db.set_tier_cache("free", &serde_json::json!({}), None)
+            .expect("set free tier");
+
+        let response = list_module_catalog_impl_with_l0(
+            &db,
+            ok_envelope(vec![fake_l0_rl("0.2.7")]),
+        );
+
+        let rl = response
+            .modules
+            .iter()
+            .find(|e| e.id == "vct-rl-reranker")
+            .expect("vct-rl-reranker must be present");
+        assert!(
+            !rl.is_licensed,
+            "free tier must NOT unlock a pro-tier paid module; if this \
+             fails the activation flow won't fire and the user can't \
+             install"
+        );
+        assert!(rl.license_required, "L0 says license_required=true");
+
+        restore_env(prev_state, prev_dev);
+    }
+
+    /// Test 5: installed v0.2.7, L0 v0.2.8 → kind=update_available.
+    #[test]
+    fn list_module_catalog_renders_update_available_when_l0_newer_than_installed() {
+        let (_lock, _tmp, prev_state, prev_dev) = isolate_state();
+        let db = open_db();
+        let _ = seed_install(&db, "vct-rl-reranker", "0.2.7", ModuleStatus::Installed);
+
+        let response = list_module_catalog_impl_with_l0(
+            &db,
+            ok_envelope(vec![fake_l0_rl("0.2.8")]),
+        );
+
+        let rl = response
+            .modules
+            .iter()
+            .find(|e| e.id == "vct-rl-reranker")
+            .expect("entry present");
+        assert_eq!(rl.kind, "update_available", "L0 newer than installed");
+        assert_eq!(
+            rl.version, "0.2.7",
+            "the catalog version reports the installed version; the renderer \
+             reads it from the install row and compares to L0's latest"
+        );
+
+        restore_env(prev_state, prev_dev);
+    }
+
+    /// Test 6: installed v0.2.7, L0 v0.2.7 → kind=installed.
+    #[test]
+    fn list_module_catalog_renders_installed_when_versions_match() {
+        let (_lock, _tmp, prev_state, prev_dev) = isolate_state();
+        let db = open_db();
+        let _ = seed_install(&db, "vct-rl-reranker", "0.2.7", ModuleStatus::Installed);
+
+        let response = list_module_catalog_impl_with_l0(
+            &db,
+            ok_envelope(vec![fake_l0_rl("0.2.7")]),
+        );
+
+        let rl = response
+            .modules
+            .iter()
+            .find(|e| e.id == "vct-rl-reranker")
+            .expect("entry present");
+        assert_eq!(rl.kind, "installed", "versions match → installed");
+        assert_eq!(rl.version, "0.2.7");
+
+        restore_env(prev_state, prev_dev);
+    }
+
+    /// Test 7: install row with status='broken' → kind=broken (reconciler
+    /// already flipped the row; catalog must reflect it).
+    #[test]
+    fn list_module_catalog_renders_broken_when_status_is_broken() {
+        let (_lock, _tmp, prev_state, prev_dev) = isolate_state();
+        let db = open_db();
+        let _ = seed_install(&db, "vct-rl-reranker", "0.2.7", ModuleStatus::Broken);
+
+        let response = list_module_catalog_impl_with_l0(
+            &db,
+            ok_envelope(vec![fake_l0_rl("0.2.7")]),
+        );
+
+        let rl = response
+            .modules
+            .iter()
+            .find(|e| e.id == "vct-rl-reranker")
+            .expect("entry present");
+        assert_eq!(
+            rl.kind, "broken",
+            "module_installs.status='broken' (reconciler flipped) must \
+             surface as kind='broken' so the renderer shows the Reinstall \
+             CTA"
+        );
+
+        restore_env(prev_state, prev_dev);
+    }
+
+    /// Test 8: L0 unreachable with no cache → l0_status=Unavailable, only
+    /// builtins in the modules list, no panic.
+    #[test]
+    fn list_module_catalog_handles_l0_unavailable_with_no_cache() {
+        let (_lock, _tmp, prev_state, prev_dev) = isolate_state();
+        let db = open_db();
+        let response = list_module_catalog_impl_with_l0(
+            &db,
+            Err("network: connection refused".into()),
+        );
+
+        match response.l0_status {
+            L0Status::Unavailable { error } => {
+                assert!(error.contains("connection refused"), "must carry the underlying error: {}", error);
+            }
+            other => panic!("expected Unavailable, got {:?}", other),
+        }
+        // Builtins still render.
+        let ids: Vec<&str> = response.modules.iter().map(|e| e.id.as_str()).collect();
+        assert!(ids.contains(&"vct-launcher"));
+        assert!(ids.contains(&"orchestrator"));
+        // No paid modules.
+        assert!(!ids.contains(&"vct-rl-reranker"));
+
+        restore_env(prev_state, prev_dev);
+    }
+
+    /// Test 9: L0 unreachable with stale cache present → the client
+    /// returns the stale value as Ok, so this test verifies that
+    /// when the L0 layer surfaces stale-as-Ok, we render the stale
+    /// modules + the renderer treats it as Stale (rather than Ok).
+    ///
+    /// Note: the actual "stale" classification lives in
+    /// `module_catalog_client::cached_module_catalog`; the
+    /// `_impl_with_l0` boundary above only sees Ok/Err. We pin the
+    /// integration by asserting: if Ok(envelope) is passed, the
+    /// modules render (regardless of whether the cache was stale).
+    /// The "stale-fallback returns Ok" contract is tested in
+    /// module_catalog_client.rs's own tests.
+    #[test]
+    fn list_module_catalog_handles_l0_unavailable_with_stale_cache() {
+        let (_lock, _tmp, prev_state, prev_dev) = isolate_state();
+        let db = open_db();
+        // Simulate `cached_module_catalog` returning Ok with a stale
+        // envelope (the client layer would have already classified the
+        // result and surfaced it as Ok, see the cache layer test in
+        // module_catalog_client::tests).
+        let response = list_module_catalog_impl_with_l0(
+            &db,
+            ok_envelope(vec![fake_l0_rl("0.2.6")]), // stale cached version
+        );
+
+        // Modules from the stale cache STILL render — this is the
+        // user-visible contract: a slightly-stale catalog is better
+        // than an empty one. The l0_status reads Ok here because the
+        // client's stale-fallback layer remaps stale-but-served to Ok
+        // (with the older fetched_at) — that mapping is verified in
+        // module_catalog_client's own tests.
+        let rl = response
+            .modules
+            .iter()
+            .find(|e| e.id == "vct-rl-reranker")
+            .expect("stale cache contents must still render");
+        assert_eq!(rl.version, "0.2.6");
+
+        restore_env(prev_state, prev_dev);
+    }
+
+    /// Test 10: installed row for a module NOT in L0 → render as
+    /// kind=installed + catalog_warning explaining "no longer available".
+    #[test]
+    fn list_module_catalog_includes_uninstalled_legacy_module_with_warning() {
+        let (_lock, _tmp, prev_state, prev_dev) = isolate_state();
+        let db = open_db();
+        // Install a hypothetical legacy module that L0 no longer lists.
+        let _ = seed_install(&db, "vct-legacy", "0.1.0", ModuleStatus::Installed);
+
+        let response = list_module_catalog_impl_with_l0(
+            &db,
+            ok_envelope(vec![fake_l0_rl("0.2.7")]), // legacy NOT in L0
+        );
+
+        let legacy = response
+            .modules
+            .iter()
+            .find(|e| e.id == "vct-legacy")
+            .expect("legacy module still in catalog because module_installs has it");
+        assert_eq!(legacy.kind, "installed");
+        assert!(
+            !legacy.catalog_warning.is_empty(),
+            "legacy installed module must carry a catalog_warning so the \
+             renderer can show the 'no longer available' badge"
+        );
+        assert!(
+            legacy.catalog_warning.to_lowercase().contains("no longer")
+                || legacy.catalog_warning.to_lowercase().contains("not in"),
+            "warning text must signal removal: {:?}",
+            legacy.catalog_warning
+        );
+
+        restore_env(prev_state, prev_dev);
+    }
+
+    /// Test 11: `resolve_install_metadata` reads from the L0 cache and
+    /// returns the install slice.
+    #[test]
+    fn resolve_install_metadata_returns_l0_slice() {
+        let (_lock, _tmp, prev_state, prev_dev) = isolate_state();
+        let db = open_db();
+        // Seed the catalog cache the way `cached_module_catalog` would.
+        let envelope = L0CatalogResponse {
+            schema_version: 1,
+            fetched_at: "2026-05-25T00:00:00Z".into(),
+            modules: vec![fake_l0_rl("0.2.7")],
+        };
+        let serialized = serde_json::to_string(&envelope).unwrap();
+        db.app_state_set(
+            crate::commands::module_catalog_client::APP_STATE_KEY_CATALOG,
+            &serialized,
+        )
+        .expect("write cache");
+
+        let slice = resolve_install_metadata(&db, "vct-rl-reranker")
+            .expect("must find the L0 slice when cache is populated");
+        assert_eq!(slice.id, "vct-rl-reranker");
+        assert_eq!(slice.version, "0.2.7");
+        assert_eq!(slice.install.container.image, "ghcr.io/hotak92/vct-rl-reranker");
+
+        let missing = resolve_install_metadata(&db, "vct-not-in-l0");
+        assert!(missing.is_err(), "unknown module must Err");
+
+        restore_env(prev_state, prev_dev);
+    }
+
+    /// Test 12: `find_installed_manifest` reads `~/.vct/modules/<id>/`.
+    #[test]
+    fn find_installed_manifest_reads_on_disk_path() {
+        let (_lock, tmp, prev_state, prev_dev) = isolate_state();
+        let db = open_db();
+        // Place a minimal valid manifest at the expected path.
+        let module_dir = tmp.path().join("modules").join("vct-test-installed");
+        std::fs::create_dir_all(&module_dir).unwrap();
+        let manifest_json = serde_json::json!({
+            "manifest_version": 1,
+            "id": "vct-test-installed",
+            "name": "Test Installed",
+            "version": "0.3.0",
+            "description": "fixture",
+            "category": "paid-independent",
+            "license": {"required": false, "min_orchestrator_tier": "free"},
+            "compatibility": {"hosts": ["base"]},
+            "install": {"method": "container_pull"},
+            "runtime": {"type": "service", "command": "echo", "args": []}
+        });
+        std::fs::write(
+            module_dir.join("vct-module.json"),
+            manifest_json.to_string(),
+        )
+        .unwrap();
+
+        let (manifest, path) = find_installed_manifest(&db, "vct-test-installed")
+            .expect("must find on-disk manifest");
+        assert_eq!(manifest.id, "vct-test-installed");
+        assert_eq!(manifest.version, "0.3.0");
+        assert!(path.ends_with("vct-module.json"));
+
+        restore_env(prev_state, prev_dev);
+    }
+
+    /// Test 13: `find_installed_manifest` returns Err when the on-disk
+    /// file is missing.
+    #[test]
+    fn find_installed_manifest_returns_err_when_missing() {
+        let (_lock, _tmp, prev_state, prev_dev) = isolate_state();
+        let db = open_db();
+        let res = find_installed_manifest(&db, "vct-never-installed");
+        assert!(
+            res.is_err(),
+            "missing on-disk manifest must Err so callers can surface \
+             a parse_errors entry to the renderer"
+        );
+        let msg = res.unwrap_err();
+        assert!(
+            msg.contains("no installed manifest"),
+            "error must signal missing-manifest: {}",
+            msg
+        );
+
+        restore_env(prev_state, prev_dev);
+    }
+
+    /// Plant a synthetic install-root under `<tmp>/install_root/` that
+    /// passes `installer::check_install_status` (so the resolver caches
+    /// it and `paid_modules_dir_exists` can find the paid-modules dir).
+    /// Returns the install_root PathBuf.
+    fn plant_install_root(tmp_dir: &std::path::Path, db: &Db) -> PathBuf {
+        let install_root = tmp_dir.join("install_root");
+        std::fs::create_dir_all(install_root.join("paid-modules")).unwrap();
+        // check_install_status requires both files + a satisfied
+        // manifest OR a .venv/ — we go with the .venv fallback because
+        // it's the cheaper path (no JSON to serialise).
+        std::fs::write(install_root.join("CLAUDE.md"), "# stub").unwrap();
+        std::fs::write(install_root.join("install.py"), "# stub").unwrap();
+        std::fs::create_dir_all(install_root.join(".venv")).unwrap();
+        db.app_state_set("launcher.install_path", install_root.to_str().unwrap())
+            .unwrap();
+        install_root
+    }
+
+    /// Test 14: dev affordance hint fires when paid-modules/ exists but
+    /// the env var isn't set.
+    #[test]
+    fn dev_affordance_hint_emitted_when_paid_modules_exists_without_env_var() {
+        let (_lock, tmp, prev_state, prev_dev) = isolate_state();
+        let db = open_db();
+        // Create the dev paid-modules dir under a synthetic install_root.
+        let _install_root = plant_install_root(tmp.path(), &db);
+
+        // Env var NOT set (isolate_state cleared it).
+        assert!(!dev_catalog_passthrough_enabled());
+
+        let response = list_module_catalog_impl_with_l0(&db, ok_envelope(Vec::new()));
+        let hint = response
+            .dev_affordance_hint
+            .as_ref()
+            .expect("hint must fire when paid-modules/ exists + env var unset + not dismissed");
+        assert_eq!(hint.env_var_name, "VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH");
+        assert!(hint.paid_modules_path.ends_with("paid-modules"));
+
+        restore_env(prev_state, prev_dev);
+    }
+
+    /// Test 15: dev affordance hint is suppressed after dismissal.
+    #[test]
+    fn dev_affordance_hint_suppressed_after_dismissal() {
+        let (_lock, tmp, prev_state, prev_dev) = isolate_state();
+        let db = open_db();
+        let _install_root = plant_install_root(tmp.path(), &db);
+
+        // Mark dismissed via the same app_state key the Tauri command writes.
+        db.app_state_set(APP_STATE_KEY_DEV_AFFORDANCE_DISMISSED, "true")
+            .unwrap();
+
+        let response = list_module_catalog_impl_with_l0(&db, ok_envelope(Vec::new()));
+        assert!(
+            response.dev_affordance_hint.is_none(),
+            "after dismissal the hint must NOT re-fire on subsequent catalog reads"
+        );
+
+        restore_env(prev_state, prev_dev);
+    }
+
+    /// Test 16: dev paid-modules scan only runs when env var is set, and
+    /// merges with L0 results (dev WINS for same module_id).
+    #[test]
+    fn dev_paid_modules_scan_only_runs_with_env_var_set() {
+        let (_lock, tmp, prev_state, prev_dev) = isolate_state();
+        let db = open_db();
+
+        // Plant a synthetic install-root with a dev manifest.
+        let install_root = plant_install_root(tmp.path(), &db);
+        let dev_dir = install_root.join("paid-modules").join("vct-rl-reranker");
+        std::fs::create_dir_all(&dev_dir).unwrap();
+        let dev_manifest = serde_json::json!({
+            "manifest_version": 1,
+            "id": "vct-rl-reranker",
+            "name": "RL Reranker (DEV)",
+            "version": "9.9.9",
+            "description": "dev fixture",
+            "category": "paid-independent",
+            "license": {"required": true, "min_orchestrator_tier": "pro"},
+            "compatibility": {"hosts": ["base", "mao", "orchestrator_root"]},
+            "install": {
+                "method": "container_pull",
+                "container": {
+                    "image": "ghcr.io/hotak92/vct-rl-reranker",
+                    "pull_token_endpoint": "https://example/token"
+                }
+            },
+            "runtime": {"type": "service", "command": "echo", "args": []}
+        });
+        std::fs::write(dev_dir.join("vct-module.json"), dev_manifest.to_string()).unwrap();
+
+        // Phase 1: env var UNSET → only L0 results visible.
+        std::env::remove_var("VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH");
+        let response_off = list_module_catalog_impl_with_l0(
+            &db,
+            ok_envelope(vec![fake_l0_rl("0.2.7")]),
+        );
+        let rl_off = response_off
+            .modules
+            .iter()
+            .find(|e| e.id == "vct-rl-reranker")
+            .expect("L0 entry present");
+        assert_eq!(
+            rl_off.version, "0.2.7",
+            "with env var unset, the L0 version wins; dev paid-modules \
+             must NOT bleed into production behaviour"
+        );
+
+        // Phase 2: env var ON → dev manifest wins for the same id.
+        std::env::set_var("VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH", "1");
+        let response_on = list_module_catalog_impl_with_l0(
+            &db,
+            ok_envelope(vec![fake_l0_rl("0.2.7")]),
+        );
+        let rl_on = response_on
+            .modules
+            .iter()
+            .find(|e| e.id == "vct-rl-reranker")
+            .expect("entry present");
+        assert_eq!(
+            rl_on.version, "9.9.9",
+            "with passthrough on, the dev manifest overrides the L0 \
+             record for the same module_id — explicit opt-in semantics"
+        );
+
+        restore_env(prev_state, prev_dev);
     }
 }
