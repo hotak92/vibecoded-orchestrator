@@ -7964,6 +7964,13 @@ mod tests {
             "infrastructure",
             "vct-module.json",
             "orchestrator-managed-paths.txt",
+            // Phase 0 of the diagrams-integration plan (2026-05-24):
+            // pinning manifest for external npm packages. Listed here
+            // so `update_orchestrator_at` propagates new editions of
+            // the manifest to existing installs — same fail-safe
+            // self-reference shape used for
+            // `orchestrator-managed-paths.txt` itself.
+            "bundled_mcp_versions.toml",
         ];
         let actual: Vec<&str> = ORCHESTRATOR_MANAGED_PATHS.iter().copied().collect();
         assert_eq!(

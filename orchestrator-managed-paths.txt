@@ -39,3 +39,4 @@ tools
 infrastructure
 vct-module.json
 orchestrator-managed-paths.txt
+bundled_mcp_versions.toml
