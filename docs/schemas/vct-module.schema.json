@@ -1,0 +1,1997 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ModuleManifest",
+  "type": "object",
+  "required": [
+    "category",
+    "id",
+    "install",
+    "name",
+    "runtime",
+    "version"
+  ],
+  "properties": {
+    "manifest_version": {
+      "default": 0,
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "id": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    },
+    "description": {
+      "default": "",
+      "type": "string"
+    },
+    "publisher": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "homepage": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "repository": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "icon": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "category": {
+      "$ref": "#/definitions/ModuleCategory"
+    },
+    "tags": {
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "compatibility": {
+      "default": {
+        "hosts": [],
+        "min_launcher_version": null
+      },
+      "allOf": [
+        {
+          "$ref": "#/definitions/Compatibility"
+        }
+      ]
+    },
+    "license": {
+      "default": {
+        "min_orchestrator_tier": "",
+        "required": false,
+        "trial_days": 0,
+        "type": null,
+        "variant_ids": []
+      },
+      "allOf": [
+        {
+          "$ref": "#/definitions/LicenseBlock"
+        }
+      ]
+    },
+    "requirements": {
+      "default": {
+        "depends_on": [],
+        "disk_mb": 0,
+        "gpu": false,
+        "memory_mb": 0,
+        "network": [],
+        "node": null,
+        "os": [],
+        "python": null
+      },
+      "allOf": [
+        {
+          "$ref": "#/definitions/Requirements"
+        }
+      ]
+    },
+    "install": {
+      "$ref": "#/definitions/InstallBlock"
+    },
+    "secrets": {
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/SecretDecl"
+      }
+    },
+    "settings": {
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/SettingDecl"
+      }
+    },
+    "runtime": {
+      "$ref": "#/definitions/RuntimeBlock"
+    },
+    "mcp_registration": {
+      "default": null,
+      "anyOf": [
+        {
+          "$ref": "#/definitions/McpRegistration"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "setup_wizard": {
+      "default": null,
+      "anyOf": [
+        {
+          "$ref": "#/definitions/SetupWizard"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "upgrade": {
+      "default": null,
+      "anyOf": [
+        {
+          "$ref": "#/definitions/UpgradeBlock"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "telemetry": {
+      "default": null
+    },
+    "uninstall": {
+      "default": null,
+      "anyOf": [
+        {
+          "$ref": "#/definitions/UninstallBlock"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "provides": {
+      "default": [],
+      "type": "array",
+      "items": true
+    },
+    "consumes": {
+      "default": [],
+      "type": "array",
+      "items": true
+    },
+    "gui": {
+      "description": "Stream 2 (2026-05-19): module-contributed GUI surfaces. When populated, the launcher's Sidebar merges a nav entry for this module and renders `gui.config_tab` via `launcher/src/lib/components/ModuleConfigTab.svelte`. See the `GuiBlock` rustdoc for the full schema rationale (load-bearing — once a module ships with `gui.config_tab`, the schema becomes part of the public manifest contract).",
+      "default": null,
+      "anyOf": [
+        {
+          "$ref": "#/definitions/GuiBlock"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "db": {
+      "description": "v0.2.31: module-shipped DB migrations block. When `Some(...)`, the launcher applies SQL files matching `[0-9]+_*.sql` from `{module_install_dir}/{db.migrations_dir}/` at install + update time, idempotent via SHA256 tracking in launcher's own `module_db_migrations` table (migration 019). Every table the module creates MUST be prefixed with `{db.namespace}_` — the launcher refuses to apply SQL that creates / alters tables outside the declared namespace. See `vct_launcher_core::db::module_db_migrations` for the apply mechanism + `.claude/context/plans/rl-module-launcher-db-tables- spec-2026-05-23.md` for the full design rationale.",
+      "default": null,
+      "anyOf": [
+        {
+          "$ref": "#/definitions/DbBlock"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "definitions": {
+    "ModuleCategory": {
+      "type": "string",
+      "enum": [
+        "core",
+        "paid-orchestrator",
+        "paid-independent",
+        "community"
+      ]
+    },
+    "Compatibility": {
+      "type": "object",
+      "properties": {
+        "hosts": {
+          "default": [
+            "base",
+            "mao"
+          ],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "min_launcher_version": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "LicenseBlock": {
+      "type": "object",
+      "properties": {
+        "required": {
+          "default": false,
+          "type": "boolean"
+        },
+        "type": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "variant_ids": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "min_orchestrator_tier": {
+          "default": "free",
+          "type": "string"
+        },
+        "trial_days": {
+          "default": 0,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    "Requirements": {
+      "type": "object",
+      "properties": {
+        "os": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "python": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "node": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "memory_mb": {
+          "default": 0,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "disk_mb": {
+          "default": 0,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "network": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "gpu": {
+          "default": false,
+          "type": "boolean"
+        },
+        "depends_on": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "InstallBlock": {
+      "type": "object",
+      "required": [
+        "method"
+      ],
+      "properties": {
+        "method": {
+          "$ref": "#/definitions/InstallMethod"
+        },
+        "source": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ref": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "install_dir": {
+          "default": "{VCT_MODULES}/{MODULE_ID}",
+          "type": "string"
+        },
+        "post_install": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/CommandSpec"
+          }
+        },
+        "container": {
+          "description": "Container-pull metadata, required when `method = container_pull`. Ignored by serde when absent for other install methods.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ContainerInstallBlock"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "InstallMethod": {
+      "oneOf": [
+        {
+          "description": "Clone a git repo to `install_dir` (default for marketplace modules).",
+          "type": "string",
+          "enum": [
+            "git_clone"
+          ]
+        },
+        {
+          "description": "Use an existing directory at `install_dir` (e.g. user-built locally).",
+          "type": "string",
+          "enum": [
+            "local"
+          ]
+        },
+        {
+          "description": "Pull a container image from a private registry via a short-lived signed pull-token. Introduced for paid Pro-tier modules (e.g. vct-rl-reranker) where source-level distribution would expose the model + code to anyone with the repo URL. Requires the manifest's `install.container` block (`image`, `tag_from_version`, `registry`, `pull_token_endpoint`).\n\nFlow (implemented in installer_engine::run_install): 1. Validate license tier locally (require Pro or higher). 2. POST current `validate-tier` JWT to `pull_token_endpoint`. 3. Receive `{ image, tag, pull_token, expires_at }`. Token TTL is short (~15 min) — single-use only. 4. `podman pull` / `docker pull` with that token (env injection, not stored on disk). 5. Discard token from memory.\n\nAnti-piracy: registry is private (no anonymous access). Without a validated Pro license the user cannot obtain a pull-token, so they cannot pull the image at all. Image weights are rotated server-side (~weekly) — a leaked snapshot degrades vs free-tier within 2 weeks of stopping refreshes.",
+          "type": "string",
+          "enum": [
+            "container_pull"
+          ]
+        }
+      ]
+    },
+    "CommandSpec": {
+      "type": "object",
+      "required": [
+        "cmd"
+      ],
+      "properties": {
+        "cmd": {
+          "type": "string"
+        },
+        "cwd": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timeout_s": {
+          "default": 120,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "platform_cmd": {
+          "default": {},
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "_note": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "ContainerInstallBlock": {
+      "description": "Container-pull install metadata. Carries the registry image reference + the signed-URL token gateway endpoint. The launcher's installer engine POSTs the user's validated-tier JWT to `pull_token_endpoint` before invoking `podman/docker pull` — no anonymous registry access is ever attempted.",
+      "type": "object",
+      "required": [
+        "image",
+        "pull_token_endpoint"
+      ],
+      "properties": {
+        "image": {
+          "description": "Fully-qualified image reference WITHOUT a tag (e.g. \"ghcr.io/hotak92/vct-rl-reranker\"). The tag is determined by `tag_from_version` + manifest.version, OR by InstallBlock::r#ref.",
+          "type": "string"
+        },
+        "tag_from_version": {
+          "description": "When true, the pulled tag is `manifest.version` (e.g. \"0.1.0\"). When false, the tag is read from `InstallBlock::r#ref` (allows \"latest\" floating-tag pulls during early Pro-tier beta).",
+          "default": true,
+          "type": "boolean"
+        },
+        "registry": {
+          "description": "Registry hostname for clarity. Inferred from `image` if absent.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pull_token_endpoint": {
+          "description": "HTTPS endpoint that issues short-lived pull tokens against the user's validated-tier JWT. POST-only. Returns `{ image, tag, pull_token, expires_at }`. TTL ~15 minutes.",
+          "type": "string"
+        },
+        "pull_token_method": {
+          "description": "HTTP method to use (default POST).",
+          "default": "POST",
+          "type": "string"
+        },
+        "rotate_weights": {
+          "description": "When true, rotate model weights independently of image-version pulls. Used by the launcher's weekly-update poller.",
+          "default": false,
+          "type": "boolean"
+        },
+        "rotate_weights_endpoint": {
+          "description": "HTTPS endpoint that returns the latest available weights bundle version + a signed download URL. Polled on launcher startup + once per day per VCO_dev's locked decision (2026-05-16).",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "SecretDecl": {
+      "type": "object",
+      "required": [
+        "key"
+      ],
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "prompt": {
+          "default": "",
+          "type": "string"
+        },
+        "description": {
+          "default": "",
+          "type": "string"
+        },
+        "example": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "validation": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "required": {
+          "default": true,
+          "type": "boolean"
+        },
+        "scope": {
+          "default": "per-project",
+          "type": "string"
+        },
+        "sensitive": {
+          "default": false,
+          "type": "boolean"
+        }
+      }
+    },
+    "SettingDecl": {
+      "type": "object",
+      "required": [
+        "key"
+      ],
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "prompt": {
+          "default": "",
+          "type": "string"
+        },
+        "description": {
+          "default": "",
+          "type": "string"
+        },
+        "type": {
+          "default": "string",
+          "type": "string"
+        },
+        "default": {
+          "default": null
+        },
+        "default_by_platform": {
+          "default": {},
+          "type": "object",
+          "additionalProperties": true
+        },
+        "options": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "validation": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "validation_cmd": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "required": {
+          "default": false,
+          "type": "boolean"
+        },
+        "min": {
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "max": {
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        }
+      }
+    },
+    "RuntimeBlock": {
+      "type": "object",
+      "required": [
+        "command",
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "type": "string"
+        },
+        "command": {
+          "type": "string"
+        },
+        "args": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "platform_command": {
+          "default": {},
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "cwd": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "env_from_secrets": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "env_from_settings": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "env_fixed": {
+          "default": {},
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "health_check": {
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/HealthCheck"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "auto_restart": {
+          "default": false,
+          "type": "boolean"
+        },
+        "log_file": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "container_name_template": {
+          "description": "Container-name template (e.g. `\"vct-rl-reranker-{project_slug}\"`). `{project_slug}` is the only placeholder honoured.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "image_ref": {
+          "description": "Image reference template (e.g. `\"{install.container.image}:{install.container.tag}\"`). Resolved by `module_supervisor::resolve_image_ref` against the manifest's `install.container` block at start time.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ports": {
+          "description": "Port mappings host → container.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/PortMapping"
+          }
+        },
+        "volumes": {
+          "description": "Volume mounts host → container.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/VolumeMount"
+          }
+        },
+        "env_derived": {
+          "description": "Env vars that need placeholder substitution at start time (`{RL_SERVER_PORT}`, `{project_slug}`, `{ollama_port}`). Distinct from `env_fixed` (literal values).",
+          "default": {},
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "log_path_template": {
+          "description": "v0.2.27: per-module event-log path convention. When the module bind-mounts per-project event logs into its container, this template tells the dispatcher how to compute the host-side path from a project id. The dispatcher's `{{events_paths_for:<id>}}` template token reads this field, walks the referenced control's UUID array, and produces a JSON array of paths to inject into a descriptor's `body` field.\n\nClosed-set placeholders inside the template: - `{project_slug}` — the project's slug (DB column). - `{project_id}` — the project's UUID.\n\nSingle-brace deliberately, to distinguish from the OUTER dispatcher tokens (`{{...}}` double-brace). Any other `{...}` or `{{...}}` inside the template is a manifest validation error — see `validate_log_path_template`.\n\nExample: `\"/data/logs/rl_events_{project_slug}.jsonl\"`.\n\nOptional. When omitted, `{{events_paths_for:<id>}}` returns a clear dispatcher error rather than silently resolving to empty.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "min_gpu_vram_gb": {
+          "description": "Per-module VRAM threshold (GB). When set, the launcher passes this value to `decide_gpu_mode` for this module's install/start flow instead of the 8 GB default. Lets smaller modules (e.g. the RL reranker, ~4 GB) opt into GPU mode on hardware that orchestrator-core would degrade to CPU.",
+          "default": null,
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "gpu_optional": {
+          "description": "When true, the module RUNS on CPU with degraded performance (RL reranker fits — its model loads on CPU, just slower). `gpu_optional=false` modules refuse to install without a qualifying GPU and surface a clear error pointing at the user's options (upgrade hardware, or `--cpu-only` if they accept the perf hit). Default `false` (GPU treated as required when the module declares any GPU hint).",
+          "default": false,
+          "type": "boolean"
+        },
+        "gpu_image_variants": {
+          "description": "Optional per-mode image-variant tags. When present, the launcher's `start_container_for_module` reads `decide_gpu_mode`'s answer and picks the matching tag (Cuda → `cuda`, Rocm → `rocm`, Cpu/Metal → `cpu`). When absent, the legacy single-tag flow (from `install.container.tag_from_version`) is used unchanged.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/GpuImageVariants"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "HealthCheck": {
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "type": "string"
+        },
+        "timeout_s": {
+          "default": 120,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "interval_s": {
+          "default": 30,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "url": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "PortMapping": {
+      "description": "A single port mapping for a container module.\n\nWire shape: `[bind:]<host>:<container>`. `host` is a placeholder string (typically `\"{RL_SERVER_PORT}\"`) resolved at start time against the project's allocated rl_port. `container` is the in-container port number (literal u16). `bind` defaults to `\"127.0.0.1\"` when None, so the supervisor never accidentally exposes per-project containers to the LAN.",
+      "type": "object",
+      "required": [
+        "container",
+        "host"
+      ],
+      "properties": {
+        "host": {
+          "description": "Host-side port (string so it can be a `{PLACEHOLDER}`).",
+          "type": "string"
+        },
+        "container": {
+          "description": "In-container port (literal u16).",
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0.0
+        },
+        "bind": {
+          "description": "Bind address. Defaults to `\"127.0.0.1\"` when None.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "VolumeMount": {
+      "description": "A single volume mount for a container module.\n\nWire shape: `<host>:<container>[:<mode>]`. Both `host` and `container` undergo placeholder substitution against `PlaceholderCtx` + `{project_slug}`. Mode is optional; common values are `\"rw\"` (default when omitted), `\"ro\"`, or `\"z\"`/`\"Z\"` (SELinux relabel on RHEL hosts).",
+      "type": "object",
+      "required": [
+        "container",
+        "host"
+      ],
+      "properties": {
+        "host": {
+          "type": "string"
+        },
+        "container": {
+          "type": "string"
+        },
+        "mode": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "GpuImageVariants": {
+      "description": "Per-GPU-mode image tag variants. Each variant ships as a separate OCI image tag (e.g. `:0.1.0-cpu`, `:0.1.0-cuda`, `:0.1.0-rocm`) because PyTorch's CUDA/ROCm/CPU wheels are mutually exclusive at pip-install time. See `knowledge/concepts/gpu-mode-decision-policy.md` > \"Why CUDA wheels vs ROCm wheels need different containers\" for the full rationale.\n\nAll three variants are REQUIRED when the block is present — the launcher would have no fallback if one were missing. Modules that only ship a CPU build should simply omit `gpu_image_variants` and rely on the legacy single-tag path.",
+      "type": "object",
+      "required": [
+        "cpu",
+        "cuda",
+        "rocm"
+      ],
+      "properties": {
+        "cpu": {
+          "description": "CPU-only variant tag (e.g. `\"0.1.0-cpu\"`). Used for `GpuMode::Cpu` AND `GpuMode::Metal` (no Metal-specific torch wheels today).",
+          "type": "string"
+        },
+        "cuda": {
+          "description": "CUDA variant tag (e.g. `\"0.1.0-cuda\"`). Used for `GpuMode::Cuda`.",
+          "type": "string"
+        },
+        "rocm": {
+          "description": "ROCm variant tag (e.g. `\"0.1.0-rocm\"`). Used for `GpuMode::Rocm`.",
+          "type": "string"
+        }
+      }
+    },
+    "McpRegistration": {
+      "type": "object",
+      "required": [
+        "mcp_name"
+      ],
+      "properties": {
+        "enabled_by_default": {
+          "default": true,
+          "type": "boolean"
+        },
+        "mcp_name": {
+          "type": "string"
+        },
+        "target_projects": {
+          "default": "all"
+        },
+        "scope": {
+          "default": "user",
+          "type": "string"
+        }
+      }
+    },
+    "SetupWizard": {
+      "type": "object",
+      "required": [
+        "command"
+      ],
+      "properties": {
+        "command": {
+          "type": "string"
+        },
+        "args": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "platform_command": {
+          "default": {},
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "env_from_secrets": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "env_from_settings": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "success_marker": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "UpgradeBlock": {
+      "type": "object",
+      "properties": {
+        "strategy": {
+          "default": "git_pull",
+          "type": "string"
+        },
+        "pre_upgrade": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/CommandSpec"
+          }
+        },
+        "post_upgrade": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/CommandSpec"
+          }
+        },
+        "migration_script": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "UninstallBlock": {
+      "type": "object",
+      "properties": {
+        "remove_install_dir": {
+          "default": true,
+          "type": "boolean"
+        },
+        "preserve_paths": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "deregister_mcp": {
+          "default": true,
+          "type": "boolean"
+        },
+        "clear_secrets": {
+          "default": false,
+          "type": "boolean"
+        }
+      }
+    },
+    "GuiBlock": {
+      "type": "object",
+      "properties": {
+        "config_tab": {
+          "description": "Optional per-module config tab. When `Some(...)`, the launcher merges a sidebar entry routed to `/modules/<id>/config` (or to `config_tab.route` if set) and renders the schema there.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ConfigTab"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "ConfigTab": {
+      "description": "A module's \"config tab\" — single full-page surface composed of collapsible sections, each containing a list of controls. Rendered by `ModuleConfigTab.svelte`.",
+      "type": "object",
+      "required": [
+        "sections",
+        "title"
+      ],
+      "properties": {
+        "title": {
+          "description": "Title shown at the top of the tab AND as the sidebar nav label.",
+          "type": "string"
+        },
+        "icon": {
+          "description": "Optional lucide icon name (e.g. `\"sliders\"`). Falls back to the first letter of `title` in a generic chip when None.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "route": {
+          "description": "Optional sidebar route override. Defaults to `\"/modules/<module_id>/config\"` when None. Must start with `/`.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "description": {
+          "description": "Optional 1-line description rendered under the title at the top of the tab.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sections": {
+          "description": "Sections rendered in order. Empty sections render as a header with no body — caller's choice.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ConfigSection"
+          }
+        },
+        "show_in_sidebar": {
+          "description": "v0.2.23 F2 (2026-05-21): when false, the Sidebar's \"Module configuration\" group SUPPRESSES the nav entry for this module — the manifest is still discovered by `get_module_nav_items` (so callers like the per-project Settings page can render the tab in an embedded surface), but the standalone sidebar route is hidden.\n\nDefault `true` keeps backwards compat for paid modules whose only surface is `/modules/<id>/config`. The orchestrator-core manifest sets this to `false` because v0.2.23 F2 folds its controls into the per-project Settings page (rendered there when the orchestrator-root project is the active project), so the duplicate sidebar entry is no longer wanted.",
+          "default": true,
+          "type": "boolean"
+        }
+      }
+    },
+    "ConfigSection": {
+      "type": "object",
+      "required": [
+        "controls",
+        "title"
+      ],
+      "properties": {
+        "title": {
+          "type": "string"
+        },
+        "description": {
+          "description": "Optional 1-line description rendered under the section header.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "collapsible": {
+          "description": "When true, the section gains a chevron toggle. When false, the section is always expanded.",
+          "default": false,
+          "type": "boolean"
+        },
+        "initially_collapsed": {
+          "description": "When `collapsible=true`, the section starts collapsed when this is true. Has no effect when `collapsible=false`.",
+          "default": false,
+          "type": "boolean"
+        },
+        "controls": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ConfigControl"
+          }
+        }
+      }
+    },
+    "ConfigControl": {
+      "description": "Private mirror enum used solely by the custom `Deserialize` impl on [`ConfigControl`]. Mirrors every KNOWN variant of `ConfigControl` (excluding `Unsupported`) and derives `Deserialize` so we can delegate to serde's auto-generated tag-dispatch logic. Convert via `From<ConfigControlKnown> for ConfigControl` below.\n\nKeeping this in sync with `ConfigControl` is enforced by `confg_control_known_mirrors_all_known_variants_compile_time` (the exhaustive match in the From impl — adding a variant to `ConfigControl` without mirroring it here fails to compile).",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "id",
+            "kind",
+            "label"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "checkbox"
+              ]
+            },
+            "id": {
+              "type": "string"
+            },
+            "label": {
+              "type": "string"
+            },
+            "tooltip": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "default": {
+              "default": false,
+              "type": "boolean"
+            },
+            "on_change": {
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ActionRef"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "id",
+            "kind",
+            "label",
+            "options_source"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "multi_select"
+              ]
+            },
+            "id": {
+              "type": "string"
+            },
+            "label": {
+              "type": "string"
+            },
+            "tooltip": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "options_source": {
+              "$ref": "#/definitions/ActionRef"
+            },
+            "filter": {
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/MultiSelectFilter"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "on_change": {
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ActionRef"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "action",
+            "id",
+            "kind",
+            "label"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "button"
+              ]
+            },
+            "id": {
+              "type": "string"
+            },
+            "label": {
+              "type": "string"
+            },
+            "tooltip": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "action": {
+              "$ref": "#/definitions/ActionRef"
+            },
+            "variant": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "confirm": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "id",
+            "kind",
+            "label",
+            "options"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "select"
+              ]
+            },
+            "id": {
+              "type": "string"
+            },
+            "label": {
+              "type": "string"
+            },
+            "tooltip": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "options": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/SelectOption"
+              }
+            },
+            "default": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "on_change": {
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ActionRef"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "id",
+            "kind",
+            "text"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "info"
+              ]
+            },
+            "id": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "variant": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "id",
+            "kind",
+            "label"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "text_input"
+              ]
+            },
+            "id": {
+              "type": "string"
+            },
+            "label": {
+              "type": "string"
+            },
+            "tooltip": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "default": {
+              "default": "",
+              "type": "string"
+            },
+            "placeholder": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "apply_action": {
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ActionRef"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "id",
+            "kind",
+            "label"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "number_input"
+              ]
+            },
+            "id": {
+              "type": "string"
+            },
+            "label": {
+              "type": "string"
+            },
+            "tooltip": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "default": {
+              "default": null,
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "min": {
+              "default": null,
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "max": {
+              "default": null,
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "step": {
+              "default": null,
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "on_change": {
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ActionRef"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "id",
+            "kind",
+            "label",
+            "render_template",
+            "source"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "status_display"
+              ]
+            },
+            "id": {
+              "type": "string"
+            },
+            "label": {
+              "type": "string"
+            },
+            "tooltip": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "source": {
+              "$ref": "#/definitions/ActionRef"
+            },
+            "render_template": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "id",
+            "kind",
+            "label"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "file_picker"
+              ]
+            },
+            "id": {
+              "type": "string"
+            },
+            "label": {
+              "type": "string"
+            },
+            "tooltip": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "extensions": {
+              "default": [],
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "directory": {
+              "default": false,
+              "type": "boolean"
+            },
+            "on_change": {
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ActionRef"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "href",
+            "id",
+            "kind",
+            "label"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "link"
+              ]
+            },
+            "id": {
+              "type": "string"
+            },
+            "label": {
+              "type": "string"
+            },
+            "tooltip": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "href": {
+              "type": "string"
+            },
+            "target": {
+              "default": "external",
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "id",
+            "kind",
+            "label",
+            "source"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "info_dynamic"
+              ]
+            },
+            "id": {
+              "type": "string"
+            },
+            "label": {
+              "type": "string"
+            },
+            "tooltip": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "source": {
+              "$ref": "#/definitions/InfoDynamicSource"
+            },
+            "format": {
+              "default": "{value}",
+              "type": "string"
+            },
+            "fallback": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "id",
+            "kind",
+            "label"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "date_picker"
+              ]
+            },
+            "id": {
+              "type": "string"
+            },
+            "label": {
+              "type": "string"
+            },
+            "tooltip": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "default": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "min": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "max": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "on_change": {
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ActionRef"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "ActionRef": {
+      "description": "Either a legacy Tauri command name OR a structured action descriptor.\n\nBack-compat: a JSON string field deserializes as [`ActionRef::Legacy`]; a JSON object deserializes as [`ActionRef::Descriptor`]. The renderer dispatches accordingly.",
+      "anyOf": [
+        {
+          "description": "Legacy form: name of a Tauri command registered in `invoke_handler!`. Kept permanently for v0.2.20-v0.2.25 modules and for in-tree controls that genuinely need Rust code.",
+          "type": "string"
+        },
+        {
+          "description": "Structured descriptor — the launcher's generic dispatcher executes it. No per-module Tauri code required.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ActionDescriptor"
+            }
+          ]
+        }
+      ]
+    },
+    "ActionDescriptor": {
+      "description": "Declarative action that the generic `module_dispatch_action` command executes at dispatch time.\n\nv0.2.26 shipped ONE kind: `http`. v0.2.32 (CHAINED_ACTION, 2026-05-24) adds the generic `chained_action` primitive — a sequence of step descriptors executed serially, with each step's response threaded into the next step's body via `{{previous_step.<field>}}` placeholders. Optional `polling` attaches to the FINAL step.\n\nFuture kinds (e.g. `shell` for sandboxed subprocess actions) are intentionally NOT included — they would expand the trust surface significantly and need their own design pass.",
+      "oneOf": [
+        {
+          "description": "Issue an HTTP request to the module's container (resolved via `db.get_project_module_port(project_id, module_id)`). The optional `polling` block converts this from a fire-and-forget call into a long-running pollable job. The optional `next_action` chains another descriptor on success.",
+          "type": "object",
+          "required": [
+            "kind",
+            "method",
+            "path"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "http"
+              ]
+            },
+            "method": {
+              "$ref": "#/definitions/HttpMethod"
+            },
+            "path": {
+              "type": "string"
+            },
+            "body": {
+              "default": null
+            },
+            "polling": {
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/PollingSpec"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "next_action": {
+              "description": "Chain a follow-up action on success. The chain is purely lexical (nested JSON), so cycles are structurally impossible. The dispatcher executes via an iterative loop guarded by `max_chain_steps` (default 1024) to bound runaway depth.",
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ActionDescriptor"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "description": "v0.2.32 (CHAINED_ACTION, 2026-05-24): execute a sequence of step descriptors serially. Each step's parsed JSON response is pushed onto a `step_results` array; the next step's body can reference previous-step fields via `{{previous_step.<field>}}` (previous step only) or `{{step.N.<field>}}` (absolute index).\n\n`polling` attaches to the FINAL step only. The renderer observes `polling.progress_event` / `polling.failed_event` as usual. Intermediate steps must be fast / synchronous — if any intermediate step needs polling, it should be split into a separate top-level dispatch.\n\n`rollback_on_step_failure` is reserved for v0.2.33+ (would require every action kind to declare a rollback companion). For v0.2.32 the dispatcher always LOGS and PROPAGATES on step failure — the partial results are dropped, the renderer sees the error, and previous steps' side-effects stay on disk / in the database. Manifests declaring `true` parse correctly but the flag has no effect today.",
+          "type": "object",
+          "required": [
+            "kind",
+            "steps"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "chained_action"
+              ]
+            },
+            "steps": {
+              "description": "Ordered list of step descriptors. Empty `steps` is a hard error at dispatch time (no point chaining nothing).",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/ActionDescriptor"
+              }
+            },
+            "polling": {
+              "description": "Attaches to the LAST step's execution. The Rust executor applies it after the final step's kick succeeds, using the same job-id-from-response mechanism as the `Http` variant.",
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/PollingSpec"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "rollback_on_step_failure": {
+              "description": "Reserved for v0.2.33+. For v0.2.32 the dispatcher always logs + propagates step failures regardless of this flag. Pinned in serde so manifests don't have to be re-touched when rollback support lands.\n\nv0.2.33 (Agent D): accepts the alias `stop_on_failure` for back-compat with the v0.2.7 RL manifest, which shipped that spelling before this field's canonical name was settled. The renamed canonical form (`rollback_on_step_failure`) is preferred for new manifests; the alias logs a deprecation warning when used.",
+              "default": false,
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "description": "v0.2.33 (Agent D, 2026-05-25): invoke a launcher-registered Tauri command directly. The v0.2.7 RL manifest uses this kind inside `chained_action.steps[]` to call commands like `module_download_default_weights` that already exist in the launcher's `invoke_handler!` registry.\n\nThe dispatcher consults a whitelist (`is_whitelisted_manifest_command`) before invoking — any command starting with `module_` plus an explicit allowlist of legacy non-`module_` commands is allowed. Unknown / non-whitelisted command names error rather than dispatch (manifest-driven RCE prevention).\n\n`args` is forwarded to the underlying Rust function as-is, substituted through the same placeholder pipeline as `Http.body` (`{{previous_step.<field>}}`, `{{control:<id>}}`, etc.). Each whitelisted command's signature is statically known to the dispatcher, so type errors surface at command-arg parse time (not as opaque dispatch failures).",
+          "type": "object",
+          "required": [
+            "command",
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "tauri_command"
+              ]
+            },
+            "command": {
+              "type": "string"
+            },
+            "args": {
+              "default": null
+            }
+          }
+        }
+      ]
+    },
+    "HttpMethod": {
+      "type": "string",
+      "enum": [
+        "GET",
+        "POST",
+        "PUT",
+        "DELETE"
+      ]
+    },
+    "PollingSpec": {
+      "description": "Polling spec for long-running actions. When attached to an [`ActionDescriptor::Http`], the dispatcher: 1. Issues the kick request (the parent descriptor's method+body). 2. Reads the `job_id` from the kick response via `job_id_path`. 3. Spawns a background poller that re-hits `endpoint` every `interval_seconds`, passing the job_id back as a query param. 4. Emits a `progress_event` Tauri event on each tick. 5. Stops when a terminal state is hit (success or failure) OR `max_attempts` is exceeded.\n\nThe renderer subscribes to `progress_event` + `failed_event` to update the UI without blocking the user's click handler.",
+      "type": "object",
+      "required": [
+        "endpoint"
+      ],
+      "properties": {
+        "endpoint": {
+          "description": "Container-relative URL for the polling GET. e.g. `/finetune_status`.",
+          "type": "string"
+        },
+        "job_id_path": {
+          "description": "JSONPath into the kick response that locates the job id. e.g. `$.job_id`. Currently supports only the top-level form (`$.<key>`); deeper paths can be added in a later release.",
+          "default": "$.job_id",
+          "type": "string"
+        },
+        "job_id_query_param": {
+          "description": "Query-parameter name the poller uses to pass the job id back. Default `\"job_id\"`.",
+          "default": "job_id",
+          "type": "string"
+        },
+        "interval_seconds": {
+          "default": 5,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "max_attempts": {
+          "default": 60,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "terminal_state_field": {
+          "description": "JSONPath into the poll response locating the terminal-state field. Default `$.state` (matches the RL container's `/finetune_status` shape).",
+          "default": "$.state",
+          "type": "string"
+        },
+        "terminal_success_values": {
+          "description": "State values that count as \"done\". Default `[\"done\"]`.",
+          "default": [
+            "done"
+          ],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "terminal_failure_values": {
+          "description": "State values that count as \"failed\". Default `[\"failed\", \"error\"]`.",
+          "default": [
+            "failed",
+            "error"
+          ],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "progress_event": {
+          "description": "Tauri event emitted on each poll tick. The payload is the full poll response JSON. Default `\"module://action-progress\"`.",
+          "default": "module://action-progress",
+          "type": "string"
+        },
+        "failed_event": {
+          "description": "Tauri event emitted on terminal failure. Default `\"module://action-failed\"`.",
+          "default": "module://action-failed",
+          "type": "string"
+        }
+      }
+    },
+    "MultiSelectFilter": {
+      "description": "Runtime-driven filter for [`ConfigControl::MultiSelect`] options.\n\nv0.2.32 ships ONE kind: `match`. The renderer evaluates the filter when rendering options — entries whose `meta.<meta_field>` does not equal the runtime-resolved value referenced by `equals_runtime` are hidden (or rendered disabled with a tooltip, implementation choice owned by the renderer).\n\n`equals_runtime` is a dotted identifier the renderer resolves against well-known runtime values. v0.2.32 supports exactly one: * `\"container.active_embedding\"` — the project's `ACTIVE_EMBEDDING` env var (typically `qwen3`, `arctic`, `openai`, or a future identifier). Resolved via a Tauri command in the renderer; default `\"qwen3\"` if the lookup fails (matches `module_service::DEFAULT_EMBEDDING_SOURCE`).\n\nFuture kinds (regex, range, contains) land additively as new variants on the enum — the `#[serde(tag = \"kind\")]` shape keeps the wire format extension-friendly.",
+      "oneOf": [
+        {
+          "description": "Show only options whose `meta.<meta_field>` exactly equals the runtime value resolved from `equals_runtime`. String equality only — for numeric / regex comparison, future kinds.",
+          "type": "object",
+          "required": [
+            "equals_runtime",
+            "kind",
+            "meta_field"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "match"
+              ]
+            },
+            "meta_field": {
+              "description": "Top-level key on each option's `meta` JSON object to look up. SQL-identifier shape recommended (no dots).",
+              "type": "string"
+            },
+            "equals_runtime": {
+              "description": "Runtime-value identifier. v0.2.32 supports `\"container.active_embedding\"` only. Unknown identifiers MUST NOT panic the renderer — they should fall back to \"no filtering\" (show all options).",
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "SelectOption": {
+      "description": "Option in a select / multi_select control. Bare strings (e.g. \"qwen3\") also deserialise as a back-compat convenience where the value+label are equal; declare full objects for forward-compatibility with badge / meta fields.",
+      "type": "object",
+      "required": [
+        "value"
+      ],
+      "properties": {
+        "value": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "badge": {
+          "type": "string"
+        },
+        "meta": true
+      }
+    },
+    "InfoDynamicSource": {
+      "description": "v0.2.32 (L4): data source for an [`ConfigControl::InfoDynamic`]. Tagged on `kind` so future variants (`http_endpoint`, `tauri_command`) can land additively without breaking older manifests.\n\nv1 ships exactly ONE kind: `module_db`. Future kinds will need their own renderer plumbing; the `kind` tag keeps the serde shape forward-compatible.",
+      "oneOf": [
+        {
+          "description": "Read one keyed row from the hub's module-DB REST surface via Agent J's `module_db_read_row` Tauri command (v0.2.31). The renderer substitutes `{{project_id}}` in `key` against the active project, then projects `field` from the returned JSON object. Returns null when the row is absent, the container has no migrations applied, or the hub is unreachable.",
+          "type": "object",
+          "required": [
+            "field",
+            "key",
+            "kind",
+            "table"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "module_db"
+              ]
+            },
+            "table": {
+              "description": "Table name (must be `{module_namespace}_*` per the v0.2.31 namespace policy — the hub enforces this at write time; we don't re-validate here).",
+              "type": "string"
+            },
+            "key": {
+              "description": "Row key. May contain `{{project_id}}`, substituted by the renderer against the active project's UUID. Other token forms are passed through unchanged.",
+              "type": "string"
+            },
+            "field": {
+              "description": "Field name to project from the row's JSON value.",
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "DbBlock": {
+      "type": "object",
+      "required": [
+        "migrations_dir",
+        "namespace"
+      ],
+      "properties": {
+        "migrations_dir": {
+          "description": "Relative path (under the module's install_dir) where the launcher looks for SQL migration files. Files matching `[0-9]+_*.sql` are applied in lexicographic order. Convention: zero-pad to 4 digits (`0001_*.sql`, `0002_*.sql`, ...) so the natural string sort matches numeric sort.",
+          "type": "string"
+        },
+        "namespace": {
+          "description": "Lowercase identifier prefix every module-owned table MUST declare. The launcher's apply mechanism refuses to execute SQL that creates / alters tables outside `{namespace}_*`. FOREIGN KEY references to launcher-owned tables (e.g. `projects(id)`) are allowed — namespace-enforcement only constrains DDL subjects, not FK targets.\n\nValidation: must match `[a-z][a-z0-9_]*`. Empty / uppercase / non-identifier-shaped values are rejected at manifest-load time.",
+          "type": "string"
+        }
+      }
+    }
+  }
+}

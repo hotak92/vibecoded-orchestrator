@@ -11,11 +11,12 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 // ─── Top-level manifest type ────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ModuleManifest {
     #[serde(default)]
     pub manifest_version: u32,
@@ -116,7 +117,7 @@ pub struct ModuleManifest {
 // launcher's apply-on-install code path runs against EVERY install /
 // update of that module. Keep the schema additive.
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DbBlock {
     /// Relative path (under the module's install_dir) where the
     /// launcher looks for SQL migration files. Files matching
@@ -156,7 +157,7 @@ pub struct DbBlock {
 // All control variants accept `tooltip: Option<String>` so every
 // control can carry mouseover help — non-tech users rely on it.
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
 pub struct GuiBlock {
     /// Optional per-module config tab. When `Some(...)`, the launcher
     /// merges a sidebar entry routed to `/modules/<id>/config` (or to
@@ -168,7 +169,7 @@ pub struct GuiBlock {
 /// A module's "config tab" — single full-page surface composed of
 /// collapsible sections, each containing a list of controls. Rendered
 /// by `ModuleConfigTab.svelte`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ConfigTab {
     /// Title shown at the top of the tab AND as the sidebar nav label.
     pub title: String,
@@ -210,7 +211,7 @@ fn default_show_in_sidebar() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ConfigSection {
     pub title: String,
     /// Optional 1-line description rendered under the section header.
@@ -601,8 +602,16 @@ fn strict_manifest_mode() -> bool {
 /// Test-only setter for the strict-manifest flag. Avoids depending on
 /// the process env var (which would leak between tests running in
 /// parallel and isn't reliably mutable on all OSes).
-#[cfg(test)]
-pub(crate) fn set_strict_manifest_for_test(strict: bool) {
+///
+/// v0.2.33 (Agent F): visibility relaxed from `#[cfg(test)] pub(crate)`
+/// to `#[cfg(any(test, debug_assertions))] pub` so the manifest-CI
+/// integration tests in `tests/manifest_ci_gate.rs` (which compile as
+/// a SEPARATE crate from the unit tests) can call it. Pattern matches
+/// the existing test-helper exposure used by `secrets.rs` /
+/// `test_env.rs`. Excluded from `--release` builds — no leak into
+/// shipped binaries.
+#[cfg(any(test, debug_assertions))]
+pub fn set_strict_manifest_for_test(strict: bool) {
     STRICT_MANIFEST_FLAG.store(strict, Ordering::Release);
     STRICT_MANIFEST_INIT.store(true, Ordering::Release);
 }
@@ -617,9 +626,9 @@ pub(crate) fn set_strict_manifest_for_test(strict: bool) {
 /// `confg_control_known_mirrors_all_known_variants_compile_time` (the
 /// exhaustive match in the From impl — adding a variant to
 /// `ConfigControl` without mirroring it here fails to compile).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(tag = "kind")]
-enum ConfigControlKnown {
+pub(crate) enum ConfigControlKnown {
     #[serde(rename = "checkbox")]
     Checkbox {
         id: String,
@@ -847,6 +856,31 @@ impl<'de> Deserialize<'de> for ConfigControl {
     }
 }
 
+/// v0.2.33 (Agent F, C2): manual `JsonSchema` impl for `ConfigControl`.
+///
+/// The derived path doesn't fit here for two reasons:
+///   1. `ConfigControl` uses a custom `Deserialize` impl (lenient
+///      fallback to the `Unsupported` variant), so the derive macro
+///      can't introspect serde's tag-dispatch logic.
+///   2. The `Unsupported` variant is `#[serde(skip)]` — it has no wire
+///      shape and shouldn't appear in the published JSON Schema (it's
+///      a runtime-only forward-compat receptacle, not a thing module
+///      authors should declare).
+///
+/// Delegates to `ConfigControlKnown::json_schema(...)` — the private
+/// mirror enum that lists every KNOWN variant the parser dispatches to.
+/// Output is identical to "schema for the strict-mode parser", which is
+/// exactly what publishers need to validate against.
+impl JsonSchema for ConfigControl {
+    fn schema_name() -> String {
+        "ConfigControl".to_owned()
+    }
+
+    fn json_schema(gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        ConfigControlKnown::json_schema(gen)
+    }
+}
+
 fn default_info_dynamic_format() -> String {
     "{value}".into()
 }
@@ -859,7 +893,7 @@ fn default_info_dynamic_format() -> String {
 /// v1 ships exactly ONE kind: `module_db`. Future kinds will need
 /// their own renderer plumbing; the `kind` tag keeps the serde shape
 /// forward-compatible.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind")]
 pub enum InfoDynamicSource {
     /// Read one keyed row from the hub's module-DB REST surface via
@@ -959,6 +993,52 @@ impl<'de> Deserialize<'de> for SelectOption {
     }
 }
 
+/// v0.2.33 (Agent F, C2): manual `JsonSchema` for `SelectOption`.
+///
+/// The published schema describes the canonical OBJECT form only — bare
+/// strings deserialise as a back-compat convenience but module authors
+/// who care about schema validation should declare full objects. Keeping
+/// the schema strict here helps publishers catch typos (e.g. `"valeu"`
+/// instead of `"value"`) that lenient deserialisation would silently
+/// route into the bare-string branch.
+impl JsonSchema for SelectOption {
+    fn schema_name() -> String {
+        "SelectOption".to_owned()
+    }
+
+    fn json_schema(gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        use schemars::schema::{InstanceType, ObjectValidation, Schema, SchemaObject};
+        let mut obj = ObjectValidation::default();
+        let string_schema: Schema = SchemaObject {
+            instance_type: Some(InstanceType::String.into()),
+            ..Default::default()
+        }
+        .into();
+        let value_schema = gen.subschema_for::<serde_json::Value>();
+        obj.properties.insert("value".to_string(), string_schema.clone());
+        obj.properties.insert("label".to_string(), string_schema.clone());
+        obj.properties.insert("badge".to_string(), string_schema);
+        obj.properties.insert("meta".to_string(), value_schema);
+        obj.required.insert("value".to_string());
+        SchemaObject {
+            instance_type: Some(InstanceType::Object.into()),
+            object: Some(Box::new(obj)),
+            metadata: Some(Box::new(schemars::schema::Metadata {
+                description: Some(
+                    "Option in a select / multi_select control. Bare strings \
+                     (e.g. \"qwen3\") also deserialise as a back-compat convenience \
+                     where the value+label are equal; declare full objects for \
+                     forward-compatibility with badge / meta fields."
+                        .to_string(),
+                ),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+        .into()
+    }
+}
+
 /// Runtime-driven filter for [`ConfigControl::MultiSelect`] options.
 ///
 /// v0.2.32 ships ONE kind: `match`. The renderer evaluates the filter
@@ -978,7 +1058,7 @@ impl<'de> Deserialize<'de> for SelectOption {
 /// Future kinds (regex, range, contains) land additively as new
 /// variants on the enum — the `#[serde(tag = "kind")]` shape keeps
 /// the wire format extension-friendly.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 #[serde(tag = "kind")]
 pub enum MultiSelectFilter {
     /// Show only options whose `meta.<meta_field>` exactly equals the
@@ -1020,7 +1100,7 @@ pub enum MultiSelectFilter {
 /// Back-compat: a JSON string field deserializes as
 /// [`ActionRef::Legacy`]; a JSON object deserializes as
 /// [`ActionRef::Descriptor`]. The renderer dispatches accordingly.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub enum ActionRef {
     /// Legacy form: name of a Tauri command registered in
@@ -1045,7 +1125,7 @@ pub enum ActionRef {
 /// Future kinds (e.g. `shell` for sandboxed subprocess actions) are
 /// intentionally NOT included — they would expand the trust surface
 /// significantly and need their own design pass.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind")]
 pub enum ActionDescriptor {
     /// Issue an HTTP request to the module's container (resolved via
@@ -1138,7 +1218,7 @@ pub enum ActionDescriptor {
     },
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum HttpMethod {
     Get,
@@ -1159,7 +1239,7 @@ pub enum HttpMethod {
 ///
 /// The renderer subscribes to `progress_event` + `failed_event` to
 /// update the UI without blocking the user's click handler.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct PollingSpec {
     /// Container-relative URL for the polling GET. e.g.
     /// `/finetune_status`.
@@ -1227,7 +1307,7 @@ fn default_failed_event() -> String {
     "module://action-failed".into()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum ModuleCategory {
     Core,
@@ -1236,7 +1316,7 @@ pub enum ModuleCategory {
     Community,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
 pub struct Compatibility {
     #[serde(default = "default_hosts")]
     pub hosts: Vec<String>,
@@ -1247,7 +1327,7 @@ fn default_hosts() -> Vec<String> {
     vec!["base".into(), "mao".into()]
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
 pub struct LicenseBlock {
     #[serde(default)]
     pub required: bool,
@@ -1264,7 +1344,7 @@ fn default_min_tier() -> String {
     "free".into()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
 pub struct Requirements {
     #[serde(default)]
     pub os: Vec<String>,
@@ -1284,7 +1364,7 @@ pub struct Requirements {
     pub depends_on: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct InstallBlock {
     pub method: InstallMethod,
     #[serde(default)]
@@ -1306,7 +1386,7 @@ pub struct InstallBlock {
 /// engine POSTs the user's validated-tier JWT to `pull_token_endpoint`
 /// before invoking `podman/docker pull` — no anonymous registry access
 /// is ever attempted.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ContainerInstallBlock {
     /// Fully-qualified image reference WITHOUT a tag (e.g.
     /// "ghcr.io/hotak92/vct-rl-reranker"). The tag is determined by
@@ -1345,7 +1425,7 @@ fn default_install_dir() -> String {
     "{VCT_MODULES}/{MODULE_ID}".into()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum InstallMethod {
     /// Clone a git repo to `install_dir` (default for marketplace modules).
@@ -1381,7 +1461,7 @@ pub enum InstallMethod {
     // them will fail to deserialize with a clean serde error.
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CommandSpec {
     pub cmd: String,
     #[serde(default)]
@@ -1398,7 +1478,7 @@ fn default_timeout() -> u64 {
     120
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SecretDecl {
     pub key: String,
     #[serde(default)]
@@ -1423,7 +1503,7 @@ fn default_scope_per_project() -> String {
     "per-project".into()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SettingDecl {
     pub key: String,
     #[serde(default)]
@@ -1453,7 +1533,7 @@ fn default_setting_type() -> String {
     "string".into()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RuntimeBlock {
     pub r#type: String, // "mcp_stdio" | "mcp_http" | "service" | "cli" | "container"
     pub command: String,
@@ -1581,7 +1661,7 @@ pub struct RuntimeBlock {
 /// launcher would have no fallback if one were missing. Modules that
 /// only ship a CPU build should simply omit `gpu_image_variants` and
 /// rely on the legacy single-tag path.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct GpuImageVariants {
     /// CPU-only variant tag (e.g. `"0.1.0-cpu"`). Used for `GpuMode::Cpu`
     /// AND `GpuMode::Metal` (no Metal-specific torch wheels today).
@@ -1600,7 +1680,7 @@ pub struct GpuImageVariants {
 /// number (literal u16). `bind` defaults to `"127.0.0.1"` when None, so
 /// the supervisor never accidentally exposes per-project containers to
 /// the LAN.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct PortMapping {
     /// Host-side port (string so it can be a `{PLACEHOLDER}`).
     pub host: String,
@@ -1617,7 +1697,7 @@ pub struct PortMapping {
 /// undergo placeholder substitution against `PlaceholderCtx` +
 /// `{project_slug}`. Mode is optional; common values are `"rw"` (default
 /// when omitted), `"ro"`, or `"z"`/`"Z"` (SELinux relabel on RHEL hosts).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct VolumeMount {
     pub host: String,
     pub container: String,
@@ -1625,7 +1705,7 @@ pub struct VolumeMount {
     pub mode: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct HealthCheck {
     pub r#type: String, // "stdio_ping" | "http_get"
     #[serde(default = "default_timeout")]
@@ -1639,7 +1719,7 @@ fn default_interval() -> u64 {
     30
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct McpRegistration {
     #[serde(default = "default_true")]
     pub enabled_by_default: bool,
@@ -1656,7 +1736,7 @@ fn default_user_scope() -> String {
     "user".into()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SetupWizard {
     pub command: String,
     #[serde(default)]
@@ -1671,7 +1751,7 @@ pub struct SetupWizard {
     pub success_marker: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct UpgradeBlock {
     #[serde(default = "default_upgrade_strategy")]
     pub strategy: String,
@@ -1686,7 +1766,7 @@ fn default_upgrade_strategy() -> String {
     "git_pull".into()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct UninstallBlock {
     #[serde(default = "default_true")]
     pub remove_install_dir: bool,

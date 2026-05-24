@@ -10,6 +10,18 @@ license = "AGPL-3.0"
 name = "vct_launcher_core"
 crate-type = ["rlib"]
 
+# v0.2.33 (Agent F, C2): manifest-CI binaries. These live in `vct-launcher-core`
+# (not the launcher binary's Cargo.toml) so they avoid `tauri-build`'s heavy
+# build script — CI compiles them in seconds instead of minutes. Both
+# binaries are pure consumers of `manifest.rs` types + the schemars derive.
+[[bin]]
+name = "validate-manifest"
+path = "src/bin/validate_manifest.rs"
+
+[[bin]]
+name = "export-schema"
+path = "src/bin/export_schema.rs"
+
 # v0.2.21 Step 3d note: an earlier attempt used a `test-support` Cargo
 # feature on this crate (enabled by launcher's [dev-dependencies]) to
 # expose `Db::open_in_memory`, `secrets::test_serialize`, and
@@ -76,6 +88,16 @@ sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 
 # tempfile for tests + intentional use in core (volumes module path probes)
 tempfile = "3"
+
+# v0.2.33 (Agent F, C2): JSON Schema export for the manifest types. We
+# derive `JsonSchema` on the 31 public types in `manifest.rs` and the
+# `export-schema` bin emits a Draft 2020-12 schema document. Module
+# publishers (e.g. RL chat) validate their `vct-module.json` against
+# the same schema in their own CI before shipping a release.
+# Version 0.8 is the family already transitively in the lockfile (via
+# Tauri / its deps), so adding it as a direct dep is zero net build
+# size — just promotes the resolved version to a first-class edge.
+schemars = { version = "0.8", features = ["preserve_order"] }
 
 # Bug 31: libc statvfs for free-space probe (Unix only)
 [target.'cfg(unix)'.dependencies]

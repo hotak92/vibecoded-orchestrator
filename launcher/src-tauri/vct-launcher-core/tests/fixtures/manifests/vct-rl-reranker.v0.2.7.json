@@ -1,0 +1,324 @@
+{
+    "manifest_version": 1,
+    "id": "vct-rl-reranker",
+    "name": "RL Reranker",
+    "version": "0.2.7",
+    "description": "Reinforcement-learning reranker for Knowledge Graph retrieval. Per-text-embedding-source neural networks (qwen3 / arctic / openai) personalize on your local citation patterns. Ships pre-trained; auto-fine-tunes on your data after each weekly model refresh. Supports hot-swap, reset, finetune, and global-retrain endpoints so the launcher can drive model lifecycle without restarting the container. Code-graph reranking will ship as a separate future module (vct-code-reranker).",
+    "publisher": "VibeCoded Tools",
+    "homepage": "https://vibecodedtools.it/modules/rl-reranker",
+    "repository": "ghcr.io/hotak92/vct-rl-reranker",
+    "category": "paid-independent",
+    "tags": ["pro", "reranking", "reinforcement-learning"],
+
+    "compatibility": {
+        "hosts": ["base", "mao", "orchestrator_root"],
+        "min_launcher_version": "0.2.32"
+    },
+
+    "license": {
+        "required": true,
+        "type": "subscription",
+        "min_orchestrator_tier": "pro",
+        "trial_days": 7
+    },
+
+    "requirements": {
+        "os": ["linux", "macos", "windows"],
+        "memory_mb": 2048,
+        "disk_mb": 1500,
+        "network": ["https://ghcr.io", "https://*.supabase.co"],
+        "gpu": false
+    },
+
+    "install": {
+        "method": "container_pull",
+        "install_dir": "{VCT_MODULES}/{MODULE_ID}",
+        "container": {
+            "image": "ghcr.io/hotak92/vct-rl-reranker",
+            "tag_from_version": true,
+            "registry": "ghcr.io",
+            "pull_token_endpoint": "https://placeholder.supabase.co/functions/v1/rl-pull-token",
+            "pull_token_method": "POST",
+            "rotate_weights": true,
+            "rotate_weights_endpoint": "https://placeholder.supabase.co/functions/v1/rl-latest-weights"
+        }
+    },
+
+    "runtime": {
+        "type": "service",
+        "command": "podman",
+        "args": ["run", "--rm", "-p", "11450:11450", "ghcr.io/hotak92/vct-rl-reranker:0.2.7"],
+        "health_check": {
+            "type": "http_get",
+            "url": "http://localhost:11450/health",
+            "timeout_s": 5,
+            "interval_s": 30
+        },
+        "auto_restart": true,
+        "log_file": "{VCT_LOGS}/rl-reranker.log",
+        "min_gpu_vram_gb": 4.0,
+        "gpu_optional": true,
+        "gpu_image_variants": {
+            "cpu":  "0.2.7-cpu",
+            "cuda": "0.2.7-cuda",
+            "rocm": "0.2.7-rocm"
+        },
+        "log_path_template": "/data/logs/rl_events_{project_slug}.jsonl",
+        "update_endpoint": "https://placeholder.supabase.co/functions/v1/rl-latest-version",
+        "update_endpoint_response_shape": "https://schemas.vibecodedtools.it/module-update-response/v1.json"
+    },
+
+    "db": {
+        "migrations_dir": "db/",
+        "namespace": "rl"
+    },
+
+    "gui": {
+        "config_tab": {
+            "title": "RL Reranker",
+            "icon": "brain-circuit",
+            "description": "Per-project reinforcement-learning reranker controls. Each project carries its own forked model; global retraining is opt-in.",
+            "sections": [
+                {
+                    "title": "RL Model Status",
+                    "description": "Read-only summary of the model currently driving rerank for the active project.",
+                    "collapsible": false,
+                    "controls": [
+                        {
+                            "kind": "info_dynamic",
+                            "id": "weights_version_live",
+                            "label": "Current weights version",
+                            "source": {
+                                "kind": "module_db",
+                                "table": "rl_weights_state",
+                                "key": "{{project_id}}:{{embedding_source_from_project_kg_binding}}",
+                                "field": "local_version"
+                            },
+                            "format": "{value}",
+                            "fallback": "no model loaded yet"
+                        },
+                        {
+                            "kind": "info_dynamic",
+                            "id": "last_training_live",
+                            "label": "Last training",
+                            "source": {
+                                "kind": "module_db",
+                                "table": "rl_weights_state",
+                                "key": "{{project_id}}:{{embedding_source_from_project_kg_binding}}",
+                                "field": "last_finetuned_at"
+                            },
+                            "format_kind": "relative_timestamp_or_never",
+                            "fallback": "never"
+                        },
+                        {
+                            "kind": "info_dynamic",
+                            "id": "active_embedding_live",
+                            "label": "Active embedding model",
+                            "source": {
+                                "kind": "module_db",
+                                "table": "rl_state",
+                                "key": "{{project_id}}",
+                                "field": "active_embedding"
+                            },
+                            "fallback": "unknown"
+                        }
+                    ]
+                },
+                {
+                    "title": "Per-Project Settings",
+                    "description": "Flags that determine how this project's local model interacts with online training events.",
+                    "collapsible": true,
+                    "initially_collapsed": false,
+                    "controls": [
+                        {
+                            "kind": "checkbox",
+                            "id": "rl_use_global",
+                            "label": "Use global model (read-only)",
+                            "tooltip": "When checked, this project uses the shared global model without diverging. Online training events from this project are NOT applied locally. Uncheck to let this project re-specialize via online learning.",
+                            "default": false,
+                            "on_change": "set_rl_use_global"
+                        },
+                        {
+                            "kind": "button",
+                            "id": "rl_reset_to_global",
+                            "label": "Reset to global model",
+                            "tooltip": "Discard this project's local model and re-fork from the current global checkpoint. Subsequent online training events will then re-diverge the local model from global.",
+                            "action": {
+                                "kind": "http",
+                                "method": "POST",
+                                "path": "/reset",
+                                "body": { "strategy": "fork" }
+                            },
+                            "variant": "secondary",
+                            "confirm": "This will discard this project's local model and re-fork from the global. Continue?"
+                        },
+                        {
+                            "kind": "button",
+                            "id": "rl_reset_and_specialize",
+                            "label": "Reset + offline-specialize",
+                            "tooltip": "Reset to global, then run an offline training pass on this project's last 30 days of events to re-specialize. Useful when online training has drifted the model in an unwanted direction.",
+                            "action": {
+                                "kind": "http",
+                                "method": "POST",
+                                "path": "/reset",
+                                "body": { "strategy": "fork_and_specialize", "days": 30 },
+                                "polling": {
+                                    "endpoint": "/finetune_status",
+                                    "job_id_path": "$.job_id",
+                                    "job_id_query_param": "job_id",
+                                    "interval_seconds": 5,
+                                    "max_attempts": 240,
+                                    "terminal_state_field": "$.state",
+                                    "terminal_success_values": ["done"],
+                                    "terminal_failure_values": ["failed", "error"],
+                                    "progress_event": "rl-reranker://reset-and-specialize-progress",
+                                    "failed_event":   "rl-reranker://reset-and-specialize-failed"
+                                }
+                            },
+                            "variant": "secondary",
+                            "confirm": "Resets to global, then runs an offline training pass on this project's last 30 days of events to re-specialize. ~30s. Continue?"
+                        },
+                        {
+                            "kind": "checkbox",
+                            "id": "rl_online_training_disabled",
+                            "label": "Disable online training for this project",
+                            "tooltip": "When checked, this project's local model is frozen. New rl_update events still get LOGGED (so you can do offline passes later) but don't update the live model.",
+                            "default": false,
+                            "on_change": "set_rl_online_training_disabled"
+                        },
+                        {
+                            "kind": "checkbox",
+                            "id": "rl_global_training_source_flag",
+                            "label": "Use this project's data to train the global model",
+                            "tooltip": "Independent of the toggles above. When checked, this project's retrieval+citation events feed the global-model retraining runs. The 'Retrain global' button in the next section selects from projects with this flag enabled.",
+                            "default": false,
+                            "on_change": "set_rl_global_training_source_flag"
+                        }
+                    ]
+                },
+                {
+                    "title": "Global Model",
+                    "description": "Cross-project training of the shared global checkpoint. Only projects on the SAME embedding model as this project can mix; cross-source projects are auto-filtered to prevent silent garbage-output bugs.",
+                    "collapsible": true,
+                    "initially_collapsed": true,
+                    "controls": [
+                        {
+                            "kind": "multi_select",
+                            "id": "rl_global_training_source_projects",
+                            "label": "Source projects for global retraining",
+                            "tooltip": "Pick which projects contribute their event logs to the next training run. Only projects with 'Use as global training source' enabled AND on the same embedding model as the global appear here (different embedders produce vectors in different latent spaces — mixing them would silently produce garbage).",
+                            "options_source": "list_rl_global_training_source_projects",
+                            "filter": {
+                                "kind": "match",
+                                "meta_field": "embedding_source",
+                                "equals_runtime": "container.active_embedding"
+                            }
+                        },
+                        {
+                            "kind": "date_picker",
+                            "id": "rl_training_earliest_date",
+                            "label": "Earliest date (older events excluded)",
+                            "tooltip": "Events logged before this date are excluded from the training pass. Leave empty to use ALL available history.",
+                            "default": "90_days_ago",
+                            "allow_clear": true
+                        },
+                        {
+                            "kind": "button",
+                            "id": "download_default_weights",
+                            "label": "Download default weights",
+                            "tooltip": "Pull the latest shipped reference checkpoint for this project's embedding model. Only available for embedding models we ship trained weights for (today: arctic). Skips projects on other sources.",
+                            "action": {
+                                "kind": "tauri_command",
+                                "command": "module_download_default_weights",
+                                "args": {
+                                    "module_id": "vct-rl-reranker",
+                                    "project_id": "{{project_id}}",
+                                    "embedding_source": "{{embedding_source_from_project_kg_binding}}"
+                                }
+                            },
+                            "variant": "primary",
+                            "confirm": "This replaces your project's local model with the latest shipped default weights. Local fine-tuning history is preserved (sidecar dynamic types survive). Continue?"
+                        },
+                        {
+                            "kind": "button",
+                            "id": "download_default_and_specialize",
+                            "label": "Download default + offline pass on top",
+                            "tooltip": "First download the latest shipped default weights, then run an offline training pass using selected projects' events (from the chosen earliest date) on top of those weights. Combines a fresh-baseline reset with project-specialization.",
+                            "action": {
+                                "kind": "chained_action",
+                                "stop_on_failure": true,
+                                "steps": [
+                                    {
+                                        "kind": "tauri_command",
+                                        "command": "module_download_default_weights",
+                                        "args": {
+                                            "module_id": "vct-rl-reranker",
+                                            "project_id": "{{project_id}}",
+                                            "embedding_source": "{{embedding_source_from_project_kg_binding}}"
+                                        }
+                                    },
+                                    {
+                                        "kind": "http",
+                                        "method": "POST",
+                                        "path": "/global/retrain",
+                                        "body": {
+                                            "mode": "offline",
+                                            "project_ids": "{{control:rl_global_training_source_projects}}",
+                                            "events_paths": "{{events_paths_for:rl_global_training_source_projects}}",
+                                            "earliest_date": "{{control:rl_training_earliest_date}}"
+                                        },
+                                        "polling": {
+                                            "endpoint": "/finetune_status",
+                                            "job_id_path": "$.job_id",
+                                            "job_id_query_param": "job_id",
+                                            "interval_seconds": 10,
+                                            "max_attempts": 360,
+                                            "terminal_state_field": "$.state",
+                                            "terminal_success_values": ["done"],
+                                            "terminal_failure_values": ["failed", "error"],
+                                            "progress_event": "rl-reranker://download-and-specialize-progress",
+                                            "failed_event":   "rl-reranker://download-and-specialize-failed"
+                                        }
+                                    }
+                                ]
+                            },
+                            "variant": "primary",
+                            "confirm": "Downloads latest shipped weights, then runs an offline training pass on top using selected projects' events from the chosen earliest date. ~30s + ~10s per 1k events. Continue?"
+                        },
+                        {
+                            "kind": "button",
+                            "id": "offline_pass_on_current",
+                            "label": "Offline training pass on current model",
+                            "tooltip": "Run an offline training pass against the CURRENTLY-loaded global model (no download). Uses selected projects' events from the chosen earliest date. Trust current weights but specialize further.",
+                            "action": {
+                                "kind": "http",
+                                "method": "POST",
+                                "path": "/global/retrain",
+                                "body": {
+                                    "mode": "offline",
+                                    "project_ids": "{{control:rl_global_training_source_projects}}",
+                                    "events_paths": "{{events_paths_for:rl_global_training_source_projects}}",
+                                    "earliest_date": "{{control:rl_training_earliest_date}}"
+                                },
+                                "polling": {
+                                    "endpoint": "/finetune_status",
+                                    "job_id_path": "$.job_id",
+                                    "job_id_query_param": "job_id",
+                                    "interval_seconds": 30,
+                                    "max_attempts": 240,
+                                    "terminal_state_field": "$.state",
+                                    "terminal_success_values": ["done"],
+                                    "terminal_failure_values": ["failed", "error"],
+                                    "progress_event": "rl-reranker://offline-pass-progress",
+                                    "failed_event":   "rl-reranker://offline-pass-failed"
+                                }
+                            },
+                            "variant": "secondary",
+                            "confirm": "Runs an offline training pass on the current global model using selected projects' events from the chosen earliest date. ~5min per 10k events. Continue?"
+                        }
+                    ]
+                }
+            ]
+        }
+    }
+}

@@ -1,0 +1,160 @@
+# v0.2.33 (Agent F, C2): paid-module manifest CI gate.
+#
+# Three independent checks:
+#   1. validate-manifest:  every committed paid-module fixture round-trips
+#                          through ModuleManifest::from_json in strict mode.
+#                          Catches the v0.2.32-class regression where the
+#                          RL chat's v0.2.7 manifest declared `tauri_command`
+#                          but the launcher's ActionDescriptor enum didn't
+#                          recognise it — the manifest parsed silently as
+#                          a failure, the catalog fell back to a stale v0.1.1
+#                          placeholder, and the bug only surfaced via the
+#                          user noticing the wrong version on a tile.
+#   2. schema-drift:       the committed JSON Schema at
+#                          docs/schemas/vct-module.schema.json must match
+#                          what `export-schema` emits fresh from manifest.rs.
+#                          Forces PR authors to refresh the schema artifact
+#                          when they touch the Rust types.
+#   3. integration tests:  cargo test -p vct-launcher-core --test
+#                          manifest_ci_gate exercises the bin invariants
+#                          (RL fixture validates, garbage input rejects,
+#                          schema includes/excludes the right variants).
+#
+# Strict mode is mandatory in this job's env. The lenient `Unsupported`
+# fallback (Agent D, v0.2.33) is forward-compat for production launchers
+# running against future paid-module versions that ship new control kinds
+# — but in CI we WANT to catch unknown kinds at PR time, not at install
+# time on a paying customer's machine.
+#
+# Paths-ignore mirrors the main CI workflow (.github/workflows/ci.yml).
+# Docs-only changes don't need this gate.
+
+name: Manifest Validate (paid modules)
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'knowledge/**'
+      - '.claude/context/**'
+      - 'README.md'
+      - 'CHANGELOG.md'
+      - 'LICENSE'
+      - 'LICENSE.*'
+      - 'CODE_OF_CONDUCT.md'
+      - 'CONTRIBUTING.md'
+      - 'SECURITY.md'
+      - 'CLA.md'
+      - 'BOOTSTRAP.md'
+      - 'KNOWN_ISSUES.md'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE.md'
+      - '.github/FUNDING.yml'
+      - '.github/CODEOWNERS'
+  pull_request:
+    paths-ignore:
+      - 'knowledge/**'
+      - '.claude/context/**'
+      - 'README.md'
+      - 'CHANGELOG.md'
+      - 'LICENSE'
+      - 'LICENSE.*'
+      - 'CODE_OF_CONDUCT.md'
+      - 'CONTRIBUTING.md'
+      - 'SECURITY.md'
+      - 'CLA.md'
+      - 'BOOTSTRAP.md'
+      - 'KNOWN_ISSUES.md'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE.md'
+      - '.github/FUNDING.yml'
+      - '.github/CODEOWNERS'
+
+permissions:
+  contents: read
+
+# Cancel previous runs on the same branch when a new commit lands.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Strict mode is set at the workflow env level so every step honours it.
+# Lenient mode (default in production) would let unknown control kinds
+# slip past as the Unsupported variant — we explicitly DON'T want that
+# in CI; PR authors should fix the launcher first when shipping a new
+# kind, not paper over it.
+env:
+  VCT_LAUNCHER_STRICT_MANIFEST: "1"
+
+jobs:
+  validate-manifests:
+    name: Validate paid-module manifests (strict mode)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: launcher/src-tauri
+
+      # No tauri-build deps required: the bins live in `vct-launcher-core`
+      # (the shared-types crate) and don't link against WebKit. Saves
+      # ~3-5 min of apt-get install vs the main CI workflow.
+
+      - name: Build manifest-CI bins
+        working-directory: launcher/src-tauri
+        run: |
+          cargo build -p vct-launcher-core \
+            --bin validate-manifest --bin export-schema
+
+      # Step 1: schema-drift check. If `manifest.rs` was touched without
+      # refreshing `docs/schemas/vct-module.schema.json`, fail loudly with
+      # the exact regenerate command in the error message.
+      - name: Schema-drift check (committed schema vs live)
+        working-directory: launcher/src-tauri
+        run: |
+          ./target/debug/export-schema --check ../../docs/schemas/vct-module.schema.json
+
+      # Step 2: validate the committed test-fixture manifest. This is the
+      # snapshot of vct-rl-reranker v0.2.7 baked into the launcher's own
+      # test fixtures at `tests/fixtures/manifests/`. It ALWAYS exists
+      # (committed to the repo), so this step never soft-passes.
+      - name: Validate committed test-fixture manifests (strict mode)
+        working-directory: launcher/src-tauri
+        run: |
+          # Glob via shell so the bin sees absolute paths. Rust's stdlib
+          # doesn't do glob expansion; the shell does.
+          fixtures=(vct-launcher-core/tests/fixtures/manifests/*.json)
+          if [ ${#fixtures[@]} -eq 0 ] || [ ! -e "${fixtures[0]}" ]; then
+            echo "::error::no test-fixture manifests under launcher/src-tauri/vct-launcher-core/tests/fixtures/manifests/"
+            echo "         expected at least vct-rl-reranker.v0.2.7.json"
+            exit 1
+          fi
+          ./target/debug/validate-manifest "${fixtures[@]}"
+
+      # Step 3: validate any dev-only `paid-modules/` fixtures if they
+      # happen to be committed. The public repo doesn't ship this
+      # directory (paid modules are co-located in dev workspaces only),
+      # so `--allow-empty` lets the job soft-pass when no glob matches.
+      # If the user ever commits `paid-modules/*/vct-module.json` to the
+      # public repo, this step starts validating those too — no workflow
+      # change needed.
+      - name: Validate dev-co-located paid-modules/ (allow-empty)
+        working-directory: .
+        run: |
+          shopt -s nullglob
+          fixtures=(paid-modules/*/vct-module.json)
+          if [ ${#fixtures[@]} -eq 0 ]; then
+            echo "[skip] paid-modules/ not present in this repo (dev-only path)"
+            exit 0
+          fi
+          launcher/src-tauri/target/debug/validate-manifest "${fixtures[@]}"
+
+      # Step 4: integration tests for the bin invariants. Same suite that
+      # runs locally via `cargo test -p vct-launcher-core --test
+      # manifest_ci_gate`. We run them under strict mode (inherited from
+      # workflow env above).
+      - name: Integration tests (manifest CI gate)
+        working-directory: launcher/src-tauri
+        run: |
+          cargo test -p vct-launcher-core --test manifest_ci_gate -- --nocapture
