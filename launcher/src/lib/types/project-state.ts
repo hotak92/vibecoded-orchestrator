@@ -277,3 +277,81 @@ export interface TelemetryEventView {
   uploaded_at: number | null;
   payload_summary: string;
 }
+
+// ─── Diagrams (Phase 1 of the diagrams-integration plan, 2026-05-24) ─────
+//
+// Mirrors the Rust types in the (forthcoming) Phase 1.1 sibling commit:
+//   launcher/src-tauri/src/commands/diagrams_cmd.rs
+//   launcher/src-tauri/vct-launcher-core/src/db/project_diagrams.rs
+//
+// These types are written to spec; until Phase 1.1 lands the `invoke<...>`
+// calls fail at runtime with a clear "not implemented" error which the UI
+// shows as a toast. The merge integrator wires the live commands in.
+
+export type DiagramType = 'mermaid' | 'excalidraw';
+export type SnapshotTrigger =
+  | 'manual'
+  | 'auto_pre_edit_save'
+  | 'auto_interval';
+
+export interface DiagramRow {
+  id: number;
+  project_id: string;
+  diagram_name: string;
+  diagram_type: DiagramType;
+  file_path: string; // relative to project root
+  category_path: string; // e.g. "gui/auth"
+  enabled: boolean;
+  // Derived metadata (recomputed on save by diagram_indexer.py — Phase 1.5.A)
+  inferred_title: string | null;
+  diagram_kind: string | null; // flowchart / classDiagram / sequenceDiagram / excalidraw
+  node_count: number | null;
+  edge_count: number | null;
+  // Runtime context — nullable when not authored via Claude
+  chat_id: string | null;
+  linked_session_summary: string | null;
+  // Snapshot rollup for the row badge
+  snapshot_count: number;
+  // Standard timestamps
+  created_at: number;
+  updated_at: number;
+}
+
+export interface DiagramSnapshotRow {
+  id: number;
+  diagram_id: number;
+  content_hash: string;
+  trigger: SnapshotTrigger;
+  label: string | null;
+  created_at: number;
+  // `content` (gzipped BLOB) is NOT included in list responses to keep
+  // them small — fetched separately via `restore_diagram_snapshot` or
+  // a future `get_diagram_snapshot_content` command.
+}
+
+export interface DiagramChangedPayload {
+  project_id: string;
+  diagram_id: number;
+  file_path: string;
+  // Discriminator the backend will set so the UI can route the refresh:
+  // - "edit" → re-fetch list + re-render preview if matching
+  // - "create" / "delete" → re-fetch list
+  // - "snapshot" → re-fetch snapshots only
+  kind: 'edit' | 'create' | 'delete' | 'snapshot';
+}
+
+// ─── Per-MCP tool grants (PermissionsTab "MCP Tools" sub-section) ────────
+//
+// Backed by `project_mcp_tool_grants(project_id, mcp_name, tool_name, enabled)`
+// in the launcher SQLite DB (Phase 1.1).
+
+export interface McpToolGrant {
+  project_id: string;
+  mcp_name: string;
+  tool_name: string;
+  enabled: boolean;
+  // Best-effort description sourced from upstream MCP's tools/list; null
+  // when the upstream MCP doesn't expose one.
+  description: string | null;
+}
+
