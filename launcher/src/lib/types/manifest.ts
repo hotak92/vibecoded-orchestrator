@@ -69,6 +69,13 @@ export interface HttpActionDescriptor {
  * logs + propagates the error to the renderer. Previous steps' side
  * effects are NOT rolled back. `rollback_on_step_failure` is reserved
  * for v0.2.33+ (no effect today).
+ *
+ * v0.2.33 (Agent D, 2026-05-25): the canonical field name is
+ * `rollback_on_step_failure`. The Rust schema also accepts
+ * `stop_on_failure` as a deserialise alias for back-compat with the
+ * v0.2.7 RL manifest, which shipped that spelling. New manifests
+ * should use the canonical name; the alias logs a deprecation
+ * notice when used.
  */
 export interface ChainedActionDescriptor {
   kind: 'chained_action';
@@ -78,10 +85,41 @@ export interface ChainedActionDescriptor {
   polling?: PollingSpec | null;
   /** Reserved for v0.2.33+. Parses but has no effect in v0.2.32. */
   rollback_on_step_failure?: boolean;
+  /** v0.2.33: deserialise-only alias for `rollback_on_step_failure`.
+   *  Present on the TS type so manifests that ship the alias
+   *  type-check correctly in the renderer's snapshot. The Rust
+   *  schema collapses both to `rollback_on_step_failure` at parse
+   *  time. */
+  stop_on_failure?: boolean;
+}
+
+/**
+ * v0.2.33 (Agent D, 2026-05-25): tauri_command step kind. Invokes a
+ * launcher-registered Tauri command by name from inside a
+ * chained_action step. The Rust dispatcher consults a strict
+ * whitelist before invoking — any name starting with `module_` is
+ * allowed, plus an explicit allowlist of legacy non-`module_*`
+ * commands (see `MANIFEST_DISPATCHABLE_COMMANDS` in
+ * `module_dispatch.rs`).
+ *
+ * Used by the v0.2.7 RL manifest's "Download default weights" /
+ * "Download default + offline pass on top" buttons.
+ */
+export interface TauriCommandActionDescriptor {
+  kind: 'tauri_command';
+  /** Tauri command name. Must match the whitelist. */
+  command: string;
+  /** Args forwarded to the underlying Rust function. Passes through
+   *  the dispatcher's placeholder substitution pipeline
+   *  (`{{previous_step.<field>}}`, `{{control:<id>}}`, etc.). */
+  args?: unknown;
 }
 
 /** Declarative action that the generic `module_dispatch_action` Tauri command executes. */
-export type ActionDescriptor = HttpActionDescriptor | ChainedActionDescriptor;
+export type ActionDescriptor =
+  | HttpActionDescriptor
+  | ChainedActionDescriptor
+  | TauriCommandActionDescriptor;
 
 /**
  * Either a legacy Tauri command name (string) OR a structured action
@@ -314,6 +352,27 @@ export interface DatePickerControl {
   on_change?: ActionRef | null;
 }
 
+/**
+ * v0.2.33 (Agent D, 2026-05-25): forward-compat fallback for control
+ * kinds this launcher version doesn't recognise. The Rust schema
+ * deserialises unknown `kind` values as this variant in LENIENT mode
+ * (the default). The renderer shows a placeholder card pointing the
+ * user at "this requires a newer launcher version".
+ *
+ * `kind_string` carries the original unknown `kind` string from the
+ * wire payload — useful for the placeholder's "Update to see <X>"
+ * affordance. `raw` is the full unmodified JSON object so future
+ * launcher versions could (e.g.) extract `id` / `label` for richer
+ * placeholders without forcing a manifest version bump.
+ */
+export interface UnsupportedControl {
+  kind: 'Unsupported';
+  /** The original `kind` value the manifest declared (e.g. `"file_drop_zone"`). */
+  kind_string: string;
+  /** The raw JSON object that failed to deserialise. */
+  raw: Record<string, unknown>;
+}
+
 export type ConfigControl =
   | CheckboxControl
   | MultiSelectControl
@@ -327,7 +386,9 @@ export type ConfigControl =
   | LinkControl
   // v0.2.32 additions:
   | InfoDynamicControl
-  | DatePickerControl;
+  | DatePickerControl
+  // v0.2.33 addition (forward-compat fallback):
+  | UnsupportedControl;
 
 // ─── ConfigSection + ConfigTab ──────────────────────────────────────────
 
@@ -351,14 +412,15 @@ export interface ConfigTab {
 
 /**
  * True when `action` is a structured ActionDescriptor (the v0.2.26
- * path or the v0.2.32 chained_action path). The renderer dispatches
- * both via the single `module_dispatch_action` Tauri command — all
- * chaining logic lives in Rust.
+ * http path, the v0.2.32 chained_action path, or the v0.2.33
+ * tauri_command path). The renderer dispatches all of them via the
+ * single `module_dispatch_action` Tauri command — chaining +
+ * tauri-command invocation logic lives in Rust.
  */
 export function isActionDescriptor(action: ActionRef): action is ActionDescriptor {
   if (typeof action !== 'object' || action === null) return false;
   const kind = (action as { kind?: string }).kind;
-  return kind === 'http' || kind === 'chained_action';
+  return kind === 'http' || kind === 'chained_action' || kind === 'tauri_command';
 }
 
 /** True when `action` is a legacy Tauri command name string. */
@@ -375,4 +437,31 @@ export function isChainedAction(
     action !== null &&
     (action as { kind?: string }).kind === 'chained_action'
   );
+}
+
+/**
+ * v0.2.33 (Agent D): True when `action` is the new tauri_command
+ * variant — the launcher's dispatcher invokes a named Tauri command
+ * with a strict whitelist gate.
+ */
+export function isTauriCommandAction(
+  action: ActionRef,
+): action is TauriCommandActionDescriptor {
+  return (
+    typeof action === 'object' &&
+    action !== null &&
+    (action as { kind?: string }).kind === 'tauri_command'
+  );
+}
+
+/**
+ * v0.2.33 (Agent D): True when `control` is the forward-compat
+ * Unsupported placeholder (Rust schema's lenient-parse fallback for
+ * unknown control kinds). The renderer maps this to a placeholder
+ * card pointing the user at "update your launcher".
+ */
+export function isUnsupportedControl(
+  control: ConfigControl,
+): control is UnsupportedControl {
+  return control.kind === 'Unsupported';
 }

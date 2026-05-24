@@ -158,8 +158,43 @@ pub async fn module_db_read_row(
     fields: Option<Vec<String>>,
     db: State<'_, Db>,
 ) -> Result<Option<Value>, String> {
+    // Tauri-command shim — see `module_db_read_row_with_fields_inner`.
+    module_db_read_row_with_fields_inner(module_id, project_id, table, key, fields, db.inner())
+        .await
+}
+
+/// v0.2.33 (Agent D): non-Tauri-command form callable from
+/// chained_action's `tauri_command` step dispatcher. Returns
+/// `serde_json::Value` (not `Option<Value>`) so the dispatcher can
+/// thread the response into the next step's body — `None` is
+/// represented as `Value::Null` over the dispatch wire.
+pub async fn module_db_read_row_inner(
+    module_id: String,
+    project_id: String,
+    table: String,
+    key: String,
+    db: &Db,
+) -> Result<Value, String> {
+    match module_db_read_row_with_fields_inner(module_id, project_id, table, key, None, db).await? {
+        Some(value) => Ok(value),
+        None => Ok(Value::Null),
+    }
+}
+
+/// Shared implementation backing both `module_db_read_row` (the Tauri
+/// command, returns `Option<Value>` to distinguish 404 from server
+/// error at the frontend) and `module_db_read_row_inner` (the
+/// dispatcher-callable form, collapses 404 to `Value::Null`).
+async fn module_db_read_row_with_fields_inner(
+    module_id: String,
+    project_id: String,
+    table: String,
+    key: String,
+    fields: Option<Vec<String>>,
+    db: &Db,
+) -> Result<Option<Value>, String> {
     let port = hub_port()?;
-    let token = get_or_issue_token(db.inner(), &module_id, &project_id)?;
+    let token = get_or_issue_token(db, &module_id, &project_id)?;
 
     let mut url = format!(
         "http://127.0.0.1:{}/api/v1/modules/{}/db/projects/{}/rows/{}/{}",

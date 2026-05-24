@@ -44,6 +44,8 @@
 //! leaks from typos.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -79,6 +81,235 @@ struct AppHandleSink(AppHandle);
 impl EventSink for AppHandleSink {
     fn emit(&self, event: &str, payload: &Value) {
         let _ = self.0.emit(event, payload);
+    }
+}
+
+// ─── v0.2.33 (Agent D, 2026-05-25): tauri_command step dispatch ─────────
+//
+// The new `ActionDescriptor::TauriCommand` step kind invokes a
+// launcher-registered Tauri command by name from inside the dispatcher
+// loop. The v0.2.7 RL manifest's "Download default weights" button uses
+// this shape (with `module_download_default_weights` as the named
+// command).
+//
+// Trust surface: a malformed (or malicious) manifest could try to name
+// an unintended command — so the dispatcher consults a strict
+// whitelist BEFORE invoking. Any command not matching the whitelist is
+// rejected at dispatch time with a clear error pointing at the
+// offending name.
+//
+// In-process invocation: Tauri doesn't expose a clean public API for
+// invoking commands by name from Rust code (its `invoke_handler!` is
+// designed for IPC from the frontend). We route through a
+// [`TauriCommandInvoker`] trait whose production implementation calls
+// the Rust functions directly via a `match` on the whitelisted names —
+// each whitelisted command gets one explicit branch that parses the
+// args + calls the underlying Rust function. Tests inject a recording
+// stub that captures `(command, args)` and returns canned responses.
+
+/// Future signature returned by [`TauriCommandInvoker::invoke`]. Boxed
+/// so the trait remains object-safe (no `async fn in trait` until we
+/// add `async_trait`, which is not in the Cargo tree today).
+type CommandFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>>;
+
+/// Abstraction over "invoke a launcher-registered Tauri command by
+/// name from inside the dispatcher". Production implements this via
+/// [`AppHandleCommandInvoker`] which dispatches to the real Rust
+/// command functions; tests can inject a recording stub.
+///
+/// SECURITY: the trait impl itself MUST consult
+/// [`is_whitelisted_manifest_command`] before dispatching. Centralised
+/// here so tests can't accidentally circumvent the whitelist by
+/// providing a "permissive" stub — the whitelist check lives in the
+/// dispatcher's `execute_one_step` branch, *before* the trait method
+/// is called.
+pub trait TauriCommandInvoker: Send + Sync + 'static {
+    /// Invoke `command` with `args`. The implementation is responsible
+    /// for argument parsing + return-value serialization; the caller
+    /// has already validated `command` against the whitelist.
+    fn invoke<'a>(&'a self, command: &'a str, args: Value) -> CommandFuture<'a>;
+}
+
+/// Explicit allowlist of legacy non-`module_*` Tauri commands that
+/// historically appeared in v0.2.20-v0.2.32 manifests' `action`
+/// fields as legacy `ActionRef::Legacy(string)` values. Adding a new
+/// entry here authorises a manifest's `tauri_command` step to invoke
+/// it via the v0.2.33 dispatcher.
+///
+/// Inclusion criteria: the command must already be registered in
+/// `invoke_handler!` AND must accept JSON args structurally
+/// compatible with the manifest's declared `args` shape. Adding a
+/// command that does destructive operations (`uninstall_module_v2`,
+/// `delete_project_v2`, …) requires a tighter security review — the
+/// whitelist is intentionally permissive for read-side commands and
+/// strict for writes.
+///
+/// The orchestrator-core legacy commands (`redetect_orchestrator_root`,
+/// `validate_clone_manifest`, `kg_rebuild_current_project`, etc.) are
+/// SAFE to add but not currently invoked from any chained_action
+/// step — the orchestrator's vct-module.json uses them via the legacy
+/// `ActionRef::Legacy(string)` path which goes through frontend
+/// `invoke()`. They land here so future chained_action authors can
+/// reference them by name without each release re-grepping the source.
+pub(crate) const MANIFEST_DISPATCHABLE_COMMANDS: &[&str] = &[
+    // Orchestrator-core legacy commands (referenced from vct-module.json
+    // root manifest's gui.config_tab buttons — see the comment above
+    // on why these are pre-authorised).
+    "redetect_orchestrator_root",
+    "validate_clone_manifest",
+    "kg_rebuild_current_project",
+    "kg_check_duplicates",
+    "code_graph_reanalyze_current",
+    "code_graph_prune_stale",
+];
+
+/// Returns true when `name` is a whitelisted Tauri command the
+/// dispatcher will invoke when it appears as a `tauri_command` step
+/// in a manifest's chained_action. The policy:
+///   * Any name starting with `module_` is allowed (paid modules
+///     register their commands under this prefix by convention).
+///   * Any name in [`MANIFEST_DISPATCHABLE_COMMANDS`] is allowed.
+///   * Everything else is rejected.
+///
+/// Empty / whitespace-only names are rejected unconditionally.
+pub(crate) fn is_whitelisted_manifest_command(name: &str) -> bool {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    trimmed.starts_with("module_") || MANIFEST_DISPATCHABLE_COMMANDS.contains(&trimmed)
+}
+
+/// Production [`TauriCommandInvoker`] implementation. Holds the
+/// `AppHandle` so it can look up Tauri-managed `State<Db>` at
+/// invocation time (Tauri's `Db` is held in `app.manage(...)`; the
+/// dispatcher receives `&Db` borrowed from the same state, but for
+/// async dispatch we need an owned-style reference, which Tauri
+/// provides via `app.state::<Db>()`).
+///
+/// Dispatch is a `match` on the whitelisted command name — one branch
+/// per recognised command. Each branch parses `args` into the
+/// command's argument struct (snake_case fields), calls the
+/// underlying Rust function, and serializes the response to `Value`.
+///
+/// IMPORTANT: every branch here MUST be paired with an entry in
+/// `is_whitelisted_manifest_command` OR `MANIFEST_DISPATCHABLE_COMMANDS`.
+/// The compile-time exhaustiveness of the match doesn't help us here
+/// (the match arm is `&str`, not an enum), so the discipline is
+/// "if you add a branch, add to the whitelist; if you add to the
+/// whitelist without a branch, dispatch returns a clear 'unsupported
+/// in this launcher version' error".
+pub(crate) struct AppHandleCommandInvoker {
+    app: AppHandle,
+}
+
+impl AppHandleCommandInvoker {
+    pub(crate) fn new(app: AppHandle) -> Self {
+        Self { app }
+    }
+}
+
+impl TauriCommandInvoker for AppHandleCommandInvoker {
+    fn invoke<'a>(&'a self, command: &'a str, args: Value) -> CommandFuture<'a> {
+        let app = self.app.clone();
+        let command = command.to_string();
+        Box::pin(async move {
+            // Resolve the launcher.db via Tauri's managed state. The
+            // borrowed `&Db` is held across the .await points below,
+            // which is fine because Tauri's State<Db> resolves to a
+            // shared reference valid for the duration of the
+            // command's async lifetime.
+            use tauri::Manager;
+            let db_state: tauri::State<'_, Db> = app.state();
+            let db: &Db = db_state.inner();
+            match command.as_str() {
+                // v0.2.32 #D: download default RL weights (the v0.2.7
+                // RL manifest's primary `tauri_command` step usage).
+                "module_download_default_weights" => {
+                    #[derive(serde::Deserialize)]
+                    struct Args {
+                        module_id: String,
+                        project_id: String,
+                        embedding_source: String,
+                    }
+                    let parsed: Args = serde_json::from_value(args).map_err(|e| {
+                        format!("tauri_command 'module_download_default_weights' args parse: {}", e)
+                    })?;
+                    // Call the underlying Rust function directly. The
+                    // Tauri `#[command]` macro wraps these in IPC
+                    // shims, but the underlying fn is callable as
+                    // ordinary async Rust given `&Db` + `&AppHandle`;
+                    // no IPC round-trip.
+                    let result = crate::commands::module_default_weights::
+                        module_download_default_weights_inner(
+                            parsed.module_id,
+                            parsed.project_id,
+                            parsed.embedding_source,
+                            db,
+                            &app,
+                        )
+                        .await?;
+                    serde_json::to_value(result).map_err(|e| {
+                        format!("tauri_command 'module_download_default_weights' result serialize: {}", e)
+                    })
+                }
+                // v0.2.32 #D: runtime-value resolver (rarely used as a
+                // chained_action step in practice, but whitelisted so
+                // manifest authors can call it consistently).
+                "module_get_runtime_value" => {
+                    #[derive(serde::Deserialize)]
+                    struct Args {
+                        project_id: String,
+                        key: String,
+                    }
+                    let parsed: Args = serde_json::from_value(args).map_err(|e| {
+                        format!("tauri_command 'module_get_runtime_value' args parse: {}", e)
+                    })?;
+                    let value = crate::commands::module_default_weights::
+                        module_get_runtime_value_inner(parsed.project_id, parsed.key, db)
+                            .await?;
+                    Ok(Value::String(value))
+                }
+                // v0.2.31 Agent J: module_db read (used by status
+                // surfaces; included in the whitelist for parity with
+                // the hub's REST surface).
+                "module_db_read_row" => {
+                    #[derive(serde::Deserialize)]
+                    struct Args {
+                        module_id: String,
+                        project_id: String,
+                        table: String,
+                        key: String,
+                    }
+                    let parsed: Args = serde_json::from_value(args).map_err(|e| {
+                        format!("tauri_command 'module_db_read_row' args parse: {}", e)
+                    })?;
+                    crate::commands::module_db_client::module_db_read_row_inner(
+                        parsed.module_id,
+                        parsed.project_id,
+                        parsed.table,
+                        parsed.key,
+                        db,
+                    )
+                    .await
+                }
+                // Any other whitelisted name (e.g. orchestrator-core
+                // legacy commands, future `module_*` commands the
+                // launcher hasn't grown an in-process branch for):
+                // surface a clear error rather than silently failing.
+                // The whitelist authorises the NAME; the dispatch
+                // table backs the ACTUAL invocation. Mismatch ⇒
+                // "supported in launcher version X but not from a
+                // tauri_command step today".
+                other => Err(format!(
+                    "tauri_command '{}' is whitelisted but has no in-process dispatch branch \
+                     in this launcher version — call from the renderer via the legacy \
+                     ActionRef::Legacy(string) path instead, or update the launcher",
+                    other,
+                )),
+            }
+        })
     }
 }
 
@@ -470,7 +701,14 @@ pub async fn dispatch_action_inner(
     db: &Db,
     http_client: &reqwest::Client,
 ) -> Result<Value, String> {
-    let sink: Arc<dyn EventSink> = Arc::new(AppHandleSink(app));
+    let sink: Arc<dyn EventSink> = Arc::new(AppHandleSink(app.clone()));
+    // v0.2.33 (Agent D): wire the Tauri-command invoker. The invoker
+    // resolves the launcher.db via `app.state::<Db>()` at dispatch
+    // time (Tauri's managed-state API), so it doesn't need its own
+    // `Db` reference — keeping the same single source of truth as
+    // the rest of the launcher.
+    let invoker: Arc<dyn TauriCommandInvoker> =
+        Arc::new(AppHandleCommandInvoker::new(app));
     dispatch_action_with_sink(
         module_id,
         project_id,
@@ -479,6 +717,7 @@ pub async fn dispatch_action_inner(
         sibling_values,
         log_path_template,
         sink,
+        Some(invoker),
         db,
         http_client,
     )
@@ -497,6 +736,11 @@ pub(crate) async fn dispatch_action_with_sink(
     sibling_values: Option<HashMap<String, Value>>,
     log_path_template: Option<String>,
     sink: Arc<dyn EventSink>,
+    // v0.2.33 (Agent D): optional Tauri-command invoker. `None` is
+    // valid (tests that don't exercise the `tauri_command` step pass
+    // None); when None, encountering a `TauriCommand` step returns a
+    // clear "no invoker wired" error rather than dispatching.
+    invoker: Option<Arc<dyn TauriCommandInvoker>>,
     db: &Db,
     http_client: &reqwest::Client,
 ) -> Result<Value, String> {
@@ -642,6 +886,7 @@ pub(crate) async fn dispatch_action_with_sink(
                 &default_ctx,
                 port,
                 sink,
+                invoker,
                 http_client,
             )
             .await
@@ -669,6 +914,7 @@ pub(crate) async fn dispatch_action_with_sink(
                     &default_ctx,
                     port,
                     sink.clone(),
+                    invoker.as_ref(),
                     http_client,
                 )
                 .await?;
@@ -716,6 +962,7 @@ async fn execute_chained_action(
     parent_ctx: &SubstitutionContext<'_>,
     port: u16,
     sink: Arc<dyn EventSink>,
+    invoker: Option<Arc<dyn TauriCommandInvoker>>,
     http_client: &reqwest::Client,
 ) -> Result<Value, String> {
     if steps.is_empty() {
@@ -809,6 +1056,7 @@ async fn execute_chained_action(
                 &step_ctx,
                 port,
                 sink.clone(),
+                invoker.as_ref(),
                 http_client,
             )
             .await
@@ -893,11 +1141,28 @@ fn attach_chain_polling_to_final_step(
             "module_dispatch: chain-level polling cannot attach to a nested chained_action final step"
                 .into(),
         ),
+        // v0.2.33 (Agent D): tauri_command step kind. Polling is an
+        // HTTP-only concept (poll an endpoint until terminal state) —
+        // it has no analogue for synchronous Tauri-command invocation.
+        // Reject rather than silently drop the polling block; manifest
+        // authors should use chained_action with a final `http` step
+        // when they need polling.
+        ActionDescriptor::TauriCommand { .. } => Err(
+            "module_dispatch: chain-level polling cannot attach to a tauri_command final step \
+             (polling is an HTTP-only mechanism — use a final http step for the polling job kick)"
+                .into(),
+        ),
     }
 }
 
 /// Execute one descriptor (no chain following). Returns
 /// `(response_body, next_action)` so the caller can iterate.
+///
+/// v0.2.33 (Agent D): the optional `invoker` parameter enables the
+/// `TauriCommand` step kind. When the step is `TauriCommand` and
+/// `invoker` is `None`, the function errors with a clear "no Tauri
+/// invoker available" message. Tests that don't exercise the new
+/// step kind pass `None`.
 async fn execute_one_step(
     module_id: &str,
     project_id: &str,
@@ -905,6 +1170,7 @@ async fn execute_one_step(
     ctx: &SubstitutionContext<'_>,
     port: u16,
     sink: Arc<dyn EventSink>,
+    invoker: Option<&Arc<dyn TauriCommandInvoker>>,
     http_client: &reqwest::Client,
 ) -> Result<(Value, Option<Box<ActionDescriptor>>), String> {
     match action {
@@ -998,6 +1264,45 @@ async fn execute_one_step(
              (the dispatch loop should have intercepted it; this is a bug)"
                 .into(),
         ),
+        // v0.2.33 (Agent D): tauri_command step kind. Invokes a
+        // launcher-registered Tauri command by name from inside the
+        // dispatcher loop. Strict whitelist enforcement happens HERE
+        // (before the invoker is called) so a permissive invoker
+        // stub can't accidentally bypass the security gate.
+        ActionDescriptor::TauriCommand { command, args } => {
+            if !is_whitelisted_manifest_command(command) {
+                return Err(format!(
+                    "module_dispatch: manifest-dispatched Tauri command '{}' is not whitelisted \
+                     (allowed: any name starting with 'module_' OR one of {:?}). \
+                     Reject prevents manifest-driven RCE.",
+                    command, MANIFEST_DISPATCHABLE_COMMANDS,
+                ));
+            }
+            // Apply the dispatcher's standard placeholder substitution
+            // to `args` before invocation — same pipeline as Http.body
+            // so `{{previous_step.<field>}}` / `{{control:<id>}}` /
+            // `{{project_id}}` / etc. resolve consistently.
+            let substituted_args = substitute(args, ctx)?;
+
+            let invoker = invoker.ok_or_else(|| {
+                "module_dispatch: tauri_command step requires an AppHandle-backed invoker \
+                 (no invoker wired — likely a test forgot to pass `Some(invoker)` to \
+                 dispatch_action_with_sink, or a future caller bypassed dispatch_action_inner)"
+                    .to_string()
+            })?;
+
+            let response = invoker
+                .invoke(command, substituted_args)
+                .await
+                .map_err(|e| format!(
+                    "tauri_command '{}' execution failed: {}",
+                    command, e,
+                ))?;
+            // tauri_command steps don't carry a `next_action` chain —
+            // the v0.2.32 chained_action shape replaces that mechanism
+            // for multi-step flows.
+            Ok((response, None))
+        }
     }
 }
 
@@ -1742,6 +2047,7 @@ mod tests {
             None,
             None,
             sink,
+            None,
             &db,
             &client,
         )
@@ -1803,6 +2109,7 @@ mod tests {
             Some(siblings),
             None,
             sink,
+            None,
             &db,
             &client,
         )
@@ -1860,7 +2167,7 @@ mod tests {
         // No sibling_values from the renderer → dispatcher MUST fall
         // back to the module_settings read.
         let resp = dispatch_action_with_sink(
-            module_id, project_id, action, None, None, None, sink, &db, &client,
+            module_id, project_id, action, None, None, None, sink, None, &db, &client,
         )
         .await
         .expect("dispatch ok");
@@ -1934,6 +2241,7 @@ mod tests {
             None,
             None,
             sink_arc,
+            None,
             &db,
             &client,
         )
@@ -2016,7 +2324,7 @@ mod tests {
             next_action: None,
         };
 
-        dispatch_action_with_sink(module_id, project_id, action, None, None, None, sink_arc, &db, &client)
+        dispatch_action_with_sink(module_id, project_id, action, None, None, None, sink_arc, None, &db, &client)
             .await
             .expect("dispatch ok");
 
@@ -2097,7 +2405,7 @@ mod tests {
             next_action: None,
         };
 
-        dispatch_action_with_sink(module_id, project_id, action, None, None, None, sink_arc, &db, &client)
+        dispatch_action_with_sink(module_id, project_id, action, None, None, None, sink_arc, None, &db, &client)
             .await
             .expect("dispatch ok");
 
@@ -2175,7 +2483,7 @@ mod tests {
             next_action: None,
         };
 
-        dispatch_action_with_sink(module_id, project_id, action, None, None, None, sink_arc, &db, &client)
+        dispatch_action_with_sink(module_id, project_id, action, None, None, None, sink_arc, None, &db, &client)
             .await
             .expect("dispatch ok");
 
@@ -2263,6 +2571,7 @@ mod tests {
             None,
             None,
             sink,
+            None,
             &db,
             &client,
         )
@@ -2313,7 +2622,7 @@ mod tests {
         }
         let head = *current.expect("chain non-empty");
 
-        let err = dispatch_action_with_sink(module_id, project_id, head, None, None, None, sink, &db, &client)
+        let err = dispatch_action_with_sink(module_id, project_id, head, None, None, None, sink, None, &db, &client)
             .await
             .expect_err("expected chain-depth error");
         assert!(
@@ -2347,7 +2656,7 @@ mod tests {
             polling: None,
             next_action: None,
         };
-        let err = dispatch_action_with_sink("ghost-module", "proj-X", action, None, None, None, sink, &db, &client)
+        let err = dispatch_action_with_sink("ghost-module", "proj-X", action, None, None, None, sink, None, &db, &client)
             .await
             .expect_err("missing port must error");
         assert!(
@@ -2432,7 +2741,7 @@ mod tests {
         };
 
         let resp = dispatch_action_with_sink(
-            module_id, project_id, action, None, None, None, sink, &db, &client,
+            module_id, project_id, action, None, None, None, sink, None, &db, &client,
         )
         .await
         .expect("chained_action dispatch ok");
@@ -2531,7 +2840,7 @@ mod tests {
         };
 
         let resp = dispatch_action_with_sink(
-            module_id, project_id, action, None, None, None, sink_arc, &db, &client,
+            module_id, project_id, action, None, None, None, sink_arc, None, &db, &client,
         )
         .await
         .expect("dispatch ok");
@@ -2628,7 +2937,7 @@ mod tests {
         };
 
         let err = dispatch_action_with_sink(
-            module_id, project_id, action, None, None, None, sink, &db, &client,
+            module_id, project_id, action, None, None, None, sink, None, &db, &client,
         )
         .await
         .expect_err("step 2 must fail and propagate");
@@ -2672,7 +2981,7 @@ mod tests {
         };
 
         let err = dispatch_action_with_sink(
-            module_id, project_id, action, None, None, None, sink, &db, &client,
+            module_id, project_id, action, None, None, None, sink, None, &db, &client,
         )
         .await
         .expect_err("empty steps must error");
@@ -2705,7 +3014,7 @@ mod tests {
             next_action: None,
         };
         let err = dispatch_action_with_sink(
-            module_id, project_id, action, None, None, None, sink, &db, &client,
+            module_id, project_id, action, None, None, None, sink, None, &db, &client,
         )
         .await
         .expect_err("previous_step outside chain must error");
@@ -2742,5 +3051,296 @@ mod tests {
     #[test]
     fn helper_socket_addr_import_is_live() {
         let _ = SocketAddr::from(([127, 0, 0, 1], 0));
+    }
+
+    // ─── v0.2.33 Agent D (2026-05-25): tauri_command step dispatch ────────
+    //
+    // The tests below pin the security gate (whitelist) + the
+    // happy-path dispatch via a stub TauriCommandInvoker that records
+    // calls instead of invoking real Tauri commands. The whitelist
+    // check happens in `execute_one_step` BEFORE the invoker is
+    // consulted — so a permissive recording stub can't bypass the
+    // gate.
+
+    /// Recording stub. Captures (command, args) pairs and returns a
+    /// canned response. Test-only — production goes through
+    /// `AppHandleCommandInvoker`.
+    #[derive(Clone, Default)]
+    struct RecordingInvoker {
+        calls: Arc<StdMutex<Vec<(String, Value)>>>,
+        response: Arc<StdMutex<Value>>,
+    }
+
+    impl RecordingInvoker {
+        fn new(response: Value) -> Self {
+            Self {
+                calls: Arc::new(StdMutex::new(Vec::new())),
+                response: Arc::new(StdMutex::new(response)),
+            }
+        }
+        fn calls_snapshot(&self) -> Vec<(String, Value)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl TauriCommandInvoker for RecordingInvoker {
+        fn invoke<'a>(&'a self, command: &'a str, args: Value) -> CommandFuture<'a> {
+            let calls = self.calls.clone();
+            let response = self.response.clone();
+            let cmd = command.to_string();
+            Box::pin(async move {
+                calls.lock().unwrap().push((cmd, args));
+                Ok(response.lock().unwrap().clone())
+            })
+        }
+    }
+
+    /// Whitelist policy: any `module_*` name accepted, otherwise must
+    /// match `MANIFEST_DISPATCHABLE_COMMANDS` exactly.
+    #[test]
+    fn is_whitelisted_manifest_command_policy() {
+        // Allowed: module_ prefix.
+        assert!(is_whitelisted_manifest_command("module_download_default_weights"));
+        assert!(is_whitelisted_manifest_command("module_db_read_row"));
+        assert!(is_whitelisted_manifest_command("module_anything_at_all"));
+        // Allowed: explicit allowlist members.
+        assert!(is_whitelisted_manifest_command("kg_rebuild_current_project"));
+        assert!(is_whitelisted_manifest_command("redetect_orchestrator_root"));
+        // Rejected: non-`module_` and not on the allowlist.
+        assert!(!is_whitelisted_manifest_command("rm_rf_everything"));
+        assert!(!is_whitelisted_manifest_command("install_module_for_project")); // not in allowlist
+        assert!(!is_whitelisted_manifest_command("delete_project_v2"));
+        // Rejected: empty / whitespace-only.
+        assert!(!is_whitelisted_manifest_command(""));
+        assert!(!is_whitelisted_manifest_command("   "));
+        // Edge: leading/trailing whitespace is trimmed — name still
+        // resolves to a whitelisted form.
+        assert!(is_whitelisted_manifest_command("  module_x  "));
+    }
+
+    /// Happy path: a tauri_command step with a whitelisted name
+    /// dispatches through the recording invoker, the response is
+    /// returned to the caller, and placeholder substitution applied
+    /// to args.
+    #[tokio::test]
+    async fn tauri_command_step_dispatches_whitelisted_command() {
+        let project_id = "proj-A";
+        let module_id = "mod-X";
+
+        // Set up a minimal axum server so port resolution succeeds —
+        // tauri_command steps don't use the port, but the dispatcher
+        // resolves it upfront for ALL action kinds (a defensive
+        // pre-flight check).
+        let router = Router::new();
+        let port = start_server(router).await;
+        let db = db_with_module(project_id, module_id, port);
+        let client = build_http_client();
+        let sink: Arc<dyn EventSink> = Arc::new(RecordingSink::new());
+
+        let invoker = RecordingInvoker::new(json!({
+            "local_path": "/data/weights/v0.2.7/arctic_1024.pt",
+            "version": "0.2.7",
+        }));
+        let invoker_arc: Arc<dyn TauriCommandInvoker> = Arc::new(invoker.clone());
+
+        let action = ActionDescriptor::TauriCommand {
+            command: "module_download_default_weights".into(),
+            args: json!({
+                "module_id": "vct-rl-reranker",
+                "project_id": "{{project_id}}",
+                "embedding_source": "qwen3"
+            }),
+        };
+
+        let resp = dispatch_action_with_sink(
+            module_id, project_id, action, None, None, None, sink,
+            Some(invoker_arc), &db, &client,
+        )
+        .await
+        .expect("tauri_command dispatch ok");
+
+        // Response flows through unchanged.
+        assert_eq!(resp["local_path"], json!("/data/weights/v0.2.7/arctic_1024.pt"));
+        assert_eq!(resp["version"], json!("0.2.7"));
+
+        // Invoker saw exactly one call with the substituted args.
+        let calls = invoker.calls_snapshot();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "module_download_default_weights");
+        // `{{project_id}}` substituted to the real project id; literal
+        // fields passed through.
+        assert_eq!(calls[0].1["project_id"], json!("proj-A"));
+        assert_eq!(calls[0].1["module_id"], json!("vct-rl-reranker"));
+        assert_eq!(calls[0].1["embedding_source"], json!("qwen3"));
+    }
+
+    /// Whitelist enforcement: a non-`module_*` command not in the
+    /// explicit allowlist is rejected with a clear error BEFORE the
+    /// invoker is called. Even a permissive recording stub doesn't
+    /// see the call.
+    #[tokio::test]
+    async fn tauri_command_step_disallowed_command_rejected() {
+        let project_id = "proj-A";
+        let module_id = "mod-X";
+
+        let router = Router::new();
+        let port = start_server(router).await;
+        let db = db_with_module(project_id, module_id, port);
+        let client = build_http_client();
+        let sink: Arc<dyn EventSink> = Arc::new(RecordingSink::new());
+
+        // Permissive stub: would return Ok if called. The whitelist
+        // gate must prevent us from getting here.
+        let invoker = RecordingInvoker::new(json!({"ok": true}));
+        let invoker_arc: Arc<dyn TauriCommandInvoker> = Arc::new(invoker.clone());
+
+        let action = ActionDescriptor::TauriCommand {
+            command: "rm_rf_everything".into(),
+            args: json!({}),
+        };
+
+        let err = dispatch_action_with_sink(
+            module_id, project_id, action, None, None, None, sink,
+            Some(invoker_arc), &db, &client,
+        )
+        .await
+        .expect_err("non-whitelisted command must reject");
+
+        assert!(
+            err.contains("rm_rf_everything") && err.contains("not whitelisted"),
+            "error must name the rejected command and explain why, got: {}",
+            err,
+        );
+        // CRITICAL: the invoker MUST NOT see the call — the whitelist
+        // is the security gate, not the invoker stub.
+        assert_eq!(
+            invoker.calls_snapshot().len(),
+            0,
+            "non-whitelisted command must NOT reach the invoker (security regression)",
+        );
+    }
+
+    /// Chained_action that mixes a `tauri_command` step with an `http`
+    /// step. Proves the new step kind composes with the existing
+    /// chained-action loop end-to-end — this is the v0.2.7 RL
+    /// "Download default + offline pass on top" button shape.
+    #[tokio::test]
+    async fn chained_action_with_tauri_command_step_full_dispatch() {
+        let project_id = "proj-A";
+        let module_id = "mod-X";
+
+        // /finetune returns the job id — the http step captures it.
+        let captured_body: Arc<StdMutex<Option<Value>>> = Arc::new(StdMutex::new(None));
+        let body_cap = captured_body.clone();
+        let router = Router::new().route(
+            "/finetune",
+            routing::post(move |Json(body): Json<Value>| {
+                let cap = body_cap.clone();
+                async move {
+                    *cap.lock().unwrap() = Some(body);
+                    Json(json!({"job_id": "ft-step2"}))
+                }
+            }),
+        );
+        let port = start_server(router).await;
+        let db = db_with_module(project_id, module_id, port);
+        let client = build_http_client();
+        let sink: Arc<dyn EventSink> = Arc::new(RecordingSink::new());
+
+        // Step 1 (tauri_command) returns the local_path that step 2
+        // threads via `{{previous_step.local_path}}`.
+        let invoker = RecordingInvoker::new(json!({
+            "local_path": "/data/weights/v0.2.7/arctic_1024.pt",
+            "version": "0.2.7",
+        }));
+        let invoker_arc: Arc<dyn TauriCommandInvoker> = Arc::new(invoker.clone());
+
+        let action = ActionDescriptor::ChainedAction {
+            steps: vec![
+                ActionDescriptor::TauriCommand {
+                    command: "module_download_default_weights".into(),
+                    args: json!({
+                        "module_id": "vct-rl-reranker",
+                        "project_id": "{{project_id}}",
+                        "embedding_source": "qwen3"
+                    }),
+                },
+                ActionDescriptor::Http {
+                    method: HttpMethod::Post,
+                    path: "/finetune".into(),
+                    body: Some(json!({
+                        "starting_checkpoint": "{{previous_step.local_path}}",
+                        "mode": "offline"
+                    })),
+                    polling: None,
+                    next_action: None,
+                },
+            ],
+            polling: None,
+            // The v0.2.7 RL manifest uses the `stop_on_failure` alias,
+            // but here we pass the canonical `rollback_on_step_failure`
+            // — the schema layer aliases between them and the executor
+            // doesn't observe a difference.
+            rollback_on_step_failure: true,
+        };
+
+        let resp = dispatch_action_with_sink(
+            module_id, project_id, action, None, None, None, sink,
+            Some(invoker_arc), &db, &client,
+        )
+        .await
+        .expect("chained dispatch with tauri_command step ok");
+
+        // Result is the FINAL step's response (the http /finetune kick).
+        assert_eq!(resp["job_id"], json!("ft-step2"));
+
+        // Step 1 invoked the tauri_command exactly once.
+        let calls = invoker.calls_snapshot();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "module_download_default_weights");
+
+        // Step 2 saw the substituted `{{previous_step.local_path}}` —
+        // PROVES the new step kind threads its response into the next
+        // step correctly via the standard chain-context mechanism.
+        let step2_body = captured_body.lock().unwrap().clone().expect("step 2 body captured");
+        assert_eq!(
+            step2_body["starting_checkpoint"],
+            json!("/data/weights/v0.2.7/arctic_1024.pt"),
+        );
+        assert_eq!(step2_body["mode"], json!("offline"));
+    }
+
+    /// No invoker wired + tauri_command step ⇒ clear error. The
+    /// invoker is `Option<Arc<...>>` precisely so tests that don't
+    /// exercise tauri_command can pass None; if a test DOES exercise
+    /// it but forgets the invoker, the error message points at the
+    /// fix.
+    #[tokio::test]
+    async fn tauri_command_step_without_invoker_errors_clearly() {
+        let project_id = "proj-A";
+        let module_id = "mod-X";
+
+        let router = Router::new();
+        let port = start_server(router).await;
+        let db = db_with_module(project_id, module_id, port);
+        let client = build_http_client();
+        let sink: Arc<dyn EventSink> = Arc::new(RecordingSink::new());
+
+        let action = ActionDescriptor::TauriCommand {
+            command: "module_download_default_weights".into(),
+            args: json!({}),
+        };
+
+        let err = dispatch_action_with_sink(
+            module_id, project_id, action, None, None, None, sink,
+            None /* no invoker wired */, &db, &client,
+        )
+        .await
+        .expect_err("tauri_command step requires invoker");
+        assert!(
+            err.contains("invoker") || err.contains("AppHandle"),
+            "error should point at the missing invoker, got: {}",
+            err,
+        );
     }
 }

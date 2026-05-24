@@ -483,7 +483,34 @@ pub async fn module_download_default_weights(
     project_id: String,
     embedding_source: String,
     db: State<'_, Db>,
-    _app: AppHandle,
+    app: AppHandle,
+) -> Result<DownloadDefaultWeightsResult, String> {
+    // Thin Tauri-command shim: unwraps `State<Db>` into `&Db` and
+    // delegates to `module_download_default_weights_inner`. The inner
+    // form is also called from v0.2.33 Agent D's `tauri_command` step
+    // dispatcher in `module_dispatch.rs`, which doesn't have access to
+    // a `State<Db>` (it holds an `Arc<Db>` instead).
+    module_download_default_weights_inner(
+        module_id,
+        project_id,
+        embedding_source,
+        db.inner(),
+        &app,
+    )
+    .await
+}
+
+/// v0.2.33 (Agent D): non-Tauri-command form of
+/// `module_download_default_weights`. Identical semantics; the
+/// difference is the dependency shape — `&Db` + `&AppHandle` instead
+/// of `State<Db>` + `AppHandle` — so the chained_action dispatcher
+/// can call it without going through Tauri's IPC layer.
+pub async fn module_download_default_weights_inner(
+    module_id: String,
+    project_id: String,
+    embedding_source: String,
+    db: &Db,
+    _app: &AppHandle,
 ) -> Result<DownloadDefaultWeightsResult, String> {
     if module_id.trim().is_empty() {
         return Err("module_id required".to_string());
@@ -514,7 +541,7 @@ pub async fn module_download_default_weights(
 
     // 3. Best-effort hub upsert. Logged but not propagated.
     if let Err(e) = upsert_global_weight_row(
-        db.inner(),
+        db,
         &module_id,
         &project_id,
         &embedding_source,
@@ -552,6 +579,18 @@ pub async fn module_get_runtime_value(
     project_id: String,
     key: String,
     db: State<'_, Db>,
+) -> Result<String, String> {
+    // Tauri-command shim — see `module_get_runtime_value_inner`.
+    module_get_runtime_value_inner(project_id, key, db.inner()).await
+}
+
+/// v0.2.33 (Agent D): non-Tauri-command form of
+/// `module_get_runtime_value` — see the inner-form rationale on
+/// `module_download_default_weights_inner` above.
+pub async fn module_get_runtime_value_inner(
+    project_id: String,
+    key: String,
+    db: &Db,
 ) -> Result<String, String> {
     match key.as_str() {
         "container.active_embedding" => {

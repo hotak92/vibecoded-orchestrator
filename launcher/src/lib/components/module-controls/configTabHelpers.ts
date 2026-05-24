@@ -81,6 +81,14 @@ function collectControlActionRefs(control: ConfigControl): ActionRef[] {
       if (control.on_change) refs.push(control.on_change);
       break;
     // `info` + `link` have no action surface.
+    // v0.2.33 (Agent D): the `Unsupported` forward-compat fallback
+    // has no recognisable action surface either — the renderer
+    // can't know which fields of the raw payload are actions, so
+    // we skip it entirely. Worst case: a future control kind that
+    // referenced `{{project_id}}` won't trigger the auto-picker
+    // on a launcher version that hasn't grown the variant yet.
+    // Acceptable — the user will see the Unsupported placeholder
+    // and update.
   }
   return refs;
 }
@@ -109,6 +117,21 @@ export function actionRefUsesProjectId(ref: ActionRef): boolean {
   if (isChainedAction(ref)) {
     for (const step of ref.steps) {
       if (actionRefUsesProjectId(step as ActionRef)) return true;
+    }
+    return false;
+  }
+  // v0.2.33 (Agent D): tauri_command descriptor — inspect the args
+  // (analogue of Http's body) for `{{project_id}}`. The command name
+  // itself never carries placeholders.
+  if (ref.kind === 'tauri_command') {
+    if (ref.args !== undefined && ref.args !== null) {
+      try {
+        const serialised = JSON.stringify(ref.args);
+        if (serialised.includes(PROJECT_ID_TOKEN)) return true;
+      } catch {
+        // Same defensive policy as Http.body — non-serialisable
+        // payloads count as non-matching.
+      }
     }
     return false;
   }
@@ -221,6 +244,15 @@ export function substituteEmbeddingSource(
       ),
     };
     return out;
+  }
+  // v0.2.33 (Agent D): tauri_command descriptor. The command name is
+  // never substituted (it's the whitelist key); only the `args`
+  // payload walks the value-substitution helper, same as Http.body.
+  if (descriptor.kind === 'tauri_command') {
+    return {
+      ...descriptor,
+      args: substituteEmbeddingSourceInValue(descriptor.args, embeddingSource),
+    };
   }
   // descriptor is HttpActionDescriptor here.
   const out: HttpActionDescriptor = {

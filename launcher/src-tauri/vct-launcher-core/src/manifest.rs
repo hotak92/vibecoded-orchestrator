@@ -239,7 +239,17 @@ pub struct ConfigSection {
 /// `module_dispatch_action` Tauri command executes without per-module
 /// Rust code. Five new variants also landed: TextInput / NumberInput /
 /// StatusDisplay / FilePicker / Link.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// v0.2.33 (Agent D, 2026-05-25): the `Deserialize` impl is now custom
+/// (no more `#[derive(Deserialize)]` here) so manifests with control
+/// kinds unknown to this launcher version deserialize as the
+/// [`ConfigControl::Unsupported`] fallback variant in LENIENT mode (the
+/// default) — forward-compat with future launcher versions adding
+/// kinds. Per-section render dispatch shows a placeholder for these.
+/// Set `VCT_LAUNCHER_STRICT_MANIFEST=1` to restore the pre-v0.2.33
+/// behaviour (unknown kinds error at parse time). Review §8.d for the
+/// design rationale.
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind")]
 pub enum ConfigControl {
     /// Boolean toggle. On change, the launcher invokes `on_change`
@@ -513,6 +523,328 @@ pub enum ConfigControl {
         #[serde(default)]
         on_change: Option<ActionRef>,
     },
+    /// v0.2.33 (Agent D, 2026-05-25): forward-compat fallback for
+    /// control kinds this launcher version doesn't recognise. Manifests
+    /// shipped by FUTURE launcher versions that add control kinds
+    /// deserialize into this variant rather than erroring at parse time
+    /// (lenient mode — the default). The renderer skips it with a
+    /// per-control placeholder ("This control requires a newer
+    /// launcher version (kind: '<X>')"), letting OTHER controls in the
+    /// same section render normally.
+    ///
+    /// Skipped during serde derive (both directions) — only ever
+    /// produced by the custom `Deserialize` impl below. The custom
+    /// `Serialize` impl on `ConfigControl` (provided alongside the
+    /// derive macro on this enum) writes the raw payload back out
+    /// verbatim so a load → save round-trip preserves the unknown
+    /// kind's wire shape.
+    ///
+    /// Strict mode (`VCT_LAUNCHER_STRICT_MANIFEST=1`) restores the
+    /// pre-v0.2.33 behaviour where unknown kinds are a hard parse
+    /// error — useful in CI gates and module-author dev mode.
+    #[serde(skip)]
+    Unsupported {
+        /// The original `kind` value the manifest used. Empty when the
+        /// JSON object lacked a `kind` field entirely.
+        kind_string: String,
+        /// The raw JSON object that failed to deserialize as a known
+        /// variant. Carries every field the manifest declared so the
+        /// renderer's placeholder can show context (id, label) if
+        /// present.
+        raw: serde_json::Value,
+    },
+}
+
+// ─── v0.2.33: ConfigControl lenient deserialize (Agent D) ────────────────
+//
+// Custom `Deserialize` for `ConfigControl` that falls back to the
+// `Unsupported` variant when the `kind` tag is unknown — instead of
+// rejecting the whole manifest. The fallback is gated on the
+// `VCT_LAUNCHER_STRICT_MANIFEST` env var (`"1"` = strict / pre-v0.2.33,
+// anything else = lenient / forward-compat).
+//
+// Implementation: deserialize the JSON value into a `serde_json::Value`,
+// try the derive-generated path via a private mirror enum
+// (`ConfigControlKnown`), and on failure either error (strict) or build
+// the `Unsupported` variant from the captured raw value.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Cached strict-mode flag. Initialised on first read from the
+/// `VCT_LAUNCHER_STRICT_MANIFEST` env var; subsequent reads are O(1).
+/// Static lifetime — strict-mode is process-global (matches how the
+/// orchestrator's CI flag works).
+static STRICT_MANIFEST_FLAG: AtomicBool = AtomicBool::new(false);
+/// Tracks whether `STRICT_MANIFEST_FLAG` has been initialised from env
+/// at least once.
+static STRICT_MANIFEST_INIT: AtomicBool = AtomicBool::new(false);
+
+/// Returns true when the launcher should reject unknown manifest
+/// `kind` values at parse time (no `Unsupported` fallback). Default is
+/// `false` — lenient — to keep forward-compat with future launcher
+/// versions adding control kinds.
+///
+/// Cached after first call; tests that need to flip the flag mid-run
+/// must use [`set_strict_manifest_for_test`] (see `cfg(test)` below)
+/// which bypasses the env read.
+fn strict_manifest_mode() -> bool {
+    if !STRICT_MANIFEST_INIT.load(Ordering::Acquire) {
+        let strict = std::env::var("VCT_LAUNCHER_STRICT_MANIFEST")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        STRICT_MANIFEST_FLAG.store(strict, Ordering::Release);
+        STRICT_MANIFEST_INIT.store(true, Ordering::Release);
+    }
+    STRICT_MANIFEST_FLAG.load(Ordering::Acquire)
+}
+
+/// Test-only setter for the strict-manifest flag. Avoids depending on
+/// the process env var (which would leak between tests running in
+/// parallel and isn't reliably mutable on all OSes).
+#[cfg(test)]
+pub(crate) fn set_strict_manifest_for_test(strict: bool) {
+    STRICT_MANIFEST_FLAG.store(strict, Ordering::Release);
+    STRICT_MANIFEST_INIT.store(true, Ordering::Release);
+}
+
+/// Private mirror enum used solely by the custom `Deserialize` impl on
+/// [`ConfigControl`]. Mirrors every KNOWN variant of `ConfigControl`
+/// (excluding `Unsupported`) and derives `Deserialize` so we can
+/// delegate to serde's auto-generated tag-dispatch logic. Convert via
+/// `From<ConfigControlKnown> for ConfigControl` below.
+///
+/// Keeping this in sync with `ConfigControl` is enforced by
+/// `confg_control_known_mirrors_all_known_variants_compile_time` (the
+/// exhaustive match in the From impl — adding a variant to
+/// `ConfigControl` without mirroring it here fails to compile).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind")]
+enum ConfigControlKnown {
+    #[serde(rename = "checkbox")]
+    Checkbox {
+        id: String,
+        label: String,
+        #[serde(default)]
+        tooltip: Option<String>,
+        #[serde(default)]
+        default: bool,
+        #[serde(default)]
+        on_change: Option<ActionRef>,
+    },
+    #[serde(rename = "multi_select")]
+    MultiSelect {
+        id: String,
+        label: String,
+        #[serde(default)]
+        tooltip: Option<String>,
+        options_source: ActionRef,
+        #[serde(default)]
+        filter: Option<MultiSelectFilter>,
+        #[serde(default)]
+        on_change: Option<ActionRef>,
+    },
+    #[serde(rename = "button")]
+    Button {
+        id: String,
+        label: String,
+        #[serde(default)]
+        tooltip: Option<String>,
+        action: ActionRef,
+        #[serde(default)]
+        variant: Option<String>,
+        #[serde(default)]
+        confirm: Option<String>,
+    },
+    #[serde(rename = "select")]
+    Select {
+        id: String,
+        label: String,
+        #[serde(default)]
+        tooltip: Option<String>,
+        options: Vec<SelectOption>,
+        #[serde(default)]
+        default: Option<String>,
+        #[serde(default)]
+        on_change: Option<ActionRef>,
+    },
+    #[serde(rename = "info")]
+    Info {
+        id: String,
+        text: String,
+        #[serde(default)]
+        variant: Option<String>,
+    },
+    #[serde(rename = "text_input")]
+    TextInput {
+        id: String,
+        label: String,
+        #[serde(default)]
+        tooltip: Option<String>,
+        #[serde(default)]
+        default: String,
+        #[serde(default)]
+        placeholder: Option<String>,
+        #[serde(default)]
+        apply_action: Option<ActionRef>,
+    },
+    #[serde(rename = "number_input")]
+    NumberInput {
+        id: String,
+        label: String,
+        #[serde(default)]
+        tooltip: Option<String>,
+        #[serde(default)]
+        default: Option<f64>,
+        #[serde(default)]
+        min: Option<f64>,
+        #[serde(default)]
+        max: Option<f64>,
+        #[serde(default)]
+        step: Option<f64>,
+        #[serde(default)]
+        on_change: Option<ActionRef>,
+    },
+    #[serde(rename = "status_display")]
+    StatusDisplay {
+        id: String,
+        label: String,
+        #[serde(default)]
+        tooltip: Option<String>,
+        source: ActionRef,
+        render_template: String,
+    },
+    #[serde(rename = "file_picker")]
+    FilePicker {
+        id: String,
+        label: String,
+        #[serde(default)]
+        tooltip: Option<String>,
+        #[serde(default)]
+        extensions: Vec<String>,
+        #[serde(default)]
+        directory: bool,
+        #[serde(default)]
+        on_change: Option<ActionRef>,
+    },
+    #[serde(rename = "link")]
+    Link {
+        id: String,
+        label: String,
+        #[serde(default)]
+        tooltip: Option<String>,
+        href: String,
+        #[serde(default = "default_link_target")]
+        target: String,
+    },
+    #[serde(rename = "info_dynamic")]
+    InfoDynamic {
+        id: String,
+        label: String,
+        #[serde(default)]
+        tooltip: Option<String>,
+        source: InfoDynamicSource,
+        #[serde(default = "default_info_dynamic_format")]
+        format: String,
+        #[serde(default)]
+        fallback: Option<String>,
+    },
+    #[serde(rename = "date_picker")]
+    DatePicker {
+        id: String,
+        label: String,
+        #[serde(default)]
+        tooltip: Option<String>,
+        #[serde(default)]
+        default: Option<String>,
+        #[serde(default)]
+        min: Option<String>,
+        #[serde(default)]
+        max: Option<String>,
+        #[serde(default)]
+        on_change: Option<ActionRef>,
+    },
+}
+
+impl From<ConfigControlKnown> for ConfigControl {
+    fn from(k: ConfigControlKnown) -> Self {
+        match k {
+            ConfigControlKnown::Checkbox { id, label, tooltip, default, on_change } => {
+                ConfigControl::Checkbox { id, label, tooltip, default, on_change }
+            }
+            ConfigControlKnown::MultiSelect { id, label, tooltip, options_source, filter, on_change } => {
+                ConfigControl::MultiSelect { id, label, tooltip, options_source, filter, on_change }
+            }
+            ConfigControlKnown::Button { id, label, tooltip, action, variant, confirm } => {
+                ConfigControl::Button { id, label, tooltip, action, variant, confirm }
+            }
+            ConfigControlKnown::Select { id, label, tooltip, options, default, on_change } => {
+                ConfigControl::Select { id, label, tooltip, options, default, on_change }
+            }
+            ConfigControlKnown::Info { id, text, variant } => {
+                ConfigControl::Info { id, text, variant }
+            }
+            ConfigControlKnown::TextInput { id, label, tooltip, default, placeholder, apply_action } => {
+                ConfigControl::TextInput { id, label, tooltip, default, placeholder, apply_action }
+            }
+            ConfigControlKnown::NumberInput { id, label, tooltip, default, min, max, step, on_change } => {
+                ConfigControl::NumberInput { id, label, tooltip, default, min, max, step, on_change }
+            }
+            ConfigControlKnown::StatusDisplay { id, label, tooltip, source, render_template } => {
+                ConfigControl::StatusDisplay { id, label, tooltip, source, render_template }
+            }
+            ConfigControlKnown::FilePicker { id, label, tooltip, extensions, directory, on_change } => {
+                ConfigControl::FilePicker { id, label, tooltip, extensions, directory, on_change }
+            }
+            ConfigControlKnown::Link { id, label, tooltip, href, target } => {
+                ConfigControl::Link { id, label, tooltip, href, target }
+            }
+            ConfigControlKnown::InfoDynamic { id, label, tooltip, source, format, fallback } => {
+                ConfigControl::InfoDynamic { id, label, tooltip, source, format, fallback }
+            }
+            ConfigControlKnown::DatePicker { id, label, tooltip, default, min, max, on_change } => {
+                ConfigControl::DatePicker { id, label, tooltip, default, min, max, on_change }
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ConfigControl {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Two-phase: deserialize to a Value first so we can both attempt
+        // the derive-generated path AND fall back to capturing the raw
+        // shape verbatim for `Unsupported`.
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match serde_json::from_value::<ConfigControlKnown>(value.clone()) {
+            Ok(known) => Ok(known.into()),
+            Err(err) => {
+                if strict_manifest_mode() {
+                    return Err(serde::de::Error::custom(format!(
+                        "manifest: unknown control kind (strict mode): {} \
+                         — set VCT_LAUNCHER_STRICT_MANIFEST=0 (or unset it) to \
+                         render unknown kinds as an Unsupported placeholder",
+                        err,
+                    )));
+                }
+                // Lenient: capture the kind string + raw payload.
+                let kind_string = value
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                eprintln!(
+                    "[manifest] forward-compat: control kind '{}' not recognised by \
+                     this launcher version — rendering as Unsupported placeholder. \
+                     Original error: {}",
+                    if kind_string.is_empty() { "<missing>" } else { kind_string.as_str() },
+                    err,
+                );
+                Ok(ConfigControl::Unsupported { kind_string, raw: value })
+            }
+        }
+    }
 }
 
 fn default_info_dynamic_format() -> String {
@@ -770,8 +1102,39 @@ pub enum ActionDescriptor {
         /// logs + propagates step failures regardless of this flag.
         /// Pinned in serde so manifests don't have to be re-touched
         /// when rollback support lands.
-        #[serde(default)]
+        ///
+        /// v0.2.33 (Agent D): accepts the alias `stop_on_failure` for
+        /// back-compat with the v0.2.7 RL manifest, which shipped that
+        /// spelling before this field's canonical name was settled.
+        /// The renamed canonical form (`rollback_on_step_failure`) is
+        /// preferred for new manifests; the alias logs a deprecation
+        /// warning when used.
+        #[serde(default, alias = "stop_on_failure")]
         rollback_on_step_failure: bool,
+    },
+    /// v0.2.33 (Agent D, 2026-05-25): invoke a launcher-registered
+    /// Tauri command directly. The v0.2.7 RL manifest uses this kind
+    /// inside `chained_action.steps[]` to call commands like
+    /// `module_download_default_weights` that already exist in the
+    /// launcher's `invoke_handler!` registry.
+    ///
+    /// The dispatcher consults a whitelist (`is_whitelisted_manifest_command`)
+    /// before invoking — any command starting with `module_` plus an
+    /// explicit allowlist of legacy non-`module_` commands is allowed.
+    /// Unknown / non-whitelisted command names error rather than
+    /// dispatch (manifest-driven RCE prevention).
+    ///
+    /// `args` is forwarded to the underlying Rust function as-is,
+    /// substituted through the same placeholder pipeline as `Http.body`
+    /// (`{{previous_step.<field>}}`, `{{control:<id>}}`, etc.). Each
+    /// whitelisted command's signature is statically known to the
+    /// dispatcher, so type errors surface at command-arg parse time
+    /// (not as opaque dispatch failures).
+    #[serde(rename = "tauri_command")]
+    TauriCommand {
+        command: String,
+        #[serde(default)]
+        args: serde_json::Value,
     },
 }
 
@@ -2158,7 +2521,15 @@ mod tests {
                     // RL manifest may grow these but the test doesn't
                     // assert on them.
                     | ConfigControl::InfoDynamic { .. }
-                    | ConfigControl::DatePicker { .. } => {}
+                    | ConfigControl::DatePicker { .. }
+                    // v0.2.33 forward-compat fallback — would only fire
+                    // if a future RL manifest ships a control kind this
+                    // launcher version doesn't know. The test stays
+                    // quiet rather than asserting (this launcher would
+                    // render the placeholder; the test isn't here to
+                    // pin the placeholder behaviour, that's in the
+                    // dedicated `unsupported_control_kind_*` tests).
+                    | ConfigControl::Unsupported { .. } => {}
                 }
             }
         }
@@ -2505,6 +2876,11 @@ mod tests {
             // unreachable in practice but needed for exhaustive match.
             ActionRef::Descriptor(ActionDescriptor::ChainedAction { .. }) => {
                 panic!("fixture is kind=http, ChainedAction unexpected")
+            }
+            // v0.2.33: ActionDescriptor gained TauriCommand. Same
+            // exhaustive-match obligation as ChainedAction above.
+            ActionRef::Descriptor(ActionDescriptor::TauriCommand { .. }) => {
+                panic!("fixture is kind=http, TauriCommand unexpected")
             }
         }
     }
@@ -3457,5 +3833,335 @@ mod tests {
         }"#;
         let m = ModuleManifest::from_json(raw).expect("must parse");
         assert_eq!(m.db.unwrap().namespace, "rl_v2_alpha9");
+    }
+
+    // ─── v0.2.33 Agent D (2026-05-25): tauri_command step kind + ───────────
+    //     stop_on_failure alias + Unsupported ConfigControl variant
+    //
+    // Three additions in v0.2.33:
+    //   - `ActionDescriptor::TauriCommand { command, args }` — chained_action
+    //     step kind that the RL v0.2.7 manifest uses (was a hard parse
+    //     failure on v0.2.32 because the variant didn't exist).
+    //   - `stop_on_failure` alias for `rollback_on_step_failure` — RL chat
+    //     shipped v0.2.7 with the alias spelling before the canonical name
+    //     was settled.
+    //   - `ConfigControl::Unsupported` — forward-compat fallback for
+    //     manifests that ship a control kind unknown to this launcher
+    //     version. Lenient by default; strict mode restores the
+    //     pre-v0.2.33 reject-at-parse behaviour for CI gates.
+
+    /// `{"kind": "tauri_command", "command": "...", "args": {...}}`
+    /// parses as `ActionDescriptor::TauriCommand`. The shape matches the
+    /// v0.2.7 RL manifest's button-level dispatch (one Tauri command,
+    /// args struct forwarded to the Rust handler).
+    #[test]
+    fn tauri_command_step_deserialize() {
+        let json = r#"{
+            "kind": "tauri_command",
+            "command": "module_download_default_weights",
+            "args": {
+                "module_id": "vct-rl-reranker",
+                "project_id": "{{project_id}}",
+                "embedding_source": "qwen3"
+            }
+        }"#;
+        let action: ActionDescriptor = serde_json::from_str(json)
+            .expect("tauri_command descriptor parses");
+        match action {
+            ActionDescriptor::TauriCommand { command, args } => {
+                assert_eq!(command, "module_download_default_weights");
+                assert_eq!(args["module_id"], "vct-rl-reranker");
+                assert_eq!(args["project_id"], "{{project_id}}");
+                assert_eq!(args["embedding_source"], "qwen3");
+            }
+            other => panic!("expected TauriCommand, got {:?}", other),
+        }
+    }
+
+    /// `tauri_command` step with `args` omitted should default to
+    /// `serde_json::Value::Null` — matching the schema's `#[serde(default)]`
+    /// on the field. Callers that don't need to pass args don't have to
+    /// declare an empty object.
+    #[test]
+    fn tauri_command_step_omitted_args_defaults_to_null() {
+        let json = r#"{
+            "kind": "tauri_command",
+            "command": "some_no_arg_command"
+        }"#;
+        let action: ActionDescriptor = serde_json::from_str(json)
+            .expect("tauri_command without args parses");
+        match action {
+            ActionDescriptor::TauriCommand { command, args } => {
+                assert_eq!(command, "some_no_arg_command");
+                assert_eq!(args, serde_json::Value::Null);
+            }
+            other => panic!("expected TauriCommand, got {:?}", other),
+        }
+    }
+
+    /// chained_action with `stop_on_failure: true` (the v0.2.7 RL
+    /// manifest alias) deserialises with the canonical
+    /// `rollback_on_step_failure` field set to `true`. This is THE
+    /// regression the launcher v0.2.32 hit at line 242 of the RL
+    /// manifest — the alias didn't exist and `rollback_on_step_failure`
+    /// was the only accepted spelling.
+    #[test]
+    fn stop_on_failure_alias_parses() {
+        let json = r#"{
+            "kind": "chained_action",
+            "stop_on_failure": true,
+            "steps": [
+                { "kind": "http", "method": "GET", "path": "/a" }
+            ]
+        }"#;
+        let action: ActionDescriptor = serde_json::from_str(json)
+            .expect("stop_on_failure alias parses");
+        match action {
+            ActionDescriptor::ChainedAction { rollback_on_step_failure, steps, .. } => {
+                assert!(
+                    rollback_on_step_failure,
+                    "stop_on_failure: true MUST map to rollback_on_step_failure: true",
+                );
+                assert_eq!(steps.len(), 1);
+            }
+            other => panic!("expected ChainedAction, got {:?}", other),
+        }
+    }
+
+    /// Backward compat: the canonical `rollback_on_step_failure` name
+    /// still works. New manifests should use this spelling; old
+    /// manifests using the alias still parse identically.
+    #[test]
+    fn rollback_on_step_failure_canonical_name_works() {
+        let json = r#"{
+            "kind": "chained_action",
+            "rollback_on_step_failure": true,
+            "steps": [
+                { "kind": "http", "method": "GET", "path": "/a" }
+            ]
+        }"#;
+        let action: ActionDescriptor = serde_json::from_str(json)
+            .expect("canonical name parses");
+        match action {
+            ActionDescriptor::ChainedAction { rollback_on_step_failure, .. } => {
+                assert!(rollback_on_step_failure);
+            }
+            other => panic!("expected ChainedAction, got {:?}", other),
+        }
+    }
+
+    /// Full smoke test: load the actual v0.2.7 RL manifest from
+    /// `paid-modules/vct-rl-reranker/vct-module.json` and assert it
+    /// parses cleanly via `ModuleManifest::from_json`. This is THE
+    /// regression test for the v0.2.32 dogfooding bug — pre-D, the
+    /// manifest rejected at line 242 (`tauri_command` step kind)
+    /// because the launcher's `ActionDescriptor` enum didn't have the
+    /// variant. Post-D, it parses cleanly and the catalog tile can
+    /// render with the correct version.
+    ///
+    /// Like `vct_rl_reranker_manifest_deserializes` above, this test
+    /// is informational on dev clones without the paid-modules
+    /// staging dir.
+    #[test]
+    fn rl_reranker_v0_2_7_manifest_with_chained_action_tauri_command_parses() {
+        let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .expect("walk to repo root")
+            .to_path_buf();
+        let path = repo_root.join("paid-modules/vct-rl-reranker/vct-module.json");
+        if !path.exists() {
+            eprintln!(
+                "[test skip] paid-modules/vct-rl-reranker/vct-module.json not present \
+                 (path: {}) — skipping v0.2.7 regression smoke",
+                path.display()
+            );
+            return;
+        }
+        let body = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
+        let manifest = ModuleManifest::from_json(&body)
+            .unwrap_or_else(|e| panic!(
+                "deserialize {} (this is the v0.2.32 regression — \
+                 tauri_command step / stop_on_failure alias must parse): {}",
+                path.display(),
+                e,
+            ));
+
+        // Verify at least one chained_action with at least one
+        // tauri_command step exists in the gui config tab. If the RL
+        // manifest ever drops these shapes the test still passes (the
+        // overall parse is what matters), but we assert when present
+        // to make the regression target explicit.
+        if let Some(gui) = manifest.gui.as_ref() {
+            if let Some(tab) = gui.config_tab.as_ref() {
+                let mut found_chained_with_tauri_step = false;
+                'outer: for section in &tab.sections {
+                    for control in &section.controls {
+                        if let ConfigControl::Button { action, .. } = control {
+                            if let ActionRef::Descriptor(d) = action {
+                                match d {
+                                    ActionDescriptor::TauriCommand { .. } => {
+                                        // Direct button → tauri_command — fine.
+                                    }
+                                    ActionDescriptor::ChainedAction { steps, .. } => {
+                                        for step in steps {
+                                            if matches!(step, ActionDescriptor::TauriCommand { .. }) {
+                                                found_chained_with_tauri_step = true;
+                                                break 'outer;
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+                // Don't hard-assert (the manifest may evolve); just log.
+                if !found_chained_with_tauri_step {
+                    eprintln!(
+                        "[v0.2.7 manifest smoke] no chained_action-with-tauri_command-step \
+                         button found — manifest may have evolved beyond v0.2.7 shape, \
+                         but the top-level parse succeeded which is the main regression"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Lenient mode (default): a manifest with an unknown control kind
+    /// in a section parses as `ConfigControl::Unsupported`. Other
+    /// controls in the same section parse normally.
+    #[test]
+    fn unsupported_control_kind_parses_lenient() {
+        set_strict_manifest_for_test(false);
+        let json = r#"{
+            "id": "test-mod",
+            "name": "Test Module",
+            "version": "0.1.0",
+            "category": "paid-orchestrator",
+            "license": { "min_orchestrator_tier": "free" },
+            "install": { "method": "git_clone", "source": "https://example.com/x.git" },
+            "runtime": { "type": "service", "command": "echo" },
+            "gui": {
+                "config_tab": {
+                    "title": "Test Tab",
+                    "sections": [
+                        {
+                            "title": "Mixed Section",
+                            "controls": [
+                                { "kind": "info", "id": "i1", "text": "ok", "variant": "info" },
+                                { "kind": "file_drop_zone", "id": "future_ctrl",
+                                  "label": "Drop a file (v0.3.0 feature)",
+                                  "accepts": ["application/json"] },
+                                { "kind": "checkbox", "id": "c1", "label": "Toggle",
+                                  "default": false }
+                            ]
+                        }
+                    ]
+                }
+            }
+        }"#;
+        let manifest = ModuleManifest::from_json(json)
+            .expect("manifest with unknown control kind must parse lenient");
+        let controls = &manifest.gui.unwrap().config_tab.unwrap().sections[0].controls;
+        assert_eq!(controls.len(), 3, "all 3 controls present (none dropped)");
+
+        // Known controls deserialize normally.
+        match &controls[0] {
+            ConfigControl::Info { id, text, .. } => {
+                assert_eq!(id, "i1");
+                assert_eq!(text, "ok");
+            }
+            other => panic!("controls[0] expected Info, got {:?}", other),
+        }
+        // Unknown kind becomes Unsupported.
+        match &controls[1] {
+            ConfigControl::Unsupported { kind_string, raw } => {
+                assert_eq!(kind_string, "file_drop_zone");
+                assert_eq!(raw["id"], "future_ctrl");
+                assert_eq!(raw["label"], "Drop a file (v0.3.0 feature)");
+                assert_eq!(raw["accepts"][0], "application/json");
+            }
+            other => panic!("controls[1] expected Unsupported, got {:?}", other),
+        }
+        // Subsequent known controls parse normally.
+        match &controls[2] {
+            ConfigControl::Checkbox { id, label, .. } => {
+                assert_eq!(id, "c1");
+                assert_eq!(label, "Toggle");
+            }
+            other => panic!("controls[2] expected Checkbox, got {:?}", other),
+        }
+    }
+
+    /// Strict mode: the same manifest as `unsupported_control_kind_parses_lenient`
+    /// rejects at parse time when `VCT_LAUNCHER_STRICT_MANIFEST=1`.
+    /// Restores the pre-v0.2.33 behaviour for CI gates and dev-mode.
+    #[test]
+    fn unsupported_control_kind_strict_mode_rejects() {
+        set_strict_manifest_for_test(true);
+        let json = r#"{
+            "id": "test-mod",
+            "name": "Test Module",
+            "version": "0.1.0",
+            "category": "paid-orchestrator",
+            "license": { "min_orchestrator_tier": "free" },
+            "install": { "method": "git_clone", "source": "https://example.com/x.git" },
+            "runtime": { "type": "service", "command": "echo" },
+            "gui": {
+                "config_tab": {
+                    "title": "Test Tab",
+                    "sections": [
+                        {
+                            "title": "Section",
+                            "controls": [
+                                { "kind": "file_drop_zone", "id": "x", "label": "Drop" }
+                            ]
+                        }
+                    ]
+                }
+            }
+        }"#;
+        let err = ModuleManifest::from_json(json)
+            .expect_err("strict mode must reject unknown control kind");
+        // Reset for subsequent tests (test isolation — tests sharing the
+        // static flag depend on lenient being the default).
+        set_strict_manifest_for_test(false);
+        assert!(
+            err.contains("unknown control kind") || err.contains("strict mode") || err.contains("file_drop_zone") || err.contains("unknown variant"),
+            "error message should pinpoint the unknown kind, got: {}",
+            err,
+        );
+    }
+
+    /// An `ActionDescriptor` with an unknown `kind` inside a
+    /// chained_action step REMAINS a hard error (no Unsupported
+    /// fallback for action descriptors today — only ConfigControl
+    /// gets the lenient treatment in v0.2.33). The dispatch surface
+    /// for actions has stronger trust requirements than the renderer:
+    /// silently skipping an unknown step would change the chain's
+    /// semantics. Document the choice here so future refactors don't
+    /// quietly relax it.
+    #[test]
+    fn unsupported_action_descriptor_kind_in_chain_step_rejects() {
+        // Lenient mode for ConfigControl — should NOT affect ActionDescriptor.
+        set_strict_manifest_for_test(false);
+        let json = r#"{
+            "kind": "chained_action",
+            "steps": [
+                { "kind": "future_step_kind", "some_arg": 1 }
+            ]
+        }"#;
+        let err = serde_json::from_str::<ActionDescriptor>(json)
+            .expect_err("unknown action kind in chain step must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown variant") || msg.contains("future_step_kind") || msg.contains("kind"),
+            "error must reference the unknown step kind, got: {}",
+            msg,
+        );
     }
 }

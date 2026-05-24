@@ -54,6 +54,12 @@
   // v0.2.32 L4 + L5 (2026-05-24): info_dynamic + date_picker.
   import InfoDynamicControl from '$lib/components/module-controls/InfoDynamicControl.svelte';
   import DatePickerControl from '$lib/components/module-controls/DatePickerControl.svelte';
+  // v0.2.33 (Agent D, 2026-05-25): forward-compat placeholder for
+  // control kinds this launcher version doesn't recognise. The Rust
+  // schema's lenient-parse fallback (ConfigControl::Unsupported)
+  // lands here; the placeholder explains the situation + invites
+  // an update.
+  import UnsupportedControl from '$lib/components/module-controls/UnsupportedControl.svelte';
 
   // ─── Schema types ──────────────────────────────────────────────────────
   //
@@ -330,7 +336,14 @@
         control.kind === 'button' ||
         control.kind === 'info' ||
         control.kind === 'info_dynamic' ||
-        control.kind === 'link'
+        control.kind === 'link' ||
+        // v0.2.33 (Agent D): forward-compat fallback has no
+        // persistence — the renderer doesn't know what shape its
+        // value would have, and the renderer can't dispatch
+        // on_change either. Filtering here lets TypeScript narrow
+        // `control` to the variants that carry `id` for the rest
+        // of the loop body.
+        control.kind === 'Unsupported'
       )
         continue;
       try {
@@ -383,7 +396,11 @@
     // Drop stale per-control state for this section so the next render
     // can either show the new project's persisted value or fall back to
     // the control's declared default.
+    //
+    // v0.2.33 (Agent D): Unsupported controls have no id field on the
+    // outer type — skip them. They carry no state to invalidate.
     for (const control of configTab.sections[sectionIdx].controls) {
+      if (control.kind === 'Unsupported') continue;
       const k = ckey(sectionIdx, control.id);
       delete values[k];
       delete optionsByControl[k];
@@ -431,7 +448,10 @@
           control.kind === 'button' ||
           control.kind === 'info' ||
           control.kind === 'info_dynamic' ||
-          control.kind === 'link'
+          control.kind === 'link' ||
+          // v0.2.33 (Agent D): forward-compat fallback has no value
+          // shape the renderer can reason about.
+          control.kind === 'Unsupported'
         ) {
           continue;
         }
@@ -702,7 +722,16 @@
 
         <div class="controls">
           {#each section.controls as control}
-            {@const k = ckey(sectionIdx, control.id)}
+            <!-- v0.2.33 (Agent D): Unsupported variant has no `id`
+                 field on the outer type — synthesise a stable key
+                 from the kind_string for state-dictionary lookups
+                 (state never reads/writes for Unsupported, but the
+                 key is referenced by busy/errors during render). -->
+            {@const controlKey =
+              control.kind === 'Unsupported'
+                ? `__unsupported__:${control.kind_string}`
+                : control.id}
+            {@const k = ckey(sectionIdx, controlKey)}
             {@const isBusy = busy[k] === true}
             {@const err = errors[k]}
             <div class="control control-{control.kind}">
@@ -859,6 +888,12 @@
                   projectId={sectionPid}
                   disabled={sectionDisabled}
                 />
+              {:else if control.kind === 'Unsupported'}
+                <!-- v0.2.33 (Agent D): forward-compat placeholder for
+                     control kinds this launcher doesn't recognise. The
+                     Rust schema's lenient-parse fallback lands here so
+                     unknown kinds don't poison the whole tab. -->
+                <UnsupportedControl {control} />
               {/if}
 
               {#if err}

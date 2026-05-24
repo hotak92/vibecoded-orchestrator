@@ -115,14 +115,27 @@
 
     // Decide whether the Rust poller will drive us (descriptor with
     // polling) or we self-poll on a fallback timer.
+    //
+    // v0.2.33 (Agent D): ActionDescriptor grew the `tauri_command`
+    // variant which has no `polling` field. Narrow the kind before
+    // touching `.polling` — tauri_command + status_display would be
+    // an unusual combination (status_display is a read-from-container
+    // surface, not a one-shot Rust command), but defending against
+    // the type error keeps the codebase honest.
     const hasNativePolling =
-      isActionDescriptor(control.source) && control.source.polling != null;
+      isActionDescriptor(control.source) &&
+      control.source.kind === 'http' &&
+      control.source.polling != null;
 
     void (async () => {
       // Kick the action.
       await fetchOnce();
 
-      if (hasNativePolling && isActionDescriptor(control.source)) {
+      if (
+        hasNativePolling &&
+        isActionDescriptor(control.source) &&
+        control.source.kind === 'http'
+      ) {
         const polling = control.source.polling!;
         const progressEvent = polling.progress_event ?? 'module://action-progress';
         const failedEvent = polling.failed_event ?? 'module://action-failed';
