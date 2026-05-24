@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# vco — thin wrapper around `python -m vco_lib.cli`.
+#
+# This shim exists because the orchestrator does not (yet) ship a
+# `pyproject.toml` with a `[project.scripts]` entry. Once packaging
+# lands, `pip install -e .` will register `vco` directly on PATH and
+# this wrapper becomes redundant.
+#
+# Until then: add `scripts/` to your PATH or symlink this file to
+# `~/.local/bin/vco`. The wrapper auto-discovers the orchestrator's
+# MCP venv (`claude_mcp_servers/.venv/bin/python`) and falls back to
+# `python3` on PATH.
+#
+# Cross-OS: the PowerShell sibling lives at `scripts/vco.ps1`.
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Prefer the orchestrator's pinned venv (matches the rest of the CLI
+# scripts in this directory).
+if [ -x "$REPO_ROOT/claude_mcp_servers/.venv/bin/python" ]; then
+    PY="$REPO_ROOT/claude_mcp_servers/.venv/bin/python"
+elif command -v python3 >/dev/null 2>&1; then
+    PY="$(command -v python3)"
+elif command -v python >/dev/null 2>&1; then
+    PY="$(command -v python)"
+else
+    echo "[vco] no python interpreter found on PATH" >&2
+    exit 127
+fi
+
+PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" exec "$PY" -m vco_lib.cli "$@"

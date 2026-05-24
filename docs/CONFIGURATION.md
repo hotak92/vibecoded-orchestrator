@@ -355,3 +355,51 @@ installations:
   Normally produced incrementally by the kg-summary-generator hook on edit;
   use this script when you want to rebuild the cache from scratch (for
   example after a bulk import or a node-format schema change).
+
+## `vco` CLI — verify commands (Phase 0 of the diagrams integration)
+
+The `vco` script (run via `scripts/vco` on Unix or `scripts/vco.ps1` on
+Windows; once `pyproject.toml` lands it will register `vco` on PATH
+directly) exposes two Phase 0 acceptance verifiers:
+
+### `vco verify-pins`
+
+Confirms each `[npm.*]` entry in `bundled_mcp_versions.toml` is installed
+at the pinned version. Compares `npm list -g <package> --json` output to
+the manifest; reports either a single `OK` line or a `package | pinned |
+installed | status` drift table.
+
+| Flag    | Behaviour                                                        |
+| ------- | ---------------------------------------------------------------- |
+| `--json`| Emit a single JSON envelope on stdout (machine-readable).        |
+| `--fix` | Re-install each drifted package via `install._install_pinned_npm`. Aborts on the first failure rather than silently skipping; re-runs the verify afterwards as an idempotency check. |
+
+Exit codes: `0` = all OK, `1` = drift, `2` = `npm` not on PATH (sysinfo
+problem, not a pinning problem), `3` = `--fix` failed to repair.
+
+```text
+$ vco verify-pins
+OK — all pinned packages match manifest.
+package                                       pinned  installed  status
+--------------------------------------------  ------  ---------  ------
+claude-mermaid                                1.4.2   1.4.2      match
+@sanjibdevnathlabs/mcp-excalidraw-local       0.3.1   0.3.1      match
+```
+
+### `vco verify-env-projection <project_slug_or_id>`
+
+Confirms `.claude/settings.json env`, `.claude/env`, and
+`.vscode/settings.json claude-code.env` all match the canonical projection
+emitted by `vco_lib.config_projection.project_env_from_db(project_id)`.
+This is the source-of-truth contract codified by the diagrams plan: every
+env value in those three surfaces is a projection of launcher DB state,
+never authored by hand.
+
+| Flag    | Behaviour                                                        |
+| ------- | ---------------------------------------------------------------- |
+| `--json`| Emit a single JSON envelope on stdout (machine-readable).        |
+| `--fix` | Call `apply_project_env(...)` to re-project from the DB onto disk. Runs a round-trip verify afterwards; exits `3` if the second check still reports drift (broken contract). |
+| `--all` | Verify every registered project in the launcher DB. Worst exit code across all projects wins. |
+
+Exit codes: `0` = all match, `1` = drift, `2` = project not found or DB
+unreadable, `3` = `--fix` failed or contract idempotency broken.
