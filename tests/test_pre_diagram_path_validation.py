@@ -111,7 +111,11 @@ class TestValidateCLI:
         p = tmp_path / ".claude" / "diagrams" / "gui" / "auth" / "login.mmd"
         result = _run_cli(["validate", "--kind", "excalidraw", str(p)])
         assert result.returncode == 2
-        assert "expected kind" in result.stderr.lower()
+        # 1.2's canonical wording: "does not match diagram kind <kind>".
+        # Updated from 1.5.A's "expected kind=..." wording at integration time.
+        stderr_lower = result.stderr.lower()
+        assert "does not match diagram kind" in stderr_lower
+        assert "excalidraw" in stderr_lower
 
     def test_corrective_message_includes_example(self, tmp_path: Path):
         p = tmp_path / ".claude" / "diagrams" / "flat.mmd"
