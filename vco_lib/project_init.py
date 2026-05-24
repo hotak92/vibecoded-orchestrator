@@ -3320,6 +3320,430 @@ def _apply_template_subs(buf: bytes, subs: dict[str, str]) -> bytes:
     return text.encode("utf-8")
 
 
+# ---------------------------------------------------------------------------
+# Conditional template primitive (Phase 1.5.B, 2026-05-25)
+#
+# Mustache-style sections that the project-template renderer strips BEFORE
+# the dict-based `{{KEY}}` placeholder pass. Designed for the "is this
+# module active for this project?" question — diagrams ships as default-on
+# with a user-toggleable opt-out in the launcher's DiagramsTab; future
+# modules (RL, MAO, paid packs) reuse the same primitive.
+#
+# Syntax (whole-line tags):
+#
+#   {{#if_module_active diagrams}}
+#   ... body ...
+#   {{/if_module_active}}
+#
+#   {{#if_module_inactive diagrams}}
+#   ... alternate body ...
+#   {{/if_module_inactive}}
+#
+# Rules:
+#   - <name> matches [a-z_][a-z0-9_]* (DB module_name convention).
+#   - Opening + closing tags must each occupy their own line; the line is
+#     removed entirely (not just the directive token), so the rendered
+#     output has no orphan blank line where the tag used to be.
+#   - When a block is DROPPED, one trailing newline immediately after the
+#     closing tag is also consumed so there is no blank-line scar.
+#   - Nesting is NOT supported in Phase 1.5.B — opening a new block while
+#     already inside one raises TemplateError. (Document this restriction
+#     in the docstring + tests; the parser asserts at the point of error.)
+#   - Variable substitution inside a kept block is the downstream pass's
+#     concern; this primitive only strips/keeps whole blocks.
+#   - Unknown opening tags (typo: `{{#if_modul_active ...}}`) → TemplateError.
+#   - Unmatched opening or unmatched closing → TemplateError.
+#
+# All TemplateError messages include the offending 1-based line number so
+# callers can point at the broken template directly.
+# ---------------------------------------------------------------------------
+
+
+class TemplateError(ValueError):
+    """Raised when a conditional template block is malformed.
+
+    Carries the offending 1-based line number in ``line_no`` so callers
+    can quote the location alongside the message.
+    """
+
+    def __init__(self, message: str, *, line_no: int | None = None) -> None:
+        super().__init__(message)
+        self.line_no = line_no
+
+
+# Regex anchors: a whole-line conditional tag (leading/trailing whitespace
+# tolerated, no other content on the line). The `<name>` capture is the
+# strict module-name rule from the plan: lowercase identifier.
+_TAG_OPEN_ACTIVE_RE = re.compile(
+    r"^\s*\{\{#if_module_active\s+([a-z_][a-z0-9_]*)\s*\}\}\s*$"
+)
+_TAG_OPEN_INACTIVE_RE = re.compile(
+    r"^\s*\{\{#if_module_inactive\s+([a-z_][a-z0-9_]*)\s*\}\}\s*$"
+)
+_TAG_CLOSE_ACTIVE_RE = re.compile(
+    r"^\s*\{\{/if_module_active\s*\}\}\s*$"
+)
+_TAG_CLOSE_INACTIVE_RE = re.compile(
+    r"^\s*\{\{/if_module_inactive\s*\}\}\s*$"
+)
+# Catch-all for typos / unknown directives: any line that looks like a
+# mustache-style block tag (`{{#...}}` or `{{/...}}`) and didn't match one
+# of the four canonical patterns above. Used for error reporting.
+_TAG_UNKNOWN_RE = re.compile(
+    r"^\s*\{\{[#/]\s*[A-Za-z][A-Za-z0-9_]*.*\}\}\s*$"
+)
+
+
+def render_conditional_blocks(
+    template: str,
+    *,
+    active_modules: set[str],
+) -> str:
+    """Strip ``{{#if_module_active <name>}}...{{/if_module_active}}`` blocks
+    where ``<name>`` is NOT in ``active_modules``. Strip the
+    ``{{#if_module_inactive ...}}`` mirror where ``<name>`` IS in
+    ``active_modules``. Remaining ``{{KEY}}`` placeholders are left
+    untouched (the downstream dict-substitution pass handles those).
+
+    Args:
+        template: Raw template text (UTF-8 decoded already).
+        active_modules: Set of module-name strings considered "on" for
+            this project (e.g. ``{"diagrams"}``).
+
+    Returns:
+        The template with conditional blocks resolved. When a block is
+        dropped, one trailing newline immediately after the closing tag
+        is also consumed so the output has no blank-line scar.
+
+    Raises:
+        TemplateError: malformed tag, mismatched open/close, attempt to
+            nest a block, or an unknown ``{{#...}}`` directive. The
+            exception's ``line_no`` attribute is the 1-based line of
+            the offending tag.
+    """
+    # Preserve the input's trailing-newline status: splitlines() drops the
+    # terminator and we rebuild with "\n".join, so capture whether the
+    # original ended in a newline so the round-trip is faithful for
+    # template files that conventionally end with one.
+    had_trailing_newline = template.endswith("\n")
+    lines = template.splitlines()
+
+    # Pass 1: parse into a list of tag events
+    # kind in {"open_active", "open_inactive", "close_active", "close_inactive"}.
+    events: list[tuple[str, int, str | None]] = []
+    for idx, ln in enumerate(lines):
+        m = _TAG_OPEN_ACTIVE_RE.match(ln)
+        if m:
+            events.append(("open_active", idx, m.group(1)))
+            continue
+        m = _TAG_OPEN_INACTIVE_RE.match(ln)
+        if m:
+            events.append(("open_inactive", idx, m.group(1)))
+            continue
+        if _TAG_CLOSE_ACTIVE_RE.match(ln):
+            events.append(("close_active", idx, None))
+            continue
+        if _TAG_CLOSE_INACTIVE_RE.match(ln):
+            events.append(("close_inactive", idx, None))
+            continue
+        # Catch-all: line looks like a mustache block tag but didn't
+        # match any canonical pattern. Likely a typo. Report at parse
+        # time so the user gets a clear line number.
+        if _TAG_UNKNOWN_RE.match(ln):
+            raise TemplateError(
+                f"Unknown conditional template tag on line {idx + 1}: "
+                f"{ln.strip()!r}. Valid tags: "
+                f"'{{{{#if_module_active <name>}}}}', "
+                f"'{{{{/if_module_active}}}}', "
+                f"'{{{{#if_module_inactive <name>}}}}', "
+                f"'{{{{/if_module_inactive}}}}'.",
+                line_no=idx + 1,
+            )
+
+    # Pass 2: walk events, build (start_line, end_line, kind, module_name)
+    # blocks. Enforce: no nesting, matched open/close pairs, matching kind.
+    blocks: list[tuple[int, int, str, str]] = []
+    open_stack: list[tuple[str, int, str]] = []
+    for kind, idx, mod_name in events:
+        if kind in ("open_active", "open_inactive"):
+            if open_stack:
+                prev_kind, prev_idx, _ = open_stack[-1]
+                raise TemplateError(
+                    f"Nested conditional template blocks are not supported "
+                    f"in Phase 1.5.B. Line {idx + 1} opens a {kind!r} block "
+                    f"while line {prev_idx + 1} ({prev_kind!r}) is still "
+                    f"open.",
+                    line_no=idx + 1,
+                )
+            assert mod_name is not None
+            open_stack.append((kind, idx, mod_name))
+            continue
+        # close_active / close_inactive
+        if not open_stack:
+            raise TemplateError(
+                f"Unmatched closing tag on line {idx + 1}: no open "
+                f"conditional block to close.",
+                line_no=idx + 1,
+            )
+        prev_kind, prev_idx, prev_mod = open_stack.pop()
+        expected_close = (
+            "close_active" if prev_kind == "open_active" else "close_inactive"
+        )
+        if kind != expected_close:
+            raise TemplateError(
+                f"Mismatched conditional tags: line {prev_idx + 1} opens "
+                f"a {prev_kind!r} block but line {idx + 1} closes with "
+                f"{kind!r}.",
+                line_no=idx + 1,
+            )
+        blocks.append((prev_idx, idx, prev_kind, prev_mod))
+
+    if open_stack:
+        leftover_kind, leftover_idx, _ = open_stack[-1]
+        raise TemplateError(
+            f"Unmatched opening tag on line {leftover_idx + 1}: "
+            f"{leftover_kind!r} block never closed.",
+            line_no=leftover_idx + 1,
+        )
+
+    # Pass 3: decide keep/drop per line, then materialise the output.
+    # A line is dropped if (a) it's an opening/closing tag line, OR
+    # (b) it falls inside a block whose body we're dropping. Additionally,
+    # when a block is dropped, the single immediately-following line is
+    # also consumed if it's blank — avoids the blank-line scar.
+    drop = [False] * len(lines)
+    for start, end, kind, mod_name in blocks:
+        # Tag lines are ALWAYS removed (the user never wants to see
+        # literal `{{#if_module_active ...}}` in rendered output, even
+        # when the body is kept).
+        drop[start] = True
+        drop[end] = True
+        if kind == "open_active":
+            keep_body = mod_name in active_modules
+        else:  # open_inactive
+            keep_body = mod_name not in active_modules
+        if not keep_body:
+            for i in range(start + 1, end):
+                drop[i] = True
+            # Consume one trailing blank line after the closing tag.
+            trailing = end + 1
+            if trailing < len(lines) and lines[trailing].strip() == "":
+                drop[trailing] = True
+
+    out_lines = [ln for ln, d in zip(lines, drop) if not d]
+    out = "\n".join(out_lines)
+    if had_trailing_newline and (not out.endswith("\n")):
+        out += "\n"
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Managed-region merge for project-level Markdown files (Phase 1.5.B)
+#
+# The CLAUDE.md template is rendered into the project's `CLAUDE.md` at
+# install time and re-rendered on module-toggle events. Anything OUTSIDE
+# the bracketed managed-region (added freely by the user) must survive the
+# re-render verbatim — same Bug-4 discipline as the `.claude/settings.json
+# env` deep-merge handling (see knowledge/concepts/config-projection-
+# contract-2026-05-24.md). The wrapper markers are HTML comments so they
+# render invisibly in markdown viewers.
+# ---------------------------------------------------------------------------
+
+MANAGED_REGION_OPEN = "<!-- >>>VCO_MANAGED>>> -->"
+MANAGED_REGION_CLOSE = "<!-- <<<VCO_MANAGED<<< -->"
+
+
+def merge_managed_region(
+    existing_claude_md: str,
+    new_managed_body: str,
+) -> str:
+    """Merge a freshly-rendered managed body into an existing CLAUDE.md,
+    preserving any user-added content outside the markers verbatim.
+
+    Three cases:
+      1. Both markers present → replace the body between them. Content
+         before the opening marker and after the closing marker is
+         preserved verbatim.
+      2. Markers absent (older project / fresh empty file) → wrap
+         ``new_managed_body`` in markers and prepend it to the existing
+         content, separated by a blank line. The prior content is treated
+         as below-the-managed-region user material.
+      3. Existing content empty → emit only the wrapped managed body.
+
+    Idempotent: feeding the output of one call back in as
+    ``existing_claude_md`` with the same ``new_managed_body`` produces the
+    same string.
+
+    ``new_managed_body`` is inserted between the marker lines WITHOUT the
+    markers themselves — pass the rendered template body, not a
+    pre-wrapped string.
+
+    Args:
+        existing_claude_md: Current on-disk CLAUDE.md content (UTF-8
+            str). May be empty.
+        new_managed_body: Newly-rendered template body, WITHOUT the
+            wrapping marker lines.
+
+    Returns:
+        The merged CLAUDE.md content as a single UTF-8 string. The
+        caller is responsible for writing atomically (use
+        ``_write_file_atomic`` or equivalent — partial writes to a
+        user-readable file would be visible).
+
+    Raises:
+        TemplateError: opening marker present but closing marker absent
+            (or vice-versa), or closing marker appears before opening.
+    """
+    # Defensive normalisation: a body the caller built with mixed CRLF
+    # would leak \r into the output. Normalise to LF here.
+    body = new_managed_body.replace("\r\n", "\n").replace("\r", "\n")
+    # No leading/trailing blank lines inside the markers.
+    body = body.strip("\n")
+
+    open_idx = existing_claude_md.find(MANAGED_REGION_OPEN)
+    close_idx = existing_claude_md.find(MANAGED_REGION_CLOSE)
+
+    if open_idx == -1 and close_idx == -1:
+        # Case 2 / 3: no markers present. Wrap the body, prepend.
+        wrapped = f"{MANAGED_REGION_OPEN}\n{body}\n{MANAGED_REGION_CLOSE}"
+        if existing_claude_md.strip() == "":
+            return wrapped + "\n"
+        # Existing content becomes "below the managed region" user
+        # material. Separate with a blank line; preserve trailing-newline.
+        return wrapped + "\n\n" + existing_claude_md
+
+    if open_idx == -1 or close_idx == -1:
+        present = "opening" if open_idx != -1 else "closing"
+        missing = "closing" if open_idx != -1 else "opening"
+        raise TemplateError(
+            f"CLAUDE.md has a {present} VCO-managed-region marker but no "
+            f"{missing} marker. Refusing to clobber: fix the file by hand "
+            f"or restore the missing marker."
+        )
+
+    if close_idx < open_idx:
+        raise TemplateError(
+            "CLAUDE.md's VCO-managed-region markers are out of order "
+            "(closing appears before opening). Refusing to clobber."
+        )
+
+    # Case 1: both markers present. Replace body in-place.
+    # `prefix` = everything up to & including the opening marker.
+    # `suffix` = everything from the closing marker onwards.
+    prefix = existing_claude_md[: open_idx + len(MANAGED_REGION_OPEN)]
+    suffix = existing_claude_md[close_idx:]
+    return f"{prefix}\n{body}\n{suffix}"
+
+
+# ---------------------------------------------------------------------------
+# Module-active resolver (Phase 1.5.B)
+#
+# Reads the launcher SQLite DB's ``project_modules`` table — Phase 1.1
+# (sibling agent) lands the actual schema. Until then we ship a STUB
+# fallback so render tests can run in isolation: when the DB or table is
+# absent, return the default-on module set. ``diagrams`` is included to
+# match Phase 1.5's "default-on with opt-out" design.
+# ---------------------------------------------------------------------------
+
+# Default-on modules: any module with no row in `project_modules`, OR with
+# `enabled=1`, is considered active. The constant lives here so the stub
+# fallback and the live-DB path share a single source of truth.
+_DEFAULT_ACTIVE_MODULES: frozenset[str] = frozenset({"diagrams"})
+
+
+def _launcher_db_path() -> Path:
+    """Return the path to the launcher SQLite DB.
+
+    Same resolution rule as ``vco_lib.paths.vct_root_dir`` /
+    ``templates/scripts/generate-kg-summary.py``:
+
+      1. ``$VCT_STATE_DIR/launcher.db`` if the env var is set.
+      2. ``~/.vct/launcher.db`` otherwise.
+    """
+    custom = os.environ.get("VCT_STATE_DIR", "").strip()
+    if custom:
+        return Path(custom) / "launcher.db"
+    return Path.home() / ".vct" / "launcher.db"
+
+
+def resolve_active_modules(
+    project_id: str,
+    *,
+    db_path: Path | None = None,
+) -> set[str]:
+    """Return the set of active module names for ``project_id``.
+
+    Reads ``project_modules`` rows from the launcher SQLite DB and treats
+    a module as active when ``enabled=1`` OR when no row exists for that
+    project + module combination (default-on policy per Phase 1.5).
+
+    STUB BEHAVIOUR (until Phase 1.1's DB migration lands): when the DB
+    file or the ``project_modules`` table is absent, returns
+    ``_DEFAULT_ACTIVE_MODULES`` so the render pipeline still produces
+    sensible output in isolated test environments and on fresh installs.
+
+    Args:
+        project_id: The project's UUID-or-slug as stored in
+            ``project_modules.project_id``.
+        db_path: Override the default ``~/.vct/launcher.db`` resolution
+            (used by tests to point at a fixture DB).
+
+    Returns:
+        Set of module name strings considered active for this project.
+        Always includes default-on modules unless a row explicitly
+        disables them (``enabled=0``).
+    """
+    import sqlite3
+
+    target = db_path if db_path is not None else _launcher_db_path()
+    if not target.is_file():
+        # Phase 1.1 not yet integrated, or fresh install before launcher
+        # has touched the DB. Return defaults.
+        return set(_DEFAULT_ACTIVE_MODULES)
+
+    try:
+        conn = sqlite3.connect(str(target))
+    except sqlite3.Error:
+        return set(_DEFAULT_ACTIVE_MODULES)
+    try:
+        # Probe for the table — Phase 1.1 owns the schema; until it lands
+        # the table doesn't exist and we fall back to defaults.
+        try:
+            cur = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name='project_modules'"
+            )
+            if cur.fetchone() is None:
+                return set(_DEFAULT_ACTIVE_MODULES)
+        except sqlite3.Error:
+            return set(_DEFAULT_ACTIVE_MODULES)
+
+        try:
+            cur = conn.execute(
+                "SELECT module_name, enabled FROM project_modules "
+                "WHERE project_id = ?",
+                (project_id,),
+            )
+            rows = cur.fetchall()
+        except sqlite3.Error:
+            return set(_DEFAULT_ACTIVE_MODULES)
+    finally:
+        conn.close()
+
+    # Build the active-set: start with defaults, then apply explicit rows.
+    # A row with enabled=0 REMOVES a default-on module from the set; a
+    # row with enabled=1 adds (or keeps) the module.
+    active = set(_DEFAULT_ACTIVE_MODULES)
+    for module_name, enabled in rows:
+        if not isinstance(module_name, str):
+            continue
+        if enabled:
+            active.add(module_name)
+        else:
+            active.discard(module_name)
+    return active
+
+
 def _normalise_for_diff(text: str) -> list[str]:
     """Normalise a file for the "meaningfully differs" check.
 
@@ -3437,11 +3861,43 @@ def _install_project_level_templates(
             raw = src.read_bytes()
         except OSError:
             continue
+        # Phase 1.5.B: run the conditional-blocks pre-pass BEFORE the
+        # dict-substitution pass. CLAUDE.md.template is the primary
+        # consumer (per-module sections); the pre-pass is a no-op on
+        # templates that don't contain any conditional tags, so applying
+        # it uniformly is safe. Use the project folder as the resolver's
+        # project_id — Phase 1.1's launcher DB uses the project folder
+        # path (sanitised) as the slug key.
+        try:
+            active = resolve_active_modules(str(folder))
+        except Exception:
+            # Defensive: any unexpected resolver failure falls back to
+            # defaults so install never breaks.
+            active = set(_DEFAULT_ACTIVE_MODULES)
+        try:
+            raw_text = raw.decode("utf-8", errors="replace")
+            rendered_text = render_conditional_blocks(raw_text, active_modules=active)
+            raw = rendered_text.encode("utf-8")
+        except TemplateError:
+            # If the template itself is malformed, skip the conditional
+            # pass and let the original bytes flow through. The reference
+            # sidecar will surface the issue on diff.
+            pass
         substituted = _apply_template_subs(raw, subs)
 
         live_target = folder / live_rel
         if not live_target.exists():
             # Missing project-level file → install the stub.
+            # For CLAUDE.md specifically, wrap the substituted body in
+            # the VCO-managed-region markers so future re-renders can
+            # safely replace only the managed body (preserving any
+            # user-added content below the closing marker).
+            if live_rel == Path("CLAUDE.md"):
+                wrapped = merge_managed_region(
+                    existing_claude_md="",
+                    new_managed_body=substituted.decode("utf-8", errors="replace"),
+                )
+                substituted = wrapped.encode("utf-8")
             if not dry_run:
                 try:
                     _write_file_atomic(live_target, substituted)
@@ -3479,6 +3935,127 @@ def _install_project_level_templates(
             out["diverged"].append(str(live_rel))
 
     return out
+
+
+# ---------------------------------------------------------------------------
+# CLAUDE.md re-render entrypoint (Phase 1.5.B)
+#
+# Wired into the DiagramsTab toggle (Phase 1.3 — sibling): when the user
+# flips a module toggle, the launcher's Tauri command
+# ``set_project_module_enabled`` calls this CLI via subprocess (Option A
+# pattern from Phase 0.B's config_projection — Rust shells out to Python
+# for byte-layout authority over template rendering).
+#
+# Pipeline:
+#   1. Read ``templates/CLAUDE.md.template`` from the orchestrator clone.
+#   2. ``render_conditional_blocks`` strips per-module sections.
+#   3. ``_apply_template_subs`` resolves ``{{PROJECT_NAME}}`` etc.
+#   4. ``merge_managed_region`` replaces the body inside the markers
+#      while preserving any user-added content outside.
+#   5. Atomic write via ``_write_file_atomic``.
+# ---------------------------------------------------------------------------
+
+
+def render_claude_md(
+    folder: Path,
+    *,
+    orchestrator_root: Path,
+    project_name: str,
+    project_id: str | None = None,
+    db_path: Path | None = None,
+) -> dict:
+    """Re-render ``<folder>/CLAUDE.md`` from the orchestrator template,
+    preserving any user content outside the VCO-managed-region markers.
+
+    Used by the launcher's ``set_project_module_enabled`` Tauri command
+    (via the ``re-render-claude-md`` CLI subcommand) when the user
+    toggles a module on/off in DiagramsTab or any future per-module
+    settings UI.
+
+    Idempotent on the managed body: feeding the same active-modules set
+    in twice produces byte-identical output.
+
+    Args:
+        folder: Target project folder containing (or about to contain)
+            ``CLAUDE.md``.
+        orchestrator_root: Orchestrator clone root (source of the
+            ``templates/CLAUDE.md.template`` file).
+        project_name: Display name used to resolve ``{{PROJECT_NAME}}``.
+        project_id: Project id/slug used to look up
+            ``project_modules`` rows. Defaults to ``str(folder)`` so the
+            stub resolver (no DB) returns default-on modules — matches
+            the install-time behaviour.
+        db_path: Override the default ``~/.vct/launcher.db`` resolution
+            (used by tests).
+
+    Returns:
+        A result dict::
+
+            {
+              "wrote_path": "<abs path>",
+              "active_modules": [<sorted module names>],
+              "managed_region_present_before": bool,
+              "rendered_bytes": <int>,
+            }
+
+    Raises:
+        FileNotFoundError: ``templates/CLAUDE.md.template`` missing on
+            the orchestrator clone.
+        TemplateError: malformed conditional tag or out-of-order markers
+            in the existing CLAUDE.md.
+        OSError: write failure (atomic-write: no partial file on disk).
+    """
+    template_path = orchestrator_root / "templates" / "CLAUDE.md.template"
+    if not template_path.is_file():
+        raise FileNotFoundError(
+            f"CLAUDE.md template not found at {template_path}. The "
+            f"orchestrator clone may be incomplete; re-run install.py "
+            f"--update."
+        )
+
+    raw_bytes = template_path.read_bytes()
+    raw_text = raw_bytes.decode("utf-8", errors="replace")
+
+    # Resolve active modules. Default project_id to the folder path so
+    # the stub resolver (no DB) returns the default-on set — matches
+    # install-time behaviour.
+    effective_project_id = project_id if project_id is not None else str(folder)
+    active = resolve_active_modules(effective_project_id, db_path=db_path)
+
+    # Pipeline: conditional → substitution.
+    rendered = render_conditional_blocks(raw_text, active_modules=active)
+    subs = _project_template_subs(orchestrator_root, folder, project_name)
+    rendered_bytes = _apply_template_subs(rendered.encode("utf-8"), subs)
+    rendered_body = rendered_bytes.decode("utf-8", errors="replace")
+
+    # Read existing CLAUDE.md (may not exist).
+    target = folder / "CLAUDE.md"
+    if target.is_file():
+        try:
+            existing = target.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            existing = ""
+    else:
+        existing = ""
+
+    had_markers = (
+        MANAGED_REGION_OPEN in existing and MANAGED_REGION_CLOSE in existing
+    )
+
+    merged = merge_managed_region(
+        existing_claude_md=existing,
+        new_managed_body=rendered_body,
+    )
+
+    merged_bytes = merged.encode("utf-8")
+    _write_file_atomic(target, merged_bytes)
+
+    return {
+        "wrote_path": str(target),
+        "active_modules": sorted(active),
+        "managed_region_present_before": had_markers,
+        "rendered_bytes": len(merged_bytes),
+    }
 
 
 def _run_rl_client_setup(folder: Path) -> dict:
@@ -7142,6 +7719,85 @@ def _cmd_dismiss_deferral(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_re_render_claude_md(args: argparse.Namespace) -> int:
+    """``re-render-claude-md --folder <path> --project-name <name>
+    [--orchestrator-root <path>] [--project-id <id>] [--db-path <path>]
+    [--json]``
+
+    Re-render ``<folder>/CLAUDE.md`` from the orchestrator template after a
+    module toggle (Phase 1.5.B). User content outside the
+    ``<!-- >>>VCO_MANAGED>>> -->`` / ``<!-- <<<VCO_MANAGED<<< -->`` markers
+    is preserved verbatim.
+
+    Used by the launcher's ``set_project_module_enabled`` Tauri command
+    (Phase 1.1 sibling) — Rust shells out to Python for byte-layout
+    authority over template rendering, same Option A pattern as the
+    Phase 0.B ``config_projection`` subcommand.
+
+    JSON stdout schema (when ``--json`` is set)::
+
+      {"wrote_path": "<abs>",
+       "active_modules": [<sorted module names>],
+       "managed_region_present_before": bool,
+       "rendered_bytes": <int>}
+
+    Exit codes:
+      0 — success.
+      1 — render failed (template missing, malformed conditional block,
+          out-of-order markers in existing file, or write failure).
+    """
+    folder = Path(args.folder).resolve()
+    if not folder.is_dir():
+        msg = f"folder does not exist or is not a directory: {folder}"
+        if args.json:
+            print(json.dumps({"ok": False, "error": msg}))
+        else:
+            print(msg, file=sys.stderr)
+        return 1
+
+    # Resolve orchestrator_root: explicit arg wins, else walk up looking
+    # for the templates/ dir (mirrors install-bundle's discovery rule).
+    if args.orchestrator_root:
+        orchestrator_root = Path(args.orchestrator_root).resolve()
+    else:
+        orchestrator_root = _find_orchestrator_root_from_module()
+
+    project_id = args.project_id if args.project_id else None
+    db_path = Path(args.db_path).resolve() if args.db_path else None
+
+    try:
+        result = render_claude_md(
+            folder,
+            orchestrator_root=orchestrator_root,
+            project_name=args.project_name,
+            project_id=project_id,
+            db_path=db_path,
+        )
+    except (FileNotFoundError, TemplateError, OSError) as exc:
+        payload = {
+            "ok": False,
+            "error": str(exc),
+            "error_type": type(exc).__name__,
+        }
+        if args.json:
+            print(json.dumps(payload))
+        else:
+            print(f"render failed: {exc}", file=sys.stderr)
+        return 1
+
+    payload = {"ok": True, **result}
+    if args.json:
+        print(json.dumps(payload))
+    else:
+        print(
+            f"re-rendered {result['wrote_path']} "
+            f"({result['rendered_bytes']} bytes, "
+            f"active_modules={result['active_modules']})",
+            file=sys.stderr,
+        )
+    return 0
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m vco_lib.project_init",
@@ -7360,6 +8016,50 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "on stderr).",
     )
     p_dismiss.set_defaults(func=_cmd_dismiss_deferral)
+
+    # re-render-claude-md (Phase 1.5.B 2026-05-25) -----------------------
+    p_render = sub.add_parser(
+        "re-render-claude-md",
+        help=(
+            "Re-render <folder>/CLAUDE.md from the orchestrator template "
+            "after a module toggle. Conditional blocks resolved against "
+            "the launcher DB's project_modules table; user content "
+            "outside the VCO-managed-region markers is preserved verbatim."
+        ),
+    )
+    p_render.add_argument(
+        "--folder", required=True,
+        help="Target user-project folder (must exist).",
+    )
+    p_render.add_argument(
+        "--project-name", required=True, dest="project_name",
+        help="Display name used to resolve {{PROJECT_NAME}} in the "
+             "template.",
+    )
+    p_render.add_argument(
+        "--orchestrator-root", default=None,
+        help="Orchestrator clone root (source of "
+             "templates/CLAUDE.md.template). Default: walk up from this "
+             "module looking for vct-module.json (same rule as "
+             "install-bundle).",
+    )
+    p_render.add_argument(
+        "--project-id", default=None, dest="project_id",
+        help="Project id/slug used to look up project_modules rows. "
+             "Default: the resolved folder path (matches the stub "
+             "resolver's contract when no DB is available).",
+    )
+    p_render.add_argument(
+        "--db-path", default=None, dest="db_path",
+        help="Override the default ~/.vct/launcher.db resolution "
+             "(used by tests / non-default state dirs).",
+    )
+    p_render.add_argument(
+        "--json", action="store_true",
+        help="Emit a single JSON object on stdout (default: human-prose "
+             "summary on stderr).",
+    )
+    p_render.set_defaults(func=_cmd_re_render_claude_md)
 
     return parser
 
