@@ -2907,6 +2907,18 @@ def main() -> int:
     # still lazy-install on first call.
     _install_playwright_browsers()
 
+    # Phase 1.2 (diagrams plan): pre-pin the `claude-mermaid` npm
+    # package at the version declared in `bundled_mcp_versions.toml`
+    # so the first Mermaid invocation doesn't pay the cold-install
+    # cost. Default-disabled per project (see BUNDLED_MCP_DEFAULT_
+    # DISABLED in vct-launcher-core); pre-installing here means
+    # opt-in is one click in the launcher, not a 30 s wait.
+    # Opt-out: VCT_SKIP_MERMAID=1.
+    # Non-fatal: returns False on skip / npm missing / pin mismatch;
+    # the wrapper MCP still lazy-installs via `npx -y` when first
+    # invoked, so the path is graceful.
+    _install_pinned_npm("mermaid_mcp", skip_env_var="VCT_SKIP_MERMAID")
+
     # Step 11: Initial code graph analysis (if repo has code)
     # Skipped on first install — user runs manually after setup
 
@@ -11327,9 +11339,28 @@ def _build_python_mcp_entries(
         "env": search_env,
     }
 
+    # mermaid (Phase 1.2 — diagrams plan)
+    # Wrapper MCP that proxies the pinned `claude-mermaid` npm package.
+    # Spawned as `<venv-python> -m claude_mcp_servers.wrappers.mermaid_proxy`
+    # — the wrapper itself spawns `npx` as a child once it's resolved the
+    # per-project tool allowlist. Mirrors the Rust path's mermaid entry
+    # in mcp_registration.rs::build_default_mcp_entries.
+    mermaid_env_raw = {"PYTHONPATH": pythonpath}
+    mermaid_env, mermaid_dropped = _filter_env_for_global_json(mermaid_env_raw)
+    mermaid_entry = {
+        "type": "stdio",
+        "command": venv_python_str,
+        "args": [
+            "-m",
+            "claude_mcp_servers.wrappers.mermaid_proxy",
+        ],
+        "env": mermaid_env,
+    }
+
     return [
         ("weaviate-kg", weaviate_entry, weaviate_dropped),
         ("search", search_entry, search_dropped),
+        ("mermaid", mermaid_entry, mermaid_dropped),
     ]
 
 

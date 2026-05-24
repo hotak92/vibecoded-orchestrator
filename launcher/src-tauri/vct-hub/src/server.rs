@@ -18,8 +18,8 @@ use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 
 use super::{
-    api, auth, cli_api, config_api, db, lifecycle_api, module_db_api, module_supervisor,
-    modules_api, project_state_api, weaviate_probe,
+    api, auth, cli_api, config_api, db, lifecycle_api, mcp_tool_grants_api, module_db_api,
+    module_supervisor, modules_api, project_state_api, weaviate_probe,
 };
 
 const DEFAULT_PORT: u16 = 7700;
@@ -120,6 +120,15 @@ pub async fn start_hub_server() -> Result<u16, String> {
         .nest(
             "/api/v1",
             cli_api::router().with_state(launcher_state.clone()),
+        )
+        // Phase 1.2: per-project MCP tool-grant resolver. Mounted
+        // INSIDE the hub-wide auth layer (the wrappers send the
+        // standard hub.token bearer). Read-only today; Phase 1.1
+        // sibling adds the write path via its own Tauri command
+        // (set_project_mcp_tool_enabled).
+        .nest(
+            "/api/v1",
+            mcp_tool_grants_api::router().with_state(launcher_state.clone()),
         )
         // v0.2.31: module-owned DB rows. Uses its OWN bearer-scope
         // middleware (require_module_scope) — token is the per-(module,

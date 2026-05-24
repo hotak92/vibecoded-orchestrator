@@ -433,9 +433,35 @@ pub fn build_default_mcp_entries(
         "env": serde_json::Value::Object(search_env_safe),
     });
 
+    // ── mermaid (Phase 1.2 — wrapper MCP) ───────────────────────────
+    // The wrapper proxies the npm `claude-mermaid` package and filters
+    // its tool surface per-project. Spawn command: `<venv-python> -m
+    // claude_mcp_servers.wrappers.mermaid_proxy`. NOT a direct `npx`
+    // invocation — the wrapper is the entry point; it spawns `npx` as
+    // its own child once it's resolved the per-project allowlist.
+    //
+    // Default-disabled per project (see `BUNDLED_MCP_DEFAULT_DISABLED`
+    // in vct-launcher-core/src/db/project_mcp_servers.rs). The user
+    // opts in via the launcher's DiagramsTab. Until opted in the entry
+    // sits in ~/.claude.json but the launcher's per-project gate keeps
+    // Claude Code from spawning it.
+    let mut mermaid_env = serde_json::Map::new();
+    mermaid_env.insert("PYTHONPATH".into(), pythonpath.clone().into());
+    let (mermaid_env_safe, mermaid_dropped) = filter_env_for_global_json(&mermaid_env);
+    let mermaid_entry = serde_json::json!({
+        "type": "stdio",
+        "command": venv_python_str.clone(),
+        "args": [
+            "-m",
+            "claude_mcp_servers.wrappers.mermaid_proxy",
+        ],
+        "env": serde_json::Value::Object(mermaid_env_safe),
+    });
+
     vec![
         ("weaviate-kg".to_string(), weaviate_entry, weaviate_dropped),
         ("search".to_string(), search_entry, search_dropped),
+        ("mermaid".to_string(), mermaid_entry, mermaid_dropped),
     ]
 }
 
@@ -941,7 +967,8 @@ mod tests {
         // Note: Ollama MCP was dropped from the default install in v0.2.11
         // (see install.py:_check_ollama_mcp_remnants); we explicitly do NOT
         // include it here. vct-coordination is Pro-tier and likewise excluded.
-        assert_eq!(names, vec!["weaviate-kg", "search"]);
+        // Phase 1.2 (diagrams plan): mermaid wrapper appended.
+        assert_eq!(names, vec!["weaviate-kg", "search", "mermaid"]);
 
         // ── weaviate-kg shape ────────────────────────────────────────
         let (_, weaviate, _) = &entries[0];
@@ -1001,16 +1028,34 @@ mod tests {
         .expect("register_default_orchestrator_mcps");
 
         assert!(report.all_succeeded(), "report.outcomes: {:?}", report.outcomes);
-        assert_eq!(report.success_count(), 2);
+        // Phase 1.2 (diagrams plan): mermaid wrapper added → 3 entries.
+        // Prior: weaviate-kg + search (2). The mermaid entry registers
+        // in ~/.claude.json but is default-DISABLED at the per-project
+        // gate (see BUNDLED_MCP_DEFAULT_DISABLED in vct-launcher-core).
+        assert_eq!(report.success_count(), 3);
 
         let raw = fs::read_to_string(&target).unwrap();
         let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert!(json["mcpServers"]["weaviate-kg"].is_object());
         assert!(json["mcpServers"]["search"].is_object());
+        assert!(
+            json["mcpServers"]["mermaid"].is_object(),
+            "mermaid wrapper MCP must be registered in ~/.claude.json"
+        );
         // ollama MCP must NOT be written (deprecated in v0.2.11).
         assert!(
             json["mcpServers"].get("ollama").is_none(),
             "Ollama MCP was dropped from default install in v0.2.11 and must NOT be auto-registered"
+        );
+        // Mermaid entry points at the wrapper module, NOT direct npx.
+        // The wrapper internally spawns `npx -y claude-mermaid@<pin>`.
+        let mermaid_args = json["mcpServers"]["mermaid"]["args"]
+            .as_array()
+            .expect("mermaid.args is an array");
+        assert_eq!(mermaid_args[0], "-m");
+        assert_eq!(
+            mermaid_args[1], "claude_mcp_servers.wrappers.mermaid_proxy",
+            "mermaid MCP must point at the wrapper module, not direct npx"
         );
 
         fs::remove_file(&target).ok();
