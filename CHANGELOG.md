@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.32] — 2026-05-24
+
+A **manifest-renderer + paid-module-v0.2.7-unblock** release. Closes 7 launcher items (L1–L7) requested by the RL chat's post-v0.2.6 GUI test, the two real-world update-detection bugs surfaced during v0.2.30→v0.2.31 dogfooding (UB1+UB2), the GUI-tour polish backlog (V1+V2+E1+E2+M1), and the v0.2.31-deferred License-dialog UI half (D1+D2).
+
+Generic primitives — chained_action, info_dynamic, date_picker, multi_select metadata+filter, per-section project picker — are NOT RL-specific. MAO and future paid modules adopt them with zero new launcher code.
+
+### Added
+
+- **`chained_action` ActionDescriptor variant** — generic chained-action primitive. Executes `steps[]` serially; each step's response is threaded into the next step's body via `{{previous_step.<field>}}` / `{{step.N.<field>}}` placeholders. Optional `polling` attaches to the FINAL step. `rollback_on_step_failure` reserved for v0.2.33+ (no effect today). Replaces what would have been per-module specialize Tauri commands — every future paid module gets multi-step actions for free.
+- **`info_dynamic` ConfigControl kind** (L4) — read-only display bound to a `module_db` source via Agent J's `module_db_read_row` Tauri command. `{{project_id}}` substitution in `source.key`; `format` template (`"{value}"` by default); `fallback` string when read returns null. Sections containing at least one `info_dynamic` render a `↻` refresh button next to the section title; clicking it re-fetches every dynamic control in the section.
+- **`date_picker` ConfigControl kind** (L5) — native HTML `<input type="date">` with optional min/max + keyword defaults (`"today"`, `"30_days_ago"`, `"90_days_ago"`). Persists via `set_module_setting`. Sibling controls can reference the value via `{{control:<id>}}`.
+- **`multi_select` per-option metadata + filter predicate** (L6) — `SelectOption` extends from `{value, label}` to `{value, label?, badge?, meta?}` (back-compat: bare-string lists `["a", "b"]` still parse via custom serde deserializer). New optional `filter: {kind: "match", meta_field, equals_runtime}` predicate hides options whose meta doesn't match a runtime-resolved value (e.g. `container.active_embedding`). Runtime resolution via new `module_get_runtime_value` Tauri command.
+- **Per-section project picker auto-wrap** (L3) — any `gui.config_tab` section whose controls reference `{{project_id}}` (in any action's path / body / next_action / chained_action.steps) automatically renders a section-local project picker above the controls. Overrides the global `selectedProject` store for dispatches originating from that section. Auto-injection (no manifest opt-in needed) so existing modules get this for free. Picker-driven project changes clear stale per-control state + re-fetch values + options for the newly-picked project.
+- **`{{embedding_source_from_project_kg_binding}}` placeholder** (L7) — client-side substitution at dispatch time, resolved via new `get_project_embedding_source(projectId)` Tauri command. Cached per project_id; lazy-loaded on first reference. Lets a manifest button dispatch to the right per-embedding-source endpoint without hardcoding `"qwen3"` / `"arctic"` / `"openai"`.
+- **`module_download_default_weights(module_id, project_id, embedding_source)` Tauri command** — the launcher-side half of the C1 download-flow decision (Option B confirmed). Calls Supabase `rl-latest-weights` with the launcher's tier JWT → downloads .pt to `<vct_root>/modules/<module_id>/weights/<embedding_source>-<version>.pt` → returns `{local_path, version}` so a chained_action can thread it into a follow-up `/finetune` POST. Keeps the license JWT out of paid-module containers. New `module_get_runtime_value(projectId, key)` companion for the L6 filter resolver.
+- **Per-module licenses section in License dialog** (D1) — surfaces `tier_cache.module_licenses` (data layer landed in v0.2.31 Agent B) as a UI list with per-row Refresh + Deactivate buttons. New Tauri commands `get_module_licenses`, `module_license_refresh`, `module_license_deactivate`. Empty state explains tier→entitlement semantics.
+
+### Fixed
+
+- **L1 — Modules tab showed `v0.1.1` instead of v0.2.6 for RL Reranker** + **L2 — "Activate License" button shown despite admin tier**. Both were the same single bug: `builtin_catalog_entries()` hardcoded a `vct-rl-reranker` placeholder with `version: "0.1.1"` + `is_licensed: false`, and `list_module_catalog`'s scan loop SKIPPED the on-disk manifest at `if out.iter().any(|e| e.id == manifest.id)`. Now the on-disk manifest WINS for catalog-display fields (version, name, description, hosts, license) via override + `is_module_licensed()` re-evaluation, while preserving the builtin's UX-only fields (kind, parent_id, cta_route). Three new regression tests pin the inversion. The v0.2.31 plan item #20 Fix #1 had promised this but Agent I shipped DB-migrations only.
+- **UB1 — `check_for_launcher_update` lost the update badge on transient network blips at boot**. `fetch_upstream`'s single-shot `git fetch --quiet vco_upstream` was never retried; a launch-time DNS hiccup or VPN coming-up race set `remote_ahead = false` until launcher restart. Replaced with `fetch_with_retry` backoff at 1s, 5s, 30s, 120s (~156s wall time on full failure). Soft-fail unchanged on final exhaustion. Cfg(test)-overridden delays (ms instead of s) keep tests sub-200ms. 4 new tests.
+- **UB2 — update badge never refreshed after initial mount**. Once `+page.svelte:onMount` ran on a fresh launcher, the badge state was frozen until next launcher restart. Moved the initial `orchestrator.checkStatus()` into root layout's `onMount` so it fires regardless of arrival route, + added hourly `setInterval` to re-check while the launcher stays open.
+- **V1+V2 (Modules page polish)** — search input alignment + redundant "Create a project first" / "No modules in catalog yet" empty-state collision (now picks the right one based on actual cause).
+- **E1 — `CdiDriftModal.svelte` bypassed the `$lib/tauri` wrapper** — imported `invoke` from `@tauri-apps/api/core` directly so browser-mode threw `TypeError: Cannot read properties of undefined`. Fixed to use the wrapper consistently with every other call site.
+- **E2 — `preferences/updates`'s `loadCached()` logged Tauri-missing as `error`** instead of `warn`. Now matches the consistency rule from other Tauri-aware surfaces.
+- **D2 — Activation modal's input placeholder `XXXX-XXXX-XXXX-XXXX` was misleading** (Lemon Squeezy keys are 32-hex UUID-shape; our own Supabase keys may differ). Replaced with neutral `"License key…"`.
+
+### Changed
+
+- **M1 — Inconsistent `<title>` tags across routes**. Added per-page `<svelte:head><title>…</title></svelte:head>` to 14 routes (audit / codegraph / coordination / glossary / hub / kg / mcp / modules / preferences / preferences/retrieval / projects / services / store / telemetry). Format: `"<Page Name> — VCT Launcher"`. Invisible inside Tauri windows; cleans up browser-mode debugging UX.
+- **Test counts**: launcher cargo lib **996 passed** (was 966; +30), vct-launcher-core **280 passed** (was 267; +13), vct-hub **178 passed** (unchanged), svelte-check **0 errors / 51 pre-existing warnings**.
+
 ## [0.2.31] — 2026-05-23
 
 A general-purpose **paid-module lifecycle release**: every step from licensed-discovery through install → update → uninstall is now declarative-manifest-driven and works for any module, not just RL Reranker. Plus several silent-bug closures surfaced by the v0.2.27–v0.2.30 sprint (broken `dismiss-deferral` subcommand, license cache never written, Windows PS1 missing, hardcoded "Upgrade to Pro" copy).
