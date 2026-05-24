@@ -24,6 +24,21 @@ Requirements:
 from __future__ import annotations
 
 # ---------------------------------------------------------------------------
+# Phase 0.B migration marker (2026-05-24): this file contains direct writes
+# to .claude/settings.json env block + .claude/env from the
+# `install-bundle --update` backfill helpers (e.g.
+# `_backfill_kg_collection_env_in_project`,
+# `_backfill_code_graph_project_env_in_project`). The new
+# `vco_lib.config_projection.apply_project_env` contract is the
+# eventual single writer; Phase 0.D will migrate these backfills to
+# subprocess into the contract's CLI. Until then this file is
+# allowlisted by the single-writer lint
+# (`tests/test_config_projection_single_writer.py`) via the
+# _LEGACY_PRODUCTION_WRITERS set + this marker comment:
+# config_projection: legacy_caller_pending_migration
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
 # Python version sentinel — runs BEFORE any other module imports.
 #
 # We hard-fail here (instead of letting a downstream import like `tomllib`
