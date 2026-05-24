@@ -1,0 +1,51 @@
+{
+  "id": "vct-rl-reranker",
+  "name": "RL Reranker",
+  "version": "0.2.7",
+  "description": "Reinforcement-learning reranker for Knowledge Graph retrieval. Per-text-embedding-source neural networks (qwen3 / arctic / openai) personalize on your local citation patterns. Ships pre-trained; auto-fine-tunes on your data after each weekly model refresh. Supports hot-swap, reset, finetune, and global-retrain endpoints so the launcher can drive model lifecycle without restarting the container. Code-graph reranking will ship as a separate future module (vct-code-reranker).",
+  "category": "paid-independent",
+  "tags": ["pro", "reranking", "reinforcement-learning"],
+  "homepage": "https://vibecodedtools.it/modules/rl-reranker",
+  "publisher": "VibeCoded Tools",
+
+  "license_required": true,
+  "min_orchestrator_tier": "pro",
+  "license_variant_ids": [],
+  "trial_days": 7,
+
+  "compatibility": {
+    "hosts": ["base", "mao", "orchestrator_root"],
+    "min_launcher_version": "0.2.33"
+  },
+
+  "install": {
+    "method": "container_pull",
+    "container": {
+      "image": "ghcr.io/hotak92/vct-rl-reranker",
+      "tag_from_version": true,
+      "registry": "ghcr.io",
+      "pull_token_endpoint": "https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/rl-pull-token",
+      "pull_token_method": "POST"
+    }
+  },
+  "requirements": {
+    "os": ["linux", "macos", "windows"],
+    "memory_mb": 2048,
+    "disk_mb": 1500,
+    "gpu": false
+  },
+  "runtime_hints": {
+    "gpu_image_variants": {
+      "cpu":  "{version}-cpu",
+      "cuda": "{version}-cuda",
+      "rocm": "{version}-rocm"
+    }
+  },
+
+  "deprecated": false,
+  "deprecation_message": "",
+  "deprecation_eol_date": "",
+  "deprecation_migration_url": "",
+
+  "post_install_manifest_path": "vct-module.json"
+}

@@ -30,6 +30,12 @@ pub mod lifecycle;
 pub mod licensing;
 pub mod maintenance;
 pub mod manifest;
+// v0.2.33 Agent A (L0): public-catalog endpoint client. Fetches paid-module
+// catalog metadata from the launcher-controlled Supabase edge function with
+// retry-with-backoff + 15min app_state-backed cache + schema_version
+// mismatch handling. Consumed by `list_module_catalog` (Agent B's L0a
+// refactor) and by the renderer's `↻` button via `refresh_module_catalog`.
+pub mod module_catalog_client;
 pub mod module_db;
 // v0.2.32 #D: explicit "download default RL weights" Tauri command +
 // runtime-value resolver for L6 MultiSelectFilter. Separate from

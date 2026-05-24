@@ -1061,6 +1061,13 @@ pub fn run() {
             commands::changes_cmd::current_change_seq,
             // Modules — catalog + install + lifecycle
             commands::modules::list_module_catalog,
+            // v0.2.33 Agent A (L0): force-refresh the paid-module catalog
+            // from the public Supabase edge function. Bypasses the 15min
+            // app_state cache used by `list_module_catalog`. Bound to the
+            // Modules-tab `↻` refresh button. Cache-poisoning protection
+            // (parse failures don't overwrite a previously-good cached
+            // value) is implemented inside `module_catalog_client`.
+            commands::module_catalog_client::refresh_module_catalog,
             commands::modules::install_module_for_project,
             // v0.2.31 #20-Fix-3: in-place update path (parallel to install).
             // Reads manifest.upgrade UpgradeBlock — runs pre_upgrade, re-fetches
