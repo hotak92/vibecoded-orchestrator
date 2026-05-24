@@ -55,6 +55,34 @@ pub struct TierCacheView {
     pub grace_period_remaining_ms: Option<i64>,
 }
 
+/// v0.2.32 §D1: row surface for the per-module license section in the
+/// orchestrator-license dialog (`ActivationModal.svelte`).
+///
+/// Backs `get_module_licenses` — flattens `tier_cache.module_licenses`
+/// (a `HashMap<module_id, JSON object>` persisted by `license_refresh`)
+/// into a stable struct the GUI can render row-by-row without parsing
+/// untyped JSON in TypeScript.
+///
+/// Field semantics, mirroring the wire contract documented in the
+/// v0.2.31 plan + the `license_refresh` parser:
+///   - `module_id`: the entry's key (e.g. `"vct-rl-reranker"`).
+///   - `display_name`: human-readable name, looked up from the catalog
+///     manifest (`vct-module.json`). Falls back to `module_id` when the
+///     catalog hasn't been populated or the module isn't installed.
+///   - `tier`: the per-module tier the server granted (e.g. `"pro"` /
+///     `"mao"`). `"unknown"` when the JSON entry is missing the field.
+///   - `activated_at`: optional ISO-8601 / display string. The wire
+///     contract is intentionally loose here — both string and numeric
+///     epoch forms are accepted and passed through; the UI renders
+///     them verbatim. `None` when the server didn't include it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ModuleLicenseRow {
+    pub module_id: String,
+    pub display_name: String,
+    pub tier: String,
+    pub activated_at: Option<String>,
+}
+
 fn to_view(row: TierCacheRow) -> TierCacheView {
     let now = chrono::Utc::now().timestamp_millis();
     let age = now - row.last_validated;
@@ -468,6 +496,173 @@ pub async fn license_deactivate(db: State<'_, Db>) -> Result<(), String> {
     // has explicitly deactivated. Soft-fail; logged on error.
     remove_license_cache_for_token_gateway();
     db.audit("license_deactivate", None, None, &serde_json::json!({}))?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// v0.2.32 §D1: per-module license surface for the ActivationModal dialog.
+// ---------------------------------------------------------------------------
+
+/// Pure parser: flatten a `tier_cache.module_licenses` JSON object into
+/// the row shape the GUI consumes. Kept separate from `get_module_licenses`
+/// so unit tests can pin the semantics without touching the DB.
+///
+/// `display_name_lookup` is a side-effect-free hook the production caller
+/// uses to look up a module's human-readable name from the catalog. In
+/// tests we pass an identity closure.
+///
+/// Wire contract reminders (see `license_refresh`):
+///   - `module_licenses` is always an object — `license_refresh` coerces
+///     malformed shapes (array/string/null) to `{}` before persisting.
+///   - Each entry's value is an object with at least `tier`; other
+///     fields (`expires_at`, `source`, `activated_at`, `license_key_id`,
+///     ...) are forward-compatible additions.
+///   - We accept both string and numeric `activated_at` for resilience
+///     against server-side encoding drift (epoch ms vs ISO-8601). The
+///     GUI just renders the resulting string.
+fn flatten_module_licenses<F>(licenses: &serde_json::Value, display_name_lookup: F) -> Vec<ModuleLicenseRow>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let map = match licenses.as_object() {
+        Some(m) => m,
+        // Defensive: license_refresh shouldn't ever persist a non-object
+        // here (it coerces to `{}`) but a hand-edited launcher.db could.
+        None => return Vec::new(),
+    };
+
+    let mut out: Vec<ModuleLicenseRow> = map
+        .iter()
+        .map(|(module_id, entry)| {
+            let tier = entry
+                .get("tier")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let activated_at = entry.get("activated_at").and_then(|v| {
+                if let Some(s) = v.as_str() {
+                    Some(s.to_string())
+                } else if let Some(n) = v.as_i64() {
+                    Some(n.to_string())
+                } else if let Some(f) = v.as_f64() {
+                    Some(f.to_string())
+                } else {
+                    None
+                }
+            });
+            let display_name = display_name_lookup(module_id).unwrap_or_else(|| module_id.clone());
+            ModuleLicenseRow {
+                module_id: module_id.clone(),
+                display_name,
+                tier,
+                activated_at,
+            }
+        })
+        .collect();
+
+    // Stable ordering for the GUI (HashMap iteration is non-deterministic).
+    out.sort_by(|a, b| a.module_id.cmp(&b.module_id));
+    out
+}
+
+/// Look up a module's display name by walking the same catalog the
+/// `/modules` GUI page uses. Returns `None` when no matching manifest
+/// exists (uninstalled / never-installed module, or catalog scan
+/// returns nothing) — the caller falls back to the module id.
+///
+/// Soft-fail: every IO error is swallowed and treated as "no match"
+/// — the worst case is the GUI shows the bare module id, never a panic.
+fn lookup_module_display_name(db: &Db, module_id: &str) -> Option<String> {
+    crate::commands::modules::find_manifest_for_resume(db, module_id).map(|m| m.name)
+}
+
+/// v0.2.32 §D1: row-oriented read of `tier_cache.module_licenses` for
+/// the orchestrator-license dialog. Backed by the existing `tier_cache`
+/// SQLite row — no new persistence layer, no new wire contract.
+///
+/// Empty response = no per-module entitlements (either because no key
+/// is activated, or because the orchestrator tier alone covers every
+/// licensed module the user has). The dialog renders a friendly empty
+/// state in that case (see ActivationModal.svelte).
+#[command]
+pub async fn get_module_licenses(db: State<'_, Db>) -> Result<Vec<ModuleLicenseRow>, String> {
+    let row = db.get_tier_cache()?;
+    let db_ref: &Db = &db;
+    Ok(flatten_module_licenses(&row.module_licenses, |id| {
+        lookup_module_display_name(db_ref, id)
+    }))
+}
+
+/// v0.2.32 §D1: refresh a single per-module license entry.
+///
+/// SOFT-STUB: `validate-tier` currently returns the entire
+/// `module_licenses` map in one shot — there's no per-module refresh
+/// endpoint yet. We therefore route through `license_refresh` (which
+/// re-queries the full tier + per-module map) and return the resulting
+/// row for `module_id`. A future server-side per-module refresh
+/// endpoint can replace this body without changing the Tauri surface.
+///
+/// Returns `None` when the requested module is absent from the
+/// refreshed cache — the GUI uses this to surface a "module no longer
+/// in your tier" message rather than an error.
+#[command]
+pub async fn module_license_refresh(
+    module_id: String,
+    db: State<'_, Db>,
+) -> Result<Option<ModuleLicenseRow>, String> {
+    // Audit FIRST so the user has a trail even if the network call hangs.
+    db.audit(
+        "module_license_refresh",
+        None,
+        None,
+        &serde_json::json!({ "module_id": module_id }),
+    )?;
+    // Full cache refresh — same wire call the orchestrator-tier Refresh
+    // button uses. Soft-fail: if the refresh errors (network, 5xx, ...),
+    // we still return the currently-cached row.
+    let _ = license_refresh(db.clone()).await;
+    let row = db.get_tier_cache()?;
+    let db_ref: &Db = &db;
+    let rows = flatten_module_licenses(&row.module_licenses, |id| {
+        lookup_module_display_name(db_ref, id)
+    });
+    Ok(rows.into_iter().find(|r| r.module_id == module_id))
+}
+
+/// v0.2.32 §D1: deactivate a single per-module license entry.
+///
+/// SOFT-STUB: server-side per-module deactivation isn't shipped yet
+/// (the v0.2.32 plan defers that to a later release). For now we clear
+/// the entry from the LOCAL `tier_cache.module_licenses` map so the
+/// dialog reflects the user's intent — the next `license_refresh` will
+/// re-fetch the server-side state and re-add the entry if the server
+/// still thinks the module is entitled. That's the right behaviour
+/// for a UX-only deactivation: visible immediately, not authoritative.
+///
+/// Note: this does NOT clear the orchestrator-tier cache or the
+/// `~/.vibecoded/license_cache.json` token-gateway file. Those gate
+/// orchestrator-level access; per-module entries are advisory.
+#[command]
+pub async fn module_license_deactivate(
+    module_id: String,
+    db: State<'_, Db>,
+) -> Result<(), String> {
+    let row = db.get_tier_cache()?;
+    // Build the new module_licenses map without the requested entry.
+    let mut map = row
+        .module_licenses
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    let removed = map.remove(&module_id).is_some();
+    let new_value = serde_json::Value::Object(map);
+    db.set_tier_cache(&row.orchestrator_tier, &new_value, row.last_error.as_deref())?;
+    db.audit(
+        "module_license_deactivate",
+        None,
+        None,
+        &serde_json::json!({ "module_id": module_id, "removed": removed }),
+    )?;
     Ok(())
 }
 
@@ -901,5 +1096,169 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    // -----------------------------------------------------------------
+    // v0.2.32 §D1: per-module license row surface.
+    //
+    // We exercise the pure parser (`flatten_module_licenses`) directly
+    // with hand-rolled JSON so the tests pin the semantic contract
+    // without depending on the HTTP loop or a live tier cache. The
+    // full command path (`get_module_licenses` Tauri call → DB →
+    // catalog lookup) is integration-tested at the launcher level.
+    // -----------------------------------------------------------------
+
+    /// Identity lookup: passes the module id through unchanged. Used by
+    /// the tests to assert the fallback display-name path.
+    fn no_catalog_lookup(_id: &str) -> Option<String> {
+        None
+    }
+
+    /// Empty `tier_cache.module_licenses` (the common case for a fresh
+    /// install + the `valid:false` branch of `license_refresh`) → empty
+    /// row list. The GUI uses this to render the friendly empty state.
+    #[test]
+    fn get_module_licenses_returns_empty_when_tier_cache_has_no_modules() {
+        let licenses = serde_json::json!({});
+        let rows = flatten_module_licenses(&licenses, no_catalog_lookup);
+        assert!(rows.is_empty(), "empty map must yield zero rows");
+    }
+
+    /// A populated `module_licenses` map parses every entry's `tier` +
+    /// `activated_at`, falls back to the module id for the display
+    /// name when the catalog lookup returns None, and sorts rows
+    /// alphabetically by module id for deterministic GUI ordering.
+    #[test]
+    fn get_module_licenses_parses_entries_with_tier_and_activated_at() {
+        let licenses = serde_json::json!({
+            "vct-rl-reranker": {
+                "tier": "pro",
+                "activated_at": "2026-05-18T12:00:00Z",
+                "source": "tier-bundled"
+            },
+            "vct-extra-module": {
+                "tier": "mao",
+                "activated_at": 1_700_000_000_i64
+            }
+        });
+        let rows = flatten_module_licenses(&licenses, no_catalog_lookup);
+
+        assert_eq!(rows.len(), 2, "must produce one row per entry");
+        // Stable sort: extra-module sorts before rl-reranker alphabetically.
+        assert_eq!(rows[0].module_id, "vct-extra-module");
+        assert_eq!(rows[0].tier, "mao");
+        assert_eq!(
+            rows[0].activated_at.as_deref(),
+            Some("1700000000"),
+            "numeric activated_at must round-trip as a string"
+        );
+        // Display name falls back to module id when catalog lookup returns None.
+        assert_eq!(rows[0].display_name, "vct-extra-module");
+
+        assert_eq!(rows[1].module_id, "vct-rl-reranker");
+        assert_eq!(rows[1].tier, "pro");
+        assert_eq!(
+            rows[1].activated_at.as_deref(),
+            Some("2026-05-18T12:00:00Z")
+        );
+    }
+
+    /// A catalog hit returns the human-readable display name instead of
+    /// the bare module id — pinning the fallback contract.
+    #[test]
+    fn get_module_licenses_uses_catalog_display_name_when_available() {
+        let licenses = serde_json::json!({
+            "vct-rl-reranker": { "tier": "pro" }
+        });
+        let rows = flatten_module_licenses(&licenses, |id| {
+            if id == "vct-rl-reranker" {
+                Some("RL Reranker".to_string())
+            } else {
+                None
+            }
+        });
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].display_name, "RL Reranker");
+        assert_eq!(rows[0].module_id, "vct-rl-reranker");
+    }
+
+    /// Missing `tier` field → "unknown" (defensive: keeps the GUI from
+    /// blowing up on a malformed server response). Missing
+    /// `activated_at` → None (renders as no activation date).
+    #[test]
+    fn get_module_licenses_handles_missing_fields() {
+        let licenses = serde_json::json!({
+            "vct-x": {}
+        });
+        let rows = flatten_module_licenses(&licenses, no_catalog_lookup);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tier, "unknown");
+        assert!(rows[0].activated_at.is_none());
+    }
+
+    /// A non-object `module_licenses` JSON value (defensive guard
+    /// against hand-edited `launcher.db` rows) yields an empty list
+    /// rather than panicking.
+    #[test]
+    fn get_module_licenses_rejects_non_object_root() {
+        let licenses = serde_json::json!(["this", "should", "not", "happen"]);
+        let rows = flatten_module_licenses(&licenses, no_catalog_lookup);
+        assert!(rows.is_empty());
+    }
+
+    /// End-to-end DB path: seed `tier_cache.module_licenses`, call the
+    /// `get_module_licenses` analogue against an in-memory Db, and
+    /// confirm the rows match. Uses `flatten_module_licenses` directly
+    /// since we can't invoke a Tauri `#[command]` from a unit test
+    /// (would need a full AppHandle).
+    #[tokio::test]
+    async fn module_licenses_round_trip_through_tier_cache() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        let seeded = serde_json::json!({
+            "vct-rl-reranker": { "tier": "pro", "activated_at": "2026-05-18T12:00:00Z" }
+        });
+        db.set_tier_cache("pro", &seeded, None).unwrap();
+
+        let row = db.get_tier_cache().unwrap();
+        let rows = flatten_module_licenses(&row.module_licenses, no_catalog_lookup);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].module_id, "vct-rl-reranker");
+        assert_eq!(rows[0].tier, "pro");
+    }
+
+    /// `module_license_deactivate` clears the entry from the local
+    /// `tier_cache.module_licenses` map. Orchestrator tier is preserved.
+    /// Idempotent: a second call on the now-removed entry is a no-op
+    /// (audit row records `removed: false`).
+    #[tokio::test]
+    async fn module_license_deactivate_clears_local_entry_only() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        let seeded = serde_json::json!({
+            "vct-rl-reranker": { "tier": "pro" },
+            "vct-other": { "tier": "pro" }
+        });
+        db.set_tier_cache("pro", &seeded, None).unwrap();
+
+        // Inline the body of module_license_deactivate (the #[command]
+        // wrapper isn't directly callable without a full AppHandle).
+        let row = db.get_tier_cache().unwrap();
+        let mut map = row
+            .module_licenses
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        let removed = map.remove("vct-rl-reranker").is_some();
+        assert!(removed, "precondition: entry was present");
+        let new_value = serde_json::Value::Object(map);
+        db.set_tier_cache(&row.orchestrator_tier, &new_value, row.last_error.as_deref())
+            .unwrap();
+
+        // Orchestrator tier is preserved.
+        let after = db.get_tier_cache().unwrap();
+        assert_eq!(after.orchestrator_tier, "pro");
+        // The targeted entry is gone but the other entry survives.
+        let after_map = after.module_licenses.as_object().unwrap();
+        assert!(!after_map.contains_key("vct-rl-reranker"));
+        assert!(after_map.contains_key("vct-other"));
     }
 }

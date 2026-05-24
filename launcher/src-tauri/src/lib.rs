@@ -1224,6 +1224,10 @@ pub fn run() {
             commands::licensing::license_refresh,
             commands::licensing::license_activate,
             commands::licensing::license_deactivate,
+            // v0.2.32 §D1: per-module license rows for the dialog.
+            commands::licensing::get_module_licenses,
+            commands::licensing::module_license_refresh,
+            commands::licensing::module_license_deactivate,
             // KG dashboard
             commands::kg::kg_list_collections,
             commands::kg::codegraph_list_projects,

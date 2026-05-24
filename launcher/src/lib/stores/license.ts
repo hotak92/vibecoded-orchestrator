@@ -12,10 +12,15 @@
 
 import { writable } from 'svelte/store';
 import { invoke, tauriAvailable } from '$lib/tauri';
-import type { TierCacheView } from '$lib/types/launcher';
+import type { ModuleLicenseRow, TierCacheView } from '$lib/types/launcher';
 
 interface LicenseState {
   cache: TierCacheView | null;
+  /** v0.2.32 §D1: per-module license rows for the dialog's new section.
+   *  Loaded alongside `cache` by every load/refresh/activate/deactivate
+   *  cycle. Empty when no per-module entries are active — the dialog
+   *  renders a friendly empty state in that case. */
+  moduleLicenses: ModuleLicenseRow[];
   loading: boolean;
   activating: boolean;
   error: string | null;
@@ -23,10 +28,29 @@ interface LicenseState {
 
 const initial: LicenseState = {
   cache: null,
+  moduleLicenses: [],
   loading: false,
   activating: false,
   error: null,
 };
+
+/** Soft-fail per-module license fetch.
+ *
+ *  v0.2.32: the rest of the dialog must keep working even if the new
+ *  `get_module_licenses` Tauri command isn't yet registered (older
+ *  launcher binaries shipped without it). Errors are swallowed and
+ *  treated as "no per-module entries" rather than propagated to the
+ *  user — this is purely additive UX. */
+async function fetchModuleLicensesSafe(): Promise<ModuleLicenseRow[]> {
+  if (!tauriAvailable()) return [];
+  try {
+    return await invoke<ModuleLicenseRow[]>('get_module_licenses');
+  } catch (e) {
+    // Log once at debug level — not a user-visible error.
+    console.debug('[license] get_module_licenses unavailable:', e);
+    return [];
+  }
+}
 
 function createLicenseStore() {
   const { subscribe, update } = writable<LicenseState>(initial);
@@ -39,7 +63,8 @@ function createLicenseStore() {
       update((s) => ({ ...s, loading: true, error: null }));
       try {
         const cache = await invoke<TierCacheView>('license_get_tier');
-        update((s) => ({ ...s, cache, loading: false }));
+        const moduleLicenses = await fetchModuleLicensesSafe();
+        update((s) => ({ ...s, cache, moduleLicenses, loading: false }));
       } catch (e) {
         update((s) => ({
           ...s,
@@ -54,7 +79,57 @@ function createLicenseStore() {
       update((s) => ({ ...s, loading: true, error: null }));
       try {
         const cache = await invoke<TierCacheView>('license_refresh');
-        update((s) => ({ ...s, cache, loading: false }));
+        const moduleLicenses = await fetchModuleLicensesSafe();
+        update((s) => ({ ...s, cache, moduleLicenses, loading: false }));
+      } catch (e) {
+        update((s) => ({
+          ...s,
+          loading: false,
+          error: e instanceof Error ? e.message : String(e),
+        }));
+      }
+    },
+
+    /** v0.2.32 §D1: refresh a single per-module license entry.
+     *
+     *  Soft-stub: routes through the full `license_refresh` server-side
+     *  call (the validate-tier edge function returns the entire
+     *  module_licenses map in one shot — no per-module endpoint exists
+     *  yet). Reloads the whole row list on success. */
+    async refreshModule(moduleId: string): Promise<void> {
+      if (!tauriAvailable()) return;
+      update((s) => ({ ...s, loading: true, error: null }));
+      try {
+        await invoke<ModuleLicenseRow | null>('module_license_refresh', { moduleId });
+        // Reload both the orchestrator tier (since the full refresh may
+        // have changed it) and the module rows.
+        const cache = await invoke<TierCacheView>('license_get_tier');
+        const moduleLicenses = await fetchModuleLicensesSafe();
+        update((s) => ({ ...s, cache, moduleLicenses, loading: false }));
+      } catch (e) {
+        update((s) => ({
+          ...s,
+          loading: false,
+          error: e instanceof Error ? e.message : String(e),
+        }));
+      }
+    },
+
+    /** v0.2.32 §D1: deactivate a single per-module license entry.
+     *
+     *  Soft-stub: clears the LOCAL `tier_cache.module_licenses` entry
+     *  only — server-side per-module deactivation isn't shipped yet, so
+     *  the next full `refresh()` may re-add the entry if the server
+     *  still thinks the module is entitled. That's the right behaviour
+     *  for a UX-only deactivation. */
+    async deactivateModule(moduleId: string): Promise<void> {
+      if (!tauriAvailable()) return;
+      update((s) => ({ ...s, loading: true, error: null }));
+      try {
+        await invoke<void>('module_license_deactivate', { moduleId });
+        const cache = await invoke<TierCacheView>('license_get_tier');
+        const moduleLicenses = await fetchModuleLicensesSafe();
+        update((s) => ({ ...s, cache, moduleLicenses, loading: false }));
       } catch (e) {
         update((s) => ({
           ...s,
@@ -78,7 +153,8 @@ function createLicenseStore() {
         const cache = await invoke<TierCacheView>('license_activate', {
           licenseKey: trimmed,
         });
-        update((s) => ({ ...s, cache, activating: false }));
+        const moduleLicenses = await fetchModuleLicensesSafe();
+        update((s) => ({ ...s, cache, moduleLicenses, activating: false }));
         // Surface backend-reported errors even on a successful round-trip
         // (e.g. tier="free" + last_error="invalid key").
         if (cache.last_error && cache.orchestrator_tier === 'free') {
@@ -102,7 +178,8 @@ function createLicenseStore() {
       try {
         await invoke<void>('license_deactivate');
         const cache = await invoke<TierCacheView>('license_get_tier');
-        update((s) => ({ ...s, cache, loading: false }));
+        const moduleLicenses = await fetchModuleLicensesSafe();
+        update((s) => ({ ...s, cache, moduleLicenses, loading: false }));
       } catch (e) {
         update((s) => ({
           ...s,

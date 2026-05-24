@@ -26,6 +26,8 @@
   const cache = $derived<TierCacheView | null>(viewState.cache);
   const tier = $derived(cache?.orchestrator_tier ?? 'free');
   const hasLicense = $derived(tier !== 'free');
+  // v0.2.32 §D1: per-module license rows for the new section.
+  const moduleLicenses = $derived(viewState.moduleLicenses ?? []);
 
   onMount(() => {
     license.load();
@@ -44,6 +46,15 @@
   async function handleDeactivate() {
     await license.deactivate();
     confirmingDeactivate = false;
+  }
+
+  // v0.2.32 §D1: per-module refresh / deactivate handlers.
+  async function refreshModule(moduleId: string) {
+    await license.refreshModule(moduleId);
+  }
+
+  async function deactivateModule(moduleId: string) {
+    await license.deactivateModule(moduleId);
   }
 
   function handleClose() {
@@ -116,7 +127,7 @@
             <input
               type="text"
               bind:value={code}
-              placeholder="XXXX-XXXX-XXXX-XXXX"
+              placeholder="License key…"
               class="activate-input"
               onkeydown={(e) => { if (e.key === 'Enter') handleActivate(); }}
             />
@@ -162,6 +173,54 @@
         {#if viewState.error}
           <div class="msg msg-error">{viewState.error}</div>
         {/if}
+
+        <!-- v0.2.32 §D1: Per-module licenses section.
+             Always rendered (with empty state) so users understand the
+             distinction between orchestrator-tier coverage vs per-module
+             overrides. Empty state copy ships even when no modules are
+             active so a first-time user has the explanation handy. -->
+        <section class="per-module-licenses">
+          <h3>Per-module licenses</h3>
+          {#if moduleLicenses.length === 0}
+            <p class="empty">
+              No per-module licenses active yet. Modules with Pro/MAO/Enterprise
+              tier are unlocked by your orchestrator tier; this list shows
+              individual module overrides.
+            </p>
+          {:else}
+            <ul class="module-rows">
+              {#each moduleLicenses as row (row.module_id)}
+                <li class="module-row">
+                  <div class="module-row-main">
+                    <strong class="module-name">{row.display_name}</strong>
+                    <span class="tier-badge">{row.tier}</span>
+                  </div>
+                  {#if row.activated_at}
+                    <span class="activated-at mono">
+                      Activated: {row.activated_at}
+                    </span>
+                  {/if}
+                  <div class="module-row-actions">
+                    <button
+                      class="btn-3d btn-3d-ghost btn-3d-sm"
+                      onclick={() => refreshModule(row.module_id)}
+                      disabled={viewState.loading}
+                    >
+                      Refresh
+                    </button>
+                    <button
+                      class="btn-3d btn-3d-ghost btn-3d-sm danger"
+                      onclick={() => deactivateModule(row.module_id)}
+                      disabled={viewState.loading}
+                    >
+                      Deactivate
+                    </button>
+                  </div>
+                </li>
+              {/each}
+            </ul>
+          {/if}
+        </section>
   {/snippet}
 </DialogRoot>
 
@@ -314,5 +373,80 @@
 
   @keyframes spin {
     to { transform: rotate(360deg); }
+  }
+
+  /* v0.2.32 §D1: per-module licenses section. */
+  .per-module-licenses {
+    margin-top: 22px;
+    padding-top: 18px;
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+  }
+
+  .per-module-licenses h3 {
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--color-text);
+    margin-bottom: 10px;
+  }
+
+  .per-module-licenses .empty {
+    font-size: 12px;
+    color: var(--color-mid);
+    line-height: 1.5;
+    margin: 0;
+  }
+
+  .module-rows {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .module-row {
+    padding: 12px 14px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .module-row-main {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+
+  .module-name {
+    font-size: 13px;
+    color: var(--color-text);
+  }
+
+  .tier-badge {
+    display: inline-block;
+    padding: 2px 8px;
+    background: rgba(0, 191, 166, 0.12);
+    border: 1px solid rgba(0, 191, 166, 0.3);
+    border-radius: 6px;
+    font-size: 11px;
+    color: var(--color-text);
+    text-transform: capitalize;
+    font-weight: 600;
+  }
+
+  .activated-at {
+    font-size: 11px;
+    color: var(--color-mid);
+  }
+
+  .module-row-actions {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
   }
 </style>

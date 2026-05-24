@@ -216,6 +216,31 @@ export interface TierCacheView {
   grace_period_remaining_ms: number | null;
 }
 
+/**
+ * v0.2.32 §D1: row surface for the per-module license section in the
+ * orchestrator-license dialog (`ActivationModal.svelte`).
+ *
+ * Backed by the `get_module_licenses` Tauri command, which flattens
+ * `tier_cache.module_licenses` into rows. Mirrors
+ * `launcher/src-tauri/src/commands/licensing.rs::ModuleLicenseRow`.
+ *
+ * Field semantics:
+ *   - `module_id`: stable wire id (e.g. `"vct-rl-reranker"`).
+ *   - `display_name`: human-readable name from `vct-module.json`; falls
+ *     back to `module_id` when no catalog manifest is available.
+ *   - `tier`: per-module tier the server granted (`"pro"` / `"mao"` /
+ *     etc.). `"unknown"` when the server response was missing the field.
+ *   - `activated_at`: optional activation timestamp. Server may send
+ *     either ISO-8601 or numeric epoch — backend pre-stringifies both
+ *     so the UI renders verbatim.
+ */
+export interface ModuleLicenseRow {
+  module_id: string;
+  display_name: string;
+  tier: string;
+  activated_at: string | null;
+}
+
 export interface ModuleCatalogEntry {
   id: string;
   name: string;
