@@ -14,6 +14,11 @@ pub mod codegraph_reanalyze;
 pub mod coordination;
 pub mod dashboard;
 pub mod desktop_shortcut;
+// Phase 1.1 of the diagrams (Mermaid + Excalidraw) integration plan
+// (.claude/context/plans/diagrams-integration-excalidraw-mermaid-2026-05-24.md).
+// Sibling Phase 1.2/1.3/1.5 agents stub these command names — keep
+// stable; the merge wires their tabs/wrappers against these.
+pub mod diagrams_cmd;
 pub mod embedding_catalog;
 pub mod embedding_enrichment;
 // v0.2.24 §A0 (2026-05-22): per-path 3-way merge for known
