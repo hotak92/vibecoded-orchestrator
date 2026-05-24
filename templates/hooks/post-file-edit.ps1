@@ -109,6 +109,89 @@ if ($EditedFile.StartsWith($DocsDir, [StringComparison]::OrdinalIgnoreCase) -and
     }
 }
 
+# 2b. Auto-index diagrams (Phase 1.5 — Mermaid + Excalidraw). Mirror of
+# the .sh sibling's same-numbered branch. 60s per-file throttle, skips
+# sidecar .meta.json writes (would infinite-loop), notifies vct-hub for
+# UI refresh (404 silently swallowed until Phase 1.2 broadcast route).
+$DiagramsDir = Join-Path $ProjectRoot ".claude/diagrams"
+if ($EditedFile.StartsWith($DiagramsDir, [StringComparison]::OrdinalIgnoreCase) `
+    -and ($EditedFile -notlike "*.meta.json") `
+    -and (($EditedFile -like "*.mmd") -or ($EditedFile -like "*.excalidraw"))) {
+
+    $throttleDir = Join-Path $ProjectRoot ".claude/state"
+    if (-not (Test-Path $throttleDir)) {
+        New-Item -ItemType Directory -Path $throttleDir -Force | Out-Null
+    }
+
+    # MD5 hash of file path → throttle key (no slashes).
+    $md5 = [System.Security.Cryptography.MD5]::Create()
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($EditedFile)
+        $digest = $md5.ComputeHash($bytes)
+        $diagramHash = -join ($digest | ForEach-Object { $_.ToString('x2') })
+    } finally {
+        $md5.Dispose()
+    }
+    $throttleFile = Join-Path $throttleDir "diagram_idx_${diagramHash}.ts"
+
+    $nowTs = [int][double]::Parse(((Get-Date) - (Get-Date "1970-01-01Z")).TotalSeconds)
+    $lastTs = 0
+    if (Test-Path $throttleFile) {
+        try {
+            $raw = (Get-Content $throttleFile -Raw -ErrorAction Stop).Trim()
+            if ($raw -match '^[0-9]+$') { $lastTs = [int]$raw }
+        } catch { $lastTs = 0 }
+    }
+
+    if (($nowTs - $lastTs) -ge 60) {
+        Set-Content -Path $throttleFile -Value $nowTs -Encoding ascii -ErrorAction SilentlyContinue
+
+        # Resolve venv-Python — same chain as the docs branch above.
+        $venvBase = if ($env:VCT_INSTALL_ROOT) { $env:VCT_INSTALL_ROOT } else { $ProjectRoot }
+        $diagVenv = ""
+        foreach ($cand in @(
+            (Join-Path $venvBase ".venv/Scripts/python.exe"),
+            (Join-Path $venvBase ".venv/bin/python"),
+            (Join-Path $venvBase "claude_mcp_servers/.venv/Scripts/python.exe"),
+            (Join-Path $venvBase "claude_mcp_servers/.venv/bin/python")
+        )) {
+            if (Test-Path $cand) { $diagVenv = $cand; break }
+        }
+        if (-not $diagVenv) {
+            $diagVenv = (Get-Command python -ErrorAction SilentlyContinue).Source
+        }
+
+        if ($diagVenv) {
+            # Background index — never block the hook on Weaviate slowness.
+            Start-Process -FilePath $diagVenv `
+                -ArgumentList @('-m', 'vco_lib.diagram_indexer', 'index', $EditedFile) `
+                -WorkingDirectory $ProjectRoot -WindowStyle Hidden | Out-Null
+        }
+
+        # vct-hub notification (best-effort, 404 silent until Phase 1.2).
+        $hubPort = if ($env:VCT_HUB_PORT) { $env:VCT_HUB_PORT } else { "7700" }
+        $hubTokenFile = Join-Path (if ($env:VCT_STATE_DIR) { $env:VCT_STATE_DIR } else { Join-Path $HOME ".vct" }) "hub.token"
+        $hubToken = ""
+        if ($env:VCT_HUB_TOKEN) {
+            $hubToken = $env:VCT_HUB_TOKEN
+        } elseif (Test-Path $hubTokenFile) {
+            try { $hubToken = (Get-Content $hubTokenFile -Raw -ErrorAction Stop).Trim() } catch { $hubToken = "" }
+        }
+        if ($hubToken) {
+            $body = @{ file_path = $EditedFile; change = "edit" } | ConvertTo-Json -Compress
+            try {
+                Invoke-RestMethod -Method POST `
+                    -Uri "http://127.0.0.1:${hubPort}/api/v1/notify/diagram-changed" `
+                    -Headers @{ Authorization = "Bearer $hubToken" } `
+                    -ContentType "application/json" `
+                    -Body $body -TimeoutSec 2 -ErrorAction SilentlyContinue | Out-Null
+            } catch {
+                # 404 / hub down — silent best-effort
+            }
+        }
+    }
+}
+
 # 3. Code file changes: code graph incremental update + LLM nudge.
 # v0.2.21 Step 18 (caller migration): resolve the code-graph collection
 # prefix via the launcher's vct-hub first (`vct_project_config.ps1 -Field

@@ -380,6 +380,12 @@ def test_no_uncovered_pretooluse_hooks() -> None:
         # correctness is the lean-ctx upstream project's responsibility.
         "lean-ctx-rewrite.sh",
         "lean-ctx-rewrite.ps1",
+        # Phase 1.5 diagrams path guard: rejects malformed diagram paths
+        # with exit 2 + stderr corrective message (handed to Claude via
+        # the blocked-tool feedback path). Exit 0 is silent (no LLM-bound
+        # stdout). Same envelope-exempt shape as pre-vercel-token-guard.
+        "pre-diagram-path-validation.sh",
+        "pre-diagram-path-validation.ps1",
     }
 
     registered = _read_settings_template_pretooluse_hooks()

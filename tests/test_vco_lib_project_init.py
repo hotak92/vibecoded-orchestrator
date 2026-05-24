@@ -91,6 +91,11 @@ class DeriveProjectCollectionNamesTests(unittest.TestCase):
             {
                 "kg_collection": "VideoFrames_KnowledgeGraph",
                 "development_collection": "VideoFrames_Development",
+                # Phase 1.5 (Diagrams Integration, 2026-05-24): the
+                # per-project diagrams collection is auto-paired with
+                # the KG collection on derive. Same `<basename>_Diagrams`
+                # convention as `_Development` / `_KnowledgeGraph`.
+                "diagrams_collection": "VideoFrames_Diagrams",
                 "project_name": "VideoFrames",
                 # Canonical shared-KG name. v0.2.23 B1 (2026-05-21):
                 # casing flipped to capital-C "VibeCoded" to match the
