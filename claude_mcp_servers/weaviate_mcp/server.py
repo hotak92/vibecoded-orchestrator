@@ -1163,6 +1163,30 @@ DEVELOPMENT_COLLECTION = _config_field(
     "development_collection", "DEVELOPMENT_COLLECTION", ""
 )
 
+# Phase 1.5.C (diagrams): per-project diagrams collection. When set,
+# hybrid_search auto-includes it so Claude can discover Mermaid /
+# Excalidraw diagrams alongside KG and Development docs without learning
+# a new tool. Results from this collection carry ``result_kind="diagram"``
+# (see ``_format_obj``) so the launcher / Claude can route the click
+# target appropriately (open in DiagramsTab, not as a .md file).
+#
+# Canonical convention (mirrors KG_COLLECTION + DEVELOPMENT_COLLECTION):
+# ``<Basename>_Diagrams``. The launcher's per-project Identity tab will
+# project this into ``.claude/settings.json`` ``env``. Unset → diagrams
+# are silently skipped (zero crash, zero log noise), which is the
+# correct behaviour for projects that don't use the diagrams module.
+#
+# Resolved via vct-hub when reachable (post Phase 1.5.A wiring), with
+# env-fallback to the empty string. ``empty_means_unset=True`` so a
+# stale empty env value doesn't poison ``hybrid_search`` (same
+# defensive coerce as KG_COLLECTION — see v0.2.27 fix).
+DIAGRAMS_COLLECTION = _config_field(
+    "diagrams_collection",
+    "DIAGRAMS_COLLECTION",
+    "",
+    empty_means_unset=True,
+)
+
 
 # ─── v0.2.27: Resolution-source tracking + startup logging ──────────────
 #
@@ -1347,13 +1371,106 @@ def _kg_peer_collections() -> list[str]:
     return out
 
 
-def _kg_collections_to_search(include_dev: bool = False) -> list[str]:
+def _diagrams_peer_collections() -> list[str]:
+    """Return the list of peer-project diagrams-collection names this
+    process should also search (Phase 1.5.C).
+
+    Source-of-truth: ``VCT_DIAGRAMS_ACCESS_LIST`` env var (CSV of peer
+    project names, sanitized to the collection-prefix shape). The
+    diagrams access matrix is conceptually parallel to the KG access
+    matrix (the plan's §1 calls these "the same access surface"); for
+    Phase 1.5.C we fall back to ``VCT_KG_ACCESS_LIST`` when the
+    diagrams-specific var is unset so users on existing installs get
+    consistent cross-project visibility without having to set a second
+    env var.
+
+    Phase 4 follow-up: split into independent ``diagram_access`` /
+    ``kg_collection_access`` SQLite tables behind the launcher. For
+    Phase 1.5.C the env-fallback is documented (see plan §1.5.3 / "for
+    Phase 1.5.C: same value as VCT_KG_ACCESS_LIST since diagram_access
+    and kg_collection_access tables are conceptually parallel — treat
+    them as one access surface for now").
+    """
+    # Hub-first path: if the hub exposes ``diagrams_access_list``, use
+    # it. Falls back to env CSV otherwise.
+    _cfg = _try_resolve_project_config()
+    if _cfg is not None:
+        try:
+            hub_list = list(getattr(_cfg, "diagrams_access_list", []) or [])
+        except Exception:
+            hub_list = []
+        if hub_list:
+            out: list[str] = []
+            seen: set[str] = set()
+            for coll in hub_list:
+                if not coll or not isinstance(coll, str):
+                    continue
+                if coll == DIAGRAMS_COLLECTION:
+                    continue
+                if coll in seen:
+                    continue
+                seen.add(coll)
+                out.append(coll)
+            return out
+
+    # Env path. Prefer the diagrams-specific var; fall back to the KG
+    # access list (per the Phase 1.5.C simplification).
+    peers = _parse_csv_env("VCT_DIAGRAMS_ACCESS_LIST") or _parse_csv_env(
+        "VCT_KG_ACCESS_LIST"
+    )
+    out: list[str] = []
+    seen: set[str] = set()
+    for p in peers:
+        prefix = _sanitize_collection_prefix(p)
+        if not prefix:
+            continue
+        coll = f"{prefix}_Diagrams"
+        if coll in seen:
+            continue
+        if coll == DIAGRAMS_COLLECTION:
+            continue
+        seen.add(coll)
+        out.append(coll)
+    return out
+
+
+def _diagrams_collections_to_search() -> list[str]:
+    """Return the union of diagrams collections this process should
+    fan-out across: self + peers (from ``VCT_DIAGRAMS_ACCESS_LIST`` /
+    ``VCT_KG_ACCESS_LIST`` fallback). No shared diagrams collection —
+    diagrams are project-scoped by design (unlike the shared KG).
+
+    Returns ``[]`` when ``DIAGRAMS_COLLECTION`` is unset, which is the
+    correct behaviour for projects that don't use the diagrams module
+    (``hybrid_search`` then silently skips the diagrams fan-out, no
+    log noise, no schema-fail).
+    """
+    if not DIAGRAMS_COLLECTION or not DIAGRAMS_COLLECTION.strip():
+        return []
+    out: list[str] = [DIAGRAMS_COLLECTION]
+    for coll in _diagrams_peer_collections():
+        if not coll or not coll.strip():
+            continue
+        if coll == DIAGRAMS_COLLECTION:
+            continue
+        if coll not in out:
+            out.append(coll)
+    return out
+
+
+def _kg_collections_to_search(
+    include_dev: bool = False, include_diagrams: bool = False
+) -> list[str]:
     """Return the union of KG collections this process should fan-out
     across: self + shared (when configured + distinct) + every peer in
     `VCT_KG_ACCESS_LIST`. Order: self first, shared second, peers after.
     Caller may pass `include_dev=True` to also include
     `DEVELOPMENT_COLLECTION` (only `hybrid_search` does — graph traversal
-    skips dev docs, see existing comment at the call site).
+    skips dev docs, see existing comment at the call site). Caller may
+    pass `include_diagrams=True` to also include the per-project
+    `DIAGRAMS_COLLECTION` + diagram-access peers (Phase 1.5.C — only
+    `hybrid_search` does; graph traversal skips diagrams for the same
+    reason it skips dev docs — they have no WikiLinks).
 
     Defensive filtering (v0.2.27): empty / whitespace-only collection
     names are dropped. KG_COLLECTION should never be empty (the resolver
@@ -1385,6 +1502,10 @@ def _kg_collections_to_search(include_dev: bool = False) -> list[str]:
         and DEVELOPMENT_COLLECTION not in out
     ):
         out.append(DEVELOPMENT_COLLECTION)
+    if include_diagrams:
+        for coll in _diagrams_collections_to_search():
+            if coll and coll not in out:
+                out.append(coll)
     return out
 
 
@@ -2396,6 +2517,26 @@ def _format_obj(obj, collection_name: str, distance: float | None = None) -> dic
     total_chunks = obj.properties.get("total_chunks") or (parsed[1] if parsed else None)
     source_id = obj.properties.get("source_node_id") or title
 
+    # Phase 1.5.C: discriminator so callers can route diagram results
+    # differently from KG / Development results. The diagrams collection
+    # is per-project (DIAGRAMS_COLLECTION) plus any peers in the
+    # diagrams-access matrix; every other collection is treated as
+    # knowledge. Default to "knowledge" so any future collection added
+    # without code changes here still surfaces as a clickable .md file
+    # rather than mis-routing.
+    diagrams_peers = (
+        _diagrams_collections_to_search()
+        if DIAGRAMS_COLLECTION
+        else []
+    )
+    if collection_name and (
+        collection_name == DIAGRAMS_COLLECTION
+        or collection_name in diagrams_peers
+    ):
+        result_kind = "diagram"
+    else:
+        result_kind = "knowledge"
+
     return {
         "title": title,
         "node_type": obj.properties.get("node_type", "unknown"),
@@ -2406,6 +2547,8 @@ def _format_obj(obj, collection_name: str, distance: float | None = None) -> dic
         "updated_at": serialize_datetime(obj.properties.get("updated_at", "")),
         "distance": dist,
         "collection": collection_name,
+        # Phase 1.5.C discriminator — "knowledge" | "diagram".
+        "result_kind": result_kind,
         # Chunk metadata (None for un-chunked nodes)
         "source_id": source_id,
         "chunk_number": chunk_number,
@@ -3995,8 +4138,15 @@ async def _hybrid_search_body(
 
     # Determine all collections to search: self + shared + peers (from
     # VCT_KG_ACCESS_LIST, P1-D 2026-05-08) + DEVELOPMENT_COLLECTION when
-    # configured. Single source of truth: `_kg_collections_to_search`.
-    collections_to_search: list[str] = _kg_collections_to_search(include_dev=True)
+    # configured + DIAGRAMS_COLLECTION (+ diagram-access peers) when
+    # configured (Phase 1.5.C). Single source of truth:
+    # `_kg_collections_to_search`. Diagrams add a `result_kind="diagram"`
+    # discriminator in `_format_obj` so Claude / the launcher can route
+    # the click target (Read for .mmd vs describe_excalidraw for
+    # .excalidraw vs the normal file open for KG nodes).
+    collections_to_search: list[str] = _kg_collections_to_search(
+        include_dev=True, include_diagrams=True,
+    )
 
     # Search all collections and merge by (title, chunk) key, keeping best score per key.
     #
@@ -4220,6 +4370,129 @@ async def _hybrid_search_body(
         # string so an aggressively-summarising consumer can't lose it.
         response = {"deprecation_warning": dep_banner, "notice": dep_banner, **response}
     return _large_result(response)
+
+
+# ===========================================================================
+# Phase 1.5.C: describe_excalidraw
+# ===========================================================================
+#
+# Companion tool to hybrid_search. When a diagram result lands with
+# result_kind="diagram" and file_path ends in .excalidraw, Claude can't
+# usefully `Read(file_path)` — Excalidraw scenes are JSON blobs full of
+# coordinates that don't ground the conversation. Instead, describe the
+# scene by name + extracted text labels + element-type counts.
+#
+# The Mermaid case is simpler: .mmd is text-readable source, so the
+# existing `Read(file_path)` is enough — no companion tool needed.
+#
+# Implementation: lightweight wrapper around
+# vco_lib.diagram_indexer.parse_excalidraw. The STUB shipped alongside
+# this branch (until Phase 1.5.A merges) is feature-complete for this
+# tool's needs.
+@mcp.tool()
+async def describe_excalidraw(file_path: str) -> str:
+    """
+    Describe an Excalidraw scene by its text labels and element shape.
+
+    Use this for .excalidraw files when ``hybrid_search`` returns a
+    diagram (``result_kind="diagram"``) you want to inspect — gives you
+    the scene name, all text labels, and a count of each element type
+    without needing to see the canvas. For .mmd (Mermaid) diagrams,
+    just ``Read(file_path)`` — those are plain text.
+
+    Args:
+        file_path: Absolute path to an ``.excalidraw`` file. Returned
+            by ``hybrid_search`` as the ``file_path`` field of a
+            diagram result.
+
+    Returns:
+        JSON with::
+
+            {
+                "success": true,
+                "scene_name": "Auth Flow" | null,
+                "text_labels": ["Login", "Submit", ...],
+                "element_counts": {"rectangle": 4, "text": 2, ...},
+                "file_path": "..."
+            }
+
+        On error (file missing, not JSON, not an .excalidraw file)
+        returns ``{"success": false, "error": "..."}``.
+    """
+    payload: dict = {
+        "file_path": file_path,
+    }
+    try:
+        path = Path(file_path)
+    except TypeError as exc:
+        payload.update({"success": False, "error": f"invalid file_path: {exc}"})
+        return _large_result(payload)
+
+    if path.suffix.lower() != ".excalidraw":
+        payload.update({
+            "success": False,
+            "error": (
+                f"not an Excalidraw file: {path.suffix or '<no suffix>'}. "
+                f"For .mmd (Mermaid) diagrams, use Read(file_path) — they "
+                f"are plain text. describe_excalidraw only handles "
+                f".excalidraw scenes."
+            ),
+        })
+        return _large_result(payload)
+
+    if not path.exists():
+        payload.update({"success": False, "error": f"file not found: {path}"})
+        return _large_result(payload)
+
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        payload.update({"success": False, "error": f"cannot read file: {exc}"})
+        return _large_result(payload)
+
+    try:
+        scene = json.loads(raw)
+    except ValueError as exc:
+        payload.update({
+            "success": False,
+            "error": f"file is not valid JSON: {exc}",
+        })
+        return _large_result(payload)
+
+    if not isinstance(scene, dict):
+        payload.update({
+            "success": False,
+            "error": (
+                f"Excalidraw scene must be a JSON object at the top "
+                f"level; got {type(scene).__name__}."
+            ),
+        })
+        return _large_result(payload)
+
+    # Import locally to keep the MCP startup time stable when this
+    # tool is never called. The STUB has no side effects; Phase 1.5.A's
+    # real implementation will likely also be import-cheap, but we
+    # localise here to be safe.
+    try:
+        from vco_lib.diagram_indexer import parse_excalidraw
+    except ImportError as exc:
+        payload.update({
+            "success": False,
+            "error": (
+                f"vco_lib.diagram_indexer is not importable: {exc}. "
+                f"Phase 1.5.A STUB should be shipped alongside this MCP."
+            ),
+        })
+        return _large_result(payload)
+
+    meta = parse_excalidraw(scene)
+    payload.update({
+        "success": True,
+        "scene_name": meta.scene_name,
+        "text_labels": list(meta.text_labels),
+        "element_counts": dict(meta.element_counts),
+    })
+    return _large_result(payload)
 
 
 def get_node_connections(
