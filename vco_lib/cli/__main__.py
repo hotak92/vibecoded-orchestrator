@@ -18,6 +18,7 @@ import argparse
 import sys
 from typing import Optional, Sequence
 
+from vco_lib.cli import rebuild_diagram_index as _rebuild_diagram_index
 from vco_lib.cli import verify as _verify
 
 
@@ -27,11 +28,13 @@ def _build_parser() -> argparse.ArgumentParser:
         description=(
             "VibeCoded Orchestrator CLI. Each subcommand maps to an "
             "operational verifier or maintenance helper. Phase 0 ships "
-            "verify-pins + verify-env-projection; later phases extend."
+            "verify-pins + verify-env-projection; Phase 1.5 adds "
+            "rebuild-diagram-index; later phases extend."
         ),
     )
     sub = parser.add_subparsers(dest="subcommand", required=True)
     _verify.add_subparsers(sub)
+    _rebuild_diagram_index.add_subparsers(sub)
     return parser
 
 
