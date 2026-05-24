@@ -8,6 +8,7 @@
 //! launcher and hub both depend on this crate via path dependencies in
 //! their respective Cargo.toml.
 
+pub mod bundled_versions;
 pub mod config;
 pub mod db;
 pub mod manifest;

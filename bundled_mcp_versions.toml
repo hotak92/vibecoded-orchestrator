@@ -1,0 +1,91 @@
+# Single source of truth for all pinned external dependencies (Phase 0
+# of the diagrams-integration plan, 2026-05-24).
+#
+# Bumping any version here is a deliberate act that ships in a VCO
+# release. Never auto-resolved; never floating.
+#
+# Edited here ONLY. Both Rust (vct-launcher-core/src/bundled_versions.rs
+# via `include_str!`) and Python (vco_lib/bundled_versions.py via
+# `tomllib`) parse this file. A cross-language parity test
+# (`tests/test_bundled_versions_parity.py`) keeps the two parsers in
+# lockstep, mirroring the orchestrator-managed-paths.txt pattern.
+#
+# Parse rules
+# -----------
+# This is standard TOML — see https://toml.io. The two language parsers
+# are required to interpret the file identically; the parity test
+# triangulates them against a third independent parse.
+#
+# Schema
+# ------
+# Each [npm.<key>] table has:
+#   package : str — the npm package name (e.g. "claude-mermaid").
+#   version : str — exact semver, NO leading "^" or "~". Resolver is
+#                   disabled at install time so the installed version
+#                   must equal this string byte-for-byte.
+#   shasum  : str — npm's NATIVE integrity field is SHA1 (40 hex chars,
+#                   lowercase), exposed as `dist.shasum` by
+#                   `npm view <pkg>@<version>`. We label the TOML key
+#                   `shasum` (NOT `sha256`) so nobody downstream confuses
+#                   it for SHA-256. Verified post-install against the
+#                   local package manifest's `_integrity` / `_shasum`
+#                   field where the installed npm version exposes it;
+#                   skipped with a WARN when the local manifest does not
+#                   (older npm cli versions).
+#
+# Self-reference: this file is listed in `orchestrator-managed-paths.txt`
+# so that `update_orchestrator_at` propagates new editions of the
+# manifest into every existing install when the user pulls a new VCO
+# clone — same fail-safe pattern the allowlist file uses.
+
+[npm.mermaid_mcp]
+package = "claude-mermaid"
+version = "1.6.3"
+shasum  = "a5f1050ef7af6dc2595f5507366006489fef2879"
+
+[npm.excalidraw_mcp]
+# TODO (Phase 0 — known gap): the fork named in the plan
+# (`@sanjibdevnathlabs/mcp-excalidraw-local`) is NOT published to the
+# npm registry as of 2026-05-25. Until it is, this entry stays as a
+# placeholder so the loader contract is uniform across keys and the
+# Phase 2 install pipeline has a slot to populate.
+#
+# Resolution options when Phase 2 lands:
+#   (a) Publish the fork to npm under our scope and replace this entry
+#       with the real package@version+shasum.
+#   (b) Switch to a git+ref pin — change `package` to a `git+https://`
+#       URL and `version` to the commit SHA; document that the shasum
+#       field is unused for git pins. Vendor a copy under
+#       `claude_mcp_servers/excalidraw_mcp_fork/` for offline installs.
+#   (c) Adopt one of the alternative packages enumerated by
+#       `npm search excalidraw mcp` (excalidraw-mcp / -mcp-server /
+#       -mcp-sentinel) if any of them already exposes the surface we
+#       need (read_scene / create_scene / add_element / modify_element /
+#       export_svg). Re-pin to that package@version here.
+#
+# Whichever path is taken, the bump happens HERE and ships in a VCO
+# release — never auto-resolved at install time.
+#
+# Upstream reference (the plan-named fork):
+# https://github.com/sanjibdevnathlabs/mcp-excalidraw-local
+package = "@sanjibdevnathlabs/mcp-excalidraw-local"
+version = "0.0.0-PLACEHOLDER"
+shasum  = "0000000000000000000000000000000000000000"
+
+[npm.mermaid_lib]
+package = "mermaid"
+version = "11.15.0"
+shasum  = "b485c13ea5e1e74f3328c4bb00427bda87fa1c1e"
+
+[npm.excalidraw_lib]
+package = "@excalidraw/excalidraw"
+version = "0.18.1"
+shasum  = "fd6ad752807c814698c5f51dab778845b7e4bba7"
+
+[chromium]
+# Mermaid PNG export + Excalidraw PNG export both lazy-load a Chromium
+# instance. Playwright already manages its own Chromium download via
+# `npx playwright install chromium` (see install.py::_install_playwright_browsers).
+# We reuse THAT Chromium rather than fetching a second copy — there is
+# no second download to pin here.
+reuse_playwright = true
