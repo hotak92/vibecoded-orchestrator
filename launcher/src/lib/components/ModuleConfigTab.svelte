@@ -46,6 +46,9 @@
     sectionUsesProjectId,
     substituteEmbeddingSourceInAction,
   } from '$lib/components/module-controls/configTabHelpers';
+  // v0.2.32 L4 + L5 (2026-05-24): info_dynamic + date_picker.
+  import InfoDynamicControl from '$lib/components/module-controls/InfoDynamicControl.svelte';
+  import DatePickerControl from '$lib/components/module-controls/DatePickerControl.svelte';
 
   // ─── Schema types ──────────────────────────────────────────────────────
   //
@@ -54,6 +57,14 @@
   // button / select / info) are rendered inline below; the 5 new kinds
   // (text_input / number_input / status_display / file_picker / link)
   // each have a dedicated component under `module-controls/`.
+  //
+  // v0.2.32 (L4 + L5, 2026-05-24): two more kinds — `info_dynamic` (live
+  // read-only display backed by the launcher's `module_db_read_row`
+  // command) and `date_picker` (native HTML date input). Each has its
+  // own component. Sections containing at least one `info_dynamic`
+  // render a `↻` refresh button next to the section title; clicking it
+  // increments `sectionRefreshNonces[idx]`, which propagates via prop
+  // to every InfoDynamicControl in that section.
   //
   // Adding a new kind requires:
   //   1. New variant in `manifest::ConfigControl` (Rust)
@@ -146,6 +157,29 @@
   // (we don't want to overwrite user toggles on every reactive run).
   let collapsedSections = $state<Record<number, boolean>>({});
 
+  // v0.2.32 L4: section-level refresh nonces, keyed by section_idx.
+  // Incremented when the user clicks a section's `↻` button; the new
+  // value propagates to every `InfoDynamicControl` in that section via
+  // its `refreshNonce` prop, triggering a re-fetch. Sections with no
+  // dynamic controls never increment (the `↻` button isn't rendered
+  // for them).
+  let sectionRefreshNonces = $state<Record<number, number>>({});
+
+  /**
+   * True iff the section has at least one control that backs the
+   * `↻` refresh affordance. v0.2.32 only `info_dynamic` qualifies;
+   * future `*_dynamic` kinds (`status_dynamic`, `chart_dynamic`,
+   * ...) should be added here so they share the same refresh
+   * UX without needing per-kind buttons.
+   */
+  function sectionHasDynamicControl(controls: ConfigControl[]): boolean {
+    return controls.some((c) => c.kind === 'info_dynamic');
+  }
+
+  function refreshSection(sectionIdx: number) {
+    sectionRefreshNonces[sectionIdx] = (sectionRefreshNonces[sectionIdx] ?? 0) + 1;
+  }
+
   // Per-control mutation in-flight indicator. Used to disable
   // controls + show a small spinner. Keyed by `<section_idx>:<control_id>`.
   let busy = $state<Record<string, boolean>>({});
@@ -228,9 +262,16 @@
     await ensureEmbeddingSourceCached(pid);
 
     // Fetch persisted value for every control whose kind supports
-    // state. Buttons + info are stateless.
+    // state. Buttons + info + info_dynamic + link are stateless
+    // (info_dynamic owns its own fetch lifecycle via module_db_read_row).
     for (const control of configTab.sections[sectionIdx].controls) {
-      if (control.kind === 'button' || control.kind === 'info') continue;
+      if (
+        control.kind === 'button' ||
+        control.kind === 'info' ||
+        control.kind === 'info_dynamic' ||
+        control.kind === 'link'
+      )
+        continue;
       try {
         const v = await invoke<unknown>('get_module_setting', {
           moduleId,
@@ -324,7 +365,15 @@
     const out: Record<string, unknown> = {};
     for (let i = 0; i < configTab.sections.length; i++) {
       for (const control of configTab.sections[i].controls) {
-        if (control.kind === 'button' || control.kind === 'info') continue;
+        // Stateless kinds contribute no sibling value.
+        if (
+          control.kind === 'button' ||
+          control.kind === 'info' ||
+          control.kind === 'info_dynamic' ||
+          control.kind === 'link'
+        ) {
+          continue;
+        }
         const v = values[ckey(i, control.id)];
         if (v !== undefined) out[control.id] = v;
       }
@@ -510,24 +559,44 @@
     {@const sectionPid = effectiveProjectId(sectionIdx)}
     {@const sectionHasProject = sectionHasEffectiveProject(sectionIdx)}
     {@const sectionDisabled = !sectionHasProject}
+    {@const hasDynamic = sectionHasDynamicControl(section.controls)}
+    {@const refreshNonce = sectionRefreshNonces[sectionIdx] ?? 0}
     <section class="config-section">
-      <button
-        type="button"
-        class="section-header"
-        class:collapsible={section.collapsible}
-        onclick={() => section.collapsible && toggleSection(sectionIdx)}
-        aria-expanded={!collapsed}
-      >
-        <span class="section-title">
-          {#if section.collapsible}
-            <span class="chevron" class:collapsed>{collapsed ? '▸' : '▾'}</span>
+      <div class="section-header-row">
+        <button
+          type="button"
+          class="section-header"
+          class:collapsible={section.collapsible}
+          onclick={() => section.collapsible && toggleSection(sectionIdx)}
+          aria-expanded={!collapsed}
+        >
+          <span class="section-title">
+            {#if section.collapsible}
+              <span class="chevron" class:collapsed>{collapsed ? '▸' : '▾'}</span>
+            {/if}
+            {section.title}
+          </span>
+          {#if section.description}
+            <span class="section-description">{section.description}</span>
           {/if}
-          {section.title}
-        </span>
-        {#if section.description}
-          <span class="section-description">{section.description}</span>
+        </button>
+        {#if hasDynamic}
+          <!-- v0.2.32 L4 section refresh affordance — re-fetches every
+               *_dynamic control in this section. Clicking it
+               increments the section's nonce; each InfoDynamicControl
+               watches its `refreshNonce` prop and re-runs
+               `module_db_read_row` when the value changes. -->
+          <button
+            type="button"
+            class="section-refresh"
+            onclick={() => refreshSection(sectionIdx)}
+            aria-label={`Refresh ${section.title}`}
+            title="Refresh dynamic values in this section"
+          >
+            ↻
+          </button>
         {/if}
-      </button>
+      </div>
 
       {#if !collapsed}
         <!--
@@ -704,6 +773,27 @@
                 />
               {:else if control.kind === 'link'}
                 <LinkControl {control} disabled={sectionDisabled} />
+              {:else if control.kind === 'info_dynamic'}
+                <!-- v0.2.32 L4: live read-only display. The section's
+                     refresh nonce flows in via `refreshNonce`; the
+                     component re-fetches on every increment. -->
+                <InfoDynamicControl
+                  {control}
+                  {moduleId}
+                  projectId={sectionPid}
+                  {refreshNonce}
+                  disabled={sectionDisabled}
+                />
+              {:else if control.kind === 'date_picker'}
+                <!-- v0.2.32 L5: native HTML date picker. Persists via
+                     `set_module_setting`; sibling controls can
+                     reference the value via `{{control:<id>}}`. -->
+                <DatePickerControl
+                  {control}
+                  {moduleId}
+                  projectId={sectionPid}
+                  disabled={sectionDisabled}
+                />
               {/if}
 
               {#if err}
@@ -782,9 +872,15 @@
     overflow: hidden;
   }
 
-  .section-header {
-    width: 100%;
+  .section-header-row {
+    display: flex;
+    align-items: stretch;
     background: rgba(255, 255, 255, 0.02);
+  }
+
+  .section-header {
+    flex: 1;
+    background: transparent;
     padding: 12px 16px;
     border: 0;
     text-align: left;
@@ -793,6 +889,24 @@
     display: flex;
     flex-direction: column;
     gap: 2px;
+  }
+
+  /* v0.2.32 L4: section refresh button. Aligns to the right edge of
+     the header row; click increments the section's refresh nonce. */
+  .section-refresh {
+    background: transparent;
+    border: 0;
+    color: var(--color-muted);
+    cursor: pointer;
+    font-size: 16px;
+    padding: 0 16px;
+    transition: color 0.12s ease, transform 0.2s ease;
+  }
+  .section-refresh:hover {
+    color: var(--color-text);
+  }
+  .section-refresh:active {
+    transform: rotate(180deg);
   }
 
   .section-header.collapsible {

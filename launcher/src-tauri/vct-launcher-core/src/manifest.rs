@@ -411,6 +411,127 @@ pub enum ConfigControl {
         #[serde(default = "default_link_target")]
         target: String,
     },
+    /// v0.2.32 (L4, 2026-05-24): live read-only info display bound to a
+    /// data source. The renderer fetches `source` on mount + on manual
+    /// refresh, substitutes the `format` template (e.g. `"{value}"`,
+    /// `"Version: {value}"`), and shows `fallback` when the source
+    /// returns null.
+    ///
+    /// Unlike [`ConfigControl::StatusDisplay`] (which polls an HTTP
+    /// endpoint and uses `render_template`'s `{{field}}` token form),
+    /// `InfoDynamic` reads ONE keyed value from a structured source
+    /// like the hub's module-DB REST surface — no container needs to
+    /// be running. Used by v0.2.32 R1/R3 (RL reranker dashboard) to
+    /// surface `weights_version_live` / `active_embedding_live` /
+    /// `last_training_live` etc. via Agent J's `module_db_read_row`.
+    ///
+    /// Refresh affordance: the renderer renders a `↻` button next to
+    /// the section header for every section that contains at least one
+    /// `*_dynamic` control. Clicking it re-fetches every dynamic
+    /// control in that section.
+    #[serde(rename = "info_dynamic")]
+    InfoDynamic {
+        id: String,
+        label: String,
+        #[serde(default)]
+        tooltip: Option<String>,
+        source: InfoDynamicSource,
+        /// Template applied to the source's resolved value. The single
+        /// token `{value}` is replaced by the source value (stringified
+        /// for non-string scalars). Default `"{value}"`.
+        #[serde(default = "default_info_dynamic_format")]
+        format: String,
+        /// Fallback text rendered when the source returns null (e.g.
+        /// row absent, container never ran, hub unreachable). When
+        /// omitted, the renderer shows an empty cell.
+        #[serde(default)]
+        fallback: Option<String>,
+    },
+    /// v0.2.32 (L5, 2026-05-24): native HTML date picker.
+    ///
+    /// The renderer surfaces an `<input type="date">` with the
+    /// declared `min` / `max` and an optional preset `default` (either
+    /// an ISO `YYYY-MM-DD` literal OR one of the keyword strings
+    /// `"today" / "30_days_ago" / "90_days_ago"`, resolved at mount
+    /// time against the user's wall clock).
+    ///
+    /// Persistence: the value persists into `module_settings` via the
+    /// generic `set_module_setting` command — same as `text_input` —
+    /// so other controls can reference it through `{{control:<id>}}`
+    /// in their descriptor bodies, and sibling buttons see it via the
+    /// renderer's `siblingValuesSnapshot()`. A "clear" affordance
+    /// writes JSON `null` (empty date → "all history" semantics for
+    /// the RL `/global/retrain` endpoint, per the v0.2.7 R2 design).
+    ///
+    /// `{{date_value}}` shorthand: when this control's value is
+    /// referenced in an `on_change` descriptor body or a sibling
+    /// button's body, the v0.2.32 renderer exposes it under both
+    /// `{{control:<id>}}` (the canonical form) and the convenience
+    /// alias `{{date_value}}` (active when the dispatching control's
+    /// value field carries the date — see substitution context).
+    #[serde(rename = "date_picker")]
+    DatePicker {
+        id: String,
+        label: String,
+        #[serde(default)]
+        tooltip: Option<String>,
+        /// ISO date literal (`"2026-01-15"`) OR keyword
+        /// (`"today"` / `"30_days_ago"` / `"90_days_ago"`). Resolved
+        /// to a concrete ISO date in the renderer at mount time
+        /// against the user's local wall clock.
+        #[serde(default)]
+        default: Option<String>,
+        /// ISO date lower-bound forwarded to the native `min`
+        /// attribute. No keyword resolution here — manifests should
+        /// only declare concrete bounds (the renderer doesn't try to
+        /// interpret keywords for `min`/`max` because clocks shift).
+        #[serde(default)]
+        min: Option<String>,
+        /// ISO date upper-bound forwarded to the native `max`
+        /// attribute.
+        #[serde(default)]
+        max: Option<String>,
+        /// Optional side-effect fired after persistence. Typically a
+        /// `descriptor` that POSTs the new date to the container.
+        #[serde(default)]
+        on_change: Option<ActionRef>,
+    },
+}
+
+fn default_info_dynamic_format() -> String {
+    "{value}".into()
+}
+
+/// v0.2.32 (L4): data source for an [`ConfigControl::InfoDynamic`].
+/// Tagged on `kind` so future variants (`http_endpoint`,
+/// `tauri_command`) can land additively without breaking older
+/// manifests.
+///
+/// v1 ships exactly ONE kind: `module_db`. Future kinds will need
+/// their own renderer plumbing; the `kind` tag keeps the serde shape
+/// forward-compatible.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum InfoDynamicSource {
+    /// Read one keyed row from the hub's module-DB REST surface via
+    /// Agent J's `module_db_read_row` Tauri command (v0.2.31). The
+    /// renderer substitutes `{{project_id}}` in `key` against the
+    /// active project, then projects `field` from the returned JSON
+    /// object. Returns null when the row is absent, the container has
+    /// no migrations applied, or the hub is unreachable.
+    #[serde(rename = "module_db")]
+    ModuleDb {
+        /// Table name (must be `{module_namespace}_*` per the
+        /// v0.2.31 namespace policy — the hub enforces this at write
+        /// time; we don't re-validate here).
+        table: String,
+        /// Row key. May contain `{{project_id}}`, substituted by the
+        /// renderer against the active project's UUID. Other token
+        /// forms are passed through unchanged.
+        key: String,
+        /// Field name to project from the row's JSON value.
+        field: String,
+    },
 }
 
 fn default_link_target() -> String {
@@ -461,10 +582,16 @@ pub enum ActionRef {
 /// Declarative action that the generic `module_dispatch_action`
 /// command executes at dispatch time.
 ///
-/// v1 ships ONE kind: `http`. Future kinds (e.g. `shell` for sandboxed
-/// subprocess actions) are intentionally NOT included — they would
-/// expand the trust surface significantly and need their own design
-/// pass.
+/// v0.2.26 shipped ONE kind: `http`. v0.2.32 (CHAINED_ACTION,
+/// 2026-05-24) adds the generic `chained_action` primitive — a
+/// sequence of step descriptors executed serially, with each step's
+/// response threaded into the next step's body via
+/// `{{previous_step.<field>}}` placeholders. Optional `polling`
+/// attaches to the FINAL step.
+///
+/// Future kinds (e.g. `shell` for sandboxed subprocess actions) are
+/// intentionally NOT included — they would expand the trust surface
+/// significantly and need their own design pass.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum ActionDescriptor {
@@ -487,6 +614,43 @@ pub enum ActionDescriptor {
         /// `max_chain_steps` (default 1024) to bound runaway depth.
         #[serde(default)]
         next_action: Option<Box<ActionDescriptor>>,
+    },
+    /// v0.2.32 (CHAINED_ACTION, 2026-05-24): execute a sequence of
+    /// step descriptors serially. Each step's parsed JSON response is
+    /// pushed onto a `step_results` array; the next step's body can
+    /// reference previous-step fields via
+    /// `{{previous_step.<field>}}` (previous step only) or
+    /// `{{step.N.<field>}}` (absolute index).
+    ///
+    /// `polling` attaches to the FINAL step only. The renderer
+    /// observes `polling.progress_event` / `polling.failed_event` as
+    /// usual. Intermediate steps must be fast / synchronous — if any
+    /// intermediate step needs polling, it should be split into a
+    /// separate top-level dispatch.
+    ///
+    /// `rollback_on_step_failure` is reserved for v0.2.33+ (would
+    /// require every action kind to declare a rollback companion).
+    /// For v0.2.32 the dispatcher always LOGS and PROPAGATES on step
+    /// failure — the partial results are dropped, the renderer sees
+    /// the error, and previous steps' side-effects stay on disk /
+    /// in the database. Manifests declaring `true` parse correctly
+    /// but the flag has no effect today.
+    #[serde(rename = "chained_action")]
+    ChainedAction {
+        /// Ordered list of step descriptors. Empty `steps` is a hard
+        /// error at dispatch time (no point chaining nothing).
+        steps: Vec<ActionDescriptor>,
+        /// Attaches to the LAST step's execution. The Rust executor
+        /// applies it after the final step's kick succeeds, using the
+        /// same job-id-from-response mechanism as the `Http` variant.
+        #[serde(default)]
+        polling: Option<PollingSpec>,
+        /// Reserved for v0.2.33+. For v0.2.32 the dispatcher always
+        /// logs + propagates step failures regardless of this flag.
+        /// Pinned in serde so manifests don't have to be re-touched
+        /// when rollback support lands.
+        #[serde(default)]
+        rollback_on_step_failure: bool,
     },
 }
 
@@ -1732,7 +1896,12 @@ mod tests {
                     | ConfigControl::NumberInput { .. }
                     | ConfigControl::StatusDisplay { .. }
                     | ConfigControl::FilePicker { .. }
-                    | ConfigControl::Link { .. } => {}
+                    | ConfigControl::Link { .. }
+                    // v0.2.32 additions — same acknowledgement: the
+                    // RL manifest may grow these but the test doesn't
+                    // assert on them.
+                    | ConfigControl::InfoDynamic { .. }
+                    | ConfigControl::DatePicker { .. } => {}
                 }
             }
         }
@@ -2074,6 +2243,12 @@ mod tests {
                 assert!(polling.is_none(), "no polling declared");
                 assert!(next_action.is_none(), "no chained action");
             }
+            // v0.2.32: ActionDescriptor gained ChainedAction; the
+            // fixture json declares kind="http" so this arm is
+            // unreachable in practice but needed for exhaustive match.
+            ActionRef::Descriptor(ActionDescriptor::ChainedAction { .. }) => {
+                panic!("fixture is kind=http, ChainedAction unexpected")
+            }
         }
     }
 
@@ -2103,12 +2278,22 @@ mod tests {
             }
         }"#;
         let action: ActionDescriptor = serde_json::from_str(json).expect("depth-3 parses");
-        let ActionDescriptor::Http { next_action, .. } = action;
+        // v0.2.32: ActionDescriptor gained the ChainedAction variant, so
+        // patterns on the Http variant are no longer irrefutable. Use
+        // `let ... else` to keep the depth-3 walk readable while
+        // gracefully panicking if the parser ever returns a wrong variant.
+        let ActionDescriptor::Http { next_action, .. } = action else {
+            panic!("outer step expected Http");
+        };
         let inner = next_action.expect("level 2 present");
-        let ActionDescriptor::Http { next_action, path, .. } = *inner;
+        let ActionDescriptor::Http { next_action, path, .. } = *inner else {
+            panic!("inner step expected Http");
+        };
         assert_eq!(path, "/step2");
         let deepest = next_action.expect("level 3 present");
-        let ActionDescriptor::Http { method, path, next_action, .. } = *deepest;
+        let ActionDescriptor::Http { method, path, next_action, .. } = *deepest else {
+            panic!("deepest step expected Http");
+        };
         assert_eq!(method, HttpMethod::Get);
         assert_eq!(path, "/step3");
         assert!(next_action.is_none(), "deepest leaf has no further chain");
@@ -2373,7 +2558,10 @@ mod tests {
                     ActionRef::Descriptor(ActionDescriptor::Http { path, next_action, .. }) => {
                         assert_eq!(path, "/reset");
                         let next = next_action.as_ref().expect("chain present");
-                        let ActionDescriptor::Http { path, polling, .. } = next.as_ref();
+                        // v0.2.32: pattern no longer irrefutable — use let-else.
+                        let ActionDescriptor::Http { path, polling, .. } = next.as_ref() else {
+                            panic!("inner action expected Http");
+                        };
                         assert_eq!(path, "/specialize");
                         let p = polling.as_ref().expect("polling on inner action");
                         assert_eq!(p.endpoint, "/finetune_status");
@@ -2691,6 +2879,311 @@ mod tests {
         }"#;
         let err = ModuleManifest::from_json(raw).expect_err("must reject empty migrations_dir");
         assert!(err.contains("migrations_dir"));
+    }
+
+    // ─── v0.2.32 (CHAINED_ACTION + L4 + L5, 2026-05-24): renderer adds ───
+    //
+    // Three new manifest additions land in v0.2.32:
+    //   - `ActionDescriptor::ChainedAction` — generic chained-action
+    //     primitive (CHAINED_ACTION). Threads each step's response into
+    //     the next step's body via `{{previous_step.<field>}}`.
+    //   - `ConfigControl::InfoDynamic` (L4) — live read-only info
+    //     display bound to a `module_db` source.
+    //   - `ConfigControl::DatePicker` (L5) — native HTML date picker
+    //     with keyword defaults (`today` / `30_days_ago` / `90_days_ago`).
+    //
+    // These tests pin the wire shape: backward-compat manifests still
+    // parse, the new shapes round-trip cleanly, and each variant
+    // surfaces the expected fields with serde defaults applied.
+
+    /// chained_action with two steps + a polling block on the
+    /// CHAINED_ACTION level (attaches to the final step at execute time)
+    /// + a `{{previous_step.local_path}}` token in the second step's
+    /// body. Round-trips through serde without losing structure.
+    #[test]
+    fn chained_action_two_step_with_polling_round_trips() {
+        let json = r#"{
+            "kind": "chained_action",
+            "steps": [
+                {
+                    "kind": "http",
+                    "method": "POST",
+                    "path": "/download_default",
+                    "body": {"embedding_source": "{{control:emb_src}}"}
+                },
+                {
+                    "kind": "http",
+                    "method": "POST",
+                    "path": "/finetune",
+                    "body": {
+                        "mode": "offline",
+                        "starting_checkpoint": "{{previous_step.local_path}}"
+                    }
+                }
+            ],
+            "polling": {
+                "endpoint": "/finetune_status",
+                "interval_seconds": 2,
+                "max_attempts": 1800
+            },
+            "rollback_on_step_failure": false
+        }"#;
+        let action: ActionDescriptor = serde_json::from_str(json).expect("chained_action parses");
+        match action {
+            ActionDescriptor::ChainedAction {
+                steps,
+                polling,
+                rollback_on_step_failure,
+            } => {
+                assert_eq!(steps.len(), 2, "two steps preserved");
+                assert!(!rollback_on_step_failure, "default rollback flag");
+                // Step 1 — POST /download_default
+                match &steps[0] {
+                    ActionDescriptor::Http { method, path, body, .. } => {
+                        assert_eq!(*method, HttpMethod::Post);
+                        assert_eq!(path, "/download_default");
+                        let body = body.as_ref().expect("body present");
+                        assert_eq!(body["embedding_source"], "{{control:emb_src}}");
+                    }
+                    other => panic!("step 1 expected Http, got {:?}", other),
+                }
+                // Step 2 — POST /finetune with {{previous_step.local_path}}
+                match &steps[1] {
+                    ActionDescriptor::Http { method, path, body, .. } => {
+                        assert_eq!(*method, HttpMethod::Post);
+                        assert_eq!(path, "/finetune");
+                        let body = body.as_ref().expect("body present");
+                        assert_eq!(
+                            body["starting_checkpoint"],
+                            "{{previous_step.local_path}}",
+                        );
+                        assert_eq!(body["mode"], "offline");
+                    }
+                    other => panic!("step 2 expected Http, got {:?}", other),
+                }
+                let polling = polling.expect("polling present on chained_action");
+                assert_eq!(polling.endpoint, "/finetune_status");
+                assert_eq!(polling.interval_seconds, 2);
+                assert_eq!(polling.max_attempts, 1800);
+            }
+            other => panic!("expected ChainedAction, got {:?}", other),
+        }
+    }
+
+    /// Defaults: chained_action without polling or rollback_on_step_failure
+    /// parses cleanly with sensible defaults (no polling, rollback flag
+    /// false).
+    #[test]
+    fn chained_action_minimum_shape_parses() {
+        let json = r#"{
+            "kind": "chained_action",
+            "steps": [
+                { "kind": "http", "method": "GET", "path": "/a" }
+            ]
+        }"#;
+        let action: ActionDescriptor = serde_json::from_str(json).expect("minimal chained_action parses");
+        match action {
+            ActionDescriptor::ChainedAction {
+                steps,
+                polling,
+                rollback_on_step_failure,
+            } => {
+                assert_eq!(steps.len(), 1);
+                assert!(polling.is_none(), "no polling declared");
+                assert!(!rollback_on_step_failure, "default flag");
+            }
+            other => panic!("expected ChainedAction, got {:?}", other),
+        }
+    }
+
+    /// info_dynamic with a module_db source round-trips. The wire shape
+    /// is the canonical v0.2.7 RL example: read the `weights_version`
+    /// field from the `rl_weights_state` table keyed by `{{project_id}}`.
+    #[test]
+    fn info_dynamic_module_db_source_serde_round_trip() {
+        let manifest_json = r#"{
+            "id": "rl-test",
+            "name": "RL Test",
+            "version": "0.2.7",
+            "category": "paid-orchestrator",
+            "license": { "min_orchestrator_tier": "pro" },
+            "install": { "method": "git_clone", "source": "https://example.com/x.git" },
+            "runtime": { "type": "service", "command": "echo" },
+            "gui": {
+                "config_tab": {
+                    "title": "RL Reranker",
+                    "sections": [{
+                        "title": "Status",
+                        "controls": [
+                            { "kind": "info_dynamic", "id": "weights_version_live",
+                              "label": "Current weights version",
+                              "tooltip": "Live read from module DB.",
+                              "source": {
+                                  "kind": "module_db",
+                                  "table": "rl_weights_state",
+                                  "key": "{{project_id}}",
+                                  "field": "weights_version"
+                              },
+                              "format": "Version: {value}",
+                              "fallback": "never"
+                            }
+                        ]
+                    }]
+                }
+            }
+        }"#;
+        let m = ModuleManifest::from_json(manifest_json).expect("manifest parses");
+        // Borrow gui by reference so the test can re-serialize `m` below.
+        let gui_ref = m.gui.as_ref().expect("gui present");
+        let tab_ref = gui_ref.config_tab.as_ref().expect("config_tab present");
+        let controls = &tab_ref.sections[0].controls;
+        match &controls[0] {
+            ConfigControl::InfoDynamic {
+                id,
+                label,
+                tooltip,
+                source,
+                format,
+                fallback,
+            } => {
+                assert_eq!(id, "weights_version_live");
+                assert_eq!(label, "Current weights version");
+                assert_eq!(tooltip.as_deref(), Some("Live read from module DB."));
+                assert_eq!(format, "Version: {value}");
+                assert_eq!(fallback.as_deref(), Some("never"));
+                match source {
+                    InfoDynamicSource::ModuleDb { table, key, field } => {
+                        assert_eq!(table, "rl_weights_state");
+                        assert_eq!(key, "{{project_id}}");
+                        assert_eq!(field, "weights_version");
+                    }
+                }
+            }
+            other => panic!("expected InfoDynamic, got {:?}", other),
+        }
+
+        // Re-serialize must preserve the `kind` tags.
+        let re = serde_json::to_string(&m).expect("re-serialize");
+        assert!(re.contains("\"kind\":\"info_dynamic\""));
+        assert!(re.contains("\"kind\":\"module_db\""));
+    }
+
+    /// info_dynamic format defaults to `"{value}"` when omitted —
+    /// matches the rendererʼs implicit "just print the value" behaviour.
+    #[test]
+    fn info_dynamic_format_defaults_to_value_token() {
+        let json = r#"{
+            "kind": "info_dynamic",
+            "id": "x", "label": "X",
+            "source": { "kind": "module_db", "table": "t", "key": "k", "field": "f" }
+        }"#;
+        let c: ConfigControl = serde_json::from_str(json).expect("info_dynamic parses");
+        match c {
+            ConfigControl::InfoDynamic { format, fallback, .. } => {
+                assert_eq!(format, "{value}", "default format");
+                assert!(fallback.is_none(), "no fallback declared");
+            }
+            other => panic!("expected InfoDynamic, got {:?}", other),
+        }
+    }
+
+    /// date_picker round-trips with keyword default + min/max + on_change
+    /// descriptor. Pins the canonical v0.2.7 R2 shape (earliest_date
+    /// filter for `/global/retrain`).
+    #[test]
+    fn date_picker_keyword_default_and_on_change_round_trip() {
+        let json = r#"{
+            "kind": "date_picker",
+            "id": "earliest_date",
+            "label": "Earliest date",
+            "tooltip": "Only train on data newer than this.",
+            "default": "30_days_ago",
+            "min": "2020-01-01",
+            "max": "2030-12-31",
+            "on_change": {
+                "kind": "http",
+                "method": "POST",
+                "path": "/set_earliest_date",
+                "body": { "date": "{{value}}" }
+            }
+        }"#;
+        let c: ConfigControl = serde_json::from_str(json).expect("date_picker parses");
+        match c {
+            ConfigControl::DatePicker {
+                id,
+                label,
+                tooltip,
+                default,
+                min,
+                max,
+                on_change,
+            } => {
+                assert_eq!(id, "earliest_date");
+                assert_eq!(label, "Earliest date");
+                assert_eq!(tooltip.as_deref(), Some("Only train on data newer than this."));
+                assert_eq!(default.as_deref(), Some("30_days_ago"));
+                assert_eq!(min.as_deref(), Some("2020-01-01"));
+                assert_eq!(max.as_deref(), Some("2030-12-31"));
+                let aa = on_change.expect("on_change present");
+                match aa {
+                    ActionRef::Descriptor(ActionDescriptor::Http { path, .. }) => {
+                        assert_eq!(path, "/set_earliest_date");
+                    }
+                    other => panic!("expected Http descriptor, got {:?}", other),
+                }
+            }
+            other => panic!("expected DatePicker, got {:?}", other),
+        }
+    }
+
+    /// date_picker with no optional fields parses cleanly — every
+    /// optional field's serde default kicks in.
+    #[test]
+    fn date_picker_minimum_shape_parses() {
+        let json = r#"{
+            "kind": "date_picker", "id": "d", "label": "Pick a date"
+        }"#;
+        let c: ConfigControl = serde_json::from_str(json).expect("minimal date_picker parses");
+        match c {
+            ConfigControl::DatePicker {
+                default,
+                min,
+                max,
+                on_change,
+                ..
+            } => {
+                assert!(default.is_none());
+                assert!(min.is_none());
+                assert!(max.is_none());
+                assert!(on_change.is_none());
+            }
+            other => panic!("expected DatePicker, got {:?}", other),
+        }
+    }
+
+    /// Backward compat: a v0.2.31 manifest (the immediate predecessor)
+    /// that uses ONLY the pre-v0.2.32 controls + no chained_action still
+    /// parses cleanly through the v0.2.32 schema. Pins the load-bearing
+    /// "additive only" invariant: existing paid modules MUST keep working
+    /// after the v0.2.32 renderer adds info_dynamic / date_picker / chained_action.
+    #[test]
+    fn v0_2_31_manifest_without_new_kinds_remains_parseable() {
+        // Cross-check against the existing v0.2.26 fixture (which covers
+        // every pre-v0.2.32 control kind + ActionRef shape). This is
+        // basically a guard: if v0.2.32 introduces a serde change that
+        // breaks the pre-existing fixture, this test surfaces it
+        // immediately with a clear "back-compat broken" failure.
+        let m = ModuleManifest::from_json(v0_2_26_controls_fixture_manifest())
+            .expect("v0.2.26 fixture must still parse under v0.2.32 schema");
+        let controls = &m.gui.unwrap().config_tab.unwrap().sections[0].controls;
+        // None of these controls are InfoDynamic / DatePicker.
+        for control in controls {
+            match control {
+                ConfigControl::InfoDynamic { .. } => panic!("v0.2.26 fixture must not have InfoDynamic"),
+                ConfigControl::DatePicker { .. } => panic!("v0.2.26 fixture must not have DatePicker"),
+                _ => {}
+            }
+        }
     }
 
     #[test]

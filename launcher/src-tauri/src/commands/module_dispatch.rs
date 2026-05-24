@@ -138,6 +138,18 @@ pub struct SubstitutionContext<'a> {
     /// OR no DB context" error. The production dispatcher always wires
     /// this when the module has `runtime.log_path_template` set.
     pub get_events_paths_for: Option<EventsPathsResolver<'a>>,
+    /// v0.2.32 (CHAINED_ACTION): the response body of the IMMEDIATELY
+    /// PREVIOUS step in a `ChainedAction` execution. Populated by the
+    /// chained-action loop before substituting each step's body; the
+    /// resolver consumes it via the `{{previous_step.<field>}}` token.
+    /// `None` outside chained-action context (single-step dispatch) or
+    /// during the first step of a chain.
+    pub previous_step: Option<&'a Value>,
+    /// v0.2.32 (CHAINED_ACTION): all step responses gathered so far in
+    /// the chain, indexed by zero-based step position. Backs the
+    /// `{{step.N.<field>}}` absolute-index token form. Empty outside
+    /// chained-action context.
+    pub step_results: &'a [Value],
 }
 
 impl<'a> SubstitutionContext<'a> {
@@ -155,9 +167,17 @@ impl<'a> SubstitutionContext<'a> {
             value,
             get_control_value: Box::new(|_| None),
             get_events_paths_for: None,
+            previous_step: None,
+            step_results: &[],
         }
     }
 }
+
+/// v0.2.32 (CHAINED_ACTION): empty slice constant used as the default
+/// `step_results` when callers don't have any previous-step data.
+/// Lifts the empty-slice value out of inline literals so chained-action
+/// builders can reference the same `'static [Value]` shape.
+const EMPTY_STEP_RESULTS: &[Value] = &[];
 
 // ─── Template substitution ──────────────────────────────────────────────
 
@@ -327,8 +347,74 @@ fn resolve_token(token: &str, ctx: &SubstitutionContext) -> Result<Value, String
                 )),
             }
         }
+        // v0.2.32 (CHAINED_ACTION): {{previous_step.<field>}} resolves
+        // the IMMEDIATELY PRECEDING step's response field. Only valid
+        // inside a chained_action body — outside that context the
+        // dispatcher never sets `ctx.previous_step`, so this token
+        // errors with a clear "outside chained_action" pointer rather
+        // than silently resolving to null.
+        other if other.starts_with("previous_step.") => {
+            let field = &other["previous_step.".len()..];
+            if field.is_empty() {
+                return Err(
+                    "substitute: '{{previous_step.}}' must name a field (e.g. {{previous_step.local_path}})"
+                        .into(),
+                );
+            }
+            let prev = ctx.previous_step.ok_or_else(|| format!(
+                "substitute: '{{{{previous_step.{}}}}}' referenced outside a chained_action \
+                 (or on the FIRST step of a chain — previous_step is only available from step 2 onwards)",
+                field,
+            ))?;
+            // Use the same top-level-only projection rule the polling
+            // job_id_path enforces, so behaviour stays uniform.
+            prev.get(field).cloned().ok_or_else(|| {
+                format!(
+                    "substitute: '{{{{previous_step.{}}}}}' — field not found in previous step's response \
+                     (response: {})",
+                    field, prev,
+                )
+            })
+        }
+        // v0.2.32 (CHAINED_ACTION): {{step.N.<field>}} resolves by
+        // absolute index into the chain's response array. Useful when
+        // step K needs to reference step (K-2)'s output rather than
+        // (K-1)'s. N is zero-based — `step.0` = the first step's
+        // response. Out-of-range indices error cleanly.
+        other if other.starts_with("step.") => {
+            let rest = &other["step.".len()..];
+            // Split at the FIRST '.' — everything before is the index,
+            // everything after is the field name. `step.0.local_path`
+            // → idx=0, field="local_path".
+            let dot = rest.find('.').ok_or_else(|| format!(
+                "substitute: '{{{{step.{}}}}}' missing field segment \
+                 (expected '{{{{step.N.<field>}}}}')",
+                rest,
+            ))?;
+            let idx_str = &rest[..dot];
+            let field = &rest[dot + 1..];
+            if field.is_empty() {
+                return Err(format!(
+                    "substitute: '{{{{step.{}.}}}}' must name a field",
+                    idx_str,
+                ));
+            }
+            let idx: usize = idx_str.parse().map_err(|_| format!(
+                "substitute: '{{{{step.{}.<field>}}}}' — '{}' is not a valid zero-based step index",
+                idx_str, idx_str,
+            ))?;
+            let step_value = ctx.step_results.get(idx).ok_or_else(|| format!(
+                "substitute: '{{{{step.{}.{}}}}}' — chain has only {} step results so far",
+                idx, field, ctx.step_results.len(),
+            ))?;
+            step_value.get(field).cloned().ok_or_else(|| format!(
+                "substitute: '{{{{step.{}.{}}}}}' — field not found in step {}'s response \
+                 (response: {})",
+                idx, field, idx, step_value,
+            ))
+        }
         other => Err(format!(
-            "substitute: unknown placeholder '{{{{{}}}}}' (allowed: project_id, module_id, value, control:<id>, events_paths_for:<id>)",
+            "substitute: unknown placeholder '{{{{{}}}}}' (allowed: project_id, module_id, value, control:<id>, events_paths_for:<id>, previous_step.<field>, step.N.<field>)",
             other,
         )),
     }
@@ -513,12 +599,18 @@ pub(crate) async fn dispatch_action_with_sink(
         resolver
     });
 
-    let ctx = SubstitutionContext {
+    // Build a default SubstitutionContext used by single-step + the
+    // legacy `next_action`-chain path. The chained_action path builds
+    // per-step contexts so it can populate `previous_step` /
+    // `step_results` between iterations.
+    let default_ctx = SubstitutionContext {
         project_id,
         module_id,
         value: value_ref,
         get_control_value: resolver,
         get_events_paths_for: events_paths_resolver,
+        previous_step: None,
+        step_results: EMPTY_STEP_RESULTS,
     };
 
     // Resolve the module's port. The dispatcher refuses to fire when
@@ -533,39 +625,275 @@ pub(crate) async fn dispatch_action_with_sink(
             )
         })?;
 
-    // Walk the chain iteratively. We retain the FIRST kick's response
-    // as the return value; subsequent steps' responses fire via events
-    // (or are simply discarded — polling progress is the visible signal).
-    let mut current_action = action;
-    let mut first_response: Option<Value> = None;
-    let mut steps: u32 = 0;
-    loop {
-        steps += 1;
-        if steps > MAX_CHAIN_STEPS {
-            return Err(format!(
-                "module_dispatch: chain depth exceeded {} steps — refusing to continue",
-                MAX_CHAIN_STEPS,
-            ));
+    // v0.2.32 (CHAINED_ACTION): top-level dispatch on the action shape.
+    // ChainedAction has different chaining semantics from the legacy
+    // `Http { next_action: ... }` form (it threads step responses into
+    // subsequent step bodies, while next_action just runs them serially
+    // without inter-step data flow). Handled by a dedicated executor
+    // that builds per-step contexts.
+    match action {
+        ActionDescriptor::ChainedAction { steps, polling, rollback_on_step_failure } => {
+            execute_chained_action(
+                module_id,
+                project_id,
+                steps,
+                polling,
+                rollback_on_step_failure,
+                &default_ctx,
+                port,
+                sink,
+                http_client,
+            )
+            .await
         }
-        let (resp, next) = execute_one_step(
-            module_id,
-            project_id,
-            &current_action,
-            &ctx,
-            port,
-            sink.clone(),
-            http_client,
-        )
-        .await?;
-        if first_response.is_none() {
-            first_response = Some(resp);
-        }
-        match next {
-            Some(boxed) => current_action = *boxed,
-            None => break,
+        other_action => {
+            // Legacy single-action + `next_action` chain path. Walk
+            // iteratively, retaining the FIRST kick's response as the
+            // return value (subsequent steps' responses fire via events
+            // or are discarded). Bounded by MAX_CHAIN_STEPS.
+            let mut current_action = other_action;
+            let mut first_response: Option<Value> = None;
+            let mut steps_walked: u32 = 0;
+            loop {
+                steps_walked += 1;
+                if steps_walked > MAX_CHAIN_STEPS {
+                    return Err(format!(
+                        "module_dispatch: chain depth exceeded {} steps — refusing to continue",
+                        MAX_CHAIN_STEPS,
+                    ));
+                }
+                let (resp, next) = execute_one_step(
+                    module_id,
+                    project_id,
+                    &current_action,
+                    &default_ctx,
+                    port,
+                    sink.clone(),
+                    http_client,
+                )
+                .await?;
+                if first_response.is_none() {
+                    first_response = Some(resp);
+                }
+                match next {
+                    Some(boxed) => current_action = *boxed,
+                    None => break,
+                }
+            }
+            Ok(first_response.unwrap_or(Value::Null))
         }
     }
-    Ok(first_response.unwrap_or(Value::Null))
+}
+
+/// v0.2.32 (CHAINED_ACTION): execute a sequence of step descriptors,
+/// threading each step's response into the next step's body via the
+/// `{{previous_step.<field>}}` and `{{step.N.<field>}}` placeholder
+/// tokens.
+///
+/// Failure semantics for v0.2.32:
+///   * On any step's failure, LOG via `eprintln!` (the dispatcher's
+///     standard error sink — matches the polling loop's error logging)
+///     and PROPAGATE the error to the caller. Previous steps' side
+///     effects (downloaded files, persisted state, container DB rows)
+///     are NOT rolled back — the user gets a clear "step N failed"
+///     error and can retry from the point of failure.
+///   * `rollback_on_step_failure: true` parses but has no effect
+///     in v0.2.32. The flag is reserved for v0.2.33+ when each action
+///     kind grows a rollback companion.
+///
+/// Polling:
+///   * `polling` (if Some) attaches to the FINAL step's response.
+///   * Intermediate steps' `polling` declarations (if any nested
+///     within a step's own `Http` descriptor) execute normally —
+///     they fire their own background polling task as usual. The
+///     chained-action `polling` is layered on top of the final step.
+async fn execute_chained_action(
+    module_id: &str,
+    project_id: &str,
+    steps: Vec<ActionDescriptor>,
+    chain_polling: Option<PollingSpec>,
+    _rollback_on_step_failure: bool, // reserved for v0.2.33+
+    parent_ctx: &SubstitutionContext<'_>,
+    port: u16,
+    sink: Arc<dyn EventSink>,
+    http_client: &reqwest::Client,
+) -> Result<Value, String> {
+    if steps.is_empty() {
+        return Err(
+            "module_dispatch: chained_action.steps is empty (a chained_action with no steps is meaningless)"
+                .into(),
+        );
+    }
+    if steps.len() > MAX_CHAIN_STEPS as usize {
+        return Err(format!(
+            "module_dispatch: chained_action has {} steps, exceeds MAX_CHAIN_STEPS={}",
+            steps.len(),
+            MAX_CHAIN_STEPS,
+        ));
+    }
+    // Accumulator for step responses. Indexed by step position so the
+    // {{step.N.<field>}} resolver can address arbitrary prior steps.
+    let mut step_results: Vec<Value> = Vec::with_capacity(steps.len());
+
+    // The chain executes serially. We rebuild the SubstitutionContext
+    // per step (cheap — it just holds references) so `previous_step` /
+    // `step_results` reflect the chain's running state at substitute
+    // time. The closures live on the parent_ctx and don't get cloned.
+    let total_steps = steps.len();
+    for (step_idx, step_action) in steps.into_iter().enumerate() {
+        // Disallow nested ChainedAction-inside-ChainedAction in v0.2.32.
+        // Nesting is technically expressible in the JSON shape but the
+        // semantics get confusing fast (which polling block wins? which
+        // previous_step is referenced? does inner failure roll back the
+        // outer chain?). Reject at execute time so manifest authors get
+        // a clear pointer rather than an opaque dispatch error.
+        if matches!(step_action, ActionDescriptor::ChainedAction { .. }) {
+            return Err(format!(
+                "module_dispatch: chained_action.steps[{}] is itself a chained_action — \
+                 nesting is not supported in v0.2.32 (flatten the inner chain into the outer one)",
+                step_idx,
+            ));
+        }
+
+        // For the final step, if a chain-level polling block was
+        // declared, layer it on top of the step's own descriptor.
+        // We do this by deconstructing the step's `Http` variant and
+        // replacing its `polling` field with the chain-level spec
+        // (overwriting any step-level polling on the final step, which
+        // would be redundant — the chain owns the user-visible
+        // polling concern).
+        let is_final = step_idx + 1 == total_steps;
+        let step_action = if is_final && chain_polling.is_some() {
+            attach_chain_polling_to_final_step(step_action, chain_polling.clone())?
+        } else {
+            step_action
+        };
+
+        // Execute the step inside a scoped block so the per-step
+        // SubstitutionContext (which holds an immutable borrow of
+        // `step_results`) drops BEFORE we push the new response.
+        // Otherwise the borrow checker rejects the push as a
+        // mutable-while-immutable conflict.
+        let (resp, next_in_step) = {
+            // Build a per-step SubstitutionContext. The previous_step
+            // reference is the last response in `step_results` (or
+            // None on the first step). step_results is the whole
+            // accumulator slice the {{step.N.<field>}} resolver
+            // indexes into.
+            let previous_step = step_results.last();
+            let step_ctx = SubstitutionContext {
+                project_id: parent_ctx.project_id,
+                module_id: parent_ctx.module_id,
+                value: parent_ctx.value,
+                // Reuse the parent's resolvers via thin closures that
+                // delegate. Box::new'ing a closure that captures
+                // &mut refs to closures isn't viable, so we just
+                // rebuild by-reference accessors that punt through
+                // to the parent.
+                get_control_value: {
+                    let parent = &parent_ctx.get_control_value;
+                    Box::new(move |id| parent(id))
+                },
+                get_events_paths_for: parent_ctx.get_events_paths_for.as_ref().map(|parent| {
+                    let resolver: EventsPathsResolver = Box::new(move |id: &str| parent(id));
+                    resolver
+                }),
+                previous_step,
+                step_results: &step_results,
+            };
+
+            execute_one_step(
+                module_id,
+                project_id,
+                &step_action,
+                &step_ctx,
+                port,
+                sink.clone(),
+                http_client,
+            )
+            .await
+            .map_err(|e| {
+                // v0.2.32 failure-mode contract: log + propagate. The
+                // {step_idx + 1} formatting is one-based for user-
+                // facing error clarity (matches "step 2 failed" in
+                // toasts).
+                eprintln!(
+                    "[module_dispatch] chained_action step {} of {} failed: {}",
+                    step_idx + 1,
+                    total_steps,
+                    e,
+                );
+                format!("chained_action step {} of {} failed: {}", step_idx + 1, total_steps, e)
+            })?
+            // step_ctx dropped here — releases the immutable borrow.
+        };
+
+        // A step's OWN `next_action` chain (the legacy Http-level
+        // chain) is forbidden inside a chained_action because the
+        // semantics overlap with the outer chain (both run more
+        // actions, but only the outer chain threads responses). If a
+        // step's Http descriptor declares its own next_action, we
+        // refuse rather than execute it silently — keeps the data
+        // flow story unambiguous.
+        if next_in_step.is_some() {
+            return Err(format!(
+                "module_dispatch: chained_action.steps[{}] has its own next_action — \
+                 use a single flat chained_action.steps array instead of nesting next_action chains \
+                 (response data flow would be ambiguous)",
+                step_idx,
+            ));
+        }
+
+        step_results.push(resp);
+    }
+
+    // Return the LAST step's response (matches the orchestrator's
+    // expectation that the chain's "result" = the result of its
+    // final step). For chains with polling, this is the kick body of
+    // the final step; the actual long-running job's progress flows
+    // via the polling-event channel.
+    step_results.pop().ok_or_else(|| {
+        // Defensive: shouldn't reach here (we error on empty above)
+        // but keep the compiler happy without unwrap.
+        "module_dispatch: chained_action produced no step results (empty steps?)".into()
+    })
+}
+
+/// v0.2.32 (CHAINED_ACTION): attach a chain-level `polling` block to
+/// the final step's `Http` descriptor, OVERWRITING any step-level
+/// polling that step may already declare (the chain owns the
+/// user-visible long-running progress concern on the final step).
+///
+/// For non-`Http` final steps (e.g. a hypothetical future `Tauri`
+/// step kind), polling currently has no meaning — we error rather
+/// than silently drop the polling block.
+fn attach_chain_polling_to_final_step(
+    step: ActionDescriptor,
+    chain_polling: Option<PollingSpec>,
+) -> Result<ActionDescriptor, String> {
+    match step {
+        ActionDescriptor::Http {
+            method,
+            path,
+            body,
+            polling: _step_polling, // intentionally discarded — chain owns the polling now
+            next_action,
+        } => Ok(ActionDescriptor::Http {
+            method,
+            path,
+            body,
+            polling: chain_polling,
+            next_action,
+        }),
+        ActionDescriptor::ChainedAction { .. } => Err(
+            // Defensive: the loop already rejects nested chained_action
+            // before this point, but pattern-completeness makes the
+            // compiler happy AND surfaces a clear error if a future
+            // refactor accidentally inverts the order of checks.
+            "module_dispatch: chain-level polling cannot attach to a nested chained_action final step"
+                .into(),
+        ),
+    }
 }
 
 /// Execute one descriptor (no chain following). Returns
@@ -656,6 +984,20 @@ async fn execute_one_step(
 
             Ok((body_json, next_action.clone()))
         }
+        // v0.2.32 (CHAINED_ACTION): `execute_one_step` is the single-
+        // step executor used by the legacy `Http { next_action: ... }`
+        // chain path AND by the chained-action loop. The chained-action
+        // loop itself decomposes its top-level descriptor BEFORE
+        // calling here (so each iteration's `action` is one of the
+        // inner steps), and it also rejects nested chained_action
+        // upstream. So reaching this arm means a code-path invariant
+        // was violated — return a clear error rather than silently
+        // returning Ok with a dummy response.
+        ActionDescriptor::ChainedAction { .. } => Err(
+            "module_dispatch: internal — execute_one_step received a ChainedAction \
+             (the dispatch loop should have intercepted it; this is a bug)"
+                .into(),
+        ),
     }
 }
 
@@ -1141,6 +1483,8 @@ mod tests {
                 }
             }),
             get_events_paths_for: None,
+            previous_step: None,
+            step_results: EMPTY_STEP_RESULTS,
         };
         let out = substitute(&v, &ctx).unwrap();
         assert_eq!(
@@ -1190,6 +1534,8 @@ mod tests {
             value: None,
             get_control_value: Box::new(|_| None),
             get_events_paths_for: Some(Box::new(resolver)),
+            previous_step: None,
+            step_results: EMPTY_STEP_RESULTS,
         }
     }
 
@@ -1228,6 +1574,8 @@ mod tests {
             value: None,
             get_control_value: Box::new(|_| None),
             get_events_paths_for: None,
+            previous_step: None,
+            step_results: EMPTY_STEP_RESULTS,
         };
         let err = substitute(&v, &ctx).unwrap_err();
         assert!(err.contains("events_paths_for"), "got: {}", err);
@@ -2005,6 +2353,365 @@ mod tests {
         assert!(
             err.contains("no port for project") && err.contains("ghost-module"),
             "expected diagnostic mentioning module + project, got: {}",
+            err,
+        );
+    }
+
+    // ─── v0.2.32 (CHAINED_ACTION, 2026-05-24): chained_action executor ───
+    //
+    // The chained_action primitive executes a sequence of step
+    // descriptors serially, threading each step's response into the
+    // next step's body via the `{{previous_step.<field>}}` token. The
+    // tests below pin the three load-bearing invariants:
+    //
+    //   1. Two-step chain threads previous_step.local_path correctly.
+    //   2. Chain-level polling attaches to the FINAL step only.
+    //   3. Second-step failure preserves the first step's effect (no
+    //      auto-rollback in v0.2.32 — the user retries from step 2).
+
+    /// chained_action with two steps where step 2 references
+    /// `{{previous_step.local_path}}` from step 1's response. Verifies
+    /// the substitution threading end-to-end.
+    #[tokio::test]
+    async fn chained_action_two_step_threads_previous_step_local_path() {
+        let project_id = "proj-A";
+        let module_id = "mod-X";
+
+        // Capture the body step 2 receives so we can assert the
+        // {{previous_step.local_path}} substitution worked.
+        let received_step2_body: Arc<StdMutex<Option<Value>>> = Arc::new(StdMutex::new(None));
+        let body_capture = received_step2_body.clone();
+
+        let router = Router::new()
+            .route(
+                "/download_default",
+                routing::post(|| async {
+                    // Step 1 response — exactly what Agent J's
+                    // module_download_default_weights would return.
+                    Json(json!({"local_path": "/data/weights/v0.2.6/arctic_1024.pt", "version": "0.2.6"}))
+                }),
+            )
+            .route(
+                "/finetune",
+                routing::post(move |Json(body): Json<Value>| {
+                    let cap = body_capture.clone();
+                    async move {
+                        *cap.lock().unwrap() = Some(body);
+                        Json(json!({"job_id": "ft-job-1"}))
+                    }
+                }),
+            );
+        let port = start_server(router).await;
+
+        let db = db_with_module(project_id, module_id, port);
+        let client = build_http_client();
+        let sink: Arc<dyn EventSink> = Arc::new(RecordingSink::new());
+
+        let action = ActionDescriptor::ChainedAction {
+            steps: vec![
+                ActionDescriptor::Http {
+                    method: HttpMethod::Post,
+                    path: "/download_default".into(),
+                    body: None,
+                    polling: None,
+                    next_action: None,
+                },
+                ActionDescriptor::Http {
+                    method: HttpMethod::Post,
+                    path: "/finetune".into(),
+                    body: Some(json!({
+                        "mode": "offline",
+                        "starting_checkpoint": "{{previous_step.local_path}}",
+                    })),
+                    polling: None,
+                    next_action: None,
+                },
+            ],
+            polling: None,
+            rollback_on_step_failure: false,
+        };
+
+        let resp = dispatch_action_with_sink(
+            module_id, project_id, action, None, None, None, sink, &db, &client,
+        )
+        .await
+        .expect("chained_action dispatch ok");
+
+        // Return value is the FINAL step's response (chain semantics:
+        // the chain's result = the final step's kick body).
+        assert_eq!(resp["job_id"], json!("ft-job-1"));
+
+        // Step 2's body MUST contain the substituted local_path from
+        // step 1's response, not the literal placeholder string.
+        let step2_body = received_step2_body.lock().unwrap().clone().expect("step 2 body captured");
+        assert_eq!(
+            step2_body["starting_checkpoint"],
+            json!("/data/weights/v0.2.6/arctic_1024.pt"),
+            "{{previous_step.local_path}} must substitute step 1's local_path",
+        );
+        assert_eq!(step2_body["mode"], json!("offline"), "literal body fields preserved");
+    }
+
+    /// Chain-level polling block attaches to the FINAL step ONLY. We
+    /// verify by sending a chain whose final step's kick response
+    /// includes a job_id, then waiting for the polling endpoint to fire
+    /// terminal=done. The earlier step does NOT carry polling; if the
+    /// dispatcher mis-attached the polling to the wrong step, the test
+    /// would see polling hit the wrong endpoint or no polling at all.
+    #[tokio::test]
+    async fn chained_action_polling_attaches_to_last_step() {
+        let project_id = "proj-A";
+        let module_id = "mod-X";
+
+        let poll_counter = Arc::new(StdMutex::new(0u32));
+        let poll_counter_clone = poll_counter.clone();
+
+        let router = Router::new()
+            .route(
+                "/quick_step",
+                routing::post(|| async { Json(json!({"step": "quick", "ok": true})) }),
+            )
+            .route(
+                "/long_step",
+                routing::post(|| async {
+                    // Final step returns the job_id the chain-level
+                    // polling spec will track.
+                    Json(json!({"job_id": "chain-final-job"}))
+                }),
+            )
+            .route(
+                "/chain_status",
+                routing::get(move |Query(_): Query<HashMap<String, String>>| {
+                    let c = poll_counter_clone.clone();
+                    async move {
+                        let mut n = c.lock().unwrap();
+                        *n += 1;
+                        // Done after a few ticks.
+                        let state = if *n >= 2 { "done" } else { "running" };
+                        Json(json!({"state": state, "tick": *n}))
+                    }
+                }),
+            );
+        let port = start_server(router).await;
+        let db = db_with_module(project_id, module_id, port);
+        let client = build_http_client();
+        let sink = RecordingSink::new();
+        let sink_arc: Arc<dyn EventSink> = Arc::new(sink.clone());
+
+        let action = ActionDescriptor::ChainedAction {
+            steps: vec![
+                ActionDescriptor::Http {
+                    method: HttpMethod::Post,
+                    path: "/quick_step".into(),
+                    body: None,
+                    polling: None,
+                    next_action: None,
+                },
+                ActionDescriptor::Http {
+                    method: HttpMethod::Post,
+                    path: "/long_step".into(),
+                    body: None,
+                    polling: None, // chain-level polling layered on
+                    next_action: None,
+                },
+            ],
+            polling: Some(PollingSpec {
+                endpoint: "/chain_status".into(),
+                job_id_path: "$.job_id".into(),
+                job_id_query_param: "job_id".into(),
+                interval_seconds: 0,
+                max_attempts: 10,
+                terminal_state_field: "$.state".into(),
+                terminal_success_values: vec!["done".into()],
+                terminal_failure_values: vec!["failed".into()],
+                progress_event: "test://chain-progress".into(),
+                failed_event: "test://chain-failed".into(),
+            }),
+            rollback_on_step_failure: false,
+        };
+
+        let resp = dispatch_action_with_sink(
+            module_id, project_id, action, None, None, None, sink_arc, &db, &client,
+        )
+        .await
+        .expect("dispatch ok");
+
+        // Return value is the FINAL step's kick response, which had
+        // the job_id (because polling was layered onto step 2).
+        assert_eq!(resp["job_id"], json!("chain-final-job"));
+
+        // Wait for the polling loop to converge.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        let events = sink.snapshot();
+        let progress: Vec<_> = events
+            .iter()
+            .filter(|(e, _)| e == "test://chain-progress")
+            .collect();
+        let failed: Vec<_> = events
+            .iter()
+            .filter(|(e, _)| e == "test://chain-failed")
+            .collect();
+        assert!(
+            !progress.is_empty(),
+            "chain-level polling must produce ≥1 progress event on the final step, got events: {:?}",
+            events,
+        );
+        assert!(failed.is_empty(), "no failed event expected on success path");
+
+        // The progress event's response shape carries `state` / `tick`
+        // from /chain_status, confirming the poller hit the right
+        // endpoint (i.e. polling was correctly attached to the final
+        // step's kick response).
+        let last_progress = progress.last().expect("≥1 progress");
+        assert_eq!(last_progress.1["state"], json!("done"));
+    }
+
+    /// Step 2 failure does NOT roll back step 1's effect (v0.2.32 has
+    /// no automatic rollback). The first step's side effect must
+    /// remain observable AFTER the chain returns its error.
+    ///
+    /// We simulate "step 1 effect" with a side-effect counter the
+    /// server increments on /step1_with_effect; the assertion is that
+    /// counter is exactly 1 after step 2 returns 500 — step 1 ran AND
+    /// was not undone.
+    #[tokio::test]
+    async fn chained_action_second_step_failure_preserves_first_step_result() {
+        let project_id = "proj-A";
+        let module_id = "mod-X";
+
+        let side_effect_counter = Arc::new(StdMutex::new(0u32));
+        let counter_for_step1 = side_effect_counter.clone();
+
+        let router = Router::new()
+            .route(
+                "/step1_with_effect",
+                routing::post(move || {
+                    let c = counter_for_step1.clone();
+                    async move {
+                        *c.lock().unwrap() += 1;
+                        Json(json!({"step": "first", "effect_applied": true}))
+                    }
+                }),
+            )
+            .route(
+                "/step2_fails",
+                routing::post(|| async {
+                    // Always 500 — step 2 fails.
+                    (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "step 2 broken").into_response()
+                }),
+            );
+        let port = start_server(router).await;
+        let db = db_with_module(project_id, module_id, port);
+        let client = build_http_client();
+        let sink: Arc<dyn EventSink> = Arc::new(RecordingSink::new());
+
+        let action = ActionDescriptor::ChainedAction {
+            steps: vec![
+                ActionDescriptor::Http {
+                    method: HttpMethod::Post,
+                    path: "/step1_with_effect".into(),
+                    body: None,
+                    polling: None,
+                    next_action: None,
+                },
+                ActionDescriptor::Http {
+                    method: HttpMethod::Post,
+                    path: "/step2_fails".into(),
+                    body: None,
+                    polling: None,
+                    next_action: None,
+                },
+            ],
+            polling: None,
+            rollback_on_step_failure: false,
+        };
+
+        let err = dispatch_action_with_sink(
+            module_id, project_id, action, None, None, None, sink, &db, &client,
+        )
+        .await
+        .expect_err("step 2 must fail and propagate");
+
+        // Error message names the failing step number (1-based) and
+        // total count.
+        assert!(
+            err.contains("step 2 of 2") || err.contains("step 2"),
+            "error must name failing step, got: {}",
+            err,
+        );
+
+        // Step 1's side effect is preserved (counter incremented
+        // exactly once, NOT rolled back even though step 2 failed).
+        let final_count = *side_effect_counter.lock().unwrap();
+        assert_eq!(
+            final_count, 1,
+            "step 1 ran exactly once and its effect is NOT rolled back \
+             on step 2 failure (v0.2.32 has no auto-rollback)",
+        );
+    }
+
+    /// Empty `steps` is rejected at execute time — a chained_action
+    /// with zero steps is meaningless and almost certainly a manifest
+    /// authoring bug.
+    #[tokio::test]
+    async fn chained_action_empty_steps_errors() {
+        let project_id = "proj-A";
+        let module_id = "mod-X";
+
+        let router = Router::new();
+        let port = start_server(router).await;
+        let db = db_with_module(project_id, module_id, port);
+        let client = build_http_client();
+        let sink: Arc<dyn EventSink> = Arc::new(RecordingSink::new());
+
+        let action = ActionDescriptor::ChainedAction {
+            steps: vec![],
+            polling: None,
+            rollback_on_step_failure: false,
+        };
+
+        let err = dispatch_action_with_sink(
+            module_id, project_id, action, None, None, None, sink, &db, &client,
+        )
+        .await
+        .expect_err("empty steps must error");
+        assert!(err.contains("empty"), "expected 'empty' in error, got: {}", err);
+    }
+
+    /// {{previous_step.<field>}} OUTSIDE a chained_action (i.e.
+    /// referenced inside a single-step dispatch) errors cleanly. The
+    /// dispatcher must not silently resolve it to null — manifests
+    /// that use the token must do so inside a chain.
+    #[tokio::test]
+    async fn previous_step_token_outside_chain_errors() {
+        let project_id = "proj-A";
+        let module_id = "mod-X";
+
+        let router = Router::new().route("/x", routing::post(|| async { Json(json!({})) }));
+        let port = start_server(router).await;
+        let db = db_with_module(project_id, module_id, port);
+        let client = build_http_client();
+        let sink: Arc<dyn EventSink> = Arc::new(RecordingSink::new());
+
+        // Single-step Http with {{previous_step.foo}} in the body —
+        // the resolver should reject because previous_step is None
+        // outside a chained_action context.
+        let action = ActionDescriptor::Http {
+            method: HttpMethod::Post,
+            path: "/x".into(),
+            body: Some(json!({"ref": "{{previous_step.foo}}"})),
+            polling: None,
+            next_action: None,
+        };
+        let err = dispatch_action_with_sink(
+            module_id, project_id, action, None, None, None, sink, &db, &client,
+        )
+        .await
+        .expect_err("previous_step outside chain must error");
+        assert!(
+            err.contains("previous_step") && err.contains("chained_action"),
+            "expected 'previous_step' + 'chained_action' in error, got: {}",
             err,
         );
     }

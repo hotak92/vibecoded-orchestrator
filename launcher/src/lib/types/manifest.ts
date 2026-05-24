@@ -47,8 +47,8 @@ export interface PollingSpec {
   failed_event?: string;
 }
 
-/** Declarative action that the generic `module_dispatch_action` Tauri command executes. */
-export type ActionDescriptor = {
+/** HTTP action descriptor — issues a request to the module's container. */
+export interface HttpActionDescriptor {
   kind: 'http';
   method: 'GET' | 'POST' | 'PUT' | 'DELETE';
   path: string;
@@ -56,7 +56,32 @@ export type ActionDescriptor = {
   polling?: PollingSpec | null;
   /** Chain a follow-up action on success. Bounded by `max_chain_steps` (default 1024). */
   next_action?: ActionDescriptor | null;
-};
+}
+
+/**
+ * v0.2.32 (CHAINED_ACTION, 2026-05-24): generic chained-action
+ * primitive. Executes `steps` serially; each step's response body is
+ * threaded into the next step's body via `{{previous_step.<field>}}`
+ * or `{{step.N.<field>}}` placeholders. Optional `polling` attaches
+ * to the FINAL step.
+ *
+ * Failure semantics for v0.2.32: on any step failure, the dispatcher
+ * logs + propagates the error to the renderer. Previous steps' side
+ * effects are NOT rolled back. `rollback_on_step_failure` is reserved
+ * for v0.2.33+ (no effect today).
+ */
+export interface ChainedActionDescriptor {
+  kind: 'chained_action';
+  /** Ordered list of step descriptors. Empty → error at dispatch time. */
+  steps: ActionDescriptor[];
+  /** Polling block attached to the final step's response. */
+  polling?: PollingSpec | null;
+  /** Reserved for v0.2.33+. Parses but has no effect in v0.2.32. */
+  rollback_on_step_failure?: boolean;
+}
+
+/** Declarative action that the generic `module_dispatch_action` Tauri command executes. */
+export type ActionDescriptor = HttpActionDescriptor | ChainedActionDescriptor;
 
 /**
  * Either a legacy Tauri command name (string) OR a structured action
@@ -169,6 +194,87 @@ export interface LinkControl {
   target?: 'external' | 'internal' | string;
 }
 
+// ─── v0.2.32 new control kinds (L4, L5) ────────────────────────────────
+
+/**
+ * v0.2.32 L4 (2026-05-24): data source for InfoDynamicControl. The
+ * `kind` tag is forward-compatible — v1 ships exactly one variant
+ * (`module_db`); future kinds (`http_endpoint`, `tauri_command`) will
+ * land additively without breaking older manifests.
+ */
+export type InfoDynamicSource = {
+  kind: 'module_db';
+  /** Module-DB table name (must be `{module_namespace}_*`). */
+  table: string;
+  /** Row key. May contain `{{project_id}}` (substituted by renderer). */
+  key: string;
+  /** Field to project from the row's JSON value. */
+  field: string;
+};
+
+/**
+ * v0.2.32 L4 (2026-05-24): live read-only info display bound to a
+ * structured data source (currently `module_db`). The renderer reads
+ * the source on mount and on manual refresh (`↻` button per section
+ * that contains at least one `*_dynamic` control).
+ *
+ * `format` is a template with the single token `{value}` — replaced
+ * with the source's resolved value (stringified for non-string
+ * scalars). Default `"{value}"` (= just print the value verbatim).
+ *
+ * `fallback` renders when the source returns null (row absent, hub
+ * unreachable, container never ran).
+ */
+export interface InfoDynamicControl {
+  kind: 'info_dynamic';
+  id: string;
+  label: string;
+  tooltip?: string | null;
+  source: InfoDynamicSource;
+  /** Default `"{value}"`. */
+  format?: string;
+  /** Rendered when source returns null. */
+  fallback?: string | null;
+}
+
+/**
+ * v0.2.32 L5 (2026-05-24): native HTML date picker.
+ *
+ * `default` accepts EITHER an ISO `YYYY-MM-DD` literal OR a keyword:
+ *   - `"today"`  → today's date in the user's local wall clock
+ *   - `"30_days_ago"` → today minus 30 days
+ *   - `"90_days_ago"` → today minus 90 days
+ *
+ * Keyword resolution happens at mount time (renderer-side) so the
+ * value matches the user's clock at the moment the control rendered.
+ *
+ * `min` / `max` are forwarded to the native `<input min/max>`
+ * attributes verbatim — they must be ISO date literals (no keyword
+ * resolution; manifests should declare concrete bounds).
+ *
+ * `on_change` fires after persistence (same flow as `text_input` /
+ * `select`). The dispatcher exposes the new date via `{{value}}` and
+ * the persisted value is available to sibling controls via
+ * `{{control:<id>}}`.
+ *
+ * Clear affordance: a small "Clear" button next to the input writes
+ * `null` to module_settings (represents "no date filter" — RL's
+ * `/global/retrain` reads this as "all history").
+ */
+export interface DatePickerControl {
+  kind: 'date_picker';
+  id: string;
+  label: string;
+  tooltip?: string | null;
+  /** ISO literal OR keyword `today` / `30_days_ago` / `90_days_ago`. */
+  default?: string | null;
+  /** ISO date lower-bound (`<input min>`). */
+  min?: string | null;
+  /** ISO date upper-bound (`<input max>`). */
+  max?: string | null;
+  on_change?: ActionRef | null;
+}
+
 export type ConfigControl =
   | CheckboxControl
   | MultiSelectControl
@@ -179,7 +285,10 @@ export type ConfigControl =
   | NumberInputControl
   | StatusDisplayControl
   | FilePickerControl
-  | LinkControl;
+  | LinkControl
+  // v0.2.32 additions:
+  | InfoDynamicControl
+  | DatePickerControl;
 
 // ─── ConfigSection + ConfigTab ──────────────────────────────────────────
 
@@ -201,12 +310,30 @@ export interface ConfigTab {
 
 // ─── Helper type guards ─────────────────────────────────────────────────
 
-/** True when `action` is a structured ActionDescriptor (the v0.2.26 path). */
+/**
+ * True when `action` is a structured ActionDescriptor (the v0.2.26
+ * path or the v0.2.32 chained_action path). The renderer dispatches
+ * both via the single `module_dispatch_action` Tauri command — all
+ * chaining logic lives in Rust.
+ */
 export function isActionDescriptor(action: ActionRef): action is ActionDescriptor {
-  return typeof action === 'object' && action !== null && (action as ActionDescriptor).kind === 'http';
+  if (typeof action !== 'object' || action === null) return false;
+  const kind = (action as { kind?: string }).kind;
+  return kind === 'http' || kind === 'chained_action';
 }
 
 /** True when `action` is a legacy Tauri command name string. */
 export function isLegacyAction(action: ActionRef): action is string {
   return typeof action === 'string';
+}
+
+/** True when `action` is the v0.2.32 chained_action variant. */
+export function isChainedAction(
+  action: ActionRef,
+): action is ChainedActionDescriptor {
+  return (
+    typeof action === 'object' &&
+    action !== null &&
+    (action as { kind?: string }).kind === 'chained_action'
+  );
 }
