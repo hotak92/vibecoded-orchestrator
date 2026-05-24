@@ -916,6 +916,36 @@ pub fn parse_active_embedding_from_env_file(path: &Path) -> Option<String> {
     None
 }
 
+/// v0.2.32 (L7): Tauri command exposing the per-project text-embedding-source
+/// identifier (e.g. `"qwen3"`, `"arctic"`, `"openai"`) to the launcher
+/// renderer.
+///
+/// Used by `ModuleConfigTab.svelte` to resolve the
+/// `{{embedding_source_from_project_kg_binding}}` placeholder at dispatch
+/// time, BEFORE the action descriptor is handed to `module_dispatch_action`.
+/// Doing the substitution client-side keeps the v0.2.32 patch surface tiny:
+/// no new Rust placeholder, no new dispatcher branch.
+///
+/// Resolution priority mirrors `read_active_embedding_source`:
+///   1. `ACTIVE_EMBEDDING` line in the project's `.claude/env`
+///   2. `DEFAULT_EMBEDDING_SOURCE` (currently `"qwen3"`) when the file is
+///      missing / malformed / has no `ACTIVE_EMBEDDING` line.
+///
+/// The return is ALWAYS a non-empty string — fallback is unconditional so
+/// the renderer never has to handle a missing value. Errors only surface
+/// for truly broken inputs (unknown project_id).
+#[command]
+pub async fn get_project_embedding_source(
+    project_id: String,
+    db: State<'_, Db>,
+) -> Result<String, String> {
+    let project = db
+        .get_project(&project_id)?
+        .ok_or_else(|| format!("project {} not found", project_id))?;
+    Ok(read_active_embedding_source(&project)
+        .unwrap_or_else(|| DEFAULT_EMBEDDING_SOURCE.to_string()))
+}
+
 /// Download new weights to a versioned file under the bind-mount, verify
 /// sha256 (when non-empty), then atomically rename to the final path.
 /// Returns the active-path the container will load.
@@ -2281,5 +2311,77 @@ mod tests {
         );
         let persisted = db.get_project_rl_port("proj-base").unwrap().unwrap();
         assert_eq!(persisted, port);
+    }
+
+    // ─── v0.2.32 L7: read_active_embedding_source via .claude/env ──────
+
+    /// Mirrors what `get_project_embedding_source` does once it has a
+    /// `ProjectRow`: build the env path, parse it, fall back to the
+    /// default. Direct `#[command]`-decorated function can't be invoked
+    /// from a unit test without a Tauri `State<'_, Db>`, so we drive the
+    /// helper composition end-to-end instead. Acceptance criteria for L7
+    /// require: (a) a real ACTIVE_EMBEDDING value flows through verbatim,
+    /// (b) absent file / line falls back to "qwen3".
+    #[test]
+    fn read_active_embedding_source_returns_active_embedding_when_set() {
+        let tmp = std::env::temp_dir().join(format!(
+            "vct_l7_test_present_{}",
+            std::process::id()
+        ));
+        let claude_dir = tmp.join(".claude");
+        std::fs::create_dir_all(&claude_dir).expect("mkdir .claude");
+        std::fs::write(
+            claude_dir.join("env"),
+            "# header\nACTIVE_EMBEDDING=arctic\nOTHER=ignored\n",
+        )
+        .expect("write env");
+
+        let project = ProjectRow {
+            id: "p-l7-present".into(),
+            name: "P".into(),
+            folder_path: tmp.to_string_lossy().into_owned(),
+            host: ProjectHost::Base,
+            slug: "p-slug".into(),
+            created_at: 0,
+            updated_at: 0,
+            rl_port: None,
+        };
+
+        let got = read_active_embedding_source(&project);
+        assert_eq!(got.as_deref(), Some("arctic"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn read_active_embedding_source_falls_back_to_default_when_missing() {
+        // Pointing at a folder that doesn't have `.claude/env` at all.
+        let tmp = std::env::temp_dir().join(format!(
+            "vct_l7_test_missing_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+
+        let project = ProjectRow {
+            id: "p-l7-missing".into(),
+            name: "P".into(),
+            folder_path: tmp.to_string_lossy().into_owned(),
+            host: ProjectHost::Base,
+            slug: "p-slug".into(),
+            created_at: 0,
+            updated_at: 0,
+            rl_port: None,
+        };
+
+        // Helper returns None.
+        let got = read_active_embedding_source(&project);
+        assert!(got.is_none());
+
+        // Caller's composition (= what the Tauri command does):
+        // None → DEFAULT_EMBEDDING_SOURCE.
+        let resolved = got.unwrap_or_else(|| DEFAULT_EMBEDDING_SOURCE.to_string());
+        assert_eq!(resolved, "qwen3");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

@@ -30,7 +30,7 @@
 
   import { onMount } from 'svelte';
   import { invoke, tauriAvailable } from '$lib/tauri';
-  import { selectedProject } from '$lib/stores/projects';
+  import { projects, selectedProject } from '$lib/stores/projects';
   import {
     isActionDescriptor,
     type ActionRef,
@@ -42,6 +42,10 @@
   import StatusDisplayControl from '$lib/components/module-controls/StatusDisplayControl.svelte';
   import FilePickerControl from '$lib/components/module-controls/FilePickerControl.svelte';
   import LinkControl from '$lib/components/module-controls/LinkControl.svelte';
+  import {
+    sectionUsesProjectId,
+    substituteEmbeddingSourceInAction,
+  } from '$lib/components/module-controls/configTabHelpers';
 
   // ─── Schema types ──────────────────────────────────────────────────────
   //
@@ -62,6 +66,74 @@
 
   const projectId = $derived($selectedProject?.id ?? '');
   const hasProject = $derived(projectId !== '');
+
+  // ─── v0.2.32 L3: per-section project picker ────────────────────────────
+  //
+  // Any section whose controls reference `{{project_id}}` in any action
+  // (path/body/legacy-string) renders a section-local picker that
+  // OVERRIDES the global `selectedProject`. Implementation strategy:
+  //
+  //   * `sectionRequiresProject[i]` — cached boolean derived from the
+  //     manifest. Computed once on mount; the schema doesn't mutate at
+  //     runtime so this is safe to memoise.
+  //   * `pickedProjectIdBySection[i]` — user's pick. Defaults to the
+  //     global `selectedProject` when null.
+  //   * `effectiveProjectId(i)` — `pickedProjectIdBySection[i] ?? projectId`.
+  //     This is what flows into every dispatchAction / persist call for
+  //     the controls inside section `i`.
+  //
+  // Backward compatibility: sections that don't reference `{{project_id}}`
+  // skip the picker entirely (the legacy global-project-only behaviour).
+  let sectionRequiresProject = $state<Record<number, boolean>>({});
+  let pickedProjectIdBySection = $state<Record<number, string>>({});
+
+  function effectiveProjectId(sectionIdx: number): string {
+    return pickedProjectIdBySection[sectionIdx] ?? projectId;
+  }
+
+  function sectionHasEffectiveProject(sectionIdx: number): boolean {
+    if (sectionRequiresProject[sectionIdx]) {
+      return effectiveProjectId(sectionIdx) !== '';
+    }
+    return hasProject;
+  }
+
+  // ─── v0.2.32 L7: embedding-source cache ────────────────────────────────
+  //
+  // The `{{embedding_source_from_project_kg_binding}}` placeholder is
+  // substituted client-side at dispatch time. Resolution happens once on
+  // mount (and again when the active project changes); the resolved
+  // value is cached PER project_id so picker-driven dispatches that
+  // target a different project pick up the right value.
+  //
+  // The Tauri command (`get_project_embedding_source`) always returns a
+  // non-empty string (falls back to `"qwen3"`), so a cache miss + lookup
+  // failure is treated as a transient — the dispatcher will see the
+  // unsubstituted token and fail loudly with a clear error.
+  let embeddingSourceByProjectId = $state<Record<string, string>>({});
+
+  async function ensureEmbeddingSourceCached(pid: string): Promise<void> {
+    if (!pid) return;
+    if (embeddingSourceByProjectId[pid] !== undefined) return;
+    if (!tauriAvailable()) return;
+    try {
+      const src = await invoke<string>('get_project_embedding_source', {
+        projectId: pid,
+      });
+      if (typeof src === 'string' && src.length > 0) {
+        embeddingSourceByProjectId[pid] = src;
+      }
+    } catch (e) {
+      // Soft-fail: leaves the cache empty for this project. The next
+      // dispatch will retry implicitly (since the slot is still
+      // undefined). A persistent failure surfaces via the dispatcher's
+      // "unknown placeholder" error path on the next action.
+      console.warn(
+        `[ModuleConfigTab] get_project_embedding_source(${pid}) failed:`,
+        e,
+      );
+    }
+  }
 
   // Per-control state caches. Keys are `<section_idx>:<control_id>`.
   // `values` is the persisted value (from `get_module_setting` on mount
@@ -103,51 +175,123 @@
       }
     });
 
-    if (!hasProject || !tauriAvailable()) return;
+    // v0.2.32 L3: cache the "does this section reference project_id?"
+    // bit per section. Computed once because the manifest is stable for
+    // the lifetime of the rendered tab.
+    configTab.sections.forEach((s, i) => {
+      sectionRequiresProject[i] = sectionUsesProjectId(s);
+    });
 
-    // Fetch persisted value for every control whose kind supports
-    // state. Buttons + info are stateless.
-    for (let i = 0; i < configTab.sections.length; i++) {
-      for (const control of configTab.sections[i].controls) {
-        if (control.kind === 'button' || control.kind === 'info') continue;
-        try {
-          const v = await invoke<unknown>('get_module_setting', {
-            moduleId,
-            controlId: control.id,
-            projectId,
-          });
-          if (v !== null && v !== undefined) {
-            values[ckey(i, control.id)] = v;
-          }
-        } catch (e) {
-          // Soft-fail: missing persisted value is non-fatal, control
-          // falls back to its declared default.
-          console.warn(
-            `[ModuleConfigTab] get_module_setting failed for ${moduleId}/${control.id}:`,
-            e,
-          );
-        }
+    // v0.2.32 L3: hydrate `projects` store so the per-section picker
+    // can render the dropdown. The store is shared with the menu bar's
+    // selector — `.load()` is idempotent and cheap when already loaded.
+    if (tauriAvailable()) {
+      try {
+        await projects.load();
+      } catch (e) {
+        console.warn('[ModuleConfigTab] projects.load failed:', e);
       }
     }
 
-    // Eagerly load options for each multi_select. Failures keep the
-    // option list empty + render an error inline.
+    // v0.2.32 L7: warm the embedding-source cache for the active
+    // project. Picker-driven dispatches that target a different project
+    // lazy-load on first reference.
+    if (projectId) {
+      await ensureEmbeddingSourceCached(projectId);
+    }
+
+    if (!tauriAvailable()) return;
+
+    // Load persisted values + multi_select options for every section
+    // that has an effective project (global or section-local picker).
     for (let i = 0; i < configTab.sections.length; i++) {
-      for (const control of configTab.sections[i].controls) {
-        if (control.kind !== 'multi_select') continue;
-        const k = ckey(i, control.id);
-        try {
-          const opts = await dispatchAction<{ value: string; label: string }[]>(
-            control.options_source,
-            null,
-          );
-          optionsByControl[k] = opts ?? [];
-        } catch (e) {
-          errors[k] = `Failed to load options: ${e instanceof Error ? e.message : String(e)}`;
-        }
+      if (sectionHasEffectiveProject(i)) {
+        await loadSectionState(i);
       }
     }
   });
+
+  /**
+   * Load persisted control values + multi_select options for a single
+   * section, using the section's effective project id. Extracted from
+   * `onMount` so the section-local project picker (v0.2.32 L3) can
+   * re-run this when the user changes the section's pick — otherwise
+   * the controls would still show the previous project's saved values.
+   */
+  async function loadSectionState(sectionIdx: number) {
+    if (!tauriAvailable()) return;
+    const pid = effectiveProjectId(sectionIdx);
+    if (!pid) return;
+
+    // Make sure the embedding-source cache is warm for the section's
+    // effective project before any dispatchAction call below.
+    await ensureEmbeddingSourceCached(pid);
+
+    // Fetch persisted value for every control whose kind supports
+    // state. Buttons + info are stateless.
+    for (const control of configTab.sections[sectionIdx].controls) {
+      if (control.kind === 'button' || control.kind === 'info') continue;
+      try {
+        const v = await invoke<unknown>('get_module_setting', {
+          moduleId,
+          controlId: control.id,
+          projectId: pid,
+        });
+        if (v !== null && v !== undefined) {
+          values[ckey(sectionIdx, control.id)] = v;
+        }
+      } catch (e) {
+        // Soft-fail: missing persisted value is non-fatal, control
+        // falls back to its declared default.
+        console.warn(
+          `[ModuleConfigTab] get_module_setting failed for ${moduleId}/${control.id}:`,
+          e,
+        );
+      }
+    }
+
+    // Eagerly load options for each multi_select in this section.
+    // Failures keep the option list empty + render an error inline.
+    for (const control of configTab.sections[sectionIdx].controls) {
+      if (control.kind !== 'multi_select') continue;
+      const k = ckey(sectionIdx, control.id);
+      try {
+        const opts = await dispatchAction<{ value: string; label: string }[]>(
+          control.options_source,
+          null,
+          {},
+          pid,
+        );
+        optionsByControl[k] = opts ?? [];
+      } catch (e) {
+        errors[k] = `Failed to load options: ${e instanceof Error ? e.message : String(e)}`;
+      }
+    }
+  }
+
+  /**
+   * Handler invoked when the user picks a project in a section-local
+   * picker (v0.2.32 L3). Updates the picked-id map, clears stale
+   * cached values + options for the section, then re-fetches state
+   * against the new project.
+   */
+  async function onSectionProjectChange(sectionIdx: number, newProjectId: string) {
+    pickedProjectIdBySection[sectionIdx] = newProjectId;
+
+    // Drop stale per-control state for this section so the next render
+    // can either show the new project's persisted value or fall back to
+    // the control's declared default.
+    for (const control of configTab.sections[sectionIdx].controls) {
+      const k = ckey(sectionIdx, control.id);
+      delete values[k];
+      delete optionsByControl[k];
+      delete errors[k];
+    }
+
+    if (newProjectId) {
+      await loadSectionState(sectionIdx);
+    }
+  }
 
   /**
    * Route an ActionRef through the right Tauri command:
@@ -192,8 +336,25 @@
     action: ActionRef,
     value: unknown = null,
     extraArgs: Record<string, unknown> = {},
+    effectivePid: string = projectId,
   ): Promise<T> {
+    // v0.2.32 L7: lazily fetch the embedding-source for whichever
+    // project we're actually dispatching against. Section-local pickers
+    // can target a project different from the global active one — make
+    // sure we substitute the right value.
+    await ensureEmbeddingSourceCached(effectivePid);
+    const embeddingSource = embeddingSourceByProjectId[effectivePid] ?? '';
+
     if (isActionDescriptor(action)) {
+      // v0.2.32 L7: pre-substitute the embedding-source token inside
+      // the descriptor BEFORE the dispatcher sees it. Doing this
+      // client-side keeps the Rust dispatcher's placeholder set
+      // unchanged. When the token isn't present, substitution is a
+      // no-op (the helper short-circuits on string include).
+      const substituted = substituteEmbeddingSourceInAction(
+        action,
+        embeddingSource,
+      );
       // v0.2.26 follow-up (reviewer finding 3.2): pass the sibling
       // values snapshot so descriptor bodies can reference other
       // controls via `{{control:<id>}}`. Without this, that token
@@ -201,16 +362,20 @@
       // dispatcher's resolver plumbing was correct.
       return invoke<T>('module_dispatch_action', {
         moduleId,
-        projectId,
-        action,
+        projectId: effectivePid,
+        action: substituted,
         value,
         siblingValues: siblingValuesSnapshot(),
       });
     }
+    // Legacy string actions: forward the embedding-source as an extra
+    // arg. Commands that don't read it are unaffected (Tauri ignores
+    // unknown args); commands that DO read it get the resolved value.
     return invoke<T>(action, {
       moduleId,
-      projectId,
+      projectId: effectivePid,
       value,
+      embeddingSource,
       ...extraArgs,
     });
   }
@@ -227,19 +392,22 @@
     busy[k] = true;
     errors[k] = '';
     try {
+      // v0.2.32 L3: persist + dispatch against the EFFECTIVE project
+      // (per-section pick wins over the global selection).
+      const pid = effectiveProjectId(sectionIdx);
       values[k] = newValue;
       // 1. Generic persistence (source of truth).
       await invoke('set_module_setting', {
         moduleId,
         controlId: control.id,
         value: newValue,
-        projectId,
+        projectId: pid,
       });
       // 2. Optional `on_change` side-effect command. Manifest-declared.
       //    v0.2.26: `on_change` is an ActionRef (legacy string OR
       //    declarative descriptor). The dispatcher routes accordingly.
       if (control.on_change) {
-        await dispatchAction(control.on_change, newValue);
+        await dispatchAction(control.on_change, newValue, {}, pid);
       }
     } catch (e) {
       errors[k] = e instanceof Error ? e.message : String(e);
@@ -284,7 +452,13 @@
           }
         }
       }
-      await dispatchAction(control.action, null, extraArgs);
+      // v0.2.32 L3: dispatch against the section's effective project.
+      await dispatchAction(
+        control.action,
+        null,
+        extraArgs,
+        effectiveProjectId(sectionIdx),
+      );
     } catch (e) {
       errors[k] = e instanceof Error ? e.message : String(e);
     } finally {
@@ -332,6 +506,10 @@
 
   {#each configTab.sections as section, sectionIdx}
     {@const collapsed = collapsedSections[sectionIdx] === true}
+    {@const requiresPicker = sectionRequiresProject[sectionIdx] === true}
+    {@const sectionPid = effectiveProjectId(sectionIdx)}
+    {@const sectionHasProject = sectionHasEffectiveProject(sectionIdx)}
+    {@const sectionDisabled = !sectionHasProject}
     <section class="config-section">
       <button
         type="button"
@@ -352,6 +530,46 @@
       </button>
 
       {#if !collapsed}
+        <!--
+          v0.2.32 L3: section-local project picker. Rendered above the
+          controls whenever any control in the section references
+          `{{project_id}}`. Overrides the global `selectedProject` for
+          dispatches that originate from this section's controls.
+        -->
+        {#if requiresPicker}
+          <div class="section-project-picker">
+            <label class="section-project-picker-label">
+              Project for this section:
+              {#if $projects.projects.length === 0}
+                <span class="section-project-picker-empty">
+                  No projects registered — controls disabled.
+                </span>
+              {:else}
+                <select
+                  value={sectionPid}
+                  onchange={(e) =>
+                    onSectionProjectChange(
+                      sectionIdx,
+                      (e.target as HTMLSelectElement).value,
+                    )}
+                >
+                  {#if !sectionPid}
+                    <option value="" disabled selected>— pick a project —</option>
+                  {/if}
+                  {#each $projects.projects as proj}
+                    <option value={proj.id}>{proj.name}</option>
+                  {/each}
+                </select>
+              {/if}
+              <span
+                class="tooltip-affordance"
+                title="This section affects per-project state. Pick which project the controls below operate on."
+                aria-label="More info"
+              >?</span>
+            </label>
+          </div>
+        {/if}
+
         <div class="controls">
           {#each section.controls as control}
             {@const k = ckey(sectionIdx, control.id)}
@@ -368,7 +586,7 @@
                   <input
                     type="checkbox"
                     checked={currentVal}
-                    disabled={!hasProject || isBusy}
+                    disabled={sectionDisabled || isBusy}
                     onchange={(e) =>
                       persistAndNotify(sectionIdx, control, (e.target as HTMLInputElement).checked)}
                   />
@@ -385,7 +603,7 @@
                   <span class="control-label">{control.label}</span>
                   <select
                     value={currentVal}
-                    disabled={!hasProject || isBusy}
+                    disabled={sectionDisabled || isBusy}
                     onchange={(e) =>
                       persistAndNotify(sectionIdx, control, (e.target as HTMLSelectElement).value)}
                   >
@@ -425,7 +643,7 @@
                           <input
                             type="checkbox"
                             checked={isChecked}
-                            disabled={!hasProject || isBusy}
+                            disabled={sectionDisabled || isBusy}
                             onchange={(e) => {
                               const checked = (e.target as HTMLInputElement).checked;
                               const next = new Set(currentVal);
@@ -445,7 +663,7 @@
                   <button
                     type="button"
                     class="action-button variant-{control.variant ?? 'secondary'}"
-                    disabled={!hasProject || isBusy}
+                    disabled={sectionDisabled || isBusy}
                     onclick={() => onButtonClick(sectionIdx, control)}
                   >
                     {isBusy ? '…' : control.label}
@@ -460,32 +678,32 @@
                 <TextInputControl
                   {control}
                   {moduleId}
-                  {projectId}
-                  disabled={!hasProject}
+                  projectId={sectionPid}
+                  disabled={sectionDisabled}
                 />
               {:else if control.kind === 'number_input'}
                 <NumberInputControl
                   {control}
                   {moduleId}
-                  {projectId}
-                  disabled={!hasProject}
+                  projectId={sectionPid}
+                  disabled={sectionDisabled}
                 />
               {:else if control.kind === 'status_display'}
                 <StatusDisplayControl
                   {control}
                   {moduleId}
-                  {projectId}
-                  disabled={!hasProject}
+                  projectId={sectionPid}
+                  disabled={sectionDisabled}
                 />
               {:else if control.kind === 'file_picker'}
                 <FilePickerControl
                   {control}
                   {moduleId}
-                  {projectId}
-                  disabled={!hasProject}
+                  projectId={sectionPid}
+                  disabled={sectionDisabled}
                 />
               {:else if control.kind === 'link'}
-                <LinkControl {control} disabled={!hasProject} />
+                <LinkControl {control} disabled={sectionDisabled} />
               {/if}
 
               {#if err}
@@ -609,6 +827,34 @@
     display: flex;
     flex-direction: column;
     gap: 10px;
+  }
+
+  /* v0.2.32 L3: per-section project picker bar. Sits above .controls
+     when the section's manifest references `{{project_id}}`. */
+  .section-project-picker {
+    padding: 10px 16px;
+    background: rgba(0, 191, 166, 0.05);
+    border-top: 1px solid rgba(0, 191, 166, 0.18);
+    border-bottom: 1px solid rgba(0, 191, 166, 0.10);
+  }
+  .section-project-picker-label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--color-muted);
+  }
+  .section-project-picker-label select {
+    font-size: 12px;
+    padding: 3px 8px;
+    border-radius: 4px;
+    background: rgba(255, 255, 255, 0.04);
+    color: var(--color-text);
+    border: 1px solid rgba(255, 255, 255, 0.10);
+  }
+  .section-project-picker-empty {
+    color: #e74c3c;
+    font-size: 12px;
   }
 
   .control {

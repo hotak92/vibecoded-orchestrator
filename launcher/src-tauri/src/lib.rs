@@ -1081,6 +1081,12 @@ pub fn run() {
             commands::module_service::check_for_weights_update_now,
             commands::module_service::apply_weights_update,
             commands::module_service::get_rl_dashboard_state,
+            // v0.2.32 (L7, Agent B): per-project text-embedding-source
+            // resolver. Backs the ModuleConfigTab renderer's substitution
+            // of `{{embedding_source_from_project_kg_binding}}` at dispatch
+            // time. Reads `ACTIVE_EMBEDDING` from `.claude/env`, falls
+            // back to `DEFAULT_EMBEDDING_SOURCE`.
+            commands::module_service::get_project_embedding_source,
             // v0.2.31 Agent J: module_weights_state Tauri commands removed
             // alongside migration 020. The dashboard's live reads now go
             // through `module_db_client::module_db_read_row` against the
