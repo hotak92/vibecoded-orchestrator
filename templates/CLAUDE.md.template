@@ -66,6 +66,23 @@ Only use `Grep` / `Read` when the user provides an exact file path, you're hunti
 
 ---
 
+{{#if_module_active diagrams}}
+## Diagrams (Mermaid + Excalidraw)
+
+This project has the diagrams module active. When you sketch a flowchart, architecture diagram, GUI mockup, or any other visual:
+
+- Use the `mermaid` MCP (`render`, `save_diagram`) for text-based diagrams.
+- Use the `excalidraw` MCP (`create_scene`, `add_element`, …) for freehand whiteboard sketches.
+- **Save path is enforced**: `.claude/diagrams/<category>/<name>.{mmd,excalidraw}`. The MCP rejects saves outside this structure. Category is the primary tag (e.g. `gui/auth/`, `architecture/data-flow/`).
+- Don't worry about metadata: the launcher auto-derives title, tags, and indexes the diagram for retrieval. Just pick a sensible category path and filename.
+- To find an earlier diagram, use `hybrid_search("topic")` — diagrams are indexed alongside the KG. Results with `result_kind="diagram"` are diagrams; open them via `Read(file_path)` for Mermaid or `describe_excalidraw(file_path)` for Excalidraw.
+- Snapshots are automatic on every save (throttled 1/min, deduplicated).
+
+To disable diagrams for this project, toggle it off in the launcher's DiagramsTab — CLAUDE.md will re-render and this section will disappear.
+
+---
+
+{{/if_module_active}}
 ## VCO-Managed Files
 
 This project's `.claude/hooks/`, `.claude/scripts/`, `.claude/agents/`, `.claude/skills/`, and `.claude/settings.json` are shipped by VCO (the orchestrator). To update them, run from the orchestrator root:
