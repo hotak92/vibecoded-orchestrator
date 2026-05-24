@@ -465,10 +465,18 @@ fn is_module_licensed(manifest: &ModuleManifest, db: &Db) -> bool {
 
 #[command]
 pub async fn list_module_catalog(db: State<'_, Db>) -> Result<Vec<ModuleCatalogEntry>, String> {
+    Ok(list_module_catalog_impl(&db))
+}
+
+/// Synchronous, State-free core of `list_module_catalog`. Lifted to a
+/// helper so unit tests can exercise the on-disk-manifest-overrides-builtin
+/// merge path without needing a Tauri `State<Db>`. The `#[command]` shell
+/// above is a thin async wrapper.
+pub(crate) fn list_module_catalog_impl(db: &Db) -> Vec<ModuleCatalogEntry> {
     // Bug 16: built-in entries (launcher + orchestrator + KG + code graph)
     // come first — they're always present and reflect real repo state.
-    let mut out = builtin_catalog_entries(&db);
-    for path in catalog_scan_paths(&db) {
+    let mut out = builtin_catalog_entries(db);
+    for path in catalog_scan_paths(db) {
         let raw = match std::fs::read_to_string(&path) {
             Ok(s) => s,
             Err(_) => continue,
@@ -480,20 +488,60 @@ pub async fn list_module_catalog(db: State<'_, Db>) -> Result<Vec<ModuleCatalogE
                 continue;
             }
         };
-        // Skip if a built-in already covers this id (defensive against a
-        // user dropping a `vct-module.json` named "orchestrator" in
-        // ~/.vct/bundled_manifests/).
-        if out.iter().any(|e| e.id == manifest.id) {
+        // v0.2.32 L1+L2 fix: when an on-disk manifest's id matches an
+        // existing builtin entry, the on-disk manifest WINS for the
+        // catalog-display fields (version, description, license_required,
+        // min_orchestrator_tier, compatibility_hosts, …) and `is_licensed`
+        // is re-resolved via the live `is_module_licensed` against the
+        // current tier cache.
+        //
+        // Pre-fix this branch was `continue;` — the builtin placeholder
+        // (e.g. `vct-rl-reranker` hardcoded at version 0.1.1 with
+        // is_licensed=false) shadowed the on-disk manifest forever, so:
+        //   * L1: Modules page rendered the stale hardcoded version
+        //     (0.1.1) instead of the shipped manifest's true version
+        //     (0.2.6 in v0.2.31).
+        //   * L2: `is_licensed` stayed `false` even for admin-tier users
+        //     because `is_module_licensed` was never run for the id.
+        //
+        // UX metadata that the on-disk manifest doesn't carry
+        // (`kind` / `parent_id` / `cta_route` / coming-soon fields) is
+        // preserved from the builtin so the Modules-page card layout
+        // (Install button vs Configure CTA vs Dashboard link) doesn't
+        // regress.
+        //
+        // The pinning test `catalog_matches_on_disk_manifest_when_present`
+        // (~line 1415) still validates that the hardcoded placeholder
+        // matches the on-disk manifest by hand. That test is the belt;
+        // this merge loop is the suspenders — even if the placeholder
+        // drifts, the live merge wins at runtime.
+        if let Some(existing_idx) = out.iter().position(|e| e.id == manifest.id) {
+            let licensed = is_module_licensed(&manifest, db);
+            let live =
+                ModuleCatalogEntry::from_manifest(&manifest, licensed, path.display().to_string());
+            let preserved_kind = out[existing_idx].kind.clone();
+            let preserved_parent_id = out[existing_idx].parent_id.clone();
+            let preserved_cta_route = out[existing_idx].cta_route.clone();
+            let preserved_coming_soon_tier = out[existing_idx].coming_soon_tier.clone();
+            let preserved_coming_soon_target = out[existing_idx].coming_soon_target.clone();
+            out[existing_idx] = ModuleCatalogEntry {
+                kind: preserved_kind,
+                parent_id: preserved_parent_id,
+                cta_route: preserved_cta_route,
+                coming_soon_tier: preserved_coming_soon_tier,
+                coming_soon_target: preserved_coming_soon_target,
+                ..live
+            };
             continue;
         }
-        let licensed = is_module_licensed(&manifest, &db);
+        let licensed = is_module_licensed(&manifest, db);
         out.push(ModuleCatalogEntry::from_manifest(
             &manifest,
             licensed,
             path.display().to_string(),
         ));
     }
-    Ok(out)
+    out
 }
 
 fn find_manifest(db: &Db, module_id: &str) -> Result<(ModuleManifest, PathBuf), String> {
@@ -1490,6 +1538,270 @@ mod tests {
             catalog_entry.compatibility_hosts, manifest.compatibility.hosts,
             "G2: catalog.compatibility_hosts must equal manifest.compatibility.hosts \
              (otherwise install fails at the is_compatible_with_host gate)"
+        );
+    }
+
+    // ─── v0.2.32 #A: on-disk-manifest-overrides-builtin merge ──────────
+    //
+    // Background: v0.2.31 shipped paid-module v0.2.6 (RL Reranker). Users
+    // who installed it via the launcher GUI reported two bugs that turned
+    // out to be a SINGLE root cause:
+    //   * L1: Modules page showed the stale hardcoded version (0.1.1)
+    //     instead of the shipped 0.2.6.
+    //   * L2: "Activate License" button stayed visible even for admin-tier
+    //     users.
+    // Root cause: `list_module_catalog` skipped on-disk manifests whose
+    // id was already present in `builtin_catalog_entries()` (defensive
+    // dedupe), so the hardcoded `is_licensed: false` + frozen version
+    // shadowed the real shipped state forever.
+    //
+    // The fix (v0.2.32 #A) inverts the dedupe: when ids collide, the
+    // on-disk manifest WINS for display fields and `is_licensed` is
+    // re-resolved against the live tier cache. UX metadata that the
+    // on-disk manifest doesn't carry (`kind`, `parent_id`, `cta_route`,
+    // `coming_soon_*`) is preserved from the builtin.
+    //
+    // The three tests below pin each axis of the fix:
+    //   1. version override (proves the on-disk manifest's `version`
+    //      reaches the catalog — L1 regression guard).
+    //   2. live is_licensed re-resolution (proves admin tier unlocks the
+    //      paid module via the catalog path — L2 regression guard).
+    //   3. UX-metadata preservation (proves we didn't accidentally wipe
+    //      the builtin's `kind` / `cta_route` while overriding everything
+    //      else — defense against turning a subcomponent into a generic
+    //      `"available"` entry that loses its Dashboard link).
+    //
+    // All three exercise the same merge loop. They use `VCT_STATE_DIR` to
+    // redirect `catalog_scan_paths` to a temp directory so the test fixture
+    // controls exactly what manifests are scanned (real `~/.vct/modules/`
+    // is left alone). Tests serialize on `MERGE_TEST_LOCK` because
+    // `VCT_STATE_DIR` is process-wide.
+
+    static MERGE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Set `VCT_STATE_DIR` to a tempdir, drop a `vct-module.json` into
+    /// `<tempdir>/bundled_manifests/<filename>`, and yield the live
+    /// `Vec<ModuleCatalogEntry>` from `list_module_catalog_impl`.
+    ///
+    /// The `_lock_guard` argument keeps the serializing mutex held for the
+    /// duration of the test — callers acquire it once at the top of the
+    /// test body so the env-var mutation can't race a parallel test.
+    fn run_catalog_with_bundled_manifest(
+        db: &Db,
+        manifest_filename: &str,
+        manifest_json: &str,
+        _lock_guard: &std::sync::MutexGuard<'_, ()>,
+    ) -> Vec<ModuleCatalogEntry> {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let bundled = tmp.path().join("bundled_manifests");
+        std::fs::create_dir_all(&bundled).expect("mkdir bundled_manifests");
+        let manifest_path = bundled.join(manifest_filename);
+        std::fs::write(&manifest_path, manifest_json).expect("write manifest");
+
+        // Save+restore VCT_STATE_DIR so the test fixture's tempdir doesn't
+        // bleed into other tests. Mutex above guarantees only this test
+        // is observing the env var while we hold it.
+        let prev = std::env::var("VCT_STATE_DIR").ok();
+        std::env::set_var("VCT_STATE_DIR", tmp.path());
+        let result = list_module_catalog_impl(db);
+        match prev {
+            Some(v) => std::env::set_var("VCT_STATE_DIR", v),
+            None => std::env::remove_var("VCT_STATE_DIR"),
+        }
+        // Keep the tempdir alive until after the catalog scan completed.
+        drop(tmp);
+        result
+    }
+
+    /// L1 regression: on-disk manifest's `version` MUST override the
+    /// hardcoded builtin placeholder version. Before the v0.2.32 #A fix,
+    /// the catalog skipped on-disk manifests whose id collided with a
+    /// builtin entry, so the launcher's Modules page froze at the
+    /// placeholder's version (0.1.1) even after the user installed v0.2.6.
+    #[test]
+    fn list_module_catalog_overrides_builtin_with_on_disk_manifest_version() {
+        let lock = MERGE_TEST_LOCK.lock().expect("acquire merge-test lock");
+        let db = open_db();
+
+        // Minimal on-disk manifest for vct-rl-reranker pinned at an
+        // obviously-different version so the assertion is unambiguous.
+        let manifest_json = serde_json::json!({
+            "manifest_version": 1,
+            "id": "vct-rl-reranker",
+            "name": "RL Reranker (test override)",
+            "version": "9.9.9",
+            "description": "Test fixture for v0.2.32 #A merge override.",
+            "category": "paid-independent",
+            "license": {
+                "required": true,
+                "variant_ids": ["fake-variant"],
+                "min_orchestrator_tier": "pro"
+            },
+            "compatibility": {"hosts": ["base", "mao", "orchestrator_root"]},
+            "install": {"method": "container_pull"},
+            "runtime": {"type": "service", "command": "echo", "args": []}
+        })
+        .to_string();
+
+        let entries = run_catalog_with_bundled_manifest(
+            &db,
+            "vct-rl-reranker.json",
+            &manifest_json,
+            &lock,
+        );
+
+        let rl_entries: Vec<&ModuleCatalogEntry> = entries
+            .iter()
+            .filter(|e| e.id == "vct-rl-reranker")
+            .collect();
+        assert_eq!(
+            rl_entries.len(),
+            1,
+            "expected exactly one vct-rl-reranker entry after merge; got {}: {:?}",
+            rl_entries.len(),
+            rl_entries.iter().map(|e| (&e.id, &e.version)).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            rl_entries[0].version, "9.9.9",
+            "on-disk manifest version (9.9.9) MUST override the hardcoded \
+             builtin placeholder version (0.1.1). Pre-v0.2.32 the merge \
+             loop skipped collision rows, so users saw the stale placeholder \
+             on the Modules page regardless of which version they installed."
+        );
+    }
+
+    /// L2 regression: `is_licensed` MUST be re-resolved via
+    /// `is_module_licensed(&manifest, &db)` on the merged entry — using
+    /// the LIVE tier cache, not the builtin placeholder's hardcoded
+    /// `is_licensed: false`. Before v0.2.32 #A, admin-tier users saw the
+    /// "Activate License" button on RL Reranker because the catalog
+    /// returned `is_licensed=false` from the placeholder, even though
+    /// `is_module_licensed` would have returned true for their tier.
+    #[test]
+    fn list_module_catalog_overrides_builtin_with_live_license_resolution() {
+        let lock = MERGE_TEST_LOCK.lock().expect("acquire merge-test lock");
+        let db = open_db();
+        // Admin tier — strict superset of enterprise, satisfies any
+        // `min_orchestrator_tier` strictly above "free" by the tier_rank
+        // ladder (see `is_module_licensed`).
+        db.set_tier_cache("admin", &serde_json::json!({}), None)
+            .expect("set admin tier");
+
+        let manifest_json = serde_json::json!({
+            "manifest_version": 1,
+            "id": "vct-rl-reranker",
+            "name": "RL Reranker",
+            "version": "0.2.6",
+            "description": "Test fixture for v0.2.32 #A L2 regression guard.",
+            "category": "paid-independent",
+            "license": {
+                "required": true,
+                "variant_ids": ["fake-variant"],
+                "min_orchestrator_tier": "pro"
+            },
+            "compatibility": {"hosts": ["base", "mao", "orchestrator_root"]},
+            "install": {"method": "container_pull"},
+            "runtime": {"type": "service", "command": "echo", "args": []}
+        })
+        .to_string();
+
+        let entries = run_catalog_with_bundled_manifest(
+            &db,
+            "vct-rl-reranker.json",
+            &manifest_json,
+            &lock,
+        );
+
+        let rl = entries
+            .iter()
+            .find(|e| e.id == "vct-rl-reranker")
+            .expect("vct-rl-reranker entry must be present");
+        assert!(
+            rl.is_licensed,
+            "admin tier MUST unlock vct-rl-reranker via the catalog merge — \
+             pre-v0.2.32 the hardcoded `is_licensed: false` from the builtin \
+             placeholder shadowed `is_module_licensed`'s live tier check, \
+             so admin users saw 'Activate License' on a module they \
+             already had universal access to."
+        );
+        assert_eq!(
+            rl.version, "0.2.6",
+            "sanity: this test also exercises the version override path \
+             so a regression in EITHER axis fails here"
+        );
+    }
+
+    /// Defense-in-depth: even though the merged entry takes display fields
+    /// from the on-disk manifest, the builtin's UX-metadata fields
+    /// (`kind` / `parent_id` / `cta_route` / `coming_soon_*`) MUST be
+    /// preserved — those fields don't exist on `ModuleManifest` and the
+    /// launcher's Modules-page layout depends on them.
+    ///
+    /// For `vct-rl-reranker` the builtin sets `kind: "available"` (so the
+    /// Install button renders) and empty `cta_route` (no Dashboard link
+    /// pre-install). If a future refactor accidentally inherits the
+    /// `from_manifest` defaults instead, the UX would still happen to
+    /// match (`"available"` + empty `cta_route`) — so this test pins a
+    /// subcomponent-like entry where the values DIFFER from
+    /// `from_manifest`'s defaults to make the regression observable.
+    #[test]
+    fn list_module_catalog_preserves_builtin_kind_and_cta_route_for_overridden_entries() {
+        let lock = MERGE_TEST_LOCK.lock().expect("acquire merge-test lock");
+        let db = open_db();
+        // The orchestrator's `knowledge-graph` builtin entry is a
+        // `subcomponent` with `parent_id: "orchestrator"` and
+        // `cta_route: "/kg"` — all three values DIFFER from
+        // `ModuleCatalogEntry::from_manifest`'s defaults (which would
+        // produce `kind: "available"`, empty parent_id, empty cta_route).
+        // If the merge accidentally took the manifest-derived defaults,
+        // the Dashboard link on the Modules card would disappear and the
+        // Install button would re-appear on a built-in subcomponent.
+        let manifest_json = serde_json::json!({
+            "manifest_version": 1,
+            "id": "knowledge-graph",
+            "name": "Knowledge Graph (override)",
+            "version": "9.9.9",
+            "description": "Test fixture for v0.2.32 #A UX-metadata preservation.",
+            "category": "core",
+            "license": {"required": false, "min_orchestrator_tier": "free"},
+            "compatibility": {"hosts": ["base"]},
+            "install": {"method": "git_clone"},
+            "runtime": {"type": "service", "command": "echo", "args": []}
+        })
+        .to_string();
+
+        let entries = run_catalog_with_bundled_manifest(
+            &db,
+            "knowledge-graph.json",
+            &manifest_json,
+            &lock,
+        );
+
+        let kg = entries
+            .iter()
+            .find(|e| e.id == "knowledge-graph")
+            .expect("knowledge-graph entry must be present");
+
+        // Display fields took the override:
+        assert_eq!(
+            kg.version, "9.9.9",
+            "version must come from the on-disk manifest"
+        );
+        // UX-metadata fields preserved from the builtin:
+        assert_eq!(
+            kg.kind, "subcomponent",
+            "kind MUST be preserved from the builtin (was overwritten to \
+             'available' if the merge accidentally used `from_manifest`'s default)"
+        );
+        assert_eq!(
+            kg.parent_id, "orchestrator",
+            "parent_id MUST be preserved from the builtin — otherwise the \
+             Modules-page card would lose its parent-grouping in the UI"
+        );
+        assert_eq!(
+            kg.cta_route, "/kg",
+            "cta_route MUST be preserved from the builtin — otherwise the \
+             Dashboard CTA link on the Modules card disappears"
         );
     }
 
