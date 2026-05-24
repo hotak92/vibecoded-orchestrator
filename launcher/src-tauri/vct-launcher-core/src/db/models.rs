@@ -76,6 +76,15 @@ pub enum ModuleStatus {
     Running,
     Stopped,
     Error,
+    /// v0.2.33 (Agent C): on-disk manifest at `~/.vct/modules/<id>/`
+    /// was found missing by the startup reconciler. Distinct from
+    /// `Error` because the recovery action is Reinstall (not Restart) —
+    /// the underlying artifact is gone and `apply_migrations` /
+    /// `start_container` can't recover from a missing manifest.
+    /// Surfaced in the catalog tile as kind=`broken` with a Reinstall
+    /// CTA. Wire format: `"broken"` (matches the CHECK constraint
+    /// introduced by migration 021).
+    Broken,
 }
 
 impl ModuleStatus {
@@ -86,6 +95,7 @@ impl ModuleStatus {
             ModuleStatus::Running => "running",
             ModuleStatus::Stopped => "stopped",
             ModuleStatus::Error => "error",
+            ModuleStatus::Broken => "broken",
         }
     }
     pub fn from_str(s: &str) -> Option<Self> {
@@ -95,6 +105,7 @@ impl ModuleStatus {
             "running" => Some(ModuleStatus::Running),
             "stopped" => Some(ModuleStatus::Stopped),
             "error" => Some(ModuleStatus::Error),
+            "broken" => Some(ModuleStatus::Broken),
             _ => None,
         }
     }

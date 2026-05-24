@@ -262,4 +262,86 @@ impl Db {
             .map_err(|e| format!("delete: {}", e))?;
         Ok(())
     }
+
+    /// v0.2.33 (Agent C, reconciler support): list every module_install
+    /// row whose `status` matches the requested string. Used by the
+    /// launcher's startup reconciler to walk `installed` rows + verify
+    /// the on-disk extracted manifest is present.
+    ///
+    /// Returns rows ordered by `installed_at DESC` to match
+    /// `list_module_installs_for_project`'s ordering convention (recent
+    /// installs first — keeps reconciler reports deterministic).
+    pub fn list_module_installs_with_status(
+        &self,
+        status: &str,
+    ) -> Result<Vec<ModuleInstallRow>, String> {
+        let guard = self.lock();
+        let mut stmt = guard
+            .prepare(
+                "SELECT id, project_id, module_id, module_version, install_path,
+                        status, enabled, installed_at, last_started_at, last_error,
+                        container_name
+                   FROM module_installs
+                  WHERE status = ?1
+                  ORDER BY installed_at DESC",
+            )
+            .map_err(|e| format!("prepare list_module_installs_with_status: {}", e))?;
+        let rows = stmt
+            .query_map(params![status], |row| {
+                let status_s: String = row.get(5)?;
+                let enabled_i: i32 = row.get(6)?;
+                Ok(ModuleInstallRow {
+                    id: row.get(0)?,
+                    project_id: row.get(1)?,
+                    module_id: row.get(2)?,
+                    module_version: row.get(3)?,
+                    install_path: row.get(4)?,
+                    status: ModuleStatus::from_str(&status_s).unwrap_or(ModuleStatus::Error),
+                    enabled: enabled_i != 0,
+                    installed_at: row.get(7)?,
+                    last_started_at: row.get(8)?,
+                    last_error: row.get(9)?,
+                    container_name: row.get(10).ok().flatten(),
+                })
+            })
+            .map_err(|e| format!("query list_module_installs_with_status: {}", e))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("collect list_module_installs_with_status: {}", e))
+    }
+
+    /// v0.2.33 (Agent C, reconciler support): flip the `status` column
+    /// of a single module_install row identified by its primary key
+    /// (the UUID assigned at `insert_module_install` time).
+    ///
+    /// Differs from `set_module_status` which keys by
+    /// `(project_id, module_id)` and ALSO touches `last_error` +
+    /// `last_started_at`. This setter is narrower: it only updates
+    /// `status`. The reconciler doesn't need the side-effects of
+    /// `set_module_status` and the by-id key is the natural shape for
+    /// a "list, iterate, flip" pattern.
+    ///
+    /// Caller is responsible for ensuring `status` is a valid CHECK
+    /// value (`'installing'`, `'installed'`, `'running'`, `'stopped'`,
+    /// `'error'`, or `'broken'`). Invalid values cause the UPDATE to
+    /// fail with a CHECK violation — surfaced as `Err`.
+    pub fn set_module_install_status(
+        &self,
+        install_id: &str,
+        status: &str,
+    ) -> Result<(), String> {
+        let guard = self.lock();
+        let n = guard
+            .execute(
+                "UPDATE module_installs SET status = ?1 WHERE id = ?2",
+                params![status, install_id],
+            )
+            .map_err(|e| format!("set_module_install_status: {}", e))?;
+        if n == 0 {
+            return Err(format!(
+                "module_install not found for id={}",
+                install_id
+            ));
+        }
+        Ok(())
+    }
 }

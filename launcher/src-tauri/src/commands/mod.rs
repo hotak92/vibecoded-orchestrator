@@ -46,6 +46,17 @@ pub mod module_default_weights;
 pub mod module_deprecation;
 pub mod module_dispatch;
 pub mod module_gui;
+// v0.2.33 Agent C (L0b): post-install manifest extraction +
+// startup reconciler. `module_manifest_extract` runs after
+// `installer_engine::container_pull` to copy /app/vct-module.json
+// out of the pulled image to ~/.vct/modules/<id>/vct-module.json
+// (atomic write with .bak rollback). `module_reconciler` walks
+// every status='installed' row at launcher boot and flips rows
+// whose on-disk manifest is missing to status='broken' so the
+// catalog tile renders "Reinstall needed" instead of a misleading
+// "Open dashboard".
+pub mod module_manifest_extract;
+pub mod module_reconciler;
 // v0.2.31 Agent J: `module_weights_state` Tauri-command surface removed
 // alongside migration 020 (which DROPs the underlying table). Weights
 // state is now container-owned in `rl_weights_state` (shipped by

@@ -739,6 +739,43 @@ pub fn run() {
             tauri::async_runtime::spawn_blocking(|| {
                 let _ = hub_launcher::ensure_hub_running();
             });
+
+            // v0.2.33 (Agent C, architecture review §10.b): startup
+            // reconciler. Walks every `module_installs` row with
+            // status='installed' and verifies that the extracted
+            // manifest at `~/.vct/modules/<id>/vct-module.json` is
+            // present on disk. Rows missing their manifest get
+            // flipped to status='broken' (CHECK extended by
+            // migration 021) so the catalog tile can render
+            // kind=`broken` + a Reinstall CTA.
+            //
+            // Runs AFTER `ensure_hub_running` was kicked (above) so
+            // the hub's bearer-auth file is already being written
+            // by the time we'd hit any hub-backed code paths — even
+            // though the reconciler itself only reads launcher.db.
+            // Runs BEFORE the GUI mounts so the user never sees a
+            // stale "Installed" badge for a row whose on-disk
+            // artifact is gone.
+            //
+            // Bounded soft-fail: per-row errors log + skip, top-
+            // level DB errors return an empty report. Total runtime
+            // is bounded by the number of installed module rows
+            // (one fs::is_file check + one UPDATE per row), so it
+            // stays under the 5 s startup budget even on slow disks.
+            {
+                use tauri::Manager;
+                let db_ref = app.state::<crate::db::Db>();
+                let report = commands::module_reconciler::reconcile_installed_modules(&db_ref);
+                if !report.broken.is_empty() {
+                    eprintln!(
+                        "[vct] reconciler: {} module(s) marked broken (missing on-disk \
+                         manifest): {:?}",
+                        report.broken.len(),
+                        report.broken,
+                    );
+                }
+            }
+
             // System tray (v1.1)
             if let Err(e) = tray::setup(&app.handle()) {
                 eprintln!("[vct] tray setup failed: {}", e);

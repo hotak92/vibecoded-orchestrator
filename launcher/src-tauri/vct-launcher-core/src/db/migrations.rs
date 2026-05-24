@@ -118,6 +118,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "drop legacy module_weights_state: replaced by container-owned rl_weights_state shipped by vct-rl-reranker v0.2.6 (v0.2.31)",
         sql: include_str!("migrations/020_drop_legacy_module_weights_state.sql"),
     },
+    Migration {
+        version: 21,
+        description: "module_installs: extend status CHECK with 'broken' (v0.2.33 Agent C — startup reconciler marks rows with missing on-disk manifest as 'broken' so the GUI funnels users to Reinstall instead of Restart)",
+        sql: include_str!("migrations/021_module_installs_broken_status.sql"),
+    },
 ];
 
 /// Apply every migration whose version is greater than the current max applied.

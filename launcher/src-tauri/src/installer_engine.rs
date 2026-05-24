@@ -28,6 +28,16 @@ pub enum InstallStage {
     /// "post-pull data migration" from generic post_install steps in
     /// the UI progress bar.
     Migrate,
+    /// v0.2.33 (Agent C, L0b): emitted after `container_pull` succeeds
+    /// and BEFORE `apply_module_db_migrations`. The launcher pulls the
+    /// module image, then extracts `/app/vct-module.json` from a
+    /// throw-away container to `~/.vct/modules/<id>/vct-module.json`.
+    /// This stage exists as its own variant so the GUI progress bar can
+    /// render "Extracting manifest…" — a phase distinct enough from
+    /// the surrounding Clone / PostInstall stages that lumping it under
+    /// either confuses the user when extraction is the slow / failing
+    /// step.
+    ExtractingManifest,
     Done,
     /// v0.2.31 (#27): emitted via `report_error` before an error return.
     /// Pre-v0.2.31 errors propagated as `Result::Err` but the progress
@@ -189,6 +199,41 @@ async fn run_install_inner(
             tokio::fs::create_dir_all(&install_dir)
                 .await
                 .map_err(|e| format!("create install_dir for container module: {}", e))?;
+
+            // v0.2.33 (Agent C, L0b): post-install manifest extraction.
+            // Pulls /app/vct-module.json out of the just-pulled image
+            // via `docker create` + `docker cp` so the renderer, the
+            // dispatcher, and the DB migrations machinery have the
+            // FULL manifest on disk (the L0 catalog endpoint only
+            // ships the install-time slice). Runs BEFORE
+            // `apply_module_db_migrations` so the migrations machinery
+            // can read `manifest.db.migrations_dir` from the extracted
+            // file. Atomic write with .bak rollback (see module docs).
+            //
+            // Hard-fail the install on extraction error — the image
+            // is in podman cache (retain it for retry), the install
+            // row is still 'installing' at this point so the outer
+            // wrapper's `report_error` path will emit InstallStage::
+            // Failed and the caller will mark it 'failed'. Retain
+            // image policy: we do NOT `podman rmi` on extract failure
+            // — retries should be cheap, not require a re-pull.
+            let image_ref = format!("{}:{}", container.image, tag);
+            let runtime = detect_container_runtime().await?;
+            emit_progress(
+                app,
+                project_id,
+                &manifest.id,
+                InstallStage::ExtractingManifest,
+                step_index,
+                total_steps,
+                "Extracting module manifest from image",
+            );
+            crate::commands::module_manifest_extract::extract_manifest_from_image(
+                &image_ref,
+                &manifest.id,
+                &runtime,
+            )
+            .await?;
         }
     }
 
@@ -472,7 +517,13 @@ async fn request_pull_token(
 
 /// Detect which container runtime to use. Prefers podman (matches the
 /// rest of VCO's container stack), falls back to docker.
-async fn detect_container_runtime() -> Result<String, String> {
+///
+/// v0.2.33 (Agent C): hoisted to `pub(crate)` so the post-install
+/// manifest extractor (`commands::module_manifest_extract`) can probe
+/// the SAME runtime that `container_pull` chose — guarantees
+/// `docker cp` runs against the runtime that did the `docker pull`,
+/// so the image reference resolves to a known-good local copy.
+pub(crate) async fn detect_container_runtime() -> Result<String, String> {
     for candidate in ["podman", "docker"] {
         let probe = Command::new(candidate)
             .args(["--version"])
@@ -838,6 +889,14 @@ async fn run_upgrade_inner(
                 "Fetching updated source (legacy fallback)",
             );
             refetch_artifact(manifest, &install_dir, gpu_mode).await?;
+            // v0.2.33 (Agent C, L0b): re-extract the manifest after a
+            // re-pull. The upgrade flow may have brought in a new
+            // image version whose manifest differs from the previous
+            // on-disk copy — the renderer / dispatcher / DB migrations
+            // need the fresh file. Atomic write with .bak rollback
+            // preserves the v0.2.7 manifest if the v0.2.8 extract
+            // fails (architecture review §J4 G-b).
+            extract_manifest_after_refetch(app, project_id, manifest, gpu_mode, 0, 1).await?;
             emit_progress(
                 app, project_id, &manifest.id, InstallStage::Done, 1, 1,
                 "Update complete (legacy fallback)",
@@ -879,6 +938,15 @@ async fn run_upgrade_inner(
     );
     step_index += 1;
     refetch_artifact(manifest, &install_dir, gpu_mode).await?;
+
+    // v0.2.33 (Agent C, L0b): re-extract the manifest after the
+    // upgrade re-pull. See the legacy-fallback comment above for
+    // the rationale. .bak rollback restores the previous version's
+    // manifest on extract failure.
+    extract_manifest_after_refetch(
+        app, project_id, manifest, gpu_mode, step_index, total_steps,
+    )
+    .await?;
 
     // ─── post_upgrade ────────────────────────────────────────────────────
     for (i, spec) in upgrade_block.post_upgrade.iter().enumerate() {
@@ -1072,6 +1140,60 @@ async fn refetch_artifact(
             container_pull(container, &tag, &manifest.id).await?;
         }
     }
+    Ok(())
+}
+
+/// v0.2.33 (Agent C, L0b): for `ContainerPull` modules, extract the
+/// FULL manifest from the image into `~/.vct/modules/<id>/vct-module.json`
+/// after `refetch_artifact` has brought the image into the runtime
+/// cache. No-op for `GitClone` / `Local` modules — those carry their
+/// manifest in the repo / user-managed install_dir already.
+///
+/// Shared between the run_upgrade legacy-fallback path and the
+/// upgrade-block path to keep the extract policy identical for both.
+async fn extract_manifest_after_refetch(
+    app: &AppHandle,
+    project_id: &str,
+    manifest: &ModuleManifest,
+    gpu_mode: crate::commands::gpu_policy::GpuMode,
+    step_index: u32,
+    total_steps: u32,
+) -> Result<(), String> {
+    if manifest.install.method != InstallMethod::ContainerPull {
+        return Ok(());
+    }
+    let container = manifest
+        .install
+        .container
+        .as_ref()
+        .ok_or("install.method=container_pull requires install.container block")?;
+    let base_tag = if container.tag_from_version {
+        manifest.version.clone()
+    } else {
+        manifest
+            .install
+            .r#ref
+            .clone()
+            .unwrap_or_else(|| "latest".to_string())
+    };
+    let tag = resolve_variant_tag(manifest, &base_tag, gpu_mode);
+    let image_ref = format!("{}:{}", container.image, tag);
+    let runtime = detect_container_runtime().await?;
+    emit_progress(
+        app,
+        project_id,
+        &manifest.id,
+        InstallStage::ExtractingManifest,
+        step_index,
+        total_steps,
+        "Extracting module manifest from image",
+    );
+    crate::commands::module_manifest_extract::extract_manifest_from_image(
+        &image_ref,
+        &manifest.id,
+        &runtime,
+    )
+    .await?;
     Ok(())
 }
 
