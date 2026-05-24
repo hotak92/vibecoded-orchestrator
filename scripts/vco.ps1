@@ -1,4 +1,4 @@
-# vco.ps1 — PowerShell sibling of scripts/vco.
+﻿# vco.ps1 — PowerShell sibling of scripts/vco.
 #
 # Thin wrapper around `python -m vco_lib.cli`. See `scripts/vco` for the
 # rationale; this file exists so Windows users get the same entry-point.
