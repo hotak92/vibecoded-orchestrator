@@ -29,10 +29,13 @@
 
 import {
   isActionDescriptor,
+  isChainedAction,
   type ActionDescriptor,
   type ActionRef,
+  type ChainedActionDescriptor,
   type ConfigControl,
   type ConfigSection,
+  type HttpActionDescriptor,
 } from '$lib/types/manifest';
 
 /** Literal placeholder token, including the curly braces. */
@@ -101,7 +104,15 @@ export function actionRefUsesProjectId(ref: ActionRef): boolean {
     return true;
   }
   if (!isActionDescriptor(ref)) return false;
-  // path is mandatory; body is optional. Serialise body once.
+  // v0.2.32 (CHAINED_ACTION): a chained_action carries no path/body of
+  // its own — recurse into every step + the (rarely-used) polling block.
+  if (isChainedAction(ref)) {
+    for (const step of ref.steps) {
+      if (actionRefUsesProjectId(step as ActionRef)) return true;
+    }
+    return false;
+  }
+  // ref is HttpActionDescriptor here.
   if (ref.path && ref.path.includes(PROJECT_ID_TOKEN)) return true;
   if (ref.body !== undefined && ref.body !== null) {
     try {
@@ -113,9 +124,9 @@ export function actionRefUsesProjectId(ref: ActionRef): boolean {
       // renderer. The dispatcher would reject the body too.
     }
   }
-  // Chained actions can also carry project_id references — walk the
-  // chain so a section whose top-level action doesn't reference
-  // project_id but whose next_action does still triggers the picker.
+  // Http descriptors can also chain via `next_action` — walk the chain
+  // so a section whose top-level action doesn't reference project_id
+  // but whose next_action does still triggers the picker.
   if (ref.next_action) {
     return actionRefUsesProjectId(ref.next_action as ActionRef);
   }
@@ -200,7 +211,19 @@ export function substituteEmbeddingSource(
   embeddingSource: string,
 ): ActionDescriptor {
   if (!embeddingSource) return descriptor;
-  const out: ActionDescriptor = {
+  // v0.2.32 (CHAINED_ACTION): map across the steps array; the wrapper
+  // carries no path/body of its own.
+  if (isChainedAction(descriptor)) {
+    const out: ChainedActionDescriptor = {
+      ...descriptor,
+      steps: descriptor.steps.map(
+        (step) => substituteEmbeddingSource(step, embeddingSource),
+      ),
+    };
+    return out;
+  }
+  // descriptor is HttpActionDescriptor here.
+  const out: HttpActionDescriptor = {
     ...descriptor,
     path: substituteEmbeddingSourceInString(descriptor.path, embeddingSource),
   };
